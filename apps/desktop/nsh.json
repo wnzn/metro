@@ -1,0 +1,13 @@
+{
+  "name": "Metro",
+  "id": "dev.metro.desktop",
+  "version": "0.1.0",
+  "build": 1,
+  "nsh": ">=0.6, <0.7",
+  "theme": "theme/theme.json",
+  "window": {
+    "title": "Metro",
+    "defaultSize": { "width": 1100, "height": 720 },
+    "minSize": { "width": 720, "height": 480 }
+  }
+}

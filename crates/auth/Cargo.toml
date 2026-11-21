@@ -1,0 +1,28 @@
+[package]
+name = "metro-auth"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+publish = false
+description = "Bearer-token authentication for Metro: explicit dev tokens or OIDC JWT access tokens"
+
+[dependencies]
+# Only the aws-lc-rs backend is enabled. Never enable `rust_crypto` alongside it
+# in the same build: `Authenticator` installs the aws-lc provider explicitly, but
+# keeping one backend avoids surprises.
+jsonwebtoken = { version = "12", default-features = false, features = ["aws_lc_rs"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+subtle = "2.6"
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"] }
+url = "2.5"
+
+[dev-dependencies]
+jsonwebtoken = { version = "12", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+wiremock = "0.6"
+aws-lc-rs = "1"
+base64 = "0.22"

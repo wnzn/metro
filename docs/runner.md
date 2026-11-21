@@ -1,0 +1,222 @@
+# Runner
+
+`metro-runner` polls the server over outbound HTTP (`/v1/runner/claim`),
+authenticates with `METRO_RUNNER_TOKEN`, runs each claimed job against one
+workspace directory, and posts the result back. It needs no inbound port.
+
+Each runner belongs to exactly one **Space**. Its token is that Space's runner
+token, issued by the Space owner (see [spaces.md](spaces.md#runner-pairing)).
+The token alone decides which Space it serves: every room and thread in that
+Space, and nothing else. The server has no runner settings. To serve two
+Spaces, run two runners, each with its own token and its own workspace.
+
+**Sandboxing is opt-in.** By default (`METRO_SANDBOX=none`), the check and MCP
+commands run with the runner's own privileges on its host. Set
+`METRO_SANDBOX=docker` to run them in a locked-down container instead; see
+[Docker sandbox](#docker-sandbox-opt-in-fails-closed).
+
+**Requirements:** Linux ≥ 5.6. File access uses
+`openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`. On older kernels the
+runner fails at startup, and it never falls back to weaker path checks.
+Containers use the host kernel, so this applies to them too.
+
+## Tools
+
+| Tool | Behaviour | Limit |
+| --- | --- | --- |
+| `workspace.list` | Lists a directory beneath the workspace | 2000 entries |
+| `workspace.read` | Reads a UTF-8 text file beneath the workspace | 1 MiB (truncated beyond) |
+| `workspace.check` | Runs `METRO_CHECK_ARGV`; reports an error if unset | [Time limits](#time-limits), output capped |
+| MCP tools | From the stdio server in `METRO_MCP_ARGV`, if set | [Time limits](#time-limits) |
+
+## Environment
+
+The runner validates every setting at startup and refuses to start on any
+invalid or contradictory value. Empty values count as unset.
+
+| Variable | Default | Notes |
+| --- | --- | --- |
+| `METRO_RUNNER_TOKEN` | **required** | The Space's runner token, as issued by its owner |
+| `METRO_WORKSPACE` | **required** | An existing directory, canonicalized at startup |
+| `METRO_SERVER_URL` | `http://127.0.0.1:8787` | Set it explicitly for any runner that isn't on the server's machine. Plain `http://` is allowed only for loopback hosts. |
+| `METRO_ALLOW_INSECURE_HTTP` | `0` | `1` allows plain HTTP to a non-loopback host. Set it only for a private network hop, such as `http://server:8787` inside Compose. |
+| `METRO_POLL_INTERVAL_MS` | `1000` | 50 – 600000 |
+| `METRO_HTTP_TIMEOUT_SECS` | `30` | See [Time limits](#time-limits) |
+| `METRO_CHECK_ARGV` | unset (no check) | JSON argv |
+| `METRO_CHECK_TIMEOUT_SECS` | `90` | See [Time limits](#time-limits) |
+| `METRO_MCP_ARGV` | unset (no MCP) | JSON argv |
+| `METRO_MCP_TIMEOUT_SECS` | `90` | See [Time limits](#time-limits) |
+| `METRO_SANDBOX` | `none` | `none` or `docker` |
+| `METRO_SANDBOX_IMAGE` | — | Required for `docker`; must be pinned by digest |
+| `METRO_SANDBOX_MEMORY` | `1g` | Memory and swap limit |
+| `METRO_SANDBOX_CPUS` | `1` | |
+| `METRO_SANDBOX_PIDS` | `256` | 8 – 65536 |
+| `METRO_SANDBOX_USER` | `65534:65534` | Numeric, non-root `uid:gid` |
+| `METRO_SANDBOX_TMPFS_SIZE` | `256m` | Size of `/tmp` in the sandbox |
+| `METRO_DOCKER_BIN` | `docker` | Docker CLI to call |
+
+Setting any `METRO_SANDBOX_*` value while `METRO_SANDBOX` isn't `docker` is a
+startup error. The runner refuses rather than run on the host by surprise.
+
+## Operator-defined argv
+
+`METRO_CHECK_ARGV` and `METRO_MCP_ARGV` are **JSON arrays of strings**. The
+first element is the executable. The runner executes them directly (`execve`),
+never through a shell, with a cleared environment that keeps only a small
+allowlist (`PATH`, `HOME`, `LANG`, …). Secrets such as the runner token are not
+passed. The agent can trigger these commands but can't change them.
+
+```sh
+export METRO_CHECK_ARGV='["./check.sh"]'
+export METRO_MCP_ARGV='["/usr/local/bin/my-mcp-server","--stdio"]'
+```
+
+## Job semantics
+
+The server keeps the job queue in memory and never re-queues a job once it's
+claimed. A job that isn't claimed within 30 s fails, and so does one that isn't
+finished within the 120 s lease (see [Time limits](#time-limits)). The runner runs each job it claims once, and retries
+only the result upload, with backoff. If the runner or the server dies while a
+job is running, that job fails, but any side effects of the check or MCP
+command may already have happened. Treat delivery as at most once, with no
+guarantee of completion, and choose commands that are safe to repeat if a
+person runs the action again. Stopping a run (`POST /v1/runs/{id}/stop`)
+halts the agent, but a job the runner has already claimed runs until it ends
+or hits its time limit.
+
+## Time limits
+
+The server expires a claimed job **120 seconds** after a runner claims it
+(server `run_timeout`; not configurable through the environment). A result that
+arrives later is wasted, and the runner stays busy with the old job in the
+meantime. The runner's own deadlines are therefore set to fit inside that
+lease:
+
+| Variable | Default | Meaning |
+| --- | --- | --- |
+| `METRO_CHECK_TIMEOUT_SECS` | `90` | Wall-clock limit for one `workspace.check` run. When it's reached, the process group (or container) is killed. |
+| `METRO_MCP_TIMEOUT_SECS` | `90` | Wall-clock limit for one MCP job: starting the server, handshake, and the list or call. |
+| `METRO_HTTP_TIMEOUT_SECS` | `30` | Limit for each HTTP request to the server, including the result upload |
+
+All three settings are optional. At startup the runner refuses (exit code 2)
+any configuration where `METRO_CHECK_TIMEOUT_SECS` or `METRO_MCP_TIMEOUT_SECS`
+plus `METRO_HTTP_TIMEOUT_SECS` is more than 120 seconds. Lower values are always
+accepted. To give a check more time, lower the HTTP timeout to match. For
+example, `METRO_CHECK_TIMEOUT_SECS=110` with `METRO_HTTP_TIMEOUT_SECS=10` is
+allowed.
+
+These limits don't cover everything:
+
+- Removing a timed-out sandbox container (`docker rm -f`) can take up to 30
+  more seconds.
+- If the first result upload fails, retries continue for up to 5 minutes and
+  may arrive after the lease has expired.
+
+## Separate remote runner
+
+Run the runner on the machine that holds the workspace. `docker compose up`
+on the server host starts only the server; the bundled runner runs only when
+you ask for the `runner` profile. The remote runner must reach the server over
+`https://`, so expose the server through a TLS reverse proxy (see
+[deploy.md](deploy.md)).
+
+Get the Space's runner token from its owner. They issue it with
+`POST /v1/spaces/{sid}/runner-token`, or under **Manage → Runner → Issue
+token** in the desktop app.
+Store it in a mode-600 file and send it over a private channel. Issuing a new
+token rotates it, and any runner still using the old one stops getting
+jobs.
+
+### Option A: runner container, no sandbox
+
+Images are `ghcr.io/<owner>/<repo>/metro-runner:<tag>`, in lower case. Fill in
+the quoted values:
+
+```sh
+export METRO_RUNNER_TOKEN="$(cat "$HOME/.config/metro-dev/space.runner-token")"
+METRO_RUNNER_IMAGE='ghcr.io/your-org/metro/metro-runner:v0.1.0'
+WORKSPACE_DIR="$HOME/src/my-project"
+
+docker run -d --name metro-runner --init --restart unless-stopped \
+  --cap-drop ALL --security-opt no-new-privileges:true \
+  -e METRO_SERVER_URL='https://metro.example.com' \
+  -e METRO_RUNNER_TOKEN \
+  -e METRO_WORKSPACE=/workspace \
+  -e METRO_CHECK_ARGV='["/bin/ls","-la"]' \
+  -v "$WORKSPACE_DIR:/workspace:ro" \
+  "$METRO_RUNNER_IMAGE"
+```
+
+The image's user has UID/GID 1000 by default (`RUNNER_UID`/`RUNNER_GID` build
+arguments), so the workspace must be readable by that user. Checks run inside
+this container (`METRO_SANDBOX=none`). Remove `:ro` only if your check needs
+to write to the workspace.
+
+### Option B: host binary with the Docker sandbox
+
+The Docker sandbox needs a runner that can call a Docker daemon, so run the
+binary on the host:
+
+```sh
+cargo build --locked --release --bin metro-runner
+```
+
+## Docker sandbox (opt-in, fails closed)
+
+With `METRO_SANDBOX=docker`, check and MCP commands run as follows:
+
+```text
+docker run --rm --label dev.metro.runner=1 --pull=never --network=none
+  --read-only --cap-drop=ALL --security-opt=no-new-privileges --ipc=none --init
+  --pids-limit/--memory/--memory-swap/--cpus/--user from the settings above
+  --tmpfs /tmp --mount <workspace> at /workspace, readonly --workdir /workspace
+  --entrypoint <argv[0]> <image> <argv[1..]>
+```
+
+- **Digest only, never pulled.** `METRO_SANDBOX_IMAGE` must be
+  `repo@sha256:<64 hex>` or `sha256:<64 hex>`. The runner rejects tags at
+  startup and uses `--pull=never`, so load the image before you start it.
+- **No host fallback.** If Docker or the image is unavailable, the command
+  fails. It never runs on the host.
+- **Read-only workspace, no network.** Only `/tmp` (tmpfs) is writable.
+- The runner refuses to mount `/`, or a workspace that contains the Docker
+  socket.
+
+```sh
+docker pull busybox:1.37
+METRO_SANDBOX_IMAGE="$(docker image inspect --format '{{index .RepoDigests 0}}' busybox:1.37)"
+echo "$METRO_SANDBOX_IMAGE"   # busybox@sha256:...
+
+export METRO_SANDBOX=docker
+export METRO_SANDBOX_IMAGE
+export METRO_SERVER_URL='https://metro.example.com'
+export METRO_RUNNER_TOKEN="$(cat "$HOME/.config/metro-dev/space.runner-token")"
+export METRO_WORKSPACE="$HOME/src/my-project"
+export METRO_CHECK_ARGV='["/bin/ls","-la"]'
+./target/release/metro-runner
+```
+
+Choose a check that works on a read-only workspace. `/bin/ls` does. Build
+tools like `cargo check` or `npm test` usually write caches, a `target/`
+directory or temp files outside `/tmp`, so they fail in this sandbox unless
+the image and argv redirect those writes to `/tmp`.
+
+### Cleaning up orphaned containers
+
+Sandbox containers are labelled `dev.metro.runner=1` and named
+`metro-runner-<pid>-<n>-<random>`. When a job times out, or the runner stops on
+SIGINT/SIGTERM, the runner force-removes the container. If the runner itself is
+killed (SIGKILL, OOM kill, or a host crash), the `docker` client process dies
+but **the container can keep running** until its command exits. The runner
+doesn't clean these up at startup. Find and remove leftover containers with:
+
+```sh
+docker ps -a --filter label=dev.metro.runner=1
+docker rm -f $(docker ps -aq --filter label=dev.metro.runner=1)
+```
+
+Only run the removal while no runner on that Docker host is running jobs.
+
+Docker reduces risk but doesn't fully isolate a command; see
+[Docker security](https://docs.docker.com/engine/security/). Access to the
+Docker daemon is equivalent to root on the runner host.

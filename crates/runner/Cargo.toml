@@ -1,0 +1,25 @@
+[package]
+name = "metro-runner"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Metro job runner: claims tool jobs from the Metro server and executes them against a confined workspace."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "metro-runner"
+path = "src/main.rs"
+
+[lib]
+name = "metro_runner"
+path = "src/lib.rs"
+
+[dependencies]
+libc = "0.2.180"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

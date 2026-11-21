@@ -1,0 +1,1319 @@
+// App state and the sync loop. Pages read these signals and call these
+// functions; nothing here knows about the UI.
+//
+// Model
+// - A user signs in to a server with a bearer token, sees the Spaces they own
+//   or belong to (GET /v1/spaces) and works in one Space at a time. Each Space
+//   has its own rooms (one is its lobby) and its own optional paired runner.
+//   There is no shared server-wide lobby: an account with no Space sees how to
+//   create one or get added.
+//
+// Sync
+// - One loop per connection ("session"). Each tick refreshes the Space list
+//   and the active Space's rooms now and then, and polls the active room with
+//   ?after=<cursor>.
+// - Everything cached is keyed by Space + room (every Space's lobby is called
+//   "lobby"), and every request checks on return that its session is current
+//   and its Space was not purged meanwhile (a per-Space epoch), so a late
+//   answer never lands in another Space or after access was lost.
+// - Only event ids above a room's cursor are accepted, so repeated or
+//   overlapping responses never duplicate events.
+// - 401: the session ends and the connect screen says why. 403/404 on a
+//   Space's endpoints: the Space list is reloaded; a Space we lost access to is
+//   purged (rooms, events, cursors, in-flight work) and we move elsewhere.
+// - Network errors, timeouts, 5xx and 429 back off exponentially (1s .. 30s)
+//   and keep what is on screen.
+//
+// Secrets
+// - The access token lives in this module's memory only (never Storage, logs
+//   or UI) and is dropped on disconnect.
+// - A runner token is shown once, right after the owner issues it, and is
+//   cleared when the owner hides it, leaves the management view, switches
+//   Space or room, or disconnects.
+
+import { batch, computed, effect, signal, Storage, untracked } from "nsh";
+import { ApiError, createClient, parseReaction } from "./api/client";
+import type { Client, Member, Mention, Room, RoomEvent, Run, Space } from "./api/client";
+import { DEFAULT_SERVER_URL, parseServerUrl } from "./api/serverUrl";
+
+export type { Member, Mention, Room, RoomEvent, Run, Space };
+
+export const LOBBY = "lobby";
+export const POLL_MS = 1500;
+const LISTS_REFRESH_MS = 10_000;
+const RUNS_REFRESH_MS = 3000;
+const CHAT = "chat"; // the personal Chat's cache key (room keys always contain \u0001)
+const MAX_BACKOFF_MS = 30_000;
+const MAX_EVENTS_PER_ROOM = 2000;
+const SERVER_URL_KEY = "metro.serverUrl"; // not secret: remembered between launches
+const LAST_SPACE_KEY = "metro.lastSpace"; // not secret: { server, space }
+
+export type Status =
+  | { phase: "signedOut" }
+  | { phase: "connecting" }
+  | { phase: "online" }
+  | { phase: "retrying"; attempt: number; retryInMs: number; message: string };
+
+export type View = "room" | "manage";
+/** Where the main panel is: the personal Chat, or the active Space. */
+export type Place = "chat" | "space";
+
+// ------------------------------------------------------------------ state
+
+// Declared before the computeds below: NSH evaluates computeds eagerly.
+const EMPTY_EVENTS: readonly RoomEvent[] = [];
+const EMPTY_REACTIONS: Reactions = {};
+
+/** Reactions folded per event: emoji -> reactor keys ("user:<id>" | "agent:<id>"), in order of arrival. */
+export type Reactions = Record<number, Record<string, readonly string[]>>;
+export const REACTION_EMOJI = ["👍", "👀", "✅", "🙏", "❤️", "🎉"] as const;
+const EMPTY_ROOMS: readonly Room[] = [];
+
+export const status = signal<Status>({ phase: "signedOut" });
+/** Why the last connect attempt or session ended; shown on the connect screen. */
+export const connectError = signal<string | null>(null);
+export const serverUrlInput = signal(DEFAULT_SERVER_URL);
+export const connectedTo = signal<string | null>(null);
+/** The signed-in user's id, which others use to add them to a Space. */
+export const me = signal<string | null>(null);
+
+export const place = signal<Place>("chat");
+export const spaces = signal<Space[]>([]);
+export const activeSpaceId = signal<string | null>(null);
+export const activeSpace = computed(() => spaces().find((s) => s.id === activeSpaceId()) ?? null);
+export const switchingSpace = signal(false);
+
+const roomsBySpace = signal<Record<string, readonly Room[]>>({});
+export const rooms = computed(() => roomsBySpace()[activeSpaceId() ?? ""] ?? EMPTY_ROOMS);
+export const activeRoomId = signal<string | null>(null);
+export const activeRoom = computed(() => rooms().find((r) => r.id === activeRoomId()) ?? null);
+
+const eventsByScope = signal<Record<string, readonly RoomEvent[]>>({});
+const loadedScopes = signal<Record<string, true>>({});
+const activeScope = computed(() => {
+  if (place() === "chat") return CHAT;
+  const sid = activeSpaceId();
+  const rid = activeRoomId();
+  return sid && rid ? scopeKey(sid, rid) : "";
+});
+export const activeEvents = computed(() => eventsByScope()[activeScope()] ?? EMPTY_EVENTS);
+export const activeLoaded = computed(() => !!loadedScopes()[activeScope()]);
+const reactionsByScope = signal<Record<string, Reactions>>({});
+export const activeReactions = computed(() => reactionsByScope()[activeScope()] ?? EMPTY_REACTIONS);
+/** `${eventId}|${emoji}` while the user's toggle is on its way. */
+export const reactionPending = signal<string | null>(null);
+
+export const view = signal<View>("room");
+/** Set when the server has no personal Chat for this user (403/404); polling it stops. */
+export const chatUnavailable = signal<string | null>(null);
+
+// Runs and dispatch (meta controls in the Chat)
+export const runs = signal<Run[]>([]);
+export const runsLoaded = signal(false);
+export const runsError = signal<string | null>(null);
+export const runBusy = signal<string | null>(null);
+/** Where a task from the Chat goes: an explicit Space and room, never implied. */
+export const dispatchTarget = signal<{ spaceId: string; roomId: string | null } | null>(null);
+export const dispatchDraft = signal("");
+export const dispatching = signal(false);
+export const dispatchError = signal<string | null>(null);
+export const dispatchNotice = signal<string | null>(null);
+export const draft = signal("");
+export const sending = signal<null | "message" | "agent">(null);
+export const demoPending = signal(false);
+export const creatingRoom = signal(false);
+export const creatingSpace = signal(false);
+/** The last failed action (send, demo, create), shown near where it happened. */
+export const actionError = signal<string | null>(null);
+/** A short confirmation or explanation of something that just happened. */
+export const notice = signal<string | null>(null);
+
+// Members per Space (any member may list them; owners manage them)
+const membersBySpace = signal<Record<string, Member[]>>({});
+export const members = computed(() => membersBySpace()[activeSpaceId() ?? ""] ?? null);
+export const membersError = signal<string | null>(null);
+
+// Mentions picked in the room composer. Only for the active room; cleared when
+// the room or Space changes, and pruned when their text leaves the draft.
+export const mentions = signal<Mention[]>([]);
+
+// Space management (owners)
+export const manageError = signal<string | null>(null);
+export const memberBusy = signal<string | null>(null);
+export const runnerBusy = signal<null | "issue" | "revoke">(null);
+/** The runner token just issued. Transient: see "Secrets" above. */
+export const revealedRunnerToken = signal<string | null>(null);
+
+// ------------------------------------------------------------------ session internals
+
+let token = "";
+let client: Client | null = null;
+let abort: AbortController | null = null;
+let session = 0;
+let timer: number | undefined;
+let ticking = false;
+let tickAgain = false;
+let failures = 0;
+let lastListsRefresh = 0;
+let lastRunsRefresh = 0;
+const cursors = new Map<string, number>();
+const inflight = new Map<string, Promise<void>>();
+const pollAgain = new Set<string>();
+const lastRoomBySpace = new Map<string, string>();
+const spaceEpoch = new Map<string, number>();
+
+function scopeKey(spaceId: string, roomId: string) {
+  return `${spaceId}\u0001${roomId}`;
+}
+const epochOf = (spaceId: string) => spaceEpoch.get(spaceId) ?? 0;
+
+/** A guard for async work: still the same session, and the space not purged since. */
+function guard(spaceId?: string) {
+  const sess = session;
+  const epoch = spaceId ? epochOf(spaceId) : 0;
+  return () => sess === session && (!spaceId || epochOf(spaceId) === epoch);
+}
+
+/** Loads the remembered server URL (never the token). */
+export async function restorePreferences() {
+  try {
+    const saved = await Storage.getItem(SERVER_URL_KEY);
+    if (saved && status().phase === "signedOut") serverUrlInput.set(saved);
+  } catch {
+    /* storage unavailable: keep the default */
+  }
+}
+
+// ------------------------------------------------------------------ connect / disconnect
+
+export async function connect(urlInput: string, tokenInput: string): Promise<void> {
+  const parsed = parseServerUrl(urlInput);
+  if (!parsed.ok) {
+    connectError.set(parsed.error);
+    return;
+  }
+  const trimmed = tokenInput.trim();
+  if (!trimmed) {
+    connectError.set("Enter your access token (a dev token or a JWT from your identity provider).");
+    return;
+  }
+  if (/\s/.test(trimmed)) {
+    connectError.set("The access token contains spaces or line breaks; paste only the token itself.");
+    return;
+  }
+
+  endSession();
+  const sess = ++session;
+  token = trimmed;
+  abort = new AbortController();
+  const c = createClient({ baseUrl: parsed.baseUrl, token: () => token, signal: abort.signal });
+  client = c;
+  batch(() => {
+    connectError.set(null);
+    status.set({ phase: "connecting" });
+  });
+
+  try {
+    const [who, list] = await Promise.all([c.me(), c.listSpaces()]);
+    if (sess !== session) return;
+    batch(() => {
+      me.set(who.id);
+      spaces.set(list);
+      connectedTo.set(parsed.baseUrl);
+    });
+    Storage.setItem(SERVER_URL_KEY, parsed.baseUrl).catch(() => {});
+    const remembered = await rememberedSpace(parsed.baseUrl);
+    if (sess !== session) return;
+    // A returning user lands in their last Space; everyone else in their Chat.
+    const initial = list.find((s) => s.id === remembered) ?? null;
+    if (initial) await enterSpace(initial.id, { place: "chat", spaceId: null });
+    if (sess !== session) return;
+    lastListsRefresh = Date.now();
+    failures = 0;
+    status.set({ phase: "online" });
+    kick();
+  } catch (error) {
+    if (sess !== session) return;
+    endSession();
+    connectError.set(describe(error, "Could not connect"));
+  }
+}
+
+export function disconnect(reason?: string) {
+  endSession();
+  connectError.set(reason ?? null);
+}
+
+/** Retry now instead of waiting for the backoff. */
+export function retryNow() {
+  if (status().phase === "retrying") kick();
+}
+
+// ------------------------------------------------------------------ spaces
+
+export function openChat() {
+  if (place() === "chat") return;
+  batch(() => {
+    clearTransient();
+    view.set("room");
+    place.set("chat");
+    actionError.set(null);
+    notice.set(null);
+  });
+  lastRunsRefresh = 0;
+  kick();
+}
+
+export async function selectSpace(spaceId: string): Promise<void> {
+  if (switchingSpace()) return;
+  if (spaceId === activeSpaceId() && roomsBySpace()[spaceId]) {
+    if (place() === "space") return;
+    batch(() => {
+      clearTransient();
+      view.set("room");
+      place.set("space");
+      actionError.set(null);
+      notice.set(null);
+    });
+    kick();
+    return;
+  }
+  await enterSpace(spaceId, { place: place(), spaceId: activeSpaceId() });
+  kick();
+}
+
+export async function createSpace(nameInput: string): Promise<boolean> {
+  const name = nameInput.trim();
+  const c = client;
+  if (!c || creatingSpace()) return false;
+  if (!name) {
+    actionError.set("Space name can't be empty.");
+    return false;
+  }
+  const ok = guard();
+  batch(() => {
+    creatingSpace.set(true);
+    actionError.set(null);
+  });
+  try {
+    const space = await c.createSpace(name);
+    if (!ok()) return false;
+    spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
+    await enterSpace(space.id, { place: place(), spaceId: activeSpaceId() });
+    kick();
+    return true;
+  } catch (error) {
+    if (ok()) handleActionError(error, "Could not create the Space");
+    return false;
+  } finally {
+    if (ok()) creatingSpace.set(false);
+  }
+}
+
+/**
+ * Makes `spaceId` active: loads its rooms if needed and opens its last room,
+ * else its lobby. If the Space can't be opened, purges it on 403/404 and
+ * returns to where the user was.
+ */
+async function enterSpace(spaceId: string, previous: { place: Place; spaceId: string | null }): Promise<void> {
+  const c = client;
+  if (!c) return;
+  const ok = guard(spaceId);
+  batch(() => {
+    clearTransient();
+    view.set("room");
+    place.set("space");
+    activeSpaceId.set(spaceId);
+    activeRoomId.set(pickRoom(spaceId, roomsBySpace()[spaceId] ?? EMPTY_ROOMS));
+    actionError.set(null);
+    notice.set(null);
+    switchingSpace.set(true);
+  });
+  try {
+    if (!roomsBySpace()[spaceId]) {
+      const list = await c.listRooms(spaceId);
+      if (!ok()) return;
+      batch(() => {
+        roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+        if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, list));
+      });
+    }
+    if (activeSpaceId() === spaceId) rememberSpace(spaceId);
+  } catch (error) {
+    if (!ok() || isAborted(error)) return;
+    if (error instanceof ApiError && error.kind === "auth") {
+      disconnect(error.message);
+      return;
+    }
+    const name = spaces().find((s) => s.id === spaceId)?.name ?? spaceId;
+    if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) purgeSpace(spaceId, true);
+    else purgeSpace(spaceId, false); // keep it listed; just don't keep half-loaded state
+    const back = previous.spaceId && spaces().some((s) => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
+    batch(() => {
+      activeSpaceId.set(back);
+      activeRoomId.set(back ? pickRoom(back, roomsBySpace()[back] ?? EMPTY_ROOMS) : null);
+      place.set(back && previous.place === "space" ? "space" : "chat");
+      actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
+    });
+  } finally {
+    switchingSpace.set(false);
+  }
+}
+
+/** Loads a Space's rooms into the cache if they aren't there (for dispatch and runs). */
+async function ensureRooms(spaceId: string): Promise<readonly Room[]> {
+  const cached = roomsBySpace()[spaceId];
+  if (cached) return cached;
+  const c = client;
+  if (!c) return EMPTY_ROOMS;
+  const ok = guard(spaceId);
+  const list = await c.listRooms(spaceId);
+  if (!ok()) return EMPTY_ROOMS;
+  roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+  return list;
+}
+
+function pickRoom(spaceId: string, list: readonly Room[]): string | null {
+  const last = lastRoomBySpace.get(spaceId);
+  if (last && list.some((r) => r.id === last)) return last;
+  return (
+    list.find((r) => r.id === LOBBY)?.id ??
+    list.find((r) => r.name.trim().toLowerCase() === LOBBY)?.id ??
+    list[0]?.id ??
+    null
+  );
+}
+
+/** Forgets everything cached for a Space; `unlist` also removes it from the list. */
+function purgeSpace(spaceId: string, unlist: boolean) {
+  spaceEpoch.set(spaceId, epochOf(spaceId) + 1);
+  const prefix = scopeKey(spaceId, "");
+  for (const key of [...cursors.keys()]) if (key.startsWith(prefix)) cursors.delete(key);
+  for (const key of [...inflight.keys()]) if (key.startsWith(prefix)) inflight.delete(key);
+  for (const key of [...pollAgain]) if (key.startsWith(prefix)) pollAgain.delete(key);
+  lastRoomBySpace.delete(spaceId);
+  const strip = <T,>(record: Record<string, T>) => {
+    const next: Record<string, T> = {};
+    for (const key of Object.keys(record)) if (!key.startsWith(prefix)) next[key] = record[key];
+    return next;
+  };
+  batch(() => {
+    const { [spaceId]: _gone, ...restRooms } = roomsBySpace();
+    roomsBySpace.set(restRooms);
+    eventsByScope.set(strip(eventsByScope()));
+    loadedScopes.set(strip(loadedScopes()));
+    reactionsByScope.set(strip(reactionsByScope()));
+    if (unlist) spaces.set(spaces().filter((s) => s.id !== spaceId));
+    if (dispatchTarget()?.spaceId === spaceId) dispatchTarget.set(null);
+    const { [spaceId]: _members, ...restMembers } = membersBySpace();
+    membersBySpace.set(restMembers);
+    if (activeSpaceId() === spaceId) clearTransient();
+  });
+}
+
+async function rememberedSpace(server: string): Promise<string | null> {
+  try {
+    const raw = await Storage.getItem(LAST_SPACE_KEY);
+    const saved = raw ? JSON.parse(raw) : null;
+    return saved && saved.server === server && typeof saved.space === "string" ? saved.space : null;
+  } catch {
+    return null;
+  }
+}
+
+function rememberSpace(spaceId: string) {
+  const server = connectedTo();
+  if (server) Storage.setItem(LAST_SPACE_KEY, JSON.stringify({ server, space: spaceId })).catch(() => {});
+}
+
+// ------------------------------------------------------------------ rooms
+
+export function selectRoom(roomId: string) {
+  const sid = activeSpaceId();
+  if (!sid || (roomId === activeRoomId() && view() === "room" && place() === "space")) return;
+  lastRoomBySpace.set(sid, roomId);
+  batch(() => {
+    clearTransient();
+    view.set("room");
+    place.set("space");
+    activeRoomId.set(roomId);
+    actionError.set(null);
+    notice.set(null);
+  });
+  kick();
+}
+
+export async function createRoom(nameInput: string): Promise<boolean> {
+  const name = nameInput.trim();
+  const c = client;
+  const sid = activeSpaceId();
+  if (!c || !sid || creatingRoom()) return false;
+  if (!name) {
+    actionError.set("Room name can't be empty.");
+    return false;
+  }
+  const ok = guard(sid);
+  batch(() => {
+    creatingRoom.set(true);
+    actionError.set(null);
+  });
+  try {
+    const room = await c.createRoom(sid, name);
+    if (!ok()) return false;
+    const list = roomsBySpace()[sid] ?? EMPTY_ROOMS;
+    batch(() => {
+      if (!list.some((r) => r.id === room.id)) roomsBySpace.set({ ...roomsBySpace(), [sid]: [...list, room] });
+    });
+    if (activeSpaceId() === sid) selectRoom(room.id);
+    lastListsRefresh = 0; // pick up rooms others created, in server order
+    kick();
+    return true;
+  } catch (error) {
+    if (ok()) handleActionError(error, "Could not create the room", sid);
+    return false;
+  } finally {
+    if (ok()) creatingRoom.set(false);
+  }
+}
+
+/** Posts the draft to the active room; `invokeAgent` asks the Space's agent to answer. */
+export async function send(invokeAgent: boolean): Promise<void> {
+  if (place() === "chat") return sendChat(invokeAgent);
+  const text = draft().trim();
+  const sid = activeSpaceId();
+  const rid = activeRoomId();
+  const c = client;
+  if (!text || !sid || !rid || !c || sending()) return;
+  const ok = guard(sid);
+  batch(() => {
+    sending.set(invokeAgent ? "agent" : "message");
+    actionError.set(null);
+    notice.set(null);
+  });
+  const sentMentions = mentions().filter((m) => {
+    const literal = mentionLiteral(m);
+    return !literal || text.includes(literal);
+  });
+  try {
+    await c.sendMessage(sid, rid, text, invokeAgent, sentMentions);
+    if (!ok()) return;
+    if (draft().trim() === text) {
+      // unless the user typed something new meanwhile
+      batch(() => {
+        draft.set("");
+        mentions.set([]);
+      });
+    }
+    kick();
+  } catch (error) {
+    if (ok()) handleActionError(error, invokeAgent ? "Could not ask the agent" : "Could not send the message", sid);
+  } finally {
+    if (ok()) sending.set(null);
+  }
+}
+
+async function sendChat(invokeAgent: boolean): Promise<void> {
+  const text = draft().trim();
+  const c = client;
+  if (!text || !c || sending()) return;
+  const ok = guard();
+  batch(() => {
+    sending.set(invokeAgent ? "agent" : "message");
+    actionError.set(null);
+    notice.set(null);
+  });
+  try {
+    await c.sendChatMessage(text, invokeAgent);
+    if (!ok()) return;
+    if (draft().trim() === text) draft.set("");
+    if (chatUnavailable()) chatUnavailable.set(null);
+    lastRunsRefresh = 0;
+    kick();
+  } catch (error) {
+    if (ok()) handleActionError(error, invokeAgent ? "Could not ask your agent" : "Could not send the message");
+  } finally {
+    if (ok()) sending.set(null);
+  }
+}
+
+// ------------------------------------------------------------------ runs and dispatch (Chat meta controls)
+
+/** Opens the room or thread a run works in. */
+export async function openRun(run: Run): Promise<void> {
+  const space = spaces().find((s) => s.id === run.spaceId);
+  if (!space) {
+    runsError.set("That run belongs to a Space you're no longer a member of.");
+    return;
+  }
+  lastRoomBySpace.set(run.spaceId, run.roomId);
+  await selectSpace(run.spaceId);
+  if (activeSpaceId() !== run.spaceId) return;
+  if (!rooms().some((r) => r.id === run.roomId)) {
+    try {
+      await refreshLists(true); // a thread created moments ago
+    } catch {
+      /* the loop reports connection problems */
+    }
+  }
+  if (rooms().some((r) => r.id === run.roomId)) selectRoom(run.roomId);
+  else notice.set("That room or thread isn't visible to you (yet).");
+}
+
+/** Targets the dispatch composer at a run's room, for a follow-up. */
+export async function followUp(run: Run): Promise<void> {
+  await setDispatchSpace(run.spaceId, run.roomId);
+}
+
+export async function setDispatchSpace(spaceId: string, roomId?: string): Promise<void> {
+  if (!spaces().some((s) => s.id === spaceId)) return;
+  dispatchError.set(null);
+  dispatchNotice.set(null);
+  dispatchTarget.set({ spaceId, roomId: roomId ?? null });
+  try {
+    const list = await ensureRooms(spaceId);
+    const current = dispatchTarget();
+    if (current?.spaceId !== spaceId) return;
+    const chosen = roomId && list.some((r) => r.id === roomId) ? roomId : pickRoom(spaceId, list);
+    dispatchTarget.set({ spaceId, roomId: chosen });
+  } catch (error) {
+    if (dispatchTarget()?.spaceId === spaceId) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+  }
+}
+
+export function setDispatchRoom(roomId: string) {
+  const t = dispatchTarget();
+  if (t) dispatchTarget.set({ spaceId: t.spaceId, roomId });
+}
+
+/** Sends the dispatch draft to the chosen Space and room and asks that Space's agent. */
+export async function sendDispatch(): Promise<void> {
+  const text = dispatchDraft().trim();
+  const target = dispatchTarget();
+  const c = client;
+  if (!text || !target?.roomId || !c || dispatching()) return;
+  const space = spaces().find((s) => s.id === target.spaceId);
+  const room = roomsBySpace()[target.spaceId]?.find((r) => r.id === target.roomId);
+  if (!space || !room) {
+    dispatchError.set("Choose a Space and room you belong to first.");
+    return;
+  }
+  const ok = guard(target.spaceId);
+  batch(() => {
+    dispatching.set(true);
+    dispatchError.set(null);
+    dispatchNotice.set(null);
+  });
+  try {
+    await c.sendMessage(target.spaceId, target.roomId, text, true);
+    if (!ok()) return;
+    if (dispatchDraft().trim() === text) dispatchDraft.set("");
+    dispatchNotice.set(`Sent to the agent in ${space.name} › #${room.name}.`);
+    lastRunsRefresh = 0;
+    kick();
+  } catch (error) {
+    if (!ok()) return;
+    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else {
+      dispatchError.set(describe(error, "Could not send the task"));
+      if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) void lostAccess(target.spaceId, null);
+    }
+  } finally {
+    if (ok()) dispatching.set(false);
+  }
+}
+
+export async function stopRun(run: Run): Promise<void> {
+  const c = client;
+  if (!c || runBusy()) return;
+  const ok = guard();
+  batch(() => {
+    runBusy.set(run.id);
+    runsError.set(null);
+  });
+  try {
+    await c.stopRun(run.id);
+    if (!ok()) return;
+    lastRunsRefresh = 0;
+    kick();
+  } catch (error) {
+    if (!ok()) return;
+    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else runsError.set(describe(error, "Could not stop the run"));
+  } finally {
+    if (ok()) runBusy.set(null);
+  }
+}
+
+/** Whether a run is still going (so Stop makes sense). */
+export function isActiveRun(run: Run) {
+  return /^(queued|pending|running|active|in_progress|started|waiting)$/i.test(run.status);
+}
+
+/** Display names for a run's scope, from what is cached. */
+export function runScope(run: Run): { space: string; room: string } {
+  const space = spaces().find((s) => s.id === run.spaceId)?.name ?? run.spaceId;
+  const room = roomsBySpace()[run.spaceId]?.find((r) => r.id === run.roomId)?.name ?? run.roomId;
+  return { space, room };
+}
+
+export function roomsOf(spaceId: string): readonly Room[] {
+  return roomsBySpace()[spaceId] ?? EMPTY_ROOMS;
+}
+
+/** Whether people can react to an event: human and agent messages, not system, tool or runner rows. */
+export function isReactable(event: RoomEvent): boolean {
+  const k = event.kind.toLowerCase();
+  if (k === "message") return true;
+  return (k === "agent" || k === "agent_message" || k === "assistant") && !/(tool|runner|system|error|demo|reaction)/.test(k);
+}
+
+/** Adds or removes the signed-in user's `emoji` on an event of the active Chat or room. */
+export async function toggleReaction(eventId: number, emoji: string): Promise<void> {
+  const c = client;
+  const myId = me();
+  if (!c || !myId || reactionPending()) return;
+  const inChat = place() === "chat";
+  const sid = activeSpaceId();
+  const rid = activeRoomId();
+  if (!inChat && (!sid || !rid)) return;
+  const key = inChat ? CHAT : scopeKey(sid!, rid!);
+  const mine = (reactionsByScope()[key]?.[eventId]?.[emoji] ?? []).includes(`user:${myId}`);
+  const ok = inChat ? guard() : guard(sid!);
+  reactionPending.set(`${eventId}|${emoji}`);
+  actionError.set(null);
+  try {
+    await c.react(inChat ? { chat: true } : { spaceId: sid!, roomId: rid! }, eventId, emoji, !mine);
+    if (!ok()) return;
+    kick(); // the server's reaction event arrives with the next poll
+  } catch (error) {
+    if (ok()) handleActionError(error, mine ? "Could not remove the reaction" : "Could not add the reaction", inChat ? undefined : sid!);
+  } finally {
+    if (ok()) reactionPending.set(null);
+  }
+}
+
+async function refreshRuns() {
+  const c = client;
+  if (!c) return;
+  const ok = guard();
+  try {
+    const list = await c.listRuns();
+    if (!ok()) return;
+    lastRunsRefresh = Date.now();
+    batch(() => {
+      runs.set(list);
+      runsLoaded.set(true);
+      runsError.set(null);
+    });
+    // Name the rooms of the runs shown (one request per Space, once).
+    for (const spaceId of new Set(list.map((r) => r.spaceId))) {
+      if (!roomsBySpace()[spaceId] && spaces().some((s) => s.id === spaceId)) void ensureRooms(spaceId).catch(() => {});
+    }
+  } catch (error) {
+    if (!ok()) return;
+    lastRunsRefresh = Date.now();
+    if (error instanceof ApiError && !error.transient && error.kind !== "auth") {
+      runsError.set(describe(error, "Could not load runs"));
+      return;
+    }
+    throw error;
+  }
+}
+
+/** Asks the server to run the deterministic runner demo (workspace.list) with this Space's runner. */
+export async function runDemo(): Promise<void> {
+  const sid = activeSpaceId();
+  const rid = activeRoomId();
+  const c = client;
+  if (!sid || !rid || !c || demoPending()) return;
+  const ok = guard(sid);
+  batch(() => {
+    demoPending.set(true);
+    actionError.set(null);
+    notice.set(null);
+  });
+  try {
+    await c.runDemo(sid, rid);
+    if (!ok()) return;
+    notice.set("Demo requested: this Space's runner will answer with workspace.list in this room.");
+    kick();
+  } catch (error) {
+    if (ok()) handleActionError(error, "Could not start the demo", sid);
+  } finally {
+    if (ok()) demoPending.set(false);
+  }
+}
+
+// ------------------------------------------------------------------ management (owners)
+
+export async function openManage(): Promise<void> {
+  const space = activeSpace();
+  if (!space || space.role !== "owner") return;
+  batch(() => {
+    clearTransient();
+    view.set("manage");
+    manageError.set(null);
+    notice.set(null);
+  });
+  await reloadMembers();
+}
+
+export function closeManage() {
+  batch(() => {
+    clearTransient();
+    view.set("room");
+    manageError.set(null);
+    notice.set(null);
+  });
+}
+
+export async function reloadMembers(): Promise<void> {
+  const sid = activeSpaceId();
+  const c = client;
+  if (!sid || !c) return;
+  const ok = guard(sid);
+  try {
+    const list = await c.listMembers(sid);
+    if (ok()) membersBySpace.set({ ...membersBySpace(), [sid]: list });
+  } catch (error) {
+    if (ok()) handleManageError(error, "Could not load members", sid);
+  }
+}
+
+/** Loads the active Space's members for the mention picker (any member may). */
+export async function loadMembersForMentions(): Promise<void> {
+  const sid = activeSpaceId();
+  const c = client;
+  if (!sid || !c) return;
+  const ok = guard(sid);
+  membersError.set(null);
+  try {
+    const list = await c.listMembers(sid);
+    if (ok()) membersBySpace.set({ ...membersBySpace(), [sid]: list });
+  } catch (error) {
+    if (!ok() || isAborted(error)) return;
+    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else if (activeSpaceId() === sid) membersError.set(describe(error, "Could not load members"));
+  }
+}
+
+// ------------------------------------------------------------------ mentions
+
+export function mentionLiteral(m: Mention): string | null {
+  if (m.kind === "agent") return "@agent";
+  return /^\S+$/.test(m.id) ? `@${m.id}` : null; // ids with spaces go only in the explicit list
+}
+
+export function sameMention(a: Mention, b: Mention) {
+  return a.kind === b.kind && (a.kind === "agent" || (b.kind === "user" && a.id === b.id));
+}
+
+function escapeRegExp(text: string) {
+  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function literalIn(text: string, literal: string) {
+  return new RegExp(`(^|\\s)${escapeRegExp(literal)}(?=$|[\\s.,;:!?)])`).test(text);
+}
+
+/** The "@partial" being typed at the end of the draft, if any. */
+export function mentionQuery(text: string): string | null {
+  const m = /(^|\s)@([^\s@]*)$/.exec(text);
+  return m ? m[2] : null;
+}
+
+/** Adds a mention: its literal replaces a trailing "@partial" or is appended. */
+export function addMention(m: Mention) {
+  if (place() !== "space") return;
+  const literal = mentionLiteral(m);
+  batch(() => {
+    if (!mentions().some((x) => sameMention(x, m))) mentions.set([...mentions(), m]);
+    if (!literal) return;
+    const text = draft();
+    if (mentionQuery(text) !== null) draft.set(text.replace(/@[^\s@]*$/, `${literal} `));
+    else if (!literalIn(text, literal)) draft.set(`${text}${text && !/\s$/.test(text) ? " " : ""}${literal} `);
+  });
+}
+
+/** Removes a mention chip and its text from the draft. */
+export function removeMention(m: Mention) {
+  const literal = mentionLiteral(m);
+  batch(() => {
+    mentions.set(mentions().filter((x) => !sameMention(x, m)));
+    if (literal) {
+      const re = new RegExp(`(^|\\s)${escapeRegExp(literal)}(?=$|[\\s.,;:!?)])`, "g");
+      draft.set(draft().replace(re, "$1").replace(/[ \t]{2,}/g, " ").trimStart());
+    }
+  });
+}
+
+/** Sets the draft and drops mention chips whose text the user deleted. */
+export function setDraft(text: string) {
+  batch(() => {
+    draft.set(text);
+    const kept = mentions().filter((m) => {
+      const literal = mentionLiteral(m);
+      return !literal || literalIn(text, literal);
+    });
+    if (kept.length !== mentions().length) mentions.set(kept);
+  });
+}
+
+export async function addMember(userIdInput: string): Promise<boolean> {
+  const userId = userIdInput.trim();
+  const sid = activeSpaceId();
+  const c = client;
+  if (!sid || !c || memberBusy()) return false;
+  if (!userId) {
+    manageError.set("Enter the user ID of the person to add. They can copy it from their sidebar.");
+    return false;
+  }
+  const ok = guard(sid);
+  batch(() => {
+    memberBusy.set(userId);
+    manageError.set(null);
+  });
+  try {
+    await c.addMember(sid, userId);
+    if (!ok()) return false;
+    await reloadMembers();
+    return true;
+  } catch (error) {
+    if (ok()) handleManageError(error, `Could not add ${userId}`, sid);
+    return false;
+  } finally {
+    if (ok()) memberBusy.set(null);
+  }
+}
+
+export async function removeMember(userId: string): Promise<void> {
+  const sid = activeSpaceId();
+  const c = client;
+  if (!sid || !c || memberBusy()) return;
+  const ok = guard(sid);
+  batch(() => {
+    memberBusy.set(userId);
+    manageError.set(null);
+  });
+  try {
+    await c.removeMember(sid, userId);
+    if (!ok()) return;
+    await reloadMembers();
+  } catch (error) {
+    if (ok()) handleManageError(error, `Could not remove ${userId}`, sid);
+  } finally {
+    if (ok()) memberBusy.set(null);
+  }
+}
+
+/** Issues or rotates the Space's runner token and shows it once. */
+export async function issueRunnerToken(): Promise<void> {
+  const sid = activeSpaceId();
+  const c = client;
+  if (!sid || !c || runnerBusy()) return;
+  const ok = guard(sid);
+  batch(() => {
+    runnerBusy.set("issue");
+    manageError.set(null);
+    revealedRunnerToken.set(null);
+  });
+  try {
+    const issued = await c.issueRunnerToken(sid);
+    // Show it only if the owner is still looking at this Space's management view.
+    if (!ok() || activeSpaceId() !== sid || view() !== "manage") return;
+    batch(() => {
+      revealedRunnerToken.set(issued);
+      setRunnerPaired(sid, true);
+    });
+  } catch (error) {
+    if (ok()) handleManageError(error, "Could not issue a runner token", sid);
+  } finally {
+    if (ok()) runnerBusy.set(null);
+  }
+}
+
+export async function revokeRunnerToken(): Promise<void> {
+  const sid = activeSpaceId();
+  const c = client;
+  if (!sid || !c || runnerBusy()) return;
+  const ok = guard(sid);
+  batch(() => {
+    runnerBusy.set("revoke");
+    manageError.set(null);
+    revealedRunnerToken.set(null);
+  });
+  try {
+    await c.revokeRunnerToken(sid);
+    if (!ok()) return;
+    setRunnerPaired(sid, false);
+    notice.set("Runner token revoked. The runner can no longer serve this Space.");
+  } catch (error) {
+    if (ok()) handleManageError(error, "Could not revoke the runner token", sid);
+  } finally {
+    if (ok()) runnerBusy.set(null);
+  }
+}
+
+export function hideRunnerToken() {
+  revealedRunnerToken.set(null);
+}
+
+function setRunnerPaired(spaceId: string, paired: boolean) {
+  spaces.set(spaces().map((s) => (s.id === spaceId ? { ...s, runnerPaired: paired } : s)));
+}
+
+function clearTransient() {
+  revealedRunnerToken.set(null);
+}
+
+// Mentions belong to one room: forget them whenever the room, Space or place changes.
+let mentionScope = "";
+effect(() => {
+  const scope = activeScope();
+  untracked(() => {
+    if (scope === mentionScope) return;
+    mentionScope = scope;
+    if (mentions().length) mentions.set([]);
+    if (membersError()) membersError.set(null);
+  });
+});
+
+// ------------------------------------------------------------------ loop
+
+function endSession() {
+  session++;
+  abort?.abort();
+  abort = null;
+  client = null;
+  token = "";
+  if (timer !== undefined) clearTimeout(timer);
+  timer = undefined;
+  ticking = false;
+  tickAgain = false;
+  failures = 0;
+  lastListsRefresh = 0;
+  lastRunsRefresh = 0;
+  cursors.clear();
+  inflight.clear();
+  pollAgain.clear();
+  lastRoomBySpace.clear();
+  spaceEpoch.clear();
+  batch(() => {
+    status.set({ phase: "signedOut" });
+    connectedTo.set(null);
+    me.set(null);
+    place.set("chat");
+    chatUnavailable.set(null);
+    runs.set([]);
+    runsLoaded.set(false);
+    runsError.set(null);
+    runBusy.set(null);
+    dispatchTarget.set(null);
+    dispatchDraft.set("");
+    dispatching.set(false);
+    dispatchError.set(null);
+    dispatchNotice.set(null);
+    spaces.set([]);
+    activeSpaceId.set(null);
+    switchingSpace.set(false);
+    roomsBySpace.set({});
+    activeRoomId.set(null);
+    eventsByScope.set({});
+    loadedScopes.set({});
+    reactionsByScope.set({});
+    reactionPending.set(null);
+    view.set("room");
+    draft.set("");
+    sending.set(null);
+    demoPending.set(false);
+    creatingRoom.set(false);
+    creatingSpace.set(false);
+    actionError.set(null);
+    notice.set(null);
+    membersBySpace.set({});
+    membersError.set(null);
+    mentions.set([]);
+    manageError.set(null);
+    memberBusy.set(null);
+    runnerBusy.set(null);
+    revealedRunnerToken.set(null);
+  });
+}
+
+/** Runs a tick now (or right after the running one). */
+function kick() {
+  if (!client) return;
+  if (ticking) {
+    tickAgain = true;
+    return;
+  }
+  schedule(session, 0);
+}
+
+function schedule(sess: number, delay: number) {
+  if (timer !== undefined) clearTimeout(timer);
+  timer = setTimeout(() => {
+    timer = undefined;
+    void tick(sess);
+  }, delay);
+}
+
+async function tick(sess: number) {
+  if (sess !== session || !client) return;
+  ticking = true;
+  tickAgain = false;
+  let delay = POLL_MS;
+  try {
+    if (Date.now() - lastListsRefresh >= LISTS_REFRESH_MS) await refreshLists();
+    if (sess !== session) return;
+    if (place() === "chat") {
+      if (!chatUnavailable()) await pollChat();
+      if (sess === session && Date.now() - lastRunsRefresh >= RUNS_REFRESH_MS) await refreshRuns();
+    } else {
+      const sid = activeSpaceId();
+      const rid = activeRoomId();
+      if (sid && rid && view() === "room") await pollRoom(sid, rid);
+    }
+    if (sess !== session) return;
+    if (failures > 0 || status().phase !== "online") status.set({ phase: "online" });
+    failures = 0;
+  } catch (error) {
+    if (sess !== session || isAborted(error)) return;
+    const next = await handleLoopError(error);
+    if (next === null || sess !== session) return;
+    delay = next;
+  } finally {
+    if (sess === session) {
+      ticking = false;
+      schedule(sess, tickAgain ? 0 : delay);
+    }
+  }
+}
+
+/** Returns the delay before the next tick, or null when the session ended. */
+async function handleLoopError(error: unknown): Promise<number | null> {
+  if (error instanceof ApiError && error.kind === "auth") {
+    disconnect(error.message);
+    return null;
+  }
+  if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found") && place() === "space") {
+    await lostAccess(activeSpaceId(), activeRoomId());
+    return 0;
+  }
+  failures++;
+  const retryInMs = Math.min(MAX_BACKOFF_MS, 1000 * 2 ** (failures - 1));
+  status.set({ phase: "retrying", attempt: failures, retryInMs, message: describe(error, "Connection problem") });
+  return retryInMs;
+}
+
+/**
+ * A Space endpoint said 403/404. Reload the Space list to tell "removed from
+ * the Space" (purge it, move on) from "this room is gone" (drop the room).
+ */
+async function lostAccess(spaceId: string | null, roomId: string | null) {
+  if (!spaceId) return;
+  const before = spaces().find((s) => s.id === spaceId);
+  try {
+    await refreshLists(true);
+  } catch {
+    /* the next tick deals with it */
+  }
+  if (spaces().some((s) => s.id === spaceId)) {
+    if (!roomId) return;
+    const key = scopeKey(spaceId, roomId);
+    cursors.delete(key);
+    batch(() => {
+      roomsBySpace.set({ ...roomsBySpace(), [spaceId]: (roomsBySpace()[spaceId] ?? EMPTY_ROOMS).filter((r) => r.id !== roomId) });
+      const { [key]: _e, ...events } = eventsByScope();
+      eventsByScope.set(events);
+      if (activeSpaceId() === spaceId && activeRoomId() === roomId) {
+        activeRoomId.set(pickRoom(spaceId, roomsBySpace()[spaceId] ?? EMPTY_ROOMS));
+        notice.set("That room is no longer available.");
+      }
+    });
+  } else if (before) {
+    notice.set(`You no longer have access to ${before.name}.`);
+  }
+}
+
+/** Reloads the Space list and the active Space's rooms. */
+async function refreshLists(force = false) {
+  const c = client;
+  if (!c) return;
+  if (!force && Date.now() - lastListsRefresh < LISTS_REFRESH_MS) return;
+  const ok = guard();
+  const list = await c.listSpaces();
+  if (!ok()) return;
+  lastListsRefresh = Date.now();
+  const known = new Set(list.map((s) => s.id));
+  const lost = spaces().filter((s) => !known.has(s.id));
+  for (const space of lost) purgeSpace(space.id, true);
+  spaces.set(list);
+  const active = activeSpaceId();
+  if (active && !known.has(active)) {
+    const lostSpace = lost.find((s) => s.id === active);
+    const wasHere = place() === "space";
+    batch(() => {
+      activeSpaceId.set(null);
+      activeRoomId.set(null);
+      view.set("room");
+      if (lostSpace) notice.set(`You no longer have access to ${lostSpace.name}.`);
+    });
+    // Never fall back to another Space silently: go to the Chat, which says what happened.
+    if (wasHere) place.set("chat");
+    return;
+  }
+  if (active) {
+    const okSpace = guard(active);
+    const rooms = await c.listRooms(active);
+    if (!okSpace()) return;
+    const previous = roomsBySpace()[active] ?? EMPTY_ROOMS;
+    const current = activeRoomId();
+    batch(() => {
+      // Keep a room we just created even if the list is a moment behind; the
+      // events poll will say 404 if it really is gone.
+      const local = current ? previous.find((r) => r.id === current && !rooms.some((x) => x.id === r.id)) : undefined;
+      roomsBySpace.set({ ...roomsBySpace(), [active]: local ? [...rooms, local] : rooms });
+      if (activeSpaceId() === active && (!current || !roomsBySpace()[active].some((r) => r.id === current))) {
+        activeRoomId.set(pickRoom(active, roomsBySpace()[active]));
+      }
+    });
+  }
+}
+
+function pollRoom(spaceId: string, roomId: string): Promise<void> {
+  return poll(scopeKey(spaceId, roomId), guard(spaceId), (c, after) => c.listEvents(spaceId, roomId, after));
+}
+
+async function pollChat(): Promise<void> {
+  try {
+    await poll(CHAT, guard(), (c, after) => c.listChatEvents(after));
+  } catch (error) {
+    if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found" || error.kind === "protocol")) {
+      chatUnavailable.set(`Your Chat isn't available on this server: ${error.message}`);
+      return;
+    }
+    throw error;
+  }
+}
+
+/** Fetches events after the scope's cursor; one request per scope at a time. */
+function poll(key: string, ok: () => boolean, fetch: (c: Client, after: number) => Promise<RoomEvent[]>): Promise<void> {
+  const running = inflight.get(key);
+  if (running) {
+    pollAgain.add(key);
+    return running;
+  }
+  const run = (async () => {
+    let pages = 0;
+    for (;;) {
+      pollAgain.delete(key);
+      const c = client;
+      if (!c || !ok()) return;
+      const firstLoad = !loadedScopes()[key];
+      const events = await fetch(c, cursors.get(key) ?? 0);
+      if (!ok()) return;
+      const added = merge(key, events);
+      pages++;
+      // Catch up a long history in a few quick pages on first load; otherwise
+      // poll once more only if someone asked for it while we were busy.
+      const more = firstLoad && added > 0 && pages < 20;
+      if (!more && !pollAgain.has(key)) return;
+    }
+  })().finally(() => {
+    if (inflight.get(key) === run) inflight.delete(key);
+  });
+  inflight.set(key, run);
+  return run;
+}
+
+/**
+ * Appends events newer than the scope's cursor and folds `reaction` events
+ * into the reactions of their target (in id order, so replays are harmless).
+ * Returns how many events were new.
+ */
+function merge(key: string, events: RoomEvent[]): number {
+  const cursor = cursors.get(key) ?? 0;
+  const seen = new Set<number>();
+  const fresh = events
+    .filter((e) => e.id > cursor && !seen.has(e.id) && (seen.add(e.id), true))
+    .sort((a, b) => a.id - b.id);
+  const shown: RoomEvent[] = [];
+  let reactions: Reactions | null = null;
+  for (const event of fresh) {
+    if (event.kind !== "reaction") {
+      shown.push(event);
+      // A delegated thread was created or reported: pick up the room list now.
+      if (event.kind === "thread") lastListsRefresh = 0;
+      continue;
+    }
+    const change = parseReaction(event);
+    if (!change) continue; // a malformed reaction is never shown as a line either
+    reactions ??= { ...(reactionsByScope()[key] ?? EMPTY_REACTIONS) };
+    const reactor = `${change.reactorKind}:${change.reactorId}`;
+    const byEmoji = { ...(reactions[change.targetEventId] ?? {}) };
+    const list = byEmoji[change.emoji] ?? [];
+    const has = list.includes(reactor);
+    if (change.present && !has) byEmoji[change.emoji] = [...list, reactor];
+    else if (!change.present && has) {
+      const rest = list.filter((r) => r !== reactor);
+      if (rest.length) byEmoji[change.emoji] = rest;
+      else delete byEmoji[change.emoji];
+    }
+    reactions[change.targetEventId] = byEmoji;
+  }
+  batch(() => {
+    if (!loadedScopes()[key]) loadedScopes.set({ ...loadedScopes(), [key]: true });
+    if (fresh.length === 0) return;
+    cursors.set(key, fresh[fresh.length - 1].id);
+    if (reactions) reactionsByScope.set({ ...reactionsByScope(), [key]: reactions });
+    if (shown.length === 0) return;
+    const current = eventsByScope()[key] ?? EMPTY_EVENTS;
+    const next = current.concat(shown);
+    eventsByScope.set({
+      ...eventsByScope(),
+      [key]: next.length > MAX_EVENTS_PER_ROOM ? next.slice(next.length - MAX_EVENTS_PER_ROOM) : next,
+    });
+  });
+  return fresh.length;
+}
+
+// ------------------------------------------------------------------ errors
+
+function handleActionError(error: unknown, what: string, spaceId?: string) {
+  if (isAborted(error)) return;
+  if (error instanceof ApiError && error.kind === "auth") {
+    disconnect(error.message);
+    return;
+  }
+  actionError.set(describe(error, what));
+  if (spaceId && error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) {
+    void lostAccess(spaceId, activeSpaceId() === spaceId ? activeRoomId() : null);
+  } else if (error instanceof ApiError && error.transient) {
+    kick();
+  }
+}
+
+function handleManageError(error: unknown, what: string, spaceId: string) {
+  if (isAborted(error)) return;
+  if (error instanceof ApiError && error.kind === "auth") {
+    disconnect(error.message);
+    return;
+  }
+  manageError.set(describe(error, what));
+  if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) {
+    void lostAccess(spaceId, null).then(() => {
+      // Ownership may have changed: leave the management view if no longer the owner.
+      if (activeSpace()?.role !== "owner" && view() === "manage") closeManage();
+    });
+  }
+}
+
+function isAborted(error: unknown) {
+  return error instanceof ApiError && error.kind === "aborted";
+}
+
+function describe(error: unknown, what: string): string {
+  if (error instanceof ApiError) return error.message;
+  return `${what}: ${String((error as Error)?.message ?? error)}`;
+}

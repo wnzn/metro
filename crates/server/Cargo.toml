@@ -1,0 +1,36 @@
+[package]
+name = "metro-server"
+version = "0.1.0"
+edition = "2024"
+rust-version.workspace = true
+description = "Metro server: private Spaces, threads and personal Chat with durable SQLite history, per-Space runner job queues and Rig agents."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "metro-server"
+path = "src/main.rs"
+
+[lib]
+name = "metro_server"
+path = "src/lib.rs"
+
+[dependencies]
+metro-auth = { path = "../auth" }
+anyhow = "1.0.100"
+getrandom = "0.3"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
+rig-agent = { version = "0.47.0", default-features = false }
+rig-core = { version = "0.47.0", default-features = false, features = ["reqwest", "rustls"] }
+rusqlite = { version = "0.43.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11"
+tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time"] }
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
+uuid = { version = "1.18.1", features = ["v4"] }
+
+[dev-dependencies]
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
+tempfile = "3.27.0"
