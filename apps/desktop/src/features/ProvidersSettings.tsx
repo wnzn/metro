@@ -59,6 +59,8 @@ import { Action, Badge, Banner, BrandMark, BrandPicker, Chip, Column, Field, Lab
 import type { BrandItem, Tone } from "../ui";
 import { describePath, groupCatalog, vendorOf } from "./providerGroups";
 import type { VendorGroup } from "./providerGroups";
+import { LocalDeviceBadge } from "../device/DeviceSetup";
+import { packaged } from "../device/state";
 import { DeviceStatusBadge, deviceStatusText, ListingResult, TokenReveal } from "./TokenReveal";
 
 // Used only when the server's catalog gives no description of its own.
@@ -80,7 +82,12 @@ const SHARE_OPTIONS = [
 
 const SHARE_BADGE: Record<Exclude<ShareVisibility, "personal">, string> = { spaces: "Shared with Spaces", organization: "Shared with organization" };
 
+/** The packaged app sets device connections up itself; it never names a helper process. */
+const PACKAGED_DEVICE_TEXT =
+  "Runs in Metro on this computer, with your own sign-in or key kept here. The Metro server relays requests and never receives them. You connect it next, in Metro.";
+
 function describeProvider(p: CatalogProvider): string {
+  if (p.execution === "device" && packaged()) return PACKAGED_DEVICE_TEXT;
   if (p.description) return p.description;
   if (FALLBACK_DESCRIPTION[p.id]) return FALLBACK_DESCRIPTION[p.id];
   if (p.execution === "device") return "Runs in metro-connector on this computer.";
@@ -226,7 +233,7 @@ function ConnectionList() {
 /** One line on how a saved connection works: its way of connecting, its model, its endpoint. */
 function connectionSummary(c: ProviderConnection): string {
   const p = providerById(c.providerId);
-  const how = p ? describePath(p) : null;
+  const how = p ? describePath(p, { packaged: packaged() }) : null;
   const parts = [how ? `${how.method}${how.variant ? ` (${how.variant})` : ""}` : c.providerId, c.model ? c.model : "no model chosen yet"];
   if (c.baseUrl) parts.push(c.baseUrl);
   return parts.join(" · ");
@@ -278,6 +285,9 @@ function ConnectionRow(props: { connection: ProviderConnection }) {
           </If>
           <If when={device()} else={<Badge tone="neutral" label={c().hasKey ? "Key saved" : "No key"} />}>
             <DeviceStatusBadge connectionId={c().id} />
+            <If when={packaged()}>
+              <LocalDeviceBadge connectionId={c().id} />
+            </If>
           </If>
         </Row>
       </SettingRow>
@@ -345,8 +355,8 @@ function ConnectionRow(props: { connection: ProviderConnection }) {
           <If when={device()}>
             <Action
               testID={`connection-token:${c().id}`}
-              label="New device token"
-              busyLabel="Issuing…"
+              label={packaged() ? (paired() ? "Manage connection" : "Connect this device") : "New device token"}
+              busyLabel={packaged() ? "Opening…" : "Issuing…"}
               busy={busy() === `token:${c().id}`}
               disabled={!!busy()}
               onPress={() => void rotateDeviceToken(c().id)}
@@ -437,7 +447,9 @@ function ConnectionRow(props: { connection: ProviderConnection }) {
           <Column gap={2} testID={`connection-confirm-unpair:${c().id}`}>
             <Banner tone="warning">
               <Label color="warning">
-                {`Unpair “${c().name}”? Its device token stops working at once, so metro-connector on that computer can't serve it until you issue a new token. The connection and its model stay. This doesn't sign you out of Metro.`}
+                {packaged()
+                  ? `Unpair “${c().name}”? The computer it's paired with stops serving it at once, until you connect a device again. The connection and its model stay. This doesn't sign you out of Metro.`
+                  : `Unpair “${c().name}”? Its device token stops working at once, so metro-connector on that computer can't serve it until you issue a new token. The connection and its model stay. This doesn't sign you out of Metro.`}
               </Label>
             </Banner>
             <Row gap={2} justify="end">
@@ -459,7 +471,9 @@ function ConnectionRow(props: { connection: ProviderConnection }) {
             <Banner tone="warning">
               <Label color="warning">
                 {device()
-                  ? `Delete “${c().name}”? Its device token stops working, so metro-connector can't serve it any more.`
+                  ? packaged()
+                    ? `Delete “${c().name}”? No computer can serve it any more.`
+                    : `Delete “${c().name}”? Its device token stops working, so metro-connector can't serve it any more.`
                   : `Delete “${c().name}”? Its stored key is erased.`}
                 {c().isDefault ? ` It's your default ${capability() === "chat" ? "chat" : CAPABILITY_LABEL[capability()]} connection: until you pick another, ${capability() === "chat" ? "runs you start have no personal connection" : `you have no default for ${CAPABILITY_USE[capability()]}`}.` : ""}
                 {shared() ? " It's shared: the people you shared it with lose it at once." : ""}
@@ -724,7 +738,7 @@ function WaysToConnect(props: { group: VendorGroup; chosen: string | null; onCho
     >
       <Each of={props.group.paths} key={(p) => p.id}>
         {(p) => {
-          const how = () => describePath(p());
+          const how = () => describePath(p(), { packaged: packaged() });
           return (
             <SettingRow
               label={`${how().method}${how().variant ? ` · ${how().variant}` : ""}`}
@@ -751,7 +765,7 @@ function WaysToConnect(props: { group: VendorGroup; chosen: string | null; onCho
 
 /** What the chosen way means, shown on its form: the way, where it runs, who pays, what it's for and who can use it. */
 function ChoiceSummary(props: { provider: CatalogProvider }) {
-  const how = () => describePath(props.provider);
+  const how = () => describePath(props.provider, { packaged: packaged() });
   const v = () => vendorOf(props.provider);
   return (
     <Row align="center" gap={2} wrap padX={4} padY={3} testID="provider-choice">
@@ -780,14 +794,22 @@ function DeviceForm(props: { provider: CatalogProvider; onDone: () => void }) {
     props.onDone();
   };
   return (
-    <SettingsGroup title={`New ${props.provider.name} connection`} description="No vendor key or password goes into Metro. You'll get a device token for metro-connector, and you sign in to the provider there." testID="device-form">
+    <SettingsGroup
+      title={`New ${props.provider.name} connection`}
+      description={
+        packaged()
+          ? "No vendor key or password goes to the Metro server. Next, Metro asks your consent and connects this computer: you sign in to the provider here and choose the models it may serve."
+          : "No vendor key or password goes into Metro. You'll get a device token for metro-connector, and you sign in to the provider there."
+      }
+      testID="device-form"
+    >
       <ChoiceSummary provider={props.provider} />
       <SettingRow label="Name" stacked>
         <Field testID="provider-name" accessibilityLabel="Connection name" value={name()} onChange={name.set} maxLength={80} onSubmit={() => void submit()} />
       </SettingRow>
       <Row padX={4} padY={3} gap={2} justify="end">
         <Action label="Cancel" variant="ghost" onPress={props.onDone} />
-        <Action testID="provider-create-device" label="Create and get device token" busyLabel="Creating…" busy={providerBusy() === "create"} variant="primary" onPress={() => void submit()} />
+        <Action testID="provider-create-device" label={packaged() ? "Connect this device" : "Create and get device token"} busyLabel="Creating…" busy={providerBusy() === "create"} variant="primary" onPress={() => void submit()} />
       </Row>
     </SettingsGroup>
   );

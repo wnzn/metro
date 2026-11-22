@@ -55,7 +55,7 @@ libc = "0.2.180"
 
 # desktop: the profile root's protected DACL (current user + SYSTEM).
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Networking_WinSock", "Win32_System_JobObjects", "Win32_System_Threading"] }
 
 [dev-dependencies]
 aws-lc-rs = "1"

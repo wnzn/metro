@@ -178,13 +178,12 @@ to write to the workspace.
 ### Option B: host binary with the Docker sandbox
 
 The Docker sandbox needs a runner that can call a Docker daemon, so run the
-Linux `metro-runner` binary from the release
+Linux runner from the release
 (`Metro-runner-<version>-linux-x64.tar.gz`) on the host. This is also the
 only way a registered runner can offer check and MCP tools. Check the
-archive against its `.sha256` file (`sha256sum -c`), extract it, and run
-`metro-runner`
-with the same environment variables as above (`METRO_SERVER_URL`,
-`METRO_RUNNER_TOKEN` from a mode-600 file, `METRO_WORKSPACE`) plus
+archive against its `.sha256` file (`sha256sum -c`), extract it, and start
+its `run-runner`, which reads the token from the mode-600 file named by
+`METRO_RUNNER_TOKEN_FILE`, never from the command line. Set `METRO_SERVER_URL` and `METRO_WORKSPACE` as above, plus
 `METRO_SANDBOX=docker` and the sandbox settings below. The user that runs it
 needs read access to the workspace (write access for a registered runner's
 base directory) and access to the Docker daemon.

@@ -1409,6 +1409,7 @@ dependencies = [
  "futures",
  "getrandom 0.3.4",
  "image",
+ "libc",
  "metro-auth",
  "metro-connector",
  "metro-model-protocol",
@@ -1425,6 +1426,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

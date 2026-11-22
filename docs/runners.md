@@ -6,6 +6,15 @@ explains the two kinds of runner, who controls each kind, and how to run a
 registered runner in Docker. For the variables and time limits that both
 kinds share, see [runner.md](runner.md).
 
+**Local tools aren't a runner you install.** In the desktop app's own local
+workspace (**Use locally**), a Space's owner can turn on read-only local tools
+instead: `workspace.list` and `workspace.read` over one private folder per
+Space on that computer, with no check, MCP or commands. They're offered
+only when the Space has no runner, and they never replace one. See
+[apps/desktop/README.md](../apps/desktop/README.md#local-tools-on-this-computer).
+Everything on this page is the separately installed runner, run by an
+operator.
+
 ## Two kinds of runner
 
 | | Dedicated runner | Registered runner |

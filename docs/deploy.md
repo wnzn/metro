@@ -7,8 +7,9 @@ source is for contributors: [development.md](development.md).
 
 > **Not published yet.** The repository is
 > <https://github.com/wnzn/metro>. The names below are the verified release
-> targets for version 0.2.0, but no release, file or image exists until it's
-> published. Each release file comes with a `.sha256` file beside it.
+> targets for version 0.2.0. A 0.2.0 candidate has been built and checked
+> locally ([acceptance](acceptance.md)), but no release, file or image
+> exists until it's published. Each release file comes with a `.sha256` file beside it.
 
 | Part | Where | Release-target name |
 | --- | --- | --- |
@@ -18,6 +19,7 @@ source is for contributors: [development.md](development.md).
 | Desktop, Linux x64 | Releases | `Metro-0.2.0-linux-x64.tar.gz` (+ `.sha256`) |
 | Runner, Linux x64 binary | Releases | `Metro-runner-0.2.0-linux-x64.tar.gz` (+ `.sha256`) |
 
+`<tag>` is the release tag, `v` plus the version (for example `v0.2.0`).
 For production, pin images by digest (`…@sha256:…`), not by tag.
 
 ## Install the server

@@ -330,7 +330,12 @@ impl Desktop {
     }
 
     fn stop_monitor(&self) {
-        if let Some(t) = self.monitor.lock().unwrap_or_else(|p| p.into_inner()).take() {
+        if let Some(t) = self
+            .monitor
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take()
+        {
             t.abort();
         }
     }

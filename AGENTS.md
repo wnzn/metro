@@ -212,11 +212,15 @@ runtime.
   `ghcr.io/wnzn/metro-runner`, `Metro-<version>-windows-x64.zip`,
   `Metro-<version>-linux-x64.tar.gz`,
   `Metro-runner-<version>-linux-x64.tar.gz`, each with `.sha256`) and say
-  they aren't published yet. Planned desktop
-  work (Use locally with a bundled local server, on-device integrations
-  owned by the app, sidebar changes) is described as expected, never as
-  shipped. A deployment's own address (such as a dev LAN host) is never a
-  documented default. Over plain HTTP on a LAN, the admin page is a landing
+  they aren't published yet. The desktop app's **Use locally**
+  runs a bundled local server with no token, and its owner-only, per-Space,
+  read-only local tools (`workspace.list`/`workspace.read`) never stand in
+  for an operator's separately installed runner. It and the other features
+  checked in the 0.2.0 Linux candidate are described as verified in that
+  local candidate, never as released. Anything still unchecked (native
+  Windows, end-to-end in-app device setup) is labelled as such. A
+  deployment's own address (such as a dev LAN host) is never a documented
+  default. Over plain HTTP on a LAN, the admin page is a landing
   page only; tokens go over loopback, an SSH port forward or HTTPS.
 - The docs must not claim features that aren't implemented, or results that
   nobody recorded. When code and docs disagree, fix the docs. Record each

@@ -228,6 +228,19 @@ def nsh_resources(ui_dir, source, version):
     }
 
 
+def brand_notice(source, resources):
+    notice = regular(source / "src/ui/icons/LICENSE-brand-marks.txt")
+    text = notice.read_text(encoding="utf-8")
+    shipped = {path.name for path in resources if path.name.startswith("brand-")}
+    recorded = set(re.findall(r"^\s+(brand-[a-z0-9-]+\.svg)\s+<- ", text, re.M))
+    require(bool(shipped) and shipped == recorded,
+            "packaged provider marks must match the brand notice's attribution list")
+    require("@lobehub/icons-static-svg 1.105.0 (MIT)" in text
+            and "MIT License" in text and "Copyright (c) 2023 LobeHub" in text,
+            "expected the pinned LobeHub provider marks attribution and license")
+    return notice
+
+
 def desktop(args, stage):
     platform = args.target.split("-")[0]
     windows = platform == "windows"
@@ -261,11 +274,12 @@ def desktop(args, stage):
     for relative, resource in resources.items():
         copy(resource, stage / "ui/nsh" / relative)
     copy(license_path, stage / "licenses/NSH-LICENSE-APACHE.txt")
+    copy(brand_notice(RENDERER_SOURCE, resources), stage / "licenses/BRAND-MARKS.txt")
     server_name = "metro-server.exe" if windows else "metro-server"
     deps[server_name] = pe(args.server) if windows else elf(args.server, (2, 39))
     copy(args.server, stage / server_name, True)
     write(stage / "START.txt", f"Extract this entire archive. Launch {executable} at the top level.\n"
-          "Choose Open local workspace for a solo workspace, or enter your Metro service URL to sign in.\n"
+          "Choose Use locally for a solo workspace, or enter your Metro service URL to sign in.\n"
           "Keep the bundled server and ui directory next to the launcher.\n\n"
           + prerequisites)
     return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked"}

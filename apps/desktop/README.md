@@ -23,8 +23,8 @@ Check each download against the `.sha256` file published beside it. The
 
 The first screen, **Connect to Metro**, offers two choices:
 
-- **On this computer → Open local workspace:** a private workspace that the
-  app runs on this computer, just for you. It needs no server address or
+- **On this computer → Use locally:** a private workspace that the app
+  runs on this computer, just for you. It needs no server address or
   token, and its data stays on this computer, separate from any server you
   connect to.
 - **Or connect to a server:** the URL and token your admin gave you
@@ -36,7 +36,8 @@ QA ran the packaged candidate in Debian 13 under Xvfb, as a non-root user,
 from a read-only install, with Docker `--network none`
 ([acceptance](../../docs/acceptance.md)). It isn't a release.
 
-- **Local workspace:** **Open local workspace** started the bundled server
+- **Local workspace:** the local button (labelled *Open local workspace* in
+  that candidate; **Use locally** in the final wording) started the bundled server
   with no token or remote service. QA created a Space and posted a message,
   which showed its time. After quitting, the app's listeners and child
   processes had all ended. On reopening, the same room, the message and the
@@ -48,29 +49,58 @@ from a read-only install, with Docker `--network none`
   Linux file picker were saved, and the avatar showed next to the message
   ([screenshot](../../docs/screenshots/settings-profile.png)). Your
   **User ID** is shown here, not in the sidebar.
-- **Sidebar footer:** shows where you're connected (for example *On this
-  device* and its loopback address) and your id.
+- **Sidebar footer:** shows where you're connected and your id. It says
+  *On this device* only when the session is positively identified as this
+  app's own hosted local workspace. Any other server, including one you
+  reach through a manual localhost port forward, shows its actual URL.
 - **Search** is a centered box at the top of the window.
 - **Provider picker:** one searchable dropdown grouped by vendor. Each
   vendor shows how many ways it can be connected and its capabilities. For
   example, OpenAI is one row with three ways to connect.
+  Each vendor's sign-in and key options are grouped under its name. Vendor
+  marks are 21 monochrome SVGs bundled with the app, from
+  `@lobehub/icons-static-svg` (MIT). They're tinted with the theme, shown
+  only beside the vendor's own name, and never fetched over the network.
+  Other providers get a lettermark.
 - **In-app device bridge:** a separate packaged smoke of the app's device
   bridge with the bundled server passed.
 
+### Also verified
+
+- **Local times:** message times are shown in your local time zone. Tests
+  with `Intl` time zones verify the conversion from the server's UTC
+  `created_at` ([spaces.md](../../docs/spaces.md#message-times)).
+
+### Local tools on this computer
+
+In the app's own local workspace, a Space's owner can open **Manage → Local
+tools on this computer → Turn on local tools**. The agents in that Space can
+then list and read files (`workspace.list` and `workspace.read`) in one
+private folder on this computer, per Space, while Metro is open.
+
+- They can't change files, run commands or programs, or see anything else
+  on your disk. Links out of the folder are refused.
+- It's per Space and owner only. It's offered only when the Space has no
+  other runner, and it never replaces one. Turning it off revokes only its
+  own pairing.
+- It's only for this computer's own local workspace, never for a remote
+  server, and never for personal Chat or model access.
+- Checks, MCP and commands, and tools for a shared server, need a separately
+  installed runner run by an operator ([runners.md](../../docs/runners.md)).
+
 ### Not verified yet
 
-- The device-connection setup screens in the candidate still show older
-  `metro-connector` wording, which is being fixed. Setting up a device
-  connection entirely in the app isn't verified end to end. Vendor software
+- **Device connections in the packaged app** now use **Connect this
+  device**, then **Manage connection** once paired, with no terminal. An
+  end-to-end proof of that pairing is pending the final gate. Vendor software
   such as the Claude Code CLI stays separate, and you install it yourself.
 - **Windows:** the candidate opened a Metro window and its server answered
   `/healthz` under Wine. Nobody has checked that it draws or takes input,
   or run it on native Windows.
 - App-wide consistency of icons and type: icons appear in the sidebar and
   Settings, but no app-wide check was recorded.
-- Converting message times to your local time zone hasn't been checked
-  separately. The server sends UTC `created_at`
-  ([spaces.md](../../docs/spaces.md#message-times)).
+- **Local tools** (below) are covered by the app's and server's tests, but
+  aren't in the recorded packaged GUI run yet.
 - Documents & media: the native file picker was verified only for the
   profile picture. Library uploads, and audio and video playback and
   seeking, haven't been verified.
@@ -150,19 +180,26 @@ from a read-only install, with Docker `--network none`
 - **Settings** (sidebar, available with or without any Space):
   - **Runners:** add a named runner, either personal or (for org admins)
     organization-wide. Its token is shown once, masked until you press Show,
-    next to copyable Docker steps: build the image, create a mode-600
-    `runner.env`, then `docker run --env-file ./runner.env` with a named
-    volume mounted at `/workspace`, where each Space gets `spaces/<space id>/`.
+    next to copyable steps for the prebuilt runner of this app's version:
+    either download `Metro-runner-<version>-linux-x64.tar.gz` from Metro
+    Releases, check its `.sha256` and start its `run-runner` with the token in
+    a mode-600 file, or run `ghcr.io/wnzn/metro-runner:v<version>` with
+    `docker run --env-file ./runner.env` and a named volume at `/workspace`.
+    Each Space gets `spaces/<space id>/`. Metro never asks you to build the
+    runner.
     No command or template contains the token. Rotate and delete are offered
     only to whoever manages the runner (its owner, or org admins). Both are
     confirmed first, with the Spaces you can see that use the runner.
   - **Model providers:** the providers come from the server's
-    `/v1/provider-catalog`, and you can search them. **On this device**
-    connections run in your own `metro-connector`. Metro has no vendor key
-    field for them. You get a device token (shown once, masked) with the
-    connector's exact `setup`, `login`, `run` and `status` commands, then
-    **Test connection**. The connector shows as paired, online or offline,
-    and you can unpair it with a confirmation. **Server-stored API profiles**
+    `/v1/provider-catalog`, grouped by vendor in a searchable dropdown.
+    **On this device** connections run inside the packaged app: **Connect
+    this device** pairs it without showing a token, and **Manage
+    connection** follows once paired. Metro has no vendor key field for
+    them. The connection shows as paired, online or offline, and you can
+    unpair it with a confirmation. (A copy of the app run without its
+    launcher, such as a development build, has no device helper and instead
+    shows `metro-connector` commands for a connector an operator already
+    installed on a headless computer.) **Server-stored API profiles**
     take an API key that is sent once and never read back. Custom endpoints
     must match one of the operator's approved URLs exactly. **Save and fetch
     models** lists models, or you enter a model ID by hand when the endpoint
@@ -199,43 +236,20 @@ from a read-only install, with Docker `--network none`
   - Every token or key shown once is wiped from memory when you press Done,
     change page, Space or room, or disconnect. None of them is stored.
 
-## Requirements (contributors)
+## Runtime requirements
 
-- **NSH 0.6.x.** Install the official release with
-  `curl -fsSL https://nsh.dev/install.sh | sh`, which installs to `~/.nsh` and
-  links `~/.local/bin/nsh`, or extract
-  `nsh-linux-x86_64.tar.gz` from <https://github.com/longbridge/nsh/releases>.
-  `nsh.json` pins `>=0.6, <0.7`.
-- **Linux window (`nsh run` / `--target linux`):** glibc ≥ 2.39, GTK ≥ 4.14,
-  and **WebKitGTK 6.0** (`libwebkitgtk-6.0-4`). The NSH Linux host links
+- **Linux x64:** glibc ≥ 2.39, GTK ≥ 4.14 and **WebKitGTK 6.0**
+  (`libwebkitgtk-6.0-4` on Debian and Ubuntu). The app's native host links
   WebKitGTK even though Metro shows no web views. GStreamer is optional.
-- **Headless (`nsh test`, `nsh check`, `nsh build`):** only `nsh`. These run
-  anywhere, CI included.
-- macOS 14+ and Windows 10 1809+ follow NSH's platform support. Metro hasn't
-  been run on either. A Windows x64 package has been built and checked on
-  Linux; see [Windows portable package](#windows-portable-package).
+- **Windows x64:** 64-bit Windows 10 1809 or later, or Windows 11 (see
+  [below](#windows-portable-package)). Not yet tested on native Windows.
+- **macOS:** not tried.
 
-## Commands (contributors)
+Building, testing and capturing screenshots of the app from source are for
+contributors only, in
+[docs/development.md](../../docs/development.md#the-desktop-app).
 
-Run these from `apps/desktop`. Building the rest of Metro from source is in
-[docs/development.md](../../docs/development.md).
-
-```sh
-nsh check                 # TypeScript 7 type check (tsc downloaded once by nsh)
-nsh test                  # headless tests, hermetic: network stubbed, no server needed
-nsh run App.tsx           # open the app in a native window (needs the Linux requirements above)
-nsh package App.tsx --target linux   # .nsh/out/Metro/ and .nsh/out/Metro.tar.gz (NSH's prebuilt release runner)
-```
-
-To work on the UI without the Rust server, use the dev double. It is the
-same in-memory fake the tests use. It has no agent, runner or persistence,
-so never use it as evidence:
-
-```sh
-node dev/mock-server.mjs       # Node >= 22.18; users alice, bob, carol (fake tokens in test/fakeServer.ts)
-```
-
-### Windows portable package
+## Windows portable package
 
 The release file will be `Metro-<version>-windows-x64.zip`, a portable build
 with no installer. The package recorded so far was built locally as
@@ -256,71 +270,7 @@ Windows N editions may also need the Media Feature Pack.
 The package holds no credentials and no server. Point it at your Metro
 server, and use HTTPS when the server is remote.
 
-### Screenshots (native Linux, isolated)
-
-`dev/screenshots/` runs the real `metro-server` and `metro-runner` on loopback
-with a temp database, workspace and tokens. It drives the app in NSH's GTK
-host on a private Xvfb display inside a container. The screenshot steps:
-
-1. Bob @mentions Alice from his app.
-2. Alice's app captures the connect screen before any secret is entered.
-3. Alice reacts, posts, runs Demo (one collapsed Runner activity group), and
-   opens Manage.
-4. With a model: Alice asks `@agent what is in the workspace?`. One real Rig
-   turn calls `workspace.list` on the runner. `agent-thinking.png` shows the
-   turn live and collapsed ("Metro is thinking…", 2 steps) while the model
-   holds its answer. `agent-activity-expanded.png` shows the finished turn
-   ("Metro’s activity") opened to its call and listing.
-5. Alice opens Settings. Runners shows a personal and an organization runner,
-   both created through the API. Model providers saves a keyless connection
-   to the allowlisted local fixture, lists its models and picks one. Device
-   onboarding creates a device connection and shows its token masked, with
-   the connector shown as offline. Then Appearance, and the Website Space,
-   which the organization runner serves (a second real `metro-runner` with a
-   `metro_rt_v2_` token).
-
-Tokens and the provider master key (`METRO_PROVIDER_KEY_FILE`) live only in
-mode-600 files inside the temp directory, which is removed on exit. The
-script fails if any of them turns up under the output directory or the app.
-
-```sh
-docker build -t metro-desktop-shots:trixie dev/screenshots
-dev/screenshots/capture.sh ../../docs/screenshots      # NSH_DIST=… if nsh isn't on PATH; METRO_BIN=… for other binaries
-```
-
-The agent shots (`agent-thinking.png`, `agent-activity-expanded.png`,
-`chat-runs.png`, `thread.png`) need a model. By default
-the script starts `scripted_model.py`, a deterministic local OpenAI-compatible
-stand-in for the model only. The server, Rig, the tool call, the runner and
-its listing are all real, and the stand-in's replies say "Scripted test
-model". To use a real model instead, set `MODEL_ENV_FILE` to a mode-600 file
-of `METRO_MODEL*` lines. To skip the agent shots, set `SCRIPTED_MODEL=0`.
-The scripted model also answers a keyless `GET /v1/models`. It is the only
-allowlisted provider endpoint (`METRO_PROVIDER_ALLOWED_BASE_URLS`), so
-`settings-providers.png` and `settings-device-onboarding.png` are captured
-only with it.
-
-### Model routing and sharing screenshots
-
-`dev/screenshots/capture-routing.sh` runs the real `metro-server` with four
-loopback fixture vendors from `tests/e2e/intelligence.py` (System One,
-embeddings and two OpenAI-compatible chat endpoints; `typed_fixtures.py`).
-Nothing reaches a real vendor. Alice and Bob's connections, the shares and
-Alice's routing are set up through the API with throwaway keys. Then the
-app, from a disposable copy in the temp directory (so the step file `nsh
-test` writes, which holds the typed token, never lands in the checkout),
-captures `model-routing.png`, `model-routing-dataflow.png`,
-`model-sharing.png` and `route-attribution.png`. The last one is a real
-turn: Alice's unaddressed message, judged by the System One fixture under
-her opt-in and routed to a use case that Bob's shared connection answers.
-The script fails if a fixture rejected a request, or if any token or key
-turns up under the output or the app.
-
-```sh
-dev/screenshots/capture-routing.sh ../../docs/screenshots   # same image and NSH_DIST / METRO_BIN as above
-```
-
-## Layout
+## Layout (contributors)
 
 ```text
 App.tsx                 entry: the connect screen or the signed-in shell

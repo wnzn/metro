@@ -149,8 +149,8 @@ locally with real PDF and DOCX bytes, scripted media vectors, and a 3 MiB
 and an 8 MiB payload through the device relay
 ([details](docs/acceptance.md#demonstrated-documents--media-with-synthetic-fixtures-2026-11-22-qa-local)).
 **No pretrained weights were downloaded, so ranking quality hasn't been
-tested.** Native audio and video playback, seeking and the native file
-picker weren't verified.
+tested.** Native audio and video playback, seeking, and the native file
+picker for library uploads weren't verified.
 
 ## Install and use (prebuilt only)
 
@@ -164,17 +164,19 @@ contributors and lives in [docs/development.md](docs/development.md).
 > (each with a `.sha256`) on the
 > [Releases page](https://github.com/wnzn/metro/releases), and the images
 > `ghcr.io/wnzn/metro-server` and `ghcr.io/wnzn/metro-runner` on GitHub
-> Container Registry. These names are verified targets, but none of them
+> Container Registry. These names are verified targets. A 0.2.0 candidate
+> has been built and checked locally, but none of these files or images
 > exists until the release is published
 > ([docs/deploy.md](docs/deploy.md#release-files-and-images)).
 
 There are two ways to use Metro:
 
-- **On your own (solo).** Install the desktop app and choose **Open local
-  workspace**. The app starts its bundled Metro server on this computer,
+- **On your own (solo).** Install the desktop app and choose **Use
+  locally**. The app starts its bundled Metro server on this computer,
   just for you, and keeps your data between launches. There's no server
   URL, environment file or token to set up, and the data is separate from
-  any server you connect to. Verified with the 0.2.0 Linux candidate
+  any server you connect to. Verified with the 0.2.0 Linux candidate,
+  where the button was still labelled *Open local workspace*
   ([acceptance](docs/acceptance.md)). On Windows it has only been started
   under Wine.
 - **With other people (shared server).** One operator runs the Metro server
@@ -256,7 +258,7 @@ Download the desktop build for your system from the Releases page.
   (Windows 10 1809+ or 11, x64). It hasn't been tested on native Windows
   ([status](apps/desktop/README.md#windows-portable-package)).
 
-- **Solo:** choose **Open local workspace** under *On this computer*.
+- **Solo:** choose **Use locally** under *On this computer*.
 - **Shared server:** enter the server URL from step 2 and paste the token
   your admin gave you. There's no built-in login yet. Close token files
   before you screen-share.
@@ -276,9 +278,19 @@ Download the desktop build for your system from the Releases page.
   [docs/settings.md](docs/settings.md#operator-settings)) for people who
   haven't chosen one.
 
-### 5. Optional: a runner for a Space's files
+### 5. Optional: tools over a Space's files
 
-A runner gives a Space's agent list and read tools over a directory on the
+**In your local workspace: local tools.** In a Space you own in your own
+local workspace, **Manage → Local tools on this computer → Turn on local
+tools** lets that Space's agent list and read files (`workspace.list`,
+`workspace.read`) in one private folder on this computer, per Space, while
+Metro is open. The agent can't change files, run commands or see anything
+else on your disk. There's nothing extra to install, and it's only offered
+when the Space has no other runner. It's tested in the app's and server's
+test suites, but it isn't in the recorded packaged GUI run yet.
+
+**On a shared server, or for checks and commands: a runner.** An operator
+installs it separately. A runner gives a Space's agent list and read tools over a directory on the
 machine that runs it. It's published as a container image and as a Linux
 binary, and needs **Linux ≥ 5.6** because it confines file access with
 `openat2`. The image runs as UID/GID 1000, so the directory you mount must

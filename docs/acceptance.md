@@ -39,6 +39,21 @@ with Docker `--network none`.
 | Strict clippy | Passed |
 | `tests/e2e/smoke.py` and `tests/e2e/threads.py` against the server built with timestamps and profiles | Passed |
 
+**Later receipts, same day.** The final local button label is **Use
+locally** (accessible id `open-local`), replacing the candidate's *Open
+local workspace*, which the steps above record as seen. Provider marks are
+21 bundled monochrome SVGs (`@lobehub/icons-static-svg`, MIT), with no
+network fetch, and names and sign-in options are grouped by vendor. The
+conversion of message times to the local time zone is verified by tests
+with `Intl` time zones. The packaged pairing buttons are now **Connect this
+device** and **Manage connection**. An end-to-end proof of pairing is
+pending the final gate. All seven current end-to-end scripts
+(`smoke.py`, `threads.py`, `settings.py`, `device_connector.py`,
+`intelligence.py`, `schedules.py`, `library.py`) passed in an independent
+run. Local tools (read-only
+`workspace.list` and `workspace.read`, per Space) are covered by the app's
+and server's tests but aren't in a recorded packaged GUI run.
+
 Not covered: native Windows, macOS, any real vendor account, and Documents
 & media in the candidate. The native file picker was verified for the
 profile picture only, not for library uploads, and audio and video playback
@@ -809,7 +824,7 @@ Desktop, from `apps/desktop`: `nsh check`, `nsh test` and `nsh build App.tsx`.
 `nsh check` and `nsh test` are headless, and the tests use an in-memory fake
 server. To recreate the native
 screenshots against real binaries, see
-[apps/desktop/README.md](../apps/desktop/README.md#screenshots-native-linux-isolated).
+[development.md](development.md#screenshots-native-linux-isolated).
 
 To check Compose by hand, follow the [README quickstart](../README.md). In a
 throwaway checkout, set `COMPOSE_PROJECT_NAME` in `.env` to keep the run

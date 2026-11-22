@@ -4,6 +4,7 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, fakeServer, header, TOKENS, world } from "./test/fakeServer";
+import { serverPlace } from "./src/features/Sidebar";
 
 async function openApp(f: ReturnType<typeof fakeServer>, storage: Record<string, string> = {}) {
   return open("./App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
@@ -537,6 +538,25 @@ test("Appearance is a Settings page", async () => {
   expect(app.shows("id:appearance-settings")).toBe(true);
 });
 
+test("the footer says On this device only for the app-hosted workspace, never from a loopback URL", () => {
+  // A loopback URL may be a port forward to another computer: it shows as itself.
+  expect(serverPlace("http://127.0.0.1:8787", false)).toEqual({ local: false, title: "127.0.0.1:8787", detail: "http://127.0.0.1:8787" });
+  expect(serverPlace("http://localhost:9000", false).title).toBe("localhost:9000");
+  expect(serverPlace("https://metro.example.org", false).title).toBe("metro.example.org");
+  expect(serverPlace("http://127.0.0.1:41234", true)).toEqual({ local: true, title: "On this device", detail: "http://127.0.0.1:41234" });
+  expect(serverPlace(null, false).title).toBe("Not connected");
+});
+
+test("a manually connected loopback server shows its actual address in the footer", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await app.waitFor("id:active-server");
+  expect(app.texts()).toContain("127.0.0.1:8787"); // the host it connected to
+  expect(app.texts()).toContain(BASE); // and the full URL
+  expect(text(app)).not.toContain("On this device");
+});
+
 test("Settings opens as a modal over a room and closes back to the same room and draft", async () => {
   const f = world();
   const app = await openApp(f);
@@ -602,6 +622,11 @@ test("the provider picker is one compact drop-down; OpenAI and Anthropic each gr
   expect(app.shows("id:provider-picker:anthropic")).toBe(true);
   expect(app.shows("id:provider-picker:custom")).toBe(true);
   expect(app.shows("id:provider-picker:device-openai-oauth")).toBe(false);
+  // Bundled marks for named providers; a lettermark for custom and self-hosted endpoints.
+  expect(app.shows("id:provider-picker:openai >> id:mark-logo:openai")).toBe(true);
+  expect(app.shows("id:provider-picker:anthropic >> id:mark-logo:anthropic")).toBe(true);
+  expect(app.shows("id:provider-picker:custom >> id:mark-letters:{}")).toBe(true);
+  expect(app.shows("id:provider-picker:custom >> id:mark-logo:openai")).toBe(false);
   await app.press("id:provider-picker:openai");
   await app.waitFor("id:provider-ways:openai");
   expect(app.shows("id:provider:device-openai-oauth")).toBe(true);
@@ -638,6 +663,8 @@ test("saved connections are grouped by provider, two ways of one provider under 
   expect(app.shows(`id:connection-group:openai >> id:connection:${api.id}`)).toBe(true);
   expect(app.shows(`id:connection-group:openai >> id:connection:${sub.id}`)).toBe(true);
   expect(app.shows(`id:connection-group:custom >> id:connection:${emb.id}`)).toBe(true);
+  expect(app.count("id:connection-group:openai >> id:mark-logo:openai")).toBe(1); // one heading for both ways
+  expect(app.shows("id:connection-group:custom >> id:mark-letters:{}")).toBe(true);
   expect(app.shows(`id:connection:${api.id} >> text:/API key · gpt-fixture-2/`)).toBe(true);
   expect(app.shows(`id:connection:${sub.id} >> text:/Sign in with ChatGPT · gpt-sub/`)).toBe(true);
   // Compact until opened: management controls stay hidden.

@@ -125,8 +125,9 @@ author and recipients, so it can tell a question for Bob from one for itself.
 
 **Status.** Verified at the API and in model context with scripted providers
 ([acceptance](acceptance.md#staged-profiles-and-message-times-api-2026-11-22-project-manager-local)).
-The 0.2.0 Linux candidate shows each message's time and a day divider.
-Converting to your local time zone hasn't been checked separately. The live
+The desktop app shows each message's time, in your local time zone, and a
+day divider. The conversion is verified by tests with `Intl` time zones, and
+the 0.2.0 Linux candidate showed the times. The live
 dev service's timestamp reads were checked too.
 
 - **Events carry `created_at`.** Every event returned over HTTP, in rooms,

@@ -31,6 +31,15 @@ async function openLibrary(app: App) {
   await app.waitFor("id:library-view");
 }
 
+/** Resolves when `cond()` holds (checked every 10 ms); fails after 20 s. */
+async function poll(cond: () => boolean, ms = 20_000) {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("condition not reached: " + cond.toString());
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+
 const text = (app: App) => app.texts().join(" | ");
 const enc = new TextEncoder();
 const lib = (w: W, path: string, method = "GET") => w.l.log.filter((r) => r.path === path && r.method === method);
@@ -302,11 +311,23 @@ test("losing a Space drops its files, results and an open preview; signing out d
   expect(app.shows(`id:library-file:${s.sideByBob.id}`)).toBe(false);
 
   // A slow read that answers after sign-out shows nothing to the next user.
-  w.l.contentDelay = 600;
-  await app.press("text:Open at section");
-  await app.waitFor("id:library-viewer-loading");
-  await app.press("id:disconnect");
-  await app.waitFor("id:connect");
+  // The driver's press() waits for in-flight requests, so a parked read would
+  // block it. The read is therefore held on a gate and the sequence is driven
+  // by conditions, never by elapsed time: once the server has the read parked
+  // (so "Opening…" is up), sign out; once the app shows the signed-out screen,
+  // release the answer. However slow the machine is, Alice's answer always
+  // arrives after she signed out, and loading is observed while it is parked.
+  const release = w.holdContent();
+  const opening = app.press("text:Open at section");
+  await poll(() => w.l.contentParked === 1);
+  const sawLoading = app.shows("id:library-viewer-loading");
+  const signingOut = app.press("id:disconnect");
+  await poll(() => app.shows("id:connect"));
+  expect(w.l.contentParked).toBe(1); // sign-out didn't wait for the read
+  expect(w.l.contentReleased).toBe(0);
+  release();
+  await Promise.all([opening, signingOut]);
+  expect(sawLoading).toBe(true);
   await app.type("id:access-token", TOKENS.bob!);
   await app.press("id:connect");
   await app.waitFor("id:top-search");
@@ -316,8 +337,13 @@ test("losing a Space drops its files, results and an open preview; signing out d
   expect(app.shows("id:library-view")).toBe(false);
   await app.press("id:search-surface:library");
   await app.waitFor("id:library-view");
-  await app.wait(800);
   expect(app.shows("id:library-viewer")).toBe(false);
+  // Alice's read was answered only after Bob's session began; wait until the
+  // server really sent it, then give the app a moment to (wrongly) render it.
+  await app.waitUntil(() => w.l.contentParked === 0 && w.l.contentReleased === 1);
+  await app.wait(300);
+  expect(app.shows("id:library-viewer")).toBe(false);
+  expect(app.shows("id:library-viewer-loading")).toBe(false);
   expect(text(app)).not.toContain("The rollback plan");
   expect(text(app)).not.toContain("notes.md");
 });

@@ -125,6 +125,21 @@ class PackageTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "not a regular release file"):
                 package.nsh_resources(ui, source, "0.2.0")
 
+    def test_brand_notice_must_cover_every_shipped_mark(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory)
+            icons = source / "src/ui/icons"
+            icons.mkdir(parents=True)
+            notice = icons / "LICENSE-brand-marks.txt"
+            notice.write_text("@lobehub/icons-static-svg 1.105.0 (MIT)\n"
+                              "  brand-example.svg <- upstream.svg\n"
+                              "MIT License\nCopyright (c) 2023 LobeHub\n")
+            resources = {Path("assets/src/ui/icons/brand-example.svg")}
+            self.assertEqual(package.brand_notice(source, resources), notice)
+            resources.add(Path("assets/src/ui/icons/brand-unlisted.svg"))
+            with self.assertRaisesRegex(ValueError, "attribution list"):
+                package.brand_notice(source, resources)
+
 
 if __name__ == "__main__":
     unittest.main()

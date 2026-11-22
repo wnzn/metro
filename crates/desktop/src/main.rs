@@ -25,12 +25,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::Duration;
 
-use metro_connector::SafeError;
 use metro_connector::desktop::bridge::{self, ENV_TOKEN, ENV_URL};
 use metro_connector::desktop::core::{Desktop, DesktopConfig};
-use metro_connector::desktop::local::{
-    BoxFut, LocalState, LocalWorkspace, LocalWorkspaceHost, ToolsHook,
-};
+use metro_connector::desktop::local::{LocalWorkspaceHost, ToolsHook};
 use metro_connector::desktop::store;
 use metro_connector::desktop_local::LocalServer;
 use metro_connector::desktop_tools::DesktopTools;
@@ -241,7 +238,7 @@ async fn launch() -> Result<u8, String> {
         (Some(bin), true) => {
             let data = root.join("local");
             match store::prepare_private_dir(&data) {
-                Ok(()) => Some(Arc::new(Packaged(LocalServer::new(bin.clone(), data)))),
+                Ok(()) => Some(Arc::new(LocalServer::new(bin.clone(), data))),
                 Err(e) => {
                     eprintln!("Metro: the local workspace is unavailable: {e}");
                     None
@@ -317,26 +314,6 @@ async fn launch() -> Result<u8, String> {
     drop(desktop);
     drop(lock);
     Ok(exit_code(status))
-}
-
-/// The bundled local server, with its running URL and bearer exposed to
-/// the bridge in process (so the tools lane can recognise this app's own
-/// hosted session).
-struct Packaged(LocalServer);
-
-impl LocalWorkspaceHost for Packaged {
-    fn open(&self) -> BoxFut<'_, Result<LocalWorkspace, SafeError>> {
-        self.0.open()
-    }
-    fn state(&self) -> LocalState {
-        LocalWorkspaceHost::state(&self.0)
-    }
-    fn shutdown(&self) -> BoxFut<'_, ()> {
-        LocalWorkspaceHost::shutdown(&self.0)
-    }
-    fn current(&self) -> Option<LocalWorkspace> {
-        LocalServer::current(&self.0)
-    }
 }
 
 /// Local workspace tools (read-only folders per hosted Space), primary

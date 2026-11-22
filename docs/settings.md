@@ -26,7 +26,9 @@ As seen in the 0.2.0 Linux candidate:
     vendor and searchable (**Search providers**). Each vendor is one row
     showing how many ways it can be connected and its capabilities. For
     example, OpenAI is one row with three ways to connect, covering Chat
-    and Embeddings.
+    and Embeddings. Vendor marks are bundled with the app (monochrome SVGs
+    from `@lobehub/icons-static-svg`, MIT) and never fetched over the
+    network.
   - **Connect <vendor>:** the ways to connect that vendor, each with its
     capability and a **Choose** button. Ways on your device (your own
     sign-in or key stays on your computer) are preferred. Ways stored on the
@@ -186,14 +188,13 @@ With a device connection, inference runs on your own machine (a laptop, or an
 always-on personal machine), using your own vendor sign-in or your own API
 key. The server relays each request to your machine and the answer back.
 
-> **Status.** Ordinary users only install the desktop app. The **0.2.0
-> candidate's desktop app includes an in-app device bridge** that serves
-> device connections while it's open, so there's no separate program or
-> terminal. A packaged smoke of that bridge with the bundled server passed.
-> Its setup screens still show older `metro-connector` wording, which is
-> being fixed. Setting up a device connection entirely in the app (pairing,
-> vendor sign-in, a real model) isn't verified end to end, and no real
-> vendor account has been used. The standalone `metro-connector` CLI remains
+> **Status.** Ordinary users only install the desktop app. The packaged
+> desktop app includes a device bridge that serves device connections while
+> it's open, so there's no separate program or terminal. A packaged smoke of
+> that bridge with the bundled server passed. In the packaged app you pair
+> with **Connect this device**, and later use **Manage connection**. An
+> end-to-end proof of that pairing (with vendor sign-in and a real model)
+> is pending the final gate, and no real vendor account has been used. The standalone `metro-connector` CLI remains
 > contributor tooling
 > ([development.md](development.md#metro-connector-developer-cli)).
 >
@@ -210,17 +211,19 @@ agent loop, on the Space's runner as usual, and never on your device.
 ### Create the connection and its device token
 
 In **Settings → Model providers**, add a connection with a way to connect
-that runs on your device (a `device-*` provider). Then click **New device
+that runs on your device (a `device-*` provider). In the packaged app,
+click **Connect this device**; the app pairs itself and never shows you the
+token. Development builds without the launcher instead offer **New device
 token**. The token starts with `metro_pc_`. It's shown **once**, masked
 unless you click **Show**, and the server keeps only a hash. Only the
 connection's owner can create, replace or revoke it. Creating it again
 replaces the old one, and revoking it or deleting the connection fails that
 connection's pending jobs.
 
-Earlier development builds then showed a **Set up metro-connector** guide
-([screenshot](screenshots/settings-device-onboarding.png)). The candidate's
-wording here is being reworked for the in-app bridge. The app never signs
-in to a vendor CLI for you. **Test
+Once paired, the button becomes **Manage connection**. Earlier development
+builds showed a **Set up metro-connector** guide instead
+([screenshot](screenshots/settings-device-onboarding.png)). The app never
+signs in to a vendor CLI for you. **Test
 connection** lists models once the device is online. Don't paste the token
 into a command line or a chat.
 

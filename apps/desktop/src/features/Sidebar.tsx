@@ -1,5 +1,5 @@
 import { Clipboard, signal } from "nsh";
-import { isLoopbackHost } from "../api/serverUrl";
+import { onLocalWorkspace } from "../localWorkspace";
 import {
   activeRoomId,
   activeSpaceId,
@@ -196,13 +196,17 @@ function RoomTree() {
   );
 }
 
-/** Where this session is connected: "On this device" for a loopback server, else the server's host. */
-export function serverPlace(url: string | null): { local: boolean; title: string; detail: string } {
+/**
+ * Where this session is connected. "On this device" only for the workspace
+ * this app itself hosts (`hosted`: src/localWorkspace.ts `onLocalWorkspace`),
+ * never from the URL: a loopback address may be a port forward to another
+ * computer. Every other session shows the host and URL it connected to.
+ */
+export function serverPlace(url: string | null, hosted: boolean): { local: boolean; title: string; detail: string } {
   if (!url) return { local: false, title: "Not connected", detail: "" };
+  if (hosted) return { local: true, title: "On this device", detail: url };
   try {
-    const parsed = new URL(url);
-    const local = isLoopbackHost(parsed.hostname);
-    return { local, title: local ? "On this device" : parsed.host, detail: url };
+    return { local: false, title: new URL(url).host, detail: url };
   } catch {
     return { local: false, title: url, detail: url };
   }
@@ -221,7 +225,7 @@ function ServerFooter() {
       })
       .catch(() => {});
   };
-  const server = () => serverPlace(connectedTo());
+  const server = () => serverPlace(connectedTo(), onLocalWorkspace());
   return (
     <Column padX={3} padY={3} gap={2} testID="server-footer">
       <Row align="center" gap={2} accessibilityLabel={`Connected to ${server().title}${server().local ? `, ${server().detail}` : ""}`} testID="active-server">

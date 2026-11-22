@@ -90,6 +90,20 @@ fn command(dir: &Path, launcher: &Path, out: &Path, home: &str) -> Command {
     c
 }
 
+/// Copying an executable while other tests fork can briefly leave it "busy"
+/// (ETXTBSY) in a forked child that hasn't exec'd yet: retry.
+fn retry<T>(mut f: impl FnMut() -> std::io::Result<T>) -> T {
+    for _ in 0..50 {
+        match f() {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                std::thread::sleep(Duration::from_millis(20))
+            }
+            r => return r.unwrap(),
+        }
+    }
+    f().unwrap()
+}
+
 fn wait_file(p: &Path) -> Value {
     let t = Instant::now();
     loop {
@@ -114,7 +128,7 @@ fn launches_the_packaged_ui_with_a_private_bridge_and_cleans_up() {
     let dir = scratch("ok");
     let launcher = layout(&dir, true);
     let out = dir.join("ui.json");
-    let o = command(&dir, &launcher, &out, "home").output().unwrap();
+    let o = retry(|| command(&dir, &launcher, &out, "home").output());
     assert_eq!(
         o.status.code(),
         Some(7),
@@ -165,9 +179,7 @@ fn launches_the_packaged_ui_with_a_private_bridge_and_cleans_up() {
 fn refuses_an_incomplete_install() {
     let dir = scratch("missing");
     let launcher = layout(&dir, false);
-    let o = command(&dir, &launcher, &dir.join("ui.json"), "home")
-        .output()
-        .unwrap();
+    let o = retry(|| command(&dir, &launcher, &dir.join("ui.json"), "home").output());
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("incomplete"));
 
@@ -176,9 +188,7 @@ fn refuses_an_incomplete_install() {
     std::fs::write(&target, FAKE_UI).unwrap();
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
     std::os::unix::fs::symlink(&target, dir.join("app/ui/Metro")).unwrap();
-    let o = command(&dir, &launcher, &dir.join("ui.json"), "home")
-        .output()
-        .unwrap();
+    let o = retry(|| command(&dir, &launcher, &dir.join("ui.json"), "home").output());
     assert_eq!(o.status.code(), Some(1));
     assert!(!dir.join("ui.json").exists());
     std::fs::remove_dir_all(&dir).unwrap();
@@ -191,7 +201,7 @@ fn stopping_the_launcher_ends_the_ui_and_a_second_instance_is_secondary() {
     let out = dir.join("first.json");
     let mut first = command(&dir, &launcher, &out, "home");
     first.env("FAKE_UI_MODE", "sleep");
-    let mut first = first.spawn().unwrap();
+    let mut first = retry(|| first.spawn());
     let r = wait_file(&out);
     let pid = r["pid"].as_i64().unwrap();
     assert_eq!(r["status"]["instance"], "primary");
@@ -203,7 +213,7 @@ fn stopping_the_launcher_ends_the_ui_and_a_second_instance_is_secondary() {
 
     // Same user, same data root: the second window serves nothing.
     let out2 = dir.join("second.json");
-    let o = command(&dir, &launcher, &out2, "home").output().unwrap();
+    let o = retry(|| command(&dir, &launcher, &out2, "home").output());
     assert_eq!(o.status.code(), Some(7));
     assert_eq!(wait_file(&out2)["status"]["instance"], "secondary");
 
@@ -243,7 +253,7 @@ fn the_ui_dies_with_a_killed_launcher() {
     let out = dir.join("ui.json");
     let mut c = command(&dir, &launcher, &out, "home");
     c.env("FAKE_UI_MODE", "sleep");
-    let mut child = c.spawn().unwrap();
+    let mut child = retry(|| c.spawn());
     let pid = wait_file(&out)["pid"].as_i64().unwrap();
     child.kill().unwrap(); // SIGKILL: no cleanup code runs in the launcher
     child.wait().unwrap();
@@ -280,7 +290,7 @@ fn local_workspace_through_the_launcher() {
     let out = dir.join("ui.json");
     let mut c = command(&dir, &launcher, &out, "home");
     c.env("FAKE_UI_MODE", "local");
-    let o = c.output().unwrap();
+    let o = retry(|| c.output());
     let r = wait_file(&out);
     assert_eq!(
         o.status.code(),

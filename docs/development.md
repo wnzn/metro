@@ -14,7 +14,7 @@ Everything below builds from a checkout of
   `crates/`.
 - Docker with Compose v2 for the local stack and images.
 - [Native Shell](https://nsh.dev) 0.6.x for `apps/desktop` (see
-  [apps/desktop/README.md](../apps/desktop/README.md#requirements-contributors)).
+  [the desktop requirements](#requirements)).
 - `python3` and `openssl` for the e2e scripts and the token helpers.
 
 ## Local stack from source
@@ -86,10 +86,110 @@ way to change the image's built-in user; the published image uses
 
 ## The desktop app
 
-From `apps/desktop`: `nsh check`, `nsh test`, `nsh run App.tsx`, and
-`nsh package App.tsx --target linux`. Details, the Windows package checks
-and the screenshot harness are in
-[apps/desktop/README.md](../apps/desktop/README.md#commands-contributors).
+The app lives in `apps/desktop` and is written in TSX on
+[Native Shell](https://nsh.dev). Users install the prebuilt app instead
+([apps/desktop/README.md](../apps/desktop/README.md)).
+
+### Requirements
+
+- **NSH 0.6.x.** Install the official release with
+  `curl -fsSL https://nsh.dev/install.sh | sh`, which installs to `~/.nsh` and
+  links `~/.local/bin/nsh`, or extract
+  `nsh-linux-x86_64.tar.gz` from <https://github.com/longbridge/nsh/releases>.
+  `nsh.json` pins `>=0.6, <0.7`.
+- **Linux window (`nsh run` / `--target linux`):** glibc ≥ 2.39, GTK ≥ 4.14,
+  and **WebKitGTK 6.0** (`libwebkitgtk-6.0-4`). The NSH Linux host links
+  WebKitGTK even though Metro shows no web views. GStreamer is optional.
+- **Headless (`nsh test`, `nsh check`, `nsh build`):** only `nsh`. These run
+  anywhere, CI included.
+- macOS 14+ and Windows 10 1809+ follow NSH's platform support. Metro hasn't
+  been run on either. A Windows x64 package has been built and checked on
+  Linux; see [apps/desktop/README.md](../apps/desktop/README.md#windows-portable-package).
+
+### Commands
+
+Run these from `apps/desktop`.
+
+```sh
+nsh check                 # TypeScript 7 type check (tsc downloaded once by nsh)
+nsh test                  # headless tests, hermetic: network stubbed, no server needed
+nsh run App.tsx           # open the app in a native window (needs the Linux requirements above)
+nsh package App.tsx --target linux   # .nsh/out/Metro/ and .nsh/out/Metro.tar.gz (NSH's prebuilt release runner)
+```
+
+To work on the UI without the Rust server, use the dev double. It is the
+same in-memory fake the tests use. It has no agent, runner or persistence,
+so never use it as evidence:
+
+```sh
+node dev/mock-server.mjs       # Node >= 22.18; users alice, bob, carol (fake tokens in test/fakeServer.ts)
+```
+
+### Screenshots (native Linux, isolated)
+
+Run these from `apps/desktop`.
+
+`dev/screenshots/` runs the real `metro-server` and `metro-runner` on loopback
+with a temp database, workspace and tokens. It drives the app in NSH's GTK
+host on a private Xvfb display inside a container. The screenshot steps:
+
+1. Bob @mentions Alice from his app.
+2. Alice's app captures the connect screen before any secret is entered.
+3. Alice reacts, posts, runs Demo (one collapsed Runner activity group), and
+   opens Manage.
+4. With a model: Alice asks `@agent what is in the workspace?`. One real Rig
+   turn calls `workspace.list` on the runner. `agent-thinking.png` shows the
+   turn live and collapsed ("Metro is thinking…", 2 steps) while the model
+   holds its answer. `agent-activity-expanded.png` shows the finished turn
+   ("Metro’s activity") opened to its call and listing.
+5. Alice opens Settings. Runners shows a personal and an organization runner,
+   both created through the API. Model providers saves a keyless connection
+   to the allowlisted local fixture, lists its models and picks one. Device
+   onboarding creates a device connection and shows its token masked, with
+   the connector shown as offline. Then Appearance, and the Website Space,
+   which the organization runner serves (a second real `metro-runner` with a
+   `metro_rt_v2_` token).
+
+Tokens and the provider master key (`METRO_PROVIDER_KEY_FILE`) live only in
+mode-600 files inside the temp directory, which is removed on exit. The
+script fails if any of them turns up under the output directory or the app.
+
+```sh
+docker build -t metro-desktop-shots:trixie dev/screenshots
+dev/screenshots/capture.sh ../../docs/screenshots      # NSH_DIST=… if nsh isn't on PATH; METRO_BIN=… for other binaries
+```
+
+The agent shots (`agent-thinking.png`, `agent-activity-expanded.png`,
+`chat-runs.png`, `thread.png`) need a model. By default
+the script starts `scripted_model.py`, a deterministic local OpenAI-compatible
+stand-in for the model only. The server, Rig, the tool call, the runner and
+its listing are all real, and the stand-in's replies say "Scripted test
+model". To use a real model instead, set `MODEL_ENV_FILE` to a mode-600 file
+of `METRO_MODEL*` lines. To skip the agent shots, set `SCRIPTED_MODEL=0`.
+The scripted model also answers a keyless `GET /v1/models`. It is the only
+allowlisted provider endpoint (`METRO_PROVIDER_ALLOWED_BASE_URLS`), so
+`settings-providers.png` and `settings-device-onboarding.png` are captured
+only with it.
+
+### Model routing and sharing screenshots
+
+`dev/screenshots/capture-routing.sh` runs the real `metro-server` with four
+loopback fixture vendors from `tests/e2e/intelligence.py` (System One,
+embeddings and two OpenAI-compatible chat endpoints; `typed_fixtures.py`).
+Nothing reaches a real vendor. Alice and Bob's connections, the shares and
+Alice's routing are set up through the API with throwaway keys. Then the
+app, from a disposable copy in the temp directory (so the step file `nsh
+test` writes, which holds the typed token, never lands in the checkout),
+captures `model-routing.png`, `model-routing-dataflow.png`,
+`model-sharing.png` and `route-attribution.png`. The last one is a real
+turn: Alice's unaddressed message, judged by the System One fixture under
+her opt-in and routed to a use case that Bob's shared connection answers.
+The script fails if a fixture rejected a request, or if any token or key
+turns up under the output or the app.
+
+```sh
+dev/screenshots/capture-routing.sh ../../docs/screenshots   # same image and NSH_DIST / METRO_BIN as above
+```
 
 ## metro-connector (developer CLI)
 

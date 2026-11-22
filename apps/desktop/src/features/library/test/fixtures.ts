@@ -33,8 +33,17 @@ export function libraryWorld() {
     settings: new Map<string, string | null>(),
     /** Server-configured file limit (bytes). */
     maxFileBytes: 8 * 1024 * 1024,
-    /** Delay (ms) for content reads, to test late answers. */
-    contentDelay: 0,
+    /**
+     * Deterministic gate for content reads, to test late answers: after
+     * `holdContent()` every content read is parked (membership is re-checked
+     * only when it's released) until the returned `release()` is called.
+     * No timers, so machine load can't change the order of events.
+     */
+    contentGate: null as null | { promise: Promise<void>; open: () => void },
+    /** Content reads currently parked behind the gate. */
+    contentParked: 0,
+    /** Content reads that were answered after being parked. */
+    contentReleased: 0,
     log: [] as { user: string; method: string; url: string; path: string; headers: Record<string, string>; body: string | null }[],
   };
 
@@ -107,7 +116,14 @@ export function libraryWorld() {
       if (!a || !visible(user, a)) return err(404, "asset not found");
       if (m[2] && req.method === "GET") {
         const answer = { status: 200, headers: { "content-type": a.mime_type, "cache-control": "no-store" }, body: a.bytes };
-        return l.contentDelay ? new Promise((resolve) => setTimeout(() => resolve(visible(user, a) ? answer : err(404, "asset not found")), l.contentDelay)) : answer;
+        const gate = l.contentGate;
+        if (!gate) return answer;
+        l.contentParked++;
+        return gate.promise.then(() => {
+          l.contentParked--;
+          l.contentReleased++;
+          return visible(user, a) ? answer : err(404, "asset not found");
+        });
       }
       if (req.method === "GET") return ok(view(a));
       if (req.method === "DELETE") {
@@ -165,5 +181,20 @@ export function libraryWorld() {
       return answer;
     };
   }
-  return { f, l, network, addAsset, addMediaConnection };
+  /**
+   * Parks content reads until the returned `release()` is called. Note the
+   * test driver's press() waits for in-flight requests, so the test must keep
+   * the press un-awaited while a read is parked (see Library.test.tsx).
+   */
+  const holdContent = () => {
+    let open!: () => void;
+    const promise = new Promise<void>((resolve) => (open = resolve));
+    const gate = { promise, open };
+    l.contentGate = gate;
+    return () => {
+      if (l.contentGate === gate) l.contentGate = null;
+      open();
+    };
+  };
+  return { f, l, network, addAsset, addMediaConnection, holdContent };
 }

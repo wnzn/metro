@@ -32,6 +32,8 @@ struct Fake {
     /// connection id -> claims seen with its current token
     claims: HashMap<String, u32>,
     refused_claims: u32,
+    /// Every request that carried an Authorization header.
+    authed: u32,
 }
 
 type Shared = Arc<Mutex<Fake>>;
@@ -44,7 +46,8 @@ fn user(h: &HeaderMap) -> Option<String> {
     }
 }
 
-async fn me(h: HeaderMap) -> Response {
+async fn me(State(s): State<Shared>, h: HeaderMap) -> Response {
+    s.lock().unwrap().authed += 1;
     match user(&h) {
         Some(u) => axum::Json(json!({"id": u, "actor": u, "is_org_admin": false})).into_response(),
         None => StatusCode::UNAUTHORIZED.into_response(),
@@ -52,6 +55,7 @@ async fn me(h: HeaderMap) -> Response {
 }
 
 async fn providers(State(s): State<Shared>, h: HeaderMap) -> Response {
+    s.lock().unwrap().authed += 1;
     let Some(u) = user(&h) else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -99,6 +103,7 @@ async fn claim(State(s): State<Shared>, h: HeaderMap) -> Response {
         .unwrap_or("")
         .to_string();
     let mut f = s.lock().unwrap();
+    f.authed += 1;
     let hit = f
         .tokens
         .iter()
@@ -151,6 +156,22 @@ async fn fake_metro() -> (String, Shared) {
 struct FakeLocal {
     url: String,
     state: Mutex<LocalState>,
+    /// Simulates a manager whose `current()` lags behind its state.
+    stale_current: std::sync::atomic::AtomicBool,
+}
+
+impl FakeLocal {
+    fn new(url: &str) -> Self {
+        FakeLocal {
+            url: url.to_string(),
+            state: Mutex::new(LocalState::Stopped),
+            stale_current: Default::default(),
+        }
+    }
+    /// The server process died; the address may be reused by anyone.
+    fn crash(&self) {
+        *self.state.lock().unwrap() = LocalState::Failed;
+    }
 }
 
 impl LocalWorkspaceHost for FakeLocal {
@@ -172,7 +193,8 @@ impl LocalWorkspaceHost for FakeLocal {
         })
     }
     fn current(&self) -> Option<LocalWorkspace> {
-        (*self.state.lock().unwrap() == LocalState::Running).then(|| LocalWorkspace {
+        let stale = self.stale_current.load(std::sync::atomic::Ordering::SeqCst);
+        (stale || *self.state.lock().unwrap() == LocalState::Running).then(|| LocalWorkspace {
             server_url: self.url.clone(),
             token: Secret::new("tok-alice"),
         })
@@ -355,10 +377,9 @@ async fn pairing_sessions_and_workers() {
     let (metro, fake) = fake_metro().await;
     let t = tempfile::tempdir().unwrap();
     let root = t.path().join("desktop");
-    let local: Arc<dyn LocalWorkspaceHost> = Arc::new(FakeLocal {
-        url: metro.clone(),
-        state: Mutex::new(LocalState::Stopped),
-    });
+    // The local workspace is a separate server from the remote one.
+    let (local_url, _local_fake) = fake_metro().await;
+    let local: Arc<dyn LocalWorkspaceHost> = Arc::new(FakeLocal::new(&local_url));
     let desktop = Desktop::new(config(&root, true, Some(local)));
     let ui = Ui {
         http: http(),
@@ -388,7 +409,7 @@ async fn pairing_sessions_and_workers() {
         .call("POST", "/v1/local-workspace/open", Some(json!({})))
         .await;
     assert_eq!(s, 200);
-    assert_eq!(l["server_url"], metro.as_str());
+    assert_eq!(l["server_url"], local_url.as_str());
     assert_eq!(l["token"], "tok-alice");
     assert_eq!(
         ui.call("GET", "/v1/status", None).await.1["local"],
@@ -785,10 +806,7 @@ async fn secondary_instance_serves_nothing_and_no_local_without_server() {
 async fn local_tools_only_for_the_apps_own_hosted_session() {
     let (metro, _fake) = fake_metro().await;
     let t = tempfile::tempdir().unwrap();
-    let local: Arc<dyn LocalWorkspaceHost> = Arc::new(FakeLocal {
-        url: metro.clone(),
-        state: Mutex::new(LocalState::Stopped),
-    });
+    let local: Arc<dyn LocalWorkspaceHost> = Arc::new(FakeLocal::new(&metro));
     let mut cfg = config(t.path(), true, Some(local));
     cfg.tools = Some(Arc::new(metro_connector::desktop_tools::DesktopTools::new(
         t.path().join("local-tools"),
@@ -816,12 +834,27 @@ async fn local_tools_only_for_the_apps_own_hosted_session() {
     let (s, v) = ui.call("GET", "/v1/local-tools", None).await;
     assert_eq!((s, &v["available"]), (200, &json!(true)), "{v}");
 
-    // Same server, another bearer (another account): not the hosted session.
-    let (s, _) = ui
+    // Same server, another bearer: refused outright (it isn't the hosted
+    // session, and the address belongs to the local workspace).
+    let (s, e) = ui
         .call(
             "POST",
             "/v1/session",
             Some(json!({"server_url": metro, "session_token": "tok-bob"})),
+        )
+        .await;
+    assert_eq!(
+        (s, e["error"]["code"].as_str()),
+        (409, Some("local_not_running")),
+        "{e}"
+    );
+    // A remote session: no tools.
+    let (remote, _r) = fake_metro().await;
+    let (s, _) = ui
+        .call(
+            "POST",
+            "/v1/session",
+            Some(json!({"server_url": remote, "session_token": "tok-bob"})),
         )
         .await;
     assert_eq!(s, 200);
@@ -842,4 +875,202 @@ async fn local_tools_only_for_the_apps_own_hosted_session() {
     assert_eq!(v["available"], false);
     desktop.shutdown().await;
     ui.bridge.stop().await;
+}
+
+fn tools_cfg(root: &std::path::Path, local: Arc<FakeLocal>) -> DesktopConfig {
+    let mut cfg = config(root, true, Some(local as Arc<dyn LocalWorkspaceHost>));
+    cfg.tools = Some(Arc::new(metro_connector::desktop_tools::DesktopTools::new(
+        root.join("local-tools"),
+    )));
+    cfg
+}
+
+/// The hosted server dies while its session is bound. Its address is then
+/// owned by "someone else" (the fake keeps listening): the bridge must end
+/// the session, stop workers and tools, never resume them, and send that
+/// address nothing more.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hosted_session_ends_when_the_local_server_stops() {
+    let (addr, other) = fake_metro().await; // the local server, later "someone else"
+    let t = tempfile::tempdir().unwrap();
+    let local = Arc::new(FakeLocal::new(&addr));
+    let desktop = Desktop::new(tools_cfg(t.path(), local.clone()));
+    let ui = Ui {
+        http: http(),
+        bridge: bridge::start(desktop.clone()).await.unwrap(),
+    };
+    let (_, w) = ui
+        .call("POST", "/v1/local-workspace/open", Some(json!({})))
+        .await;
+    let (s, _) = ui
+        .call(
+            "POST",
+            "/v1/session",
+            Some(json!({"server_url": w["server_url"], "session_token": w["token"]})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    // A device connection paired against the hosted server, serving.
+    let base = format!("{addr}/model/v1");
+    ui.call(
+        "POST",
+        "/v1/connections/c1/pair",
+        Some(json!({"kind": "device-openai-compatible", "base_url": base, "models": ["m1"]})),
+    )
+    .await;
+    let (s, c) = ui
+        .call(
+            "POST",
+            "/v1/connections/c1/credentials",
+            Some(json!({"no_api_key": true})),
+        )
+        .await;
+    assert_eq!(s, 200, "{c}");
+    wait_for("hosted claims", || {
+        other.lock().unwrap().claims.get("c1").copied().unwrap_or(0) >= 2
+    })
+    .await;
+    assert_eq!(
+        ui.call("GET", "/v1/local-tools", None).await.1["available"],
+        true
+    );
+
+    local.crash();
+    wait_for("session ended", || {
+        let d = desktop.clone();
+        futures_now(async move { d.status().await["session"].is_null() })
+    })
+    .await;
+    // Let anything in flight land, then nothing more may reach the address.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let before = other.lock().unwrap().authed;
+    let (_, v) = ui.call("GET", "/v1/local-tools", None).await;
+    assert_eq!(v["available"], false, "{v}");
+    let (s, v) = ui
+        .call("POST", "/v1/local-tools/spaces/s1/enable", Some(json!({})))
+        .await;
+    assert_eq!(s, 409, "{v}");
+    // Re-binding the old URL and bearer is refused before anything is sent.
+    let (s, e) = ui
+        .call(
+            "POST",
+            "/v1/session",
+            Some(json!({"server_url": w["server_url"], "session_token": w["token"]})),
+        )
+        .await;
+    assert_eq!(
+        (s, e["error"]["code"].as_str()),
+        (409, Some("local_not_running")),
+        "{e}"
+    );
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(
+        other.lock().unwrap().authed,
+        before,
+        "credentials went to the reused address"
+    );
+    let st = ui.call("GET", "/v1/status", None).await.1;
+    assert_eq!(st["session"], Value::Null);
+    assert_eq!(st["local"], "failed");
+    desktop.shutdown().await;
+    ui.bridge.stop().await;
+}
+
+/// A manager whose `current()` still answers after its state left Running
+/// is not trusted: no hosted context, no session to that address.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_current_is_not_a_hosted_session() {
+    let (addr, other) = fake_metro().await;
+    let t = tempfile::tempdir().unwrap();
+    let local = Arc::new(FakeLocal::new(&addr));
+    let desktop = Desktop::new(tools_cfg(t.path(), local.clone()));
+    let ui = Ui {
+        http: http(),
+        bridge: bridge::start(desktop.clone()).await.unwrap(),
+    };
+    let (_, w) = ui
+        .call("POST", "/v1/local-workspace/open", Some(json!({})))
+        .await;
+    local
+        .stale_current
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    *local.state.lock().unwrap() = LocalState::Stopped;
+    let before = other.lock().unwrap().authed;
+    let (s, e) = ui
+        .call(
+            "POST",
+            "/v1/session",
+            Some(json!({"server_url": w["server_url"], "session_token": w["token"]})),
+        )
+        .await;
+    assert_eq!(
+        (s, e["error"]["code"].as_str()),
+        (409, Some("local_not_running")),
+        "{e}"
+    );
+    assert_eq!(
+        ui.call("GET", "/v1/local-tools", None).await.1["available"],
+        false
+    );
+    assert_eq!(other.lock().unwrap().authed, before);
+    ui.bridge.stop().await;
+}
+
+/// The local server stopping has no effect on an ordinary remote session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remote_sessions_ignore_the_local_server() {
+    let (remote, fake) = fake_metro().await;
+    let (addr, _local_fake) = fake_metro().await;
+    let t = tempfile::tempdir().unwrap();
+    let local = Arc::new(FakeLocal::new(&addr));
+    let desktop = Desktop::new(tools_cfg(t.path(), local.clone()));
+    let ui = Ui {
+        http: http(),
+        bridge: bridge::start(desktop.clone()).await.unwrap(),
+    };
+    ui.call("POST", "/v1/local-workspace/open", Some(json!({})))
+        .await;
+    let (s, _) = ui
+        .call(
+            "POST",
+            "/v1/session",
+            Some(json!({"server_url": remote, "session_token": "tok-alice"})),
+        )
+        .await;
+    assert_eq!(s, 200);
+    let base = format!("{remote}/model/v1");
+    ui.call(
+        "POST",
+        "/v1/connections/c1/pair",
+        Some(json!({"kind": "device-openai-compatible", "base_url": base, "models": ["m1"]})),
+    )
+    .await;
+    ui.call(
+        "POST",
+        "/v1/connections/c1/credentials",
+        Some(json!({"no_api_key": true})),
+    )
+    .await;
+    wait_for("remote claims", || {
+        fake.lock().unwrap().claims.get("c1").copied().unwrap_or(0) >= 2
+    })
+    .await;
+    local.crash();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let n = fake.lock().unwrap().claims["c1"];
+    wait_for("remote claims continue", || {
+        fake.lock().unwrap().claims["c1"] > n + 2
+    })
+    .await;
+    let st = ui.call("GET", "/v1/status", None).await.1;
+    assert_eq!(st["session"]["server_url"], remote.as_str());
+    assert_eq!(connection(&st, "c1")["worker"], "online");
+    desktop.shutdown().await;
+    ui.bridge.stop().await;
+}
+
+/// Runs a future to completion from a sync predicate (tests only).
+fn futures_now<F: std::future::Future<Output = bool> + Send + 'static>(f: F) -> bool {
+    let h = tokio::runtime::Handle::current();
+    std::thread::spawn(move || h.block_on(f)).join().unwrap()
 }

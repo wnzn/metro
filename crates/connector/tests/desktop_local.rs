@@ -64,6 +64,25 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+/// The process has fully exited, so its parent's wait can see it: gone, or
+/// only its main thread is left and that is a zombie. (The main thread turns
+/// into a zombie while other threads are still exiting, and the OS holds its
+/// exit back until they have all been removed.)
+fn exited(pid: u32) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return true;
+    };
+    let names: Vec<String> = tasks
+        .flatten()
+        .map(|t| t.file_name().to_string_lossy().into_owned())
+        .collect();
+    names == [pid.to_string()]
+        && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
+            stat.rsplit_once(')')
+                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
+        })
+}
+
 fn server_pid(root: &Path) -> u32 {
     let ready: Value =
         serde_json::from_slice(&std::fs::read(root.join("run/ready.json")).unwrap()).unwrap();
@@ -139,6 +158,9 @@ async fn starts_authenticates_persists_and_stops() {
     assert_eq!(status, 200);
     let cur = host.current().unwrap();
     assert_eq!(cur.server_url, url);
+    let via_trait = LocalWorkspaceHost::current(&host).unwrap();
+    assert_eq!(via_trait.server_url, url);
+    assert_eq!(via_trait.token.expose(), token);
     assert_eq!(host.service_url().as_deref(), Some(url.as_str()));
     assert_eq!(host.token().unwrap().expose(), token);
 
@@ -153,6 +175,7 @@ async fn starts_authenticates_persists_and_stops() {
         serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
     let port = saved["port"].as_u64().unwrap();
     assert!(url.ends_with(&format!(":{port}")));
+    assert!(std::net::TcpListener::bind(("127.0.0.1", port as u16)).is_err());
 
     // Some data, then a second host on the same root is refused.
     let created = http()
@@ -169,13 +192,15 @@ async fn starts_authenticates_persists_and_stops() {
     assert!(err.as_str().contains("already open"), "{err}");
     drop(other);
 
-    // Stop: the process ends and credentials are gone.
+    // Stop: the process ends and credentials are gone. The app is quitting,
+    // so the launcher gives the address up.
     let pid = server_pid(&root);
     assert!(pid_alive(pid));
     host.shutdown().await;
     assert_eq!(host.state(), LocalState::Stopped);
     assert!(host.current().is_none());
     assert!(!pid_alive(pid));
+    drop(std::net::TcpListener::bind(("127.0.0.1", port as u16)).expect("released at shutdown"));
     host.shutdown().await; // idempotent
 
     // Reopen: same origin, new bearer, the old one is dead, data is kept.
@@ -195,16 +220,30 @@ async fn starts_authenticates_persists_and_stops() {
     assert_eq!(names, ["Solo"]);
     let token2 = again.token.expose().to_string();
 
-    // A crash is noticed; the next open starts a fresh server.
+    // A crash is seen synchronously: once the OS shows the process exited,
+    // the very next read reports no server (no background thread involved).
     let pid = server_pid(&root);
+    assert!(host.current().is_some());
     // SAFETY: killing our own test's child server.
     unsafe { libc::kill(pid as i32, libc::SIGKILL) };
-    wait_until("the crash to be noticed", || {
-        host.state() == LocalState::Failed
-    })
-    .await;
-    assert!(host.current().is_none());
+    wait_until("the server process to exit", || exited(pid)).await;
+    assert!(host.current().is_none(), "a dead server is never current");
+    assert_eq!(host.state(), LocalState::Failed);
+    assert!(host.service_url().is_none() && host.token().is_none());
+    let dyn_host: &dyn LocalWorkspaceHost = &host;
+    assert!(dyn_host.current().is_none());
+    // The server is gone, but the launcher still owns its address: no other
+    // program can bind it while the app runs, so nothing the UI or a worker
+    // still sends there can reach anyone else.
+    assert!(std::net::TcpListener::bind(("127.0.0.1", port as u16)).is_err());
+    assert!(std::net::TcpListener::bind(("0.0.0.0", port as u16)).is_err());
     let third = host.open().await.unwrap();
+    assert_ne!(third.token.expose(), token2);
+    let (status, spaces) = get(&format!("{url}/v1/spaces"), third.token.expose()).await;
+    assert_eq!(status, 200);
+    assert_eq!(spaces["spaces"][0]["name"], "Solo");
+    let (status, _) = get(&format!("{url}/v1/me"), &token2).await;
+    assert_eq!(status, 401);
     assert_eq!(third.server_url, url);
     assert_eq!(host.state(), LocalState::Running);
 
@@ -220,6 +259,7 @@ async fn starts_authenticates_persists_and_stops() {
     assert_eq!(fourth.server_url, url);
     let token4 = fourth.token.expose().to_string();
     host.shutdown().await;
+    drop(std::net::TcpListener::bind(("127.0.0.1", port as u16)).expect("released at shutdown"));
 
     for secret in [&token, &token2, &token4] {
         assert_nowhere(&root, secret);
@@ -263,6 +303,14 @@ async fn no_server_outlives_a_killed_launcher() {
     launcher.kill().unwrap(); // SIGKILL: no cleanup code runs
     launcher.wait().unwrap();
     wait_until("the orphaned server to exit", || !pid_alive(pid)).await;
+    // With the launcher and its server gone, the address is free again.
+    let saved: Value =
+        serde_json::from_slice(&std::fs::read(root.join("state.json")).unwrap()).unwrap();
+    let port = saved["port"].as_u64().unwrap() as u16;
+    wait_until("the port to be released", || {
+        std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+    })
+    .await;
 }
 
 /// The child half of `no_server_outlives_a_killed_launcher`.
