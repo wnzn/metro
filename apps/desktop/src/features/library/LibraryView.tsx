@@ -168,7 +168,7 @@ function LibraryFiles() {
     <Column gap={6} testID="library-view">
       <PageHeader
         title="Library"
-        subtitle="Files you uploaded to your personal library or a Space."
+        subtitle="Your personal uploads and files uploaded by members of your Spaces."
       >
         <GlyphAction testID="library-choose" glyph="upload" label="Upload" busyLabel="Uploading…" busy={uploading()} accessibilityLabel={`Upload files to ${scopeLabel(uploadTarget())}`} onPress={() => void chooseAndUpload()} />
       </PageHeader>
