@@ -144,7 +144,8 @@ private folder on this computer, per Space, while Metro is open.
 - **Chat:** your personal thread with the agent, outside every Space. Only
   you see it. Its agent can't see your Spaces, and its only tool is
   acknowledging with a reaction. Next to it, the Chat shows active and recent
-  **agent runs** in your Spaces, with three actions:
+  **agent runs** in your Spaces (in a side panel at 1100 points and wider,
+  or behind **Runs** in a dialog when narrower), with three actions:
   Open (go to the room or thread), Follow up, and Stop. **New task** there
   sends a task right away, once, to the agent of a Space and room or thread
   that you pick explicitly. The recipient is spelled out before **Send to
@@ -227,9 +228,12 @@ its scope and type filters, folded zero-similarity results, the Library
 page, the media model in Settings, scheduled-task cards with the History
 menu, the routing badge's percentage, the account row, and Chat's **New
 task** form were checked in a native Linux GTK run, in dark and light themes,
-of the unreleased source after 0.2.0. At 860 px wide with the runs shown,
-Chat's composer and header currently overlap the runs. A fix is in
-progress. The account menu's items and the Ctrl/⌘+K shortcut are covered
+of the unreleased source after 0.2.0. That review found Chat's composer
+and header overlapping the runs at 860 px wide. Since then, below 1100
+points the runs open in an **Agent runs** dialog from a **Runs** button.
+Escape, the backdrop or Close shut the dialog, and your draft is kept.
+This is covered by automated tests, and the native recheck isn't recorded
+yet. The account menu's items and the Ctrl/⌘+K shortcut are covered
 by automated tests. Windows and macOS weren't checked.
 - **Manage (owners only):** list, add, and remove members. Pick which runner
   serves the Space: attach one of your personal runners or an organization

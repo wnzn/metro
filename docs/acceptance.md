@@ -11,15 +11,23 @@ The [Metro 0.2.0 local release](#final-metro-020-local-release-prepublication-20
 below is still the current final local result. Packaging tests and the e2e
 scripts weren't rerun for this gate.
 
-**Source.** Commit `df5b8fa14ea4e10fb7259f067cbadbcccba031c0`, 45 commits
-after `v0.2.0`. Its last change after the audio fix only rewords the Library
-caption (personal files and files Space members uploaded).
+**Source.** The final application gate ran on commit
+`13c80b4f682243ead3e13fc68d8a0db17e18fcf5`, 50 commits after `v0.2.0`. Its
+last two app changes were:
+
+- `ffd8978`: below 1100 points, Chat's agent runs open in an **Agent runs**
+  dialog from a **Runs** button, instead of as a side panel.
+- `13c80b4`: the composer hint stays beside **Ask agent** and **Send**, and
+  keeps its full wording as its accessible label.
+
+The native reviews below ran on the earlier renderer builds named there.
 
 | Check | Result |
 | --- | --- |
-| Desktop, from a clean `git archive` of `df5b8fa`: pinned NSH `nsh test` | 229/229, with zero errors, failures or skips. JUnit report `final-nsh-test-df5b8fa.junit.xml` |
-| Desktop type check (`nsh check`) and release compile at `df5b8fa` | Pass |
-| Earlier desktop baseline at `58a1b7d` | 229/229, check and release build pass |
+| Desktop, from a clean `git archive` of `13c80b4`: NSH 0.6.1 `nsh test` | **234/234**, with zero errors, failures or skips. JUnit report `verified-13c80b4f6.junit.xml` |
+| NSH 0.6.1 `nsh check` and `nsh build --release` at `13c80b4` | Pass |
+| Focused tests in that run | An intact Chat draft, dispatch, and closing the runs dialog (Close, Escape) across widths. The composer hint at narrow widths. |
+| Earlier desktop gates | `df5b8fa`: 229/229 from a clean `git archive`, with JUnit `final-nsh-test-df5b8fa.junit.xml`, plus check and release compile. `58a1b7d`: 229/229, plus check and release build. |
 | `cargo test --locked -p metro-server`, all 18 nonempty server test binaries | 331/331 |
 | Admin web page: browser checks, and color-contrast pairs | 19/19 checks, 68 pairs (the receipt doesn't break the pairs down further) |
 
@@ -87,9 +95,11 @@ recorded as reported.
   (text, controls and focus), with the admin CSS at `2869c6b`. No auth or
   script changes.
 - **Open findings from this review:**
-  - At 860 px wide with the runs shown, Chat's composer and header overlap
-    the runs. A fix is in progress, and its proof will be added in a later
-    entry.
+  - At 860 px wide with the runs shown, Chat's composer and header overlapped
+    the runs in this build. `ffd8978` and `13c80b4` change that layout, and
+    the automated tests above cover it. The `13c80b4` commit reports a check
+    on the GTK host at 720 and 860 points. The native before-and-after
+    receipt for this fix is still to come, and isn't recorded here yet.
   - Two minor issues:
     - The provider dropdown opens upward over the Documents & media heading.
       0.2.0 does the same.
