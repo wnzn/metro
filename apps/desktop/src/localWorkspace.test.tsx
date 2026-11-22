@@ -109,7 +109,8 @@ test("one press opens the local workspace: no URL, no token, and the remote sett
   expect(app.storage()["metro.serverUrl"]).toBe("https://metro.example.com");
   expectNoTokens(app);
 
-  // Leaving it shows the connect screen with the remote server as it was.
+  // Leaving it (Sign out, in the account menu) shows the connect screen with the remote server as it was.
+  await app.press("id:account-menu");
   await app.press("id:disconnect");
   await app.waitFor("id:connect-screen");
   expect(app.value("id:server-url")).toBe("https://metro.example.com");
