@@ -176,7 +176,13 @@ test("the media model settings offer only media-capable connections and disclose
   await connect(app, "alice");
   await app.waitFor("id:library-model");
   await app.waitFor(`id:library-file:${s.mine.id}`);
+  // Index is in the row's More menu, and can't be chosen without a saved model.
+  expect(app.shows(`id:library-index:${s.mine.id}`)).toBe(false);
+  await app.press(`id:library-actions:${s.mine.id}`);
+  await app.waitFor(`id:library-index:${s.mine.id}`);
   expect(app.enabled(`id:library-index:${s.mine.id}`)).toBe(false);
+  await app.back();
+  await app.waitFor(`id:library-index:${s.mine.id}`, { state: "gone" });
   expect(text(app)).toContain("Nothing is chosen, so nothing can be indexed or searched.");
 
   await app.press("id:library-model-picker");
@@ -200,6 +206,7 @@ test("the media model settings offer only media-capable connections and disclose
   expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
   await app.waitFor("text:/Index sends a file to My EG2, only when you press Index/");
 
+  await app.press(`id:library-actions:${s.mine.id}`);
   await app.press(`id:library-index:${s.mine.id}`);
   await app.waitFor(`id:library-index-state:${s.mine.id}`);
   await app.waitFor("text:Indexed 3 parts in your own index.");
@@ -214,11 +221,16 @@ test("Delete sits in each row's More menu, asks first, and is offered only to th
   const app = await signIn(w);
   await openLibrary(app);
   await app.waitFor(`id:library-file:${s.mine.id}`);
-  // Alice owns Acme (Bob's file there), but is only a member of Side.
-  expect(app.shows(`id:library-actions:${s.mine.id}`)).toBe(true);
-  expect(app.shows(`id:library-actions:${s.acmeByBob.id}`)).toBe(true);
-  expect(app.shows(`id:library-actions:${s.sideByBob.id}`)).toBe(false);
+  // Each row: one visible Open, everything else in More.
+  expect(app.shows(`id:library-open:${s.mine.id}`)).toBe(true);
+  expect(app.shows(`id:library-index:${s.mine.id}`)).toBe(false);
   expect(app.shows(`id:library-delete:${s.acmeByBob.id}`)).toBe(false); // folded away until the menu opens
+  // Alice owns Acme (Bob's file there), but is only a member of Side: its menu has Index, not Delete.
+  await app.press(`id:library-actions:${s.sideByBob.id}`);
+  await app.waitFor(`id:library-index:${s.sideByBob.id}`);
+  expect(app.shows(`id:library-delete:${s.sideByBob.id}`)).toBe(false);
+  await app.back();
+  await app.waitFor(`id:library-index:${s.sideByBob.id}`, { state: "gone" });
 
   await app.press(`id:library-actions:${s.acmeByBob.id}`);
   await app.waitFor(`id:library-delete:${s.acmeByBob.id}`);

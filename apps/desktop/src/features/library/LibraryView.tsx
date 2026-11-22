@@ -297,23 +297,20 @@ function AssetRow(props: { asset: LibraryAsset }) {
         <>
           <Badge tone={where().tone} label={where().label} />
           <Action testID={`library-open:${a().id}`} label="Open" accessibilityLabel={`Open ${a().name}`} variant="ghost" onPress={() => openAsset(a())} />
-          <Action
-            testID={`library-index:${a().id}`}
-            label={state()?.state === "indexed" ? "Index again" : "Index"}
-            accessibilityLabel={`Index ${a().name} with ${savedModel()?.name ?? "your media model"}`}
-            busyLabel="Indexing…"
-            busy={state()?.state === "indexing"}
-            disabled={!savedModelId()}
-            onPress={() => void indexAsset(a())}
+          <ActionsMenu
+            testID={`library-actions:${a().id}`}
+            label="More"
+            accessibilityLabel={`More actions for ${a().name}`}
+            items={[
+              {
+                id: `library-index:${a().id}`,
+                label: state()?.state === "indexing" ? "Indexing…" : state()?.state === "indexed" ? "Index again" : "Index",
+                disabled: !savedModelId() || state()?.state === "indexing",
+                onPress: () => void indexAsset(a()),
+              },
+              ...(canDelete(a()) ? [{ id: `library-delete:${a().id}`, label: "Delete…", destructive: true, onPress: () => askDelete(a().id) }] : []),
+            ]}
           />
-          <If when={canDelete(a())}>
-            <ActionsMenu
-              testID={`library-actions:${a().id}`}
-              label="More"
-              accessibilityLabel={`More actions for ${a().name}`}
-              items={[{ id: `library-delete:${a().id}`, label: "Delete…", destructive: true, onPress: () => askDelete(a().id) }]}
-            />
-          </If>
         </>
       }
       below={
