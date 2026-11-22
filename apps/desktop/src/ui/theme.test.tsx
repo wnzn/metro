@@ -14,7 +14,7 @@ const rgba = (hex: string) => `${hex.toLowerCase()}ff`;
 
 const FIXTURE = "./theme.fixture.tsx";
 const openFixture = (storage: Record<string, string> = {}, colorScheme: ColorScheme = "light") =>
-  open(FIXTURE, { platform: "linux", width: 1100, height: 760, storage, colorScheme });
+  open(FIXTURE, { platform: "linux", width: 1280, height: 1400, storage, colorScheme });
 
 const bg = (app: App, selector: string) => app.viewStyle(selector)?.backgroundColor ?? null;
 const fg = (app: App, selector: string) => app.spanStyle(selector).color;
@@ -131,6 +131,13 @@ test("every token pair the primitives draw meets WCAG AA in both schemes", () =>
     ["sidebar-foreground", "sidebar"],
     ["sidebar-accent-foreground", "sidebar-accent"],
     ["muted-foreground", "sidebar"],
+    ["muted-foreground", "sidebar-accent"],
+    ["muted-foreground", "popover"],
+    ["accent-foreground", "background"],
+    // Destructive (outline) Actions and menu items draw this ink on the page, cards and popovers.
+    ["tone-danger-foreground", "background"],
+    ["tone-danger-foreground", "card"],
+    ["tone-danger-foreground", "popover"],
     ...["neutral", "agent", "runner", "system", "success", "warning", "danger"].map((t) => [`tone-${t}-foreground`, `tone-${t}`]),
   ];
   const failures: string[] = [];
@@ -142,10 +149,117 @@ test("every token pair the primitives draw meets WCAG AA in both schemes", () =>
     // The focus ring must stand out from the page (WCAG 1.4.11, 3:1).
     const ring = contrast(palette.ring, palette.background);
     if (ring < 3) failures.push(`${scheme} ring on background: ${ring.toFixed(2)}`);
+    // The chosen segment and primary buttons must stand out from the page too.
+    const primary = contrast(palette.primary, palette.background);
+    if (primary < 3) failures.push(`${scheme} primary on background: ${primary.toFixed(2)}`);
   }
   expect(failures).toEqual([]);
 });
 
 test("both schemes define the same tokens", () => {
   expect(Object.keys(light).sort()).toEqual(Object.keys(dark).sort());
+});
+
+test("the shared scales: 8/12/16 radii, 36/28 controls, 24 titles, a line height for every size", () => {
+  const t = theme.cssVars.theme as Record<string, string>;
+  expect([t["radius-sm"], t.radius, t["radius-lg"]]).toEqual(["8px", "12px", "16px"]);
+  expect([t["control-height"], t["control-height-sm"]]).toEqual(["36px", "28px"]);
+  expect(t["text-2xl"]).toBe("24px");
+  for (const size of ["xs", "sm", "md", "lg", "xl", "2xl"]) {
+    const px = (v: string) => Number(v.replace("px", ""));
+    expect(px(t[`leading-${size}`]) > px(t[`text-${size}`])).toBe(true);
+  }
+});
+
+test("Showing now appears only while System is chosen", async () => {
+  const app = await openFixture({}, "light");
+  await expectScheme(app, dark);
+  expect(app.shows("id:appearance-shown")).toBe(false);
+  await app.press("id:appearance:system");
+  await app.waitFor("text:Light, from your system");
+  await app.press("id:appearance:dark");
+  await app.waitFor("id:appearance-shown", { state: "gone" });
+});
+
+test("the preview shows every kind of element, including a sample message", async () => {
+  const app = await openFixture({ [APPEARANCE_KEY]: "dark" });
+  await app.waitFor("id:appearance-preview");
+  for (const label of [
+    "Preview of a primary button",
+    "Preview of a secondary button",
+    "Preview of a quiet button",
+    "Preview of a destructive button",
+    "Preview of a confirm-delete button",
+    "Preview of a disabled button",
+    "Preview of a compact button",
+    "Preview of a text field",
+    "Preview of a switch",
+  ]) {
+    expect(app.shows(`label:${label}`)).toBe(true);
+  }
+  expect(app.enabled("label:Preview of a disabled button")).toBe(false);
+  expect(app.shows("id:appearance-sample-message >> text:Leo Navarro")).toBe(true);
+  expect(app.shows("text:Couldn't connect")).toBe(true);
+});
+
+test("Action variants: disabled turns neutral, destructive is an outline in the danger ink, danger is filled", async () => {
+  for (const [scheme, palette] of [["dark", dark], ["light", light]] as const) {
+    const app = await openFixture({ [APPEARANCE_KEY]: scheme });
+    await expectScheme(app, palette);
+    expect(bg(app, "id:fx-disabled")).toBe(rgba(palette.muted));
+    expect(fg(app, "id:fx-disabled >> text:Fixture off")).toBe(rgba(palette["muted-foreground"]));
+    expect(app.enabled("id:fx-disabled")).toBe(false);
+    expect(bg(app, "id:fx-destructive")).toBe(rgba(palette.background));
+    expect(fg(app, "text:Fixture remove")).toBe(rgba(palette["tone-danger-foreground"]));
+    expect(bg(app, "id:fx-danger")).toBe(rgba(palette.destructive));
+    expect(fg(app, "text:Fixture delete")).toBe(rgba(palette["destructive-foreground"]));
+    expect(bg(app, "id:fx-edge") ?? "transparent").toBe("transparent");
+  }
+});
+
+test("ActionsMenu: opens from its trigger, items by id, destructive ink, disabled items stay put", async () => {
+  const app = await openFixture({ [APPEARANCE_KEY]: "dark" });
+  await expectScheme(app, dark);
+  expect(app.shows("id:fx-menu-rename")).toBe(false);
+  await app.press("id:fx-menu");
+  await app.waitFor("id:fx-menu-rename");
+  expect(fg(app, "text:Fixture delete item")).toBe(rgba(dark["tone-danger-foreground"]));
+  expect(fg(app, "text:Fixture rename")).toBe(rgba(dark["popover-foreground"]));
+  expect(app.enabled("id:fx-menu-off")).toBe(false);
+  await app.press("id:fx-menu-delete");
+  await app.waitFor("text:Last: delete");
+  await app.waitFor("id:fx-menu-rename", { state: "gone" });
+  await app.press("id:fx-menu");
+  await app.press("id:fx-menu-rename");
+  await app.waitFor("text:Last: rename");
+});
+
+test("Banner: the inline form shows its title and message in the tone's ink on the tone", async () => {
+  const app = await openFixture({ [APPEARANCE_KEY]: "light" });
+  await expectScheme(app, light);
+  expect(bg(app, "id:fx-banner")).toBe(rgba(light["tone-danger"]));
+  expect(fg(app, "text:Fixture failed")).toBe(rgba(light["tone-danger-foreground"]));
+  expect(fg(app, "text:Fixture banner message")).toBe(rgba(light["tone-danger-foreground"]));
+});
+
+test("Disclosure: the header toggles its content", async () => {
+  const app = await openFixture({ [APPEARANCE_KEY]: "dark" });
+  await expectScheme(app, dark);
+  expect(app.shows("text:Fixture hidden content")).toBe(false);
+  await app.press("id:fx-disclosure:toggle");
+  await app.waitFor("text:Fixture hidden content");
+  await app.press("id:fx-disclosure:toggle");
+  await app.waitFor("text:Fixture hidden content", { state: "gone" });
+});
+
+test("Picker: a detail shows as a second line, and the trigger shows only the label", async () => {
+  const app = await openFixture({ [APPEARANCE_KEY]: "dark" });
+  await expectScheme(app, dark);
+  await app.press("id:fx-picker");
+  await app.waitFor("id:fx-picker:a");
+  expect(fg(app, "text:Fixture alpha detail")).toBe(rgba(dark["muted-foreground"]));
+  await app.press("id:fx-picker:a");
+  await app.waitFor("id:fx-picker:a", { state: "gone" });
+  expect(app.shows("text:Fixture alpha detail")).toBe(false);
+  expect(app.shows("id:fx-picker >> text:Fixture alpha")).toBe(true);
 });

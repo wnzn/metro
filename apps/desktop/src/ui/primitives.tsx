@@ -5,10 +5,27 @@
 
 import { List, Scroll, Text, View } from "nsh";
 import type { JSX, ListRef } from "nsh";
-import { Button, Input, Radio, RadioGroup, Select, Switch } from "nsh/base";
+import { Button, Collapsible, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
 import { Icon } from "./chrome";
-import type { IconName } from "./chrome";
-import { cx, gapClass, padClass, padXClass, padYClass, toneSolidClass, toneSurfaceClass, toneTextClass } from "./tokens";
+import type { IconColor, IconName } from "./chrome";
+import {
+  controlHeightClass,
+  cx,
+  disabledClass,
+  disabledTextClass,
+  focusRingClass,
+  gapClass,
+  padClass,
+  padXClass,
+  padYClass,
+  popoverClass,
+  popoverItemClass,
+  textClass,
+  toneBorderClass,
+  toneSolidClass,
+  toneSurfaceClass,
+  toneTextClass,
+} from "./tokens";
 import type { Space, Tone } from "./tokens";
 
 type Children = { children?: JSX.Element };
@@ -84,12 +101,15 @@ export type SurfaceVariant =
   /** A centred, width-limited column for settings and forms inside a panel. */
   | "content"
   /** The bar across the top of the main panel, its content centred (the search box). */
-  | "topbar";
+  | "topbar"
+  /** A floating surface one step above cards (a menu, a preview of one). */
+  | "popover";
 
 const surfaceClass: Record<SurfaceVariant, string> = {
   app: "flex-1 flex-row bg-background",
   sidebar: "w-(--sidebar-width) bg-sidebar border-r border-sidebar-border",
   panel: "flex-1 min-w-0 bg-background",
+  // Cards are flat: a border, no shadow. Only popovers and dialogs float.
   card: "bg-card border border-border rounded-(--radius)",
   dialog: "w-full max-w-[460px] bg-card border border-border rounded-(--radius-lg) shadow-lg",
   toolbar: "flex-row items-center min-h-[52px] border-b border-border bg-background",
@@ -99,6 +119,7 @@ const surfaceClass: Record<SurfaceVariant, string> = {
   scroll: "flex-1 min-h-0",
   content: "w-full max-w-(--content-width) self-center",
   topbar: "flex-row items-center justify-center min-h-[52px] px-(--space-4) py-(--space-2) border-b border-border bg-background",
+  popover: "bg-popover border border-border rounded-(--radius) shadow-lg",
 };
 
 export function Surface(props: StackProps & { variant: SurfaceVariant }) {
@@ -119,17 +140,27 @@ export function Divider() {
 
 // ---------------------------------------------------------------- text
 
-export type LabelVariant = "display" | "title" | "heading" | "body" | "strong" | "caption" | "mono";
+export type LabelVariant =
+  | "display"
+  | "title"
+  | "heading"
+  | "body"
+  | "strong"
+  | "caption"
+  /** Metadata (times, counts, ids): small, tabular figures, muted unless a color is given. */
+  | "meta"
+  | "mono";
 export type LabelColor = "default" | "muted" | "danger" | "accent" | "sidebar" | "sidebar-active" | Tone;
 
 const labelVariantClass: Record<LabelVariant, string> = {
-  display: "text-(length:--text-xl) font-semibold tracking-tight",
-  title: "text-(length:--text-lg) font-semibold",
-  heading: "text-(length:--text-md) font-semibold",
-  body: "text-(length:--text-md)",
-  strong: "text-(length:--text-sm) font-semibold",
-  caption: "text-(length:--text-xs)",
-  mono: "text-(length:--text-sm) font-mono",
+  display: cx(textClass["2xl"], "font-semibold tracking-tight"),
+  title: cx(textClass.lg, "font-semibold"),
+  heading: cx(textClass.md, "font-semibold"),
+  body: textClass.md,
+  strong: cx(textClass.sm, "font-semibold"),
+  caption: textClass.xs,
+  meta: cx(textClass.xs, "tabular-nums"),
+  mono: cx(textClass.sm, "font-mono"),
 };
 
 const labelColorClass: Record<string, string> = {
@@ -157,7 +188,7 @@ export function Label(
 ) {
   return (
     <Text
-      class={cx("shrink min-w-0", labelVariantClass[props.variant ?? "body"], colorClass(props.color ?? "default"))}
+      class={cx("shrink min-w-0", labelVariantClass[props.variant ?? "body"], colorClass(props.color ?? (props.variant === "meta" ? "muted" : "default")))}
       style={props.lines ? { numberOfLines: props.lines } : undefined}
       role={props.heading ? "header" : undefined}
       testID={props.testID}
@@ -171,22 +202,44 @@ export function Label(
 // ---------------------------------------------------------------- controls
 
 /** The keyboard focus ring every interactive primitive shares. */
-const focusRing = "focus-visible:ring-2 focus-visible:ring-ring";
+const focusRing = focusRingClass;
 
-export type ActionVariant = "primary" | "secondary" | "ghost" | "danger";
+/**
+ * - `primary`: the one main action of a view.
+ * - `secondary`: an outlined everyday action.
+ * - `ghost`: a quiet action (Cancel, a disclosure, a link-like action).
+ * - `destructive`: an outlined action that removes or revokes something and
+ *   asks for confirmation next. Use it for the first press.
+ * - `danger`: filled, only for the final confirm of a destructive action.
+ */
+export type ActionVariant = "primary" | "secondary" | "ghost" | "destructive" | "danger";
 
+// Disabled Actions turn neutral (no fill of their variant, muted text)
+// rather than a dimmed copy of it, so a disabled primary never reads as live.
 const actionClass: Record<ActionVariant, string> = {
-  primary: "bg-primary active:bg-primary/85 hover:bg-primary/90 disabled:opacity-50",
-  secondary: "bg-secondary border border-input active:bg-secondary/70 hover:bg-muted disabled:opacity-50",
-  ghost: "active:bg-muted hover:bg-muted disabled:opacity-50",
-  danger: "bg-destructive active:bg-destructive/85 hover:bg-destructive/90 disabled:opacity-50",
+  primary: "bg-primary hover:bg-primary/90 active:bg-primary/85 disabled:bg-muted",
+  secondary: "bg-background border border-input hover:bg-muted active:bg-muted/70 disabled:bg-transparent disabled:border-border",
+  ghost: "hover:bg-muted active:bg-muted disabled:bg-transparent",
+  destructive:
+    "bg-background border border-tone-danger-foreground/40 hover:bg-tone-danger active:bg-tone-danger disabled:bg-transparent disabled:border-border",
+  danger: "bg-destructive hover:bg-destructive/90 active:bg-destructive/85 disabled:bg-muted",
 };
 
 const actionTextClass: Record<ActionVariant, string> = {
   primary: "text-primary-foreground",
   secondary: "text-secondary-foreground",
   ghost: "text-foreground",
+  destructive: "text-tone-danger-foreground",
   danger: "text-destructive-foreground",
+};
+
+// Icons have no on-fill tint yet: filled variants show none (see Action's icon).
+const actionIconColor: Record<ActionVariant, IconColor | null> = {
+  primary: null,
+  secondary: "default",
+  ghost: "muted",
+  destructive: "muted",
+  danger: null,
 };
 
 export function Action(
@@ -197,16 +250,30 @@ export function Action(
     disabled?: boolean;
     busy?: boolean;
     busyLabel?: string;
-    /** A disclosure: shows a caret (▸ closed, ▾ open) before the label. Say the state in `accessibilityLabel` too. */
+    /** A disclosure: shows a chevron (right closed, down open) before the label. Say the state in `accessibilityLabel` too. */
     expanded?: boolean;
+    /** 28 high instead of 36, tighter padding: in rows, lists and table cells. */
+    compact?: boolean;
+    /**
+     * Ghost and destructive Actions only: pull the button out by its own
+     * padding so its label lines up with the text edge above and below it
+     * (the start edge; with `justify="end"` rows, put it last).
+     */
+    edgeAligned?: boolean;
+    /** An icon of the app's family before the label (secondary, ghost and destructive only). */
+    icon?: IconName;
   },
 ) {
   const variant = () => props.variant ?? "secondary";
+  const iconColor = () => actionIconColor[variant()];
+  const quiet = () => variant() === "ghost" || variant() === "destructive";
   return (
     <Button
       class={cx(
-        "flex-row items-center justify-center min-h-[32px] rounded-(--radius-sm) px-(--space-3) py-(--space-2)",
-        props.expanded !== undefined && "justify-start gap-(--space-2)",
+        "group flex-row items-center justify-center rounded-(--radius-sm)",
+        props.compact ? cx(controlHeightClass.compact, "gap-(--space-1) px-(--space-2)") : cx(controlHeightClass.default, "gap-(--space-2) px-(--space-3)"),
+        props.expanded !== undefined && "justify-start",
+        props.edgeAligned && quiet() && (props.compact ? "-mx-2" : "-mx-3"),
         focusRing,
         actionClass[variant()],
       )}
@@ -215,13 +282,29 @@ export function Action(
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.label}
     >
-      <If when={props.expanded !== undefined}>
-        <Text class={cx("text-(length:--text-sm)", actionTextClass[variant()])}>{props.expanded ? "▾" : "▸"}</Text>
+      <If when={props.expanded !== undefined ? iconColor() : null}>
+        {(color) => <Icon name={props.expanded ? "chevron-down" : "chevron-right"} color={color()} size={14} />}
       </If>
-      <Text class={cx("text-(length:--text-sm) font-medium", actionTextClass[variant()])}>
+      <If when={props.expanded === undefined && props.icon ? iconColor() : null}>
+        {(color) => <Icon name={props.icon!} color={color()} size={props.compact ? 14 : 16} />}
+      </If>
+      <Text class={cx(props.compact ? textClass.xs : textClass.sm, "font-medium", actionTextClass[variant()], disabledTextClass)}>
         {props.busy ? props.busyLabel ?? props.label : props.label}
       </Text>
     </Button>
+  );
+}
+
+/** A row of Actions at the end of a card, form or footer (the primary one last). */
+export function ActionBar(props: Testable & { children?: JSX.Element; justify?: "end" | "between" | "start" }) {
+  return (
+    <View
+      class={cx("flex-row flex-wrap items-center gap-(--space-2)", justifyClass[props.justify ?? "end"])}
+      testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel}
+    >
+      {props.children}
+    </View>
   );
 }
 
@@ -247,10 +330,10 @@ export function NavItem(
   return (
     <Button
       class={cx(
-        "flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-[7px] hover:bg-sidebar-accent/60 active:bg-sidebar-accent",
+        "flex-row items-center gap-(--space-2) min-h-[32px] rounded-(--radius-sm) px-(--space-2) py-[6px]",
         focusRing,
         indentClass[Math.min(props.depth ?? 0, indentClass.length - 1)],
-        props.selected && "bg-sidebar-accent",
+        props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/60 active:bg-sidebar-accent",
       )}
       selected={props.selected}
       onPress={props.onPress}
@@ -261,7 +344,7 @@ export function NavItem(
         when={props.icon}
         else={
           <If when={props.prefix !== ""}>
-            <Text class="w-[12px] text-(length:--text-sm) text-muted-foreground">{props.prefix ?? "#"}</Text>
+            <Text class={cx("w-[12px]", textClass.sm, "text-muted-foreground")}>{props.prefix ?? "#"}</Text>
           </If>
         }
       >
@@ -269,16 +352,16 @@ export function NavItem(
       </If>
       <Text
         class={cx(
-          "flex-1 text-(length:--text-sm)",
-          props.selected || props.emphasis ? "font-semibold" : "",
-          props.selected ? "text-sidebar-accent-foreground" : "text-sidebar-foreground",
+          "flex-1",
+          textClass.sm,
+          props.selected ? "font-semibold text-sidebar-accent-foreground" : props.emphasis ? "font-semibold text-sidebar-foreground" : "text-sidebar-foreground",
         )}
         style={{ numberOfLines: 1 }}
       >
         {props.label}
       </Text>
       <If when={props.trailing}>
-        <Text class="text-(length:--text-xs) text-muted-foreground">{props.trailing}</Text>
+        <Text class={cx(textClass.xs, "text-muted-foreground")}>{props.trailing}</Text>
       </If>
     </Button>
   );
@@ -289,8 +372,9 @@ export function Chip(props: Testable & { label: string; selected: boolean; onPre
   return (
     <Button
       class={cx(
-        "rounded-full border px-(--space-3) py-(--space-1) disabled:opacity-50",
+        "flex-row items-center min-h-[28px] rounded-full border px-(--space-3)",
         focusRing,
+        disabledClass,
         props.selected ? "border-ring bg-accent" : "border-border bg-background hover:bg-muted",
       )}
       selected={props.selected}
@@ -299,7 +383,7 @@ export function Chip(props: Testable & { label: string; selected: boolean; onPre
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.label}
     >
-      <Text class={cx("text-(length:--text-xs)", props.selected ? "font-semibold text-accent-foreground" : "text-foreground")}>{props.label}</Text>
+      <Text class={cx(textClass.xs, "font-medium", props.selected ? "text-accent-foreground" : "text-foreground")}>{props.label}</Text>
     </Button>
   );
 }
@@ -315,8 +399,9 @@ export function ReactionChip(
   return (
     <Button
       class={cx(
-        "flex-row items-center gap-(--space-1) rounded-full border px-(--space-2) py-px disabled:opacity-60",
+        "flex-row items-center gap-(--space-1) rounded-full border px-(--space-2) py-px",
         focusRing,
+        disabledClass,
         props.mine ? "border-ring bg-accent" : props.agent && props.count === 0 ? "border-tone-agent-foreground/40 bg-tone-agent" : "border-border bg-background hover:bg-muted",
       )}
       selected={props.mine}
@@ -325,12 +410,12 @@ export function ReactionChip(
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
     >
-      <Text class="text-(length:--text-sm) text-foreground">{props.emoji}</Text>
+      <Text class={cx(textClass.sm, "text-foreground")}>{props.emoji}</Text>
       <If when={props.count > 0}>
-        <Text class={cx("text-(length:--text-xs)", props.mine ? "font-semibold text-accent-foreground" : "text-muted-foreground")}>{String(props.count)}</Text>
+        <Text class={cx(textClass.xs, "tabular-nums", props.mine ? "font-semibold text-accent-foreground" : "text-muted-foreground")}>{String(props.count)}</Text>
       </If>
       <If when={props.agent}>
-        <Text class="text-(length:--text-xs) font-medium text-tone-agent-foreground">agent</Text>
+        <Text class={cx(textClass.xs, "font-medium text-tone-agent-foreground")}>agent</Text>
       </If>
     </Button>
   );
@@ -340,7 +425,7 @@ export function ReactionChip(
 export function SecretValue(props: Testable & { value: string }) {
   return (
     <View class="rounded-(--radius-sm) border border-border bg-tone-warning px-(--space-3) py-(--space-2)" selectable testID={props.testID}>
-      <Text class="text-(length:--text-sm) font-mono text-tone-warning-foreground">{props.value}</Text>
+      <Text class={cx(textClass.sm, "font-mono text-tone-warning-foreground")}>{props.value}</Text>
     </View>
   );
 }
@@ -364,8 +449,11 @@ export function Field(
   return (
     <Input
       class={cx(
-        "rounded-(--radius-sm) border border-input bg-background px-(--space-3) py-(--space-2) text-(length:--text-md) text-foreground placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring disabled:opacity-60",
-        props.multiline && "min-h-[64px] max-h-[160px]",
+        "rounded-(--radius-sm) border border-input bg-background px-(--space-3) py-[7px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring",
+        textClass.md,
+        controlHeightClass.default,
+        disabledClass,
+        props.multiline && "min-h-[72px] max-h-[160px]",
         props.grow && "flex-1",
       )}
       value={props.value}
@@ -403,10 +491,23 @@ export function FormRow(props: { label: string; hint?: string; children?: JSX.El
 
 // ---------------------------------------------------------------- status
 
-export function Badge(props: { tone: Tone; label: string; testID?: string }) {
+/**
+ * A quiet status pill. `soft` (the default) is tinted by its tone; `outline`
+ * is quieter still, for metadata beside a name (a scope, a capability).
+ */
+export function Badge(props: { tone: Tone; label: string; testID?: string; variant?: "soft" | "outline" }) {
+  const outline = () => props.variant === "outline";
   return (
-    <View class={cx("rounded-(--radius-sm) px-(--space-2) py-px", toneSurfaceClass[props.tone])} testID={props.testID}>
-      <Text class={cx("text-(length:--text-xs) font-medium", toneTextClass[props.tone])}>{props.label}</Text>
+    <View
+      class={cx(
+        "flex-row items-center self-center rounded-full px-[8px] py-px",
+        outline() ? "border border-border" : toneSurfaceClass[props.tone],
+      )}
+      testID={props.testID}
+    >
+      <Text class={cx(textClass.xs, "font-medium", outline() ? "text-muted-foreground" : toneTextClass[props.tone])} style={{ numberOfLines: 1 }}>
+        {props.label}
+      </Text>
     </View>
   );
 }
@@ -415,15 +516,57 @@ export function StatusDot(props: { tone: Tone }) {
   return <View class={cx("size-2 rounded-full", toneSolidClass[props.tone])} />;
 }
 
-export function Banner(props: Testable & { tone: Tone; children?: JSX.Element }) {
+/**
+ * Feedback in a tone: an error, a warning, a success, something in progress.
+ *
+ * - `bar` (the default): full width, square, flush with the edges of the
+ *   panel or card it sits in (above a composer, under a toolbar).
+ * - `inline`: a rounded, outlined box inside a form or card's flow.
+ *
+ * Give `title` and/or `message` for the standard look (a strong title, the
+ * message under it, both in the tone's text color) and `action` for one
+ * trailing control (Retry, Dismiss). `children` still work for anything else
+ * and come after the message. Warnings and errors are announced at once.
+ */
+export function Banner(
+  props: Testable & {
+    tone: Tone;
+    variant?: "bar" | "inline";
+    title?: string;
+    message?: string;
+    action?: JSX.Element;
+    children?: JSX.Element;
+  },
+) {
+  const inline = () => props.variant === "inline";
   return (
     <View
-      class={cx("flex-row items-center gap-(--space-3) px-(--space-4) py-(--space-2)", toneSurfaceClass[props.tone])}
+      class={cx(
+        "flex-row items-center gap-(--space-3)",
+        inline() ? cx("rounded-(--radius) border px-(--space-3) py-(--space-2)", toneBorderClass[props.tone]) : "px-(--space-4) py-(--space-2)",
+        toneSurfaceClass[props.tone],
+      )}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
       role="alert"
     >
-      {props.children}
+      <If
+        when={props.title || props.message}
+        else={props.children}
+      >
+        <View class="flex-1 min-w-0 flex-col gap-px">
+          <If when={props.title}>
+            <Text class={cx(textClass.sm, "font-semibold", toneTextClass[props.tone])}>{props.title}</Text>
+          </If>
+          <If when={props.message}>
+            <Text class={cx(textClass.sm, toneTextClass[props.tone])}>{props.message}</Text>
+          </If>
+          {props.children}
+        </View>
+      </If>
+      <If when={props.action}>
+        <View class="shrink-0 flex-row items-center gap-(--space-2)">{props.action}</View>
+      </If>
     </View>
   );
 }
@@ -431,6 +574,138 @@ export function Banner(props: Testable & { tone: Tone; children?: JSX.Element })
 /** A tone-coloured rail beside a block of content (transcript entries). */
 export function Rail(props: { tone: Tone }) {
   return <View class={cx("w-[3px] self-stretch rounded-full", toneSolidClass[props.tone])} />;
+}
+
+// ---------------------------------------------------------------- disclosure
+
+/**
+ * A titled section that opens and closes (advanced options, history,
+ * details). The header row is the trigger: a chevron, the title, an optional
+ * summary and trailing content. Its content opens with a short reveal, and
+ * at once when the user asked for reduced motion (NSH's Collapsible).
+ * The trigger's testID is `${testID}:toggle`.
+ */
+export function Disclosure(
+  props: Testable & {
+    title: string;
+    open: boolean;
+    onToggle: (open: boolean) => void;
+    /** A quiet note after the title ("3 runs", "Optional"). */
+    summary?: string;
+    /** Content at the header's end (a badge). Keep it non-interactive. */
+    trailing?: JSX.Element;
+    disabled?: boolean;
+    children?: JSX.Element;
+  },
+) {
+  return (
+    <Collapsible
+      open={props.open}
+      reveal
+      class="flex-col"
+      testID={props.testID}
+      content={<View class="flex-col gap-(--space-2) pt-(--space-2)">{props.children}</View>}
+    >
+      <View
+        class={cx(
+          "group flex-row items-center gap-(--space-2) min-h-[32px] -mx-2 rounded-(--radius-sm) px-(--space-2) hover:bg-muted active:bg-muted",
+          focusRing,
+          disabledClass,
+        )}
+        role="button"
+        focusable={!props.disabled}
+        disabled={props.disabled}
+        onPress={() => props.onToggle(!props.open)}
+        accessibilityState={{ expanded: props.open, disabled: !!props.disabled }}
+        accessibilityLabel={props.accessibilityLabel ?? props.title}
+        testID={props.testID ? `${props.testID}:toggle` : undefined}
+      >
+        <Icon name={props.open ? "chevron-down" : "chevron-right"} color="muted" size={14} />
+        <Text class={cx(textClass.sm, "font-semibold text-foreground")} style={{ numberOfLines: 1 }}>
+          {props.title}
+        </Text>
+        <If when={props.summary}>
+          <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+            {props.summary}
+          </Text>
+        </If>
+        <View class="flex-1" />
+        {props.trailing}
+      </View>
+    </Collapsible>
+  );
+}
+
+// ---------------------------------------------------------------- actions menu
+
+export type ActionsMenuItem = {
+  /** Unique among the items; also the item's testID, as given. */
+  id: string;
+  label: string;
+  onPress: () => void;
+  disabled?: boolean;
+  /** Removes or revokes something: drawn in the danger ink, after a separator. Lead to a confirmation. */
+  destructive?: boolean;
+};
+
+/**
+ * Secondary actions folded into a menu ("More", "Actions"). The trigger is a
+ * compact ghost button with the label and a chevron (`testID`); the items
+ * open in a popover, in the order given, with a separator before a
+ * destructive item that follows others. Keyboard: Return, Space or Down open
+ * it on the first item, the arrows move, Escape closes (NSH's Menu).
+ */
+export function ActionsMenu(
+  props: Testable & {
+    label: string;
+    items: readonly ActionsMenuItem[];
+    disabled?: boolean;
+  },
+) {
+  const rows = () =>
+    props.items.map((item, i) => ({ item, separated: !!item.destructive && i > 0 && !props.items[i - 1].destructive }));
+  return (
+    <Menu
+      placement="bottom"
+      align="end"
+      offset={4}
+      popupClass={cx(popoverClass, "min-w-[180px]")}
+      trigger={
+        <Button
+          class={cx(
+            "group flex-row items-center gap-(--space-1) rounded-(--radius-sm) px-(--space-2) hover:bg-muted active:bg-muted aria-expanded:bg-muted",
+            controlHeightClass.compact,
+            focusRing,
+            disabledClass,
+          )}
+          disabled={props.disabled}
+          accessibilityLabel={props.accessibilityLabel ?? props.label}
+          testID={props.testID}
+        >
+          <Text class={cx(textClass.xs, "font-medium text-foreground")}>{props.label}</Text>
+          <Icon name="chevron-down" color="muted" size={14} />
+        </Button>
+      }
+    >
+      <Each of={rows()} key={(row) => row.item.id}>
+        {(row) => (
+          <>
+            <If when={row().separated}>
+              <MenuSeparator class="my-[4px] h-px bg-border" />
+            </If>
+            <MenuItem
+              class={popoverItemClass}
+              disabled={row().item.disabled}
+              onSelect={() => row().item.onPress()}
+              testID={row().item.id}
+            >
+              <Text class={cx(textClass.sm, row().item.destructive ? "text-tone-danger-foreground" : "text-popover-foreground")}>{row().item.label}</Text>
+            </MenuItem>
+          </>
+        )}
+      </Each>
+    </Menu>
+  );
 }
 
 // ---------------------------------------------------------------- lists
@@ -441,6 +716,27 @@ export function ScrollArea(props: StackProps) {
     <Scroll class="flex-1 min-h-0" testID={props.testID}>
       <View class={stackClass({ ...props, grow: false }, "col")}>{props.children}</View>
     </Scroll>
+  );
+}
+
+/**
+ * A page that scrolls with a footer that doesn't: the footer (an ActionBar of
+ * Save / Cancel) stays at the bottom of the page while the content scrolls
+ * above it. Content and footer share the content width unless `wide`.
+ * The scrolling region takes `testID`; the footer `${testID}:footer`.
+ */
+export function PageLayout(props: StackProps & { footer?: JSX.Element; wide?: boolean }) {
+  return (
+    <View class="flex-1 min-h-0 flex-col">
+      <Scroll class="flex-1 min-h-0" testID={props.testID}>
+        <View class={cx(stackClass({ ...props, grow: false }, "col"), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>
+      </Scroll>
+      <If when={props.footer}>
+        <View class="border-t border-border bg-background px-(--space-6) py-(--space-3)" testID={props.testID ? `${props.testID}:footer` : undefined}>
+          <View class={cx("w-full", !props.wide && "max-w-(--content-width) self-center")}>{props.footer}</View>
+        </View>
+      </If>
+    </View>
   );
 }
 
@@ -483,7 +779,8 @@ export type ChoiceOption<T extends string> = { value: T; label: string; descript
 /**
  * Pick exactly one of a few options (an appearance, a mode). A radio group
  * for screen readers and the keyboard (arrows move, Space checks). Each
- * option's testID is `${testID}:${value}`.
+ * option's testID is `${testID}:${value}`. 36 high, like every control; the
+ * chosen option is the primary fill, the others muted text on the track.
  */
 export function SegmentedControl<T extends string>(
   props: {
@@ -506,11 +803,12 @@ export function SegmentedControl<T extends string>(
         {(option) => (
           <Radio
             class={cx(
-              "group flex-row items-center justify-center min-w-[84px] rounded-[5px] px-(--space-3) py-[6px] checked:bg-primary disabled:opacity-50",
+              "group flex-row items-center justify-center min-w-[84px] min-h-[28px] rounded-[5px] px-(--space-3) checked:bg-primary",
               // Hover only on unchecked options: a hover background would
               // otherwise cover the checked one under the pointer.
               props.value !== option().value && "hover:bg-background/60",
               focusRing,
+              disabledClass,
             )}
             checked={props.value === option().value}
             disabled={props.disabled || option().disabled}
@@ -518,7 +816,16 @@ export function SegmentedControl<T extends string>(
             accessibilityLabel={option().description ? `${option().label}. ${option().description}` : option().label}
             testID={props.testID ? `${props.testID}:${option().value}` : undefined}
           >
-            <Text class="text-(length:--text-sm) font-medium text-muted-foreground group-checked:text-primary-foreground">{option().label}</Text>
+            <Text
+              class={cx(
+                textClass.sm,
+                "font-medium text-muted-foreground group-checked:text-primary-foreground",
+                // As with the background: hover ink only on unchecked options.
+                props.value !== option().value && "group-hover:text-foreground",
+              )}
+            >
+              {option().label}
+            </Text>
           </Radio>
         )}
       </Each>
@@ -540,9 +847,9 @@ export function Toggle(
 ) {
   return (
     <Switch
-      class={cx("flex-row items-center gap-(--space-2) rounded-full disabled:opacity-50", focusRing)}
-      trackClass="w-[36px] h-[20px] rounded-full bg-input p-[2px] checked:bg-primary transition-colors"
-      thumbClass="size-[16px] rounded-full bg-primary-foreground checked:translate-x-4 transition-transform"
+      class={cx("flex-row items-center gap-(--space-2) rounded-full", focusRing, disabledClass)}
+      trackClass="w-[36px] h-[20px] rounded-full bg-input p-[2px] checked:bg-primary transition-colors motion-reduce:transition-none"
+      thumbClass="size-[16px] rounded-full bg-primary-foreground checked:translate-x-4 transition-transform motion-reduce:transition-none"
       checked={props.checked}
       disabled={props.disabled}
       onChange={({ checked }) => props.onChange(checked)}
@@ -550,15 +857,25 @@ export function Toggle(
       testID={props.testID}
     >
       <If when={props.showLabel}>
-        <Text class="text-(length:--text-sm) text-foreground">{props.label}</Text>
+        <Text class={cx(textClass.sm, "text-foreground")}>{props.label}</Text>
       </If>
     </Switch>
   );
 }
 
-export type PickerItem = { value: string; label: string; disabled?: boolean; group?: string };
+export type PickerItem = {
+  value: string;
+  label: string;
+  disabled?: boolean;
+  group?: string;
+  /**
+   * A second, muted line under the label in the list (what the option does).
+   * Screen readers and search get it too; the trigger shows only the label.
+   */
+  detail?: string;
+};
 
-/** A drop-down choice among many (a provider, a model). */
+/** A drop-down choice among many (a provider, a model). Option rows' testIDs are `${testID}:${value}`. */
 export function Picker(
   props: {
     accessibilityLabel: string;
@@ -572,30 +889,58 @@ export function Picker(
   },
 ) {
   const current = () => props.items.find((item) => item.value === props.value)?.label;
+  const byValue = () => new Map(props.items.map((item) => [item.value, item]));
+  const anyDetail = () => props.items.some((item) => item.detail);
   return (
     <Select
       class={cx(
-        "flex-row items-center justify-between gap-(--space-2) min-h-[32px] min-w-[200px] self-start rounded-(--radius-sm) border border-input bg-background px-(--space-3) hover:bg-muted disabled:opacity-50",
+        "flex-row items-center justify-between gap-(--space-2) min-w-[200px] self-start rounded-(--radius-sm) border border-input bg-background px-(--space-3) hover:bg-muted",
+        controlHeightClass.default,
         focusRing,
+        disabledClass,
       )}
-      items={props.items.map((item) => ({ value: item.value, title: item.label, disabled: item.disabled, group: item.group }))}
+      items={props.items.map((item) => ({
+        value: item.value,
+        // The title is what screen readers say and search matches: the
+        // label, then the detail when there is one.
+        title: item.detail ? `${item.label} — ${item.detail}` : item.label,
+        disabled: item.disabled,
+        group: item.group,
+      }))}
       value={props.value}
       onChange={({ value }) => props.onChange(value)}
       placeholder={props.placeholder}
       searchable={props.searchable}
       disabled={props.disabled}
       accessibilityLabel={props.accessibilityLabel}
-      popupClass="rounded-(--radius) border border-border bg-popover p-[4px] shadow-lg"
-      itemClass="rounded-(--radius-sm) px-(--space-2) py-[6px] text-(length:--text-sm) text-popover-foreground focus:bg-accent selected:font-semibold disabled:opacity-50"
+      popupClass={popoverClass}
+      itemClass={cx(popoverItemClass, "selected:font-semibold")}
       groupClass="px-(--space-2) pt-(--space-2) pb-(--space-1)"
-      searchClass="rounded-(--radius-sm) border border-input bg-background px-(--space-2) py-(--space-1) text-(length:--text-sm) text-foreground"
+      searchClass={cx("mb-[4px] rounded-(--radius-sm) border border-input bg-background px-(--space-2) py-(--space-1) text-foreground", textClass.sm)}
       testID={props.testID}
+      renderItem={
+        anyDetail()
+          ? (entry) => {
+              const item = byValue().get(entry.value);
+              return (
+                <View class="flex-col gap-px" testID={props.testID ? `${props.testID}:${entry.value}` : undefined}>
+                  <Text class={cx(textClass.sm, "text-popover-foreground")} style={{ numberOfLines: 1 }}>
+                    {item?.label ?? entry.title}
+                  </Text>
+                  <If when={item?.detail}>
+                    <Text class={cx(textClass.xs, "text-muted-foreground")}>{item?.detail}</Text>
+                  </If>
+                </View>
+              );
+            }
+          : undefined
+      }
       trigger={
         <View class="flex-1 flex-row items-center justify-between gap-(--space-2)">
-          <Text class={cx("text-(length:--text-sm)", current() ? "text-foreground" : "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+          <Text class={cx(textClass.sm, current() ? "text-foreground" : "text-muted-foreground")} style={{ numberOfLines: 1 }}>
             {current() ?? props.placeholder ?? ""}
           </Text>
-          <Text class="text-(length:--text-xs) text-muted-foreground">▾</Text>
+          <Icon name="chevron-down" color="muted" size={14} />
         </View>
       }
     />
@@ -607,11 +952,11 @@ export function PageHeader(props: Testable & { title: string; subtitle?: string;
   return (
     <View class="flex-row items-start gap-(--space-4) pb-(--space-2)" testID={props.testID}>
       <View class="flex-1 min-w-0 flex-col gap-(--space-1)">
-        <Text class="text-(length:--text-xl) font-semibold tracking-tight text-foreground" role="header">
+        <Text class={cx(textClass["2xl"], "font-semibold tracking-tight text-foreground")} role="header">
           {props.title}
         </Text>
         <If when={props.subtitle}>
-          <Text class="text-(length:--text-sm) text-muted-foreground">{props.subtitle}</Text>
+          <Text class={cx(textClass.sm, "text-muted-foreground")}>{props.subtitle}</Text>
         </If>
       </View>
       {props.children}
@@ -629,12 +974,12 @@ export function SettingsGroup(props: Testable & { title?: string; description?: 
       <If when={props.title || props.description}>
         <View class="flex-col gap-px px-(--space-1)">
           <If when={props.title}>
-            <Text class="text-(length:--text-sm) font-semibold text-foreground" role="header">
+            <Text class={cx(textClass.sm, "font-semibold text-foreground")} role="header">
               {props.title}
             </Text>
           </If>
           <If when={props.description}>
-            <Text class="text-(length:--text-xs) text-muted-foreground">{props.description}</Text>
+            <Text class={cx(textClass.xs, "text-muted-foreground")}>{props.description}</Text>
           </If>
         </View>
       </If>
@@ -653,17 +998,17 @@ export function SettingRow(props: Testable & { label: string; description?: stri
   return (
     <View
       class={cx(
-        "border-t border-border px-(--space-4) py-(--space-3) gap-(--space-3)",
+        "border-t border-border px-(--space-4) py-(--space-3) gap-(--space-3) min-h-[56px]",
         props.stacked ? "flex-col" : "flex-row items-center justify-between",
       )}
       testID={props.testID}
     >
       <View class="flex-1 min-w-0 flex-col gap-px">
-        <Text class="text-(length:--text-md) font-medium text-card-foreground" accessibilityLabel={props.accessibilityLabel}>
+        <Text class={cx(textClass.md, "font-medium text-card-foreground")} accessibilityLabel={props.accessibilityLabel}>
           {props.label}
         </Text>
         <If when={props.description}>
-          <Text class="text-(length:--text-xs) text-muted-foreground">{props.description}</Text>
+          <Text class={cx(textClass.xs, "text-muted-foreground")}>{props.description}</Text>
         </If>
       </View>
       {props.children}
