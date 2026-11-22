@@ -326,17 +326,24 @@ test("packaged: following a starting worker stops when the page closes or the us
   await app.wait(3200);
   expect(reads()).toBe(left);
 
-  // Back on the page it resumes; signing out ends it for good.
+  // Back on the page it resumes. The session then ends while the page is still
+  // open and following the worker: the fixture stops accepting Bob's token, so
+  // the app's next ordinary request gets 401 and the session ends. Following
+  // stops for good.
   await openProviders(app);
   await app.wait(1700);
   expect(reads()).toBeGreaterThan(left);
-  // Sign out is in the account menu, which Settings covers: close it, then sign out.
-  await app.back();
-  await app.press("id:account-menu");
-  await app.press("id:disconnect");
-  await app.waitFor("id:connect");
-  await app.wait(300);
-  const out = reads();
-  await app.wait(3200);
-  expect(reads()).toBe(out);
+  expect(app.shows("id:providers-settings")).toBe(true); // Settings stays open
+  const token = TOKENS.bob!;
+  TOKENS.bob = "tok-bob-expired";
+  try {
+    await app.waitFor("id:connect", { timeout: 8000 });
+    expect(app.shows("text:/rejected the access token/")).toBe(true); // ended by the 401, not by a press
+    await app.wait(300);
+    const out = reads();
+    await app.wait(3200);
+    expect(reads()).toBe(out);
+  } finally {
+    TOKENS.bob = token;
+  }
 });
