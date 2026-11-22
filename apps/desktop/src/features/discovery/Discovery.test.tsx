@@ -39,6 +39,12 @@ async function search(app: App, query: string) {
   await app.waitFor("id:search-results");
 }
 
+/** A task's History, Pause or Resume and Delete… are items of its "More" menu. */
+async function taskMenu(app: App, id: string, item: "history" | "pause" | "resume" | "delete") {
+  await app.press(`id:schedule-more:${id}`);
+  await app.press(`id:schedule-${item}:${id}`);
+}
+
 test("search covers my Chat and my Spaces only, says it was reranked by System One, and opens the conversation", async () => {
   const w = discoveryWorld();
   seedCorpus(w);
@@ -170,9 +176,10 @@ test("a daily 09:00 task in Asia/Manila goes to a chosen room, shows its next fi
   await app.type("id:schedule-prompt", "Summarise yesterday in the lobby.");
   await app.press("id:schedule-destination");
   await app.press("text:Acme");
-  await app.waitFor("text:To: agent in Acme › #lobby");
+  await app.waitFor("text:To: the agent in Acme · #lobby");
   // Every day at 09:00 is the default shape; the zone defaults to the device's and is visible.
   expect(app.value("id:schedule-timezone")).toBe("UTC");
+  await app.press("id:schedule-zone:other");
   await app.clear("id:schedule-timezone");
   await app.type("id:schedule-timezone", "Asia/Manila");
   await app.waitFor("text:/Sends cron “0 9 \\* \\* \\*” in Asia\\/Manila/");
@@ -190,8 +197,16 @@ test("a daily 09:00 task in Asia/Manila goes to a chosen room, shows its next fi
   const id = w.d.tasks[0]!.id;
   await app.waitFor(`id:schedule:${id}`);
   expect(text(app)).toContain("Every day at 09:00 · Asia/Manila");
-  expect(text(app)).toContain("Next: Tue, Nov 24, 2026 · 09:00 Asia/Manila (UTC+08:00) · Tue, Nov 24, 2026 · 01:00 UTC");
-  expect(text(app)).toContain("To: agent in Acme › #lobby");
+  // The card: how far off, then the server's wall time in the task's own zone.
+  expect(text(app)).toMatch(/Next (in|ago) [^|]* · Tue, Nov 24(, 2026)? · 09:00 Asia\/Manila/);
+  expect(app.shows(`id:schedule:${id} >> text:Acme · #lobby`)).toBe(true);
+  // The exact instant, with its offset and in UTC, is behind History.
+  expect(text(app)).not.toContain("01:00 UTC");
+  await app.press(`id:schedule-more:${id}`);
+  await app.press(`id:schedule-history:${id}`);
+  await app.waitFor(`id:schedule-exact:${id}`);
+  expect(text(app)).toContain("Tue, Nov 24, 2026 · 09:00 Asia/Manila (UTC+08:00)");
+  expect(text(app)).toContain("Tue, Nov 24, 2026 · 01:00 UTC");
 
   // A zone the server doesn't know: its own reason, and nothing saved.
   await app.press(`id:schedule-edit:${id}`);
@@ -204,11 +219,14 @@ test("a daily 09:00 task in Asia/Manila goes to a chosen room, shows its next fi
   await app.press("id:schedule-save");
   await app.waitFor("id:schedule-form-error");
   expect(text(app)).toContain("unknown time zone `Mars/Base`; use an IANA zone such as Asia/Manila");
-  await app.press("id:schedule-timezone-device");
+  expect(w.d.tasks[0]!.schedule).toEqual({ kind: "cron", expression: "0 9 * * *", timezone: "Asia/Manila" }); // nothing saved
+  await app.press("id:schedule-zone:device");
+  expect(app.value("id:schedule-timezone")).toBe("UTC");
   await app.press("id:schedule-save");
   await app.waitFor("text:Saved “Morning summary”.");
   expect(lastBody(w, `/v1/schedules/${id}`)?.schedule).toEqual({ kind: "cron", expression: "30 7 1 * *", timezone: "UTC" });
-  expect(text(app)).toContain("Custom cron: 30 7 1 * * · UTC");
+  expect(text(app)).toContain("Cron 30 7 1 * * · UTC");
+  expect(w.d.tasks).toHaveLength(1); // edited in place, not a second task
 });
 
 test("a one-time task in UTC or the device's zone is sent with its offset; past times are refused here", async () => {
@@ -241,8 +259,8 @@ test("a one-time task in UTC or the device's zone is sent with its offset; past 
   await app.waitFor("text:Scheduled “Reminder”.");
   expect(lastBody(w, "/v1/schedules")).toMatchObject({ space_id: null, room_id: null, schedule: { kind: "once", at: `${year}-03-02T17:30:00Z` } });
   const id = w.d.tasks[0]!.id;
-  expect(text(app)).toContain("To: agent in Your personal Chat");
-  expect(text(app)).toContain(`Next: `);
+  expect(app.shows(`id:schedule:${id} >> text:Your personal Chat`)).toBe(true);
+  expect(app.shows(`id:schedule:${id} >> text:/^Next in /`)).toBe(true);
   expect(text(app)).toContain(`Mar 2, ${year} · 17:30 UTC`);
   expect(app.shows(`id:schedule:${id}`)).toBe(true);
 });
@@ -276,16 +294,23 @@ test("pause, resume, history (dispatched is not completed) and delete with confi
   await app.waitFor("id:schedule:st9");
   expect(text(app)).not.toContain("Bob's own task");
   expect(text(app)).toContain("Every day at 09:00 · UTC");
-  expect(text(app)).toContain("Next: Tue, Nov 24, 2026 · 09:00 UTC");
+  expect(text(app)).toMatch(/Next (in|ago) [^|]* · Tue, Nov 24(, 2026)? · 09:00 UTC/);
 
   await app.waitFor("id:schedule:st11");
-  expect(text(app)).toContain("No more firings");
-  expect(text(app)).toContain("It won't fire again: a one-time task fires once.");
+  // Already fired, nothing left: the badge says so and there's no "next" line.
+  expect(app.shows("id:schedule:st11 >> text:No more firings")).toBe(true);
+  expect(app.shows("id:schedule-next:st11")).toBe(false);
+  expect(app.shows("id:schedule-edit:st11")).toBe(true);
+  // Its menu holds History and Delete…, but nothing to pause or resume.
+  await app.press("id:schedule-more:st11");
+  await app.waitFor("id:schedule-history:st11");
+  expect(app.shows("id:schedule-delete:st11")).toBe(true);
   expect(app.shows("id:schedule-pause:st11")).toBe(false);
   expect(app.shows("id:schedule-resume:st11")).toBe(false);
-  for (const a of ["edit", "delete", "history"]) expect(app.shows(`id:schedule-${a}:st11`)).toBe(true);
+  await app.back(); // Escape closes the menu, changing nothing
+  await app.waitFor("id:schedule-history:st11", { state: "gone" });
 
-  await app.press("id:schedule-history:st9");
+  await taskMenu(app, "st9", "history");
   await app.waitFor("id:schedule-run:st9:2");
   expect(text(app)).toContain("Dispatched");
   expect(text(app)).toContain("This doesn't mean it succeeded");
@@ -293,20 +318,25 @@ test("pause, resume, history (dispatched is not completed) and delete with confi
   expect(text(app)).toContain("Missed");
   expect(text(app)).toContain("1 occurrence skipped");
 
-  await app.press("id:schedule-pause:st9");
-  await app.waitFor("id:schedule-resume:st9");
+  await taskMenu(app, "st9", "pause");
+  await app.waitFor("id:schedule:st9 >> text:Won't fire while paused.");
+  expect(app.shows("id:schedule:st9 >> text:Paused")).toBe(true);
   expect(lastBody(w, "/v1/schedules/st9")).toEqual({ enabled: false });
-  expect(text(app)).toContain("Paused. It won't fire until you resume it.");
+  await app.press("id:schedule-more:st9");
+  await app.waitFor("id:schedule-resume:st9");
+  expect(app.shows("id:schedule-pause:st9")).toBe(false);
   await app.press("id:schedule-resume:st9");
-  await app.waitFor("id:schedule-pause:st9");
+  await app.waitUntil(() => w.d.tasks.find((t) => t.id === "st9")?.enabled === true);
   expect(lastBody(w, "/v1/schedules/st9")).toEqual({ enabled: true });
 
-  await app.press("id:schedule-delete:st9");
+  // Delete… only asks; Cancel keeps the task, and only the confirmation deletes it.
+  await taskMenu(app, "st9", "delete");
   await app.waitFor("id:schedule-confirm:st9");
   expect(w.d.tasks.some((t) => t.id === "st9")).toBe(true);
   await app.press("id:schedule-cancel-delete");
   await app.waitFor("id:schedule-confirm:st9", { state: "gone" });
-  await app.press("id:schedule-delete:st9");
+  expect(w.d.tasks.some((t) => t.id === "st9")).toBe(true);
+  await taskMenu(app, "st9", "delete");
   await app.press("id:schedule-confirm-delete:st9");
   await app.waitFor("text:Deleted “Standup nudge”. It won't fire again.");
   expect(w.d.tasks.some((t) => t.id === "st9")).toBe(false);
