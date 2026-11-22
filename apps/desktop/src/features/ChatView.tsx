@@ -39,7 +39,7 @@ import {
   stopRun,
 } from "../store";
 import type { Run } from "../store";
-import { Action, Badge, Banner, Chip, Column, compactWidth, Field, Label, Row, ScrollArea, Spacer, Surface } from "../ui";
+import { Action, Badge, Banner, Chip, Column, compactWidth, Field, Icon, Label, Row, ScrollArea, Spacer, Surface } from "../ui";
 import { EmptyState, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
 import { Composer, ConnectionBanner, Transcript } from "./Conversation";
@@ -181,12 +181,64 @@ function RunsAside() {
           {(run) => <RunCard run={run} />}
         </Each>
         <If when={runsLoaded() && runs().length === 0 && !runsError()}>
-          <Label variant="caption" color="muted" testID="runs-empty">
-            No runs yet.
-          </Label>
+          <RunsEmpty />
         </If>
       </ScrollArea>
     </Surface>
+  );
+}
+
+/** Task drafts the empty runs list suggests. Nothing names a Space or room: the user picks those. */
+export const TASK_SUGGESTIONS: readonly { label: string; draft: string }[] = [
+  { label: "Summarize a room", draft: "Summarize what happened in this room recently." },
+  { label: "List open work", draft: "List the open tasks here and anything that's blocked." },
+];
+
+/**
+ * No runs yet: what this list is for, and two task drafts. A suggestion opens
+ * the task form and fills its draft only when the draft is empty. It never
+ * chooses a Space or room, never touches the Chat's message box, and never
+ * sends. Without a Space there is nowhere to send a task, so the suggestions
+ * are disabled and say why.
+ */
+function RunsEmpty() {
+  const noSpace = () => spaces().length === 0;
+  const suggest = (text: string) => {
+    if (noSpace()) return;
+    dispatchOpen.set(true);
+    if (dispatchDraft().trim() === "") dispatchDraft.set(text);
+  };
+  return (
+    <Column gap={2} padY={3} align="center" testID="runs-empty">
+      <Icon name="runner" color="muted" size={20} />
+      <Label variant="caption" color="muted" testID="runs-empty-text">
+        {noSpace()
+          ? "No runs yet. Join or create a Space to send its agent a task."
+          : "No runs yet. Tasks you send to a Space's agent show up here."}
+      </Label>
+      <Row gap={2} wrap justify="center">
+        <Each of={[...TASK_SUGGESTIONS]} key={(s) => s.label}>
+          {(s) => (
+            <Action
+              compact
+              variant="secondary"
+              icon="plus"
+              testID={`runs-suggestion:${TASK_SUGGESTIONS.indexOf(s())}`}
+              label={s().label}
+              disabled={noSpace()}
+              accessibilityLabel={
+                noSpace()
+                  ? `${s().label}: unavailable, you're not in any Space yet`
+                  : dispatchDraft().trim() !== ""
+                    ? `${s().label}: open the task form (your draft is kept)`
+                    : `${s().label}: open the task form with this draft`
+              }
+              onPress={() => suggest(s().draft)}
+            />
+          )}
+        </Each>
+      </Row>
+    </Column>
   );
 }
 
