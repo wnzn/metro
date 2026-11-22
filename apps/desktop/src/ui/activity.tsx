@@ -7,7 +7,7 @@
 // Motion is native (`createMotion`). When the user asks for less motion
 // (`reduceMotion`) the dots are drawn still and no motion is created.
 
-import { Image, Text, View, cleanup, createMotion, reduceMotion, token } from "nsh";
+import { Image, Text, View, cleanup, createMotion, reduceMotion, token, windowSize } from "nsh";
 import type { ImageAsset, JSX, Tokens } from "nsh";
 import { Button } from "nsh/base";
 import chatIcon from "./icons/chat.svg";
@@ -180,6 +180,16 @@ export function CodeOutput(props: {
     </View>
   );
 }
+
+// ---------------------------------------------------------------- layout
+
+/**
+ * The window is wide enough for a side panel (the Chat's runs) beside the
+ * sidebar without squeezing the conversation: 256 sidebar + 340 panel leaves
+ * the conversation at least ~500 points, where the composer's controls fit.
+ * Narrower windows show the panel in a dialog instead.
+ */
+export const sidePanelFits = () => windowSize().width >= 1100;
 
 // ---------------------------------------------------------------- empty state
 

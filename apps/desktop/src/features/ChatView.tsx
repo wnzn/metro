@@ -39,16 +39,16 @@ import {
   stopRun,
 } from "../store";
 import type { Run } from "../store";
-import { Action, Badge, Banner, Chip, Column, compactWidth, Field, Icon, Label, Row, ScrollArea, Spacer, Surface } from "../ui";
-import { EmptyState, SuggestionChip } from "../ui/activity";
+import { Action, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, Row, ScrollArea, Spacer, Surface } from "../ui";
+import { EmptyState, sidePanelFits, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
 import { Composer, ConnectionBanner, Transcript } from "./Conversation";
 import { roomTree } from "./Sidebar";
 
 /** The task form is open (folded behind "New task" otherwise). */
 const dispatchOpen = signal(false);
-/** In a narrow window the runs list is shown on request. */
-const asideOpen = signal(false);
+/** In a window too narrow for the side panel, the runs open in a dialog over the Chat. */
+const runsDialogOpen = signal(false);
 
 /** Drafts the empty Chat suggests. The personal agent has no tools, so none asks for any. */
 export const CHAT_SUGGESTIONS: readonly { label: string; draft: string }[] = [
@@ -58,7 +58,6 @@ export const CHAT_SUGGESTIONS: readonly { label: string; draft: string }[] = [
 ];
 
 export function ChatView() {
-  const showAside = () => !compactWidth() || asideOpen();
   return (
     <Surface variant="app" testID="chat-view">
       <Surface variant="panel" grow>
@@ -71,12 +70,13 @@ export function ChatView() {
               Only you see this chat, and its agent can't see your Spaces.
             </Label>
           </Column>
-          <If when={compactWidth()}>
+          <If when={!sidePanelFits()}>
             <Action
               compact
               testID="runs-toggle"
-              label={asideOpen() ? "Hide runs" : runs().some(isActiveRun) ? `Runs · ${runs().filter(isActiveRun).length} active` : "Runs"}
-              onPress={() => asideOpen.set(!asideOpen())}
+              label={runs().some(isActiveRun) ? `Runs · ${runs().filter(isActiveRun).length} active` : "Runs"}
+              accessibilityLabel="Show agent runs"
+              onPress={() => runsDialogOpen.set(true)}
             />
           </If>
         </Surface>
@@ -98,11 +98,18 @@ export function ChatView() {
             </Column>
           )}
         </If>
-        <Composer placeholder="Message your Chat — Return to send" agentHint="Ask agent replies here. It has no runner, workspace or thread tools." disabled={!!chatUnavailable()} />
+        <Composer placeholder="Message your Chat — Return to send" agentHint="No runner, workspace or thread tools here." disabled={!!chatUnavailable()} />
       </Surface>
-      <If when={showAside()}>
-        <RunsAside />
+      {/* Wide windows keep the runs beside the Chat; narrower ones open them
+          in a dialog, so the Chat (and its draft) keeps its full width. */}
+      <If when={sidePanelFits()}>
+        <Surface variant="aside" testID="runs-aside">
+          <RunsPanel />
+        </Surface>
       </If>
+      <Modal testID="runs-dialog" title="Agent runs" open={runsDialogOpen() && !sidePanelFits()} onClose={() => runsDialogOpen.set(false)}>
+        <RunsPanel onClose={() => runsDialogOpen.set(false)} />
+      </Modal>
     </Surface>
   );
 }
@@ -150,9 +157,10 @@ function Onboarding() {
   );
 }
 
-function RunsAside() {
+/** The runs list and task form: in the side panel, or in the dialog (with `onClose`). */
+function RunsPanel(props: { onClose?: () => void }) {
   return (
-    <Surface variant="aside" testID="runs-aside">
+    <Column grow>
       <Column padX={4} padY={3} gap={1}>
         <Row align="center" gap={2}>
           <Column grow>
@@ -160,6 +168,9 @@ function RunsAside() {
           </Column>
           <If when={!dispatchOpen()}>
             <Action compact testID="dispatch-new" icon="plus" label="New task" accessibilityLabel="New task for a Space's agent" onPress={() => dispatchOpen.set(true)} />
+          </If>
+          <If when={props.onClose}>
+            {(close) => <IconButton testID="runs-dialog-close" icon="close" accessibilityLabel="Close agent runs" onPress={() => close()()} />}
           </If>
         </Row>
         <Label variant="caption" color="muted">
@@ -178,13 +189,13 @@ function RunsAside() {
           )}
         </If>
         <Each of={runs()} key={(run) => run.id}>
-          {(run) => <RunCard run={run} />}
+          {(run) => <RunCard run={run} onLeave={props.onClose} />}
         </Each>
         <If when={runsLoaded() && runs().length === 0 && !runsError()}>
           <RunsEmpty />
         </If>
       </ScrollArea>
-    </Surface>
+    </Column>
   );
 }
 
@@ -242,7 +253,7 @@ function RunsEmpty() {
   );
 }
 
-function RunCard(props: { run: () => Run }) {
+function RunCard(props: { run: () => Run; /** Opening the run leaves the Chat: close the dialog first. */ onLeave?: () => void }) {
   const run = () => props.run();
   const scope = () => runScope(run());
   return (
@@ -262,7 +273,16 @@ function RunCard(props: { run: () => Run }) {
         {`Started by ${run().actor === me() ? "you" : run().actor}`}
       </Label>
       <Row gap={2} align="center" wrap>
-        <Action compact testID={`run-open:${run().id}`} label="Open" accessibilityLabel={`Open #${scope().room}`} onPress={() => void openRun(run())} />
+        <Action
+          compact
+          testID={`run-open:${run().id}`}
+          label="Open"
+          accessibilityLabel={`Open #${scope().room}`}
+          onPress={() => {
+            props.onLeave?.();
+            void openRun(run());
+          }}
+        />
         <Action
           compact
           testID={`run-follow:${run().id}`}

@@ -100,17 +100,54 @@ test("Follow up opens the folded form, aimed at the run's room", async () => {
   await app.waitFor("text:To: agent in Acme › #lobby");
 });
 
-test("in a narrow window the runs are shown on request", async () => {
+for (const width of [780, 860, 960]) {
+  test(`at ${width} wide the runs open in a dialog over a full-width Chat; a task sent there leaves the Chat intact`, async () => {
+    const f = world();
+    f.state.runs.push({ id: "run1", space_id: "acme", room_id: "lobby", status: "running", actor: "alice", task: "Audit the build" });
+    const app = await inChat(f, width);
+    await app.waitFor("id:runs-toggle >> text:Runs · 1 active");
+    expect(app.shows("id:runs-aside")).toBe(false); // never squeezed beside the Chat
+    await app.type("id:composer", "my chat draft");
+
+    await app.press("id:runs-toggle");
+    await app.waitFor("id:runs-dialog");
+    await app.press("id:run-follow:run1");
+    await app.waitFor("text:To: agent in Acme › #lobby");
+    await app.type("id:dispatch-text", "also check the tests");
+    await app.press("id:dispatch-send");
+    await app.waitFor("id:dispatch-notice");
+    expect(f.posts().at(-1)).toMatchObject({ path: "/v1/spaces/acme/rooms/lobby/messages", body: { text: "also check the tests", invoke_agent: true } });
+
+    await app.press("id:runs-dialog-close");
+    await app.waitFor("id:runs-dialog", { state: "gone" });
+    expect(app.shows("id:chat-view")).toBe(true);
+    expect(app.value("id:composer")).toBe("my chat draft");
+
+    // Escape closes it too.
+    await app.press("id:runs-toggle");
+    await app.waitFor("id:runs-dialog");
+    await app.back();
+    await app.waitFor("id:runs-dialog", { state: "gone" });
+    expect(app.value("id:composer")).toBe("my chat draft");
+  });
+}
+
+test("at 1200 wide the runs stay beside the Chat, with no dialog toggle", async () => {
+  const f = world();
+  const app = await inChat(f, 1200);
+  await app.waitFor("id:runs-aside");
+  expect(app.shows("id:runs-toggle")).toBe(false);
+});
+
+test("Open from the dialog closes it and goes to the run's room", async () => {
   const f = world();
   f.state.runs.push({ id: "run1", space_id: "acme", room_id: "lobby", status: "running", actor: "alice", task: "Audit the build" });
-  const app = await inChat(f, 820);
-  await app.waitFor("id:runs-toggle");
-  expect(app.shows("id:runs-aside")).toBe(false);
-  await app.waitFor("id:runs-toggle >> text:Runs · 1 active");
+  const app = await inChat(f, 860);
   await app.press("id:runs-toggle");
-  await app.waitFor("id:run:run1");
-  await app.press("id:runs-toggle");
-  await app.waitFor("id:runs-aside", { state: "gone" });
+  await app.waitFor("id:run-open:run1");
+  await app.press("id:run-open:run1");
+  await app.waitFor("text:hello from bob in acme");
+  expect(app.shows("id:runs-dialog")).toBe(false);
 });
 
 const sentAnything = (f: F) => f.posts().some((p) => p.path.endsWith("/messages"));
