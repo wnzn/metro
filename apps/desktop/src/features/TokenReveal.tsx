@@ -264,7 +264,7 @@ export function ListingResult(props: { connectionId: string }) {
             else={
               <Label variant="caption" color="success" testID={`listing-ok:${props.connectionId}`}>
                 {l().state === "ok" && (l() as { models: string[] }).models.length
-                  ? `Connected: ${(l() as { models: string[] }).models.length} models listed.`
+                  ? `Connected: ${(l() as { models: string[] }).models.length} model${(l() as { models: string[] }).models.length === 1 ? "" : "s"} listed.`
                   : "Connected, but it listed no models. Enter a model ID by hand."}
               </Label>
             }

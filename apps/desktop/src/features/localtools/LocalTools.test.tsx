@@ -17,7 +17,9 @@ const LOCAL_RUNNER_SECRET = "metro_rt_local_fixture_secret";
 const FOLDER = "/home/me/.config/metro-desktop/local-tools/accounts/a1/spaces/solo/workspace";
 
 /** The fake bridge plus local tools. `available`: is this session the computer's own workspace? */
-function bridgeWithTools(f: F, available = true) {
+function bridgeWithTools(f: F, available = true, opts: { startingReads?: number } = {}) {
+  /** After enable, this many status reads still report the worker as starting. */
+  let starting = 0;
   const b = fakeBridge(f);
   const tools = new Map<string, any>();
   const log: { method: string; path: string; body: any; auth: string | undefined }[] = [];
@@ -27,6 +29,9 @@ function bridgeWithTools(f: F, available = true) {
     log.push({ method: req.method, path, body, auth: header(req as any, "authorization") });
     if (header(req as any, "authorization") !== `Bearer ${BRIDGE_TOKEN}`) return { status: 401, body: { error: { code: "unauthorized", message: "Unauthorized." } } };
     if (path === "/v1/local-tools") {
+      for (const e of tools.values()) {
+        if (e.worker === "starting" && starting-- <= 0) e.worker = "online";
+      }
       return available
         ? { status: 200, body: { available: true, reason: null, spaces: [...tools.values()] } }
         : { status: 200, body: { available: false, reason: "Local tools work only in this computer's own Metro workspace.", spaces: [] } };
@@ -41,7 +46,9 @@ function bridgeWithTools(f: F, available = true) {
         return { status: 409, body: { error: { code: "runner_present", message: "This Space already has a dedicated runner token. Metro won't replace it." } } };
       }
       space.runnerToken = LOCAL_RUNNER_SECRET;
-      const e = { space_id: space.id, enabled: true, state: "on", worker: "online", detail: null, folder: FOLDER, tools: ["workspace.list", "workspace.read"] };
+      const startingFor = opts.startingReads;
+      if (startingFor !== undefined) starting = startingFor;
+      const e = { space_id: space.id, enabled: true, state: "on", worker: startingFor === undefined ? "online" : "starting", detail: null, folder: FOLDER, tools: ["workspace.list", "workspace.read"] };
       tools.set(space.id, e);
       return { status: 200, body: e };
     }
@@ -169,6 +176,58 @@ test("members never see the switch", async () => {
   await app.waitFor("text:side lobby only");
   expect(app.shows("id:manage-space")).toBe(false);
   expect(app.shows("id:local-tools-card")).toBe(false);
+});
+
+const statusReads = (t: ReturnType<typeof bridgeWithTools>) => t.log.filter((l) => l.method === "GET" && l.path === "/v1/local-tools").length;
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+test("after turning on, the card follows a starting worker to On without reopening the page", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const t = bridgeWithTools(f, true, { startingReads: 2 });
+  const app = await openWith(f, t);
+  await signIn(app, "alice");
+  await manage(app, "solo");
+  await app.press("id:local-tools-enable");
+  await app.waitFor("text:Starting…");
+  const before = statusReads(t);
+  await app.waitFor("text:On", { timeout: 10_000 });
+  expect(app.shows("text:Starting…")).toBe(false);
+  // Exactly the reads needed, then it stops.
+  const after = statusReads(t);
+  expect(after - before).toBe(3);
+  await sleep(2000);
+  expect(statusReads(t)).toBe(after);
+  // Guard semantics unchanged: one guarded enable, nothing else posted.
+  expect(t.log.filter((l) => l.method === "POST").map((l) => l.path)).toEqual(["/v1/local-tools/spaces/solo/enable"]);
+});
+
+test("a worker stuck at starting is followed only while the page is open, and never past the limit", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const t = bridgeWithTools(f, true, { startingReads: 1_000 });
+  const app = await openWith(f, t);
+  await signIn(app, "alice");
+  await manage(app, "solo");
+  const opened = statusReads(t);
+  await app.press("id:local-tools-enable");
+  await app.waitUntil(() => statusReads(t) >= opened + 2, { timeout: 10_000 });
+  // Leaving the page ends it.
+  await app.press("id:close-manage");
+  const left = statusReads(t);
+  await sleep(2000);
+  expect(statusReads(t)).toBe(left);
+
+  // Back on the page it follows again (one poller), and signing out ends it.
+  await app.press("id:manage-space");
+  await app.waitUntil(() => statusReads(t) >= left + 3, { timeout: 10_000 });
+  await app.press("id:disconnect");
+  await sleep(300);
+  const out = statusReads(t);
+  await sleep(2000);
+  expect(statusReads(t)).toBe(out);
+  // Never more than the open read plus the bounded follow-up, per visit.
+  expect(out - left).toBeLessThanOrEqual(1 + 20 + 1);
 });
 
 test("badge reflects the worker honestly", () => {

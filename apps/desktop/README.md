@@ -52,7 +52,11 @@ from a read-only install, with Docker `--network none`
 - **Sidebar footer:** shows where you're connected and your id. It says
   *On this device* only when the session is positively identified as this
   app's own hosted local workspace. Any other server, including one you
-  reach through a manual localhost port forward, shows its actual URL.
+  reach through a manual localhost port forward, shows its actual URL. The final
+  0.2.0 source checks for the hosted local workspace itself, and a test
+  covers a manual port forward. A UI-validation build cut from older source
+  showed the plain loopback address in local mode. The final build hasn't
+  been re-checked in the GUI yet.
 - **Search** is a centered box at the top of the window.
 - **Provider picker:** one searchable dropdown grouped by vendor. Each
   vendor shows how many ways it can be connected and its capabilities. For
@@ -66,6 +70,22 @@ from a read-only install, with Docker `--network none`
   bridge with the bundled server passed.
 
 ### Also verified
+
+These were checked in a packaged Linux UI-validation build, with no CLI,
+separate runner or real vendor
+([acceptance](../../docs/acceptance.md)):
+
+- **Device connection in the app:** **Settings → Model providers →
+  Connect this device** asked for consent before pairing, and no device
+  token was ever shown or entered. A test endpoint offered two models, and
+  only the approved one was listed by **Test connection** and used. The
+  agent answered through it, and kept answering after signing out and
+  after a full restart.
+- **Local tools:** turned on separately for two Spaces from **Manage**.
+  Each Space's listing showed only its own folder, and no model was called.
+  Turning one Space off left the other on.
+
+Checked by tests:
 
 - **Local times:** message times are shown in your local time zone. Tests
   with `Intl` time zones verify the conversion from the server's UTC
@@ -90,17 +110,23 @@ private folder on this computer, per Space, while Metro is open.
 
 ### Not verified yet
 
-- **Device connections in the packaged app** now use **Connect this
-  device**, then **Manage connection** once paired, with no terminal. An
-  end-to-end proof of that pairing is pending the final gate. Vendor software
-  such as the Claude Code CLI stays separate, and you install it yourself.
+- **Device connections with a real vendor:** the in-app flow was verified
+  only against a local test endpoint ([above](#also-verified)). No real
+  vendor account or vendor sign-in has been tested. Vendor software such as
+  the Claude Code CLI stays separate, and you install it yourself.
+- **Status badges:** in the tested build, a **Starting…** badge could stay
+  shown after a device connection or local tools were already working,
+  until you reopened **Manage connection** or the Space's Manage page. A
+  fix is under way.
 - **Windows:** the candidate opened a Metro window and its server answered
   `/healthz` under Wine. Nobody has checked that it draws or takes input,
   or run it on native Windows.
 - App-wide consistency of icons and type: icons appear in the sidebar and
   Settings, but no app-wide check was recorded.
-- **Local tools** (below) are covered by the app's and server's tests, but
-  aren't in the recorded packaged GUI run yet.
+- **Local tools:** `workspace.read` hasn't been exercised in the app, and
+  neither have arbitrary paths. In the UI-validation build, QA also saw
+  the general runner token controls and *Runner attached* under the local
+  tools card.
 - Documents & media: the native file picker was verified only for the
   profile picture. Library uploads, and audio and video playback and
   seeking, haven't been verified.

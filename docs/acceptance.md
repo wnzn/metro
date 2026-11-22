@@ -3,6 +3,104 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Staged: Linux UI validation of the in-app device flow and local tools (2026-11-22, QA, local)
+
+A separate **internal UI-validation build** of the Linux desktop archive
+(SHA-256 `a8d951da5cc280c8be0a288dbc1bd4aa6fe41cae1d133f453e8691a2922b019a`).
+It isn't the 0.2.0 artifact recorded below, which is unchanged, and it isn't
+a release. QA ran the archive's own launcher, packaged app and bundled
+server in Debian 13 under GTK and Xvfb, with no network. Nothing was built
+or swapped in, and neither the connector CLI nor a separate runner was
+used. The only model endpoint was a local test fixture, never an external
+provider.
+
+**Device connection, in the app.**
+
+1. **Use locally** opened a private workspace with no account or token.
+2. **Settings → Model providers** showed vendor marks, and a single OpenAI
+   row with its three ways to connect.
+3. Choosing a self-hosted endpoint on this computer, then **Connect this
+   device**, used the built-in wizard. Pairing stayed disabled until
+   consent was given. No device token was shown, entered or copied, and
+   the old `metro-connector` hand-off didn't appear.
+4. The endpoint listed two models, and only one was approved. **Test
+   connection** succeeded and listed only that model.
+5. With it as the default chat model, **Ask agent** replied in a Space, in
+   the Space again after signing out and back in (with no key re-entered),
+   and in personal Chat after a full exit and relaunch. The fixture saw 2
+   list requests, 3 completions, no rejected auth and no unexpected
+   requests. Plain messages didn't call the model.
+6. After sign-out there was no traffic to the fixture. On close, every
+   Metro process and listener ended.
+7. In the places sampled (process arguments, launcher and app output, the
+   server log), no fixture key or recognizable token appeared. This was a
+   sampled check, not a proof.
+
+**Local tools.** QA turned them on from **Manage** for Space A, then
+separately for Space B, with no runner installed or attached. Each Space's
+`workspace.list` demo showed only its own marker file, with neither the
+sibling Space's marker nor one outside the folder, and no model was called.
+Turning B off returned it to *Off* and *No runner*, and A stayed *On*.
+`workspace.read` and arbitrary paths weren't exercised.
+
+**Still working after a relaunch:** the Settings window, avatar upload
+through the GTK file picker, and workspace restore (room, timestamped
+message, display name, avatar and demo history). Search asked for an
+embeddings connection, and retrieval wasn't tested.
+
+**What QA observed in this build.**
+
+- A **Starting…** badge could stay shown after the device connection or
+  local tools were already working, until **Manage connection** or the
+  Space's Manage page was reopened. No workflow was blocked. Fixes are
+  under way.
+- In local mode, the sidebar showed the plain loopback address instead of
+  an *On this computer* label. This build's source still placed the label
+  without checking for the hosted local workspace. The final source
+  (`b3ef2da…`, below) checks for it, and a test covers a manual localhost
+  port forward. The final build hasn't been re-checked in the GUI.
+- Under the local tools card, the Manage page also showed the general
+  *Dedicated token* and *Rotate token* controls, and the room said *Runner
+  attached*. No token was revealed. This is recorded as an observation
+  only.
+
+Out of scope: Windows, real vendor sign-in (OAuth), abnormal child-process
+exit, and socket activation.
+
+## Staged: final local 0.2.0 test artifacts (2026-11-22, project manager, local)
+
+These are **local test artifacts, not a release.** No binaries have been
+published on GitHub, and pushing the source is still waiting on the
+maintainer. The final gate stays open: one parallel test is intermittent
+(below), and full GUI QA is still under way.
+
+**Source.** Commit `b3ef2dae69208af91a0f1ddfb2056207141c6b31`, tree
+`b6499d58a0ca28e2f7548a1a4ab1f190bfea3b86`.
+
+| Archive | SHA-256 |
+| --- | --- |
+| Windows desktop ZIP | `d836d6d0983121389a92e70641f4f4b2cb3fc24dedb3002b2d0844224b3df440` |
+| Linux desktop archive | `7ab0b0f128848d2409669c736bd1643883fa9a94f35e719ef3e91eaf97449bc1` |
+| Linux runner archive | `192f0767e0b8011ca629a3df8aaac3eaf5254ecb8cfae9c709034932f6724fb3` |
+
+| Check | Result |
+| --- | --- |
+| Archive contents | Every manifest file verified, including the 21 vendor marks and their notices |
+| Release JS bytecode | Exactly matches an independent build from source |
+| Desktop `nsh test` (`TZ=Asia/Manila`) | 155/155 passed |
+| Packaging unit tests | 6 passed |
+| Linux launcher | Socket ownership, restart after a crash, current-bearer handling and shutdown verified |
+| Windows archive, under Wine on Linux | The window opened and the bundled server answered `/healthz`. No native Windows run. |
+| Windows server executable from the final ZIP, under Wine, over its API | Passed: an admin created a managed account; that account set its display name and bio, uploaded a PNG avatar and read it back, and posted a personal message whose stored UTC time came back intact; after the admin revoked the token, it got `401`. No Windows GUI interaction and no production vendor. |
+| Linux runner archive, on Debian 12 | A real confined workspace read passed |
+| `cargo fmt` and strict clippy | Passed |
+| Full parallel Rust gate | **Not clean yet:** one intermittent assertion (an immediate re-acquisition in the exclusive-lock test). Run alone, the affected connector library passed 61/61. Still being investigated. |
+| End-to-end scripts on the integrated code | All 7 passed |
+| Shared dev service, updated | `/admin`, `/v1/me`, `/v1/me/profile` and `/v1/admin/users` verified; an anonymous profile request got `401` |
+
+Still under way: full GUI QA of the in-app device and model flow, and of
+local tools, without any CLI.
+
 ## Staged: 0.2.0 Linux candidate, local workspace and desktop QA (2026-11-22, project manager, local)
 
 Staged evidence for a **locally built 0.2.0 candidate**, reported by the
@@ -32,7 +130,7 @@ with Docker `--network none`.
 | Item | Result |
 | --- | --- |
 | In-app device bridge with the bundled server, in a separate packaged smoke | Passed |
-| Device-connection setup screens in the candidate | Still show older `metro-connector` wording; being fixed. In-app device setup isn't verified end to end. |
+| Device-connection setup screens in the candidate | Still show older `metro-connector` wording; being fixed. In-app device setup wasn't verified end to end in this candidate; it later was, against a local test endpoint ([above](#staged-linux-ui-validation-of-the-in-app-device-flow-and-local-tools-2026-11-22-qa-local)). |
 | Windows x64 candidate, under Wine on Linux | A Metro window started and the bundled server answered `/healthz` with `200`. No check of drawing or input, and no native Windows run. |
 | Live dev service | The new profile and timestamp read endpoints were checked |
 | Rust integration tests | 566 passed, 0 failed, 2 ignored on purpose |
@@ -46,8 +144,9 @@ local workspace*, which the steps above record as seen. Provider marks are
 network fetch, and names and sign-in options are grouped by vendor. The
 conversion of message times to the local time zone is verified by tests
 with `Intl` time zones. The packaged pairing buttons are now **Connect this
-device** and **Manage connection**. An end-to-end proof of pairing is
-pending the final gate. All seven current end-to-end scripts
+device** and **Manage connection**. An end-to-end proof of pairing was
+pending at this point; it was later recorded against a local test endpoint
+([above](#staged-linux-ui-validation-of-the-in-app-device-flow-and-local-tools-2026-11-22-qa-local)). All seven current end-to-end scripts
 (`smoke.py`, `threads.py`, `settings.py`, `device_connector.py`,
 `intelligence.py`, `schedules.py`, `library.py`) passed in an independent
 run. Local tools (read-only

@@ -192,11 +192,10 @@ There are two ways to use Metro:
 **Model access.** Server-stored API profiles need no extra install: the
 server calls the provider. **Device connections** run on your own computer,
 inside the desktop app, so you don't install or start a separate terminal
-program. The 0.2.0 candidate includes this in-app device bridge, and a
-packaged smoke of it with the bundled server passed. Its setup screens
-still show older `metro-connector` wording, which is being fixed, so
-setting up a device connection in the app isn't verified end to end yet
-([status](docs/settings.md#device-connections)). Vendor software that you
+program. In a packaged Linux build, QA paired an endpoint on this computer
+through **Settings → Connect this device**, with no token or terminal, and
+the agent answered through it. That was against a local test endpoint, not
+a real vendor ([status](docs/settings.md#device-connections)). Vendor software that you
 choose to use with Metro, such as the Claude Code CLI, is always separate.
 Install and update it yourself, from its vendor.
 
@@ -286,8 +285,9 @@ tools** lets that Space's agent list and read files (`workspace.list`,
 `workspace.read`) in one private folder on this computer, per Space, while
 Metro is open. The agent can't change files, run commands or see anything
 else on your disk. There's nothing extra to install, and it's only offered
-when the Space has no other runner. It's tested in the app's and server's
-test suites, but it isn't in the recorded packaged GUI run yet.
+when the Space has no other runner. QA turned it on for two Spaces in a
+packaged Linux build: each Space's listing showed only its own folder, and
+turning one off left the other on.
 
 **On a shared server, or for checks and commands: a runner.** An operator
 installs it separately. A runner gives a Space's agent list and read tools over a directory on the

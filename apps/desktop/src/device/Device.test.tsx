@@ -257,3 +257,82 @@ test("unpackaged or malformed variables: no bridge requests, the manual path for
     for (const r of app.requests()) expect(r.url.startsWith(BASE)).toBe(true);
   }
 });
+
+test("packaged: a starting worker turns to serving by itself, with spaced status reads only, while the page is open", async () => {
+  const f = world();
+  const b = fakeBridge(f);
+  b.state.slowStart = true;
+  const app = await openPackaged(f, b);
+  await signIn(app, "bob");
+  await openProviders(app);
+  await createDevice(app, "device-openai-compatible", "Slow box");
+  await app.waitFor("id:device-consent");
+  const c = [...f.state.connections.values()].find((x) => x.name === "Slow box")!;
+  await app.type("id:device-endpoint-url", "http://127.0.0.1:8000/v1");
+  await app.press("id:device-consent-agree");
+  await app.press("id:device-pair");
+  await app.waitFor("id:device-no-key");
+  await app.press("id:device-no-key");
+  await app.press("id:device-save-key");
+  await app.waitFor(`id:device-model:${LOCAL_MODELS[0]}`);
+  await app.press(`id:device-model:${LOCAL_MODELS[0]}`);
+  await app.press("id:device-models-save");
+  await app.waitFor(`id:device-local-state:${c.id} >> text:Starting…`);
+  const listed = b.calls(`/v1/connections/${c.id}/available-models`).length;
+
+  // The worker reaches the server; nothing is pressed or reopened.
+  b.serve(c.id);
+  await app.waitFor(`id:device-local-state:${c.id} >> text:Serving from here`, { timeout: 5000 });
+  // Only status reads followed it: no vendor or model call, and never two at once.
+  expect(b.calls(`/v1/connections/${c.id}/available-models`)).toHaveLength(listed);
+  // The server's view followed too: the row says this computer serves it.
+  await app.press("id:device-setup-done");
+  await app.waitUntil(() => app.texts().some((s) => s.startsWith("This computer serves it")));
+  expectNoSecrets(app);
+});
+
+test("packaged: following a starting worker stops when the page closes or the user signs out", async () => {
+  const f = world();
+  const b = fakeBridge(f);
+  b.state.slowStart = true;
+  const c = f.addConnection("bob", "device-openai-compatible", "Never starts", null);
+  const app = await openPackaged(f, b);
+  await signIn(app, "bob");
+  await openProviders(app);
+  await app.press(`id:connection-manage:${c.id}`);
+  await app.press(`id:connection-token:${c.id}`);
+  await app.type("id:device-endpoint-url", "http://127.0.0.1:8000/v1");
+  await app.press("id:device-consent-agree");
+  await app.press("id:device-pair");
+  await app.waitFor("id:device-no-key");
+  await app.press("id:device-no-key");
+  await app.press("id:device-save-key");
+  await app.waitFor(`id:device-model:${LOCAL_MODELS[0]}`);
+  await app.press(`id:device-model:${LOCAL_MODELS[0]}`);
+  await app.press("id:device-models-save");
+  await app.waitFor(`id:device-local-state:${c.id} >> text:Starting…`);
+  const reads = () => b.calls("/v1/status", "GET").length;
+  const start = reads();
+  await app.wait(3400);
+  expect(reads() - start).toBeGreaterThanOrEqual(1);
+  expect(reads() - start).toBeLessThanOrEqual(3); // spaced, about one per 1.5 s
+
+  // Leaving Model providers ends it.
+  await app.back(); // Escape closes the Settings modal
+  await app.waitFor("id:providers-settings", { state: "gone" });
+  await app.wait(300);
+  const left = reads();
+  await app.wait(3200);
+  expect(reads()).toBe(left);
+
+  // Back on the page it resumes; signing out ends it for good.
+  await openProviders(app);
+  await app.wait(1700);
+  expect(reads()).toBeGreaterThan(left);
+  await app.press("id:disconnect");
+  await app.waitFor("id:connect");
+  await app.wait(300);
+  const out = reads();
+  await app.wait(3200);
+  expect(reads()).toBe(out);
+});

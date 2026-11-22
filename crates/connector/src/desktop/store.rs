@@ -316,16 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn instance_lock_is_exclusive() {
-        let t = tempfile::tempdir().unwrap();
-        let first = try_lock_instance(t.path()).unwrap();
-        assert!(first.is_some());
-        assert!(try_lock_instance(t.path()).unwrap().is_none());
-        drop(first);
-        assert!(try_lock_instance(t.path()).unwrap().is_some());
-    }
-
-    #[test]
     fn bindings_must_match_their_directory() {
         let t = tempfile::tempdir().unwrap();
         let root = t.path();

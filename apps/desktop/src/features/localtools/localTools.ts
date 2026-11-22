@@ -180,6 +180,45 @@ export async function disableLocalTools(spaceId: string): Promise<void> {
   }
 }
 
+/** While a worker says `starting`: re-read at most this often, this many times. */
+export const STARTING_POLL_MS = 750;
+export const STARTING_POLL_MAX = 20;
+
+// At most one follow-up poller, app-wide. Starting a new one ends the old.
+let pollGen = 0;
+
+/**
+ * Re-reads the status until `spaceId`'s worker leaves `starting`, at most
+ * STARTING_POLL_MAX times, one request at a time. `stillValid` is checked
+ * before every request and before applying an answer (the view is still
+ * open for the same Space, owner and session). Returns the stop function.
+ */
+export function followStarting(spaceId: string, stillValid: () => boolean): () => void {
+  const gen = ++pollGen;
+  let timer: number | undefined;
+  let left = STARTING_POLL_MAX;
+  const live = () => gen === pollGen && stillValid();
+  const tick = async () => {
+    timer = undefined;
+    if (!client || !live() || left-- <= 0) return;
+    let next: LocalToolsStatus;
+    try {
+      next = await client.status();
+    } catch {
+      return; // unknown: stop; the next visit reads again
+    }
+    if (!live()) return;
+    localTools.set(next);
+    const e = next.spaces.find((s) => s.spaceId === spaceId);
+    if (e && e.state === "on" && e.worker === "starting") timer = setTimeout(() => void tick(), STARTING_POLL_MS);
+  };
+  timer = setTimeout(() => void tick(), STARTING_POLL_MS);
+  return () => {
+    if (gen === pollGen) pollGen++;
+    clearTimeout(timer);
+  };
+}
+
 export function clearLocalToolsMessages() {
   localToolsError.set(null);
   localToolsNotice.set(null);

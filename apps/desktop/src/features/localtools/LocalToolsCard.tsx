@@ -2,14 +2,15 @@
 // only when the packaged launcher says this session is this computer's own
 // local workspace (status `available`). Never shows a token.
 
-import { Clipboard, signal } from "nsh";
-import { activeSpace } from "../../store";
+import { Clipboard, computed, effect, signal, untracked } from "nsh";
+import { activeSpace, connectedTo, me } from "../../store";
 import { activeSpaceRunner } from "../../settings";
 import { Action, Badge, Banner, Column, Label, Row, Surface } from "../../ui";
 import type { Tone } from "../../ui";
 import {
   disableLocalTools,
   enableLocalTools,
+  followStarting,
   localTools,
   localToolsBusy,
   localToolsError,
@@ -39,6 +40,23 @@ export function LocalToolsCard() {
   const sid = () => activeSpace()?.id;
   const entry = () => localToolsFor(sid());
   const badge = () => localToolsBadge(entry());
+  // While this Space's worker is starting, follow it here (bounded), so the
+  // owner sees "On" without leaving the page. Keyed by Space, owner and
+  // server: a new key (or leaving, or signing out) ends the old follow-up.
+  const startingKey = computed(() => {
+    const id = sid();
+    const e = entry();
+    if (!id || !e || e.state !== "on" || e.worker !== "starting") return null;
+    return `${connectedTo() ?? ""}\n${me() ?? ""}\n${id}`;
+  });
+  effect(() => {
+    const key = startingKey();
+    if (!key) return;
+    const id = untracked(sid)!;
+    return untracked(() =>
+      followStarting(id, () => startingKey() === key && activeSpace()?.id === id && !!localTools()?.available),
+    );
+  });
   // Another runner already serves this Space (not this computer's pairing).
   const otherRunner = () => {
     const r = activeSpaceRunner();

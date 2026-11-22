@@ -192,9 +192,13 @@ key. The server relays each request to your machine and the answer back.
 > desktop app includes a device bridge that serves device connections while
 > it's open, so there's no separate program or terminal. A packaged smoke of
 > that bridge with the bundled server passed. In the packaged app you pair
-> with **Connect this device**, and later use **Manage connection**. An
-> end-to-end proof of that pairing (with vendor sign-in and a real model)
-> is pending the final gate, and no real vendor account has been used. The standalone `metro-connector` CLI remains
+> with **Connect this device**, and later use **Manage connection**.
+> Verified in a packaged Linux build against a local test endpoint
+> ([acceptance](acceptance.md)): you consent before pairing, you never see
+> or enter a device token, only the models you approve are offered, and
+> replies kept working after signing out and after a restart. No real
+> vendor account or vendor sign-in (such as Sign in with ChatGPT) has been
+> tested, and nor has native Windows. The standalone `metro-connector` CLI remains
 > contributor tooling
 > ([development.md](development.md#metro-connector-developer-cli)).
 >

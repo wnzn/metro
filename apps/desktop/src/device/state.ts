@@ -17,8 +17,8 @@
 // Races: every answer is applied only if it is still the latest request of
 // its kind and the session (store.ts `sessionGuard`) is unchanged.
 
-import { batch, computed, signal } from "nsh";
-import { connectedTo, onSessionEnd, onSessionStart, sessionGuard } from "../store";
+import { batch, cleanup, computed, effect, signal, untracked } from "nsh";
+import { connectedTo, onSessionEnd, onSessionStart, place, sessionGuard, settingsSection } from "../store";
 import { BridgeError, createBridge, isEndpointKind } from "./bridge";
 import type { Bridge, BridgeStatus, CredentialsBody, LocalConnection } from "./bridge";
 import { readBridgeEnv } from "./env";
@@ -111,8 +111,21 @@ function message(error: unknown, what: string): string {
   return what;
 }
 
+/** Worker state per connection id, to tell which ones changed between two statuses. */
+function workers(status: BridgeStatus | null): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const c of status?.connections ?? []) out[c.connectionId] = `${c.worker}|${c.credential}|${c.models.length}`;
+  return out;
+}
+
 function applyStatus(status: BridgeStatus) {
   noteInfo(status);
+  const h = helper();
+  const before = workers(h.phase === "ready" ? h.status : null);
+  const after = workers(status);
+  // A worker that moved on (starting -> online): the server's paired/online view follows.
+  const moved = Object.keys(after).filter((id) => id in before && before[id] !== after[id]);
+  if (moved.length) void Promise.resolve().then(() => moved.forEach(notify));
   const server = connectedTo();
   if (status.instance === "secondary") {
     helper.set({ phase: "secondary", status });
@@ -157,6 +170,44 @@ export async function refreshHelper(): Promise<void> {
     helper.set({ phase: "unreachable", message: message(error, "Metro's device helper didn't answer.") });
   }
 }
+
+// ------------------------------------------------------------------ following a starting worker
+
+/** How often, and how many times at most per stretch, a starting worker's status is re-read. */
+export const STARTING_POLL_MS = 1500;
+export const STARTING_POLL_MAX = 40;
+
+/** Connections on this computer whose worker is still starting. */
+const startingIds = computed(() => {
+  const h = helper();
+  return h.phase === "ready" ? h.status.connections.filter((c) => c.worker === "starting").map((c) => c.connectionId).sort().join(",") : "";
+});
+/** Model providers is on screen (its list, a row or the setup page): the only view that shows these states. */
+const providersVisible = computed(() => place() === "settings" && settingsSection() === "providers");
+
+// While a worker is starting and Model providers is open, re-read the bridge's
+// GET /v1/status (no vendor or model call) until it settles: one request at a
+// time, spaced, at most STARTING_POLL_MAX per stretch. Leaving the page,
+// signing out or switching account (session change) ends it.
+effect(() => {
+  const ids = startingIds();
+  if (!ids || !providersVisible()) return;
+  const ok = untracked(() => sessionGuard());
+  let left = STARTING_POLL_MAX;
+  let timer: number | undefined;
+  let stopped = false;
+  const tick = async () => {
+    timer = undefined;
+    if (stopped || !ok() || left-- <= 0) return;
+    await refreshHelper();
+    if (!stopped && ok()) timer = setTimeout(() => void tick(), STARTING_POLL_MS);
+  };
+  timer = setTimeout(() => void tick(), STARTING_POLL_MS);
+  cleanup(() => {
+    stopped = true;
+    if (timer !== undefined) clearTimeout(timer);
+  });
+});
 
 function resetLocal() {
   statusSeq++;

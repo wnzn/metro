@@ -43,6 +43,9 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
     keys: new Map<string, string | null>(),
     /** Answer every request with this error instead (status, code). */
     failWith: null as null | { status: number; code: string; message: string },
+    /** Ready workers stay "starting" until `serve(id)`, as a real worker does while it first reaches the server. */
+    slowStart: false,
+    served: new Set<string>(),
   };
 
   const ok = (body: unknown, status = 200) => ({ status, headers: { "cache-control": "no-store" }, body });
@@ -59,7 +62,7 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
   const account = (token: string) => Object.keys(TOKENS).find((u) => TOKENS[u] === token) ?? null;
   const ready = (c: Local) => {
     const credOk = c.credential === "signed_in" || c.credential === "key_saved" || c.credential === "no_key";
-    c.worker = credOk && c.models.length ? "online" : "needs_setup";
+    c.worker = credOk && c.models.length ? (state.slowStart && !state.served.has(c.connection_id) ? "starting" : "online") : "needs_setup";
     if (c.worker === "online") f.state.online.add(c.connection_id);
     else f.state.online.delete(c.connection_id);
   };
@@ -178,7 +181,14 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
     ready(c);
   };
 
+  /** The starting worker reached the server and serves now (nothing tells the UI; it has to look). */
+  const serve = (id: string) => {
+    state.served.add(id);
+    const c = state.connections.get(id);
+    if (c) ready(c);
+  };
+
   const network: Record<string, (req: Req) => unknown> = {};
   for (const method of ["GET", "POST", "PUT", "DELETE"]) network[`${method} ${BRIDGE}/v1/*`] = handle;
-  return { state, network, finishLogin, calls: (path: string, method?: string) => state.log.filter((l) => l.path === path && (!method || l.method === method)) };
+  return { state, network, finishLogin, serve, calls: (path: string, method?: string) => state.log.filter((l) => l.path === path && (!method || l.method === method)) };
 }

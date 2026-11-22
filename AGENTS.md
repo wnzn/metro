@@ -218,7 +218,7 @@ runtime.
   for an operator's separately installed runner. It and the other features
   checked in the 0.2.0 Linux candidate are described as verified in that
   local candidate, never as released. Anything still unchecked (native
-  Windows, end-to-end in-app device setup) is labelled as such. A
+  Windows, real vendor accounts and sign-ins) is labelled as such. A
   deployment's own address (such as a dev LAN host) is never a documented
   default. Over plain HTTP on a LAN, the admin page is a landing
   page only; tokens go over loopback, an SSH port forward or HTTPS.

@@ -561,6 +561,8 @@ export async function fetchModels(id: string): Promise<void> {
     const models = await c.listProviderModels(id);
     if (!ok() || modelsSeq.get(id) !== seq) return;
     modelListings.set({ ...modelListings(), [id]: { state: "ok", models } });
+    // A test that went through the device: this computer's state may have moved on too (status only).
+    if (known && isDeviceConnection(known) && packaged()) void refreshHelper();
   } catch (error) {
     if (!ok() || modelsSeq.get(id) !== seq || isAborted(error)) return;
     if (error instanceof ApiError && error.kind === "auth") {
