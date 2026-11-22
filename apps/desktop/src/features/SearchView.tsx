@@ -12,7 +12,7 @@
 // filter sends nothing.
 
 import { openSettings, roomsOf, spaces } from "../store";
-import { Action, Badge, Banner, Chip, Column, Label, MarkedText, PageHeader, ResultCard, Row, ScrollArea, SegmentedControl, SettingRow, SettingsGroup, Surface } from "../ui";
+import { Action, Badge, Banner, Chip, Column, Disclosure, Label, MarkedText, PageHeader, ResultCard, Row, ScrollArea, SegmentedControl, SettingRow, SettingsGroup, Surface } from "../ui";
 import { ConnectionBanner } from "./Conversation";
 import { LibrarySearch } from "./library/LibraryView";
 import { searchSurface } from "./library/libraryState";
@@ -23,9 +23,12 @@ import {
   indexing,
   indexMore,
   indexProgress,
+  lessRelevantHits,
+  lessRelevantOpen,
   markTerms,
   openError,
   openHit,
+  relevantHits,
   scopeLabel,
   searchAnswer,
   searchError,
@@ -203,9 +206,27 @@ function Results() {
               />
             </SettingsGroup>
           </If>
-          <Each of={visibleHits()} key={hitKey}>
+          <Each of={relevantHits()} key={hitKey}>
             {(hit) => <MessageResult hit={hit()} query={answer().query} />}
           </Each>
+          <If when={lessRelevantHits().length > 0}>
+            <Disclosure
+              testID="search-less-relevant"
+              title={`Less relevant (${lessRelevantHits().length})`}
+              summary="No measurable similarity to your query"
+              accessibilityLabel={`Less relevant: ${lessRelevantHits().length} ${lessRelevantHits().length === 1 ? "result" : "results"} with no measurable similarity to your query`}
+              open={lessRelevantOpen()}
+              onToggle={(open) => lessRelevantOpen.set(open)}
+            >
+              <If when={lessRelevantOpen()}>
+                <Column gap={3}>
+                  <Each of={lessRelevantHits()} key={hitKey}>
+                    {(hit) => <MessageResult hit={hit()} query={answer().query} />}
+                  </Each>
+                </Column>
+              </If>
+            </Disclosure>
+          </If>
         </Column>
       )}
     </If>

@@ -6,10 +6,9 @@
 //   Chat and the Spaces you're in) or Documents & media. On the Library page
 //   it is the Documents & media query. It never changes the scope or filters.
 // - Typing only edits the query: it opens nothing and sends nothing.
-// - Return opens Search in that mode and runs its search, as the Search
-//   page's own button does: the only thing that sends the query to the server
-//   (and so to the searcher's embedding or media connection). An empty query
-//   only opens the page.
+// - Return opens Search in that mode and runs its search: the only thing
+//   that sends the query to the server (and so to the searcher's embedding
+//   or media connection). An empty query only opens the page.
 // - Focus alone changes nothing (no change of context on focus), so Tab can
 //   pass through it.
 

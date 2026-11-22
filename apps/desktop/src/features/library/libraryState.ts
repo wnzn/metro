@@ -203,7 +203,22 @@ export const visibleHits = computed(() => {
   const gone = deletedIds();
   return answer.results.filter((h) => (h.spaceId === null || joined.has(h.spaceId)) && !gone.has(h.assetId));
 });
+/** Results the server returned that the user can't read (any more): a lost Space or a deleted file. */
 export const hiddenHits = computed(() => (libAnswer()?.results.length ?? 0) - visibleHits().length);
+
+/**
+ * A readable result with no measurable embedding similarity (a cosine score
+ * of 0 or below). System One scores (`classifier`) are never folded: their
+ * provenance stays as the server said.
+ */
+export const isLessRelevant = (h: LibraryHit) => h.scoreKind === "cosine" && !(h.score > 0);
+/** Readable results shown at once. */
+export const relevantHits = computed(() => visibleHits().filter((h) => !isLessRelevant(h)));
+/** Readable results folded under "Less relevant", closed until the user opens it. */
+export const lessRelevantHits = computed(() => visibleHits().filter(isLessRelevant));
+export const lessRelevantOpen = signal(false);
+/** What the results list draws now: the relevant ones, then the folded ones while open. */
+export const shownHits = computed(() => (lessRelevantOpen() ? [...relevantHits(), ...lessRelevantHits()] : relevantHits()));
 
 /** The uploader may delete; so may the owner of the file's Space. The server decides again. */
 export function canDelete(asset: LibraryAsset): boolean {
@@ -547,8 +562,10 @@ export async function runLibrarySearch(): Promise<void> {
     if (!api) return;
     const answer = await api.searchLibrary(query, scope, LIBRARY_SEARCH_LIMIT, kind);
     if (!ok() || mine !== seq) return;
-    libAnswer.set({ query, scope, ...answer });
-    void loadThumbnails();
+    batch(() => {
+      lessRelevantOpen.set(false);
+      libAnswer.set({ query, scope, ...answer });
+    });
   } catch (error) {
     if (!ok() || mine !== seq) return;
     const status = statusOf(error);
@@ -852,23 +869,26 @@ export async function saveCopy(): Promise<void> {
 
 // ------------------------------------------------------------------ thumbnails
 
-/** Most image results that get a thumbnail per answer. */
+/** Most image results that get a thumbnail at once. */
 export const MAX_THUMBNAILS = 6;
 /**
  * Small previews of image results: `blob:` URLs of bytes read through the
  * same authenticated request the viewer uses (the server checks access again
- * for each), only for images of the personal library or a Space the user is
- * in now. Nothing goes to a model. Revoked with the next answer, a lost
- * Space, a deleted file and at sign-out.
+ * for each), only for image results drawn on Search's Documents & media
+ * results right now: not folded under "Less relevant", not behind an open
+ * viewer, not on another page or mode. Nothing goes to a model. A thumbnail
+ * that stops being drawn is revoked at once; a read that answers after its
+ * result stopped being drawn, the session changed or the Space was lost is
+ * thrown away.
  */
 export const thumbnails = signal<Record<string, string>>({});
 let thumbSeq = 0;
 let thumbAbort: AbortController | null = null;
+let thumbKey = "";
 
 function dropThumbnails(keep?: (assetId: string) => boolean) {
-  const all = thumbnails();
   const next: Record<string, string> = {};
-  for (const [id, url] of Object.entries(all)) {
+  for (const [id, url] of Object.entries(thumbnails())) {
     if (keep?.(id)) next[id] = url;
     else {
       try {
@@ -885,27 +905,40 @@ function stopThumbnails() {
   thumbSeq++;
   thumbAbort?.abort();
   thumbAbort = null;
+  thumbKey = "";
 }
 
-async function loadThumbnails(): Promise<void> {
+/** The image results drawn with a thumbnail now, at most MAX_THUMBNAILS. */
+const wantedThumbnails = computed(() => {
+  const onResults = mainPlace() === "search" && searchSurface() === "library" && !viewing() && libAnswer() !== null;
+  if (!onResults) return [] as string[];
+  return [...new Set(shownHits().filter((h) => h.kind === "image").map((h) => h.assetId))].slice(0, MAX_THUMBNAILS);
+});
+
+async function syncThumbnails(ids: readonly string[]): Promise<void> {
+  const key = ids.join("|");
+  if (key === thumbKey) return;
   stopThumbnails();
+  thumbKey = key;
   const mine = thumbSeq;
-  const abort = new AbortController();
-  thumbAbort = abort;
-  dropThumbnails();
-  const ids = [...new Set(visibleHits().filter((h) => h.kind === "image").map((h) => h.assetId))].slice(0, MAX_THUMBNAILS);
-  if (ids.length === 0) return;
-  const ok = sessionGuard();
+  const wanted = new Set(ids);
+  dropThumbnails((id) => wanted.has(id));
+  const missing = ids.filter((id) => !thumbnails()[id]);
+  if (missing.length === 0) return;
   const api = library();
   if (!api) return;
-  for (const id of ids) {
-    const hit = visibleHits().find((h) => h.assetId === id);
-    if (!hit || !isJoined(hit.spaceId)) continue;
+  const ok = sessionGuard();
+  const abort = new AbortController();
+  thumbAbort = abort;
+  const stillWanted = (id: string) => mine === thumbSeq && ok() && untracked(wantedThumbnails).includes(id);
+  for (const id of missing) {
+    const hit = untracked(shownHits).find((h) => h.assetId === id);
+    if (!hit || !stillWanted(id)) return;
     try {
       const content = await api.assetContent(id, abort.signal);
-      // Kept only for the same session, the same answer, and a hit still shown now.
-      if (!ok() || mine !== thumbSeq || !isJoined(hit.spaceId) || deletedIds().has(id)) return;
-      if (!visibleHits().some((h) => h.assetId === id && h.kind === "image")) continue;
+      // Kept only for the same session and the same drawn results, in a Space the user is still in.
+      if (mine !== thumbSeq || !ok()) return;
+      if (!stillWanted(id) || !isJoined(hit.spaceId) || deletedIds().has(id)) continue;
       const mime = (content.contentType || hit.mimeType).split(";")[0]!.trim();
       if (mediaKindOf(mime) !== "image") continue;
       const url = URL.createObjectURL(new Blob([content.bytes as BlobPart], { type: mime }));
@@ -922,13 +955,9 @@ async function loadThumbnails(): Promise<void> {
   if (mine === thumbSeq) thumbAbort = null;
 }
 
-// A thumbnail lives only while its image hit is shown: a new answer, a lost
-// Space, a deleted file or the end of the session drops (and revokes) it.
 effect(() => {
-  const shown = new Set(visibleHits().filter((h) => h.kind === "image").map((h) => h.assetId));
-  untracked(() => {
-    if (Object.keys(thumbnails()).some((id) => !shown.has(id))) dropThumbnails((id) => shown.has(id));
-  });
+  const ids = wantedThumbnails();
+  untracked(() => void syncThumbnails(ids));
 });
 
 // ------------------------------------------------------------------ lifecycle
@@ -972,6 +1001,7 @@ onSessionEnd(() => {
   stopThumbnails();
   closeViewer();
   dropThumbnails();
+  lessRelevantOpen.set(false);
   purgePreviews();
   batch(() => {
     searchSurface.set("conversations");

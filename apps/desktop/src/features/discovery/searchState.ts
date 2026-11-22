@@ -36,7 +36,21 @@ export const visibleHits = computed(() => {
   const joined = new Set(spaces().map((s) => s.id));
   return answer.results.filter((hit) => hit.spaceId === null || joined.has(hit.spaceId));
 });
+/** Results the server returned from a Space the user is no longer a member of. */
 export const hiddenHits = computed(() => (searchAnswer()?.results.length ?? 0) - visibleHits().length);
+
+/**
+ * A readable result with no measurable embedding similarity: a score of 0
+ * in an answer ordered by embeddings only. In a System One (or mixed) answer
+ * a score may be System One's, so nothing is folded there.
+ */
+export const isLessRelevant = (hit: SearchHit, ranking: SearchRanking) => ranking === "embeddings" && !(hit.score > 0);
+const rankingNow = () => searchAnswer()?.ranking ?? "embeddings";
+/** Readable results shown at once. */
+export const relevantHits = computed(() => visibleHits().filter((h) => !isLessRelevant(h, rankingNow())));
+/** Readable results folded under "Less relevant", closed until the user opens it. */
+export const lessRelevantHits = computed(() => visibleHits().filter((h) => isLessRelevant(h, rankingNow())));
+export const lessRelevantOpen = signal(false);
 
 export function scopeLabel(scope: SearchScope): string {
   if (scope.kind === "all") return "Everything you can read";
@@ -102,7 +116,10 @@ export async function runSearch(): Promise<void> {
     if (!api) return;
     const answer = await api.search(query, scope, SEARCH_LIMIT);
     if (!ok() || mine !== seq) return;
-    searchAnswer.set({ query, scope, ...answer });
+    batch(() => {
+      lessRelevantOpen.set(false);
+      searchAnswer.set({ query, scope, ...answer });
+    });
   } catch (error) {
     if (!ok() || mine !== seq) return;
     const status = statusOf(error);
@@ -193,6 +210,7 @@ onSessionEnd(() => {
     searchQuery.set("");
     searchScope.set({ kind: "all" });
     searchAnswer.set(null);
+    lessRelevantOpen.set(false);
     searching.set(false);
     searchError.set(null);
     indexing.set(false);

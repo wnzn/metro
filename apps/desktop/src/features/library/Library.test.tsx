@@ -436,3 +436,65 @@ test("losing a Space drops its files, results, thumbnails and an open preview; s
   expect(text(app)).not.toContain("The rollback plan");
   expect(text(app)).not.toContain("notes.md");
 });
+
+test("zero-similarity matches fold under Less relevant; a folded, collapsed or left-behind image is never read for a thumbnail", async () => {
+  const w = libraryWorld();
+  const s = seed(w);
+  const faint = w.addAsset("alice", null, "whiteboard.png", "PNGFAINT");
+  w.l.hits.push(
+    { asset_id: s.acmeByBob.id, locator: { kind: "image" }, score: 0.71, score_kind: "cosine" },
+    { asset_id: faint.id, locator: { kind: "image" }, score: 0, score_kind: "cosine" },
+    // A System One score of 0 keeps its provenance: never folded as "no similarity".
+    { asset_id: s.mine.id, locator: { kind: "text", start: null, end: null }, excerpt: "Intro paragraph.", score: 0, score_kind: "classifier" },
+    { asset_id: s.carols.id, locator: { kind: "page", page: 1 }, excerpt: "carol's secret", score: 0.9, score_kind: "classifier" },
+  );
+  w.l.settings.set("alice", w.addMediaConnection("alice", "embeddinggemma-2", "EG2"));
+  const app = await signIn(w);
+  await openFileSearch(app);
+  await searchFiles(app, "whiteboard");
+  const faintKey = `${faint.id}:image:0`;
+  const reads = (id: string) => lib(w, `/v1/library/assets/${id}/content`).length;
+
+  // Readable and shown counts are separate; the folded one isn't called lost.
+  expect(text(app)).toContain("3 matches for “whiteboard”");
+  expect(text(app)).toContain("Less relevant (1)");
+  expect(text(app)).not.toContain("no longer in"); // carol's file is not mine to read: no lost-membership notice either
+  expect(app.shows(`id:library-hit:${faintKey}`)).toBe(false);
+  expect(app.shows(`id:library-hit:${s.mine.id}:text:0`)).toBe(true); // classifier 0 stays in the list
+  await app.waitUntil(() => reads(s.acmeByBob.id) === 1);
+  await app.wait(200);
+  expect(reads(faint.id)).toBe(0); // folded: no bytes requested
+
+  // Open the fold: now it's drawn, and only now read, with auth.
+  await app.press("id:library-less-relevant:toggle");
+  await app.waitFor(`id:library-hit:${faintKey}`);
+  await app.waitUntil(() => reads(faint.id) === 1);
+  expect(lib(w, `/v1/library/assets/${faint.id}/content`)[0]!.headers["authorization"]).toBe(`Bearer ${TOKENS.alice}`);
+  await app.waitFor(`id:library-hit-thumb:${faintKey}`);
+
+  // Collapse: the thumbnail goes; opening again reads again (nothing was kept).
+  await app.press("id:library-less-relevant:toggle");
+  await app.waitUntil(() => !app.shows(`id:library-hit:${faintKey}`));
+  await app.press("id:library-less-relevant:toggle");
+  await app.waitUntil(() => reads(faint.id) === 2);
+
+  // Switching to Conversations drops every thumbnail; coming back reads again.
+  const before = reads(s.acmeByBob.id);
+  await app.press("id:search-surface:conversations");
+  await app.wait(200);
+  expect(reads(s.acmeByBob.id)).toBe(before);
+  await app.press("id:search-surface:library");
+  await app.waitUntil(() => reads(s.acmeByBob.id) === before + 1);
+
+  // Leaving Search altogether drops them too, and reads nothing while away.
+  await app.press("id:nav-chat");
+  const away = contentReads(w).length;
+  await app.wait(200);
+  expect(contentReads(w).length).toBe(away);
+
+  // A new search closes the fold again.
+  await openFileSearch(app);
+  await searchFiles(app, "whiteboard again");
+  expect(app.shows(`id:library-hit:${faintKey}`)).toBe(false);
+  expect(text(app)).toContain("Less relevant (1)");
+});

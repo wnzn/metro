@@ -23,6 +23,7 @@ import {
   Banner,
   Chip,
   Column,
+  Disclosure,
   CompactAudioPlayer,
   FileIcon,
   FileList,
@@ -65,6 +66,8 @@ import {
   hiddenHits,
   indexAsset,
   indexStates,
+  lessRelevantHits,
+  lessRelevantOpen,
   libAnswer,
   libKind,
   libScope,
@@ -86,6 +89,7 @@ import {
   openLibrary,
   openLibraryHit,
   openLibrarySearch,
+  relevantHits,
   playerError,
   playerFailed,
   playerPosition,
@@ -589,9 +593,27 @@ function Results() {
               </SettingRow>
             </SettingsGroup>
           </If>
-          <Each of={visibleHits()} key={hitKey}>
+          <Each of={relevantHits()} key={hitKey}>
             {(hit) => <HitCard hit={hit()} query={answer().query} />}
           </Each>
+          <If when={lessRelevantHits().length > 0}>
+            <Disclosure
+              testID="library-less-relevant"
+              title={`Less relevant (${lessRelevantHits().length})`}
+              summary="No measurable similarity to your query"
+              accessibilityLabel={`Less relevant: ${lessRelevantHits().length} ${lessRelevantHits().length === 1 ? "match" : "matches"} with no measurable similarity to your query`}
+              open={lessRelevantOpen()}
+              onToggle={(open) => lessRelevantOpen.set(open)}
+            >
+              <If when={lessRelevantOpen()}>
+                <Column gap={3}>
+                  <Each of={lessRelevantHits()} key={hitKey}>
+                    {(hit) => <HitCard hit={hit()} query={answer().query} />}
+                  </Each>
+                </Column>
+              </If>
+            </Disclosure>
+          </If>
         </Column>
       )}
     </If>
