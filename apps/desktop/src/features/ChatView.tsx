@@ -2,9 +2,16 @@
 // agent runs in the user's Spaces, and sending a task to an explicitly chosen
 // Space and room. The Chat's own agent can't see Spaces; these controls are
 // the user's, and the server checks membership for each.
+//
+// An empty Chat offers a few suggested drafts. Pressing one only fills an
+// empty message box: it never sends, and never replaces what the user typed.
+// The task form stays folded behind "New task" until the user opens it (or
+// presses Follow up), and it scrolls with the runs, so it never covers them.
 
 import { signal } from "nsh";
 import {
+  activeEvents,
+  activeLoaded,
   chatUnavailable,
   createSpace,
   creatingSpace,
@@ -13,6 +20,7 @@ import {
   dispatching,
   dispatchNotice,
   dispatchTarget,
+  draft,
   followUp,
   isActiveRun,
   me,
@@ -26,16 +34,31 @@ import {
   sendDispatch,
   setDispatchRoom,
   setDispatchSpace,
+  setDraft,
   spaces,
   stopRun,
 } from "../store";
 import type { Run } from "../store";
-import { Action, Badge, Banner, Chip, Column, Field, Label, Row, ScrollArea, Spacer, Surface } from "../ui";
-import type { Tone } from "../ui";
+import { Action, Badge, Banner, Chip, Column, compactWidth, Field, Label, Row, ScrollArea, Spacer, Surface } from "../ui";
+import { EmptyState, SuggestionChip } from "../ui/activity";
+import { runStatusLabel, runTitle, runTone } from "./activity/runs";
 import { Composer, ConnectionBanner, Transcript } from "./Conversation";
 import { roomTree } from "./Sidebar";
 
+/** The task form is open (folded behind "New task" otherwise). */
+const dispatchOpen = signal(false);
+/** In a narrow window the runs list is shown on request. */
+const asideOpen = signal(false);
+
+/** Drafts the empty Chat suggests. The personal agent has no tools, so none asks for any. */
+export const CHAT_SUGGESTIONS: readonly { label: string; draft: string }[] = [
+  { label: "Plan my day", draft: "Help me plan my day. Here's what I need to get done: " },
+  { label: "Draft a status update", draft: "Help me write a short status update about: " },
+  { label: "Explain something simply", draft: "Explain this in plain words: " },
+];
+
 export function ChatView() {
+  const showAside = () => !compactWidth() || asideOpen();
   return (
     <Surface variant="app" testID="chat-view">
       <Surface variant="panel" grow>
@@ -45,9 +68,17 @@ export function ChatView() {
               Chat
             </Label>
             <Label variant="caption" color="muted" lines={2}>
-              Your personal thread with the agent. Only you see it, and it can't see your Spaces. Their runs are on the right.
+              Only you see this chat, and its agent can't see your Spaces.
             </Label>
           </Column>
+          <If when={compactWidth()}>
+            <Action
+              compact
+              testID="runs-toggle"
+              label={asideOpen() ? "Hide runs" : runs().some(isActiveRun) ? `Runs · ${runs().filter(isActiveRun).length} active` : "Runs"}
+              onPress={() => asideOpen.set(!asideOpen())}
+            />
+          </If>
         </Surface>
         <ConnectionBanner />
         <If when={spaces().length === 0}>
@@ -55,7 +86,11 @@ export function ChatView() {
         </If>
         <If
           when={chatUnavailable()}
-          else={<Transcript emptyText="Nothing here yet. Ask your agent something, or send a task to a Space on the right." />}
+          else={
+            <If when={activeLoaded() && activeEvents().length === 0} else={<Transcript emptyText="No messages yet." />}>
+              <ChatEmpty />
+            </If>
+          }
         >
           {(message) => (
             <Column grow pad={6} align="center" justify="center">
@@ -63,10 +98,37 @@ export function ChatView() {
             </Column>
           )}
         </If>
-        <Composer placeholder="Message your Chat — Return to send" agentHint="Ask agent answers here. This agent has no runner, workspace or thread tools." disabled={!!chatUnavailable()} />
+        <Composer placeholder="Message your Chat — Return to send" agentHint="Ask agent replies here. It has no runner, workspace or thread tools." disabled={!!chatUnavailable()} />
       </Surface>
-      <RunsAside />
+      <If when={showAside()}>
+        <RunsAside />
+      </If>
     </Surface>
+  );
+}
+
+/** An empty Chat: what it is for, and drafts that only fill an empty message box. */
+function ChatEmpty() {
+  const typed = () => draft().trim().length > 0;
+  return (
+    <EmptyState testID="chat-empty" title="Start a conversation" text="Ask your agent anything. A suggestion only fills the message box; nothing is sent until you send it.">
+      <Row gap={2} wrap justify="center">
+        <Each of={[...CHAT_SUGGESTIONS]} key={(s) => s.label}>
+          {(s) => (
+            <SuggestionChip
+              testID={`chat-suggestion:${CHAT_SUGGESTIONS.indexOf(s())}`}
+              label={s().label}
+              disabled={typed()}
+              accessibilityLabel={typed() ? `${s().label} (the message box already has text)` : `Start a draft: ${s().label}`}
+              onPress={() => {
+                // Never replaces what the user typed, and never sends.
+                if (!typed()) setDraft(s().draft);
+              }}
+            />
+          )}
+        </Each>
+      </Row>
+    </EmptyState>
   );
 }
 
@@ -88,24 +150,26 @@ function Onboarding() {
   );
 }
 
-const statusTone = (run: Run): Tone => {
-  if (isActiveRun(run)) return "runner";
-  if (/(fail|error)/i.test(run.status)) return "danger";
-  if (/(stop|cancel)/i.test(run.status)) return "warning";
-  if (/(done|complete|succe|finish)/i.test(run.status)) return "success";
-  return "neutral";
-};
-
 function RunsAside() {
   return (
     <Surface variant="aside" testID="runs-aside">
-      <Column pad={4} gap={1}>
-        <Label variant="heading">Agent runs</Label>
+      <Column padX={4} padY={3} gap={1}>
+        <Row align="center" gap={2}>
+          <Column grow>
+            <Label variant="heading">Agent runs</Label>
+          </Column>
+          <If when={!dispatchOpen()}>
+            <Action compact testID="dispatch-new" icon="plus" label="New task" accessibilityLabel="New task for a Space's agent" onPress={() => dispatchOpen.set(true)} />
+          </If>
+        </Row>
         <Label variant="caption" color="muted">
           Active and recent, in Spaces you belong to.
         </Label>
       </Column>
-      <ScrollArea padX={4} gap={2} testID="runs-list">
+      <ScrollArea padX={4} padY={1} gap={2} testID="runs-list">
+        <If when={dispatchOpen()}>
+          <Dispatch />
+        </If>
         <If when={runsError()}>
           {(message) => (
             <Label variant="caption" color="danger" testID="runs-error">
@@ -117,45 +181,57 @@ function RunsAside() {
           {(run) => <RunCard run={run} />}
         </Each>
         <If when={runsLoaded() && runs().length === 0 && !runsError()}>
-          <Label variant="caption" color="muted">
+          <Label variant="caption" color="muted" testID="runs-empty">
             No runs yet.
           </Label>
         </If>
       </ScrollArea>
-      <Dispatch />
     </Surface>
   );
 }
 
 function RunCard(props: { run: () => Run }) {
-  const scope = () => runScope(props.run());
+  const run = () => props.run();
+  const scope = () => runScope(run());
   return (
-    <Surface variant="card" pad={3} gap={2} testID={`run:${props.run().id}`}>
+    <Surface variant="card" pad={3} gap={2} testID={`run:${run().id}`}>
       <Row align="center" gap={2}>
-        <Badge tone={statusTone(props.run())} label={props.run().status} />
+        <Badge tone={runTone(run().status)} label={runStatusLabel(run().status)} />
         <Column grow>
           <Label variant="caption" color="muted" lines={1}>
             {`${scope().space} › #${scope().room}`}
           </Label>
         </Column>
       </Row>
-      <Label variant="body" lines={3}>
-        {props.run().task}
+      <Label variant="body" lines={2} testID={`run-title:${run().id}`}>
+        {runTitle(run().task)}
       </Label>
       <Label variant="caption" color="muted">
-        {`started by ${props.run().actor === me() ? "you" : props.run().actor}`}
+        {`Started by ${run().actor === me() ? "you" : run().actor}`}
       </Label>
-      <Row gap={2} wrap>
-        <Action testID={`run-open:${props.run().id}`} label="Open" variant="ghost" onPress={() => void openRun(props.run())} />
-        <Action testID={`run-follow:${props.run().id}`} label="Follow up" variant="ghost" onPress={() => void followUp(props.run())} />
-        <If when={isActiveRun(props.run())}>
+      <Row gap={2} align="center" wrap>
+        <Action compact testID={`run-open:${run().id}`} label="Open" accessibilityLabel={`Open #${scope().room}`} onPress={() => void openRun(run())} />
+        <Action
+          compact
+          testID={`run-follow:${run().id}`}
+          label="Follow up"
+          accessibilityLabel={`Follow up in #${scope().room}`}
+          onPress={() => {
+            dispatchOpen.set(true);
+            void followUp(run());
+          }}
+        />
+        <Spacer />
+        <If when={isActiveRun(run())}>
           <Action
-            testID={`run-stop:${props.run().id}`}
+            compact
+            testID={`run-stop:${run().id}`}
             label="Stop"
             busyLabel="Stopping…"
-            busy={runBusy() === props.run().id}
-            variant="danger"
-            onPress={() => void stopRun(props.run())}
+            busy={runBusy() === run().id}
+            variant="destructive"
+            accessibilityLabel="Stop this run"
+            onPress={() => void stopRun(run())}
           />
         </If>
       </Row>
@@ -169,8 +245,14 @@ function Dispatch() {
   const targetRoom = () => roomsOf(target()?.spaceId ?? "").find((r) => r.id === target()?.roomId) ?? null;
   const ready = () => !!targetSpace() && !!targetRoom() && dispatchDraft().trim().length > 0 && !dispatching();
   return (
-    <Surface variant="footer" pad={4} gap={2} testID="dispatch">
-      <Label variant="strong">Send a task to a Space's agent</Label>
+    <Surface variant="card" pad={3} gap={2} testID="dispatch">
+      <Row align="center" gap={2}>
+        <Column grow>
+          <Label variant="strong">Send a task to a Space's agent</Label>
+        </Column>
+        {/* Folding the form keeps the draft and the chosen Space and room. */}
+        <Action compact testID="dispatch-close" label="Close" variant="ghost" accessibilityLabel="Close the task form (your draft is kept)" onPress={() => dispatchOpen.set(false)} />
+      </Row>
       <If
         when={spaces().length > 0}
         else={
@@ -214,12 +296,10 @@ function Dispatch() {
             multiline
             keepFocusOnSubmit
           />
+          <Label variant="caption" color={targetRoom() ? "default" : "muted"} testID="dispatch-recipient">
+            {targetSpace() && targetRoom() ? `To: agent in ${targetSpace()!.name} › #${targetRoom()!.name}` : "Choose a Space and a room."}
+          </Label>
           <Row align="center" gap={2}>
-            <Column grow>
-              <Label variant="caption" color={targetRoom() ? "default" : "muted"} lines={2} testID="dispatch-recipient">
-                {targetSpace() && targetRoom() ? `To: agent in ${targetSpace()!.name} › #${targetRoom()!.name}` : "Choose a Space and a room."}
-              </Label>
-            </Column>
             <Spacer />
             <Action
               testID="dispatch-send"
