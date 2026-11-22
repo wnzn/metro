@@ -152,9 +152,10 @@ export function finalize(d: RoutingDraft, usable: readonly AvailableModel[]): { 
     !!id && usable.some((m) => m.connectionId === id && m.capability === capability && !!m.model && m.ready !== false);
   const minDirectedness = parseProbability(d.minDirectedness);
   const minRouteProbability = parseProbability(d.minRouteProbability);
-  if (minRouteProbability === null) return { ok: false, error: "The routing threshold must be a number from 0 to 1, such as 0.65." };
+  // Shown as percentages, as the page asks for them; the values stay 0 to 1.
+  if (minRouteProbability === null) return { ok: false, error: "The routing confidence must be a whole number from 0 to 100%, such as 65%." };
   if (minDirectedness === null || minDirectedness < MIN_DIRECTEDNESS_FLOOR) {
-    return { ok: false, error: `The “asking the agent” threshold must be a number from ${MIN_DIRECTEDNESS_FLOOR} to 1, such as 0.85.` };
+    return { ok: false, error: `The “asking the agent” confidence must be a whole number from ${Math.round(MIN_DIRECTEDNESS_FLOOR * 100)} to 100%, such as 85%.` };
   }
   if ((d.enabled || d.inferAddressing) && !d.classifierId) {
     return { ok: false, error: "Choose a System One classifier first: routing and classification both need one." };

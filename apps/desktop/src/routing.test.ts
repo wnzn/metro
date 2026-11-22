@@ -45,6 +45,12 @@ test("thresholds are probabilities from 0 to 1, as decimals or percentages", () 
   expect(parseProbability("high")).toBe(null);
 });
 
+test("a threshold that can't be saved is explained in percent; the values stay 0 to 1", () => {
+  expect(finalize({ ...base(), minRouteProbability: "high" }, usable)).toEqual({ ok: false, error: "The routing confidence must be a whole number from 0 to 100%, such as 65%." });
+  expect(finalize({ ...base(), minDirectedness: "0.4" }, usable)).toEqual({ ok: false, error: "The “asking the agent” confidence must be a whole number from 50 to 100%, such as 85%." });
+  expect(finalizeOk({ ...base(), minRouteProbability: "70%", minDirectedness: "0.9" })).toMatchObject({ minRouteProbability: 0.7, minDirectedness: 0.9 });
+});
+
 test("new use cases get a key from their name, unique, and existing keys never change", () => {
   expect(caseKey("Code review", new Set())).toBe("code_review");
   expect(caseKey("Code review", new Set(["code_review"]))).toBe("code_review_2");
