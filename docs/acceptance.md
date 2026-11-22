@@ -20,7 +20,9 @@ last two app changes were:
 - `13c80b4`: the composer hint stays beside **Ask agent** and **Send**, and
   keeps its full wording as its accessible label.
 
-The native reviews below ran on the earlier renderer builds named there.
+The narrow-Chat and composer checks below ran natively on this source
+(renderer `3e3b6c7d85c5`). The other native reviews ran on the earlier
+renderer builds named there.
 
 | Check | Result |
 | --- | --- |
@@ -75,11 +77,12 @@ recorded as reported.
   `22cc1af11473`, which is the frozen app at `58a1b7d`. Both ran against a
   real local `metro-server` and `metro-runner`, with a scripted model.
 - **The receipt:** stored outside the gallery, under
-  `~/.cache/metro-release/desktop-refresh/core/`.
-  - `HANDOFF.md` and `PROVENANCE.md`.
-  - `SHA256SUMS.png.txt`, covering all 160 PNGs: 52 before, 56 after and
-    52 pairs.
-  - The capture tooling is at commit `d5258b3`.
+  `~/.cache/metro-release/desktop-refresh/core/`, with `HANDOFF.md` and
+  `PROVENANCE.md`.
+  - The final `SHA256SUMS.png.txt` lists 170 PNGs.
+  - The capture tooling was at commit `d5258b3` for the first run, and at
+    `3289ff8` and `6bd2d3b` for the narrow rerun.
+  - The handoff archive is separate from the 0.2.0 artifacts.
 - **Checked:** personal Chat with populated agent runs, a populated room with
   agent activity, a thread, **Model providers** with its setup flows,
   **Appearance**, and the account chrome.
@@ -94,13 +97,20 @@ recorded as reported.
 - **Admin page:** 19/19 browser checks and 68/68 measured contrast pairs
   (text, controls and focus), with the admin CSS at `2869c6b`. No auth or
   script changes.
-- **Open findings from this review:**
-  - At 860 px wide with the runs shown, Chat's composer and header overlapped
-    the runs in this build. `ffd8978` and `13c80b4` change that layout, and
-    the automated tests above cover it. The `13c80b4` commit reports a check
-    on the GTK host at 720 and 860 points. The native before-and-after
-    receipt for this fix is still to come, and isn't recorded here yet.
-  - Two minor issues:
+- **Narrow Chat and composer: found, fixed, rechecked.**
+  - Renderer `22cc1af11473` showed Chat's composer and header overlapping
+    the runs at 860 px wide, with the runs shown.
+  - The rerun used source `13c80b4`, renderer `3e3b6c7d85c5`, with 126/126
+    runtime inputs matched, the same local server and runner, and both
+    themes.
+    - At 860, **Runs** opened in its own dialog. **Escape** and **Close**
+      each closed it, and returned the typed draft unchanged.
+    - At 1200, Chat's runs stayed inline.
+    - The focused composer hint cleared **Ask agent** and **Send** in Chat
+      at 1200 and 860, and in a room at 860 and 720.
+    - At 720 the room hint wraps to two lines and ends with an ellipsis.
+      Its accessible label keeps the full wording.
+- **Still open, minor:**
     - The provider dropdown opens upward over the Documents & media heading.
       0.2.0 does the same.
     - After **Make default**, the media **Save** sits under the fixed footer

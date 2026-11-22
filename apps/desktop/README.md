@@ -228,12 +228,13 @@ its scope and type filters, folded zero-similarity results, the Library
 page, the media model in Settings, scheduled-task cards with the History
 menu, the routing badge's percentage, the account row, and Chat's **New
 task** form were checked in a native Linux GTK run, in dark and light themes,
-of the unreleased source after 0.2.0. That review found Chat's composer
-and header overlapping the runs at 860 px wide. Since then, below 1100
-points the runs open in an **Agent runs** dialog from a **Runs** button.
-Escape, the backdrop or Close shut the dialog, and your draft is kept.
-This is covered by automated tests, and the native recheck isn't recorded
-yet. The account menu's items and the Ctrl/⌘+K shortcut are covered
+of the unreleased source after 0.2.0. Below 1100 points, Chat's runs open
+in an **Agent runs** dialog from a **Runs** button. At 860 points, a native
+recheck of source `13c80b4` showed that **Escape** and **Close** each
+returned the typed draft unchanged. At 1200 the runs stay inline. The
+composer hint stays clear of **Ask agent** and **Send**. In a room at 720
+points it wraps to two lines and ends with an ellipsis, and its accessible
+label keeps the full wording. The account menu's items and the Ctrl/⌘+K shortcut are covered
 by automated tests. Windows and macOS weren't checked.
 - **Manage (owners only):** list, add, and remove members. Pick which runner
   serves the Space: attach one of your personal runners or an organization
