@@ -221,6 +221,7 @@ test("a worker stuck at starting is followed only while the page is open, and ne
   // Back on the page it follows again (one poller), and signing out ends it.
   await app.press("id:manage-space");
   await app.waitUntil(() => statusReads(t) >= left + 3, { timeout: 10_000 });
+  await app.press("id:account-menu"); // Sign out is in the account menu
   await app.press("id:disconnect");
   await sleep(300);
   const out = statusReads(t);

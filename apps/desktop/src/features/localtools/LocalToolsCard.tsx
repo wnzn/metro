@@ -5,7 +5,7 @@
 import { Clipboard, computed, effect, signal, untracked } from "nsh";
 import { activeSpace, connectedTo, me } from "../../store";
 import { activeSpaceRunner } from "../../settings";
-import { Action, Badge, Banner, Column, Label, Row, Surface } from "../../ui";
+import { Action, Badge, Banner, Column, Label, Row, Spacer, Surface } from "../../ui";
 import type { Tone } from "../../ui";
 import {
   disableLocalTools,
@@ -67,7 +67,9 @@ export function LocalToolsCard() {
       <Surface variant="card" pad={4} gap={3} testID="local-tools-card">
         <Row align="center" gap={2}>
           <Column grow gap={1}>
-            <Label variant="heading">Local tools on this computer</Label>
+            <Label variant="heading" heading>
+              Local tools on this computer
+            </Label>
             <Label variant="caption" color="muted">
               Agents in this Space can list and read files in one private folder on this computer, while Metro is open. They can't change files, run commands or see anything else on your disk.
             </Label>
@@ -122,8 +124,9 @@ export function LocalToolsCard() {
                   Put the files this Space's agent may read in this folder. Links inside it are never followed.
                 </Label>
               </Column>
-              <If when={e().state === "revoked"}>
-                <Row>
+              {/* Pair again (when revoked) on the leading edge; Turn off, and its confirmation, on the trailing one. */}
+              <Row align="center" gap={2} wrap>
+                <If when={e().state === "revoked"}>
                   <Action
                     testID="local-tools-enable"
                     label="Pair again"
@@ -132,17 +135,13 @@ export function LocalToolsCard() {
                     disabled={!!localToolsBusy()}
                     onPress={() => void enableLocalTools(e().spaceId)}
                   />
-                </Row>
-              </If>
-              <If
-                when={confirm()}
-                else={
-                  <Row>
-                    <Action testID="local-tools-disable" label="Turn off…" variant="ghost" disabled={!!localToolsBusy()} onPress={() => confirm.set(true)} />
-                  </Row>
-                }
-              >
-                <Row gap={2} wrap>
+                </If>
+                <Spacer />
+                <If
+                  when={confirm()}
+                  else={<Action variant="destructive" testID="local-tools-disable" label="Turn off…" disabled={!!localToolsBusy()} onPress={() => confirm.set(true)} />}
+                >
+                  <Action label="Cancel" variant="ghost" onPress={() => confirm.set(false)} />
                   <Action
                     testID="local-tools-confirm-disable"
                     label="Turn off: this computer stops serving this Space"
@@ -154,9 +153,8 @@ export function LocalToolsCard() {
                       void disableLocalTools(e().spaceId);
                     }}
                   />
-                  <Action label="Cancel" variant="ghost" onPress={() => confirm.set(false)} />
-                </Row>
-              </If>
+                </If>
+              </Row>
             </Column>
           )}
         </If>
@@ -177,7 +175,7 @@ export function LocalToolsCard() {
                 busyLabel="Turning on…"
                 busy={localToolsBusy() === "enable"}
                 disabled={!!localToolsBusy() || activeSpaceRunner() === undefined}
-                variant="primary"
+                variant="secondary"
                 onPress={() => {
                   const id = sid();
                   if (id) void enableLocalTools(id);

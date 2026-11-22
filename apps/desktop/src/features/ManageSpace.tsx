@@ -1,7 +1,12 @@
 // Owner-only management of the active Space: members, and which runner
 // serves it (an attached registered runner, or its own dedicated token).
+//
+// One primary action (Add member). Every first step that removes or stops
+// something is `variant="destructive"` (outlined) at the card's trailing
+// edge; only its confirmation, which says what happens, is filled ("danger").
 
 import { signal } from "nsh";
+import type { JSX } from "nsh";
 import { activeSpace, addMember, closeManage, manageError, me, memberBusy, members, notice, openSettings, removeMember } from "../store";
 import {
   activeSpaceRunner,
@@ -17,7 +22,7 @@ import {
   spaceRunnerNotice,
 } from "../settings";
 import type { SpaceRunner } from "../settings";
-import { Action, Badge, Banner, Column, Divider, Field, Label, Row, ScrollArea, Surface } from "../ui";
+import { Action, Badge, Banner, Column, Divider, Field, Label, Row, ScrollArea, Spacer, Surface } from "../ui";
 import { ConnectionBanner } from "./Conversation";
 import { TokenReveal } from "./TokenReveal";
 import { LocalToolsCard } from "./localtools/LocalToolsCard";
@@ -28,9 +33,9 @@ export function ManageSpace() {
     <Surface variant="panel" grow testID="manage-space">
       <Surface variant="toolbar" padX={4} padY={3} gap={3}>
         <Column grow gap={1}>
-          <Label variant="heading">{`Manage ${activeSpace()?.name ?? ""}`}</Label>
+          <Label variant="heading" heading>{`Manage ${activeSpace()?.name ?? ""}`}</Label>
           <Label variant="caption" color="muted">
-            Only the owner sees this. Members use the Space's rooms and runner.
+            Only you, the owner, see this.
           </Label>
         </Column>
         <Action testID="close-manage" label="Back to room" onPress={closeManage} />
@@ -51,25 +56,29 @@ function ManageBody() {
   // Local tools exist only with the packaged launcher and this computer's own workspace.
   clearLocalToolsMessages();
   void loadLocalTools();
+  // A runner change that just went through reads as done; anything else the store says is plain news.
+  const message = () => notice() ?? spaceRunnerNotice();
   return (
-    <ScrollArea pad={4} gap={4}>
+    <ScrollArea pad={4}>
+      <Surface variant="content" gap={4}>
         <If when={manageError()}>
-          {(message) => (
+          {(m) => (
             <Banner tone="danger" testID="manage-error">
-              <Label color="danger">{message()}</Label>
+              <Label color="danger">{m()}</Label>
             </Banner>
           )}
         </If>
-        <If when={notice() ?? spaceRunnerNotice()}>
-          {(message) => (
-            <Label variant="caption" color="muted" testID="manage-notice">
-              {message()}
-            </Label>
+        <If when={message()}>
+          {(m) => (
+            <Banner tone={notice() ? "neutral" : "success"} testID="manage-notice">
+              <Label color={notice() ? "default" : "success"}>{m()}</Label>
+            </Banner>
           )}
         </If>
         <MembersCard />
         <LocalToolsCard />
         <RunnerCard />
+      </Surface>
     </ScrollArea>
   );
 }
@@ -82,9 +91,11 @@ function MembersCard() {
   return (
     <Surface variant="card" pad={4} gap={3} testID="members-card">
       <Column gap={1}>
-        <Label variant="heading">Members</Label>
+        <Label variant="heading" heading>
+          Members
+        </Label>
         <Label variant="caption" color="muted">
-          Add people by the user ID shown in their sidebar (their identity provider's stable id, not a display name).
+          Add people by their user ID (Copy ID in their account menu), not a display name.
         </Label>
       </Column>
       <If
@@ -109,11 +120,12 @@ function MembersCard() {
                     <Badge tone={m().role === "owner" ? "agent" : "neutral"} label={m().role} />
                     <If when={m().role !== "owner" && m().userId !== me()}>
                       <Action
+                        variant="destructive"
                         testID={`remove-member:${m().userId}`}
                         label="Remove"
+                        accessibilityLabel={`Remove ${m().userId} from this Space`}
                         busyLabel="Removing…"
                         busy={memberBusy() === m().userId}
-                        variant="ghost"
                         onPress={() => void removeMember(m().userId)}
                       />
                     </If>
@@ -133,6 +145,26 @@ function MembersCard() {
   );
 }
 
+/** A destructive first step at the trailing edge, and in its place the filled confirmation with Cancel. */
+function ConfirmAtEdge(props: {
+  asking: boolean;
+  lead?: JSX.Element;
+  trigger: JSX.Element;
+  confirm: JSX.Element;
+  onCancel: () => void;
+}) {
+  return (
+    <Row align="center" gap={2} wrap>
+      {props.lead}
+      <Spacer />
+      <If when={props.asking} else={props.trigger}>
+        <Action label="Cancel" variant="ghost" onPress={props.onCancel} />
+        {props.confirm}
+      </If>
+    </Row>
+  );
+}
+
 function RunnerCard() {
   const confirm = signal<null | "detach" | "revoke">(null);
   const runner = () => activeSpaceRunner();
@@ -146,9 +178,11 @@ function RunnerCard() {
     <Surface variant="card" pad={4} gap={3} testID="runner-card">
       <Row align="center" gap={2}>
         <Column grow gap={1}>
-          <Label variant="heading">Runner</Label>
+          <Label variant="heading" heading>
+            Runner
+          </Label>
           <Label variant="caption" color="muted">
-            This Space uses at most one runner. Attached or paired means jobs from this Space go to it; it doesn't mean the runner is online.
+            One runner at a time. Attached or paired means this Space's jobs go to it; it doesn't mean the runner is online.
           </Label>
         </Column>
         <Badge testID="runner-paired" tone={badge().tone} label={badge().label} />
@@ -171,11 +205,11 @@ function RunnerCard() {
             <Label variant="caption" color="muted">
               It works in its own folder for this Space (spaces/{activeSpace()?.id ?? ""}/ on the runner). Its token is managed in Settings › Runners.
             </Label>
-            <If
-              when={confirm() === "detach"}
-              else={<Row><Action testID="detach-runner" label="Detach…" variant="ghost" onPress={() => confirm.set("detach")} /></Row>}
-            >
-              <Row gap={2} wrap>
+            <ConfirmAtEdge
+              asking={confirm() === "detach"}
+              onCancel={() => confirm.set(null)}
+              trigger={<Action variant="destructive" testID="detach-runner" label="Detach…" onPress={() => confirm.set("detach")} />}
+              confirm={
                 <Action
                   testID="confirm-detach"
                   label="Detach now: this Space stops sending it jobs"
@@ -187,9 +221,8 @@ function RunnerCard() {
                     void detachRunner();
                   }}
                 />
-                <Action label="Cancel" variant="ghost" onPress={() => confirm.set(null)} />
-              </Row>
-            </If>
+              }
+            />
           </Column>
         )}
       </If>
@@ -200,19 +233,24 @@ function RunnerCard() {
           <Label variant="caption" color="muted">
             A dedicated token serves this Space only. To use a registered runner instead, revoke it first.
           </Label>
-          <Row gap={2} wrap>
-            <Action
-              testID="issue-runner-token"
-              label="Rotate token"
-              busyLabel="Issuing…"
-              busy={spaceRunnerBusy() === "issue"}
-              disabled={!!spaceRunnerBusy()}
-              onPress={() => {
-                confirm.set(null);
-                void issueDedicatedToken();
-              }}
-            />
-            <If when={confirm() === "revoke"} else={<Action testID="revoke-runner-token" label="Revoke…" variant="ghost" onPress={() => confirm.set("revoke")} />}>
+          <ConfirmAtEdge
+            asking={confirm() === "revoke"}
+            onCancel={() => confirm.set(null)}
+            lead={
+              <Action
+                testID="issue-runner-token"
+                label="Rotate token"
+                busyLabel="Issuing…"
+                busy={spaceRunnerBusy() === "issue"}
+                disabled={!!spaceRunnerBusy()}
+                onPress={() => {
+                  confirm.set(null);
+                  void issueDedicatedToken();
+                }}
+              />
+            }
+            trigger={<Action variant="destructive" testID="revoke-runner-token" label="Revoke…" disabled={!!spaceRunnerBusy()} onPress={() => confirm.set("revoke")} />}
+            confirm={
               <Action
                 testID="confirm-revoke"
                 label="Revoke now: the runner stops serving this Space"
@@ -224,9 +262,8 @@ function RunnerCard() {
                   void revokeDedicatedToken();
                 }}
               />
-              <Action label="Cancel" variant="ghost" onPress={() => confirm.set(null)} />
-            </If>
-          </Row>
+            }
+          />
         </Column>
       </If>
 
@@ -235,7 +272,11 @@ function RunnerCard() {
         <Column gap={3} testID="attach-runner-list">
           <If when={registeredRunnersSupported()}>
             <Column gap={1}>
-              <Label variant="strong">Attach a runner</Label>
+              <Row align="center" gap={2}>
+                <Label variant="strong">Attach a runner</Label>
+                <Spacer />
+                <Action testID="open-runner-settings" label="Manage runners in Settings" variant="ghost" onPress={() => openSettings("runners")} />
+              </Row>
               <If
                 when={runners()}
                 else={
@@ -248,7 +289,7 @@ function RunnerCard() {
                   when={attachableRunners().length > 0}
                   else={
                     <Label variant="caption" color="muted">
-                      No runner you can attach yet. Add one in Settings › Runners: your personal runners, and the organization's, show up here.
+                      No runner you can attach yet. Your personal runners and the organization's show up here once added in Settings › Runners.
                     </Label>
                   }
                 >
@@ -264,10 +305,11 @@ function RunnerCard() {
                             <Action
                               testID={`attach-runner:${r().id}`}
                               label="Attach"
+                              accessibilityLabel={`Attach ${r().name}`}
                               busyLabel="Attaching…"
                               busy={spaceRunnerBusy() === `attach:${r().id}`}
                               disabled={!!spaceRunnerBusy()}
-                              variant="primary"
+                              variant="secondary"
                               onPress={() => void attachRunner(r().id)}
                             />
                           </Row>
@@ -278,9 +320,6 @@ function RunnerCard() {
                   </Column>
                 </If>
               </If>
-              <Row>
-                <Action testID="open-runner-settings" label="Manage runners in Settings" variant="ghost" onPress={() => openSettings("runners")} />
-              </Row>
             </Column>
           </If>
           <Column gap={1}>
