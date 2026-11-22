@@ -69,12 +69,16 @@ export function Avatar(
 /**
  * One transcript entry: a narrow gutter (a picture, or a continuation's
  * time) and the content beside it. `highlight` marks a message addressed to
- * the signed-in user.
+ * the signed-in user with an accent rail and a faint tint. `toolbar` floats
+ * at the top right on hover or keyboard focus (always on touch screens; see
+ * MessageToolbar). The row tints while the pointer is over it.
  */
 export function MessageFrame(
   props: Testable & {
     gutter?: JSX.Element;
-    /** Small controls at the entry's top right (adding a reaction). */
+    /** The message's actions (a MessageToolbar). */
+    toolbar?: JSX.Element;
+    /** Small controls at the entry's top right, in the flow. */
     trailing?: JSX.Element;
     highlight?: boolean;
     /** Follows the previous entry by the same author: tighter spacing. */
@@ -86,13 +90,16 @@ export function MessageFrame(
   return (
     <View
       class={cx(
-        "flex-row gap-(--space-3) rounded-(--radius-sm) px-(--space-2)",
+        "group/msg relative flex-row gap-(--space-3) rounded-(--radius-sm) px-(--space-2) hover:bg-muted/50 focus-within:bg-muted/50",
         props.continued ? "py-px" : "pt-(--space-2) pb-px",
-        props.highlight && "bg-tone-warning",
+        props.highlight && "bg-tone-warning/45 hover:bg-tone-warning/70",
       )}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
     >
+      <If when={props.highlight}>
+        <View class="absolute left-0 top-[3px] bottom-[3px] w-[3px] rounded-full bg-tone-warning-foreground" accessibilityElementsHidden />
+      </If>
       <View class="w-[52px] shrink-0 items-center">{props.gutter}</View>
       <View class="flex-1 min-w-0 flex-col gap-[2px]" selectable={props.selectable}>
         {props.children}
@@ -100,6 +107,7 @@ export function MessageFrame(
       <If when={props.trailing}>
         <View class="shrink-0 items-end">{props.trailing}</View>
       </If>
+      {props.toolbar}
     </View>
   );
 }
@@ -113,13 +121,18 @@ export function MessageHeader(props: Testable & { children?: JSX.Element }) {
   );
 }
 
-/** An author's name in the transcript; `agent` gives the agent's tone. */
-export function AuthorName(props: Testable & { name: string; agent?: boolean }) {
+/**
+ * An author's name in the transcript; `agent` gives the agent's tone.
+ * `detail` (a person's stable id) shows on hover and is read after the name.
+ */
+export function AuthorName(props: Testable & { name: string; agent?: boolean; detail?: string }) {
   return (
     <Text
       class={cx("text-(length:--text-md) font-semibold", props.agent ? "text-tone-agent-foreground" : "text-foreground")}
       style={{ numberOfLines: 1 }}
       testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel ?? (props.detail ? `${props.name}, ${props.detail}` : undefined)}
+      tooltip={props.detail ? <Text class="rounded-(--radius-sm) bg-popover border border-border px-(--space-2) py-[3px] text-(length:--text-xs) text-popover-foreground">{props.detail}</Text> : undefined}
     >
       {props.name}
     </Text>
@@ -137,9 +150,16 @@ export function AuthorTag(props: Testable & { label: string; tone?: Tone }) {
 
 /** A time in the transcript: short on screen, the full date, time and zone for screen readers and on hover. */
 export function Timestamp(props: Testable & { text: string; full: string; compact?: boolean }) {
+  // A continuation's time (compact, in the gutter) stays quiet until the
+  // pointer or the keyboard focus is on its message; touch screens show it.
   return (
     <Text
-      class={cx("text-muted-foreground", props.compact ? "text-[10px] pt-[3px]" : "text-(length:--text-xs)")}
+      class={cx(
+        "text-muted-foreground",
+        props.compact
+          ? "text-[10px] pt-[3px] opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 pointer-coarse:opacity-100 transition-opacity"
+          : "text-(length:--text-xs)",
+      )}
       style={{ numberOfLines: 1 }}
       accessibilityLabel={props.full}
       testID={props.testID}
@@ -162,3 +182,5 @@ export function DaySeparator(props: Testable & { label: string }) {
     </View>
   );
 }
+
+export * from "./chatControls";
