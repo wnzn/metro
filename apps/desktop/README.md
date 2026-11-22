@@ -225,9 +225,12 @@ Space, and work with or without any Space. The entries above describe the
 current source after 0.2.0, which isn't released. Return-only search with
 its scope and type filters, folded zero-similarity results, the Library
 page, the media model in Settings, scheduled-task cards with the History
-menu, and the routing badge's percentage were checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. The account
-menu, the Ctrl/⌘+K shortcut and the Chat **New task** form are covered by
-automated tests. Windows and macOS weren't checked.
+menu, the routing badge's percentage, the account row, and Chat's **New
+task** form were checked in a native Linux GTK run, in dark and light themes,
+of the unreleased source after 0.2.0. At 860 px wide with the runs shown,
+Chat's composer and header currently overlap the runs. A fix is in
+progress. The account menu's items and the Ctrl/⌘+K shortcut are covered
+by automated tests. Windows and macOS weren't checked.
 - **Manage (owners only):** list, add, and remove members. Pick which runner
   serves the Space: attach one of your personal runners or an organization
   runner from the same list as Settings › Runners, or detach it. A Space that

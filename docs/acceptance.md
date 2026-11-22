@@ -61,8 +61,42 @@ recorded as reported.
 - The native file picker for Library uploads.
 - Packaging and the e2e scripts.
 
-**Pending:** the core and compact-window GTK receipt. It will be added here
-when it arrives.
+**Core and compact windows: native GTK, before and after, dark and light.**
+
+- **What was compared:** native `v0.2.0` (`3787f01`) against renderer
+  `22cc1af11473`, which is the frozen app at `58a1b7d`. Both ran against a
+  real local `metro-server` and `metro-runner`, with a scripted model.
+- **The receipt:** stored outside the gallery, under
+  `~/.cache/metro-release/desktop-refresh/core/`.
+  - `HANDOFF.md` and `PROVENANCE.md`.
+  - `SHA256SUMS.png.txt`, covering all 160 PNGs: 52 before, 56 after and
+    52 pairs.
+  - The capture tooling is at commit `d5258b3`.
+- **Checked:** personal Chat with populated agent runs, a populated room with
+  agent activity, a thread, **Model providers** with its setup flows,
+  **Appearance**, and the account chrome.
+  - Chat's **New task**: the dispatch form open, and the narrow layout with
+    the runs hidden.
+- **Profile Save at 780×810, the same geometry in both themes:**
+  - Before, Save showed 23 px of its 36 px and was clipped by the modal.
+  - After, all 36 px show, with 12 px of clearance.
+  - The fixture was edited and Save pressed without scrolling.
+  - In all four runs the server returned the intended display name and bio.
+  - Afterwards, *Profile saved* showed in the fixed footer.
+- **Admin page:** 19/19 browser checks and 68/68 measured contrast pairs
+  (text, controls and focus), with the admin CSS at `2869c6b`. No auth or
+  script changes.
+- **Open findings from this review:**
+  - At 860 px wide with the runs shown, Chat's composer and header overlap
+    the runs. A fix is in progress, and its proof will be added in a later
+    entry.
+  - Two minor issues:
+    - The provider dropdown opens upward over the Documents & media heading.
+      0.2.0 does the same.
+    - After **Make default**, the media **Save** sits under the fixed footer
+      notice until you scroll.
+
+This gate makes no release, packaging or e2e claims.
 
 ## Final: Metro 0.2.0 local release, prepublication (2026-11-23, project manager, local)
 

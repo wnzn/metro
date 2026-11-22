@@ -16,8 +16,9 @@ sidebar entry with these sections. **Model providers** also holds
 **Documents & media**, where you choose the media model that indexes and
 searches your files ([library.md](library.md#in-the-desktop-app)). That
 choice was checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. Your account is in the sidebar's account row.
-Its menu offers **Copy server URL**, **Copy ID** and **Sign out** (covered
-by automated tests).
+Its menu offers **Copy server URL**, **Copy ID** and **Sign out**. The
+account row was checked in the same native GTK review, and its menu items
+are covered by automated tests.
 
 This page also covers the server settings that operators set behind them.
 
