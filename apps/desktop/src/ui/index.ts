@@ -10,3 +10,4 @@ export * from "./chrome";
 export * from "./media";
 export * from "./chat";
 export type { Space, Tone } from "./tokens";
+export * from "./settings";
