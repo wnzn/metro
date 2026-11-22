@@ -143,9 +143,12 @@ private folder on this computer, per Space, while Metro is open.
   you see it. Its agent can't see your Spaces, and its only tool is
   acknowledging with a reaction. Next to it, the Chat shows active and recent
   **agent runs** in your Spaces, with three actions:
-  Open (go to the room or thread), Follow up, and Stop. You can also send a
-  task to the agent of a Space and room that you pick explicitly. The
-  recipient is spelled out before you send ("To: agent in Acme › #lobby").
+  Open (go to the room or thread), Follow up, and Stop. **New task** there
+  sends a task right away, once, to the agent of a Space and room or thread
+  that you pick explicitly. The recipient is spelled out before **Send to
+  agent** ("To: agent in Acme › #lobby"). Follow up opens the same form, and
+  Close folds it while keeping your draft. This is separate from
+  **Scheduled tasks › New task**, which creates a schedule.
 - **Spaces:** a Space has its own rooms (starting with its `lobby`), members,
   and optional paired runner. A new account has no Spaces. It sees how to
   create one. Your user ID, to give an owner, is under **Settings →
@@ -187,18 +190,37 @@ private folder on this computer, per Space, while Metro is open.
 - **Which model answered:** a turn's `started` marker carries the route the
   server recorded (`activity.route`). When it's worth saying (a use case, a
   model chosen for that message, a start by System One or a scheduled
-  prompt), the collapsed group shows one small badge, such as **Incident
-  review**. Opening the group adds one line: where the model came from, its
-  provider and model ID, and the server's short reason. Connection IDs are
+  prompt), the collapsed group shows one compact badge, such as **Routed:
+  Incident review · 91%** (or **Routed: chosen model**). Opening the group
+  adds one line: where the model came from, its provider and model ID, and
+  the server's short reason. The raw probability (`p 0.91`) is never
+  shown. Connection IDs are
   never shown, and the route is not counted as a step. A turn that answered
   with no steps keeps a row only when it has such a badge. A message that
   System One judged to be for the agent is labelled **agent · detected by
   System One**, never as an `@agent` its sender typed. The app never sends
   `addressed_by`; only the server sets it.
-- **Search** and **Scheduled tasks** (sidebar, with or without any Space):
-  your own pages, outside every Space. A search result opens your Chat, or
-  the room or thread it came from, if you're still a member. See
-  [docs/schedules.md](../../docs/schedules.md) for scheduled prompts.
+- **Search** (the box at the top of the window; <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>K</kbd>
+  focuses it): typing sends nothing, and **Return** runs the search. The
+  Search page has two modes, **Conversations** (messages you can read) and
+  **Documents & media** (your indexed files), and no second query field.
+  A result opens your Chat, or the room or thread it came from, if you're
+  still a member. Results show no raw scores.
+- **Library** (sidebar): your personal library and the files of Spaces
+  you're in. **Upload**, **Open**, **Index**, and **Delete…** in each row's
+  **More** menu, which asks first. On this page, the top search box searches
+  documents and media. The media model is chosen in **Settings › Model
+  providers › Documents & media**. See [docs/library.md](../../docs/library.md).
+- **Scheduled tasks** (sidebar): **New task** creates a schedule. Each card
+  has **Edit**, and **History**, **Pause**/**Resume** and **Delete…** in
+  its **More** menu. See [docs/schedules.md](../../docs/schedules.md).
+- **Account row** (sidebar footer): your picture, name and host. Its menu
+  offers **Copy server URL**, **Copy ID** and **Sign out**.
+
+Chat, Search, Library and Scheduled tasks are your own pages, outside every
+Space, and work with or without any Space. The entries above describe the
+current source after 0.2.0. It's covered by automated tests, isn't released,
+and has no recorded GUI run yet.
 - **Manage (owners only):** list, add, and remove members. Pick which runner
   serves the Space: attach one of your personal runners or an organization
   runner from the same list as Settings › Runners, or detach it. A Space that
@@ -249,6 +271,10 @@ private folder on this computer, per Space, while Metro is open.
     sign-in or device token. A connection needs a model before it can be
     shared. A Sign in with ChatGPT connection shares only a bring-your-own
     preset: each person signs in with their own account.
+    In the current source after 0.2.0, this page also holds **Documents &
+    media**: **Index and search with** picks your media model (only
+    media-capable connections), and **Where your files go** says what Index
+    and search send, and to whom.
   - **Model routing:** all off by default, and only ever about messages you
     write. Pick a **System One classifier**, an **embeddings model** for
     search, and a **fallback answer model**. Each picker offers only models of
@@ -436,8 +462,8 @@ These IDs are used by the tests and screenshot steps; keep them stable:
   `routing-save`, `routing-revert`, `routing-error`, `routing-notice`,
   `routing-unsupported`, `available-error`,
   `routing-no-<classifier|chat|embedding>`
-- **Search:** `search-view`, `search-form`, `search-query`, `search-scope`,
-  `search-submit`, `search-results`, `search-result:…`, `search-open:…`,
+- **Search:** `top-search`, `search-view`, `search-surface`, `search-form`,
+  `search-scope`, `search-results`, `search-less-relevant`, `search-result:…`, `search-open:…`,
   `search-summary`, `search-ranking`, `search-ranking-explain`,
   `search-partial`, `search-notice`, `search-empty`, `search-hidden`,
   `search-error`, `search-open-error`, `search-open-providers`,
@@ -450,13 +476,14 @@ These IDs are used by the tests and screenshot steps; keep them stable:
   `schedule-recipient`, `schedule-when`, `schedule-once-date`,
   `schedule-once-time`, `schedule-once-zone`, `schedule-once-preview`,
   `schedule-repeat`, `schedule-repeat-time`, `schedule-weekday`,
-  `schedule-cron`, `schedule-cron-preview`, `schedule-timezone`,
-  `schedule-timezone-device`, `schedule-timezone-utc`, `schedule-enabled`,
+  `schedule-cron`, `schedule-cron-preview`, `schedule-zone`,
+  `schedule-timezone`, `schedule-enabled`,
   `schedule-save`, `schedule-cancel`, `schedule-form-error`, and per task
-  (`…:<id>`): `schedule:`, `schedule-state:`, `schedule-next:`,
-  `schedule-last:`, `schedule-edit:`, `schedule-pause:`, `schedule-resume:`,
-  `schedule-run:`, `schedule-delete:`, `schedule-confirm:`,
-  `schedule-confirm-delete:`, `schedule-cancel-delete`, `schedule-history:`,
+  (`…:<id>`): `schedule:`, `schedule-summary:`, `schedule-state:`,
+  `schedule-next:`, `schedule-exact:`, `schedule-last:`, `schedule-edit:`,
+  `schedule-more:` (its items `schedule-history:`, `schedule-pause:`, `schedule-resume:`,
+  `schedule-delete:`), `schedule-busy:`, `schedule-run:`, `schedule-confirm:`,
+  `schedule-confirm-delete:`, `schedule-cancel-delete`, `schedule-legend:`,
   `schedule-history-refresh:`, `schedule-runs:`, `schedule-runs-empty:`,
   `schedule-runs-error:`
 
