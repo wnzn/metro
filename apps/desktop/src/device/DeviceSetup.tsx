@@ -10,7 +10,7 @@
 import { cleanup, effect, openUrl, signal, untracked } from "nsh";
 import { connectedTo } from "../store";
 import { fetchModels, modelListings, providerById } from "../settings";
-import { Action, Badge, Banner, Column, Field, Label, Row, SettingRow, SettingsGroup, Toggle } from "../ui";
+import { Action, ActionBar, Badge, Banner, Column, Field, Row, SettingRow, SettingsGroup, Toggle } from "../ui";
 import { isEndpointKind } from "./bridge";
 import type { LocalConnection } from "./bridge";
 import {
@@ -72,16 +72,13 @@ export function HelperStatus() {
   return (
     <If when={text()}>
       {(t) => (
-        <Banner tone={h().phase === "checking" ? "neutral" : "warning"} testID="device-helper-status">
-          <Column gap={2} grow>
-            <Label color={h().phase === "checking" ? "muted" : "warning"}>{t()}</Label>
-            <If when={h().phase !== "checking"}>
-              <Row>
-                <Action testID="device-helper-retry" label="Check again" variant="ghost" onPress={() => void refreshHelper()} />
-              </Row>
-            </If>
-          </Column>
-        </Banner>
+        <Banner
+          variant="inline"
+          tone={h().phase === "checking" ? "neutral" : "warning"}
+          testID="device-helper-status"
+          message={t()}
+          action={h().phase !== "checking" ? <Action testID="device-helper-retry" label="Check again" variant="ghost" onPress={() => void refreshHelper()} /> : undefined}
+        />
       )}
     </If>
   );
@@ -120,9 +117,12 @@ export function DeviceSetup(props: { connectionId: string; connectionName: strin
       <HelperStatus />
       <Messages />
       <If when={ready() && !supported()}>
-        <Banner tone="warning" testID="device-unsupported">
-          <Label color="warning">{`Metro's device helper in this app can't run ${providerById(props.providerId)?.name ?? props.providerId}. Pick another provider for this computer.`}</Label>
-        </Banner>
+        <Banner
+          variant="inline"
+          tone="warning"
+          testID="device-unsupported"
+          message={`Metro's device helper in this app can't run ${providerById(props.providerId)?.name ?? props.providerId}. Pick another provider for this computer.`}
+        />
       </If>
       <If when={ready() && supported()}>
         <Column gap={6}>
@@ -148,20 +148,8 @@ export function DeviceSetup(props: { connectionId: string; connectionName: strin
 function Messages() {
   return (
     <Column gap={2}>
-      <If when={pairError()}>
-        {(e) => (
-          <Banner tone="danger" testID="device-setup-error">
-            <Label color="danger">{e()}</Label>
-          </Banner>
-        )}
-      </If>
-      <If when={pairNotice()}>
-        {(n) => (
-          <Banner tone="success" testID="device-setup-notice">
-            <Label color="success">{n()}</Label>
-          </Banner>
-        )}
-      </If>
+      <If when={pairError()}>{(e) => <Banner variant="inline" tone="danger" testID="device-setup-error" message={e()} />}</If>
+      <If when={pairNotice()}>{(n) => <Banner variant="inline" tone="success" testID="device-setup-notice" message={n()} />}</If>
     </Column>
   );
 }
@@ -240,9 +228,7 @@ function Credentials(props: { connectionId: string; kind: string; local: LocalCo
     <Column gap={4}>
       <If when={failed()}>
         {(f) => (
-          <Banner tone="warning" testID="device-signin-failed">
-            <Label color="warning">{`Sign-in didn't finish: ${f()}`}</Label>
-          </Banner>
+          <Banner variant="inline" tone="warning" testID="device-signin-failed" message={`Sign-in didn't finish: ${f()}`} />
         )}
       </If>
       <If
@@ -355,9 +341,7 @@ function Models(props: { connectionId: string; current: string[]; onDone?: () =>
       <If when={list()?.state === "error" ? (list() as { message: string }).message : null}>
         {(m) => (
           <Column padX={4} padY={2}>
-            <Banner tone="warning" testID="device-models-error">
-              <Label color="warning">{`${m()} Enter a model ID below instead.`}</Label>
-            </Banner>
+            <Banner variant="inline" tone="warning" testID="device-models-error" message={`${m()} Enter a model ID below instead.`} />
           </Column>
         )}
       </If>
@@ -378,7 +362,7 @@ function Models(props: { connectionId: string; current: string[]; onDone?: () =>
         <Action testID="device-models-refresh" label="List again" variant="ghost" disabled={list()?.state === "loading"} onPress={() => void listModelsHere(props.connectionId)} />
         <Action
           testID="device-models-save"
-          label={`Approve ${chosen().length || ""} model${chosen().length === 1 ? "" : "s"}`.replace("  ", " ")}
+          label={chosen().length === 0 ? "Approve models" : `Approve ${chosen().length} model${chosen().length === 1 ? "" : "s"}`}
           busyLabel="Saving…"
           busy={pairBusy() === `models:${props.connectionId}`}
           disabled={!!pairBusy() || chosen().length === 0}
@@ -447,23 +431,27 @@ function Ready(props: { connection: LocalConnection; connectionName: string }) {
         <Models connectionId={id()} current={props.connection.models} onDone={() => editing.set(false)} />
       </If>
 
-      <SettingsGroup title="Manage" description="These change this computer only, except Forget, which also revokes its device token.">
+      <SettingsGroup title="This computer" description="These change this computer only, except Forget, which also revokes its device token.">
         <Row padX={4} padY={3} gap={2} wrap>
-          <Action testID="device-signout" label="Sign out here…" variant="ghost" disabled={!!pairBusy()} onPress={() => confirm.set("signout")} />
-          <Action testID="device-rotate" label="Re-pair…" variant="ghost" disabled={!!pairBusy()} onPress={() => confirm.set("rotate")} />
-          <Action testID="device-forget" label="Forget this computer…" variant="ghost" disabled={!!pairBusy()} onPress={() => confirm.set("forget")} />
+          <Action testID="device-signout" label="Sign out here…" disabled={!!pairBusy()} onPress={() => confirm.set("signout")} />
+          <Action testID="device-rotate" label="Re-pair…" disabled={!!pairBusy()} onPress={() => confirm.set("rotate")} />
+          <Action testID="device-forget" label="Forget this computer…" variant="destructive" disabled={!!pairBusy()} onPress={() => confirm.set("forget")} />
         </Row>
         <If when={confirm()}>
           {(what) => (
             <Column padX={4} padY={3} gap={2} testID={`device-confirm-${what()}`}>
-              <Label color="warning">
-                {what() === "rotate"
-                  ? `Re-pair “${props.connectionName}”? This computer gets a new device token and the old one stops working at once.`
-                  : what() === "forget"
-                    ? `Forget this computer for “${props.connectionName}”? Its sign-in or key, approved models and device token are deleted here, and the token is revoked, so nothing serves this connection until you set it up again. The connection itself stays.`
-                    : `Sign out of the provider on this computer? It stops serving “${props.connectionName}” until you sign in again. The pairing stays.`}
-              </Label>
-              <Row gap={2}>
+              <Banner
+                variant="inline"
+                tone="warning"
+                message={
+                  what() === "rotate"
+                    ? `Re-pair “${props.connectionName}”? This computer gets a new device token and the old one stops working at once.`
+                    : what() === "forget"
+                      ? `Forget this computer for “${props.connectionName}”? Its sign-in or key, approved models and device token are deleted here, and the token is revoked, so nothing serves this connection until you set it up again. The connection itself stays.`
+                      : `Sign out of the provider on this computer? It stops serving “${props.connectionName}” until you sign in again. The pairing stays.`
+                }
+              />
+              <ActionBar>
                 <Action label="Cancel" variant="ghost" onPress={() => confirm.set(null)} />
                 <Action
                   testID={`device-confirm-${what()}-now`}
@@ -478,7 +466,7 @@ function Ready(props: { connection: LocalConnection; connectionName: string }) {
                     else void signOutHere(id());
                   }}
                 />
-              </Row>
+              </ActionBar>
             </Column>
           )}
         </If>

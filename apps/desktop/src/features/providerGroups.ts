@@ -90,6 +90,14 @@ export function vendorOf(provider: Pick<CatalogProvider, "id" | "name">): { key:
 
 const CAPABILITY_ORDER: Record<Capability, number> = { chat: 0, system_one: 1, embeddings: 2 };
 
+/**
+ * Each capability's badge tone, the same wherever a capability is named
+ * (saved connections, ways to connect, a new connection's summary). The
+ * other badges on a connection (Default, Key saved) are outlined, so a
+ * capability's color always means the capability.
+ */
+export const CAPABILITY_TONE: Record<Capability, Tone> = { chat: "runner", system_one: "agent", embeddings: "success" };
+
 /** The catalog grouped by provider, in a stable, readable order. */
 export function groupCatalog(providers: readonly CatalogProvider[]): VendorGroup[] {
   const groups = new Map<string, VendorGroup>();
@@ -132,6 +140,29 @@ export type PathSummary = {
   /** The default scope of a new connection: always the person's own. */
   scope: string;
 };
+
+const CAPABILITY_WORD: Record<Capability, string> = { chat: "Chat", system_one: "System One", embeddings: "Embeddings" };
+/** The capability inside a phrase: "chat", "embeddings", but "System One". */
+const capWord = (c: Capability) => (c === "system_one" ? CAPABILITY_WORD[c] : CAPABILITY_WORD[c].toLowerCase());
+
+/**
+ * A way's name in a provider's list, which tells two ways of one provider
+ * apart: "Chat API key" and "Embeddings API key", not "API key" twice. The
+ * device ways already say what they are ("Sign in with ChatGPT").
+ */
+export function wayLabel(p: CatalogProvider, opts: { packaged?: boolean } = {}): string {
+  const how = describePath(p, opts);
+  const cap = CAPABILITY_WORD[p.capability];
+  let method = how.method;
+  if (p.execution === "server") {
+    if (how.method === "API key") method = `${cap} API key`;
+    else if (how.method === "API key optional") method = `${cap} API, key optional`;
+    else if (how.method === "Approved endpoint") method = `Approved ${capWord(p.capability)} endpoint`;
+  } else if (how.method.startsWith("Your endpoint")) {
+    method = how.method.replace("Your endpoint", `Your ${capWord(p.capability)} endpoint`);
+  }
+  return how.variant ? `${method} · ${how.variant}` : method;
+}
 
 /**
  * `packaged`: the desktop app sets device connections up itself, so a way is

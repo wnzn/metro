@@ -4,7 +4,7 @@
 
 import { expect, test } from "nsh/test";
 import type { CatalogProvider } from "../settings";
-import { describePath, groupCatalog, vendorOf } from "./providerGroups";
+import { CAPABILITY_TONE, describePath, groupCatalog, vendorOf, wayLabel } from "./providerGroups";
 
 function entry(id: string, name: string, more: Partial<CatalogProvider> = {}): CatalogProvider {
   const device = id.startsWith("device-");
@@ -102,4 +102,26 @@ test("each way says how you sign in, where it runs, who pays, and that it starts
   // The packaged app sets device connections up itself: no helper names.
   expect(describePath(CATALOG.find((p) => p.id === "device-openai-compatible")!, { packaged: true }).method).toBe("Your endpoint, from this computer");
   expect(byId("device-openai-compatible")).toEqual({ method: "Your endpoint, via metro-connector", variant: null, where: "On your device", billing: "Whoever runs the endpoint", scope: "Only you, until you share it" });
+});
+
+test("two ways of one provider never read the same: a chat API key and an embeddings API key say which", () => {
+  const way = (id: string, packaged = false) => wayLabel(CATALOG.find((p) => p.id === id)!, { packaged });
+  expect(way("openai")).toBe("Chat API key · OpenAI Responses");
+  expect(way("openai-embeddings")).toBe("Embeddings API key");
+  expect(way("systemone")).toBe("System One API key");
+  expect(way("custom")).toBe("Approved chat endpoint");
+  expect(way("custom-embeddings")).toBe("Approved embeddings endpoint");
+  expect(way("device-openai-compatible", true)).toBe("Your chat endpoint, from this computer");
+  expect(way("device-embeddinggemma-2")).toBe("Your embeddings endpoint, via metro-connector");
+  // Ways that already say what they are keep their name.
+  expect(way("device-openai-oauth")).toBe("Sign in with ChatGPT");
+  // Within every provider, no two ways share a label.
+  for (const g of groupCatalog(CATALOG)) {
+    const labels = g.paths.map((p) => wayLabel(p));
+    expect(new Set(labels).size).toBe(labels.length);
+  }
+});
+
+test("each capability has its own badge tone", () => {
+  expect(new Set(Object.values(CAPABILITY_TONE)).size).toBe(3);
 });

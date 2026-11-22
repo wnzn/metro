@@ -20,51 +20,39 @@ import {
   runnersError,
 } from "../settings";
 import type { RegisteredRunner, RunnerVisibility } from "../settings";
-import { Action, Badge, Banner, Column, Field, Label, PageHeader, Row, ScrollArea, SegmentedControl, SettingRow, SettingsGroup, Surface } from "../ui";
+import { Action, ActionBar, Badge, Banner, Column, compactWidth, Field, PageHeader, PageLayout, Row, SegmentedControl, SettingRow, SettingsGroup } from "../ui";
 import { TokenReveal } from "./TokenReveal";
 
 export function RunnersSettings() {
+  const token = () => revealed()?.kind === "runner";
+  const hasMessages = () => !token() && !!(runnersError() || runnerNotice());
   return (
-    <ScrollArea pad={6} testID="runners-settings">
-      <Surface variant="content" gap={6}>
-        <If
-          when={revealed()?.kind === "runner"}
-          else={
-            <Column gap={6}>
-              <PageHeader
-                title="Runners"
-                subtitle="A runner runs workspace tools for Spaces. Register one, start it with Docker, then attach it to Spaces you own. One runner can serve several Spaces, each in its own folder; each Space uses at most one runner."
-              />
-              <Messages />
-              <AddRunner />
-              <RunnerList />
-            </Column>
-          }
-        >
-          <TokenReveal />
-        </If>
-      </Surface>
-    </ScrollArea>
+    <PageLayout testID="runners-settings" pad={compactWidth() ? 4 : 6} gap={6} footer={hasMessages() ? <Messages /> : undefined}>
+      <If
+        when={token()}
+        else={
+          <Column gap={6}>
+            <PageHeader
+              title="Runners"
+              subtitle="A runner runs workspace tools for Spaces. Register one, start it, then attach it to Spaces you own. One runner can serve several Spaces, each in its own folder; each Space uses at most one runner."
+            />
+            <AddRunner />
+            <RunnerList />
+          </Column>
+        }
+      >
+        <TokenReveal />
+      </If>
+    </PageLayout>
   );
 }
 
+/** Errors and what the last change did, in the page's fixed footer. */
 function Messages() {
   return (
     <Column gap={2}>
-      <If when={runnersError()}>
-        {(message) => (
-          <Banner tone="danger" testID="runners-error">
-            <Label color="danger">{message()}</Label>
-          </Banner>
-        )}
-      </If>
-      <If when={runnerNotice()}>
-        {(message) => (
-          <Label variant="caption" color="muted" testID="runners-notice">
-            {message()}
-          </Label>
-        )}
-      </If>
+      <If when={runnersError()}>{(message) => <Banner variant="inline" tone="danger" testID="runners-error" message={message()} />}</If>
+      <If when={runnerNotice()}>{(message) => <Banner variant="inline" tone="success" testID="runners-notice" message={message()} />}</If>
     </Column>
   );
 }
@@ -79,7 +67,7 @@ function AddRunner() {
     }
   };
   return (
-    <SettingsGroup title="Add a runner" description="You'll get its token once, with the Docker command to start it." testID="add-runner-group">
+    <SettingsGroup title="Add a runner" description="You'll get its token once, with the steps to start it." testID="add-runner-group">
       <SettingRow label="Name" description="Something you'll recognise in a Space's runner list, such as the machine it runs on." stacked>
         <Field testID="runner-name" accessibilityLabel="Runner name" value={name()} onChange={name.set} placeholder="Build box" maxLength={80} onSubmit={() => void submit()} />
       </SettingRow>
@@ -148,7 +136,7 @@ function RunnerRow(props: { runner: RegisteredRunner }) {
   return (
     <Column testID={`runner:${r().id}`}>
       <SettingRow label={r().name} description={scopeText(r())}>
-        <Row align="center" gap={2}>
+        <Row align="center" gap={2} wrap justify="end">
           <Badge tone={r().visibility === "organization" ? "agent" : "neutral"} label={r().visibility === "organization" ? "Organization" : "Personal"} />
           <If when={r().canManage}>
             <Action
@@ -157,7 +145,6 @@ function RunnerRow(props: { runner: RegisteredRunner }) {
               busyLabel="Rotating…"
               busy={runnerBusy() === `rotate:${r().id}`}
               disabled={!!runnerBusy()}
-              variant="ghost"
               onPress={() => void confirmRunnerAction("rotate", r().id)}
             />
             <Action
@@ -166,7 +153,7 @@ function RunnerRow(props: { runner: RegisteredRunner }) {
               busyLabel="Deleting…"
               busy={runnerBusy() === `delete:${r().id}`}
               disabled={!!runnerBusy()}
-              variant="ghost"
+              variant="destructive"
               onPress={() => void confirmRunnerAction("delete", r().id)}
             />
           </If>
@@ -175,10 +162,8 @@ function RunnerRow(props: { runner: RegisteredRunner }) {
       <If when={confirming()}>
         {(action) => (
           <Column padX={4} padY={3} gap={2} testID={`runner-confirm:${r().id}`}>
-            <Banner tone="warning">
-              <Label color="warning">{impactText(action(), r())}</Label>
-            </Banner>
-            <Row gap={2} justify="end">
+            <Banner variant="inline" tone="warning" message={impactText(action(), r())} />
+            <ActionBar>
               <Action testID="cancel-runner-action" label="Cancel" variant="ghost" onPress={cancelRunnerAction} />
               <Action
                 testID={`confirm-${action()}-runner`}
@@ -186,7 +171,7 @@ function RunnerRow(props: { runner: RegisteredRunner }) {
                 variant="danger"
                 onPress={() => void (action() === "rotate" ? rotateRunner(r().id) : deleteRunner(r().id))}
               />
-            </Row>
+            </ActionBar>
           </Column>
         )}
       </If>

@@ -5,11 +5,13 @@
 // password; server-stored API profiles take a key that is sent once and
 // never shown again.
 //
-// Layout: your connections grouped by provider, each a compact row that opens
-// to manage it; then Add a connection: what it's for, one compact drop-down
-// of providers (one entry per provider however many ways it has), and that
-// provider's ways to connect, each saying how you sign in, where it runs and
-// who pays. Grouping is ./providerGroups.
+// Layout: your connections grouped by provider, each a compact row with one
+// Manage control that opens everything else about it; then the Documents &
+// media model (./library owns it); then Add a connection: what it's for, one
+// compact drop-down of providers (one entry per provider however many ways it
+// has), and that provider's ways to connect, each saying how you sign in,
+// where it runs and who pays. Grouping is ./providerGroups. Feedback shows in
+// the page's fixed footer, so it's seen wherever the page is scrolled.
 
 import { signal } from "nsh";
 import {
@@ -55,9 +57,10 @@ import {
 } from "../settings";
 import type { Capability, CatalogProvider, ProviderConnection } from "../settings";
 import { onSessionEnd, spaces } from "../store";
-import { Action, Badge, Banner, BrandMark, BrandPicker, Chip, Column, Field, Label, PageHeader, Row, ScrollArea, SegmentedControl, SettingRow, SettingsGroup, Surface } from "../ui";
-import type { BrandItem, Tone } from "../ui";
-import { describePath, groupCatalog, vendorOf } from "./providerGroups";
+import { Action, ActionBar, Badge, Banner, BrandMark, BrandPicker, Chip, Column, compactWidth, Field, Label, PageHeader, PageLayout, Row, SegmentedControl, SettingRow, SettingsGroup } from "../ui";
+import type { BrandItem } from "../ui";
+import { MediaModelSettings } from "./library/LibraryView";
+import { CAPABILITY_TONE, describePath, groupCatalog, vendorOf, wayLabel } from "./providerGroups";
 import type { VendorGroup } from "./providerGroups";
 import { LocalDeviceBadge } from "../device/DeviceSetup";
 import { packaged } from "../device/state";
@@ -71,8 +74,6 @@ const FALLBACK_DESCRIPTION: Record<string, string> = {
   "device-systemone": "System One from metro-connector on this computer, with your own TypeSafe key there. Metro never receives it.",
   "device-embeddings": "An OpenAI-compatible embeddings endpoint reached from metro-connector on this computer, such as a local server you run.",
 };
-
-const CAPABILITY_TONE: Record<Capability, Tone> = { chat: "neutral", system_one: "agent", embeddings: "runner" };
 
 const SHARE_OPTIONS = [
   { value: "personal", label: "Only me" },
@@ -108,59 +109,46 @@ function setManaging(id: string, open: boolean) {
 onSessionEnd(() => managing.set(new Set()));
 
 export function ProvidersSettings() {
+  const device = () => revealed()?.kind === "device";
+  const hasMessages = () => !device() && !!(catalogError() || connectionsError() || providerNotice());
   return (
-    <ScrollArea pad={6} testID="providers-settings">
-      <Surface variant="content" gap={6}>
-        <If
-          when={revealed()?.kind === "device"}
-          else={
-            <Column gap={6}>
-              <PageHeader
-                title="Model providers"
-                subtitle="Your model connections. Each serves one capability (chat, System One or embeddings) and each capability has its own default. Runs you start, and the threads they delegate, use your default chat connection unless Model routing picks another. They're private unless you share one."
-              />
-              <Messages />
-              <ConnectionList />
-              <AddConnection />
-            </Column>
-          }
-        >
-          <TokenReveal />
-        </If>
-      </Surface>
-    </ScrollArea>
+    <PageLayout testID="providers-settings" pad={compactWidth() ? 4 : 6} gap={6} footer={hasMessages() ? <Messages /> : undefined}>
+      <If
+        when={device()}
+        else={
+          <Column gap={6}>
+            <PageHeader
+              title="Model providers"
+              subtitle="Each connection serves one capability, and each capability has its own default. Your runs, and the threads they start, use your default chat connection unless Model routing picks another. Connections are private unless you share one."
+            />
+            <ConnectionList />
+            {/* Documents & media's own form and Save (./library). Mounting it only loads the choice: nothing is indexed or sent. */}
+            <MediaModelSettings />
+            <AddConnection />
+          </Column>
+        }
+      >
+        <TokenReveal />
+      </If>
+    </PageLayout>
   );
 }
 
+/** Errors and what the last change did, in the page's fixed footer. */
 function Messages() {
   return (
     <Column gap={2}>
-      <If when={catalogError()}>
-        {(message) => (
-          <Banner tone="danger" testID="catalog-error">
-            <Label color="danger">{message()}</Label>
-          </Banner>
-        )}
-      </If>
-      <If when={connectionsError()}>
-        {(message) => (
-          <Banner tone="danger" testID="providers-error">
-            <Label color="danger">{message()}</Label>
-          </Banner>
-        )}
-      </If>
-      <If when={providerNotice()}>
-        {(message) => (
-          <Label variant="caption" color="muted" testID="providers-notice">
-            {message()}
-          </Label>
-        )}
-      </If>
+      <If when={catalogError()}>{(message) => <Banner variant="inline" tone="danger" testID="catalog-error" message={message()} />}</If>
+      <If when={connectionsError()}>{(message) => <Banner variant="inline" tone="danger" testID="providers-error" message={message()} />}</If>
+      <If when={providerNotice()}>{(message) => <Banner variant="inline" tone="success" testID="providers-notice" message={message()} />}</If>
     </Column>
   );
 }
 
 // ------------------------------------------------------------------ the list
+
+/** "1 connection", "2 connections". */
+export const countLabel = (n: number, noun: string) => `${n} ${noun}${n === 1 ? "" : "s"}`;
 
 type ConnectionGroup = { key: string; name: string; mark: VendorGroup["mark"]; items: ProviderConnection[] };
 
@@ -192,7 +180,7 @@ function ConnectionList() {
           Your connections
         </Label>
         <Label variant="caption" color="muted">
-          Only you can change these. Keys are never shown again after you save them, and sharing a connection never reveals them.
+          Only you can change these. A saved key is never shown again, and sharing never reveals it.
         </Label>
       </Column>
       <If when={connections()} else={<SettingsGroup><SettingRow label="Loading your connections…" /></SettingsGroup>}>
@@ -200,7 +188,7 @@ function ConnectionList() {
           <Column gap={4}>
             <If when={list().length === 0}>
               <SettingsGroup>
-                <SettingRow label="No connections yet" description="Add one below. Without one, Ask agent uses whatever the server operator configured, if anything." />
+                <SettingRow label="No connections yet" description="Add one below. Until then, Ask agent uses what the server operator configured, if anything." />
               </SettingsGroup>
             </If>
             <Each of={groupConnections(list())} key={(g) => g.key}>
@@ -212,7 +200,7 @@ function ConnectionList() {
                       {g().name}
                     </Label>
                     <Label variant="caption" color="muted">
-                      {`${g().items.length} connection${g().items.length === 1 ? "" : "s"}`}
+                      {countLabel(g().items.length, "connection")}
                     </Label>
                   </Row>
                   <SettingsGroup>
@@ -239,6 +227,14 @@ function connectionSummary(c: ProviderConnection): string {
   return parts.join(" · ");
 }
 
+/** "chat", "System One", "embeddings" inside a sentence. */
+const capabilityWord = (c: Capability) => (c === "chat" ? "chat" : c === "system_one" ? CAPABILITY_LABEL[c] : CAPABILITY_LABEL[c].toLowerCase());
+
+/**
+ * One saved connection: its name, how it works and its badges, with one
+ * Manage control. Everything else (default, sharing, models, key, device,
+ * delete) is inside Manage, so a row stays one line of actions.
+ */
 function ConnectionRow(props: { connection: ProviderConnection }) {
   const c = () => props.connection;
   const provider = () => providerById(c().providerId);
@@ -272,66 +268,43 @@ function ConnectionRow(props: { connection: ProviderConnection }) {
     const v = c().visibility ?? shareOf(c().id);
     return v && v !== "personal" ? v : null;
   };
+  const toggleManage = () => {
+    const next = !open();
+    setManaging(c().id, next);
+    if (!next) {
+      if (sharingOpen() === c().id) closeSharing();
+      if (providerConfirmDelete() === c().id) providerConfirmDelete.set(null);
+      if (deviceConfirmUnpair() === c().id) deviceConfirmUnpair.set(null);
+      replacingKey.set(false);
+      newKey.set("");
+    }
+  };
   return (
     <Column testID={`connection:${c().id}`}>
       <SettingRow label={c().name} description={connectionSummary(c())}>
-        <Row align="center" gap={2} wrap>
+        <Row align="center" gap={2} wrap justify="end">
           <Badge testID={`connection-capability:${c().id}`} tone={CAPABILITY_TONE[capability()]} label={CAPABILITY_LABEL[capability()]} />
           <If when={c().isDefault}>
-            <Badge testID={`connection-default:${c().id}`} tone="success" label={`Default ${capability() === "chat" ? "chat" : CAPABILITY_LABEL[capability()]}`} />
+            <Badge testID={`connection-default:${c().id}`} tone="neutral" variant="outline" label={`Default ${capabilityWord(capability())}`} />
           </If>
           <If when={shared()}>
             {(v) => <Badge testID={`connection-shared:${c().id}`} tone="warning" label={SHARE_BADGE[v()]} />}
           </If>
-          <If when={device()} else={<Badge tone="neutral" label={c().hasKey ? "Key saved" : "No key"} />}>
+          <If when={device()} else={<Badge tone="neutral" variant="outline" label={c().hasKey ? "Key saved" : "No key"} />}>
             <DeviceStatusBadge connectionId={c().id} />
             <If when={packaged()}>
               <LocalDeviceBadge connectionId={c().id} />
             </If>
           </If>
-        </Row>
-      </SettingRow>
-      <Row padX={4} padY={2} gap={2} wrap align="center">
-          <If when={!c().isDefault}>
-            <Action
-              testID={`connection-make-default:${c().id}`}
-              label={capability() === "chat" ? "Make default for chat" : `Make default for ${CAPABILITY_LABEL[capability()]}`}
-              disabled={!!busy()}
-              onPress={() =>
-                void updateConnection(
-                  c().id,
-                  { is_default: true },
-                  `“${c().name}” is now your default ${capability() === "chat" ? "chat" : CAPABILITY_LABEL[capability()]} connection, for ${CAPABILITY_USE[capability()]}. Your defaults for other capabilities are unchanged.`,
-                )
-              }
-            />
-          </If>
-          <Action
-            testID={`connection-sharing:${c().id}`}
-            label={sharingOpen() === c().id ? "Close sharing" : "Sharing…"}
-            variant="ghost"
-            disabled={!!busy()}
-            onPress={() => void openSharing(c().id)}
-          />
           <Action
             testID={`connection-manage:${c().id}`}
             label="Manage"
-            accessibilityLabel={`${open() ? "Hide" : "Manage"} ${c().name}`}
-            variant="ghost"
+            accessibilityLabel={`Manage ${c().name}`}
             expanded={open()}
-            onPress={() => {
-              const next = !open();
-              setManaging(c().id, next);
-              if (!next) {
-                if (sharingOpen() === c().id) closeSharing();
-                if (providerConfirmDelete() === c().id) providerConfirmDelete.set(null);
-                if (deviceConfirmUnpair() === c().id) deviceConfirmUnpair.set(null);
-                replacingKey.set(false);
-                newKey.set("");
-              }
-            }}
+            onPress={toggleManage}
           />
-      </Row>
+        </Row>
+      </SettingRow>
       <If when={device()}>
         <Column padX={4} padY={1}>
           <Label variant="caption" color="muted" testID={`device-status-text:${c().id}`}>
@@ -341,161 +314,181 @@ function ConnectionRow(props: { connection: ProviderConnection }) {
         </Column>
       </If>
       <If when={open()}>
-      <Column padX={4} padY={3} gap={3} testID={`connection-details:${c().id}`}>
-        <Row gap={2} wrap>
-          <If when={device() || provider()?.listsModels !== false}>
+        <Column padX={4} padY={3} gap={3} testID={`connection-details:${c().id}`}>
+          <Row gap={2} wrap>
+            <If when={!c().isDefault}>
+              <Action
+                testID={`connection-make-default:${c().id}`}
+                label={`Make default for ${capabilityWord(capability())}`}
+                disabled={!!busy()}
+                onPress={() =>
+                  void updateConnection(
+                    c().id,
+                    { is_default: true },
+                    `“${c().name}” is now your default ${capabilityWord(capability())} connection, for ${CAPABILITY_USE[capability()]}. Your defaults for other capabilities are unchanged.`,
+                  )
+                }
+              />
+            </If>
             <Action
-              testID={`connection-models:${c().id}`}
-              label={device() ? "Test connection" : "Fetch models"}
-              busyLabel={device() ? "Testing…" : "Fetching…"}
-              busy={listing()?.state === "loading"}
-              onPress={() => void fetchModels(c().id)}
-            />
-          </If>
-          <If when={device()}>
-            <Action
-              testID={`connection-token:${c().id}`}
-              label={packaged() ? (paired() ? "Manage connection" : "Connect this device") : "New device token"}
-              busyLabel={packaged() ? "Opening…" : "Issuing…"}
-              busy={busy() === `token:${c().id}`}
+              testID={`connection-sharing:${c().id}`}
+              label="Sharing"
+              accessibilityLabel={`Who can use ${c().name}`}
+              expanded={sharingOpen() === c().id}
               disabled={!!busy()}
-              onPress={() => void rotateDeviceToken(c().id)}
+              onPress={() => void openSharing(c().id)}
             />
-          </If>
-          <If when={device() && paired()}>
-            <Action
-              testID={`connection-unpair:${c().id}`}
-              label="Unpair…"
-              variant="ghost"
-              disabled={!!busy()}
-              onPress={() => deviceConfirmUnpair.set(c().id)}
-            />
-          </If>
-          <If when={!device() && (provider()?.requiresKey || c().hasKey)}>
-            <Action testID={`connection-replace-key:${c().id}`} label={replacingKey() ? "Cancel key change" : "Replace key…"} variant="ghost" onPress={() => {
-              newKey.set("");
-              replacingKey.set(!replacingKey());
-            }} />
-          </If>
-          <Action
-            testID={`connection-delete:${c().id}`}
-            label="Delete…"
-            variant="ghost"
-            disabled={!!busy()}
-            onPress={() => providerConfirmDelete.set(c().id)}
-          />
-        </Row>
+            <If when={device() || provider()?.listsModels !== false}>
+              <Action
+                testID={`connection-models:${c().id}`}
+                label={device() ? "Test connection" : "Fetch models"}
+                busyLabel={device() ? "Testing…" : "Fetching…"}
+                busy={listing()?.state === "loading"}
+                onPress={() => void fetchModels(c().id)}
+              />
+            </If>
+            <If when={device()}>
+              <Action
+                testID={`connection-token:${c().id}`}
+                label={packaged() ? (paired() ? "This computer…" : "Set up on this computer") : "New device token"}
+                busyLabel={packaged() ? "Opening…" : "Issuing…"}
+                busy={busy() === `token:${c().id}`}
+                disabled={!!busy()}
+                onPress={() => void rotateDeviceToken(c().id)}
+              />
+            </If>
+            <If when={!device() && (provider()?.requiresKey || c().hasKey)}>
+              <Action
+                testID={`connection-replace-key:${c().id}`}
+                label={replacingKey() ? "Cancel key change" : "Replace key…"}
+                variant="ghost"
+                onPress={() => {
+                  newKey.set("");
+                  replacingKey.set(!replacingKey());
+                }}
+              />
+            </If>
+            <If when={device() && paired()}>
+              <Action testID={`connection-unpair:${c().id}`} label="Unpair…" variant="destructive" disabled={!!busy()} onPress={() => deviceConfirmUnpair.set(c().id)} />
+            </If>
+            <Action testID={`connection-delete:${c().id}`} label="Delete…" variant="destructive" disabled={!!busy()} onPress={() => providerConfirmDelete.set(c().id)} />
+          </Row>
 
-        <If when={replacingKey()}>
+          <If when={replacingKey()}>
+            <Row gap={2} align="center">
+              <Field
+                testID={`connection-key-input:${c().id}`}
+                accessibilityLabel={`New API key for ${c().name}`}
+                value={newKey()}
+                onChange={newKey.set}
+                placeholder="New API key"
+                masked
+                grow
+                onSubmit={() => void saveKey()}
+              />
+              <Action testID={`connection-key-save:${c().id}`} label="Save key" busyLabel="Saving…" busy={busy() === `patch:${c().id}`} variant="primary" onPress={() => void saveKey()} />
+            </Row>
+          </If>
+
+          <ListingResult connectionId={c().id} />
+          <If when={listing()?.state === "ok" && (listing() as { models: string[] }).models.length > 0 ? (listing() as { models: string[] }).models : null}>
+            {(models) => (
+              <Column gap={1}>
+                <Label variant="caption" color="muted">
+                  Pick the model this connection uses:
+                </Label>
+                <Row gap={1} wrap testID={`connection-model-list:${c().id}`}>
+                  <Each of={models()} key={(m) => m}>
+                    {(m) => <Chip testID={`model:${c().id}:${m()}`} label={m()} selected={c().model === m()} disabled={!!busy()} onPress={() => void saveModel(m())} />}
+                  </Each>
+                </Row>
+              </Column>
+            )}
+          </If>
           <Row gap={2} align="center">
             <Field
-              testID={`connection-key-input:${c().id}`}
-              accessibilityLabel={`New API key for ${c().name}`}
-              value={newKey()}
-              onChange={newKey.set}
-              placeholder="New API key"
-              masked
+              testID={`connection-model-input:${c().id}`}
+              accessibilityLabel={`Model ID for ${c().name}`}
+              value={manualModel()}
+              onChange={manualModel.set}
+              placeholder={c().model ? `Model ID (now ${c().model})` : "Model ID, as your provider documents it"}
               grow
-              onSubmit={() => void saveKey()}
+              maxLength={200}
+              onSubmit={() => void saveModel(manualModel())}
             />
-            <Action testID={`connection-key-save:${c().id}`} label="Save key" busyLabel="Saving…" busy={busy() === `patch:${c().id}`} variant="primary" onPress={() => void saveKey()} />
+            <Action
+              testID={`connection-model-save:${c().id}`}
+              label="Use this model"
+              busyLabel="Saving…"
+              busy={busy() === `patch:${c().id}`}
+              disabled={!manualModel().trim()}
+              onPress={() => void saveModel(manualModel())}
+            />
           </Row>
-        </If>
 
-        <ListingResult connectionId={c().id} />
-        <If when={listing()?.state === "ok" && (listing() as { models: string[] }).models.length > 0 ? (listing() as { models: string[] }).models : null}>
-          {(models) => (
-            <Column gap={1}>
-              <Label variant="caption" color="muted">
-                Pick the model this connection uses:
-              </Label>
-              <Row gap={1} wrap testID={`connection-model-list:${c().id}`}>
-                <Each of={models()} key={(m) => m}>
-                  {(m) => (
-                    <Chip
-                      testID={`model:${c().id}:${m()}`}
-                      label={m()}
-                      selected={c().model === m()}
-                      disabled={!!busy()}
-                      onPress={() => void saveModel(m())}
-                    />
-                  )}
-                </Each>
-              </Row>
+          <If when={sharingOpen() === c().id}>
+            <SharingPanel connection={c()} />
+          </If>
+
+          <If when={deviceConfirmUnpair() === c().id}>
+            <Column gap={2} testID={`connection-confirm-unpair:${c().id}`}>
+              <Banner
+                variant="inline"
+                tone="warning"
+                message={
+                  packaged()
+                    ? `Unpair “${c().name}”? The computer it's paired with stops serving it at once, until you connect a device again. The connection and its model stay, and you stay signed in to Metro.`
+                    : `Unpair “${c().name}”? Its device token stops working at once, so metro-connector can't serve it until you issue a new token. The connection and its model stay, and you stay signed in to Metro.`
+                }
+              />
+              <ActionBar>
+                <Action label="Cancel" variant="ghost" onPress={() => deviceConfirmUnpair.set(null)} />
+                <Action
+                  testID={`connection-confirm-unpair-now:${c().id}`}
+                  label="Unpair device"
+                  busyLabel="Unpairing…"
+                  busy={busy() === `unpair:${c().id}`}
+                  variant="danger"
+                  onPress={() => void unpairDevice(c().id)}
+                />
+              </ActionBar>
             </Column>
-          )}
-        </If>
-        <Row gap={2} align="center">
-          <Field
-            testID={`connection-model-input:${c().id}`}
-            accessibilityLabel={`Model ID for ${c().name}`}
-            value={manualModel()}
-            onChange={manualModel.set}
-            placeholder={c().model ? `Model ID (now ${c().model})` : "Model ID, such as the one your provider documents"}
-            grow
-            maxLength={200}
-            onSubmit={() => void saveModel(manualModel())}
-          />
-          <Action testID={`connection-model-save:${c().id}`} label="Use this model" busyLabel="Saving…" busy={busy() === `patch:${c().id}`} disabled={!manualModel().trim()} onPress={() => void saveModel(manualModel())} />
-        </Row>
+          </If>
 
-        <If when={sharingOpen() === c().id}>
-          <SharingPanel connection={c()} />
-        </If>
-
-        <If when={deviceConfirmUnpair() === c().id}>
-          <Column gap={2} testID={`connection-confirm-unpair:${c().id}`}>
-            <Banner tone="warning">
-              <Label color="warning">
-                {packaged()
-                  ? `Unpair “${c().name}”? The computer it's paired with stops serving it at once, until you connect a device again. The connection and its model stay. This doesn't sign you out of Metro.`
-                  : `Unpair “${c().name}”? Its device token stops working at once, so metro-connector on that computer can't serve it until you issue a new token. The connection and its model stay. This doesn't sign you out of Metro.`}
-              </Label>
-            </Banner>
-            <Row gap={2} justify="end">
-              <Action label="Cancel" variant="ghost" onPress={() => deviceConfirmUnpair.set(null)} />
-              <Action
-                testID={`connection-confirm-unpair-now:${c().id}`}
-                label="Unpair device"
-                busyLabel="Unpairing…"
-                busy={busy() === `unpair:${c().id}`}
-                variant="danger"
-                onPress={() => void unpairDevice(c().id)}
-              />
-            </Row>
-          </Column>
-        </If>
-
-        <If when={providerConfirmDelete() === c().id}>
-          <Column gap={2} testID={`connection-confirm-delete:${c().id}`}>
-            <Banner tone="warning">
-              <Label color="warning">
-                {device()
-                  ? packaged()
-                    ? `Delete “${c().name}”? No computer can serve it any more.`
-                    : `Delete “${c().name}”? Its device token stops working, so metro-connector can't serve it any more.`
-                  : `Delete “${c().name}”? Its stored key is erased.`}
-                {c().isDefault ? ` It's your default ${capability() === "chat" ? "chat" : CAPABILITY_LABEL[capability()]} connection: until you pick another, ${capability() === "chat" ? "runs you start have no personal connection" : `you have no default for ${CAPABILITY_USE[capability()]}`}.` : ""}
-                {shared() ? " It's shared: the people you shared it with lose it at once." : ""}
-              </Label>
-            </Banner>
-            <Row gap={2} justify="end">
-              <Action label="Cancel" variant="ghost" onPress={() => providerConfirmDelete.set(null)} />
-              <Action
-                testID={`connection-confirm-delete-now:${c().id}`}
-                label="Delete connection"
-                busyLabel="Deleting…"
-                busy={busy() === `delete:${c().id}`}
-                variant="danger"
-                onPress={() => void deleteConnection(c().id)}
-              />
-            </Row>
-          </Column>
-        </If>
-      </Column>
+          <If when={providerConfirmDelete() === c().id}>
+            <Column gap={2} testID={`connection-confirm-delete:${c().id}`}>
+              <Banner variant="inline" tone="warning" message={deleteText(c(), device(), shared() !== null)} />
+              <ActionBar>
+                <Action label="Cancel" variant="ghost" onPress={() => providerConfirmDelete.set(null)} />
+                <Action
+                  testID={`connection-confirm-delete-now:${c().id}`}
+                  label="Delete connection"
+                  busyLabel="Deleting…"
+                  busy={busy() === `delete:${c().id}`}
+                  variant="danger"
+                  onPress={() => void deleteConnection(c().id)}
+                />
+              </ActionBar>
+            </Column>
+          </If>
+        </Column>
       </If>
     </Column>
   );
+}
+
+/** What deleting a connection does, in the confirmation. */
+function deleteText(c: ProviderConnection, device: boolean, shared: boolean): string {
+  const cap = connectionCapability(c);
+  const what = device
+    ? packaged()
+      ? `Delete “${c.name}”? No computer can serve it any more.`
+      : `Delete “${c.name}”? Its device token stops working, so metro-connector can't serve it any more.`
+    : `Delete “${c.name}”? Its stored key is erased.`;
+  const fallback = c.isDefault
+    ? ` It's your default ${capabilityWord(cap)} connection: until you pick another, ${cap === "chat" ? "runs you start have no personal connection" : `you have no default for ${CAPABILITY_USE[cap]}`}.`
+    : "";
+  return `${what}${fallback}${shared ? " It's shared: the people you shared it with lose it at once." : ""}`;
 }
 
 // ------------------------------------------------------------------ sharing (owner only)
@@ -532,11 +525,12 @@ function SharingPanel(props: { connection: ProviderConnection }) {
     <Column gap={3} testID={`sharing:${c().id}`}>
       <Label variant="strong">{preset() ? "Share a bring-your-own preset" : "Who can use this connection"}</Label>
       <If when={preset()}>
-        <Banner tone="warning" testID={`sharing-preset:${c().id}`}>
-          <Label color="warning">
-            This connection is your own ChatGPT sign-in and plan, and that can't be shared or lent. Sharing it shares only a preset: its model name, with no credential. Each person who uses the preset signs in with their own ChatGPT account, and their use counts against their own plan. A preset never moves onto anyone's paid API key.
-          </Label>
-        </Banner>
+        <Banner
+          variant="inline"
+          tone="warning"
+          testID={`sharing-preset:${c().id}`}
+          message="Your ChatGPT sign-in and plan can't be shared or lent. Sharing shares only a preset: the model name, with no credential. Each person signs in with their own ChatGPT account and uses their own plan. A preset never switches to anyone's paid API key."
+        />
       </If>
       <If when={!d() && !shareError()}>
         <Label variant="caption" color="muted">
@@ -561,7 +555,7 @@ function SharingPanel(props: { connection: ProviderConnection }) {
             <If when={x().visibility === "spaces"}>
               <Column gap={2}>
                 <Label variant="caption" color="muted">
-                  Members of the Spaces you pick can use it there, only while both you and they are members. Every use is checked again. Only Spaces you're in are listed.
+                  Members of the Spaces you pick can use it there while you and they are both members. Every use is checked again. Only Spaces you're in are listed.
                 </Label>
                 <Row gap={1} wrap testID={`sharing-spaces:${c().id}`}>
                   <Each of={spaces()} key={(s) => s.id}>
@@ -598,32 +592,24 @@ function SharingPanel(props: { connection: ProviderConnection }) {
               </Label>
             </If>
             <If when={x().visibility !== "personal"}>
-              <Banner tone="warning" testID={`sharing-warning:${c().id}`}>
-                <Label color="warning">
-                  {preset()
+              <Banner
+                variant="inline"
+                tone="warning"
+                testID={`sharing-warning:${c().id}`}
+                title={preset() ? undefined : "You see their requests and may pay for them"}
+                message={
+                  preset()
                     ? "People you share the preset with get a setup to copy, with nothing of yours in it. Their requests go to their own sign-in, never through yours."
-                    : `People you share it with can send their requests through this connection, and use your credits${device() ? ", your computer and your metro-connector (their requests fail while it's offline)" : " or plan"}. They never see its base URL, key, sign-in or device token, and can't change or manage it. You can see what they send through it, as the owner of the ${device() ? "device" : "endpoint"}, and you may pay for their use. You can make it private again at any time.`}
-                </Label>
-              </Banner>
+                    : `Their requests go through this connection${device() ? ", your computer and your metro-connector (their requests fail while it's offline)" : ""}, using your credits or plan. As the owner of the ${device() ? "device" : "endpoint"}, you can see what they send, and you may pay for their use. They never see its base URL, key, sign-in or device token, and can't manage it. You can make it private again at any time.`
+                }
+              />
             </If>
           </Column>
         )}
       </If>
-      <If when={shareError()}>
-        {(message) => (
-          <Banner tone="danger" testID={`sharing-error:${c().id}`}>
-            <Label color="danger">{message()}</Label>
-          </Banner>
-        )}
-      </If>
-      <If when={shareNotice()}>
-        {(message) => (
-          <Label variant="caption" color="muted" testID={`sharing-notice:${c().id}`}>
-            {message()}
-          </Label>
-        )}
-      </If>
-      <Row gap={2} justify="end" wrap>
+      <If when={shareError()}>{(message) => <Banner variant="inline" tone="danger" testID={`sharing-error:${c().id}`} message={message()} />}</If>
+      <If when={shareNotice()}>{(message) => <Banner variant="inline" tone="success" testID={`sharing-notice:${c().id}`} message={message()} />}</If>
+      <ActionBar>
         <Action label="Close" variant="ghost" onPress={closeSharing} />
         <Action
           testID={`sharing-save:${c().id}`}
@@ -634,7 +620,7 @@ function SharingPanel(props: { connection: ProviderConnection }) {
           variant={d()?.visibility === "personal" ? "secondary" : "primary"}
           onPress={() => void saveSharing()}
         />
-      </Row>
+      </ActionBar>
     </Column>
   );
 }
@@ -691,7 +677,7 @@ function AddConnection() {
           Add a connection
         </Label>
         <Label variant="caption" color="muted">
-          Pick a provider, then how to connect. On your device is preferred: your own sign-in or key stays on your computer.
+          Pick a provider, then how to connect. On your device is preferred: your sign-in or key stays on your computer.
         </Label>
       </Column>
       <If when={catalog()} else={<Label variant="caption" color="muted">{catalogError() ? "The provider list couldn't be loaded." : "Loading providers…"}</Label>}>
@@ -703,7 +689,7 @@ function AddConnection() {
               </Label>
             </If>
             <SettingsGroup>
-              <SettingRow label="For" description="Chat answers your runs. System One makes typed decisions for Model routing and search. Embeddings index for search. A connection serves only the one it was made for.">
+              <SettingRow label="For" description="Chat answers, System One decides, Embeddings index for search. A connection serves only one.">
                 <SegmentedControl testID="provider-capability" accessibilityLabel="What the connection is for" options={kinds()} value={kind()} onChange={chooseKind} />
               </SettingRow>
               <SettingRow label="Provider" description="Only what this server supports." stacked>
@@ -739,19 +725,17 @@ function WaysToConnect(props: { group: VendorGroup; chosen: string | null; onCho
       <Each of={props.group.paths} key={(p) => p.id}>
         {(p) => {
           const how = () => describePath(p(), { packaged: packaged() });
+          const label = () => wayLabel(p(), { packaged: packaged() });
+          const chosen = () => props.chosen === p().id;
           return (
-            <SettingRow
-              label={`${how().method}${how().variant ? ` · ${how().variant}` : ""}`}
-              description={`${how().where} · ${how().billing}`}
-              testID={`provider-way:${p().id}`}
-            >
+            <SettingRow label={label()} description={`${how().where} · ${how().billing}`} testID={`provider-way:${p().id}`}>
               <Row align="center" gap={2}>
                 <Badge tone={CAPABILITY_TONE[p().capability]} label={CAPABILITY_LABEL[p().capability]} />
-                <Chip
+                <Action
                   testID={`provider:${p().id}`}
-                  label={props.chosen === p().id ? "Selected" : "Choose"}
-                  accessibilityLabel={`${props.chosen === p().id ? "Selected" : "Choose"} ${p().name}`}
-                  selected={props.chosen === p().id}
+                  label={chosen() ? "Setting up" : "Set up"}
+                  accessibilityLabel={chosen() ? `Setting up ${label()}, below` : `Set up ${label()}`}
+                  disabled={chosen()}
                   onPress={() => props.onChoose(p().id)}
                 />
               </Row>
@@ -771,10 +755,10 @@ function ChoiceSummary(props: { provider: CatalogProvider }) {
     <Row align="center" gap={2} wrap padX={4} padY={3} testID="provider-choice">
       <BrandMark mark={v().mark} />
       <Label variant="strong">{v().name}</Label>
-      <Badge tone="neutral" label={how().method} />
-      <Badge tone={props.provider.execution === "device" ? "agent" : "neutral"} label={how().where} />
+      <Badge tone="neutral" variant="outline" label={how().method} />
+      <Badge tone="neutral" variant="outline" label={how().where} />
       <Badge tone={CAPABILITY_TONE[props.provider.capability]} label={CAPABILITY_LABEL[props.provider.capability]} />
-      <Badge tone="neutral" label={how().scope} />
+      <Badge tone="neutral" variant="outline" label={how().scope} />
       <Label variant="caption" color="muted">
         {how().billing}
       </Label>
@@ -807,7 +791,7 @@ function DeviceForm(props: { provider: CatalogProvider; onDone: () => void }) {
       <SettingRow label="Name" stacked>
         <Field testID="provider-name" accessibilityLabel="Connection name" value={name()} onChange={name.set} maxLength={80} onSubmit={() => void submit()} />
       </SettingRow>
-      <Row padX={4} padY={3} gap={2} justify="end">
+      <Row padX={4} padY={3} gap={2} justify="end" wrap>
         <Action label="Cancel" variant="ghost" onPress={props.onDone} />
         <Action testID="provider-create-device" label={packaged() ? "Connect this device" : "Create and get device token"} busyLabel="Creating…" busy={providerBusy() === "create"} variant="primary" onPress={() => void submit()} />
       </Row>
@@ -901,9 +885,7 @@ function ServerForm(props: { provider: CatalogProvider; onDone: () => void }) {
       <If when={formError()}>
         {(message) => (
           <Column padX={4} padY={2}>
-            <Banner tone="danger" testID="provider-form-error">
-              <Label color="danger">{message()}</Label>
-            </Banner>
+            <Banner variant="inline" tone="danger" testID="provider-form-error" message={message()} />
           </Column>
         )}
       </If>

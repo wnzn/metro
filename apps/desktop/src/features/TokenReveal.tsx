@@ -252,6 +252,12 @@ function DeviceSteps(props: { connectionId: string; connectionName: string; prov
   );
 }
 
+/** A successful listing in words: "Connected: 1 model listed." */
+function listingText(l: { state: string; models?: string[] }): string {
+  const n = l.state === "ok" ? l.models?.length ?? 0 : 0;
+  return n ? `Connected: ${n} model${n === 1 ? "" : "s"} listed.` : "Connected, but it listed no models. Enter a model ID by hand.";
+}
+
 /** What the last model listing of a connection said. */
 export function ListingResult(props: { connectionId: string }) {
   const listing = () => modelListings()[props.connectionId];
@@ -261,19 +267,9 @@ export function ListingResult(props: { connectionId: string }) {
         <Column padX={4} padY={3}>
           <If
             when={l().state === "error" ? (l() as { message: string; offline: boolean }) : null}
-            else={
-              <Label variant="caption" color="success" testID={`listing-ok:${props.connectionId}`}>
-                {l().state === "ok" && (l() as { models: string[] }).models.length
-                  ? `Connected: ${(l() as { models: string[] }).models.length} model${(l() as { models: string[] }).models.length === 1 ? "" : "s"} listed.`
-                  : "Connected, but it listed no models. Enter a model ID by hand."}
-              </Label>
-            }
+            else={<Banner variant="inline" tone="success" testID={`listing-ok:${props.connectionId}`} message={listingText(l())} />}
           >
-            {(e) => (
-              <Banner tone={e().offline ? "warning" : "danger"} testID={`listing-error:${props.connectionId}`}>
-                <Label color={e().offline ? "warning" : "danger"}>{e().message}</Label>
-              </Banner>
-            )}
+            {(e) => <Banner variant="inline" tone={e().offline ? "warning" : "danger"} testID={`listing-error:${props.connectionId}`} message={e().message} />}
           </If>
         </Column>
       )}

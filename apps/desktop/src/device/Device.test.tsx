@@ -78,6 +78,7 @@ test("packaged: sign-in binds the bridge with the session; it's the only place t
     if (!r.url.startsWith(BRIDGE)) expect(JSON.stringify(r)).not.toContain(BRIDGE_TOKEN);
   }
   // Signing out stops this computer's workers.
+  await app.press("id:account-menu"); // Sign out is in the account menu
   await app.press("id:disconnect");
   await app.waitUntil(() => b.calls("/v1/session", "DELETE").length === 1);
   expectNoSecrets(app);
@@ -329,6 +330,9 @@ test("packaged: following a starting worker stops when the page closes or the us
   await openProviders(app);
   await app.wait(1700);
   expect(reads()).toBeGreaterThan(left);
+  // Sign out is in the account menu, which Settings covers: close it, then sign out.
+  await app.back();
+  await app.press("id:account-menu");
   await app.press("id:disconnect");
   await app.waitFor("id:connect");
   await app.wait(300);
