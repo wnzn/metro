@@ -250,8 +250,10 @@ message search doesn't change.
 
    `partial: true`, with a `notice`, means not everything was searched yet.
 
-**In the desktop app** (current source after 0.2.0, not released; covered
-by automated tests, no recorded GUI run yet). Type in the search box at the
+**In the desktop app** (current source after 0.2.0, not released). Return-only
+search, the scope chips and the folded **Less relevant** results were
+checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. The keyboard shortcut is covered by automated tests. Type
+in the search box at the
 top of the window (<kbd>Ctrl</kbd>+<kbd>K</kbd>, or <kbd>⌘</kbd>+<kbd>K</kbd>
 on macOS, focuses it) and press **Return**. Typing or changing a filter
 sends nothing. Only Return runs the search. Search opens in

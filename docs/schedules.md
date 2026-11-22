@@ -24,7 +24,8 @@ room or thread in a Space you belong to.
 ## In the desktop app
 
 This section describes the current source after 0.2.0. It isn't released.
-It's covered by the app's automated tests, with no recorded GUI run yet. The
+The task cards and their **More** menu with **History** were checked in
+a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. The form's other changes are covered by automated tests. The
 [screenshot](screenshots/scheduled-tasks.png) is historical and shows the
 0.2.0-era cards.
 

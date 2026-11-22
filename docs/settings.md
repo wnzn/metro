@@ -11,13 +11,13 @@ sections in this order (as verified in the 0.2.0 Linux candidate):
 | **Model routing** | Opt-in use-case routing and classification; see [system-one.md](system-one.md#how-a-message-reaches-the-agent) |
 | **Appearance** | Color scheme, [below](#appearance) |
 
-In the current source after 0.2.0 (not released, covered by automated tests,
-no recorded GUI run yet), **Settings** is still a sidebar entry with these
-sections. **Model providers** also holds **Documents & media**, where you
-choose the media model that indexes and searches your files
-([library.md](library.md#in-the-desktop-app)). Your account is in the
-sidebar's account row. Its menu offers **Copy server URL**, **Copy ID** and
-**Sign out**.
+In the current source after 0.2.0, which isn't released, **Settings** is still a
+sidebar entry with these sections. **Model providers** also holds
+**Documents & media**, where you choose the media model that indexes and
+searches your files ([library.md](library.md#in-the-desktop-app)). That
+choice was checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. Your account is in the sidebar's account row.
+Its menu offers **Copy server URL**, **Copy ID** and **Sign out** (covered
+by automated tests).
 
 This page also covers the server settings that operators set behind them.
 

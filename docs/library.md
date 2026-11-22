@@ -481,8 +481,11 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 > top of the window (on the Library page it searches documents and media)
 > and press **Return**, or choose **Documents & media** in Search. Typing
 > sends nothing, and only Return runs the search. Results show no raw
-> scores. This layout is covered by the app's automated tests but has no
-> recorded GUI run yet.
+> scores, and matches with no measurable similarity are folded away.
+> The Library page, the media model in Settings, and Return-only search
+> with its scope and type filters were checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. It isn't a release,
+> and Windows and macOS weren't checked. The Delete confirmation is covered
+> by automated tests.
 
 The screenshots below are historical: they show the 0.2.0-era layout, where
 files and the media model were under Search. They're native Linux captures,
@@ -529,7 +532,7 @@ access check runs again.
 | TXT, Markdown | The file's text, opened at the matching section, or the whole file when opened from the file list |
 | PDF, DOCX | The **indexed text** of the matching page or section, with its location, and **Save a copy to Downloads**. There's no built-in PDF or DOCX renderer, so open the saved copy in your own viewer. |
 | PNG, JPEG | The image, shown in the app |
-| WAV, MP3, MP4, WebM | A player that's meant to start at the matching time. Native playback and seeking haven't been verified: the capture machine had no sound device, and only a WAV's duration was seen to load. |
+| WAV, MP3, MP4, WebM | A player that's meant to start at the matching time. Native playback and seeking haven't been verified. In the 0.2.0-era capture the machine had no sound device, and only a WAV's duration was seen to load. In the later headless GTK run, the player loaded a file's real duration (0:10) but showed no playback progress. |
 
 **Losing access while a file is open.** If you're removed from a Space while
 you're viewing one of its files, the viewer closes, and the Space's files

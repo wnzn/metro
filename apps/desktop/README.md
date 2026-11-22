@@ -131,7 +131,9 @@ private folder on this computer, per Space, while Metro is open.
   tools card.
 - Documents & media: the native file picker was verified only for the
   profile picture. Library uploads, and audio and video playback and
-  seeking, haven't been verified.
+  seeking, haven't been verified. In a headless GTK run of the source
+  after 0.2.0, the audio player loaded a file's real duration (0:10) but
+  showed no playback progress.
 
 ## What it does
 
@@ -219,8 +221,12 @@ private folder on this computer, per Space, while Metro is open.
 
 Chat, Search, Library and Scheduled tasks are your own pages, outside every
 Space, and work with or without any Space. The entries above describe the
-current source after 0.2.0. It's covered by automated tests, isn't released,
-and has no recorded GUI run yet.
+current source after 0.2.0, which isn't released. Return-only search with
+its scope and type filters, folded zero-similarity results, the Library
+page, the media model in Settings, scheduled-task cards with the History
+menu, and the routing badge's percentage were checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. The account
+menu, the Ctrl/⌘+K shortcut and the Chat **New task** form are covered by
+automated tests. Windows and macOS weren't checked.
 - **Manage (owners only):** list, add, and remove members. Pick which runner
   serves the Space: attach one of your personal runners or an organization
   runner from the same list as Settings › Runners, or detach it. A Space that
