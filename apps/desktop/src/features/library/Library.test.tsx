@@ -342,9 +342,12 @@ test("file search: chips filter, Return runs it, results carry no raw scores, on
   // The match is asked of the player at load, but no position is shown until the player itself reports one.
   expect(app.shows("id:library-viewer-player:position")).toBe(true);
   expect(app.texts().filter((t) => t === "–:––").length).toBe(2); // position and length both unknown
-  expect(app.shows("id:library-play-match")).toBe(true);
-  expect(text(app)).toContain("Play from 1:01");
+  // One play control for audio: the player's own button, which starts at the match.
+  expect(app.shows("id:library-play-match")).toBe(false);
   expect(app.shows("id:library-play-toggle")).toBe(false);
+  expect(app.count("id:library-viewer-player:toggle")).toBe(1);
+  await app.press("id:library-viewer-player:toggle"); // plays (asks the host to seek first); still no reported position
+  expect(app.texts().filter((t) => t === "–:––").length).toBe(2);
   await app.press("id:library-viewer-back");
 
   // A PDF page: the indexed text of that page, and an honest way to open the original.

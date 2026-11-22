@@ -107,6 +107,11 @@ function clockOf(seconds: number): string {
  * reads "–:––". The match (`matchStart`..`matchEnd`, seconds) is drawn under
  * the timeline once the length is known, whether or not playback was
  * confirmed, and never on a guessed scale. A new `src` starts over.
+ *
+ * Its one play button starts at the match the first time (it asks the player
+ * to seek to `startSeconds`, then plays), and pauses and resumes from where
+ * the player is after that. Once the user moved the timeline themselves,
+ * nothing jumps back to the match.
  */
 export function CompactAudioPlayer(
   props: Testable & {
@@ -132,6 +137,9 @@ export function CompactAudioPlayer(
   const duration = signal(0);
   const position = signal<number | null>(null);
   const dragging = signal<number | null>(null);
+  /** The first play still starts at the match (no play yet, no manual seek). */
+  const atMatchFirst = signal(true);
+  let seekOnLoad = false;
   /** A finite length in seconds, else 0 (unknown). */
   const lengthOf = (d: unknown) => (typeof d === "number" && Number.isFinite(d) && d > 0 ? d : 0);
   /** `seconds` held to 0..length, or null when it isn't a finite number. */
@@ -151,6 +159,8 @@ export function CompactAudioPlayer(
       duration.set(0);
       position.set(null);
       dragging.set(null);
+      atMatchFirst.set(true);
+      seekOnLoad = false;
     });
   });
   effect(() => {
@@ -180,7 +190,8 @@ export function CompactAudioPlayer(
           const d = lengthOf(e?.duration);
           loaded.set(true);
           duration.set(d);
-          if (props.startSeconds > 0) seekTo(props.startSeconds);
+          if (seekOnLoad && props.startSeconds > 0) seekTo(props.startSeconds);
+          seekOnLoad = false;
           props.onLoaded?.(d);
         }}
         onProgress={(e: { currentTime: number; duration: number }) => {
@@ -197,8 +208,22 @@ export function CompactAudioPlayer(
       <View class="flex-row items-center gap-(--space-2)">
         <Button
           class="items-center justify-center size-[32px] rounded-full bg-primary hover:bg-primary/90 active:bg-primary/85 disabled:opacity-50 focus-visible:ring-2 focus-visible:ring-ring"
-          onPress={() => props.onPlayingChange(!props.playing)}
-          accessibilityLabel={`${props.playing ? "Pause" : "Play"} ${props.title}`}
+          onPress={() => {
+            if (props.playing) return props.onPlayingChange(false);
+            if (atMatchFirst() && props.startSeconds > 0) {
+              if (loaded()) seekTo(props.startSeconds);
+              else seekOnLoad = true;
+            }
+            atMatchFirst.set(false);
+            props.onPlayingChange(true);
+          }}
+          accessibilityLabel={
+            props.playing
+              ? `Pause ${props.title}`
+              : atMatchFirst() && props.startSeconds > 0
+                ? `Play ${props.title} from the match at ${clockOf(props.startSeconds)}`
+                : `Play ${props.title}`
+          }
           testID={props.testID ? `${props.testID}:toggle` : undefined}
         >
           <MediaGlyphIcon name={props.playing ? "pause" : "play"} tone="primary-foreground" />
@@ -223,7 +248,10 @@ export function CompactAudioPlayer(
             onChangeEnd={(e) => {
               const v = typeof e.value === "number" ? e.value : e.value[0];
               dragging.set(null);
-              if (typeof v === "number") seekTo(v);
+              if (typeof v !== "number") return;
+              atMatchFirst.set(false); // the user chose a place: never jump back to the match
+              seekOnLoad = false;
+              seekTo(v);
             }}
             testID={props.testID ? `${props.testID}:timeline` : undefined}
           />

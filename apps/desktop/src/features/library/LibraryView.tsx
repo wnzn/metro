@@ -742,14 +742,6 @@ function ViewerBody(props: { target: ViewTarget }) {
                 onLoaded={(duration) => playerPosition.set({ current: playerPosition()?.current ?? 0, duration })}
                 onEnd={() => playing.set(false)}
               />
-              <If when={time()}>
-                <Row gap={2} align="center" wrap>
-                  <Action testID="library-play-match" label={`Play from ${clock(startSeconds() * 1000)}`} variant="primary" onPress={playFromMatch} />
-                  <Label variant="caption" color="muted">
-                    {`The match is ${locatorText(t().locator)}, marked under the timeline once the recording has loaded.`}
-                  </Label>
-                </Row>
-              </If>
             </If>
             <If when={playerError()}>
               {(e) => (
