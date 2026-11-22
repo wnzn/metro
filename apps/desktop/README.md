@@ -209,8 +209,9 @@ private folder on this computer, per Space, while Metro is open.
   A result opens your Chat, or the room or thread it came from, if you're
   still a member. Results show no raw scores.
 - **Library** (sidebar): your personal library and the files of Spaces
-  you're in. **Upload**, **Open**, **Index**, and **Delete…** in each row's
-  **More** menu, which asks first. On this page, the top search box searches
+  you're in. **Upload**, then **Open** on each row. The row's **More** menu
+  holds **Index** (or **Index again**), and **Delete…** for the uploader or
+  the Space owner, which asks first. On this page, the top search box searches
   documents and media. The media model is chosen in **Settings › Model
   providers › Documents & media**. See [docs/library.md](../../docs/library.md).
 - **Scheduled tasks** (sidebar): **New task** creates a schedule. Each card

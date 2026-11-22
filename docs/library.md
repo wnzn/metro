@@ -473,9 +473,14 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 ## In the desktop app
 
 > **Navigation in the current source (after 0.2.0, not released).** Files
-> live on their own **Library** page in the sidebar: upload, the file list,
-> **Open**, **Index** and, under each row's **More** menu, **Delete…**,
-> which asks before it deletes. You choose the media model in **Settings ›
+> live on their own **Library** page in the sidebar: **Upload** and the file
+> list. Each row shows **Open**. Its **More** menu holds **Index** (or
+> **Index again**), and **Delete…** for the uploader or the Space owner,
+> which asks before it deletes. Index needs a saved media model and sends
+> only that one file. An audio match opens in a compact player with one
+> play/pause control. The first play asks to start at the match unless
+> you've moved the timeline. Playback and seeking aren't verified (see
+> below). You choose the media model in **Settings ›
 > Model providers › Documents & media** (**Index and search with**, then
 > **Save**). There you'll also find **Where your files go**. To search files, type in the search box at the
 > top of the window (on the Library page it searches documents and media)

@@ -3,6 +3,67 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Staged: desktop UI gate after 0.2.0 (2026-11-23, project manager, local)
+
+A **UI gate** on unreleased source after tag `v0.2.0`, reported by the
+project manager. It isn't a release, and nothing was published.
+The [Metro 0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)
+below is still the current final local result. Packaging tests and the e2e
+scripts weren't rerun for this gate.
+
+**Source.** Commit `df5b8fa14ea4e10fb7259f067cbadbcccba031c0`, 45 commits
+after `v0.2.0`. Its last change after the audio fix only rewords the Library
+caption (personal files and files Space members uploaded).
+
+| Check | Result |
+| --- | --- |
+| Desktop, from a clean `git archive` of `df5b8fa`: pinned NSH `nsh test` | 229/229, with zero errors, failures or skips. JUnit report `final-nsh-test-df5b8fa.junit.xml` |
+| Desktop type check (`nsh check`) and release compile at `df5b8fa` | Pass |
+| Earlier desktop baseline at `58a1b7d` | 229/229, check and release build pass |
+| `cargo test --locked -p metro-server`, all 18 nonempty server test binaries | 331/331 |
+| Admin web page: browser checks, and color-contrast pairs | 19/19 checks, 68 pairs (the receipt doesn't break the pairs down further) |
+
+**Native Linux GTK review, dark and light themes.** Renderer build ids are
+recorded as reported.
+
+- **Discovery states**, renderer `22cc1af11473`:
+  - Search runs only on **Return**, with nothing sent while typing.
+  - The scope and file-type chips work.
+  - Zero-similarity results are folded under **Less relevant**.
+  - The routing badge shows its percentage, with the egress warning,
+    including that the connection's owner can see the requests and may pay
+    for them.
+  - Scheduled-task cards work, with **History** in the **More** menu.
+- **Library home and its row menu**, recaptured at renderer `0d658fc75fcb`:
+  - Library is a standalone page, and the media model is chosen in
+    **Settings › Model providers**.
+  - Each row shows **Open**. **More** holds **Index** or **Index again**,
+    and **Delete…** for the uploader or the Space owner. Delete still asks
+    first (`234c1fa`).
+- **Audio**, renderer `9dfcee25955e` (`952bcee`):
+  - The match band is shown, with one play/pause control. Its first play
+    asks to start at the match unless the timeline was moved.
+  - The host loaded the file's real duration (0:10).
+  - In headless GTK it reported no playback times or progress. Native audio
+    and video playback and seeking are **not** verified.
+- **Mentions.** Typing `@` with the caret, then Down and Return, selected a
+  mention without sending. The plain message then posted to Bob.
+- **Scheduled task form**, an extra check at 1200×1000 in both themes:
+  - New and Edit were each scrolled down to the enabled **Active**,
+    **Cancel**, and **Schedule** or **Save** controls.
+  - Pressing **Cancel** saved no task.
+
+**Not covered by this gate:**
+
+- Native Windows and macOS.
+- Real vendor accounts or vendor sign-ins: none were used or recorded.
+- Pretrained `google/embeddinggemma-2` ranking quality.
+- The native file picker for Library uploads.
+- Packaging and the e2e scripts.
+
+**Pending:** the core and compact-window GTK receipt. It will be added here
+when it arrives.
+
 ## Final: Metro 0.2.0 local release, prepublication (2026-11-23, project manager, local)
 
 This is the **current final local result** for Metro 0.2.0. It's local and
