@@ -1,7 +1,8 @@
-import { keymap } from "nsh";
+import { cleanup, keymap } from "nsh";
 import { mainPlace, openSettings, view } from "../store";
 import { Column, Surface } from "../ui";
 import { ChatView } from "./ChatView";
+import { LibraryHome } from "./library/LibraryView";
 import { ManageSpace } from "./ManageSpace";
 import { ScheduledTasksView } from "./ScheduledTasksView";
 import { SearchView } from "./SearchView";
@@ -12,13 +13,15 @@ import { TopSearch } from "./TopSearch";
 
 /**
  * The signed-in app: the sidebar, then the main panel: the search box on
- * top, under it the Chat, Search, Scheduled tasks, or a Space's room or its
- * management. Settings opens as a modal over all of it and leaves the main
- * panel mounted, so closing it returns to the same place, draft and scroll.
+ * top (mod+k focuses it), under it the Chat, Library, Search, Scheduled
+ * tasks, or a Space's room or its management. Settings opens as a modal over
+ * all of it and leaves the main panel mounted, so closing it returns to the
+ * same place, draft and scroll.
  */
 export function Shell() {
   try {
-    keymap.bind("mod+,", () => openSettings());
+    // Removed with the Shell: signing out and in again never stacks it.
+    cleanup(keymap.bind("mod+,", () => openSettings()));
   } catch {
     /* a platform that keeps this keystroke: the sidebar's Settings still opens it */
   }
@@ -31,6 +34,9 @@ export function Shell() {
         </Surface>
         <If when={mainPlace() === "chat"}>
           <ChatView />
+        </If>
+        <If when={mainPlace() === "library"}>
+          <LibraryHome />
         </If>
         <If when={mainPlace() === "search"}>
           <SearchView />

@@ -1,4 +1,4 @@
-import { Clipboard, signal } from "nsh";
+import { announce, cleanup, Clipboard, signal } from "nsh";
 import { onLocalWorkspace } from "../localWorkspace";
 import {
   activeRoomId,
@@ -25,19 +25,21 @@ import {
   view,
 } from "../store";
 import type { Room } from "../store";
-import { Action, Column, Field, Icon, IconButton, Label, NavItem, Row, ScrollArea, Spacer, StatusDot, Surface } from "../ui";
-import type { Tone } from "../ui";
+import { AccountMenu, Action, Column, Field, IconButton, Label, MetroMark, NavItem, Row, ScrollArea, Spacer, StatusDot, Surface } from "../ui";
+import type { AccountMenuItem, Tone } from "../ui";
+import { PersonAvatar } from "./profile/PersonAvatar";
+import { profileName } from "./profile/profileState";
 
 /**
- * The app's navigation: Chat, Scheduled tasks, the Spaces and their rooms,
- * and Settings (a modal). Search is the box at the top of the main panel.
- * The server this session is connected to, and who is signed in, are at the
- * bottom.
+ * The app's navigation: Chat, Library, Scheduled tasks, the Spaces and their
+ * rooms, and Settings (a modal). Search is the box at the top of the main
+ * panel. Who is signed in, and where, is the account menu at the bottom.
  */
 export function Sidebar() {
   return (
     <Surface variant="sidebar" testID="sidebar">
       <Row align="center" gap={2} padX={4} padY={3}>
+        <MetroMark />
         <Label variant="heading" color="sidebar">
           Metro
         </Label>
@@ -55,6 +57,7 @@ export function Sidebar() {
           selected={mainPlace() === "chat"}
           onPress={openChat}
         />
+        <NavItem testID="nav-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
         <NavItem testID="nav-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
         <SpacesSection />
       </ScrollArea>
@@ -62,7 +65,7 @@ export function Sidebar() {
       <Column padX={2} padY={2} gap={1}>
         <NavItem testID="nav-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
       </Column>
-      <ServerFooter />
+      <AccountFooter />
     </Surface>
   );
 }
@@ -179,9 +182,8 @@ function RoomTree() {
       <If
         when={adding()}
         else={
-          <Row padX={2}>
-            <Action testID="new-room-toggle" label="+ Room" accessibilityLabel="New room" variant="ghost" onPress={() => adding.set(true)} />
-          </Row>
+          // In line with the rooms: the plus where their # is.
+          <NavItem testID="new-room-toggle" label="New room" icon="plus" depth={1} selected={false} onPress={() => adding.set(true)} />
         }
       >
         <Column padX={2} padY={1} gap={2}>
@@ -212,48 +214,57 @@ export function serverPlace(url: string | null, hosted: boolean): { local: boole
   }
 }
 
-/** The server this session talks to, who is signed in, copy ID and disconnect. */
-function ServerFooter() {
-  const copied = signal(false);
-  const copy = () => {
-    const id = me();
-    if (!id) return;
-    Clipboard.writeText(id)
+/**
+ * Who is signed in (picture, profile name), and where, once: "On this
+ * device" for the app-hosted workspace, else the server's host. The menu
+ * copies the server URL or the user's stable ID (what Space owners add),
+ * and signs out.
+ */
+function AccountFooter() {
+  const copied = signal<string | null>(null);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  cleanup(() => timer && clearTimeout(timer));
+  const copy = (value: string | null, done: string) => {
+    if (!value) return;
+    Clipboard.writeText(value)
       .then(() => {
-        copied.set(true);
-        setTimeout(() => copied.set(false), 1500);
+        copied.set(done);
+        announce(done);
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(() => copied.set(null), 1500);
       })
       .catch(() => {});
   };
   const server = () => serverPlace(connectedTo(), onLocalWorkspace());
+  const name = () => profileName(me()) ?? me() ?? "";
+  // Item ids are the testIDs: account-menu opens them. Sign out ends this
+  // session only, as Disconnect did (local and remote alike).
+  const items: readonly AccountMenuItem[] = [
+    { id: "copy-server-url", label: "Copy server URL", icon: "server", onPress: () => copy(connectedTo(), "Server URL copied") },
+    { id: "copy-id", label: "Copy ID", icon: "copy", onPress: () => copy(me(), "ID copied") },
+    { id: "disconnect", label: "Sign out", icon: "logout", destructive: true, onPress: () => disconnect() },
+  ];
   return (
-    <Column padX={3} padY={3} gap={2} testID="server-footer">
-      <Row align="center" gap={2} accessibilityLabel={`Connected to ${server().title}${server().local ? `, ${server().detail}` : ""}`} testID="active-server">
-        <Icon name={server().local ? "device" : "server"} color="sidebar" />
-        <Column grow>
-          <Label variant="strong" color="sidebar" lines={1} testID="server-title">
-            {server().title}
-          </Label>
-          <Label variant="caption" color="muted" lines={1} testID="server-origin">
-            {server().detail}
-          </Label>
-        </Column>
-      </Row>
-      <Row align="center" gap={1}>
-        <Column grow>
-          <Label variant="mono" color="sidebar" lines={1} testID="my-id">
-            {me() ?? ""}
-          </Label>
-        </Column>
-        <IconButton
-          testID="copy-id"
-          icon={copied() ? "check" : "copy"}
-          accessibilityLabel={copied() ? "Your ID was copied" : "Copy your ID, to share with a Space owner"}
-          tooltip={copied() ? "Copied" : "Copy ID"}
-          onPress={copy}
-        />
-        <IconButton testID="disconnect" icon="logout" accessibilityLabel="Disconnect" tooltip="Disconnect" onPress={() => disconnect()} />
-      </Row>
+    <Column padX={2} padY={2} gap={1} testID="active-server">
+      <AccountMenu
+        testID="account-menu"
+        accessibilityLabel={`${name()}, ${server().local ? "on this device" : `connected to ${server().title}`}. Account menu`}
+        avatar={<PersonAvatar userId={me()} name={name()} size="sm" />}
+        name={name()}
+        detail={server().title}
+        detailIcon={server().local ? "device" : "server"}
+        note={me() ?? undefined}
+        items={items}
+      />
+      <If when={copied()}>
+        {(message) => (
+          <Row padX={2}>
+            <Label variant="caption" color="success" testID="account-copied">
+              {message()}
+            </Label>
+          </Row>
+        )}
+      </If>
     </Column>
   );
 }
