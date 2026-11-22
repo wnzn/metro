@@ -1,7 +1,7 @@
 import { signal } from "nsh";
 import { cancelLocalOpen, localAvailability, localError, localOpening, openLocalWorkspace, remember, restoreWorkspace } from "../localWorkspace";
 import { connect, connectError, serverUrlInput, status } from "../store";
-import { Action, Banner, Column, Divider, Field, FormRow, Label, Row, Surface } from "../ui";
+import { Action, Banner, Column, Divider, Field, FormRow, Label, MetroMark, Row, Surface } from "../ui";
 
 export function ConnectScreen() {
   // Once per launch: offer the local workspace, and reopen it if it was the last one used.
@@ -26,11 +26,16 @@ export function ConnectScreen() {
     <Surface variant="panel" grow testID="connect-screen">
       <Column grow align="center" justify="center" pad={6}>
         <Surface variant="dialog" pad={6} gap={4}>
-          <Column gap={1}>
-            <Label variant="title">Connect to Metro</Label>
-            <Label variant="body" color="muted">
-              You'll see your personal Chat and the Spaces you own or belong to.
-            </Label>
+          <Column gap={3}>
+            <MetroMark size="lg" />
+            <Column gap={1}>
+              <Label variant="title" heading>
+                Connect to Metro
+              </Label>
+              <Label variant="body" color="muted">
+                You'll see your personal Chat and the Spaces you own or belong to.
+              </Label>
+            </Column>
           </Column>
 
           <If when={offerLocal()}>
