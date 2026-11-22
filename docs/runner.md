@@ -4,16 +4,31 @@
 authenticates with `METRO_RUNNER_TOKEN`, runs each claimed job against one
 workspace directory, and posts the result back. It needs no inbound port.
 
-Each runner belongs to exactly one **Space**. Its token is that Space's runner
-token, issued by the Space owner (see [spaces.md](spaces.md#runner-pairing)).
-The token alone decides which Space it serves: every room and thread in that
-Space, and nothing else. The server has no runner settings. To serve two
-Spaces, run two runners, each with its own token and its own workspace.
+The token decides what the runner serves, and the server has no runner
+settings. There are two kinds of token. See [runners.md](runners.md) for who
+manages each kind, and for a Docker setup with the published image.
 
-**Sandboxing is opt-in.** By default (`METRO_SANDBOX=none`), the check and MCP
-commands run with the runner's own privileges on its host. Set
-`METRO_SANDBOX=docker` to run them in a locked-down container instead; see
-[Docker sandbox](#docker-sandbox-opt-in-fails-closed).
+- **Dedicated:** the Space's own runner token, issued by its owner (see
+  [spaces.md](spaces.md#runner-pairing)). The runner serves every room and
+  thread in that one Space, and its tools work on `METRO_WORKSPACE` itself.
+- **Registered** (starts with `metro_rt_v2_`): a named personal or
+  organization runner. It serves each Space it's attached to, and nothing
+  else. `METRO_WORKSPACE` is a writable base, and each Space gets its own
+  root at `METRO_WORKSPACE/spaces/<sid>/`. It speaks runner protocol 2, and the
+  server refuses a registered credential from an older runner with `426`.
+
+**Sandboxing is opt-in.** By default (`METRO_SANDBOX=none`), a dedicated
+runner runs the check and MCP commands with its own privileges on its host.
+Set `METRO_SANDBOX=docker` to run them in a locked-down container instead; see
+[Docker sandbox](#docker-sandbox-opt-in-fails-closed). A registered runner
+never runs them on the host, because they could read other Spaces' roots.
+With `METRO_SANDBOX=none` it offers list and read only, and `workspace.check`
+and the MCP tools return an error. With `docker`, they run in a container
+that mounts only the claiming Space's root.
+
+Running the runner itself in a container (the `runner` image) is packaging,
+not this sandbox. That image has no Docker access, so it always uses
+`METRO_SANDBOX=none`.
 
 **Requirements:** Linux ≥ 5.6. File access uses
 `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS)`. On older kernels the
@@ -36,8 +51,8 @@ invalid or contradictory value. Empty values count as unset.
 
 | Variable | Default | Notes |
 | --- | --- | --- |
-| `METRO_RUNNER_TOKEN` | **required** | The Space's runner token, as issued by its owner |
-| `METRO_WORKSPACE` | **required** | An existing directory, canonicalized at startup |
+| `METRO_RUNNER_TOKEN` | **required** | A dedicated Space token, or a registered runner credential (`metro_rt_v2_…`) |
+| `METRO_WORKSPACE` | **required** | An existing directory, canonicalized at startup. Registered runners need it writable, and refuse `/`. |
 | `METRO_SERVER_URL` | `http://127.0.0.1:8787` | Set it explicitly for any runner that isn't on the server's machine. Plain `http://` is allowed only for loopback hosts. |
 | `METRO_ALLOW_INSECURE_HTTP` | `0` | `1` allows plain HTTP to a non-loopback host. Set it only for a private network hop, such as `http://server:8787` inside Compose. |
 | `METRO_POLL_INTERVAL_MS` | `1000` | 50 – 600000 |
@@ -114,11 +129,20 @@ These limits don't cover everything:
 
 ## Separate remote runner
 
-Run the runner on the machine that holds the workspace. `docker compose up`
-on the server host starts only the server; the bundled runner runs only when
-you ask for the `runner` profile. The remote runner must reach the server over
-`https://`, so expose the server through a TLS reverse proxy (see
-[deploy.md](deploy.md)).
+Run the runner on the machine that holds the workspace, as the published
+runner image or the Linux runner binary. Either needs Linux ≥ 5.6
+(`openat2`). The remote runner must reach the server over `https://`, so
+expose the server through a TLS reverse proxy (see [deploy.md](deploy.md)).
+
+> **Not published yet.** `ghcr.io/wnzn/metro-runner:<tag>` and
+> `Metro-runner-0.2.0-linux-x64.tar.gz` are the verified release targets,
+> but neither exists until the release is published
+> ([deploy.md](deploy.md#release-files-and-images)). Building them yourself
+> is contributor tooling ([development.md](development.md#images-and-binaries)).
+
+For a **registered** runner, which can serve several Spaces, follow
+[runners.md](runners.md#run-a-registered-runner-in-docker). The rest of this
+section is about a **dedicated** runner.
 
 Get the Space's runner token from its owner. They issue it with
 `POST /v1/spaces/{sid}/runner-token`, or under **Manage → Runner → Issue
@@ -129,37 +153,41 @@ jobs.
 
 ### Option A: runner container, no sandbox
 
-Images are `ghcr.io/<owner>/<repo>/metro-runner:<tag>`, in lower case. Fill in
-the quoted values:
+Put the token in a mode-600 env file, then fill in the quoted values:
 
 ```sh
-export METRO_RUNNER_TOKEN="$(cat "$HOME/.config/metro-dev/space.runner-token")"
-METRO_RUNNER_IMAGE='ghcr.io/your-org/metro/metro-runner:v0.1.0'
+TOKEN_FILE="$HOME/.config/metro-dev/space.runner-token"
+( umask 077; printf 'METRO_RUNNER_TOKEN=%s\n' "$(cat "$TOKEN_FILE")" > "$TOKEN_FILE.env" )
 WORKSPACE_DIR="$HOME/src/my-project"
 
 docker run -d --name metro-runner --init --restart unless-stopped \
   --cap-drop ALL --security-opt no-new-privileges:true \
+  --env-file "$TOKEN_FILE.env" \
   -e METRO_SERVER_URL='https://metro.example.com' \
-  -e METRO_RUNNER_TOKEN \
   -e METRO_WORKSPACE=/workspace \
   -e METRO_CHECK_ARGV='["/bin/ls","-la"]' \
   -v "$WORKSPACE_DIR:/workspace:ro" \
-  "$METRO_RUNNER_IMAGE"
+  ghcr.io/wnzn/metro-runner:<tag>
 ```
 
-The image's user has UID/GID 1000 by default (`RUNNER_UID`/`RUNNER_GID` build
-arguments), so the workspace must be readable by that user. Checks run inside
+The image's user is UID/GID 1000, so the workspace must be readable by that
+user, or by a group it belongs to. Checks run inside
 this container (`METRO_SANDBOX=none`). Remove `:ro` only if your check needs
 to write to the workspace.
 
 ### Option B: host binary with the Docker sandbox
 
 The Docker sandbox needs a runner that can call a Docker daemon, so run the
-binary on the host:
-
-```sh
-cargo build --locked --release --bin metro-runner
-```
+Linux `metro-runner` binary from the release
+(`Metro-runner-<version>-linux-x64.tar.gz`) on the host. This is also the
+only way a registered runner can offer check and MCP tools. Check the
+archive against its `.sha256` file (`sha256sum -c`), extract it, and run
+`metro-runner`
+with the same environment variables as above (`METRO_SERVER_URL`,
+`METRO_RUNNER_TOKEN` from a mode-600 file, `METRO_WORKSPACE`) plus
+`METRO_SANDBOX=docker` and the sandbox settings below. The user that runs it
+needs read access to the workspace (write access for a registered runner's
+base directory) and access to the Docker daemon.
 
 ## Docker sandbox (opt-in, fails closed)
 
@@ -179,6 +207,8 @@ docker run --rm --label dev.metro.runner=1 --pull=never --network=none
 - **No host fallback.** If Docker or the image is unavailable, the command
   fails. It never runs on the host.
 - **Read-only workspace, no network.** Only `/tmp` (tmpfs) is writable.
+- **One Space per container.** On a registered runner, the mounted workspace
+  is the claiming Space's `spaces/<sid>/` root, never the base or a sibling.
 - The runner refuses to mount `/`, or a workspace that contains the Docker
   socket.
 

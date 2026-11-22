@@ -1,0 +1,34 @@
+// Native capture of Settings › Profile and a room with pictures (see
+// capture-profile.sh): the real app on NSH's Linux host against a real
+// metro-server on loopback. Pictures are drawn fixture PNGs uploaded with
+// curl; nothing reaches a vendor or model. The script fills in the
+// placeholders in a disposable copy that is removed on exit.
+
+import { open, test } from "nsh/test";
+
+const URL = "__URL__";
+const TOKEN = "__TOKEN__";
+const SPACE = "__SPACE__";
+const SHOTS = "/shots";
+
+test("capture live", async () => {
+  const app = await open("./Harness.tsx", { network: "live", platform: "linux" });
+  await app.setViewport(1200, 860);
+  await app.clear("id:server-url");
+  await app.type("id:server-url", URL);
+  await app.type("id:access-token", TOKEN);
+  await app.press("id:connect");
+  await app.waitFor("id:h-profile", { timeout: 15000 });
+
+  await app.press("id:h-profile");
+  await app.waitFor("id:profile-avatar:image", { timeout: 15000 });
+  await app.wait(500);
+  await app.screenshot(`${SHOTS}/profile-settings.png`);
+
+  await app.press("id:h-profile");
+  await app.waitFor(`id:space:${SPACE}`, { timeout: 15000 });
+  await app.press(`id:space:${SPACE}`);
+  await app.waitFor("text:Staging deploy finished, all checks green.", { timeout: 15000 });
+  await app.wait(1500);
+  await app.screenshot(`${SHOTS}/chat-transcript.png`);
+}, 120000);

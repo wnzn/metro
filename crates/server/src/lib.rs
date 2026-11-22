@@ -1,28 +1,40 @@
 //! Metro server: private Spaces of shared rooms and threads with durable
 //! SQLite history, a private personal Chat per user, a bounded job queue per
-//! Space for that Space's optional paired runner, and Rig agents whose tools
-//! run on that runner.
+//! Space for the runner serving it (a dedicated Space token, or a registered
+//! personal or organization runner attached to it), and Rig agents whose
+//! tools run on that runner.
 
+pub mod admin_users;
 pub mod agent;
 pub mod api;
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod device_relay;
 pub mod jobs;
+pub mod library;
+pub mod library_search;
 pub mod mentions;
+pub mod model_routing;
 pub mod orchestration;
+pub mod profiles;
+pub mod providers;
+pub mod runner_pairing;
+pub mod runners;
+pub mod schedules;
+pub mod search;
 pub mod tools;
 
 use std::sync::Arc;
 
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use tokio::sync::Semaphore;
 
 pub use auth::HumanAuth;
 pub use config::{Config, Limits, ModelConfig};
-use db::{Addressed, Author, Db, Event};
+use db::{Activity, Addressed, Author, Db, Event};
 use jobs::JobQueue;
 use orchestration::RunRegistry;
 
@@ -42,6 +54,18 @@ pub struct AppState {
     pub demo_runs: Arc<Semaphore>,
     /// Space agent runs, active and recent.
     pub runs: Arc<RunRegistry>,
+    /// Personal model connections.
+    pub providers: crate::providers::ProviderService,
+    /// Relay to people's own `metro-connector` devices for device connections.
+    pub device: crate::device_relay::DeviceRelay,
+    /// Personal model routing and System One decisions.
+    pub routing: crate::model_routing::Routing,
+    /// Documents and media library limits and upload slots.
+    pub library: crate::library::Library,
+    /// Managed local accounts (dev namespace only).
+    pub managed: crate::admin_users::Managed,
+    /// Avatar re-encodes running at once (see [`crate::profiles`]).
+    pub avatar_encodes: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -50,10 +74,33 @@ impl AppState {
     /// shared state.
     pub async fn new(config: Config, db: Db, auth: Arc<dyn HumanAuth>) -> anyhow::Result<Self> {
         let namespace = auth.namespace().to_owned();
+        let managed = crate::admin_users::Managed::from_env(&namespace);
+        if managed.enabled()
+            && let Some(bad) = config
+                .org_admins
+                .iter()
+                .find(|a| crate::admin_users::is_managed_id(a))
+        {
+            anyhow::bail!(
+                "METRO_ORG_ADMINS lists the managed user id {bad}; managed users can't be \
+                 organization admins"
+            );
+        }
         db.call(move |db| db.bind_identity_namespace(&namespace))
             .await?;
+        let providers = crate::providers::ProviderService::from_env(&config.db_path, db.clone())?;
         let limits = &config.limits;
+        let library = crate::library::Library::from_env()?;
         Ok(Self {
+            avatar_encodes: Arc::new(Semaphore::new(crate::profiles::MAX_AVATAR_ENCODES)),
+            managed,
+            library,
+            providers,
+            routing: crate::model_routing::Routing::default(),
+            device: crate::device_relay::DeviceRelay::new(
+                crate::device_relay::DeviceLimits::default(),
+                Arc::new(crate::providers::DeviceDirectory),
+            ),
             jobs: JobQueue::new(
                 limits.queue_capacity,
                 limits.claim_timeout,
@@ -68,6 +115,13 @@ impl AppState {
         })
     }
 
+    /// Replace the env user names that managed display names may not take
+    /// (read from `METRO_DEV_USERS` by [`AppState::new`]). For tests.
+    pub fn with_env_user_ids(mut self, ids: Vec<String>) -> Self {
+        self.managed = crate::admin_users::Managed::new(self.auth.namespace(), ids);
+        self
+    }
+
     /// Append a server-written event to a Space room; failures are logged,
     /// not returned, because background tasks have no caller to report to.
     pub async fn append(
@@ -78,17 +132,40 @@ impl AppState {
         author: &Author,
         text: &str,
     ) -> Option<Event> {
-        let (space, room, kind, author, text) = (
+        self.append_with(space, room, kind, author, text, None)
+            .await
+    }
+
+    /// [`AppState::append`] tagged with the agent turn or Demo run that wrote it.
+    pub async fn append_with(
+        &self,
+        space: &str,
+        room: &str,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        activity: Option<&Activity>,
+    ) -> Option<Event> {
+        let (space, room, kind, author, text, activity) = (
             space.to_owned(),
             room.to_owned(),
             kind.to_owned(),
             author.clone(),
             text.to_owned(),
+            activity.cloned(),
         );
         match self
             .db
             .call(move |db| {
-                db.append_event(&space, &room, &kind, &author, &text, &Addressed::room())
+                db.append_event_with(
+                    &space,
+                    &room,
+                    &kind,
+                    &author,
+                    &text,
+                    &Addressed::room(),
+                    activity.as_ref(),
+                )
             })
             .await
         {
@@ -137,6 +214,37 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/runs", get(api::list_runs))
         .route("/v1/runs/{id}/stop", post(api::stop_run))
+        .route(
+            "/v1/runners",
+            get(runners::list_runners).post(runners::create_runner),
+        )
+        .route("/v1/runners/{id}", delete(runners::delete_runner))
+        .route("/v1/runners/{id}/token", post(runners::rotate_runner_token))
+        .route(
+            "/v1/spaces/{sid}/runner",
+            get(runners::get_space_runner)
+                .put(runners::put_space_runner)
+                .delete(runners::delete_space_runner),
+        )
+        // Provider routes carry their full paths and authenticate people
+        // themselves; they share the human body limit.
+        .merge(crate::providers::router())
+        // Personal device connector routes (`/v1/device/*` and
+        // `POST /v1/providers/{id}/device-token`), with full paths.
+        .merge(crate::device_relay::router())
+        // `GET|PUT /v1/model-routing`, personal routing settings.
+        .merge(crate::model_routing::router())
+        // Personal semantic search and scheduled prompts, with full paths.
+        .merge(crate::search::router())
+        .merge(crate::schedules::router())
+        // Documents and media library; its upload route sets its own limit.
+        .merge(crate::library::router())
+        // Documents and media search, with full paths.
+        .merge(crate::library_search::router())
+        // Managed user accounts, for org admins (dev namespace only).
+        .merge(crate::admin_users::api_router())
+        // Personal profiles and avatars; the avatar upload sets its own limit.
+        .merge(crate::profiles::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;
@@ -146,6 +254,8 @@ pub fn router(state: AppState) -> Router {
         .layer(DefaultBodyLimit::max(runner_limit));
     Router::new()
         .route("/healthz", get(api::healthz))
+        // Static admin shell at `/admin`; `/` redirects there.
+        .merge(crate::admin_users::web_router())
         .merge(human)
         .merge(runner)
         .with_state(state)

@@ -77,10 +77,7 @@ function Onboarding() {
       <Column grow gap={2}>
         <Label variant="strong">You're not in any Space yet</Label>
         <Label variant="caption" color="muted">
-          A Space has its own rooms (starting with a lobby), members and optional runner. Create one, or share your user ID with a Space owner so they can add you:
-        </Label>
-        <Label variant="mono" testID="onboarding-id">
-          {me() ?? ""}
+          A Space has its own rooms, members and optional runner. Create one, or ask a Space owner to add you.
         </Label>
         <Row gap={2} align="center">
           <Field testID="onboarding-space-name" accessibilityLabel="New Space name" value={name()} onChange={name.set} placeholder="Name your first Space" grow maxLength={80} onSubmit={() => void createSpace(name())} />

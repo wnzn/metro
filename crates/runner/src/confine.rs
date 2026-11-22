@@ -13,7 +13,7 @@ use std::ffi::{CStr, CString};
 use std::fmt;
 use std::fs::File;
 use std::io::{self, Read};
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 
 pub const MAX_PATH_LEN: usize = 4096;
@@ -54,8 +54,9 @@ struct OpenHow {
     resolve: u64,
 }
 
-const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
-const RESOLVE_BENEATH: u64 = 0x08;
+pub(crate) const RESOLVE_NO_MAGICLINKS: u64 = 0x02;
+pub(crate) const RESOLVE_NO_SYMLINKS: u64 = 0x04;
+pub(crate) const RESOLVE_BENEATH: u64 = 0x08;
 
 #[derive(Debug)]
 pub struct Workspace {
@@ -116,45 +117,49 @@ impl Workspace {
         &self.root_path
     }
 
+    /// Wrap an already-opened directory fd whose canonical path is
+    /// `root_path`. Probes openat2 like [`Workspace::open`].
+    pub(crate) fn from_fd(root: OwnedFd, root_path: PathBuf) -> Result<Self, ConfineError> {
+        let ws = Workspace { root, root_path };
+        ws.open_beneath(".", libc::O_PATH | libc::O_DIRECTORY)?;
+        Ok(ws)
+    }
+
+    pub(crate) fn root_fd(&self) -> BorrowedFd<'_> {
+        self.root.as_fd()
+    }
+
+    /// (st_dev, st_ino) of the open root directory.
+    pub fn root_identity(&self) -> Result<(u64, u64), ConfineError> {
+        let st = fstat(&self.root)?;
+        Ok((st.st_dev, st.st_ino))
+    }
+
+    /// Check that `root_path` still names the directory held open as the
+    /// root (same canonical path, same device and inode). Subprocesses and
+    /// docker bind mounts are given a path, not the fd, so this is checked
+    /// right before every spawn; a swapped-in symlink or directory fails.
+    pub fn verify_root_path(&self) -> Result<(), ConfineError> {
+        use std::os::unix::fs::MetadataExt;
+        let canon = std::fs::canonicalize(&self.root_path).map_err(ConfineError::Io)?;
+        if canon != self.root_path {
+            return Err(ConfineError::Escape);
+        }
+        let md = std::fs::symlink_metadata(&self.root_path).map_err(ConfineError::Io)?;
+        if !md.is_dir() || (md.dev(), md.ino()) != self.root_identity()? {
+            return Err(ConfineError::Escape);
+        }
+        Ok(())
+    }
+
     fn open_beneath(&self, rel: &str, flags: i32) -> Result<OwnedFd, ConfineError> {
         let rel = validate_rel(rel)?;
-        let c = CString::new(rel).map_err(|_| ConfineError::InvalidPath("NUL byte".into()))?;
-        // openat2 rejects O_PATH combined with unrelated flags (EINVAL).
-        let extra = if flags & libc::O_PATH != 0 {
-            libc::O_CLOEXEC
-        } else {
-            libc::O_CLOEXEC | libc::O_NOCTTY
-        };
-        let how = OpenHow {
-            flags: (flags | extra) as u64,
-            mode: 0,
-            resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
-        };
-        // SAFETY: all pointers are valid for the duration of the call and the
-        // struct layout matches `struct open_how` (3 x u64).
-        let fd = unsafe {
-            libc::syscall(
-                libc::SYS_openat2,
-                self.root.as_raw_fd(),
-                c.as_ptr(),
-                &how as *const OpenHow,
-                std::mem::size_of::<OpenHow>(),
-            )
-        };
-        if fd < 0 {
-            let e = io::Error::last_os_error();
-            return Err(match e.raw_os_error() {
-                Some(libc::EXDEV) | Some(libc::ELOOP) => ConfineError::Escape,
-                Some(libc::ENOENT) => ConfineError::NotFound,
-                Some(libc::ENOTDIR) => ConfineError::NotADirectory,
-                Some(libc::ENOSYS) => ConfineError::Unsupported(
-                    "openat2(2) unavailable (Linux >= 5.6 required)".into(),
-                ),
-                _ => ConfineError::Io(e),
-            });
-        }
-        // SAFETY: fd is a fresh descriptor returned by the kernel.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
+        openat2(
+            self.root.as_fd(),
+            rel,
+            flags,
+            RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS,
+        )
     }
 
     /// Read a regular file (UTF-8 text), at most [`MAX_READ_BYTES`].
@@ -286,6 +291,53 @@ fn fstat(fd: &OwnedFd) -> Result<libc::stat, ConfineError> {
         return Err(ConfineError::Io(io::Error::last_os_error()));
     }
     Ok(st)
+}
+
+/// `openat2(dirfd, rel, flags, resolve)` with the error mapping used by this
+/// module. `rel` must already be validated.
+pub(crate) fn openat2(
+    dirfd: BorrowedFd<'_>,
+    rel: &str,
+    flags: i32,
+    resolve: u64,
+) -> Result<OwnedFd, ConfineError> {
+    let c = CString::new(rel).map_err(|_| ConfineError::InvalidPath("NUL byte".into()))?;
+    // openat2 rejects O_PATH combined with unrelated flags (EINVAL).
+    let extra = if flags & libc::O_PATH != 0 {
+        libc::O_CLOEXEC
+    } else {
+        libc::O_CLOEXEC | libc::O_NOCTTY
+    };
+    let how = OpenHow {
+        flags: (flags | extra) as u64,
+        mode: 0,
+        resolve,
+    };
+    // SAFETY: all pointers are valid for the duration of the call and the
+    // struct layout matches `struct open_how` (3 x u64).
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            dirfd.as_raw_fd(),
+            c.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        let e = io::Error::last_os_error();
+        return Err(match e.raw_os_error() {
+            Some(libc::EXDEV) | Some(libc::ELOOP) => ConfineError::Escape,
+            Some(libc::ENOENT) => ConfineError::NotFound,
+            Some(libc::ENOTDIR) => ConfineError::NotADirectory,
+            Some(libc::ENOSYS) => {
+                ConfineError::Unsupported("openat2(2) unavailable (Linux >= 5.6 required)".into())
+            }
+            _ => ConfineError::Io(e),
+        });
+    }
+    // SAFETY: fd is a fresh descriptor returned by the kernel.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd as RawFd) })
 }
 
 /// Lexical validation before handing the path to the kernel. The kernel

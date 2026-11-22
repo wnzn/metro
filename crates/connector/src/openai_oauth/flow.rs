@@ -1,0 +1,641 @@
+//! Sign-in, refresh, sign-out, the model catalog, and inference.
+
+use std::path::Path;
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow, bail};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+use super::http::{self, Category, Failure, MAX_JSON, form, pct, tagged};
+use super::loopback::Loopback;
+use super::oidc::{self, Discovery};
+use super::sse;
+use super::store::{Account, Profile, Tokens, now};
+use super::translate;
+use super::{
+    AGENT_NAME, DYNAMIC_CLIENT_ID, Endpoints, LoginOptions, ModelInfo, PLAN_SCOPE, SCOPES, Status,
+    USAGE_URL,
+};
+
+/// Refresh this many seconds before `exp`.
+const REFRESH_SKEW: u64 = 120;
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LogoutOutcome {
+    /// Local tokens existed and are now cleared.
+    pub signed_out: bool,
+    /// OpenAI answered the revocation with HTTP 200.
+    pub remote_revoked: bool,
+}
+
+#[derive(Deserialize)]
+struct TokenResponse {
+    access_token: String,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    token_type: Option<String>,
+    #[serde(default)]
+    expires_in: Option<u64>,
+    #[serde(default)]
+    scope: Option<String>,
+    #[serde(default)]
+    earliest_refresh_at: Option<Value>,
+}
+
+/// Prints the one-time local start URL. It carries no tokens, and only
+/// redirects to OpenAI once. Then it opens the system browser. Opener failure
+/// isn't fatal, because the printed URL still works.
+pub(crate) fn open_system_browser(url: &str) -> Result<()> {
+    eprintln!("Continue with ChatGPT in your browser. If it did not open, visit:\n  {url}");
+    #[cfg(target_os = "macos")]
+    let cmd = ("open", vec![url]);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let cmd = ("xdg-open", vec![url]);
+    #[cfg(windows)]
+    let cmd = ("explorer", vec![url]);
+    let _ = std::process::Command::new(cmd.0)
+        .args(cmd.1)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn();
+    Ok(())
+}
+
+pub(crate) async fn login(dir: &Path, opts: LoginOptions) -> Result<()> {
+    let ep = opts.endpoints.clone();
+    http::check_endpoints(&ep)?;
+    let profile = Profile::open(dir, true)?.expect("created");
+    let host = {
+        let lock = profile.lock().await?;
+        profile.host_or_create(&lock)?
+    };
+    let account = profile.account()?;
+    if let Some(a) = &account
+        && a.endpoints != ep
+    {
+        bail!(
+            "this connection profile is bound to a different OpenAI issuer/API; use a new profile"
+        );
+    }
+    let retained = profile.tokens()?;
+    let client = http::client_for(&ep)?;
+    let disc = oidc::discover(&client, &ep.issuer).await?;
+
+    let lb = Loopback::bind(opts.preferred_port).await?;
+    let redirect_uri = lb.redirect_uri();
+    let state = oidc::random_token();
+    let nonce = oidc::random_token();
+    let pkce = oidc::pkce();
+    let start_key = oidc::random_token();
+
+    let saved_client = account.as_ref().map(|a| a.client_id.clone());
+    let mut q: Vec<(&str, String)> = vec![
+        (
+            "client_id",
+            saved_client
+                .clone()
+                .unwrap_or_else(|| DYNAMIC_CLIENT_ID.into()),
+        ),
+        ("ext_agent_host_id", host.ext_agent_host_id.clone()),
+        ("response_type", "code".into()),
+        ("redirect_uri", redirect_uri.clone()),
+        ("scope", SCOPES.into()),
+        ("resource", ep.resource.clone()),
+        ("state", state.clone()),
+        ("nonce", nonce.clone()),
+        ("code_challenge_method", "S256".into()),
+        ("code_challenge", pkce.challenge.clone()),
+    ];
+    match &account {
+        None => q.push(("agent_name_hint", AGENT_NAME.into())),
+        Some(a) => {
+            if let Some(t) = &retained {
+                q.push(("id_token_hint", t.id_token.clone()));
+            }
+            if let Some(e) = &a.email {
+                q.push(("login_hint", e.clone()));
+            }
+            // A sign-in that lacks plan permission asks again with the full
+            // scope set. Ordinary sign-ins never force consent.
+            if a.subject.is_some() && !a.plan_usage_enabled {
+                q.push(("prompt", "consent".into()));
+            }
+        }
+    }
+    let authorize_url = format!(
+        "{}?{}",
+        disc.authorization_endpoint,
+        q.iter()
+            .map(|(k, v)| format!("{k}={}", pct(v)))
+            .collect::<Vec<_>>()
+            .join("&")
+    );
+
+    (opts.open_browser)(&lb.start_url(&start_key))
+        .context("opening the browser for Sign in with ChatGPT")?;
+    let cb = lb
+        .wait(&start_key, &authorize_url, &state, opts.timeout)
+        .await?;
+    drop(authorize_url);
+
+    if let Some(err) = cb.error.as_deref() {
+        let err = http::clean(err, 64);
+        if err == "access_denied" {
+            bail!(
+                "Sign in with ChatGPT was declined, so ChatGPT plan usage is not enabled for Metro. \
+                 Sign in again to approve it, or configure another model connection"
+            );
+        }
+        let desc = cb
+            .error_description
+            .as_deref()
+            .map(|d| format!(": {}", http::clean(d, 200)))
+            .unwrap_or_default();
+        bail!("Sign in with ChatGPT returned error {err}{desc}");
+    }
+    let code = cb
+        .code
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| anyhow!("sign-in callback carried no authorization code"))?;
+
+    // Work out the client ID for the exchange.
+    let client_id = match (&saved_client, cb.client_id.as_deref()) {
+        (Some(saved), Some(got)) if got != saved => {
+            bail!(
+                "sign-in callback named a different client than this connection's registration; nothing was changed"
+            )
+        }
+        (Some(saved), _) => saved.clone(),
+        (None, Some(got)) => {
+            if got == DYNAMIC_CLIENT_ID || !valid_client_id(got) {
+                bail!("registration incomplete: the callback carried no valid issued client_id");
+            }
+            // Keep the issued client right away, so a failed exchange retries
+            // with it instead of registering again.
+            let lock = profile.lock().await?;
+            if profile.account()?.is_some() {
+                bail!(
+                    "this connection profile was registered by another sign-in in the meantime; try again"
+                );
+            }
+            profile.write_account(
+                &lock,
+                &Account {
+                    endpoints: ep.clone(),
+                    client_id: got.to_owned(),
+                    subject: None,
+                    email: None,
+                    plan_usage_enabled: false,
+                },
+            )?;
+            got.to_owned()
+        }
+        (None, None) => bail!("registration incomplete: the callback carried no issued client_id"),
+    };
+
+    let body = form(&[
+        ("grant_type", "authorization_code"),
+        ("client_id", &client_id),
+        ("code", &code),
+        ("code_verifier", &pkce.verifier),
+        ("redirect_uri", &redirect_uri),
+        ("resource", &ep.resource),
+    ]);
+    let tr = token_request(
+        &client,
+        &disc.token_endpoint,
+        body,
+        "authorization code exchange",
+    )
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("invalid_grant") {
+            anyhow!("{e}. Start a new sign-in; the code cannot be reused")
+        } else {
+            e
+        }
+    })?;
+
+    let id_token = tr
+        .id_token
+        .clone()
+        .ok_or_else(|| anyhow!("token response carried no ID token"))?;
+    let keys = oidc::fetch_jwks(&client, &disc.jwks_uri).await?;
+    let claims = oidc::verify_id_token(&id_token, &keys, &disc.issuer, &client_id, Some(&nonce))?;
+    let access_scope =
+        oidc::check_access_token(&tr.access_token, &disc.issuer, &ep.resource, &client_id)?;
+    let tokens = build_tokens(tr, id_token, access_scope, None)?;
+    let plan = tokens.scopes.iter().any(|s| s == PLAN_SCOPE);
+
+    let lock = profile.lock().await?;
+    let Some(current) = profile.account()?.filter(|a| a.client_id == client_id) else {
+        bail!("the connection's registration changed during sign-in; try again");
+    };
+    if let Some(sub) = &current.subject
+        && *sub != claims.sub
+    {
+        bail!(
+            "you signed in to a different ChatGPT account than this connection belongs to; \
+                 nothing was changed. Add a new connection for the other account"
+        );
+    }
+    profile.write_account(
+        &lock,
+        &Account {
+            endpoints: ep.clone(),
+            client_id: client_id.clone(),
+            subject: Some(claims.sub),
+            email: claims.email.or(current.email),
+            plan_usage_enabled: plan,
+        },
+    )?;
+    profile.write_tokens(&lock, &tokens)?;
+    drop(lock);
+
+    if !plan {
+        bail!(
+            "signed in, but ChatGPT plan usage was not granted (no {PLAN_SCOPE} scope), so Metro will \
+             not send requests with this connection. Sign in again to approve it"
+        );
+    }
+    Ok(())
+}
+
+fn valid_client_id(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-' | b'.'))
+}
+
+fn build_tokens(
+    tr: TokenResponse,
+    id_token: String,
+    access_scope: Option<String>,
+    previous: Option<&Tokens>,
+) -> Result<Tokens> {
+    let token_type = tr.token_type.clone().unwrap_or_else(|| "Bearer".into());
+    if !token_type.eq_ignore_ascii_case("bearer") {
+        bail!("unexpected token type from the token endpoint");
+    }
+    let t = now();
+    let scope = tr.scope.or(access_scope);
+    let scopes: Vec<String> = match (scope, previous) {
+        (Some(s), _) => {
+            let mut v: Vec<String> = s.split_whitespace().map(str::to_owned).collect();
+            v.sort();
+            v.dedup();
+            v
+        }
+        // A refresh that omits `scope` keeps the original grant.
+        (None, Some(p)) => p.scopes.clone(),
+        (None, None) => Vec::new(),
+    };
+    let refresh_token = match (tr.refresh_token, previous) {
+        (Some(r), _) if !r.is_empty() => r,
+        (_, Some(p)) => p.refresh_token.clone(),
+        _ => bail!(
+            "token response carried no refresh token (offline_access not granted); sign in again"
+        ),
+    };
+    let earliest = match tr.earliest_refresh_at {
+        Some(Value::Number(n)) => n.as_u64(),
+        Some(Value::String(s)) => s.parse().ok(),
+        _ => None,
+    };
+    Ok(Tokens {
+        id_token,
+        access_token: tr.access_token,
+        refresh_token,
+        token_type: "Bearer".into(),
+        expires_at: t + tr.expires_in.unwrap_or(3600).min(86_400),
+        earliest_refresh_at: earliest,
+        scopes,
+        saved_at: t,
+    })
+}
+
+async fn token_request(
+    client: &reqwest::Client,
+    endpoint: &str,
+    body: String,
+    what: &str,
+) -> Result<TokenResponse> {
+    let resp = client
+        .post(endpoint)
+        .header("content-type", "application/x-www-form-urlencoded")
+        .header("accept", "application/json")
+        .body(body)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(http::net)?;
+    let status = resp.status();
+    let rid = http::request_id(resp.headers());
+    let bytes = http::read_bounded(resp, MAX_JSON).await?;
+    if !status.is_success() {
+        let f = Failure::parse(status.as_u16(), rid, &bytes);
+        return Err(TokenError(f.clone())).context(f.describe(what));
+    }
+    serde_json::from_slice(&bytes).map_err(|_| anyhow!("{what}: token response is malformed"))
+}
+
+/// Carries the parsed failure so refresh can branch on its code.
+#[derive(Debug)]
+struct TokenError(Failure);
+impl std::fmt::Display for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "token endpoint HTTP {}", self.0.status)
+    }
+}
+impl std::error::Error for TokenError {}
+
+const UNUSABLE_REFRESH: &[&str] = &[
+    "invalid_grant",
+    "invalid_refresh_token",
+    "token_expired",
+    "refresh_token_expired",
+    "refresh_token_invalidated",
+    "refresh_token_reused",
+];
+
+/// A usable access token, refreshed under the profile lock when it's near
+/// expiry.
+async fn access(dir: &Path, ep: &Endpoints) -> Result<(Account, Tokens)> {
+    http::check_endpoints(ep)?;
+    let profile = Profile::open(dir, false)?.ok_or_else(not_signed_in)?;
+    let account = profile.account()?.ok_or_else(not_signed_in)?;
+    if account.endpoints != *ep {
+        bail!("this connection profile is bound to a different OpenAI issuer/API");
+    }
+    let tokens = profile.tokens()?.ok_or_else(not_signed_in)?;
+    if !tokens.scopes.iter().any(|s| s == PLAN_SCOPE) {
+        return Err(tagged(
+            anyhow!(
+                "ChatGPT plan usage is not enabled for this connection; sign in again to approve it"
+            ),
+            Some(Category::PlanNotAvailable),
+        ));
+    }
+    if fresh(&tokens) {
+        return Ok((account, tokens));
+    }
+    let lock = profile.lock().await?;
+    // Another process may have refreshed while this one waited for the lock.
+    let tokens = profile.tokens()?.ok_or_else(not_signed_in)?;
+    if fresh(&tokens) {
+        return Ok((account, tokens));
+    }
+    let client = http::client_for(ep)?;
+    let disc = oidc::discover(&client, &ep.issuer).await?;
+    let body = form(&[
+        ("grant_type", "refresh_token"),
+        ("client_id", &account.client_id),
+        ("refresh_token", &tokens.refresh_token),
+        ("resource", &ep.resource),
+    ]);
+    let tr = match token_request(&client, &disc.token_endpoint, body, "token refresh").await {
+        Ok(t) => t,
+        Err(e) => {
+            if let Some(TokenError(f)) = e.downcast_ref::<TokenError>() {
+                let code = f.code.as_deref().unwrap_or("");
+                if UNUSABLE_REFRESH.contains(&code) {
+                    profile.clear_tokens(&lock)?;
+                    return Err(tagged(
+                        anyhow!("{e:#}. The ChatGPT session has ended; sign in again"),
+                        Some(Category::SignIn),
+                    ));
+                }
+                if code == "invalid_client" {
+                    return Err(tagged(
+                        anyhow!(
+                            "{e:#}. The connection's client registration is not accepted; sign in again or add a new connection"
+                        ),
+                        Some(Category::SignIn),
+                    ));
+                }
+            }
+            // A network failure or 5xx leaves the credentials as they are.
+            let server_error = e
+                .downcast_ref::<TokenError>()
+                .is_some_and(|TokenError(f)| f.status >= 500);
+            return Err(if server_error {
+                tagged(e, Some(Category::Unavailable))
+            } else {
+                e
+            });
+        }
+    };
+    let id_token = match &tr.id_token {
+        Some(t) => {
+            let keys = oidc::fetch_jwks(&client, &disc.jwks_uri).await?;
+            let c = oidc::verify_id_token(t, &keys, &disc.issuer, &account.client_id, None)?;
+            if account.subject.as_deref() != Some(c.sub.as_str()) {
+                bail!(
+                    "refresh returned an identity for a different account; credentials left unchanged"
+                );
+            }
+            t.clone()
+        }
+        None => tokens.id_token.clone(),
+    };
+    let access_scope = oidc::check_access_token(
+        &tr.access_token,
+        &disc.issuer,
+        &ep.resource,
+        &account.client_id,
+    )?;
+    let new = build_tokens(tr, id_token, access_scope, Some(&tokens))?;
+    profile.write_tokens(&lock, &new)?;
+    if !new.scopes.iter().any(|s| s == PLAN_SCOPE) {
+        return Err(tagged(
+            anyhow!(
+                "ChatGPT plan usage is no longer granted for this connection; sign in again to approve it"
+            ),
+            Some(Category::PlanNotAvailable),
+        ));
+    }
+    Ok((account, new))
+}
+
+fn fresh(t: &Tokens) -> bool {
+    let n = now();
+    if t.expires_at > n + REFRESH_SKEW {
+        return true;
+    }
+    // Respect earliest_refresh_at while the token hasn't actually expired.
+    t.earliest_refresh_at.is_some_and(|e| n < e) && t.expires_at > n + 5
+}
+
+fn not_signed_in() -> anyhow::Error {
+    tagged(
+        anyhow!("not signed in with ChatGPT for this connection; sign in first"),
+        Some(Category::SignIn),
+    )
+}
+
+pub(crate) async fn logout(dir: &Path, ep: &Endpoints) -> Result<LogoutOutcome> {
+    let Some(profile) = Profile::open(dir, false)? else {
+        return Ok(LogoutOutcome {
+            signed_out: false,
+            remote_revoked: false,
+        });
+    };
+    let lock = profile.lock().await?;
+    let (Some(account), Some(tokens)) = (profile.account()?, profile.tokens()?) else {
+        profile.clear_tokens(&lock)?;
+        return Ok(LogoutOutcome {
+            signed_out: false,
+            remote_revoked: false,
+        });
+    };
+    let mut revoked = false;
+    if account.endpoints == *ep
+        && http::check_endpoints(ep).is_ok()
+        && let Ok(client) = http::client_for(ep)
+        && let Ok(Discovery {
+            revocation_endpoint: Some(rev),
+            ..
+        }) = oidc::discover(&client, &ep.issuer).await
+    {
+        let body = form(&[
+            ("token", &tokens.refresh_token),
+            ("token_type_hint", "refresh_token"),
+            ("client_id", &account.client_id),
+        ]);
+        for attempt in 0..3u32 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_millis(500 << attempt)).await;
+            }
+            match client
+                .post(&rev)
+                .header("content-type", "application/x-www-form-urlencoded")
+                .body(body.clone())
+                .timeout(Duration::from_secs(20))
+                .send()
+                .await
+            {
+                Ok(r) if r.status().as_u16() == 200 => {
+                    revoked = true;
+                    break;
+                }
+                Ok(r) if r.status().is_server_error() => continue,
+                Ok(_) => break,
+                Err(_) => continue,
+            }
+        }
+    }
+    // Keep the client mapping and host ID for later sign-ins.
+    profile.clear_tokens(&lock)?;
+    Ok(LogoutOutcome {
+        signed_out: true,
+        remote_revoked: revoked,
+    })
+}
+
+pub(crate) async fn status(dir: &Path) -> Result<Status> {
+    let mut s = Status {
+        signed_in: false,
+        registered: false,
+        plan_usage_enabled: false,
+        email: None,
+        subject: None,
+        access_expires_at: None,
+        ext_agent_host_id: None,
+        manage_usage_url: USAGE_URL,
+    };
+    let Some(profile) = Profile::open(dir, false)? else {
+        return Ok(s);
+    };
+    s.ext_agent_host_id = profile.host()?.map(|h| h.ext_agent_host_id);
+    if let Some(a) = profile.account()? {
+        s.registered = true;
+        s.email = a.email;
+        s.subject = a.subject;
+    }
+    if let Some(t) = profile.tokens()? {
+        s.signed_in = true;
+        s.plan_usage_enabled = t.scopes.iter().any(|x| x == PLAN_SCOPE);
+        s.access_expires_at = Some(t.expires_at);
+    }
+    Ok(s)
+}
+
+pub(crate) async fn model_catalog(dir: &Path, ep: &Endpoints) -> Result<Vec<ModelInfo>> {
+    let (_, tokens) = access(dir, ep).await?;
+    let client = http::client_for(ep)?;
+    let resp = client
+        .get(format!("{}/models", ep.api_base))
+        .bearer_auth(&tokens.access_token)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(http::net)?;
+    let status = resp.status();
+    let rid = http::request_id(resp.headers());
+    let body = http::read_bounded(resp, MAX_JSON).await?;
+    if !status.is_success() {
+        return Err(Failure::parse(status.as_u16(), rid, &body).error("model list"));
+    }
+    let v: Value =
+        serde_json::from_slice(&body).map_err(|_| anyhow!("model list response is malformed"))?;
+    let models = v
+        .get("models")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("model list response has no `models` array"))?;
+    Ok(models
+        .iter()
+        .filter(|m| m.get("visibility").and_then(Value::as_str) == Some("list"))
+        .filter_map(|m| {
+            Some(ModelInfo {
+                slug: m.get("slug")?.as_str()?.to_owned(),
+                display_name: m
+                    .get("display_name")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+            })
+        })
+        .collect())
+}
+
+pub(crate) async fn complete(dir: &Path, ep: &Endpoints, request: Value) -> Result<Value> {
+    // Translate first, so an unsupported request never touches the network or
+    // the refresh path.
+    let body =
+        translate::to_responses(&request).map_err(|e| tagged(e, Some(Category::Unsupported)))?;
+    let (_, tokens) = access(dir, ep).await?;
+    let client = http::client_for(ep)?;
+    let resp = client
+        .post(format!("{}/responses", ep.api_base))
+        .bearer_auth(&tokens.access_token)
+        .header("content-type", "application/json")
+        .header("accept", "text/event-stream")
+        .body(serde_json::to_vec(&body)?)
+        .send()
+        .await
+        .map_err(http::net)?;
+    let status = resp.status();
+    if !status.is_success() {
+        let rid = http::request_id(resp.headers());
+        let bytes = http::read_bounded(resp, 64 * 1024)
+            .await
+            .unwrap_or_default();
+        return Err(Failure::parse(status.as_u16(), rid, &bytes).error("Responses request"));
+    }
+    let ct = resp
+        .headers()
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !ct.starts_with("text/event-stream") {
+        bail!("Responses did not return an event stream");
+    }
+    let completed = sse::collect(resp, sse::Limits::default()).await?;
+    translate::to_chat_completion(&completed).map_err(|e| tagged(e, Some(Category::Unsupported)))
+}

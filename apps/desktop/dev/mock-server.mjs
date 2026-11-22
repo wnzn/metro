@@ -24,7 +24,7 @@ createServer(async (req, res) => {
   let body = "";
   for await (const chunk of req) body += chunk;
   // The double was written for BASE http://127.0.0.1:8787; only the path matters.
-  const answer = route({ method: req.method, url: `http://127.0.0.1:8787${req.url}`, headers: req.headers, body: body || null });
+  const answer = await route({ method: req.method, url: `http://127.0.0.1:8787${req.url}`, headers: req.headers, body: body || null });
   if (answer.error) {
     res.destroy();
     return;

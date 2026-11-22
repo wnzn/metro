@@ -29,11 +29,14 @@
 //   or UI) and is dropped on disconnect.
 // - A runner token is shown once, right after the owner issues it, and is
 //   cleared when the owner hides it, leaves the management view, switches
-//   Space or room, or disconnects.
+//   Space or room, or disconnects. The same holds for registered runner and
+//   device tokens shown in Settings (src/settings.ts registers its clearers
+//   here with onTransientClear / onSessionEnd).
 
 import { batch, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError, createClient, parseReaction } from "./api/client";
 import type { Client, Member, Mention, Room, RoomEvent, Run, Space } from "./api/client";
+export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl } from "./api/serverUrl";
 
 export type { Member, Mention, Room, RoomEvent, Run, Space };
@@ -55,8 +58,16 @@ export type Status =
   | { phase: "retrying"; attempt: number; retryInMs: number; message: string };
 
 export type View = "room" | "manage";
-/** Where the main panel is: the personal Chat, or the active Space. */
-export type Place = "chat" | "space";
+/**
+ * What the user is looking at: the personal Chat, the active Space, the
+ * user's own Search and Scheduled tasks (both outside every Space), or
+ * Settings, which opens as a modal over whichever of those is underneath.
+ */
+export type Place = "chat" | "space" | "settings" | "search" | "schedules";
+/** Where the main panel is under any modal: never Settings. */
+export type MainPlace = Exclude<Place, "settings">;
+/** The pages of Settings. Reachable with or without any Space. */
+export type SettingsSection = "profile" | "runners" | "providers" | "routing" | "appearance";
 
 // ------------------------------------------------------------------ state
 
@@ -76,8 +87,19 @@ export const serverUrlInput = signal(DEFAULT_SERVER_URL);
 export const connectedTo = signal<string | null>(null);
 /** The signed-in user's id, which others use to add them to a Space. */
 export const me = signal<string | null>(null);
+/** The signed-in user is an admin of the server's one organization (METRO_ORG_ADMINS). */
+export const orgAdmin = signal(false);
 
-export const place = signal<Place>("chat");
+// The main panel's place, kept while Settings is open over it, so closing
+// Settings returns to the same Chat, Space, room, view and draft.
+const basePlace = signal<MainPlace>("chat");
+/** Settings is open as a modal over the main panel. */
+export const settingsOpen = signal(false);
+/** What the user is looking at: "settings" while the Settings modal is open, else the main panel's place. */
+export const place = computed<Place>(() => (settingsOpen() ? "settings" : basePlace()));
+/** The main panel's place, under the Settings modal too. */
+export const mainPlace = computed<MainPlace>(() => basePlace());
+export const settingsSection = signal<SettingsSection>("runners");
 export const spaces = signal<Space[]>([]);
 export const activeSpaceId = signal<string | null>(null);
 export const activeSpace = computed(() => spaces().find((s) => s.id === activeSpaceId()) ?? null);
@@ -91,7 +113,7 @@ export const activeRoom = computed(() => rooms().find((r) => r.id === activeRoom
 const eventsByScope = signal<Record<string, readonly RoomEvent[]>>({});
 const loadedScopes = signal<Record<string, true>>({});
 const activeScope = computed(() => {
-  if (place() === "chat") return CHAT;
+  if (basePlace() === "chat") return CHAT;
   const sid = activeSpaceId();
   const rid = activeRoomId();
   return sid && rid ? scopeKey(sid, rid) : "";
@@ -140,9 +162,6 @@ export const mentions = signal<Mention[]>([]);
 // Space management (owners)
 export const manageError = signal<string | null>(null);
 export const memberBusy = signal<string | null>(null);
-export const runnerBusy = signal<null | "issue" | "revoke">(null);
-/** The runner token just issued. Transient: see "Secrets" above. */
-export const revealedRunnerToken = signal<string | null>(null);
 
 // ------------------------------------------------------------------ session internals
 
@@ -161,6 +180,42 @@ const inflight = new Map<string, Promise<void>>();
 const pollAgain = new Set<string>();
 const lastRoomBySpace = new Map<string, string>();
 const spaceEpoch = new Map<string, number>();
+
+// Other state modules (src/settings.ts) hook into the session's lifecycle
+// here instead of this module importing them.
+const transientClearers: (() => void)[] = [];
+const sessionEnders: (() => void)[] = [];
+const manageOpeners: ((spaceId: string) => void)[] = [];
+/** Called whenever the place, Space, room or view changes: drop anything shown once. */
+export function onTransientClear(fn: () => void) {
+  transientClearers.push(fn);
+}
+/** Called when the session ends (disconnect, 401): drop everything of the session. */
+export function onSessionEnd(fn: () => void) {
+  sessionEnders.push(fn);
+}
+const sessionStarters: ((session: { baseUrl: string; token: string }) => void)[] = [];
+/**
+ * Called once a session is online. Only src/device uses it: it hands the
+ * token straight to the packaged launcher's loopback bridge (POST /v1/session)
+ * and keeps no copy.
+ */
+export function onSessionStart(fn: (session: { baseUrl: string; token: string }) => void) {
+  sessionStarters.push(fn);
+}
+/** Called after an owner opens a Space's management view. */
+export function onManageOpen(fn: (spaceId: string) => void) {
+  manageOpeners.push(fn);
+}
+
+/** The session's client, or null when signed out. Never exposes the token. */
+export function apiClient(): Client | null {
+  return client;
+}
+/** A guard for async work started now: still the same session (and Space, when given). */
+export function sessionGuard(spaceId?: string) {
+  return guard(spaceId);
+}
 
 function scopeKey(spaceId: string, roomId: string) {
   return `${spaceId}\u0001${roomId}`;
@@ -186,7 +241,11 @@ export async function restorePreferences() {
 
 // ------------------------------------------------------------------ connect / disconnect
 
-export async function connect(urlInput: string, tokenInput: string): Promise<void> {
+/**
+ * `remember: false` (the desktop-hosted local workspace): don't save this URL
+ * as the server to offer next time, so the remote choice stays as it was.
+ */
+export async function connect(urlInput: string, tokenInput: string, opts: { remember?: boolean } = {}): Promise<void> {
   const parsed = parseServerUrl(urlInput);
   if (!parsed.ok) {
     connectError.set(parsed.error);
@@ -218,10 +277,11 @@ export async function connect(urlInput: string, tokenInput: string): Promise<voi
     if (sess !== session) return;
     batch(() => {
       me.set(who.id);
+      orgAdmin.set(who.isOrgAdmin);
       spaces.set(list);
       connectedTo.set(parsed.baseUrl);
     });
-    Storage.setItem(SERVER_URL_KEY, parsed.baseUrl).catch(() => {});
+    if (opts.remember !== false) Storage.setItem(SERVER_URL_KEY, parsed.baseUrl).catch(() => {});
     const remembered = await rememberedSpace(parsed.baseUrl);
     if (sess !== session) return;
     // A returning user lands in their last Space; everyone else in their Chat.
@@ -231,6 +291,7 @@ export async function connect(urlInput: string, tokenInput: string): Promise<voi
     lastListsRefresh = Date.now();
     failures = 0;
     status.set({ phase: "online" });
+    for (const fn of sessionStarters) fn({ baseUrl: parsed.baseUrl, token });
     kick();
   } catch (error) {
     if (sess !== session) return;
@@ -252,11 +313,12 @@ export function retryNow() {
 // ------------------------------------------------------------------ spaces
 
 export function openChat() {
-  if (place() === "chat") return;
+  if (basePlace() === "chat" && !settingsOpen()) return;
   batch(() => {
     clearTransient();
     view.set("room");
-    place.set("chat");
+    settingsOpen.set(false);
+    basePlace.set("chat");
     actionError.set(null);
     notice.set(null);
   });
@@ -264,21 +326,111 @@ export function openChat() {
   kick();
 }
 
+/** Opens Search or Scheduled tasks: the user's own pages, outside every Space. */
+export function openPlace(where: "search" | "schedules") {
+  if (basePlace() === where && !settingsOpen()) return;
+  batch(() => {
+    clearTransient();
+    view.set("room");
+    settingsOpen.set(false);
+    basePlace.set(where);
+    actionError.set(null);
+    notice.set(null);
+  });
+}
+
+/**
+ * Where a search result (or anything else) points: the personal Chat when
+ * `spaceId` is null, otherwise a room or thread of a Space.
+ */
+export type Location = { spaceId: string | null; roomId: string | null; eventId?: number };
+
+/**
+ * The event to bring into view after `openLocation`, keyed by where it is
+ * (`chat` or `<space>\u0001<room>`). Conversations may read it; it is cleared
+ * on any move and at sign-out.
+ */
+export const focusTarget = signal<{ scope: string; eventId: number } | null>(null);
+
+/**
+ * Opens what a location points at. Only Spaces the user is a member of now
+ * can be opened; a room or thread that isn't visible says so instead of
+ * opening something else. Resolves to whether it got there.
+ */
+export async function openLocation(target: Location): Promise<boolean> {
+  if (!client) return false;
+  if (target.spaceId === null) {
+    if (basePlace() !== "chat" || settingsOpen()) openChat();
+    if (target.eventId !== undefined) focusTarget.set({ scope: CHAT, eventId: target.eventId });
+    return true;
+  }
+  const sid = target.spaceId;
+  if (!spaces().some((s) => s.id === sid)) {
+    notice.set("That Space isn't available to you any more.");
+    return false;
+  }
+  const rid = target.roomId;
+  if (rid) lastRoomBySpace.set(sid, rid);
+  await selectSpace(sid);
+  if (activeSpaceId() !== sid || basePlace() !== "space") return false;
+  if (!rid) return true;
+  if (!rooms().some((r) => r.id === rid)) {
+    try {
+      await refreshLists(true); // a thread created moments ago
+    } catch {
+      /* the loop reports connection problems */
+    }
+  }
+  if (activeSpaceId() !== sid) return false;
+  if (!rooms().some((r) => r.id === rid)) {
+    notice.set("That room or thread isn't visible to you (yet).");
+    return false;
+  }
+  selectRoom(rid);
+  if (target.eventId !== undefined) focusTarget.set({ scope: scopeKey(sid, rid), eventId: target.eventId });
+  return true;
+}
+
+/**
+ * Opens Settings at `section`, as a modal over the main panel, or moves the
+ * open modal to that section. Works with no Space at all. What is underneath
+ * (place, Space, room, view, drafts, scroll) is kept for closeSettings; only
+ * what is shown once (tokens, confirmations) is dropped, as on any move.
+ */
+export function openSettings(section: SettingsSection = settingsSection()) {
+  if (settingsOpen() && settingsSection() === section) return;
+  batch(() => {
+    clearTransient();
+    settingsSection.set(section);
+    settingsOpen.set(true);
+  });
+}
+
+/** Closes the Settings modal and returns to what was underneath, as it was. */
+export function closeSettings() {
+  if (!settingsOpen()) return;
+  batch(() => {
+    clearTransient();
+    settingsOpen.set(false);
+  });
+}
+
 export async function selectSpace(spaceId: string): Promise<void> {
   if (switchingSpace()) return;
   if (spaceId === activeSpaceId() && roomsBySpace()[spaceId]) {
-    if (place() === "space") return;
+    if (basePlace() === "space" && !settingsOpen()) return;
     batch(() => {
       clearTransient();
       view.set("room");
-      place.set("space");
+      settingsOpen.set(false);
+      basePlace.set("space");
       actionError.set(null);
       notice.set(null);
     });
     kick();
     return;
   }
-  await enterSpace(spaceId, { place: place(), spaceId: activeSpaceId() });
+  await enterSpace(spaceId, { place: basePlace(), spaceId: activeSpaceId() });
   kick();
 }
 
@@ -299,7 +451,7 @@ export async function createSpace(nameInput: string): Promise<boolean> {
     const space = await c.createSpace(name);
     if (!ok()) return false;
     spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
-    await enterSpace(space.id, { place: place(), spaceId: activeSpaceId() });
+    await enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
     kick();
     return true;
   } catch (error) {
@@ -315,14 +467,15 @@ export async function createSpace(nameInput: string): Promise<boolean> {
  * else its lobby. If the Space can't be opened, purges it on 403/404 and
  * returns to where the user was.
  */
-async function enterSpace(spaceId: string, previous: { place: Place; spaceId: string | null }): Promise<void> {
+async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId: string | null }): Promise<void> {
   const c = client;
   if (!c) return;
   const ok = guard(spaceId);
   batch(() => {
     clearTransient();
     view.set("room");
-    place.set("space");
+    settingsOpen.set(false);
+    basePlace.set("space");
     activeSpaceId.set(spaceId);
     activeRoomId.set(pickRoom(spaceId, roomsBySpace()[spaceId] ?? EMPTY_ROOMS));
     actionError.set(null);
@@ -352,7 +505,7 @@ async function enterSpace(spaceId: string, previous: { place: Place; spaceId: st
     batch(() => {
       activeSpaceId.set(back);
       activeRoomId.set(back ? pickRoom(back, roomsBySpace()[back] ?? EMPTY_ROOMS) : null);
-      place.set(back && previous.place === "space" ? "space" : "chat");
+      basePlace.set(back && previous.place === "space" ? "space" : "chat");
       actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
     });
   } finally {
@@ -430,12 +583,13 @@ function rememberSpace(spaceId: string) {
 
 export function selectRoom(roomId: string) {
   const sid = activeSpaceId();
-  if (!sid || (roomId === activeRoomId() && view() === "room" && place() === "space")) return;
+  if (!sid || (roomId === activeRoomId() && view() === "room" && basePlace() === "space" && !settingsOpen())) return;
   lastRoomBySpace.set(sid, roomId);
   batch(() => {
     clearTransient();
     view.set("room");
-    place.set("space");
+    settingsOpen.set(false);
+    basePlace.set("space");
     activeRoomId.set(roomId);
     actionError.set(null);
     notice.set(null);
@@ -478,7 +632,7 @@ export async function createRoom(nameInput: string): Promise<boolean> {
 
 /** Posts the draft to the active room; `invokeAgent` asks the Space's agent to answer. */
 export async function send(invokeAgent: boolean): Promise<void> {
-  if (place() === "chat") return sendChat(invokeAgent);
+  if (basePlace() === "chat") return sendChat(invokeAgent);
   const text = draft().trim();
   const sid = activeSpaceId();
   const rid = activeRoomId();
@@ -672,7 +826,7 @@ export async function toggleReaction(eventId: number, emoji: string): Promise<vo
   const c = client;
   const myId = me();
   if (!c || !myId || reactionPending()) return;
-  const inChat = place() === "chat";
+  const inChat = basePlace() === "chat";
   const sid = activeSpaceId();
   const rid = activeRoomId();
   if (!inChat && (!sid || !rid)) return;
@@ -755,6 +909,7 @@ export async function openManage(): Promise<void> {
     manageError.set(null);
     notice.set(null);
   });
+  for (const fn of manageOpeners) fn(space.id);
   await reloadMembers();
 }
 
@@ -824,7 +979,7 @@ export function mentionQuery(text: string): string | null {
 
 /** Adds a mention: its literal replaces a trailing "@partial" or is appended. */
 export function addMention(m: Mention) {
-  if (place() !== "space") return;
+  if (basePlace() !== "space") return;
   const literal = mentionLiteral(m);
   batch(() => {
     if (!mentions().some((x) => sameMention(x, m))) mentions.set([...mentions(), m]);
@@ -906,64 +1061,14 @@ export async function removeMember(userId: string): Promise<void> {
   }
 }
 
-/** Issues or rotates the Space's runner token and shows it once. */
-export async function issueRunnerToken(): Promise<void> {
-  const sid = activeSpaceId();
-  const c = client;
-  if (!sid || !c || runnerBusy()) return;
-  const ok = guard(sid);
-  batch(() => {
-    runnerBusy.set("issue");
-    manageError.set(null);
-    revealedRunnerToken.set(null);
-  });
-  try {
-    const issued = await c.issueRunnerToken(sid);
-    // Show it only if the owner is still looking at this Space's management view.
-    if (!ok() || activeSpaceId() !== sid || view() !== "manage") return;
-    batch(() => {
-      revealedRunnerToken.set(issued);
-      setRunnerPaired(sid, true);
-    });
-  } catch (error) {
-    if (ok()) handleManageError(error, "Could not issue a runner token", sid);
-  } finally {
-    if (ok()) runnerBusy.set(null);
-  }
-}
-
-export async function revokeRunnerToken(): Promise<void> {
-  const sid = activeSpaceId();
-  const c = client;
-  if (!sid || !c || runnerBusy()) return;
-  const ok = guard(sid);
-  batch(() => {
-    runnerBusy.set("revoke");
-    manageError.set(null);
-    revealedRunnerToken.set(null);
-  });
-  try {
-    await c.revokeRunnerToken(sid);
-    if (!ok()) return;
-    setRunnerPaired(sid, false);
-    notice.set("Runner token revoked. The runner can no longer serve this Space.");
-  } catch (error) {
-    if (ok()) handleManageError(error, "Could not revoke the runner token", sid);
-  } finally {
-    if (ok()) runnerBusy.set(null);
-  }
-}
-
-export function hideRunnerToken() {
-  revealedRunnerToken.set(null);
-}
-
-function setRunnerPaired(spaceId: string, paired: boolean) {
+/** Marks whether anyone serves a Space (a dedicated token or an attached runner). */
+export function setRunnerPaired(spaceId: string, paired: boolean) {
   spaces.set(spaces().map((s) => (s.id === spaceId ? { ...s, runnerPaired: paired } : s)));
 }
 
 function clearTransient() {
-  revealedRunnerToken.set(null);
+  focusTarget.set(null);
+  for (const fn of transientClearers) fn();
 }
 
 // Mentions belong to one room: forget them whenever the room, Space or place changes.
@@ -1002,7 +1107,9 @@ function endSession() {
     status.set({ phase: "signedOut" });
     connectedTo.set(null);
     me.set(null);
-    place.set("chat");
+    settingsOpen.set(false);
+    basePlace.set("chat");
+    focusTarget.set(null);
     chatUnavailable.set(null);
     runs.set([]);
     runsLoaded.set(false);
@@ -1035,8 +1142,9 @@ function endSession() {
     mentions.set([]);
     manageError.set(null);
     memberBusy.set(null);
-    runnerBusy.set(null);
-    revealedRunnerToken.set(null);
+    orgAdmin.set(false);
+    settingsSection.set("runners");
+    for (const fn of sessionEnders) fn();
   });
 }
 
@@ -1066,10 +1174,10 @@ async function tick(sess: number) {
   try {
     if (Date.now() - lastListsRefresh >= LISTS_REFRESH_MS) await refreshLists();
     if (sess !== session) return;
-    if (place() === "chat") {
+    if (basePlace() === "chat") {
       if (!chatUnavailable()) await pollChat();
       if (sess === session && Date.now() - lastRunsRefresh >= RUNS_REFRESH_MS) await refreshRuns();
-    } else {
+    } else if (basePlace() === "space") {
       const sid = activeSpaceId();
       const rid = activeRoomId();
       if (sid && rid && view() === "room") await pollRoom(sid, rid);
@@ -1096,7 +1204,7 @@ async function handleLoopError(error: unknown): Promise<number | null> {
     disconnect(error.message);
     return null;
   }
-  if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found") && place() === "space") {
+  if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found") && basePlace() === "space") {
     await lostAccess(activeSpaceId(), activeRoomId());
     return 0;
   }
@@ -1152,7 +1260,7 @@ async function refreshLists(force = false) {
   const active = activeSpaceId();
   if (active && !known.has(active)) {
     const lostSpace = lost.find((s) => s.id === active);
-    const wasHere = place() === "space";
+    const wasHere = basePlace() === "space";
     batch(() => {
       activeSpaceId.set(null);
       activeRoomId.set(null);
@@ -1160,7 +1268,7 @@ async function refreshLists(force = false) {
       if (lostSpace) notice.set(`You no longer have access to ${lostSpace.name}.`);
     });
     // Never fall back to another Space silently: go to the Chat, which says what happened.
-    if (wasHere) place.set("chat");
+    if (wasHere) basePlace.set("chat");
     return;
   }
   if (active) {
@@ -1294,7 +1402,7 @@ function handleActionError(error: unknown, what: string, spaceId?: string) {
   }
 }
 
-function handleManageError(error: unknown, what: string, spaceId: string) {
+export function handleManageError(error: unknown, what: string, spaceId: string) {
   if (isAborted(error)) return;
   if (error instanceof ApiError && error.kind === "auth") {
     disconnect(error.message);
@@ -1309,11 +1417,11 @@ function handleManageError(error: unknown, what: string, spaceId: string) {
   }
 }
 
-function isAborted(error: unknown) {
+export function isAborted(error: unknown) {
   return error instanceof ApiError && error.kind === "aborted";
 }
 
-function describe(error: unknown, what: string): string {
+export function describe(error: unknown, what: string): string {
   if (error instanceof ApiError) return error.message;
   return `${what}: ${String((error as Error)?.message ?? error)}`;
 }

@@ -250,3 +250,53 @@ fn mcp_over_docker_stdio() {
     std::thread::sleep(Duration::from_millis(500));
     assert_eq!(our_containers(), "", "container left behind");
 }
+
+/// Reusable credential + docker: the container sees only the claiming
+/// Space's root, read-only, and nothing from the base or a sibling Space.
+#[test]
+fn reusable_check_mounts_only_the_claiming_space() {
+    let _g = lock();
+    let Some(img) = image() else {
+        eprintln!("skipping: METRO_TEST_DOCKER_IMAGE not set");
+        return;
+    };
+    let base = tempfile::tempdir().unwrap();
+    std::fs::write(base.path().join("root-secret"), "ROOT").unwrap();
+    for s in ["a", "b"] {
+        let p = base.path().join("spaces").join(format!("s-{s}"));
+        std::fs::create_dir_all(&p).unwrap();
+        std::fs::set_permissions(&p, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+        let f = p.join(format!("marker-{s}"));
+        std::fs::write(&f, s).unwrap();
+        std::fs::set_permissions(&f, std::os::unix::fs::PermissionsExt::from_mode(0o644)).unwrap();
+    }
+    let script = "ls -A /workspace | tr '\\n' ' '; echo; \
+        (ls /workspace/.. ; ls /workspace/../s-b) 2>&1 | grep -c marker-b; \
+        (touch /workspace/w 2>/dev/null && echo ws-WRITABLE) || echo ws-ro; \
+        env | grep -c METRO || true";
+    let argv = serde_json::to_string(&["/bin/sh", "-c", script]).unwrap();
+    let cfg = config(
+        base.path(),
+        &[
+            ("METRO_RUNNER_TOKEN", "metro_rt_v2_docker-test"),
+            ("METRO_SANDBOX", "docker"),
+            ("METRO_SANDBOX_IMAGE", &img),
+            ("METRO_CHECK_ARGV", &argv),
+            ("METRO_CHECK_TIMEOUT_SECS", "60"),
+        ],
+    );
+    let roots = metro_runner::spaces::SpaceRoots::open(&cfg.workspace).unwrap();
+    let ws = roots.open_space("s-a").unwrap();
+    let r = Registry::for_space(Arc::new(cfg), Arc::new(ws));
+    let out = r.dispatch("workspace.check", &json!({}));
+    assert!(out.ok, "{}", out.output);
+    let o = &out.output;
+    assert!(o.contains("marker-a \n"), "only s-a's files expected:\n{o}");
+    assert!(!o.contains("root-secret") && !o.contains("WRITABLE"), "{o}");
+    assert!(o.contains("ws-ro"), "{o}");
+    assert!(
+        o.contains("\n0\nws-ro\n0\n"),
+        "sibling visible or env leaked:\n{o}"
+    );
+    assert_eq!(our_containers(), "", "container left behind");
+}

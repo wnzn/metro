@@ -1,0 +1,20 @@
+# Optional override: read the provider master key from a file you choose.
+#   METRO_PROVIDER_MASTER_KEY_HOST_FILE=/abs/path/key.b64 \
+#     docker compose -f compose.yaml -f compose.provider-key-file.yaml up -d server
+# The file holds base64 of 32 random bytes, outside the repo. Compose bind-mounts
+# it as-is, so it must be readable by uid 10001 (e.g. chown 10001 + mode 400).
+# Don't combine it with METRO_PROVIDER_MASTER_KEY.
+services:
+  server:
+    environment:
+      METRO_PROVIDER_KEY_FILE: /run/secrets/metro_provider_master_key
+    secrets:
+      - source: metro_provider_master_key
+        target: metro_provider_master_key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+
+secrets:
+  metro_provider_master_key:
+    file: "${METRO_PROVIDER_MASTER_KEY_HOST_FILE:?set to an absolute key file path}"

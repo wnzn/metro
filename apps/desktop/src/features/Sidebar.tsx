@@ -1,4 +1,5 @@
 import { Clipboard, signal } from "nsh";
+import { isLoopbackHost } from "../api/serverUrl";
 import {
   activeRoomId,
   activeSpaceId,
@@ -9,51 +10,59 @@ import {
   creatingSpace,
   disconnect,
   isActiveRun,
+  mainPlace,
   me,
   openChat,
-  place,
+  openPlace,
+  openSettings,
   rooms,
   runs,
   selectRoom,
   selectSpace,
+  settingsOpen,
   spaces,
   status,
   view,
 } from "../store";
 import type { Room } from "../store";
-import { Action, Column, Field, Label, NavItem, Row, ScrollArea, Spacer, StatusDot, Surface } from "../ui";
+import { Action, Column, Field, Icon, IconButton, Label, NavItem, Row, ScrollArea, Spacer, StatusDot, Surface } from "../ui";
 import type { Tone } from "../ui";
 
+/**
+ * The app's navigation: Chat, Scheduled tasks, the Spaces and their rooms,
+ * and Settings (a modal). Search is the box at the top of the main panel.
+ * The server this session is connected to, and who is signed in, are at the
+ * bottom.
+ */
 export function Sidebar() {
   return (
     <Surface variant="sidebar" testID="sidebar">
-      <Column pad={3} gap={1}>
-        <Row align="center" gap={2}>
-          <Label variant="heading" color="sidebar">
-            Metro
-          </Label>
-          <Spacer />
-          <ConnectionDot />
-        </Row>
-        <Label variant="caption" color="muted" lines={1} testID="server-origin">
-          {connectedTo() ?? ""}
+      <Row align="center" gap={2} padX={4} padY={3}>
+        <Label variant="heading" color="sidebar">
+          Metro
         </Label>
-      </Column>
+        <Spacer />
+        <ConnectionDot />
+      </Row>
 
       <ScrollArea padX={2} gap={1}>
         <NavItem
           testID="nav-chat"
           label="Chat"
-          prefix="✦"
+          icon="chat"
           emphasis
           trailing={activeRunCount() ? `${activeRunCount()} running` : undefined}
-          selected={place() === "chat"}
+          selected={mainPlace() === "chat"}
           onPress={openChat}
         />
+        <NavItem testID="nav-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
         <SpacesSection />
       </ScrollArea>
 
-      <Identity />
+      <Column padX={2} padY={2} gap={1}>
+        <NavItem testID="nav-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
+      </Column>
+      <ServerFooter />
     </Surface>
   );
 }
@@ -73,14 +82,14 @@ function SpacesSection() {
     <Column gap={1} padY={2}>
       <Row align="center" padX={2}>
         <Label variant="caption" color="muted">
-          SPACES
+          Spaces
         </Label>
         <Spacer />
-        <Action
+        <IconButton
           testID="new-space-toggle"
-          label={adding() ? "Cancel" : "+ Space"}
+          icon={adding() ? "close" : "plus"}
           accessibilityLabel={adding() ? "Cancel new Space" : "New Space"}
-          variant="ghost"
+          tooltip={adding() ? "Cancel" : "New Space"}
           onPress={() => adding.set(!adding())}
         />
       </Row>
@@ -96,13 +105,13 @@ function SpacesSection() {
             <NavItem
               testID={`space:${space().id}`}
               label={space().name}
-              prefix={space().id === activeSpaceId() && place() === "space" ? "▾" : "▸"}
+              icon={space().id === activeSpaceId() && mainPlace() === "space" ? "chevron-down" : "chevron-right"}
               trailing={space().role === "owner" ? "owner" : undefined}
               emphasis={space().id === activeSpaceId()}
               selected={false}
               onPress={() => void selectSpace(space().id)}
             />
-            <If when={space().id === activeSpaceId() && place() === "space"}>
+            <If when={space().id === activeSpaceId() && mainPlace() === "space"}>
               <RoomTree />
             </If>
           </Column>
@@ -111,7 +120,7 @@ function SpacesSection() {
       <If when={spaces().length === 0 && !adding()}>
         <Column padX={2} padY={1}>
           <Label variant="caption" color="muted">
-            No Spaces yet. Create one, or ask a Space owner to add your ID.
+            No Spaces yet. Create one, or ask a Space owner to add you.
           </Label>
         </Column>
       </If>
@@ -160,9 +169,9 @@ function RoomTree() {
           <NavItem
             testID={`room:${row().room.id}`}
             label={row().room.name}
-            prefix={row().depth > 1 ? "↳" : "#"}
+            icon={row().depth > 1 ? "thread" : "hash"}
             depth={row().depth}
-            selected={row().room.id === activeRoomId() && view() === "room" && place() === "space"}
+            selected={row().room.id === activeRoomId() && view() === "room" && mainPlace() === "space"}
             onPress={() => selectRoom(row().room.id)}
           />
         )}
@@ -187,7 +196,20 @@ function RoomTree() {
   );
 }
 
-function Identity() {
+/** Where this session is connected: "On this device" for a loopback server, else the server's host. */
+export function serverPlace(url: string | null): { local: boolean; title: string; detail: string } {
+  if (!url) return { local: false, title: "Not connected", detail: "" };
+  try {
+    const parsed = new URL(url);
+    const local = isLoopbackHost(parsed.hostname);
+    return { local, title: local ? "On this device" : parsed.host, detail: url };
+  } catch {
+    return { local: false, title: url, detail: url };
+  }
+}
+
+/** The server this session talks to, who is signed in, copy ID and disconnect. */
+function ServerFooter() {
   const copied = signal(false);
   const copy = () => {
     const id = me();
@@ -199,22 +221,35 @@ function Identity() {
       })
       .catch(() => {});
   };
+  const server = () => serverPlace(connectedTo());
   return (
-    <Column pad={3} gap={2}>
-      <Column gap={1}>
-        <Label variant="caption" color="muted">
-          Your user ID (share it to be added to a Space)
-        </Label>
-        <Row align="center" gap={2}>
-          <Column grow>
-            <Label variant="mono" lines={1} testID="my-id">
-              {me() ?? ""}
-            </Label>
-          </Column>
-          <Action testID="copy-id" label={copied() ? "Copied" : "Copy ID"} variant="ghost" onPress={copy} />
-        </Row>
-      </Column>
-      <Action testID="disconnect" label="Disconnect" variant="ghost" onPress={() => disconnect()} />
+    <Column padX={3} padY={3} gap={2} testID="server-footer">
+      <Row align="center" gap={2} accessibilityLabel={`Connected to ${server().title}${server().local ? `, ${server().detail}` : ""}`} testID="active-server">
+        <Icon name={server().local ? "device" : "server"} color="sidebar" />
+        <Column grow>
+          <Label variant="strong" color="sidebar" lines={1} testID="server-title">
+            {server().title}
+          </Label>
+          <Label variant="caption" color="muted" lines={1} testID="server-origin">
+            {server().detail}
+          </Label>
+        </Column>
+      </Row>
+      <Row align="center" gap={1}>
+        <Column grow>
+          <Label variant="mono" color="sidebar" lines={1} testID="my-id">
+            {me() ?? ""}
+          </Label>
+        </Column>
+        <IconButton
+          testID="copy-id"
+          icon={copied() ? "check" : "copy"}
+          accessibilityLabel={copied() ? "Your ID was copied" : "Copy your ID, to share with a Space owner"}
+          tooltip={copied() ? "Copied" : "Copy ID"}
+          onPress={copy}
+        />
+        <IconButton testID="disconnect" icon="logout" accessibilityLabel="Disconnect" tooltip="Disconnect" onPress={() => disconnect()} />
+      </Row>
     </Column>
   );
 }

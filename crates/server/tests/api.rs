@@ -66,6 +66,7 @@ fn config(model: Option<ModelConfig>) -> Config {
             agent_timeout: Duration::from_secs(30),
             ..Limits::default()
         },
+        org_admins: Vec::new(),
     }
 }
 
@@ -251,8 +252,34 @@ impl Server {
     }
 }
 
+/// The kinds of `events`, without `activity` lifecycle events (checked
+/// separately with [`lifecycle`]).
 fn kinds(events: &[Value]) -> Vec<&str> {
-    events.iter().map(|e| e["kind"].as_str().unwrap()).collect()
+    events
+        .iter()
+        .map(|e| e["kind"].as_str().unwrap())
+        .filter(|k| *k != "activity")
+        .collect()
+}
+
+/// `(activity id, phase)` of each lifecycle event, oldest first.
+fn lifecycle(events: &[Value]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter(|e| e["kind"] == "activity")
+        .map(|e| {
+            assert!(
+                e["activity"]["name"]
+                    .as_str()
+                    .is_some_and(|n| !n.is_empty()),
+                "{e}"
+            );
+            (
+                e["activity"]["id"].as_str().unwrap().to_owned(),
+                e["activity"]["phase"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect()
 }
 
 // ---- Mock model ----
@@ -692,6 +719,32 @@ async fn two_spaces_have_separate_runners_with_the_same_lobby_id() {
         .wait_for(ALICE, &a, "lobby", |e| e["kind"] == "tool_result")
         .await;
     assert_eq!(kinds(&events), ["demo", "tool_call", "tool_result"]);
+    let events: Vec<Value> = s
+        .wait_for(ALICE, &a, "lobby", |e| {
+            e["activity"]["phase"] == "completed"
+        })
+        .await;
+    // Demo is its own `demo` activity, never an agent turn; the person's
+    // Demo event is not part of it.
+    assert!(events[0].get("activity").is_none());
+    let demo = events[1]["activity"]["id"].as_str().unwrap().to_owned();
+    assert!(demo.starts_with("demo_"), "{demo}");
+    assert_eq!(
+        lifecycle(&events),
+        [
+            (demo.clone(), "started".into()),
+            (demo.clone(), "completed".into())
+        ]
+    );
+    for e in &events[1..] {
+        assert_eq!(e["activity"]["id"], demo.as_str(), "{e}");
+        assert_eq!(e["activity"]["source"], "demo", "{e}");
+        assert_eq!(e["activity"]["name"], "Demo", "{e}");
+    }
+    let events: Vec<Value> = events
+        .into_iter()
+        .filter(|e| e["kind"] != "activity")
+        .collect();
     assert_eq!(events[2]["text"], "workspace.list ok\nCargo.toml\nsrc/");
     assert_eq!(events[2]["actor"], "runner");
     assert!(s.events(BOB, &b, "lobby").await.is_empty());
@@ -843,6 +896,10 @@ async fn personal_chat_is_private_and_needs_no_space() {
                     .contains("METRO_MODEL")
             );
             assert_eq!(events[1]["audience"], "agent");
+            assert!(
+                events.iter().all(|e| e.get("activity").is_none()),
+                "a turn that never started has no activity: {events:?}"
+            );
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -881,6 +938,25 @@ async fn personal_chat_talks_to_the_model_without_tools() {
                 s.runs(ALICE).await.is_empty(),
                 "personal Chat runs are not Space runs"
             );
+            // Its own `chat_` turn, started before the reply and ended after it.
+            let turn = reply["activity"]["id"].as_str().unwrap().to_owned();
+            assert!(turn.starts_with("chat_"), "{turn}");
+            assert_eq!(reply["activity"]["name"], "Metro");
+            let events = loop {
+                let events = s.get(ALICE, "/v1/chat/events").await.1["events"]
+                    .as_array()
+                    .unwrap()
+                    .clone();
+                if events.iter().any(|e| e["activity"]["phase"] == "completed") {
+                    break events;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            };
+            assert_eq!(
+                lifecycle(&events),
+                [(turn.clone(), "started".into()), (turn, "completed".into())]
+            );
+            assert!(events[0].get("activity").is_none());
             return;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
@@ -956,7 +1032,10 @@ async fn only_agent_mentions_wake_the_agent() {
     let events = s
         .wait_for(ALICE, &a, "lobby", |e| e["kind"] == "agent")
         .await;
-    assert_eq!(events.last().unwrap()["text"], "noted");
+    assert_eq!(
+        events.iter().rev().find(|e| e["kind"] == "agent").unwrap()["text"],
+        "noted"
+    );
     let requests = model.requests();
     assert_eq!(requests.len(), 1);
     // The model saw who earlier messages were addressed to, as Metro context
@@ -1004,14 +1083,58 @@ async fn ask_agent_runs_the_rig_tool_loop_through_the_space_runner() {
     assert_eq!(s.result(&token, &job, "main.rs").await.0, StatusCode::OK);
 
     let events = s
-        .wait_for(ALICE, &a, "lobby", |e| e["kind"] == "agent")
+        .wait_for(ALICE, &a, "lobby", |e| {
+            e["activity"]["phase"] == "completed"
+        })
         .await;
     assert_eq!(events, s.events(BOB, &a, "lobby").await);
     assert_eq!(
         kinds(&events),
         ["message", "tool_call", "tool_result", "agent"]
     );
+    let runs = s.runs(BOB).await;
+    let run = runs[0]["id"].as_str().unwrap().to_owned();
+    // One turn: started before its first tool, ended after its reply. The
+    // person's message is not part of it; every server event is.
+    let events = s
+        .wait_for(ALICE, &a, "lobby", |e| {
+            e["activity"]["phase"] == "completed"
+        })
+        .await;
+    assert_eq!(
+        events
+            .iter()
+            .map(|e| e["kind"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "message",
+            "activity",
+            "tool_call",
+            "tool_result",
+            "agent",
+            "activity"
+        ]
+    );
+    assert!(events[0].get("activity").is_none(), "{}", events[0]);
+    for e in &events[1..] {
+        assert_eq!(e["activity"]["id"].as_str(), Some(run.as_str()), "{e}");
+        assert_eq!(e["activity"]["name"], "Metro", "{e}");
+        assert_eq!(e["activity"]["source"], "agent", "{e}");
+    }
+    assert!(events[2]["activity"].get("phase").is_none());
+    assert_eq!(
+        lifecycle(&events),
+        [(run.clone(), "started".into()), (run, "completed".into())]
+    );
+    let events: Vec<Value> = events
+        .into_iter()
+        .filter(|e| e["kind"] != "activity")
+        .collect();
     assert!(events[3]["text"].as_str().unwrap().contains("main.rs"));
+    // Lifecycle events never reach the model.
+    for r in model.requests() {
+        assert!(!r["messages"].to_string().contains("\"activity\""), "{r}");
+    }
     let tools = tool_names(&model.requests()[0]);
     for name in [
         "workspace_list",
@@ -1142,6 +1265,217 @@ async fn a_parent_agent_delegates_to_a_thread_and_hears_back() {
     );
     // Outsiders see none of these runs.
     assert!(s.runs(CAROL).await.is_empty());
+
+    // Each turn is its own activity: the child is shown by its thread's
+    // name in its own room; the parent's marker belongs to the parent turn,
+    // the mirrored result to the child's.
+    let child_run = runs.iter().find(|r| r["room_id"] == tid).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let parent_run = runs.iter().find(|r| r["room_id"] == "lobby").unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let child = s
+        .wait_for(BOB, &a, tid, |e| e["activity"]["phase"] == "completed")
+        .await;
+    assert_eq!(
+        lifecycle(&child),
+        [
+            (child_run.clone(), "started".into()),
+            (child_run.clone(), "completed".into())
+        ]
+    );
+    assert!(child[0].get("activity").is_none(), "the task is a message");
+    for e in &child[1..] {
+        assert_eq!(e["activity"]["name"], "research", "{e}");
+        assert_eq!(e["activity"]["source"], "agent", "{e}");
+    }
+    let parent = s
+        .wait_for(BOB, &a, "lobby", |e| e["activity"]["phase"] == "completed")
+        .await;
+    let started = parent
+        .iter()
+        .find(|e| e["text"].as_str().unwrap().starts_with("Started thread"))
+        .unwrap();
+    assert_eq!(started["activity"]["id"], parent_run.as_str());
+    assert_eq!(started["activity"]["name"], "Metro");
+    let mirror = parent
+        .iter()
+        .find(|e| e["kind"] == "thread" && e["text"].as_str().unwrap().contains("completed"))
+        .unwrap();
+    assert_eq!(mirror["activity"]["id"], child_run.as_str());
+    assert!(mirror["activity"].get("phase").is_none());
+    // Only the parent's own lifecycle is in the parent room.
+    assert!(lifecycle(&parent).iter().all(|(id, _)| *id == parent_run));
+}
+
+#[tokio::test]
+async fn interleaved_turns_in_one_room_keep_their_own_activity() {
+    // Each run lists the directory its prompt names, then reports.
+    let model = MockModel::start(|req| {
+        if has_tool_reply(req) {
+            Reply::Text(format!("done: {}", last_tool_reply(req)))
+        } else {
+            // The prompt is the last of the two in the request; the other
+            // one, if present, is shared history.
+            let sent = req["messages"].to_string();
+            let at = |p: &str| sent.rfind(p).map_or(-1, |i| i as i64);
+            let path = if at("list alpha") > at("list beta") {
+                "alpha"
+            } else {
+                "beta"
+            };
+            Reply::Tool("workspace_list", json!({"path": path}))
+        }
+    })
+    .await;
+    let s = Server::start(
+        config(Some(model.config.clone())),
+        Db::open_in_memory().unwrap(),
+    )
+    .await;
+    let a = s.space(ALICE, "team").await;
+    s.add(ALICE, &a, "bob").await;
+    let token = s.runner_token(ALICE, &a).await;
+    s.say(
+        ALICE,
+        &a,
+        "lobby",
+        json!({"text": "list alpha", "invoke_agent": true}),
+    )
+    .await;
+    s.say(
+        BOB,
+        &a,
+        "lobby",
+        json!({"text": "list beta", "invoke_agent": true}),
+    )
+    .await;
+    // Both are waiting on the runner before either is answered.
+    let first = s.claim(&token).await;
+    let second = s.claim(&token).await;
+    s.result(&token, &second, "second-out").await;
+    s.result(&token, &first, "first-out").await;
+    let events = loop {
+        let events = s.events(ALICE, &a, "lobby").await;
+        if lifecycle(&events)
+            .iter()
+            .filter(|(_, p)| p == "completed")
+            .count()
+            == 2
+        {
+            break events;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    let runs = s.runs(ALICE).await;
+    let run_of = |task: &str| {
+        runs.iter().find(|r| r["task"] == task).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (alpha, beta) = (run_of("list alpha"), run_of("list beta"));
+    assert_ne!(alpha, beta);
+    for e in &events {
+        let text = e["text"].as_str().unwrap();
+        match e["kind"].as_str().unwrap() {
+            "message" => assert!(e.get("activity").is_none(), "{e}"),
+            "tool_call" if text.contains("alpha") => {
+                assert_eq!(e["activity"]["id"], alpha.as_str())
+            }
+            "tool_call" => assert_eq!(e["activity"]["id"], beta.as_str()),
+            "tool_result" | "agent" => {
+                // The output the runner gave for this run's own path.
+                let path = if e["activity"]["id"] == alpha.as_str() {
+                    "alpha"
+                } else {
+                    "beta"
+                };
+                assert!(
+                    e["activity"]["id"] == alpha.as_str() || e["activity"]["id"] == beta.as_str(),
+                    "{e}"
+                );
+                let out = if first["arguments"]["path"] == path {
+                    "first-out"
+                } else {
+                    "second-out"
+                };
+                assert!(text.contains(out), "{e} should carry {out}");
+            }
+            "activity" => {}
+            other => panic!("unexpected {other}: {e}"),
+        }
+    }
+    for run in [&alpha, &beta] {
+        let phases: Vec<_> = lifecycle(&events)
+            .into_iter()
+            .filter(|(id, _)| id == run)
+            .map(|(_, p)| p)
+            .collect();
+        assert_eq!(phases, ["started", "completed"]);
+    }
+}
+
+#[tokio::test]
+async fn a_failed_turn_ends_failed_and_a_refused_one_never_starts() {
+    // A model that is not there: the run starts, then fails.
+    let dead = {
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        format!("http://{}/v1", l.local_addr().unwrap())
+    };
+    let s = Server::start(
+        config(Some(ModelConfig {
+            base_url: dead,
+            model: "mock".into(),
+            api_key: "test-key".into(),
+        })),
+        Db::open_in_memory().unwrap(),
+    )
+    .await;
+    let a = s.space(ALICE, "team").await;
+    s.say(
+        ALICE,
+        &a,
+        "lobby",
+        json!({"text": "hi", "invoke_agent": true}),
+    )
+    .await;
+    let events = s
+        .wait_for(ALICE, &a, "lobby", |e| e["activity"]["phase"] == "failed")
+        .await;
+    let run = s.runs(ALICE).await[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        lifecycle(&events),
+        [
+            (run.clone(), "started".into()),
+            (run.clone(), "failed".into())
+        ]
+    );
+    let error = events.iter().find(|e| e["kind"] == "error").unwrap();
+    assert_eq!(error["activity"]["id"], run.as_str());
+
+    // No model at all: the run is refused before it starts, so there is a
+    // plain error and no lifecycle that could look live.
+    let s = Server::plain().await;
+    let a = s.space(ALICE, "team").await;
+    s.say(
+        ALICE,
+        &a,
+        "lobby",
+        json!({"text": "hi", "invoke_agent": true}),
+    )
+    .await;
+    let events = s
+        .wait_for(ALICE, &a, "lobby", |e| e["kind"] == "error")
+        .await;
+    assert!(lifecycle(&events).is_empty(), "{events:?}");
+    assert!(
+        events.iter().all(|e| e.get("activity").is_none()),
+        "{events:?}"
+    );
 }
 
 // ---- Runs: listing and stopping ----
@@ -1198,13 +1532,16 @@ async fn runs_can_be_stopped_by_their_initiator_or_the_owner_only() {
     );
 
     let events = s
-        .wait_for(BOB, &a, "lobby", |e| e["kind"] == "status")
+        .wait_for(BOB, &a, "lobby", |e| e["activity"]["phase"] == "cancelled")
         .await;
-    assert!(
-        events.last().unwrap()["text"]
-            .as_str()
-            .unwrap()
-            .contains("cancelled")
+    let status = events.iter().find(|e| e["kind"] == "status").unwrap();
+    assert!(status["text"].as_str().unwrap().contains("cancelled"));
+    let id = run["id"].as_str().unwrap().to_owned();
+    assert_eq!(status["activity"]["id"], id.as_str());
+    // A stopped turn ends `cancelled`, never left looking live.
+    assert_eq!(
+        lifecycle(&events),
+        [(id.clone(), "started".into()), (id, "cancelled".into())]
     );
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(
@@ -1357,8 +1694,13 @@ async fn the_agent_can_answer_with_a_reaction_alone() {
     let events = s
         .wait_for(ALICE, &a, "lobby", |e| e["kind"] == "reaction")
         .await;
-    let reaction: Value =
-        serde_json::from_str(events.last().unwrap()["text"].as_str().unwrap()).unwrap();
+    let reaction = events
+        .iter()
+        .rev()
+        .find(|e| e["kind"] == "reaction")
+        .unwrap();
+    assert!(reaction.get("activity").is_none(), "{reaction}");
+    let reaction: Value = serde_json::from_str(reaction["text"].as_str().unwrap()).unwrap();
     assert_eq!(reaction["target_event_id"], msg["id"]);
     assert_eq!(reaction["emoji"], "🙏");
     assert_eq!(reaction["reactor_kind"], "agent");
@@ -1372,5 +1714,11 @@ async fn the_agent_can_answer_with_a_reaction_alone() {
     assert!(
         !events.iter().any(|e| e["kind"] == "agent"),
         "no redundant reply: {events:?}"
+    );
+    // A reaction-only turn still ends: its lifecycle is closed.
+    let run = s.runs(ALICE).await[0]["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        lifecycle(&events),
+        [(run.clone(), "started".into()), (run, "completed".into())]
     );
 }

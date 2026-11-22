@@ -4,7 +4,7 @@ Metro uses three kinds of secret:
 
 | Who | Credential | Comes from | Used on |
 | --- | --- | --- | --- |
-| People | `Authorization: Bearer <token>`: a dev token or an OIDC JWT access token | `METRO_DEV_USERS`, or your identity provider | `/v1/me`, `/v1/spaces/...`, `/v1/chat/...`, `/v1/runs/...` |
+| People | `Authorization: Bearer <token>`: a local-account token or an OIDC JWT access token | `METRO_DEV_USERS`, the admin panel (`metro_ut_…`), or your identity provider | `/v1/me`, `/v1/spaces/...`, `/v1/chat/...`, `/v1/runs/...` |
 | A Space's runner | `METRO_RUNNER_TOKEN` | Issued by the Space owner; see [spaces.md](spaces.md#runner-pairing) | `/v1/runner/...` |
 | The model (optional) | `METRO_MODEL_API_KEY` | Your model provider | Agent replies |
 
@@ -22,19 +22,32 @@ The server refuses to start in any of these cases:
 
 Empty values count as unset.
 
-### Dev users (your own machine only)
+### Local accounts
 
-```sh
-METRO_DEV_USERS='{"alice":"replace-with-token","bob":"replace-with-token"}'
-```
+This mode has two kinds of account, both in the server's own `dev`
+identity namespace:
 
-- Each token must be 16–512 printable ASCII bytes and distinct per user.
-  Generate them with `openssl rand -hex 32`.
-- Usernames are 1–64 characters from `A–Z a–z 0–9 . _ @ -`. The username is
-  both the user's `id` and their display name.
+- **Environment accounts**, from `METRO_DEV_USERS`. Use them to bootstrap
+  the first admin, as in [deploy.md](deploy.md#1-bootstrap-the-first-admin).
 
-The [README quickstart](../README.md#1-dev-users-with-tokens-kept-off-screen)
-writes these to private files without printing them.
+  ```sh
+  METRO_DEV_USERS='{"admin":"replace-with-token"}'
+  ```
+
+  Each token must be 16–512 printable ASCII bytes and distinct per user;
+  generate it with `openssl rand -hex 32`. Usernames are 1–64 characters
+  from `A–Z a–z 0–9 . _ @ -`, and the username is both the `id` and the
+  display name. To rotate one, change the environment and restart the
+  server. They can't be revoked from the panel.
+- **Managed accounts**, created by an org admin in the admin panel at
+  `/admin` ([deploy.md](deploy.md#4-create-peoples-accounts)). The server
+  generates a stable `mu:` id and a `metro_ut_` token, shows the token once,
+  and stores only its hash. Admins can rename, reissue and revoke, and each
+  change takes effect on the next request. Managed accounts can't be admins,
+  are never deleted, and start with no Space memberships.
+
+Send these tokens only over loopback, an SSH port forward or HTTPS
+([deploy.md](deploy.md#reaching-the-server-from-other-machines)).
 
 ### OIDC (JWT access tokens)
 
@@ -83,8 +96,12 @@ Spec: [OpenID Connect Core](https://openid.net/specs/openid-connect-core-1_0.htm
 
 - The desktop app has no login or token refresh. Get an access token from your
   provider and paste it in; paste a new one when it expires.
-- User tokens can't be revoked. Each stays valid until `exp`, so keep
-  lifetimes short.
+- OIDC tokens can't be revoked by Metro. Each stays valid until `exp`, so
+  keep lifetimes short. Managed local-account tokens can be reissued or
+  revoked in the admin panel. Environment accounts change only with the
+  server's environment.
+- With OIDC there are no managed accounts: the admin user routes answer
+  `404`, and managed tokens are never looked up.
 - There are no scope or group checks. Space membership is the access control.
 - One issuer and one audience per server. If the audience equals a client ID,
   an ID token for that client also passes. Use a distinct audience, or set

@@ -1,0 +1,27 @@
+[package]
+name = "metro-model-protocol"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+description = "Metro's model wire types: connection capabilities and typed System One questions and answers, with strict answer validation, and the System One and embeddings HTTP clients."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "metro_model_protocol"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+# client.rs: the System One and embeddings HTTP clients (no redirects,
+# bounded bodies). Versions match what Cargo.lock already resolves.
+anyhow = "1.0.100"
+reqwest = { version = "0.13", default-features = false, features = ["rustls"] }
+url = "2.5"
+# media.rs: strict, canonical base64 of media assets.
+base64 = "0.22"
+
+[dev-dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+tokio = { version = "1.53.1", features = ["macros", "net", "rt-multi-thread"] }

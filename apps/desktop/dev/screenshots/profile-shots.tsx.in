@@ -1,0 +1,39 @@
+// Native capture of a room's transcript (see capture-profile.sh): the real
+// app views and NSH Linux host against the test fake server and profile
+// fixture. No real server, network or token. The test network carries only
+// text, so pictures show as initials here; the live capture shows them.
+// Copied into a disposable copy of the app as a test file and run with
+// `nsh test --target linux`; never part of the regular `nsh test` run.
+
+import { open, test } from "nsh/test";
+import { BASE, TOKENS } from "../../../../test/fakeServer";
+import { profileWorld } from "./fixtures";
+
+const SHOTS = "/shots";
+
+test("capture", async () => {
+  const w = profileWorld();
+  w.f.state.spaces.get("acme")!.name = "Acme";
+  const lobby = "acme/lobby";
+  w.say(lobby, { kind: "message", actor: "Bob Tan", actor_id: "bob", text: "Staging deploy finished, all checks green.", created_at: "2026-11-21T23:48:00.000Z" });
+  w.say(lobby, { kind: "message", actor: "Bob Tan", actor_id: "bob", text: "I'll leave prod for the morning.", created_at: "2026-11-21T23:49:10.000Z" });
+  w.say(lobby, { kind: "message", actor: "Alice Moreno", actor_id: "alice", text: "Thanks Bob. Starting the prod rollout now.", created_at: "2026-11-22T01:02:03.000Z", mentions: [{ kind: "user", id: "bob" }], audience: "users" });
+  w.say(lobby, { kind: "message", actor: "Alice Moreno", actor_id: "alice", text: "Tag is v2.4.0; I'll post the changelog after.", created_at: "2026-11-22T01:03:00.000Z" });
+  w.say(lobby, { kind: "message", actor: "Bob Tan", actor_id: "bob", text: "@agent summarize what changed since v2.3 for the release notes", created_at: "2026-11-22T01:10:00.000Z", mentions: [{ kind: "agent" }], audience: "agent" });
+  w.say(lobby, { kind: "agent", actor: "agent", text: "Since v2.3: profiles with pictures, timestamps in every transcript, and faster room sync. Two fixes: reaction counts and thread titles.", created_at: "2026-11-22T01:10:24.000Z" });
+  w.say(lobby, { kind: "message", actor: "Bob Tan", actor_id: "bob", text: "@Alice Moreno can you check the rollout dashboard?", created_at: "2026-11-22T01:14:00.000Z", mentions: [{ kind: "user", id: "alice" }], audience: "users" });
+
+  const app = await open("./Harness.tsx", { network: w.network as any, platform: "linux", localeSettings: { timeZone: "UTC", hourCycle: "h12", languages: ["en-US"] } });
+  await app.setViewport(1200, 860);
+  await app.clear("id:server-url");
+  await app.type("id:server-url", BASE);
+  await app.type("id:access-token", TOKENS.alice!);
+  await app.press("id:connect");
+  await app.waitFor("id:h-profile", { timeout: 15000 });
+
+  await app.waitFor("id:space:acme", { timeout: 15000 });
+  await app.press("id:space:acme");
+  await app.waitFor("text:Staging deploy finished, all checks green.", { timeout: 15000 });
+  await app.wait(600);
+  await app.screenshot(`${SHOTS}/chat-transcript-fixture.png`);
+}, 120000);

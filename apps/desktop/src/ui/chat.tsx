@@ -1,0 +1,164 @@
+// Chat and profile primitives: a person's picture (or initials), the
+// transcript's message frame and day separator, and a timestamp. Like
+// ./primitives, feature code passes only semantic props; every class and
+// color decision lives here or in theme/theme.json.
+//
+// A picture's `src` is a `blob:` URL the feature made from bytes it fetched
+// with the user's credential, never a remote URL.
+
+import { Image, Text, View } from "nsh";
+import type { JSX } from "nsh";
+import { cx, toneSurfaceClass, toneTextClass } from "./tokens";
+import type { Tone } from "./tokens";
+
+type Testable = { testID?: string; accessibilityLabel?: string };
+
+export type AvatarSize = "sm" | "md" | "lg";
+
+const avatarBox: Record<AvatarSize, string> = {
+  sm: "size-[20px]",
+  md: "size-[32px]",
+  lg: "size-[72px]",
+};
+const avatarText: Record<AvatarSize, string> = {
+  sm: "text-[9px]",
+  md: "text-(length:--text-xs)",
+  lg: "text-(length:--text-xl)",
+};
+
+/**
+ * A round picture, or the initials on a tone when there is none (or it
+ * failed to load). Decorative unless it has an `accessibilityLabel`.
+ */
+export function Avatar(
+  props: Testable & {
+    initials: string;
+    tone: Tone;
+    src?: string | null;
+    size?: AvatarSize;
+    onImageError?: () => void;
+  },
+) {
+  const size = () => props.size ?? "md";
+  return (
+    <View
+      class={cx("shrink-0 items-center justify-center overflow-hidden rounded-full", avatarBox[size()], toneSurfaceClass[props.tone])}
+      testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel}
+      accessibilityElementsHidden={props.accessibilityLabel ? undefined : true}
+      role={props.accessibilityLabel ? "image" : undefined}
+    >
+      <If
+        when={props.src}
+        else={<Text class={cx("font-semibold", avatarText[size()], toneTextClass[props.tone])}>{props.initials}</Text>}
+      >
+        {(src) => (
+          <Image
+            src={src()}
+            class="w-full h-full"
+            style={{ objectFit: "cover" }}
+            testID={props.testID ? `${props.testID}:image` : undefined}
+            onError={() => props.onImageError?.()}
+          />
+        )}
+      </If>
+    </View>
+  );
+}
+
+/**
+ * One transcript entry: a narrow gutter (a picture, or a continuation's
+ * time) and the content beside it. `highlight` marks a message addressed to
+ * the signed-in user.
+ */
+export function MessageFrame(
+  props: Testable & {
+    gutter?: JSX.Element;
+    /** Small controls at the entry's top right (adding a reaction). */
+    trailing?: JSX.Element;
+    highlight?: boolean;
+    /** Follows the previous entry by the same author: tighter spacing. */
+    continued?: boolean;
+    selectable?: boolean;
+    children?: JSX.Element;
+  },
+) {
+  return (
+    <View
+      class={cx(
+        "flex-row gap-(--space-3) rounded-(--radius-sm) px-(--space-2)",
+        props.continued ? "py-px" : "pt-(--space-2) pb-px",
+        props.highlight && "bg-tone-warning",
+      )}
+      testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel}
+    >
+      <View class="w-[52px] shrink-0 items-center">{props.gutter}</View>
+      <View class="flex-1 min-w-0 flex-col gap-[2px]" selectable={props.selectable}>
+        {props.children}
+      </View>
+      <If when={props.trailing}>
+        <View class="shrink-0 items-end">{props.trailing}</View>
+      </If>
+    </View>
+  );
+}
+
+/** The author line of a message: name, markers and time on one baseline. */
+export function MessageHeader(props: Testable & { children?: JSX.Element }) {
+  return (
+    <View class="flex-row flex-wrap items-center gap-x-(--space-2) gap-y-px" testID={props.testID}>
+      {props.children}
+    </View>
+  );
+}
+
+/** An author's name in the transcript; `agent` gives the agent's tone. */
+export function AuthorName(props: Testable & { name: string; agent?: boolean }) {
+  return (
+    <Text
+      class={cx("text-(length:--text-md) font-semibold", props.agent ? "text-tone-agent-foreground" : "text-foreground")}
+      style={{ numberOfLines: 1 }}
+      testID={props.testID}
+    >
+      {props.name}
+    </Text>
+  );
+}
+
+/** A quiet marker after an author's name ("you", "agent"). */
+export function AuthorTag(props: Testable & { label: string; tone?: Tone }) {
+  return (
+    <View class={cx("rounded-full px-[6px] py-px", toneSurfaceClass[props.tone ?? "neutral"])} testID={props.testID}>
+      <Text class={cx("text-[11px] font-medium", toneTextClass[props.tone ?? "neutral"])}>{props.label}</Text>
+    </View>
+  );
+}
+
+/** A time in the transcript: short on screen, the full date, time and zone for screen readers and on hover. */
+export function Timestamp(props: Testable & { text: string; full: string; compact?: boolean }) {
+  return (
+    <Text
+      class={cx("text-muted-foreground", props.compact ? "text-[10px] pt-[3px]" : "text-(length:--text-xs)")}
+      style={{ numberOfLines: 1 }}
+      accessibilityLabel={props.full}
+      testID={props.testID}
+      tooltip={<Text class="rounded-(--radius-sm) bg-popover border border-border px-(--space-2) py-[3px] text-(length:--text-xs) text-popover-foreground">{props.full}</Text>}
+    >
+      {props.text}
+    </Text>
+  );
+}
+
+/** A line across the transcript with the day's date in the middle. */
+export function DaySeparator(props: Testable & { label: string }) {
+  return (
+    <View class="flex-row items-center gap-(--space-3) px-(--space-2) pt-(--space-3) pb-(--space-1)" testID={props.testID}>
+      <View class="flex-1 h-px bg-border" />
+      <Text class="text-(length:--text-xs) font-medium text-muted-foreground" role="header">
+        {props.label}
+      </Text>
+      <View class="flex-1 h-px bg-border" />
+    </View>
+  );
+}

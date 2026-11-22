@@ -1,5 +1,6 @@
 //! metro-runner: claims tool jobs from a Metro server and executes them
-//! against a single confined workspace directory.
+//! against a confined workspace directory (one per Space for reusable
+//! credentials).
 //!
 //! Module overview:
 //! - [`config`]: environment parsing and validation (fail closed).
@@ -8,6 +9,7 @@
 //! - [`exec`]: subprocess execution on the host or inside an opt-in docker sandbox.
 //! - [`mcp`]: minimal stdio MCP client (initialize, tools/list, tools/call).
 //! - [`tools`]: tool trait, registry and the built-in adapters.
+//! - [`spaces`]: per-Space roots under the base for reusable credentials.
 //! - [`runner`]: the claim/execute/report loop with backoff.
 
 pub mod client;
@@ -16,6 +18,7 @@ pub mod confine;
 pub mod exec;
 pub mod mcp;
 pub mod runner;
+pub mod spaces;
 pub mod tools;
 pub mod util;
 

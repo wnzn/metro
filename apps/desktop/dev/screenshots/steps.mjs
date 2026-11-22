@@ -3,11 +3,16 @@
 // and JSON-quoted into a `type` step, so it never appears in argv, logs or a
 // screenshot (screenshots are taken before it is typed or after it is gone).
 //
-//   URL=… SPACE=<space id> SHOTS=/shots TOKEN_FILE=… [EVENT_ID=…] [AGENT=…] node steps.mjs <bob|alice|alice-chat|alice-agent|invalid>
+//   URL=… SPACE=<space id> SHOTS=/shots TOKEN_FILE=… [EVENT_ID=…] [AGENT=…] [SITE=…] [FIXTURE_URL=…]
+//     node steps.mjs <bob|alice|alice-activity|alice-chat|alice-agent|alice-settings|invalid>
+//
+// Settings shots never show a token: a token just issued stays masked (the
+// steps never press Show), and API keys are never typed (the fixture
+// endpoint is keyless).
 import { readFileSync } from "node:fs";
 
 const q = JSON.stringify;
-const { URL, SPACE, SHOTS = "/shots", TOKEN_FILE, EVENT_ID, AGENT, THREAD_ID } = process.env;
+const { URL, SPACE, SHOTS = "/shots", TOKEN_FILE, EVENT_ID, AGENT, THREAD_ID, SITE, FIXTURE_URL } = process.env;
 if (!URL) throw new Error("URL is required");
 const token = () => {
   if (!TOKEN_FILE) throw new Error("TOKEN_FILE is required");
@@ -67,13 +72,38 @@ const scenarios = {
         ]
       : []),
     `await app.press("id:run-demo")`,
-    `await app.waitFor("text:/README\\\\.md/", { timeout: 30000 })`,
+    // The Demo's call and listing arrive as one collapsed "Runner activity" group (dark theme by default).
+    `await app.waitFor("text:Runner activity", { timeout: 30000 })`,
     `await app.wait(1000)`,
     shot("room-runner.png"),
     `await app.press("id:manage-space")`,
     `await app.waitFor("id:member:bob", { timeout: 10000 })`,
     `await app.wait(300)`,
     shot("space-members.png"),
+  ],
+  // One real agent turn (Rig + the runner's workspace.list): first live and
+  // collapsed while the model holds its answer, then finished and expanded.
+  "alice-activity": () => [
+    ...open,
+    ...connect(),
+    ...enterSpace(),
+    `await app.type("id:composer", "@")`,
+    `await app.waitFor("id:pick:agent", { timeout: 10000 })`,
+    `await app.press("id:pick:agent")`,
+    `await app.type("id:composer", "what is in the workspace?")`,
+    `await app.press("id:send")`,
+    `await app.waitFor("text:Metro is thinking…", { timeout: 20000 })`,
+    // Live, with the call and the runner's listing inside: the Demo's group is the other "2 steps".
+    `await app.waitUntil(() => app.count("text:2 steps") >= 2 && app.shows("text:Metro is thinking…"), { timeout: 20000 })`,
+    `await app.wait(800)`,
+    shot("agent-thinking.png"),
+    `await app.waitFor("text:/The workspace has/", { timeout: 40000 })`,
+    `await app.waitFor("label:Show details: Metro\u2019s activity, completed, 2 steps", { timeout: 10000 })`,
+    `if (app.shows("text:Metro is thinking…")) throw new Error("a finished turn still says it is thinking")`,
+    `await app.press("label:Show details: Metro\u2019s activity, completed, 2 steps")`,
+    `await app.waitFor("label:Hide details: Metro\u2019s activity, completed, 2 steps", { timeout: 5000 })`,
+    `await app.wait(800)`,
+    shot("agent-activity-expanded.png"),
   ],
   // Only with a configured model: ask the Space's agent, then look at the Chat's run controls.
   // Delegate to a child thread, then look at the Chat's run controls while it runs.
@@ -106,6 +136,72 @@ const scenarios = {
     `await app.waitFor("text:/The workspace has/", { timeout: 25000 })`,
     `await app.wait(800)`,
     shot("thread.png"),
+  ],
+  // Settings with no secret on screen: runners, model providers (with the
+  // allowlisted keyless fixture), device onboarding (token masked), appearance,
+  // and the Website Space served by the organization runner.
+  "alice-settings": () => [
+    ...open,
+    ...connect(),
+    `await app.press("id:nav-settings")`,
+    `await app.waitFor("id:runners-settings", { timeout: 10000 })`,
+    `await app.waitFor("text:Shared build runner", { timeout: 10000 })`,
+    `await app.waitFor("text:Alice workstation", { timeout: 10000 })`,
+    `await app.wait(500)`,
+    shot("settings-runners.png"),
+    `await app.press("id:nav-settings:providers")`,
+    `await app.waitFor("id:provider-picker", { timeout: 10000 })`,
+    ...(FIXTURE_URL
+      ? [
+`await app.press("id:provider-picker")`,
+          `await app.press("id:provider-picker:custom")`,
+          `await app.waitFor("id:provider-ways:custom", { timeout: 5000 })`,
+          `await app.press("id:provider:custom")`,
+          `await app.waitFor("id:server-form", { timeout: 5000 })`,
+          `await app.clear("id:provider-name")`,
+          `await app.type("id:provider-name", "Local fixture (keyless)")`,
+          `await app.press(${q(`id:provider-url:${FIXTURE_URL}`)})`,
+          `await app.press("id:provider-save-fetch")`,
+          `await app.waitFor("text:Local fixture (keyless)", { timeout: 10000 })`,
+          `await app.waitFor("text:metro-scripted-test-model", { timeout: 15000 })`,
+          `await app.press("text:metro-scripted-test-model")`,
+          `await app.waitFor("text:/now uses metro-scripted-test-model/", { timeout: 10000 })`,
+          `if (app.shows("text:Make default")) { await app.press("text:Make default"); await app.waitFor("text:/is now your default/", { timeout: 10000 }) }`,
+          `await app.wait(500)`,
+          shot("settings-providers.png"),
+`await app.press("id:provider-picker")`,
+          `await app.press("id:provider-picker:custom")`,
+          `await app.waitFor("id:provider-ways:custom", { timeout: 5000 })`,
+          `await app.press("id:provider:device-openai-compatible")`,
+          `await app.waitFor("id:device-form", { timeout: 5000 })`,
+          `await app.clear("id:provider-name")`,
+          `await app.type("id:provider-name", "Home GPU")`,
+          `await app.press("id:provider-create-device")`,
+          `await app.waitFor("id:token-reveal", { timeout: 10000 })`,
+          `await app.press("id:reveal-test-connection")`,
+          `await app.waitFor("text:/didn't answer/", { timeout: 20000 })`,
+          `await app.waitFor("text:Paired · offline", { timeout: 10000 })`,
+          `await app.scroll("id:providers-settings", -5000)`, // back to the (masked) token and the first steps
+          `await app.wait(500)`,
+          shot("settings-device-onboarding.png"),
+          `await app.press("id:hide-runner-token")`,
+        ]
+      : []),
+    `await app.press("id:nav-settings:appearance")`,
+    `await app.waitFor("id:appearance-settings", { timeout: 10000 })`,
+    `await app.wait(500)`,
+    shot("settings-appearance.png"),
+    `await app.press("id:settings-close")`,
+    ...(SITE
+      ? [
+          `await app.press(${q(`id:space:${SITE}`)})`,
+          `await app.waitFor("id:space-view", { timeout: 15000 })`,
+          `await app.press("id:manage-space")`,
+          `await app.waitFor("id:attached-runner", { timeout: 10000 })`,
+          `await app.wait(500)`,
+          shot("settings-space-runner.png"),
+        ]
+      : []),
   ],
   invalid: () => [
     ...open,

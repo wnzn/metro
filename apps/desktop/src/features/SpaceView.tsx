@@ -72,12 +72,12 @@ function RoomHeader() {
           )}
         </If>
       </Column>
-      <Badge testID="runner-state" tone={paired() ? "runner" : "neutral"} label={paired() ? "Runner paired" : "No runner paired"} />
+      <Badge testID="runner-state" tone={paired() ? "runner" : "neutral"} label={paired() ? "Runner attached" : "No runner"} />
       <Action
         testID="run-demo"
         label="Run demo"
         busyLabel="Requesting…"
-        accessibilityLabel={paired() ? "Run the deterministic runner demo (workspace.list)" : "Run demo (needs a runner paired with this Space)"}
+        accessibilityLabel={paired() ? "Run the deterministic runner demo (workspace.list)" : "Run demo (needs a runner attached to this Space)"}
         busy={demoPending()}
         disabled={!activeRoom() || !paired() || status().phase !== "online"}
         onPress={() => void runDemo()}

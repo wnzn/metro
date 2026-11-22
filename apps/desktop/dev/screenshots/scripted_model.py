@@ -9,6 +9,7 @@ Behaviour per request (non-streaming /v1/chat/completions), keyed on the
 newest user message and the tool results after it:
 - "acknowledge" and a reaction tool: react 👀, then reply METRO_REACTION_ONLY
   (the server's "reaction, no text" marker);
+- "what is in the workspace" and a listing tool: list the root, hold, summarize;
 - "delegate" and thread_create: start a child thread "workspace-audit" whose
   task is to list the workspace, then confirm;
 - a workspace listing tool and no result yet: list the workspace root;
@@ -101,8 +102,16 @@ def complete(req):
     listing = offered(tools, r"workspace[_.-]list")
 
     # The newest prompt may batch several unanswered messages: act on the last request in it.
-    wants = max(("acknowledge", "delegate"), key=lambda k: latest.rfind(k)) if ("acknowledge" in latest or "delegate" in latest) else ""
-    if wants == "acknowledge" and react:
+    intents = ("acknowledge", "delegate", "what is in the workspace")
+    wants = max(intents, key=lambda k: latest.rfind(k)) if any(k in latest for k in intents) else ""
+    if wants == "what is in the workspace" and listing:
+        # One turn that lists, holds (still live), then answers from the listing.
+        if results:
+            time.sleep(HOLD)
+            message, finish = say(summarize_listing(results[-1].strip()))
+        else:
+            message, finish = call(listing, arguments_for(listing))
+    elif wants == "acknowledge" and react:
         message, finish = say("METRO_REACTION_ONLY") if results else call(react, {"emoji": "👀"})
     elif wants == "delegate" and delegate:
         message, finish = (say("Started a thread for the workspace audit; its result will be posted here. (Scripted test model.)")
@@ -128,6 +137,23 @@ def complete(req):
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *_):
         pass
+
+    def do_GET(self):
+        # Keyless model listing, so Settings › Model providers shows a real
+        # (allowlisted, local) endpoint's list. It lists only this double.
+        if self.path.rstrip("/").endswith("/models"):
+            body, status = {"object": "list", "data": [
+                {"id": "metro-scripted-test-model", "object": "model", "owned_by": "local-fixture"},
+                {"id": "metro-scripted-test-model-small", "object": "model", "owned_by": "local-fixture"},
+            ]}, 200
+        else:
+            body, status = {"error": {"message": f"unexpected path {self.path}"}}, 404
+        data = json.dumps(body).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
 
     def do_POST(self):
         try:

@@ -23,7 +23,11 @@
 #              the agent shots so nothing calls a model.
 #
 # Writes connection.png, room-runner.png, space-members.png, connection-error.png,
-# and with a model chat-runs.png and thread.png, into OUT_DIR.
+# settings-runners.png, settings-space-runner.png, settings-appearance.png,
+# and with a model agent-thinking.png, agent-activity-expanded.png, chat-runs.png
+# and thread.png; with the scripted model also
+# settings-providers.png and settings-device-onboarding.png (its keyless
+# /v1/models is the allowlisted endpoint), into OUT_DIR.
 set -euo pipefail
 
 here="$(cd "$(dirname "$0")" && pwd)"
@@ -85,6 +89,8 @@ printf '[package]\nname = "acme"\n' >"$ws/Cargo.toml"
 # --- server ---------------------------------------------------------------
 agent=""
 model_env=()
+fixture_url=""
+openssl rand -base64 32 >"$sec/provider.key" # the provider master key (a file, never argv)
 if [ -n "${MODEL_ENV_FILE:-}" ]; then
   [ "$(stat -c %a "$MODEL_ENV_FILE")" = 600 ] || { echo "MODEL_ENV_FILE must be mode 600" >&2; exit 1; }
   while IFS= read -r line; do
@@ -96,12 +102,15 @@ elif [ "${SCRIPTED_MODEL:-1}" = 1 ]; then
   pids+=($!)
   for _ in $(seq 50); do [ -s "$tmp/model.port" ] && break; sleep 0.1; done
   [ -s "$tmp/model.port" ] || { echo "scripted model did not start" >&2; exit 1; }
-  model_env=(METRO_MODEL=metro-scripted-test-model "METRO_MODEL_BASE_URL=http://127.0.0.1:$(cat "$tmp/model.port")/v1" METRO_MODEL_API_KEY=local-not-a-real-key)
+  fixture_url="http://127.0.0.1:$(cat "$tmp/model.port")/v1"
+  model_env=(METRO_MODEL=metro-scripted-test-model "METRO_MODEL_BASE_URL=$fixture_url" METRO_MODEL_API_KEY=local-not-a-real-key
+    "METRO_PROVIDER_ALLOWED_BASE_URLS=[\"$fixture_url\"]")
   agent=scripted
 fi
 env -i PATH=/usr/bin:/bin HOME="$tmp" \
   METRO_BIND="127.0.0.1:$port" METRO_DB="$tmp/metro.sqlite" \
   METRO_DEV_USERS="$(cat "$sec/dev-users.json")" "${model_env[@]}" \
+  METRO_ORG_ADMINS='["alice"]' METRO_PROVIDER_KEY_FILE="$sec/provider.key" \
   "$bin/metro-server" >"$tmp/server.log" 2>&1 &
 pids+=($!)
 for _ in $(seq 150); do curl -fs -o /dev/null "$url/healthz" && break; sleep 0.1; done
@@ -118,13 +127,28 @@ env -i PATH=/usr/bin:/bin HOME="$tmp" METRO_RUNNER_TOKEN="$(cat "$sec/runner")" 
   "$bin/metro-runner" >"$tmp/runner.log" 2>&1 &
 pids+=($!)
 
+# --- Settings: two named runners, and a Space the organization runner serves
+field() { node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{let v=JSON.parse(s);for(const k of process.argv[1].split("."))v=v[k];process.stdout.write(String(v))})' "$1"; }
+api alice POST /v1/runners '{"name":"Shared build runner","visibility":"organization"}' >"$sec/org-runner.json"
+field token <"$sec/org-runner.json" >"$sec/org-runner"
+org_runner="$(field runner.id <"$sec/org-runner.json")"
+api alice POST /v1/runners '{"name":"Alice workstation","visibility":"personal"}' | field token >"$sec/alice-runner"
+rm -f "$sec/org-runner.json"
+site_sid="$(api alice POST /v1/spaces '{"name":"Website"}' | field id)"
+api alice PUT "/v1/spaces/$site_sid/runner" "{\"runner_id\":\"$org_runner\"}" >/dev/null
+mkdir -p "$tmp/registered"
+env -i PATH=/usr/bin:/bin HOME="$tmp" METRO_RUNNER_TOKEN="$(cat "$sec/org-runner")" \
+  METRO_SERVER_URL="$url" METRO_WORKSPACE="$tmp/registered" \
+  "$bin/metro-runner" >"$tmp/registered-runner.log" 2>&1 &
+pids+=($!)
+
 # --- the app, natively, in the container ----------------------------------
 run_app() { # stdin: steps
   docker run --rm -i --init --network host --user "$(id -u):$(id -g)" -e HOME=/tmp \
     -v "$NSH_DIST":/opt/nsh:ro -v "$app":/app -v "$out":/shots -w /app "$image" \
     sh /app/dev/screenshots/with-display.sh /opt/nsh/bin/nsh test App.tsx --target linux
 }
-steps() { URL="$url" SPACE="$sid" SHOTS=/shots AGENT="$agent" node "$here/steps.mjs" "$@"; }
+steps() { URL="$url" SPACE="$sid" SITE="$site_sid" FIXTURE_URL="$fixture_url" SHOTS=/shots AGENT="$agent" node "$here/steps.mjs" "$@"; }
 
 echo "== Bob mentions Alice from his desktop app"
 TOKEN_FILE="$sec/bob" steps bob | run_app
@@ -136,6 +160,8 @@ echo "== Alice: connect screen, reaction, message, Demo, members"
 TOKEN_FILE="$sec/alice" EVENT_ID="$event_id" steps alice | run_app
 
 if [ -n "$agent" ]; then
+  echo "== Alice asks @agent about the workspace: one turn, live then expanded ($agent model)"
+  TOKEN_FILE="$sec/alice" steps alice-activity | run_app
   echo "== Alice asks @agent, then the Chat's run controls ($agent model)"
   TOKEN_FILE="$sec/alice" steps alice-chat | run_app
   sleep "${MODEL_HOLD_SECONDS:-15}" # let the child run finish
@@ -146,11 +172,19 @@ if [ -n "$agent" ]; then
   TOKEN_FILE="$sec/alice" THREAD_ID="$thread_id" steps alice-agent | run_app
 fi
 
+echo "== Alice: Settings (runners, model providers, device onboarding, appearance) and a Space's runner"
+TOKEN_FILE="$sec/alice" steps alice-settings | run_app
+# The connection the steps created exists on the server, its key-less listing came from the fixture.
+if [ -n "$fixture_url" ]; then
+  api alice GET /v1/providers | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const c=JSON.parse(s).connections;if(!c.some(x=>x.model==="metro-scripted-test-model"&&x.is_default))process.exit(1)})' ||
+    { echo "the provider connection was not saved with the listed model" >&2; exit 1; }
+fi
+
 echo "== An invalid token is rejected"
 steps invalid | run_app
 
 # Tokens only ever lived in $sec; make sure none reached the output or the app.
-for f in "$sec/alice" "$sec/bob" "$sec/runner"; do
+for f in "$sec/alice" "$sec/bob" "$sec/runner" "$sec/org-runner" "$sec/alice-runner" "$sec/provider.key"; do
   if grep -rqF -- "$(cat "$f")" "$out" "$app" 2>/dev/null; then
     echo "a token was found under $out or $app; refusing to keep the output" >&2
     exit 1

@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value};
 
-use crate::config::Config;
+use crate::config::{Config, Credential, Sandbox};
 use crate::confine::Workspace;
 use crate::exec;
 use crate::mcp::{McpSession, render_call_result};
@@ -64,14 +64,33 @@ impl Registry {
         self.tools.keys().copied().collect()
     }
 
-    /// The standard tool set for a configuration.
+    /// The standard tool set for a dedicated (legacy) credential: every tool
+    /// works on `ws`, and check/MCP run under the configured sandbox (host
+    /// execution stays the operator's opt-in, as before).
     pub fn standard(cfg: Arc<Config>, ws: Arc<Workspace>) -> Self {
+        Self::build(cfg, ws, SubprocessPolicy::Allowed)
+    }
+
+    /// The tool set for one job of a reusable credential, bound to that
+    /// Space's root only. Built fresh per job so nothing carries over from a
+    /// previous Space.
+    pub fn for_space(cfg: Arc<Config>, ws: Arc<Workspace>) -> Self {
+        let policy = SubprocessPolicy::for_config(&cfg);
+        Self::build(cfg, ws, policy)
+    }
+
+    fn build(cfg: Arc<Config>, ws: Arc<Workspace>, policy: SubprocessPolicy) -> Self {
+        let ctx = Arc::new(ExecCtx {
+            cfg,
+            ws: ws.clone(),
+            policy,
+        });
         let mut r = Registry::new();
         r.register(Box::new(ListTool { ws: ws.clone() }));
         r.register(Box::new(ReadTool { ws }));
-        r.register(Box::new(CheckTool { cfg: cfg.clone() }));
-        r.register(Box::new(McpListTool { cfg: cfg.clone() }));
-        r.register(Box::new(McpCallTool { cfg }));
+        r.register(Box::new(CheckTool { ctx: ctx.clone() }));
+        r.register(Box::new(McpListTool { ctx: ctx.clone() }));
+        r.register(Box::new(McpCallTool { ctx }));
         r
     }
 
@@ -92,6 +111,62 @@ impl Registry {
             ok: r.ok,
             output: crate::util::truncate_utf8(r.output, MAX_OUTPUT_BYTES),
         }
+    }
+}
+
+/// Whether check/MCP subprocesses may run for a job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubprocessPolicy {
+    Allowed,
+    Disabled(String),
+}
+
+/// Why check/MCP are off for a reusable credential, if they are.
+///
+/// Trust decision: a reusable runner serves several Spaces from one host. A
+/// host subprocess (`METRO_SANDBOX=none`) runs as the runner user and could
+/// read sibling Space roots, so per-Space isolation would rest on the tool
+/// behaving. Reusable credentials therefore run check/MCP only inside the
+/// docker sandbox, where the container sees just that Space's root (read-only,
+/// no network, empty environment). The built-in file tools work in any mode.
+pub const REUSABLE_HOST_EXEC_DISABLED: &str = "is disabled: this runner uses a reusable \
+     (multi-Space) credential with METRO_SANDBOX=none, and a host subprocess could read other \
+     Spaces' workspaces. Set METRO_SANDBOX=docker with a pinned METRO_SANDBOX_IMAGE to enable it, \
+     or use a dedicated runner credential for this Space";
+
+impl SubprocessPolicy {
+    pub fn for_config(cfg: &Config) -> Self {
+        match (cfg.credential, &cfg.sandbox) {
+            (Credential::Dedicated, _) | (Credential::Reusable, Sandbox::Docker(_)) => {
+                SubprocessPolicy::Allowed
+            }
+            (Credential::Reusable, Sandbox::None) => {
+                SubprocessPolicy::Disabled(REUSABLE_HOST_EXEC_DISABLED.into())
+            }
+        }
+    }
+}
+
+/// What check/MCP need: config, the job's workspace root and the policy.
+pub struct ExecCtx {
+    pub cfg: Arc<Config>,
+    pub ws: Arc<Workspace>,
+    pub policy: SubprocessPolicy,
+}
+
+impl ExecCtx {
+    /// The directory to run in / bind-mount, after re-checking that its path
+    /// still names the root we opened.
+    fn workdir(&self, tool: &str) -> Result<&std::path::Path, ToolResult> {
+        if let SubprocessPolicy::Disabled(why) = &self.policy {
+            return Err(ToolResult::err(format!("{tool} {why}")));
+        }
+        self.ws.verify_root_path().map_err(|e| {
+            ToolResult::err(format!(
+                "{tool}: workspace root changed or is not a plain directory ({e}); refusing to run"
+            ))
+        })?;
+        Ok(self.ws.root_path())
     }
 }
 
@@ -170,7 +245,7 @@ impl Tool for ReadTool {
 }
 
 pub struct CheckTool {
-    pub cfg: Arc<Config>,
+    pub ctx: Arc<ExecCtx>,
 }
 
 impl Tool for CheckTool {
@@ -181,16 +256,21 @@ impl Tool for CheckTool {
         if let Err(e) = parse_args::<NoArgs>(args) {
             return e;
         }
-        let Some(argv) = &self.cfg.check_argv else {
+        let cfg = &self.ctx.cfg;
+        let Some(argv) = &cfg.check_argv else {
             return ToolResult::err(
                 "workspace.check is not configured on this runner (METRO_CHECK_ARGV unset)",
             );
         };
-        let p = match exec::prepare(argv, &self.cfg.workspace, &self.cfg.sandbox, false) {
+        let dir = match self.ctx.workdir("workspace.check") {
+            Ok(d) => d,
+            Err(e) => return e,
+        };
+        let p = match exec::prepare(argv, dir, &cfg.sandbox, false) {
             Ok(p) => p,
             Err(e) => return ToolResult::err(e.to_string()),
         };
-        match exec::run_bounded(p, self.cfg.check_timeout) {
+        match exec::run_bounded(p, cfg.check_timeout) {
             Ok(c) => {
                 let code = match c.status.code() {
                     Some(n) => n.to_string(),
@@ -225,18 +305,19 @@ fn section(out: &mut String, name: &str, data: &[u8], total: u64) {
     }
 }
 
-fn mcp_session(cfg: &Config) -> Result<McpSession, ToolResult> {
+fn mcp_session(ctx: &ExecCtx, tool: &str) -> Result<McpSession, ToolResult> {
+    let cfg = &ctx.cfg;
     let Some(argv) = &cfg.mcp_argv else {
         return Err(ToolResult::err(
             "MCP is not configured on this runner (METRO_MCP_ARGV unset)",
         ));
     };
-    McpSession::connect(argv, &cfg.workspace, &cfg.sandbox, cfg.mcp_timeout)
-        .map_err(ToolResult::err)
+    let dir = ctx.workdir(tool)?;
+    McpSession::connect(argv, dir, &cfg.sandbox, cfg.mcp_timeout).map_err(ToolResult::err)
 }
 
 pub struct McpListTool {
-    pub cfg: Arc<Config>,
+    pub ctx: Arc<ExecCtx>,
 }
 
 impl Tool for McpListTool {
@@ -247,7 +328,7 @@ impl Tool for McpListTool {
         if let Err(e) = parse_args::<NoArgs>(args) {
             return e;
         }
-        let mut s = match mcp_session(&self.cfg) {
+        let mut s = match mcp_session(&self.ctx, "workspace.mcp_list") {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -261,7 +342,7 @@ impl Tool for McpListTool {
 }
 
 pub struct McpCallTool {
-    pub cfg: Arc<Config>,
+    pub ctx: Arc<ExecCtx>,
 }
 
 impl Tool for McpCallTool {
@@ -280,7 +361,7 @@ impl Tool for McpCallTool {
         if !arguments.is_object() {
             return ToolResult::err("invalid arguments: `arguments` must be an object");
         }
-        let mut s = match mcp_session(&self.cfg) {
+        let mut s = match mcp_session(&self.ctx, "workspace.mcp") {
             Ok(s) => s,
             Err(e) => return e,
         };

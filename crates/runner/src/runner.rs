@@ -7,18 +7,59 @@
 //! have had side effects (for example from the check or an MCP tool) without
 //! the server ever receiving a result for it.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::client::{Claim, ServerClient};
+use crate::client::{Claim, Job, ServerClient, valid_space_id};
+use crate::config::Config;
+use crate::spaces::SpaceRoots;
 use crate::tools::{Registry, ToolResult};
 use crate::util::{Backoff, sleep_interruptible};
 
 pub const RESULT_MAX_ATTEMPTS: u32 = 8;
 pub const RESULT_MAX_ELAPSED: Duration = Duration::from_secs(300);
 
+/// How a claimed job finds its tools.
+pub enum Dispatch {
+    /// Dedicated (legacy) credential: one registry over `METRO_WORKSPACE`.
+    Dedicated(Registry),
+    /// Reusable credential: a fresh registry per job over
+    /// `spaces/<space_id>/`. There is no registry over the base.
+    PerSpace {
+        cfg: Arc<Config>,
+        roots: Arc<SpaceRoots>,
+    },
+}
+
+impl Dispatch {
+    fn run(&self, job: &Job) -> ToolResult {
+        match self {
+            Dispatch::Dedicated(r) => r.dispatch(&job.tool, &job.arguments),
+            Dispatch::PerSpace { cfg, roots } => {
+                // parse_claim_for already refused these; checked again so no
+                // code path can reach the base without a valid Space id.
+                let Some(sid) = job.space_id.as_deref().filter(|s| valid_space_id(s)) else {
+                    return ToolResult::err(
+                        "refusing job: no valid space_id for a reusable runner credential",
+                    );
+                };
+                let ws = match roots.open_space(sid) {
+                    Ok(w) => w,
+                    Err(e) => {
+                        return ToolResult::err(format!(
+                            "refusing job: cannot open the workspace for Space {sid}: {e}"
+                        ));
+                    }
+                };
+                Registry::for_space(cfg.clone(), Arc::new(ws)).dispatch(&job.tool, &job.arguments)
+            }
+        }
+    }
+}
+
 pub struct Runner {
     pub client: ServerClient,
-    pub registry: Registry,
+    pub dispatch: Dispatch,
     pub poll_interval: Duration,
     pub error_backoff: Backoff,
     pub result_backoff: Backoff,
@@ -37,10 +78,29 @@ pub enum Step {
 }
 
 impl Runner {
+    /// Dedicated (legacy) runner over one registry.
     pub fn new(client: ServerClient, registry: Registry, poll_interval: Duration) -> Self {
+        Self::with_dispatch(client, Dispatch::Dedicated(registry), poll_interval)
+    }
+
+    /// Reusable runner: each job runs in its own Space's root under `roots`.
+    pub fn per_space(
+        client: ServerClient,
+        cfg: Arc<Config>,
+        roots: Arc<SpaceRoots>,
+        poll_interval: Duration,
+    ) -> Self {
+        Self::with_dispatch(client, Dispatch::PerSpace { cfg, roots }, poll_interval)
+    }
+
+    pub fn with_dispatch(
+        client: ServerClient,
+        dispatch: Dispatch,
+        poll_interval: Duration,
+    ) -> Self {
         Runner {
             client,
-            registry,
+            dispatch,
             poll_interval,
             error_backoff: Backoff::new(Duration::from_millis(500), Duration::from_secs(60)),
             result_backoff: Backoff::new(Duration::from_millis(250), Duration::from_secs(30)),
@@ -72,9 +132,14 @@ impl Runner {
             }
             Ok(Claim::Job(job)) => {
                 self.error_backoff.reset();
-                eprintln!("metro-runner: job {} tool {}", job.id, job.tool);
+                match &job.space_id {
+                    Some(sid) if matches!(self.dispatch, Dispatch::PerSpace { .. }) => {
+                        eprintln!("metro-runner: job {} tool {} space {sid}", job.id, job.tool)
+                    }
+                    _ => eprintln!("metro-runner: job {} tool {}", job.id, job.tool),
+                }
                 let started = Instant::now();
-                let r = self.registry.dispatch(&job.tool, &job.arguments);
+                let r = self.dispatch.run(&job);
                 eprintln!(
                     "metro-runner: job {} finished ok={} in {:.1}s ({} bytes)",
                     job.id,

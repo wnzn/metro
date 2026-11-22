@@ -1,0 +1,116 @@
+[
+  {
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "You are the Metro agent.",
+            "type": "text"
+          }
+        ],
+        "role": "system"
+      },
+      {
+        "content": "earlier",
+        "role": "user"
+      },
+      {
+        "content": "earlier reply",
+        "role": "assistant"
+      },
+      {
+        "content": "metro-context: {}\nread the readme",
+        "role": "user"
+      }
+    ],
+    "model": "m1",
+    "tools": [
+      {
+        "function": {
+          "description": "Read a file.",
+          "name": "workspace_read",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "description": "File relative to the workspace root.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  },
+  {
+    "messages": [
+      {
+        "content": [
+          {
+            "text": "You are the Metro agent.",
+            "type": "text"
+          }
+        ],
+        "role": "system"
+      },
+      {
+        "content": "earlier",
+        "role": "user"
+      },
+      {
+        "content": "earlier reply",
+        "role": "assistant"
+      },
+      {
+        "content": "metro-context: {}\nread the readme",
+        "role": "user"
+      },
+      {
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"path\":\"README.md\"}",
+              "name": "workspace_read"
+            },
+            "id": "call_abc",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "# Metro\nhello",
+        "role": "tool",
+        "tool_call_id": "call_abc"
+      }
+    ],
+    "model": "m1",
+    "tools": [
+      {
+        "function": {
+          "description": "Read a file.",
+          "name": "workspace_read",
+          "parameters": {
+            "additionalProperties": false,
+            "properties": {
+              "path": {
+                "description": "File relative to the workspace root.",
+                "type": "string"
+              }
+            },
+            "required": [
+              "path"
+            ],
+            "type": "object"
+          }
+        },
+        "type": "function"
+      }
+    ]
+  }
+]

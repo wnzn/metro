@@ -1,0 +1,694 @@
+name: Release artifacts
+
+# Reusable workflow, called only from ci.yml:
+#   - on pull requests / main with `release: false` (build + package smoke, nothing leaves the run);
+#   - on `v*` tags, after the rust, desktop and containers gates, with `release: true`.
+# It has no triggers of its own, so nothing here runs on its own and nothing is
+# published unless a maintainer pushes a tag.
+
+on:
+  workflow_call:
+    inputs:
+      release:
+        description: 'Tag build (push GHCR images, create a DRAFT GitHub release) when true; build and smoke only when false.'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  NSH_VERSION: v0.6.1
+  # Official longbridge/nsh v0.6.1 release assets (digests from the GitHub release).
+  NSH_LINUX_SHA256: 9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070
+  NSH_WINDOWS_SHA256: 7952c84b165e13515bd2ad2787ef22622e49ce88cb8d877825e40b40f3aff4be
+  RUSTUP_TOOLCHAIN: 1.98.1
+
+jobs:
+  meta:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - id: v
+        env:
+          RELEASE: ${{ inputs.release }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          if [ "$RELEASE" = true ]; then
+            case "$REF_NAME" in
+              v[0-9]*.[0-9]*.[0-9]*) ;;
+              *) echo "tag $REF_NAME is not vMAJOR.MINOR.PATCH[-prerelease]" >&2; exit 1 ;;
+            esac
+            version="${REF_NAME#v}"
+            printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+              || { echo "tag $REF_NAME is not valid semver" >&2; exit 1; }
+            base="${version%%-*}"
+            app="$(python3 -I -c 'import json;print(json.load(open("apps/desktop/nsh.json"))["version"])')"
+            [ "$base" = "$app" ] || { echo "tag $REF_NAME does not match apps/desktop/nsh.json version $app" >&2; exit 1; }
+            case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+          else
+            # Same base version as the app manifest, so PR packages exercise the real manifest
+            # version (0.2.0 now) instead of an unrelated placeholder.
+            version="$(python3 -I -c 'import json;print(json.load(open("apps/desktop/nsh.json"))["version"])')-ci"
+            prerelease=true
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+  # Native Linux x64 runner. Built in the same Debian bookworm toolchain image
+  # as the GHCR runner image, so it needs glibc <= 2.36. Windows has no runner
+  # build: confinement uses Linux openat2.
+  runner-linux:
+    needs: meta
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Build metro-runner in the bookworm toolchain image
+        run: |
+          set -eu
+          docker build --target build -t metro-build:release .
+          cid="$(docker create metro-build:release)"
+          trap 'docker rm "$cid" >/dev/null' EXIT
+          mkdir -p "$RUNNER_TEMP/runner-bin"
+          docker cp "$cid:/build/target/release/metro-runner" "$RUNNER_TEMP/runner-bin/metro-runner"
+      - name: Binary is x86-64 ELF and needs glibc 2.36 or older
+        run: |
+          set -eu
+          bin="$RUNNER_TEMP/runner-bin/metro-runner"
+          file "$bin" | grep -q 'ELF 64-bit.*x86-64'
+          newest="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -1)"
+          echo "newest glibc symbol: $newest"
+          [ "$(printf '%s\nGLIBC_2.36\n' "$newest" | sort -V | tail -1)" = GLIBC_2.36 ]
+      - name: Third-party notices for the runner (Cargo sources fetched, locked)
+        run: |
+          set -eu
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          cargo fetch --locked --target x86_64-unknown-linux-gnu
+          python3 -I packaging/cargo-notices.py --target x86_64-unknown-linux-gnu \
+            --package metro-runner --out "$RUNNER_TEMP/notices-runner.txt"
+      - name: Package
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          python3 -I packaging/package.py runner --version "$VERSION" \
+            --binary "$RUNNER_TEMP/runner-bin/metro-runner" \
+            --notices "$RUNNER_TEMP/notices-runner.txt" --out-dir dist
+          ls -l dist
+      - name: Archive has the confirmed name, matches its checksum and extracts (fresh directory)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          name="Metro-runner-$VERSION-linux-x64.tar.gz"
+          test "$(ls dist | sort | tr '\n' ' ')" = "$name $name.sha256 " \
+            || { echo "unexpected dist contents" >&2; ls dist; exit 1; }
+          (cd dist && sha256sum --check "$name.sha256")
+          out="$(mktemp -d "$RUNNER_TEMP/runner-extract.XXXXXX")"
+          tar -xzf "dist/$name" -C "$out"
+          exe="$out/Metro-runner-$VERSION-linux-x64/metro-runner"
+          test -x "$exe"
+          # Starting without configuration must fail with a message, never hang or crash.
+          set +e
+          timeout 10 env -i PATH=/usr/bin:/bin "$exe" >"$out/run.log" 2>&1
+          code=$?
+          set -e
+          echo "exit code without configuration: $code"
+          [ "$code" -ne 124 ] && [ "$code" -lt 128 ]
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-runner-linux-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # Packages the TSX app once with the official Linux NSH CLI. The Windows
+  # target is cross-packaged with the pinned, checksum-verified Windows NSH
+  # distribution as NSH_RUNTIME.
+  ui:
+    needs: meta
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install pinned NSH (Linux CLI + Windows distribution)
+        run: |
+          set -eu
+          base="https://github.com/longbridge/nsh/releases/download/$NSH_VERSION"
+          for pair in "nsh-linux-x86_64.tar.gz:$NSH_LINUX_SHA256" "nsh-windows-x86_64.zip:$NSH_WINDOWS_SHA256"; do
+            name="${pair%%:*}"
+            curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/$name" "$base/$name"
+            printf '%s  %s\n' "${pair##*:}" "$RUNNER_TEMP/$name" | sha256sum --check -
+          done
+          mkdir -p "$RUNNER_TEMP/nsh-linux" "$RUNNER_TEMP/nsh-windows"
+          tar -xzf "$RUNNER_TEMP/nsh-linux-x86_64.tar.gz" -C "$RUNNER_TEMP/nsh-linux"
+          unzip -q "$RUNNER_TEMP/nsh-windows-x86_64.zip" -d "$RUNNER_TEMP/nsh-windows"
+          printf '%s\n' "$RUNNER_TEMP/nsh-linux/nsh/bin" >> "$GITHUB_PATH"
+      - name: nsh package (windows and linux)
+        working-directory: apps/desktop
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          NSH_RUNTIME="$RUNNER_TEMP/nsh-windows/nsh/runtime" \
+            nsh package App.tsx --target windows --app-version "${VERSION#v}" --out "$RUNNER_TEMP/out-windows"
+          nsh package App.tsx --target linux --app-version "${VERSION#v}" --out "$RUNNER_TEMP/out-linux"
+          cd "$GITHUB_WORKSPACE"
+          for target in windows linux; do
+            # nsh/capabilities.json is the manifest the packaged host actually reads.
+            python3 -I - "$RUNNER_TEMP/out-$target/Metro/nsh" "${VERSION#v}" <<'PY'
+          import json, sys
+          nsh, version = sys.argv[1:]
+          app = json.load(open(nsh + "/app.json"))
+          cap = json.load(open(nsh + "/capabilities.json"))
+          src = json.load(open("apps/desktop/nsh.json"))["capabilities"]
+          assert app["version"] == version, app["version"]
+          assert cap["process"]["env"] == src["process"]["env"], cap["process"]
+          assert {"METRO_DESKTOP_BRIDGE_URL", "METRO_DESKTOP_BRIDGE_TOKEN"} <= set(cap["process"]["env"])
+          # NSH expands the manifest with defaults, so compare after normalizing the source the same way.
+          want = json.loads(json.dumps(src))
+          want.setdefault("network", {}).setdefault("http", [])
+          want.setdefault("process", {}).setdefault("execute", [])
+          want["process"].setdefault("exit", False)
+          assert cap == want, "packaged capabilities differ from apps/desktop/nsh.json after normalization"
+          # Stock NSH writes `"schemes": []` even when unused; only a non-empty registration is a problem.
+          assert not any(app.get(k) for k in ("singleInstance", "schemes", "fileTypes")), "would start the UI without the launcher"
+          PY
+          done
+          test -f "$RUNNER_TEMP/out-windows/Metro/Metro.exe"
+          test -f "$RUNNER_TEMP/out-windows/Metro/nsh/bundle.nshc"
+          test -f "$RUNNER_TEMP/out-linux/Metro/Metro"
+          test -f "$RUNNER_TEMP/out-linux/Metro/nsh/bundle.nshc"
+          file "$RUNNER_TEMP/out-windows/Metro/Metro.exe" | grep -q 'PE32+.*x86-64'
+      - name: Stage ui and NSH root per target
+        run: |
+          set -eu
+          for target in windows linux; do
+            stage="$RUNNER_TEMP/stage-$target"
+            mkdir -p "$stage"
+            cp -r "$RUNNER_TEMP/out-$target/Metro" "$stage/ui"
+            cp -r "$RUNNER_TEMP/nsh-$target/nsh" "$stage/nsh-root"
+            rm -rf "$stage/nsh-root/bin"
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ui-windows-x64
+          path: ${{ runner.temp }}/stage-windows
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ui-linux-x64
+          path: ${{ runner.temp }}/stage-linux
+          if-no-files-found: error
+          retention-days: 14
+
+  # Native Windows x64: metro-desktop (with the connector linked in) and metro-server
+  # are compiled on a Windows runner (MSVC), never cross-compiled. No runner here.
+  desktop-windows:
+    needs: [meta, ui]
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-windows-x64
+          path: ${{ runner.temp }}/stage
+      - name: Toolchain, locked fetch and native tests of the launcher
+        run: |
+          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+          cargo fetch --locked --target x86_64-pc-windows-msvc
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          python --version
+          python -I -c "import sys; assert sys.version_info >= (3, 11), sys.version"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release -p metro-desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Build metro-desktop and metro-server (native, locked)
+        run: |
+          cargo build --locked --release --target x86_64-pc-windows-msvc --bin metro-desktop --bin metro-server
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($f in 'metro-desktop.exe', 'metro-server.exe') {
+            if (-not (Test-Path "target\x86_64-pc-windows-msvc\release\$f")) { throw "missing $f" }
+          }
+      - name: Third-party notices
+        run: |
+          python -I packaging/cargo-notices.py --target x86_64-pc-windows-msvc `
+            --package metro-desktop --package metro-server --out "$env:RUNNER_TEMP\notices-desktop.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Package
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $rel = 'target\x86_64-pc-windows-msvc\release'
+          python -I packaging/package.py desktop --target windows-x64 --version $env:VERSION `
+            --launcher "$rel\metro-desktop.exe" --server "$rel\metro-server.exe" `
+            --ui-dir "$env:RUNNER_TEMP\stage\ui" --nsh-root "$env:RUNNER_TEMP\stage\nsh-root" `
+            --notices "$env:RUNNER_TEMP\notices-desktop.txt" --out-dir dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          Get-ChildItem dist | Format-Table Name, Length
+      - name: Archive has the confirmed name, matches its checksum and extracts (fresh directory)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          $name = "Metro-$env:VERSION-windows-x64.zip"
+          $names = (Get-ChildItem dist -File | ForEach-Object Name | Sort-Object) -join ' '
+          if ($names -ne "$name $name.sha256") { throw "unexpected dist contents: $names" }
+          $want = ((Get-Content "dist\$name.sha256" -Raw) -split '\s+')[0].ToLower()
+          $got = (Get-FileHash "dist\$name" -Algorithm SHA256).Hash.ToLower()
+          if ($want -ne $got) { throw "checksum mismatch: $want vs $got" }
+          $dest = Join-Path $env:RUNNER_TEMP 'desktop-extract'
+          New-Item -ItemType Directory $dest | Out-Null
+          Expand-Archive "dist\$name" -DestinationPath $dest
+          $root = Join-Path $dest "Metro-$env:VERSION-windows-x64"
+          foreach ($f in 'Metro.exe', 'metro-server.exe', 'ui\Metro.exe', 'ui\nsh\bundle.nshc', 'ui\nsh\app.json', 'ui\nsh\capabilities.json') {
+            if (-not (Test-Path (Join-Path $root $f))) { throw "package is missing $f" }
+          }
+          # No standalone runner: it is Linux-only (openat2 confinement).
+          if (Get-ChildItem $dest -Recurse -File | Where-Object { $_.Name -like 'metro-runner*' }) {
+            throw 'the Windows desktop package must not contain the standalone runner'
+          }
+          "METRO_ROOT=$root" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: The packaged app uses the real capability manifest
+        run: |
+          @'
+          import json, sys
+          nsh, version = sys.argv[1:]
+          app = json.load(open(nsh + "/app.json"))
+          cap = json.load(open(nsh + "/capabilities.json"))
+          src = json.load(open("apps/desktop/nsh.json"))["capabilities"]
+          assert app["version"] == version, app["version"]
+          assert cap["process"]["env"] == src["process"]["env"], cap["process"]
+          # NSH expands the manifest with defaults, so compare after normalizing the source the same way.
+          want = json.loads(json.dumps(src))
+          want.setdefault("network", {}).setdefault("http", [])
+          want.setdefault("process", {}).setdefault("execute", [])
+          want["process"].setdefault("exit", False)
+          assert cap == want, "packaged capabilities differ from apps/desktop/nsh.json after normalization"
+          '@ | python -I - "$env:METRO_ROOT\ui\nsh" $env:VERSION
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+      - name: Packaged metro-server runs natively on Windows (documented env config, loopback)
+        run: |
+          $work = Join-Path $env:RUNNER_TEMP 'server-run'
+          New-Item -ItemType Directory $work | Out-Null
+          $port = 18787
+          $env:METRO_BIND = "127.0.0.1:$port"
+          $env:METRO_DB = Join-Path $work 'metro.sqlite3'
+          # Random throwaway dev token, never printed; the server refuses to start without an auth mode.
+          $bytes = New-Object byte[] 24
+          [System.Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+          $env:METRO_DEV_USERS = '{"ci":"' + (($bytes | ForEach-Object { $_.ToString('x2') }) -join '') + '"}'
+          $log = Join-Path $work 'server.log'
+          $p = Start-Process -FilePath "$env:METRO_ROOT\metro-server.exe" -WorkingDirectory $work -PassThru `
+            -RedirectStandardOutput $log -RedirectStandardError "$log.err"
+          try {
+            $ok = $false
+            for ($i = 0; $i -lt 30 -and -not $ok; $i++) {
+              Start-Sleep -Seconds 1
+              if ($p.HasExited) { throw "metro-server exited early with code $($p.ExitCode): $(Get-Content "$log.err" -Raw)" }
+              try { $ok = (Invoke-RestMethod "http://127.0.0.1:$port/healthz" -TimeoutSec 2) -ne $null } catch { }
+            }
+            if (-not $ok) { throw 'metro-server did not answer /healthz within 30 s' }
+          } finally { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
+      - name: Open, use locally (through the UI), close and reopen (restores local mode) on native Windows
+        run: |
+          # Throwaway absolute desktop home (supported by the launcher for tests) so nothing touches the
+          # runner's profile and the second launch is a true reopen. The bridge token is never visible:
+          # the UI itself calls POST /v1/local-workspace/open, driven by Windows UI Automation.
+          $work = Join-Path $env:RUNNER_TEMP 'desktop-run'
+          New-Item -ItemType Directory $work | Out-Null
+          $env:METRO_DESKTOP_HOME = Join-Path $work 'home'
+          New-Item -ItemType Directory $env:METRO_DESKTOP_HOME | Out-Null
+          New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\shot" | Out-Null
+          Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms, System.Drawing
+          function Find-Window {
+            Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -eq 'Metro' } | Select-Object -First 1
+          }
+          function Shot($name) {
+            try {
+              $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
+              $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
+              [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+              $bmp.Save("$env:RUNNER_TEMP\shot\$name.png")
+            } catch { Write-Host "screenshot skipped: $_" }
+          }
+          $installedServer = (Resolve-Path "$env:METRO_ROOT\metro-server.exe").Path
+          # Only the server that the launcher we started runs from the installed path counts.
+          # Any other metro-server (stale, external, a different path or parent) is never accepted.
+          function Get-OwnServer($launcherPid) {
+            Get-CimInstance Win32_Process -Filter "Name='metro-server.exe'" |
+              Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -ieq $installedServer) -and $_.ParentProcessId -eq $launcherPid } |
+              Select-Object -First 1
+          }
+          function Test-LocalHealthy($server) {
+            $listeners = Get-NetTCPConnection -State Listen -OwningProcess $server.ProcessId -ErrorAction SilentlyContinue
+            if (-not $listeners) { return $false }
+            if ($listeners | Where-Object { $_.LocalAddress -notin '127.0.0.1', '::1' }) {
+              throw 'the hosted metro-server listens beyond loopback'
+            }
+            $port = ($listeners | Where-Object { $_.LocalAddress -eq '127.0.0.1' } | Select-Object -First 1).LocalPort
+            if (-not $port) { return $false }
+            try { return $null -ne (Invoke-RestMethod "http://127.0.0.1:$port/healthz" -TimeoutSec 2) } catch { return $false }
+          }
+          function Wait-Healthy($launcherPid, $seconds) {
+            for ($i = 0; $i -lt $seconds; $i++) {
+              $server = Get-OwnServer $launcherPid
+              if ($server -and (Test-LocalHealthy $server)) { return $server }
+              Start-Sleep -Seconds 1
+            }
+            return $null
+          }
+          foreach ($launch in 1, 2) {
+            if (Get-Process -Name 'metro-server' -ErrorAction SilentlyContinue) {
+              throw "launch ${launch}: a metro-server was already running before launch; refusing to accept it"
+            }
+            $proc = Start-Process -FilePath "$env:METRO_ROOT\Metro.exe" -WorkingDirectory $work -PassThru
+            $window = $null
+            for ($i = 0; $i -lt 60 -and -not $window; $i++) {
+              Start-Sleep -Seconds 1
+              if ($proc.HasExited) { throw "launch ${launch}: launcher exited early with code $($proc.ExitCode)" }
+              $window = Find-Window
+            }
+            if (-not $window) { throw "launch ${launch}: no window titled Metro within 60 s" }
+            Start-Sleep -Seconds 5
+            Shot "desktop-windows-$launch-start"
+            $server = $null
+            $how = $null
+            if ($launch -eq 2) {
+              # The desktop restores local mode from its saved preference: our own bundled server
+              # should come up and become healthy without any click.
+              $server = Wait-Healthy $proc.Id 45
+              if ($server) { $how = 'restored from the saved preference' }
+            }
+            if (-not $server) {
+              # Use locally: find the control in the UI Automation tree and invoke it. The first
+              # button label is being standardised; accept the current and the earlier candidate.
+              $root = [System.Windows.Automation.AutomationElement]::FromHandle($window.MainWindowHandle)
+              $nameProp = [System.Windows.Automation.AutomationElement]::NameProperty
+              $cond = New-Object System.Windows.Automation.OrCondition (
+                (New-Object System.Windows.Automation.PropertyCondition $nameProp, 'Use locally'),
+                (New-Object System.Windows.Automation.PropertyCondition $nameProp, 'Open local workspace'))
+              $button = $null
+              for ($i = 0; $i -lt 30 -and -not $button; $i++) {
+                $button = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
+                if (-not $button) { Start-Sleep -Seconds 1 }
+              }
+              if (-not $button) {
+                Shot "desktop-windows-$launch-no-button"
+                throw "launch ${launch}: no local-mode control ('Use locally' or 'Open local workspace') and no restored local server"
+              }
+              $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+              $server = Wait-Healthy $proc.Id 90
+              $how = 'started by the button'
+            }
+            if (-not $server) { Shot "desktop-windows-$launch-no-server"; throw "launch ${launch}: no healthy metro-server of the installed package ran under the launcher" }
+            Write-Host "launch ${launch}: local server pid $($server.ProcessId) $how"
+            # The data root is the fresh desktop home's `local` directory.
+            $localHome = Join-Path $env:METRO_DESKTOP_HOME 'local'
+            if (-not (Get-ChildItem $localHome -Recurse -File -ErrorAction SilentlyContinue)) {
+              throw "launch ${launch}: nothing was written under the fresh local home $localHome"
+            }
+            Shot "desktop-windows-$launch-local"
+            # Close: ask the window to close, then force whatever is left.
+            [void]$window.CloseMainWindow()
+            Start-Sleep -Seconds 8
+            Get-Process | Where-Object { $_.Id -in @($proc.Id, $window.Id) } | Stop-Process -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 2
+            if (Get-Process -Name 'metro-server' -ErrorAction SilentlyContinue) {
+              Get-Process -Name 'metro-server' | Stop-Process -Force
+              throw "launch ${launch}: hosted metro-server outlived the app"
+            }
+          }
+          $left = Get-Process -Name 'Metro', 'metro-desktop' -ErrorAction SilentlyContinue
+          if ($left) { $left | Stop-Process -Force; throw "processes left behind after closing: $(($left | ForEach-Object Name) -join ', ')" }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: smoke-windows-screenshot
+          path: ${{ runner.temp }}/shot
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-desktop-windows-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # Linux x64 desktop. The GUI launch is best-effort on a headless runner
+  # (Xvfb + WebKitGTK); native tests, layout, checksum, capability and server
+  # checks are blocking.
+  desktop-linux:
+    needs: [meta, ui]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ui-linux-x64
+          path: ${{ runner.temp }}/stage
+      - name: Toolchain, locked fetch and native tests of the launcher
+        run: |
+          set -eu
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          cargo fetch --locked --target x86_64-unknown-linux-gnu
+          python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+          readelf --version | head -1
+          cargo test --locked --release -p metro-desktop
+      - name: Build metro-desktop and metro-server (locked)
+        run: |
+          set -eu
+          cargo build --locked --release --target x86_64-unknown-linux-gnu --bin metro-desktop --bin metro-server
+      - name: Third-party notices
+        run: |
+          python3 -I packaging/cargo-notices.py --target x86_64-unknown-linux-gnu \
+            --package metro-desktop --package metro-server --out "$RUNNER_TEMP/notices-desktop.txt"
+      - name: Package
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          rel=target/x86_64-unknown-linux-gnu/release
+          python3 -I packaging/package.py desktop --target linux-x64 --version "$VERSION" \
+            --launcher "$rel/metro-desktop" --server "$rel/metro-server" \
+            --ui-dir "$RUNNER_TEMP/stage/ui" --nsh-root "$RUNNER_TEMP/stage/nsh-root" \
+            --notices "$RUNNER_TEMP/notices-desktop.txt" --out-dir dist
+          ls -l dist
+      - name: Archive has the confirmed name, matches its checksum and extracts (fresh directory)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          name="Metro-$VERSION-linux-x64.tar.gz"
+          test "$(ls dist | sort | tr '\n' ' ')" = "$name $name.sha256 " \
+            || { echo "unexpected dist contents" >&2; ls dist; exit 1; }
+          (cd dist && sha256sum --check "$name.sha256")
+          out="$(mktemp -d "$RUNNER_TEMP/desktop-extract.XXXXXX")"
+          tar -xzf "dist/$name" -C "$out"
+          root="$out/Metro-$VERSION-linux-x64"
+          for f in Metro metro-server ui/Metro ui/nsh/bundle.nshc ui/nsh/app.json ui/nsh/capabilities.json; do
+            test -e "$root/$f" || { echo "package is missing $f" >&2; exit 1; }
+          done
+          test -x "$root/Metro" && test -x "$root/metro-server" && test -x "$root/ui/Metro"
+          # No standalone runner: runner packages are separate.
+          ! find "$out" -name 'metro-runner*' | grep -q .
+          echo "METRO_ROOT=$root" >> "$GITHUB_ENV"
+      - name: The packaged app uses the real capability manifest
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          python3 -I - "$METRO_ROOT/ui/nsh" "$VERSION" <<'PY'
+          import json, sys
+          nsh, version = sys.argv[1:]
+          app = json.load(open(nsh + "/app.json"))
+          cap = json.load(open(nsh + "/capabilities.json"))
+          src = json.load(open("apps/desktop/nsh.json"))["capabilities"]
+          assert app["version"] == version, app["version"]
+          assert cap["process"]["env"] == src["process"]["env"], cap["process"]
+          # NSH expands the manifest with defaults, so compare after normalizing the source the same way.
+          want = json.loads(json.dumps(src))
+          want.setdefault("network", {}).setdefault("http", [])
+          want.setdefault("process", {}).setdefault("execute", [])
+          want["process"].setdefault("exit", False)
+          assert cap == want, "packaged capabilities differ from apps/desktop/nsh.json after normalization"
+          PY
+      - name: Packaged metro-server answers /healthz (documented env config, loopback)
+        run: |
+          set -eu
+          work="$(mktemp -d "$RUNNER_TEMP/server-run.XXXXXX")"
+          # Random throwaway dev token, never printed; the server refuses to start without an auth mode.
+          METRO_DEV_USERS="{\"ci\":\"$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')\"}" \
+            METRO_BIND=127.0.0.1:18787 METRO_DB="$work/metro.sqlite3" "$METRO_ROOT/metro-server" >"$work/server.log" 2>&1 &
+          pid=$!
+          trap 'kill "$pid" 2>/dev/null || true' EXIT
+          for _ in $(seq 1 30); do
+            kill -0 "$pid" 2>/dev/null || { cat "$work/server.log" >&2; echo "metro-server exited early" >&2; exit 1; }
+            curl --fail --silent --max-time 2 http://127.0.0.1:18787/healthz && exit 0
+            sleep 1
+          done
+          echo "metro-server did not answer /healthz" >&2; exit 1
+      - name: Launch under Xvfb (best effort)
+        continue-on-error: true
+        run: |
+          set -eu
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends xvfb xdotool imagemagick libwebkitgtk-6.0-4 libgtk-4-1
+          work="$(mktemp -d "$RUNNER_TEMP/desktop-run.XXXXXX")"
+          mkdir -p "$RUNNER_TEMP/shot"
+          for attempt in 1 2 3; do
+            if METRO_DESKTOP_HOME="$work/home" xvfb-run -a --server-args='-screen 0 1280x800x24' bash -c '
+              set -eu
+              mkdir -p "$METRO_DESKTOP_HOME"
+              cd "$1"
+              HOME="$1" "$METRO_ROOT/Metro" &
+              pid=$!
+              for _ in $(seq 1 45); do
+                kill -0 "$pid" 2>/dev/null || { echo "launcher exited early" >&2; exit 1; }
+                xdotool search --name "^Metro$" >/dev/null 2>&1 && break
+                sleep 1
+              done
+              xdotool search --name "^Metro$" >/dev/null
+              sleep 8
+              kill -0 "$pid"
+              import -window root "$2/desktop-linux.png" || true
+              kill "$pid"
+            ' _ "$work" "$RUNNER_TEMP/shot"; then exit 0; fi
+            echo "attempt $attempt failed" >&2
+          done
+          exit 1
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: smoke-linux-screenshot
+          path: ${{ runner.temp }}/shot
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-desktop-linux-x64
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # Combines every archive, writes one SHA256SUMS and (tag builds only) creates a
+  # DRAFT release for a human to review and publish. Nothing is public until then.
+  assets:
+    needs: [meta, runner-linux, desktop-windows, desktop-linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: ${{ runner.temp }}/collected
+          merge-multiple: true
+      - name: SHA256SUMS
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          mkdir release
+          cp "$RUNNER_TEMP"/collected/* release/
+          expected="Metro-$VERSION-linux-x64.tar.gz Metro-$VERSION-windows-x64.zip Metro-runner-$VERSION-linux-x64.tar.gz"
+          for f in $expected; do
+            test -f "release/$f" && test -f "release/$f.sha256" || { echo "missing $f or its .sha256" >&2; ls release; exit 1; }
+          done
+          test "$(ls release | wc -l)" -eq 6 || { echo "unexpected release files" >&2; ls release; exit 1; }
+          (cd release && for f in $expected; do sha256sum --check "$f.sha256"; done)
+          (cd release && sha256sum $expected | sort -k2 > SHA256SUMS && cat SHA256SUMS && sha256sum --check SHA256SUMS)
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  draft-release:
+    if: inputs.release
+    needs: [meta, assets, images]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-assets
+          path: ${{ runner.temp }}/release
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/release"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ] \
+              || { echo "release $TAG is already published; refusing to modify it" >&2; exit 1; }
+            gh release upload "$TAG" --clobber -- *
+          else
+            flags=""
+            [ "$PRERELEASE" = true ] && flags="--prerelease"
+            # shellcheck disable=SC2086
+            gh release create "$TAG" --draft --verify-tag $flags --title "$TAG" \
+              --notes "Draft. Verify with SHA256SUMS before publishing." -- *
+          fi
+
+  # GHCR images, pushed on tag builds only (after every gate in ci.yml and the
+  # package jobs above). Names: ghcr.io/<owner>/metro-server and /metro-runner.
+  images:
+    if: inputs.release
+    needs: [meta, runner-linux, desktop-windows, desktop-linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Build release images
+        run: |
+          set -eu
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          epoch="$(git log -1 --format=%ct)"
+          for component in server runner; do
+            docker build --target "$component" \
+              --build-arg "SOURCE_DATE_EPOCH=$epoch" \
+              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
+              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+              --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \
+              -t "ghcr.io/${owner}/metro-${component}:${GITHUB_REF_NAME}" .
+          done
+      - name: Publish tagged images
+        env:
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          trap 'docker logout ghcr.io >/dev/null' EXIT
+          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+          owner="${GITHUB_REPOSITORY_OWNER,,}"
+          for component in server runner; do
+            docker push "ghcr.io/${owner}/metro-${component}:${GITHUB_REF_NAME}"
+          done

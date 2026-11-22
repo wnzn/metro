@@ -3,10 +3,11 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use metro_runner::client::ServerClient;
-use metro_runner::config::{Config, Sandbox};
+use metro_runner::config::{Config, Credential, Sandbox};
 use metro_runner::confine::Workspace;
 use metro_runner::runner::Runner;
-use metro_runner::tools::Registry;
+use metro_runner::spaces::SpaceRoots;
+use metro_runner::tools::{Registry, SubprocessPolicy};
 
 extern "C" fn on_signal(_: libc::c_int) {
     if metro_runner::SHUTDOWN.swap(true, Ordering::SeqCst) {
@@ -52,6 +53,28 @@ fn preflight_docker(cfg: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Running inside a container with METRO_SANDBOX=docker means talking to
+/// some daemon from inside a container. Say what that requires rather than
+/// pretend it is a supported default.
+fn warn_nested_docker(cfg: &Config) {
+    if !matches!(cfg.sandbox, Sandbox::Docker(_)) {
+        return;
+    }
+    let in_container = std::path::Path::new("/.dockerenv").exists()
+        || std::path::Path::new("/run/.containerenv").exists();
+    if in_container {
+        eprintln!(
+            "metro-runner: warning: METRO_SANDBOX=docker inside a container. The docker daemon \
+             resolves bind-mount sources on ITS host, so {} must exist at the same path there \
+             (bind-mount it at an identical path; a named volume path will not match), the \
+             docker CLI must be in this image (the stock runner image has none), and whoever \
+             can reach the daemon socket you provide is effectively root on that host. The \
+             socket is never mounted into tool containers.",
+            cfg.workspace.display()
+        );
+    }
+}
+
 fn main() -> ExitCode {
     let cfg = match Config::from_env() {
         Ok(c) => c,
@@ -60,8 +83,24 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    let ws = match Workspace::open(&cfg.workspace) {
-        Ok(w) => w,
+    if let Err(e) = preflight_docker(&cfg) {
+        eprintln!("metro-runner: docker sandbox preflight failed (no host fallback): {e}");
+        return ExitCode::from(2);
+    }
+    warn_nested_docker(&cfg);
+
+    // Open the workspace (dedicated) or the per-Space base (reusable) before
+    // taking any job; both fail closed.
+    enum Opened {
+        Dedicated(Workspace),
+        Reusable(SpaceRoots),
+    }
+    let opened = match cfg.credential {
+        Credential::Dedicated => Workspace::open(&cfg.workspace).map(Opened::Dedicated),
+        Credential::Reusable => SpaceRoots::open(&cfg.workspace).map(Opened::Reusable),
+    };
+    let opened = match opened {
+        Ok(o) => o,
         Err(e) => {
             eprintln!(
                 "metro-runner: cannot open workspace {:?}: {e}",
@@ -70,21 +109,29 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(e) = preflight_docker(&cfg) {
-        eprintln!("metro-runner: docker sandbox preflight failed (no host fallback): {e}");
-        return ExitCode::from(2);
-    }
     install_signal_handlers();
 
     let sandbox = match &cfg.sandbox {
         Sandbox::None => "none (host; trust boundary, not a sandbox)".to_string(),
         Sandbox::Docker(d) => format!("docker image={}", d.image),
     };
+    let (credential, ws_desc) = match cfg.credential {
+        Credential::Dedicated => ("dedicated", cfg.workspace.display().to_string()),
+        Credential::Reusable => (
+            "reusable",
+            format!(
+                "{}/{}/<space_id>",
+                cfg.workspace.display(),
+                metro_runner::spaces::SPACES_DIR
+            ),
+        ),
+    };
     eprintln!(
-        "metro-runner {}: server={} workspace={} sandbox={} check={} mcp={}",
+        "metro-runner {}: server={} credential={} workspace={} sandbox={} check={} mcp={}",
         env!("CARGO_PKG_VERSION"),
         cfg.server_url,
-        cfg.workspace.display(),
+        credential,
+        ws_desc,
         sandbox,
         if cfg.check_argv.is_some() {
             "configured"
@@ -98,10 +145,19 @@ fn main() -> ExitCode {
         },
     );
 
+    if let SubprocessPolicy::Disabled(why) = SubprocessPolicy::for_config(&cfg)
+        && (cfg.check_argv.is_some() || cfg.mcp_argv.is_some())
+    {
+        eprintln!("metro-runner: warning: workspace.check/workspace.mcp {why}");
+    }
+
     let client = ServerClient::new(&cfg);
     let poll = cfg.poll_interval;
     let cfg = Arc::new(cfg);
-    let registry = Registry::standard(cfg, Arc::new(ws));
-    Runner::new(client, registry, poll).run();
+    let mut runner = match opened {
+        Opened::Dedicated(ws) => Runner::new(client, Registry::standard(cfg, Arc::new(ws)), poll),
+        Opened::Reusable(roots) => Runner::per_space(client, cfg, Arc::new(roots), poll),
+    };
+    runner.run();
     ExitCode::SUCCESS
 }

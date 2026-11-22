@@ -2,19 +2,198 @@
 // timers, no UI. Every failure is an ApiError whose `kind` the store uses to
 // decide between retrying, stopping, and what to tell the user.
 
+import { discoveryApi } from "./discovery";
+import { libraryApi } from "./library";
+import { profileApi } from "./profile";
+import type { RawFn } from "./profile";
+
 /** `parentRoomId`: set on a thread an agent delegated from that room. */
 export type Room = { id: string; name: string; parentRoomId?: string };
-/** Who a message addresses: the Space's agent, or a member by their stable user id. */
-export type Mention = { kind: "agent" } | { kind: "user"; id: string };
+/**
+ * Who a message addresses: the Space's agent, or a member by their stable
+ * user id. On received events only, an agent mention may say it wasn't typed:
+ * `classifier` (the sender's opt-in System One judgement started the agent
+ * from an unaddressed message) or `schedule` (the creator's scheduled
+ * prompt). The server sets it; the app never sends it.
+ */
+export type Mention = { kind: "agent"; addressedBy?: "classifier" | "schedule" } | { kind: "user"; id: string };
 /** For messages: who it was addressed to ("room" = nobody in particular). */
 export type Audience = "room" | "agent" | "users" | "mixed";
-export type RoomEvent = { id: number; kind: string; actor: string; text: string; mentions?: Mention[]; audience?: Audience };
+/** Where a turn's activity comes from: an agent run, or the deterministic Demo (no model). */
+export type ActivitySource = "agent" | "demo";
+/** A lifecycle step of one activity; only `kind: "activity"` events carry it. */
+export type ActivityPhase = "started" | "completed" | "failed" | "cancelled" | "interrupted";
+/**
+ * Optional metadata tying an event to one agent turn (or one Demo). Every
+ * event of the turn — its lifecycle (`kind: "activity"`), tool calls and
+ * results — carries the same `id`, `name` and `source`.
+ */
+export type EventActivity = { id: string; name: string; source: ActivitySource; phase?: ActivityPhase; route?: ActivityRoute };
+
+/** Where a turn's model came from (`activity.route` on its `started` marker). */
+export type RouteSource = "override" | "case" | "routing_default" | "default" | "environment" | "inherited";
+/** How the turn came to be addressed to the agent. */
+export type AddressedBy = "explicit" | "classifier" | "schedule" | "thread";
+/**
+ * The route a turn took, as the server recorded it: no prompts, no
+ * credentials, no connection ids shown. `reason` is the server's short,
+ * public sentence (never a model's hidden reasoning).
+ */
+export type ActivityRoute = {
+  source: RouteSource;
+  addressedBy: AddressedBy;
+  caseLabel: string | null;
+  providerId: string | null;
+  modelId: string | null;
+  reason: string;
+};
+export type RoomEvent = {
+  id: number;
+  kind: string;
+  /** The author's display name as it was written. */
+  actor: string;
+  text: string;
+  mentions?: Mention[];
+  audience?: Audience;
+  activity?: EventActivity;
+  /** A person's stable id; absent for the agent, runner and system. */
+  actorId?: string;
+  /** When the server stored it (RFC 3339, UTC). Absent when the server doesn't know: never guessed. */
+  createdAt?: string;
+};
 export type SpaceRole = "owner" | "member";
 /** `runnerPaired`: a runner token is issued for the space. It says nothing about the runner being online. */
 export type Space = { id: string; name: string; role: SpaceRole; runnerPaired: boolean };
 export type Member = { userId: string; role: SpaceRole };
 /** An agent run in a Space the user belongs to (GET /v1/runs, newest first). */
 export type Run = { id: string; spaceId: string; roomId: string; status: string; actor: string; task: string };
+
+/** Who is signed in. `isOrgAdmin`: may create and manage organization runners. */
+export type Me = { id: string; isOrgAdmin: boolean };
+
+/** A registered runner the user can see (GET /v1/runners). */
+export type RunnerVisibility = "personal" | "organization";
+export type RegisteredRunner = { id: string; name: string; visibility: RunnerVisibility; canManage: boolean };
+
+/**
+ * Who serves a Space (GET /v1/spaces/{sid}/runner): a registered runner, the
+ * Space's own dedicated (legacy) token, or nobody. Attached says nothing
+ * about the runner being online.
+ */
+export type SpaceRunner =
+  | { kind: "registered"; id: string; name: string; visibility: RunnerVisibility }
+  | { kind: "dedicated"; name: string };
+
+/** Where a provider's inference runs: in the user's own metro-connector, or from the server. */
+export type ProviderExecution = "device" | "server";
+
+/**
+ * What a connection is for, fixed by its adapter: agent answers (`chat`),
+ * typed System One decisions (`system_one`) or vectors for search
+ * (`embeddings`). A connection is never used for another capability, and
+ * each capability has its own default.
+ */
+export type Capability = "chat" | "system_one" | "embeddings";
+export const CAPABILITIES: readonly Capability[] = ["chat", "system_one", "embeddings"];
+
+/** One adapter the server's build implements (GET /v1/provider-catalog). */
+export type CatalogProvider = {
+  id: string;
+  name: string;
+  requiresKey: boolean;
+  allowCustomUrl: boolean;
+  defaultBaseUrl: string | null;
+  execution: ProviderExecution;
+  description: string | null;
+  capability: Capability;
+  /** The adapter can list its models; otherwise the model ID is entered by hand. */
+  listsModels: boolean;
+};
+export type ProviderCatalog = { providers: CatalogProvider[]; allowedBaseUrls: string[] };
+
+/** Who besides its owner may use a connection. Personal (nobody) is the default. */
+export type ShareVisibility = "personal" | "spaces" | "organization";
+/**
+ * A connection's share (GET/PUT /v1/providers/{id}/sharing, owner only).
+ * Grants use, never the credential. `mode`: `owner_connection` (others run
+ * on this connection, which its owner can observe and pays for) or `preset`
+ * (a subscription sign-in: others get only the model name and run it on
+ * their own sign-in or key).
+ */
+export type Sharing = { visibility: ShareVisibility; spaceIds: string[]; mode?: "owner_connection" | "preset" };
+
+/** A personal model connection (GET /v1/providers). The key is never returned. */
+export type ProviderConnection = {
+  id: string;
+  name: string;
+  providerId: string;
+  baseUrl: string | null;
+  model: string | null;
+  isDefault: boolean;
+  hasKey: boolean;
+  /** null: the server didn't say; the catalog entry of its provider decides. */
+  capability: Capability | null;
+  /** null: the server didn't say (an older server shares nothing). */
+  visibility: ShareVisibility | null;
+};
+
+/**
+ * A model the signed-in user may pick (GET /v1/models/available): one of
+ * their own connections, or one shared with them. Never carries a key, a
+ * sign-in or a device token.
+ */
+export type AvailableModel = {
+  connectionId: string;
+  name: string;
+  providerId: string;
+  model: string | null;
+  capability: Capability;
+  visibility: ShareVisibility;
+  /** The signed-in user owns it. */
+  owned: boolean;
+  /** The stable id of whoever owns it. */
+  ownerId: string | null;
+  execution: ProviderExecution;
+  /**
+   * `your_connection`; `owner_connection` (the owner's endpoint, key or
+   * device: they can see these requests and may pay for them); or
+   * `your_own_sign_in` (a shared preset run on your own connection).
+   */
+  runsOn: "your_connection" | "owner_connection" | "your_own_sign_in";
+  billing: "you" | "owner";
+  /** A preset: whether you have a connection of your own it can run on (null: not a preset). */
+  ready: boolean | null;
+  /** Your default for this capability (own connections only). */
+  isDefault: boolean;
+  /** An embeddings adapter that embeds documents, images, audio and video itself (never a text-only `/v1/embeddings`). */
+  mediaInputs?: boolean;
+};
+
+/** One named use case and the chat connection that answers it. */
+export type RoutingCase = { key: string; label: string; description: string; connectionId: string | null };
+/** The signed-in user's model routing (GET/PUT /v1/model-routing). Everything is off by default. */
+export type ModelRouting = {
+  /** Use-case routing: System One picks which chat connection answers. */
+  enabled: boolean;
+  /** Opt-in: System One judges whether an unaddressed message of mine asks the agent. */
+  inferAddressing: boolean;
+  classifierId: string | null;
+  embeddingId: string | null;
+  /** Used when System One returns no match or a score below the threshold; a classifier failure calls no model (null: my default chat connection). */
+  defaultChatId: string | null;
+  minDirectedness: number;
+  minRouteProbability: number;
+  cases: RoutingCase[];
+};
+
+/** The transport other API modules (src/api/discovery.ts) build on. */
+export type RequestFn = (method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) => Promise<unknown>;
+
+/** A device connection's metro-connector (GET /v1/providers/{id}/device-token). */
+export type DeviceStatus = { paired: boolean; online: boolean; lastSeenSecs: number | null };
+
+export type NewProviderConnection = { name: string; provider_id: string; base_url?: string; api_key?: string; model?: string };
+export type ProviderPatch = { name?: string; model?: string; is_default?: boolean; api_key?: string };
 
 export type ApiErrorKind =
   | "network" // no HTTP response: refused, DNS, TLS, offline
@@ -59,7 +238,7 @@ export type Client = ReturnType<typeof createClient>;
 export function createClient(options: ClientOptions) {
   const timeoutMs = options.timeoutMs ?? 10_000;
 
-  async function request(method: "GET" | "POST" | "PUT" | "DELETE", path: string, body?: unknown): Promise<unknown> {
+  async function request(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown): Promise<unknown> {
     const url = options.baseUrl + path;
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(), timeoutMs);
@@ -94,21 +273,7 @@ export function createClient(options: ClientOptions) {
       options.signal?.removeEventListener("abort", onOuterAbort);
     }
 
-    if (response.status === 401) {
-      throw new ApiError("auth", "The server rejected the access token (HTTP 401). Check the token and connect again.", 401);
-    }
-    if (response.status === 403) {
-      const detail = await safeSnippet(response);
-      throw new ApiError("forbidden", `You don't have access to that (HTTP 403)${detail ? `: ${detail}` : ""}.`, 403);
-    }
-    if (!response.ok) {
-      const detail = await safeSnippet(response);
-      throw new ApiError(
-        response.status === 404 ? "not_found" : "http",
-        `${method} ${path} failed with HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
-        response.status,
-      );
-    }
+    await checkStatus(response, method, path);
     const text = await response.text();
     if (!text.trim()) return null;
     try {
@@ -118,18 +283,224 @@ export function createClient(options: ClientOptions) {
     }
   }
 
+  /**
+   * Raw bytes both ways (library uploads and file content): the same
+   * timeout, abort and error mapping as `request`, the bearer only in the
+   * Authorization header, never in a URL, and never sent to a redirect.
+   */
+  const binary: RawFn = async (method, path, init) => {
+    const url = options.baseUrl + path;
+    const limit = init.timeoutMs ?? timeoutMs;
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(), limit);
+    const onAbort = () => timeout.abort();
+    options.signal?.addEventListener("abort", onAbort);
+    init.signal?.addEventListener("abort", onAbort);
+    const cancelled = () => options.signal?.aborted === true || init.signal?.aborted === true;
+    const headers: Record<string, string> = { Accept: init.accept ?? "*/*", Authorization: `Bearer ${options.token()}` };
+    if (init.body !== undefined) headers["Content-Type"] = init.contentType ?? "application/octet-stream";
+    try {
+      if (cancelled()) throw new ApiError("aborted", "Cancelled");
+      let response: Response;
+      try {
+        response = await fetch(url, { method, headers, body: init.body as BodyInit | undefined, signal: timeout.signal, redirect: "error" });
+      } catch (error) {
+        if (error instanceof ApiError) throw error;
+        if (cancelled()) throw new ApiError("aborted", "Cancelled");
+        if (timeout.signal.aborted) throw new ApiError("timeout", `${options.baseUrl} did not answer ${method} ${path} within ${Math.round(limit / 1000)}s.`);
+        const detail = String((error as Error)?.message ?? error).replace(/^Network request failed:\s*/i, "");
+        throw new ApiError("network", `Cannot reach ${options.baseUrl} (${detail}). Is the server running?`);
+      }
+      await checkStatus(response, method, path);
+      let bytes: Uint8Array;
+      try {
+        bytes = new Uint8Array(await response.arrayBuffer());
+      } catch (error) {
+        if (cancelled()) throw new ApiError("aborted", "Cancelled");
+        throw new ApiError("network", `The answer to ${method} ${path} was cut off (${String((error as Error)?.message ?? error)}).`);
+      }
+      if (cancelled()) throw new ApiError("aborted", "Cancelled");
+      return { status: response.status, contentType: response.headers.get("content-type") ?? "", bytes };
+    } finally {
+      clearTimeout(timer);
+      options.signal?.removeEventListener("abort", onAbort);
+      init.signal?.removeEventListener("abort", onAbort);
+    }
+  };
+
   const sp = (spaceId: string) => `/v1/spaces/${encodeURIComponent(spaceId)}`;
   const room = (spaceId: string, roomId: string) => `${sp(spaceId)}/rooms/${encodeURIComponent(roomId)}`;
 
   return {
     baseUrl: options.baseUrl,
+    // Search and scheduled prompts (src/api/discovery.ts), on the same transport.
+    ...discoveryApi(request),
+    // Documents & media (src/api/library.ts): JSON on `request`, bytes on `binary`.
+    ...libraryApi(request, binary),
+    // Profiles (src/api/profile.ts): JSON on `request`, pictures on `binary`.
+    ...profileApi(request, binary),
 
-    async me(): Promise<{ id: string }> {
+    async me(): Promise<Me> {
       const data = await request("GET", "/v1/me");
       if (!isObject(data) || (typeof data.id !== "string" && typeof data.id !== "number")) {
         throw new ApiError("protocol", "GET /v1/me did not return { id }.");
       }
-      return { id: String(data.id) };
+      // An older server has no organization: nobody is its admin.
+      return { id: String(data.id), isOrgAdmin: data.is_org_admin === true };
+    },
+
+    // ---- registered runners (personal or organization), reusable across Spaces
+
+    async listRunners(): Promise<RegisteredRunner[]> {
+      const data = await request("GET", "/v1/runners");
+      const runners = isObject(data) ? data.runners : undefined;
+      if (!Array.isArray(runners)) throw new ApiError("protocol", "GET /v1/runners did not return { runners: [...] }.");
+      return runners.filter(isRegisteredRunner).map(toRegisteredRunner);
+    },
+
+    /** Registers a runner. The token is shown once; the caller must not keep it longer than it is shown. */
+    async createRunner(name: string, visibility: RunnerVisibility): Promise<{ runner: RegisteredRunner; token: string }> {
+      const data = await request("POST", "/v1/runners", { name, visibility });
+      if (!isObject(data) || !isRegisteredRunner(data.runner) || !isToken(data.token)) {
+        throw new ApiError("protocol", "POST /v1/runners did not return { runner, token }.");
+      }
+      return { runner: toRegisteredRunner(data.runner), token: data.token };
+    },
+
+    /** Rotates a registered runner's token: the old one stops working in every Space it serves. */
+    async rotateRunnerToken(runnerId: string): Promise<string> {
+      const data = await request("POST", `/v1/runners/${encodeURIComponent(runnerId)}/token`, {});
+      if (!isObject(data) || !isToken(data.token)) throw new ApiError("protocol", "POST …/token did not return { token }.");
+      return data.token;
+    },
+
+    async deleteRunner(runnerId: string): Promise<void> {
+      await request("DELETE", `/v1/runners/${encodeURIComponent(runnerId)}`);
+    },
+
+    async getSpaceRunner(spaceId: string): Promise<SpaceRunner | null> {
+      const data = await request("GET", `${sp(spaceId)}/runner`);
+      if (!isObject(data) || !("runner" in data)) throw new ApiError("protocol", "GET …/runner did not return { runner }.");
+      return toSpaceRunner(data.runner);
+    },
+
+    async attachRunner(spaceId: string, runnerId: string): Promise<SpaceRunner | null> {
+      const data = await request("PUT", `${sp(spaceId)}/runner`, { runner_id: runnerId });
+      return isObject(data) && "runner" in data ? toSpaceRunner(data.runner) : null;
+    },
+
+    /** Detaches the Space's registered runner (or revokes its dedicated token). */
+    async detachRunner(spaceId: string): Promise<void> {
+      await request("DELETE", `${sp(spaceId)}/runner`);
+    },
+
+    // ---- personal model connections
+
+    async providerCatalog(): Promise<ProviderCatalog> {
+      const data = await request("GET", "/v1/provider-catalog");
+      const providers = isObject(data) ? data.providers : undefined;
+      if (!isObject(data) || !Array.isArray(providers)) throw new ApiError("protocol", "GET /v1/provider-catalog did not return { providers: [...] }.");
+      const allowed = Array.isArray(data.allowed_base_urls) ? data.allowed_base_urls.filter((u): u is string => typeof u === "string") : [];
+      return { providers: providers.filter(isCatalogProvider).map(toCatalogProvider), allowedBaseUrls: allowed };
+    },
+
+    async listProviders(): Promise<ProviderConnection[]> {
+      const data = await request("GET", "/v1/providers");
+      const list = isObject(data) ? data.connections : undefined;
+      if (!Array.isArray(list)) throw new ApiError("protocol", "GET /v1/providers did not return { connections: [...] }.");
+      return list.filter(isConnection).map(toConnection);
+    },
+
+    async createProvider(body: NewProviderConnection): Promise<ProviderConnection> {
+      const data = await request("POST", "/v1/providers", body);
+      const connection = isObject(data) && isObject(data.connection) ? data.connection : data;
+      if (!isConnection(connection)) throw new ApiError("protocol", "POST /v1/providers did not return the connection.");
+      return toConnection(connection);
+    },
+
+    async updateProvider(id: string, patch: ProviderPatch): Promise<void> {
+      await request("PATCH", `/v1/providers/${encodeURIComponent(id)}`, patch);
+    },
+
+    async deleteProvider(id: string): Promise<void> {
+      await request("DELETE", `/v1/providers/${encodeURIComponent(id)}`);
+    },
+
+    /** Asks the connection's endpoint (or the user's metro-connector) for its model IDs. */
+    async listProviderModels(id: string): Promise<string[]> {
+      const data = await request("POST", `/v1/providers/${encodeURIComponent(id)}/models`, {});
+      const models = isObject(data) ? data.models : undefined;
+      if (!Array.isArray(models)) throw new ApiError("protocol", "POST …/models did not return { models: [...] }.");
+      return [...new Set(models.filter((m): m is string => typeof m === "string" && m.trim() !== "").map((m) => m.trim()))];
+    },
+
+    /** Whether a device token is issued (paired) and whether its metro-connector is polling (online). */
+    async deviceStatus(id: string): Promise<DeviceStatus> {
+      const data = await request("GET", `/v1/providers/${encodeURIComponent(id)}/device-token`);
+      if (!isObject(data) || typeof data.paired !== "boolean") throw new ApiError("protocol", "GET …/device-token did not return { paired, online }.");
+      const seen = typeof data.last_seen_secs === "number" && Number.isFinite(data.last_seen_secs) && data.last_seen_secs >= 0 ? data.last_seen_secs : null;
+      return { paired: data.paired, online: data.paired && data.online === true, lastSeenSecs: seen };
+    },
+
+    /** Revokes the device token: the connector is unpaired and stops serving this connection. */
+    async revokeDeviceToken(id: string): Promise<void> {
+      await request("DELETE", `/v1/providers/${encodeURIComponent(id)}/device-token`);
+    },
+
+    /** Issues (or rotates) a device connection's token for the local metro-connector. Shown once. */
+    async issueDeviceToken(id: string): Promise<string> {
+      const data = await request("POST", `/v1/providers/${encodeURIComponent(id)}/device-token`, {});
+      if (!isObject(data) || !isToken(data.token)) throw new ApiError("protocol", "POST …/device-token did not return { token }.");
+      return data.token;
+    },
+
+    /** Who besides the owner may use a connection (owner only). */
+    async getSharing(id: string): Promise<Sharing> {
+      return toSharing(await request("GET", `/v1/providers/${encodeURIComponent(id)}/sharing`), "GET …/sharing");
+    },
+
+    /** Replaces a connection's share; `personal` revokes it. Answers with the share as stored. */
+    async putSharing(id: string, sharing: Sharing): Promise<Sharing> {
+      const body = { visibility: sharing.visibility, space_ids: sharing.visibility === "spaces" ? sharing.spaceIds : [] };
+      const data = await request("PUT", `/v1/providers/${encodeURIComponent(id)}/sharing`, body);
+      return data === null ? { visibility: body.visibility, spaceIds: body.space_ids } : toSharing(data, "PUT …/sharing");
+    },
+
+    /** Models the user may pick: their own and those shared with them. `scope`: "any", or a Space id. */
+    async availableModels(scope = "any"): Promise<AvailableModel[]> {
+      const data = await request("GET", `/v1/models/available?scope=${encodeURIComponent(scope)}`);
+      const models = isObject(data) ? data.models : undefined;
+      if (!Array.isArray(models)) throw new ApiError("protocol", "GET /v1/models/available did not return { models: [...] }.");
+      const seen = new Set<string>();
+      const out: AvailableModel[] = [];
+      for (const m of models) {
+        const model = toAvailableModel(m);
+        if (model && !seen.has(model.connectionId)) {
+          seen.add(model.connectionId);
+          out.push(model);
+        }
+      }
+      return out;
+    },
+
+    async getModelRouting(): Promise<ModelRouting> {
+      return toModelRouting(await request("GET", "/v1/model-routing"), "GET /v1/model-routing");
+    },
+
+    /** Saves the whole routing. Answers with what the server stored. */
+    async putModelRouting(routing: ModelRouting): Promise<ModelRouting> {
+      const body = {
+        enabled: routing.enabled,
+        infer_addressing: routing.inferAddressing,
+        classifier_id: routing.classifierId,
+        embedding_id: routing.embeddingId,
+        default_chat_id: routing.defaultChatId,
+        min_directedness: routing.minDirectedness,
+        min_route_probability: routing.minRouteProbability,
+        cases: routing.cases.map((c) => ({ key: c.key, label: c.label, description: c.description, connection_id: c.connectionId })),
+      };
+      const data = await request("PUT", "/v1/model-routing", body);
+      return data === null ? routing : toModelRouting(data, "PUT /v1/model-routing");
     },
 
     async listSpaces(): Promise<Space[]> {
@@ -198,7 +569,8 @@ export function createClient(options: ClientOptions) {
 
     async sendMessage(spaceId: string, roomId: string, text: string, invokeAgent: boolean, mentions?: Mention[]): Promise<void> {
       const body: Record<string, unknown> = { text, invoke_agent: invokeAgent };
-      if (mentions && mentions.length > 0) body.mentions = mentions;
+      // Only what a person can type: never `addressed_by`, which only the server sets.
+      if (mentions && mentions.length > 0) body.mentions = mentions.map((m) => (m.kind === "agent" ? { kind: "agent" } : { kind: "user", id: m.id }));
       await request("POST", `${room(spaceId, roomId)}/messages`, body);
     },
 
@@ -266,6 +638,119 @@ function toSpace(v: { id: string | number; name: string; role: SpaceRole; runner
 }
 
 const isId = (v: unknown): v is string | number => typeof v === "string" || typeof v === "number";
+const isToken = (v: unknown): v is string => typeof v === "string" && v.length > 0 && !/\s/.test(v);
+const isVisibility = (v: unknown): v is RunnerVisibility => v === "personal" || v === "organization";
+
+function isRegisteredRunner(v: unknown): v is { id: string | number; name: string; visibility: RunnerVisibility; can_manage?: unknown } {
+  return isObject(v) && isId(v.id) && typeof v.name === "string" && isVisibility(v.visibility);
+}
+
+function toRegisteredRunner(v: { id: string | number; name: string; visibility: RunnerVisibility; can_manage?: unknown }): RegisteredRunner {
+  return { id: String(v.id), name: v.name, visibility: v.visibility, canManage: v.can_manage === true };
+}
+
+/** null: nobody serves the Space. Unknown shapes are a protocol error, never "no runner". */
+function toSpaceRunner(v: unknown): SpaceRunner | null {
+  if (v === null) return null;
+  if (isObject(v) && (v.visibility === "dedicated" || v.kind === "dedicated")) {
+    return { kind: "dedicated", name: typeof v.name === "string" && v.name ? v.name : "Dedicated Space runner" };
+  }
+  if (isRegisteredRunner(v)) return { kind: "registered", id: String(v.id), name: v.name, visibility: v.visibility };
+  throw new ApiError("protocol", "The Space's runner is in a shape this app doesn't know.");
+}
+
+function isCatalogProvider(v: unknown): v is Record<string, unknown> & { id: string; name: string } {
+  return isObject(v) && typeof v.id === "string" && v.id !== "" && typeof v.name === "string";
+}
+
+function toCatalogProvider(v: Record<string, unknown> & { id: string; name: string }): CatalogProvider {
+  // Device adapters run in the user's metro-connector; the id prefix is the contract's fallback.
+  const execution: ProviderExecution = v.execution === "device" || (v.execution === undefined && v.id.startsWith("device-")) ? "device" : "server";
+  return {
+    id: v.id,
+    name: v.name,
+    requiresKey: execution === "server" && v.requires_key === true,
+    allowCustomUrl: execution === "server" && v.allow_custom_url === true,
+    defaultBaseUrl: typeof v.default_base_url === "string" && v.default_base_url ? v.default_base_url : null,
+    execution,
+    description: typeof v.description === "string" && v.description ? v.description : null,
+    capability: isCapability(v.capability) ? v.capability : "chat", // an older server has chat adapters only
+    listsModels: v.lists_models !== false,
+  };
+}
+
+const isCapability = (v: unknown): v is Capability => v === "chat" || v === "system_one" || v === "embeddings";
+const isShareVisibility = (v: unknown): v is ShareVisibility => v === "personal" || v === "spaces" || v === "organization";
+
+function toSharing(v: unknown, what: string): Sharing {
+  if (!isObject(v) || !isShareVisibility(v.visibility)) throw new ApiError("protocol", `${what} did not return { visibility, space_ids }.`);
+  const ids = Array.isArray(v.space_ids) ? v.space_ids.filter(isId).map(String) : [];
+  const sharing: Sharing = { visibility: v.visibility, spaceIds: v.visibility === "spaces" ? [...new Set(ids)] : [] };
+  if (v.mode === "preset" || v.mode === "owner_connection") sharing.mode = v.mode;
+  return sharing;
+}
+
+function toAvailableModel(v: unknown): AvailableModel | null {
+  if (!isObject(v) || !isId(v.connection_id) || typeof v.name !== "string" || !isCapability(v.capability)) return null;
+  return {
+    connectionId: String(v.connection_id),
+    name: v.name,
+    providerId: typeof v.provider_id === "string" ? v.provider_id : "",
+    model: typeof v.model === "string" && v.model ? v.model : null,
+    capability: v.capability,
+    visibility: isShareVisibility(v.visibility) ? v.visibility : "personal",
+    owned: v.owned === true,
+    ownerId: isId(v.owner_id) ? String(v.owner_id) : null,
+    execution: v.execution === "device" || (v.execution === undefined && typeof v.provider_id === "string" && v.provider_id.startsWith("device-")) ? "device" : "server",
+    // Unknown: assume the safer reading for the person using it (someone else's endpoint, their bill).
+    runsOn: v.runs_on === "your_connection" || v.runs_on === "your_own_sign_in" ? v.runs_on : v.owned === true ? "your_connection" : "owner_connection",
+    billing: v.billing === "you" || (v.billing === undefined && v.owned === true) ? "you" : "owner",
+    ready: typeof v.ready === "boolean" ? v.ready : null,
+    isDefault: v.is_default === true,
+    mediaInputs: v.capability === "embeddings" && v.media_inputs === true,
+  };
+}
+
+const optionalId = (v: unknown): string | null => (isId(v) && String(v) !== "" ? String(v) : null);
+const probability = (v: unknown, fallback: number): number => (typeof v === "number" && Number.isFinite(v) && v >= 0 && v <= 1 ? v : fallback);
+
+function toModelRouting(v: unknown, what: string): ModelRouting {
+  if (!isObject(v) || !Array.isArray(v.cases)) throw new ApiError("protocol", `${what} did not return the routing settings.`);
+  const cases: RoutingCase[] = [];
+  for (const c of v.cases) {
+    if (!isObject(c) || typeof c.key !== "string" || !c.key || typeof c.label !== "string") continue;
+    cases.push({ key: c.key, label: c.label, description: typeof c.description === "string" ? c.description : "", connectionId: optionalId(c.connection_id) });
+  }
+  return {
+    enabled: v.enabled === true,
+    inferAddressing: v.infer_addressing === true,
+    classifierId: optionalId(v.classifier_id),
+    embeddingId: optionalId(v.embedding_id),
+    defaultChatId: optionalId(v.default_chat_id),
+    // The server's defaults, for an answer that leaves them out.
+    minDirectedness: probability(v.min_directedness, 0.85),
+    minRouteProbability: probability(v.min_route_probability, 0.65),
+    cases,
+  };
+}
+
+function isConnection(v: unknown): v is Record<string, unknown> & { id: string | number; name: string; provider_id: string } {
+  return isObject(v) && isId(v.id) && typeof v.name === "string" && typeof v.provider_id === "string";
+}
+
+function toConnection(v: Record<string, unknown> & { id: string | number; name: string; provider_id: string }): ProviderConnection {
+  return {
+    id: String(v.id),
+    name: v.name,
+    providerId: v.provider_id,
+    baseUrl: typeof v.base_url === "string" && v.base_url ? v.base_url : null,
+    model: typeof v.model === "string" && v.model ? v.model : null,
+    isDefault: v.is_default === true,
+    hasKey: v.has_key === true,
+    capability: isCapability(v.capability) ? v.capability : null,
+    visibility: isShareVisibility(v.visibility) ? v.visibility : null,
+  };
+}
 
 function isRoom(v: unknown): v is { id: string | number; name: string; parent_room_id?: string | number | null } {
   return isObject(v) && isId(v.id) && typeof v.name === "string" && (v.parent_room_id == null || isId(v.parent_room_id));
@@ -293,13 +778,69 @@ function toEvent(v: RoomEvent): RoomEvent {
   if (Array.isArray(raw.mentions)) {
     const mentions: Mention[] = [];
     for (const m of raw.mentions) {
-      if (isObject(m) && m.kind === "agent") mentions.push({ kind: "agent" });
+      if (isObject(m) && m.kind === "agent") {
+        mentions.push(m.addressed_by === "classifier" || m.addressed_by === "schedule" ? { kind: "agent", addressedBy: m.addressed_by } : { kind: "agent" });
+      }
       else if (isObject(m) && m.kind === "user" && isId(m.id)) mentions.push({ kind: "user", id: String(m.id) });
     }
     if (mentions.length) event.mentions = mentions;
   }
   if (raw.audience === "room" || raw.audience === "agent" || raw.audience === "users" || raw.audience === "mixed") event.audience = raw.audience;
+  const activity = toActivity(raw.activity);
+  if (activity) event.activity = activity;
+  if (isId(raw.actor_id) && String(raw.actor_id).trim()) event.actorId = String(raw.actor_id);
+  const createdAt = toCreatedAt(raw.created_at);
+  if (createdAt) event.createdAt = createdAt;
   return event;
+}
+
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/i;
+
+/**
+ * The server's `created_at` (RFC 3339 in UTC, or null for history whose time
+ * is unknown) as a UTC ISO string; undefined when missing, null or malformed.
+ * A number is never read as a time: the wire contract is a string.
+ */
+export function toCreatedAt(v: unknown): string | undefined {
+  if (typeof v !== "string") return undefined;
+  const s = v.trim();
+  if (!RFC3339.test(s)) return undefined;
+  const ms = Date.parse(s);
+  // Epoch 0 is how some migrated rows without a time were stored.
+  if (!Number.isFinite(ms) || ms <= 0) return undefined;
+  return new Date(ms).toISOString();
+}
+
+const ACTIVITY_PHASES: readonly string[] = ["started", "completed", "failed", "cancelled", "interrupted"];
+
+/** The event's activity metadata, or undefined when it is missing or malformed (then the event is uncorrelated). */
+export function toActivity(v: unknown): EventActivity | undefined {
+  if (!isObject(v)) return undefined;
+  const id = typeof v.id === "string" ? v.id.trim() : typeof v.id === "number" && Number.isFinite(v.id) ? String(v.id) : "";
+  if (!id) return undefined;
+  if (v.source !== "agent" && v.source !== "demo") return undefined;
+  const activity: EventActivity = { id, name: typeof v.name === "string" ? v.name.trim() : "", source: v.source };
+  if (typeof v.phase === "string" && ACTIVITY_PHASES.includes(v.phase)) activity.phase = v.phase as ActivityPhase;
+  const route = toRoute(v.route);
+  if (route) activity.route = route;
+  return activity;
+}
+
+const ROUTE_SOURCES: readonly string[] = ["override", "case", "routing_default", "default", "environment", "inherited"];
+const ADDRESSED_BY: readonly string[] = ["explicit", "classifier", "schedule", "thread"];
+const shortText = (v: unknown, max: number): string | null => (typeof v === "string" && v.trim() ? v.trim().slice(0, max) : null);
+
+/** A turn's route, or undefined when missing or malformed (then nothing is shown). */
+export function toRoute(v: unknown): ActivityRoute | undefined {
+  if (!isObject(v) || typeof v.source !== "string" || !ROUTE_SOURCES.includes(v.source)) return undefined;
+  return {
+    source: v.source as RouteSource,
+    addressedBy: typeof v.addressed_by === "string" && ADDRESSED_BY.includes(v.addressed_by) ? (v.addressed_by as AddressedBy) : "explicit",
+    caseLabel: shortText(v.case_label, 64),
+    providerId: shortText(v.provider_id, 64),
+    modelId: shortText(v.model_id, 256),
+    reason: shortText(v.reason, 300) ?? "",
+  };
 }
 
 function isEvent(v: unknown): v is RoomEvent {
@@ -311,6 +852,25 @@ function isEvent(v: unknown): v is RoomEvent {
     typeof v.actor === "string" &&
     typeof v.text === "string"
   );
+}
+
+/** Maps a non-2xx response to its ApiError (the body read only for a short server message). */
+async function checkStatus(response: Response, method: string, path: string): Promise<void> {
+  if (response.status === 401) {
+    throw new ApiError("auth", "The server rejected the access token (HTTP 401). Check the token and connect again.", 401);
+  }
+  if (response.status === 403) {
+    const detail = await safeSnippet(response);
+    throw new ApiError("forbidden", `You don't have access to that (HTTP 403)${detail ? `: ${detail}` : ""}.`, 403);
+  }
+  if (!response.ok) {
+    const detail = await safeSnippet(response);
+    throw new ApiError(
+      response.status === 404 ? "not_found" : "http",
+      `${method} ${path} failed with HTTP ${response.status}${detail ? `: ${detail}` : ""}`,
+      response.status,
+    );
+  }
 }
 
 async function safeSnippet(response: Response): Promise<string> {

@@ -4,13 +4,22 @@
 //! - Redirects are never followed (a redirect could carry the bearer token to
 //!   another origin); any 3xx is an error.
 //! - Every request has a global timeout and response bodies are size-limited.
+//! - Every request carries `X-Metro-Runner-Protocol: 2`. With a reusable
+//!   (`metro_rt_v2_`) credential a claim must name a valid `space_id`;
+//!   otherwise the job is refused and reported as failed. Dedicated (legacy)
+//!   credentials ignore `space_id` and keep the old single-workspace meaning.
 
 use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::config::Config;
+use crate::config::{Config, Credential};
+
+pub const PROTOCOL_HEADER: &str = "X-Metro-Runner-Protocol";
+pub const PROTOCOL_VERSION: &str = "2";
+/// Maximum length of a Space id the runner accepts.
+pub const MAX_SPACE_ID_LEN: usize = 64;
 
 pub const MAX_CLAIM_BODY: u64 = 8 * 1024 * 1024;
 const MAX_ERROR_BODY: u64 = 4 * 1024;
@@ -20,6 +29,10 @@ pub struct Job {
     pub id: String,
     pub tool: String,
     pub arguments: Value,
+    /// The Space this job belongs to. Always `Some(valid id)` for a reusable
+    /// credential (otherwise the claim is [`Claim::Invalid`]); for a dedicated
+    /// credential it is informational only and never selects a directory.
+    pub space_id: Option<String>,
 }
 
 #[derive(Debug)]
@@ -72,6 +85,7 @@ pub struct ServerClient {
     agent: ureq::Agent,
     base: String,
     auth: String,
+    credential: Credential,
 }
 
 impl ServerClient {
@@ -91,6 +105,7 @@ impl ServerClient {
             agent,
             base: base.trim_end_matches('/').to_string(),
             auth: format!("Bearer {token}"),
+            credential: Credential::from_token(token),
         }
     }
 
@@ -105,6 +120,7 @@ impl ServerClient {
             .header("Authorization", &self.auth)
             .header("Content-Type", "application/json")
             .header("Accept", "application/json")
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION)
             .send(body)
             // Transport errors (connect, timeout, reset) are transient.
             .map_err(|e| retryable(format!("POST {path}: {e}")))
@@ -123,7 +139,7 @@ impl ServerClient {
                     .limit(MAX_CLAIM_BODY)
                     .read_to_string()
                     .map_err(|e| retryable(format!("claim: reading body: {e}")))?;
-                parse_claim(&body)
+                parse_claim_for(&body, self.credential)
             }
             _ => Err(status_error("claim", status, &mut resp)),
         }
@@ -189,7 +205,28 @@ pub fn valid_job_id(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
 }
 
+/// Space ids name a directory (`spaces/<id>/`), so only a conservative ASCII
+/// slug is accepted: 1..=64 bytes of `[a-z0-9_-]`, starting with `[a-z0-9]`.
+/// Lowercase only, so case-insensitive filesystems can't alias two Spaces.
+/// Server ids look like `s-0123456789abcdef`.
+pub fn valid_space_id(id: &str) -> bool {
+    let b = id.as_bytes();
+    !b.is_empty()
+        && b.len() <= MAX_SPACE_ID_LEN
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, b'-' | b'_'))
+}
+
+/// Parse a claim for a dedicated (legacy) credential.
 pub fn parse_claim(body: &str) -> Result<Claim, ClientError> {
+    parse_claim_for(body, Credential::Dedicated)
+}
+
+/// Parse a claim. With [`Credential::Reusable`] a missing, non-string or
+/// unsafe `space_id` turns the job into [`Claim::Invalid`]: it is reported as
+/// failed and never runs (there is no fallback to the base directory).
+pub fn parse_claim_for(body: &str, credential: Credential) -> Result<Claim, ClientError> {
     let v: Value =
         serde_json::from_str(body).map_err(|e| fatal(format!("claim: invalid JSON: {e}")))?;
     let id = match v.get("id").and_then(Value::as_str) {
@@ -216,10 +253,32 @@ pub fn parse_claim(body: &str) -> Result<Claim, ClientError> {
             });
         }
     };
+    let space_id = match (credential, v.get("space_id")) {
+        (Credential::Dedicated, Some(Value::String(s))) => Some(s.clone()),
+        (Credential::Dedicated, _) => None,
+        (Credential::Reusable, Some(Value::String(s))) if valid_space_id(s) => Some(s.clone()),
+        (Credential::Reusable, Some(Value::String(_))) => {
+            return Ok(Claim::Invalid {
+                id,
+                reason: "refusing job: 'space_id' is not a valid Space id \
+                         (expected 1-64 chars of [a-z0-9_-], starting with [a-z0-9])"
+                    .into(),
+            });
+        }
+        (Credential::Reusable, _) => {
+            return Ok(Claim::Invalid {
+                id,
+                reason: "refusing job: a reusable runner credential requires a string \
+                         'space_id' in every claim (protocol 2)"
+                    .into(),
+            });
+        }
+    };
     Ok(Claim::Job(Job {
         id,
         tool,
         arguments,
+        space_id,
     }))
 }
 
@@ -253,5 +312,62 @@ mod tests {
         ));
         assert!(parse_claim(r#"{"id":"../x","tool":"t"}"#).is_err());
         assert!(parse_claim("nope").is_err());
+    }
+
+    #[test]
+    fn space_ids() {
+        for ok in ["s-0123456789abcdef", "a", "0", "team_1-x", &"a".repeat(64)] {
+            assert!(valid_space_id(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "-a",
+            "_a",
+            "S-ABC",
+            "a/b",
+            "a.b",
+            "a b",
+            "a\0",
+            "é",
+            "../s-b",
+            "a\\b",
+            &"a".repeat(65),
+        ] {
+            assert!(!valid_space_id(bad), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn reusable_claims_require_space_id() {
+        let r = Credential::Reusable;
+        match parse_claim_for(
+            r#"{"id":"j1","tool":"workspace.list","arguments":{},"space_id":"s-a"}"#,
+            r,
+        )
+        .unwrap()
+        {
+            Claim::Job(j) => assert_eq!(j.space_id.as_deref(), Some("s-a")),
+            other => panic!("{other:?}"),
+        }
+        for body in [
+            r#"{"id":"j1","tool":"workspace.list","arguments":{}}"#,
+            r#"{"id":"j1","tool":"workspace.list","space_id":null}"#,
+            r#"{"id":"j1","tool":"workspace.list","space_id":7}"#,
+            r#"{"id":"j1","tool":"workspace.list","space_id":""}"#,
+            r#"{"id":"j1","tool":"workspace.list","space_id":"../s-b"}"#,
+            r#"{"id":"j1","tool":"workspace.list","space_id":"S-A"}"#,
+        ] {
+            assert!(
+                matches!(parse_claim_for(body, r).unwrap(), Claim::Invalid { .. }),
+                "{body}"
+            );
+        }
+        // Dedicated credentials keep the legacy meaning.
+        assert!(matches!(
+            parse_claim(r#"{"id":"j1","tool":"workspace.list"}"#).unwrap(),
+            Claim::Job(Job { space_id: None, .. })
+        ));
     }
 }

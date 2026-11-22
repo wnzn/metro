@@ -379,11 +379,17 @@ def exercise_rig(call, room, alice, bob, children, model, deadline):
     call(alice, "POST", f"{room}/messages",
          body={"text": model.prompt, "invoke_agent": False},
          label="Alice invokes the agent via @agent")
-    missing = {"Alice's post", "the final assistant reply"}
+    missing = {"Alice's post", "the final assistant reply", "the completed activity lifecycle"}
     try:
         while missing:
             check_processes(children, model)
-            for event in read_events(call, bob, room):
+            events = read_events(call, bob, room)
+            for event in events:
+                value = event.get("activity")
+                if (event["kind"] == "activity" and isinstance(value, dict)
+                        and value.get("source") == "agent" and value.get("phase") == "completed"
+                        and isinstance(value.get("id"), str) and value["id"]):
+                    missing.discard("the completed activity lifecycle")
                 if alice_turn(event, model.prompt, "agent", agent_mentions):
                     missing.discard("Alice's post")
                 if (event["kind"], event["actor"], event["text"]) == (
@@ -399,6 +405,56 @@ def exercise_rig(call, room, alice, bob, children, model, deadline):
             f"Bob did not see {' and '.join(sorted(missing))} before the deadline "
             f"(model requests completed: {model.stage}/2)"
         ) from exc
+    check_agent_activity(events, model)
+
+
+ACTIVITY_PHASES = {"started", "completed", "failed", "cancelled", "interrupted"}
+
+
+def check_agent_activity(events, model):
+    """Real Rig flow: one nonempty agent turn id ties call, result and lifecycle."""
+    def activity(event):
+        value = event.get("activity")
+        if value is None:
+            return None
+        require(isinstance(value, dict) and isinstance(value.get("id"), str) and value["id"]
+                and isinstance(value.get("name"), str) and value["name"]
+                and value.get("source") in {"agent", "demo"}
+                and value.get("phase") in ACTIVITY_PHASES | {None},
+                f"malformed activity metadata on {event['kind']} event")
+        return value
+
+    def agent_owned(event):
+        value = activity(event)  # separately marked Demo events are not this turn
+        return value is not None and value["source"] == "agent"
+
+    for event in events:
+        if event["kind"] in {"tool_call", "tool_result", "activity"}:
+            require(activity(event) is not None, f"{event['kind']} event lacked activity metadata")
+    calls = [e for e in events if e["kind"] == "tool_call" and agent_owned(e)]
+    results = [e for e in events if e["kind"] == "tool_result" and agent_owned(e)]
+    require(len(calls) == 1 and len(results) == 1,
+            "expected exactly one agent tool call and result in the agent flow")
+    require(calls[0]["activity"]["id"] == results[0]["activity"]["id"],
+            "tool call and result had different turn ids")
+    turn = calls[0]["activity"]["id"]
+
+    lifecycle = [e for e in events if e["kind"] == "activity" and agent_owned(e)]
+    require(lifecycle, "no kind 'activity' lifecycle event for the agent turn")
+    for event in lifecycle:
+        require(event["activity"]["id"] == turn and event["activity"].get("phase") in ACTIVITY_PHASES,
+                "agent lifecycle event did not belong to the real agent turn")
+    require(lifecycle[-1]["activity"]["phase"] == "completed",
+            "agent turn lifecycle did not end 'completed'")
+
+    finals = [e for e in events if e["kind"] == "agent" and e["text"] == model.final_text]
+    require(len(finals) == 1, "final text was not a single 'agent' event")
+    require(activity(finals[0]) is None or activity(finals[0])["id"] == turn,
+            "final agent event carried a different turn id")
+    for event in events:
+        if event["kind"] == "message" and event["text"] == model.human_message:
+            require(event.get("activity") is None,
+                    "human-only message was claimed by the activity group")
 
 
 def create_space(call, user, name):
@@ -447,6 +503,8 @@ def exercise_demos(call, demos, children, model, deadline):
                     if kind != "tool_result":
                         continue
                     header, _, output = event["text"].partition("\n")
+                    require((event.get("activity") or {}).get("source") != "agent",
+                            f"{label} Demo was labeled agent activity")
                     require(event["actor"] == "runner" and header == "workspace.list ok",
                             f"{label} Demo did not get a successful runner listing")
                     try:

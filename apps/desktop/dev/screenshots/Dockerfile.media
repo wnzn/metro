@@ -1,0 +1,13 @@
+# The screenshot image plus GTK's GStreamer media backend and the base and
+# good plugins, so NSH's <Video> (GtkVideo) can decode WAV, MP3, MP4 and WebM
+# for the Documents & media capture. There is no sound card in the container:
+# ALSA's null device takes the sound.
+#
+#   docker build -t metro-desktop-shots:trixie apps/desktop/dev/screenshots
+#   docker build -t metro-desktop-shots:trixie-media -f apps/desktop/dev/screenshots/Dockerfile.media apps/desktop/dev/screenshots
+FROM metro-desktop-shots:trixie
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+      libgtk-4-media-gstreamer gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-alsa \
+ && rm -rf /var/lib/apt/lists/* \
+ && printf 'pcm.!default { type null }\n' >/etc/asound.conf

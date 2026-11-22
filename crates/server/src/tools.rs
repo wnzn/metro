@@ -8,7 +8,7 @@
 use serde_json::{Map, Value, json};
 
 use crate::AppState;
-use crate::db::{Author, actor, kind};
+use crate::db::{Activity, Author, actor, kind};
 use crate::jobs::{JobError, JobOutcome};
 
 const MAX_PATH_LEN: usize = 4096;
@@ -197,52 +197,79 @@ pub fn truncate(text: &str, max: usize) -> String {
     )
 }
 
-/// Run `tool` on the paired runner of `space`, recording the call and its
-/// result as shared events in `room`. `caller` is the author of the call event.
+/// Run `tool` on the runner serving `space` (dedicated or attached), recording the call and its
+/// result as shared events in `room`. `caller` is the author of the call event;
+/// `activity`, the agent turn or Demo run making the call, tags all of them.
 pub async fn call_runner(
     state: &AppState,
     space: &str,
     room: &str,
     caller: &Author,
+    activity: Option<&Activity>,
     tool: RunnerTool,
     arguments: Value,
 ) -> Result<JobOutcome, JobError> {
     let limits = &state.config.limits;
     let call_text = format!("{} {}", tool.runner_name(), arguments);
     state
-        .append(
+        .append_with(
             space,
             room,
             kind::TOOL_CALL,
             caller,
             &truncate(&call_text, limits.max_event_text),
+            activity,
         )
         .await;
 
-    let result = state.jobs.run(space, tool.runner_name(), arguments).await;
+    // The job is bound to whoever serves the Space right now; if that
+    // changes before a runner answers, the job fails instead of crossing to
+    // the new runner.
+    let generation = {
+        let space = space.to_owned();
+        state
+            .db
+            .call(move |db| db.space_runner_generation(&space))
+            .await
+    };
+    let result = match generation {
+        Ok(Some(generation)) => {
+            state
+                .jobs
+                .run(space, generation, tool.runner_name(), arguments)
+                .await
+        }
+        Ok(None) => Err(JobError::CredentialChanged),
+        Err(e) => {
+            tracing::error!(error = %format!("{e:#}"), "reading the Space's runner generation");
+            Err(JobError::CredentialChanged)
+        }
+    };
     match &result {
         Ok(outcome) => {
             let status = if outcome.ok { "ok" } else { "failed" };
             let text = format!("{} {status}\n{}", tool.runner_name(), outcome.output);
             state
-                .append(
+                .append_with(
                     space,
                     room,
                     kind::TOOL_RESULT,
                     &Author::server(actor::RUNNER),
                     &truncate(&text, limits.max_event_text),
+                    activity,
                 )
                 .await;
         }
         Err(e) => {
             let text = format!("{} failed: {e}", tool.runner_name());
             state
-                .append(
+                .append_with(
                     space,
                     room,
                     kind::ERROR,
                     &Author::server(actor::SYSTEM),
                     &text,
+                    activity,
                 )
                 .await;
         }

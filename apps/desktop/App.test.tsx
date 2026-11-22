@@ -39,7 +39,8 @@ test("an account without Spaces lands in its Chat with instructions, no implicit
   await signIn(app, "carol");
   await app.waitFor("id:onboarding");
   expect(app.shows("text:You're not in any Space yet")).toBe(true);
-  expect(app.shows("id:onboarding-id")).toBe(true);
+  // The ID isn't repeated here: it's in the sidebar's footer and Settings › Profile.
+  expect(app.shows("id:onboarding-id")).toBe(false);
   expect(text(app)).toContain("carol");
   expect(f.state.log.some((l) => l.path.includes("/rooms"))).toBe(false);
   const first = app.requests()[0];
@@ -146,18 +147,21 @@ test("reactions: add and remove mine, fold the agent's acknowledgement, no extra
   expect(text(app)).not.toContain("target_event_id");
 });
 
-test("Demo needs this Space's paired runner", async () => {
+test("Demo needs this Space's runner and shows its tool output collapsed", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "alice");
   await openAcme(app);
-  expect(app.shows("text:Runner paired")).toBe(true);
+  expect(app.shows("text:Runner attached")).toBe(true);
   await app.press("id:run-demo");
-  await app.waitFor("text:/README\\.md/");
+  // One collapsed Runner activity group: Demo is deterministic, so nothing says "thinking".
+  await app.waitFor("text:Runner activity");
+  expect(app.shows("text:/thinking/")).toBe(false);
+  expect(app.shows("text:README.md\nsrc/")).toBe(false); // collapsed until opened
   expect(f.posts().at(-1)).toMatchObject({ path: "/v1/spaces/acme/rooms/lobby/demo", body: {} });
 
   await app.press("id:space:side");
-  await app.waitFor("text:No runner paired");
+  await app.waitFor("text:No runner");
   expect(app.enabled("id:run-demo")).toBe(false);
 });
 
@@ -174,13 +178,20 @@ test("owners manage members and see a runner token once; members can't manage", 
   await app.press("id:remove-member:carol");
   await app.waitFor("id:member:carol", { state: "gone" });
 
+  // Acme has a dedicated (legacy) token: the owner can still rotate it.
+  await app.waitFor("id:dedicated-runner");
   await app.press("id:issue-runner-token");
   await app.waitFor("id:runner-token-value");
+  expect(text(app)).not.toContain("secret-runner-token-"); // masked until asked
+  await app.press("id:copy-runner-token");
+  expect(app.clipboard()).toContain("secret-runner-token-");
+  await app.press("id:reveal-toggle");
   expect(text(app)).toContain("secret-runner-token-");
   await app.press("id:close-manage"); // leaving the view forgets it
   await app.press("id:manage-space");
   await app.waitFor("id:runner-card");
   expect(text(app)).not.toContain("secret-runner-token-");
+  expect(JSON.stringify(app.storage())).not.toContain("secret-runner-token-");
 
   await app.press("id:space:side"); // Bob owns Side; Alice is a member
   await app.waitFor("text:side lobby only");
@@ -263,7 +274,392 @@ test("long tool output starts folded and expands on demand", async () => {
   const app = await openApp(f);
   await signIn(app, "alice");
   await openAcme(app);
+  const ev = f.state.events.get("acme/lobby")!.at(-1)!;
+  // Uncorrelated (older) output: its own collapsed group, opened once.
+  await app.waitFor(`id:activity-toggle:event:${ev.id}`);
+  await app.press(`id:activity-toggle:event:${ev.id}`);
   await app.waitFor("text:Show all 30 lines");
   await app.press("text:Show all 30 lines");
   await app.waitFor("text:Show less");
+});
+
+// ------------------------------------------------------------------ Settings
+
+const RUNNER_SECRET = "metro_rt_v2_secret";
+const DEVICE_SECRET = "metro_pc_secret";
+
+async function openSettings(app: App, section: "runners" | "providers" | "appearance") {
+  if (!app.shows(`id:nav-settings:${section}`)) await app.press("id:nav-settings");
+  await app.press(`id:nav-settings:${section}`);
+  await app.waitFor(`id:${section}-settings`);
+}
+
+/** Add a connection: the provider from the drop-down, then one of its ways to connect. */
+async function chooseProvider(app: App, vendor: string, id: string) {
+  await app.press("id:provider-picker");
+  await app.press(`id:provider-picker:${vendor}`);
+  await app.waitFor(`id:provider-ways:${vendor}`);
+  await app.press(`id:provider:${id}`);
+}
+
+test("Settings work without any Space; a personal runner's token is shown once, masked, with a Docker template that never holds it", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "carol");
+  await app.waitFor("id:onboarding");
+  await openSettings(app, "runners");
+  await app.waitFor("text:No runners yet");
+  // Not an org admin: organization runners can't be chosen.
+  expect(app.enabled("id:runner-visibility:organization")).toBe(false);
+
+  await app.type("id:runner-name", "Carol laptop");
+  await app.press("id:add-runner");
+  await app.waitFor("id:token-reveal");
+  expect(f.posts().at(-1)).toMatchObject({ method: "POST", path: "/v1/runners", body: { name: "Carol laptop", visibility: "personal" } });
+  expect(text(app)).not.toContain(RUNNER_SECRET);
+  // The prebuilt standalone runner comes first: this version's release files, a mode-600 token file, never the token.
+  const run = app.texts().find((t) => t.startsWith("mkdir -p")) ?? "";
+  expect(run).toContain("METRO_RUNNER_TOKEN_FILE=\"$PWD/runner.token\"");
+  expect(run).toContain("METRO_WORKSPACE=\"$HOME/metro-runner-carol-laptop\"");
+  expect(run).not.toContain(RUNNER_SECRET);
+  expect(text(app)).toContain("Get the matching prebuilt runner from Metro Releases, or pull this version's image when available.");
+  for (const banned of ["docker build", "cargo", "git clone", "isn't published"]) expect(text(app)).not.toContain(banned);
+  // Docker is the alternative: env file, named volume, never the token.
+  expect(app.shows("id:setup-docker")).toBe(false);
+  await app.press("id:setup-docker-toggle");
+  const docker = app.texts().find((t) => t.startsWith("docker run")) ?? "";
+  expect(docker).toContain("--env-file ./runner.env");
+  expect(docker).toContain("-v metro-runner-carol-laptop-workspace:/workspace");
+  expect(docker).toContain("--network host"); // the server is on this machine
+  expect(docker).not.toContain(RUNNER_SECRET);
+  expect(text(app)).toContain("METRO_RUNNER_TOKEN=<paste the runner token here>");
+  await app.press("id:setup-docker-copy");
+  expect(app.clipboard()).not.toContain(RUNNER_SECRET);
+  await app.press("id:copy-runner-token");
+  expect(app.clipboard()).toContain(RUNNER_SECRET);
+  await app.press("id:reveal-toggle");
+  expect(text(app)).toContain(RUNNER_SECRET);
+
+  // Closing Settings forgets it; the runner is listed without it.
+  await app.press("id:settings-close");
+  await openSettings(app, "runners");
+  await app.waitFor("text:Carol laptop");
+  expect(text(app)).not.toContain(RUNNER_SECRET);
+  expect(JSON.stringify(app.storage())).not.toContain(RUNNER_SECRET);
+});
+
+test("org admins add organization runners; others see them but can't manage them; rotate and delete say which Spaces they affect", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await openSettings(app, "runners");
+  await app.type("id:runner-name", "Shared CI");
+  await app.press("id:runner-visibility:organization");
+  await app.press("id:add-runner");
+  await app.waitFor("id:token-reveal");
+  await app.press("id:hide-runner-token");
+  const org = [...f.state.runners.values()].find((r) => r.name === "Shared CI")!;
+  expect(org.visibility).toBe("organization");
+  f.state.attached.set("side", org.id); // Bob attached it to his Space
+
+  await app.waitFor(`id:rotate-runner:${org.id}`);
+  await app.press(`id:rotate-runner:${org.id}`);
+  await app.waitFor("text:/Spaces you belong to that use it: Side project/");
+  await app.press("id:confirm-rotate-runner");
+  await app.waitFor("text:/New token for/");
+  expect(text(app)).not.toContain(org.token);
+  await app.press("id:hide-runner-token");
+
+  await app.press(`id:delete-runner:${org.id}`);
+  await app.waitFor("text:/Deleting revokes its token/");
+  await app.press("id:confirm-delete-runner");
+  await app.waitFor("text:/It no longer serves any Space/");
+  expect(f.state.runners.has(org.id)).toBe(false);
+  expect(f.state.attached.has("side")).toBe(false);
+
+  // Bob sees an organization runner but has no rotate or delete for it.
+  const other = f.addRunner("Org builder", "organization", "alice");
+  const bob = await openApp(f);
+  await signIn(bob, "bob");
+  await openSettings(bob, "runners");
+  await bob.waitFor("text:Org builder");
+  expect(bob.shows(`id:rotate-runner:${other.id}`)).toBe(false);
+  expect(bob.shows(`id:delete-runner:${other.id}`)).toBe(false);
+  expect(bob.shows("text:Organization · managed by org admins. You can attach it to Spaces you own.")).toBe(true);
+});
+
+test("a Space owner attaches and detaches a runner from the same list; attached is not online", async () => {
+  const f = world();
+  const org = f.addRunner("Org builder", "organization", "alice");
+  const mine = f.addRunner("Bob desktop", "personal", "bob");
+  f.addRunner("Alice private", "personal", "alice"); // invisible to Bob
+  const app = await openApp(f);
+  await signIn(app, "bob");
+  await app.press("id:space:side");
+  await app.waitFor("text:side lobby only");
+  await app.press("id:manage-space");
+  await app.waitFor("id:attach-runner-list");
+  expect(app.shows(`id:attachable:${org.id}`)).toBe(true);
+  expect(app.shows(`id:attachable:${mine.id}`)).toBe(true);
+  expect(app.shows("text:Alice private")).toBe(false);
+
+  await app.press(`id:attach-runner:${mine.id}`);
+  await app.waitFor("id:attached-runner");
+  expect(f.posts().at(-1)).toMatchObject({ method: "PUT", path: "/v1/spaces/side/runner", body: { runner_id: mine.id } });
+  expect(text(app)).toContain("it doesn't mean the runner is online");
+  expect(text(app)).not.toContain(mine.token);
+
+  await app.press("id:detach-runner");
+  await app.press("id:confirm-detach");
+  await app.waitFor("id:attach-runner-list");
+  expect(f.state.attached.has("side")).toBe(false);
+  await app.press("id:open-runner-settings");
+  await app.waitFor("id:runners-settings");
+});
+
+test("Model providers come from the server's catalog: an API profile with a key, Save and fetch models, then pick one", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await openSettings(app, "providers");
+  await app.waitFor("id:provider-picker");
+  // No wall of provider cards: one compact drop-down until a provider is chosen.
+  expect(app.shows("id:provider:openai")).toBe(false);
+  expect(app.shows("id:provider:device-openai-oauth")).toBe(false);
+
+  await chooseProvider(app, "openai", "openai");
+  await app.waitFor("id:server-form");
+  expect(app.shows("id:provider-choice >> text:API key")).toBe(true);
+  expect(app.shows("id:provider-choice >> text:Only you, until you share it")).toBe(true);
+  await app.press("id:provider-save-fetch");
+  await app.waitFor("id:provider-form-error"); // a key is required
+  await app.type("id:provider-key", "sk-test-not-real");
+  await app.press("id:provider-save-fetch");
+  const c = await waitConnection(app, f, "OpenAI API");
+  expect(f.posts().find((p) => p.path === "/v1/providers")?.body).toMatchObject({ provider_id: "openai", api_key: "sk-test-not-real" });
+  await app.waitFor(`id:model:${c.id}:gpt-fixture-2`);
+  await app.press(`id:model:${c.id}:gpt-fixture-2`);
+  await app.waitUntil(() => f.state.connections.get(c.id)!.model === "gpt-fixture-2");
+  expect(text(app)).not.toContain("sk-test-not-real"); // never read back
+  expect(app.shows(`id:connection-default:${c.id}`)).toBe(true);
+});
+
+async function waitConnection(app: App, f: ReturnType<typeof fakeServer>, name: string) {
+  await app.waitUntil(() => [...f.state.connections.values()].some((c) => c.name === name));
+  const c = [...f.state.connections.values()].find((x) => x.name === name)!;
+  await app.waitFor(`id:connection:${c.id}`);
+  return c;
+}
+
+test("custom endpoints must be approved exactly; an endpoint that can't list models asks for a model ID", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await openSettings(app, "providers");
+  await chooseProvider(app, "custom", "custom");
+  await app.type("id:provider-base-url", "http://127.0.0.1:11434/v1/other");
+  const before = f.posts().length;
+  await app.press("id:provider-save-fetch");
+  await app.waitFor("text:/isn't on the server's approved list/");
+  expect(f.posts().length).toBe(before); // refused before any request
+
+  await app.clear("id:provider-base-url");
+  await app.press("id:provider-url:http://127.0.0.1:11434/v1");
+  await app.press("id:provider-save-fetch");
+  const c = await waitConnection(app, f, "Custom OpenAI-compatible endpoint");
+  await app.waitFor(`id:listing-error:${c.id}`);
+  expect(text(app)).toContain("enter the model ID by hand");
+  await app.type(`id:connection-model-input:${c.id}`, "llama-local");
+  await app.press(`id:connection-model-save:${c.id}`);
+  await app.waitUntil(() => f.state.connections.get(c.id)!.model === "llama-local");
+});
+
+test("a device connection: no vendor key in Metro, a masked device token with metro-connector steps, offline then online", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "bob");
+  await openSettings(app, "providers");
+  await chooseProvider(app, "custom", "device-openai-compatible");
+  await app.waitFor("id:device-form");
+  expect(app.shows("id:provider-key")).toBe(false); // no key or password field for devices
+  await app.clear("id:provider-name");
+  await app.type("id:provider-name", "Home GPU");
+  await app.press("id:provider-create-device");
+  await app.waitFor("id:token-reveal");
+  const c = [...f.state.connections.values()].find((x) => x.name === "Home GPU")!;
+  expect(f.posts().map((p) => p.path)).toContain(`/v1/providers/${c.id}/device-token`);
+  expect(text(app)).not.toContain(DEVICE_SECRET);
+  expect(text(app)).toContain(`metro-connector setup --profile home-gpu --server-url ${BASE} --kind device-openai-compatible`);
+  expect(text(app)).toContain("metro-connector run --profile home-gpu");
+  expect(text(app)).toContain("1. Run setup.");
+  expect(text(app)).not.toContain("cargo");
+
+  await app.waitFor(`id:device-status:${c.id} >> text:Paired · offline`);
+  await app.press("id:reveal-test-connection");
+  await app.waitFor(`id:listing-error:${c.id}`);
+  expect(text(app)).toContain("metro-connector for this connection didn't answer");
+  f.state.online.add(c.id);
+  await app.press("id:reveal-test-connection");
+  await app.waitFor(`id:listing-ok:${c.id}`);
+  await app.waitFor(`id:device-status:${c.id} >> text:Online`);
+  await app.press("id:hide-runner-token");
+  await app.waitFor(`id:connection:${c.id}`);
+  expect(app.shows(`id:connection:${c.id} >> text:Online`)).toBe(true);
+  expect(text(app)).not.toContain(DEVICE_SECRET);
+  await app.press(`id:model:${c.id}:fixture-local-large`);
+  await app.waitUntil(() => f.state.connections.get(c.id)!.model === "fixture-local-large");
+
+  // Unpairing asks first and leaves the connection (and Metro sign-in) in place.
+  await app.press(`id:connection-unpair:${c.id}`);
+  await app.waitFor(`id:connection-confirm-unpair:${c.id}`);
+  await app.press(`id:connection-confirm-unpair-now:${c.id}`);
+  await app.waitFor(`id:device-status:${c.id} >> text:Not paired`);
+  expect(f.state.connections.get(c.id)!.deviceToken).toBe(null);
+  expect(app.shows("id:workspace")).toBe(true);
+
+  // A new device token pairs it again; delete asks first.
+  await app.press(`id:connection-token:${c.id}`);
+  await app.waitFor("text:/New device token for/");
+  await app.press("id:settings-close"); // closing Settings wipes it
+  await openSettings(app, "providers");
+  expect(text(app)).not.toContain(DEVICE_SECRET);
+  await app.press(`id:connection-delete:${c.id}`);
+  await app.press(`id:connection-confirm-delete-now:${c.id}`);
+  await app.waitFor(`id:connection:${c.id}`, { state: "gone" });
+  expect(f.state.connections.has(c.id)).toBe(false);
+});
+
+test("Appearance is a Settings page", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "carol");
+  await openSettings(app, "appearance");
+  expect(app.shows("id:appearance-settings")).toBe(true);
+});
+
+test("Settings opens as a modal over a room and closes back to the same room and draft", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await openAcme(app);
+  await app.type("id:composer", "half-written thought");
+  // The sidebar has one Settings entry; its sections live only in the modal.
+  expect(app.shows("id:nav-settings:runners")).toBe(false);
+  await app.press("id:nav-settings");
+  await app.waitFor("id:settings-dialog");
+  expect(app.count("id:nav-settings:providers")).toBe(1);
+  await app.press("id:nav-settings:profile");
+  await app.waitFor("id:profile-settings");
+  await app.press("id:nav-settings:providers");
+  await app.waitFor("id:providers-settings");
+
+  // Escape (back) closes it: the same Space, room and draft, nothing sent.
+  const before = f.posts().length;
+  await app.back();
+  await app.waitFor("id:settings-dialog", { state: "gone" });
+  expect(app.shows("text:# lobby")).toBe(true);
+  expect(app.value("id:composer")).toBe("half-written thought");
+  expect(f.posts().length).toBe(before);
+
+  // It reopens where it was; Close returns again.
+  await app.press("id:nav-settings");
+  await app.waitFor("id:providers-settings");
+  await app.press("id:settings-close");
+  await app.waitFor("id:settings-dialog", { state: "gone" });
+  expect(app.value("id:composer")).toBe("half-written thought");
+  expect(app.shows("text:hello from bob in acme")).toBe(true);
+});
+
+test("Settings opened from a Space's management returns to it; a runner token shown in Settings is gone after closing", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "bob");
+  await app.press("id:space:side");
+  await app.waitFor("text:side lobby only");
+  await app.press("id:manage-space");
+  await app.waitFor("id:attach-runner-list");
+  await app.press("id:open-runner-settings");
+  await app.waitFor("id:runners-settings");
+  await app.type("id:runner-name", "Bob laptop");
+  await app.press("id:add-runner");
+  await app.waitFor("id:token-reveal");
+  await app.press("id:settings-close");
+  await app.waitFor("id:attach-runner-list"); // still managing Side
+  await app.press("id:nav-settings");
+  await app.waitFor("id:runners-settings");
+  expect(app.shows("id:token-reveal")).toBe(false);
+  expect(text(app)).not.toContain(RUNNER_SECRET);
+});
+
+test("the provider picker is one compact drop-down; OpenAI and Anthropic each group their ways to connect", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await openSettings(app, "providers");
+  await app.press("id:provider-picker");
+  await app.waitFor("id:provider-picker:openai");
+  expect(app.count("id:provider-picker:openai")).toBe(1); // ChatGPT sign-in, API key and embeddings: one entry
+  expect(app.shows("id:provider-picker:anthropic")).toBe(true);
+  expect(app.shows("id:provider-picker:custom")).toBe(true);
+  expect(app.shows("id:provider-picker:device-openai-oauth")).toBe(false);
+  await app.press("id:provider-picker:openai");
+  await app.waitFor("id:provider-ways:openai");
+  expect(app.shows("id:provider:device-openai-oauth")).toBe(true);
+  expect(app.shows("id:provider:openai")).toBe(true);
+  expect(app.shows("id:provider:openai-embeddings")).toBe(true);
+  expect(app.shows("id:provider-way:device-openai-oauth >> text:Sign in with ChatGPT")).toBe(true);
+  expect(app.shows("id:provider:anthropic")).toBe(false);
+
+  await app.press("id:provider:device-openai-oauth");
+  await app.waitFor("id:device-form");
+  expect(app.shows("id:provider-choice >> text:On your device")).toBe(true);
+  expect(app.shows("id:provider-choice >> text:Your own ChatGPT plan; can't be shared or lent")).toBe(true);
+  expect(app.shows("id:provider-key")).toBe(false);
+
+  // Another provider starts afresh: Anthropic's ways, no OpenAI form left behind.
+  await app.press("id:provider-picker");
+  await app.press("id:provider-picker:anthropic");
+  await app.waitFor("id:provider-ways:anthropic");
+  expect(app.shows("id:device-form")).toBe(false);
+  expect(app.shows("id:provider:device-claude-code")).toBe(true);
+  expect(app.shows("id:provider:anthropic")).toBe(true);
+  expect(app.shows("id:provider:openai")).toBe(false);
+});
+
+test("saved connections are grouped by provider, two ways of one provider under one heading", async () => {
+  const f = world();
+  const api = f.addConnection("alice", "openai", "Work API", "gpt-fixture-2");
+  const sub = f.addConnection("alice", "device-openai-oauth", "My ChatGPT", "gpt-sub");
+  const emb = f.addConnection("alice", "custom-embeddings", "Home embeddings", "nomic-embed-text");
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await openSettings(app, "providers");
+  await app.waitFor("id:connection-group:openai");
+  expect(app.shows(`id:connection-group:openai >> id:connection:${api.id}`)).toBe(true);
+  expect(app.shows(`id:connection-group:openai >> id:connection:${sub.id}`)).toBe(true);
+  expect(app.shows(`id:connection-group:custom >> id:connection:${emb.id}`)).toBe(true);
+  expect(app.shows(`id:connection:${api.id} >> text:/API key · gpt-fixture-2/`)).toBe(true);
+  expect(app.shows(`id:connection:${sub.id} >> text:/Sign in with ChatGPT · gpt-sub/`)).toBe(true);
+  // Compact until opened: management controls stay hidden.
+  expect(app.shows(`id:connection-delete:${api.id}`)).toBe(false);
+  await app.press(`id:connection-manage:${api.id}`);
+  await app.waitFor(`id:connection-delete:${api.id}`);
+  expect(text(app)).not.toContain("sk-fixture-not-real");
+});
+
+test("a late settings answer never lands after sign-out or in the next user's session", async () => {
+  const f = world();
+  f.addRunner("Alice private", "personal", "alice");
+  f.state.delays.set("/v1/runners", 600);
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await app.press("id:nav-settings");
+  await app.press("id:settings-close");
+  await app.press("id:disconnect"); // while GET /v1/runners is still on its way
+  f.state.delays.delete("/v1/runners");
+  await signIn(app, "bob");
+  await openSettings(app, "runners");
+  await app.waitFor("text:No runners yet");
+  await app.wait(800);
+  expect(app.shows("text:Alice private")).toBe(false);
 });

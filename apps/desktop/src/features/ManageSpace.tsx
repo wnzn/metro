@@ -1,24 +1,27 @@
-// Owner-only management of the active Space: members and the runner token.
+// Owner-only management of the active Space: members, and which runner
+// serves it (an attached registered runner, or its own dedicated token).
 
-import { Clipboard, signal } from "nsh";
+import { signal } from "nsh";
+import { activeSpace, addMember, closeManage, manageError, me, memberBusy, members, notice, openSettings, removeMember } from "../store";
 import {
-  activeSpace,
-  addMember,
-  closeManage,
-  hideRunnerToken,
-  issueRunnerToken,
-  manageError,
-  me,
-  memberBusy,
-  members,
-  notice,
-  removeMember,
-  revealedRunnerToken,
-  revokeRunnerToken,
-  runnerBusy,
-} from "../store";
-import { Action, Badge, Banner, Column, Divider, Field, Label, Row, ScrollArea, SecretValue, Surface } from "../ui";
+  activeSpaceRunner,
+  attachableRunners,
+  attachRunner,
+  detachRunner,
+  issueDedicatedToken,
+  registeredRunnersSupported,
+  revealed,
+  revokeDedicatedToken,
+  runners,
+  spaceRunnerBusy,
+  spaceRunnerNotice,
+} from "../settings";
+import type { SpaceRunner } from "../settings";
+import { Action, Badge, Banner, Column, Divider, Field, Label, Row, ScrollArea, Surface } from "../ui";
 import { ConnectionBanner } from "./Conversation";
+import { TokenReveal } from "./TokenReveal";
+import { LocalToolsCard } from "./localtools/LocalToolsCard";
+import { clearLocalToolsMessages, loadLocalTools } from "./localtools/localTools";
 
 export function ManageSpace() {
   return (
@@ -33,7 +36,23 @@ export function ManageSpace() {
         <Action testID="close-manage" label="Back to room" onPress={closeManage} />
       </Surface>
       <ConnectionBanner />
-      <ScrollArea pad={4} gap={4}>
+      <If when={revealed()?.kind === "dedicated"} else={<ManageBody />}>
+        <ScrollArea pad={6}>
+          <Surface variant="content">
+            <TokenReveal />
+          </Surface>
+        </ScrollArea>
+      </If>
+    </Surface>
+  );
+}
+
+function ManageBody() {
+  // Local tools exist only with the packaged launcher and this computer's own workspace.
+  clearLocalToolsMessages();
+  void loadLocalTools();
+  return (
+    <ScrollArea pad={4} gap={4}>
         <If when={manageError()}>
           {(message) => (
             <Banner tone="danger" testID="manage-error">
@@ -41,7 +60,7 @@ export function ManageSpace() {
             </Banner>
           )}
         </If>
-        <If when={notice()}>
+        <If when={notice() ?? spaceRunnerNotice()}>
           {(message) => (
             <Label variant="caption" color="muted" testID="manage-notice">
               {message()}
@@ -49,9 +68,9 @@ export function ManageSpace() {
           )}
         </If>
         <MembersCard />
+        <LocalToolsCard />
         <RunnerCard />
-      </ScrollArea>
-    </Surface>
+    </ScrollArea>
   );
 }
 
@@ -115,15 +134,13 @@ function MembersCard() {
 }
 
 function RunnerCard() {
-  const confirmRevoke = signal(false);
-  const copied = signal(false);
-  const paired = () => !!activeSpace()?.runnerPaired;
-  const copy = () => {
-    const token = revealedRunnerToken();
-    if (!token) return;
-    Clipboard.writeText(token)
-      .then(() => copied.set(true))
-      .catch(() => {});
+  const confirm = signal<null | "detach" | "revoke">(null);
+  const runner = () => activeSpaceRunner();
+  const badge = () => {
+    const r = runner();
+    if (r === undefined) return { tone: "neutral" as const, label: "Checking…" };
+    if (r === null) return { tone: "neutral" as const, label: "No runner" };
+    return { tone: "runner" as const, label: r.kind === "dedicated" ? "Dedicated token" : "Attached" };
   };
   return (
     <Surface variant="card" pad={4} gap={3} testID="runner-card">
@@ -131,70 +148,159 @@ function RunnerCard() {
         <Column grow gap={1}>
           <Label variant="heading">Runner</Label>
           <Label variant="caption" color="muted">
-            A runner serves only this Space. Paired means a token is issued; it doesn't mean the runner is online.
+            This Space uses at most one runner. Attached or paired means jobs from this Space go to it; it doesn't mean the runner is online.
           </Label>
         </Column>
-        <Badge testID="runner-paired" tone={paired() ? "runner" : "neutral"} label={paired() ? "Paired" : "Not paired"} />
+        <Badge testID="runner-paired" tone={badge().tone} label={badge().label} />
       </Row>
 
-      <If when={revealedRunnerToken()}>
-        {(token) => (
-          <Column gap={2} testID="runner-token-reveal">
-            <Label variant="strong" color="warning">
-              Copy this token now. It is shown once and disappears when you leave this view.
-            </Label>
-            <SecretValue testID="runner-token-value" value={token()} />
-            <Label variant="caption" color="muted">
-              Save it in a file only you can read (chmod 600) and point the runner's METRO_RUNNER_TOKEN at it. Issuing a new one replaces it.
-            </Label>
-            <Row gap={2}>
-              <Action testID="copy-runner-token" label={copied() ? "Copied" : "Copy token"} variant="primary" onPress={copy} />
-              <Action
-                testID="hide-runner-token"
-                label="Done, hide it"
-                onPress={() => {
-                  copied.set(false);
-                  hideRunnerToken();
-                }}
-              />
+      <If when={runner() === undefined}>
+        <Label variant="caption" color="muted">
+          Loading this Space's runner…
+        </Label>
+      </If>
+
+      {/* A registered runner: detach it (it keeps serving its other Spaces). */}
+      <If when={runner()?.kind === "registered" ? (runner() as Extract<SpaceRunner, { kind: "registered" }>) : null}>
+        {(r) => (
+          <Column gap={2} testID="attached-runner">
+            <Row align="center" gap={2}>
+              <Label variant="strong">{r().name}</Label>
+              <Badge tone={r().visibility === "organization" ? "agent" : "neutral"} label={r().visibility === "organization" ? "Organization" : "Personal"} />
             </Row>
+            <Label variant="caption" color="muted">
+              It works in its own folder for this Space (spaces/{activeSpace()?.id ?? ""}/ on the runner). Its token is managed in Settings › Runners.
+            </Label>
+            <If
+              when={confirm() === "detach"}
+              else={<Row><Action testID="detach-runner" label="Detach…" variant="ghost" onPress={() => confirm.set("detach")} /></Row>}
+            >
+              <Row gap={2} wrap>
+                <Action
+                  testID="confirm-detach"
+                  label="Detach now: this Space stops sending it jobs"
+                  busyLabel="Detaching…"
+                  busy={spaceRunnerBusy() === "detach"}
+                  variant="danger"
+                  onPress={() => {
+                    confirm.set(null);
+                    void detachRunner();
+                  }}
+                />
+                <Action label="Cancel" variant="ghost" onPress={() => confirm.set(null)} />
+              </Row>
+            </If>
           </Column>
         )}
       </If>
 
-      <Row gap={2} wrap>
-        <Action
-          testID="issue-runner-token"
-          label={paired() ? "Rotate token" : "Issue token"}
-          busyLabel="Issuing…"
-          busy={runnerBusy() === "issue"}
-          variant={paired() ? "secondary" : "primary"}
-          onPress={() => {
-            copied.set(false);
-            confirmRevoke.set(false);
-            void issueRunnerToken();
-          }}
-        />
-        <If when={paired()}>
-          <If
-            when={confirmRevoke()}
-            else={<Action testID="revoke-runner-token" label="Revoke…" variant="ghost" onPress={() => confirmRevoke.set(true)} />}
-          >
+      {/* The Space's own dedicated token (single-Space, legacy): rotate or revoke it. */}
+      <If when={runner()?.kind === "dedicated"}>
+        <Column gap={2} testID="dedicated-runner">
+          <Label variant="caption" color="muted">
+            A dedicated token serves this Space only. To use a registered runner instead, revoke it first.
+          </Label>
+          <Row gap={2} wrap>
             <Action
-              testID="confirm-revoke"
-              label="Revoke now: the runner stops serving this Space"
-              busyLabel="Revoking…"
-              busy={runnerBusy() === "revoke"}
-              variant="danger"
+              testID="issue-runner-token"
+              label="Rotate token"
+              busyLabel="Issuing…"
+              busy={spaceRunnerBusy() === "issue"}
+              disabled={!!spaceRunnerBusy()}
               onPress={() => {
-                confirmRevoke.set(false);
-                void revokeRunnerToken();
+                confirm.set(null);
+                void issueDedicatedToken();
               }}
             />
-            <Action label="Cancel" variant="ghost" onPress={() => confirmRevoke.set(false)} />
+            <If when={confirm() === "revoke"} else={<Action testID="revoke-runner-token" label="Revoke…" variant="ghost" onPress={() => confirm.set("revoke")} />}>
+              <Action
+                testID="confirm-revoke"
+                label="Revoke now: the runner stops serving this Space"
+                busyLabel="Revoking…"
+                busy={spaceRunnerBusy() === "revoke"}
+                variant="danger"
+                onPress={() => {
+                  confirm.set(null);
+                  void revokeDedicatedToken();
+                }}
+              />
+              <Action label="Cancel" variant="ghost" onPress={() => confirm.set(null)} />
+            </If>
+          </Row>
+        </Column>
+      </If>
+
+      {/* Nobody serves the Space: attach one from the same list as Settings › Runners, or pair a dedicated runner. */}
+      <If when={runner() === null}>
+        <Column gap={3} testID="attach-runner-list">
+          <If when={registeredRunnersSupported()}>
+            <Column gap={1}>
+              <Label variant="strong">Attach a runner</Label>
+              <If
+                when={runners()}
+                else={
+                  <Label variant="caption" color="muted">
+                    Loading runners…
+                  </Label>
+                }
+              >
+                <If
+                  when={attachableRunners().length > 0}
+                  else={
+                    <Label variant="caption" color="muted">
+                      No runner you can attach yet. Add one in Settings › Runners: your personal runners, and the organization's, show up here.
+                    </Label>
+                  }
+                >
+                  <Column gap={1}>
+                    <Each of={attachableRunners()} key={(r) => r.id}>
+                      {(r) => (
+                        <Column gap={1}>
+                          <Row align="center" gap={2} padY={1} testID={`attachable:${r().id}`}>
+                            <Column grow>
+                              <Label lines={1}>{r().name}</Label>
+                            </Column>
+                            <Badge tone={r().visibility === "organization" ? "agent" : "neutral"} label={r().visibility === "organization" ? "Organization" : "Personal"} />
+                            <Action
+                              testID={`attach-runner:${r().id}`}
+                              label="Attach"
+                              busyLabel="Attaching…"
+                              busy={spaceRunnerBusy() === `attach:${r().id}`}
+                              disabled={!!spaceRunnerBusy()}
+                              variant="primary"
+                              onPress={() => void attachRunner(r().id)}
+                            />
+                          </Row>
+                          <Divider />
+                        </Column>
+                      )}
+                    </Each>
+                  </Column>
+                </If>
+              </If>
+              <Row>
+                <Action testID="open-runner-settings" label="Manage runners in Settings" variant="ghost" onPress={() => openSettings("runners")} />
+              </Row>
+            </Column>
           </If>
-        </If>
-      </Row>
+          <Column gap={1}>
+            <Label variant="strong">Or pair a dedicated runner</Label>
+            <Label variant="caption" color="muted">
+              A token for this Space only, shown once. Use it when a runner should never serve another Space.
+            </Label>
+            <Row>
+              <Action
+                testID="issue-runner-token"
+                label="Issue dedicated token"
+                busyLabel="Issuing…"
+                busy={spaceRunnerBusy() === "issue"}
+                disabled={!!spaceRunnerBusy()}
+                onPress={() => void issueDedicatedToken()}
+              />
+            </Row>
+          </Column>
+        </Column>
+      </If>
     </Surface>
   );
 }

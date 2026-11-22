@@ -18,6 +18,23 @@ services:
       METRO_MODEL:
       METRO_MODEL_BASE_URL:
       METRO_MODEL_API_KEY:
+      # Org settings. All optional and unset by default (no public defaults).
+      # METRO_ORG_ADMINS: JSON array of stable user IDs (dev username or OIDC sub), e.g. '["alice"]'.
+      METRO_ORG_ADMINS:
+      # base64 of exactly 32 random bytes; encrypts stored provider keys.
+      METRO_PROVIDER_MASTER_KEY:
+      # JSON array of exact provider endpoint URLs the server may call.
+      METRO_PROVIDER_ALLOWED_BASE_URLS:
+      # Optional library limits; unset or blank values use the server defaults.
+      METRO_LIBRARY_MAX_FILE_BYTES:
+      METRO_LIBRARY_USER_QUOTA_BYTES:
+      METRO_LIBRARY_SPACE_QUOTA_BYTES:
+      METRO_LIBRARY_MAX_FILES_PER_USER:
+      METRO_LIBRARY_MAX_CONCURRENT_UPLOADS:
+      METRO_LIBRARY_MAX_UPLOADS_PER_USER:
+      METRO_LIBRARY_UPLOAD_TIMEOUT_SECS:
+      METRO_LIBRARY_UPLOAD_IDLE_TIMEOUT_SECS:
+      # Only set by compose.provider-key-file.yaml, which mounts the file.
     volumes:
       - server-data:/data
     cap_drop:
@@ -65,5 +82,43 @@ services:
       - no-new-privileges:true
     restart: unless-stopped
 
+  # Reusable registered runner (metro_rt_v2_ tokens). One runner serves every
+  # Space it is registered for and creates spaces/<sid> itself under /workspace.
+  # Default storage is a writable named volume, never the source repo. Start it
+  # explicitly: docker compose --profile reusable-runner up -d registered-runner
+  registered-runner:
+    profiles: [reusable-runner]
+    build:
+      context: .
+      target: runner
+      args:
+        RUNNER_UID: "${METRO_RUNNER_UID:-1000}"
+        RUNNER_GID: "${METRO_RUNNER_GID:-1000}"
+    init: true
+    depends_on:
+      server:
+        condition: service_healthy
+    environment:
+      METRO_SERVER_URL: http://server:8787
+      # This HTTP hop stays inside the Compose network; remote runners use HTTPS.
+      METRO_ALLOW_INSECURE_HTTP: "1"
+      # Registered token from the settings page; supply it at start, don't commit it.
+      METRO_RUNNER_TOKEN: "${METRO_REGISTERED_RUNNER_TOKEN:-}"
+      METRO_WORKSPACE: /workspace
+      METRO_SANDBOX: none
+    volumes:
+      # A volume name (default) or an absolute host path. A host path must
+      # already exist and be writable by METRO_RUNNER_UID:METRO_RUNNER_GID.
+      # A custom volume name must also be declared under top-level volumes.
+      - "${METRO_REGISTERED_WORKSPACES:-metro-workspaces}:/workspace"
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
 volumes:
   server-data:
+  # Shared by name so `docker run -v metro-workspaces:/workspace` sees the same data.
+  metro-workspaces:
+    name: metro-workspaces

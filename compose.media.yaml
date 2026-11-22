@@ -1,0 +1,80 @@
+# Explicitly opt in with -f compose.yaml -f compose.media.yaml.
+# Add http://embeddinggemma2:8795/v1 to METRO_PROVIDER_ALLOWED_BASE_URLS
+# alongside any existing entries. This override doesn't change the allowlist.
+x-media-image: &media-image
+  image: "${COMPOSE_PROJECT_NAME}-embeddinggemma2:local"
+  build:
+    context: ./services/embeddinggemma2
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  pids_limit: 256
+
+services:
+  server:
+    networks: [default, media]
+
+  embeddinggemma2:
+    <<: *media-image
+    mem_limit: "${METRO_EG2_MEMORY_LIMIT:-8g}"
+    environment:
+      EG2_BIND: "0.0.0.0:8795"
+      EG2_MODEL_DIR: /models/embeddinggemma-2
+      EG2_API_KEY_FILE: /run/secrets/metro_eg2_api_key
+      HF_HUB_OFFLINE: "1"
+      TRANSFORMERS_OFFLINE: "1"
+    secrets: [metro_eg2_api_key]
+    volumes:
+      - media-model-cache:/models:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777
+    networks: [media]
+
+  # Explicit one-shot import from an already prepared, trusted local snapshot.
+  # It cannot download weights or see the serving key, even when run manually.
+  embeddinggemma2-prepare:
+    <<: *media-image
+    mem_limit: 256m
+    profiles: [media-prepare]
+    network_mode: none
+    healthcheck:
+      disable: true
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for artifact in config.json config_sentence_transformers.json model.safetensors; do
+          test -r "/model-source/$$artifact" || { echo "Missing or unreadable model snapshot file: $$artifact" >&2; exit 1; }
+        done
+        dest=/tmp/embeddinggemma-2
+        test ! -e "$$dest" || { echo "Model cache already prepared; use a fresh cache for a new snapshot" >&2; exit 1; }
+        stage=$$(mktemp -d /tmp/.prepare.XXXXXX)
+        trap 'rm -rf -- "$$stage"' EXIT
+        cp -R -- /model-source/. "$$stage/"
+        mv -T -- "$$stage" "$$dest"
+    volumes:
+      # The image's sticky /tmp initializes a fresh volume for unprivileged
+      # writes. No privileged bootstrap is needed; serving mounts it at /models.
+      - media-model-cache:/tmp
+      - type: bind
+        source: "${METRO_EG2_MODEL_SOURCE:-/nonexistent/metro-eg2-model-source}"
+        target: /model-source
+        read_only: true
+        bind:
+          create_host_path: false
+
+volumes:
+  media-model-cache:
+
+secrets:
+  # The source file must be readable by the image's non-root user.
+  metro_eg2_api_key:
+    file: "${METRO_EG2_API_KEY_HOST_FILE:-/nonexistent/metro-eg2-api-key}"
+
+networks:
+  media:
+    driver: bridge
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated

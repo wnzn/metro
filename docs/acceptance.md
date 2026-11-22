@@ -3,7 +3,204 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
-## Demonstrated (2026-11-22, integrator, local)
+## Staged: 0.2.0 Linux candidate, local workspace and desktop QA (2026-11-22, project manager, local)
+
+Staged evidence for a **locally built 0.2.0 candidate**, reported by the
+project manager. It isn't a release: nothing has been published. It isn't
+the final gate either, which stays pending until the integration receipts,
+with the latest full test counts, are in.
+
+**Linux candidate GUI QA.** The real packaged launcher and bundled server
+ran in Debian 13 under Xvfb, as a non-root user, from a read-only install,
+with Docker `--network none`.
+
+1. **Open local workspace** opened a local workspace with no token and no
+   remote service.
+2. QA created a Space and posted a message, which showed its time.
+3. In **Settings** (a window over the app) → **Profile**, QA saved a
+   display name and a synthetic PNG avatar chosen through the **native
+   Linux file picker**. The avatar showed next to the message.
+4. QA saw the centered search box at the top, and the vendor-grouped
+   provider dropdown: OpenAI is one row, with three ways to connect.
+5. After quitting, every listener and child process had ended.
+6. On reopening, the same local room, the message, and the saved profile
+   and avatar were all still there
+   ([screenshot](screenshots/local-workspace-relaunch.png),
+   [profile](screenshots/settings-profile.png)). Both screenshots were
+   checked for sanitization.
+
+| Item | Result |
+| --- | --- |
+| In-app device bridge with the bundled server, in a separate packaged smoke | Passed |
+| Device-connection setup screens in the candidate | Still show older `metro-connector` wording; being fixed. In-app device setup isn't verified end to end. |
+| Windows x64 candidate, under Wine on Linux | A Metro window started and the bundled server answered `/healthz` with `200`. No check of drawing or input, and no native Windows run. |
+| Live dev service | The new profile and timestamp read endpoints were checked |
+| Rust integration tests | 566 passed, 0 failed, 2 ignored on purpose |
+| Strict clippy | Passed |
+| `tests/e2e/smoke.py` and `tests/e2e/threads.py` against the server built with timestamps and profiles | Passed |
+
+Not covered: native Windows, macOS, any real vendor account, and Documents
+& media in the candidate. The native file picker was verified for the
+profile picture only, not for library uploads, and audio and video playback
+and seeking weren't tested.
+
+## Staged: admin panel, local accounts, runner package and release targets (2026-11-22, project manager, local and dev service)
+
+Staged evidence, reported by the project manager. It isn't a final gate.
+The next final gate is still pending integration receipts, and the gate
+below stays the current one until then. **Nothing has been released.**
+
+| Item | Result |
+| --- | --- |
+| Backend tests covering the current admin routes (`/admin`, `/` redirect, `GET\|POST /v1/admin/users`, `PATCH /v1/admin/users/{id}`, `POST\|DELETE /v1/admin/users/{id}/token`) | 302 passed |
+| Admin panel browser suite, against a mock server | 19/19 passed |
+| Admin panel in headless Chromium against a real `metro-server` with a throwaway, isolated database | Passed: see below |
+| Dev service deployment | `/admin` and its assets served; an authenticated admin JSON request succeeded; an anonymous one got `401`. Checked through the service's own bound dev address, which these docs don't name. |
+| Prebuilt Linux runner package | Assembled locally, checksum validated, and a real `workspace.read` smoke against a fixture server passed |
+| Windows server build | Cross-built, started under Wine, and `/healthz` returned `200`. Not a GUI check, and not native Windows. |
+| Release target names | Verified as targets: `ghcr.io/wnzn/metro-server:<tag>`, `ghcr.io/wnzn/metro-runner:<tag>`, `Metro-0.2.0-windows-x64.zip`, `Metro-0.2.0-linux-x64.tar.gz`, `Metro-runner-0.2.0-linux-x64.tar.gz`, each with `.sha256` |
+
+**The headless browser run, step by step:**
+
+1. Signed in to the panel as the environment bootstrap admin.
+2. Added a managed user in the panel.
+3. With that user's returned bearer token, `GET /v1/me` returned `200` and
+   the admin user list returned `403`.
+4. Rotated the token in the panel. The old token returned `401` at once.
+5. Revoked the token in the panel. The new token returned `401`.
+6. Signed out.
+
+No secret was logged, and no screenshot was taken.
+
+Not yet recorded:
+
+- Publishing any release file or image. Nothing has been released.
+- The runner package as a published release download, and the runner
+  image pulled from GHCR.
+- The desktop app on native Windows, or any Windows GUI run.
+- The desktop changes that were planned at the time. Most of them were
+  later checked in the 0.2.0 Linux candidate
+  ([below](#staged-020-linux-candidate-local-workspace-and-desktop-qa-2026-11-22-project-manager-local)).
+
+## Staged: profiles and message times API (2026-11-22, project manager, local)
+
+Server-side receipts. Not a final gate, and nothing has been released. The
+desktop interface for both features is pending and not verified.
+
+| Item | Result |
+| --- | --- |
+| Server tests | 323 passed. The lanes' suites overlap, so don't add this to other counts. |
+| Profile routes | `GET` and `PATCH /v1/me/profile` with `{id, display_name, bio: null\|string (≤ 280), avatar_version: null\|string}`. Avatars: PNG or JPEG, raw ≤ 1 MiB and ≤ 4096 px a side, re-encoded to a PNG ≤ 256 px a side with no metadata. Reads limited to yourself and current Space co-members, with no admin bypass. |
+| Event times | Every HTTP event has an additive `created_at`: RFC 3339 UTC with milliseconds, or `null`. It's immutable server time on posted and returned messages, events stay sorted by id, and no time is invented. |
+| Agent context | `sent_at` on current and earlier user-context messages and on a parent thread's task, while earlier assistant replies stay plain assistant text; plus the server's UTC time at run start. Verified with a scripted provider and a device connection across Chat, rooms, threads and schedules. |
+
+Not recorded in this entry: the desktop app. Profile editing and avatars
+were later verified in the 0.2.0 Linux candidate, and the live dev
+service's profile and timestamp reads were checked
+([below](#staged-020-linux-candidate-local-workspace-and-desktop-qa-2026-11-22-project-manager-local)).
+
+## Demonstrated: final local gate with Documents & media (2026-11-22, primary workspace, local)
+
+This is the current gate. It ran on the primary workspace, with every
+full-process script using the same verified final binaries. The [System One
+milestone gate](#historical-final-gate-for-the-system-one-milestone-2026-11-22-independent-reviewer-local)
+below is kept for the record and is superseded by this one.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check`, strict `cargo clippy --locked --workspace --all-targets -- -D warnings`, `git diff --check` | pass |
+| `cargo test --locked --workspace --no-fail-fast`: **497 passed, 0 failed, 1 ignored** (a doctest). All 7 Docker sandbox tests ran, against a pinned image. | pass |
+| Locked debug builds of `metro-server`, `metro-runner` and `metro-connector`, and the locked release `metro-connector` | pass |
+| All **seven** full-process e2e scripts: [smoke](../tests/e2e/smoke.py), [threads](../tests/e2e/threads.py), [settings](../tests/e2e/settings.py), [device_connector](../tests/e2e/device_connector.py), [schedules](../tests/e2e/schedules.py), [intelligence](../tests/e2e/intelligence.py) and [library](../tests/e2e/library.py). `library.py` ran twice. | pass |
+| Media reference service: the 83 hardened worker tests, and `tests/e2e/library_reference.py` (Metro through the real reference HTTP app, with the test-only encoder) | pass, as [below](#demonstrated-documents--media-with-synthetic-fixtures-2026-11-22-qa-local) |
+| Desktop: `nsh check`, `nsh test .` **106/106**, and the build. There are 6 native Linux captures. | pass |
+
+**`library.py`'s expectation was changed once, for correct behaviour.**
+When a model share is revoked, the borrower's later search now gets `200`
+with **empty results**. There are no file identifiers, no hits, and no
+model call. Indexing again with that connection is refused. The script used
+to expect an error there.
+
+Every model in this gate was a local fixture, a scripted endpoint or a
+test-only encoder. **No pretrained `google/embeddinggemma-2` weights were
+downloaded, and no ranking quality was tested.** No commercial vendor was
+validated. Native audio and video playback, seeking, and the native file
+picker (portal) weren't verified. **Nothing was published or released.**
+
+## Historical: final gate for the System One milestone (2026-11-22, independent reviewer, local)
+
+Superseded by the [current gate](#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local). It's kept as a record of that milestone.
+
+An independent reviewer ran this on the primary checkout with Rust 1.98.1.
+It supersedes the earlier backend gate below. The full report and the test
+log were local files (`/tmp/opencode/metro-intelligence-primary-gates.md`
+and `metro-intelligence-workspace-test.log`) and aren't in the repo.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | pass |
+| `cargo test --locked --workspace --no-fail-fast`: **403 passed, 0 failed, 1 ignored** (a connector doctest). By crate: auth 37, connector 76, model-protocol 13, runner 64, server 213. All 7 Docker sandbox tests ran, against a pinned Alpine image. | pass |
+| Locked debug builds of `metro-server`, `metro-runner` and `metro-connector`, and `cargo build --locked --release --bin metro-connector` | pass |
+| `docker build --target server` and `--target runner`. Both images run their binaries as non-root, with networking disabled. | pass |
+| Workspace example check, `actionlint`, and Compose service selection (default and registered runner) | pass |
+| All six e2e scripts, run separately against `target/debug` within CI deadlines: [smoke](../tests/e2e/smoke.py), [threads](../tests/e2e/threads.py), [settings](../tests/e2e/settings.py), [device_connector](../tests/e2e/device_connector.py) and [intelligence](../tests/e2e/intelligence.py) (60 s each), and [schedules](../tests/e2e/schedules.py) (150 s; it took 57 s) | pass |
+| Supplemental: `schedules.py --live-recurring`, a real scheduled occurrence on the live clock ([details](#demonstrated-scheduled-prompts-end-to-end-2026-11-22-scheduler-lane-local)) | pass |
+| Desktop: `nsh check`, `nsh test` 99/99 and `nsh build App.tsx`, with the native screenshots checked ([details](#demonstrated-desktop-model-routing-sharing-and-route-attribution-2026-11-22-frontend-lead-local)) | pass |
+
+Every vendor-facing check used local fixtures or scripted models.
+**Commercial vendors haven't been validated**: no real TypeSafe, OpenAI,
+Anthropic, Gemini or embeddings account, no live ChatGPT sign-in, and no
+production OIDC. Nothing was published.
+
+## Earlier backend gate (2026-11-22, integrator, local)
+
+This is superseded by the final gate above. It ran on the primary workspace,
+with registered runners, model connections and the device connector. It covers the Rust workspace and the
+end-to-end scripts. The desktop results are listed separately
+([below](#demonstrated-native-desktop-2026-11-22-frontend-local)).
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --all -- --check` | pass |
+| `cargo clippy --locked --workspace --all-targets -- -D warnings` | pass |
+| `cargo test --locked --workspace`: 298 passed, 0 failed, 1 ignored (a doctest). This includes the Docker sandbox tests, run against a pinned Alpine image (`METRO_TEST_DOCKER_IMAGE` set). | pass |
+| `cargo build --locked --release --bin metro-connector` | pass |
+| `python3 tests/e2e/smoke.py --timeout 60`, against rebuilt binaries | pass |
+| `python3 tests/e2e/threads.py --timeout 60`, against rebuilt binaries | pass |
+| `python3 tests/e2e/settings.py --timeout 60`, against rebuilt binaries | pass |
+| `python3 tests/e2e/device_connector.py --timeout 60`, against rebuilt binaries | pass |
+| Compose with a shared organization runner ([below](#demonstrated-compose-with-a-shared-organization-runner-2026-11-22-integrator-local)) | pass |
+| `actionlint` on `.github/workflows/ci.yml` | pass |
+
+The workspace tests include:
+
+- **The server's tests:**
+  - Native Anthropic and Gemini fixtures.
+  - Keyless local endpoints, which send no auth header.
+  - The base URL allowlist, and no redirects.
+  - Encrypted keys bound to their owner and connection.
+- **The connector's tests:**
+  - The library tests, the Claude adapter's tests among them, run against a
+    stub CLI and a stub Anthropic API.
+  - `--test companion`: the real connector binary against loopback Metro
+    fixtures.
+  - `--test openai_oauth`: Sign in with ChatGPT against an inert fixture with
+    fake OIDC, JWKS, token, revocation, model and SSE endpoints, plus a
+    scripted browser.
+- **The runner's tests:** registered runner and per-Space sandbox tests.
+
+All of these use fixtures. None used a vendor account, a real CLI or a paid
+model. Nothing was signed or published.
+
+## Demonstrated: first Spaces build (2026-11-22, integrator, local)
+
+These are earlier results for commit `d3a435a`, from before registered
+runners, model connections and the device connector. For Rust and the e2e
+scripts, the gate above supersedes them, and the
+[desktop section](#demonstrated-native-desktop-2026-11-22-frontend-local)
+supersedes the desktop rows. They're kept for the Compose dedicated-runner
+check.
 
 | Check | Result |
 | --- | --- |
@@ -40,25 +237,532 @@ What the two scripts cover:
 - Bob's Demo returned `202`, and the `tool_result` listed that runner's own
   fixture workspace.
 
-**Desktop screenshots** (1200×780, native Linux GTK; the agent's replies come
-from the labelled scripted model):
-[room-runner](screenshots/room-runner.png),
-[chat-runs](screenshots/chat-runs.png),
-[thread](screenshots/thread.png),
-[space-members](screenshots/space-members.png),
-[connection](screenshots/connection.png),
-[connection-error](screenshots/connection-error.png).
+The six screenshots from this run have since been replaced by the
+captures listed under the native desktop section.
+
+## Demonstrated: settings, registered runners and device connections (2026-11-22, integrator, local)
+
+This section shows what the two newer e2e scripts check. Their final run is
+part of the backend gate above.
+
+The scripts run real locked builds of `metro-server`, `metro-runner` and
+`metro-connector`. The only models are local scripted providers that you
+supply yourself (BYOK). No paid or vendor sign-in is involved.
+
+What the two new scripts cover:
+
+- **`settings.py`: providers.**
+  - The catalog lists `openai`, `anthropic`, `gcp.gemini` and `custom`, plus
+    the allowed base URLs, without calling any provider.
+  - Each user's connections are private.
+  - A keyed connection and a keyless manual one work, with live model
+    listing.
+  - The default persists.
+  - A two-turn Rig tool exchange runs on the initiator's own connection, and
+    no other user's prompt or answer leaks in.
+  - A personal Chat message can pick a different, non-default connection for
+    that one reply, and the saved default stays unchanged.
+  - Keys appear in neither API responses nor the SQLite file.
+  - Deleted connections are gone.
+- **`settings.py`: runners.**
+  - Personal and organization runners get distinct credentials, with the
+    right visibility and `can_manage`.
+  - The dedicated view works, and a dedicated token stops working once it's
+    revoked.
+  - A registered credential without protocol 2 gets `426`.
+  - The shared runner's claim names the right Space, and results from a
+    runner that doesn't own the job get `404`.
+  - Deleting a runner detaches it everywhere, and its credential gets `401`.
+  - Demo never calls the model.
+- **`device_connector.py`.**
+  - A `device-openai-compatible` connection pairs with a `metro_pc_` token.
+    `GET …/device-token` reports `paired`, `online` and `last_seen_secs`.
+  - A personal Chat turn runs through the connector to a loopback vendor,
+    including a tool round trip.
+  - Model listing is relayed as `{}`.
+  - Rotation leaves the old credential with no stale work, and another
+    user's device never claims Alice's job.
+  - The profile directory is mode 700.
+  - The vendor key never appears in Metro's SQLite file or server output.
+
+These prove the wiring with scripted models. They don't show the behaviour
+of a real model or vendor account.
+
+## Demonstrated: Compose with a shared organization runner (2026-11-22, integrator, local)
+
+This used the real `reusable-runner` Compose profile, the runner image, and a
+named workspace volume.
+
+| Check | Result |
+| --- | --- |
+| Alice and Bob each own a Space, and both attach the same organization runner | pass |
+| The runner creates a separate `spaces/<sid>/` for each Space in the named volume, owned by UID 1000 | pass |
+| Each Space's Demo lists only its own marker file, never the other Space's | pass |
+| The same isolation holds after the runner container restarts | pass |
+| The legacy dedicated `runner` profile still lists the sample workspace | pass |
+| `compose.provider-key-file.yaml` mounts the key file exactly as documented | pass |
+| `actionlint` on `.github/workflows/ci.yml` | pass |
+
+## Runner image and workspace volume (2026-11-22, docs writer, local)
+
+Run against the working tree while registered runners were being built. It
+checks only the Docker steps in [runners.md](runners.md). It doesn't involve a
+server, a registered credential or a claimed job.
+
+| Check | Result |
+| --- | --- |
+| `docker build --target runner -t metro-runner:docs-check .` from the repo root (Docker 29.9.1) | pass; repo tree unchanged |
+| A new named volume mounted at `/workspace` in that image is owned by `metro` (1000:1000), and the image's user can create `spaces/<sid>` in it | pass |
+| `alpine/git:2.47.2` as `--user 1000:1000` with `HOME=/tmp` clones into an existing, empty `/workspace/spaces/<sid>` on that volume, and the runner image lists it | pass (local source repo) |
+
+## Demonstrated: native search and scheduled tasks screens (2026-11-22, frontend lane, local)
+
+These checks ran natively in NSH against the real backend. Embeddings and
+System One were keyless loopback fixtures, and the chat model was the
+scripted stand-in. The full desktop gate later passed with these screens
+integrated (see *desktop model routing, sharing and route attribution*).
+
+| Check | Result |
+| --- | --- |
+| 11 focused desktop tests for search, scheduled tasks and routing | pass |
+| [semantic-search](screenshots/semantic-search.png): one search across everything the user can read. The results came from Chat and Space rooms, with the *Reranked by System One* badge and per-result labels such as *System One relevance 0.95*. Both appear only because the fixture's System One endpoint scored every result. | pass |
+| [scheduled-tasks](screenshots/scheduled-tasks.png): daily, weekday, one-time and paused tasks. The next firing is shown in the task's IANA zone and in UTC. A one-time task actually fired: it now reads *No more firings*, and its history shows *Dispatched*. | pass |
+
+These are the revised captures. The fixture's scores and order show that the
+wiring works. They say nothing about ranking quality with a real model.
+
+## Demonstrated: desktop model routing, sharing and route attribution (2026-11-22, frontend lead, local)
+
+Desktop gate on the shared checkout, from `apps/desktop` with NSH 0.6.1,
+after the Search and Scheduled tasks screens were integrated:
+
+| Check | Result |
+| --- | --- |
+| `nsh check` | pass |
+| `nsh test`: 99 tests in 14 files, including `src/routing.test.ts` (7), `src/features/RoutingSettings.test.tsx` (11), `src/features/RouteAttribution.test.tsx` (4) and the discovery lane's 11 | pass, 0 failed |
+| `nsh build App.tsx` | pass |
+
+The tests run against the in-memory fake server. They cover pickers that
+offer only models of their own capability that the user can use, opt-ins
+that are off by default, the classifier needed for routing and
+classification, the server's bounds (at most 16 use cases, keys
+`[a-z][a-z0-9_]{0,31}`, a minimum of 0.5 for "asking the agent"), a revoked
+share flagged and refused on save, and a late routing answer that never
+lands after sign-out. For capabilities and sharing they cover separate
+defaults per capability, sharing with chosen Spaces then revoking it, a
+borrower who can pick the model but never sees its key, an outsider who
+can't see it, and a ChatGPT sign-in shared only as a preset. For route
+attribution they cover one row with a badge, the reason shown only when
+opened, no connection IDs, and the composer never sending `addressed_by`.
+
+Native screenshots came from `apps/desktop/dev/screenshots/capture-routing.sh`.
+It ran the real `metro-server` (`target/debug`, SHA-256 `3725ad18…9173`, a
+newer build than the one in the binaries note) and four loopback fixture
+vendors from `tests/e2e/intelligence.py`, with throwaway keys.
+`model-routing.png` was then recaptured with the corrected fallback text
+against `target/debug/metro-server` SHA-256 `8e468d96…c469`. After that
+change, `nsh check` passed and `nsh test` passed 99/99.
+
+| Shot | What it shows | Result |
+| --- | --- | --- |
+| [model-routing](screenshots/model-routing.png) | Classifier, routing on, use cases each with its answering chat model; one is Bob's connection shared with Acme | pass |
+| [model-routing-dataflow](screenshots/model-routing-dataflow.png) | Classification opt-in, embeddings model, and *Where your text goes* naming each endpoint | pass |
+| [model-sharing](screenshots/model-sharing.png) | A self-hosted local model shared with one Space, with the owner-visibility and billing warning | pass |
+| [route-attribution](screenshots/route-attribution.png) | A real turn: Alice's unaddressed message judged by the System One fixture under her opt-in (*agent · detected by System One*), routed to *Incident review* and answered by Bob's shared fixture endpoint; the group opened to its route | pass |
+
+The script's secret scan found no token or key under the output or the
+checkout. The app ran from a disposable copy, so no step file was written
+into the checkout. The `p 1.00` and the replies come from the fixtures and
+say nothing about a real model.
+
+**Not demonstrated:** a real TypeSafe, OpenAI or embeddings vendor, and a
+device (`metro-connector`) connection in these shots.
+
+## Demonstrated: classification, routing, sharing and search end to end (2026-11-22, integrator, local)
+
+`python3 tests/e2e/intelligence.py --timeout 60` passed against the
+**primary workspace's locked binaries**, not a snapshot. It ran real
+`metro-server` and `metro-connector` processes, with loopback inference
+fixtures for chat, embeddings and the System One wire. Each fixture counts
+the calls it receives. An earlier run of the full workflow on an integration
+snapshot, which included the `no_match` branch, is superseded by this one.
+
+**Exactly one typed question per System One request.**
+
+| Message | System One calls | Chat calls |
+| --- | --- | --- |
+| `@bob` only (people only) | none | none |
+| Unmentioned, classification on, uncertain answer | one `noul`, no `choice` | none; the agent didn't start |
+| Unmentioned, classification on, confident answer | one `noul`, then a separate `choice` | one turn, on the routed connection |
+| Explicit `@agent` | one `choice`, no `noul` | one turn |
+
+**Failures and fallbacks.**
+
+- A valid explicit `no_match` was answered by the configured default
+  connection only (`source: routing_default`). No other model was called.
+- When the routed answering model failed, the error was visible in the room,
+  and only that model was called. No other model was billed.
+- When the addressing decision failed, only System One was called. No
+  routing question was asked, no answering model was called, and no agent
+  run started.
+- A routing failure, or a revoked classifier, stopped the turn visibly,
+  without calling the default model.
+
+**Sharing and search.**
+
+- Chat and embeddings connections were shared across users, both on a
+  local endpoint and on a device. They worked, and stopped when revoked.
+- The semantic-search shortlist was reordered by pointwise System One
+  calls over the real System One wire, to the fixture.
+- No credential was exposed to the borrower.
+- **Server-stored borrowed connections** are rechecked for System One
+  decisions and embeddings too. When the share is revoked or changed, an
+  in-flight answer or vector is withheld. A request already sent upstream
+  can't be unsent.
+
+**Not demonstrated:** a real TypeSafe account, a cloud embeddings vendor,
+production authentication (OIDC), or a real chat vendor. This run is
+included in the [final gate](#historical-final-gate-for-the-system-one-milestone-2026-11-22-independent-reviewer-local). The per-lane test
+counts in the sections below apply only to their own lanes and runs.
+
+## Demonstrated: scheduled prompts end to end (2026-11-22, scheduler lane, local)
+
+The scheduler lane reported these runs. Both black-box runs use the real
+`metro-server` binary, dev-token users, a temporary SQLite database, the
+real clock, and local scripted OpenAI-compatible model stubs that count
+every call. No real vendor model was involved.
+
+| Check | Result |
+| --- | --- |
+| `python3 tests/e2e/schedules.py --timeout 150` | pass |
+| `python3 tests/e2e/schedules.py --live-recurring`: a real hourly cron task. Its first occurrence, due 06:53Z, fired once, and `next_run_at` moved to 07:53Z. | pass |
+
+What the black-box run showed:
+
+- **Accepted once, as the creator.** A once task in personal Chat and one in
+  a Space room each posted their prompt once, under the creator's identity,
+  and the agent answered once.
+- **`dispatched` means accepted, in Chat too.** The stub held the personal
+  Chat inference open. History already had exactly one `dispatched` entry,
+  and the Chat had no final answer yet. Personal Chat now behaves the same as
+  a Space room.
+- **Revocation.** After the creator left the Space, nothing was posted and
+  no model was called. The task was paused, and the failure was recorded,
+  with a notice in the creator's personal Chat.
+- **No fallback.** When the creator's default connection was a paired but
+  offline device, neither a model stub nor the `METRO_MODEL` fallback was
+  called, and the failure was visible.
+- **Pause, resume, edit and delete** behaved as documented.
+- **Restart.** After a SIGKILL, finished occurrences weren't replayed. An
+  occurrence that fell due while the server was down, still inside the
+  5-minute grace, ran exactly once after the restart.
+
+**Not demonstrated:** a real vendor model, or a long-running deployment. The
+desktop screen is covered [above](#demonstrated-native-search-and-scheduled-tasks-screens-2026-11-22-frontend-lane-local).
+
+## Scheduled prompts: unit and component tests (2026-11-22, scheduler lane, local)
+
+These are the focused tests for the code in `crates/server/src/schedules.rs`,
+`schedules/cron.rs` and `crates/server/tests/schedules.rs`. The end-to-end
+runs above build on them.
+
+| Check | Result |
+| --- | --- |
+| 30 unit tests (`src/schedules/tests.rs`, `src/schedules/cron.rs`), with an injected clock and a fake submitter. They cover cron parsing, `Asia/Manila` daily and DST zones, validation, the 50-task cap, owner-only `404`, Space membership and room scope, revocation that pauses and notifies, cancel on edit or pause after claim, no catch-up on resume, a single `missed` entry, recorded errors with no retry, a hung submission becoming `unknown`, concurrent ticks submitting once, a unique-occurrence guard, a restart marking `interrupted`, bounded history, and moving a task to personal Chat | pass |
+| 2 HTTP component tests (`tests/schedules.rs`): API shapes, owner-only access, validation and Space access, over real HTTP. They don't start the scheduler loop. | pass |
+
+## Model capabilities and sharing: component tests (2026-11-22, providers lane, local)
+
+The providers lane reported these component tests green, including
+`crates/server/tests/provider_sharing.rs` over real HTTP. They ran against a
+loopback fixture that speaks System One, embeddings and Chat Completions,
+and records every request it receives.
+
+They covered:
+
+- per-connection private defaults, and one default per fixed capability;
+- the provider ids `systemone`, `custom-systemone`, `openai-embeddings`,
+  `custom-embeddings`, `device-systemone` and `device-embeddings`;
+- share management by the owner only, with `personal`, `spaces` and
+  `organization` visibility;
+- use in a Space only while both people are members;
+- borrowed use on the owner's endpoint, with no key or URL in any response;
+- revocation stopping the next request, with server and device work
+  rechecked;
+- subscription presets never running on someone else's account. In
+  `presets_never_bill_an_api_key_and_stop_when_revoked`:
+  - a borrower with only a working OpenAI API-key connection got a clear
+    error, `ready: false`, and no upstream call;
+  - with their own `device-openai-oauth`, the preset ran on their device;
+  - revoking stopped the next request before it reached the device, and
+    withheld an answer the device was still producing;
+  - no request ever went anywhere else;
+- fingerprints following model edits.
+
+**Not demonstrated:**
+
+- Any real commercial provider: TypeSafe, OpenAI embeddings, or a shared
+  real account.
+- A live Sign in with ChatGPT preset. Sharing end to end with fixtures is
+  covered by `tests/e2e/intelligence.py` ([above](#demonstrated-classification-routing-sharing-and-search-end-to-end-2026-11-22-integrator-local)).
+
+## Semantic search: unit and HTTP tests (2026-11-22, search lane, local)
+
+The search lane reported these results for `crates/server/src/search.rs`,
+`search/` and `crates/server/tests/search.rs`. Every model call went to a
+loopback fixture that speaks the OpenAI embeddings wire and the System One
+wire, and records what reached it.
+
+| Check | Result |
+| --- | --- |
+| 14 unit tests (`src/search/tests.rs`). They cover: normalized vectors ranking by meaning, not length; System One reordering the shortlist; a rerank failure falling back visibly; malformed System One answers not being used as scores; other people's Chats and other Spaces never reaching the model; leaving a Space hiding its results and deleting its vectors; access revoked between retrieval and results being honoured; a destination-restricted connection skipping its Space; a fingerprint change reindexing and a dimension change being refused; incremental indexing; only messages and agent replies being indexed; deterministic ties; request validation; and vector checks with top-k ordering | pass |
+| 4 HTTP tests (`tests/search.rs`): real HTTP through the real provider layer, against the loopback fixture | pass |
+
+**Not demonstrated:** a real embeddings vendor or cloud account, Ollama, or
+a real TypeSafe account. The end-to-end run and the desktop screen are
+covered by the sections above.
+
+## Demonstrated: grouped agent activity (2026-11-22, frontend, local)
+
+This run is newer than the native desktop run below. It supersedes that
+run's test count and its two agent captures. It used NSH 0.6.x on native
+Linux GTK, against the real `metro-server` and `metro-runner`.
+
+| Check | Result |
+| --- | --- |
+| `nsh test`: 66/66, headless, against a fake server. This includes activity tests where people's messages arrive in the middle of a live agent turn. | pass |
+| A native capture of a live turn, collapsed as **Metro is thinking…** with 2 steps: [agent-thinking](screenshots/agent-thinking.png) | pass |
+| A native capture of the finished turn, **Metro’s activity**, opened to its `workspace.list` call and the runner's listing: [agent-activity-expanded](screenshots/agent-activity-expanded.png) | pass |
+| Demo shows as one collapsed **Runner activity** group, never as "thinking" or under a person's name | pass |
+
+What these show, and what they don't:
+
+- Each agent turn is one collapsed group, identified by the server's
+  activity metadata.
+- The only "thinking" text is the live label. Metro shows no chain of thought
+  of its own, and none was invented. A step counts as thinking only if the
+  server or provider labels it that way.
+- The turn ran through Rig with a real tool call on the runner, but the model
+  was the local scripted stand-in, whose reply says "Scripted test model".
+  No real model was used.
+- This run's other captures were refreshed too: `room-runner`, `chat-runs`
+  and `thread`.
+
+## Demonstrated: native desktop (2026-11-22, frontend, local)
+
+This run used NSH v0.6.1, on native Linux GTK. Its test count was superseded
+by the [grouped activity run](#demonstrated-grouped-agent-activity-2026-11-22-frontend-local).
+
+| Check | Result |
+| --- | --- |
+| `nsh check` | pass |
+| `nsh test`: 52/52 at the time, headless, against a fake server | pass |
+| `nsh build App.tsx` | pass |
+| Dark by default, with Light and System applied live | pass |
+| Agent activity (tool calls, tool output, and thinking and progress summaries) starts collapsed, while errors and final messages stay visible | pass |
+| Six screenshot runs against the assembled real server and runner, 1200×780 in the default dark theme | pass |
+| A scan of the captures found no tokens or keys | pass |
+
+The captures are in `docs/screenshots/`:
+
+- **Settings:**
+  [settings-runners](screenshots/settings-runners.png),
+  [settings-providers](screenshots/settings-providers.png),
+  [settings-device-onboarding](screenshots/settings-device-onboarding.png),
+  [settings-appearance](screenshots/settings-appearance.png),
+  [settings-space-runner](screenshots/settings-space-runner.png).
+- **Refreshed in the same run:**
+  [room-runner](screenshots/room-runner.png),
+  [chat-runs](screenshots/chat-runs.png),
+  [thread](screenshots/thread.png),
+  [space-members](screenshots/space-members.png),
+  [connection](screenshots/connection.png),
+  [connection-error](screenshots/connection-error.png).
+
+What they show, and what they don't:
+
+- `room-runner` shows the attached runner's Demo output, collapsed. The
+  current capture, from the grouped activity run, shows it as one *Runner
+  activity* group.
+- `settings-providers` shows a **keyless, locally scripted** model listing.
+  The device connection shows as offline.
+- `settings-device-onboarding` shows the terminal-wizard guide, with the token
+  masked.
+- None of them shows a real vendor sign-in or a real model.
+
 The native Linux app needs glibc ≥ 2.39, GTK ≥ 4.14 and WebKitGTK 6.0.
+
+## Demonstrated: Documents & media with synthetic fixtures (2026-11-22, QA, local)
+
+These results come from QA and the service lane. This writer didn't rerun
+them. Every model in them was synthetic.
+
+**`tests/e2e/library.py`.** It ran against the real `metro-server` and
+`metro-connector` from the primary workspace, and passed three times. The
+media vendor was a loopback **scripted** service that extracts text and
+returns vectors deterministically. It showed the following:
+
+- **PDF.** A valid PDF went over the wire as its raw bytes, and the search
+  hit was located on **page 2**.
+- **DOCX.** A valid DOCX gave a hit in **paragraph 2**, with text offsets and
+  an extracted excerpt.
+- **Device relay.** A real 3 MiB PNG and a payload of **exactly 8 MiB**
+  went through the real `metro-connector` companion unchanged. The relay
+  enforces per-caller and per-connection budgets. The server allows 4 media
+  calls at once, 2 per person and 3 per connection, and it doesn't
+  serialize a large body just to measure its size.
+- **Content beats file names.** With scripted vectors, the matching content
+  outranked a file whose name was misleading.
+- **Access.**
+  - Out-of-scope reads were blocked, and nothing was sent anywhere for
+    them. That includes `Range` and `HEAD` requests.
+  - Results were withheld when the member was removed during a search.
+  - Removing a member and adding them back dropped only that person's
+    index. The Space's files and other members' indexes stayed.
+  - An uploader's own access to an original still depends on current
+    membership. Adding someone back restores their access to the originals
+    but not their old index. Nothing already sent is clawed back.
+  - Deleting a connection, changing its model or revision, or narrowing a
+    grant purged the affected index rows straight away. A stale write that
+    was still in flight couldn't bring them back.
+
+**Reported separately by the final owners.**
+
+- **Upload settings.** All eight `METRO_LIBRARY_*` settings were checked.
+- **Compose media stack.** The runtime has a limit of 256 processes and the
+  default 8 GiB `METRO_EG2_MEMORY_LIMIT` cap, which is a ceiling, not a
+  measured need. The import step is capped at 256 MiB. Landlock started
+  under Docker's default profile.
+
+**Reference service (`services/embeddinggemma2/`), after hardening.**
+These results come from the service lane. They supersede the earlier 54
+tests.
+
+| Check | Result |
+| --- | --- |
+| `uv run --frozen pytest -q` on the host | **83 passed**, including 9 isolation, 17 wire and 4 admission and deadline tests, plus a fail-closed `503` test |
+| `docker build --target test` (BuildKit, UID 10001) | 83 passed |
+| The test image under `--read-only --tmpfs /tmp --cap-drop ALL --security-opt no-new-privileges --network none` | 83 passed |
+| The runtime image bound to `0.0.0.0` without a key | refused to start, as designed |
+| The hardened runtime image: non-root, `--read-only`, noexec tmpfs, `--cap-drop ALL`, `no-new-privileges`, `--pids-limit 256`, `--memory 6g`, the key file mounted read-only, with a random-init model | The sandbox self-test passed at startup. `/v1/models` without the key returned `401`. A PDF with one text page and one scanned page decoded through the worker. PID 1 had `CapEff=0`, `NoNewPrivs=1` and `Seccomp=2`. |
+| A probe with harmless test files, on the host (Linux 6.12, Landlock ABI 6) | **Denied:** a sibling job's files, `/proc/<parent>/environ`, `/etc/hostname`, loopback TCP, a UNIX socket, signals, `ptrace` and `process_vm_readv` against the parent, and fork and exec. **Allowed:** threads, a signal to itself, its own workdir, importing numpy. The child environment held only allowlisted keys. |
+| `scripts/plumbing_check.py` (before hardening) | The real Sentence Transformers and Transformers code and the pinned processor ran on a **random-init 2-layer** copy of the model. Every modality gave finite, unit-length 768-dimensional vectors, and the prefixes matched `prompt_name` exactly. |
+| `tests/e2e/library_reference.py` | Metro uploaded, indexed and searched synthetic TXT and PNG through the service's real HTTP app with its **test-only** encoder. The real locators came back, the TXT had an excerpt, and the PNG had none. |
+
+The isolation was checked only with Docker 29.9.1's default seccomp profile
+on that Linux 6.12 host. Podman, Kubernetes and gVisor weren't checked.
+**No pretrained weights were used in any of these runs.**
+
+**Desktop (frontend lane).**
+
+- With NSH 0.6.1, `nsh check` was clean. `nsh test .` passed **106/106**
+  twice: 7 new library tests and the 99 earlier ones. The first build
+  passed.
+- There were three native Linux runs against the real server binary
+  (sha256 `99865f44…d7ca04b`), with a **scripted** media endpoint. They
+  produced six screenshots: `docs/screenshots/library-{assets,search,open-page,open-image,revocation-before,revocation-after}.png`.
+  See [library.md](library.md#in-the-desktop-app).
+- **Removal.** When Bob was removed while viewing a Space file, his viewer
+  closed and only his personal files stayed listed. The server answered
+  `404` to his next read.
+- **Uploads.** The files in the captures were uploaded through the real
+  authorized HTTP upload. The native file picker was tested headless only.
+- **PDF and DOCX** open as their indexed page or section text, with the
+  location and a save of the authenticated original. There's no
+  full native renderer.
+- **Images** previewed natively.
+- **Audio and video:** a WAV's duration loaded. Native playback and
+  seeking were **not** verified, because the capture machine had no sound
+  device.
+- **Temporary files.** The Linux temporary file used for audio and video is
+  removed on close, sign-out, loss of membership and startup. Copies saved
+  to Downloads can't be clawed back.
+
+**Not shown:**
+
+- any ranking by the pretrained `google/embeddinggemma-2`, because no
+  weights were downloaded and the real-weight smoke wasn't run,
+- retrieval quality on real files,
+- decoder isolation on any other kernel or container runtime,
+- any real remote endpoint or vendor.
+
+## Verified: Windows x64 portable package, built on Linux (2026-11-22, packaging, local)
+
+This is a local, **unpublished** desktop client package built from the
+working tree. It isn't signed and isn't a release. It wasn't run on native
+Windows.
+
+| Item | Value |
+| --- | --- |
+| File | `dist/windows/Metro-windows-x64.zip`, with `Metro-windows-x64.zip.sha256` beside it |
+| Version | 0.1.0 |
+| Size | 26,288,229 bytes |
+| SHA-256 | `5d42a80326485f484cd8addf330129984d0a80db073501e92c90fd78ce07dfed` |
+| Contents | `Metro/Metro.exe`, `Metro/nsh/app.json`, `Metro/nsh/bundle.nshc`, `Metro/LICENSE-APACHE` |
+
+**How it was built.** On a copy of the current `apps/desktop`, the Linux NSH
+CLI ran `nsh package App.tsx --target windows --out <output>`, with
+`NSH_RUNTIME` pointing at the `nsh/runtime` directory of the pinned official
+Windows distribution. Both the CLI and the Windows distribution are official
+[longbridge/nsh v0.6.1](https://github.com/longbridge/nsh/releases/tag/v0.6.1)
+release assets.
+
+| Check | Result |
+| --- | --- |
+| The ZIP's CRCs | pass |
+| The Windows distribution matches the official v0.6.1 release digest | pass |
+| `Metro.exe` is a PE32+ x86-64 GUI executable | pass |
+| `Metro.exe` matches the official v0.6.1 Windows release runner | pass |
+| An independent `nsh build App.tsx --release` on the live working tree gave a bundle identical byte for byte to the shipped `Metro/nsh/bundle.nshc` | pass |
+| `nsh test .` on that snapshot, headless: **106/106** | pass |
+
+**What the package needs and holds.**
+
+- 64-bit Windows 10 1809 or later, or Windows 11.
+- The Microsoft Visual C++ v14 x64 runtime (`VCRUNTIME140.dll` and
+  `VCRUNTIME140_1.dll`). Windows N editions may also need the Media Feature
+  Pack, because the executable imports `mfplat.dll` and `mfreadwrite.dll`.
+- It contains no credentials and no server. People connect it to a Metro
+  server, over HTTPS when the server is remote.
+
+**Wine smoke test (QA).** On Linux, under Wine 10.0 on Xvfb with software
+graphics, QA launched the shipped `Metro.exe` from an unrelated working
+directory. It opened a window titled Metro, 1100×720, and stayed running for
+the whole 20–25 second observation. The window showed only a dark
+background, and no Connect form was visible. No token was entered, and the
+server connection and sign-in weren't tested.
+
+**Not shown:** launching, rendering, input or sign-in on native Windows.
 
 ## Not demonstrated
 
 - Deployment behind a real OIDC provider (Ory Hydra, Authelia or authentik).
   Auth is covered by `crates/auth`'s tests against a local stand-in provider.
 - Inference with a real or paid model.
+- Any server-side catalog adapter against its real vendor with a real
+  account. Only fixtures have been used.
+- `device-openai-oauth` with a live ChatGPT sign-in or real inference, or any
+  plan's limits.
+- `device-claude-code` with a real Claude Code CLI or a real Console key.
 - Publishing images to GHCR from a `v*` tag.
 - A full scan of logs and the database for leaked tokens. The code is written
   never to log tokens, but no exhaustive scan was done.
-- The desktop app on macOS or Windows.
+- The desktop app on macOS, or running on Windows. A Windows x64 package was
+  built and checked on Linux
+  ([above](#verified-windows-x64-portable-package-built-on-linux-2026-11-22-packaging-local)),
+  but it hasn't been started on Windows.
+- A desktop-managed connector (a sidecar), or automatic vendor or CLI
+  sign-in from the app. Neither is implemented. Device setup runs in a
+  terminal, through `metro-connector`.
+- Signing or publishing a release.
+- Documents & media with the pretrained `google/embeddinggemma-2`: no
+  ranking or retrieval quality on real files, no measured memory or timings,
+  and decoder isolation checked only on one Linux 6.12 host with Docker
+  29.9.1 ([library.md](library.md#not-yet-recorded)).
+- Commercial vendor validation for the System One milestone
+  ([system-one.md](system-one.md)): any real TypeSafe, cloud embeddings
+  (OpenAI) or Ollama call from Metro, or a shared real account. Its local
+  gates all passed ([above](#historical-final-gate-for-the-system-one-milestone-2026-11-22-independent-reviewer-local)).
 
 ## Reproduce
 
@@ -67,15 +771,32 @@ Run from the repo root.
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --locked -- -D warnings
-cargo build --locked --bin metro-server --bin metro-runner
-cargo test --workspace --locked
+cargo build --locked --bin metro-server --bin metro-runner --bin metro-connector
+cargo test --workspace --locked --no-fail-fast
+cargo build --locked --release --bin metro-connector
 python3 tests/e2e/smoke.py --timeout 60
 python3 tests/e2e/threads.py --timeout 60
+python3 tests/e2e/settings.py --timeout 60
+python3 tests/e2e/device_connector.py --timeout 60
+python3 tests/e2e/schedules.py --timeout 150
+python3 tests/e2e/schedules.py --live-recurring   # optional: waits for a real hourly cron firing
+python3 tests/e2e/intelligence.py --timeout 60
+python3 tests/e2e/library.py              # default --timeout 120
 ```
+
+The media reference service's own checks are weight-free, and run from
+`services/embeddinggemma2`: `uv run --frozen pytest -q`, or `docker build
+--target test .`. On a new host or container runtime, run the test image
+with the runtime's restrictions, using the command in
+[its README](../services/embeddinggemma2/README.md#tests-and-checks).
+`tests/e2e/library_reference.py` needs the service's Python environment.
+CI runs it inside the service's test image with `--network none`. See
+`.github/workflows/ci.yml`.
 
 The Docker sandbox tests in `cargo test` are skipped without Docker. To run
 them in full, first load a local image pinned by digest that contains
-`/bin/sh`, `id`, `ls`, `grep` and `sleep`:
+`/bin/sh`, `id`, `ls`, `grep` and `sleep`. The final gate used a pinned Alpine
+image. BusyBox works too:
 
 ```sh
 docker pull busybox:1.37
@@ -84,8 +805,9 @@ cargo test -p metro-runner --locked --test docker_sandbox
 docker ps -a --filter label=dev.metro.runner=1    # expect nothing left behind
 ```
 
-Desktop, from `apps/desktop`: `nsh check` and `nsh test`. Both are headless,
-and the tests use an in-memory fake server. To recreate the native
+Desktop, from `apps/desktop`: `nsh check`, `nsh test` and `nsh build App.tsx`.
+`nsh check` and `nsh test` are headless, and the tests use an in-memory fake
+server. To recreate the native
 screenshots against real binaries, see
 [apps/desktop/README.md](../apps/desktop/README.md#screenshots-native-linux-isolated).
 

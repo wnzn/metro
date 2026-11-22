@@ -14,15 +14,16 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::AppState;
-use crate::agent::{respond_personal, start_room_run, stop_runs_of};
-use crate::auth::{Human, Runner, new_runner_token, runner_token_hash, valid_id};
+use crate::agent::{start_personal_run, start_room_run, stop_runs_of};
+use crate::auth::{Human, Runner, RunnerCredential, new_runner_token, runner_token_hash, valid_id};
 use crate::db::reactions::{ReactionScope, Reactor, valid_emoji};
 use crate::db::{
-    AddMember, Addressed, Author, Event, LimitError, RemoveMember, Role, Room, SpaceView, actor,
-    kind,
+    Activity, AddMember, Addressed, Author, Event, LimitError, RemoveMember, Role, Room, SpaceView,
+    activity, actor, kind,
 };
 use crate::jobs::{CompleteError, JobOutcome};
 use crate::mentions::{self, Mention};
+use crate::model_routing::{self as routing, AddressedBy, Addressing, RoutingSettings};
 use crate::orchestration::RunStatus;
 use crate::tools::RunnerTool;
 
@@ -45,10 +46,10 @@ impl ApiError {
     pub fn unavailable(message: impl Into<String>) -> Self {
         Self::new(StatusCode::SERVICE_UNAVAILABLE, message)
     }
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self::new(StatusCode::BAD_REQUEST, message)
     }
-    fn not_found(message: impl Into<String>) -> Self {
+    pub(crate) fn not_found(message: impl Into<String>) -> Self {
         Self::new(StatusCode::NOT_FOUND, message)
     }
     fn forbidden(message: impl Into<String>) -> Self {
@@ -87,10 +88,10 @@ impl From<QueryRejection> for ApiError {
     }
 }
 
-type ApiResult<T> = Result<T, ApiError>;
-type JsonBody<T> = Result<Json<T>, JsonRejection>;
+pub(crate) type ApiResult<T> = Result<T, ApiError>;
+pub(crate) type JsonBody<T> = Result<Json<T>, JsonRejection>;
 
-async fn db<T, F>(state: &AppState, f: F) -> ApiResult<T>
+pub(crate) async fn db<T, F>(state: &AppState, f: F) -> ApiResult<T>
 where
     T: Send + 'static,
     F: FnOnce(&crate::db::Db) -> anyhow::Result<T> + Send + 'static,
@@ -101,7 +102,7 @@ where
 const NO_SPACE: &str = "no such Space";
 
 /// The Space `sid` as `who` sees it; 404 unless they are a member.
-async fn member_of(state: &AppState, sid: &str, who: &Human) -> ApiResult<SpaceView> {
+pub(crate) async fn member_of(state: &AppState, sid: &str, who: &Human) -> ApiResult<SpaceView> {
     if crate::config::validate_id(sid).is_err() {
         return Err(ApiError::not_found(NO_SPACE));
     }
@@ -112,7 +113,7 @@ async fn member_of(state: &AppState, sid: &str, who: &Human) -> ApiResult<SpaceV
 }
 
 /// Like [`member_of`], and 403 unless they own it.
-async fn owner_of(state: &AppState, sid: &str, who: &Human) -> ApiResult<SpaceView> {
+pub(crate) async fn owner_of(state: &AppState, sid: &str, who: &Human) -> ApiResult<SpaceView> {
     let space = member_of(state, sid, who).await?;
     if space.role != Role::Owner {
         return Err(ApiError::forbidden("only the Space owner can do this"));
@@ -130,7 +131,7 @@ async fn room_of(state: &AppState, space: &SpaceView, rid: &str) -> ApiResult<Ro
         .ok_or_else(|| ApiError::not_found("no such room"))
 }
 
-fn check_name(state: &AppState, name: &str) -> ApiResult<String> {
+pub(crate) fn check_name(state: &AppState, name: &str) -> ApiResult<String> {
     let name = name.trim().to_owned();
     let max = state.config.limits.max_room_name_chars;
     if name.is_empty() || name.chars().count() > max || name.chars().any(char::is_control) {
@@ -181,8 +182,18 @@ pub async fn healthz() -> Json<serde_json::Value> {
     Json(json!({"ok": true}))
 }
 
-pub async fn me(who: Human) -> Json<serde_json::Value> {
-    Json(json!({"id": who.id, "actor": who.name}))
+pub async fn me(State(state): State<AppState>, who: Human) -> Json<serde_json::Value> {
+    let is_org_admin = state.config.is_org_admin(&who.id);
+    Json(json!({"id": who.id, "actor": who.name, "is_org_admin": is_org_admin}))
+}
+
+/// A JSON response that must not be cached (it carries a token).
+pub(crate) fn no_store(status: StatusCode, body: serde_json::Value) -> Response {
+    let mut response = (status, Json(body)).into_response();
+    let headers = response.headers_mut();
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
+    response
 }
 
 // ---- Spaces ----
@@ -256,6 +267,20 @@ pub async fn add_member(
             "user_id must be 1..=256 printable characters without surrounding spaces",
         ));
     }
+    // A managed id can be added only once its account exists, so no Space
+    // can be prepared for an account that doesn't yet exist.
+    if state.managed.enabled()
+        && body
+            .user_id
+            .starts_with(crate::admin_users::MANAGED_ID_PREFIX)
+    {
+        let user = body.user_id.clone();
+        let exists = crate::admin_users::is_managed_id(&user)
+            && db(&state, move |db| db.managed_user_exists(&user)).await?;
+        if !exists {
+            return Err(ApiError::not_found("no such managed user"));
+        }
+    }
     let max = state.config.limits.max_members;
     let user = body.user_id.clone();
     match db(&state, move |db| Ok(db.add_member(&space.id, &user, max))).await? {
@@ -291,6 +316,13 @@ pub async fn remove_member(
             // Their runs stop now; their delegated actions are also refused
             // at call time by the membership check.
             let stopped = stop_runs_of(&state, &space.id, &body.user_id);
+            // Queued borrowed device jobs whose caller just lost this Space's
+            // share fail now instead of at claim time. The removal is already
+            // committed and no database lock is held here; the relay still
+            // rechecks access at claim and before returning a result.
+            if let Err(e) = state.device.shares_changed(&state.db, None).await {
+                tracing::warn!(error = %format!("{e:#}"), "rechecking borrowed device jobs");
+            }
             Ok(Json(json!({"removed": true, "stopped_runs": stopped})))
         }
         RemoveMember::NotMember => Err(ApiError::not_found("no such member")),
@@ -304,40 +336,59 @@ pub async fn issue_runner_token(
     State(state): State<AppState>,
     who: Human,
     Path(sid): Path<String>,
+    headers: axum::http::HeaderMap,
     body: axum::body::Bytes,
 ) -> ApiResult<Response> {
+    // `If-None-Match: *`: issue only while the Space has no runner at all.
+    if let Some(r) =
+        crate::runner_pairing::issue_if_requested(&state, &who, &sid, &headers, &body).await
+    {
+        return r;
+    }
     empty_object(&body)?;
     let space = owner_of(&state, &sid, &who).await?;
     let token = new_runner_token().map_err(ApiError::internal)?;
     let hash = runner_token_hash(&token);
     let space_id = space.id.clone();
-    let generation = db(&state, move |db| db.set_runner_token(&space_id, &hash)).await?;
+    let Some(generation) = db(&state, move |db| db.set_runner_token(&space_id, &hash)).await?
+    else {
+        return Err(ApiError::conflict(
+            "this Space uses a registered runner; its token is managed from the runner \
+             (POST /v1/runners/{id}/token). Detach it first to pair a dedicated runner",
+        ));
+    };
     // Jobs claimed with the previous token fail now; queued ones wait for
     // the runner that holds the new token.
     state.jobs.rotate(&space.id, generation);
     tracing::info!(space = %space.id, generation, "runner token issued");
-    let mut response = Json(json!({"token": token})).into_response();
-    let headers = response.headers_mut();
-    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    headers.insert(header::PRAGMA, HeaderValue::from_static("no-cache"));
-    Ok(response)
+    Ok(no_store(StatusCode::OK, json!({"token": token})))
 }
 
 pub async fn revoke_runner_token(
     State(state): State<AppState>,
     who: Human,
     Path(sid): Path<String>,
-) -> ApiResult<StatusCode> {
+    headers: axum::http::HeaderMap,
+) -> ApiResult<Response> {
+    // `If-Match: "rtg-<generation>"`: revoke only that exact pairing.
+    if let Some(r) = crate::runner_pairing::revoke_if_requested(&state, &who, &sid, &headers).await
+    {
+        return r;
+    }
     let space = owner_of(&state, &sid, &who).await?;
     let space_id = space.id.clone();
-    let generation = db(&state, move |db| db.clear_runner_token(&space_id)).await?;
+    let Some(generation) = db(&state, move |db| db.clear_runner_token(&space_id)).await? else {
+        return Err(ApiError::conflict(
+            "this Space uses a registered runner; detach it with DELETE /v1/spaces/{sid}/runner",
+        ));
+    };
     state.jobs.revoke(&space.id, generation);
     tracing::info!(space = %space.id, generation, "runner token revoked");
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// An empty body or `{}`.
-fn empty_object(body: &[u8]) -> ApiResult<()> {
+pub(crate) fn empty_object(body: &[u8]) -> ApiResult<()> {
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Empty {}
@@ -416,6 +467,89 @@ pub struct PostMessage {
     invoke_agent: bool,
     #[serde(default)]
     mentions: Vec<Mention>,
+    /// Answer with this model connection instead of the sender's routing or
+    /// default: their own, or one shared with this Space or the
+    /// organization. Never falls back.
+    #[serde(default)]
+    provider_connection_id: Option<String>,
+}
+
+/// A model chosen for one turn, checked before anything is stored so a bad
+/// choice never leaves a message the agent then answers some other way.
+async fn check_choice(
+    state: &AppState,
+    who: &Human,
+    space: Option<&str>,
+    choice: Option<String>,
+    addressing: Addressing,
+) -> ApiResult<Option<String>> {
+    let Some(id) = choice else {
+        return Ok(None);
+    };
+    if !crate::providers::api::valid_connection_id(&id) {
+        return Err(ApiError::bad_request(
+            "provider_connection_id must be a model connection id (pc_…)",
+        ));
+    }
+    if addressing != Addressing::Agent {
+        return Err(ApiError::bad_request(
+            "provider_connection_id only applies to a message for the agent \
+             (@agent or invoke_agent)",
+        ));
+    }
+    // Another person's unshared connection and a missing one look the same.
+    // Other problems with a usable connection are reported by the turn.
+    match state
+        .routing
+        .backend
+        .chat_model(state, &who.id, space, &id)
+        .await
+    {
+        Err(crate::providers::UseError::NotFound) => {
+            Err(ApiError::not_found("no such model connection"))
+        }
+        Err(crate::providers::UseError::Internal) => Err(ApiError::internal(anyhow::anyhow!(
+            "checking a model connection"
+        ))),
+        _ => Ok(Some(id)),
+    }
+}
+
+/// How a new message of `who` is addressed and whether it starts a turn:
+/// people-only messages never do and never reach System One; explicit
+/// agent messages always do; unaddressed ones only when the sender opted
+/// in and System One clearly says the message is for the agent.
+async fn dispatch_of(
+    state: &AppState,
+    who: &Human,
+    space: Option<&str>,
+    text: &str,
+    resolved: &[Mention],
+    addressing: Addressing,
+) -> ApiResult<(Addressed, Option<(AddressedBy, RoutingSettings)>)> {
+    let settings = || async {
+        routing::preferences(state, &who.id)
+            .await
+            .map_err(ApiError::internal)
+    };
+    Ok(match addressing {
+        Addressing::PeopleOnly => (addressed(resolved), None),
+        Addressing::Agent => (
+            addressed(resolved),
+            Some((AddressedBy::Explicit, settings().await?)),
+        ),
+        Addressing::Unaddressed => {
+            let settings = settings().await?;
+            if routing::infer_addressed(state, &who.id, space, &settings, text).await {
+                (
+                    routing::classifier_addressed(),
+                    Some((AddressedBy::Classifier, settings)),
+                )
+            } else {
+                (addressed(resolved), None)
+            }
+        }
+    })
 }
 
 pub async fn post_message(
@@ -436,19 +570,45 @@ pub async fn post_message(
         .collect();
     let resolved = mentions::resolve(&text, &body.mentions, body.invoke_agent, &member_ids)
         .map_err(ApiError::bad_request)?;
-    let addressed = addressed(&resolved);
+    let addressing = Addressing::of(&resolved);
+    let chosen = check_choice(
+        &state,
+        &who,
+        Some(&space.id),
+        body.provider_connection_id,
+        addressing,
+    )
+    .await?;
+    let (addressed, turn) =
+        dispatch_of(&state, &who, Some(&space.id), &text, &resolved, addressing).await?;
     let author = who.author();
     let event = {
-        let (sid, rid, author) = (space.id.clone(), room.id.clone(), author.clone());
+        let (sid, rid, author, text) = (
+            space.id.clone(),
+            room.id.clone(),
+            author.clone(),
+            text.clone(),
+        );
         db(&state, move |db| {
             db.append_event(&sid, &rid, kind::MESSAGE, &author, &text, &addressed)
         })
         .await?
     };
-    // Only `@agent` or Ask agent starts agent work; mentioning people never does.
-    if mentions::invokes_agent(&resolved)
-        && let Err(reason) = start_room_run(&state, &space.id, &room, &author, &event).await
-    {
+    // Mentioning only people never starts agent work.
+    let Some((addressed_by, settings)) = turn else {
+        return Ok((StatusCode::ACCEPTED, Json(event)));
+    };
+    let route = routing::route_turn(
+        &state,
+        &who.id,
+        Some(&space.id),
+        &settings,
+        &text,
+        addressed_by,
+        chosen.as_deref(),
+    )
+    .await;
+    if let Err(reason) = start_room_run(&state, &space.id, &room, &author, &event, route).await {
         state
             .append(
                 &space.id,
@@ -475,7 +635,8 @@ pub async fn demo(
     let room = room_of(&state, &space, &rid).await?;
     if !space.runner_paired {
         return Err(ApiError::conflict(
-            "this Space has no paired runner; its owner can issue a runner token to pair one",
+            "this Space has no runner; its owner can attach a registered runner or issue a \
+             dedicated runner token",
         ));
     }
     let Ok(permit) = state.demo_runs.clone().try_acquire_owned() else {
@@ -498,9 +659,38 @@ pub async fn demo(
         let tool = RunnerTool::List;
         let arguments = tool.runner_arguments(&json!({})).expect("static arguments");
         let caller = Author::server(actor::SYSTEM);
-        let _ =
-            crate::tools::call_runner(&task_state, &space.id, &room.id, &caller, tool, arguments)
-                .await;
+        // Its own `demo` activity, never an agent turn: no model is involved.
+        let run = Activity::demo();
+        let lifecycle = |phase: &'static str| {
+            let (state, space, room, run, caller) = (
+                task_state.clone(),
+                space.id.clone(),
+                room.id.clone(),
+                run.at(phase),
+                caller.clone(),
+            );
+            async move {
+                state
+                    .append_with(&space, &room, kind::ACTIVITY, &caller, "", Some(&run))
+                    .await;
+            }
+        };
+        lifecycle(activity::STARTED).await;
+        let result = crate::tools::call_runner(
+            &task_state,
+            &space.id,
+            &room.id,
+            &caller,
+            Some(&run),
+            tool,
+            arguments,
+        )
+        .await;
+        let phase = match result {
+            Ok(outcome) if outcome.ok => activity::COMPLETED,
+            _ => activity::FAILED,
+        };
+        lifecycle(phase).await;
     });
     Ok((StatusCode::ACCEPTED, Json(event)))
 }
@@ -620,6 +810,10 @@ pub struct ChatMessage {
     text: String,
     #[serde(default)]
     invoke_agent: bool,
+    /// Answer with this one of the sender's own model connections instead of
+    /// their default. Never falls back to the default or the server model.
+    #[serde(default)]
+    provider_connection_id: Option<String>,
 }
 
 pub async fn chat_message(
@@ -632,18 +826,33 @@ pub async fn chat_message(
     // Personal Chat has no other members: only `@agent` or the flag resolve.
     let resolved =
         mentions::resolve(&text, &[], body.invoke_agent, &[]).map_err(ApiError::bad_request)?;
-    let addressed = addressed(&resolved);
-    let (uid, author) = (who.id.clone(), who.author());
+    let addressing = Addressing::of(&resolved);
+    let chosen = check_choice(&state, &who, None, body.provider_connection_id, addressing).await?;
+    let (addressed, turn) = dispatch_of(&state, &who, None, &text, &resolved, addressing).await?;
+    let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
     let event = db(&state, move |db| {
-        db.append_personal(&uid, kind::MESSAGE, &author, &text, &addressed)
+        db.append_personal(&uid, kind::MESSAGE, &author, &stored, &addressed)
     })
     .await?;
-    if mentions::invokes_agent(&resolved) {
-        tokio::spawn(respond_personal(
-            state.clone(),
-            who.id.clone(),
-            event.clone(),
-        ));
+    if let Some((addressed_by, settings)) = turn {
+        // With a choice: only that connection. Otherwise routing, if the
+        // sender turned it on, or their default; a connection that cannot
+        // be used fails the reply.
+        let route = routing::route_turn(
+            &state,
+            &who.id,
+            None,
+            &settings,
+            &text,
+            addressed_by,
+            chosen.as_deref(),
+        )
+        .await;
+        let (state, uid, event) = (state.clone(), who.id.clone(), event.clone());
+        tokio::spawn(async move {
+            // A turn that cannot start says why in the Chat.
+            let _ = start_personal_run(&state, &uid, &event, route).await;
+        });
     }
     Ok((StatusCode::ACCEPTED, Json(event)))
 }
@@ -693,9 +902,18 @@ pub async fn stop_run(
 
 // ---- Runner ----
 
+/// Claim the oldest queued job of any Space this runner serves. Protocol 2
+/// claims name the job's `space_id`; a registered runner keeps a separate
+/// workspace per Space and must check it.
 pub async fn runner_claim(State(state): State<AppState>, runner: Runner) -> Response {
-    match state.jobs.claim(&runner.space_id, runner.generation) {
-        Some(job) => (StatusCode::OK, Json(job)).into_response(),
+    match state.jobs.claim(&runner.claimer(), &runner.spaces) {
+        Some(mut job) => {
+            if runner.protocol < 2 {
+                debug_assert_eq!(runner.credential, RunnerCredential::Dedicated);
+                job.space_id = None;
+            }
+            (StatusCode::OK, Json(job)).into_response()
+        }
         None => StatusCode::NO_CONTENT.into_response(),
     }
 }
@@ -726,7 +944,7 @@ pub async fn runner_result(
     };
     match state
         .jobs
-        .complete(&runner.space_id, runner.generation, &id, outcome)
+        .complete(&runner.claimer(), &runner.spaces, &id, outcome)
     {
         Ok(()) => Ok(Json(json!({"accepted": true}))),
         // A retried delivery of a result we already have: acknowledge it so

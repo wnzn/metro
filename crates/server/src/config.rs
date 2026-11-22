@@ -75,6 +75,10 @@ pub struct Limits {
     pub max_event_text: usize,
     /// Events returned by one `GET .../events` page.
     pub events_page: usize,
+    /// Most personal registered runners one user may own.
+    pub max_personal_runners: usize,
+    /// Most organization runners on the server.
+    pub max_org_runners: usize,
 }
 
 impl Default for Limits {
@@ -100,6 +104,8 @@ impl Default for Limits {
             max_tool_output_to_model: 64 * 1024,
             max_event_text: 16 * 1024,
             events_page: 500,
+            max_personal_runners: 20,
+            max_org_runners: 100,
         }
     }
 }
@@ -111,6 +117,10 @@ pub struct Config {
     /// `None` when `METRO_MODEL` is unset: Ask agent is unavailable.
     pub model: Option<ModelConfig>,
     pub limits: Limits,
+    /// Stable user ids (`sub`, or the dev username) of the organization's
+    /// admins, from `METRO_ORG_ADMINS`. Empty means nobody can create or
+    /// manage organization runners.
+    pub org_admins: Vec<String>,
 }
 
 impl Config {
@@ -143,13 +153,43 @@ impl Config {
             bail!("METRO_MODEL_BASE_URL must start with http:// or https://");
         }
 
+        let org_admins = parse_org_admins(env("METRO_ORG_ADMINS").as_deref())?;
+
         Ok(Self {
             bind,
             db_path,
             model,
             limits: Limits::default(),
+            org_admins,
         })
     }
+
+    /// Whether `user_id` is an organization admin.
+    pub fn is_org_admin(&self, user_id: &str) -> bool {
+        self.org_admins.iter().any(|a| a == user_id)
+    }
+}
+
+/// `METRO_ORG_ADMINS`: a JSON array of stable user ids, such as
+/// `["alice","00u1abcd"]`. Unset or blank means no admins.
+pub fn parse_org_admins(raw: Option<&str>) -> anyhow::Result<Vec<String>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let ids: Vec<String> = serde_json::from_str(raw)
+        .context("METRO_ORG_ADMINS must be a JSON array of stable user ids, such as [\"alice\"]")?;
+    let mut out: Vec<String> = Vec::with_capacity(ids.len());
+    for id in ids {
+        if !crate::auth::valid_id(&id) {
+            bail!(
+                "METRO_ORG_ADMINS entries must be 1..=256 printable characters without surrounding spaces"
+            );
+        }
+        if !out.contains(&id) {
+            out.push(id);
+        }
+    }
+    Ok(out)
 }
 
 /// A set, non-blank environment variable.
@@ -171,4 +211,23 @@ pub fn validate_id(id: &str) -> anyhow::Result<()> {
         bail!("id must match [a-z0-9_-]{{1,64}}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn org_admins_parse() {
+        assert!(parse_org_admins(None).unwrap().is_empty());
+        assert!(parse_org_admins(Some("[]")).unwrap().is_empty());
+        assert_eq!(
+            parse_org_admins(Some(r#"["alice","bob","alice"]"#)).unwrap(),
+            vec!["alice".to_owned(), "bob".to_owned()]
+        );
+        assert!(parse_org_admins(Some("alice")).is_err());
+        assert!(parse_org_admins(Some(r#"[" alice"]"#)).is_err());
+        assert!(parse_org_admins(Some(r#"[""]"#)).is_err());
+        assert!(parse_org_admins(Some(r#"[1]"#)).is_err());
+    }
 }

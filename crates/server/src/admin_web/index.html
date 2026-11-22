@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<meta name="color-scheme" content="light dark">
+<title>Metro Workspace admin</title>
+<link rel="stylesheet" href="/admin/assets/admin.css">
+<script src="/admin/assets/admin.js" defer></script>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+<header class="topbar">
+  <div class="brand">
+    <span class="logo" aria-hidden="true">M</span>
+    <span class="brand-text"><strong>Metro Workspace</strong> <span class="muted">admin</span></span>
+  </div>
+  <div id="session-bar" class="session-bar" hidden>
+    <span class="who">Signed in as <strong id="who-name"></strong> <span class="muted" id="who-id"></span></span>
+    <button type="button" id="sign-out" class="btn btn-secondary">Sign out</button>
+  </div>
+</header>
+
+<main id="main" tabindex="-1">
+  <noscript>
+    <section class="card notice notice-warning">
+      <h1>JavaScript is required</h1>
+      <p>The admin panel needs JavaScript to sign you in and talk to this Metro server.</p>
+    </section>
+  </noscript>
+
+  <!-- Shown when this page must not take credentials. -->
+  <section id="unsafe" class="card notice notice-danger" hidden aria-labelledby="unsafe-title">
+    <h1 id="unsafe-title">Sign-in is turned off on this page</h1>
+    <p id="unsafe-reason"></p>
+    <p><strong>Do not paste an admin token into this page.</strong> Open the panel over a protected connection instead:</p>
+    <ul class="steps">
+      <li><strong>HTTPS:</strong> put Metro behind a TLS proxy and open <code>https://&lt;your-host&gt;/admin</code>.</li>
+      <li><strong>SSH tunnel:</strong> from your computer run
+        <code class="block" id="unsafe-ssh"></code>
+        then open <a id="unsafe-local" href="http://localhost:8080/admin" rel="noreferrer">http://localhost:8080/admin</a>.</li>
+      <li><strong>On the server itself:</strong> open <code id="unsafe-loopback">http://127.0.0.1/admin</code>.</li>
+    </ul>
+  </section>
+
+  <section id="signin" class="card signin" hidden aria-labelledby="signin-title">
+    <h1 id="signin-title">Sign in</h1>
+    <p class="muted">Use an organization admin's access token. It stays in this tab's memory only and is forgotten when you sign out, reload or close the tab.</p>
+    <div id="signin-error" class="alert alert-danger" role="alert" hidden></div>
+    <!-- No name attributes: nothing is ever sent as a form submission. -->
+    <form id="signin-form" method="post" novalidate>
+      <label for="token" class="label">Admin access token</label>
+      <input id="token" class="input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required aria-describedby="token-hint">
+      <p id="token-hint" class="hint">Sent only to this server, in an Authorization header.</p>
+      <button type="submit" id="signin-submit" class="btn btn-primary">Sign in</button>
+    </form>
+  </section>
+
+  <section id="denied" class="card notice notice-warning" hidden aria-labelledby="denied-title">
+    <h1 id="denied-title">This account isn't an organization admin</h1>
+    <p>The token belongs to <strong id="denied-id"></strong>, who isn't listed in <code>METRO_ORG_ADMINS</code>. You've been signed out and the token has been discarded.</p>
+    <button type="button" id="denied-back" class="btn btn-secondary">Sign in with another token</button>
+  </section>
+
+  <div id="panel" hidden>
+    <div id="secret" class="card secret" hidden role="region" aria-labelledby="secret-title">
+      <h2 id="secret-title">Token for <span id="secret-for"></span></h2>
+      <p>Copy it now and hand it over privately. <strong>It's shown only once.</strong> Metro stores only a hash, so you can't see this token again.</p>
+      <div class="secret-row">
+        <label for="secret-value" class="visually-hidden">One-time token</label>
+        <input id="secret-value" class="input mono" type="password" readonly autocomplete="off" spellcheck="false">
+        <button type="button" id="secret-reveal" class="btn btn-secondary" aria-pressed="false" aria-controls="secret-value">Reveal</button>
+        <button type="button" id="secret-copy" class="btn btn-primary">Copy</button>
+      </div>
+      <p id="secret-status" class="hint" role="status" aria-live="polite"></p>
+      <button type="button" id="secret-done" class="btn btn-secondary">I've saved it, hide token</button>
+    </div>
+
+    <section class="card" aria-labelledby="add-title">
+      <h2 id="add-title">Add a user</h2>
+      <form id="add-form" class="add-form" method="post" novalidate>
+        <div class="field">
+          <label for="add-name" class="label">Display name</label>
+          <input id="add-name" class="input" type="text" maxlength="64" autocomplete="off" required aria-describedby="add-hint">
+        </div>
+        <button type="submit" id="add-submit" class="btn btn-primary">Add user and issue token</button>
+      </form>
+      <p id="add-hint" class="hint">Up to 64 characters. Metro gives the user a stable id and a token, which you'll see once.</p>
+      <div id="add-error" class="alert alert-danger" role="alert" hidden></div>
+    </section>
+
+    <section class="card" aria-labelledby="users-title" aria-busy="false" id="users-card">
+      <div class="section-head">
+        <h2 id="users-title">Managed users</h2>
+        <div class="section-tools">
+          <span id="users-updated" class="hint"></span>
+          <button type="button" id="refresh" class="btn btn-secondary">Refresh</button>
+        </div>
+      </div>
+      <div id="users-error" class="alert alert-warning" role="alert" hidden></div>
+      <p id="users-empty" class="muted" hidden>No managed users yet. Add one above.</p>
+      <p id="users-loading" class="muted" hidden>Loading users…</p>
+      <div class="table-wrap">
+        <table id="users-table" class="users" hidden>
+          <caption class="visually-hidden">Managed users and their token status</caption>
+          <thead>
+            <tr><th scope="col">Name</th><th scope="col">User id</th><th scope="col">Token</th><th scope="col"><span class="visually-hidden">Actions</span></th></tr>
+          </thead>
+          <tbody id="users-body"></tbody>
+        </table>
+      </div>
+    </section>
+  </div>
+
+  <p id="announce" class="visually-hidden" role="status" aria-live="polite"></p>
+</main>
+
+<dialog id="confirm" aria-labelledby="confirm-title" aria-describedby="confirm-body">
+  <form method="dialog">
+    <h2 id="confirm-title"></h2>
+    <p id="confirm-body"></p>
+    <div class="dialog-actions">
+      <button value="cancel" class="btn btn-secondary" id="confirm-cancel">Cancel</button>
+      <button value="ok" class="btn btn-primary" id="confirm-ok">Confirm</button>
+    </div>
+  </form>
+</dialog>
+</body>
+</html>

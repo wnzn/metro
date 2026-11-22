@@ -4,10 +4,81 @@ The Metro desktop client, written in TSX on [Native Shell (NSH)](https://nsh.dev
 NSH renders it with each platform's own views: GTK 4 on Linux, AppKit on macOS,
 and Win32 on Windows. No npm or Node is needed to build or run it.
 
+## Install (users)
+
+Download the build for your system from
+[Releases](https://github.com/wnzn/metro/releases). **No release has been
+published yet.** A 0.2.0 candidate has been built locally and checked
+(below), but there are no files to download yet. You never need NSH, a
+checkout or a terminal to use the app; the build commands further down are
+for contributors.
+
+- **Linux x64:** `Metro-<version>-linux-x64.tar.gz`. Extract it and start
+  its launcher. Needs glibc ≥ 2.39, GTK ≥ 4.14 and WebKitGTK 6.0.
+- **Windows x64:** `Metro-<version>-windows-x64.zip`, a portable ZIP. See
+  [Windows portable package](#windows-portable-package).
+
+Check each download against the `.sha256` file published beside it. The
+0.2.0 names are verified targets but aren't published yet.
+
+The first screen, **Connect to Metro**, offers two choices:
+
+- **On this computer → Open local workspace:** a private workspace that the
+  app runs on this computer, just for you. It needs no server address or
+  token, and its data stays on this computer, separate from any server you
+  connect to.
+- **Or connect to a server:** the URL and token your admin gave you
+  ([README](../../README.md#install-and-use-prebuilt-only)).
+
+### Verified in the 0.2.0 Linux candidate
+
+QA ran the packaged candidate in Debian 13 under Xvfb, as a non-root user,
+from a read-only install, with Docker `--network none`
+([acceptance](../../docs/acceptance.md)). It isn't a release.
+
+- **Local workspace:** **Open local workspace** started the bundled server
+  with no token or remote service. QA created a Space and posted a message,
+  which showed its time. After quitting, the app's listeners and child
+  processes had all ended. On reopening, the same room, the message and the
+  saved profile and avatar were all still there
+  ([screenshot](../../docs/screenshots/local-workspace-relaunch.png)).
+- **Settings** opens as a window over the app, with **Profile**,
+  **Runners**, **Model providers**, **Model routing** and **Appearance**.
+- **Profile:** the display name and a picture chosen through the native
+  Linux file picker were saved, and the avatar showed next to the message
+  ([screenshot](../../docs/screenshots/settings-profile.png)). Your
+  **User ID** is shown here, not in the sidebar.
+- **Sidebar footer:** shows where you're connected (for example *On this
+  device* and its loopback address) and your id.
+- **Search** is a centered box at the top of the window.
+- **Provider picker:** one searchable dropdown grouped by vendor. Each
+  vendor shows how many ways it can be connected and its capabilities. For
+  example, OpenAI is one row with three ways to connect.
+- **In-app device bridge:** a separate packaged smoke of the app's device
+  bridge with the bundled server passed.
+
+### Not verified yet
+
+- The device-connection setup screens in the candidate still show older
+  `metro-connector` wording, which is being fixed. Setting up a device
+  connection entirely in the app isn't verified end to end. Vendor software
+  such as the Claude Code CLI stays separate, and you install it yourself.
+- **Windows:** the candidate opened a Metro window and its server answered
+  `/healthz` under Wine. Nobody has checked that it draws or takes input,
+  or run it on native Windows.
+- App-wide consistency of icons and type: icons appear in the sidebar and
+  Settings, but no app-wide check was recorded.
+- Converting message times to your local time zone hasn't been checked
+  separately. The server sends UTC `created_at`
+  ([spaces.md](../../docs/spaces.md#message-times)).
+- Documents & media: the native file picker was verified only for the
+  profile picture. Library uploads, and audio and video playback and
+  seeking, haven't been verified.
+
 ## What it does
 
-- **Connect:** you enter a server URL (default `http://127.0.0.1:8787`) and a
-  bearer token. Plain `http://` is accepted only for loopback (`localhost`,
+- **Connect:** open the local workspace, or enter a server URL (default
+  `http://127.0.0.1:8787`) and a bearer token. Plain `http://` is accepted only for loopback (`localhost`,
   `127.0.0.0/8`, `::1`). Remote servers need `https://`, so a token never
   crosses a network in clear text. Redirects are refused.
 - **Chat:** your personal thread with the agent, outside every Space. Only
@@ -19,7 +90,8 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
   recipient is spelled out before you send ("To: agent in Acme › #lobby").
 - **Spaces:** a Space has its own rooms (starting with its `lobby`), members,
   and optional paired runner. A new account has no Spaces. It sees how to
-  create one, or the user ID to give an owner. There is no shared lobby.
+  create one. Your user ID, to give an owner, is under **Settings →
+  Profile**. There is no shared lobby.
 - **Rooms and threads:** threads that an agent delegated
   (`parent_room_id`) appear under their parent room. A thread links back to
   its parent.
@@ -35,14 +107,99 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
   Reactions are folded from `reaction` events and are never shown as
   transcript lines.
 - **Run demo:** runs the deterministic `workspace.list` on this Space's
-  paired runner. It is disabled when the Space has no runner. Paired means a
-  token was issued. It does not mean the runner is online.
-- **Manage (owners only):** list, add, and remove members. Issue, rotate, or
-  revoke the Space's runner token. A newly issued token is shown once. It is
-  cleared when you hide it, leave the view, switch rooms or Spaces, or
-  disconnect.
+  runner. It is disabled when the Space has no runner. Attached or paired
+  means jobs go to that runner. It does not mean the runner is online. The
+  call and its listing show as one collapsed **Runner activity** group. Demo
+  never calls a model, so it never says "thinking".
+- **Agent activity:** each agent turn shows as **one** collapsed group, not a
+  row per tool. The turn is identified by the event's `activity` metadata
+  (`id`, `name`, `source`, and a lifecycle `phase` on `kind: "activity"`
+  events). While the turn runs, the group reads **`<name> is thinking…`**
+  (`Metro` when the server sends no name), even before its first tool. Once
+  it ends, it reads **`<name>’s activity`**. A failed, cancelled or interrupted
+  turn, or a failed tool, carries a badge that stays visible while collapsed.
+  One press (or Space/Return) opens every step in order: the calls with their
+  arguments, the results, and any summaries the model provider shared. Very
+  long output still folds. Metro shows no chain of thought of its own. The
+  group stays where its first event appeared, and later steps join it
+  without moving other messages or closing it on the next poll. People's
+  messages, the agent's replies, errors and reactions stay in the transcript
+  as before. Older events without metadata each stay a separate collapsed
+  group, because which run they belong to is unknown.
+- **Which model answered:** a turn's `started` marker carries the route the
+  server recorded (`activity.route`). When it's worth saying (a use case, a
+  model chosen for that message, a start by System One or a scheduled
+  prompt), the collapsed group shows one small badge, such as **Incident
+  review**. Opening the group adds one line: where the model came from, its
+  provider and model ID, and the server's short reason. Connection IDs are
+  never shown, and the route is not counted as a step. A turn that answered
+  with no steps keeps a row only when it has such a badge. A message that
+  System One judged to be for the agent is labelled **agent · detected by
+  System One**, never as an `@agent` its sender typed. The app never sends
+  `addressed_by`; only the server sets it.
+- **Search** and **Scheduled tasks** (sidebar, with or without any Space):
+  your own pages, outside every Space. A search result opens your Chat, or
+  the room or thread it came from, if you're still a member. See
+  [docs/schedules.md](../../docs/schedules.md) for scheduled prompts.
+- **Manage (owners only):** list, add, and remove members. Pick which runner
+  serves the Space: attach one of your personal runners or an organization
+  runner from the same list as Settings › Runners, or detach it. A Space that
+  still has a dedicated (single-Space) token can rotate or revoke it, and an
+  owner can still issue one on purpose. A Space uses at most one runner, so
+  attaching needs the dedicated token revoked first.
+- **Settings** (sidebar, available with or without any Space):
+  - **Runners:** add a named runner, either personal or (for org admins)
+    organization-wide. Its token is shown once, masked until you press Show,
+    next to copyable Docker steps: build the image, create a mode-600
+    `runner.env`, then `docker run --env-file ./runner.env` with a named
+    volume mounted at `/workspace`, where each Space gets `spaces/<space id>/`.
+    No command or template contains the token. Rotate and delete are offered
+    only to whoever manages the runner (its owner, or org admins). Both are
+    confirmed first, with the Spaces you can see that use the runner.
+  - **Model providers:** the providers come from the server's
+    `/v1/provider-catalog`, and you can search them. **On this device**
+    connections run in your own `metro-connector`. Metro has no vendor key
+    field for them. You get a device token (shown once, masked) with the
+    connector's exact `setup`, `login`, `run` and `status` commands, then
+    **Test connection**. The connector shows as paired, online or offline,
+    and you can unpair it with a confirmation. **Server-stored API profiles**
+    take an API key that is sent once and never read back. Custom endpoints
+    must match one of the operator's approved URLs exactly. **Save and fetch
+    models** lists models, or you enter a model ID by hand when the endpoint
+    can't list them. You can also make a connection your default and replace
+    or delete it.
+    Each connection serves one **capability**, fixed by its provider: **Chat**
+    (answers), **System One** (typed decisions) or **Embeddings** (search).
+    The list filters by capability, each connection shows its capability,
+    and each capability has its own default: making a System One connection
+    the default never changes your chat default. A provider that can't list
+    its models needs a model ID before it's saved, and a custom-endpoint
+    provider with no approved endpoint can't be saved at all.
+    **Sharing…** (owner only) sets who else may use a connection: **Only me**
+    (the default), **Selected Spaces** (only Spaces you're in, and only while
+    both you and they are members) or the **Organization**. Saving **Only
+    me** revokes it. The panel says what sharing means: others can send
+    requests through it and use your credits, plan or device, you can see
+    what they send and may pay for it, and they never see its base URL, key,
+    sign-in or device token. A connection needs a model before it can be
+    shared. A Sign in with ChatGPT connection shares only a bring-your-own
+    preset: each person signs in with their own account.
+  - **Model routing:** all off by default, and only ever about messages you
+    write. Pick a **System One classifier**, an **embeddings model** for
+    search, and a **fallback answer model**. Each picker offers only models of
+    its capability that you own or that are shared with you, grouped by whose
+    they are; one with no model, or a preset you can't run yet, can't be
+    picked. **Use-case routing** has editable named use cases (name,
+    description, answering chat model, up to 16) and a minimum confidence.
+    **Classify my unaddressed messages** is a separate opt-in with its own
+    threshold (0.5 to 1). **Where your text goes** says, from what is chosen,
+    which endpoint receives which text, whose it is, and what is never sent.
+    The page saves the whole draft at once; leaving it drops unsaved edits.
+  - **Appearance:** Dark (the default), Light or System.
+  - Every token or key shown once is wiped from memory when you press Done,
+    change page, Space or room, or disconnect. None of them is stored.
 
-## Requirements
+## Requirements (contributors)
 
 - **NSH 0.6.x.** Install the official release with
   `curl -fsSL https://nsh.dev/install.sh | sh`, which installs to `~/.nsh` and
@@ -54,12 +211,14 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
   WebKitGTK even though Metro shows no web views. GStreamer is optional.
 - **Headless (`nsh test`, `nsh check`, `nsh build`):** only `nsh`. These run
   anywhere, CI included.
-- macOS 14+ and Windows 10 1809+ follow NSH's platform support. They have not
-  been tried with Metro.
+- macOS 14+ and Windows 10 1809+ follow NSH's platform support. Metro hasn't
+  been run on either. A Windows x64 package has been built and checked on
+  Linux; see [Windows portable package](#windows-portable-package).
 
-## Commands
+## Commands (contributors)
 
-Run these from `apps/desktop`.
+Run these from `apps/desktop`. Building the rest of Metro from source is in
+[docs/development.md](../../docs/development.md).
 
 ```sh
 nsh check                 # TypeScript 7 type check (tsc downloaded once by nsh)
@@ -76,6 +235,27 @@ so never use it as evidence:
 node dev/mock-server.mjs       # Node >= 22.18; users alice, bob, carol (fake tokens in test/fakeServer.ts)
 ```
 
+### Windows portable package
+
+The release file will be `Metro-<version>-windows-x64.zip`, a portable build
+with no installer. The package recorded so far was built locally as
+`Metro-windows-x64.zip`. It isn't signed or published yet, and it hasn't been started on native Windows. The 0.2.0 candidate has only been started under Wine. Its
+checks are in [acceptance](../../docs/acceptance.md#verified-windows-x64-portable-package-built-on-linux-2026-11-22-packaging-local).
+
+1. Check the ZIP against its `.sha256` file, for example with
+   `Get-FileHash Metro-0.2.0-windows-x64.zip -Algorithm SHA256` in PowerShell.
+2. Extract the **whole** ZIP. Don't run the app from inside the archive.
+3. Run `Metro\Metro.exe`. Keep the `nsh` folder next to it, because it holds
+   the app bundle.
+
+It needs 64-bit Windows 10 1809 or later, or Windows 11. If Windows reports
+that `VCRUNTIME140.dll` or `VCRUNTIME140_1.dll` is missing, install the
+[Microsoft Visual C++ v14 Redistributable (x64)](https://learn.microsoft.com/cpp/windows/latest-supported-vc-redist).
+Windows N editions may also need the Media Feature Pack.
+
+The package holds no credentials and no server. Point it at your Metro
+server, and use HTTPS when the server is remote.
+
 ### Screenshots (native Linux, isolated)
 
 `dev/screenshots/` runs the real `metro-server` and `metro-runner` on loopback
@@ -84,22 +264,61 @@ host on a private Xvfb display inside a container. The screenshot steps:
 
 1. Bob @mentions Alice from his app.
 2. Alice's app captures the connect screen before any secret is entered.
-3. Alice reacts, posts, runs Demo, and opens Manage.
+3. Alice reacts, posts, runs Demo (one collapsed Runner activity group), and
+   opens Manage.
+4. With a model: Alice asks `@agent what is in the workspace?`. One real Rig
+   turn calls `workspace.list` on the runner. `agent-thinking.png` shows the
+   turn live and collapsed ("Metro is thinking…", 2 steps) while the model
+   holds its answer. `agent-activity-expanded.png` shows the finished turn
+   ("Metro’s activity") opened to its call and listing.
+5. Alice opens Settings. Runners shows a personal and an organization runner,
+   both created through the API. Model providers saves a keyless connection
+   to the allowlisted local fixture, lists its models and picks one. Device
+   onboarding creates a device connection and shows its token masked, with
+   the connector shown as offline. Then Appearance, and the Website Space,
+   which the organization runner serves (a second real `metro-runner` with a
+   `metro_rt_v2_` token).
 
-Tokens live only in mode-600 files inside the temp directory, which is
-removed on exit.
+Tokens and the provider master key (`METRO_PROVIDER_KEY_FILE`) live only in
+mode-600 files inside the temp directory, which is removed on exit. The
+script fails if any of them turns up under the output directory or the app.
 
 ```sh
 docker build -t metro-desktop-shots:trixie dev/screenshots
 dev/screenshots/capture.sh ../../docs/screenshots      # NSH_DIST=… if nsh isn't on PATH; METRO_BIN=… for other binaries
 ```
 
-The agent shots (`chat-runs.png`, `thread.png`) need a model. By default
+The agent shots (`agent-thinking.png`, `agent-activity-expanded.png`,
+`chat-runs.png`, `thread.png`) need a model. By default
 the script starts `scripted_model.py`, a deterministic local OpenAI-compatible
 stand-in for the model only. The server, Rig, the tool call, the runner and
 its listing are all real, and the stand-in's replies say "Scripted test
 model". To use a real model instead, set `MODEL_ENV_FILE` to a mode-600 file
 of `METRO_MODEL*` lines. To skip the agent shots, set `SCRIPTED_MODEL=0`.
+The scripted model also answers a keyless `GET /v1/models`. It is the only
+allowlisted provider endpoint (`METRO_PROVIDER_ALLOWED_BASE_URLS`), so
+`settings-providers.png` and `settings-device-onboarding.png` are captured
+only with it.
+
+### Model routing and sharing screenshots
+
+`dev/screenshots/capture-routing.sh` runs the real `metro-server` with four
+loopback fixture vendors from `tests/e2e/intelligence.py` (System One,
+embeddings and two OpenAI-compatible chat endpoints; `typed_fixtures.py`).
+Nothing reaches a real vendor. Alice and Bob's connections, the shares and
+Alice's routing are set up through the API with throwaway keys. Then the
+app, from a disposable copy in the temp directory (so the step file `nsh
+test` writes, which holds the typed token, never lands in the checkout),
+captures `model-routing.png`, `model-routing-dataflow.png`,
+`model-sharing.png` and `route-attribution.png`. The last one is a real
+turn: Alice's unaddressed message, judged by the System One fixture under
+her opt-in and routed to a use case that Bob's shared connection answers.
+The script fails if a fixture rejected a request, or if any token or key
+turns up under the output or the app.
+
+```sh
+dev/screenshots/capture-routing.sh ../../docs/screenshots   # same image and NSH_DIST / METRO_BIN as above
+```
 
 ## Layout
 
@@ -111,8 +330,16 @@ src/ui/                 the replaceable styled layer: tokens.ts maps semantic na
                         theme classes, primitives.tsx holds the components features compose
 src/api/                HTTP contract (client.ts) and the server-URL guard (serverUrl.ts)
 src/store.ts            session, sync loop, caches, actions: no UI
+src/settings.ts         Settings state: runners, Space runner, provider catalog and connections,
+                        the one-time token reveal; hooks into store.ts's session lifecycle
+src/routing.ts          Model routing draft and its rules, the models you may pick, and
+                        connection sharing; same session and race rules as settings.ts
 src/features/           screens: ConnectScreen, Shell, Sidebar, SpaceView, ChatView,
-                        ManageSpace, Conversation (transcript and composer), eventKinds
+                        ManageSpace, Conversation (transcript and composer), eventKinds,
+                        activity/ (one collapsed group per agent turn), SettingsView, RunnersSettings,
+                        ProvidersSettings, RoutingSettings, AppearanceSettings, SearchView,
+                        ScheduledTasksView, TokenReveal (one-time token panel),
+                        setupTemplates (non-secret Docker and metro-connector steps)
 test/fakeServer.ts      in-memory server double for the tests and the dev mock
 App.test.tsx, src/**/*.test.ts   headless tests
 dev/                    mock server and screenshot tooling
@@ -153,7 +380,8 @@ These IDs are used by the tests and screenshot steps; keep them stable:
 
 - **Connect:** `server-url`, `access-token`, `connect`, `connect-error`,
   `connect-screen`
-- **Shell:** `workspace`, `sidebar`, `nav-chat`, `space:<sid>`,
+- **Shell:** `workspace`, `sidebar`, `nav-chat`, `nav-search`,
+  `nav-schedules`, `space:<sid>`,
   `room:<rid>`, `room-list`, `new-space-toggle`, `new-space-name`,
   `create-space`, `new-room-toggle`, `new-room-name`, `create-room`, `my-id`,
   `copy-id`, `disconnect`, `connection-state`, `server-origin`
@@ -170,19 +398,96 @@ These IDs are used by the tests and screenshot steps; keep them stable:
   `run-stop:<id>`, `dispatch`, `dispatch-space:<sid>`,
   `dispatch-room:<rid>`, `dispatch-text`, `dispatch-recipient`,
   `dispatch-send`, `dispatch-error`, `dispatch-notice`
+- **Activity:** per group, where `<key>` is `<source>:<activity id>` (for
+  example `agent:run_…`, `demo:demo_…`) or `event:<event id>` for an older
+  uncorrelated event: `activity:<key>`, `activity-toggle:<key>`,
+  `activity-title:<key>` (no steps yet), `activity-outcome:<key>`,
+  `activity-details:<key>`, `activity-route-badge:<key>`,
+  `activity-route:<key>` (opened), and `activity-step:<event id>` for each step
 - **Manage:** `manage-space`, `close-manage`, `members-card`,
   `members-list`, `member:<user>`, `remove-member:<user>`, `add-member-id`,
-  `add-member`, `runner-card`, `runner-paired`, `issue-runner-token`,
-  `runner-token-reveal`, `runner-token-value`, `copy-runner-token`,
-  `hide-runner-token`, `revoke-runner-token`, `confirm-revoke`,
-  `manage-error`, `manage-notice`
+  `add-member`, `runner-card`, `runner-paired`, `attached-runner`,
+  `detach-runner`, `confirm-detach`, `dedicated-runner`,
+  `issue-runner-token`, `revoke-runner-token`, `confirm-revoke`,
+  `attach-runner-list`, `attachable:<runner>`, `attach-runner:<runner>`,
+  `open-runner-settings`, `manage-error`, `manage-notice`
+- **One-time token panel** (Settings and Manage): `token-reveal`,
+  `token-reveal-title`, `runner-token-value` (masked until shown),
+  `reveal-toggle`, `copy-runner-token`, `hide-runner-token` (Done),
+  `setup-build`, `setup-envfile`, `setup-env`, `setup-docker` (each with
+  `-copy`), `connector-step-<n>`, `reveal-test-connection`
+- **Settings:** `nav-settings`,
+  `nav-settings:<runners|providers|routing|appearance>`, `settings`,
+  `runners-settings`, `providers-settings`, `routing-settings`,
+  `appearance-settings`
+- **Runners:** `add-runner-group`, `runner-name`,
+  `runner-visibility:<personal|organization>`, `add-runner`, `runner-list`,
+  `runner:<id>`, `rotate-runner:<id>`, `delete-runner:<id>`,
+  `runner-confirm:<id>`, `confirm-rotate-runner`, `confirm-delete-runner`,
+  `cancel-runner-action`, `runners-error`, `runners-notice`
+- **Model providers:** `provider-search`, `device-providers`,
+  `server-providers`, `provider:<provider id>`, `device-form`,
+  `server-form`, `provider-name`, `provider-url:<url>`,
+  `provider-base-url`, `provider-key`, `provider-model`, `provider-save`,
+  `provider-save-fetch`, `provider-create-device`, `provider-form-error`,
+  `connection-list`, `connection:<id>`, `connection-default:<id>`,
+  `connection-make-default:<id>`, `connection-models:<id>`,
+  `connection-token:<id>`, `connection-unpair:<id>`,
+  `connection-confirm-unpair:<id>`, `connection-confirm-unpair-now:<id>`,
+  `device-status:<id>`, `device-status-text:<id>`,
+  `connection-replace-key:<id>`, `connection-key-input:<id>`,
+  `connection-key-save:<id>`, `model:<id>:<model>`,
+  `connection-model-list:<id>`, `connection-model-input:<id>`,
+  `connection-model-save:<id>`, `listing-ok:<id>`, `listing-error:<id>`,
+  `connection-delete:<id>`, `connection-confirm-delete:<id>`,
+  `connection-confirm-delete-now:<id>`, `catalog-error`, `providers-error`,
+  `providers-notice`, `provider-capability` (and
+  `provider-capability:<all|chat|system_one|embeddings>`),
+  `connection-capability:<id>`, `connection-shared:<id>`
+- **Sharing:** `connection-sharing:<id>`, `sharing:<id>`,
+  `sharing-visibility:<id>` (and `:<personal|spaces|organization>`),
+  `sharing-spaces:<id>`, `sharing-space:<id>:<sid>`, `sharing-warning:<id>`,
+  `sharing-preset:<id>`, `sharing-needs-model:<id>`, `sharing-save:<id>`,
+  `sharing-error:<id>`, `sharing-notice:<id>`
+- **Model routing:** `routing-classifier`, `routing-embedding`,
+  `routing-default-chat` (each with `-missing`), `routing-enabled`,
+  `routing-infer`, `routing-min-route`, `routing-min-directed`,
+  `routing-add-case`, `case:<n>`, `case-label:<n>`, `case-description:<n>`,
+  `case-model:<n>`, `case-remove:<n>`, `case-missing:<n>`,
+  `routing-dataflow`, `dataflow-<routing|addressing|search|never>`,
+  `routing-save`, `routing-revert`, `routing-error`, `routing-notice`,
+  `routing-unsupported`, `available-error`,
+  `routing-no-<classifier|chat|embedding>`
+- **Search:** `search-view`, `search-form`, `search-query`, `search-scope`,
+  `search-submit`, `search-results`, `search-result:…`, `search-open:…`,
+  `search-summary`, `search-ranking`, `search-ranking-explain`,
+  `search-partial`, `search-notice`, `search-empty`, `search-hidden`,
+  `search-error`, `search-open-error`, `search-open-providers`,
+  `search-index-progress`, `search-index-more`, `search-index-notice`,
+  `search-index-error`
+- **Scheduled tasks:** `schedules-view`, `schedule-list`, `schedule-new`,
+  `schedules-reload`, `schedules-error`, `schedules-notice`, `schedule-form`,
+  `schedule-name`, `schedule-prompt`, `schedule-destination` (and
+  `schedule-destination:…`), `schedule-room`, `schedule-rooms-state`,
+  `schedule-recipient`, `schedule-when`, `schedule-once-date`,
+  `schedule-once-time`, `schedule-once-zone`, `schedule-once-preview`,
+  `schedule-repeat`, `schedule-repeat-time`, `schedule-weekday`,
+  `schedule-cron`, `schedule-cron-preview`, `schedule-timezone`,
+  `schedule-timezone-device`, `schedule-timezone-utc`, `schedule-enabled`,
+  `schedule-save`, `schedule-cancel`, `schedule-form-error`, and per task
+  (`…:<id>`): `schedule:`, `schedule-state:`, `schedule-next:`,
+  `schedule-last:`, `schedule-edit:`, `schedule-pause:`, `schedule-resume:`,
+  `schedule-run:`, `schedule-delete:`, `schedule-confirm:`,
+  `schedule-confirm-delete:`, `schedule-cancel-delete`, `schedule-history:`,
+  `schedule-history-refresh:`, `schedule-runs:`, `schedule-runs-empty:`,
+  `schedule-runs-error:`
 
 ## Limits
 
 - Polling, not push. New events appear within about 1.5 s.
 - Each room keeps the last 2,000 events in memory. Older history isn't
   paged back yet.
-- Mentions use user IDs as written. There are no display names until the
-  server provides them.
+- Mentions use user IDs as written. Messages show the author's display name,
+  as the server recorded it when the message was written.
 - The WebKitGTK 6.0 requirement on Linux comes from NSH's host, not from
   Metro.

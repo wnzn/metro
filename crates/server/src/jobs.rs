@@ -1,10 +1,18 @@
-//! Bounded job queues between the server and each Space's paired runner.
+//! Bounded job queues between the server and the runner serving each Space.
 //!
-//! Every Space has its own queue. A runner token resolves to one Space and a
-//! credential *generation*; the generation goes up whenever the owner
-//! rotates or revokes the token. A runner only ever claims jobs of its own
-//! Space, and a result is accepted only from the Space and generation that
-//! claimed the job, so a stale or foreign runner can never answer a job.
+//! Every Space has its own queue and a *runner generation* (stored in the
+//! database) that goes up whenever who may serve the Space changes: a
+//! dedicated token is issued, rotated or revoked, or a registered runner is
+//! attached, detached, reassigned, rotated or deleted. A runner's credential
+//! resolves, on every request, to the Spaces it may serve and each one's
+//! current generation. A runner only ever claims jobs of those Spaces, and a
+//! result is accepted only from the same claimer, for a Space it still
+//! serves, at the generation the job was claimed under, so a stale or foreign
+//! runner can never answer a job, and nothing in flight crosses to a new
+//! attachment.
+//!
+//! A registered runner may serve several Spaces; its claim takes the oldest
+//! queued job across all of them, so no Space starves another.
 //!
 //! Jobs live in memory only: a job belongs to the request or agent run that
 //! waits for it, and the room history in SQLite is the durable record. A job
@@ -29,6 +37,9 @@ pub struct ClaimedJob {
     pub id: String,
     pub tool: String,
     pub arguments: serde_json::Value,
+    /// The Space the job belongs to (runner protocol 2 only).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub space_id: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -45,7 +56,8 @@ pub enum JobError {
     NotClaimed,
     /// The runner claimed the job but did not answer in time.
     TimedOut,
-    /// The Space's runner token was rotated or revoked while the job was pending.
+    /// The Space's runner changed (token rotated or revoked, runner detached,
+    /// reassigned or deleted) while the job was pending.
     CredentialChanged,
 }
 
@@ -56,7 +68,8 @@ impl std::fmt::Display for JobError {
             JobError::NotClaimed => "no runner picked up the job in time; is the runner connected?",
             JobError::TimedOut => "the runner did not return a result in time",
             JobError::CredentialChanged => {
-                "the Space's runner token was rotated or revoked; the job was cancelled"
+                "the Space's runner changed (token rotated or revoked, or runner detached, \
+                 reassigned or deleted); the job was cancelled"
             }
         })
     }
@@ -84,11 +97,19 @@ enum Finished {
 
 enum State {
     Queued,
-    Claimed { at: Instant, generation: u64 },
+    Claimed {
+        at: Instant,
+        generation: u64,
+        claimer: String,
+    },
 }
 
 struct Job {
     space: String,
+    /// Order of arrival across all Spaces.
+    seq: u64,
+    /// The Space's runner generation when the job was queued.
+    generation: u64,
     tool: String,
     arguments: serde_json::Value,
     state: State,
@@ -108,6 +129,7 @@ struct Inner {
     jobs: HashMap<String, Job>,
     finished: HashMap<String, (String, Finished)>,
     finished_order: VecDeque<String>,
+    next_seq: u64,
 }
 
 impl Inner {
@@ -139,10 +161,10 @@ impl Inner {
         }
     }
 
-    /// Note that `space` now uses credential `generation`. Returns false when
+    /// Note that `space` now uses runner `generation`. Returns false when
     /// the caller holds an older generation than one already seen. A newer
     /// generation fails every job claimed under an older one, and with
-    /// `drop_queued` every queued job too.
+    /// `drop_queued` every job queued under an older one too.
     fn observe(&mut self, space: &str, generation: u64, drop_queued: bool) -> bool {
         let q = self.spaces.entry(space.to_owned()).or_default();
         if generation < q.generation {
@@ -157,7 +179,7 @@ impl Inner {
                 .filter(|(_, job)| job.space == space)
                 .filter(|(_, job)| match job.state {
                     State::Claimed { generation: g, .. } => g < generation,
-                    State::Queued => drop_queued,
+                    State::Queued => drop_queued && job.generation < generation,
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -194,12 +216,16 @@ impl JobQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Queue `tool` for `space`'s runner and wait for its result. Dropping
-    /// the future abandons the job: a queued job is withdrawn and a late
-    /// result is refused as expired.
+    /// Queue `tool` for `space`'s runner and wait for its result.
+    /// `generation` is the Space's runner generation as read from the
+    /// database just before; a job for a superseded generation is refused
+    /// at once, so it can never reach a runner attached later. Dropping the
+    /// future abandons the job: a queued job is withdrawn and a late result
+    /// is refused as expired.
     pub async fn run(
         &self,
         space: &str,
+        generation: u64,
         tool: &str,
         arguments: serde_json::Value,
     ) -> Result<JobOutcome, JobError> {
@@ -207,6 +233,11 @@ impl JobQueue {
         let (tx, mut rx) = oneshot::channel();
         {
             let mut inner = self.lock();
+            if !inner.observe(space, generation, false) {
+                return Err(JobError::CredentialChanged);
+            }
+            let seq = inner.next_seq;
+            inner.next_seq += 1;
             let q = inner.spaces.entry(space.to_owned()).or_default();
             if q.queue.len() >= self.capacity {
                 return Err(JobError::QueueFull);
@@ -216,6 +247,8 @@ impl JobQueue {
                 id.clone(),
                 Job {
                     space: space.to_owned(),
+                    seq,
+                    generation,
                     tool: tool.to_owned(),
                     arguments,
                     state: State::Queued,
@@ -255,87 +288,121 @@ impl JobQueue {
         result
     }
 
-    /// The oldest queued job of `space`, now claimed by the runner holding
-    /// credential `generation`. `None` when there is none, or when the
-    /// credential has been superseded.
-    pub fn claim(&self, space: &str, generation: u64) -> Option<ClaimedJob> {
+    /// The oldest queued job across `spaces` (each with the runner
+    /// generation the caller holds for it), now claimed by `claimer`. `None`
+    /// when there is none; Spaces whose generation has been superseded are
+    /// skipped.
+    pub fn claim(&self, claimer: &str, spaces: &[(String, u64)]) -> Option<ClaimedJob> {
         let mut inner = self.lock();
-        if !inner.observe(space, generation, false) {
-            return None;
-        }
-        let now = Instant::now();
-        while let Some(id) = inner
-            .spaces
-            .get_mut(space)
-            .and_then(|q| q.queue.pop_front())
-        {
-            if let Some(job) = inner.jobs.get_mut(&id) {
-                job.state = State::Claimed {
-                    at: now,
-                    generation,
-                };
-                return Some(ClaimedJob {
-                    id,
-                    tool: job.tool.clone(),
-                    arguments: job.arguments.clone(),
-                });
+        let mut best: Option<(u64, String, u64)> = None;
+        for (space, generation) in spaces {
+            if !inner.observe(space, *generation, false) {
+                continue;
+            }
+            let inner = &mut *inner;
+            let Some(q) = inner.spaces.get_mut(space) else {
+                continue;
+            };
+            // Drop ids of jobs that already left (abandoned or failed).
+            while let Some(id) = q.queue.front() {
+                if inner.jobs.contains_key(id) {
+                    break;
+                }
+                q.queue.pop_front();
+            }
+            if let Some(job) = q.queue.front().and_then(|id| inner.jobs.get(id))
+                && best.as_ref().is_none_or(|(seq, _, _)| job.seq < *seq)
+            {
+                best = Some((job.seq, space.clone(), *generation));
             }
         }
-        None
+        let (_, space, generation) = best?;
+        let id = inner.spaces.get_mut(&space)?.queue.pop_front()?;
+        let job = inner.jobs.get_mut(&id)?;
+        job.state = State::Claimed {
+            at: Instant::now(),
+            generation,
+            claimer: claimer.to_owned(),
+        };
+        Some(ClaimedJob {
+            id,
+            tool: job.tool.clone(),
+            arguments: job.arguments.clone(),
+            space_id: Some(space),
+        })
     }
 
-    /// Accept a result from `space`'s runner holding credential `generation`.
+    /// Accept a result from `claimer`, which may serve `spaces` (each with
+    /// the runner generation it holds). A job of any other Space is
+    /// indistinguishable from an unknown one.
     pub fn complete(
         &self,
-        space: &str,
-        generation: u64,
+        claimer: &str,
+        spaces: &[(String, u64)],
         id: &str,
         outcome: JobOutcome,
     ) -> Result<(), CompleteError> {
         let mut inner = self.lock();
-        if !inner.observe(space, generation, false) {
-            return Err(CompleteError::Expired);
-        }
-        match inner.jobs.get(id) {
-            // Another Space's job is indistinguishable from an unknown one.
-            Some(job) if job.space != space => return Err(CompleteError::Unknown),
+        let served = |space: &str| {
+            spaces
+                .iter()
+                .find(|(s, _)| s == space)
+                .map(|(s, g)| (s.clone(), *g))
+        };
+        let space = match inner.jobs.get(id) {
+            Some(job) => job.space.clone(),
             None => {
                 return Err(match inner.finished.get(id) {
-                    Some((s, _)) if s != space => CompleteError::Unknown,
+                    Some((s, _)) if served(s).is_none() => CompleteError::Unknown,
                     Some((_, Finished::Completed)) => CompleteError::Duplicate,
                     Some((_, Finished::Expired)) => CompleteError::Expired,
                     None => CompleteError::Unknown,
                 });
             }
-            Some(job) => match job.state {
-                State::Queued => return Err(CompleteError::NotClaimed),
-                State::Claimed { generation: g, .. } if g != generation => {
-                    inner.fail(id, Some(JobError::CredentialChanged));
-                    return Err(CompleteError::Expired);
-                }
-                State::Claimed { at, .. } if at.elapsed() > self.run_timeout => {
-                    inner.fail(id, Some(JobError::TimedOut));
-                    return Err(CompleteError::Expired);
-                }
-                State::Claimed { .. } => {}
-            },
+        };
+        let Some((space, generation)) = served(&space) else {
+            return Err(CompleteError::Unknown);
+        };
+        if !inner.observe(&space, generation, false) {
+            return Err(CompleteError::Expired);
+        }
+        // `observe` may have failed the job just now.
+        let Some(job) = inner.jobs.get(id) else {
+            return Err(CompleteError::Expired);
+        };
+        match &job.state {
+            State::Queued => return Err(CompleteError::NotClaimed),
+            State::Claimed { claimer: c, .. } if c != claimer => {
+                return Err(CompleteError::Unknown);
+            }
+            State::Claimed { generation: g, .. } if *g != generation => {
+                inner.fail(id, Some(JobError::CredentialChanged));
+                return Err(CompleteError::Expired);
+            }
+            State::Claimed { at, .. } if at.elapsed() > self.run_timeout => {
+                inner.fail(id, Some(JobError::TimedOut));
+                return Err(CompleteError::Expired);
+            }
+            State::Claimed { .. } => {}
         }
         let job = inner.jobs.remove(id).expect("checked above");
-        inner.finish(id, space, Finished::Completed);
+        inner.finish(id, &space, Finished::Completed);
         drop(inner);
         // The waiter may have just given up; the result then goes nowhere.
         let _ = job.tx.send(Ok(outcome));
         Ok(())
     }
 
-    /// The Space's token was rotated to `generation`: jobs claimed under the
-    /// old token fail; queued jobs wait for the new runner.
+    /// The same runner's token was rotated (`generation` is the Space's new
+    /// generation): jobs claimed under the old token fail; queued jobs wait
+    /// for the runner holding the new token.
     pub fn rotate(&self, space: &str, generation: u64) {
         self.lock().observe(space, generation, false);
     }
 
-    /// The Space's token was revoked (`generation` is the new, tokenless
-    /// generation): every pending job fails.
+    /// Who serves the Space changed (token revoked; runner attached,
+    /// detached, reassigned or deleted; `generation` is the new one): every
+    /// job queued or claimed before fails.
     pub fn revoke(&self, space: &str, generation: u64) {
         self.lock().observe(space, generation, true);
     }
@@ -363,13 +430,19 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    const D: &str = "dedicated";
+
     fn queue() -> JobQueue {
         JobQueue::new(2, Duration::from_millis(200), Duration::from_millis(300))
     }
 
-    async fn claim_wait(q: &JobQueue, space: &str, generation: u64) -> ClaimedJob {
+    fn sp(space: &str, generation: u64) -> Vec<(String, u64)> {
+        vec![(space.to_owned(), generation)]
+    }
+
+    async fn claim_wait(q: &JobQueue, who: &str, spaces: &[(String, u64)]) -> ClaimedJob {
         loop {
-            if let Some(job) = q.claim(space, generation) {
+            if let Some(job) = q.claim(who, spaces) {
                 return job;
             }
             tokio::task::yield_now().await;
@@ -388,25 +461,35 @@ mod tests {
         let q = queue();
         let runner = q.clone();
         let task =
-            tokio::spawn(async move { q.run("s1", "workspace.list", json!({"path": "."})).await });
+            tokio::spawn(
+                async move { q.run("s1", 1, "workspace.list", json!({"path": "."})).await },
+            );
         assert_eq!(
-            runner.claim("s2", 1),
+            runner.claim(D, &sp("s2", 1)),
             None,
             "another Space's runner sees nothing"
         );
-        let job = claim_wait(&runner, "s1", 1).await;
+        let job = claim_wait(&runner, D, &sp("s1", 1)).await;
         assert_eq!(job.tool, "workspace.list");
+        assert_eq!(job.space_id.as_deref(), Some("s1"));
         assert_eq!(
-            runner.complete("s2", 1, &job.id, ok("x")),
+            runner.complete(D, &sp("s2", 1), &job.id, ok("x")),
             Err(CompleteError::Unknown)
         );
-        runner.complete("s1", 1, &job.id, ok("a\nb")).unwrap();
         assert_eq!(
-            runner.complete("s1", 1, &job.id, ok("again")),
+            runner.complete("runner:other", &sp("s1", 1), &job.id, ok("x")),
+            Err(CompleteError::Unknown),
+            "another claimer cannot answer"
+        );
+        runner
+            .complete(D, &sp("s1", 1), &job.id, ok("a\nb"))
+            .unwrap();
+        assert_eq!(
+            runner.complete(D, &sp("s1", 1), &job.id, ok("again")),
             Err(CompleteError::Duplicate)
         );
         assert_eq!(
-            runner.complete("s2", 1, &job.id, ok("again")),
+            runner.complete(D, &sp("s2", 1), &job.id, ok("again")),
             Err(CompleteError::Unknown)
         );
         assert_eq!(task.await.unwrap().unwrap().output, "a\nb");
@@ -414,16 +497,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn one_runner_serves_several_spaces_oldest_first() {
+        let q = JobQueue::new(8, Duration::from_secs(5), Duration::from_secs(5));
+        let spawn = |space: &'static str, n: u64| {
+            let q = q.clone();
+            tokio::spawn(async move { q.run(space, 1, "t", json!({"n": n})).await })
+        };
+        // Two jobs in a busy Space, then one in a quiet one, then another busy one.
+        let a1 = spawn("busy", 1);
+        while q.pending() < 1 {
+            tokio::task::yield_now().await;
+        }
+        let a2 = spawn("busy", 2);
+        while q.pending() < 2 {
+            tokio::task::yield_now().await;
+        }
+        let b1 = spawn("quiet", 3);
+        while q.pending() < 3 {
+            tokio::task::yield_now().await;
+        }
+        let both = vec![("busy".to_owned(), 1), ("quiet".to_owned(), 1)];
+        let r = "runner:r1";
+        let order: Vec<u64> = (0..3)
+            .map(|_| {
+                let job = q.claim(r, &both).unwrap();
+                q.complete(r, &both, &job.id, ok("")).unwrap();
+                job.arguments["n"].as_u64().unwrap()
+            })
+            .collect();
+        assert_eq!(order, vec![1, 2, 3], "arrival order across Spaces");
+        for t in [a1, a2, b1] {
+            t.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn rotation_fails_claimed_jobs_and_keeps_queued_ones() {
         let q = JobQueue::new(4, Duration::from_secs(5), Duration::from_secs(5));
         let a = tokio::spawn({
             let q = q.clone();
-            async move { q.run("s", "t", json!({"n": 1})).await }
+            async move { q.run("s", 1, "t", json!({"n": 1})).await }
         });
-        let claimed = claim_wait(&q, "s", 1).await;
+        let claimed = claim_wait(&q, D, &sp("s", 1)).await;
         let b = tokio::spawn({
             let q = q.clone();
-            async move { q.run("s", "t", json!({"n": 2})).await }
+            async move { q.run("s", 1, "t", json!({"n": 2})).await }
         });
         while q.pending() < 2 {
             tokio::task::yield_now().await;
@@ -432,14 +550,14 @@ mod tests {
         assert_eq!(a.await.unwrap(), Err(JobError::CredentialChanged));
         // The old runner can neither answer nor claim.
         assert_eq!(
-            q.complete("s", 1, &claimed.id, ok("late")),
+            q.complete(D, &sp("s", 1), &claimed.id, ok("late")),
             Err(CompleteError::Expired)
         );
-        assert_eq!(q.claim("s", 1), None);
+        assert_eq!(q.claim(D, &sp("s", 1)), None);
         // The new runner gets the queued job.
-        let next = q.claim("s", 2).unwrap();
+        let next = q.claim(D, &sp("s", 2)).unwrap();
         assert_eq!(next.arguments, json!({"n": 2}));
-        q.complete("s", 2, &next.id, ok("fresh")).unwrap();
+        q.complete(D, &sp("s", 2), &next.id, ok("fresh")).unwrap();
         assert_eq!(b.await.unwrap().unwrap().output, "fresh");
     }
 
@@ -448,7 +566,7 @@ mod tests {
         let q = JobQueue::new(4, Duration::from_secs(5), Duration::from_secs(5));
         let a = tokio::spawn({
             let q = q.clone();
-            async move { q.run("s", "t", json!({})).await }
+            async move { q.run("s", 0, "t", json!({})).await }
         });
         while q.pending() < 1 {
             tokio::task::yield_now().await;
@@ -459,29 +577,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_generation_cannot_queue_and_reattach_keeps_new_jobs() {
+        let q = JobQueue::new(4, Duration::from_secs(5), Duration::from_secs(5));
+        q.revoke("s", 5);
+        // Read before the change: refused, so it never reaches the new runner.
+        assert_eq!(
+            q.run("s", 4, "t", json!({})).await,
+            Err(JobError::CredentialChanged)
+        );
+        // Queued at the new generation; a repeated revoke at the same
+        // generation leaves it alone.
+        let a = tokio::spawn({
+            let q = q.clone();
+            async move { q.run("s", 5, "t", json!({})).await }
+        });
+        while q.pending() < 1 {
+            tokio::task::yield_now().await;
+        }
+        q.revoke("s", 5);
+        let job = q.claim("runner:b", &sp("s", 5)).unwrap();
+        q.complete("runner:b", &sp("s", 5), &job.id, ok("b"))
+            .unwrap();
+        assert_eq!(a.await.unwrap().unwrap().output, "b");
+    }
+
+    #[tokio::test]
+    async fn detached_runner_late_result_is_refused() {
+        let q = JobQueue::new(4, Duration::from_secs(5), Duration::from_secs(5));
+        let r = "runner:a";
+        let a = tokio::spawn({
+            let q = q.clone();
+            async move { q.run("s", 1, "t", json!({})).await }
+        });
+        let job = claim_wait(&q, r, &sp("s", 1)).await;
+        q.revoke("s", 2);
+        assert_eq!(a.await.unwrap(), Err(JobError::CredentialChanged));
+        // The runner no longer serves the Space at all.
+        assert_eq!(
+            q.complete(r, &[], &job.id, ok("late")),
+            Err(CompleteError::Unknown)
+        );
+        // Or it still lists the Space with its old generation.
+        assert_eq!(
+            q.complete(r, &sp("s", 1), &job.id, ok("late")),
+            Err(CompleteError::Expired)
+        );
+    }
+
+    #[tokio::test]
     async fn unclaimed_job_fails_and_is_withdrawn() {
         let q = queue();
         assert_eq!(
-            q.run("s", "workspace.check", json!({})).await,
+            q.run("s", 1, "workspace.check", json!({})).await,
             Err(JobError::NotClaimed)
         );
         assert_eq!(q.pending(), 0);
-        assert_eq!(q.claim("s", 1), None);
+        assert_eq!(q.claim(D, &sp("s", 1)), None);
     }
 
     #[tokio::test]
     async fn late_result_is_expired() {
         let q = queue();
         let runner = q.clone();
-        let task = tokio::spawn(async move { q.run("s", "workspace.check", json!({})).await });
-        let job = claim_wait(&runner, "s", 1).await;
+        let task = tokio::spawn(async move { q.run("s", 1, "workspace.check", json!({})).await });
+        let job = claim_wait(&runner, D, &sp("s", 1)).await;
         assert_eq!(task.await.unwrap(), Err(JobError::TimedOut));
         assert_eq!(
-            runner.complete("s", 1, &job.id, ok("")),
+            runner.complete(D, &sp("s", 1), &job.id, ok("")),
             Err(CompleteError::Expired)
         );
         assert_eq!(
-            runner.complete("s", 1, "nope", ok("")),
+            runner.complete(D, &sp("s", 1), "nope", ok("")),
             Err(CompleteError::Unknown)
         );
     }
@@ -491,14 +657,17 @@ mod tests {
         let q = queue();
         let spawn = |space: &'static str| {
             let q = q.clone();
-            tokio::spawn(async move { q.run(space, "t", json!({})).await })
+            tokio::spawn(async move { q.run(space, 1, "t", json!({})).await })
         };
         let a = spawn("s");
         let b = spawn("s");
         while q.pending() < 2 {
             tokio::task::yield_now().await;
         }
-        assert_eq!(q.run("s", "t", json!({})).await, Err(JobError::QueueFull));
+        assert_eq!(
+            q.run("s", 1, "t", json!({})).await,
+            Err(JobError::QueueFull)
+        );
         // Another Space has its own capacity.
         let c = spawn("other");
         while q.pending() < 3 {
@@ -509,6 +678,6 @@ mod tests {
             let _ = t.await;
         }
         assert_eq!(q.pending(), 0);
-        assert_eq!(q.claim("s", 1), None);
+        assert_eq!(q.claim(D, &sp("s", 1)), None);
     }
 }

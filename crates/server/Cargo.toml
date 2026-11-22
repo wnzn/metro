@@ -1,6 +1,6 @@
 [package]
 name = "metro-server"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 description = "Metro server: private Spaces, threads and personal Chat with durable SQLite history, per-Space runner job queues and Rig agents."
@@ -17,11 +17,20 @@ path = "src/lib.rs"
 
 [dependencies]
 metro-auth = { path = "../auth" }
+metro-model-protocol = { path = "../model-protocol" }
 anyhow = "1.0.100"
+base64 = "0.22"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+chrono-tz = { version = "0.10.4", default-features = false, features = ["std"] }
+chacha20poly1305 = { version = "0.11", default-features = false, features = ["alloc"] }
+futures = "0.3"
 getrandom = "0.3"
+# Avatars: decode PNG/JPEG under limits, downscale, re-encode as a clean PNG.
+image = { version = "=0.25.10", default-features = false, features = ["png", "jpeg"] }
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "query", "tokio"] }
 rig-agent = { version = "0.47.0", default-features = false }
 rig-core = { version = "0.47.0", default-features = false, features = ["reqwest", "rustls"] }
+rig-reqwest = { version = "0.47.0", default-features = false, features = ["rustls"] }
 rusqlite = { version = "0.43.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
@@ -32,5 +41,8 @@ tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["v4"] }
 
 [dev-dependencies]
+# tests/media_embeddings.rs: the real connector client and job runner against
+# this server's device routes.
+metro-connector = { path = "../connector" }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 tempfile = "3.27.0"

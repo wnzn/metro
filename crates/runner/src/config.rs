@@ -16,6 +16,33 @@ pub const SERVER_JOB_LEASE_SECS: u64 = 120;
 /// 30s of the lease for result delivery (one full default HTTP attempt).
 pub const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 90;
 
+/// Bearer prefix of a reusable (registered, protocol 2) runner credential.
+/// Any other token is a legacy dedicated credential.
+pub const REUSABLE_TOKEN_PREFIX: &str = "metro_rt_v2_";
+
+/// Which kind of credential the runner holds. Decided by the token prefix
+/// only, never by anything the server sends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Credential {
+    /// Legacy token bound to one Space: tools operate on `METRO_WORKSPACE`
+    /// itself, exactly as before.
+    Dedicated,
+    /// Registered runner that may serve several Spaces. `METRO_WORKSPACE` is
+    /// only the writable base; each job runs in `spaces/<space_id>/` and a
+    /// claim without a valid `space_id` is refused.
+    Reusable,
+}
+
+impl Credential {
+    pub fn from_token(token: &str) -> Self {
+        if token.starts_with(REUSABLE_TOKEN_PREFIX) {
+            Credential::Reusable
+        } else {
+            Credential::Dedicated
+        }
+    }
+}
+
 /// Environment variables the runner reads. Kept in one place so docs and the
 /// startup log can list them.
 pub mod env {
@@ -93,9 +120,11 @@ pub enum Sandbox {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub token: Secret,
+    pub credential: Credential,
     /// Base URL without trailing slash.
     pub server_url: String,
-    /// Canonical absolute workspace path.
+    /// Canonical absolute workspace path. For a reusable credential this is
+    /// the base that holds `spaces/<space_id>/`, never a tool root itself.
     pub workspace: PathBuf,
     pub poll_interval: Duration,
     pub http_timeout: Duration,
@@ -239,7 +268,16 @@ impl Config {
             }
         };
 
+        let credential = Credential::from_token(&token);
+        if credential == Credential::Reusable && workspace == Path::new("/") {
+            return err(format!(
+                "{}: refusing / as the base for per-Space workspaces",
+                env::WORKSPACE
+            ));
+        }
+
         Ok(Config {
+            credential,
             token: Secret(token),
             server_url,
             workspace,
@@ -623,6 +661,22 @@ mod tests {
                 assert_eq!(d.pids, 256);
             }
             Sandbox::None => panic!("expected docker"),
+        }
+    }
+
+    #[test]
+    fn credential_kind_comes_from_token_prefix() {
+        assert_eq!(cfg(&[]).unwrap().credential, Credential::Dedicated);
+        let c = cfg(&[(env::TOKEN, "metro_rt_v2_abc")]).unwrap();
+        assert_eq!(c.credential, Credential::Reusable);
+        assert!(!format!("{c:?}").contains("metro_rt_v2_abc"));
+        // Similar-looking prefixes stay dedicated.
+        for t in ["metro_rt_v1_abc", "xmetro_rt_v2_abc", "METRO_RT_V2_abc"] {
+            assert_eq!(
+                cfg(&[(env::TOKEN, t)]).unwrap().credential,
+                Credential::Dedicated,
+                "{t}"
+            );
         }
     }
 

@@ -1,0 +1,64 @@
+[package]
+name = "metro-connector"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+description = "Metro device connector: runs a person's own model connection (OpenAI sign-in, Claude Code, an OpenAI-compatible endpoint, a System One endpoint or an embeddings endpoint, with their own key) on their own machine, and polls Metro for inference jobs. Outbound only."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[[bin]]
+name = "metro-connector"
+path = "src/main.rs"
+
+[lib]
+name = "metro_connector"
+path = "src/lib.rs"
+
+# Versions match what Cargo.lock already resolves (via metro-auth and
+# metro-server). Vendor adapter needs come from their authors' handoff notes.
+[dependencies]
+anyhow = "1.0.100"
+# System One and embeddings clients, shared with metro-server.
+metro-model-protocol = { path = "../model-protocol" }
+# openai_oauth: PKCE and state encoding.
+base64 = "0.22"
+# openai_oauth: ID-token parsing. Same single crypto backend as metro-auth;
+# never add `rust_crypto` alongside it.
+jsonwebtoken = { version = "12", default-features = false, features = ["aws_lc_rs"] }
+rand = "0.9"
+reqwest = { version = "0.13", default-features = false, features = ["rustls", "http2"] }
+# No-echo terminal prompts for the device token and provider keys.
+rpassword = "7.4"
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11"
+subtle = "2.6"
+# `process`/`io-util`: claude_code runs the person's own `claude` CLI with
+# piped, bounded I/O. `fs`: openai_oauth token store.
+tokio = { version = "1.53.1", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+url = "2.5"
+zeroize = "1.8"
+# desktop_tools: capability-relative file access (Linux and Windows) for the
+# desktop's read-only local workspace tools. Never ambient paths per request.
+cap-std = "4.0.3"
+# Its core (already locked with cap-std): handle-relative no-follow opens.
+cap-primitives = "4.0.3"
+# desktop: the launcher's loopback bridge (bounded HTTP/1.1 server). Same
+# versions Cargo.lock already resolves through metro-server.
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+hyper = { version = "1.12", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1.21", default-features = false, features = ["tokio", "service"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.180"
+
+# desktop: the profile root's protected DACL (current user + SYSTEM).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_JobObjects", "Win32_System_Threading"] }
+
+[dev-dependencies]
+aws-lc-rs = "1"
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
+jsonwebtoken = { version = "12", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+tempfile = "3.27.0"

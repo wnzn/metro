@@ -15,14 +15,16 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use rusqlite::{Connection, ErrorCode, OptionalExtension, Transaction, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[path = "reactions.rs"]
 pub mod reactions;
 
 pub const LOBBY_ID: &str = "lobby";
 pub const LOBBY_NAME: &str = "lobby";
-const SCHEMA_VERSION: i64 = 2;
+/// 3 added registered runners (`runners`, `space_runners`); a version 2
+/// database is upgraded in place, additively.
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -90,6 +92,122 @@ pub struct Event {
     pub mentions: serde_json::Value,
     /// `room`, `agent`, `users` or `mixed`; `room` for non-messages.
     pub audience: String,
+    /// The agent turn or Demo run that wrote this event, when the server
+    /// knows it. Absent on people's messages, reactions and older history.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub activity: Option<Activity>,
+    /// When the server stored this event, in epoch milliseconds (the
+    /// `created_at` column). `None` when the stored value is not a usable
+    /// time (see [`event_time`]); never filled in with "now". On the wire it
+    /// is an RFC 3339 UTC string with millisecond precision and a `Z`
+    /// suffix, or `null`. Only the server sets it; ordering stays by `id`.
+    #[serde(serialize_with = "serialize_event_time")]
+    pub created_at: Option<i64>,
+}
+
+/// Earliest stored `created_at` taken as a real time: 2000-01-01T00:00:00Z
+/// in milliseconds. Metro has always written epoch milliseconds; anything
+/// below this (0, negative, or a seconds value from a foreign import) is not
+/// a time Metro recorded, so it is reported as unknown rather than guessed.
+const EARLIEST_EVENT_MS: i64 = 946_684_800_000;
+
+/// The stored `created_at` milliseconds as a known time, or `None`.
+pub fn event_time(ms: i64) -> Option<i64> {
+    (ms >= EARLIEST_EVENT_MS && chrono::DateTime::from_timestamp_millis(ms).is_some()).then_some(ms)
+}
+
+/// `ms` (epoch milliseconds) as RFC 3339 UTC, e.g. `2026-11-22T03:04:05.123Z`.
+pub fn rfc3339_utc(ms: i64) -> Option<String> {
+    chrono::DateTime::from_timestamp_millis(ms)
+        .map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Millis, true))
+}
+
+fn serialize_event_time<S: serde::Serializer>(ms: &Option<i64>, s: S) -> Result<S::Ok, S::Error> {
+    match ms.and_then(rfc3339_utc) {
+        Some(t) => s.serialize_str(&t),
+        None => s.serialize_none(),
+    }
+}
+
+/// One agent turn or Demo run, as tagged on the events it produced.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Activity {
+    /// The Space run id (`run_…`), or `chat_…` / `demo_…`; stable for the turn.
+    pub id: String,
+    /// Who is working, for display: [`Activity::AGENT_NAME`], a thread's
+    /// name, or `Demo`. Never the person who started it.
+    pub name: String,
+    /// [`activity::AGENT`] or [`activity::DEMO`].
+    pub source: String,
+    /// Only on `activity` lifecycle events: one of the [`activity`] phases.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase: Option<String>,
+    /// Only on an agent turn's `started` event: which model answered and
+    /// why ([`crate::model_routing`]). No prompts, no credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<crate::model_routing::RouteNote>,
+}
+
+impl Activity {
+    /// Display name of the built-in agent.
+    pub const AGENT_NAME: &'static str = "Metro";
+    pub const DEMO_NAME: &'static str = "Demo";
+
+    pub fn agent(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            source: activity::AGENT.to_owned(),
+            phase: None,
+            route: None,
+        }
+    }
+
+    /// A personal Chat turn: there is no registered run, so it gets its own id.
+    pub fn chat() -> Self {
+        Self::agent(
+            format!("chat_{}", uuid::Uuid::new_v4().simple()),
+            Self::AGENT_NAME,
+        )
+    }
+
+    pub fn demo() -> Self {
+        Self {
+            id: format!("demo_{}", uuid::Uuid::new_v4().simple()),
+            name: Self::DEMO_NAME.to_owned(),
+            source: activity::DEMO.to_owned(),
+            phase: None,
+            route: None,
+        }
+    }
+
+    /// This activity on a lifecycle event of `phase`. The route is not
+    /// carried over: it belongs on the `started` event only.
+    pub fn at(&self, phase: &str) -> Self {
+        Self {
+            phase: Some(phase.to_owned()),
+            route: None,
+            ..self.clone()
+        }
+    }
+
+    /// This activity with the route its turn took.
+    pub fn with_route(mut self, route: crate::model_routing::RouteNote) -> Self {
+        self.route = Some(route);
+        self
+    }
+}
+
+/// Activity sources and lifecycle phases.
+pub mod activity {
+    pub const AGENT: &str = "agent";
+    pub const DEMO: &str = "demo";
+    pub const STARTED: &str = "started";
+    pub const COMPLETED: &str = "completed";
+    pub const FAILED: &str = "failed";
+    pub const CANCELLED: &str = "cancelled";
+    /// Written at startup for a turn that was still active when the server stopped.
+    pub const INTERRUPTED: &str = "interrupted";
 }
 
 /// Recipients of a new event.
@@ -128,6 +246,9 @@ pub mod kind {
     pub const THREAD: &str = "thread";
     /// An agent run changed state without a reply (for example, it was cancelled).
     pub const STATUS: &str = "status";
+    /// An agent turn or Demo run started or ended; `activity.phase` says
+    /// which, and the text is empty. Never a message, never model history.
+    pub const ACTIVITY: &str = "activity";
 }
 
 /// Actors the server writes for non-human events.
@@ -286,7 +407,19 @@ impl Db {
              );
              CREATE INDEX IF NOT EXISTS personal_events_user ON personal_events (user_id, id);",
         )?;
+        add_activity_columns(&conn)?;
         reactions::init(&conn)?;
+        crate::runners::init(&conn)?;
+        crate::admin_users::init(&conn)?;
+        crate::profiles::init(&conn)?;
+        crate::providers::init(&conn)?;
+        crate::device_relay::init(&conn)?;
+        crate::model_routing::init(&conn)?;
+        crate::search::init(&conn)?;
+        crate::schedules::init(&conn)?;
+        crate::library::init(&conn)?;
+        // References library_assets, so it comes after it.
+        crate::library_search::init(&conn)?;
         let version: Option<String> = conn
             .query_row(
                 "SELECT value FROM metro_meta WHERE key = 'schema_version'",
@@ -302,16 +435,27 @@ impl Db {
                 )?;
             }
             Some(v) if v == SCHEMA_VERSION.to_string() => {}
+            // The new tables were created above; nothing existing changes.
+            Some(v) if v == "2" => {
+                conn.execute(
+                    "UPDATE metro_meta SET value = ?1 WHERE key = 'schema_version'",
+                    [SCHEMA_VERSION.to_string()],
+                )?;
+                tracing::info!("database schema upgraded from version 2 to {SCHEMA_VERSION}");
+            }
             Some(v) => anyhow::bail!(
                 "database schema version {v} is not supported by this server (expects {SCHEMA_VERSION})"
             ),
         }
+        interrupt_orphaned_activity(&conn)?;
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
+    /// The connection, for crate modules that run their own statements or
+    /// transactions. Hold it only inside a [`Db::call`] closure.
+    pub(crate) fn lock(&self) -> std::sync::MutexGuard<'_, Connection> {
         self.conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -399,7 +543,9 @@ impl Db {
     pub fn list_spaces(&self, user_id: &str) -> anyhow::Result<Vec<SpaceView>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT s.id, s.name, m.role, s.runner_token_hash IS NOT NULL
+            "SELECT s.id, s.name, m.role,
+                    (s.runner_token_hash IS NOT NULL
+                     OR EXISTS (SELECT 1 FROM space_runners a WHERE a.space_id = s.id))
              FROM space_members m JOIN spaces s ON s.id = m.space_id
              WHERE m.user_id = ?1 ORDER BY s.created_at, s.rowid",
         )?;
@@ -413,7 +559,9 @@ impl Db {
         let conn = self.lock();
         Ok(conn
             .query_row(
-                "SELECT s.id, s.name, m.role, s.runner_token_hash IS NOT NULL
+                "SELECT s.id, s.name, m.role,
+                    (s.runner_token_hash IS NOT NULL
+                     OR EXISTS (SELECT 1 FROM space_runners a WHERE a.space_id = s.id))
                  FROM space_members m JOIN spaces s ON s.id = m.space_id
                  WHERE m.space_id = ?1 AND m.user_id = ?2",
                 params![space_id, user_id],
@@ -489,6 +637,10 @@ impl Db {
                     "DELETE FROM space_members WHERE space_id = ?1 AND user_id = ?2",
                     params![space_id, user_id],
                 )?;
+                // Their own library search index of this Space goes in the
+                // same transaction; the Space's files and other members'
+                // index rows stay.
+                crate::library_search::hooks::member_removed(&tx, space_id, user_id)?;
                 RemoveMember::Removed
             }
         };
@@ -498,32 +650,56 @@ impl Db {
 
     // ---- Runner credentials ----
 
-    /// Store the hash of a new runner token for `space_id`, replacing any
-    /// previous one, and return the new credential generation.
-    pub fn set_runner_token(&self, space_id: &str, hash: &[u8]) -> anyhow::Result<u64> {
-        let conn = self.lock();
-        let generation: i64 = conn.query_row(
+    /// Store the hash of a new dedicated runner token for `space_id`,
+    /// replacing any previous one, and return the new runner generation.
+    /// `None` when a registered runner is attached: a dedicated token can
+    /// never replace or rotate it.
+    pub fn set_runner_token(&self, space_id: &str, hash: &[u8]) -> anyhow::Result<Option<u64>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let attached: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM space_runners WHERE space_id = ?1)",
+            [space_id],
+            |r| r.get(0),
+        )?;
+        if attached {
+            return Ok(None);
+        }
+        let generation: i64 = tx.query_row(
             "UPDATE spaces SET runner_token_hash = ?2, runner_generation = runner_generation + 1
              WHERE id = ?1 RETURNING runner_generation",
             params![space_id, hash],
             |r| r.get(0),
         )?;
-        Ok(generation as u64)
+        tx.commit()?;
+        Ok(Some(generation as u64))
     }
 
-    /// Remove `space_id`'s runner token and return the new generation.
-    pub fn clear_runner_token(&self, space_id: &str) -> anyhow::Result<u64> {
-        let conn = self.lock();
-        let generation: i64 = conn.query_row(
+    /// Remove `space_id`'s dedicated runner token and return the new
+    /// generation. `None` when a registered runner is attached instead
+    /// (detach it with [`Db::detach_runner`]).
+    pub fn clear_runner_token(&self, space_id: &str) -> anyhow::Result<Option<u64>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction()?;
+        let attached: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM space_runners WHERE space_id = ?1)",
+            [space_id],
+            |r| r.get(0),
+        )?;
+        if attached {
+            return Ok(None);
+        }
+        let generation: i64 = tx.query_row(
             "UPDATE spaces SET runner_token_hash = NULL, runner_generation = runner_generation + 1
              WHERE id = ?1 RETURNING runner_generation",
             [space_id],
             |r| r.get(0),
         )?;
-        Ok(generation as u64)
+        tx.commit()?;
+        Ok(Some(generation as u64))
     }
 
-    /// The Space and credential generation a runner token hash belongs to.
+    /// The Space and runner generation a dedicated runner token hash belongs to.
     pub fn runner_by_token_hash(&self, hash: &[u8]) -> anyhow::Result<Option<(String, u64)>> {
         let conn = self.lock();
         Ok(conn
@@ -535,16 +711,35 @@ impl Db {
             .optional()?)
     }
 
+    /// Whether `space_id` has a runner: a dedicated token or an attached
+    /// registered runner.
     pub fn runner_paired(&self, space_id: &str) -> anyhow::Result<bool> {
         let conn = self.lock();
         Ok(conn
             .query_row(
-                "SELECT runner_token_hash IS NOT NULL FROM spaces WHERE id = ?1",
+                "SELECT runner_token_hash IS NOT NULL
+                        OR EXISTS (SELECT 1 FROM space_runners WHERE space_id = spaces.id)
+                 FROM spaces WHERE id = ?1",
                 [space_id],
                 |r| r.get(0),
             )
             .optional()?
             .unwrap_or(false))
+    }
+
+    /// `space_id`'s current runner generation. It changes whenever who may
+    /// serve the Space changes: dedicated token issued, rotated or revoked;
+    /// registered runner attached, detached, reassigned, rotated or deleted.
+    pub fn space_runner_generation(&self, space_id: &str) -> anyhow::Result<Option<u64>> {
+        let conn = self.lock();
+        Ok(conn
+            .query_row(
+                "SELECT runner_generation FROM spaces WHERE id = ?1",
+                [space_id],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(|g| g as u64))
     }
 
     // ---- Rooms and events ----
@@ -641,7 +836,7 @@ impl Db {
     ) -> anyhow::Result<Option<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT id, kind, actor, actor_id, text, mentions, audience FROM space_events
+            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
              WHERE space_id = ?1 AND room_id = ?2 AND kind IN (SELECT value FROM json_each(?3))
              ORDER BY id DESC LIMIT 1",
         )?;
@@ -660,10 +855,26 @@ impl Db {
         text: &str,
         addressed: &Addressed,
     ) -> anyhow::Result<Event> {
+        self.append_event_with(space_id, room_id, kind, author, text, addressed, None)
+    }
+
+    /// [`Db::append_event`] tagged with the agent turn or Demo run that wrote it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_event_with(
+        &self,
+        space_id: &str,
+        room_id: &str,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        addressed: &Addressed,
+        activity: Option<&Activity>,
+    ) -> anyhow::Result<Event> {
         let conn = self.lock();
+        let at = now_ms();
         conn.execute(
-            "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, mentions, audience, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 space_id,
                 room_id,
@@ -673,7 +884,8 @@ impl Db {
                 text,
                 addressed.mentions.to_string(),
                 addressed.audience,
-                now_ms()
+                at,
+                activity_json(activity)?,
             ],
         )?;
         Ok(new_event(
@@ -682,7 +894,57 @@ impl Db {
             author,
             text,
             addressed,
+            activity,
+            at,
         ))
+    }
+
+    /// Append a message written by `author` (a person) to `room_id` of
+    /// `space_id`, in one transaction with the check that they are a
+    /// member of the Space now and the room exists. `None`, with nothing
+    /// written, when either check fails.
+    pub fn append_event_as_member(
+        &self,
+        space_id: &str,
+        room_id: &str,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        addressed: &Addressed,
+    ) -> anyhow::Result<Option<Event>> {
+        let Some(user_id) = author.id.as_deref() else {
+            return Ok(None);
+        };
+        let conn = self.lock();
+        let tx = conn.unchecked_transaction()?;
+        let allowed: bool = tx.query_row(
+            "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)
+                AND EXISTS (SELECT 1 FROM space_rooms WHERE space_id = ?1 AND id = ?3)",
+            params![space_id, user_id, room_id],
+            |r| r.get(0),
+        )?;
+        if !allowed {
+            return Ok(None);
+        }
+        let at = now_ms();
+        tx.execute(
+            "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+            params![
+                space_id,
+                room_id,
+                kind,
+                author.name,
+                author.id,
+                text,
+                addressed.mentions.to_string(),
+                addressed.audience,
+                at,
+            ],
+        )?;
+        let id = tx.last_insert_rowid();
+        tx.commit()?;
+        Ok(Some(new_event(id, kind, author, text, addressed, None, at)))
     }
 
     /// Events of a room with an id above `after`, oldest first.
@@ -695,7 +957,7 @@ impl Db {
     ) -> anyhow::Result<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT id, kind, actor, actor_id, text, mentions, audience FROM space_events
+            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
              WHERE space_id = ?1 AND room_id = ?2 AND id > ?3 ORDER BY id ASC LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![space_id, room_id, after, limit as i64], row_event)?;
@@ -712,8 +974,9 @@ impl Db {
     ) -> anyhow::Result<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT id, kind, actor, actor_id, text, mentions, audience FROM space_events
-             WHERE space_id = ?1 AND room_id = ?2 AND id < ?3 ORDER BY id DESC LIMIT ?4",
+            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
+             WHERE space_id = ?1 AND room_id = ?2 AND id < ?3 AND kind <> 'activity'
+             ORDER BY id DESC LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![space_id, room_id, before, limit as i64], row_event)?;
         let mut events: Vec<Event> = rows.collect::<Result<_, _>>()?;
@@ -731,10 +994,24 @@ impl Db {
         text: &str,
         addressed: &Addressed,
     ) -> anyhow::Result<Event> {
+        self.append_personal_with(user_id, kind, author, text, addressed, None)
+    }
+
+    /// [`Db::append_personal`] tagged with the agent turn that wrote it.
+    pub fn append_personal_with(
+        &self,
+        user_id: &str,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        addressed: &Addressed,
+        activity: Option<&Activity>,
+    ) -> anyhow::Result<Event> {
         let conn = self.lock();
+        let at = now_ms();
         conn.execute(
-            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 user_id,
                 kind,
@@ -743,7 +1020,8 @@ impl Db {
                 text,
                 addressed.mentions.to_string(),
                 addressed.audience,
-                now_ms()
+                at,
+                activity_json(activity)?,
             ],
         )?;
         Ok(new_event(
@@ -752,6 +1030,8 @@ impl Db {
             author,
             text,
             addressed,
+            activity,
+            at,
         ))
     }
 
@@ -763,7 +1043,7 @@ impl Db {
     ) -> anyhow::Result<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT id, kind, actor, actor_id, text, mentions, audience FROM personal_events
+            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
              WHERE user_id = ?1 AND id > ?2 ORDER BY id ASC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![user_id, after, limit as i64], row_event)?;
@@ -778,8 +1058,9 @@ impl Db {
     ) -> anyhow::Result<Vec<Event>> {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
-            "SELECT id, kind, actor, actor_id, text, mentions, audience FROM personal_events
-             WHERE user_id = ?1 AND id < ?2 ORDER BY id DESC LIMIT ?3",
+            "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
+             WHERE user_id = ?1 AND id < ?2 AND kind <> 'activity'
+             ORDER BY id DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![user_id, before, limit as i64], row_event)?;
         let mut events: Vec<Event> = rows.collect::<Result<_, _>>()?;
@@ -852,10 +1133,111 @@ fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         mentions: serde_json::from_str(&mentions)
             .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
         audience: r.get(6)?,
+        // Unreadable metadata is dropped, never guessed.
+        activity: r
+            .get::<_, Option<String>>(7)?
+            .and_then(|a| serde_json::from_str(&a).ok()),
+        created_at: r.get::<_, Option<i64>>(8)?.and_then(event_time),
     })
 }
 
-fn new_event(id: i64, kind: &str, author: &Author, text: &str, addressed: &Addressed) -> Event {
+fn activity_json(activity: Option<&Activity>) -> anyhow::Result<Option<String>> {
+    Ok(activity.map(serde_json::to_string).transpose()?)
+}
+
+/// Additive: older databases gain a nullable `activity` column; their
+/// existing events keep `NULL`, so no correlation is made up for them.
+fn add_activity_columns(conn: &Connection) -> rusqlite::Result<()> {
+    for table in ["space_events", "personal_events"] {
+        let has: bool = conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = 'activity')",
+            [table],
+            |r| r.get(0),
+        )?;
+        if !has {
+            conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN activity TEXT"))?;
+        }
+        conn.execute_batch(&format!(
+            "CREATE INDEX IF NOT EXISTS {table}_activity ON {table} (id) WHERE kind = 'activity'"
+        ))?;
+    }
+    Ok(())
+}
+
+/// Runs live only in this process, so at startup no turn is active. Every
+/// turn whose last lifecycle event is still `started` gets an
+/// `interrupted` event, so it never looks live forever. One server per
+/// database file is assumed (as for the in-memory run registry).
+fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
+    let now = now_ms();
+    // (scope ids, activity JSON, actor, actor id) of each orphaned start.
+    type Orphan = (Vec<String>, String, String, Option<String>);
+    let orphans = |sql: &str| -> rusqlite::Result<Vec<Orphan>> {
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |r| {
+            Ok((
+                vec![r.get::<_, String>(0)?, r.get::<_, String>(1)?],
+                r.get::<_, String>(2)?,
+                r.get::<_, String>(3)?,
+                r.get::<_, Option<String>>(4)?,
+            ))
+        })?;
+        rows.collect()
+    };
+    let interrupted = |activity: &str| -> Option<String> {
+        let a: Activity = serde_json::from_str(activity).ok()?;
+        serde_json::to_string(&a.at(activity::INTERRUPTED)).ok()
+    };
+    // The latest lifecycle event of each turn, where that one is `started`.
+    const LATEST_STARTED: &str = "e.kind = 'activity'
+          AND json_extract(e.activity, '$.phase') = 'started'
+          AND NOT EXISTS (SELECT 1 FROM {t} l WHERE l.kind = 'activity' AND l.id > e.id {scope}
+                          AND json_extract(l.activity, '$.id') = json_extract(e.activity, '$.id'))";
+    let space_sql = format!(
+        "SELECT e.space_id, e.room_id, e.activity, e.actor, e.actor_id FROM space_events e WHERE {}",
+        LATEST_STARTED.replace("{t}", "space_events").replace(
+            "{scope}",
+            "AND l.space_id = e.space_id AND l.room_id = e.room_id"
+        )
+    );
+    for (ids, activity, actor, actor_id) in orphans(&space_sql)? {
+        let Some(json) = interrupted(&activity) else {
+            continue;
+        };
+        conn.execute(
+            "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, created_at, activity)
+             VALUES (?1, ?2, 'activity', ?3, ?4, ?5, ?6, ?7)",
+            params![ids[0], ids[1], actor, actor_id, "", now, json],
+        )?;
+    }
+    let personal_sql = format!(
+        "SELECT e.user_id, '', e.activity, e.actor, e.actor_id FROM personal_events e WHERE {}",
+        LATEST_STARTED
+            .replace("{t}", "personal_events")
+            .replace("{scope}", "AND l.user_id = e.user_id")
+    );
+    for (ids, activity, actor, actor_id) in orphans(&personal_sql)? {
+        let Some(json) = interrupted(&activity) else {
+            continue;
+        };
+        conn.execute(
+            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, created_at, activity)
+             VALUES (?1, 'activity', ?2, ?3, ?4, ?5, ?6)",
+            params![ids[0], actor, actor_id, "", now, json],
+        )?;
+    }
+    Ok(())
+}
+
+fn new_event(
+    id: i64,
+    kind: &str,
+    author: &Author,
+    text: &str,
+    addressed: &Addressed,
+    activity: Option<&Activity>,
+    created_at_ms: i64,
+) -> Event {
     Event {
         id,
         kind: kind.to_owned(),
@@ -864,18 +1246,20 @@ fn new_event(id: i64, kind: &str, author: &Author, text: &str, addressed: &Addre
         text: text.to_owned(),
         mentions: addressed.mentions.clone(),
         audience: addressed.audience.clone(),
+        activity: activity.cloned(),
+        created_at: event_time(created_at_ms),
     }
 }
 
-fn is_unique_violation(e: &rusqlite::Error) -> bool {
+pub(crate) fn is_unique_violation(e: &rusqlite::Error) -> bool {
     matches!(e, rusqlite::Error::SqliteFailure(f, _) if f.code == ErrorCode::ConstraintViolation)
 }
 
-fn short_id() -> String {
+pub(crate) fn short_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()[..16].to_owned()
 }
 
-fn now_ms() -> i64 {
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -920,6 +1304,150 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_interrupts_turns_left_started_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metro.sqlite3");
+        let agent = Author::server(actor::AGENT);
+        let room = Addressed::room();
+        let (sid, live, done, chat) = {
+            let db = Db::open(&path).unwrap();
+            let s = db.create_space("alice", "a", 10).unwrap();
+            let live = Activity::agent("run_live", "research");
+            let done = Activity::agent("run_done", Activity::AGENT_NAME);
+            let chat = Activity::chat();
+            for (a, phases) in [
+                (&live, &[activity::STARTED][..]),
+                (&done, &[activity::STARTED, activity::COMPLETED][..]),
+            ] {
+                for p in phases {
+                    db.append_event_with(
+                        &s.id,
+                        LOBBY_ID,
+                        kind::ACTIVITY,
+                        &agent,
+                        "",
+                        &room,
+                        Some(&a.at(p)),
+                    )
+                    .unwrap();
+                }
+            }
+            db.append_personal_with(
+                "alice",
+                kind::ACTIVITY,
+                &agent,
+                "",
+                &room,
+                Some(&chat.at(activity::STARTED)),
+            )
+            .unwrap();
+            // Another person's Chat, with a finished turn: untouched.
+            let other = Activity::chat();
+            for p in [activity::STARTED, activity::FAILED] {
+                db.append_personal_with(
+                    "bob",
+                    kind::ACTIVITY,
+                    &agent,
+                    "",
+                    &room,
+                    Some(&other.at(p)),
+                )
+                .unwrap();
+            }
+            (s.id, live, done, chat)
+        };
+        let phases = |events: Vec<Event>| -> Vec<(String, String)> {
+            events
+                .into_iter()
+                .filter_map(|e| e.activity)
+                .map(|a| (a.id, a.phase.unwrap()))
+                .collect()
+        };
+        for _ in 0..2 {
+            // Reopening twice adds the `interrupted` events only once.
+            let db = Db::open(&path).unwrap();
+            assert_eq!(
+                phases(db.events_after(&sid, LOBBY_ID, 0, 100).unwrap()),
+                [
+                    (live.id.clone(), "started".into()),
+                    (done.id.clone(), "started".into()),
+                    (done.id.clone(), "completed".into()),
+                    (live.id.clone(), "interrupted".into()),
+                ]
+            );
+            let last = db
+                .events_after(&sid, LOBBY_ID, 0, 100)
+                .unwrap()
+                .pop()
+                .unwrap();
+            assert_eq!(last.activity.unwrap().name, "research");
+            assert_eq!(
+                (last.kind.as_str(), last.text.as_str()),
+                (kind::ACTIVITY, "")
+            );
+            assert_eq!(
+                phases(db.personal_after("alice", 0, 100).unwrap()),
+                [
+                    (chat.id.clone(), "started".into()),
+                    (chat.id.clone(), "interrupted".into())
+                ]
+            );
+            assert_eq!(db.personal_after("bob", 0, 100).unwrap().len(), 2);
+            // Lifecycle events are not model history.
+            assert!(
+                db.events_before(&sid, LOBBY_ID, i64::MAX, 100)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert!(
+                db.personal_before("alice", i64::MAX, 100)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn older_databases_gain_activity_without_made_up_history() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v3.sqlite3");
+        {
+            // The event tables as they were before `activity` existed.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE metro_meta (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL);
+                 INSERT INTO metro_meta VALUES ('schema_version', '3');
+                 CREATE TABLE space_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, space_id TEXT NOT NULL, room_id TEXT NOT NULL,
+                     kind TEXT NOT NULL, actor TEXT NOT NULL, actor_id TEXT, text TEXT NOT NULL,
+                     mentions TEXT NOT NULL DEFAULT '[]', audience TEXT NOT NULL DEFAULT 'room',
+                     created_at INTEGER NOT NULL);
+                 CREATE TABLE personal_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL, kind TEXT NOT NULL,
+                     actor TEXT NOT NULL, actor_id TEXT, text TEXT NOT NULL,
+                     mentions TEXT NOT NULL DEFAULT '[]', audience TEXT NOT NULL DEFAULT 'room',
+                     created_at INTEGER NOT NULL);
+                 INSERT INTO space_events (space_id, room_id, kind, actor, text, created_at)
+                     VALUES ('s-old', 'lobby', 'tool_call', 'agent', 'workspace.list {}', 0);
+                 INSERT INTO personal_events (user_id, kind, actor, text, created_at)
+                     VALUES ('alice', 'agent', 'agent', 'old reply', 0);",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let old = db.events_after("s-old", "lobby", 0, 10).unwrap();
+        assert_eq!(old.len(), 1);
+        assert_eq!(old[0].activity, None);
+        assert!(
+            serde_json::to_value(&old[0])
+                .unwrap()
+                .get("activity")
+                .is_none()
+        );
+        assert_eq!(db.personal_after("alice", 0, 10).unwrap()[0].activity, None);
+    }
+
+    #[test]
     fn identity_namespace_is_pinned() {
         let db = Db::open_in_memory().unwrap();
         db.bind_identity_namespace("dev").unwrap();
@@ -950,6 +1478,78 @@ mod tests {
         assert_eq!(
             db.remove_member(&s.id, "bob").unwrap(),
             RemoveMember::NotMember
+        );
+    }
+
+    #[test]
+    fn event_times_are_the_stored_milliseconds_or_honestly_unknown() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_space("alice", "a", 10).unwrap();
+        let alice = Author {
+            id: Some("alice".into()),
+            name: "Alice".into(),
+        };
+        let before = now_ms();
+        let new = db
+            .append_event(
+                &s.id,
+                LOBBY_ID,
+                kind::MESSAGE,
+                &alice,
+                "now",
+                &Addressed::room(),
+            )
+            .unwrap();
+        let mine = db
+            .append_personal("alice", kind::MESSAGE, &alice, "mine", &Addressed::room())
+            .unwrap();
+        let after = now_ms();
+        for e in [&new, &mine] {
+            let at = e.created_at.unwrap();
+            assert!(before <= at && at <= after);
+        }
+        // Rows as an import or an older tool might have left them: no usable
+        // time (0), a seconds value, a known time. Order follows ids.
+        {
+            let conn = db.lock();
+            for (text, at) in [
+                ("zero", 0_i64),
+                ("seconds", 1_700_000_000),
+                ("known", 1_767_225_600_123),
+            ] {
+                conn.execute(
+                    "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, created_at)
+                     VALUES (?1, 'lobby', 'message', 'Alice', 'alice', ?2, ?3)",
+                    params![s.id, text, at],
+                )
+                .unwrap();
+                conn.execute(
+                    "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, created_at)
+                     VALUES ('alice', 'message', 'Alice', 'alice', ?1, ?2)",
+                    params![text, at],
+                )
+                .unwrap();
+            }
+        }
+        let room = db.events_after(&s.id, LOBBY_ID, 0, 100).unwrap();
+        let history = db.events_before(&s.id, LOBBY_ID, i64::MAX, 100).unwrap();
+        let personal = db.personal_after("alice", 0, 100).unwrap();
+        assert_eq!(room, history);
+        for events in [&room, &personal] {
+            let texts: Vec<&str> = events.iter().map(|e| e.text.as_str()).collect();
+            assert_eq!(&texts[1..], ["zero", "seconds", "known"]);
+            let wire = serde_json::to_value(events).unwrap();
+            assert_eq!(
+                wire[0]["created_at"],
+                serde_json::json!(rfc3339_utc(events[0].created_at.unwrap()))
+            );
+            assert_eq!(wire[1]["created_at"], serde_json::Value::Null);
+            assert_eq!(wire[2]["created_at"], serde_json::Value::Null);
+            assert_eq!(wire[3]["created_at"], "2026-01-01T00:00:00.123Z");
+        }
+        assert_eq!(
+            serde_json::to_value(&new).unwrap()["created_at"],
+            serde_json::to_value(&room[0]).unwrap()["created_at"]
         );
     }
 }

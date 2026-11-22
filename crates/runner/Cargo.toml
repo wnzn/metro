@@ -1,6 +1,6 @@
 [package]
 name = "metro-runner"
-version = "0.1.0"
+version.workspace = true
 edition = "2024"
 rust-version.workspace = true
 description = "Metro job runner: claims tool jobs from the Metro server and executes them against a confined workspace."

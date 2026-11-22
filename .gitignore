@@ -1,4 +1,8 @@
 /target/
+/dist/**/Metro-*.zip
+/dist/**/Metro-*.zip.sha256
+/dist/**/Metro-*.tar.gz
+/dist/**/Metro-*.tar.gz.sha256
 **/node_modules/
 **/__pycache__/
 
