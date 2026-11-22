@@ -24,6 +24,22 @@ export function authorKey(e: RoomEvent): string | null {
   return null; // errors, status, threads, Demo, unknown kinds: always their own header
 }
 
+type MentionOf = NonNullable<RoomEvent["mentions"]>[number];
+
+/**
+ * The audience a message header shows beside its explicit recipients: left
+ * out (undefined) only when it would repeat them, that is "to the agent"
+ * beside an @agent the sender typed. An agent mention System One or a
+ * schedule added, Ask agent without @agent, and every audience that
+ * includes people keep their phrase; the recipients themselves always show.
+ */
+export function headerAudience(audience: string | undefined, mentions: readonly MentionOf[] | undefined): string | undefined {
+  if (audience !== "agent") return audience;
+  const typedAgent = !!mentions?.some((m) => m.kind === "agent" && !m.addressedBy);
+  const people = !!mentions?.some((m) => m.kind === "user");
+  return typedAgent && !people ? undefined : audience;
+}
+
 export function transcriptRows(items: readonly TranscriptItem[], events: readonly RoomEvent[], clock: Clock): TranscriptRow[] {
   const created = new Map<number, string | undefined>();
   for (const e of events) created.set(e.id, e.createdAt);

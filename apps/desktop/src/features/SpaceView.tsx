@@ -1,4 +1,16 @@
-import { signal } from "nsh";
+// A Space's room or thread: its header, the transcript and the composer with
+// @mentions.
+//
+// Mentions: typing "@" opens suggestions at the caret (the field's
+// `onCaretMove` box in the window), the @ button opens them under itself
+// with the focus on the first one. Return in the field picks the highlighted
+// suggestion and sends nothing; Tab moves into the list, where Up and Down
+// move and Return or Space picks; Escape or a press outside closes it, and
+// so does leaving the room. Only the agent and members of this Space are
+// offered, each person by display name and picture with their stable id.
+
+import { computed, effect, signal, untracked } from "nsh";
+import type { Bounds, ViewRef } from "nsh";
 import {
   activeRoom,
   activeSpace,
@@ -16,19 +28,54 @@ import {
   rooms,
   runDemo,
   selectRoom,
+  setDraft,
   status,
 } from "../store";
 import type { Mention } from "../store";
-import { Action, Badge, Chip, Column, Label, Row, Surface } from "../ui";
-import { Composer, ConnectionBanner, Transcript } from "./Conversation";
+import {
+  Action,
+  AnchoredPopover,
+  AuthorGlyph,
+  Badge,
+  Column,
+  InlineLink,
+  Label,
+  PopoverNote,
+  RecipientBar,
+  RecipientChip,
+  Row,
+  SuggestionList,
+  SuggestionOption,
+  Surface,
+  ToolbarIconButton,
+} from "../ui";
+import { Composer, ConnectionBanner, fillDraft, focusComposer, Transcript } from "./Conversation";
+import type { DraftIdea } from "./Conversation";
 import { mentionText } from "./eventKinds";
+import { PersonAvatar } from "./profile/PersonAvatar";
+import { profileName } from "./profile/profileState";
+
+/** Suggestions of an empty room: they fill the draft (and its recipients), never send. */
+const ROOM_IDEAS: DraftIdea[] = [
+  { id: "hello", label: "Say hello", apply: () => fillDraft("Hello everyone! ") },
+  {
+    id: "ask-agent",
+    label: "Ask the agent",
+    apply: () => {
+      setDraft("");
+      addMention({ kind: "agent" });
+      fillDraft(`${draft()}what can you help with in this room?`);
+    },
+  },
+  { id: "mention", label: "Mention someone", apply: () => fillDraft("@") },
+];
 
 export function SpaceView() {
   return (
     <Surface variant="panel" grow testID="space-view">
       <RoomHeader />
       <ConnectionBanner />
-      <Transcript emptyText="No events yet. Say hello, mention @agent or someone, or run the demo." />
+      <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
       <RoomComposer />
     </Surface>
   );
@@ -41,7 +88,7 @@ function RoomHeader() {
   };
   const paired = () => !!activeSpace()?.runnerPaired;
   return (
-    <Surface variant="toolbar" padX={4} padY={3} gap={3}>
+    <Surface variant="toolbar" padX={4} padY={2} gap={3}>
       <Column grow gap={1}>
         <Row align="center" gap={2}>
           <Label variant="caption" color="muted" lines={1}>
@@ -63,11 +110,11 @@ function RoomHeader() {
           }
         >
           {(p) => (
-            <Row align="center" gap={2}>
+            <Row align="center" gap={1}>
               <Label variant="caption" color="muted">
                 Thread delegated from
               </Label>
-              <Action testID="open-parent" label={`# ${p().name}`} variant="ghost" onPress={() => selectRoom(p().id)} />
+              <InlineLink testID="open-parent" label={`# ${p().name}`} accessibilityLabel={`Open the parent room # ${p().name}`} onPress={() => selectRoom(p().id)} />
             </Row>
           )}
         </If>
@@ -89,104 +136,206 @@ function RoomHeader() {
   );
 }
 
+/** One suggestion of the mention list. */
+type MentionOption = { key: string; mention: Mention; title: string; detail: string; note?: string; testID: string; label: string };
+
+/** The agent and the members (never the signed-in user) whose id or display name matches what follows "@". */
+export function mentionOptions(query: string, list: readonly { userId: string; role?: string }[] | null, myId: string | null): MentionOption[] {
+  const q = query.toLowerCase();
+  const out: MentionOption[] = [];
+  if ("agent".startsWith(q)) {
+    out.push({ key: "agent", mention: { kind: "agent" }, title: "agent", detail: "starts agent work", testID: "pick:agent", label: "Mention @agent: starts agent work" });
+  }
+  for (const m of list ?? []) {
+    if (m.userId === myId) continue;
+    const name = profileName(m.userId);
+    if (!m.userId.toLowerCase().includes(q) && !(name ?? "").toLowerCase().includes(q)) continue;
+    const owner = m.role === "owner";
+    out.push({
+      key: `user:${m.userId}`,
+      mention: { kind: "user", id: m.userId },
+      title: name ?? m.userId,
+      detail: `@${m.userId}`,
+      note: owner ? "owner" : undefined,
+      testID: `pick:${m.userId}`,
+      label: `Mention ${name && name !== m.userId ? `${name} (@${m.userId})` : `@${m.userId}`}${owner ? ", owner" : ""}: notifies them only`,
+    });
+  }
+  return out;
+}
+
 function RoomComposer() {
-  const pickerOpen = signal(false);
+  /** Opened with the @ button (not by typing). */
+  const explicit = signal(false);
+  /** The draft the user closed the suggestions at: typing on opens them again. */
+  const dismissedAt = signal<string | null>(null);
+  /** The caret's box in the window, as the field last reported it. */
+  const caret = signal<Bounds | null>(null);
+  const highlighted = signal(0);
+  let atButton: ViewRef | null = null;
+  /** The keyboard focus is in the list (the button put it there, or Tab). */
+  let focusInList = false;
+
   const query = () => mentionQuery(draft());
-  const showPicker = () => pickerOpen() || query() !== null;
-  const toggle = () => {
-    const open = !pickerOpen();
-    pickerOpen.set(open);
-    if (open) void loadMembersForMentions();
-  };
-  // Typing "@" opens the picker; members load once per Space and room.
+  const typing = () => query() !== null && dismissedAt() !== draft();
+  const open = () => !!activeRoom() && (explicit() || typing());
+  const options = computed(() => mentionOptions(query() ?? "", members(), me()));
+  const active = () => Math.max(0, Math.min(highlighted(), options().length - 1));
+
+  // Typing "@" opens the list; members load once per Space and room.
   let loadedFor = "";
-  const ensureMembers = () => {
+  effect(() => {
+    if (!open()) return;
     const key = `${activeSpace()?.id}/${activeRoom()?.id}`;
     if (loadedFor !== key) {
       loadedFor = key;
       void loadMembersForMentions();
     }
+  });
+  // A new query starts at the first suggestion.
+  effect(() => {
+    query();
+    untracked(() => highlighted.set(0));
+  });
+  // Leaving the room (or Space) closes it, whatever the draft still says.
+  const place = computed(() => `${activeSpace()?.id ?? ""}/${activeRoom()?.id ?? ""}`);
+  let shownFor: string | null = null;
+  effect(() => {
+    const key = place();
+    if (key === shownFor) return;
+    shownFor = key;
+    untracked(() => {
+      explicit.set(false);
+      caret.set(null);
+      dismissedAt.set(draft());
+      focusInList = false;
+    });
+  });
+  // Typing something that is not a mention closes the list the button opened.
+  effect(() => {
+    draft();
+    untracked(() => {
+      if (explicit() && query() === null && !focusInList) explicit.set(false);
+    });
+  });
+
+  const close = () => {
+    focusInList = false;
+    explicit.set(false);
+    dismissedAt.set(draft());
+    focusComposer();
   };
   const choose = (m: Mention) => {
+    focusInList = false;
     addMention(m);
-    pickerOpen.set(false);
+    explicit.set(false);
+    caret.set(null);
+    focusComposer();
   };
+  const toggle = () => {
+    if (open()) close();
+    else {
+      dismissedAt.set(null);
+      explicit.set(true);
+    }
+  };
+  /** Return in the field: picks the highlighted suggestion instead of sending. */
+  const intercept = () => {
+    if (!open() || options().length === 0) return false;
+    choose(options()[active()]!.mention);
+    return true;
+  };
+  /** Next to the caret while typing; under the button when it opened the list or no caret was reported yet. */
+  const anchor = () => (typing() && !explicit() ? caret() ?? atButton : atButton);
+
   return (
     <Composer
-      placeholder={activeRoom() ? `Message #${activeRoom()!.name} — @ to mention, Return to send` : "Select a room"}
-      agentHint="Ask agent or @agent asks this Space's agent. Mentioning a person only notifies them."
+      placeholder={activeRoom() ? `Message #${activeRoom()!.name}` : "Select a room"}
+      agentHint="Return sends · Shift+Return adds a line · @agent or Ask agent asks this Space's agent; @name only notifies them."
       disabled={!activeRoom()}
-      tools={<Action testID="mention" label="@" accessibilityLabel="Mention the agent or a member" variant="ghost" onPress={toggle} />}
+      onSubmitIntercept={intercept}
+      onCaretMove={(e) => caret.set(e.pageBounds)}
+      tools={
+        <ToolbarIconButton
+          testID="mention"
+          icon="at"
+          accessibilityLabel="Mention the agent or a member"
+          tooltip="Mention someone (@)"
+          active={open()}
+          disabled={!activeRoom()}
+          ref={(node) => (atButton = node)}
+          onPress={toggle}
+        />
+      }
       above={
-        <Column gap={2}>
+        <>
           <If when={mentions().length > 0}>
-            <Row gap={2} wrap testID="mention-chips">
-              <Label variant="caption" color="muted">
-                To:
-              </Label>
+            <RecipientBar testID="mention-chips">
               <Each of={mentions()} key={(m) => (m.kind === "agent" ? "agent" : `user:${m.id}`)}>
                 {(m) => (
-                  <Chip
+                  <RecipientChip
                     testID={m().kind === "agent" ? "mention-chip:agent" : `mention-chip:${(m() as { id: string }).id}`}
-                    label={`${mentionLabel(m())}  ×`}
+                    label={chipLabel(m())}
+                    agent={m().kind === "agent"}
                     accessibilityLabel={`Remove mention ${mentionLabel(m())}`}
-                    selected
-                    onPress={() => removeMention(m())}
+                    onRemove={() => removeMention(m())}
                   />
                 )}
               </Each>
-            </Row>
+            </RecipientBar>
           </If>
-          <If when={showPicker()}>
-            {(() => {
-              ensureMembers();
-              return <MentionPicker query={query() ?? ""} onChoose={choose} />;
-            })()}
+          <If when={open()}>
+            <AnchoredPopover
+              anchor={anchor()}
+              onClose={close}
+              placement="top"
+              align="start"
+              role="listbox"
+              testID="mention-picker"
+              accessibilityLabel={`Mention in #${activeRoom()?.name ?? ""}`}
+            >
+              <PopoverNote text={`Mention in #${activeRoom()?.name ?? ""} · members of ${activeSpace()?.name ?? "this Space"} only`} />
+              <SuggestionList accessibilityLabel="Mention suggestions">
+                <Each of={options()} key={(o) => o.key}>
+                  {(o, index) => (
+                    <SuggestionOption
+                      testID={o().testID}
+                      title={o().title}
+                      detail={o().detail}
+                      note={o().note}
+                      active={index() === active()}
+                      accessibilityLabel={o().label}
+                      leading={
+                        o().mention.kind === "agent" ? (
+                          <AuthorGlyph kind="agent" tone="agent" size="sm" />
+                        ) : (
+                          <PersonAvatar userId={(o().mention as { id: string }).id} name={o().title} size="sm" />
+                        )
+                      }
+                      ref={(node) => {
+                        // The button moves the focus into the list; typing keeps it in the field.
+                        if (index() === 0 && explicit() && !typing()) {
+                          focusInList = true;
+                          node.focus();
+                        }
+                      }}
+                      onPress={() => choose(o().mention)}
+                    />
+                  )}
+                </Each>
+              </SuggestionList>
+              <If when={membersError()}>{(message) => <PopoverNote tone="danger" text={message()} />}</If>
+              <If when={members() !== null && options().length === 0}>
+                <PopoverNote testID="mention-none" text={`No member matches “${query() ?? ""}”.`} />
+              </If>
+            </AnchoredPopover>
           </If>
-        </Column>
+        </>
       }
     />
   );
 }
 
 const mentionLabel = (m: Mention) => mentionText(m, me());
-
-function MentionPicker(props: { query: string; onChoose: (m: Mention) => void }) {
-  const q = () => props.query.toLowerCase();
-  const people = () => (members() ?? []).filter((m) => m.userId !== me() && m.userId.toLowerCase().includes(q()));
-  const agentMatches = () => "agent".startsWith(q());
-  return (
-    <Surface variant="card" pad={2} gap={2} testID="mention-picker">
-      <Label variant="caption" color="muted">
-        Mention in #{activeRoom()?.name ?? ""} (members of {activeSpace()?.name ?? "this Space"} only)
-      </Label>
-      <Row gap={2} wrap>
-        <If when={agentMatches()}>
-          <Chip testID="pick:agent" label="@agent · starts agent work" selected={false} onPress={() => props.onChoose({ kind: "agent" })} />
-        </If>
-        <Each of={people()} key={(m) => m.userId}>
-          {(m) => (
-            <Chip
-              testID={`pick:${m().userId}`}
-              label={`@${m().userId}${m().role === "owner" ? " · owner" : ""}`}
-              selected={false}
-              onPress={() => props.onChoose({ kind: "user", id: m().userId })}
-            />
-          )}
-        </Each>
-      </Row>
-      <If when={membersError()}>
-        {(message) => (
-          <Label variant="caption" color="danger">
-            {message()}
-          </Label>
-        )}
-      </If>
-      <If when={members() !== null && people().length === 0 && !agentMatches()}>
-        <Label variant="caption" color="muted">
-          No member matches “{props.query}”.
-        </Label>
-      </If>
-    </Surface>
-  );
-}
+/** A chosen person by display name, else their id; the agent as "@agent". */
+const chipLabel = (m: Mention) => (m.kind === "user" ? `@${profileName(m.id) ?? m.id}` : mentionLabel(m));
