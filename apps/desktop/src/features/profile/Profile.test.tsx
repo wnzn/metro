@@ -66,9 +66,12 @@ test("the transcript shows profile names, 'you', the agent, local times and day 
   // Mine: marked "you", recipients kept, by display name.
   expect(app.shows(`id:you:${s.a1.id}`)).toBe(true);
   expect(app.shows(`id:you:${s.bob.id}`)).toBe(false);
+  // The recipient is a pill for Bob by his stable id: it shows his display name and
+  // tells screen readers both; no separate "to people" note repeats it.
   expect(app.shows(`id:recipient:${s.a1.id}:bob`)).toBe(true);
   expect(text(app)).toContain("@Bob Tan");
-  expect(text(app)).toContain("to people");
+  expect(app.shows("label:Addressed to Bob Tan (@bob)")).toBe(true);
+  expect(app.shows("text:to people")).toBe(false);
   // A second message a minute later continues the first: no repeated header.
   expect(app.shows(`id:author:${s.a2.id}`)).toBe(false);
   expect(app.shows(`id:time:${s.a2.id}`)).toBe(true);
@@ -145,6 +148,11 @@ test("Settings › Profile edits the name and bio, and sets, changes and removes
   expect(app.value("id:profile-name")).toBe("Alice Moreno");
   expect(app.value("id:profile-bio")).toBe("Runs the Acme rollout.");
   expect(app.shows("id:profile-id")).toBe(true);
+  // The stable id copies with one press; Save stays in the fixed footer.
+  await app.press("id:profile-id-copy");
+  await app.waitFor("id:profile-id-copy >> text:Copied");
+  expect(app.clipboard()).toBe("alice");
+  expect(app.shows("id:profile-settings:footer >> id:profile-save")).toBe(true);
   expect(app.enabled("id:profile-save")).toBe(false); // nothing changed yet
   expect(app.shows("id:profile-picture-remove")).toBe(false); // no picture: initials
 
@@ -208,6 +216,7 @@ test("signing out drops profiles, drafts and pictures; the next user starts clea
   await app.waitFor("id:profile-name");
   await app.type("id:profile-name", " (draft)");
   await app.press("id:h-profile");
+  await app.press("id:account-menu"); // Sign out is in the account menu
   await app.press("id:disconnect");
   await app.waitFor("id:connect");
   await app.type("id:access-token", TOKENS.bob!);
