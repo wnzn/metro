@@ -35,6 +35,8 @@ export const histories = signal<Record<string, ScheduleRun[] | { error: string }
 export type When = "once" | "recurring";
 export type RecurrenceKind = Recurrence["kind"];
 export type OnceZone = "device" | "utc";
+/** Which time zone a recurring task is read in: the device's, UTC, or an IANA name typed in. */
+export type ZoneChoice = "device" | "utc" | "other";
 export type Destination = { kind: "chat" } | { kind: "room"; spaceId: string; roomId: string | null };
 
 export const formOpen = signal<null | { mode: "new" } | { mode: "edit"; id: string }>(null);
@@ -50,8 +52,38 @@ export const formRecurTime = signal("09:00");
 export const formWeekday = signal(1);
 export const formCron = signal("");
 export const formTimezone = signal("");
+export const formZoneChoice = signal<ZoneChoice>("device");
 export const formEnabled = signal(true);
 export const formError = signal<string | null>(null);
+
+/** Now, for "in 3 h": the list ticks it while it's shown (`tickNow`). */
+export const nowMs = signal(Date.now());
+export function tickNow() {
+  nowMs.set(Date.now());
+}
+
+/** Picks the device's zone or UTC (fills the field), or another zone (empties it to type one). */
+export function chooseZone(choice: ZoneChoice) {
+  batch(() => {
+    formZoneChoice.set(choice);
+    if (choice === "device") formTimezone.set(deviceZone());
+    else if (choice === "utc") formTimezone.set("UTC");
+    else if (formTimezone().trim() === deviceZone() || formTimezone().trim() === "UTC") formTimezone.set("");
+  });
+}
+
+/** Typing a zone name makes it the chosen one. */
+export function typeZone(value: string) {
+  batch(() => {
+    formTimezone.set(value);
+    formZoneChoice.set("other");
+  });
+}
+
+function zoneChoiceOf(zone: string): ZoneChoice {
+  if (zone === deviceZone()) return "device";
+  return zone === "UTC" ? "utc" : "other";
+}
 
 /** Rooms of Spaces picked as a destination, loaded on demand. */
 export const destinationRooms = signal<Record<string, readonly Room[] | { error: string }>>({});
@@ -97,6 +129,7 @@ export function openEditTask(task: ScheduledTask) {
     } else {
       formWhen.set("recurring");
       formTimezone.set(task.schedule.timezone);
+      formZoneChoice.set(zoneChoiceOf(task.schedule.timezone));
       const r = recurrenceOf(task.schedule.expression);
       formRecurrence.set(r.kind);
       formCron.set(task.schedule.expression);
@@ -128,6 +161,7 @@ function resetForm() {
   formWeekday.set(1);
   formCron.set("0 9 * * *");
   formTimezone.set(deviceZone());
+  formZoneChoice.set("device");
   formEnabled.set(true);
   formError.set(null);
 }

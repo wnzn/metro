@@ -158,6 +158,35 @@ export function describeStamp(stamp: string, zoneName?: string): string | null {
   return `${formatWall(parsed.wall)} ${zoneName && zoneName !== "UTC" ? `${zoneName} (${label})` : label}`;
 }
 
+/** "Mon, Nov 23 · 09:00": the year only when it isn't `nowYear`. */
+export function formatWallShort(w: Wall, nowYear: number): string {
+  const weekday = WEEKDAYS[new Date(wallMs(w)).getUTCDay()];
+  const year = w.year === nowYear ? "" : `, ${w.year}`;
+  return `${weekday}, ${MONTHS[w.month - 1]} ${w.day}${year} · ${pad(w.hour)}:${pad(w.minute)}`;
+}
+
+/**
+ * How far `instantMs` is from `nowMs`, in words: "in 45 min", "in 3 h 5 min",
+ * "in 2 days", "1 h ago". Rounded down to whole minutes; under a minute is
+ * "in under a minute" (or "just now" when past).
+ */
+export function relativeTime(instantMs: number, nowMs: number): string {
+  const diff = instantMs - nowMs;
+  const minutes = Math.floor(Math.abs(diff) / 60_000);
+  let span: string;
+  if (minutes < 1) return diff >= 0 ? "in under a minute" : "just now";
+  if (minutes < 60) span = `${minutes} min`;
+  else if (minutes < 24 * 60) {
+    const h = Math.floor(minutes / 60);
+    const m = minutes % 60;
+    span = m ? `${h} h ${m} min` : `${h} h`;
+  } else {
+    const days = Math.floor(minutes / (24 * 60));
+    span = days === 1 ? "1 day" : `${days} days`;
+  }
+  return diff >= 0 ? `in ${span}` : `${span} ago`;
+}
+
 /** Today's date in `zone`, as YYYY-MM-DD. */
 export function todayIn(nowMs: number, zone: string): string {
   const w = wallIn(nowMs, zone === "UTC" || zoneFormattable(zone) ? zone : "UTC");
@@ -204,21 +233,6 @@ export function recurrenceOf(expression: string): Recurrence {
     }
   }
   return { kind: "custom", expression: expression.trim() };
-}
-
-// "Every day at 09:00", "Weekdays (Mon–Fri) at 17:30", "Every Monday at 08:00", "Custom cron: 0 12 1 * *".
-export function describeRecurrence(r: Recurrence): string {
-  const at = (h: number, m: number) => `${pad(h)}:${pad(m)}`;
-  switch (r.kind) {
-    case "daily":
-      return `Every day at ${at(r.hour, r.minute)}`;
-    case "weekdays":
-      return `Weekdays (Mon–Fri) at ${at(r.hour, r.minute)}`;
-    case "weekly":
-      return `Every ${WEEKDAY_NAMES[r.weekday]} at ${at(r.hour, r.minute)}`;
-    case "custom":
-      return `Custom cron: ${cronOf(r)}`;
-  }
 }
 
 /** A light check before the server's full one: five fields, or an @shorthand. */

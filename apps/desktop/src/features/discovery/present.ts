@@ -3,25 +3,55 @@
 
 import type { SearchRanking, ScheduleTarget, ScheduledTask } from "../../api/discovery";
 import type { Tone } from "../../ui";
-import { describeInstant, describeRecurrence, describeStamp, parseStamp, recurrenceOf } from "./time";
+import { cronOf, describeInstant, describeStamp, formatWallShort, parseStamp, recurrenceOf, relativeTime, wallIn, WEEKDAY_NAMES, zoneFormattable } from "./time";
+import type { Recurrence } from "./time";
 
 export type SpaceLookup = { spaceName: (spaceId: string) => string | null; roomName: (spaceId: string, roomId: string) => string | null };
 
-/** "Your personal Chat", "Acme › #lobby", or why the destination is no longer reachable. */
+/** "Your personal Chat", "Acme · #lobby", or why the destination is no longer reachable. */
 export function destinationText(target: ScheduleTarget, lookup: SpaceLookup): { text: string; lost: boolean } {
   if (target.kind === "chat") return { text: "Your personal Chat", lost: false };
   const space = lookup.spaceName(target.spaceId);
-  if (!space) return { text: "A Space you're no longer a member of. Its next firing will be refused and the task paused.", lost: true };
+  if (!space) return { text: "A Space you're no longer in. Its next firing will be refused and the task paused.", lost: true };
   const room = lookup.roomName(target.spaceId, target.roomId) ?? target.roomId;
-  return { text: `${space} › #${room}`, lost: false };
+  return { text: `${space} · #${room}`, lost: false };
 }
 
-export function scheduleText(task: ScheduledTask): string {
+/** "Every day", "Weekdays", "Fridays", "Cron 30 7 1 * *": the repeat without its time. */
+function repeatWords(r: Recurrence): string {
+  switch (r.kind) {
+    case "daily":
+      return "Every day";
+    case "weekdays":
+      return "Weekdays";
+    case "weekly":
+      return `${WEEKDAY_NAMES[r.weekday]}s`;
+    case "custom":
+      return `Cron ${cronOf(r)}`;
+  }
+}
+
+const hm = (h: number, m: number) => `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+
+/**
+ * A compact summary of when a task fires: "Every day at 09:00 · Asia/Manila",
+ * "Fridays at 17:00 · UTC", "Cron 30 7 1 * * · UTC", "Once · Sun, Nov 22 · 18:00 UTC".
+ * A one-time task is shown in the device's zone (the server stores UTC).
+ */
+export function scheduleText(task: ScheduledTask, deviceZone = "UTC", nowMs = Date.now()): string {
   if (task.schedule.kind === "once") {
     const at = parseStamp(task.schedule.at);
-    return at ? `Once, ${describeInstant(at.instantMs, "UTC")}` : `Once, at ${task.schedule.at}`;
+    return at ? `Once · ${shortInstant(at.instantMs, deviceZone, nowMs)}` : `Once · ${task.schedule.at}`;
   }
-  return `${describeRecurrence(recurrenceOf(task.schedule.expression))} · ${task.schedule.timezone}`;
+  const r = recurrenceOf(task.schedule.expression);
+  const when = r.kind === "custom" ? repeatWords(r) : `${repeatWords(r)} at ${hm(r.hour, r.minute)}`;
+  return `${when} · ${task.schedule.timezone}`;
+}
+
+/** "Mon, Nov 23 · 09:00 Asia/Manila" (the year only when it isn't this year). */
+export function shortInstant(instantMs: number, zone: string, nowMs: number): string {
+  const z = zone === "UTC" || zoneFormattable(zone) ? zone : "UTC";
+  return `${formatWallShort(wallIn(instantMs, z), wallIn(nowMs, z).year)} ${z}`;
 }
 
 export type TaskState = "active" | "paused" | "finished";
@@ -43,22 +73,39 @@ export function taskBadge(task: ScheduledTask): { label: string; tone: Tone } {
   return state === "paused" ? { label: "Paused", tone: "neutral" } : { label: "Active", tone: "success" };
 }
 
-/** When it fires next, in the task's zone (recurring) or the device's (once), plus UTC. */
-export function nextFiringText(task: ScheduledTask, deviceZone: string): string {
-  if (!task.enabled) return "Paused. It won't fire until you resume it.";
-  if (taskState(task) === "finished") return "It won't fire again: a one-time task fires once. Its outcome is below and in History.";
-  if (!task.nextRunAt) return task.schedule.kind === "once" ? "No firing planned. A one-time task fires only once." : "No firing planned.";
+/**
+ * When a task fires next, for its card. `text` is one short line: how far
+ * off, then the time in the task's own zone (recurring) or the device's
+ * (one-time). `exact` holds the same moment in UTC, with the offset, and on
+ * this device when that's another zone: the card shows it on hover or focus,
+ * and in full once the task is expanded. `null` when a finished task has
+ * nothing left to fire (its last firing says what happened).
+ */
+export type NextFiring = { text: string; exact: string[] } | null;
+
+export function nextFiring(task: ScheduledTask, deviceZone: string, nowMs: number): NextFiring {
+  if (!task.enabled) return { text: "Won't fire while paused.", exact: [] };
+  if (taskState(task) === "finished") return null;
+  if (!task.nextRunAt) return { text: "No firing planned.", exact: [] };
   const next = parseStamp(task.nextRunAt);
-  if (!next) return `Next: ${task.nextRunAt}`;
+  if (!next) return { text: `Next: ${task.nextRunAt}`, exact: [] };
+  const rel = relativeTime(next.instantMs, nowMs);
   const utc = describeInstant(next.instantMs, "UTC");
+  const exact: string[] = [];
+  let local: string;
   if (task.schedule.kind === "cron") {
-    const local = task.nextRunLocal ? describeStamp(task.nextRunLocal, task.schedule.timezone) : null;
-    const parts = [local ?? utc];
-    if (task.schedule.timezone !== deviceZone && deviceZone !== "UTC") parts.push(`on this device ${describeInstant(next.instantMs, deviceZone)}`);
-    if (local && task.schedule.timezone !== "UTC") parts.push(utc);
-    return `Next: ${parts.join(" · ")}`;
+    const zone = task.schedule.timezone;
+    const stamp = task.nextRunLocal ? parseStamp(task.nextRunLocal) : null;
+    // The server's own wall time in the task's zone; never a guess made here.
+    local = stamp ? `${formatWallShort(stamp.wall, wallIn(nowMs, "UTC").year)} ${zone}` : shortInstant(next.instantMs, "UTC", nowMs);
+    if (stamp && zone !== "UTC") exact.push(`${describeStamp(task.nextRunLocal!, zone)}`);
+    if (zone !== deviceZone && deviceZone !== "UTC") exact.push(`On this device: ${describeInstant(next.instantMs, deviceZone)}`);
+  } else {
+    local = shortInstant(next.instantMs, deviceZone, nowMs);
+    if (deviceZone !== "UTC") exact.push(describeInstant(next.instantMs, deviceZone));
   }
-  return deviceZone === "UTC" ? `Next: ${utc}` : `Next: ${describeInstant(next.instantMs, deviceZone)} · ${utc}`;
+  exact.push(utc);
+  return { text: `Next ${rel} · ${local}`, exact };
 }
 
 /**
@@ -78,7 +125,7 @@ export function runStatus(status: string): { label: string; tone: Tone; explain:
     case "unknown":
       return { label: "Unknown", tone: "warning", explain: "The hand-off didn't answer within 60 seconds. It may still be running and this status may change. It isn't retried." };
     case "missed":
-      return { label: "Missed", tone: "warning", explain: "Found more than 5 minutes late (the server wasn't running). It isn't run late; one row counts every skipped firing." };
+      return { label: "Missed", tone: "warning", explain: "The server wasn't running when it was due. Skipped firings aren't run late." };
     case "cancelled":
       return { label: "Cancelled", tone: "neutral", explain: "The task was paused, edited or deleted just before it fired." };
     case "revoked":
@@ -88,6 +135,34 @@ export function runStatus(status: string): { label: string; tone: Tone; explain:
     default:
       return { label: status, tone: "neutral", explain: "" };
   }
+}
+
+/** The server's fixed wording for a status, which `runStatus(..).explain` already says better. */
+const BOILERPLATE: Record<string, RegExp> = {
+  dispatched: /^the prompt was posted and agent work was accepted\b/i,
+  unknown: /^the submission had not returned after \d+s\b/i,
+  interrupted: /^the server stopped while submitting this occurrence\b/i,
+};
+
+/**
+ * What an occurrence's detail adds to its status, or `null` when it adds
+ * nothing (the server's fixed wording for that status). A reason of its own
+ * (a refusal, a model error, what was cancelled) is always kept, as a
+ * sentence; a missed run says how many firings it stands for.
+ */
+export function runDetail(status: string, detail: string | null | undefined): string | null {
+  const d = (detail ?? "").trim();
+  if (!d) return null;
+  if (BOILERPLATE[status]?.test(d)) return null;
+  if (status === "missed") {
+    const m = /; (more than \d+|\d+) occurrence\(s\) since \S+ were skipped and not run late; (?:next at (\S+)|no further occurrence)$/i.exec(d);
+    if (m) {
+      const count = m[1] === "1" ? "1 firing" : `${m[1]} firings`;
+      return `${count} skipped.`;
+    }
+  }
+  const sentence = d[0].toUpperCase() + d.slice(1);
+  return /[.!?]$/.test(sentence) ? sentence : `${sentence}.`;
 }
 
 /** How results are ordered, without claiming a System One rerank that didn't happen. */
