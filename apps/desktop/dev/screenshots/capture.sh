@@ -39,8 +39,11 @@
 # checked on the server), provider-dropdown.png, server-api-profile.png,
 # appearance-preview.png, appearance-preview-end.png,
 # and with a model agent-thinking.png, agent-activity-expanded.png, chat-runs.png,
-# chat-narrow.png (860 wide), chat-dispatch.png and chat-narrow-runs.png (where
-# the app has a collapsible task form and a narrow-window runs toggle)
+# chat-narrow.png (860 wide), chat-dispatch.png, chat-narrow-runs.png and
+# chat-narrow-after-esc.png and chat-narrow-runs-closed.png (where the app has
+# a collapsible task form, a narrow-window runs toggle and a runs dialog; a
+# draft must survive closing it), and room-narrow-860.png and
+# room-narrow-720.png (the focused room composer)
 # and thread.png; with the scripted model also
 # settings-providers.png and settings-device-onboarding.png (its keyless
 # /v1/models is the allowlisted endpoint), into OUT_DIR.
@@ -262,6 +265,11 @@ if [ -n "$agent" ]; then
   echo "== Alice opens the delegated thread"
   TOKEN_FILE="$sec/alice" THREAD_ID="$thread_id" steps alice-agent | run_app
   fi
+fi
+
+if want narrow-room; then
+echo "== Alice: the room's composer at 860 and 720 wide"
+TOKEN_FILE="$sec/alice" steps narrow-room | run_app
 fi
 
 if want alice-settings; then

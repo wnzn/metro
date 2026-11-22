@@ -4,7 +4,7 @@
 // screenshot (screenshots are taken before it is typed or after it is gone).
 //
 //   URL=… SPACE=<space id> SHOTS=/shots TOKEN_FILE=… [EVENT_ID=…] [AGENT=…] [SITE=…] [FIXTURE_URL=…] [THEME=dark|light]
-//     node steps.mjs <bob|alice|alice-activity|alice-chat|alice-agent|alice-settings|space-settings|tour|tour-settings|invalid>
+//     node steps.mjs <bob|alice|alice-activity|alice-chat|alice-agent|alice-settings|space-settings|narrow-room|tour|tour-settings|invalid>
 //
 // THEME=light switches Settings › Appearance to Light right after connecting,
 // so every shot of the run is the light theme. The connect screen comes
@@ -59,6 +59,14 @@ const pickProvider = (key, query) => [
   `await app.waitFor(${q(`id:provider-picker:${key}`)}, { timeout: 5000 })`,
   `await app.press(${q(`id:provider-picker:${key}`)})`,
 ];
+// The focused composer's hint: shown, and its full text in the accessibility tree
+// (it may wrap or clip on screen). Apps without a hint id report shown=false.
+const CHAT_HINT = "No runner, workspace or thread tools here.";
+const ROOM_HINT = "Return sends · Shift+Return adds a line · @agent or Ask agent asks this Space's agent; @name only notifies them.";
+const hints = (where, text) =>
+  `console.log("HINT ${where} shown=" + app.shows("id:composer-hint") + " full-label=" + app.shows(${q("label:" + text)}))`;
+const DRAFT = "Draft: check the audit before lunch";
+const ROOM_DRAFT = "Draft for the room";
 const shot = (name) => `await app.screenshot(${q(`${SHOTS}/${name}`)})`;
 
 const scenarios = {
@@ -154,6 +162,7 @@ const scenarios = {
     `await app.waitFor("text:👀", { timeout: 20000 })`,
     `await app.waitFor("text:Acme › #workspace-audit", { timeout: 20000 })`,
     `await app.wait(800)`,
+    hints("chat-1200", CHAT_HINT),
     shot("chat-runs.png"),
     // Apps with a collapsible task form and a narrow-window runs toggle:
     // the open form, then the Chat at 860 wide with its runs shown on request.
@@ -161,7 +170,14 @@ const scenarios = {
     `await app.setViewport(860, 780)`,
     `await app.wait(500)`,
     shot("chat-narrow.png"),
-    `if (app.shows("id:runs-toggle")) { await app.press("id:runs-toggle"); await app.waitFor("id:runs-aside", { timeout: 5000 }); await app.wait(400); ${shot("chat-narrow-runs.png")} }`,
+    // Runs on request: inline (older apps) or a dialog. With a draft in the
+    // composer: Esc closes the dialog and the draft is intact; so does its button.
+    `await app.type("id:composer", ${q(DRAFT)})`,
+    hints("chat-860", CHAT_HINT),
+    `if (app.shows("id:runs-toggle")) { await app.press("id:runs-toggle"); await app.waitUntil(() => app.shows("id:runs-dialog") || app.shows("id:runs-aside"), { timeout: 5000 }); await app.wait(500); ${shot("chat-narrow-runs.png")} }`,
+    `if (app.shows("id:runs-dialog")) { await app.keyboard.press("Escape"); await app.waitUntil(() => !app.shows("id:runs-dialog"), { timeout: 5000 }); if (app.value("id:composer") !== ${q(DRAFT)}) throw new Error("the draft changed after Esc: " + JSON.stringify(app.value("id:composer"))); await app.wait(400); ${shot("chat-narrow-after-esc.png")}; console.log("CHECK Esc closed the runs dialog; the draft is intact") }`,
+    `if (app.shows("id:runs-toggle") && !app.shows("id:runs-aside")) { await app.press("id:runs-toggle"); await app.waitFor("id:runs-dialog", { timeout: 5000 }); await app.press("id:runs-dialog-close"); await app.waitUntil(() => !app.shows("id:runs-dialog"), { timeout: 5000 }); if (app.value("id:composer") !== ${q(DRAFT)}) throw new Error("the draft changed after Close"); await app.wait(400); ${shot("chat-narrow-runs-closed.png")}; console.log("CHECK the dialog's Close button closed it; the draft is intact") }`,
+    `await app.clear("id:composer")`,
     `await app.setViewport(1200, 780)`,
   ],
   // After the child run finished: the thread, nested under the lobby, with its tool call, result and answer.
@@ -174,6 +190,24 @@ const scenarios = {
     `await app.waitFor("text:/The workspace has/", { timeout: 25000 })`,
     `await app.wait(800)`,
     shot("thread.png"),
+  ],
+  // The room's composer, focused, at 860 and 720 points wide (its hint beside the buttons).
+  "narrow-room": () => [
+    ...open,
+    ...connect(),
+    ...enterSpace(),
+    `await app.waitFor("text:/the runner is paired with Acme/", { timeout: 15000 })`,
+    `await app.type("id:composer", ${q(ROOM_DRAFT)})`, // focused, with a draft
+    `await app.setViewport(860, 780)`,
+    `await app.wait(600)`,
+    hints("room-860", ROOM_HINT),
+    shot("room-narrow-860.png"),
+    `await app.setViewport(720, 780)`,
+    `await app.wait(600)`,
+    hints("room-720", ROOM_HINT),
+    shot("room-narrow-720.png"),
+    `await app.clear("id:composer")`,
+    `await app.setViewport(1200, 780)`,
   ],
   // Settings with no secret on screen: runners, model providers (with the
   // allowlisted keyless fixture) and device onboarding (token masked).
