@@ -1,9 +1,11 @@
 # System One, semantic search, shared connections and scheduled prompts
 
 > **Status: implemented, and every local gate passed. Commercial vendors
-> haven't been validated.** See the
-> [current local gate](acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local):
-> 497 Rust tests, all seven e2e scripts, and desktop `nsh test` 106/106.
+> haven't been validated.** The current final local result is the
+> [Metro 0.2.0 local release](acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local) (prepublication). The
+> [Documents & media gate](acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local),
+> with 497 Rust tests, all seven e2e scripts and desktop `nsh test` 106/106,
+> is a historical milestone.
 > The earlier [System One milestone gate](acceptance.md#historical-final-gate-for-the-system-one-milestone-2026-11-22-independent-reviewer-local),
 > with 403 Rust tests, is kept as a record.
 >

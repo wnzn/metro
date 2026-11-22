@@ -17,7 +17,7 @@ room or thread in a Space you belong to.
 > against the real backend: a prompt fired, and its history shows
 > `dispatched` ([screenshot](screenshots/scheduled-tasks.png)). Both are
 > part of the
-> [current local gate](acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local),
+> [Documents & media local gate](acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local),
 > along with desktop `nsh test` 106/106. The models were local scripted stubs,
 > and no real vendor model has been used.
 

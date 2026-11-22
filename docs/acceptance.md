@@ -3,7 +3,75 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Final: Metro 0.2.0 local release, prepublication (2026-11-23, project manager, local)
+
+This is the **current final local result** for Metro 0.2.0. It's local and
+prepublication only: no public release or published image is recorded here.
+The staged entries below it are historical.
+
+**Source.** Tag `v0.2.0`, commit `1397150b8b0af43b4cc2cf26f25d8604d40bf6d3`,
+tree `b9d5a2ea396b872df6b52374d5d040e66580e5f3`.
+
+**Artifacts.** These are in `dist/release/`, with `SHA256SUMS` and a `.sha256`
+beside each archive. `sha256sum -c SHA256SUMS` passed.
+
+| File | Bytes | SHA-256 |
+| --- | --- | --- |
+| `Metro-0.2.0-windows-x64.zip` | 43927434 | `26ffbb2ecc0db1181ba8d46e43356723098a61824b3a983cda02f4d3303e6b22` |
+| `Metro-0.2.0-linux-x64.tar.gz` | 37535065 | `6501380b6d7d7505ad842052f118f0f192c7907461f29e74f709807ae943a075` |
+| `Metro-runner-0.2.0-linux-x64.tar.gz` | 1424758 | `192f0767e0b8011ca629a3df8aaac3eaf5254ecb8cfae9c709034932f6724fb3` |
+
+| Check | Result |
+| --- | --- |
+| Embedded UI bundle | SHA-256 `c51c546b69782c12277855e481e0223dc0d58daceca0e39c9392f3cb959e8f9a`, reproduced independently |
+| Archives | Architecture, notices, manifests and sidecar checksums all checked |
+| `cargo fmt` and strict clippy | Clean |
+| Rust tests (default parallel run) | 570 passed, 0 failed, 2 ignored on purpose |
+| Earlier intermittent instance-lock assertion | Resolved: it was isolated in a dedicated test, with no production code changed |
+| Desktop: pinned NSH `nsh check`, `nsh test` (`TZ=Asia/Manila`) and release build | Check passed, 159/159 tests passed, build green |
+| End-to-end scripts (all 7) and packaging tests (6) | Passed |
+
+**Fixed in this source, and covered by automated tests:**
+
+- **Status badges.** The device connection and local tools now move from
+  **Starting…** to *Serving from here* or *On* in the open view, with no
+  need to reopen it. Pending updates are cancelled on sign-out and when the
+  view closes.
+- **Sidebar footer.** It shows the hosted local workspace by checking
+  `onLocalWorkspace()`, never by guessing from a loopback address, so a
+  manual port forward shows its actual URL.
+
+**Linux GUI, from earlier receipts.** The packaged Linux GUI checks are
+recorded in the
+[UI validation](#staged-linux-ui-validation-of-the-in-app-device-flow-and-local-tools-2026-11-22-qa-local)
+and [candidate QA](#staged-020-linux-candidate-local-workspace-and-desktop-qa-2026-11-22-project-manager-local)
+entries below. They covered local persistence, avatars, timestamps, in-app
+device setup with consent and an approved-model list, three **Ask agent**
+replies from a fixture, and per-Space local tools. They weren't all run
+again on these final archives. The *Dedicated token* and *Runner attached*
+controls seen there are recorded as an observation only, not as something
+this release changes.
+
+**Windows, under Wine on Linux.** The polished ZIP (`26ff…`) isn't
+byte-identical to the earlier one (`d836…`), because the renderer bytecode
+was refreshed. Its native launcher, renderer host and `metro-server.exe`
+are, though: they're the same verified bytes. Those checks were run with
+the earlier ZIP. Its packaged launcher opened a Metro window, and its
+server answered the health check. Over the API of that byte-identical
+`metro-server.exe`:
+
+- a managed user was created, and their token got `401` after it was
+  revoked;
+- the user's display name and bio were saved;
+- a PNG avatar was uploaded and read back;
+- a personal Chat message's UTC timestamp came back unchanged.
+
+**Not covered:** the native Windows GUI, macOS, any real vendor account or
+sign-in, and publishing on GitHub Releases or GHCR.
+
 ## Staged: Linux UI validation of the in-app device flow and local tools (2026-11-22, QA, local)
+
+> **Historical.** Superseded by the [Metro 0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local).
 
 A separate **internal UI-validation build** of the Linux desktop archive
 (SHA-256 `a8d951da5cc280c8be0a288dbc1bd4aa6fe41cae1d133f453e8691a2922b019a`).
@@ -69,10 +137,13 @@ exit, and socket activation.
 
 ## Staged: final local 0.2.0 test artifacts (2026-11-22, project manager, local)
 
+> **Historical.** Superseded by the [Metro 0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local).
+
 These are **local test artifacts, not a release.** No binaries have been
 published on GitHub, and pushing the source is still waiting on the
-maintainer. The final gate stays open: one parallel test is intermittent
-(below), and full GUI QA is still under way.
+maintainer. At the time, the final gate stayed open: one parallel test was
+intermittent (below), and full GUI QA was still under way. Both were
+resolved for the final release.
 
 **Source.** Commit `b3ef2dae69208af91a0f1ddfb2056207141c6b31`, tree
 `b6499d58a0ca28e2f7548a1a4ab1f190bfea3b86`.
@@ -91,7 +162,7 @@ maintainer. The final gate stays open: one parallel test is intermittent
 | Packaging unit tests | 6 passed |
 | Linux launcher | Socket ownership, restart after a crash, current-bearer handling and shutdown verified |
 | Windows archive, under Wine on Linux | The window opened and the bundled server answered `/healthz`. No native Windows run. |
-| Windows server executable from the final ZIP, under Wine, over its API | Passed: an admin created a managed account; that account set its display name and bio, uploaded a PNG avatar and read it back, and posted a personal message whose stored UTC time came back intact; after the admin revoked the token, it got `401`. No Windows GUI interaction and no production vendor. |
+| Windows server executable from this ZIP (`d836…`), under Wine, over its API | Passed: an admin created a managed account; that account set its display name and bio, uploaded a PNG avatar and read it back, and posted a personal message whose stored UTC time came back intact; after the admin revoked the token, it got `401`. No Windows GUI interaction and no production vendor. |
 | Linux runner archive, on Debian 12 | A real confined workspace read passed |
 | `cargo fmt` and strict clippy | Passed |
 | Full parallel Rust gate | **Not clean yet:** one intermittent assertion (an immediate re-acquisition in the exclusive-lock test). Run alone, the affected connector library passed 61/61. Still being investigated. |
@@ -102,6 +173,8 @@ Still under way: full GUI QA of the in-app device and model flow, and of
 local tools, without any CLI.
 
 ## Staged: 0.2.0 Linux candidate, local workspace and desktop QA (2026-11-22, project manager, local)
+
+> **Historical.** Superseded by the [Metro 0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local).
 
 Staged evidence for a **locally built 0.2.0 candidate**, reported by the
 project manager. It isn't a release: nothing has been published. It isn't
@@ -160,6 +233,8 @@ and seeking weren't tested.
 
 ## Staged: admin panel, local accounts, runner package and release targets (2026-11-22, project manager, local and dev service)
 
+> **Historical.** Superseded by the [Metro 0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local).
+
 Staged evidence, reported by the project manager. It isn't a final gate.
 The next final gate is still pending integration receipts, and the gate
 below stays the current one until then. **Nothing has been released.**
@@ -198,6 +273,8 @@ Not yet recorded:
 
 ## Staged: profiles and message times API (2026-11-22, project manager, local)
 
+> **Historical.** Superseded by the [Metro 0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local).
+
 Server-side receipts. Not a final gate, and nothing has been released. The
 desktop interface for both features is pending and not verified.
 
@@ -215,7 +292,8 @@ service's profile and timestamp reads were checked
 
 ## Demonstrated: final local gate with Documents & media (2026-11-22, primary workspace, local)
 
-This is the current gate. It ran on the primary workspace, with every
+This was the current gate for the Documents & media build, and the 0.2.0
+local release above supersedes it overall. It ran on the primary workspace, with every
 full-process script using the same verified final binaries. The [System One
 milestone gate](#historical-final-gate-for-the-system-one-milestone-2026-11-22-independent-reviewer-local)
 below is kept for the record and is superseded by this one.
@@ -243,7 +321,7 @@ picker (portal) weren't verified. **Nothing was published or released.**
 
 ## Historical: final gate for the System One milestone (2026-11-22, independent reviewer, local)
 
-Superseded by the [current gate](#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local). It's kept as a record of that milestone.
+Superseded by the [Documents & media gate](#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local), and then by the [0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local). It's kept as a record of that milestone.
 
 An independent reviewer ran this on the primary checkout with Rust 1.98.1.
 It supersedes the earlier backend gate below. The full report and the test
@@ -861,13 +939,12 @@ server connection and sign-in weren't tested.
 - Publishing images to GHCR from a `v*` tag.
 - A full scan of logs and the database for leaked tokens. The code is written
   never to log tokens, but no exhaustive scan was done.
-- The desktop app on macOS, or running on Windows. A Windows x64 package was
-  built and checked on Linux
-  ([above](#verified-windows-x64-portable-package-built-on-linux-2026-11-22-packaging-local)),
-  but it hasn't been started on Windows.
-- A desktop-managed connector (a sidecar), or automatic vendor or CLI
-  sign-in from the app. Neither is implemented. Device setup runs in a
-  terminal, through `metro-connector`.
+- The desktop app on macOS, or on native Windows. Windows has run only
+  under Wine, using the launcher and server executables that are byte-identical
+  in the final ZIP ([0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)).
+- Automatic vendor or CLI sign-in from the app, or a real vendor account
+  through the in-app device flow. That flow was verified only against a
+  local test endpoint.
 - Signing or publishing a release.
 - Documents & media with the pretrained `google/embeddinggemma-2`: no
   ranking or retrieval quality on real files, no measured memory or timings,

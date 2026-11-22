@@ -194,14 +194,16 @@ runtime.
     loopback fixtures and scripted models.
   - The classification and routing opt-ins are off by default. With them
     off, the default behaviour above is the only behaviour.
-  - The current final local gate passed (`docs/acceptance.md`): 497 Rust
-    tests, all seven e2e scripts (`library.py` included), the 83 hardened
-    media-service tests, and desktop `nsh test` 106/106. The earlier
-    403-test gate is historical only.
+  - The current final local result is the Metro 0.2.0 local release,
+    prepublication (`docs/acceptance.md`): 570 Rust tests, all seven e2e
+    scripts, 6 packaging tests, and desktop `nsh test` 159/159. The
+    Documents & media gate (497 Rust tests, the 83 hardened media-service
+    tests, `nsh test` 106/106) and the earlier 403-test gate are historical
+    milestones.
   - Don't claim a real commercial provider, production auth, a published
     release, pretrained `google/embeddinggemma-2` ranking quality, or
-    native audio and video playback, seeking or a native file picker,
-    until a run is recorded.
+    native audio and video playback, seeking or the native file picker for
+    library uploads, until a run is recorded.
 - **User and operator docs use prebuilt files only:** the desktop app
   (Windows, Linux), the server and runner images, and the Linux runner
   binary from https://github.com/wnzn/metro. They never ask anyone to

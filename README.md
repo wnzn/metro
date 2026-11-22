@@ -132,10 +132,11 @@ The full behaviour and the API are in [docs/spaces.md](docs/spaces.md).
 - [Documents & media](docs/library.md): a library of files you upload
   yourself, with search by content.
 
-They pass the
-[final local gate](docs/acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local):
+They passed the
+[Documents & media local gate](docs/acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local):
 497 Rust tests, all seven e2e scripts, the 83 hardened media-service tests,
-and desktop `nsh test` 106/106. That gate used local fixtures, scripted
+and desktop `nsh test` 106/106. The current final result is the
+[Metro 0.2.0 local release](docs/acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local). That gate used local fixtures, scripted
 models and a test-only encoder only. **No commercial vendor has been
 validated, and nothing has been released.** See
 [docs/system-one.md](docs/system-one.md).
@@ -164,9 +165,10 @@ contributors and lives in [docs/development.md](docs/development.md).
 > (each with a `.sha256`) on the
 > [Releases page](https://github.com/wnzn/metro/releases), and the images
 > `ghcr.io/wnzn/metro-server` and `ghcr.io/wnzn/metro-runner` on GitHub
-> Container Registry. These names are verified targets. A 0.2.0 candidate
-> has been built and checked locally, but none of these files or images
-> exists until the release is published
+> Container Registry. These names are verified targets. The 0.2.0
+> files have been built and verified locally
+> ([evidence](docs/acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)), but nothing is public until the release is
+> published
 > ([docs/deploy.md](docs/deploy.md#release-files-and-images)).
 
 There are two ways to use Metro:

@@ -3,6 +3,7 @@
 /dist/**/Metro-*.zip.sha256
 /dist/**/Metro-*.tar.gz
 /dist/**/Metro-*.tar.gz.sha256
+/dist/**/SHA256SUMS
 **/node_modules/
 **/__pycache__/
 

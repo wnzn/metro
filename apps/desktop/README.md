@@ -8,8 +8,8 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
 
 Download the build for your system from
 [Releases](https://github.com/wnzn/metro/releases). **No release has been
-published yet.** A 0.2.0 candidate has been built locally and checked
-(below), but there are no files to download yet. You never need NSH, a
+published yet.** The 0.2.0 files have been built and verified locally
+([evidence](../../docs/acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)), but there are no files to download yet. You never need NSH, a
 checkout or a terminal to use the app; the build commands further down are
 for contributors.
 
@@ -53,10 +53,11 @@ from a read-only install, with Docker `--network none`
   *On this device* only when the session is positively identified as this
   app's own hosted local workspace. Any other server, including one you
   reach through a manual localhost port forward, shows its actual URL. The final
-  0.2.0 source checks for the hosted local workspace itself, and a test
-  covers a manual port forward. A UI-validation build cut from older source
-  showed the plain loopback address in local mode. The final build hasn't
-  been re-checked in the GUI yet.
+  0.2.0 source checks for the hosted local workspace itself
+  (`onLocalWorkspace()`), and a test covers a manual port forward. A
+  UI-validation build cut from older source showed the plain loopback
+  address in local mode. The final archive hasn't been re-checked in the
+  GUI.
 - **Search** is a centered box at the top of the window.
 - **Provider picker:** one searchable dropdown grouped by vendor. Each
   vendor shows how many ways it can be connected and its capabilities. For
@@ -114,10 +115,11 @@ private folder on this computer, per Space, while Metro is open.
   only against a local test endpoint ([above](#also-verified)). No real
   vendor account or vendor sign-in has been tested. Vendor software such as
   the Claude Code CLI stays separate, and you install it yourself.
-- **Status badges:** in the tested build, a **Starting…** badge could stay
-  shown after a device connection or local tools were already working,
-  until you reopened **Manage connection** or the Space's Manage page. A
-  fix is under way.
+- **Status badges in the GUI:** in an earlier tested build, a **Starting…**
+  badge could stay shown until the view was reopened. The final 0.2.0
+  source fixes this: badges now move to *Serving from here* or *On* in the
+  open view, which automated tests cover. The final archive hasn't been
+  re-checked in the GUI.
 - **Windows:** the candidate opened a Metro window and its server answered
   `/healthz` under Wine. Nobody has checked that it draws or takes input,
   or run it on native Windows.

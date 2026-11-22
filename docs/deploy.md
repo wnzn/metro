@@ -7,9 +7,9 @@ source is for contributors: [development.md](development.md).
 
 > **Not published yet.** The repository is
 > <https://github.com/wnzn/metro>. The names below are the verified release
-> targets for version 0.2.0. A 0.2.0 candidate has been built and checked
-> locally ([acceptance](acceptance.md)), but no release, file or image
-> exists until it's published. Each release file comes with a `.sha256` file beside it.
+> targets for version 0.2.0. The 0.2.0 files have been built and verified
+> locally ([acceptance](acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)), but no public release, file or image exists
+> until it's published. Each release file comes with a `.sha256` file beside it.
 
 | Part | Where | Release-target name |
 | --- | --- | --- |
