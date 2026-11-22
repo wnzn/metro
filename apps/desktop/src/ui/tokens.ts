@@ -130,11 +130,17 @@ export const controlHeightClass = {
  */
 export const transitionClass = "transition-colors duration-150 ease-out motion-reduce:transition-none";
 
-/** A popup's entrance and exit (menus, pickers): a 150 ms fade, none with reduced motion. */
+/**
+ * A popup's entrance and exit (menus, pickers): 150 ms ease-out, a fade with
+ * a small 0.98 → 1 scale. `transition` animates opacity and transform
+ * together. With reduced motion NSH skips the starting and ending looks
+ * (nsh-base popup.rs), and `motion-reduce:transition-none` also stops any
+ * transition, so the popup simply appears and goes.
+ */
 export const popoverMotion = {
-  base: "transition-opacity duration-150 ease-out motion-reduce:transition-none",
-  starting: "opacity-0",
-  ending: "opacity-0",
+  base: "transition duration-150 ease-out motion-reduce:transition-none",
+  starting: "opacity-0 scale-[0.98]",
+  ending: "opacity-0 scale-[0.98]",
 } as const;
 
 /**

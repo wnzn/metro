@@ -300,3 +300,17 @@ test("Picker: a detail shows as a second line, and the trigger shows only the la
   expect(app.shows("text:Fixture alpha detail")).toBe(false);
   expect(app.shows("id:fx-picker >> text:Fixture alpha")).toBe(true);
 });
+
+test("menus open and close with and without reduced motion (fade + 0.98 scale, none when reduced)", async () => {
+  for (const reducedMotion of [false, true]) {
+    const app = await open(FIXTURE, { platform: "linux", width: 1280, height: 1400, storage: { [APPEARANCE_KEY]: "dark" }, reducedMotion });
+    await expectScheme(app, dark);
+    await app.press("id:fx-menu");
+    await app.waitFor("id:fx-menu-rename");
+    // Its end look is fully opaque, whatever the entrance.
+    await app.waitUntil(() => app.viewStyle("id:fx-menu-rename")?.effectiveOpacity === 1);
+    await app.press("id:fx-menu-rename");
+    await app.waitFor("id:fx-menu-rename", { state: "gone" });
+    await app.waitFor("text:Last: rename");
+  }
+});
