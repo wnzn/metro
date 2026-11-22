@@ -12,5 +12,6 @@ while [ ! -e "/tmp/.X11-unix/X$num" ]; do
   if [ "$i" -gt 100 ]; then echo "Xvfb did not start" >&2; cat /tmp/xvfb.log >&2; exit 1; fi
   sleep 0.1
 done
+sleep 0.3 # the socket can appear before Xvfb accepts clients (GTK "Failed to open display")
 export DISPLAY=":$num"
 exec "$@"

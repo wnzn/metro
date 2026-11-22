@@ -9,6 +9,11 @@
 # screenshot is taken. The GTK window runs on a private Xvfb display inside a
 # container, so the developer's desktop is not touched.
 #
+# `nsh test` writes the steps it was fed, typed tokens included, to
+# <app>/.nsh/test/. So the app runs from a staged copy in the temp directory,
+# mounted read-only, with a tmpfs at /app/.nsh that dies with the container;
+# the checkout is never mounted. NSH's output is redacted before it is shown.
+#
 #   docker build -t metro-desktop-shots:trixie apps/desktop/dev/screenshots
 #   apps/desktop/dev/screenshots/capture.sh [OUT_DIR]       # default: docs/screenshots
 #
@@ -21,10 +26,19 @@
 #              deterministic local OpenAI-compatible double of the MODEL only
 #              (server, Rig, tool call, runner and listing stay real); 0 skips
 #              the agent shots so nothing calls a model.
+#   THEME      dark (default) or light: every shot after connecting in that
+#              appearance (connection*.png are taken in dark runs only).
 #
 # Writes connection.png, room-runner.png, space-members.png, connection-error.png,
 # settings-runners.png, settings-space-runner.png, settings-appearance.png,
-# and with a model agent-thinking.png, agent-activity-expanded.png, chat-runs.png
+# team-room.png, create-space.png, create-room.png, recipient-picker.png,
+# reactions.png, profile.png, compact-profile.png, compact-profile-edited.png
+# and compact-profile-saved.png (780 wide: Save pressed without scrolling,
+# checked on the server), provider-dropdown.png, server-api-profile.png,
+# appearance-preview.png, appearance-preview-end.png,
+# and with a model agent-thinking.png, agent-activity-expanded.png, chat-runs.png,
+# chat-narrow.png (860 wide), chat-dispatch.png and chat-narrow-runs.png (where
+# the app has a collapsible task form and a narrow-window runs toggle)
 # and thread.png; with the scripted model also
 # settings-providers.png and settings-device-onboarding.png (its keyless
 # /v1/models is the allowlisted endpoint), into OUT_DIR.
@@ -47,6 +61,9 @@ for b in metro-server metro-runner; do [ -x "$bin/$b" ] || { echo "missing $bin/
 docker image inspect "$image" >/dev/null 2>&1 || { echo "build the image first: docker build -t $image $here" >&2; exit 1; }
 for tool in node openssl curl python3; do command -v "$tool" >/dev/null || { echo "$tool is required" >&2; exit 1; }; done
 
+theme="${THEME:-dark}"
+case "$theme" in dark|light) ;; *) echo "THEME must be dark or light" >&2; exit 1 ;; esac
+
 umask 077
 tmp="$(mktemp -d "${TMPDIR:-/tmp}/metro-shots-XXXXXX")"
 sec="$tmp/secrets"; mkdir -m 700 "$sec"
@@ -57,6 +74,11 @@ cleanup() {
   rm -rf "$tmp"
 }
 trap cleanup EXIT INT TERM
+
+# The app as the container sees it: a copy without .nsh, target or node_modules, read-only.
+stage="$tmp/app"; mkdir -p "$stage/.nsh" # .nsh: only the tmpfs mountpoint
+tar -C "$app" --exclude=.nsh --exclude=target --exclude=node_modules -cf - . | tar -C "$stage" -xf - # at any depth
+chmod -R a+rX,go-w "$stage"
 
 # --- secrets (files only) ------------------------------------------------
 openssl rand -hex 24 >"$sec/alice"
@@ -109,7 +131,7 @@ elif [ "${SCRIPTED_MODEL:-1}" = 1 ]; then
 fi
 env -i PATH=/usr/bin:/bin HOME="$tmp" \
   METRO_BIND="127.0.0.1:$port" METRO_DB="$tmp/metro.sqlite" \
-  METRO_DEV_USERS="$(cat "$sec/dev-users.json")" "${model_env[@]}" \
+  METRO_DEV_USERS_FILE="$sec/dev-users.json" "${model_env[@]}" \
   METRO_ORG_ADMINS='["alice"]' METRO_PROVIDER_KEY_FILE="$sec/provider.key" \
   "$bin/metro-server" >"$tmp/server.log" 2>&1 &
 pids+=($!)
@@ -143,12 +165,30 @@ env -i PATH=/usr/bin:/bin HOME="$tmp" METRO_RUNNER_TOKEN="$(cat "$sec/org-runner
 pids+=($!)
 
 # --- the app, natively, in the container ----------------------------------
-run_app() { # stdin: steps
-  docker run --rm -i --init --network host --user "$(id -u):$(id -g)" -e HOME=/tmp \
-    -v "$NSH_DIST":/opt/nsh:ro -v "$app":/app -v "$out":/shots -w /app "$image" \
-    sh /app/dev/screenshots/with-display.sh /opt/nsh/bin/nsh test App.tsx --target linux
+# Prints NSH's output with every secret in $sec replaced, never the raw text.
+redact() {
+  python3 -c '
+import pathlib, sys
+secrets = [p.read_text().strip() for p in pathlib.Path(sys.argv[1]).iterdir() if p.is_file() and p.suffix != ".hdr"]
+secrets = sorted({s for s in secrets if len(s) >= 8}, key=len, reverse=True)
+for line in sys.stdin:
+    for s in secrets:
+        line = line.replace(s, "[redacted]")
+    sys.stdout.write(line)
+' "$sec"
 }
-steps() { URL="$url" SPACE="$sid" SITE="$site_sid" FIXTURE_URL="$fixture_url" SHOTS=/shots AGENT="$agent" node "$here/steps.mjs" "$@"; }
+run_app() { # stdin: steps
+  # A private, uncommon X display per run: --network host shares abstract X sockets.
+  local display=$((200 + RANDOM % 600))
+  docker run --rm -i --init --network host --user "$(id -u):$(id -g)" -e HOME=/tmp \
+    -e DISPLAY_NUM="$display" -e SCREEN="${SCREEN:-1440x1050x24}" \
+    -v "$NSH_DIST":/opt/nsh:ro -v "$stage":/app:ro \
+    --tmpfs "/app/.nsh:rw,exec,mode=0700,uid=$(id -u),gid=$(id -g)" \
+    -v "$out":/shots -w /app "$image" \
+    sh /app/dev/screenshots/with-display.sh /opt/nsh/bin/nsh test App.tsx --target linux 2>&1 | redact # pipefail: a failed run fails the script
+}
+profile_name="Alice Rivera" profile_bio="Runs the Acme workspace." # typed by the tour at 780 wide
+steps() { PROFILE_NAME="$profile_name" PROFILE_BIO="$profile_bio" URL="$url" SPACE="$sid" SITE="$site_sid" FIXTURE_URL="$fixture_url" SHOTS=/shots AGENT="$agent" THEME="$theme" node "$here/steps.mjs" "$@"; }
 
 echo "== Bob mentions Alice from his desktop app"
 TOKEN_FILE="$sec/bob" steps bob | run_app
@@ -172,24 +212,41 @@ if [ -n "$agent" ]; then
   TOKEN_FILE="$sec/alice" THREAD_ID="$thread_id" steps alice-agent | run_app
 fi
 
-echo "== Alice: Settings (runners, model providers, device onboarding, appearance) and a Space's runner"
+echo "== Alice: Settings (runners, model providers, device onboarding)"
 TOKEN_FILE="$sec/alice" steps alice-settings | run_app
 # The connection the steps created exists on the server, its key-less listing came from the fixture.
 if [ -n "$fixture_url" ]; then
-  api alice GET /v1/providers | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const c=JSON.parse(s).connections;if(!c.some(x=>x.model==="metro-scripted-test-model"&&x.is_default))process.exit(1)})' ||
+  api alice GET /v1/providers | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const c=JSON.parse(s).connections;if(!c.some(x=>x.model==="metro-scripted-test-model"&&x.is_default)){console.error(JSON.stringify(c.map(x=>({name:x.name,provider_id:x.provider_id,model:x.model,is_default:x.is_default,capability:x.capability}))));process.exit(1)}})' ||
     { echo "the provider connection was not saved with the listed model" >&2; exit 1; }
 fi
+
+echo "== Alice: appearance and a Space's runner"
+TOKEN_FILE="$sec/alice" steps space-settings | run_app
+
+echo "== Alice: room popovers and compact forms"
+TOKEN_FILE="$sec/alice" EVENT_ID="$event_id" steps tour | run_app
+
+echo "== Alice: profile (also at 780 wide, saved), provider dropdown, appearance preview"
+TOKEN_FILE="$sec/alice" steps tour-settings | run_app
+# The compact Save really saved: the server has the name and bio typed at 780 wide.
+api alice GET /v1/me/profile | PROFILE_NAME="$profile_name" PROFILE_BIO="$profile_bio" node -e '
+let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
+  const p = JSON.parse(s), want = { display_name: process.env.PROFILE_NAME, bio: process.env.PROFILE_BIO };
+  const got = { display_name: p.display_name, bio: p.bio };
+  if (got.display_name !== want.display_name || got.bio !== want.bio) { console.error("profile not saved:", JSON.stringify(got)); process.exit(1); }
+  console.log("profile saved at 780 wide:", JSON.stringify(got));
+});' || { echo "the compact profile save did not reach the server" >&2; exit 1; }
 
 echo "== An invalid token is rejected"
 steps invalid | run_app
 
 # Tokens only ever lived in $sec; make sure none reached the output or the app.
 for f in "$sec/alice" "$sec/bob" "$sec/runner" "$sec/org-runner" "$sec/alice-runner" "$sec/provider.key"; do
-  if grep -rqF -- "$(cat "$f")" "$out" "$app" 2>/dev/null; then
-    echo "a token was found under $out or $app; refusing to keep the output" >&2
+  if grep -rqF -f "$f" -- "$out" "$app" "$stage" 2>/dev/null; then # -f: the token never reaches argv
+    echo "a token was found under $out, $app or the staged app; refusing to keep the output" >&2
     exit 1
   fi
 done
-echo "== wrote (agent: ${agent:-none}):"; ls -l "$out"/*.png
+echo "== wrote (agent: ${agent:-none}, theme: $theme):"; ls -l "$out"/*.png
 [ "$agent" = scripted ] && echo "note: agent replies and the 👀 in these shots come from scripted_model.py (a model double); server, runner and listings are real."
 exit 0
