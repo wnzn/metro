@@ -168,7 +168,7 @@ function LibraryFiles() {
     <Column gap={6} testID="library-view">
       <PageHeader
         title="Library"
-        subtitle="Files you uploaded. Your personal library is yours alone; a Space's library is seen by its current members. Metro never scans runner files, workspaces or disks, and uploading sends nothing to a model."
+        subtitle="Files you uploaded to your personal library or a Space."
       >
         <GlyphAction testID="library-choose" glyph="upload" label="Upload" busyLabel="Uploading…" busy={uploading()} accessibilityLabel={`Upload files to ${scopeLabel(uploadTarget())}`} onPress={() => void chooseAndUpload()} />
       </PageHeader>
@@ -184,19 +184,19 @@ function UploadTarget() {
   const who = () => (uploadTarget().kind === "personal" ? "Only you will see these files." : `Every current member of ${scopeLabel(uploadTarget())} will see these files.`);
   return (
     <Column gap={2} testID="library-upload">
-      <Row align="center" gap={3} wrap>
-        <Label variant="strong">Upload to</Label>
-        <Picker
-          testID="library-upload-target"
-          accessibilityLabel="Upload to"
-          items={items()}
-          value={scopeValue(uploadTarget())}
-          onChange={(v) => setUploadTarget(v?.startsWith("space:") ? { kind: "space", spaceId: v.slice(6) } : { kind: "personal" })}
-        />
-      </Row>
-      <Label variant="caption" color="muted">
-        {`${who()} TXT, Markdown, PDF, DOCX, PNG, JPEG, WAV, MP3, MP4 and WebM, up to ${formatSize(maxFileBytes())} each, from your system's file picker. Their bytes go to your Metro server and nowhere else.`}
-      </Label>
+      <SettingsGroup>
+        <SettingRow label="Upload to" description={who()}>
+          <Picker
+            testID="library-upload-target"
+            accessibilityLabel="Upload to"
+            items={items()}
+            value={scopeValue(uploadTarget())}
+            onChange={(v) => setUploadTarget(v?.startsWith("space:") ? { kind: "space", spaceId: v.slice(6) } : { kind: "personal" })}
+          />
+        </SettingRow>
+        <SettingRow label="Accepted" description={`TXT, Markdown, PDF, DOCX, PNG, JPEG, WAV, MP3, MP4 and WebM, up to ${formatSize(maxFileBytes())} each.`} />
+        <SettingRow label="Where files go" description="Only to your Metro server. Uploading sends nothing to a model, and Metro never scans runner files, workspaces or disks." />
+      </SettingsGroup>
       <If when={uploadOutcomes().length > 0}>
         <Column gap={1} testID="library-upload-outcomes">
           <Each of={uploadOutcomes()} key={(o) => o.key}>
@@ -555,7 +555,7 @@ function Results() {
           <SettingsGroup testID="library-search-start">
             <SettingRow
               label="Search your files by meaning"
-              description="Type what you're looking for in the search box at the top, such as a whiteboard photo of the roadmap or the clause about termination, then press Return. Only files you indexed are searched."
+              description="Only files you indexed are searched."
             >
               <Action testID="search-open-library" label="Open Library" variant="ghost" onPress={() => openPlace("library")} />
             </SettingRow>
