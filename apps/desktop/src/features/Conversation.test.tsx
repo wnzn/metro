@@ -8,11 +8,13 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
 import { headerAudience } from "./transcriptRows";
+import theme from "../../theme/theme.json";
+import { APPEARANCE_KEY } from "../ui";
 
 type F = ReturnType<typeof world>;
 
-async function inAcme(f: F) {
-  const app = await open("../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800 });
+async function inAcme(f: F, storage: Record<string, string> = {}) {
+  const app = await open("../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);
@@ -109,6 +111,30 @@ test("@ suggestions: Return picks the highlighted one and sends nothing", async 
   expect(messages(f).at(-1)!.body).toEqual({ text: "ping @bob @agent", invoke_agent: false, mentions: [{ kind: "user", id: "bob" }, { kind: "agent" }] });
 });
 
+test("@ then Down then Return picks the second suggestion with the caret still in the field; nothing is sent", async () => {
+  const f = world();
+  const app = await inAcme(f);
+  await app.type("id:composer", "ping @");
+  await app.waitFor("id:pick:bob"); // agent first, then bob
+  const before = messages(f).length;
+  await app.keyboard.press("down");
+  await app.keyboard.press("enter"); // a real Return key, as verified on the GTK host too
+  await app.waitFor("id:mention-chip:bob");
+  expect(app.shows("id:mention-chip:agent")).toBe(false);
+  expect(app.value("id:composer")).toBe("ping @bob ");
+  expect(messages(f).length).toBe(before);
+  // Up wraps to the last; with the list closed the arrows are the caret's again.
+  await app.type("id:composer", "@");
+  await app.waitFor("id:pick:agent");
+  await app.keyboard.press("up");
+  await app.keyboard.press("up");
+  await app.submit("id:composer");
+  await app.waitFor("id:mention-chip:agent");
+  await app.keyboard.press("down");
+  expect(app.value("id:composer")).toBe("ping @bob @agent ");
+  expect(messages(f).length).toBe(before);
+});
+
 test("the @ button opens the list under itself; leaving the room closes it", async () => {
   const f = world();
   f.addRoom("acme", { id: "ops", name: "ops" });
@@ -153,12 +179,57 @@ test("the agent has a glyph, not initials; a message to me has the rail and expl
   expect(app.shows("label:Addressed to you")).toBe(true);
 });
 
-test("an audience phrase is left out only where a typed @agent already says it", () => {
-  const typed = [{ kind: "agent" as const }];
-  expect(headerAudience("agent", typed)).toBe(undefined);
-  expect(headerAudience("agent", undefined)).toBe("agent"); // Ask agent, nothing typed
-  expect(headerAudience("agent", [{ kind: "agent", addressedBy: "classifier" }])).toBe("agent");
-  expect(headerAudience("mixed", [...typed, { kind: "user", id: "bob" }])).toBe("mixed");
-  expect(headerAudience("users", [{ kind: "user", id: "bob" }])).toBe("users");
-  expect(headerAudience("room", undefined)).toBe("room");
+test("recipient pills say who a message is for; only what no pill says is added", () => {
+  const agent = { kind: "agent" as const };
+  const bob = { kind: "user" as const, id: "bob" };
+  const shown = (a: string | undefined, m?: Parameters<typeof headerAudience>[1]) => {
+    const h = headerAudience(a, m);
+    return [h.agentBadge, h.peopleNote];
+  };
+  expect(shown("agent", [agent])).toEqual([false, false]); // typed @agent
+  expect(shown("agent", [{ kind: "agent", addressedBy: "classifier" }])).toEqual([false, false]); // detected
+  expect(shown("agent", [{ kind: "agent", addressedBy: "schedule" }])).toEqual([false, false]); // scheduled
+  expect(shown("users", [bob])).toEqual([false, false]); // no "to people"
+  expect(shown("mixed", [agent, bob])).toEqual([false, false]); // two pills, no phrase
+  expect(shown("agent", undefined)).toEqual([true, false]); // Ask agent: one small agent badge
+  expect(shown("mixed", [bob])).toEqual([true, false]); // Ask agent with @bob
+  expect(shown("users", undefined)).toEqual([false, true]); // legacy event without recipients
+  expect(shown("room", undefined)).toEqual([false, false]);
+  expect(headerAudience("mixed", [agent, bob]).spoken).toBe("Addressed to the agent and people");
+});
+
+test("headers drop 'to people' and repeat no agent audience; Ask agent shows one agent badge", async () => {
+  const f = world();
+  const toMe = f.post("acme/lobby", { kind: "message", actor: "bob", text: "@alice look", mentions: [{ kind: "user", id: "alice" }], audience: "users" });
+  const both = f.post("acme/lobby", { kind: "message", actor: "bob", text: "@alice and @agent", mentions: [{ kind: "user", id: "alice" }, { kind: "agent" }], audience: "mixed" });
+  const asked = f.post("acme/lobby", { kind: "message", actor: "bob", text: "asked with the button", audience: "agent" });
+  const app = await inAcme(f);
+  await app.waitFor("text:asked with the button");
+  expect(app.shows("text:to people")).toBe(false);
+  expect(app.shows("text:to the agent and people")).toBe(false);
+  expect(app.shows(`id:recipient:${toMe.id}:alice`)).toBe(true);
+  expect(app.shows(`id:recipient:${both.id}:alice`)).toBe(true);
+  expect(app.shows(`id:recipient:${both.id}:agent`)).toBe(true);
+  expect(app.count(`id:event:${both.id} >> text:to the agent`)).toBe(0);
+  expect(app.shows(`id:recipient:${asked.id}:ask-agent >> text:to the agent`)).toBe(true);
+  expect(app.shows("label:Addressed to the agent (Ask agent)")).toBe(true);
+});
+
+test("disabled Send and Ask agent are muted, never a dimmed brand fill, in both themes", async () => {
+  const norm = (c: string | null | undefined) => (c ?? "").toLowerCase().replace(/^#([0-9a-f]{6})ff$/, "#$1");
+  for (const scheme of ["dark", "light"] as const) {
+    const palette = theme.cssVars[scheme] as Record<string, string>;
+    const f = world();
+    const app = await inAcme(f, { [APPEARANCE_KEY]: scheme });
+    expect(app.enabled("id:send")).toBe(false);
+    for (const id of ["id:send", "id:ask-agent"]) {
+      const style = app.viewStyle(id)!;
+      expect(norm(style.backgroundColor)).toBe(palette.muted!.toLowerCase());
+      expect(style.effectiveOpacity).toBe(1);
+    }
+    await app.type("id:composer", "ready");
+    expect(norm(app.viewStyle("id:send")!.backgroundColor)).toBe(palette.primary!.toLowerCase());
+    expect(norm(app.viewStyle("id:ask-agent")!.backgroundColor)).toBe(palette["tone-agent"]!.toLowerCase());
+    expect(f.posts().some((p) => p.path.endsWith("/messages"))).toBe(false); // the chip asks only when pressed
+  }
 });

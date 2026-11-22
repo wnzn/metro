@@ -140,7 +140,7 @@ export function MessageToolbar(props: Testable & { open?: boolean; children?: JS
   return (
     <View
       class={cx(
-        "absolute top-[2px] right-(--space-2) opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 pointer-coarse:opacity-100 transition-opacity",
+        "absolute top-[2px] right-(--space-2) opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 pointer-coarse:opacity-100 motion-safe:transition-opacity",
         props.open && "opacity-100",
       )}
     >
@@ -437,39 +437,56 @@ export function RecipientChip(props: Testable & { label: string; agent?: boolean
 }
 
 /**
- * "Ask agent": sends and explicitly asks the agent to answer. Outlined in
- * the agent's tone with its glyph, so it never reads as the plain send.
+ * The send controls share one look while they can't act (disabled or busy):
+ * a muted surface with muted glyph and text, never a dimmed brand fill, in
+ * both themes. 36px tall, with the shared focus ring (ring on background is
+ * checked for 3:1 in theme.test).
+ */
+const sendInactive = "bg-muted border border-border";
+
+/**
+ * "Ask agent": a rounded chip in the agent's tone with its glyph. Pressing it
+ * sends and explicitly asks the agent; it never reads as the plain send.
  */
 export function AskAgentButton(props: Testable & { label: string; busyLabel: string; busy: boolean; disabled: boolean; onPress: () => void }) {
+  const inactive = () => props.disabled || props.busy;
   return (
     <Button
       class={cx(
-        "flex-row items-center gap-(--space-1) min-h-[32px] rounded-(--radius-sm) border border-tone-agent-foreground/40 px-(--space-2) hover:bg-tone-agent active:bg-tone-agent disabled:opacity-50",
+        "flex-row items-center gap-(--space-1) h-[36px] rounded-full px-(--space-3)",
         focusRing,
+        inactive() ? sendInactive : "bg-tone-agent border border-tone-agent-foreground/40 hover:border-tone-agent-foreground active:opacity-90",
       )}
-      disabled={props.disabled || props.busy}
+      disabled={inactive()}
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.label}
     >
-      <ChatGlyph name="agent" color="agent" />
-      <Text class="text-(length:--text-sm) font-medium text-tone-agent-foreground">{props.busy ? props.busyLabel : props.label}</Text>
+      <ChatGlyph name="agent" color={inactive() ? "muted" : "agent"} />
+      <Text class={cx("text-(length:--text-sm) font-medium", inactive() ? "text-muted-foreground" : "text-tone-agent-foreground")}>
+        {props.busy ? props.busyLabel : props.label}
+      </Text>
     </Button>
   );
 }
 
-/** The plain send, at the bottom right: an arrow on the primary color. */
+/** The plain send, at the bottom right: an arrow on the primary color while it can send, muted otherwise. */
 export function SendButton(props: Testable & { busy: boolean; disabled: boolean; onPress: () => void; tooltip?: string }) {
+  const inactive = () => props.disabled || props.busy;
   return (
     <Button
-      class={cx("items-center justify-center size-[32px] rounded-(--radius-sm) bg-primary hover:bg-primary/90 active:bg-primary/85 disabled:opacity-40", focusRing, props.busy && "opacity-60")}
-      disabled={props.disabled || props.busy}
+      class={cx(
+        "items-center justify-center size-[36px] rounded-full",
+        focusRing,
+        inactive() ? sendInactive : "bg-primary hover:bg-primary/90 active:bg-primary/85",
+      )}
+      disabled={inactive()}
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={props.busy ? "Sending…" : props.accessibilityLabel ?? "Send"}
       tooltip={props.tooltip ? <TooltipText text={props.tooltip} /> : undefined}
     >
-      <ChatGlyph name="send" color="on-primary" />
+      <ChatGlyph name="send" color={inactive() ? "muted" : "on-primary"} />
     </Button>
   );
 }

@@ -157,7 +157,7 @@ export function Timestamp(props: Testable & { text: string; full: string; compac
       class={cx(
         "text-muted-foreground",
         props.compact
-          ? "text-[10px] pt-[3px] opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 pointer-coarse:opacity-100 transition-opacity"
+          ? "text-[10px] pt-[3px] opacity-0 group-hover/msg:opacity-100 group-focus-within/msg:opacity-100 pointer-coarse:opacity-100 motion-safe:transition-opacity"
           : "text-(length:--text-xs)",
       )}
       style={{ numberOfLines: 1 }}

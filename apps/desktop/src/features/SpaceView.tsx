@@ -9,7 +9,7 @@
 // so does leaving the room. Only the agent and members of this Space are
 // offered, each person by display name and picture with their stable id.
 
-import { computed, effect, signal, untracked } from "nsh";
+import { computed, effect, keymap, signal, untracked } from "nsh";
 import type { Bounds, ViewRef } from "nsh";
 import {
   activeRoom,
@@ -172,6 +172,8 @@ function RoomComposer() {
   /** The caret's box in the window, as the field last reported it. */
   const caret = signal<Bounds | null>(null);
   const highlighted = signal(0);
+  /** The composer's field has the keyboard focus. */
+  const fieldFocused = signal(false);
   let atButton: ViewRef | null = null;
   /** The keyboard focus is in the list (the button put it there, or Tab). */
   let focusInList = false;
@@ -210,6 +212,19 @@ function RoomComposer() {
       dismissedAt.set(draft());
       focusInList = false;
     });
+  });
+  // Up and Down move the highlight while the caret is in the field and the
+  // list is open: an app binding with `when: "always"` fires even though the
+  // input would move its caret. Bound only then; removed on blur, close,
+  // room switch and unmount (the effect's cleanup), so the caret keeps its
+  // arrows otherwise.
+  effect(() => {
+    if (!open() || !fieldFocused() || options().length === 0) return;
+    const move = (step: number) => () => {
+      const n = options().length;
+      if (n > 0) highlighted.set((active() + step + n) % n);
+    };
+    return keymap.bind({ down: move(1), up: move(-1) }, { when: "always", repeat: true });
   });
   // Typing something that is not a mention closes the list the button opened.
   effect(() => {
@@ -255,6 +270,7 @@ function RoomComposer() {
       disabled={!activeRoom()}
       onSubmitIntercept={intercept}
       onCaretMove={(e) => caret.set(e.pageBounds)}
+      onFocusChange={(f) => fieldFocused.set(f)}
       tools={
         <ToolbarIconButton
           testID="mention"
@@ -294,7 +310,7 @@ function RoomComposer() {
               testID="mention-picker"
               accessibilityLabel={`Mention in #${activeRoom()?.name ?? ""}`}
             >
-              <PopoverNote text={`Mention in #${activeRoom()?.name ?? ""} · members of ${activeSpace()?.name ?? "this Space"} only`} />
+              <PopoverNote text={`Mention in #${activeRoom()?.name ?? ""} · members of ${activeSpace()?.name ?? "this Space"} only · ↑↓ then Return`} />
               <SuggestionList accessibilityLabel="Mention suggestions">
                 <Each of={options()} key={(o) => o.key}>
                   {(o, index) => (

@@ -27,17 +27,24 @@ export function authorKey(e: RoomEvent): string | null {
 type MentionOf = NonNullable<RoomEvent["mentions"]>[number];
 
 /**
- * The audience a message header shows beside its explicit recipients: left
- * out (undefined) only when it would repeat them, that is "to the agent"
- * beside an @agent the sender typed. An agent mention System One or a
- * schedule added, Ask agent without @agent, and every audience that
- * includes people keep their phrase; the recipients themselves always show.
+ * What a message header adds beside its explicit recipients. The recipient
+ * pills (@person, @agent, "agent · detected by System One", "agent ·
+ * scheduled prompt") already say who it is for, so no audience phrase repeats
+ * them. Only what no pill says is shown: `agentBadge` when the agent was
+ * asked without an agent mention (Ask agent), `peopleNote` when people were
+ * addressed but no person is listed (older events without recipients). The
+ * full audience stays in `spoken` for screen readers.
  */
-export function headerAudience(audience: string | undefined, mentions: readonly MentionOf[] | undefined): string | undefined {
-  if (audience !== "agent") return audience;
-  const typedAgent = !!mentions?.some((m) => m.kind === "agent" && !m.addressedBy);
-  const people = !!mentions?.some((m) => m.kind === "user");
-  return typedAgent && !people ? undefined : audience;
+export function headerAudience(
+  audience: string | undefined,
+  mentions: readonly MentionOf[] | undefined,
+): { agentBadge: boolean; peopleNote: boolean; spoken: string | null } {
+  const toAgent = audience === "agent" || audience === "mixed";
+  const toPeople = audience === "users" || audience === "mixed";
+  const agentPill = !!mentions?.some((m) => m.kind === "agent");
+  const personPill = !!mentions?.some((m) => m.kind === "user");
+  const spoken = toAgent && toPeople ? "Addressed to the agent and people" : toAgent ? "Addressed to the agent" : toPeople ? "Addressed to people" : null;
+  return { agentBadge: toAgent && !agentPill, peopleNote: toPeople && !personPill, spoken };
 }
 
 export function transcriptRows(items: readonly TranscriptItem[], events: readonly RoomEvent[], clock: Clock): TranscriptRow[] {

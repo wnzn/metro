@@ -63,7 +63,7 @@ test("a classifier-started, use-case-routed turn: detected label, one row with a
   // Not an "@agent" the sender typed.
   expect(app.shows(`id:recipient:${ask.id}:agent >> text:agent · detected by System One`)).toBe(true);
   expect(app.shows(`id:event:${ask.id} >> text:@agent`)).toBe(false);
-  expect(app.shows(`id:event:${ask.id} >> text:to the agent`)).toBe(true);
+  expect(app.shows(`id:event:${ask.id} >> text:to the agent`)).toBe(false); // the detected pill already says it
 
   // One collapsed row with a compact badge; no sentence, model or connection id in the transcript.
   expect(app.count("id:activity:agent:r1")).toBe(1);

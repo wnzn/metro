@@ -253,8 +253,8 @@ function MessageRow(props: { row: () => Of<"event"> }) {
   const tone = () => toneForEvent(event().kind, event().actor);
   const author = () => authorOf(event(), me());
   const forMe = () => mentionsMe(event().mentions, me());
-  const audience = () => audienceText(headerAudience(event().audience, event().mentions));
-  const hasRecipients = () => !!audience() || (event().mentions?.length ?? 0) > 0;
+  const audience = () => headerAudience(event().audience, event().mentions);
+  const hasRecipients = () => audience().agentBadge || audience().peopleNote || (event().mentions?.length ?? 0) > 0;
   const continued = () => props.row().continued;
   const person = () => {
     const a = author();
@@ -353,7 +353,17 @@ function MessageRow(props: { row: () => Of<"event"> }) {
               {(s) => <Timestamp text={s().short} full={s().full} testID={`time:${event().id}`} />}
             </If>
           </If>
-          <If when={audience()}>{(text) => <HeaderNote text={text()} testID={`audience:${event().id}`} />}</If>
+          <If when={audience().peopleNote}>
+            <HeaderNote text={audienceText("users") ?? ""} testID={`audience:${event().id}`} accessibilityLabel={audience().spoken ?? undefined} />
+          </If>
+          <If when={audience().agentBadge}>
+            <RecipientTag
+              testID={`recipient:${event().id}:ask-agent`}
+              tone="agent"
+              label="to the agent"
+              accessibilityLabel={`${audience().spoken ?? "Addressed to the agent"} (Ask agent)`}
+            />
+          </If>
           <Each of={event().mentions ?? []} key={(m) => (m.kind === "agent" ? "agent" : `user:${m.id}`)}>
             {(m) => (
               <RecipientTag
@@ -495,6 +505,8 @@ export function Composer(props: {
   onSubmitIntercept?: () => boolean;
   /** The caret moved in the field (its box in the window anchors mention suggestions). */
   onCaretMove?: (e: CaretEvent) => void;
+  /** The field took or lost the keyboard focus. */
+  onFocusChange?: (focused: boolean) => void;
 }) {
   const focused = signal(false);
   const canSend = () => !props.disabled && status().phase !== "signedOut" && draft().trim().length > 0 && !sending();
@@ -514,7 +526,10 @@ export function Composer(props: {
           value={draft()}
           onChange={setDraft}
           onSubmit={submit}
-          onFocusChange={(f) => focused.set(f)}
+          onFocusChange={(f) => {
+            focused.set(f);
+            props.onFocusChange?.(f);
+          }}
           onCaretMove={props.onCaretMove}
           placeholder={props.placeholder}
           disabled={props.disabled}
