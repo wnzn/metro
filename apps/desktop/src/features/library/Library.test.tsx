@@ -339,7 +339,9 @@ test("file search: chips filter, Return runs it, results carry no raw scores, on
   expect(app.shows("id:library-viewer-player:toggle")).toBe(true);
   expect(app.enabled("id:library-viewer-player:timeline")).toBe(false);
   expect(app.shows("id:library-viewer-player:match")).toBe(false);
-  expect(text(app)).toContain("–:––");
+  // The match is asked of the player at load, but no position is shown until the player itself reports one.
+  expect(app.shows("id:library-viewer-player:position")).toBe(true);
+  expect(app.texts().filter((t) => t === "–:––").length).toBe(2); // position and length both unknown
   expect(app.shows("id:library-play-match")).toBe(true);
   expect(text(app)).toContain("Play from 1:01");
   expect(app.shows("id:library-play-toggle")).toBe(false);

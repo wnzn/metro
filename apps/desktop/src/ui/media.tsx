@@ -99,11 +99,14 @@ function clockOf(seconds: number): string {
  * can drag or step with the arrow keys, and the length. The sound plays
  * through the platform's player (the documented `Video` element, which plays
  * audio files too), kept out of sight. Every time it shows comes from that
- * player: the length once it loaded, the position from its progress events
- * or the user's own seek. Before it loaded the timeline is disabled and
- * shows no position. The match (`matchStart`..`matchEnd`, seconds) is drawn
- * under the timeline only once the length is known, so it is never placed on
- * a guessed scale.
+ * player: the length from its load event, the position only from its
+ * progress events. A seek (the jump to the match, a drag of the timeline) is
+ * asked of the player but never shown as done until the player reports where
+ * it is; while dragging, the thumb previews the value under the pointer and
+ * then returns to the reported position. Until the first report the position
+ * reads "–:––". The match (`matchStart`..`matchEnd`, seconds) is drawn under
+ * the timeline once the length is known, whether or not playback was
+ * confirmed, and never on a guessed scale. A new `src` starts over.
  */
 export function CompactAudioPlayer(
   props: Testable & {
@@ -129,16 +132,32 @@ export function CompactAudioPlayer(
   const duration = signal(0);
   const position = signal<number | null>(null);
   const dragging = signal<number | null>(null);
+  /** A finite length in seconds, else 0 (unknown). */
+  const lengthOf = (d: unknown) => (typeof d === "number" && Number.isFinite(d) && d > 0 ? d : 0);
+  /** `seconds` held to 0..length, or null when it isn't a finite number. */
+  const within = (seconds: unknown, length: number): number | null =>
+    typeof seconds === "number" && Number.isFinite(seconds) ? Math.min(Math.max(seconds, 0), length > 0 ? length : Math.max(seconds, 0)) : null;
+  /** Asks the player to move; the position changes only when the player reports it. */
   const seekTo = (seconds: number) => {
-    if (!video) return;
-    video.seek(seconds);
-    position.set(seconds);
+    const target = within(seconds, untracked(duration));
+    if (!video || target === null) return;
+    video.seek(target);
   };
+  // A new source: nothing of the previous one's length or position remains.
+  effect(() => {
+    props.src;
+    untracked(() => {
+      loaded.set(false);
+      duration.set(0);
+      position.set(null);
+      dragging.set(null);
+    });
+  });
   effect(() => {
     props.seekToken;
     if (untracked(loaded) && props.startSeconds > 0) seekTo(props.startSeconds);
   });
-  const known = () => loaded() && duration() > 0 && Number.isFinite(duration());
+  const known = () => loaded() && duration() > 0;
   const shown = () => dragging() ?? position();
   const band = () => {
     if (!known() || props.matchStart == null) return null;
@@ -158,17 +177,19 @@ export function CompactAudioPlayer(
         class="absolute h-px w-px opacity-0"
         accessibilityElementsHidden
         onLoad={(e: { duration: number }) => {
-          const d = e?.duration ?? 0;
+          const d = lengthOf(e?.duration);
           loaded.set(true);
           duration.set(d);
-          position.set(0);
           if (props.startSeconds > 0) seekTo(props.startSeconds);
           props.onLoaded?.(d);
         }}
         onProgress={(e: { currentTime: number; duration: number }) => {
-          position.set(e.currentTime);
-          if (e.duration > 0 && Number.isFinite(e.duration)) duration.set(e.duration);
-          props.onTime?.(e.currentTime, e.duration);
+          const d = lengthOf(e?.duration) || untracked(duration);
+          const at = within(e?.currentTime, d);
+          if (at === null) return;
+          if (d !== untracked(duration)) duration.set(d);
+          position.set(at);
+          props.onTime?.(at, d);
         }}
         onError={(e: { message?: string }) => props.onError?.(e?.message ?? "This file can't be played here.")}
         onEnd={() => props.onEnd?.()}
@@ -182,7 +203,7 @@ export function CompactAudioPlayer(
         >
           <MediaGlyphIcon name={props.playing ? "pause" : "play"} tone="primary-foreground" />
         </Button>
-        <Text class="min-w-[40px] text-(length:--text-xs) font-mono text-muted-foreground" testID={props.testID ? `${props.testID}:position` : undefined}>
+        <Text class="min-w-[40px] text-(length:--text-xs) tabular-nums text-muted-foreground" testID={props.testID ? `${props.testID}:position` : undefined}>
           {known() && shown() !== null ? clockOf(shown()!) : "–:––"}
         </Text>
         <View class="flex-1 min-w-0 flex-col gap-[2px]">
@@ -198,11 +219,11 @@ export function CompactAudioPlayer(
             indicatorClass="h-[4px] rounded-full bg-muted"
             rangeClass="rounded-full bg-primary"
             thumbClass="size-[12px] rounded-full bg-primary-foreground border border-primary focus-visible:ring-2 focus-visible:ring-ring"
-            onChange={(e) => dragging.set(typeof e.value === "number" ? e.value : e.value[0])}
+            onChange={(e) => dragging.set(within(typeof e.value === "number" ? e.value : e.value[0], duration()))}
             onChangeEnd={(e) => {
               const v = typeof e.value === "number" ? e.value : e.value[0];
               dragging.set(null);
-              seekTo(v);
+              if (typeof v === "number") seekTo(v);
             }}
             testID={props.testID ? `${props.testID}:timeline` : undefined}
           />
@@ -216,7 +237,7 @@ export function CompactAudioPlayer(
             )}
           </If>
         </View>
-        <Text class="min-w-[40px] text-(length:--text-xs) font-mono text-muted-foreground" testID={props.testID ? `${props.testID}:duration` : undefined}>
+        <Text class="min-w-[40px] text-(length:--text-xs) tabular-nums text-muted-foreground" testID={props.testID ? `${props.testID}:duration` : undefined}>
           {known() ? clockOf(duration()) : "–:––"}
         </Text>
       </View>
