@@ -216,7 +216,7 @@ export function AccountMenu(props: {
       backdropClass="bg-black/40"
       trigger={
         <View
-          class={cx("flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-(--space-2) hover:bg-sidebar-accent/60 active:bg-sidebar-accent", transitionClass, focusRing)}
+          class={cx("flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-(--space-2) hover:bg-sidebar-hover active:bg-sidebar-hover", transitionClass, focusRing)}
           focusable
           testID={props.testID}
           accessibilityLabel={props.accessibilityLabel}
@@ -332,10 +332,12 @@ export function ModalTab(props: { label: string; icon: IconName; selected: boole
   return (
     <Button
       class={cx(
-        "flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-[7px] hover:bg-sidebar-accent/60 active:bg-sidebar-accent",
+        "flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-[7px]",
+        transitionClass,
         focusRing,
-        props.compact && "px-(--space-3)",
-        props.selected && "bg-sidebar-accent",
+        // 40px rows in the side nav; the compact row of tabs keeps its own height.
+        props.compact ? "px-(--space-3)" : "min-h-[40px]",
+        props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-hover active:bg-sidebar-hover",
       )}
       role="tab"
       selected={props.selected}
@@ -545,7 +547,7 @@ export function SearchBox(
   return (
     <View
       class={cx(
-        "flex-row items-center gap-(--space-2) w-full max-w-[560px] min-w-0 rounded-full border bg-card pl-(--space-3) pr-[6px] shadow-sm focus-within:border-ring focus-within:bg-background",
+        "flex-row items-center gap-(--space-2) w-full max-w-[560px] min-w-0 rounded-full border bg-popover pl-(--space-3) pr-[6px] focus-within:border-ring focus-within:bg-background",
         controlEdgeClass,
         controlHeightClass.default,
         transitionClass,
@@ -568,7 +570,7 @@ export function SearchBox(
       {props.trailing}
       <If when={hint}>
         <View class="rounded-[5px] border border-border bg-muted px-[6px] py-px" accessibilityElementsHidden testID={props.testID ? `${props.testID}-shortcut` : undefined}>
-          <Text class="text-[10px] font-medium text-muted-foreground">{hint}</Text>
+          <Text class={cx(textClass.xs, "font-medium text-muted-foreground")}>{hint}</Text>
         </View>
       </If>
     </View>
