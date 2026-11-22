@@ -20,7 +20,7 @@ import {
   runnersError,
 } from "../settings";
 import type { RegisteredRunner, RunnerVisibility } from "../settings";
-import { Action, ActionBar, Badge, Banner, Column, compactWidth, Field, PageHeader, PageLayout, Row, SegmentedControl, SettingRow, SettingsGroup } from "../ui";
+import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field, LearnMore, PageHeader, PageLayout, Row, SegmentedControl, SettingRow, SettingsGroup } from "../ui";
 import { TokenReveal } from "./TokenReveal";
 
 export function RunnersSettings() {
@@ -32,10 +32,17 @@ export function RunnersSettings() {
         when={token()}
         else={
           <Column gap={6}>
-            <PageHeader
-              title="Runners"
-              subtitle="A runner runs workspace tools for Spaces. Register one, start it, then attach it to Spaces you own. One runner can serve several Spaces, each in its own folder; each Space uses at most one runner."
-            />
+            <Column gap={2}>
+              <PageHeader title="Runners" subtitle="A runner runs workspace tools for the Spaces you attach it to." />
+              <LearnMore testID="runners-learn-more">
+                <FactList
+                  facts={[
+                    { label: "Setup", value: "Register one, start it, then attach it to Spaces you own." },
+                    { label: "Spaces", value: "One runner can serve several Spaces, each in its own folder. Each Space uses at most one runner." },
+                  ]}
+                />
+              </LearnMore>
+            </Column>
             <AddRunner />
             <RunnerList />
           </Column>

@@ -62,6 +62,16 @@ test("Model routing is off by default and says nothing is sent", async () => {
   expect(text(app)).toContain("Off: your unaddressed messages are ordinary conversation and are sent to no model.");
   expect(text(app)).toContain("Messages that mention only people, and other members' messages for routing or classification.");
   expect(app.enabled("id:routing-save")).toBe(false); // nothing changed
+  // Section headers are one sentence; the rest is under Learn more, closed until asked.
+  expect(app.shows("text:Off by default.")).toBe(true); // the opt-in's default stays visible
+  expect(app.shows("text:While this is on, System One judges only messages you write that mention nobody.")).toBe(true);
+  expect(app.shows("text:A model you pick for one turn overrides it.")).toBe(false);
+  await app.press("id:routing-learn-more:toggle");
+  await app.waitFor("text:A model you pick for one turn overrides it.");
+  await app.press("id:addressing-learn-more:toggle");
+  await app.waitFor("text:A message that mentions a person only (@bob) never starts the agent and is never classified.");
+  await app.press("id:classifier-learn-more:toggle");
+  await app.waitFor("text:Typed questions: Noul, choice and score.");
   expect(f.posts().some((p) => p.path === "/v1/model-routing")).toBe(false);
 });
 
@@ -213,6 +223,8 @@ test("each capability has its own default; a System One connection never becomes
   await settings(app, "providers");
   await app.waitFor(`id:connection:${chat.id}`);
   expect(app.shows(`id:connection-default:${chat.id} >> text:Default chat`)).toBe(true);
+  await app.press("id:providers-learn-more:toggle");
+  await app.waitFor("text:Each connection serves one: chat, System One or embeddings. Each capability has its own default.");
   const s1b = f.addConnection("alice", "device-systemone", "Laptop System One", "jev-latest");
   await app.press("id:settings-close");
   await settings(app, "providers");

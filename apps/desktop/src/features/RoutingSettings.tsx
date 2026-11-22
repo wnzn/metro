@@ -29,11 +29,12 @@ import {
   routingUnsupported,
   saveRouting,
 } from "../routing";
+import type { JSX } from "nsh";
 import type { AvailableModel, DraftCase, RoutingDraft } from "../routing";
 import { providerById } from "../settings";
 import type { Capability } from "../settings";
 import { openSettings } from "../store";
-import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field, Label, PageHeader, PageLayout, PercentField, Picker, Row, SettingRow, SettingsGroup, Toggle } from "../ui";
+import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field, Label, LearnMore, PageHeader, PageLayout, PercentField, Picker, Row, SettingRow, SettingsGroup, Toggle } from "../ui";
 import type { Fact, PickerItem } from "../ui";
 
 const NONE = "";
@@ -89,7 +90,7 @@ export function RoutingSettings() {
     >
       <PageHeader
         title="Model routing"
-        subtitle="Which model answers which kind of request, and whether System One may start the agent without @agent. Both are off until you turn them on, and apply only to messages you write."
+        subtitle="Use-case routing and starting the agent without @agent are off until you turn them on, and apply only to messages you write."
       />
       <If when={!routingUnsupported()} else={<Unsupported />}>
         <If when={draft()} else={<Label variant="caption" color="muted">{routingError() ? "" : "Loading your model routing…"}</Label>}>
@@ -220,13 +221,25 @@ function NoneOf(props: { capability: Capability; what: string; testID: string })
 
 // ------------------------------------------------------------------ groups
 
+/** A section's Learn more, as the first row of its card. */
+function SectionMore(props: { testID: string; children?: JSX.Element }) {
+  return (
+    <Column padX={4} padY={2}>
+      <LearnMore testID={props.testID}>{props.children}</LearnMore>
+    </Column>
+  );
+}
+
 function ClassifierGroup(props: { draft: RoutingDraft }) {
   return (
     <SettingsGroup
       title="System One classifier"
-      description="System One answers typed questions (Noul, choice, score). Use-case routing and the opt-in below use it, and search reranks with it. A chat model never stands in for it."
+      description="Routing, the opt-in below and search use this System One connection; a chat model never stands in for it."
       testID="routing-classifier-group"
     >
+      <SectionMore testID="classifier-learn-more">
+        <FactList facts={[{ label: "Answers", value: "Typed questions: Noul, choice and score." }, { label: "Used by", value: "Use-case routing, the opt-in below, and search, which reranks with it." }]} />
+      </SectionMore>
       <SettingRow label="Classifier" description="Only System One connections are offered." stacked>
         <ModelPicker
           testID="routing-classifier"
@@ -247,9 +260,18 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
   return (
     <SettingsGroup
       title="Use-case routing"
-      description="When agent work starts for you (@agent, Ask agent, or a start the opt-in below allowed), System One picks which use case the message is, and that use case's model answers. A model you pick for one turn overrides it. With routing off, your default chat connection answers."
+      description="When agent work starts for you, System One picks the use case and that use case's model answers."
       testID="routing-group"
     >
+      <SectionMore testID="routing-learn-more">
+        <FactList
+          facts={[
+            { label: "Starts on", value: "@agent, Ask agent, or a start the opt-in below allowed." },
+            { label: "Override", value: "A model you pick for one turn overrides it." },
+            { label: "When off", value: "Your default chat connection answers." },
+          ]}
+        />
+      </SectionMore>
       <SettingRow label="Route by use case" description="Off by default.">
         <Toggle testID="routing-enabled" label="Route by use case" checked={d().enabled} onChange={(on) => editRouting({ enabled: on })} />
       </SettingRow>
@@ -319,7 +341,7 @@ function CaseRow(props: { item: DraftCase; index: number }) {
             placeholder="Choose a chat model"
             searchable
           />
-          <Action testID={`case-remove:${n()}`} label="Remove" accessibilityLabel={`Remove use case ${n() + 1}`} variant="ghost" onPress={() => removeCase(c().uid)} />
+          <Action testID={`case-remove:${n()}`} label="Remove" accessibilityLabel={`Remove use case ${n() + 1}`} variant="destructive" edgeAligned onPress={() => removeCase(c().uid)} />
         </Row>
         <Missing id={c().connectionId} testID={`case-missing:${n()}`} />
       </Column>
@@ -332,9 +354,18 @@ function AddressingGroup(props: { draft: RoutingDraft }) {
   return (
     <SettingsGroup
       title="Start the agent without @agent (opt in)"
-      description="Explicit recipients always decide. A message that mentions a person only (@bob) never starts the agent and is never classified. @agent and Ask agent start it with no classification. Only messages you write that mention nobody are judged, and only while this is on."
+      description="While this is on, System One judges only messages you write that mention nobody."
       testID="addressing-group"
     >
+      <SectionMore testID="addressing-learn-more">
+        <FactList
+          facts={[
+            { label: "Recipients", value: "Explicit recipients always decide." },
+            { label: "@person only", value: "A message that mentions a person only (@bob) never starts the agent and is never classified." },
+            { label: "@agent", value: "@agent and Ask agent start it with no classification." },
+          ]}
+        />
+      </SectionMore>
       <SettingRow label="Classify my unaddressed messages" description="Off by default. In rooms and in your Chat. A start it allows runs as you, with your connections.">
         <Toggle testID="routing-infer" label="Classify my unaddressed messages" checked={d().inferAddressing} onChange={(on) => editRouting({ inferAddressing: on })} />
       </SettingRow>

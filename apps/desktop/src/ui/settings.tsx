@@ -1,10 +1,13 @@
-// Settings form primitives: a percentage field and short fact rows. Feature
+// Settings form primitives: a percentage field, short fact rows, and a
+// "Learn more" disclosure for the explanation behind a one-sentence header. Feature
 // code passes only semantic props; the styling lives here, like
 // ./primitives.tsx.
 
-import { Text, View } from "nsh";
+import { signal, Text, View } from "nsh";
+import type { JSX } from "nsh";
 import { Input } from "nsh/base";
 import { compactWidth } from "./chrome";
+import { Disclosure } from "./primitives";
 import { cx } from "./tokens";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
@@ -79,5 +82,19 @@ export function FactList(props: Testable & { facts: readonly Fact[] }) {
         )}
       </Each>
     </View>
+  );
+}
+
+/**
+ * The longer explanation of a page or section, closed under its one-sentence
+ * header. Only for background: never put a consent, a cost, an off-by-default
+ * or who-sees-what fact only in here. Its toggle's testID is `${testID}:toggle`.
+ */
+export function LearnMore(props: { testID: string; children?: JSX.Element }) {
+  const open = signal(false);
+  return (
+    <Disclosure testID={props.testID} title="Learn more" open={open()} onToggle={open.set}>
+      {props.children}
+    </Disclosure>
   );
 }

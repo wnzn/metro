@@ -57,7 +57,7 @@ import {
 } from "../settings";
 import type { Capability, CatalogProvider, ProviderConnection } from "../settings";
 import { onSessionEnd, spaces } from "../store";
-import { Action, ActionBar, Badge, Banner, BrandMark, BrandPicker, Chip, Column, compactWidth, Field, Label, PageHeader, PageLayout, Row, SegmentedControl, SettingRow, SettingsGroup } from "../ui";
+import { Action, ActionBar, Badge, Banner, BrandMark, BrandPicker, Chip, Column, compactWidth, FactList, Field, Label, LearnMore, PageHeader, PageLayout, Row, SegmentedControl, SettingRow, SettingsGroup } from "../ui";
 import type { BrandItem } from "../ui";
 import { MediaModelSettings } from "./library/LibraryView";
 import { CAPABILITY_TONE, describePath, groupCatalog, vendorOf, wayLabel } from "./providerGroups";
@@ -117,10 +117,17 @@ export function ProvidersSettings() {
         when={device()}
         else={
           <Column gap={6}>
-            <PageHeader
-              title="Model providers"
-              subtitle="Each connection serves one capability, and each capability has its own default. Your runs, and the threads they start, use your default chat connection unless Model routing picks another. Connections are private unless you share one."
-            />
+            <Column gap={2}>
+              <PageHeader title="Model providers" subtitle="Your model connections, private unless you share one." />
+              <LearnMore testID="providers-learn-more">
+                <FactList
+                  facts={[
+                    { label: "Capability", value: "Each connection serves one: chat, System One or embeddings. Each capability has its own default." },
+                    { label: "Your runs", value: "Your runs, and the threads they start, use your default chat connection unless Model routing picks another." },
+                  ]}
+                />
+              </LearnMore>
+            </Column>
             <ConnectionList />
             {/* Documents & media's own form and Save (./library). Mounting it only loads the choice: nothing is indexed or sent. */}
             <MediaModelSettings />
