@@ -18,6 +18,7 @@ import {
   MAX_LABEL,
   MIN_DIRECTEDNESS_FLOOR,
   modelsFor,
+  parseProbability,
   removeCase,
   revertRouting,
   routing,
@@ -32,71 +33,99 @@ import type { AvailableModel, DraftCase, RoutingDraft } from "../routing";
 import { providerById } from "../settings";
 import type { Capability } from "../settings";
 import { openSettings } from "../store";
-import { Action, Badge, Banner, Column, Field, Label, PageHeader, Picker, Row, ScrollArea, SettingRow, SettingsGroup, Surface, Toggle } from "../ui";
-import type { PickerItem } from "../ui";
+import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field, Label, PageHeader, PageLayout, PercentField, Picker, Row, SettingRow, SettingsGroup, Toggle } from "../ui";
+import type { Fact, PickerItem } from "../ui";
 
 const NONE = "";
 
+// ------------------------------------------------------------------ percentages
+
+/** The "asking the agent" floor as a percentage (50). */
+const FLOOR_PERCENT = Math.round(MIN_DIRECTEDNESS_FLOOR * 100);
+
+/**
+ * What a confidence field shows for the draft's value, as a whole
+ * percentage: a stored 0.65 shows as "65", a typed "65%" as "65". Anything
+ * else shows as it was typed, so the field never rewrites the person's input.
+ */
+export function percentText(value: string): string {
+  const t = value.trim();
+  if (t.endsWith("%")) return t.slice(0, -1).trim();
+  const n = parseProbability(t);
+  return n === null ? t : String(Math.round(n * 100));
+}
+
+/** What the draft keeps for a typed percentage: "65" becomes "65%", which src/routing.ts reads as 0.65. */
+export function fromPercent(typed: string): string {
+  const t = typed.replace(/%/g, "").trim();
+  return t ? `${t}%` : "";
+}
+
+/** Why a typed percentage can't be saved, or null: a whole number from `min` to 100. */
+export function percentError(typed: string, min: number): string | null {
+  const t = typed.trim();
+  return /^[0-9]{1,3}$/.test(t) && Number(t) >= min && Number(t) <= 100 ? null : `Enter a whole number from ${min} to 100.`;
+}
+
+/** Both confidence fields hold whole percentages in range. */
+function percentsValid(d: RoutingDraft): boolean {
+  return percentError(percentText(d.minRouteProbability), 0) === null && percentError(percentText(d.minDirectedness), FLOOR_PERCENT) === null;
+}
+
 export function RoutingSettings() {
   return (
-    <ScrollArea pad={6} testID="routing-settings">
-      <Surface variant="content" gap={6}>
-        <PageHeader
-          title="Model routing"
-          subtitle="Choose which model answers which kind of request, and whether System One may start the agent for you without @agent. Both are off until you turn them on, and they only ever apply to messages you write."
-        />
-        <Messages />
-        <If when={!routingUnsupported()} else={<Unsupported />}>
-          <If when={draft()} else={<Label variant="caption" color="muted">{routingError() ? "" : "Loading your model routing…"}</Label>}>
-            {(d) => (
-              <Column gap={6}>
-                <ClassifierGroup draft={d()} />
-                <RoutingGroup draft={d()} />
-                <AddressingGroup draft={d()} />
-                <SearchGroup draft={d()} />
-                <DataFlow draft={d()} />
-                <SaveBar />
-              </Column>
-            )}
+    <PageLayout
+      testID="routing-settings"
+      pad={compactWidth() ? 4 : 6}
+      gap={6}
+      footer={
+        <Column gap={2}>
+          <Messages />
+          <If when={!routingUnsupported() && draft()}>
+            <SaveBar />
           </If>
+        </Column>
+      }
+    >
+      <PageHeader
+        title="Model routing"
+        subtitle="Which model answers which kind of request, and whether System One may start the agent without @agent. Both are off until you turn them on, and apply only to messages you write."
+      />
+      <If when={!routingUnsupported()} else={<Unsupported />}>
+        <If when={draft()} else={<Label variant="caption" color="muted">{routingError() ? "" : "Loading your model routing…"}</Label>}>
+          {(d) => (
+            <Column gap={6}>
+              <ClassifierGroup draft={d()} />
+              <RoutingGroup draft={d()} />
+              <AddressingGroup draft={d()} />
+              <SearchGroup draft={d()} />
+              <DataFlow draft={d()} />
+            </Column>
+          )}
         </If>
-      </Surface>
-    </ScrollArea>
+      </If>
+    </PageLayout>
   );
 }
 
 function Unsupported() {
   return (
-    <Banner tone="warning" testID="routing-unsupported">
-      <Label color="warning">This server doesn't offer model routing. Runs you start use your default chat connection.</Label>
-    </Banner>
+    <Banner
+      variant="inline"
+      tone="warning"
+      testID="routing-unsupported"
+      message="This server doesn't offer model routing. Runs you start use your default chat connection."
+    />
   );
 }
 
+/** Errors and what the last save did, in the fixed footer beside Save so they're seen. */
 function Messages() {
   return (
     <Column gap={2}>
-      <If when={availableError()}>
-        {(message) => (
-          <Banner tone="danger" testID="available-error">
-            <Label color="danger">{message()}</Label>
-          </Banner>
-        )}
-      </If>
-      <If when={routingError()}>
-        {(message) => (
-          <Banner tone="danger" testID="routing-error">
-            <Label color="danger">{message()}</Label>
-          </Banner>
-        )}
-      </If>
-      <If when={routingNotice()}>
-        {(message) => (
-          <Label variant="caption" color="muted" testID="routing-notice">
-            {message()}
-          </Label>
-        )}
-      </If>
+      <If when={availableError()}>{(message) => <Banner variant="inline" tone="danger" testID="available-error" message={message()} />}</If>
+      <If when={routingError()}>{(message) => <Banner variant="inline" tone="danger" testID="routing-error" message={message()} />}</If>
+      <If when={routingNotice()}>{(message) => <Banner variant="inline" tone="success" testID="routing-notice" message={message()} />}</If>
     </Column>
   );
 }
@@ -109,11 +138,20 @@ const GROUP: Record<AvailableModel["visibility"], string> = {
   organization: "Shared with the organization",
 };
 
+/** An option's first line: the connection and its model. */
 function modelLabel(m: AvailableModel): string {
+  return `${m.name} · ${m.model ?? "no model chosen yet"}`;
+}
+
+/**
+ * An option's second line: its provider, whose it is, and why it can't be
+ * picked yet. Never a base URL, key or sign-in: a borrowed model's owner keeps those.
+ */
+function modelDetail(m: AvailableModel): string {
   const provider = providerById(m.providerId)?.name ?? m.providerId;
-  const whose = m.owned ? "" : m.runsOn === "your_own_sign_in" ? `, preset from ${m.ownerId ?? "someone"}` : `, shared by ${m.ownerId ?? "someone"}`;
-  const notReady = m.ready === false ? " · sign in with your own account first" : "";
-  return `${m.name} · ${m.model ?? "no model chosen yet"} (${provider}${whose})${notReady}`;
+  const whose = m.owned ? "Yours" : m.runsOn === "your_own_sign_in" ? `Preset from ${m.ownerId ?? "someone"}` : `Shared by ${m.ownerId ?? "someone"}`;
+  const notReady = m.ready === false ? " · Sign in with your own account first" : "";
+  return `${provider} · ${whose}${notReady}`;
 }
 
 /**
@@ -125,6 +163,7 @@ function itemsFor(capability: Capability, first?: PickerItem): PickerItem[] {
   const items: PickerItem[] = models.map((m) => ({
     value: m.connectionId,
     label: modelLabel(m),
+    detail: modelDetail(m),
     disabled: !m.model || m.ready === false,
     group: m.owned ? GROUP.personal : GROUP[m.visibility === "personal" ? "spaces" : m.visibility],
   }));
@@ -214,14 +253,14 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
       <SettingRow label="Route by use case" description="Off by default.">
         <Toggle testID="routing-enabled" label="Route by use case" checked={d().enabled} onChange={(on) => editRouting({ enabled: on })} />
       </SettingRow>
-      <SettingRow label="Minimum confidence" description="Route only when System One is at least this sure of the use case (0 to 1). Below it, the fallback model answers." stacked>
-        <Field
+      <SettingRow label="Minimum confidence" description="Route only when System One is at least this sure of the use case, 0 to 100%. Below it, the fallback model answers." stacked>
+        <PercentField
           testID="routing-min-route"
           accessibilityLabel="Minimum confidence to route"
-          value={d().minRouteProbability}
-          onChange={(v) => editRouting({ minRouteProbability: v })}
-          placeholder="0.65"
-          maxLength={6}
+          value={percentText(d().minRouteProbability)}
+          onChange={(v) => editRouting({ minRouteProbability: fromPercent(v) })}
+          error={percentError(percentText(d().minRouteProbability), 0)}
+          placeholder="65"
         />
       </SettingRow>
       <SettingRow label="Fallback answer model" description="Used when System One returns no match or a score below your threshold. If the classifier fails, no answering model is called." stacked>
@@ -299,14 +338,18 @@ function AddressingGroup(props: { draft: RoutingDraft }) {
       <SettingRow label="Classify my unaddressed messages" description="Off by default. In rooms and in your Chat. A start it allows runs as you, with your connections.">
         <Toggle testID="routing-infer" label="Classify my unaddressed messages" checked={d().inferAddressing} onChange={(on) => editRouting({ inferAddressing: on })} />
       </SettingRow>
-      <SettingRow label="Minimum confidence" description={`Start the agent only when System One is at least this sure the message asks it (${MIN_DIRECTEDNESS_FLOOR} to 1). Below it, the message stays ordinary conversation.`} stacked>
-        <Field
+      <SettingRow
+        label="Minimum confidence"
+        description={`Start the agent only when System One is at least this sure the message asks it, ${FLOOR_PERCENT} to 100%. Below it, the message stays ordinary conversation.`}
+        stacked
+      >
+        <PercentField
           testID="routing-min-directed"
           accessibilityLabel="Minimum confidence that a message asks the agent"
-          value={d().minDirectedness}
-          onChange={(v) => editRouting({ minDirectedness: v })}
-          placeholder="0.85"
-          maxLength={6}
+          value={percentText(d().minDirectedness)}
+          onChange={(v) => editRouting({ minDirectedness: fromPercent(v) })}
+          error={percentError(percentText(d().minDirectedness), FLOOR_PERCENT)}
+          placeholder="85"
         />
       </SettingRow>
     </SettingsGroup>
@@ -333,22 +376,47 @@ function SearchGroup(props: { draft: RoutingDraft }) {
 
 // ------------------------------------------------------------------ where text goes
 
-/** Who receives text sent to `m`, in words: the server, the user's own device, or someone else's. */
-export function endpointText(m: AvailableModel | null): string {
-  if (!m) return "nobody (none chosen)";
+/**
+ * Who receives text sent to `m`, as short rows: which connection gets it,
+ * where it runs, and who else can see it or pays. Nothing is dropped: a
+ * shared model always says its owner can see the requests (and may pay).
+ */
+export function endpointFacts(m: AvailableModel | null, to = "To"): Fact[] {
+  if (!m) return [{ label: to, value: "Nobody (none chosen)" }];
   const name = providerById(m.providerId)?.name ?? m.providerId;
-  const device = m.execution === "device";
   const owner = m.ownerId ?? "its owner";
+  const facts: Fact[] = [{ label: to, value: `“${m.name}” (${name})` }];
   if (m.runsOn === "your_own_sign_in") {
-    return `“${m.name}”, a preset ${owner} shared, which runs on your own sign-in (${name}). ${owner} sees none of it`;
+    facts.push({ label: "Runs on", value: `Your own sign-in. ${owner} shared only the preset` }, { label: "Who sees it", value: `Not ${owner}: they see none of it` });
+    return facts;
   }
+  const device = m.execution === "device";
   if (m.owned || m.runsOn === "your_connection") {
-    return device ? `“${m.name}”, which runs in your own metro-connector (${name})` : `“${m.name}” (${name}), which the Metro server calls with your settings`;
+    facts.push({ label: "Runs on", value: device ? "Your own metro-connector" : "The Metro server calls it with your settings" });
+    return facts;
   }
-  const pays = m.billing === "owner" ? ` and ${owner} may pay for them` : "";
-  return device
-    ? `“${m.name}”, shared by ${owner}, which runs on ${owner}'s computer (${name}). ${owner} can see these requests${pays}`
-    : `“${m.name}” (${name}), shared by ${owner}. ${owner} can see the requests sent through it${pays}`;
+  facts.push(
+    { label: "Runs on", value: device ? `${owner}'s computer, shared by ${owner}` : `${owner}'s connection, shared by ${owner}` },
+    { label: "Who sees it", value: `${owner} can see these requests` },
+  );
+  if (m.billing === "owner") facts.push({ label: "Who pays", value: `${owner} may pay for them` });
+  return facts;
+}
+
+/** One flow of text: whether it's on, and when it is, what goes where. */
+function FlowRow(props: { label: string; on: boolean; off: string; facts: Fact[]; testID: string }) {
+  return (
+    <SettingRow label={props.label} description={props.on ? undefined : props.off} stacked testID={props.testID}>
+      <Column gap={2}>
+        <Row>
+          <Badge tone={props.on ? "agent" : "neutral"} label={props.on ? "On" : "Off"} />
+        </Row>
+        <If when={props.on}>
+          <FactList facts={props.facts} testID={`${props.testID}-facts`} />
+        </If>
+      </Column>
+    </SettingRow>
+  );
 }
 
 function DataFlow(props: { draft: RoutingDraft }) {
@@ -357,39 +425,38 @@ function DataFlow(props: { draft: RoutingDraft }) {
   const embedding = () => findAvailable(d().embeddingId);
   return (
     <SettingsGroup title="Where your text goes" description="From what is chosen above. Nothing here is sent until you save." testID="routing-dataflow">
-      <SettingRow
+      <FlowRow
         label="Use-case routing"
-        description={
-          d().enabled
-            ? `When agent work starts for you, that message's text and your use-case names and descriptions go to ${endpointText(classifier())}. The model it picks then answers as usual.`
-            : "Off: nothing is sent to pick a model. Your default chat connection answers."
-        }
+        on={d().enabled}
+        off="Off: nothing is sent to pick a model. Your default chat connection answers."
         testID="dataflow-routing"
-      >
-        <Badge tone={d().enabled ? "agent" : "neutral"} label={d().enabled ? "On" : "Off"} />
-      </SettingRow>
-      <SettingRow
+        facts={[
+          { label: "When", value: "Agent work starts for you" },
+          { label: "Sends", value: "That message's text, and your use-case names and descriptions" },
+          ...endpointFacts(classifier()),
+          { label: "Then", value: "The model it picks answers as usual" },
+        ]}
+      />
+      <FlowRow
         label="Unaddressed messages"
-        description={
-          d().inferAddressing
-            ? `Each message you write that mentions nobody and isn't sent with Ask agent goes to ${endpointText(classifier())}.`
-            : "Off: your unaddressed messages are ordinary conversation and are sent to no model."
-        }
+        on={d().inferAddressing}
+        off="Off: your unaddressed messages are ordinary conversation and are sent to no model."
         testID="dataflow-addressing"
-      >
-        <Badge tone={d().inferAddressing ? "agent" : "neutral"} label={d().inferAddressing ? "On" : "Off"} />
-      </SettingRow>
-      <SettingRow
+        facts={[{ label: "Sends", value: "Each message you write that mentions nobody and isn't sent with Ask agent" }, ...endpointFacts(classifier())]}
+      />
+      <FlowRow
         label="Search"
-        description={
-          d().embeddingId
-            ? `To index and search, your queries and the text of messages you can read (your Chat, and the rooms and threads of Spaces you're in now, other members' messages there included) go to ${endpointText(embedding())}.${d().classifierId ? ` Each query and its top results (at most 10) also go to ${endpointText(classifier())} to rerank them.` : " Results keep their embedding order: no classifier reranks them."}`
-            : "Off: no embeddings model is chosen, so nothing is indexed."
-        }
+        on={!!d().embeddingId}
+        off="Off: no embeddings model is chosen, so nothing is indexed."
         testID="dataflow-search"
-      >
-        <Badge tone={d().embeddingId ? "agent" : "neutral"} label={d().embeddingId ? "On" : "Off"} />
-      </SettingRow>
+        facts={[
+          { label: "Sends", value: "Your queries, and the text of messages you can read: your Chat, and the rooms and threads of Spaces you're in now, other members' messages there included" },
+          ...endpointFacts(embedding()),
+          ...(d().classifierId
+            ? [{ label: "Reranks", value: "Each query and its top results (at most 10) also go to the classifier" }, ...endpointFacts(classifier(), "Classifier")]
+            : [{ label: "Reranks", value: "No: results keep their embedding order" }]),
+        ]}
+      />
       <SettingRow
         label="Never sent"
         description="Messages that mention only people, and other members' messages for routing or classification. Your settings apply to messages you write, and never to anyone else's."
@@ -400,10 +467,40 @@ function DataFlow(props: { draft: RoutingDraft }) {
 }
 
 function SaveBar() {
+  const invalid = () => {
+    const d = draft();
+    return !!d && !percentsValid(d);
+  };
   return (
-    <Row gap={2} justify="end" wrap>
-      <Action testID="routing-revert" label="Revert" variant="ghost" disabled={!routing() || !routingDirty() || routingSaving()} onPress={revertRouting} />
-      <Action testID="routing-save" label="Save routing" busyLabel="Saving…" busy={routingSaving()} disabled={!routingDirty()} variant="primary" onPress={() => void saveRouting()} />
-    </Row>
+    <ActionBar justify="between" testID="routing-footer">
+      <Column grow>
+        <If
+          when={invalid()}
+          else={
+            <If when={routingDirty()}>
+              <Label variant="caption" color="muted" testID="routing-unsaved">
+                Unsaved changes. Nothing is sent until you save.
+              </Label>
+            </If>
+          }
+        >
+          <Label variant="caption" color="danger" testID="routing-invalid">
+            Fix the confidence above: a whole number of percent.
+          </Label>
+        </If>
+      </Column>
+      <Row gap={2}>
+        <Action testID="routing-revert" label="Revert" variant="ghost" disabled={!routing() || !routingDirty() || routingSaving()} onPress={revertRouting} />
+        <Action
+          testID="routing-save"
+          label="Save routing"
+          busyLabel="Saving…"
+          busy={routingSaving()}
+          disabled={!routingDirty() || invalid()}
+          variant="primary"
+          onPress={() => void saveRouting()}
+        />
+      </Row>
+    </ActionBar>
   );
 }

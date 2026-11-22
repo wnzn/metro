@@ -26,6 +26,13 @@ async function settings(app: App, section: "providers" | "routing") {
 const text = (app: App) => app.texts().join(" | ");
 const puts = (f: F, path: string) => f.posts().filter((p) => p.method === "PUT" && p.path === path);
 
+/** Sign out: close Settings, then the account menu's Sign out. */
+async function signOut(app: App) {
+  if (app.shows("id:settings-close")) await app.press("id:settings-close");
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+}
+
 /** Picks `label` in the picker `id`. */
 async function pick(app: App, id: string, label: string) {
   await app.press(`id:${id}`);
@@ -48,8 +55,9 @@ test("Model routing is off by default and says nothing is sent", async () => {
   const app = await signIn(f, "alice");
   await settings(app, "routing");
   await app.waitFor("id:routing-dataflow");
-  expect(app.value("id:routing-min-route")).toBe("0.65");
-  expect(app.value("id:routing-min-directed")).toBe("0.85");
+  // Confidence is a whole percentage.
+  expect(app.value("id:routing-min-route")).toBe("65");
+  expect(app.value("id:routing-min-directed")).toBe("85");
   expect(text(app)).toContain("Off: nothing is sent to pick a model.");
   expect(text(app)).toContain("Off: your unaddressed messages are ordinary conversation and are sent to no model.");
   expect(text(app)).toContain("Messages that mention only people, and other members' messages for routing or classification.");
@@ -89,12 +97,17 @@ test("pickers offer only models of their capability that I can use, mine and sha
 
   await pick(app, "routing-embedding", "/Home embeddings · nomic-embed-text/");
   await app.clear("id:routing-min-route");
-  await app.type("id:routing-min-route", "0.7");
+  await app.type("id:routing-min-route", "70");
 
-  // What goes where, from what is chosen.
-  expect(text(app)).toContain("When agent work starts for you, that message's text and your use-case names and descriptions go to “Alice System One” (TypeSafe System One), which the Metro server calls with your settings.");
-  expect(text(app)).toContain("other members' messages there included) go to “Home embeddings”");
-  expect(text(app)).toContain("Each query and its top results (at most 10) also go to “Alice System One”");
+  // What goes where, from what is chosen, in short rows.
+  const fact = (row: string, value: string) => app.shows(`id:dataflow-${row}-facts >> text:${value}`);
+  expect(fact("routing", "That message's text, and your use-case names and descriptions")).toBe(true);
+  expect(fact("routing", "“Alice System One” (TypeSafe System One)")).toBe(true);
+  expect(fact("routing", "The Metro server calls it with your settings")).toBe(true);
+  expect(fact("search", "/other members' messages there included/")).toBe(true);
+  expect(fact("search", "/“Home embeddings”/")).toBe(true);
+  expect(fact("search", "Each query and its top results (at most 10) also go to the classifier")).toBe(true);
+  expect(fact("search", "Classifier")).toBe(true);
 
   await app.press("id:routing-save");
   await app.waitFor("id:routing-notice");
@@ -116,7 +129,7 @@ test("pickers offer only models of their capability that I can use, mine and sha
   await settings(app, "routing");
   await app.waitFor("id:case-label:0");
   expect(app.value("id:case-label:0")).toBe("Code review");
-  expect(app.value("id:routing-min-route")).toBe("0.7");
+  expect(app.value("id:routing-min-route")).toBe("70");
 });
 
 test("classification of my unaddressed messages is a separate opt-in and names the endpoint that receives them", async () => {
@@ -125,13 +138,20 @@ test("classification of my unaddressed messages is a separate opt-in and names t
   await settings(app, "routing");
   await pick(app, "routing-classifier", "/Alice System One · jev-latest/");
   await app.press("id:routing-infer");
-  expect(text(app)).toContain("Each message you write that mentions nobody and isn't sent with Ask agent goes to “Alice System One” (TypeSafe System One)");
+  expect(app.shows("id:dataflow-addressing-facts >> text:Each message you write that mentions nobody and isn't sent with Ask agent")).toBe(true);
+  expect(app.shows("id:dataflow-addressing-facts >> text:“Alice System One” (TypeSafe System One)")).toBe(true);
+  // A percentage below the floor, or not a whole number, can't be saved.
   await app.clear("id:routing-min-directed");
   await app.type("id:routing-min-directed", "2");
-  await app.press("id:routing-save");
-  await app.waitFor("text:/The “asking the agent” threshold must be a number from 0.5 to 1/");
+  await app.waitFor("id:routing-min-directed-error");
+  expect(app.shows("text:Enter a whole number from 50 to 100.")).toBe(true);
+  expect(app.enabled("id:routing-save")).toBe(false);
   await app.clear("id:routing-min-directed");
-  await app.type("id:routing-min-directed", "90%");
+  await app.type("id:routing-min-directed", "0.9");
+  expect(app.enabled("id:routing-save")).toBe(false);
+  await app.clear("id:routing-min-directed");
+  await app.type("id:routing-min-directed", "90");
+  expect(app.shows("id:routing-min-directed-error")).toBe(false);
   await app.press("id:routing-save");
   await app.waitFor("id:routing-notice");
   expect(puts(f, "/v1/model-routing").at(-1)?.body).toMatchObject({ enabled: false, infer_addressing: true, classifier_id: s1.id, min_directedness: 0.9, cases: [] });
@@ -173,13 +193,16 @@ test("a late routing answer never lands in the next user's session", async () =>
   const app = await signIn(f, "alice");
   await app.press("id:nav-settings");
   await app.press("id:nav-settings:routing");
-  await app.press("id:disconnect"); // while GET /v1/model-routing is on its way
+  // Sign out (in the account menu, under the Settings modal) while GET /v1/model-routing is on its way.
+  await app.press("id:settings-close");
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
   f.state.delays.delete("/v1/model-routing");
   await signIn(f, "bob", app);
   await settings(app, "routing");
   await app.waitFor("id:routing-min-directed");
   await app.wait(800);
-  expect(app.value("id:routing-min-directed")).toBe("0.85");
+  expect(app.value("id:routing-min-directed")).toBe("85");
 });
 
 // ------------------------------------------------------------------ capabilities and sharing
@@ -195,6 +218,8 @@ test("each capability has its own default; a System One connection never becomes
   await settings(app, "providers");
   await app.waitFor(`id:connection:${s1b.id}`);
   expect(app.shows(`id:connection-capability:${s1b.id} >> text:System One`)).toBe(true);
+  expect(app.shows(`id:connection-make-default:${s1b.id}`)).toBe(false); // inside Manage
+  await app.press(`id:connection-manage:${s1b.id}`);
   await app.press(`id:connection-make-default:${s1b.id}`);
   await app.waitUntil(() => f.state.connections.get(s1b.id)!.is_default);
   await app.waitFor(`id:connection-default:${s1b.id}`);
@@ -237,6 +262,7 @@ test("the owner shares a connection with chosen Spaces, others can use it withou
   const app = await signIn(f, "alice");
   await settings(app, "providers");
   await app.waitFor(`id:connection:${chat.id}`);
+  await app.press(`id:connection-manage:${chat.id}`);
   await app.press(`id:connection-sharing:${chat.id}`);
   await app.waitFor(`id:sharing-visibility:${chat.id}`);
   expect(text(app)).toContain("Only you can use it. This is the default.");
@@ -246,7 +272,8 @@ test("the owner shares a connection with chosen Spaces, others can use it withou
   await app.press(`id:sharing-save:${chat.id}`);
   await app.waitFor("text:Pick at least one Space, or choose Only me.");
   await app.press(`id:sharing-space:${chat.id}:acme`);
-  expect(text(app)).toContain("They never see its base URL, key, sign-in or device token, and can't change or manage it. You can see what they send through it, as the owner of the endpoint, and you may pay for their use.");
+  expect(text(app)).toContain("You see their requests and may pay for them");
+  expect(text(app)).toContain("As the owner of the endpoint, you can see what they send, and you may pay for their use. They never see its base URL, key, sign-in or device token, and can't manage it.");
   await app.press(`id:sharing-save:${chat.id}`);
   await app.waitFor(`id:sharing-notice:${chat.id}`);
   expect(puts(f, `/v1/providers/${chat.id}/sharing`).at(-1)?.body).toEqual({ visibility: "spaces", space_ids: ["acme"] });
@@ -255,14 +282,14 @@ test("the owner shares a connection with chosen Spaces, others can use it withou
   expect(text(app)).not.toContain("sk-fixture-not-real");
 
   // Bob (in Acme) can pick it, never read it; Carol (in no Space with Alice) can't see it.
-  await app.press("id:disconnect");
+  await signOut(app);
   await signIn(f, "bob", app);
   await settings(app, "routing");
   await app.press("id:routing-add-case");
   await app.press("id:case-model:0");
   expect(app.shows("text:/Alice OpenAI · gpt-fixture-2/")).toBe(true);
   expect(text(app)).not.toContain("sk-fixture-not-real");
-  await app.press("id:disconnect");
+  await signOut(app);
   await signIn(f, "carol", app);
   await settings(app, "routing");
   await app.press("id:routing-add-case");
@@ -270,9 +297,10 @@ test("the owner shares a connection with chosen Spaces, others can use it withou
   expect(app.shows("text:/Alice OpenAI/")).toBe(false);
 
   // Alice makes it private again.
-  await app.press("id:disconnect");
+  await signOut(app);
   await signIn(f, "alice", app);
   await settings(app, "providers");
+  if (!app.shows(`id:connection-sharing:${chat.id}`)) await app.press(`id:connection-manage:${chat.id}`);
   await app.press(`id:connection-sharing:${chat.id}`);
   await app.waitFor(`id:sharing-visibility:${chat.id}`);
   await app.press(`id:sharing-visibility:${chat.id}:personal`);
@@ -289,19 +317,21 @@ test("a ChatGPT sign-in is shared only as a bring-your-own preset; a device shar
   const gpu = f.addConnection("alice", "device-openai-compatible", "Desk GPU", "qwen-fixture");
   const app = await signIn(f, "alice");
   await settings(app, "providers");
+  await app.press(`id:connection-manage:${oauth.id}`);
   await app.press(`id:connection-sharing:${oauth.id}`);
   await app.waitFor(`id:sharing-preset:${oauth.id}`);
-  expect(text(app)).toContain("This connection is your own ChatGPT sign-in and plan, and that can't be shared or lent.");
+  expect(text(app)).toContain("Your ChatGPT sign-in and plan can't be shared or lent.");
   await app.press(`id:sharing-visibility:${oauth.id}:organization`);
   expect(app.shows(`id:sharing-save:${oauth.id} >> text:Share preset with the organization`)).toBe(true);
   expect(text(app)).toContain("Their requests go to their own sign-in, never through yours.");
 
+  await app.press(`id:connection-manage:${gpu.id}`);
   await app.press(`id:connection-sharing:${gpu.id}`); // one panel at a time
   await app.waitFor(`id:sharing-visibility:${gpu.id}`);
   expect(app.shows(`id:sharing:${oauth.id}`)).toBe(false);
   await app.press(`id:sharing-visibility:${gpu.id}:organization`);
   expect(text(app)).toContain("your computer and your metro-connector (their requests fail while it's offline)");
-  expect(text(app)).toContain("as the owner of the device");
+  expect(text(app)).toContain("As the owner of the device, you can see what they send, and you may pay for their use.");
 });
 
 // ------------------------------------------------------------------ navigation
@@ -312,8 +342,10 @@ test("Search is the box at the top of every page and Scheduled tasks a sidebar d
   expect(app.shows("id:nav-search")).toBe(false); // no second way into Search
   await app.waitFor("id:top-search");
   await app.type("id:top-search", "pricing");
-  await app.waitFor("id:search-view");
+  await app.wait(300);
   expect(f.posts().some((p) => p.path.startsWith("/v1/search"))).toBe(false); // typing sends nothing
+  await app.submit("id:top-search"); // Return opens Search
+  await app.waitFor("id:search-view");
   await app.press("id:nav-schedules");
   await app.waitFor("id:search-view", { state: "gone" });
   expect(app.shows("id:top-search")).toBe(true);
