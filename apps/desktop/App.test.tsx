@@ -25,6 +25,11 @@ async function openAcme(app: App) {
 
 const text = (app: App) => app.texts().join(" | ");
 
+/** Asks the agent with the composer's draft (the explicit to-the-agent case). */
+async function askAgent(app: App) {
+  await app.press("id:ask-agent");
+}
+
 test("refuses to send a token over plain HTTP to a remote host", async () => {
   const f = world();
   const app = await openApp(f);
@@ -113,6 +118,28 @@ test("@mentions: pick a member, send, prune and clear on room change", async () 
   await app.press("id:space:side");
   await app.waitFor("text:side lobby only");
   expect(app.shows("id:mention-chips")).toBe(false);
+});
+
+test("mixed @bob @agent is addressed to both and starts the agent with no extra decision", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await openAcme(app);
+  await app.type("id:composer", "please both look @");
+  await app.press("id:pick:bob");
+  await app.type("id:composer", "@");
+  await app.press("id:pick:agent");
+  await app.waitFor("id:mention-chip:agent");
+  await app.waitFor("id:mention-chip:bob");
+  await app.press("id:send");
+  await app.waitFor("text:to the agent and people");
+  const sent = f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!;
+  const body = sent.body as { text: string; invoke_agent: boolean; mentions: { kind: string; id?: string }[] };
+  expect(body.mentions).toContainEqual({ kind: "user", id: "bob" });
+  expect(body.mentions).toContainEqual({ kind: "agent" });
+  // The agent is addressed explicitly, so it answers without a classification call.
+  await app.waitFor("text:/\\(agent\\) on it: please both look/");
+  expect(f.posts().some((p) => p.path === "/v1/systemone")).toBe(false);
 });
 
 test("a message that mentions me is highlighted as @you", async () => {
@@ -218,12 +245,16 @@ test("Chat: personal messages, runs, follow-up to an explicit Space and room, st
   await signIn(app, "alice");
   await app.waitFor("id:chat-view");
   await app.type("id:composer", "what's running?");
-  await app.press("id:ask-agent");
+  await askAgent(app);
   await app.waitFor("text:(agent) re: what's running?");
+  expect(f.posts().find((p) => p.path === "/v1/chat/messages")?.body).toMatchObject({ text: "what's running?", invoke_agent: true });
 
   await app.waitFor("id:run:run1");
   expect(app.shows("text:Acme › #lobby")).toBe(true);
-  await app.press("id:run-follow:run1");
+  expect(app.shows("id:run:run1 >> text:Started by you")).toBe(true); // alice started it
+  expect(app.shows("id:dispatch")).toBe(false); // the task form stays folded
+  await app.press("id:run-follow:run1"); // Follow up opens it, aimed at the run's room
+  await app.waitFor("id:dispatch");
   await app.waitFor("text:To: agent in Acme › #lobby");
   await app.type("id:dispatch-text", "also check the tests");
   await app.press("id:dispatch-send");
@@ -236,6 +267,32 @@ test("Chat: personal messages, runs, follow-up to an explicit Space and room, st
 
   await app.press("id:run-open:run1");
   await app.waitFor("text:hello from bob in acme");
+});
+
+test("Chat: New task asks for an explicit Space and room; closing the form keeps the draft", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await app.waitFor("id:chat-view");
+  expect(app.shows("id:dispatch")).toBe(false); // folded until asked for
+  await app.press("id:dispatch-new");
+  await app.waitFor("id:dispatch");
+  await app.type("id:dispatch-text", "tidy the changelog");
+  expect(app.enabled("id:dispatch-send")).toBe(false); // no implicit Space or room
+  await app.press("id:dispatch-space:acme");
+  await app.press("id:dispatch-room:lobby");
+  await app.waitFor("text:To: agent in Acme › #lobby");
+
+  const before = f.posts().length;
+  await app.press("id:dispatch-close");
+  await app.waitFor("id:dispatch", { state: "gone" });
+  expect(f.posts().length).toBe(before); // closing sends nothing
+  await app.press("id:dispatch-new");
+  expect(app.value("id:dispatch-text")).toBe("tidy the changelog");
+  expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+  await app.press("id:dispatch-send");
+  await app.waitFor("id:dispatch-notice");
+  expect(f.posts().at(-1)).toMatchObject({ path: "/v1/spaces/acme/rooms/lobby/messages", body: { text: "tidy the changelog", invoke_agent: true } });
 });
 
 test("a rejected token returns to the connect screen with the reason", async () => {
@@ -407,7 +464,9 @@ test("a Space owner attaches and detaches a runner from the same list; attached 
   await app.press(`id:attach-runner:${mine.id}`);
   await app.waitFor("id:attached-runner");
   expect(f.posts().at(-1)).toMatchObject({ method: "PUT", path: "/v1/spaces/side/runner", body: { runner_id: mine.id } });
-  expect(text(app)).toContain("it doesn't mean the runner is online");
+  // Attached only routes this Space's jobs; it never claims the runner is up.
+  expect(text(app)).toMatch(/Attached or paired means [^|]*(it doesn't mean the runner is online|not that it[’']s online)/);
+  expect(app.shows("id:runner-card >> text:Online")).toBe(false);
   expect(text(app)).not.toContain(mine.token);
 
   await app.press("id:detach-runner");
