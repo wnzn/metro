@@ -46,6 +46,30 @@ export function scopeLabel(scope: SearchScope): string {
 
 export const spaceName = (spaceId: string) => spaces().find((s) => s.id === spaceId)?.name ?? "a Space";
 
+const STOP_WORDS = new Set(["the", "and", "for", "with", "what", "where", "which", "who", "how", "has", "have", "was", "are", "about", "from", "that", "this", "into", "does", "did", "our", "your", "you"]);
+
+/**
+ * `text` cut into parts, the words of `query` (three letters or more, not
+ * filler words) marked wherever they appear, case-insensitively. Only the
+ * literal words are marked: a result found by meaning may mark nothing.
+ */
+export function markTerms(text: string, query: string): { text: string; mark: boolean }[] {
+  const terms = [...new Set(query.toLowerCase().match(/[\p{L}\p{N}]{3,}/gu) ?? [])].filter((t) => !STOP_WORDS.has(t)).slice(0, 12);
+  if (!text || terms.length === 0) return [{ text, mark: false }];
+  const escaped = terms.sort((a, b) => b.length - a.length).map((t) => t.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
+  const parts: { text: string; mark: boolean }[] = [];
+  const re = new RegExp(escaped.join("|"), "giu");
+  let at = 0;
+  for (const m of text.matchAll(re)) {
+    const i = m.index ?? 0;
+    if (i > at) parts.push({ text: text.slice(at, i), mark: false });
+    parts.push({ text: m[0], mark: true });
+    at = i + m[0].length;
+  }
+  if (at < text.length) parts.push({ text: text.slice(at), mark: false });
+  return parts.length ? parts : [{ text, mark: false }];
+}
+
 export function setScope(scope: SearchScope) {
   if (scope.kind === "space" && !spaces().some((s) => s.id === scope.spaceId)) return;
   batch(() => {

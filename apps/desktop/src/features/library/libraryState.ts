@@ -22,7 +22,7 @@ import { ApiError } from "../../api/client";
 import type { AvailableModel } from "../../api/client";
 import { ACCEPTED, acceptedOf, MAX_UPLOAD_BYTES, mediaKindOf } from "../../api/library";
 import type { AssetKind, LibraryApi, LibraryAsset, LibraryHit, LibraryRanking, LibraryScope, Locator, MediaKind, UploadTarget } from "../../api/library";
-import { apiClient, describe, disconnect, isAborted, me, onSessionEnd, sessionGuard, spaces } from "../../store";
+import { apiClient, describe, disconnect, isAborted, mainPlace, me, onSessionEnd, sessionGuard, spaces } from "../../store";
 
 export type { LibraryAsset, LibraryHit, LibraryRanking, LibraryScope, Locator, MediaKind, UploadTarget };
 
@@ -31,8 +31,14 @@ export const MAX_QUERY_CHARS = 1000;
 /** Files one pick may upload. */
 export const MAX_PICK = 10;
 
-/** Which Search surface shows: message search (unchanged) or this library. */
+/** Which mode Search shows: message search, or search across Documents & media. */
 export const searchSurface = signal<"conversations" | "library">("conversations");
+
+/** A file's type for its icon: what it is, not its format. */
+export function fileKindOf(kind: AssetKind | null, mimeType: string): MediaKind {
+  const mime = kind ? ACCEPTED.find((a) => a.kind === kind)?.mime ?? mimeType : mimeType;
+  return mediaKindOf(mime);
+}
 
 // ------------------------------------------------------------------ files
 
@@ -82,8 +88,22 @@ export const libSearchError = signal<{ message: string; needsModel: boolean } | 
 
 // ------------------------------------------------------------------ viewer
 
-/** What the viewer opens: a file, and the matching part when it came from a search. */
-export type ViewTarget = { assetId: string; name: string; mimeType: string; kind: AssetKind | null; spaceId: string | null; locator: Locator | null; excerpt: string | null; query: string | null };
+/**
+ * What the viewer opens: a file, and the matching part when it came from a
+ * search. `from` is the page it opened on (the Library's file list, or
+ * Search's results); it shows only there and closes when that page goes.
+ */
+export type ViewTarget = {
+  assetId: string;
+  name: string;
+  mimeType: string;
+  kind: AssetKind | null;
+  spaceId: string | null;
+  locator: Locator | null;
+  excerpt: string | null;
+  query: string | null;
+  from: "library" | "search";
+};
 export type ViewContent =
   | { status: "loading" }
   | { status: "error"; message: string }
@@ -193,9 +213,14 @@ export function canDelete(asset: LibraryAsset): boolean {
 
 // ------------------------------------------------------------------ loading
 
-/** Loads (or reloads) the first page of files and the media model choice. */
+/** Loads (or reloads) the first page of files and the media model choice: the Library page. */
 export async function openLibrary(): Promise<void> {
   await Promise.all([loadAssets(false), loadModels()]);
+}
+
+/** Search's Documents & media mode needs only the media model choice (to say where a query goes). */
+export async function openLibrarySearch(): Promise<void> {
+  if (!modelsLoaded()) await loadModels();
 }
 
 export function setListScope(scope: LibraryScope) {
@@ -523,6 +548,7 @@ export async function runLibrarySearch(): Promise<void> {
     const answer = await api.searchLibrary(query, scope, LIBRARY_SEARCH_LIMIT, kind);
     if (!ok() || mine !== seq) return;
     libAnswer.set({ query, scope, ...answer });
+    void loadThumbnails();
   } catch (error) {
     if (!ok() || mine !== seq) return;
     const status = statusOf(error);
@@ -589,7 +615,7 @@ function kindFromMime(mime: string): AssetKind | null {
 }
 
 export function openAsset(asset: LibraryAsset) {
-  void openTarget({ assetId: asset.id, name: asset.name, mimeType: asset.mimeType, kind: asset.kind, spaceId: asset.spaceId, locator: null, excerpt: null, query: null });
+  void openTarget({ assetId: asset.id, name: asset.name, mimeType: asset.mimeType, kind: asset.kind, spaceId: asset.spaceId, locator: null, excerpt: null, query: null, from: "library" });
 }
 
 export function openLibraryHit(hit: LibraryHit) {
@@ -603,6 +629,7 @@ export function openLibraryHit(hit: LibraryHit) {
     locator: hit.locator,
     excerpt: hit.excerpt,
     query: libAnswer()?.query ?? null,
+    from: "search",
   });
 }
 
@@ -823,7 +850,101 @@ export async function saveCopy(): Promise<void> {
   }
 }
 
+// ------------------------------------------------------------------ thumbnails
+
+/** Most image results that get a thumbnail per answer. */
+export const MAX_THUMBNAILS = 6;
+/**
+ * Small previews of image results: `blob:` URLs of bytes read through the
+ * same authenticated request the viewer uses (the server checks access again
+ * for each), only for images of the personal library or a Space the user is
+ * in now. Nothing goes to a model. Revoked with the next answer, a lost
+ * Space, a deleted file and at sign-out.
+ */
+export const thumbnails = signal<Record<string, string>>({});
+let thumbSeq = 0;
+let thumbAbort: AbortController | null = null;
+
+function dropThumbnails(keep?: (assetId: string) => boolean) {
+  const all = thumbnails();
+  const next: Record<string, string> = {};
+  for (const [id, url] of Object.entries(all)) {
+    if (keep?.(id)) next[id] = url;
+    else {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        /* already gone */
+      }
+    }
+  }
+  thumbnails.set(next);
+}
+
+function stopThumbnails() {
+  thumbSeq++;
+  thumbAbort?.abort();
+  thumbAbort = null;
+}
+
+async function loadThumbnails(): Promise<void> {
+  stopThumbnails();
+  const mine = thumbSeq;
+  const abort = new AbortController();
+  thumbAbort = abort;
+  dropThumbnails();
+  const ids = [...new Set(visibleHits().filter((h) => h.kind === "image").map((h) => h.assetId))].slice(0, MAX_THUMBNAILS);
+  if (ids.length === 0) return;
+  const ok = sessionGuard();
+  const api = library();
+  if (!api) return;
+  for (const id of ids) {
+    const hit = visibleHits().find((h) => h.assetId === id);
+    if (!hit || !isJoined(hit.spaceId)) continue;
+    try {
+      const content = await api.assetContent(id, abort.signal);
+      // Kept only for the same session, the same answer, and a hit still shown now.
+      if (!ok() || mine !== thumbSeq || !isJoined(hit.spaceId) || deletedIds().has(id)) return;
+      if (!visibleHits().some((h) => h.assetId === id && h.kind === "image")) continue;
+      const mime = (content.contentType || hit.mimeType).split(";")[0]!.trim();
+      if (mediaKindOf(mime) !== "image") continue;
+      const url = URL.createObjectURL(new Blob([content.bytes as BlobPart], { type: mime }));
+      thumbnails.set({ ...thumbnails(), [id]: url });
+    } catch (error) {
+      if (mine !== thumbSeq || isAborted(error)) return;
+      if (error instanceof ApiError && error.kind === "auth") {
+        disconnect(error.message);
+        return;
+      }
+      // A file that can't be read just keeps its icon.
+    }
+  }
+  if (mine === thumbSeq) thumbAbort = null;
+}
+
+// A thumbnail lives only while its image hit is shown: a new answer, a lost
+// Space, a deleted file or the end of the session drops (and revokes) it.
+effect(() => {
+  const shown = new Set(visibleHits().filter((h) => h.kind === "image").map((h) => h.assetId));
+  untracked(() => {
+    if (Object.keys(thumbnails()).some((id) => !shown.has(id))) dropThumbnails((id) => shown.has(id));
+  });
+});
+
 // ------------------------------------------------------------------ lifecycle
+
+// The viewer belongs to the page it opened on: leaving that page (or Search's
+// Documents & media mode) closes it and drops its bytes.
+effect(() => {
+  const here = mainPlace();
+  const surface = searchSurface();
+  untracked(() => {
+    const v = viewing();
+    if (!v) return;
+    const stays = v.from === "library" ? here === "library" : here === "search" && surface === "library";
+    if (!stays) closeViewer();
+  });
+});
 
 // A Space the user is no longer in: its files, results and any open preview go at once.
 effect(() => {
@@ -848,7 +969,9 @@ effect(() => {
 
 onSessionEnd(() => {
   seq++;
+  stopThumbnails();
   closeViewer();
+  dropThumbnails();
   purgePreviews();
   batch(() => {
     searchSurface.set("conversations");

@@ -1,6 +1,9 @@
-// Search › Documents & media against the shared fake server plus the
-// library routes (test/fixtures.ts). Real NSH engine and the real app entry,
-// no network. Tokens are the fake server's own, never real ones.
+// Library (Documents & media) and Search's Documents & media mode against the
+// shared fake server plus the library routes (test/fixtures.ts). Real NSH
+// engine and the real app entry (the media model choice through
+// test/ModelHarness.tsx), no network. Tokens are the fake server's own,
+// never real ones. These are headless engine runs: they check what the app
+// requests and shows, not native playback.
 
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
@@ -9,14 +12,24 @@ import { libraryWorld } from "./test/fixtures";
 
 type W = ReturnType<typeof libraryWorld>;
 
-async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice"): Promise<App> {
-  const app = await open("../../../App.tsx", { network: w.network as any, platform: "linux", width: 1280, height: 900 });
+async function connect(app: App, user: string) {
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
   await app.press("id:connect");
+}
+
+async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice"): Promise<App> {
+  const app = await open("../../../App.tsx", { network: w.network as any, platform: "linux", width: 1280, height: 900 });
+  await connect(app, user);
   await app.waitFor("id:top-search");
   return app;
+}
+
+/** The Library page, from the sidebar. */
+async function openLibrary(app: App) {
+  await app.press("id:nav-library");
+  await app.waitFor("id:library-view");
 }
 
 /** Return in the empty search box at the top opens Search without searching. */
@@ -25,10 +38,10 @@ async function openSearch(app: App) {
   await app.waitFor("id:search-view");
 }
 
-async function openLibrary(app: App) {
+async function openFileSearch(app: App) {
   await openSearch(app);
   await app.press("id:search-surface:library");
-  await app.waitFor("id:library-view");
+  await app.waitFor("id:library-search");
 }
 
 /** Resolves when `cond()` holds (checked every 10 ms); fails after 20 s. */
@@ -43,6 +56,7 @@ async function poll(cond: () => boolean, ms = 20_000) {
 const text = (app: App) => app.texts().join(" | ");
 const enc = new TextEncoder();
 const lib = (w: W, path: string, method = "GET") => w.l.log.filter((r) => r.path === path && r.method === method);
+const contentReads = (w: W) => w.l.log.filter((r) => r.path.endsWith("/content"));
 
 function seed(w: W) {
   const mine = w.addAsset("alice", null, "notes.md", "# Notes\n\nIntro paragraph.\n\nThe rollback plan: revert the tag, rebuild, then run the smoke test.\n\nOutro.");
@@ -54,19 +68,13 @@ function seed(w: W) {
   return { mine, acmeByBob, sideByBob, bobsOwn, carols };
 }
 
-test("message search stays the default; Documents & media is its own surface listing only what I can access", async () => {
+test("Library is its own page listing only what I can access; Search's file mode lists nothing and typing sends nothing", async () => {
   const w = libraryWorld();
   const s = seed(w);
   const app = await signIn(w);
-  await openSearch(app);
-  expect(lib(w, "/v1/library/assets").length).toBe(0); // opening Search lists nothing yet
-  // Conversations first, as before.
-  expect(app.shows("id:search-query-echo")).toBe(true);
-  expect(app.shows("id:library-view")).toBe(false);
-  await app.press("id:search-surface:library");
+  expect(lib(w, "/v1/library/assets").length).toBe(0); // nothing listed before the Library opens
+  await openLibrary(app);
   await app.waitFor(`id:library-file:${s.mine.id}`);
-  expect(app.shows("id:search-query-echo")).toBe(false);
-  expect(app.shows("id:top-search")).toBe(true); // the one query field, now for files
   expect(app.shows(`id:library-file:${s.acmeByBob.id}`)).toBe(true);
   expect(app.shows(`id:library-file:${s.sideByBob.id}`)).toBe(true);
   // Nobody else's personal files, no Space I'm not in.
@@ -77,7 +85,10 @@ test("message search stays the default; Documents & media is its own surface lis
   expect(text(app)).toContain("Personal");
   expect(text(app)).toContain("Acme");
   expect(lib(w, "/v1/library/assets")[0]!.url).toBe(`${BASE}/v1/library/assets?scope=all`);
-  // Only listing happened: nothing was indexed or searched.
+  // The media model is chosen in Settings, not here: only its status and a way there.
+  expect(app.shows("id:library-model-status")).toBe(true);
+  expect(app.shows("id:library-model-picker")).toBe(false);
+  expect(text(app)).toContain("No media model is chosen");
   expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
 
   await app.press("id:library-list-scope");
@@ -88,10 +99,28 @@ test("message search stays the default; Documents & media is its own surface lis
   await app.waitUntil(() => !app.shows(`id:library-file:${s.mine.id}`));
   expect(lib(w, "/v1/library/assets").at(-1)!.url).toBe(`${BASE}/v1/library/assets?scope=space&space_id=acme`);
 
-  // Back to Conversations: message search is still there and unchanged.
-  await app.press("id:search-surface:conversations");
-  await app.waitFor("id:search-query-echo");
-  expect(text(app)).toContain("Everything you can read");
+  // Typing in the box at the top edits the files query only: it opens nothing and sends nothing.
+  const before = w.l.log.length;
+  await app.type("id:top-search", "rollback");
+  expect(app.shows("id:library-view")).toBe(true);
+  expect(w.l.log.length).toBe(before);
+  await app.clear("id:top-search");
+
+  // Search opens on messages; its Documents & media mode has no upload or file list.
+  await app.press("id:nav-chat");
+  await openSearch(app);
+  expect(app.shows("id:search-form")).toBe(true);
+  expect(app.shows("id:library-search")).toBe(false);
+  const lists = lib(w, "/v1/library/assets").length;
+  await app.press("id:search-surface:library");
+  await app.waitFor("id:library-search-start");
+  expect(app.shows("id:library-choose")).toBe(false);
+  expect(app.shows(`id:library-file:${s.mine.id}`)).toBe(false);
+  expect(lib(w, "/v1/library/assets").length).toBe(lists);
+  expect(lib(w, "/v1/library/search", "POST").length).toBe(0);
+  // From there, the Library is one press away.
+  await app.press("id:search-open-library");
+  await app.waitFor("id:library-view");
 });
 
 test("uploads come from the system picker as raw bytes, to the chosen Space, within the server's limit; nothing goes to a model", async () => {
@@ -137,14 +166,15 @@ test("uploads come from the system picker as raw bytes, to the chosen Space, wit
   expect(lib(w, "/v1/library/search", "POST").length).toBe(0);
 });
 
-test("only media-capable connections can be chosen; the data flow is disclosed; Index sends one file only on request", async () => {
+test("the media model settings offer only media-capable connections and disclose the data flow; Index sends one file only on request", async () => {
   const w = libraryWorld();
   const s = seed(w);
   w.f.addConnection("alice", "custom-embeddings", "Text embeddings", "nomic-embed");
   const own = w.addMediaConnection("alice", "device-embeddinggemma-2", "My EG2");
   w.addMediaConnection("bob", "embeddinggemma-2", "Bob's EG2 server", { visibility: "spaces", space_ids: ["acme"] });
-  const app = await signIn(w);
-  await openLibrary(app);
+  const app = await open("./test/ModelHarness.tsx", { network: w.network as any, platform: "linux", width: 1280, height: 900 });
+  await connect(app, "alice");
+  await app.waitFor("id:library-model");
   await app.waitFor(`id:library-file:${s.mine.id}`);
   expect(app.enabled(`id:library-index:${s.mine.id}`)).toBe(false);
   expect(text(app)).toContain("Nothing is chosen, so nothing can be indexed or searched.");
@@ -158,6 +188,8 @@ test("only media-capable connections can be chosen; the data flow is disclosed; 
   expect(text(app)).toContain("Uploading and opening files send it nothing.");
   expect(text(app)).toContain("never whole files");
   expect(text(app)).toContain("Shared by bob: it runs on bob's endpoint, so whoever runs that endpoint can see the files and queries sent, and bob may pay for it.");
+  // Picking isn't saving: nothing is used yet.
+  expect(lib(w, "/v1/library/settings", "PUT").length).toBe(0);
 
   await app.press("id:library-model-picker");
   await app.press("text:/My EG2/");
@@ -166,6 +198,7 @@ test("only media-capable connections can be chosen; the data flow is disclosed; 
   await app.waitFor("text:Saved: My EG2.");
   expect(lib(w, "/v1/library/settings", "PUT")[0]!.body).toBe(JSON.stringify({ embedding_id: own }));
   expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
+  await app.waitFor("text:/Index sends a file to My EG2, only when you press Index/");
 
   await app.press(`id:library-index:${s.mine.id}`);
   await app.waitFor(`id:library-index-state:${s.mine.id}`);
@@ -175,29 +208,51 @@ test("only media-capable connections can be chosen; the data flow is disclosed; 
   expect(JSON.parse(index[0]!.body!)).toEqual({ asset_id: s.mine.id });
 });
 
-test("delete asks first, and is offered only to the uploader or the Space owner", async () => {
+test("Delete sits in each row's More menu, asks first, and is offered only to the uploader or the Space owner", async () => {
   const w = libraryWorld();
   const s = seed(w);
   const app = await signIn(w);
   await openLibrary(app);
   await app.waitFor(`id:library-file:${s.mine.id}`);
   // Alice owns Acme (Bob's file there), but is only a member of Side.
-  expect(app.shows(`id:library-delete:${s.mine.id}`)).toBe(true);
-  expect(app.shows(`id:library-delete:${s.acmeByBob.id}`)).toBe(true);
-  expect(app.shows(`id:library-delete:${s.sideByBob.id}`)).toBe(false);
+  expect(app.shows(`id:library-actions:${s.mine.id}`)).toBe(true);
+  expect(app.shows(`id:library-actions:${s.acmeByBob.id}`)).toBe(true);
+  expect(app.shows(`id:library-actions:${s.sideByBob.id}`)).toBe(false);
+  expect(app.shows(`id:library-delete:${s.acmeByBob.id}`)).toBe(false); // folded away until the menu opens
 
+  await app.press(`id:library-actions:${s.acmeByBob.id}`);
+  await app.waitFor(`id:library-delete:${s.acmeByBob.id}`);
   await app.press(`id:library-delete:${s.acmeByBob.id}`);
   await app.waitFor(`id:library-confirm-delete:${s.acmeByBob.id}`);
   expect(text(app)).toContain("It's removed for every member of Acme, with its index.");
+  expect(lib(w, `/v1/library/assets/${s.acmeByBob.id}`, "DELETE").length).toBe(0); // choosing Delete only asks
   await app.press(`id:library-delete-cancel:${s.acmeByBob.id}`);
   expect(app.shows(`id:library-confirm-delete:${s.acmeByBob.id}`)).toBe(false);
   expect(lib(w, `/v1/library/assets/${s.acmeByBob.id}`, "DELETE").length).toBe(0);
 
+  await app.press(`id:library-actions:${s.acmeByBob.id}`);
   await app.press(`id:library-delete:${s.acmeByBob.id}`);
   await app.press(`id:library-delete-confirm:${s.acmeByBob.id}`);
   await app.waitFor("text:Deleted roadmap.png and its index.");
   expect(app.shows(`id:library-file:${s.acmeByBob.id}`)).toBe(false);
   expect(lib(w, `/v1/library/assets/${s.acmeByBob.id}`, "DELETE").length).toBe(1);
+});
+
+test("a file opened from the Library reads its bytes with auth, and leaving the Library closes it", async () => {
+  const w = libraryWorld();
+  const s = seed(w);
+  const app = await signIn(w);
+  await openLibrary(app);
+  await app.press(`id:library-open:${s.mine.id}`);
+  await app.waitFor("id:library-viewer-text");
+  expect(text(app)).toContain("‹ Back to files");
+  const reads = lib(w, `/v1/library/assets/${s.mine.id}/content`);
+  expect(reads.length).toBe(1);
+  expect(reads[0]!.headers["authorization"]).toBe(`Bearer ${TOKENS.alice}`);
+  await app.press("id:nav-chat");
+  await app.press("id:nav-library");
+  await app.waitFor("id:library-view");
+  expect(app.shows("id:library-viewer")).toBe(false);
 });
 
 function seedHits(w: W, s: ReturnType<typeof seed>) {
@@ -219,48 +274,75 @@ function seedHits(w: W, s: ReturnType<typeof seed>) {
 async function searchFiles(app: App, query: string) {
   await app.clear("id:top-search");
   await app.type("id:top-search", query);
-  await app.press("id:library-search-submit");
+  await app.submit("id:top-search");
   await app.waitFor("id:library-results");
 }
 
-test("search finds pages, sections, images and times; labels never claim a rerank that didn't happen; open fetches with auth and jumps to the match", async () => {
+test("file search: chips filter, Return runs it, results carry no raw scores, only image hits get authenticated thumbnails, and opening jumps to the match", async () => {
   const w = libraryWorld();
   const s = seed(w);
-  const { pdf } = seedHits(w, s);
+  const { pdf, wav } = seedHits(w, s);
   w.l.settings.set("alice", w.addMediaConnection("alice", "embeddinggemma-2", "EG2"));
   const app = await signIn(w);
-  await openLibrary(app);
+  await openFileSearch(app);
+  await app.waitFor("id:library-search-disclosure");
+  expect(text(app)).toContain("sends your query to EG2");
+  // Filters change nothing until the search runs.
+  await app.press("id:library-search-kind:document");
+  await app.press("id:library-search-kind:any");
+  expect(lib(w, "/v1/library/search", "POST").length).toBe(0);
+
   await searchFiles(app, "rollback plan");
   expect(JSON.parse(lib(w, "/v1/library/search", "POST")[0]!.body!)).toEqual({ query: "rollback plan", scope: "all", limit: 10 });
   expect(text(app)).toContain("5 matches for “rollback plan” · Everything you can access");
   expect(text(app)).not.toContain("carol's secret");
   expect(text(app)).toContain("Documents reranked by System One");
-  expect(text(app)).toContain("System One relevance 0.93");
-  expect(text(app)).toContain("similarity 0.71");
-  expect(text(app)).toContain("similarity 0.66");
-  expect(text(app)).not.toContain("System One relevance 0.66");
+  // No raw numbers on results.
+  expect(text(app)).not.toContain("relevance 0.");
+  expect(text(app)).not.toContain("similarity 0.");
+  expect(text(app)).not.toContain("No text excerpt");
   expect(text(app)).toContain("Page 3");
   expect(text(app)).toContain("0:12–0:23");
   expect(text(app)).toContain("Play from 0:12");
-  expect(text(app)).toContain("No text excerpt: matched by its image content.");
 
-  // A text section, marked.
-  await app.press("text:Open at section");
+  // Exactly one thumbnail read: the one image hit, with the bearer in a header.
+  await app.waitUntil(() => contentReads(w).length === 1);
+  const thumb = contentReads(w)[0]!;
+  expect(thumb.path).toBe(`/v1/library/assets/${s.acmeByBob.id}/content`);
+  expect(thumb.headers["authorization"]).toBe(`Bearer ${TOKENS.alice}`);
+  expect(app.shows(`id:library-hit-thumb:${s.acmeByBob.id}:image:0`)).toBe(true);
+  expect(w.l.log.some((r) => r.url.includes(TOKENS.alice!))).toBe(false);
+
+  // The whole card opens a text section, marked.
+  await app.press(`id:library-hit-open:${s.mine.id}:text:${"# Notes\n\nIntro paragraph.\n\n".length}`);
   await app.waitFor("id:library-viewer-text");
   await app.waitFor("text:/The rollback plan/");
   expect(text(app)).toContain("The matching section is marked");
+  expect(text(app)).toContain("‹ Back to results");
   const reads = lib(w, `/v1/library/assets/${s.mine.id}/content`);
   expect(reads.length).toBe(1);
   expect(reads[0]!.headers["authorization"]).toBe(`Bearer ${TOKENS.alice}`);
-  expect(reads[0]!.url).toBe(`${BASE}/v1/library/assets/${s.mine.id}/content`);
   await app.press("id:library-viewer-back");
   await app.waitFor("id:library-results");
 
-  // A video at its time.
+  // A video keeps the platform's player and its controls.
   await app.press("text:Play from 0:12");
   await app.waitFor("id:library-viewer-player");
   expect(text(app)).toContain("The player starts at the match (0:12–0:23).");
   expect(app.shows("id:library-play-match")).toBe(true);
+  expect(app.shows("id:library-play-toggle")).toBe(true);
+  await app.press("id:library-viewer-back");
+
+  // Audio: a compact player. No time or match mark is shown before the player itself reported its length.
+  await app.press(`id:library-hit-open:${wav.id}:time:61000`);
+  await app.waitFor("id:library-viewer-player:timeline");
+  expect(app.shows("id:library-viewer-player:toggle")).toBe(true);
+  expect(app.enabled("id:library-viewer-player:timeline")).toBe(false);
+  expect(app.shows("id:library-viewer-player:match")).toBe(false);
+  expect(text(app)).toContain("–:––");
+  expect(app.shows("id:library-play-match")).toBe(true);
+  expect(text(app)).toContain("Play from 1:01");
+  expect(app.shows("id:library-play-toggle")).toBe(false);
   await app.press("id:library-viewer-back");
 
   // A PDF page: the indexed text of that page, and an honest way to open the original.
@@ -269,22 +351,24 @@ test("search finds pages, sections, images and times; labels never claim a reran
   expect(text(app)).toContain("Indexed text of page 3");
   expect(text(app)).toContain("then go to page 3");
   expect(lib(w, `/v1/library/assets/${pdf.id}/content`).length).toBe(1);
-  expect(w.l.log.some((r) => r.url.includes(TOKENS.alice!))).toBe(false);
   // Opening never indexes or sends a file anywhere.
   expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
 });
 
-test("similarity-only answers say so; without a media model the search explains what's missing", async () => {
+test("similarity-only answers say so; without a media model Search says what's missing before anything is sent", async () => {
   const w = libraryWorld();
   const s = seed(w);
   seedHits(w, s);
   w.l.ranking = "embeddings";
   const app = await signIn(w);
-  await openLibrary(app);
+  await openFileSearch(app);
+  await app.waitFor("id:library-search-no-model");
+  expect(app.shows("id:library-search-submit")).toBe(false); // one query field: Return in it runs the search
   await app.type("id:top-search", "x");
-  await app.press("id:library-search-submit");
+  await app.submit("id:top-search");
   await app.waitFor("id:library-search-error");
   expect(text(app)).toContain("File search needs a media model: choose a media embedding model in Settings to search your files.");
+  expect(app.shows("id:library-search-open-providers")).toBe(true);
   w.l.settings.set("alice", w.addMediaConnection("alice", "embeddinggemma-2", "EG2"));
   await searchFiles(app, "rollback");
   expect(text(app)).toContain("Similarity order");
@@ -292,41 +376,47 @@ test("similarity-only answers say so; without a media model the search explains 
   expect(text(app)).not.toContain("reranked by System One");
 });
 
-test("losing a Space drops its files, results and an open preview; signing out discards a late file read", async () => {
+test("losing a Space drops its files, results, thumbnails and an open preview; signing out discards a late file read", async () => {
   const w = libraryWorld();
   const s = seed(w);
   seedHits(w, s);
   w.l.settings.set("alice", w.addMediaConnection("alice", "embeddinggemma-2", "EG2"));
   const app = await signIn(w);
-  await openLibrary(app);
+  await openFileSearch(app);
   await searchFiles(app, "anything");
+  await app.waitFor(`id:library-hit-thumb:${s.acmeByBob.id}:image:0`);
   await app.press("text:Play from 0:12"); // demo.mp4 in Side
   await app.waitFor("id:library-viewer-player");
 
-  // Alice is removed from Side while the preview is open.
+  // Alice is removed from Side (the open preview's) and from Acme (the image hit's).
   w.f.state.spaces.get("side")!.members.delete("alice");
+  w.f.state.spaces.get("acme")!.members.delete("alice");
   await app.waitUntil(() => !app.shows("id:library-viewer"), { timeout: 15_000 });
   await app.waitFor("id:library-results");
   expect(text(app)).not.toContain("demo.mp4");
-  expect(app.shows(`id:library-file:${s.sideByBob.id}`)).toBe(false);
+  expect(app.shows(`id:library-hit:${s.acmeByBob.id}:image:0`)).toBe(false);
+  expect(app.shows(`id:library-hit-thumb:${s.acmeByBob.id}:image:0`)).toBe(false);
 
   // A slow read that answers after sign-out shows nothing to the next user.
   // The driver's press() waits for in-flight requests, so a parked read would
   // block it. The read is therefore held on a gate and the sequence is driven
   // by conditions, never by elapsed time: once the server has the read parked
   // (so "Opening…" is up), sign out; once the app shows the signed-out screen,
-  // release the answer. However slow the machine is, Alice's answer always
-  // arrives after she signed out, and loading is observed while it is parked.
+  // release the answer.
   const release = w.holdContent();
   const opening = app.press("text:Open at section");
   await poll(() => w.l.contentParked === 1);
   const sawLoading = app.shows("id:library-viewer-loading");
+  // Sign out is in the account menu: open it, then choose Sign out, each
+  // press dispatched without waiting on the parked read.
+  const menuOpening = app.press("id:account-menu");
+  await poll(() => app.shows("id:disconnect"));
   const signingOut = app.press("id:disconnect");
   await poll(() => app.shows("id:connect"));
   expect(w.l.contentParked).toBe(1); // sign-out didn't wait for the read
   expect(w.l.contentReleased).toBe(0);
   release();
-  await Promise.all([opening, signingOut]);
+  await Promise.all([opening, menuOpening, signingOut]);
   expect(sawLoading).toBe(true);
   await app.type("id:access-token", TOKENS.bob!);
   await app.press("id:connect");
@@ -334,12 +424,11 @@ test("losing a Space drops its files, results and an open preview; signing out d
   expect(app.value("id:top-search")).toBe(""); // nothing of Alice's query
   await openSearch(app);
   // Bob starts on Conversations with nothing of Alice's.
-  expect(app.shows("id:library-view")).toBe(false);
+  expect(app.shows("id:library-search")).toBe(false);
   await app.press("id:search-surface:library");
-  await app.waitFor("id:library-view");
+  await app.waitFor("id:library-search");
   expect(app.shows("id:library-viewer")).toBe(false);
-  // Alice's read was answered only after Bob's session began; wait until the
-  // server really sent it, then give the app a moment to (wrongly) render it.
+  expect(app.shows("id:library-results")).toBe(false);
   await app.waitUntil(() => w.l.contentParked === 0 && w.l.contentReleased === 1);
   await app.wait(300);
   expect(app.shows("id:library-viewer")).toBe(false);

@@ -1,37 +1,41 @@
-// Search: semantic search over what the user can already read: their own
-// personal Chat and the rooms and threads of Spaces they're a member of now.
-// It says how results were ordered (System One rerank or similarity only)
-// and when indexing is incomplete, and it never shows a result from a Space
-// the user has left. A switch at the top turns to Documents & media
-// (./library), a separate corpus of files the user uploaded.
+// Search: by meaning, in two modes.
+//
+// - Conversations: the user's own personal Chat and the rooms and threads of
+//   Spaces they're a member of now. It says how results were ordered (System
+//   One rerank or similarity only) and when indexing is incomplete, and it
+//   never shows a result from a Space the user has left.
+// - Documents & media (./library): the separate corpus of files people
+//   uploaded.
+//
+// The query is typed only in the search box at the top (TopSearch). Return
+// there is the only thing that sends it anywhere; typing, changing a mode or a
+// filter sends nothing.
 
 import { openSettings, roomsOf, spaces } from "../store";
-import { Action, Badge, Banner, Column, Label, PageHeader, Picker, Row, ScrollArea, SegmentedControl, SettingRow, SettingsGroup, Surface } from "../ui";
-import type { PickerItem } from "../ui";
+import { Action, Badge, Banner, Chip, Column, Label, MarkedText, PageHeader, ResultCard, Row, ScrollArea, SegmentedControl, SettingRow, SettingsGroup, Surface } from "../ui";
 import { ConnectionBanner } from "./Conversation";
-import { LibrarySurface } from "./library/LibraryView";
-import { openLibrary, searchSurface } from "./library/libraryState";
-import { rankingText, scoreText } from "./discovery/present";
+import { LibrarySearch } from "./library/LibraryView";
+import { searchSurface } from "./library/libraryState";
+import { rankingText } from "./discovery/present";
 import {
   hiddenHits,
   indexError,
   indexing,
   indexMore,
   indexProgress,
+  markTerms,
   openError,
   openHit,
-  runSearch,
   scopeLabel,
   searchAnswer,
   searchError,
   searching,
-  searchQuery,
   searchScope,
   setScope,
   spaceName,
   visibleHits,
 } from "./discovery/searchState";
-import type { SearchHit, SearchRanking, SearchScope } from "./discovery/searchState";
+import type { SearchHit, SearchScope } from "./discovery/searchState";
 
 const scopeValue = (scope: SearchScope) => (scope.kind === "space" ? `space:${scope.spaceId}` : scope.kind);
 
@@ -41,16 +45,10 @@ function scopeFrom(value: string | null): SearchScope {
   return { kind: "all" };
 }
 
-const SURFACES = [
+const MODES = [
   { value: "conversations", label: "Conversations", description: "Messages in your personal Chat and your Spaces" },
-  { value: "library", label: "Documents & media", description: "Files you uploaded" },
+  { value: "library", label: "Documents & media", description: "Files people uploaded" },
 ] as const;
-
-function showSurface(value: "conversations" | "library") {
-  if (searchSurface() === value) return;
-  searchSurface.set(value);
-  if (value === "library") void openLibrary();
-}
 
 export function SearchView() {
   return (
@@ -62,13 +60,13 @@ export function SearchView() {
             title="Search"
             subtitle={
               searchSurface() === "library"
-                ? "Search by meaning across your personal library and the files members uploaded to Spaces you're in. It's separate from message search."
-                : "Search by meaning across your personal Chat and the rooms and threads of Spaces you're a member of. Only messages you can already read are searched. Runner files and tool output aren't."
+                ? "By meaning, across your personal library and the files members uploaded to Spaces you're in."
+                : "By meaning, across your personal Chat and the rooms and threads of Spaces you're a member of. Runner files and tool output aren't searched."
             }
           />
-          <SegmentedControl testID="search-surface" accessibilityLabel="Search" options={SURFACES} value={searchSurface()} onChange={showSurface} />
+          <SegmentedControl testID="search-surface" accessibilityLabel="Search mode" options={MODES} value={searchSurface()} onChange={(v) => searchSurface.set(v)} />
           <If when={searchSurface() === "library"} else={<ConversationSearch />}>
-            <LibrarySurface />
+            <LibrarySearch />
           </If>
         </Surface>
       </ScrollArea>
@@ -76,38 +74,46 @@ export function SearchView() {
   );
 }
 
-/** Message search, unchanged. */
 function ConversationSearch() {
   return (
     <Column gap={6}>
-      <SearchForm />
+      <Filters />
       <Messages />
       <Results />
     </Column>
   );
 }
 
-function SearchForm() {
-  const items = (): PickerItem[] => [
-    { value: "all", label: "Everything you can read" },
-    { value: "chat", label: "Your personal Chat" },
-    ...spaces().map((s) => ({ value: `space:${s.id}`, label: s.name, group: "Spaces you're in" })),
+function Filters() {
+  const scopes = () => [
+    { value: "all", label: "Everything" },
+    { value: "chat", label: "Personal Chat" },
+    ...spaces().map((s) => ({ value: `space:${s.id}`, label: s.name })),
   ];
   return (
-    <SettingsGroup testID="search-form">
-      {/* The query is typed in the search box at the top of the window (TopSearch); no second field here. */}
-      <SettingRow
-        testID="search-query-echo"
-        label={searchQuery().trim() ? `Looking for “${searchQuery().trim()}”` : "Type what you're looking for in the search box at the top"}
-        description="Such as the deploy checklist, or what we decided about pricing. Return there, or Search, runs it."
-      />
-      <SettingRow label="Search in" description={`Now: ${scopeLabel(searchScope())}. Only Spaces you're a member of are listed.`}>
-        <Picker testID="search-scope" accessibilityLabel="Search in" items={items()} value={scopeValue(searchScope())} onChange={(v) => setScope(scopeFrom(v))} />
-      </SettingRow>
-      <Row padX={4} padY={3} justify="end">
-        <Action testID="search-submit" label="Search" busyLabel="Searching…" busy={searching()} variant="primary" onPress={() => void runSearch()} />
+    <Column gap={3} testID="search-form">
+      <Row align="center" gap={2} wrap testID="search-scope" accessibilityLabel="Search in">
+        <Label variant="caption" color="muted">
+          In
+        </Label>
+        <Each of={scopes()} key={(s) => s.value}>
+          {(s) => (
+            <Chip
+              testID={`search-scope:${s().value}`}
+              label={s().label}
+              accessibilityLabel={`Search in ${s().label}`}
+              selected={scopeValue(searchScope()) === s().value}
+              onPress={() => setScope(scopeFrom(s().value))}
+            />
+          )}
+        </Each>
       </Row>
-    </SettingsGroup>
+      <Label variant="caption" color="muted" testID="search-disclosure">
+        {searching()
+          ? "Searching…"
+          : "Return in the search box at the top sends your query to your embeddings connection, and, if you have a System One connection, a short list of matching messages you can read to it for reranking. Typing or changing a filter sends nothing."}
+      </Label>
+    </Column>
   );
 }
 
@@ -198,7 +204,7 @@ function Results() {
             </SettingsGroup>
           </If>
           <Each of={visibleHits()} key={hitKey}>
-            {(hit) => <ResultCard hit={hit()} ranking={answer().ranking} />}
+            {(hit) => <MessageResult hit={hit()} query={answer().query} />}
           </Each>
         </Column>
       )}
@@ -236,27 +242,22 @@ function IndexProgressLine() {
   );
 }
 
-function ResultCard(props: { hit: SearchHit; ranking: SearchRanking }) {
+/** One message; the whole card opens its conversation at that message. */
+function MessageResult(props: { hit: SearchHit; query: string }) {
   const hit = () => props.hit;
   return (
-    <Surface variant="card" pad={4} gap={2} testID={`search-result:${hitKey(hit())}`}>
-      <Row align="center" gap={2} wrap>
-        <Label variant="strong">{hit().actor}</Label>
-        <Badge tone={hit().spaceId === null ? "agent" : "neutral"} label={whereText(hit())} />
-        <Label variant="caption" color="muted">
-          {scoreText(hit().score, props.ranking)}
-        </Label>
-      </Row>
-      <Label lines={6}>{hit().text}</Label>
-      <Row justify="end">
-        <Action
-          testID={`search-open:${hitKey(hit())}`}
-          label="Open conversation"
-          accessibilityLabel={`Open conversation: ${whereText(hit())}`}
-          variant="ghost"
-          onPress={() => void openHit(hit())}
-        />
-      </Row>
-    </Surface>
+    <Column testID={`search-result:${hitKey(hit())}`}>
+      <ResultCard
+        testID={`search-open:${hitKey(hit())}`}
+        accessibilityLabel={`Open conversation: ${hit().actor} in ${whereText(hit())}`}
+        onPress={() => void openHit(hit())}
+      >
+        <Row align="center" gap={2} wrap>
+          <Label variant="strong">{hit().actor}</Label>
+          <Badge tone={hit().spaceId === null ? "agent" : "neutral"} label={whereText(hit())} />
+        </Row>
+        <MarkedText parts={markTerms(hit().text, props.query)} lines={4} />
+      </ResultCard>
+    </Column>
   );
 }
