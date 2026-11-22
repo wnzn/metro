@@ -48,6 +48,15 @@ const TOOL_RESULT_KINDS = new Set(["tool_result", "tool_output", "runner_result"
 const THINKING_KINDS = new Set(["thinking", "reasoning", "reasoning_summary", "thinking_summary", "agent_thinking", "agent_reasoning"]);
 const PROGRESS_KINDS = new Set(["progress", "working", "agent_progress", "agent_working"]);
 
+/** Where a step stands, for its icon: called, complete, failed, a thought, progress, or stopped (cancelled, interrupted). */
+export function stepPhase(a: Activity): "called" | "complete" | "failed" | "thinking" | "progress" | "stopped" {
+  if (a.tone === "danger") return "failed";
+  if (a.kind === "tool_call") return "called";
+  if (a.kind === "tool_result") return "complete";
+  if (a.kind === "thinking") return "thinking";
+  return a.tone === "warning" ? "stopped" : "progress";
+}
+
 /** The event's activity, or null when it should stay visible as it is. */
 export function activityOf(event: { kind: string; text: string }): Activity | null {
   const k = norm(event.kind);

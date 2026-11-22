@@ -1,7 +1,7 @@
 import { expect, test } from "nsh/test";
 import type { EventActivity, RoomEvent } from "../../api/client";
 import { toActivity } from "../../api/client";
-import { groupAccessibleLabel, groupOutcomeText, groupTitle, groupTranscript } from "./group";
+import { groupAccessibleLabel, groupOutcomeText, groupTitle, groupTranscript, routeBadge, routeConfidence, routeText } from "./group";
 import type { ActivityGroup, TranscriptItem } from "./group";
 
 let nextId = 1;
@@ -122,4 +122,25 @@ test("activity metadata is read strictly", () => {
   for (const bad of [null, "r1", { id: "", source: "agent" }, { id: "r1", source: "human" }, { name: "x", source: "agent" }]) expect(toActivity(bad)).toBe(undefined);
   // A turn without a name falls back to the built-in agent's.
   expect(groupTitle(groups(groupTranscript([ev("activity", "agent", "", { id: "n", name: "", source: "agent", phase: "started" })]))[0]!)).toBe("Metro is thinking…");
+});
+
+const route = (over: Partial<import("../../api/client").ActivityRoute>): import("../../api/client").ActivityRoute => ({
+  source: "case", addressedBy: "classifier", caseLabel: "Code review", providerId: null, modelId: null, reason: 'System One matched the use case "Code review" (p 0.91)', ...over,
+});
+
+test("route attribution: a compact badge, and the full sentence in words, never the raw p", () => {
+  expect(routeConfidence(route({}))).toBe(91);
+  expect(routeBadge(route({}))).toBe("Routed: Code review · 91%");
+  expect(routeBadge(route({ reason: 'System One matched the use case "Code review" (p 1.00)' }))).toBe("Routed: Code review · 100%");
+  expect(routeBadge(route({ reason: "picked" }))).toBe("Routed: Code review"); // no probability given
+  expect(routeBadge(route({ source: "override", caseLabel: null, addressedBy: "explicit" }))).toBe("Routed: chosen model");
+  expect(routeBadge(route({ source: "default", caseLabel: null }))).toBe("Started by System One");
+  expect(routeBadge(route({ source: "default", caseLabel: null, addressedBy: "schedule" }))).toBe("Scheduled");
+  expect(routeBadge(route({ source: "default", caseLabel: null, addressedBy: "explicit" }))).toBe(null);
+
+  const sentence = routeText(route({ reason: 'System One matched the use case "Code review" (p 0.91).' }));
+  expect(sentence).toBe('Use case “Code review” answered: System One matched the use case "Code review" with 91% probability. System One judged that the message asked the agent; nobody typed @agent.');
+  // An out-of-range probability is dropped, not shown.
+  expect(routeConfidence(route({ reason: "matched (p 7.5)" }))).toBe(null);
+  expect(routeText(route({ reason: "matched (p 7.5)" }))).not.toContain("p 7.5");
 });

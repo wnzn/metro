@@ -202,20 +202,41 @@ export function groupOutcomeText(g: ActivityGroup): string | null {
   }
 }
 
+/** System One's "(p 0.91)" in a route's reason: its probability, 0..1. */
+const PROBABILITY = /\s*\(p\s*(\d+(?:\.\d+)?|\.\d+)\)/i;
+
+/** The probability a route's reason gives, as a whole percent; null when it gives none (or one out of range). */
+export function routeConfidence(r: ActivityRoute | null): number | null {
+  const m = r ? PROBABILITY.exec(r.reason) : null;
+  if (!m) return null;
+  const p = Number(m[1]);
+  return Number.isFinite(p) && p >= 0 && p <= 1 ? Math.round(p * 100) : null;
+}
+
+/** A route's reason with "(p 0.91)" said in words ("with 91% probability"); a malformed one is dropped. */
+function readableReason(r: ActivityRoute): string {
+  const pct = routeConfidence(r);
+  return r.reason.replace(PROBABILITY, pct === null ? "" : ` with ${pct}% probability`).trim().replace(/[.\s]+$/, "");
+}
+
 /**
- * The turn's route in a few words for the collapsed row, or null when there
- * is nothing worth a badge (the asker's own default, a typed @agent).
+ * The turn's route in a few words for the collapsed row ("Routed: Code
+ * review · 91%"), or null when there is nothing worth a badge (the asker's own
+ * default, a typed @agent). The full sentence is only in the opened details.
  */
 export function routeBadge(r: ActivityRoute | null): string | null {
   if (!r) return null;
-  if (r.source === "case" && r.caseLabel) return r.caseLabel;
-  if (r.source === "override") return "model chosen";
-  if (r.addressedBy === "classifier") return "started by System One";
-  if (r.addressedBy === "schedule") return "scheduled";
+  if (r.source === "case" && r.caseLabel) {
+    const pct = routeConfidence(r);
+    return `Routed: ${r.caseLabel}${pct === null ? "" : ` · ${pct}%`}`;
+  }
+  if (r.source === "override") return "Routed: chosen model";
+  if (r.addressedBy === "classifier") return "Started by System One";
+  if (r.addressedBy === "schedule") return "Scheduled";
   return null;
 }
 
-/** The turn's route in a sentence or two, for the opened details. */
+/** The turn's route in a sentence or two, for the opened details. Never the raw "(p 0.91)". */
 export function routeText(r: ActivityRoute): string {
   const how =
     r.addressedBy === "classifier"
@@ -234,7 +255,8 @@ export function routeText(r: ActivityRoute): string {
     inherited: "The parent turn's model",
   };
   const model = r.modelId ? ` (${r.providerId ? `${r.providerId} · ` : ""}${r.modelId})` : "";
-  const reason = r.reason ? `: ${r.reason}` : "";
+  const said = r.reason ? readableReason(r) : "";
+  const reason = said ? `: ${said}` : "";
   return [`${where[r.source]}${model} answered${reason}.`, how].filter(Boolean).join(" ");
 }
 

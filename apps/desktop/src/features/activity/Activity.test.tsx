@@ -8,8 +8,8 @@ import { BASE, TOKENS, world } from "../../../test/fakeServer";
 type F = ReturnType<typeof world>;
 type Act = { id: string; name: string; source: "agent" | "demo"; phase?: string };
 
-async function signedIntoAcme(f: F, user: "alice" | "bob" = "alice") {
-  const app = await open("../../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800 });
+async function signedIntoAcme(f: F, user: "alice" | "bob" = "alice", options: { reducedMotion?: boolean } = {}) {
+  const app = await open("../../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, ...options });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
@@ -226,4 +226,71 @@ test("screen readers hear the group's title, outcome, size and whether it is ope
   await app.press("label:Show details: Metro\u2019s activity, completed, 3 steps");
   await app.waitFor("id:activity-details:agent:kb");
   expect(shown(app, "label:Hide details: Metro\u2019s activity, completed, 3 steps")).toBe(true);
+});
+
+test("a live turn shows a working indicator beside its title, gone once the turn ends", async () => {
+  const f = world();
+  const a = turn("live");
+  startTurn(f, a);
+  const app = await signedIntoAcme(f);
+  await app.waitFor("id:activity-live:agent:live");
+  expect(shown(app, "id:activity-toggle:agent:live >> id:activity-live:agent:live")).toBe(true);
+  // Decorative: screen readers hear the title, not the dots.
+  expect(shown(app, "label:Show details: Metro is thinking…, in progress, 1 step")).toBe(true);
+  finishTurn(f, a);
+  await app.waitFor("text:Metro’s activity");
+  expect(shown(app, "id:activity-live:agent:live")).toBe(false);
+});
+
+test("with reduced motion the working indicator is drawn still, with no motion", async () => {
+  const f = world();
+  startTurn(f, turn("calm"));
+  const moving = await signedIntoAcme(f);
+  await moving.waitFor("id:activity-live-dots:agent:calm:moving");
+  expect(moving.shows("id:activity-live-dots:agent:calm:still")).toBe(false);
+
+  const g = world();
+  startTurn(g, turn("calm"));
+  const calm = await signedIntoAcme(g, "alice", { reducedMotion: true });
+  await calm.waitFor("id:activity-live-dots:agent:calm:still");
+  expect(calm.shows("id:activity-live-dots:agent:calm:moving")).toBe(false);
+  expect(calm.shows("text:Metro is thinking…")).toBe(true); // the words say it either way
+});
+
+test("each step has a phase icon; tool output is a box that can be copied whole", async () => {
+  const f = world();
+  const a = turn("icons");
+  const { call } = startTurn(f, a);
+  const { result, summary } = finishTurn(f, a);
+  const bad = post(f, { kind: "tool_result", actor: "runner", text: "workspace.check failed\nexit status 1", activity: a });
+  const app = await signedIntoAcme(f);
+  await app.press("id:activity-toggle:agent:icons");
+  await app.waitFor("id:activity-details:agent:icons");
+  expect(shown(app, `id:activity-step-icon:${call.id}:called`)).toBe(true);
+  expect(shown(app, `id:activity-step-icon:${result.id}:complete`)).toBe(true);
+  expect(shown(app, `id:activity-step-icon:${summary.id}:thinking`)).toBe(true);
+  expect(shown(app, `id:activity-step-icon:${bad.id}:failed`)).toBe(true);
+  // The provider's summary is prose, not a code box.
+  expect(shown(app, `id:activity-output:${summary.id}`)).toBe(false);
+
+  await app.press(`id:activity-output:${result.id}:copy`);
+  await app.waitFor(`id:activity-output:${result.id}:copy >> text:Copied`);
+  expect(app.clipboard()).toBe("README.md\nsrc/");
+  expect(shown(app, "id:activity-details:agent:icons")).toBe(true); // copying never closes the group
+});
+
+test("long tool output in a turn folds to a few lines, shows all N on demand, and copies all of it", async () => {
+  const f = world();
+  const a = turn("long");
+  post(f, { kind: "activity", actor: "agent", text: "", activity: phase(a, "started") });
+  const lines = Array.from({ length: 24 }, (_, i) => `entry ${i + 1}`);
+  const out = post(f, { kind: "tool_result", actor: "runner", text: `workspace.list ok\n${lines.join("\n")}`, activity: a });
+  post(f, { kind: "activity", actor: "agent", text: "", activity: phase(a, "completed") });
+  const app = await signedIntoAcme(f);
+  await app.press("id:activity-toggle:agent:long");
+  await app.waitFor(`id:activity-output:${out.id}:fold >> text:Show all 24 lines`);
+  await app.press(`id:activity-output:${out.id}:fold`);
+  await app.waitFor(`id:activity-output:${out.id}:fold >> text:Show less`);
+  await app.press(`id:activity-output:${out.id}:copy`);
+  await app.waitUntil(() => app.clipboard() === lines.join("\n"));
 });

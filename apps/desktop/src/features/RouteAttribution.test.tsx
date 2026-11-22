@@ -1,7 +1,8 @@
 // A turn says which model answered and why (its `started` marker's
-// `activity.route`), as a small badge on the one collapsed row and a line in
-// its opened details. A message System One judged to be for the agent is
-// labelled as detected, never shown as an "@agent" its sender typed.
+// `activity.route`), as a compact "Routed: … · N%" badge on the one collapsed
+// row and a complete sentence only in its opened details. The raw "(p 0.91)"
+// is never shown. A message System One judged to be for the agent is labelled
+// as detected, never shown as an "@agent" its sender typed.
 
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
@@ -64,19 +65,22 @@ test("a classifier-started, use-case-routed turn: detected label, one row with a
   expect(app.shows(`id:event:${ask.id} >> text:@agent`)).toBe(false);
   expect(app.shows(`id:event:${ask.id} >> text:to the agent`)).toBe(true);
 
-  // One collapsed row with a small badge; no reason, model or connection id in the transcript.
+  // One collapsed row with a compact badge; no sentence, model or connection id in the transcript.
   expect(app.count("id:activity:agent:r1")).toBe(1);
-  expect(app.shows("id:activity-route-badge:agent:r1 >> text:Code review")).toBe(true);
+  expect(app.shows("id:activity-route-badge:agent:r1 >> text:Routed: Code review · 91%")).toBe(true);
   expect(app.shows("id:activity-route:agent:r1")).toBe(false);
   expect(text(app)).not.toContain("p 0.91");
+  expect(text(app)).not.toContain("System One matched");
+  expect(text(app)).not.toContain("gpt-fixture-2");
   expect(text(app)).not.toContain("pc_0123456789abcdef");
   expect(app.shows("text:2 steps")).toBe(true); // the route is not a step
 
   await app.press("id:activity-toggle:agent:r1");
   await app.waitFor("id:activity-route:agent:r1");
   const line = text(app);
-  expect(line).toContain('Use case “Code review” (openai · gpt-fixture-2) answered: System One matched the use case "Code review" (p 0.91).');
+  expect(line).toContain('Use case “Code review” (openai · gpt-fixture-2) answered: System One matched the use case "Code review" with 91% probability.');
   expect(line).toContain("System One judged that the message asked the agent; nobody typed @agent.");
+  expect(line).not.toContain("(p 0.91)"); // never the raw probability
   expect(line).not.toContain("pc_0123456789abcdef"); // connection ids are never shown
 });
 
@@ -103,7 +107,7 @@ test("a routed turn with no tool steps stays one row with its badge, and opens t
   const app = await inAcme(f);
   await app.waitFor("text:reply for quick");
   await app.waitFor("id:activity-route-badge:agent:quick");
-  expect(app.shows("id:activity-route-badge:agent:quick >> text:model chosen")).toBe(true);
+  expect(app.shows("id:activity-route-badge:agent:quick >> text:Routed: chosen model")).toBe(true);
   await app.press("id:activity-toggle:agent:quick");
   await app.waitFor("id:activity-route:agent:quick");
   expect(text(app)).toContain("The model chosen for this message (qwen-fixture) answered: the model you chose for this message.");
@@ -120,4 +124,24 @@ test("a malformed route is ignored, and the composer never sends addressed_by", 
   await app.waitUntil(() => f.posts().some((p) => p.path === "/v1/spaces/acme/rooms/lobby/messages"));
   const sent = f.posts().find((p) => p.path === "/v1/spaces/acme/rooms/lobby/messages")!;
   expect(JSON.stringify(sent.body)).not.toContain("addressed_by");
+});
+
+test("a probability of 1.00 reads 100% on the badge and in words when opened, never as p 1.00", async () => {
+  const f = world();
+  turn(f, "sure", {
+    source: "case",
+    addressed_by: "classifier",
+    case_key: "incident_review",
+    case_label: "Incident review",
+    provider_id: "custom",
+    model_id: "fixture/shared-local",
+    reason: 'System One matched the use case "Incident review" (p 1.00)',
+  }, false);
+  const app = await inAcme(f);
+  await app.waitFor("id:activity-route-badge:agent:sure");
+  expect(app.shows("id:activity-route-badge:agent:sure >> text:Routed: Incident review · 100%")).toBe(true);
+  await app.press("id:activity-toggle:agent:sure");
+  await app.waitFor("id:activity-route:agent:sure");
+  expect(text(app)).toContain('System One matched the use case "Incident review" with 100% probability.');
+  expect(text(app)).not.toContain("p 1.00");
 });
