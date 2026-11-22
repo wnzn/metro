@@ -346,7 +346,7 @@ export function ComposerBar(props: { leading?: JSX.Element; trailing?: JSX.Eleme
   return (
     <View class="flex-row items-center gap-(--space-2) px-(--space-2) pb-(--space-2)">
       <View class="flex-1 min-w-0 flex-row items-center gap-(--space-1)">{props.leading}</View>
-      <View class="flex-row items-center gap-(--space-2)">{props.trailing}</View>
+      <View class="shrink-0 flex-row items-center gap-(--space-2)">{props.trailing}</View>
     </View>
   );
 }
@@ -401,7 +401,12 @@ export function ComposerField(
 /** The one line of help under the composer, shown while it has the focus. */
 export function ComposerHint(props: Testable & { text: string }) {
   return (
-    <Text class="px-(--space-1) text-(length:--text-xs) text-muted-foreground" style={{ numberOfLines: 2 }} testID={props.testID}>
+    <Text
+      class="flex-1 shrink min-w-0 px-(--space-1) text-(length:--text-xs) text-muted-foreground"
+      style={{ numberOfLines: 2 }}
+      accessibilityLabel={props.text}
+      testID={props.testID}
+    >
       {props.text}
     </Text>
   );

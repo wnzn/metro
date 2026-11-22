@@ -233,3 +233,16 @@ test("disabled Send and Ask agent are muted, never a dimmed brand fill, in both 
     expect(f.posts().some((p) => p.path.endsWith("/messages"))).toBe(false); // the chip asks only when pressed
   }
 });
+
+test("at 720 and 860 the focused hint keeps its full wording beside Ask agent and Send", async () => {
+  for (const width of [720, 860]) {
+    const f = world();
+    const app = await inAcme(f);
+    await app.setViewport(width, 800);
+    await app.type("id:composer", "x");
+    await app.waitFor("id:composer-hint");
+    expect(app.shows("label:Return sends · Shift+Return adds a line · @agent or Ask agent asks this Space's agent; @name only notifies them.")).toBe(true);
+    expect(app.enabled("id:ask-agent")).toBe(true);
+    expect(app.enabled("id:send")).toBe(true);
+  }
+});
