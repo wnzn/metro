@@ -60,10 +60,11 @@ export type Status =
 export type View = "room" | "manage";
 /**
  * What the user is looking at: the personal Chat, the active Space, the
- * user's own Search and Scheduled tasks (both outside every Space), or
- * Settings, which opens as a modal over whichever of those is underneath.
+ * user's own Search, Library (Documents & media) and Scheduled tasks (all
+ * outside every Space), or Settings, which opens as a modal over whichever of
+ * those is underneath.
  */
-export type Place = "chat" | "space" | "settings" | "search" | "schedules";
+export type Place = "chat" | "space" | "settings" | "search" | "library" | "schedules";
 /** Where the main panel is under any modal: never Settings. */
 export type MainPlace = Exclude<Place, "settings">;
 /** The pages of Settings. Reachable with or without any Space. */
@@ -326,8 +327,8 @@ export function openChat() {
   kick();
 }
 
-/** Opens Search or Scheduled tasks: the user's own pages, outside every Space. */
-export function openPlace(where: "search" | "schedules") {
+/** Opens Search, Library or Scheduled tasks: the user's own pages, outside every Space. */
+export function openPlace(where: "search" | "library" | "schedules") {
   if (basePlace() === where && !settingsOpen()) return;
   batch(() => {
     clearTransient();
