@@ -26,6 +26,8 @@
 #              deterministic local OpenAI-compatible double of the MODEL only
 #              (server, Rig, tool call, runner and listing stay real); 0 skips
 #              the agent shots so nothing calls a model.
+#   ONLY       optional space-separated scenarios to run (default: all), e.g.
+#              ONLY="alice-activity alice-chat" for the Chat and runs shots only.
 #   THEME      dark (default) or light: every shot after connecting in that
 #              appearance (connection*.png are taken in dark runs only).
 #
@@ -50,7 +52,7 @@ repo="$(cd "$app/../.." && pwd)"
 out_arg="${1:-$repo/docs/screenshots}"
 mkdir -p "$out_arg"
 out="$(cd "$out_arg" && pwd)"
-bin="${METRO_BIN:-$repo/target/debug}"
+bin="$(cd "${METRO_BIN:-$repo/target/debug}" && pwd)" # absolute: launch tells the program from VAR=value by its leading /
 image="metro-desktop-shots:trixie"
 if [ -z "${NSH_DIST:-}" ]; then
   nsh_path="$(readlink -f "$(command -v nsh)")" || { echo "nsh not on PATH; set NSH_DIST" >&2; exit 1; }
@@ -81,6 +83,30 @@ tar -C "$app" --exclude=.nsh --exclude=target --exclude=node_modules -cf - . | t
 chmod -R a+rX,go-w "$stage"
 
 # --- secrets (files only) ------------------------------------------------
+# launch VAR@FILE... -- [VAR=value...] PROGRAM [ARG...]
+# Starts PROGRAM with only the given environment. Each VAR@FILE value is read
+# from its mode-600 file inside the launcher and handed over by execve, so no
+# secret is ever in an argv (no `env VAR=$(cat file)`), and nothing is printed.
+launch() {
+  env -i PATH=/usr/bin:/bin python3 -I -c '
+import os, stat, sys
+args = sys.argv[1:]
+cut = args.index("--")
+env = {}
+for spec in args[:cut]:
+    name, path = spec.split("@", 1)
+    st = os.stat(path)
+    if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+        sys.exit(f"launch: {name} must come from a private (mode 600) file")
+    with open(path, encoding="utf-8") as f:
+        env[name] = f.read().strip()
+rest = args[cut + 1:]
+while rest and "=" in rest[0] and not rest[0].startswith("/"):
+    name, value = rest.pop(0).split("=", 1)
+    env[name] = value
+os.execve(rest[0], rest, env)
+' "$@"
+}
 openssl rand -hex 24 >"$sec/alice"
 openssl rand -hex 24 >"$sec/bob"
 for u in alice bob; do printf 'Authorization: Bearer %s\n' "$(cat "$sec/$u")" >"$sec/$u.hdr"; done
@@ -110,14 +136,28 @@ printf '[package]\nname = "acme"\n' >"$ws/Cargo.toml"
 
 # --- server ---------------------------------------------------------------
 agent=""
-model_env=()
+model_env=()     # non-secret VAR=value (the scripted double's)
+model_secrets=() # VAR@file (a real model's, from MODEL_ENV_FILE)
 fixture_url=""
 openssl rand -base64 32 >"$sec/provider.key" # the provider master key (a file, never argv)
 if [ -n "${MODEL_ENV_FILE:-}" ]; then
   [ "$(stat -c %a "$MODEL_ENV_FILE")" = 600 ] || { echo "MODEL_ENV_FILE must be mode 600" >&2; exit 1; }
-  while IFS= read -r line; do
-    case "$line" in METRO_MODEL=*|METRO_MODEL_BASE_URL=*|METRO_MODEL_API_KEY=*) model_env+=("$line") ;; esac
-  done <"$MODEL_ENV_FILE"
+  # Each allowed line becomes its own mode-600 file in $sec (read in Python,
+  # never in argv); the launcher passes them on as METRO_MODEL*@file.
+  python3 -I - "$MODEL_ENV_FILE" "$sec" <<'PY_MODEL'
+import os, pathlib, sys
+src, sec = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+for line in src.read_text(encoding="utf-8").splitlines():
+    name, sep, value = line.partition("=")
+    if sep and name in ("METRO_MODEL", "METRO_MODEL_BASE_URL", "METRO_MODEL_API_KEY"):
+        path = sec / ("model-" + name)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(value)
+PY_MODEL
+  for name in METRO_MODEL METRO_MODEL_BASE_URL METRO_MODEL_API_KEY; do
+    [ -f "$sec/model-$name" ] && model_secrets+=("$name@$sec/model-$name")
+  done
   agent=real
 elif [ "${SCRIPTED_MODEL:-1}" = 1 ]; then
   python3 "$here/scripted_model.py" "$tmp/model.port" "${MODEL_HOLD_SECONDS:-15}" >"$tmp/model.log" 2>&1 &
@@ -129,7 +169,7 @@ elif [ "${SCRIPTED_MODEL:-1}" = 1 ]; then
     "METRO_PROVIDER_ALLOWED_BASE_URLS=[\"$fixture_url\"]")
   agent=scripted
 fi
-env -i PATH=/usr/bin:/bin HOME="$tmp" \
+launch "${model_secrets[@]}" -- PATH=/usr/bin:/bin HOME="$tmp" \
   METRO_BIND="127.0.0.1:$port" METRO_DB="$tmp/metro.sqlite" \
   METRO_DEV_USERS_FILE="$sec/dev-users.json" "${model_env[@]}" \
   METRO_ORG_ADMINS='["alice"]' METRO_PROVIDER_KEY_FILE="$sec/provider.key" \
@@ -144,7 +184,7 @@ sid="$(node -e 'process.stdout.write(String(JSON.parse(process.argv[1]).id))' "$
 api alice POST "/v1/spaces/$sid/members" '{"user_id":"bob"}' >/dev/null
 api alice POST "/v1/spaces/$sid/runner-token" '{}' |
   node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>process.stdout.write(JSON.parse(s).token))' >"$sec/runner"
-env -i PATH=/usr/bin:/bin HOME="$tmp" METRO_RUNNER_TOKEN="$(cat "$sec/runner")" \
+launch METRO_RUNNER_TOKEN@"$sec/runner" -- PATH=/usr/bin:/bin HOME="$tmp" \
   METRO_SERVER_URL="$url" METRO_WORKSPACE="$ws" \
   "$bin/metro-runner" >"$tmp/runner.log" 2>&1 &
 pids+=($!)
@@ -159,7 +199,7 @@ rm -f "$sec/org-runner.json"
 site_sid="$(api alice POST /v1/spaces '{"name":"Website"}' | field id)"
 api alice PUT "/v1/spaces/$site_sid/runner" "{\"runner_id\":\"$org_runner\"}" >/dev/null
 mkdir -p "$tmp/registered"
-env -i PATH=/usr/bin:/bin HOME="$tmp" METRO_RUNNER_TOKEN="$(cat "$sec/org-runner")" \
+launch METRO_RUNNER_TOKEN@"$sec/org-runner" -- PATH=/usr/bin:/bin HOME="$tmp" \
   METRO_SERVER_URL="$url" METRO_WORKSPACE="$tmp/registered" \
   "$bin/metro-runner" >"$tmp/registered-runner.log" 2>&1 &
 pids+=($!)
@@ -188,44 +228,63 @@ run_app() { # stdin: steps
     sh /app/dev/screenshots/with-display.sh /opt/nsh/bin/nsh test App.tsx --target linux 2>&1 | redact # pipefail: a failed run fails the script
 }
 profile_name="Alice Rivera" profile_bio="Runs the Acme workspace." # typed by the tour at 780 wide
+want() { [ -z "${ONLY:-}" ] || [[ " $ONLY " == *" $1 "* ]]; }
 steps() { PROFILE_NAME="$profile_name" PROFILE_BIO="$profile_bio" URL="$url" SPACE="$sid" SITE="$site_sid" FIXTURE_URL="$fixture_url" SHOTS=/shots AGENT="$agent" THEME="$theme" node "$here/steps.mjs" "$@"; }
 
+event_id=""
+if want bob; then
 echo "== Bob mentions Alice from his desktop app"
 TOKEN_FILE="$sec/bob" steps bob | run_app
 event_id="$(api alice GET "/v1/spaces/$sid/rooms/lobby/events?after=0" |
   node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const e=JSON.parse(s).events.find(e=>e.actor==="bob"&&e.kind==="message");process.stdout.write(e?String(e.id):"")})')"
 [ -n "$event_id" ] || { echo "Bob's message is not on the server" >&2; exit 1; }
+fi
 
+if want alice; then
 echo "== Alice: connect screen, reaction, message, Demo, members"
 TOKEN_FILE="$sec/alice" EVENT_ID="$event_id" steps alice | run_app
+fi
 
 if [ -n "$agent" ]; then
+  if want alice-activity; then
   echo "== Alice asks @agent about the workspace: one turn, live then expanded ($agent model)"
   TOKEN_FILE="$sec/alice" steps alice-activity | run_app
+  fi
+  if want alice-chat; then
   echo "== Alice asks @agent, then the Chat's run controls ($agent model)"
   TOKEN_FILE="$sec/alice" steps alice-chat | run_app
+  fi
+  if want alice-agent; then
   sleep "${MODEL_HOLD_SECONDS:-15}" # let the child run finish
   thread_id="$(api alice GET "/v1/spaces/$sid/rooms" |
     node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const r=JSON.parse(s).rooms.find(r=>r.name==="workspace-audit"&&r.parent_room_id);process.stdout.write(r?String(r.id):"")})')"
   [ -n "$thread_id" ] || { echo "no delegated thread was created" >&2; exit 1; }
   echo "== Alice opens the delegated thread"
   TOKEN_FILE="$sec/alice" THREAD_ID="$thread_id" steps alice-agent | run_app
+  fi
 fi
 
+if want alice-settings; then
 echo "== Alice: Settings (runners, model providers, device onboarding)"
 TOKEN_FILE="$sec/alice" steps alice-settings | run_app
+fi
 # The connection the steps created exists on the server, its key-less listing came from the fixture.
-if [ -n "$fixture_url" ]; then
+if want alice-settings && [ -n "$fixture_url" ]; then
   api alice GET /v1/providers | node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{const c=JSON.parse(s).connections;if(!c.some(x=>x.model==="metro-scripted-test-model"&&x.is_default)){console.error(JSON.stringify(c.map(x=>({name:x.name,provider_id:x.provider_id,model:x.model,is_default:x.is_default,capability:x.capability}))));process.exit(1)}})' ||
     { echo "the provider connection was not saved with the listed model" >&2; exit 1; }
 fi
 
+if want space-settings; then
 echo "== Alice: appearance and a Space's runner"
 TOKEN_FILE="$sec/alice" steps space-settings | run_app
+fi
 
+if want tour; then
 echo "== Alice: room popovers and compact forms"
 TOKEN_FILE="$sec/alice" EVENT_ID="$event_id" steps tour | run_app
+fi
 
+if want tour-settings; then
 echo "== Alice: profile (also at 780 wide, saved), provider dropdown, appearance preview"
 TOKEN_FILE="$sec/alice" steps tour-settings | run_app
 # The compact Save really saved: the server has the name and bio typed at 780 wide.
@@ -236,12 +295,16 @@ let s = ""; process.stdin.on("data", (d) => (s += d)).on("end", () => {
   if (got.display_name !== want.display_name || got.bio !== want.bio) { console.error("profile not saved:", JSON.stringify(got)); process.exit(1); }
   console.log("profile saved at 780 wide:", JSON.stringify(got));
 });' || { echo "the compact profile save did not reach the server" >&2; exit 1; }
+fi
 
+if want invalid; then
 echo "== An invalid token is rejected"
 steps invalid | run_app
+fi
 
 # Tokens only ever lived in $sec; make sure none reached the output or the app.
-for f in "$sec/alice" "$sec/bob" "$sec/runner" "$sec/org-runner" "$sec/alice-runner" "$sec/provider.key"; do
+for f in "$sec/alice" "$sec/bob" "$sec/runner" "$sec/org-runner" "$sec/alice-runner" "$sec/provider.key" "$sec"/model-METRO_MODEL_API_KEY; do
+  [ -s "$f" ] || continue
   if grep -rqF -f "$f" -- "$out" "$app" "$stage" 2>/dev/null; then # -f: the token never reaches argv
     echo "a token was found under $out, $app or the staged app; refusing to keep the output" >&2
     exit 1
