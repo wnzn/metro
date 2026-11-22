@@ -23,26 +23,38 @@ room or thread in a Space you belong to.
 
 ## In the desktop app
 
-Open **Scheduled tasks** in the sidebar. Each task shows:
+This section describes the current source after 0.2.0. It isn't released.
+It's covered by the app's automated tests, with no recorded GUI run yet. The
+[screenshot](screenshots/scheduled-tasks.png) is historical and shows the
+0.2.0-era cards.
 
-- its schedule in words, for example *Every day at 09:00 · Asia/Manila*;
-- its next firing, in the task's zone and in UTC;
+Open **Scheduled tasks** in the sidebar. Each task's card shows:
+
+- its name and a short schedule summary;
+- its next firing, as a relative time plus the wall time in the task's zone.
+  Expand the card to see the exact time with its offset and UTC;
 - where it goes;
-- its prompt;
-- its last status, with **History**, **Edit**, **Pause**/**Resume** and
-  **Delete…** buttons.
+- its prompt, on one line;
+- its last status.
+
+**Edit** stays on the card. **History**, **Pause** or **Resume**, and
+**Delete…** are in the card's **More** menu. Delete asks you to confirm
+(**Delete task**) before anything is deleted.
 
 A one-time task that has fired reads **No more firings**. Its outcome stays
 in History, and you can still edit it with a new time, or delete it.
 
-**New task** opens a form with these fields:
+**New task** here creates a *schedule*. It's separate from **New task**
+under Chat's agent runs, which sends a task once, right away
+([spaces.md](spaces.md#personal-chat)). This **New task** opens a form with
+these fields:
 
 - **Name** and **Prompt.**
 - **Where:** your personal Chat, or a room or thread of a Space you're a
   member of.
 - **When: Once.**
   - Enter a date and a 24-hour time, at most 366 days ahead.
-  - **Read the time in:** *This device* (its IANA zone) or *UTC*.
+  - **Time zone:** *This device* (its IANA zone) or *UTC*.
   - The app sends that exact moment, with its offset, and the server stores
     it in UTC. The form previews it both ways, for example *Fires … Asia/Manila,
     which is … UTC*.
@@ -51,8 +63,8 @@ in History, and you can still edit it with a new time, or delete it.
 - **When: Repeats.**
   - Pick *Every day*, *Weekdays* or *Weekly* (choose the day) with an
     `HH:MM` time, or *Cron* to type a five-field expression.
-  - **Time zone** takes any IANA name, such as `Asia/Manila`. The **This
-    device's** and **UTC** buttons fill it in for you.
+  - **Time zone:** choose **This device**, **UTC** or **Other**, with the
+    IANA name in the field below, such as `Asia/Manila`.
   - The server checks the zone and the 15-minute minimum.
   - The next firing shown always comes from the server (`next_run_local`).
     The app never calculates it.
@@ -61,8 +73,8 @@ in History, and you can still edit it with a new time, or delete it.
 **History** lists each occurrence, with its due time, status and detail. The
 app labels the statuses in plain words: *Dispatched*, *Not dispatched* (for
 `error`), *Unknown*, *Missed*, *Cancelled*, *Refused: no access* (for
-`revoked`) and *Interrupted*. It repeats that *Dispatched* means the agent
-accepted the prompt, not that it succeeded.
+`revoked`) and *Interrupted*. It explains each status once, including that
+*Dispatched* means the agent accepted the prompt, not that it succeeded.
 
 ## What a scheduled prompt does
 

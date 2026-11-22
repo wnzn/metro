@@ -250,13 +250,20 @@ message search doesn't change.
 
    `partial: true`, with a `notice`, means not everything was searched yet.
 
-**In the desktop app.** Open **Search** in the sidebar, type what you're
-looking for, and pick where to search: **Everything you can read**, **Your
-personal Chat**, or one of your Spaces.
+**In the desktop app** (current source after 0.2.0, not released; covered
+by automated tests, no recorded GUI run yet). Type in the search box at the
+top of the window (<kbd>Ctrl</kbd>+<kbd>K</kbd>, or <kbd>⌘</kbd>+<kbd>K</kbd>
+on macOS, focuses it) and press **Return**. Typing or changing a filter
+sends nothing. Only Return runs the search. Search opens in
+**Conversations** mode. Pick where to search with the **In** chips:
+**Everything**, **Personal Chat**, or one of your Spaces. The
+**Documents & media** mode searches your files instead
+([library.md](library.md#in-the-desktop-app)).
 
 - Each result shows the author, where the message is (for example *Acme ›
-  #lobby* or *Personal Chat*), its text, a score label, and **Open
-  conversation**.
+  #lobby* or *Personal Chat*) and its text with your query words marked.
+  Pressing the result opens the conversation. Results show no raw score.
+  Results with no measurable similarity are folded under **Less relevant**.
 - The badge above the results says how they were ordered:
   - **Reranked by System One** (`classifier`) appears only when your System
     One connection actually scored every result.
@@ -264,21 +271,16 @@ personal Chat**, or one of your Spaces.
     and the rest follow in similarity order.
   - **Similarity order** (`embeddings`) means nothing was reranked. The
     notice says why.
-- The score label names what the number is:
-  - **System One relevance 0.95** when every result was reranked. It's the
-    System One `noul`.
-  - **similarity 0.81** when none was. It's the cosine similarity, clamped
-    to 0–1.
-  - Just **score** for partly reranked results, because the numbers then mix
-    the two scales.
+- When the search is partial, the app says so and offers **Index more**.
 
-  It's a ranking signal for that search, not a measure of answer quality.
-- When the search is partial, the app says so and offers to index more.
-
-The [screenshot](screenshots/semantic-search.png) shows *Reranked by System
+The [screenshot](screenshots/semantic-search.png) is historical: it shows
+the 0.2.0-era page, with a query field and button on the page and a score
+label on each result (*System One relevance 0.95*, *similarity 0.81*, or
+just *score* for partly reranked results). It shows *Reranked by System
 One* because the keyless fixture's System One endpoint did score every
 result. Its scores and its order prove that the wiring works, and say
-nothing about how good the ranking is with a real model.
+nothing about how good the ranking is with a real model. The API still
+returns each result's `score`.
 
 **Privacy checks.** Your access is checked when candidates are read, again
 just before any text goes to a model, and again on the final results. Each

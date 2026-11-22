@@ -472,8 +472,21 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 
 ## In the desktop app
 
-Open **Search** and choose **Documents & media**. The screenshots below are
-native Linux captures. They were taken against the real `metro-server`
+> **Navigation in the current source (after 0.2.0, not released).** Files
+> live on their own **Library** page in the sidebar: upload, the file list,
+> **Open**, **Index** and, under each row's **More** menu, **Delete…**,
+> which asks before it deletes. You choose the media model in **Settings ›
+> Model providers › Documents & media** (**Index and search with**, then
+> **Save**). There you'll also find **Where your files go**. To search files, type in the search box at the
+> top of the window (on the Library page it searches documents and media)
+> and press **Return**, or choose **Documents & media** in Search. Typing
+> sends nothing, and only Return runs the search. Results show no raw
+> scores. This layout is covered by the app's automated tests but has no
+> recorded GUI run yet.
+
+The screenshots below are historical: they show the 0.2.0-era layout, where
+files and the media model were under Search. They're native Linux captures,
+taken against the real `metro-server`
 binary, with a **scripted** media endpoint, so the scores show only that
 the wiring works and say nothing about ranking quality. The files in them
 were uploaded through the real authorized HTTP upload. The native file
@@ -489,7 +502,8 @@ verified.
 | ![Bob viewing a Space file before he's removed](screenshots/library-revocation-before.png) | ![After removal: the viewer closed and only Bob's personal files remain](screenshots/library-revocation-after.png) |
 | Bob viewing an Acme file… | …after the owner removes him: personal files only |
 
-**What the screen does:**
+**What the screens did in that layout** (the current source differs as
+described above):
 
 - **Upload** to your personal library or to a Space you're in. The screen
   lists the accepted types and the size limit, and says that uploading
@@ -710,8 +724,9 @@ without one.
   trusts, over HTTPS), the operator adds its exact base URL to
   `METRO_PROVIDER_ALLOWED_BASE_URLS`. You then choose **EmbeddingGemma 2 on
   an approved endpoint** in **Settings → Model providers**, give the base
-  URL, the model `google/embeddinggemma-2` and its key, and choose that
-  connection under Documents & media.
+  URL, the model `google/embeddinggemma-2` and its key. Then choose that
+  connection as your media model under **Documents & media** on the same
+  Settings page.
 - Whoever runs the endpoint, including a shared device's owner, sees the
   segments and bytes that are sent to it.
 

@@ -195,10 +195,13 @@ A room's agent can delegate work to **child threads** with the tools
   even your personal registered one, and Chat messages are never forwarded
   into a Space.
 - The cross-Space controls in Chat are for you, not the agent: you can list,
-  open, follow up on and stop runs (see [Runs](#runs)). From Chat, the desktop
-  also lets you send a task to the agent of a Space and room you pick
-  explicitly, and shows the recipient before you send. All of these check
-  your membership.
+  open, follow up on and stop runs (see [Runs](#runs)). In the desktop app,
+  **New task** beside Chat's agent runs sends a task right away to the agent
+  of a Space and a room or thread you pick explicitly. It shows the
+  recipient (*To: agent in Acme › #lobby*) before **Send to agent**, and
+  **Follow up** on a run opens the same form. It sends once, now. To send
+  later or repeatedly, use **Scheduled tasks › New task**
+  ([schedules.md](schedules.md)). All of these check your membership.
 
 ## Runs
 

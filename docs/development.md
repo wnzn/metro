@@ -350,7 +350,8 @@ METRO_EG2_API_KEY_HOST_FILE=/absolute/path/to/eg2.key \
 **5. Create the connection.** In **Settings**, choose **EmbeddingGemma 2 on
 an approved endpoint**. Use the base URL `http://embeddinggemma2:8795/v1`
 and the model `google/embeddinggemma-2`, and paste the same key. Then choose
-it under Documents & media.
+it as your media model under **Settings › Model providers › Documents &
+media**.
 
 - The Metro **server** resolves and calls this address, not your browser
   or connector.
