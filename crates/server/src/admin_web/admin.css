@@ -1,12 +1,13 @@
 /* Metro Workspace admin panel. No external fonts or assets.
  *
  * Tokens mirror the desktop theme (apps/desktop/theme/theme.json): same
- * names, same values. Only the two token blocks below hold colors, radii,
- * spacing and type; the rules after them use the variables only. */
+ * names, same values, plus a few admin-only aliases of them. Only the token
+ * blocks below hold colors, radii, spacing and type; the rules after them
+ * use the variables only. */
 :root {
   color-scheme: light dark;
 
-  /* Shape, spacing and type */
+  /* Shape, spacing and type (theme.json "theme") */
   --radius-sm: 8px;   /* controls, alerts, row cards */
   --radius: 12px;     /* cards */
   --radius-lg: 16px;  /* dialogs */
@@ -22,87 +23,92 @@
   --text-md: 14px;
   --text-lg: 16px;
   --text-xl: 20px;
+  --text-2xl: 24px;
+  --leading-xs: 16px;
+  --leading-sm: 20px;
+  --leading-md: 22px;
+  --leading-lg: 24px;
+  --leading-xl: 28px;
+  --leading-2xl: 32px;
   --control-h: 36px;
-  --control-h-sm: 32px;
+  --control-h-sm: 28px;
   --font-sans: Inter, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
 
-  /* Light palette */
-  --canvas: #f6f7f9;            /* page behind the cards (desktop sidebar tone) */
-  --background: #ffffff;
-  --foreground: #14161a;
+  /* Light palette (theme.json "light") */
+  --background: #f7f8fa;
+  --foreground: #111318;
   --card: #ffffff;
-  --card-foreground: #14161a;
+  --card-foreground: #111318;
   --popover: #ffffff;
-  --popover-foreground: #14161a;
-  --muted: #f2f3f5;
-  --muted-foreground: #5f6672;
-  --border: #e3e5e9;
-  --input: #cdd1d8;
-  --input-border: #868d98;      /* text-field outline, >= 3:1 (admin-only) */
-  --ring: #2563eb;
-  --primary: #2563eb;
-  --primary-hover: #1d4ed8;
+  --popover-foreground: #111318;
+  --muted: #f3f4f6;
+  --muted-foreground: #5c6370;
+  --border: #e4e6eb;
+  --input: #cfd4dc;
+  --ring: #3b5bdb;
+  --primary: #3b5bdb;
   --primary-foreground: #ffffff;
-  --secondary: #f2f3f5;
-  --secondary-hover: #e6e8ec;
-  --secondary-foreground: #14161a;
-  --accent-foreground: #1d4ed8;  /* links */
-  --destructive: #d4373d;
-  --destructive-hover: #b92a30;
+  --secondary: #f3f4f6;
+  --secondary-foreground: #111318;
+  --accent: #edf1ff;
+  --accent-foreground: #2b44b8;
+  --destructive: #c42b35;
   --destructive-foreground: #ffffff;
-  --destructive-outline: #b42328;      /* text on an outline destructive button */
-  --destructive-outline-border: #ecb0b2;
-  --destructive-outline-hover: #fde8e8;
-  --tone-success: #e3f8eb;
-  --tone-success-foreground: #166534;
-  --tone-warning: #fdf3d8;
-  --tone-warning-foreground: #8a3b0a;
-  --tone-danger: #fde8e8;
-  --tone-danger-foreground: #991b1b;
-  --tone-neutral: #f2f3f5;
+  --tone-neutral: #f1f2f4;
   --tone-neutral-foreground: #3d424b;
-  --code: #eef0f3;
+  --tone-success: #e5f7ec;
+  --tone-success-foreground: #166534;
+  --tone-warning: #fcf3d9;
+  --tone-warning-foreground: #8a3b0a;
+  --tone-danger: #fdeaea;
+  --tone-danger-foreground: #991b1b;
+  --primary-hover: #3150c9;
+  --destructive-hover: #a92530;
+  --control-edge: #858c97;
+
+  /* Admin-only aliases of the desktop tokens above. */
+  --canvas: var(--background);
+  --input-border: var(--control-edge);       /* text-field outline, >= 3:1 */
+  --destructive-outline: var(--destructive); /* outline Revoke: ink and border */
+  --destructive-outline-hover: var(--tone-danger);
+  --code: var(--muted);
   --backdrop: rgb(15 17 21 / 0.5);
   --shadow-dialog: 0 16px 48px rgb(15 17 21 / 0.18);
 }
 @media (prefers-color-scheme: dark) {
   :root {
-    --canvas: #0d0f12;
-    --background: #0d0f12;
-    --foreground: #e8eaed;
-    --card: #15181d;
-    --card-foreground: #e8eaed;
-    --popover: #181b21;
-    --popover-foreground: #e8eaed;
-    --muted: #1b1f25;
-    --muted-foreground: #9aa1ac;
-    --border: #262b33;
-    --input: #353b46;
-    --input-border: #636a77;
-    --ring: #4d82f0;
-    --primary: #2563eb;
-    --primary-hover: #1d4ed8;
+    /* Dark palette (theme.json "dark") */
+    --background: #0b0d10;
+    --foreground: #e6e8eb;
+    --card: #15181c;
+    --card-foreground: #e6e8eb;
+    --popover: #1b1e23;
+    --popover-foreground: #e6e8eb;
+    --muted: #1a1d22;
+    --muted-foreground: #9aa1ab;
+    --border: #262a31;
+    --input: #363c47;
+    --ring: #7a93ff;
+    --primary: #4263eb;
     --primary-foreground: #ffffff;
-    --secondary: #1f242b;
-    --secondary-hover: #2a3039;
-    --secondary-foreground: #e8eaed;
-    --accent-foreground: #a9c4fb;
-    --destructive: #d4373d;
-    --destructive-hover: #b92a30;
-    --destructive-foreground: #ffffff;
-    --destructive-outline: #fbc4c4;
-    --destructive-outline-border: #6e2a2e;
-    --destructive-outline-hover: #3a1214;
-    --tone-success: #0c2a1a;
-    --tone-success-foreground: #a7ecc1;
-    --tone-warning: #33240a;
-    --tone-warning-foreground: #f8dd8f;
-    --tone-danger: #3a1214;
-    --tone-danger-foreground: #fbc4c4;
-    --tone-neutral: #1f242b;
+    --secondary: #1e2228;
+    --secondary-foreground: #e6e8eb;
+    --accent: #1c2444;
+    --accent-foreground: #b9c6ff;
+    --destructive: #f47c7c;
+    --destructive-foreground: #1a0507;
+    --tone-neutral: #1e2228;
     --tone-neutral-foreground: #d0d4da;
-    --code: #1f242b;
+    --tone-success: #0d2819;
+    --tone-success-foreground: #a7ecc1;
+    --tone-warning: #2f230c;
+    --tone-warning-foreground: #f5d98a;
+    --tone-danger: #361416;
+    --tone-danger-foreground: #fbc4c4;
+    --primary-hover: #3a5ad9;
+    --destructive-hover: #f89a9a;
+    --control-edge: #666d79;
     --backdrop: rgb(0 0 0 / 0.6);
     --shadow-dialog: 0 16px 48px rgb(0 0 0 / 0.5);
   }
@@ -116,7 +122,7 @@ body {
   margin: 0;
   background: var(--canvas);
   color: var(--foreground);
-  font: var(--text-md)/1.5 var(--font-sans);
+  font: var(--text-md)/var(--leading-md) var(--font-sans);
 }
 [hidden] { display: none !important; }
 h1, h2 { line-height: 1.3; letter-spacing: -0.01em; }
@@ -146,7 +152,7 @@ main:focus, main:focus-visible { outline: none; }
   display: flex; align-items: center; justify-content: space-between; gap: var(--space-3); flex-wrap: wrap;
   min-height: 56px;
   padding: var(--space-2) clamp(var(--space-4), 4vw, var(--space-8));
-  background: var(--background); border-bottom: 1px solid var(--border);
+  background: var(--card); border-bottom: 1px solid var(--border);
 }
 .brand { display: flex; align-items: center; gap: var(--space-2); font-size: var(--text-md); }
 .logo {
@@ -199,7 +205,7 @@ code.block { display: block; margin: var(--space-2) 0; padding: var(--space-2) v
 .hint { color: var(--muted-foreground); font-size: var(--text-sm); margin: var(--space-2) 0 var(--space-3); }
 .input {
   width: 100%; min-height: var(--control-h); padding: var(--space-2) var(--space-3);
-  font: inherit; line-height: 1.25; color: var(--foreground); background: var(--background);
+  font: inherit; line-height: 1.25; color: var(--foreground); background: var(--card);
   border: 1px solid var(--input-border); border-radius: var(--radius-sm);
 }
 .input:focus-visible { border-color: var(--ring); outline-offset: 1px; }
@@ -224,7 +230,7 @@ code.block { display: block; margin: var(--space-2) 0; padding: var(--space-2) v
 .btn-danger:hover:not(:disabled) { background: var(--destructive-hover); }
 /* Destructive, outline: the row action that opens the confirmation. */
 .btn-ghost-danger {
-  background: transparent; color: var(--destructive-outline); border-color: var(--destructive-outline-border);
+  background: transparent; color: var(--destructive-outline); border-color: var(--destructive-outline);
 }
 .btn-ghost-danger:hover:not(:disabled) { background: var(--destructive-outline-hover); }
 .btn:disabled, .btn:disabled:hover {
