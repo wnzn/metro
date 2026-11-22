@@ -10,11 +10,17 @@
 // tinted with the theme's foreground, shown only beside the provider's own
 // name; any other provider gets a lettermark. Nothing is fetched at runtime.
 
-import { Image, Text, View, token, windowSize } from "nsh";
-import type { ImageAsset, JSX } from "nsh";
-import { Button, Dialog, Input, Select } from "nsh/base";
+import { Image, Text, View, cleanup, effect, keymap, reduceMotion, signal, token, untracked, windowSize } from "nsh";
+import type { ImageAsset, InputRef, JSX } from "nsh";
+import { Button, Dialog, Input, Menu, MenuItem, MenuSeparator, Select } from "nsh/base";
+import agentIcon from "./icons/agent.svg";
 import appearanceIcon from "./icons/appearance.svg";
 import chatIcon from "./icons/chat.svg";
+import fileIcon from "./icons/file.svg";
+import libraryIcon from "./icons/library.svg";
+import metroIcon from "./icons/metro.svg";
+import moreIcon from "./icons/more.svg";
+import sendIcon from "./icons/send.svg";
 import checkIcon from "./icons/check.svg";
 import chevronDownIcon from "./icons/chevron-down.svg";
 import chevronRightIcon from "./icons/chevron-right.svg";
@@ -54,14 +60,31 @@ import brandOllama from "./icons/brand-ollama.svg";
 import brandOpencode from "./icons/brand-opencode.svg";
 import brandXai from "./icons/brand-xai.svg";
 import brandSystemone from "./icons/brand-systemone.svg";
-import { cx, toneSurfaceClass, toneTextClass } from "./tokens";
+import {
+  controlEdgeClass,
+  controlHeightClass,
+  cx,
+  disabledClass,
+  focusRingClass,
+  popoverClass,
+  popoverItemClass,
+  popoverMotion,
+  textClass,
+  toneSurfaceClass,
+  toneTextClass,
+  tooltipClass,
+  transitionClass,
+} from "./tokens";
 import type { Tone } from "./tokens";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
 
 // ---------------------------------------------------------------- icons
 
+// The one map of the app's icon names. Any feature may use any name here;
+// a glyph only one screen draws can stay a local import beside it.
 const ICONS = {
+  agent: agentIcon,
   appearance: appearanceIcon,
   chat: chatIcon,
   check: checkIcon,
@@ -71,21 +94,26 @@ const ICONS = {
   close: closeIcon,
   copy: copyIcon,
   device: deviceIcon,
+  file: fileIcon,
   hash: hashIcon,
+  library: libraryIcon,
   logout: logoutIcon,
+  metro: metroIcon,
+  more: moreIcon,
   person: personIcon,
   plus: plusIcon,
   providers: providersIcon,
   routing: routingIcon,
   runner: runnerIcon,
   search: searchIcon,
+  send: sendIcon,
   server: serverIcon,
   settings: settingsIcon,
   thread: threadIcon,
 } as const;
 
 export type IconName = keyof typeof ICONS;
-export type IconColor = "default" | "muted" | "sidebar" | "sidebar-active" | "accent";
+export type IconColor = "default" | "muted" | "sidebar" | "sidebar-active" | "accent" | "danger" | "on-primary";
 
 const ICON_TOKEN = {
   default: "foreground",
@@ -93,10 +121,12 @@ const ICON_TOKEN = {
   sidebar: "sidebar-foreground",
   "sidebar-active": "sidebar-accent-foreground",
   accent: "accent-foreground",
+  danger: "destructive",
+  "on-primary": "primary-foreground",
 } as const;
 
 /** A decorative icon: screen readers skip it; say what it means in the control's label. */
-export function Icon(props: { name: IconName; color?: IconColor; size?: 14 | 16 | 20 }) {
+export function Icon(props: { name: IconName; color?: IconColor; size?: 12 | 14 | 16 | 20 }) {
   const size = () => props.size ?? 16;
   return (
     <Image
@@ -108,21 +138,135 @@ export function Icon(props: { name: IconName; color?: IconColor; size?: 14 | 16 
   );
 }
 
-const focusRing = "focus-visible:ring-2 focus-visible:ring-ring";
+const focusRing = focusRingClass;
 
 /** A square button with only an icon. `accessibilityLabel` is required: it is all a screen reader hears. */
 export function IconButton(props: { icon: IconName; accessibilityLabel: string; onPress: () => void; testID?: string; disabled?: boolean; tooltip?: string }) {
   return (
     <Button
-      class={cx("items-center justify-center size-[30px] rounded-(--radius-sm) hover:bg-muted active:bg-muted disabled:opacity-50", focusRing)}
+      class={cx("items-center justify-center size-[30px] rounded-(--radius-sm) hover:bg-muted active:bg-muted", transitionClass, disabledClass, focusRing)}
       onPress={props.onPress}
       disabled={props.disabled}
       accessibilityLabel={props.accessibilityLabel}
       testID={props.testID}
-      tooltip={props.tooltip ? <Text class="rounded-(--radius-sm) bg-popover border border-border px-(--space-2) py-[3px] text-(length:--text-xs) text-popover-foreground">{props.tooltip}</Text> : undefined}
+      tooltip={props.tooltip ? <Text class={tooltipClass}>{props.tooltip}</Text> : undefined}
     >
       <Icon name={props.icon} color="muted" />
     </Button>
+  );
+}
+
+// ---------------------------------------------------------------- brand
+
+/** Metro's own mark: an M on the primary colour. Decorative; the name beside it is what screen readers hear. */
+export function MetroMark(props: { size?: "sm" | "lg" }) {
+  const lg = () => props.size === "lg";
+  return (
+    <View
+      class={cx("items-center justify-center bg-primary", lg() ? "size-[36px] rounded-(--radius)" : "size-[22px] rounded-[6px]")}
+      accessibilityElementsHidden
+      testID="metro-mark"
+    >
+      <Image src={metroIcon} fadeDuration={0} style={{ width: lg() ? 22 : 15, height: lg() ? 22 : 15, tintColor: token("primary-foreground") }} accessibilityElementsHidden />
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------- account menu
+
+/** One account action: `ActionsMenuItem`'s shape (./primitives), plus an icon. */
+export type AccountMenuItem = {
+  /** Its testID. */
+  id: string;
+  label: string;
+  onPress: () => void;
+  icon?: IconName;
+  /** Ends something (Sign out): the danger colour, last, after a line. */
+  destructive?: boolean;
+  disabled?: boolean;
+};
+
+/**
+ * Who is signed in, where: a picture, a name and one quiet line (the
+ * server), pressed to open a menu of account actions. The trigger carries
+ * `testID`; each item its own `id`. `note` is a short line above the items
+ * (the user's ID), not an action.
+ */
+export function AccountMenu(props: {
+  testID?: string;
+  accessibilityLabel: string;
+  avatar: JSX.Element;
+  name: string;
+  detail: string;
+  detailIcon?: IconName;
+  note?: string;
+  items: readonly AccountMenuItem[];
+}) {
+  const plain = () => props.items.filter((i) => !i.destructive);
+  const ending = () => props.items.filter((i) => i.destructive);
+  const still = () => reduceMotion();
+  return (
+    <Menu
+      placement="top"
+      align="start"
+      offset={6}
+      popupClass={cx(popoverClass, "min-w-[232px]")}
+      popupStartingClass={still() ? undefined : popoverMotion.starting}
+      popupEndingClass={still() ? undefined : popoverMotion.ending}
+      backdropClass="bg-black/40"
+      trigger={
+        <View
+          class={cx("flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-(--space-2) hover:bg-sidebar-accent/60 active:bg-sidebar-accent", transitionClass, focusRing)}
+          focusable
+          testID={props.testID}
+          accessibilityLabel={props.accessibilityLabel}
+        >
+          {props.avatar}
+          <View class="flex-1 min-w-0 flex-col">
+            <Text class={cx(textClass.sm, "font-semibold text-sidebar-foreground")} style={{ numberOfLines: 1 }}>
+              {props.name}
+            </Text>
+            <View class="flex-row items-center gap-[4px] min-w-0">
+              <If when={props.detailIcon}>{(name) => <Icon name={name()} color="muted" size={12} />}</If>
+              <Text class={cx("flex-1", textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+                {props.detail}
+              </Text>
+            </View>
+          </View>
+          <Icon name="more" color="muted" />
+        </View>
+      }
+    >
+      <If when={props.note}>
+        <Text class={cx("px-(--space-2) pt-[4px] pb-[6px] font-mono text-muted-foreground", textClass.xs)} style={{ numberOfLines: 1 }}>
+          {props.note}
+        </Text>
+      </If>
+      <Each of={plain()} key={(i) => i.id}>
+        {(item) => <AccountEntry item={item()} />}
+      </Each>
+      <If when={plain().length > 0 && ending().length > 0}>
+        <MenuSeparator class="my-[4px] h-px bg-border" />
+      </If>
+      <Each of={ending()} key={(i) => i.id}>
+        {(item) => <AccountEntry item={item()} />}
+      </Each>
+    </Menu>
+  );
+}
+
+function AccountEntry(props: { item: AccountMenuItem }) {
+  return (
+    <MenuItem
+      class={cx("flex-row items-center gap-(--space-2)", popoverItemClass)}
+      testID={props.item.id}
+      disabled={props.item.disabled}
+      accessibilityLabel={props.item.label}
+      onSelect={() => props.item.onPress()}
+    >
+      <If when={props.item.icon}>{(name) => <Icon name={name()} color={props.item.destructive ? "danger" : "muted"} />}</If>
+      <Text class={cx(textClass.sm, props.item.destructive ? "text-tone-danger-foreground" : "text-popover-foreground")}>{props.item.label}</Text>
+    </MenuItem>
   );
 }
 
@@ -133,20 +277,32 @@ export const compactWidth = () => windowSize().width < 900;
 
 // ---------------------------------------------------------------- modal
 
+/** How many `Modal`s are open: the app's shortcuts leave the page under one alone. */
+const openModals = signal(0);
+/** A `Modal` is open over the app. */
+export const modalOpen = () => openModals() > 0;
+
 /**
  * A large modal over the app, in its own native layer: it takes the keyboard
  * focus and gives it back as it closes; Escape, the backdrop and `onClose`'s
- * callers close it. Sized to the window, never past it.
+ * callers close it. Sized to the window, never past it: a compact window
+ * gets a narrower margin. With reduced motion it appears without a fade.
  */
 export function Modal(props: Testable & { open: boolean; title: string; onClose: () => void; children?: JSX.Element }) {
+  effect(() => {
+    if (!props.open) return;
+    openModals.set(untracked(openModals) + 1);
+    return () => openModals.set(untracked(openModals) - 1);
+  });
   const size = () => {
     const w = windowSize();
-    return { width: Math.max(320, Math.min(1080, w.width - 48)), height: Math.max(360, Math.min(800, w.height - 48)) };
+    const margin = compactWidth() ? 16 : 48;
+    return { width: Math.max(320, Math.min(1080, w.width - margin)), height: Math.max(360, Math.min(800, w.height - margin)) };
   };
   return (
     <Dialog
       open={props.open}
-      animation="fade"
+      animation={reduceMotion() ? "none" : "fade"}
       accessibilityLabel={props.title}
       testID={props.testID}
       backdropTestID={props.testID ? `${props.testID}-backdrop` : undefined}
@@ -306,9 +462,11 @@ export function BrandPicker(props: {
       searchAccessibilityLabel="Search providers"
       searchTestID={props.testID ? `${props.testID}-search` : undefined}
       accessibilityLabel={props.accessibilityLabel}
-      popupClass="rounded-(--radius) border border-border bg-popover p-[4px] shadow-lg"
+      popupClass={popoverClass}
+      popupStartingClass={reduceMotion() ? undefined : popoverMotion.starting}
+      popupEndingClass={reduceMotion() ? undefined : popoverMotion.ending}
       listClass="max-h-[340px]"
-      itemClass="group rounded-(--radius-sm) px-(--space-2) py-[6px] focus:bg-accent disabled:opacity-50"
+      itemClass={cx("group", popoverItemClass)}
       searchClass="mb-[4px] rounded-(--radius-sm) border border-input bg-background px-(--space-2) py-(--space-1) text-(length:--text-sm) text-foreground"
       empty={<Text class="px-(--space-2) py-(--space-2) text-(length:--text-sm) text-muted-foreground">No provider matches.</Text>}
       testID={props.testID}
@@ -348,8 +506,12 @@ export function BrandPicker(props: {
 // ---------------------------------------------------------------- search box
 
 /**
- * The app's search box: a magnifier, the field and an optional trailing
- * control (a mode). Return submits.
+ * The app's search box: a raised pill with a magnifier, the field, an
+ * optional trailing control (a mode) and its keyboard shortcut. Return
+ * submits. `shortcut` (default `mod+k`, `null` for none) only moves the
+ * keyboard focus into the field, as a click does: it changes nothing else,
+ * and does nothing while a `Modal` is open over the box. The binding is
+ * removed with the box, so signing out and in again never stacks it.
  */
 export function SearchBox(
   props: Testable & {
@@ -360,13 +522,39 @@ export function SearchBox(
     placeholder: string;
     maxLength?: number;
     trailing?: JSX.Element;
+    shortcut?: string | null;
   },
 ) {
+  let field: InputRef | undefined;
+  const shortcut = props.shortcut === undefined ? "mod+k" : props.shortcut;
+  let hint = "";
+  if (shortcut) {
+    try {
+      const unbind = keymap.bind(
+        shortcut,
+        () => {
+          if (!modalOpen()) field?.focus();
+        },
+      );
+      cleanup(unbind);
+      hint = keymap.label(shortcut);
+    } catch {
+      /* a platform that keeps this keystroke: the box is still a click away */
+    }
+  }
   return (
-    <View class="flex-row items-center gap-(--space-2) w-full max-w-[560px] min-w-0 rounded-(--radius) border border-input bg-muted/60 pl-(--space-3) pr-[4px] focus-within:border-ring focus-within:bg-background">
+    <View
+      class={cx(
+        "flex-row items-center gap-(--space-2) w-full max-w-[560px] min-w-0 rounded-full border bg-card pl-(--space-3) pr-[6px] shadow-sm focus-within:border-ring focus-within:bg-background",
+        controlEdgeClass,
+        controlHeightClass.default,
+        transitionClass,
+      )}
+    >
       <Icon name="search" color="muted" />
       <Input
-        class="flex-1 min-w-0 py-[7px] text-(length:--text-sm) text-foreground placeholder:text-muted-foreground"
+        ref={(node) => (field = node)}
+        class={cx("flex-1 min-w-0 py-[6px] text-foreground placeholder:text-muted-foreground", textClass.sm)}
         value={props.value}
         onChange={({ value }) => props.onChange(value)}
         onSubmit={() => props.onSubmit()}
@@ -378,6 +566,11 @@ export function SearchBox(
         accessibilityLabel={props.accessibilityLabel ?? props.placeholder}
       />
       {props.trailing}
+      <If when={hint}>
+        <View class="rounded-[5px] border border-border bg-muted px-[6px] py-px" accessibilityElementsHidden testID={props.testID ? `${props.testID}-shortcut` : undefined}>
+          <Text class="text-[10px] font-medium text-muted-foreground">{hint}</Text>
+        </View>
+      </If>
     </View>
   );
 }
