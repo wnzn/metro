@@ -116,44 +116,76 @@ test("the shown text colors meet WCAG AA on their surfaces, in both schemes", as
   }
 });
 
-test("every token pair the primitives draw meets WCAG AA in both schemes", () => {
-  const pairs = [
-    ["foreground", "background"],
-    ["muted-foreground", "background"],
-    ["card-foreground", "card"],
-    ["muted-foreground", "card"],
-    ["muted-foreground", "muted"],
-    ["popover-foreground", "popover"],
-    ["primary-foreground", "primary"],
-    ["secondary-foreground", "secondary"],
-    ["accent-foreground", "accent"],
-    ["destructive-foreground", "destructive"],
-    ["sidebar-foreground", "sidebar"],
-    ["sidebar-accent-foreground", "sidebar-accent"],
-    ["muted-foreground", "sidebar"],
-    ["muted-foreground", "sidebar-accent"],
-    ["muted-foreground", "popover"],
-    ["accent-foreground", "background"],
-    // Destructive (outline) Actions and menu items draw this ink on the page, cards and popovers.
-    ["tone-danger-foreground", "background"],
-    ["tone-danger-foreground", "card"],
-    ["tone-danger-foreground", "popover"],
-    ...["neutral", "agent", "runner", "system", "success", "warning", "danger"].map((t) => [`tone-${t}-foreground`, `tone-${t}`]),
-  ];
+// Every text color the primitives draw, on every surface it is drawn on.
+const TEXT_PAIRS: [string, string][] = [
+  ["foreground", "background"],
+  ["foreground", "card"],
+  ["foreground", "muted"], // ghost Action label on its hover
+  ["muted-foreground", "background"],
+  ["muted-foreground", "card"],
+  ["muted-foreground", "popover"],
+  ["muted-foreground", "muted"], // disabled Actions, segmented track
+  ["card-foreground", "card"],
+  ["popover-foreground", "popover"],
+  ["popover-foreground", "muted"], // menu item hover
+  ["popover-foreground", "accent"], // menu item keyboard focus
+  ["primary-foreground", "primary"],
+  ["primary-foreground", "primary-hover"],
+  ["secondary-foreground", "secondary"],
+  ["secondary-foreground", "background"], // secondary Action
+  ["secondary-foreground", "card"],
+  ["accent-foreground", "accent"], // selected Chip
+  ["accent-foreground", "background"],
+  ["accent-foreground", "card"],
+  ["destructive-foreground", "destructive"], // danger (confirm) Action
+  ["destructive-foreground", "destructive-hover"],
+  ["destructive", "background"], // Label color="danger", destructive Action, menu items
+  ["destructive", "card"],
+  ["destructive", "popover"],
+  ["destructive", "tone-danger"], // destructive Action hover
+  ["sidebar-foreground", "sidebar"],
+  ["sidebar-foreground", "sidebar-hover"],
+  ["sidebar-accent-foreground", "sidebar-accent"], // selected NavItem
+  ["muted-foreground", "sidebar"],
+  ["muted-foreground", "sidebar-hover"],
+  ["muted-foreground", "sidebar-accent"], // NavItem trailing note when selected
+  ...["neutral", "agent", "runner", "system", "success", "warning", "danger"].map((t): [string, string] => [`tone-${t}-foreground`, `tone-${t}`]),
+];
+
+// Edges and indicators the user must find: 3:1 against what is next to them (WCAG 1.4.11).
+const EDGE_PAIRS: [string, string][] = [
+  ...["background", "card", "popover", "sidebar"].map((s): [string, string] => ["ring", s]),
+  ...["background", "card", "popover"].map((s): [string, string] => ["control-edge", s]), // fields, pickers, a switch's off track
+  ...["background", "card", "popover"].map((s): [string, string] => ["destructive", s]), // destructive outline
+  ["primary", "muted"], // the chosen segment on its track
+  ["primary", "background"],
+  ["primary", "card"],
+];
+
+test("every text pair the primitives draw meets WCAG AA, and every essential edge 3:1, in both schemes", () => {
   const failures: string[] = [];
   for (const [scheme, palette] of [["dark", dark], ["light", light]] as const) {
-    for (const [text, surface] of pairs) {
+    for (const [text, surface] of TEXT_PAIRS) {
       const ratio = contrast(palette[text], palette[surface]);
       if (ratio < 4.5) failures.push(`${scheme} ${text} on ${surface}: ${ratio.toFixed(2)}`);
     }
-    // The focus ring must stand out from the page (WCAG 1.4.11, 3:1).
-    const ring = contrast(palette.ring, palette.background);
-    if (ring < 3) failures.push(`${scheme} ring on background: ${ring.toFixed(2)}`);
-    // The chosen segment and primary buttons must stand out from the page too.
-    const primary = contrast(palette.primary, palette.background);
-    if (primary < 3) failures.push(`${scheme} primary on background: ${primary.toFixed(2)}`);
+    for (const [edge, surface] of EDGE_PAIRS) {
+      const ratio = contrast(palette[edge], palette[surface]);
+      if (ratio < 3) failures.push(`${scheme} ${edge} against ${surface}: ${ratio.toFixed(2)}`);
+    }
   }
   expect(failures).toEqual([]);
+});
+
+test("surfaces are distinct: cards on the page, the sidebar beside it, popovers above cards", () => {
+  for (const palette of [dark, light]) {
+    for (const [a, b] of [["card", "background"], ["sidebar", "background"]] as const) {
+      expect(palette[a] === palette[b]).toBe(false);
+    }
+  }
+  expect([light.background, light.sidebar, light.card]).toEqual(["#f7f8fa", "#f1f2f5", "#ffffff"]);
+  expect([dark.background, dark.sidebar]).toEqual(["#0b0d10", "#0f1115"]);
+  expect(dark.popover === dark.card).toBe(false);
 });
 
 test("both schemes define the same tokens", () => {
@@ -210,7 +242,12 @@ test("Action variants: disabled turns neutral, destructive is an outline in the 
     expect(fg(app, "id:fx-disabled >> text:Fixture off")).toBe(rgba(palette["muted-foreground"]));
     expect(app.enabled("id:fx-disabled")).toBe(false);
     expect(bg(app, "id:fx-destructive")).toBe(rgba(palette.background));
-    expect(fg(app, "text:Fixture remove")).toBe(rgba(palette["tone-danger-foreground"]));
+    expect(fg(app, "id:fx-destructive >> text:Fixture remove")).toBe(rgba(palette.destructive));
+    // Every disabled variant: the same muted surface and muted text.
+    expect(bg(app, "id:fx-destructive-off")).toBe(rgba(palette.muted));
+    expect(fg(app, "text:Fixture remove off")).toBe(rgba(palette["muted-foreground"]));
+    expect(bg(app, "id:fx-ghost-off")).toBe(rgba(palette.muted));
+    expect(fg(app, "text:Fixture ghost off")).toBe(rgba(palette["muted-foreground"]));
     expect(bg(app, "id:fx-danger")).toBe(rgba(palette.destructive));
     expect(fg(app, "text:Fixture delete")).toBe(rgba(palette["destructive-foreground"]));
     expect(bg(app, "id:fx-edge") ?? "transparent").toBe("transparent");
@@ -223,7 +260,7 @@ test("ActionsMenu: opens from its trigger, items by id, destructive ink, disable
   expect(app.shows("id:fx-menu-rename")).toBe(false);
   await app.press("id:fx-menu");
   await app.waitFor("id:fx-menu-rename");
-  expect(fg(app, "text:Fixture delete item")).toBe(rgba(dark["tone-danger-foreground"]));
+  expect(fg(app, "text:Fixture delete item")).toBe(rgba(dark.destructive));
   expect(fg(app, "text:Fixture rename")).toBe(rgba(dark["popover-foreground"]));
   expect(app.enabled("id:fx-menu-off")).toBe(false);
   await app.press("id:fx-menu-delete");

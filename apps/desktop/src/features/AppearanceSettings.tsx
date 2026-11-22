@@ -4,7 +4,7 @@
 //
 // The preview draws one of each kind of element with the real primitives, so
 // it shows exactly what the rest of the app looks like in the current scheme.
-// Nothing in it acts; its controls only change the preview's own state.
+// Its controls change only the preview's own state, never the workspace.
 
 import { signal } from "nsh";
 import {
@@ -12,6 +12,7 @@ import {
   ActionBar,
   APPEARANCE_OPTIONS,
   appearancePreference,
+  AuthorGlyph,
   AuthorName,
   AuthorTag,
   Avatar,
@@ -19,6 +20,7 @@ import {
   Banner,
   Chip,
   Column,
+  compactWidth,
   Field,
   Label,
   MessageFrame,
@@ -42,7 +44,7 @@ export function AppearanceSettings() {
   const toggle = signal(true);
   const field = signal("");
   return (
-    <ScrollArea pad={6} testID="appearance-settings">
+    <ScrollArea pad={compactWidth() ? 4 : 8} testID="appearance-settings">
       <Surface variant="content" gap={6}>
         <PageHeader title="Appearance" subtitle="How Metro looks on this device. Saved locally." />
 
@@ -65,7 +67,7 @@ export function AppearanceSettings() {
           </If>
         </SettingsGroup>
 
-        <SettingsGroup title="Preview" description="One of each kind of element, in the current scheme. Nothing here does anything.">
+        <SettingsGroup title="Preview" description="Try the controls here without changing your workspace.">
           <Column pad={4} gap={4} testID="appearance-preview">
             <Column gap={2}>
               <Label variant="strong">Buttons</Label>
@@ -117,7 +119,7 @@ export function AppearanceSettings() {
                   </MessageHeader>
                   <Label>The new layout is ready for review.</Label>
                 </MessageFrame>
-                <MessageFrame gutter={<Avatar initials="A" tone="agent" />}>
+                <MessageFrame gutter={<AuthorGlyph kind="agent" tone="agent" />}>
                   <MessageHeader>
                     <AuthorName name="Agent" agent />
                     <Timestamp text="09:42" full="Monday 09:42" />
@@ -132,6 +134,7 @@ export function AppearanceSettings() {
               <Banner variant="inline" tone="success" title="Saved" message="Your changes are in effect." />
               <Banner variant="inline" tone="warning" message="The runner is offline. Jobs wait until it's back." />
               <Banner variant="inline" tone="danger" title="Couldn't connect" message="Check the address and try again." />
+              <Label color="danger">An error next to a field uses the danger ink.</Label>
             </Column>
 
             <Column gap={2}>
@@ -146,7 +149,7 @@ export function AppearanceSettings() {
                 <Surface variant="popover" pad={3} gap={1}>
                   <Label variant="heading">Menu</Label>
                   <Label variant="caption" color="muted">
-                    One step above, with a shadow.
+                    One step above, rounder, with a shadow.
                   </Label>
                 </Surface>
               </Row>

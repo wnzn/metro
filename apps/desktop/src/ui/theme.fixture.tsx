@@ -33,6 +33,8 @@ function Fixture() {
             <Action testID="fx-primary" label="Primary" variant="primary" onPress={() => {}} />
             <Action testID="fx-disabled" label="Fixture off" variant="primary" disabled onPress={() => {}} />
             <Action testID="fx-destructive" label="Fixture remove" variant="destructive" onPress={() => last.set("remove")} />
+            <Action testID="fx-destructive-off" label="Fixture remove off" variant="destructive" disabled onPress={() => {}} />
+            <Action testID="fx-ghost-off" label="Fixture ghost off" variant="ghost" disabled onPress={() => {}} />
             <Action testID="fx-danger" label="Fixture delete" variant="danger" onPress={() => {}} />
             <Action testID="fx-edge" label="Fixture edge" variant="ghost" compact edgeAligned onPress={() => {}} />
             <ActionsMenu

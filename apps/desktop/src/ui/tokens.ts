@@ -5,7 +5,7 @@
 // components never name colors, sizes or classes themselves. Replace this
 // file and ./primitives.tsx (or just theme.json) to restyle the whole app.
 
-export type Space = 0 | 1 | 2 | 3 | 4 | 6;
+export type Space = 0 | 1 | 2 | 3 | 4 | 6 | 8;
 
 /** Semantic tones. Event kinds, statuses and banners pick one of these. */
 export type Tone = "neutral" | "agent" | "runner" | "system" | "success" | "warning" | "danger";
@@ -17,6 +17,7 @@ export const gapClass: Record<Space, string> = {
   3: "gap-(--space-3)",
   4: "gap-(--space-4)",
   6: "gap-(--space-6)",
+  8: "gap-(--space-8)",
 };
 
 export const padClass: Record<Space, string> = {
@@ -26,6 +27,7 @@ export const padClass: Record<Space, string> = {
   3: "p-(--space-3)",
   4: "p-(--space-4)",
   6: "p-(--space-6)",
+  8: "p-(--space-8)",
 };
 
 export const padXClass: Record<Space, string> = {
@@ -35,6 +37,7 @@ export const padXClass: Record<Space, string> = {
   3: "px-(--space-3)",
   4: "px-(--space-4)",
   6: "px-(--space-6)",
+  8: "px-(--space-8)",
 };
 
 export const padYClass: Record<Space, string> = {
@@ -44,6 +47,7 @@ export const padYClass: Record<Space, string> = {
   3: "py-(--space-3)",
   4: "py-(--space-4)",
   6: "py-(--space-6)",
+  8: "py-(--space-8)",
 };
 
 export const toneSurfaceClass: Record<Tone, string> = {
@@ -105,10 +109,11 @@ export const textClass = {
   "2xl": "text-(length:--text-2xl) leading-(--leading-2xl)",
 } as const;
 
-/** Radii: 8 controls, 12 cards and popovers, 16 dialogs; pills are full. */
+/** Radii: 8 controls, 12 cards, 16 popovers and dialogs; pills are full. */
 export const radiusClass = {
   control: "rounded-(--radius-sm)",
   card: "rounded-(--radius)",
+  popover: "rounded-(--radius-lg)",
   dialog: "rounded-(--radius-lg)",
   pill: "rounded-full",
 } as const;
@@ -118,6 +123,26 @@ export const controlHeightClass = {
   default: "min-h-(--control-height)",
   compact: "min-h-(--control-height-sm)",
 } as const;
+
+/**
+ * Color changes on hover, press and selection: 150 ms, ease-out, none when
+ * the user asked for reduced motion (NSH's `motion-reduce:` variant).
+ */
+export const transitionClass = "transition-colors duration-150 ease-out motion-reduce:transition-none";
+
+/** A popup's entrance and exit (menus, pickers): a 150 ms fade, none with reduced motion. */
+export const popoverMotion = {
+  base: "transition-opacity duration-150 ease-out motion-reduce:transition-none",
+  starting: "opacity-0",
+  ending: "opacity-0",
+} as const;
+
+/**
+ * The edge of a standalone control the user must find (a text field, a
+ * picker, a switch's off track): at least 3:1 against the page, cards and
+ * popovers (WCAG 1.4.11). `border` stays the soft separator between rows.
+ */
+export const controlEdgeClass = "border-control-edge";
 
 /** The keyboard focus ring every interactive element shares. */
 export const focusRingClass = "focus-visible:ring-2 focus-visible:ring-ring";
@@ -129,15 +154,21 @@ export const focusRingClass = "focus-visible:ring-2 focus-visible:ring-ring";
  */
 export const disabledClass = "disabled:opacity-50";
 
+/**
+ * Disabled, for Actions of every variant: the same muted surface and muted
+ * text, never a dimmed copy of the variant (pair with disabledTextClass).
+ */
+export const actionDisabledClass = "disabled:bg-muted disabled:border-transparent";
+
 /** A text inside a `group` control that turns muted while the control is disabled. */
 export const disabledTextClass = "group-disabled:text-muted-foreground";
 
 /** A floating surface one step above cards: menus, pickers, tooltips. */
-export const popoverClass = "rounded-(--radius) border border-border bg-popover p-[4px] shadow-lg";
+export const popoverClass = cx("rounded-(--radius-lg) border border-border bg-popover p-[6px] shadow-lg", popoverMotion.base);
 
 /** One row of a popover list (a menu item, a picker option). */
 export const popoverItemClass =
-  "rounded-(--radius-sm) px-(--space-2) py-[6px] text-(length:--text-sm) leading-(--leading-sm) text-popover-foreground hover:bg-muted focus:bg-accent disabled:opacity-50";
+  "rounded-(--radius-sm) px-(--space-2) py-[7px] text-(length:--text-sm) leading-(--leading-sm) text-popover-foreground hover:bg-muted focus:bg-accent disabled:opacity-50 transition-colors duration-150 ease-out motion-reduce:transition-none";
 
 /** A tooltip's bubble (also a popover step). */
 export const tooltipClass =

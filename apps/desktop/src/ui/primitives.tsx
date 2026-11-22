@@ -9,6 +9,8 @@ import { Button, Collapsible, Input, Menu, MenuItem, MenuSeparator, Radio, Radio
 import { Icon } from "./chrome";
 import type { IconColor, IconName } from "./chrome";
 import {
+  actionDisabledClass,
+  controlEdgeClass,
   controlHeightClass,
   cx,
   disabledClass,
@@ -20,11 +22,13 @@ import {
   padYClass,
   popoverClass,
   popoverItemClass,
+  popoverMotion,
   textClass,
   toneBorderClass,
   toneSolidClass,
   toneSurfaceClass,
   toneTextClass,
+  transitionClass,
 } from "./tokens";
 import type { Space, Tone } from "./tokens";
 
@@ -119,7 +123,7 @@ const surfaceClass: Record<SurfaceVariant, string> = {
   scroll: "flex-1 min-h-0",
   content: "w-full max-w-(--content-width) self-center",
   topbar: "flex-row items-center justify-center min-h-[52px] px-(--space-4) py-(--space-2) border-b border-border bg-background",
-  popover: "bg-popover border border-border rounded-(--radius) shadow-lg",
+  popover: "bg-popover border border-border rounded-(--radius-lg) shadow-lg",
 };
 
 export function Surface(props: StackProps & { variant: SurfaceVariant }) {
@@ -214,22 +218,24 @@ const focusRing = focusRingClass;
  */
 export type ActionVariant = "primary" | "secondary" | "ghost" | "destructive" | "danger";
 
-// Disabled Actions turn neutral (no fill of their variant, muted text)
-// rather than a dimmed copy of it, so a disabled primary never reads as live.
+// Hover and press use opaque tokens (primary-hover, destructive-hover), so
+// the label keeps AA on them. Disabled Actions of every variant show the
+// same muted surface and muted text (actionDisabledClass), never a dimmed
+// copy of the variant, so a disabled primary never reads as live.
 const actionClass: Record<ActionVariant, string> = {
-  primary: "bg-primary hover:bg-primary/90 active:bg-primary/85 disabled:bg-muted",
-  secondary: "bg-background border border-input hover:bg-muted active:bg-muted/70 disabled:bg-transparent disabled:border-border",
-  ghost: "hover:bg-muted active:bg-muted disabled:bg-transparent",
-  destructive:
-    "bg-background border border-tone-danger-foreground/40 hover:bg-tone-danger active:bg-tone-danger disabled:bg-transparent disabled:border-border",
-  danger: "bg-destructive hover:bg-destructive/90 active:bg-destructive/85 disabled:bg-muted",
+  primary: "bg-primary hover:bg-primary-hover active:bg-primary-hover",
+  secondary: "bg-background border border-input hover:bg-muted active:bg-muted",
+  ghost: "hover:bg-muted active:bg-muted",
+  // The danger ink as text and a 3:1 edge on page, card and popover.
+  destructive: "bg-background border border-destructive hover:bg-tone-danger active:bg-tone-danger",
+  danger: "bg-destructive hover:bg-destructive-hover active:bg-destructive-hover",
 };
 
 const actionTextClass: Record<ActionVariant, string> = {
   primary: "text-primary-foreground",
   secondary: "text-secondary-foreground",
   ghost: "text-foreground",
-  destructive: "text-tone-danger-foreground",
+  destructive: "text-destructive",
   danger: "text-destructive-foreground",
 };
 
@@ -275,7 +281,9 @@ export function Action(
         props.expanded !== undefined && "justify-start",
         props.edgeAligned && quiet() && (props.compact ? "-mx-2" : "-mx-3"),
         focusRing,
+        transitionClass,
         actionClass[variant()],
+        actionDisabledClass,
       )}
       disabled={props.disabled || props.busy}
       onPress={props.onPress}
@@ -330,10 +338,12 @@ export function NavItem(
   return (
     <Button
       class={cx(
-        "flex-row items-center gap-(--space-2) min-h-[32px] rounded-(--radius-sm) px-(--space-2) py-[6px]",
+        // 40 high: a comfortable list row; the selected one takes the accent tint.
+        "flex-row items-center gap-(--space-2) min-h-[40px] rounded-(--radius-sm) px-(--space-3) py-[8px]",
         focusRing,
+        transitionClass,
         indentClass[Math.min(props.depth ?? 0, indentClass.length - 1)],
-        props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-accent/60 active:bg-sidebar-accent",
+        props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-hover active:bg-sidebar-hover",
       )}
       selected={props.selected}
       onPress={props.onPress}
@@ -374,6 +384,7 @@ export function Chip(props: Testable & { label: string; selected: boolean; onPre
       class={cx(
         "flex-row items-center min-h-[28px] rounded-full border px-(--space-3)",
         focusRing,
+        transitionClass,
         disabledClass,
         props.selected ? "border-ring bg-accent" : "border-border bg-background hover:bg-muted",
       )}
@@ -401,6 +412,7 @@ export function ReactionChip(
       class={cx(
         "flex-row items-center gap-(--space-1) rounded-full border px-(--space-2) py-px",
         focusRing,
+        transitionClass,
         disabledClass,
         props.mine ? "border-ring bg-accent" : props.agent && props.count === 0 ? "border-tone-agent-foreground/40 bg-tone-agent" : "border-border bg-background hover:bg-muted",
       )}
@@ -449,7 +461,8 @@ export function Field(
   return (
     <Input
       class={cx(
-        "rounded-(--radius-sm) border border-input bg-background px-(--space-3) py-[7px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring",
+        "rounded-(--radius-sm) border bg-background px-(--space-3) py-[7px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring",
+        controlEdgeClass,
         textClass.md,
         controlHeightClass.default,
         disabledClass,
@@ -610,6 +623,7 @@ export function Disclosure(
         class={cx(
           "group flex-row items-center gap-(--space-2) min-h-[32px] -mx-2 rounded-(--radius-sm) px-(--space-2) hover:bg-muted active:bg-muted",
           focusRing,
+          transitionClass,
           disabledClass,
         )}
         role="button"
@@ -670,12 +684,15 @@ export function ActionsMenu(
       align="end"
       offset={4}
       popupClass={cx(popoverClass, "min-w-[180px]")}
+      popupStartingClass={popoverMotion.starting}
+      popupEndingClass={popoverMotion.ending}
       trigger={
         <Button
           class={cx(
             "group flex-row items-center gap-(--space-1) rounded-(--radius-sm) px-(--space-2) hover:bg-muted active:bg-muted aria-expanded:bg-muted",
             controlHeightClass.compact,
             focusRing,
+            transitionClass,
             disabledClass,
           )}
           disabled={props.disabled}
@@ -699,7 +716,7 @@ export function ActionsMenu(
               onSelect={() => row().item.onPress()}
               testID={row().item.id}
             >
-              <Text class={cx(textClass.sm, row().item.destructive ? "text-tone-danger-foreground" : "text-popover-foreground")}>{row().item.label}</Text>
+              <Text class={cx(textClass.sm, row().item.destructive ? "text-destructive" : "text-popover-foreground")}>{row().item.label}</Text>
             </MenuItem>
           </>
         )}
@@ -732,7 +749,7 @@ export function PageLayout(props: StackProps & { footer?: JSX.Element; wide?: bo
         <View class={cx(stackClass({ ...props, grow: false }, "col"), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>
       </Scroll>
       <If when={props.footer}>
-        <View class="border-t border-border bg-background px-(--space-6) py-(--space-3)" testID={props.testID ? `${props.testID}:footer` : undefined}>
+        <View class="border-t border-border bg-background px-(--space-8) max-md:px-(--space-4) py-(--space-3)" testID={props.testID ? `${props.testID}:footer` : undefined}>
           <View class={cx("w-full", !props.wide && "max-w-(--content-width) self-center")}>{props.footer}</View>
         </View>
       </If>
@@ -808,6 +825,7 @@ export function SegmentedControl<T extends string>(
               // otherwise cover the checked one under the pointer.
               props.value !== option().value && "hover:bg-background/60",
               focusRing,
+              transitionClass,
               disabledClass,
             )}
             checked={props.value === option().value}
@@ -848,8 +866,8 @@ export function Toggle(
   return (
     <Switch
       class={cx("flex-row items-center gap-(--space-2) rounded-full", focusRing, disabledClass)}
-      trackClass="w-[36px] h-[20px] rounded-full bg-input p-[2px] checked:bg-primary transition-colors motion-reduce:transition-none"
-      thumbClass="size-[16px] rounded-full bg-primary-foreground checked:translate-x-4 transition-transform motion-reduce:transition-none"
+      trackClass="w-[36px] h-[20px] rounded-full bg-control-edge p-[2px] checked:bg-primary transition-colors duration-150 ease-out motion-reduce:transition-none"
+      thumbClass="size-[16px] rounded-full bg-primary-foreground checked:translate-x-4 transition-transform duration-150 ease-out motion-reduce:transition-none"
       checked={props.checked}
       disabled={props.disabled}
       onChange={({ checked }) => props.onChange(checked)}
@@ -894,9 +912,11 @@ export function Picker(
   return (
     <Select
       class={cx(
-        "flex-row items-center justify-between gap-(--space-2) min-w-[200px] self-start rounded-(--radius-sm) border border-input bg-background px-(--space-3) hover:bg-muted",
+        "flex-row items-center justify-between gap-(--space-2) min-w-[200px] self-start rounded-(--radius-sm) border bg-background px-(--space-3) hover:bg-muted",
+        controlEdgeClass,
         controlHeightClass.default,
         focusRing,
+        transitionClass,
         disabledClass,
       )}
       items={props.items.map((item) => ({
@@ -914,6 +934,8 @@ export function Picker(
       disabled={props.disabled}
       accessibilityLabel={props.accessibilityLabel}
       popupClass={popoverClass}
+      popupStartingClass={popoverMotion.starting}
+      popupEndingClass={popoverMotion.ending}
       itemClass={cx(popoverItemClass, "selected:font-semibold")}
       groupClass="px-(--space-2) pt-(--space-2) pb-(--space-1)"
       searchClass={cx("mb-[4px] rounded-(--radius-sm) border border-input bg-background px-(--space-2) py-(--space-1) text-foreground", textClass.sm)}

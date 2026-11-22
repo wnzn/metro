@@ -29,7 +29,7 @@
       "font-sans": "Inter, system-ui, sans-serif"
     },
     "light": {
-      "background": "#ffffff",
+      "background": "#f7f8fa",
       "foreground": "#111318",
       "card": "#ffffff",
       "card-foreground": "#111318",
@@ -46,13 +46,13 @@
       "secondary-foreground": "#111318",
       "accent": "#edf1ff",
       "accent-foreground": "#2b44b8",
-      "destructive": "#c9303a",
+      "destructive": "#c42b35",
       "destructive-foreground": "#ffffff",
-      "sidebar": "#f7f8fa",
+      "sidebar": "#f1f2f5",
       "sidebar-foreground": "#2b2f36",
-      "sidebar-accent": "#e8eaef",
-      "sidebar-accent-foreground": "#0b0c0f",
-      "sidebar-border": "#e4e6eb",
+      "sidebar-accent": "#e3e9ff",
+      "sidebar-accent-foreground": "#253da8",
+      "sidebar-border": "#e2e4e9",
       "tone-neutral": "#f1f2f4",
       "tone-neutral-foreground": "#3d424b",
       "tone-agent": "#f1ecfe",
@@ -66,10 +66,14 @@
       "tone-warning": "#fcf3d9",
       "tone-warning-foreground": "#8a3b0a",
       "tone-danger": "#fdeaea",
-      "tone-danger-foreground": "#991b1b"
+      "tone-danger-foreground": "#991b1b",
+      "primary-hover": "#3150c9",
+      "destructive-hover": "#a92530",
+      "sidebar-hover": "#e6e8ec",
+      "control-edge": "#858c97"
     },
     "dark": {
-      "background": "#0f1115",
+      "background": "#0b0d10",
       "foreground": "#e6e8eb",
       "card": "#15181c",
       "card-foreground": "#e6e8eb",
@@ -86,12 +90,12 @@
       "secondary-foreground": "#e6e8eb",
       "accent": "#1c2444",
       "accent-foreground": "#b9c6ff",
-      "destructive": "#d1343c",
-      "destructive-foreground": "#ffffff",
-      "sidebar": "#0c0e11",
+      "destructive": "#f47c7c",
+      "destructive-foreground": "#1a0507",
+      "sidebar": "#0f1115",
       "sidebar-foreground": "#c4c9d1",
-      "sidebar-accent": "#1d2128",
-      "sidebar-accent-foreground": "#f4f5f7",
+      "sidebar-accent": "#1c2444",
+      "sidebar-accent-foreground": "#dfe5ff",
       "sidebar-border": "#1c1f25",
       "tone-neutral": "#1e2228",
       "tone-neutral-foreground": "#d0d4da",
@@ -106,7 +110,11 @@
       "tone-warning": "#2f230c",
       "tone-warning-foreground": "#f5d98a",
       "tone-danger": "#361416",
-      "tone-danger-foreground": "#fbc4c4"
+      "tone-danger-foreground": "#fbc4c4",
+      "primary-hover": "#3a5ad9",
+      "destructive-hover": "#f89a9a",
+      "sidebar-hover": "#181b21",
+      "control-edge": "#666d79"
     }
   }
 }
