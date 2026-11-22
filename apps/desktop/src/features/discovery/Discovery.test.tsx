@@ -39,11 +39,26 @@ async function search(app: App, query: string) {
   await app.waitFor("id:search-results");
 }
 
+/** Return again in the toolbar box: the only way to (re)run a search; there is no Search button. */
+async function searchAgain(app: App) {
+  await app.submit("id:top-search");
+}
+
 /** A task's History, Pause or Resume and Delete… are items of its "More" menu. */
 async function taskMenu(app: App, id: string, item: "history" | "pause" | "resume" | "delete") {
   await app.press(`id:schedule-more:${id}`);
   await app.press(`id:schedule-${item}:${id}`);
 }
+
+/** The highlight of a scope chip (its background); exactly the chosen one differs. */
+const chip = (app: App, value: string) => app.viewStyle(`id:search-scope:${value}`)?.backgroundColor ?? null;
+
+function expectChosen(app: App, chosen: string, others: string[]) {
+  for (const o of others) expect(chip(app, o)).not.toBe(chip(app, chosen));
+  for (const o of others.slice(1)) expect(chip(app, o)).toBe(chip(app, others[0]!));
+}
+
+const searches = (w: W) => w.d.log.filter((l) => l.path === "/v1/search" && l.method !== "GET").length;
 
 test("search covers my Chat and my Spaces only, says it was reranked by System One, and opens the conversation", async () => {
   const w = discoveryWorld();
@@ -51,18 +66,39 @@ test("search covers my Chat and my Spaces only, says it was reranked by System O
   const app = await signIn(w);
   await app.press("id:h-search");
   await app.waitFor("id:search-view");
-  await search(app, "deploy checklist");
+  // One query field, in the toolbar: no second box or Search button on the page.
+  expect(app.count("id:top-search")).toBe(1);
+  expect(app.shows("id:search-query")).toBe(false);
+  expect(app.shows("id:search-submit")).toBe(false);
+  expectChosen(app, "all", ["chat", "space:acme"]);
+  // Typing changes only the query: nothing is sent (so nothing reaches an embedding
+  // connection), the scope stays, and no results appear. Return searches, once.
+  await app.type("id:top-search", "deploy checklist");
+  await app.wait(300);
+  expect(searches(w)).toBe(0);
+  expect(app.shows("id:search-results")).toBe(false);
+  expectChosen(app, "all", ["chat", "space:acme"]);
+  await app.submit("id:top-search");
+  await app.waitFor("id:search-results");
+  expect(searches(w)).toBe(1);
   expect(lastBody(w, "/v1/search")).toEqual({ query: "deploy checklist", scope: "all", limit: 20 });
   await app.waitFor("id:search-result:chat:chat:7");
   expect(app.shows("id:search-result:acme:lobby:101")).toBe(true);
   // Nobody else's Chat, no Space I'm not in.
   expect(text(app)).not.toContain("bob's private deploy notes");
   expect(text(app)).not.toContain("carol's secret deploy plan");
+  expect(text(app)).toContain("2 results for “deploy checklist” · Everything you can read");
+  // Ranked by a real System One call, and it says so; no other rerank claim.
+  expect(app.shows("id:search-ranking")).toBe(true);
   expect(text(app)).toContain("Reranked by System One");
-  expect(text(app)).toContain("System One relevance 0.91");
+  expect(text(app)).toContain("Every result was scored by your System One connection.");
+  expect(text(app)).not.toContain("Partly reranked");
   expect(text(app)).toContain("Acme › #lobby");
   expect(text(app)).toContain("Personal Chat");
   expect(app.shows("id:search-partial")).toBe(false);
+  // Each result opens its conversation, and says whose and where to a screen reader.
+  expect(app.shows("label:Open conversation: bob in Acme › #lobby")).toBe(true);
+  expect(app.shows("label:Open conversation: alice in Personal Chat")).toBe(true);
 
   await app.press("id:search-open:acme:lobby:101");
   await app.waitFor("id:space-view");
@@ -79,23 +115,30 @@ test("the scope lists only joined Spaces; a Space I lost access to answers 404 a
   seedCorpus(w);
   const app = await signIn(w);
   await app.press("id:h-search");
-  await app.press("id:search-scope");
-  await app.waitFor("text:Side project");
+  await app.waitFor("id:search-scope:space:side");
+  // One chip per Space I'm in; none for a Space I'm not in.
+  expect(app.shows("id:search-scope:space:acme")).toBe(true);
+  expect(app.shows("id:search-scope:space:secret")).toBe(false);
   expect(app.shows("text:Secret")).toBe(false);
-  await app.press("text:Acme");
-  await app.waitFor("text:Now: Acme. Only Spaces you're a member of are listed.");
+  expect(app.shows("label:Search in Acme")).toBe(true);
+  // Choosing a scope sends nothing; only Return does.
+  await app.press("id:search-scope:space:acme");
+  expectChosen(app, "space:acme", ["all", "chat", "space:side"]);
+  expect(searches(w)).toBe(0);
   await search(app, "checklist");
+  expect(searches(w)).toBe(1);
   expect(lastBody(w, "/v1/search")).toEqual({ query: "checklist", scope: "space", space_id: "acme", limit: 20 });
   expect(app.shows("id:search-result:chat:chat:7")).toBe(false);
   expect(text(app)).toContain("1 result for “checklist” · Acme");
 
   // Alice is removed from Acme while the page is open.
   w.f.state.spaces.get("acme")!.members.delete("alice");
-  await app.press("id:search-submit");
+  await searchAgain(app);
   await app.waitFor("id:search-error");
-  expect(text(app)).toContain("You're not a member of that Space (any more)");
-  expect(text(app)).toContain("Now: Everything you can read.");
+  expect(text(app)).toContain("You're not a member of that Space (any more), so it can't be searched. The scope is back to everything you can read.");
+  expect(app.shows("id:search-results")).toBe(false);
   expect(text(app)).not.toContain("deploy checklist: tag, build, smoke test");
+  expectChosen(app, "all", ["chat", "space:side"]);
 });
 
 test("similarity-only and incomplete answers say so; Index more advances indexing", async () => {
@@ -109,10 +152,11 @@ test("similarity-only and incomplete answers say so; Index more advances indexin
   await app.press("id:h-search");
   await search(app, "deploy");
   await app.waitFor("id:search-partial");
+  // Similarity only: the matches are listed, and nothing claims a rerank.
+  expect(app.shows("id:search-result:chat:chat:7")).toBe(true);
   expect(text(app)).toContain("Similarity order");
-  expect(text(app)).toContain("similarity 0.91");
-  expect(text(app)).not.toContain("System One relevance");
-  expect(text(app)).toContain("System One didn't rerank these.");
+  expect(text(app)).toContain("Ordered by embedding similarity only. System One didn't rerank these.");
+  expect(text(app)).not.toContain("Partly reranked");
   expect(text(app)).not.toContain("Reranked by System One");
   expect(text(app)).toContain("Incomplete: not everything was searched.");
   expect(text(app)).toContain("120 messages aren't indexed yet. Search again or index more.");
@@ -130,6 +174,8 @@ test("similarity-only and incomplete answers say so; Index more advances indexin
   w.d.notice = null;
   await search(app, "deploy");
   await app.waitFor("text:Partly reranked");
+  expect(text(app)).toContain("System One scored the top results; the rest follow in similarity order.");
+  expect(text(app)).not.toContain("Reranked by System One");
   expect(app.shows("id:search-partial")).toBe(false);
 });
 
@@ -142,7 +188,7 @@ test("search without an embedding model points to Model providers; nothing is ca
   expect(text(app)).toContain("note to self: deploy checklist lives in the wiki");
 
   w.d.fail = { status: 409, error: "choose an embedding model in Settings to use search" };
-  await app.press("id:search-submit");
+  await searchAgain(app);
   await app.waitFor("id:search-error");
   expect(text(app)).toContain("Search needs an embedding model: choose an embedding model in Settings to use search.");
   expect(app.shows("id:search-open-providers")).toBe(true);
@@ -150,6 +196,7 @@ test("search without an embedding model points to Model providers; nothing is ca
   // Bob signs in on the same app: none of Alice's query or results remain.
   w.d.fail = null;
   await app.press("id:h-chat");
+  await app.press("id:account-menu");
   await app.press("id:disconnect");
   await app.waitFor("id:connect-screen");
   await app.clear("id:access-token");

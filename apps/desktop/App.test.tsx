@@ -25,6 +25,12 @@ async function openAcme(app: App) {
 
 const text = (app: App) => app.texts().join(" | ");
 
+/** Sign out is an item of the account menu at the bottom of the sidebar: open it first. */
+async function signOut(app: App) {
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+}
+
 /** Asks the agent with the composer's draft (the explicit to-the-agent case). */
 async function askAgent(app: App) {
   await app.press("id:ask-agent");
@@ -132,11 +138,20 @@ test("mixed @bob @agent is addressed to both and starts the agent with no extra 
   await app.waitFor("id:mention-chip:agent");
   await app.waitFor("id:mention-chip:bob");
   await app.press("id:send");
-  await app.waitFor("text:to the agent and people");
   const sent = f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!;
   const body = sent.body as { text: string; invoke_agent: boolean; mentions: { kind: string; id?: string }[] };
+  // On the wire: both recipients, each once; the agent is addressed explicitly.
   expect(body.mentions).toContainEqual({ kind: "user", id: "bob" });
-  expect(body.mentions).toContainEqual({ kind: "agent" });
+  expect(body.mentions.filter((m) => m.kind === "agent")).toHaveLength(1);
+  expect(body.mentions).toHaveLength(2);
+  expect(body.invoke_agent === true || body.mentions.some((m) => m.kind === "agent")).toBe(true);
+  // In the transcript: one agent badge and one pill for bob on that message.
+  const ev = f.state.events.get("acme/lobby")!.find((e) => e.actor === "alice" && e.text.startsWith("please both look"))!;
+  await app.waitFor(`id:recipient:${ev.id}:agent`);
+  expect(app.count(`id:recipient:${ev.id}:agent`)).toBe(1);
+  expect(app.count(`id:recipient:${ev.id}:bob`)).toBe(1);
+  expect(app.shows("label:Addressed to the agent")).toBe(true);
+  expect(app.shows("label:/^Addressed to .*bob/")).toBe(true);
   // The agent is addressed explicitly, so it answers without a classification call.
   await app.waitFor("text:/\\(agent\\) on it: please both look/");
   expect(f.posts().some((p) => p.path === "/v1/systemone")).toBe(false);
@@ -606,14 +621,29 @@ test("the footer says On this device only for the app-hosted workspace, never fr
   expect(serverPlace(null, false).title).toBe("Not connected");
 });
 
-test("a manually connected loopback server shows its actual address in the footer", async () => {
+test("a manually connected loopback server shows its actual host once; the account menu copies its exact origin and my ID", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "alice");
-  await app.waitFor("id:active-server");
-  expect(app.texts()).toContain("127.0.0.1:8787"); // the host it connected to
-  expect(app.texts()).toContain(BASE); // and the full URL
+  await app.waitFor("id:account-menu");
+  // Compact footer: the host it connected to, once, and never "On this device".
+  expect(app.count("id:active-server >> text:127.0.0.1:8787")).toBe(1);
+  expect(app.shows("label:/connected to 127\\.0\\.0\\.1:8787/")).toBe(true);
   expect(text(app)).not.toContain("On this device");
+  expect(text(app)).not.toContain(TOKENS.alice);
+
+  const before = f.posts().length;
+  await app.press("id:account-menu");
+  await app.press("id:copy-server-url");
+  expect(app.clipboard()).toBe(BASE); // the exact origin, not the host label
+  await app.press("id:account-menu");
+  await app.press("id:copy-id");
+  expect(app.clipboard()).toBe("alice"); // the stable id, never a token
+  expect(f.posts().length).toBe(before); // copying sends nothing
+
+  await signOut(app);
+  await app.waitFor("id:connect-screen");
+  expect(JSON.stringify(app.storage())).not.toContain(TOKENS.alice);
 });
 
 test("Settings opens as a modal over a room and closes back to the same room and draft", async () => {
@@ -741,7 +771,7 @@ test("a late settings answer never lands after sign-out or in the next user's se
   await signIn(app, "alice");
   await app.press("id:nav-settings");
   await app.press("id:settings-close");
-  await app.press("id:disconnect"); // while GET /v1/runners is still on its way
+  await signOut(app); // while GET /v1/runners is still on its way
   f.state.delays.delete("/v1/runners");
   await signIn(app, "bob");
   await openSettings(app, "runners");
