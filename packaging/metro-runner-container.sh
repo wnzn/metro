@@ -67,20 +67,27 @@ while [ $# -gt 0 ]; do
 done
 
 # ---------------------------------------------------------------- checks
-loopback_http() {
-    rest=${1#http://}; host=${rest%%/*}
-    case "$host" in \[::1\]|\[::1\]:*) return 0 ;; esac
-    host=${host%:*}
-    case "$host" in localhost|127.*) return 0 ;; esac
-    return 1
+# Plain http only to an exact loopback literal (localhost, 127.0.0.1 or
+# [::1]) with an explicit numeric port 1-65535, then an optional path.
+loopback_http() { # $1 = URL starting with http://
+    rest=${1#http://}; auth=${rest%%/*}
+    case "$auth" in
+        localhost:*) host=localhost; port=${auth#localhost:} ;;
+        127.0.0.1:*) host=127.0.0.1; port=${auth#127.0.0.1:} ;;
+        \[::1\]:*) host='[::1]'; port=${auth#\[::1\]:} ;;
+        *) return 1 ;;
+    esac
+    [ "$auth" = "$host:$port" ] || return 1
+    case "$port" in ''|*[!0-9]*) return 1 ;; esac
+    [ ${#port} -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
 }
 
 check_url() {
     case "$1" in *[[:space:]]*|*\?*|*\#*|*@*|*\"*|*\\*|*\$*|*\`*|*,*) die "--server-url must be a plain URL without spaces, credentials, query or fragment" ;; esac
     case "$1" in
-        https://?*) ;;
+        https://[!/:]*) ;;
         http://?*) loopback_http "$1" ||
-            die "plain http to a non-loopback host would send the runner token unencrypted; use https:// (http:// only to 127.0.0.1/localhost)" ;;
+            die "plain http to a non-loopback host would send the runner token unencrypted; use https:// (http:// only to 127.0.0.1:PORT, localhost:PORT or [::1]:PORT)" ;;
         *) die "--server-url must start with https:// (or http:// for loopback)" ;;
     esac
 }
@@ -188,9 +195,8 @@ setup() {
         die "the container cannot read $token_file. Share its folder with $engine (Docker Desktop: Settings > Resources > File sharing); on Linux the file must be readable by the image's runner user (uid 1000), or use the native Linux runner."
     if [ "$network" = host ]; then
         hostport=${server_url#http://}; hostport=${hostport%%/*}
-        h=${hostport%:*}; p=${hostport##*:}
-        [ "$p" != "$hostport" ] || p=80
-        case "$h" in localhost|\[::1\]) h=127.0.0.1 ;; esac
+        h=${hostport%:*}; p=${hostport##*:}  # both validated by loopback_http
+        case "$h" in localhost) h=127.0.0.1 ;; \[::1\]) h=::1 ;; esac
         if ! probe "exec 3<>/dev/tcp/$h/$p"; then
             say "warning: the container cannot reach $server_url right now. Make sure Metro is running on that port."
             say "         On Docker Desktop, enable Settings > Resources > Network > Enable host networking (4.34+)."

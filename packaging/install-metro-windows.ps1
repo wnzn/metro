@@ -239,9 +239,13 @@ function Install-Metro {
         Set-ItemProperty -Path $UninstallKey -Name NoRepair -Value 1 -Type DWord
 
         Say "Metro $version is installed in $target"
-        if ($enable) {
+        $supported = ($m.PSObject.Properties.Name -contains 'local_runner') -and $m.local_runner -eq 'installer-marker'
+        if (-not $enable) { Say 'Local runner support is off (install again with -LocalRunner to turn it on).' }
+        elseif ($supported) {
             Say 'Local runner support is on. Metro sets up your personal on-device runner after you sign in; it is not attached to any Space until you choose it under Manage Space.'
-        } else { Say 'Local runner support is off (install again with -LocalRunner to turn it on).' }
+        } else {
+            Say 'Local runner support was requested, but this Metro build predates it, so no runner will be set up. It takes effect once you update to a build that supports it.'
+        }
         Say "Your Metro data stays in $UserData."
     } finally {
         if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
@@ -282,7 +286,11 @@ try {
             $v = Get-Current
             if ($v) {
                 Say "Installed: Metro $v in $(Join-Path $Root "versions\$v")"
-                if (Test-Path -LiteralPath (Join-Path $Root "versions\$v\enable-local-runner")) { Say 'Local runner support: on' } else { Say 'Local runner support: off' }
+                $m = Get-Content -LiteralPath (Join-Path $Root "versions\$v\RELEASE.json") -Raw | ConvertFrom-Json
+                $supported = ($m.PSObject.Properties.Name -contains 'local_runner') -and $m.local_runner -eq 'installer-marker'
+                if (-not (Test-Path -LiteralPath (Join-Path $Root "versions\$v\enable-local-runner"))) { Say 'Local runner support: off' }
+                elseif ($supported) { Say 'Local runner support: on' }
+                else { Say 'Local runner support: requested (this build predates it; no runner is set up)' }
             } else { Say "Metro is not installed in $Root." }
             Say "Data: $UserData"
         }

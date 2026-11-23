@@ -260,6 +260,12 @@ install_app() {
         [ -f "$app/$f" ] && [ -x "$app/$f" ] || die "package is missing executable $f"
     done
     check_runtime "$app"
+    # Only launchers that read the marker say so in their manifest.
+    if [ "$(json_field "$app/RELEASE.json" local_runner)" = installer-marker ]; then
+        supports_local_runner=yes
+    else
+        supports_local_runner=no
+    fi
 
     # Local runner choice: explicit flag, else the previous install's, else on.
     if [ -z "$local_runner" ]; then
@@ -300,10 +306,12 @@ install_app() {
     fi
     say "Metro $version is installed in $root/versions/$version"
     say "Start it from your applications menu or run: $root/current/Metro"
-    if [ "$local_runner" = yes ]; then
+    if [ "$local_runner" != yes ]; then
+        say "Local runner support is off (reinstall with --local-runner to turn it on)."
+    elif [ "$supports_local_runner" = yes ]; then
         say "Local runner support is on. Metro sets up your personal on-device runner after you sign in; it is not attached to any Space until you choose it under Manage Space."
     else
-        say "Local runner support is off (reinstall with --local-runner to turn it on)."
+        say "Local runner support was requested, but this Metro build predates it, so no runner will be set up. It takes effect once you update to a build that supports it."
     fi
     say "Your Metro data stays in $user_data."
 }
@@ -325,7 +333,9 @@ status() {
     if [ -L "$root/current" ]; then
         target=$(readlink -- "$root/current")
         say "Installed: Metro ${target#versions/} in $root/$target"
-        if [ -f "$root/current/enable-local-runner" ]; then say "Local runner support: on"; else say "Local runner support: off"; fi
+        if [ ! -f "$root/current/enable-local-runner" ]; then say "Local runner support: off"
+        elif [ "$(json_field "$root/current/RELEASE.json" local_runner)" = installer-marker ]; then say "Local runner support: on"
+        else say "Local runner support: requested (this build predates it; no runner is set up)"; fi
     else
         say "Metro is not installed in $root."
     fi

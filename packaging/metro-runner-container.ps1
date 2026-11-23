@@ -45,19 +45,24 @@ $Docker = if ($env:METRO_DOCKER_BIN) { $env:METRO_DOCKER_BIN } else { 'docker' }
 
 function Fail([string] $Message) { throw "${Prog}: $Message" }
 
+# Plain http only to an exact loopback literal (localhost, 127.0.0.1 or [::1])
+# with an explicit numeric port 1-65535, then an optional path.
 function Test-LoopbackHttp([string] $Url) {
-    $u = [Uri] $Url
-    return $u.Scheme -eq 'http' -and ($u.Host -eq 'localhost' -or $u.Host -eq '[::1]' -or $u.Host -match '^127\.')
+    if (-not ($Url -cmatch '^http://(localhost|127\.0\.0\.1|\[::1\]):([0-9]{1,5})(/[^?#@]*)?$')) { return $false }
+    $port = [int] $Matches[2]
+    return $port -ge 1 -and $port -le 65535
 }
 
 function Test-Url([string] $Url) {
     if ($Url -match '[\s?#@"`$\\,]') { Fail '-ServerUrl must be a plain URL without spaces, credentials, query or fragment' }
-    $u = $null
-    if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref] $u) -or -not $u.Host) { Fail "invalid -ServerUrl: $Url" }
-    if ($u.Scheme -eq 'https') { return }
-    if ($u.Scheme -eq 'http') {
+    if ($Url -cmatch '^https://[^/:]') {
+        $u = $null
+        if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref] $u) -or -not $u.Host -or $u.UserInfo) { Fail "invalid -ServerUrl: $Url" }
+        return
+    }
+    if ($Url -cmatch '^http://') {
         if (Test-LoopbackHttp $Url) { return }
-        Fail 'plain http to a non-loopback host would send the runner token unencrypted; use https:// (http:// only to 127.0.0.1/localhost)'
+        Fail 'plain http to a non-loopback host would send the runner token unencrypted; use https:// (http:// only to 127.0.0.1:PORT, localhost:PORT or [::1]:PORT)'
     }
     Fail '-ServerUrl must start with https:// (or http:// for loopback)'
 }
@@ -212,7 +217,7 @@ try {
             }
             if ($c.Network -eq 'host') {
                 $u = [Uri] $url
-                $h = if ($u.Host -match '^127\.') { $u.Host } else { '127.0.0.1' }
+                $h = if ($u.Host -eq '[::1]') { '::1' } else { '127.0.0.1' }
                 if (-not (Invoke-Probe $c "exec 3<>/dev/tcp/$h/$($u.Port)")) {
                     Write-Warning "the container cannot reach $url right now. Make sure Metro is running on that port, and enable Docker Desktop's Settings > Resources > Network > Enable host networking (4.34+)."
                 }

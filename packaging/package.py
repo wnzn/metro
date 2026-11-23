@@ -32,6 +32,8 @@ NSH_MACOS_APPS = {
     "macos-x64": ("4fef59fd1f8813261e81326946750f5dc41302b6631f6dc75b30b3348be6ea89", 0x01000007),
 }
 MACOS_UI_ID = "dev.metro.desktop.ui"
+# RELEASE.json capability: this launcher acts on the installer's marker.
+LOCAL_RUNNER = "installer-marker"
 MACOS_MIN = "14.0"
 NSH_LICENSE_SHA = "ec75427ad955e3c740f22e7dc3f6db6fc5b2cc1d9135c2af91cece8dd47a2d38"
 WINDOWS_SYSTEM = set("""
@@ -431,7 +433,9 @@ def desktop(args, stage):
           "to choose On this computer or a saved server.\n"
           + integration + "\n"
           + prerequisites)
-    return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked"}
+    # The launcher reads the installer's enable-local-runner marker (see
+    # desktop_tools::runner). Archives without this field predate that.
+    return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked", "local_runner": LOCAL_RUNNER}
 
 
 def macho(path, cputype):
@@ -552,7 +556,8 @@ def macos(args, stage):
           "Install with install-metro-macos.sh, which places Metro.app in\n"
           "~/Applications/Metro Desktop/ and keeps your data in\n"
           "~/Library/Application Support/Metro/Desktop.\n")
-    return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked", "signing": "adhoc",
+    return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked", "local_runner": LOCAL_RUNNER,
+            "signing": "adhoc",
             "status": "preview-not-verified",
             "renderer": {"stock_unsigned_sha256": stock_sha, "packaged_signed_sha256": source_exe,
                          "code_resources_sha256": source_seal}}

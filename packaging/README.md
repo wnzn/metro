@@ -73,8 +73,9 @@ stops.
     starts. It's never in the container's configuration, environment
     settings or command line. No port is published.
   - A `https://` server works with the default network.
-  - `http://` is accepted only for loopback (`127.0.0.1`, `localhost`,
-    `::1`) on a stable port, and then the container uses host networking.
+  - `http://` is accepted only for exactly `localhost`, `127.0.0.1` or
+    `[::1]` with an explicit port from 1 to 65535 (a stable one), and then
+    the container uses host networking. Every other server needs `https://`.
     On Docker Desktop that needs 4.34 or newer with **Settings > Resources
     > Network > Enable host networking**.
   - `METRO_ALLOW_INSECURE_HTTP` is never set.
@@ -96,9 +97,12 @@ written, so these local 0.2.0 candidates install as they are (verified
   (commit 28ba4e2). It installs with the menu entry.
 - `dist/Metro-runner-0.2.0-linux-x64.tar.gz`.
 
-Launchers built at or before 28ba4e2 don't read `enable-local-runner`, so
-the marker does nothing with those builds. Only launchers that implement
-it act on it.
+Launchers built at or before 28ba4e2 don't read `enable-local-runner`.
+Archives whose launcher does read it say so in `RELEASE.json`
+(`"local_runner": "installer-marker"`). For an archive without that field,
+the installers still verify and install it and keep your choice, but they
+report that this build predates local runner support and that no runner
+will be set up. They never say the runner is on.
 
 ## macOS status
 

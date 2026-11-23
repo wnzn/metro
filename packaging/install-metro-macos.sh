@@ -216,10 +216,12 @@ install_app() {
     fi
     [ -z "$old" ] || rm -rf -- "$old"
     say "Metro $version is installed: $root/Metro.app"
-    if [ "$local_runner" = yes ]; then
+    if [ "$local_runner" != yes ]; then
+        say "Local runner support is off (reinstall with --local-runner to turn it on)."
+    elif [ "$(json_field "$state/RELEASE.json" local_runner)" = installer-marker ]; then
         say "Local runner support is on. Metro sets up your personal on-device runner after you sign in; it is not attached to any Space until you choose it under Manage Space."
     else
-        say "Local runner support is off (reinstall with --local-runner to turn it on)."
+        say "Local runner support was requested, but this Metro build predates it, so no runner will be set up."
     fi
     say "Your Metro data stays in $user_data."
 }
@@ -239,7 +241,9 @@ case "$action" in
     status)
         if [ -d "$root/Metro.app" ] && [ -f "$state/RELEASE.json" ]; then say "Installed: Metro $(json_field "$state/RELEASE.json" version) in $root"
         else say "Metro is not installed in $root."; fi
-        if [ -f "$root/enable-local-runner" ]; then say "Local runner support: on"; else say "Local runner support: off"; fi ;;
+        if [ ! -f "$root/enable-local-runner" ]; then say "Local runner support: off"
+        elif [ "$(json_field "$state/RELEASE.json" local_runner 2>/dev/null)" = installer-marker ]; then say "Local runner support: on"
+        else say "Local runner support: requested (this build predates it; no runner is set up)"; fi ;;
     -h|--help|help) usage ;;
     '') usage >&2; exit 2 ;;
     *) usage >&2; die "unknown command: $action" ;;

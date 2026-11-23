@@ -30,6 +30,17 @@ MACOS = HERE / "install-metro-macos.sh"
 WINDOWS = HERE / "install-metro-windows.ps1"
 CONTAINER_PS1 = HERE / "metro-runner-container.ps1"
 TRUE = shutil.which("true")
+# Validation only: none of these is ever connected to.
+BAD_LOOPBACK = (
+    "http://127.0.0.1.evil.example:80", "http://127.0.0.2:8787", "http://127.1:8787", "http://localhost",
+    "http://localhost:", "http://localhost:0", "http://localhost:65536", "http://localhost:99999",
+    "http://localhost:80x", "http://localhost:+80", "http://localhost:8787:1", "http://localhostx:80",
+    "http://LOCALHOST:80", "http://[::1]", "http://[::1]80", "http://[::1:80", "http://[::1]]:80",
+    "http://[0:0:0:0:0:0:0:1]:80", "http://u@localhost:80", "http://localhost@evil.example:80",
+    "http://0.0.0.0:80", "http://127.0.0.1 :80",
+)
+GOOD_LOOPBACK = ("http://127.0.0.1:41234", "http://localhost:1", "http://[::1]:65535",
+                 "http://localhost:41234/base")
 HOST_MUTATORS = {"docker", "podman", "sudo", "doas", "pkexec", "su", "systemctl", "apt", "apt-get", "dpkg",
                  "pacman", "dnf", "yum", "rpm", "zypper", "flatpak", "snap"}
 
@@ -44,10 +55,10 @@ def write_exec(path, text):
     path.chmod(0o755)
 
 
-def build_archive(out_dir, top, files, kind, target, version, extra_members=(), tamper=None):
+def build_archive(out_dir, top, files, kind, target, version, extra_members=(), tamper=None, fields=None):
     """A package.py-shaped archive: <top>/... plus RELEASE.json, and its .sha256."""
     manifest = {"kind": kind, "target": target, "version": version,
-                "files": {name: sha(data) for name, (data, _) in files.items()}}
+                "files": {name: sha(data) for name, (data, _) in files.items()}, **(fields or {})}
     if tamper:
         tamper(manifest)
     members = dict(files)
@@ -154,6 +165,7 @@ class DesktopInstallerTests(unittest.TestCase):
     def archive(self, version="0.3.0", **kw):
         top = f"Metro-{version}-linux-x64"
         files = kw.pop("files", None) or desktop_files()
+        kw.setdefault("fields", {"local_runner": package.LOCAL_RUNNER})
         return build_archive(self.dist, top, files, "desktop", "linux-x64", version, **kw)
 
     def test_install_update_uninstall_keep_data_and_local_runner_choice(self):
@@ -188,13 +200,19 @@ class DesktopInstallerTests(unittest.TestCase):
         self.assertEqual(self.box.calls(), [])  # no package manager, sudo or systemctl
 
     def test_update_requires_install_and_old_archives_without_menu_script(self):
-        a = self.archive(files=desktop_files(with_menu=False))
+        # Like the early 0.2.0 candidates: no menu script, no local_runner capability.
+        a = self.archive(files=desktop_files(with_menu=False), fields={})
         r = self.box.run(DESKTOP, "update", "--archive", a)
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("use install", r.stderr)
         out = self.box.run(DESKTOP, "install", "--archive", a, check=True).stdout
         self.assertIn("no applications-menu integration", out)
-        self.assertTrue((self.app_root / "current/enable-local-runner").is_file())
+        self.assertIn("predates it, so no runner will be set up", out)
+        self.assertNotIn("Local runner support is on", out)
+        self.assertTrue((self.app_root / "current/enable-local-runner").is_file())  # the choice is kept
+        self.assertIn("requested (this build predates it", self.box.run(DESKTOP, "status", check=True).stdout)
+        out = self.box.run(DESKTOP, "update", "--archive", self.archive("0.3.1"), check=True).stdout
+        self.assertIn("Local runner support is on", out)
 
     def assert_refused(self, archive, message, *extra):
         r = self.box.run(DESKTOP, "install", "--archive", archive, *extra)
@@ -362,10 +380,10 @@ class RunnerInstallerTests(unittest.TestCase):
     def test_configuration_is_validated(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
         for url in ("http://metro.example", "http://10.0.0.5:8787", "ftp://x", "https://u:p@metro.example",
-                    "https://metro.example/?q"):
+                    "https://metro.example/?q", "https://", "https://:443", *BAD_LOOPBACK):
             r = self.configure(url)
             self.assertNotEqual(r.returncode, 0, url)
-        for url in ("http://127.0.0.1:41234", "http://localhost:41234", "http://[::1]:41234"):
+        for url in GOOD_LOOPBACK:
             self.assertEqual(self.configure(url).returncode, 0, url)
         self.token.chmod(0o644)
         self.assertIn("mode 600", self.configure().stderr)
@@ -473,6 +491,17 @@ class ContainerScriptTests(unittest.TestCase):
         self.box.run(CONTAINER, "start", check=True)
         run = next(c for c in self.docker_calls() if c.startswith("docker run -d"))
         self.assertIn("--network=host", run)
+
+    def test_loopback_urls_are_exact_literals_with_a_port(self):
+        for url in BAD_LOOPBACK:
+            r = self.box.run(CONTAINER, "setup", "--server-url", url, "--token-file", self.token, "--image", "m:ci")
+            self.assertNotEqual(r.returncode, 0, url)
+        self.assertEqual(self.docker_calls(), [])
+        for url in GOOD_LOOPBACK:
+            self.box.run(CONTAINER, "setup", "--server-url", url, "--token-file", self.token, "--image", "m:ci",
+                         check=True)
+            self.assertIn("NETWORK=host", self.config.read_text())
+        self.assertTrue(any("/dev/tcp/::1/65535" in c for c in self.docker_calls()))
 
     def test_token_file_checks_and_foreign_container(self):
         self.token.chmod(0o640)
@@ -594,6 +623,19 @@ class PowerShellTests(unittest.TestCase):
             r = self.pwsh("-Command", f"$e=$null; [System.Management.Automation.Language.Parser]::ParseFile("
                                       f"'{script}', [ref]$null, [ref]$e) | Out-Null; if ($e) {{ $e; exit 1 }}")
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_container_url_validation(self):
+        missing = "/nonexistent/metro-token"  # a valid URL gets as far as the token file
+        for url in BAD_LOOPBACK + ("http://metro.example:80", "https://", "https://u@metro.example"):
+            r = self.pwsh("-File", CONTAINER_PS1, "-Action", "Setup", "-ServerUrl", url, "-TokenFile", missing,
+                          "-Version", "0.3.0")
+            self.assertNotEqual(r.returncode, 0, url)
+            self.assertNotIn("Cannot find path", r.stderr, url)
+        for url in GOOD_LOOPBACK + ("https://metro.example", "https://metro.example:8443/base"):
+            r = self.pwsh("-File", CONTAINER_PS1, "-Action", "Setup", "-ServerUrl", url, "-TokenFile", missing,
+                          "-Version", "0.3.0")
+            self.assertNotEqual(r.returncode, 0, url)
+            self.assertIn("Cannot find path", r.stderr, url)
 
     def test_windows_installer_verifies_archives(self):
         with tempfile.TemporaryDirectory() as d:
