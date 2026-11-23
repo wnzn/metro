@@ -37,6 +37,13 @@ class Dockerfile(unittest.TestCase):
         self.assertEqual(self.text.count("sha256sum --check -"), 2)
         self.assertRegex(self.text, r'--snapshot "\$UBUNTU_SNAPSHOT"')
 
+    def test_nsh_is_first_on_path_for_the_self_hosted_workflow(self):
+        # .github/workflows/self-hosted-ci.yml resolves `nsh` from PATH and checks its hash.
+        self.assertIn("tar -xzf /tmp/nsh.tgz -C /opt", self.text)
+        self.assertRegex(self.text, r"ENV PATH=/opt/nsh/bin:")
+        wf = (REPO / ".github/workflows/self-hosted-ci.yml").read_text(encoding="utf-8")
+        self.assertIn("runs-on: metro-ci-linux-x64", wf)
+
     def test_non_root_and_no_secrets(self):
         self.assertIn("USER 1001:1001", self.text)
         for word in ("TOKEN", "GH_", "GITHUB_TOKEN", "--replace", "docker.sock"):
@@ -106,6 +113,13 @@ class Compose(unittest.TestCase):
         self.assertIn("no-new-privileges:true", egress["security_opt"])
         self.assertNotRegex(egress["user"], r"^0(:|$)|^root")
         self.assertTrue(egress["build"]["context"].endswith("ops/github-runner/egress"))
+
+    def test_runner_waits_for_a_healthy_proxy(self):
+        self.assertEqual(self.cfg["services"]["runner"]["depends_on"]["egress"]["condition"], "service_healthy")
+        egress = self.cfg["services"]["egress"]
+        self.assertEqual(egress["healthcheck"]["test"], ["CMD", "/usr/local/bin/egress", "-healthcheck"])
+        self.assertIn("noexec", egress["tmpfs"][0])
+        self.assertEqual(egress["user"], "65532:65532")
 
     def test_registration_survives_down(self):
         self.assertEqual(self.cfg["volumes"]["state"]["name"], "metro-ci-runner-state")

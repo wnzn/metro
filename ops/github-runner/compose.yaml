@@ -47,7 +47,11 @@ services:
       - type: volume
         target: /runner
     networks: [jobs]
-    depends_on: [egress]
+    # The runner (and `runner.sh setup`'s `compose run`) starts only once the
+    # proxy answers its health check.
+    depends_on:
+      egress:
+        condition: service_healthy
     restart: unless-stopped
     stop_signal: SIGINT
     stop_grace_period: 2m
@@ -75,6 +79,12 @@ services:
       net.ipv6.conf.all.disable_ipv6: 1
     tmpfs:
       - /tmp:rw,nosuid,nodev,noexec,size=16m
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/egress", "-healthcheck"]
+      interval: 15s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
     networks: [jobs, egress-out]
     restart: unless-stopped
     logging:
