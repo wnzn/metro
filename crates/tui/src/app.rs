@@ -163,6 +163,9 @@ impl App {
     pub fn current(&self) -> &Conversation {
         &self.conversations[&self.place]
     }
+    pub fn is_signed_in(&self) -> bool {
+        self.signed_in
+    }
     fn current_mut(&mut self) -> &mut Conversation {
         self.conversations.get_mut(&self.place).unwrap()
     }

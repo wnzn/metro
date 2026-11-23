@@ -4,7 +4,7 @@ use crossterm::{
     cursor::{Hide, MoveTo, Show},
     event::{DisableBracketedPaste, EnableBracketedPaste},
     execute, queue,
-    style::Print,
+    style::{Attribute, Print, SetAttribute},
     terminal::{self, Clear, ClearType, EnterAlternateScreen, LeaveAlternateScreen},
 };
 use unicode_segmentation::UnicodeSegmentation;
@@ -13,6 +13,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     api::Recipient,
     app::{App, Focus, Overlay},
+    theme::{Mode, Tone},
 };
 
 const HELP: &[&str] = &[
@@ -37,6 +38,7 @@ const HELP: &[&str] = &[
 pub struct Screen {
     out: Stdout,
     paste: bool,
+    mode: Mode,
     _raw: RawMode,
 }
 
@@ -61,6 +63,7 @@ impl Screen {
         let mut screen = Self {
             out: io::stdout(),
             paste: false,
+            mode: Mode::detect(),
             _raw: raw,
         };
         execute!(screen.out, EnterAlternateScreen, Hide)?;
@@ -74,6 +77,7 @@ impl Screen {
         let (cols, rows) = terminal::size()?;
         let mut frame = Frame {
             out: &mut self.out,
+            mode: self.mode,
             secret,
             cols: cols.saturating_sub(1) as usize,
             rows: rows as usize,
@@ -81,33 +85,38 @@ impl Screen {
         queue!(frame.out, Hide, Clear(ClearType::All))?;
         let width = frame.cols;
         let height = frame.rows;
-        frame.line(0, 0, width, &format!("Metro   |   {}", app.identity))?;
+        frame.header(app)?;
         if width < 18 || height < 7 {
             frame.line(0, 1, width, "Resize · F10 quit")?;
         } else if let Some(overlay) = &app.overlay {
             match overlay {
                 Overlay::Help => {
-                    frame.line(0, 2, width, "KEYBOARD HELP   ·   Esc to close")?;
+                    frame.paint(
+                        0,
+                        2,
+                        width,
+                        "KEYBOARD HELP   ·   Esc to close",
+                        Tone::Strong,
+                    )?;
                     let mut y = 3;
-                    for text in HELP {
+                    'help: for text in HELP {
                         for line in wrap(text, width).0 {
+                            if y >= height - 1 {
+                                frame.line(0, height - 1, width, "Enlarge for full help")?;
+                                break 'help;
+                            }
                             frame.line(0, y, width, &line)?;
                             y += 1;
                         }
-                        if y >= height - 1 {
-                            break;
-                        }
-                    }
-                    if y >= height - 1 {
-                        frame.line(0, height - 1, width, "Enlarge terminal for full help")?;
                     }
                 }
                 Overlay::Models => {
-                    frame.line(
+                    frame.paint(
                         0,
                         2,
                         width,
                         "MODEL & THINKING   ·   ↑/↓ Enter   ·   Esc back",
+                        Tone::Strong,
                     )?;
                     let caption = if app.catalog_status.is_empty() {
                         app.model_caption()
@@ -120,7 +129,17 @@ impl Screen {
                     let start = list_start(rows.len(), app.model_selected, room);
                     for (i, row) in rows.iter().enumerate().skip(start).take(room) {
                         let marker = if i == app.model_selected { ">" } else { " " };
-                        frame.line(0, 5 + i - start, width, &format!("{marker} {}", row.text))?;
+                        frame.paint(
+                            0,
+                            5 + i - start,
+                            width,
+                            &format!("{marker} {}", row.text),
+                            if i == app.model_selected {
+                                Tone::Selected
+                            } else {
+                                Tone::Plain
+                            },
+                        )?;
                     }
                     if let Some(row) = rows.get(app.model_selected) {
                         frame.line(0, height - 1, width, row.detail)?;
@@ -128,9 +147,14 @@ impl Screen {
                 }
             }
         } else if app.fatal {
-            for (i, line) in wrap(&app.transcript_status, width).0.iter().enumerate() {
-                frame.line(0, 2 + i, width, line)?;
-            }
+            frame.status(
+                0,
+                2,
+                width,
+                height - 3,
+                (Tone::Error, "Error"),
+                &app.transcript_status,
+            )?;
             frame.line(0, height - 1, width, "F10 / Ctrl-C quit")?;
         } else {
             let browser = app.focus == Focus::Browser;
@@ -142,20 +166,39 @@ impl Screen {
                 } else {
                     "CONVERSATIONS"
                 };
-                frame.line(0, 2, nav_width, heading)?;
+                frame.paint(0, 2, nav_width, heading, Tone::Strong)?;
                 let nav = app.nav_rows();
                 let room = height - 5;
                 let start = list_start(nav.len(), app.nav_selected, room);
                 for (i, row) in nav.iter().enumerate().skip(start).take(room) {
                     let marker = if i == app.nav_selected { ">" } else { " " };
-                    frame.line(
+                    frame.paint(
                         0,
                         3 + i - start,
                         nav_width,
                         &format!("{marker} {}", row.text),
+                        if i == app.nav_selected {
+                            Tone::Selected
+                        } else {
+                            Tone::Plain
+                        },
                     )?;
                 }
-                frame.line(0, height - 2, nav_width, &app.nav_status)?;
+                if !app.nav_status.is_empty() {
+                    let loading = app.nav_status.starts_with("Loading");
+                    frame.status(
+                        0,
+                        height - 2,
+                        nav_width,
+                        1,
+                        if loading {
+                            (Tone::Info, "Info")
+                        } else {
+                            (Tone::Error, "Error")
+                        },
+                        &app.nav_status,
+                    )?;
+                }
             }
             if !split && browser {
                 frame.line(0, height - 1, width, "Enter open · Tab draft · F1 help")?;
@@ -173,12 +216,18 @@ impl Drop for Screen {
         if self.paste {
             let _ = execute!(self.out, DisableBracketedPaste);
         }
-        let _ = execute!(self.out, Show, LeaveAlternateScreen);
+        let _ = execute!(
+            self.out,
+            SetAttribute(Attribute::Reset),
+            Show,
+            LeaveAlternateScreen
+        );
     }
 }
 
 struct Frame<'a> {
     out: &'a mut Stdout,
+    mode: Mode,
     secret: &'a str,
     cols: usize,
     rows: usize,
@@ -186,6 +235,17 @@ struct Frame<'a> {
 
 impl Frame<'_> {
     fn line(&mut self, x: usize, y: usize, width: usize, text: &str) -> io::Result<()> {
+        self.paint(x, y, width, text, Tone::Plain)
+    }
+
+    fn paint(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        text: &str,
+        tone: Tone,
+    ) -> io::Result<()> {
         if y >= self.rows || x >= self.cols || width == 0 {
             return Ok(());
         }
@@ -198,7 +258,60 @@ impl Frame<'_> {
                 (used > width).then_some(i)
             })
             .unwrap_or(text.len());
-        queue!(self.out, MoveTo(x as u16, y as u16), Print(&text[..end]))
+        queue!(self.out, MoveTo(x as u16, y as u16))?;
+        self.mode.begin(self.out, tone)?;
+        queue!(self.out, Print(&text[..end]))?;
+        self.mode.end(self.out, tone)
+    }
+
+    fn header(&mut self, app: &App) -> io::Result<()> {
+        self.paint(0, 0, self.cols, " metro ", Tone::Brand)?;
+        if self.cols <= 7 {
+            return Ok(());
+        }
+        let (label, tone) = if app.fatal {
+            ("Offline", Tone::Error)
+        } else if app.is_signed_in() {
+            ("Signed in", Tone::Success)
+        } else {
+            ("Connecting", Tone::Info)
+        };
+        let badge = format!(" [{label}] ");
+        let body_width = self.cols - 7;
+        // On narrow screens give the identity more room than the badge.
+        let width = if body_width >= badge.len() + 12 {
+            body_width - badge.len()
+        } else {
+            body_width
+        };
+        self.paint(7, 0, width, &" ".repeat(width), Tone::Rail)?;
+        self.paint(7, 0, width, &format!(" | {}", app.identity), Tone::Rail)?;
+        if width < body_width {
+            self.paint(7 + width, 0, badge.len(), &badge, tone)?;
+        }
+        Ok(())
+    }
+
+    fn status(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        max_lines: usize,
+        (tone, label): (Tone, &str),
+        detail: &str,
+    ) -> io::Result<()> {
+        let chip = format!("[{label}]");
+        let indent = chip.len() + 1;
+        self.paint(x, y, width, &chip, tone)?;
+        let available = width.saturating_sub(indent);
+        if available > 0 {
+            let safe = single_line(detail, self.secret);
+            for (i, line) in wrap(&safe, available).0.iter().take(max_lines).enumerate() {
+                self.line(x + indent, y + i, available, line)?;
+            }
+        }
+        Ok(())
     }
 
     fn conversation(
@@ -208,21 +321,58 @@ impl Frame<'_> {
         width: usize,
         height: usize,
     ) -> io::Result<()> {
-        self.line(x, 2, width, &app.title)?;
+        self.paint(x, 2, width, &app.title, Tone::Strong)?;
         let caption = if app.catalog_status.is_empty() {
             app.model_caption()
         } else {
             app.catalog_status.clone()
         };
         if height >= 9 {
-            self.line(x, 3, width, &format!("Model: {caption}"))?;
+            if app.current().blocked {
+                self.status(x, 3, width, 1, (Tone::Warning, "Warning"), &caption)?;
+            } else {
+                self.line(x, 3, width, &format!("Model: {caption}"))?;
+            }
         }
 
         let draft_height = if height >= 15 { 3 } else { 1 };
         let draft_top = height - 2 - draft_height;
         let status_y = draft_top - 1;
         let transcript_top = if height >= 9 { 4 } else { 3 };
-        let room = status_y.saturating_sub(transcript_top);
+        let status = if app.sending_here() {
+            Some(((Tone::Info, "Info"), "Sending…"))
+        } else if let Some(note) = &app.current().draft.notice {
+            Some(((Tone::Warning, "Warning"), note.as_str()))
+        } else if !app.transcript_status.is_empty() {
+            let loading = app.transcript_status.starts_with("Loading") || !app.is_signed_in();
+            let badge = if loading {
+                (Tone::Info, "Info")
+            } else {
+                (Tone::Error, "Error")
+            };
+            Some((badge, app.transcript_status.as_str()))
+        } else {
+            None
+        };
+        let spare = status_y.saturating_sub(transcript_top);
+        let multiline = spare > 1
+            && status.is_some_and(|((_, label), detail)| {
+                detail.width() > width.saturating_sub(label.len() + 3)
+            });
+        let room = spare - usize::from(multiline);
+        let status_drawn = status.is_some();
+        // Reserve the status rows first, so a wrapped notice never paints
+        // over part of a transcript line.
+        if let Some((badge, detail)) = status {
+            self.status(
+                x,
+                status_y - usize::from(multiline),
+                width,
+                1 + usize::from(multiline),
+                badge,
+                detail,
+            )?;
+        }
         let mut lines = Vec::new();
         if room > 0 {
             for entry in &app.entries {
@@ -247,7 +397,18 @@ impl Frame<'_> {
                 } else {
                     by
                 };
-                lines.extend(wrap(&single_line(&title, self.secret), width).0);
+                let (title, tone) = match entry.kind.as_str() {
+                    "agent" => (format!("[AI] {title}"), Tone::Ai),
+                    "error" => (format!("[Error] {title}"), Tone::Error),
+                    _ => (title, Tone::Strong),
+                };
+                lines.extend(
+                    wrap(&single_line(&title, self.secret), width)
+                        .0
+                        .into_iter()
+                        .enumerate()
+                        .map(|(i, line)| (if i == 0 { tone } else { Tone::Strong }, line)),
+                );
                 let text = redact(&entry.text, self.secret);
                 let limit = 16 * 1024;
                 lines.extend(
@@ -255,52 +416,66 @@ impl Frame<'_> {
                         &text[..text.floor_char_boundary(text.len().min(limit))],
                         width,
                     )
-                    .0,
+                    .0
+                    .into_iter()
+                    .map(|line| (Tone::Plain, line)),
                 );
                 if text.len() > limit {
-                    lines.push("[entry display truncated]".into());
+                    lines.push((Tone::Strong, "[entry display truncated]".into()));
                 }
-                lines.push(String::new());
+                lines.push((Tone::Plain, String::new()));
             }
             if lines.is_empty() && app.transcript_status.is_empty() {
-                lines.push("No messages yet.".into());
+                lines.push((Tone::Plain, "No messages yet.".into()));
             }
             app.scroll = app.scroll.min(lines.len().saturating_sub(room));
             let end = lines.len().saturating_sub(app.scroll);
-            for (i, line) in lines[end.saturating_sub(room)..end].iter().enumerate() {
-                self.line(x, transcript_top + i, width, line)?;
+            for (i, (tone, line)) in lines[end.saturating_sub(room)..end].iter().enumerate() {
+                // Keep the chip short; the rest of the header reads in the user's colors.
+                let chip = match tone {
+                    Tone::Ai => Some("[AI]"),
+                    Tone::Error => Some("[Error]"),
+                    _ => None,
+                };
+                if let Some(chip) = chip {
+                    self.paint(x, transcript_top + i, width, chip, *tone)?;
+                    self.line(
+                        x + chip.len() + 1,
+                        transcript_top + i,
+                        width.saturating_sub(chip.len() + 1),
+                        line.strip_prefix(chip).unwrap_or(line).trim_start(),
+                    )?;
+                } else {
+                    self.paint(x, transcript_top + i, width, line, *tone)?;
+                }
             }
         }
 
-        let draft = &app.current().draft;
-        let status = if app.sending_here() {
-            "Sending…".to_owned()
-        } else if let Some(note) = &draft.notice {
-            note.clone()
-        } else if !app.transcript_status.is_empty() {
-            app.transcript_status.clone()
-        } else if app.scroll > 0 {
-            format!("Scrolled up {} lines · PgDn for latest", app.scroll)
-        } else {
-            String::new()
-        };
-        let status_width = wrap(&single_line(&status, self.secret), width).0;
-        let status_lines = status_width.len().min(if room > 1 { 2 } else { 1 });
-        for (i, line) in status_width.iter().take(status_lines).enumerate() {
-            self.line(x, status_y + i + 1 - status_lines, width, line)?;
+        if !status_drawn && app.scroll > 0 {
+            self.status(
+                x,
+                status_y,
+                width,
+                1,
+                (Tone::Info, "Info"),
+                &format!("Scrolled up {} lines · PgDn for latest", app.scroll),
+            )?;
         }
 
+        let draft = &app.current().draft;
         let draft_width = width.saturating_sub(3).max(1);
         let text = redact(&draft.text, self.secret);
         let (lines, cursor_row, cursor_col) = wrap_at(&text, draft_width, Some(draft.caret));
         let top = cursor_row
             .saturating_sub(draft_height - 1)
             .min(lines.len().saturating_sub(draft_height));
-        self.line(
+        let focused = app.focus == Focus::Draft;
+        self.paint(
             x,
             draft_top,
             2,
-            if app.focus == Focus::Draft { ">" } else { "·" },
+            if focused { ">" } else { "·" },
+            if focused { Tone::Selected } else { Tone::Plain },
         )?;
         for (i, line) in lines.iter().skip(top).take(draft_height).enumerate() {
             self.line(x + 2, draft_top + i, width - 2, line)?;
@@ -315,17 +490,24 @@ impl Frame<'_> {
         } else {
             "Send"
         };
-        self.line(
+        self.paint(
             x,
             height - 2,
             width,
             &format!("Enter {enter} · F2 Ask · F3 {alternate}"),
+            Tone::Strong,
         )?;
         self.line(
             x,
             height - 1,
             width,
-            "Tab Browse · F4 Model · F5 Refresh · F1 Help · F10 Quit",
+            if width >= 52 {
+                "Tab Browse · F1 Help · F4 Model · F5 Refresh · F10 Quit"
+            } else if width >= 22 {
+                "Tab Browse · F1 Help"
+            } else {
+                "Tab · F1 Help"
+            },
         )?;
         if app.focus == Focus::Draft && !app.sending_here() {
             queue!(

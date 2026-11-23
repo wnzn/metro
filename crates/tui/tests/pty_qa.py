@@ -12,6 +12,7 @@ from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import select
 import signal
@@ -34,6 +35,8 @@ F1, F2, F3, F4, F5 = b"\x1bOP", b"\x1bOQ", b"\x1bOR", b"\x1bOS", b"\x1b[15~"
 UP, DOWN, ENTER = b"\x1b[A", b"\x1b[B", b"\r"
 ENTER_SCREEN, EXIT_SCREEN = b"\x1b[?1049h", b"\x1b[?1049l"
 CLEAR = b"\x1b[2J"
+SGR = re.compile(rb"\x1b\[[0-9;:]*m")
+SET_COLOR = re.compile(rb"\x1b\[(?:38|48);(?:2|5);")
 
 
 class Endpoint(BaseHTTPRequestHandler):
@@ -151,13 +154,23 @@ class Pty:
         if fresh:
             self.data = b""
         while True:
-            within = self.data.rsplit(CLEAR, 1)[-1]
+            within = self.frame()
             if wanted in within and (unwanted is None or unwanted not in within):
                 return
             require(self.child.poll() is None, f"TUI exited before rendering {text!r}")
             if time.monotonic() >= deadline:
                 raise RuntimeError(f"TUI did not render {text!r} before the deadline")
             self.read(min(0.08, remaining(deadline)))
+
+    def frame(self):
+        return SGR.sub(b"", self.data.rsplit(CLEAR, 1)[-1])
+
+    def require_rgb(self, text, fg, bg):
+        code = lambda plane, rgb: f"\x1b[{plane};2;{';'.join(map(str, rgb))}m".encode()
+        raw = self.data.rsplit(CLEAR, 1)[-1]
+        colored = code(38, fg) + code(48, bg)
+        require(re.search(re.escape(colored) + rb"(?:\x1b\[1m)?" + re.escape(text.encode()), raw)
+                is not None, f"missing expected foreground/background pair on {text!r}")
 
     def exit(self, code, *, screen=True):
         self.child.wait(timeout=min(3, remaining(self.deadline)))
@@ -251,9 +264,15 @@ def main(server, tui):
         proxy = f"http://{HOST}:{endpoint.server_port}"
         tui_env = env | {"HTTP_PROXY": proxy, "http_proxy": proxy, "ALL_PROXY": proxy}
 
-        ui = Pty(stack, tui, origin, private, tui_env, deadline, forbidden)
+        ui = Pty(stack, tui, origin, private, tui_env | {"COLORTERM": "truecolor"}, deadline, forbidden)
         ui.wait("Untrusted display", absent="Invisible QA Space")
         ui.wait("+ QA Space")
+        ui.wait("[Signed in]")
+        slate, ink = (248, 250, 255), (11, 15, 25)
+        ui.require_rgb(" metro ", slate, (10, 88, 255))
+        ui.require_rgb(" | alice", slate, (8, 27, 59))
+        ui.require_rgb(" [Signed in] ", ink, (16, 185, 129))
+        ui.require_rgb("> Personal Chat", slate, (10, 88, 255))
         require(not endpoint.calls, "entering TUI started model work")
         ui.send(F1)
         ui.wait("KEYBOARD HELP")
@@ -271,6 +290,7 @@ def main(server, tui):
         ui.wait("Enter Ask agent")
         ui.send(ENTER)
         ui.wait("Verified reply 1")
+        ui.require_rgb("[AI]", ink, (139, 92, 246))
         check_message(call, alice, chat, "A personal question", [{"kind": "agent"}])
         require(endpoint.calls == ["qa-default"], "primary Ask did not use the default")
 
@@ -302,7 +322,7 @@ def main(server, tui):
         ui.send(F4)
         ui.wait("qa-alternate · QA Alternate")
         # Discover order from the frame; this is a black-box keyboard test.
-        frame = ui.data.rsplit(CLEAR, 1)[-1]
+        frame = ui.frame()
         step = 1 if frame.rfind(b"qa-alternate") < frame.rfind(b"qa-default") else 2
         ui.send(DOWN * step + ENTER)
         ui.wait("Model:")
@@ -314,6 +334,7 @@ def main(server, tui):
         ui.paste("Draft after revocation")
         ui.send(F2)
         ui.wait("Model or thinking level unavailable.")
+        ui.require_rgb("[Warning]", ink, (245, 158, 11))
         ui.wait("Draft after revocation")
         require(len(endpoint.calls) == 3, "revoked selection started model work")
         require(not any(e["text"] == "Draft after revocation"
@@ -340,7 +361,7 @@ def main(server, tui):
         require(claim_device(port, deadline, device, relay_model) is None, "unexpected initial relay job")
         ui.send(F4)
         ui.wait("Thinking: high")
-        frame = ui.data.rsplit(CLEAR, 1)[-1]
+        frame = ui.frame()
         rows = [part for part in frame.split(b"\x1b[") if b";1H  " in part and b"> " not in part]
         choice = next(i for i, part in enumerate(rows, 1) if b"Thinking: high" in part)
         ui.send(DOWN * choice + ENTER)
@@ -364,6 +385,13 @@ def main(server, tui):
         ui.wait("Verified thinking reply")
         check_message(call, alice, chat, "Requested thinking", [{"kind": "agent"}])
 
+        ui.resize(20, 100)
+        ui.send(b"\x1b[5~")
+        ui.wait("Scrolled up")
+        ui.require_rgb("[Info]", ink, (6, 182, 212))
+        ui.send(b"\x1b[6~" * 8)
+        ui.wait("Verified thinking reply", absent="Scrolled up")
+
         ui.paste(f"Accidental credential: {alice}")
         ui.send(F3)
         ui.wait("Remove the sign-in token from the draft.")
@@ -379,7 +407,9 @@ def main(server, tui):
         hidden = Pty(stack, tui, origin, None, tui_env, deadline, forbidden)
         hidden.wait("Metro token:")
         hidden.send(alice.encode() + ENTER)
-        hidden.wait("Metro   |   alice")
+        hidden.wait("| alice")
+        require(b"\x1b[38;5;231m\x1b[48;5;27m" in hidden.data, "missing indexed wordmark colors")
+        require(b"\x1b[38;2;" not in hidden.data, "indexed terminal received RGB colors")
         hidden.child.send_signal(signal.SIGINT)
         hidden.exit(0)
 
@@ -390,15 +420,36 @@ def main(server, tui):
 
         for stopping_signal in (signal.SIGHUP, signal.SIGTERM):
             stopping = Pty(stack, tui, origin, private, tui_env, deadline, forbidden)
-            stopping.wait("Metro   |   alice")
+            stopping.wait("| alice")
             stopping.child.send_signal(stopping_signal)
             stopping.exit(0)
 
         wrong = Pty(stack, tui, origin, token_file(state, "invalid-token", invalid),
-                    tui_env, deadline, forbidden)
+                    tui_env | {"COLORTERM": "24bit"}, deadline, forbidden)
         wrong.wait("HTTP 401")
+        wrong.require_rgb("[Error]", ink, (239, 68, 68))
         wrong.send(b"\x03")
         wrong.exit(1)
+
+        for mono_env in ({"NO_COLOR": "1", "COLORTERM": "truecolor"}, {"TERM": "xterm"}):
+            mono = Pty(stack, tui, origin, private, tui_env | mono_env, deadline, forbidden)
+            mono.resize(12, 34)
+            mono.wait("Tab Browse · F1 Help")
+            mono.wait("| alice")
+            mono.send(b"\t")
+            mono.wait("CONVERSATIONS  <")
+            mono.wait("> Personal Chat")
+            require(b"\x1b[7m> Personal Chat" in mono.data, "monochrome selection lacks inverse")
+            mono.send(F1)
+            mono.wait("KEYBOARD HELP")
+            require(SET_COLOR.search(mono.data) is None, "monochrome terminal received color")
+            mono.send(b"\x03")
+            mono.exit(0)
+
+        dumb = Pty(stack, tui, origin, private, tui_env | {"TERM": "dumb"}, deadline, forbidden)
+        dumb.exit(1, screen=False)
+        require(b"TERM=dumb lacks cursor addressing" in dumb.data and b"\x1b" not in dumb.data,
+                "dumb terminal received control sequences or no explanation")
 
         exposed = Pty(stack, tui, origin, token_file(state, "exposed-token", invalid, 0o644),
                       tui_env, deadline, forbidden)

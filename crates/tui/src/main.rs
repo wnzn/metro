@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod composer;
 mod terminal;
+mod theme;
 
 use std::{
     fs::OpenOptions,
@@ -143,6 +144,11 @@ fn run(args: Args) -> Result<(), &'static str> {
     let origin = api::origin(&args.server)?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("An interactive terminal is required (allocate a PTY when using SSH).");
+    }
+    if theme::dumb_terminal() {
+        return Err(
+            "TERM=dumb lacks cursor addressing. Use an interactive terminal with a matching TERM.",
+        );
     }
     let interrupted = Arc::new(AtomicBool::new(false));
     install_interrupt_handlers(&interrupted)
