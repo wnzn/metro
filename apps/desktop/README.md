@@ -237,8 +237,8 @@ private folder on this computer, per Space, while Metro is open.
 
 Chat, Search, Library and Scheduled tasks are your own pages, outside every
 Space, and work with or without any Space. The entries above describe the
-current source after 0.2.0, which isn't released. Quick results are
-covered by automated tests, with no native check recorded yet. Before they
+current source after 0.2.0, which isn't released. Quick results were
+checked natively at `95a3d2b` ([acceptance](../../docs/acceptance.md#staged-quick-search-as-you-type-2026-11-23-project-manager-local)). Before they
 were added, native runs checked the full search's Return behaviour with its
 scope and type filters, folded zero-similarity results, the Library
 page, the media model in Settings, scheduled-task cards with the History
@@ -493,6 +493,8 @@ These IDs are used by the tests and screenshot steps; keep them stable:
   `routing-save`, `routing-revert`, `routing-error`, `routing-notice`,
   `routing-unsupported`, `available-error`,
   `routing-no-<classifier|chat|embedding>`
+- **Quick results:** `quick-results`, `quick-more`, `quick-asset:<id>`,
+  `quick-message:<space id|chat>:<room id|chat>:<event id>`
 - **Search:** `top-search`, `search-view`, `search-surface`, `search-form`,
   `search-scope`, `search-results`, `search-less-relevant`, `search-result:…`, `search-open:…`,
   `search-summary`, `search-ranking`, `search-ranking-explain`,

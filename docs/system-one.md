@@ -281,8 +281,9 @@ automated tests.
 
 #### Quick results as you type
 
-This describes the current source after 0.2.0. It isn't released. It's
-covered by automated tests, but no native GTK check of it is recorded yet.
+This describes the current source after 0.2.0. It isn't released. It was
+checked in native Linux GTK, in dark and light themes, at `95a3d2b`
+([acceptance](acceptance.md#staged-quick-search-as-you-type-2026-11-23-project-manager-local)). Windows and macOS weren't checked.
 
 - About 220 ms after you stop typing, the app sends what you typed to your
   Metro server (`POST /v1/search/quick`) as a **literal** lookup: a
@@ -302,12 +303,21 @@ covered by automated tests, but no native GTK check of it is recorded yet.
   search for anything older.
 - It shows at most 8 suggestions in a scrollable list under the box:
   - a message shows a snippet around the match and where it is;
-  - a file shows its name with its extension. A file row may show a small
-    preview, which the app reads from the file through your Metro session.
-    It isn't sent to a model.
+  - a file shows its name with its extension, and a small preview that the
+    app reads from the file through your Metro session. The preview is never
+    sent to a model.
+    - Text and Markdown files show an excerpt, and a PNG shows the image.
+    - A WAV shows its real waveform and duration.
+    - A video shows its first frame when the computer has the codec. When it
+      doesn't, the row says to open the file to play it.
+    - MP3 shows its title and artist tags, with no waveform. DOCX shows its
+      text where it can be read. These two are covered by automated tests
+      only.
+    - PDF shows no preview.
 - Where it looks follows the page you're on:
   - in Search, the mode and scope you picked;
-  - in Library, files only, within the Library's scope;
+  - in Library, files only, from where **Show files from** points. **More
+    results** keeps that scope;
   - anywhere else, files and messages across everything you can read.
 
   It never widens a page's filters.

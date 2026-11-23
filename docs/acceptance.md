@@ -3,6 +3,66 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Staged: quick search as you type (2026-11-23, project manager, local)
+
+Local and unreleased: nothing was packaged or published. It doesn't change
+the [UI gate below](#staged-desktop-ui-gate-after-020-2026-11-23-project-manager-local)
+or the 0.2.0 local release.
+
+**Source.** App `95a3d2b9064a18818681b2a6bf55d932a52b6679`. Server `d6513c6`.
+
+| Check | Result |
+| --- | --- |
+| Desktop, from a clean archive of `95a3d2b`: NSH 0.6.1 `nsh check`, `nsh build --release` and `nsh test` | Check and build passed. Tests: **272/272**, with 0 failures, errors or skips. JUnit report `verified-95a3d2b90.junit.xml` |
+| Follow-up `05fbfb6` (test only) | 17/17 targeted tests |
+| `cargo test --locked -p metro-server` at `d6513c6`, 19 nonempty test binaries | **342/342** |
+
+**Native Linux GTK, dark and light, at 1200×1000 and a compact 1200×560.**
+Chat, System One, embeddings and media connections were all configured.
+
+- **No model while typing:**
+  - Typing made zero model requests. The app sent only
+    `POST /v1/search/quick`, and authenticated reads of the preview bytes.
+  - The only model calls came from the full search, after **More results**.
+- **Previews:**
+  - A text file showed an excerpt, and a PNG showed the image itself.
+  - A WAV showed its real waveform and duration.
+  - Video first frames were checked against the frame's own pixels: VP8
+    WebM, and H.264 MP4 on a host with the H.264 codec.
+  - Without that codec, H.264 MP4 showed its fallback message instead.
+  - An unindexed Markdown file was found by its name.
+- **Keyboard and pointer:**
+  - In the 560 px window, the arrow keys scrolled all the way down to **More
+    results**.
+  - Return opened the selected row, or full Search from More.
+  - Ctrl+K focused the box. Escape closed the list and kept the query.
+  - Clicking a file row opened it. Clicking More opened full Search.
+- **Scope and access:**
+  - The Library's **Show files from** scope carried into quick results and
+    More.
+  - Only current memberships were searched. Bob's private file never
+    appeared.
+- **Not a blocker:** after a file is opened, the top box shows the
+  Library's own search field. The quick query isn't carried over.
+
+**Automated tests only:**
+
+- MP3 title and artist tags, shown with no waveform.
+- Bounded DOCX text, shown where it can be read.
+- The PDF fallback.
+
+**Not verified:**
+
+- Windows and macOS.
+- Video on a host without the codec, beyond its fallback.
+- General audio or video playback and seeking.
+
+**Receipt:** stored outside the gallery.
+
+- `~/.cache/metro-release/quick-search/final-95a3d2b/RESULTS.txt`, with 32
+  delivered PNGs listed in `deliver/SHA256SUMS`.
+- The app and server gate logs are in the sibling `checks/` directory.
+
 ## Staged: desktop UI gate after 0.2.0 (2026-11-23, project manager, local)
 
 A **UI gate** on unreleased source after tag `v0.2.0`, reported by the

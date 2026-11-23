@@ -497,7 +497,9 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 > its scope and type filters were checked in a native Linux GTK run, in dark
 > and light themes, of the source after 0.2.0, before quick results were
 > added. It isn't a release, and Windows and macOS weren't checked. The
-> Delete confirmation and quick results are covered by automated tests.
+> Delete confirmation is covered by automated tests. Quick results,
+> including finding an unindexed Markdown file by its name, were checked
+> natively later, at `95a3d2b` ([acceptance](acceptance.md#staged-quick-search-as-you-type-2026-11-23-project-manager-local)).
 
 The screenshots below are historical: they show the 0.2.0-era layout, where
 files and the media model were under Search. They're native Linux captures,
