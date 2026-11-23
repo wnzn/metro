@@ -192,10 +192,9 @@ pub type BrowserOpener = Box<dyn FnOnce(&str) -> anyhow::Result<()> + Send>;
 /// How [`login_with`] runs the browser half of the sign-in.
 pub struct LoginOptions {
     pub endpoints: Endpoints,
-    /// Receives the local one-time start URL
-    /// (`http://127.0.0.1:<port>/auth/start?k=…`). That URL redirects to
-    /// OpenAI. It contains no tokens. The default prints it to stderr and
-    /// opens the system browser.
+    /// Receives the private loopback start link, which redirects to OpenAI
+    /// while the attempt waits. The default opens it in the system browser
+    /// without printing it. Custom openers must not display or log the link.
     pub open_browser: BrowserOpener,
     pub preferred_port: u16,
     /// How long to wait for the browser callback.

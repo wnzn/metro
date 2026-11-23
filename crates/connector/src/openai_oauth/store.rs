@@ -215,7 +215,7 @@ impl Profile {
             f.write_all(&bytes)?;
             f.sync_all()?;
             drop(f);
-            fs::rename(&tmp, self.dir.join(name))?;
+            replace_profile_file(&tmp, &self.dir.join(name))?;
             sync_dir(&self.dir)
         })();
         if result.is_err() {
@@ -223,6 +223,41 @@ impl Profile {
         }
         result.with_context(|| format!("writing {name}"))
     }
+}
+
+#[cfg(not(windows))]
+fn replace_profile_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    fs::rename(from, to)
+}
+
+#[cfg(windows)]
+fn replace_profile_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    retry_replace(|| fs::rename(from, to))
+}
+
+#[cfg(windows)]
+fn retry_replace(mut replace: impl FnMut() -> std::io::Result<()>) -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+    // A concurrent status read can briefly block replacement. Windows can
+    // report either sharing violation or access denied for a busy target.
+    // Retry only the atomic rename of the same flushed, sealed file, with
+    // 150 ms of total backoff. Persistent denial is still returned to the
+    // caller, leaving the existing file in place.
+    for ms in [10, 20, 40, 80] {
+        match replace() {
+            Err(e)
+                if matches!(
+                    e.raw_os_error().map(|code| code as u32),
+                    Some(ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED)
+                ) =>
+            {
+                std::thread::sleep(Duration::from_millis(ms));
+            }
+            result => return result,
+        }
+    }
+    replace()
 }
 
 fn valid_host_id(id: &str) -> Result<()> {
@@ -536,8 +571,98 @@ mod dpapi {
     }
 }
 
-fn sync_dir(dir: &Path) -> Result<()> {
+fn sync_dir(_dir: &Path) -> Result<()> {
     #[cfg(unix)]
-    fs::File::open(dir)?.sync_all()?;
+    fs::File::open(_dir)?.sync_all()?;
     Ok(())
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_SHARING_VIOLATION};
+
+    #[test]
+    fn replace_retries_when_a_reader_releases_the_account_file() {
+        const FILE_SHARE_READ: u32 = 1;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("profile");
+        let profile = Profile::open(&dir, true).unwrap().unwrap();
+        let target = dir.join(ACCOUNT_FILE);
+        let next = dir.join("next.json");
+        profile.write(ACCOUNT_FILE, &"old").unwrap();
+        profile.write("next.json", &"new").unwrap();
+        let mut reader = Some(
+            fs::OpenOptions::new()
+                .read(true)
+                // Deliberately omit delete sharing to force the first failure.
+                .share_mode(FILE_SHARE_READ)
+                .open(&target)
+                .unwrap(),
+        );
+        let mut tries = 0;
+        retry_replace(|| {
+            tries += 1;
+            let result = fs::rename(&next, &target);
+            if tries == 1 {
+                assert!(matches!(
+                    result
+                        .as_ref()
+                        .unwrap_err()
+                        .raw_os_error()
+                        .map(|code| code as u32),
+                    Some(ERROR_SHARING_VIOLATION | ERROR_ACCESS_DENIED)
+                ));
+                assert_eq!(
+                    profile.read::<String>(ACCOUNT_FILE).unwrap().as_deref(),
+                    Some("old")
+                );
+                // Release only after the real failed rename; no timing race.
+                drop(reader.take());
+            }
+            result
+        })
+        .unwrap();
+        assert_eq!(tries, 2);
+        assert_eq!(
+            profile.read::<String>(ACCOUNT_FILE).unwrap().as_deref(),
+            Some("new")
+        );
+        assert!(!next.exists());
+    }
+
+    #[test]
+    fn write_preserves_the_sealed_account_when_replacement_is_denied() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("profile");
+        let profile = Profile::open(&dir, true).unwrap().unwrap();
+        let target = dir.join(ACCOUNT_FILE);
+        profile.write(ACCOUNT_FILE, &"old").unwrap();
+        let original = fs::read(&target).unwrap();
+        let perms = target.metadata().unwrap().permissions();
+        let mut readonly = perms.clone();
+        readonly.set_readonly(true);
+        fs::set_permissions(&target, readonly).unwrap();
+        let result = profile.write(ACCOUNT_FILE, &"new");
+        fs::set_permissions(&target, perms).unwrap();
+
+        let err = result.unwrap_err();
+        assert_eq!(
+            err.downcast_ref::<std::io::Error>()
+                .and_then(std::io::Error::raw_os_error),
+            Some(ERROR_ACCESS_DENIED as i32)
+        );
+        assert!(fs::read(&target).unwrap() == original);
+        assert_eq!(
+            profile.read::<String>(ACCOUNT_FILE).unwrap().as_deref(),
+            Some("old")
+        );
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            1,
+            "no abandoned temp file"
+        );
+    }
 }
