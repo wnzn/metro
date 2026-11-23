@@ -3,6 +3,48 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Partial: self-hosted CI runner stack, hosted preflight and offline image check (2026-11-23, runner CI)
+
+The repository's own CI runner, [ops/github-runner](../ops/github-runner/README.md).
+It's unrelated to Metro's Space runners.
+
+**Not yet shown:** the runner registered to `wnzn/metro`, or any job of
+`self-hosted-ci.yml` running on the operator's own machine.
+
+**Hosted preflight passed.** Run
+[45199814095](https://github.com/wnzn/metro/actions/runs/45199814095), job
+`137779964816`, "Runner stack preflight" (`check-runner-stack.yml` →
+`ops/github-runner/ci_preflight.py`), was a push to `main` at `7452f6f8d8d2`.
+On a disposable GitHub-hosted Linux VM's own Docker, without registering
+anything or using any enrollment credential, it checked:
+
+- **Build and start:** both Compose images built, and the stack started
+  with the egress proxy healthy. The jobs network is an internal, IPv6-off
+  bridge in `isolated` gateway mode.
+- **Containment:**
+  - both containers run as non-root, with a read-only root filesystem, no
+    capabilities and `no-new-privileges`;
+  - no published ports, devices or host namespaces;
+  - no credential-like environment variables.
+- **Mounts:** the effective mounts were only the expected tmpfs and two
+  plain Docker-managed local volumes (state and scratch). There were no
+  host paths, volume driver options or Docker socket.
+- **Network:**
+  - GitHub's public Git endpoint was reachable through the proxy;
+  - a `CONNECT` to another host was refused (403), and its header didn't
+    appear in the logs;
+  - direct TCP from the runner to a GitHub address, to a listener on the VM
+    itself, and to a LAN-like listener on another bridge was blocked.
+- **Tools:** the pinned NSH 0.6.1 and its offline TypeScript 7.0.2 built and
+  tested a small fixture app inside the runner, as UID 1001.
+- **Persistence:** the runner reported "not registered". A marker file in
+  the state volume survived `down` and `up`.
+
+**Earlier, offline, from the runner image:** Metro's desktop app passed
+`nsh check`, `nsh build --release` and the focused Shell tests (13/13), with
+the network disabled and an empty `HOME`. This was a local run of the
+image, not a GitHub job.
+
 ## Partial: automatic releases from protected master, branding, and the first GitHub run (2026-11-23, docs lane, local and GitHub)
 
 **No release exists.** Nothing has been signed, notarized or published for
