@@ -1,13 +1,16 @@
 import json
 import os
 from pathlib import Path
+import plistlib
 import shutil
 import struct
 import subprocess
 import sys
 import tarfile
 import tempfile
+from types import SimpleNamespace
 import unittest
+from unittest.mock import patch
 import zipfile
 
 import package
@@ -30,7 +33,12 @@ def renderer_source(source):
             "".join(f'import {Path(n).stem} from "./icons/{n}";\n' for n in names))
         for name in names:
             (icons / name).write_text(f"<svg id='{name}'/>")
+    package.copy(package.RENDERER_SOURCE / package.INTER_FONT, source / package.INTER_FONT)
     return icons
+
+
+def bundle_font(source, assets):
+    package.copy(source / package.INTER_FONT, assets / package.INTER_FONT)
 
 
 class PackageTests(unittest.TestCase):
@@ -131,6 +139,7 @@ class PackageTests(unittest.TestCase):
                 package.nsh_resources(ui, source, "0.2.0")
             for name in ("check.svg", "send.svg", "play.svg"):
                 package.copy(icons / name, packaged_icons / name)
+            bundle_font(source, resources / "assets")
             self.assertIn(Path("assets/src/ui/icons/check.svg"), package.nsh_resources(ui, source, "0.2.0"))
             # The final packager supplies its own exact renderer sidecar, not an
             # arbitrary icon submitted alongside the stock NSH build.
@@ -167,18 +176,20 @@ class PackageTests(unittest.TestCase):
             bundled.mkdir(parents=True)
             for name in ("check.svg", "send.svg"):
                 package.copy(icons / name, bundled / name)
+            bundle_font(source, actual)
             # library.tsx's own import is required, though chrome.tsx doesn't import it.
             with self.assertRaisesRegex(ValueError, r"missing renderer assets: src/ui/icons/play\.svg"):
                 package.nsh_assets(actual, source)
             package.copy(icons / "play.svg", bundled / "play.svg")
             self.assertEqual(set(package.nsh_assets(actual, source)),
-                             {Path("src/ui/icons") / n for n in ("check.svg", "send.svg", "play.svg")})
+                             {Path("src/ui/icons") / n for n in ("check.svg", "send.svg", "play.svg")}
+                             | {package.INTER_FONT})
 
             # A test, fixture or unlisted module never approves an icon, even an exact copy.
             (icons / "stray.svg").write_text("<svg id='stray'/>")
             for module in ("theme.fixture.tsx", "QuickSearch.test.tsx", "extra.tsx"):
                 (icons.parent / module).write_text('import stray from "./icons/stray.svg";\n')
-            self.assertEqual(len(package.nsh_assets(actual, source)), 3)  # unbundled: fine
+            self.assertEqual(len(package.nsh_assets(actual, source)), 4)  # unbundled: fine
             package.copy(icons / "stray.svg", bundled / "stray.svg")
             with self.assertRaisesRegex(ValueError, r"unapproved renderer asset: src/ui/icons/stray\.svg"):
                 package.nsh_assets(actual, source)
@@ -198,6 +209,80 @@ class PackageTests(unittest.TestCase):
             library.unlink()
             with self.assertRaisesRegex(ValueError, "not a regular release file"):
                 package.nsh_assets(actual, source)
+
+    def test_inter_font_and_license_are_pinned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            source, actual = scratch / "source", scratch / "assets"
+            icons = renderer_source(source)
+            for icon in icons.iterdir():
+                package.copy(icon, actual / "src/ui/icons" / icon.name)
+            bundled = actual / package.INTER_FONT
+            with self.assertRaisesRegex(ValueError, r"missing renderer assets: src/ui/fonts/InterVariable\.ttf"):
+                package.nsh_assets(actual, source)
+            bundle_font(source, actual)
+            self.assertEqual(package.nsh_assets(actual, source)[package.INTER_FONT], bundled)
+            other = bundled.with_name("other.ttf")
+            package.copy(bundled, other)
+            with self.assertRaisesRegex(ValueError, "unapproved renderer asset: src/ui/fonts/other.ttf"):
+                package.nsh_assets(actual, source)
+            other.unlink()
+            bundled.write_bytes(b"not Inter")
+            with self.assertRaisesRegex(ValueError, "unexpected Inter font digest"):
+                package.nsh_assets(actual, source)
+            (source / package.INTER_FONT).write_bytes(bundled.read_bytes())
+            with self.assertRaisesRegex(ValueError, "unexpected Inter font digest"):
+                package.nsh_assets(actual, source)
+            package.write_inter_notice(scratch)
+            self.assertEqual(package.sha256(scratch / "licenses/INTER-OFL.txt"), package.INTER_OFL_SHA)
+
+    def test_macos_outer_bundle_has_canonical_icon_without_an_inner_icon(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            ui = root / "Metro.app"
+            contents = ui / "Contents"
+            for part in ("Resources", "MacOS", "_CodeSignature"):
+                (contents / part).mkdir(parents=True)
+            package.write(contents / "MacOS/Metro", "signed renderer")
+            package.write(contents / "_CodeSignature/CodeResources", "inner seal")
+            (contents / "Info.plist").write_bytes(plistlib.dumps({
+                "CFBundleExecutable": "Metro", "CFBundleIdentifier": package.MACOS_UI_ID,
+                "CFBundleShortVersionString": "0.2.0", "LSMinimumSystemVersion": package.MACOS_MIN,
+            }))
+            stock = root / "runtime/macos/nsh-macos-app"
+            stock.parent.mkdir(parents=True)
+            license_path = root / "LICENSE-APACHE"
+            launcher, server = root / "launcher", root / "server"
+            for f in (stock, license_path, launcher, server):
+                package.write(f, f.name)
+            target = "macos-arm64"
+            args = SimpleNamespace(target=target, version="0.2.0", nsh_root=root, ui_dir=ui,
+                                   launcher=launcher, server=server, tui=None)
+            stage = root / "stage"
+            with (patch.object(package.sys, "platform", "darwin"),
+                  patch.object(package, "NSH_MACOS_APPS", {target: (package.sha256(stock), 0x0100000C)}),
+                  patch.object(package, "NSH_LICENSE_SHA", package.sha256(license_path)),
+                  patch.object(package, "nsh_resources", return_value={}),
+                  patch.object(package, "brand_notice", return_value=license_path),
+                  patch.object(package, "unsigned_bytes", return_value=b"stock renderer"),
+                  patch.object(package, "macho", return_value=[]),
+                  patch.object(package, "codesign") as codesign):
+                info = package.macos(args, stage)
+            outer = stage / "Metro.app/Contents"
+            plist = plistlib.loads((outer / "Info.plist").read_bytes())
+            self.assertEqual(plist["CFBundleIconFile"], "Metro.icns")
+            icns = (outer / "Resources/Metro.icns").read_bytes()
+            self.assertEqual(struct.unpack(">4sI4sI", icns[:16]), (b"icns", len(icns), b"ic08", len(icns) - 8))
+            self.assertEqual(icns[16:], package.app_icon("metro-256.png").read_bytes())
+            self.assertEqual(struct.unpack(">II", icns[32:40]), (256, 256))
+            inner = outer / "Helpers/MetroUI.app/Contents"
+            self.assertFalse((inner / "Resources/Metro.icns").exists())
+            self.assertEqual(package.sha256(inner / "_CodeSignature/CodeResources"),
+                             info["renderer"]["code_resources_sha256"])
+            self.assertEqual(package.sha256(inner / "MacOS/Metro"), package.sha256(contents / "MacOS/Metro"))
+            for call in codesign.call_args_list:
+                self.assertFalse("--sign" in call.args and "MetroUI.app" in call.args[-1])
+            self.assertEqual(package.sha256(stage / "licenses/INTER-OFL.txt"), package.INTER_OFL_SHA)
 
     def test_brand_notice_must_cover_every_shipped_mark(self):
         with tempfile.TemporaryDirectory() as directory:

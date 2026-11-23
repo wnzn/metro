@@ -235,6 +235,10 @@ class Build(unittest.TestCase):
         self.assertEqual(out1.read_bytes(), out2.read_bytes())
         self.assertEqual(info["signing"], "unsigned")
         self.assertTrue(info["payload"]["has_metro_tui"])
+        self.assertEqual(info["builder"]["icon_sha256"], b.sha256_file(b.APP_ICON))
+        self.assertEqual(info["builder"]["ui_sha256"], b.sha256_file(b.UI_WXS))
+        self.assertEqual(self.tools.stream(out1, f"Binary.{b.SETUP_MARK}"), b.APP_ICON.read_bytes())
+        self.assertEqual(self.tools.stream(out1, f"Icon.{b.APP_ICON_ID}"), b.APP_ICON.read_bytes())
         b.inspect(self.tools, out1, "1.0.0", payload=p)
         with self.assertRaises(b.Fail):
             b.inspect(self.tools, out1, "1.0.0", payload=p, preview=True)
@@ -275,6 +279,14 @@ class Build(unittest.TestCase):
         with self.assertRaises(b.Fail) as ctx:
             b.inspect(self.tools, out, "1.0.0", payload=p)
         self.assertIn("DirectoryList", str(ctx.exception))
+
+    def test_inspect_catches_wrong_arp_icon(self):
+        d = tmpdir(self)
+        _, out, _ = self.build(d)
+        self.tools.run("msibuild", out, "-q", "UPDATE `Property` SET `Value` = 'Wrong.ico' "
+                                              "WHERE `Property` = 'ARPPRODUCTICON'")
+        with self.assertRaisesRegex(b.Fail, "Add or Remove Programs icon"):
+            b.inspect(self.tools, out, "1.0.0")
 
     def test_inspect_catches_changed_bytes(self):
         d = tmpdir(self)

@@ -32,10 +32,12 @@
           <Publish Event="SpawnDialog" Value="CancelDlg" />
         </Control>
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="&amp;Back" />
-        <Control Id="Title" Type="Text" X="20" Y="20" Width="330" Height="30" Transparent="yes" NoPrefix="yes" Text="{\MetroBigger}Welcome to Metro Setup" />
-        <Control Id="Description" Type="Text" X="20" Y="60" Width="330" Height="40" Transparent="yes" NoPrefix="yes" Text="Setup installs Metro [MetroSemver] for you only. No administrator rights are needed. Next, you choose the folder and what Setup sets up." HideCondition="OLDERFOUND OR SAMEVERSIONFOUND" ShowCondition="NOT (OLDERFOUND OR SAMEVERSIONFOUND)" />
-        <Control Id="UpgradeDescription" Type="Text" X="20" Y="60" Width="330" Height="40" Transparent="yes" NoPrefix="yes" Text="Setup updates Metro [PREVSEMVER] to Metro [MetroSemver]. Close Metro before you continue." ShowCondition="OLDERFOUND OR SAMEVERSIONFOUND" HideCondition="NOT (OLDERFOUND OR SAMEVERSIONFOUND)" />
-        <Control Id="DataNote" Type="Text" X="20" Y="105" Width="330" Height="40" Transparent="yes" NoPrefix="yes" Text="Your Metro data in [MetroDataDir] is never changed or removed by Setup, including when you update or uninstall Metro." />
+        <Control Id="BrandIcon" Type="Icon" X="20" Y="12" Width="28" Height="28" FixedSize="yes" IconSize="32" Text="MetroSetupMark" />
+        <Control Id="BrandName" Type="Text" X="52" Y="13" Width="55" Height="24" NoPrefix="yes" Text="{\MetroBrand}metro" />
+        <Control Id="Title" Type="Text" X="20" Y="42" Width="330" Height="21" NoPrefix="yes" Text="{\MetroBigger}Welcome to Metro Setup" />
+        <Control Id="Description" Type="Text" X="20" Y="67" Width="330" Height="40" NoPrefix="yes" Text="Setup installs Metro [MetroSemver] for you only. No administrator rights are needed. Next, you choose the folder and what Setup sets up." HideCondition="OLDERFOUND OR SAMEVERSIONFOUND" ShowCondition="NOT (OLDERFOUND OR SAMEVERSIONFOUND)" />
+        <Control Id="UpgradeDescription" Type="Text" X="20" Y="67" Width="330" Height="40" NoPrefix="yes" Text="Setup updates Metro [PREVSEMVER] to Metro [MetroSemver]. Close Metro before you continue." ShowCondition="OLDERFOUND OR SAMEVERSIONFOUND" HideCondition="NOT (OLDERFOUND OR SAMEVERSIONFOUND)" />
+        <Control Id="DataNote" Type="Text" X="20" Y="113" Width="330" Height="40" NoPrefix="yes" Text="Your Metro data in [MetroDataDir] is never changed or removed by Setup, including when you update or uninstall Metro." />
         <Control Id="PreviewNote" Type="Text" X="20" Y="160" Width="330" Height="40" NoPrefix="yes" Text="{\MetroWarning}This is an unsigned local preview build for testing. It is not a Metro release and is not Authenticode signed." Hidden="yes" ShowCondition="MetroPreview = &quot;1&quot;" />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
       </Dialog>
@@ -187,11 +189,13 @@
         </Control>
         <Control Id="Back" Type="PushButton" X="180" Y="243" Width="56" Height="17" Disabled="yes" Text="&amp;Back" />
         <Control Id="Cancel" Type="PushButton" X="304" Y="243" Width="56" Height="17" Disabled="yes" Text="Cancel" />
-        <Control Id="Title" Type="Text" X="20" Y="20" Width="330" Height="30" Transparent="yes" NoPrefix="yes" Text="{\MetroBigger}Metro Setup finished" />
-        <Control Id="InstalledText" Type="Text" X="20" Y="60" Width="330" Height="36" NoPrefix="yes" Text="Metro [MetroSemver] is installed in [INSTALLDIR]" Hidden="yes" ShowCondition="NOT Installed OR MetroMode = &quot;Repair&quot;" />
-        <Control Id="StartMenuText" Type="Text" X="20" Y="100" Width="330" Height="24" NoPrefix="yes" Text="Start it from the Start menu: Metro." Hidden="yes" ShowCondition="(NOT Installed OR MetroMode = &quot;Repair&quot;) AND SCBOX" />
-        <Control Id="NoStartMenuText" Type="Text" X="20" Y="100" Width="330" Height="24" NoPrefix="yes" Text="Start it with Metro.exe in that folder." Hidden="yes" ShowCondition="(NOT Installed OR MetroMode = &quot;Repair&quot;) AND NOT SCBOX" />
-        <Control Id="RemovedText" Type="Text" X="20" Y="60" Width="330" Height="36" NoPrefix="yes" Text="Metro was removed. Your Metro data in [MetroDataDir] was kept." Hidden="yes" ShowCondition="Installed AND MetroMode = &quot;Remove&quot;" />
+        <Control Id="BrandIcon" Type="Icon" X="20" Y="12" Width="28" Height="28" FixedSize="yes" IconSize="32" Text="MetroSetupMark" />
+        <Control Id="BrandName" Type="Text" X="52" Y="13" Width="55" Height="24" NoPrefix="yes" Text="{\MetroBrand}metro" />
+        <Control Id="Title" Type="Text" X="20" Y="42" Width="330" Height="21" NoPrefix="yes" Text="{\MetroBigger}Metro Setup finished" />
+        <Control Id="InstalledText" Type="Text" X="20" Y="67" Width="330" Height="36" NoPrefix="yes" Text="Metro [MetroSemver] is installed in [INSTALLDIR]" Hidden="yes" ShowCondition="NOT Installed OR MetroMode = &quot;Repair&quot;" />
+        <Control Id="StartMenuText" Type="Text" X="20" Y="107" Width="330" Height="24" NoPrefix="yes" Text="Start it from the Start menu: Metro." Hidden="yes" ShowCondition="(NOT Installed OR MetroMode = &quot;Repair&quot;) AND SCBOX" />
+        <Control Id="NoStartMenuText" Type="Text" X="20" Y="107" Width="330" Height="24" NoPrefix="yes" Text="Start it with Metro.exe in that folder." Hidden="yes" ShowCondition="(NOT Installed OR MetroMode = &quot;Repair&quot;) AND NOT SCBOX" />
+        <Control Id="RemovedText" Type="Text" X="20" Y="67" Width="330" Height="36" NoPrefix="yes" Text="Metro was removed. Your Metro data in [MetroDataDir] was kept." Hidden="yes" ShowCondition="Installed AND MetroMode = &quot;Remove&quot;" />
         <Control Id="BottomLine" Type="Line" X="0" Y="234" Width="370" Height="0" />
       </Dialog>
 

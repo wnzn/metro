@@ -56,6 +56,9 @@ HERE = Path(__file__).resolve().parent
 LOCK = HERE / "wixl-lock.json"
 UI_WXS = HERE / "metro-ui.wxs"
 EXT_DIR = HERE / "wixl-ext"
+APP_ICON = HERE.parents[1] / "apps/desktop/assets/metro.ico"
+SETUP_MARK = "MetroSetupMark"
+APP_ICON_ID = "MetroApp.ico"
 TOOLS_STAMP = "METRO-MSI-TOOLS.json"
 
 # Fixed forever for the released product: changing it breaks upgrades.
@@ -167,8 +170,9 @@ def product_code(identity, semver):
     return "{%s}" % str(uuid.uuid5(NAMESPACE, f"{identity}:product:{semver}")).upper()
 
 
-def package_code(identity, semver, payload_digest, preview):
+def package_code(identity, semver, payload_digest, preview, sources):
     key = f"{identity}:package:{semver}:{payload_digest}:{'preview' if preview else 'plain'}"
+    key += ":" + json.dumps(sources, sort_keys=True)
     return "{%s}" % str(uuid.uuid5(NAMESPACE, key)).upper()
 
 
@@ -376,7 +380,13 @@ class Tools:
         return p
 
     def table(self, msi, name):
-        p = self.run("msiinfo", "export", msi, name, check=False)
+        if name in ("Binary", "Icon"):
+            # IDT export writes object columns as side files; never touch the
+            # caller's working directory when inspecting an installer.
+            with tempfile.TemporaryDirectory(prefix="metro-msi-table-") as export:
+                p = self.run("msiinfo", "export", Path(msi).resolve(), name, cwd=export, check=False)
+        else:
+            p = self.run("msiinfo", "export", msi, name, check=False)
         if p.returncode != 0:
             return None
         lines = p.stdout.split("\r\n") if "\r\n" in p.stdout else p.stdout.split("\n")
@@ -390,6 +400,11 @@ class Tools:
 
     def tables(self, msi):
         return set(self.run("msiinfo", "tables", msi).stdout.split())
+
+    def stream(self, msi, name):
+        p = subprocess.run([str(self.root / "usr/bin/msiinfo"), "extract", str(msi), name],
+                           env=self.env, capture_output=True, timeout=600)
+        return p.stdout if p.returncode == 0 else None
 
     def suminfo(self, msi):
         out = self.run("msiinfo", "suminfo", msi).stdout
@@ -562,6 +577,7 @@ def product_wxs(identity, semver, pv, entries, files_root, marker_path, preview)
     props = "\n".join(f"    <Property Id={a(k)} Value={a(v)} />" for k, v in [
         ("MetroSemver", semver), ("MetroDataDir", data_dir), ("MetroPreview", "1" if preview else "0"),
         ("LRSTATE", "0"), ("SCSTATE", "0"), ("ARPNOMODIFY", "1"), ("ARPCOMMENTS", comments),
+        ("ARPPRODUCTICON", APP_ICON_ID),
         ("ARPURLINFOABOUT", "https://github.com/wnzn/metro"), ("ARPHELPLINK", "https://github.com/wnzn/metro"),
     ])
     uc = idn["upgrade_code"]
@@ -573,6 +589,8 @@ def product_wxs(identity, semver, pv, entries, files_root, marker_path, preview)
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perUser" Description={a(pname)}
              Comments={a(comments)} Manufacturer={a(idn['manufacturer'])} />
     <Media Id="1" Cabinet="metro.cab" EmbedCab="yes" />
+    <Icon Id={a(APP_ICON_ID)} SourceFile={a(APP_ICON)} />
+    <Binary Id={a(SETUP_MARK)} SourceFile={a(APP_ICON)} />
     <Upgrade Id={a(uc)}>
       <UpgradeVersion Property="OLDERFOUND" Minimum="0.0.0" IncludeMinimum="yes" Maximum={a(pv)} IncludeMaximum="no" />
       <UpgradeVersion Property="SAMEVERSIONFOUND" Minimum={a(pv)} IncludeMinimum="yes" Maximum={a(pv)} IncludeMaximum="yes" />
@@ -601,7 +619,7 @@ def product_wxs(identity, semver, pv, entries, files_root, marker_path, preview)
           <Condition>SCBOX</Condition>
           <RegistryValue Root="HKCU" Key={a(reg + chr(92) + 'Components')} Name="C_SHORTCUT" Type="integer" Value="1" KeyPath="yes" />
           <Shortcut Id="S_START" Name={a(msi_name(idn['shortcut'] + '.lnk', 'shortcut', set()))} Target="[INSTALLDIR]Metro.exe"
-                    WorkingDirectory="INSTALLDIR" Description={a(idn['product_name'])} />
+                    WorkingDirectory="INSTALLDIR" Description={a(idn['product_name'])} Icon={a(APP_ICON_ID)} IconIndex="0" />
         </Component>
       </Directory>
     </Directory>
@@ -738,6 +756,9 @@ def build(tools, payload, semver, out, identity="release", preview=False, requir
     require(not out.exists(), f"{out} already exists")
     pv, kind = windows_version(semver)
     manifest, entries, digest = validate_payload(payload, semver, required)
+    sources = {"script_sha256": sha256_file(Path(__file__)), "ui_sha256": sha256_file(UI_WXS),
+               "icon_sha256": sha256_file(APP_ICON),
+               "ext_sha256": {p.name: sha256_file(p) for p in sorted((EXT_DIR / "ui").glob("*.wxs"))}}
     if epoch is None:
         epoch = int(os.environ.get("SOURCE_DATE_EPOCH", "315532800"))
     require(315532800 <= epoch < 4102444800, "SOURCE_DATE_EPOCH must be between 1980 and 2100")
@@ -760,7 +781,7 @@ def build(tools, payload, semver, out, identity="release", preview=False, requir
         raw = work / "raw.msi"
         tools.run("wixl", "-a", "x64", "--ext", "ui", "--extdir", EXT_DIR, "-o", raw, wxs, UI_WXS, cwd=work)
         post_process(tools, raw)
-        pc = package_code(identity, semver, digest, preview)
+        pc = package_code(identity, semver, digest, preview, sources)
         patch_summary(raw, pc, (epoch + 11644473600) * 10 ** 7)
         inspect(tools, raw, semver, payload=payload, preview=preview, identity=identity, entries=entries,
                 expect_package_code=pc)
@@ -778,8 +799,7 @@ def build(tools, payload, semver, out, identity="release", preview=False, requir
                     "has_metro_tui": "metro-tui.exe" in manifest["files"]},
         "source_date_epoch": epoch,
         "tools": {"wixl": tools.version, "tree_sha256": tools.tree_sha256, "debs": tools.debs},
-        "builder": {"script_sha256": sha256_file(Path(__file__)), "ui_sha256": sha256_file(UI_WXS),
-                    "ext_sha256": {p.name: sha256_file(p) for p in sorted((EXT_DIR / "ui").glob("*.wxs"))}},
+        "builder": sources,
     }
     if extra_receipt:
         info.update(extra_receipt)
@@ -804,8 +824,8 @@ def inspect(tools, msi, semver, payload=None, preview=False, identity="release",
     T = {name: tools.table(msi, name) or [] for name in (
         "Property", "Directory", "Component", "File", "Dialog", "Control", "ControlEvent", "ControlCondition",
         "CheckBox", "EventMapping", "InstallUISequence", "InstallExecuteSequence", "Upgrade", "LaunchCondition",
-        "CustomAction", "AppSearch", "RegLocator", "Registry", "RemoveFile", "Shortcut", "Binary", "Media")}
-    present = tools.tables(msi)
+        "CustomAction", "AppSearch", "RegLocator", "Registry", "RemoveFile", "Shortcut", "Binary", "Icon", "TextStyle",
+        "Media")}
     prop = {r["Property"]: r["Value"] for r in T["Property"]}
     si = tools.suminfo(msi)
     check(si.get("Template") == "x64;1033", f"template is {si.get('Template')}")
@@ -823,6 +843,7 @@ def inspect(tools, msi, semver, payload=None, preview=False, identity="release",
         check(p not in prop, f"Property table must not preset {p}")
     check(prop.get("WIXUI_INSTALLDIR") == "INSTALLDIR", "WIXUI_INSTALLDIR must name INSTALLDIR")
     check(prop.get("ErrorDialog") == "ErrorDlg" and prop.get("ARPNOMODIFY") == "1", "ErrorDialog/ARPNOMODIFY")
+    check(prop.get("ARPPRODUCTICON") == APP_ICON_ID, "Add or Remove Programs icon")
     secure = set(prop.get("SecureCustomProperties", "").split(";"))
     check(set(PUBLIC_PROPS) | {"OLDERFOUND", "NEWERFOUND", "SAMEVERSIONFOUND"} <= secure,
           "SecureCustomProperties incomplete")
@@ -835,6 +856,19 @@ def inspect(tools, msi, semver, payload=None, preview=False, identity="release",
     dialogs = {r["Dialog"]: r for r in T["Dialog"]}
     check(REQUIRED_DIALOGS <= set(dialogs), f"missing dialogs: {sorted(REQUIRED_DIALOGS - set(dialogs))}")
     ctl = {(r["Dialog_"], r["Control"]): r for r in T["Control"]}
+    styles = {r["TextStyle"]: r for r in T["TextStyle"]}
+    check(prop.get("DefaultUIFont") == "MetroNormal" and all(
+        styles.get(s, {}).get("FaceName") == "Segoe UI" and not styles[s]["Color"]
+        for s in ("MetroNormal", "MetroTitle", "MetroBigger", "MetroWarning", "MetroBrand")),
+        "setup text must use Segoe UI with the system foreground")
+    for dlg in ("WelcomeDlg", "ExitDialog"):
+        mark = ctl.get((dlg, "BrandIcon"), {})
+        wordmark = ctl.get((dlg, "BrandName"), {})
+        # MSI Icon attributes: fixed size (0x100000) and 32×32 (0x400000).
+        check(mark.get("Type") == "Icon" and mark.get("Text") == SETUP_MARK
+              and int(mark.get("Attributes") or 0) & 0x700000 == 0x500000, f"{dlg} 32px setup mark")
+        check(wordmark.get("Type") == "Text" and wordmark.get("Text") == r"{\MetroBrand}metro",
+              f"{dlg} lowercase native wordmark")
     ev = [(r["Dialog_"], r["Control_"], r["Event"], r["Argument"], r["Condition"]) for r in T["ControlEvent"]]
     for c, typ in (("DirectoryCombo", "DirectoryCombo"), ("DirectoryList", "DirectoryList"), ("PathEdit", "PathEdit")):
         r = ctl.get(("BrowseDlg", c), {})
@@ -894,7 +928,11 @@ def inspect(tools, msi, semver, payload=None, preview=False, identity="release",
               'Installed OR NOT SAMEVERSIONFOUND OR METRO_REPLACE_SAME_VERSION = "1"'):
         check(c in lc, f"missing launch condition {c}")
     check(all(r["Type"] == "51" for r in T["CustomAction"]), "custom actions may only set properties (type 51)")
-    check(not T["Binary"] and "Binary" not in present or not T["Binary"], "no embedded binaries/DLL actions")
+    check([r["Name"] for r in T["Binary"]] == [SETUP_MARK], "only the setup mark may be embedded in Binary")
+    check([r["Name"] for r in T["Icon"]] == [APP_ICON_ID], "expected exactly the Metro app icon")
+    icon_bytes = APP_ICON.read_bytes()
+    check(tools.stream(msi, f"Binary.{SETUP_MARK}") == icon_bytes, "setup mark differs from Metro's source ICO")
+    check(tools.stream(msi, f"Icon.{APP_ICON_ID}") == icon_bytes, "app icon differs from Metro's source ICO")
     rl = {r["Signature_"]: r for r in T["RegLocator"]}
     check(rl.get("S_LEGACYSCRIPTDIR", {}).get("Key") == idn["legacy_key"], "legacy script detection")
     comps = {r["Component"]: r for r in T["Component"]}
@@ -908,7 +946,8 @@ def inspect(tools, msi, semver, payload=None, preview=False, identity="release",
     check(all(r["Root"] == "1" for r in reg), "registry writes are HKCU only")
     sc = T["Shortcut"]
     check(len(sc) == 1 and sc[0]["Directory_"] == "ProgramMenuFolder" and sc[0]["Target"] == "[INSTALLDIR]Metro.exe"
-          and sc[0]["Name"].split("|")[-1] == idn["shortcut"] + ".lnk", "Start menu shortcut")
+          and sc[0]["Name"].split("|")[-1] == idn["shortcut"] + ".lnk"
+          and sc[0]["Icon_"] == APP_ICON_ID and sc[0]["IconIndex"] == "0", "Start menu shortcut/icon")
     # Files: exactly payload + marker, under the right directories.
     dirpath = {}
 

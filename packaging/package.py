@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shutil
 import stat
 import struct
@@ -38,6 +39,9 @@ LOCAL_RUNNER = "installer-marker"
 TUI_NAMES = {"linux": "metro-tui", "windows": "metro-tui.exe", "macos": "Contents/MacOS/metro-tui"}
 MACOS_MIN = "14.0"
 NSH_LICENSE_SHA = "ec75427ad955e3c740f22e7dc3f6db6fc5b2cc1d9135c2af91cece8dd47a2d38"
+INTER_FONT = Path("src/ui/fonts/InterVariable.ttf")
+INTER_FONT_SHA = "29160a80ff49ddcab2c97711247e08b1fab27a484a329ce8b813d820dc559031"
+INTER_OFL_SHA = "5b9321a4298cfeb6b34354164a1c3afc3db114569984c502b9b35d988fd58c57"
 WINDOWS_SYSTEM = set("""
 advapi32 bcrypt bcryptprimitives cfgmgr32 combase comctl32 coremessaging crypt32 d2d1 d3d11
 dcomp dwmapi dwrite dxgi gdi32 imm32 iphlpapi kernel32 ktmw32 mfplat mfreadwrite msvcrt ncrypt
@@ -262,7 +266,7 @@ def elf(path, max_glibc, ui=False):
 
 
 def nsh_assets(actual, source):
-    """Allow only exact copies of the SVG icons the production UI modules import."""
+    """Allow only the imported production icons and the pinned Inter font."""
     names = set()
     for module in ICON_MODULES:
         text = regular(source / "src/ui" / module).read_text(encoding="utf-8")
@@ -270,7 +274,7 @@ def nsh_assets(actual, source):
         require(bool(imports) and len(imports) == len(set(imports)),
                 f"production src/ui/{module} must import distinct SVG icons from src/ui/icons")
         names.update(imports)
-    expected = {Path("src/ui/icons") / name for name in names}
+    expected = {Path("src/ui/icons") / name for name in names} | {INTER_FONT}
     parents = {parent for p in expected for parent in p.parents}
     found = {}
 
@@ -285,9 +289,15 @@ def nsh_assets(actual, source):
                 bundled_bytes = regular(path).read_bytes()
                 # CI builds the NSH bundle on Linux; a Windows checkout can
                 # have CRLF in the same tracked SVG text.
-                matches = bundled_bytes == source_bytes or (
-                    os.name == "nt" and bundled_bytes == source_bytes.replace(b"\r\n", b"\n")
-                )
+                if relative == INTER_FONT:
+                    require(hashlib.sha256(source_bytes).hexdigest() == INTER_FONT_SHA
+                            and hashlib.sha256(bundled_bytes).hexdigest() == INTER_FONT_SHA,
+                            f"unexpected Inter font digest: {relative}")
+                    matches = bundled_bytes == source_bytes
+                else:
+                    matches = bundled_bytes == source_bytes or (
+                        os.name == "nt" and bundled_bytes == source_bytes.replace(b"\r\n", b"\n")
+                    )
                 require(not path.stat().st_mode & 0o111 and matches,
                         f"renderer asset must be an exact non-executable copy of its source: {relative}")
                 found[relative] = path
@@ -343,6 +353,18 @@ def brand_notice(source, resources):
 
 def app_icon(name):
     return regular(RENDERER_SOURCE / "assets" / name)
+
+
+def write_inter_notice(stage):
+    source = regular(RENDERER_SOURCE / "src/ui/fonts/OFL.txt")
+    contents = source.read_bytes()
+    if os.name == "nt":
+        contents = contents.replace(b"\r\n", b"\n")
+    require(hashlib.sha256(contents).hexdigest() == INTER_OFL_SHA, f"{source}: unexpected Inter license")
+    dest = stage / "licenses/INTER-OFL.txt"
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(contents)
+    dest.chmod(0o644)
 
 
 def linux_icon_assets():
@@ -425,6 +447,7 @@ def desktop(args, stage):
         copy(resource, stage / "ui/nsh" / relative)
     copy(license_path, stage / "licenses/NSH-LICENSE-APACHE.txt")
     copy(brand_notice(RENDERER_SOURCE, resources), stage / "licenses/BRAND-MARKS.txt")
+    write_inter_notice(stage)
     server_name = "metro-server.exe" if windows else "metro-server"
     deps[server_name] = pe(args.server) if windows else elf(args.server, (2, 39))
     copy(args.server, stage / server_name, True)
@@ -506,7 +529,7 @@ def macos(args, stage):
             and {p.name for p in directory(contents / "Resources").iterdir()} <= {"nsh", *([icon] if icon else [])},
             "unexpected files in the NSH app bundle")
     require(not any(p.is_symlink() for p in ui.rglob("*")), "the NSH app bundle must not contain links")
-    nsh_resources(contents / "Resources", RENDERER_SOURCE, version, MACOS_UI_ID)
+    resources = nsh_resources(contents / "Resources", RENDERER_SOURCE, version, MACOS_UI_ID)
     inner_exe = contents / "MacOS/Metro"
     codesign("--verify", "--strict", str(ui))
     # Digests of the signed inner app as NSH produced it (after its ad hoc
@@ -549,9 +572,8 @@ def macos(args, stage):
         "CFBundleSupportedPlatforms": ["MacOSX"], "LSMinimumSystemVersion": MACOS_MIN,
         "NSHighResolutionCapable": True, "NSPrincipalClass": "NSApplication",
     }
-    if icon:
-        copy(contents / "Resources" / icon, out_contents / "Resources" / icon)
-        outer_info["CFBundleIconFile"] = icon
+    icon_helper = runpy.run_path(str(Path(__file__).with_name("macos_icon.py")))
+    outer_info["CFBundleIconFile"] = icon_helper["write_outer_icon"](out_contents, app_icon("metro-256.png"))
     (out_contents / "Info.plist").write_bytes(plistlib.dumps(outer_info))
     (out_contents / "Info.plist").chmod(0o644)
     # Ad hoc signatures only (CI preview). Sign nested code first; never --deep,
@@ -563,8 +585,8 @@ def macos(args, stage):
     codesign("--verify", "--deep", "--strict", str(app))
     inner_unchanged("when the outer app was signed")
     copy(license_path, stage / "licenses/NSH-LICENSE-APACHE.txt")
-    copy(brand_notice(RENDERER_SOURCE, nsh_resources(contents / "Resources", RENDERER_SOURCE, version, MACOS_UI_ID)),
-         stage / "licenses/BRAND-MARKS.txt")
+    copy(brand_notice(RENDERER_SOURCE, resources), stage / "licenses/BRAND-MARKS.txt")
+    write_inter_notice(stage)
     write(stage / "START.txt",
           "Metro for macOS — CI PREVIEW, NOT YET VERIFIED.\n"
           "This build is ad hoc signed. It is not Developer ID signed or notarized,\n"

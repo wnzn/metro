@@ -5,10 +5,11 @@
 <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
   <Fragment>
     <UI Id="MetroCommon">
-      <TextStyle Id="MetroNormal" FaceName="Tahoma" Size="8" />
-      <TextStyle Id="MetroTitle" FaceName="Tahoma" Size="9" Bold="yes" />
-      <TextStyle Id="MetroBigger" FaceName="Tahoma" Size="12" />
-      <TextStyle Id="MetroWarning" FaceName="Tahoma" Size="8" Bold="yes" />
+      <TextStyle Id="MetroNormal" FaceName="Segoe UI" Size="9" />
+      <TextStyle Id="MetroTitle" FaceName="Segoe UI" Size="10" Bold="yes" />
+      <TextStyle Id="MetroBigger" FaceName="Segoe UI" Size="12" />
+      <TextStyle Id="MetroWarning" FaceName="Segoe UI" Size="9" Bold="yes" />
+      <TextStyle Id="MetroBrand" FaceName="Segoe UI" Size="20" Bold="yes" />
 
       <UIText Id="AbsentPath" />
       <UIText Id="bytes" Value="bytes" />
