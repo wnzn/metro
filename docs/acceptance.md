@@ -3,6 +3,34 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Partial: macOS installer previews on hosted Macs at b7f693b (2026-11-24, docs lane, GitHub)
+
+Pull request #3 (`fix/macos-installer-chmod`), run
+[45238024508](https://github.com/wnzn/metro/actions/runs/45238024508), at
+`b7f693b`. These are **ad hoc signed previews**: not notarized, not an
+official release.
+
+- **macOS installer, Intel**
+  ([job 137915858965](https://github.com/wnzn/metro/actions/runs/45238024508/job/137915858965))
+  **and Apple silicon**
+  ([job 137927761044](https://github.com/wnzn/metro/actions/runs/45238024508/job/137927761044),
+  attempt 2): each passed install to a path with spaces, a real launch and
+  clean shutdown, update and uninstall. On attempt 1 GitHub couldn't
+  allocate an ARM64 runner; the retry ran the same revision.
+- **Preview downloads verified:** the Apple silicon
+  [artifact](https://github.com/wnzn/metro/actions/runs/45238024508/artifacts/14851224042)
+  matched GitHub's digest, and its archive's SHA-256 is
+  `3ebef6c2a10486686cf0c071f47aaf5cdc2e7d617f6e4bd653fb976536532072`. An
+  earlier Intel artifact, from `f3bc1c8`
+  ([run 45233193747](https://github.com/wnzn/metro/actions/runs/45233193747/artifacts/14848567927)),
+  was verified the same way: SHA-256
+  `431281f493df577e6f2a88bc87c3d88486feef42e67e938b42e1f5edebad3419`.
+- **Windows** (job `137925913809`): the fixture MSI lifecycle passed,
+  through repair, upgrade, refusals, uninstall and a `D:` install. It
+  couldn't prove an install by a standard (non-admin) user, so this isn't
+  evidence of a final Windows download.
+- **Chrome and Rust** (job `137914856904`): passed.
+
 ## Partial: self-hosted CI runner stack, hosted preflight and offline image check (2026-11-23, runner CI)
 
 The repository's own CI runner, [ops/github-runner](../ops/github-runner/README.md).
