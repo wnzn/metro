@@ -332,7 +332,7 @@ async fn cli_version(dir: &Path, binary: &Path) -> Result<String> {
         },
     )
     .await
-    .map_err(|_| SafeError::new("couldn't run `claude --version`"))?;
+    .context(SafeError::new("couldn't run `claude --version`"))?;
     let text = String::from_utf8_lossy(&out.stdout).to_string();
     let Some(v) = parse_version(&text).filter(|_| out.status_ok) else {
         bail!(SafeError::new(
@@ -366,11 +366,12 @@ pub async fn models_at(dir: &Path, api_base: &str) -> Result<Vec<String>> {
 }
 
 async fn list_models(key: &Secret, api_base: &str, limit: Option<u32>) -> Result<Vec<String>> {
-    let client = crate::http::client(Duration::from_secs(30))?;
+    let models_url = url::Url::parse(&format!("{}/v1/models", api_base.trim_end_matches('/')))?;
+    let client = crate::http::client_for_url(Duration::from_secs(30), &models_url)?;
     let mut ids = Vec::new();
     let mut after: Option<String> = None;
     for _page in 0..20 {
-        let mut url = url::Url::parse(&format!("{}/v1/models", api_base.trim_end_matches('/')))?;
+        let mut url = models_url.clone();
         url.query_pairs_mut()
             .append_pair("limit", &limit.unwrap_or(1000).to_string());
         if let Some(a) = &after {
@@ -712,9 +713,9 @@ async fn run_capped(
         .kill_on_drop(true);
     #[cfg(unix)]
     cmd.process_group(0);
-    let mut child = cmd.spawn().map_err(|_| {
-        SafeError::new("couldn't start Claude Code on this device; check the installation")
-    })?;
+    let mut child = cmd.spawn().context(SafeError::new(
+        "couldn't start Claude Code on this device; check the installation",
+    ))?;
     let guard = GroupGuard(child.id());
     let mut stdin = child.stdin.take().context("no stdin")?;
     let stdout = child.stdout.take().context("no stdout")?;

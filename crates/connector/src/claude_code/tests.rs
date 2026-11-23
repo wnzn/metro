@@ -13,9 +13,10 @@ use serde_json::{Value, json};
 use super::*;
 
 const KEY: &str = "sk-ant-api03-TESTKEY_abcdefghijklmnopqrstuvwxyz0123456789";
+const WRONG_KEY: &str = "sk-ant-api03-WRONGKEY_abcdefghijklmnopqrstuvwxyz";
 
 struct Fixture {
-    _tmp: tempfile::TempDir,
+    tmp: tempfile::TempDir,
     dir: PathBuf,
     log: PathBuf,
     bin: PathBuf,
@@ -26,39 +27,17 @@ struct Fixture {
 /// `log/`, then runs `behaviour` (shell).
 fn fixture(behaviour: &str) -> Fixture {
     let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().to_path_buf();
+    let root = tmp.path();
     let dir = root.join("vendor");
     let log = root.join("log");
-    let bin_dir = root.join("bin");
     std::fs::create_dir_all(&log).unwrap();
-    std::fs::create_dir_all(&bin_dir).unwrap();
-    let bin = bin_dir.join("claude");
-    let script = format!(
-        r#"#!/bin/sh
-if [ "$1" = "--version" ]; then echo "2.1.300 (Claude Code)"; exit 0; fi
-L='{log}'
-: > "$L/args"
-prev=""
-for a in "$@"; do
-  printf '%s\n' "$a" >> "$L/args"
-  if [ "$prev" = "--system-prompt-file" ]; then cp "$a" "$L/system"; fi
-  prev="$a"
-done
-env > "$L/env"
-pwd > "$L/cwd"
-cat > "$L/stdin"
-{behaviour}
-"#,
-        log = log.display()
-    );
-    std::fs::write(&bin, script).unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    Fixture {
-        _tmp: tmp,
-        dir,
-        log,
-        bin,
-    }
+    std::fs::write(root.join("behaviour"), behaviour).unwrap();
+    std::fs::write(root.join("version"), "2.1.300 (Claude Code)\n").unwrap();
+    // Never write the executable at runtime. A concurrent fork can inherit
+    // the writable descriptor before it closes on exec, causing ETXTBSY
+    // even after the fixture creator has finished writing.
+    let bin = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/claude_code/fixtures/claude");
+    Fixture { tmp, dir, log, bin }
 }
 
 /// Write the key and config directly (what `setup` saves), skipping the
@@ -241,6 +220,12 @@ async fn argv_env_and_workdir_are_fixed_and_clean() {
 #[tokio::test]
 async fn no_tools_means_plain_text_and_no_schema() {
     let f = fixture(&prints(&success_text("plain answer")));
+    // A concurrent fork may retain a writable descriptor for fixture data.
+    // Keeping one open must not make the executable busy.
+    let _writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(f.tmp.path().join("behaviour"))
+        .unwrap();
     install(&f);
     let req = json!({"model":"claude-haiku-5-5","messages":[{"role":"user","content":[{"type":"text","text":"hello"}]}]});
     let resp = complete_with(&f.dir, req, &limits()).await.unwrap();
@@ -548,18 +533,50 @@ fn versions() {
 
 // --- Models API stub -------------------------------------------------------
 
-async fn models_stub() -> (String, tokio::task::JoinHandle<()>) {
+#[derive(Debug, PartialEq)]
+struct ModelRequest {
+    key: &'static str,
+    limit: u32,
+    after_id: Option<String>,
+}
+
+async fn models_stub() -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    tokio::sync::mpsc::UnboundedReceiver<ModelRequest>,
+) {
+    use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode, Uri};
     use axum::routing::get;
-    async fn list(h: HeaderMap, uri: Uri) -> (StatusCode, axum::Json<Value>) {
+    use tokio::sync::mpsc;
+
+    async fn list(
+        State(requests): State<mpsc::UnboundedSender<ModelRequest>>,
+        h: HeaderMap,
+        uri: Uri,
+    ) -> (StatusCode, axum::Json<Value>) {
         let q: HashMap<String, String> =
             url::form_urlencoded::parse(uri.query().unwrap_or("").as_bytes())
                 .into_owned()
                 .collect();
-        if h.get("x-api-key").and_then(|v| v.to_str().ok()) != Some(KEY)
-            || h.get("anthropic-version").is_none()
-            || h.get("authorization").is_some()
+        if h.get("anthropic-version").and_then(|v| v.to_str().ok()) != Some("2023-06-01")
+            || h.contains_key("authorization")
         {
+            return (StatusCode::BAD_REQUEST, axum::Json(json!({"type":"error"})));
+        }
+        let key = match h.get("x-api-key").and_then(|v| v.to_str().ok()) {
+            Some(KEY) => "valid",
+            Some(WRONG_KEY) => "wrong",
+            _ => "unexpected",
+        };
+        requests
+            .send(ModelRequest {
+                key,
+                limit: q.get("limit").and_then(|v| v.parse().ok()).unwrap_or(0),
+                after_id: q.get("after_id").cloned(),
+            })
+            .unwrap();
+        if key != "valid" {
             return (
                 StatusCode::UNAUTHORIZED,
                 axum::Json(json!({"type":"error"})),
@@ -576,78 +593,106 @@ async fn models_stub() -> (String, tokio::task::JoinHandle<()>) {
         };
         (StatusCode::OK, axum::Json(body))
     }
-    let app = axum::Router::new().route("/v1/models", get(list));
+    let (tx, rx) = mpsc::unbounded_channel();
+    let app = axum::Router::new()
+        .route("/v1/models", get(list))
+        .with_state(tx);
     let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = l.local_addr().unwrap();
     let h = tokio::spawn(async move {
         axum::serve(l, app).await.unwrap();
     });
-    (format!("http://{addr}"), h)
+    (format!("http://{addr}"), h, rx)
 }
 
 #[tokio::test]
 async fn setup_and_models_use_only_the_local_key() {
-    let (base, h) = models_stub().await;
+    let (base, h, mut requests) = models_stub().await;
     let f = fixture("exit 0");
     let v = setup(&f.dir, &f.bin, Secret::new(KEY), &base)
         .await
         .unwrap();
     assert_eq!(v, "2.1.300");
-    let mode = std::fs::metadata(f.dir.join(KEY_FILE))
-        .unwrap()
-        .permissions()
-        .mode();
-    assert_eq!(mode & 0o777, 0o600);
+    for (path, expected) in [
+        (f.dir.clone(), 0o700),
+        (f.dir.join("home"), 0o700),
+        (f.dir.join("config"), 0o700),
+        (f.dir.join(KEY_FILE), 0o600),
+        (f.dir.join(CONFIG_FILE), 0o600),
+    ] {
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, expected, "{path:?}");
+    }
+    assert!(is_configured(&f.dir));
+    assert!(f.log.join("version").exists());
     let models = models_at(&f.dir, &base).await.unwrap();
     assert_eq!(models, ["claude-opus-5-5", "claude-haiku-5-5"]);
 
     // A wrong key is refused at setup and nothing is saved.
     let g = fixture("exit 0");
-    let other = Secret::new("sk-ant-api03-WRONGKEY_abcdefghijklmnopqrstuvwxyz");
-    let err = setup(&g.dir, &g.bin, other, &base).await.unwrap_err();
-    assert!(err.to_string().contains("rejected"));
+    let err = setup(&g.dir, &g.bin, Secret::new(WRONG_KEY), &base)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "Anthropic rejected the API key", "{err:#}");
+    assert!(g.log.join("version").exists());
     assert!(!g.dir.join(KEY_FILE).exists());
+    assert!(!g.dir.join(CONFIG_FILE).exists());
 
     // A subscription token is refused before any network or process use.
+    let bad = fixture("exit 1");
     let err = setup(
-        &g.dir,
-        &g.bin,
+        &bad.dir,
+        &bad.bin,
         Secret::new("sk-ant-oat01-abcdefghijklmnopqrstuvwxyz"),
         &base,
     )
     .await
     .unwrap_err();
-    assert!(err.to_string().contains("subscription"));
+    assert!(err.to_string().contains("subscription"), "{err:#}");
+    assert!(!bad.log.join("version").exists());
+    assert!(!bad.dir.exists());
+
+    // Only local requests, in order: key validation, two pages, rejected key.
+    for (key, limit, after_id) in [
+        ("valid", 1, None),
+        ("valid", 1000, None),
+        ("valid", 1000, Some("claude-opus-5-5")),
+        ("wrong", 1, None),
+    ] {
+        assert_eq!(
+            requests.try_recv().unwrap(),
+            ModelRequest {
+                key,
+                limit,
+                after_id: after_id.map(str::to_owned),
+            }
+        );
+    }
+    assert_eq!(
+        requests.try_recv(),
+        Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+    );
 
     logout(&f.dir).await.unwrap();
-    assert!(!f.dir.join(KEY_FILE).exists() && !f.dir.join("home").exists());
+    for name in [KEY_FILE, CONFIG_FILE, "home", "config"] {
+        assert!(!f.dir.join(name).exists(), "{name} survived logout");
+    }
     h.abort();
 }
 
 #[tokio::test]
 async fn too_old_or_wrong_binary_is_refused() {
-    let tmp = tempfile::tempdir().unwrap();
-    let bin = tmp.path().join("claude");
-    std::fs::write(&bin, "#!/bin/sh\necho '2.0.1 (Claude Code)'\n").unwrap();
-    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let err = setup(
-        &tmp.path().join("v"),
-        &bin,
-        Secret::new(KEY),
-        "http://127.0.0.1:9",
-    )
-    .await
-    .unwrap_err();
+    let f = fixture("exit 1");
+    let version = f.tmp.path().join("version");
+    std::fs::write(&version, "2.0.1 (Claude Code)\n").unwrap();
+    let err = setup(&f.dir, &f.bin, Secret::new(KEY), "http://127.0.0.1:9")
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("too old"), "{err}");
-    std::fs::write(&bin, "#!/bin/sh\necho 'something else'\n").unwrap();
-    let err = setup(
-        &tmp.path().join("v"),
-        &bin,
-        Secret::new(KEY),
-        "http://127.0.0.1:9",
-    )
-    .await
-    .unwrap_err();
+    std::fs::write(&version, "something else\n").unwrap();
+    let err = setup(&f.dir, &f.bin, Secret::new(KEY), "http://127.0.0.1:9")
+        .await
+        .unwrap_err();
     assert!(err.to_string().contains("doesn't report"), "{err}");
 }
 

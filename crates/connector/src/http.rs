@@ -49,12 +49,30 @@ pub unsafe fn exempt_loopback_from_proxy() {
 /// Build a client that never follows redirects (a redirect could carry a
 /// bearer token or key to another origin) and gives up after `timeout`.
 pub fn client(timeout: Duration) -> Result<reqwest::Client> {
-    Ok(reqwest::Client::builder()
+    Ok(client_builder(timeout).build()?)
+}
+
+/// Build a client for a single URL's origin. For loopback, don't depend on
+/// the caller's NO_PROXY or on the connector CLI having initialized it.
+pub(crate) fn client_for_url(timeout: Duration, url: &url::Url) -> Result<reqwest::Client> {
+    let mut builder = client_builder(timeout);
+    if match url.host() {
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback(),
+        Some(url::Host::Domain(host)) => host.eq_ignore_ascii_case("localhost"),
+        None => false,
+    } {
+        builder = builder.no_proxy();
+    }
+    Ok(builder.build()?)
+}
+
+fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(10).min(timeout))
         .timeout(timeout)
         .user_agent(crate::USER_AGENT)
-        .build()?)
 }
 
 /// Read at most `cap` bytes of a response body. A longer body is an error,

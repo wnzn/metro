@@ -1,0 +1,24 @@
+#!/bin/sh
+# Inert test double. HOME is <fixture root>/vendor/home, even for --version.
+F="$HOME/../.."
+L="$F/log"
+if [ "$1" = "--version" ]; then
+  : > "$L/version"
+  test -z "${ANTHROPIC_API_KEY+x}${ANTHROPIC_AUTH_TOKEN+x}${ANTHROPIC_BASE_URL+x}" || exit 1
+  exec /bin/cat "$F/version"
+fi
+
+: > "$L/args"
+prev=""
+for a in "$@"; do
+  printf '%s\n' "$a" >> "$L/args"
+  if [ "$prev" = "--system-prompt-file" ]; then /bin/cp "$a" "$L/system"; fi
+  prev="$a"
+done
+/usr/bin/env > "$L/env"
+pwd > "$L/cwd"
+/bin/cat > "$L/stdin"
+
+# Fixture behavior can use ordinary utilities, but not the developer's PATH.
+PATH=/usr/bin:/bin
+. "$F/behaviour"
