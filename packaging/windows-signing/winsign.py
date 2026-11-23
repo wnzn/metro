@@ -62,12 +62,12 @@ EXECUTABLE_SUFFIXES = (".exe", ".dll", ".sys", ".com", ".scr", ".cpl", ".ocx", "
 SEMVER = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]{1,40})?")
 HEX64 = re.compile(r"[0-9a-f]{64}")
 # The only context in which official (signing) mode may run: a push, not a
-# deletion, to the protected literal master branch of this repository, whose
-# top-level workflow is ci.yml on master, building exactly the pushed commit.
+# deletion, to the protected literal main branch of this repository, whose
+# top-level workflow is ci.yml on main, building exactly the pushed commit.
 # Tags, pull requests and any other branch are never official.
 OFFICIAL_REPOSITORY = "wnzn/metro"
 OFFICIAL_REPOSITORY_ID = "1467654868"
-OFFICIAL_REF = "refs/heads/master"
+OFFICIAL_REF = "refs/heads/main"
 OFFICIAL_WORKFLOW_REF = f"{OFFICIAL_REPOSITORY}/.github/workflows/ci.yml@{OFFICIAL_REF}"
 SHA = re.compile(r"[0-9a-f]{40}")
 
@@ -739,7 +739,7 @@ def release_context(env, head, version, root=Path(__file__).resolve().parents[2]
     require(env.get("GITHUB_REF") == OFFICIAL_REF and env.get("GITHUB_REF_TYPE") == "branch",
             bad(f"ref is {env.get('GITHUB_REF')!r}"))
     require(env.get("GITHUB_REF_PROTECTED") == "true", bad("the branch is not protected"))
-    require(env.get("GITHUB_WORKFLOW_REF") == OFFICIAL_WORKFLOW_REF, bad("the top-level workflow is not ci.yml on master"))
+    require(env.get("GITHUB_WORKFLOW_REF") == OFFICIAL_WORKFLOW_REF, bad("the top-level workflow is not ci.yml on main"))
     sha = env.get("GITHUB_SHA", "")
     require(SHA.fullmatch(sha), bad("no commit SHA"))
     require(head == sha, bad("the checked-out commit is not the pushed commit"))
@@ -765,7 +765,7 @@ def check_release_context(args):
 
 
 def check_signing_environment(args):
-    """The GitHub environment itself must reject every deployment except the master branch."""
+    """The GitHub environment itself must reject every deployment except the main branch."""
     environment = json.loads(Path(args.environment).read_text(encoding="utf-8"))
     policies = json.loads(Path(args.policies).read_text(encoding="utf-8"))
     policy = environment.get("deployment_branch_policy") or {}
@@ -773,8 +773,8 @@ def check_signing_environment(args):
     require(environment.get("name") == "windows-release-signing"
             and policy.get("protected_branches") is False and policy.get("custom_branch_policies") is True
             and policies.get("total_count") == len(rules) == 1
-            and rules[0].get("name") == "master" and rules[0].get("type") == "branch",
-            "windows-release-signing needs one custom deployment rule: branch master, no tags")
+            and rules[0].get("name") == "main" and rules[0].get("type") == "branch",
+            "windows-release-signing needs one custom deployment rule: branch main, no tags")
 
 
 def load_summary(work):
@@ -1138,7 +1138,7 @@ def main(argv=None):
     m.add_argument("--msi", required=True)
     m.add_argument("--expect", required=True, choices=("unsigned", "signed"))
     m.set_defaults(func=msi_state)
-    c = sub.add_parser("release-context", help="fail unless this is the official master-branch release context")
+    c = sub.add_parser("release-context", help="fail unless this is the official main-branch release context")
     c.add_argument("--version", required=True)
     c.add_argument("--head", required=True, help="the checked-out commit (git rev-parse HEAD)")
     c.set_defaults(func=check_release_context)

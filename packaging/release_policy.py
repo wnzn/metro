@@ -2,9 +2,9 @@
 """Metro's public release policy: who may release, which version, and when.
 
 The only official trigger is a protected, non-deleted, non-force `push` to
-refs/heads/master of wnzn/metro, run by the top-level ci.yml at that branch,
-for exactly the pushed commit. Tags, pull requests (including ones targeting
-master), other branches and manual runs never release or publish.
+refs/heads/main of wnzn/metro, run by the top-level ci.yml at that branch,
+for exactly the pushed commit. Tags, pull requests, other branches and manual
+runs never release or publish.
 
 The version is the checked-in one: Cargo `[workspace.package] version` and
 apps/desktop/nsh.json `version` must be the same semantic version (a
@@ -13,24 +13,31 @@ latest). Its immutable marker is the tag v<version>, created by this workflow
 after CI, the platform smoke gates and Windows signing and verification.
 It is never moved.
 
-Eligibility for a master push (`decide`):
+Only a version bump releases. A main push whose checked-in version equals the
+version at push.before is CI only, and so is a push whose before commit is
+missing, all zeros or unreadable. Such pushes never look at tags or releases,
+so they never fail on them.
+
+Eligibility for a main push that changed the version (`decide`):
 
   tag v<version>     published release   state       outcome
   missing            none                new         release
-  at this commit     none                resume      release (a rerun after a failure)
+  at this commit     none                resume      release (a rerun of the bump run after a failure)
   at this commit     exact asset set     done        nothing to do (success)
-  at another commit  exists              unchanged   no release if unchanged from push.before
-  at another commit  exists              -           fail if this push changed to a used version
+  at another commit  exists              -           fail: this push changed to a used version
   at another commit  none                -           fail: conflicting unpublished tag
   missing            exists              -           fail: release without its tag
   at this commit     other asset set     -           fail: never overwritten
 
+Without a bump the state is `unchanged` (same version as push.before) or
+`no-previous-version` (before missing, all zeros or unreadable): CI only.
+
 Commands (GitHub API via GH_TOKEN; the token is never printed):
 
   version      print the checked-in version
-  provenance   fail unless this is the official master push (no network)
-  decide       provenance, version, eligibility; writes GITHUB_OUTPUT
-  authorize    recheck the eligible version before Windows signing (read only)
+  provenance   fail unless this is the official main push (no network)
+  decide       provenance, version bump, eligibility; writes GITHUB_OUTPUT
+  authorize    recheck the bump and eligibility before Windows signing (read only)
   tag          create refs/tags/v<version> at this commit (idempotent, never moved)
   verify-tag   verify the exact tag before signing (read only)
   publish      stage a draft with exactly the verified files, check every
@@ -55,7 +62,7 @@ import release_signatures  # noqa: E402  (the signer's exact final file set)
 
 REPOSITORY = "wnzn/metro"
 REPOSITORY_ID = "1467654868"
-BRANCH_REF = "refs/heads/master"
+BRANCH_REF = "refs/heads/main"
 CALLER = f"{REPOSITORY}/.github/workflows/ci.yml@{BRANCH_REF}"
 # Use the subset supported by the packaging, MSI, image and signature tools.
 SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*))?")
@@ -96,17 +103,25 @@ def read_version(root=ROOT):
 
 
 def previous_version(before, root=ROOT):
-    # A branch-creation push has no previous version. Inspect only checked-in
-    # manifests, never run anything from the previous revision.
-    require(SHA.fullmatch(before), "the push has no valid before SHA")
-    if before == "0" * 40:
+    """The checked-in version at the push's before commit, or None when there is none.
+
+    None (never an error) for a missing, all-zero (branch creation) or malformed
+    before SHA, a commit that is not in the checkout, and manifests that do not
+    parse. Such a push is never a version bump. Only the two checked-in manifest
+    blobs are read; nothing from the previous revision runs.
+    """
+    if not isinstance(before, str) or not SHA.fullmatch(before) or before == "0" * 40:
         return None
     versions = []
-    for path in ("Cargo.toml", "apps/desktop/nsh.json"):
-        result = subprocess.run(["git", "-C", str(root), "show", f"{before}:{path}"],
-                                capture_output=True, text=True, check=True)
-        versions.append(result.stdout)
-    return parse_versions(*versions)[0]
+    try:
+        for path in ("Cargo.toml", "apps/desktop/nsh.json"):
+            result = subprocess.run(["git", "-C", str(root), "cat-file", "blob", f"{before}:{path}"],
+                                    capture_output=True, text=True, check=True)
+            versions.append(result.stdout)
+        return parse_versions(*versions)[0]
+    except (PolicyError, OSError, ValueError, TypeError, AttributeError, subprocess.CalledProcessError,
+            tomllib.TOMLDecodeError):
+        return None
 
 
 def expected_assets(version):
@@ -248,7 +263,24 @@ class GitHub:
 
 # --- decisions ------------------------------------------------------------------
 
-def decide(api, version, sha, prior_version=lambda: None):
+def bump(version, prior):
+    """The no-release state for a push that did not change the version, or None for a bump."""
+    if prior is None:
+        return "no-previous-version"
+    if prior == version:
+        return "unchanged"
+    return None
+
+
+def decide(api, version, sha, prior):
+    """Eligibility of this push. `prior` is previous_version(push.before).
+
+    Without a version bump this returns before any GitHub call, so tags and
+    releases can never fail such a push.
+    """
+    quiet = bump(version, prior)
+    if quiet:
+        return quiet
     tag = api.tag_commit(version)
     public = api.public_release(version)
     if tag is None:
@@ -264,9 +296,8 @@ def decide(api, version, sha, prior_version=lambda: None):
     require(public is not None,
             f"tag v{version} points at {tag[:12]}, not this commit, and nothing is published for it: "
             "bump the version or have a maintainer review and remove that tag")
-    require(prior_version() == version,
-            f"release v{version} is already published at {tag[:12]}; this push changed to a used version")
-    return "unchanged"
+    raise PolicyError(f"release v{version} is already published at {tag[:12]}; "
+                      f"this push changed the version from {prior} to a used version")
 
 
 def create_tag(api, version, sha):
@@ -319,8 +350,9 @@ def publish(api, version, sha, folder, prerelease):
         require(public.get("prerelease") is prerelease, f"published v{version} has the wrong prerelease status")
         check_assets(public, local, f"published v{version}")
         return "already published"
-    # ci.yml serializes master runs. Replace only a proven, interrupted staging
-    # draft for this SHA, never a manual draft or a release that was published.
+    # ci.yml serializes release publication (its `publish` job). Replace only a
+    # proven, interrupted staging draft for this SHA, never a manual draft or a
+    # release that was published.
     old = api.releases(f"v{version}")
     require(len(old) <= 1, f"more than one release or staging draft for v{version}")
     if old:
@@ -376,19 +408,35 @@ def main():
         if args.command == "provenance":
             outputs({"version": version, "prerelease": str(prerelease).lower(), "sha": sha})
             return
+        if args.command != "decide":
+            require(args.version == version, f"--version {args.version} is not the checked-in version {version}")
+        prior = None
+        if args.command in ("decide", "authorize", "tag"):
+            # Only a version bump releases. Without one, stop before any GitHub call.
+            prior = previous_version(os.environ.get("EVENT_BEFORE", ""))
+            quiet = bump(version, prior)
+            # authorize and tag run only after decide chose a release, so a
+            # missing bump there is an inconsistency, never a quiet skip.
+            require(not quiet or args.command == "decide",
+                    f"this push did not change the version ({quiet}); refusing to {args.command}")
+            if quiet:
+                print(f"release_policy: {quiet} (before: {prior or 'none'}, now: {version}); CI only, no release",
+                      file=sys.stderr)
+                outputs({"release": "false", "state": quiet, "version": version,
+                         "prerelease": str(prerelease).lower()})
+                return
         api = GitHub(os.environ.get("GH_TOKEN", ""), api=os.environ.get("GITHUB_API_URL", "https://api.github.com"))
         if args.command == "decide":
-            state = decide(api, version, sha, lambda: previous_version(os.environ.get("EVENT_BEFORE", "")))
+            state = decide(api, version, sha, prior)
             outputs({"release": str(state in ("new", "resume")).lower(), "state": state, "version": version,
                      "prerelease": str(prerelease).lower()})
             return
-        require(args.version == version, f"--version {args.version} is not the checked-in version {version}")
         if args.command in ("authorize", "tag"):
-            proceed = decide(api, version, sha) in ("new", "resume")
+            proceed = decide(api, version, sha, prior) in ("new", "resume")
             if proceed and args.command == "tag":
                 create_tag(api, version, sha)
                 # Close the race with an out-of-band publisher during tagging.
-                proceed = decide(api, version, sha) == "resume"
+                proceed = decide(api, version, sha, prior) == "resume"
             outputs({"proceed": str(proceed).lower()})
         elif args.command == "verify-tag":
             require(api.tag_commit(version) == sha, f"tag v{version} does not point at {sha[:12]}")

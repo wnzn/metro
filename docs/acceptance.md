@@ -3,6 +3,142 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: releases from `main` on a version bump (2026-11-24, CI lane, local)
+
+Uncommitted changes on `fix/ci-cleanup`, on top of `106e5da`
+([deploy.md](deploy.md#releases-from-main-on-a-version-bump-in-the-source-never-run-with-real-credentials)).
+`main` is the only long-lived branch. Earlier entries that name `master`
+describe the source as it was then.
+
+- Every release guard, signer identity and provenance check now names
+  `refs/heads/main` and `ci.yml@refs/heads/main`: `release_policy.py`,
+  `winsign.py`, `release_signatures.py`, `ci.yml`, `release.yml`,
+  `release-publish.yml`, `windows-sign.yml`, `windows-distribution.yml`,
+  `sign-release-assets.yml` and `release-images.yml`. `ci.yml` no longer
+  runs on `master` pushes.
+- Only a version bump releases. `release_policy.py decide` compares the
+  checked-in version with the one at `github.event.before`. Without a
+  change, or without a readable previous version, it answers
+  `release=false` before any GitHub call. `authorize` and `tag` recheck the
+  bump and fail without one.
+- A version bump uses the earlier eligibility table. A re-run of the bump's
+  run resumes after a failure.
+- Release runs keep the `desktop` job on GitHub-hosted runners. The
+  self-hosted queue is used only when release-policy didn't choose a
+  release.
+- Every push to `main` has its own workflow-level concurrency group and is
+  never cancelled or replaced; pull requests keep `ci-pr-<n>` with cancel.
+  Only the `publish` job is serialized (`metro-official-release`, never
+  cancelled), so only a second release run can wait behind a first.
+- The Windows verifier self-test no longer decides by branch. It runs only
+  when the preview job sets `METRO_WINDOWS_SELF_TEST=preview` (from
+  `!inputs.release`), and refuses tags and jobs that can request an OIDC
+  token.
+- The `packaging` CI job also runs the `packaging/release-signatures` and
+  `packaging/windows-signing` suites.
+- No macOS builds for now, for Apple silicon or Intel, in previews or
+  releases: GitHub's macOS runners queued for 15+ minutes and jobs were
+  cancelled. `desktop-macos`, meta's macOS matrix and `macos-sign` are
+  removed, along with the five Apple secrets passed to `release-publish.yml`.
+  `release-publish.yml`'s `assets` job now checks the tag step's `proceed`
+  itself; before, `macos-sign` did. The official set is Windows and Linux
+  only (no macOS archive, no `install-metro-macos.sh`). The macOS packaging
+  code and its unit tests stay. The install-step tests skip while
+  `desktop-macos` is absent, and the release-assets macOS gate is still
+  tested with the targets patched back in.
+
+With version 0.2.0 checked in and nothing published, merging this releases
+nothing until a later pull request changes the version.
+
+**Not yet shown:** any GitHub run. The `windows-release-signing`
+environment's deployment rule must name `main` before Windows signing can
+pass. The runner routing, the `publish` concurrency group and the release
+DAG without macOS were checked only by actionlint and the contract tests
+below. The self-test guard ran under Linux pwsh 7.7.0 only, not on Windows.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging -v # 190 tests, OK (15 skipped: no pwsh, MSI tools, macOS runtimes; 3 desktop-macos step tests)
+python3 -B -m unittest discover -s packaging/release-signatures  # 17 tests, OK (1 skipped: no METRO_TEST_COSIGN)
+python3 -B -m unittest discover -s packaging/windows-signing     # 39 tests, OK (6 skipped: no pwsh)
+python3 -B -m unittest discover -s ops/github-runner             # 33 tests, OK
+# Again with pwsh 7.7.0 on PATH, as on ubuntu-24.04:
+#   packaging 190 OK (10 skipped: MSI tools, macOS runtimes, desktop-macos step); windows-signing 39 OK (0 skipped)
+# shellcheck -s sh packaging/*.sh (koalaman/shellcheck:stable)  # clean
+```
+
+The policy tests run `release_policy.py` itself with synthetic GitHub
+environments and no network: no-bump pushes (same version, all-zero,
+unknown, malformed or missing `before`) answer `release=false`, and a bump
+in a throwaway repository reaches the GitHub client. `master` refs are
+refused everywhere.
+
+## Source only: faster pull request CI (2026-11-24, CI lane, local)
+
+Uncommitted changes on `fix/ci-cleanup`, on top of `1719366`, to `ci.yml`,
+`release.yml` and `packaging/package_smoke_policy.py`
+([deploy.md](deploy.md#ci-and-publishing)):
+
+- a new push to a pull request cancels its older run; pushes and the
+  official `master` group never cancel;
+- the packaging tests run in their own `packaging` job, which releases need;
+- a pull request into `main` skips the test builds unless it changes a
+  build input; pull requests build only the Apple-silicon Mac;
+- a Rust cache, written only by `main` pushes and skipped by release builds;
+- the `rust` job builds its debug binaries once and no longer builds a
+  release connector, and `desktop-linux` no longer runs a second release
+  compile for tests.
+
+**Not yet shown:** any GitHub run of these changes. GitHub's matrix from
+`fromJSON`, cancellation and cache scoping were checked only by the
+contract tests below, not on GitHub.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging -v # 182 tests, OK (12 skipped: no pwsh, MSI tools or macOS runtimes)
+python3 -B -m unittest discover -s ops/github-runner  # 33 tests, OK
+```
+
+The `Swatinem/rust-cache` pin `d1527c8` is the commit of tag `v2.9.3`
+(`git ls-remote`). The preview policy was also run by hand on this
+repository's history: the `tests/e2e`-only commit `1719366` skips as a pull
+request into `main` and builds as a pull request into `master` or a push; a
+`crates` commit and an invalid SHA build.
+
+## Partial: macOS installer previews on hosted Macs at b7f693b (2026-11-24, docs lane, GitHub)
+
+Pull request #3 (`fix/macos-installer-chmod`), run
+[45238024508](https://github.com/wnzn/metro/actions/runs/45238024508), at
+`b7f693b`. These are **ad hoc signed previews**: not notarized, not an
+official release.
+
+- **macOS installer, Intel**
+  ([job 137915858965](https://github.com/wnzn/metro/actions/runs/45238024508/job/137915858965))
+  **and Apple silicon**
+  ([job 137927761044](https://github.com/wnzn/metro/actions/runs/45238024508/job/137927761044),
+  attempt 2): each passed install to a path with spaces, a real launch and
+  clean shutdown, update and uninstall. On attempt 1 GitHub couldn't
+  allocate an ARM64 runner; the retry ran the same revision.
+- **Preview downloads verified:** the Apple silicon
+  [artifact](https://github.com/wnzn/metro/actions/runs/45238024508/artifacts/14851224042)
+  matched GitHub's digest, and its archive's SHA-256 is
+  `3ebef6c2a10486686cf0c071f47aaf5cdc2e7d617f6e4bd653fb976536532072`. An
+  earlier Intel artifact, from `f3bc1c8`
+  ([run 45233193747](https://github.com/wnzn/metro/actions/runs/45233193747/artifacts/14848567927)),
+  was verified the same way: SHA-256
+  `431281f493df577e6f2a88bc87c3d88486feef42e67e938b42e1f5edebad3419`.
+- **Windows** (job `137925913809`): the fixture MSI lifecycle passed,
+  through repair, upgrade, refusals, uninstall and a `D:` install. It
+  couldn't prove an install by a standard (non-admin) user, so this isn't
+  evidence of a final Windows download.
+- **Chrome and Rust** (job `137914856904`): passed.
+
 ## Partial: self-hosted CI runner stack, hosted preflight and offline image check (2026-11-23, runner CI)
 
 The repository's own CI runner, [ops/github-runner](../ops/github-runner/README.md).

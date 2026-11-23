@@ -13,6 +13,7 @@ import sys
 import tarfile
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 import package
@@ -116,13 +117,17 @@ def collected(folder, mode="release", windows_signed=True, mac=None, msi_signed=
         source = (HERE / script).read_bytes()  # preview: unchanged source; tag: source + one signature block
         (folder / script).write_bytes(source + (PS1_SIG if ps1_signed and mode == "release" else b""))
     if mode == "release":
-        for target in ("macos-arm64", "macos-x64"):
-            write_archive(folder, f"Metro-{V}-{target}",
-                          {"Metro.app/Contents/MacOS/Metro": b"\xcf\xfa\xed\xfe",
-                           "Metro.app/Contents/MacOS/metro-tui": b"\xcf\xfa\xed\xfe tui",
-                           "Metro.app/Contents/CodeResources": b"ticket"},
-                          "desktop", target, mac or mac_fields())
+        for target in ra.MACOS:  # none while macOS builds are off; tests patch ra.MACOS
+            write_mac(folder, target, mac or mac_fields())
     return folder
+
+
+def write_mac(folder, target, fields):
+    write_archive(folder, f"Metro-{V}-{target}",
+                  {"Metro.app/Contents/MacOS/Metro": b"\xcf\xfa\xed\xfe",
+                   "Metro.app/Contents/MacOS/metro-tui": b"\xcf\xfa\xed\xfe tui",
+                   "Metro.app/Contents/CodeResources": b"ticket"},
+                  "desktop", target, fields)
 
 
 def image_evidence(folder, version=V, revision=REV):
@@ -165,9 +170,10 @@ class AssembleTests(unittest.TestCase):
     def test_release_holds_exactly_the_published_set(self):
         self.assemble()
         names = sorted(p.name for p in self.out.iterdir())
-        archives = [f"Metro-{V}-linux-x64.tar.gz", f"Metro-{V}-macos-arm64.tar.gz", f"Metro-{V}-macos-x64.tar.gz",
+        self.assertEqual(ra.MACOS, ())  # macOS builds are off for now: Windows and Linux only
+        archives = [f"Metro-{V}-linux-x64.tar.gz",
                     f"Metro-{V}-windows-x64.msi", f"Metro-{V}-windows-x64.zip", f"Metro-runner-{V}-linux-x64.tar.gz"]
-        scripts = ["install-metro-linux.sh", "install-metro-macos.sh", "install-metro-runner-linux.sh",
+        scripts = ["install-metro-linux.sh", "install-metro-runner-linux.sh",
                    "install-metro-windows.ps1", "metro-runner-container.ps1", "metro-runner-container.sh"]
         self.assertEqual(names, sorted(archives + [a + ".sha256" for a in archives] + scripts + ["SHA256SUMS"]))
         sums = (self.out / "SHA256SUMS").read_text().splitlines()
@@ -182,8 +188,8 @@ class AssembleTests(unittest.TestCase):
             self.assertNotEqual(signed, source)
             info = winsign.script_unsigned_info(source, script)
             self.assertEqual(winsign.script_split(signed, info, script)[0], source)
-        for script in ("install-metro-linux.sh", "install-metro-macos.sh"):
-            self.assertEqual((self.out / script).read_bytes(), (HERE / script).read_bytes())
+        self.assertEqual((self.out / "install-metro-linux.sh").read_bytes(),
+                         (HERE / "install-metro-linux.sh").read_bytes())
 
     def test_smoke_has_no_macos_and_allows_unsigned_previews(self):
         self.assemble("smoke", windows_signed=False, msi_signed=False, ps1_signed=False, tui=False)
@@ -230,11 +236,7 @@ class AssembleTests(unittest.TestCase):
             ra.assemble(V, "release", src, self.out)
 
     def test_release_refuses_what_must_never_ship(self):
-        cases = {
-            "ad hoc macOS": dict(mac=mac_fields(signing="adhoc", status="preview-not-verified")),
-            "not stapled": dict(mac=mac_fields(notarization={**mac_fields()["notarization"], "stapled": False})),
-            "ticket missing": dict(mac=mac_fields(notarization={**mac_fields()["notarization"],
-                                                                "ticket_files": ["Metro.app/Contents/Nope"]})),
+        cases = {  # the macOS cases are in test_macos_release_checks_still_hold_when_macs_return
             "unsigned Windows seed": dict(windows_signed=False),
             "unsigned MSI": dict(msi_signed=False),
             "unsigned ps1": dict(ps1_signed=False),
@@ -251,8 +253,8 @@ class AssembleTests(unittest.TestCase):
 
     def test_missing_and_extra_inputs_are_refused(self):
         src = collected(self.root / "collected")
-        (src / f"Metro-{V}-macos-x64.tar.gz").unlink()
-        with self.assertRaisesRegex(ra.AssetError, "missing release files: Metro-0.3.0-macos-x64.tar.gz"):
+        (src / f"Metro-{V}-linux-x64.tar.gz").unlink()
+        with self.assertRaisesRegex(ra.AssetError, "missing release files: Metro-0.3.0-linux-x64.tar.gz"):
             ra.assemble(V, "release", src, self.out)
         shutil.rmtree(src)
         src = collected(self.root / "collected")
@@ -262,7 +264,37 @@ class AssembleTests(unittest.TestCase):
         shutil.rmtree(src)
         src = collected(self.root / "collected", "smoke")
         with self.assertRaisesRegex(ra.AssetError, "missing release files"):
-            ra.assemble(V, "release", src, self.out)  # a tag never ships without macOS
+            ra.assemble(V, "release", src, self.out)  # a preview set is never a release
+        shutil.rmtree(src)
+        # macOS builds are off: even a notarized-looking Mac archive is never part of a release.
+        for target in ("macos-arm64", "macos-x64"):
+            src = collected(self.root / "collected")
+            write_mac(src, target, mac_fields())
+            with self.subTest(target), self.assertRaisesRegex(ra.AssetError, f"unexpected files.*{target}"):
+                ra.assemble(V, "release", src, self.out)
+            shutil.rmtree(src)
+
+    def test_macos_release_checks_still_hold_when_macs_return(self):
+        """The macOS gate is kept for later; exercise it with the targets it would have."""
+        with patch.object(ra, "MACOS", ("macos-arm64", "macos-x64")):
+            self.assemble()
+            names = {p.name for p in self.out.iterdir()}
+            self.assertTrue({f"Metro-{V}-macos-arm64.tar.gz", f"Metro-{V}-macos-x64.tar.gz",
+                             "install-metro-macos.sh"} <= names)
+            src = collected(self.root / "smoke-collected", "smoke")
+            with self.assertRaisesRegex(ra.AssetError, "missing release files"):
+                ra.assemble(V, "release", src, self.root / "out2")  # a tag never ships without macOS
+            for label, mac in {
+                "ad hoc macOS": mac_fields(signing="adhoc", status="preview-not-verified"),
+                "not stapled": mac_fields(notarization={**mac_fields()["notarization"], "stapled": False}),
+                "ticket missing": mac_fields(notarization={**mac_fields()["notarization"],
+                                                           "ticket_files": ["Metro.app/Contents/Nope"]}),
+            }.items():
+                with self.subTest(label):
+                    out = self.root / f"out-{label}"
+                    with self.assertRaises(ra.AssetError):
+                        ra.assemble(V, "release", collected(self.root / f"c-{label}", mac=mac), out)
+                    self.assertFalse(out.exists())
 
     def test_tampering_is_refused(self):
         src = collected(self.root / "collected")

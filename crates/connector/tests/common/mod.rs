@@ -25,6 +25,7 @@ use jsonwebtoken::{Algorithm, EncodingKey, Header};
 use metro_connector::openai_oauth::{Endpoints, LoginOptions};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tempfile::{Builder, TempDir};
 use tokio::sync::Semaphore;
 
 pub const RESOURCE: &str = "https://api.openai.com/v1";
@@ -526,8 +527,11 @@ pub async fn fixture_with_discovery_gate(
         .route("/v1/responses", post(responses))
         .with_state(s.clone());
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let dir = TempDir::new();
-    let profile = dir.0.join("conn");
+    let dir = Builder::new()
+        .prefix("metro-oauth-test-")
+        .tempdir()
+        .unwrap();
+    let profile = dir.path().join("conn");
     Fixture {
         s,
         ep: Endpoints {
@@ -579,14 +583,17 @@ pub async fn browse(s: S, start: String) {
     let u = url::Url::parse(&loc).unwrap();
     let q: HashMap<String, String> = u.query_pairs().into_owned().collect();
     let redirect = q["redirect_uri"].clone();
-    let (browser, issuer) = {
+    let (browser, issuer, code) = {
         let mut fx = s.lock().unwrap();
         fx.authorize.push(q.clone());
-        (fx.browser.clone(), fx.issuer.clone())
+        (
+            fx.browser.clone(),
+            fx.issuer.clone(),
+            format!("code-{}", fx.authorize.len()),
+        )
     };
     assert!(loc.starts_with(&format!("{issuer}/api/accounts/authorize?")));
     let new_reg = q["client_id"] == "dynamic_agent_client";
-    let code = format!("code-{}", rand_hex());
     let mut cb = url::Url::parse(&redirect).unwrap();
     let (sub, scope, bad_nonce) = match &browser {
         Browser::Approve { sub, scope } => (*sub, *scope, false),
@@ -649,14 +656,6 @@ pub fn safe(e: &anyhow::Error) -> String {
         .unwrap_or_default()
 }
 
-pub fn rand_hex() -> String {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{n:x}")
-}
-
 pub fn opts(f: &Fixture) -> LoginOptions {
     let s = f.s.clone();
     LoginOptions {
@@ -669,24 +668,6 @@ pub fn opts(f: &Fixture) -> LoginOptions {
         }),
         preferred_port: 0,
         timeout: Duration::from_secs(20),
-    }
-}
-
-pub struct TempDir(pub PathBuf);
-impl TempDir {
-    fn new() -> Self {
-        let p = std::env::temp_dir().join(format!(
-            "metro-oauth-test-{}-{}",
-            std::process::id(),
-            rand_hex()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        Self(p)
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
     }
 }
 

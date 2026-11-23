@@ -146,19 +146,66 @@ sys.exit({status!r})
             self.assertEqual(self.route("push", PUSH | {flag: True})[0], HOSTED)
         self.assertEqual(self.route("workflow_dispatch", {})[0], HOSTED)
 
+    def test_release_runs_keep_the_desktop_job_on_github_hosted_runners(self):
+        """Evaluate the real runs-on and if expressions over every release-policy outcome."""
+        def evaluate(expression, ctx):
+            # Exactly the two shapes used by the desktop job; anything else fails this test.
+            body = expression.removeprefix("${{ ").removesuffix(" }}")
+            runner = ("needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' "
+                      "&& needs.release-policy.outputs.release != 'true' && 'metro-ci-linux-x64' || 'ubuntu-24.04'")
+            gate = ("!cancelled() && needs.workflows.result == 'success' "
+                    "&& needs.release-policy.result != 'failure'")
+            if body == runner:
+                local = ctx["selected"] == LOCAL and ctx["release"] != "true"
+                return LOCAL if local else HOSTED
+            self.assertEqual(body, gate)
+            return not ctx["cancelled"] and ctx["workflows"] == "success" and ctx["policy"] != "failure"
+
+        cases = (
+            # (release-policy result, release output, selector choice) -> (desktop runs, runner)
+            ("skipped", "", LOCAL, True, LOCAL),          # pull request
+            ("success", "false", LOCAL, True, LOCAL),     # main push without a version bump
+            ("success", "true", LOCAL, True, HOSTED),     # release run: always GitHub-hosted
+            ("success", "true", HOSTED, True, HOSTED),
+            ("skipped", "", HOSTED, True, HOSTED),        # fork or untrusted PR
+            ("failure", "", LOCAL, False, None),          # no release, and nothing to route
+        )
+        for policy, release, selected, runs, runner in cases:
+            ctx = {"policy": policy, "release": release, "selected": selected, "workflows": "success",
+                   "cancelled": False}
+            with self.subTest(ctx=ctx):
+                self.assertIs(evaluate(self.desktop["if"], ctx), runs)
+                if runs:
+                    self.assertEqual(evaluate(self.desktop["runs-on"], ctx), runner)
+        for workflows in ("failure", "skipped"):
+            self.assertFalse(evaluate(self.desktop["if"], {"policy": "skipped", "workflows": workflows,
+                                                           "cancelled": False}))
+        self.assertFalse(evaluate(self.desktop["if"], {"policy": "success", "workflows": "success", "cancelled": True}))
+
     def test_single_read_only_desktop_job_and_one_toolchain_per_runner(self):
         self.assertEqual(self.ci["permissions"], {"contents": "read"})
         self.assertNotIn("permissions", self.desktop)
         self.assertNotIn("secrets", self.desktop)
-        self.assertEqual(self.desktop["needs"], "workflows")
+        self.assertEqual(self.desktop["needs"], ["workflows", "release-policy"])
         self.assertIs(self.selector, self.workflow_gate["steps"][0])
         self.assertEqual(self.selector["env"], {"GH_TOKEN": "${{ github.token }}"})
         self.assertEqual(self.workflow_gate["outputs"]["desktop_runner"], "${{ steps.desktop-route.outputs.desktop_runner }}")
         self.assertEqual(self.desktop["runs-on"],
                          "${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' "
+                         "&& needs.release-policy.outputs.release != 'true' "
                          "&& 'metro-ci-linux-x64' || 'ubuntu-24.04' }}")
-        for job in ("rust", "containers", "workflows", "release-policy"):
+        self.assertEqual(self.desktop["if"], "${{ !cancelled() && needs.workflows.result == 'success' "
+                                             "&& needs.release-policy.result != 'failure' }}")
+        self.assertIn("desktop", self.ci["jobs"]["release"]["needs"])
+        for job in ("rust", "containers", "workflows", "packaging", "release-policy"):
             self.assertEqual(self.ci["jobs"][job]["runs-on"], HOSTED)
+        # The slow packaging tests run in their own job, so they do not hold up the desktop job.
+        packaging = self.ci["jobs"]["packaging"]
+        self.assertNotIn("needs", packaging)
+        self.assertEqual(packaging["steps"][0]["with"], {"persist-credentials": False})
+        for suite in ("packaging", "packaging/release-signatures", "packaging/windows-signing"):
+            self.assertIn(f"python3 -B -m unittest discover -s {suite} -v\n", packaging["steps"][1]["run"])
+        self.assertNotIn("unittest discover", yaml.safe_dump(self.workflow_gate))
         steps = self.desktop["steps"]
         verify, checkout, install, *commands = steps
         self.assertEqual(verify["if"], "runner.environment == 'self-hosted'")

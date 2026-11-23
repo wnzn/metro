@@ -1128,7 +1128,7 @@ async fn first_rig_chat_through_relay_wire_and_streaming_oauth() {
         base_url: None,
         request_timeout_secs: 5,
     };
-    let profile = Profile::open(&f._dir.0, "unsigned").unwrap();
+    let profile = Profile::open(f._dir.path(), "unsigned").unwrap();
     let provider = Provider {
         config: &config,
         profile: &profile,

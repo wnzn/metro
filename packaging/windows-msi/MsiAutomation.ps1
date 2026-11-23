@@ -77,7 +77,7 @@ function Invoke-MsiAutomation {
     $flags = if ($kind -eq 'Method') { [Reflection.BindingFlags]::InvokeMethod } else { [Reflection.BindingFlags]::GetProperty }
     $name = $Member.Split('.')[1]
     try {
-        return $target.GetType().InvokeMember($name, $flags, $null, $target, $typed, [Globalization.CultureInfo]::InvariantCulture)
+        $result = $target.GetType().InvokeMember($name, $flags, $null, $target, $typed, [Globalization.CultureInfo]::InvariantCulture)
     } catch [Management.Automation.MethodInvocationException] {
         # Re-thrown with the operation and types only (argument values such as paths or SQL are not logged).
         $e = $_.Exception.InnerException
@@ -86,4 +86,11 @@ function Invoke-MsiAutomation {
         throw ("MsiAutomation: {0} failed ({1}, BindingFlags {2}, target {3}, argument types [{4}]): HRESULT 0x{5:X8} {6}" -f
             $Member, $kind, $flags, $target.GetType().FullName, $types, $e.HResult, $e.Message.Trim())
     }
+    # Return the automation object itself. A plain `return` would enumerate any
+    # enumerable result into the pipeline: Installer.RelatedProducts' StringList
+    # with no items became $null (the next call failed binding -Object) and with
+    # one item became a bare string. The unary comma emits exactly one object: the
+    # StringList (or Database, View, Record, String, Int32), or $null for Fetch past
+    # the last row and for methods without a return value.
+    return , $result
 }

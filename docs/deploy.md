@@ -8,12 +8,12 @@ source is for contributors: [development.md](development.md).
 > **Not published yet.** The repository is
 > <https://github.com/wnzn/metro>. Releases will appear on its
 > [Releases page](https://github.com/wnzn/metro/releases), published
-> automatically from the protected `master` branch
-> ([CI and publishing](#ci-and-publishing)). No public release, file or image
+> automatically when a version bump is merged into the protected `main`
+> branch ([CI and publishing](#ci-and-publishing)). No public release, file or image
 > exists yet. The 0.2.0 names below were built and verified locally
 > ([acceptance](acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)).
 > Each release file comes with a `.sha256` file beside it. The full release
-> file list, including the MSI and macOS builds, is in
+> file list, including the MSI, is in
 > [install.md](install.md#official-releases).
 
 | Part | Where | Release-target name |
@@ -182,77 +182,122 @@ fresh volume.
 
 ## CI and publishing
 
-`.github/workflows/ci.yml` runs on pull requests and on pushes to `main` and
-`master`. It runs:
+`.github/workflows/ci.yml` runs on pull requests and on pushes to `main`.
+`main` is the only long-lived branch; everything else is a feature branch.
+It runs:
 
 - the Rust format, lint and test suites and the end-to-end scripts;
 - the terminal client's pseudo-terminal test;
 - the desktop checks and release build;
 - both container targets;
 - the packaging and workflow tests;
-- unsigned test builds for Linux, Windows and both Macs
+- unsigned test builds for Linux and Windows
   ([install.md](install.md#test-builds-from-github-actions)).
+
+There are no macOS builds for now, in test builds or releases. GitHub's
+macOS runners queued for 15 minutes or more and the jobs were cancelled, so
+the Mac jobs are switched off. The macOS packaging code stays in the source;
+the jobs can be restored from git history (see the comment at the top of
+`release.yml`).
+
+Some of this is cut down for pull requests, to keep them fast:
+
+- A pull request into `main` gets test builds only when it changes
+  something a build reads: the workflows, `apps/desktop`, `crates`,
+  `packaging`, `services`, the Cargo files, the Dockerfile and a few other
+  build files. A change only to docs, `tests`, `examples`, `ops` or the
+  Compose files skips them. If CI can't read the change, it builds.
+- Pull requests into any other branch always get test builds.
+- A new push to a pull request cancels that pull request's older run.
+  Pushes are never cancelled.
+
+Pushes to `main` build everything.
+
+The Rust jobs keep a build cache. Only pushes to `main` write it. Pull
+requests and other pushes only read it. Release builds never use it, so
+they always compile from scratch.
 
 A tag push starts nothing, and there's no manual trigger. What has been
 verified so far is in [acceptance.md](acceptance.md).
 
-### Releases from `master` (in the source; never run with real credentials)
+### Releases from `main` on a version bump (in the source; never run with real credentials)
 
 `packaging/release_policy.py` decides. A release runs only for a
-**protected, non-deleted, non-forced push to `refs/heads/master`** of
-`wnzn/metro` (repository id 1467654868). `ci.yml` itself must be the
-top-level workflow at that branch, and `github.sha` must equal the pushed
-commit. Every job that signs, creates the tag, pushes images or publishes
-checks this again before it touches a credential. Pull requests (also into
-`master`), `main`, tags and manual runs never do any of that.
+**protected, non-deleted, non-forced push to `refs/heads/main`** of
+`wnzn/metro` (repository id 1467654868) **that changes the version**.
+`ci.yml` itself must be the top-level workflow at that branch, and
+`github.sha` must equal the pushed commit. Every job that signs, creates the
+tag, pushes images or publishes checks this again before it touches a
+credential. Pull requests, other branches, tags and manual runs never do any
+of that.
 
 The version is the one checked in. The Cargo workspace version and
-`apps/desktop/nsh.json` must match. For each eligible push:
+`apps/desktop/nsh.json` must match. A push releases only when that version
+differs from the version at the push's previous commit
+(`github.event.before`). Every other push to `main` runs CI and test builds
+only. That includes a push whose previous commit is missing or can't be
+read. Such a push never looks at tags or releases, so it never fails on
+them.
+
+To release:
+
+1. In a pull request, set the new version in both the Cargo workspace
+   (`Cargo.toml`, `[workspace.package] version`) and `apps/desktop/nsh.json`.
+2. Merge it into `main`. That push to `main` builds, signs and publishes the
+   release.
+3. If the release fails, fix the cause (for example a missing signing
+   setting) and **re-run that same workflow run** in GitHub Actions. It
+   resumes from the tag it already created. If the fix needs a code change,
+   merge it and bump to a new version: a push without a bump never
+   releases.
+
+For a push that changes the version:
 
 | `v<version>` tag | Published release | Result |
 | --- | --- | --- |
 | missing | none | **release** (new version) |
-| on this commit | none | **release** (resume after a failed run) |
+| on this commit | none | **release** (a re-run resumes after a failure) |
 | on this commit | exactly the expected files | nothing to do |
-| on another commit | exists | no release (this version is already out; the push only runs CI) |
-| on another commit | exists, and this push changed to that version | fail |
+| on another commit | exists | fail (changed to a version that is already out) |
 | on another commit | none | fail (conflicting unpublished tag) |
 | missing | exists | fail |
 | on this commit | other files | fail (never overwritten) |
 
-Official runs are serialized. The order, in `release.yml` and then
+Every push to `main` gets its own CI run, and pushes never cancel or replace
+each other. Only the publication step (`publish`) of a release run is
+serialized, and a running release is never interrupted. So only a second
+release run can wait, and only behind a first one that is still publishing.
+GitHub keeps one waiting job in that queue: if a third release run reaches
+it while the second still waits, the second's `publish` is cancelled.
+Re-run that run; it still releases. The order, in `release.yml` and then
 `release-publish.yml`:
 
 1. Build and test every platform.
-2. Recheck eligibility.
+2. Recheck the version bump and eligibility.
 3. Windows signing and verification.
 4. Create the immutable `v<version>` tag on exactly that commit, with the
    workflow's own token.
-5. macOS Developer ID signing and notarization.
-6. The exact release set.
-7. GHCR images, pushed, read back and signed.
-8. The Sigstore-signed `SHA256SUMS`.
-9. Publication: the files are uploaded to a staging draft, every digest
+5. The exact release set: Windows and Linux only, no macOS for now.
+6. GHCR images, pushed, read back and signed.
+7. The Sigstore-signed `SHA256SUMS`.
+8. Publication: the files are uploaded to a staging draft, every digest
    GitHub reports is compared with the verified files, and only then does
    the release become public.
 
-Image and file signatures are bound to `refs/heads/master` and to the exact
+Image and file signatures are bound to `refs/heads/main` and to the exact
 commit. A rerun after a failure resumes, and a rerun after success changes
 nothing. A prerelease version is never marked latest.
 
 Before the first release, a maintainer sets up:
 
-- **The `master` branch,** protected by a ruleset (no deletion or force
-  push). Today the public repository has only `main`.
-- **macOS:** the five repository secrets listed in
-  [packaging/README.md](../packaging/README.md#release-signing-protected-master-only):
-  - the Developer ID `.p12` and its password;
-  - the App Store Connect notary key ID, issuer ID and `.p8`.
-
-  There's also an optional `MACOS_SIGNING_TEAM_ID` variable. A release push
-  without them fails.
+- **The `main` branch,** the repository's default branch, protected against
+  deletion and force pushes. Changes, including version bumps, arrive
+  through pull requests.
+- **macOS:** nothing for now. Releases don't build or sign a Mac, and no
+  workflow reads the Apple signing secrets. If they're already set, they're
+  unused.
 - **Windows:** the `windows-release-signing` environment, with deployment
-  allowed only from the `master` branch and never from tags (the signing job
+  allowed only from the `main` branch and never from tags (the signing job
   checks this). Reviewers are recommended. It also needs repository
   variables:
   - `METRO_WINDOWS_SIGNING_BACKEND`;

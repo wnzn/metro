@@ -9,6 +9,7 @@ windows-msi/test-msi-windows.ps1 (Windows CI only).
 
 import hashlib
 import json
+import re
 import os
 from pathlib import Path
 import shutil
@@ -216,16 +217,119 @@ class Sources(unittest.TestCase):
         helper = (MSI_DIR / "MsiAutomation.ps1").read_text(encoding="utf-8")
         declared = set(re.findall(r"^\s+'(\w+\.\w+)'\s+= @\('(?:Method|Property)'", helper, re.M))
         self.assertIn("Record.StringData", declared)
-        users = [MSI_DIR / "test-msi-windows.ps1", HERE / "windows-signing" / "MetroWindowsSigning.psm1"]
+        users = [MSI_DIR / "MsiHarness.ps1", HERE / "windows-signing" / "MetroWindowsSigning.psm1"]
         for p in users:
             with self.subTest(p=p.name):
                 text = p.read_text(encoding="utf-8")
-                self.assertIn("MsiAutomation.ps1", text)
                 self.assertNotIn("InvokeMember", text)
                 used = set(re.findall(r"Invoke-MsiAutomation \$\w+ '(\w+\.\w+)'", text))
                 self.assertTrue(used, "no Windows Installer calls found")
                 self.assertLessEqual(used, declared)
                 self.assertIsNone(re.search(r"\$(installer|db|view|record|list)\.\w+\(", text, re.I))
+        self.assertIn("MsiAutomation.ps1", (HERE / "windows-signing" / "MetroWindowsSigning.psm1").read_text(encoding="utf-8"))
+        # The native harness reaches Windows Installer only through MsiHarness.ps1's helpers.
+        harness = (MSI_DIR / "test-msi-windows.ps1").read_text(encoding="utf-8")
+        self.assertIn(". (Join-Path $PSScriptRoot 'MsiAutomation.ps1')", harness)
+        self.assertIn(". (Join-Path $PSScriptRoot 'MsiHarness.ps1')", harness)
+        self.assertNotIn("InvokeMember", harness)
+        self.assertNotIn("Invoke-MsiAutomation", harness)
+        self.assertIsNone(re.search(r"\$(installer|db|view|record|list)\.\w+\(", harness, re.I))
+        self.assertNotIn("Get-ArpKey", harness)  # per-user MSI ARP keys live under HKLM; context comes from ProductInfo
+
+    def test_msi_automation_returns_objects_unenumerated(self):
+        # A plain `return <InvokeMember result>` enumerated RelatedProducts' StringList:
+        # no items -> $null ("Cannot bind argument to parameter 'Object'"), one -> a string.
+        helper = (MSI_DIR / "MsiAutomation.ps1").read_text(encoding="utf-8")
+        self.assertIn("    return , $result\n}", helper)
+        self.assertNotIn("return $target.GetType().InvokeMember", helper)
+
+    @unittest.skipUnless(os.environ.get("METRO_PWSH") or shutil.which("pwsh"), "PowerShell 7 (pwsh) not available")
+    def test_msi_automation_with_stand_ins(self):
+        pwsh = os.environ.get("METRO_PWSH") or shutil.which("pwsh")
+        env = dict(os.environ, POWERSHELL_TELEMETRY_OPTOUT="1")
+        p = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(MSI_DIR / "test-msi-automation.ps1")],
+                           capture_output=True, text=True, timeout=300, env=env)
+        self.assertEqual(p.returncode, 0, p.stdout[-4000:] + p.stderr[-2000:])
+        self.assertIn("fails=0", p.stdout)
+        self.assertNotIn("FAIL ", p.stdout)
+        self.assertEqual(p.stdout.count("PASS "), 25)
+
+    @unittest.skipUnless(os.environ.get("METRO_PWSH") or shutil.which("pwsh"), "PowerShell 7 (pwsh) not available")
+    def test_native_harness_helpers_with_stand_ins(self):
+        # test-msi-windows.ps1 helpers and its parameter/variable rule, without Windows.
+        # With the msitools tree, identity checks read tables of real build_msi.py output.
+        pwsh = os.environ.get("METRO_PWSH") or shutil.which("pwsh")
+        env = dict(os.environ, POWERSHELL_TELEMETRY_OPTOUT="1")
+        env.pop("METRO_MSI_FACTS_JSON", None)
+        real = bool(TOOLS)
+        if real:
+            tools = b.Tools(TOOLS)
+            d = tmpdir(self)
+            p = b.fake_payload(d / "p", "1.0.0")
+            facts = {"version": "1.0.0"}
+            for kind, preview in (("release", False), ("preview", True)):
+                out = d / kind / b.out_name("1.0.0", preview)
+                out.parent.mkdir()
+                b.build(tools, p, "1.0.0", out, preview=preview, epoch=315532800)
+                facts[kind] = {
+                    "file": out.name,
+                    "Property": [[r["Property"], r["Value"]] for r in tools.table(out, "Property")],
+                    "Shortcut": [[r["Name"], r["Directory_"]] for r in tools.table(out, "Shortcut")],
+                }
+            (d / "facts.json").write_text(json.dumps(facts))
+            env["METRO_MSI_FACTS_JSON"] = str(d / "facts.json")
+            # The installed layout of the release package, unpacked by msiextract.
+            x = d / "extracted"
+            tools.run("msiextract", "-C", x, d / "release" / b.out_name("1.0.0", False))
+            env["METRO_MSI_EXTRACTED_TREE"] = str(x / "Programs" / b.IDENTITIES["release"]["default_dir"])
+        proc = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(MSI_DIR / "test-msi-harness.ps1")],
+                              capture_output=True, text=True, timeout=300, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout[-4000:] + proc.stderr[-2000:])
+        self.assertIn("fails=0", proc.stdout)
+        self.assertNotIn("FAIL ", proc.stdout)
+        self.assertEqual(proc.stdout.count("PASS "), 103 + (1 if real else 0))
+        self.assertIn("exported from packages built by build_msi.py" if real else "written in this test", proc.stdout)
+        if real:
+            self.assertIn("extracted from a package built by build_msi.py", proc.stdout)
+
+    def test_policy_fixture_only_on_hosted_harness_runs(self):
+        # Both CI calls of the native harness run on GitHub-hosted windows-2025 and ask for the
+        # client-policy fixture; the harness itself refuses it anywhere else.
+        root = HERE.parent / ".github" / "workflows"
+        for wf, job in (("windows-distribution.yml", "preview"), ("windows-sign.yml", "verify")):
+            with self.subTest(wf=wf):
+                text = (root / wf).read_text(encoding="utf-8")
+                start = text.index(f"\n  {job}:\n")
+                nxt = re.search(r"\n  [a-z][a-z0-9-]*:\n", text[start + 3:])
+                body = text[start: start + 3 + nxt.start()] if nxt else text[start:]
+                self.assertIn("runs-on: windows-2025", body)
+                self.assertIn("test-msi-windows.ps1", body)
+                self.assertIn("-StandardUserFixture", body)
+                self.assertNotIn("-ClientPolicyFixture", text)
+        harness = (MSI_DIR / "test-msi-windows.ps1").read_text(encoding="utf-8")
+        code = "\n".join(l for l in harness.splitlines() if not l.lstrip().startswith("#"))
+        self.assertIn("Get-PolicyFixtureRefusal", code)
+        self.assertIn("Invoke-WithClientMsiPolicy", code)
+        self.assertIn("New-LocalUser", code)
+        self.assertIn("-Credential $Credential -LoadUserProfile", code)
+        self.assertIn("Remove-LocalUser", code)
+        self.assertIn("Win32_UserProfile", code)
+        for banned in ("AlwaysInstallElevated", "runas.exe", "trustlevel", "Add-LocalGroupMember -SID 'S-1-5-32-544'",
+                       "ConvertFrom-SecureString", "ConvertTo-SecureString", "-AsPlainText"):
+            self.assertNotIn(banned, code)
+        # Helpers return arrays as one object (unary comma); @() around them would nest the array.
+        for p in MSI_DIR.glob("*.ps1"):
+            text = p.read_text(encoding="utf-8")
+            self.assertIsNone(re.search(r"@\((Get-Tree|Get-RelatedProducts|Get-InstalledTreeProblems|Get-StandardUserResultProblems|"
+                                        r"Get-PackageIdentityProblems|Get-MsiQueryRows|Get-ParamShadowing)\b", text), p.name)
+
+    def test_installer_is_policy_neutral(self):
+        d = tmpdir(self)
+        p = b.fake_payload(d, "1.0.0")
+        _, entries, _ = b.validate_payload(p, "1.0.0")
+        xml = b.product_wxs("release", "1.0.0", "1.0.99", entries, p, d / "marker", False)
+        for word in ("Policies", "DisableMsi", "AlwaysInstallElevated", "Root=\"HKLM\" Key=\"SOFTWARE\\Policies"):
+            self.assertNotIn(word, xml)
 
     def test_lock_is_pinned(self):
         lock = json.loads((MSI_DIR / "wixl-lock.json").read_text())

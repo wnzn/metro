@@ -94,14 +94,15 @@ function Invoke-MetroSigning {
 }
 
 # The only context in which release credentials may be used: a push (not a
-# deletion) to the protected literal master branch of wnzn/metro, whose
-# top-level workflow is ci.yml on master, with the pushed commit checked out.
-# winsign.py release-context holds the rules (and their tests).
+# deletion) to the protected literal main branch of wnzn/metro, whose
+# top-level workflow is ci.yml on main, with the pushed commit checked out.
+# winsign.py release-context holds the rules (and their tests); ci.yml calls
+# the signing workflow only for a push that bumped the version.
 function Assert-MetroReleaseContext([string] $Version) {
     $head = & git -C $env:GITHUB_WORKSPACE rev-parse HEAD
     if ($LASTEXITCODE -ne 0 -or -not $head) { Fail 'cannot read the checked-out commit' }
     & python -I (Join-Path $PSScriptRoot 'winsign.py') release-context --version $Version --head ([string] $head).Trim() | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail 'release signing runs only for a push to protected master of wnzn/metro from ci.yml' }
+    if ($LASTEXITCODE -ne 0) { Fail 'release signing runs only for a push to protected main of wnzn/metro from ci.yml' }
 }
 
 function Install-MetroArtifactSigningClient([string] $Version, [string] $Sha256, [string] $Dest) {
@@ -132,7 +133,7 @@ function Install-MetroArtifactSigningClient([string] $Version, [string] $Sha256,
 # that only lives for the signing call. The value is masked and never printed.
 function New-GitHubOidcTokenFile([string] $Path) {
     if (-not $env:ACTIONS_ID_TOKEN_REQUEST_URL -or -not $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
-        Fail 'no GitHub OIDC token is available: the official master call must grant id-token: write'
+        Fail 'no GitHub OIDC token is available: the official main release call must grant id-token: write'
     }
     $uri = $env:ACTIONS_ID_TOKEN_REQUEST_URL + '&audience=api://AzureADTokenExchange'
     $token = (Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
@@ -308,16 +309,59 @@ function Test-MetroMsiStructure {
 }
 
 # A copy with one extra Property row: every hashed stream stays, the content changes.
+# The edit runs in a short child pwsh that has exited before this returns. Windows
+# Installer automation is in-process COM (msi.dll): the database file stays open
+# while anything references the Database, and the View holds such a reference, as
+# PowerShell's adapters may. Releasing only the Database left tampered.msi open
+# ("being used by another process" in Get-AuthenticodeSignature). Process exit
+# closes every handle the editor had; the child still releases view, database and
+# installer in reverse order. The caller then requires an exclusive open.
 function New-TamperedMsiCopy([string] $Path, [string] $Dest) {
     Copy-Item -LiteralPath $Path -Destination $Dest
-    $installer = New-Object -ComObject WindowsInstaller.Installer
-    $db = Invoke-MsiAutomation $installer 'Installer.OpenDatabase' @($Dest, 1)
-    $view = Invoke-MsiAutomation $db 'Database.OpenView' @("INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('MetroTamperCheck', '1')")
-    Invoke-MsiAutomation $view 'View.Execute' | Out-Null
-    Invoke-MsiAutomation $view 'View.Close' | Out-Null
-    Invoke-MsiAutomation $db 'Database.Commit' | Out-Null
-    [Runtime.InteropServices.Marshal]::FinalReleaseComObject($db) | Out-Null
+    $editor = {
+        param([string] $Automation, [string] $Msi)
+        Set-StrictMode -Version 3.0
+        $ErrorActionPreference = 'Stop'
+        . $Automation
+        $installer = $db = $view = $null
+        try {
+            $installer = New-Object -ComObject WindowsInstaller.Installer
+            $db = Invoke-MsiAutomation $installer 'Installer.OpenDatabase' @($Msi, 1)
+            $view = Invoke-MsiAutomation $db 'Database.OpenView' @("INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('MetroTamperCheck', '1')")
+            Invoke-MsiAutomation $view 'View.Execute' | Out-Null
+            Invoke-MsiAutomation $view 'View.Close' | Out-Null
+            Invoke-MsiAutomation $db 'Database.Commit' | Out-Null
+        } finally {
+            foreach ($o in $view, $db, $installer) {
+                if ($null -ne $o) { [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($o.PSObject.BaseObject) }
+            }
+        }
+    }
+    Invoke-MetroChildEditor $editor @((Join-Path $PSScriptRoot '..\windows-msi\MsiAutomation.ps1'), $Dest) 'the MSI editor'
+    Assert-MetroFileClosed $Dest 'the tampered MSI'
+    if ((Get-FileHash -LiteralPath $Path).Hash -eq (Get-FileHash -LiteralPath $Dest).Hash) { Fail 'the MSI editor did not change the copy' }
     return $Dest
+}
+
+# Runs $Block in a child pwsh (this executable) and waits for it to exit.
+function Invoke-MetroChildEditor([scriptblock] $Block, [object[]] $BlockArgs, [string] $What) {
+    $PSNativeCommandUseErrorActionPreference = $false
+    $out = & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -Command $Block -args $BlockArgs 2>&1
+    if ($LASTEXITCODE -ne 0) { Fail "$What exited with code $LASTEXITCODE`: $(($out | Out-String).Trim())" }
+    $global:LASTEXITCODE = 0
+}
+
+# Fails unless no process, this one included, still has the file open: only then
+# does an exclusive (FileShare None) open succeed. No retry: a held handle is a bug.
+function Assert-MetroFileClosed([string] $Path, [string] $What) {
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    } catch {
+        $e = $_.Exception
+        while ($e.InnerException) { $e = $e.InnerException }
+        Fail "$What is still open after its editor exited: $($e.Message)"
+    }
+    $stream.Dispose()
 }
 
 function Get-MetroMsiProductState([string] $ProductCode) {
@@ -493,11 +537,23 @@ function Test-MetroScriptMsiCoexistence {
 # Preview only. A throwaway self-signed certificate signs scratch copies so the
 # verifiers are exercised on real SignTool output; it is never trusted, never
 # timestamped, never shipped, and removed afterwards.
+#
+# Fail-closed guard. The branch no longer tells a release apart (main pushes
+# without a version bump run previews too), so the caller must say so
+# explicitly: windows-distribution.yml's preview job sets
+# METRO_WINDOWS_SELF_TEST=preview from `!inputs.release`. It never runs for a
+# tag, or in a job that can request a GitHub OIDC token (release signing).
 function Invoke-MetroVerifierSelfTest {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $Tree, [Parameter(Mandatory)] [string] $Msi, [Parameter(Mandatory)] [string] $SourceScripts)
-    if ($env:GITHUB_REF_TYPE -eq 'tag' -or ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF -eq 'refs/heads/master')) {
-        Fail 'the throwaway-certificate self-test never runs for master pushes or tags'
+    if ($env:GITHUB_REF_TYPE -eq 'tag' -or ([string] $env:GITHUB_REF).StartsWith('refs/tags/')) {
+        Fail 'the throwaway-certificate self-test never runs for tags'
+    }
+    if ($env:METRO_WINDOWS_SELF_TEST -cne 'preview') {
+        Fail 'the throwaway-certificate self-test runs only in the preview job (METRO_WINDOWS_SELF_TEST=preview)'
+    }
+    if ($env:ACTIONS_ID_TOKEN_REQUEST_URL -or $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
+        Fail 'the throwaway-certificate self-test never runs in a job that can request an OIDC token'
     }
     $tool = Get-MetroSignTool
     $subject = 'Metro CI throwaway self-test (not a release signer)'

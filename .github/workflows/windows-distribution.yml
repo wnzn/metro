@@ -4,14 +4,14 @@ name: Windows distribution
 # own. Every job is contents: read and none uses an environment, a credential,
 # OIDC or a self-hosted runner. Interface: packaging/windows-signing/README.md.
 #
-#   release: false  PR / main preview. Verifies the seed, repacks it unsigned,
+#   release: false  PR / main preview (no release). Verifies the seed, repacks it unsigned,
 #                   builds Metro-<v>-windows-x64.unsigned-preview.msi with the
 #                   MSI lane (packaging/windows-msi, on Linux), checks and
 #                   installs it on a fresh Windows VM, runs the MSI lane's native
 #                   tests and self-tests the verifiers with a throwaway
 #                   certificate. Uploads dist-desktop-windows-x64.
-#   release: true   Only a push (not a deletion) to protected master of
-#                   wnzn/metro whose top-level workflow is ci.yml on master,
+#   release: true   Only a push (not a deletion) to protected main of
+#                   wnzn/metro whose top-level workflow is ci.yml on main,
 #                   with exactly github.sha checked out; tags, pull requests
 #                   and other branches are refused. Verifies the seed for an
 #                   official release (metro-tui.exe required) and uploads
@@ -23,7 +23,7 @@ on:
   workflow_call:
     inputs:
       release:
-        description: 'Official master release: hand the verified seed to windows-sign.yml when true; unsigned preview when false.'
+        description: 'Official main release: hand the verified seed to windows-sign.yml when true; unsigned preview when false.'
         type: boolean
         default: false
       version:
@@ -32,7 +32,7 @@ on:
         required: true
     outputs:
       mode:
-        description: 'official (master release hand-off) or preview'
+        description: 'official (main release hand-off) or preview'
         value: ${{ jobs.seed.outputs.mode }}
       seed-sha256:
         value: ${{ jobs.seed.outputs.seed-sha256 }}
@@ -57,7 +57,7 @@ jobs:
         with:
           persist-credentials: false
       - id: mode
-        name: Mode (official only for a push to protected master of wnzn/metro from ci.yml)
+        name: Mode (official only for a push to protected main of wnzn/metro from ci.yml)
         env:
           RELEASE: ${{ inputs.release }}
           VERSION: ${{ inputs.version }}
@@ -211,15 +211,30 @@ jobs:
           $t = $env:RUNNER_TEMP
           Test-MetroScriptMsiCoexistence -Msi "$t\dist\$env:MSI_NAME" -Zip "$t\dist\Metro-$env:VERSION-windows-x64.zip" `
             -Script (Join-Path $env:GITHUB_WORKSPACE 'packaging\install-metro-windows.ps1') -Version $env:VERSION -LogDir "$t\logs"
+      # On this disposable GitHub-hosted runner the harness creates an ephemeral standard
+      # (non-admin) local account that installs, inspects and uninstalls in its own
+      # context: refused (1625) under Windows Server's default DisableMsi, then allowed
+      # with DisableMsi=0 (Windows client behaviour); account, profile and policy are
+      # restored afterwards.
       - name: MSI lane native tests (fixtures, upgrade, repair, downgrade, uninstall; then the preview MSI)
+        id: msi-lifecycle
         run: |
           $t = $env:RUNNER_TEMP
           $require = @()
           if (Test-Path -LiteralPath "$t\tree\metro-tui.exe") { $require = @('-RequireFile', 'metro-tui.exe') }
           & pwsh -NoProfile -NonInteractive -File (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-msi\test-msi-windows.ps1') `
-            -FixturesDir "$t\fixtures" -Msi "$t\dist\$env:MSI_NAME" -Version $env:VERSION -LogDir "$t\logs\msi-lane" @require
+            -FixturesDir "$t\fixtures" -Msi "$t\dist\$env:MSI_NAME" -Version $env:VERSION -LogDir "$t\logs\msi-lane" @require `
+            -StandardUserFixture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # Independent diagnostic on the same validated inputs: also run it when the MSI
+      # lifecycle failed, so one red run reports both. Never after cancellation or when
+      # an earlier step failed (the lifecycle is then skipped). The job still fails and
+      # the dist upload below still needs every step green.
       - name: Verifier self-test with a throwaway certificate (never trusted, never shipped)
+        if: ${{ !cancelled() && (steps.msi-lifecycle.outcome == 'success' || steps.msi-lifecycle.outcome == 'failure') }}
+        env:
+          # The module refuses the self-test unless this is exactly 'preview'.
+          METRO_WINDOWS_SELF_TEST: ${{ !inputs.release && 'preview' || 'release' }}
         run: |
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
           $t = $env:RUNNER_TEMP

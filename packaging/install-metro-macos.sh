@@ -214,7 +214,7 @@ install_app() {
     fi
 
     mkdir -p -- "$root"
-    chmod 700 -- "$root"
+    chmod 700 "$root"
     old=
     if [ -e "$root/Metro.app" ]; then old=$(mktemp -d -- "$parent/.metro-desktop-old.XXXXXX"); mv -- "$root/Metro.app" "$old/"; fi
     mv -- "$app/Metro.app" "$root/Metro.app"
@@ -224,7 +224,7 @@ install_app() {
     printf '%s\n' "$root" >"$state/install-dir"
     # The marker lives beside the sealed bundle, never inside it.
     if [ "$local_runner" = yes ]; then
-        rm -f -- "$root/enable-local-runner"; : >"$root/enable-local-runner"; chmod 644 -- "$root/enable-local-runner"
+        rm -f -- "$root/enable-local-runner"; : >"$root/enable-local-runner"; chmod 644 "$root/enable-local-runner"
     else
         rm -f -- "$root/enable-local-runner"
     fi

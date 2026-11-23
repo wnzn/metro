@@ -15,11 +15,12 @@ import release_policy as rp
 
 HERE = Path(__file__).resolve().parent
 V = "0.3.0"
+PREV = "0.2.0"  # the version at push.before for a bump push
 SHA = "a" * 40
 OTHER = "b" * 40
 OFFICIAL = {
-    "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/master", "GITHUB_REPOSITORY": "wnzn/metro",
-    "GITHUB_REPOSITORY_ID": "1467654868", "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master",
+    "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main", "GITHUB_REPOSITORY": "wnzn/metro",
+    "GITHUB_REPOSITORY_ID": "1467654868", "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/main",
     "REF_PROTECTED": "true", "EVENT_DELETED": "false", "EVENT_FORCED": "false", "EVENT_AFTER": SHA,
     "EVENT_BEFORE": OTHER, "GITHUB_SHA": SHA,
 }
@@ -32,8 +33,10 @@ class FakeGitHub:
         self.tags, self.rels, self.mutations, self.next_id = {}, [], [], 1
         self.corrupt_upload = None
         self.race_tag = None
+        self.lookups = 0
 
     def tag_commit(self, version):
+        self.lookups += 1
         return self.tags.get(f"v{version}")
 
     def create_tag(self, version, sha):
@@ -53,6 +56,7 @@ class FakeGitHub:
         return next(r for r in self.rels if r["id"] == release_id)
 
     def public_release(self, version):
+        self.lookups += 1
         return next((r for r in self.releases(f"v{version}") if not r["draft"]), None)
 
     def create_release(self, version, prerelease, sha):
@@ -95,11 +99,20 @@ def published_release(fake, folder, version=V):
         for p in folder.iterdir()]})
 
 
+def write_manifests(root, cargo, app):
+    (root / "apps/desktop").mkdir(parents=True, exist_ok=True)
+    (root / "Cargo.toml").write_text(f'[workspace]\nmembers = []\n\n[workspace.package]\nversion = "{cargo}"\n')
+    (root / "apps/desktop/nsh.json").write_text(json.dumps({"version": app, "build": 2}))
+
+
+def git(root, *args):
+    subprocess.run(["git", "-C", str(root), "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                    "-c", "commit.gpgsign=false", *args], check=True, capture_output=True)
+
+
 class VersionTests(unittest.TestCase):
     def write(self, root, cargo, app):
-        (root / "apps/desktop").mkdir(parents=True)
-        (root / "Cargo.toml").write_text(f'[workspace]\nmembers = []\n\n[workspace.package]\nversion = "{cargo}"\n')
-        (root / "apps/desktop/nsh.json").write_text(json.dumps({"version": app, "build": 2}))
+        write_manifests(root, cargo, app)
 
     def test_checked_in_version(self):
         self.assertEqual(rp.read_version()[0], json.loads((HERE.parent / "apps/desktop/nsh.json").read_text())["version"])
@@ -121,7 +134,9 @@ class VersionTests(unittest.TestCase):
     def test_expected_assets_are_the_signers_set(self):
         names = rp.expected_assets(V)
         self.assertIn(f"Metro-{V}-windows-x64.msi", names)
-        self.assertIn(f"Metro-{V}-macos-arm64.tar.gz.sha256", names)
+        self.assertIn(f"Metro-{V}-linux-x64.tar.gz.sha256", names)
+        self.assertIn(f"Metro-{V}-windows-x64.zip.sha256", names)
+        self.assertFalse(any("macos" in n for n in names))  # macOS builds are off for now: Windows and Linux only
         self.assertIn("SHA256SUMS.sigstore.json", names)
         self.assertIn("IMAGES.txt", names)
         self.assertNotIn(f"Metro-{V}-windows-x64.unsigned-preview.msi", names)
@@ -131,36 +146,51 @@ class VersionTests(unittest.TestCase):
             root = Path(d)
             self.write(root, V, V)
             subprocess.run(["git", "init", "-q", d], check=True)
-            subprocess.run(["git", "-C", d, "add", "Cargo.toml", "apps/desktop/nsh.json"], check=True)
-            subprocess.run(["git", "-C", d, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                            "-c", "commit.gpgsign=false", "commit", "-qm", "previous version"], check=True)
+            git(root, "add", "Cargo.toml", "apps/desktop/nsh.json")
+            git(root, "commit", "-qm", "previous version")
+            good = rp.git_head(root)
             (root / "Cargo.toml").write_text("not current TOML")
-            self.assertEqual(rp.previous_version(rp.git_head(root), root), V)
-            self.assertIsNone(rp.previous_version("0" * 40, root))
-            with self.assertRaisesRegex(rp.PolicyError, "before SHA"):
-                rp.previous_version("HEAD", root)
+            self.assertEqual(rp.previous_version(good, root), V)
+            # Mismatched manifests at before are unreadable, not an error.
+            (root / "Cargo.toml").write_text('[workspace]\nmembers = []\n\n[workspace.package]\nversion = "0.4.0"\n')
+            git(root, "commit", "-qam", "half a bump")
+            mismatched = rp.git_head(root)
+            self.assertIsNone(rp.previous_version(mismatched, root))
+            # No before version: missing, all zeros (branch creation), malformed, unknown commit.
+            for before in (None, "", "0" * 40, "HEAD", good.upper(), good[:12], good + "\n", OTHER):
+                with self.subTest(before=before):
+                    self.assertIsNone(rp.previous_version(before, root))
+
 
 class ProvenanceTests(unittest.TestCase):
-    def test_only_the_protected_master_push_of_ci_yml(self):
+    def test_only_the_protected_main_push_of_ci_yml(self):
         self.assertEqual(rp.check_provenance(OFFICIAL, SHA), SHA)
+        self.assertEqual((rp.BRANCH_REF, rp.CALLER),
+                         ("refs/heads/main", "wnzn/metro/.github/workflows/ci.yml@refs/heads/main"))
         bad = {
-            "tag push (even pointing at master)": {"GITHUB_REF": "refs/tags/v0.3.0"},
-            "pull request into master": {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/7/merge"},
+            "tag push (even pointing at main)": {"GITHUB_REF": "refs/tags/v0.3.0"},
+            "pull request into main": {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/7/merge"},
             "pull_request_target": {"GITHUB_EVENT_NAME": "pull_request_target"},
-            "manual run on master": {"GITHUB_EVENT_NAME": "workflow_dispatch"},
+            "manual run on main": {"GITHUB_EVENT_NAME": "workflow_dispatch"},
             "schedule": {"GITHUB_EVENT_NAME": "schedule"},
-            "push to main": {"GITHUB_REF": "refs/heads/main"},
-            "push to another branch": {"GITHUB_REF": "refs/heads/master-copy"},
+            "push to master (no longer the release branch)": {"GITHUB_REF": "refs/heads/master"},
+            "master push run by master's ci.yml": {
+                "GITHUB_REF": "refs/heads/master",
+                "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master"},
+            "ci.yml from master": {"GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master"},
+            "push to another branch": {"GITHUB_REF": "refs/heads/main-copy"},
             "fork or other repository": {"GITHUB_REPOSITORY": "someone/metro"},
             "renamed repository id": {"GITHUB_REPOSITORY_ID": "1"},
-            "other top-level workflow": {"GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/other.yml@refs/heads/master"},
+            "other top-level workflow": {"GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/other.yml@refs/heads/main"},
             "ci.yml from a tag": {"GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/tags/v0.3.0"},
-            "unprotected master": {"REF_PROTECTED": "false"},
+            "ci.yml, nonliteral case": {"GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/Main"},
+            "repository, nonliteral case": {"GITHUB_REPOSITORY": "WNZN/metro"},
+            "unprotected main": {"REF_PROTECTED": "false"},
             "branch deletion": {"EVENT_DELETED": "true"},
             "missing deleted flag": {"EVENT_DELETED": ""},
             "force push": {"EVENT_FORCED": "true"},
             "missing forced flag": {"EVENT_FORCED": ""},
-            "nonliteral branch": {"GITHUB_REF": "refs/heads/Master"},
+            "nonliteral branch": {"GITHUB_REF": "refs/heads/Main"},
             "pushed commit differs": {"EVENT_AFTER": OTHER},
             "invalid sha": {"GITHUB_SHA": "HEAD", "EVENT_AFTER": "HEAD"},
         }
@@ -180,32 +210,65 @@ class DecideTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def test_states(self):
-        self.assertEqual(rp.decide(self.fake, V, SHA), "new")
+    def test_version_bump_states(self):
+        self.assertEqual(rp.decide(self.fake, V, SHA, PREV), "new")  # bump, tag missing, nothing published
         self.fake.tags[f"v{V}"] = SHA
-        self.assertEqual(rp.decide(self.fake, V, SHA), "resume")
+        self.assertEqual(rp.decide(self.fake, V, SHA, PREV), "resume")  # rerun of the failed bump run
         published_release(self.fake, self.folder)
-        self.assertEqual(rp.decide(self.fake, V, SHA), "done")
-        self.assertEqual(rp.decide(self.fake, V, OTHER, lambda: V), "unchanged")
+        self.assertEqual(rp.decide(self.fake, V, SHA, PREV), "done")  # rerun after it published
         with self.assertRaisesRegex(rp.PolicyError, "used version"):
-            rp.decide(self.fake, V, OTHER, lambda: "0.4.0")  # attempted version reuse, not an unchanged push
+            rp.decide(self.fake, V, OTHER, PREV)  # a later bump back to a published version
+        with self.assertRaisesRegex(rp.PolicyError, "used version"):
+            rp.decide(self.fake, V, OTHER, "0.4.0")  # a downgrade to a published version
         self.assertEqual(self.fake.mutations, [])  # deciding never changes anything
+
+    def test_no_bump_never_releases_and_never_reads_tags_or_releases(self):
+        def conflicting_tag(fake):
+            fake.tags[f"v{V}"] = OTHER
+
+        def release_without_tag(fake):
+            published_release(fake, self.folder)
+
+        def published_elsewhere(fake):
+            fake.tags[f"v{V}"] = OTHER
+            published_release(fake, self.folder)
+
+        def other_asset_set(fake):
+            fake.tags[f"v{V}"] = SHA
+            published_release(fake, self.folder)
+            fake.rels[0]["assets"].pop()
+
+        setups = {"tag missing, nothing published": lambda fake: None, "conflicting unpublished tag": conflicting_tag,
+                  "release without its tag": release_without_tag, "published at another commit": published_elsewhere,
+                  "published with another asset set": other_asset_set}
+        for prior, state in ((V, "unchanged"), (None, "no-previous-version")):
+            for label, setup in setups.items():
+                with self.subTest(prior=prior, state=label):
+                    fake = FakeGitHub()
+                    setup(fake)
+                    self.assertEqual(rp.decide(fake, V, SHA, prior), state)
+                    self.assertEqual((fake.lookups, fake.mutations), (0, []))
+        self.assertEqual((rp.bump(V, V), rp.bump(V, None), rp.bump(V, PREV)), ("unchanged", "no-previous-version", None))
 
     def test_refusals(self):
         self.fake.tags[f"v{V}"] = OTHER
         with self.assertRaisesRegex(rp.PolicyError, "nothing is published"):
-            rp.decide(self.fake, V, SHA)  # conflicting unpublished tag
+            rp.decide(self.fake, V, SHA, PREV)  # conflicting unpublished tag
         self.fake.rels.append({"id": 5, "tag_name": f"v{V}", "draft": True, "assets": []})
         with self.assertRaisesRegex(rp.PolicyError, "nothing is published"):
-            rp.decide(self.fake, V, SHA)  # a draft is not a release
+            rp.decide(self.fake, V, SHA, PREV)  # a draft is not a release
         fake = FakeGitHub()
         published_release(fake, self.folder)
         with self.assertRaisesRegex(rp.PolicyError, "tag is missing"):
-            rp.decide(fake, V, SHA)
+            rp.decide(fake, V, SHA, PREV)
         fake.tags[f"v{V}"] = SHA
+        fake.rels[0]["prerelease"] = True
+        with self.assertRaisesRegex(rp.PolicyError, "wrong prerelease status"):
+            rp.decide(fake, V, SHA, PREV)
+        fake.rels[0]["prerelease"] = False
         fake.rels[0]["assets"].pop()
         with self.assertRaisesRegex(rp.PolicyError, "never overwritten"):
-            rp.decide(fake, V, SHA)
+            rp.decide(fake, V, SHA, PREV)
 
 
 class TagTests(unittest.TestCase):
@@ -377,10 +440,10 @@ class ClientTests(unittest.TestCase):
 
 
 class CliTests(unittest.TestCase):
-    def run_cli(self, *args, env=None):
+    def run_cli(self, *args, env=None, script=HERE / "release_policy.py"):
         base = {"PATH": os.environ["PATH"], "GH_TOKEN": "tok-secret"}
-        return subprocess.run([sys.executable, "-I", str(HERE / "release_policy.py"), *args],
-                              env={**base, **(env or {})}, capture_output=True, text=True, cwd=HERE.parent)
+        return subprocess.run([sys.executable, "-I", str(script), *args],
+                              env={**base, **(env or {})}, capture_output=True, text=True, cwd=script.parent.parent)
 
     def test_version(self):
         r = self.run_cli("version")
@@ -394,18 +457,71 @@ class CliTests(unittest.TestCase):
         self.assertIn(f"sha={head}\n", r.stdout)
 
     def test_non_official_runs_stop_before_any_network(self):
-        head = rp.git_head()
+        head, version = rp.git_head(), rp.read_version()[0]
+        commands = ("decide", f"authorize --version {version}", f"tag --version {version}",
+                    f"verify-tag --version {version}", f"publish --version {version} --dir .")
         for change in ({"GITHUB_REF": "refs/tags/v0.2.0"}, {"GITHUB_EVENT_NAME": "pull_request"},
-                       {"GITHUB_EVENT_NAME": "workflow_dispatch"}, {}):
-            env = {**OFFICIAL, "GITHUB_SHA": head, "EVENT_AFTER": head, **change,
+                       {"GITHUB_EVENT_NAME": "workflow_dispatch"}, {"GITHUB_REF": "refs/heads/master"},
+                       {"GITHUB_REF": "refs/heads/master",
+                        "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master"}):
+            env = {**OFFICIAL, "GITHUB_SHA": head, "EVENT_AFTER": head, "EVENT_BEFORE": head, **change,
                    "GITHUB_API_URL": "http://127.0.0.1:9"}  # unreachable, and plain http is refused anyway
-            for command in ("decide", "authorize --version 0.2.0", "tag --version 0.2.0", "verify-tag --version 0.2.0",
-                            "publish --version 0.2.0 --dir ."):
+            for command in commands:
                 r = self.run_cli(*command.split(), env=env)
                 self.assertEqual(r.returncode, 1, (change, command))
-                expected = "not an official release run" if change else "must be https"
-                self.assertIn(expected, r.stderr, (change, command))
+                self.assertIn("not an official release run", r.stderr, (change, command))
                 self.assertNotIn("tok-secret", r.stdout + r.stderr)
+
+    def test_official_push_without_a_version_bump_is_ci_only_and_offline(self):
+        head, version = rp.git_head(), rp.read_version()[0]
+        for before, state in ((head, "unchanged"), ("0" * 40, "no-previous-version"), (OTHER, "no-previous-version"),
+                              ("garbage", "no-previous-version"), (None, "no-previous-version")):
+            env = {**OFFICIAL, "GITHUB_SHA": head, "EVENT_AFTER": head, "EVENT_BEFORE": before,
+                   "GITHUB_API_URL": "http://127.0.0.1:9"}  # any GitHub call would fail ("must be https")
+            if before is None:
+                del env["EVENT_BEFORE"]
+            with self.subTest(before=before):
+                r = self.run_cli("decide", env=env)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertIn(f"release=false\nstate={state}\nversion={version}\n", r.stdout)
+                for command in (f"authorize --version {version}", f"tag --version {version}"):
+                    r = self.run_cli(*command.split(), env=env)
+                    self.assertEqual(r.returncode, 1, command)
+                    self.assertIn("did not change the version", r.stderr, command)
+                    self.assertNotIn("proceed=", r.stdout, command)
+                for command in (f"verify-tag --version {version}", f"publish --version {version} --dir ."):
+                    self.assertIn("must be https", self.run_cli(*command.split(), env=env).stderr, command)
+
+    def test_official_version_bump_reaches_the_github_checks(self):
+        """A copy of the policy in a throwaway repository: PREV at push.before, V at the pushed commit."""
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / "packaging/release-signatures").mkdir(parents=True)
+            (root / "apps/desktop").mkdir(parents=True)
+            script = root / "packaging/release_policy.py"
+            script.write_bytes((HERE / "release_policy.py").read_bytes())
+            (root / "packaging/release-signatures/release_signatures.py").write_bytes(
+                (HERE / "release-signatures/release_signatures.py").read_bytes())
+            subprocess.run(["git", "init", "-q", d], check=True)
+            shas = []
+            for version in (PREV, V):
+                write_manifests(root, version, version)
+                git(root, "add", "-A")
+                git(root, "commit", "-qm", version)
+                shas.append(rp.git_head(root))
+            env = {**OFFICIAL, "GITHUB_SHA": shas[1], "EVENT_AFTER": shas[1], "EVENT_BEFORE": shas[0],
+                   "GITHUB_API_URL": "http://127.0.0.1:9"}
+            for command in ("decide", f"authorize --version {V}", f"tag --version {V}"):
+                with self.subTest(command=command):
+                    r = self.run_cli(*command.split(), env=env, script=script)
+                    self.assertEqual(r.returncode, 1, r.stdout)
+                    self.assertIn("must be https", r.stderr)  # past the bump gate, at the GitHub client
+                    self.assertNotIn("tok-secret", r.stdout + r.stderr)
+            r = self.run_cli("decide", env={**env, "EVENT_BEFORE": shas[1]}, script=script)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("release=false\nstate=unchanged\n", r.stdout)
+            r = self.run_cli("decide", env={**env, "GITHUB_REF": "refs/heads/master"}, script=script)
+            self.assertIn("not an official release run", r.stderr)
 
 
 if __name__ == "__main__":

@@ -4,8 +4,9 @@
 `release.yml` workflow). The scripts below install those prebuilt archives
 for one person, without compiling anything. Each one is a standalone file
 that's also published as a release asset next to the archives, and each is
-listed in `SHA256SUMS`. Nothing is published yet. Until the first release
-from the protected `master` branch, use archives you built or CI's unsigned
+listed in `SHA256SUMS` (except `install-metro-macos.sh` while there are no
+Mac builds). Nothing is published yet. Until the first release
+from the protected `main` branch, use archives you built or CI's unsigned
 test builds ([docs/install.md](../docs/install.md#test-builds-from-github-actions)).
 
 Every installer checks the archive's SHA-256 before it extracts anything.
@@ -20,7 +21,7 @@ it never attaches anything to a Space.
 | --- | --- | --- | --- |
 | `install-metro-linux.sh` | Linux x64 desktop | `~/.local/share/metro-desktop-app/versions/<v>` + `current` link, applications menu entry | `~/.config/metro-desktop` (your data) |
 | `install-metro-windows.ps1` | Windows x64 desktop | `%LOCALAPPDATA%\Programs\Metro\versions\<v>`, Start menu shortcut, per-user Installed apps entry | `%LOCALAPPDATA%\Metro\Desktop` |
-| `install-metro-macos.sh` | macOS desktop (**not yet verified**, CI preview only) | `~/Applications/Metro Desktop/Metro.app`; records in `~/Library/Application Support/Metro/Installer` | `~/Library/Application Support/Metro/Desktop` |
+| `install-metro-macos.sh` | macOS desktop (**not yet verified**; no Mac builds for now, see [macOS status](#macos-status)) | `~/Applications/Metro Desktop/Metro.app`; records in `~/Library/Application Support/Metro/Installer` | `~/Library/Application Support/Metro/Desktop` |
 | `install-metro-runner-linux.sh` | Operator-managed runner, Linux x64 native | `~/.local/share/metro-runner`, settings in `~/.config/metro-runner/runner.env` (mode 600, no token) | the workspace and the token file |
 | `metro-runner-container.sh` / `.ps1` | Operator-managed runner on macOS or Windows (or Linux) with Docker or Podman | container `metro-runner` from `ghcr.io/wnzn/metro-runner:v<v>`, named volume at `/workspace` | the volume and the token file |
 
@@ -107,87 +108,67 @@ will be set up. They never say the runner is on.
 
 ## macOS status
 
-This is **not yet verified**, and there are no production builds.
+**No macOS builds for now.** CI doesn't build, sign or ship a Mac, for
+Apple silicon or Intel, in previews or releases. GitHub's macOS runners
+queued for 15 minutes or more and the jobs were cancelled, so the jobs are
+switched off. A release ships Windows and Linux only.
+
+The macOS code stays in this folder, unused by any workflow and not
+verified: `package.py`'s macOS targets, `macos_release.py`,
+`install-metro-macos.sh` and `smoke-macos-launch.sh`, with their unit tests.
+To bring the builds back, restore the `desktop-macos` job and meta's macOS
+matrix step in `release.yml`, and the `macos-sign` job and its five Apple
+secrets in `release-publish.yml` and `ci.yml`, from commit `106e5da`. Then
+list the targets in `release_assets.MACOS` and
+`release_signatures.MACOS_TARGETS`, and add `install-metro-macos.sh` back to
+`release_signatures.INSTALLERS`.
+
+For reference, this is how that code works:
 
 - NSH v0.6.1 publishes official `nsh-macos-arm64.tar.gz` and
   `nsh-macos-x86_64.tar.gz` (macOS 14+). `nsh package --target macos` ad
   hoc signs, so it needs a Mac.
-- The `desktop-macos` CI jobs (`macos-15` for Apple silicon,
-  `macos-15-intel` for Intel; GitHub offers Intel runners until August
-  2027) build and test natively. They assemble `Metro.app`, with the stock
-  NSH app at `Contents/Helpers/MetroUI.app`, then install it and check a
-  bounded start and shutdown.
-- Their output is ad hoc signed, named `preview-not-verified-adhoc-*`, and
-  never attached to a release.
+- The removed `desktop-macos` jobs built and tested natively, assembled
+  `Metro.app` with the stock NSH app at `Contents/Helpers/MetroUI.app`, then
+  installed it and checked a bounded start and shutdown. Their output was
+  ad hoc signed and named `preview-not-verified-adhoc-*`.
 - An x64 build under Rosetta isn't supported.
 - We never ask anyone to change Gatekeeper.
+- `macos_release.py sign` checks the ad hoc archive, imports the Developer
+  ID identity into a throwaway keychain, signs from the inside out with the
+  hardened runtime and a secure timestamp (never `--deep`), keeps the
+  entitlements (refusing `get-task-allow`), notarizes with
+  `notarytool --wait`, staples and validates the ticket, and re-archives
+  with `"signing": "developer-id"`. It then checks a fresh extraction with
+  `codesign`, `stapler validate` and `spctl`.
 
-## Release signing (protected `master` only)
+## Release signing (protected `main` only)
 
 The pipeline below is implemented and covered by local contract tests. It
-has **never run with real credentials**, so no notarized or signed release
-exists yet. Who may release, which version, and when: `release_policy.py`
-and [docs/deploy.md](../docs/deploy.md#releases-from-master-in-the-source-never-run-with-real-credentials).
+has **never run with real credentials**, so no signed release exists yet.
+Who may release, which version, and when: `release_policy.py` and
+[docs/deploy.md](../docs/deploy.md#releases-from-main-on-a-version-bump-in-the-source-never-run-with-real-credentials).
+Only a push to `main` that changes the version releases.
 
-`ci.yml` passes five repository secrets by name, only to the official
-`master` publication workflow (`release-publish.yml`). There they reach
-only the signing steps of its `macos-sign` job. That job first verifies the
-exact `v<version>` tag and the protected `master` push. It runs separately
-from the build, which runs third-party build code.
+No workflow reads a repository secret. Windows signing, images, the tag and
+Sigstore use GitHub OIDC and the workflow's own token.
 
-| Secret | Contents |
-| --- | --- |
-| `MACOS_SIGNING_P12_BASE64` | Developer ID Application certificate and private key, exported as `.p12`, then base64 |
-| `MACOS_SIGNING_P12_PASSWORD` | The `.p12` export password |
-| `APPLE_NOTARY_KEY_ID` | App Store Connect API key ID |
-| `APPLE_NOTARY_ISSUER_ID` | App Store Connect issuer ID |
-| `APPLE_NOTARY_KEY_P8` | Contents of the `AuthKey_<id>.p8` file |
-
-There's also an optional repository **variable**, `MACOS_SIGNING_TEAM_ID`.
-If you set it, the identity must belong to that team.
-
-What `macos_release.py sign` does:
-
-- It checks the ad hoc archive against its sidecar and `RELEASE.json`.
-- It imports the identity into a throwaway keychain. That keychain is
-  deleted afterwards, and the keychain search list is restored.
-- It signs with the hardened runtime and a secure timestamp, from the
-  inside out: `MetroUI.app`, `metro-server`, `metro-tui`, then `Metro.app`.
-  It never uses `--deep`.
-- It keeps the existing entitlements. It refuses `get-task-allow` instead of
-  dropping it.
-- It submits with `notarytool --wait`, requires `Accepted`, then staples
-  and validates the ticket.
-- It re-archives with a new `RELEASE.json` (`"signing": "developer-id"`) and
-  a new `.sha256`.
-- It extracts that archive again with the system `tar` and checks the copy
-  with `codesign`, `stapler validate` and `spctl`. The stapled ticket is a
-  regular file inside the bundle (`Contents/CodeResources`), so it survives
-  the `.tar.gz` and the installer's move.
-
-The release gate then installs the signed archive and checks the installed
-app the same way. It starts and stops it, and only then uploads
-`dist-desktop-macos-*`.
-
-Missing secrets fail the release run, which lists their names. A release
-never ships without macOS. Ad hoc previews are never renamed into release
-names.
-
-Release order, on an eligible protected `master` push:
+Release order, on an eligible protected `main` push (a version bump):
 
 1. `release.yml` builds and tests every platform. Its Windows seed goes to
    `windows-distribution.yml`.
-2. `release-publish.yml` rechecks eligibility (`release_policy.py authorize`),
-   then runs Windows signing and verification (`windows-sign.yml`).
+2. `release-publish.yml` rechecks the version bump and eligibility
+   (`release_policy.py authorize`), then runs Windows signing and
+   verification (`windows-sign.yml`).
 3. `release_policy.py tag` creates the immutable `v<version>` tag on exactly
    the pushed commit, or accepts it there on a rerun. It's never moved.
-4. `macos-sign` signs, notarizes and gates both Macs.
-5. `release_assets.py` assembles the release. It requires all four desktop
-   archives, the MSI, the runner, the sidecars, the six scripts and
-   `metro-tui` in every desktop archive.
-6. GHCR images are pushed, read back and signed (`release-images.yml`).
-7. `SHA256SUMS` and the Linux archives get Sigstore signatures
-   (`sign-release-assets.yml`), bound to `refs/heads/master` and the commit.
-8. `release_policy.py publish` uploads exactly that set to a staging draft,
+4. `release_assets.py` assembles the release. It requires the Linux and
+   Windows desktop archives, the MSI, the runner, the sidecars, the five
+   scripts and `metro-tui` in every desktop archive, and refuses any macOS
+   archive.
+5. GHCR images are pushed, read back and signed (`release-images.yml`).
+6. `SHA256SUMS` and the Linux archives get Sigstore signatures
+   (`sign-release-assets.yml`), bound to `refs/heads/main` and the commit.
+7. `release_policy.py publish` uploads exactly that set to a staging draft,
    compares every digest GitHub reports, then makes the release public. It
    never overwrites a published release.
