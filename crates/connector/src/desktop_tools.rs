@@ -396,12 +396,23 @@ impl DesktopTools {
         if method != "POST" {
             return Err(ToolsError::new(405, "method_not_allowed", "use POST"));
         }
-        if !body.iter().all(u8::is_ascii_whitespace)
-            && serde_json::from_slice::<serde_json::Map<String, Value>>(body)
-                .map(|m| !m.is_empty())
-                .unwrap_or(true)
-        {
-            return Err(ToolsError::new(422, "invalid", "the body must be {}"));
+        // `{}`, or for reconnect `{"runner_id": "<id>"}`: a runner the
+        // person chose from their own list, named by its id.
+        let fields = if body.iter().all(u8::is_ascii_whitespace) {
+            serde_json::Map::new()
+        } else {
+            serde_json::from_slice::<serde_json::Map<String, Value>>(body)
+                .map_err(|_| ToolsError::new(422, "invalid", "the body must be a JSON object"))?
+        };
+        let choice = match fields.get("runner_id") {
+            None => None,
+            Some(Value::String(id)) if rest == "/reconnect" && hosted::valid_job_id(id) => {
+                Some(id.clone())
+            }
+            Some(_) => return Err(ToolsError::new(422, "invalid", "invalid runner_id")),
+        };
+        if fields.keys().any(|k| k != "runner_id") {
+            return Err(ToolsError::new(422, "invalid", "unknown field"));
         }
         let Some(h) = hosted else {
             self.stop_all().await;
@@ -423,7 +434,7 @@ impl DesktopTools {
         if let Some(sid) = folder_sid {
             return runner::folder_for(&cx, sid).await;
         }
-        runner::reconnect(&mut inner.runner, &cx).await?;
+        runner::reconnect(&mut inner.runner, &cx, choice).await?;
         Ok(self.runner_status(&inner, Some(&h)))
     }
 

@@ -148,6 +148,54 @@ impl Server {
         .0
     }
 
+    /// A registered runner's claim: 204/200 while its token works, 401
+    /// once rotated or revoked.
+    async fn claim(&self, runner_token: &str) -> StatusCode {
+        self.http
+            .post(format!("{}/v1/runner/claim", self.base))
+            .bearer_auth(runner_token)
+            .header("X-Metro-Runner-Protocol", "2")
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap()
+            .status()
+    }
+
+    /// Create a personal runner directly (as Settings would); its id and
+    /// token. The token stays in the test, never in a message.
+    async fn create_runner(&self, token: &str, name: &str) -> (String, String) {
+        let r = self
+            .http
+            .post(format!("{}/v1/runners", self.base))
+            .bearer_auth(token)
+            .json(&json!({"name": name, "visibility": "personal"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::CREATED);
+        let v: Value = r.json().await.unwrap();
+        (
+            v["runner"]["id"].as_str().unwrap().to_owned(),
+            v["token"].as_str().unwrap().to_owned(),
+        )
+    }
+
+    /// Rotate a runner's token directly (as Settings would).
+    async fn rotate(&self, token: &str, id: &str) -> String {
+        let r = self
+            .http
+            .post(format!("{}/v1/runners/{id}/token", self.base))
+            .bearer_auth(token)
+            .json(&json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let v: Value = r.json().await.unwrap();
+        v["token"].as_str().unwrap().to_owned()
+    }
+
     async fn demo(&self, token: &str, sid: &str) -> (StatusCode, Value) {
         self.post(
             token,
@@ -218,6 +266,32 @@ async fn reconnect(t: &DesktopTools, h: &HostedSession) -> (u16, Value) {
         Some(h.clone()),
     )
     .await
+}
+
+/// Reconnect to a runner the person picked by id.
+async fn reconnect_to(t: &DesktopTools, h: &HostedSession, id: &str) -> (u16, Value) {
+    let body = json!({"runner_id": id}).to_string();
+    t.handle(
+        "POST",
+        "/v1/local-tools/runner/reconnect",
+        body.as_bytes(),
+        Some(h.clone()),
+    )
+    .await
+}
+
+/// A record as a crash right after the create call leaves it.
+fn plant(root: &Path, h: &HostedSession, state: RecordState, name: &str, id: Option<&str>) {
+    let r = store::open_root(root).unwrap();
+    let rec = Record {
+        server_url: h.server_url().to_owned(),
+        account_id: h.account_id().to_owned(),
+        name: name.into(),
+        state,
+        runner_id: id.map(str::to_owned),
+        token: None,
+    };
+    runner::save(&r, h, &rec).unwrap();
 }
 
 async fn folder(t: &DesktopTools, h: &HostedSession, sid: &str) -> (u16, Value) {
@@ -295,14 +369,32 @@ async fn created_once_resumed_and_serves_only_attached_spaces() {
     assert_eq!(t.local_runner_id().await.as_deref(), Some(rid.as_str()));
     assert!(same_token(&first, &record(&root, &alice).unwrap()));
 
-    // The owner attaches it to the first Space only.
+    // The owner attaches it to the first Space only. The second Space gets
+    // a different runner with the very same display name: "attached" goes
+    // by the stable id, so it is false there.
     assert_eq!(s.attach(ALICE, &a, &rid).await, StatusCode::OK);
-    let (st, fa) = folder(&t, &alice, &a).await;
-    assert_eq!(st, 200, "{fa}");
+    let name = st["runner"]["name"].as_str().unwrap().to_owned();
+    let (twin, _twin_token) = s.create_runner(ALICE, &name).await;
+    assert_ne!(twin, rid);
+    assert_eq!(s.attach(ALICE, &b, &twin).await, StatusCode::OK);
+    let (code, fa) = folder(&t, &alice, &a).await;
+    assert_eq!(code, 200, "{fa}");
     assert_eq!(fa["attached"], true);
-    let (st, fb) = folder(&t, &alice, &b).await;
-    assert_eq!(st, 200, "{fb}");
-    assert_eq!(fb["attached"], false);
+    let (code, fb) = folder(&t, &alice, &b).await;
+    assert_eq!(code, 200, "{fb}");
+    assert_eq!(fb["attached"], false, "same name, other runner: {fb}");
+    assert_eq!(s.space_runner(ALICE, &b).await["name"], name.as_str());
+    // Back to no runner on the second Space, and the twin removed.
+    let (code, _) = s
+        .send(
+            reqwest::Method::DELETE,
+            ALICE,
+            &format!("/v1/runners/{twin}"),
+            None,
+        )
+        .await;
+    assert_eq!(code, StatusCode::NO_CONTENT);
+    assert!(s.space_runner(ALICE, &b).await.is_null());
     let fa = PathBuf::from(fa["folder"].as_str().unwrap());
     let fb = PathBuf::from(fb["folder"].as_str().unwrap());
     assert!(fa.starts_with(&root) && fb.starts_with(&root));
@@ -318,6 +410,7 @@ async fn created_once_resumed_and_serves_only_attached_spaces() {
 
     // Attached to the second Space too: its own folder only.
     assert_eq!(s.attach(ALICE, &b, &rid).await, StatusCode::OK);
+    assert_eq!(folder(&t, &alice, &b).await.1["attached"], true);
     let (st, v) = s.demo(ALICE, &b).await;
     assert_eq!(st, StatusCode::ACCEPTED, "{v}");
     let r = s.wait_tool_result(ALICE, &b, 1).await.to_string();
@@ -445,70 +538,141 @@ async fn an_active_record_whose_runner_is_gone_is_marked_deleted() {
 }
 
 #[tokio::test]
-async fn interrupted_creation_is_finished_by_name_or_left_alone() {
+async fn a_lost_create_is_never_rotated_by_name_even_after_the_owner_rotated() {
     let s = Server::start().await;
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("local-tools");
     let alice = s.hosted(ALICE, "alice");
 
-    // The create call reached the server but its answer was lost.
-    let creating = |name: &str| Record {
-        server_url: alice.server_url().to_owned(),
-        account_id: "alice".into(),
-        name: name.into(),
-        state: RecordState::Creating,
-        runner_id: None,
-        token: None,
-    };
-    {
-        let r = store::open_root(&root).unwrap();
-        runner::save(
-            &r,
-            &alice,
-            &creating("Metro desktop on this computer (aaaaaa)"),
-        )
-        .unwrap();
-    }
-    let (st, v) = s
-        .post(
-            ALICE,
-            "/v1/runners",
-            json!({"name": "Metro desktop on this computer (aaaaaa)", "visibility": "personal"}),
-        )
-        .await;
-    assert_eq!(st, StatusCode::CREATED, "{v}");
-    let rid = v["runner"]["id"].as_str().unwrap().to_owned();
-    let t = tools(&root, Marker::Accepted);
-    t.resume(alice.clone()).await;
-    wait_state(&t, &alice, "online").await;
-    assert_eq!(t.local_runner_id().await.as_deref(), Some(rid.as_str()));
-    assert_eq!(s.personal_runners(ALICE).await.len(), 1, "no duplicate");
-    t.stop_all().await;
+    // The create reached the server but its answer was lost (crash). The
+    // owner later found the runner in Settings and rotated its token.
+    let name = "Metro desktop on this computer (aaaaaa)";
+    plant(&root, &alice, RecordState::Creating, name, None);
+    let (id, _lost) = s.create_runner(ALICE, name).await;
+    let owners = s.rotate(ALICE, &id).await;
 
-    // Lost before it reached the server: not found, so stop as interrupted
-    // rather than risk a duplicate.
-    let dir2 = tempfile::tempdir().unwrap();
-    let root2 = dir2.path().join("local-tools");
-    {
-        let r = store::open_root(&root2).unwrap();
-        runner::save(
-            &r,
-            &alice,
-            &creating("Metro desktop on this computer (bbbbbb)"),
-        )
-        .unwrap();
-    }
-    let t = tools(&root2, Marker::Accepted);
+    // Start: interrupted, nothing rotated, nothing created.
+    let t = tools(&root, Marker::Accepted);
     t.resume(alice.clone()).await;
     let v = runner_status(&t, Some(&alice)).await;
     assert_eq!(v["state"], "interrupted", "{v}");
-    assert_eq!(s.personal_runners(ALICE).await.len(), 1);
+    assert_eq!(v["unconfirmed_name"], name);
+    assert!(v["runner"].is_null(), "{v}");
+    assert_eq!(v["can_reconnect"], true);
+    assert_eq!(t.local_runner_id().await, None);
+    assert_eq!(
+        s.claim(&owners).await,
+        StatusCode::NO_CONTENT,
+        "owner's token untouched"
+    );
+    assert_eq!(
+        record(&root, &alice).unwrap().state,
+        RecordState::Interrupted
+    );
+    // Again (token refresh, restart): still nothing.
     t.resume(alice.clone()).await;
+    t.stop_all().await;
+    let t = tools(&root, Marker::Accepted);
+    t.resume(alice.clone()).await;
+    assert_eq!(
+        runner_status(&t, Some(&alice)).await["state"],
+        "interrupted"
+    );
+    assert_eq!(s.claim(&owners).await, StatusCode::NO_CONTENT);
     assert_eq!(s.personal_runners(ALICE).await.len(), 1);
-    // The person finishes it explicitly.
-    let (st, v) = reconnect(&t, &alice).await;
-    assert_eq!(st, 200, "{v}");
+
+    // Explicit reconnect without a choice: no known id, so a new runner;
+    // the same-named one is left alone.
+    let (code, v) = reconnect(&t, &alice).await;
+    assert_eq!(code, 200, "{v}");
     wait_state(&t, &alice, "online").await;
+    let new_id = t.local_runner_id().await.unwrap();
+    assert_ne!(new_id, id);
+    assert_eq!(s.claim(&owners).await, StatusCode::NO_CONTENT);
+    assert_eq!(s.personal_runners(ALICE).await.len(), 2);
+    t.stop_all().await;
+}
+
+#[tokio::test]
+async fn duplicate_names_are_never_picked_and_an_explicit_id_is() {
+    let s = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-tools");
+    let alice = s.hosted(ALICE, "alice");
+    let name = "Metro desktop on this computer (dddddd)";
+    plant(&root, &alice, RecordState::Creating, name, None);
+    let (first, first_token) = s.create_runner(ALICE, name).await;
+    let (second, second_token) = s.create_runner(ALICE, name).await;
+
+    let t = tools(&root, Marker::Accepted);
+    t.resume(alice.clone()).await;
+    let v = runner_status(&t, Some(&alice)).await;
+    assert_eq!(v["state"], "interrupted", "{v}");
+    assert_eq!(s.claim(&first_token).await, StatusCode::NO_CONTENT);
+    assert_eq!(s.claim(&second_token).await, StatusCode::NO_CONTENT);
+
+    // A runner that isn't the person's own can't be chosen.
+    let (bob_runner, _) = s.create_runner(BOB, name).await;
+    let (code, v) = reconnect_to(&t, &alice, &bob_runner).await;
+    assert_eq!(code, 404, "{v}");
+    let (code, _) = t
+        .handle(
+            "POST",
+            "/v1/local-tools/runner/reconnect",
+            br#"{"runner_id":"../x"}"#,
+            Some(alice.clone()),
+        )
+        .await;
+    assert_eq!(code, 422);
+
+    // The person picks the second one by id: exactly that one is rotated.
+    let (code, v) = reconnect_to(&t, &alice, &second).await;
+    assert_eq!(code, 200, "{v}");
+    wait_state(&t, &alice, "online").await;
+    assert_eq!(t.local_runner_id().await.as_deref(), Some(second.as_str()));
+    assert_eq!(s.claim(&second_token).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        s.claim(&first_token).await,
+        StatusCode::NO_CONTENT,
+        "the other is untouched"
+    );
+    // While it runs, another choice is refused.
+    let (code, _) = reconnect_to(&t, &alice, &first).await;
+    assert_eq!(code, 409);
+    assert_eq!(s.personal_runners(ALICE).await.len(), 2);
+    t.stop_all().await;
+}
+
+#[tokio::test]
+async fn a_known_id_is_kept_and_reconnect_rotates_only_that_runner() {
+    let s = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-tools");
+    let alice = s.hosted(ALICE, "alice");
+    // Created and its id learned, but the token couldn't be saved; a
+    // same-named runner also exists.
+    let name = "Metro desktop on this computer (eeeeee)";
+    let (known, known_token) = s.create_runner(ALICE, name).await;
+    let (_twin, twin_token) = s.create_runner(ALICE, name).await;
+    plant(&root, &alice, RecordState::Interrupted, name, Some(&known));
+
+    let t = tools(&root, Marker::Accepted);
+    t.resume(alice.clone()).await;
+    let v = runner_status(&t, Some(&alice)).await;
+    assert_eq!(v["state"], "interrupted", "{v}");
+    assert_eq!(v["runner"]["id"], known.as_str(), "known id kept: {v}");
+    assert_eq!(
+        s.claim(&known_token).await,
+        StatusCode::NO_CONTENT,
+        "not rotated on its own"
+    );
+
+    let (code, v) = reconnect(&t, &alice).await;
+    assert_eq!(code, 200, "{v}");
+    wait_state(&t, &alice, "online").await;
+    assert_eq!(t.local_runner_id().await.as_deref(), Some(known.as_str()));
+    assert_eq!(s.claim(&known_token).await, StatusCode::UNAUTHORIZED);
+    assert_eq!(s.claim(&twin_token).await, StatusCode::NO_CONTENT);
     assert_eq!(s.personal_runners(ALICE).await.len(), 2);
     t.stop_all().await;
 }

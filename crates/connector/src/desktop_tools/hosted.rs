@@ -250,6 +250,37 @@ impl Hosted {
         })
     }
 
+    /// The stable id of the registered runner attached to `sid`, if one is
+    /// (`None` for no runner or a dedicated token). Display names are never
+    /// used to identify a runner.
+    pub async fn space_runner_id(
+        &self,
+        session: &Secret,
+        sid: &str,
+    ) -> Result<Option<String>, CallError> {
+        let (s, _, v) = self
+            .send(
+                reqwest::Method::GET,
+                &format!("/v1/spaces/{sid}/runner"),
+                session,
+                &[],
+                None,
+                MAX_BODY,
+            )
+            .await?;
+        if s != 200 {
+            return Err(Self::classify(s, &v));
+        }
+        let r = v.get("runner").cloned().unwrap_or(Value::Null);
+        if r.get("kind").and_then(Value::as_str) != Some("registered") {
+            return Ok(None);
+        }
+        Ok(r.get("id")
+            .and_then(Value::as_str)
+            .filter(|i| valid_job_id(i))
+            .map(str::to_owned))
+    }
+
     /// `POST /v1/spaces/{sid}/runner-token` with `If-None-Match: *`: a new
     /// dedicated token and its ETag, only if the Space has no runner.
     pub async fn issue_guarded(

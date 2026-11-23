@@ -23,11 +23,18 @@
 //!   /v1/local-tools/runner/reconnect`) issues a new token or runner. An
 //!   installer update changes nothing here: the record lives in the desktop
 //!   root, not in the install folder.
-//! - **Crash-safe creation.** A `creating` record (with a unique runner
-//!   name) is written before the create call. If the answer is lost, the
-//!   next start looks for exactly that name and, if found, rotates its token
-//!   (nobody else ever held one); if not found it stops as `interrupted`
-//!   rather than create another runner.
+//! - **Runners are identified by id only.** A display name never identifies
+//!   a runner: names can repeat, and anyone with the runner can rename or
+//!   reuse one. Nothing is ever rotated, adopted or reported as attached
+//!   because of its name.
+//! - **Uncertain creation stops.** A `creating` record is written before the
+//!   create call. If its answer is lost (or the app stops in between), the
+//!   runner may or may not exist and its id is unknown, so the record
+//!   becomes `interrupted`, keeping any id it did learn, and nothing is
+//!   rotated or created on its own. The person recovers explicitly: reconnect
+//!   with the id of a runner they choose from their own list, or without one
+//!   to rotate the recorded id (if known and still theirs) or create a new
+//!   runner.
 //! - **No Space is attached by Metro.** The Space owner attaches it in the
 //!   existing Space runner settings. Metro never attaches, detaches or
 //!   replaces any Space's runner.
@@ -58,7 +65,7 @@ use tokio::sync::watch;
 use zeroize::Zeroize;
 
 use super::folder::Folder;
-use super::hosted::{CallError, Claim, CreateError, Hosted, Job, RunnerInfo, SpaceRunner};
+use super::hosted::{CallError, Claim, CreateError, Hosted, Job, RunnerInfo};
 use super::store::{read_capped, subdir, valid_space_id, write_atomic};
 use super::{HostedSession, ToolsError, from_call};
 use crate::Secret;
@@ -490,9 +497,10 @@ const REVOKED: &str = "This computer's runner is no longer accepted by the local
      its own; reconnect it to continue.";
 const DELETED: &str = "This computer's runner was deleted from the local Metro server. Metro \
      doesn't recreate it on its own; reconnect it to create a new one.";
-const INTERRUPTED: &str = "Setting up this computer's runner was interrupted and Metro couldn't \
-     confirm it was created. To avoid duplicates it won't try again on its own; reconnect it to \
-     finish.";
+const INTERRUPTED: &str = "Setting up this computer's runner was interrupted, so Metro can't \
+     tell which runner (if any) was created. It won't guess or try again on its own. Reconnect to \
+     finish: choose the runner from your runner list, or create a new one (then delete any \
+     unused runner in Settings).";
 
 fn note(state: RunnerState, detail: Option<&str>) -> Note {
     Note {
@@ -627,11 +635,16 @@ pub fn status(
     v["available"] = json!(true);
     v["spaces_folder"] =
         json!(spaces_path(root_path, &h.server_url, &h.account_id).to_string_lossy());
-    if let Some(id) = rec
-        .as_ref()
-        .and_then(|r| r.runner_id.as_ref().map(|i| (i, &r.name)))
-    {
-        v["runner"] = json!({"id": id.0, "name": id.1});
+    if let Some(r) = rec.as_ref() {
+        match &r.runner_id {
+            Some(id) => v["runner"] = json!({"id": id, "name": r.name}),
+            // The name an unconfirmed creation asked for: only a hint for
+            // the person, never used to pick a runner.
+            None if r.state != RecordState::Active => {
+                v["unconfirmed_name"] = json!(r.name);
+            }
+            None => {}
+        }
     }
     v["can_reconnect"] = json!(!slot.worker.as_ref().is_some_and(Handle::live));
     v
@@ -696,7 +709,7 @@ pub async fn ensure(slot: &mut Slot, cx: &Ctx<'_>) {
     match rec {
         None => provision(slot, cx).await,
         Some(r) => match r.state {
-            RecordState::Creating => recover(slot, cx, r).await,
+            RecordState::Creating => interrupt(slot, cx, r),
             RecordState::Active => start(slot, cx, r).await,
             RecordState::Revoked => slot.set(note(RunnerState::Revoked, Some(REVOKED))),
             RecordState::Deleted => slot.set(note(RunnerState::Deleted, Some(DELETED))),
@@ -705,10 +718,19 @@ pub async fn ensure(slot: &mut Slot, cx: &Ctx<'_>) {
     }
 }
 
-/// The person explicitly asks to reconnect: issue a new token for the same
-/// runner if it still exists, else create a new one. Idempotent while the
-/// runner is running.
-pub(super) async fn reconnect(slot: &mut Slot, cx: &Ctx<'_>) -> Result<(), ToolsError> {
+/// The person explicitly asks to reconnect. Idempotent while the runner
+/// runs. Otherwise, by id only, never by name:
+///
+/// - `choice`: a runner id the person picked from their own runner list;
+///   it gets a new token and becomes this computer's runner.
+/// - no `choice`: the recorded runner id, if any and still theirs, gets a
+///   new token; with no usable id (deleted, or a creation whose answer was
+///   lost) a new runner is created.
+pub(super) async fn reconnect(
+    slot: &mut Slot,
+    cx: &Ctx<'_>,
+    choice: Option<String>,
+) -> Result<(), ToolsError> {
     if !cx.marker.accepted() {
         return Err(ToolsError::new(
             409,
@@ -717,7 +739,14 @@ pub(super) async fn reconnect(slot: &mut Slot, cx: &Ctx<'_>) -> Result<(), Tools
         ));
     }
     if slot.worker.as_ref().is_some_and(Handle::live) {
-        return Ok(());
+        return match (&choice, running_id(slot)) {
+            (Some(c), Some(id)) if c != id => Err(ToolsError::new(
+                409,
+                "runner_running",
+                "This computer's runner is already running.",
+            )),
+            _ => Ok(()),
+        };
     }
     if let Some(w) = slot.worker.take() {
         w.stop().await;
@@ -725,43 +754,78 @@ pub(super) async fn reconnect(slot: &mut Slot, cx: &Ctx<'_>) -> Result<(), Tools
     let rec = cx
         .load()
         .map_err(|_| super::fs_error("read the runner's record"))?;
-    let Some(rec) = rec else {
+    if let Some(r) = rec.as_ref().filter(|r| r.state == RecordState::Active) {
+        if choice
+            .as_ref()
+            .is_some_and(|c| Some(c) != r.runner_id.as_ref())
+        {
+            return Err(ToolsError::new(
+                409,
+                "runner_running",
+                "This computer already has a working runner.",
+            ));
+        }
+        start(slot, cx, r.clone()).await;
+        return failed_as_error(slot);
+    }
+    let target = choice
+        .clone()
+        .or_else(|| rec.as_ref().and_then(|r| r.runner_id.clone()));
+    let Some(target) = target else {
         provision(slot, cx).await;
-        return Ok(());
+        return failed_as_error(slot);
     };
-    match rec.state {
-        RecordState::Creating => recover(slot, cx, rec).await,
-        RecordState::Active => start(slot, cx, rec).await,
-        RecordState::Revoked | RecordState::Deleted | RecordState::Interrupted => {
-            let list = cx
-                .api
-                .personal_runners(&cx.hosted.token)
-                .await
-                .map_err(from_call)?;
-            let same = list.iter().find(|r| {
-                Some(&r.id) == rec.runner_id.as_ref()
-                    || (rec.runner_id.is_none() && r.name == rec.name)
+    let list = cx
+        .api
+        .personal_runners(&cx.hosted.token)
+        .await
+        .map_err(from_call)?;
+    // Ids are unique on the server; exactly one or none.
+    match list.into_iter().find(|r| r.id == target) {
+        Some(info) => {
+            let base = rec.unwrap_or_else(|| Record {
+                server_url: cx.hosted.server_url.clone(),
+                account_id: cx.hosted.account_id.clone(),
+                name: info.name.clone(),
+                state: RecordState::Interrupted,
+                runner_id: None,
+                token: None,
             });
-            match same {
-                Some(info) => {
-                    let info = info.clone();
-                    rotate_into(slot, cx, &rec, &info).await?;
-                }
-                None => provision(slot, cx).await,
-            }
+            rotate_into(slot, cx, &base, &info).await?;
+            Ok(())
+        }
+        None if choice.is_some() => Err(ToolsError::new(
+            404,
+            "not_found",
+            "That runner isn't one of your personal runners.",
+        )),
+        None => {
+            provision(slot, cx).await;
+            failed_as_error(slot)
         }
     }
-    match slot.last.as_ref().map(|n| n.state) {
-        Some(RunnerState::Failed) if slot.worker.is_none() => Err(ToolsError::new(
+}
+
+fn failed_as_error(slot: &Slot) -> Result<(), ToolsError> {
+    match slot.last.as_ref() {
+        Some(n) if n.state == RunnerState::Failed && slot.worker.is_none() => Err(ToolsError::new(
             502,
             "runner_failed",
-            slot.last
-                .as_ref()
-                .and_then(|n| n.detail.clone())
-                .unwrap_or_default(),
+            n.detail.clone().unwrap_or_default(),
         )),
         _ => Ok(()),
     }
+}
+
+/// An unconfirmed creation: stop as interrupted, keep any id we know.
+fn interrupt(slot: &mut Slot, cx: &Ctx<'_>, rec: Record) {
+    let mut r = rec;
+    r.state = RecordState::Interrupted;
+    r.token = None;
+    if cx.save(&r).is_err() {
+        return fs_failed(slot, "save its record");
+    }
+    slot.set(note(RunnerState::Interrupted, Some(INTERRUPTED)));
 }
 
 async fn start(slot: &mut Slot, cx: &Ctx<'_>, rec: Record) {
@@ -816,9 +880,9 @@ async fn provision(slot: &mut Slot, cx: &Ctx<'_>) {
             rec.runner_id = Some(info.id.clone());
             rec.token = Some(token.clone());
             if cx.save(&rec).is_err() {
-                // Nobody could use it: take it back if we can. If that fails
-                // too, the `creating` record lets the next start find it by
-                // its name.
+                // Nobody could use it: take it back if we can. If not, try
+                // to remember its id (without a token) so the person can
+                // reconnect to exactly that runner.
                 if cx
                     .api
                     .delete_runner(&cx.hosted.token, &info.id)
@@ -826,6 +890,10 @@ async fn provision(slot: &mut Slot, cx: &Ctx<'_>) {
                     .is_ok()
                 {
                     let _ = cx.remove();
+                } else {
+                    rec.state = RecordState::Interrupted;
+                    rec.token = None;
+                    let _ = cx.save(&rec);
                 }
                 return fs_failed(slot, "save its token");
             }
@@ -848,45 +916,10 @@ async fn provision(slot: &mut Slot, cx: &Ctx<'_>) {
         Err(CreateError {
             definite: false, ..
         }) => {
-            // The answer was lost: the runner may or may not exist.
-            recover(slot, cx, rec).await;
+            // The answer was lost: the runner may or may not exist, and its
+            // id is unknown. Don't guess.
+            interrupt(slot, cx, rec);
         }
-    }
-}
-
-/// A `creating` record: find exactly that runner by its unique name and
-/// give it a token we hold; if it isn't there, stop as interrupted.
-async fn recover(slot: &mut Slot, cx: &Ctx<'_>, rec: Record) {
-    let list = match cx.api.personal_runners(&cx.hosted.token).await {
-        Ok(l) => l,
-        Err(e) => {
-            slot.set(note(
-                RunnerState::Offline,
-                Some(&format!(
-                    "Metro couldn't finish setting up this computer's runner and will check \
-                     again next time: {}",
-                    e.message()
-                )),
-            ));
-            return;
-        }
-    };
-    let found: Vec<&RunnerInfo> = list.iter().filter(|r| r.name == rec.name).collect();
-    if found.len() != 1 {
-        let mut r = rec;
-        r.state = RecordState::Interrupted;
-        let _ = cx.save(&r);
-        slot.set(note(RunnerState::Interrupted, Some(INTERRUPTED)));
-        return;
-    }
-    let info = found[0].clone();
-    if let Err(e) = rotate_into(slot, cx, &rec, &info).await
-        && e.code == "not_found"
-    {
-        let mut r = rec;
-        r.state = RecordState::Interrupted;
-        let _ = cx.save(&r);
-        slot.set(note(RunnerState::Interrupted, Some(INTERRUPTED)));
     }
 }
 
@@ -955,11 +988,13 @@ pub(super) async fn folder_for(cx: &Ctx<'_>, sid: &str) -> Result<Value, ToolsEr
     {
         return Err(ToolsError::new(404, "not_found", "no such Space"));
     }
-    let attached = match cx.api.space_runner(&cx.hosted.token, sid).await {
-        Ok(SpaceRunner::Registered(name)) => name == crate::secret::clean_line(&rec.name, 80),
-        Ok(_) => false,
-        Err(e) => return Err(from_call(e)),
-    };
+    // By the stable runner id, never by display name.
+    let attached = cx
+        .api
+        .space_runner_id(&cx.hosted.token, sid)
+        .await
+        .map_err(from_call)?
+        .is_some_and(|id| Some(&id) == rec.runner_id.as_ref());
     {
         let _g = cx.store_lock.lock();
         space_folder(cx.root, cx.hosted, sid)
