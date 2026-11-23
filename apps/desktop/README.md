@@ -209,6 +209,13 @@ private folder on this computer, per Space, while Metro is open.
   **Documents & media** (your indexed files), and no second query field.
   A result opens your Chat, or the room or thread it came from, if you're
   still a member. Results show no raw scores.
+  *In development, not in the app yet:* quick search as you type. After
+  a short pause, it sends a literal lookup to your Metro server only (no
+  indexing, embedding, reranking or model). It shows a bounded, scrollable
+  list of matching messages and files (with file names and extensions)
+  from your personal Chat and library and the Spaces you can access now.
+  Choosing one opens it, and **More results** opens full search with the
+  query. **Return** with nothing chosen still runs full semantic search.
 - **Library** (sidebar): your personal library and the files of Spaces
   you're in. **Upload**, then **Open** on each row. The row's **More** menu
   holds **Index** (or **Index again**), and **Delete…** for the uploader or

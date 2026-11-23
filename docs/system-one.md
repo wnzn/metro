@@ -275,6 +275,22 @@ sends nothing. Only Return runs the search. Search opens in
     notice says why.
 - When the search is partial, the app says so and offers **Index more**.
 
+**Quick search as you type: in development.** It isn't in the app yet and
+hasn't been verified. As planned:
+
+- After a short pause in typing, the app sends a **literal** (exact-text)
+  lookup of what you typed to your Metro server. It doesn't index, embed,
+  rerank or call any model, and nothing goes to a connection.
+- Suggestions appear in a bounded, scrollable list under the search box.
+  They cover only what you can read at that moment: your personal Chat and
+  library, and the Spaces you're a member of. Files show their name and
+  extension.
+- Choosing a suggestion opens that message or file. **More results**, at
+  the end of the list, opens full search with your query. **Return** with
+  no suggestion chosen still runs the full semantic search described here.
+
+Until it ships, typing sends nothing, as described above.
+
 The [screenshot](screenshots/semantic-search.png) is historical: it shows
 the 0.2.0-era page, with a query field and button on the page and a score
 label on each result (*System One relevance 0.95*, *similarity 0.81*, or

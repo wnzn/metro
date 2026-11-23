@@ -485,7 +485,11 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 > **Save**). There you'll also find **Where your files go**. To search files, type in the search box at the
 > top of the window (on the Library page it searches documents and media)
 > and press **Return**, or choose **Documents & media** in Search. Typing
-> sends nothing, and only Return runs the search. Results show no raw
+> sends nothing, and only Return runs the search. (A quick search as you
+> type is in development and not in the app yet. As planned, it sends only
+> a literal lookup to your Metro server, never to a
+> model, and **Return** still runs this search. See
+> [system-one.md](system-one.md#semantic-search).) Results show no raw
 > scores, and matches with no measurable similarity are folded away.
 > The Library page, the media model in Settings, and Return-only search
 > with its scope and type filters were checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. It isn't a release,
