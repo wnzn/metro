@@ -45,6 +45,59 @@ def inspect(*names):
     return read_json(*DOCKER, "inspect", *names)
 
 
+def check_mounts(container, service, project):
+    host = container["HostConfig"]
+    tmpfs = {"/tmp", "/home/runner"} if service == "runner" else {"/tmp"}
+    allowed = {"/state", "/runner"} if service == "runner" else set()
+    require(set(host.get("Tmpfs") or {}) <= tmpfs and not host.get("VolumesFrom"),
+            f"{service} has unexpected tmpfs or inherited mounts")
+    mounts = {}
+    for mount in container["Mounts"] or []:
+        target = mount["Destination"]
+        require(target not in mounts, f"{service} has overlapping mount definitions")
+        mounts[target] = mount
+        # Legacy HostConfig.Tmpfs entries need not appear here.
+        require((mount["Type"] == "tmpfs" and target in tmpfs)
+                or (mount["Type"] == "volume" and target in allowed),
+                f"{service} has an unexpected effective mount; host paths and Docker sockets are forbidden")
+    volumes = {target: mount for target, mount in mounts.items() if mount["Type"] == "volume"}
+    require(set(volumes) == allowed, f"{service} does not have the expected Docker volumes")
+
+    # Compose 2.38.2 sends named local volumes as NAME:TARGET:rw in
+    # HostConfig.Binds. Allow only an exact match to an effective volume.
+    # Newer Compose may use the typed HostConfig.Mounts API instead.
+    bind_entries = {f'{m["Name"]}:{target}:rw' for target, m in volumes.items()}
+    require(set(host.get("Binds") or []) <= bind_entries, f"{service} has an unexpected legacy bind entry")
+    for mount in host.get("Mounts") or []:
+        target = mount["Target"]
+        kind = mount["Type"]
+        source = mount.get("Source", "")
+        require((kind == "tmpfs" and target in tmpfs and not source)
+                or (kind == "volume" and target in volumes
+                    and (source == volumes[target]["Name"] or (target == "/runner" and not source))),
+                f"{service} has an unexpected structured mount")
+    if service != "runner":
+        return
+
+    state_name = f"{project}-state"
+    require(volumes["/state"]["Name"] == state_name, "runner is not using the test state volume")
+    require(re.fullmatch(r"[a-f0-9]{64}", volumes["/runner"]["Name"]),
+            "runner scratch storage is not an anonymous Docker volume")
+    for target, mount in volumes.items():
+        require(mount["Driver"] == "local" and mount["RW"] is True, f"{target} must be a writable local volume")
+        # Even Driver=local can bind a host directory via driver_opts
+        # (type=none,o=bind,device=/host/path). Inspect the actual volume.
+        volume, = read_json(*DOCKER, "volume", "inspect", mount["Name"])
+        require(volume["Name"] == mount["Name"] and volume["Mountpoint"] == mount["Source"]
+                and volume["Driver"] == "local" and volume["Scope"] == "local" and not volume["Options"],
+                f"{target} is not a plain Docker-managed local volume; driver options and host backing are forbidden")
+        if target == "/state":
+            labels = volume["Labels"] or {}
+            require(labels.get("com.docker.compose.project") == project
+                    and labels.get("com.docker.compose.volume") == "state",
+                    "runner state volume does not belong to this test project")
+
+
 def check_containers(containers, project):
     for service, uid in (("runner", "1001"), ("egress", "65532")):
         container = containers[service]
@@ -53,21 +106,18 @@ def check_containers(containers, project):
         require(host["ReadonlyRootfs"] and not host["Privileged"], f"{service} has excess host privileges")
         require("ALL" in host["CapDrop"] and "no-new-privileges:true" in host["SecurityOpt"],
                 f"{service} has lost containment options")
-        require(not host["Binds"] and not host["PortBindings"] and not host["PublishAllPorts"],
-                f"{service} must not bind host paths or publish ports")
+        net = container["NetworkSettings"]
+        # Engine reports exposed but unpublished ports as e.g. {"3128/tcp": null}.
+        require(not host["PortBindings"] and not host["PublishAllPorts"] and not any((net.get("Ports") or {}).values()),
+                f"{service} must not publish ports")
         require(not host.get("CapAdd") and not host.get("Devices") and not host.get("DeviceRequests")
                 and host.get("PidMode") != "host" and host.get("IpcMode") != "host",
                 f"{service} must not access host devices or share host namespaces")
         require(not any(SENSITIVE.search(var.partition("=")[0]) for var in cfg["Env"] or []),
                 f"{service} has a credential-like environment variable")
-        mounts = {m["Destination"]: m for m in container["Mounts"] if m["Type"] != "tmpfs"}
-        allowed = {"/runner", "/state"} if service == "runner" else set()
-        require(set(mounts) == allowed and all(m["Type"] == "volume" for m in mounts.values()),
-                f"{service} must not mount any host paths, including the Docker socket")
-        if service == "runner":
-            require(mounts["/state"]["Name"] == f"{project}-state", "runner is not using the test state volume")
+        check_mounts(container, service, project)
         networks = {f"{project}-jobs"} | ({f"{project}-out"} if service == "egress" else set())
-        require(set(container["NetworkSettings"]["Networks"]) == networks and host["NetworkMode"] != "host",
+        require(set(net["Networks"] or {}) == networks and host["NetworkMode"] in networks,
                 f"{service} is attached to an unexpected network")
 
 
@@ -167,6 +217,10 @@ test -x /opt/actions-runner/bin/Runner.Listener
 git --version
 printf 'Pinned NSH CLI: '
 nsh --version | grep -Ex 'nsh 0\.6\.1 \([0-9a-f]+\)'
+test "$NSH_TSC" = /opt/typescript/lib/tsc
+test -x "$NSH_TSC"
+printf 'Pinned offline TypeScript: '
+"$NSH_TSC" --version | grep -Fx 'Version 7.0.2'
 dir="$(mktemp -d)"
 cd "$dir"
 cat > App.tsx <<'TSX'
@@ -219,7 +273,7 @@ def exercise(compose, project):
     unregistered()
     jobs = read_json(*DOCKER, "network", "inspect", f"{project}-jobs")[0]
     require(jobs["Driver"] == "bridge" and jobs["Internal"] and not jobs["EnableIPv6"]
-            and jobs["Options"]["com.docker.network.bridge.gateway_mode_ipv4"] == "isolated",
+            and (jobs["Options"] or {}).get("com.docker.network.bridge.gateway_mode_ipv4") == "isolated",
             "jobs network is not an isolated internal bridge")
 
     network_checks(compose, project)
@@ -233,6 +287,7 @@ def exercise(compose, project):
     retained = read_json(*DOCKER, "volume", "inspect", f"{project}-state")[0]
     require(retained["Labels"]["com.docker.compose.project"] == project, "test state volume was not retained")
     run(*compose, "up", "-d", "--no-build", "--wait", "--wait-timeout", "90")
+    check_containers(containers(), project)
     unregistered("preflight-marker")
     require(exec_runner("cat", "/state/preflight-marker", capture=True).strip() == marker, "state did not survive down/up")
     print("Stack, offline Native Shell fixture, and unregistered state persistence passed", flush=True)
