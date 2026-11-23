@@ -5,14 +5,16 @@ name: Windows signing
 # ci.yml on master, building exactly github.sha. Tags, pull requests and other
 # branches are refused by the guard job, by a job-level `if:` on both signing
 # jobs (before any runner, including a self-hosted one, is assigned) and by
-# winsign.py release-context before any credential is touched. Called only by
+# winsign.py release-context before any credential is touched. There is no
+# version-tag lookup: Windows signs the pinned commit before tag creation. Called only by
 # release-publish.yml, in the same workflow run as windows-distribution.yml
 # (release: true), with
 #   permissions: { contents: read, id-token: write }
 # No triggers of its own and no secrets: Azure Artifact Signing authenticates
 # with GitHub OIDC; the kms backend uses a certificate pre-provisioned in the
 # HSM/KSP of a restricted self-hosted runner. Configuration lives in the
-# protected `windows-release-signing` environment and repository variables;
+# protected `windows-release-signing` environment (only the literal `master`
+# branch, no tag rule; verified before either signing job) and repository variables;
 # see packaging/windows-signing/README.md.
 #
 # Input: unsigned-desktop-windows-x64 (exactly the verified seed ZIP + .sha256).
@@ -58,6 +60,18 @@ jobs:
           set -eu
           python3 -I packaging/windows-signing/winsign.py release-context --version "$VERSION" --head "$(git rev-parse HEAD)" >/dev/null
           case "$BACKEND" in azure|kms) ;; *) echo "METRO_WINDOWS_SIGNING_BACKEND must be azure or kms" >&2; exit 1 ;; esac
+      - name: Require the signing environment to allow only the master branch and no tags
+        run: |
+          set -eu
+          url=https://api.github.com/repos/wnzn/metro/environments/windows-release-signing
+          get_policy() {
+            curl --fail --silent --show-error --retry 3 \
+              -H 'Accept: application/vnd.github+json' -H 'X-GitHub-Api-Version: 2022-11-28' "$@"
+          }
+          get_policy "$url" -o "$RUNNER_TEMP/signing-environment.json"
+          get_policy "$url/deployment-branch-policies" -o "$RUNNER_TEMP/signing-policies.json"
+          python3 -I packaging/windows-signing/winsign.py signing-environment \
+            --environment "$RUNNER_TEMP/signing-environment.json" --policies "$RUNNER_TEMP/signing-policies.json"
       - name: Signing helper tests
         run: python3 -B -m unittest discover -s packaging/windows-signing -v
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -78,7 +92,11 @@ jobs:
   # SignTool on files the verifier staged under the job's own temp directory.
   sign:
     needs: guard
-    if: github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master' && github.ref_protected && !github.event.deleted && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
+    if: >-
+      github.event_name == 'push' && github.repository == 'wnzn/metro' && github.repository_id == '1467654868' &&
+      github.ref == 'refs/heads/master' && github.ref_type == 'branch' && github.ref_protected &&
+      toJSON(github.event.deleted) == 'false' && github.event.after == github.sha &&
+      github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
     runs-on: ${{ vars.METRO_WINDOWS_SIGNING_BACKEND == 'kms' && fromJSON(vars.METRO_WINDOWS_SIGNING_RUNNER) || 'windows-2025' }}
     environment: windows-release-signing
     permissions:
@@ -199,7 +217,11 @@ jobs:
   # Signs exactly the MSI checked above, matched by hash.
   sign-msi:
     needs: [guard, msi]
-    if: github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master' && github.ref_protected && !github.event.deleted && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
+    if: >-
+      github.event_name == 'push' && github.repository == 'wnzn/metro' && github.repository_id == '1467654868' &&
+      github.ref == 'refs/heads/master' && github.ref_type == 'branch' && github.ref_protected &&
+      toJSON(github.event.deleted) == 'false' && github.event.after == github.sha &&
+      github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
     runs-on: ${{ vars.METRO_WINDOWS_SIGNING_BACKEND == 'kms' && fromJSON(vars.METRO_WINDOWS_SIGNING_RUNNER) || 'windows-2025' }}
     environment: windows-release-signing
     permissions:

@@ -1,46 +1,64 @@
 name: Release images
 
-# Reusable, tag-only workflow that builds, smoke-tests, publishes, signs and
-# verifies Metro's container images. It has no triggers of its own.
+# Reusable workflow that builds, smoke-tests, publishes, signs and verifies
+# Metro's container images. It has no triggers of its own.
 #
-# Interface (for the caller, e.g. ci.yml on a v* tag push):
+# Publishing happens only for a push to the protected branch `master` of
+# wnzn/metro, run by .github/workflows/ci.yml. Manually pushed tags, other
+# branches, forks, pull requests and manual runs never write an image. The
+# release pipeline creates the immutable tag v<version> at the triggering
+# github.sha BEFORE calling this workflow; with push: true this workflow only
+# checks that the tag exists and points at exactly that commit. It never
+# creates or moves a git tag, and image tags come from inputs.version only.
+#
+# Interface (caller: ci.yml -> release-publish.yml on a push to master):
 #   uses: ./.github/workflows/release-images.yml
 #   with:
-#     version: 0.2.0            # required, without the leading v; must equal the pushed tag minus v
-#     push: true                # optional (default true); false = build and smoke only, publish nothing
+#     version: 0.2.0            # required, without the leading v; tag v<version> must already name github.sha
+#     push: true                # optional (default true); false = build and smoke only: no image, tag,
+#                               #   signature, evidence artifact or output is written
 #     media: true               # optional (default true): also ship metro-embeddinggemma2, linux/amd64 only
 #     arm64: true               # optional (default true): also build linux/arm64 server and runner
 #   permissions:
 #     contents: read
-#     packages: write           # push to ghcr.io/<owner>
-#     id-token: write           # keyless Sigstore signing (used only by the sign job)
+#     packages: write           # push to ghcr.io/wnzn (publish and sign jobs only)
+#     id-token: write           # keyless Sigstore signing (sign job only)
 #   No secrets are accepted; the only credential is github.token. GitHub checks
 #   these grants when the call is loaded, so the caller must grant all three
 #   even with push: false.
 #
-# Outputs: server-ref, runner-ref, media-ref (ghcr.io/<owner>/<image>:v<version>@sha256:<index>,
-# media-ref empty when media is false) and the artifact `release-image-digests`
-# (IMAGES.txt for people, images.json for machines, SHA256SUMS; the same files
-# are also uploaded as `image-evidence` for release-publish.yml). That artifact is uploaded
-# only after every image was pushed by exact digest, read back with the
-# expected platform descriptors, signed keyless and the signatures verified
-# against this workflow's tag identity. If any step fails the workflow fails,
+# Outputs (push: true only; empty otherwise): server-ref, runner-ref, media-ref
+# (ghcr.io/wnzn/<image>:v<version>@sha256:<index>; media-ref empty when media is
+# false) and the artifact `release-image-digests` (IMAGES.txt for people,
+# images.json for machines, SHA256SUMS; also uploaded as `image-evidence`).
+# That artifact is uploaded only after every image was pushed by exact digest,
+# read back with the expected platform descriptors, signed keyless and every
+# signature verified against: the identity
+#   https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/master
+# (issuer https://token.actions.githubusercontent.com), the Fulcio claims
+# repository wnzn/metro, ref refs/heads/master, trigger push and commit
+# github.sha, the exact image digest, and the signed annotations
+# org.opencontainers.image.revision=<github.sha>, org.opencontainers.image.version=v<version>,
+# org.opencontainers.image.source=https://github.com/wnzn/metro and
+# dev.metro.source-ref=refs/heads/master. If any step fails the workflow fails,
 # so a caller that needs this job never drafts a release.
 #
-# Images: ghcr.io/<owner>/metro-server:v<version> and metro-runner:v<version>
+# Images: ghcr.io/wnzn/metro-server:v<version> and metro-runner:v<version>
 # (linux/amd64 and linux/arm64, each built natively on its own runner), and
-# metro-embeddinggemma2:v<version> (linux/amd64, weight-free). No `latest`
-# tag. No macOS or Windows containers exist.
+# metro-embeddinggemma2:v<version> (linux/amd64, weight-free). Every image
+# carries the source commit in its org.opencontainers.image.revision label and
+# each index in the same annotation. No `latest` tag. No macOS or Windows
+# containers exist.
 
 on:
   workflow_call:
     inputs:
       version:
-        description: 'Release version without the leading v (X.Y.Z or X.Y.Z-pre). Must match the pushed tag.'
+        description: 'Release version without the leading v (X.Y.Z or X.Y.Z-pre). With push, tag v<version> must already name github.sha.'
         type: string
         required: true
       push:
-        description: 'Publish (tag push only): push, read back and sign. False builds and smoke-tests only.'
+        description: 'Publish (protected master push of wnzn/metro only): push, read back and sign. False builds and smoke-tests only.'
         type: boolean
         default: true
       media:
@@ -69,6 +87,11 @@ env:
   BUILDKIT_IMAGE: moby/buildkit:v0.34.0@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
   COSIGN_VERSION: v3.1.4
   COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
+  # The only source that may publish.
+  OFFICIAL_REPOSITORY: wnzn/metro
+  OFFICIAL_REPOSITORY_ID: '1467654868'
+  OFFICIAL_REF: refs/heads/master
+  OFFICIAL_CALLER: wnzn/metro/.github/workflows/ci.yml@refs/heads/master
 
 jobs:
   guard:
@@ -80,37 +103,57 @@ jobs:
       platforms: ${{ steps.meta.outputs.platforms }}
       matrix: ${{ steps.meta.outputs.matrix }}
     steps:
-      - name: Only a pushed tag named exactly v<version> publishes
+      - name: Only a push to protected master of wnzn/metro, run by ci.yml, publishes
         env:
           PUSH: ${{ inputs.push }}
           VERSION: ${{ inputs.version }}
           EVENT: ${{ github.event_name }}
+          REPOSITORY: ${{ github.repository }}
+          REPOSITORY_ID: ${{ github.repository_id }}
           REF: ${{ github.ref }}
           REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          DELETED: ${{ github.event.deleted }}
+          AFTER: ${{ github.event.after }}
+          CALLER: ${{ github.workflow_ref }}
         run: |
           set -eu
           printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
             || { echo "version must be X.Y.Z[-pre] without a leading v" >&2; exit 1; }
           [ "$PUSH" = true ] || { echo "push: false, build and smoke only"; exit 0; }
-          [ "$EVENT" = push ] || { echo "images are published only from a tag push, not $EVENT" >&2; exit 1; }
-          [ "$REF_TYPE" = tag ] && [ "$REF" = "refs/tags/v$VERSION" ] && [ "$REF_NAME" = "v$VERSION" ] \
-            || { echo "ref $REF is not the tag v$VERSION" >&2; exit 1; }
+          fail() { echo "refusing to publish: $*" >&2; exit 1; }
+          [ "$EVENT" = push ] || fail "event is $EVENT, not push"
+          [ "$REPOSITORY" = "$OFFICIAL_REPOSITORY" ] || fail "repository is $REPOSITORY"
+          [ "$REPOSITORY_ID" = "$OFFICIAL_REPOSITORY_ID" ] || fail "repository ID is $REPOSITORY_ID"
+          [ "$REF_TYPE" = branch ] || fail "ref is not a branch"
+          [ "$REF" = "$OFFICIAL_REF" ] || fail "ref is $REF, not $OFFICIAL_REF"
+          [ "$REF_PROTECTED" = true ] || fail "$REF is not protected"
+          [ "$DELETED" = false ] || fail "the push deleted $REF"
+          [ "$AFTER" = "$GITHUB_SHA" ] || fail "github.sha is not the pushed head"
+          [ "$CALLER" = "$OFFICIAL_CALLER" ] || fail "called from $CALLER, not $OFFICIAL_CALLER"
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: The tag names this exact commit and the app version
+      - name: Tag v<version> names exactly github.sha; workspace and app versions match
         if: inputs.push
         env:
           VERSION: ${{ inputs.version }}
+          GH_READ_TOKEN: ${{ github.token }}
         run: |
           set -eu
-          git fetch --no-tags --depth=1 origin "+refs/tags/v$VERSION:refs/tags/v$VERSION"
-          [ "$(git rev-parse "refs/tags/v$VERSION^{commit}")" = "$GITHUB_SHA" ] \
-            || { echo "tag v$VERSION does not point at $GITHUB_SHA" >&2; exit 1; }
           [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]
-          app="$(python3 -I -c 'import json;print(json.load(open("apps/desktop/nsh.json"))["version"])')"
-          [ "${VERSION%%-*}" = "$app" ] || { echo "v$VERSION does not match apps/desktop/nsh.json $app" >&2; exit 1; }
+          python3 -I - "$VERSION" <<'PY'
+          import json, sys, tomllib
+          with open("Cargo.toml", "rb") as f:
+              workspace = tomllib.load(f)["workspace"]["package"]["version"]
+          with open("apps/desktop/nsh.json", encoding="utf-8") as f:
+              app = json.load(f)["version"]
+          if not sys.argv[1] == workspace == app:
+              sys.exit("the input version must exactly match Cargo.toml and apps/desktop/nsh.json")
+          PY
+          # Read only (GitHub API, token from the environment): never creates or moves a tag.
+          python3 -I packaging/image_release.py check-tag --repository "$GITHUB_REPOSITORY" \
+            --tag "v$VERSION" --commit "$GITHUB_SHA" --token-env GH_READ_TOKEN
       - id: meta
         env:
           ARM64: ${{ inputs.arm64 }}
@@ -161,7 +204,7 @@ jobs:
           for component in server runner; do
             python3 -I packaging/image_release.py build --component "$component" --platform "$PLATFORM" \
               --version "$VERSION" --revision "$GITHUB_SHA" --source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-              --builder metro-release --out "$RUNNER_TEMP/images"
+              --source-ref "$GITHUB_REF" --builder metro-release --out "$RUNNER_TEMP/images"
           done
       - name: Load exactly those archives
         run: |
@@ -216,7 +259,7 @@ jobs:
           set -eu
           python3 -I packaging/image_release.py build --component media --platform linux/amd64 \
             --version "$VERSION" --revision "$GITHUB_SHA" --source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-            --builder metro-release --out "$RUNNER_TEMP/media"
+            --source-ref "$GITHUB_REF" --builder metro-release --out "$RUNNER_TEMP/media"
           python3 -I packaging/image_release.py load "$RUNNER_TEMP/media/metro-embeddinggemma2-amd64.oci.tar" \
             --platform linux/amd64 --tag metro-release-smoke/metro-embeddinggemma2:amd64
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
@@ -271,8 +314,13 @@ jobs:
   # exact smoked blobs and manifests, then one index per image under v<version>.
   publish:
     needs: [guard, build, media]
+    # Second, independent gate: the guard already checked all of this.
     if: >-
-      inputs.push && !cancelled() && needs.guard.result == 'success' && needs.build.result == 'success' &&
+      inputs.push && github.event_name == 'push' && github.repository == 'wnzn/metro' && github.repository_id == '1467654868' &&
+      github.ref == 'refs/heads/master' && github.ref_type == 'branch' && github.ref_protected &&
+      toJSON(github.event.deleted) == 'false' && github.event.after == github.sha &&
+      github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master' &&
+      !cancelled() && needs.guard.result == 'success' && needs.build.result == 'success' &&
       ((inputs.media && needs.media.result == 'success') || (!inputs.media && needs.media.result == 'skipped'))
     runs-on: ubuntu-24.04
     timeout-minutes: 30
@@ -301,6 +349,8 @@ jobs:
           REGISTRY_TOKEN: ${{ github.token }}
         run: |
           set -eu
+          python3 -I packaging/image_release.py check-tag --repository "$OFFICIAL_REPOSITORY" \
+            --tag "v$VERSION" --commit "$GITHUB_SHA" --token-env REGISTRY_TOKEN
           r="$RUNNER_TEMP/images"
           mkdir -p "$RUNNER_TEMP/pushed"
           push() { # image expected-platforms archive...
@@ -308,7 +358,7 @@ jobs:
             python3 -I packaging/image_release.py push --repository "ghcr.io/$OWNER/$image" \
               --user "$GITHUB_ACTOR" --token-env REGISTRY_TOKEN \
               --version "$VERSION" --revision "$GITHUB_SHA" --source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-              --expect-platforms "$platforms" --result "$RUNNER_TEMP/pushed/$image.json" "$@"
+              --source-ref "$OFFICIAL_REF" --expect-platforms "$platforms" --result "$RUNNER_TEMP/pushed/$image.json" "$@"
           }
           archives() { for p in $(echo "$PLATFORMS" | tr , ' '); do printf '%s\n' "$r/$1-${p#linux/}.oci.tar"; done; }
           # shellcheck disable=SC2046 # one archive path per line, no spaces
@@ -348,10 +398,15 @@ jobs:
           retention-days: 7
 
   # Keyless Sigstore signatures bind each pushed digest to this workflow at
-  # this tag (GitHub OIDC). Only this job can mint an ID token.
+  # refs/heads/master (GitHub OIDC). Only this job can mint an ID token.
   sign:
     needs: [guard, publish]
-    if: inputs.push
+    if: >-
+      inputs.push && github.event_name == 'push' && github.repository == 'wnzn/metro' && github.repository_id == '1467654868' &&
+      github.ref == 'refs/heads/master' && github.ref_type == 'branch' && github.ref_protected &&
+      toJSON(github.event.deleted) == 'false' && github.event.after == github.sha &&
+      github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master' &&
+      needs.guard.result == 'success' && needs.publish.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     permissions:
@@ -381,41 +436,69 @@ jobs:
           printf '%s  %s\n' "$COSIGN_SHA256" "$RUNNER_TEMP/bin/cosign" | sha256sum --check -
           chmod 755 "$RUNNER_TEMP/bin/cosign"
           echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
-      - name: Sign every index and platform manifest, then verify the publisher identity
+      - name: The version tag still names exactly this commit
+        env:
+          GH_READ_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I packaging/image_release.py check-tag --repository "$OFFICIAL_REPOSITORY" \
+            --tag "v$VERSION" --commit "$GITHUB_SHA" --token-env GH_READ_TOKEN
+      - name: Sign every index and platform manifest, then verify identity, commit and digest
         env:
           REGISTRY_TOKEN: ${{ github.token }}
         run: |
           set -eu
           trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
           printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
-          identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/release-images.yml@refs/tags/v$VERSION"
+          source_url="https://github.com/$OFFICIAL_REPOSITORY"
+          identity="$source_url/.github/workflows/release-images.yml@$OFFICIAL_REF"
           issuer=https://token.actions.githubusercontent.com
           for result in "$RUNNER_TEMP"/pushed/*.json; do
             python3 -I - "$result" > "$RUNNER_TEMP/digests.txt" <<'PY'
-          import json, sys
+          import json, os, re, sys
           r = json.load(open(sys.argv[1]))
-          print(f"{r['repository']}@{r['index_digest']}")
-          for p in sorted(r["platforms"]):
-              print(f"{r['repository']}@{r['platforms'][p]['manifest_digest']}")
+          repo = r["repository"]
+          assert repo in {"ghcr.io/wnzn/metro-server", "ghcr.io/wnzn/metro-runner", "ghcr.io/wnzn/metro-embeddinggemma2"}
+          assert r["revision"] == os.environ["GITHUB_SHA"] and r["source_ref"] == os.environ["OFFICIAL_REF"]
+          assert r["tag"] == "v" + os.environ["VERSION"]
+          for digest in [r["index_digest"], *(p["manifest_digest"] for p in r["platforms"].values())]:
+              assert re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+              print(repo, digest)
           PY
-            index="$(head -n 1 "$RUNNER_TEMP/digests.txt")"
-            cosign sign --yes --recursive "$index"
-            while IFS= read -r ref; do
+            # Signed annotations bind each signature to the source commit and ref.
+            read -r repo index < "$RUNNER_TEMP/digests.txt"
+            cosign sign --yes --recursive \
+              -a "org.opencontainers.image.revision=$GITHUB_SHA" \
+              -a "org.opencontainers.image.version=v$VERSION" \
+              -a "org.opencontainers.image.source=$source_url" \
+              -a "dev.metro.source-ref=$OFFICIAL_REF" \
+              "$repo@$index"
+            while read -r repo digest; do
               cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
-                --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+                --certificate-github-workflow-repository "$OFFICIAL_REPOSITORY" \
+                --certificate-github-workflow-ref "$OFFICIAL_REF" \
                 --certificate-github-workflow-sha "$GITHUB_SHA" \
                 --certificate-github-workflow-trigger push \
-                --certificate-github-workflow-ref "refs/tags/v$VERSION" \
-                "$ref" > /dev/null
-              echo "verified signature: $ref"
+                -a "org.opencontainers.image.revision=$GITHUB_SHA" \
+                -a "org.opencontainers.image.version=v$VERSION" \
+                -a "org.opencontainers.image.source=$source_url" \
+                -a "dev.metro.source-ref=$OFFICIAL_REF" \
+                --output json "$repo@$digest" > "$RUNNER_TEMP/cosign.json"
+              python3 -I packaging/image_release.py check-signatures --cosign-json "$RUNNER_TEMP/cosign.json" \
+                --repository "$repo" --digest "$digest" --revision "$GITHUB_SHA" --version "$VERSION" \
+                --source-url "$source_url" --source-ref "$OFFICIAL_REF" \
+                --identity "$identity" --issuer "$issuer" --workflow-repository "$OFFICIAL_REPOSITORY"
             done < "$RUNNER_TEMP/digests.txt"
           done
-          echo "SIGNER_IDENTITY=$identity" >> "$GITHUB_ENV"
-          echo "SIGNER_ISSUER=$issuer" >> "$GITHUB_ENV"
+          {
+            echo "SIGNER_IDENTITY=$identity"
+            echo "SIGNER_ISSUER=$issuer"
+            echo "SOURCE_URL=$source_url"
+          } >> "$GITHUB_ENV"
       - name: IMAGES.txt and images.json
         run: |
           set -eu
           python3 -I packaging/image_release.py evidence --version "$VERSION" --revision "$GITHUB_SHA" \
+            --source-url "$SOURCE_URL" --source-ref "$OFFICIAL_REF" \
             --signer-identity "$SIGNER_IDENTITY" --signer-issuer "$SIGNER_ISSUER" \
             --out "$RUNNER_TEMP/evidence" "$RUNNER_TEMP"/pushed/*.json
           (cd "$RUNNER_TEMP/evidence" && sha256sum IMAGES.txt images.json > SHA256SUMS)

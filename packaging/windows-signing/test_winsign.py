@@ -7,6 +7,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import shutil
 import stat
 import struct
 import sys
@@ -462,14 +463,16 @@ def jobs(text):
 
 class ReleaseContext(unittest.TestCase):
     SHA = "a" * 40
+    VERSION = json.loads((HERE.parents[1] / "apps/desktop/nsh.json").read_text())["version"]
 
     def context(self, tmp, event=None, **env):
         payload = {"ref": "refs/heads/master", "after": self.SHA, "deleted": False,
-                   "repository": {"full_name": "wnzn/metro"}}
+                   "repository": {"full_name": "wnzn/metro", "id": 1467654868}}
         payload.update(event or {})
         path = Path(tmp) / "event.json"
         path.write_text(json.dumps(payload))
         base = {"GITHUB_EVENT_NAME": "push", "GITHUB_REPOSITORY": "wnzn/metro", "GITHUB_REF": "refs/heads/master",
+                 "GITHUB_REPOSITORY_ID": "1467654868",
                 "GITHUB_REF_TYPE": "branch", "GITHUB_REF_PROTECTED": "true", "GITHUB_SHA": self.SHA,
                 "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master",
                 "GITHUB_EVENT_PATH": str(path)}
@@ -478,7 +481,22 @@ class ReleaseContext(unittest.TestCase):
 
     def test_official_master_push(self):
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertEqual(winsign.release_context(self.context(tmp), self.SHA, "0.3.0"), self.SHA)
+            self.assertEqual(winsign.release_context(self.context(tmp), self.SHA, self.VERSION), self.SHA)
+
+    def test_input_version_matches_both_files_even_for_prereleases(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = root / "apps/desktop/nsh.json"
+            app.parent.mkdir(parents=True)
+            version = "0.3.0-rc.1"
+            (root / "Cargo.toml").write_text(f'[workspace.package]\nversion = "{version}"\n')
+            app.write_text(json.dumps({"version": version}))
+            self.assertEqual(winsign.release_context(self.context(tmp), self.SHA, version, root), self.SHA)
+            with self.assertRaisesRegex(winsign.Failure, "exactly match"):
+                winsign.release_context(self.context(tmp), self.SHA, "0.3.0", root)
+            app.write_text(json.dumps({"version": "0.3.0"}))
+            with self.assertRaisesRegex(winsign.Failure, "exactly match"):
+                winsign.release_context(self.context(tmp), self.SHA, version, root)
 
     def test_everything_else_is_refused(self):
         other = "b" * 40
@@ -492,6 +510,7 @@ class ReleaseContext(unittest.TestCase):
             "master-like branch": dict(GITHUB_REF="refs/heads/master2"),
             "unprotected master": dict(GITHUB_REF_PROTECTED="false"),
             "fork": dict(GITHUB_REPOSITORY="someone/metro"),
+            "reused repository name": dict(GITHUB_REPOSITORY_ID="123"),
             "other workflow": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/release.yml@refs/heads/master"),
             "workflow from a tag": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/ci.yml@refs/tags/v0.3.0"),
             "no sha": dict(GITHUB_SHA=""),
@@ -503,7 +522,8 @@ class ReleaseContext(unittest.TestCase):
             for name, event in {"deleted branch": {"deleted": True}, "missing deleted": {"deleted": None},
                                 "event for another commit": {"after": other},
                                 "event for another ref": {"ref": "refs/tags/v0.3.0"},
-                                "event from another repository": {"repository": {"full_name": "x/metro"}}}.items():
+                                 "event from another repository": {"repository": {"full_name": "x/metro", "id": 1467654868}},
+                                 "event with another repo ID": {"repository": {"full_name": "wnzn/metro", "id": 123}}}.items():
                 with self.subTest(name), self.assertRaisesRegex(winsign.Failure, "refused"):
                     winsign.release_context(self.context(tmp, event), self.SHA, "0.3.0")
             with self.assertRaisesRegex(winsign.Failure, "checked-out commit"):
@@ -523,6 +543,76 @@ class ReleaseContext(unittest.TestCase):
                                               work=tmp, out_dir=str(Path(tmp) / "out"))
             with self.assertRaisesRegex(winsign.Failure, "refused"):
                 winsign.finalize(args)
+
+
+class SigningEnvironment(unittest.TestCase):
+    def test_only_one_literal_master_branch_rule(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            args = winsign.argparse.Namespace(environment=Path(tmp) / "environment", policies=Path(tmp) / "policies")
+            custom = {"protected_branches": False, "custom_branch_policies": True}
+            master = {"name": "master", "type": "branch"}
+
+            def check(policy, *rules, total=None):
+                args.environment.write_text(json.dumps({"name": "windows-release-signing", "deployment_branch_policy": policy}))
+                args.policies.write_text(json.dumps({"total_count": len(rules) if total is None else total,
+                                                    "branch_policies": rules}))
+                winsign.check_signing_environment(args)
+
+            check(custom, master)
+            for policy, rules, total in (
+                (None, [], 0), ({"protected_branches": True, "custom_branch_policies": False}, [master], 1),
+                (custom, [{"name": "master", "type": "tag"}], 1),
+                (custom, [{"name": "master*", "type": "branch"}], 1),
+                (custom, [master, {"name": "v*", "type": "tag"}], 2), (custom, [master], 2),
+            ):
+                with self.subTest(policy=policy, rules=rules, total=total), self.assertRaisesRegex(winsign.Failure, "no tags"):
+                    check(policy, *rules, total=total)
+
+
+class LegacyScriptCoexistence(unittest.TestCase):
+    """install-metro-windows.ps1 never installs over, or touches, an MSI-managed Metro."""
+    SCRIPT = HERE.parent / "install-metro-windows.ps1"
+
+    def text(self):
+        return self.SCRIPT.read_text(encoding="utf-8")
+
+    def test_uses_the_msi_lanes_release_identity(self):
+        import re
+        msi = (HERE.parent / "windows-msi/build_msi.py").read_text(encoding="utf-8")
+        release = msi[msi.index('"release": {'):msi.index('"fixture": {')]
+        upgrade = re.search(r'"upgrade_code": "(\{[0-9A-F-]+\})"', release).group(1)
+        key = re.search(r'"reg_key": r"([^"]+)"', release).group(1)
+        self.assertIn(f"$MsiUpgradeCode = '{upgrade}'", self.text())
+        self.assertIn(f"$MsiKey = 'HKCU:\\{key}'", self.text())
+
+    def test_checks_happen_before_any_change(self):
+        text = self.text()
+        install = text[text.index("function Install-Metro"):text.index("function Uninstall-Metro")]
+        self.assertLess(install.index("Get-MsiManagedMetro"), install.index("New-Item -ItemType Directory -Force -Path $Root"))
+        self.assertLess(install.index("Test-OwnShortcut $existing $Root"), install.index("CreateShortcut((Get-ShortcutPath))"))
+        uninstall = text[text.index("function Uninstall-Metro"):text.index("\ntry {")]
+        self.assertIn("if (Test-OwnShortcut (Get-ShortcutTarget $lnk) $Root) { Remove-Item -LiteralPath $lnk -Force }", uninstall)
+        self.assertEqual(uninstall.count("Remove-Item -LiteralPath $lnk"), 1)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
+    def test_only_its_own_shortcut_counts(self):
+        import subprocess
+        command = (
+            "$ast = [System.Management.Automation.Language.Parser]::ParseFile($env:METRO_SCRIPT, [ref]$null, [ref]$null);"
+            "$f = $ast.Find({ param($n) $n -is [System.Management.Automation.Language.FunctionDefinitionAst] -and "
+            "$n.Name -eq 'Test-OwnShortcut' }, $true); . ([scriptblock]::Create($f.Extent.Text));"
+            "$root = Join-Path ([IO.Path]::GetTempPath()) 'Metro Root';"
+            "@((Test-OwnShortcut (Join-Path $root 'versions/0.3.0/Metro.exe') $root),"
+            "(Test-OwnShortcut (Join-Path $root 'versions/../../Metro Desktop/Metro.exe') $root),"
+            "(Test-OwnShortcut (Join-Path $root 'Metro.exe') $root),"
+            "(Test-OwnShortcut (Join-Path ([IO.Path]::GetTempPath()) 'Metro Rootx/versions/1/Metro.exe') $root),"
+            "(Test-OwnShortcut (Join-Path ([IO.Path]::GetTempPath()) 'Metro Desktop/Metro.exe') $root),"
+            "(Test-OwnShortcut '' $root)) -join ','")
+        import os
+        r = subprocess.run(["pwsh", "-NoProfile", "-NonInteractive", "-Command", command],
+                           text=True, capture_output=True, timeout=120, env={**os.environ, "METRO_SCRIPT": str(self.SCRIPT)})
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "True,False,False,False,False,False")
 
 
 class Trees(unittest.TestCase):
@@ -588,7 +678,7 @@ class Workflows(unittest.TestCase):
     def test_no_tag_or_ref_name_release_logic(self):
         for name in ("windows-distribution.yml", "windows-sign.yml"):
             text = self.read(name)
-            for forbidden in ("refs/tags", "ref_type", "ref_name", "github.head_ref", "pull_request"):
+            for forbidden in ("refs/tags", "ref_name", "github.head_ref", "pull_request"):
                 self.assertNotIn(forbidden, text, name)
         self.assertIn("winsign.py release-context", jobs(self.read("windows-distribution.yml"))["seed"])
 
@@ -612,12 +702,15 @@ class Workflows(unittest.TestCase):
             else:
                 self.assertIn("runs-on: ubuntu-24.04" if job in ("guard", "msi") else "runs-on: windows-2025", body)
         self.assertIn("winsign.py release-context", all_jobs["guard"])
-        guard_if = ("    if: github.event_name == 'push' && github.repository == 'wnzn/metro' && "
-                    "github.ref == 'refs/heads/master' && github.ref_protected && !github.event.deleted && "
-                    "github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'\n")
+        self.assertIn("winsign.py signing-environment", all_jobs["guard"])
+        guard_if = ("if: >- github.event_name == 'push' && github.repository == 'wnzn/metro' && "
+                    "github.repository_id == '1467654868' && github.ref == 'refs/heads/master' && "
+                    "github.ref_type == 'branch' && github.ref_protected && toJSON(github.event.deleted) == 'false' && "
+                    "github.event.after == github.sha && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'")
         for job in ("sign", "sign-msi"):
             # Job-level, so no runner (self-hosted included) is assigned outside the official context.
-            self.assertIn(guard_if, all_jobs[job])
+            self.assertIn(guard_if, " ".join(all_jobs[job].split()))
+            self.assertLess(all_jobs[job].index("Assert-MetroReleaseContext"), all_jobs[job].index("Invoke-MetroReleaseSigning"))
             self.assertIn("--commit $env:GITHUB_SHA" if job == "sign" else "Assert-MetroReleaseContext", all_jobs[job])
         self.assertIn("--expect-commit $env:GITHUB_SHA", all_jobs["verify"])
         self.assertIn("name: dist-desktop-windows-x64", all_jobs["verify"])

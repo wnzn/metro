@@ -34,6 +34,7 @@ import stat
 import struct
 import sys
 import tempfile
+import tomllib
 import zipfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -63,6 +64,7 @@ HEX64 = re.compile(r"[0-9a-f]{64}")
 # top-level workflow is ci.yml on master, building exactly the pushed commit.
 # Tags, pull requests and any other branch are never official.
 OFFICIAL_REPOSITORY = "wnzn/metro"
+OFFICIAL_REPOSITORY_ID = "1467654868"
 OFFICIAL_REF = "refs/heads/master"
 OFFICIAL_WORKFLOW_REF = f"{OFFICIAL_REPOSITORY}/.github/workflows/ci.yml@{OFFICIAL_REF}"
 SHA = re.compile(r"[0-9a-f]{40}")
@@ -712,14 +714,15 @@ def verify_seed(args):
     print(digest)
 
 
-def release_context(env, head, version):
+def release_context(env, head, version, root=Path(__file__).resolve().parents[2]):
     """Fail unless `env` (a GitHub Actions environment) is the official release context."""
     def bad(what):
         return f"official Windows signing refused: {what} (only a push to protected {OFFICIAL_REF} of " \
                f"{OFFICIAL_REPOSITORY} from ci.yml is official)"
     require(SEMVER.fullmatch(version or ""), bad("invalid version input"))
     require(env.get("GITHUB_EVENT_NAME") == "push", bad(f"event is {env.get('GITHUB_EVENT_NAME')!r}"))
-    require(env.get("GITHUB_REPOSITORY") == OFFICIAL_REPOSITORY, bad("another repository"))
+    require(env.get("GITHUB_REPOSITORY") == OFFICIAL_REPOSITORY
+            and env.get("GITHUB_REPOSITORY_ID") == OFFICIAL_REPOSITORY_ID, bad("another repository"))
     require(env.get("GITHUB_REF") == OFFICIAL_REF and env.get("GITHUB_REF_TYPE") == "branch",
             bad(f"ref is {env.get('GITHUB_REF')!r}"))
     require(env.get("GITHUB_REF_PROTECTED") == "true", bad("the branch is not protected"))
@@ -731,15 +734,34 @@ def release_context(env, head, version):
         event = json.loads(Path(env.get("GITHUB_EVENT_PATH", "")).read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise Failure(bad("unreadable event payload")) from error
-    require(isinstance(event, dict) and event.get("deleted") is False and event.get("ref") == OFFICIAL_REF
+    repository = event.get("repository") if isinstance(event, dict) else None
+    require(isinstance(repository, dict) and event.get("deleted") is False and event.get("ref") == OFFICIAL_REF
             and event.get("after") == sha
-            and (event.get("repository") or {}).get("full_name") == OFFICIAL_REPOSITORY,
+            and repository.get("full_name") == OFFICIAL_REPOSITORY
+            and repository.get("id") == int(OFFICIAL_REPOSITORY_ID),
             bad("the push event is a deletion or does not match the commit"))
+    cargo = tomllib.loads((root / "Cargo.toml").read_text(encoding="utf-8"))
+    app = json.loads((root / "apps/desktop/nsh.json").read_text(encoding="utf-8"))
+    require(cargo["workspace"]["package"]["version"] == app["version"] == version,
+            bad("the input version must exactly match Cargo.toml and apps/desktop/nsh.json"))
     return sha
 
 
 def check_release_context(args):
     print(release_context(os.environ, args.head, args.version))
+
+
+def check_signing_environment(args):
+    """The GitHub environment itself must reject every deployment except the master branch."""
+    environment = json.loads(Path(args.environment).read_text(encoding="utf-8"))
+    policies = json.loads(Path(args.policies).read_text(encoding="utf-8"))
+    policy = environment.get("deployment_branch_policy") or {}
+    rules = policies.get("branch_policies") or []
+    require(environment.get("name") == "windows-release-signing"
+            and policy.get("protected_branches") is False and policy.get("custom_branch_policies") is True
+            and policies.get("total_count") == len(rules) == 1
+            and rules[0].get("name") == "master" and rules[0].get("type") == "branch",
+            "windows-release-signing needs one custom deployment rule: branch master, no tags")
 
 
 def load_summary(work):
@@ -1107,6 +1129,10 @@ def main(argv=None):
     c.add_argument("--version", required=True)
     c.add_argument("--head", required=True, help="the checked-out commit (git rev-parse HEAD)")
     c.set_defaults(func=check_release_context)
+    e = sub.add_parser("signing-environment", help="check the GitHub signing environment deployment policy")
+    e.add_argument("--environment", required=True)
+    e.add_argument("--policies", required=True)
+    e.set_defaults(func=check_signing_environment)
     n = sub.add_parser("inspect", help="structural Authenticode checks of one signed file")
     n.add_argument("path")
     publisher(n)

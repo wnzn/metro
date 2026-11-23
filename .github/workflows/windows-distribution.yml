@@ -205,6 +205,12 @@ jobs:
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
           $t = $env:RUNNER_TEMP
           Test-MetroMsiInstall -Msi "$t\dist\$env:MSI_NAME" -Tree "$t\tree" -Version $env:VERSION -Mode preview -LogDir "$t\logs"
+      - name: The legacy install script refuses to install next to the MSI and leaves its shortcut and files alone
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
+          $t = $env:RUNNER_TEMP
+          Test-MetroScriptMsiCoexistence -Msi "$t\dist\$env:MSI_NAME" -Zip "$t\dist\Metro-$env:VERSION-windows-x64.zip" `
+            -Script (Join-Path $env:GITHUB_WORKSPACE 'packaging\install-metro-windows.ps1') -Version $env:VERSION -LogDir "$t\logs"
       - name: MSI lane native tests (fixtures, upgrade, repair, downgrade, uninstall; then the preview MSI)
         run: |
           $t = $env:RUNNER_TEMP

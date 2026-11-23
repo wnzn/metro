@@ -132,7 +132,7 @@ function Install-MetroArtifactSigningClient([string] $Version, [string] $Sha256,
 # that only lives for the signing call. The value is masked and never printed.
 function New-GitHubOidcTokenFile([string] $Path) {
     if (-not $env:ACTIONS_ID_TOKEN_REQUEST_URL -or -not $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
-        Fail 'no GitHub OIDC token is available: the tag call must grant id-token: write'
+        Fail 'no GitHub OIDC token is available: the official master call must grant id-token: write'
     }
     $uri = $env:ACTIONS_ID_TOKEN_REQUEST_URL + '&audience=api://AzureADTokenExchange'
     $token = (Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
@@ -441,6 +441,54 @@ function Test-MetroMsiInstall {
     Write-Host "MSI installed into a chosen folder, matched the release, ran the server and uninstalled cleanly"
 }
 
+# With the MSI installed, install-metro-windows.ps1 refuses to install a second
+# copy and its uninstall leaves the MSI's shortcut, files and registration alone.
+function Test-MetroScriptMsiCoexistence {
+    [CmdletBinding()]
+    param([Parameter(Mandatory)] [string] $Msi, [Parameter(Mandatory)] [string] $Zip, [Parameter(Mandatory)] [string] $Script,
+          [Parameter(Mandatory)] [string] $Version, [Parameter(Mandatory)] [string] $LogDir)
+    $info = Test-MetroMsiStructure -Msi $Msi -Version $Version
+    $temp = [IO.Path]::GetTempPath()
+    $dir = Join-Path $temp ('MSI coexistence ' + [Guid]::NewGuid().ToString('N') + '\Metro')
+    $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Metro.lnk'
+    if (Test-Path -LiteralPath $lnk) { Fail 'a Metro Start menu shortcut already exists on this machine' }
+    Invoke-Msiexec @('/i', "`"$Msi`"", "INSTALLDIR=`"$dir`"") (Join-Path $LogDir 'msi-coexistence-install.log')
+    try {
+        if ((Get-MetroMsiProductState $info.ProductCode) -ne 5) { Fail 'the MSI did not register as installed' }
+        if ((New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath -ne (Join-Path $dir 'Metro.exe')) {
+            Fail 'the MSI did not create its Start menu shortcut'
+        }
+        $snapshot = {
+            @(Get-ChildItem -LiteralPath $dir -Recurse -File -Force | Sort-Object FullName |
+                ForEach-Object { "$($_.FullName)=$((Get-FileHash -LiteralPath $_.FullName -Algorithm SHA256).Hash)" }) +
+            @("lnk=$((Get-FileHash -LiteralPath $lnk -Algorithm SHA256).Hash)") -join "`n"
+        }
+        $before = & $snapshot
+        $legacyRoot = Join-Path $temp ('legacy script root ' + [Guid]::NewGuid().ToString('N'))
+        $savedRoot = $env:METRO_INSTALL_DIR
+        $env:METRO_INSTALL_DIR = $legacyRoot
+        $PSNativeCommandUseErrorActionPreference = $false
+        try {
+            $out = & pwsh -NoProfile -NonInteractive -File $Script -Action Install -Archive $Zip 2>&1
+            if ($LASTEXITCODE -eq 0 -or ($out -join ' ') -notmatch 'Windows Installer package \(MSI\)') {
+                Fail "the script did not refuse to install next to the MSI: $($out -join ' ')"
+            }
+            if (Test-Path -LiteralPath $legacyRoot) { Fail 'the refused script install still created its folder' }
+            $out = & pwsh -NoProfile -NonInteractive -File $Script -Action Uninstall 2>&1
+            if ($LASTEXITCODE -ne 0) { Fail "the script's uninstall failed: $($out -join ' ')" }
+            $out = & pwsh -NoProfile -NonInteractive -File $Script -Action Status 2>&1
+            if (($out -join ' ') -notmatch 'Windows Installer package \(MSI\)') { Fail 'Status does not report the MSI install' }
+        } finally { $env:METRO_INSTALL_DIR = $savedRoot }
+        if ((& $snapshot) -ne $before) { Fail "the script changed the MSI's files or shortcut" }
+        if ((Get-MetroMsiProductState $info.ProductCode) -ne 5) { Fail 'the MSI is no longer registered' }
+        if (-not (Test-Path -LiteralPath 'HKCU:\Software\Metro\Desktop MSI')) { Fail "the script removed the MSI's registry key" }
+    } finally {
+        Invoke-Msiexec @('/x', "`"$Msi`"") (Join-Path $LogDir 'msi-coexistence-uninstall.log')
+    }
+    $global:LASTEXITCODE = 0
+    Write-Host 'install-metro-windows.ps1 refused to install next to the MSI and left its shortcut, files and registration alone'
+}
+
 # Preview only. A throwaway self-signed certificate signs scratch copies so the
 # verifiers are exercised on real SignTool output; it is never trusted, never
 # timestamped, never shipped, and removed afterwards.
@@ -490,5 +538,5 @@ function Invoke-MetroVerifierSelfTest {
 
 Export-ModuleMember -Function Get-MetroPublisherArgs, Invoke-WinSign, Get-MetroSignTool, Invoke-MetroSigning, Invoke-MetroReleaseSigning, Assert-MetroReleaseContext,
     Test-MetroOsTrust, Assert-MetroRejected, New-TamperedCopy, New-TamperedMsiCopy, Test-MetroMsiStructure,
-    Get-MetroMsiProductState, Invoke-Msiexec, Test-MetroMsiCandidate, Test-MetroOfficialTrust, Test-MetroMsiInstall,
+    Get-MetroMsiProductState, Invoke-Msiexec, Test-MetroMsiCandidate, Test-MetroScriptMsiCoexistence, Test-MetroOfficialTrust, Test-MetroMsiInstall,
     Invoke-MetroVerifierSelfTest

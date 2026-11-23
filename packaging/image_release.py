@@ -2,8 +2,8 @@
 """Build, describe, push and verify Metro's release container images.
 
 Used by .github/workflows/release-images.yml and for local test bundles.
-Standard library only. Registry credentials are read from an environment
-variable named on the command line, never from argv, and are never printed.
+Standard library only. Credentials come from a named environment variable,
+never from argv, and are never printed.
 
   build     build one component for one native platform into an OCI archive
             (plus a JSON description) with `docker buildx build`
@@ -14,6 +14,10 @@ variable named on the command line, never from argv, and are never printed.
             (refuses to move a tag that already names different content)
   verify    fetch the tag back and check the index digest, the platform
             descriptors and every per-platform manifest digest
+  check-tag         read-only: tag v<version> exists and peels to exactly one commit
+                    (GitHub API; never creates or moves a tag)
+  check-signatures  check `cosign verify --output json`: exact digest, signed
+                    source annotations and any reported Fulcio claims
   evidence  write IMAGES.txt and images.json from verified results
 """
 
@@ -67,6 +71,15 @@ def sha256_bytes(data):
 
 def canonical(obj):
     return json.dumps(obj, separators=(",", ":"), sort_keys=True).encode()
+
+
+def source_annotations(version, revision, source, source_ref=None):
+    return {
+        "org.opencontainers.image.version": f"v{version}",
+        "org.opencontainers.image.revision": revision,
+        "org.opencontainers.image.source": source,
+        **({"dev.metro.source-ref": source_ref} if source_ref else {}),
+    }
 
 
 # ------------------------------------------------------------------ OCI archive
@@ -216,6 +229,7 @@ def build(args):
             "--label", f"org.opencontainers.image.revision={args.revision}",
             "--label", f"org.opencontainers.image.version=v{args.version}",
             "--label", f"org.opencontainers.image.title={name}",
+            *(["--label", f"dev.metro.source-ref={args.source_ref}"] if args.source_ref else []),
             "--output", f"type=oci,dest={tar},compression=gzip,rewrite-timestamp=true"]
     if target:
         cmd += ["--target", target]
@@ -374,7 +388,7 @@ class Registry:
         return data, headers.get("content-type", "").split(";")[0]
 
 
-def build_index(infos, version, revision, source):
+def build_index(infos, version, revision, source, source_ref=None):
     manifests = []
     for info in sorted(infos, key=lambda i: i["platform"]):
         os_, arch = info["platform"].split("/")[:2]
@@ -390,11 +404,7 @@ def build_index(infos, version, revision, source):
         "schemaVersion": 2,
         "mediaType": OCI_INDEX,
         "manifests": manifests,
-        "annotations": {
-            "org.opencontainers.image.version": f"v{version}",
-            "org.opencontainers.image.revision": revision,
-            "org.opencontainers.image.source": source,
-        },
+        "annotations": source_annotations(version, revision, source, source_ref),
     }
     return canonical(index)
 
@@ -418,11 +428,14 @@ def push(args):
         infos = [a.describe() for a in archives]
         for info in infos:
             require(info["platform"] in PLATFORMS, f"unexpected platform {info['platform']}")
+            if args.source_ref:
+                for key, value in source_annotations(args.version, args.revision, args.source, args.source_ref).items():
+                    require(info["labels"].get(key) == value, f"{info['platform']}: source label {key} differs")
         if args.expect_platforms:
             got = sorted(i["platform"] for i in infos)
             require(got == sorted(args.expect_platforms.split(",")),
                     f"platforms {got} differ from the expected set")
-        index = build_index(infos, args.version, args.revision, args.source)
+        index = build_index(infos, args.version, args.revision, args.source, args.source_ref)
         index_digest = sha256_bytes(index)
         reg.login()
         existing, _ = reg.get_manifest(tag, INDEX_TYPES + MANIFEST_TYPES)
@@ -442,6 +455,7 @@ def push(args):
             a.close()
     result = {
         "repository": args.repository, "tag": tag, "index_digest": index_digest,
+        "revision": args.revision, "source_ref": args.source_ref,
         "platforms": {i["platform"]: {"manifest_digest": i["manifest_digest"],
                                       "config_digest": i["config_digest"]} for i in infos},
     }
@@ -483,24 +497,39 @@ def verify(args):
 
 def evidence(args):
     results = [json.loads(Path(p).read_text()) for p in args.results]
+    require(re.fullmatch(r"[0-9a-f]{40}", args.revision), "--revision must be a full commit SHA")
     lines = [
         f"# Metro container images v{args.version}",
         f"# Source commit: {args.revision}",
-        "# Pull by digest. The tag is the version only; there is no 'latest'.",
     ]
     machine = {"version": args.version, "revision": args.revision, "images": []}
+    if args.source_url or args.source_ref:
+        require(args.source_url and args.source_ref, "--source-url and --source-ref go together")
+        lines += [f"# Source: {args.source_url} {args.source_ref} (git tag v{args.version} -> {args.revision})"]
+        machine["source"] = {"url": args.source_url, "ref": args.source_ref,
+                             "tag": f"v{args.version}", "revision": args.revision}
+    lines.append("# Pull by digest. The tag is the version only; there is no 'latest'.")
+    for r in results:
+        require(r.get("revision", args.revision) == args.revision,
+                f"{r['repository']} was pushed from another commit")
+        if args.source_ref:
+            require(r.get("source_ref") == args.source_ref, f"{r['repository']} was pushed from another ref")
     if args.signer_identity:
         require(args.signer_issuer, "--signer-identity needs --signer-issuer")
         lines += [
             "# Every index and per-platform digest below is signed keyless with Sigstore cosign",
-            "# and was verified against this exact publisher identity before this file was written:",
+            "# and was verified before this file was written against this publisher identity,",
+            "# the commit above (Fulcio claim and signed annotation) and the exact digest:",
             f"#   certificate identity: {args.signer_identity}",
             f"#   OIDC issuer:          {args.signer_issuer}",
+            f"#   signed annotation:    org.opencontainers.image.revision={args.revision}",
             "# Verify:  cosign verify --certificate-identity '<identity>' \\",
-            "#            --certificate-oidc-issuer '<issuer>' '<reference@digest>'",
+            "#            --certificate-oidc-issuer '<issuer>' \\",
+            f"#            --certificate-github-workflow-sha {args.revision} \\",
+            f"#            -a org.opencontainers.image.revision={args.revision} '<reference@digest>'",
         ]
         machine["signature"] = {"type": "sigstore-cosign-keyless", "identity": args.signer_identity,
-                                "issuer": args.signer_issuer}
+                                "issuer": args.signer_issuer, "revision": args.revision}
     else:
         lines.append("# NOT SIGNED: these digests carry no publisher signature.")
     lines += ["# Columns: reference  architecture(s)", ""]
@@ -526,6 +555,89 @@ def evidence(args):
     print((out / "IMAGES.txt").read_text(), end="")
 
 
+SHA1 = re.compile(r"^[0-9a-f]{40}$")
+FULCIO = {
+    # GitHub Actions certificate claims exactly as `cosign verify --output json`
+    # reports them (seen with cosign v3.1.4). cosign itself enforces them through
+    # the --certificate-* flags; this re-checks whatever it reports.
+    "Issuer": "issuer", "1.3.6.1.4.1.57264.1.1": "issuer",
+    "Subject": "identity",
+    "githubWorkflowTrigger": "trigger", "1.3.6.1.4.1.57264.1.2": "trigger",
+    "githubWorkflowSha": "revision", "1.3.6.1.4.1.57264.1.3": "revision",
+    "githubWorkflowRepository": "workflow_repository", "1.3.6.1.4.1.57264.1.5": "workflow_repository",
+    "githubWorkflowRef": "source_ref", "1.3.6.1.4.1.57264.1.6": "source_ref",
+}
+
+
+def check_tag(args):
+    """Read only. GitHub API, token from the environment (never argv)."""
+    require(SHA1.fullmatch(args.commit), "--commit must be a full commit SHA")
+    require(re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository), "bad --repository")
+    require(re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?", args.tag), "bad --tag")
+    token = os.environ.get(args.token_env or "", "")
+    api = urlsplit(args.api_url)
+    require(api.scheme == "https" or (args.allow_http_loopback and api.hostname == "127.0.0.1"),
+            "the API must use https")
+
+    def get(path):
+        cls = http.client.HTTPSConnection if api.scheme == "https" else http.client.HTTPConnection
+        conn = cls(api.netloc, timeout=60)
+        headers = {"Accept": "application/vnd.github+json", "User-Agent": "metro-release-images",
+                   "X-GitHub-Api-Version": "2022-11-28"}
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        try:
+            conn.request("GET", api.path.rstrip("/") + path, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read(MAX_JSON)
+        finally:
+            conn.close()
+        require(resp.status != 404, f"tag {args.tag} does not exist in {args.repository}")
+        require(resp.status == 200, f"GitHub API answered HTTP {resp.status}")
+        return json.loads(body)
+
+    ref = get(f"/repos/{args.repository}/git/ref/tags/{args.tag}")
+    require(isinstance(ref, dict) and ref.get("ref") == f"refs/tags/{args.tag}",
+            f"tag {args.tag} does not exist in {args.repository}")
+    obj = ref["object"]
+    for _ in range(4):  # an annotated tag peels to its target
+        if obj["type"] != "tag":
+            break
+        require(SHA1.fullmatch(obj["sha"]), "annotated tag has an invalid SHA")
+        obj = get(f"/repos/{args.repository}/git/tags/{obj['sha']}")["object"]
+    require(obj["type"] == "commit", f"tag {args.tag} does not name a commit")
+    require(obj["sha"] == args.commit, f"tag {args.tag} names {obj['sha']}, not {args.commit}")
+    print(json.dumps({"tag": args.tag, "commit": obj["sha"]}))
+
+
+def check_signatures(args):
+    """Every signature cosign verified names this digest and carries the expected source."""
+    require(DIGEST.fullmatch(args.digest), "bad --digest")
+    require(SHA1.fullmatch(args.revision), "--revision must be a full commit SHA")
+    entries = json.loads(Path(args.cosign_json).read_text())
+    require(isinstance(entries, list) and entries, "cosign reported no verified signatures")
+    want_annotations = source_annotations(args.version, args.revision, args.source_url, args.source_ref)
+    want_claims = {"revision": args.revision, "source_ref": args.source_ref,
+                   "identity": args.identity, "issuer": args.issuer,
+                   "workflow_repository": args.workflow_repository, "trigger": "push"}
+    claims_seen = set()
+    for entry in entries:
+        critical = entry.get("critical") or {}
+        require(critical.get("image", {}).get("docker-manifest-digest") == args.digest,
+                "a signature names another digest")
+        reference = critical.get("identity", {}).get("docker-reference", "")
+        require(reference in (args.repository, f"{args.repository}@{args.digest}"),
+                "a signature names another repository")
+        optional = entry.get("optional") or {}
+        for key, value in want_annotations.items():
+            require(optional.get(key) == value, f"signed annotation {key} is missing or differs")
+        for key, claim in FULCIO.items():
+            if key in optional and want_claims.get(claim) is not None:
+                require(optional[key] == want_claims[claim], f"certificate claim {key} differs")
+                claims_seen.add(claim)
+    print(json.dumps({"digest": args.digest, "signatures": len(entries), "claims_checked": sorted(claims_seen)}))
+
+
 def write_json(path, data):
     if path:
         Path(path).write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
@@ -541,6 +653,7 @@ def main(argv=None):
     b.add_argument("--version", required=True)
     b.add_argument("--revision", required=True)
     b.add_argument("--source", required=True)
+    b.add_argument("--source-ref", help="git ref the build came from, recorded as dev.metro.source-ref")
     b.add_argument("--context", default=".")
     b.add_argument("--git-dir", help="repository for the commit time (default: --context)")
     b.add_argument("--builder")
@@ -566,16 +679,39 @@ def main(argv=None):
             s.add_argument("--version", required=True)
             s.add_argument("--revision", required=True)
             s.add_argument("--source", required=True)
+            s.add_argument("--source-ref")
             s.add_argument("--expect-platforms")
             s.add_argument("--result")
             s.add_argument("archives", nargs="+")
         else:
             s.add_argument("--expect", required=True)
 
+    t = sub.add_parser("check-tag")
+    t.add_argument("--repository", required=True, help="owner/name on GitHub")
+    t.add_argument("--tag", required=True)
+    t.add_argument("--commit", required=True)
+    t.add_argument("--token-env", help="name of the environment variable holding a read token")
+    t.add_argument("--api-url", default="https://api.github.com")
+    t.add_argument("--allow-http-loopback", action="store_true", help=argparse.SUPPRESS)
+
+    c = sub.add_parser("check-signatures")
+    c.add_argument("--cosign-json", required=True)
+    c.add_argument("--repository", required=True)
+    c.add_argument("--digest", required=True)
+    c.add_argument("--revision", required=True)
+    c.add_argument("--version", required=True)
+    c.add_argument("--source-url", required=True)
+    c.add_argument("--source-ref", required=True)
+    c.add_argument("--identity")
+    c.add_argument("--issuer")
+    c.add_argument("--workflow-repository")
+
     e = sub.add_parser("evidence")
     e.add_argument("--version", required=True)
     e.add_argument("--revision", required=True)
     e.add_argument("--out", required=True)
+    e.add_argument("--source-url")
+    e.add_argument("--source-ref")
     e.add_argument("--signer-identity")
     e.add_argument("--signer-issuer")
     e.add_argument("results", nargs="+")
@@ -592,6 +728,10 @@ def main(argv=None):
             push(args)
         elif args.cmd == "verify":
             verify(args)
+        elif args.cmd == "check-tag":
+            check_tag(args)
+        elif args.cmd == "check-signatures":
+            check_signatures(args)
         else:
             evidence(args)
     except (Fail, KeyError, ValueError, OSError, tarfile.TarError, http.client.HTTPException,

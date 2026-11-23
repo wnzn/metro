@@ -149,6 +149,39 @@ function Get-Current {
 
 function Get-ShortcutPath { Join-Path ([Environment]::GetFolderPath('Programs')) 'Metro.lnk' }
 
+# The Metro Windows Installer package (packaging/windows-msi) records its
+# install in this HKCU key and registers this UpgradeCode. This script never
+# installs a second copy next to it and never changes its shortcut or files.
+$MsiKey = 'HKCU:\Software\Metro\Desktop MSI'
+$MsiUpgradeCode = '{29BBE899-7D6A-49A7-B60E-F9644544D683}'
+
+# Describes an MSI-managed Metro for this user, or returns nothing.
+function Get-MsiManagedMetro {
+    if (Test-Path -LiteralPath $MsiKey) {
+        $p = (Get-ItemProperty -LiteralPath $MsiKey).PSObject.Properties['InstallDir']
+        if ($p -and $p.Value) { return "in $($p.Value)" }
+        return "(registered in $MsiKey)"
+    }
+    try {
+        $installer = New-Object -ComObject WindowsInstaller.Installer
+        $related = $installer.GetType().InvokeMember('RelatedProducts', [Reflection.BindingFlags]::GetProperty, $null, $installer, @($MsiUpgradeCode))
+        $count = [int] $related.GetType().InvokeMember('Count', [Reflection.BindingFlags]::GetProperty, $null, $related, $null)
+        if ($count -gt 0) { return "(Windows Installer product registered)" }
+    } catch { Fail 'cannot ask Windows Installer whether the Metro MSI is installed' }
+}
+
+# True only for a shortcut target inside this script's own versions folder.
+function Test-OwnShortcut([string] $Target, [string] $InstallRoot) {
+    if (-not $Target) { return $false }
+    $own = [System.IO.Path]::GetFullPath((Join-Path $InstallRoot 'versions')).TrimEnd('\', '/') + [System.IO.Path]::DirectorySeparatorChar
+    return [System.IO.Path]::GetFullPath($Target).StartsWith($own, [StringComparison]::OrdinalIgnoreCase)
+}
+
+function Get-ShortcutTarget([string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    return (New-Object -ComObject WScript.Shell).CreateShortcut($Path).TargetPath
+}
+
 function Install-Metro {
     if (-not $Archive) { Fail '-Archive is required' }
     if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) { Fail "archive not found: $Archive" }
@@ -164,6 +197,11 @@ function Install-Metro {
         $script:Root = Join-Path ([System.IO.Path]::GetTempPath()) ('metro-verify-' + [Guid]::NewGuid().ToString('N'))
     } else {
         Test-Prerequisites
+        $msi = @(Get-MsiManagedMetro)
+        if ($msi.Count -gt 0) {
+            Fail ("Metro is already installed by the Metro Windows Installer package (MSI) $($msi -join ' '). " +
+                  'Update or remove it with that package (Settings > Apps > Installed apps); this script does not install a second copy or change it.')
+        }
         if ($Action -eq 'Update' -and -not (Get-Current)) { Fail "Metro is not installed in $Root; use -Action Install" }
     }
     $expected = Get-ExpectedSum $archivePath
@@ -223,7 +261,10 @@ function Install-Metro {
             Copy-Item -LiteralPath $PSCommandPath -Destination $self -Force
         }
         $exe = Join-Path $target 'Metro.exe'
-        if (-not $NoShortcut) {
+        $existing = if (-not $NoShortcut) { Get-ShortcutTarget (Get-ShortcutPath) }
+        if (-not $NoShortcut -and $existing -and -not (Test-OwnShortcut $existing $Root)) {
+            Say "Kept the existing Start menu shortcut: it belongs to another Metro installation ($existing)."
+        } elseif (-not $NoShortcut) {
             $shell = New-Object -ComObject WScript.Shell
             $lnk = $shell.CreateShortcut((Get-ShortcutPath))
             $lnk.TargetPath = $exe
@@ -268,7 +309,8 @@ function Uninstall-Metro {
         if (Test-Running) { Fail 'Metro is running; close it first' }
     }
     $lnk = Get-ShortcutPath
-    if (Test-Path -LiteralPath $lnk) { Remove-Item -LiteralPath $lnk -Force }
+    # Only this script's own shortcut; another installer's (such as the MSI's) stays.
+    if (Test-OwnShortcut (Get-ShortcutTarget $lnk) $Root) { Remove-Item -LiteralPath $lnk -Force }
     if (Test-Path -LiteralPath $UninstallKey) { Remove-Item -LiteralPath $UninstallKey -Recurse -Force }
     if (Test-Path -LiteralPath $Root) {
         # The uninstall entry may run the copy of this script inside $Root.
@@ -299,6 +341,10 @@ try {
                 elseif ($supported) { Say 'Local runner support: on' }
                 else { Say 'Local runner support: requested (this build predates it; no runner is set up)' }
             } else { Say "Metro is not installed in $Root." }
+            if ($OnWindows) {
+                $msi = @(Get-MsiManagedMetro)
+                if ($msi.Count -gt 0) { Say "Also installed by the Metro Windows Installer package (MSI) $($msi -join ' '); manage it in Settings > Apps." }
+            }
             Say "Data: $UserData"
         }
     }

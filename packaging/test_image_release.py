@@ -20,6 +20,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import textwrap
 import threading
 import unittest
 from urllib.parse import parse_qs, urlsplit
@@ -30,17 +31,18 @@ import image_release as ir  # noqa: E402
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github" / "workflows" / "release-images.yml"
 SECRET = "ghs_fake_registry_token_" + "x" * 20
+REV = "0123456789abcdef0123456789abcdef01234567"
 
 
 def digest(data):
     return "sha256:" + hashlib.sha256(data).hexdigest()
 
 
-def make_archive(path, arch, user="10001:10001", nested=False, payload=b"metro"):
+def make_archive(path, arch, user="10001:10001", nested=False, payload=b"metro", revision=REV):
     layer = gzip.compress(payload + arch.encode(), mtime=0)
     config = json.dumps({
         "architecture": arch, "os": "linux",
-        "config": {"User": user, "Labels": {"org.opencontainers.image.revision": "r"}},
+        "config": {"User": user, "Labels": ir.source_annotations("1.2.3", revision, "https://x/y", "refs/heads/master")},
         "rootfs": {"type": "layers", "diff_ids": [digest(payload)]},
     }).encode()
     manifest = json.dumps({
@@ -75,6 +77,7 @@ class FakeRegistry(http.server.ThreadingHTTPServer):
         self.blobs, self.manifests, self.uploads = {}, {}, {}
         self.issued = set()
         self.auth_headers = []
+        self.git_objects = {}
 
     @property
     def host(self):
@@ -108,6 +111,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_GET(self):
         url = urlsplit(self.path)
+        if url.path.startswith("/repos/wnzn/metro/git/"):
+            entry = self.server.git_objects.get(url.path)
+            return self.reply(200, json.dumps(entry).encode()) if entry else self.reply(404)
         if url.path == "/token":
             q = parse_qs(url.query)
             expected = "Basic " + base64.b64encode(f"actor:{SECRET}".encode()).decode()
@@ -245,7 +251,7 @@ class RegistryTests(unittest.TestCase):
         result = self.dir / f"{repo}.json"
         code, out, err = run(["push", "--repository", f"{reg.host}/owner/{repo}", "--allow-http-loopback",
                               "--user", "actor", "--token-env", "TEST_REGISTRY_TOKEN",
-                              "--version", version, "--revision", "abc", "--source", "https://x/y",
+                              "--version", version, "--revision", REV, "--source", "https://x/y", "--source-ref", "refs/heads/master",
                               "--expect-platforms", "linux/amd64,linux/arm64", "--result", str(result),
                               *map(str, archives)])
         self.assertNotIn(SECRET, out + err)
@@ -264,6 +270,10 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual([m["platform"] for m in index["manifests"]],
                              [{"architecture": "amd64", "os": "linux"}, {"architecture": "arm64", "os": "linux"}])
             self.assertNotIn("latest", {ref for _, ref in reg.manifests})
+            self.assertEqual(index["annotations"], {
+                "org.opencontainers.image.version": "v1.2.3", "org.opencontainers.image.revision": REV,
+                "org.opencontainers.image.source": "https://x/y", "dev.metro.source-ref": "refs/heads/master"})
+            self.assertEqual(data["revision"], REV)
             code, out, err = run(["verify", "--repository", f"{reg.host}/owner/metro-server",
                                   "--allow-http-loopback", "--expect", str(result)])
             self.assertEqual(code, 0, err)
@@ -278,6 +288,16 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(code, 1)
             self.assertIn("refusing to move it", err)
             self.assertEqual(reg.manifests[("owner/metro-server", "v1.2.3")], (media, raw))
+
+    def test_push_rejects_mislabelled_platform_before_registry_access(self):
+        other = self.dir / "other.tar"
+        make_archive(other, "arm64", revision="0" * 40)
+        with registry() as reg:
+            code, err, _ = self.push(reg, self.amd, other)
+            self.assertEqual(code, 1)
+            self.assertIn("source label org.opencontainers.image.revision differs", err)
+            self.assertEqual(reg.manifests, {})
+            self.assertEqual(reg.auth_headers, [])
 
     def test_verify_detects_missing_platform_and_wrong_digest(self):
         with registry() as reg:
@@ -314,8 +334,9 @@ class RegistryTests(unittest.TestCase):
             _, _, server = self.push(reg, self.amd, self.arm)
             _, _, runner = self.push(reg, self.amd, self.arm, repo="metro-runner")
             out = self.dir / "evidence"
-            code, _, err = run(["evidence", "--version", "1.2.3", "--revision", "abc", "--out", str(out),
-                                "--signer-identity", "https://github.com/o/r/.github/workflows/release-images.yml@refs/tags/v1.2.3",
+            code, _, err = run(["evidence", "--version", "1.2.3", "--revision", REV, "--out", str(out),
+                                "--source-url", "https://github.com/wnzn/metro", "--source-ref", "refs/heads/master",
+                                "--signer-identity", "https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/master",
                                 "--signer-issuer", "https://token.actions.githubusercontent.com",
                                 str(server), str(runner)])
             self.assertEqual(code, 0, err)
@@ -327,16 +348,74 @@ class RegistryTests(unittest.TestCase):
                 for platform, desc in image["platforms"].items():
                     self.assertIn(f"{desc['ref']}  {platform}", text)
             self.assertEqual(data["signature"]["type"], "sigstore-cosign-keyless")
-            self.assertIn("certificate identity: https://github.com/o/r/", text)
+            self.assertIn("certificate identity: https://github.com/wnzn/metro/.github/workflows/"
+                          "release-images.yml@refs/heads/master", text)
+            self.assertIn(f"# Source commit: {REV}", text)
+            self.assertIn(f"refs/heads/master (git tag v1.2.3 -> {REV})", text)
+            self.assertIn(f"org.opencontainers.image.revision={REV}", text)
+            self.assertEqual(data["source"], {"url": "https://github.com/wnzn/metro", "ref": "refs/heads/master",
+                                              "tag": "v1.2.3", "revision": REV})
+            self.assertEqual(data["signature"]["revision"], REV)
             for f in out.iterdir():
                 f.unlink()
             out.rmdir()
-            code, _, _ = run(["evidence", "--version", "1.2.3", "--revision", "abc", "--out", str(out),
+            code, _, _ = run(["evidence", "--version", "1.2.3", "--revision", REV, "--out", str(out),
                               str(server)])
             self.assertIn("NOT SIGNED", (out / "IMAGES.txt").read_text())
             for f in out.iterdir():
                 f.unlink()
             out.rmdir()
+
+
+class PublishedSourceTests(unittest.TestCase):
+    def test_version_tag_must_peel_to_triggering_commit(self):
+        with registry() as reg:
+            api = "/repos/wnzn/metro/git/"
+            ref = api + "ref/tags/v1.2.3"
+            args = ["check-tag", "--repository", "wnzn/metro", "--tag", "v1.2.3", "--commit", REV,
+                    "--api-url", "http://" + reg.host, "--allow-http-loopback"]
+            self.assertIn("does not exist", run(args)[2])
+            annotated = "1" * 40
+            tag = {"ref": "refs/tags/v1.2.3", "object": {"type": "tag", "sha": annotated}}
+            reg.git_objects[ref] = tag
+            reg.git_objects[api + "tags/" + annotated] = {"object": {"type": "commit", "sha": REV}}
+            self.assertEqual(run(args)[0], 0)
+            tag["object"] = {"type": "commit", "sha": REV}
+            self.assertEqual(run(args)[0], 0)
+            tag["object"]["sha"] = "2" * 40
+            self.assertIn("not " + REV, run(args)[2])
+            tag["object"]["type"] = "tree"
+            self.assertIn("does not name a commit", run(args)[2])
+
+    def test_signature_output_requires_exact_digest_and_signed_source(self):
+        repo, ref = "ghcr.io/wnzn/metro-server", "refs/heads/master"
+        source = "https://github.com/wnzn/metro"
+        identity = f"{source}/.github/workflows/release-images.yml@{ref}"
+        image_digest = digest(b"index")
+        good = {"critical": {"identity": {"docker-reference": f"{repo}@{image_digest}"},
+                             "image": {"docker-manifest-digest": image_digest}},
+                "optional": ir.source_annotations("1.2.3", REV, source, ref)}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "cosign.json"
+            args = ["check-signatures", "--cosign-json", str(path), "--repository", repo, "--digest", image_digest,
+                    "--revision", REV, "--version", "1.2.3", "--source-url", source, "--source-ref", ref,
+                    "--identity", identity, "--issuer", "https://token.actions.githubusercontent.com",
+                    "--workflow-repository", "wnzn/metro"]
+            path.write_text(json.dumps([good]))
+            self.assertEqual(run(args)[0], 0)
+            for mutate, message in (
+                (lambda d: d["critical"]["image"].update({"docker-manifest-digest": digest(b"other")}), "another digest"),
+                (lambda d: d["optional"].update({"org.opencontainers.image.revision": "0" * 40}), "signed annotation"),
+                (lambda d: d["optional"].pop("dev.metro.source-ref"), "signed annotation"),
+                (lambda d: d["optional"].update(Subject=identity.replace(ref, "refs/tags/v1.2.3")), "certificate claim"),
+            ):
+                with self.subTest(message):
+                    value = json.loads(json.dumps(good))
+                    mutate(value)
+                    path.write_text(json.dumps([value]))
+                    code, _, err = run(args)
+                    self.assertNotEqual(code, 0)
+                    self.assertIn(message, err)
 
 
 class WorkflowContractTests(unittest.TestCase):
@@ -370,20 +449,90 @@ class WorkflowContractTests(unittest.TestCase):
                 want["id-token"] = "write"
             self.assertEqual(granted, want, name)
 
-    def test_tag_guard_and_promotion_order(self):
+    def test_publishes_only_from_protected_master_of_wnzn_metro_via_ci(self):
+        head = self.text.split("\njobs:\n", 1)[0]
+        for needle in ("OFFICIAL_REPOSITORY: wnzn/metro\n", "OFFICIAL_REPOSITORY_ID: '1467654868'\n",
+                       "OFFICIAL_REF: refs/heads/master\n",
+                       "OFFICIAL_CALLER: wnzn/metro/.github/workflows/ci.yml@refs/heads/master\n"):
+            self.assertIn(needle, head)
         guard = self.jobs["guard"]
-        for needle in ('[ "$EVENT" = push ]', '"refs/tags/v$VERSION"', '"$REF_NAME" = "v$VERSION"',
-                       '"refs/tags/v$VERSION^{commit}")" = "$GITHUB_SHA"'):
+        for needle in ('[ "$EVENT" = push ]', '[ "$REPOSITORY" = "$OFFICIAL_REPOSITORY" ]',
+                       '[ "$REPOSITORY_ID" = "$OFFICIAL_REPOSITORY_ID" ]',
+                       '[ "$REF_TYPE" = branch ]', '[ "$REF" = "$OFFICIAL_REF" ]', '[ "$REF_PROTECTED" = true ]',
+                       '[ "$DELETED" = false ]', '[ "$AFTER" = "$GITHUB_SHA" ]', '[ "$CALLER" = "$OFFICIAL_CALLER" ]',
+                       "REF_PROTECTED: ${{ github.ref_protected }}", "DELETED: ${{ github.event.deleted }}",
+                       "CALLER: ${{ github.workflow_ref }}"):
             self.assertIn(needle, guard)
+        # push: false exits before the checks; everything after the exit is the publish gate.
+        self.assertLess(guard.index('[ "$PUSH" = true ] ||'), guard.index('[ "$EVENT" = push ]'))
+        gate = ("if: >- inputs.push && github.event_name == 'push' && github.repository == 'wnzn/metro' && "
+                "github.repository_id == '1467654868' && github.ref == 'refs/heads/master' && github.ref_type == 'branch' && "
+                "github.ref_protected && toJSON(github.event.deleted) == 'false' && github.event.after == github.sha && "
+                "github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master' &&")
+        for job in ("publish", "sign"):
+            self.assertIn(gate, " ".join(self.jobs[job].split()), job)
+        # Outputs come only from the sign job, which runs only when publishing.
+        self.assertEqual(re.findall(r"value: \$\{\{ jobs\.(\w+)\.", self.text), ["sign"] * 3)
+        for job in ("guard", "build", "media"):
+            self.assertNotIn("packages:", self.jobs[job])
+            self.assertNotRegex(self.jobs[job], r"image_release\.py push|cosign|docker push|docker login")
+
+    def test_runtime_guard_refuses_nonofficial_events(self):
+        guard = self.jobs["guard"].split("        run: |\n", 1)[1].split("      - uses:", 1)[0]
+        cmd = ["bash", "-c", textwrap.dedent(guard)]
+        caller = "wnzn/metro/.github/workflows/ci.yml@refs/heads/master"
+        env = dict(os.environ, PUSH="true", VERSION="1.2.3", EVENT="push", REPOSITORY="wnzn/metro",
+                   REPOSITORY_ID="1467654868", REF="refs/heads/master", REF_TYPE="branch", REF_PROTECTED="true",
+                   DELETED="false", AFTER=REV, GITHUB_SHA=REV, CALLER=caller, OFFICIAL_REPOSITORY="wnzn/metro",
+                   OFFICIAL_REPOSITORY_ID="1467654868", OFFICIAL_REF="refs/heads/master", OFFICIAL_CALLER=caller)
+        self.assertEqual(subprocess.run(cmd, env=env, capture_output=True).returncode, 0)
+        for bad in (dict(REF="refs/tags/v1.2.3", REF_TYPE="tag"), dict(REF="refs/heads/main"),
+                    dict(REF="refs/heads/Master"), dict(EVENT="pull_request"), dict(EVENT="workflow_dispatch"),
+                    dict(REPOSITORY_ID="1"), dict(REPOSITORY="WNZN/metro"), dict(REF_PROTECTED="false"),
+                    dict(DELETED="true"), dict(DELETED=""), dict(AFTER="0" * 40), dict(CALLER=caller.replace("ci.yml", "other.yml"))):
+            with self.subTest(bad):
+                self.assertNotEqual(subprocess.run(cmd, env=env | bad, capture_output=True).returncode, 0)
+                self.assertEqual(subprocess.run(cmd, env=env | bad | {"PUSH": "false"}, capture_output=True).returncode, 0)
+
+    def test_tag_is_checked_never_created_and_names_only_the_version(self):
+        guard, sign = self.jobs["guard"], self.jobs["sign"]
+        check = ('check-tag --repository "$GITHUB_REPOSITORY" \\\n            --tag "v$VERSION" '
+                 '--commit "$GITHUB_SHA" --token-env GH_READ_TOKEN')
+        self.assertIn(check, guard)
+        self.assertIn('--tag "v$VERSION" --commit "$GITHUB_SHA" --token-env GH_READ_TOKEN', sign)
+        for job, write in ((self.jobs["publish"], "image_release.py push"), (sign, "cosign sign")):
+            self.assertLess(job.index("check-tag"), job.index(write))
+        self.assertIn('sys.argv[1] == workspace == app', guard)
+        executable_lines = "\n".join(line for line in self.text.splitlines() if not line.lstrip().startswith("#"))
+        for forbidden in ("git tag", "git push", "/git/refs", "gh release", "GITHUB_REF_NAME", "ref_name",
+                          "refs/tags/v$VERSION:", "contents: write"):
+            self.assertNotIn(forbidden, executable_lines)
+        self.assertNotIn("github.ref_name", self.text)
+        self.assertIn('--source-ref "$OFFICIAL_REF" --expect-platforms', self.jobs["publish"])
+        self.assertIn('--source-ref "$GITHUB_REF" --builder', self.jobs["build"])
+
+    def test_promotion_order_and_signature_binding(self):
         self.assertIn("needs: [guard, build, media]", self.jobs["publish"])
         self.assertIn("needs: [guard, publish]", self.jobs["sign"])
-        self.assertIn("ubuntu-24.04-arm", guard)
+        self.assertIn("ubuntu-24.04-arm", self.jobs["guard"])
         self.assertIn("image_smoke.py", self.jobs["build"])
-        # Signed identity is this workflow at this tag; the digests file is uploaded after verification.
         sign = self.jobs["sign"]
-        self.assertIn("cosign sign --yes --recursive", sign)
-        self.assertIn("/.github/workflows/release-images.yml@refs/tags/v$VERSION", sign)
-        self.assertLess(sign.index("cosign verify"), sign.index("name: release-image-digests"))
+        self.assertIn('identity="$source_url/.github/workflows/release-images.yml@$OFFICIAL_REF"', sign)
+        self.assertIn('source_url="https://github.com/$OFFICIAL_REPOSITORY"', sign)
+        signed, verified = sign.split("cosign verify", 1)
+        annotations = ['-a "org.opencontainers.image.revision=$GITHUB_SHA"', '-a "org.opencontainers.image.version=v$VERSION"',
+                       '-a "org.opencontainers.image.source=$source_url"', '-a "dev.metro.source-ref=$OFFICIAL_REF"']
+        for a in annotations:
+            self.assertIn(a, signed.split("cosign sign", 1)[1])
+            self.assertIn(a, verified)
+        for flag in ('--certificate-identity "$identity"', '--certificate-oidc-issuer "$issuer"',
+                     '--certificate-github-workflow-repository "$OFFICIAL_REPOSITORY"',
+                     '--certificate-github-workflow-ref "$OFFICIAL_REF"',
+                     '--certificate-github-workflow-sha "$GITHUB_SHA"', "--certificate-github-workflow-trigger push",
+                     '--output json "$repo@$digest"', "image_release.py check-signatures"):
+            self.assertIn(flag, verified)
+        self.assertLess(sign.index("check-signatures"), sign.index("name: release-image-digests"))
+        self.assertIn('--source-ref "$OFFICIAL_REF"', sign.split("image_release.py evidence", 1)[1])
         self.assertNotIn("latest", self.text.replace("no `latest`", "").replace("No `latest`", ""))
 
     def test_registry_token_never_in_argv(self):
