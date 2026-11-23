@@ -472,3 +472,7 @@ RSS seen with the tiny random model says nothing about the real one.
 `cargo test --workspace`, the scripts in `tests/e2e/`, and `nsh test` in
 `apps/desktop`. How each recorded run was done, and its results, are in
 [acceptance.md](acceptance.md). Record every new verification run there.
+
+A self-hosted Linux runner for the repository's own CI (unrelated to Metro's
+Space runners) is described in
+[ops/github-runner/README.md](../ops/github-runner/README.md).
