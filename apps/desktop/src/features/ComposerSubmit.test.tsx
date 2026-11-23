@@ -30,20 +30,19 @@ async function chat(f: Pick<ReturnType<typeof world>, "network">) {
   return app;
 }
 
-async function pin(app: App) {
+async function pin(app: App, target: { id: string }) {
   await app.press("id:composer-model");
   await app.waitFor("id:composer-model-options");
   await app.press("id:composer-model-options");
-  await app.press("text:review · Work · openai");
-  await app.press("id:composer-thinking-options");
-  await app.press("text:high");
+  await app.press(`id:composer-model-options:${JSON.stringify([target.id, "review"])}`);
+  await app.press("id:composer-thinking-options:high");
   await app.press("text:Done");
 }
 
 test("Chat Return explicitly asks using the picked connection, model and effort; people and notes omit all three", async () => {
   const { f, posts, target } = setup();
   const app = await chat(f);
-  await pin(app);
+  await pin(app, target);
   const chosen = { provider_connection_id: target.id, model_id: "review", reasoning_effort: "high" };
   await app.type("id:composer", "Please review");
   await app.waitFor("text:Ask agent ↵");
@@ -66,7 +65,7 @@ test("Chat Return explicitly asks using the picked connection, model and effort;
   await app.waitUntil(() => posts().length === 4);
   expect(posts()[3]!.body.provider_connection_id).toBeUndefined();
   expect(posts()[3]!.body.invoke_agent).toBe(false);
-  await pin(app);
+  await pin(app, target);
   await app.type("id:composer", "demo ` @agent ` bob@agent here");
   await app.submit("id:composer");
   await app.waitUntil(() => posts().length === 5);
@@ -85,7 +84,7 @@ test("Chat Return explicitly asks using the picked connection, model and effort;
 test("System One keeps Return as Send; an unavailable pin blocks Ask but never blocks a note", async () => {
   const { f, target, posts } = setup(true);
   const app = await chat(f);
-  await pin(app);
+  await pin(app, target);
   await app.type("id:composer", "ordinary conversation");
   await app.submit("id:composer");
   await app.waitUntil(() => posts().length === 1);
@@ -106,12 +105,12 @@ test("System One keeps Return as Send; an unavailable pin blocks Ask but never b
 
 test("a file-only personal draft with a pinned chat connection still saves with Return", async () => {
   const w = attachmentWorld();
-  w.f.addConnection("alice", "openai", "Notes", "review");
+  const notes = w.f.addConnection("alice", "openai", "Notes", "review");
   const app = await chat(w);
   await app.press("id:composer-model");
   await app.waitFor("id:composer-model-options");
   await app.press("id:composer-model-options");
-  await app.press("text:review · Notes · openai");
+  await app.press(`id:composer-model-options:${JSON.stringify([notes.id, null])}`);
   await app.press("text:Done");
   app.onPick(() => [{ name: "notes.txt", type: "text/plain", data: new TextEncoder().encode("a note") }]);
   await app.press("id:attach");

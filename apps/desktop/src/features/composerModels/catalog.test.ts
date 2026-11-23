@@ -79,3 +79,38 @@ test("Space shares, pins and late responses cannot cross scopes or survive sign-
   await pending;
   expect(c.current("space-b")).toBeUndefined();
 });
+
+test("targets group by provider under canonical names and marks; custom endpoints fall back to lettermarks", async () => {
+  const c = createComposerCatalog();
+  const rows = [
+    model({ connectionId: "local", name: "Laptop", providerId: "device-openai-compatible", chatModels: [{ id: "qwen", reasoningEfforts: [] }] }),
+    model({ connectionId: "ds", name: "DS", providerId: "deepseek", chatModels: [{ id: "r1", reasoningEfforts: [] }] }),
+    model({ connectionId: "oauth", name: "ChatGPT", providerId: "device-openai-oauth", chatModels: [{ id: "gpt-x", reasoningEfforts: ["low", "high"] }] }),
+    model({ connectionId: "claude", name: "Claude", providerId: "anthropic", chatModels: [{ id: "opus", reasoningEfforts: [] }] }),
+    model({ connectionId: "api", name: "Work", providerId: "openai", chatModels: [{ id: "gpt-y", reasoningEfforts: [] }] }),
+    model({ connectionId: "mystery", name: "Lab", providerId: "acme-llm", chatModels: [{ id: "m", reasoningEfforts: [] }] }),
+  ];
+  await c.load(null, ok, async () => rows, async () => [{ id: "deepseek", name: "DeepSeek" }]);
+  const t = c.current(null)!.targets;
+  expect(t.map(x => [x.provider.name, x.model, x.connection])).toEqual([
+    ["OpenAI", "gpt-x", "ChatGPT"], ["OpenAI", "gpt-y", "Work"], ["Anthropic", "opus", "Claude"],
+    ["acme-llm", "m", "Lab"], ["DeepSeek", "r1", "DS"], ["Custom & self-hosted", "qwen", "Laptop"],
+  ]);
+  // Same provider, two connections: identities and levels stay with their own connection.
+  expect(t[0].choice).toEqual({ connectionId: "oauth", modelId: "gpt-x" });
+  expect(t[0].levels).toEqual(["low", "high"]);
+  expect(t[1].choice).toEqual({ connectionId: "api", modelId: "gpt-y" });
+  expect(t[1].levels).toEqual([]);
+  expect(t[0].provider.mark.logo).toBe("openai");
+  expect(t[4].provider.mark.logo).toBe("deepseek");
+  expect(t[3].provider.mark.logo).toBeUndefined();
+  expect(t[5].provider.mark.logo).toBeUndefined();
+  expect(t[5].provider.mark.letters).toBe("{}");
+  expect(t[0].label).toBe("gpt-x · ChatGPT · OpenAI");
+  // A failed provider catalog only loses the friendly name; every choice stays.
+  await c.load(null, ok, async () => rows, async () => { throw new Error("offline"); });
+  const again = c.current(null)!;
+  expect(again.phase).toBe("ready");
+  expect(again.targets.find(x => x.choice.connectionId === "ds")!.provider.name).toBe("deepseek");
+  expect(again.targets).toHaveLength(6);
+});
