@@ -10,10 +10,12 @@
 // CHROME defaults to the newest Playwright Chromium in ~/.cache/ms-playwright.
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { once } from "node:events";
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import { homedir, tmpdir } from "node:os";
 import { dirname, join } from "node:path";
+import { setTimeout as delay } from "node:timers/promises";
 import { fileURLToPath } from "node:url";
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -105,28 +107,85 @@ const port = server.address().port;
 
 // ------------------------------------------------------------------ chrome + CDP
 
-const profile = mkdtempSync(join(tmpdir(), "metro-admin-test-"));
-const chrome = spawn(findChrome(), [
-  "--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
-  `--user-data-dir=${profile}`, "--remote-debugging-port=0",
-  "--host-resolver-rules=MAP metro.lan 127.0.0.1", "about:blank",
-], { stdio: ["ignore", "ignore", "pipe"] });
-const wsUrl = await new Promise((resolve, reject) => {
-  let buf = "";
-  chrome.stderr.on("data", (d) => {
-    buf += d;
-    const m = /DevTools listening on (ws:\S+)/.exec(buf);
-    if (m) resolve(m[1]);
-  });
-  chrome.on("exit", () => reject(new Error("chrome exited")));
-  setTimeout(() => reject(new Error("chrome did not start")), 15000);
-});
-
-const ws = new WebSocket(wsUrl);
-await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
+let profile, chrome, chromeClosed, ws;
 let nextId = 0;
+
+async function startChrome() {
+  const executable = findChrome();
+  profile = mkdtempSync(join(tmpdir(), "metro-admin-test-"));
+  chrome = spawn(executable, [
+    "--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
+    `--user-data-dir=${profile}`, "--remote-debugging-port=0",
+    "--host-resolver-rules=MAP metro.lan 127.0.0.1", "about:blank",
+  ], { stdio: "ignore" });
+  chromeClosed = new Promise((resolve) => { chrome.once("close", resolve); });
+
+  const startup = new AbortController();
+  const { signal } = startup;
+  const abort = (message) => startup.abort(new Error(message));
+  chrome.on("error", (error) => abort(`could not start Chrome (${error.code || "spawn error"})`));
+  chrome.once("exit", (code, signal) => abort(`Chrome exited during startup (${signal || `code ${code}`})`));
+  const timer = setTimeout(() => abort("Chrome startup timed out after 60s waiting for DevTools"), 60_000);
+  try {
+    for (;;) {
+      let contents = "";
+      try {
+        contents = readFileSync(join(profile, "DevToolsActivePort"), "utf8").trim();
+      } catch (error) {
+        if (error.code !== "ENOENT") throw new Error("could not read Chrome DevToolsActivePort");
+      }
+      const [port, path] = contents.split(/\r?\n/);
+      // Chrome may not have finished writing both fields yet.
+      if (/^\d{1,5}$/.test(port) && +port > 0 && +port <= 65535 &&
+          /^\/devtools\/browser\/[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(path)) {
+        ws = new WebSocket(`ws://127.0.0.1:${port}${path}`);
+        ws.addEventListener("error", () => abort("could not open Chrome DevTools WebSocket"), { once: true });
+        await once(ws, "open", { signal });
+        return;
+      }
+      await delay(100, undefined, { signal });
+    }
+  } catch (error) {
+    signal.throwIfAborted();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function cleanup() {
+  let killTimer;
+  if (chrome?.pid && chrome.exitCode === null && chrome.signalCode === null) {
+    if (ws?.readyState === WebSocket.OPEN) {
+      // Let Chrome stop its helpers and finish writing the profile before removing it.
+      ws.send(JSON.stringify({ id: ++nextId, method: "Browser.close" }));
+    } else {
+      chrome.kill();
+    }
+    killTimer = setTimeout(() => chrome.kill("SIGKILL"), 5_000);
+  }
+  await chromeClosed;
+  clearTimeout(killTimer);
+  if (ws && ws.readyState < WebSocket.CLOSING) ws.close();
+  await new Promise((resolve) => {
+    server.close(resolve);
+    server.closeAllConnections();
+  });
+  if (profile) rmSync(profile, { recursive: true, force: true, maxRetries: 3 });
+}
+
+async function cleanupAndThrow(error) {
+  await cleanup();
+  throw error;
+}
+
+await startChrome().catch(cleanupAndThrow);
 const pending = new Map();
 const consoleMsgs = [];
+ws.onclose = () => {
+  for (const { reject } of pending.values()) reject(new Error("Chrome DevTools WebSocket closed"));
+  pending.clear();
+};
 ws.onmessage = (ev) => {
   const msg = JSON.parse(ev.data);
   if (msg.id && pending.has(msg.id)) {
@@ -138,17 +197,18 @@ ws.onmessage = (ev) => {
   }
 };
 const cdp = (method, params = {}, sessionId) => new Promise((resolve, reject) => {
+  if (ws.readyState !== WebSocket.OPEN) return reject(new Error("Chrome DevTools WebSocket is not open"));
   const id = ++nextId;
   pending.set(id, { resolve, reject });
   ws.send(JSON.stringify({ id, method, params, sessionId }));
 });
 
-const { targetId } = await cdp("Target.createTarget", { url: "about:blank" });
-const { sessionId } = await cdp("Target.attachToTarget", { targetId, flatten: true });
+const { targetId } = await cdp("Target.createTarget", { url: "about:blank" }).catch(cleanupAndThrow);
+const { sessionId } = await cdp("Target.attachToTarget", { targetId, flatten: true }).catch(cleanupAndThrow);
 const page = (m, p) => cdp(m, p, sessionId);
-await page("Runtime.enable");
-await page("Log.enable");
-await page("Page.enable");
+await page("Runtime.enable").catch(cleanupAndThrow);
+await page("Log.enable").catch(cleanupAndThrow);
+await page("Page.enable").catch(cleanupAndThrow);
 
 async function evaluate(expr) {
   const r = await page("Runtime.evaluate", { expression: expr, awaitPromise: true, returnByValue: true });
@@ -190,7 +250,10 @@ let passed = 0;
 const failures = [];
 async function test(name, fn) {
   try { await fn(); passed++; process.stdout.write(`ok   ${name}\n`); }
-  catch (e) { failures.push(name); process.stdout.write(`FAIL ${name}: ${e.message}\n`); }
+  catch (e) {
+    failures.push(name);
+    process.stdout.write(`FAIL ${name}: ${String(e.message).replace(/metro_[a-f0-9]{36}/g, "<redacted>")}\n`);
+  }
 }
 function assert(cond, msg) { if (!cond) throw new Error(msg); }
 const base = `http://127.0.0.1:${port}`;
@@ -541,9 +604,6 @@ await test("the page never logs to the console and has no CSP violations", async
   assert(exc.length === 0, "exceptions: " + exc.map((m) => m.params.exceptionDetails.text).join("; "));
 });
 
-ws.close();
-chrome.kill("SIGKILL");
-server.close();
-rmSync(profile, { recursive: true, force: true });
+await cleanup();
 process.stdout.write(`\n${passed} passed, ${failures.length} failed\n`);
-process.exit(failures.length ? 1 : 0);
+process.exitCode = failures.length ? 1 : 0;
