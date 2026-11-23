@@ -89,13 +89,13 @@ function titleOf(r: Reveal): string {
 function subtitleOf(r: Reveal): string {
   if (r.kind === "runner") {
     return r.reason === "created"
-      ? "Start the runner with Docker, then attach it to Spaces you own (Space › Manage › Runner)."
-      : "The old token stopped working in every Space this runner serves. Put the new one in its runner.env and restart the container.";
+      ? "Start it on its machine, then attach it to Spaces you own."
+      : "The old token stopped working in every Space this runner serves. Put the new one in its runner.token (or runner.env) and restart the runner.";
   }
   if (r.kind === "dedicated") return "This token serves this one Space only. Issuing a new one replaces it.";
-  if (nativeSetup(r)) return "Inference for this connection runs on this computer, in Metro itself. Pair it, sign in to the provider here, and approve the models it may serve.";
+  if (nativeSetup(r)) return "Runs on this computer, in Metro. Pair it, sign in to the provider here, and approve the models it may serve.";
   return r.reason === "created"
-    ? "This copy of Metro runs without its launcher (a development build or an operator's headless setup), so it can't set the connection up itself. An operator gives this token to metro-connector on the headless computer that serves it."
+    ? "This build of Metro can't set it up itself. Give this token to metro-connector on the headless computer that serves it."
     : "The old device token stopped working. Give the new one to metro-connector on the headless computer that serves it.";
 }
 
@@ -121,8 +121,8 @@ export function TokenReveal() {
           </Column>
 
           <If when={!nativeSetup(r())}>
-            <SettingsGroup title="Token" description="Shown once. It disappears when you press Done or leave this page, and Metro can't show it again.">
-              <SettingRow label="Copy it now and keep it in a private file (chmod 600). Never paste it into a command line or a chat." stacked>
+            <SettingsGroup title="Token" description="Shown once. Copy it now: after Done Metro can't show it again, and a new one stops this one.">
+              <SettingRow label="Keep it in a private file (chmod 600), never in a command line or a chat." stacked>
                 <Column gap={2}>
                   <SecretValue testID="runner-token-value" value={revealShown() ? r().token ?? MASK : MASK} />
                   <Row gap={2} wrap>
@@ -176,10 +176,10 @@ function RunnerSteps(props: { name: string }) {
     <Column gap={6}>
       <SettingsGroup
         title="Run the prebuilt runner"
-        description={`On the Linux machine that runs it (x64, kernel 5.6 or newer). None of these lines contains the token; you paste it into a private file yourself. ${RUNNER_SOURCE_NOTE}`}
+        description={`Linux x64, kernel 5.6 or newer. No line below contains the token. ${RUNNER_SOURCE_NOTE}`}
         testID="setup-standalone"
       >
-        <SettingRow label={`Metro Releases · ${releaseTag(APP_VERSION)}`} description={`This app is Metro ${APP_VERSION}: use ${runnerArchive(APP_VERSION)} and its .sha256 from the release tagged ${releaseTag(APP_VERSION)}.`}>
+        <SettingRow label={`Metro Releases · ${releaseTag(APP_VERSION)}`} description={`${runnerArchive(APP_VERSION)} and its .sha256`}>
           <Action testID="setup-releases" label="Open Metro Releases" variant="ghost" onPress={() => void openUrl(RELEASES_URL).catch(() => {})} />
         </SettingRow>
         <Step n={1} text={`Download the runner for ${releaseTag(APP_VERSION)}, check it and unpack it:`}>
@@ -191,7 +191,7 @@ function RunnerSteps(props: { name: string }) {
         <Step n={3} text="Start it. Its workspace holds a separate folder for each Space it serves (spaces/<space id>/):">
           <CopyBlock testID="setup-standalone-run" label="the command that starts the runner" text={standaloneRunCommand({ serverUrl: server(), runnerName: props.name, appVersion: APP_VERSION })} />
         </Step>
-        <Step n={4} text="Attach it to a Space you own: open the Space, then Manage › Runner. Attached means the Space sends it jobs, not that it is online." />
+        <Step n={4} text="Attach it to a Space you own: Space › Manage › Runner." />
         <SettingRow label="What it can do" description={RUNNER_TOOLS_NOTE} />
       </SettingsGroup>
 
@@ -206,7 +206,7 @@ function RunnerSteps(props: { name: string }) {
         />
       </Row>
       <If when={docker()}>
-        <SettingsGroup title="Run it with Docker" description={`With this version's image, ${runnerImage(APP_VERSION)}, when it's available. None of these lines contains the token; you paste it into runner.env yourself.`} testID="setup-docker-steps">
+        <SettingsGroup title="Run it with Docker" description={`Image ${runnerImage(APP_VERSION)}, when available. No line below contains the token.`} testID="setup-docker-steps">
           <Step n={1} text="Create runner.env, readable only by you:">
             <CopyBlock testID="setup-envfile" label="the command that creates runner.env" text={PRIVATE_ENV_FILE_COMMAND} />
           </Step>

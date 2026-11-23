@@ -75,15 +75,15 @@ function AddRunner() {
   };
   return (
     <SettingsGroup title="Add a runner" description="You'll get its token once, with the steps to start it." testID="add-runner-group">
-      <SettingRow label="Name" description="Something you'll recognise in a Space's runner list, such as the machine it runs on." stacked>
+      <SettingRow label="Name" description="Such as the machine it runs on." stacked>
         <Field testID="runner-name" accessibilityLabel="Runner name" value={name()} onChange={name.set} placeholder="Build box" maxLength={80} onSubmit={() => void submit()} />
       </SettingRow>
       <SettingRow
         label="Who can attach it"
         description={
           orgAdmin()
-            ? "Personal: only you, to Spaces you own. Organization: any Space owner on this server; only org admins manage it."
-            : "Personal: only you, to Spaces you own. Only organization admins can add organization runners."
+            ? "Personal: only you, to Spaces you own. Organization: any Space owner; org admins manage it."
+            : "Personal: only you, to Spaces you own. Org admins add organization runners."
         }
       >
         <SegmentedControl
@@ -108,7 +108,7 @@ function RunnerList() {
   return (
     <SettingsGroup
       title="Runners you can see"
-      description="Your personal runners and the organization's. Attached to a Space means that Space sends it jobs; it doesn't mean the runner is online."
+      description="Attached means a Space sends it jobs, not that it's online."
       testID="runner-list"
     >
       <If
@@ -120,7 +120,7 @@ function RunnerList() {
         {(list) => (
           <Column>
             <If when={list().length === 0}>
-              <SettingRow label="No runners yet" description="Add one above. Spaces without a runner still chat with their agent; only workspace tools are missing." />
+              <SettingRow label="No runners yet" description="Spaces without one still chat with their agent; only workspace tools are missing." />
             </If>
             <Each of={list()} key={(r) => r.id}>
               {(r) => <RunnerRow runner={r()} />}
