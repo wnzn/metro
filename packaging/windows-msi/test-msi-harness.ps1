@@ -353,29 +353,61 @@ $same = $true
 foreach ($n in $target.Keys) { if ($inheritedEnv[$n] -cne $target[$n]) { $same = $false } }
 Check ($same -and $inheritedEnv.Count -eq $target.Count + 1) 'environment plan: applied, the process environment is the account''s own (plus PSModulePath)'
 
-$folders = [ordered] @{ Profile = $childProfile; LocalAppData = "$childProfile\AppData\Local"; RoamingAppData = "$childProfile\AppData\Roaming"
+# Lexical containment.
+Check ((Test-InsideDirectory "$childProfile\AppData\Local" $childProfile) -and (Test-InsideDirectory "$childProfile/AppData" $childProfile)) 'containment: a folder under the profile is inside'
+Check (-not (Test-InsideDirectory $childProfile $childProfile)) 'containment: the profile itself is not inside itself'
+Check (-not (Test-InsideDirectory "${childProfile}0\AppData" $childProfile)) 'containment: a sibling with the same prefix is outside'
+Check (-not (Test-InsideDirectory "$childProfile\..\runneradmin\AppData" $childProfile) -and -not (Test-InsideDirectory "$childProfile\.\x" $childProfile)) 'containment: . and .. segments are refused'
+Check (-not (Test-InsideDirectory '' $childProfile) -and -not (Test-InsideDirectory "$childProfile\x" '')) 'containment: empty paths are refused'
+
+# Programs folder: the account's unexpanded HKCU value, or the default on a fresh profile.
+$own = [Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+$own['USERPROFILE'] = $childProfile; $own['APPDATA'] = "$childProfile\AppData\Roaming"
+$pf = Resolve-ProgramsFolder '%USERPROFILE%\AppData\Roaming\Microsoft\Windows\Start Menu\Programs' $own
+Check ($pf.Path -eq "$childProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs" -and $pf.Source -eq 'HKCU User Shell Folders') 'Programs: the HKCU value expands with the account''s own USERPROFILE'
+$pf = Resolve-ProgramsFolder '' $own
+Check ($pf.Path -eq "$childProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs" -and $pf.Source -eq 'default under APPDATA') 'Programs: a fresh profile without the value uses the default under its own APPDATA'
+$pf = Resolve-ProgramsFolder '%UNKNOWNVAR%\Programs' $own
+Check (-not (Test-InsideDirectory $pf.Path $childProfile)) 'Programs: an unexpandable value stays outside the profile (and fails ownership)'
+
+$folders = [ordered] @{ LocalAppData = "$childProfile\AppData\Local"; RoamingAppData = "$childProfile\AppData\Roaming"
                          Programs = "$childProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs" }
 $ownEnv = @{ USERPROFILE = $childProfile; LOCALAPPDATA = "$childProfile\AppData\Local"; APPDATA = "$childProfile\AppData\Roaming"
              TEMP = "$childProfile\AppData\Local\Temp"; TMP = "$childProfile\AppData\Local\Temp" }
-Check ((Get-OwnProfileProblems $childProfile $childProfile $folders $ownEnv).Count -eq 0) 'own profile: environment and known folders inside the SID''s listed profile'
+Check ((Get-OwnProfileProblems $childProfile $folders $ownEnv).Count -eq 0) 'own profile: environment and folders inside the SID''s listed profile'
 $parentEnv = @{ USERPROFILE = $parentProfile; LOCALAPPDATA = "$parentProfile\AppData\Local"; APPDATA = "$parentProfile\AppData\Roaming"
-                TEMP = "$parentProfile\AppData\Local\Temp"; TMP = "$parentProfile\AppData\Local\Temp" }
-$pp = Get-OwnProfileProblems $childProfile $childProfile $folders $parentEnv
-Check ($pp.Count -eq 6 -and $pp[0] -eq "USERPROFILE is '$parentProfile'") "own profile: the inherited parent environment is rejected ($($pp.Count) problems)"
-Check ((Get-OwnProfileProblems $childProfile 'C:\Users\someone' $folders $ownEnv)[0] -like "profile * is not the one listed for this SID*") 'own profile: a profile not listed for the SID is rejected'
-$sibling = [ordered] @{ Profile = $childProfile; LocalAppData = "${childProfile}0\AppData\Local" }
-$sp = Get-OwnProfileProblems $childProfile $childProfile $sibling $ownEnv
-Check ($sp -contains "known folder LocalAppData '${childProfile}0\AppData\Local' is outside the profile") 'own profile: a sibling folder with the same prefix is outside'
-Check ((Get-OwnProfileProblems $childProfile $childProfile ([ordered] @{ Profile = $parentProfile }) $ownEnv) -contains "known folder Profile is '$parentProfile'") 'own profile: a known Profile folder elsewhere is rejected'
+                TEMP = 'C:\Users\RUNNER~1\AppData\Local\Temp'; TMP = 'C:\Users\RUNNER~1\AppData\Local\Temp' }
+$pp = Get-OwnProfileProblems $childProfile $folders $parentEnv
+Check ($pp.Count -eq 5 -and $pp[0] -like "USERPROFILE is '$parentProfile'*") "own profile: the inherited parent environment is rejected ($($pp.Count) problems)"
+Check ((Get-OwnProfileProblems '' $folders $ownEnv)[0] -eq 'no profile is listed for this SID') 'own profile: no ProfileList entry is rejected'
+Check ((Get-OwnProfileProblems 'C:\Users\someone' $folders $ownEnv)[0] -like "USERPROFILE is * not the listed profile 'C:\Users\someone'") 'own profile: a profile not listed for the SID is rejected'
+$sibling = [ordered] @{ LocalAppData = "${childProfile}0\AppData\Local" }
+Check ((Get-OwnProfileProblems $childProfile $sibling $ownEnv) -contains "folder LocalAppData '${childProfile}0\AppData\Local' is outside the profile") 'own profile: a sibling folder with the same prefix is outside'
 
-# The P/Invoke source (documented Win32 calls on the process's own token) compiles.
+# A fresh, empty profile: missing folders are created only inside the verified profile.
+$fresh = Join-Path ([IO.Path]::GetTempPath()) ('fresh profile ' + [Guid]::NewGuid().ToString('N'))
+$outside = Join-Path ([IO.Path]::GetTempPath()) ('not the profile ' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $fresh | Out-Null
+try {
+    $tempDir = Join-Path (Join-Path (Join-Path $fresh 'AppData') 'Local') 'Temp'
+    Check ((Confirm-OwnDirectory $tempDir $fresh) -eq '' -and (Test-Path -LiteralPath $tempDir -PathType Container)) 'fresh profile: a missing Temp folder is created inside it'
+    Check ((Confirm-OwnDirectory $tempDir $fresh) -eq '') 'fresh profile: an existing folder is left as it is'
+    Check ((Confirm-OwnDirectory $outside $fresh) -like "*is outside the profile" -and -not (Test-Path -LiteralPath $outside)) 'fresh profile: nothing is created outside it'
+    $traversal = (Join-Path $fresh '..') + [IO.Path]::DirectorySeparatorChar + (Split-Path -Leaf $outside)
+    Check ((Confirm-OwnDirectory $traversal $fresh) -like "*is outside the profile" -and -not (Test-Path -LiteralPath $outside)) 'fresh profile: a .. path is not created'
+    $file = Join-Path $fresh 'AppData-file'
+    [IO.File]::WriteAllText($file, 'x')
+    Check ((Confirm-OwnDirectory $file $fresh) -like '*exists but is not a folder') 'fresh profile: a file in the way is reported'
+} finally { Remove-Item -LiteralPath $fresh -Recurse -Force; if (Test-Path -LiteralPath $outside) { Remove-Item -LiteralPath $outside -Recurse -Force } }
+
+# The P/Invoke source compiles and uses only CreateEnvironmentBlock on the process's own token.
 Add-Type -TypeDefinition $script:OwnUserSource
 $methods = @([MetroOwnUser].GetMethods() | Where-Object { $_.IsStatic -and $_.IsPublic } | ForEach-Object Name | Sort-Object)
-Check (($methods -join ',') -ceq 'EnvironmentBlock,KnownFolder,LongPath,ProfileDirectory') 'own-user API source compiles: EnvironmentBlock, KnownFolder, LongPath, ProfileDirectory'
+Check (($methods -join ',') -ceq 'EnvironmentBlock') 'own-user API source compiles: EnvironmentBlock only'
 $nonPublic = [Reflection.BindingFlags] 'NonPublic, Static'
 $imports = @([MetroOwnUser].GetMethods($nonPublic) | Where-Object { $_.Attributes -band [Reflection.MethodAttributes]::PinvokeImpl } | ForEach-Object Name | Sort-Object)
-Check (($imports -join ',') -ceq 'CloseHandle,CreateEnvironmentBlock,DestroyEnvironmentBlock,GetCurrentProcess,GetLongPathNameW,GetUserProfileDirectoryW,OpenProcessToken,SHGetKnownFolderPath') "own-user API uses only the documented calls ($($imports -join ', '))"
-Check ($script:OwnUserSource -notmatch 'AdjustTokenPrivileges|ImpersonateLoggedOnUser|DuplicateTokenEx|CreateProcessAsUser|SetTokenInformation|LogonUser') 'own-user API changes no token and starts no process'
+Check (($imports -join ',') -ceq 'CloseHandle,CreateEnvironmentBlock,DestroyEnvironmentBlock,GetCurrentProcess,OpenProcessToken') "own-user API uses only the documented calls ($($imports -join ', '))"
+Check ($script:OwnUserSource -notmatch 'SHGetKnownFolderPath|GetUserProfileDirectory|GetLongPathName|AdjustTokenPrivileges|ImpersonateLoggedOnUser|DuplicateTokenEx|CreateProcessAsUser|SetTokenInformation|LogonUser') 'own-user API passes no token to shell folder APIs and changes no token'
 
 # The child switches environment before anything touches a file, and takes paths only from its own token.
 $childLines = Get-Content -LiteralPath $child

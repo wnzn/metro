@@ -20,7 +20,7 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'MsiHarness.ps1')
 
 $out = Join-Path $Root 'out'
-$result = [ordered] @{ phase = $Phase; expect = $Expect; user_sid = ''; profile_dir = ''; inherited_userprofile = ''
+$result = [ordered] @{ phase = $Phase; expect = $Expect; stage = 'start'; user_sid = ''; profile_dir = ''; inherited_userprofile = ''; programs_source = ''
                      checks = [Collections.Generic.List[object]]::new(); error = '' }
 function Record([string] $Name, [bool] $Ok, [string] $Detail = '') {
     $result.checks.Add([ordered] @{ name = $Name; ok = $Ok; detail = $Detail })
@@ -43,24 +43,28 @@ try {
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     Record 'token is standard' ($tokenProblem -eq '' -and -not $isAdmin) "$tokenProblem$(if ($isAdmin) { ' (in the Administrators role)' })"
 
-    # The parent started this process for this account but with its own environment (USERPROFILE,
-    # LOCALAPPDATA, TEMP...). Before touching any file, switch to the environment
-    # Windows builds for this token and prove the profile is this SID's own.
-    $own = Initialize-OwnUserEnvironment
+    # The parent started this process for this account but with its own environment
+    # (USERPROFILE, LOCALAPPDATA, TEMP...). Before touching any file, switch to the
+    # environment Windows builds for this token (msiexec inherits it) and prove every
+    # path is inside the profile Windows lists for this SID.
+    $result.stage = 'own environment'
+    $own = Initialize-OwnUserEnvironment $result.user_sid
     $result.profile_dir = $own.ProfileDir
     $result.inherited_userprofile = $own.Inherited
+    $result.programs_source = $own.ProgramsSource
     $envNow = @{}
-    foreach ($k in 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP') {
-        $v = [Environment]::GetEnvironmentVariable($k)
-        $envNow[$k] = if ($v -and (Test-Path -LiteralPath $v)) { [MetroOwnUser]::LongPath($v) } else { $v }
-    }
-    $tempDir = [MetroOwnUser]::LongPath([IO.Path]::GetTempPath())
-    Record 'environment from own profile' ($envNow['USERPROFILE'] -eq $own.ProfileDir -and $tempDir.StartsWith($own.ProfileDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) `
-        "USERPROFILE '$($envNow['USERPROFILE'])', temp '$tempDir' (inherited USERPROFILE '$($own.Inherited)')"
-    $listed = [string] (Get-ItemPropertyValue -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($result.user_sid)" -Name ProfileImagePath)
-    $profileProblems = Get-OwnProfileProblems $own.ProfileDir ([Environment]::ExpandEnvironmentVariables($listed)) $own.Folders $envNow
+    foreach ($k in 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP') { $envNow[$k] = [Environment]::GetEnvironmentVariable($k) }
+    Record 'environment from own profile' ($own.ProfileDir -and $envNow['USERPROFILE'] -eq $own.ProfileDir) `
+        "USERPROFILE '$($envNow['USERPROFILE'])', listed profile '$($own.ProfileDir)' (inherited USERPROFILE '$($own.Inherited)')"
+    $result.stage = 'profile ownership'
+    $profileProblems = Get-OwnProfileProblems $own.ProfileDir $own.Folders $envNow
     Record 'profile belongs to own SID' ($profileProblems.Count -eq 0) ($profileProblems -join '; ')
+    # A fresh profile may lack some of these; create them only inside the verified profile.
+    $result.stage = 'own folders'
+    $missing = @(foreach ($k in 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP') { $why = Confirm-OwnDirectory $envNow[$k] $own.ProfileDir; if ($why) { "${k}: $why" } })
+    Record 'own folders exist' ($missing.Count -eq 0) ($missing -join '; ')
 
+    $result.stage = 'windows installer'
     $installer = New-Object -ComObject WindowsInstaller.Installer
     $uc = [string] $spec.upgrade_code
     Record 'no product before' ((Get-RelatedProducts $installer $uc).Count -eq 0)
@@ -90,7 +94,7 @@ try {
         Record 'shortcut removed' (-not (Test-Path -LiteralPath $lnk))
     }
 } catch {
-    $result.error = "$(Format-FailureLocation $_): $($_.Exception.Message)"
+    $result.error = "stage '$($result.stage)', $(Format-FailureLocation $_): $($_.Exception.Message)"
 } finally {
     $json = $result | ConvertTo-Json -Depth 5
     [IO.File]::WriteAllText((Join-Path $out "$Phase.json"), $json, [Text.UTF8Encoding]::new($false))
