@@ -1,7 +1,13 @@
 name: Windows signing
 
-# Reusable, tag-only. Called only by release-publish.yml, in the same workflow
-# run as windows-distribution.yml (release: true), with
+# Reusable, official master releases only: a push (not a deletion) to the
+# protected literal master branch of wnzn/metro whose top-level workflow is
+# ci.yml on master, building exactly github.sha. Tags, pull requests and other
+# branches are refused by the guard job, by a job-level `if:` on both signing
+# jobs (before any runner, including a self-hosted one, is assigned) and by
+# winsign.py release-context before any credential is touched. Called only by
+# release-publish.yml, in the same workflow run as windows-distribution.yml
+# (release: true), with
 #   permissions: { contents: read, id-token: write }
 # No triggers of its own and no secrets: Azure Artifact Signing authenticates
 # with GitHub OIDC; the kms backend uses a certificate pre-provisioned in the
@@ -20,7 +26,7 @@ on:
   workflow_call:
     inputs:
       version:
-        description: 'Release version without the leading v; must equal the pushed tag.'
+        description: 'Release version without the leading v, from CI (not derived from any ref name).'
         type: string
         required: true
     outputs:
@@ -33,7 +39,7 @@ permissions:
   contents: read
 
 jobs:
-  # Tag guard and seed re-verification, before any job can reach a credential.
+  # Release-context guard and seed re-verification, before any job can reach a credential.
   guard:
     runs-on: ubuntu-24.04
     permissions:
@@ -44,23 +50,13 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
-      - name: Only this repository's pushed version tag, from ci.yml
+      - name: Only a push to protected master of wnzn/metro from ci.yml, at exactly github.sha
         env:
           VERSION: ${{ inputs.version }}
-          EVENT: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_PROTECTED: ${{ github.ref_protected }}
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          REPO: ${{ github.repository }}
           BACKEND: ${{ vars.METRO_WINDOWS_SIGNING_BACKEND }}
         run: |
           set -eu
-          printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]{1,40})?$' \
-            || { echo "invalid version input" >&2; exit 1; }
-          [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && [ "$REF" = "refs/tags/v$VERSION" ] && [ "$REF_PROTECTED" = true ] \
-            && [ "$WORKFLOW_REF" = "$REPO/.github/workflows/ci.yml@refs/tags/v$VERSION" ] \
-            || { echo "Windows release signing runs only for a pushed, protected v$VERSION tag from ci.yml" >&2; exit 1; }
+          python3 -I packaging/windows-signing/winsign.py release-context --version "$VERSION" --head "$(git rev-parse HEAD)" >/dev/null
           case "$BACKEND" in azure|kms) ;; *) echo "METRO_WINDOWS_SIGNING_BACKEND must be azure or kms" >&2; exit 1 ;; esac
       - name: Signing helper tests
         run: python3 -B -m unittest discover -s packaging/windows-signing -v
@@ -82,6 +78,7 @@ jobs:
   # SignTool on files the verifier staged under the job's own temp directory.
   sign:
     needs: guard
+    if: github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master' && github.ref_protected && !github.event.deleted && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
     runs-on: ${{ vars.METRO_WINDOWS_SIGNING_BACKEND == 'kms' && fromJSON(vars.METRO_WINDOWS_SIGNING_RUNNER) || 'windows-2025' }}
     environment: windows-release-signing
     permissions:
@@ -134,7 +131,7 @@ jobs:
           $files = Get-Content -LiteralPath "$work\to-sign.txt" | Where-Object { $_ }
           Invoke-MetroReleaseSigning -Version $env:VERSION -WorkRoot $work -Files $files
           $pub = Get-MetroPublisherArgs $env:METRO_WINDOWS_PUBLISHER_CN $env:METRO_WINDOWS_PUBLISHER_ORG
-          $zip = Invoke-WinSign finalize --work $work --mode official --out-dir "$t\signed-stage" @pub
+          $zip = Invoke-WinSign finalize --work $work --mode official --out-dir "$t\signed-stage" --commit $env:GITHUB_SHA @pub
           "zip=$zip" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
@@ -177,7 +174,7 @@ jobs:
           set -- --publisher-cn "$PUBLISHER_CN"
           [ -z "$PUBLISHER_ORG" ] || set -- "$@" --publisher-org "$PUBLISHER_ORG"
           python3 -I "$w" extract-final --zip "$RUNNER_TEMP/signed-stage/Metro-$VERSION-windows-x64.zip" --version "$VERSION" \
-            --mode official --expect-sha256 "$ZIP_SHA256" --tree-out "$RUNNER_TEMP/tree" "$@" >/dev/null
+            --mode official --expect-sha256 "$ZIP_SHA256" --tree-out "$RUNNER_TEMP/tree" --expect-commit "$GITHUB_SHA" "$@" >/dev/null
           python3 -I "$m" fetch-tools --dest "$RUNNER_TEMP/msi-tools"
           mkdir "$RUNNER_TEMP/msi"
           msi="$RUNNER_TEMP/msi/Metro-$VERSION-windows-x64.msi"
@@ -202,6 +199,7 @@ jobs:
   # Signs exactly the MSI checked above, matched by hash.
   sign-msi:
     needs: [guard, msi]
+    if: github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master' && github.ref_protected && !github.event.deleted && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
     runs-on: ${{ vars.METRO_WINDOWS_SIGNING_BACKEND == 'kms' && fromJSON(vars.METRO_WINDOWS_SIGNING_RUNNER) || 'windows-2025' }}
     environment: windows-release-signing
     permissions:
@@ -317,7 +315,7 @@ jobs:
           $pub = Get-MetroPublisherArgs $env:PUBLISHER_CN $env:PUBLISHER_ORG
           Invoke-WinSign verify-dist --dist "$t\dist" --version $env:VERSION --mode official --scripts-dir packaging `
             --tree-out "$t\tree" --sums-out "$t\windows-SHA256SUMS" --expect-zip-sha256 $env:ZIP_SHA256 `
-            --expect-seed-sha256 $env:SEED_SHA256 @pub | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+            --expect-seed-sha256 $env:SEED_SHA256 --expect-commit $env:GITHUB_SHA @pub | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           Invoke-WinSign verify-seed --seed-dir "$t\unsigned" --version $env:VERSION --mode official --work "$t\seed-check" `
             --scripts-dir packaging --expect-sha256 $env:SEED_SHA256 | Out-Null
           "zip=$env:ZIP_SHA256" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT

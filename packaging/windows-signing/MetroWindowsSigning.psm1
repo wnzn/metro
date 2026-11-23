@@ -93,17 +93,15 @@ function Invoke-MetroSigning {
     }
 }
 
-# The only context in which release credentials may be used: a push of a
-# vMAJOR.MINOR.PATCH[-pre] tag whose top-level workflow is this repository's
-# ci.yml at that same tag, building exactly that version.
+# The only context in which release credentials may be used: a push (not a
+# deletion) to the protected literal master branch of wnzn/metro, whose
+# top-level workflow is ci.yml on master, with the pushed commit checked out.
+# winsign.py release-context holds the rules (and their tests).
 function Assert-MetroReleaseContext([string] $Version) {
-    if ($Version -notmatch '^\d+\.\d+\.\d+(-[0-9A-Za-z.\-]{1,40})?$') { Fail 'invalid release version' }
-    $ref = "refs/tags/v$Version"
-    if ($env:GITHUB_EVENT_NAME -ne 'push' -or $env:GITHUB_REF_TYPE -ne 'tag' -or $env:GITHUB_REF -cne $ref -or
-        $env:GITHUB_REF_PROTECTED -ne 'true' -or
-        $env:GITHUB_WORKFLOW_REF -cne "$env:GITHUB_REPOSITORY/.github/workflows/ci.yml@$ref") {
-        Fail "release signing runs only for a pushed, protected tag v$Version from .github/workflows/ci.yml"
-    }
+    $head = & git -C $env:GITHUB_WORKSPACE rev-parse HEAD
+    if ($LASTEXITCODE -ne 0 -or -not $head) { Fail 'cannot read the checked-out commit' }
+    & python -I (Join-Path $PSScriptRoot 'winsign.py') release-context --version $Version --head ([string] $head).Trim() | Out-Null
+    if ($LASTEXITCODE -ne 0) { Fail 'release signing runs only for a push to protected master of wnzn/metro from ci.yml' }
 }
 
 function Install-MetroArtifactSigningClient([string] $Version, [string] $Sha256, [string] $Dest) {
@@ -449,7 +447,9 @@ function Test-MetroMsiInstall {
 function Invoke-MetroVerifierSelfTest {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $Tree, [Parameter(Mandatory)] [string] $Msi, [Parameter(Mandatory)] [string] $SourceScripts)
-    if ($env:GITHUB_REF_TYPE -eq 'tag') { Fail 'the throwaway-certificate self-test never runs for tags' }
+    if ($env:GITHUB_REF_TYPE -eq 'tag' -or ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF -eq 'refs/heads/master')) {
+        Fail 'the throwaway-certificate self-test never runs for master pushes or tags'
+    }
     $tool = Get-MetroSignTool
     $subject = 'Metro CI throwaway self-test (not a release signer)'
     $scratch = Join-Path ([IO.Path]::GetTempPath()) ('metro-self-test-' + [Guid]::NewGuid().ToString('N'))

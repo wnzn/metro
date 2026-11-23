@@ -58,6 +58,15 @@ EXECUTABLE_SUFFIXES = (".exe", ".dll", ".sys", ".com", ".scr", ".cpl", ".ocx", "
                        ".wsf", ".wsh", ".hta", ".lnk", ".reg", ".jar")
 SEMVER = re.compile(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]{1,40})?")
 HEX64 = re.compile(r"[0-9a-f]{64}")
+# The only context in which official (signing) mode may run: a push, not a
+# deletion, to the protected literal master branch of this repository, whose
+# top-level workflow is ci.yml on master, building exactly the pushed commit.
+# Tags, pull requests and any other branch are never official.
+OFFICIAL_REPOSITORY = "wnzn/metro"
+OFFICIAL_REF = "refs/heads/master"
+OFFICIAL_WORKFLOW_REF = f"{OFFICIAL_REPOSITORY}/.github/workflows/ci.yml@{OFFICIAL_REF}"
+SHA = re.compile(r"[0-9a-f]{40}")
+
 # The MSI's local-runner choice installs this empty file next to Metro.exe
 # (packaging/windows-msi); it is the only file an installed folder may add.
 MARKER = "enable-local-runner"
@@ -703,6 +712,36 @@ def verify_seed(args):
     print(digest)
 
 
+def release_context(env, head, version):
+    """Fail unless `env` (a GitHub Actions environment) is the official release context."""
+    def bad(what):
+        return f"official Windows signing refused: {what} (only a push to protected {OFFICIAL_REF} of " \
+               f"{OFFICIAL_REPOSITORY} from ci.yml is official)"
+    require(SEMVER.fullmatch(version or ""), bad("invalid version input"))
+    require(env.get("GITHUB_EVENT_NAME") == "push", bad(f"event is {env.get('GITHUB_EVENT_NAME')!r}"))
+    require(env.get("GITHUB_REPOSITORY") == OFFICIAL_REPOSITORY, bad("another repository"))
+    require(env.get("GITHUB_REF") == OFFICIAL_REF and env.get("GITHUB_REF_TYPE") == "branch",
+            bad(f"ref is {env.get('GITHUB_REF')!r}"))
+    require(env.get("GITHUB_REF_PROTECTED") == "true", bad("the branch is not protected"))
+    require(env.get("GITHUB_WORKFLOW_REF") == OFFICIAL_WORKFLOW_REF, bad("the top-level workflow is not ci.yml on master"))
+    sha = env.get("GITHUB_SHA", "")
+    require(SHA.fullmatch(sha), bad("no commit SHA"))
+    require(head == sha, bad("the checked-out commit is not the pushed commit"))
+    try:
+        event = json.loads(Path(env.get("GITHUB_EVENT_PATH", "")).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise Failure(bad("unreadable event payload")) from error
+    require(isinstance(event, dict) and event.get("deleted") is False and event.get("ref") == OFFICIAL_REF
+            and event.get("after") == sha
+            and (event.get("repository") or {}).get("full_name") == OFFICIAL_REPOSITORY,
+            bad("the push event is a deletion or does not match the commit"))
+    return sha
+
+
+def check_release_context(args):
+    print(release_context(os.environ, args.head, args.version))
+
+
 def load_summary(work):
     summary = json.loads((Path(work) / "seed.json").read_text(encoding="utf-8"))
     require(summary["manifest"]["files"]["ui/Metro.exe"] == STOCK_RENDERER_SHA256, "seed summary renderer mismatch")
@@ -743,9 +782,12 @@ def write_zip(stage, output, root, modes):
 
 def finalize(args):
     official = args.mode == "official"
+    require(SHA.fullmatch(args.commit or ""), "--commit must be the 40-hex commit being built")
     require(not official or args.publisher_cn, "official mode needs the expected publisher CN")
     work = Path(args.work)
     summary = load_summary(work)
+    if official:
+        release_context(os.environ, args.commit, summary["version"])
     require(summary["mode"] == args.mode, "the seed was verified for a different mode")
     exes = tuple(summary["exes"])
     root = summary["root"]
@@ -778,6 +820,7 @@ def finalize(args):
     manifest["signing"] = {
         "mode": "authenticode" if official else "unsigned-preview",
         "seed_sha256": summary["seed_sha256"],
+        "commit": args.commit,
         "stock_renderer_unsigned_sha256": STOCK_RENDERER_SHA256,
         "files": record,
     }
@@ -794,11 +837,11 @@ def finalize(args):
         else:
             require(sha256_bytes(data) == info["unsigned_sha256"], f"{script} must stay unsigned in preview mode")
         (out / script).write_bytes(data)
-    verify_zip(out / name, summary["version"], args.mode, args.publisher_cn, args.publisher_org)
+    verify_zip(out / name, summary["version"], args.mode, args.publisher_cn, args.publisher_org, expect_commit=args.commit)
     print(sha256_file(out / name))
 
 
-def verify_zip(zip_path, version, mode, publisher_cn=None, publisher_org=None, tree_out=None):
+def verify_zip(zip_path, version, mode, publisher_cn=None, publisher_org=None, tree_out=None, expect_commit=None):
     """Re-extract the final ZIP into a fresh directory and verify everything in it."""
     official = mode == "official"
     root = f"Metro-{version}-{TARGET}"
@@ -809,7 +852,8 @@ def verify_zip(zip_path, version, mode, publisher_cn=None, publisher_org=None, t
         require(set(members) == set(manifest["files"]) | {"RELEASE.json"}, "final ZIP entries differ from RELEASE.json")
         check_modes(members)
         signing = manifest["signing"]
-        require(set(signing) == {"mode", "seed_sha256", "stock_renderer_unsigned_sha256", "files"}
+        require(set(signing) == {"mode", "seed_sha256", "commit", "stock_renderer_unsigned_sha256", "files"}
+                and SHA.fullmatch(str(signing["commit"])) and (expect_commit is None or signing["commit"] == expect_commit)
                 and signing["mode"] == ("authenticode" if official else "unsigned-preview")
                 and signing["stock_renderer_unsigned_sha256"] == STOCK_RENDERER_SHA256
                 and set(signing["files"]) == set(exes), "invalid RELEASE.json signing record")
@@ -871,7 +915,8 @@ def verify_dist(args):
     require(present == expected, f"distribution files {sorted(present)} are not the expected {sorted(expected)}")
     for name in (zip_name, msi_name):
         require(sha256_file(dist / name) == read_sidecar(dist / (name + ".sha256"), name), f"{name} does not match its .sha256")
-    manifest = verify_zip(dist / zip_name, version, args.mode, args.publisher_cn, args.publisher_org, args.tree_out)
+    manifest = verify_zip(dist / zip_name, version, args.mode, args.publisher_cn, args.publisher_org, args.tree_out,
+                          expect_commit=args.expect_commit)
     if args.expect_zip_sha256:
         require(sha256_file(dist / zip_name) == args.expect_zip_sha256, "ZIP differs from the one finalized in this run")
     if args.expect_seed_sha256:
@@ -906,7 +951,8 @@ def verify_dist(args):
 
 def extract_final(args):
     require(sha256_file(args.zip) == args.expect_sha256, "final ZIP differs from the one finalized in this run")
-    verify_zip(args.zip, args.version, args.mode, args.publisher_cn, args.publisher_org, args.tree_out)
+    verify_zip(args.zip, args.version, args.mode, args.publisher_cn, args.publisher_org, args.tree_out,
+               expect_commit=args.expect_commit)
     print(Path(args.tree_out))
 
 
@@ -1010,6 +1056,7 @@ def main(argv=None):
     f.add_argument("--work", required=True)
     f.add_argument("--mode", required=True, choices=("official", "preview"))
     f.add_argument("--out-dir", required=True)
+    f.add_argument("--commit", required=True, help="the commit being built (github.sha); recorded in RELEASE.json")
     publisher(f)
     f.set_defaults(func=finalize)
     z = sub.add_parser("extract-final")
@@ -1018,6 +1065,7 @@ def main(argv=None):
     z.add_argument("--mode", required=True, choices=("official", "preview"))
     z.add_argument("--expect-sha256", required=True)
     z.add_argument("--tree-out", required=True)
+    z.add_argument("--expect-commit")
     publisher(z)
     z.set_defaults(func=extract_final)
     d = sub.add_parser("verify-dist")
@@ -1029,6 +1077,7 @@ def main(argv=None):
     d.add_argument("--sums-out")
     d.add_argument("--expect-zip-sha256")
     d.add_argument("--expect-seed-sha256")
+    d.add_argument("--expect-commit")
     publisher(d)
     d.set_defaults(func=verify_dist)
     i = sub.add_parser("verify-installed")
@@ -1054,6 +1103,10 @@ def main(argv=None):
     m.add_argument("--msi", required=True)
     m.add_argument("--expect", required=True, choices=("unsigned", "signed"))
     m.set_defaults(func=msi_state)
+    c = sub.add_parser("release-context", help="fail unless this is the official master-branch release context")
+    c.add_argument("--version", required=True)
+    c.add_argument("--head", required=True, help="the checked-out commit (git rev-parse HEAD)")
+    c.set_defaults(func=check_release_context)
     n = sub.add_parser("inspect", help="structural Authenticode checks of one signed file")
     n.add_argument("path")
     publisher(n)

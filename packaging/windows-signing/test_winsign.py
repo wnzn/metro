@@ -460,6 +460,71 @@ def jobs(text):
     return dict(zip(parts[1::2], parts[2::2]))
 
 
+class ReleaseContext(unittest.TestCase):
+    SHA = "a" * 40
+
+    def context(self, tmp, event=None, **env):
+        payload = {"ref": "refs/heads/master", "after": self.SHA, "deleted": False,
+                   "repository": {"full_name": "wnzn/metro"}}
+        payload.update(event or {})
+        path = Path(tmp) / "event.json"
+        path.write_text(json.dumps(payload))
+        base = {"GITHUB_EVENT_NAME": "push", "GITHUB_REPOSITORY": "wnzn/metro", "GITHUB_REF": "refs/heads/master",
+                "GITHUB_REF_TYPE": "branch", "GITHUB_REF_PROTECTED": "true", "GITHUB_SHA": self.SHA,
+                "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master",
+                "GITHUB_EVENT_PATH": str(path)}
+        base.update(env)
+        return base
+
+    def test_official_master_push(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertEqual(winsign.release_context(self.context(tmp), self.SHA, "0.3.0"), self.SHA)
+
+    def test_everything_else_is_refused(self):
+        other = "b" * 40
+        cases = {
+            "tag push": dict(GITHUB_REF="refs/tags/v0.3.0", GITHUB_REF_TYPE="tag"),
+            "pull request": dict(GITHUB_EVENT_NAME="pull_request", GITHUB_REF="refs/pull/1/merge"),
+            "pull_request_target": dict(GITHUB_EVENT_NAME="pull_request_target"),
+            "workflow_dispatch": dict(GITHUB_EVENT_NAME="workflow_dispatch"),
+            "main branch": dict(GITHUB_REF="refs/heads/main",
+                                GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/ci.yml@refs/heads/main"),
+            "master-like branch": dict(GITHUB_REF="refs/heads/master2"),
+            "unprotected master": dict(GITHUB_REF_PROTECTED="false"),
+            "fork": dict(GITHUB_REPOSITORY="someone/metro"),
+            "other workflow": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/release.yml@refs/heads/master"),
+            "workflow from a tag": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/ci.yml@refs/tags/v0.3.0"),
+            "no sha": dict(GITHUB_SHA=""),
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            for name, env in cases.items():
+                with self.subTest(name), self.assertRaisesRegex(winsign.Failure, "refused"):
+                    winsign.release_context(self.context(tmp, **env), self.SHA, "0.3.0")
+            for name, event in {"deleted branch": {"deleted": True}, "missing deleted": {"deleted": None},
+                                "event for another commit": {"after": other},
+                                "event for another ref": {"ref": "refs/tags/v0.3.0"},
+                                "event from another repository": {"repository": {"full_name": "x/metro"}}}.items():
+                with self.subTest(name), self.assertRaisesRegex(winsign.Failure, "refused"):
+                    winsign.release_context(self.context(tmp, event), self.SHA, "0.3.0")
+            with self.assertRaisesRegex(winsign.Failure, "checked-out commit"):
+                winsign.release_context(self.context(tmp), other, "0.3.0")
+            for version in ("", "v0.3.0", "master", "0.3"):
+                with self.subTest(version), self.assertRaisesRegex(winsign.Failure, "invalid version"):
+                    winsign.release_context(self.context(tmp), self.SHA, version)
+            with self.assertRaisesRegex(winsign.Failure, "unreadable event"):
+                winsign.release_context(self.context(tmp, GITHUB_EVENT_PATH=str(Path(tmp) / "missing.json")), self.SHA, "0.3.0")
+
+    def test_official_finalize_refuses_outside_master(self):
+        import os
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, self.context(tmp, GITHUB_REF="refs/tags/v0.3.0")), \
+                mock.patch.object(winsign, "load_summary", return_value={"version": "0.3.0"}):
+            args = winsign.argparse.Namespace(mode="official", commit=self.SHA, publisher_cn="Metro", publisher_org=None,
+                                              work=tmp, out_dir=str(Path(tmp) / "out"))
+            with self.assertRaisesRegex(winsign.Failure, "refused"):
+                winsign.finalize(args)
+
+
 class Trees(unittest.TestCase):
     def test_marker_is_allowed_only_when_asked_and_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -520,7 +585,14 @@ class Workflows(unittest.TestCase):
         self.assertIn("if: ${{ !inputs.release }}", jobs(text)["preview"])
         self.assertIn("name: unsigned-desktop-windows-x64", jobs(text)["seed"])
 
-    def test_signing_is_tag_only_and_isolated(self):
+    def test_no_tag_or_ref_name_release_logic(self):
+        for name in ("windows-distribution.yml", "windows-sign.yml"):
+            text = self.read(name)
+            for forbidden in ("refs/tags", "ref_type", "ref_name", "github.head_ref", "pull_request"):
+                self.assertNotIn(forbidden, text, name)
+        self.assertIn("winsign.py release-context", jobs(self.read("windows-distribution.yml"))["seed"])
+
+    def test_signing_is_master_only_and_isolated(self):
         text = self.read("windows-sign.yml")
         self.check_common(text)
         head = text.split("\njobs:", 1)[0]
@@ -539,7 +611,15 @@ class Workflows(unittest.TestCase):
                 self.assertNotIn("build-msi", body)
             else:
                 self.assertIn("runs-on: ubuntu-24.04" if job in ("guard", "msi") else "runs-on: windows-2025", body)
-        self.assertIn("refs/tags/v$VERSION", all_jobs["guard"])
+        self.assertIn("winsign.py release-context", all_jobs["guard"])
+        guard_if = ("    if: github.event_name == 'push' && github.repository == 'wnzn/metro' && "
+                    "github.ref == 'refs/heads/master' && github.ref_protected && !github.event.deleted && "
+                    "github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'\n")
+        for job in ("sign", "sign-msi"):
+            # Job-level, so no runner (self-hosted included) is assigned outside the official context.
+            self.assertIn(guard_if, all_jobs[job])
+            self.assertIn("--commit $env:GITHUB_SHA" if job == "sign" else "Assert-MetroReleaseContext", all_jobs[job])
+        self.assertIn("--expect-commit $env:GITHUB_SHA", all_jobs["verify"])
         self.assertIn("name: dist-desktop-windows-x64", all_jobs["verify"])
 
     def test_module_allowlist_matches_winsign(self):

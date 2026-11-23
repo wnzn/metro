@@ -10,16 +10,20 @@ name: Windows distribution
 #                   installs it on a fresh Windows VM, runs the MSI lane's native
 #                   tests and self-tests the verifiers with a throwaway
 #                   certificate. Uploads dist-desktop-windows-x64.
-#   release: true   Pushed vX.Y.Z[-pre] tag from ci.yml only. Verifies the seed
-#                   for an official release (metro-tui.exe required) and uploads
+#   release: true   Only a push (not a deletion) to protected master of
+#                   wnzn/metro whose top-level workflow is ci.yml on master,
+#                   with exactly github.sha checked out; tags, pull requests
+#                   and other branches are refused. Verifies the seed for an
+#                   official release (metro-tui.exe required) and uploads
 #                   exactly the seed ZIP and its .sha256 as
-#                   unsigned-desktop-windows-x64 for windows-sign.yml.
+#                   unsigned-desktop-windows-x64 for windows-sign.yml. Still
+#                   read-only: no environment, credential or OIDC.
 
 on:
   workflow_call:
     inputs:
       release:
-        description: 'Tag build: hand the verified seed to windows-sign.yml when true; unsigned preview when false.'
+        description: 'Official master release: hand the verified seed to windows-sign.yml when true; unsigned preview when false.'
         type: boolean
         default: false
       version:
@@ -28,7 +32,7 @@ on:
         required: true
     outputs:
       mode:
-        description: 'official (tag hand-off) or preview'
+        description: 'official (master release hand-off) or preview'
         value: ${{ jobs.seed.outputs.mode }}
       seed-sha256:
         value: ${{ jobs.seed.outputs.seed-sha256 }}
@@ -53,23 +57,16 @@ jobs:
         with:
           persist-credentials: false
       - id: mode
-        name: Mode (official only for this repository's pushed version tag)
+        name: Mode (official only for a push to protected master of wnzn/metro from ci.yml)
         env:
           RELEASE: ${{ inputs.release }}
           VERSION: ${{ inputs.version }}
-          EVENT: ${{ github.event_name }}
-          REF: ${{ github.ref }}
-          REF_TYPE: ${{ github.ref_type }}
-          WORKFLOW_REF: ${{ github.workflow_ref }}
-          REPO: ${{ github.repository }}
         run: |
           set -eu
           printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]{1,40})?$' \
             || { echo "invalid version input" >&2; exit 1; }
           if [ "$RELEASE" = true ]; then
-            [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && [ "$REF" = "refs/tags/v$VERSION" ] \
-              && [ "$WORKFLOW_REF" = "$REPO/.github/workflows/ci.yml@refs/tags/v$VERSION" ] \
-              || { echo "the official Windows hand-off runs only for a pushed v$VERSION tag from ci.yml" >&2; exit 1; }
+            python3 -I packaging/windows-signing/winsign.py release-context --version "$VERSION" --head "$(git rev-parse HEAD)" >/dev/null
             echo mode=official >> "$GITHUB_OUTPUT"
           else
             echo mode=preview >> "$GITHUB_OUTPUT"
@@ -109,13 +106,14 @@ jobs:
         name: Preview - repack unsigned, build the unsigned-preview MSI and the MSI test fixtures
         env:
           VERSION: ${{ inputs.version }}
+          COMMIT: ${{ github.sha }}
         run: |
           set -eu
           w=packaging/windows-signing/winsign.py
           python3 -I "$w" prepare --work "$RUNNER_TEMP/work" --scripts-dir packaging >/dev/null
-          zip="$(python3 -I "$w" finalize --work "$RUNNER_TEMP/work" --mode preview --out-dir "$RUNNER_TEMP/stage")"
+          zip="$(python3 -I "$w" finalize --work "$RUNNER_TEMP/work" --mode preview --out-dir "$RUNNER_TEMP/stage" --commit "$COMMIT")"
           python3 -I "$w" extract-final --zip "$RUNNER_TEMP/stage/Metro-$VERSION-windows-x64.zip" --version "$VERSION" \
-            --mode preview --expect-sha256 "$zip" --tree-out "$RUNNER_TEMP/tree" >/dev/null
+            --mode preview --expect-sha256 "$zip" --tree-out "$RUNNER_TEMP/tree" --expect-commit "$COMMIT" >/dev/null
           m=packaging/windows-msi/build_msi.py
           python3 -I "$m" fetch-tools --dest "$RUNNER_TEMP/msi-tools"
           require=""
@@ -184,6 +182,7 @@ jobs:
           SEED_SHA256: ${{ needs.seed.outputs.seed-sha256 }}
           ZIP_SHA256: ${{ needs.seed.outputs.zip-sha256 }}
           MSI_SHA256: ${{ needs.seed.outputs.msi-sha256 }}
+          COMMIT: ${{ github.sha }}
         run: |
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
           python -I -c "import sys; assert sys.version_info >= (3, 11), sys.version"
@@ -197,7 +196,7 @@ jobs:
           [IO.File]::WriteAllText("$t\dist\$name.sha256", "$env:MSI_SHA256  $name`n", [Text.UTF8Encoding]::new($false))
           Invoke-WinSign verify-dist --dist "$t\dist" --version $env:VERSION --mode preview --scripts-dir packaging `
             --tree-out "$t\tree" --sums-out "$t\windows-SHA256SUMS" --expect-zip-sha256 $env:ZIP_SHA256 `
-            --expect-seed-sha256 $env:SEED_SHA256 | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+            --expect-seed-sha256 $env:SEED_SHA256 --expect-commit $env:COMMIT | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
           New-Item -ItemType Directory "$t\logs" | Out-Null
           Test-MetroMsiCandidate -Msi "$t\dist\$name" -Tree "$t\tree" -Version $env:VERSION -Mode preview -Expect unsigned -LogDir "$t\logs"
           "MSI_NAME=$name" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV

@@ -4,8 +4,35 @@ This folder holds the helpers behind two reusable workflows:
 
 - `.github/workflows/windows-distribution.yml`, which runs on every build and
   never signs anything;
-- `.github/workflows/windows-sign.yml`, which runs only for a release tag and
-  signs.
+- `.github/workflows/windows-sign.yml`, which runs only for an official
+  release from `master` and signs.
+
+## Official release context
+
+Official mode is allowed only for a `push` event to the protected literal
+`refs/heads/master` branch of `wnzn/metro`. The push must not be a branch
+deletion, the top-level workflow must be exactly
+`wnzn/metro/.github/workflows/ci.yml@refs/heads/master`, and the checked-out
+commit must equal `github.sha`. The push event payload must agree on the
+`ref`, the `after` commit and the repository.
+
+- Tags, pull requests, `main`, other branches, forks and manual dispatches are
+  never official.
+- The version comes from CI as the `version` input. Nothing reads it from a
+  ref name. Output names use that version, `Metro-<version>-windows-x64.*`.
+- `RELEASE.json` → `signing.commit` records `github.sha`, so every output can
+  be traced to its commit. `verify-dist` and `extract-final` check it with
+  `--expect-commit`.
+
+The rules are in `winsign.py release-context`, together with their negative
+tests. The following places check them:
+
+- the `seed` job of `windows-distribution.yml`, before the hand-off
+- the `guard` job of `windows-sign.yml`
+- a job-level `if:` on `sign` and `sign-msi`, so no runner (self-hosted
+  included) is assigned outside this context
+- `Assert-MetroReleaseContext`, before any credential is fetched
+- `winsign.py finalize --mode official`
 
 Nothing here generates, imports or stores a key or certificate. Nothing has
 been signed for real yet: the official path has only been exercised with the
@@ -41,25 +68,23 @@ synthetic signatures on real 0.2.0 binaries.
   lane's test fixtures. The `preview` job (`windows-2025`) checks, installs and
   self-tests them. No environment, variable, OIDC token or self-hosted runner
   is used.
-- **`release: true`**: allowed only for a pushed `v<version>` tag whose
-  top-level workflow is `ci.yml` at that tag. The seed is verified in official
-  mode, which requires `metro-tui.exe`, and then exactly the seed ZIP and its
-  `.sha256` are uploaded as `unsigned-desktop-windows-x64`.
+- **`release: true`**: allowed only in the official release context above.
+  The seed is verified in official mode, which requires `metro-tui.exe`, and
+  then exactly the seed ZIP and its `.sha256` are uploaded as
+  `unsigned-desktop-windows-x64`. This mode is still read-only.
 - **Outputs:** `mode` and `seed-sha256`.
 
 ### `windows-sign.yml`
 
 - **Inputs:** `version` only.
-- **Caller:** called only by `release-publish.yml`, only for pushed,
-  protected tags (`github.ref_protected`), with
-  `permissions: { contents: read, id-token: write }`. It must run in the same
-  workflow run as `windows-distribution.yml` (`release: true`), because it
-  downloads `unsigned-desktop-windows-x64` without a run id. The top-level
-  workflow must be `.github/workflows/ci.yml`; every job checks
-  `GITHUB_WORKFLOW_REF`.
+- **Caller:** called only by `release-publish.yml`, only in the official
+  release context, with `permissions: { contents: read, id-token: write }`.
+  It must run in the same workflow run as `windows-distribution.yml`
+  (`release: true`), because it downloads `unsigned-desktop-windows-x64`
+  without a run id.
 - **Jobs:**
-  - `guard`: runs on hosted Ubuntu with no credentials. It checks the tag, the
-    version and the backend, then verifies the hand-off again.
+  - `guard`: runs on hosted Ubuntu with no credentials. It checks the release
+    context and the backend, then verifies the hand-off again.
   - `sign`: runs in the `windows-release-signing` environment with
     `id-token: write`. It signs `Metro.exe`, `metro-server.exe`,
     `metro-tui.exe`, `ui/Metro.exe`, `install-metro-windows.ps1` and
@@ -181,7 +206,8 @@ Internal artifacts, kept for three days and never named `dist-*`:
   the MSI signature. Both verifiers must reject the throwaway signature, and
   tampering must show as `HashMismatch`. The certificate is removed
   afterwards, and nothing from the self-test is uploaded. The self-test
-  refuses to run for tags and doesn't exist in `windows-sign.yml`.
+  refuses to run for `master` pushes and for tags, and it doesn't exist in
+  `windows-sign.yml`.
 
 ## MSI lane interface (`packaging/windows-msi`)
 
@@ -197,8 +223,8 @@ python3 -I packaging/windows-msi/build_msi.py fixtures --tools "$TOOLS" --dest "
 pwsh -File packaging/windows-msi/test-msi-windows.ps1 -FixturesDir "$FIXTURES" -Msi "$MSI" -Version "$VERSION" [-RequireFile metro-tui.exe]
 ```
 
-- `$TREE` is the verified extraction of the final ZIP. On tags it holds the
-  signed EXEs, and its `RELEASE.json` includes the `signing` record.
+- `$TREE` is the verified extraction of the final ZIP. For official releases
+  it holds the signed EXEs, and its `RELEASE.json` includes the `signing` record.
 - This lane relies on these properties of the MSI:
   - It installs exactly the tree, plus the empty `enable-local-runner` marker
     when the local-runner choice is on.
@@ -228,10 +254,13 @@ starts:
 
 ### Environment `windows-release-signing`
 
-- **Deployment branches and tags:** selected tags only, `v*`. Protect `v*`
-  tags with a tag ruleset (restricted creation, no deletion or update).
+- **Deployment branches and tags:** selected branches only, exactly `master`,
+  with no tag rules. Protect `master` with a ruleset (pull requests required,
+  no force pushes, no deletion).
+- **Name:** the environment name stays `windows-release-signing`, so the
+  Azure federated subject doesn't change.
 - **Required reviewers:** recommended. The environment gates both `sign` and
-  `sign-msi`, so a tag asks for approval twice.
+  `sign-msi`, so each release asks for approval twice.
 - **Variables for the `azure` backend:**
   - `METRO_ARTIFACT_SIGNING_ENDPOINT`: the regional
     `https://<region>.codesigning.azure.net`, which must match the account's
@@ -289,7 +318,7 @@ Runner requirements:
   10.0.22621.755 or newer, and the vendor's KSP or CSP.
 - The certificate is installed with its private key only in the HSM or KSP.
 - The runner is in a runner group that's limited to this repository and to
-  the workflow `<owner>/<repo>/.github/workflows/windows-sign.yml@refs/tags/v*`.
+  the workflow `wnzn/metro/.github/workflows/windows-sign.yml@refs/heads/master`.
   Check how your GitHub plan matches reusable workflows. The label is unique
   to that group.
 - Ephemeral or `--ephemeral` registration is recommended. No other jobs run on
@@ -311,8 +340,8 @@ you. The workflow, the verifiers and the release output are the same for both.
 - **No real signing has run.** No release certificate exists in this
   repository. The official path, both backends, SignTool's handling of the LF
   ASCII `.ps1` files, and the trust checks on a hosted VM have never been run.
-  The first tag will be the first real run, and the preview self-test is the
-  only native SignTool exercise before then.
+  The first official `master` release will be the first real run, and the
+  preview self-test is the only native SignTool exercise before then.
 - **Windows SmartScreen reputation** isn't something CI can check.
 - **Native Windows hasn't run yet.** Neither this lane's Windows steps nor
   the MSI lane's `test-msi-windows.ps1` have run on Windows so far.
