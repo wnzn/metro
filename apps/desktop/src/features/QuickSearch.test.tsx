@@ -11,6 +11,9 @@ import { libraryWorld } from "./library/test/fixtures";
 type Req = { method: string; url: string; headers: unknown; body?: string | null };
 type Wire = { assets: unknown[]; messages: unknown[] };
 
+/** A request body as one comparable string, whatever its key order. */
+const canonical = (body: Record<string, unknown>) => JSON.stringify(Object.keys(body).sort().map((k) => [k, body[k]]));
+
 function quickWorld() {
   const w = libraryWorld();
   const q = {
@@ -19,7 +22,7 @@ function quickWorld() {
     answers: new Map<string, (user: string) => Wire>(),
     /** Answers delayed by query (ms of test time), to test late ones; `answered` records when each came back. */
     delay: new Map<string, number>(),
-    answered: [] as { query: string; at: number }[],
+    answered: [] as { query: string; body: string; at: number }[],
     /** Answers to these queries wait for `release()`. */
     hold: new Set<string>(),
     held: [] as (() => void)[],
@@ -35,7 +38,7 @@ function quickWorld() {
     q.calls.push({ user, body });
     if (q.status !== 200) return { status: q.status, body: { error: "no" } };
     const answer = () => {
-      q.answered.push({ query: body.query, at: Date.now() });
+      q.answered.push({ query: body.query, body: canonical(body), at: Date.now() });
       return { status: 200, body: q.answers.get(body.query)?.(user) ?? { assets: [], messages: [] } };
     };
     if (q.hold.has(body.query)) return new Promise((resolve) => q.held.push(() => resolve(answer())));
@@ -78,6 +81,17 @@ async function poll(cond: () => boolean, ms = 10_000) {
     await new Promise((r) => setTimeout(r, 10));
   }
 }
+/**
+ * Waits until Metro was asked exactly this (query, scope, mode) and its answer
+ * came back, whatever partial queries typing asked on the way; the list then
+ * shows that answer, the newest one.
+ */
+async function lookedUp(app: App, w: QW, body: Record<string, unknown>) {
+  const want = canonical(body);
+  await app.waitUntil(() => w.q.answered.some((a) => a.body === want), { timeout: 10_000 });
+  expect(w.q.calls.at(-1)!.body).toEqual(body); // nothing asked after it
+}
+
 const semantic = (w: QW) => w.f.posts().filter((p) => p.path === "/v1/search" || p.path === "/v1/search/index");
 const quickCalls = (w: QW) => w.q.calls.length;
 
@@ -105,8 +119,9 @@ test("typing shows loading, then results with the file's own name and extension 
   expect(app.shows(`id:quick-asset:${photo.id} >> text:.jpg · Your personal library`)).toBe(true);
   expect(app.shows(`id:quick-message:acme:lobby:${ev.id} >> text:the roadmap review moved to Thursday`)).toBe(true);
   expect(app.shows(`id:quick-message:acme:lobby:${ev.id} >> text:bob · Acme`)).toBe(true);
-  // One lookup, global on the Chat page; no semantic search, no indexing, no model.
-  expect(w.q.calls.map((c) => c.body)).toEqual([{ query: "roadmap", scope: "all", mode: "all" }]);
+  // Global on the Chat page (typing may have asked for partial queries on the way); no semantic search, no indexing, no model.
+  expect(w.q.calls.at(-1)!.body).toEqual({ query: "roadmap", scope: "all", mode: "all" });
+  expect(w.q.calls.every((c) => c.body.scope === "all" && c.body.mode === "all")).toBe(true);
   expect(semantic(w)).toEqual([]);
   expect(app.shows("id:quick-loading")).toBe(false);
 });
@@ -220,13 +235,14 @@ test("a late answer for an older query is never shown", async () => {
   const typing = app.type("id:top-search", "x"); // "roadx": the first answer is stale now
   await poll(() => app.value("id:top-search") === "roadx");
   w.release(); // the answer for "road" arrives after the edit
-  await poll(() => w.q.answered.length === 1);
+  await poll(() => w.q.answered.some((a) => a.query === "road"));
   expect(app.shows(`id:quick-asset:${photo.id}`)).toBe(false);
   await Promise.all([running, typing]);
   expect(app.shows(`id:quick-asset:${photo.id}`)).toBe(false);
+  await lookedUp(app, w, { query: "roadx", scope: "all", mode: "all" });
   await app.waitFor("id:quick-empty");
-  expect(w.q.calls.map((c) => c.body.query)).toEqual(["road", "roadx"]);
-  expect(w.q.answered.map((a) => a.query)).toEqual(["road", "roadx"]);
+  const at = (q: string) => w.q.answered.findIndex((a) => a.query === q);
+  expect(at("road")).toBeLessThan(at("roadx")); // the stale answer came first and was dropped
   expect(app.shows(`id:quick-asset:${photo.id}`)).toBe(false);
 });
 
@@ -246,7 +262,7 @@ test("an answer that arrives after signing out never reaches the next session", 
   await Promise.all([running, menu, out]);
   expect(app.shows("id:quick-results")).toBe(false);
   expect(app.shows("id:connect-screen")).toBe(true);
-  expect(w.q.answered.map((a) => a.query)).toEqual(["roadmap"]);
+  expect(w.q.answered.some((a) => a.query === "roadmap")).toBe(true);
   await signIn(w, "bob", app);
   await app.wait(200);
   expect(app.shows(`id:quick-asset:${photo.id}`)).toBe(false);
@@ -273,8 +289,8 @@ test("Search and Library keep their own mode and filters for the lookup", async 
   await app.waitFor("id:search-view");
   await app.press("id:search-scope:chat");
   await app.type("id:top-search", "plan");
+  await lookedUp(app, w, { query: "plan", scope: "chat", mode: "conversations" });
   await app.waitFor("id:quick-empty");
-  expect(w.q.calls.at(-1)!.body).toEqual({ query: "plan", scope: "chat", mode: "conversations" });
   await app.keyboard.press("escape");
 
   // The Library page: Documents & media, everything by default.
@@ -282,8 +298,8 @@ test("Search and Library keep their own mode and filters for the lookup", async 
   await app.waitFor("id:library-view");
   await app.clear("id:top-search");
   await app.type("id:top-search", "plan");
+  await lookedUp(app, w, { query: "plan", scope: "all", mode: "library" });
   await app.waitFor("id:quick-empty");
-  expect(w.q.calls.at(-1)!.body).toEqual({ query: "plan", scope: "all", mode: "library" });
 });
 
 test("a server without quick search says so, and More results still searches in full", async () => {
@@ -381,8 +397,8 @@ test("the Library page looks where its picker shows, and More and Return search 
   await app.keyboard.press("enter");
   await app.waitUntil(() => w.l.log.some((l) => l.url.endsWith("/v1/library/assets?scope=personal")));
   await app.type("id:top-search", "plan");
+  await lookedUp(app, w, { query: "plan", scope: "personal", mode: "library" });
   await app.waitFor("id:quick-empty");
-  expect(w.q.calls.at(-1)!.body).toEqual({ query: "plan", scope: "personal", mode: "library" });
   await app.press("id:quick-more");
   await app.waitFor("id:search-view");
   await app.waitUntil(() => libSearches(w).length === 1);
@@ -397,8 +413,8 @@ test("the Library page looks where its picker shows, and More and Return search 
   await app.waitUntil(() => w.l.log.some((l) => l.url.endsWith("scope=space&space_id=acme")));
   await app.clear("id:top-search");
   await app.type("id:top-search", "plan");
+  await lookedUp(app, w, { query: "plan", scope: "space", space_id: "acme", mode: "library" });
   await app.waitFor("id:quick-empty");
-  expect(w.q.calls.at(-1)!.body).toEqual({ query: "plan", scope: "space", space_id: "acme", mode: "library" });
   await app.submit("id:top-search");
   await app.waitFor("id:search-view");
   await app.waitUntil(() => libSearches(w).length === 2);
@@ -423,8 +439,8 @@ test("More from the general bar searches everything in its corpus, keeping the q
 
   // Files only: Documents & media, everything, any type.
   await app.type("id:top-search", "budget");
+  await lookedUp(app, w, { query: "budget", scope: "all", mode: "all" });
   await app.waitFor(`id:quick-asset:${doc.id}`);
-  expect(w.q.calls.at(-1)!.body).toEqual({ query: "budget", scope: "all", mode: "all" });
   await app.press("id:quick-more");
   await app.waitFor("id:search-view");
   await app.waitUntil(() => libSearches(w).length === 1);
