@@ -1,0 +1,9 @@
+# Files whose exact committed bytes are hashed, signed or compared across
+# Windows and Linux CI (packaging/package.py, packaging/windows-signing,
+# packaging/release_assets.py). Git never converts their line endings,
+# whatever core.autocrlf says. Deliberately narrow: all other files keep
+# Git's default behaviour.
+/apps/desktop/src/ui/icons/** -text
+/apps/desktop/src/ui/fonts/** -text
+/apps/desktop/assets/** -text
+/packaging/*.ps1 -text

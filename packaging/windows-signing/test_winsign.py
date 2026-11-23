@@ -688,6 +688,30 @@ class LegacyScriptCoexistence(unittest.TestCase):
         self.assertEqual(r.stdout.strip(), "True,False,False,False,False,False")
 
 
+@unittest.skipUnless(shutil.which("git") and (HERE.parents[1] / ".git").exists(), "needs a git checkout")
+class CrossPlatformBytes(unittest.TestCase):
+    """Files hashed, signed or compared across Windows and Linux CI keep their exact
+    committed bytes under core.autocrlf=true (hosted Windows runners): .gitattributes -text."""
+
+    def git(self, *args):
+        import subprocess
+        return subprocess.run(["git", "-C", str(HERE.parents[1]), *args], text=True, capture_output=True,
+                              check=True).stdout
+
+    def test_hashed_inputs_are_never_converted(self):
+        tracked = self.git("ls-files", "-z", "--", "apps/desktop/src/ui/icons", "apps/desktop/src/ui/fonts",
+                           "apps/desktop/assets", *(f"packaging/{s}" for s in winsign.SCRIPTS)).split("\0")
+        tracked = [t for t in tracked if t]
+        for needed in ("apps/desktop/src/ui/icons/LICENSE-brand-marks.txt", "apps/desktop/src/ui/fonts/OFL.txt",
+                       "apps/desktop/assets/metro.ico", *(f"packaging/{s}" for s in winsign.SCRIPTS)):
+            self.assertIn(needed, tracked)
+        self.assertTrue(any(t.endswith(".svg") for t in tracked))
+        out = self.git("-c", "core.autocrlf=true", "check-attr", "-z", "text", "--", *tracked).split("\0")
+        values = dict(zip(out[0::3], out[2::3]))
+        self.assertEqual({t for t in tracked if values.get(t) != "unset"}, set(),
+                         "these hashed inputs would get CRLF on a Windows checkout")
+
+
 class Trees(unittest.TestCase):
     def test_marker_is_allowed_only_when_asked_and_empty(self):
         with tempfile.TemporaryDirectory() as tmp:
