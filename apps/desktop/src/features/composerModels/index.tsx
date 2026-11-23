@@ -79,13 +79,15 @@ export function ComposerModelControls() {
   };
   const triggerLabel = () => {
     const pin = current()?.pin, t = selected();
-    if (!pin) return "Model: Default";
+    // Default sends no model or level: whichever model routing picks uses its provider's default thinking.
+    if (!pin) return `Model: Default model, your normal routing · Thinking: ${PROVIDER_DEFAULT}`;
     const thinking = `Thinking: ${pin.reasoningEffort ?? PROVIDER_DEFAULT}`;
     return `Model: ${t ? `${t.model} · ${t.connection} · ${t.provider.name}` : "Check selection"} · ${thinking}`;
   };
   const options = (): ModelOption[] => {
     const s = current(), chosen = selected()?.key, effort = s?.pin?.reasoningEffort;
-    return [{ value: "", model: "Default", title: "Default — your normal routing", detail: "Your normal routing" },
+    return [{ value: "", model: "Default model", title: `Default model — your normal routing — Thinking ${PROVIDER_DEFAULT}`,
+      detail: "Your normal routing", thinking: `Thinking: ${PROVIDER_DEFAULT}` },
       ...(s?.targets ?? []).map(t => option(t, t.key === chosen, effort))];
   };
   effect(() => {
@@ -100,7 +102,7 @@ export function ComposerModelControls() {
   return (
     <Column>
       <ComposerModelTrigger model={selected()?.model ?? (current()?.pin ? "Check selection" : null)}
-        thinking={current()?.pin ? current()?.pin?.reasoningEffort ?? PROVIDER_DEFAULT : null}
+        thinking={current()?.pin?.reasoningEffort ?? PROVIDER_DEFAULT}
         mark={selected()?.provider.mark ?? null} accessibilityLabel={triggerLabel()}
         onPress={() => { refresh(); open.set(true); }} />
       <Modal size="compact" open={open()} title="Model for agent turns" onClose={close}>

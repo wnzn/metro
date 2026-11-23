@@ -114,3 +114,52 @@ test("targets group by provider under canonical names and marks; custom endpoint
   expect(again.targets.find(x => x.choice.connectionId === "ds")!.provider.name).toBe("deepseek");
   expect(again.targets).toHaveLength(6);
 });
+
+function deferred<T>() {
+  let resolve!: (v: T) => void;
+  const promise = new Promise<T>(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+test("optional provider names never block rows; late names rename in place only while current", async () => {
+  const c = createComposerCatalog();
+  const rows = [model({ connectionId: "ds", name: "DS", providerId: "deepseek", chatModels: [{ id: "r1", reasoningEfforts: ["low", "high"] }] })];
+  const slow = deferred<{ id: string; name: string }[]>();
+  await c.load(null, ok, async () => rows, () => slow.promise);
+  const s = c.current(null)!;
+  expect(s.phase).toBe("ready");
+  expect(s.targets[0].provider.name).toBe("deepseek");
+  c.select(s, s.targets[0].key, "high");
+  const pinned = c.current(null)!;
+  // An Ask can already use the choice while the names are still pending.
+  expect(c.choice(null)).toEqual({ choice: { connectionId: "ds", modelId: "r1", reasoningEffort: "high" } });
+  expect(c.knownNoSystemOne(null)).toBe(true);
+  slow.resolve([{ id: "deepseek", name: "DeepSeek" }]);
+  await slow.promise;
+  await Promise.resolve();
+  // Same snapshot (open picker, in-progress fetch stay valid), renamed, pin and effort kept.
+  expect(c.current(null)).toBe(pinned);
+  expect(pinned.targets[0].provider.name).toBe("DeepSeek");
+  expect(pinned.targets[0].label).toBe("r1 · DS · DeepSeek");
+  expect(c.choice(null)).toEqual({ choice: { connectionId: "ds", modelId: "r1", reasoningEffort: "high" } });
+
+  // A scope switch before the names arrive: the late names never touch the new scope.
+  const late = deferred<{ id: string; name: string }[]>();
+  await c.load(null, ok, async () => rows, () => late.promise);
+  await c.load("space-a", ok, async () => rows, async () => { throw new Error("offline"); });
+  late.resolve([{ id: "deepseek", name: "Stale" }]);
+  await late.promise;
+  await Promise.resolve();
+  expect(c.current("space-a")!.targets[0].provider.name).toBe("deepseek");
+  expect(c.current("space-a")!.phase).toBe("ready");
+
+  // Names that never arrive leave rows usable; clearing drops them.
+  const never = deferred<{ id: string; name: string }[]>();
+  await c.load(null, ok, async () => rows, () => never.promise);
+  expect(c.current(null)!.targets).toHaveLength(1);
+  c.clear();
+  never.resolve([{ id: "deepseek", name: "Gone" }]);
+  await never.promise;
+  await Promise.resolve();
+  expect(c.current(null)).toBeUndefined();
+});

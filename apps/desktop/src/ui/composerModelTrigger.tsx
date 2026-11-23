@@ -53,7 +53,7 @@ export type ModelOption = {
 /**
  * The model list, grouped by provider under its mark and name. Searchable and
  * keyboard driven (arrows, typeahead, Return); each row says its thinking
- * levels so they read without opening anything else. Row testIDs are
+ * levels so they read without opening anything else (wrapping, never cut, in a narrow window). Row testIDs are
  * `${testID}:${value}`.
  */
 export function ModelOptionPicker(props: {
@@ -100,7 +100,7 @@ export function ModelOptionPicker(props: {
               <Text class={cx(textClass.sm, "text-popover-foreground group-selected:font-semibold")} style={{ numberOfLines: 1 }}>{o?.model ?? entry.title}</Text>
               <If when={o?.detail}>{d => <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 2 }}>{d()}</Text>}</If>
             </View>
-            <If when={o?.thinking}>{t => <Text class={cx(textClass.xs, "shrink-0 max-w-[45%] text-muted-foreground group-selected:text-foreground")} style={{ numberOfLines: 1 }}>{t()}</Text>}</If>
+            <If when={o?.thinking}>{t => <Text class={cx(textClass.xs, "shrink-0 max-w-[45%] text-right text-muted-foreground group-selected:text-foreground")} style={{ numberOfLines: 3 }}>{t()}</Text>}</If>
           </View>
         );
       }}

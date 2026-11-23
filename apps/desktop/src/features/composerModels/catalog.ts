@@ -62,36 +62,66 @@ function targets(rows: AvailableModel[], names: ReadonlyMap<string, string>): Ta
     .map(x => x.t);
 }
 
-type Snapshot = {
+type Fields = {
   scope: Scope; valid: () => boolean; phase: "loading" | "ready" | "failed";
-  targets: Target[]; systemOne: boolean; pin?: TurnModelChoice;
+  rows: AvailableModel[]; systemOne: boolean; pin?: TurnModelChoice; ticket: number;
 };
+type Snapshot = Fields & { readonly targets: Target[] };
 
 /** One active scope only. Refresh drops catalog metadata immediately, retaining only the
  * wire choice so loss of access or removal of an effort can never imply Default. */
 export function createComposerCatalog() {
   const state = signal<Snapshot | undefined>(undefined);
+  /** Provider names for one load: they only rename groups, never change a snapshot or its choices. */
+  const names = signal<{ ticket: number; map: ReadonlyMap<string, string> }>({ ticket: 0, map: new Map() });
+  const none: ReadonlyMap<string, string> = new Map();
   let generation = 0;
+  /** A snapshot whose targets follow the names as they arrive, keeping its identity (so a pin,
+   * the open picker and an in-progress fetch stay valid across the rename). */
+  function snapshot(f: Fields): Snapshot {
+    let cache: { map: ReadonlyMap<string, string>; targets: Target[] } | undefined;
+    return {
+      ...f,
+      get targets() {
+        const n = names();
+        const map = n.ticket === f.ticket ? n.map : none;
+        if (!cache || cache.map !== map) cache = { map, targets: targets(f.rows, map) };
+        return cache.targets;
+      },
+    };
+  }
+  const fields = (s: Snapshot): Fields => ({ scope: s.scope, valid: s.valid, phase: s.phase, rows: s.rows, systemOne: s.systemOne, pin: s.pin, ticket: s.ticket });
   function clear() {
     generation++;
     state.set(undefined);
   }
-  /** `providers` only names groups: when it fails, groups fall back to provider ids and nothing else changes. */
+  /**
+   * `providers` only names groups. Rows are usable as soon as they arrive, named
+   * from what Metro knows (else the provider id); names that arrive later apply
+   * only while this load is still the current one. A failed name request changes nothing.
+   */
   async function load(scope: Scope, valid: () => boolean, fetch: () => Promise<AvailableModel[]>,
     providers?: () => Promise<readonly ProviderName[]>) {
     const ticket = ++generation;
     const old = state();
-    const base = { scope, valid, pin: old?.scope === scope && old.valid() ? old.pin : undefined };
-    state.set({ ...base, phase: "loading", targets: [], systemOne: false });
+    const base = { scope, valid, ticket, pin: old?.scope === scope && old.valid() ? old.pin : undefined };
+    state.set(snapshot({ ...base, phase: "loading", rows: [], systemOne: false }));
+    const current = () => ticket === generation && valid();
+    // The rows go out first; the names never hold them up.
+    const pending = (async () => fetch())();
+    if (providers) {
+      void (async () => providers())().then(list => {
+        if (current()) names.set({ ticket, map: new Map(list.map(p => [p.id, p.name])) });
+      }, () => {});
+    }
     try {
-      const [rows, named] = await Promise.all([fetch(), providers ? providers().catch(() => []) : []]);
-      const names = new Map(named.map(p => [p.id, p.name]));
-      if (ticket !== generation || !valid()) return;
+      const rows = await pending;
+      if (!current()) return;
       const usable = rows.filter(m => m.ready !== false && (m.runsOn !== "your_own_sign_in" || m.ready === true)
         && (m.owned || m.visibility === "organization" || (scope !== null && m.visibility === "spaces")));
-      state.set({ ...base, phase: "ready", targets: targets(usable, names), systemOne: usable.some(m => m.capability === "system_one") });
+      state.set(snapshot({ ...base, phase: "ready", rows: usable, systemOne: usable.some(m => m.capability === "system_one") }));
     } catch {
-      if (ticket === generation && valid()) state.set({ ...base, phase: "failed", targets: [], systemOne: false });
+      if (current()) state.set(snapshot({ ...base, phase: "failed", rows: [], systemOne: false }));
     }
   }
   function current(scope: Scope | undefined) {
@@ -103,10 +133,10 @@ export function createComposerCatalog() {
   }
   function select(s: Snapshot, key: string | null, level?: string) {
     if (current(s.scope) !== s || s.phase !== "ready") return;
-    if (key === null) { state.set({ ...s, pin: undefined }); return; }
+    if (key === null) { state.set(snapshot({ ...fields(s), pin: undefined })); return; }
     const t = s.targets.find(t => t.key === key);
     if (!t || (level !== undefined && !t.levels.includes(level))) return;
-    state.set({ ...s, pin: level === undefined ? t.choice : { ...t.choice, reasoningEffort: level } });
+    state.set(snapshot({ ...fields(s), pin: level === undefined ? t.choice : { ...t.choice, reasoningEffort: level } }));
   }
   function choice(scope: Scope | undefined): { choice?: TurnModelChoice; error?: string } {
     const s = state();

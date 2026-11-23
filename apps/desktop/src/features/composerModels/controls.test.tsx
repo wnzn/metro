@@ -1,6 +1,8 @@
 import { expect, open, test } from "nsh/test";
 import { BASE, world } from "../../../test/fakeServer";
 
+const DEFAULT_LABEL = "label:Model: Default model, your normal routing · Thinking: Provider default";
+
 test("composer refreshes exact-scope metadata on open and drops a shared model on returning to personal Chat", async () => {
   const f = world();
   const get = `GET ${BASE}/v1/*`;
@@ -49,7 +51,7 @@ test("composer refreshes exact-scope metadata on open and drops a shared model o
   await app.waitFor("text:· high");
   expect(app.shows("text:b")).toBe(true);
   await app.press("label:Personal");
-  await app.waitFor("label:Model: Default");
+  await app.waitFor(DEFAULT_LABEL);
   expect(requests.at(-1)).toBe("");
   expect(requests.includes("?scope=any")).toBe(false);
 });
@@ -117,8 +119,9 @@ test("search finds models by provider name across connections; Default stays apa
     ] } };
   };
   const app = await open("./test/Harness.tsx", { network: f.network as any });
-  await app.waitFor("label:Model: Default");
+  await app.waitFor(DEFAULT_LABEL);
   await app.press("id:composer-model");
+  await app.waitFor("id:composer-model-options");
   await app.press("id:composer-model-options");
   await app.waitFor("id:composer-model-options-group:Anthropic");
   expect(app.shows("id:composer-model-options-group:Custom & self-hosted")).toBe(true);
@@ -134,14 +137,97 @@ test("search finds models by provider name across connections; Default stays apa
   await app.press("label:Done");
   await app.waitFor("label:Model: gpt-x · Work key · OpenAI · Thinking: Provider default");
   await app.press("id:composer-model");
+  await app.waitFor("id:composer-model-options");
   await app.press("id:composer-model-options");
   await app.press('id:composer-model-options:["plan","gpt-x"]');
   await app.press("id:composer-thinking-options:medium");
   await app.press("label:Done");
   await app.waitFor("label:Model: gpt-x · My plan · OpenAI · Thinking: medium");
   await app.press("id:composer-model");
+  await app.waitFor("id:composer-model-options");
   await app.press("id:composer-model-options");
   await app.press("id:composer-model-options:");
   await app.press("label:Done");
-  await app.waitFor("label:Model: Default");
+  await app.waitFor(DEFAULT_LABEL);
+});
+
+test("names that fail or arrive late never block choosing; they rename groups in place and keep the pin and effort", async () => {
+  const f = world();
+  const get = `GET ${BASE}/v1/*`;
+  const base = f.network[get]!;
+  const order: string[] = [];
+  let namesUp = false;
+  f.network[get] = async req => {
+    const url = new URL(req.url);
+    if (url.pathname === "/v1/provider-catalog") {
+      // Naming fails until the test lets it answer, then answers only well after the rows.
+      if (!namesUp) return { status: 503, body: { error: "unavailable" } };
+      await new Promise(r => setTimeout(r, 1500));
+      order.push("names");
+      return { status: 200, body: { providers: [{ id: "deepseek", name: "DeepSeek", requires_key: true, allow_custom_url: false,
+        execution: "server", capability: "chat", lists_models: true }], allowed_base_urls: [] } };
+    }
+    if (url.pathname !== "/v1/models/available") return base(req);
+    order.push("rows");
+    return { status: 200, body: { models: [{ connection_id: "ds", name: "DS key", provider_id: "deepseek", capability: "chat",
+      owned: true, execution: "server", runs_on: "your_connection", chat_models: [{ id: "r1", reasoning_efforts: ["low", "high"] }] }] } };
+  };
+  const app = await open("./test/Harness.tsx", { network: f.network as any });
+  // The unpinned trigger says Default model and its default thinking, naming no routed model.
+  await app.waitFor(DEFAULT_LABEL);
+  await app.waitFor("text:Default model");
+  await app.waitFor("text:· Provider default");
+  await app.press("id:composer-model");
+  await app.waitFor("id:composer-model-options");
+  await app.press("id:composer-model-options");
+  // Names failed: the group falls back to the provider id and every row is still a choice.
+  await app.waitFor("id:composer-model-options-group:deepseek");
+  expect(app.shows("text:Thinking: Provider default")).toBe(true);
+  await app.press('id:composer-model-options:["ds","r1"]');
+  await app.press("id:composer-thinking-options:high");
+  await app.press("label:Done");
+  await app.waitFor("label:Model: r1 · DS key · deepseek · Thinking: high");
+  // Reopening refreshes: the rows land first and the names well after, renaming the
+  // open picker's group while the choice and level stay.
+  namesUp = true;
+  const mark = order.length;
+  await app.press("id:composer-model");
+  await app.waitFor("text:DeepSeek", { timeout: 6000 });
+  const tail = order.slice(mark);
+  expect(tail.indexOf("rows")).toBeGreaterThan(-1);
+  expect(tail.indexOf("rows")).toBeLessThan(tail.indexOf("names"));
+  expect(app.shows("id:composer-thinking-options:high")).toBe(true);
+  await app.press("label:Done");
+  await app.waitFor("label:Model: r1 · DS key · DeepSeek · Thinking: high");
+});
+
+test("the keyboard alone searches, chooses a model and a thinking level", async () => {
+  const f = world();
+  const get = `GET ${BASE}/v1/*`;
+  const base = f.network[get]!;
+  f.network[get] = req => {
+    const url = new URL(req.url);
+    if (url.pathname !== "/v1/models/available") return base(req);
+    return { status: 200, body: { models: [
+      { connection_id: "api", name: "Work key", provider_id: "openai", capability: "chat", owned: true, execution: "server",
+        runs_on: "your_connection", chat_models: [{ id: "gpt-x", reasoning_efforts: [] }] },
+      { connection_id: "claude", name: "Claude", provider_id: "anthropic", capability: "chat", owned: true, execution: "server",
+        runs_on: "your_connection", chat_models: [{ id: "opus", reasoning_efforts: ["low", "high"] }] },
+    ] } };
+  };
+  const app = await open("./test/Harness.tsx", { network: f.network as any, platform: "linux" });
+  await app.waitFor(DEFAULT_LABEL);
+  await app.press("id:composer-model");
+  await app.waitFor("id:composer-model-options");
+  await app.press("id:composer-model-options");
+  await app.type("id:composer-model-options-search", "opus");
+  await app.keyboard.press("return");
+  await app.waitFor("id:composer-thinking-options");
+  // Return leaves the focus on the model list's trigger; Tab passes Fetch models to the levels.
+  await app.keyboard.press("tab");
+  await app.keyboard.press("tab");
+  await app.keyboard.press("right");
+  await app.keyboard.press("space");
+  await app.keyboard.press("escape");
+  await app.waitFor("label:Model: opus · Claude · Anthropic · Thinking: low");
 });
