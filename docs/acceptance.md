@@ -86,6 +86,17 @@ following natively in NSH/GTK:
 - Only the targeted tests above are recorded for `70587cb`. It isn't a
   release, and nothing was packaged.
 
+**Follow-up: extension badges, `8fcc32f`** (after `031d20c`; a visual
+change only). Extension badges now use semantic colors, and the rows have
+even gutters. The project manager checked this natively in dark and light
+at 1200×1000, and **More results** could still be reached from the
+keyboard at 780×560. At 720×560 a long `.MARKDOWN` badge stayed whole on
+one line, next to a shortened title. The eight new badge text/fill pairs
+per theme measured at least 5.60:1 in light and 9.78:1 in dark. `nsh
+check` and the release build passed, and QuickSearch passed 20/20.
+Evidence: `dist/ui-review/quick-search/extensions/` (`dark.png`,
+`light.png`). Nothing was released or packaged.
+
 ## Staged: desktop UI gate after 0.2.0 (2026-11-23, project manager, local)
 
 A **UI gate** on unreleased source after tag `v0.2.0`, reported by the
