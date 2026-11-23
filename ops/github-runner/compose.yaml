@@ -1,0 +1,99 @@
+# One self-hosted GitHub Actions runner for the public wnzn/metro repository.
+#
+#   ops/github-runner/runner.sh setup                    # once: checks policy, registers
+#   docker compose -f ops/github-runner/compose.yaml up -d
+#   docker compose -f ops/github-runner/compose.yaml down   # registration is kept
+#   ops/github-runner/runner.sh status | remove
+#
+# Network: the runner is attached only to `jobs`, an internal bridge with no
+# gateway (isolated) and no IPv6, so a job can't reach this host, the LAN or
+# the internet directly. Its only way out is the `egress` proxy, which is
+# also on `egress-out` and allows only the GitHub HTTPS endpoints Actions
+# needs. No published ports, no Docker socket, and no host directory mounts.
+name: metro-ci-runner
+
+services:
+  runner:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: metro-ci-runner:local
+    init: true
+    user: "1001:1001"
+    read_only: true
+    privileged: false
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 4
+    mem_limit: 6g
+    memswap_limit: 6g
+    pids_limit: 2048
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 1
+    environment:
+      HTTP_PROXY: http://egress:3128
+      HTTPS_PROXY: http://egress:3128
+      http_proxy: http://egress:3128
+      https_proxy: http://egress:3128
+      NO_PROXY: localhost,127.0.0.1,::1
+      no_proxy: localhost,127.0.0.1,::1
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,size=1g,mode=1777
+      - /home/runner:rw,nosuid,nodev,size=1g,uid=1001,gid=1001,mode=0700
+    volumes:
+      # Only the registration (.runner and credentials); kept across down/up.
+      - state:/state
+      # Scratch for the runner copy and the work folder. Wiped at every start.
+      - type: volume
+        target: /runner
+    networks: [jobs]
+    depends_on: [egress]
+    restart: unless-stopped
+    stop_signal: SIGINT
+    stop_grace_period: 2m
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+  # Strict GitHub-only HTTPS proxy, built from ./egress (its own lane):
+  # listens on :3128 on `jobs`, reaches the internet only through `egress-out`.
+  egress:
+    build:
+      context: ./egress
+    image: metro-ci-egress:local
+    init: true
+    user: "65532:65532"
+    read_only: true
+    privileged: false
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    cpus: 0.5
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 128
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 1
+    tmpfs:
+      - /tmp:rw,nosuid,nodev,noexec,size=16m
+    networks: [jobs, egress-out]
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options: {max-size: 10m, max-file: "3"}
+
+volumes:
+  state:
+    name: metro-ci-runner-state
+
+networks:
+  jobs:
+    name: metro-ci-jobs
+    driver: bridge
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+  egress-out:
+    name: metro-ci-egress-out
+    driver: bridge
+    enable_ipv6: false
