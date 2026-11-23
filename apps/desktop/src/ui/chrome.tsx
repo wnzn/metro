@@ -10,8 +10,8 @@
 // tinted with the theme's foreground, shown only beside the provider's own
 // name; any other provider gets a lettermark. Nothing is fetched at runtime.
 
-import { Image, Text, View, cleanup, effect, keymap, reduceMotion, signal, token, untracked, windowSize } from "nsh";
-import type { ImageAsset, InputRef, JSX } from "nsh";
+import { Image, Overlay, Scroll, Text, View, cleanup, effect, keymap, reduceMotion, signal, token, untracked, windowSize } from "nsh";
+import type { ImageAsset, InputRef, JSX, ViewRef } from "nsh";
 import { Button, Dialog, Input, Menu, MenuItem, MenuSeparator, Select } from "nsh/base";
 import agentIcon from "./icons/agent.svg";
 import appearanceIcon from "./icons/appearance.svg";
@@ -507,6 +507,19 @@ export function BrandPicker(props: {
 
 // ---------------------------------------------------------------- search box
 
+/** The list under the search box: shown while `open`, anchored to the box, as wide as it. */
+export type SearchPopup = {
+  open: boolean;
+  /** Escape, or a press outside the box and the list. */
+  onClose: () => void;
+  /** Up and Down while the field has the focus and the list is open. */
+  onMove: (step: 1 | -1) => void;
+  /** What screen readers call the list. */
+  accessibilityLabel: string;
+  testID?: string;
+  children?: JSX.Element;
+};
+
 /**
  * The app's search box: a raised pill with a magnifier, the field, an
  * optional trailing control (a mode) and its keyboard shortcut. Return
@@ -514,6 +527,12 @@ export function BrandPicker(props: {
  * keyboard focus into the field, as a click does: it changes nothing else,
  * and does nothing while a `Modal` is open over the box. The binding is
  * removed with the box, so signing out and in again never stacks it.
+ *
+ * `popup` is a list under the box (quick results): anchored to it, as wide
+ * as it, never taller than the room below (it scrolls). Its rows never take
+ * the keyboard focus, so the caret stays in the field: Up and Down move the
+ * highlight (bound only while the list is open and the field focused), Tab
+ * leaves as usual.
  */
 export function SearchBox(
   props: Testable & {
@@ -521,13 +540,19 @@ export function SearchBox(
     onChange: (value: string) => void;
     onSubmit: () => void;
     onFocus?: () => void;
+    onBlur?: () => void;
     placeholder: string;
     maxLength?: number;
     trailing?: JSX.Element;
     shortcut?: string | null;
+    popup?: SearchPopup;
   },
 ) {
   let field: InputRef | undefined;
+  const box = signal<ViewRef | null>(null);
+  const width = signal(0);
+  const room = signal(360);
+  const focused = signal(false);
   const shortcut = props.shortcut === undefined ? "mod+k" : props.shortcut;
   let hint = "";
   if (shortcut) {
@@ -544,8 +569,15 @@ export function SearchBox(
       /* a platform that keeps this keystroke: the box is still a click away */
     }
   }
+  effect(() => {
+    const popup = props.popup;
+    if (!popup?.open || !focused()) return;
+    return keymap.bind({ down: () => popup.onMove(1), up: () => popup.onMove(-1) }, { when: "always", repeat: true });
+  });
   return (
     <View
+      ref={(node) => box.set(node)}
+      onLayout={(e) => width.set(e.bounds.size.width)}
       class={cx(
         "flex-row items-center gap-(--space-2) w-full max-w-[560px] min-w-0 rounded-full border bg-popover pl-(--space-3) pr-[6px] focus-within:border-ring focus-within:bg-background",
         controlEdgeClass,
@@ -560,7 +592,14 @@ export function SearchBox(
         value={props.value}
         onChange={({ value }) => props.onChange(value)}
         onSubmit={() => props.onSubmit()}
-        onFocus={() => props.onFocus?.()}
+        onFocus={() => {
+          focused.set(true);
+          props.onFocus?.();
+        }}
+        onBlur={() => {
+          focused.set(false);
+          props.onBlur?.();
+        }}
         submitBehavior="submit"
         placeholder={props.placeholder}
         maxLength={props.maxLength}
@@ -573,6 +612,125 @@ export function SearchBox(
           <Text class={cx(textClass.xs, "font-medium text-muted-foreground")}>{hint}</Text>
         </View>
       </If>
+      <If when={props.popup?.open ? props.popup : null}>
+        {(popup) => (
+          <Overlay
+            anchor={box()}
+            placement="bottom"
+            align="start"
+            offset={6}
+            margin={8}
+            onPressOutside={() => popup().onClose()}
+            onCancel={() => popup().onClose()}
+            onPosition={(e) => room.set(e.available.height)}
+          >
+            <View
+              class={cx(popoverClass, "flex-col")}
+              style={{ width: Math.max(300, width()) }}
+              role="listbox"
+              testID={popup().testID}
+              accessibilityLabel={popup().accessibilityLabel}
+            >
+              <Scroll style={{ maxHeight: Math.max(140, Math.min(440, room() - 16)) }}>
+                <View class="flex-col gap-[2px]">{popup().children}</View>
+              </Scroll>
+            </View>
+          </Overlay>
+        )}
+      </If>
+    </View>
+  );
+}
+
+/**
+ * One quick result: its preview first (a file's thumbnail or type, a
+ * message's place), then its name or text, then a quiet line (the file's
+ * extension, where it is). Never takes the keyboard focus: the field keeps it.
+ */
+export function SearchResultRow(
+  props: Testable & {
+    preview: JSX.Element;
+    label: string;
+    /** Up to two lines (a message's text); one otherwise. */
+    lines?: 1 | 2;
+    meta: string;
+    selected: boolean;
+    onPress: () => void;
+  },
+) {
+  const row = revealWhenSelected(() => props.selected);
+  return (
+    <View
+      ref={row}
+      class={cx("flex-row items-center gap-(--space-3) rounded-(--radius-sm) px-(--space-2) py-[6px] hover:bg-muted", transitionClass, props.selected && "bg-accent")}
+      focusable={false}
+      role="option"
+      accessibilityState={{ selected: props.selected }}
+      onPress={props.onPress}
+      testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel ?? `${props.label}, ${props.meta}`}
+    >
+      <View class="size-[36px] shrink-0 items-center justify-center overflow-hidden rounded-(--radius-sm) bg-muted">{props.preview}</View>
+      <View class="flex-1 min-w-0 flex-col">
+        <Text class={cx(textClass.sm, "font-medium", props.selected ? "text-accent-foreground" : "text-popover-foreground")} style={{ numberOfLines: props.lines ?? 1 }}>
+          {props.label}
+        </Text>
+        <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+          {props.meta}
+        </Text>
+      </View>
+    </View>
+  );
+}
+
+/** A row's ref that scrolls the list just enough to show the row while it is highlighted (Up and Down). */
+function revealWhenSelected(selected: () => boolean): (node: ViewRef) => void {
+  let node: ViewRef | undefined;
+  effect(() => {
+    if (!selected()) return;
+    // Once laid out (measure waits for this turn's layout); a row not drawn yet has nothing to reveal.
+    let live = true;
+    void node?.measure().then((m) => {
+      if (live && m && m.bounds.size.height > 0) node?.reveal({ vertical: "nearest", animated: !untracked(reduceMotion) });
+    });
+    return () => {
+      live = false;
+    };
+  });
+  return (n) => (node = n);
+}
+
+/** A message's or a place's glyph, as a quick result's preview. */
+export function SearchResultGlyph(props: { icon: IconName }) {
+  return <Icon name={props.icon} color="muted" size={20} />;
+}
+
+/** A line in place of results: searching, nothing found, a failure, not available. */
+export function SearchResultStatus(props: Testable & { text: string; tone?: "muted" | "danger" }) {
+  return (
+    <View class="px-(--space-2) py-(--space-2)" testID={props.testID} role={props.tone === "danger" ? "alert" : undefined}>
+      <Text class={cx(textClass.sm, props.tone === "danger" ? "text-tone-danger-foreground" : "text-muted-foreground")}>{props.text}</Text>
+    </View>
+  );
+}
+
+/** The last row: more results in full Search. */
+export function SearchMoreRow(props: Testable & { label: string; selected: boolean; onPress: () => void }) {
+  const row = revealWhenSelected(() => props.selected);
+  return (
+    <View
+      ref={row}
+      class={cx("flex-row items-center gap-(--space-2) mt-[2px] border-t border-border rounded-(--radius-sm) px-(--space-2) py-[8px] hover:bg-muted", transitionClass, props.selected && "bg-accent")}
+      focusable={false}
+      role="option"
+      accessibilityState={{ selected: props.selected }}
+      onPress={props.onPress}
+      testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel ?? props.label}
+    >
+      <Icon name="search" color="muted" />
+      <Text class={cx("flex-1", textClass.sm, "font-medium text-popover-foreground")}>{props.label}</Text>
+      <Icon name="chevron-right" color="muted" size={14} />
     </View>
   );
 }
