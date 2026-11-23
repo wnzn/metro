@@ -10,7 +10,32 @@ import zipfile
 import package
 
 
+# Icons each production module imports in the fixtures; activity.tsx shares chrome's.
+MODULE_ICONS = {
+    "chrome.tsx": ["check.svg"],
+    "activity.tsx": ["check.svg"],
+    "chatControls.tsx": ["send.svg"],
+    "library.tsx": ["play.svg"],
+}
+
+
+def renderer_source(source):
+    icons = source / "src/ui/icons"
+    icons.mkdir(parents=True)
+    for module, names in MODULE_ICONS.items():
+        (icons.parent / module).write_text(
+            "".join(f'import {Path(n).stem} from "./icons/{n}";\n' for n in names))
+        for name in names:
+            (icons / name).write_text(f"<svg id='{name}'/>")
+    return icons
+
+
 class PackageTests(unittest.TestCase):
+    def test_icon_modules_are_the_production_owners(self):
+        self.assertEqual(package.ICON_MODULES, tuple(MODULE_ICONS))
+        live = package.RENDERER_SOURCE / "src/ui"
+        for module in package.ICON_MODULES:
+            self.assertTrue((live / module).is_file(), module)
     def test_fixed_archive_outputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -82,10 +107,7 @@ class PackageTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             scratch = Path(directory)
             source, ui = scratch / "source", scratch / "ui"
-            icons = source / "src/ui/icons"
-            icons.mkdir(parents=True)
-            (icons.parent / "chrome.tsx").write_text('import check from "./icons/check.svg";\n')
-            (icons / "check.svg").write_text("<svg/>")
+            icons = renderer_source(source)
             declared = {"network": {"hosts": ["*"]}, "process": {"env": sorted(package.BRIDGE_ENV)}}
             (source / "nsh.json").write_text(json.dumps({"capabilities": declared}))
             resources = ui / "nsh"
@@ -104,7 +126,8 @@ class PackageTests(unittest.TestCase):
             asset = packaged_icons / "check.svg"
             with self.assertRaisesRegex(ValueError, "missing renderer assets"):
                 package.nsh_resources(ui, source, "0.2.0")
-            package.copy(icons / "check.svg", asset)
+            for name in ("check.svg", "send.svg", "play.svg"):
+                package.copy(icons / name, packaged_icons / name)
             self.assertIn(Path("assets/src/ui/icons/check.svg"), package.nsh_resources(ui, source, "0.2.0"))
             (packaged_icons / ".env").write_text("unapproved")
             with self.assertRaisesRegex(ValueError, "unapproved renderer asset"):
@@ -124,6 +147,47 @@ class PackageTests(unittest.TestCase):
                 return  # native Windows test users may lack permission to create symlinks
             with self.assertRaisesRegex(ValueError, "not a regular release file"):
                 package.nsh_resources(ui, source, "0.2.0")
+
+    def test_icons_of_every_production_module_and_no_stray_ones(self):
+        with tempfile.TemporaryDirectory() as directory:
+            scratch = Path(directory)
+            source, actual = scratch / "source", scratch / "assets"
+            icons = renderer_source(source)
+            bundled = actual / "src/ui/icons"
+            bundled.mkdir(parents=True)
+            for name in ("check.svg", "send.svg"):
+                package.copy(icons / name, bundled / name)
+            # library.tsx's own import is required, though chrome.tsx doesn't import it.
+            with self.assertRaisesRegex(ValueError, r"missing renderer assets: src/ui/icons/play\.svg"):
+                package.nsh_assets(actual, source)
+            package.copy(icons / "play.svg", bundled / "play.svg")
+            self.assertEqual(set(package.nsh_assets(actual, source)),
+                             {Path("src/ui/icons") / n for n in ("check.svg", "send.svg", "play.svg")})
+
+            # A test, fixture or unlisted module never approves an icon, even an exact copy.
+            (icons / "stray.svg").write_text("<svg id='stray'/>")
+            for module in ("theme.fixture.tsx", "QuickSearch.test.tsx", "extra.tsx"):
+                (icons.parent / module).write_text('import stray from "./icons/stray.svg";\n')
+            self.assertEqual(len(package.nsh_assets(actual, source)), 3)  # unbundled: fine
+            package.copy(icons / "stray.svg", bundled / "stray.svg")
+            with self.assertRaisesRegex(ValueError, r"unapproved renderer asset: src/ui/icons/stray\.svg"):
+                package.nsh_assets(actual, source)
+            (bundled / "stray.svg").unlink()
+
+            # A non-chrome module's icon is still checked byte for byte.
+            (bundled / "play.svg").write_text("<svg id='tampered'/>")
+            with self.assertRaisesRegex(ValueError, "exact non-executable copy of its source: src/ui/icons/play.svg"):
+                package.nsh_assets(actual, source)
+            package.copy(icons / "play.svg", bundled / "play.svg")
+
+            # Every listed module must exist and import distinct icons.
+            library = icons.parent / "library.tsx"
+            library.write_text('import a from "./icons/play.svg";\nimport b from "./icons/play.svg";\n')
+            with self.assertRaisesRegex(ValueError, r"src/ui/library\.tsx must import distinct"):
+                package.nsh_assets(actual, source)
+            library.unlink()
+            with self.assertRaisesRegex(ValueError, "not a regular release file"):
+                package.nsh_assets(actual, source)
 
     def test_brand_notice_must_cover_every_shipped_mark(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -42,6 +42,9 @@ LINUX_UI = {
     "libsoup-3.0.so.0", "libgio-2.0.so.0", "libjavascriptcoregtk-6.0.so.1",
 }
 RENDERER_SOURCE = Path(__file__).resolve().parents[1] / "apps/desktop"
+# Production modules in apps/desktop/src/ui that import bundled SVG icons. Only
+# these approve renderer assets: a test or fixture module never does.
+ICON_MODULES = ("chrome.tsx", "activity.tsx", "chatControls.tsx", "library.tsx")
 BRIDGE_ENV = {"METRO_DESKTOP_BRIDGE_URL", "METRO_DESKTOP_BRIDGE_TOKEN"}
 
 
@@ -165,12 +168,15 @@ def elf(path, max_glibc, ui=False):
 
 
 def nsh_assets(actual, source):
-    """Allow only exact copies of production chrome's imported SVG icons."""
-    chrome = regular(source / "src/ui/chrome.tsx").read_text(encoding="utf-8")
-    imports = re.findall(r"""^import [^;\n]+ from ["']\./icons/([a-z0-9-]+\.svg)["'];""", chrome, re.M)
-    require(bool(imports) and len(imports) == len(set(imports)),
-            "production chrome must import distinct SVG icons from src/ui/icons")
-    expected = {Path("src/ui/icons") / name for name in imports}
+    """Allow only exact copies of the SVG icons the production UI modules import."""
+    names = set()
+    for module in ICON_MODULES:
+        text = regular(source / "src/ui" / module).read_text(encoding="utf-8")
+        imports = re.findall(r"""^import [^;\n]+ from ["']\./icons/([a-z0-9-]+\.svg)["'];""", text, re.M)
+        require(bool(imports) and len(imports) == len(set(imports)),
+                f"production src/ui/{module} must import distinct SVG icons from src/ui/icons")
+        names.update(imports)
+    expected = {Path("src/ui/icons") / name for name in names}
     parents = {parent for p in expected for parent in p.parents}
     found = {}
 
