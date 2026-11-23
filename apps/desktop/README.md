@@ -217,6 +217,14 @@ private folder on this computer, per Space, while Metro is open.
   - With no chat models at all, the picker offers **Model providers** to
     set one up. **Fetch models from …** asks your own server-stored
     connection for its list.
+  - Since `93d7968` (source only; no packaged or native check recorded
+    yet), the searchable list is grouped by provider, under its name and
+    bundled mark (OpenAI, Anthropic and Gemini first, custom endpoints
+    last). Each row shows the model, the connection's name and the levels
+    the server advertised for it. Thinking levels are inline choices, and
+    the closed button shows the model and its level, including **Provider
+    default**. Which models are offered, and the checks on them, are
+    unchanged.
 - **Spaces:** a Space has its own rooms (starting with its `lobby`), members,
   and optional paired runner. A new account has no Spaces. It sees how to
   create one. Your user ID, to give an owner, is under **Settings →
@@ -413,19 +421,30 @@ contributors only, in
   from the extracted folder. On CachyOS and other Arch-based systems the
   package is `webkitgtk-6.0` (with `gtk4` and the GStreamer base plugins).
 - **Test connection lists models, but the agent doesn't answer.** For a
-  connection **On this computer**, **Test connection** asks the Metro
-  server for the connection's models, and it answers with exactly the
-  models you approved on this computer, while the app is open and serving
-  it. That proves the pairing works and the device is online. It doesn't
-  send a question to the vendor. A reply is a separate request, which can
-  still fail, for example if the vendor sign-in expired, the plan doesn't
-  include that model, or the thinking level isn't supported. Read the error
-  shown in the conversation, check the model and level chosen under
-  **Model**, and sign in again under **Manage connection** if asked.
-- **A model is missing from the composer's Model list.** For a device
-  connection, approve it under **Approved models → Change…** and keep Metro
-  open so the device is online. A connection someone shared with you
-  offers only its one saved model.
+  connection **On this computer**, **Test connection** goes through the
+  Metro server to this computer, which asks the vendor for its model list
+  with your sign-in or key. For Sign in with ChatGPT that's an
+  authenticated `GET /v1/models`. Metro then shows only the models that are
+  in **both** the vendor's list and the ones you approved on this computer.
+  - If the vendor's list fails (sign-in expired, network, vendor error),
+    the test fails.
+  - If none of your approved models is in the vendor's list, the test
+    succeeds but lists nothing usable. Approve a model the vendor offers.
+  - A model in the result proves the sign-in can list models and the device
+    is online. It isn't an inference: no question is sent. A reply is a
+    separate request that can still fail, for example if the plan doesn't
+    include that model or thinking level. Read the error shown in the
+    conversation, check what's chosen under **Model**, and sign in again
+    under **Manage connection** if asked.
+- **A model is missing from the composer's Model list.** Opening **Model**
+  in the composer makes no vendor call. It asks the Metro server, which
+  answers from what it already knows: for a device connection, the models
+  you approved on that computer, as the device reported them while online
+  (not checked against the vendor; use **Test connection** for that). So
+  approve the model under **Approved models → Change…** and keep Metro open
+  so the device is online. A connection someone shared with you offers
+  only its one saved model. For your own server-stored connection, **Fetch
+  models from …** in the picker asks the vendor for a fresh list.
 - **A runner is attached, but tools never run.** *Attached* only means the
   Space's jobs go to that runner, not that it's online. A runner connects
   out to the Metro server and needs no inbound port, so it must be able to

@@ -265,10 +265,16 @@ Once paired, the button becomes **Manage connection**. Earlier development
 builds showed a **Set up metro-connector** guide instead
 ([screenshot](screenshots/settings-device-onboarding.png)). The app never
 signs in to a vendor CLI for you. **Test
-connection** lists models once the device is online: exactly the models you
-approved on that device. A list proves the device is paired and online; it
-doesn't send a question to the vendor, so a reply can still fail (an expired
-sign-in, a model or thinking level the plan doesn't include). Don't paste
+connection** lists models once the device is online. The device asks the
+vendor for its model list with your sign-in or key (for Sign in with
+ChatGPT, an authenticated `GET /v1/models`) and returns only the models in
+both that list and the ones you approved on the device. If the vendor's
+list fails, the test fails; if none of your approved models is in it, the
+test lists nothing usable. It isn't an inference: no question is sent, so
+a reply can still fail (a model or thinking level the plan doesn't
+include, for example). Opening the composer's **Model** list makes no
+vendor call at all: the server answers from the approved models the
+device last reported while online. Don't paste
 the token into a command line or a chat, and don't share it, sign-in files
 or raw logs when you ask for help.
 
