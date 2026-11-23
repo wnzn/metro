@@ -14,8 +14,12 @@ export const WAVE_BARS = 40;
 export const WAVE_SAMPLE_BUDGET = 200_000;
 /** Peaks below this (about -60 dBFS) count as silence. */
 export const SILENCE = 0.001;
-/** Largest `word/document.xml` a DOCX snippet inflates. */
-export const DOCX_XML_MAX = 4 * 1024 * 1024;
+/**
+ * Largest `word/document.xml` a DOCX snippet inflates. Enforced while
+ * inflating (zlib's `maxOutputLength`, which NSH's zlib applies during
+ * decompression and fails past), never taken from the archive's own sizes.
+ */
+export const DOCX_XML_MAX = 1024 * 1024;
 
 // ------------------------------------------------------------------ text
 
@@ -60,7 +64,14 @@ export function textSnippet(bytes: Uint8Array, markdown: boolean, max = SNIPPET_
 const u16 = (b: Uint8Array, o: number) => b[o]! | (b[o + 1]! << 8);
 const u32 = (b: Uint8Array, o: number) => (b[o]! | (b[o + 1]! << 8) | (b[o + 2]! << 16) | (b[o + 3]! << 24)) >>> 0;
 
-/** One file of a ZIP archive (a DOCX is one), read through its central directory. Null when absent or unreadable. */
+/**
+ * One file of a ZIP archive (a DOCX is one), read through its central
+ * directory, at most `maxBytes` of it. The sizes an archive declares are
+ * never trusted as limits: a stored entry's real length is checked, and a
+ * deflated one is inflated with a hard output limit, so a small archive that
+ * expands enormously fails while inflating instead of allocating. Null when
+ * absent, unreadable or over the limit.
+ */
 export function zipEntry(zip: Uint8Array, name: string, maxBytes: number): Uint8Array | null {
   // End of central directory: the last 22 bytes, or before a comment of up to 65535.
   let eocd = -1;
@@ -84,17 +95,18 @@ export function zipEntry(zip: Uint8Array, name: string, maxBytes: number): Uint8
     const local = u32(zip, o + 42);
     const entryName = new TextDecoder().decode(zip.subarray(o + 46, o + 46 + nameLen));
     if (entryName === name) {
+      // A declared size over the limit is refused early; one under it proves nothing.
       if (size > maxBytes || local + 30 > zip.length || u32(zip, local) !== 0x04034b50) return null;
       const start = local + 30 + u16(zip, local + 26) + u16(zip, local + 28);
       if (start + compressed > zip.length) return null;
       const data = zip.subarray(start, start + compressed);
-      if (method === 0) return data;
+      if (method === 0) return data.length <= maxBytes ? data : null;
       if (method !== 8) return null;
       try {
-        const out = inflateRawSync(data) as unknown as Uint8Array;
-        return out.length > maxBytes ? null : new Uint8Array(out);
+        const out = inflateRawSync(data, { maxOutputLength: maxBytes }) as unknown as Uint8Array;
+        return out.length <= maxBytes ? new Uint8Array(out) : null;
       } catch {
-        return null;
+        return null; // past the limit (a RangeError) or not valid deflate data
       }
     }
     o += 46 + nameLen + extraLen + commentLen;
@@ -118,11 +130,105 @@ export function docxSnippet(bytes: Uint8Array, max = SNIPPET_CHARS): string | nu
   const joined = runs.join("").replace(/&(#x[0-9a-f]+|#\d+|\w+);/gi, (all, e: string) => {
     if (e[0] === "#") {
       const n = e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
-      return Number.isFinite(n) ? String.fromCodePoint(n) : all;
+      // Only real Unicode scalar values: no surrogates, nothing past U+10FFFF, no NUL.
+      return Number.isInteger(n) && n > 0 && n <= 0x10ffff && !(n >= 0xd800 && n <= 0xdfff) ? String.fromCodePoint(n) : "\ufffd";
     }
     return ENTITIES[e.toLowerCase()] ?? all;
   });
   return cut(joined, max);
+}
+
+// ------------------------------------------------------------------ mp3 tags
+
+/** How much of an MP3's start the tag reader looks at. */
+export const ID3_READ_BYTES = 64 * 1024;
+
+export type AudioTags = { title: string | null; artist: string | null; album: string | null };
+
+function id3Text(frame: Uint8Array): string | null {
+  if (frame.length < 2) return null;
+  const encoding = frame[0]!;
+  let body = frame.subarray(1);
+  let text: string;
+  try {
+    if (encoding === 0) text = Array.from(body, (b) => String.fromCharCode(b)).join("");
+    else if (encoding === 3) text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+    else if (encoding === 1 || encoding === 2) {
+      let le = encoding === 1;
+      if (encoding === 1 && body.length >= 2) {
+        if (body[0] === 0xff && body[1] === 0xfe) body = body.subarray(2);
+        else if (body[0] === 0xfe && body[1] === 0xff) {
+          le = false;
+          body = body.subarray(2);
+        }
+      }
+      const units: number[] = [];
+      for (let i = 0; i + 1 < body.length; i += 2) units.push(le ? body[i]! | (body[i + 1]! << 8) : (body[i]! << 8) | body[i + 1]!);
+      text = String.fromCharCode(...units.slice(0, 1024));
+    } else return null;
+  } catch {
+    return null;
+  }
+  // A text frame may hold several values split by NUL: the first one is shown.
+  const first = text.split("\u0000")[0]!.replace(/[\u0000-\u001f\u007f]/g, " ").replace(/\s+/g, " ").trim();
+  return first ? first.slice(0, 120) : null;
+}
+
+/**
+ * The title, artist and album from an MP3's ID3v2 tag (v2.2, v2.3, v2.4),
+ * read from at most the first ID3_READ_BYTES of the file. Frames past that,
+ * compressed or encrypted frames, and pictures are skipped. Null when there's
+ * no ID3v2 tag or it names none of the three: the file's sound is never
+ * guessed at.
+ */
+export function id3Tags(head: Uint8Array): AudioTags | null {
+  if (head.length < 10 || head[0] !== 0x49 || head[1] !== 0x44 || head[2] !== 0x33) return null;
+  const version = head[3]!;
+  if (version < 2 || version > 4) return null;
+  const flags = head[5]!;
+  const syncsafe = (o: number) => ((head[o]! & 0x7f) << 21) | ((head[o + 1]! & 0x7f) << 14) | ((head[o + 2]! & 0x7f) << 7) | (head[o + 3]! & 0x7f);
+  const tagSize = syncsafe(6);
+  let tag = head.subarray(10, Math.min(head.length, 10 + tagSize));
+  if (flags & 0x80) {
+    // Unsynchronisation: every 0xFF 0x00 stands for 0xFF.
+    const out: number[] = [];
+    for (let i = 0; i < tag.length; i++) {
+      out.push(tag[i]!);
+      if (tag[i] === 0xff && tag[i + 1] === 0x00) i++;
+    }
+    tag = new Uint8Array(out);
+  }
+  let o = 0;
+  if (flags & 0x40 && version >= 3 && tag.length >= 4) {
+    const ext = version === 4 ? ((tag[0]! & 0x7f) << 21) | ((tag[1]! & 0x7f) << 14) | ((tag[2]! & 0x7f) << 7) | (tag[3]! & 0x7f) : ((tag[0]! << 24) | (tag[1]! << 16) | (tag[2]! << 8) | tag[3]!) + 4;
+    o = ext;
+  }
+  const ids = version === 2 ? { title: "TT2", artist: "TP1", album: "TAL" } : { title: "TIT2", artist: "TPE1", album: "TALB" };
+  const found: AudioTags = { title: null, artist: null, album: null };
+  const idLen = version === 2 ? 3 : 4;
+  const headLen = version === 2 ? 6 : 10;
+  for (let n = 0; n < 256 && o + headLen <= tag.length; n++) {
+    const id = String.fromCharCode(...tag.subarray(o, o + idLen));
+    if (!/^[A-Z0-9]+$/.test(id)) break; // padding or the end
+    const size =
+      version === 2
+        ? (tag[o + 3]! << 16) | (tag[o + 4]! << 8) | tag[o + 5]!
+        : version === 4
+          ? ((tag[o + 4]! & 0x7f) << 21) | ((tag[o + 5]! & 0x7f) << 14) | ((tag[o + 6]! & 0x7f) << 7) | (tag[o + 7]! & 0x7f)
+          : ((tag[o + 4]! << 24) | (tag[o + 5]! << 16) | (tag[o + 6]! << 8) | tag[o + 7]!) >>> 0;
+    const body = o + headLen;
+    if (size <= 0 || body + size > tag.length) break;
+    const frameFlags = version === 2 ? 0 : tag[o + 9]!;
+    // v2.3: 0x80 compressed, 0x40 encrypted; v2.4: 0x08 compressed, 0x04 encrypted, 0x02 unsynchronised, 0x01 length added.
+    const skip = version === 3 ? (frameFlags & 0xc0) !== 0 : version === 4 ? (frameFlags & 0x0f) !== 0 : false;
+    if (!skip) {
+      for (const key of ["title", "artist", "album"] as const) {
+        if (id === ids[key] && found[key] === null) found[key] = id3Text(tag.subarray(body, body + size));
+      }
+    }
+    o = body + size;
+  }
+  return found.title || found.artist || found.album ? found : null;
 }
 
 // ------------------------------------------------------------------ wav

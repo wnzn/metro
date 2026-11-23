@@ -15,7 +15,7 @@
 //   Space is thrown away.
 
 import { batch, computed, effect, Picker as SystemPicker, signal, untracked } from "nsh";
-import { mkdir, readdir, unlink, writeFile } from "fs/promises";
+import { mkdir, readdir, stat, unlink, writeFile } from "fs/promises";
 import proc from "process";
 import { homedir } from "os";
 import { ApiError } from "../../api/client";
@@ -138,12 +138,18 @@ function removePreviewFile(path: string | null) {
   if (path) void unlink(path).catch(() => {});
 }
 
-/** Deletes any preview file left behind (a crash, a kill). */
+/** This run's token and session count: a cleanup removes only files of an earlier run or session, never one just written. */
+const RUN = crypto.randomUUID().slice(0, 8);
+let previewSession = 0;
+const previewPrefix = () => `${RUN}-${previewSession}-`;
+
+/** Deletes any preview file left behind (a crash, a kill, an ended session); this session's own stay. */
 function purgePreviews() {
   const dir = previewDir();
   if (!dir) return;
+  const keep = previewPrefix();
   void readdir(dir)
-    .then((names) => Promise.all(names.map((n) => unlink(`${dir}/${n}`).catch(() => {}))))
+    .then((names) => Promise.all(names.filter((n) => !n.startsWith(keep)).map((n) => unlink(`${dir}/${n}`).catch(() => {}))))
     .catch(() => {});
 }
 purgePreviews();
@@ -800,9 +806,11 @@ export async function playerFailed(message: string): Promise<void> {
   }
   const mine = viewSeq;
   const ext = ACCEPTED.find((a) => a.kind === target.kind)?.extensions[0] ?? "bin";
-  const path = `${dir}/${crypto.randomUUID()}.${ext}`;
+  const path = `${dir}/${previewPrefix()}${crypto.randomUUID()}.${ext}`;
   try {
     await mkdir(dir, { recursive: true });
+    // Never write into a directory others could write to (a planted link or file).
+    if (((await stat(dir)).mode & 0o022) !== 0) throw new Error("the preview directory is writable by others");
     await writeFile(path, bytes);
   } catch (error) {
     if (mine === viewSeq) playerError.set(`${message} (a private preview file couldn't be written: ${String((error as Error)?.message ?? error)})`);
@@ -1002,6 +1010,7 @@ onSessionEnd(() => {
   closeViewer();
   dropThumbnails();
   lessRelevantOpen.set(false);
+  previewSession++;
   purgePreviews();
   batch(() => {
     searchSurface.set("conversations");

@@ -2,8 +2,8 @@
 //
 // It shows what the file itself holds: the start of its text (plain text,
 // Markdown, a Word document's own words), the image, a still of the video
-// (its own first frame, paused and muted), or the waveform of a WAV file's
-// real samples. Where nothing honest can be drawn (PDF, MP3, an unreadable
+// (its own first frame, paused and muted), the waveform of a WAV file's real
+// samples, or an MP3's own title, artist and album tags. Where nothing honest can be drawn (PDF, MP3, an unreadable
 // or too-large file, a budget reached, lost access) it says so in a quiet
 // line. The bytes are read, shared, bounded and dropped by
 // ./quickPreviewStore: mounting reads (once per file), unmounting the last
@@ -11,7 +11,7 @@
 // everything at once.
 
 import { cleanup, effect, signal, untracked } from "nsh";
-import { QuickImage, QuickNoPreview, QuickPreviewLoading, QuickTextExcerpt, QuickVideoStill, QuickWaveform } from "../../ui";
+import { QuickAudioTags, QuickImage, QuickNoPreview, QuickPreviewLoading, QuickTextExcerpt, QuickVideoStill, QuickWaveform } from "../../ui";
 import { clock } from "./libraryState";
 import type { LibraryAsset } from "./libraryState";
 import { acquirePreview, releasePreview, videoFailed, videoShown } from "./quickPreviewStore";
@@ -32,6 +32,11 @@ export function previewLabel(name: string, p: QuickPreview): string {
       const w = p.waveform;
       const part = w.coveredMs + 1 < w.durationMs ? `, its first ${clock(w.coveredMs)}` : "";
       return `Preview of ${name}: audio waveform${part}, ${clock(w.durationMs)} long${w.silent ? ", silent" : ""}`;
+    }
+    case "tags": {
+      const t = p.tags;
+      const parts = [t.title && `title ${t.title}`, t.artist && `artist ${t.artist}`, t.album && `album ${t.album}`].filter(Boolean).join(", ");
+      return `Preview of ${name}, its tags: ${parts}`;
     }
     case "none":
       return `No preview of ${name}. ${p.reason}`;
@@ -90,6 +95,15 @@ export function QuickAssetPreview(props: { asset: LibraryAsset }) {
       </If>
       <If when={p().status === "waveform" ? (p() as Extract<QuickPreview, { status: "waveform" }>) : null}>
         {(w) => <QuickWaveform testID={`quick-preview-wave:${id()}`} accessibilityLabel={previewLabel(name(), w())} peaks={w().waveform.peaks} caption={waveCaption(w())} />}
+      </If>
+      <If when={p().status === "tags" ? (p() as Extract<QuickPreview, { status: "tags" }>) : null}>
+        {(t) => (
+          <QuickAudioTags
+            testID={`quick-preview-tags:${id()}`}
+            accessibilityLabel={previewLabel(name(), t())}
+            parts={[t().tags.title ? `“${t().tags.title}”` : null, t().tags.artist, t().tags.album].filter((x): x is string => !!x)}
+          />
+        )}
       </If>
       <If when={p().status === "none" ? (p() as Extract<QuickPreview, { status: "none" }>) : null}>
         {(n) => <QuickNoPreview testID={`quick-preview-none:${id()}`} accessibilityLabel={previewLabel(name(), n())} text={n().reason} />}

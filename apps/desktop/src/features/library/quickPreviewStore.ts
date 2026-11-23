@@ -4,8 +4,9 @@
 // - Bytes come only through the authenticated content read (the bearer in a
 //   header, never in a URL or a media widget's source), and only for a row
 //   that is mounted. Text and WAV read a prefix (`Range: bytes=0-N`); images,
-//   videos and DOCX read the whole file, up to a per-kind cap. PDF and MP3
-//   aren't read at all: nothing here can draw them honestly.
+//   videos and DOCX read the whole file, up to a per-kind cap; an MP3 reads
+//   its first 64 KB for its ID3 title, artist and album (never a waveform:
+//   nothing here decodes MP3 audio). PDF isn't read at all.
 // - At most QUICK_CONCURRENCY reads run at once, at most QUICK_MAX_LIVE
 //   previews hold bytes, and at most QUICK_MAX_HELD_BYTES are held in all.
 //   Past a budget a row says so instead of reading.
@@ -15,20 +16,24 @@
 //   and a read that answers after them is thrown away.
 // - Private preview files (only for a video the platform's player can't play
 //   from `blob:`, as on Linux) live in their own directory, apart from the
-//   viewer's, and are removed at start, on release and at sign-out.
+//   viewer's, and are removed on release, at sign-out and (left over from an
+//   earlier run) at start. Their names carry this run's and session's token,
+//   so a cleanup only ever removes files of an earlier run or session, never
+//   one a preview just wrote. NSH's files API can't set permissions: they get
+//   the process's defaults inside the app's data directory.
 // Nothing is sent to a model, and no disk is scanned.
 
 import { batch, effect, signal, untracked } from "nsh";
 import type { Signal } from "nsh";
-import { mkdir, readdir, unlink, writeFile } from "fs/promises";
+import { mkdir, readdir, stat, unlink, writeFile } from "fs/promises";
 import proc from "process";
 import { ApiError } from "../../api/client";
 import { ACCEPTED } from "../../api/library";
 import { disconnect, isAborted, onSessionEnd, sessionGuard, spaces } from "../../store";
 import { formatSize, library } from "./libraryState";
 import type { LibraryAsset } from "./libraryState";
-import { docxSnippet, textSnippet, wavWaveform } from "./quickPreviewData";
-import type { Waveform } from "./quickPreviewData";
+import { docxSnippet, ID3_READ_BYTES, id3Tags, textSnippet, wavWaveform } from "./quickPreviewData";
+import type { AudioTags, Waveform } from "./quickPreviewData";
 
 export const QUICK_CONCURRENCY = 2;
 export const QUICK_MAX_LIVE = 12;
@@ -46,9 +51,10 @@ export type QuickPreview =
   | { status: "image"; url: string }
   | { status: "video"; url: string }
   | { status: "waveform"; waveform: Waveform }
+  | { status: "tags"; tags: AudioTags }
   | { status: "none"; reason: string };
 
-type Plan = { kind: "text" | "markdown" | "wav" | "docx"; part: number } | { kind: "image" | "video"; whole: number } | { kind: "none"; reason: string };
+type Plan = { kind: "text" | "markdown" | "wav" | "docx" | "mp3"; part: number } | { kind: "image" | "video"; whole: number } | { kind: "none"; reason: string };
 
 type Entry = {
   asset: LibraryAsset;
@@ -95,7 +101,7 @@ export function planFor(asset: LibraryAsset): Plan {
     case "pdf":
       return { kind: "none", reason: "PDF: no preview here. Open it to read." };
     case "mp3":
-      return { kind: "none", reason: "MP3 audio: no waveform here. Open it to play." };
+      return { kind: "mp3", part: ID3_READ_BYTES };
     default:
       return { kind: "none", reason: "No preview for this type." };
   }
@@ -106,16 +112,22 @@ const budget = (p: Plan) => (p.kind === "none" ? 0 : "part" in p ? p.part : p.wh
 // ------------------------------------------------------------------ files
 
 const previewDir = () => (proc.dataDir ? `${proc.dataDir}/quick-preview` : null);
+/** This run's token: files of an earlier run (a crash, a kill) are the only ones a start-up cleanup removes. */
+const RUN = crypto.randomUUID().slice(0, 8);
+/** The prefix of this run's and this session's files. */
+const filePrefix = () => `${RUN}-${epoch}-`;
 
 function removeFile(path: string | null) {
   if (path) void unlink(path).catch(() => {});
 }
 
+/** Removes every preview file but this session's own (files of an earlier run, or of a session that ended). */
 function purgeFiles() {
   const dir = previewDir();
   if (!dir) return;
+  const keep = filePrefix();
   void readdir(dir)
-    .then((names) => Promise.all(names.map((n) => unlink(`${dir}/${n}`).catch(() => {}))))
+    .then((names) => Promise.all(names.filter((n) => !n.startsWith(keep)).map((n) => unlink(`${dir}/${n}`).catch(() => {}))))
     .catch(() => {});
 }
 purgeFiles();
@@ -221,6 +233,11 @@ async function load(e: Entry): Promise<void> {
         set(t ? { status: "text", text: t } : { status: "none", reason: "Word file: no readable text found." });
         break;
       }
+      case "mp3": {
+        const t = id3Tags(bytes);
+        set(t ? { status: "tags", tags: t } : { status: "none", reason: "MP3 audio without a title or artist tag. Open it to play." });
+        break;
+      }
       case "wav": {
         const w = wavWaveform(bytes);
         set(w ? { status: "waveform", waveform: w } : { status: "none", reason: "WAV audio in a format this can't read." });
@@ -277,9 +294,11 @@ export async function videoFailed(assetId: string): Promise<void> {
   const bytes = e.videoBytes;
   e.videoBytes = null;
   const ext = ACCEPTED.find((a) => a.kind === e.asset.kind)?.extensions[0] ?? "bin";
-  const path = `${dir}/${crypto.randomUUID()}.${ext}`;
+  const path = `${dir}/${filePrefix()}${crypto.randomUUID()}.${ext}`;
   try {
     await mkdir(dir, { recursive: true });
+    // Never write into a directory others could write to (a planted link or file).
+    if (((await stat(dir)).mode & 0o022) !== 0) throw new Error("the preview directory is writable by others");
     await writeFile(path, bytes);
   } catch {
     removeFile(path);

@@ -4,7 +4,7 @@
 
 import { expect, test } from "nsh/test";
 import { deflateRawSync } from "zlib";
-import { docxSnippet, SILENCE, textSnippet, WAVE_BARS, wavWaveform, zipEntry } from "./quickPreviewData";
+import { docxSnippet, id3Tags, SILENCE, textSnippet, WAVE_BARS, wavWaveform, zipEntry } from "./quickPreviewData";
 
 type Layout = { format: 1 | 3; bits: 8 | 16 | 24 | 32 | 64; channels: number; rate: number; extensible?: boolean };
 
@@ -114,8 +114,8 @@ test("bytes that aren't a readable WAV give no waveform", () => {
   expect(wavWaveform(adpcm)).toBeNull();
 });
 
-/** A ZIP archive of `files`, each deflated (or stored). */
-function zip(files: Record<string, string>, store = false): Uint8Array {
+/** A ZIP archive of `files`, each deflated (or stored); `declare` overrides the uncompressed size it claims. */
+function zip(files: Record<string, string>, store = false, declare?: number): Uint8Array {
   const enc = new TextEncoder();
   const locals: Uint8Array[] = [];
   const centrals: Uint8Array[] = [];
@@ -129,7 +129,7 @@ function zip(files: Record<string, string>, store = false): Uint8Array {
     lv.setUint32(0, 0x04034b50, true);
     lv.setUint16(8, store ? 0 : 8, true);
     lv.setUint32(18, data.length, true);
-    lv.setUint32(22, raw.length, true);
+    lv.setUint32(22, declare ?? raw.length, true);
     lv.setUint16(26, n.length, true);
     local.set(n, 30);
     local.set(data, 30 + n.length);
@@ -138,7 +138,7 @@ function zip(files: Record<string, string>, store = false): Uint8Array {
     cv.setUint32(0, 0x02014b50, true);
     cv.setUint16(10, store ? 0 : 8, true);
     cv.setUint32(20, data.length, true);
-    cv.setUint32(24, raw.length, true);
+    cv.setUint32(24, declare ?? raw.length, true);
     cv.setUint16(28, n.length, true);
     cv.setUint32(42, offset, true);
     central.set(n, 46);
@@ -186,4 +186,57 @@ test("text snippets fold whitespace, drop Markdown marks, cut long text, and ref
   // A multi-byte character cut by the read limit is dropped, not refused.
   const cutChar = enc.encode("café").subarray(0, 4);
   expect(textSnippet(cutChar, false)).toBe("caf");
+});
+
+test("inflating is bounded while it runs, whatever sizes the archive claims (small, benign thresholds)", () => {
+  const big = { "word/document.xml": `<w:t>${"a".repeat(4096)}</w:t>` }; // 4 KB that deflates to a few bytes
+  // Honest sizes over the limit: refused.
+  expect(zipEntry(zip(big), "word/document.xml", 1024)).toBeNull();
+  // The archive claims 10 bytes: inflating still stops at the limit instead of trusting it.
+  expect(zipEntry(zip(big, false, 10), "word/document.xml", 1024)).toBeNull();
+  // A stored entry claiming 10 bytes: its real length is checked.
+  expect(zipEntry(zip(big, true, 10), "word/document.xml", 1024)).toBeNull();
+  // Under the limit, both read.
+  expect(zipEntry(zip(big, false, 10), "word/document.xml", 8192)!.length).toBe(4096 + 11);
+  expect(zipEntry(zip(big, true), "word/document.xml", 8192)!.length).toBe(4096 + 11);
+  // Not deflate data at all: none, no throw.
+  const broken = zip(big);
+  broken.fill(0x55, 30 + "word/document.xml".length, 30 + "word/document.xml".length + 4);
+  expect(zipEntry(broken, "word/document.xml", 8192)).toBeNull();
+});
+
+test("numeric entities outside Unicode scalar values never throw; they read as U+FFFD", () => {
+  const doc = `<w:document><w:p><w:t>a&#xD800;b&#x110000;c&#0;d&#99999999999;e&#x41;</w:t></w:p></w:document>`;
+  expect(docxSnippet(zip({ "word/document.xml": doc }))).toBe("a\ufffdb\ufffdc\ufffdd\ufffdeA");
+});
+
+/** An ID3v2 tag of `frames` (id, encoding byte, text bytes). */
+function id3(version: 2 | 3 | 4, frames: [string, number, Uint8Array][], flags = 0): Uint8Array {
+  const parts: number[] = [];
+  for (const [id, enc, text] of frames) {
+    const size = text.length + 1;
+    parts.push(...[...id].map((c) => c.charCodeAt(0)));
+    if (version === 2) parts.push((size >> 16) & 0xff, (size >> 8) & 0xff, size & 0xff);
+    else if (version === 4) parts.push((size >> 21) & 0x7f, (size >> 14) & 0x7f, (size >> 7) & 0x7f, size & 0x7f, 0, 0);
+    else parts.push((size >>> 24) & 0xff, (size >> 16) & 0xff, (size >> 8) & 0xff, size & 0xff, 0, flags);
+    parts.push(enc, ...text);
+  }
+  const n = parts.length;
+  return new Uint8Array([0x49, 0x44, 0x33, version, 0, 0, (n >> 21) & 0x7f, (n >> 14) & 0x7f, (n >> 7) & 0x7f, n & 0x7f, ...parts, 0xff, 0xfb, 0x90, 0x00]);
+}
+const latin1 = (t: string) => new Uint8Array([...t].map((c) => c.charCodeAt(0)));
+const utf16le = (t: string) => new Uint8Array([0xff, 0xfe, ...[...t].flatMap((c) => [c.charCodeAt(0) & 0xff, c.charCodeAt(0) >> 8])]);
+
+test("an MP3's ID3 title, artist and album are read in each tag version and text encoding", () => {
+  expect(id3Tags(id3(3, [["TIT2", 0, latin1("Harbor Song")], ["TPE1", 1, utf16le("Ana Reyes")], ["TALB", 0, latin1("Dockside")]]))).toEqual({ title: "Harbor Song", artist: "Ana Reyes", album: "Dockside" });
+  expect(id3Tags(id3(4, [["TIT2", 3, new TextEncoder().encode("Café Night")]]))).toEqual({ title: "Café Night", artist: null, album: null });
+  expect(id3Tags(id3(2, [["TT2", 0, latin1("Old Tag")], ["TP1", 0, latin1("Band")]]))).toEqual({ title: "Old Tag", artist: "Band", album: null });
+});
+
+test("no tag, an empty tag, or only compressed frames give no tags; a frame past the bytes read is skipped", () => {
+  expect(id3Tags(new Uint8Array([0xff, 0xfb, 0x90, 0x00, 1, 2, 3, 4, 5, 6, 7]))).toBeNull(); // plain MPEG frames
+  expect(id3Tags(id3(3, [["TXXX", 0, latin1("other")]]))).toBeNull();
+  expect(id3Tags(id3(3, [["TIT2", 0, latin1("Hidden")]], 0x80))).toBeNull(); // compressed frame: not read
+  const cut = id3(3, [["TIT2", 0, latin1("Long title")]]);
+  expect(id3Tags(cut.subarray(0, 16))).toBeNull();
 });

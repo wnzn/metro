@@ -11,11 +11,15 @@ import { cx } from "./tokens";
 
 type Named = { testID?: string; accessibilityLabel: string };
 
-/** A short excerpt of a file's own text. The popup around it scrolls, so it isn't clipped to a line count. */
-export function QuickTextExcerpt(props: Named & { text: string }) {
+/**
+ * A short excerpt of a file's own text, kept small: at most `lines` lines
+ * (3) on screen. Put the whole excerpt in `accessibilityLabel`; opening the
+ * file shows it in full.
+ */
+export function QuickTextExcerpt(props: Named & { text: string; lines?: 1 | 2 | 3 }) {
   return (
-    <View class="w-full rounded-(--radius-sm) bg-muted px-(--space-2) py-(--space-1)" testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="text" selectable>
-      <Text class="text-(length:--text-xs) text-muted-foreground" accessibilityElementsHidden>
+    <View class="w-full rounded-(--radius-sm) bg-muted px-(--space-2) py-(--space-1)" testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="text">
+      <Text class="text-(length:--text-xs) text-muted-foreground" style={{ numberOfLines: props.lines ?? 3 }} accessibilityElementsHidden>
         {props.text}
       </Text>
     </View>
@@ -78,6 +82,17 @@ export function QuickWaveform(props: Named & { peaks: readonly number[]; caption
           {props.caption}
         </Text>
       </If>
+    </View>
+  );
+}
+
+/** An audio file's own tags (its title, artist, album) on one line: metadata, not a picture of its sound. */
+export function QuickAudioTags(props: Named & { parts: readonly string[] }) {
+  return (
+    <View class="flex-row items-center min-w-0" testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="text">
+      <Text class="text-(length:--text-xs) text-muted-foreground" style={{ numberOfLines: 1 }} accessibilityElementsHidden>
+        {props.parts.join(" · ")}
+      </Text>
     </View>
   );
 }

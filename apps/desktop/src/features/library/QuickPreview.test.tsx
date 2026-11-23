@@ -45,6 +45,14 @@ function asciiWav(loud: (i: number) => boolean, frames: number): string {
   return out;
 }
 
+/** An MP3 whose ID3v2.3 tag holds Latin-1 title, artist and album frames, then a stand-in for audio frames; ASCII only. */
+function asciiId3(title: string, artist: string, album: string): string {
+  const frame = (id: string, text: string) => id + "\u0000\u0000\u0000" + String.fromCharCode(text.length + 1) + "\u0000\u0000" + "\u0000" + text;
+  const body = frame("TIT2", title) + frame("TPE1", artist) + frame("TALB", album);
+  const n = body.length;
+  return "ID3\u0003\u0000\u0000" + String.fromCharCode((n >> 21) & 0x7f, (n >> 14) & 0x7f, (n >> 7) & 0x7f, n & 0x7f) + body + "audio frames";
+}
+
 const reads = (w: W, id?: string) => w.l.log.filter((r) => r.path.endsWith("/content") && (!id || r.path === `/v1/library/assets/${id}/content`));
 
 function seed(w: W) {
@@ -54,12 +62,13 @@ function seed(w: W) {
   const photo = w.addAsset("alice", null, "photo.png", "PNGDATA");
   const clip = w.addAsset("alice", null, "clip.mp4", "MP4DATA");
   const pdf = w.addAsset("alice", null, "contract.pdf", "%PDF-1.7 fake");
-  const song = w.addAsset("alice", null, "song.mp3", "ID3fake");
+  const song = w.addAsset("alice", null, "song.mp3", asciiId3("Harbor Song", "Ana Reyes", "Dockside"));
+  const untagged = w.addAsset("alice", null, "raw.mp3", "\u0000\u0000 no tag here");
   const word = w.addAsset("alice", null, "memo.docx", "PK not a real docx");
   const huge = w.addAsset("alice", null, "huge.png", "PNGBIG");
   huge.size_bytes = 5 * 1024 * 1024;
   const acme = w.addAsset("bob", "acme", "roadmap.png", "PNGACME");
-  return { notes, half, quiet, photo, clip, pdf, song, word, huge, acme };
+  return { notes, half, quiet, photo, clip, pdf, song, untagged, word, huge, acme };
 }
 
 test("each file shows what it holds, or says why not; reads are authenticated, ranged for text and WAV, and skipped for PDF, MP3 and oversized files", async () => {
@@ -88,16 +97,21 @@ test("each file shows what it holds, or says why not; reads are authenticated, r
   expect(text).toContain("0:00 · silent");
   // Honest fallbacks, never a made-up preview.
   expect(text).toContain("PDF: no preview here. Open it to read.");
-  expect(text).toContain("MP3 audio: no waveform here. Open it to play.");
+  // MP3: its own tags (metadata, not a picture of its sound), or an honest line without them.
+  await app.waitFor(`id:quick-preview-tags:${s.song.id}`);
+  expect(app.texts()).toContain("“Harbor Song” · Ana Reyes · Dockside");
+  await app.waitFor(`id:quick-preview-none:${s.untagged.id}`);
+  expect(app.texts().join(" | ")).toContain("MP3 audio without a title or artist tag. Open it to play.");
   expect(text).toContain("Word file: no readable text found.");
   expect(text).toContain("PNG image of 5.0 MB: too large for a quick preview.");
 
   // What was read: one authenticated read per previewable file; text and WAV a prefix only.
-  for (const id of [s.pdf.id, s.song.id, s.huge.id]) expect(reads(w, id)).toHaveLength(0);
+  for (const id of [s.pdf.id, s.huge.id]) expect(reads(w, id)).toHaveLength(0);
+  expect(reads(w, s.song.id)[0]!.headers["range"]).toBe("bytes=0-65535");
   expect(reads(w, s.notes.id)[0]!.headers["range"]).toBe("bytes=0-8191");
   expect(reads(w, s.half.id)[0]!.headers["range"]).toBe("bytes=0-1048575");
   expect(reads(w, s.photo.id)[0]!.headers["range"]).toBeUndefined();
-  for (const id of [s.notes.id, s.half.id, s.quiet.id, s.photo.id, s.clip.id, s.word.id, s.acme.id]) {
+  for (const id of [s.notes.id, s.half.id, s.quiet.id, s.photo.id, s.clip.id, s.song.id, s.untagged.id, s.word.id, s.acme.id]) {
     expect(reads(w, id)).toHaveLength(1);
     expect(reads(w, id)[0]!.headers["authorization"]).toBe(`Bearer ${TOKENS.alice}`);
   }
