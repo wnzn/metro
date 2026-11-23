@@ -169,6 +169,7 @@ echo creds > .credentials; echo rsa > .credentials_rsaparams
         for f in (".runner", ".credentials", ".credentials_rsaparams"):
             self.assertEqual((self.tmp / "state" / f).stat().st_mode & 0o777, 0o600)
         self.assertEqual(self.entry("status", "--name-only").stdout.strip(), name)
+        self.assertEqual(self.entry("status", "--identity").stdout.strip(), f"{name} 7 https://github.com/wnzn/metro")
         again = self.entry("register", stdin=TOKEN + "\n", METRO_RUNNER_NAME=name)
         self.assertEqual(again.returncode, 0, again.stderr)
         self.assertIn("already registered", again.stdout)
@@ -180,6 +181,7 @@ echo creds > .credentials; echo rsa > .credentials_rsaparams
         self.assertEqual(removed.returncode, 0, removed.stderr)
         self.assertFalse(any((self.tmp / "state").iterdir()))
         self.assertEqual(self.entry("status", "--name-only").stdout.strip(), "")
+        self.assertEqual(self.entry("status", "--identity").stdout.strip(), "")
         self.assertEqual(self.entry("remove", stdin="").returncode, 0)  # nothing to remove: still fine
 
     def test_rejects_bad_input(self):
@@ -237,34 +239,78 @@ class HostHelper(unittest.TestCase):
         bin_dir = self.tmp / "bin"
         bin_dir.mkdir()
         self.calls = self.tmp / "calls.log"
+        t = self.tmp
         (bin_dir / "gh").write_text(f"""#!/usr/bin/env bash
-printf 'gh %s\\n' "$*" >> {self.calls}
+printf 'gh %s | GH_HOST=%s GH_REPO=%s\\n' "$*" "${{GH_HOST:-}}" "${{GH_REPO:-}}" >> {self.calls}
+[ "$1 $2 $3" = "api --hostname github.com" ] || {{ echo "unpinned gh" >&2; exit 9; }}
+shift 3
 case "$*" in
-  "api repos/wnzn/metro --jq"*) echo "wnzn/metro public" ;;
-  *fork-pr-contributor-approval*) cat "{self.tmp}/policy" ;;
+  "repos/wnzn/metro --jq"*) echo "wnzn/metro public" ;;
+  *fork-pr-contributor-approval*) cat "{t}/policy" ;;
   *registration-token*|*remove-token*) echo {TOKEN} ;;
-  *"actions/runners --jq"*|*"--paginate repos/wnzn/metro/actions/runners"*) cat "{self.tmp}/remote" 2>/dev/null || true ;;
-  *"-X DELETE"*) ;;
-  *"actions/runners/"*) echo true ;;
+  *"--paginate repos/wnzn/metro/actions/runners --jq"*) cat "{t}/remote_names" 2>/dev/null || true ;;
+  "-X DELETE"*) echo DELETED >> {self.calls} ;;
+  repos/wnzn/metro/actions/runners/[0-9]*)
+    id="${{1##*/}}"
+    if [ -f "{t}/remote_$id" ]; then cat "{t}/remote_$id"; else echo "gh: Not Found (HTTP 404)" >&2; exit 1; fi ;;
 esac
 """)
         (bin_dir / "docker").write_text(f"""#!/usr/bin/env bash
+if [ "$1" = context ]; then echo "${{STUB_DOCKER_ENDPOINT:-unix:///var/run/docker.sock}}"; exit 0; fi
 stdin="$(cat)"
-printf 'docker %s | stdin=%s\\n' "$*" "$stdin" >> {self.calls}
-case "$*" in *"status --name-only"*) cat "{self.tmp}/local" 2>/dev/null ;; esac
+printf 'docker %s | COMPOSE_FILE=%s stdin=%s\\n' "$*" "${{COMPOSE_FILE:-}}" "$stdin" >> {self.calls}
+case "$*" in *"status --identity"*) cat "{t}/local" 2>/dev/null || true ;; esac
 exit 0
 """)
         for f in ("gh", "docker"):
             (bin_dir / f).chmod(0o755)
         (self.tmp / "policy").write_text("all_external_contributors\n")
-        self.env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "METRO_RUNNER_MACHINE_ID": "test-machine"}
+        self.env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "METRO_RUNNER_MACHINE_ID": "test-machine",
+                    "GH_HOST": "evil.example", "GH_REPO": "evil/repo", "COMPOSE_FILE": "/evil/compose.yaml"}
+        self.env.pop("DOCKER_HOST", None)
 
-    def helper(self, *args):
-        return run(["bash", str(HERE / "runner.sh"), *args], env=self.env)
+    def helper(self, *args, **env):
+        return run(["bash", str(HERE / "runner.sh"), *args], env={**self.env, **env}, cwd=str(self.tmp))
 
     def name(self):
         r = run(["bash", "-c", f'source <(sed -n "/^runner_name()/,/^}}/p" {HERE / "runner.sh"}); runner_name'], env=self.env)
         return r.stdout.strip()
+
+    def registered(self, local_id=42, remote=None):
+        name = self.name()
+        (self.tmp / "local").write_text(f"{name} {local_id} https://github.com/wnzn/metro\n")
+        if remote is not None:
+            (self.tmp / f"remote_{local_id}").write_text(remote + "\n")
+        return name
+
+    def log(self):
+        return self.calls.read_text() if self.calls.exists() else ""
+
+    def assert_no_token_requested(self):
+        self.assertNotIn("registration-token", self.log())
+        self.assertNotIn("remove-token", self.log())
+        self.assertNotIn("DELETED", self.log())
+
+    def test_environment_cannot_redirect_gh_or_compose(self):
+        self.helper("setup")
+        log = self.log()
+        self.assertNotIn("unpinned gh", log)
+        for line in log.splitlines():
+            if line.startswith("gh "):
+                self.assertIn("api --hostname github.com", line)
+                self.assertTrue(line.endswith("GH_HOST= GH_REPO="), line)
+            if line.startswith("docker compose"):
+                self.assertIn(f"--project-directory {HERE} -p metro-ci-runner --env-file /dev/null -f {HERE}/compose.yaml", line)
+                self.assertIn("COMPOSE_FILE= ", line)
+
+    def test_tokens_only_go_to_a_local_daemon(self):
+        for endpoint in ("tcp://10.0.0.5:2376", "ssh://user@host"):
+            r = self.helper("setup", DOCKER_HOST=endpoint)
+            self.assertNotEqual(r.returncode, 0, endpoint)
+            self.assertIn("must be local", r.stderr)
+            r = self.helper("setup", STUB_DOCKER_ENDPOINT=endpoint)
+            self.assertNotEqual(r.returncode, 0, endpoint)
+        self.assert_no_token_requested()
 
     def test_refuses_without_all_external_contributors(self):
         for policy in ("first_time_contributors", "first_time_contributors_new_to_github", ""):
@@ -272,10 +318,9 @@ exit 0
             r = self.helper("setup")
             self.assertNotEqual(r.returncode, 0, policy)
             self.assertIn("all_external_contributors", r.stderr)
-            calls = self.calls.read_text()
-            self.assertNotIn("registration-token", calls)
-            self.assertNotIn("docker", calls)
-            self.assertNotRegex(calls, r"(?m)^gh api -X (PUT|PATCH)")
+            self.assertNotIn("docker compose", self.log())
+            self.assert_no_token_requested()
+            self.assertNotRegex(self.log(), r"-X (PUT|PATCH)")
 
     def test_setup_streams_the_token_on_stdin_only(self):
         name = self.name()
@@ -283,41 +328,77 @@ exit 0
         r = self.helper("setup")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertNotIn(TOKEN, r.stdout + r.stderr)
-        register = [line for line in self.calls.read_text().splitlines() if " register" in line]
+        register = [line for line in self.log().splitlines() if " register " in line]
         self.assertEqual(len(register), 1)
-        argv, stdin = register[0].split(" | stdin=")
+        argv, stdin = register[0].split(" stdin=")
         self.assertNotIn(TOKEN, argv)
         self.assertEqual(stdin, TOKEN)
         self.assertIn(f"METRO_RUNNER_NAME={name}", argv)
         self.assertIn("run -T --rm", argv)
 
-    def test_setup_never_takes_over_an_existing_runner(self):
-        (self.tmp / "remote").write_text("42\n")
+    def test_setup_never_takes_over_a_runner_by_name(self):
+        (self.tmp / "remote_names").write_text("99\n")
         r = self.helper("setup")
         self.assertNotEqual(r.returncode, 0)
-        self.assertNotIn("registration-token", self.calls.read_text())
+        self.assertIn("never deletes or replaces it", r.stderr)
+        self.assert_no_token_requested()
 
-    def test_setup_is_idempotent(self):
-        (self.tmp / "remote").write_text("42\n")
-        (self.tmp / "local").write_text(self.name() + "\n")
+    def test_setup_checks_the_stored_agent_id(self):
+        self.registered(42, remote=f"{self.name()} true")
         r = self.helper("setup")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("already registered", r.stdout)
-        self.assertNotIn("registration-token", self.calls.read_text())
+        self.assert_no_token_requested()
+        (self.tmp / "remote_42").write_text("someone-else true\n")
+        self.assertNotEqual(self.helper("setup").returncode, 0)
+        (self.tmp / "remote_42").write_text(f"{self.name()} false\n")
+        self.assertNotEqual(self.helper("setup").returncode, 0)
+        (self.tmp / "remote_42").unlink()
+        r = self.helper("setup")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("no longer exists on GitHub", r.stderr)
+        self.assert_no_token_requested()
 
-    def test_remove_uses_a_removal_token_on_stdin(self):
-        (self.tmp / "remote").write_text("42\n")
-        (self.tmp / "local").write_text(self.name() + "\n")
+    def test_bad_local_identity_is_refused(self):
+        for local in ("metro-ci-linux-abc 0 https://github.com/wnzn/metro", "metro-ci-linux-abc 42 https://github.com/evil/metro",
+                      "other 42 https://github.com/wnzn/metro", "metro-ci-linux-abc x https://github.com/wnzn/metro"):
+            (self.tmp / "local").write_text(local + "\n")
+            self.assertNotEqual(self.helper("remove").returncode, 0, local)
+        self.assert_no_token_requested()
+
+    def test_remove_uses_the_stored_agent_id_and_a_removal_token_on_stdin(self):
+        self.registered(42, remote=f"{self.name()} true")
         r = self.helper("remove")
         self.assertEqual(r.returncode, 0, r.stderr)
-        remove = [line for line in self.calls.read_text().splitlines() if line.endswith(f"stdin={TOKEN}")]
+        remove = [line for line in self.log().splitlines() if line.endswith(f"stdin={TOKEN}")]
         self.assertEqual(len(remove), 1)
-        self.assertIn(" runner remove", remove[0].split(" | stdin=")[0])
+        self.assertIn(" runner remove ", remove[0].split(" stdin=")[0] + " ")
+        self.assertNotIn("DELETED", self.log())
+
+    def test_remove_forgets_local_only_when_github_has_no_such_id(self):
+        self.registered(42)
+        r = self.helper("remove")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("runner forget", self.log())
+        self.assert_no_token_requested()
+
+    def test_remove_refuses_a_mismatched_github_runner(self):
+        self.registered(42, remote="metro-ci-linux-somewhereelse true")
+        self.assertNotEqual(self.helper("remove").returncode, 0)
+        self.assert_no_token_requested()
+
+    def test_remove_never_deletes_by_display_name(self):
+        (self.tmp / "remote_names").write_text("99\n")
+        r = self.helper("remove")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("Settings > Actions > Runners", r.stderr)
+        self.assert_no_token_requested()
 
     def test_remove_with_nothing_registered(self):
         r = self.helper("remove")
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("nothing to remove", r.stdout)
+        self.assert_no_token_requested()
 
 
 class Static(unittest.TestCase):

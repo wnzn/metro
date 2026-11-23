@@ -131,9 +131,13 @@ cmd_status() {
     if configured; then
         check_saved
         if [ "${1:-}" = "--name-only" ]; then setting agentName; return 0; fi
+        if [ "${1:-}" = "--identity" ]; then
+            printf '%s %s %s\n' "$(setting agentName)" "$(setting agentId)" "$(setting gitHubUrl)"
+            return 0
+        fi
         say "registered: $(setting agentName) (id $(setting agentId)) for $(setting gitHubUrl)"
     else
-        [ "${1:-}" = "--name-only" ] && return 0
+        case "${1:-}" in --name-only|--identity) return 0 ;; esac
         say "not registered"
     fi
 }
@@ -173,5 +177,5 @@ case "${1:-run}" in
     remove) cmd_remove ;;
     forget) cmd_forget ;;
     status) shift; cmd_status "$@" ;;
-    *) die "usage: run | register | remove | forget | status [--name-only]" ;;
+    *) die "usage: run | register | remove | forget | status [--name-only | --identity]" ;;
 esac
