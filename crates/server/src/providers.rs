@@ -42,6 +42,7 @@
 pub mod api;
 pub mod catalog;
 pub mod guard;
+mod listed;
 pub mod secret;
 pub mod sharing;
 pub mod store;
@@ -143,6 +144,7 @@ struct Inner {
     allowed: Vec<String>,
     http: DynHttpClient,
     listings: Semaphore,
+    listed_chat: Mutex<listed::Cache>,
     typed_calls: Arc<Semaphore>,
     media_calls: Arc<Semaphore>,
     /// Media calls in flight by caller and by connection.
@@ -184,6 +186,7 @@ impl ProviderService {
                 allowed,
                 http: no_redirect_client()?,
                 listings: Semaphore::new(MAX_LISTINGS),
+                listed_chat: Mutex::new(listed::Cache::default()),
                 typed_calls: Arc::new(Semaphore::new(MAX_TYPED_CALLS)),
                 media_calls: Arc::new(Semaphore::new(MAX_MEDIA_CALLS)),
                 media_in_flight: Arc::new(Mutex::new(MediaInFlight::default())),

@@ -432,6 +432,7 @@ pub async fn models(
     crate::api::empty_object(&body)?;
     let entry = catalog::find(&row.provider_id)
         .ok_or_else(|| conflict("this connection's provider is no longer supported"))?;
+    let started_at = std::time::Instant::now();
     let models = match entry.adapter {
         Adapter::Device => state
             .device
@@ -441,7 +442,19 @@ pub async fn models(
         Adapter::SystemOne | Adapter::Embeddings => list_typed_models(&state, entry, &row).await?,
         Adapter::Registered(_) | Adapter::Custom => list_server_models(&state, entry, &row).await?,
     };
-    Ok(Json(json!({ "models": clean_model_ids(models) })))
+    let models = clean_model_ids(models);
+    if super::listed::server_chat(entry, &row)
+        && !state
+            .providers
+            .remember_chat_listing(&state.db, row, started_at, &models)
+            .await
+            .map_err(ApiError::internal)?
+    {
+        return Err(conflict(
+            "the connection changed while fetching models; fetch them again",
+        ));
+    }
+    Ok(Json(json!({ "models": models })))
 }
 
 /// Valid, unique model ids, sorted, at most [`MAX_LISTED_MODELS`].
