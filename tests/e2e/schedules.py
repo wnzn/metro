@@ -29,8 +29,8 @@ transcript and the model stubs. A scheduled prompt is an explicit request: no cl
 
 Product rules asserted: recurring at most every 15 minutes (too frequent -> 400), once strictly in
 the future and within 366 days, a 5-minute catch-up grace, `revoked` (task paused + a notice in the
-owner's personal Chat) when the owner left the Space. Real recurring firing is NOT waited for here
-(the shortest legal recurrence is 15 minutes); the server's deterministic tick tests cover it.
+owner's personal Chat) when the owner left the Space. The default run validates cron without
+waiting for a recurring firing; --live-recurring checks that separately on the real clock.
 Pure cron expectations are self-checked against seeded instants, including DST, before any I/O.
 """
 
@@ -202,6 +202,16 @@ def serve_stub(stack, stub):
     stack.callback(thread.join, 3)
     stack.callback(stub.shutdown)
     return stub
+
+
+def require_no_new_calls(stubs, before, label):
+    for stub, (prior, prior_unmarked) in zip(stubs, before):
+        calls, unmarked = stub.snapshot()
+        if (calls, unmarked) != (prior, prior_unmarked):
+            changes = sorted((key.rsplit("-", 1)[0], calls.get(key, 0) - prior.get(key, 0))
+                             for key in calls.keys() | prior.keys() if calls.get(key) != prior.get(key))
+            raise RuntimeError(f"{label}: {stub.label} call changes {changes}, "
+                               f"unmarked {unmarked - prior_unmarked:+d}")
 
 
 # ---------------------------------------------------------------- server
@@ -556,6 +566,13 @@ def selfcheck_cron():
     for expression, tz, after, expected in cases:
         got = next_cron(expression, tz, at(after))
         require(got == at(expected), f"test helper wrong for {expression} {tz} after {after}: {got}")
+    # The old quarter-hour fixture fired inside the offline-connection check at 19:00Z.
+    require(validation_cron("*/15 * * * *", "7/15 * * * *", ("UTC",),
+                            at("2026-11-23T18:59:29+00:00")) == "7/15 * * * *",
+            "validation fixture did not move away from the 19:00 UTC boundary")
+    require(validation_cron("30 8 * * *", "45 8 * * *", ("Asia/Manila", "UTC"),
+                            at("2026-11-23T08:29:59+00:00")) == "45 8 * * *",
+            "validation fixture was too close to firing after a timezone update")
 
 
 def exercise_validation(api, users, alice_space, bob_only_space, now):
@@ -606,48 +623,65 @@ def exercise_validation(api, users, alice_space, bob_only_space, now):
             "a rejected create left a schedule behind")
 
 
-def exercise_cron(api, users, now):
+def validation_cron(expression, alternate, zones, now):
+    """Keep validation-only fixtures away from a firing, even across a minute boundary."""
+    safe_after = now + timedelta(minutes=5)
+    for candidate in (expression, alternate):
+        if all(next_cron(candidate, tz, now) > safe_after for tz in zones):
+            return candidate
+    raise RuntimeError(f"no safe validation window for cron {expression} in {', '.join(zones)}")
+
+
+def check_cron_due(view, expression, tz, before, after, label):
+    due = next_due(view)
+    expected = {next_cron(expression, tz, before), next_cron(expression, tz, after)}
+    require(due in expected, f"{label}: next due {due} is not the next {expression} "
+                             f"in {tz} (expected {sorted(rfc3339(e) for e in expected)})")
+    return due
+
+
+def exercise_cron(api, users):
     alice = users["alice"]
+    # Alternate phases preserve each cadence and zone when its usual slot is
+    # close. Manila needs a safe window in both its initial and updated zones.
     cases = [
-        ("cron-utc-15min", "*/15 * * * *", "UTC"),
-        ("cron-manila", "30 8 * * *", "Asia/Manila"),
-        ("cron-newyork-weekdays", "0 9 * * 1-5", "America/New_York"),
-        ("cron-utc-daily", "15 3 * * *", "UTC"),
+        ("cron-utc-15min", "*/15 * * * *", "7/15 * * * *", ("UTC",)),
+        ("cron-manila", "30 8 * * *", "45 8 * * *", ("Asia/Manila", "UTC")),
+        ("cron-newyork-weekdays", "0 9 * * 1-5", "15 9 * * 1-5", ("America/New_York",)),
+        ("cron-utc-daily", "15 3 * * *", "30 3 * * *", ("UTC",)),
     ]
     made = []
-    for label, expression, tz in cases:
+    for label, expression, alternate, zones in cases:
+        expression = validation_cron(expression, alternate, zones, datetime.now(UTC))
+        tz = zones[0]
         before = datetime.now(UTC)
         plan, body = create(api, alice, label, cron(expression, tz), enabled=True)
         after = datetime.now(UTC)
         check_view(plan.view, body, label)
-        due = next_due(plan.view)
-        require(due is not None, f"{label}: enabled recurring schedule had no next due time")
-        expected = {next_cron(expression, tz, before), next_cron(expression, tz, after)}
-        require(due in expected, f"{label}: next due {rfc3339(due)} is not the next {expression} "
-                                 f"in {tz} (expected {sorted(rfc3339(e) for e in expected)})")
-        require(due > before, f"{label}: next due is not in the future")
+        due = check_cron_due(plan.view, expression, tz, before, after, label)
         listed = find_in_list(api, alice, plan.id)
         require(listed is not None and next_due(listed) == due,
-                f"{label}: list disagreed about next due")
+                 f"{label}: list disagreed about next due")
         made.append(plan)
 
     manila = made[1]
     # Update: timezone change recomputes next due; invalid update changes nothing.
+    expression = manila.view["schedule"]["expression"]
+    before = datetime.now(UTC)
     status, data = api.ok(alice, "PATCH", item(manila.id),
-                          {"schedule": cron("30 8 * * *", "UTC")}, (200,), "PATCH cron timezone")
+                          {"schedule": cron(expression, "UTC")}, (200,), "PATCH cron timezone")
+    after = datetime.now(UTC)
     record("PATCH /v1/schedules/{id}", status, data)
     view = data if isinstance(data, dict) and "id" in data else find_in_list(api, alice, manila.id)
-    require(view is not None and view["schedule"].get("timezone") == "UTC",
-            "timezone update was not applied")
-    now2 = datetime.now(UTC)
-    require(next_due(view) in {next_cron("30 8 * * *", "UTC", now), next_cron("30 8 * * *", "UTC", now2)},
-            "timezone update did not recompute next due")
-    api.rejected(alice, "PATCH", item(manila.id), {"schedule": cron("30 8 * * *", "Not/AZone")},
-                 (400, 422), "PATCH with an invalid timezone")
+    require(view is not None and view["schedule"] == cron(expression, "UTC"),
+            "timezone update was not applied without changing the expression")
+    check_cron_due(view, expression, "UTC", before, after, "updated timezone")
+    api.rejected(alice, "PATCH", item(manila.id), {"schedule": cron(expression, "Not/AZone")},
+                  (400, 422), "PATCH with an invalid timezone")
     api.rejected(alice, "PATCH", item(manila.id), {"schedule": cron("* * * *", "UTC")},
                  (400, 422), "PATCH with an invalid cron")
     unchanged = find_in_list(api, alice, manila.id)
-    require(unchanged["schedule"].get("timezone") == "UTC" and next_due(unchanged) == next_due(view),
+    require(unchanged["schedule"] == view["schedule"] and next_due(unchanged) == next_due(view),
             "a rejected update changed the schedule")
 
     # Pause / resume of a recurring schedule.
@@ -657,13 +691,18 @@ def exercise_cron(api, users, now):
     require(paused["enabled"] is False, "paused recurring schedule still enabled")
     if next_due(paused) is not None:  # next_due() itself requires the field to exist
         note("paused cron schedules keep reporting a next_due time")
+    before = datetime.now(UTC)
     api.ok(alice, "PATCH", item(pause_target.id), {"enabled": True}, (200,), "resume cron")
+    after = datetime.now(UTC)
     resumed = find_in_list(api, alice, pause_target.id)
-    require(resumed["enabled"] is True and next_due(resumed) is not None
-            and next_due(resumed) > datetime.now(UTC),
-            "resumed recurring schedule had no future next due")
-    # Resume must not backfill: nothing recurring fired during pause or resume.
-    return made
+    require(resumed["enabled"] is True, "resumed recurring schedule is still paused")
+    check_cron_due(resumed, pause_target.view["schedule"]["expression"], "UTC", before, after, "resumed cron")
+
+    # These are validation probes, not part of the later dispatch/replay tests.
+    for plan in made:
+        require(not history(api, alice, plan.id), f"{plan.label}: validation cron unexpectedly ran")
+        api.ok(alice, "DELETE", item(plan.id), expect=(204,), label=f"remove {plan.label}")
+    require(list_schedules(api, alice) == [], "recurring validation fixture was left behind")
 
 
 def exercise_fires(api, users, stubs, state, children, deadline, alice_space, watch):
@@ -757,8 +796,7 @@ def exercise_fires(api, users, stubs, state, children, deadline, alice_space, wa
         require(want <= ids, f"{name}'s list is missing their own schedule")
         others = {p.id for key, p in plans.items() if key not in labels}
         require(not (ids & others), f"{name}'s list contains someone else's schedule")
-        if name != "alice":  # Alice also owns the cron schedules from the earlier phase
-            require(ids == want, f"{name}'s list has unexpected schedules")
+        require(ids == want, f"{name}'s list has unexpected schedules")
 
     # Wait for the sentinel: everything due earlier has been processed by then.
     chat_alice = lambda: chat_events(api, alice)
@@ -920,9 +958,9 @@ def exercise_unusable_default(api, users, stubs, deadline, watch):
     entries = history(api, dave, plan.id)
     require(len(entries) == 1, f"Dave's occurrence has {len(entries)} history entries, expected 1")
     state, events = entry_state(entries[0]), chat_events(api, dave)
-    require([stub.snapshot() for stub in stubs] == before and
-            all(stub.count(plan.marker) == 0 for stub in stubs),
-            "an unusable default connection still reached a model (silent fallback)")
+    require(all(stub.count(plan.marker) == 0 for stub in stubs),
+            "Dave's offline prompt reached a model (silent fallback)")
+    require_no_new_calls(stubs, before, "unexpected model traffic during the offline-default check")
     require(not results(events, plan.marker), "Dave's offline connection produced an answer")
     errors = [e for e in events if e.get("kind") == "error" and (e.get("text") or "").strip()]
     if state == DISPATCHED:
@@ -956,7 +994,7 @@ def exercise_restarts(api, users, stubs, server, plans, old_marker, alice_space,
         for guard in watch:
             guard()
         time.sleep(0.25)
-    require([stub.snapshot() for stub in stubs] == before, "model calls happened after a crash restart (replay)")
+    require_no_new_calls(stubs, before, "model calls happened after a crash restart (replay)")
     for key, plan in plans.items():
         if key == "cancelled":
             require(find_in_list(api, plan.owner, plan.id) is None, "a cancelled schedule came back after restart")
@@ -1004,7 +1042,7 @@ def exercise_restarts(api, users, stubs, server, plans, old_marker, alice_space,
         for guard in watch:
             guard()
         time.sleep(0.25)
-    require([stub.snapshot() for stub in stubs] == marks, "model calls happened after a clean restart (replay)")
+    require_no_new_calls(stubs, marks, "model calls happened after a clean restart (replay)")
 
 
 # ---------------------------------------------------------------- driver
@@ -1061,8 +1099,11 @@ def schedules(server_binary, timeout):
         require(list_schedules(api, tokens["alice"]) == [], "a fresh server listed schedules")
 
         now = datetime.now(UTC)
+        before_validation = [stub.snapshot() for stub in stubs]
         exercise_validation(api, users, alice_space, bob_space, now)
-        exercise_cron(api, users, now)
+        exercise_cron(api, users)
+        require_no_new_calls(stubs, before_validation, "schedule validation reached a model")
+        watch_stubs()
         plans, old_marker = exercise_fires(api, users, stubs, state, None, deadline, alice_space, watch)
         verify_outcomes(api, users, stubs, plans, old_marker, alice_space, "after firing")
         dave_plan = exercise_unusable_default(api, users, stubs, deadline, watch)
