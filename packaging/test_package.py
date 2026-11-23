@@ -3,6 +3,7 @@ import os
 from pathlib import Path
 import plistlib
 import shutil
+import stat
 import struct
 import subprocess
 import sys
@@ -52,7 +53,7 @@ class PackageTests(unittest.TestCase):
             root = Path(directory)
             stage = root / "stage"
             stage.mkdir()
-            source = stage / "bin"
+            source = stage / "Metro.exe"
             source.write_bytes(b"Metro" * 8192)
             source.chmod(0o755)
             expected = package.sha256(source)
@@ -64,15 +65,54 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(package.sha256(a), package.sha256(b))
                 if strict_windows:
                     with zipfile.ZipFile(a) as result:
-                        member = result.getinfo("Metro/bin")
+                        member = result.getinfo("Metro/Metro.exe")
                         self.assertEqual(member.compress_type, zipfile.ZIP_DEFLATED)
                         self.assertEqual(member.external_attr >> 16 & 0o777, 0o755)
                         self.assertEqual(result.read(member), source.read_bytes())
                 else:
                     with tarfile.open(a) as result:
-                        self.assertEqual(result.getmember("Metro/bin").mode, 0o755)
-                        self.assertEqual(result.extractfile("Metro/bin").read(), source.read_bytes())
-                self.assertEqual(package.sha256(source), expected)
+                        self.assertEqual(result.getmember("Metro/Metro.exe").mode, 0o755)
+                        self.assertEqual(result.extractfile("Metro/Metro.exe").read(), source.read_bytes())
+            self.assertEqual(package.sha256(source), expected)
+
+    def test_windows_zip_modes_are_independent_of_host_stat(self):
+        executables = ("Metro.exe", "metro-server.exe", "metro-tui.exe", "ui/Metro.exe")
+        data = ("RELEASE.json", "START.txt", "licenses/BRAND-MARKS.txt", "licenses/INTER-OFL.txt",
+                "ui/nsh/icon.ico", "ui/nsh/assets/src/ui/fonts/InterVariable.ttf")
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / "stage"
+            for rel in (*executables, *data):
+                path = stage / rel
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(rel.encode())
+            original_stat = Path.stat
+
+            def host_stat(exe_mode, data_mode):
+                def get_stat(path, *args, **kwargs):
+                    result = original_stat(path, *args, **kwargs)
+                    if stat.S_ISREG(result.st_mode) and path.is_relative_to(stage):
+                        mode = exe_mode if path.relative_to(stage).as_posix() in executables else data_mode
+                        return os.stat_result((stat.S_IFREG | mode, *result[1:]))
+                    return result
+                return get_stat
+
+            linux, windows = root / "linux.zip", root / "windows.zip"
+            with patch.object(Path, "stat", host_stat(0o755, 0o644)):
+                package.archive(stage, linux, "Metro", True)
+            # Mode bits observed in the native Windows seed from run 45191721188.
+            with patch.object(Path, "stat", host_stat(0o777, 0o666)):
+                package.archive(stage, windows, "Metro", True)
+            self.assertEqual(linux.read_bytes(), windows.read_bytes())
+            with zipfile.ZipFile(windows) as result:
+                self.assertEqual(
+                    {member.filename.removeprefix("Metro/"): (member.create_system, member.external_attr)
+                     for member in result.infolist()},
+                    {rel: (3, (stat.S_IFREG | mode) << 16)
+                     for rels, mode in ((executables, 0o755), (data, 0o644)) for rel in rels},
+                )
+                for rel in (*executables, *data):
+                    self.assertEqual(result.read(f"Metro/{rel}"), rel.encode())
 
     def test_rejects_invalid_binaries(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -67,6 +67,7 @@ LINUX_ICONS = {
     f"icons/{APP_ID}.svg": "metro.svg",
 }
 WINDOWS_ICON = "ui/nsh/icon.ico"
+WINDOWS_EXECUTABLES = {"Metro.exe", "ui/Metro.exe", "metro-server.exe", TUI_NAMES["windows"]}
 # Production modules in apps/desktop/src/ui that import bundled SVG icons. Only
 # these approve renderer assets: a test or fixture module never does.
 ICON_MODULES = ("chrome.tsx", "activity.tsx", "chatControls.tsx", "library.tsx")
@@ -633,17 +634,24 @@ def archive(stage, output, root, windows):
     inputs = {f"{root}/{p.relative_to(stage).as_posix()}": p for p in files(stage)}
     expected = {name: sha256(p) for name, p in inputs.items()}
     if windows:
+        # Windows stat/chmod does not preserve POSIX modes (in particular
+        # writable data appears as 0666 and writable EXEs as 0777).
+        modes = {name: stat.S_IFREG | (0o755 if p.relative_to(stage).as_posix() in WINDOWS_EXECUTABLES else 0o644)
+                 for name, p in inputs.items()}
         with zipfile.ZipFile(output, "w") as result:
             for name, path in inputs.items():
                 info = zipfile.ZipInfo(name)
                 info.create_system = 3
                 info.compress_type = zipfile.ZIP_DEFLATED
-                info.external_attr = (stat.S_IFREG | stat.S_IMODE(path.stat().st_mode)) << 16
+                info.external_attr = modes[name] << 16
                 with path.open("rb") as src, result.open(info, "w") as dest:
                     shutil.copyfileobj(src, dest)
         with zipfile.ZipFile(output) as result:
             require(result.namelist() == list(expected), "unexpected ZIP entries")
             for name, digest in expected.items():
+                info = result.getinfo(name)
+                require(info.create_system == 3 and info.external_attr == modes[name] << 16,
+                        f"bad ZIP member mode: {name}")
                 with result.open(name) as src:
                     require(hashlib.file_digest(src, "sha256").hexdigest() == digest, f"bad ZIP member: {name}")
     else:
