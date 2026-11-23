@@ -418,6 +418,146 @@ class PublishedSourceTests(unittest.TestCase):
                     self.assertIn(message, err)
 
 
+class FakeGitHub(http.server.ThreadingHTTPServer):
+    def __init__(self, refs, tags):
+        super().__init__(("127.0.0.1", 0), GitHubHandler)
+        self.refs, self.tags, self.auth = refs, tags, []
+
+
+class GitHubHandler(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_GET(self):
+        self.server.auth.append(self.headers.get("Authorization"))
+        m = re.fullmatch(r"/repos/wnzn/metro/git/ref/tags/(.+)", self.path)
+        n = re.fullmatch(r"/repos/wnzn/metro/git/tags/(\w+)", self.path)
+        if m and m.group(1) in self.server.refs:
+            body = {"ref": f"refs/tags/{m.group(1)}", "object": self.server.refs[m.group(1)]}
+        elif n and n.group(1) in self.server.tags:
+            body = {"object": self.server.tags[n.group(1)]}
+        else:
+            self.send_response(404)
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+
+class CheckTagTests(unittest.TestCase):
+    OTHER = "f" * 40
+
+    def check(self, server, tag):
+        os.environ["TEST_GH_TOKEN"] = SECRET
+        try:
+            return run(["check-tag", "--repository", "wnzn/metro", "--tag", tag, "--commit", REV,
+                        "--token-env", "TEST_GH_TOKEN", "--allow-http-loopback",
+                        "--api-url", f"http://127.0.0.1:{server.server_port}"])
+        finally:
+            os.environ.pop("TEST_GH_TOKEN")
+
+    def test_lightweight_and_annotated_tags_must_name_exactly_the_commit(self):
+        refs = {"v1.0.0": {"type": "commit", "sha": REV},
+                "v1.0.1": {"type": "tag", "sha": "a" * 40},
+                "v1.0.2": {"type": "commit", "sha": self.OTHER},
+                "v1.0.3": {"type": "tag", "sha": "b" * 40},
+                "v1.0.4": {"type": "tree", "sha": REV}}
+        tags = {"a" * 40: {"type": "commit", "sha": REV}, "b" * 40: {"type": "commit", "sha": self.OTHER}}
+        server = FakeGitHub(refs, tags)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            for tag, ok, message in (("v1.0.0", True, ""), ("v1.0.1", True, ""),
+                                     ("v1.0.2", False, "not " + REV), ("v1.0.3", False, "not " + REV),
+                                     ("v1.0.4", False, "does not name a commit"),
+                                     ("v9.9.9", False, "does not exist")):
+                code, out, err = self.check(server, tag)
+                self.assertEqual(code == 0, ok, (tag, err))
+                self.assertIn(message, err)
+                self.assertNotIn(SECRET, out + err)
+            self.assertTrue(all(a == f"Bearer {SECRET}" for a in server.auth))
+        finally:
+            server.shutdown()
+            server.server_close()
+
+    def test_refuses_plain_http_and_bad_input(self):
+        for argv in (["--api-url", "http://api.example"], ["--commit", "abc"], ["--tag", "main"]):
+            base = {"--repository": "wnzn/metro", "--tag": "v1.0.0", "--commit": REV,
+                    "--api-url": "https://api.github.com"}
+            base[argv[0]] = argv[1]
+            code, _, _ = run(["check-tag", *[x for kv in base.items() for x in kv]])
+            self.assertEqual(code, 1, argv)
+
+
+class CheckSignaturesTests(unittest.TestCase):
+    REPO = "ghcr.io/wnzn/metro-server"
+    DIGEST = "sha256:" + "7" * 64
+    IDENTITY = "https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/master"
+    ISSUER = "https://token.actions.githubusercontent.com"
+
+    def entry(self, keyless=True):
+        # Shape of `cosign verify --output json` (cosign v3.1.4): critical names the digest,
+        # optional holds the signed annotations and, for keyless, the certificate claims.
+        optional = {"org.opencontainers.image.revision": REV, "org.opencontainers.image.version": "v1.2.3",
+                    "org.opencontainers.image.source": "https://github.com/wnzn/metro",
+                    "dev.metro.source-ref": "refs/heads/master"}
+        if keyless:
+            optional |= {"Issuer": self.ISSUER, "Subject": self.IDENTITY,
+                         "1.3.6.1.4.1.57264.1.1": self.ISSUER, "1.3.6.1.4.1.57264.1.2": "push",
+                         "1.3.6.1.4.1.57264.1.3": REV, "1.3.6.1.4.1.57264.1.5": "wnzn/metro",
+                         "1.3.6.1.4.1.57264.1.6": "refs/heads/master",
+                         "githubWorkflowRef": "refs/heads/master", "githubWorkflowRepository": "wnzn/metro",
+                         "githubWorkflowSha": REV, "githubWorkflowTrigger": "push"}
+        return {"critical": {"identity": {"docker-reference": f"{self.REPO}@{self.DIGEST}"},
+                             "image": {"docker-manifest-digest": self.DIGEST},
+                             "type": "https://sigstore.dev/cosign/sign/v1"},
+                "optional": optional}
+
+    def check(self, entries):
+        with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+            json.dump(entries, f)
+        self.addCleanup(os.unlink, f.name)
+        return run(["check-signatures", "--cosign-json", f.name, "--repository", self.REPO,
+                    "--digest", self.DIGEST, "--revision", REV, "--version", "1.2.3",
+                    "--source-url", "https://github.com/wnzn/metro", "--source-ref", "refs/heads/master",
+                    "--identity", self.IDENTITY, "--issuer", self.ISSUER, "--workflow-repository", "wnzn/metro"])
+
+    def test_accepts_exact_digest_annotations_and_claims(self):
+        code, out, err = self.check([self.entry()])
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["claims_checked"],
+                         ["identity", "issuer", "revision", "source_ref", "trigger", "workflow_repository"])
+        # Old-style references name the repository without the digest.
+        e = self.entry(keyless=False)
+        e["critical"]["identity"]["docker-reference"] = self.REPO
+        self.assertEqual(self.check([e])[0], 0)
+
+    def test_rejects_any_mismatch(self):
+        mutations = {
+            "another digest": lambda e: e["critical"]["image"].update({"docker-manifest-digest": "sha256:" + "8" * 64}),
+            "another repository": lambda e: e["critical"]["identity"].update(
+                {"docker-reference": "ghcr.io/evil/metro-server"}),
+            "revision annotation": lambda e: e["optional"].update({"org.opencontainers.image.revision": "0" * 40}),
+            "missing ref annotation": lambda e: e["optional"].pop("dev.metro.source-ref"),
+            "tag workflow ref": lambda e: e["optional"].update({"githubWorkflowRef": "refs/tags/v1.2.3"}),
+            "other commit claim": lambda e: e["optional"].update({"1.3.6.1.4.1.57264.1.3": "0" * 40}),
+            "other identity": lambda e: e["optional"].update(
+                {"Subject": self.IDENTITY.replace("refs/heads/master", "refs/heads/dev")}),
+            "other trigger": lambda e: e["optional"].update({"githubWorkflowTrigger": "workflow_dispatch"}),
+            "fork repository": lambda e: e["optional"].update({"githubWorkflowRepository": "evil/metro"}),
+        }
+        for name, mutate in mutations.items():
+            good, bad = self.entry(), self.entry()
+            mutate(bad)
+            code, _, err = self.check([good, bad])
+            self.assertEqual(code, 1, name)
+            self.assertIn("image_release:", err)
+        self.assertEqual(self.check([])[0], 1)
+
+
 class WorkflowContractTests(unittest.TestCase):
     """Text checks on .github/workflows/release-images.yml (no YAML parser in the stdlib)."""
 
