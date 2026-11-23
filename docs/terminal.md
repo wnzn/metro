@@ -49,8 +49,11 @@ Options:
   proxy environment variables aren't used.
 - **Your token.** Without `--token-file`, it asks for `Metro token:` and
   doesn't echo what you type or paste. With `--token-file PATH`, the file
-  must be a regular file you own with mode 600 (`chmod 600`); otherwise it
-  refuses to start. Never put a token on the command line.
+  must be a regular file. On Linux and macOS it must also belong to you and
+  give no access to group or others (`chmod 600`), and symbolic links are
+  refused; otherwise it refuses to start. On Windows it checks only that
+  the path is a regular file, not its permissions, so keep the file in a
+  folder only you can read. Never put a token on the command line.
 - It needs an interactive terminal. Over SSH, allocate one (`ssh -t`).
 - If the server refuses the token, it says so and exits. A mistaken
   argument is never echoed back, in case it held a credential.
