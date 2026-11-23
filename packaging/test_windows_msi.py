@@ -287,7 +287,7 @@ class Sources(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout[-4000:] + proc.stderr[-2000:])
         self.assertIn("fails=0", proc.stdout)
         self.assertNotIn("FAIL ", proc.stdout)
-        self.assertEqual(proc.stdout.count("PASS "), 69 + (1 if real else 0))
+        self.assertEqual(proc.stdout.count("PASS "), 86 + (1 if real else 0))
         self.assertIn("exported from packages built by build_msi.py" if real else "written in this test", proc.stdout)
         if real:
             self.assertIn("extracted from a package built by build_msi.py", proc.stdout)

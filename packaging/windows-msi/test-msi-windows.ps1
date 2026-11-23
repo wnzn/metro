@@ -152,13 +152,16 @@ function Invoke-StandardUserMsiFixture([string] $Package, $Spec, [string] $Expec
         $cred = [pscredential]::new("$env:COMPUTERNAME\$name", $password)
 
         $r = Invoke-StandardUserPhase $cred $root 'host' $Expectation
-        $problems = Get-StandardUserResultProblems $r $sid $Expectation
+        # The account's profile as Windows records it (its first logon created it).
+        $profilePath = [string] (Get-CimInstance -ClassName Win32_UserProfile -Filter "SID = '$sid'").LocalPath
+        Write-Host "standard-user profile: $profilePath (child started with USERPROFILE $(if ($r) { $r.inherited_userprofile }))"
+        $problems = Get-StandardUserResultProblems $r $sid $Expectation $profilePath $env:USERPROFILE
         Check ($problems.Count -eq 0) "standard user under this machine's policy: $($problems -join '; ')"
         Pass "standard user under this machine's policy: $(if ($Expectation -eq 'refused') { 'refused (1625), nothing registered or installed' } else { 'installed, inspected and uninstalled its own product' })"
         if ($Expectation -eq 'refused') {
             Invoke-WithClientMsiPolicy $PolicyStore {
                 $r2 = Invoke-StandardUserPhase $cred $root 'client' 'allowed'
-                $problems2 = Get-StandardUserResultProblems $r2 $sid 'allowed'
+                $problems2 = Get-StandardUserResultProblems $r2 $sid 'allowed' $profilePath $env:USERPROFILE
                 Check ($problems2.Count -eq 0) "standard user with DisableMsi=0: $($problems2 -join '; ')"
             }
             Pass 'standard user with DisableMsi=0 (client policy): installed, inspected and uninstalled its own product'

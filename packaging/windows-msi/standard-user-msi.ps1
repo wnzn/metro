@@ -20,7 +20,8 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'MsiHarness.ps1')
 
 $out = Join-Path $Root 'out'
-$result = [ordered] @{ phase = $Phase; expect = $Expect; user_sid = ''; checks = [Collections.Generic.List[object]]::new(); error = '' }
+$result = [ordered] @{ phase = $Phase; expect = $Expect; user_sid = ''; profile_dir = ''; inherited_userprofile = ''
+                     checks = [Collections.Generic.List[object]]::new(); error = '' }
 function Record([string] $Name, [bool] $Ok, [string] $Detail = '') {
     $result.checks.Add([ordered] @{ name = $Name; ok = $Ok; detail = $Detail })
     if (-not $Ok) { throw "check '$Name' failed: $Detail" }
@@ -42,11 +43,28 @@ try {
     $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
     Record 'token is standard' ($tokenProblem -eq '' -and -not $isAdmin) "$tokenProblem$(if ($isAdmin) { ' (in the Administrators role)' })"
 
+    # The parent started this process for this account but with its own environment (USERPROFILE,
+    # LOCALAPPDATA, TEMP...). Before touching any file, switch to the environment
+    # Windows builds for this token and prove the profile is this SID's own.
+    $own = Initialize-OwnUserEnvironment
+    $result.profile_dir = $own.ProfileDir
+    $result.inherited_userprofile = $own.Inherited
+    $envNow = @{}
+    foreach ($k in 'USERPROFILE', 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP') {
+        $v = [Environment]::GetEnvironmentVariable($k)
+        $envNow[$k] = if ($v -and (Test-Path -LiteralPath $v)) { [MetroOwnUser]::LongPath($v) } else { $v }
+    }
+    $tempDir = [MetroOwnUser]::LongPath([IO.Path]::GetTempPath())
+    Record 'environment from own profile' ($envNow['USERPROFILE'] -eq $own.ProfileDir -and $tempDir.StartsWith($own.ProfileDir.TrimEnd('\') + '\', [StringComparison]::OrdinalIgnoreCase)) `
+        "USERPROFILE '$($envNow['USERPROFILE'])', temp '$tempDir' (inherited USERPROFILE '$($own.Inherited)')"
+    $listed = [string] (Get-ItemPropertyValue -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($result.user_sid)" -Name ProfileImagePath)
+    $profileProblems = Get-OwnProfileProblems $own.ProfileDir ([Environment]::ExpandEnvironmentVariables($listed)) $own.Folders $envNow
+    Record 'profile belongs to own SID' ($profileProblems.Count -eq 0) ($profileProblems -join '; ')
+
     $installer = New-Object -ComObject WindowsInstaller.Installer
     $uc = [string] $spec.upgrade_code
     Record 'no product before' ((Get-RelatedProducts $installer $uc).Count -eq 0)
-    $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
-    $dir = Join-Path $localAppData 'Metro MSI Standard User\Chosen Folder'
+    $dir = Join-Path $own.Folders.LocalAppData 'Metro MSI Standard User\Chosen Folder'
     $code = Invoke-Msiexec "/i `"$package`" INSTALLDIR=`"$dir`"" "$Phase-install-msiexec.log"
     if ($Expect -eq 'refused') {
         Record 'msiexec refused by policy (1625)' ($code -eq 1625) "exit $code"
@@ -62,7 +80,7 @@ try {
         Record 'installed files' ($problems.Count -eq 0) ($problems -join '; ')
         $remembered = (Get-ItemProperty -LiteralPath ('HKCU:\' + [string] $spec.reg_key) -Name InstallDir -ErrorAction SilentlyContinue)
         Record 'remembered folder in own HKCU' ($remembered -and ([string] $remembered.InstallDir).TrimEnd('\') -eq $dir)
-        $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) ([string] $spec.shortcut)
+        $lnk = Join-Path $own.Folders.Programs ([string] $spec.shortcut)
         $target = if (Test-Path -LiteralPath $lnk) { (New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath } else { '' }
         Record 'own Start menu shortcut' ($target -eq (Join-Path $dir 'Metro.exe'))
         $code = Invoke-Msiexec "/x $($related[0])" "$Phase-uninstall-msiexec.log"

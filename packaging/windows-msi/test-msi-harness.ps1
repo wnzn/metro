@@ -303,18 +303,22 @@ Check ($plain1 -cmatch '[A-Z]' -and $plain1 -cmatch '[a-z]' -and $plain1 -match 
 $plain1 = $null; $plain2 = $null
 
 $sid = 'S-1-5-21-1-2-3-1001'
-function New-Result([string] $Expect, [string] $Sid = 'S-1-5-21-1-2-3-1001', [string[]] $Skip = @(), [string] $Fail = '', [string] $Err = '') {
+$childProfile = 'C:\Users\metromsi1a2b3c4d'
+$parentProfile = 'C:\Users\runneradmin'
+function New-Result([string] $Expect, [string] $Sid = 'S-1-5-21-1-2-3-1001', [string[]] $Skip = @(), [string] $Fail = '', [string] $Err = '',
+                    [string] $Profile = $childProfile) {
     $checks = @($script:StandardUserChecks[$Expect] | Where-Object { $Skip -notcontains $_ } | ForEach-Object { @{ name = $_; ok = ($_ -ne $Fail); detail = '' } })
-    return (@{ phase = 'host'; expect = $Expect; user_sid = $Sid; checks = $checks; error = $Err } | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
+    return (@{ phase = 'host'; expect = $Expect; user_sid = $Sid; profile_dir = $Profile; inherited_userprofile = $parentProfile
+               checks = $checks; error = $Err } | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
 }
-Check ((Get-StandardUserResultProblems (New-Result 'refused') $sid 'refused').Count -eq 0) 'standard-user result: complete refusal phase passes'
-Check ((Get-StandardUserResultProblems (New-Result 'allowed') $sid 'allowed').Count -eq 0) 'standard-user result: complete install phase passes'
-Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Sid 'S-1-5-21-9') $sid 'allowed')[0] -like "result is from SID*") 'standard-user result: another SID is rejected'
-Check ((Get-StandardUserResultProblems (New-Result 'refused') $sid 'allowed').Count -gt 0) 'standard-user result: a refusal never passes as the install'
+Check ((Get-StandardUserResultProblems (New-Result 'refused') $sid 'refused' $childProfile $parentProfile).Count -eq 0) 'standard-user result: complete refusal phase passes'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed') $sid 'allowed' $childProfile $parentProfile).Count -eq 0) 'standard-user result: complete install phase passes'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Sid 'S-1-5-21-9') $sid 'allowed' $childProfile $parentProfile)[0] -like "result is from SID*") 'standard-user result: another SID is rejected'
+Check ((Get-StandardUserResultProblems (New-Result 'refused') $sid 'allowed' $childProfile $parentProfile).Count -gt 0) 'standard-user result: a refusal never passes as the install'
 Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Skip @('folder removed')) $sid 'allowed') -contains "check 'folder removed' was not run") 'standard-user result: a skipped check is rejected'
-Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Fail 'token is standard') $sid 'allowed') -contains "check 'token is standard' failed: ") 'standard-user result: a failed token check is rejected'
-Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Err 'boom') $sid 'allowed') -contains 'child failed: boom') 'standard-user result: a child error is rejected'
-Check ((Get-StandardUserResultProblems $null $sid 'allowed')[0] -eq 'no result was written') 'standard-user result: no result is rejected'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Fail 'token is standard') $sid 'allowed' $childProfile $parentProfile) -contains "check 'token is standard' failed: ") 'standard-user result: a failed token check is rejected'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Err 'boom') $sid 'allowed' $childProfile $parentProfile) -contains 'child failed: boom') 'standard-user result: a child error is rejected'
+Check ((Get-StandardUserResultProblems $null $sid 'allowed' $childProfile $parentProfile)[0] -eq 'no result was written') 'standard-user result: no result is rejected'
 $standardUser = @('"BUILTIN\Users","Alias","S-1-5-32-545","Mandatory group, Enabled by default, Enabled group"', '"Mandatory Label\Medium Mandatory Level","Label","S-1-16-8192",""')
 Check ((Get-NonAdminTokenProblem $standardUser) -eq '') 'token: a standard user without the Administrators group passes'
 
@@ -327,6 +331,58 @@ $required = @($script:StandardUserChecks['refused'] + $script:StandardUserChecks
 Check ((Get-SetDifference $required $recorded) -eq '') "standard-user-msi.ps1 records exactly the required checks ($(Get-SetDifference $required $recorded))"
 $childText = Get-Content -LiteralPath $child -Raw
 Check ($childText -notmatch '(?i)-Credential|-Verb\s+RunAs|runas|trustlevel|AlwaysInstallElevated|Policies') 'standard-user-msi.ps1 never elevates, switches users or touches policy'
+
+# ---- 9. The standard user's own environment -----------------------------------------
+Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Profile $parentProfile) $sid 'allowed' $parentProfile $parentProfile) -contains "child worked in the test runner's own profile '$parentProfile'") 'standard-user result: work in the runner''s profile is rejected'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Profile 'C:\Users\other') $sid 'allowed' $childProfile $parentProfile)[0] -like "child worked in profile 'C:\Users\other'*") 'standard-user result: a profile other than the account''s is rejected'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed') $sid 'allowed' '' $parentProfile).Count -gt 0) 'standard-user result: an unknown account profile is rejected'
+
+$block = "=C:=C:\x`0USERPROFILE=$childProfile`0Path=C:\Windows;C:\Windows\System32`0TEMP=$childProfile\AppData\Local\Temp`0LOCALAPPDATA=$childProfile\AppData\Local`0`0"
+$target = ConvertFrom-EnvironmentBlock $block
+Check ($target.Count -eq 4 -and $target['path'] -eq 'C:\Windows;C:\Windows\System32' -and -not $target.Contains('=C:')) 'environment block: entries parsed, per-drive entries skipped, names case-insensitive'
+# What Start-Process -Credential hands the child: the parent's block.
+$inheritedEnv = [Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+foreach ($kv in @(@('USERPROFILE', $parentProfile), @('LOCALAPPDATA', "$parentProfile\AppData\Local"), @('TEMP', 'C:\Users\RUNNER~1\AppData\Local\Temp'),
+                  @('PATH', 'C:\Windows;C:\Windows\System32'), @('RUNNER_TEMP', 'D:\a\_temp'), @('PSModulePath', 'C:\pwsh\Modules'))) { $inheritedEnv[$kv[0]] = $kv[1] }
+$plan = Get-EnvironmentPlan $inheritedEnv $target @('PSModulePath')
+Check ($plan.Set['USERPROFILE'] -eq $childProfile -and $plan.Set['LOCALAPPDATA'] -eq "$childProfile\AppData\Local" -and $plan.Set['TEMP'] -like "$childProfile\*" -and -not $plan.Set.Contains('Path')) 'environment plan: parent profile values are replaced, equal ones left alone'
+Check (($plan.Remove -join ',') -eq 'RUNNER_TEMP') 'environment plan: parent-only variables are removed, PSModulePath is kept'
+foreach ($n in $plan.Remove) { $inheritedEnv.Remove($n) }
+foreach ($n in $plan.Set.Keys) { $inheritedEnv[$n] = $plan.Set[$n] }
+$same = $true
+foreach ($n in $target.Keys) { if ($inheritedEnv[$n] -cne $target[$n]) { $same = $false } }
+Check ($same -and $inheritedEnv.Count -eq $target.Count + 1) 'environment plan: applied, the process environment is the account''s own (plus PSModulePath)'
+
+$folders = [ordered] @{ Profile = $childProfile; LocalAppData = "$childProfile\AppData\Local"; RoamingAppData = "$childProfile\AppData\Roaming"
+                         Programs = "$childProfile\AppData\Roaming\Microsoft\Windows\Start Menu\Programs" }
+$ownEnv = @{ USERPROFILE = $childProfile; LOCALAPPDATA = "$childProfile\AppData\Local"; APPDATA = "$childProfile\AppData\Roaming"
+             TEMP = "$childProfile\AppData\Local\Temp"; TMP = "$childProfile\AppData\Local\Temp" }
+Check ((Get-OwnProfileProblems $childProfile $childProfile $folders $ownEnv).Count -eq 0) 'own profile: environment and known folders inside the SID''s listed profile'
+$parentEnv = @{ USERPROFILE = $parentProfile; LOCALAPPDATA = "$parentProfile\AppData\Local"; APPDATA = "$parentProfile\AppData\Roaming"
+                TEMP = "$parentProfile\AppData\Local\Temp"; TMP = "$parentProfile\AppData\Local\Temp" }
+$pp = Get-OwnProfileProblems $childProfile $childProfile $folders $parentEnv
+Check ($pp.Count -eq 6 -and $pp[0] -eq "USERPROFILE is '$parentProfile'") "own profile: the inherited parent environment is rejected ($($pp.Count) problems)"
+Check ((Get-OwnProfileProblems $childProfile 'C:\Users\someone' $folders $ownEnv)[0] -like "profile * is not the one listed for this SID*") 'own profile: a profile not listed for the SID is rejected'
+$sibling = [ordered] @{ Profile = $childProfile; LocalAppData = "${childProfile}0\AppData\Local" }
+$sp = Get-OwnProfileProblems $childProfile $childProfile $sibling $ownEnv
+Check ($sp -contains "known folder LocalAppData '${childProfile}0\AppData\Local' is outside the profile") 'own profile: a sibling folder with the same prefix is outside'
+Check ((Get-OwnProfileProblems $childProfile $childProfile ([ordered] @{ Profile = $parentProfile }) $ownEnv) -contains "known folder Profile is '$parentProfile'") 'own profile: a known Profile folder elsewhere is rejected'
+
+# The P/Invoke source (documented Win32 calls on the process's own token) compiles.
+Add-Type -TypeDefinition $script:OwnUserSource
+$methods = @([MetroOwnUser].GetMethods() | Where-Object { $_.IsStatic -and $_.IsPublic } | ForEach-Object Name | Sort-Object)
+Check (($methods -join ',') -ceq 'EnvironmentBlock,KnownFolder,LongPath,ProfileDirectory') 'own-user API source compiles: EnvironmentBlock, KnownFolder, LongPath, ProfileDirectory'
+$nonPublic = [Reflection.BindingFlags] 'NonPublic, Static'
+$imports = @([MetroOwnUser].GetMethods($nonPublic) | Where-Object { $_.Attributes -band [Reflection.MethodAttributes]::PinvokeImpl } | ForEach-Object Name | Sort-Object)
+Check (($imports -join ',') -ceq 'CloseHandle,CreateEnvironmentBlock,DestroyEnvironmentBlock,GetCurrentProcess,GetLongPathNameW,GetUserProfileDirectoryW,OpenProcessToken,SHGetKnownFolderPath') "own-user API uses only the documented calls ($($imports -join ', '))"
+Check ($script:OwnUserSource -notmatch 'AdjustTokenPrivileges|ImpersonateLoggedOnUser|DuplicateTokenEx|CreateProcessAsUser|SetTokenInformation|LogonUser') 'own-user API changes no token and starts no process'
+
+# The child switches environment before anything touches a file, and takes paths only from its own token.
+$childLines = Get-Content -LiteralPath $child
+$initLine = ($childLines | Select-String -SimpleMatch 'Initialize-OwnUserEnvironment' | Select-Object -First 1).LineNumber
+$firstUse = ($childLines | Select-String -Pattern 'Invoke-Msiexec "|New-Object -ComObject|Get-RelatedProducts' | Select-Object -First 1).LineNumber
+Check ($initLine -gt 0 -and $initLine -lt $firstUse) "child initializes its own environment (line $initLine) before Windows Installer or msiexec (line $firstUse)"
+Check ($childText -notmatch 'GetFolderPath|\$env:(LOCALAPPDATA|USERPROFILE|APPDATA|TEMP)') 'child takes no path from the inherited environment or GetFolderPath'
 
 "fails=$script:fails"
 exit $script:fails

@@ -289,8 +289,9 @@ function New-EphemeralPassword([int] $Length = 32) {
 
 # Checks each standard-user phase must report (standard-user-msi.ps1 writes them).
 $script:StandardUserChecks = @{
-    refused = @('token is standard', 'no product before', 'msiexec refused by policy (1625)', 'nothing registered', 'nothing installed')
-    allowed = @('token is standard', 'no product before', 'msiexec installed (0)', 'one per-user product', 'install location',
+    refused = @('token is standard', 'environment from own profile', 'profile belongs to own SID', 'no product before',
+                'msiexec refused by policy (1625)', 'nothing registered', 'nothing installed')
+    allowed = @('token is standard', 'environment from own profile', 'profile belongs to own SID', 'no product before', 'msiexec installed (0)', 'one per-user product', 'install location',
                 'installed files', 'remembered folder in own HKCU', 'own Start menu shortcut', 'msiexec uninstalled (0)',
                 'product removed', 'folder removed', 'shortcut removed')
 }
@@ -298,10 +299,15 @@ $script:StandardUserChecks = @{
 # Problems ([string[]]) with a phase result from standard-user-msi.ps1: it must
 # come from the ephemeral account's SID with a standard (Medium, non-admin)
 # token, and report every check of its expectation as passed.
-function Get-StandardUserResultProblems($Result, [string] $Sid, [string] $Expect) {
+# $ProfilePath is the account's profile as Windows records it for $Sid
+# (Win32_UserProfile); $ParentProfile is the test runner's own profile.
+function Get-StandardUserResultProblems($Result, [string] $Sid, [string] $Expect, [string] $ProfilePath, [string] $ParentProfile) {
     $p = [Collections.Generic.List[string]]::new()
     if ($null -eq $Result) { $p.Add('no result was written'); return , [string[]] $p.ToArray() }
     if ([string] $Result.user_sid -cne $Sid) { $p.Add("result is from SID '$($Result.user_sid)', not the test account") }
+    $own = [string] $Result.profile_dir
+    if (-not $ProfilePath -or $own -ne $ProfilePath) { $p.Add("child worked in profile '$own', not the account's profile '$ProfilePath'") }
+    if ($ParentProfile -and $own -eq $ParentProfile) { $p.Add("child worked in the test runner's own profile '$own'") }
     if ([string] $Result.expect -cne $Expect) { $p.Add("result is for '$($Result.expect)', expected '$Expect'") }
     if ($Result.error) { $p.Add("child failed: $($Result.error)") }
     $checks = @{}
@@ -311,4 +317,138 @@ function Get-StandardUserResultProblems($Result, [string] $Sid, [string] $Expect
         elseif ($checks[$name].ok -ne $true) { $p.Add("check '$name' failed: $($checks[$name].detail)") }
     }
     return , [string[]] $p.ToArray()
+}
+
+# ---------------------------------------------------------------- own environment
+# Start-Process -Credential gives the child the *parent's* environment block, so
+# USERPROFILE, LOCALAPPDATA, TEMP (and every known folder and msiexec resolved
+# from them) still point at the parent's profile. The child replaces it with the
+# block Windows builds for its own token (CreateEnvironmentBlock, bInherit FALSE)
+# and resolves known folders for that token explicitly.
+
+# NAME=VALUE entries of a NUL-separated environment block (the '=C:' style
+# per-drive entries are skipped), as a case-insensitive ordered dictionary.
+function ConvertFrom-EnvironmentBlock([string] $Block) {
+    $d = [Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($entry in $Block.Split([char] 0)) {
+        if (-not $entry -or $entry.StartsWith('=')) { continue }
+        $i = $entry.IndexOf('=')
+        if ($i -lt 1) { continue }
+        $d[$entry.Substring(0, $i)] = $entry.Substring($i + 1)
+    }
+    return , $d
+}
+
+# What to set and remove so the process environment equals $Target (names compare
+# case-insensitively), keeping only $Keep from the current one.
+function Get-EnvironmentPlan($Current, $Target, [string[]] $Keep) {
+    $remove = [Collections.Generic.List[string]]::new()
+    foreach ($name in @($Current.Keys)) {
+        if (-not $Target.Contains($name) -and -not (@($Keep) -contains $name)) { $remove.Add([string] $name) }
+    }
+    $set = [ordered] @{}
+    foreach ($name in $Target.Keys) { if ($Current[$name] -cne $Target[$name]) { $set[$name] = $Target[$name] } }
+    return @{ Set = $set; Remove = [string[]] $remove.ToArray() }
+}
+
+# Problems ([string[]]) with the account's resolved profile: it must be the
+# profile Windows lists for $Sid (ProfileList ProfileImagePath), and the
+# environment and known folders must all be inside it.
+function Get-OwnProfileProblems([string] $ProfileDir, [string] $ProfileImagePath, $Folders, $Environment) {
+    $p = [Collections.Generic.List[string]]::new()
+    if (-not $ProfileDir) { $p.Add('no profile directory'); return , [string[]] $p.ToArray() }
+    $prefix = $ProfileDir.TrimEnd('\') + '\'
+    $inside = { param($x) $x -and $x.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) }
+    if ($ProfileImagePath -ne $ProfileDir) { $p.Add("profile '$ProfileDir' is not the one listed for this SID ('$ProfileImagePath')") }
+    if ($Environment['USERPROFILE'] -ne $ProfileDir) { $p.Add("USERPROFILE is '$($Environment['USERPROFILE'])'") }
+    foreach ($k in 'LOCALAPPDATA', 'APPDATA', 'TEMP', 'TMP') {
+        if (-not (& $inside $Environment[$k])) { $p.Add("$k '$($Environment[$k])' is outside the profile") }
+    }
+    foreach ($k in @($Folders.Keys)) {
+        if ($k -eq 'Profile') { if ($Folders[$k] -ne $ProfileDir) { $p.Add("known folder Profile is '$($Folders[$k])'") } }
+        elseif (-not (& $inside $Folders[$k])) { $p.Add("known folder $k '$($Folders[$k])' is outside the profile") }
+    }
+    if ($Folders['LocalAppData'] -ne $Environment['LOCALAPPDATA']) { $p.Add('LOCALAPPDATA differs from the LocalAppData known folder') }
+    return , [string[]] $p.ToArray()
+}
+
+$script:OwnUserSource = @'
+using System; using System.ComponentModel; using System.Runtime.InteropServices; using System.Text;
+public static class MetroOwnUser {
+    const uint TOKEN_DUPLICATE = 0x0002, TOKEN_IMPERSONATE = 0x0004, TOKEN_QUERY = 0x0008;
+    [DllImport("kernel32.dll")] static extern IntPtr GetCurrentProcess();
+    [DllImport("kernel32.dll", SetLastError = true)] static extern bool CloseHandle(IntPtr h);
+    [DllImport("advapi32.dll", SetLastError = true)] static extern bool OpenProcessToken(IntPtr process, uint access, out IntPtr token);
+    [DllImport("userenv.dll", SetLastError = true)] static extern bool CreateEnvironmentBlock(out IntPtr env, IntPtr token, bool inherit);
+    [DllImport("userenv.dll", SetLastError = true)] static extern bool DestroyEnvironmentBlock(IntPtr env);
+    [DllImport("userenv.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern bool GetUserProfileDirectoryW(IntPtr token, StringBuilder dir, ref uint size);
+    [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)] static extern uint GetLongPathNameW(string shortPath, StringBuilder longPath, uint size);
+    [DllImport("shell32.dll")] static extern int SHGetKnownFolderPath([MarshalAs(UnmanagedType.LPStruct)] Guid id, uint flags, IntPtr token, out IntPtr path);
+    // This process's own token, for reading only (documented access rights of the calls below).
+    static IntPtr OwnToken() {
+        IntPtr t;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_DUPLICATE | TOKEN_IMPERSONATE, out t)) throw new Win32Exception();
+        return t;
+    }
+    public static string EnvironmentBlock() {
+        IntPtr t = OwnToken();
+        try {
+            IntPtr env;
+            if (!CreateEnvironmentBlock(out env, t, false)) throw new Win32Exception();
+            try {
+                var sb = new StringBuilder(); int off = 0;
+                while (true) {
+                    string s = Marshal.PtrToStringUni(IntPtr.Add(env, off));
+                    if (string.IsNullOrEmpty(s)) break;
+                    sb.Append(s).Append('\0'); off += (s.Length + 1) * 2;
+                }
+                return sb.ToString();
+            } finally { DestroyEnvironmentBlock(env); }
+        } finally { CloseHandle(t); }
+    }
+    public static string ProfileDirectory() {
+        IntPtr t = OwnToken();
+        try {
+            uint size = 0; GetUserProfileDirectoryW(t, null, ref size);
+            var sb = new StringBuilder((int) size + 1);
+            if (!GetUserProfileDirectoryW(t, sb, ref size)) throw new Win32Exception();
+            return sb.ToString();
+        } finally { CloseHandle(t); }
+    }
+    // Long form of an existing path (8.3 components such as RUNNER~1 expanded).
+    public static string LongPath(string path) {
+        var sb = new StringBuilder(1024);
+        uint n = GetLongPathNameW(path, sb, (uint) sb.Capacity);
+        if (n == 0 || n >= sb.Capacity) throw new Win32Exception();
+        return sb.ToString();
+    }
+    public static string KnownFolder(string id) {
+        IntPtr t = OwnToken();
+        try {
+            IntPtr p; int hr = SHGetKnownFolderPath(new Guid(id), 0, t, out p);
+            if (hr != 0) Marshal.ThrowExceptionForHR(hr);
+            try { return Marshal.PtrToStringUni(p); } finally { Marshal.FreeCoTaskMem(p); }
+        } finally { CloseHandle(t); }
+    }
+}
+'@
+
+# Windows only. Replaces this process's environment with its own token's and
+# returns @{ ProfileDir; Folders; Inherited } (Inherited: USERPROFILE before).
+function Initialize-OwnUserEnvironment {
+    Add-Type -TypeDefinition $script:OwnUserSource
+    $inherited = $env:USERPROFILE
+    $target = ConvertFrom-EnvironmentBlock ([MetroOwnUser]::EnvironmentBlock())
+    $current = [Collections.Specialized.OrderedDictionary]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($e in [Environment]::GetEnvironmentVariables('Process').GetEnumerator()) { $current[[string] $e.Key] = [string] $e.Value }
+    $plan = Get-EnvironmentPlan $current $target @('PSModulePath')
+    foreach ($name in $plan.Remove) { [Environment]::SetEnvironmentVariable($name, $null, 'Process') }
+    foreach ($name in $plan.Set.Keys) { [Environment]::SetEnvironmentVariable($name, $plan.Set[$name], 'Process') }
+    $folders = [ordered] @{
+        Profile      = [MetroOwnUser]::KnownFolder('5E6C858F-0E22-4760-9AFE-EA3317B67173')
+        LocalAppData = [MetroOwnUser]::KnownFolder('F1B32785-6FBA-4FCF-9D55-7B8E7F157091')
+        RoamingAppData = [MetroOwnUser]::KnownFolder('3EB685DB-65F9-4CF6-A03A-E3EF65729F3D')
+        Programs     = [MetroOwnUser]::KnownFolder('A77F5D77-2E2B-44C3-A6A2-ABA601054A51')
+    }
+    return @{ ProfileDir = [MetroOwnUser]::ProfileDirectory(); Folders = $folders; Inherited = $inherited }
 }
