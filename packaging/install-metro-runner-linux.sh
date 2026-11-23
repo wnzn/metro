@@ -330,7 +330,9 @@ install_runner() {
     say "Metro runner $version is installed in $root/versions/$version"
     if [ -f "$config" ]; then
         say "Existing settings kept: $config"
-        [ -f "$unit_file" ] && say "Restart it to use the new version: systemctl --user restart $UNIT"
+        if [ -f "$unit_file" ]; then
+            say "Restart it to use the new version: systemctl --user restart $UNIT"
+        fi
     else
         say "Next: $root/$PROG.sh configure --server-url https://metro.example --workspace DIR --token-file FILE"
     fi

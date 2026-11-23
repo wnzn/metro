@@ -377,6 +377,32 @@ class RunnerInstallerTests(unittest.TestCase):
         self.assertFalse(self.config.exists())
         self.assertTrue(self.token.exists() and (self.ws / "spaces/s1").is_dir())
 
+    def test_reinstall_configured_runner_without_service(self):
+        self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
+        self.assertEqual(self.configure().returncode, 0)
+        config = self.config.read_bytes()
+        token_digest = sha(self.token.read_bytes())
+        marker = self.ws / "spaces/s1/keep.txt"
+        marker.write_text("keep")
+
+        result = self.box.run(RUNNER, "update", "--archive", self.archive)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("Existing settings kept", result.stdout)
+        self.assertNotIn("Restart it", result.stdout)
+        current = self.install_root / "current"
+        self.assertEqual(os.readlink(current), "versions/0.3.0")
+        self.assertEqual(current.resolve(strict=True), self.install_root.resolve() / "versions/0.3.0")
+        self.assertTrue(os.access(current / "metro-runner", os.X_OK))
+        self.assertEqual(self.config.read_bytes(), config)
+
+        self.box.run(RUNNER, "uninstall", check=True)
+        self.assertFalse(self.install_root.exists() or self.install_root.is_symlink())
+        self.assertEqual(self.config.read_bytes(), config)
+        self.assertEqual(sha(self.token.read_bytes()), token_digest)
+        self.assertEqual(stat.S_IMODE(self.token.stat().st_mode), 0o600)
+        self.assertEqual(marker.read_text(), "keep")
+        self.assertEqual(self.box.calls(), [])
+
     def test_configuration_is_validated(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
         for url in ("http://metro.example", "http://10.0.0.5:8787", "ftp://x", "https://u:p@metro.example",
