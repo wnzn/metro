@@ -195,6 +195,62 @@ pub fn page(
     }))
 }
 
+/// Newest-first assets `user` may read now whose name contains `pattern`
+/// (a `LIKE` pattern with `\` as its escape), of one of `kinds` when given,
+/// at most `limit`. Visibility and current membership are in the same
+/// statement as the rows. Never reads blobs.
+pub fn find_by_name(
+    db: &Db,
+    user: &str,
+    scope: &Scope,
+    pattern: &str,
+    kinds: Option<&[AssetKind]>,
+    limit: usize,
+) -> anyhow::Result<Vec<Asset>> {
+    let conn = db.lock();
+    let filter = match scope {
+        Scope::Personal => "a.space_id IS NULL AND a.uploader_id = ?1",
+        Scope::Space(_) => {
+            "a.space_id = ?2 AND EXISTS (SELECT 1 FROM space_members m
+                 WHERE m.space_id = a.space_id AND m.user_id = ?1)"
+        }
+        Scope::All => VISIBLE,
+    };
+    // At most four kinds per category; unused slots stay NULL and match
+    // nothing. No kinds at all (`?5` NULL): every kind.
+    let mut slots: [Option<&str>; 4] = [None; 4];
+    if let Some(kinds) = kinds {
+        for (slot, k) in slots.iter_mut().zip(kinds) {
+            *slot = Some(k.as_str());
+        }
+    }
+    let sql = format!(
+        "SELECT {COLUMNS} FROM library_assets a
+         WHERE ({filter}) AND a.name LIKE ?3 ESCAPE '\\'
+           AND (?5 IS NULL OR a.kind IN (?5, ?6, ?7, ?8))
+         ORDER BY a.created_at DESC, a.seq DESC LIMIT ?4"
+    );
+    let space = match scope {
+        Scope::Space(sid) => Some(sid.as_str()),
+        _ => None,
+    };
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(
+        params![
+            user,
+            space,
+            pattern,
+            limit as i64,
+            slots[0],
+            slots[1],
+            slots[2],
+            slots[3]
+        ],
+        row_asset,
+    )?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
 /// Why an upload could not be stored.
 #[derive(Debug)]
 pub enum InsertError {

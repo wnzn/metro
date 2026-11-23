@@ -344,6 +344,20 @@ pub fn enumerate(
     )
 }
 
+/// Newest-first assets readable by `user` now whose name contains the
+/// `LIKE` pattern `pattern` (escape `\`), limited to `kinds` when given.
+/// Metadata only: never reads bytes.
+pub fn find_by_name(
+    db: &Db,
+    user: &str,
+    scope: &Scope,
+    pattern: &str,
+    kinds: Option<&[AssetKind]>,
+    limit: usize,
+) -> anyhow::Result<Vec<Asset>> {
+    store::find_by_name(db, user, scope, pattern, kinds, limit.clamp(1, MAX_PAGE))
+}
+
 /// The subset of `ids` that `user` may read right now.
 pub fn filter_visible(db: &Db, user: &str, ids: &[String]) -> anyhow::Result<HashSet<String>> {
     store::filter_visible(db, user, ids)

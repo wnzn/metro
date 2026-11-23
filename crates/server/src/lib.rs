@@ -19,6 +19,7 @@ pub mod model_routing;
 pub mod orchestration;
 pub mod profiles;
 pub mod providers;
+pub mod quick_search;
 pub mod runner_pairing;
 pub mod runners;
 pub mod schedules;
@@ -236,6 +237,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::model_routing::router())
         // Personal semantic search and scheduled prompts, with full paths.
         .merge(crate::search::router())
+        .merge(crate::quick_search::router())
         .merge(crate::schedules::router())
         // Documents and media library; its upload route sets its own limit.
         .merge(crate::library::router())

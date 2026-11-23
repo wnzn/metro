@@ -1,10 +1,14 @@
-// Type-safe wrappers for semantic search and scheduled prompts, built on the
-// same `request` function as the rest of the client (createClient spreads
-// `...discoveryApi(request)` into its result). No state, no timers, no UI.
-// Contracts: crates/server/src/search/API.md and crates/server/src/schedules.rs.
+// Type-safe wrappers for semantic search, quick (literal) search and
+// scheduled prompts, built on the same `request` function as the rest of the
+// client (createClient spreads `...discoveryApi(request)` into its result).
+// No state, no timers, no caching, no UI. Contracts:
+// crates/server/src/search/API.md, crates/server/src/quick_search.rs and
+// crates/server/src/schedules.rs.
 
 import { ApiError } from "./client";
 import type { RequestFn } from "./client";
+import { toAsset } from "./library";
+import type { LibraryAsset, MediaKind } from "./library";
 
 export type DiscoveryRequest = RequestFn;
 
@@ -26,6 +30,25 @@ export type SearchHit = { spaceId: string | null; roomId: string | null; eventId
 export type SearchResponse = { results: SearchHit[]; ranking: SearchRanking; partial: boolean; notice: string | null };
 
 export type IndexProgress = { indexed: number; skipped: number; remaining: number; done: boolean; notice: string | null };
+
+// ------------------------------------------------------------------ quick search
+
+/**
+ * Where a quick lookup looks; it never widens. `chat`: the personal Chat's
+ * messages only. `personal`: the personal library's files only. `space`: one
+ * Space's rooms, threads and library (the caller must be a member now).
+ * `all`: all of these.
+ */
+export type QuickSearchScope = { kind: "all" } | { kind: "chat" } | { kind: "personal" } | { kind: "space"; spaceId: string };
+
+/** `conversations`: messages only; `library`: files only; `all`: both. */
+export type QuickSearchMode = "all" | "conversations" | "library";
+
+/** A message match: a `SearchHit` without a score. `text` is a snippet around the match. */
+export type QuickSearchMessage = Omit<SearchHit, "score">;
+
+/** At most 8 results together, newest first; shared between files and messages when both match. */
+export type QuickSearchResponse = { assets: LibraryAsset[]; messages: QuickSearchMessage[] };
 
 // ------------------------------------------------------------------ schedules
 
@@ -81,6 +104,25 @@ export function discoveryApi(request: DiscoveryRequest) {
         ranking: data.ranking,
         partial: data.partial,
         notice: text(data.notice),
+      };
+    },
+
+    /**
+     * POST /v1/search/quick: a literal, model-free lookup (typeahead) of
+     * message text and file names the caller may read now. `kind` narrows
+     * files and is not allowed with `conversations`.
+     */
+    async quickSearch(query: string, scope: QuickSearchScope, mode: QuickSearchMode, kind?: MediaKind): Promise<QuickSearchResponse> {
+      const body: Record<string, unknown> = { query, scope: scope.kind, mode };
+      if (scope.kind === "space") body.space_id = scope.spaceId;
+      if (kind !== undefined) body.kind = kind;
+      const data = await request("POST", "/v1/search/quick", body);
+      if (!isObject(data) || !Array.isArray(data.assets) || !Array.isArray(data.messages)) {
+        throw new ApiError("protocol", "POST /v1/search/quick did not return { assets, messages }.");
+      }
+      return {
+        assets: data.assets.map(toAsset).filter((a): a is LibraryAsset => a !== null),
+        messages: data.messages.filter(isHit).map(toQuickMessage),
       };
     },
 
@@ -176,6 +218,11 @@ function toHit(v: Record<string, unknown> & { event_id: number; actor: string; t
     text: v.text,
     score,
   };
+}
+
+function toQuickMessage(v: Record<string, unknown> & { event_id: number; actor: string; text: string }): QuickSearchMessage {
+  const { score: _score, ...hit } = toHit(v);
+  return hit;
 }
 
 function toSpec(v: unknown): ScheduleSpec | null {
