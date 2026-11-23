@@ -3,6 +3,32 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Staged: Windows test build at 5035545 (2026-11-23, project manager, local)
+
+A local, unreleased Windows x64 test build, for handing off to Windows
+testing. It isn't the 0.2.0 release or a replacement for it, and nothing
+was published.
+
+- **Source:** `5035545809ab7fb4edfb7444ca12e3c8c02ae949`, with the UI as of
+  `8fcc32f`.
+- **Build:** the Windows UI from the official, pinned NSH 0.6.1. The
+  launcher and server were cross-built locally for Windows GNU x64.
+- **File:** `Metro-0.2.0-dev-5035545-windows-x64.zip`, SHA-256
+  `1317054d81c9cec245f58ca8445969554e425a93c16eac40c1c6c8be339625c2`, in
+  `dist/windows-testing/` (local, not in git).
+- **Checked:**
+  - All 66 hashes in `RELEASE.json` matched.
+  - The archive's integrity was checked.
+  - All three executables are PE32+ x64.
+- **Under Wine:**
+  - The launcher started the renderer and opened a window.
+  - The server's health check and test sign-in worked.
+  - The window was blank, so real Windows rendering, sign-in and **Use
+    locally** are **not** verified.
+- **Packager fix `0467371`:** it lists the four production icon modules
+  explicitly. 8/8 packaging tests passed, and the ZIP it emitted was
+  byte-identical.
+
 ## Staged: quick search as you type (2026-11-23, project manager, local)
 
 Local and unreleased: nothing was packaged or published. It doesn't change
