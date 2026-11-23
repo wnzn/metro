@@ -11,6 +11,7 @@ import { MediaGlyphIcon } from "./library";
 import { cx } from "./tokens";
 
 export * from "./library";
+export * from "./quickMedia";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
 
