@@ -6,8 +6,9 @@ hasn't been demonstrated.
 ## Staged: installers and setup at 57409bb (2026-11-23, project manager, local)
 
 A frozen local integration cut, **not a release**. Nothing was published or
-signed. Later work (an MSI installer, a text-mode installer, Authenticode,
-notarization, signed manifests or images) is **not** in this cut.
+signed. Later work (an MSI installer, a terminal Metro client, Authenticode,
+notarization, signed manifests or images) is **not** in this cut, and this
+cut contains no terminal client.
 
 **Source.** `57409bb309ee4169c9a2dbeae9ead5c81533bbc6`, with installer
 scripts as of `fb7cb06`. The backend was gated at `6392af4`, whose
