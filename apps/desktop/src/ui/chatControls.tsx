@@ -15,6 +15,7 @@ import type { Bounds, CaretEvent, InputRef, JSX, ViewRef } from "nsh";
 import { Button, Input, Toolbar } from "nsh/base";
 import agentIcon from "./icons/agent.svg";
 import atIcon from "./icons/at.svg";
+import attachIcon from "./icons/attach.svg";
 import chatIcon from "./icons/chat.svg";
 import checkIcon from "./icons/check.svg";
 import copyIcon from "./icons/copy.svg";
@@ -24,6 +25,8 @@ import runnerIcon from "./icons/runner.svg";
 import sendIcon from "./icons/send.svg";
 import serverIcon from "./icons/server.svg";
 import threadIcon from "./icons/thread.svg";
+import { MediaGlyphIcon } from "./library";
+import type { FileKind } from "./library";
 import { cx, toneSurfaceClass, toneTextClass } from "./tokens";
 import type { Tone } from "./tokens";
 
@@ -36,6 +39,7 @@ const focusRing = "focus-visible:ring-2 focus-visible:ring-ring";
 const GLYPHS = {
   agent: agentIcon,
   at: atIcon,
+  attach: attachIcon,
   chat: chatIcon,
   check: checkIcon,
   copy: copyIcon,
@@ -453,7 +457,7 @@ const sendInactive = "bg-muted border border-border";
  * "Ask agent": a rounded chip in the agent's tone with its glyph. Pressing it
  * sends and explicitly asks the agent; it never reads as the plain send.
  */
-export function AskAgentButton(props: Testable & { label: string; busyLabel: string; busy: boolean; disabled: boolean; onPress: () => void }) {
+export function AskAgentButton(props: Testable & { label: string; busyLabel: string; busy: boolean; disabled: boolean; onPress: () => void; tooltip?: string }) {
   const inactive = () => props.disabled || props.busy;
   return (
     <Button
@@ -466,6 +470,7 @@ export function AskAgentButton(props: Testable & { label: string; busyLabel: str
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.label}
+      tooltip={props.tooltip ? <TooltipText text={props.tooltip} /> : undefined}
     >
       <ChatGlyph name="agent" color={inactive() ? "muted" : "agent"} />
       <Text class={cx("text-(length:--text-sm) font-medium", inactive() ? "text-muted-foreground" : "text-tone-agent-foreground")}>
@@ -493,6 +498,128 @@ export function SendButton(props: Testable & { busy: boolean; disabled: boolean;
     >
       <ChatGlyph name="send" color={inactive() ? "muted" : "on-primary"} />
     </Button>
+  );
+}
+
+// ---------------------------------------------------------------- attachments
+
+/**
+ * The files staged in the composer, above the field: their chips, one short
+ * line on where they go and who sees them, and what a pick left out.
+ */
+export function AttachmentTray(props: Testable & { cue: string; note?: string | null; children?: JSX.Element }) {
+  return (
+    <View class="flex-col gap-(--space-1) px-(--space-3) pt-(--space-2)" testID={props.testID}>
+      <View class="flex-row flex-wrap gap-(--space-2)">{props.children}</View>
+      <Text class="text-(length:--text-xs) text-muted-foreground" testID={props.testID ? `${props.testID}:cue` : undefined}>
+        {props.cue}
+      </Text>
+      <If when={props.note}>
+        <Text class="text-(length:--text-xs) text-tone-warning-foreground" role="alert" testID={props.testID ? `${props.testID}:note` : undefined}>
+          {props.note}
+        </Text>
+      </If>
+    </View>
+  );
+}
+
+/** A note about attaching files, outside the tray (no files staged yet). */
+export function AttachmentNote(props: Testable & { text: string }) {
+  return (
+    <Text class="px-(--space-3) pt-(--space-2) text-(length:--text-xs) text-tone-warning-foreground" role="alert" testID={props.testID}>
+      {props.text}
+    </Text>
+  );
+}
+
+function FileThumb(props: { kind: FileKind; src?: string | null }) {
+  return (
+    <View class="size-[28px] shrink-0 items-center justify-center overflow-hidden rounded-[5px] bg-muted" accessibilityElementsHidden>
+      <If when={props.src} else={<MediaGlyphIcon name={props.kind} size={16} />}>
+        {(src) => <Image src={src()} class="w-full h-full" style={{ objectFit: "cover" }} fadeDuration={0} />}
+      </If>
+    </View>
+  );
+}
+
+/** One staged file: a small picture or its type's icon, its name and size, and Remove. */
+export function StagedFileChip(
+  props: Testable & { name: string; detail: string; kind: FileKind; previewSrc?: string | null; busy?: boolean; onRemove: () => void },
+) {
+  return (
+    <View
+      class="flex-row items-center gap-(--space-2) max-w-[260px] rounded-(--radius-sm) border border-border bg-background py-[3px] pl-[3px] pr-[2px]"
+      testID={props.testID}
+      accessibilityLabel={`${props.name}, ${props.detail}`}
+    >
+      <FileThumb kind={props.kind} src={props.previewSrc} />
+      <View class="flex-1 min-w-0 flex-col">
+        <Text class="text-(length:--text-xs) font-medium text-foreground" style={{ numberOfLines: 1 }}>
+          {props.name}
+        </Text>
+        <Text class="text-[11px] text-muted-foreground" style={{ numberOfLines: 1 }}>
+          {props.detail}
+        </Text>
+      </View>
+      <Button
+        class={cx("items-center justify-center size-[24px] rounded-[5px] hover:bg-muted active:bg-muted disabled:opacity-50", focusRing)}
+        disabled={props.busy}
+        onPress={props.onRemove}
+        testID={props.testID ? `${props.testID}:remove` : undefined}
+        accessibilityLabel={`Remove ${props.name}`}
+      >
+        <Text class="text-(length:--text-sm) text-muted-foreground">×</Text>
+      </Button>
+    </View>
+  );
+}
+
+/** A message's files, below its text. */
+export function MessageFiles(props: Testable & { children?: JSX.Element }) {
+  return (
+    <View class="flex-row flex-wrap gap-(--space-2) pt-[2px]" testID={props.testID}>
+      {props.children}
+    </View>
+  );
+}
+
+/** A file a message carries: its type's icon, name and size; pressing it opens it in the Library. */
+export function MessageFileCard(props: Testable & { name: string; detail: string; kind: FileKind; onOpen: () => void }) {
+  return (
+    <Button
+      class={cx(
+        "flex-row items-center gap-(--space-2) min-w-[180px] max-w-[320px] rounded-(--radius) border border-border bg-card px-(--space-2) py-(--space-1) hover:bg-muted active:bg-muted",
+        focusRing,
+      )}
+      onPress={props.onOpen}
+      testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel ?? `Open ${props.name} in the Library`}
+      tooltip={<TooltipText text="Open in the Library" />}
+    >
+      <FileThumb kind={props.kind} />
+      <View class="flex-1 min-w-0 flex-col">
+        <Text class="text-(length:--text-sm) font-medium text-card-foreground" style={{ numberOfLines: 1 }}>
+          {props.name}
+        </Text>
+        <Text class="text-(length:--text-xs) text-muted-foreground" style={{ numberOfLines: 1 }}>
+          {props.detail}
+        </Text>
+      </View>
+    </Button>
+  );
+}
+
+/** A file deleted from the Library since the message was sent: neutral, no name, nothing to open. */
+export function RemovedFileCard(props: Testable) {
+  return (
+    <View
+      class="flex-row items-center gap-(--space-2) min-w-[180px] rounded-(--radius) border border-dashed border-border px-(--space-2) py-(--space-1)"
+      testID={props.testID}
+      accessibilityLabel="File removed"
+    >
+      <FileThumb kind="document" />
+      <Text class="text-(length:--text-sm) text-muted-foreground">File removed</Text>
+    </View>
   );
 }
 

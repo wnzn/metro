@@ -16,18 +16,20 @@
 // phrase is left out only where a typed @agent already says the same.
 //
 // The composer is one raised box: recipients, the growing field, and a bar
-// with the tools, a hint shown while the field has the focus, "Ask agent"
+// with the tools, "Ask agent"
 // (explicitly asks the agent) and the plain send at the bottom right. Send
 // never asks the agent by itself; who a message reaches is the store's and
 // the server's rule (explicit recipients decide).
 
-import { Clipboard, announce, computed, localeSettings, signal } from "nsh";
+import { Clipboard, announce, cleanup, computed, localeSettings, signal } from "nsh";
 import type { CaretEvent, InputRef, JSX, ViewRef } from "nsh";
 import {
   activeEvents,
   activeLoaded,
   activeReactions,
+  activeSpace,
   actionError,
+  composerScope,
   draft,
   isReactable,
   me,
@@ -43,10 +45,13 @@ import {
   toggleReaction,
 } from "../store";
 import type { RoomEvent } from "../store";
+import type { AttachedFile } from "../api/client";
 import {
   Action,
   AnchoredPopover,
   AskAgentButton,
+  AttachmentNote,
+  AttachmentTray,
   AuthorGlyph,
   AuthorName,
   AuthorTag,
@@ -56,7 +61,6 @@ import {
   ComposerBar,
   ComposerBox,
   ComposerField,
-  ComposerHint,
   DaySeparator,
   DraftSuggestion,
   EmojiChoice,
@@ -65,6 +69,9 @@ import {
   FeedList,
   HeaderNote,
   Label,
+  MessageFileCard,
+  RemovedFileCard,
+  MessageFiles,
   MessageFrame,
   MessageHeader,
   MessageToolbar,
@@ -72,6 +79,7 @@ import {
   RecipientTag,
   Row,
   SendButton,
+  StagedFileChip,
   Timestamp,
   ToolbarIconButton,
 } from "../ui";
@@ -86,6 +94,12 @@ import { PersonAvatar } from "./profile/PersonAvatar";
 import { profileName } from "./profile/profileState";
 import { headerAudience, transcriptRows } from "./transcriptRows";
 import type { TranscriptRow } from "./transcriptRows";
+import { stagedFor } from "./attachments/attachmentDraft";
+import type { StagedFile } from "./attachments/attachmentDraft";
+import { destinationCue, openMessageFile, pickAttachments, pickNote, picking } from "./attachments/attachmentSend";
+import { unstage } from "./attachments/attachmentDraft";
+import { formatSize } from "./library/libraryState";
+import { mediaKindOf } from "../api/library";
 
 /** The active place's transcript, with each agent turn folded into one group. */
 const transcriptItems = computed(() => groupTranscript(activeEvents()));
@@ -377,12 +391,52 @@ function MessageRow(props: { row: () => Of<"event"> }) {
           </Each>
         </MessageHeader>
       </If>
-      <FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />
+      <If when={event().text.trim().length > 0}>
+        <FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />
+      </If>
+      <If when={event().attachments?.length ? event().attachments! : null}>
+        {(files) => (
+          <MessageFiles testID={`files:${event().id}`}>
+            <Each of={files()} key="index">
+              {(f, index) => (
+                <If when={!f().removed ? (f() as AttachedFile) : null} else={<RemovedFileCard testID={`file-removed:${event().id}:${index()}`} />}>
+                  {(file) => (
+                    <MessageFileCard
+                      testID={`file:${event().id}:${file().assetId}`}
+                      name={file().name}
+                      detail={fileDetail(file())}
+                      kind={mediaKindOf(file().mimeType)}
+                      onOpen={() => openFile(file())}
+                    />
+                  )}
+                </If>
+              )}
+            </Each>
+          </MessageFiles>
+        )}
+      </If>
       <If when={reactable()}>
         <Reactions eventId={event().id} />
       </If>
     </MessageFrame>
   );
+}
+
+/** A message file's quiet line: its size and the library it is in (the message's place says which). */
+function fileDetail(f: AttachedFile): string {
+  const where = mainPlace() === "chat" ? "your Library" : `${activeSpace()?.name ?? "Space"} Library`;
+  return `${formatSize(f.sizeBytes)} · ${where}`;
+}
+
+/** Opens a message's file in the Library viewer (membership checked here and by the server). */
+function openFile(f: AttachedFile) {
+  const sid = activeSpace()?.id;
+  if (mainPlace() !== "chat" && (mainPlace() !== "space" || !sid)) {
+    notice.set("This Space is no longer available.");
+    return;
+  }
+  const problem = openMessageFile(f, mainPlace() === "chat" ? null : sid!);
+  if (problem) notice.set(problem);
 }
 
 /**
@@ -492,14 +546,59 @@ function ComposerFeedback() {
   );
 }
 
+/** One staged file, with a small picture for images (a `blob:` URL of the picked bytes, revoked when it goes). */
+function StagedChip(props: { scope: string; file: StagedFile }) {
+  let url: string | null = null;
+  if (props.file.kind === "png" || props.file.kind === "jpeg") {
+    try {
+      url = URL.createObjectURL(props.file.file);
+    } catch {
+      url = null;
+    }
+  }
+  cleanup(() => {
+    if (url) URL.revokeObjectURL(url);
+  });
+  return (
+    <StagedFileChip
+      testID={`staged:${props.file.name}`}
+      name={props.file.name}
+      detail={props.file.assetId ? `${formatSize(props.file.size)} · in the Library` : formatSize(props.file.size)}
+      kind={mediaKindOf(props.file.mime)}
+      previewSrc={url}
+      busy={sending() !== null}
+      onRemove={() => unstage(props.scope, props.file.key)}
+    />
+  );
+}
+
+/** The files staged for the active place, where they go, and what a pick left out. */
+function StagedFiles() {
+  const scope = () => composerScope();
+  const files = () => stagedFor(scope());
+  const note = () => {
+    const n = pickNote();
+    return n && n.scope === scope() ? n.text : null;
+  };
+  return (
+    <If when={files().length > 0} else={<If when={note()}>{(t) => <AttachmentNote testID="attach-note" text={t()} />}</If>}>
+      <AttachmentTray testID="attachments" cue={destinationCue(scope())} note={note()}>
+        <Each of={files()} key={(f) => f.key}>
+          {(f) => <StagedChip scope={scope()} file={f()} />}
+        </Each>
+      </AttachmentTray>
+    </If>
+  );
+}
+
 export function Composer(props: {
   placeholder: string;
-  /** One line of help, shown while the field has the focus. */
+  /** How sending works here (Return, @mentions, what Ask agent asks): Ask agent's tooltip and spoken description. */
   agentHint: string;
   disabled?: boolean;
   /** Inside the box, above the field (the recipients of a room message), and its popovers. */
   above?: JSX.Element;
-  /** Tools at the bottom left of the box (the @ button). */
+  /** Tools at the bottom left of the box, after the paperclip (the @ button). */
   tools?: JSX.Element;
   /** Return while a suggestion list is open: return true when it picked one (nothing is sent). */
   onSubmitIntercept?: () => boolean;
@@ -508,8 +607,11 @@ export function Composer(props: {
   /** The field took or lost the keyboard focus. */
   onFocusChange?: (focused: boolean) => void;
 }) {
-  const focused = signal(false);
-  const canSend = () => !props.disabled && status().phase !== "signedOut" && draft().trim().length > 0 && !sending();
+  const hasFiles = () => stagedFor(composerScope()).length > 0;
+  const ready = () => !props.disabled && status().phase !== "signedOut" && !sending();
+  const canSend = () => ready() && (draft().trim().length > 0 || hasFiles());
+  // Asking the agent needs a typed question: files alone are saved, not sent to it.
+  const canAsk = () => ready() && draft().trim().length > 0;
   const submit = () => {
     if (props.onSubmitIntercept?.()) return;
     void send(false);
@@ -519,6 +621,7 @@ export function Composer(props: {
       <ComposerFeedback />
       <ComposerBox testID="composer-box">
         {props.above}
+        <StagedFiles />
         <ComposerField
           testID="composer"
           ref={(node) => (composerInput = node)}
@@ -526,10 +629,7 @@ export function Composer(props: {
           value={draft()}
           onChange={setDraft}
           onSubmit={submit}
-          onFocusChange={(f) => {
-            focused.set(f);
-            props.onFocusChange?.(f);
-          }}
+          onFocusChange={(f) => props.onFocusChange?.(f)}
           onCaretMove={props.onCaretMove}
           placeholder={props.placeholder}
           disabled={props.disabled}
@@ -537,10 +637,16 @@ export function Composer(props: {
         <ComposerBar
           leading={
             <>
+              <ToolbarIconButton
+                testID="attach"
+                icon="attach"
+                accessibilityLabel={mainPlace() === "chat" ? "Attach files (saved to your personal Library)" : "Attach files (saved to this Space's Library)"}
+                tooltip="Attach files"
+                active={picking()}
+                disabled={props.disabled || status().phase === "signedOut" || picking()}
+                onPress={() => void pickAttachments()}
+              />
               {props.tools}
-              <If when={focused()}>
-                <ComposerHint testID="composer-hint" text={props.agentHint} />
-              </If>
             </>
           }
           trailing={
@@ -549,14 +655,15 @@ export function Composer(props: {
                 testID="ask-agent"
                 label="Ask agent"
                 busyLabel="Asking…"
-                accessibilityLabel="Send and ask the agent to answer"
+                accessibilityLabel={`Send and ask the agent to answer. ${props.agentHint}${hasFiles() ? " Attached files are saved to the Library, not sent to the agent." : ""}`}
+                tooltip={props.agentHint}
                 busy={sending() === "agent"}
-                disabled={!canSend()}
+                disabled={!canAsk()}
                 onPress={() => void send(true)}
               />
               <SendButton
                 testID="send"
-                accessibilityLabel="Send"
+                accessibilityLabel={hasFiles() ? "Send with files" : "Send"}
                 tooltip="Send (Return)"
                 busy={sending() === "message"}
                 disabled={!canSend()}

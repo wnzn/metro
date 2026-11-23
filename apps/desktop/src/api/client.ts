@@ -60,7 +60,20 @@ export type RoomEvent = {
   actorId?: string;
   /** When the server stored it (RFC 3339, UTC). Absent when the server doesn't know: never guessed. */
   createdAt?: string;
+  /** Library files sent with a message: metadata only, never bytes or URLs. */
+  attachments?: EventAttachment[];
 };
+/**
+ * A Library file attached to a message, or a tombstone for one deleted
+ * since (no name, nothing to open). Which library holds a file is the
+ * message's own place (the sender's personal library in the Chat, the
+ * Space's in its rooms), never a field of the file. Opening it goes through
+ * the Library's authenticated content read, which checks access again.
+ */
+export type AttachedFile = { removed: false; assetId: string; name: string; mimeType: string; kind: string | null; sizeBytes: number };
+export type EventAttachment = AttachedFile | { removed: true };
+/** Most files one message may carry (the server's limit too). */
+export const MAX_MESSAGE_ATTACHMENTS = 10;
 export type SpaceRole = "owner" | "member";
 /** `runnerPaired`: a runner token is issued for the space. It says nothing about the runner being online. */
 export type Space = { id: string; name: string; role: SpaceRole; runnerPaired: boolean };
@@ -569,10 +582,12 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendMessage(spaceId: string, roomId: string, text: string, invokeAgent: boolean, mentions?: Mention[]): Promise<void> {
+    async sendMessage(spaceId: string, roomId: string, text: string, invokeAgent: boolean, mentions?: Mention[], assetIds?: readonly string[]): Promise<void> {
       const body: Record<string, unknown> = { text, invoke_agent: invokeAgent };
       // Only what a person can type: never `addressed_by`, which only the server sets.
       if (mentions && mentions.length > 0) body.mentions = mentions.map((m) => (m.kind === "agent" ? { kind: "agent" } : { kind: "user", id: m.id }));
+      const ids = assetIdsBody(assetIds);
+      if (ids) body.asset_ids = ids;
       await request("POST", `${room(spaceId, roomId)}/messages`, body);
     },
 
@@ -588,8 +603,11 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendChatMessage(text: string, invokeAgent: boolean): Promise<void> {
-      await request("POST", "/v1/chat/messages", { text, invoke_agent: invokeAgent });
+    async sendChatMessage(text: string, invokeAgent: boolean, assetIds?: readonly string[]): Promise<void> {
+      const body: Record<string, unknown> = { text, invoke_agent: invokeAgent };
+      const ids = assetIdsBody(assetIds);
+      if (ids) body.asset_ids = ids;
+      await request("POST", "/v1/chat/messages", body);
     },
 
     async listRuns(): Promise<Run[]> {
@@ -793,7 +811,48 @@ function toEvent(v: RoomEvent): RoomEvent {
   if (isId(raw.actor_id) && String(raw.actor_id).trim()) event.actorId = String(raw.actor_id);
   const createdAt = toCreatedAt(raw.created_at);
   if (createdAt) event.createdAt = createdAt;
+  const attachments = toAttachments(raw.attachments);
+  if (attachments.length) event.attachments = attachments;
   return event;
+}
+
+/** `asset_ids` for a message body: distinct, at most MAX_MESSAGE_ATTACHMENTS; undefined when there are none. */
+export function assetIdsBody(ids: readonly string[] | undefined): string[] | undefined {
+  if (!ids || ids.length === 0) return undefined;
+  const distinct = [...new Set(ids.map((id) => id.trim()).filter(Boolean))];
+  if (distinct.length > MAX_MESSAGE_ATTACHMENTS) throw new ApiError("protocol", `A message carries at most ${MAX_MESSAGE_ATTACHMENTS} files.`);
+  return distinct.length ? distinct : undefined;
+}
+
+/**
+ * An event's `attachments`: files and `{ removed: true }` tombstones,
+ * well-formed only, files distinct by id, at most MAX_MESSAGE_ATTACHMENTS.
+ * Nothing else in them (a URL, a Space) is read.
+ */
+export function toAttachments(v: unknown): EventAttachment[] {
+  if (!Array.isArray(v)) return [];
+  const out: EventAttachment[] = [];
+  for (const a of v) {
+    if (out.length >= MAX_MESSAGE_ATTACHMENTS) break;
+    if (!isObject(a)) continue;
+    if (a.removed === true) {
+      out.push({ removed: true });
+      continue;
+    }
+    if (!isId(a.asset_id) || typeof a.name !== "string" || !a.name.trim()) continue;
+    const assetId = String(a.asset_id);
+    if (out.some((x) => !x.removed && x.assetId === assetId)) continue;
+    const size = typeof a.size_bytes === "number" && Number.isFinite(a.size_bytes) && a.size_bytes >= 0 ? Math.floor(a.size_bytes) : 0;
+    out.push({
+      removed: false,
+      assetId,
+      name: a.name.trim().slice(0, 255),
+      mimeType: typeof a.mime_type === "string" ? a.mime_type : "application/octet-stream",
+      kind: typeof a.kind === "string" ? a.kind : null,
+      sizeBytes: size,
+    });
+  }
+  return out;
 }
 
 const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(\.\d{1,9})?(Z|[+-]\d{2}:\d{2})$/i;

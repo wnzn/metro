@@ -63,12 +63,12 @@ test("the reaction popover: focus on the first emoji, arrows move, Return picks,
   expect(app.shows(`id:palette:${ev.id}`)).toBe(false);
 });
 
-test("Send posts a plain message; Ask agent explicitly asks; the hint shows only while typing", async () => {
+test("Send posts a plain message; Ask agent explicitly asks; how it works is Ask agent's help, not a text line", async () => {
   const f = world();
   const app = await inAcme(f);
-  expect(app.shows("id:composer-hint")).toBe(false);
   await app.type("id:composer", "just people");
-  expect(app.shows("id:composer-hint")).toBe(true);
+  expect(app.shows("id:composer-hint")).toBe(false);
+  expect(app.shows("label:/^Send and ask the agent to answer. Return sends · Shift\\+Return adds a line · @agent or Ask agent asks this Space's agent; @name only notifies them.$/")).toBe(true);
   await app.press("id:send");
   await app.waitFor("text:just people");
   expect(messages(f).at(-1)!.body).toMatchObject({ text: "just people", invoke_agent: false });
@@ -234,14 +234,13 @@ test("disabled Send and Ask agent are muted, never a dimmed brand fill, in both 
   }
 });
 
-test("at 720 and 860 the focused hint keeps its full wording beside Ask agent and Send", async () => {
+test("at 720 and 860 the composer's help stays reachable on Ask agent and the send controls work", async () => {
   for (const width of [720, 860]) {
     const f = world();
     const app = await inAcme(f);
     await app.setViewport(width, 800);
     await app.type("id:composer", "x");
-    await app.waitFor("id:composer-hint");
-    expect(app.shows("label:Return sends · Shift+Return adds a line · @agent or Ask agent asks this Space's agent; @name only notifies them.")).toBe(true);
+    expect(app.shows("label:/Return sends · Shift\\+Return adds a line · @agent or Ask agent asks this Space's agent; @name only notifies them./")).toBe(true);
     expect(app.enabled("id:ask-agent")).toBe(true);
     expect(app.enabled("id:send")).toBe(true);
   }

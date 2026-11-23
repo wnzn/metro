@@ -631,63 +631,114 @@ export async function createRoom(nameInput: string): Promise<boolean> {
   }
 }
 
-/** Posts the draft to the active room; `invokeAgent` asks the Space's agent to answer. */
+// ------------------------------------------------------------------ attachments (hook)
+
+/**
+ * Where a message goes: the personal Chat (files to the sender's personal
+ * library) or a Space's room or thread (files to that Space's library).
+ */
+export type SendDestination = { kind: "chat" } | { kind: "room"; spaceId: string; roomId: string };
+
+/**
+ * Files staged in the composer, uploaded at Send. Registered by
+ * src/features/attachments so this module needs no library code. `upload`
+ * puts every staged file of `scope` in the destination's library (reusing
+ * ids a failed attempt already got) and resolves to their ids, or to the
+ * message to show when one failed (nothing is posted then, the draft and
+ * files stay). `sent` drops the files a message carried.
+ */
+export type AttachmentHook = {
+  pending(scope: string): boolean;
+  upload(scope: string, to: SendDestination, ok: () => boolean): Promise<{ ids: string[]; keys: string[] } | { error: string }>;
+  sent(scope: string, keys: string[], to: SendDestination): void;
+};
+let attachments: AttachmentHook | null = null;
+export function registerAttachments(hook: AttachmentHook) {
+  attachments = hook;
+}
+/** The active place's key for staged files ("chat", or a room's); "" when none is open. */
+export function composerScope(): string {
+  return activeScope();
+}
+
+/** Asking the agent needs a typed question: files alone are saved to the Library, not sent to a model. */
+export const ASK_NEEDS_TEXT = "Type a question to ask the agent. Attached files are saved to the Library; they aren't sent to the agent.";
+
+/**
+ * Posts the draft (and any staged files) to the active place; `invokeAgent`
+ * asks the agent to answer. Files are uploaded to the destination's library
+ * first; if one fails nothing is posted and the draft and files stay. A
+ * message may be files only, unless it asks the agent.
+ */
 export async function send(invokeAgent: boolean): Promise<void> {
-  if (basePlace() === "chat") return sendChat(invokeAgent);
+  const chat = basePlace() === "chat";
   const text = draft().trim();
   const sid = activeSpaceId();
   const rid = activeRoomId();
   const c = client;
-  if (!text || !sid || !rid || !c || sending()) return;
-  const ok = guard(sid);
+  const scope = activeScope();
+  if (!c || sending() || !scope || (!chat && (!sid || !rid))) return;
+  const files = !!attachments?.pending(scope);
+  if (!text && !files) return;
+  if (invokeAgent && !text) {
+    batch(() => {
+      actionError.set(ASK_NEEDS_TEXT);
+      notice.set(null);
+    });
+    return;
+  }
+  const to: SendDestination = chat ? { kind: "chat" } : { kind: "room", spaceId: sid!, roomId: rid! };
+  const sameSession = guard();
+  const ok = chat ? sameSession : guard(sid!);
+  // Feedback only where it happened: never in a place the user moved to.
+  const here = () => ok() && activeScope() === scope;
   batch(() => {
     sending.set(invokeAgent ? "agent" : "message");
     actionError.set(null);
     notice.set(null);
   });
-  const sentMentions = mentions().filter((m) => {
-    const literal = mentionLiteral(m);
-    return !literal || text.includes(literal);
-  });
+  const sentMentions = chat
+    ? []
+    : mentions().filter((m) => {
+        const literal = mentionLiteral(m);
+        return !literal || text.includes(literal);
+      });
   try {
-    await c.sendMessage(sid, rid, text, invokeAgent, sentMentions);
+    let ids: string[] = [];
+    let keys: string[] = [];
+    if (files && attachments) {
+      const up = await attachments.upload(scope, to, ok);
+      if (!ok()) return;
+      if ("error" in up) {
+        if (here()) actionError.set(up.error);
+        return;
+      }
+      ids = up.ids;
+      keys = up.keys;
+    }
+    if (chat) await c.sendChatMessage(text, invokeAgent, ids);
+    else await c.sendMessage(sid!, rid!, text, invokeAgent, sentMentions, ids);
     if (!ok()) return;
-    if (draft().trim() === text) {
+    if (keys.length) attachments?.sent(scope, keys, to);
+    if (activeScope() === scope && draft().trim() === text) {
       // unless the user typed something new meanwhile
       batch(() => {
         draft.set("");
-        mentions.set([]);
+        if (!chat) mentions.set([]);
       });
+    }
+    if (chat) {
+      if (chatUnavailable()) chatUnavailable.set(null);
+      lastRunsRefresh = 0;
     }
     kick();
   } catch (error) {
-    if (ok()) handleActionError(error, invokeAgent ? "Could not ask the agent" : "Could not send the message", sid);
+    if (!here()) return;
+    handleActionError(error, invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", chat ? undefined : sid!);
+    const shown = actionError();
+    if (files && shown) actionError.set(`${shown} Its files are already in the Library; Send again won't upload them twice.`);
   } finally {
-    if (ok()) sending.set(null);
-  }
-}
-
-async function sendChat(invokeAgent: boolean): Promise<void> {
-  const text = draft().trim();
-  const c = client;
-  if (!text || !c || sending()) return;
-  const ok = guard();
-  batch(() => {
-    sending.set(invokeAgent ? "agent" : "message");
-    actionError.set(null);
-    notice.set(null);
-  });
-  try {
-    await c.sendChatMessage(text, invokeAgent);
-    if (!ok()) return;
-    if (draft().trim() === text) draft.set("");
-    if (chatUnavailable()) chatUnavailable.set(null);
-    lastRunsRefresh = 0;
-    kick();
-  } catch (error) {
-    if (ok()) handleActionError(error, invokeAgent ? "Could not ask your agent" : "Could not send the message");
-  } finally {
-    if (ok()) sending.set(null);
+    if (sameSession()) sending.set(null);
   }
 }
 
