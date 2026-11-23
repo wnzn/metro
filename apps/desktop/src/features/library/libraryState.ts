@@ -15,13 +15,14 @@
 //   Space is thrown away.
 
 import { batch, computed, effect, Picker as SystemPicker, signal, untracked } from "nsh";
-import { mkdir, readdir, stat, unlink, writeFile } from "fs/promises";
+import { mkdir, readdir, unlink, writeFile } from "fs/promises";
 import proc from "process";
 import { homedir } from "os";
 import { ApiError } from "../../api/client";
 import type { AvailableModel } from "../../api/client";
 import { ACCEPTED, acceptedOf, MAX_UPLOAD_BYTES, mediaKindOf } from "../../api/library";
 import type { AssetKind, LibraryApi, LibraryAsset, LibraryHit, LibraryRanking, LibraryScope, Locator, MediaKind, UploadTarget } from "../../api/library";
+import { ensurePrivateDir } from "./privateDir";
 import { apiClient, describe, disconnect, isAborted, mainPlace, me, onSessionEnd, sessionGuard, spaces } from "../../store";
 
 export type { LibraryAsset, LibraryHit, LibraryRanking, LibraryScope, Locator, MediaKind, UploadTarget };
@@ -807,10 +808,13 @@ export async function playerFailed(message: string): Promise<void> {
   const mine = viewSeq;
   const ext = ACCEPTED.find((a) => a.kind === target.kind)?.extensions[0] ?? "bin";
   const path = `${dir}/${previewPrefix()}${crypto.randomUUID()}.${ext}`;
+  // No byte is written until the directory is confirmed private.
+  const refusal = await ensurePrivateDir(dir);
+  if (refusal !== null) {
+    if (mine === viewSeq) playerError.set(`${message} It wasn't copied to a private preview file either: ${refusal}.`);
+    return;
+  }
   try {
-    await mkdir(dir, { recursive: true });
-    // Never write into a directory others could write to (a planted link or file).
-    if (((await stat(dir)).mode & 0o022) !== 0) throw new Error("the preview directory is writable by others");
     await writeFile(path, bytes);
   } catch (error) {
     if (mine === viewSeq) playerError.set(`${message} (a private preview file couldn't be written: ${String((error as Error)?.message ?? error)})`);

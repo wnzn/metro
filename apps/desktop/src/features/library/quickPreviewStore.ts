@@ -19,19 +19,21 @@
 //   viewer's, and are removed on release, at sign-out and (left over from an
 //   earlier run) at start. Their names carry this run's and session's token,
 //   so a cleanup only ever removes files of an earlier run or session, never
-//   one a preview just wrote. NSH's files API can't set permissions: they get
-//   the process's defaults inside the app's data directory.
+//   one a preview just wrote. Bytes are written only into a directory
+//   ./privateDir confirms private (owner-only on Unix); otherwise the row says
+//   why and nothing is written.
 // Nothing is sent to a model, and no disk is scanned.
 
 import { batch, effect, signal, untracked } from "nsh";
 import type { Signal } from "nsh";
-import { mkdir, readdir, stat, unlink, writeFile } from "fs/promises";
+import { readdir, unlink, writeFile } from "fs/promises";
 import proc from "process";
 import { ApiError } from "../../api/client";
 import { ACCEPTED } from "../../api/library";
 import { disconnect, isAborted, onSessionEnd, sessionGuard, spaces } from "../../store";
 import { formatSize, library } from "./libraryState";
 import type { LibraryAsset } from "./libraryState";
+import { ensurePrivateDir } from "./privateDir";
 import { docxSnippet, ID3_READ_BYTES, id3Tags, textSnippet, wavWaveform } from "./quickPreviewData";
 import type { AudioTags, Waveform } from "./quickPreviewData";
 
@@ -295,10 +297,16 @@ export async function videoFailed(assetId: string): Promise<void> {
   e.videoBytes = null;
   const ext = ACCEPTED.find((a) => a.kind === e.asset.kind)?.extensions[0] ?? "bin";
   const path = `${dir}/${filePrefix()}${crypto.randomUUID()}.${ext}`;
+  // No byte is written until the directory is confirmed private.
+  const refusal = await ensurePrivateDir(dir);
+  if (refusal !== null) {
+    if (current(e)) {
+      dropBytes(e);
+      e.state.set({ status: "none", reason: "This video can't be shown here without a private preview folder. Open it to play." });
+    }
+    return;
+  }
   try {
-    await mkdir(dir, { recursive: true });
-    // Never write into a directory others could write to (a planted link or file).
-    if (((await stat(dir)).mode & 0o022) !== 0) throw new Error("the preview directory is writable by others");
     await writeFile(path, bytes);
   } catch {
     removeFile(path);
