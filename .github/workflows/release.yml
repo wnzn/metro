@@ -861,13 +861,35 @@ jobs:
         working-directory: apps/desktop
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          # Package the pinned prebuilt runner. Without NSH_RUNTIME, nsh on a Mac
+          # with cargo builds an app-specific runner from source instead.
+          NSH_RUNTIME: ${{ runner.temp }}/nsh-macos/nsh/runtime
         run: |
           set -eu
+          python3 -I - "$GITHUB_WORKSPACE/packaging" "$TARGET" "$NSH_RUNTIME/macos/nsh-macos-app" <<'PY'
+          import hashlib, runpy, sys
+          pinned = runpy.run_path(sys.argv[1] + "/package.py")["NSH_MACOS_APPS"][sys.argv[2]][0]
+          got = hashlib.sha256(open(sys.argv[3], "rb").read()).hexdigest()
+          assert got == pinned, f"NSH_RUNTIME runner is not the pinned stock runtime: {got}"
+          PY
           nsh package App.tsx --target macos --id dev.metro.desktop.ui --app-version "${VERSION#v}" \
             --icon assets/metro-256.png --out "$RUNNER_TEMP/out-macos"
           find "$RUNNER_TEMP/out-macos" | head -40
           plutil -p "$RUNNER_TEMP/out-macos/Metro.app/Contents/Info.plist"
           codesign --verify --strict --verbose=2 "$RUNNER_TEMP/out-macos/Metro.app"
+          codesign --display --verbose=2 "$RUNNER_TEMP/out-macos/Metro.app" 2>&1 | grep -E '^(Identifier|Format|CodeDirectory|Signature|TeamIdentifier)='
+          # Early, explicit: the inner executable is the stock runtime re-signed ad hoc
+          # (package.py repeats this check before it assembles the outer app).
+          python3 -I - "$GITHUB_WORKSPACE/packaging" "$NSH_RUNTIME/macos/nsh-macos-app" \
+            "$RUNNER_TEMP/out-macos/Metro.app/Contents" "$TARGET" <<'PY'
+          import sys
+          from pathlib import Path
+          sys.path.insert(0, sys.argv[1])
+          import package
+          contents = Path(sys.argv[3])
+          package.stock_renderer(contents / "MacOS/Metro", Path(sys.argv[2]), contents, sys.argv[4])
+          print("inner executable: stock NSH runtime, re-signed ad hoc for", package.MACOS_UI_ID)
+          PY
       - name: Toolchain, locked fetch and native tests of the launcher
         run: |
           set -eu

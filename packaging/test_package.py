@@ -304,7 +304,7 @@ class PackageTests(unittest.TestCase):
                   patch.object(package, "NSH_LICENSE_SHA", package.sha256(license_path)),
                   patch.object(package, "nsh_resources", return_value={}),
                   patch.object(package, "brand_notice", return_value=license_path),
-                  patch.object(package, "unsigned_bytes", return_value=b"stock renderer"),
+                  patch.object(package, "stock_renderer") as stock_renderer,
                   patch.object(package, "macho", return_value=[]),
                   patch.object(package, "codesign") as codesign):
                 info = package.macos(args, stage)
@@ -322,6 +322,7 @@ class PackageTests(unittest.TestCase):
             self.assertEqual(package.sha256(inner / "MacOS/Metro"), package.sha256(contents / "MacOS/Metro"))
             for call in codesign.call_args_list:
                 self.assertFalse("--sign" in call.args and "MetroUI.app" in call.args[-1])
+            stock_renderer.assert_called_once_with(contents / "MacOS/Metro", stock, contents, target)
             self.assertEqual(package.sha256(stage / "licenses/INTER-OFL.txt"), package.INTER_OFL_SHA)
 
     def test_brand_notice_must_cover_every_shipped_mark(self):

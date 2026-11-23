@@ -25,9 +25,12 @@ NSH_APPS = {
     "windows": ("nsh-windows-app.exe", "3cde53d3a3d7d7bfc5eb30c670739116629034d3c3da89232c1ccbd90e01fd0f"),
     "linux": ("nsh-linux-app", "0a382b9e76ae45b5a28afc7d9ba0ea169e8390c8a21b94e74874907907d6d517"),
 }
-# Stock macOS runtimes from nsh-macos-<arch>.tar.gz (runtime/macos/nsh-macos-app).
-# `nsh package --target macos` copies this binary into the .app and ad hoc
-# signs it on a Mac, so the packaged copy is compared with its signature removed.
+# Stock macOS runtimes from nsh-macos-<arch>.tar.gz (runtime/macos/nsh-macos-app),
+# already ad hoc signed upstream. With NSH_RUNTIME set to that runtime root,
+# `nsh package --target macos` copies this file unchanged into the .app and
+# re-signs the bundle ad hoc (without NSH_RUNTIME, a Mac with cargo builds an
+# app-specific runner instead). macos_macho.py compares the packaged copy with
+# these bytes outside the code signature and checks the new seal.
 NSH_MACOS_APPS = {
     "macos-arm64": ("7b972892cf7d368abe31c1ce7d5ecc4f0ef5972e0aa5ca77048f13e75ca371b5", 0x0100000C),
     "macos-x64": ("4fef59fd1f8813261e81326946750f5dc41302b6631f6dc75b30b3348be6ea89", 0x01000007),
@@ -491,15 +494,21 @@ def codesign(*args):
     subprocess.run(["codesign", *args], check=True, capture_output=True, text=True)
 
 
-def unsigned_bytes(path, work):
-    """The executable with its code signature removed, for comparison with the stock runtime."""
-    copy_path = work / f"unsigned-{len(list(work.iterdir()))}"
-    shutil.copyfile(regular(path), copy_path)
-    copy_path.chmod(0o755)
-    result = subprocess.run(["codesign", "--remove-signature", str(copy_path)], capture_output=True, text=True)
-    require(result.returncode == 0 or "not signed" in result.stderr,
-            f"{path}: cannot remove its code signature: {result.stderr.strip()}")
-    return copy_path.read_bytes()
+def stock_renderer(inner_exe, stock, contents, target):
+    """The inner executable is the pinned stock runtime, re-signed ad hoc for MetroUI.app.
+
+    Trust comes from the pinned stock bytes only (macos_macho.py): identical
+    outside the code signature, and a bundle seal that covers exactly that code,
+    this Info.plist and this CodeResources under the MetroUI identifier."""
+    helper = runpy.run_path(str(Path(__file__).with_name("macos_macho.py")))
+    packaged = regular(inner_exe).read_bytes()
+    try:
+        helper["same_code"](packaged, regular(stock).read_bytes())
+        helper["verify_adhoc_signature"](packaged, MACOS_UI_ID, regular(contents / "Info.plist").read_bytes(),
+                                         regular(contents / "_CodeSignature/CodeResources").read_bytes())
+    except helper["MachOError"] as exc:
+        raise ValueError(f"inner executable must be the stock NSH {NSH_VERSION} {target} runtime "
+                         f"(package with NSH_RUNTIME set to the pinned runtime): {exc}") from None
 
 
 def macos(args, stage):
@@ -537,10 +546,7 @@ def macos(args, stage):
     # codesign); the stock runtime digest above is the unsigned original.
     source_seal = sha256(contents / "_CodeSignature/CodeResources")
     source_exe = sha256(inner_exe)
-    with tempfile.TemporaryDirectory() as work:
-        work = Path(work)
-        require(unsigned_bytes(inner_exe, work) == unsigned_bytes(stock, work),
-                f"inner executable must be the stock NSH {NSH_VERSION} {args.target} runtime")
+    stock_renderer(inner_exe, stock, contents, args.target)
     deps = {"Metro.app/Contents/Helpers/MetroUI.app/Contents/MacOS/Metro": macho(inner_exe, cputype),
             "Metro.app/Contents/MacOS/Metro": macho(args.launcher, cputype),
             "Metro.app/Contents/MacOS/metro-server": macho(args.server, cputype)}
