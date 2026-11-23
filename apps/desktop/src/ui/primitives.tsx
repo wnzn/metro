@@ -3,7 +3,7 @@
 // in theme/theme.json. To swap the design system, replace this module while
 // keeping its exports' props.
 
-import { List, Scroll, Text, View } from "nsh";
+import { List, Scroll, signal, Text, View } from "nsh";
 import type { JSX, ListRef } from "nsh";
 import { Button, Collapsible, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
 import { Icon } from "./chrome";
@@ -141,6 +141,19 @@ export function Surface(props: StackProps & { variant: SurfaceVariant; hidden?: 
 
 export function Divider() {
   return <View class="h-px bg-border" />;
+}
+
+/** Keep search on the main pane's centerline. Reserve the actual width of
+ * the leading control on both sides, including when it becomes icon-only. */
+export function CenteredToolbar(props: Children & Testable & { leading: JSX.Element }) {
+  const leadingWidth = signal(0);
+  return (
+    <Surface variant="topbar" testID={props.testID} gap={2}>
+      <View class="shrink-0" onLayout={e => leadingWidth.set(e.bounds.size.width)}>{props.leading}</View>
+      <Column grow align="center">{props.children}</Column>
+      <View class="shrink-0" style={{ width: leadingWidth() }} accessibilityElementsHidden />
+    </Surface>
+  );
 }
 
 // ---------------------------------------------------------------- text

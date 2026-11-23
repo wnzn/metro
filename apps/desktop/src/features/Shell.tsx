@@ -1,6 +1,6 @@
 import { cleanup, keymap } from "nsh";
 import { mainPlace, openSettings, view } from "../store";
-import { Column, compactWidth, modalOpen, navigationPanel, PanelToggle, Surface } from "../ui";
+import { CenteredToolbar, Column, compactWidth, modalOpen, navigationPanel, PanelToggle, Surface } from "../ui";
 import { ChatView } from "./ChatView";
 import { LibraryHome } from "./library/LibraryView";
 import { ManageSpace } from "./ManageSpace";
@@ -30,13 +30,12 @@ export function Shell() {
     <Surface variant="app" testID="workspace">
       <Sidebar hidden={!navigationPanel.open()} />
       <Column grow testID="main-panel">
-        <Surface variant="topbar" testID="top-bar" gap={2}>
+        <CenteredToolbar testID="top-bar" leading={
           <PanelToggle side="left" name="workspace navigation" caption={compactWidth() ? undefined : "Navigation"} expanded={navigationPanel.open()}
             shortcut="B" testID="toggle-navigation" onPress={navigationPanel.toggle} />
-          <Column grow align="center">
-            <TopSearch />
-          </Column>
-        </Surface>
+        }>
+          <TopSearch />
+        </CenteredToolbar>
         <If when={mainPlace() === "chat"}>
           <ChatView />
         </If>
