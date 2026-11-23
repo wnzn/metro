@@ -4,17 +4,18 @@
 `assemble` takes the per-platform CI outputs (the `dist-*` artifacts) and writes
 the release folder with SHA256SUMS:
 
-  - desktop archives: Linux x64 and Windows x64, plus macOS arm64 and x64 in
-    `release` mode (tags); the Linux runner archive; each with its .sha256
+  - desktop archives: Linux x64 and Windows x64 (plus the macOS archives in
+    `release` mode, none for now: see MACOS); the Linux runner archive; each
+    with its .sha256
   - the Windows MSI and its .sha256, and the two PowerShell scripts, exactly as
     windows-distribution.yml produced them (signed on tags; never replaced by
     checkout copies)
   - the shell installers from this checkout (install-metro-macos.sh only in
-    release mode, next to the notarized macOS archives)
+    release mode, next to notarized macOS archives, so not for now)
 
 Every archive is opened and checked against its sidecar and RELEASE.json.
 Release mode also requires: the metro-tui terminal client in every desktop
-archive (named by RELEASE.json "tui"), both macOS archives notarized, stapled Developer ID
+archive (named by RELEASE.json "tui"), every macOS archive (if any) notarized, stapled Developer ID
 builds per RELEASE.json (the native macOS gate already verified the real
 signature and ticket), and an Authenticode signature present on every Windows
 executable, the MSI and both .ps1 scripts (validity is checked natively by the
@@ -37,7 +38,12 @@ import tarfile
 import zipfile
 
 HERE = Path(__file__).resolve().parent
-DESKTOP = ("linux-x64", "windows-x64", "macos-arm64", "macos-x64")
+# The Macs a release ships: none for now. macOS builds are off in CI (GitHub's
+# macOS runners queued for 15+ minutes and jobs were cancelled; see
+# release.yml). The macOS checks below stay for when they return
+# ("macos-arm64", "macos-x64"), together with release_signatures.MACOS_TARGETS.
+MACOS = ()
+DESKTOP = ("linux-x64", "windows-x64")  # every mode; release mode adds MACOS
 SH_SCRIPTS = ("install-metro-linux.sh", "install-metro-runner-linux.sh", "metro-runner-container.sh")
 PS1_SCRIPTS = ("install-metro-windows.ps1", "metro-runner-container.ps1")
 MACOS_SCRIPT = "install-metro-macos.sh"
@@ -74,7 +80,7 @@ class Layout:
         require(mode in ("release", "smoke"), f"bad mode {mode!r}")
         require(mode == "smoke" or not version.endswith("-ci"), "release mode needs a tag version")
         self.version, self.mode = version, mode
-        desktop = DESKTOP if mode == "release" else DESKTOP[:2]
+        desktop = DESKTOP + (MACOS if mode == "release" else ())
         self.archives = {f"Metro-{version}-{t}{'.zip' if t == 'windows-x64' else '.tar.gz'}": ("desktop", t)
                          for t in desktop}
         self.archives[f"Metro-runner-{version}-linux-x64.tar.gz"] = ("runner", "linux-x64")
@@ -82,7 +88,7 @@ class Layout:
         # windows-sign.yml produces the release name.
         self.msi = f"Metro-{version}-windows-x64{'.msi' if mode == 'release' else '.unsigned-preview.msi'}"
         self.ps1 = PS1_SCRIPTS
-        self.sh = SH_SCRIPTS + ((MACOS_SCRIPT,) if mode == "release" else ())
+        self.sh = SH_SCRIPTS + ((MACOS_SCRIPT,) if mode == "release" and MACOS else ())
 
     def collected(self):
         """What the dist-* artifacts must hold, exactly."""

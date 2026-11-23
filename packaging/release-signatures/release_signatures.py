@@ -17,15 +17,16 @@ import tarfile
 REPOSITORY = "https://github.com/wnzn/metro"
 REPOSITORY_ID = "1467654868"
 ISSUER = "https://token.actions.githubusercontent.com"
-SOURCE_REF = "refs/heads/master"
+SOURCE_REF = "refs/heads/main"
 MANIFEST = "SHA256SUMS"
 BUNDLE = ".sigstore.json"
 SIGNER_WORKFLOW = "sign-release-assets.yml"
 CALLER_WORKFLOW = "ci.yml"
 VERSION = re.compile(r"[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*)?")
 COMMIT = re.compile(r"[0-9a-f]{40}")
+# install-metro-macos.sh ships only next to macOS archives (none for now; see MACOS_TARGETS).
 INSTALLERS = {
-    "install-metro-linux.sh", "install-metro-macos.sh", "install-metro-runner-linux.sh",
+    "install-metro-linux.sh", "install-metro-runner-linux.sh",
     "install-metro-windows.ps1", "metro-runner-container.sh", "metro-runner-container.ps1",
 }
 IMAGES = {
@@ -83,11 +84,17 @@ def direct_archives(version):
     return (f"Metro-{version}-linux-x64.tar.gz", f"Metro-runner-{version}-linux-x64.tar.gz")
 
 
+# The Macs a release ships (release_assets.MACOS): none for now. macOS builds
+# are off in CI (GitHub's macOS runners queued for 15+ minutes and jobs were
+# cancelled; see release.yml). When they return, list the targets here and add
+# install-metro-macos.sh to INSTALLERS again.
+MACOS_TARGETS = ()
+
+
 def binaries(version):
     return set(direct_archives(version)) | {
         f"Metro-{version}-windows-x64.zip", f"Metro-{version}-windows-x64.msi",
-        f"Metro-{version}-macos-arm64.tar.gz", f"Metro-{version}-macos-x64.tar.gz",
-    }
+    } | {f"Metro-{version}-{target}.tar.gz" for target in MACOS_TARGETS}
 
 
 def regular_file(path):

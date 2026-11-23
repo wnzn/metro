@@ -29,12 +29,14 @@ for contributors.
 Check each download against the `.sha256` file published beside it. The
 0.2.0 names are verified targets but aren't published yet.
 
-Per-user installer scripts for Linux, Windows and macOS (preview), which
-check the download, add a menu entry and optionally install Linux
-libraries, are described in [docs/install.md](../../docs/install.md). The
-Linux installer passed in a local test cut on Debian 13 and CachyOS
+Per-user installer scripts for Linux and Windows, which check the
+download, add a menu entry and optionally install Linux libraries, are
+described in [docs/install.md](../../docs/install.md). The Linux installer
+passed in a local test cut on Debian 13 and CachyOS
 ([acceptance](../../docs/acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)). None is published or
-signed, and the Windows and macOS ones haven't been run in a recorded test.
+signed, and the Windows one hasn't been run in a recorded test. There's no
+Mac build or download for now: CI doesn't build macOS. The macOS installer
+script stays in the repository, untested, for when Mac builds return.
 
 In 0.2.0, the first screen, **Connect to Metro**, offers two choices:
 

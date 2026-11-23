@@ -3,6 +3,79 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: releases from `main` on a version bump (2026-11-24, CI lane, local)
+
+Uncommitted changes on `fix/ci-cleanup`, on top of `106e5da`
+([deploy.md](deploy.md#releases-from-main-on-a-version-bump-in-the-source-never-run-with-real-credentials)).
+`main` is the only long-lived branch. Earlier entries that name `master`
+describe the source as it was then.
+
+- Every release guard, signer identity and provenance check now names
+  `refs/heads/main` and `ci.yml@refs/heads/main`: `release_policy.py`,
+  `winsign.py`, `release_signatures.py`, `ci.yml`, `release.yml`,
+  `release-publish.yml`, `windows-sign.yml`, `windows-distribution.yml`,
+  `sign-release-assets.yml` and `release-images.yml`. `ci.yml` no longer
+  runs on `master` pushes.
+- Only a version bump releases. `release_policy.py decide` compares the
+  checked-in version with the one at `github.event.before`. Without a
+  change, or without a readable previous version, it answers
+  `release=false` before any GitHub call. `authorize` and `tag` recheck the
+  bump and fail without one.
+- A version bump uses the earlier eligibility table. A re-run of the bump's
+  run resumes after a failure.
+- Release runs keep the `desktop` job on GitHub-hosted runners. The
+  self-hosted queue is used only when release-policy didn't choose a
+  release.
+- Every push to `main` has its own workflow-level concurrency group and is
+  never cancelled or replaced; pull requests keep `ci-pr-<n>` with cancel.
+  Only the `publish` job is serialized (`metro-official-release`, never
+  cancelled), so only a second release run can wait behind a first.
+- The Windows verifier self-test no longer decides by branch. It runs only
+  when the preview job sets `METRO_WINDOWS_SELF_TEST=preview` (from
+  `!inputs.release`), and refuses tags and jobs that can request an OIDC
+  token.
+- The `packaging` CI job also runs the `packaging/release-signatures` and
+  `packaging/windows-signing` suites.
+- No macOS builds for now, for Apple silicon or Intel, in previews or
+  releases: GitHub's macOS runners queued for 15+ minutes and jobs were
+  cancelled. `desktop-macos`, meta's macOS matrix and `macos-sign` are
+  removed, along with the five Apple secrets passed to `release-publish.yml`.
+  `release-publish.yml`'s `assets` job now checks the tag step's `proceed`
+  itself; before, `macos-sign` did. The official set is Windows and Linux
+  only (no macOS archive, no `install-metro-macos.sh`). The macOS packaging
+  code and its unit tests stay. The install-step tests skip while
+  `desktop-macos` is absent, and the release-assets macOS gate is still
+  tested with the targets patched back in.
+
+With version 0.2.0 checked in and nothing published, merging this releases
+nothing until a later pull request changes the version.
+
+**Not yet shown:** any GitHub run. The `windows-release-signing`
+environment's deployment rule must name `main` before Windows signing can
+pass. The runner routing, the `publish` concurrency group and the release
+DAG without macOS were checked only by actionlint and the contract tests
+below. The self-test guard ran under Linux pwsh 7.7.0 only, not on Windows.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging -v # 190 tests, OK (15 skipped: no pwsh, MSI tools, macOS runtimes; 3 desktop-macos step tests)
+python3 -B -m unittest discover -s packaging/release-signatures  # 17 tests, OK (1 skipped: no METRO_TEST_COSIGN)
+python3 -B -m unittest discover -s packaging/windows-signing     # 39 tests, OK (6 skipped: no pwsh)
+python3 -B -m unittest discover -s ops/github-runner             # 33 tests, OK
+# Again with pwsh 7.7.0 on PATH, as on ubuntu-24.04:
+#   packaging 190 OK (10 skipped: MSI tools, macOS runtimes, desktop-macos step); windows-signing 39 OK (0 skipped)
+# shellcheck -s sh packaging/*.sh (koalaman/shellcheck:stable)  # clean
+```
+
+The policy tests run `release_policy.py` itself with synthetic GitHub
+environments and no network: no-bump pushes (same version, all-zero,
+unknown, malformed or missing `before`) answer `release=false`, and a bump
+in a throwaway repository reaches the GitHub client. `master` refs are
+refused everywhere.
+
 ## Source only: faster pull request CI (2026-11-24, CI lane, local)
 
 Uncommitted changes on `fix/ci-cleanup`, on top of `1719366`, to `ci.yml`,

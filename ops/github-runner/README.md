@@ -4,7 +4,7 @@ One Linux x64 runner for the public repository `wnzn/metro`, run with Docker
 Compose. It's for Metro's own CI only. It has nothing to do with Metro's
 personal or Space runners (`metro-runner`), and it never signs anything:
 the Windows signer and every release job stay on their own workflows.
-GitHub-hosted Windows and macOS jobs aren't affected.
+GitHub-hosted Windows jobs aren't affected. (There are no macOS jobs for now.)
 
 > **Status: registered; the manual smoke run passed.**
 >
@@ -27,14 +27,16 @@ GitHub-hosted Windows and macOS jobs aren't affected.
   publishes nothing. Two workflows use this label:
   - **`ci.yml`'s `desktop` job,** automatically. That covers pull requests
     from branches of `wnzn/metro` itself into `main` by trusted authors (not
-    forks, not Dependabot) and pushes to the protected `main` branch.
+    forks, not Dependabot) and pushes to the protected `main` branch that
+    don't release.
   - **`.github/workflows/self-hosted-ci.yml`,** a manual run on the literal
     `main` branch ([below](#run-the-workflow)).
 - **What stays on GitHub's runners:** everything else, including:
-  - official `master` release runs;
+  - official release runs: a push to `main` that bumps the version keeps its
+    `desktop` job on GitHub's runners too;
   - pull requests from forks;
   - the Rust jobs and anything that needs Docker;
-  - the native macOS and Windows jobs.
+  - the native Windows jobs (there are no macOS jobs for now).
 - **The label only routes jobs; it doesn't authorize them.** A workflow
   change that targets it still needs review like any other.
 - **No Docker access, no host files.** There's no Docker socket, no host

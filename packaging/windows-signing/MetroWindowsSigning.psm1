@@ -94,14 +94,15 @@ function Invoke-MetroSigning {
 }
 
 # The only context in which release credentials may be used: a push (not a
-# deletion) to the protected literal master branch of wnzn/metro, whose
-# top-level workflow is ci.yml on master, with the pushed commit checked out.
-# winsign.py release-context holds the rules (and their tests).
+# deletion) to the protected literal main branch of wnzn/metro, whose
+# top-level workflow is ci.yml on main, with the pushed commit checked out.
+# winsign.py release-context holds the rules (and their tests); ci.yml calls
+# the signing workflow only for a push that bumped the version.
 function Assert-MetroReleaseContext([string] $Version) {
     $head = & git -C $env:GITHUB_WORKSPACE rev-parse HEAD
     if ($LASTEXITCODE -ne 0 -or -not $head) { Fail 'cannot read the checked-out commit' }
     & python -I (Join-Path $PSScriptRoot 'winsign.py') release-context --version $Version --head ([string] $head).Trim() | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail 'release signing runs only for a push to protected master of wnzn/metro from ci.yml' }
+    if ($LASTEXITCODE -ne 0) { Fail 'release signing runs only for a push to protected main of wnzn/metro from ci.yml' }
 }
 
 function Install-MetroArtifactSigningClient([string] $Version, [string] $Sha256, [string] $Dest) {
@@ -132,7 +133,7 @@ function Install-MetroArtifactSigningClient([string] $Version, [string] $Sha256,
 # that only lives for the signing call. The value is masked and never printed.
 function New-GitHubOidcTokenFile([string] $Path) {
     if (-not $env:ACTIONS_ID_TOKEN_REQUEST_URL -or -not $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
-        Fail 'no GitHub OIDC token is available: the official master call must grant id-token: write'
+        Fail 'no GitHub OIDC token is available: the official main release call must grant id-token: write'
     }
     $uri = $env:ACTIONS_ID_TOKEN_REQUEST_URL + '&audience=api://AzureADTokenExchange'
     $token = (Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
@@ -536,11 +537,23 @@ function Test-MetroScriptMsiCoexistence {
 # Preview only. A throwaway self-signed certificate signs scratch copies so the
 # verifiers are exercised on real SignTool output; it is never trusted, never
 # timestamped, never shipped, and removed afterwards.
+#
+# Fail-closed guard. The branch no longer tells a release apart (main pushes
+# without a version bump run previews too), so the caller must say so
+# explicitly: windows-distribution.yml's preview job sets
+# METRO_WINDOWS_SELF_TEST=preview from `!inputs.release`. It never runs for a
+# tag, or in a job that can request a GitHub OIDC token (release signing).
 function Invoke-MetroVerifierSelfTest {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $Tree, [Parameter(Mandatory)] [string] $Msi, [Parameter(Mandatory)] [string] $SourceScripts)
-    if ($env:GITHUB_REF_TYPE -eq 'tag' -or ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF -eq 'refs/heads/master')) {
-        Fail 'the throwaway-certificate self-test never runs for master pushes or tags'
+    if ($env:GITHUB_REF_TYPE -eq 'tag' -or ([string] $env:GITHUB_REF).StartsWith('refs/tags/')) {
+        Fail 'the throwaway-certificate self-test never runs for tags'
+    }
+    if ($env:METRO_WINDOWS_SELF_TEST -cne 'preview') {
+        Fail 'the throwaway-certificate self-test runs only in the preview job (METRO_WINDOWS_SELF_TEST=preview)'
+    }
+    if ($env:ACTIONS_ID_TOKEN_REQUEST_URL -or $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
+        Fail 'the throwaway-certificate self-test never runs in a job that can request an OIDC token'
     }
     $tool = Get-MetroSignTool
     $subject = 'Metro CI throwaway self-test (not a release signer)'
