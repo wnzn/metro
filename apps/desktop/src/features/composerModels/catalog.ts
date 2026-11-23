@@ -2,7 +2,7 @@ import { signal } from "nsh";
 import type { AvailableModel, TurnModelChoice } from "../../api/client";
 
 type Scope = string | null;
-type Target = { key: string; label: string; detail?: string; levels: string[]; choice: TurnModelChoice };
+type Target = { key: string; label: string; detail?: string; levels: string[]; choice: TurnModelChoice; fetchFrom?: string };
 const keyFor = (c: TurnModelChoice) => JSON.stringify([c.connectionId, c.modelId ?? null]);
 
 function targets(rows: AvailableModel[]): Target[] {
@@ -14,6 +14,7 @@ function targets(rows: AvailableModel[]): Target[] {
       const choice = model.id === undefined ? { connectionId: m.connectionId } : { connectionId: m.connectionId, modelId: model.id };
       return {
         key: keyFor(choice), choice, detail, levels: model.reasoningEfforts,
+        fetchFrom: m.owned && m.execution === "server" && m.runsOn === "your_connection" ? m.name || m.providerId : undefined,
         label: [model.id ?? m.model, m.name, m.providerId].filter(Boolean).join(" · "),
       };
     });
