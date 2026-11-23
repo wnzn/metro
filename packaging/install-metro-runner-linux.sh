@@ -191,7 +191,9 @@ check_url() {
 check_token_file() { # never reads the token
     f=$1
     case "$f" in /*) ;; *) die "token file path must be absolute: $f" ;; esac
-    [ ! -L "$f" ] && [ -f "$f" ] || die "token file must be a regular file (not a link): $f"
+    if [ -L "$f" ] || [ ! -f "$f" ]; then
+        die "token file must be a regular file (not a link): $f"
+    fi
     [ -s "$f" ] || die "token file is empty: $f"
     [ "$(stat -c '%u:%a' -- "$f")" = "$(id -u):600" ] ||
         die "token file must be owned by you with mode 600 (run: chmod 600 '$f')"
@@ -227,13 +229,16 @@ load_config() {
 }
 
 configure() {
-    [ -n "$server_url" ] && [ -n "$workspace" ] && [ -n "$token_file" ] ||
+    if [ -z "$server_url" ] || [ -z "$workspace" ] || [ -z "$token_file" ]; then
         die "configure needs --server-url, --workspace and --token-file"
+    fi
     server_url=${server_url%/}
     check_url "$server_url"
     workspace=$(absolute "$workspace"); token_file=$(absolute "$token_file")
     check_plain_value --workspace "$workspace"; check_plain_value --token-file "$token_file"
-    [ -d "$workspace" ] && [ ! -L "$workspace" ] || die "workspace must be an existing directory (create it with: mkdir -p '$workspace')"
+    if [ ! -d "$workspace" ] || [ -L "$workspace" ]; then
+        die "workspace must be an existing directory (create it with: mkdir -p '$workspace')"
+    fi
     [ "$(stat -c '%u' -- "$workspace")" = "$(id -u)" ] || die "workspace must be owned by you: $workspace"
     check_token_file "$token_file"
     mkdir -p -- "$config_dir"
@@ -295,10 +300,14 @@ install_runner() {
     stage=$(mktemp -d -- "$root/.stage.XXXXXX")
     extract_verified "$archive" "$stage" "$top"
     app=$stage/$top
-    [ "$(json_field "$app/RELEASE.json" kind)" = runner ] && [ "$(json_field "$app/RELEASE.json" target)" = linux-x64 ] &&
-        [ "$(json_field "$app/RELEASE.json" version)" = "$version" ] ||
+    if [ "$(json_field "$app/RELEASE.json" kind)" != runner ] ||
+        [ "$(json_field "$app/RELEASE.json" target)" != linux-x64 ] ||
+        [ "$(json_field "$app/RELEASE.json" version)" != "$version" ]; then
         die "RELEASE.json does not describe a Metro runner $version linux-x64 package"
-    [ -x "$app/metro-runner" ] && [ -x "$app/run-runner" ] || die "package is missing metro-runner or run-runner"
+    fi
+    if [ ! -x "$app/metro-runner" ] || [ ! -x "$app/run-runner" ]; then
+        die "package is missing metro-runner or run-runner"
+    fi
     problems=$(host_problems "$app/metro-runner")
     [ -z "$problems" ] || die "this host cannot run this runner: $problems"
     mkdir -p -- "$root/versions"
@@ -385,7 +394,9 @@ uninstall_runner() {
             systemctl --user disable --now "$UNIT" >/dev/null 2>&1 || true
         fi
         rm -f -- "$unit_file"
-        command -v systemctl >/dev/null 2>&1 && systemctl --user daemon-reload >/dev/null 2>&1 || true
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl --user daemon-reload >/dev/null 2>&1 || true
+        fi
         say "Removed $unit_file"
     fi
     if [ -d "$root" ]; then

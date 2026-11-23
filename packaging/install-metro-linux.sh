@@ -253,11 +253,15 @@ install_app() {
     stage=$(mktemp -d -- "$root/.stage.XXXXXX")
     extract_verified "$archive" "$stage" "$top"
     app=$stage/$top
-    [ "$(json_field "$app/RELEASE.json" kind)" = desktop ] && [ "$(json_field "$app/RELEASE.json" target)" = linux-x64 ] &&
-        [ "$(json_field "$app/RELEASE.json" version)" = "$version" ] ||
+    if [ "$(json_field "$app/RELEASE.json" kind)" != desktop ] ||
+        [ "$(json_field "$app/RELEASE.json" target)" != linux-x64 ] ||
+        [ "$(json_field "$app/RELEASE.json" version)" != "$version" ]; then
         die "RELEASE.json does not describe a Metro $version linux-x64 desktop package"
+    fi
     for f in Metro metro-server ui/Metro; do
-        [ -f "$app/$f" ] && [ -x "$app/$f" ] || die "package is missing executable $f"
+        if [ ! -f "$app/$f" ] || [ ! -x "$app/$f" ]; then
+            die "package is missing executable $f"
+        fi
     done
     check_runtime "$app"
     # Only launchers that read the marker say so in their manifest.

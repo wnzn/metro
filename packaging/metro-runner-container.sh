@@ -100,7 +100,9 @@ check_token_file() { # never reads the token
     case "$1" in /*) ;; *) die "token file path must be absolute" ;; esac
     case "$1" in *,*|*:*|*"
 "*) die "token file path must not contain commas, colons or newlines: $1" ;; esac
-    [ ! -L "$1" ] && [ -f "$1" ] || die "token file must be a regular file (not a link): $1"
+    if [ -L "$1" ] || [ ! -f "$1" ]; then
+        die "token file must be a regular file (not a link): $1"
+    fi
     [ -s "$1" ] || die "token file is empty: $1"
     [ "$(file_owner_mode "$1")" = "$(id -u):600" ] || die "token file must be owned by you with mode 600 (run: chmod 600 '$1')"
 }
@@ -171,10 +173,16 @@ probe() { # $@ = shell command
         --entrypoint /bin/bash "$image" -c "$1" >/dev/null 2>&1
 }
 
-network_flag() { [ "$network" = host ] && printf '%s' '--network=host' || true; }
+network_flag() {
+    if [ "$network" = host ]; then
+        printf '%s' '--network=host' || true
+    fi
+}
 
 setup() {
-    [ -n "$server_url" ] && [ -n "$token_file" ] || die "setup needs --server-url and --token-file"
+    if [ -z "$server_url" ] || [ -z "$token_file" ]; then
+        die "setup needs --server-url and --token-file"
+    fi
     [ -n "$image" ] || [ -n "$version" ] || die "setup needs --version X.Y.Z or --image REF"
     if [ -z "$image" ]; then
         printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' || die "invalid --version: $version"

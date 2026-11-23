@@ -124,8 +124,9 @@ extract_verified() { # $1 archive, $2 dest, $3 top folder
     manifest_sums "$dir/RELEASE.json" >"$2/.sums" || die "RELEASE.json has no valid file list"
     while IFS= read -r line; do
         h=${line%%"  "*}; p=${line#*"  "}
-        [ -f "$dir/$p" ] && [ ! -L "$dir/$p" ] && [ "$(sha_of "$dir/$p")" = "$h" ] ||
+        if [ ! -f "$dir/$p" ] || [ -L "$dir/$p" ] || [ "$(sha_of "$dir/$p")" != "$h" ]; then
             die "files in the archive do not match its RELEASE.json manifest ($p)"
+        fi
     done <"$2/.sums"
     (cd "$dir" && find . ! -type d ! -type f | grep -q .) && die "archive contains links or special files"
     { cut -c67- "$2/.sums"; echo RELEASE.json; } | LC_ALL=C sort >"$2/.want"
@@ -184,9 +185,11 @@ install_app() {
     stage=$(mktemp -d -- "$parent/.metro-desktop-stage.XXXXXX")
     extract_verified "$archive" "$stage" "$top"
     app=$stage/$top
-    [ "$(json_field "$app/RELEASE.json" kind)" = desktop ] && [ "$(json_field "$app/RELEASE.json" target)" = "macos-$arch" ] &&
-        [ "$(json_field "$app/RELEASE.json" version)" = "$version" ] ||
+    if [ "$(json_field "$app/RELEASE.json" kind)" != desktop ] ||
+        [ "$(json_field "$app/RELEASE.json" target)" != "macos-$arch" ] ||
+        [ "$(json_field "$app/RELEASE.json" version)" != "$version" ]; then
         die "RELEASE.json does not describe a Metro $version macos-$arch desktop package"
+    fi
     [ -x "$app/Metro.app/Contents/MacOS/Metro" ] || die "package has no Metro.app"
     codesign --verify --deep --strict "$app/Metro.app" 2>/dev/null ||
         die "Metro.app's code signature is invalid or the app was modified; do not install it"
