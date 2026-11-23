@@ -322,6 +322,8 @@ jobs:
 
   workflows:
     runs-on: ubuntu-24.04
+    outputs:
+      docs_only: ${{ steps.preview-policy.outputs.docs_only }}
     env:
       ACTIONLINT_VERSION: 1.7.12
       ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
@@ -352,6 +354,18 @@ jobs:
           # pwsh ships with the ubuntu-24.04 image; the PowerShell tests skip without it.
           command -v pwsh
           python3 -B -m unittest discover -s packaging -v
+      - name: Check whether this PR needs the optional package previews
+        id: preview-policy
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if python3 -I packaging/package_smoke_policy.py; then
+            echo 'docs_only=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'docs_only=false' >> "$GITHUB_OUTPUT"
+          fi
 
   # The release decision for the official master push: provenance first (no
   # secrets, read-only token), then the checked-in version and its eligibility
@@ -387,12 +401,14 @@ jobs:
         run: python3 -I packaging/release_policy.py decide
 
   # Build and package everything a release would ship, but publish nothing:
-  # pull requests, main, and master pushes whose version is already released.
+  # PRs except proven docs-only changes to main, main pushes, and already
+  # released master versions. Unknown PR diffs still build.
   # No secrets and contents: read only (release.yml's whole tree stays read-only).
   package-smoke:
     needs: [workflows, release-policy]
     if: >-
       ${{ !cancelled() && needs.workflows.result == 'success'
+      && needs.workflows.outputs.docs_only != 'true'
       && (needs.release-policy.result == 'skipped'
           || (needs.release-policy.result == 'success' && needs.release-policy.outputs.release != 'true')) }}
     uses: ./.github/workflows/release.yml
