@@ -107,11 +107,16 @@ const NO_MODEL: &str = "Ask agent is unavailable: you have no default model conn
 struct RunModel {
     model: DynModel<Completion>,
     max_tokens: Option<u64>,
+    params: Option<serde_json::Value>,
 }
 
 impl RunModel {
     fn builder(self) -> AgentBuilder {
         let builder = AgentBuilder::new(self.model);
+        let builder = match self.params {
+            Some(params) => builder.additional_params(params),
+            None => builder,
+        };
         match self.max_tokens {
             Some(n) => builder.max_tokens(n),
             None => builder,
@@ -135,19 +140,29 @@ async fn route_model(
     let note = &mut route.note;
     match route.connection_id.clone() {
         Some(id) => {
-            match state
-                .routing
-                .backend
-                .chat_model(state, user_id, space, &id)
-                .await
-            {
+            let selection = route.turn_selection.as_ref();
+            let selected = match selection {
+                Some(selection) => {
+                    crate::providers::turn_model_for(state, user_id, space, &id, selection).await
+                }
+                None => {
+                    state
+                        .routing
+                        .backend
+                        .chat_model(state, user_id, space, &id)
+                        .await
+                }
+            };
+            match selected {
                 Ok(selected) => {
                     note.connection_id = Some(selected.connection_id.clone());
                     note.provider_id = Some(selected.provider_id.clone());
                     note.model_id = Some(selected.model_id.clone());
+                    note.reasoning_effort = selection.and_then(|s| s.reasoning_effort.clone());
                     Ok(RunModel {
                         model: selected.model,
                         max_tokens: selected.max_tokens,
+                        params: selection.and_then(|s| s.params(&selected.provider_id)),
                     })
                 }
                 Err(e) => Err(route.unavailable(&e)),
@@ -161,6 +176,7 @@ async fn route_model(
                 Ok(RunModel {
                     model: selected.model,
                     max_tokens: selected.max_tokens,
+                    params: None,
                 })
             }
             Ok(None) => match &state.config.model {
@@ -173,6 +189,7 @@ async fn route_model(
                     Ok(RunModel {
                         model: model(config).into(),
                         max_tokens: None,
+                        params: None,
                     })
                 }
                 None => Err(NO_MODEL.to_owned()),

@@ -46,6 +46,7 @@ mod listed;
 pub mod secret;
 pub mod sharing;
 pub mod store;
+pub(crate) mod turn;
 pub mod typed;
 
 #[cfg(test)]
@@ -435,6 +436,10 @@ pub enum UseError {
     KeyMissing,
     EndpointNotApproved,
     Unsupported,
+    DeviceOffline,
+    TurnModelNotAllowed,
+    TurnEffortNotAllowed,
+    TurnChanged,
     /// The connection serves another capability.
     WrongCapability {
         expected: Capability,
@@ -496,6 +501,12 @@ impl std::fmt::Display for UseError {
             UseError::Unsupported => {
                 "your model connection's provider is not supported by this server"
             }
+            UseError::DeviceOffline => "the device for this model connection is offline",
+            UseError::TurnModelNotAllowed => "model_id is not selectable on that connection",
+            UseError::TurnEffortNotAllowed => {
+                "reasoning_effort is not supported by that model on that connection"
+            }
+            UseError::TurnChanged => "that model connection changed; choose the model again",
             UseError::Revoked => {
                 "access to that shared model connection has ended: its owner stopped sharing \
                  it, someone left the Space, or it was deleted"
@@ -612,6 +623,31 @@ pub async fn connection_model_for(
     build_model(state, caller, space, authorized)
 }
 
+/// Re-resolve an explicit per-turn model and effort when the run starts.
+pub(crate) async fn turn_model_for(
+    state: &AppState,
+    caller: &str,
+    space: Option<&str>,
+    id: &str,
+    selection: &turn::TurnSelection,
+) -> Result<SelectedModel, UseError> {
+    let mut authorized = resolve(state, caller, space, id).await?;
+    if let Some(sid) = space {
+        let (sid, caller) = (sid.to_owned(), caller.to_owned());
+        let member = state
+            .db
+            .call(move |db| Ok(store::is_member(&db.lock(), &sid, &caller)?))
+            .await
+            .map_err(read_error)?;
+        if !member {
+            return Err(UseError::NotFound);
+        }
+    }
+    selection.recheck(state, &authorized)?;
+    authorized.row.model.clone_from(&selection.model_id);
+    build_model_for_turn(state, caller, space, authorized, Some(selection))
+}
+
 async fn resolve(
     state: &AppState,
     caller: &str,
@@ -645,6 +681,7 @@ fn grant_for(state: &AppState, caller: &str, space: Option<&str>, a: &Authorized
         space: space.map(str::to_owned),
         chosen: a.chosen.clone(),
         target: a.row.id.clone(),
+        turn_check: None,
         slots,
     })
 }
@@ -663,7 +700,32 @@ fn build_model(
     space: Option<&str>,
     authorized: Authorized,
 ) -> Result<SelectedModel, UseError> {
-    let grant = grant_for(state, caller, space, &authorized);
+    build_model_for_turn(state, caller, space, authorized, None)
+}
+
+fn build_model_for_turn(
+    state: &AppState,
+    caller: &str,
+    space: Option<&str>,
+    authorized: Authorized,
+    selection: Option<&turn::TurnSelection>,
+) -> Result<SelectedModel, UseError> {
+    let mut grant = grant_for(state, caller, space, &authorized);
+    if let Some(selection) = selection {
+        let grant = grant.get_or_insert_with(|| Grant {
+            db: state.db.clone(),
+            caller: caller.to_owned(),
+            space: space.map(str::to_owned),
+            chosen: authorized.chosen.clone(),
+            target: authorized.row.id.clone(),
+            turn_check: None,
+            slots: None,
+        });
+        grant.turn_check = Some(guard::TurnCheck {
+            state: state.clone(),
+            selection: selection.clone(),
+        });
+    }
     let Authorized { row, chosen, .. } = authorized;
     let entry = catalog::find(&row.provider_id).ok_or(UseError::Unsupported)?;
     if row.model.is_empty() {
@@ -686,17 +748,18 @@ fn build_model(
         }),
     };
     let model = match entry.adapter {
-        // A preset on the caller's own sign-in: their device, with the
-        // preset's share rechecked before each request and before its
-        // answer is returned.
-        Adapter::Device if grant.is_some() && row.user_id == caller => {
-            let grant = grant.clone().expect("checked");
+        // Recheck an explicit model or preset before each relay request and
+        // again before the answer is returned.
+        Adapter::Device if grant.is_some() && (selection.is_some() || row.user_id == caller) => {
+            let mut grant = grant.clone().expect("checked");
+            // The authenticated relay already caps borrowed device traffic.
+            grant.slots = None;
             let wire = OpenAIConfig::with_key(&guard::DEVICE_WIRE_DIALECT, "metro-device-relay")
                 .with_base_url(guard::DEVICE_WIRE_URL)
                 .chat(row.model.clone());
             rig_core::Model::new(
                 wire,
-                guard::PresetDeviceTransport {
+                guard::GuardedDeviceTransport {
                     relay: state.device.clone(),
                     caller: caller_of(caller, space),
                     connection: row.id.clone(),

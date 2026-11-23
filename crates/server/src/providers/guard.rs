@@ -15,7 +15,7 @@
 //! [`super::DeviceDirectory`] at dispatch, before the device claims the job
 //! and before the result is returned), and capped by its per-connection
 //! queue. A subscription preset that resolved to the caller's *own*
-//! Sign in with ChatGPT device runs on [`PresetDeviceTransport`], which
+//! Sign in with ChatGPT device runs on [`GuardedDeviceTransport`], which
 //! rechecks the preset's share before each request and again before its
 //! answer is returned.
 
@@ -34,7 +34,7 @@ use serde_json::{Value, json};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use super::UseError;
-use super::sharing;
+use super::{sharing, turn};
 use crate::db::Db;
 use crate::device_relay::{Caller, DeviceRelay};
 
@@ -52,8 +52,46 @@ pub struct Grant {
     /// The connection that runs: the owner's, or the caller's own for a
     /// preset. A grant that now resolves elsewhere is refused.
     pub(crate) target: String,
+    pub(super) turn_check: Option<TurnCheck>,
     /// The in-flight cap of a borrowed connection; `None` for a preset.
     pub(crate) slots: Option<Arc<Semaphore>>,
+}
+
+/// Additional checks for a client-selected model, including owned connections.
+#[derive(Clone)]
+pub(super) struct TurnCheck {
+    pub state: crate::AppState,
+    pub selection: turn::TurnSelection,
+}
+
+/// Minimal selection grant a queued relay job can retain. Does not hold the
+/// AppState or relay that owns the job.
+pub(crate) struct DeviceClaimGrant {
+    caller: String,
+    space: Option<String>,
+    chosen: String,
+    target: String,
+    model: String,
+    config_rev: i64,
+}
+
+impl DeviceClaimGrant {
+    pub(crate) fn allowed(&self, conn: &rusqlite::Connection) -> anyhow::Result<bool> {
+        if let Some(space) = &self.space
+            && !super::store::is_member(conn, space, &self.caller)?
+        {
+            return Ok(false);
+        }
+        Ok(
+            sharing::authorize(conn, &self.caller, self.space.as_deref(), &self.chosen).is_ok_and(
+                |a| {
+                    a.row.id == self.target
+                        && a.row.config_rev == self.config_rev
+                        && (a.access == sharing::Access::Own || a.row.model == self.model)
+                },
+            ),
+        )
+    }
 }
 
 impl std::fmt::Debug for Grant {
@@ -66,22 +104,46 @@ impl std::fmt::Debug for Grant {
 }
 
 impl Grant {
-    /// Recheck the grant now, then take a slot. A grant that no longer
-    /// holds is [`UseError::Revoked`].
+    /// Take a slot and recheck the grant immediately before using it, since
+    /// access or the selected model can change while a request is waiting.
     pub async fn admit(&self) -> Result<Option<OwnedSemaphorePermit>, UseError> {
-        let (caller, space, chosen, target) = (
+        let permit = match &self.slots {
+            None => None,
+            Some(slots) => {
+                match tokio::time::timeout(SLOT_WAIT, slots.clone().acquire_owned()).await {
+                    Ok(Ok(permit)) => Some(permit),
+                    _ => return Err(UseError::Busy),
+                }
+            }
+        };
+        let (caller, space, chosen, target, turn_check) = (
             self.caller.clone(),
             self.space.clone(),
             self.chosen.clone(),
             self.target.clone(),
+            self.turn_check.clone(),
         );
         let still = self
             .db
             .call(move |db| {
-                Ok(
-                    sharing::authorize(&db.lock(), &caller, space.as_deref(), &chosen)
-                        .map(|a| a.row.id == target),
-                )
+                let conn = db.lock();
+                if turn_check.is_some()
+                    && let Some(sid) = &space
+                    && !super::store::is_member(&conn, sid, &caller)?
+                {
+                    return Ok(Err(UseError::NotFound));
+                }
+                let checked = sharing::authorize(&conn, &caller, space.as_deref(), &chosen)
+                    .and_then(|a| {
+                        if a.row.id != target {
+                            return Ok(false);
+                        }
+                        if let Some(check) = turn_check {
+                            check.selection.recheck(&check.state, &a)?;
+                        }
+                        Ok(true)
+                    });
+                Ok(checked)
             })
             .await
             .map_err(|e| {
@@ -89,18 +151,9 @@ impl Grant {
                 UseError::Internal
             })?;
         match still {
-            Ok(true) => {}
-            Ok(false) | Err(UseError::NotFound) => return Err(UseError::Revoked),
-            Err(e) => return Err(e),
-        }
-        match &self.slots {
-            None => Ok(None),
-            Some(slots) => {
-                match tokio::time::timeout(SLOT_WAIT, slots.clone().acquire_owned()).await {
-                    Ok(Ok(permit)) => Ok(Some(permit)),
-                    _ => Err(UseError::Busy),
-                }
-            }
+            Ok(true) => Ok(permit),
+            Ok(false) | Err(UseError::NotFound) => Err(UseError::Revoked),
+            Err(e) => Err(e),
         }
     }
 }
@@ -192,13 +245,10 @@ pub(crate) const DEVICE_WIRE_URL: &str = "http://metro-device.invalid/v1";
 pub(crate) const DEVICE_WIRE_DIALECT: Dialect =
     Dialect::gateway("metro-device", DEVICE_WIRE_URL, "METRO_DEVICE_UNUSED_KEY");
 
-/// Chat Completions for a shared subscription preset on the caller's *own*
-/// device connection. The device is the caller's, so it is relayed as them
-/// ([`DeviceRelay::complete_as`]); what this adds is the preset's grant,
-/// checked before every request and again before the answer is returned, so
-/// revoking the preset stops further use. Never someone else's device.
+/// Chat Completions with an extra grant check for a subscription preset or
+/// an explicit model selection. The relay still applies its own checks.
 #[derive(Clone)]
-pub struct PresetDeviceTransport {
+pub struct GuardedDeviceTransport {
     pub(crate) relay: DeviceRelay,
     pub(crate) caller: Caller,
     pub(crate) connection: String,
@@ -206,15 +256,15 @@ pub struct PresetDeviceTransport {
     pub(crate) grant: Grant,
 }
 
-impl std::fmt::Debug for PresetDeviceTransport {
+impl std::fmt::Debug for GuardedDeviceTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PresetDeviceTransport")
+        f.debug_struct("GuardedDeviceTransport")
             .field("connection", &self.connection)
             .finish_non_exhaustive()
     }
 }
 
-impl Transport<Chat> for PresetDeviceTransport {
+impl Transport<Chat> for GuardedDeviceTransport {
     fn send(&self, payload: Encoded, exchange: Exchange) -> Opening<WireFrame> {
         let mode = exchange.mode;
         let mut body: Value = match payload.request.body() {
@@ -239,15 +289,41 @@ impl Transport<Chat> for PresetDeviceTransport {
         Opening::new(async move {
             let refused = |e: UseError| RigProviderError::Provider(e.to_string());
             this.grant.admit().await.map_err(refused)?;
-            // Only ever the caller's own connection.
             if this.grant.target != this.connection {
                 return Err(refused(UseError::Revoked));
             }
-            let response = this
-                .relay
-                .complete_as(&this.grant.db, &this.caller, &this.connection, body)
-                .await
-                .map_err(|e| RigProviderError::Provider(e.to_string()))?;
+            let selection = this
+                .grant
+                .turn_check
+                .as_ref()
+                .and_then(|check| check.selection.device.map(|expected| (check, expected)));
+            let response = match selection {
+                Some((check, expected)) => {
+                    this.relay
+                        .complete_selected_as(
+                            &this.grant.db,
+                            &this.caller,
+                            &this.connection,
+                            body,
+                            expected,
+                            DeviceClaimGrant {
+                                caller: this.grant.caller.clone(),
+                                space: this.grant.space.clone(),
+                                chosen: this.grant.chosen.clone(),
+                                target: this.grant.target.clone(),
+                                model: check.selection.model_id.clone(),
+                                config_rev: check.selection.config_rev,
+                            },
+                        )
+                        .await
+                }
+                None => {
+                    this.relay
+                        .complete_as(&this.grant.db, &this.caller, &this.connection, body)
+                        .await
+                }
+            }
+            .map_err(|e| RigProviderError::Provider(e.to_string()))?;
             // Revoked while the device worked: the answer is withheld.
             this.grant.admit().await.map_err(refused)?;
             Ok(match mode {

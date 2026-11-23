@@ -3,12 +3,13 @@
 //! and a foreign, missing or malformed choice is refused before anything is
 //! stored or any model is called. Nothing falls back.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::Json;
 use axum::http::HeaderMap;
-use axum::routing::post;
+use axum::routing::{get, post};
 use base64::Engine;
 use metro_server::auth::{AuthFailure, AuthFuture, HumanAuth, UserIdentity};
 use metro_server::db::Db;
@@ -48,38 +49,61 @@ impl HumanAuth for FakeAuth {
 struct Endpoint {
     base_url: String,
     calls: Arc<Mutex<Vec<Option<String>>>>,
+    model_ids: Arc<Mutex<Vec<String>>>,
+    listings: Arc<AtomicUsize>,
 }
 
 impl Endpoint {
     async fn start(reply: &'static str) -> Self {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let seen = calls.clone();
-        let app = axum::Router::new().route(
-            "/v1/chat/completions",
-            post(move |headers: HeaderMap, Json(body): Json<Value>| {
-                let seen = seen.clone();
-                async move {
-                    seen.lock().unwrap().push(
-                        headers
-                            .get("authorization")
-                            .map(|v| v.to_str().unwrap().to_owned()),
-                    );
-                    Json(json!({
-                        "id": "c", "object": "chat.completion", "created": 0,
-                        "model": body["model"],
-                        "choices": [{"index": 0, "finish_reason": "stop",
-                                     "message": {"role": "assistant", "content": reply}}],
-                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
-                    }))
-                }
-            }),
-        );
+        let model_ids = Arc::new(Mutex::new(Vec::new()));
+        let ids = model_ids.clone();
+        let listings = Arc::new(AtomicUsize::new(0));
+        let listed = listings.clone();
+        let app = axum::Router::new()
+            .route(
+                "/v1/chat/completions",
+                post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                    let seen = seen.clone();
+                    let ids = ids.clone();
+                    async move {
+                        ids.lock()
+                            .unwrap()
+                            .push(body["model"].as_str().unwrap().to_owned());
+                        seen.lock().unwrap().push(
+                            headers
+                                .get("authorization")
+                                .map(|v| v.to_str().unwrap().to_owned()),
+                        );
+                        Json(json!({
+                            "id": "c", "object": "chat.completion", "created": 0,
+                            "model": body["model"],
+                            "choices": [{"index": 0, "finish_reason": "stop",
+                                         "message": {"role": "assistant", "content": reply}}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                        }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/models",
+                get(move || {
+                    let listed = listed.clone();
+                    async move {
+                        listed.fetch_add(1, Ordering::Relaxed);
+                        Json(json!({"object":"list","data":[{"id":"m-other","object":"model"}]}))
+                    }
+                }),
+            );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Self {
             base_url: format!("http://{addr}/v1"),
             calls,
+            model_ids,
+            listings,
         }
     }
 
@@ -246,6 +270,34 @@ async fn chat_uses_the_chosen_connection_or_the_default_never_another() {
     assert_eq!(default.calls().len(), 1, "the default was not used");
     assert_eq!(chosen.calls(), vec![Some(format!("Bearer {OVERRIDE_KEY}"))]);
 
+    let (status, catalog) = s
+        .send(reqwest::Method::GET, ALICE, "/v1/models/available", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!catalog.contains(OVERRIDE_KEY) && !catalog.contains(&chosen.base_url));
+    let catalog: Value = serde_json::from_str(&catalog).unwrap();
+    let offered = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["connection_id"] == alice_override)
+        .unwrap();
+    assert_eq!(
+        offered["chat_models"],
+        json!([{"id": "m", "reasoning_efforts": []}])
+    );
+    let answer = s
+        .ask(
+            ALICE,
+            json!({
+                "text":"explicit pinned model","invoke_agent":true,
+                "provider_connection_id":alice_override,"model_id":"m"
+            }),
+        )
+        .await;
+    assert_eq!(answer["text"], "from override");
+    assert_eq!(chosen.calls().len(), 2);
+
     // Refused before anything is stored or any model is called.
     let before = s.events(ALICE).await.len();
     let missing = format!("pc_{}", "0".repeat(32));
@@ -279,6 +331,18 @@ async fn chat_uses_the_chosen_connection_or_the_default_never_another() {
             json!({"text": "just a note", "provider_connection_id": alice_override}),
             StatusCode::BAD_REQUEST,
         ),
+        (
+            json!({"text": "@agent x", "provider_connection_id": bobs, "model_id": "m"}),
+            StatusCode::NOT_FOUND,
+        ),
+        (
+            json!({"text": "@agent x", "provider_connection_id": alice_override, "model_id": "m-other"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"text": "@agent x", "provider_connection_id": alice_override, "reasoning_effort": "high"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
     ];
     for (body, want) in refusals {
         let (status, reply) = s.post(ALICE, "/v1/chat/messages", body.clone()).await;
@@ -287,9 +351,52 @@ async fn chat_uses_the_chosen_connection_or_the_default_never_another() {
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(s.events(ALICE).await.len(), before, "nothing stored");
     assert_eq!(default.calls().len(), 1);
-    assert_eq!(chosen.calls().len(), 1);
+    assert_eq!(chosen.calls().len(), 2);
     assert!(
         env.calls().is_empty(),
         "never fell back to the server model"
+    );
+
+    assert_eq!(chosen.listings.load(Ordering::Relaxed), 0);
+    let list_path = format!("/v1/providers/{alice_override}/models");
+    assert_eq!(
+        s.post(BOB, &list_path, json!({})).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let (status, listing) = s.post(ALICE, &list_path, json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{listing}");
+    assert_eq!(listing["models"], json!(["m-other"]));
+    let (status, catalog) = s
+        .send(reqwest::Method::GET, ALICE, "/v1/models/available", None)
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let catalog: Value = serde_json::from_str(&catalog).unwrap();
+    let offered = catalog["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["connection_id"] == alice_override)
+        .unwrap();
+    assert_eq!(
+        offered["chat_models"],
+        json!([
+            {"id":"m","reasoning_efforts":[]}, {"id":"m-other","reasoning_efforts":[]}
+        ])
+    );
+    let answer = s
+        .ask(
+            ALICE,
+            json!({
+                "text":"listed alt","invoke_agent":true,
+                "provider_connection_id":alice_override,"model_id":"m-other"
+            }),
+        )
+        .await;
+    assert_eq!(answer["text"], "from override");
+    assert_eq!(*chosen.model_ids.lock().unwrap(), ["m", "m", "m-other"]);
+    assert_eq!(
+        chosen.listings.load(Ordering::Relaxed),
+        1,
+        "only explicit listing reaches server"
     );
 }

@@ -378,23 +378,29 @@ pub struct AvailableModel {
     /// What it embeds natively, for media connections.
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     pub modalities: &'static [&'static str],
+    /// Selectable chat models in the requested scope. An empty list means
+    /// the chat connection is not presently usable for a new selection.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_models: Option<Vec<super::turn::ChatModel>>,
 }
 
 fn available_entry(
+    state: &AppState,
     conn: &Connection,
     caller: &str,
+    space: Option<&str>,
     row: &Row,
     visibility: Visibility,
 ) -> rusqlite::Result<Option<AvailableModel>> {
     let Some(entry) = catalog::find(&row.provider_id) else {
         return Ok(None);
     };
-    if row.model.is_empty() {
+    if row.model.is_empty() && !(row.user_id == caller && row.capability == Capability::Chat) {
         return Ok(None);
     }
     let owned = row.user_id == caller;
     let preset = !owned && catalog::is_subscription(&row.provider_id);
-    let (runs_on, billing, ready) = if owned {
+    let (runs_on, billing, mut ready) = if owned {
         ("your_connection", "you", None)
     } else if preset {
         (
@@ -404,6 +410,27 @@ fn available_entry(
         )
     } else {
         ("owner_connection", "owner", None)
+    };
+    if row.capability == Capability::SystemOne {
+        ready = Some(match entry.adapter {
+            catalog::Adapter::Device => state.device.status(&row.id).online,
+            catalog::Adapter::SystemOne => state.providers.typed_endpoint(entry, row).is_ok(),
+            _ => false,
+        });
+    }
+    let chat_models = if row.capability == Capability::Chat {
+        let models = match authorize(conn, caller, space, &row.id) {
+            Ok(authorized) => super::turn::models(state, &authorized).unwrap_or_default(),
+            Err(_) => vec![],
+        };
+        // Preserve the omission of unconfigured rows unless the owner has
+        // actual inventory: a live device report or explicit Settings list.
+        if row.model.is_empty() && models.is_empty() {
+            return Ok(None);
+        }
+        Some(models)
+    } else {
+        None
     };
     Ok(Some(AvailableModel {
         connection_id: row.id.clone(),
@@ -421,6 +448,7 @@ fn available_entry(
         is_default: owned && row.is_default,
         media_inputs: entry.media_inputs,
         modalities: entry.modalities,
+        chat_models,
     }))
 }
 
@@ -447,6 +475,7 @@ pub async fn available(
         return Err(no_space());
     }
     let caller = who.id.clone();
+    let catalog_state = state.clone();
     let models = state
         .db
         .call(move |db| {
@@ -459,10 +488,24 @@ pub async fn available(
             let mut out = Vec::new();
             for row in store::list(&conn, &caller)? {
                 let visibility = store::share_of(&conn, &row.id)?.visibility;
-                out.extend(available_entry(&conn, &caller, &row, visibility)?);
+                out.extend(available_entry(
+                    &catalog_state,
+                    &conn,
+                    &caller,
+                    space.as_deref(),
+                    &row,
+                    visibility,
+                )?);
             }
             for (row, visibility) in store::shared_with(&conn, &caller, space.as_deref(), any)? {
-                out.extend(available_entry(&conn, &caller, &row, visibility)?);
+                out.extend(available_entry(
+                    &catalog_state,
+                    &conn,
+                    &caller,
+                    space.as_deref(),
+                    &row,
+                    visibility,
+                )?);
             }
             Ok(Some(out))
         })

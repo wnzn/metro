@@ -553,6 +553,8 @@ pub struct RouteNote {
     pub provider_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     /// A short, human-readable reason.
     pub reason: String,
 }
@@ -563,6 +565,8 @@ pub struct Route {
     /// `None`: the person's default chat connection, or the environment
     /// model when they have none (the behaviour without routing).
     pub connection_id: Option<String>,
+    /// Validated explicit selection, not derived from the route note.
+    pub(crate) turn_selection: Option<crate::providers::turn::TurnSelection>,
     pub note: RouteNote,
     /// Set when the person's routing could not decide (their System One
     /// connection failed, answered malformed, or can no longer be used):
@@ -576,6 +580,7 @@ impl Route {
     pub fn default_for(addressed_by: AddressedBy) -> Self {
         Self {
             connection_id: None,
+            turn_selection: None,
             blocked: None,
             note: RouteNote {
                 source: RouteSource::Default,
@@ -585,6 +590,7 @@ impl Route {
                 connection_id: None,
                 provider_id: None,
                 model_id: None,
+                reasoning_effort: None,
                 reason: "your default chat connection".to_owned(),
             },
         }
@@ -594,6 +600,7 @@ impl Route {
     pub fn chosen(addressed_by: AddressedBy, connection_id: &str) -> Self {
         Self {
             connection_id: Some(connection_id.to_owned()),
+            turn_selection: None,
             blocked: None,
             note: RouteNote {
                 source: RouteSource::Override,
@@ -603,6 +610,7 @@ impl Route {
                 connection_id: Some(connection_id.to_owned()),
                 provider_id: None,
                 model_id: None,
+                reasoning_effort: None,
                 reason: "the model you chose for this message".to_owned(),
             },
         }
@@ -618,6 +626,7 @@ impl Route {
         }
         Self {
             connection_id: parent.connection_id.clone(),
+            turn_selection: parent.turn_selection.clone(),
             blocked: None,
             note,
         }
@@ -852,6 +861,7 @@ pub async fn route_turn(
         let mut route = match &settings.default_chat_id {
             Some(id) if settings.enabled => Route {
                 connection_id: Some(id.clone()),
+                turn_selection: None,
                 blocked: None,
                 note: RouteNote {
                     source: RouteSource::RoutingDefault,
@@ -902,6 +912,7 @@ pub async fn route_turn(
     };
     Route {
         connection_id: Some(case.connection_id.clone()),
+        turn_selection: None,
         blocked: None,
         note: RouteNote {
             source: RouteSource::Case,
@@ -911,6 +922,7 @@ pub async fn route_turn(
             connection_id: Some(case.connection_id.clone()),
             provider_id: None,
             model_id: None,
+            reasoning_effort: None,
             reason: format!(
                 "System One matched the use case \"{}\" (p {:.2})",
                 case.label, answer.probability

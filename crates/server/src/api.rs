@@ -546,6 +546,8 @@ pub struct PostMessage {
     /// organization. Never falls back.
     #[serde(default)]
     provider_connection_id: Option<String>,
+    model_id: Option<String>,
+    reasoning_effort: Option<String>,
     /// Library files of this Space to attach (see [`crate::attachments`]).
     #[serde(default)]
     asset_ids: Vec<String>,
@@ -558,9 +560,17 @@ async fn check_choice(
     who: &Human,
     space: Option<&str>,
     choice: Option<String>,
+    model_id: Option<String>,
+    reasoning_effort: Option<String>,
     addressing: Addressing,
-) -> ApiResult<Option<String>> {
+) -> ApiResult<Option<routing::Route>> {
+    let selecting = model_id.is_some() || reasoning_effort.is_some();
     let Some(id) = choice else {
+        if selecting {
+            return Err(ApiError::bad_request(
+                "model_id and reasoning_effort require provider_connection_id",
+            ));
+        }
         return Ok(None);
     };
     if !crate::providers::api::valid_connection_id(&id) {
@@ -573,6 +583,22 @@ async fn check_choice(
             "provider_connection_id only applies to a message for the agent \
              (@agent or invoke_agent)",
         ));
+    }
+    let mut route = routing::Route::chosen(AddressedBy::Explicit, &id);
+    if selecting {
+        route.turn_selection = Some(
+            crate::providers::turn::check(
+                state,
+                &who.id,
+                space,
+                &id,
+                model_id.as_deref(),
+                reasoning_effort.as_deref(),
+            )
+            .await
+            .map_err(crate::providers::api::use_error)?,
+        );
+        return Ok(Some(route));
     }
     // Another person's unshared connection and a missing one look the same.
     // Other problems with a usable connection are reported by the turn.
@@ -588,7 +614,7 @@ async fn check_choice(
         Err(crate::providers::UseError::Internal) => Err(ApiError::internal(anyhow::anyhow!(
             "checking a model connection"
         ))),
-        _ => Ok(Some(id)),
+        _ => Ok(Some(route)),
     }
 }
 
@@ -663,6 +689,8 @@ pub async fn post_message(
         &who,
         Some(&space.id),
         body.provider_connection_id,
+        body.model_id,
+        body.reasoning_effort,
         addressing,
     )
     .await?;
@@ -700,16 +728,21 @@ pub async fn post_message(
     let Some((addressed_by, settings)) = turn else {
         return Ok((StatusCode::ACCEPTED, Json(event)));
     };
-    let route = routing::route_turn(
-        &state,
-        &who.id,
-        Some(&space.id),
-        &settings,
-        &text,
-        addressed_by,
-        chosen.as_deref(),
-    )
-    .await;
+    let route = match chosen {
+        Some(route) => route,
+        None => {
+            routing::route_turn(
+                &state,
+                &who.id,
+                Some(&space.id),
+                &settings,
+                &text,
+                addressed_by,
+                None,
+            )
+            .await
+        }
+    };
     if let Err(reason) = start_room_run(&state, &space.id, &room, &author, &event, route).await {
         state
             .append(
@@ -924,6 +957,8 @@ pub struct ChatMessage {
     /// their default. Never falls back to the default or the server model.
     #[serde(default)]
     provider_connection_id: Option<String>,
+    model_id: Option<String>,
+    reasoning_effort: Option<String>,
     /// The sender's own personal library files to attach.
     #[serde(default)]
     asset_ids: Vec<String>,
@@ -941,7 +976,16 @@ pub async fn chat_message(
         mentions::resolve(&text, &[], body.invoke_agent, &[]).map_err(ApiError::bad_request)?;
     let addressing = Addressing::of(&resolved);
     agent_needs_text(&text, addressing)?;
-    let chosen = check_choice(&state, &who, None, body.provider_connection_id, addressing).await?;
+    let chosen = check_choice(
+        &state,
+        &who,
+        None,
+        body.provider_connection_id,
+        body.model_id,
+        body.reasoning_effort,
+        addressing,
+    )
+    .await?;
     let (addressed, turn) = dispatch_of(&state, &who, None, &text, &resolved, addressing).await?;
     let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
     let event = if body.asset_ids.is_empty() {
@@ -965,16 +1009,13 @@ pub async fn chat_message(
         // With a choice: only that connection. Otherwise routing, if the
         // sender turned it on, or their default; a connection that cannot
         // be used fails the reply.
-        let route = routing::route_turn(
-            &state,
-            &who.id,
-            None,
-            &settings,
-            &text,
-            addressed_by,
-            chosen.as_deref(),
-        )
-        .await;
+        let route = match chosen {
+            Some(route) => route,
+            None => {
+                routing::route_turn(&state, &who.id, None, &settings, &text, addressed_by, None)
+                    .await
+            }
+        };
         let (state, uid, event) = (state.clone(), who.id.clone(), event.clone());
         tokio::spawn(async move {
             // A turn that cannot start says why in the Chat.

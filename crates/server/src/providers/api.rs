@@ -473,10 +473,12 @@ pub(crate) fn use_error(e: UseError) -> ApiError {
     let status = match e {
         UseError::NotFound => StatusCode::NOT_FOUND,
         UseError::Internal => StatusCode::INTERNAL_SERVER_ERROR,
-        UseError::Unsupported | UseError::WrongCapability { .. } | UseError::MediaUnsupported => {
-            StatusCode::UNPROCESSABLE_ENTITY
-        }
-        UseError::Busy => StatusCode::SERVICE_UNAVAILABLE,
+        UseError::Unsupported
+        | UseError::WrongCapability { .. }
+        | UseError::MediaUnsupported
+        | UseError::TurnModelNotAllowed
+        | UseError::TurnEffortNotAllowed => StatusCode::UNPROCESSABLE_ENTITY,
+        UseError::Busy | UseError::DeviceOffline => StatusCode::SERVICE_UNAVAILABLE,
         UseError::Revoked => StatusCode::FORBIDDEN,
         _ => StatusCode::CONFLICT,
     };

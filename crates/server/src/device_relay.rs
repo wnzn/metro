@@ -150,6 +150,7 @@ const MAX_TOKEN_LEN: usize = 512;
 const MAX_DEVICE_ERROR: usize = 2048;
 /// Most model ids a `models` answer may list, and the longest one.
 const MAX_MODELS: usize = 1000;
+const MAX_APPROVED_MODELS: usize = 64;
 const MAX_MODEL_ID: usize = 256;
 /// Finished job ids remembered to tell duplicates and late results apart
 /// from unknown ids.
@@ -563,6 +564,9 @@ struct Job {
     connection: String,
     generation: u64,
     operation: Operation,
+    /// An explicit turn validated against an upgraded connector's inventory.
+    requires_inventory: bool,
+    claim_grant: Option<Arc<crate::providers::guard::DeviceClaimGrant>>,
     /// The connection's owner when the job was queued.
     owner: String,
     /// Set for borrowed work: the caller that isn't the owner.
@@ -578,6 +582,35 @@ struct Job {
     tx: oneshot::Sender<Result<Value, DeviceError>>,
 }
 
+impl Job {
+    fn inventory_allows(&self, models: Option<&[String]>) -> bool {
+        if self.operation != Operation::Complete {
+            return true;
+        }
+        let Some(request) = &self.request else {
+            return false;
+        };
+        match models {
+            Some(ids) => request["model"]
+                .as_str()
+                .is_some_and(|m| ids.iter().any(|id| id == m)),
+            None => !self.requires_inventory && request["reasoning_effort"].is_null(),
+        }
+    }
+}
+
+fn inventory_changed() -> DeviceError {
+    DeviceError::InvalidRequest(
+        "the device no longer approves that model or reasoning option".into(),
+    )
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ExpectedDevice {
+    pub generation: u64,
+    pub advertised: bool,
+}
+
 #[derive(Default)]
 struct ConnQueue {
     queue: VecDeque<String>,
@@ -585,6 +618,9 @@ struct ConnQueue {
     generation: u64,
     /// Last poll, and the generation it was made with.
     last_seen: Option<(Instant, u64)>,
+    /// Chat model allowlist from the most recent authenticated HTTP poll.
+    /// None means a legacy connector, not an empty allowlist.
+    approved_models: Option<Vec<String>>,
 }
 
 #[derive(Default)]
@@ -684,6 +720,7 @@ impl Inner {
         if generation > q.generation {
             q.generation = generation;
             q.last_seen = q.last_seen.filter(|(_, g)| *g == generation);
+            q.approved_models = None;
             let doomed: Vec<String> = self
                 .jobs
                 .iter()
@@ -732,10 +769,11 @@ fn release(map: &mut HashMap<String, usize>, key: &str, bytes: usize) {
 /// What a device poll found.
 enum Next {
     Ready(ClaimedDeviceJob),
-    /// A borrowed job, marked [`JobState::Checking`], to re-check first.
+    /// A borrowed or explicitly selected job, to re-check first.
     Check {
         id: String,
-        caller: Caller,
+        caller: Option<Caller>,
+        grant: Option<Arc<crate::providers::guard::DeviceClaimGrant>>,
         owner: String,
         operation: Operation,
     },
@@ -855,6 +893,30 @@ impl DeviceRelay {
             .await
     }
 
+    pub(crate) async fn complete_selected_as(
+        &self,
+        db: &Db,
+        caller: &Caller,
+        connection: &str,
+        request: Value,
+        expected: ExpectedDevice,
+        grant: crate::providers::guard::DeviceClaimGrant,
+    ) -> Result<Value, DeviceError> {
+        let request = unary(request)?;
+        let size = metro_model_protocol::json_len(&request);
+        self.dispatch_sized(
+            db,
+            caller,
+            connection,
+            Operation::Complete,
+            request,
+            size,
+            true,
+            Some((expected, grant)),
+        )
+        .await
+    }
+
     /// One System One call on a `device-systemone` connection. The request
     /// is checked before it is queued and the answers against the questions
     /// asked; the result is the normalized response
@@ -936,6 +998,7 @@ impl DeviceRelay {
                 body,
                 size,
                 true,
+                None,
             )
             .await?;
         metro_model_protocol::check_media_response(
@@ -1002,6 +1065,7 @@ impl DeviceRelay {
             request,
             size,
             allow_borrow,
+            None,
         )
         .await
     }
@@ -1017,6 +1081,7 @@ impl DeviceRelay {
         request: Value,
         size: usize,
         allow_borrow: bool,
+        selection: Option<(ExpectedDevice, crate::providers::guard::DeviceClaimGrant)>,
     ) -> Result<Value, DeviceError> {
         let media = operation == Operation::MediaEmbed;
         let cap = if media {
@@ -1074,6 +1139,13 @@ impl DeviceRelay {
                 return Err(DeviceError::CredentialChanged);
             }
             let q = inner.conns.entry(connection.to_owned()).or_default();
+            let expected = selection.as_ref().map(|(expected, _)| *expected);
+            if let Some(expected) = expected
+                && (generation != expected.generation
+                    || expected.advertised != q.approved_models.is_some())
+            {
+                return Err(DeviceError::CredentialChanged);
+            }
             let online = q.last_seen.is_some_and(|(at, g)| {
                 g == generation && at.elapsed() <= self.limits.offline_after
             });
@@ -1095,6 +1167,8 @@ impl DeviceRelay {
                     connection: connection.to_owned(),
                     generation,
                     operation,
+                    requires_inventory: expected.is_some_and(|e| e.advertised),
+                    claim_grant: selection.map(|(_, grant)| Arc::new(grant)),
                     owner: owner.clone(),
                     borrowed: borrowed.then(|| caller.clone()),
                     request: Some(request),
@@ -1230,6 +1304,7 @@ impl DeviceRelay {
         }
         let q = inner.conns.entry(device.connection.clone()).or_default();
         q.last_seen = Some((Instant::now(), device.generation));
+        let approved = q.approved_models.clone();
         let ids: Vec<String> = q.queue.iter().cloned().collect();
         for id in ids {
             let Some(job) = inner.jobs.get_mut(&id) else {
@@ -1240,7 +1315,15 @@ impl DeviceRelay {
                 inner.unqueue(&device.connection, &id);
                 continue;
             }
-            if let Some(caller) = job.borrowed.clone() {
+            // Recheck at claim: a profile may have removed approval since
+            // the message was accepted or since its model was built.
+            if !job.inventory_allows(approved.as_deref()) {
+                inner.fail(&id, Some(inventory_changed()));
+                continue;
+            }
+            let caller = job.borrowed.clone();
+            let grant = job.claim_grant.clone();
+            if caller.is_some() || grant.is_some() {
                 if !borrowed {
                     continue;
                 }
@@ -1250,6 +1333,7 @@ impl DeviceRelay {
                 return Some(Next::Check {
                     id,
                     caller,
+                    grant,
                     owner,
                     operation,
                 });
@@ -1278,25 +1362,37 @@ impl DeviceRelay {
         }
     }
 
-    /// The oldest job for `device`'s connection, marking it claimed. A
-    /// borrowed job is handed out only if its caller is still entitled;
-    /// otherwise it fails with [`DeviceError::AccessRevoked`] and the next
-    /// job is tried.
+    /// The oldest job for `device`'s connection, marking it claimed.
+    /// Recheck access before handing out borrowed or explicitly selected work.
     pub async fn claim_checked(&self, db: &Db, device: &Device) -> Option<ClaimedDeviceJob> {
         loop {
-            let (id, caller, owner, operation) = match self.next_job(device, true)? {
+            let (id, caller, grant, owner, operation) = match self.next_job(device, true)? {
                 Next::Ready(job) => return Some(job),
                 Next::Check {
                     id,
                     caller,
+                    grant,
                     owner,
                     operation,
-                } => (id, caller, owner, operation),
+                } => (id, caller, grant, owner, operation),
             };
-            let ok = self
-                .entitled(db, &caller, &device.connection, &owner, operation)
-                .await;
+            let mut ok = true;
+            if let Some(caller) = caller {
+                ok = self
+                    .entitled(db, &caller, &device.connection, &owner, operation)
+                    .await;
+            }
+            if ok && let Some(grant) = grant {
+                ok = db
+                    .call(move |db| grant.allowed(&db.lock()))
+                    .await
+                    .unwrap_or(false);
+            }
             let mut inner = self.lock();
+            let approved = inner
+                .conns
+                .get(&device.connection)
+                .and_then(|q| q.approved_models.clone());
             let Some(job) = inner.jobs.get_mut(&id) else {
                 continue; // failed or withdrawn meanwhile
             };
@@ -1304,13 +1400,17 @@ impl DeviceRelay {
                 continue;
             }
             if !ok {
-                tracing::debug!(job = %id, "borrowed device job refused at claim: access revoked");
+                tracing::debug!(job = %id, "device job refused at claim: access revoked");
                 inner.fail(&id, Some(DeviceError::AccessRevoked));
+                continue;
+            }
+            if !job.inventory_allows(approved.as_deref()) {
+                inner.fail(&id, Some(inventory_changed()));
                 continue;
             }
             job.state = JobState::Claimed { at: Instant::now() };
             let request = job.request.take().unwrap_or(Value::Null);
-            tracing::debug!(job = %id, ?operation, "borrowed device job claimed");
+            tracing::debug!(job = %id, ?operation, "checked device job claimed");
             return Some(ClaimedDeviceJob {
                 id,
                 operation,
@@ -1359,6 +1459,25 @@ impl DeviceRelay {
         DeviceStatus {
             online: seen.is_some_and(|(at, _)| at.elapsed() <= self.limits.offline_after),
             last_seen_secs: seen.map(|(at, _)| at.elapsed().as_secs()),
+        }
+    }
+
+    /// A live current-generation heartbeat, and its optional local allowlist.
+    pub(crate) fn chat_inventory(&self, connection: &str) -> Option<(u64, Option<Vec<String>>)> {
+        let inner = self.lock();
+        let q = inner.conns.get(connection)?;
+        let (seen, generation) = q.last_seen?;
+        (generation == q.generation && seen.elapsed() <= self.limits.offline_after)
+            .then(|| (generation, q.approved_models.clone()))
+    }
+
+    fn report_inventory(&self, device: &Device, approved_models: Option<Vec<String>>) {
+        let mut inner = self.lock();
+        if inner.observe(&device.connection, device.generation)
+            && let Some(q) = inner.conns.get_mut(&device.connection)
+        {
+            q.approved_models = approved_models;
+            q.last_seen = Some((Instant::now(), device.generation));
         }
     }
 
@@ -1799,12 +1918,47 @@ pub async fn device_token_status(
 }
 
 /// `POST /v1/device/claim`.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DevicePoll {
+    approved_models: Option<Vec<String>>,
+}
+
 pub async fn device_claim(
     State(state): State<AppState>,
     device: Device,
     body: Bytes,
 ) -> Result<Response, ApiError> {
-    empty_object(&body)?;
+    let invalid = || {
+        ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the body must be {} or contain a bounded approved_models array",
+        )
+    };
+    let poll = match body.iter().copied().find(|b| !b.is_ascii_whitespace()) {
+        None => DevicePoll::default(),
+        Some(b'{') => serde_json::from_slice::<DevicePoll>(&body).map_err(|_| invalid())?,
+        Some(_) => return Err(invalid()),
+    };
+    let approved_models = poll
+        .approved_models
+        .map(|mut ids| {
+            if ids.len() > MAX_APPROVED_MODELS
+                || ids.iter().any(|id| {
+                    id.is_empty()
+                        || id.len() > MAX_MODEL_ID
+                        || !crate::providers::api::check_model(id)
+                            .is_ok_and(|checked| checked == *id)
+                })
+            {
+                return Err(invalid());
+            }
+            ids.sort();
+            ids.dedup();
+            Ok(ids)
+        })
+        .transpose()?;
+    state.device.report_inventory(&device, approved_models);
     Ok(match state.device.claim_checked(&state.db, &device).await {
         Some(job) => (StatusCode::OK, Json(job)).into_response(),
         None => StatusCode::NO_CONTENT.into_response(),

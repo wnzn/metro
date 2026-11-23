@@ -126,8 +126,12 @@ impl Server {
     }
 
     async fn claim_job(&self, device: &str) -> Value {
+        self.claim_with_job(device, &json!({})).await
+    }
+
+    async fn claim_with_job(&self, device: &str, poll: &Value) -> Value {
         for _ in 0..200 {
-            let (status, body) = self.claim(device).await;
+            let (status, body) = self.post(device, "/v1/device/claim", poll.clone()).await;
             if status == StatusCode::OK {
                 return body;
             }
@@ -141,6 +145,274 @@ impl Server {
         self.post(device, &format!("/v1/device/jobs/{id}/result"), body)
             .await
     }
+}
+
+#[tokio::test]
+async fn composer_inventory_is_current_generation_owner_scoped_and_pinned_for_presets() {
+    let s = Server::start().await;
+    let (status, connection) = s
+        .post(
+            ALICE,
+            "/v1/providers",
+            json!({
+                "name": "ChatGPT", "provider_id": "device-openai-oauth", "model": "gpt-5.5"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{connection}");
+    let id = connection["id"].as_str().unwrap();
+    let device = s.device_token(ALICE, id).await;
+    let available = |token, path| s.send(reqwest::Method::GET, token, path, None);
+    let path = "/v1/models/available";
+    assert_eq!(
+        available(ALICE, path).await.1["models"][0]["chat_models"],
+        json!([])
+    );
+    assert_eq!(s.claim(&device).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        available(ALICE, path).await.1["models"][0]["chat_models"],
+        json!([{"id":"gpt-5.5","reasoning_efforts":[]}])
+    );
+
+    let poll = json!({"approved_models": ["gpt-6.2-sol", "gpt-5.5", "gpt-4.1"]});
+    let bad = json!({"approved_models": [" padded"]});
+    assert_eq!(
+        s.post(&device, "/v1/device/claim", bad).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        s.post(&device, "/v1/device/claim", poll.clone()).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let models = available(ALICE, path).await.1;
+    assert_eq!(
+        models["models"][0]["chat_models"],
+        json!([
+            {"id": "gpt-4.1", "reasoning_efforts": []},
+            {"id": "gpt-5.5", "reasoning_efforts": ["low", "medium", "high", "xhigh"]},
+            {"id": "gpt-6.2-sol", "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"]}
+        ])
+    );
+    assert!(!models.to_string().contains(&device));
+    assert_eq!(available(BOB, path).await.1["models"], json!([]));
+
+    let (_, space) = s.post(ALICE, "/v1/spaces", json!({"name": "shared"})).await;
+    let sid = space["id"].as_str().unwrap();
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    let messages = format!("{room}/messages");
+    let scoped = format!("{path}?space_id={sid}");
+    assert_eq!(available(BOB, &scoped).await.0, StatusCode::NOT_FOUND);
+    assert_eq!(
+        s.post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/members"),
+            json!({"user_id":"bob"})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    let (status, share) = s
+        .send(
+            reqwest::Method::PUT,
+            ALICE,
+            &format!("/v1/providers/{id}/sharing"),
+            Some(json!({"visibility":"spaces","space_ids":[sid]})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{share}");
+    assert_eq!(available(BOB, path).await.1["models"], json!([]));
+    assert_eq!(
+        available(BOB, &scoped).await.1["models"][0]["chat_models"],
+        json!([])
+    );
+
+    let (_, own) = s
+        .post(
+            BOB,
+            "/v1/providers",
+            json!({
+                "name": "Bob's ChatGPT", "provider_id": "device-openai-oauth", "model": "gpt-5.5"
+            }),
+        )
+        .await;
+    let own_device = s.device_token(BOB, own["id"].as_str().unwrap()).await;
+    s.post(&own_device, "/v1/device/claim", poll.clone()).await;
+    let entries = available(BOB, &scoped).await.1;
+    let preset = entries["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["connection_id"] == id)
+        .unwrap();
+    assert_eq!(
+        preset["chat_models"],
+        json!([
+            {"id":"gpt-5.5","reasoning_efforts":["low","medium","high","xhigh"]}
+        ])
+    );
+    let forged = json!({
+        "text":"@agent not this model", "provider_connection_id":id, "model_id":"gpt-6.2-sol",
+        "reasoning_effort":"high"
+    });
+    assert_eq!(
+        s.post(BOB, &messages, forged.clone()).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        s.post(BOB, "/v1/chat/messages", forged).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let events = format!("{room}/events");
+    assert_eq!(available(BOB, &events).await.1["events"], json!([]));
+
+    let rotated = s.device_token(ALICE, id).await;
+    assert_eq!(
+        available(ALICE, path).await.1["models"][0]["chat_models"],
+        json!([])
+    );
+    assert_eq!(
+        s.post(&device, "/v1/device/claim", poll).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(s.claim(&rotated).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        available(ALICE, path).await.1["models"][0]["chat_models"],
+        json!([{"id":"gpt-5.5","reasoning_efforts":[]}])
+    );
+}
+
+#[tokio::test]
+async fn chosen_device_model_and_effort_reach_each_tool_turn_and_child() {
+    let s = Server::start().await;
+    let (_, connection) = s
+        .post(
+            ALICE,
+            "/v1/providers",
+            json!({
+                "name":"ChatGPT", "provider_id":"device-openai-oauth", "model":"gpt-5.5"
+            }),
+        )
+        .await;
+    let id = connection["id"].as_str().unwrap();
+    let device = s.device_token(ALICE, id).await;
+    let poll = json!({"approved_models":["gpt-5.5","gpt-6.2-sol"]});
+    assert_eq!(
+        s.post(&device, "/v1/device/claim", poll.clone()).await.0,
+        StatusCode::NO_CONTENT
+    );
+    let (_, space) = s.post(ALICE, "/v1/spaces", json!({"name":"threads"})).await;
+    let sid = space["id"].as_str().unwrap();
+    assert_eq!(
+        s.post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/members"),
+            json!({"user_id":"bob"})
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    let messages = format!("{room}/messages");
+    for (text, audience) in [("ordinary", "room"), ("@bob ordinary", "users")] {
+        let (status, event) = s.post(ALICE, &messages, json!({"text": text})).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{event}");
+        assert_eq!(event["audience"], audience);
+    }
+    for (bad, expected) in [
+        (
+            json!({"text":"@agent no pinned connection","model_id":"gpt-6.2-sol"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"text":"@bob only","provider_connection_id":id,"model_id":"gpt-6.2-sol"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"text":"unaddressed","provider_connection_id":id,"model_id":"gpt-6.2-sol"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"text":"@agent forged","provider_connection_id":id,"model_id":"gpt-6.2-astra"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"text":"@agent wrong effort","provider_connection_id":id,"model_id":"gpt-6.2-sol","reasoning_effort":"none"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        assert_eq!(s.post(ALICE, &messages, bad).await.0, expected);
+    }
+    let (_, events) = s
+        .send(reqwest::Method::GET, ALICE, &format!("{room}/events"), None)
+        .await;
+    assert_eq!(events["events"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        s.post(&device, "/v1/device/claim", poll.clone()).await.0,
+        StatusCode::NO_CONTENT
+    );
+
+    let (status, event) = s
+        .post(
+            ALICE,
+            &messages,
+            json!({
+                "text":"@agent @bob please start a child", "provider_connection_id":id,
+                "model_id":"gpt-6.2-sol", "reasoning_effort":"xhigh"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{event}");
+    assert_eq!(event["audience"], "mixed");
+    let mut saw_child = false;
+    let mut saw_tool_result = false;
+    for step in 0..3 {
+        let job = s.claim_with_job(&device, &poll).await;
+        let req = &job["request"];
+        assert_eq!(job["operation"], "complete");
+        assert_eq!(req["model"], "gpt-6.2-sol");
+        assert_eq!(req["reasoning_effort"], "xhigh");
+        let parent = req["tools"].as_array().is_some_and(|tools| {
+            tools
+                .iter()
+                .any(|t| t["function"]["name"] == "thread_create")
+        });
+        let (message, finish) = if step == 0 {
+            assert!(parent);
+            (
+                json!({"role":"assistant", "content":null,"tool_calls":[{
+                    "id":"call_1","type":"function","function":{
+                        "name":"thread_create",
+                        "arguments":json!({"name":"research","task":"do the child task"}).to_string()
+                    }
+                }]}),
+                "tool_calls",
+            )
+        } else {
+            if parent {
+                saw_tool_result = req["messages"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["role"] == "tool");
+            } else {
+                saw_child = req.to_string().contains("do the child task");
+            }
+            (json!({"role":"assistant","content":"done"}), "stop")
+        };
+        let reply = json!({"ok":true,"response":{
+            "id":"fixture","object":"chat.completion","created":0,"model":req["model"],
+            "choices":[{"index":0,"finish_reason":finish,"message":message}]
+        }});
+        assert_eq!(
+            s.result(&device, job["id"].as_str().unwrap(), reply)
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+    }
+    assert!(saw_child && saw_tool_result);
 }
 
 #[tokio::test]
@@ -366,15 +638,44 @@ async fn devices_are_personal() {
 async fn typed_device_connections_serve_decide_and_embed_over_http() {
     use metro_server::device_relay::{Caller, DeviceError};
     let s = Server::start().await;
-    let so = s.connection(ALICE, "device-systemone").await;
+    let (status, connection) = s
+        .post(
+            ALICE,
+            "/v1/providers",
+            json!({
+                "name":"Typed fixture", "provider_id":"device-systemone", "model":"jev-latest"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{connection}");
+    let so = connection["id"].as_str().unwrap().to_owned();
     let emb = s.connection(ALICE, "device-embeddings").await;
     let chat = s.connection(ALICE, "device-openai-compatible").await;
     let so_device = s.device_token(ALICE, &so).await;
     let emb_device = s.device_token(ALICE, &emb).await;
     let chat_device = s.device_token(ALICE, &chat).await;
+    let ready = |online| {
+        let (s, so) = (&s, so.as_str());
+        async move {
+            let (status, catalog) = s
+                .send(reqwest::Method::GET, ALICE, "/v1/models/available", None)
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            let entry = catalog["models"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["connection_id"] == so)
+                .unwrap();
+            assert_eq!(entry["ready"], online);
+            assert!(entry.get("chat_models").is_none());
+        }
+    };
+    ready(false).await;
     for d in [&so_device, &emb_device, &chat_device] {
         assert_eq!(s.claim(d).await.0, StatusCode::NO_CONTENT);
     }
+    ready(true).await;
     let alice = Caller::personal("alice");
     let request = json!({"model": "jev-latest", "state": "Charged twice.",
         "questions": {"billing": {"type": "noul", "instructions": "Is this about billing?"}}});
