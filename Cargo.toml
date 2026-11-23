@@ -6,6 +6,7 @@ members = [
     "crates/model-protocol",
     "crates/runner",
     "crates/server",
+    "crates/tui",
 ]
 resolver = "3"
 
