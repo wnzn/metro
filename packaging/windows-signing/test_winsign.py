@@ -7,12 +7,14 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import shutil
 import stat
 import struct
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 import zipfile
 
 HERE = Path(__file__).resolve().parent
@@ -459,6 +461,77 @@ def jobs(text):
     body = text.split("\njobs:\n", 1)[1]
     parts = re.split(r"(?m)^  ([a-z][a-z0-9-]*):\n", body)
     return dict(zip(parts[1::2], parts[2::2]))
+
+
+class SeedSources(unittest.TestCase):
+    def test_branded_inventory_uses_checkout_icon_font_and_licenses(self):
+        package = winsign.package
+        source = package.RENDERER_SOURCE
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            nsh = root / "ui/nsh"
+            licenses = root / "licenses"
+            licenses.mkdir()
+            exes = winsign.REQUIRED_EXES
+            version = "1.2.3"
+
+            package.copy(package.app_icon("metro.ico"), root / package.WINDOWS_ICON)
+            for module in package.ICON_MODULES:
+                text = (source / "src/ui" / module).read_text(encoding="utf-8")
+                for name in re.findall(r'\./icons/([a-z0-9-]+\.svg)', text):
+                    rel = Path("src/ui/icons") / name
+                    package.copy(source / rel, nsh / "assets" / rel)
+            font = nsh / "assets" / package.INTER_FONT
+            package.copy(source / package.INTER_FONT, font)
+            (nsh / "app.json").write_text(json.dumps({"name": "Metro", "id": package.APP_ID, "version": version}))
+            cap = package.read_json(source / "nsh.json")["capabilities"]
+            cap = {**cap, "network": {"http": [], **cap["network"]},
+                   "process": {"execute": [], "exit": False, **cap["process"]}}
+            (nsh / "capabilities.json").write_text(json.dumps(cap))
+            (nsh / "bundle.nshc").write_bytes(b"fixture bundle")
+            (root / "START.txt").write_bytes(b"fixture instructions")
+            for rel in exes:
+                (root / rel).write_bytes(b"MZ" + rel.encode())
+            apache = b"fixture NSH license"
+            (licenses / "NSH-LICENSE-APACHE.txt").write_bytes(apache)
+            (licenses / "THIRD-PARTY-NOTICES.txt").write_bytes(b"fixture third-party notices")
+            (licenses / "METRO-LICENSE.txt").write_bytes(b"fixture optional license")
+            brand = (source / "src/ui/icons/LICENSE-brand-marks.txt").read_text(encoding="utf-8")
+            (licenses / "BRAND-MARKS.txt").write_bytes(brand.replace("\n", "\r\n").encode())
+            package.write_inter_notice(root)
+            ofl = licenses / "INTER-OFL.txt"
+
+            def verify():
+                # Rehash even altered inputs: RELEASE.json is not a trusted license or asset pin.
+                files = {rel: winsign.sha256_file(path) for rel, path in winsign.tree_files(root).items()}
+                manifest = {"version": version, "files": files, "dependencies": dict.fromkeys(exes, ["kernel32.dll"])}
+                winsign.check_sources(root, manifest, exes)
+
+            with patch.object(package, "pe", return_value=["kernel32.dll"]), \
+                    patch.object(package, "NSH_LICENSE_SHA", winsign.sha256_bytes(apache)), \
+                    patch.object(winsign, "STOCK_RENDERER_SHA256", winsign.sha256_file(root / "ui/Metro.exe")):
+                verify()
+                (licenses / "METRO-LICENSE.txt").unlink()
+                verify()
+                ofl.write_bytes(b"wrong OFL")
+                with self.assertRaisesRegex(winsign.Failure, "unexpected Inter license"):
+                    verify()
+                ofl.unlink()
+                with self.assertRaisesRegex(winsign.Failure, r"missing \['licenses/INTER-OFL.txt'\]"):
+                    verify()
+                package.write_inter_notice(root)
+                extra = licenses / "extra.txt"
+                extra.touch()
+                with self.assertRaisesRegex(winsign.Failure, r"extra \['licenses/extra.txt'\]"):
+                    verify()
+                extra.unlink()
+                (licenses / "BRAND-MARKS.txt").write_bytes(b"wrong brand notice")
+                with self.assertRaisesRegex(winsign.Failure, "brand notice differs"):
+                    verify()
+                (licenses / "BRAND-MARKS.txt").write_bytes(brand.encode())
+                font.write_bytes(b"wrong font")
+                with self.assertRaisesRegex(ValueError, "unexpected Inter font digest"):
+                    verify()
 
 
 class ReleaseContext(unittest.TestCase):

@@ -51,6 +51,8 @@ SCRIPTS = ("install-metro-windows.ps1", "metro-runner-container.ps1")
 STOCK_RENDERER_SHA256 = package.NSH_APPS["windows"][1]
 ICON_FRAMES = 7
 NSH_DIR_ENTRIES = {"app.json", "bundle.nshc", "capabilities.json", "assets", "icon.ico"}
+SEED_LICENSES = {"NSH-LICENSE-APACHE.txt", "INTER-OFL.txt", "BRAND-MARKS.txt", "THIRD-PARTY-NOTICES.txt"}
+OPTIONAL_SEED_LICENSE = "METRO-LICENSE.txt"
 MANIFEST_KEYS = {"connector", "dependencies", "files", "kind", "local_runner", "nsh", "target", "version"}
 # Anything that Windows could execute or load, judged by name. Every member is
 # also checked for an MZ header, so a renamed PE is caught too.
@@ -657,10 +659,21 @@ def check_sources(root, manifest, exes):
                 "process": {"execute": [], "exit": False, **declared["process"]}}
     require(json.dumps(package.read_json(nsh / "capabilities.json"), sort_keys=True) == json.dumps(expected, sort_keys=True),
             "ui/nsh/capabilities.json differs from apps/desktop/nsh.json")
-    package.nsh_assets(nsh / "assets", package.RENDERER_SOURCE)
+    assets = package.nsh_assets(nsh / "assets", package.RENDERER_SOURCE)
+    required = {*exes, "START.txt"} | {f"ui/nsh/{name}" for name in NSH_DIR_ENTRIES - {"assets"}}
+    required |= {f"ui/nsh/assets/{path.as_posix()}" for path in assets}
+    required |= {f"licenses/{name}" for name in SEED_LICENSES}
+    files = set(manifest["files"])
+    missing = sorted(required - files)
+    extra = sorted(files - required - {f"licenses/{OPTIONAL_SEED_LICENSE}"})
+    require(not missing and not extra, f"unexpected seed inventory: missing {missing}, extra {extra}")
     require(sha256_file(root / "licenses/NSH-LICENSE-APACHE.txt") == package.NSH_LICENSE_SHA, "unexpected NSH license")
-    brand = package.RENDERER_SOURCE / "src/ui/icons/LICENSE-brand-marks.txt"
-    require(sha256_file(root / "licenses/BRAND-MARKS.txt") == sha256_file(brand), "brand notice differs from source")
+    require(sha256_file(root / "licenses/INTER-OFL.txt") == package.INTER_OFL_SHA, "unexpected Inter license")
+    brand = package.brand_notice(package.RENDERER_SOURCE, assets)
+    # The seed's notice is copied from a native Windows checkout, which can use CRLF.
+    source_brand = brand.read_bytes().replace(b"\r\n", b"\n")
+    actual_brand = (root / "licenses/BRAND-MARKS.txt").read_bytes()
+    require(actual_brand in (source_brand, source_brand.replace(b"\n", b"\r\n")), "brand notice differs from source")
 
 
 def extract(archive, members, root, dest):
