@@ -264,8 +264,9 @@ your deployment. Metro has no built-in default other than loopback.
 Download the desktop build for your system from the Releases page.
 Per-user installers for the desktop and the runner, including the Linux
 library check (`--install-deps` is opt-in), are described in
-[docs/install.md](docs/install.md). They're source only until a tested
-release.
+[docs/install.md](docs/install.md). The Linux ones passed in a local test
+cut on Debian 13 and CachyOS; none is released or signed, and the Windows,
+macOS and container ones haven't been run in a recorded test.
 
 - **Linux:** extract `Metro-<version>-linux-x64.tar.gz` and start its
   launcher. Needs glibc ≥ 2.39, GTK ≥ 4.14, WebKitGTK 6.0 and the GStreamer

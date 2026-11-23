@@ -31,8 +31,10 @@ Check each download against the `.sha256` file published beside it. The
 
 Per-user installer scripts for Linux, Windows and macOS (preview), which
 check the download, add a menu entry and optionally install Linux
-libraries, are described in [docs/install.md](../../docs/install.md). They're
-in the source, not yet in a tested or published download.
+libraries, are described in [docs/install.md](../../docs/install.md). The
+Linux installer passed in a local test cut on Debian 13 and CachyOS
+([acceptance](../../docs/acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)). None is published or
+signed, and the Windows and macOS ones haven't been run in a recorded test.
 
 In 0.2.0, the first screen, **Connect to Metro**, offers two choices:
 
@@ -152,9 +154,11 @@ They never stand in for each other.
 | Tools | List and read | List and read | List and read; check and MCP when configured ([runners.md](../../docs/runners.md)) |
 | Runs while | Metro is open | Metro is open and signed in to its local workspace | Its process or container runs |
 
-**The app's personal runner** (source only: `baff3f0`, `e0982d7`, installers
-at `fb7cb06`, Settings screen at `57409bb`; tested against a real local
-server with two Spaces in automated tests only; no tested download yet).
+**The app's personal runner** (`baff3f0`, `e0982d7`, installers at
+`fb7cb06`, Settings screen at `57409bb`; checked in the native GTK app on
+Debian 13 in the local
+[57409bb setup cut](../../docs/acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local), with
+scripted models; not released, and not checked on Windows or macOS).
 Installing and recovery are in [docs/install.md](../../docs/install.md#the-desktops-own-runner).
 
 - It's created only if the desktop installer left its `enable-local-runner`
@@ -261,8 +265,8 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   - With no chat models at all, the picker offers **Model providers** to
     set one up. **Fetch models from …** asks your own server-stored
     connection for its list.
-  - Since `93d7968` (source only; no packaged or native check recorded
-    yet), the searchable list is grouped by provider, under its name and
+  - Since `93d7968` (checked in the native GTK app on Debian 13 in the
+    local 57409bb setup cut; not released), the searchable list is grouped by provider, under its name and
     bundled mark (OpenAI, Anthropic and Gemini first, custom endpoints
     last). Each row shows the model, the connection's name and the levels
     the server advertised for it. Thinking levels are inline choices, and
@@ -502,8 +506,9 @@ contributors only, in
   Local tools in **Use locally** need no runner.
 - **Metro's own errors on this computer** (current source after 0.2.0:
   `322dc9b`, with Sign in with ChatGPT details from `9144e1c` and
-  `38749f3`; covered by automated tests, in no recorded test cut, no
-  real-account run). The packaged app keeps a
+  `38749f3`; covered by automated tests. In the local 57409bb setup cut its
+  view opened natively on Debian 13, but no failure was injected into it;
+  no real-account run). The packaged app keeps a
   short private list of its own failures on this computer: the launcher or
   window failing to start (including exit status 127, usually a missing
   library), the bundled local server stopping, and the device connection
@@ -523,8 +528,9 @@ contributors only, in
     (`~/.config/metro-desktop` on Linux, `%LOCALAPPDATA%\Metro\Desktop` on
     Windows). The app reads it through the launcher's local service, which
     refuses requests without the app's own credential.
-  - Since `5f4463e` (source only; no packaged or native check recorded),
-    **Settings → Monitoring** shows one source at a time, never combined:
+  - Since `5f4463e` (checked in the native GTK app on Debian 13 in the
+    local 57409bb setup cut, except an injected device-local failure; not
+    released), **Settings → Monitoring** shows one source at a time, never combined:
     **This computer** (this list), **Your account on this server** (your
     personal Chat's events, only you), **Spaces you own** (one Space), and
     **Organization** for org admins. A server or helper too old to support

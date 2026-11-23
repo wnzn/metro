@@ -237,9 +237,9 @@ A room's agent can delegate work to **child threads** with the tools
 
 **Status.** In the current source after 0.2.0 (`797eac1`, with the personal
 scope added in `c5e2753`), covered by the server's automated tests
-(`crates/server/tests/monitoring.rs`). It's in no recorded test cut or
-release yet. The desktop's **Settings → Monitoring** reads it since
-`5f4463e`, in source only.
+(`crates/server/tests/monitoring.rs`), and checked through the desktop's
+**Settings → Monitoring** in the native GTK app on Debian 13 in the local
+[57409bb setup cut](acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local). It isn't released.
 
 The server keeps a short log of things that went wrong, so a Space's owner,
 a person, or an operator can see that something failed without anyone

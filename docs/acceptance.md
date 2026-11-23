@@ -3,6 +3,131 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Staged: installers and setup at 57409bb (2026-11-23, project manager, local)
+
+A frozen local integration cut, **not a release**. Nothing was published or
+signed. Later work (an MSI installer, a text-mode installer, Authenticode,
+notarization, signed manifests or images) is **not** in this cut.
+
+**Source.** `57409bb309ee4169c9a2dbeae9ead5c81533bbc6`, with installer
+scripts as of `fb7cb06`. The backend was gated at `6392af4`, whose
+`Cargo.toml`, `Cargo.lock`, `crates/` and `tests/e2e/` are identical to this
+cut.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt`, build, clippy | Pass |
+| Rust tests | **657 passed**, 0 failed, 2 ignored on purpose |
+| e2e scripts | 8/8: smoke, threads, settings, device_connector, intelligence, schedules, library, attachments |
+| Desktop: `nsh check`, release build | Pass |
+| Desktop `nsh test` | **351/351**, with 0 failures, errors or skips. The first full run had one isolated timeout (a QuickPreview test whose held read didn't park in time); the recheck passed in full |
+
+**Local files** (not release files), in `dist/setup-testing/57409bb309ee/`
+with `SHA256SUMS` (all nine checked OK):
+
+| File | SHA-256 |
+| --- | --- |
+| `Metro-0.2.0-setup-57409bb309ee-linux-x64.tar.gz` | `3937e9dda2148f0d98dcb90f7b87e40adc9eeb62496b44e52abdabefa8ed32cc` |
+| `Metro-0.2.0-setup-57409bb309ee-windows-x64.zip` (unsigned) | `fc9680aacab6679fad7903d78247f05f1481a01fe47175c727c4eef3df20771b` |
+| `Metro-runner-0.2.0-setup-57409bb309ee-linux-x64.tar.gz` | `6bb85470ae2c4d4ebefd4559516761b49e275acbc77914ca057ec5d4aed64a2c` |
+
+The six installer scripts sit beside them, each with its own checksum.
+
+**Linux installers, in isolated containers, on Debian 13 and CachyOS:**
+
+- `install-metro-linux.sh` and `install-metro-runner-linux.sh` both
+  installed, and upgraded a distinct baseline built from the same source to
+  the final archive. Both refused a wrong archive checksum.
+- An opted-out runner choice survived the upgrade. A default install left
+  the empty `enable-local-runner` marker. Removal kept data and
+  configuration.
+- The runner's `doctor` refused a token file with the wrong mode, and
+  passed once that was fixed. The user service unit was written and
+  removed; it wasn't started.
+- **CachyOS** (a real CachyOS userland image, real offline `pacman` with a
+  trusted signature policy): with WebKitGTK missing, the installer refused
+  and changed no packages. With `--install-deps` it installed the resolved
+  package transaction, and afterwards `ldd` found no missing libraries.
+  **No GUI was run on CachyOS.**
+
+**Native GTK on Debian 13, from the installed archive.** This ran in an
+isolated read-only root with loopback-only networking, scripted model
+endpoints and synthetic accounts:
+
+- **The desktop's own runner, opted out:** no registered runner existed,
+  before or after a restart.
+- **The desktop's own runner, opted in** (installed with `--local-runner`):
+  - **Settings › Runners** showed it online, with the same runner ID after
+    a restart. Two new Spaces started unattached.
+  - Attaching it to one Space left the other unattached, until it too was
+    attached explicitly. Each Space's Demo and agent `workspace.read` saw
+    only that Space's own files.
+  - After it was detached from one Space, that Space got no new tool
+    result, while the other still did.
+  - A second bundled server reached from the same app got no local runner.
+  - Another member couldn't attach the owner's personal runner (403 in the
+    owner's Space, 404 in their own).
+- **Monitoring in Settings:** the This computer, My Chat, Space and
+  Organization sources were each selected natively.
+  - A failed turn in one Space appeared only in that Space, not in the
+    other Space or in My Chat.
+  - A failed personal turn appeared only in its owner's My Chat.
+  - Member and outsider reads of a Space were refused (403, 404), and
+    asking for another person's personal events was rejected.
+  - Both kinds of event survived a server restart.
+- **Composer:**
+  - **Grouping:** the grouped picker showed Default on its own, then two
+    providers offering the same model ID. A connection that couldn't be used
+    had nothing to pick.
+  - **Personal Chat:** the first question showed **Ask agent ↵** with the
+    closed model and effort, and Return sent exactly that pair.
+  - **Space:** `@bob` alone called no model, and an explicit Ask used the
+    Space's own choice.
+- **Not covered:** sign-out and reopen, an injected device-local failure,
+  screen-reader labels, a real vendor or sign-in, and any CachyOS, Windows or
+  macOS GUI.
+
+**Windows, under Wine 10 only:**
+
+- **Launch:** the unsigned packaged launcher started its renderer window,
+  and the bundled server answered health and sign-in checks (401 anonymous,
+  200 for a synthetic account).
+- **Not verified:** the window was blank, and Wine reported no window icon.
+  `install-metro-windows.ps1` wasn't run on Windows. Native Windows
+  rendering, the Windows installer, and the container scripts
+  (`metro-runner-container.sh` / `.ps1`) are **not verified** by this cut.
+
+**Optional: container images, local only.** Server and runner images for
+`linux/amd64` were built from `git archive` of this commit with the
+repository's Dockerfile, under local test tags:
+
+- server manifest `sha256:97fb387d0cab39324eb63d7ec6fe89794f7ad15db0b22724a5e3115fccc8010b`
+- runner manifest `sha256:7ee310575dc5fdf13133181fdf9c799a2008d245e7e7d782ea483ea20a2fa373`
+
+One smoke on those exact digests passed:
+
+- health check, and 401 for an anonymous caller, an unknown bearer and an
+  unknown runner;
+- 404 for outsiders;
+- claim and result for a dedicated runner, and for a registered runner in
+  two Spaces;
+- non-root users, a read-only root filesystem and no published ports;
+- no token in `docker inspect` or the logs.
+
+They're **unsigned and not in GHCR**. The saved bundle hasn't been
+smoked again since, arm64 wasn't covered here, and the media image wasn't
+included.
+
+**Receipts**, kept locally outside git:
+- `dist/ui-review/setup/57409bb309ee/` (`backend.json`, `desktop.json`,
+  `nsh.junit.xml`, `installer-qa.txt`, and the native GTK `RECEIPT.md` and
+  assertions);
+- `dist/docker-testing/`.
+
+Earlier failed QA attempts are kept in those receipts; host temporary-file
+exhaustion forced private isolated runtimes, and no frozen binary or
+installer script was changed. The results above are the record.
+
 ## Staged: composer models and Ask from personal Chat at 28ba4e2 (2026-11-23, project manager, local)
 
 A local test cut, **not a release**. Nothing was published, and the
@@ -1312,13 +1437,15 @@ server connection and sign-in weren't tested.
 - A recorded desktop GUI run on a Linux distribution other than Debian 13
   (for example Arch or CachyOS). Their runtime package names are documented
   as troubleshooting only.
-- Monitoring events (`797eac1`, `322dc9b`, `c5e2753`, and the ChatGPT
-  diagnostics of `9144e1c` and `38749f3`) and the app's installer-requested
-  personal runner (`baff3f0`, `e0982d7`) in a packaged build, or with a real
-  account: so far only their automated tests exist in the source.
-- The per-user installers (`fb7cb06`) and the **This computer's runner**
-  screen (`57409bb`) in a tested download, on native Windows, or on macOS.
-  Their documented interface ([install.md](install.md)) is source only.
+- Monitoring and the app's installer-requested personal runner with a real
+  account, or outside the native Debian GTK run of the
+  [57409bb setup cut](#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local). A device-local failure (including the
+  ChatGPT diagnostics of `9144e1c` and `38749f3`) wasn't injected there.
+- The desktop GUI after a CachyOS install: the CachyOS run covered the
+  installer and `--install-deps` only.
+- `install-metro-windows.ps1`, `install-metro-macos.sh` and the
+  `metro-runner-container` scripts in any recorded run, and the desktop on
+  native Windows or macOS.
 - Any tagged CI release, signed build or published GHCR image.
 - Automatic vendor or CLI sign-in from the app, or a real vendor account
   through the in-app device flow. That flow was verified only against a

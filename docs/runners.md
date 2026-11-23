@@ -181,8 +181,8 @@ mkdir -p "$D" && chmod 700 "$D"
 shell history. It does become part of the container's environment: anyone
 who can run `docker inspect` on that container (any Docker administrator on
 the machine) can read it. Treat Docker access as access to the credential.
-The `metro-runner-container` script (source at `fb7cb06`, not yet in a
-tested download; see [install.md](install.md#in-a-container-metro-runner-containersh--ps1))
+The `metro-runner-container` script (at `fb7cb06`; in the local setup cut,
+but not run in any recorded test; see [install.md](install.md#in-a-container-metro-runner-containersh--ps1))
 avoids this: it mounts the token file read-only and keeps the credential
 out of the container's configuration and environment settings. Prefer it
 once it's in a download you've verified.

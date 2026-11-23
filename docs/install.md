@@ -1,14 +1,21 @@
 # Installers: desktop and runners
 
-> **Status: source interface, not a tested download.** Everything on this
-> page describes the per-user installer scripts as they are in the source at
-> commit `fb7cb06` (scripts) and `57409bb` (the desktop's runner screen).
-> Their own automated tests are in `packaging/test_installers.py`. **No
-> release has been published**, and no download containing these scripts
-> has a recorded acceptance run yet; see [acceptance.md](acceptance.md).
-> Until then, treat flags and messages here as the interface the release is
-> built from, not as verified results. Nothing on this page needs a compiler,
-> NSH or a source checkout.
+> **Status: a local test cut, not a release.** This page describes the
+> per-user installer scripts at `fb7cb06` and the desktop's runner screen at
+> `57409bb`. **No release has been published**, and nothing is signed. The
+> local [57409bb setup cut](acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local) recorded:
+>
+> - **Verified locally:** `install-metro-linux.sh` and
+>   `install-metro-runner-linux.sh` on Debian 13 and CachyOS (install,
+>   upgrade, wrong checksum refused, runner choice kept, removal keeps
+>   data). On CachyOS, `--install-deps` repaired a missing WebKitGTK. The
+>   desktop's own runner and its Settings screen were checked in the native
+>   GTK app on Debian 13 only.
+> - **Not verified:** the desktop GUI on CachyOS, `install-metro-windows.ps1`,
+>   `install-metro-macos.sh`, the `metro-runner-container` scripts, and native
+>   Windows or macOS.
+>
+> Nothing on this page needs a compiler, NSH or a source checkout.
 
 Each installer is a single script, planned to be published beside the
 release archives and listed in their `SHA256SUMS`. The final release asset
