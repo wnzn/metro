@@ -54,6 +54,8 @@ jobs:
         run: python3 tests/e2e/schedules.py --bin-dir target/debug --timeout 150
       - name: End-to-end media library test with a local model double
         run: python3 tests/e2e/library.py --bin-dir target/debug --timeout 120
+      - name: Chat attachments survive restart and follow Library access
+        run: python3 tests/e2e/attachments.py --bin-dir target/debug --timeout 60
 
   desktop:
     runs-on: ubuntu-24.04

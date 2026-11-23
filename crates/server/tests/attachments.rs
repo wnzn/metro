@@ -512,6 +512,7 @@ async fn scopes_never_cross_personal_space_or_another_space() {
         )
         .await;
 
+    h.classify_for_alice().await;
     // Personal Chat: only the sender's own personal files.
     for id in [&bobs, &acme_file, &other_file] {
         let (s, v) = h
@@ -553,6 +554,11 @@ async fn scopes_never_cross_personal_space_or_another_space() {
     assert_eq!(s, StatusCode::NOT_FOUND);
     assert!(h.room_events("alice", &acme, "lobby").await.1.is_empty());
     assert!(h.chat_events("alice").await.is_empty());
+    assert_eq!(
+        h.system_one_calls(),
+        0,
+        "rejected messages reached the classifier"
+    );
     assert_eq!(h.link_rows(), (0, 0));
 
     // Outsiders can't post there at all.

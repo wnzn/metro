@@ -157,7 +157,13 @@ fn check_text(state: &AppState, text: &str) -> ApiResult<String> {
 /// A message's text and attachments checked together: the text may be
 /// empty only when files are attached, and the ids must be distinct, at
 /// most [`attachments::MAX_ATTACHMENTS`], and shaped like library ids.
-fn check_message(state: &AppState, text: &str, asset_ids: &[String]) -> ApiResult<String> {
+async fn check_message(
+    state: &AppState,
+    sender: &str,
+    space: Option<&str>,
+    text: &str,
+    asset_ids: &[String],
+) -> ApiResult<String> {
     match attachments::check_ids(asset_ids) {
         Ok(()) => {}
         Err(IdsError::TooMany) => {
@@ -171,10 +177,34 @@ fn check_message(state: &AppState, text: &str, asset_ids: &[String]) -> ApiResul
         }
         Err(IdsError::Unknown) => return Err(no_attachment()),
     }
-    if asset_ids.is_empty() || !text.trim().is_empty() {
-        return check_text(state, text);
+    if !asset_ids.is_empty() && text.trim().is_empty() {
+        return Ok(String::new());
     }
-    Ok(String::new())
+    let text = check_text(state, text)?;
+    // A rejected file must not cause even the message text to be sent to
+    // the opt-in classifier. append_message rechecks inside the write transaction.
+    if !asset_ids.is_empty() {
+        let (ids, user, scope) = (
+            asset_ids.to_vec(),
+            sender.to_owned(),
+            space.map(str::to_owned),
+        );
+        let allowed = db(state, move |db| {
+            for id in &ids {
+                if !crate::library::visible(db, &user, id)?
+                    .is_some_and(|asset| asset.uploader_id == user && asset.space_id == scope)
+                {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        })
+        .await?;
+        if !allowed {
+            return Err(no_attachment());
+        }
+    }
+    Ok(text)
 }
 
 fn no_attachment() -> ApiError {
@@ -610,7 +640,14 @@ pub async fn post_message(
     let Json(body) = body?;
     let space = member_of(&state, &sid, &who).await?;
     let room = room_of(&state, &space, &rid).await?;
-    let text = check_message(&state, &body.text, &body.asset_ids)?;
+    let text = check_message(
+        &state,
+        &who.id,
+        Some(&space.id),
+        &body.text,
+        &body.asset_ids,
+    )
+    .await?;
     let space_id = space.id.clone();
     let member_ids: Vec<String> = db(&state, move |db| db.list_members(&space_id))
         .await?
@@ -898,7 +935,7 @@ pub async fn chat_message(
     body: JsonBody<ChatMessage>,
 ) -> ApiResult<(StatusCode, Json<Event>)> {
     let Json(body) = body?;
-    let text = check_message(&state, &body.text, &body.asset_ids)?;
+    let text = check_message(&state, &who.id, None, &body.text, &body.asset_ids).await?;
     // Personal Chat has no other members: only `@agent` or the flag resolve.
     let resolved =
         mentions::resolve(&text, &[], body.invoke_agent, &[]).map_err(ApiError::bad_request)?;
