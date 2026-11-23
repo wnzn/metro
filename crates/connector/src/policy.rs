@@ -146,14 +146,10 @@ fn valid_id(s: &str) -> bool {
 fn only_keys(obj: &Map<String, Value>, allowed: &[&str], what: &str) -> R<()> {
     for k in obj.keys() {
         if !allowed.contains(&k.as_str()) {
-            return Err(bad(format!("{what}: field '{}' is not allowed", short(k))));
+            return Err(bad(format!("{what}: contains an unsupported field")));
         }
     }
     Ok(())
-}
-
-fn short(s: &str) -> String {
-    s.chars().take(40).filter(|c| !c.is_control()).collect()
 }
 
 fn get_str<'a>(obj: &'a Map<String, Value>, key: &str, what: &str) -> R<Option<&'a str>> {
@@ -177,10 +173,9 @@ fn text_content(v: &Value, what: &str, allow_null: bool) -> R<Value> {
                     .ok_or_else(|| bad(format!("{what}: content parts must be objects")))?;
                 match obj.get("type").and_then(Value::as_str) {
                     Some("text") => {}
-                    Some(t) => {
+                    Some(_) => {
                         return Err(bad(format!(
-                            "{what}: content part type '{}' is not allowed (text only)",
-                            short(t)
+                            "{what}: content part type is not allowed (text only)"
                         )));
                     }
                     None => return Err(bad(format!("{what}: content part has no 'type'"))),
@@ -285,10 +280,7 @@ fn message(v: &Value, i: usize) -> R<Value> {
             out.insert("content".into(), text_content(c, &what, false)?);
         }
         _ => {
-            return Err(bad(format!(
-                "{what}: role '{}' is not allowed",
-                short(role)
-            )));
+            return Err(bad(format!("{what}: role is not allowed")));
         }
     }
     if let Some(n) = get_str(obj, "name", &what)? {
@@ -466,12 +458,39 @@ fn integer(v: &Value, key: &str, min: i64, max: i64) -> R<Value> {
     }
 }
 
+/// Responses wire vocabulary, not a promise that every model accepts all
+/// seven levels. A rejection for the selected model is surfaced by the adapter.
+pub(crate) fn valid_reasoning_effort(v: &Value) -> bool {
+    matches!(
+        v.as_str(),
+        Some("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+    )
+}
+
 /// Check and rebuild a `complete` request. `allowed_models` is the profile's
 /// local allowlist.
 pub fn sanitize_complete(request: &Value, allowed_models: &[String]) -> R<Value> {
+    sanitize_chat(request, allowed_models, false)
+}
+
+/// As [`sanitize_complete`], with options explicitly supported by `kind`.
+pub fn sanitize_complete_for_kind(
+    request: &Value,
+    allowed_models: &[String],
+    kind: Kind,
+) -> R<Value> {
+    sanitize_chat(request, allowed_models, kind == Kind::OpenAiOAuth)
+}
+
+fn sanitize_chat(request: &Value, allowed_models: &[String], reasoning: bool) -> R<Value> {
     let obj = request
         .as_object()
         .ok_or_else(|| bad("'request' must be an object"))?;
+    if !reasoning && obj.contains_key("reasoning_effort") {
+        return Err(bad(
+            "'reasoning_effort' is not supported by this connection",
+        ));
+    }
     only_keys(
         obj,
         &[
@@ -489,6 +508,7 @@ pub fn sanitize_complete(request: &Value, allowed_models: &[String]) -> R<Value>
             "presence_penalty",
             "frequency_penalty",
             "response_format",
+            "reasoning_effort",
             "n",
             "stream",
         ],
@@ -570,6 +590,14 @@ pub fn sanitize_complete(request: &Value, allowed_models: &[String]) -> R<Value>
                 _ => return Err(bad("'stop' must be a string or up to 4 strings")),
             },
             "response_format" => response_format(v)?,
+            "reasoning_effort" => {
+                if !valid_reasoning_effort(v) {
+                    return Err(bad(
+                        "'reasoning_effort' must be none, minimal, low, medium, high, xhigh or max",
+                    ));
+                }
+                v.clone()
+            }
             _ => continue, // handled above
         };
         out.insert(key.clone(), checked);
@@ -740,6 +768,44 @@ mod tests {
         let mut r = ok_request();
         r.as_object_mut().unwrap().remove("model");
         assert!(sanitize_complete(&r, &allowed()).is_err());
+    }
+
+    #[test]
+    fn reasoning_effort_is_preserved_only_for_chatgpt_plan_usage() {
+        use crate::openai_oauth::chat_to_responses;
+        let mut r = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "private prompt"}],
+        });
+        for level in ["none", "minimal", "low", "medium", "high", "xhigh", "max"] {
+            r["reasoning_effort"] = json!(level);
+            let clean = sanitize_complete_for_kind(&r, &allowed(), Kind::OpenAiOAuth).unwrap();
+            assert_eq!(clean["reasoning_effort"], level);
+            assert_eq!(
+                chat_to_responses(&clean).unwrap()["reasoning"]["effort"],
+                level
+            );
+            for kind in [Kind::ClaudeCode, Kind::OpenAiCompatible] {
+                assert!(sanitize_complete_for_kind(&r, &allowed(), kind).is_err());
+            }
+        }
+        for v in [json!("private@example.test"), json!(6), json!({})] {
+            r["reasoning_effort"] = v;
+            let e = sanitize_complete_for_kind(&r, &allowed(), Kind::OpenAiOAuth)
+                .unwrap_err()
+                .to_string();
+            assert!(e.contains("'reasoning_effort' must be"));
+            assert!(!e.contains("private"));
+            assert!(chat_to_responses(&r).is_err());
+        }
+        r["reasoning_effort"] = Value::Null;
+        let clean = sanitize_complete_for_kind(&r, &allowed(), Kind::OpenAiOAuth).unwrap();
+        assert!(
+            chat_to_responses(&clean)
+                .unwrap()
+                .get("reasoning")
+                .is_none()
+        );
     }
 
     #[test]

@@ -126,12 +126,18 @@ pub(crate) fn to_responses(req: &Value) -> Result<Value> {
             bail!("unsupported request field `{k}`");
         }
     }
-    if obj.get("stream").and_then(Value::as_bool) == Some(true) {
+    if obj
+        .get("stream")
+        .is_some_and(|v| !v.is_null() && v.as_bool() != Some(false))
+    {
         bail!(
             "unsupported request field `stream`: this connector returns one completed chat.completion"
         );
     }
-    if obj.get("store").and_then(Value::as_bool) == Some(true) {
+    if obj
+        .get("store")
+        .is_some_and(|v| !v.is_null() && v.as_bool() != Some(false))
+    {
         bail!("unsupported request field `store`: ChatGPT plan usage requires store:false");
     }
     let model = obj
@@ -192,15 +198,13 @@ pub(crate) fn to_responses(req: &Value) -> Result<Value> {
         body.insert("parallel_tool_calls".into(), Value::Bool(p));
     }
     if let Some(e) = obj.get("reasoning_effort").filter(|v| !v.is_null()) {
-        let e = e
-            .as_str()
-            .ok_or_else(|| anyhow!("`reasoning_effort` must be a string"))?;
+        if !crate::policy::valid_reasoning_effort(e) {
+            bail!("`reasoning_effort` must be none, minimal, low, medium, high, xhigh or max");
+        }
         body.insert("reasoning".into(), json!({ "effort": e }));
     }
-    if let Some(rf) = obj.get("response_format").filter(|v| !v.is_null())
-        && let Some(fmt) = response_format(rf)?
-    {
-        body.insert("text".into(), json!({ "format": fmt }));
+    if let Some(rf) = obj.get("response_format").filter(|v| !v.is_null()) {
+        body.insert("text".into(), json!({ "format": response_format(rf)? }));
     }
     Ok(Value::Object(body))
 }
@@ -220,6 +224,9 @@ fn tools(list: &[Value]) -> Result<(Vec<Value>, HashMap<String, Kind>)> {
                 let mut spec = Map::new();
                 spec.insert("type".into(), "function".into());
                 spec.insert("name".into(), name.clone().into());
+                // Responses can normalize omitted strictness and require
+                // optional fields. Keep Chat Completions' non-strict default.
+                spec.insert("strict".into(), Value::Bool(false));
                 for (k, v) in f {
                     match k.as_str() {
                         "name" => {}
@@ -337,9 +344,8 @@ fn message(
             }
             if !text.is_empty() {
                 input.push(json!({
-                    "type": "message",
                     "role": "assistant",
-                    "content": [{ "type": "output_text", "text": text }],
+                    "content": text,
                 }));
             }
             if let Some(tc) = o.get("tool_calls").filter(|v| !v.is_null()) {
@@ -510,10 +516,10 @@ fn user_parts(content: Option<&Value>, i: usize) -> Result<Value> {
     }
 }
 
-fn response_format(rf: &Value) -> Result<Option<Value>> {
+fn response_format(rf: &Value) -> Result<Value> {
     match rf.get("type").and_then(Value::as_str) {
-        Some("text") => Ok(None),
-        Some("json_object") => Ok(Some(json!({ "type": "json_object" }))),
+        Some("text") => Ok(json!({ "type": "text" })),
+        Some("json_object") => Ok(json!({ "type": "json_object" })),
         Some("json_schema") => {
             let js = rf
                 .get("json_schema")
@@ -531,7 +537,7 @@ fn response_format(rf: &Value) -> Result<Option<Value>> {
                     f.insert(k.into(), v.clone());
                 }
             }
-            Ok(Some(Value::Object(f)))
+            Ok(Value::Object(f))
         }
         _ => bail!("unsupported response_format"),
     }
@@ -603,6 +609,9 @@ pub(crate) fn to_chat_completion(r: &Value) -> Result<Value> {
                 "unsupported Responses output item `{other}`; this connector only requests text and function/custom tool calls"
             ),
         }
+    }
+    if text.is_empty() && refusal.is_empty() && tool_calls.is_empty() {
+        bail!("completed response has no public text, refusal or tool calls");
     }
     let mut message = Map::new();
     message.insert("role".into(), "assistant".into());

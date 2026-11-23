@@ -183,7 +183,7 @@ async fn sign_in_list_models_tool_round_and_sign_out() {
     let e = oa::complete_with(&f.profile, &f.ep, tool_request())
         .await
         .unwrap_err();
-    assert!(e.to_string().contains("not signed in"), "{e}");
+    assert!(safe(&e).contains("Sign in again"), "{e}");
 
     // Re-sign-in reuses the issued client and host. There's no name hint and
     // no id_token_hint after sign-out, but login_hint is sent.
@@ -245,7 +245,7 @@ async fn unusable_refresh_clears_tokens_but_keeps_registration() {
     oa::login_with(&f.profile, opts(&f)).await.unwrap();
     f.s.lock().unwrap().refresh_error = Some("invalid_grant");
     let e = oa::models_with(&f.profile, &f.ep).await.unwrap_err();
-    assert!(format!("{e:#}").contains("sign in again"), "{e:#}");
+    assert!(safe(&e).contains("Sign in again"), "{e:#}");
     let st = oa::status(&f.profile).await.unwrap();
     assert!(!st.signed_in && st.registered);
 }
@@ -260,7 +260,8 @@ async fn transient_refresh_failure_keeps_tokens() {
     f.s.lock().unwrap().first_expires_in = 1;
     oa::login_with(&f.profile, opts(&f)).await.unwrap();
     f.s.lock().unwrap().refresh_error = Some("temporarily_unavailable");
-    assert!(oa::models_with(&f.profile, &f.ep).await.is_err());
+    let e = oa::models_with(&f.profile, &f.ep).await.unwrap_err();
+    assert!(safe(&e).contains("temporarily unavailable"), "{e:#}");
     assert!(oa::status(&f.profile).await.unwrap().signed_in);
 }
 
@@ -370,41 +371,6 @@ async fn different_account_cannot_overwrite_registration() {
     );
 }
 
-#[tokio::test]
-async fn stream_failures_are_visible() {
-    let f = fixture(Browser::Approve {
-        sub: "user-1",
-        scope: PLAN_SCOPES,
-    })
-    .await;
-    oa::login_with(&f.profile, opts(&f)).await.unwrap();
-
-    f.s.lock().unwrap().sse_mode = "limit";
-    let e = oa::complete_with(&f.profile, &f.ep, tool_request())
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(
-        e.contains("subscription_sharing_usage_limit_exceeded")
-            && e.contains("chatgpt.com/settings/usage"),
-        "{e}"
-    );
-
-    f.s.lock().unwrap().sse_mode = "truncated";
-    let e = oa::complete_with(&f.profile, &f.ep, tool_request())
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("without response.completed"), "{e}");
-
-    f.s.lock().unwrap().sse_mode = "hosted";
-    let e = oa::complete_with(&f.profile, &f.ep, tool_request())
-        .await
-        .unwrap_err()
-        .to_string();
-    assert!(e.contains("web_search_call"), "{e}");
-}
-
 #[cfg(unix)]
 #[tokio::test]
 async fn profile_must_be_private_and_endpoints_bound() {
@@ -427,7 +393,7 @@ async fn profile_must_be_private_and_endpoints_bound() {
     // A signed-in fixture profile refuses production endpoints, and the other
     // way round.
     let e = oa::models(&f.profile).await.unwrap_err();
-    assert!(e.to_string().contains("different OpenAI issuer"), "{e}");
+    assert!(safe(&e).contains("registration"), "{e}");
 }
 
 #[tokio::test]
@@ -576,8 +542,6 @@ fn metro_and_local(e: &anyhow::Error) -> (String, String) {
 
 #[tokio::test]
 async fn metro_sees_only_fixed_error_categories() {
-    let generic =
-        "the connector could not complete this request (see the connector log on the device)";
     let f = fixture(Browser::Approve {
         sub: "user-1",
         scope: PLAN_SCOPES,
@@ -600,15 +564,25 @@ async fn metro_sees_only_fixed_error_categories() {
     let e = oa::complete_with(&f.profile, &f.ep, r).await.unwrap_err();
     let (metro, local) = metro_and_local(&e);
     assert!(metro.contains("doesn't support"), "{metro}");
-    assert!(local.contains("temperature"), "detail stays local: {local}");
+    assert_eq!(local, metro, "no error detail is logged");
 
-    let cases: &[(&str, Option<&str>)] = &[
-        ("limit", Some("usage limit reached")),
-        ("capability", Some("doesn't support")),
-        ("http503", Some("temporarily unavailable")),
-        ("http403", Some("isn't available for this connection")),
-        ("truncated", Some("temporarily unavailable")),
-        ("http400", None),
+    let cases = [
+        ("limit", "usage limit reached"),
+        ("capability", "doesn't support"),
+        ("reasoning", "rejected the reasoning effort"),
+        ("model_missing", "Refresh the model list"),
+        ("http503", "temporarily unavailable"),
+        ("http403", "isn't available for this connection"),
+        ("http401", "Sign in again on the device"),
+        ("truncated", "ended early or was interrupted"),
+        ("http400", "rejected the ChatGPT request"),
+        ("flat_error", "context limit"),
+        ("incomplete", "shorter answer"),
+        ("filtered", "content filter"),
+        ("bad_completion", "unexpected response"),
+        ("malformed", "unexpected response"),
+        ("non_sse", "unexpected response"),
+        ("hosted", "unexpected response"),
     ];
     for (mode, want) in cases {
         f.s.lock().unwrap().sse_mode = mode;
@@ -616,12 +590,12 @@ async fn metro_sees_only_fixed_error_categories() {
             .await
             .unwrap_err();
         let (metro, local) = metro_and_local(&e);
-        match want {
-            Some(w) => assert!(metro.contains(w), "{mode}: {metro}"),
-            None => assert_eq!(metro, generic, "{mode}"),
-        }
+        assert!(metro.contains(want), "{mode}: {metro}");
+        assert_eq!(metro, local, "{mode}");
         for leak in [
             "SENSITIVE",
+            "https://",
+            "example.test",
             "req_",
             "resp_",
             "weird_code",
@@ -635,12 +609,6 @@ async fn metro_sees_only_fixed_error_categories() {
             );
         }
         assert!(metro.chars().count() <= metro_connector::secret::MAX_SAFE_ERROR);
-        if *mode != "truncated" {
-            assert!(
-                local.contains("SENSITIVE"),
-                "{mode}: local log keeps the detail: {local}"
-            );
-        }
     }
 
     // Model listing uses the same boundary.
@@ -649,4 +617,163 @@ async fn metro_sees_only_fixed_error_categories() {
     o.api_base = format!("{}/missing", f.ep.issuer);
     let e = oa::models_with(&f.profile, &o).await.unwrap_err();
     assert!(!metro_and_local(&e).0.contains("missing"));
+}
+
+#[tokio::test]
+async fn first_rig_chat_through_relay_wire_and_streaming_oauth() {
+    use axum::{Json, Router, extract::Path, http::StatusCode, routing::post};
+    use metro_connector::metro::{Claim, MetroClient};
+    use metro_connector::policy::{sanitize_complete_for_kind, sanitize_response};
+    use metro_connector::profile::{Kind, Profile, ProfileConfig};
+    use metro_connector::{provider::Provider, run::handle_job};
+    use std::sync::{Arc, Mutex};
+
+    let f = fixture(Browser::Approve {
+        sub: "user-1",
+        scope: PLAN_SCOPES,
+    })
+    .await;
+    oa::login_with(&f.profile, opts(&f)).await.unwrap();
+    let available = oa::models_with(&f.profile, &f.ep).await.unwrap();
+    let model = &available[0];
+    // Captured Rig 0.47 device agent turn, after the relay removes
+    // `stream`/`stream_options` and sets the selected model.
+    let turns: Value = serde_json::from_str(include_str!(
+        "../src/claude_code/fixtures/rig_0_47_agent_turns.json"
+    ))
+    .unwrap();
+    let mut request = turns[0].clone();
+    request["model"] = json!(model);
+    request["reasoning_effort"] = json!("max");
+    let mut first = request.clone();
+    first["messages"].as_array_mut().unwrap().drain(1..3);
+    let mut malformed = first.clone();
+    malformed["reasoning_effort"] = json!("private@example.test");
+    let jobs = Arc::new(Mutex::new([first, request, malformed].into_iter()));
+    let result = Arc::new(Mutex::new(None));
+    let relay = Router::new()
+        .route(
+            "/v1/device/claim",
+            post(move || async move {
+                let request = jobs.lock().unwrap().next().unwrap();
+                Json(json!({"id": "first-chat", "operation": "complete", "request": request}))
+            }),
+        )
+        .route(
+            "/v1/device/jobs/{id}/result",
+            post({
+                let result = Arc::clone(&result);
+                move |Path(id): Path<String>, Json(body): Json<Value>| async move {
+                    *result.lock().unwrap() = Some((id, body));
+                    StatusCode::NO_CONTENT
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(listener, relay).await.unwrap() });
+    let client = MetroClient::new(
+        &format!("http://{addr}"),
+        metro_connector::Secret::new("metro_pc_fixturetoken-no-reuse"),
+        Duration::from_secs(5),
+    )
+    .unwrap();
+    for mode in ["first_chat", "eof_completed"] {
+        let Claim::Job(job) = client.claim().await.unwrap() else {
+            panic!("expected the first chat claim");
+        };
+        assert_eq!(job.operation, "complete");
+        let clean =
+            sanitize_complete_for_kind(&job.request, &available, Kind::OpenAiOAuth).unwrap();
+        f.s.lock().unwrap().sse_mode = mode;
+        let raw = oa::complete_with(&f.profile, &f.ep, clean).await.unwrap();
+        let response = sanitize_response(&raw, model).unwrap();
+        assert_eq!(
+            response["choices"][0]["message"]["content"],
+            "Hello, world!"
+        );
+        assert_eq!(response["usage"]["total_tokens"], 15);
+        let sent = f.s.lock().unwrap().responses_bodies.last().unwrap().clone();
+        assert_eq!(sent["input"][0]["role"], "developer");
+        if mode == "first_chat" {
+            assert_eq!(sent["input"].as_array().unwrap().len(), 2);
+            assert_eq!(sent["input"][1]["role"], "user");
+        } else {
+            assert_eq!(
+                sent["input"][2],
+                json!({"role": "assistant", "content": "earlier reply"})
+            );
+        }
+        assert_eq!(sent["tools"][0]["tools"][0]["strict"], false);
+        assert_eq!(sent["reasoning"]["effort"], "max");
+        assert_eq!(sent["stream"], true);
+        assert_eq!(sent["store"], false);
+        assert!(sent.get("previous_response_id").is_none());
+        let body = json!({"ok": true, "response": response});
+        client
+            .post_result(&job.id, &body, Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(*result.lock().unwrap(), Some((job.id, body)));
+    }
+    // The production worker must refuse a malformed setting before it even
+    // tries to load the vendor credentials or contact OpenAI.
+    let Claim::Job(job) = client.claim().await.unwrap() else {
+        panic!("expected the malformed chat claim");
+    };
+    let config = ProfileConfig {
+        version: 1,
+        kind: Kind::OpenAiOAuth,
+        models: available,
+        server_url: format!("http://{addr}"),
+        base_url: None,
+        request_timeout_secs: 5,
+    };
+    let profile = Profile::open(&f._dir.0, "unsigned").unwrap();
+    let provider = Provider {
+        config: &config,
+        profile: &profile,
+    };
+    let error = handle_job(
+        &provider,
+        &job,
+        std::time::Instant::now() + Duration::from_secs(5),
+    )
+    .await;
+    assert_eq!(error["ok"], false);
+    let text = error["error"].as_str().unwrap();
+    assert!(text.contains("'reasoning_effort' must be"), "{text}");
+    assert!(!text.contains("private@example.test"), "{text}");
+    client
+        .post_result(&job.id, &error, Duration::from_secs(5))
+        .await
+        .unwrap();
+    assert_eq!(*result.lock().unwrap(), Some((job.id, error)));
+}
+
+#[tokio::test]
+async fn refresh_scope_change_stops_waiting_calls_before_inference() {
+    let f = fixture(Browser::Approve {
+        sub: "user-1",
+        scope: PLAN_SCOPES,
+    })
+    .await;
+    f.s.lock().unwrap().first_expires_in = 1;
+    oa::login_with(&f.profile, opts(&f)).await.unwrap();
+    f.s.lock().unwrap().refresh_scope = Some("openid profile offline_access");
+    let mut tasks = Vec::new();
+    for _ in 0..8 {
+        let (p, ep) = (f.profile.clone(), f.ep.clone());
+        tasks.push(tokio::spawn(async move {
+            oa::complete_with(&p, &ep, tool_request()).await
+        }));
+    }
+    for task in tasks {
+        let e = task.await.unwrap().unwrap_err();
+        assert!(safe(&e).contains("approve plan usage"), "{e}");
+    }
+    assert!(!oa::status(&f.profile).await.unwrap().plan_usage_enabled);
+    let fx = f.s.lock().unwrap();
+    assert_eq!(fx.refresh_count, 1);
+    assert!(fx.responses_bodies.is_empty());
 }

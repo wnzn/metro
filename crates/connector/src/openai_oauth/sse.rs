@@ -6,11 +6,11 @@
 use std::collections::BTreeMap;
 use std::time::Duration;
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Result, anyhow};
 use serde_json::Value;
 use tokio::time::Instant;
 
-use super::http::{self, Category, categorize, clean, tagged};
+use super::http::{self, Category, categorize, error_code, tagged};
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Limits {
@@ -46,7 +46,7 @@ pub(crate) async fn collect(mut resp: reqwest::Response, limits: Limits) -> Resu
                     anyhow!(
                         "Responses stream stalled or exceeded its time limit before response.completed"
                     ),
-                    Some(Category::Unavailable),
+                    Some(Category::Interrupted),
                 )
             })?
             .map_err(|e| {
@@ -55,14 +55,16 @@ pub(crate) async fn collect(mut resp: reqwest::Response, limits: Limits) -> Resu
                         "Responses stream interrupted before response.completed ({})",
                         http::net(e)
                     ),
-                    Some(Category::Unavailable),
+                    Some(Category::Interrupted),
                 )
             })?;
         let Some(chunk) = chunk else {
-            parser.finish()?;
+            if let Some(done) = parser.finish()? {
+                return Ok(done);
+            }
             return Err(tagged(
                 anyhow!("Responses stream ended without response.completed"),
-                Some(Category::Unavailable),
+                Some(Category::Interrupted),
             ));
         };
         if let Some(done) = parser.feed(&chunk)? {
@@ -76,6 +78,8 @@ pub(crate) struct Parser {
     limits: Limits,
     total: usize,
     line: Vec<u8>,
+    after_cr: bool,
+    first_line: bool,
     data: Vec<u8>,
     event: Option<String>,
     items: BTreeMap<u64, Value>,
@@ -87,6 +91,8 @@ impl Parser {
             limits,
             total: 0,
             line: Vec::new(),
+            after_cr: false,
+            first_line: true,
             data: Vec::new(),
             event: None,
             items: BTreeMap::new(),
@@ -96,31 +102,29 @@ impl Parser {
     pub fn feed(&mut self, bytes: &[u8]) -> Result<Option<Value>> {
         self.total += bytes.len();
         if self.total > self.limits.max_total {
-            bail!("Responses stream exceeded {} bytes", self.limits.max_total);
+            return Err(too_large());
         }
         for &b in bytes {
-            if b == b'\n' {
-                let mut line = std::mem::take(&mut self.line);
-                if line.last() == Some(&b'\r') {
-                    line.pop();
-                }
+            if std::mem::replace(&mut self.after_cr, b == b'\r') && b == b'\n' {
+                continue;
+            }
+            if matches!(b, b'\r' | b'\n') {
+                let line = std::mem::take(&mut self.line);
                 if let Some(v) = self.line_done(&line)? {
                     return Ok(Some(v));
                 }
             } else {
                 self.line.push(b);
                 if self.line.len() > self.limits.max_event {
-                    bail!(
-                        "Responses stream event exceeded {} bytes",
-                        self.limits.max_event
-                    );
+                    return Err(too_large());
                 }
             }
         }
         Ok(None)
     }
 
-    /// Flushes a final event that has no trailing blank line.
+    /// Accepts an EOF directly after a complete terminal JSON event even if
+    /// the peer omitted the final delimiter. A delta or `[DONE]` isn't one.
     pub fn finish(&mut self) -> Result<Option<Value>> {
         if !self.line.is_empty() {
             let line = std::mem::take(&mut self.line);
@@ -132,6 +136,11 @@ impl Parser {
     }
 
     fn line_done(&mut self, line: &[u8]) -> Result<Option<Value>> {
+        let line = if std::mem::take(&mut self.first_line) {
+            line.strip_prefix(b"\xef\xbb\xbf").unwrap_or(line)
+        } else {
+            line
+        };
         if line.is_empty() {
             return self.dispatch();
         }
@@ -147,15 +156,10 @@ impl Parser {
         };
         match field {
             b"data" => {
-                if !self.data.is_empty() {
-                    self.data.push(b'\n');
-                }
                 self.data.extend_from_slice(value);
-                if self.data.len() > self.limits.max_event {
-                    bail!(
-                        "Responses stream event exceeded {} bytes",
-                        self.limits.max_event
-                    );
+                self.data.push(b'\n');
+                if self.data.len() - 1 > self.limits.max_event {
+                    return Err(too_large());
                 }
             }
             b"event" => self.event = Some(String::from_utf8_lossy(value).into_owned()),
@@ -165,7 +169,8 @@ impl Parser {
     }
 
     fn dispatch(&mut self) -> Result<Option<Value>> {
-        let data = std::mem::take(&mut self.data);
+        let mut data = std::mem::take(&mut self.data);
+        data.pop(); // SSE joins data lines with LF and removes the final LF.
         let event_name = self.event.take();
         if data.is_empty() || data == b"[DONE]" {
             return Ok(None);
@@ -175,10 +180,14 @@ impl Parser {
         let kind = v
             .get("type")
             .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or(event_name)
+            .or(event_name.as_deref())
             .unwrap_or_default();
-        match kind.as_str() {
+        if kind == "error" || event_name.as_deref() == Some("error") {
+            return Err(stream_error(
+                v.get("error").filter(|e| e.is_object()).unwrap_or(&v),
+            ));
+        }
+        match kind {
             "response.output_item.done" => {
                 if let (Some(i), Some(item)) =
                     (v.get("output_index").and_then(Value::as_u64), v.get("item"))
@@ -188,72 +197,58 @@ impl Parser {
                 Ok(None)
             }
             "response.completed" => {
-                let mut r = v
+                let r = v
                     .get("response")
+                    .and_then(Value::as_object)
                     .cloned()
                     .ok_or_else(|| anyhow!("response.completed carried no response"))?;
+                let mut r = Value::Object(r);
                 let empty = r
                     .get("output")
-                    .and_then(Value::as_array)
-                    .is_none_or(Vec::is_empty);
+                    .is_none_or(|v| v.is_null() || v.as_array().is_some_and(Vec::is_empty));
                 if empty && !self.items.is_empty() {
                     r["output"] =
                         Value::Array(std::mem::take(&mut self.items).into_values().collect());
                 }
                 Ok(Some(r))
             }
-            "response.failed" => {
-                let e = v.pointer("/response/error").cloned().unwrap_or(Value::Null);
-                Err(stream_error(
-                    "response.failed",
-                    &e,
-                    v.pointer("/response/id"),
-                ))
-            }
+            "response.failed" => Err(stream_error(
+                v.pointer("/response/error").unwrap_or(&Value::Null),
+            )),
             "response.incomplete" => {
-                let reason = v
+                let category = match v
                     .pointer("/response/incomplete_details/reason")
                     .and_then(Value::as_str)
-                    .map(|s| clean(s, 96))
-                    .unwrap_or_else(|| "unknown".into());
-                bail!(
-                    "Responses returned response.incomplete (reason {reason}); no completion was produced"
-                )
-            }
-            "error" => {
-                let e = v.get("error").cloned().unwrap_or_else(|| v.clone());
-                Err(stream_error("stream error", &e, None))
+                {
+                    Some("content_filter") => Category::ContentFilter,
+                    _ => Category::Incomplete,
+                };
+                Err(tagged(
+                    anyhow!("Responses stream reported an incomplete response"),
+                    Some(category),
+                ))
             }
             _ => Ok(None),
         }
     }
 }
 
-/// The detailed local error, tagged by its documented code. The status is
-/// unknown because the stream already returned HTTP 200.
-fn stream_error(what: &str, e: &Value, id: Option<&Value>) -> anyhow::Error {
-    let code = e.get("code").and_then(Value::as_str).map(|s| clean(s, 96));
-    let param = e
-        .get("param")
-        .and_then(Value::as_str)
-        .map(|s| clean(s, 128));
-    let message = e
-        .get("message")
-        .and_then(Value::as_str)
-        .map(|s| clean(s, 300));
-    let f = http::Failure {
-        status: 200,
-        code: code.clone(),
-        param,
-        message,
-        request_id: id.and_then(Value::as_str).map(|s| clean(s, 128)),
-    };
-    // The stream already returned HTTP 200, so the status adds nothing; keep
-    // the code, param, message and hint.
-    let text = f
-        .describe(&format!("Responses ({what})"))
-        .replacen(": HTTP 200", "", 1);
-    tagged(anyhow!(text), categorize(None, code.as_deref()))
+fn too_large() -> anyhow::Error {
+    crate::SafeError::new(
+        "The OpenAI response stream is too large for Metro. Ask for a shorter answer and try again.",
+    )
+    .into()
+}
+
+/// A mid-stream error has no separate HTTP status; inspect machine fields only.
+fn stream_error(e: &Value) -> anyhow::Error {
+    tagged(
+        anyhow!("Responses stream reported a failure"),
+        Some(
+            categorize(None, error_code(e), e.get("param").and_then(Value::as_str))
+                .unwrap_or(Category::Rejected),
+        ),
+    )
 }
 
 #[cfg(test)]
@@ -280,14 +275,23 @@ mod tests {
     }
 
     #[test]
+    fn accepts_bom_and_bare_cr() {
+        let mut p = Parser::new(Limits::default());
+        let ev = "\u{feff}: comment\revent: response.completed\rdata: {\"response\":{\"status\":\"completed\",\"output\":[]}}\r\r";
+        let (a, b) = ev.as_bytes().split_at(2);
+        assert!(p.feed(a).unwrap().is_none());
+        assert_eq!(p.feed(b).unwrap().unwrap()["status"], "completed");
+    }
+
+    #[test]
     fn limits_are_enforced() {
         let mut p = Parser::new(small());
         let big = format!("data: {}\n", "x".repeat(100));
         assert!(
             p.feed(big.as_bytes())
                 .unwrap_err()
-                .to_string()
-                .contains("event exceeded")
+                .downcast_ref::<crate::SafeError>()
+                .is_some()
         );
         let mut p = Parser::new(small());
         let e = (0..10)
@@ -296,8 +300,8 @@ mod tests {
         assert!(
             p.feed(e.as_bytes())
                 .unwrap_err()
-                .to_string()
-                .contains("exceeded 256 bytes")
+                .downcast_ref::<crate::SafeError>()
+                .is_some()
         );
     }
 
@@ -305,11 +309,10 @@ mod tests {
     fn error_and_incomplete_events_fail() {
         let mut p = Parser::new(Limits::default());
         let e = p.feed(b"data: {\"type\":\"error\",\"error\":{\"code\":\"subscription_sharing_usage_unavailable\",\"message\":\"m\"}}\n\n").unwrap_err();
-        assert!(format!("{e:#}").contains("subscription_sharing_usage_unavailable"));
         assert_eq!(e.downcast_ref::<Category>(), Some(&Category::Unavailable));
         let mut p = Parser::new(Limits::default());
         let e = p.feed(b"data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n").unwrap_err();
-        assert!(e.to_string().contains("max_output_tokens"));
+        assert_eq!(e.downcast_ref::<Category>(), Some(&Category::Incomplete));
         let mut p = Parser::new(Limits::default());
         assert!(p.feed(b"data: not json\n\n").is_err());
     }

@@ -65,13 +65,9 @@
 //!
 //! # Errors reported to Metro
 //!
-//! Errors from [`models`] and [`complete`] reach Metro only as one of five
-//! fixed texts: sign in again, plan usage not available, usage limit,
-//! unsupported request, or OpenAI unavailable. They're chosen from the HTTP
-//! status, the documented error code, translation, or the transport, never
-//! from response text. Everything else is the connector's generic message.
-//! OpenAI's messages, request IDs and request contents stay in the local
-//! redacted log.
+//! Errors from [`models`] and [`complete`] reach Metro (and the local log)
+//! as fixed recovery text. The adapter can classify known machine-readable
+//! fields, but never reports provider text, IDs or request contents.
 
 mod flow;
 mod http;
@@ -349,19 +345,21 @@ pub async fn complete_with(
 }
 
 /// Errors returned from [`models`] and [`complete`], which the connector
-/// reports to Metro. If the error has a category from the fixed list in
-/// `http::Category`, Metro gets only that category's fixed text, as a
-/// [`crate::SafeError`]. Everything else stays without a `SafeError`, so
-/// Metro shows the connector's generic message. The detailed chain is kept
-/// as context for the device's local, redacted log. Its text may include
-/// OpenAI's error message or request ID, which never leave the device.
+/// reports to Metro. Discard the cause here: the same error is also logged
+/// locally, and redacting credential shapes isn't enough to remove prompts,
+/// arbitrary fields, or personal information.
 fn for_metro(e: anyhow::Error) -> anyhow::Error {
-    match e.downcast_ref::<http::Category>().copied() {
-        Some(c) => {
-            anyhow::Error::new(crate::SafeError::new(c.user_text())).context(format!("{e:#}"))
-        }
-        None => e,
-    }
+    let safe = e
+        .downcast_ref::<crate::SafeError>()
+        .cloned()
+        .unwrap_or_else(|| {
+            let category = e
+                .downcast_ref::<http::Category>()
+                .copied()
+                .unwrap_or(http::Category::UnexpectedResponse);
+            crate::SafeError::new(category.user_text())
+        });
+    safe.into()
 }
 
 /// The local sign-in state. It reads no tokens out and makes no network calls.

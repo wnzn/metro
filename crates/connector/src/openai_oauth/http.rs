@@ -1,5 +1,4 @@
-//! HTTP plumbing: endpoint policy, bounded bodies, and error messages that
-//! keep status, code, param and request ID without leaking credentials.
+//! HTTP plumbing: endpoint policy, bounded bodies and safe error categories.
 
 use std::time::Duration;
 
@@ -13,17 +12,27 @@ pub(crate) const MAX_JSON: usize = 4 << 20;
 
 /// The only reasons that can reach Metro. Each one is fixed text written
 /// here, never anything from a server response, request or `anyhow` chain.
-/// It's attached as context where the cause is known (HTTP status and
-/// error code, stream event code, translation, transport) and turned into
-/// a `SafeError` at the public boundary. Errors without a category reach
-/// Metro only as the connector's generic message, and their details stay in
-/// the local log.
+/// Attached as context where the cause is known, then turned into a
+/// `SafeError` at the public boundary.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Category {
     SignIn,
+    Registration,
+    Route,
+    Storage,
+    Refresh,
+    Consent,
     PlanNotAvailable,
     UsageLimit,
     Unsupported,
+    Model,
+    ReasoningEffort,
+    ContextLength,
+    ContentFilter,
+    Incomplete,
+    Interrupted,
+    UnexpectedResponse,
+    Rejected,
     Unavailable,
 }
 
@@ -33,19 +42,58 @@ impl Category {
         match self {
             Category::SignIn => {
                 "The ChatGPT sign-in for this connection ended or was not accepted. Sign in again \
-                 on the device (metro-connector login)."
+                 on the device."
+            }
+            Category::Registration => {
+                "OpenAI didn't accept this connection's ChatGPT registration. Add a new ChatGPT connection and sign in on this device."
+            }
+            Category::Route => {
+                "OpenAI didn't accept Metro's ChatGPT plan usage route. Update Metro or use another model connection."
+            }
+            Category::Storage => {
+                "Metro couldn't read or update this device's ChatGPT sign-in. Retry; if it keeps failing, reconnect ChatGPT on this device."
+            }
+            Category::Refresh => {
+                "Metro couldn't renew the ChatGPT session. Retry; if it keeps failing, sign in again on this device."
+            }
+            Category::Consent => {
+                "ChatGPT plan usage isn't enabled for this connection. Sign in again on this device and approve plan usage."
             }
             Category::PlanNotAvailable => {
                 "ChatGPT plan usage isn't available for this connection (not approved, or not \
-                 allowed for the account, workspace or region). Check on the device."
+                 allowed for the account, workspace or region). Check your ChatGPT account and workspace settings."
             }
             Category::UsageLimit => {
-                "ChatGPT plan usage limit reached. Review it at https://chatgpt.com/settings/usage. \
+                "ChatGPT plan usage limit reached. Review it in ChatGPT Settings under Usage. \
                  Metro doesn't switch to another billing path."
             }
             Category::Unsupported => {
                 "The request uses an option, input, tool or model that ChatGPT plan usage doesn't \
-                 support, so it wasn't completed. See the connector log on the device."
+                 support. Remove unsupported options or tools, or select another ChatGPT model."
+            }
+            Category::Model => {
+                "This model isn't available through the signed-in ChatGPT account. Refresh the model list and select an available model."
+            }
+            Category::ReasoningEffort => {
+                "The ChatGPT model rejected the reasoning effort setting. Choose a supported effort for this model or use the model default."
+            }
+            Category::ContextLength => {
+                "This request exceeds the ChatGPT model's context limit. Start a shorter chat or choose a model with more context."
+            }
+            Category::ContentFilter => {
+                "OpenAI's content filter stopped the response. Revise the request before trying again."
+            }
+            Category::Incomplete => {
+                "OpenAI stopped before completing the response. Try a shorter request or ask for a shorter answer."
+            }
+            Category::Interrupted => {
+                "The OpenAI response stream ended early or was interrupted. Check this device's connection and try again."
+            }
+            Category::UnexpectedResponse => {
+                "OpenAI returned an unexpected response. Try again; if it keeps failing, update Metro or select another ChatGPT model."
+            }
+            Category::Rejected => {
+                "OpenAI rejected the ChatGPT request. Try a new chat with default model settings; if it keeps failing, update Metro."
             }
             Category::Unavailable => {
                 "OpenAI couldn't be reached from the device or is temporarily unavailable. Try \
@@ -57,14 +105,7 @@ impl Category {
 
 impl std::fmt::Display for Category {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let s = match self {
-            Category::SignIn => "sign-in required",
-            Category::PlanNotAvailable => "plan usage not available",
-            Category::UsageLimit => "usage limit",
-            Category::Unsupported => "unsupported request",
-            Category::Unavailable => "unavailable",
-        };
-        write!(f, "[{s}]")
+        f.write_str(self.user_text())
     }
 }
 
@@ -77,7 +118,11 @@ pub(crate) fn tagged(e: anyhow::Error, category: Option<Category>) -> anyhow::Er
 }
 
 /// Category for a documented code or a status.
-pub(crate) fn categorize(status: Option<u16>, code: Option<&str>) -> Option<Category> {
+pub(crate) fn categorize(
+    status: Option<u16>,
+    code: Option<&str>,
+    param: Option<&str>,
+) -> Option<Category> {
     use Category::*;
     let by_code = match code {
         Some("subscription_sharing_usage_limit_exceeded") => Some(UsageLimit),
@@ -86,14 +131,41 @@ pub(crate) fn categorize(status: Option<u16>, code: Option<&str>) -> Option<Cate
         | Some("chatpass_v2_invalid_authorization_context") => Some(PlanNotAvailable),
         Some("subscription_sharing_usage_unavailable")
         | Some("subscription_sharing_user_unavailable") => Some(Unavailable),
-        Some("subscription_sharing_unsupported_capability")
-        | Some("subscription_sharing_route_not_supported") => Some(Unsupported),
-        Some("subscription_sharing_invalid_user") => Some(SignIn),
+        Some("subscription_sharing_route_not_supported") => Some(Route),
+        Some("subscription_sharing_invalid_user" | "invalid_api_key") => Some(SignIn),
+        Some("model_not_found" | "model_not_available") => Some(Model),
+        Some("context_length_exceeded") => Some(ContextLength),
+        Some("content_filter") => Some(ContentFilter),
+        Some("insufficient_quota" | "rate_limit_exceeded") => Some(UsageLimit),
+        Some("server_error" | "temporarily_unavailable" | "overloaded") => Some(Unavailable),
+        Some("invalid_client") => Some(Registration),
+        Some(
+            "invalid_request_error"
+            | "invalid_value"
+            | "unsupported_value"
+            | "unsupported_parameter"
+            | "subscription_sharing_unsupported_capability",
+        )
+        | None
+            if matches!(status, None | Some(400 | 422))
+                && matches!(param, Some("reasoning" | "reasoning.effort")) =>
+        {
+            Some(ReasoningEffort)
+        }
+        Some(
+            "subscription_sharing_unsupported_capability"
+            | "unsupported_parameter"
+            | "unsupported_value",
+        ) => Some(Unsupported),
+        Some("invalid_request_error" | "invalid_value") => Some(Rejected),
         _ => None,
     };
     by_code.or(match status {
         Some(401) => Some(SignIn),
         Some(403) => Some(PlanNotAvailable),
+        Some(400 | 413 | 422) => Some(Rejected),
+        Some(404 | 405) => Some(Route),
+        Some(408) => Some(Interrupted),
         Some(429) => Some(UsageLimit),
         Some(500..=599) => Some(Unavailable),
         _ => None,
@@ -178,30 +250,20 @@ pub(crate) fn net(e: reqwest::Error) -> anyhow::Error {
     )
 }
 
-pub(crate) fn request_id(h: &reqwest::header::HeaderMap) -> Option<String> {
-    ["x-request-id", "openai-request-id"]
-        .iter()
-        .find_map(|k| h.get(*k))
-        .and_then(|v| v.to_str().ok())
-        .map(|s| clean(s, 128))
-}
-
 /// Parsed failure body. It may be the Responses `{error:{code,param,message}}`,
-/// OAuth `{error, error_description}`, or direct-admission `{detail}`.
-#[derive(Debug, Default, Clone)]
+/// OAuth `{error, error_description}`, or direct-admission `{detail}`. Only
+/// the exact machine-readable fields are used, never interpolated into errors.
+#[derive(Default)]
 pub(crate) struct Failure {
     pub status: u16,
     pub code: Option<String>,
-    pub param: Option<String>,
-    pub message: Option<String>,
-    pub request_id: Option<String>,
+    param: Option<String>,
 }
 
 impl Failure {
-    pub fn parse(status: u16, request_id: Option<String>, body: &[u8]) -> Self {
+    pub fn parse(status: u16, body: &[u8]) -> Self {
         let mut f = Failure {
             status,
-            request_id,
             ..Default::default()
         };
         let Ok(v) = serde_json::from_slice::<Value>(body) else {
@@ -209,114 +271,39 @@ impl Failure {
         };
         match v.get("error") {
             Some(Value::Object(e)) => {
-                f.code = e.get("code").and_then(Value::as_str).map(|s| clean(s, 96));
-                f.param = e
-                    .get("param")
-                    .and_then(Value::as_str)
-                    .map(|s| clean(s, 128));
-                f.message = e
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .map(|s| clean(s, 300));
-                if f.code.is_none() {
-                    f.code = e.get("type").and_then(Value::as_str).map(|s| clean(s, 96));
-                }
+                f.code = error_code(&v["error"]).map(str::to_owned);
+                f.param = e.get("param").and_then(Value::as_str).map(str::to_owned);
             }
-            Some(Value::String(code)) => {
-                f.code = Some(clean(code, 96));
-                f.message = v
-                    .get("error_description")
-                    .and_then(Value::as_str)
-                    .map(|s| clean(s, 300));
-            }
+            Some(Value::String(code)) => f.code = Some(code.clone()),
             _ => {}
-        }
-        if f.message.is_none() {
-            f.message = v
-                .get("detail")
-                .and_then(Value::as_str)
-                .map(|s| clean(s, 300));
         }
         f
     }
 
-    /// The detailed local error, tagged with its category if it has one.
     pub fn error(&self, what: &str) -> anyhow::Error {
         tagged(anyhow!(self.describe(what)), self.category())
     }
 
     pub fn category(&self) -> Option<Category> {
-        let status = (self.status != 200).then_some(self.status);
-        categorize(status, self.code.as_deref())
+        categorize(
+            Some(self.status),
+            self.code.as_deref(),
+            self.param.as_deref(),
+        )
     }
 
     pub fn describe(&self, what: &str) -> String {
-        let mut s = format!("{what} failed: HTTP {}", self.status);
-        if let Some(c) = &self.code {
-            s += &format!(", code {c}");
-        }
-        if let Some(p) = &self.param {
-            s += &format!(", param {p}");
-        }
-        if let Some(m) = &self.message {
-            s += &format!(": {m}");
-        }
-        if let Some(id) = &self.request_id {
-            s += &format!(" (request id {id})");
-        }
-        if let Some(hint) = hint(self.code.as_deref(), self.status) {
-            s += &format!(". {hint}");
-        }
-        s
+        format!("{what} failed: HTTP {}", self.status)
     }
 }
 
-/// Recovery hints from the documented error table.
-fn hint(code: Option<&str>, status: u16) -> Option<&'static str> {
-    Some(match code {
-        Some("subscription_sharing_usage_limit_exceeded") => {
-            "ChatGPT plan usage limit reached for this app or plan; review it at \
-             https://chatgpt.com/settings/usage. Metro does not switch to another billing path"
-        }
-        Some("subscription_sharing_user_not_eligible") => {
-            "ChatGPT plan usage is not available for this account, workspace or policy"
-        }
-        Some("subscription_sharing_usage_unavailable")
-        | Some("subscription_sharing_user_unavailable") => {
-            "Temporarily unavailable; try again later"
-        }
-        Some("subscription_sharing_unsupported_capability") => {
-            "Remove the unsupported input, tool, model or option named by param"
-        }
-        Some("subscription_sharing_route_not_supported") => {
-            "This route isn't supported for ChatGPT plan usage"
-        }
-        Some("subscription_sharing_invalid_user") => {
-            "The ChatGPT session could not be validated; sign in again"
-        }
-        Some("chatpass_v2_scope_not_authorized")
-        | Some("chatpass_v2_invalid_authorization_context") => {
-            "The granted permission does not cover this request; sign in again and approve ChatGPT plan usage"
-        }
-        _ => match status {
-            401 => {
-                "The signed-in identity or ChatGPT plan permission was not accepted; check the account and sign in again"
-            }
-            403 => "A policy or permission check, such as the serving region, refused the request",
-            503 => "Direct routing is unavailable right now; try again later",
-            _ => return None,
-        },
+pub(crate) fn error_code(error: &Value) -> Option<&str> {
+    error.get("code").and_then(Value::as_str).or_else(|| {
+        error
+            .get("type")
+            .and_then(Value::as_str)
+            .filter(|t| *t != "error")
     })
-}
-
-/// Bounds the length of server-supplied text and strips control characters
-/// before it goes into an error message.
-pub(crate) fn clean(s: &str, max: usize) -> String {
-    let mut out: String = s.chars().filter(|c| !c.is_control()).take(max).collect();
-    if s.chars().count() > max {
-        out.push('…');
-    }
-    out
 }
 
 /// Percent-encodes per RFC 3986 unreserved characters (`%20` for space).
@@ -349,9 +336,22 @@ mod tests {
         use Category::*;
         for c in [
             SignIn,
+            Registration,
+            Route,
+            Storage,
+            Refresh,
+            Consent,
             PlanNotAvailable,
             UsageLimit,
             Unsupported,
+            Model,
+            ReasoningEffort,
+            ContextLength,
+            ContentFilter,
+            Incomplete,
+            Interrupted,
+            UnexpectedResponse,
+            Rejected,
             Unavailable,
         ] {
             let t = c.user_text();
@@ -363,19 +363,26 @@ mod tests {
     #[test]
     fn categories_come_from_codes_and_statuses_only() {
         assert_eq!(
-            categorize(Some(429), Some("subscription_sharing_usage_limit_exceeded")),
+            categorize(
+                Some(429),
+                Some("subscription_sharing_usage_limit_exceeded"),
+                None
+            ),
             Some(Category::UsageLimit)
         );
         assert_eq!(
-            categorize(None, Some("subscription_sharing_invalid_user")),
+            categorize(None, Some("subscription_sharing_invalid_user"), None),
             Some(Category::SignIn)
         );
-        assert_eq!(categorize(Some(401), None), Some(Category::SignIn));
+        assert_eq!(categorize(Some(401), None, None), Some(Category::SignIn));
         assert_eq!(
-            categorize(Some(502), Some("whatever")),
+            categorize(Some(502), Some("whatever"), None),
             Some(Category::Unavailable)
         );
-        assert_eq!(categorize(Some(400), Some("whatever")), None);
-        assert_eq!(categorize(None, None), None);
+        assert_eq!(
+            categorize(Some(400), Some("whatever"), None),
+            Some(Category::Rejected)
+        );
+        assert_eq!(categorize(None, None, None), None);
     }
 }

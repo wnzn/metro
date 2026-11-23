@@ -37,7 +37,6 @@ pub(crate) struct Callback {
     pub code: Option<String>,
     pub client_id: Option<String>,
     pub error: Option<String>,
-    pub error_description: Option<String>,
 }
 
 impl Loopback {
@@ -138,7 +137,6 @@ impl Loopback {
                         code: q.get("code").cloned(),
                         client_id: q.get("client_id").cloned(),
                         error: q.get("error").cloned(),
-                        error_description: q.get("error_description").cloned(),
                     };
                     let msg = if cb.error.is_some() {
                         "Sign-in with ChatGPT did not complete. You can close this tab and return to Metro."

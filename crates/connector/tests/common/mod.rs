@@ -73,6 +73,7 @@ pub struct Fx {
     pub refresh: Option<String>,
     pub refresh_count: u32,
     pub refresh_error: Option<&'static str>,
+    pub refresh_scope: Option<&'static str>,
     pub revoked: Vec<HashMap<String, String>>,
     pub responses_bodies: Vec<Value>,
     pub sse_mode: &'static str,
@@ -214,13 +215,16 @@ pub async fn token(State(s): State<S>, body: String) -> Response {
             let rt = format!("rt-{n}");
             fx.access = Some(access.clone());
             fx.refresh = Some(rt.clone());
-            let sub = fx.sub_for_refresh.clone();
-            let id = fx.id_token(ISSUED, &sub, None);
-            axum::Json(json!({
-                "access_token": access, "refresh_token": rt, "id_token": id, "token_type": "Bearer",
-                "expires_in": 3600, "scope": PLAN_SCOPES,
-            }))
-            .into_response()
+            // Common OAuth refresh shape: no new ID token and no scope
+            // unless the grant changes. Still rotate the refresh token.
+            let mut result = json!({
+                "access_token": access, "refresh_token": rt, "token_type": "Bearer",
+                "expires_in": 3600,
+            });
+            if let Some(scope) = fx.refresh_scope {
+                result["scope"] = json!(scope);
+            }
+            axum::Json(result).into_response()
         }
         _ => oauth_err("unsupported_grant_type"),
     }
@@ -263,6 +267,40 @@ pub fn sse(events: &[Value]) -> String {
         .collect()
 }
 
+fn streamed(parts: Vec<String>) -> Response {
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+
+    struct Chunks {
+        parts: std::vec::IntoIter<String>,
+        pause: Pin<Box<tokio::time::Sleep>>,
+    }
+    impl hyper::body::Body for Chunks {
+        type Data = axum::body::Bytes;
+        type Error = std::convert::Infallible;
+
+        fn poll_frame(
+            mut self: Pin<&mut Self>,
+            cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<hyper::body::Frame<Self::Data>, Self::Error>>> {
+            std::task::ready!(self.pause.as_mut().poll(cx));
+            let next = self.parts.next();
+            self.pause
+                .as_mut()
+                .reset(tokio::time::Instant::now() + Duration::from_millis(5));
+            Poll::Ready(next.map(|s| Ok(hyper::body::Frame::data(s.into()))))
+        }
+    }
+    (
+        [(header::CONTENT_TYPE, "text/event-stream; charset=UTF-8")],
+        axum::body::Body::new(Chunks {
+            parts: parts.into_iter(),
+            pause: Box::pin(tokio::time::sleep(Duration::ZERO)),
+        }),
+    )
+        .into_response()
+}
+
 pub async fn responses(State(s): State<S>, h: HeaderMap, body: String) -> Response {
     let mut fx = s.lock().unwrap();
     if !bearer_ok(&fx, &h) {
@@ -302,6 +340,26 @@ pub async fn responses(State(s): State<S>, h: HeaderMap, body: String) -> Respon
                 json!({"detail": "SENSITIVE-DETAIL"}),
             );
         }
+        "http401" => {
+            return leak(
+                StatusCode::UNAUTHORIZED,
+                json!({"detail": "fixture.person@example.test"}),
+            );
+        }
+        "model_missing" => {
+            return leak(
+                StatusCode::NOT_FOUND,
+                json!({"error": {"code": "model_not_found", "param": "model", "message": "SENSITIVE-MODEL"}}),
+            );
+        }
+        "non_sse" => return ([(header::CONTENT_TYPE, "text/html")], "SENSITIVE").into_response(),
+        "reasoning" => {
+            return leak(
+                StatusCode::BAD_REQUEST,
+                json!({"error": {"type": "invalid_request_error", "code": "unsupported_value",
+                    "param": "reasoning.effort", "message": "SENSITIVE max at https://example.test"}}),
+            );
+        }
         "http403" => {
             return leak(
                 StatusCode::FORBIDDEN,
@@ -323,12 +381,60 @@ pub async fn responses(State(s): State<S>, h: HeaderMap, body: String) -> Respon
         .any(|i| i["type"] == "function_call_output");
     let resp = |output: Value| json!({"id": "resp_1", "object": "response", "created_at": 1_790_000_000, "model": body["model"], "status": "completed", "output": output, "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}});
     let events = match fx.sse_mode {
+        "first_chat" | "eof_completed" => {
+            let mut in_progress = resp(json!([]));
+            in_progress["status"] = json!("in_progress");
+            in_progress["usage"] = Value::Null;
+            let item = json!({"type": "message", "id": "msg_1", "role": "assistant",
+            "status": "completed", "content": [
+                {"type": "output_text", "text": "Hello, world!", "annotations": [], "logprobs": []}
+            ]});
+            let events = sse(&[
+                json!({"type": "response.created", "sequence_number": 0, "response": in_progress}),
+                json!({"type": "response.output_text.delta", "sequence_number": 1,
+                    "item_id": "msg_1", "output_index": 0, "content_index": 0, "delta": "Hello, "}),
+                json!({"type": "response.output_text.delta", "sequence_number": 2,
+                    "item_id": "msg_1", "output_index": 0, "content_index": 0, "delta": "world!"}),
+                json!({"type": "response.output_item.done", "sequence_number": 3, "output_index": 0,
+                    "item": item}),
+            ]);
+            let terminal = sse(&[json!({"type": "response.completed", "sequence_number": 4,
+                "response": resp(json!([item]))})]);
+            let (a, b) = terminal.split_at(50);
+            return streamed(vec![
+                events.replace('\n', "\r\n"),
+                a.into(),
+                if fx.sse_mode == "eof_completed" {
+                    b.trim_end().into()
+                } else {
+                    b.into()
+                },
+            ]);
+        }
         "limit" => vec![
             json!({"type": "response.created", "response": {"id": "resp_1"}}),
             json!({"type": "response.output_text.delta", "delta": "par"}),
             json!({"type": "response.failed", "response": {"id": "resp_SENSITIVE", "error": {"code": "subscription_sharing_usage_limit_exceeded", "message": "SENSITIVE limit text"}}}),
         ],
         "truncated" => vec![json!({"type": "response.output_text.delta", "delta": "Hel"})],
+        "flat_error" => vec![json!({"type": "error", "sequence_number": 7,
+            "code": "context_length_exceeded", "param": "input", "message": "SENSITIVE prompt text"})],
+        "incomplete" => vec![json!({"type": "response.incomplete", "response": {
+            "id": "resp_SENSITIVE", "status": "incomplete",
+            "incomplete_details": {"reason": "max_output_tokens"}}})],
+        "filtered" => vec![json!({"type": "response.incomplete", "response": {
+            "status": "incomplete", "incomplete_details": {"reason": "content_filter"}}})],
+        "bad_completion" => vec![
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "reasoning"}}),
+            json!({"type": "response.completed", "response": "SENSITIVE not an object"}),
+        ],
+        "malformed" => {
+            return (
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                "data: {SENSITIVE\n\n",
+            )
+                .into_response();
+        }
         "hosted" => vec![
             json!({"type": "response.completed", "response": resp(json!([{"type": "web_search_call", "id": "ws"}]))}),
         ],
@@ -384,6 +490,7 @@ pub async fn fixture_with_discovery_gate(
         refresh: None,
         refresh_count: 0,
         refresh_error: None,
+        refresh_scope: None,
         revoked: Vec::new(),
         responses_bodies: Vec::new(),
         sse_mode: "",

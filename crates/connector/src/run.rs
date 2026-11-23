@@ -18,8 +18,8 @@ use serde_json::{Value, json};
 
 use crate::metro::{Claim, ErrorKind, Job, MAX_RESPONSE_BYTES, MetroClient, MetroError};
 use crate::policy::{
-    Operation, approved_models, check_typed, operation_allowed, parse_operation, sanitize_complete,
-    sanitize_response,
+    Operation, approved_models, check_typed, operation_allowed, parse_operation,
+    sanitize_complete_for_kind, sanitize_response,
 };
 use crate::profile::{MAX_REQUEST_TIMEOUT_SECS, SERVER_RUN_TIMEOUT_SECS};
 use crate::provider::Provider;
@@ -149,7 +149,7 @@ pub async fn handle_job(provider: &Provider<'_>, job: &Job, deadline: Instant) -
                 Ok::<Value, anyhow::Error>(approved_models(allowed, Some(&available)))
             }
             Operation::Complete(req) => {
-                let clean = sanitize_complete(&req, allowed)?;
+                let clean = sanitize_complete_for_kind(&req, allowed, provider.config.kind)?;
                 let model = clean["model"].as_str().unwrap_or_default().to_string();
                 let raw = provider.complete(clean).await?;
                 Ok(sanitize_response(&raw, &model)?)

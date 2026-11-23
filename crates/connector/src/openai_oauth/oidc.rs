@@ -49,11 +49,11 @@ pub(crate) async fn discover(client: &reqwest::Client, issuer: &str) -> Result<D
     );
     let resp = client.get(&url).send().await.map_err(http::net)?;
     let status = resp.status();
-    let rid = http::request_id(resp.headers());
-    let body = http::read_bounded(resp, MAX_JSON).await?;
     if !status.is_success() {
-        return Err(Failure::parse(status.as_u16(), rid, &body).error("OIDC discovery"));
+        let body = http::read_bounded(resp, MAX_JSON).await.unwrap_or_default();
+        return Err(Failure::parse(status.as_u16(), &body).error("OIDC discovery"));
     }
+    let body = http::read_bounded(resp, MAX_JSON).await?;
     let d: Discovery =
         serde_json::from_slice(&body).context("OIDC discovery document is malformed")?;
     if d.issuer != issuer {
@@ -82,11 +82,11 @@ pub(crate) async fn fetch_jwks(client: &reqwest::Client, uri: &str) -> Result<Ve
     install_crypto_provider();
     let resp = client.get(uri).send().await.map_err(http::net)?;
     let status = resp.status();
-    let rid = http::request_id(resp.headers());
-    let body = http::read_bounded(resp, MAX_JSON).await?;
     if !status.is_success() {
-        return Err(Failure::parse(status.as_u16(), rid, &body).error("JWKS fetch"));
+        let body = http::read_bounded(resp, MAX_JSON).await.unwrap_or_default();
+        return Err(Failure::parse(status.as_u16(), &body).error("JWKS fetch"));
     }
+    let body = http::read_bounded(resp, MAX_JSON).await?;
     #[derive(Deserialize)]
     struct Raw {
         keys: Vec<Value>,

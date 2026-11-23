@@ -183,7 +183,6 @@ pub(crate) async fn login(dir: &Path, opts: LoginOptions) -> Result<()> {
     drop(authorize_url);
 
     if let Some(err) = cb.error.as_deref() {
-        let err = http::clean(err, 64);
         if err == "access_denied" {
             return Err(safe(
                 SignInStage::Response,
@@ -191,21 +190,10 @@ pub(crate) async fn login(dir: &Path, opts: LoginOptions) -> Result<()> {
                  Sign in again to approve it, or use another model connection.",
             ));
         }
-        let code: String = err
-            .chars()
-            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
-            .take(64)
-            .collect();
-        let desc = cb
-            .error_description
-            .as_deref()
-            .map(|d| format!(": {}", http::clean(d, 200)))
-            .unwrap_or_default();
-        return Err(anyhow!("Sign in with ChatGPT returned error {err}{desc}")
-            .context(SafeError::new(format!(
-                "ChatGPT's sign-in page returned an error ({code}). Start the sign-in again."
-            )))
-            .context(SignInStage::Response));
+        return Err(safe(
+            SignInStage::Response,
+            "ChatGPT's sign-in page returned an error. Start the sign-in again.",
+        ));
     }
     let code = cb.code.filter(|c| !c.is_empty()).ok_or_else(|| {
         safe(
@@ -418,18 +406,23 @@ async fn token_request(
         .await
         .map_err(http::net)?;
     let status = resp.status();
-    let rid = http::request_id(resp.headers());
-    let bytes = http::read_bounded(resp, MAX_JSON).await?;
     if !status.is_success() {
-        let f = Failure::parse(status.as_u16(), rid, &bytes);
-        return Err(TokenError(f.clone())).context(f.describe(what));
+        let bytes = http::read_bounded(resp, MAX_JSON).await.unwrap_or_default();
+        let f = Failure::parse(status.as_u16(), &bytes);
+        let description = f.describe(what);
+        return Err(TokenError(f)).context(description);
     }
+    let bytes = http::read_bounded(resp, MAX_JSON).await?;
     serde_json::from_slice(&bytes).map_err(|_| anyhow!("{what}: token response is malformed"))
 }
 
 /// Carries the parsed failure so refresh can branch on its code.
-#[derive(Debug)]
 struct TokenError(Failure);
+impl std::fmt::Debug for TokenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
 impl std::fmt::Display for TokenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "token endpoint HTTP {}", self.0.status)
@@ -450,31 +443,41 @@ const UNUSABLE_REFRESH: &[&str] = &[
 /// expiry.
 async fn access(dir: &Path, ep: &Endpoints) -> Result<(Account, Tokens)> {
     http::check_endpoints(ep)?;
-    let profile = Profile::open(dir, false)?.ok_or_else(not_signed_in)?;
-    let account = profile.account()?.ok_or_else(not_signed_in)?;
+    let profile = Profile::open(dir, false)
+        .context(Category::Storage)?
+        .ok_or_else(not_signed_in)?;
+    let account = profile
+        .account()
+        .context(Category::Storage)?
+        .ok_or_else(not_signed_in)?;
     if account.endpoints != *ep {
-        bail!("this connection profile is bound to a different OpenAI issuer/API");
+        return Err(
+            anyhow!("this connection profile is bound to a different OpenAI issuer/API")
+                .context(Category::Registration),
+        );
     }
-    let tokens = profile.tokens()?.ok_or_else(not_signed_in)?;
-    if !tokens.scopes.iter().any(|s| s == PLAN_SCOPE) {
-        return Err(tagged(
-            anyhow!(
-                "ChatGPT plan usage is not enabled for this connection; sign in again to approve it"
-            ),
-            Some(Category::PlanNotAvailable),
-        ));
-    }
+    let tokens = profile
+        .tokens()
+        .context(Category::Storage)?
+        .ok_or_else(not_signed_in)?;
+    check_plan(&tokens)?;
     if fresh(&tokens) {
         return Ok((account, tokens));
     }
-    let lock = profile.lock().await?;
+    let lock = profile.lock().await.context(Category::Storage)?;
     // Another process may have refreshed while this one waited for the lock.
-    let tokens = profile.tokens()?.ok_or_else(not_signed_in)?;
+    let tokens = profile
+        .tokens()
+        .context(Category::Storage)?
+        .ok_or_else(not_signed_in)?;
+    check_plan(&tokens)?;
     if fresh(&tokens) {
         return Ok((account, tokens));
     }
     let client = http::client_for(ep)?;
-    let disc = oidc::discover(&client, &ep.issuer).await?;
+    let disc = oidc::discover(&client, &ep.issuer)
+        .await
+        .map_err(refresh_error)?;
     let body = form(&[
         ("grant_type", "refresh_token"),
         ("client_id", &account.client_id),
@@ -487,40 +490,36 @@ async fn access(dir: &Path, ep: &Endpoints) -> Result<(Account, Tokens)> {
             if let Some(TokenError(f)) = e.downcast_ref::<TokenError>() {
                 let code = f.code.as_deref().unwrap_or("");
                 if UNUSABLE_REFRESH.contains(&code) {
-                    profile.clear_tokens(&lock)?;
-                    return Err(tagged(
-                        anyhow!("{e:#}. The ChatGPT session has ended; sign in again"),
-                        Some(Category::SignIn),
-                    ));
+                    profile.clear_tokens(&lock).context(Category::Storage)?;
+                    return Err(e.context(Category::SignIn));
                 }
-                if code == "invalid_client" {
-                    return Err(tagged(
-                        anyhow!(
-                            "{e:#}. The connection's client registration is not accepted; sign in again or add a new connection"
-                        ),
-                        Some(Category::SignIn),
-                    ));
-                }
+                // A transient failure leaves the credentials as they are.
+                let category = match f.category() {
+                    Some(
+                        c @ (Category::Registration
+                        | Category::SignIn
+                        | Category::Unavailable
+                        | Category::PlanNotAvailable
+                        | Category::UsageLimit),
+                    ) => c,
+                    _ => Category::Refresh,
+                };
+                return Err(e.context(category));
             }
-            // A network failure or 5xx leaves the credentials as they are.
-            let server_error = e
-                .downcast_ref::<TokenError>()
-                .is_some_and(|TokenError(f)| f.status >= 500);
-            return Err(if server_error {
-                tagged(e, Some(Category::Unavailable))
-            } else {
-                e
-            });
+            return Err(refresh_error(e));
         }
     };
     let id_token = match &tr.id_token {
         Some(t) => {
-            let keys = oidc::fetch_jwks(&client, &disc.jwks_uri).await?;
-            let c = oidc::verify_id_token(t, &keys, &disc.issuer, &account.client_id, None)?;
+            let keys = oidc::fetch_jwks(&client, &disc.jwks_uri)
+                .await
+                .map_err(refresh_error)?;
+            let c = oidc::verify_id_token(t, &keys, &disc.issuer, &account.client_id, None)
+                .context(Category::Refresh)?;
             if account.subject.as_deref() != Some(c.sub.as_str()) {
-                bail!(
+                return Err(anyhow!(
                     "refresh returned an identity for a different account; credentials left unchanged"
-                );
+                ).context(Category::Refresh));
             }
             t.clone()
         }
@@ -531,18 +530,29 @@ async fn access(dir: &Path, ep: &Endpoints) -> Result<(Account, Tokens)> {
         &disc.issuer,
         &ep.resource,
         &account.client_id,
-    )?;
-    let new = build_tokens(tr, id_token, access_scope, Some(&tokens))?;
-    profile.write_tokens(&lock, &new)?;
-    if !new.scopes.iter().any(|s| s == PLAN_SCOPE) {
-        return Err(tagged(
-            anyhow!(
-                "ChatGPT plan usage is no longer granted for this connection; sign in again to approve it"
-            ),
-            Some(Category::PlanNotAvailable),
-        ));
-    }
+    )
+    .context(Category::Refresh)?;
+    let new = build_tokens(tr, id_token, access_scope, Some(&tokens)).context(Category::Refresh)?;
+    profile
+        .write_tokens(&lock, &new)
+        .context(Category::Storage)?;
+    check_plan(&new)?;
     Ok((account, new))
+}
+
+fn refresh_error(e: anyhow::Error) -> anyhow::Error {
+    if e.downcast_ref::<Category>().is_some() {
+        e
+    } else {
+        e.context(Category::Refresh)
+    }
+}
+
+fn check_plan(tokens: &Tokens) -> Result<()> {
+    if !tokens.scopes.iter().any(|s| s == PLAN_SCOPE) {
+        return Err(anyhow!("missing ChatGPT plan permission").context(Category::Consent));
+    }
+    Ok(())
 }
 
 fn fresh(t: &Tokens) -> bool {
@@ -659,11 +669,11 @@ pub(crate) async fn model_catalog(dir: &Path, ep: &Endpoints) -> Result<Vec<Mode
         .await
         .map_err(http::net)?;
     let status = resp.status();
-    let rid = http::request_id(resp.headers());
-    let body = http::read_bounded(resp, MAX_JSON).await?;
     if !status.is_success() {
-        return Err(Failure::parse(status.as_u16(), rid, &body).error("model list"));
+        let body = http::read_bounded(resp, MAX_JSON).await.unwrap_or_default();
+        return Err(Failure::parse(status.as_u16(), &body).error("model list"));
     }
+    let body = http::read_bounded(resp, MAX_JSON).await?;
     let v: Value =
         serde_json::from_slice(&body).map_err(|_| anyhow!("model list response is malformed"))?;
     let models = v
@@ -703,21 +713,28 @@ pub(crate) async fn complete(dir: &Path, ep: &Endpoints, request: Value) -> Resu
         .map_err(http::net)?;
     let status = resp.status();
     if !status.is_success() {
-        let rid = http::request_id(resp.headers());
         let bytes = http::read_bounded(resp, 64 * 1024)
             .await
             .unwrap_or_default();
-        return Err(Failure::parse(status.as_u16(), rid, &bytes).error("Responses request"));
+        return Err(Failure::parse(status.as_u16(), &bytes).error("Responses request"));
     }
-    let ct = resp
+    let media_type = resp
         .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(';').next())
         .unwrap_or("")
-        .to_ascii_lowercase();
-    if !ct.starts_with("text/event-stream") {
+        .trim();
+    if !media_type.eq_ignore_ascii_case("text/event-stream") {
+        if media_type.eq_ignore_ascii_case("application/json") {
+            let bytes = http::read_bounded(resp, 64 * 1024).await?;
+            let failure = Failure::parse(status.as_u16(), &bytes);
+            if failure.category().is_some() {
+                return Err(failure.error("Responses request"));
+            }
+        }
         bail!("Responses did not return an event stream");
     }
     let completed = sse::collect(resp, sse::Limits::default()).await?;
-    translate::to_chat_completion(&completed).map_err(|e| tagged(e, Some(Category::Unsupported)))
+    translate::to_chat_completion(&completed)
 }
