@@ -5,7 +5,7 @@
 // components never name colors, sizes or classes themselves. Replace this
 // file and ./primitives.tsx (or just theme.json) to restyle the whole app.
 
-export type Space = 0 | 1 | 2 | 3 | 4 | 6 | 8;
+export type Space = 0 | 1 | 2 | 3 | 4 | 6 | 8 | 12 | 16;
 
 /** Semantic tones. Event kinds, statuses and banners pick one of these. */
 export type Tone = "neutral" | "agent" | "runner" | "system" | "success" | "warning" | "danger";
@@ -18,6 +18,8 @@ export const gapClass: Record<Space, string> = {
   4: "gap-(--space-4)",
   6: "gap-(--space-6)",
   8: "gap-(--space-8)",
+  12: "gap-(--space-12)",
+  16: "gap-(--space-16)",
 };
 
 export const padClass: Record<Space, string> = {
@@ -28,6 +30,8 @@ export const padClass: Record<Space, string> = {
   4: "p-(--space-4)",
   6: "p-(--space-6)",
   8: "p-(--space-8)",
+  12: "p-(--space-12)",
+  16: "p-(--space-16)",
 };
 
 export const padXClass: Record<Space, string> = {
@@ -38,6 +42,8 @@ export const padXClass: Record<Space, string> = {
   4: "px-(--space-4)",
   6: "px-(--space-6)",
   8: "px-(--space-8)",
+  12: "px-(--space-12)",
+  16: "px-(--space-16)",
 };
 
 export const padYClass: Record<Space, string> = {
@@ -48,6 +54,8 @@ export const padYClass: Record<Space, string> = {
   4: "py-(--space-4)",
   6: "py-(--space-6)",
   8: "py-(--space-8)",
+  12: "py-(--space-12)",
+  16: "py-(--space-16)",
 };
 
 export const toneSurfaceClass: Record<Tone, string> = {
@@ -109,12 +117,12 @@ export const textClass = {
   "2xl": "text-(length:--text-2xl) leading-(--leading-2xl)",
 } as const;
 
-/** Radii: 8 controls, 12 cards, 16 popovers and dialogs; pills are full. */
+/** Radii: 6 compact controls, 8 regular controls, 12 cards/popovers and 16 dialogs. */
 export const radiusClass = {
-  control: "rounded-(--radius-sm)",
+  control: "rounded-(--radius-md)",
   card: "rounded-(--radius)",
   popover: "rounded-(--radius-lg)",
-  dialog: "rounded-(--radius-lg)",
+  dialog: "rounded-(--radius-xl)",
   pill: "rounded-full",
 } as const;
 

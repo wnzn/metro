@@ -13,12 +13,12 @@ async function openApp(f: F, opts: { reducedMotion?: boolean; width?: number; he
   return open("../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, ...opts });
 }
 
-async function signIn(app: App, user: string) {
+async function signIn(app: App, user: string, ready = "id:account-menu") {
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
   await app.press("id:connect");
-  await app.waitFor("id:account-menu");
+  await app.waitFor(ready);
 }
 
 const text = (app: App) => app.texts().join(" | ");
@@ -38,6 +38,44 @@ test("Library is a place of its own in the sidebar", async () => {
   await app.waitFor("id:library-home");
   await app.press("id:nav-chat");
   await app.waitFor("id:library-home", { state: "gone" });
+});
+
+test("navigation collapses and restores with its draft, and stays collapsed across a restart", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await app.press("id:new-space-toggle");
+  await app.type("id:new-space-name", "Unfinished space");
+  await app.press("label:Hide workspace navigation");
+  await app.waitFor("label:Show workspace navigation");
+  expect(app.shows("id:runs-aside")).toBe(true);
+  expect(app.shows("id:nav-chat")).toBe(false);
+  const storage = app.storage();
+  expect(storage["metro.layout.navigation"]).toBe("collapsed");
+  await app.keyboard.press("mod+b");
+  await app.waitFor("id:new-space-name");
+  expect(app.value("id:new-space-name")).toBe("Unfinished space");
+  const second = await open("../../App.tsx", { network: world().network as any, platform: "linux", width: 760, height: 560, storage });
+  await second.press("id:show-server-form");
+  await signIn(second, "alice", "id:toggle-navigation");
+  await second.waitFor("label:Show workspace navigation");
+  await second.press("id:toggle-navigation");
+  await second.waitFor("id:nav-library");
+});
+
+test("collapsing Settings sections keeps the active page and leaves the workspace panel alone", async () => {
+  const app = await openApp(world());
+  await signIn(app, "alice");
+  await app.press("id:nav-settings");
+  await app.press("id:nav-settings:appearance");
+  await app.press("label:Hide settings sections");
+  await app.waitFor("id:settings-nav", { state: "gone" });
+  expect(app.shows("id:appearance-settings")).toBe(true);
+  await app.keyboard.press("mod+b");
+  await app.press("label:Show settings sections");
+  await app.waitFor("id:nav-settings:profile");
+  await app.press("id:settings-close");
+  await app.waitFor("id:nav-settings");
 });
 
 test("the account shows the host once, and its menu copies the server URL and the ID, then signs out", async () => {

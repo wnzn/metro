@@ -8,7 +8,7 @@
 // The task form stays folded behind "New task" until the user opens it (or
 // presses Follow up), and it scrolls with the runs, so it never covers them.
 
-import { signal } from "nsh";
+import { cleanup, effect, keymap, signal } from "nsh";
 import {
   activeEvents,
   activeLoaded,
@@ -39,7 +39,7 @@ import {
   stopRun,
 } from "../store";
 import type { Run } from "../store";
-import { Action, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, Row, ScrollArea, Spacer, Surface } from "../ui";
+import { Action, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, PanelToggle, Row, runsPanel, ScrollArea, Spacer, Surface } from "../ui";
 import { EmptyState, sidePanelFits, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
 import { Composer, ConnectionBanner, Transcript } from "./Conversation";
@@ -47,8 +47,6 @@ import { roomTree } from "./Sidebar";
 
 /** The task form is open (folded behind "New task" otherwise). */
 const dispatchOpen = signal(false);
-/** In a window too narrow for the side panel, the runs open in a dialog over the Chat. */
-const runsDialogOpen = signal(false);
 
 /** Drafts the empty Chat suggests. The personal agent has no tools, so none asks for any. */
 export const CHAT_SUGGESTIONS: readonly { label: string; draft: string }[] = [
@@ -58,6 +56,12 @@ export const CHAT_SUGGESTIONS: readonly { label: string; draft: string }[] = [
 ];
 
 export function ChatView() {
+  const runsDialogOpen = signal(false);
+  const showRuns = () => sidePanelFits() ? runsPanel.toggle() : runsDialogOpen.set(!runsDialogOpen());
+  effect(() => { if (sidePanelFits()) runsDialogOpen.set(false); });
+  try {
+    cleanup(keymap.bind("mod+shift+b", () => { if (!modalOpen() || runsDialogOpen()) showRuns(); }, { when: "always" }));
+  } catch { /* The header button works on hosts that reserve this shortcut. */ }
   return (
     <Surface variant="app" testID="chat-view">
       <Surface variant="panel" grow>
@@ -70,15 +74,9 @@ export function ChatView() {
               Only you see this chat, and its agent can't see your Spaces.
             </Label>
           </Column>
-          <If when={!sidePanelFits()}>
-            <Action
-              compact
-              testID="runs-toggle"
-              label={runs().some(isActiveRun) ? `Runs · ${runs().filter(isActiveRun).length} active` : "Runs"}
-              accessibilityLabel="Show agent runs"
-              onPress={() => runsDialogOpen.set(true)}
-            />
-          </If>
+          <PanelToggle side="right" name="agent runs" testID="runs-toggle"
+            caption={runs().some(isActiveRun) ? `Runs · ${runs().filter(isActiveRun).length} active` : "Runs"}
+            expanded={sidePanelFits() ? runsPanel.open() : runsDialogOpen()} shortcut="Shift+B" onPress={showRuns} />
         </Surface>
         <ConnectionBanner />
         <If when={spaces().length === 0}>
@@ -102,7 +100,7 @@ export function ChatView() {
       </Surface>
       {/* Wide windows keep the runs beside the Chat; narrower ones open them
           in a dialog, so the Chat (and its draft) keeps its full width. */}
-      <If when={sidePanelFits()}>
+      <If when={sidePanelFits() && runsPanel.open()}>
         <Surface variant="aside" testID="runs-aside">
           <RunsPanel />
         </Surface>

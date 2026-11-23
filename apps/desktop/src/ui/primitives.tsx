@@ -115,7 +115,7 @@ const surfaceClass: Record<SurfaceVariant, string> = {
   panel: "flex-1 min-w-0 bg-background",
   // Cards are flat: a border, no shadow. Only popovers and dialogs float.
   card: "bg-card border border-border rounded-(--radius)",
-  dialog: "w-full max-w-[460px] bg-card border border-border rounded-(--radius-lg) shadow-lg",
+  dialog: "w-full max-w-[460px] bg-card border border-border rounded-(--radius-xl) shadow-lg",
   toolbar: "flex-row items-center min-h-[52px] border-b border-border bg-background",
   footer: "border-t border-border bg-background",
   aside: "w-[340px] border-l border-border bg-sidebar",
@@ -126,10 +126,11 @@ const surfaceClass: Record<SurfaceVariant, string> = {
   popover: "bg-popover border border-border rounded-(--radius-lg) shadow-lg",
 };
 
-export function Surface(props: StackProps & { variant: SurfaceVariant }) {
+export function Surface(props: StackProps & { variant: SurfaceVariant; hidden?: boolean }) {
   return (
     <View
-      class={cx(surfaceClass[props.variant], stackClass({ ...props, grow: false }, props.variant === "toolbar" || props.variant === "app" ? "row" : "col"), props.grow && "flex-1 min-h-0")}
+      class={cx(surfaceClass[props.variant], stackClass({ ...props, grow: false }, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col"), props.grow && "flex-1 min-h-0", props.hidden && "hidden")}
+      accessibilityElementsHidden={props.hidden}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
     >
@@ -158,8 +159,8 @@ export type LabelColor = "default" | "muted" | "danger" | "accent" | "sidebar" |
 
 const labelVariantClass: Record<LabelVariant, string> = {
   display: cx(textClass["2xl"], "font-semibold tracking-tight"),
-  title: cx(textClass.lg, "font-semibold"),
-  heading: cx(textClass.md, "font-semibold"),
+  title: cx(textClass.xl, "font-semibold tracking-tight"),
+  heading: cx(textClass.lg, "font-semibold"),
   body: textClass.md,
   strong: cx(textClass.sm, "font-semibold"),
   caption: textClass.xs,
@@ -276,8 +277,8 @@ export function Action(
   return (
     <Button
       class={cx(
-        "group flex-row items-center justify-center rounded-(--radius-sm)",
-        props.compact ? cx(controlHeightClass.compact, "gap-(--space-1) px-(--space-2)") : cx(controlHeightClass.default, "gap-(--space-2) px-(--space-3)"),
+        "group flex-row items-center justify-center",
+        props.compact ? cx(controlHeightClass.compact, "rounded-(--radius-sm) gap-(--space-1) px-(--space-2)") : cx(controlHeightClass.default, "rounded-(--radius-md) gap-(--space-2) px-(--space-3)"),
         props.expanded !== undefined && "justify-start",
         props.edgeAligned && quiet() && (props.compact ? "-mx-2" : "-mx-3"),
         focusRing,
@@ -461,7 +462,7 @@ export function Field(
   return (
     <Input
       class={cx(
-        "rounded-(--radius-sm) border bg-background px-(--space-3) py-[7px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring",
+        "rounded-(--radius-md) border bg-background px-(--space-3) py-[7px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring",
         controlEdgeClass,
         textClass.md,
         controlHeightClass.default,

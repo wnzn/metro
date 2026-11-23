@@ -19,6 +19,9 @@ import chatIcon from "./icons/chat.svg";
 import fileIcon from "./icons/file.svg";
 import libraryIcon from "./icons/library.svg";
 import metroIcon from "./icons/metro.svg";
+import metroHorizontal from "./icons/metro-horizontal.svg";
+import panelLeftIcon from "./icons/panel-left.svg";
+import panelRightIcon from "./icons/panel-right.svg";
 import moreIcon from "./icons/more.svg";
 import sendIcon from "./icons/send.svg";
 import checkIcon from "./icons/check.svg";
@@ -100,6 +103,8 @@ const ICONS = {
   logout: logoutIcon,
   metro: metroIcon,
   more: moreIcon,
+  "panel-left": panelLeftIcon,
+  "panel-right": panelRightIcon,
   person: personIcon,
   plus: plusIcon,
   providers: providersIcon,
@@ -156,19 +161,38 @@ export function IconButton(props: { icon: IconName; accessibilityLabel: string; 
   );
 }
 
+/** Kept outside the panel it controls: one target to collapse and restore,
+ * including when navigating with a keyboard or a screen reader. */
+export function PanelToggle(props: {
+  side: "left" | "right"; expanded: boolean; name: string; caption?: string;
+  shortcut?: "B" | "Shift+B"; testID: string; onPress: () => void;
+}) {
+  const label = () => `${props.expanded ? "Hide" : "Show"} ${props.name}`;
+  const shortcut = () => props.shortcut ? ` (${keymap.label("mod+" + props.shortcut.toLowerCase())})` : "";
+  return (
+    <View role="button" focusable class={cx("flex-row shrink-0 min-w-[36px] min-h-[36px] items-center justify-center gap-(--space-1) px-(--space-2) rounded-(--radius-md) hover:bg-muted", transitionClass, focusRing)}
+      testID={props.testID} accessibilityLabel={label()} accessibilityState={{ expanded: props.expanded }}
+      tooltip={<Text class={tooltipClass}>{label() + shortcut()}</Text>} onPress={props.onPress}>
+      <Icon name={props.side === "left" ? "panel-left" : "panel-right"} color={props.expanded ? "accent" : "muted"} size={20} />
+      <If when={props.caption}>{(caption) => <Text class={cx(textClass.sm, "font-medium text-foreground")}>{caption()}</Text>}</If>
+    </View>
+  );
+}
+
 // ---------------------------------------------------------------- brand
 
-/** Metro's own mark: an M on the primary colour. Decorative; the name beside it is what screen readers hear. */
-export function MetroMark(props: { size?: "sm" | "lg" }) {
-  const lg = () => props.size === "lg";
+/** A single tinted silhouette and wordmark, with one accessible name. */
+export function MetroMark(props: { size?: "sm" | "lg"; symbolOnly?: boolean }) {
+  const width = () => props.symbolOnly ? 50 : props.size === "lg" ? 174 : 126;
+  const height = () => width() * 96 / (props.symbolOnly ? 200 : 498);
   return (
-    <View
-      class={cx("items-center justify-center bg-primary", lg() ? "size-[36px] rounded-(--radius)" : "size-[22px] rounded-[6px]")}
-      accessibilityElementsHidden
+    <Image
+      src={props.symbolOnly ? metroIcon : metroHorizontal}
+      fadeDuration={0}
+      accessibilityLabel="Metro"
+      style={{ width: width(), height: height(), tintColor: token("foreground") }}
       testID="metro-mark"
-    >
-      <Image src={metroIcon} fadeDuration={0} style={{ width: lg() ? 22 : 15, height: lg() ? 22 : 15, tintColor: token("primary-foreground") }} accessibilityElementsHidden />
-    </View>
+    />
   );
 }
 
@@ -386,7 +410,7 @@ export function Modal(props: Testable & { open: boolean; title: string; onClose:
         if (!e.open) props.onClose();
       }}
       backdropClass="bg-black/55"
-      class="m-auto flex-col overflow-hidden rounded-(--radius-lg) border border-border bg-background shadow-lg"
+      class="m-auto flex-col overflow-hidden rounded-(--radius-xl) border border-border bg-background shadow-lg"
       style={size()}
     >
       {props.children}

@@ -132,11 +132,23 @@ for (const width of [780, 860, 960]) {
   });
 }
 
-test("at 1200 wide the runs stay beside the Chat, with no dialog toggle", async () => {
+test("wide runs collapse and reopen without losing either draft or affecting workspace navigation", async () => {
   const f = world();
   const app = await inChat(f, 1200);
   await app.waitFor("id:runs-aside");
-  expect(app.shows("id:runs-toggle")).toBe(false);
+  await app.press("id:dispatch-new");
+  await app.type("id:dispatch-text", "unfinished task");
+  await app.type("id:composer", "unfinished message");
+  await app.press("label:Hide agent runs");
+  await app.waitFor("id:runs-aside", { state: "gone" });
+  expect(app.shows("id:sidebar")).toBe(true);
+  expect(app.shows("label:Show agent runs")).toBe(true);
+  expect(app.storage()["metro.layout.runs"]).toBe("collapsed");
+  await app.keyboard.press("mod+shift+b");
+  await app.waitFor("id:runs-aside");
+  expect(app.value("id:dispatch-text")).toBe("unfinished task");
+  expect(app.value("id:composer")).toBe("unfinished message");
+  expect(f.posts().some(p => p.path.endsWith("/messages"))).toBe(false);
 });
 
 test("Open from the dialog closes it and goes to the run's room", async () => {

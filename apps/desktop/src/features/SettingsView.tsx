@@ -9,7 +9,7 @@
 
 import { closeSettings, openSettings, settingsOpen, settingsSection } from "../store";
 import type { SettingsSection } from "../store";
-import { Column, compactWidth, IconButton, Label, Modal, ModalNav, ModalTab, ModalTabRow, Row, Spacer, Surface } from "../ui";
+import { Column, compactWidth, IconButton, Label, Modal, ModalNav, ModalTab, ModalTabRow, PanelToggle, Row, settingsPanel, Spacer, Surface } from "../ui";
 import type { IconName } from "../ui";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { ConnectionBanner } from "./Conversation";
@@ -45,16 +45,17 @@ export function SettingsModal() {
 function WideSettings() {
   return (
     <Row grow testID="settings">
-      <ModalNav testID="settings-nav" accessibilityLabel="Settings sections">
-        <Row padX={2} padY={2}>
-          <Label variant="heading" heading>
-            Settings
-          </Label>
-        </Row>
-        <Tabs compact={false} />
-      </ModalNav>
+      <If when={settingsPanel.open()}>
+        <ModalNav testID="settings-nav" accessibilityLabel="Settings sections">
+          <Row padX={2} padY={2}>
+            <Label variant="heading" heading>Settings</Label>
+          </Row>
+          <Tabs compact={false} />
+        </ModalNav>
+      </If>
       <Column grow>
         <Row align="center" padX={3} padY={2}>
+          <SectionsToggle />
           <Spacer />
           <CloseButton />
         </Row>
@@ -71,15 +72,23 @@ function CompactSettings() {
         <Label variant="heading" heading>
           Settings
         </Label>
+        <SectionsToggle />
         <Spacer />
         <CloseButton />
       </Row>
-      <ModalTabRow testID="settings-nav">
-        <Tabs compact />
-      </ModalTabRow>
+      <If when={settingsPanel.open()}>
+        <ModalTabRow testID="settings-nav">
+          <Tabs compact />
+        </ModalTabRow>
+      </If>
       <SettingsPage />
     </Column>
   );
+}
+
+function SectionsToggle() {
+  return <PanelToggle side="left" name="settings sections" caption="Sections" expanded={settingsPanel.open()}
+    testID="toggle-settings-sections" onPress={settingsPanel.toggle} />;
 }
 
 function Tabs(props: { compact: boolean }) {

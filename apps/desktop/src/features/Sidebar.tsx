@@ -36,14 +36,11 @@ import { profileName } from "./profile/profileState";
  * rooms, and Settings (a modal). Search is the box at the top of the main
  * panel. Who is signed in, and where, is the account menu at the bottom.
  */
-export function Sidebar() {
+export function Sidebar(props: { hidden?: boolean }) {
   return (
-    <Surface variant="sidebar" testID="sidebar">
+    <Surface variant="sidebar" testID="sidebar" hidden={props.hidden}>
       <Row align="center" gap={2} padX={4} padY={3}>
         <MetroMark />
-        <Label variant="heading" color="sidebar">
-          Metro
-        </Label>
         <Spacer />
         <ConnectionDot />
       </Row>

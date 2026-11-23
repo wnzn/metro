@@ -4,7 +4,8 @@
 // Importing it also starts the appearance (dark by default, then the saved
 // preference) before the app's first frame: see ./appearance.
 export * from "./appearance";
-export * from "./fonts";
+export * from "./panels";
+import "./fonts/InterVariable.ttf";
 export * from "./primitives";
 export * from "./chrome";
 export * from "./media";

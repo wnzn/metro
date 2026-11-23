@@ -183,8 +183,8 @@ test("surfaces are distinct: cards on the page, the sidebar beside it, popovers 
       expect(palette[a] === palette[b]).toBe(false);
     }
   }
-  expect([light.background, light.sidebar, light.card]).toEqual(["#f7f8fa", "#f1f2f5", "#ffffff"]);
-  expect([dark.background, dark.sidebar]).toEqual(["#0b0d10", "#0f1115"]);
+  expect([light.background, light.sidebar, light.card]).toEqual(["#f8faff", "#f1f5fc", "#ffffff"]);
+  expect([dark.background, dark.sidebar]).toEqual(["#0b0f19", "#081b3b"]);
   expect(dark.popover === dark.card).toBe(false);
 });
 
@@ -192,12 +192,12 @@ test("both schemes define the same tokens", () => {
   expect(Object.keys(light).sort()).toEqual(Object.keys(dark).sort());
 });
 
-test("the shared scales: 8/12/16 radii, 36/28 controls, 24 titles, a line height for every size", () => {
+test("the shared scales retain compact controls and provide the complete brand type and radius scales", () => {
   const t = theme.cssVars.theme as Record<string, string>;
-  expect([t["radius-sm"], t.radius, t["radius-lg"]]).toEqual(["8px", "12px", "16px"]);
+  expect(["sm", "md", "lg", "xl"].map(s => t[`radius-${s}`])).toEqual(["6px", "8px", "12px", "16px"]);
   expect([t["control-height"], t["control-height-sm"]]).toEqual(["36px", "28px"]);
   expect(t["text-2xl"]).toBe("24px");
-  for (const size of ["xs", "sm", "md", "lg", "xl", "2xl"]) {
+  for (const size of ["xs", "sm", "md", "lg", "xl", "2xl", "3xl", "4xl", "display"]) {
     const px = (v: string) => Number(v.replace("px", ""));
     expect(px(t[`leading-${size}`]) > px(t[`text-${size}`])).toBe(true);
   }
