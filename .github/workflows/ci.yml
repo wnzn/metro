@@ -317,12 +317,41 @@ jobs:
     steps:
       - name: Select the desktop runner from the GitHub event
         id: desktop-route
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           python3 -I - <<'PY'
           import json
           import os
+          import re
+          import subprocess
+          from urllib.parse import quote
 
-          def select(env, event):
+          def verify_writer(login, user_id, token):
+              if not token:
+                  return False, "read-only permission lookup token unavailable"
+              # Pass the step's token to this one command only. No inherited gh
+              # host, debug settings, proxy overrides, or interactive prompts.
+              endpoint = f"repos/wnzn/metro/collaborators/{quote(login, safe='')}/permission"
+              try:
+                  result = subprocess.run(
+                      ["gh", "api", "--hostname", "github.com", "--method", "GET", endpoint],
+                      env={"PATH": os.environ["PATH"], "GH_TOKEN": token, "GH_PROMPT_DISABLED": "1"},
+                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, check=False,
+                  )
+                  if result.returncode:
+                      return False, "PR author permission lookup failed"
+                  answer = json.loads(result.stdout)
+                  account = answer["user"]
+                  if account["login"] != login or type(account["id"]) is not int or account["id"] != user_id:
+                      return False, "PR author permission lookup identity mismatch"
+                  if answer["permission"] not in ("write", "maintain", "admin"):
+                      return False, "PR author does not have verified write access"
+              except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                  return False, "PR author permission lookup unavailable or invalid"
+              return True, "same-repository PR to main by a verified writer"
+
+          def select(env, event, token):
               if env.get("GITHUB_REPOSITORY") != "wnzn/metro" or env.get("GITHUB_REPOSITORY_ID") != "1467654868":
                   return False, "not the official Metro repository"
               actor = env.get("GITHUB_ACTOR", "")
@@ -339,11 +368,12 @@ jobs:
                   login = author.get("login", "")
                   if not login or author["type"] != "User" or login.lower().endswith("[bot]"):
                       return False, "missing or bot PR author"
-                  if pr["author_association"] not in ("OWNER", "MEMBER", "COLLABORATOR"):
-                      return False, "PR author association is not trusted"
+                  user_id = author.get("id")
+                  if type(user_id) is not int or user_id <= 0 or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", login):
+                      return False, "PR author lacks a valid account ID or login"
                   if (event.get("sender") or {}).get("type") == "Bot":
                       return False, "PR event sender is a bot"
-                  return True, "trusted same-repository PR to main"
+                  return verify_writer(login, user_id, token)
               if kind == "push":
                   if env.get("GITHUB_REF") != "refs/heads/main" or event["ref"] != "refs/heads/main":
                       return False, "push is not to literal main"
@@ -354,9 +384,10 @@ jobs:
                   return True, "protected main push"
               return False, "not a push or pull_request"
 
+          token = os.environ.pop("GH_TOKEN", "")
           try:
               with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as stream:
-                  use_metro, reason = select(os.environ, json.load(stream))
+                  use_metro, reason = select(os.environ, json.load(stream), token)
           except (OSError, ValueError, KeyError, TypeError, AttributeError):
               use_metro, reason = False, "event payload is missing or incomplete"
           runner = "metro-ci-linux-x64" if use_metro else "ubuntu-24.04"

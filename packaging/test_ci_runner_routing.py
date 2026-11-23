@@ -14,12 +14,14 @@ from test_release_workflow import load, yaml
 METRO = 1467654868
 HOSTED = "ubuntu-24.04"
 LOCAL = "metro-ci-linux-x64"
+AUTHOR = {"type": "User", "login": "alice", "id": 176448921}
+FAKE_TOKEN = "synthetic-test-only"
 
 
 PR = {
     "pull_request": {
         "base": {"ref": "main", "repo": {"id": METRO}}, "head": {"repo": {"id": METRO}},
-        "user": {"type": "User", "login": "alice"}, "author_association": "MEMBER",
+        "user": AUTHOR, "author_association": "NONE",
     },
 }
 PUSH = {"ref": "refs/heads/main", "sender": {"type": "User"}, "deleted": False, "forced": False}
@@ -36,26 +38,55 @@ class DesktopRoutingTests(unittest.TestCase):
         cls.workflow_gate = cls.ci["jobs"]["workflows"]
         cls.selector, = [step for step in cls.workflow_gate["steps"] if step.get("id") == "desktop-route"]
 
-    def route(self, kind, payload, **overrides):
+    def route(self, kind, payload, *, answer=None, status=0, lookup=False, **overrides):
         with tempfile.TemporaryDirectory() as d:
             event_path, output = Path(d) / "event.json", Path(d) / "output"
             event_path.write_text(json.dumps(payload) if not isinstance(payload, str) else payload)
+            marker, gh = Path(d) / "gh-called", Path(d) / "gh"
+            answer = {"user": AUTHOR, "permission": "write"} if answer is None else answer
+            body = answer if isinstance(answer, str) else json.dumps(answer)
+            gh.write_text(f"""#!/usr/bin/env python3
+import os
+from pathlib import Path
+import sys
+assert os.environ.get("GH_TOKEN") == {FAKE_TOKEN!r}
+assert os.environ.get("GH_PROMPT_DISABLED") == "1"
+assert not set(os.environ).intersection({{"GH_HOST", "GH_DEBUG", "GITHUB_EVENT_PATH", "GITHUB_TOKEN"}})
+assert sys.argv[1:] == [
+    "api", "--hostname", "github.com", "--method", "GET", "repos/wnzn/metro/collaborators/alice/permission",
+]
+Path({str(marker)!r}).touch()
+print({body!r})
+print("synthetic debug response", file=sys.stderr)
+sys.exit({status!r})
+""")
+            gh.chmod(0o700)
             env = dict(os.environ, GITHUB_REPOSITORY="wnzn/metro", GITHUB_REPOSITORY_ID=str(METRO),
                        GITHUB_ACTOR="maintainer", GITHUB_EVENT_NAME=kind, GITHUB_REF="refs/heads/main",
-                       GITHUB_REF_PROTECTED="true", GITHUB_EVENT_PATH=str(event_path), GITHUB_OUTPUT=str(output))
+                       GITHUB_REF_PROTECTED="true", GITHUB_EVENT_PATH=str(event_path), GITHUB_OUTPUT=str(output),
+                       GH_TOKEN=FAKE_TOKEN, GH_HOST="untrusted.invalid", GH_DEBUG="api",
+                       PATH=f"{d}:{os.environ['PATH']}")
             env.update(overrides)
             r = subprocess.run(["bash", "-e", "-c", self.selector["run"]], env=env, text=True,
                                capture_output=True, check=True)
+            self.assertEqual(marker.exists(), lookup)
+            self.assertNotIn(FAKE_TOKEN, r.stdout + r.stderr)
+            self.assertNotIn("synthetic debug response", r.stdout + r.stderr)
             self.assertNotIn("alice", r.stdout)
             self.assertNotIn("maintainer", r.stdout)
             return output.read_text().strip().removeprefix("desktop_runner="), r.stdout
 
-    def test_pr_routing_uses_real_event_and_does_not_require_actor_author_equality(self):
-        for association, expect in (("OWNER", LOCAL), ("MEMBER", LOCAL), ("COLLABORATOR", LOCAL), ("CONTRIBUTOR", HOSTED)):
+    def test_pr_routing_uses_verified_permission_not_association(self):
+        for role in ("write", "maintain", "admin"):
+            with self.subTest(role=role):
+                self.assertEqual(self.route("pull_request", PR, answer={"user": AUTHOR, "permission": role},
+                                            lookup=True)[0], LOCAL)
+        for association in ("MEMBER", "CONTRIBUTOR", "NONE"):
             payload = deepcopy(PR)
             payload["pull_request"]["author_association"] = association
             with self.subTest(association=association):
-                self.assertEqual(self.route("pull_request", payload)[0], expect)
+                self.assertEqual(self.route("pull_request", payload, answer={"user": AUTHOR, "permission": "read"},
+                                            lookup=True)[0], HOSTED)
         for side in ("base", "head"):
             payload = deepcopy(PR)
             payload["pull_request"][side]["repo"]["id"] = 123
@@ -63,6 +94,30 @@ class DesktopRoutingTests(unittest.TestCase):
         for ref in ("master", "Main"):
             payload = deepcopy(PR)
             payload["pull_request"]["base"]["ref"] = ref
+            self.assertEqual(self.route("pull_request", payload)[0], HOSTED)
+
+    def test_permission_failures_and_identity_mismatches_stay_hosted(self):
+        for answer, status, reason in (
+            ({"permission": "admin", "user": AUTHOR | {"id": 123}}, 0, "identity mismatch"),
+            ({"permission": "admin", "user": AUTHOR | {"login": "someone-else"}}, 0, "identity mismatch"),
+            ({"permission": "admin", "user": AUTHOR | {"id": str(AUTHOR["id"])}}, 0, "identity mismatch"),
+            ({"permission": "unknown", "user": AUTHOR}, 0, "does not have verified write access"),
+            ("invalid JSON", 0, "unavailable or invalid"),
+            ({}, 0, "unavailable or invalid"),
+            ("HTTP 403", 1, "permission lookup failed"),
+            ("HTTP 404", 1, "permission lookup failed"),
+        ):
+            with self.subTest(reason=reason):
+                runner, log = self.route("pull_request", PR, answer=answer, lookup=True, status=status)
+                self.assertEqual(runner, HOSTED)
+                self.assertIn(reason, log)
+        self.assertEqual(self.route("pull_request", PR, GH_TOKEN="")[0], HOSTED)
+
+    def test_invalid_author_id_or_login_is_rejected_before_gh(self):
+        for bad in ({"id": None}, {"id": "176448921"}, {"id": True}, {"id": 0},
+                    {"login": "alice/../../"}, {"login": "alice?x=1"}):
+            payload = deepcopy(PR)
+            payload["pull_request"]["user"].update(bad)
             self.assertEqual(self.route("pull_request", payload)[0], HOSTED)
 
     def test_bots_wrong_repository_and_uncertainty_stay_hosted_with_a_reason(self):
@@ -97,6 +152,7 @@ class DesktopRoutingTests(unittest.TestCase):
         self.assertNotIn("secrets", self.desktop)
         self.assertEqual(self.desktop["needs"], "workflows")
         self.assertIs(self.selector, self.workflow_gate["steps"][0])
+        self.assertEqual(self.selector["env"], {"GH_TOKEN": "${{ github.token }}"})
         self.assertEqual(self.workflow_gate["outputs"]["desktop_runner"], "${{ steps.desktop-route.outputs.desktop_runner }}")
         self.assertEqual(self.desktop["runs-on"],
                          "${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' "
