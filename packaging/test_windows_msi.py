@@ -209,6 +209,24 @@ class Sources(unittest.TestCase):
         self.assertRegex(n, r"^[0-9A-F]{8}\.exe\|metro-server\.exe$")
         self.assertEqual(b.msi_name("Metro.exe", "x/Metro.exe", used).split("|")[1], "Metro.exe")  # collision
 
+    def test_windows_installer_com_calls_are_typed(self):
+        # Every Windows Installer automation call goes through Invoke-MsiAutomation with a
+        # declared signature; PowerShell values reaching IDispatch raised DISP_E_TYPEMISMATCH.
+        import re
+        helper = (MSI_DIR / "MsiAutomation.ps1").read_text(encoding="utf-8")
+        declared = set(re.findall(r"^\s+'(\w+\.\w+)'\s+= @\('(?:Method|Property)'", helper, re.M))
+        self.assertIn("Record.StringData", declared)
+        users = [MSI_DIR / "test-msi-windows.ps1", HERE / "windows-signing" / "MetroWindowsSigning.psm1"]
+        for p in users:
+            with self.subTest(p=p.name):
+                text = p.read_text(encoding="utf-8")
+                self.assertIn("MsiAutomation.ps1", text)
+                self.assertNotIn("InvokeMember", text)
+                used = set(re.findall(r"Invoke-MsiAutomation \$\w+ '(\w+\.\w+)'", text))
+                self.assertTrue(used, "no Windows Installer calls found")
+                self.assertLessEqual(used, declared)
+                self.assertIsNone(re.search(r"\$(installer|db|view|record|list)\.\w+\(", text, re.I))
+
     def test_lock_is_pinned(self):
         lock = json.loads((MSI_DIR / "wixl-lock.json").read_text())
         self.assertRegex(lock["tree_sha256"], r"^[0-9a-f]{64}$")

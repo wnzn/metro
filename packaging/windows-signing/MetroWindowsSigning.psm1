@@ -250,23 +250,24 @@ function New-TamperedCopy([string] $Path, [string] $Dest) {
 
 # ---------------------------------------------------------------- MSI checks
 
-function Invoke-Com($Object, [string] $Name, [object[]] $Arguments = @()) {
-    $Object.GetType().InvokeMember($Name, [Reflection.BindingFlags]::InvokeMethod, $null, $Object, $Arguments)
-}
-function Get-ComProperty($Object, [string] $Name, [object[]] $Arguments = @()) {
-    $Object.GetType().InvokeMember($Name, [Reflection.BindingFlags]::GetProperty, $null, $Object, $Arguments)
-}
+# Windows Installer automation calls go through Invoke-MsiAutomation, which binds
+# each member to its documented signature with raw .NET-typed arguments (see
+# packaging/windows-msi/MsiAutomation.ps1 for why PowerShell values must not reach
+# IDispatch directly).
+. (Join-Path $PSScriptRoot '..\windows-msi\MsiAutomation.ps1')
 
 function Get-MsiRows($Database, [string] $Query, [int] $Columns) {
-    $view = Invoke-Com $Database 'OpenView' @($Query)
-    Invoke-Com $view 'Execute' | Out-Null
+    $view = Invoke-MsiAutomation $Database 'Database.OpenView' @($Query)
+    Invoke-MsiAutomation $view 'View.Execute' | Out-Null
     $rows = @()
     while ($true) {
-        $record = Invoke-Com $view 'Fetch'
+        $record = Invoke-MsiAutomation $view 'View.Fetch'
         if ($null -eq $record) { break }
-        $rows += , @(1..$Columns | ForEach-Object { Get-ComProperty $record 'StringData' @($_) })
+        $row = [string[]]::new($Columns)
+        for ($field = 1; $field -le $Columns; $field++) { $row[$field - 1] = [string] (Invoke-MsiAutomation $record 'Record.StringData' @($field)) }
+        $rows += , $row
     }
-    Invoke-Com $view 'Close' | Out-Null
+    Invoke-MsiAutomation $view 'View.Close' | Out-Null
     return , $rows
 }
 
@@ -276,7 +277,7 @@ function Test-MetroMsiStructure {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $Msi, [Parameter(Mandatory)] [string] $Version)
     $installer = New-Object -ComObject WindowsInstaller.Installer
-    $db = Invoke-Com $installer 'OpenDatabase' @($Msi, 0)
+    $db = Invoke-MsiAutomation $installer 'Installer.OpenDatabase' @($Msi, 0)
     $tables = (Get-MsiRows $db 'SELECT `Name` FROM `_Tables`' 1) | ForEach-Object { $_[0] }
     foreach ($t in 'MsiEmbeddedUI', 'MsiEmbeddedChainer', 'ServiceInstall', 'ServiceControl', 'SelfReg', 'MsiDigitalSignature') {
         if ($tables -contains $t -and (Get-MsiRows $db "SELECT * FROM ``$t``" 1).Count -gt 0) { Fail "MSI has rows in $t" }
@@ -310,18 +311,18 @@ function Test-MetroMsiStructure {
 function New-TamperedMsiCopy([string] $Path, [string] $Dest) {
     Copy-Item -LiteralPath $Path -Destination $Dest
     $installer = New-Object -ComObject WindowsInstaller.Installer
-    $db = Invoke-Com $installer 'OpenDatabase' @($Dest, 1)
-    $view = Invoke-Com $db 'OpenView' @("INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('MetroTamperCheck', '1')")
-    Invoke-Com $view 'Execute' | Out-Null
-    Invoke-Com $view 'Close' | Out-Null
-    Invoke-Com $db 'Commit' | Out-Null
+    $db = Invoke-MsiAutomation $installer 'Installer.OpenDatabase' @($Dest, 1)
+    $view = Invoke-MsiAutomation $db 'Database.OpenView' @("INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('MetroTamperCheck', '1')")
+    Invoke-MsiAutomation $view 'View.Execute' | Out-Null
+    Invoke-MsiAutomation $view 'View.Close' | Out-Null
+    Invoke-MsiAutomation $db 'Database.Commit' | Out-Null
     [Runtime.InteropServices.Marshal]::FinalReleaseComObject($db) | Out-Null
     return $Dest
 }
 
 function Get-MetroMsiProductState([string] $ProductCode) {
     $installer = New-Object -ComObject WindowsInstaller.Installer
-    return [int] (Get-ComProperty $installer 'ProductState' @($ProductCode))
+    return [int] (Invoke-MsiAutomation $installer 'Installer.ProductState' @($ProductCode))
 }
 
 function Invoke-Msiexec([string[]] $Arguments, [string] $Log) {

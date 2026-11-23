@@ -43,6 +43,7 @@ if (-not ($env:CI -eq 'true' -or $IAcceptChangesToThisWindowsProfile)) {
     throw 'This test installs and removes per-user products in this Windows profile. Run it in CI (CI=true) or pass -IAcceptChangesToThisWindowsProfile.'
 }
 
+. (Join-Path $PSScriptRoot 'MsiAutomation.ps1')
 $Fixtures = Get-Content -LiteralPath (Join-Path $FixturesDir 'fixtures.json') -Raw | ConvertFrom-Json
 $LocalAppData = [Environment]::GetFolderPath('LocalApplicationData')
 $Programs = [Environment]::GetFolderPath('Programs')
@@ -69,10 +70,12 @@ function Invoke-Msi([string] $Arguments, [int] $Expect, [string] $What) {
 }
 
 function Get-Related([string] $UpgradeCode) {
+    # WindowsInstaller.Installer has no members in PowerShell's COM adapter: use the typed IDispatch helper.
     $installer = New-Object -ComObject WindowsInstaller.Installer
-    $list = $installer.RelatedProducts($UpgradeCode)
-    $out = @()
-    for ($i = 0; $i -lt $list.Count; $i++) { $out += [string] $list.Item($i) }
+    $list = Invoke-MsiAutomation $installer 'Installer.RelatedProducts' @($UpgradeCode)
+    $count = [int] (Invoke-MsiAutomation $list 'StringList.Count')
+    $out = [string[]]::new($count)
+    for ($i = 0; $i -lt $count; $i++) { $out[$i] = [string] (Invoke-MsiAutomation $list 'StringList.Item' @($i)) }
     return ,$out
 }
 
