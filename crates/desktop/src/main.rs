@@ -28,6 +28,7 @@ use std::time::Duration;
 use metro_connector::desktop::bridge::{self, ENV_TOKEN, ENV_URL};
 use metro_connector::desktop::core::{Desktop, DesktopConfig};
 use metro_connector::desktop::local::{LocalWorkspaceHost, ToolsHook};
+use metro_connector::desktop::monitoring::{EventKind, Events};
 use metro_connector::desktop::store;
 use metro_connector::desktop_local::LocalServer;
 use metro_connector::desktop_tools::DesktopTools;
@@ -204,7 +205,9 @@ async fn end_ui(child: &mut tokio::process::Child) -> Option<std::process::ExitS
 fn exit_code(status: Option<std::process::ExitStatus>) -> u8 {
     let Some(s) = status else { return 1 };
     if let Some(c) = s.code() {
-        return c.clamp(0, 255) as u8;
+        // NTSTATUS values (for example a missing DLL) are negative as i32.
+        // The launcher cannot forward the full value, but must still fail.
+        return u8::try_from(c).unwrap_or(1);
     }
     #[cfg(unix)]
     {
@@ -216,30 +219,38 @@ fn exit_code(status: Option<std::process::ExitStatus>) -> u8 {
     1
 }
 
-async fn launch() -> Result<u8, String> {
-    let dir = install_dir()?;
+async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
+    let start_failed = |msg| (EventKind::LauncherStartFailed, msg);
+    let dir = install_dir().map_err(start_failed)?;
     let ui = component(&dir.join("ui").join(UI_NAME)).ok_or_else(|| {
-        format!(
+        start_failed(format!(
             "the app files are incomplete: ui{}{UI_NAME} is missing. Extract the whole Metro archive again and keep the ui folder next to Metro.",
             std::path::MAIN_SEPARATOR
-        )
+        ))
     })?;
     let server = component(&dir.join(SERVER_NAME));
 
-    let root =
-        store::desktop_root().map_err(|e| format!("cannot find a place for Metro's data: {e}"))?;
+    let root = store::desktop_root()
+        .map_err(|e| start_failed(format!("cannot find a place for Metro's data: {e}")))?;
     store::prepare_private_dir(&root)
-        .map_err(|e| format!("cannot prepare Metro's data folder: {e}"))?;
+        .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
     let lock = store::try_lock_instance(&root)
-        .map_err(|e| format!("cannot prepare Metro's data folder: {e}"))?;
+        .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
     let primary = lock.is_some();
 
     let local: Option<Arc<dyn LocalWorkspaceHost>> = match (&server, primary) {
         (Some(bin), true) => {
             let data = root.join("local");
             match store::prepare_private_dir(&data) {
-                Ok(()) => Some(Arc::new(LocalServer::new(bin.clone(), data))),
+                Ok(()) => Some(Arc::new(LocalServer::with_events(
+                    bin.clone(),
+                    data,
+                    events.cloned(),
+                ))),
                 Err(e) => {
+                    if let Some(events) = events {
+                        events.record(EventKind::LocalServerStartFailed);
+                    }
                     eprintln!("Metro: the local workspace is unavailable: {e}");
                     None
                 }
@@ -250,9 +261,11 @@ async fn launch() -> Result<u8, String> {
     let mut cfg = DesktopConfig::new(root.clone(), primary, local);
     cfg.tools = tools_hook(&root, primary);
     let desktop = Desktop::new(cfg);
-    let bridge = bridge::start(desktop.clone())
-        .await
-        .map_err(|e| format!("cannot start Metro's local connection service: {e}"))?;
+    let bridge = bridge::start(desktop.clone()).await.map_err(|e| {
+        start_failed(format!(
+            "cannot start Metro's local connection service: {e}"
+        ))
+    })?;
 
     let mut cmd = tokio::process::Command::new(&ui);
     if let Some(ui_dir) = ui.parent() {
@@ -293,14 +306,33 @@ async fn launch() -> Result<u8, String> {
         Err(e) => {
             bridge.stop().await;
             desktop.shutdown().await;
-            return Err(format!("cannot start the Metro window: {e}"));
+            return Err((
+                EventKind::UiSpawnFailed,
+                format!("cannot start the Metro window: {e}"),
+            ));
         }
     };
     #[cfg(windows)]
     let _job = child.raw_handle().and_then(|h| job::Job::assign(h as _));
 
     let status = tokio::select! {
-        s = child.wait() => s.ok(),
+        s = child.wait() => {
+            let failure = match &s {
+                Err(_) => Some(EventKind::UiWaitFailed),
+                Ok(s) if !s.success() => Some(match s.code() {
+                    #[cfg(unix)]
+                    Some(127) => EventKind::UiExit127,
+                    #[cfg(windows)]
+                    Some(c) if c as u32 == 0xc000_0135 => EventKind::UiMissingDll,
+                    _ => EventKind::UiUnexpectedExit,
+                }),
+                _ => None,
+            };
+            if let (Some(events), Some(kind)) = (events, failure) {
+                events.record(kind);
+            }
+            s.ok()
+        },
         _ = stop_requested() => end_ui(&mut child).await,
     };
     // The UI is gone: nothing may keep serving on its behalf.
@@ -332,6 +364,7 @@ fn main() -> ExitCode {
     unsafe {
         metro_connector::http::exempt_loopback_from_proxy();
     }
+    let events = store::desktop_root().ok().map(|root| Events::new(&root));
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -339,13 +372,19 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
+            if let Some(events) = &events {
+                events.record(EventKind::LauncherStartFailed);
+            }
             fatal(&format!("Metro can't start: {e}"));
             return ExitCode::from(1);
         }
     };
-    let code = match rt.block_on(launch()) {
+    let code = match rt.block_on(launch(events.as_ref())) {
         Ok(code) => code,
-        Err(msg) => {
+        Err((kind, msg)) => {
+            if let Some(events) = &events {
+                events.record(kind);
+            }
             fatal(&format!("Metro can't start: {msg}"));
             1
         }

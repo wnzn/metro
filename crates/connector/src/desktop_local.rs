@@ -61,6 +61,7 @@ use rand::RngCore;
 use serde::{Deserialize, Serialize};
 
 use crate::desktop::local::{BoxFut, LocalState, LocalWorkspace, LocalWorkspaceHost};
+use crate::desktop::monitoring::{EventKind, Events};
 use crate::fsutil::{ensure_private_dir, read_private, remove_private, write_private};
 use crate::{SafeError, Secret};
 
@@ -108,6 +109,7 @@ pub struct LocalServer {
 struct Shared {
     binary: PathBuf,
     root: PathBuf,
+    events: Option<Events>,
     state: Mutex<LocalState>,
     /// Serializes open and shutdown; holds the running server.
     running: tokio::sync::Mutex<Option<Running>>,
@@ -156,10 +158,15 @@ impl LocalServer {
     /// `server_binary`: the absolute path of the bundled `metro-server[.exe]`.
     /// `data_root`: the private directory for this OS user's local workspace.
     pub fn new(server_binary: PathBuf, data_root: PathBuf) -> Self {
+        Self::with_events(server_binary, data_root, None)
+    }
+
+    pub fn with_events(server_binary: PathBuf, data_root: PathBuf, events: Option<Events>) -> Self {
         LocalServer {
             shared: Arc::new(Shared {
                 binary: server_binary,
                 root: data_root,
+                events,
                 state: Mutex::new(LocalState::Stopped),
                 running: tokio::sync::Mutex::new(None),
                 closing: AtomicBool::new(false),
@@ -200,7 +207,7 @@ impl LocalServer {
                 });
             }
             // It stopped on its own (crash, killed): start a fresh one.
-            self.shared.set_current(None);
+            let _ = self.shared.live();
             if let Some(old) = slot.take() {
                 let child = old.child.clone();
                 drop(old);
@@ -232,6 +239,9 @@ impl LocalServer {
             }
             Err(e) => {
                 self.shared.set_state(LocalState::Failed);
+                if !self.shared.closing.load(Ordering::SeqCst) {
+                    self.shared.record(EventKind::LocalServerStartFailed);
+                }
                 Err(e)
             }
         }
@@ -456,6 +466,12 @@ impl Drop for LocalServer {
 }
 
 impl Shared {
+    fn record(&self, kind: EventKind) {
+        if let Some(events) = &self.events {
+            events.record(kind);
+        }
+    }
+
     fn set_state(&self, state: LocalState) {
         *self.state.lock().unwrap_or_else(|e| e.into_inner()) = state;
     }
@@ -483,6 +499,10 @@ impl Shared {
         // while the state says Running.
         if !stopping {
             self.set_state(LocalState::Failed);
+        }
+        drop(cur);
+        if !stopping && !self.closing.load(Ordering::SeqCst) {
+            self.record(EventKind::LocalServerExited);
         }
         None
     }

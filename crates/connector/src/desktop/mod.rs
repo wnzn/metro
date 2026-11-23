@@ -7,6 +7,7 @@
 //! | Method + path | Body | Answer |
 //! |---|---|---|
 //! | `GET /v1/status` | | bridge, version, instance, kinds, session, local, connections |
+//! | `GET /v1/monitoring/events` | | `{events: [...]}`; recent device-only operational errors |
 //! | `POST /v1/session` | `{server_url, session_token}` | status; verifies `GET /v1/me`, starts confirmed workers |
 //! | `DELETE /v1/session` | | status; stops every worker and sign-in |
 //! | `POST /v1/connections/{id}/pair` | `{kind, base_url?, models?}` | connection; mints the device token itself |
@@ -26,5 +27,6 @@ pub mod bridge;
 pub mod core;
 pub mod local;
 pub mod metro_api;
+pub mod monitoring;
 pub mod store;
 mod tools_glue;

@@ -25,6 +25,7 @@ use tokio::task::JoinHandle;
 
 use super::local::{LocalState, LocalWorkspaceHost, SessionCtx, ToolsHook};
 use super::metro_api::{ApiError, MetroApi};
+use super::monitoring::{EventKind, Events};
 use super::store::{self, Binding};
 use crate::metro::MetroClient;
 use crate::netpolicy::validate_base_url;
@@ -246,6 +247,7 @@ pub fn open_system_browser(url: &str) -> Result<(), String> {
 
 pub struct Desktop {
     cfg: DesktopConfig,
+    pub(super) events: Events,
     /// Serializes changes (session, pairing, credentials); status never waits on it.
     ops: tokio::sync::Mutex<()>,
     state: Arc<Mutex<State>>,
@@ -282,6 +284,7 @@ struct Bound {
 impl Desktop {
     pub fn new(cfg: DesktopConfig) -> Arc<Self> {
         Arc::new(Desktop {
+            events: Events::new(&cfg.root),
             cfg,
             ops: tokio::sync::Mutex::new(()),
             state: Arc::new(Mutex::new(State::default())),
@@ -566,6 +569,8 @@ impl Desktop {
         };
         let s_state = self.state.clone();
         let s_name = name.clone();
+        let state_events = self.events.clone();
+        let offline = std::sync::atomic::AtomicBool::new(false);
         let on_state = Arc::new(move |rs: RunState| {
             let w = match rs {
                 RunState::Online => WorkerState::Online,
@@ -574,6 +579,10 @@ impl Desktop {
             let d = (w == WorkerState::Offline)
                 .then(|| "Cannot reach the Metro server; retrying".to_string());
             set_worker(&s_state, &s_name, epoch, w, d);
+            let is_offline = w == WorkerState::Offline;
+            if !offline.swap(is_offline, std::sync::atomic::Ordering::Relaxed) && is_offline {
+                state_events.record(EventKind::DeviceWorkerOffline);
+            }
         });
         let opts = RunOptions {
             poll_interval: self.cfg.poll_interval,
@@ -583,6 +592,7 @@ impl Desktop {
         };
         let e_state = self.state.clone();
         let e_name = name.clone();
+        let events = self.events.clone();
         let task = tokio::spawn(async move {
             let client = if cfg.kind.embeds_media() {
                 MetroClient::new(&cfg.server_url, token, Duration::from_secs(120))
@@ -602,14 +612,17 @@ impl Desktop {
             };
             let (w, d) = match outcome {
                 Stop::Done => (WorkerState::Stopped, None),
-                Stop::Unauthorized => (
-                    WorkerState::Unauthorized,
-                    Some(
-                        "Metro no longer accepts this device's token; pair the connection again"
-                            .into(),
-                    ),
-                ),
-                Stop::Fatal(m) => (WorkerState::Error, Some(clean_line(&m, 200))),
+                Stop::Unauthorized => {
+                    events.record(EventKind::DeviceWorkerUnauthorized);
+                    (
+                        WorkerState::Unauthorized,
+                        Some("Metro no longer accepts this device's token; pair the connection again".into()),
+                    )
+                }
+                Stop::Fatal(m) => {
+                    events.record(EventKind::DeviceWorkerFailed);
+                    (WorkerState::Error, Some(clean_line(&m, 200)))
+                }
             };
             set_worker(&e_state, &e_name, epoch, w, d);
         });
@@ -1320,7 +1333,11 @@ impl Desktop {
             profile: &b.profile,
             config: &b.config,
         };
-        match tokio::time::timeout(Duration::from_secs(60), p.available_models()).await {
+        let result = tokio::time::timeout(Duration::from_secs(60), p.available_models()).await;
+        if !matches!(&result, Ok(Ok(_))) {
+            self.events.record(EventKind::DeviceModelDiscoveryFailed);
+        }
+        match result {
             Ok(Ok(models)) => Ok(json!({"models": models})),
             Ok(Err(e)) => Err(err(
                 502,

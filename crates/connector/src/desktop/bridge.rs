@@ -241,6 +241,7 @@ async fn guard(State(ctx): State<Arc<Ctx>>, req: Request, next: Next) -> Respons
 fn router(ctx: Arc<Ctx>) -> Router {
     Router::new()
         .route("/v1/status", get(status))
+        .route("/v1/monitoring/events", get(monitoring_events))
         .route("/v1/session", post(session_open).delete(session_close))
         .route("/v1/connections/{id}/pair", post(pair))
         .route("/v1/connections/{id}/rotate", post(rotate))
@@ -287,6 +288,19 @@ struct Empty {}
 
 async fn status(State(ctx): State<Arc<Ctx>>) -> Response {
     ok(ctx.desktop.status().await)
+}
+
+async fn monitoring_events(State(ctx): State<Arc<Ctx>>) -> Response {
+    let events = ctx.desktop.events.clone();
+    match tokio::task::spawn_blocking(move || events.recent()).await {
+        Ok(Ok(events)) => ok(json!({"events": events})),
+        _ => err(
+            503,
+            "monitoring_unavailable",
+            "Device events are unavailable",
+        )
+        .into_response(),
+    }
 }
 
 #[derive(Deserialize)]

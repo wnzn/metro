@@ -33,6 +33,12 @@ res["status"] = json.loads(b)
 res["no_auth"] = req("GET", "/v1/status", {})[0]
 res["origin"] = req("GET", "/v1/status", dict(auth, Origin="http://evil.example"))[0]
 res["local_open"] = req("POST", "/v1/local-workspace/open", dict(auth, **{"Content-Type": "application/json"}), "{}")[0]
+events_path = "/v1/monitoring/events"
+res["events_no_auth"] = req("GET", events_path, {})[0]
+res["events_wrong_host"] = req("GET", events_path, dict(auth, Host="evil.example"))[0]
+res["events_origin"] = req("GET", events_path, dict(auth, Origin="http://evil.example"))[0]
+res["events_code"], b = req("GET", events_path, auth)
+res["events"] = json.loads(b)
 if os.environ.get("FAKE_UI_MODE") == "local":
     j = dict(auth, **{"Content-Type": "application/json"})
     s, b = req("POST", "/v1/local-workspace/open", j, "{}")
@@ -50,6 +56,8 @@ with open(tmp, "w") as f:
 os.rename(tmp, out)
 if os.environ.get("FAKE_UI_MODE") == "sleep":
     time.sleep(60)
+if os.environ.get("FAKE_UI_MODE") == "monitoring":
+    sys.exit(0)
 sys.exit(7)
 "#;
 
@@ -160,6 +168,11 @@ fn launches_the_packaged_ui_with_a_private_bridge_and_cleans_up() {
     assert_eq!(r["no_auth"], 401);
     assert_eq!(r["origin"], 403);
     assert_eq!(r["local_open"], 503);
+    assert_eq!(r["events_no_auth"], 401);
+    assert_eq!(r["events_wrong_host"], 403);
+    assert_eq!(r["events_origin"], 403);
+    assert_eq!(r["events_code"], 200);
+    assert_eq!(r["events"], serde_json::json!({"events": []}));
     // The bridge is gone with the UI.
     assert!(std::net::TcpStream::connect(("127.0.0.1", port)).is_err());
     // Nothing printed the token.
@@ -182,6 +195,8 @@ fn refuses_an_incomplete_install() {
     let o = retry(|| command(&dir, &launcher, &dir.join("ui.json"), "home").output());
     assert_eq!(o.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&o.stderr).contains("incomplete"));
+    let log = std::fs::read_to_string(dir.join("home/monitoring/events.json")).unwrap();
+    assert!(log.contains("launcher_start_failed"));
 
     // A symlinked UI is not a shipped component either.
     let target = dir.join("elsewhere");
@@ -191,6 +206,53 @@ fn refuses_an_incomplete_install() {
     let o = retry(|| command(&dir, &launcher, &dir.join("ui.json"), "home").output());
     assert_eq!(o.status.code(), Some(1));
     assert!(!dir.join("ui.json").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn records_loader_exit_before_bridge_is_used_and_keeps_stderr_out_of_events() {
+    let dir = scratch("loader-exit");
+    let launcher = layout(&dir, true);
+    let ui = dir.join("app/ui/Metro");
+    let out = dir.join("ui.json");
+    let canary = "private-child-stderr-canary";
+    std::fs::write(&ui, format!("#!/bin/sh\necho {canary} >&2\nexit 127\n")).unwrap();
+    let o = retry(|| command(&dir, &launcher, &out, "home").output());
+    assert_eq!(o.status.code(), Some(127));
+    assert!(!out.exists());
+    let path = dir.join("home/monitoring/events.json");
+    let disk = std::fs::read_to_string(&path).unwrap();
+    assert!(!disk.contains(canary));
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    // On the next launch, provoke an independent local-server startup error.
+    std::fs::write(&ui, FAKE_UI).unwrap();
+    let server = dir.join("app/metro-server");
+    std::fs::write(&server, format!("#!/bin/sh\necho {canary} >&2\nexit 1\n")).unwrap();
+    std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut c = command(&dir, &launcher, &out, "home");
+    c.env("FAKE_UI_MODE", "monitoring");
+    let o = retry(|| c.output());
+    assert_eq!(o.status.code(), Some(0));
+    let r = wait_file(&out);
+    assert_eq!(r["events_code"], 200);
+    let list = r["events"]["events"].as_array().unwrap();
+    assert_eq!(list.len(), 2, "{r}");
+    assert_eq!(list[0]["component"], "local_server");
+    assert_eq!(list[0]["code"], "local_server_start_failed");
+    assert_eq!(list[1]["component"], "launcher");
+    assert_eq!(list[1]["code"], "ui_exit_127");
+    assert!(
+        list[1]["summary"]
+            .as_str()
+            .unwrap()
+            .contains("shared library")
+    );
+    assert!(!r["events"].to_string().contains(canary));
+    assert!(!std::fs::read_to_string(path).unwrap().contains(canary));
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
@@ -235,6 +297,9 @@ fn stopping_the_launcher_ends_the_ui_and_a_second_instance_is_secondary() {
     };
     // The UI was ended by SIGTERM: 128 + 15.
     assert_eq!(status.code(), Some(143));
+    let events = metro_connector::desktop::monitoring::Events::new(&dir.join("home"));
+    // Only the secondary window's spontaneous nonzero exit was recorded.
+    assert_eq!(events.recent().unwrap().len(), 1);
     let t = Instant::now();
     while alive(pid) {
         assert!(
