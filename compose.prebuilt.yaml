@@ -1,0 +1,22 @@
+# Use the prebuilt release images instead of building from source:
+#   METRO_VERSION=X.Y.Z docker compose -f compose.yaml -f compose.prebuilt.yaml up -d
+# or pin exact digests from the release's IMAGES.txt (recommended):
+#   METRO_SERVER_IMAGE=ghcr.io/wnzn/metro-server:vX.Y.Z@sha256:...
+#   METRO_RUNNER_IMAGE=ghcr.io/wnzn/metro-runner:vX.Y.Z@sha256:...
+# Images exist for linux/amd64 and linux/arm64. They are not published yet.
+# The prebuilt runner image runs as uid:gid 1000:1000, so METRO_RUNNER_UID/GID
+# have no effect here; a bind-mounted workspace must be writable by 1000:1000.
+x-server-image: &server-image
+  image: "${METRO_SERVER_IMAGE:-ghcr.io/wnzn/metro-server:v${METRO_VERSION:?set METRO_VERSION or METRO_SERVER_IMAGE}}"
+  build: !reset null
+  pull_policy: missing
+
+x-runner-image: &runner-image
+  image: "${METRO_RUNNER_IMAGE:-ghcr.io/wnzn/metro-runner:v${METRO_VERSION:?set METRO_VERSION or METRO_RUNNER_IMAGE}}"
+  build: !reset null
+  pull_policy: missing
+
+services:
+  server: *server-image
+  runner: *runner-image
+  registered-runner: *runner-image

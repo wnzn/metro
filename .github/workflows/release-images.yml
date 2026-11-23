@@ -1,0 +1,444 @@
+name: Release images
+
+# Reusable, tag-only workflow that builds, smoke-tests, publishes, signs and
+# verifies Metro's container images. It has no triggers of its own.
+#
+# Interface (for the caller, e.g. ci.yml on a v* tag push):
+#   uses: ./.github/workflows/release-images.yml
+#   with:
+#     version: 0.2.0            # required, without the leading v; must equal the pushed tag minus v
+#     push: true                # optional (default true); false = build and smoke only, publish nothing
+#     media: true               # optional (default true): also ship metro-embeddinggemma2, linux/amd64 only
+#     arm64: true               # optional (default true): also build linux/arm64 server and runner
+#   permissions:
+#     contents: read
+#     packages: write           # push to ghcr.io/<owner>
+#     id-token: write           # keyless Sigstore signing (used only by the sign job)
+#   No secrets are accepted; the only credential is github.token. GitHub checks
+#   these grants when the call is loaded, so the caller must grant all three
+#   even with push: false.
+#
+# Outputs: server-ref, runner-ref, media-ref (ghcr.io/<owner>/<image>:v<version>@sha256:<index>,
+# media-ref empty when media is false) and the artifact `release-image-digests`
+# (IMAGES.txt for people, images.json for machines, SHA256SUMS; the same files
+# are also uploaded as `image-evidence` for release-publish.yml). That artifact is uploaded
+# only after every image was pushed by exact digest, read back with the
+# expected platform descriptors, signed keyless and the signatures verified
+# against this workflow's tag identity. If any step fails the workflow fails,
+# so a caller that needs this job never drafts a release.
+#
+# Images: ghcr.io/<owner>/metro-server:v<version> and metro-runner:v<version>
+# (linux/amd64 and linux/arm64, each built natively on its own runner), and
+# metro-embeddinggemma2:v<version> (linux/amd64, weight-free). No `latest`
+# tag. No macOS or Windows containers exist.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Release version without the leading v (X.Y.Z or X.Y.Z-pre). Must match the pushed tag.'
+        type: string
+        required: true
+      push:
+        description: 'Publish (tag push only): push, read back and sign. False builds and smoke-tests only.'
+        type: boolean
+        default: true
+      media:
+        description: 'Also build, smoke-test and publish the weight-free metro-embeddinggemma2 image (linux/amd64).'
+        type: boolean
+        default: true
+      arm64:
+        description: 'Also build linux/arm64 server and runner images on a native arm64 runner.'
+        type: boolean
+        default: true
+    outputs:
+      server-ref:
+        description: 'Signed, digest-pinned metro-server index reference'
+        value: ${{ jobs.sign.outputs.server-ref }}
+      runner-ref:
+        description: 'Signed, digest-pinned metro-runner index reference'
+        value: ${{ jobs.sign.outputs.runner-ref }}
+      media-ref:
+        description: 'Signed, digest-pinned metro-embeddinggemma2 index reference (empty when media is false)'
+        value: ${{ jobs.sign.outputs.media-ref }}
+
+permissions: {}
+
+env:
+  # BuildKit for the docker-container builder (OCI archive export), pinned by digest.
+  BUILDKIT_IMAGE: moby/buildkit:v0.34.0@sha256:b059f8d7226d0b326bc871af489a5dddf65e36af4d20d14251b072974d9ee87c
+  COSIGN_VERSION: v3.1.4
+  COSIGN_SHA256: 424e2c97d0b45fd7a6b608a87f090f35633f4c23ece5f092d48bba11aaf4bbfa
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      owner: ${{ steps.meta.outputs.owner }}
+      platforms: ${{ steps.meta.outputs.platforms }}
+      matrix: ${{ steps.meta.outputs.matrix }}
+    steps:
+      - name: Only a pushed tag named exactly v<version> publishes
+        env:
+          PUSH: ${{ inputs.push }}
+          VERSION: ${{ inputs.version }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -eu
+          printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
+            || { echo "version must be X.Y.Z[-pre] without a leading v" >&2; exit 1; }
+          [ "$PUSH" = true ] || { echo "push: false, build and smoke only"; exit 0; }
+          [ "$EVENT" = push ] || { echo "images are published only from a tag push, not $EVENT" >&2; exit 1; }
+          [ "$REF_TYPE" = tag ] && [ "$REF" = "refs/tags/v$VERSION" ] && [ "$REF_NAME" = "v$VERSION" ] \
+            || { echo "ref $REF is not the tag v$VERSION" >&2; exit 1; }
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: The tag names this exact commit and the app version
+        if: inputs.push
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          git fetch --no-tags --depth=1 origin "+refs/tags/v$VERSION:refs/tags/v$VERSION"
+          [ "$(git rev-parse "refs/tags/v$VERSION^{commit}")" = "$GITHUB_SHA" ] \
+            || { echo "tag v$VERSION does not point at $GITHUB_SHA" >&2; exit 1; }
+          [ "$(git rev-parse HEAD)" = "$GITHUB_SHA" ]
+          app="$(python3 -I -c 'import json;print(json.load(open("apps/desktop/nsh.json"))["version"])')"
+          [ "${VERSION%%-*}" = "$app" ] || { echo "v$VERSION does not match apps/desktop/nsh.json $app" >&2; exit 1; }
+      - id: meta
+        env:
+          ARM64: ${{ inputs.arm64 }}
+        run: |
+          set -eu
+          echo "owner=${GITHUB_REPOSITORY_OWNER,,}" >> "$GITHUB_OUTPUT"
+          amd='{"platform":"linux/amd64","arch":"amd64","runner":"ubuntu-24.04","uname":"x86_64"}'
+          arm='{"platform":"linux/arm64","arch":"arm64","runner":"ubuntu-24.04-arm","uname":"aarch64"}'
+          if [ "$ARM64" = true ]; then
+            echo "matrix={\"include\":[$amd,$arm]}" >> "$GITHUB_OUTPUT"
+            echo "platforms=linux/amd64,linux/arm64" >> "$GITHUB_OUTPUT"
+          else
+            echo "matrix={\"include\":[$amd]}" >> "$GITHUB_OUTPUT"
+            echo "platforms=linux/amd64" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Each platform is built natively, then the exact archives that will be pushed
+  # are loaded and run: no emulation, nothing pushed yet.
+  build:
+    needs: guard
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJSON(needs.guard.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      PLATFORM: ${{ matrix.platform }}
+      ARCH: ${{ matrix.arch }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Native runner for the platform
+        env:
+          UNAME: ${{ matrix.uname }}
+        run: |
+          set -eu
+          [ "$(uname -m)" = "$UNAME" ]
+          docker version --format '{{.Server.Os}}/{{.Server.Arch}} {{.Server.Version}}'
+      - name: Pinned BuildKit builder
+        run: docker buildx create --name metro-release --driver docker-container --driver-opt "image=$BUILDKIT_IMAGE" --bootstrap
+      - name: Build server and runner OCI archives (locked, from this commit)
+        run: |
+          set -eu
+          for component in server runner; do
+            python3 -I packaging/image_release.py build --component "$component" --platform "$PLATFORM" \
+              --version "$VERSION" --revision "$GITHUB_SHA" --source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+              --builder metro-release --out "$RUNNER_TEMP/images"
+          done
+      - name: Load exactly those archives
+        run: |
+          set -eu
+          for name in metro-server metro-runner; do
+            python3 -I packaging/image_release.py load "$RUNNER_TEMP/images/$name-$ARCH.oci.tar" \
+              --platform "$PLATFORM" --tag "metro-release-smoke/$name:$ARCH"
+          done
+      - name: Integrated smoke (health, 401, dedicated and registered runner claims, per-Space roots, non-root)
+        timeout-minutes: 10
+        run: |
+          set -eu
+          python3 -I packaging/image_smoke.py --platform "$PLATFORM" \
+            --server-image "metro-release-smoke/metro-server:$ARCH" \
+            --runner-image "metro-release-smoke/metro-runner:$ARCH" \
+            --result "$RUNNER_TEMP/images/smoke-$ARCH.json"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-images-${{ matrix.arch }}
+          path: ${{ runner.temp }}/images/*-${{ matrix.arch }}.*
+          if-no-files-found: error
+          retention-days: 3
+
+  # Optional weight-free media service, linux/amd64 only (its locked CPU wheels
+  # also cover aarch64, but no arm64 image has been tested, so none is shipped).
+  media:
+    if: inputs.media
+    needs: [guard, build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Pinned BuildKit builder
+        run: docker buildx create --name metro-release --driver docker-container --driver-opt "image=$BUILDKIT_IMAGE" --bootstrap
+      - name: Protocol and preprocessing tests (test-double encoder, no model weights, no network)
+        run: |
+          set -eu
+          docker buildx build --builder metro-release --load --target test -t metro-eg2-release-test:amd64 services/embeddinggemma2
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 256 --memory 8g --cpus 2 \
+            --entrypoint /opt/venv/bin/python metro-eg2-release-test:amd64 \
+            -I -m pytest -q -m 'not real_model' -p no:cacheprovider tests
+      - name: Build the runtime OCI archive and load exactly it
+        run: |
+          set -eu
+          python3 -I packaging/image_release.py build --component media --platform linux/amd64 \
+            --version "$VERSION" --revision "$GITHUB_SHA" --source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+            --builder metro-release --out "$RUNNER_TEMP/media"
+          python3 -I packaging/image_release.py load "$RUNNER_TEMP/media/metro-embeddinggemma2-amd64.oci.tar" \
+            --platform linux/amd64 --tag metro-release-smoke/metro-embeddinggemma2:amd64
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-images-amd64
+          path: ${{ runner.temp }}/core
+      - name: Metro library drives the reference worker offline (the release server binary)
+        run: |
+          set -eu
+          python3 -I packaging/image_release.py load "$RUNNER_TEMP/core/metro-server-amd64.oci.tar" \
+            --platform linux/amd64 --tag metro-release-smoke/metro-server:amd64
+          bin="$(mktemp -d "$RUNNER_TEMP/server-bin.XXXXXX")"
+          cid="$(docker create --network none metro-release-smoke/metro-server:amd64)"
+          trap 'docker rm "$cid" >/dev/null' EXIT
+          docker cp "$cid:/usr/local/bin/metro-server" "$bin/metro-server"
+          docker run --rm --network none --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 256 --memory 8g --cpus 2 \
+            --mount "type=bind,src=$bin/metro-server,dst=/metro-bin/metro-server,readonly" \
+            --mount "type=bind,src=$PWD/tests/e2e,dst=/checkout/tests/e2e,readonly" \
+            --workdir /src --entrypoint /opt/venv/bin/python metro-eg2-release-test:amd64 \
+            -B /checkout/tests/e2e/library_reference.py --bin-dir /metro-bin --timeout 45
+      - name: The release image is weight-free, non-root and its decoder sandbox starts
+        run: |
+          set -eu
+          img=metro-release-smoke/metro-embeddinggemma2:amd64
+          docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges:true \
+            --pids-limit 64 --memory 256m --cpus 1 --entrypoint /bin/sh "$img" \
+            -ec 'test "$(id -u)" = 10001 && test ! -e /models && ! find / -xdev \( -name "*.safetensors" -o -name "*.gguf" \) -print 2>/dev/null | grep -q .'
+          docker run --rm -i --network none --read-only \
+            --tmpfs /tmp:rw,noexec,nosuid,nodev,size=128m,mode=1777 \
+            --cap-drop ALL --security-opt no-new-privileges:true --pids-limit 256 --memory 8g --cpus 2 \
+            --entrypoint /opt/venv/bin/python "$img" -I - <<'PY'
+          import logging
+          import os
+          from metro_eg2.isolation import landlock_abi, set_nondumpable
+          from metro_eg2.main import _sandbox_self_test
+
+          assert os.getuid() == 10001 and landlock_abi() >= 3
+          set_nondumpable()
+          logging.basicConfig(level=logging.INFO)
+          _sandbox_self_test(logging.getLogger("metro_eg2"))
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-images-media-amd64
+          path: ${{ runner.temp }}/media/metro-embeddinggemma2-amd64.*
+          if-no-files-found: error
+          retention-days: 3
+
+  # Promotion: only after every platform and component passed. Uploads the
+  # exact smoked blobs and manifests, then one index per image under v<version>.
+  publish:
+    needs: [guard, build, media]
+    if: >-
+      inputs.push && !cancelled() && needs.guard.result == 'success' && needs.build.result == 'success' &&
+      ((inputs.media && needs.media.result == 'success') || (!inputs.media && needs.media.result == 'skipped'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    concurrency:
+      group: release-images-${{ github.repository }}-v${{ inputs.version }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      packages: write
+    env:
+      VERSION: ${{ inputs.version }}
+      OWNER: ${{ needs.guard.outputs.owner }}
+      PLATFORMS: ${{ needs.guard.outputs.platforms }}
+      MEDIA: ${{ inputs.media }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: release-images-*
+          path: ${{ runner.temp }}/images
+          merge-multiple: true
+      - name: Push exact digests, then the version index (never moves an existing tag)
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          r="$RUNNER_TEMP/images"
+          mkdir -p "$RUNNER_TEMP/pushed"
+          push() { # image expected-platforms archive...
+            image=$1; platforms=$2; shift 2
+            python3 -I packaging/image_release.py push --repository "ghcr.io/$OWNER/$image" \
+              --user "$GITHUB_ACTOR" --token-env REGISTRY_TOKEN \
+              --version "$VERSION" --revision "$GITHUB_SHA" --source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
+              --expect-platforms "$platforms" --result "$RUNNER_TEMP/pushed/$image.json" "$@"
+          }
+          archives() { for p in $(echo "$PLATFORMS" | tr , ' '); do printf '%s\n' "$r/$1-${p#linux/}.oci.tar"; done; }
+          # shellcheck disable=SC2046 # one archive path per line, no spaces
+          push metro-server "$PLATFORMS" $(archives metro-server)
+          # shellcheck disable=SC2046
+          push metro-runner "$PLATFORMS" $(archives metro-runner)
+          if [ "$MEDIA" = true ]; then
+            push metro-embeddinggemma2 linux/amd64 "$r/metro-embeddinggemma2-amd64.oci.tar"
+          fi
+      - name: Read every index and manifest back (own client, then docker buildx imagetools)
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          for result in "$RUNNER_TEMP"/pushed/*.json; do
+            repo="$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["repository"])' "$result")"
+            python3 -I packaging/image_release.py verify --repository "$repo" --user "$GITHUB_ACTOR" \
+              --token-env REGISTRY_TOKEN --expect "$result"
+            digest="$(python3 -I -c 'import json,sys;print(json.load(open(sys.argv[1]))["index_digest"])' "$result")"
+            docker buildx imagetools inspect --raw "$repo:v$VERSION" > "$RUNNER_TEMP/raw.json"
+            python3 -I - "$RUNNER_TEMP/raw.json" "$result" "$digest" <<'PY'
+          import hashlib, json, sys
+          raw = open(sys.argv[1], "rb").read().rstrip(b"\n")
+          want = json.load(open(sys.argv[2]))
+          assert "sha256:" + hashlib.sha256(raw).hexdigest() == sys.argv[3], "imagetools saw a different index"
+          got = {f"{m['platform']['os']}/{m['platform']['architecture']}": m["digest"] for m in json.loads(raw)["manifests"]}
+          assert got == {p: v["manifest_digest"] for p, v in want["platforms"].items()}, got
+          PY
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-images-pushed
+          path: ${{ runner.temp }}/pushed/
+          if-no-files-found: error
+          retention-days: 7
+
+  # Keyless Sigstore signatures bind each pushed digest to this workflow at
+  # this tag (GitHub OIDC). Only this job can mint an ID token.
+  sign:
+    needs: [guard, publish]
+    if: inputs.push
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    env:
+      VERSION: ${{ inputs.version }}
+    outputs:
+      server-ref: ${{ steps.refs.outputs.server }}
+      runner-ref: ${{ steps.refs.outputs.runner }}
+      media-ref: ${{ steps.refs.outputs.media }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-images-pushed
+          path: ${{ runner.temp }}/pushed
+      - name: Install cosign (pinned release, checksum-verified)
+        run: |
+          set -eu
+          mkdir -p "$RUNNER_TEMP/bin"
+          curl --fail --silent --show-error --location --retry 3 --output "$RUNNER_TEMP/bin/cosign" \
+            "https://github.com/sigstore/cosign/releases/download/$COSIGN_VERSION/cosign-linux-amd64"
+          printf '%s  %s\n' "$COSIGN_SHA256" "$RUNNER_TEMP/bin/cosign" | sha256sum --check -
+          chmod 755 "$RUNNER_TEMP/bin/cosign"
+          echo "$RUNNER_TEMP/bin" >> "$GITHUB_PATH"
+      - name: Sign every index and platform manifest, then verify the publisher identity
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          trap 'docker logout ghcr.io >/dev/null 2>&1 || true' EXIT
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin >/dev/null
+          identity="$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/.github/workflows/release-images.yml@refs/tags/v$VERSION"
+          issuer=https://token.actions.githubusercontent.com
+          for result in "$RUNNER_TEMP"/pushed/*.json; do
+            python3 -I - "$result" > "$RUNNER_TEMP/digests.txt" <<'PY'
+          import json, sys
+          r = json.load(open(sys.argv[1]))
+          print(f"{r['repository']}@{r['index_digest']}")
+          for p in sorted(r["platforms"]):
+              print(f"{r['repository']}@{r['platforms'][p]['manifest_digest']}")
+          PY
+            index="$(head -n 1 "$RUNNER_TEMP/digests.txt")"
+            cosign sign --yes --recursive "$index"
+            while IFS= read -r ref; do
+              cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$issuer" \
+                --certificate-github-workflow-repository "$GITHUB_REPOSITORY" \
+                --certificate-github-workflow-sha "$GITHUB_SHA" \
+                --certificate-github-workflow-trigger push \
+                --certificate-github-workflow-ref "refs/tags/v$VERSION" \
+                "$ref" > /dev/null
+              echo "verified signature: $ref"
+            done < "$RUNNER_TEMP/digests.txt"
+          done
+          echo "SIGNER_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "SIGNER_ISSUER=$issuer" >> "$GITHUB_ENV"
+      - name: IMAGES.txt and images.json
+        run: |
+          set -eu
+          python3 -I packaging/image_release.py evidence --version "$VERSION" --revision "$GITHUB_SHA" \
+            --signer-identity "$SIGNER_IDENTITY" --signer-issuer "$SIGNER_ISSUER" \
+            --out "$RUNNER_TEMP/evidence" "$RUNNER_TEMP"/pushed/*.json
+          (cd "$RUNNER_TEMP/evidence" && sha256sum IMAGES.txt images.json > SHA256SUMS)
+      - id: refs
+        run: |
+          set -eu
+          python3 -I - "$RUNNER_TEMP/evidence/images.json" >> "$GITHUB_OUTPUT" <<'PY'
+          import json, sys
+          refs = {i["repository"].rsplit("/", 1)[1]: i["ref"] for i in json.load(open(sys.argv[1]))["images"]}
+          print(f"server={refs['metro-server']}")
+          print(f"runner={refs['metro-runner']}")
+          print(f"media={refs.get('metro-embeddinggemma2', '')}")
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-image-digests
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 90
+      # Same files under the name release-publish.yml downloads.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: image-evidence
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 30
