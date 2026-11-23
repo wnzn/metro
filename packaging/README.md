@@ -4,8 +4,9 @@
 `release.yml` workflow). The scripts below install those prebuilt archives
 for one person, without compiling anything. Each one is a standalone file
 that's also published as a release asset next to the archives, and each is
-listed in `SHA256SUMS`. Nothing is published yet: until a tagged release
-exists, use archives you built or got from CI.
+listed in `SHA256SUMS`. Nothing is published yet. Until the first release
+from the protected `master` branch, use archives you built or CI's unsigned
+test builds ([docs/install.md](../docs/install.md#test-builds-from-github-actions)).
 
 Every installer checks the archive's SHA-256 before it extracts anything.
 It takes `--sha256 HEX`, `--checksum-file` (a `.sha256` sidecar or
@@ -121,15 +122,18 @@ This is **not yet verified**, and there are no production builds.
 - An x64 build under Rosetta isn't supported.
 - We never ask anyone to change Gatekeeper.
 
-## Release signing (tags only)
+## Release signing (protected `master` only)
 
 The pipeline below is implemented and covered by local contract tests. It
 has **never run with real credentials**, so no notarized or signed release
-exists yet.
+exists yet. Who may release, which version, and when: `release_policy.py`
+and [docs/deploy.md](../docs/deploy.md#releases-from-master-in-the-source-never-run-with-real-credentials).
 
-`ci.yml` passes five repository secrets, by name, only to the tag build
-(`release.yml`). They reach only the signing steps of the `macos-sign` job.
-That job runs separately from the build, which runs third-party build code.
+`ci.yml` passes five repository secrets by name, only to the official
+`master` publication workflow (`release-publish.yml`). There they reach
+only the signing steps of its `macos-sign` job. That job first verifies the
+exact `v<version>` tag and the protected `master` push. It runs separately
+from the build, which runs third-party build code.
 
 | Secret | Contents |
 | --- | --- |
@@ -142,17 +146,14 @@ That job runs separately from the build, which runs third-party build code.
 There's also an optional repository **variable**, `MACOS_SIGNING_TEAM_ID`.
 If you set it, the identity must belong to that team.
 
-Official signing also needs a tag ruleset that protects `v*` tags. Every
-signing, push and publication job checks `github.ref_protected`.
-
 What `macos_release.py sign` does:
 
 - It checks the ad hoc archive against its sidecar and `RELEASE.json`.
 - It imports the identity into a throwaway keychain. That keychain is
   deleted afterwards, and the keychain search list is restored.
 - It signs with the hardened runtime and a secure timestamp, from the
-  inside out: `MetroUI.app`, `metro-server`, `metro-tui` when the package
-  includes it, then `Metro.app`. It never uses `--deep`.
+  inside out: `MetroUI.app`, `metro-server`, `metro-tui`, then `Metro.app`.
+  It never uses `--deep`.
 - It keeps the existing entitlements. It refuses `get-task-allow` instead of
   dropping it.
 - It submits with `notarytool --wait`, requires `Accepted`, then staples
@@ -164,22 +165,29 @@ What `macos_release.py sign` does:
   regular file inside the bundle (`Contents/CodeResources`), so it survives
   the `.tar.gz` and the installer's move.
 
-The tag gate then installs the signed archive and checks the installed app
-the same way. It starts and stops it, and only then uploads
+The release gate then installs the signed archive and checks the installed
+app the same way. It starts and stops it, and only then uploads
 `dist-desktop-macos-*`.
 
-Missing secrets fail the tag build, which lists their names. A tag never
-releases without macOS. Ad hoc previews are never renamed into release
+Missing secrets fail the release run, which lists their names. A release
+never ships without macOS. Ad hoc previews are never renamed into release
 names.
 
-Tag order:
+Release order, on an eligible protected `master` push:
 
-1. `release.yml` builds everything, and `macos-sign` runs.
-2. `release-publish.yml` runs Windows signing (`windows-sign.yml`).
-3. `release_assets.py` assembles the release. It requires all four desktop
-   archives, the MSI, the runner, the sidecars, the six scripts and the
-   `metro-tui` terminal client in every desktop archive.
-4. GHCR images are built and signed.
-5. `SHA256SUMS` and the Linux archives get Sigstore signatures.
-6. A draft release is created from the verified signed set. A person
-   publishes it.
+1. `release.yml` builds and tests every platform. Its Windows seed goes to
+   `windows-distribution.yml`.
+2. `release-publish.yml` rechecks eligibility (`release_policy.py authorize`),
+   then runs Windows signing and verification (`windows-sign.yml`).
+3. `release_policy.py tag` creates the immutable `v<version>` tag on exactly
+   the pushed commit, or accepts it there on a rerun. It's never moved.
+4. `macos-sign` signs, notarizes and gates both Macs.
+5. `release_assets.py` assembles the release. It requires all four desktop
+   archives, the MSI, the runner, the sidecars, the six scripts and
+   `metro-tui` in every desktop archive.
+6. GHCR images are pushed, read back and signed (`release-images.yml`).
+7. `SHA256SUMS` and the Linux archives get Sigstore signatures
+   (`sign-release-assets.yml`), bound to `refs/heads/master` and the commit.
+8. `release_policy.py publish` uploads exactly that set to a staging draft,
+   compares every digest GitHub reports, then makes the release public. It
+   never overwrites a published release.

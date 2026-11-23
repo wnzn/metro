@@ -3,28 +3,63 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
-## Partial: release signing, tag DAG and terminal client packaging, local contract checks only (2026-11-23, release lane, local)
+## Partial: automatic releases from protected master, branding, and the first GitHub run (2026-11-23, docs lane, local and GitHub)
 
-**Not a release.** Nothing ran on GitHub, nothing was signed or notarized
-with real credentials, and nothing was published. These are local checks of
-`packaging/macos_release.py`, `packaging/release_assets.py`, `package.py
---tui`, the macOS installer's release checks, and the workflow graph. They
-were run against the committed Windows workflows (`0d27e9a`) and the
-committed `metro-tui` crate (`142bc85`), with no stand-in workflows.
+**No release exists.** Nothing has been signed, notarized or published for
+real. The public repository `wnzn/metro` has only `main`, with no `master`
+branch and no release.
+
+**Release process in the source:**
+- policy and workflow graph: `1b3edab`;
+- Windows signing and GHCR: `1cb6094`;
+- Sigstore: `2cfdc24`;
+- MSI: `f642616` and `6171c75`.
+
+It's described in [deploy.md](deploy.md#ci-and-publishing). Its first real
+run needs a protected `master` branch, the macOS secrets and the Windows
+signing setup.
+
+**Local checks at `82ff919`** (docs lane, re-run for this record):
 
 | Check | Result |
 | --- | --- |
-| `python3 -m unittest discover -s packaging` with PyYAML (`CI=1`) | 106 pass. 8 skipped: PowerShell 7 isn't installed here (3), and the MSI tool tests need `METRO_MSI_TOOLS` (5). |
-| Windows interface cross-checks: preview MSI `*.unsigned-preview.msi`, release `*.msi`; `winsign.check_manifest` accepts the ZIP manifests; `winsign.script_split` accepts the signed `.ps1` files; `package.py` writes exactly `winsign.MANIFEST_KEYS` | Pass |
-| `test_release_workflow.py`: nested permission ceilings across `ci.yml` → `release.yml` / `release-publish.yml` → `windows-distribution.yml`, `windows-sign.yml`, `release-images.yml`, `sign-release-assets.yml`; inputs; secret reach; job order; `metro-tui` built, packaged, given notices and run (`--help`) in every desktop job; the PTY gate in `ci.yml` | Pass |
-| actionlint 1.7.12 with shellcheck on every workflow; `shellcheck -s sh packaging/*.sh` | Clean |
-| `cargo metadata --locked --filter-platform` for x86_64 Linux, Windows MSVC, aarch64 and x86_64 macOS | Resolves; `metro-tui` bin present on all four |
-| `cargo-notices.py --offline` with `metro-tui` | Linux and Windows: pass. **macOS: fails.** `block2 0.6.2` (via `ctrlc` → `dispatch2`, new with `metro-tui`) ships no license text, and no crate from its upstream commit has one. The macOS desktop jobs fail at this step until the license is reviewed or the dependency changes. |
+| `python3 -m unittest discover -s packaging` with PyYAML (`CI=1`). Covers the release policy (official master push versus tags, PRs, `main` and manual runs; eligibility states; immutable tag; staged publication with digest checks), the release set, macOS signing with stand-in Apple tools, installers and the workflow graph. | 136 pass. 9 skipped: PowerShell 7 isn't installed here, and the MSI tool tests need `METRO_MSI_TOOLS`. |
+| `packaging/release-signatures` tests | 16 pass, 1 skipped |
+| `packaging/windows-signing` tests | 33 pass, 1 skipped |
+| actionlint 1.7.12 with shellcheck on every workflow | Clean |
+| `cargo-notices.py --offline` for both macOS targets with `metro-tui` | Pass (the `block2` notice gap was removed in `1feba10`) |
 
-Still open before any tag: the macOS `block2` notice (above), the five macOS
-signing secrets, the Windows signing configuration, a `v*` tag ruleset
-(`github.ref_protected`), and a first native run of every gate on GitHub.
-The `ci.yml` PTY gate for `metro-tui` hasn't run on GitHub yet.
+**Reported by other lanes** (each at its own commit; not re-run here):
+
+| What | Where | Result |
+| --- | --- | --- |
+| Desktop at the train identity commit (frozen) | `72f60c1` | 352 tests pass |
+| Desktop search centering | `f94656b` | 13 focused tests pass; centering checked in the native GTK app |
+| Terminal client F7 sidebar toggle, real PTY | `88a058b` | Pass |
+| Admin panel | — | 21 Chromium checks and 8 Rust tests pass |
+| Backend | `1feba10` | 662 tests pass, 2 ignored; 8 end-to-end scripts pass |
+
+**Design facts these record:**
+- Metro's train identity, with the lowercase `metro` wordmark.
+- The desktop bundles the Inter font, with its license.
+- The MSI's setup window uses Windows' Segoe UI.
+- The desktop's Settings, Navigation and Runs panels collapse independently,
+  with **Mod+B** and **Mod+Shift+B**.
+- The terminal client's **F7** hides or shows its sidebar.
+
+**First GitHub run: `45182697863`.** It was the first hosted run of CI. It
+exposed test fixtures that didn't hold up on GitHub's runners, which
+separate lanes are fixing (for example `e4f1ce2` and `15e51d8`). **Not
+every hosted job has passed yet.** No run has signed, tagged, pushed an
+image or published anything.
+
+**Not verified:**
+- native Windows: the MSI wizard and `msiexec` checks, and any Windows
+  start-up beyond Wine;
+- Apple Developer ID signing and notarization;
+- Windows Authenticode signing by a real publisher;
+- any real vendor account or sign-in;
+- a public release, and the images on GHCR.
 
 ## Source only: terminal client at 142bc85 (2026-11-23, project manager, local)
 

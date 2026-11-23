@@ -1,9 +1,11 @@
 # Terminal client (`metro-tui`)
 
-> **Status: source only.** `metro-tui` is in the source at commit `142bc85`.
-> It isn't in any released or tested download, and the
+> **Status: no release yet.** `metro-tui` has been in the source since
+> `142bc85`. CI now builds it into every desktop download, including the
+> unsigned [test builds](install.md#test-builds-from-github-actions), but no
+> public release containing it exists yet. The
 > [57409bb setup cut](acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)
-> doesn't include it. Its committed test runs the real Linux binary in a
+> doesn't include it. Its test runs the real Linux binary in a
 > pseudo-terminal against a real Metro server with a scripted model
 > ([acceptance](acceptance.md#source-only-terminal-client-at-142bc85-2026-11-23-project-manager-local)).
 > It hasn't been run on native Windows or macOS, or against a real vendor.
@@ -13,15 +15,16 @@ from a terminal, including over SSH. It talks to a Metro server over its
 HTTP API with your own token, like the desktop app does. It doesn't need
 GTK, the desktop app or a display, and it never reads Metro's database.
 
-## Where it will be
+## Where it is
 
-These are **release targets**; no release containing it exists yet.
+It's inside each desktop download. A release will have it in the same
+places; no release exists yet.
 
 | Download | Where `metro-tui` is |
 | --- | --- |
 | `Metro-<version>-linux-x64.tar.gz` | `metro-tui`, next to the `Metro` launcher |
-| `Metro-<version>-windows-x64.zip` | `metro-tui.exe`, next to `Metro.exe` |
-| macOS desktop download | inside the app: `Metro.app/Contents/MacOS/metro-tui` |
+| `Metro-<version>-windows-x64.zip`, or the MSI's install folder | `metro-tui.exe`, next to `Metro.exe` |
+| `Metro-<version>-macos-arm64.tar.gz` / `-macos-x64.tar.gz` | inside the app: `Metro.app/Contents/MacOS/metro-tui` |
 
 Run it from a terminal in that folder, for example `./metro-tui --server …`
 on Linux or `.\metro-tui.exe --server …` in Windows Terminal or PowerShell.
@@ -74,6 +77,7 @@ Press **F1** in the app for this list.
 | **F4** | Pick a model and an advertised thinking level |
 | **F5** | Refresh Spaces, rooms, the transcript and available models |
 | **F6** | Insert a newline in the draft |
+| **F7** | Hide or show the sidebar in a wide terminal |
 | **PgUp / PgDn** | Scroll the transcript while the draft has focus |
 | **← / →**, **Home / End** | Move the caret; jump to the draft's start or end |
 
