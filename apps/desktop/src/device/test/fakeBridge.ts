@@ -50,6 +50,10 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
     /** Ready workers stay "starting" until `serve(id)`, as a real worker does while it first reaches the server. */
     slowStart: false,
     served: new Set<string>(),
+    /** This computer's monitoring events; null: an older helper without them (404). */
+    monitoring: null as null | unknown[],
+    /** Delay (ms) before the monitoring answer. */
+    monitoringDelay: 0,
   };
 
   const ok = (body: unknown, status = 200) => ({ status, headers: { "cache-control": "no-store" }, body });
@@ -86,6 +90,11 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
     if (state.failWith) return err(state.failWith.status, state.failWith.code, state.failWith.message);
 
     if (path === "/v1/status" && req.method === "GET") return ok(status());
+    if (path === "/v1/monitoring/events" && req.method === "GET") {
+      if (!state.monitoring) return err(404, "not_found", "Unknown path.");
+      const answer = ok({ events: state.monitoring });
+      return state.monitoringDelay ? new Promise((resolve) => setTimeout(() => resolve(answer), state.monitoringDelay)) : answer;
+    }
     if (path === "/v1/session") {
       if (req.method === "DELETE") {
         state.session = null;

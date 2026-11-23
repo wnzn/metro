@@ -13,6 +13,7 @@ import { Column, compactWidth, IconButton, Label, Modal, ModalNav, ModalTab, Mod
 import type { IconName } from "../ui";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { ConnectionBanner } from "./Conversation";
+import { MonitoringSettings } from "./MonitoringSettings";
 import { ProfileSettings } from "./profile/ProfileSettings";
 import { ProvidersSettings } from "./ProvidersSettings";
 import { RoutingSettings } from "./RoutingSettings";
@@ -23,6 +24,7 @@ export const SETTINGS_PAGES: readonly { section: SettingsSection; label: string;
   { section: "runners", label: "Runners", icon: "runner" },
   { section: "providers", label: "Model providers", icon: "providers" },
   { section: "routing", label: "Model routing", icon: "routing" },
+  { section: "monitoring", label: "Monitoring", icon: "clock" },
   { section: "appearance", label: "Appearance", icon: "appearance" },
 ];
 
@@ -117,6 +119,9 @@ function SettingsPage() {
       </If>
       <If when={settingsSection() === "routing"}>
         <RoutingSettings />
+      </If>
+      <If when={settingsSection() === "monitoring"}>
+        <MonitoringSettings />
       </If>
       <If when={settingsSection() === "appearance"}>
         <AppearanceSettings />

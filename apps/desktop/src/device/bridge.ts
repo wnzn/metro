@@ -8,6 +8,8 @@
 // JSON. Errors carry the bridge's short safe text plus its `code`, scrubbed
 // once more so a token-shaped string never reaches the UI.
 
+import { parseMonitoringEvents } from "../api/monitoring";
+import type { MonitoringList } from "../api/monitoring";
 import type { BridgeEndpoint } from "./env";
 
 export type DeviceKind =
@@ -176,6 +178,11 @@ export type Bridge = {
    * connect with them, never store or show the token.
    */
   openLocalWorkspace(): Promise<{ serverUrl: string; token: string }>;
+  /**
+   * This computer's own monitoring events (GET /v1/monitoring/events), newest
+   * first. An older helper answers 404: callers show that as unsupported.
+   */
+  monitoringEvents(): Promise<MonitoringList>;
 };
 
 type Method = "GET" | "POST" | "PUT" | "DELETE";
@@ -252,6 +259,11 @@ export function createBridge(endpoint: BridgeEndpoint): Bridge {
         throw new BridgeError("protocol", "Metro's device helper didn't return the local workspace.");
       }
       return { serverUrl: data.server_url, token: data.token };
+    },
+    monitoringEvents: async () => {
+      const list = parseMonitoringEvents(await call("GET", "/v1/monitoring/events", undefined, 10_000));
+      if (!list) throw new BridgeError("protocol", "Metro's device helper sent monitoring events this app doesn't understand.");
+      return list;
     },
   };
 }

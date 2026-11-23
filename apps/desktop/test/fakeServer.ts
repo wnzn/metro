@@ -72,8 +72,17 @@ export function fakeServer() {
     routing: new Map<string, Routing>(),
     /** The server has no model routing (an older version): 404. */
     noRouting: false,
-    /** Delays (ms) for GET paths, to test that late answers don't win. */
+    /** Delays (ms) for GET paths (pathname, or pathname plus query), to test that late answers don't win. */
     delays: new Map<string, number>(),
+    /**
+     * Monitoring events (GET /v1/monitoring/events): per Space (owner only,
+     * `?space_id=`), the caller's own personal Chat (`?scope=me`, from the
+     * token alone) and the instance (org admins). `supported: false` answers
+     * 404, as a server without monitoring does; `noMe: true` answers 400 to
+     * `scope`, as a server with Space and instance events only does;
+     * `unauthorized` answers 401.
+     */
+    monitoring: { supported: true, noMe: false, unauthorized: false, instance: [] as unknown[], spaces: new Map<string, unknown[]>(), users: new Map<string, unknown[]>() },
   };
 
   const addSpace = (id: string, name: string, owner: string, members: string[] = [], paired = false) => {
@@ -139,6 +148,27 @@ export function fakeServer() {
     const m = (re: RegExp) => re.exec(path);
     let r: RegExpExecArray | null;
 
+    if (path === "/v1/monitoring/events" && req.method === "GET") {
+      if (state.monitoring.unauthorized) return err(401, "invalid token");
+      if (!state.monitoring.supported) return err(404, "not found");
+      const sid = url.searchParams.get("space_id");
+      const scope = url.searchParams.get("scope");
+      if ([...url.searchParams.keys()].some((k) => k !== "space_id" && k !== "scope") || (sid !== null && scope !== null)) return err(400, "ask for one scope");
+      if (scope !== null) {
+        if (state.monitoring.noMe) return err(400, "unknown query");
+        if (scope !== "me") return err(400, "scope must be `me`");
+        return ok({ events: state.monitoring.users.get(user) ?? [] });
+      }
+      if (sid !== null) {
+        const s = state.spaces.get(sid);
+        if (!s || !s.members.has(user)) return err(404, "no such space");
+        if (s.owner !== user) return err(403, "only the owner sees a Space's monitoring events");
+        return ok({ events: state.monitoring.spaces.get(sid) ?? [] });
+      }
+      if (url.search) return err(400, "unknown query");
+      if (!admin(user)) return err(403, "only organization admins see instance events");
+      return ok({ events: state.monitoring.instance });
+    }
     if (path === "/v1/me" && req.method === "GET") return ok({ id: user, actor: user, is_org_admin: admin(user) });
     if (path === "/v1/runners" && req.method === "GET") {
       return ok({ runners: [...state.runners.values()].filter((x) => visibleRunner(x, user)).map((x) => runnerJson(x, user)) });
@@ -391,7 +421,8 @@ export function fakeServer() {
   for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"]) {
     network[`${method} ${BASE}/v1/*`] = (req: Req) => {
       const answer = handle(req);
-      const delay = state.delays.get(new URL(req.url).pathname);
+      const u = new URL(req.url);
+      const delay = state.delays.get(u.pathname + u.search) ?? state.delays.get(u.pathname);
       return delay ? new Promise((resolve) => setTimeout(() => resolve(answer), delay)) : answer;
     };
   }

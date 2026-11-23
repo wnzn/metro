@@ -68,7 +68,7 @@ export type Place = "chat" | "space" | "settings" | "search" | "library" | "sche
 /** Where the main panel is under any modal: never Settings. */
 export type MainPlace = Exclude<Place, "settings">;
 /** The pages of Settings. Reachable with or without any Space. */
-export type SettingsSection = "profile" | "runners" | "providers" | "routing" | "appearance";
+export type SettingsSection = "profile" | "runners" | "providers" | "routing" | "monitoring" | "appearance";
 
 // ------------------------------------------------------------------ state
 

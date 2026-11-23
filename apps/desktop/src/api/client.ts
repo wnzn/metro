@@ -4,6 +4,7 @@
 
 import { discoveryApi } from "./discovery";
 import { libraryApi } from "./library";
+import { monitoringApi } from "./monitoring";
 import { profileApi } from "./profile";
 import type { RawFn } from "./profile";
 
@@ -368,6 +369,8 @@ export function createClient(options: ClientOptions) {
     ...libraryApi(request, binary),
     // Profiles (src/api/profile.ts): JSON on `request`, pictures on `binary`.
     ...profileApi(request, binary),
+    // Monitoring events (src/api/monitoring.ts): one Space, My Chat or the instance; never an aggregate.
+    ...monitoringApi(request),
 
     async me(): Promise<Me> {
       const data = await request("GET", "/v1/me");
