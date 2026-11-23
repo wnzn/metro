@@ -1,5 +1,7 @@
 //! The real `metro-desktop` binary in a packaged layout (`<dir>/Metro`,
-//! `<dir>/ui/Metro`), with a scripted stand-in for the NSH UI that reports
+//! `<dir>/ui/Metro`; on macOS the `Metro.app` bundle with the nested
+//! `MetroUI.app`, so the UI runs under the guardian), with a scripted
+//! stand-in for the NSH UI that reports
 //! what it was given and probes the bridge. Unix only (the stand-in is a
 //! Python script); Windows is covered by the cross build.
 #![cfg(unix)]
@@ -69,13 +71,26 @@ fn scratch(name: &str) -> PathBuf {
     d
 }
 
-/// `<dir>/Metro` (the launcher) and `<dir>/ui/Metro` (the stand-in UI).
+/// The launcher's folder (it also holds `metro-server`) and the UI's
+/// folder. macOS: the app bundle layout, under an install folder with a
+/// space in its name.
+#[cfg(not(target_os = "macos"))]
+const LAUNCHER_DIR: &str = "app";
+#[cfg(not(target_os = "macos"))]
+const UI_DIR: &str = "app/ui";
+#[cfg(target_os = "macos")]
+const LAUNCHER_DIR: &str = "app/Metro Desktop/Metro.app/Contents/MacOS";
+#[cfg(target_os = "macos")]
+const UI_DIR: &str = "app/Metro Desktop/Metro.app/Contents/Helpers/MetroUI.app/Contents/MacOS";
+
+/// `<LAUNCHER_DIR>/Metro` (the launcher) and `<UI_DIR>/Metro` (the stand-in UI).
 fn layout(dir: &Path, with_ui: bool) -> PathBuf {
-    let launcher = dir.join("app").join("Metro");
-    std::fs::create_dir_all(dir.join("app").join("ui")).unwrap();
+    let launcher = dir.join(LAUNCHER_DIR).join("Metro");
+    std::fs::create_dir_all(dir.join(LAUNCHER_DIR)).unwrap();
+    std::fs::create_dir_all(dir.join(UI_DIR)).unwrap();
     std::fs::copy(env!("CARGO_BIN_EXE_metro-desktop"), &launcher).unwrap();
     if with_ui {
-        let ui = dir.join("app").join("ui").join("Metro");
+        let ui = dir.join(UI_DIR).join("Metro");
         std::fs::write(&ui, FAKE_UI).unwrap();
         std::fs::set_permissions(&ui, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
@@ -159,7 +174,7 @@ fn launches_the_packaged_ui_with_a_private_bridge_and_cleans_up() {
     );
     assert_eq!(r["no_proxy"], "example.com,127.0.0.1,localhost,::1");
     assert_eq!(r["argv"], serde_json::json!([]));
-    let ui_dir = std::fs::canonicalize(dir.join("app/ui")).unwrap();
+    let ui_dir = std::fs::canonicalize(dir.join(UI_DIR)).unwrap();
     assert_eq!(Path::new(r["cwd"].as_str().unwrap()), ui_dir);
     assert_eq!(r["status_code"], 200);
     assert_eq!(r["status"]["instance"], "primary");
@@ -202,7 +217,7 @@ fn refuses_an_incomplete_install() {
     let target = dir.join("elsewhere");
     std::fs::write(&target, FAKE_UI).unwrap();
     std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
-    std::os::unix::fs::symlink(&target, dir.join("app/ui/Metro")).unwrap();
+    std::os::unix::fs::symlink(&target, dir.join(UI_DIR).join("Metro")).unwrap();
     let o = retry(|| command(&dir, &launcher, &dir.join("ui.json"), "home").output());
     assert_eq!(o.status.code(), Some(1));
     assert!(!dir.join("ui.json").exists());
@@ -213,7 +228,7 @@ fn refuses_an_incomplete_install() {
 fn records_loader_exit_before_bridge_is_used_and_keeps_stderr_out_of_events() {
     let dir = scratch("loader-exit");
     let launcher = layout(&dir, true);
-    let ui = dir.join("app/ui/Metro");
+    let ui = dir.join(UI_DIR).join("Metro");
     let out = dir.join("ui.json");
     let canary = "private-child-stderr-canary";
     std::fs::write(&ui, format!("#!/bin/sh\necho {canary} >&2\nexit 127\n")).unwrap();
@@ -230,7 +245,7 @@ fn records_loader_exit_before_bridge_is_used_and_keeps_stderr_out_of_events() {
 
     // On the next launch, provoke an independent local-server startup error.
     std::fs::write(&ui, FAKE_UI).unwrap();
-    let server = dir.join("app/metro-server");
+    let server = dir.join(LAUNCHER_DIR).join("metro-server");
     std::fs::write(&server, format!("#!/bin/sh\necho {canary} >&2\nexit 1\n")).unwrap();
     std::fs::set_permissions(&server, std::fs::Permissions::from_mode(0o755)).unwrap();
     let mut c = command(&dir, &launcher, &out, "home");
@@ -351,7 +366,7 @@ fn local_workspace_through_the_launcher() {
     }
     let dir = scratch("local");
     let launcher = layout(&dir, true);
-    std::fs::copy(&server, dir.join("app/metro-server")).unwrap();
+    std::fs::copy(&server, dir.join(LAUNCHER_DIR).join("metro-server")).unwrap();
     let out = dir.join("ui.json");
     let mut c = command(&dir, &launcher, &out, "home");
     c.env("FAKE_UI_MODE", "local");

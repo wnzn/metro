@@ -17,8 +17,15 @@
 //!    workspace, and exits with the UI's exit code.
 //!
 //! Nothing secret is written to argv, logs or disk by the launcher.
+//!
+//! On macOS the launcher is `Metro.app/Contents/MacOS/Metro`, the server sits
+//! next to it, and the UI is the nested, unchanged NSH app; a guardian keeps
+//! the UI's lifetime tied to the launcher's (see [`macos`]).
 
 #![cfg_attr(windows, windows_subsystem = "windows")]
+
+#[cfg(unix)]
+mod macos;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -35,7 +42,7 @@ use metro_connector::desktop_tools::DesktopTools;
 
 #[cfg(windows)]
 const UI_NAME: &str = "Metro.exe";
-#[cfg(not(windows))]
+#[cfg(not(any(windows, target_os = "macos")))]
 const UI_NAME: &str = "Metro";
 #[cfg(windows)]
 const SERVER_NAME: &str = "metro-server.exe";
@@ -222,6 +229,9 @@ fn exit_code(status: Option<std::process::ExitStatus>) -> u8 {
 async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
     let start_failed = |msg| (EventKind::LauncherStartFailed, msg);
     let dir = install_dir().map_err(start_failed)?;
+    #[cfg(target_os = "macos")]
+    let ui = macos::ui_executable(&dir).map_err(start_failed)?;
+    #[cfg(not(target_os = "macos"))]
     let ui = component(&dir.join("ui").join(UI_NAME)).ok_or_else(|| {
         start_failed(format!(
             "the app files are incomplete: ui{}{UI_NAME} is missing. Extract the whole Metro archive again and keep the ui folder next to Metro.",
@@ -267,7 +277,21 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
         ))
     })?;
 
+    #[cfg(not(target_os = "macos"))]
     let mut cmd = tokio::process::Command::new(&ui);
+    // The guardian starts `ui` itself and passes this environment on.
+    #[cfg(target_os = "macos")]
+    let mut cmd = match macos::guardian_command(&dir) {
+        Ok(cmd) => cmd,
+        Err(e) => {
+            bridge.stop().await;
+            desktop.shutdown().await;
+            return Err((
+                EventKind::UiSpawnFailed,
+                format!("cannot start the Metro window: {e}"),
+            ));
+        }
+    };
     if let Some(ui_dir) = ui.parent() {
         cmd.current_dir(ui_dir);
     }
@@ -278,6 +302,11 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
         .env("no_proxy", no_proxy())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
+    // The guardian's stdin is its liveness pipe: when it closes (this
+    // process ends, however it ends) the guardian ends the UI. It is never
+    // SIGKILLed on drop, so it always gets to do that.
+    #[cfg(target_os = "macos")]
+    cmd.stdin(std::process::Stdio::piped()).kill_on_drop(false);
     #[cfg(unix)]
     {
         // Own process group (so stopping reaches its helpers), and Linux
@@ -314,6 +343,9 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
     };
     #[cfg(windows)]
     let _job = child.raw_handle().and_then(|h| job::Job::assign(h as _));
+    // Held, never written, until this function returns.
+    #[cfg(target_os = "macos")]
+    let _liveness = child.stdin.take();
 
     let status = tokio::select! {
         s = child.wait() => {
@@ -365,6 +397,19 @@ fn tools_hook(root: &Path, primary: bool) -> Option<Arc<dyn ToolsHook>> {
 }
 
 fn main() -> ExitCode {
+    // First: a guardian does none of the launcher's setup (no desktop root,
+    // monitoring, proxy changes or runtime).
+    #[cfg(target_os = "macos")]
+    if let Some(code) = macos::guardian_main() {
+        return code;
+    }
+    // Below a guardian (a missing dispatch, or the launcher shipped as the
+    // UI) this binary never acts as the launcher: no recursion.
+    #[cfg(unix)]
+    if macos::under_guardian() {
+        fatal("Metro can't start: this copy of Metro is damaged. Download Metro again.");
+        return ExitCode::from(2);
+    }
     #[cfg(unix)]
     // SAFETY: umask has no preconditions.
     unsafe {
