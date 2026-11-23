@@ -217,6 +217,7 @@ jobs:
       # with DisableMsi=0 (Windows client behaviour); account, profile and policy are
       # restored afterwards.
       - name: MSI lane native tests (fixtures, upgrade, repair, downgrade, uninstall; then the preview MSI)
+        id: msi-lifecycle
         run: |
           $t = $env:RUNNER_TEMP
           $require = @()
@@ -225,7 +226,12 @@ jobs:
             -FixturesDir "$t\fixtures" -Msi "$t\dist\$env:MSI_NAME" -Version $env:VERSION -LogDir "$t\logs\msi-lane" @require `
             -StandardUserFixture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      # Independent diagnostic on the same validated inputs: also run it when the MSI
+      # lifecycle failed, so one red run reports both. Never after cancellation or when
+      # an earlier step failed (the lifecycle is then skipped). The job still fails and
+      # the dist upload below still needs every step green.
       - name: Verifier self-test with a throwaway certificate (never trusted, never shipped)
+        if: ${{ !cancelled() && (steps.msi-lifecycle.outcome == 'success' || steps.msi-lifecycle.outcome == 'failure') }}
         run: |
           Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
           $t = $env:RUNNER_TEMP
