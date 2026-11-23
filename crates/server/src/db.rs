@@ -427,6 +427,7 @@ impl Db {
         crate::attachments::init(&conn)?;
         // References library_assets, so it comes after it.
         crate::library_search::init(&conn)?;
+        crate::monitoring::init(&conn)?;
         let version: Option<String> = conn
             .query_row(
                 "SELECT value FROM metro_meta WHERE key = 'schema_version'",

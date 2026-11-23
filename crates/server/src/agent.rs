@@ -32,6 +32,7 @@ use crate::config::ModelConfig;
 use crate::db::reactions::{ReactToMessageTool, ReactionScope};
 use crate::db::{Activity, Addressed, Author, Event, LimitError, Room, activity, actor, kind};
 use crate::model_routing::{AddressedBy, Route, RouteSource};
+use crate::monitoring::Code;
 use crate::orchestration::{
     RunInfo, RunStatus, ThreadAction, ThreadControl, ThreadCreateTool, ThreadSendTool,
     ThreadStatusTool, ThreadStopTool,
@@ -293,8 +294,23 @@ async fn cancelled(mut cancel: watch::Receiver<bool>) {
 
 enum Outcome {
     Completed(String),
-    Failed(String),
+    /// The text shown in the room, and the allowlisted monitoring code.
+    Failed(String, Code),
     Cancelled,
+}
+
+/// The monitoring code of a failed run, from the error's type and
+/// classification only; its text is never recorded.
+fn failure_code(e: &PromptError) -> Code {
+    match e {
+        PromptError::Provider(p) => {
+            crate::monitoring::provider_code(&rig_core::ErrorReport::from(p))
+        }
+        PromptError::Report(report) => crate::monitoring::provider_code(report),
+        PromptError::MaxTurns { .. } => Code::AgentTurnLimit,
+        PromptError::UnknownToolCall { .. } => Code::AgentInvalidToolCall,
+        _ => Code::AgentRunFailed,
+    }
 }
 
 /// What a completed run posts.
@@ -362,9 +378,15 @@ async fn drive(
             Ok(Ok(response)) => Outcome::Completed(response.output()),
             Ok(Err(e)) => {
                 tracing::warn!(error = %e, "agent run failed");
-                Outcome::Failed(truncate(&format!("The agent failed: {e}"), 2_000))
+                Outcome::Failed(
+                    truncate(&format!("The agent failed: {e}"), 2_000),
+                    failure_code(&e),
+                )
             }
-            Err(_) => Outcome::Failed("The agent took too long and was stopped.".to_owned()),
+            Err(_) => Outcome::Failed(
+                "The agent took too long and was stopped.".to_owned(),
+                Code::AgentTimedOut,
+            ),
         },
         () = cancel => Outcome::Cancelled,
     }
@@ -388,7 +410,15 @@ pub async fn start_room_run(
     };
     // Rechecked at acceptance, before any model is built or called.
     ensure_member(state, space_id, initiator).await?;
-    let model = route_model(state, &user_id, Some(space_id), &mut route).await?;
+    let model = match route_model(state, &user_id, Some(space_id), &mut route).await {
+        Ok(model) => model,
+        Err(e) => {
+            state
+                .monitor_space(space_id, Code::ProviderUnavailable)
+                .await;
+            return Err(e);
+        }
+    };
     let active = state
         .runs
         .list()
@@ -396,17 +426,25 @@ pub async fn start_room_run(
         .filter(|r| r.space_id == space_id && r.status == RunStatus::Running)
         .count();
     if active >= state.config.limits.max_space_runs {
+        state.monitor_space(space_id, Code::AgentBusy).await;
         return Err(
             "This Space already has the most agent runs it may have at once; try again shortly."
                 .to_owned(),
         );
     }
     let Ok(permit) = state.agent_runs.clone().try_acquire_owned() else {
+        state.monitor_space(space_id, Code::AgentBusy).await;
         return Err("The agent is busy with other requests; try again shortly.".to_owned());
     };
     let task = truncate(&trigger.text, 200);
     // The registry's `actor` is the initiator's stable id: it authorizes stops.
-    let (info, cancel) = state.runs.start(space_id, &room.id, &user_id, &task)?;
+    let (info, cancel) = match state.runs.start(space_id, &room.id, &user_id, &task) {
+        Ok(started) => started,
+        Err(e) => {
+            state.monitor_space(space_id, Code::AgentBusy).await;
+            return Err(e);
+        }
+    };
     // The turn is shown as the agent that works it: a thread's agent by the
     // thread's name, otherwise Metro; never the person who asked.
     let turn = Activity::agent(
@@ -480,7 +518,10 @@ async fn execute_room_run(
     let outcome = match loaded {
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "loading agent history");
-            Outcome::Failed("The agent could not read the room history.".to_owned())
+            Outcome::Failed(
+                "The agent could not read the room history.".to_owned(),
+                Code::AgentHistoryUnavailable,
+            )
         }
         Ok((earlier, paired)) => {
             let is_thread = room.parent_room_id.is_some();
@@ -554,7 +595,11 @@ async fn execute_room_run(
             ),
             Reply::ReactionOnly => (RunStatus::Completed, None),
         },
-        Outcome::Failed(text) => (RunStatus::Failed, Some((kind::ERROR, text))),
+        Outcome::Failed(text, code) => {
+            // Space-scoped, owner-readable; the room keeps the full text.
+            state.monitor_space(space_id, code).await;
+            (RunStatus::Failed, Some((kind::ERROR, text)))
+        }
         Outcome::Cancelled => (
             RunStatus::Cancelled,
             Some((kind::STATUS, format!("Agent run {run_id} was cancelled."))),
@@ -1141,7 +1186,8 @@ async fn execute_personal_run(
             }
             activity::COMPLETED
         }
-        Outcome::Failed(text) => {
+        // Personal Chat is private: its failures are never monitoring events.
+        Outcome::Failed(text, _) => {
             tagged(kind::ERROR, text).await;
             activity::FAILED
         }

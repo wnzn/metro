@@ -17,6 +17,7 @@ pub mod library;
 pub mod library_search;
 pub mod mentions;
 pub mod model_routing;
+pub mod monitoring;
 pub mod orchestration;
 pub mod profiles;
 pub mod providers;
@@ -93,7 +94,10 @@ impl AppState {
         let providers = crate::providers::ProviderService::from_env(&config.db_path, db.clone())?;
         let limits = &config.limits;
         let library = crate::library::Library::from_env()?;
-        Ok(Self {
+        let retention = crate::monitoring::Retention::of(&config.limits);
+        db.call(move |db| crate::monitoring::prune(db, retention))
+            .await?;
+        let state = Self {
             avatar_encodes: Arc::new(Semaphore::new(crate::profiles::MAX_AVATAR_ENCODES)),
             managed,
             library,
@@ -114,7 +118,14 @@ impl AppState {
             config: Arc::new(config),
             db,
             auth,
-        })
+        };
+        state
+            .monitor(
+                crate::monitoring::Scope::Instance,
+                crate::monitoring::Code::ServerStarted,
+            )
+            .await;
+        Ok(state)
     }
 
     /// Replace the env user names that managed display names may not take
@@ -248,6 +259,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::admin_users::api_router())
         // Personal profiles and avatars; the avatar upload sets its own limit.
         .merge(crate::profiles::router())
+        // `GET /v1/monitoring/events`: Space owners and org admins.
+        .merge(crate::monitoring::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;

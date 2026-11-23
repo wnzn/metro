@@ -261,6 +261,9 @@ pub async fn call_runner(
                 .await;
         }
         Err(e) => {
+            state
+                .monitor_space(space, crate::monitoring::Code::from(e))
+                .await;
             let text = format!("{} failed: {e}", tool.runner_name());
             state
                 .append_with(

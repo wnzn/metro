@@ -79,6 +79,10 @@ pub struct Limits {
     pub max_personal_runners: usize,
     /// Most organization runners on the server.
     pub max_org_runners: usize,
+    /// Monitoring events kept per Space, and for the instance.
+    pub monitoring_events_per_scope: usize,
+    /// How long monitoring events are kept.
+    pub monitoring_max_age: Duration,
 }
 
 impl Default for Limits {
@@ -106,6 +110,8 @@ impl Default for Limits {
             events_page: 500,
             max_personal_runners: 20,
             max_org_runners: 100,
+            monitoring_events_per_scope: 500,
+            monitoring_max_age: Duration::from_secs(30 * 24 * 3600),
         }
     }
 }

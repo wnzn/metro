@@ -1310,7 +1310,13 @@ pub fn spawn(state: AppState) {
                 "scheduled occurrences were interrupted by the last shutdown; not retried"
             ),
             Err(e) => {
-                tracing::error!(error = %format!("{e:#}"), "recovering scheduled occurrences")
+                tracing::error!(error = %format!("{e:#}"), "recovering scheduled occurrences");
+                state
+                    .monitor(
+                        crate::monitoring::Scope::Instance,
+                        crate::monitoring::Code::SchedulerRecoveryFailed,
+                    )
+                    .await;
             }
         }
         let notify = WAKE.get_or_init(Default::default).clone();
@@ -1320,7 +1326,15 @@ pub fn spawn(state: AppState) {
                     tracing::info!(?r, "scheduled prompts");
                 }
                 Ok(_) => {}
-                Err(e) => tracing::error!(error = %format!("{e:#}"), "scheduler tick"),
+                Err(e) => {
+                    tracing::error!(error = %format!("{e:#}"), "scheduler tick");
+                    state
+                        .monitor(
+                            crate::monitoring::Scope::Instance,
+                            crate::monitoring::Code::SchedulerTickFailed,
+                        )
+                        .await;
+                }
             }
             // Sleep until the earliest firing, at most one tick interval,
             // and wake early when a task changes.
