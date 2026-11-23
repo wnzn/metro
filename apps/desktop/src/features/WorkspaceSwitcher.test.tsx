@@ -31,7 +31,8 @@ test("Add verifies an explicit token even for the active URL, and renames only a
 
 test("a file-only draft survives backing out while Add is checking a new account", async () => {
   const w = world();
-  const app = await open("../../App.tsx", { network: w.network as any, platform: "linux", width: 1200, height: 820 });
+  // A manual clock: Bob's verification answers only when the test moves time.
+  const app = await open("../../App.tsx", { network: w.network as any, platform: "linux", width: 1200, height: 820, clock: {} });
   await app.type("id:access-token", TOKENS.alice!);
   await app.press("id:connect");
   await app.waitFor("id:attach");
@@ -39,7 +40,9 @@ test("a file-only draft survives backing out while Add is checking a new account
   await app.press("id:attach");
   await app.waitFor("id:staged:pending.txt");
   const before = app.storage()["metro.savedServers"];
-  w.state.delays.set("/v1/me", 800);
+  // A successful answer, 5 s of app time later: inside the app's own 10 s
+  // limit, so it really arrives, after the person has backed out.
+  const bobCheck = w.answerLate("/v1/me", TOKENS.bob!, 5_000);
   await app.press("id:account-menu");
   await app.press("id:add-server");
   await app.type("id:add-server-name", "Late rename");
@@ -47,12 +50,22 @@ test("a file-only draft survives backing out while Add is checking a new account
   await app.type("id:add-server-token", TOKENS.bob!);
   await app.press("id:add-server-submit");
   await app.press("id:workspace-discard-switch");
+  const bobRequests = () => w.state.log.filter((l) => l.user === "bob").map((l) => `${l.method} ${l.path}`).sort();
+  // Verification asks who Bob is and lists his Spaces, together.
+  await app.waitUntil(() => bobCheck.arrived() === 1 && bobRequests().length === 2, { timeout: 1_000 });
+  expect(bobRequests()).toEqual(["GET /v1/me", "GET /v1/spaces"]);
   await app.back();
-  await app.waitFor("id:workspace-dialog", { state: "gone" });
-  await app.wait(900); // even a successful delayed verification cannot commit
+  await app.waitFor("id:workspace-dialog", { state: "gone", timeout: 1_000 });
+  expect(app.shows("id:staged:pending.txt")).toBe(true);
+  // Move past Bob's answer (and well short of the 10 s limit): the late
+  // success must not switch, rename, or drop the staged file.
+  await app.clock!.runFor(6_000);
   expect(app.shows("id:staged:pending.txt")).toBe(true);
   expect(app.shows("text:alice")).toBe(true);
   expect(app.storage()["metro.savedServers"]).toBe(before);
+  // The stale success went no further: Bob's token was used for that one check only.
+  expect(bobRequests()).toEqual(["GET /v1/me", "GET /v1/spaces"]);
+  expect(app.texts().some((t) => t.includes("Late rename"))).toBe(false);
 });
 
 test("choosing the startup server persists its id without contacting it or leaving the current workspace", async () => {

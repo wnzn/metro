@@ -166,18 +166,26 @@ test("the time zone is one choice: this device, UTC or another IANA name, shown 
   await app.press("id:schedule-once-zone:device");
 });
 
-test("a simple reminder is the prompt and Schedule: the next whole hour in the device's zone is shown first, and nothing is scheduled before Schedule", async () => {
-  const w = discoveryWorld();
-  const app = await signIn(w, "Asia/Manila");
-  await app.press("id:h-schedules");
-  await app.press("id:schedule-new");
-  await app.waitFor("id:schedule-once-preview");
-  // Prefilled, visible and editable: once, the next whole hour, this device's zone, the personal Chat.
+/**
+ * Whether this runtime formats wall times in `zone`. NSH's `Intl` knows UTC
+ * and the zone the process really runs in, not every IANA zone: a device
+ * setting alone doesn't make a zone formattable. Asked here independently of
+ * the app's own check (`zoneFormattable`), with a known instant.
+ */
+function canFormat(zone: string): boolean {
+  try {
+    const hour = new Intl.DateTimeFormat("en-GB", { timeZone: zone, hour: "2-digit", hourCycle: "h23" }).format(new Date(Date.UTC(2026, 0, 1, 0)));
+    return zone !== "Asia/Manila" || hour === "08";
+  } catch {
+    return false;
+  }
+}
+
+/** The once form's prefilled time, checked against what Schedule then posts, read in `zone`. */
+async function scheduleReminder(w: W, app: App, zone: string) {
   const time = app.value("id:schedule-once-time")!;
   expect(time).toMatch(/^\d{2}:00$/);
   expect(app.value("id:schedule-once-date")).toMatch(/^\d{4}-\d{2}-\d{2}$/);
-  expect(text(app)).toContain("This device (Asia/Manila)");
-  expect(text(app)).toMatch(/Fires [^|]*Asia\/Manila/);
   expect(text(app)).toContain("To: the agent in your personal Chat");
   expect(w.d.log.filter((l) => l.path === "/v1/schedules" && l.method === "POST")).toHaveLength(0);
 
@@ -189,8 +197,51 @@ test("a simple reminder is the prompt and Schedule: the next whole hour in the d
   expect(body.space_id).toBeNull();
   expect(body.schedule.kind).toBe("once");
   const at = Date.parse(body.schedule.at);
-  // The exact moment shown: that hour on Manila's clock.
-  expect(new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Manila", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(at))).toBe(time);
+  // The exact moment shown: that hour on `zone`'s clock, the next whole hour.
+  const wall = zone === "UTC"
+    ? `${String(new Date(at).getUTCHours()).padStart(2, "0")}:${String(new Date(at).getUTCMinutes()).padStart(2, "0")}`
+    : new Intl.DateTimeFormat("en-GB", { timeZone: zone, hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(at));
+  expect(wall).toBe(time);
   expect(at - Date.now()).toBeGreaterThan(9 * 60_000);
   expect(at - Date.now()).toBeLessThan(71 * 60_000);
+  return body.schedule.at;
+}
+
+test("a device zone this runtime can't format falls back to UTC, says so, and schedules in UTC", async () => {
+  // A well-formed IANA-style name that no runtime knows: the same on every host.
+  const zone = "Atlantis/Poseidonia";
+  expect(canFormat(zone)).toBe(false);
+  const w = discoveryWorld();
+  const app = await signIn(w, zone);
+  await app.press("id:h-schedules");
+  await app.press("id:schedule-new");
+  await app.waitFor("id:schedule-once-preview");
+  expect(text(app)).toContain("This device (UTC)");
+  expect(text(app)).not.toContain(zone);
+  expect(text(app)).toMatch(/Fires [^|]* UTC\./);
+  const at = await scheduleReminder(w, app, "UTC");
+  expect(at).toMatch(/^\d{4}-\d{2}-\d{2}T\d{2}:00:00Z$/);
+});
+
+test("a simple reminder is the prompt and Schedule: the next whole hour in the device's zone is shown first, and nothing is scheduled before Schedule", async () => {
+  // Manila is formattable only when the runtime itself runs in it (TZ=Asia/Manila);
+  // elsewhere the app must fall back to UTC visibly, never guess Manila's offset.
+  const manila = canFormat("Asia/Manila");
+  const w = discoveryWorld();
+  const app = await signIn(w, "Asia/Manila");
+  await app.press("id:h-schedules");
+  await app.press("id:schedule-new");
+  await app.waitFor("id:schedule-once-preview");
+  if (manila) {
+    expect(text(app)).toContain("This device (Asia/Manila)");
+    expect(text(app)).toMatch(/Fires [^|]*Asia\/Manila/);
+    const at = await scheduleReminder(w, app, "Asia/Manila");
+    expect(at).toMatch(/\+08:00$/);
+  } else {
+    expect(text(app)).toContain("This device (UTC)");
+    expect(text(app)).not.toContain("Asia/Manila");
+    expect(text(app)).toMatch(/Fires [^|]* UTC\./);
+    const at = await scheduleReminder(w, app, "UTC");
+    expect(at).toMatch(/Z$/);
+  }
 });

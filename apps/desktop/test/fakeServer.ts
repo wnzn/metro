@@ -417,9 +417,27 @@ export function fakeServer() {
     return err(404, "not found");
   }
 
+  /**
+   * Answers requests to `path` made with `token` after `ms` milliseconds,
+   * through the stub's own `delay`: on a manual clock (`open(…, { clock: {} })`)
+   * that answer comes only when the test moves the clock, never by wall time.
+   */
+  const slow = new Map<string, { ms: number; arrived: number }>();
+  const answerLate = (path: string, token: string, ms: number) => {
+    const entry = { ms, arrived: 0 };
+    slow.set(`${path} ${token}`, entry);
+    /** How many such requests have reached the server. */
+    return { arrived: () => entry.arrived };
+  };
+
   const network: Record<string, (req: Req) => unknown> = {};
   for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"]) {
     network[`${method} ${BASE}/v1/*`] = (req: Req) => {
+      const late = slow.get(`${new URL(req.url).pathname} ${(header(req, "authorization") ?? "").replace(/^Bearer /, "")}`);
+      if (late) {
+        late.arrived++;
+        return { ...(handle(req) as object), delay: late.ms };
+      }
       const answer = handle(req);
       const u = new URL(req.url);
       const delay = state.delays.get(u.pathname + u.search) ?? state.delays.get(u.pathname);
@@ -434,7 +452,7 @@ export function fakeServer() {
     state.connections.set(c.id, c);
     return c;
   };
-  return { state, network, addSpace, addRoom, addRunner, addConnection, post, react, posts: () => state.log.filter((l) => l.method !== "GET") };
+  return { state, network, answerLate, addSpace, addRoom, addRunner, addConnection, post, react, posts: () => state.log.filter((l) => l.method !== "GET") };
 }
 
 /** The standard world: Alice owns Acme (paired, Bob is a member); Bob owns Side; Carol has nothing. */
