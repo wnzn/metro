@@ -1,49 +1,21 @@
 name: Release artifacts
 
-# Reusable workflow, called only from ci.yml:
-#   - on pull requests / main with `release: false` (build + package smoke, nothing leaves the
-#     run; no secrets; macOS is an ad hoc signed preview that is never released);
-#   - on `v*` tags, after the rust, desktop and containers gates, with `release: true`.
-# It has no triggers of its own, so nothing here runs on its own and nothing is
-# published unless a maintainer pushes a tag.
-#
-# Every job here holds contents: read at most, because ci.yml also calls this file for pull
-# requests (GitHub validates nested permissions before evaluating `if:`). Tag DAG:
-#   meta (pushed, protected v* tag) -> runner-linux, desktop-linux,
-#        desktop-windows (seed) -> windows-distribution (unsigned-desktop-windows-x64),
-#        desktop-macos (ad hoc, no secrets) -> macos-sign (Developer ID + notarization;
-#        the only job that sees the Apple credentials)
-# then ci.yml calls release-publish.yml (tag only): windows-sign -> assets -> images ->
-# sign-release-assets -> draft-release. A missing credential fails the tag build: macOS
-# is never skipped. Pull requests and main end with the `assets` preview aggregate here.
+# Reusable, read-only platform build and smoke gates. Main and PRs get preview
+# artifacts only. Eligible protected master pushes instead hand off the verified
+# Windows ZIP seed, the ad hoc macOS archives and Linux archives. No job in
+# this tree can sign with credentials or publish.
 
 on:
   workflow_call:
     inputs:
       release:
-        description: 'Tag build (Developer ID macOS, signed Windows, release-mode asset gate) when true; build and smoke only when false.'
+        description: 'Stage native signing inputs for an official master release; false yields a preview.'
         type: boolean
         default: false
-    outputs:
       version:
-        description: 'Release version without the leading v'
-        value: ${{ jobs.meta.outputs.version }}
-      prerelease:
-        description: 'true for a prerelease tag (never marked latest)'
-        value: ${{ jobs.meta.outputs.prerelease }}
-    # Tag builds only (ci.yml maps them by name; pull requests and main pass none).
-    # Used only by the macos-sign job's signing step. See packaging/macos_release.py.
-    secrets:
-      MACOS_SIGNING_P12_BASE64:
-        required: false
-      MACOS_SIGNING_P12_PASSWORD:
-        required: false
-      APPLE_NOTARY_KEY_ID:
-        required: false
-      APPLE_NOTARY_ISSUER_ID:
-        required: false
-      APPLE_NOTARY_KEY_P8:
-        required: false
+        description: 'Official builds: the checked-in version chosen by release_policy.py decide (no leading v).'
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -60,7 +32,6 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.v.outputs.version }}
-      prerelease: ${{ steps.v.outputs.prerelease }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -68,35 +39,29 @@ jobs:
       - id: v
         env:
           RELEASE: ${{ inputs.release }}
-          REF_NAME: ${{ github.ref_name }}
-          REF_TYPE: ${{ github.ref_type }}
+          INPUT_VERSION: ${{ inputs.version }}
           REF_PROTECTED: ${{ github.ref_protected }}
-          EVENT: ${{ github.event_name }}
+          EVENT_DELETED: ${{ github.event.deleted }}
+          EVENT_FORCED: ${{ github.event.forced }}
+          EVENT_AFTER: ${{ github.event.after }}
         run: |
           set -eu
           if [ "$RELEASE" = true ]; then
-            # Official builds (signing, then publication) only from a pushed, protected v* tag.
-            [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && [ "$REF_PROTECTED" = true ] \
-              || { echo "release builds need a pushed v* tag protected by a ruleset" >&2; exit 1; }
-            case "$REF_NAME" in
-              v[0-9]*.[0-9]*.[0-9]*) ;;
-              *) echo "tag $REF_NAME is not vMAJOR.MINOR.PATCH[-prerelease]" >&2; exit 1 ;;
-            esac
-            version="${REF_NAME#v}"
-            printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$' \
-              || { echo "tag $REF_NAME is not valid semver" >&2; exit 1; }
-            base="${version%%-*}"
-            app="$(python3 -I -c 'import json;print(json.load(open("apps/desktop/nsh.json"))["version"])')"
-            [ "$base" = "$app" ] || { echo "tag $REF_NAME does not match apps/desktop/nsh.json version $app" >&2; exit 1; }
-            case "$version" in *-*) prerelease=true ;; *) prerelease=false ;; esac
+            # Official builds only for the protected master push (release_policy.py), and only
+            # for the checked-in version that the caller's release decision chose.
+            python3 -I packaging/release_policy.py provenance > "$RUNNER_TEMP/policy.txt"
+            version="$(sed -n 's/^version=//p' "$RUNNER_TEMP/policy.txt")"
+            if [ -z "$version" ] || [ "$version" != "$INPUT_VERSION" ]; then
+              echo "the release version input is not the checked-in version" >&2
+              exit 1
+            fi
           else
-            # Same base version as the app manifest, so PR packages exercise the real manifest
-            # version (0.2.0 now) instead of an unrelated placeholder.
-            version="$(python3 -I -c 'import json;print(json.load(open("apps/desktop/nsh.json"))["version"])')-ci"
-            prerelease=true
+            # Same base version as the app manifest, so previews exercise the real manifest
+            # version instead of an unrelated placeholder.
+            python3 -I packaging/release_policy.py version > "$RUNNER_TEMP/policy.txt"
+            version="$(sed -n 's/^version=//p' "$RUNNER_TEMP/policy.txt")-ci"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
   # Native Linux x64 runner. Built in the same Debian bookworm toolchain image
   # as the GHCR runner image, so it needs glibc <= 2.36. Windows has no runner
@@ -190,6 +155,7 @@ jobs:
           name: dist-runner-linux-x64
           path: dist/
           if-no-files-found: error
+          overwrite: true
           retention-days: 14
 
   # Packages the TSX app once with the official Linux NSH CLI. The Windows
@@ -266,12 +232,14 @@ jobs:
           name: ui-windows-x64
           path: ${{ runner.temp }}/stage-windows
           if-no-files-found: error
+          overwrite: true
           retention-days: 14
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: ui-linux-x64
           path: ${{ runner.temp }}/stage-linux
           if-no-files-found: error
+          overwrite: true
           retention-days: 14
 
   # Native Windows x64: metro-desktop (with the connector linked in) and metro-server
@@ -586,6 +554,7 @@ jobs:
           name: smoke-windows-screenshot
           path: ${{ runner.temp }}/shot
           if-no-files-found: ignore
+          overwrite: true
           retention-days: 7
       # The unsigned seed for windows-distribution.yml. Never named dist-*, so the
       # release collection can never pick it up.
@@ -594,12 +563,13 @@ jobs:
           name: seed-desktop-windows-x64
           path: dist/
           if-no-files-found: error
+          overwrite: true
           retention-days: 14
 
   # Windows distribution (owned by the Windows lane): turns the seed into the
   # ZIP, the MSI and the two PowerShell scripts, the ZIP and MSI each with a
   # .sha256. Pull requests and main: uploaded as dist-desktop-windows-x64
-  # (unsigned preview). Tags: uploaded as unsigned-desktop-windows-x64 for
+  # (unsigned preview). Official master: uploaded as unsigned-desktop-windows-x64 for
   # windows-sign.yml in release-publish.yml, the only place that may hold
   # id-token: write. This call grants contents: read only, so nothing in its
   # tree may request more (GitHub checks nested permissions before any `if:`).
@@ -782,12 +752,14 @@ jobs:
           name: smoke-linux-screenshot
           path: ${{ runner.temp }}/shot
           if-no-files-found: ignore
+          overwrite: true
           retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-desktop-linux-x64
           path: dist/
           if-no-files-found: error
+          overwrite: true
           retention-days: 14
 
   # macOS build and preview. Native jobs per architecture (macos-15 = Apple
@@ -798,8 +770,8 @@ jobs:
   # install-metro-macos.sh into a path with spaces and check a clean start and
   # shutdown. This job never sees signing credentials (it runs third-party build
   # code). Its ad hoc output is uploaded as preview-not-verified-adhoc-*, never
-  # matched by the release collection; on tags, macos-sign turns it into the
-  # Developer ID signed, notarized release archive.
+  # matched by the release collection; release-publish.yml signs and notarizes
+  # it on eligible master pushes.
   desktop-macos:
     needs: meta
     strategy:
@@ -923,6 +895,7 @@ jobs:
           name: smoke-${{ matrix.target }}-screenshot
           path: ${{ runner.temp }}/shot/*.png
           if-no-files-found: ignore
+          overwrite: true
           retention-days: 7
       # Named so it cannot be mistaken for a release asset.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -930,133 +903,17 @@ jobs:
           name: preview-not-verified-adhoc-${{ matrix.target }}
           path: dist-macos/
           if-no-files-found: error
+          overwrite: true
           retention-days: 7
 
-  # Tag builds only: Developer ID signing and notarization of the ad hoc archive
-  # above, on the same native runner type. The Apple credentials exist only in
-  # the one signing step's environment; macos_release.py keeps the identity in a
-  # throwaway keychain, writes the .p12 and .p8 to owner-only temporary files and
-  # deletes them, and never prints a value. The gate then checks what users get:
-  # a copy of the final archive extracted with the system tar, and the app as
-  # install-metro-macos.sh installs it (stapled ticket, Gatekeeper, launch).
-  macos-sign:
-    if: inputs.release
-    needs: [meta, desktop-macos]
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - runner: macos-15
-            target: macos-arm64
-            arch: arm64
-          - runner: macos-15-intel
-            target: macos-x64
-            arch: x86_64
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 150
-    env:
-      TARGET: ${{ matrix.target }}
-      VERSION: ${{ needs.meta.outputs.version }}
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - name: Runner architecture matches the target
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -eu
-          test "$(uname -m)" = "$ARCH"
-          sw_vers
-          python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: preview-not-verified-adhoc-${{ matrix.target }}
-          path: ${{ runner.temp }}/adhoc
-      - name: Only a pushed, protected v<version> tag is signed
-        env:
-          REF_PROTECTED: ${{ github.ref_protected }}
-        run: |
-          set -eu
-          [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = "refs/tags/v$VERSION" ] && [ "$REF_PROTECTED" = true ] \
-            || { echo "Developer ID signing runs only for the protected v$VERSION tag push" >&2; exit 1; }
-      - name: Signing credentials are configured (checked by name only)
-        env:
-          MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
-          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
-        run: python3 -I packaging/macos_release.py check-credentials
-      - name: Developer ID sign, notarize, staple, re-archive; verify a fresh extraction
-        timeout-minutes: 130
-        env:
-          MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
-          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
-          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
-          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
-          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
-          MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
-        run: |
-          set -eu
-          python3 -I packaging/macos_release.py sign \
-            --archive "$RUNNER_TEMP/adhoc/Metro-$VERSION-$TARGET.tar.gz" --out-dir dist
-          ls -l dist
-      - name: Release gate (downloaded copy, installer, stapled ticket, Gatekeeper, launch)
-        timeout-minutes: 10
-        run: |
-          set -eu
-          # A separate copy, as a person would download it.
-          dl="$(mktemp -d "$RUNNER_TEMP/download dir.XXXXXX")"
-          cp "dist/Metro-$VERSION-$TARGET.tar.gz" "dist/Metro-$VERSION-$TARGET.tar.gz.sha256" "$dl/"
-          a="$dl/Metro-$VERSION-$TARGET.tar.gz"
-          python3 -I packaging/macos_release.py verify-archive "$a"
-          home="$(mktemp -d "$RUNNER_TEMP/mac home.XXXXXX")"
-          home="$(cd "$home" && pwd -P)"
-          i="$GITHUB_WORKSPACE/packaging/install-metro-macos.sh"
-          HOME="$home" sh "$i" install --archive "$a" | tee "$RUNNER_TEMP/install.log"
-          grep -q "Developer ID signed and notarized" "$RUNNER_TEMP/install.log"
-          dir="$home/Applications/Metro Desktop"
-          app="$dir/Metro.app"
-          manifest="$home/Library/Application Support/Metro/Installer/RELEASE.json"
-          # The ticket survived the archive, the installer's copy and its move.
-          python3 -I packaging/macos_release.py verify-app --app "$app" --manifest "$manifest"
-          # The signed terminal client runs under the hardened runtime from the installed bundle.
-          "$app/Contents/MacOS/metro-tui" --help > "$RUNNER_TEMP/tui-help.txt"
-          grep -q "Metro conversations" "$RUNNER_TEMP/tui-help.txt"
-          export METRO_DESKTOP_HOME="$home/desktop data"
-          sh packaging/smoke-macos-launch.sh "$app" "$manifest" "$RUNNER_TEMP/shot" "release-$TARGET"
-          HOME="$home" sh "$i" uninstall
-          test ! -e "$dir"
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: release-${{ matrix.target }}-screenshot
-          path: ${{ runner.temp }}/shot/*.png
-          if-no-files-found: ignore
-          retention-days: 7
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: dist-desktop-${{ matrix.target }}
-          path: dist/
-          if-no-files-found: error
-          retention-days: 14
-
-  # The preview aggregate (pull requests and main): the Linux and Windows
+  # The preview aggregate: the Linux and Windows
   # desktop archives, the Windows MSI, the Linux runner, their .sha256
   # sidecars and the installer scripts in one SHA256SUMS, checked by the same
-  # release_assets.py as tags but without macOS (its ad hoc previews are
-  # separate artifacts) and without signature requirements. Tags assemble in
-  # release-publish.yml instead, in release mode, after Windows signing.
+  # release_assets.py as the release but without macOS (its ad hoc previews
+  # are separate artifacts) and without signature requirements.
   assets:
-    needs: [meta, runner-linux, windows-distribution, desktop-linux, desktop-macos, macos-sign]
-    # Pull requests and main only (macos-sign is skipped there). On tags the
-    # release-mode aggregate runs in release-publish.yml, after Windows signing.
-    if: >-
-      ${{ !cancelled() && !inputs.release
-      && needs.meta.result == 'success' && needs.runner-linux.result == 'success'
-      && needs.windows-distribution.result == 'success' && needs.desktop-linux.result == 'success'
-      && needs.desktop-macos.result == 'success' && needs.macos-sign.result == 'skipped' }}
+    needs: [meta, runner-linux, windows-distribution, desktop-linux, desktop-macos]
+    if: ${{ !inputs.release }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -1080,4 +937,5 @@ jobs:
           name: preview-assets
           path: release/
           if-no-files-found: error
+          overwrite: true
           retention-days: 14

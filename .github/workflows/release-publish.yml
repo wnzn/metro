@@ -1,60 +1,58 @@
 name: Release publication
 
-# Reusable workflow, tag builds only: ci.yml calls it after release.yml
-# (release: true) built every platform in the same run. Every
-# job that needs more than contents: read lives here, so the pull-request path
-# (release.yml with release: false) never references a write or OIDC permission.
-#
-#   guard -> windows-sign (windows-sign.yml, Windows lane: signs the
-#            unsigned-desktop-windows-x64 output of release.yml and uploads
-#            dist-desktop-windows-x64)
-#         -> assets (release_assets.py in release mode: exactly the four desktop
-#            archives incl. both notarized macOS builds, the MSI, the runner,
-#            sidecars, all six installer scripts, SHA256SUMS; `release-assets`)
-#         -> images (release-images.yml: build, push, read back and keyless-sign
-#            the GHCR images; uploads `release-image-digests`: IMAGES.txt,
-#            images.json, SHA256SUMS)
-#         -> sign (sign-release-assets.yml: stages `release-assets` plus
-#            IMAGES.txt, Sigstore-signs SHA256SUMS and both Linux archives with
-#            the GitHub OIDC identity of this tag, verifies, and uploads
-#            `signed-release-assets`)
-#         -> draft-release (verifies `signed-release-assets` again with cosign
-#            against the signer identity, then creates or updates a DRAFT
-#            GitHub release from exactly that folder; a human publishes it)
+# CI calls this only after its tests and the platform smoke gates pass on the
+# official protected master push. Sign and verify Windows, pin v<version> at
+# that commit, then sign macOS, assemble the set, verify GHCR and Sigstore
+# signatures, and publicly promote the complete release. The tag is a marker,
+# not a workflow trigger.
 
 on:
   workflow_call:
     inputs:
       version:
-        description: 'Release version without the leading v (release.yml output)'
+        description: 'Checked-in release version chosen by ci.yml, without the leading v.'
         type: string
         required: true
-      prerelease:
-        description: 'Prerelease tag: marked prerelease, never latest'
-        type: boolean
-        required: true
+    secrets:
+      MACOS_SIGNING_P12_BASE64:
+        required: false
+      MACOS_SIGNING_P12_PASSWORD:
+        required: false
+      APPLE_NOTARY_KEY_ID:
+        required: false
+      APPLE_NOTARY_ISSUER_ID:
+        required: false
+      APPLE_NOTARY_KEY_P8:
+        required: false
 
 permissions:
   contents: read
 
 jobs:
-  guard:
+  authorize:
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.check.outputs.proceed }}
     steps:
-      - name: Only a v<version> tag push publishes
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Recheck exact protected master provenance and eligibility before signing Windows
+        id: check
         env:
+          GH_TOKEN: ${{ github.token }}
           VERSION: ${{ inputs.version }}
-          EVENT: ${{ github.event_name }}
-          REF_TYPE: ${{ github.ref_type }}
-          REF_NAME: ${{ github.ref_name }}
           REF_PROTECTED: ${{ github.ref_protected }}
-        run: |
-          set -eu
-          [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && [ "$REF_NAME" = "v$VERSION" ] && [ "$REF_PROTECTED" = true ] \
-            || { echo "release publication runs only for a pushed, protected v$VERSION tag" >&2; exit 1; }
+          EVENT_DELETED: ${{ github.event.deleted }}
+          EVENT_FORCED: ${{ github.event.forced }}
+          EVENT_AFTER: ${{ github.event.after }}
+        run: python3 -I packaging/release_policy.py authorize --version "$VERSION"
 
   windows-sign:
-    needs: guard
+    needs: authorize
+    if: needs.authorize.outputs.proceed == 'true'
     uses: ./.github/workflows/windows-sign.yml
     with:
       version: ${{ inputs.version }}
@@ -62,8 +60,140 @@ jobs:
       contents: read
       id-token: write
 
+  tag:
+    needs: windows-sign
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    timeout-minutes: 5
+    outputs:
+      proceed: ${{ steps.pin.outputs.proceed }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Verify protected master provenance, create the tag if missing and read it back
+        id: pin
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          EVENT_DELETED: ${{ github.event.deleted }}
+          EVENT_FORCED: ${{ github.event.forced }}
+          EVENT_AFTER: ${{ github.event.after }}
+        run: python3 -I packaging/release_policy.py tag --version "$VERSION"
+
+  # Developer ID signing and notarization on both native runner types. The
+  # provenance/tag step succeeds before either step receives any Apple secret.
+  macos-sign:
+    needs: tag
+    if: needs.tag.outputs.proceed == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: macos-arm64
+            arch: arm64
+          - runner: macos-15-intel
+            target: macos-x64
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Runner architecture matches the target
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          test "$(uname -m)" = "$ARCH"
+          sw_vers
+          python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: preview-not-verified-adhoc-${{ matrix.target }}
+          path: ${{ runner.temp }}/adhoc
+          digest-mismatch: error
+      - name: Verify the exact tag and protected master push before any Apple credentials
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          EVENT_DELETED: ${{ github.event.deleted }}
+          EVENT_FORCED: ${{ github.event.forced }}
+          EVENT_AFTER: ${{ github.event.after }}
+        run: python3 -I packaging/release_policy.py verify-tag --version "$VERSION"
+      - name: Signing credentials are configured (checked by name only)
+        env:
+          MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+        run: python3 -I packaging/macos_release.py check-credentials
+      - name: Developer ID sign, notarize, staple, re-archive; verify a fresh extraction
+        timeout-minutes: 130
+        env:
+          MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
+        run: |
+          set -eu
+          python3 -I packaging/macos_release.py sign \
+            --archive "$RUNNER_TEMP/adhoc/Metro-$VERSION-$TARGET.tar.gz" --out-dir dist
+          ls -l dist
+      - name: Release gate (downloaded copy, installer, stapled ticket, Gatekeeper, launch)
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          set -euo pipefail
+          dl="$(mktemp -d "$RUNNER_TEMP/download dir.XXXXXX")"
+          cp "dist/Metro-$VERSION-$TARGET.tar.gz" "dist/Metro-$VERSION-$TARGET.tar.gz.sha256" "$dl/"
+          a="$dl/Metro-$VERSION-$TARGET.tar.gz"
+          python3 -I packaging/macos_release.py verify-archive "$a"
+          home="$(mktemp -d "$RUNNER_TEMP/mac home.XXXXXX")"
+          home="$(cd "$home" && pwd -P)"
+          i="$GITHUB_WORKSPACE/packaging/install-metro-macos.sh"
+          HOME="$home" sh "$i" install --archive "$a" | tee "$RUNNER_TEMP/install.log"
+          grep -q "Developer ID signed and notarized" "$RUNNER_TEMP/install.log"
+          dir="$home/Applications/Metro Desktop"
+          app="$dir/Metro.app"
+          manifest="$home/Library/Application Support/Metro/Installer/RELEASE.json"
+          python3 -I packaging/macos_release.py verify-app --app "$app" --manifest "$manifest"
+          "$app/Contents/MacOS/metro-tui" --help > "$RUNNER_TEMP/tui-help.txt"
+          grep -q "Metro conversations" "$RUNNER_TEMP/tui-help.txt"
+          export METRO_DESKTOP_HOME="$home/desktop data"
+          sh packaging/smoke-macos-launch.sh "$app" "$manifest" "$RUNNER_TEMP/shot" "release-$TARGET"
+          HOME="$home" sh "$i" uninstall
+          test ! -e "$dir"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: release-${{ matrix.target }}-screenshot
+          path: ${{ runner.temp }}/shot/*.png
+          if-no-files-found: ignore
+          overwrite: true
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-desktop-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 14
+
   assets:
-    needs: [guard, windows-sign]
+    needs: [tag, macos-sign]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -74,6 +204,7 @@ jobs:
           pattern: dist-*
           path: ${{ runner.temp }}/collected
           merge-multiple: true
+          digest-mismatch: error
       - name: Assemble and check the release folder (SHA256SUMS)
         env:
           VERSION: ${{ inputs.version }}
@@ -85,10 +216,11 @@ jobs:
           name: release-assets
           path: release/
           if-no-files-found: error
+          overwrite: true
           retention-days: 30
 
   images:
-    needs: [guard, assets]
+    needs: [tag, assets]
     uses: ./.github/workflows/release-images.yml
     with:
       version: ${{ inputs.version }}
@@ -99,16 +231,17 @@ jobs:
       id-token: write
 
   sign:
-    needs: [guard, assets, images]
+    needs: [tag, assets, images]
     uses: ./.github/workflows/sign-release-assets.yml
     with:
       version: ${{ inputs.version }}
+      revision: ${{ github.sha }}
     permissions:
       contents: read
       id-token: write
 
-  draft-release:
-    needs: [guard, assets, images, sign]
+  publish:
+    needs: [tag, assets, images, sign]
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -117,6 +250,7 @@ jobs:
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -130,25 +264,11 @@ jobs:
           sh packaging/release-signatures/install_cosign.sh "$dir/cosign"
           python3 -I packaging/release-signatures/release_signatures.py verify --version "$VERSION" \
             --revision "$GITHUB_SHA" --cosign "$dir/cosign" --directory "$RUNNER_TEMP/release"
-      - name: Create or update the draft release
+      - name: Stage the verified assets, verify GitHub's uploaded digests, and publish
         env:
           GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-          PRERELEASE: ${{ inputs.prerelease }}
-        run: |
-          set -eu
-          cd "$RUNNER_TEMP/release"
-          notes="Draft for review. Windows x64 (ZIP and MSI), Linux x64, macOS Apple silicon and Intel (Developer ID signed, notarized, stapled), the Linux runner and six installer scripts. SHA256SUMS lists every file and is signed with Sigstore (SHA256SUMS.sigstore.json, identity: this repository's sign-release-assets.yml at tag $TAG). Container images by digest: IMAGES.txt."
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ] \
-              || { echo "release $TAG is already published; refusing to modify it" >&2; exit 1; }
-            gh release upload "$TAG" --clobber -- *
-            if [ "$PRERELEASE" = true ]; then gh release edit "$TAG" --prerelease --latest=false; fi
-          else
-            flags=""
-            # A prerelease is never marked latest.
-            [ "$PRERELEASE" = true ] && flags="--prerelease --latest=false"
-            # shellcheck disable=SC2086
-            gh release create "$TAG" --draft --verify-tag $flags --title "$TAG" --notes "$notes" -- *
-          fi
+          REF_PROTECTED: ${{ github.ref_protected }}
+          EVENT_DELETED: ${{ github.event.deleted }}
+          EVENT_FORCED: ${{ github.event.forced }}
+          EVENT_AFTER: ${{ github.event.after }}
+        run: python3 -I packaging/release_policy.py publish --version "$VERSION" --dir "$RUNNER_TEMP/release"

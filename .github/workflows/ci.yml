@@ -1,13 +1,21 @@
 name: CI
 
+# Public releases come only from a protected push to refs/heads/master (see
+# packaging/release_policy.py). Pull requests (including into master) and
+# main run read-only previews; tag pushes start nothing here.
 on:
   pull_request:
   push:
-    branches: [main]
-    tags: ["v*"]
+    branches: [main, master]
 
 permissions:
   contents: read
+
+# Official master runs are serialized. A new run may replace a pending one,
+# but cannot interrupt the run already signing or publishing.
+concurrency:
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && github.ref_protected && !github.event.deleted && !github.event.forced && 'metro-official-master' || format('ci-{0}', github.run_id) }}
+  cancel-in-progress: false
 
 jobs:
   rust:
@@ -304,47 +312,87 @@ jobs:
           command -v pwsh
           python3 -B -m unittest discover -s packaging -v
 
-  # Build and package everything a tag would release, but publish nothing. No
-  # secrets and contents: read only (release.yml's whole tree stays read-only).
+  # The release decision for the official master push: provenance first (no
+  # secrets, read-only token), then the checked-in version and its eligibility
+  # (new / resume -> release; unchanged / done -> CI only). Skipped for every
+  # other event, so nothing else can release.
+  release-policy:
+    if: >-
+      github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master'
+      && github.repository_id == '1467654868' && github.ref_protected
+      && github.event.deleted == false && github.event.forced == false && github.event.after == github.sha
+      && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      release: ${{ steps.decide.outputs.release }}
+      version: ${{ steps.decide.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Provenance, checked-in version and eligibility (v<version> tag, published release)
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          EVENT_DELETED: ${{ github.event.deleted }}
+          EVENT_FORCED: ${{ github.event.forced }}
+          EVENT_BEFORE: ${{ github.event.before }}
+          EVENT_AFTER: ${{ github.event.after }}
+        run: python3 -I packaging/release_policy.py decide
+
+  # Build and package everything a release would ship, but publish nothing:
+  # pull requests, main, and master pushes whose version is already released.
+  # No secrets and contents: read only (release.yml's whole tree stays read-only).
   package-smoke:
-    if: github.ref_type != 'tag'
-    needs: [workflows]
+    needs: [workflows, release-policy]
+    if: >-
+      ${{ !cancelled() && needs.workflows.result == 'success'
+      && (needs.release-policy.result == 'skipped'
+          || (needs.release-policy.result == 'success' && needs.release-policy.outputs.release != 'true')) }}
     uses: ./.github/workflows/release.yml
     with:
       release: false
     permissions:
       contents: read
 
-  # Tag builds only: after every validation gate, build, sign (Developer ID +
-  # notarization on macOS, the Windows signer) and gate the release artifacts.
-  # Only the signing credentials the jobs need are passed, by name; they reach
-  # only macos-sign's signing step; secrets are never inherited wholesale.
+  # Build and exercise every platform on the exact protected push revision.
+  # This tree cannot write or see signing credentials.
   release:
-    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
-    needs: [rust, desktop, containers, workflows]
+    needs: [rust, desktop, containers, workflows, release-policy]
+    if: needs.release-policy.outputs.release == 'true'
     uses: ./.github/workflows/release.yml
     with:
       release: true
+      version: ${{ needs.release-policy.outputs.version }}
     permissions:
       contents: read
+
+  # Then: Windows signing and verification, exact-commit tag, macOS signing,
+  # GHCR images, Sigstore, and automatic public release of the verified set.
+  # No tag event is used.
+  publish:
+    needs: [release-policy, release]
+    if: >-
+      needs.release-policy.outputs.release == 'true'
+      && github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master'
+      && github.repository_id == '1467654868' && github.ref_protected
+      && github.event.deleted == false && github.event.forced == false && github.event.after == github.sha
+      && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      version: ${{ needs.release-policy.outputs.version }}
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
     secrets:
       MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
       MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
       APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
       APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
       APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
-
-  # Tag builds only, after every release asset (macOS and Windows signed) passed:
-  # push and verify the GHCR images, add their digests, sign SHA256SUMS with
-  # Sigstore and create a DRAFT GitHub release for a human to publish.
-  publish:
-    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
-    needs: [release]
-    uses: ./.github/workflows/release-publish.yml
-    with:
-      version: ${{ needs.release.outputs.version }}
-      prerelease: ${{ needs.release.outputs.prerelease == 'true' }}
-    permissions:
-      contents: write
-      packages: write
-      id-token: write
