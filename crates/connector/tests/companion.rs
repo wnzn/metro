@@ -13,6 +13,9 @@ use axum::extract::{Path as UrlPath, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use metro_connector::Secret;
+use metro_connector::metro::{Claim, ErrorKind, MetroClient};
+use metro_connector::profile::{MAX_MODEL_LEN, MAX_MODELS};
 use serde_json::{Value, json};
 
 const DEVICE_TOKEN: &str = "metro_pc_TESTdeviceTOKEN0123456789abcdef";
@@ -30,7 +33,7 @@ struct MetroState {
     seen_bodies: Vec<String>,
     /// Fail this many result posts with 500 before accepting.
     fail_results: usize,
-    claim_override: Option<Response>,
+    claim_overrides: VecDeque<Response>,
     claims: usize,
     /// The token this server accepts (default `DEVICE_TOKEN`).
     token: Option<String>,
@@ -47,7 +50,7 @@ async fn claim(State(s): State<Metro>, headers: HeaderMap, body: Bytes) -> Respo
     if auth(&headers) != format!("Bearer {expected}") {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    if let Some(r) = s.claim_override.take() {
+    if let Some(r) = s.claim_overrides.pop_front() {
         return r;
     }
     match s.jobs.pop_front() {
@@ -320,6 +323,25 @@ fn metro_never_saw_key(e: &Env) {
     }
 }
 
+fn claim_client(e: &Env) -> MetroClient {
+    MetroClient::new(
+        &e.metro_url,
+        Secret::new(DEVICE_TOKEN),
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap()
+}
+
+fn claim_bodies(e: &Env) -> Vec<Value> {
+    e.metro
+        .lock()
+        .unwrap()
+        .seen_bodies
+        .iter()
+        .map(|b| serde_json::from_str(b).unwrap())
+        .collect()
+}
+
 fn chat(model: &str) -> Value {
     json!({
         "model": model,
@@ -336,6 +358,193 @@ fn chat(model: &str) -> Value {
 }
 
 // ---------------------------------------------------------------- tests
+
+#[tokio::test]
+async fn claim_legacy_retry_is_authenticated_and_local_to_the_client() {
+    for old_response in [
+        StatusCode::BAD_REQUEST.into_response(),
+        (
+            StatusCode::UNPROCESSABLE_ENTITY,
+            axum::Json(json!({"error": "the body must be {}"})),
+        )
+            .into_response(),
+    ] {
+        let e = env().await;
+        e.metro
+            .lock()
+            .unwrap()
+            .claim_overrides
+            .push_back(old_response);
+        let models = ["local-small".into()];
+        let client = claim_client(&e);
+        for _ in 0..2 {
+            assert_eq!(
+                client.claim_with_inventory(Some(&models)).await.unwrap(),
+                Claim::Idle
+            );
+        }
+        assert_eq!(
+            claim_client(&e)
+                .claim_with_inventory(Some(&models))
+                .await
+                .unwrap(),
+            Claim::Idle
+        );
+        let extended = json!({"approved_models": models});
+        assert_eq!(
+            claim_bodies(&e),
+            vec![extended.clone(), json!({}), json!({}), extended]
+        );
+        metro_never_saw_key(&e);
+        assert!(e.model.lock().unwrap().seen_auth.is_empty());
+    }
+}
+
+#[tokio::test]
+async fn claim_errors_do_not_downgrade_or_mask_revocation() {
+    let models = ["local-small".into()];
+    let extended = json!({"approved_models": models});
+    for (status, kind) in [
+        (StatusCode::UNAUTHORIZED, ErrorKind::Unauthorized),
+        (StatusCode::FORBIDDEN, ErrorKind::Unauthorized),
+        (StatusCode::UNPROCESSABLE_ENTITY, ErrorKind::Fatal),
+        (StatusCode::TOO_MANY_REQUESTS, ErrorKind::Retryable),
+        (StatusCode::INTERNAL_SERVER_ERROR, ErrorKind::Retryable),
+    ] {
+        let e = env().await;
+        e.metro
+            .lock()
+            .unwrap()
+            .claim_overrides
+            .push_back(status.into_response());
+        let err = claim_client(&e)
+            .claim_with_inventory(Some(&models))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind, kind);
+        assert_eq!(claim_bodies(&e), vec![extended.clone()]);
+        metro_never_saw_key(&e);
+    }
+
+    let e = env().await;
+    e.metro.lock().unwrap().claim_overrides.push_back(
+        (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({"error": "some other invalid request"})),
+        )
+            .into_response(),
+    );
+    assert_eq!(
+        claim_client(&e)
+            .claim_with_inventory(Some(&models))
+            .await
+            .unwrap_err()
+            .message,
+        "claim: HTTP 400",
+    );
+    assert_eq!(claim_bodies(&e), vec![extended.clone()]);
+    metro_never_saw_key(&e);
+
+    let e = env().await;
+    let client = claim_client(&e);
+    e.metro.lock().unwrap().claim_overrides.extend([
+        StatusCode::BAD_REQUEST.into_response(),
+        StatusCode::UNAUTHORIZED.into_response(),
+        StatusCode::BAD_REQUEST.into_response(),
+    ]);
+    assert_eq!(
+        client
+            .claim_with_inventory(Some(&models))
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::Unauthorized,
+    );
+    assert_eq!(
+        client
+            .claim_with_inventory(Some(&models))
+            .await
+            .unwrap_err()
+            .message,
+        "claim: HTTP 400",
+    );
+    assert_eq!(
+        claim_bodies(&e),
+        vec![extended.clone(), json!({}), extended.clone()]
+    );
+    metro_never_saw_key(&e);
+
+    let e = env().await;
+    let client = claim_client(&e);
+    assert_eq!(
+        client.claim_with_inventory(Some(&models)).await.unwrap(),
+        Claim::Idle
+    );
+    e.metro
+        .lock()
+        .unwrap()
+        .claim_overrides
+        .push_back(StatusCode::BAD_REQUEST.into_response());
+    assert_eq!(
+        client
+            .claim_with_inventory(Some(&models))
+            .await
+            .unwrap_err()
+            .message,
+        "claim: HTTP 400",
+    );
+    assert_eq!(claim_bodies(&e), vec![extended.clone(), extended]);
+    metro_never_saw_key(&e);
+}
+
+#[tokio::test]
+async fn claim_checks_profile_limits_without_changing_the_list() {
+    let e = env().await;
+    let client = claim_client(&e);
+    let mut models = (0..MAX_MODELS)
+        .map(|i| format!("{i:02}{}", "é".repeat((MAX_MODEL_LEN - 2) / 2)))
+        .collect::<Vec<_>>();
+    for bad in [
+        vec!["a".into(), "a".into()],
+        vec!["".into()],
+        vec!["a\u{a0}b".into()],
+        vec!["a\u{7f}b".into()],
+        vec![format!("a{}", "é".repeat(MAX_MODEL_LEN / 2))],
+    ] {
+        let err = client.claim_with_inventory(Some(&bad)).await.unwrap_err();
+        assert_eq!(err.kind, ErrorKind::Fatal);
+        assert_eq!(err.message, "claim: invalid approved models");
+    }
+    models.push("extra".into());
+    assert_eq!(
+        client
+            .claim_with_inventory(Some(&models))
+            .await
+            .unwrap_err()
+            .kind,
+        ErrorKind::Fatal
+    );
+    assert!(claim_bodies(&e).is_empty());
+    models.pop();
+    assert_eq!(
+        client.claim_with_inventory(Some(&models)).await.unwrap(),
+        Claim::Idle
+    );
+    assert_eq!(
+        client.claim_with_inventory(Some(&[])).await.unwrap(),
+        Claim::Idle
+    );
+    assert_eq!(client.claim().await.unwrap(), Claim::Idle);
+    assert_eq!(
+        claim_bodies(&e),
+        vec![
+            json!({"approved_models": models}),
+            json!({"approved_models": []}),
+            json!({})
+        ]
+    );
+    metro_never_saw_key(&e);
+}
 
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -380,6 +589,12 @@ async fn setup_writes_private_profile() {
 async fn models_and_complete_roundtrip() {
     let e = env().await;
     setup(&e, true).await;
+
+    assert_eq!(run_once(&e).await.code, 0);
+    let approved = json!({"approved_models": ["local-small", "local-big"]});
+    assert_eq!(claim_bodies(&e), vec![approved.clone()]);
+    // An idle poll is driven only by local approval, never by vendor discovery.
+    assert!(e.model.lock().unwrap().seen_auth.is_empty());
 
     push_job(
         &e,
@@ -428,7 +643,13 @@ async fn models_and_complete_roundtrip() {
     let sent = &m.completions[0];
     assert_eq!(sent["model"], "local-small");
     assert_eq!(sent["stream"], false);
+    assert!(sent.get("approved_models").is_none());
     drop(m);
+    let bodies = claim_bodies(&e);
+    for i in [0, 1, 3] {
+        assert_eq!(bodies[i], approved);
+    }
+    assert_eq!(bodies.len(), 5);
     metro_never_saw_key(&e);
 }
 
@@ -558,7 +779,11 @@ async fn result_retries_never_rerun_the_request() {
 async fn revoked_token_stops_with_clear_message() {
     let e = env().await;
     setup(&e, true).await;
-    e.metro.lock().unwrap().claim_override = Some(StatusCode::UNAUTHORIZED.into_response());
+    e.metro
+        .lock()
+        .unwrap()
+        .claim_overrides
+        .push_back(StatusCode::UNAUTHORIZED.into_response());
     let out = run_once(&e).await;
     assert_eq!(out.code, 3, "{}", out.stderr);
     assert!(
@@ -572,7 +797,7 @@ async fn revoked_token_stops_with_clear_message() {
 async fn metro_redirects_and_huge_claims_are_refused() {
     let e = env().await;
     setup(&e, true).await;
-    e.metro.lock().unwrap().claim_override = Some(
+    e.metro.lock().unwrap().claim_overrides.push_back(
         (
             StatusCode::TEMPORARY_REDIRECT,
             [("location", e.model_url.clone() + "/chat/completions")],
@@ -588,8 +813,11 @@ async fn metro_redirects_and_huge_claims_are_refused() {
     );
 
     let huge = json!({"id": "huge", "operation": "complete", "request": {"pad": "x".repeat(5 * 1024 * 1024)}});
-    e.metro.lock().unwrap().claim_override =
-        Some((StatusCode::OK, axum::Json(huge)).into_response());
+    e.metro
+        .lock()
+        .unwrap()
+        .claim_overrides
+        .push_back((StatusCode::OK, axum::Json(huge)).into_response());
     let out = run_once(&e).await;
     assert_ne!(out.code, 0);
     let m = e.model.lock().unwrap();

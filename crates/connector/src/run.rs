@@ -241,6 +241,8 @@ async fn sleep_or_shutdown(d: Duration, opts: &RunOptions) -> bool {
 }
 
 pub async fn run(client: &MetroClient, provider: &Provider<'_>, opts: &RunOptions) -> Stop {
+    let approved_models = (provider.config.kind.capability() == crate::profile::Capability::Chat)
+        .then_some(provider.config.models.as_slice());
     let mut backoff = Duration::from_secs(1);
     let mut offline = false;
     loop {
@@ -248,7 +250,7 @@ pub async fn run(client: &MetroClient, provider: &Provider<'_>, opts: &RunOption
         // after this moment: timing from here is conservative.
         let claim_sent = Instant::now();
         let claim = tokio::select! {
-            c = client.claim() => c,
+            c = client.claim_with_inventory(approved_models) => c,
             _ = opts.stopped() => return Stop::Done,
         };
         match claim {

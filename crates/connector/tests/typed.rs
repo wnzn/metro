@@ -22,6 +22,7 @@ struct MetroState {
     jobs: VecDeque<Value>,
     results: Vec<(String, Value)>,
     seen: Vec<String>,
+    chat: bool,
 }
 type Metro = Arc<Mutex<MetroState>>;
 
@@ -31,11 +32,19 @@ fn auth(h: &HeaderMap) -> Option<String> {
         .map(str::to_string)
 }
 
-async fn claim(State(s): State<Metro>, h: HeaderMap) -> Response {
+async fn claim(State(s): State<Metro>, h: HeaderMap, body: Bytes) -> Response {
     let mut s = s.lock().unwrap();
     s.seen.push(auth(&h).unwrap_or_default());
     if auth(&h).as_deref() != Some(&format!("Bearer {DEVICE_TOKEN}")) {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let expected: &[u8] = if s.chat {
+        br#"{"approved_models":["jev-latest"]}"#
+    } else {
+        b"{}"
+    };
+    if body.as_ref() != expected {
+        return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
     match s.jobs.pop_front() {
         Some(j) => (StatusCode::OK, axum::Json(j)).into_response(),
@@ -353,6 +362,7 @@ async fn embeddings_profile_runs_only_embed_without_a_key() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn chat_profiles_refuse_typed_jobs() {
     let e = env().await;
+    e.metro.lock().unwrap().chat = true;
     setup(&e, "device-openai-compatible", "jev-latest", true).await;
     for job in [
         json!({"id": "c1", "operation": "decide", "request": decide_request("jev-latest")}),

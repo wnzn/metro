@@ -1,6 +1,7 @@
 //! Outbound client for Metro's device endpoints.
 //!
-//! - `POST /v1/device/claim {}` with `Authorization: Bearer metro_pc_...`
+//! - `POST /v1/device/claim` with `Authorization: Bearer metro_pc_...`
+//!   and `{"approved_models":[...]}` for chat, or `{}` otherwise
 //!   → `204` (nothing to do) or `200 {id, operation, request}`.
 //! - `POST /v1/device/jobs/{id}/result` with `{ok:true, response}` or
 //!   `{ok:false, error}`.
@@ -14,6 +15,7 @@ use serde_json::{Value, json};
 
 use crate::Secret;
 use crate::http::{client, read_capped};
+use crate::profile::validate_models;
 
 /// Metro hands a device at most 4 MiB of request (`max_request_bytes`).
 pub const MAX_CLAIM_BODY: usize = 4 * 1024 * 1024;
@@ -94,6 +96,14 @@ pub struct MetroClient {
     base: String,
     token: Secret,
     claim_cap: usize,
+    claim_mode: tokio::sync::Mutex<ClaimMode>,
+}
+
+#[derive(Clone, Copy)]
+enum ClaimMode {
+    Probe,
+    Extended,
+    Legacy,
 }
 
 impl MetroClient {
@@ -104,6 +114,7 @@ impl MetroClient {
             base: base.trim_end_matches('/').to_string(),
             token,
             claim_cap: MAX_CLAIM_BODY,
+            claim_mode: tokio::sync::Mutex::new(ClaimMode::Probe),
         })
     }
 
@@ -142,8 +153,66 @@ impl MetroClient {
             })
     }
 
+    /// Claim without advertising a chat inventory.
     pub async fn claim(&self) -> Result<Claim, MetroError> {
-        let resp = self.post("/v1/device/claim", b"{}".to_vec(), None).await?;
+        self.claim_with_inventory(None).await
+    }
+
+    /// `approved_models` is the local profile's approval list, never a
+    /// vendor's list. `None` is a non-chat poll; `Some(&[])` is explicit.
+    pub async fn claim_with_inventory(
+        &self,
+        approved_models: Option<&[String]>,
+    ) -> Result<Claim, MetroError> {
+        const PATH: &str = "/v1/device/claim";
+        let Some(models) = approved_models else {
+            return self
+                .decode_claim(self.post(PATH, b"{}".to_vec(), None).await?)
+                .await;
+        };
+        // Never truncate, normalize, or include a bad identifier in an error.
+        validate_models(models)
+            .map_err(|_| e(ErrorKind::Fatal, "claim: invalid approved models"))?;
+        // Keep negotiation scoped to this client, even if shared by callers.
+        let mut mode = self.claim_mode.lock().await;
+        if matches!(*mode, ClaimMode::Legacy) {
+            return self
+                .decode_claim(self.post(PATH, b"{}".to_vec(), None).await?)
+                .await;
+        }
+        let body = serde_json::to_vec(&json!({"approved_models": models}))
+            .map_err(|_| e(ErrorKind::Fatal, "claim: encode"))?;
+        let resp = self.post(PATH, body, None).await?;
+        match (*mode, resp.status().as_u16()) {
+            (ClaimMode::Probe, status @ (400 | 422)) => {
+                // Allow a bare 400 or the prior handler's exact empty-object
+                // rejection. Don't turn another reported error into legacy mode.
+                let legacy = read_capped(resp, MAX_ACK_BODY).await.is_ok_and(|body| {
+                    (status == 400 && body.is_empty())
+                        || serde_json::from_slice::<Value>(&body)
+                            .is_ok_and(|v| v == json!({"error": "the body must be {}"}))
+                });
+                if !legacy {
+                    return Err(status_error("claim", status, false));
+                }
+            }
+            _ => {
+                let claim = self.decode_claim(resp).await?;
+                *mode = ClaimMode::Extended;
+                return Ok(claim);
+            }
+        }
+        // Consume the one compatibility attempt before sending it.
+        // Don't enter legacy mode if the retry fails.
+        *mode = ClaimMode::Extended;
+        let claim = self
+            .decode_claim(self.post(PATH, b"{}".to_vec(), None).await?)
+            .await?;
+        *mode = ClaimMode::Legacy;
+        Ok(claim)
+    }
+
+    async fn decode_claim(&self, resp: reqwest::Response) -> Result<Claim, MetroError> {
         let status = resp.status().as_u16();
         match status {
             204 => Ok(Claim::Idle),
