@@ -130,7 +130,7 @@ pub fn open_root(path: &Path) -> io::Result<File> {
 }
 
 /// Open (creating if `create`) `name` inside `dir`, never following links.
-fn subdir(dir: &File, name: &str, create: bool) -> io::Result<File> {
+pub(crate) fn subdir(dir: &File, name: &str, create: bool) -> io::Result<File> {
     match open_subdir(dir, name) {
         Ok(f) => Ok(f),
         Err(FolderError::NotFound) if create => {
@@ -268,7 +268,17 @@ pub fn load(root: &File, account_id: &str, sid: &str) -> io::Result<Option<Pairi
 /// Write the Space's pairing atomically (new file, fsync, rename), mode 600.
 pub fn save(root: &File, p: &Pairing) -> io::Result<()> {
     let dir = space_dir(root, &p.account_id, &p.space_id, true)?;
-    let _ = cap_primitives::fs::remove_file(&dir, Path::new(PAIRING_TMP));
+    let mut data = p.to_json();
+    let r = write_atomic(&dir, PAIRING, PAIRING_TMP, &data);
+    data.zeroize();
+    r
+}
+
+/// Replace `name` in `dir` atomically with `data`: a new private (600) file
+/// `tmp`, written and fsynced, then renamed over `name`. Never follows a
+/// link; a leftover `tmp` is removed first and on failure.
+pub(crate) fn write_atomic(dir: &File, name: &str, tmp: &str, data: &[u8]) -> io::Result<()> {
+    let _ = cap_primitives::fs::remove_file(dir, Path::new(tmp));
     let mut opts = OpenOptions::new();
     opts.write(true).create_new(true);
     opts._cap_fs_ext_follow(FollowSymlinks::No);
@@ -277,25 +287,38 @@ pub fn save(root: &File, p: &Pairing) -> io::Result<()> {
         use cap_primitives::fs::OpenOptionsExt;
         opts.mode(0o600);
     }
-    let mut data = p.to_json();
     let written = (|| -> io::Result<()> {
-        let mut f = cap_primitives::fs::open(&dir, Path::new(PAIRING_TMP), &opts)?;
-        f.write_all(&data)?;
+        let mut f = cap_primitives::fs::open(dir, Path::new(tmp), &opts)?;
+        f.write_all(data)?;
         f.sync_all()?;
         Ok(())
     })();
-    data.zeroize();
     if let Err(e) = written {
-        let _ = cap_primitives::fs::remove_file(&dir, Path::new(PAIRING_TMP));
+        let _ = cap_primitives::fs::remove_file(dir, Path::new(tmp));
         return Err(e);
     }
-    if let Err(e) =
-        cap_primitives::fs::rename(&dir, Path::new(PAIRING_TMP), &dir, Path::new(PAIRING))
-    {
-        let _ = cap_primitives::fs::remove_file(&dir, Path::new(PAIRING_TMP));
+    if let Err(e) = cap_primitives::fs::rename(dir, Path::new(tmp), dir, Path::new(name)) {
+        let _ = cap_primitives::fs::remove_file(dir, Path::new(tmp));
         return Err(e);
     }
     Ok(())
+}
+
+/// Read the regular file `name` in `dir` (no links), at most `cap` bytes;
+/// `None` when it is missing, `Some(None)` when it is larger than `cap`.
+pub(crate) fn read_capped(dir: &File, name: &str, cap: u64) -> io::Result<Option<Option<Vec<u8>>>> {
+    let file = match open_file(dir, name) {
+        Ok(f) => f,
+        Err(FolderError::NotFound) => return Ok(None),
+        Err(e) => return Err(io_err(e)),
+    };
+    let mut buf = Vec::new();
+    file.take(cap + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > cap {
+        buf.zeroize();
+        return Ok(Some(None));
+    }
+    Ok(Some(Some(buf)))
 }
 
 /// Delete the Space's pairing (its token). The folder and its files stay:

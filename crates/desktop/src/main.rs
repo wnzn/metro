@@ -349,9 +349,19 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
 }
 
 /// Local workspace tools (read-only folders per hosted Space), primary
-/// instance only.
+/// instance only. With the installer's `enable-local-runner` marker (next to
+/// this launcher; on macOS beside the outer Metro.app in its private install
+/// folder), also this computer's personal registered runner on the own
+/// hosted server.
 fn tools_hook(root: &Path, primary: bool) -> Option<Arc<dyn ToolsHook>> {
-    primary.then(|| Arc::new(DesktopTools::new(root.join("local-tools"))) as Arc<dyn ToolsHook>)
+    use metro_connector::desktop_tools::runner;
+    primary.then(|| {
+        let marker = install_dir()
+            .map(|d| runner::installer_marker(&d))
+            .unwrap_or(runner::Marker::Absent);
+        Arc::new(DesktopTools::new(root.join("local-tools")).with_local_runner(marker))
+            as Arc<dyn ToolsHook>
+    })
 }
 
 fn main() -> ExitCode {

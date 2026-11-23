@@ -43,6 +43,15 @@ impl CallError {
     }
 }
 
+/// A failed `POST /v1/runners`. `definite`: the server refused and created
+/// nothing. Otherwise the answer was lost or unusable, and the runner may
+/// exist.
+#[derive(Debug, Clone)]
+pub struct CreateError {
+    pub definite: bool,
+    pub error: CallError,
+}
+
 /// The Space's runner, as `GET /v1/spaces/{sid}/runner` reports it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpaceRunner {
@@ -316,6 +325,114 @@ impl Hosted {
         Err(Self::classify(s, &v))
     }
 
+    /// `GET /v1/runners`: the caller's own personal runners that they can
+    /// manage (organization runners are left out).
+    pub async fn personal_runners(&self, session: &Secret) -> Result<Vec<RunnerInfo>, CallError> {
+        let (s, _, v) = self
+            .send(
+                reqwest::Method::GET,
+                "/v1/runners",
+                session,
+                &[],
+                None,
+                4 * MAX_BODY,
+            )
+            .await?;
+        if s != 200 {
+            return Err(Self::classify(s, &v));
+        }
+        let Some(list) = v.get("runners").and_then(Value::as_array) else {
+            return Err(CallError::Other(
+                "the local Metro server sent no runner list".into(),
+            ));
+        };
+        Ok(list.iter().filter_map(RunnerInfo::personal).collect())
+    }
+
+    /// `POST /v1/runners` for a personal runner: its id and its token,
+    /// which the server shows only this once.
+    pub async fn create_personal_runner(
+        &self,
+        session: &Secret,
+        name: &str,
+    ) -> Result<(RunnerInfo, Secret), CreateError> {
+        let lost = |error| CreateError {
+            definite: false,
+            error,
+        };
+        let (s, _, mut v) = self
+            .send(
+                reqwest::Method::POST,
+                "/v1/runners",
+                session,
+                &[],
+                Some(&json!({"name": name, "visibility": "personal"})),
+                MAX_BODY,
+            )
+            .await
+            .map_err(lost)?;
+        if s != 201 && s != 200 {
+            let error = Self::classify(s, &v);
+            // A 4xx refusal (other than timeouts and rate limits) created
+            // nothing; anything else may have.
+            let definite = (400..500).contains(&s) && !matches!(s, 408 | 425 | 429);
+            return Err(CreateError { definite, error });
+        }
+        let token = take_registered_token(&mut v).map_err(lost)?;
+        let info = v
+            .get("runner")
+            .and_then(RunnerInfo::personal)
+            .ok_or_else(|| {
+                lost(CallError::Other(
+                    "the local Metro server sent an unexpected runner".into(),
+                ))
+            })?;
+        Ok((info, token))
+    }
+
+    /// `POST /v1/runners/{id}/token`: the same runner, a new token. The old
+    /// one stops working at once.
+    pub async fn rotate_runner(&self, session: &Secret, id: &str) -> Result<Secret, CallError> {
+        if !valid_job_id(id) {
+            return Err(CallError::NotFound("no such runner".into()));
+        }
+        let (s, _, mut v) = self
+            .send(
+                reqwest::Method::POST,
+                &format!("/v1/runners/{id}/token"),
+                session,
+                &[],
+                Some(&json!({})),
+                MAX_BODY,
+            )
+            .await?;
+        if s != 200 {
+            return Err(Self::classify(s, &v));
+        }
+        take_registered_token(&mut v)
+    }
+
+    /// `DELETE /v1/runners/{id}`.
+    pub async fn delete_runner(&self, session: &Secret, id: &str) -> Result<(), CallError> {
+        if !valid_job_id(id) {
+            return Err(CallError::NotFound("no such runner".into()));
+        }
+        let (s, _, v) = self
+            .send(
+                reqwest::Method::DELETE,
+                &format!("/v1/runners/{id}"),
+                session,
+                &[],
+                None,
+                MAX_BODY,
+            )
+            .await?;
+        if s == 204 || s == 200 {
+            return Ok(());
+        }
+        Err(Self::classify(s, &v))
+    }
+
     /// `POST /v1/runner/claim` with the Space's dedicated token.
     pub async fn claim(&self, token: &Secret) -> Result<Claim, CallError> {
         let (s, _, v) = self
@@ -363,6 +480,57 @@ impl Hosted {
             _ => Err(Self::classify(s, &v)),
         }
     }
+}
+
+/// A personal registered runner the caller manages, as `/v1/runners` shows
+/// it (never with a token).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerInfo {
+    pub id: String,
+    pub name: String,
+}
+
+impl RunnerInfo {
+    fn personal(v: &Value) -> Option<Self> {
+        if v.get("visibility").and_then(Value::as_str) != Some("personal")
+            || v.get("can_manage").and_then(Value::as_bool) != Some(true)
+        {
+            return None;
+        }
+        let id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|i| valid_job_id(i))?;
+        let name = v.get("name").and_then(Value::as_str)?;
+        Some(RunnerInfo {
+            id: id.to_owned(),
+            name: name.to_owned(),
+        })
+    }
+}
+
+/// The `token` of a registered-runner answer, wiped from the JSON. Only a
+/// registered (`metro_rt_v2_`) token is accepted.
+fn take_registered_token(v: &mut Value) -> Result<Secret, CallError> {
+    let token = match v.get_mut("token") {
+        Some(Value::String(t)) => {
+            let out = Secret::new(t.as_str());
+            zeroize::Zeroize::zeroize(t);
+            out
+        }
+        _ => {
+            return Err(CallError::Other(
+                "the local Metro server sent no token".into(),
+            ));
+        }
+    };
+    let t = token.expose();
+    if !t.starts_with("metro_rt_v2_") || t.len() > 256 || t.chars().any(|c| !c.is_ascii_graphic()) {
+        return Err(CallError::Other(
+            "the local Metro server sent an unexpected token".into(),
+        ));
+    }
+    Ok(token)
 }
 
 pub fn parse_claim(v: &Value) -> Claim {

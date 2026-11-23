@@ -39,9 +39,16 @@
 //! tools.resume(hosted).await;   // after POST /v1/session bound the local server
 //! tools.stop_all().await;       // DELETE /v1/session, switch, shutdown
 //! ```
+//!
+//! Separately, and only when the installer asked for it, [`runner`] keeps
+//! one **personal registered runner** for this computer on the same own
+//! hosted server (`DesktopTools::new(..).with_local_runner(marker)`). It is
+//! a different thing from the per-Space dedicated pairings above: neither
+//! stands in for the other, and Metro never attaches it to a Space.
 
 pub mod folder;
 pub mod hosted;
+pub mod runner;
 pub mod store;
 pub mod worker;
 
@@ -190,6 +197,8 @@ struct Inner {
     /// (server URL, account id) the workers belong to.
     bound: Option<(String, String)>,
     workers: HashMap<String, worker::Handle>,
+    /// The installer-requested personal runner (see [`runner`]).
+    runner: runner::Slot,
 }
 
 /// The desktop's local tools manager. One per launcher; `Send + Sync`.
@@ -197,6 +206,7 @@ pub struct DesktopTools {
     root_path: PathBuf,
     inner: tokio::sync::Mutex<Inner>,
     store_lock: Arc<Mutex<()>>,
+    marker: runner::Marker,
 }
 
 impl DesktopTools {
@@ -208,9 +218,19 @@ impl DesktopTools {
                 root: None,
                 bound: None,
                 workers: HashMap::new(),
+                runner: runner::Slot::default(),
             }),
             store_lock: Arc::new(Mutex::new(())),
+            marker: runner::Marker::Absent,
         }
+    }
+
+    /// What the installer asked for ([`runner::installer_marker`]): with
+    /// [`runner::Marker::Accepted`], this computer's personal registered
+    /// runner is created once and resumed on the own hosted server.
+    pub fn with_local_runner(mut self, marker: runner::Marker) -> Self {
+        self.marker = marker;
+        self
     }
 
     fn root(&self, inner: &mut Inner) -> Result<Arc<File>, ToolsError> {
@@ -230,6 +250,7 @@ impl DesktopTools {
             for (_, w) in inner.workers.drain() {
                 w.stop().await;
             }
+            inner.runner.stop().await;
             inner.bound = key;
         }
     }
@@ -266,6 +287,9 @@ impl DesktopTools {
                 return Err(ToolsError::new(405, "method_not_allowed", "use GET"));
             }
             return self.status(hosted.as_ref()).await;
+        }
+        if let Some(r) = rest.strip_prefix("/runner") {
+            return self.runner_route(method, r, body, hosted).await;
         }
         let Some((sid, action)) = rest
             .strip_prefix("/spaces/")
@@ -332,11 +356,87 @@ impl DesktopTools {
         })
     }
 
+    fn runner_status(&self, inner: &Inner, hosted: Option<&HostedSession>) -> Value {
+        let Some(h) = hosted else {
+            return runner::status(&inner.runner, &self.marker, None);
+        };
+        let rec = inner.root.as_ref().and_then(|root| {
+            let _g = self.store_lock.lock();
+            runner::load(root, h).ok().flatten()
+        });
+        runner::status(&inner.runner, &self.marker, Some((&self.root_path, h, rec)))
+    }
+
+    /// `/v1/local-tools/runner…`: this computer's personal runner.
+    async fn runner_route(
+        &self,
+        method: &str,
+        rest: &str,
+        body: &[u8],
+        hosted: Option<HostedSession>,
+    ) -> Result<Value, ToolsError> {
+        if rest.is_empty() {
+            if method != "GET" {
+                return Err(ToolsError::new(405, "method_not_allowed", "use GET"));
+            }
+            let mut inner = self.inner.lock().await;
+            Self::rebind(&mut inner, hosted.as_ref()).await;
+            if hosted.is_some() {
+                self.root(&mut inner)?;
+            }
+            return Ok(self.runner_status(&inner, hosted.as_ref()));
+        }
+        let folder_sid = rest
+            .strip_prefix("/spaces/")
+            .and_then(|r| r.strip_suffix("/folder"))
+            .filter(|s| !s.contains('/'));
+        if rest != "/reconnect" && folder_sid.is_none() {
+            return Err(ToolsError::new(404, "not_found", "unknown path"));
+        }
+        if method != "POST" {
+            return Err(ToolsError::new(405, "method_not_allowed", "use POST"));
+        }
+        if !body.iter().all(u8::is_ascii_whitespace)
+            && serde_json::from_slice::<serde_json::Map<String, Value>>(body)
+                .map(|m| !m.is_empty())
+                .unwrap_or(true)
+        {
+            return Err(ToolsError::new(422, "invalid", "the body must be {}"));
+        }
+        let Some(h) = hosted else {
+            self.stop_all().await;
+            return Err(ToolsError::new(409, "not_local", NOT_LOCAL));
+        };
+        let mut inner = self.inner.lock().await;
+        Self::rebind(&mut inner, Some(&h)).await;
+        let root = self.root(&mut inner)?;
+        let api = Hosted::new(&h.server_url).map_err(|_| fs_error("start"))?;
+        Self::check_account(&api, &h).await?;
+        let cx = runner::Ctx {
+            marker: &self.marker,
+            root: &root,
+            root_path: &self.root_path,
+            hosted: &h,
+            api: &api,
+            store_lock: &self.store_lock,
+        };
+        if let Some(sid) = folder_sid {
+            return runner::folder_for(&cx, sid).await;
+        }
+        runner::reconnect(&mut inner.runner, &cx).await?;
+        Ok(self.runner_status(&inner, Some(&h)))
+    }
+
     async fn status(&self, hosted: Option<&HostedSession>) -> Result<Value, ToolsError> {
         let mut inner = self.inner.lock().await;
         Self::rebind(&mut inner, hosted).await;
         let Some(h) = hosted else {
-            return Ok(json!({"available": false, "reason": NOT_LOCAL, "spaces": []}));
+            return Ok(json!({
+                "available": false,
+                "reason": NOT_LOCAL,
+                "spaces": [],
+                "local_runner": self.runner_status(&inner, None),
+            }));
         };
         let root = self.root(&mut inner)?;
         let records = {
@@ -347,7 +447,13 @@ impl DesktopTools {
             .iter()
             .map(|p| self.entry(&inner, &h.account_id, &p.space_id, Some(p)))
             .collect();
-        Ok(json!({"available": true, "reason": null, "spaces": spaces}))
+        let local_runner = self.runner_status(&inner, Some(h));
+        Ok(json!({
+            "available": true,
+            "reason": null,
+            "spaces": spaces,
+            "local_runner": local_runner,
+        }))
     }
 
     /// The session must still be this account on the hosted server.
@@ -532,6 +638,7 @@ impl DesktopTools {
             for (_, w) in inner.workers.drain() {
                 w.stop().await;
             }
+            inner.runner.stop().await;
             return;
         }
         let records = {
@@ -548,6 +655,17 @@ impl DesktopTools {
                 let _ = self.spawn_worker(&mut inner, &api, &root, p);
             }
         }
+        // This computer's personal runner, if the installer asked for it:
+        // resumed, or created the first time; never recreated.
+        let cx = runner::Ctx {
+            marker: &self.marker,
+            root: &root,
+            root_path: &self.root_path,
+            hosted: &hosted,
+            api: &api,
+            store_lock: &self.store_lock,
+        };
+        runner::ensure(&mut inner.runner, &cx).await;
     }
 
     /// Stop every worker (sign-out, server or account switch, app exit).
@@ -557,7 +675,14 @@ impl DesktopTools {
         for (_, w) in inner.workers.drain() {
             w.stop().await;
         }
+        inner.runner.stop().await;
         inner.bound = None;
+    }
+
+    /// The id of the personal runner this computer serves right now.
+    pub async fn local_runner_id(&self) -> Option<String> {
+        let inner = self.inner.lock().await;
+        runner::running_id(&inner.runner).map(str::to_owned)
     }
 }
 
