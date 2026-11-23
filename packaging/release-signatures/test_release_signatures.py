@@ -1,11 +1,14 @@
 """Release signing contract tests (no Metro release, GitHub credentials or test CA)."""
 
+import base64
 import hashlib
 import json
 import os
 from pathlib import Path
 import subprocess
+import tarfile
 import tempfile
+import textwrap
 import unittest
 from unittest.mock import patch
 from urllib.request import urlopen
@@ -115,14 +118,114 @@ class ReleaseInputs(unittest.TestCase):
         manifest = self.out / release.MANIFEST
         manifest.with_name(manifest.name + release.BUNDLE).write_bytes(b"bundle")
         with patch.object(release, "run") as verifier, patch.object(release, "check_cert_extensions") as claims:
-            release.verify_file("cosign", manifest, self.version)
+            release.verify_file("cosign", manifest, self.version, self.revision)
         self.assertEqual(verifier.call_args.args[0], [
             "cosign", "verify-blob", "--bundle", str(manifest) + release.BUNDLE,
             "--certificate-identity",
-            "https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/tags/v0.2.0-rc.1",
+            "https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/master",
             "--certificate-oidc-issuer", "https://token.actions.githubusercontent.com", str(manifest),
         ])
-        claims.assert_called_once_with(b"bundle", self.version, None)
+        claims.assert_called_once_with(b"bundle", self.revision)
+
+    def test_verifier_requires_independently_supplied_full_commit(self):
+        for revision in (None, "", self.revision[:12], "refs/heads/master"):
+            with self.subTest(revision=revision), self.assertRaisesRegex(release.ReleaseError, "full release commit"):
+                release.verify_file("cosign", self.out / release.MANIFEST, self.version, revision)
+
+    def test_signed_manifest_version_cannot_be_relabelled(self):
+        self.prepare()
+        manifest = self.out / release.MANIFEST
+        manifest.with_name(manifest.name + release.BUNDLE).write_bytes(b"bundle")
+        with patch.object(release, "run"), patch.object(release, "check_cert_extensions"):
+            with self.assertRaisesRegex(release.ReleaseError, "another version"):
+                release.verify_file("cosign", manifest, "0.3.0", self.revision)
+
+    def test_signed_linux_archive_cannot_be_relabelled(self):
+        name = release.direct_archives(self.version)[0]
+        artifact = self.assets / name
+        archive_metadata = self.assets / "RELEASE.json"
+        archive_metadata.write_text(json.dumps({"version": "0.3.0"}))
+        with tarfile.open(artifact, "w:gz") as archive:
+            archive.add(archive_metadata, arcname=f"{name.removesuffix('.tar.gz')}/RELEASE.json")
+        artifact.with_name(name + release.BUNDLE).write_bytes(b"bundle")
+        with patch.object(release, "run"), patch.object(release, "check_cert_extensions"):
+            with self.assertRaisesRegex(release.ReleaseError, "another version"):
+                release.verify_file("cosign", artifact, self.version, self.revision)
+            archive_metadata.write_text(json.dumps({"version": self.version}))
+            with tarfile.open(artifact, "w:gz") as archive:
+                archive.add(archive_metadata, arcname=f"{name.removesuffix('.tar.gz')}/RELEASE.json")
+            release.verify_file("cosign", artifact, self.version, self.revision)
+
+    def test_workflow_guard_requires_non_deleted_protected_master_push(self):
+        root = Path(__file__).resolve().parents[2]
+        workflow = (root / ".github/workflows/sign-release-assets.yml").read_text()
+        step = workflow.split("- name: Require Metro CI on a protected master push\n", 1)[1]
+        script = textwrap.dedent(step.split("run: |\n", 1)[1].split("      - uses:", 1)[0])
+        env = {
+            **os.environ, "GITHUB_REPOSITORY": "wnzn/metro", "REPOSITORY_ID": "1467654868",
+            "GITHUB_EVENT_NAME": "push", "REF_TYPE": "branch", "GITHUB_REF": "refs/heads/master",
+            "WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master", "REF_PROTECTED": "true",
+            "PUSH_DELETED": "false", "VERSION": self.version, "REVISION": self.revision,
+            "GITHUB_SHA": self.revision, "PUSH_AFTER": self.revision,
+        }
+        self.assertEqual(subprocess.run(["bash", "-c", script], env=env, capture_output=True).returncode, 0)
+        for changes in (
+            {"REF_TYPE": "tag", "GITHUB_REF": "refs/tags/v" + self.version},
+            {"GITHUB_REF": "refs/heads/main"}, {"GITHUB_REF": "refs/heads/feature/master"},
+            {"GITHUB_EVENT_NAME": "pull_request"}, {"GITHUB_EVENT_NAME": "workflow_dispatch"},
+            {"REF_PROTECTED": "false"}, {"PUSH_DELETED": "true"}, {"REPOSITORY_ID": "0"},
+            {"GITHUB_REPOSITORY": "somebody/metro"}, {"REVISION": "b" * 40}, {"PUSH_AFTER": "b" * 40},
+            {"WORKFLOW_REF": "wnzn/metro/.github/workflows/other.yml@refs/heads/master"},
+        ):
+            with self.subTest(changes=changes):
+                result = subprocess.run(["bash", "-c", script], env=env | changes, capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+
+    def test_resolve_exact_public_tag_and_peel_annotated_tag(self):
+        ref = "refs/tags/v0.2.0-rc.1"
+        object_id = "b" * 40
+        output = f"{object_id}\t{ref}\n{self.revision}\t{ref}^{{}}\n".encode()
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output)) as git:
+            self.assertEqual(release.resolve_tag(self.version), self.revision)
+        self.assertEqual(git.call_args.args[0],
+                         ["git", "ls-remote", "--exit-code", "https://github.com/wnzn/metro.git", ref, ref + "^{}"])
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output.splitlines()[0])):
+            self.assertEqual(release.resolve_tag(self.version), object_id)
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 2, b"")):
+            with self.assertRaisesRegex(release.ReleaseError, "unable to resolve"):
+                release.resolve_tag(self.version)
+        output += f"{object_id}\t{ref}-wrong\n".encode()
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, output)):
+            with self.assertRaisesRegex(release.ReleaseError, "unexpected response"):
+                release.resolve_tag(self.version)
+
+    def test_master_claims_require_the_pinned_commit_in_all_three_digest_fields(self):
+        # Only exercise the parser here: an OpenSSL test certificate is never
+        # passed through the cosign verifier or trusted as production evidence.
+        claims = {
+            9: "https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/master",
+            10: self.revision, 12: "https://github.com/wnzn/metro", 13: self.revision,
+            14: "refs/heads/master", 15: "1467654868",
+            18: "https://github.com/wnzn/metro/.github/workflows/ci.yml@refs/heads/master",
+            19: self.revision, 20: "push",
+        }
+        for bad_claim, bad_value in ((None, None), (10, "b" * 40), (13, "b" * 40), (19, "b" * 40),
+                                     (14, "refs/heads/main"), (18, claims[18].replace("ci.yml", "other.yml"))):
+            with self.subTest(claim=bad_claim):
+                raw = claims if bad_claim is None else claims | {bad_claim: bad_value}
+                cmd = ["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:P-256",
+                       "-nodes", "-keyout", os.devnull, "-outform", "DER", "-subj", "/CN=test-only", "-days", "1"]
+                for oid, value in raw.items():
+                    cmd.extend(["-addext", f"1.3.6.1.4.1.57264.1.{oid}=ASN1:UTF8String:{value}"])
+                cert = subprocess.run(cmd, capture_output=True, check=True).stdout
+                bundle = json.dumps({"mediaType": "application/vnd.dev.sigstore.bundle.v0.3+json",
+                                     "verificationMaterial": {"certificate": {"rawBytes":
+                                         base64.b64encode(cert).decode("ascii")}}})
+                if bad_claim is None:
+                    release.check_cert_extensions(bundle, self.revision)
+                else:
+                    with self.assertRaisesRegex(release.ReleaseError, rf"wrong value for Fulcio extension .*\.{bad_claim}$"):
+                        release.check_cert_extensions(bundle, self.revision)
 
     def test_tool_failure_does_not_leak_diagnostics(self):
         failure = subprocess.CalledProcessError(1, ["cosign"], b"fake-secret", b"fake-secret")
@@ -148,11 +251,6 @@ class PublicSigstoreBundles(unittest.TestCase):
         self.artifact.write_bytes(self.fetch("v2.20.3", "checksums.txt",
                                            "0cb9bc491aed89a6bed88d89a61cd0bbf97f30d0906ac6e99ecb5b2d9d4d6aaf"))
         self.bundle.write_bytes(self.good)
-        policy = patch.multiple(release, REPOSITORY="https://github.com/goreleaser/goreleaser",
-                                REPOSITORY_ID="77071454", CALLER_WORKFLOW="release.yml",
-                                SIGNER_WORKFLOW="release.yml")
-        policy.start()
-        self.addCleanup(policy.stop)
 
     def fetch(self, tag, name, expected_hash):
         url = f"https://github.com/goreleaser/goreleaser/releases/download/{tag}/{name}"
@@ -161,13 +259,23 @@ class PublicSigstoreBundles(unittest.TestCase):
         self.assertEqual(hashlib.sha256(raw).hexdigest(), expected_hash)
         return raw
 
-    def test_real_cosign_accepts_only_correct_payload_bundle_and_provenance(self):
-        release.verify_file(self.cosign, self.artifact, self.version)
+    def test_valid_third_party_tag_bundle_does_not_pass_metro_master_policy(self):
+        identity = "https://github.com/goreleaser/goreleaser/.github/workflows/release.yml@refs/tags/v2.20.3"
+        issuer = "https://token.actions.githubusercontent.com"
+
+        def verify_public(expected_identity=identity, expected_issuer=issuer):
+            release.run([self.cosign, "verify-blob", "--bundle", str(self.bundle),
+                         "--certificate-identity", expected_identity, "--certificate-oidc-issuer", expected_issuer,
+                         str(self.artifact)])
+
+        verify_public()
+        with self.assertRaisesRegex(release.ReleaseError, "verify-blob failed"):
+            release.verify_file(self.cosign, self.artifact, self.version, "a6edafaafe0fd15a4725e917beac26305ba67738")
         with self.subTest("modified payload"):
             good_artifact = self.artifact.read_bytes()
             self.artifact.write_bytes(good_artifact + b"modified\n")
             with self.assertRaisesRegex(release.ReleaseError, "verify-blob failed"):
-                release.verify_file(self.cosign, self.artifact, self.version)
+                verify_public()
             self.artifact.write_bytes(good_artifact)
         with self.subTest("signature substituted from another real bundle"):
             good = json.loads(self.good)
@@ -176,19 +284,13 @@ class PublicSigstoreBundles(unittest.TestCase):
             good["messageSignature"]["signature"] = other["messageSignature"]["signature"]
             self.bundle.write_text(json.dumps(good))
             with self.assertRaisesRegex(release.ReleaseError, "verify-blob failed"):
-                release.verify_file(self.cosign, self.artifact, self.version)
+                verify_public()
             self.bundle.write_bytes(self.good)
         with self.subTest("wrong tag"), self.assertRaisesRegex(release.ReleaseError, "verify-blob failed"):
-            release.verify_file(self.cosign, self.artifact, "2.20.2")
-        with self.subTest("wrong issuer"), patch.object(release, "ISSUER", "https://oauth2.sigstore.dev/auth"):
+            verify_public(expected_identity=identity.replace("v2.20.3", "v2.20.2"))
+        with self.subTest("wrong issuer"):
             with self.assertRaisesRegex(release.ReleaseError, "verify-blob failed"):
-                release.verify_file(self.cosign, self.artifact, self.version)
-        with self.subTest("wrong caller"), patch.object(release, "CALLER_WORKFLOW", "ci.yml"):
-            with self.assertRaisesRegex(release.ReleaseError, r"wrong value for Fulcio extension .*\.18"):
-                release.verify_file(self.cosign, self.artifact, self.version)
-        with self.subTest("wrong repository ID"), patch.object(release, "REPOSITORY_ID", "0"):
-            with self.assertRaisesRegex(release.ReleaseError, r"wrong value for Fulcio extension .*\.15"):
-                release.verify_file(self.cosign, self.artifact, self.version)
+                verify_public(expected_issuer="https://oauth2.sigstore.dev/auth")
 
 
 if __name__ == "__main__":

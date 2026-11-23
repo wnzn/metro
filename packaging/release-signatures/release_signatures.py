@@ -11,11 +11,13 @@ import re
 import shutil
 import stat
 import subprocess
+import tarfile
 
 
 REPOSITORY = "https://github.com/wnzn/metro"
 REPOSITORY_ID = "1467654868"
 ISSUER = "https://token.actions.githubusercontent.com"
+SOURCE_REF = "refs/heads/master"
 MANIFEST = "SHA256SUMS"
 BUNDLE = ".sigstore.json"
 SIGNER_WORKFLOW = "sign-release-assets.yml"
@@ -47,8 +49,34 @@ def tag_ref(version):
     return f"refs/tags/v{version}"
 
 
-def workflow_uri(filename, version):
-    return f"{REPOSITORY}/.github/workflows/{filename}@{tag_ref(version)}"
+def workflow_uri(filename):
+    return f"{REPOSITORY}/.github/workflows/{filename}@{SOURCE_REF}"
+
+
+def require_revision(revision):
+    require(isinstance(revision, str) and COMMIT.fullmatch(revision), "expected a full release commit SHA")
+
+
+def resolve_tag(version):
+    ref = tag_ref(version)
+    peeled = ref + "^{}"
+    # Use the public origin, not a local/remapped remote, local tag or asset
+    # metadata. Support both lightweight and annotated release tags.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0")
+    result = subprocess.run(
+        ["git", "ls-remote", "--exit-code", REPOSITORY + ".git", ref, peeled],
+        cwd=Path.home().anchor, env=env, capture_output=True, timeout=30,
+    )
+    require(result.returncode == 0, "unable to resolve the exact public release tag")
+    matches = {}
+    for line in result.stdout.decode("ascii").splitlines():
+        digest, sep, name = line.partition("\t")
+        require(sep and COMMIT.fullmatch(digest) and name in (ref, peeled) and name not in matches,
+                "unexpected response for the public release tag")
+        matches[name] = digest
+    require(ref in matches, "public release tag is missing")
+    return matches.get(peeled, matches[ref])
 
 
 def direct_archives(version):
@@ -144,7 +172,7 @@ def image_evidence(path, version, revision=None):
 
 def prepare(assets, image_digests, directory, version, revision):
     tag_ref(version)
-    require(COMMIT.fullmatch(revision), "invalid release source commit")
+    require_revision(revision)
     core = binaries(version) | INSTALLERS
     names = core | {f"{name}.sha256" for name in binaries(version)} | {MANIFEST}
     exact_files(assets, names)
@@ -195,8 +223,9 @@ def unique_object(pairs):
     return result
 
 
-def check_cert_extensions(bundle, version, revision):
+def check_cert_extensions(bundle, revision):
     """Enforce GitHub provenance claims beyond cosign's issuer and exact SAN checks."""
+    require_revision(revision)
     data = json.loads(bundle, object_pairs_hook=unique_object)
     require(data.get("mediaType") == "application/vnd.dev.sigstore.bundle.v0.3+json",
             "expected a Sigstore v0.3 bundle")
@@ -205,11 +234,10 @@ def check_cert_extensions(bundle, version, revision):
     cert = base64.b64decode(data["verificationMaterial"]["certificate"]["rawBytes"], validate=True)
     listing = run(["openssl", "asn1parse", "-inform", "DER"], input_data=cert).split(b"\n")
     expectations = {
-        12: REPOSITORY, 14: tag_ref(version), 15: REPOSITORY_ID,
-        18: workflow_uri(CALLER_WORKFLOW, version), 20: "push",
+        9: workflow_uri(SIGNER_WORKFLOW), 10: revision,  # reusable signing workflow URI and commit
+        12: REPOSITORY, 13: revision, 14: SOURCE_REF, 15: REPOSITORY_ID,
+        18: workflow_uri(CALLER_WORKFLOW), 19: revision, 20: "push",  # top-level workflow and commit
     }
-    if revision is not None:
-        expectations[13] = revision
     for number, expected in expectations.items():
         oid = f"1.3.6.1.4.1.57264.1.{number}".encode()
         oid_line = rb"\s*\d+:d=5\s+hl=\d+ l=\s*\d+ prim: OBJECT\s+:" + re.escape(oid)
@@ -224,18 +252,42 @@ def check_cert_extensions(bundle, version, revision):
         require(re.fullmatch(want, listing[indices[0] + 1]), f"wrong value for Fulcio extension {oid.decode()}")
 
 
-def verify_file(cosign, artifact, version, revision=None):
-    identity = workflow_uri(SIGNER_WORKFLOW, version)
+def verify_file(cosign, artifact, version, revision):
+    require_revision(revision)
+    tag_ref(version)
+    name = artifact.name
+    require(name == MANIFEST or name in direct_archives(version),
+            "expected SHA256SUMS or a Linux archive named for the exact release version")
+
+    identity = workflow_uri(SIGNER_WORKFLOW)
     regular_file(artifact)
     bundle = artifact.with_name(artifact.name + BUNDLE)
     data = read_small(bundle)
     run([str(cosign), "verify-blob", "--bundle", str(bundle.absolute()),
          "--certificate-identity", identity, "--certificate-oidc-issuer", ISSUER, str(artifact.absolute())])
     require(read_small(bundle) == data, "signature bundle changed during verification")
-    check_cert_extensions(data, version, revision)
+    check_cert_extensions(data, revision)
+    if name == MANIFEST:
+        expected = sorted(binaries(version) | INSTALLERS | {"IMAGES.txt"}
+                          | {f"{binary}.sha256" for binary in binaries(version)})
+        rows = read_small(artifact).decode("ascii").splitlines()
+        require(len(rows) == len(expected) and all(
+            re.fullmatch(r"[0-9a-f]{64}  " + re.escape(filename), row)
+            for row, filename in zip(rows, expected)
+        ), "signed SHA256SUMS has unexpected files or is for another version")
+    else:
+        # The detached signature covers bytes, not the downloaded filename.
+        # Check the version inside the authenticated archive as well.
+        metadata = f"{name.removesuffix('.tar.gz')}/RELEASE.json"
+        with tarfile.open(artifact, "r:gz") as archive:
+            matches = [entry for entry in archive if entry.name == metadata]
+            require(len(matches) == 1 and matches[0].isfile() and 0 < matches[0].size <= 65536,
+                    "signed archive lacks its exact release metadata")
+            with archive.extractfile(matches[0]) as stream:
+                require(json.load(stream).get("version") == version, "signed archive is for another version")
 
 
-def verify(cosign, directory, version, revision=None):
+def verify(cosign, directory, version, revision):
     verify_file(cosign, directory / MANIFEST, version, revision)
     check_directory(directory, version, revision)
     for name in direct_archives(version):
@@ -243,6 +295,7 @@ def verify(cosign, directory, version, revision=None):
 
 
 def sign(cosign, directory, version, revision):
+    require_revision(revision)
     check_directory(directory, version, revision, signed=False)
     for name in (*direct_archives(version), MANIFEST):
         artifact = directory / name
@@ -255,10 +308,15 @@ def sign(cosign, directory, version, revision):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
+    for name in ("resolve-tag", "check-tag"):
+        command = commands.add_parser(name)
+        command.add_argument("--version", required=True)
+        if name == "check-tag":
+            command.add_argument("--revision", required=True)
     for name in ("prepare", "sign", "verify", "verify-file"):
         command = commands.add_parser(name)
         command.add_argument("--version", required=True)
-        command.add_argument("--revision", required=name in ("prepare", "sign"))
+        command.add_argument("--revision", required=True)
         if name != "prepare":
             command.add_argument("--cosign", type=Path, default=Path("cosign"))
         if name == "verify-file":
@@ -270,7 +328,13 @@ def main():
             command.add_argument("--image-digests", required=True, type=Path)
     args = parser.parse_args()
     try:
-        if args.command == "prepare":
+        if args.command == "resolve-tag":
+            print(resolve_tag(args.version))
+            return
+        if args.command == "check-tag":
+            require_revision(args.revision)
+            require(resolve_tag(args.version) == args.revision, "public release tag does not point to the pinned commit")
+        elif args.command == "prepare":
             prepare(args.assets, args.image_digests, args.directory, args.version, args.revision)
         elif args.command == "sign":
             sign(args.cosign, args.directory, args.version, args.revision)
@@ -278,7 +342,8 @@ def main():
             verify(args.cosign, args.directory, args.version, args.revision)
         else:
             verify_file(args.cosign, args.artifact, args.version, args.revision)
-    except (ReleaseError, OSError, ValueError, TypeError, KeyError, AttributeError) as error:
+    except (ReleaseError, OSError, ValueError, TypeError, KeyError, AttributeError,
+            subprocess.TimeoutExpired, tarfile.TarError) as error:
         parser.exit(1, f"release_signatures: {error}\n")
     print(f"Release signature gate: {args.command} OK")
 

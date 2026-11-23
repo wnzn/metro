@@ -7,6 +7,10 @@ on:
         description: Release version without the leading v.
         required: true
         type: string
+      revision:
+        description: Commit pinned by the master release gate for v<version>.
+        required: true
+        type: string
 
 permissions: {}
 
@@ -14,24 +18,41 @@ jobs:
   authorize:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    permissions:
+      contents: read
     steps:
-      - name: Require Metro CI on a protected release tag push
+      - name: Require Metro CI on a protected master push
         env:
           VERSION: ${{ inputs.version }}
+          REVISION: ${{ inputs.revision }}
           REF_PROTECTED: ${{ github.ref_protected }}
           REF_TYPE: ${{ github.ref_type }}
           WORKFLOW_REF: ${{ github.workflow_ref }}
           REPOSITORY_ID: ${{ github.repository_id }}
+          PUSH_DELETED: ${{ github.event.deleted }}
+          PUSH_AFTER: ${{ github.event.after }}
         run: |
           set -euo pipefail
           if [[ "$GITHUB_REPOSITORY" != wnzn/metro || "$REPOSITORY_ID" != 1467654868 ||
-                "$GITHUB_EVENT_NAME" != push || "$REF_PROTECTED" != true ||
-                "$REF_TYPE" != tag || "$GITHUB_REF" != "refs/tags/v$VERSION" ||
-                "$WORKFLOW_REF" != "wnzn/metro/.github/workflows/ci.yml@$GITHUB_REF" ||
+                "$GITHUB_EVENT_NAME" != push || "$REF_PROTECTED" != true || "$PUSH_DELETED" != false ||
+                "$REF_TYPE" != branch || "$GITHUB_REF" != refs/heads/master ||
+                "$WORKFLOW_REF" != wnzn/metro/.github/workflows/ci.yml@refs/heads/master ||
+                "$REVISION" != "$GITHUB_SHA" || "$REVISION" != "$PUSH_AFTER" ||
+                ! "$REVISION" =~ ^[0-9a-f]{40}$ ||
                 ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z]+([.-][0-9A-Za-z]+)*)?$ ]]; then
-            echo "::error::Release signing requires Metro CI on the matching protected v* tag push."
+            echo "::error::Release signing requires Metro CI on a protected master push of the pinned commit."
             exit 1
           fi
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      - name: Check that the public release tag resolves to the triggering commit
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 -I packaging/release-signatures/release_signatures.py check-tag \
+            --version "$VERSION" --revision "$GITHUB_SHA"
 
   sign:
     needs: authorize
@@ -73,6 +94,9 @@ jobs:
             --directory "$RUNNER_TEMP/signed-release-assets"
       - name: Sign with GitHub OIDC and verify before uploading
         run: |
+          set -euo pipefail
+          python3 -I packaging/release-signatures/release_signatures.py check-tag \
+            --version "$VERSION" --revision "$GITHUB_SHA"
           python3 -I packaging/release-signatures/release_signatures.py sign \
             --version "$VERSION" --revision "$GITHUB_SHA" --cosign "$METRO_COSIGN" \
             --directory "$RUNNER_TEMP/signed-release-assets"
