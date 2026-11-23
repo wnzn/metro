@@ -278,13 +278,19 @@ class Sources(unittest.TestCase):
                 }
             (d / "facts.json").write_text(json.dumps(facts))
             env["METRO_MSI_FACTS_JSON"] = str(d / "facts.json")
+            # The installed layout of the release package, unpacked by msiextract.
+            x = d / "extracted"
+            tools.run("msiextract", "-C", x, d / "release" / b.out_name("1.0.0", False))
+            env["METRO_MSI_EXTRACTED_TREE"] = str(x / "Programs" / b.IDENTITIES["release"]["default_dir"])
         proc = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(MSI_DIR / "test-msi-harness.ps1")],
                               capture_output=True, text=True, timeout=300, env=env)
         self.assertEqual(proc.returncode, 0, proc.stdout[-4000:] + proc.stderr[-2000:])
         self.assertIn("fails=0", proc.stdout)
         self.assertNotIn("FAIL ", proc.stdout)
-        self.assertEqual(proc.stdout.count("PASS "), 50)
+        self.assertEqual(proc.stdout.count("PASS "), 69 + (1 if real else 0))
         self.assertIn("exported from packages built by build_msi.py" if real else "written in this test", proc.stdout)
+        if real:
+            self.assertIn("extracted from a package built by build_msi.py", proc.stdout)
 
     def test_policy_fixture_only_on_hosted_harness_runs(self):
         # Both CI calls of the native harness run on GitHub-hosted windows-2025 and ask for the
@@ -298,11 +304,24 @@ class Sources(unittest.TestCase):
                 body = text[start: start + 3 + nxt.start()] if nxt else text[start:]
                 self.assertIn("runs-on: windows-2025", body)
                 self.assertIn("test-msi-windows.ps1", body)
-                self.assertIn("-ClientPolicyFixture", body)
+                self.assertIn("-StandardUserFixture", body)
+                self.assertNotIn("-ClientPolicyFixture", text)
         harness = (MSI_DIR / "test-msi-windows.ps1").read_text(encoding="utf-8")
-        self.assertIn("Get-PolicyFixtureRefusal", harness)
-        self.assertIn("Invoke-WithClientMsiPolicy", harness)
-        self.assertNotIn("AlwaysInstallElevated", harness)
+        code = "\n".join(l for l in harness.splitlines() if not l.lstrip().startswith("#"))
+        self.assertIn("Get-PolicyFixtureRefusal", code)
+        self.assertIn("Invoke-WithClientMsiPolicy", code)
+        self.assertIn("New-LocalUser", code)
+        self.assertIn("-Credential $Credential -LoadUserProfile", code)
+        self.assertIn("Remove-LocalUser", code)
+        self.assertIn("Win32_UserProfile", code)
+        for banned in ("AlwaysInstallElevated", "runas.exe", "trustlevel", "Add-LocalGroupMember -SID 'S-1-5-32-544'",
+                       "ConvertFrom-SecureString", "ConvertTo-SecureString", "-AsPlainText"):
+            self.assertNotIn(banned, code)
+        # Helpers return arrays as one object (unary comma); @() around them would nest the array.
+        for p in MSI_DIR.glob("*.ps1"):
+            text = p.read_text(encoding="utf-8")
+            self.assertIsNone(re.search(r"@\((Get-Tree|Get-RelatedProducts|Get-InstalledTreeProblems|Get-StandardUserResultProblems|"
+                                        r"Get-PackageIdentityProblems|Get-MsiQueryRows|Get-ParamShadowing)\b", text), p.name)
 
     def test_installer_is_policy_neutral(self):
         d = tmpdir(self)

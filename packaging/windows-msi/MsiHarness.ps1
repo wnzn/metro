@@ -237,3 +237,78 @@ function Get-NonAdminTokenProblem([string[]] $GroupsCsv) {
     if ($sids.ContainsKey('S-1-5-32-544') -and $sids['S-1-5-32-544'] -notmatch 'deny') { return 'Administrators group is enabled in the token' }
     return ''
 }
+
+# ---------------------------------------------------------------- installed tree
+# Problems ([string[]]) with an installed folder: exactly the payload files
+# listed in $Files (RELEASE.json's `files` object as ConvertFrom-Json gives it),
+# RELEASE.json, the empty marker when $Marker, plus $Extra; every payload file
+# byte-identical.
+function Get-InstalledTreeProblems([string] $Dir, $Files, [bool] $Marker, [string[]] $Extra) {
+    $p = [Collections.Generic.List[string]]::new()
+    if (-not (Test-Path -LiteralPath $Dir -PathType Container)) { $p.Add("folder $Dir does not exist"); return , [string[]] $p.ToArray() }
+    $names = @($Files.PSObject.Properties | ForEach-Object { [string] $_.Name })
+    if ($names.Count -eq 0) { $p.Add('the manifest lists no files') }
+    $want = [string[]] (@($names) + @('RELEASE.json') + @($Extra | Where-Object { $_ }) + $(if ($Marker) { @('enable-local-runner') } else { @() }))
+    $diff = Get-SetDifference $want (Get-Tree $Dir)
+    if ($diff) { $p.Add("installed files differ: $diff") }
+    foreach ($f in $Files.PSObject.Properties) {
+        $path = Join-Path $Dir ([string] $f.Name)
+        if ((Test-Path -LiteralPath $path -PathType Leaf) -and
+            (Get-FileHash -LiteralPath $path -Algorithm SHA256).Hash.ToLowerInvariant() -cne ([string] $f.Value).ToLowerInvariant()) {
+            $p.Add("$($f.Name) bytes differ")
+        }
+    }
+    $m = Join-Path $Dir 'enable-local-runner'
+    if ($Marker -and (Test-Path -LiteralPath $m -PathType Leaf) -and (Get-Item -LiteralPath $m).Length -ne 0) { $p.Add('marker is not empty') }
+    return , [string[]] $p.ToArray()
+}
+
+# ---------------------------------------------------------------- standard user
+# A random password for an ephemeral local account, only ever held as a
+# SecureString (never written, printed or passed on a command line).
+function New-EphemeralPassword([int] $Length = 32) {
+    $sets = 'ABCDEFGHJKLMNPQRSTUVWXYZ', 'abcdefghijkmnopqrstuvwxyz', '23456789', '!#%+-.:=?@_~'
+    $all = -join $sets
+    while ($true) {
+        $bytes = [byte[]]::new($Length)
+        [Security.Cryptography.RandomNumberGenerator]::Fill($bytes)
+        $chars = [char[]]::new($Length)
+        for ($i = 0; $i -lt $Length; $i++) { $chars[$i] = $all[$bytes[$i] % $all.Length] }
+        $ok = $true
+        foreach ($s in $sets) { if (-not ($chars | Where-Object { $s.IndexOf($_) -ge 0 })) { $ok = $false } }
+        if ($ok) {
+            $secure = [Security.SecureString]::new()
+            foreach ($c in $chars) { $secure.AppendChar($c) }
+            [Array]::Clear($chars, 0, $chars.Length); [Array]::Clear($bytes, 0, $bytes.Length)
+            $secure.MakeReadOnly()
+            return $secure
+        }
+        [Array]::Clear($chars, 0, $chars.Length); [Array]::Clear($bytes, 0, $bytes.Length)
+    }
+}
+
+# Checks each standard-user phase must report (standard-user-msi.ps1 writes them).
+$script:StandardUserChecks = @{
+    refused = @('token is standard', 'no product before', 'msiexec refused by policy (1625)', 'nothing registered', 'nothing installed')
+    allowed = @('token is standard', 'no product before', 'msiexec installed (0)', 'one per-user product', 'install location',
+                'installed files', 'remembered folder in own HKCU', 'own Start menu shortcut', 'msiexec uninstalled (0)',
+                'product removed', 'folder removed', 'shortcut removed')
+}
+
+# Problems ([string[]]) with a phase result from standard-user-msi.ps1: it must
+# come from the ephemeral account's SID with a standard (Medium, non-admin)
+# token, and report every check of its expectation as passed.
+function Get-StandardUserResultProblems($Result, [string] $Sid, [string] $Expect) {
+    $p = [Collections.Generic.List[string]]::new()
+    if ($null -eq $Result) { $p.Add('no result was written'); return , [string[]] $p.ToArray() }
+    if ([string] $Result.user_sid -cne $Sid) { $p.Add("result is from SID '$($Result.user_sid)', not the test account") }
+    if ([string] $Result.expect -cne $Expect) { $p.Add("result is for '$($Result.expect)', expected '$Expect'") }
+    if ($Result.error) { $p.Add("child failed: $($Result.error)") }
+    $checks = @{}
+    foreach ($c in @($Result.checks)) { if ($c) { $checks[[string] $c.name] = $c } }
+    foreach ($name in $script:StandardUserChecks[$Expect]) {
+        if (-not $checks.ContainsKey($name)) { $p.Add("check '$name' was not run") }
+        elseif ($checks[$name].ok -ne $true) { $p.Add("check '$name' failed: $($checks[$name].detail)") }
+    }
+    return , [string[]] $p.ToArray()
+}

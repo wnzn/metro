@@ -363,7 +363,7 @@ jobs:
           $t = $env:RUNNER_TEMP
           & pwsh -NoProfile -NonInteractive -File (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-msi\test-msi-windows.ps1') `
             -FixturesDir "$t\fixtures" -Msi "$t\dist\Metro-$env:VERSION-windows-x64.msi" -Version $env:VERSION `
-            -LogDir "$t\logs\msi-lane" -RequireFile metro-tui.exe -ClientPolicyFixture
+            -LogDir "$t\logs\msi-lane" -RequireFile metro-tui.exe -StandardUserFixture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()

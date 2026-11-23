@@ -13,8 +13,9 @@
     different build refused unless METRO_REPLACE_SAME_VERSION=1, legacy
     install-metro-windows.ps1 install refused, uninstall keeps data and
     unrelated files, default %LOCALAPPDATA%\Programs folder, another drive
-    (D:) when present, and an install under a Basic-user (non-admin) token
-    via runas /trustlevel when Windows offers it.
+    (D:) when present, and (with -StandardUserFixture, GitHub-hosted runners
+    only) an ephemeral standard local account that installs, inspects and
+    uninstalls in its own context, policy-aware (see step 11).
   Part 2 (with -Msi): the real Metro MSI (signed or unsigned) installs into a
   custom folder with spaces, every installed file matches the installed
   RELEASE.json, the marker and shortcut follow the options, and uninstall
@@ -24,7 +25,7 @@
   covered by static table checks (build_msi.py inspect), not here.
 
 .EXAMPLE
-  pwsh -File test-msi-windows.ps1 -FixturesDir .\fixtures -Msi .\Metro-0.3.0-windows-x64.msi -Version 0.3.0 -RequireFile metro-tui.exe
+  pwsh -File test-msi-windows.ps1 -FixturesDir .\fixtures -Msi .\Metro-0.3.0-windows-x64.msi -Version 0.3.0 -RequireFile metro-tui.exe -StandardUserFixture
 #>
 [CmdletBinding()]
 param(
@@ -34,8 +35,9 @@ param(
     [string[]] $RequireFile = @(),
     [string] $LogDir,
     [switch] $IAcceptChangesToThisWindowsProfile,
-    # GitHub-hosted CI only: allow DisableMsi=0 for the non-admin install (see step 11).
-    [switch] $ClientPolicyFixture
+    # GitHub-hosted CI only: an ephemeral standard account (and DisableMsi=0 when the
+    # machine policy blocks per-user installs) for the non-admin install (step 11).
+    [switch] $StandardUserFixture
 )
 
 Set-StrictMode -Version 3.0
@@ -87,46 +89,109 @@ function Get-Sha([string] $Path) { (Get-FileHash -LiteralPath $Path -Algorithm S
 
 # The installed tree must be exactly the payload (+ marker when on) + any $Extra files.
 function Assert-Installed([string] $Dir, $Files, [bool] $Marker, [string[]] $Extra, [string] $What) {
-    $want = @($Files.PSObject.Properties.Name) + @('RELEASE.json') + $Extra
-    if ($Marker) { $want += 'enable-local-runner' }
-    $diff = Get-SetDifference $want (Get-Tree $Dir)
-    Check ($diff -eq '') "$What`: installed files differ: $diff"
-    foreach ($p in $Files.PSObject.Properties) {
-        Check ((Get-Sha (Join-Path $Dir $p.Name)) -eq [string] $p.Value) "$What`: $($p.Name) bytes differ"
-    }
-    if ($Marker) { Check ((Get-Item -LiteralPath (Join-Path $Dir 'enable-local-runner')).Length -eq 0) "$What`: marker must be empty" }
+    $problems = Get-InstalledTreeProblems $Dir $Files $Marker $Extra
+    Check ($problems.Count -eq 0) "$What`: $($problems -join '; ')"
     Pass "$What`: files exact (marker $(if ($Marker) {'on'} else {'off'}))"
 }
 
-# Installs $Package into $Dir with a Basic-user token (runas /trustlevel:0x20000),
-# checks the token really is non-admin (whoami /groups), returns msiexec's exit code.
-function Invoke-BasicUserMsi([string] $Package, [string] $Dir, [string] $Tag) {
-    $script:Step++
-    $log = Join-Path $LogDir ('{0:D2}-basic-user-{1}-msiexec.log' -f $script:Step, $Tag)
-    $rc = Join-Path $Work "basic-$Tag-rc.txt"
-    $groups = Join-Path $Work "basic-$Tag-groups.csv"
-    # runas takes one program string; a .cmd file avoids nested quoting.
-    $cmd = Join-Path ([System.IO.Path]::GetTempPath()) ('metro-msi-basic-' + [Guid]::NewGuid().ToString('N') + '.cmd')
-    if ($cmd.Contains(' ')) { throw "temporary folder path has a space; runas needs one without: $cmd" }
-    Set-Content -LiteralPath $cmd -Encoding ASCII -Value @(
-        '@echo off',
-        "`"%SystemRoot%\System32\whoami.exe`" /groups /fo csv /nh >`"$groups`"",
-        "`"%SystemRoot%\System32\msiexec.exe`" /i `"$Package`" INSTALLDIR=`"$Dir`" /qn /norestart /l*v `"$log`"",
-        "echo %errorlevel%>`"$rc`"")
+# Runs standard-user-msi.ps1 as $Credential (profile loaded) and returns its parsed result.
+function Invoke-StandardUserPhase([pscredential] $Credential, [string] $Root, [string] $Phase, [string] $Expect) {
+    $pwsh = Join-Path $PSHOME 'pwsh.exe'
+    $childScript = Join-Path $Root 'standard-user-msi.ps1'
+    $p = Start-Process -FilePath $pwsh -Credential $Credential -LoadUserProfile -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
+        -ArgumentList "-NoProfile -NonInteractive -File `"$childScript`" -Root `"$Root`" -Phase $Phase -Expect $Expect"
+    $null = $p.Handle
+    if (-not $p.WaitForExit(900000)) { $p.Kill(); throw "FAIL  standard-user $Phase phase timed out" }
+    $file = Join-Path $Root "out\$Phase.json"
+    $result = if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file -Raw | ConvertFrom-Json } else { $null }
+    Write-Host ("standard-user {0} phase: exit {1} (0x{1:X8}){2}" -f $Phase, $p.ExitCode, $(if ($result) { '' } else { '; it wrote no result' }))
+    return $result
+}
+
+# Ephemeral standard local account (Users only), its profile and a test root
+# readable by it; removed again in all cases. Only on a GitHub-hosted runner.
+function Invoke-StandardUserMsiFixture([string] $Package, $Spec, [string] $Expectation, $PolicyStore) {
+    $name = 'metromsi' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    $root = Join-Path $env:SystemDrive ('MetroMsiStdUser-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
+    $sid = $null
+    $failure = $null
+    $password = $null
     try {
-        $r = Start-Process -FilePath "$env:SystemRoot\System32\runas.exe" -ArgumentList @('/trustlevel:0x20000', $cmd) -PassThru -WindowStyle Hidden
-        $null = $r.Handle  # cache the handle so ExitCode is available after the wait
-        $exited = $r.WaitForExit(30000)
-        Check (-not $exited -or $r.ExitCode -eq 0) "runas /trustlevel could not start the Basic-user command (runas exit $(if ($exited) { $r.ExitCode }))"
-        $deadline = (Get-Date).AddMinutes(5)
-        while (-not (Test-Path -LiteralPath $rc) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
-        Check (Test-Path -LiteralPath $rc) "the Basic-user command did not finish within 5 minutes (log $log)"
-        $problem = Get-NonAdminTokenProblem @(Get-Content -LiteralPath $groups)
-        Check ($problem -eq '') "the runas /trustlevel token is not a non-admin token: $problem"
-        $code = [int] (Get-Content -LiteralPath $rc -Raw).Trim()
-        Pass "Basic-user ($Tag) msiexec ran with a Medium-integrity, non-admin token; exit $code (log $log)"
-        return $code
-    } finally { Remove-Item -LiteralPath $cmd -Force -ErrorAction SilentlyContinue }
+        $password = New-EphemeralPassword   # SecureString only; never written or printed
+        $user = New-LocalUser -Name $name -Password $password -AccountNeverExpires -PasswordNeverExpires `
+            -UserMayNotChangePassword -Description 'Metro MSI CI test account (ephemeral)'
+        $sid = $user.SID.Value
+        # Users only (interactive logon, nothing more); New-LocalUser may already have added it.
+        if (-not @(Get-LocalGroupMember -SID 'S-1-5-32-545' | Where-Object { $_.SID.Value -eq $sid }).Count) {
+            Add-LocalGroupMember -SID 'S-1-5-32-545' -Member $sid
+        }
+        $admins = @(Get-LocalGroupMember -SID 'S-1-5-32-544' | Where-Object { $_.SID.Value -eq $sid })
+        Check ($admins.Count -eq 0) 'the test account is not an administrator'
+        Pass "ephemeral standard account created (SID $sid; Users only)"
+        # Test root: SYSTEM and Administrators full control, the test account read
+        # (and modify only on out\); no inherited access.
+        New-Item -ItemType Directory -Path $root | Out-Null
+        New-Item -ItemType Directory -Path (Join-Path $root 'out') | Out-Null
+        foreach ($f in 'standard-user-msi.ps1', 'MsiAutomation.ps1', 'MsiHarness.ps1') { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination $root }
+        Copy-Item -LiteralPath $Package -Destination (Join-Path $root ([string] $Spec.package))
+        [IO.File]::WriteAllText((Join-Path $root 'spec.json'), ($Spec | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+        $acl = Get-Acl -LiteralPath $root
+        $acl.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($acl.Access)) { $null = $acl.RemoveAccessRuleSpecific($rule) }
+        $inherit = [Security.AccessControl.InheritanceFlags] 'ContainerInherit, ObjectInherit'
+        $none = [Security.AccessControl.PropagationFlags]::None
+        foreach ($admin in 'S-1-5-18', 'S-1-5-32-544') {
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new([Security.Principal.SecurityIdentifier]::new($admin), 'FullControl', $inherit, $none, 'Allow'))
+        }
+        $userSid = [Security.Principal.SecurityIdentifier]::new($sid)
+        $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($userSid, 'ReadAndExecute', $inherit, $none, 'Allow'))
+        Set-Acl -LiteralPath $root -AclObject $acl
+        $outAcl = Get-Acl -LiteralPath (Join-Path $root 'out')
+        $outAcl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new($userSid, 'Modify', $inherit, $none, 'Allow'))
+        Set-Acl -LiteralPath (Join-Path $root 'out') -AclObject $outAcl
+        $cred = [pscredential]::new("$env:COMPUTERNAME\$name", $password)
+
+        $r = Invoke-StandardUserPhase $cred $root 'host' $Expectation
+        $problems = Get-StandardUserResultProblems $r $sid $Expectation
+        Check ($problems.Count -eq 0) "standard user under this machine's policy: $($problems -join '; ')"
+        Pass "standard user under this machine's policy: $(if ($Expectation -eq 'refused') { 'refused (1625), nothing registered or installed' } else { 'installed, inspected and uninstalled its own product' })"
+        if ($Expectation -eq 'refused') {
+            Invoke-WithClientMsiPolicy $PolicyStore {
+                $r2 = Invoke-StandardUserPhase $cred $root 'client' 'allowed'
+                $problems2 = Get-StandardUserResultProblems $r2 $sid 'allowed'
+                Check ($problems2.Count -eq 0) "standard user with DisableMsi=0: $($problems2 -join '; ')"
+            }
+            Pass 'standard user with DisableMsi=0 (client policy): installed, inspected and uninstalled its own product'
+            Pass "installer policy restored: DisableMsi $(Format-RegistryValueState (Get-RegistryValueState $PolicyStore $script:MsiPolicyKey $script:MsiPolicyValue))"
+        }
+    } catch { $failure = $_ } finally {
+        if (Test-Path -LiteralPath (Join-Path $root 'out')) {
+            Copy-Item -Path (Join-Path $root 'out\*') -Destination $LogDir -Force -ErrorAction SilentlyContinue
+        }
+        if ($password) { $password.Dispose() }
+        $cleanup = [Collections.Generic.List[string]]::new()
+        if ($sid) {
+            Get-Process -IncludeUserName -ErrorAction SilentlyContinue | Where-Object { $_.UserName -like "*\$name" } |
+                Stop-Process -Force -ErrorAction SilentlyContinue
+            $deadline = (Get-Date).AddSeconds(90)
+            do {
+                $prof = Get-CimInstance -ClassName Win32_UserProfile -Filter "SID = '$sid'"
+                if (-not $prof) { break }
+                if (-not $prof.Loaded) { $prof | Remove-CimInstance -ErrorAction SilentlyContinue }
+                Start-Sleep -Seconds 2
+            } while ((Get-Date) -lt $deadline)
+            if (Get-CimInstance -ClassName Win32_UserProfile -Filter "SID = '$sid'") { $cleanup.Add('the test profile could not be removed') }
+        }
+        if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $name }
+        if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) { $cleanup.Add('the test account could not be removed') }
+        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+        if (Test-Path -LiteralPath $root) { $cleanup.Add('the test root could not be removed') }
+        if ($cleanup.Count -gt 0) {
+            if ($failure) { Write-Host "standard-user cleanup also failed: $($cleanup -join '; ')" }
+            else { throw "FAIL  standard-user cleanup: $($cleanup -join '; ')" }
+        } elseif ($sid) { Pass 'ephemeral account, its profile and the test root removed' }
+    }
+    if ($failure) { throw $failure }
 }
 
 function Assert-Single([string] $UpgradeCode, [string] $ProductCode, [string] $What) {
@@ -234,48 +299,28 @@ try {
         Remove-Item -LiteralPath (Split-Path -Parent $dDir) -Recurse -Force -ErrorAction SilentlyContinue
     } else { Skip 'install on another drive (no writable D:)' }
 
-    # 11. Without administrator rights: a Basic-user token (runas /trustlevel:0x20000),
-    # policy-aware. Under the machine's own Windows Installer policy the outcome must
-    # be the documented one: success, or refusal (1625) with nothing installed. A
-    # refusal never counts as the non-admin install; that then needs
-    # -ClientPolicyFixture (GitHub-hosted runners only), which sets DisableMsi=0
-    # (Windows client behaviour) for that install and restores the exact old state.
+    # 11. Without administrator rights: a genuine standard local account installs,
+    # inspects and uninstalls in its own context. Under this machine's installer
+    # policy the outcome must be the documented one (Windows Server blocks
+    # non-elevated per-user installs: 1625); where it is blocked, the same account
+    # must then succeed with DisableMsi=0 (Windows client behaviour), restored after.
+    # runas /trustlevel is not used: on the hosted runner its token kept High
+    # integrity. Accounts and policy changes happen only on GitHub-hosted runners.
+    $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    $envMap = @{ GITHUB_ACTIONS = $env:GITHUB_ACTIONS; CI = $env:CI; RUNNER_ENVIRONMENT = $env:RUNNER_ENVIRONMENT }
+    $refusal = if ($StandardUserFixture) { Get-PolicyFixtureRefusal $envMap $isAdmin } else { 'run without -StandardUserFixture' }
+    Check ($refusal -eq '') "no non-admin install could be verified: $refusal (the fixture runs only on GitHub-hosted runners)"
     $policyStore = New-HklmStore
     $policy = Get-RegistryValueState $policyStore $script:MsiPolicyKey $script:MsiPolicyValue
     $isServer = [int] (Get-CimInstance -ClassName Win32_OperatingSystem).ProductType -ne 1
     $expectation = Get-BasicUserPolicyExpectation $policy $isServer
     Write-Host "Installer policy: DisableMsi $(Format-RegistryValueState $policy); $(if ($isServer) { 'Windows Server' } else { 'Windows client' }); non-admin per-user install expected: $expectation"
-    $basicDir = Join-Path $Work 'Basic User'
-    $nonAdminInstalled = $false
-    $outcome = Invoke-BasicUserMsi $fixtureMsi['1.0.0'] $basicDir 'host-policy'
-    if ($expectation -eq 'allowed') {
-        Check ($outcome -eq 0) "Basic-user install under this machine's policy: exit $outcome, expected 0"
-        $nonAdminInstalled = $true
-    } else {
-        Check ($outcome -eq 1625) "Basic-user install under this machine's policy: exit $outcome, expected 1625 (forbidden by policy)"
-        Check ((Get-RelatedProducts $Installer $uc).Count -eq 0) 'refused Basic-user install registered nothing'
-        Check (-not (Test-Path -LiteralPath $basicDir) -or (Get-Tree $basicDir).Count -eq 0) 'refused Basic-user install wrote no files'
-        Pass "machine policy refuses a non-elevated per-user install (1625), as documented for DisableMsi $(Format-RegistryValueState $policy)"
-        if ($ClientPolicyFixture) {
-            $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-            $envMap = @{ GITHUB_ACTIONS = $env:GITHUB_ACTIONS; CI = $env:CI; RUNNER_ENVIRONMENT = $env:RUNNER_ENVIRONMENT }
-            $refusal = Get-PolicyFixtureRefusal $envMap $isAdmin
-            Check ($refusal -eq '') "client-policy fixture refused: $refusal"
-            Invoke-WithClientMsiPolicy $policyStore {
-                $code = Invoke-BasicUserMsi $fixtureMsi['1.0.0'] $basicDir 'client-policy'
-                Check ($code -eq 0) "Basic-user install with DisableMsi=0 (client policy): exit $code, expected 0"
-            }
-            Pass "installer policy restored: DisableMsi $(Format-RegistryValueState (Get-RegistryValueState $policyStore $script:MsiPolicyKey $script:MsiPolicyValue))"
-            $nonAdminInstalled = $true
-        }
+    $spec = [ordered] @{
+        package = [string] $fx.'1.0.0'.file; product_code = $pc['1.0.0']; upgrade_code = $uc
+        reg_key = [string] $Fixtures.reg_key; shortcut = [string] $Fixtures.shortcut; files = $fx.'1.0.0'.files
     }
-    Check $nonAdminInstalled ("no non-admin install could be verified: this machine's policy blocks it; " +
-        'on a GitHub-hosted runner pass -ClientPolicyFixture (never on other machines)')
-    Assert-Installed $basicDir $fx.'1.0.0'.files $true @() 'Basic-user install'
-    Assert-Single $uc $pc['1.0.0'] 'Basic-user install'
-    Check ((Get-ProductFacts $Installer $pc['1.0.0']).InstallLocation.TrimEnd('\') -eq $basicDir) 'Basic-user install went into the chosen folder'
-    Invoke-Msi "/x $($pc['1.0.0'])" 0 'uninstall Basic-user install' | Out-Null
-    Check ((Get-RelatedProducts $Installer $uc).Count -eq 0) 'Basic-user install removed'
+    Invoke-StandardUserMsiFixture $fixtureMsi['1.0.0'] $spec $expectation $policyStore
+    Check ((Get-RelatedProducts $Installer $uc).Count -eq 0) 'the standard-user install left nothing registered for this account either'
 
     # Part 2: the real MSI.
     if ($Msi) {

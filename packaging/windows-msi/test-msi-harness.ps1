@@ -263,5 +263,70 @@ Check ((Get-NonAdminTokenProblem @($users, $admOn, $high)) -eq 'token has High o
 Check ((Get-NonAdminTokenProblem @($users, $admOn, $medium)) -eq 'Administrators group is enabled in the token') 'token: enabled Administrators group is rejected'
 Check ((Get-NonAdminTokenProblem @('')) -eq 'no groups were recorded for the token') 'token: no recorded groups is rejected'
 
+# ---- 7. Installed tree against a manifest ------------------------------------------
+$t7 = Join-Path ([IO.Path]::GetTempPath()) ('installed tree ' + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path (Join-Path $t7 'ui') -Force | Out-Null
+try {
+    [IO.File]::WriteAllText((Join-Path $t7 'Metro.exe'), 'a')
+    [IO.File]::WriteAllText((Join-Path $t7 'ui/Metro.exe'), 'b')
+    [IO.File]::WriteAllText((Join-Path $t7 'RELEASE.json'), '{}')
+    [IO.File]::WriteAllBytes((Join-Path $t7 'enable-local-runner'), [byte[]] @())
+    $sha = { param($x) ([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($x)) | ForEach-Object { $_.ToString('x2') }) -join '' }
+    $files = ('{"Metro.exe": "' + (& $sha 'a') + '", "ui/Metro.exe": "' + (& $sha 'b') + '"}') | ConvertFrom-Json
+    Check ((Get-InstalledTreeProblems $t7 $files $true @()).Count -eq 0) 'installed tree: exact files, bytes and empty marker'
+    Check ((Get-InstalledTreeProblems $t7 $files $false @())[0] -ceq 'installed files differ: missing []; unexpected [enable-local-runner]') 'installed tree: marker present when off is reported'
+    $one = ('{"Metro.exe": "' + (& $sha 'a') + '"}') | ConvertFrom-Json
+    Check ((Get-InstalledTreeProblems $t7 $one $true @('ui/Metro.exe')).Count -eq 0) 'installed tree: one-file manifest plus an expected extra file'
+    [IO.File]::WriteAllText((Join-Path $t7 'ui/Metro.exe'), 'changed')
+    $pr7 = Get-InstalledTreeProblems $t7 $files $true @()
+    Check ($pr7 -contains 'ui/Metro.exe bytes differ') "installed tree: changed bytes are reported ($($pr7 -join '; '))"
+    [IO.File]::WriteAllText((Join-Path $t7 'enable-local-runner'), 'x')
+    $pr7 = Get-InstalledTreeProblems $t7 $files $true @()
+    Check ($pr7 -contains 'marker is not empty') "installed tree: non-empty marker is reported ($($pr7 -join '; '))"
+    Check ((Get-InstalledTreeProblems (Join-Path $t7 'absent') $files $true @())[0] -like 'folder * does not exist') 'installed tree: missing folder is reported'
+} finally { Remove-Item -LiteralPath $t7 -Recurse -Force }
+if ($env:METRO_MSI_EXTRACTED_TREE) {
+    # A tree msiextract unpacked from a real build_msi.py package, checked against the RELEASE.json inside it.
+    $m = Get-Content -LiteralPath (Join-Path $env:METRO_MSI_EXTRACTED_TREE 'RELEASE.json') -Raw | ConvertFrom-Json
+    $pr = Get-InstalledTreeProblems $env:METRO_MSI_EXTRACTED_TREE $m.files $true @()
+    Check ($pr.Count -eq 0) "built package: its RELEASE.json files match the extracted payload ($($pr -join '; '))"
+    "installed tree rows: extracted from a package built by build_msi.py"
+}
+
+# ---- 8. Standard-user fixture pieces ---------------------------------------------
+$pw1 = New-EphemeralPassword
+$pw2 = New-EphemeralPassword
+$plain1 = [Net.NetworkCredential]::new('', $pw1).Password   # test only; never printed
+$plain2 = [Net.NetworkCredential]::new('', $pw2).Password
+Check ($pw1 -is [Security.SecureString] -and $pw1.IsReadOnly() -and $pw1.Length -eq 32) 'ephemeral password is a read-only 32-character SecureString'
+Check ($plain1 -cmatch '[A-Z]' -and $plain1 -cmatch '[a-z]' -and $plain1 -match '[0-9]' -and $plain1 -match '[^A-Za-z0-9]' -and $plain1 -cne $plain2) 'ephemeral password meets complexity and differs per call'
+$plain1 = $null; $plain2 = $null
+
+$sid = 'S-1-5-21-1-2-3-1001'
+function New-Result([string] $Expect, [string] $Sid = 'S-1-5-21-1-2-3-1001', [string[]] $Skip = @(), [string] $Fail = '', [string] $Err = '') {
+    $checks = @($script:StandardUserChecks[$Expect] | Where-Object { $Skip -notcontains $_ } | ForEach-Object { @{ name = $_; ok = ($_ -ne $Fail); detail = '' } })
+    return (@{ phase = 'host'; expect = $Expect; user_sid = $Sid; checks = $checks; error = $Err } | ConvertTo-Json -Depth 5 | ConvertFrom-Json)
+}
+Check ((Get-StandardUserResultProblems (New-Result 'refused') $sid 'refused').Count -eq 0) 'standard-user result: complete refusal phase passes'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed') $sid 'allowed').Count -eq 0) 'standard-user result: complete install phase passes'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Sid 'S-1-5-21-9') $sid 'allowed')[0] -like "result is from SID*") 'standard-user result: another SID is rejected'
+Check ((Get-StandardUserResultProblems (New-Result 'refused') $sid 'allowed').Count -gt 0) 'standard-user result: a refusal never passes as the install'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Skip @('folder removed')) $sid 'allowed') -contains "check 'folder removed' was not run") 'standard-user result: a skipped check is rejected'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Fail 'token is standard') $sid 'allowed') -contains "check 'token is standard' failed: ") 'standard-user result: a failed token check is rejected'
+Check ((Get-StandardUserResultProblems (New-Result 'allowed' -Err 'boom') $sid 'allowed') -contains 'child failed: boom') 'standard-user result: a child error is rejected'
+Check ((Get-StandardUserResultProblems $null $sid 'allowed')[0] -eq 'no result was written') 'standard-user result: no result is rejected'
+$standardUser = @('"BUILTIN\Users","Alias","S-1-5-32-545","Mandatory group, Enabled by default, Enabled group"', '"Mandatory Label\Medium Mandatory Level","Label","S-1-16-8192",""')
+Check ((Get-NonAdminTokenProblem $standardUser) -eq '') 'token: a standard user without the Administrators group passes'
+
+# The child records exactly the checks the parent requires.
+$child = Join-Path $PSScriptRoot 'standard-user-msi.ps1'
+$childAst = [Management.Automation.Language.Parser]::ParseFile($child, [ref] $null, [ref] $null)
+$recorded = @($childAst.FindAll({ param($n) $n -is [Management.Automation.Language.CommandAst] -and $n.GetCommandName() -eq 'Record' }, $true) |
+    ForEach-Object { $_.CommandElements[1].Value })
+$required = @($script:StandardUserChecks['refused'] + $script:StandardUserChecks['allowed'] | Sort-Object -Unique)
+Check ((Get-SetDifference $required $recorded) -eq '') "standard-user-msi.ps1 records exactly the required checks ($(Get-SetDifference $required $recorded))"
+$childText = Get-Content -LiteralPath $child -Raw
+Check ($childText -notmatch '(?i)-Credential|-Verb\s+RunAs|runas|trustlevel|AlwaysInstallElevated|Policies') 'standard-user-msi.ps1 never elevates, switches users or touches policy'
+
 "fails=$script:fails"
 exit $script:fails
