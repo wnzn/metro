@@ -1,0 +1,29 @@
+name: Runner stack preflight
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'ops/github-runner/**'
+      - '.github/workflows/check-runner-stack.yml'
+  pull_request:
+    paths:
+      - 'ops/github-runner/**'
+      - '.github/workflows/check-runner-stack.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  preflight:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          ref: ${{ github.sha }}
+          persist-credentials: false
+      # Uses only this disposable hosted Docker daemon. No runner registration
+      # command, repository enrollment credential, or self-hosted runner.
+      - name: Build, start, and probe the unregistered stack
+        run: python3 -I -B ops/github-runner/ci_preflight.py
