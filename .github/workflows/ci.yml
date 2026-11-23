@@ -71,15 +71,42 @@ jobs:
         run: timeout --kill-after=15s 240s python3 -B crates/tui/tests/pty_qa.py --bin-dir target/debug
 
   desktop:
-    runs-on: ubuntu-24.04
+    needs: workflows
+    # Choose a queue, not a fallback if the selected runner is offline.
+    runs-on: ${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' && 'metro-ci-linux-x64' || 'ubuntu-24.04' }}
     env:
       NSH_VERSION: v0.6.1
       NSH_ARCHIVE_SHA256: 9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070
     steps:
+      - name: Verify preinstalled Native Shell and offline TypeScript
+        if: runner.environment == 'self-hosted'
+        shell: bash
+        env:
+          NSH_CLI_SHA256: 8eb4cedc71aaaeeda729d4dba7d0fb2040db29cce98cd6ff3dad6df7d5d5bafd
+        run: |
+          set -euo pipefail
+          # Recheck the repository and ref before checking out on this runner.
+          test "$GITHUB_REPOSITORY" = wnzn/metro
+          test "$GITHUB_REPOSITORY_ID" = 1467654868
+          case "$GITHUB_EVENT_NAME" in
+            push) test "$GITHUB_REF" = refs/heads/main ;;
+            pull_request) test "$GITHUB_BASE_REF" = main ;;
+            *) exit 1 ;;
+          esac
+          test "$RUNNER_OS" = Linux
+          test "$RUNNER_ARCH" = X64
+          test "$(type -P nsh)" = /opt/nsh/bin/nsh
+          test "${NSH_TSC:-}" = /opt/typescript/lib/tsc
+          test -x "$NSH_TSC"
+          printf '%s  %s\n' "$NSH_CLI_SHA256" /opt/nsh/bin/nsh | sha256sum --check -
+          /opt/nsh/bin/nsh --version
+          "$NSH_TSC" --version | grep -Fx 'Version 7.0.2'
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
+          ref: ${{ github.sha }}
           persist-credentials: false
       - name: Install pinned Longbridge Native Shell
+        if: runner.environment == 'github-hosted'
         run: |
           set -eu
           install_dir="$RUNNER_TEMP/nsh-$NSH_VERSION"
@@ -281,10 +308,93 @@ jobs:
 
   workflows:
     runs-on: ubuntu-24.04
+    outputs:
+      docs_only: ${{ steps.preview-policy.outputs.docs_only }}
+      desktop_runner: ${{ steps.desktop-route.outputs.desktop_runner }}
     env:
       ACTIONLINT_VERSION: 1.7.12
       ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
     steps:
+      - name: Select the desktop runner from the GitHub event
+        id: desktop-route
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -I - <<'PY'
+          import json
+          import os
+          import re
+          import subprocess
+          from urllib.parse import quote
+
+          def verify_writer(login, user_id, token):
+              if not token:
+                  return False, "read-only permission lookup token unavailable"
+              # Pass the step's token to this one command only. No inherited gh
+              # host, debug settings, proxy overrides, or interactive prompts.
+              endpoint = f"repos/wnzn/metro/collaborators/{quote(login, safe='')}/permission"
+              try:
+                  result = subprocess.run(
+                      ["gh", "api", "--hostname", "github.com", "--method", "GET", endpoint],
+                      env={"PATH": os.environ["PATH"], "GH_TOKEN": token, "GH_PROMPT_DISABLED": "1"},
+                      stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, timeout=8, check=False,
+                  )
+                  if result.returncode:
+                      return False, "PR author permission lookup failed"
+                  answer = json.loads(result.stdout)
+                  account = answer["user"]
+                  if account["login"] != login or type(account["id"]) is not int or account["id"] != user_id:
+                      return False, "PR author permission lookup identity mismatch"
+                  if answer["permission"] not in ("write", "maintain", "admin"):
+                      return False, "PR author does not have verified write access"
+              except (OSError, ValueError, KeyError, TypeError, subprocess.TimeoutExpired):
+                  return False, "PR author permission lookup unavailable or invalid"
+              return True, "same-repository PR to main by a verified writer"
+
+          def select(env, event, token):
+              if env.get("GITHUB_REPOSITORY") != "wnzn/metro" or env.get("GITHUB_REPOSITORY_ID") != "1467654868":
+                  return False, "not the official Metro repository"
+              actor = env.get("GITHUB_ACTOR", "")
+              if not actor or actor.lower().endswith("[bot]"):
+                  return False, "missing or bot workflow actor"
+              kind = env.get("GITHUB_EVENT_NAME")
+              if kind == "pull_request":
+                  pr = event["pull_request"]
+                  if pr["base"]["ref"] != "main":
+                      return False, "PR does not target literal main"
+                  if pr["base"]["repo"]["id"] != 1467654868 or pr["head"]["repo"]["id"] != 1467654868:
+                      return False, "PR head or base is not in the official repository"
+                  author = pr["user"]
+                  login = author.get("login", "")
+                  if not login or author["type"] != "User" or login.lower().endswith("[bot]"):
+                      return False, "missing or bot PR author"
+                  user_id = author.get("id")
+                  if type(user_id) is not int or user_id <= 0 or not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?", login):
+                      return False, "PR author lacks a valid account ID or login"
+                  if (event.get("sender") or {}).get("type") == "Bot":
+                      return False, "PR event sender is a bot"
+                  return verify_writer(login, user_id, token)
+              if kind == "push":
+                  if env.get("GITHUB_REF") != "refs/heads/main" or event["ref"] != "refs/heads/main":
+                      return False, "push is not to literal main"
+                  if env.get("GITHUB_REF_PROTECTED") != "true":
+                      return False, "main is not protected"
+                  if event["deleted"] is not False or event["forced"] is not False or event["sender"]["type"] != "User":
+                      return False, "push is deleted, forced, or has no human sender"
+                  return True, "protected main push"
+              return False, "not a push or pull_request"
+
+          token = os.environ.pop("GH_TOKEN", "")
+          try:
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as stream:
+                  use_metro, reason = select(os.environ, json.load(stream), token)
+          except (OSError, ValueError, KeyError, TypeError, AttributeError):
+              use_metro, reason = False, "event payload is missing or incomplete"
+          runner = "metro-ci-linux-x64" if use_metro else "ubuntu-24.04"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"desktop_runner={runner}", file=output)
+          print(f"Desktop runner: {runner} ({reason}).")
+          PY
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
@@ -311,6 +421,18 @@ jobs:
           # pwsh ships with the ubuntu-24.04 image; the PowerShell tests skip without it.
           command -v pwsh
           python3 -B -m unittest discover -s packaging -v
+      - name: Check whether this PR needs the optional package previews
+        id: preview-policy
+        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          if python3 -I packaging/package_smoke_policy.py; then
+            echo 'docs_only=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'docs_only=false' >> "$GITHUB_OUTPUT"
+          fi
 
   # The release decision for the official master push: provenance first (no
   # secrets, read-only token), then the checked-in version and its eligibility
@@ -346,12 +468,14 @@ jobs:
         run: python3 -I packaging/release_policy.py decide
 
   # Build and package everything a release would ship, but publish nothing:
-  # pull requests, main, and master pushes whose version is already released.
+  # PRs except proven docs-only changes to main, main pushes, and already
+  # released master versions. Unknown PR diffs still build.
   # No secrets and contents: read only (release.yml's whole tree stays read-only).
   package-smoke:
     needs: [workflows, release-policy]
     if: >-
       ${{ !cancelled() && needs.workflows.result == 'success'
+      && needs.workflows.outputs.docs_only != 'true'
       && (needs.release-policy.result == 'skipped'
           || (needs.release-policy.result == 'success' && needs.release-policy.outputs.release != 'true')) }}
     uses: ./.github/workflows/release.yml
