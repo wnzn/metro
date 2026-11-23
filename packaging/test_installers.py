@@ -539,6 +539,9 @@ class MacosInstallerTests(unittest.TestCase):
             "codesign": f'printf "%s\\n" "codesign $*" >> "{self.box.log}"',
             "plutil": "echo dev.metro.desktop",
             "ps": "exit 0",
+            # Gatekeeper stand-ins: record the call; fail when the test asks for it.
+            "xcrun": f'printf "%s\\n" "xcrun $*" >> "{self.box.log}"; [ ! -e "{self.root}/no-ticket" ]',
+            "spctl": f'printf "%s\\n" "spctl $*" >> "{self.box.log}"; [ ! -e "{self.root}/gatekeeper-rejects" ]',
         }
         for name, body in fakes.items():
             write_exec(self.box.bin / name, f"#!/bin/sh\n{body}\n")
@@ -551,7 +554,7 @@ class MacosInstallerTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def archive(self, arch="arm64", version="0.3.0"):
+    def archive(self, arch="arm64", version="0.3.0", signing="adhoc"):
         exe = b"\xcf\xfa\xed\xfe macho"
         files = {
             "Metro.app/Contents/Info.plist": (b"<plist/>", 0o644),
@@ -562,7 +565,10 @@ class MacosInstallerTests(unittest.TestCase):
         }
 
         def adhoc(m):
-            m["signing"] = "adhoc"
+            if signing is None:
+                m.pop("signing", None)
+            else:
+                m["signing"] = signing
         return build_archive(self.root, f"Metro-{version}-macos-{arch}", files, "desktop", f"macos-{arch}",
                              version, tamper=adhoc)
 
@@ -593,6 +599,29 @@ class MacosInstallerTests(unittest.TestCase):
         self.box.run(MACOS, "uninstall", check=True)
         self.assertFalse(self.install.exists() or self.state.exists())
         self.assertEqual((self.data / "desktop.json").read_text(), "keep")
+
+    def test_notarized_release_needs_its_ticket_and_gatekeeper(self):
+        a = self.archive(signing="developer-id")
+        out = self.box.run(MACOS, "install", "--archive", a, check=True).stdout
+        self.assertIn("Developer ID signed and notarized", out)
+        calls = "\n".join(self.box.calls())
+        self.assertIn(f"xcrun stapler validate {self.install.parent}/.metro-desktop-stage.", calls)
+        self.assertIn(f"spctl --assess --type execute {self.install.parent}/.metro-desktop-stage.", calls)
+        for marker, message in (("no-ticket", "no valid stapled notarization ticket"),
+                                ("gatekeeper-rejects", "Gatekeeper does not accept")):
+            (self.root / marker).touch()
+            r = self.box.run(MACOS, "update", "--archive", self.archive(version="0.3.1", signing="developer-id"))
+            self.assertIn(message, r.stderr)
+            self.assertIn("Metro 0.3.0", self.box.run(MACOS, "status", check=True).stdout)  # unchanged
+            (self.root / marker).unlink()
+        # The installer never touches quarantine or Gatekeeper settings.
+        self.assertFalse(any(c.startswith(("xattr", "spctl --master", "spctl --add")) for c in self.box.calls()))
+
+    def test_unknown_signing_is_refused(self):
+        for signing in (None, "self-signed"):
+            r = self.box.run(MACOS, "install", "--archive", self.archive(signing=signing))
+            self.assertIn("does not say how Metro.app is signed", r.stderr)
+            self.assertFalse((self.install / "Metro.app").exists())
 
     def test_wrong_architecture_and_tampering_are_refused(self):
         r = self.box.run(MACOS, "install", "--archive", self.archive("x64"))

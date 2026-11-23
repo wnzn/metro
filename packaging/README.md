@@ -118,7 +118,68 @@ This is **not yet verified**, and there are no production builds.
   bounded start and shutdown.
 - Their output is ad hoc signed, named `preview-not-verified-adhoc-*`, and
   never attached to a release.
-- There's no Developer ID signing or notarization, because there are no
-  credentials. Until there are, macOS may refuse to open such a build. We
-  never ask anyone to change Gatekeeper.
 - An x64 build under Rosetta isn't supported.
+- We never ask anyone to change Gatekeeper.
+
+## Release signing (tags only)
+
+The pipeline below is implemented and covered by local contract tests. It
+has **never run with real credentials**, so no notarized or signed release
+exists yet.
+
+`ci.yml` passes five repository secrets, by name, only to the tag build
+(`release.yml`). They reach only the signing steps of the `macos-sign` job.
+That job runs separately from the build, which runs third-party build code.
+
+| Secret | Contents |
+| --- | --- |
+| `MACOS_SIGNING_P12_BASE64` | Developer ID Application certificate and private key, exported as `.p12`, then base64 |
+| `MACOS_SIGNING_P12_PASSWORD` | The `.p12` export password |
+| `APPLE_NOTARY_KEY_ID` | App Store Connect API key ID |
+| `APPLE_NOTARY_ISSUER_ID` | App Store Connect issuer ID |
+| `APPLE_NOTARY_KEY_P8` | Contents of the `AuthKey_<id>.p8` file |
+
+There's also an optional repository **variable**, `MACOS_SIGNING_TEAM_ID`.
+If you set it, the identity must belong to that team.
+
+Official signing also needs a tag ruleset that protects `v*` tags. Every
+signing, push and publication job checks `github.ref_protected`.
+
+What `macos_release.py sign` does:
+
+- It checks the ad hoc archive against its sidecar and `RELEASE.json`.
+- It imports the identity into a throwaway keychain. That keychain is
+  deleted afterwards, and the keychain search list is restored.
+- It signs with the hardened runtime and a secure timestamp, from the
+  inside out: `MetroUI.app`, `metro-server`, `metro-tui` when the package
+  includes it, then `Metro.app`. It never uses `--deep`.
+- It keeps the existing entitlements. It refuses `get-task-allow` instead of
+  dropping it.
+- It submits with `notarytool --wait`, requires `Accepted`, then staples
+  and validates the ticket.
+- It re-archives with a new `RELEASE.json` (`"signing": "developer-id"`) and
+  a new `.sha256`.
+- It extracts that archive again with the system `tar` and checks the copy
+  with `codesign`, `stapler validate` and `spctl`. The stapled ticket is a
+  regular file inside the bundle (`Contents/CodeResources`), so it survives
+  the `.tar.gz` and the installer's move.
+
+The tag gate then installs the signed archive and checks the installed app
+the same way. It starts and stops it, and only then uploads
+`dist-desktop-macos-*`.
+
+Missing secrets fail the tag build, which lists their names. A tag never
+releases without macOS. Ad hoc previews are never renamed into release
+names.
+
+Tag order:
+
+1. `release.yml` builds everything, and `macos-sign` runs.
+2. `release-publish.yml` runs Windows signing (`windows-sign.yml`).
+3. `release_assets.py` assembles the release. It requires all four desktop
+   archives, the MSI, the runner, the sidecars, the six scripts and the
+   `metro-tui` terminal client in every desktop archive.
+4. GHCR images are built and signed.
+5. `SHA256SUMS` and the Linux archives get Sigstore signatures.
+6. A draft release is created from the verified signed set. A person
+   publishes it.

@@ -295,13 +295,14 @@ jobs:
       - name: Packaging and installer tests (PE resources, app-menu integration, isolated installers)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends desktop-file-utils libglib2.0-bin shellcheck
+          sudo apt-get install -y -qq --no-install-recommends desktop-file-utils libglib2.0-bin shellcheck python3-yaml
           shellcheck -s sh packaging/*.sh
           # pwsh ships with the ubuntu-24.04 image; the PowerShell tests skip without it.
           command -v pwsh
           python3 -B -m unittest discover -s packaging -v
 
-  # Build and package everything a tag would release, but publish nothing.
+  # Build and package everything a tag would release, but publish nothing. No
+  # secrets and contents: read only (release.yml's whole tree stays read-only).
   package-smoke:
     if: github.ref_type != 'tag'
     needs: [workflows]
@@ -311,8 +312,10 @@ jobs:
     permissions:
       contents: read
 
-  # Tag builds only: after every validation gate, build and package the release
-  # artifacts, push the GHCR images and create a DRAFT GitHub release.
+  # Tag builds only: after every validation gate, build, sign (Developer ID +
+  # notarization on macOS, the Windows signer) and gate the release artifacts.
+  # Only the signing credentials the jobs need are passed, by name; they reach
+  # only macos-sign's signing step; secrets are never inherited wholesale.
   release:
     if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
     needs: [rust, desktop, containers, workflows]
@@ -320,5 +323,25 @@ jobs:
     with:
       release: true
     permissions:
+      contents: read
+    secrets:
+      MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+      MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+      APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+      APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+      APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+
+  # Tag builds only, after every release asset (macOS and Windows signed) passed:
+  # push and verify the GHCR images, add their digests, sign SHA256SUMS with
+  # Sigstore and create a DRAFT GitHub release for a human to publish.
+  publish:
+    if: github.event_name == 'push' && github.ref_type == 'tag' && startsWith(github.ref_name, 'v')
+    needs: [release]
+    uses: ./.github/workflows/release-publish.yml
+    with:
+      version: ${{ needs.release.outputs.version }}
+      prerelease: ${{ needs.release.outputs.prerelease == 'true' }}
+    permissions:
       contents: write
       packages: write
+      id-token: write

@@ -82,9 +82,13 @@ execution policy for Metro.
 
 ## Desktop on macOS (`install-metro-macos.sh`)
 
-**Not verified, preview only.** CI builds ad hoc signed previews that are
-never attached to a release. Without Developer ID signing and notarization,
-macOS may refuse to open them, and Metro never asks you to change
+**Not verified, no release yet.** Pull-request and main builds are ad hoc
+signed previews that are never attached to a release. A tagged release
+build is set up to sign `Metro.app` with a Developer ID certificate, have
+Apple notarize it and staple the ticket. No such build has run yet, because
+the signing credentials aren't configured. For an archive marked as a
+release, the installer requires the stapled ticket and Gatekeeper's
+acceptance before it installs anything. Metro never asks you to change
 Gatekeeper. It installs to `~/Applications/Metro Desktop/Metro.app` and
 never touches `~/Library/Application Support/Metro/Desktop`.
 

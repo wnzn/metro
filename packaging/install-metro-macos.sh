@@ -7,10 +7,11 @@
 # ~/Library/Application Support/Metro/Installer. Your Metro data
 # (~/Library/Application Support/Metro/Desktop) is never touched.
 #
-# NOT YET VERIFIED: macOS builds so far are ad hoc signed CI previews, not
-# Developer ID signed or notarized. This script never removes quarantine
-# attributes or changes Gatekeeper settings; if macOS refuses to open such a
-# build, that is expected until a notarized release exists.
+# Release archives (RELEASE.json "signing": "developer-id") are Developer ID
+# signed, notarized and stapled; this script requires the stapled ticket and
+# Gatekeeper's acceptance before installing them. Ad hoc signed CI previews
+# ("adhoc") still install, with a note. This script never removes quarantine
+# attributes or changes Gatekeeper settings.
 set -eu
 umask 022
 
@@ -189,9 +190,19 @@ install_app() {
     [ -x "$app/Metro.app/Contents/MacOS/Metro" ] || die "package has no Metro.app"
     codesign --verify --deep --strict "$app/Metro.app" 2>/dev/null ||
         die "Metro.app's code signature is invalid or the app was modified; do not install it"
-    if [ "$(json_field "$app/RELEASE.json" signing)" = adhoc ]; then
-        say "Note: this is an ad hoc signed preview build (not notarized). macOS may refuse to open it; Metro does not ask you to change Gatekeeper."
-    fi
+    case "$(json_field "$app/RELEASE.json" signing)" in
+        developer-id)
+            # A release build: the notarization ticket must be stapled to the
+            # bundle and Gatekeeper must accept it (this works offline).
+            xcrun stapler validate "$app/Metro.app" >/dev/null 2>&1 ||
+                die "Metro.app has no valid stapled notarization ticket; do not install it"
+            spctl --assess --type execute "$app/Metro.app" >/dev/null 2>&1 ||
+                die "macOS Gatekeeper does not accept this Metro.app; do not install it"
+            say "Developer ID signed and notarized by Apple." ;;
+        adhoc)
+            say "Note: this is an ad hoc signed preview build (not notarized). macOS may refuse to open it; Metro does not ask you to change Gatekeeper." ;;
+        *) die "RELEASE.json does not say how Metro.app is signed; refusing it" ;;
+    esac
 
     if [ -z "$local_runner" ]; then
         if [ -d "$root/Metro.app" ]; then

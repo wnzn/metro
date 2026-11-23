@@ -3,6 +3,27 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Partial: release signing and tag DAG, local contract checks only (2026-11-23, release lane, local)
+
+**Not a release.** Nothing ran on GitHub, nothing was signed or notarized
+with real credentials, and nothing was published. These are local contract
+checks of `packaging/macos_release.py`, `packaging/release_assets.py`, the
+macOS installer's release checks, and the workflow graph in `ci.yml`,
+`release.yml` and `release-publish.yml`.
+
+| Check | Result |
+| --- | --- |
+| `test_macos_release.py` (stand-in Apple tools: signing order, hardened runtime and timestamp, no `--deep`, preserved entitlements, notary rejection, ticket survives a fresh `tar` extraction, no secret in errors, keychain cleanup, `metro-tui`) | 16 pass |
+| `test_release_assets.py` (release and preview aggregate; refuses ad hoc macOS, unsigned Windows code, MSI or `.ps1`, and a missing `metro-tui`; output accepted by `release_signatures.py prepare` with `IMAGES.txt` from `image_release.py evidence`) | Pass |
+| `test_installers.py` macOS Developer ID path (stapled ticket and Gatekeeper required; unknown signing refused) | Pass |
+| `test_release_workflow.py` with PyYAML (nested permission ceilings, input contracts, secret reach, job order) | **Fails, pending:** `windows-sign.yml` doesn't exist yet. Against the Windows lane's uncommitted `windows-distribution.yml`, the read-only pull-request tree passes. |
+| actionlint 1.7.12 with shellcheck; `shellcheck -s sh packaging/*.sh` | actionlint: **pending**, its only finding is the missing `windows-sign.yml`. shellcheck: clean. |
+
+Still open before any tag: `windows-sign.yml` (Windows lane), a `metro-tui`
+crate with build targets (the desktop jobs fail on `cargo metadata` until
+`crates/tui` builds), the five macOS signing secrets, a `v*` tag ruleset
+(`github.ref_protected`), and a first native run of every gate on GitHub.
+
 ## Staged: installers and setup at 57409bb (2026-11-23, project manager, local)
 
 A frozen local integration cut, **not a release**. Nothing was published or

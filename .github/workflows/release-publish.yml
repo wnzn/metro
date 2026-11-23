@@ -1,0 +1,154 @@
+name: Release publication
+
+# Reusable workflow, tag builds only: ci.yml calls it after release.yml
+# (release: true) built every platform in the same run. Every
+# job that needs more than contents: read lives here, so the pull-request path
+# (release.yml with release: false) never references a write or OIDC permission.
+#
+#   guard -> windows-sign (windows-sign.yml, Windows lane: signs the
+#            unsigned-desktop-windows-x64 output of release.yml and uploads
+#            dist-desktop-windows-x64)
+#         -> assets (release_assets.py in release mode: exactly the four desktop
+#            archives incl. both notarized macOS builds, the MSI, the runner,
+#            sidecars, all six installer scripts, SHA256SUMS; `release-assets`)
+#         -> images (release-images.yml: build, push, read back and keyless-sign
+#            the GHCR images; uploads `release-image-digests`: IMAGES.txt,
+#            images.json, SHA256SUMS)
+#         -> sign (sign-release-assets.yml: stages `release-assets` plus
+#            IMAGES.txt, Sigstore-signs SHA256SUMS and both Linux archives with
+#            the GitHub OIDC identity of this tag, verifies, and uploads
+#            `signed-release-assets`)
+#         -> draft-release (verifies `signed-release-assets` again with cosign
+#            against the signer identity, then creates or updates a DRAFT
+#            GitHub release from exactly that folder; a human publishes it)
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Release version without the leading v (release.yml output)'
+        type: string
+        required: true
+      prerelease:
+        description: 'Prerelease tag: marked prerelease, never latest'
+        type: boolean
+        required: true
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Only a v<version> tag push publishes
+        env:
+          VERSION: ${{ inputs.version }}
+          EVENT: ${{ github.event_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -eu
+          [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && [ "$REF_NAME" = "v$VERSION" ] && [ "$REF_PROTECTED" = true ] \
+            || { echo "release publication runs only for a pushed, protected v$VERSION tag" >&2; exit 1; }
+
+  windows-sign:
+    needs: guard
+    uses: ./.github/workflows/windows-sign.yml
+    with:
+      version: ${{ inputs.version }}
+    permissions:
+      contents: read
+      id-token: write
+
+  assets:
+    needs: [guard, windows-sign]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dist-*
+          path: ${{ runner.temp }}/collected
+          merge-multiple: true
+      - name: Assemble and check the release folder (SHA256SUMS)
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 -I packaging/release_assets.py assemble --version "$VERSION" --mode release \
+            --collected "$RUNNER_TEMP/collected" --out release
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-assets
+          path: release/
+          if-no-files-found: error
+          retention-days: 30
+
+  images:
+    needs: [guard, assets]
+    uses: ./.github/workflows/release-images.yml
+    with:
+      version: ${{ inputs.version }}
+      push: true
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+
+  sign:
+    needs: [guard, assets, images]
+    uses: ./.github/workflows/sign-release-assets.yml
+    with:
+      version: ${{ inputs.version }}
+    permissions:
+      contents: read
+      id-token: write
+
+  draft-release:
+    needs: [guard, assets, images, sign]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: signed-release-assets
+          path: ${{ runner.temp }}/release
+          digest-mismatch: error
+      - name: Only the verified, signed set is promoted
+        run: |
+          set -eu
+          dir="$(mktemp -d "$RUNNER_TEMP/cosign.XXXXXX")"
+          sh packaging/release-signatures/install_cosign.sh "$dir/cosign"
+          python3 -I packaging/release-signatures/release_signatures.py verify --version "$VERSION" \
+            --revision "$GITHUB_SHA" --cosign "$dir/cosign" --directory "$RUNNER_TEMP/release"
+      - name: Create or update the draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -eu
+          cd "$RUNNER_TEMP/release"
+          notes="Draft for review. Windows x64 (ZIP and MSI), Linux x64, macOS Apple silicon and Intel (Developer ID signed, notarized, stapled), the Linux runner and six installer scripts. SHA256SUMS lists every file and is signed with Sigstore (SHA256SUMS.sigstore.json, identity: this repository's sign-release-assets.yml at tag $TAG). Container images by digest: IMAGES.txt."
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ] \
+              || { echo "release $TAG is already published; refusing to modify it" >&2; exit 1; }
+            gh release upload "$TAG" --clobber -- *
+            if [ "$PRERELEASE" = true ]; then gh release edit "$TAG" --prerelease --latest=false; fi
+          else
+            flags=""
+            # A prerelease is never marked latest.
+            [ "$PRERELEASE" = true ] && flags="--prerelease --latest=false"
+            # shellcheck disable=SC2086
+            gh release create "$TAG" --draft --verify-tag $flags --title "$TAG" --notes "$notes" -- *
+          fi

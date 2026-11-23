@@ -34,6 +34,8 @@ NSH_MACOS_APPS = {
 MACOS_UI_ID = "dev.metro.desktop.ui"
 # RELEASE.json capability: this launcher acts on the installer's marker.
 LOCAL_RUNNER = "installer-marker"
+# The terminal client inside each desktop archive (RELEASE.json "tui" names it).
+TUI_NAMES = {"linux": "metro-tui", "windows": "metro-tui.exe", "macos": "Contents/MacOS/metro-tui"}
 MACOS_MIN = "14.0"
 NSH_LICENSE_SHA = "ec75427ad955e3c740f22e7dc3f6db6fc5b2cc1d9135c2af91cece8dd47a2d38"
 WINDOWS_SYSTEM = set("""
@@ -383,8 +385,9 @@ def desktop(args, stage):
             and sha256(renderer) == expected, f"renderer must be the stock NSH {NSH_VERSION} {platform} app")
     license_path = args.nsh_root / "LICENSE-APACHE"
     require(sha256(license_path) == NSH_LICENSE_SHA, "unexpected NSH license text")
-    require(len({sha256(args.launcher), sha256(args.server), expected}) == 3,
-            "launcher, server and NSH renderer must be separate executables")
+    tui = [args.tui] if args.tui else []
+    require(len({sha256(args.launcher), sha256(args.server), expected, *map(sha256, tui)}) == 3 + len(tui),
+            "launcher, server, terminal client and NSH renderer must be separate executables")
     if windows:
         ico = app_icon("metro.ico")
         deps = {executable: pe(args.launcher, gui=True, icon=ico), f"ui/{executable}": pe(renderer, gui=True)}
@@ -425,6 +428,14 @@ def desktop(args, stage):
     server_name = "metro-server.exe" if windows else "metro-server"
     deps[server_name] = pe(args.server) if windows else elf(args.server, (2, 39))
     copy(args.server, stage / server_name, True)
+    extra = {}
+    if args.tui:
+        # The terminal client ships in the same archive under a fixed name.
+        tui_name = TUI_NAMES[platform]
+        deps[tui_name] = pe(args.tui) if windows else elf(args.tui, (2, 39))
+        copy(args.tui, stage / tui_name, True)
+        extra["tui"] = tui_name
+        integration += f"\nTerminal client: run {tui_name} from a terminal in this folder.\n"
     write(stage / "START.txt", f"Extract this entire archive. Launch {executable} at the top level.\n"
           "Keep the bundled server and ui directory next to the launcher.\n\n"
           "Metro opens your private on-device workspace by default. To connect to\n"
@@ -435,7 +446,7 @@ def desktop(args, stage):
           + prerequisites)
     # The launcher reads the installer's enable-local-runner marker (see
     # desktop_tools::runner). Archives without this field predate that.
-    return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked", "local_runner": LOCAL_RUNNER}
+    return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked", "local_runner": LOCAL_RUNNER, **extra}
 
 
 def macho(path, cputype):
@@ -510,8 +521,11 @@ def macos(args, stage):
     deps = {"Metro.app/Contents/Helpers/MetroUI.app/Contents/MacOS/Metro": macho(inner_exe, cputype),
             "Metro.app/Contents/MacOS/Metro": macho(args.launcher, cputype),
             "Metro.app/Contents/MacOS/metro-server": macho(args.server, cputype)}
-    require(len({sha256(args.launcher), sha256(args.server), sha256(inner_exe)}) == 3,
-            "launcher, server and NSH renderer must be separate executables")
+    if args.tui:
+        deps["Metro.app/" + TUI_NAMES["macos"]] = macho(args.tui, cputype)
+    tui = [args.tui] if args.tui else []
+    require(len({sha256(args.launcher), sha256(args.server), sha256(inner_exe), *map(sha256, tui)}) == 3 + len(tui),
+            "launcher, server, terminal client and NSH renderer must be separate executables")
 
     app = stage / "Metro.app"
     out_contents = app / "Contents"
@@ -526,6 +540,8 @@ def macos(args, stage):
     inner_unchanged("while it was copied")
     copy(args.launcher, out_contents / "MacOS/Metro", True)
     copy(args.server, out_contents / "MacOS/metro-server", True)
+    if args.tui:
+        copy(args.tui, app / TUI_NAMES["macos"], True)
     outer_info = {
         "CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "Metro", "CFBundleIdentifier": APP_ID,
         "CFBundleName": "Metro", "CFBundleDisplayName": "Metro", "CFBundlePackageType": "APPL",
@@ -542,6 +558,8 @@ def macos(args, stage):
     # Ad hoc signatures only (CI preview). Sign nested code first; never --deep,
     # which would re-sign the stock inner app.
     codesign("--force", "--sign", "-", "--timestamp=none", str(out_contents / "MacOS/metro-server"))
+    if args.tui:
+        codesign("--force", "--sign", "-", "--timestamp=none", str(app / TUI_NAMES["macos"]))
     codesign("--force", "--sign", "-", "--timestamp=none", str(app))
     codesign("--verify", "--deep", "--strict", str(app))
     inner_unchanged("when the outer app was signed")
@@ -557,6 +575,7 @@ def macos(args, stage):
           "~/Applications/Metro Desktop/ and keeps your data in\n"
           "~/Library/Application Support/Metro/Desktop.\n")
     return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked", "local_runner": LOCAL_RUNNER,
+            **({"tui": "Metro.app/" + TUI_NAMES["macos"]} if args.tui else {}),
             "signing": "adhoc",
             "status": "preview-not-verified",
             "renderer": {"stock_unsigned_sha256": stock_sha, "packaged_signed_sha256": source_exe,
@@ -633,6 +652,7 @@ def main():
     d.add_argument("--server", required=True, type=Path)
     d.add_argument("--ui-dir", required=True, type=Path)
     d.add_argument("--nsh-root", required=True, type=Path)
+    d.add_argument("--tui", type=Path, help="metro-tui terminal client built for --target (shipped in the archive)")
     r = kinds.add_parser("runner")
     r.add_argument("--binary", required=True, type=Path)
     check = kinds.add_parser("verify-desktop-icons")

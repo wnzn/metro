@@ -1,18 +1,49 @@
 name: Release artifacts
 
 # Reusable workflow, called only from ci.yml:
-#   - on pull requests / main with `release: false` (build + package smoke, nothing leaves the run);
+#   - on pull requests / main with `release: false` (build + package smoke, nothing leaves the
+#     run; no secrets; macOS is an ad hoc signed preview that is never released);
 #   - on `v*` tags, after the rust, desktop and containers gates, with `release: true`.
 # It has no triggers of its own, so nothing here runs on its own and nothing is
 # published unless a maintainer pushes a tag.
+#
+# Every job here holds contents: read at most, because ci.yml also calls this file for pull
+# requests (GitHub validates nested permissions before evaluating `if:`). Tag DAG:
+#   meta (pushed, protected v* tag) -> runner-linux, desktop-linux,
+#        desktop-windows (seed) -> windows-distribution (unsigned-desktop-windows-x64),
+#        desktop-macos (ad hoc, no secrets) -> macos-sign (Developer ID + notarization;
+#        the only job that sees the Apple credentials)
+# then ci.yml calls release-publish.yml (tag only): windows-sign -> assets -> images ->
+# sign-release-assets -> draft-release. A missing credential fails the tag build: macOS
+# is never skipped. Pull requests and main end with the `assets` preview aggregate here.
 
 on:
   workflow_call:
     inputs:
       release:
-        description: 'Tag build (push GHCR images, create a DRAFT GitHub release) when true; build and smoke only when false.'
+        description: 'Tag build (Developer ID macOS, signed Windows, release-mode asset gate) when true; build and smoke only when false.'
         type: boolean
         default: false
+    outputs:
+      version:
+        description: 'Release version without the leading v'
+        value: ${{ jobs.meta.outputs.version }}
+      prerelease:
+        description: 'true for a prerelease tag (never marked latest)'
+        value: ${{ jobs.meta.outputs.prerelease }}
+    # Tag builds only (ci.yml maps them by name; pull requests and main pass none).
+    # Used only by the macos-sign job's signing step. See packaging/macos_release.py.
+    secrets:
+      MACOS_SIGNING_P12_BASE64:
+        required: false
+      MACOS_SIGNING_P12_PASSWORD:
+        required: false
+      APPLE_NOTARY_KEY_ID:
+        required: false
+      APPLE_NOTARY_ISSUER_ID:
+        required: false
+      APPLE_NOTARY_KEY_P8:
+        required: false
 
 permissions:
   contents: read
@@ -38,9 +69,15 @@ jobs:
         env:
           RELEASE: ${{ inputs.release }}
           REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -eu
           if [ "$RELEASE" = true ]; then
+            # Official builds (signing, then publication) only from a pushed, protected v* tag.
+            [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && [ "$REF_PROTECTED" = true ] \
+              || { echo "release builds need a pushed v* tag protected by a ruleset" >&2; exit 1; }
             case "$REF_NAME" in
               v[0-9]*.[0-9]*.[0-9]*) ;;
               *) echo "tag $REF_NAME is not vMAJOR.MINOR.PATCH[-prerelease]" >&2; exit 1 ;;
@@ -269,25 +306,47 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --lib openai_oauth::store::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      - name: Build metro-desktop and metro-server (native, locked)
+      # metro-tui ships inside the desktop archives once its crate exists. Until then
+      # pull requests package without it, and release_assets.py refuses a tag.
+      - name: Is the metro-tui terminal client in this commit?
+        id: tui
         run: |
-          cargo build --locked --release --target x86_64-pc-windows-msvc --bin metro-desktop --bin metro-server
+          cargo metadata --locked --no-deps --format-version 1 > "$env:RUNNER_TEMP\cargo-metadata.json"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          foreach ($f in 'metro-desktop.exe', 'metro-server.exe') {
+          $meta = Get-Content -Raw "$env:RUNNER_TEMP\cargo-metadata.json" | ConvertFrom-Json
+          $present = @($meta.packages | Where-Object { $_.name -eq 'metro-tui' }).Count -gt 0
+          "present=$($present.ToString().ToLower())" >> $env:GITHUB_OUTPUT
+      - name: Build metro-desktop, metro-server and metro-tui (native, locked)
+        env:
+          TUI: ${{ steps.tui.outputs.present }}
+        run: |
+          $bins = @('--bin', 'metro-desktop', '--bin', 'metro-server')
+          $files = @('metro-desktop.exe', 'metro-server.exe')
+          if ($env:TUI -eq 'true') { $bins += @('--bin', 'metro-tui'); $files += 'metro-tui.exe' }
+          cargo build --locked --release --target x86_64-pc-windows-msvc @bins
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          foreach ($f in $files) {
             if (-not (Test-Path "target\x86_64-pc-windows-msvc\release\$f")) { throw "missing $f" }
           }
       - name: Third-party notices
+        env:
+          TUI: ${{ steps.tui.outputs.present }}
         run: |
-          python -I packaging/cargo-notices.py --target x86_64-pc-windows-msvc `
-            --package metro-desktop --package metro-server --out "$env:RUNNER_TEMP\notices-desktop.txt"
+          $pkgs = @('--package', 'metro-desktop', '--package', 'metro-server')
+          if ($env:TUI -eq 'true') { $pkgs += @('--package', 'metro-tui') }
+          python -I packaging/cargo-notices.py --target x86_64-pc-windows-msvc @pkgs `
+            --out "$env:RUNNER_TEMP\notices-desktop.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          TUI: ${{ steps.tui.outputs.present }}
         run: |
           $rel = 'target\x86_64-pc-windows-msvc\release'
+          $tui = @()
+          if ($env:TUI -eq 'true') { $tui = @('--tui', "$rel\metro-tui.exe") }
           python -I packaging/package.py desktop --target windows-x64 --version $env:VERSION `
-            --launcher "$rel\metro-desktop.exe" --server "$rel\metro-server.exe" `
+            --launcher "$rel\metro-desktop.exe" --server "$rel\metro-server.exe" @tui `
             --ui-dir "$env:RUNNER_TEMP\stage\ui" --nsh-root "$env:RUNNER_TEMP\stage\nsh-root" `
             --notices "$env:RUNNER_TEMP\notices-desktop.txt" --out-dir dist
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -545,12 +604,30 @@ jobs:
           path: ${{ runner.temp }}/shot
           if-no-files-found: ignore
           retention-days: 7
+      # The unsigned seed for windows-distribution.yml. Never named dist-*, so the
+      # release collection can never pick it up.
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: dist-desktop-windows-x64
+          name: seed-desktop-windows-x64
           path: dist/
           if-no-files-found: error
           retention-days: 14
+
+  # Windows distribution (owned by the Windows lane): turns the seed into the
+  # ZIP, the MSI and the two PowerShell scripts, the ZIP and MSI each with a
+  # .sha256. Pull requests and main: uploaded as dist-desktop-windows-x64
+  # (unsigned preview). Tags: uploaded as unsigned-desktop-windows-x64 for
+  # windows-sign.yml in release-publish.yml, the only place that may hold
+  # id-token: write. This call grants contents: read only, so nothing in its
+  # tree may request more (GitHub checks nested permissions before any `if:`).
+  windows-distribution:
+    needs: [meta, desktop-windows]
+    uses: ./.github/workflows/windows-distribution.yml
+    with:
+      release: ${{ inputs.release }}
+      version: ${{ needs.meta.outputs.version }}
+    permissions:
+      contents: read
 
   # Linux x64 desktop. The GUI launch is best-effort on a headless runner
   # (Xvfb + WebKitGTK); native tests, layout, checksum, capability and server
@@ -574,21 +651,42 @@ jobs:
           python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
           readelf --version | head -1
           cargo test --locked --release -p metro-desktop
-      - name: Build metro-desktop and metro-server (locked)
+      # metro-tui ships inside the desktop archives once its crate exists. Until then
+      # pull requests package without it, and release_assets.py refuses a tag.
+      - name: Is the metro-tui terminal client in this commit?
+        id: tui
         run: |
           set -eu
-          cargo build --locked --release --target x86_64-unknown-linux-gnu --bin metro-desktop --bin metro-server
-      - name: Third-party notices
+          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
+          present="$(python3 -I -c 'import json, sys; print(str(any(p["name"] == "metro-tui" for p in json.load(open(sys.argv[1]))["packages"])).lower())' "$RUNNER_TEMP/cargo-metadata.json")"
+          echo "present=$present" >> "$GITHUB_OUTPUT"
+      - name: Build metro-desktop, metro-server and metro-tui (locked)
+        env:
+          TUI: ${{ steps.tui.outputs.present }}
         run: |
-          python3 -I packaging/cargo-notices.py --target x86_64-unknown-linux-gnu \
-            --package metro-desktop --package metro-server --out "$RUNNER_TEMP/notices-desktop.txt"
+          set -eu
+          set -- --bin metro-desktop --bin metro-server
+          [ "$TUI" = true ] && set -- "$@" --bin metro-tui
+          cargo build --locked --release --target x86_64-unknown-linux-gnu "$@"
+      - name: Third-party notices
+        env:
+          TUI: ${{ steps.tui.outputs.present }}
+        run: |
+          set -eu
+          set -- --package metro-desktop --package metro-server
+          [ "$TUI" = true ] && set -- "$@" --package metro-tui
+          python3 -I packaging/cargo-notices.py --target x86_64-unknown-linux-gnu "$@" \
+            --out "$RUNNER_TEMP/notices-desktop.txt"
       - name: Package
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          TUI: ${{ steps.tui.outputs.present }}
         run: |
           set -eu
           rel=target/x86_64-unknown-linux-gnu/release
-          python3 -I packaging/package.py desktop --target linux-x64 --version "$VERSION" \
+          set --
+          [ "$TUI" = true ] && set -- --tui "$rel/metro-tui"
+          python3 -I packaging/package.py desktop --target linux-x64 --version "$VERSION" "$@" \
             --launcher "$rel/metro-desktop" --server "$rel/metro-server" \
             --ui-dir "$RUNNER_TEMP/stage/ui" --nsh-root "$RUNNER_TEMP/stage/nsh-root" \
             --notices "$RUNNER_TEMP/notices-desktop.txt" --out-dir dist
@@ -726,15 +824,16 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-  # macOS: NOT YET VERIFIED, CI PREVIEW ONLY. Native jobs per architecture
-  # (macos-15 = Apple silicon, macos-15-intel = Intel; GitHub offers Intel
-  # macOS runners until August 2027). They build and test the launcher and
-  # server natively, package the stock NSH macOS runtime (pinned asset and
-  # runtime digests) as the inner MetroUI.app, assemble and ad hoc sign the
-  # outer Metro.app, install it with install-metro-macos.sh into a path with
-  # spaces and check a clean start and shutdown. There is no Developer ID
-  # signing or notarization (no credentials), so these artifacts are never
-  # attached to the draft release, and nothing here changes Gatekeeper.
+  # macOS build and preview. Native jobs per architecture (macos-15 = Apple
+  # silicon, macos-15-intel = Intel; GitHub offers Intel macOS runners until
+  # August 2027). They build and test the launcher and server natively, package
+  # the stock NSH macOS runtime (pinned asset and runtime digests) as the inner
+  # MetroUI.app, assemble and ad hoc sign the outer Metro.app, install it with
+  # install-metro-macos.sh into a path with spaces and check a clean start and
+  # shutdown. This job never sees signing credentials (it runs third-party build
+  # code). Its ad hoc output is uploaded as preview-not-verified-adhoc-*, never
+  # matched by the release collection; on tags, macos-sign turns it into the
+  # Developer ID signed, notarized release archive.
   desktop-macos:
     needs: meta
     strategy:
@@ -800,19 +899,41 @@ jobs:
           cargo fetch --locked --target "$RUST_TARGET"
           python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
           cargo test --locked --release --target "$RUST_TARGET" -p metro-desktop
-      - name: Build metro-desktop and metro-server (native, locked)
-        run: cargo build --locked --release --target "$RUST_TARGET" --bin metro-desktop --bin metro-server
-      - name: Third-party notices
+      # metro-tui ships inside the desktop archives once its crate exists. Until then
+      # pull requests package without it, and release_assets.py refuses a tag.
+      - name: Is the metro-tui terminal client in this commit?
+        id: tui
         run: |
-          python3 -I packaging/cargo-notices.py --target "$RUST_TARGET" \
-            --package metro-desktop --package metro-server --out "$RUNNER_TEMP/notices-desktop.txt"
+          set -eu
+          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
+          present="$(python3 -I -c 'import json, sys; print(str(any(p["name"] == "metro-tui" for p in json.load(open(sys.argv[1]))["packages"])).lower())' "$RUNNER_TEMP/cargo-metadata.json")"
+          echo "present=$present" >> "$GITHUB_OUTPUT"
+      - name: Build metro-desktop, metro-server and metro-tui (native, locked)
+        env:
+          TUI: ${{ steps.tui.outputs.present }}
+        run: |
+          set -eu
+          set -- --bin metro-desktop --bin metro-server
+          [ "$TUI" = true ] && set -- "$@" --bin metro-tui
+          cargo build --locked --release --target "$RUST_TARGET" "$@"
+      - name: Third-party notices
+        env:
+          TUI: ${{ steps.tui.outputs.present }}
+        run: |
+          set -eu
+          set -- --package metro-desktop --package metro-server
+          [ "$TUI" = true ] && set -- "$@" --package metro-tui
+          python3 -I packaging/cargo-notices.py --target "$RUST_TARGET" "$@" --out "$RUNNER_TEMP/notices-desktop.txt"
       - name: Package (outer Metro.app, ad hoc signed preview)
         env:
           VERSION: ${{ needs.meta.outputs.version }}
+          TUI: ${{ steps.tui.outputs.present }}
         run: |
           set -eu
           rel="target/$RUST_TARGET/release"
-          python3 -I packaging/package.py desktop --target "$TARGET" --version "$VERSION" \
+          set --
+          [ "$TUI" = true ] && set -- --tui "$rel/metro-tui"
+          python3 -I packaging/package.py desktop --target "$TARGET" --version "$VERSION" "$@" \
             --launcher "$rel/metro-desktop" --server "$rel/metro-server" \
             --ui-dir "$RUNNER_TEMP/out-macos/Metro.app" --nsh-root "$RUNNER_TEMP/nsh-macos/nsh" \
             --notices "$RUNNER_TEMP/notices-desktop.txt" --out-dir dist-macos
@@ -831,92 +952,15 @@ jobs:
           HOME="$home" sh "$i" install --archive "$a"
           dir="$home/Applications/Metro Desktop"
           app="$dir/Metro.app"
-          launcher="$app/Contents/MacOS/Metro"
-          server_exe="$app/Contents/MacOS/metro-server"
-          ui="$app/Contents/Helpers/MetroUI.app/Contents/MacOS/Metro"
           test "$(find "$dir" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | tr '\n' ' ')" = "Metro.app enable-local-runner "
           codesign --verify --deep --strict "$app"
           codesign --verify --strict "$app/Contents/Helpers/MetroUI.app"
           plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist" | grep -qx dev.metro.desktop
           plutil -extract CFBundleIdentifier raw "$app/Contents/Helpers/MetroUI.app/Contents/Info.plist" | grep -qx dev.metro.desktop.ui
 
-          # Preflight: the renderer is the packaged (pinned-runtime) one, and the
-          # launcher is neither the renderer nor the server.
-          digest() { shasum -a 256 "$1" | cut -c1-64; }
-          want_ui="$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["renderer"]["packaged_signed_sha256"])' \
-            "$home/Library/Application Support/Metro/Installer/RELEASE.json")"
-          test "$(digest "$ui")" = "$want_ui"
-          test "$(digest "$launcher")" != "$want_ui"
-          test "$(digest "$launcher")" != "$(digest "$server_exe")"
-
-          # Hard bound: RLIMIT_NPROC (per user on macOS) for the launcher and
-          # everything it starts, a little above what this user already runs.
-          used="$(ps -axo uid= | awk -v u="$(id -u)" '$1 == u' | wc -l | tr -d ' ')"
-          cap=$((used + 24))
-          ( ulimit -u "$cap" && test "$(ulimit -u)" = "$cap" ) || { echo "cannot enforce a process limit; not launching" >&2; exit 1; }
-
-          # Processes by exact executable path (ps comm is the full path on macOS).
-          procs() { ps -axo pid=,ppid=,comm= | awk '{ pid = $1; ppid = $2; sub(/^ *[0-9]+ +[0-9]+ /, ""); print pid "\t" ppid "\t" $0 }'; }
-          children() { procs | awk -F '\t' -v p="$1" -v e="$2" '$2 == p && $3 == e { print $1 }'; }
-          in_bundle() { procs | awk -F '\t' -v pre="$app/Contents/" 'index($3, pre) == 1 { print $1 }'; }
-          count() { grep -c . || true; }
-          # Launcher, guardian, UI and server, plus one transient process.
-          budget() {
-            n="$(in_bundle | count)"
-            [ "$n" -le 5 ] || { echo "process budget exceeded: $n processes from the bundle" >&2; exit 1; }
-          }
-          cleanup() { in_bundle | xargs kill -KILL 2>/dev/null || true; }
-          trap cleanup EXIT
-
           export METRO_DESKTOP_HOME="$home/desktop data"
-          mkdir -p "$METRO_DESKTOP_HOME" "$RUNNER_TEMP/shot"
-          # The launcher's log stays on the runner; it is not printed.
-          ( ulimit -u "$cap"; exec "$launcher" ) >"$RUNNER_TEMP/launcher.log" 2>&1 &
-          pid=$!
-          healthy=0
-          for _ in $(seq 1 90); do
-            budget
-            kill -0 "$pid" 2>/dev/null || { echo "the launcher exited early" >&2; exit 1; }
-            server="$(children "$pid" "$server_exe")"
-            if [ "$(printf '%s\n' "$server" | count)" = 1 ]; then
-              listen="$(lsof -nP -a -p "$server" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n//p' || true)"
-              if printf '%s\n' "$listen" | grep . | grep -vqE '^(127\.0\.0\.1|\[::1\]):'; then
-                echo "the bundled metro-server listens beyond loopback" >&2; exit 1
-              fi
-              port="$(printf '%s\n' "$listen" | sed -n 's/^127\.0\.0\.1://p' | head -n1)"
-              if [ -n "$port" ] && [ "$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' \
-                  --max-time 2 "http://127.0.0.1:$port/healthz" || true)" = 200 ]; then
-                healthy=1; break
-              fi
-            fi
-            sleep 1
-          done
-          [ "$healthy" = 1 ] || { echo "the bundled metro-server never answered /healthz with 200" >&2; exit 1; }
-
-          # Exactly one guardian (the launcher's own executable, guardian argument
-          # only) under the launcher, and exactly one UI under that guardian.
-          guardian="$(children "$pid" "$launcher")"
-          [ "$(printf '%s\n' "$guardian" | count)" = 1 ] || { echo "expected exactly one guardian under the launcher" >&2; exit 1; }
-          [ "$(ps -o args= -p "$guardian")" = "$launcher --metro-ui-guardian" ] || { echo "unexpected guardian command line" >&2; exit 1; }
-          uiproc=
-          for _ in $(seq 1 30); do
-            budget
-            uiproc="$(children "$guardian" "$ui")"
-            [ -n "$uiproc" ] && break
-            sleep 1
-          done
-          [ "$(printf '%s\n' "$uiproc" | count)" = 1 ] || { echo "expected exactly one UI under the guardian" >&2; exit 1; }
-          [ -z "$(children "$uiproc" "$launcher")" ] || { echo "a launcher runs below the UI" >&2; exit 1; }
-          sleep 5
-          budget
-          screencapture -x "$RUNNER_TEMP/shot/desktop-$TARGET.png" || true
-
-          kill -TERM "$pid"
-          for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
-          if kill -0 "$pid" 2>/dev/null; then echo "the launcher did not stop on SIGTERM" >&2; exit 1; fi
-          sleep 3
-          [ -z "$(in_bundle)" ] || { echo "a guardian, UI or server outlived the launcher" >&2; exit 1; }
-          trap - EXIT
+          sh packaging/smoke-macos-launch.sh "$app" "$home/Library/Application Support/Metro/Installer/RELEASE.json" \
+            "$RUNNER_TEMP/shot" "desktop-$TARGET"
 
           HOME="$home" sh "$i" update --archive "$a" --no-local-runner
           test ! -e "$dir/enable-local-runner"
@@ -927,7 +971,7 @@ jobs:
         if: always()
         with:
           name: smoke-${{ matrix.target }}-screenshot
-          path: ${{ runner.temp }}/shot
+          path: ${{ runner.temp }}/shot/*.png
           if-no-files-found: ignore
           retention-days: 7
       # Named so it cannot be mistaken for a release asset.
@@ -938,10 +982,128 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
-  # Combines every archive, writes one SHA256SUMS and (tag builds only) creates a
-  # DRAFT release for a human to review and publish. Nothing is public until then.
+  # Tag builds only: Developer ID signing and notarization of the ad hoc archive
+  # above, on the same native runner type. The Apple credentials exist only in
+  # the one signing step's environment; macos_release.py keeps the identity in a
+  # throwaway keychain, writes the .p12 and .p8 to owner-only temporary files and
+  # deletes them, and never prints a value. The gate then checks what users get:
+  # a copy of the final archive extracted with the system tar, and the app as
+  # install-metro-macos.sh installs it (stapled ticket, Gatekeeper, launch).
+  macos-sign:
+    if: inputs.release
+    needs: [meta, desktop-macos]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: macos-arm64
+            arch: arm64
+          - runner: macos-15-intel
+            target: macos-x64
+            arch: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 150
+    env:
+      TARGET: ${{ matrix.target }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Runner architecture matches the target
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          test "$(uname -m)" = "$ARCH"
+          sw_vers
+          python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: preview-not-verified-adhoc-${{ matrix.target }}
+          path: ${{ runner.temp }}/adhoc
+      - name: Only a pushed, protected v<version> tag is signed
+        env:
+          REF_PROTECTED: ${{ github.ref_protected }}
+        run: |
+          set -eu
+          [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = "refs/tags/v$VERSION" ] && [ "$REF_PROTECTED" = true ] \
+            || { echo "Developer ID signing runs only for the protected v$VERSION tag push" >&2; exit 1; }
+      - name: Signing credentials are configured (checked by name only)
+        env:
+          MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+        run: python3 -I packaging/macos_release.py check-credentials
+      - name: Developer ID sign, notarize, staple, re-archive; verify a fresh extraction
+        timeout-minutes: 130
+        env:
+          MACOS_SIGNING_P12_BASE64: ${{ secrets.MACOS_SIGNING_P12_BASE64 }}
+          MACOS_SIGNING_P12_PASSWORD: ${{ secrets.MACOS_SIGNING_P12_PASSWORD }}
+          APPLE_NOTARY_KEY_ID: ${{ secrets.APPLE_NOTARY_KEY_ID }}
+          APPLE_NOTARY_ISSUER_ID: ${{ secrets.APPLE_NOTARY_ISSUER_ID }}
+          APPLE_NOTARY_KEY_P8: ${{ secrets.APPLE_NOTARY_KEY_P8 }}
+          MACOS_SIGNING_TEAM_ID: ${{ vars.MACOS_SIGNING_TEAM_ID }}
+        run: |
+          set -eu
+          python3 -I packaging/macos_release.py sign \
+            --archive "$RUNNER_TEMP/adhoc/Metro-$VERSION-$TARGET.tar.gz" --out-dir dist
+          ls -l dist
+      - name: Release gate (downloaded copy, installer, stapled ticket, Gatekeeper, launch)
+        timeout-minutes: 10
+        run: |
+          set -eu
+          # A separate copy, as a person would download it.
+          dl="$(mktemp -d "$RUNNER_TEMP/download dir.XXXXXX")"
+          cp "dist/Metro-$VERSION-$TARGET.tar.gz" "dist/Metro-$VERSION-$TARGET.tar.gz.sha256" "$dl/"
+          a="$dl/Metro-$VERSION-$TARGET.tar.gz"
+          python3 -I packaging/macos_release.py verify-archive "$a"
+          home="$(mktemp -d "$RUNNER_TEMP/mac home.XXXXXX")"
+          home="$(cd "$home" && pwd -P)"
+          i="$GITHUB_WORKSPACE/packaging/install-metro-macos.sh"
+          HOME="$home" sh "$i" install --archive "$a" | tee "$RUNNER_TEMP/install.log"
+          grep -q "Developer ID signed and notarized" "$RUNNER_TEMP/install.log"
+          dir="$home/Applications/Metro Desktop"
+          app="$dir/Metro.app"
+          manifest="$home/Library/Application Support/Metro/Installer/RELEASE.json"
+          # The ticket survived the archive, the installer's copy and its move.
+          python3 -I packaging/macos_release.py verify-app --app "$app" --manifest "$manifest"
+          export METRO_DESKTOP_HOME="$home/desktop data"
+          sh packaging/smoke-macos-launch.sh "$app" "$manifest" "$RUNNER_TEMP/shot" "release-$TARGET"
+          HOME="$home" sh "$i" uninstall
+          test ! -e "$dir"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: release-${{ matrix.target }}-screenshot
+          path: ${{ runner.temp }}/shot/*.png
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-desktop-${{ matrix.target }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  # The preview aggregate (pull requests and main): the Linux and Windows
+  # desktop archives, the Windows MSI, the Linux runner, their .sha256
+  # sidecars and the installer scripts in one SHA256SUMS, checked by the same
+  # release_assets.py as tags but without macOS (its ad hoc previews are
+  # separate artifacts) and without signature requirements. Tags assemble in
+  # release-publish.yml instead, in release mode, after Windows signing.
   assets:
-    needs: [meta, runner-linux, desktop-windows, desktop-linux]
+    needs: [meta, runner-linux, windows-distribution, desktop-linux, desktop-macos, macos-sign]
+    # Pull requests and main only (macos-sign is skipped there). On tags the
+    # release-mode aggregate runs in release-publish.yml, after Windows signing.
+    if: >-
+      ${{ !cancelled() && !inputs.release
+      && needs.meta.result == 'success' && needs.runner-linux.result == 'success'
+      && needs.windows-distribution.result == 'success' && needs.desktop-linux.result == 'success'
+      && needs.desktop-macos.result == 'success' && needs.macos-sign.result == 'skipped' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -954,99 +1116,15 @@ jobs:
           pattern: dist-*
           path: ${{ runner.temp }}/collected
           merge-multiple: true
-      - name: SHA256SUMS (archives and the standalone installer scripts)
+      - name: Assemble and check the preview folder (SHA256SUMS)
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
-          set -eu
-          mkdir release
-          cp "$RUNNER_TEMP"/collected/* release/
-          expected="Metro-$VERSION-linux-x64.tar.gz Metro-$VERSION-windows-x64.zip Metro-runner-$VERSION-linux-x64.tar.gz"
-          # shellcheck disable=SC2086 # $expected is a fixed list of file names
-          for f in $expected; do
-            test -f "release/$f" && test -f "release/$f.sha256" || { echo "missing $f or its .sha256" >&2; ls release; exit 1; }
-          done
-          test "$(find release -mindepth 1 -maxdepth 1 | wc -l)" -eq 6 || { echo "unexpected release files" >&2; ls release; exit 1; }
-          (cd release && for f in $expected; do sha256sum --check "$f.sha256"; done)
-          # Independent downloads; each checks the archive you give it against SHA256SUMS.
-          # (install-metro-macos.sh is not published until a notarized macOS build exists.)
-          scripts="install-metro-linux.sh install-metro-windows.ps1 install-metro-runner-linux.sh metro-runner-container.sh metro-runner-container.ps1"
-          for s in $scripts; do install -m 644 "packaging/$s" "release/$s"; done
-          # shellcheck disable=SC2086
-          (cd release && sha256sum $expected $scripts | sort -k2 > SHA256SUMS && cat SHA256SUMS && sha256sum --check SHA256SUMS)
+          python3 -I packaging/release_assets.py assemble --version "$VERSION" --mode smoke \
+            --collected "$RUNNER_TEMP/collected" --out release
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: release-assets
+          name: preview-assets
           path: release/
           if-no-files-found: error
-          retention-days: 30
-
-  draft-release:
-    if: inputs.release
-    needs: [meta, assets, images]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: release-assets
-          path: ${{ runner.temp }}/release
-      - name: Create or update the draft release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-          TAG: ${{ github.ref_name }}
-          PRERELEASE: ${{ needs.meta.outputs.prerelease }}
-        run: |
-          set -eu
-          cd "$RUNNER_TEMP/release"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true ] \
-              || { echo "release $TAG is already published; refusing to modify it" >&2; exit 1; }
-            gh release upload "$TAG" --clobber -- *
-          else
-            flags=""
-            [ "$PRERELEASE" = true ] && flags="--prerelease"
-            # shellcheck disable=SC2086
-            gh release create "$TAG" --draft --verify-tag $flags --title "$TAG" \
-              --notes "Draft. Verify with SHA256SUMS before publishing." -- *
-          fi
-
-  # GHCR images, pushed on tag builds only (after every gate in ci.yml and the
-  # package jobs above). Names: ghcr.io/<owner>/metro-server and /metro-runner.
-  images:
-    if: inputs.release
-    needs: [meta, runner-linux, desktop-windows, desktop-linux]
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          persist-credentials: false
-      - name: Build release images
-        run: |
-          set -eu
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          epoch="$(git log -1 --format=%ct)"
-          for component in server runner; do
-            docker build --target "$component" \
-              --build-arg "SOURCE_DATE_EPOCH=$epoch" \
-              --label "org.opencontainers.image.source=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}" \
-              --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
-              --label "org.opencontainers.image.version=${GITHUB_REF_NAME}" \
-              -t "ghcr.io/${owner}/metro-${component}:${GITHUB_REF_NAME}" .
-          done
-      - name: Publish tagged images
-        env:
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -eu
-          trap 'docker logout ghcr.io >/dev/null' EXIT
-          printf '%s' "$GHCR_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
-          owner="${GITHUB_REPOSITORY_OWNER,,}"
-          for component in server runner; do
-            docker push "ghcr.io/${owner}/metro-${component}:${GITHUB_REF_NAME}"
-          done
+          retention-days: 14
