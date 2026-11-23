@@ -1,0 +1,236 @@
+name: Windows distribution
+
+# Reusable, called only by this repository's own workflows; no triggers of its
+# own. Every job is contents: read and none uses an environment, a credential,
+# OIDC or a self-hosted runner. Interface: packaging/windows-signing/README.md.
+#
+#   release: false  PR / main preview. Verifies the seed, repacks it unsigned,
+#                   builds Metro-<v>-windows-x64.unsigned-preview.msi with the
+#                   MSI lane (packaging/windows-msi, on Linux), checks and
+#                   installs it on a fresh Windows VM, runs the MSI lane's native
+#                   tests and self-tests the verifiers with a throwaway
+#                   certificate. Uploads dist-desktop-windows-x64.
+#   release: true   Pushed vX.Y.Z[-pre] tag from ci.yml only. Verifies the seed
+#                   for an official release (metro-tui.exe required) and uploads
+#                   exactly the seed ZIP and its .sha256 as
+#                   unsigned-desktop-windows-x64 for windows-sign.yml.
+
+on:
+  workflow_call:
+    inputs:
+      release:
+        description: 'Tag build: hand the verified seed to windows-sign.yml when true; unsigned preview when false.'
+        type: boolean
+        default: false
+      version:
+        description: 'Version without the leading v (the seed is Metro-<version>-windows-x64.zip).'
+        type: string
+        required: true
+    outputs:
+      mode:
+        description: 'official (tag hand-off) or preview'
+        value: ${{ jobs.seed.outputs.mode }}
+      seed-sha256:
+        value: ${{ jobs.seed.outputs.seed-sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Seed checks without credentials: exact archive, manifest, pinned stock
+  # renderer, binary allowlist and the sources this checkout builds from.
+  seed:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+      seed-sha256: ${{ steps.verify.outputs.sha256 }}
+      zip-sha256: ${{ steps.preview.outputs.zip }}
+      msi-sha256: ${{ steps.preview.outputs.msi }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - id: mode
+        name: Mode (official only for this repository's pushed version tag)
+        env:
+          RELEASE: ${{ inputs.release }}
+          VERSION: ${{ inputs.version }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]{1,40})?$' \
+            || { echo "invalid version input" >&2; exit 1; }
+          if [ "$RELEASE" = true ]; then
+            [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && [ "$REF" = "refs/tags/v$VERSION" ] \
+              && [ "$WORKFLOW_REF" = "$REPO/.github/workflows/ci.yml@refs/tags/v$VERSION" ] \
+              || { echo "the official Windows hand-off runs only for a pushed v$VERSION tag from ci.yml" >&2; exit 1; }
+            echo mode=official >> "$GITHUB_OUTPUT"
+          else
+            echo mode=preview >> "$GITHUB_OUTPUT"
+          fi
+      - name: Signing helper tests
+        run: python3 -B -m unittest discover -s packaging/windows-signing -v
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: seed-desktop-windows-x64
+          path: ${{ runner.temp }}/seed
+      - id: verify
+        name: Verify the seed
+        env:
+          VERSION: ${{ inputs.version }}
+          MODE: ${{ steps.mode.outputs.mode }}
+        run: |
+          set -eu
+          sha="$(python3 -I packaging/windows-signing/winsign.py verify-seed --seed-dir "$RUNNER_TEMP/seed" \
+            --version "$VERSION" --mode "$MODE" --work "$RUNNER_TEMP/work" --scripts-dir packaging)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          if [ "$MODE" = official ]; then
+            mkdir "$RUNNER_TEMP/handoff"
+            for f in "Metro-$VERSION-windows-x64.zip" "Metro-$VERSION-windows-x64.zip.sha256"; do
+              cp -- "$RUNNER_TEMP/seed/$f" "$RUNNER_TEMP/handoff/$f"
+            done
+            [ "$(sha256sum "$RUNNER_TEMP/handoff/Metro-$VERSION-windows-x64.zip" | cut -c1-64)" = "$sha" ]
+          fi
+      - if: inputs.release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: unsigned-desktop-windows-x64
+          path: ${{ runner.temp }}/handoff/
+          if-no-files-found: error
+          retention-days: 3
+      - id: preview
+        if: ${{ !inputs.release }}
+        name: Preview - repack unsigned, build the unsigned-preview MSI and the MSI test fixtures
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          w=packaging/windows-signing/winsign.py
+          python3 -I "$w" prepare --work "$RUNNER_TEMP/work" --scripts-dir packaging >/dev/null
+          zip="$(python3 -I "$w" finalize --work "$RUNNER_TEMP/work" --mode preview --out-dir "$RUNNER_TEMP/stage")"
+          python3 -I "$w" extract-final --zip "$RUNNER_TEMP/stage/Metro-$VERSION-windows-x64.zip" --version "$VERSION" \
+            --mode preview --expect-sha256 "$zip" --tree-out "$RUNNER_TEMP/tree" >/dev/null
+          m=packaging/windows-msi/build_msi.py
+          python3 -I "$m" fetch-tools --dest "$RUNNER_TEMP/msi-tools"
+          require=""
+          [ ! -e "$RUNNER_TEMP/tree/metro-tui.exe" ] || require="--require-file metro-tui.exe"
+          mkdir "$RUNNER_TEMP/msi"
+          # shellcheck disable=SC2086
+          python3 -I "$m" build --tools "$RUNNER_TEMP/msi-tools" --payload "$RUNNER_TEMP/tree" --version "$VERSION" \
+            --out "$RUNNER_TEMP/msi/Metro-$VERSION-windows-x64.unsigned-preview.msi" --preview $require
+          python3 -I "$w" msi-state --msi "$RUNNER_TEMP/msi/Metro-$VERSION-windows-x64.unsigned-preview.msi" --expect unsigned
+          python3 -I "$m" fixtures --tools "$RUNNER_TEMP/msi-tools" --dest "$RUNNER_TEMP/fixtures"
+          echo "zip=$zip" >> "$GITHUB_OUTPUT"
+          echo "msi=$(sha256sum "$RUNNER_TEMP/msi/Metro-$VERSION-windows-x64.unsigned-preview.msi" | cut -c1-64)" >> "$GITHUB_OUTPUT"
+      - if: ${{ !inputs.release }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-preview-stage
+          path: ${{ runner.temp }}/stage/
+          if-no-files-found: error
+          retention-days: 3
+      - if: ${{ !inputs.release }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-preview-msi
+          path: ${{ runner.temp }}/msi/
+          if-no-files-found: error
+          retention-days: 3
+      - if: ${{ !inputs.release }}
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-preview-msi-fixtures
+          path: ${{ runner.temp }}/fixtures/
+          if-no-files-found: error
+          retention-days: 3
+
+  # PR / main only: the unsigned preview, checked and installed natively.
+  preview:
+    if: ${{ !inputs.release }}
+    needs: seed
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-preview-stage
+          path: ${{ runner.temp }}/dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-preview-msi
+          path: ${{ runner.temp }}/msi
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-preview-msi-fixtures
+          path: ${{ runner.temp }}/fixtures
+      - name: Assemble the preview and verify it (exact files, checksums, re-extracted ZIP, MSI tables and admin image)
+        env:
+          SEED_SHA256: ${{ needs.seed.outputs.seed-sha256 }}
+          ZIP_SHA256: ${{ needs.seed.outputs.zip-sha256 }}
+          MSI_SHA256: ${{ needs.seed.outputs.msi-sha256 }}
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
+          python -I -c "import sys; assert sys.version_info >= (3, 11), sys.version"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $t = $env:RUNNER_TEMP
+          $name = "Metro-$env:VERSION-windows-x64.unsigned-preview.msi"
+          $names = (Get-ChildItem "$t\msi" -Force | ForEach-Object Name) -join ' '
+          if ($names -ne $name) { throw "unexpected MSI artifact contents: $names" }
+          if ((Get-FileHash -LiteralPath "$t\msi\$name" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:MSI_SHA256) { throw 'MSI changed between jobs' }
+          Copy-Item -LiteralPath "$t\msi\$name" -Destination "$t\dist\$name"
+          [IO.File]::WriteAllText("$t\dist\$name.sha256", "$env:MSI_SHA256  $name`n", [Text.UTF8Encoding]::new($false))
+          Invoke-WinSign verify-dist --dist "$t\dist" --version $env:VERSION --mode preview --scripts-dir packaging `
+            --tree-out "$t\tree" --sums-out "$t\windows-SHA256SUMS" --expect-zip-sha256 $env:ZIP_SHA256 `
+            --expect-seed-sha256 $env:SEED_SHA256 | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          New-Item -ItemType Directory "$t\logs" | Out-Null
+          Test-MetroMsiCandidate -Msi "$t\dist\$name" -Tree "$t\tree" -Version $env:VERSION -Mode preview -Expect unsigned -LogDir "$t\logs"
+          "MSI_NAME=$name" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Install the preview MSI into a chosen folder, check the payload, run the server, uninstall
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
+          $t = $env:RUNNER_TEMP
+          Test-MetroMsiInstall -Msi "$t\dist\$env:MSI_NAME" -Tree "$t\tree" -Version $env:VERSION -Mode preview -LogDir "$t\logs"
+      - name: MSI lane native tests (fixtures, upgrade, repair, downgrade, uninstall; then the preview MSI)
+        run: |
+          $t = $env:RUNNER_TEMP
+          $require = @()
+          if (Test-Path -LiteralPath "$t\tree\metro-tui.exe") { $require = @('-RequireFile', 'metro-tui.exe') }
+          & pwsh -NoProfile -NonInteractive -File (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-msi\test-msi-windows.ps1') `
+            -FixturesDir "$t\fixtures" -Msi "$t\dist\$env:MSI_NAME" -Version $env:VERSION -LogDir "$t\logs\msi-lane" @require
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Verifier self-test with a throwaway certificate (never trusted, never shipped)
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
+          $t = $env:RUNNER_TEMP
+          Invoke-MetroVerifierSelfTest -Tree "$t\tree" -Msi "$t\dist\$env:MSI_NAME" -SourceScripts (Join-Path $env:GITHUB_WORKSPACE 'packaging')
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: windows-preview-logs
+          path: |
+            ${{ runner.temp }}/logs/*.log
+            ${{ runner.temp }}/logs/msi-lane/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-desktop-windows-x64
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 14

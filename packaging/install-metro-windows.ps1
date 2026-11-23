@@ -11,7 +11,12 @@
   unless -NoLocalRunner is given; updates keep the previous choice.
 
 .EXAMPLE
-  powershell -ExecutionPolicy Bypass -File install-metro-windows.ps1 -Action Install -Archive .\Metro-0.2.0-windows-x64.zip
+  .\install-metro-windows.ps1 -Action Install -Archive .\Metro-0.2.0-windows-x64.zip
+
+  Use the Authenticode-signed copy from the Metro release, and check it first:
+  (Get-AuthenticodeSignature .\install-metro-windows.ps1).Status must be Valid.
+  It runs under the RemoteSigned or AllSigned execution policy. Never bypass or
+  turn off your execution policy for Metro.
 #>
 [CmdletBinding()]
 param(
@@ -232,7 +237,9 @@ function Install-Metro {
         $values = @{
             DisplayName = 'Metro'; DisplayVersion = $version; Publisher = 'Metro'; InstallLocation = $Root
             DisplayIcon = $exe
-            UninstallString = "`"$ps`" -NoProfile -ExecutionPolicy Bypass -File `"$self`" -Action Uninstall"
+            # RemoteSigned still requires this copy's release signature when it carries
+            # a download mark; Group Policy, if set, overrides it. No Bypass.
+            UninstallString = "`"$ps`" -NoProfile -ExecutionPolicy RemoteSigned -File `"$self`" -Action Uninstall"
         }
         foreach ($k in $values.Keys) { Set-ItemProperty -Path $UninstallKey -Name $k -Value $values[$k] }
         Set-ItemProperty -Path $UninstallKey -Name NoModify -Value 1 -Type DWord

@@ -18,6 +18,11 @@
 .EXAMPLE
   .\metro-runner-container.ps1 -Action Setup -ServerUrl https://metro.example -TokenFile $HOME\metro-runner.token -Version 0.2.0
   .\metro-runner-container.ps1 -Action Start
+
+  Use the Authenticode-signed copy from the Metro release, and check it first:
+  (Get-AuthenticodeSignature .\metro-runner-container.ps1).Status must be Valid.
+  It runs under the RemoteSigned or AllSigned execution policy. Never bypass or
+  turn off your execution policy for Metro.
 #>
 [CmdletBinding()]
 param(

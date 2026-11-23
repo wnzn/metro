@@ -1,0 +1,554 @@
+"""Tests for winsign.py. Fixtures are synthetic DER/PE/CFB structures built here;
+no certificate, key or signature in this file is real or usable for signing."""
+
+import base64
+import datetime as dt
+import hashlib
+import io
+import json
+from pathlib import Path
+import stat
+import struct
+import sys
+import tempfile
+import unittest
+import zipfile
+
+HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE))
+import winsign  # noqa: E402
+
+SHA256 = winsign.OID_SHA256
+
+
+# ---------------------------------------------------------------- DER builders
+
+def tlv(tag, body):
+    n = len(body)
+    if n < 0x80:
+        head = bytes([n])
+    else:
+        raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        head = bytes([0x80 | len(raw)]) + raw
+    return bytes([tag]) + head + body
+
+
+def seq(*xs):
+    return tlv(0x30, b"".join(xs))
+
+
+def set_(*xs):
+    return tlv(0x31, b"".join(xs))
+
+
+def ctx(n, body):
+    return tlv(0xA0 | n, body)
+
+
+def oid(dotted):
+    arcs = list(map(int, dotted.split(".")))
+    out = bytearray()
+    for i, arc in enumerate([40 * arcs[0] + arcs[1], *arcs[2:]]):
+        chunk = [arc & 0x7F]
+        arc >>= 7
+        while arc:
+            chunk.append(0x80 | (arc & 0x7F))
+            arc >>= 7
+        out += bytes(reversed(chunk))
+    return tlv(0x06, bytes(out))
+
+
+def integer(n):
+    return tlv(0x02, n.to_bytes(max(1, (n.bit_length() + 8) // 8), "big"))
+
+
+def octet(b):
+    return tlv(0x04, b)
+
+
+def alg(dotted):
+    return seq(oid(dotted), tlv(0x05, b""))
+
+
+def name(cn, org=None):
+    rdns = [set_(seq(oid(winsign.OID_CN), tlv(0x0C, cn.encode())))]
+    if org:
+        rdns.append(set_(seq(oid(winsign.OID_O), tlv(0x0C, org.encode()))))
+    return seq(*rdns)
+
+
+def gtime(when):
+    return tlv(0x18, when.strftime("%Y%m%d%H%M%SZ").encode())
+
+
+def utctime(when):
+    return tlv(0x17, when.strftime("%y%m%d%H%M%SZ").encode())
+
+
+T0 = dt.datetime(2026, 1, 1, tzinfo=dt.timezone.utc)
+T1 = dt.datetime(2027, 1, 1, tzinfo=dt.timezone.utc)
+
+
+def certificate(subject, issuer, serial, eku):
+    ext = seq(oid(winsign.OID_EKU), octet(seq(*[oid(e) for e in eku])))
+    tbs = seq(ctx(0, integer(2)), integer(serial), alg("1.2.840.113549.1.1.11"), issuer,
+              seq(utctime(T0), utctime(T1)), subject, seq(alg("1.2.840.113549.1.1.1"), tlv(0x03, b"\0\1")),
+              tlv(0xA3, seq(ext)))
+    return seq(tbs, alg("1.2.840.113549.1.1.11"), tlv(0x03, b"\0sig"))
+
+
+CA = name("Synthetic Test CA")
+
+
+def signer_info(issuer, serial, signature, unsigned=None, digest=SHA256):
+    parts = [integer(1), seq(issuer, integer(serial)), alg(digest),
+             ctx(0, seq(oid("1.2.840.113549.1.9.3"), set_(oid(winsign.OID_SPC_INDIRECT)))),
+             alg("1.2.840.113549.1.1.11"), octet(signature)]
+    if unsigned is not None:
+        parts.append(tlv(0xA1, unsigned))
+    return seq(*parts)
+
+
+def content_info(content_type, content, certs, signers, digests=(SHA256,), wrap_octet=False):
+    body = octet(content) if wrap_octet else content
+    sd = seq(integer(1), set_(*[alg(d) for d in digests]), seq(oid(content_type), ctx(0, body)),
+             ctx(0, b"".join(certs)), set_(*signers))
+    return seq(oid(winsign.OID_SIGNED_DATA), ctx(0, sd))
+
+
+def timestamp(signature, imprint_alg=SHA256, bound=True, when=None):
+    imprint = hashlib.sha256(signature if bound else b"other").digest()
+    tst = seq(integer(1), oid("1.2.3.4"), seq(alg(imprint_alg), octet(imprint)), integer(7),
+              gtime(when or dt.datetime(2026, 6, 1, tzinfo=dt.timezone.utc)))
+    tsa = certificate(name("Synthetic TSA"), CA, 9, [winsign.OID_TIME_STAMPING])
+    return content_info(winsign.OID_TSTINFO, tst, [tsa], [signer_info(CA, 9, b"tsa-signature")], wrap_octet=True)
+
+
+def authenticode(cn="Metro Publisher", org="Metro Org", eku=(winsign.OID_CODE_SIGNING,), ts="ok",
+                 file_digest=SHA256, digests=(SHA256,), extra_unsigned=b"", self_signed=False, signers=1):
+    signature = b"S" * 256
+    subject = name(cn, org)
+    cert = certificate(subject, subject if self_signed else CA, 5, list(eku))
+    unsigned = b""
+    if ts == "ok":
+        unsigned = seq(oid(winsign.OID_RFC3161), set_(timestamp(signature)))
+    elif ts == "unbound":
+        unsigned = seq(oid(winsign.OID_RFC3161), set_(timestamp(signature, bound=False)))
+    elif ts == "sha1":
+        unsigned = seq(oid(winsign.OID_RFC3161), set_(timestamp(signature, imprint_alg="1.3.14.3.2.26")))
+    elif ts == "late":
+        unsigned = seq(oid(winsign.OID_RFC3161), set_(timestamp(signature, when=dt.datetime(2028, 1, 1, tzinfo=dt.timezone.utc))))
+    unsigned += extra_unsigned
+    indirect = seq(seq(oid("1.3.6.1.4.1.311.2.1.15"), seq()), seq(alg(file_digest), octet(b"d" * 32)))
+    info = signer_info(subject if self_signed else CA, 5, signature, unsigned if unsigned else None)
+    return content_info(winsign.OID_SPC_INDIRECT, indirect, [cert], [info] * signers, digests)
+
+
+# ---------------------------------------------------------------- PE / CFB builders
+
+def fake_pe(size=4096, checksum=0x1234):
+    data = bytearray(size)
+    data[:2] = b"MZ"
+    struct.pack_into("<I", data, 0x3C, 0x80)
+    data[0x80:0x84] = b"PE\0\0"
+    opt = 0x80 + 24
+    struct.pack_into("<H", data, opt, 0x20B)
+    struct.pack_into("<I", data, opt + 64, checksum)
+    struct.pack_into("<I", data, opt + 108, 16)
+    data[0x400:0x410] = b"code-and-data..."
+    return bytes(data)
+
+
+def sign_pe(data, blob, pad_inside=3):
+    out = bytearray(data)
+    out += b"\0" * (-len(out) % 8)
+    offset = len(out)
+    body = blob + b"\0" * pad_inside
+    length = 8 + len(body)
+    entry = struct.pack("<IHH", length, 0x0200, 0x0002) + body
+    entry += b"\0" * (-len(entry) % 8)
+    out += entry
+    opt = struct.unpack_from("<I", out, 0x3C)[0] + 24
+    struct.pack_into("<I", out, opt + 64, 0xBEEF)
+    struct.pack_into("<II", out, opt + 112 + 32, offset, len(entry))
+    return bytes(out)
+
+
+def cfb(streams):
+    """Minimal v3 compound file with root-level streams (regular sectors only)."""
+    size = 512
+    sectors, entries = [], []
+    for stream_name, payload in streams.items():
+        start = len(sectors)
+        padded = payload + b"\0" * (-len(payload) % size)
+        sectors += [padded[i:i + size] for i in range(0, len(padded), size)]
+        entries.append((stream_name, start, len(sectors) - start, len(payload)))
+    dir_sector = len(sectors)
+    fat_sector = dir_sector + 1
+    fat = [0xFFFFFFFF] * (size // 4)
+    for _, start, count, _ in entries:
+        for i in range(count):
+            fat[start + i] = start + i + 1 if i < count - 1 else 0xFFFFFFFE
+    fat[dir_sector] = 0xFFFFFFFE
+    fat[fat_sector] = 0xFFFFFFFD
+
+    def dirent(entry_name, kind, left, right, child, start, length):
+        raw = entry_name.encode("utf-16-le") + b"\0\0"
+        e = bytearray(128)
+        e[:len(raw)] = raw
+        struct.pack_into("<H", e, 64, len(raw))
+        e[66] = kind
+        struct.pack_into("<III", e, 68, left, right, child)
+        struct.pack_into("<IQ", e, 116, start, length)
+        return bytes(e)
+
+    nodes = [dirent("Root Entry", 5, 0xFFFFFFFF, 0xFFFFFFFF, 1 if entries else 0xFFFFFFFF, 0xFFFFFFFE, 0)]
+    for i, (stream_name, start, _, length) in enumerate(entries):
+        right = i + 2 if i + 1 < len(entries) else 0xFFFFFFFF
+        nodes.append(dirent(stream_name, 2, 0xFFFFFFFF, right, 0xFFFFFFFF, start, length))
+    while len(nodes) < 4:
+        nodes.append(b"\0" * 64 + struct.pack("<H", 0) + b"\0" * 62)
+    sectors.append(b"".join(nodes))
+    sectors.append(struct.pack(f"<{size // 4}I", *fat))
+    header = bytearray(512)
+    header[:8] = bytes.fromhex("d0cf11e0a1b11ae1")
+    struct.pack_into("<HHHH", header, 24, 0x3E, 3, 0xFFFE, 9)
+    struct.pack_into("<H", header, 32, 6)
+    struct.pack_into("<II", header, 44, 1, dir_sector)
+    struct.pack_into("<IIIII", header, 56, 4096, 0xFFFFFFFE, 0, 0xFFFFFFFE, 0)
+    difat = [fat_sector] + [0xFFFFFFFF] * 108
+    struct.pack_into("<109I", header, 76, *difat)
+    return bytes(header) + b"".join(sectors)
+
+
+# ---------------------------------------------------------------- tests
+
+class SignatureInspection(unittest.TestCase):
+    def test_valid_signature(self):
+        seen = winsign.inspect_signature(authenticode(), "x", "Metro Publisher", "Metro Org")
+        self.assertEqual(seen["publisher_cn"], "Metro Publisher")
+        self.assertTrue(seen["timestamp"].startswith("2026-06-01"))
+
+    def assertRejected(self, blob, fragment, cn="Metro Publisher", org=None):
+        with self.assertRaises(winsign.Failure) as caught:
+            winsign.inspect_signature(blob, "x", cn, org)
+        self.assertIn(fragment, str(caught.exception))
+
+    def test_rejections(self):
+        self.assertRejected(authenticode(ts=None), "RFC 3161")
+        self.assertRejected(authenticode(ts="unbound"), "not bound")
+        self.assertRejected(authenticode(ts="sha1"), "imprint is not SHA-256")
+        self.assertRejected(authenticode(ts="late"), "outside")
+        self.assertRejected(authenticode(eku=("1.3.6.1.5.5.7.3.1",)), "code-signing EKU")
+        self.assertRejected(authenticode(), "publisher CN", cn="Someone Else")
+        self.assertRejected(authenticode(), "publisher O", org="Other Org")
+        self.assertRejected(authenticode(self_signed=True), "self-signed")
+        self.assertRejected(authenticode(digests=("1.3.14.3.2.26",)), "exactly SHA-256")
+        self.assertRejected(authenticode(digests=(SHA256, "1.3.14.3.2.26")), "exactly SHA-256")
+        self.assertRejected(authenticode(file_digest="1.3.14.3.2.26"), "file digest")
+        self.assertRejected(authenticode(signers=2), "exactly one SignerInfo")
+        nested = seq(oid(winsign.OID_NESTED), set_(authenticode()))
+        self.assertRejected(authenticode(extra_unsigned=nested), "nested")
+        legacy = seq(oid("1.2.840.113549.1.9.6"), set_(seq()))
+        self.assertRejected(authenticode(extra_unsigned=legacy), "no other unsigned")
+
+    def test_publisher_is_required_when_given_empty(self):
+        with self.assertRaises(winsign.Failure):
+            winsign.inspect_signature(authenticode(), "x", "", None)
+
+    def test_garbage_is_rejected(self):
+        for blob in (b"", b"\x30\x80\x00\x00", b"\x30\x05abc", authenticode() + b"x"):
+            with self.assertRaises((winsign.Failure, IndexError, ValueError)):
+                winsign.inspect_signature(blob, "x", "Metro Publisher")
+
+
+class PortableExecutable(unittest.TestCase):
+    def setUp(self):
+        self.original = fake_pe()
+        self.info = winsign.pe_unsigned_info(self.original, "a.exe")
+
+    def test_round_trip_restores_exact_unsigned_bytes(self):
+        signed = sign_pe(self.original, authenticode())
+        restored, blob = winsign.pe_split(signed, self.info, "a.exe")
+        self.assertEqual(restored, self.original)
+        self.assertEqual(blob, authenticode())
+
+    def test_unaligned_original_is_padded_with_zeros(self):
+        original = fake_pe(size=4093)
+        info = winsign.pe_unsigned_info(original, "a.exe")
+        restored, _ = winsign.pe_split(sign_pe(original, authenticode()), info, "a.exe")
+        self.assertEqual(restored, original)
+
+    def test_code_change_is_rejected(self):
+        signed = bytearray(sign_pe(self.original, authenticode()))
+        signed[0x405] ^= 1
+        with self.assertRaisesRegex(winsign.Failure, "bytes other than"):
+            winsign.pe_split(bytes(signed), self.info, "a.exe")
+
+    def test_unsigned_appended_or_seed_already_signed(self):
+        with self.assertRaisesRegex(winsign.Failure, "not signed"):
+            winsign.pe_split(self.original, self.info, "a.exe")
+        signed = sign_pe(self.original, authenticode())
+        with self.assertRaisesRegex(winsign.Failure, "single trailing block"):
+            winsign.pe_split(signed + b"\0" * 8, self.info, "a.exe")
+        with self.assertRaisesRegex(winsign.Failure, "already signed"):
+            winsign.pe_unsigned_info(signed, "a.exe")
+
+    def test_second_certificate_entry_is_rejected(self):
+        signed = bytearray(sign_pe(self.original, authenticode(), pad_inside=0))
+        opt = 0x80 + 24
+        offset, size = struct.unpack_from("<II", signed, opt + 112 + 32)
+        extra = struct.pack("<IHH", 16, 0x0200, 0x0002) + b"\x30\x06" + b"\0" * 6
+        signed += extra
+        struct.pack_into("<II", signed, opt + 112 + 32, offset, size + len(extra))
+        with self.assertRaisesRegex(winsign.Failure, "exactly one WIN_CERT"):
+            winsign.pe_split(bytes(signed), self.info, "a.exe")
+
+
+class PowerShellScripts(unittest.TestCase):
+    SOURCE = b"<#\n.SYNOPSIS\n  x\n#>\nWrite-Host hi\n"
+
+    def signed(self, blob, newline=b"\r\n"):
+        text = base64.b64encode(blob).decode()
+        lines = "".join(f"# {text[i:i + 64]}\r\n" for i in range(0, len(text), 64)).encode()
+        return self.SOURCE + newline + b"# SIG # Begin signature block\r\n" + lines + b"# SIG # End signature block\r\n"
+
+    def test_round_trip(self):
+        info = winsign.script_unsigned_info(self.SOURCE, "s.ps1")
+        original, blob = winsign.script_split(self.signed(authenticode()), info, "s.ps1")
+        self.assertEqual((original, blob), (self.SOURCE, authenticode()))
+
+    def test_rejections(self):
+        info = winsign.script_unsigned_info(self.SOURCE, "s.ps1")
+        with self.assertRaisesRegex(winsign.Failure, "content changed"):
+            winsign.script_split(self.signed(authenticode()).replace(b"hi", b"ho"), info, "s.ps1")
+        with self.assertRaisesRegex(winsign.Failure, "exactly one PowerShell signature block"):
+            winsign.script_split(self.SOURCE, info, "s.ps1")
+        with self.assertRaisesRegex(winsign.Failure, "exactly one PowerShell signature block"):
+            winsign.script_split(self.signed(authenticode()) + b"Remove-Item x\n", info, "s.ps1")
+        with self.assertRaisesRegex(winsign.Failure, "already has a signature"):
+            winsign.script_unsigned_info(self.signed(authenticode()), "s.ps1")
+        with self.assertRaisesRegex(winsign.Failure, "plain ASCII"):
+            winsign.script_unsigned_info("café".encode(), "s.ps1")
+
+    def test_repository_scripts_are_signable_plain_ascii(self):
+        for script in winsign.SCRIPTS:
+            data = (HERE.parent / script).read_bytes()
+            winsign.script_unsigned_info(data, script)
+            self.assertNotIn(b"ExecutionPolicy Bypass", data, f"{script} must not advise bypassing the execution policy")
+
+
+class CompoundFile(unittest.TestCase):
+    def test_reads_signature_stream(self):
+        blob = authenticode()
+        data = cfb({"\x05SummaryInformation": b"s" * 600, "\x05DigitalSignature": blob + b"\0" * (4200 - len(blob))})
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "a.msi"
+            path.write_bytes(data)
+            self.assertEqual(winsign.msi_signature(path), blob)
+            path.write_bytes(cfb({"\x05SummaryInformation": b"s" * 4100}))
+            self.assertIsNone(winsign.msi_signature(path))
+            path.write_bytes(b"MZ" + data[2:])
+            with self.assertRaisesRegex(winsign.Failure, "not an MSI"):
+                winsign.msi_signature(path)
+
+
+class Archives(unittest.TestCase):
+    def manifest(self, tui=False, **change):
+        files = {"Metro.exe": "a" * 64, "metro-server.exe": "b" * 64, "ui/Metro.exe": winsign.STOCK_RENDERER_SHA256}
+        if tui:
+            files["metro-tui.exe"] = "c" * 64
+        m = {"connector": "linked", "dependencies": {k: [] for k in files}, "files": files,
+             "kind": "desktop", "local_runner": winsign.package.LOCAL_RUNNER, "nsh": winsign.package.NSH_VERSION,
+             "target": "windows-x64", "version": "1.2.3"}
+        m.update(change)
+        return m
+
+    def test_manifest(self):
+        self.assertEqual(winsign.check_manifest(self.manifest(), "1.2.3", signing=False, official=False),
+                         winsign.REQUIRED_EXES)
+        self.assertEqual(winsign.check_manifest(self.manifest(tui=True), "1.2.3", signing=False, official=True),
+                         winsign.SIGNED_EXES)
+        self.assertEqual(winsign.check_manifest(self.manifest(tui=True), "1.2.3", signing=False, official=False),
+                         winsign.SIGNED_EXES)
+        for bad, official, msg in ((self.manifest(), True, "expected EXEs"),
+                                   (self.manifest(version="1.2.4"), False, "does not describe"),
+                                   (self.manifest(signing={}), False, "keys"),
+                                   (self.manifest(files={"../x": "a" * 64}), False, "unsafe"),
+                                   (self.manifest(local_runner="none"), False, "does not describe"),
+                                   (self.manifest(dependencies={"Metro.exe": []}), False, "dependencies")):
+            with self.assertRaisesRegex(winsign.Failure, msg):
+                winsign.check_manifest(bad, "1.2.3", signing=False, official=official)
+        broken = self.manifest()
+        broken["files"] = {**broken["files"], "RELEASE.json": "a" * 64}
+        with self.assertRaisesRegex(winsign.Failure, "list itself"):
+            winsign.check_manifest(broken, "1.2.3", signing=False, official=False)
+
+    def zip_with(self, entries):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as z:
+            for entry_name, mode in entries:
+                info = zipfile.ZipInfo(entry_name)
+                info.create_system = 3
+                info.external_attr = mode << 16
+                z.writestr(info, b"x")
+        return zipfile.ZipFile(io.BytesIO(buf.getvalue()))
+
+    def test_zip_entries(self):
+        root = "Metro-1.2.3-windows-x64"
+        good = self.zip_with([(f"{root}/Metro.exe", 0o100755), (f"{root}/a.txt", 0o100644)])
+        winsign.check_modes(winsign.zip_members(good, root))
+        for entries, msg in (([(f"{root}/../x", 0o100644)], "unsafe"),
+                             ([("Other/x", 0o100644)], "outside"),
+                             ([(f"{root}/link", 0o120777)], "entry type"),
+                             ([(f"{root}/a\\b", 0o100644)], "unsafe")):
+            with self.assertRaisesRegex(winsign.Failure, msg):
+                winsign.zip_members(self.zip_with(entries), root)
+        with self.assertRaisesRegex(winsign.Failure, "file mode"):
+            winsign.check_modes(winsign.zip_members(self.zip_with([(f"{root}/Metro.exe", 0o100644)]), root))
+
+    def test_binary_allowlist(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for rel in (*winsign.SIGNED_EXES, "notes.txt", "hidden.dat"):
+                (root / rel).parent.mkdir(parents=True, exist_ok=True)
+                (root / rel).write_bytes(b"MZ" if rel.endswith(".exe") else b"text")
+            exes = winsign.SIGNED_EXES
+            winsign.check_binaries(root, [*exes, "notes.txt", "hidden.dat"], exes)
+            with self.assertRaisesRegex(winsign.Failure, "allowlist"):
+                winsign.check_binaries(root, [*exes, "notes.txt"], winsign.REQUIRED_EXES)
+            (root / "hidden.dat").write_bytes(b"MZ\x90\x00")
+            with self.assertRaisesRegex(winsign.Failure, "allowlist"):
+                winsign.check_binaries(root, [*exes, "hidden.dat"], exes)
+            (root / "hidden.dat").write_bytes(b"text")
+            (root / "x.ps1").write_bytes(b"text")
+            with self.assertRaisesRegex(winsign.Failure, "allowlist"):
+                winsign.check_binaries(root, [*exes, "x.ps1"], exes)
+
+    def test_deterministic_zip_keeps_seed_modes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            stage = Path(tmp) / "stage"
+            (stage / "ui").mkdir(parents=True)
+            (stage / "Metro.exe").write_bytes(b"MZ1")
+            (stage / "ui/a.txt").write_bytes(b"t")
+            modes = {"Metro.exe": (stat.S_IFREG | 0o755) << 16, "ui/a.txt": (stat.S_IFREG | 0o644) << 16}
+            winsign.write_zip(stage, Path(tmp) / "a.zip", "R", modes)
+            winsign.write_zip(stage, Path(tmp) / "b.zip", "R", modes)
+            self.assertEqual((Path(tmp) / "a.zip").read_bytes(), (Path(tmp) / "b.zip").read_bytes())
+            with zipfile.ZipFile(Path(tmp) / "a.zip") as z:
+                self.assertEqual(z.namelist(), ["R/Metro.exe", "R/ui/a.txt"])
+            (stage / "extra").write_bytes(b"x")
+            with self.assertRaisesRegex(winsign.Failure, "differs from the seed"):
+                winsign.write_zip(stage, Path(tmp) / "c.zip", "R", modes)
+
+    def test_sidecar(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            p = Path(tmp) / "a.zip"
+            p.write_bytes(b"zip")
+            digest = winsign.write_sidecar(p, "a.zip")
+            self.assertEqual(winsign.read_sidecar(Path(tmp) / "a.zip.sha256", "a.zip"), digest)
+            (Path(tmp) / "a.zip.sha256").write_text(f"{digest} *a.zip\n")
+            with self.assertRaises(winsign.Failure):
+                winsign.read_sidecar(Path(tmp) / "a.zip.sha256", "a.zip")
+
+
+def jobs(text):
+    """Job name -> text of that job, for the two-space-indented `jobs:` map."""
+    import re
+    body = text.split("\njobs:\n", 1)[1]
+    parts = re.split(r"(?m)^  ([a-z][a-z0-9-]*):\n", body)
+    return dict(zip(parts[1::2], parts[2::2]))
+
+
+class Trees(unittest.TestCase):
+    def test_marker_is_allowed_only_when_asked_and_empty(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "a.txt").write_bytes(b"a")
+            files = {"a.txt": hashlib.sha256(b"a").hexdigest()}
+            manifest = {"files": files}
+            (root / "RELEASE.json").write_text(json.dumps(manifest))
+            original = winsign.check_binaries
+            winsign.check_binaries = lambda *a: None
+            exes = winsign.exes_in
+            winsign.exes_in = lambda *a: ()
+            icons = winsign.package.verify_desktop_icons
+            winsign.package.verify_desktop_icons = lambda *a: None
+            try:
+                winsign.verify_tree(root, manifest, "preview")
+                (root / winsign.MARKER).write_bytes(b"")
+                with self.assertRaisesRegex(winsign.Failure, "extra"):
+                    winsign.verify_tree(root, manifest, "preview")
+                winsign.verify_tree(root, manifest, "preview", allow_marker=True)
+                (root / winsign.MARKER).write_bytes(b"x")
+                with self.assertRaisesRegex(winsign.Failure, "must be empty"):
+                    winsign.verify_tree(root, manifest, "preview", allow_marker=True)
+            finally:
+                winsign.check_binaries, winsign.exes_in = original, exes
+                winsign.package.verify_desktop_icons = icons
+
+
+class Workflows(unittest.TestCase):
+    """Static guards on the two reusable workflows (the parts that protect signing)."""
+
+    def read(self, name):
+        """The workflow without its full-line comments."""
+        text = (HERE.parents[1] / ".github/workflows" / name).read_text(encoding="utf-8")
+        return "".join(line for line in text.splitlines(True) if not line.lstrip().startswith("#"))
+
+    def check_common(self, text):
+        import re
+        head = text.split("\njobs:", 1)[0]
+        self.assertIn("workflow_call:", head)
+        for trigger in ("workflow_dispatch", "pull_request", "push:", "schedule:", "repository_dispatch", "workflow_run"):
+            self.assertNotIn(trigger, head)
+        self.assertRegex(head, r"(?m)^permissions:\n  contents: read\n")
+        self.assertNotIn("secrets.", text)
+        self.assertNotIn("secrets: inherit", text)
+        for ref in re.findall(r"uses:\s*(\S+)", text):
+            self.assertRegex(ref, r"^[^@]+@[0-9a-f]{40}$")
+        for job, body in jobs(text).items():
+            self.assertRegex(body, r"(?m)^    permissions:\n      contents: read\n", job)
+
+    def test_distribution_never_touches_signing(self):
+        text = self.read("windows-distribution.yml")
+        self.check_common(text)
+        for forbidden in ("environment:", "id-token", "self-hosted", "METRO_WINDOWS_SIGNING", "Invoke-MetroReleaseSigning",
+                          "vars."):
+            self.assertNotIn(forbidden, text)
+        self.assertEqual(set(jobs(text)), {"seed", "preview"})
+        self.assertIn("if: ${{ !inputs.release }}", jobs(text)["preview"])
+        self.assertIn("name: unsigned-desktop-windows-x64", jobs(text)["seed"])
+
+    def test_signing_is_tag_only_and_isolated(self):
+        text = self.read("windows-sign.yml")
+        self.check_common(text)
+        head = text.split("\njobs:", 1)[0]
+        self.assertNotRegex(head, r"(?m)^      release:")
+        self.assertNotIn("New-SelfSignedCertificate", text)
+        self.assertNotIn("Invoke-MetroVerifierSelfTest", text)
+        all_jobs = jobs(text)
+        self.assertEqual(set(all_jobs), {"guard", "sign", "msi", "sign-msi", "verify"})
+        for job, body in all_jobs.items():
+            privileged = job in ("sign", "sign-msi")
+            self.assertEqual("environment: windows-release-signing" in body, privileged, job)
+            self.assertEqual("id-token: write" in body, privileged, job)
+            self.assertEqual("Invoke-MetroReleaseSigning" in body, privileged, job)
+            if privileged:
+                self.assertIn("Assert-MetroReleaseContext", body)
+                self.assertNotIn("build-msi", body)
+            else:
+                self.assertIn("runs-on: ubuntu-24.04" if job in ("guard", "msi") else "runs-on: windows-2025", body)
+        self.assertIn("refs/tags/v$VERSION", all_jobs["guard"])
+        self.assertIn("name: dist-desktop-windows-x64", all_jobs["verify"])
+
+    def test_module_allowlist_matches_winsign(self):
+        module = (HERE / "MetroWindowsSigning.psm1").read_text(encoding="utf-8")
+        for exe in winsign.SIGNED_EXES:
+            self.assertIn(exe.replace("/", "\\\\").replace(".", "\\."), module)
+        for script in winsign.SCRIPTS:
+            self.assertIn(script.removesuffix(".ps1"), module)
+
+
+if __name__ == "__main__":
+    unittest.main()

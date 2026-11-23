@@ -1,0 +1,368 @@
+name: Windows signing
+
+# Reusable, tag-only. Called only by release-publish.yml, in the same workflow
+# run as windows-distribution.yml (release: true), with
+#   permissions: { contents: read, id-token: write }
+# No triggers of its own and no secrets: Azure Artifact Signing authenticates
+# with GitHub OIDC; the kms backend uses a certificate pre-provisioned in the
+# HSM/KSP of a restricted self-hosted runner. Configuration lives in the
+# protected `windows-release-signing` environment and repository variables;
+# see packaging/windows-signing/README.md.
+#
+# Input: unsigned-desktop-windows-x64 (exactly the verified seed ZIP + .sha256).
+# Output: dist-desktop-windows-x64 with exactly
+#   Metro-<v>-windows-x64.zip(.sha256), Metro-<v>-windows-x64.msi(.sha256),
+#   install-metro-windows.ps1, metro-runner-container.ps1
+# uploaded only after Windows trust, publisher, timestamp, payload, tamper and
+# install checks passed on a fresh hosted VM.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: 'Release version without the leading v; must equal the pushed tag.'
+        type: string
+        required: true
+    outputs:
+      zip-sha256:
+        value: ${{ jobs.verify.outputs.zip-sha256 }}
+      msi-sha256:
+        value: ${{ jobs.verify.outputs.msi-sha256 }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Tag guard and seed re-verification, before any job can reach a credential.
+  guard:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    outputs:
+      seed-sha256: ${{ steps.verify.outputs.sha256 }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Only this repository's pushed version tag, from ci.yml
+        env:
+          VERSION: ${{ inputs.version }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_PROTECTED: ${{ github.ref_protected }}
+          WORKFLOW_REF: ${{ github.workflow_ref }}
+          REPO: ${{ github.repository }}
+          BACKEND: ${{ vars.METRO_WINDOWS_SIGNING_BACKEND }}
+        run: |
+          set -eu
+          printf '%s' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]{1,40})?$' \
+            || { echo "invalid version input" >&2; exit 1; }
+          [ "$EVENT" = push ] && [ "$REF_TYPE" = tag ] && [ "$REF" = "refs/tags/v$VERSION" ] && [ "$REF_PROTECTED" = true ] \
+            && [ "$WORKFLOW_REF" = "$REPO/.github/workflows/ci.yml@refs/tags/v$VERSION" ] \
+            || { echo "Windows release signing runs only for a pushed, protected v$VERSION tag from ci.yml" >&2; exit 1; }
+          case "$BACKEND" in azure|kms) ;; *) echo "METRO_WINDOWS_SIGNING_BACKEND must be azure or kms" >&2; exit 1 ;; esac
+      - name: Signing helper tests
+        run: python3 -B -m unittest discover -s packaging/windows-signing -v
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-desktop-windows-x64
+          path: ${{ runner.temp }}/unsigned
+      - id: verify
+        name: The hand-off is exactly the official seed (ZIP + .sha256), verified again
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -eu
+          sha="$(python3 -I packaging/windows-signing/winsign.py verify-seed --seed-dir "$RUNNER_TEMP/unsigned" \
+            --version "$VERSION" --mode official --work "$RUNNER_TEMP/work" --scripts-dir packaging)"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+
+  # Signs the four PEs and both scripts. Runs only this checkout's verifier and
+  # SignTool on files the verifier staged under the job's own temp directory.
+  sign:
+    needs: guard
+    runs-on: ${{ vars.METRO_WINDOWS_SIGNING_BACKEND == 'kms' && fromJSON(vars.METRO_WINDOWS_SIGNING_RUNNER) || 'windows-2025' }}
+    environment: windows-release-signing
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      zip-sha256: ${{ steps.sign.outputs.zip }}
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-desktop-windows-x64
+          path: ${{ runner.temp }}/unsigned
+      - id: sign
+        name: Verify, stage, sign, prove signature-only changes, repack
+        env:
+          SEED_SHA256: ${{ needs.guard.outputs.seed-sha256 }}
+          METRO_WINDOWS_SIGNING_BACKEND: ${{ vars.METRO_WINDOWS_SIGNING_BACKEND }}
+          METRO_WINDOWS_PUBLISHER_CN: ${{ vars.METRO_WINDOWS_PUBLISHER_CN }}
+          METRO_WINDOWS_PUBLISHER_ORG: ${{ vars.METRO_WINDOWS_PUBLISHER_ORG }}
+          METRO_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.METRO_ARTIFACT_SIGNING_ENDPOINT }}
+          METRO_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.METRO_ARTIFACT_SIGNING_ACCOUNT }}
+          METRO_ARTIFACT_SIGNING_PROFILE: ${{ vars.METRO_ARTIFACT_SIGNING_PROFILE }}
+          METRO_ARTIFACT_SIGNING_CLIENT_VERSION: ${{ vars.METRO_ARTIFACT_SIGNING_CLIENT_VERSION }}
+          METRO_ARTIFACT_SIGNING_CLIENT_SHA256: ${{ vars.METRO_ARTIFACT_SIGNING_CLIENT_SHA256 }}
+          METRO_AZURE_CLIENT_ID: ${{ vars.METRO_AZURE_CLIENT_ID }}
+          METRO_AZURE_TENANT_ID: ${{ vars.METRO_AZURE_TENANT_ID }}
+          METRO_WINDOWS_SIGNING_CERT_SHA1: ${{ vars.METRO_WINDOWS_SIGNING_CERT_SHA1 }}
+          METRO_WINDOWS_SIGNING_CERT_STORE: ${{ vars.METRO_WINDOWS_SIGNING_CERT_STORE }}
+          METRO_WINDOWS_TIMESTAMP_URL: ${{ vars.METRO_WINDOWS_TIMESTAMP_URL }}
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
+          Assert-MetroReleaseContext $env:VERSION
+          if (-not $env:METRO_WINDOWS_PUBLISHER_CN) { throw 'METRO_WINDOWS_PUBLISHER_CN is not set in windows-release-signing' }
+          python -I -c "import sys; assert sys.version_info >= (3, 11), sys.version"
+          if ($LASTEXITCODE -ne 0) { exit 1 }
+          $t = $env:RUNNER_TEMP
+          $work = Join-Path $t 'metro-sign'
+          Invoke-WinSign verify-seed --seed-dir "$t\unsigned" --version $env:VERSION --mode official --work $work `
+            --scripts-dir packaging --expect-sha256 $env:SEED_SHA256 | Out-Null
+          Invoke-WinSign prepare --work $work --scripts-dir packaging | Out-Null
+          $files = Get-Content -LiteralPath "$work\to-sign.txt" | Where-Object { $_ }
+          Invoke-MetroReleaseSigning -Version $env:VERSION -WorkRoot $work -Files $files
+          $pub = Get-MetroPublisherArgs $env:METRO_WINDOWS_PUBLISHER_CN $env:METRO_WINDOWS_PUBLISHER_ORG
+          $zip = Invoke-WinSign finalize --work $work --mode official --out-dir "$t\signed-stage" @pub
+          "zip=$zip" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-signed-stage
+          path: ${{ runner.temp }}/signed-stage/
+          if-no-files-found: error
+          retention-days: 3
+
+  # Builds the MSI from the newly signed tree with the MSI lane's pinned
+  # toolchain (Linux, no credentials); its static inspection checks the tables
+  # and the extracted bytes of every file before anything signs the MSI.
+  msi:
+    needs: sign
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    outputs:
+      msi-sha256: ${{ steps.msi.outputs.sha256 }}
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-signed-stage
+          path: ${{ runner.temp }}/signed-stage
+      - id: msi
+        name: Build the MSI from the signed tree (metro-tui.exe required) and the MSI test fixtures
+        env:
+          ZIP_SHA256: ${{ needs.sign.outputs.zip-sha256 }}
+          PUBLISHER_CN: ${{ vars.METRO_WINDOWS_PUBLISHER_CN }}
+          PUBLISHER_ORG: ${{ vars.METRO_WINDOWS_PUBLISHER_ORG }}
+        run: |
+          set -eu
+          w=packaging/windows-signing/winsign.py
+          m=packaging/windows-msi/build_msi.py
+          set -- --publisher-cn "$PUBLISHER_CN"
+          [ -z "$PUBLISHER_ORG" ] || set -- "$@" --publisher-org "$PUBLISHER_ORG"
+          python3 -I "$w" extract-final --zip "$RUNNER_TEMP/signed-stage/Metro-$VERSION-windows-x64.zip" --version "$VERSION" \
+            --mode official --expect-sha256 "$ZIP_SHA256" --tree-out "$RUNNER_TEMP/tree" "$@" >/dev/null
+          python3 -I "$m" fetch-tools --dest "$RUNNER_TEMP/msi-tools"
+          mkdir "$RUNNER_TEMP/msi"
+          msi="$RUNNER_TEMP/msi/Metro-$VERSION-windows-x64.msi"
+          python3 -I "$m" build --tools "$RUNNER_TEMP/msi-tools" --payload "$RUNNER_TEMP/tree" --version "$VERSION" \
+            --out "$msi" --require-file metro-tui.exe
+          python3 -I "$w" msi-state --msi "$msi" --expect unsigned
+          python3 -I "$m" fixtures --tools "$RUNNER_TEMP/msi-tools" --dest "$RUNNER_TEMP/fixtures"
+          echo "sha256=$(sha256sum "$msi" | cut -c1-64)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-msi-unsigned
+          path: ${{ runner.temp }}/msi/
+          if-no-files-found: error
+          retention-days: 3
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-msi-fixtures
+          path: ${{ runner.temp }}/fixtures/
+          if-no-files-found: error
+          retention-days: 3
+
+  # Signs exactly the MSI checked above, matched by hash.
+  sign-msi:
+    needs: [guard, msi]
+    runs-on: ${{ vars.METRO_WINDOWS_SIGNING_BACKEND == 'kms' && fromJSON(vars.METRO_WINDOWS_SIGNING_RUNNER) || 'windows-2025' }}
+    environment: windows-release-signing
+    permissions:
+      contents: read
+      id-token: write
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VERSION: ${{ inputs.version }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-msi-unsigned
+          path: ${{ runner.temp }}/msi-in
+      - name: Sign the verified MSI
+        env:
+          MSI_SHA256: ${{ needs.msi.outputs.msi-sha256 }}
+          METRO_WINDOWS_SIGNING_BACKEND: ${{ vars.METRO_WINDOWS_SIGNING_BACKEND }}
+          METRO_WINDOWS_PUBLISHER_CN: ${{ vars.METRO_WINDOWS_PUBLISHER_CN }}
+          METRO_ARTIFACT_SIGNING_ENDPOINT: ${{ vars.METRO_ARTIFACT_SIGNING_ENDPOINT }}
+          METRO_ARTIFACT_SIGNING_ACCOUNT: ${{ vars.METRO_ARTIFACT_SIGNING_ACCOUNT }}
+          METRO_ARTIFACT_SIGNING_PROFILE: ${{ vars.METRO_ARTIFACT_SIGNING_PROFILE }}
+          METRO_ARTIFACT_SIGNING_CLIENT_VERSION: ${{ vars.METRO_ARTIFACT_SIGNING_CLIENT_VERSION }}
+          METRO_ARTIFACT_SIGNING_CLIENT_SHA256: ${{ vars.METRO_ARTIFACT_SIGNING_CLIENT_SHA256 }}
+          METRO_AZURE_CLIENT_ID: ${{ vars.METRO_AZURE_CLIENT_ID }}
+          METRO_AZURE_TENANT_ID: ${{ vars.METRO_AZURE_TENANT_ID }}
+          METRO_WINDOWS_SIGNING_CERT_SHA1: ${{ vars.METRO_WINDOWS_SIGNING_CERT_SHA1 }}
+          METRO_WINDOWS_SIGNING_CERT_STORE: ${{ vars.METRO_WINDOWS_SIGNING_CERT_STORE }}
+          METRO_WINDOWS_TIMESTAMP_URL: ${{ vars.METRO_WINDOWS_TIMESTAMP_URL }}
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
+          Assert-MetroReleaseContext $env:VERSION
+          $name = "Metro-$env:VERSION-windows-x64.msi"
+          $names = (Get-ChildItem "$env:RUNNER_TEMP\msi-in" -Force | ForEach-Object Name) -join ' '
+          if ($names -ne $name) { throw "unexpected MSI artifact contents: $names" }
+          $work = Join-Path $env:RUNNER_TEMP 'metro-sign-msi'
+          New-Item -ItemType Directory "$work\msi" | Out-Null
+          Copy-Item -LiteralPath "$env:RUNNER_TEMP\msi-in\$name" -Destination "$work\msi\$name"
+          if ((Get-FileHash -LiteralPath "$work\msi\$name" -Algorithm SHA256).Hash.ToLowerInvariant() -ne $env:MSI_SHA256) {
+            throw 'the MSI differs from the one checked in this run'
+          }
+          Invoke-WinSign msi-state --msi "$work\msi\$name" --expect unsigned | Out-Null
+          Invoke-MetroReleaseSigning -Version $env:VERSION -WorkRoot $work -Files @("$work\msi\$name")
+          New-Item -ItemType Directory "$env:RUNNER_TEMP\msi-out" | Out-Null
+          Copy-Item -LiteralPath "$work\msi\$name" -Destination "$env:RUNNER_TEMP\msi-out\$name"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-msi-signed
+          path: ${{ runner.temp }}/msi-out/
+          if-no-files-found: error
+          retention-days: 3
+
+  # Fresh Microsoft-hosted VM, no certificate added: Windows' own trust decision
+  # here is the public-trust gate. Output is uploaded only if everything passes.
+  verify:
+    needs: [guard, sign, msi, sign-msi]
+    runs-on: windows-2025
+    permissions:
+      contents: read
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: pwsh
+    outputs:
+      zip-sha256: ${{ steps.dist.outputs.zip }}
+      msi-sha256: ${{ steps.dist.outputs.msi }}
+    env:
+      VERSION: ${{ inputs.version }}
+      PUBLISHER_CN: ${{ vars.METRO_WINDOWS_PUBLISHER_CN }}
+      PUBLISHER_ORG: ${{ vars.METRO_WINDOWS_PUBLISHER_ORG }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-signed-stage
+          path: ${{ runner.temp }}/dist
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-msi-signed
+          path: ${{ runner.temp }}/msi-in
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: unsigned-desktop-windows-x64
+          path: ${{ runner.temp }}/unsigned
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: windows-msi-fixtures
+          path: ${{ runner.temp }}/fixtures
+      - id: dist
+        name: Assemble and verify after signing (exact files, checksums, re-extracted ZIP, one publisher, timestamps)
+        env:
+          ZIP_SHA256: ${{ needs.sign.outputs.zip-sha256 }}
+          UNSIGNED_MSI_SHA256: ${{ needs.msi.outputs.msi-sha256 }}
+          SEED_SHA256: ${{ needs.guard.outputs.seed-sha256 }}
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
+          if (-not $env:PUBLISHER_CN) { throw 'METRO_WINDOWS_PUBLISHER_CN is not set' }
+          $t = $env:RUNNER_TEMP
+          $name = "Metro-$env:VERSION-windows-x64.msi"
+          $names = (Get-ChildItem "$t\msi-in" -Force | ForEach-Object Name) -join ' '
+          if ($names -ne $name) { throw "unexpected signed MSI artifact contents: $names" }
+          $msiSha = (Get-FileHash -LiteralPath "$t\msi-in\$name" -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($msiSha -eq $env:UNSIGNED_MSI_SHA256) { throw 'the release MSI is the unsigned build' }
+          Copy-Item -LiteralPath "$t\msi-in\$name" -Destination "$t\dist\$name"
+          [IO.File]::WriteAllText("$t\dist\$name.sha256", "$msiSha  $name`n", [Text.UTF8Encoding]::new($false))
+          $pub = Get-MetroPublisherArgs $env:PUBLISHER_CN $env:PUBLISHER_ORG
+          Invoke-WinSign verify-dist --dist "$t\dist" --version $env:VERSION --mode official --scripts-dir packaging `
+            --tree-out "$t\tree" --sums-out "$t\windows-SHA256SUMS" --expect-zip-sha256 $env:ZIP_SHA256 `
+            --expect-seed-sha256 $env:SEED_SHA256 @pub | Out-File -Append -Encoding utf8 $env:GITHUB_STEP_SUMMARY
+          Invoke-WinSign verify-seed --seed-dir "$t\unsigned" --version $env:VERSION --mode official --work "$t\seed-check" `
+            --scripts-dir packaging --expect-sha256 $env:SEED_SHA256 | Out-Null
+          "zip=$env:ZIP_SHA256" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+          "msi=$msiSha" | Out-File -Append -Encoding utf8 $env:GITHUB_OUTPUT
+      - name: Windows trust, publisher and timestamp; tampered and unsigned files are rejected
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
+          $t = $env:RUNNER_TEMP
+          Test-MetroOfficialTrust -Tree "$t\tree" -Dist "$t\dist" -MsiName "Metro-$env:VERSION-windows-x64.msi" `
+            -SeedRoot "$t\seed-check\seed\Metro-$env:VERSION-windows-x64" -SourceScripts (Join-Path $env:GITHUB_WORKSPACE 'packaging') `
+            -PublisherCN $env:PUBLISHER_CN -PublisherOrg $env:PUBLISHER_ORG
+      - name: Install the signed MSI into a chosen folder, check tables, admin image, payload and signatures, run the server, uninstall
+        run: |
+          Import-Module (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-signing\MetroWindowsSigning.psm1')
+          $t = $env:RUNNER_TEMP
+          New-Item -ItemType Directory "$t\logs" | Out-Null
+          Test-MetroMsiCandidate -Msi "$t\dist\Metro-$env:VERSION-windows-x64.msi" -Tree "$t\tree" -Version $env:VERSION `
+            -Mode official -Expect signed -LogDir "$t\logs" -PublisherCN $env:PUBLISHER_CN -PublisherOrg $env:PUBLISHER_ORG
+          Test-MetroMsiInstall -Msi "$t\dist\Metro-$env:VERSION-windows-x64.msi" -Tree "$t\tree" -Version $env:VERSION `
+            -Mode official -LogDir "$t\logs" -PublisherCN $env:PUBLISHER_CN -PublisherOrg $env:PUBLISHER_ORG
+      - name: MSI lane native tests (fixtures, upgrade, repair, downgrade, uninstall; then the signed MSI)
+        run: |
+          $t = $env:RUNNER_TEMP
+          & pwsh -NoProfile -NonInteractive -File (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-msi\test-msi-windows.ps1') `
+            -FixturesDir "$t\fixtures" -Msi "$t\dist\Metro-$env:VERSION-windows-x64.msi" -Version $env:VERSION `
+            -LogDir "$t\logs\msi-lane" -RequireFile metro-tui.exe
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: windows-sign-logs
+          path: |
+            ${{ runner.temp }}/logs/*.log
+            ${{ runner.temp }}/logs/msi-lane/*.log
+          if-no-files-found: ignore
+          retention-days: 7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: windows-sha256sums
+          path: ${{ runner.temp }}/windows-SHA256SUMS
+          if-no-files-found: error
+          retention-days: 14
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dist-desktop-windows-x64
+          path: ${{ runner.temp }}/dist/
+          if-no-files-found: error
+          retention-days: 14
