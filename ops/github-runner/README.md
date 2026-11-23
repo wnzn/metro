@@ -6,15 +6,15 @@ personal or Space runners (`metro-runner`), and it never signs anything:
 the Windows signer and every release job stay on their own workflows.
 GitHub-hosted Windows and macOS jobs aren't affected.
 
-> **Status: not yet verified live.** The files and their contract tests are
-> in the source:
+> **Status: built and tested locally; not registered yet.**
 >
-> - the runner: `fdbbec1`;
-> - the egress proxy: `5d06302`;
-> - the manual workflow: `b9934f1`.
->
-> Nobody has yet recorded the runner online in GitHub, running a job, then
-> showing offline after `down`.
+> - **Source:** the runner at `fdbbec1`, `bd8e6ae` and `023b442`; the egress
+>   proxy at `5d06302`; the manual workflow at `b9934f1`.
+> - **Locally:** both Compose images built. From the runner image, with its
+>   network disabled and an empty `HOME`, Metro's desktop app passed
+>   `nsh check`, `nsh build --release` and the focused Shell tests (13/13).
+> - **Not yet recorded:** the runner online in GitHub, running a job, then
+>   showing offline after `down`.
 
 ## What it is, and what it isn't
 
@@ -38,7 +38,14 @@ GitHub-hosted Windows and macOS jobs aren't affected.
   proxy, which allows HTTPS only to `github.com`, `api.github.com`,
   `codeload.github.com` and `*.actions.githubusercontent.com`. A job can't
   install packages or reach anything else, so everything a job needs is in
-  the image (Ubuntu 24.04, GTK 4, WebKitGTK 6, Xvfb, the pinned NSH).
+  the image:
+  - Ubuntu 24.04, GTK 4, WebKitGTK 6 and Xvfb;
+  - the pinned NSH;
+  - the TypeScript 7 compiler that NSH pins for `nsh check`
+    (`@typescript/typescript-linux-x64@7.0.2`, at `/opt/typescript`, with its
+    `LICENSE` and `NOTICE.txt`). `NSH_TSC=/opt/typescript/lib/tsc` makes
+    `nsh` use this copy, so nothing is fetched from npm, which a job
+    couldn't reach anyway.
 - **No artifacts or caches.** GitHub stores those in Azure blob storage,
   which the proxy doesn't allow. GitHub's documentation lists that storage
   for job summaries and logs too. Whether a job's logs still reach GitHub
@@ -75,10 +82,16 @@ GitHub-hosted Windows and macOS jobs aren't affected.
 - **GitHub CLI (`gh`) on the host**, signed in as a repository admin of
   `wnzn/metro` (today, `jenerestain`). Check it with `gh auth status`. The
   login stays on the host and never enters a container.
-- **Room for the build.** Building the images downloads Ubuntu packages from
-  a pinned `snapshot.ubuntu.com` date, the base images from Docker Hub, and
-  the actions runner and NSH archives from GitHub. Each is checked by digest
-  or SHA-256.
+- **Network access for the build.** Only the build reaches beyond GitHub;
+  jobs never do. It downloads:
+  - the base images from Docker Hub;
+  - Ubuntu packages from a pinned `snapshot.ubuntu.com` date, over HTTPS
+    checked against the CA bundle from the same digest-pinned `golang`
+    image the egress proxy builds with;
+  - the actions runner and NSH archives from GitHub;
+  - the TypeScript compiler from `registry.npmjs.org`.
+
+  Each is checked by digest, SHA-256 or npm integrity hash.
 - **A local Docker daemon.** The helper refuses unless the Docker context
   is a local `unix://` socket, so a token can never go to another machine's
   daemon.
@@ -228,8 +241,15 @@ a reviewed change to the `Dockerfile`:
   runner release, well inside that window.
 - **Base image and packages:** the `ubuntu:24.04` digest and
   `UBUNTU_SNAPSHOT`, which move forward together.
-- **The proxy:** the `golang` and `debian` digests in `egress/Dockerfile`.
-- **NSH:** `NSH_VERSION` and `NSH_SHA256`, the same pin as `ci.yml`.
+- **The CA bundle and the proxy:** the `golang` digest, the same in the
+  runner `Dockerfile` (stage `ca`) and `egress/Dockerfile`, plus the
+  `debian` digest in `egress/Dockerfile`.
+- **NSH and its TypeScript compiler, together:** `NSH_VERSION` and
+  `NSH_SHA256` (the same pin as `ci.yml`), plus `TS_VERSION`,
+  `TS_INTEGRITY` and `TS_SHA256` for the compiler that NSH version pins.
+
+Change these only in the `Dockerfile`; never install packages into a
+running runner.
 
 After such a change is on `main`:
 
