@@ -6,9 +6,12 @@ workflow (validated before any `if:`), the input contracts of each call, who
 sees which secret, and the order in which release jobs run.
 """
 
+import json
 import os
 from pathlib import Path
 import re
+import subprocess
+import tempfile
 import unittest
 
 try:
@@ -173,13 +176,24 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(release["if"], "needs.release-policy.outputs.release == 'true'")
         self.assertEqual(release["with"], {"release": True, "version": "${{ needs.release-policy.outputs.version }}"})
         self.assertEqual(release["permissions"], {"contents": "read"})
-        self.assertEqual(set(release["needs"]), {"rust", "desktop", "containers", "workflows", "release-policy"})
+        self.assertEqual(set(release["needs"]), {"rust", "desktop", "containers", "workflows", "packaging",
+                                                 "release-policy"})
         self.assertEqual(publish["needs"], ["release-policy", "release"])
         self.assertEqual(publish["uses"], "./.github/workflows/release-publish.yml")
         self.assertEqual(publish["permissions"], {"contents": "write", "packages": "write", "id-token": "write"})
         self.assertEqual(publish["with"], {"version": "${{ needs.release-policy.outputs.version }}"})
-        self.assertIs(self.ci["concurrency"]["cancel-in-progress"], False)
         self.assertIn("'metro-official-master'", self.ci["concurrency"]["group"])
+
+    def test_only_pull_requests_cancel_superseded_runs(self):
+        concurrency = self.ci["concurrency"]
+        self.assertEqual(concurrency["cancel-in-progress"], "${{ github.event_name == 'pull_request' }}")
+        official = ("github.event_name == 'push' && github.ref == 'refs/heads/master' && github.ref_protected "
+                    "&& !github.event.deleted && !github.event.forced && 'metro-official-master'")
+        self.assertEqual(concurrency["group"],
+                         "${{ " + official + " || github.event_name == 'pull_request' && "
+                         "format('ci-pr-{0}', github.event.pull_request.number) || format('ci-{0}', github.run_id) }}")
+        # Pushes (main, master, official or not) never take the cancelling branch.
+        self.assertNotIn("push", concurrency["cancel-in-progress"])
 
     def test_real_job_guards_admit_only_eligible_official_pushes(self):
         jobs = self.ci["jobs"]
@@ -235,16 +249,46 @@ class ReleaseWorkflowTests(unittest.TestCase):
                 self.assertEqual(set(re.findall(r"secrets\.([A-Z0-9_]+)", str(step["env"]))), names)
                 self.assertNotIn("set -x", step["run"])
 
+    def macos_matrix(self, event, release):
+        """Run meta's real matrix step with the value its PULL_REQUEST_PREVIEW expression would take."""
+        step, = [s for s in self.release["jobs"]["meta"]["steps"] if s.get("id") == "macos"]
+        self.assertEqual(step["env"]["PULL_REQUEST_PREVIEW"],
+                         "${{ github.event_name == 'pull_request' && !inputs.release }}")
+        preview = event == "pull_request" and not release
+        with tempfile.TemporaryDirectory() as d:
+            output = Path(d) / "output"
+            env = {"PATH": os.environ["PATH"], "GITHUB_OUTPUT": str(output),
+                   "MACOS_BUILDS": step["env"]["MACOS_BUILDS"], "PULL_REQUEST_PREVIEW": str(preview).lower()}
+            subprocess.run(["bash", "-e", "-c", step["run"]], env=env, check=True, capture_output=True)
+            name, value = output.read_text().strip().split("=", 1)
+        self.assertEqual(name, "matrix")
+        return json.loads(value)
+
     def test_macos_release_jobs(self):
         jobs = self.release["jobs"]
         build, sign = jobs["desktop-macos"], self.publish["jobs"]["macos-sign"]
-        self.assertNotIn("if", build)  # pull requests and main still build and smoke both Macs
+        self.assertNotIn("if", build)  # every preview and release builds and smokes at least one Mac
         self.assertEqual(uploads(build)[-1], "preview-not-verified-adhoc-${{ matrix.target }}")
         self.assertEqual(sign["if"], "needs.tag.outputs.proceed == 'true'")
         self.assertEqual(sign["needs"], "tag")
         matrix = {(i["runner"], i["target"]) for i in sign["strategy"]["matrix"]["include"]}
         self.assertEqual(matrix, {("macos-15", "macos-arm64"), ("macos-15-intel", "macos-x64")})
-        self.assertEqual(matrix, {(i["runner"], i["target"]) for i in build["strategy"]["matrix"]["include"]})
+        # The build matrix has a single source: meta's MACOS_BUILDS, filtered for pull requests.
+        self.assertEqual(build["needs"], "meta")
+        self.assertEqual(build["strategy"]["matrix"], {"include": "${{ fromJSON(needs.meta.outputs.macos_matrix) }}"})
+        self.assertEqual(jobs["meta"]["outputs"]["macos_matrix"], "${{ steps.macos.outputs.matrix }}")
+        step, = [s for s in jobs["meta"]["steps"] if s.get("id") == "macos"]
+        everything = json.loads(step["env"]["MACOS_BUILDS"])
+        self.assertEqual(matrix, {(i["runner"], i["target"]) for i in everything})
+        for item in everything:
+            self.assertEqual(set(item), {"runner", "target", "rust", "arch", "nsh_asset", "nsh_sha256"})
+            self.assertRegex(item["nsh_sha256"], r"^[0-9a-f]{64}$")
+        arm64 = [i for i in everything if i["target"] == "macos-arm64"]
+        self.assertEqual([(i["runner"], i["arch"]) for i in arm64], [("macos-15", "arm64")])
+        for event, release, want in (("pull_request", False, arm64), ("push", False, everything),
+                                     ("push", True, everything), ("pull_request", True, everything)):
+            with self.subTest(event=event, release=release):
+                self.assertEqual(self.macos_matrix(event, release), want)
         self.assertEqual([d.get("name") for d in downloads(sign)], ["preview-not-verified-adhoc-${{ matrix.target }}"])
         text = steps_text(sign)
         order = ["macos_release.py check-credentials", "macos_release.py sign", "macos_release.py verify-archive",
@@ -344,6 +388,48 @@ class ReleaseWorkflowTests(unittest.TestCase):
             self.assertIn("Metro conversations", text, name)
         gate = steps_text(self.publish["jobs"]["macos-sign"])
         self.assertLess(gate.find("verify-app"), gate.find("Contents/MacOS/metro-tui\" --help"))
+
+    def test_rust_caches_are_written_by_main_only_and_never_reach_official_builds(self):
+        pin = "Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0"
+        main_only = "${{ github.ref == 'refs/heads/main' }}"
+        found = {}
+        for file, wf in (("ci.yml", self.ci), ("release.yml", self.release), ("release-publish.yml", self.publish)):
+            for name, job in wf["jobs"].items():
+                for index, step in enumerate(job.get("steps", [])):
+                    if "rust-cache" not in str(step.get("uses", "")):
+                        continue
+                    found.setdefault(file, set()).add(name)
+                    self.assertEqual(step["uses"], pin, name)
+                    self.assertEqual(step["with"]["save-if"], main_only, name)
+                    # The toolchain is installed before the cache restores, and nothing compiles earlier.
+                    before = " ".join(str(s.get("run", "")) for s in job["steps"][:index])
+                    self.assertIn("rustup toolchain install", before, name)
+                    self.assertNotRegex(before, r"cargo (build|test|clippy)", name)
+                    if file != "ci.yml":
+                        self.assertEqual(step["if"], "${{ !inputs.release }}", name)
+        self.assertEqual(found, {"ci.yml": {"rust"},
+                                 "release.yml": {"desktop-linux", "desktop-windows", "desktop-macos"}})
+        keys = {name: self.release["jobs"][name]["steps"] for name in found["release.yml"]}
+        self.assertEqual({name: next(s["with"]["key"] for s in steps if "rust-cache" in str(s.get("uses", "")))
+                          for name, steps in keys.items()},
+                         {"desktop-linux": "x86_64-unknown-linux-gnu", "desktop-windows": "x86_64-pc-windows-msvc",
+                          "desktop-macos": "${{ matrix.rust }}"})
+        # release.yml never runs an official build with a cache: every use is in a guarded step.
+        self.assertEqual((WF / "release.yml").read_text().count("rust-cache@"), 3)
+
+    def test_ci_compiles_each_profile_once(self):
+        rust = [s.get("run", "") for s in self.ci["jobs"]["rust"]["steps"]]
+        build = rust.index("cargo build --locked --bin metro-server --bin metro-runner --bin metro-connector "
+                           "--bin metro-tui")
+        self.assertLess(build, rust.index("cargo test --locked --workspace"))
+        self.assertEqual([r for r in rust if "--release" in r], [])
+        linux = steps_text(self.release["jobs"]["desktop-linux"])
+        self.assertNotIn("cargo test", linux)
+        self.assertIn("cargo fetch --locked --target x86_64-unknown-linux-gnu", linux)
+        self.assertIn("sys.version_info >= (3, 11)", linux)
+        for name in ("desktop-windows", "desktop-macos"):
+            self.assertRegex(steps_text(self.release["jobs"][name]),
+                             r"cargo test --locked --release --target \S+ -p metro-desktop", name)
 
     def test_ci_runs_the_terminal_client_in_a_real_pty(self):
         rust = self.ci["jobs"]["rust"]

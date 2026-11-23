@@ -3,6 +3,41 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: faster pull request CI (2026-11-24, CI lane, local)
+
+Uncommitted changes on `fix/ci-cleanup`, on top of `1719366`, to `ci.yml`,
+`release.yml` and `packaging/package_smoke_policy.py`
+([deploy.md](deploy.md#ci-and-publishing)):
+
+- a new push to a pull request cancels its older run; pushes and the
+  official `master` group never cancel;
+- the packaging tests run in their own `packaging` job, which releases need;
+- a pull request into `main` skips the test builds unless it changes a
+  build input; pull requests build only the Apple-silicon Mac;
+- a Rust cache, written only by `main` pushes and skipped by release builds;
+- the `rust` job builds its debug binaries once and no longer builds a
+  release connector, and `desktop-linux` no longer runs a second release
+  compile for tests.
+
+**Not yet shown:** any GitHub run of these changes. GitHub's matrix from
+`fromJSON`, cancellation and cache scoping were checked only by the
+contract tests below, not on GitHub.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging -v # 182 tests, OK (12 skipped: no pwsh, MSI tools or macOS runtimes)
+python3 -B -m unittest discover -s ops/github-runner  # 33 tests, OK
+```
+
+The `Swatinem/rust-cache` pin `d1527c8` is the commit of tag `v2.9.3`
+(`git ls-remote`). The preview policy was also run by hand on this
+repository's history: the `tests/e2e`-only commit `1719366` skips as a pull
+request into `main` and builds as a pull request into `master` or a push; a
+`crates` commit and an invalid SHA build.
+
 ## Partial: macOS installer previews on hosted Macs at b7f693b (2026-11-24, docs lane, GitHub)
 
 Pull request #3 (`fix/macos-installer-chmod`), run

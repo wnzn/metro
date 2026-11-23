@@ -193,6 +193,24 @@ fresh volume.
 - unsigned test builds for Linux, Windows and both Macs
   ([install.md](install.md#test-builds-from-github-actions)).
 
+Some of this is cut down for pull requests, to keep them fast:
+
+- A pull request into `main` gets test builds only when it changes
+  something a build reads: the workflows, `apps/desktop`, `crates`,
+  `packaging`, `services`, the Cargo files, the Dockerfile and a few other
+  build files. A change only to docs, `tests`, `examples`, `ops` or the
+  Compose files skips them. If CI can't read the change, it builds.
+- A pull request builds only the Apple-silicon Mac. Pull requests into
+  `master` always get test builds.
+- A new push to a pull request cancels that pull request's older run.
+  Pushes are never cancelled.
+
+Pushes to `main` and `master` build everything, including both Macs.
+
+The Rust jobs keep a build cache. Only pushes to `main` write it. Pull
+requests and other pushes only read it. Release builds never use it, so
+they always compile from scratch.
+
 A tag push starts nothing, and there's no manual trigger. What has been
 verified so far is in [acceptance.md](acceptance.md).
 

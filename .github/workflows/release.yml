@@ -32,6 +32,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.v.outputs.version }}
+      macos_matrix: ${{ steps.macos.outputs.matrix }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -62,6 +63,32 @@ jobs:
             version="$(sed -n 's/^version=//p' "$RUNNER_TEMP/policy.txt")-ci"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+      # The desktop-macos matrix. MACOS_BUILDS lists every Mac a release ships.
+      # Pull request previews build only Apple silicon; main pushes and official
+      # builds build both.
+      - id: macos
+        env:
+          PULL_REQUEST_PREVIEW: ${{ github.event_name == 'pull_request' && !inputs.release }}
+          MACOS_BUILDS: |
+            [
+              {"runner": "macos-15", "target": "macos-arm64", "rust": "aarch64-apple-darwin", "arch": "arm64",
+               "nsh_asset": "nsh-macos-arm64.tar.gz",
+               "nsh_sha256": "ee1aed2a4d111fe90e6cceca4b9d5f834c9e11cfda525f8be984261a329c06de"},
+              {"runner": "macos-15-intel", "target": "macos-x64", "rust": "x86_64-apple-darwin", "arch": "x86_64",
+               "nsh_asset": "nsh-macos-x86_64.tar.gz",
+               "nsh_sha256": "23ccbfa71f50eb312e57862b7b843a15b23c1b9a9464cfc30735b1c07a18e324"}
+            ]
+        run: |
+          python3 -I - <<'PY'
+          import json, os
+          builds = json.loads(os.environ["MACOS_BUILDS"])
+          if os.environ["PULL_REQUEST_PREVIEW"] == "true":
+              builds = [b for b in builds if b["target"] == "macos-arm64"]
+          assert builds, "no macOS build selected"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print("matrix=" + json.dumps(builds, separators=(",", ":")), file=output)
+          print("macOS builds:", ", ".join(b["target"] for b in builds))
+          PY
 
   # Native Linux x64 runner. Built in the same Debian bookworm toolchain image
   # as the GHCR runner image, so it needs glibc <= 2.36. Windows has no runner
@@ -258,9 +285,17 @@ jobs:
         with:
           name: ui-windows-x64
           path: ${{ runner.temp }}/stage
-      - name: Toolchain, locked fetch and native tests of the launcher
+      - name: Rust toolchain
+        run: rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
+      # Previews only: official builds always compile from a clean target. Only
+      # main pushes write the cache.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          key: x86_64-pc-windows-msvc
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Locked fetch and native tests of the launcher
         run: |
-          rustup toolchain install $env:RUSTUP_TOOLCHAIN --profile minimal
           cargo fetch --locked --target x86_64-pc-windows-msvc
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           python --version
@@ -634,14 +669,22 @@ jobs:
         with:
           name: ui-linux-x64
           path: ${{ runner.temp }}/stage
-      - name: Toolchain, locked fetch and native tests of the launcher
+      - name: Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+      # Previews only: official builds always compile from a clean target. Only
+      # main pushes write the cache.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          key: x86_64-unknown-linux-gnu
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # metro-desktop's tests run on Linux in ci.yml's rust job.
+      - name: Locked fetch and build tools
         run: |
           set -eu
-          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
           cargo fetch --locked --target x86_64-unknown-linux-gnu
           python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
           readelf --version | head -1
-          cargo test --locked --release -p metro-desktop
       - name: Build metro-desktop, metro-server and metro-tui (locked)
         run: |
           set -eu
@@ -802,7 +845,9 @@ jobs:
 
   # macOS build and preview. Native jobs per architecture (macos-15 = Apple
   # silicon, macos-15-intel = Intel; GitHub offers Intel macOS runners until
-  # August 2027). They build and test the launcher and server natively, package
+  # August 2027). The matrix comes from meta (MACOS_BUILDS): pull requests build
+  # Apple silicon only; main pushes and official builds build both. They build
+  # and test the launcher and server natively, package
   # the stock NSH macOS runtime (pinned asset and runtime digests) as the inner
   # MetroUI.app, assemble and ad hoc sign the outer Metro.app, install it with
   # install-metro-macos.sh into a path with spaces and check a clean start and
@@ -815,19 +860,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: macos-15
-            target: macos-arm64
-            rust: aarch64-apple-darwin
-            arch: arm64
-            nsh_asset: nsh-macos-arm64.tar.gz
-            nsh_sha256: ee1aed2a4d111fe90e6cceca4b9d5f834c9e11cfda525f8be984261a329c06de
-          - runner: macos-15-intel
-            target: macos-x64
-            rust: x86_64-apple-darwin
-            arch: x86_64
-            nsh_asset: nsh-macos-x86_64.tar.gz
-            nsh_sha256: 23ccbfa71f50eb312e57862b7b843a15b23c1b9a9464cfc30735b1c07a18e324
+        include: ${{ fromJSON(needs.meta.outputs.macos_matrix) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     env:
@@ -890,10 +923,18 @@ jobs:
           package.stock_renderer(contents / "MacOS/Metro", Path(sys.argv[2]), contents, sys.argv[4])
           print("inner executable: stock NSH runtime, re-signed ad hoc for", package.MACOS_UI_ID)
           PY
-      - name: Toolchain, locked fetch and native tests of the launcher
+      - name: Rust toolchain
+        run: rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$RUST_TARGET"
+      # Previews only: official builds always compile from a clean target. Only
+      # main pushes write the cache.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        if: ${{ !inputs.release }}
+        with:
+          key: ${{ matrix.rust }}
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: Locked fetch and native tests of the launcher
         run: |
           set -eu
-          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$RUST_TARGET"
           cargo fetch --locked --target "$RUST_TARGET"
           python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
           cargo test --locked --release --target "$RUST_TARGET" -p metro-desktop

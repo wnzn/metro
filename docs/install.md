@@ -269,8 +269,10 @@ native runner with `METRO_SANDBOX=docker` ([runner.md](runner.md)).
 
 ## Test builds from GitHub Actions
 
-**For testing only.** Every pull request, every push to `main`, and every
-push to `master` that doesn't release builds installable test files. A test build is **not a release**,
+**For testing only.** Every push to `main`, every push to `master` that
+doesn't release, and pull requests that change a build input build
+installable test files. Pull requests that change only docs or tests don't
+([deploy.md](deploy.md#ci-and-publishing)). A test build is **not a release**,
 **not signed**, and kept only for a short time. Use one only if you accept
 that.
 
@@ -280,7 +282,8 @@ that.
   `….unsigned-preview.msi`, the Linux runner archive, their `.sha256` files,
   the installer scripts and a `SHA256SUMS`.
 - `preview-not-verified-adhoc-macos-arm64` and `…-macos-x64`: one
-  download per Mac, ad hoc signed, not notarized.
+  download per Mac, ad hoc signed, not notarized. Pull requests build only
+  the Apple-silicon one (`…-macos-arm64`).
 - The checksums only show that a file wasn't damaged in transit. They don't
   show who built it. Nothing in a test build is signed by Metro's
   publishers.

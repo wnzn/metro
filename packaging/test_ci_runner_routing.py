@@ -157,8 +157,14 @@ sys.exit({status!r})
         self.assertEqual(self.desktop["runs-on"],
                          "${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' "
                          "&& 'metro-ci-linux-x64' || 'ubuntu-24.04' }}")
-        for job in ("rust", "containers", "workflows", "release-policy"):
+        for job in ("rust", "containers", "workflows", "packaging", "release-policy"):
             self.assertEqual(self.ci["jobs"][job]["runs-on"], HOSTED)
+        # The slow packaging tests run in their own job, so they do not hold up the desktop job.
+        packaging = self.ci["jobs"]["packaging"]
+        self.assertNotIn("needs", packaging)
+        self.assertEqual(packaging["steps"][0]["with"], {"persist-credentials": False})
+        self.assertIn("python3 -B -m unittest discover -s packaging", packaging["steps"][1]["run"])
+        self.assertNotIn("unittest discover", yaml.safe_dump(self.workflow_gate))
         steps = self.desktop["steps"]
         verify, checkout, install, *commands = steps
         self.assertEqual(verify["if"], "runner.environment == 'self-hosted'")
