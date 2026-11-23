@@ -1,5 +1,8 @@
 import json
+import os
 from pathlib import Path
+import shutil
+import struct
 import subprocess
 import sys
 import tarfile
@@ -129,6 +132,13 @@ class PackageTests(unittest.TestCase):
             for name in ("check.svg", "send.svg", "play.svg"):
                 package.copy(icons / name, packaged_icons / name)
             self.assertIn(Path("assets/src/ui/icons/check.svg"), package.nsh_resources(ui, source, "0.2.0"))
+            # The final packager supplies its own exact renderer sidecar, not an
+            # arbitrary icon submitted alongside the stock NSH build.
+            upstream_icon = resources / "icon.ico"
+            upstream_icon.write_bytes(b"unapproved")
+            with self.assertRaisesRegex(ValueError, "expected NSH resources"):
+                package.nsh_resources(ui, source, "0.2.0")
+            upstream_icon.unlink()
             (packaged_icons / ".env").write_text("unapproved")
             with self.assertRaisesRegex(ValueError, "unapproved renderer asset"):
                 package.nsh_resources(ui, source, "0.2.0")
@@ -203,6 +213,110 @@ class PackageTests(unittest.TestCase):
             resources.add(Path("assets/src/ui/icons/brand-unlisted.svg"))
             with self.assertRaisesRegex(ValueError, "attribution list"):
                 package.brand_notice(source, resources)
+
+    def test_multi_resolution_pe_icon_tree(self):
+        images = package.ico_images(package.app_icon("metro.ico"))
+        tree = bytearray()
+
+        def put(fmt, *values):
+            pos = len(tree)
+            tree.extend(struct.pack(fmt, *values))
+            return pos
+
+        def directory(*ids):
+            start = put("<IIHHHH", 0, 0, 0, 0, 0, len(ids))
+            for id in ids:
+                put("<II", id, 0)
+            return start
+
+        def child(parent, index, target, is_dir=True):
+            struct.pack_into("<I", tree, parent + 20 + 8 * index, target | (0x80000000 if is_dir else 0))
+
+        rva = 0x6000
+
+        def language(data):
+            directory_pos = directory(0)
+            leaf = put("<IIII", rva + len(tree) + 16, len(data), 0, 0)
+            child(directory_pos, 0, leaf, is_dir=False)
+            tree.extend(data)
+            return directory_pos
+
+        group = struct.pack("<3H", 0, 1, len(images))
+        root = directory(3, 14)
+        icons = directory(*range(1, 1 + len(images)))
+        child(root, 0, icons)
+        for i, (meta, image) in enumerate(images):
+            child(icons, i, language(image))
+            group += meta + struct.pack("<H", i + 1)
+        groups = directory(1)
+        child(root, 1, groups)
+        child(groups, 0, language(group))
+
+        def verify():
+            package.pe_icon(tree, rva, "Metro.exe", images)
+
+        verify()
+        tree[-1] ^= 1  # A dangling RT_ICON ID in the group is not accepted.
+        with self.assertRaisesRegex(ValueError, "missing PE icon resource"):
+            verify()
+        tree[-1] ^= 1
+        tree[icons + 16 + 8 * len(images) + 40] ^= 1  # First frame's payload.
+        with self.assertRaisesRegex(ValueError, "RT_ICON 1 does not match"):
+            verify()
+
+    @unittest.skipUnless(sys.platform.startswith("linux") and shutil.which("gio"),
+                         "requires GLib's real desktop launcher")
+    def test_linux_application_menu_registration_and_relocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            stage = root / 'Metro space % \'" $ ` \\ 日本'
+            stage.mkdir()
+            for dest, source in package.linux_icon_assets().items():
+                package.copy(source, stage / dest)
+            package.copy(Path(package.__file__).with_name("install-desktop.sh"),
+                         stage / "install-desktop", executable=True)
+            home = root / "home"
+            home.mkdir()
+            data = root / "data with spaces"
+            mark = root / "started"
+            env = {**os.environ, "HOME": str(home), "XDG_DATA_HOME": str(data), "TEST_MARK": str(mark)}
+            launcher = stage / "Metro"
+            launcher.write_text('#!/bin/sh\nprintf "%s\\n" "$0" > "$TEST_MARK"\n')
+            launcher.chmod(0o755)
+            result = subprocess.run([stage / "install-desktop"], cwd=root, env=env, capture_output=True)
+            self.assertEqual(result.returncode, 2)
+            self.assertFalse(data.exists())
+            self.assertEqual(list(home.iterdir()), [])
+            entry = data / f"applications/{package.APP_ID}.desktop"
+            theme = data / "icons/hicolor"
+            installed_icons = [theme / f"{size}/apps/{package.APP_ID}.{ext}"
+                               for size, ext in (("256x256", "png"), ("scalable", "svg"))]
+            for cycle in range(2):
+                package.verify_desktop_icons(stage, windows=False)
+                subprocess.run([stage / "install-desktop", "--install"], cwd=root, env=env, check=True,
+                               capture_output=True)
+                for icon in installed_icons:
+                    self.assertEqual(icon.read_bytes(), (stage / "icons" / icon.name).read_bytes())
+                lines = entry.read_text().splitlines()
+                self.assertIn(f"Icon={package.APP_ID}", lines)
+                self.assertIn(f"StartupWMClass={package.APP_ID}", lines)
+                if shutil.which("desktop-file-validate"):
+                    subprocess.run(["desktop-file-validate", entry], check=True, capture_output=True)
+                launched = subprocess.run(["gio", "launch", entry], cwd=root, env=env, text=True,
+                                          capture_output=True, timeout=10)
+                self.assertEqual(launched.returncode, 0, launched.stderr)
+                self.assertEqual(mark.read_text().strip(), str(stage / "Metro"))
+                mark.unlink()
+                if cycle == 0:
+                    stage = stage.rename(root / "new folder")
+            welcome = data / "applications/unrelated.desktop"
+            welcome.write_text("unchanged")
+            subprocess.run([stage / "install-desktop", "--uninstall"], cwd=root, env=env, check=True,
+                           capture_output=True)
+            self.assertFalse(entry.exists())
+            self.assertTrue(welcome.exists())
+            self.assertTrue(all(not icon.exists() for icon in installed_icons))
+            self.assertEqual(list(home.iterdir()), [])
 
 
 if __name__ == "__main__":

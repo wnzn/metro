@@ -263,6 +263,11 @@ jobs:
           set -eu
           bad="$(grep -hE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s+\./' | grep -vE 'uses:[[:space:]]+[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$)' || true)"
           [ -z "$bad" ] || { printf 'unpinned actions:\n%s\n' "$bad" >&2; exit 1; }
+      - name: Desktop packaging tests (PE resources, Linux icons and app-menu integration)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends desktop-file-utils libglib2.0-bin
+          python3 -B -m unittest discover -s packaging -v
 
   # Build and package everything a tag would release, but publish nothing.
   package-smoke:

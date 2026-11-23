@@ -14,6 +14,7 @@ import struct
 import subprocess
 import tarfile
 import tempfile
+import xml.etree.ElementTree as ET
 import zipfile
 
 
@@ -42,6 +43,12 @@ LINUX_UI = {
     "libsoup-3.0.so.0", "libgio-2.0.so.0", "libjavascriptcoregtk-6.0.so.1",
 }
 RENDERER_SOURCE = Path(__file__).resolve().parents[1] / "apps/desktop"
+APP_ID = "dev.metro.desktop"
+LINUX_ICONS = {
+    f"icons/{APP_ID}.png": "metro-256.png",
+    f"icons/{APP_ID}.svg": "metro.svg",
+}
+WINDOWS_ICON = "ui/nsh/icon.ico"
 # Production modules in apps/desktop/src/ui that import bundled SVG icons. Only
 # these approve renderer assets: a test or fixture module never does.
 ICON_MODULES = ("chrome.tsx", "activity.tsx", "chatControls.tsx", "library.tsx")
@@ -88,8 +95,74 @@ def write(path, text):
     path.chmod(0o644)
 
 
-def pe(path, gui=False):
-    """Inspect PE32+ header and imports without depending on host binutils."""
+def ico_images(path):
+    """Return the ICO directory metadata and the bytes of each image."""
+    ico = regular(path).read_bytes()
+    reserved, kind, count = struct.unpack_from("<3H", ico)
+    end = 6 + 16 * count
+    require(reserved == 0 and kind == 1 and count > 1 and end <= len(ico),
+            f"{path}: expected a multi-resolution ICO")
+    images = []
+    for i in range(6, end, 16):
+        length, start = struct.unpack_from("<II", ico, i + 8)
+        require(length > 0 and end <= start <= start + length <= len(ico),
+                f"{path}: invalid ICO image")
+        images.append((ico[i:i + 12], ico[start:start + length]))
+    require(len({meta[:2] for meta, _ in images}) > 1,
+            f"{path}: ICO images must have different sizes")
+    return images
+
+
+def pe_icon(resources, resource_rva, path, images):
+    """Read numeric PE resource types/names/languages and verify icon group 1."""
+    def invalid(message):
+        return f"{path}: {message}"
+
+    def unpack(fmt, relative):
+        require(0 <= relative <= len(resources) - struct.calcsize(fmt),
+                invalid("invalid PE resource directory offset"))
+        return struct.unpack_from(fmt, resources, relative)
+
+    def find(relative, id, directory):
+        named, numbered = unpack("<HH", relative + 12)
+        start = relative + 16 + 8 * named
+        for i in range(numbered):
+            name, target = unpack("<II", start + 8 * i)
+            if id is not None and name != id:
+                continue
+            require(bool(target & 0x80000000) == directory, invalid("invalid PE icon resource tree"))
+            return target & 0x7fffffff, name
+        raise ValueError(invalid(f"missing PE icon resource (id {id})"))
+
+    def payload(directory, lang):
+        leaf, language = find(directory, lang, False)
+        rva, size = unpack("<II", leaf)
+        require(resource_rva <= rva and rva + size <= resource_rva + len(resources),
+                invalid("invalid PE icon resource bounds"))
+        start = rva - resource_rva
+        return resources[start:start + size], language
+
+    group_type, _ = find(0, 14, True)  # RT_GROUP_ICON
+    icon_type, _ = find(0, 3, True)   # RT_ICON
+    group, _ = find(group_type, 1, True)
+    contents, lang = payload(group, None)
+    require(len(contents) == 6 + 14 * len(images)
+            and struct.unpack_from("<3H", contents) == (0, 1, len(images)),
+            invalid("PE GROUP_ICON 1 must contain all Metro icon sizes"))
+    ids = set()
+    for i, (meta, expected) in enumerate(images):
+        start = 6 + 14 * i
+        (id,) = struct.unpack_from("<H", contents, start + 12)
+        require(contents[start:start + 12] == meta and id not in ids,
+                invalid("PE GROUP_ICON 1 does not match the Metro ICO"))
+        ids.add(id)
+        entry, _ = find(icon_type, id, True)
+        actual, _ = payload(entry, lang)
+        require(actual == expected, invalid(f"PE RT_ICON {id} does not match the Metro ICO"))
+
+
+def pe(path, gui=False, icon=None):
+    """Inspect PE32+ header, imports and optional icon without host binutils."""
     data = regular(path).read_bytes()
 
     def u16(offset):
@@ -113,11 +186,11 @@ def pe(path, gui=False):
         for i in range(u16(header + 6))
     ]
 
-    def offset(rva):
+    def offset(rva, size=1):
         for _, start, raw_size, raw_offset in sections:
-            if start <= rva < start + raw_size:
+            if start <= rva < start + raw_size and rva + size <= start + raw_size:
                 return raw_offset + rva - start
-        raise ValueError(f"{path}: invalid PE import address")
+        raise ValueError(f"{path}: invalid PE section address")
 
     imports = set()
     count = min(u32(opt + 108), (size - 112) // 8)
@@ -143,6 +216,13 @@ def pe(path, gui=False):
     unknown = {name for name in unknown if not name.startswith(("api-ms-win-", "ext-ms-win-"))}
     require(not unknown, f"{path}: unhandled DLL dependencies: {', '.join(sorted(unknown))}")
     require("kernel32.dll" in imports, f"{path}: no standard Windows import table found")
+    if icon is not None:
+        require(count > 2, f"{path}: missing PE resource directory")
+        rva, length = struct.unpack_from("<II", data, opt + 112 + 8 * 2)
+        require(rva != 0 and length >= 16, f"{path}: missing PE resource directory")
+        start = offset(rva, length)
+        require(start + length <= len(data), f"{path}: truncated PE resource directory")
+        pe_icon(data[start:start + length], rva, path, ico_images(icon))
     return sorted(imports)
 
 
@@ -209,7 +289,7 @@ def nsh_resources(ui_dir, source, version):
     require({p.name for p in resources.iterdir()} == {"app.json", "bundle.nshc", "capabilities.json", "assets"},
             "expected NSH resources (app.json, bundle.nshc, capabilities.json, assets) and no extras")
     app = read_json(resources / "app.json")
-    require((app.get("name"), app.get("id"), app.get("version")) == ("Metro", "dev.metro.desktop", version),
+    require((app.get("name"), app.get("id"), app.get("version")) == ("Metro", APP_ID, version),
             "NSH manifest name, ID or version does not match; set --app-version when running nsh package")
     require(not any(app.get(key) for key in ("singleInstance", "schemes", "fileTypes")),
             "the stock renderer must not register itself as the top-level launcher")
@@ -247,6 +327,39 @@ def brand_notice(source, resources):
     return notice
 
 
+def app_icon(name):
+    return regular(RENDERER_SOURCE / "assets" / name)
+
+
+def linux_icon_assets():
+    assets = {dest: app_icon(name) for dest, name in LINUX_ICONS.items()}
+    for path in assets.values():
+        if path.suffix == ".png":
+            with path.open("rb") as stream:
+                header = stream.read(24)
+            require(header == b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR" + struct.pack(">II", 256, 256),
+                    f"{path}: expected a 256×256 PNG")
+        else:
+            require(ET.parse(path).getroot().tag == "{http://www.w3.org/2000/svg}svg",
+                    f"{path}: expected an SVG")
+    return assets
+
+
+def verify_desktop_icons(root, windows):
+    """Check extracted archives against the same source icons as the build."""
+    if windows:
+        ico = app_icon("metro.ico")
+        require(sha256(root / WINDOWS_ICON) == sha256(ico), "packaged NSH ICO differs from Metro's source")
+        pe(root / "Metro.exe", gui=True, icon=ico)
+    else:
+        for dest, path in linux_icon_assets().items():
+            require(sha256(root / dest) == sha256(path), f"packaged icon differs from source: {dest}")
+        script = regular(root / "install-desktop")
+        require(script.stat().st_mode & 0o111
+                and sha256(script) == sha256(Path(__file__).with_name("install-desktop.sh")),
+                "expected the executable freedesktop integration script")
+
+
 def desktop(args, stage):
     platform = args.target.split("-")[0]
     windows = platform == "windows"
@@ -261,7 +374,12 @@ def desktop(args, stage):
     require(len({sha256(args.launcher), sha256(args.server), expected}) == 3,
             "launcher, server and NSH renderer must be separate executables")
     if windows:
-        deps = {executable: pe(args.launcher, gui=True), f"ui/{executable}": pe(renderer, gui=True)}
+        ico = app_icon("metro.ico")
+        deps = {executable: pe(args.launcher, gui=True, icon=ico), f"ui/{executable}": pe(renderer, gui=True)}
+        # The stock Windows runner loads this external icon for its windows.
+        # Do not let NSH's native Windows packager rewrite the pinned EXE.
+        copy(ico, stage / WINDOWS_ICON)
+        integration = ""
         prerequisites = (
             "Windows 11 x64 with Windows Media Foundation (install Media Feature Pack on N editions).\n"
             "Install Microsoft's current Visual C++ v14 Redistributable (x64) if needed:\n"
@@ -270,6 +388,17 @@ def desktop(args, stage):
     else:
         deps = {executable: elf(args.launcher, (2, 39)),
                 f"ui/{executable}": elf(renderer, (2, 39), ui=True)}
+        for dest, source in linux_icon_assets().items():
+            copy(source, stage / dest)
+        copy(Path(__file__).with_name("install-desktop.sh"), stage / "install-desktop", True)
+        integration = (
+            "\nOptional Linux applications-menu entry (no sudo): from this folder, run\n"
+            "  ./install-desktop --install\n"
+            "Metro will appear with its icon in compatible desktop environments.\n"
+            "If you move this folder, run the command again from its new location.\n"
+            "Run ./install-desktop --uninstall before deleting the folder to remove\n"
+            "the menu entry and icons. This does not remove your Metro data.\n"
+        )
         prerequisites = (
             "Linux x64 with glibc 2.39 or newer (e.g. Ubuntu 24.04 or Debian 13).\n"
             "Requires GTK 4, WebKitGTK 6.0 and GStreamer runtime libraries. Debian/Ubuntu:\n"
@@ -285,8 +414,12 @@ def desktop(args, stage):
     deps[server_name] = pe(args.server) if windows else elf(args.server, (2, 39))
     copy(args.server, stage / server_name, True)
     write(stage / "START.txt", f"Extract this entire archive. Launch {executable} at the top level.\n"
-          "Choose Use locally for a solo workspace, or enter your Metro service URL to sign in.\n"
           "Keep the bundled server and ui directory next to the launcher.\n\n"
+          "Metro opens your private on-device workspace by default. To connect to\n"
+          "a shared Metro server, open the account menu and choose Add a server.\n"
+          "To change what opens at launch, use Startup server in the account menu\n"
+          "to choose On this computer or a saved server.\n"
+          + integration + "\n"
           + prerequisites)
     return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked"}
 
@@ -363,6 +496,9 @@ def main():
     d.add_argument("--nsh-root", required=True, type=Path)
     r = kinds.add_parser("runner")
     r.add_argument("--binary", required=True, type=Path)
+    check = kinds.add_parser("verify-desktop-icons")
+    check.add_argument("--target", required=True, choices=("windows-x64", "linux-x64"))
+    check.add_argument("root", type=Path, help="extracted Metro desktop archive root")
     for sub in (d, r):
         sub.add_argument("--version", required=True)
         sub.add_argument("--out-dir", type=Path, default=Path("dist"))
@@ -371,6 +507,9 @@ def main():
         sub.add_argument("--metro-license", type=Path, help="Metro license (if granted by the authors)")
     args = parser.parse_args()
     try:
+        if args.kind == "verify-desktop-icons":
+            verify_desktop_icons(args.root, args.target == "windows-x64")
+            return
         require(re.fullmatch(r"v?\d+\.\d+\.\d+(?:[-+][A-Za-z0-9][A-Za-z0-9.-]{0,30})?", args.version),
                 "version must be a file-safe semantic version (e.g. 1.2.3 or v1.2.3-rc.1)")
         windows = args.kind == "desktop" and args.target == "windows-x64"
@@ -397,7 +536,7 @@ def main():
             result.replace(args.out_dir / filename)
             sidecar.replace(args.out_dir / sidecar.name)
         print(args.out_dir / filename)
-    except (OSError, ValueError, struct.error, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, struct.error, ET.ParseError, subprocess.CalledProcessError) as error:
         parser.exit(1, f"package: {error}\n")
 
 

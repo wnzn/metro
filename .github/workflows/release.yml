@@ -281,9 +281,11 @@ jobs:
           New-Item -ItemType Directory $dest | Out-Null
           Expand-Archive "dist\$name" -DestinationPath $dest
           $root = Join-Path $dest "Metro-$env:VERSION-windows-x64"
-          foreach ($f in 'Metro.exe', 'metro-server.exe', 'ui\Metro.exe', 'ui\nsh\bundle.nshc', 'ui\nsh\app.json', 'ui\nsh\capabilities.json') {
+          foreach ($f in 'Metro.exe', 'metro-server.exe', 'ui\Metro.exe', 'ui\nsh\bundle.nshc', 'ui\nsh\app.json', 'ui\nsh\capabilities.json', 'ui\nsh\icon.ico') {
             if (-not (Test-Path (Join-Path $root $f))) { throw "package is missing $f" }
           }
+          python -I packaging/package.py verify-desktop-icons --target windows-x64 $root
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # No standalone runner: it is Linux-only (openat2 confinement).
           if (Get-ChildItem $dest -Recurse -File | Where-Object { $_.Name -like 'metro-runner*' }) {
             throw 'the Windows desktop package must not contain the standalone runner'
@@ -342,6 +344,16 @@ jobs:
           New-Item -ItemType Directory $env:METRO_DESKTOP_HOME | Out-Null
           New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\shot" | Out-Null
           Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms, System.Drawing
+          Add-Type @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class MetroWindowIcon {
+              [DllImport("user32.dll", SetLastError = true)]
+              public static extern IntPtr SendMessageTimeoutW(
+                  IntPtr window, uint message, UIntPtr wParam, IntPtr lParam,
+                  uint flags, uint milliseconds, out UIntPtr result);
+          }
+          '@
           $installedUi = (Resolve-Path "$env:METRO_ROOT\ui\Metro.exe").Path
           $installedServer = (Resolve-Path "$env:METRO_ROOT\metro-server.exe").Path
           function Find-Window($launcherPid) {
@@ -425,6 +437,16 @@ jobs:
               }
               if (-not $window) { throw "launch ${launch}: no window from the packaged UI child within 60 s" }
               Start-Sleep -Seconds 5
+              # WM_GETICON for the big and small window icons. The stock renderer
+              # has no embedded icons; these must be set by its ICO sidecar.
+              foreach ($size in 0, 1) {
+                [UIntPtr]$icon = [UIntPtr]::Zero
+                $sent = [MetroWindowIcon]::SendMessageTimeoutW(
+                  $window.MainWindowHandle, 0x007f, [UIntPtr]::new([uint32]$size), [IntPtr]::Zero, 2, 5000, [ref]$icon)
+                if ($sent -eq [IntPtr]::Zero -or $icon -eq [UIntPtr]::Zero) {
+                  throw "launch ${launch}: no NSH window icon (WM_GETICON $size)"
+                }
+              }
               Shot $window "desktop-windows-$launch-start"
               $server = Wait-Healthy $proc 90
               if (-not $server) {
@@ -534,6 +556,7 @@ jobs:
             test -e "$root/$f" || { echo "package is missing $f" >&2; exit 1; }
           done
           test -x "$root/Metro" && test -x "$root/metro-server" && test -x "$root/ui/Metro"
+          python3 -I packaging/package.py verify-desktop-icons --target linux-x64 "$root"
           # No standalone runner: runner packages are separate.
           ! find "$out" -name 'metro-runner*' | grep -q .
           echo "METRO_ROOT=$root" >> "$GITHUB_ENV"
@@ -577,11 +600,11 @@ jobs:
         run: |
           set -eu
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends xvfb xdotool imagemagick libwebkitgtk-6.0-4 libgtk-4-1
+          sudo apt-get install -y -qq --no-install-recommends xvfb xdotool x11-utils imagemagick libwebkitgtk-6.0-4 libgtk-4-1
           work="$(mktemp -d "$RUNNER_TEMP/desktop-run.XXXXXX")"
           mkdir -p "$RUNNER_TEMP/shot"
           for attempt in 1 2 3; do
-            if METRO_DESKTOP_HOME="$work/home" xvfb-run -a --server-args='-screen 0 1280x800x24' bash -c '
+            if GDK_BACKEND=x11 METRO_DESKTOP_HOME="$work/home" xvfb-run -a --server-args='-screen 0 1280x800x24' bash -c '
               set -eu
               mkdir -p "$METRO_DESKTOP_HOME"
               cd "$1"
@@ -592,7 +615,8 @@ jobs:
                 xdotool search --name "^Metro$" >/dev/null 2>&1 && break
                 sleep 1
               done
-              xdotool search --name "^Metro$" >/dev/null
+              wid="$(xdotool search --name "^Metro$" | head -n 1)"
+              xprop -id "$wid" WM_CLASS | grep -F dev.metro.desktop
               sleep 8
               kill -0 "$pid"
               import -window root "$2/desktop-linux.png" || true
