@@ -200,6 +200,9 @@ pub fn agent_addressed() -> Addressed {
 /// read time and never "now" for history whose time is unknown (`null`).
 fn event_message(e: &Event, key: &TurnKey) -> Option<Message> {
     match e.kind.as_str() {
+        // A message with only attachments has no text: nothing for the
+        // model, and its files are never sent as a prompt.
+        kind::MESSAGE if e.text.trim().is_empty() => None,
         kind::MESSAGE | kind::THREAD => Some(user_turn(e, key)),
         kind::AGENT => Some(Message::assistant(e.text.clone())),
         _ => None,
@@ -1148,7 +1151,19 @@ mod tests {
             audience: "agent".to_owned(),
             activity: None,
             created_at,
+            attachments: Vec::new(),
         }
+    }
+
+    #[test]
+    fn a_message_without_text_is_not_model_history() {
+        let key = TurnKey::new();
+        let events = vec![
+            event(kind::MESSAGE, "", None),
+            event(kind::MESSAGE, "  ", None),
+            event(kind::MESSAGE, "hello", None),
+        ];
+        assert_eq!(history(&events, &key).len(), 1);
     }
 
     fn texts(m: &Message) -> Vec<String> {

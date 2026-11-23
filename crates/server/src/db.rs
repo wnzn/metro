@@ -103,6 +103,11 @@ pub struct Event {
     /// suffix, or `null`. Only the server sets it; ordering stays by `id`.
     #[serde(serialize_with = "serialize_event_time")]
     pub created_at: Option<i64>,
+    /// Library files attached to a person's message, as the reader may see
+    /// them now (see [`crate::attachments`]). Absent when there are none,
+    /// and never filled in for the agent's history.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<crate::attachments::Attachment>,
 }
 
 /// Earliest stored `created_at` taken as a real time: 2000-01-01T00:00:00Z
@@ -418,6 +423,8 @@ impl Db {
         crate::search::init(&conn)?;
         crate::schedules::init(&conn)?;
         crate::library::init(&conn)?;
+        // References library_assets; its links go when a file is deleted.
+        crate::attachments::init(&conn)?;
         // References library_assets, so it comes after it.
         crate::library_search::init(&conn)?;
         let version: Option<String> = conn
@@ -1138,6 +1145,7 @@ fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
             .get::<_, Option<String>>(7)?
             .and_then(|a| serde_json::from_str(&a).ok()),
         created_at: r.get::<_, Option<i64>>(8)?.and_then(event_time),
+        attachments: Vec::new(),
     })
 }
 
@@ -1229,7 +1237,7 @@ fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-fn new_event(
+pub(crate) fn new_event(
     id: i64,
     kind: &str,
     author: &Author,
@@ -1248,6 +1256,7 @@ fn new_event(
         audience: addressed.audience.clone(),
         activity: activity.cloned(),
         created_at: event_time(created_at_ms),
+        attachments: Vec::new(),
     }
 }
 

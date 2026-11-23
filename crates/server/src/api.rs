@@ -15,6 +15,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::agent::{start_personal_run, start_room_run, stop_runs_of};
+use crate::attachments::{self, Append, IdsError, Place};
 use crate::auth::{Human, Runner, RunnerCredential, new_runner_token, runner_token_hash, valid_id};
 use crate::db::reactions::{ReactionScope, Reactor, valid_emoji};
 use crate::db::{
@@ -151,6 +152,43 @@ fn check_text(state: &AppState, text: &str) -> ApiResult<String> {
         )));
     }
     Ok(text)
+}
+
+/// A message's text and attachments checked together: the text may be
+/// empty only when files are attached, and the ids must be distinct, at
+/// most [`attachments::MAX_ATTACHMENTS`], and shaped like library ids.
+fn check_message(state: &AppState, text: &str, asset_ids: &[String]) -> ApiResult<String> {
+    match attachments::check_ids(asset_ids) {
+        Ok(()) => {}
+        Err(IdsError::TooMany) => {
+            return Err(ApiError::bad_request(format!(
+                "a message can attach at most {} files",
+                attachments::MAX_ATTACHMENTS
+            )));
+        }
+        Err(IdsError::Duplicate) => {
+            return Err(ApiError::bad_request("asset_ids must not repeat a file"));
+        }
+        Err(IdsError::Unknown) => return Err(no_attachment()),
+    }
+    if asset_ids.is_empty() || !text.trim().is_empty() {
+        return check_text(state, text);
+    }
+    Ok(String::new())
+}
+
+fn no_attachment() -> ApiError {
+    ApiError::not_found("no such attachment")
+}
+
+/// Attachments are for people: a message for the agent needs words.
+fn agent_needs_text(text: &str, addressing: Addressing) -> ApiResult<()> {
+    if text.is_empty() && addressing == Addressing::Agent {
+        return Err(ApiError::bad_request(
+            "a message for the agent needs a question; the agent does not read attachments",
+        ));
+    }
+    Ok(())
 }
 
 fn addressed(resolved: &[Mention]) -> Addressed {
@@ -453,7 +491,13 @@ pub async fn list_events(
     let room = room_of(&state, &space, &rid).await?;
     let page = state.config.limits.events_page;
     let events = db(&state, move |db| {
-        db.events_after(&space.id, &room.id, after, page)
+        let mut events = db.events_after(&space.id, &room.id, after, page)?;
+        let place = Place::Space {
+            space_id: space.id,
+            room_id: room.id,
+        };
+        attachments::hydrate(db, &who.id, &place, &mut events)?;
+        Ok(events)
     })
     .await?;
     Ok(Json(json!({"events": events})))
@@ -472,6 +516,9 @@ pub struct PostMessage {
     /// organization. Never falls back.
     #[serde(default)]
     provider_connection_id: Option<String>,
+    /// Library files of this Space to attach (see [`crate::attachments`]).
+    #[serde(default)]
+    asset_ids: Vec<String>,
 }
 
 /// A model chosen for one turn, checked before anything is stored so a bad
@@ -533,6 +580,8 @@ async fn dispatch_of(
             .map_err(ApiError::internal)
     };
     Ok(match addressing {
+        // Attachments alone are ordinary conversation: never classified.
+        Addressing::Unaddressed if text.is_empty() => (addressed(resolved), None),
         Addressing::PeopleOnly => (addressed(resolved), None),
         Addressing::Agent => (
             addressed(resolved),
@@ -561,7 +610,7 @@ pub async fn post_message(
     let Json(body) = body?;
     let space = member_of(&state, &sid, &who).await?;
     let room = room_of(&state, &space, &rid).await?;
-    let text = check_text(&state, &body.text)?;
+    let text = check_message(&state, &body.text, &body.asset_ids)?;
     let space_id = space.id.clone();
     let member_ids: Vec<String> = db(&state, move |db| db.list_members(&space_id))
         .await?
@@ -571,6 +620,7 @@ pub async fn post_message(
     let resolved = mentions::resolve(&text, &body.mentions, body.invoke_agent, &member_ids)
         .map_err(ApiError::bad_request)?;
     let addressing = Addressing::of(&resolved);
+    agent_needs_text(&text, addressing)?;
     let chosen = check_choice(
         &state,
         &who,
@@ -582,7 +632,7 @@ pub async fn post_message(
     let (addressed, turn) =
         dispatch_of(&state, &who, Some(&space.id), &text, &resolved, addressing).await?;
     let author = who.author();
-    let event = {
+    let event = if body.asset_ids.is_empty() {
         let (sid, rid, author, text) = (
             space.id.clone(),
             room.id.clone(),
@@ -593,6 +643,21 @@ pub async fn post_message(
             db.append_event(&sid, &rid, kind::MESSAGE, &author, &text, &addressed)
         })
         .await?
+    } else {
+        let place = Place::Space {
+            space_id: space.id.clone(),
+            room_id: room.id.clone(),
+        };
+        let (author, text, ids) = (author.clone(), text.clone(), body.asset_ids);
+        match db(&state, move |db| {
+            attachments::append_message(db, &place, &author, &text, &addressed, &ids)
+        })
+        .await?
+        {
+            Append::Posted(event) => *event,
+            Append::NoRoom => return Err(ApiError::not_found("no such room")),
+            Append::NoAsset => return Err(no_attachment()),
+        }
     };
     // Mentioning only people never starts agent work.
     let Some((addressed_by, settings)) = turn else {
@@ -800,7 +865,15 @@ pub async fn chat_events(
 ) -> ApiResult<Json<serde_json::Value>> {
     let after = after_cursor(query)?;
     let page = state.config.limits.events_page;
-    let events = db(&state, move |db| db.personal_after(&who.id, after, page)).await?;
+    let events = db(&state, move |db| {
+        let mut events = db.personal_after(&who.id, after, page)?;
+        let place = Place::Personal {
+            user_id: who.id.clone(),
+        };
+        attachments::hydrate(db, &who.id, &place, &mut events)?;
+        Ok(events)
+    })
+    .await?;
     Ok(Json(json!({"events": events})))
 }
 
@@ -814,6 +887,9 @@ pub struct ChatMessage {
     /// their default. Never falls back to the default or the server model.
     #[serde(default)]
     provider_connection_id: Option<String>,
+    /// The sender's own personal library files to attach.
+    #[serde(default)]
+    asset_ids: Vec<String>,
 }
 
 pub async fn chat_message(
@@ -822,18 +898,32 @@ pub async fn chat_message(
     body: JsonBody<ChatMessage>,
 ) -> ApiResult<(StatusCode, Json<Event>)> {
     let Json(body) = body?;
-    let text = check_text(&state, &body.text)?;
+    let text = check_message(&state, &body.text, &body.asset_ids)?;
     // Personal Chat has no other members: only `@agent` or the flag resolve.
     let resolved =
         mentions::resolve(&text, &[], body.invoke_agent, &[]).map_err(ApiError::bad_request)?;
     let addressing = Addressing::of(&resolved);
+    agent_needs_text(&text, addressing)?;
     let chosen = check_choice(&state, &who, None, body.provider_connection_id, addressing).await?;
     let (addressed, turn) = dispatch_of(&state, &who, None, &text, &resolved, addressing).await?;
     let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
-    let event = db(&state, move |db| {
-        db.append_personal(&uid, kind::MESSAGE, &author, &stored, &addressed)
-    })
-    .await?;
+    let event = if body.asset_ids.is_empty() {
+        db(&state, move |db| {
+            db.append_personal(&uid, kind::MESSAGE, &author, &stored, &addressed)
+        })
+        .await?
+    } else {
+        let ids = body.asset_ids;
+        let place = Place::Personal { user_id: uid };
+        match db(&state, move |db| {
+            attachments::append_message(db, &place, &author, &stored, &addressed, &ids)
+        })
+        .await?
+        {
+            Append::Posted(event) => *event,
+            Append::NoRoom | Append::NoAsset => return Err(no_attachment()),
+        }
+    };
     if let Some((addressed_by, settings)) = turn {
         // With a choice: only that connection. Otherwise routing, if the
         // sender turned it on, or their default; a connection that cannot

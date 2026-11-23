@@ -7,6 +7,7 @@
 pub mod admin_users;
 pub mod agent;
 pub mod api;
+pub mod attachments;
 pub mod auth;
 pub mod config;
 pub mod db;

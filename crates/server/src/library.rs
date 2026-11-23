@@ -445,7 +445,7 @@ fn scope_of(scope: WireScope, space_id: Option<String>) -> Result<Scope, ApiErro
 }
 
 /// Asset ids are server-made UUIDs; anything else cannot exist.
-fn plausible_id(id: &str) -> bool {
+pub(crate) fn plausible_id(id: &str) -> bool {
     id.len() == 36 && id.bytes().all(|b| b.is_ascii_hexdigit() || b == b'-')
 }
 
