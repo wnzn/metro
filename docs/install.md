@@ -58,9 +58,11 @@ sh install-metro-linux.sh check-deps [--install-deps]
 
 ## Desktop on Windows (`install-metro-windows.ps1`)
 
-```powershell
-powershell -ExecutionPolicy Bypass -File install-metro-windows.ps1 -Action Install -Archive .\Metro-<version>-windows-x64.zip
-```
+Until a signed Windows installer is released, the supported Windows path is
+the portable ZIP ([desktop README](../apps/desktop/README.md#windows-portable-package)).
+This script is in the source but unsigned, so Windows PowerShell's
+execution policy may refuse to run it. Don't weaken or bypass your
+execution policy for Metro.
 
 - Actions: `Install`, `Update`, `Uninstall`, `Status`, `Verify`. Options:
   `-Sha256`, `-ChecksumFile`, `-NoLocalRunner`, `-LocalRunner`,
