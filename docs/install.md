@@ -225,13 +225,72 @@ native runner with `METRO_SANDBOX=docker` ([runner.md](runner.md)).
 
 ## Official releases
 
-**Pending.** Tagged CI releases of the Windows, macOS and Linux desktop
-apps, the runner archive and the server and runner images on GHCR are
-planned. Signing and the container publishing workflows are still being
-finished separately. This section will give the exact tag-release steps,
-file names, image names and verification once a release has actually been
-built and published. Until then, no hosted build or published image exists,
-and the names elsewhere in these docs are targets.
+> **Nothing has been released or signed yet.** The tag pipeline below is
+> in the source (`7bd4c19`, `ad93ac9`, `87396c4`, `0d27e9a`) and has only
+> passed local contract tests. It has never run with real credentials. The
+> Windows MSI tools aren't committed yet, so the MSI isn't final and the
+> portable ZIP stays the Windows path for now.
+
+A release is drafted only after every gate passes, and a person publishes
+the draft. A prerelease is never marked latest, and images have no
+`latest` tag.
+
+**Files** (release targets, for version `X.Y.Z`): the desktop archives
+`Metro-X.Y.Z-linux-x64.tar.gz`, `Metro-X.Y.Z-windows-x64.zip`,
+`Metro-X.Y.Z-macos-arm64.tar.gz` and `Metro-X.Y.Z-macos-x64.tar.gz`, each
+with `metro-tui` inside; `Metro-X.Y.Z-windows-x64.msi`; the runner archive
+`Metro-runner-X.Y.Z-linux-x64.tar.gz`; a `.sha256` beside each archive and
+the MSI; the six installer scripts; `SHA256SUMS`, which lists them all; and
+`IMAGES.txt`.
+
+A file named `…windows-x64.unsigned-preview.msi`, or a ZIP whose
+`RELEASE.json` says `unsigned-preview`, comes from a pull-request or `main`
+build. It's unsigned and never part of a release.
+
+### Check a download
+
+1. **The checksum list is signed.** `SHA256SUMS` comes with
+   `SHA256SUMS.sigstore.json` (the two Linux archives have their own
+   `.sigstore.json` too). Verify it with
+   [cosign](https://docs.sigstore.dev/cosign/system_config/installation/):
+
+   ```sh
+   cosign verify-blob --bundle SHA256SUMS.sigstore.json \
+     --certificate-identity 'https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/tags/vX.Y.Z' \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com SHA256SUMS
+   sha256sum -c --ignore-missing SHA256SUMS
+   ```
+
+   The repository's `packaging/release-signatures/release_signatures.py
+   verify-file --version X.Y.Z SHA256SUMS` runs the same check and also
+   checks the certificate's repository, tag and workflow fields.
+2. **Windows.** Right-click the MSI or `Metro.exe` → **Properties → Digital
+   Signatures**. The signer must be the publisher named in the release
+   notes, with a timestamp. Or, in PowerShell,
+   `Get-AuthenticodeSignature .\Metro-X.Y.Z-windows-x64.msi` should say
+   `Valid` with that publisher. The publisher isn't known yet: it's the
+   validated name on the certificate the maintainers obtain. Release copies
+   of the two PowerShell scripts are signed, so a policy that requires
+   signed scripts (`RemoteSigned` or `AllSigned`) can run them; don't
+   bypass your execution policy for Metro. SmartScreen may still warn about a new
+   publisher until it builds reputation, which signing alone doesn't
+   guarantee.
+3. **macOS.** Release builds are Developer ID signed, notarized and
+   stapled. `install-metro-macos.sh` refuses a release archive without the
+   stapled ticket and Gatekeeper's acceptance.
+4. **Images.** `IMAGES.txt` lists each image by digest:
+   `ghcr.io/wnzn/metro-server` and `ghcr.io/wnzn/metro-runner` for
+   `linux/amd64` and `linux/arm64`, and the optional media image
+   `ghcr.io/wnzn/metro-embeddinggemma2` for `linux/amd64` only. There are no
+   macOS or Windows containers. Pull by digest, and verify with:
+
+   ```sh
+   cosign verify \
+     --certificate-identity 'https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/tags/vX.Y.Z' \
+     --certificate-oidc-issuer https://token.actions.githubusercontent.com 'ghcr.io/wnzn/metro-server:vX.Y.Z@sha256:…'
+   ```
+
+Operators setting up signing: [deploy.md](deploy.md#ci-and-publishing).
 
 ## Troubleshooting and help
 

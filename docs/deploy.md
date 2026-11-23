@@ -185,11 +185,43 @@ images to the
 Publishing hasn't run yet; the first tagged release will be its first real
 run. What CI has verified so far is in [acceptance.md](acceptance.md).
 
-Tagged releases of the Windows, macOS and Linux desktop apps and the GHCR
-images are planned, with signing and image publishing being finished
-separately. Exact tag-release steps, names and verification will be added
-here and in [install.md](install.md#official-releases) once a release has
-actually been published. Until then, nothing here describes a hosted build.
+### Tagged releases (in the source; never run with real credentials)
+
+A pushed, **protected** `v*` tag runs `release.yml`, then
+`release-publish.yml`: Windows signing, the release set, the GHCR images,
+Sigstore signatures, then a **draft** release that a person publishes. Every
+signing, push and publication job checks `github.ref_protected`. Users'
+verification steps are in [install.md](install.md#official-releases).
+
+Before the first tag, a maintainer sets up:
+
+- **A tag ruleset** protecting `v*` (restricted creation, no update or
+  deletion).
+- **macOS:** the five repository secrets listed in
+  [packaging/README.md](../packaging/README.md#release-signing-tags-only)
+  (Developer ID `.p12` and its password, and the App Store Connect notary
+  key ID, issuer ID and `.p8`), plus the optional `MACOS_SIGNING_TEAM_ID`
+  variable. A tag without them fails.
+- **Windows:** the `windows-release-signing` environment (deployment limited
+  to `v*` tags; reviewers recommended) and repository variables including
+  `METRO_WINDOWS_SIGNING_BACKEND` and `METRO_WINDOWS_PUBLISHER_CN` (plus the
+  optional `METRO_WINDOWS_PUBLISHER_ORG`), set to the name exactly as the
+  issued certificate shows it. There are two backends:
+  - `azure`: Azure Artifact Signing with a **Public Trust** profile, over
+    GitHub OIDC, with no stored secret. Microsoft's identity validation and
+    eligibility depend on the publisher's country and entity type, so check
+    it before choosing it (for example, from the Philippines); don't assume
+    it's available.
+  - `kms`: a certificate from a public CA whose key stays in an HSM or KSP,
+    on a restricted self-hosted runner.
+
+  Details are in
+  [packaging/windows-signing/README.md](../packaging/windows-signing/README.md#repository-setup-for-official-releases).
+- **Images and Sigstore** need no secret: they use the workflow's own GitHub
+  token and OIDC identity.
+
+Never paste a key, certificate, password or token into chat, an issue or a
+log. Enter them only in GitHub's secret and variable settings.
 
 ## Trust boundaries
 
