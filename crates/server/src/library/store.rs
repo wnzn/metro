@@ -198,54 +198,53 @@ pub fn page(
 /// Newest-first assets `user` may read now whose name contains `pattern`
 /// (a `LIKE` pattern with `\` as its escape), of one of `kinds` when given,
 /// at most `limit`. Visibility and current membership are in the same
-/// statement as the rows. Never reads blobs.
+/// statement as the rows, and so is `excluded`: a name containing any of
+/// them never matches (it is left out before `LIMIT`, so it never hides
+/// another name). Runs on a connection the caller already holds, so it can
+/// share one lock with other reads. Never reads blobs.
 pub fn find_by_name(
-    db: &Db,
+    conn: &Connection,
     user: &str,
     scope: &Scope,
     pattern: &str,
     kinds: Option<&[AssetKind]>,
+    excluded: &[&str],
     limit: usize,
 ) -> anyhow::Result<Vec<Asset>> {
-    let conn = db.lock();
+    // Every scope names `:space`: the Space for one Space, NULL otherwise.
+    let visible = format!("{} AND :space IS NULL", VISIBLE.replace("?1", ":user"));
     let filter = match scope {
-        Scope::Personal => "a.space_id IS NULL AND a.uploader_id = ?1",
+        Scope::Personal => "a.space_id IS NULL AND a.uploader_id = :user AND :space IS NULL",
         Scope::Space(_) => {
-            "a.space_id = ?2 AND EXISTS (SELECT 1 FROM space_members m
-                 WHERE m.space_id = a.space_id AND m.user_id = ?1)"
+            "a.space_id = :space AND EXISTS (SELECT 1 FROM space_members m
+                 WHERE m.space_id = a.space_id AND m.user_id = :user)"
         }
-        Scope::All => VISIBLE,
+        Scope::All => visible.as_str(),
     };
-    // At most four kinds per category; unused slots stay NULL and match
-    // nothing. No kinds at all (`?5` NULL): every kind.
-    let mut slots: [Option<&str>; 4] = [None; 4];
-    if let Some(kinds) = kinds {
-        for (slot, k) in slots.iter_mut().zip(kinds) {
-            *slot = Some(k.as_str());
-        }
-    }
     let sql = format!(
         "SELECT {COLUMNS} FROM library_assets a
-         WHERE ({filter}) AND a.name LIKE ?3 ESCAPE '\\'
-           AND (?5 IS NULL OR a.kind IN (?5, ?6, ?7, ?8))
-         ORDER BY a.created_at DESC, a.seq DESC LIMIT ?4"
+         WHERE ({filter}) AND a.name LIKE :pattern ESCAPE '\\'
+           AND (:kinds IS NULL OR a.kind IN (SELECT value FROM json_each(:kinds)))
+           AND NOT EXISTS (SELECT 1 FROM json_each(:excluded) x WHERE instr(a.name, x.value) > 0)
+         ORDER BY a.created_at DESC, a.seq DESC LIMIT :limit"
     );
     let space = match scope {
         Scope::Space(sid) => Some(sid.as_str()),
         _ => None,
     };
+    let kinds = kinds
+        .map(|ks| serde_json::json!(ks.iter().map(|k| k.as_str()).collect::<Vec<_>>()).to_string());
+    let excluded = serde_json::json!(excluded).to_string();
     let mut stmt = conn.prepare_cached(&sql)?;
     let rows = stmt.query_map(
-        params![
-            user,
-            space,
-            pattern,
-            limit as i64,
-            slots[0],
-            slots[1],
-            slots[2],
-            slots[3]
-        ],
+        rusqlite::named_params! {
+            ":user": user,
+            ":space": space,
+            ":pattern": pattern,
+            ":kinds": kinds,
+            ":excluded": excluded,
+            ":limit": limit as i64,
+        },
         row_asset,
     )?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)

@@ -639,3 +639,65 @@ async fn results_are_capped_shared_newest_first_and_clipped() {
     );
     assert!(first.chars().count() <= 162, "{}", first.chars().count());
 }
+
+#[tokio::test]
+async fn unrelated_traffic_never_pushes_a_callers_messages_out_of_reach() {
+    let app = app().await;
+    let acme = app.space("alice", "Acme", &[]).await;
+    let busy = app.space("carol", "Busy", &[]).await;
+    app.chat("alice", "quince in alice's chat").await;
+    app.say("alice", &acme, "lobby", "quince in the lobby")
+        .await;
+    // Millions of other people's events later (an id gap far beyond any window).
+    {
+        let conn = rusqlite::Connection::open(&app.db_path).unwrap();
+        let n = conn
+            .execute(
+                "UPDATE sqlite_sequence SET seq = seq + 5000000
+                 WHERE name IN ('personal_events', 'space_events')",
+                [],
+            )
+            .unwrap();
+        assert_eq!(n, 2);
+    }
+    app.chat("carol", "quince elsewhere").await;
+    app.say("carol", &busy, "lobby", "quince elsewhere").await;
+    let mut got = texts(&app.quick("alice", all("quince")).await);
+    got.sort();
+    assert_eq!(got, ["quince in alice's chat", "quince in the lobby"]);
+    let space = app
+        .quick(
+            "alice",
+            json!({"query": "quince", "scope": "space", "space_id": acme, "mode": "conversations"}),
+        )
+        .await;
+    assert_eq!(texts(&space), ["quince in the lobby"]);
+}
+
+#[tokio::test]
+async fn credential_like_names_never_hide_an_older_valid_file() {
+    let app = app().await;
+    app.upload(
+        "alice",
+        "scope=personal&name=report-final.txt",
+        "text/plain",
+        b"ok",
+    )
+    .await;
+    for i in 0..20 {
+        app.upload(
+            "alice",
+            &format!("scope=personal&name=report-metro_rt_{i}.txt"),
+            "text/plain",
+            b"x",
+        )
+        .await;
+    }
+    let v = app
+        .quick(
+            "alice",
+            json!({"query": "report", "scope": "all", "mode": "library"}),
+        )
+        .await;
+    assert_eq!(names(&v), ["report-final.txt"]);
+}

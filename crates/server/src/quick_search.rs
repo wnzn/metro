@@ -12,8 +12,16 @@
 //! Nothing is embedded, indexed, sent to a model or cached; no file bytes
 //! are read. Every row's visibility (the caller's own Chat or library, or
 //! current Space membership) is checked in the same SQL statement that
-//! returns it. Text carrying a Metro credential prefix is never matched,
-//! so it is excluded before anything is clipped or returned.
+//! returns it, and the whole lookup (the Space check included) runs under
+//! one hold of the database lock, so every row reflects the same moment.
+//! Text or a file name carrying a Metro credential prefix is never matched;
+//! it is left out in SQL, before any limit or clipping.
+//!
+//! Work is bounded per conversation, never by other people's traffic: the
+//! personal Chat and each readable room or thread are searched over their
+//! own [`CONVERSATION_WINDOW`] most recent messages (through the existing
+//! `(user_id, id)` and `(space_id, room_id, id)` indexes), across at most
+//! [`MAX_ROOMS`] readable rooms and threads, the most recently active first.
 //!
 //! Scopes never widen: `chat` is the personal Chat's messages only,
 //! `personal` the personal library only, `space` one Space's rooms, threads
@@ -30,13 +38,12 @@ use axum::http::{HeaderValue, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
-use rusqlite::params;
+use rusqlite::{Connection, named_params};
 use serde::{Deserialize, Serialize};
 
 use crate::AppState;
 use crate::api::ApiError;
 use crate::auth::{DEVICE_TOKEN_PREFIX, Human, RUNNER_TOKEN_PREFIX, valid_id};
-use crate::db::Db;
 use crate::library::{self, Asset, AssetKind};
 
 /// Longest query, in characters.
@@ -49,8 +56,11 @@ pub const MIN_SHARE: usize = MAX_RESULTS / 2;
 pub const SNIPPET_CHARS: usize = 160;
 /// Characters of context kept before the match in a snippet.
 const SNIPPET_LEAD: usize = 60;
-/// Most recent events per table a lookup looks at, newest first.
-pub const SCAN_EVENTS: i64 = 100_000;
+/// Most recent messages a lookup reads in one conversation (the personal
+/// Chat, or one room or thread), newest first.
+pub const CONVERSATION_WINDOW: i64 = 10_000;
+/// Readable rooms and threads one lookup reads, the most recently active first.
+pub const MAX_ROOMS: i64 = 100;
 /// Metro credential prefixes: text containing one never matches.
 /// (`metro_rt_` covers registered runner tokens, `metro_rt_v2_`.)
 pub const CREDENTIAL_PREFIXES: [&str; 3] = [
@@ -220,45 +230,36 @@ pub fn split(messages: usize, assets: usize) -> (usize, usize) {
     (MAX_RESULTS - keep_a, keep_a)
 }
 
-/// The SQL that keeps credential-carrying text out, for column `col`
-/// (parameters `?10`, `?11`, `?12`).
-fn no_credentials(col: &str) -> String {
-    format!("instr({col}, ?10) = 0 AND instr({col}, ?11) = 0 AND instr({col}, ?12) = 0")
+/// The credential prefixes as a JSON array, for `json_each(:excluded)`.
+fn excluded() -> String {
+    serde_json::json!(CREDENTIAL_PREFIXES).to_string()
 }
 
-/// Newest-first personal Chat messages of `user` containing `pattern`.
+/// Newest-first personal Chat messages of `user` containing `pattern`,
+/// among the Chat's [`CONVERSATION_WINDOW`] most recent messages.
 fn chat_messages(
-    db: &Db,
+    conn: &Connection,
     user: &str,
     pattern: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<QuickMessage>> {
-    let conn = db.lock();
-    let sql = format!(
-        "SELECT id, actor, text, created_at FROM personal_events
-         WHERE user_id = ?1 AND kind IN ('message', 'agent')
-           AND id > (SELECT COALESCE(MAX(id), 0) FROM personal_events) - ?4
-           AND text LIKE ?2 ESCAPE '\\' AND {}
-         ORDER BY id DESC LIMIT ?3",
-        no_credentials("text")
-    );
-    let [c1, c2, c3] = CREDENTIAL_PREFIXES;
-    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, actor, text, created_at FROM (
+             SELECT id, actor, text, created_at FROM personal_events
+             WHERE user_id = :user AND kind IN ('message', 'agent')
+             ORDER BY id DESC LIMIT :window)
+         WHERE text LIKE :pattern ESCAPE '\\'
+           AND NOT EXISTS (SELECT 1 FROM json_each(:excluded) x WHERE instr(text, x.value) > 0)
+         ORDER BY id DESC LIMIT :limit",
+    )?;
     let rows = stmt.query_map(
-        params![
-            user,
-            pattern,
-            limit as i64,
-            SCAN_EVENTS,
-            None::<i64>,
-            None::<i64>,
-            None::<i64>,
-            None::<i64>,
-            None::<i64>,
-            c1,
-            c2,
-            c3
-        ],
+        named_params! {
+            ":user": user,
+            ":window": CONVERSATION_WINDOW,
+            ":pattern": pattern,
+            ":excluded": excluded(),
+            ":limit": limit as i64,
+        },
         |r| {
             Ok(QuickMessage {
                 space_id: None,
@@ -273,87 +274,118 @@ fn chat_messages(
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// Newest-first messages in rooms and threads of `space` (or of every Space
-/// `user` belongs to, when `None`) containing `pattern`; membership is
-/// checked in the same statement.
-fn space_messages(
-    db: &Db,
+/// The rooms and threads `user` may read now, in `space` or in every Space
+/// they belong to: the [`MAX_ROOMS`] most recently active, deterministic.
+fn readable_rooms(
+    conn: &Connection,
     user: &str,
     space: Option<&str>,
+) -> anyhow::Result<Vec<(String, String)>> {
+    let mut stmt = conn.prepare_cached(
+        "SELECT r.space_id, r.id FROM space_members m
+         JOIN space_rooms r ON r.space_id = m.space_id
+         WHERE m.user_id = :user AND (:space IS NULL OR m.space_id = :space)
+         ORDER BY (SELECT MAX(e.id) FROM space_events e
+                   WHERE e.space_id = r.space_id AND e.room_id = r.id) DESC,
+                  r.space_id, r.id
+         LIMIT :max_rooms",
+    )?;
+    let rows = stmt.query_map(
+        named_params! { ":user": user, ":space": space, ":max_rooms": MAX_ROOMS },
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )?;
+    Ok(rows.collect::<Result<Vec<_>, _>>()?)
+}
+
+/// Newest-first messages of one room or thread containing `pattern`, among
+/// its [`CONVERSATION_WINDOW`] most recent messages; membership is checked
+/// again in the same statement.
+fn room_messages(
+    conn: &Connection,
+    user: &str,
+    space: &str,
+    room: &str,
     pattern: &str,
     limit: usize,
 ) -> anyhow::Result<Vec<QuickMessage>> {
-    let conn = db.lock();
-    let which = if space.is_some() {
-        "e.space_id = ?5 AND EXISTS (SELECT 1 FROM space_members m
-             WHERE m.space_id = e.space_id AND m.user_id = ?1)"
-    } else {
-        "e.space_id IN (SELECT m.space_id FROM space_members m WHERE m.user_id = ?1)"
-    };
-    let sql = format!(
-        "SELECT e.id, e.space_id, e.room_id, e.actor, e.text, e.created_at FROM space_events e
-         WHERE {which} AND e.kind IN ('message', 'agent')
-           AND e.id > (SELECT COALESCE(MAX(id), 0) FROM space_events) - ?4
-           AND e.text LIKE ?2 ESCAPE '\\' AND {}
-         ORDER BY e.id DESC LIMIT ?3",
-        no_credentials("e.text")
-    );
-    let [c1, c2, c3] = CREDENTIAL_PREFIXES;
-    let mut stmt = conn.prepare_cached(&sql)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, actor, text, created_at FROM (
+             SELECT id, actor, text, created_at FROM space_events
+             WHERE space_id = :space AND room_id = :room AND kind IN ('message', 'agent')
+             ORDER BY id DESC LIMIT :window)
+         WHERE text LIKE :pattern ESCAPE '\\'
+           AND NOT EXISTS (SELECT 1 FROM json_each(:excluded) x WHERE instr(text, x.value) > 0)
+           AND EXISTS (SELECT 1 FROM space_members m WHERE m.space_id = :space AND m.user_id = :user)
+         ORDER BY id DESC LIMIT :limit",
+    )?;
     let rows = stmt.query_map(
-        params![
-            user,
-            pattern,
-            limit as i64,
-            SCAN_EVENTS,
-            space,
-            None::<i64>,
-            None::<i64>,
-            None::<i64>,
-            None::<i64>,
-            c1,
-            c2,
-            c3
-        ],
+        named_params! {
+            ":user": user,
+            ":space": space,
+            ":room": room,
+            ":window": CONVERSATION_WINDOW,
+            ":pattern": pattern,
+            ":excluded": excluded(),
+            ":limit": limit as i64,
+        },
         |r| {
             Ok(QuickMessage {
+                space_id: Some(space.to_owned()),
+                room_id: Some(room.to_owned()),
                 event_id: r.get(0)?,
-                space_id: Some(r.get(1)?),
-                room_id: Some(r.get(2)?),
-                actor: r.get(3)?,
-                text: r.get(4)?,
-                created_at: r.get(5)?,
+                actor: r.get(1)?,
+                text: r.get(2)?,
+                created_at: r.get(3)?,
             })
         },
     )?;
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// The lookup itself, inside one `Db::call`.
+/// Whether `user` is a member of `space` now.
+fn is_member(conn: &Connection, user: &str, space: &str) -> anyhow::Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = :space AND user_id = :user)",
+        named_params! { ":space": space, ":user": user },
+        |r| r.get(0),
+    )?)
+}
+
+/// The lookup itself, on a connection held for its whole duration (inside
+/// one `Db::call`), so the Space check and every corpus see one moment.
+/// `None` when `space` names a Space `user` is not a member of now.
 pub fn lookup(
-    db: &Db,
+    conn: &Connection,
     user: &str,
     query: &str,
     scope: Scope,
     space: Option<&str>,
     mode: Mode,
     kind: Option<FileKind>,
-) -> anyhow::Result<QuickResponse> {
+) -> anyhow::Result<Option<QuickResponse>> {
+    if let Some(sid) = space
+        && !is_member(conn, user, sid)?
+    {
+        return Ok(None);
+    }
     let pattern = like_pattern(query);
-    let want_messages = mode != Mode::Library;
-    let want_assets = mode != Mode::Conversations;
 
     let mut messages = Vec::new();
-    if want_messages {
+    if mode != Mode::Library {
         if matches!(scope, Scope::All | Scope::Chat) {
-            messages.extend(chat_messages(db, user, &pattern, MAX_RESULTS)?);
+            messages.extend(chat_messages(conn, user, &pattern, MAX_RESULTS)?);
         }
-        match scope {
-            Scope::All => messages.extend(space_messages(db, user, None, &pattern, MAX_RESULTS)?),
-            Scope::Space => {
-                messages.extend(space_messages(db, user, space, &pattern, MAX_RESULTS)?)
+        if matches!(scope, Scope::All | Scope::Space) {
+            for (sid, rid) in readable_rooms(conn, user, space)? {
+                messages.extend(room_messages(
+                    conn,
+                    user,
+                    &sid,
+                    &rid,
+                    &pattern,
+                    MAX_RESULTS,
+                )?);
             }
-            Scope::Chat | Scope::Personal => {}
         }
         // Chat and Space events are separate id sequences: merge newest
         // first by the time each was written, ties broken by place and id,
@@ -362,13 +394,14 @@ pub fn lookup(
             y.created_at
                 .cmp(&x.created_at)
                 .then_with(|| x.space_id.cmp(&y.space_id))
+                .then_with(|| x.room_id.cmp(&y.room_id))
                 .then_with(|| y.event_id.cmp(&x.event_id))
         });
         messages.truncate(MAX_RESULTS);
     }
 
     let mut assets = Vec::new();
-    if want_assets {
+    if mode != Mode::Conversations {
         let lib_scope = match scope {
             Scope::All => Some(library::Scope::All),
             Scope::Personal => Some(library::Scope::Personal),
@@ -377,17 +410,14 @@ pub fn lookup(
         };
         if let Some(lib_scope) = lib_scope {
             assets = library::find_by_name(
-                db,
+                conn,
                 user,
                 &lib_scope,
                 &pattern,
                 kind.map(FileKind::kinds),
-                MAX_RESULTS + 4,
-            )?
-            .into_iter()
-            .filter(|a| !CREDENTIAL_PREFIXES.iter().any(|p| a.name.contains(p)))
-            .take(MAX_RESULTS)
-            .collect();
+                &CREDENTIAL_PREFIXES,
+                MAX_RESULTS,
+            )?;
         }
     }
 
@@ -397,7 +427,7 @@ pub fn lookup(
     for msg in &mut messages {
         msg.text = snippet(&msg.text, query);
     }
-    Ok(QuickResponse { assets, messages })
+    Ok(Some(QuickResponse { assets, messages }))
 }
 
 async fn quick(
@@ -429,16 +459,19 @@ async fn quick(
     };
     let user = who.id.clone();
     let (scope, mode, kind) = (body.scope, body.mode, body.kind);
+    // One hold of the lock for the Space check and every corpus.
     let result = state
         .db
         .call(move |db| {
-            if let Some(sid) = space.as_deref() {
-                // Outsiders and unknown ids look the same.
-                if db.membership(sid, &user)?.is_none() {
-                    return Ok(None);
-                }
-            }
-            lookup(db, &user, &query, scope, space.as_deref(), mode, kind).map(Some)
+            lookup(
+                &db.lock(),
+                &user,
+                &query,
+                scope,
+                space.as_deref(),
+                mode,
+                kind,
+            )
         })
         .await
         .map_err(ApiError::internal)?

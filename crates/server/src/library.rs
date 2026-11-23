@@ -345,17 +345,28 @@ pub fn enumerate(
 }
 
 /// Newest-first assets readable by `user` now whose name contains the
-/// `LIKE` pattern `pattern` (escape `\`), limited to `kinds` when given.
+/// `LIKE` pattern `pattern` (escape `\`), limited to `kinds` when given;
+/// names containing any of `excluded` never match. Takes a connection the
+/// caller holds (inside `Db::call`), so one lock can cover several reads.
 /// Metadata only: never reads bytes.
 pub fn find_by_name(
-    db: &Db,
+    conn: &rusqlite::Connection,
     user: &str,
     scope: &Scope,
     pattern: &str,
     kinds: Option<&[AssetKind]>,
+    excluded: &[&str],
     limit: usize,
 ) -> anyhow::Result<Vec<Asset>> {
-    store::find_by_name(db, user, scope, pattern, kinds, limit.clamp(1, MAX_PAGE))
+    store::find_by_name(
+        conn,
+        user,
+        scope,
+        pattern,
+        kinds,
+        excluded,
+        limit.clamp(1, MAX_PAGE),
+    )
 }
 
 /// The subset of `ids` that `user` may read right now.
