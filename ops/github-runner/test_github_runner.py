@@ -36,11 +36,27 @@ class Dockerfile(unittest.TestCase):
         nsh = re.search(r"NSH_ARCHIVE_SHA256: ([0-9a-f]{64})", ci).group(1)
         self.assertIn(f"ARG NSH_SHA256={nsh}\n", self.text)
         self.assertIn("ARG NSH_VERSION=v0.6.1\n", self.text)
-        self.assertEqual(self.text.count("sha256sum --check -"), 2)
+        self.assertEqual(self.text.count("sha256sum --check -"), 3)  # runner, NSH, TypeScript
         self.assertIn("URIs: https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/", self.text)
         self.assertIn("Acquire::https::Verify-Peer=true", self.text)
         for weak in ("Verify-Peer=false", "AllowInsecure", "allow-unauthenticated", "trusted=yes", "Check-Valid-Until=false"):
             self.assertNotIn(weak, self.text)
+
+    def test_nsh_check_needs_no_network(self):
+        # nsh 0.6.1 downloads this compiler from npm on first `nsh check` unless
+        # NSH_TSC names one; the job proxy allows GitHub only.
+        self.assertIn("ARG TS_PACKAGE=@typescript/typescript-linux-x64\n", self.text)
+        self.assertIn("ARG TS_VERSION=7.0.2\n", self.text)
+        self.assertIn("ARG TS_INTEGRITY=sha512-EYdf2cNg7rgCWJnxCdJ+F3V39O8ihb37eHAu1LK8oAFizgTQbPOK7zHHXbPt8rX24COqODXeI3sIf0fCXG7H/A==\n",
+                      self.text)
+        self.assertIn("ARG TS_SHA256=7ecad6f67377e831856367ab062ef394f21506a611405bf8ac0ff039348637d3\n", self.text)
+        self.assertIn('echo "${TS_SHA256}  /tmp/ts.tgz" | sha256sum --check -', self.text)
+        self.assertIn('= "$TS_INTEGRITY"', self.text)
+        self.assertIn("NSH_TSC=/opt/typescript/lib/tsc", self.text)
+        self.assertIn("test -s /opt/typescript/LICENSE && test -s /opt/typescript/NOTICE.txt", self.text)
+        self.assertIn('RUN --network=none test -z "$(ls -A /home/runner)" && "$NSH_TSC" --version', self.text)
+        self.assertNotIn("NSH_CACHE", self.text)
+        self.assertNotIn("registry.npmjs.org", (HERE / "compose.yaml").read_text())
 
     def test_nsh_is_first_on_path_for_the_self_hosted_workflow(self):
         # .github/workflows/self-hosted-ci.yml resolves `nsh` from PATH and checks its hash.

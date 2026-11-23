@@ -33,6 +33,14 @@ ARG RUNNER_SHA256=baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c
 # Longbridge Native Shell, the same pin as .github/workflows/ci.yml.
 ARG NSH_VERSION=v0.6.1
 ARG NSH_SHA256=9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070
+# The TypeScript 7 compiler NSH v0.6.1 pins for `nsh check`. On first use, nsh
+# downloads it from npm (a job can't: the proxy allows only GitHub). Its
+# integrity is the one built into nsh 0.6.1 (2f51d86), checked here together
+# with the tarball's SHA-256. NSH_TSC below makes nsh use this copy.
+ARG TS_PACKAGE=@typescript/typescript-linux-x64
+ARG TS_VERSION=7.0.2
+ARG TS_INTEGRITY=sha512-EYdf2cNg7rgCWJnxCdJ+F3V39O8ihb37eHAu1LK8oAFizgTQbPOK7zHHXbPt8rX24COqODXeI3sIf0fCXG7H/A==
+ARG TS_SHA256=7ecad6f67377e831856367ab062ef394f21506a611405bf8ac0ff039348637d3
 
 SHELL ["/bin/bash", "-euo", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
@@ -67,9 +75,15 @@ RUN curl --fail --silent --show-error --location --retry 3 -o /tmp/runner.tgz \
       "https://github.com/longbridge/nsh/releases/download/${NSH_VERSION}/nsh-linux-x86_64.tar.gz" \
  && echo "${NSH_SHA256}  /tmp/nsh.tgz" | sha256sum --check - \
  && tar -xzf /tmp/nsh.tgz -C /opt \
- && rm -f /tmp/runner.tgz /tmp/nsh.tgz \
- && chown -R root:root /opt/actions-runner /opt/nsh \
- && chmod -R go-w /opt/actions-runner /opt/nsh
+ && curl --fail --silent --show-error --location --retry 3 -o /tmp/ts.tgz \
+      "https://registry.npmjs.org/${TS_PACKAGE}/-/${TS_PACKAGE#*/}-${TS_VERSION}.tgz" \
+ && echo "${TS_SHA256}  /tmp/ts.tgz" | sha256sum --check - \
+ && test "$(python3 -I -c 'import base64, hashlib, sys; print("sha512-" + base64.b64encode(hashlib.sha512(open(sys.argv[1], "rb").read()).digest()).decode())' /tmp/ts.tgz)" = "$TS_INTEGRITY" \
+ && mkdir /opt/typescript && tar -xzf /tmp/ts.tgz -C /opt/typescript --strip-components=1 --no-same-owner \
+ && test -x /opt/typescript/lib/tsc && test -s /opt/typescript/LICENSE && test -s /opt/typescript/NOTICE.txt \
+ && rm -f /tmp/runner.tgz /tmp/nsh.tgz /tmp/ts.tgz \
+ && chown -R root:root /opt/actions-runner /opt/nsh /opt/typescript \
+ && chmod -R go-w /opt/actions-runner /opt/nsh /opt/typescript
 
 # Non-root runner account. /runner is the per-container scratch volume, and
 # /state holds only the registration (.runner and credentials).
@@ -80,8 +94,11 @@ RUN groupadd --gid 1001 runner \
 COPY --chown=root:root --chmod=0755 entrypoint.sh job-started.sh job-completed.sh /opt/metro-runner/
 
 ENV PATH=/opt/nsh/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
-    HOME=/home/runner
+    HOME=/home/runner \
+    NSH_TSC=/opt/typescript/lib/tsc
 USER 1001:1001
+# The compiler works with no network and an empty HOME.
+RUN --network=none test -z "$(ls -A /home/runner)" && "$NSH_TSC" --version && nsh --version
 WORKDIR /home/runner
 ENTRYPOINT ["/opt/metro-runner/entrypoint.sh"]
 CMD ["run"]
