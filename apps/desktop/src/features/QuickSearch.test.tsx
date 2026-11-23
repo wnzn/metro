@@ -103,8 +103,8 @@ test("typing shows loading, then results with the file's own name and extension 
   await app.waitFor(`id:quick-asset:${photo.id}`);
   expect(app.shows(`id:quick-asset:${photo.id} >> text:Roadmap Q3.jpg`)).toBe(true);
   expect(app.shows(`id:quick-asset:${photo.id} >> text:.jpg · Your personal library`)).toBe(true);
-  expect(app.shows(`id:quick-message:${ev.id} >> text:the roadmap review moved to Thursday`)).toBe(true);
-  expect(app.shows(`id:quick-message:${ev.id} >> text:bob · Acme`)).toBe(true);
+  expect(app.shows(`id:quick-message:acme:lobby:${ev.id} >> text:the roadmap review moved to Thursday`)).toBe(true);
+  expect(app.shows(`id:quick-message:acme:lobby:${ev.id} >> text:bob · Acme`)).toBe(true);
   // One lookup, global on the Chat page; no semantic search, no indexing, no model.
   expect(w.q.calls.map((c) => c.body)).toEqual([{ query: "roadmap", scope: "all", mode: "all" }]);
   expect(semantic(w)).toEqual([]);
@@ -126,8 +126,8 @@ test("a message row opens its conversation; a file row opens it in the Library v
   const { photo, ev } = seedRoadmap(w);
   const app = await signIn(w);
   await app.type("id:top-search", "roadmap");
-  await app.waitFor(`id:quick-message:${ev.id}`);
-  await app.press(`id:quick-message:${ev.id}`);
+  await app.waitFor(`id:quick-message:acme:lobby:${ev.id}`);
+  await app.press(`id:quick-message:acme:lobby:${ev.id}`);
   await app.waitFor("text:the roadmap review moved to Thursday");
   await app.waitFor("id:quick-results", { state: "gone" });
   expect(app.shows("text:# lobby")).toBe(true);
@@ -147,7 +147,7 @@ test("More results opens full Search with the query and runs it once; no further
   seedRoadmap(w);
   const app = await signIn(w);
   await app.type("id:top-search", "roadmap");
-  await app.waitFor("id:quick-message:" + w.f.state.events.get("acme/lobby")!.at(-1)!.id);
+  await app.waitFor("id:quick-message:acme:lobby:" + w.f.state.events.get("acme/lobby")!.at(-1)!.id);
   const before = quickCalls(w);
   await app.press("id:quick-more");
   await app.waitFor("id:search-view");
@@ -189,7 +189,7 @@ test("keyboard: Down and Up move through the rows and More; Return opens the hig
 
   await app.keyboard.press("backspace");
   await app.keyboard.press("p");
-  await app.waitFor(`id:quick-message:${ev.id}`);
+  await app.waitFor(`id:quick-message:acme:lobby:${ev.id}`);
   await app.keyboard.press("up"); // wraps to More
   await app.keyboard.press("up");
   await app.keyboard.press("down");
@@ -259,9 +259,9 @@ test("losing a Space drops its results from the open list", async () => {
   const { ev } = seedRoadmap(w);
   const app = await signIn(w);
   await app.type("id:top-search", "roadmap");
-  await app.waitFor(`id:quick-message:${ev.id}`);
+  await app.waitFor(`id:quick-message:acme:lobby:${ev.id}`);
   w.f.state.spaces.get("acme")!.members.delete("alice");
-  await app.waitUntil(() => !app.shows(`id:quick-message:${ev.id}`), { timeout: 15_000 });
+  await app.waitUntil(() => !app.shows(`id:quick-message:acme:lobby:${ev.id}`), { timeout: 15_000 });
   expect(text(app)).not.toContain("the roadmap review moved to Thursday");
 });
 
@@ -338,4 +338,108 @@ test("Down walks a full list of eight to More, which is last", async () => {
   await app.keyboard.press("enter"); // the ninth row: More results
   await app.waitFor("id:search-view");
   await app.waitUntil(() => w.l.log.some((l) => l.path === "/v1/library/search")); // only files: Documents & media
+});
+
+test("a Chat message and a Space message with the same event id are two rows; the global box says files and messages", async () => {
+  const w = quickWorld();
+  w.q.answers.set("same", () => ({
+    assets: [],
+    messages: [
+      { space_id: null, room_id: null, event_id: 5, actor: "alice", text: "same in my Chat" },
+      { space_id: "acme", room_id: "lobby", event_id: 5, actor: "bob", text: "same in Acme" },
+    ],
+  }));
+  const app = await signIn(w);
+  expect(app.shows("label:Search files and messages in your Chat, library and Spaces; Return searches")).toBe(true);
+  expect(app.shows("text:Search files and messages")).toBe(true);
+  await app.type("id:top-search", "same");
+  await app.waitFor("id:quick-message:chat:chat:5");
+  expect(app.shows("id:quick-message:chat:chat:5 >> text:same in my Chat")).toBe(true);
+  expect(app.shows("id:quick-message:acme:lobby:5 >> text:same in Acme")).toBe(true);
+  await app.keyboard.press("escape");
+  // The tabs keep their own names.
+  await app.submit("id:top-search");
+  await app.waitFor("id:search-view");
+  expect(app.shows("label:Search messages in your Chat and Spaces; Return searches")).toBe(true);
+  await app.press("id:nav-library");
+  await app.waitFor("id:library-view");
+  expect(app.shows("label:Search your documents and media; Return searches")).toBe(true);
+});
+
+const libSearches = (w: QW) => w.l.log.filter((l) => l.path === "/v1/library/search" && l.method === "POST").map((l) => JSON.parse(l.body!));
+
+test("the Library page looks where its picker shows, and More and Return search there", async () => {
+  const w = quickWorld();
+  const app = await signIn(w);
+  await app.press("id:nav-library");
+  await app.waitFor("id:library-view");
+
+  // Personal: the quick lookup and More's full search both stay in the personal library.
+  // "Show files from": Everything, Your personal library, then each Space (Acme, Side project).
+  await app.press("id:library-list-scope");
+  await app.keyboard.press("down");
+  await app.keyboard.press("enter");
+  await app.waitUntil(() => w.l.log.some((l) => l.url.endsWith("/v1/library/assets?scope=personal")));
+  await app.type("id:top-search", "plan");
+  await app.waitFor("id:quick-empty");
+  expect(w.q.calls.at(-1)!.body).toEqual({ query: "plan", scope: "personal", mode: "library" });
+  await app.press("id:quick-more");
+  await app.waitFor("id:search-view");
+  await app.waitUntil(() => libSearches(w).length === 1);
+  expect(libSearches(w)[0]).toEqual({ query: "plan", scope: "personal", limit: 10 });
+
+  // A Space: the quick lookup and an unselected Return stay in it.
+  await app.press("id:nav-library");
+  await app.waitFor("id:library-view");
+  await app.press("id:library-list-scope");
+  await app.keyboard.press("down");
+  await app.keyboard.press("enter");
+  await app.waitUntil(() => w.l.log.some((l) => l.url.endsWith("scope=space&space_id=acme")));
+  await app.clear("id:top-search");
+  await app.type("id:top-search", "plan");
+  await app.waitFor("id:quick-empty");
+  expect(w.q.calls.at(-1)!.body).toEqual({ query: "plan", scope: "space", space_id: "acme", mode: "library" });
+  await app.submit("id:top-search");
+  await app.waitFor("id:search-view");
+  await app.waitUntil(() => libSearches(w).length === 2);
+  expect(libSearches(w)[1]).toEqual({ query: "plan", scope: "space", space_id: "acme", limit: 10 });
+});
+
+test("More from the general bar searches everything in its corpus, keeping the query, never an old Space or type filter", async () => {
+  const w = quickWorld();
+  const doc = w.addAsset("alice", null, "budget notes.md", "# budget");
+  w.q.answers.set("budget", () => ({ assets: [w.wireAsset(doc)], messages: [] }));
+  const { ev } = seedRoadmap(w);
+  const app = await signIn(w);
+  // Earlier full searches left narrow filters behind: Side and Images for files, the personal Chat for messages.
+  await app.submit("id:top-search");
+  await app.waitFor("id:search-view");
+  await app.press("id:search-scope:chat");
+  await app.press("id:search-surface:library");
+  await app.press("id:library-search-scope:space:side");
+  await app.press("id:library-search-kind:image");
+  await app.press("id:search-surface:conversations");
+  await app.press("id:nav-chat");
+
+  // Files only: Documents & media, everything, any type.
+  await app.type("id:top-search", "budget");
+  await app.waitFor(`id:quick-asset:${doc.id}`);
+  expect(w.q.calls.at(-1)!.body).toEqual({ query: "budget", scope: "all", mode: "all" });
+  await app.press("id:quick-more");
+  await app.waitFor("id:search-view");
+  await app.waitUntil(() => libSearches(w).length === 1);
+  expect(libSearches(w)[0]).toEqual({ query: "budget", scope: "all", limit: 10 });
+  expect(app.value("id:top-search")).toBe("budget");
+
+  // Files and messages: the box's own mode (back to Conversations), everything.
+  await app.press("id:search-surface:conversations");
+  await app.press("id:nav-chat");
+  await app.clear("id:top-search");
+  await app.type("id:top-search", "roadmap");
+  await app.waitFor(`id:quick-message:acme:lobby:${ev.id}`);
+  await app.press("id:quick-more");
+  await app.waitFor("id:search-view");
+  await app.waitUntil(() => semantic(w).length === 1);
+  expect(semantic(w)[0]!.body).toEqual({ query: "roadmap", scope: "all", limit: 20 });
+  expect(app.value("id:top-search")).toBe("roadmap");
 });

@@ -21,8 +21,9 @@ import type { SearchHit } from "../api/discovery";
 import type { LibraryAsset, MediaKind } from "../api/library";
 import { apiClient, mainPlace, onSessionEnd, openLocation, openPlace, sessionGuard, spaces } from "../store";
 import { failure, statusOf } from "./discovery/access";
-import { runSearch, searchQuery, searchScope } from "./discovery/searchState";
-import { libKind, libQuery, libScope, openAsset, runLibrarySearch, searchSurface } from "./library/libraryState";
+import { runSearch, searchQuery, searchScope, setScope } from "./discovery/searchState";
+import { libKind, libQuery, libScope, listScope, openAsset, runLibrarySearch, searchSurface } from "./library/libraryState";
+import type { LibraryScope } from "./library/libraryState";
 
 /** Where a quick lookup looks. `chat`: the personal Chat; `personal`: the personal library. */
 export type QuickScope = { kind: "all" | "chat" | "personal" } | { kind: "space"; spaceId: string };
@@ -39,14 +40,18 @@ export const QUICK_DEBOUNCE_MS = 220;
 
 export type QuickContext = { mode: QuickMode; scope: QuickScope; kind: MediaKind | null };
 
-/** The page's search: Library and Search keep their own mode and filters; everywhere else looks at everything. */
+const fromLibrary = (s: LibraryScope): QuickScope => (s.kind === "space" ? { kind: "space", spaceId: s.spaceId } : { kind: s.kind });
+
+/**
+ * The page's search. The Library page looks where its "Show files from"
+ * picker shows (`listScope`; it has no type filter). Search keeps its tab's
+ * own scope (and, for Documents & media, type). Everywhere else looks at
+ * everything.
+ */
 export const quickContext = computed<QuickContext>(() => {
   const place = mainPlace();
-  const files = place === "library" || (place === "search" && searchSurface() === "library");
-  if (files) {
-    const s = libScope();
-    return { mode: "library", scope: s.kind === "space" ? { kind: "space", spaceId: s.spaceId } : { kind: s.kind }, kind: libKind() };
-  }
+  if (place === "library") return { mode: "library", scope: fromLibrary(listScope()), kind: null };
+  if (place === "search" && searchSurface() === "library") return { mode: "library", scope: fromLibrary(libScope()), kind: libKind() };
   if (place === "search") {
     const s = searchScope();
     return { mode: "conversations", scope: s.kind === "space" ? { kind: "space", spaceId: s.spaceId } : { kind: s.kind }, kind: null };
@@ -158,9 +163,25 @@ async function lookup(query: string, mine: number) {
   }
 }
 
+let blurTimer: ReturnType<typeof setTimeout> | undefined;
+/** How long the list stays after the field loses the focus, so a press on a row that moved the focus still lands. */
+const BLUR_CLOSE_MS = 150;
+
+/**
+ * The field took or lost the focus. Losing it drops any answer in flight at
+ * once; the list itself closes a moment later (a row press that moved the
+ * focus still opens its row), unless the focus came back.
+ */
 export function quickFocus(focused: boolean) {
   quickFocused.set(focused);
-  if (!focused) quickClose();
+  if (blurTimer) clearTimeout(blurTimer);
+  blurTimer = undefined;
+  if (focused) return;
+  stop();
+  blurTimer = setTimeout(() => {
+    blurTimer = undefined;
+    if (!untracked(quickFocused)) quickClose();
+  }, BLUR_CLOSE_MS);
 }
 
 /** Closes the list (Escape, a press outside, blur): what's in flight is dropped. The query stays. */
@@ -180,10 +201,21 @@ export function quickMove(step: 1 | -1) {
   quickSelected.set(at < 0 ? (step > 0 ? 0 : n - 1) : (at + step + n) % n);
 }
 
-/** The full search, as Return did before: in the page's mode, with its own scope and filters. */
+/**
+ * The full search (Return with no row chosen, or More): in the page's mode.
+ * From the Library page it searches where the page shows (its picker's
+ * scope, no type filter); Search keeps its tab's own scope and filters.
+ */
 export function fullSearch() {
   quickClose();
-  const files = mainPlace() === "library" || searchSurface() === "library";
+  const fromLibraryPage = mainPlace() === "library";
+  const files = fromLibraryPage || searchSurface() === "library";
+  if (fromLibraryPage) {
+    batch(() => {
+      libScope.set(listScope());
+      libKind.set(null);
+    });
+  }
   if (files) searchSurface.set("library");
   if (mainPlace() !== "search") openPlace("search");
   if (!boxQuery().trim()) return;
@@ -191,15 +223,29 @@ export function fullSearch() {
   else void runSearch();
 }
 
-/** More results: full Search with this query. A global lookup that found only files goes to Documents & media. */
+/**
+ * More results: full Search with this query. From the general bar (a global
+ * lookup across everything) it goes to Documents & media when only files
+ * matched, else to the box's own mode, and searches everything there: no
+ * Space, personal or type filter left from an earlier search drops the
+ * matches the list just showed. Library and Search keep theirs.
+ */
 export function quickMore() {
   const state = quickState();
   const query = boxQuery();
-  const fileOnly = quickContext().mode === "all" && state.status === "ready" && state.assets.length > 0 && state.messages.length === 0;
-  if (fileOnly && searchSurface() !== "library") {
+  if (quickContext().mode === "all") {
+    const fileOnly = state.status === "ready" && state.assets.length > 0 && state.messages.length === 0;
+    const files = fileOnly || searchSurface() === "library";
     batch(() => {
-      libQuery.set(query);
-      searchSurface.set("library");
+      if (files) {
+        libQuery.set(query);
+        libScope.set({ kind: "all" });
+        libKind.set(null);
+        searchSurface.set("library");
+      } else {
+        searchQuery.set(query);
+        setScope({ kind: "all" });
+      }
     });
   }
   fullSearch();

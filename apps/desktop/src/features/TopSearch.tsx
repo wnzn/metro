@@ -15,7 +15,7 @@
 //   pass through it.
 
 import { mainPlace } from "../store";
-import { SearchBox, SearchMoreRow, SearchResultGlyph, SearchResultRow, SearchResultStatus } from "../ui";
+import { SearchBox, SearchFileRow, SearchMoreRow, SearchResultGlyph, SearchResultRow, SearchResultStatus } from "../ui";
 import { MAX_QUERY_CHARS, searchQuery, spaceName } from "./discovery/searchState";
 import { QuickAssetPreview } from "./library/QuickAssetPreview";
 import { libQuery, searchSurface } from "./library/libraryState";
@@ -67,12 +67,18 @@ export function TopSearch() {
     else searchQuery.set(text);
     quickEdited(text);
   };
-  const rowID = (row: QuickRow) => (row.kind === "asset" ? `quick-asset:${row.asset.id}` : row.kind === "message" ? `quick-message:${row.message.eventId}` : "quick-more");
+  const mode = () => quickContext().mode;
   return (
     <SearchBox
       testID="top-search"
-      accessibilityLabel={library() ? "Search your documents and media; Return searches" : "Search messages in your Chat and Spaces; Return searches"}
-      placeholder={library() ? "Search documents & media" : "Search messages"}
+      accessibilityLabel={
+        mode() === "all"
+          ? "Search files and messages in your Chat, library and Spaces; Return searches"
+          : mode() === "library"
+            ? "Search your documents and media; Return searches"
+            : "Search messages in your Chat and Spaces; Return searches"
+      }
+      placeholder={mode() === "all" ? "Search files and messages" : mode() === "library" ? "Search documents & media" : "Search messages"}
       value={boxQuery()}
       onChange={change}
       onSubmit={quickSubmit}
@@ -98,6 +104,18 @@ export function TopSearch() {
   );
 }
 
+/**
+ * A row's key and testID. Message ids are per place (the personal Chat and
+ * each Space number their own events), so a message is named by its Space,
+ * room and event: `quick-message:<spaceId|chat>:<roomId|chat>:<eventId>`.
+ */
+export function rowID(row: QuickRow): string {
+  if (row.kind === "asset") return `quick-asset:${row.asset.id}`;
+  if (row.kind === "more") return "quick-more";
+  const m = row.message;
+  return `quick-message:${m.spaceId ?? "chat"}:${m.roomId ?? "chat"}:${m.eventId}`;
+}
+
 function QuickStatusLine() {
   const line = (): { text: string; tone?: "danger"; id: string } | null => {
     const s = quickState();
@@ -117,7 +135,7 @@ function Row(props: { row: QuickRow; index: number; id: string }) {
   if (row.kind === "more") return <SearchMoreRow testID={props.id} label="More results" accessibilityLabel="More results in full Search" selected={selected()} onPress={open} />;
   if (row.kind === "asset") {
     return (
-      <SearchResultRow
+      <SearchFileRow
         testID={props.id}
         preview={<QuickAssetPreview asset={row.asset} />}
         label={row.asset.name}

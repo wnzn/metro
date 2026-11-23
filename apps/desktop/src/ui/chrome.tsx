@@ -643,9 +643,9 @@ export function SearchBox(
 }
 
 /**
- * One quick result: its preview first (a file's thumbnail or type, a
- * message's place), then its name or text, then a quiet line (the file's
- * extension, where it is). Never takes the keyboard focus: the field keeps it.
+ * A quick result for a message: a small glyph of its place beside up to two
+ * lines of its text, then a quiet line (who, where). Never takes the keyboard
+ * focus: the field keeps it.
  */
 export function SearchResultRow(
   props: Testable & {
@@ -662,7 +662,7 @@ export function SearchResultRow(
   return (
     <View
       ref={row}
-      class={cx("flex-row items-center gap-(--space-3) rounded-(--radius-sm) px-(--space-2) py-[6px] hover:bg-muted", transitionClass, props.selected && "bg-accent")}
+      class={cx("flex-row items-start gap-(--space-3) rounded-(--radius-sm) px-(--space-2) py-[6px] hover:bg-muted", transitionClass, props.selected && "bg-accent")}
       focusable={false}
       role="option"
       accessibilityState={{ selected: props.selected }}
@@ -670,15 +670,54 @@ export function SearchResultRow(
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? `${props.label}, ${props.meta}`}
     >
-      <View class="size-[36px] shrink-0 items-center justify-center overflow-hidden rounded-(--radius-sm) bg-muted">{props.preview}</View>
-      <View class="flex-1 min-w-0 flex-col">
-        <Text class={cx(textClass.sm, "font-medium", props.selected ? "text-accent-foreground" : "text-popover-foreground")} style={{ numberOfLines: props.lines ?? 1 }}>
-          {props.label}
-        </Text>
-        <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
-          {props.meta}
-        </Text>
-      </View>
+      <View class="size-[28px] shrink-0 items-center justify-center rounded-(--radius-sm) bg-muted">{props.preview}</View>
+      <ResultText label={props.label} lines={props.lines ?? 1} meta={props.meta} selected={props.selected} />
+    </View>
+  );
+}
+
+/**
+ * A quick result for a file: its preview on top, at its own size and never
+ * clipped (an image or frame, a waveform with its length, a few lines of
+ * text), left-aligned and as wide as the row allows; then the file's name and
+ * a quiet line (its extension, where it is).
+ */
+export function SearchFileRow(
+  props: Testable & {
+    preview: JSX.Element;
+    label: string;
+    meta: string;
+    selected: boolean;
+    onPress: () => void;
+  },
+) {
+  const row = revealWhenSelected(() => props.selected);
+  return (
+    <View
+      ref={row}
+      class={cx("flex-col items-stretch gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-[8px] hover:bg-muted", transitionClass, props.selected && "bg-accent")}
+      focusable={false}
+      role="option"
+      accessibilityState={{ selected: props.selected }}
+      onPress={props.onPress}
+      testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel ?? `${props.label}, ${props.meta}`}
+    >
+      <View class="flex-row items-start justify-start min-w-0 max-w-full">{props.preview}</View>
+      <ResultText label={props.label} lines={1} meta={props.meta} selected={props.selected} />
+    </View>
+  );
+}
+
+function ResultText(props: { label: string; lines: 1 | 2; meta: string; selected: boolean }) {
+  return (
+    <View class="flex-1 min-w-0 flex-col">
+      <Text class={cx(textClass.sm, "font-medium", props.selected ? "text-accent-foreground" : "text-popover-foreground")} style={{ numberOfLines: props.lines }}>
+        {props.label}
+      </Text>
+      <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+        {props.meta}
+      </Text>
     </View>
   );
 }
@@ -702,7 +741,7 @@ function revealWhenSelected(selected: () => boolean): (node: ViewRef) => void {
 
 /** A message's or a place's glyph, as a quick result's preview. */
 export function SearchResultGlyph(props: { icon: IconName }) {
-  return <Icon name={props.icon} color="muted" size={20} />;
+  return <Icon name={props.icon} color="muted" size={16} />;
 }
 
 /** A line in place of results: searching, nothing found, a failure, not available. */
