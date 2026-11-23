@@ -238,7 +238,8 @@ A room's agent can delegate work to **child threads** with the tools
 **Status.** In the current source after 0.2.0 (`797eac1`, with the personal
 scope added in `c5e2753`), covered by the server's automated tests
 (`crates/server/tests/monitoring.rs`). It's in no recorded test cut or
-release yet, and no desktop screen for it is committed.
+release yet. The desktop's **Settings → Monitoring** reads it since
+`5f4463e`, in source only.
 
 The server keeps a short log of things that went wrong, so a Space's owner,
 a person, or an operator can see that something failed without anyone

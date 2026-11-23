@@ -492,7 +492,7 @@ contributors only, in
 - **Metro's own errors on this computer** (current source after 0.2.0:
   `322dc9b`, with Sign in with ChatGPT details from `9144e1c` and
   `38749f3`; covered by automated tests, in no recorded test cut, no
-  real-account run, and no committed screen yet). The packaged app keeps a
+  real-account run). The packaged app keeps a
   short private list of its own failures on this computer: the launcher or
   window failing to start (including exit status 127, usually a missing
   library), the bundled local server stopping, and the device connection
@@ -512,6 +512,12 @@ contributors only, in
     (`~/.config/metro-desktop` on Linux, `%LOCALAPPDATA%\Metro\Desktop` on
     Windows). The app reads it through the launcher's local service, which
     refuses requests without the app's own credential.
+  - Since `5f4463e` (source only; no packaged or native check recorded),
+    **Settings → Monitoring** shows one source at a time, never combined:
+    **This computer** (this list), **Your account on this server** (your
+    personal Chat's events, only you), **Spaces you own** (one Space), and
+    **Organization** for org admins. A server or helper too old to support
+    a source shows it as unsupported, with no fallback.
 - **Asking for help.** Describe what you did and the exact message Metro
   showed. Never send anyone your tokens, keys, sign-in files, `.env` files,
   databases or raw logs, and don't post screenshots that show a token.
