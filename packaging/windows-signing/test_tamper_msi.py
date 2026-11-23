@@ -9,7 +9,6 @@ Installer edit itself and Authenticode's HashMismatch are checked natively in th
 Windows verifier self-test.
 """
 
-import fcntl
 import os
 import re
 from pathlib import Path
@@ -42,14 +41,20 @@ class TamperEditorHandles(unittest.TestCase):
         self.file.write_bytes(b"msi bytes")
 
     def test_exclusive_open_is_required(self):
-        r = self.ps("Assert-MetroFileClosed $env:F 'the tampered MSI'; 'closed'", F=str(self.file))
-        self.assertEqual((r.returncode, r.stdout.strip()), (0, "closed"), r.stderr)
-        with open(self.file, "rb") as held:
-            fcntl.flock(held, fcntl.LOCK_EX)  # another process still has it (exclusively) open
-            r = self.ps("Assert-MetroFileClosed $env:F 'the tampered MSI'; 'closed'", F=str(self.file))
-        self.assertNotEqual(r.returncode, 0)
-        self.assertNotIn("closed", r.stdout)
-        self.assertIn("MetroWindowsSigning: the tampered MSI is still open after its editor exited", r.stderr)
+        # One .NET FileShare.None holder in the same process: the check must fail while
+        # it is open (Windows sharing violation; flock on Unix) and pass once disposed.
+        body = (
+            "$held = [IO.File]::Open($env:F, 'Open', 'Read', 'None'); "
+            "try { try { Assert-MetroFileClosed $env:F 'the tampered MSI'; 'PASSED WHILE HELD' } "
+            "catch { 'refused: ' + $_.Exception.Message } } finally { $held.Dispose() }; "
+            "Assert-MetroFileClosed $env:F 'the tampered MSI'; 'closed after dispose'")
+        r = self.ps(body, F=str(self.file))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        lines = r.stdout.strip().splitlines()
+        self.assertEqual(len(lines), 2, r.stdout)
+        self.assertTrue(lines[0].startswith(
+            "refused: MetroWindowsSigning: the tampered MSI is still open after its editor exited"), lines[0])
+        self.assertEqual(lines[1], "closed after dispose")
 
     def test_child_editor_handles_end_with_the_child(self):
         # The child opens the file exclusively, writes and never disposes the stream:
