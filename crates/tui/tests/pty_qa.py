@@ -173,7 +173,10 @@ class Pty:
 
 def token_file(directory, name, token, mode=0o600):
     path = directory / name
-    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode), "w") as stream:
+    with os.fdopen(os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), "w") as stream:
+        # Synthetic fixtures live in a private temporary directory. Set
+        # the exact test mode on the fd even when the caller uses umask 077.
+        os.fchmod(stream.fileno(), mode)
         stream.write(token + "\n")
     return path
 
@@ -384,6 +387,12 @@ def main(server, tui):
         interrupted.wait("Metro token:")
         interrupted.child.send_signal(signal.SIGINT)
         interrupted.exit(1, screen=False)
+
+        for stopping_signal in (signal.SIGHUP, signal.SIGTERM):
+            stopping = Pty(stack, tui, origin, private, tui_env, deadline, forbidden)
+            stopping.wait("Metro   |   alice")
+            stopping.child.send_signal(stopping_signal)
+            stopping.exit(0)
 
         wrong = Pty(stack, tui, origin, token_file(state, "invalid-token", invalid),
                     tui_env, deadline, forbidden)

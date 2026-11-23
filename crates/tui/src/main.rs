@@ -123,14 +123,29 @@ fn prompt_token(interrupted: &AtomicBool) -> io::Result<String> {
     Err(io::ErrorKind::Interrupted.into())
 }
 
+#[cfg(unix)]
+fn install_interrupt_handlers(flag: &Arc<AtomicBool>) -> io::Result<()> {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+
+    for signal in [SIGINT, SIGHUP, SIGTERM] {
+        signal_hook::flag::register(signal, Arc::clone(flag))?;
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn install_interrupt_handlers(flag: &Arc<AtomicBool>) -> Result<(), ctrlc::Error> {
+    let flag = Arc::clone(flag);
+    ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))
+}
+
 fn run(args: Args) -> Result<(), &'static str> {
     let origin = api::origin(&args.server)?;
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err("An interactive terminal is required (allocate a PTY when using SSH).");
     }
     let interrupted = Arc::new(AtomicBool::new(false));
-    let flag = interrupted.clone();
-    ctrlc::set_handler(move || flag.store(true, Ordering::Relaxed))
+    install_interrupt_handlers(&interrupted)
         .map_err(|_| "Could not install terminal cleanup signal handling.")?;
     let token = match args.token_file {
         Some(path) => token_file(&path)?,
