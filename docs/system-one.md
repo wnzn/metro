@@ -303,17 +303,21 @@ checked in native Linux GTK, in dark and light themes, at `95a3d2b`
   search for anything older.
 - It shows at most 8 suggestions in a scrollable list under the box:
   - a message shows a snippet around the match and where it is;
-  - a file shows its name with its extension, and a small preview that the
-    app reads from the file through your Metro session. The preview is never
-    sent to a model.
-    - Text and Markdown files show an excerpt, and a PNG shows the image.
-    - A WAV shows its real waveform and duration.
-    - A video shows its first frame when the computer has the codec. When it
-      doesn't, the row says to open the file to play it.
+  - a file is one compact row: a small preview tile, its name, at most one
+    short line under it, and its extension as a badge. The app reads the
+    preview from the file through your Metro session, and it's never sent
+    to a model. Files and messages get their own headings when both are
+    listed.
+    - Text and Markdown files show the start of their text, and a PNG shows
+      the image.
+    - A WAV shows its real waveform and its length.
+    - A video shows its first frame when the computer has the codec.
     - MP3 shows its title and artist tags, with no waveform. DOCX shows its
       text where it can be read. These two are covered by automated tests
       only.
-    - PDF shows no preview.
+    - Without a preview, such as for a PDF or a video with no codec, the
+      tile shows the file type's icon. The row's accessible name gives the
+      reason.
 - Where it looks follows the page you're on:
   - in Search, the mode and scope you picked;
   - in Library, files only, from where **Show files from** points. **More

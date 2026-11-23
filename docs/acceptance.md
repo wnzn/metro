@@ -63,6 +63,29 @@ Chat, System One, embeddings and media connections were all configured.
   delivered PNGs listed in `deliver/SHA256SUMS`.
 - The app and server gate logs are in the sibling `checks/` directory.
 
+**Follow-up: compact result rows, `70587cb`.** This followed feedback that
+the rows had too much text and nothing to tell them apart. The results
+above are for `95a3d2b`. At `70587cb`, the project manager checked the
+following natively in NSH/GTK:
+
+- **1200×1000, both themes, the same `mixer` query:**
+  - All six file rows fit together. At `95a3d2b`, four were fully visible.
+  - Each row has one line under its name and an extension badge, instead
+    of repeating the location.
+  - Files and messages are listed separately.
+- **780×560:** Down reached **More results** in the footer, and Return
+  opened full Search.
+- **Model calls:** both typing runs with mixed results made zero model
+  requests.
+- **Tests:** `nsh check` passed. QuickSearch 19/19, QuickPreview 5/5 and the
+  preview-data tests 11/11.
+- **Evidence:**
+  - `dist/ui-review/quick-search/rows/` (`before-after-dark.png`,
+    `before-after-light.png`, `compact-more.png`);
+  - `~/.cache/metro-release/quick-search/row-review/70587cb9b0bf/`.
+- Only the targeted tests above are recorded for `70587cb`. It isn't a
+  release, and nothing was packaged.
+
 ## Staged: desktop UI gate after 0.2.0 (2026-11-23, project manager, local)
 
 A **UI gate** on unreleased source after tag `v0.2.0`, reported by the
