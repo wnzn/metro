@@ -557,28 +557,37 @@ class PrebuiltComposeTests(unittest.TestCase):
     def config(self, **env):
         base = {k: v for k, v in os.environ.items() if not k.startswith("METRO_")}
         return subprocess.run(
-            ["docker", "compose", "-f", "compose.yaml", "-f", "compose.prebuilt.yaml",
+            ["docker", "compose", "--env-file", os.devnull, "-f", "compose.yaml", "-f", "compose.prebuilt.yaml",
              "--profile", "runner", "--profile", "reusable-runner", "config", "--format", "json"],
             cwd=ROOT, env=base | env, capture_output=True, text=True)
 
     def test_versioned_and_pinned_images_replace_builds(self):
-        for env, server, runner in (
-            ({"METRO_VERSION": "1.2.3"}, "ghcr.io/wnzn/metro-server:v1.2.3", "ghcr.io/wnzn/metro-runner:v1.2.3"),
-            ({"METRO_SERVER_IMAGE": "r/s:v1@sha256:" + "a" * 64, "METRO_RUNNER_IMAGE": "r/r:v1@sha256:" + "b" * 64},
+        for mode, env, server, runner in (
+            ("version", {"METRO_VERSION": "1.2.3"}, "ghcr.io/wnzn/metro-server:v1.2.3", "ghcr.io/wnzn/metro-runner:v1.2.3"),
+            ("digest", {"METRO_SERVER_IMAGE": "r/s:v1@sha256:" + "a" * 64, "METRO_RUNNER_IMAGE": "r/r:v1@sha256:" + "b" * 64},
              "r/s:v1@sha256:" + "a" * 64, "r/r:v1@sha256:" + "b" * 64),
         ):
-            proc = self.config(**env)
-            self.assertEqual(proc.returncode, 0, proc.stderr[-400:])
-            services = json.loads(proc.stdout)["services"]
-            self.assertEqual({n: s["image"] for n, s in services.items()},
-                             {"server": server, "runner": runner, "registered-runner": runner})
-            self.assertFalse(any("build" in s for s in services.values()))
-            self.assertNotIn("latest", proc.stdout)
+            with self.subTest(mode=mode):
+                proc = self.config(**env)
+                self.assertEqual(proc.returncode, 0, proc.stderr[-400:])
+                services = json.loads(proc.stdout)["services"]
+                self.assertEqual({n: s["image"] for n, s in services.items()},
+                                 {"server": server, "runner": runner, "registered-runner": runner})
+                for name, service in services.items():
+                    # Absent and JSON null both mean no build; even {} enables default build settings.
+                    self.assertIsNone(service.get("build"), f"{name} still has a build definition")
+                    self.assertEqual(service["pull_policy"], "missing", name)
+                self.assertNotIn("latest", proc.stdout)
 
     def test_refuses_to_guess_a_version(self):
-        proc = self.config()
-        self.assertNotEqual(proc.returncode, 0)
-        self.assertIn("set METRO_VERSION", proc.stderr)
+        for env, missing in (({}, "server|runner|registered-runner"),
+                             ({"METRO_VERSION": ""}, "server|runner|registered-runner"),
+                             ({"METRO_SERVER_IMAGE": "r/s:v1"}, "runner|registered-runner"),
+                             ({"METRO_RUNNER_IMAGE": "r/r:v1"}, "server")):
+            with self.subTest(env=env):
+                proc = self.config(**env)
+                self.assertNotEqual(proc.returncode, 0)
+                self.assertRegex(proc.stderr, rf'service "(?:{missing})" has neither an image nor a build context')
 
 
 if __name__ == "__main__":

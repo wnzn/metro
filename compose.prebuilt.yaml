@@ -6,17 +6,20 @@
 # Images exist for linux/amd64 and linux/arm64. They are not published yet.
 # The prebuilt runner image runs as uid:gid 1000:1000, so METRO_RUNNER_UID/GID
 # have no effect here; a bind-mounted workspace must be writable by 1000:1000.
-x-server-image: &server-image
-  image: "${METRO_SERVER_IMAGE:-ghcr.io/wnzn/metro-server:v${METRO_VERSION:?set METRO_VERSION or METRO_SERVER_IMAGE}}"
-  build: !reset null
-  pull_policy: missing
-
-x-runner-image: &runner-image
-  image: "${METRO_RUNNER_IMAGE:-ghcr.io/wnzn/metro-runner:v${METRO_VERSION:?set METRO_VERSION or METRO_RUNNER_IMAGE}}"
-  build: !reset null
-  pull_policy: missing
-
+#
+# Set a version or supply an explicit image for each service you use. An
+# unset version leaves the fallback empty, so Compose rejects missing images.
+# Keep !reset on each service: Compose 2.38.2 ignores it inside an aliased mapping.
 services:
-  server: *server-image
-  runner: *runner-image
-  registered-runner: *runner-image
+  server:
+    image: "${METRO_SERVER_IMAGE:-${METRO_VERSION:+ghcr.io/wnzn/metro-server:v${METRO_VERSION:-}}}"
+    build: !reset null
+    pull_policy: missing
+  runner:
+    image: &runner-image "${METRO_RUNNER_IMAGE:-${METRO_VERSION:+ghcr.io/wnzn/metro-runner:v${METRO_VERSION:-}}}"
+    build: !reset null
+    pull_policy: missing
+  registered-runner:
+    image: *runner-image
+    build: !reset null
+    pull_policy: missing
