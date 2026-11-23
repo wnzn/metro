@@ -1,0 +1,341 @@
+// Quick results under the top search box, against the shared fake server
+// and the library fixtures, plus a test double of POST /v1/search/quick
+// (crates/server/src/quick_search.rs's wire shape). Answers can be delayed to
+// test late ones. Fake tokens only; headless engine runs.
+
+import { expect, open, test } from "nsh/test";
+import type { App } from "nsh/test";
+import { BASE, header, TOKENS } from "../../test/fakeServer";
+import { libraryWorld } from "./library/test/fixtures";
+
+type Req = { method: string; url: string; headers: unknown; body?: string | null };
+type Wire = { assets: unknown[]; messages: unknown[] };
+
+function quickWorld() {
+  const w = libraryWorld();
+  const q = {
+    calls: [] as { user: string; body: any }[],
+    /** What the next lookups answer, by query (else nothing found). */
+    answers: new Map<string, (user: string) => Wire>(),
+    /** Answers delayed by query (ms of test time), to test late ones; `answered` records when each came back. */
+    delay: new Map<string, number>(),
+    answered: [] as { query: string; at: number }[],
+    /** Answers to these queries wait for `release()`. */
+    hold: new Set<string>(),
+    held: [] as (() => void)[],
+    status: 200,
+  };
+  const userOf = (req: Req) => Object.keys(TOKENS).find((u) => header(req as any, "authorization") === `Bearer ${TOKENS[u]}`) ?? "";
+  const network: Record<string, (req: Req) => unknown> = { ...(w.network as any) };
+  const inner = network[`POST ${BASE}/v1/*`]!;
+  network[`POST ${BASE}/v1/*`] = (req: Req) => {
+    if (new URL(req.url).pathname !== "/v1/search/quick") return inner(req);
+    const body = JSON.parse(req.body ?? "{}");
+    const user = userOf(req);
+    q.calls.push({ user, body });
+    if (q.status !== 200) return { status: q.status, body: { error: "no" } };
+    const answer = () => {
+      q.answered.push({ query: body.query, at: Date.now() });
+      return { status: 200, body: q.answers.get(body.query)?.(user) ?? { assets: [], messages: [] } };
+    };
+    if (q.hold.has(body.query)) return new Promise((resolve) => q.held.push(() => resolve(answer())));
+    const ms = q.delay.get(body.query);
+    if (ms === undefined) return answer();
+    return new Promise((resolve) => setTimeout(() => resolve(answer()), ms));
+  };
+  const wireAsset = (a: any) => {
+    const { bytes: _b, ...rest } = a;
+    return rest;
+  };
+  const release = () => {
+    for (const r of q.held.splice(0)) r();
+  };
+  return { ...w, q, network, wireAsset, release };
+}
+type QW = ReturnType<typeof quickWorld>;
+
+async function signIn(w: QW, user = "alice", app?: App): Promise<App> {
+  const a = app ?? (await open("../../App.tsx", { network: w.network as any, platform: "linux", width: 1280, height: 860 }));
+  await a.clear("id:server-url");
+  await a.type("id:server-url", BASE);
+  await a.type("id:access-token", TOKENS[user]!);
+  await a.press("id:connect");
+  await a.waitFor("id:top-search");
+  return a;
+}
+
+const text = (app: App) => app.texts().join(" | ");
+
+/**
+ * Waits on a condition outside the app's steps. The fake network is served
+ * while a step runs, so a held answer is raced by starting steps without
+ * awaiting them (a long `app.wait` keeps the app running) and polling here.
+ */
+async function poll(cond: () => boolean, ms = 10_000) {
+  const end = Date.now() + ms;
+  while (!cond()) {
+    if (Date.now() > end) throw new Error("condition not reached: " + cond.toString());
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
+const semantic = (w: QW) => w.f.posts().filter((p) => p.path === "/v1/search" || p.path === "/v1/search/index");
+const quickCalls = (w: QW) => w.q.calls.length;
+
+/** A Chat page lookup that finds a personal photo and Bob's message in Acme. */
+function seedRoadmap(w: QW) {
+  const photo = w.addAsset("alice", null, "Roadmap Q3.jpg", "jpeg-bytes");
+  const ev = w.f.post("acme/lobby", { kind: "message", actor: "bob", text: "the roadmap review moved to Thursday" });
+  w.q.answers.set("roadmap", () => ({
+    assets: [w.wireAsset(photo)],
+    messages: [{ space_id: "acme", room_id: "lobby", event_id: ev.id, actor: "bob", text: "the roadmap review moved to Thursday" }],
+  }));
+  return { photo, ev };
+}
+
+test("typing shows loading, then results with the file's own name and extension and the message's text; More is last", async () => {
+  const w = quickWorld();
+  const { photo, ev } = seedRoadmap(w);
+  const app = await signIn(w);
+  w.q.delay.set("roadmap", 600);
+  await app.type("id:top-search", "roadmap");
+  await app.waitFor("id:quick-loading");
+  expect(app.shows("id:quick-more")).toBe(true);
+  await app.waitFor(`id:quick-asset:${photo.id}`);
+  expect(app.shows(`id:quick-asset:${photo.id} >> text:Roadmap Q3.jpg`)).toBe(true);
+  expect(app.shows(`id:quick-asset:${photo.id} >> text:.jpg · Your personal library`)).toBe(true);
+  expect(app.shows(`id:quick-message:${ev.id} >> text:the roadmap review moved to Thursday`)).toBe(true);
+  expect(app.shows(`id:quick-message:${ev.id} >> text:bob · Acme`)).toBe(true);
+  // One lookup, global on the Chat page; no semantic search, no indexing, no model.
+  expect(w.q.calls.map((c) => c.body)).toEqual([{ query: "roadmap", scope: "all", mode: "all" }]);
+  expect(semantic(w)).toEqual([]);
+  expect(app.shows("id:quick-loading")).toBe(false);
+});
+
+test("nothing found says so in place, with More results still last", async () => {
+  const w = quickWorld();
+  const app = await signIn(w);
+  await app.type("id:top-search", "zebra");
+  await app.waitFor("id:quick-empty");
+  expect(text(app)).toContain("No quick matches. Files and messages in everything you can read.");
+  expect(app.shows("id:quick-more")).toBe(true);
+  expect(app.shows("id:search-view")).toBe(false); // not a separate page
+});
+
+test("a message row opens its conversation; a file row opens it in the Library viewer", async () => {
+  const w = quickWorld();
+  const { photo, ev } = seedRoadmap(w);
+  const app = await signIn(w);
+  await app.type("id:top-search", "roadmap");
+  await app.waitFor(`id:quick-message:${ev.id}`);
+  await app.press(`id:quick-message:${ev.id}`);
+  await app.waitFor("text:the roadmap review moved to Thursday");
+  await app.waitFor("id:quick-results", { state: "gone" });
+  expect(app.shows("text:# lobby")).toBe(true);
+
+  await app.clear("id:top-search");
+  await app.type("id:top-search", "roadmap");
+  await app.waitFor(`id:quick-asset:${photo.id}`);
+  await app.press(`id:quick-asset:${photo.id}`);
+  await app.waitFor("id:library-viewer");
+  // The file is read through the authenticated content route, with its access check.
+  expect(w.l.log.some((l) => l.path === `/v1/library/assets/${photo.id}/content` && l.user === "alice")).toBe(true);
+  expect(semantic(w)).toEqual([]);
+});
+
+test("More results opens full Search with the query and runs it once; no further quick lookup", async () => {
+  const w = quickWorld();
+  seedRoadmap(w);
+  const app = await signIn(w);
+  await app.type("id:top-search", "roadmap");
+  await app.waitFor("id:quick-message:" + w.f.state.events.get("acme/lobby")!.at(-1)!.id);
+  const before = quickCalls(w);
+  await app.press("id:quick-more");
+  await app.waitFor("id:search-view");
+  await app.waitUntil(() => semantic(w).length === 1);
+  expect(semantic(w)[0]).toMatchObject({ path: "/v1/search", body: { query: "roadmap", scope: "all" } });
+  expect(quickCalls(w)).toBe(before);
+  expect(app.shows("id:quick-results")).toBe(false);
+  expect(app.value("id:top-search")).toBe("roadmap");
+});
+
+test("a global lookup that found only files opens More in Documents & media, with its own filters", async () => {
+  const w = quickWorld();
+  const doc = w.addAsset("alice", null, "budget notes.md", "# budget");
+  w.q.answers.set("budget", () => ({ assets: [w.wireAsset(doc)], messages: [] }));
+  const app = await signIn(w);
+  await app.type("id:top-search", "budget");
+  await app.waitFor(`id:quick-asset:${doc.id}`);
+  expect(app.shows(`id:quick-asset:${doc.id} >> text:.md · Your personal library`)).toBe(true);
+  await app.press("id:quick-more");
+  await app.waitFor("id:search-view");
+  await app.waitUntil(() => w.l.log.some((l) => l.path === "/v1/library/search"));
+  expect(app.value("id:top-search")).toBe("budget");
+  expect(semantic(w)).toEqual([]); // not message search
+});
+
+test("keyboard: Down and Up move through the rows and More; Return opens the highlighted one; Escape closes; Return with none runs the full search", async () => {
+  const w = quickWorld();
+  const { photo, ev } = seedRoadmap(w);
+  const app = await signIn(w);
+  await app.keyboard.press("mod+k");
+  await app.keyboard.press("r");
+  for (const k of "oadmap") await app.keyboard.press(k);
+  expect(app.value("id:top-search")).toBe("roadmap");
+  await app.waitFor(`id:quick-asset:${photo.id}`);
+
+  await app.keyboard.press("escape");
+  await app.waitFor("id:quick-results", { state: "gone" });
+  expect(app.value("id:top-search")).toBe("roadmap");
+
+  await app.keyboard.press("backspace");
+  await app.keyboard.press("p");
+  await app.waitFor(`id:quick-message:${ev.id}`);
+  await app.keyboard.press("up"); // wraps to More
+  await app.keyboard.press("up");
+  await app.keyboard.press("down");
+  await app.keyboard.press("up"); // the message
+  await app.keyboard.press("enter");
+  await app.waitFor("text:# lobby");
+  expect(semantic(w)).toEqual([]);
+
+  // Nothing highlighted: Return is the full search, as before.
+  await app.clear("id:top-search");
+  await app.type("id:top-search", "roadmap");
+  await app.waitFor(`id:quick-asset:${photo.id}`);
+  await app.submit("id:top-search");
+  await app.waitFor("id:search-view");
+  await app.waitUntil(() => semantic(w).length === 1);
+  expect(app.shows("id:quick-results")).toBe(false);
+});
+
+test("a late answer for an older query is never shown", async () => {
+  const w = quickWorld();
+  const { photo } = seedRoadmap(w);
+  w.q.answers.set("road", () => ({ assets: [w.wireAsset(photo)], messages: [] }));
+  const app = await signIn(w);
+  w.q.hold.add("road");
+  await app.type("id:top-search", "road");
+  const running = app.wait(2500);
+  await poll(() => w.q.held.length === 1); // asked; the answer is held
+  const typing = app.type("id:top-search", "x"); // "roadx": the first answer is stale now
+  await poll(() => app.value("id:top-search") === "roadx");
+  w.release(); // the answer for "road" arrives after the edit
+  await poll(() => w.q.answered.length === 1);
+  expect(app.shows(`id:quick-asset:${photo.id}`)).toBe(false);
+  await Promise.all([running, typing]);
+  expect(app.shows(`id:quick-asset:${photo.id}`)).toBe(false);
+  await app.waitFor("id:quick-empty");
+  expect(w.q.calls.map((c) => c.body.query)).toEqual(["road", "roadx"]);
+  expect(w.q.answered.map((a) => a.query)).toEqual(["road", "roadx"]);
+  expect(app.shows(`id:quick-asset:${photo.id}`)).toBe(false);
+});
+
+test("an answer that arrives after signing out never reaches the next session", async () => {
+  const w = quickWorld();
+  const { photo } = seedRoadmap(w);
+  const app = await signIn(w);
+  w.q.hold.add("roadmap");
+  await app.type("id:top-search", "roadmap");
+  const running = app.wait(3000);
+  await poll(() => w.q.held.length === 1);
+  const menu = app.press("id:account-menu");
+  await poll(() => app.shows("id:disconnect"));
+  const out = app.press("id:disconnect");
+  await poll(() => app.shows("id:connect"));
+  w.release(); // Alice's answer arrives after she signed out
+  await Promise.all([running, menu, out]);
+  expect(app.shows("id:quick-results")).toBe(false);
+  expect(app.shows("id:connect-screen")).toBe(true);
+  expect(w.q.answered.map((a) => a.query)).toEqual(["roadmap"]);
+  await signIn(w, "bob", app);
+  await app.wait(200);
+  expect(app.shows(`id:quick-asset:${photo.id}`)).toBe(false);
+  expect(app.shows("id:quick-results")).toBe(false);
+  expect(app.value("id:top-search")).toBe("");
+});
+
+test("losing a Space drops its results from the open list", async () => {
+  const w = quickWorld();
+  const { ev } = seedRoadmap(w);
+  const app = await signIn(w);
+  await app.type("id:top-search", "roadmap");
+  await app.waitFor(`id:quick-message:${ev.id}`);
+  w.f.state.spaces.get("acme")!.members.delete("alice");
+  await app.waitUntil(() => !app.shows(`id:quick-message:${ev.id}`), { timeout: 15_000 });
+  expect(text(app)).not.toContain("the roadmap review moved to Thursday");
+});
+
+test("Search and Library keep their own mode and filters for the lookup", async () => {
+  const w = quickWorld();
+  const app = await signIn(w);
+  // Search, Conversations, scoped to the personal Chat.
+  await app.submit("id:top-search");
+  await app.waitFor("id:search-view");
+  await app.press("id:search-scope:chat");
+  await app.type("id:top-search", "plan");
+  await app.waitFor("id:quick-empty");
+  expect(w.q.calls.at(-1)!.body).toEqual({ query: "plan", scope: "chat", mode: "conversations" });
+  await app.keyboard.press("escape");
+
+  // The Library page: Documents & media, everything by default.
+  await app.press("id:nav-library");
+  await app.waitFor("id:library-view");
+  await app.clear("id:top-search");
+  await app.type("id:top-search", "plan");
+  await app.waitFor("id:quick-empty");
+  expect(w.q.calls.at(-1)!.body).toEqual({ query: "plan", scope: "all", mode: "library" });
+});
+
+test("a server without quick search says so, and More results still searches in full", async () => {
+  const w = quickWorld();
+  w.q.status = 404;
+  const app = await signIn(w);
+  await app.type("id:top-search", "anything");
+  await app.waitFor("id:quick-unavailable");
+  await app.press("id:quick-more");
+  await app.waitFor("id:search-view");
+  await app.waitUntil(() => semantic(w).length === 1);
+});
+
+test("Tab leaves the box and closes the list; focus alone opens nothing", async () => {
+  const w = quickWorld();
+  seedRoadmap(w);
+  const app = await signIn(w);
+  await app.type("id:top-search", "roadmap");
+  await app.waitFor("id:quick-results");
+  await app.keyboard.press("tab");
+  await app.waitFor("id:quick-results", { state: "gone" });
+  const calls = quickCalls(w);
+  await app.keyboard.press("mod+k");
+  await app.wait(400);
+  expect(app.shows("id:quick-results")).toBe(false);
+  expect(quickCalls(w)).toBe(calls);
+});
+
+test("a query longer than quick search takes sends no lookup; More and Return still search in full", async () => {
+  const w = quickWorld();
+  const app = await signIn(w);
+  const long = "é".repeat(201); // Unicode characters, as the server counts them
+  await app.type("id:top-search", long);
+  await app.waitFor("id:quick-too-long");
+  expect(text(app)).toContain("Open full search for longer queries.");
+  await app.wait(400);
+  expect(quickCalls(w)).toBe(0);
+  await app.press("id:quick-more");
+  await app.waitFor("id:search-view");
+  await app.waitUntil(() => semantic(w).length === 1);
+});
+
+test("Down walks a full list of eight to More, which is last", async () => {
+  const w = quickWorld();
+  const files = Array.from({ length: 8 }, (_, i) => w.addAsset("alice", null, `note ${i}.txt`, "x"));
+  w.q.answers.set("note", () => ({ assets: files.map(w.wireAsset), messages: [] }));
+  const app = await open("../../App.tsx", { network: w.network as any, platform: "linux", width: 900, height: 520 });
+  await signIn(w, "alice", app);
+  await app.type("id:top-search", "note");
+  await app.waitFor(`id:quick-asset:${files[7]!.id}`);
+  for (let i = 0; i < 9; i++) await app.keyboard.press("down");
+  await app.keyboard.press("enter"); // the ninth row: More results
+  await app.waitFor("id:search-view");
+  await app.waitUntil(() => w.l.log.some((l) => l.path === "/v1/library/search")); // only files: Documents & media
+});
