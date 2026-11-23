@@ -425,21 +425,58 @@ jobs:
               Where-Object { $_.ExecutablePath -and ($_.ExecutablePath -ieq $installedServer) -and $_.ParentProcessId -eq $launcherPid } |
               Select-Object -First 1
           }
-          function Test-LocalHealthy($server) {
-            $listeners = Get-NetTCPConnection -State Listen -OwningProcess $server.ProcessId -ErrorAction SilentlyContinue
-            if (-not $listeners) { return $false }
-            if ($listeners | Where-Object { $_.LocalAddress -notin '127.0.0.1', '::1' }) {
-              throw 'the hosted metro-server listens beyond loopback'
+          # The launcher owns the local workspace's loopback socket for the whole app
+          # lifetime and hands each metro-server a WSADuplicateSocketW copy
+          # (crates/connector/src/desktop_local.rs), so Windows' TCP table lists the
+          # listener under the launcher's PID, never the server's. Health is therefore
+          # tied to the server through its own ready file: written by this server's PID
+          # for 127.0.0.1:<saved port>, listened on only by the launcher or this server,
+          # only on loopback, and answering /healthz with 200.
+          function Get-LocalState($server, $launcherPid) {
+            $run = Join-Path $env:METRO_DESKTOP_HOME 'local\run\ready.json'
+            $state = Join-Path $env:METRO_DESKTOP_HOME 'local\state.json'
+            $ready = try { Get-Content -LiteralPath $run -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+            $saved = try { Get-Content -LiteralPath $state -Raw -ErrorAction Stop | ConvertFrom-Json } catch { $null }
+            $port = if ($ready -and "$($ready.addr)" -match '^127\.0\.0\.1:(\d+)$') { [int] $Matches[1] } else { $null }
+            $owners = @($launcherPid, $server.ProcessId)
+            $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction SilentlyContinue | Where-Object { $_.OwningProcess -in $owners })
+            [pscustomobject] @{
+              ReadyPid = if ($ready) { $ready.pid } else { $null }; Port = $port
+              SavedPort = if ($saved) { $saved.port } else { $null }; Listeners = $listeners
             }
-            $port = ($listeners | Where-Object { $_.LocalAddress -eq '127.0.0.1' } | Select-Object -First 1).LocalPort
-            if (-not $port) { return $false }
-            try { return $null -ne (Invoke-RestMethod "http://127.0.0.1:$port/healthz" -NoProxy -TimeoutSec 2) } catch { return $false }
+          }
+          function Test-LocalHealthy($server, $launcherPid) {
+            if (-not (Get-Process -Id $server.ProcessId -ErrorAction SilentlyContinue)) { return $false }
+            $s = Get-LocalState $server $launcherPid
+            if ($s.Listeners | Where-Object { $_.LocalAddress -notin '127.0.0.1', '::1' }) {
+              throw 'the launcher or its hosted metro-server listens beyond loopback'
+            }
+            if ($s.ReadyPid -ne $server.ProcessId -or -not $s.Port -or $s.SavedPort -ne $s.Port) { return $false }
+            $onPort = @(Get-NetTCPConnection -State Listen -LocalPort $s.Port -ErrorAction SilentlyContinue)
+            if (-not $onPort -or ($onPort | Where-Object { $_.LocalAddress -ne '127.0.0.1' -or $_.OwningProcess -notin @($launcherPid, $server.ProcessId) })) {
+              return $false
+            }
+            try { return (Invoke-WebRequest "http://127.0.0.1:$($s.Port)/healthz" -NoProxy -TimeoutSec 2).StatusCode -eq 200 } catch { return $false }
+          }
+          # Sanitized failure facts: process ids, paths, parents, listening addresses
+          # and the ready/state pid and port. No log, token or environment content.
+          function Write-LaunchDiagnostics($launcherPid) {
+            Write-Host "launcher pid $launcherPid alive: $([bool] (Get-Process -Id $launcherPid -ErrorAction SilentlyContinue))"
+            Get-CimInstance Win32_Process -Filter "Name='metro-server.exe' OR Name='Metro.exe'" | ForEach-Object {
+              Write-Host "process $($_.Name) pid $($_.ProcessId) parent $($_.ParentProcessId) path $($_.ExecutablePath)"
+            }
+            $server = Get-OwnServer $launcherPid
+            if ($server) {
+              $s = Get-LocalState $server $launcherPid
+              Write-Host "own server pid $($server.ProcessId); ready.json pid $($s.ReadyPid) port $($s.Port); state.json port $($s.SavedPort)"
+              $s.Listeners | ForEach-Object { Write-Host "listener $($_.LocalAddress):$($_.LocalPort) owned by pid $($_.OwningProcess)" }
+            } else { Write-Host 'no metro-server.exe from the installed path under the launcher' }
           }
           function Wait-Healthy($launcher, $seconds) {
             for ($i = 0; $i -lt $seconds; $i++) {
               if ($launcher.HasExited) { return $null }
               $server = Get-OwnServer $launcher.Id
-              if ($server -and (Test-LocalHealthy $server)) { return $server }
+              if ($server -and (Test-LocalHealthy $server $launcher.Id)) { return $server }
               Start-Sleep -Seconds 1
             }
             return $null
@@ -486,6 +523,7 @@ jobs:
               $server = Wait-Healthy $proc 90
               if (-not $server) {
                 Shot $window "desktop-windows-$launch-no-server"
+                Write-LaunchDiagnostics $proc.Id
                 throw "launch ${launch}: no healthy bundled metro-server started automatically under the launcher"
               }
               $localHome = Join-Path $env:METRO_DESKTOP_HOME 'local'
@@ -501,7 +539,7 @@ jobs:
                 Shot $window "desktop-windows-$launch-no-workspace"
                 throw "launch ${launch}: the packaged UI did not show a local account and usable composer"
               }
-              if (-not (Test-LocalHealthy $server)) { throw "launch ${launch}: the bundled server stopped before the workspace check finished" }
+              if (-not (Test-LocalHealthy $server $proc.Id)) { throw "launch ${launch}: the bundled server stopped before the workspace check finished" }
               Shot $window "desktop-windows-$launch-local"
               Write-Host "launch ${launch}: local workspace opened automatically (server pid $($server.ProcessId))"
             } finally {
