@@ -8,7 +8,6 @@ import {
   createSpace,
   creatingRoom,
   creatingSpace,
-  disconnect,
   isActiveRun,
   mainPlace,
   me,
@@ -27,6 +26,8 @@ import {
 import type { Room } from "../store";
 import { AccountMenu, Action, Column, Field, IconButton, Label, MetroMark, NavItem, Row, ScrollArea, Spacer, StatusDot, Surface } from "../ui";
 import type { AccountMenuItem, Tone } from "../ui";
+import { loadSavedServers, signOut } from "../savedWorkspaces";
+import { WorkspaceDialogs, workspaceItems, WorkspaceNotice } from "./WorkspaceSwitcher";
 import { PersonAvatar } from "./profile/PersonAvatar";
 import { profileName } from "./profile/profileState";
 
@@ -237,12 +238,15 @@ function AccountFooter() {
   };
   const server = () => serverPlace(connectedTo(), onLocalWorkspace());
   const name = () => profileName(me()) ?? me() ?? "";
-  // Item ids are the testIDs: account-menu opens them. Sign out ends this
-  // session only, as Disconnect did (local and remote alike).
-  const items: readonly AccountMenuItem[] = [
-    { id: "copy-server-url", label: "Copy server URL", icon: "server", onPress: () => copy(connectedTo(), "Server URL copied") },
+  void loadSavedServers();
+  // Item ids are the testIDs: account-menu opens them. The Workspaces group
+  // switches straight to this computer's workspace or a saved server. Sign
+  // out ends this session and forgets its server's token in memory.
+  const items = (): readonly AccountMenuItem[] => [
+    ...workspaceItems(),
+    { id: "copy-server-url", label: "Copy server URL", icon: "copy", onPress: () => copy(connectedTo(), "Server URL copied") },
     { id: "copy-id", label: "Copy ID", icon: "copy", onPress: () => copy(me(), "ID copied") },
-    { id: "disconnect", label: "Sign out", icon: "logout", destructive: true, onPress: () => disconnect() },
+    { id: "disconnect", label: "Sign out", icon: "logout", destructive: true, onPress: () => signOut() },
   ];
   return (
     <Column padX={2} padY={2} gap={1} testID="active-server">
@@ -254,8 +258,10 @@ function AccountFooter() {
         detail={server().title}
         detailIcon={server().local ? "device" : "server"}
         note={me() ?? undefined}
-        items={items}
+        items={items()}
       />
+      <WorkspaceDialogs />
+      <WorkspaceNotice />
       <If when={copied()}>
         {(message) => (
           <Row padX={2}>

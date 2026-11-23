@@ -13,18 +13,14 @@
 //   session that is signed in or connecting, and a local session never
 //   overwrites the remembered remote server URL. Nothing falls back from one
 //   to the other: a failure is shown as it is.
-// - The only thing remembered is which of the two the user last opened
-//   (`metro.workspace`, not secret). At launch, "local" opens the local
-//   workspace again; "remote" (or nothing) shows the connect screen as before.
+// - The explicit startup preference lives in startupWorkspace.ts. Opening a
+//   workspace never changes that preference.
 
-import { batch, computed, signal, Storage } from "nsh";
+import { batch, computed, signal } from "nsh";
 import { BridgeError } from "./device/bridge";
 import { desktopBridge } from "./device/state";
-import { connect, connectedTo, connectError, status } from "./store";
-
-const WORKSPACE_KEY = "metro.workspace";
-
-export type WorkspaceChoice = "local" | "remote";
+import { adoptConnection, connectedTo, connectError, describe, prepareConnection, status } from "./store";
+import type { PreparedConnection } from "./store";
 
 export type LocalAvailability =
   /** No packaged launcher (`nsh run`, tests, a hand-started UI): nothing to offer. */
@@ -50,7 +46,7 @@ export const onLocalWorkspace = computed(() => {
 });
 
 let seq = 0;
-let restored = false;
+let opening: AbortController | null = null;
 
 /** Asks the launcher whether it can host a local workspace. */
 export async function checkLocalWorkspace(): Promise<LocalAvailability> {
@@ -76,6 +72,8 @@ export async function openLocalWorkspace(): Promise<void> {
   const bridge = desktopBridge();
   if (!bridge || localOpening() || status().phase !== "signedOut") return;
   const mine = ++seq;
+  const ac = new AbortController();
+  opening = ac;
   batch(() => {
     localOpening.set(true);
     localError.set(null);
@@ -85,20 +83,9 @@ export async function openLocalWorkspace(): Promise<void> {
     const opened = await bridge.openLocalWorkspace();
     // The user chose something else meanwhile (a remote server): drop this.
     if (mine !== seq || status().phase !== "signedOut") return;
-    localUrl.set(opened.serverUrl);
-    await connect(opened.serverUrl, opened.token, { remember: false });
-    if (mine !== seq) return;
-    if (status().phase === "online" || status().phase === "retrying") {
-      localAvailability.set("available");
-      void remember("local");
-    } else {
-      // `connect` explains on the connect screen; show it with this choice instead.
-      const why = connectError();
-      batch(() => {
-        localError.set(why ?? "Couldn't sign in to the local workspace.");
-        connectError.set(null);
-      });
-    }
+    const prepared = await prepareConnection(opened.serverUrl, opened.token, ac.signal);
+    if (mine !== seq || status().phase !== "signedOut") return;
+    commitLocalWorkspace(prepared);
   } catch (error) {
     if (mine !== seq) return;
     localError.set(
@@ -106,45 +93,54 @@ export async function openLocalWorkspace(): Promise<void> {
         ? error.code === "local_unavailable"
           ? `This Metro install can't host a local workspace: ${error.message}`
           : error.message
-        : "Couldn't open the local workspace.",
+        : describe(error, "Couldn't open the local workspace"),
     );
     if (error instanceof BridgeError && error.code === "local_unavailable") localAvailability.set("unavailable");
   } finally {
-    if (mine === seq) localOpening.set(false);
-  }
-}
-
-/** The user chose a remote server: an open in flight no longer signs in. */
-export function cancelLocalOpen() {
-  if (!localOpening()) return;
-  seq++;
-  localOpening.set(false);
-}
-
-/** Records the workspace the user signed in to, for the next launch. */
-export async function remember(choice: WorkspaceChoice): Promise<void> {
-  try {
-    await Storage.setItem(WORKSPACE_KEY, choice);
-  } catch {
-    /* storage unavailable: nothing is restored next time */
+    if (mine === seq) {
+      localOpening.set(false);
+      opening = null;
+    }
   }
 }
 
 /**
- * Once per launch: finds out whether a local workspace can be offered, and
- * opens it again if it is what the user last opened. Never runs after a
- * sign-out in the same launch.
+ * Starts (or reuses) the local workspace and returns its address and a
+ * session bearer, without signing in: the account switcher checks them with
+ * a client of its own before it leaves the current session. The bearer goes
+ * straight to `commitLocalWorkspace` and is never kept.
  */
-export async function restoreWorkspace(): Promise<void> {
-  if (restored) return;
-  restored = true;
-  if (!desktopBridge()) return;
-  let choice: string | null = null;
+export async function prepareLocalWorkspace(): Promise<{ ok: true; serverUrl: string; token: string } | { ok: false; message: string }> {
+  const bridge = desktopBridge();
+  if (!bridge || localAvailability() !== "available") return { ok: false, message: "This computer's workspace isn't available in this install." };
   try {
-    choice = await Storage.getItem(WORKSPACE_KEY);
-  } catch {
-    choice = null;
+    const opened = await bridge.openLocalWorkspace();
+    return { ok: true, serverUrl: opened.serverUrl, token: opened.token };
+  } catch (error) {
+    if (error instanceof BridgeError && error.code === "local_unavailable") localAvailability.set("unavailable");
+    return {
+      ok: false,
+      message:
+        error instanceof BridgeError
+          ? error.code === "local_unavailable"
+            ? `This Metro install can't host a local workspace: ${error.message}`
+            : error.message
+          : "Couldn't open the local workspace.",
+    };
   }
-  const availability = await checkLocalWorkspace();
-  if (choice === "local" && availability === "available" && status().phase === "signedOut") await openLocalWorkspace();
+}
+
+/** Adopt the already verified local session; leave the remembered remote address alone. */
+export function commitLocalWorkspace(prepared: PreparedConnection): void {
+  localUrl.set(prepared.baseUrl);
+  adoptConnection(prepared, { remember: false });
+  localAvailability.set("available");
+}
+
+/** The user chose a remote server: an open in flight no longer signs in. */
+export function cancelLocalOpen() {
+  seq++;
+  opening?.abort();
+  opening = null;
+  localOpening.set(false);
 }

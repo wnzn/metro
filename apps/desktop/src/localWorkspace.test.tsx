@@ -81,18 +81,12 @@ test("without the packaged launcher there is no local option, and connecting wor
   await app.waitFor("id:workspace");
 });
 
-test("one press opens the local workspace: no URL, no token, and the remote settings are untouched", async () => {
+test("a new install opens local Chat without a click and leaves remote settings untouched", async () => {
   const remote = world();
   const local = fakeServer();
   local.addSpace("solo", "Solo", "carol");
   const bridge = fakeLauncher();
   const app = await launch(remote, local, bridge, { "metro.serverUrl": "https://metro.example.com" });
-  await app.waitFor("id:open-local");
-  expect(app.shows("id:local-workspace")).toBe(true);
-  // The remote form is still there, as its own explicit choice.
-  expect(app.shows("id:server-url")).toBe(true);
-
-  await app.press("id:open-local");
   await app.waitFor("id:workspace");
   await app.waitFor("id:space:solo");
 
@@ -105,7 +99,6 @@ test("one press opens the local workspace: no URL, no token, and the remote sett
   // Nothing went to the remote server, and its URL is still the remembered one.
   expect(remote.state.log).toHaveLength(0);
   expect(app.requests().some((r: any) => r.url.startsWith("https://metro.example.com"))).toBe(false);
-  await app.waitUntil(() => app.storage()["metro.workspace"] === "local");
   expect(app.storage()["metro.serverUrl"]).toBe("https://metro.example.com");
   expectNoTokens(app);
 
@@ -114,10 +107,11 @@ test("one press opens the local workspace: no URL, no token, and the remote sett
   await app.press("id:disconnect");
   await app.waitFor("id:connect-screen");
   expect(app.value("id:server-url")).toBe("https://metro.example.com");
+  expect(bridge.opens()).toHaveLength(1);
   expectNoTokens(app);
 });
 
-test("the last choice is restored at launch: local reopens, remote waits for the user", async () => {
+test("legacy last-used markers never override the factory startup preference", async () => {
   const local = fakeServer();
   const bridge = fakeLauncher();
   const app = await launch(world(), local, bridge, { "metro.workspace": "local" });
@@ -127,9 +121,8 @@ test("the last choice is restored at launch: local reopens, remote waits for the
 
   const other = fakeLauncher();
   const app2 = await launch(world(), fakeServer(), other, { "metro.workspace": "remote" });
-  await app2.waitFor("id:open-local");
-  expect(app2.shows("id:workspace")).toBe(false);
-  expect(other.opens()).toHaveLength(0);
+  await app2.waitFor("id:workspace");
+  expect(other.opens()).toHaveLength(1);
 });
 
 test("a failure shows the helper's own message and never falls back to a remote server", async () => {

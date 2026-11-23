@@ -1,10 +1,11 @@
 import { mount } from "nsh";
 import { ConnectScreen } from "./src/features/ConnectScreen";
 import { Shell } from "./src/features/Shell";
-import { restorePreferences, status } from "./src/store";
+import { status } from "./src/store";
+import { startWorkspace } from "./src/startupWorkspace";
 
 function App() {
-  void restorePreferences();
+  void startWorkspace();
   const signedIn = () => {
     const phase = status().phase;
     return phase === "online" || phase === "retrying";

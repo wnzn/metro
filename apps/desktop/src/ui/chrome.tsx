@@ -184,6 +184,12 @@ export type AccountMenuItem = {
   /** Ends something (Sign out): the danger colour, last, after a line. */
   destructive?: boolean;
   disabled?: boolean;
+  /** A heading shown above the first item of each group (Workspaces); headings aren't items. */
+  group?: string;
+  /** One of a set of places, the one the user is in now: a check, and screen readers say "checked". */
+  checked?: boolean;
+  /** A quiet second line (an address). */
+  detail?: string;
 };
 
 /**
@@ -243,7 +249,26 @@ export function AccountMenu(props: {
         </Text>
       </If>
       <Each of={plain()} key={(i) => i.id}>
-        {(item) => <AccountEntry item={item()} />}
+        {(item, index) => (
+          <>
+            <If when={item().group && item().group !== plain()[index() - 1]?.group ? item().group : null}>
+              {(g) => (
+                <>
+                  <If when={index() > 0}>
+                    <MenuSeparator class="my-[4px] h-px bg-border" />
+                  </If>
+                  <Text class={cx("px-(--space-2) pt-[4px] pb-[2px] font-semibold text-muted-foreground", textClass.xs)} role="header">
+                    {g()}
+                  </Text>
+                </>
+              )}
+            </If>
+            <If when={index() > 0 && !item().group && plain()[index() - 1]?.group}>
+              <MenuSeparator class="my-[4px] h-px bg-border" />
+            </If>
+            <AccountEntry item={item()} />
+          </>
+        )}
       </Each>
       <If when={plain().length > 0 && ending().length > 0}>
         <MenuSeparator class="my-[4px] h-px bg-border" />
@@ -256,17 +281,66 @@ export function AccountMenu(props: {
 }
 
 function AccountEntry(props: { item: AccountMenuItem }) {
+  const checkable = () => props.item.checked !== undefined;
   return (
     <MenuItem
       class={cx("flex-row items-center gap-(--space-2)", popoverItemClass)}
       testID={props.item.id}
       disabled={props.item.disabled}
-      accessibilityLabel={props.item.label}
+      checked={checkable() ? !!props.item.checked : undefined}
+      role={checkable() ? "menuitemradio" : undefined}
+      accessibilityLabel={props.item.detail ? `${props.item.label}, ${props.item.detail}` : props.item.label}
       onSelect={() => props.item.onPress()}
     >
       <If when={props.item.icon}>{(name) => <Icon name={name()} color={props.item.destructive ? "danger" : "muted"} />}</If>
-      <Text class={cx(textClass.sm, props.item.destructive ? "text-tone-danger-foreground" : "text-popover-foreground")}>{props.item.label}</Text>
+      <View class="flex-1 min-w-0 flex-col">
+        <Text class={cx(textClass.sm, props.item.checked && "font-semibold", props.item.destructive ? "text-tone-danger-foreground" : "text-popover-foreground")} style={{ numberOfLines: 1 }}>
+          {props.item.label}
+        </Text>
+        <If when={props.item.detail}>
+          <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+            {props.item.detail}
+          </Text>
+        </If>
+      </View>
+      <If when={props.item.checked}>
+        <Icon name="check" color="accent" size={14} />
+      </If>
     </MenuItem>
+  );
+}
+
+/**
+ * A saved server on the connect screen: its name, its address, and a quiet
+ * note (signed in this session). Pressing it chooses it.
+ */
+export function SavedServerChoice(props: Testable & { name: string; address: string; note?: string; selected: boolean; onPress: () => void }) {
+  return (
+    <Button
+      class={cx(
+        "flex-row items-center gap-(--space-3) rounded-(--radius-sm) border px-(--space-3) py-[8px] hover:bg-muted",
+        transitionClass,
+        focusRing,
+        props.selected ? "border-ring bg-accent" : "border-border bg-card",
+      )}
+      selected={props.selected}
+      onPress={props.onPress}
+      testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel ?? `${props.name}, ${props.address}${props.note ? `, ${props.note}` : ""}`}
+    >
+      <Icon name="server" color="muted" />
+      <View class="flex-1 min-w-0 flex-col">
+        <Text class={cx(textClass.sm, "font-semibold text-foreground")} style={{ numberOfLines: 1 }}>
+          {props.name}
+        </Text>
+        <Text class={cx(textClass.xs, "font-mono text-muted-foreground")} style={{ numberOfLines: 1 }}>
+          {props.address}
+        </Text>
+      </View>
+      <If when={props.note}>
+        <Text class={cx(textClass.xs, "text-tone-success-foreground")}>{props.note}</Text>
+      </If>
+    </Button>
   );
 }
 
@@ -288,7 +362,7 @@ export const modalOpen = () => openModals() > 0;
  * callers close it. Sized to the window, never past it: a compact window
  * gets a narrower margin. With reduced motion it appears without a fade.
  */
-export function Modal(props: Testable & { open: boolean; title: string; onClose: () => void; children?: JSX.Element }) {
+export function Modal(props: Testable & { open: boolean; title: string; onClose: () => void; children?: JSX.Element; size?: "large" | "compact" }) {
   effect(() => {
     if (!props.open) return;
     openModals.set(untracked(openModals) + 1);
@@ -297,6 +371,8 @@ export function Modal(props: Testable & { open: boolean; title: string; onClose:
   const size = () => {
     const w = windowSize();
     const margin = compactWidth() ? 16 : 48;
+    // A compact modal (a short form, a question) is as tall as its content.
+    if (props.size === "compact") return { width: Math.max(300, Math.min(460, w.width - margin)), maxHeight: w.height - margin };
     return { width: Math.max(320, Math.min(1080, w.width - margin)), height: Math.max(360, Math.min(800, w.height - margin)) };
   };
   return (

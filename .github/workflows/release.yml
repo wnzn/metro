@@ -236,7 +236,13 @@ jobs:
           python --version
           python -I -c "import sys; assert sys.version_info >= (3, 11), sys.version"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test --locked --release -p metro-desktop
+          cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-desktop
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test OpenAI sign-in and credential storage on native Windows (deterministic fixtures)
+        run: |
+          cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --test desktop_sign_in --test openai_oauth
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --lib openai_oauth::store::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build metro-desktop and metro-server (native, locked)
         run: |
@@ -326,29 +332,45 @@ jobs:
             }
             if (-not $ok) { throw 'metro-server did not answer /healthz within 30 s' }
           } finally { if (-not $p.HasExited) { Stop-Process -Id $p.Id -Force } }
-      - name: Open, use locally (through the UI), close and reopen (restores local mode) on native Windows
+      - name: A clean profile starts locally on first launch and reopen, without clicks (native Windows)
         run: |
-          # Throwaway absolute desktop home (supported by the launcher for tests) so nothing touches the
-          # runner's profile and the second launch is a true reopen. The bridge token is never visible:
-          # the UI itself calls POST /v1/local-workspace/open, driven by Windows UI Automation.
+          # Throwaway absolute desktop home; the same home is used for the second launch.
+          # No credentials are supplied or inspected. UI Automation observes the app without interacting.
           $work = Join-Path $env:RUNNER_TEMP 'desktop-run'
           New-Item -ItemType Directory $work | Out-Null
           $env:METRO_DESKTOP_HOME = Join-Path $work 'home'
           New-Item -ItemType Directory $env:METRO_DESKTOP_HOME | Out-Null
           New-Item -ItemType Directory -Force "$env:RUNNER_TEMP\shot" | Out-Null
           Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms, System.Drawing
-          function Find-Window {
-            Get-Process | Where-Object { $_.MainWindowHandle -ne 0 -and $_.MainWindowTitle -eq 'Metro' } | Select-Object -First 1
-          }
-          function Shot($name) {
-            try {
-              $b = [System.Windows.Forms.SystemInformation]::VirtualScreen
-              $bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height
-              [System.Drawing.Graphics]::FromImage($bmp).CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
-              $bmp.Save("$env:RUNNER_TEMP\shot\$name.png")
-            } catch { Write-Host "screenshot skipped: $_" }
-          }
+          $installedUi = (Resolve-Path "$env:METRO_ROOT\ui\Metro.exe").Path
           $installedServer = (Resolve-Path "$env:METRO_ROOT\metro-server.exe").Path
+          function Find-Window($launcherPid) {
+            $ui = Get-CimInstance Win32_Process -Filter "Name='Metro.exe' AND ParentProcessId=$launcherPid" |
+              Where-Object { $_.ExecutablePath -ieq $installedUi } | Select-Object -First 1
+            if ($ui) {
+              $p = Get-Process -Id $ui.ProcessId -ErrorAction SilentlyContinue
+              if ($p -and $p.MainWindowHandle -ne 0) { return $p }
+            }
+          }
+          function Shot($window, $name) {
+            $bmp = $null
+            $graphics = $null
+            try {
+              $root = [System.Windows.Automation.AutomationElement]::FromHandle($window.MainWindowHandle)
+              $bounds = $root.Current.BoundingRectangle
+              $app = [System.Drawing.Rectangle]::new([int]$bounds.X, [int]$bounds.Y, [int]$bounds.Width, [int]$bounds.Height)
+              $b = [System.Drawing.Rectangle]::Intersect($app, [System.Windows.Forms.SystemInformation]::VirtualScreen)
+              if ($b.Width -le 0 -or $b.Height -le 0) { return }
+              $bmp = [System.Drawing.Bitmap]::new($b.Width, $b.Height)
+              $graphics = [System.Drawing.Graphics]::FromImage($bmp)
+              $graphics.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size)
+              $bmp.Save("$env:RUNNER_TEMP\shot\$name.png")
+            } catch { Write-Host "screenshot skipped: $name" }
+            finally {
+              if ($graphics) { $graphics.Dispose() }
+              if ($bmp) { $bmp.Dispose() }
+            }
+          }
           # Only the server that the launcher we started runs from the installed path counts.
           # Any other metro-server (stale, external, a different path or parent) is never accepted.
           function Get-OwnServer($launcherPid) {
@@ -364,15 +386,30 @@ jobs:
             }
             $port = ($listeners | Where-Object { $_.LocalAddress -eq '127.0.0.1' } | Select-Object -First 1).LocalPort
             if (-not $port) { return $false }
-            try { return $null -ne (Invoke-RestMethod "http://127.0.0.1:$port/healthz" -TimeoutSec 2) } catch { return $false }
+            try { return $null -ne (Invoke-RestMethod "http://127.0.0.1:$port/healthz" -NoProxy -TimeoutSec 2) } catch { return $false }
           }
-          function Wait-Healthy($launcherPid, $seconds) {
+          function Wait-Healthy($launcher, $seconds) {
             for ($i = 0; $i -lt $seconds; $i++) {
-              $server = Get-OwnServer $launcherPid
+              if ($launcher.HasExited) { return $null }
+              $server = Get-OwnServer $launcher.Id
               if ($server -and (Test-LocalHealthy $server)) { return $server }
               Start-Sleep -Seconds 1
             }
             return $null
+          }
+          function Test-LocalWorkspaceUi($window) {
+            # NSH v0.6.1 exposes testID as UI Automation's AutomationId.
+            # The account menu distinguishes local from remote; Chat's enabled composer
+            # distinguishes a usable workspace from a window still on the startup screen.
+            $element = [System.Windows.Automation.AutomationElement]
+            $scope = [System.Windows.Automation.TreeScope]::Descendants
+            try {
+              $root = $element::FromHandle($window.MainWindowHandle)
+              $account = $root.FindFirst($scope, [System.Windows.Automation.PropertyCondition]::new($element::AutomationIdProperty, 'account-menu'))
+              $composer = $root.FindFirst($scope, [System.Windows.Automation.PropertyCondition]::new($element::AutomationIdProperty, 'composer'))
+              return ($account -and -not $account.Current.IsOffscreen -and $account.Current.Name -like '*, on this device. Account menu' `
+                -and $composer -and -not $composer.Current.IsOffscreen -and $composer.Current.IsEnabled)
+            } catch [System.Windows.Automation.ElementNotAvailableException] { return $false }
           }
           foreach ($launch in 1, 2) {
             if (Get-Process -Name 'metro-server' -ErrorAction SilentlyContinue) {
@@ -380,59 +417,48 @@ jobs:
             }
             $proc = Start-Process -FilePath "$env:METRO_ROOT\Metro.exe" -WorkingDirectory $work -PassThru
             $window = $null
-            for ($i = 0; $i -lt 60 -and -not $window; $i++) {
-              Start-Sleep -Seconds 1
-              if ($proc.HasExited) { throw "launch ${launch}: launcher exited early with code $($proc.ExitCode)" }
-              $window = Find-Window
-            }
-            if (-not $window) { throw "launch ${launch}: no window titled Metro within 60 s" }
-            Start-Sleep -Seconds 5
-            Shot "desktop-windows-$launch-start"
-            $server = $null
-            $how = $null
-            if ($launch -eq 2) {
-              # The desktop restores local mode from its saved preference: our own bundled server
-              # should come up and become healthy without any click.
-              $server = Wait-Healthy $proc.Id 45
-              if ($server) { $how = 'restored from the saved preference' }
-            }
-            if (-not $server) {
-              # Use locally: find the control in the UI Automation tree and invoke it. The first
-              # button label is being standardised; accept the current and the earlier candidate.
-              $root = [System.Windows.Automation.AutomationElement]::FromHandle($window.MainWindowHandle)
-              $nameProp = [System.Windows.Automation.AutomationElement]::NameProperty
-              $cond = New-Object System.Windows.Automation.OrCondition (
-                (New-Object System.Windows.Automation.PropertyCondition $nameProp, 'Use locally'),
-                (New-Object System.Windows.Automation.PropertyCondition $nameProp, 'Open local workspace'))
-              $button = $null
-              for ($i = 0; $i -lt 30 -and -not $button; $i++) {
-                $button = $root.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $cond)
-                if (-not $button) { Start-Sleep -Seconds 1 }
+            try {
+              for ($i = 0; $i -lt 60 -and -not $window; $i++) {
+                Start-Sleep -Seconds 1
+                if ($proc.HasExited) { throw "launch ${launch}: launcher exited early with code $($proc.ExitCode)" }
+                $window = Find-Window $proc.Id
               }
-              if (-not $button) {
-                Shot "desktop-windows-$launch-no-button"
-                throw "launch ${launch}: no local-mode control ('Use locally' or 'Open local workspace') and no restored local server"
+              if (-not $window) { throw "launch ${launch}: no window from the packaged UI child within 60 s" }
+              Start-Sleep -Seconds 5
+              Shot $window "desktop-windows-$launch-start"
+              $server = Wait-Healthy $proc 90
+              if (-not $server) {
+                Shot $window "desktop-windows-$launch-no-server"
+                throw "launch ${launch}: no healthy bundled metro-server started automatically under the launcher"
               }
-              $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
-              $server = Wait-Healthy $proc.Id 90
-              $how = 'started by the button'
-            }
-            if (-not $server) { Shot "desktop-windows-$launch-no-server"; throw "launch ${launch}: no healthy metro-server of the installed package ran under the launcher" }
-            Write-Host "launch ${launch}: local server pid $($server.ProcessId) $how"
-            # The data root is the fresh desktop home's `local` directory.
-            $localHome = Join-Path $env:METRO_DESKTOP_HOME 'local'
-            if (-not (Get-ChildItem $localHome -Recurse -File -ErrorAction SilentlyContinue)) {
-              throw "launch ${launch}: nothing was written under the fresh local home $localHome"
-            }
-            Shot "desktop-windows-$launch-local"
-            # Close: ask the window to close, then force whatever is left.
-            [void]$window.CloseMainWindow()
-            Start-Sleep -Seconds 8
-            Get-Process | Where-Object { $_.Id -in @($proc.Id, $window.Id) } | Stop-Process -Force -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 2
-            if (Get-Process -Name 'metro-server' -ErrorAction SilentlyContinue) {
-              Get-Process -Name 'metro-server' | Stop-Process -Force
-              throw "launch ${launch}: hosted metro-server outlived the app"
+              $localHome = Join-Path $env:METRO_DESKTOP_HOME 'local'
+              if (-not (Get-ChildItem $localHome -Recurse -File -ErrorAction SilentlyContinue)) {
+                throw "launch ${launch}: nothing was written under the fresh local home"
+              }
+              $usable = $false
+              for ($i = 0; $i -lt 45 -and -not $window.HasExited; $i++) {
+                if (Test-LocalWorkspaceUi $window) { $usable = $true; break }
+                Start-Sleep -Seconds 1
+              }
+              if (-not $usable) {
+                Shot $window "desktop-windows-$launch-no-workspace"
+                throw "launch ${launch}: the packaged UI did not show a local account and usable composer"
+              }
+              if (-not (Test-LocalHealthy $server)) { throw "launch ${launch}: the bundled server stopped before the workspace check finished" }
+              Shot $window "desktop-windows-$launch-local"
+              Write-Host "launch ${launch}: local workspace opened automatically (server pid $($server.ProcessId))"
+            } finally {
+              # Close: ask the window to close, then force whatever is left, even on failure.
+              if ($window -and -not $window.HasExited) {
+                [void]$window.CloseMainWindow()
+                Start-Sleep -Seconds 8
+              }
+              Get-Process | Where-Object { $_.Id -in @($proc.Id, $window.Id) } | Stop-Process -Force -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 2
+              if (Get-Process -Name 'metro-server' -ErrorAction SilentlyContinue) {
+                Get-Process -Name 'metro-server' | Stop-Process -Force
+                throw "launch ${launch}: hosted metro-server outlived the app"
+              }
             }
           }
           $left = Get-Process -Name 'Metro', 'metro-desktop' -ErrorAction SilentlyContinue

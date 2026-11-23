@@ -35,7 +35,7 @@
 
 import { batch, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError, createClient, parseReaction } from "./api/client";
-import type { Client, Member, Mention, Room, RoomEvent, Run, Space } from "./api/client";
+import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space } from "./api/client";
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl } from "./api/serverUrl";
 
@@ -166,7 +166,6 @@ export const memberBusy = signal<string | null>(null);
 
 // ------------------------------------------------------------------ session internals
 
-let token = "";
 let client: Client | null = null;
 let abort: AbortController | null = null;
 let session = 0;
@@ -231,10 +230,10 @@ function guard(spaceId?: string) {
 }
 
 /** Loads the remembered server URL (never the token). */
-export async function restorePreferences() {
+export async function restorePreferences(mayRestore: () => boolean = () => true) {
   try {
     const saved = await Storage.getItem(SERVER_URL_KEY);
-    if (saved && status().phase === "signedOut") serverUrlInput.set(saved);
+    if (saved && mayRestore() && status().phase === "signedOut") serverUrlInput.set(saved);
   } catch {
     /* storage unavailable: keep the default */
   }
@@ -242,32 +241,88 @@ export async function restorePreferences() {
 
 // ------------------------------------------------------------------ connect / disconnect
 
+export type PreparedConnection = Readonly<{ baseUrl: string }>;
+const candidates = new WeakMap<PreparedConnection, {
+  token: string; who: Me; list: Space[]; remembered: string | null; signal: AbortSignal;
+}>();
+
+function credentials(urlInput: string, tokenInput: string) {
+  const parsed = parseServerUrl(urlInput);
+  if (!parsed.ok) throw new Error(parsed.error);
+  const token = tokenInput.trim();
+  if (!token) throw new ApiError("auth", "Enter your access token (a dev token or a JWT from your identity provider).");
+  if (/\s/.test(token)) throw new ApiError("auth", "The access token contains spaces or line breaks; paste only the token itself.");
+  return { baseUrl: parsed.baseUrl, token };
+}
+
+/** Probe a candidate without touching the live session, including on failure. */
+export async function prepareConnection(baseUrl: string, token: string, signal: AbortSignal): Promise<PreparedConnection> {
+  const target = credentials(baseUrl, token);
+  const c = createClient({ baseUrl: target.baseUrl, token: () => target.token, signal });
+  const [who, list, remembered] = await Promise.all([c.me(), c.listSpaces(), rememberedSpace(target.baseUrl)]);
+  if (signal.aborted) throw new ApiError("aborted", "Cancelled");
+  const prepared = Object.freeze({ baseUrl: target.baseUrl });
+  candidates.set(prepared, { token: target.token, who, list, remembered, signal });
+  return prepared;
+}
+
+function beginSession(baseUrl: string, token: string) {
+  endSession();
+  const sess = ++session;
+  abort = new AbortController();
+  client = createClient({ baseUrl, token: () => (sess === session ? token : ""), signal: abort.signal });
+  return { sess, c: client };
+}
+
+function publishIdentity(baseUrl: string, who: Me, list: Space[], remember?: boolean) {
+  batch(() => {
+    me.set(who.id);
+    orgAdmin.set(who.isOrgAdmin);
+    spaces.set(list);
+    connectedTo.set(baseUrl);
+  });
+  if (remember !== false) Storage.setItem(SERVER_URL_KEY, baseUrl).catch(() => {});
+}
+
+function startOnline(baseUrl: string, token: string) {
+  lastListsRefresh = Date.now();
+  failures = 0;
+  status.set({ phase: "online" });
+  for (const fn of sessionStarters) fn({ baseUrl, token });
+  kick();
+}
+
+/** Consume a verified candidate synchronously. Subsequent requests have their own session lifetime. */
+export function adoptConnection(prepared: PreparedConnection, opts: { remember?: boolean } = {}): void {
+  const candidate = candidates.get(prepared);
+  if (!candidate) throw new Error("Connection was not prepared or was already adopted.");
+  candidates.delete(prepared);
+  if (candidate.signal.aborted) throw new ApiError("aborted", "Cancelled");
+  batch(() => {
+    beginSession(prepared.baseUrl, candidate.token);
+    connectError.set(null);
+    publishIdentity(prepared.baseUrl, candidate.who, candidate.list, opts.remember);
+    startOnline(prepared.baseUrl, candidate.token);
+    if (candidate.list.some((s) => s.id === candidate.remembered)) {
+      void enterSpace(candidate.remembered!, { place: "chat", spaceId: null });
+    }
+  });
+}
+
 /**
  * `remember: false` (the desktop-hosted local workspace): don't save this URL
  * as the server to offer next time, so the remote choice stays as it was.
  */
 export async function connect(urlInput: string, tokenInput: string, opts: { remember?: boolean } = {}): Promise<void> {
-  const parsed = parseServerUrl(urlInput);
-  if (!parsed.ok) {
-    connectError.set(parsed.error);
+  let target: ReturnType<typeof credentials>;
+  try {
+    target = credentials(urlInput, tokenInput);
+  } catch (error) {
+    connectError.set((error as Error).message);
     return;
   }
-  const trimmed = tokenInput.trim();
-  if (!trimmed) {
-    connectError.set("Enter your access token (a dev token or a JWT from your identity provider).");
-    return;
-  }
-  if (/\s/.test(trimmed)) {
-    connectError.set("The access token contains spaces or line breaks; paste only the token itself.");
-    return;
-  }
-
-  endSession();
-  const sess = ++session;
-  token = trimmed;
-  abort = new AbortController();
-  const c = createClient({ baseUrl: parsed.baseUrl, token: () => token, signal: abort.signal });
-  client = c;
+  const { baseUrl, token } = target;
+  const { sess, c } = beginSession(baseUrl, token);
   batch(() => {
     connectError.set(null);
     status.set({ phase: "connecting" });
@@ -276,24 +331,14 @@ export async function connect(urlInput: string, tokenInput: string, opts: { reme
   try {
     const [who, list] = await Promise.all([c.me(), c.listSpaces()]);
     if (sess !== session) return;
-    batch(() => {
-      me.set(who.id);
-      orgAdmin.set(who.isOrgAdmin);
-      spaces.set(list);
-      connectedTo.set(parsed.baseUrl);
-    });
-    if (opts.remember !== false) Storage.setItem(SERVER_URL_KEY, parsed.baseUrl).catch(() => {});
-    const remembered = await rememberedSpace(parsed.baseUrl);
+    publishIdentity(baseUrl, who, list, opts.remember);
+    const remembered = await rememberedSpace(baseUrl);
     if (sess !== session) return;
     // A returning user lands in their last Space; everyone else in their Chat.
     const initial = list.find((s) => s.id === remembered) ?? null;
     if (initial) await enterSpace(initial.id, { place: "chat", spaceId: null });
     if (sess !== session) return;
-    lastListsRefresh = Date.now();
-    failures = 0;
-    status.set({ phase: "online" });
-    for (const fn of sessionStarters) fn({ baseUrl: parsed.baseUrl, token });
-    kick();
+    startOnline(baseUrl, token);
   } catch (error) {
     if (sess !== session) return;
     endSession();
@@ -471,6 +516,7 @@ export async function createSpace(nameInput: string): Promise<boolean> {
 async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId: string | null }): Promise<void> {
   const c = client;
   if (!c) return;
+  const currentSession = guard();
   const ok = guard(spaceId);
   batch(() => {
     clearTransient();
@@ -510,7 +556,7 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
       actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
     });
   } finally {
-    switchingSpace.set(false);
+    if (currentSession()) switchingSpace.set(false);
   }
 }
 
@@ -1142,7 +1188,6 @@ function endSession() {
   abort?.abort();
   abort = null;
   client = null;
-  token = "";
   if (timer !== undefined) clearTimeout(timer);
   timer = undefined;
   ticking = false;
