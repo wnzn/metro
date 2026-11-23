@@ -20,6 +20,7 @@ const EXT: Record<string, { kind: string; mimes: string[] }> = {
   mp3: { kind: "mp3", mimes: ["audio/mpeg"] },
   mp4: { kind: "mp4", mimes: ["video/mp4"] },
   webm: { kind: "webm", mimes: ["video/webm"] },
+  docx: { kind: "docx", mimes: ["application/vnd.openxmlformats-officedocument.wordprocessingml.document"] },
 };
 
 export function libraryWorld() {
@@ -115,7 +116,16 @@ export function libraryWorld() {
       const a = l.assets.find((x) => x.id === decodeURIComponent(m[1]!));
       if (!a || !visible(user, a)) return err(404, "asset not found");
       if (m[2] && req.method === "GET") {
-        const answer = { status: 200, headers: { "content-type": a.mime_type, "cache-control": "no-store" }, body: a.bytes };
+        // A single `bytes=A-B` range, as library.rs answers it. Bodies are strings
+        // (the test network can't carry raw bytes), so fixtures stay ASCII.
+        const range = /^bytes=(\d+)-(\d+)$/.exec(header(req, "range") ?? "");
+        const answer = range
+          ? (() => {
+              const start = Number(range[1]);
+              const end = Math.min(Number(range[2]), a.bytes.length - 1);
+              return { status: 206, headers: { "content-type": a.mime_type, "cache-control": "no-store", "content-range": `bytes ${start}-${end}/${a.bytes.length}` }, body: a.bytes.slice(start, end + 1) };
+            })()
+          : { status: 200, headers: { "content-type": a.mime_type, "cache-control": "no-store" }, body: a.bytes };
         const gate = l.contentGate;
         if (!gate) return answer;
         l.contentParked++;

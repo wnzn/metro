@@ -105,8 +105,8 @@ export type AssetContent = { bytes: Uint8Array; contentType: string };
 export type BinaryFn = (
   method: "GET" | "POST",
   path: string,
-  init: { body?: Blob | Uint8Array; contentType?: string; accept?: string; timeoutMs?: number; signal?: AbortSignal },
-) => Promise<{ status: number; contentType: string; bytes: Uint8Array }>;
+  init: { body?: Blob | Uint8Array; contentType?: string; accept?: string; timeoutMs?: number; signal?: AbortSignal; range?: string },
+) => Promise<{ status: number; contentType: string; bytes: Uint8Array; contentRange?: string | null }>;
 
 const enc = encodeURIComponent;
 
@@ -150,6 +150,20 @@ export function libraryApi(request: RequestFn, binary: BinaryFn) {
     async assetContent(id: string, signal?: AbortSignal): Promise<AssetContent> {
       const res = await binary("GET", `/v1/library/assets/${enc(id)}/content`, { accept: "*/*", timeoutMs: 120_000, signal });
       return { bytes: res.bytes, contentType: res.contentType };
+    },
+
+    /**
+     * At most the first `maxBytes` of the file, through the same access check
+     * (a single `Range: bytes=0-N` the server supports). A server that
+     * answers with the whole file is cut here; `whole` says whether the bytes
+     * are the entire file.
+     */
+    async assetContentPart(id: string, maxBytes: number, signal?: AbortSignal): Promise<AssetContent & { whole: boolean }> {
+      const n = Math.max(1, Math.floor(maxBytes));
+      const res = await binary("GET", `/v1/library/assets/${enc(id)}/content`, { accept: "*/*", timeoutMs: 60_000, signal, range: `bytes=0-${n - 1}` });
+      const total = /\/(\d+)\s*$/.exec(res.contentRange ?? "")?.[1];
+      if (res.status === 206) return { bytes: res.bytes.subarray(0, n), contentType: res.contentType, whole: total !== undefined && Number(total) <= res.bytes.length };
+      return { bytes: res.bytes.length > n ? res.bytes.subarray(0, n) : res.bytes, contentType: res.contentType, whole: res.bytes.length <= n };
     },
 
     async deleteAsset(id: string): Promise<void> {

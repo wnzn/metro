@@ -35,8 +35,8 @@ export const AVATAR_EXTENSIONS = ["png", "jpg", "jpeg"] as const;
 export type RawFn = (
   method: "GET" | "POST" | "PUT",
   path: string,
-  init: { body?: Blob | Uint8Array; contentType?: string; accept?: string; timeoutMs?: number; signal?: AbortSignal },
-) => Promise<{ status: number; contentType: string; bytes: Uint8Array }>;
+  init: { body?: Blob | Uint8Array; contentType?: string; accept?: string; timeoutMs?: number; signal?: AbortSignal; range?: string },
+) => Promise<{ status: number; contentType: string; bytes: Uint8Array; contentRange?: string | null }>;
 
 const enc = encodeURIComponent;
 

@@ -299,6 +299,8 @@ export function createClient(options: ClientOptions) {
     const cancelled = () => options.signal?.aborted === true || init.signal?.aborted === true;
     const headers: Record<string, string> = { Accept: init.accept ?? "*/*", Authorization: `Bearer ${options.token()}` };
     if (init.body !== undefined) headers["Content-Type"] = init.contentType ?? "application/octet-stream";
+    // A single byte range (`bytes=A-B`), only for reads; never anything else in this header.
+    if (init.range !== undefined && method === "GET" && /^bytes=\d+-\d+$/.test(init.range)) headers.Range = init.range;
     try {
       if (cancelled()) throw new ApiError("aborted", "Cancelled");
       let response: Response;
@@ -320,7 +322,7 @@ export function createClient(options: ClientOptions) {
         throw new ApiError("network", `The answer to ${method} ${path} was cut off (${String((error as Error)?.message ?? error)}).`);
       }
       if (cancelled()) throw new ApiError("aborted", "Cancelled");
-      return { status: response.status, contentType: response.headers.get("content-type") ?? "", bytes };
+      return { status: response.status, contentType: response.headers.get("content-type") ?? "", bytes, contentRange: response.headers.get("content-range") };
     } finally {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onAbort);
