@@ -923,32 +923,72 @@ jobs:
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
-          set -euo pipefail
+          set -Eeuo pipefail
+          # Every check runs under a named gate; a failure reports that gate and the
+          # script line. Nothing prints process arguments, the environment or tokens.
+          gate=setup
+          trap 'echo "::error title=macOS install smoke::gate \"$gate\" failed (step script line $LINENO)" >&2' ERR
+          # Exact folder inventory: names, kinds and the marker's mode, no extras.
+          # (Not `find | sort`: sort order follows the runner's en_US.UTF-8 collation.)
+          inventory() { # DIR NAME=KIND...  (KIND: dir, or empty-file-644)
+            python3 -I - "$@" <<'PY'
+          import stat, sys
+          from pathlib import Path
+          folder, want = Path(sys.argv[1]), dict(a.split("=", 1) for a in sys.argv[2:])
+          def kind(p):
+              st = p.lstat()
+              if stat.S_ISLNK(st.st_mode):
+                  return "symlink"
+              if stat.S_ISDIR(st.st_mode):
+                  return "dir"
+              if stat.S_ISREG(st.st_mode):
+                  return f"{'empty-' if st.st_size == 0 else ''}file-{stat.S_IMODE(st.st_mode):03o}"
+              return "other"
+          got = {p.name: kind(p) for p in folder.iterdir()}
+          if got != want:
+              print(f"{folder.name}: expected {sorted(want.items())}, found {sorted(got.items())}", file=sys.stderr)
+              sys.exit(1)
+          PY
+          }
           home="$(mktemp -d "$RUNNER_TEMP/mac home.XXXXXX")"
           home="$(cd "$home" && pwd -P)"
           a="$GITHUB_WORKSPACE/dist-macos/Metro-$VERSION-$TARGET.tar.gz"
           i="$GITHUB_WORKSPACE/packaging/install-metro-macos.sh"
-          HOME="$home" sh "$i" install --archive "$a"
           dir="$home/Applications/Metro Desktop"
           app="$dir/Metro.app"
-          test "$(find "$dir" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | tr '\n' ' ')" = "Metro.app enable-local-runner "
+
+          gate="install (path with spaces)"
+          HOME="$home" sh "$i" install --archive "$a"
+          gate="install folder holds exactly Metro.app and the local-runner marker"
+          inventory "$dir" Metro.app=dir enable-local-runner=empty-file-644
+          gate="codesign --verify --deep --strict Metro.app"
           codesign --verify --deep --strict "$app"
+          gate="codesign --verify --strict MetroUI.app"
           codesign --verify --strict "$app/Contents/Helpers/MetroUI.app"
+          gate="codesign --verify --strict metro-tui"
           codesign --verify --strict "$app/Contents/MacOS/metro-tui"
+          gate="metro-tui --help (exit 0, about text on stdout)"
           "$app/Contents/MacOS/metro-tui" --help > "$RUNNER_TEMP/tui-help.txt"
           grep -q "Metro conversations" "$RUNNER_TEMP/tui-help.txt"
-          plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist" | grep -qx dev.metro.desktop
-          plutil -extract CFBundleIdentifier raw "$app/Contents/Helpers/MetroUI.app/Contents/Info.plist" | grep -qx dev.metro.desktop.ui
+          gate="outer bundle identifier dev.metro.desktop"
+          test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist")" = dev.metro.desktop
+          gate="inner bundle identifier dev.metro.desktop.ui"
+          test "$(plutil -extract CFBundleIdentifier raw "$app/Contents/Helpers/MetroUI.app/Contents/Info.plist")" = dev.metro.desktop.ui
 
+          gate="launch smoke (smoke-macos-launch.sh names its own failing check)"
           export METRO_DESKTOP_HOME="$home/desktop data"
           sh packaging/smoke-macos-launch.sh "$app" "$home/Library/Application Support/Metro/Installer/RELEASE.json" \
             "$RUNNER_TEMP/shot" "desktop-$TARGET"
 
+          gate="update --no-local-runner removes only the marker"
           HOME="$home" sh "$i" update --archive "$a" --no-local-runner
-          test ! -e "$dir/enable-local-runner"
+          inventory "$dir" Metro.app=dir
+          gate="uninstall removes the app folder and keeps Metro data"
           HOME="$home" sh "$i" uninstall
           test ! -e "$dir"
           test -d "$METRO_DESKTOP_HOME"
+          gate="all checks passed"
+          echo "macOS install smoke passed"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
