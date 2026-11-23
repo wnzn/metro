@@ -39,10 +39,10 @@ import type { QuickMessage, QuickRow } from "./quickSearch";
 
 const library = () => mainPlace() === "library" || searchSurface() === "library";
 
-/** The file's own extension, as its name has it (".jpg", ".md"); none when the name has none. */
+/** The file's own extension, exactly as its name has it (".jpg", ".JPG", ".md"); none when the name has none. */
 export function extensionOf(name: string): string {
   const dot = name.lastIndexOf(".");
-  return dot > 0 && dot < name.length - 1 ? name.slice(dot).toLowerCase() : "";
+  return dot > 0 && dot < name.length - 1 ? name.slice(dot) : "";
 }
 
 /** The name without its extension, for the row's title (the extension is its badge). */

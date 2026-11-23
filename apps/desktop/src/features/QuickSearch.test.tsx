@@ -7,6 +7,7 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, header, TOKENS } from "../../test/fakeServer";
 import { libraryWorld } from "./library/test/fixtures";
+import theme from "../../theme/theme.json";
 
 type Req = { method: string; url: string; headers: unknown; body?: string | null };
 type Wire = { assets: unknown[]; messages: unknown[] };
@@ -68,6 +69,8 @@ async function signIn(w: QW, user = "alice", app?: App): Promise<App> {
 }
 
 const text = (app: App) => app.texts().join(" | ");
+/** A theme colour as the test driver reports colours (#rrggbbaa). */
+const themeColor = (scheme: "light" | "dark", name: string) => `${(theme.cssVars[scheme] as Record<string, string>)[name]!.toLowerCase()}ff`;
 
 /**
  * Waits on a condition outside the app's steps. The fake network is served
@@ -120,6 +123,8 @@ test("typing shows loading, then results with the file's own name and extension 
   expect(app.shows(`id:quick-asset:${photo.id} >> text:.jpg`)).toBe(true);
   expect(app.shows(`label:/^Roadmap Q3\\.jpg, Your personal library\\./`)).toBe(true);
   expect(text(app)).not.toContain("Your personal library"); // one file of that name: no source drawn
+  // The extension badge is coloured by its family (images), from the theme; the app opens dark.
+  expect(app.viewStyle(`id:quick-asset:${photo.id}:ext`)?.backgroundColor).toBe(themeColor("dark", "ext-image"));
   expect(app.shows(`id:quick-message:acme:lobby:${ev.id} >> text:the roadmap review moved to Thursday`)).toBe(true);
   expect(app.shows(`id:quick-message:acme:lobby:${ev.id} >> text:bob · Acme`)).toBe(true);
   // Global on the Chat page (typing may have asked for partial queries on the way); no semantic search, no indexing, no model.
@@ -482,6 +487,8 @@ test("files and messages are grouped under headings Up and Down skip; two files 
   expect(app.shows(`id:quick-asset:${mine.id} >> text:Personal`)).toBe(true);
   expect(app.shows(`id:quick-asset:${team.id} >> text:Acme`)).toBe(true);
   expect(app.shows(`label:/^plan\\.md, Acme\\./`)).toBe(true);
+  expect(app.viewStyle(`id:quick-asset:${mine.id}:ext`)?.backgroundColor).toBe(themeColor("dark", "ext-markdown"));
+  expect(app.viewStyle(`id:quick-asset:${team.id}:ext`)?.backgroundColor).toBe(themeColor("dark", "ext-markdown"));
   // Down goes to the first file, not a heading; three more reach More.
   await app.keyboard.press("down");
   await app.keyboard.press("down");

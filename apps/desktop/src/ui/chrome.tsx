@@ -618,21 +618,21 @@ export function SearchBox(
             anchor={box()}
             placement="bottom"
             align="start"
-            offset={6}
+            offset={8}
             margin={8}
             onPressOutside={() => popup().onClose()}
             onCancel={() => popup().onClose()}
             onPosition={(e) => room.set(e.available.height)}
           >
             <View
-              class={cx(popoverClass, "flex-col")}
+              class={searchPanel}
               style={{ width: Math.max(300, width()) }}
               role="listbox"
               testID={popup().testID}
               accessibilityLabel={popup().accessibilityLabel}
             >
               <Scroll style={{ maxHeight: Math.max(140, Math.min(440, room() - 16)) }}>
-                <View class="flex-col">{popup().children}</View>
+                <View class="flex-col px-[6px]">{popup().children}</View>
               </Scroll>
             </View>
           </Overlay>
@@ -646,15 +646,100 @@ export function SearchBox(
 // hairline: a leading column 72 wide (a file's tile, a message's glyph), the
 // name in the middle as the strongest text with at most one quiet line under
 // it, and on the right a file's source (only when it tells two apart) and its
-// extension as a small badge. The highlighted row (Up and Down) has the
-// accent surface and a primary bar at its leading edge in both themes. Rows
-// never take the keyboard focus: the field keeps it.
+// extension as a small colour-coded badge. The highlighted row (Up and Down)
+// has the accent surface and a primary bar in its leading gutter, in both
+// themes. Rows never take the keyboard focus: the field keeps it.
+//
+// Gutters: the panel's list is inset 6 from its edges and every row, heading,
+// status line and footer pads 8 more on the left, so tiles, glyphs, headings
+// and the footer's icon all start 14 from the panel's edge. On the right the
+// badge column ends 16 from it, clear of the scroll bar. Dividers run the
+// list's width, inset 6 on both sides.
 
-const resultRow = cx("flex-row items-center gap-(--space-3) min-h-[56px] border-b border-border pr-(--space-2) py-[6px] hover:bg-muted", transitionClass);
+/** The panel: no padding of its own on the sides (the list sets the gutters), a little above and below. */
+const searchPanel = cx("flex-col rounded-(--radius-lg) border border-border bg-popover py-[6px] shadow-lg", popoverMotion.base);
 
-/** The leading edge of a row: a primary bar while it is highlighted, nothing otherwise. */
+const resultRow = cx("relative flex-row items-center gap-(--space-3) min-h-[58px] border-b border-border pl-[8px] pr-[10px] py-[7px] hover:bg-muted", transitionClass);
+
+/** In a row's leading gutter: a primary bar while it is highlighted. Takes no room in the row's layout. */
 function SelectionBar(props: { selected: boolean }) {
-  return <View class={cx("w-[3px] self-stretch rounded-full", props.selected ? "bg-primary" : "bg-transparent")} accessibilityElementsHidden />;
+  return (
+    <If when={props.selected}>
+      <View class="absolute left-[2px] top-[10px] bottom-[10px] w-[3px] rounded-full bg-primary" accessibilityElementsHidden />
+    </If>
+  );
+}
+
+// ---------------------------------------------------------------- extension colours
+
+/**
+ * The families a file extension's badge is coloured by: each a soft fill and
+ * a high-contrast ink from the theme (`ext-*` in theme/theme.json, light and
+ * dark), the same for every file of the family. The two video formats get
+ * related tints (MP4 violet, WebM indigo). Anything unknown is neutral.
+ */
+export type ExtensionTone = "text" | "markdown" | "pdf" | "word" | "image" | "audio" | "video" | "webm" | "neutral";
+
+const EXTENSION_TONES: Record<string, ExtensionTone> = {
+  txt: "text",
+  text: "text",
+  md: "markdown",
+  markdown: "markdown",
+  pdf: "pdf",
+  doc: "word",
+  docx: "word",
+  png: "image",
+  jpg: "image",
+  jpeg: "image",
+  gif: "image",
+  webp: "image",
+  wav: "audio",
+  mp3: "audio",
+  m4a: "audio",
+  ogg: "audio",
+  flac: "audio",
+  mp4: "video",
+  m4v: "video",
+  mov: "video",
+  webm: "webm",
+};
+
+/** The colour family of an extension (".JPG" or "jpg"), case-insensitive. */
+export function extensionTone(ext: string): ExtensionTone {
+  return EXTENSION_TONES[ext.replace(/^\./, "").toLowerCase()] ?? "neutral";
+}
+
+const extensionFill: Record<ExtensionTone, string> = {
+  text: "bg-ext-text",
+  markdown: "bg-ext-markdown",
+  pdf: "bg-ext-pdf",
+  word: "bg-ext-word",
+  image: "bg-ext-image",
+  audio: "bg-ext-audio",
+  video: "bg-ext-video",
+  webm: "bg-ext-webm",
+  neutral: "bg-tone-neutral",
+};
+
+const extensionInk: Record<ExtensionTone, string> = {
+  text: "text-ext-text-foreground",
+  markdown: "text-ext-markdown-foreground",
+  pdf: "text-ext-pdf-foreground",
+  word: "text-ext-word-foreground",
+  image: "text-ext-image-foreground",
+  audio: "text-ext-audio-foreground",
+  video: "text-ext-video-foreground",
+  webm: "text-ext-webm-foreground",
+  neutral: "text-tone-neutral-foreground",
+};
+
+/** A file's extension as a small badge in its family's colours, shown as the file's name has it. Decorative: the row's name says it. */
+export function ExtensionBadge(props: { ext: string; testID?: string }) {
+  return (
+    <View class={cx("shrink-0 rounded-[5px] px-[6px] py-px", extensionFill[extensionTone(props.ext)])} testID={props.testID} accessibilityElementsHidden>
+      <Text class={cx(textClass.xs, "font-semibold font-mono", extensionInk[extensionTone(props.ext)])}>{props.ext}</Text>
+    </View>
+  );
 }
 
 function RowTitle(props: { text: string; selected: boolean; weight: "semibold" | "normal" }) {
@@ -748,11 +833,9 @@ export function SearchFileRow(
           {props.source}
         </Text>
       </If>
-      <If when={props.badge}>
-        <View class="shrink-0 rounded-[5px] border border-border bg-muted px-[6px] py-px">
-          <Text class={cx(textClass.xs, "font-medium font-mono text-muted-foreground")}>{props.badge}</Text>
-        </View>
-      </If>
+      <View class="w-[52px] shrink-0 items-end">
+        <If when={props.badge}>{(ext) => <ExtensionBadge ext={ext()} testID={props.testID ? `${props.testID}:ext` : undefined} />}</If>
+      </View>
     </View>
   );
 }
@@ -760,7 +843,7 @@ export function SearchFileRow(
 /** A heading over a group of results (Files, Messages): not a row, never highlighted. */
 export function SearchGroupHeader(props: Testable & { label: string }) {
   return (
-    <View class="px-(--space-2) pt-(--space-2) pb-[4px] border-b border-border" testID={props.testID} role="header">
+    <View class="pl-[8px] pr-[10px] pt-[10px] pb-[4px]" testID={props.testID} role="header">
       <Text class={cx(textClass.xs, "font-semibold text-muted-foreground")}>{props.label}</Text>
     </View>
   );
@@ -795,7 +878,7 @@ export function SearchResultGlyph(props: { icon: IconName }) {
 /** A line in place of results: searching, nothing found, a failure, not available. */
 export function SearchResultStatus(props: Testable & { text: string; tone?: "muted" | "danger" }) {
   return (
-    <View class="px-(--space-2) py-(--space-3) border-b border-border" testID={props.testID} role={props.tone === "danger" ? "alert" : undefined}>
+    <View class="pl-[8px] pr-[10px] py-(--space-3) border-b border-border" testID={props.testID} role={props.tone === "danger" ? "alert" : undefined}>
       <Text class={cx(textClass.sm, props.tone === "danger" ? "text-tone-danger-foreground" : "text-muted-foreground")}>{props.text}</Text>
     </View>
   );
@@ -807,7 +890,7 @@ export function SearchMoreRow(props: Testable & { label: string; selected: boole
   return (
     <View
       ref={row}
-      class={cx("flex-row items-center gap-(--space-2) mt-[4px] rounded-(--radius-sm) pr-(--space-2) py-[8px] hover:bg-accent", transitionClass, props.selected ? "bg-accent" : "bg-muted")}
+      class={cx("relative flex-row items-center gap-(--space-2) mt-[6px] rounded-(--radius-sm) pl-[8px] pr-[10px] py-[9px] hover:bg-accent", transitionClass, props.selected ? "bg-accent" : "bg-muted")}
       focusable={false}
       role="option"
       accessibilityState={{ selected: props.selected }}
