@@ -71,11 +71,13 @@ More: [where your text goes](docs/screenshots/model-routing-dataflow.png) ·
 [connect](docs/screenshots/connection.png) ·
 [connect error](docs/screenshots/connection-error.png)
 
-The native Linux app needs glibc ≥ 2.39, GTK ≥ 4.14 and WebKitGTK 6.0. The
-Windows x64 candidate has only been started under Wine on Linux (its window
-opened and its server answered `/healthz`). Nobody has checked that it
-draws or takes input, or run it on native Windows. macOS hasn't been
-tried.
+The native Linux app needs glibc ≥ 2.39, GTK ≥ 4.14, WebKitGTK 6.0 and the
+GStreamer base plugins. Its native GUI checks ran in Debian 13 under Xvfb
+with scripted local model endpoints. The Windows x64 candidate and later
+Windows test archives have only been started under Wine on Linux: a window
+opened and the bundled server answered health checks, but the window
+rendered blank. Nobody has checked that it draws or takes input, or run it
+on native Windows. macOS hasn't been tried.
 
 ## How it works
 
@@ -93,7 +95,11 @@ tried.
   Nobody can add themselves.
 - **Addressing.** `@bob` speaks to Bob and never wakes the agent. `@agent`, or
   the **Ask agent** button, starts an agent reply. You can tag both in one
-  message. Text with no tag is ordinary room conversation.
+  message. Text with no tag is ordinary room conversation, and in your
+  personal Chat it's a note to yourself. In the current source after 0.2.0
+  (not released), personal Chat makes **Ask agent** the default for typed
+  text when a chat model is ready and System One isn't set up, with **Save
+  note** beside it ([details](apps/desktop/README.md#what-it-does)).
 - **Reactions.** 👍 👀 ✅ 🙏 ❤️ 🎉 on human and agent messages, in Chat, rooms
   and threads. Click to toggle. A reaction never starts agent work. When the
   agent is addressed, it may answer with a single reaction instead of a
@@ -109,7 +115,12 @@ tried.
   model connection of the person who started it. People without one fall
   back to the server's `METRO_MODEL`. A connection that can't be used fails
   the run with a clear error and never falls back silently
-  ([details](docs/settings.md)).
+  ([details](docs/settings.md)). In the current source after 0.2.0 (not
+  released), the composer's **Model** button can choose a model, and where
+  supported a thinking level, for agent turns in your Chat or in a Space,
+  from the connections you may use there. The server checks the choice
+  again when the run starts, and a choice that's no longer allowed fails
+  that turn ([details](docs/settings.md#which-model-a-run-uses)).
 - **Demo vs Ask agent.** **Demo** runs a fixed `workspace.list` on the Space's
   runner and never calls a model. **Ask agent** uses the model chosen as
   above.
@@ -253,8 +264,10 @@ your deployment. Metro has no built-in default other than loopback.
 Download the desktop build for your system from the Releases page.
 
 - **Linux:** extract `Metro-<version>-linux-x64.tar.gz` and start its
-  launcher. Needs glibc ≥ 2.39, GTK ≥ 4.14 and WebKitGTK 6.0. The app can
-  run from a read-only install location.
+  launcher. Needs glibc ≥ 2.39, GTK ≥ 4.14, WebKitGTK 6.0 and the GStreamer
+  base plugins; the package names for Debian, Ubuntu, Arch and CachyOS are
+  in the [desktop README](apps/desktop/README.md#runtime-requirements). The
+  app can run from a read-only install location.
 - **Windows:** extract the whole portable ZIP and run `Metro\Metro.exe`
   (Windows 10 1809+ or 11, x64). It hasn't been tested on native Windows
   ([status](apps/desktop/README.md#windows-portable-package)).
@@ -263,6 +276,13 @@ Download the desktop build for your system from the Releases page.
 - **Shared server:** enter the server URL from step 2 and paste the token
   your admin gave you. There's no built-in login yet. Close token files
   before you screen-share.
+- In the current source after 0.2.0 (not released), Metro opens **On this
+  computer** at launch. Use **Add a server…** in the account menu for a
+  shared server, and **Startup server…** to choose what opens at launch
+  ([details](apps/desktop/README.md#install-users)).
+- If something doesn't work, see
+  [troubleshooting](apps/desktop/README.md#troubleshooting). Never send
+  anyone your tokens, keys, sign-in files or raw logs.
 
 ### 4. Try it
 

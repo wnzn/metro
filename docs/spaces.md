@@ -114,6 +114,11 @@ author and recipients, so it can tell a question for Bob from one for itself.
   `mentions` is a list of up to 32 recipients, each `{"kind":"agent"}` or
   `{"kind":"user","id":"<member id>"}`. The desktop picker sends these, which
   also works for opaque OIDC ids that nobody would type.
+  In the current source after 0.2.0 (not released), a message to the agent
+  may also carry `provider_connection_id`, `model_id` and
+  `reasoning_effort` to choose the model and thinking level for that turn,
+  and `asset_ids` to attach Library files. See
+  [settings.md](settings.md#which-model-a-run-uses).
 - `GET /v1/spaces/{sid}/rooms/{rid}/events?after=<id>` returns
   `{"events": [...]}`. Message events carry `mentions` and an `audience`:
   `room`, `agent`, `users` or `mixed`.
@@ -188,7 +193,16 @@ A room's agent can delegate work to **child threads** with the tools
   for that reply only. It's allowed only on a message to the agent, and
   someone else's connection, or one that doesn't exist, gets `404`. See
   [settings.md](settings.md#which-model-a-run-uses). Chat has no other
-  members, so only `@agent` or `invoke_agent` addresses anyone.
+  members, so only `@agent` or `invoke_agent` addresses anyone. Any other
+  Chat message is a note to yourself and never calls a model. In the current
+  source after 0.2.0, `model_id` and `reasoning_effort` may go with
+  `provider_connection_id` on a message to the agent.
+- In the desktop app (current source after 0.2.0, not released), when a
+  chat model is ready for your Chat and you haven't set up System One,
+  **Ask agent ↵** is the primary action for a typed message and **Return**
+  asks the agent. **Save note** keeps the text without asking. Files sent
+  without text are only saved to your Library. See the
+  [desktop README](../apps/desktop/README.md#what-it-does).
 - The Chat agent's only tool is `react_to_message`, which acknowledges a
   message addressed to it in your Chat. It has no runner, workspace or thread
   tools, and it can't read Space transcripts. Chat never uses a runner, not
@@ -218,6 +232,34 @@ A room's agent can delegate work to **child threads** with the tools
 - Run history is kept in memory, bounded, and lost on restart. Room
   transcripts are durable.
 - At most 4 agent runs are active per Space, and 8 per server.
+
+## Monitoring events
+
+**Status.** In the current source after 0.2.0 (`797eac1`), covered by the
+server's automated tests (`crates/server/tests/monitoring.rs`). It's in no
+recorded test cut or release yet, and the desktop app has no screen for it
+in that source.
+
+The server keeps a short log of things that went wrong, so a Space's owner
+or an operator can see that something failed without anyone sharing logs.
+
+- `GET /v1/monitoring/events?space_id=SID` returns `{"events": [...]}` for
+  one Space: failed, timed-out or refused agent runs, problems with the
+  model connection a run used (unreachable, credentials rejected, rate
+  limited, server error, unusable reply), and runner problems (queue full,
+  no runner picked up the job, no result in time, runner changed). Only the
+  Space's **current owner** may read it. Members get 403, and outsiders and
+  unknown ids get 404, checked on every request.
+- `GET /v1/monitoring/events` with no `space_id` returns the server's own
+  events (started, scheduler failures). Only
+  [organization admins](deploy.md) may read it; everyone else gets 403.
+- Each event is only a time, a component, a fixed code and that code's
+  fixed one-line summary. No message text, prompt, error text from a vendor
+  or device, path, URL, token or user id is ever stored. **Personal Chat
+  turns are never recorded**, and no Space event appears in the server-wide
+  log.
+- Events are kept for 30 days and at most 500 per Space (or for the
+  server), across restarts. A read returns the newest 100.
 
 ## Runner pairing
 

@@ -3,6 +3,138 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Staged: composer models and Ask from personal Chat at 28ba4e2 (2026-11-23, project manager, local)
+
+A local test cut, **not a release**. Nothing was published, and the
+[Metro 0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)
+is still the current final local result. Later commits (`797eac1` server
+monitoring, `322dc9b` desktop operational errors) aren't part of this cut
+and have no acceptance run recorded yet.
+
+**Source.** `28ba4e2257612bc759b4ebff1d01ecce3a473833`. It adds, since the
+`ba07516` cut below: a model and thinking-level picker for agent turns
+(`004dd2b`), approved models advertised by device connections (`0c4dcfd`),
+owner-fetched model lists (`82fd49e`, `67194e7`), the ChatGPT effort and
+recovery fixes (`4824d8a`), packaged icons (`32a46a0`, `b8ac423`), **Ask
+agent** from personal Chat with the chosen model and effort (`c836eee`),
+catalog invalidation on credential changes (`2352b86`), server validation
+of per-turn choices in personal Chat and Spaces (`e97c850`), and opening
+provider setup when the composer has no models (`28ba4e2`).
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt`, clippy, build | Pass |
+| Rust tests | **610 passed**, 0 failed, 2 ignored on purpose |
+| e2e scripts, original and unmodified | 8/8: smoke, threads, settings, device_connector, intelligence, schedules, library, attachments |
+| Desktop: `nsh check`, release build, `nsh test` | Pass; **323/323**, with 0 failures or skips |
+| Packaging tests | 10/10 |
+
+**Test archives** (local only, not release files):
+`Metro-0.2.0-composer-28ba4e225761-linux-x64.tar.gz`, SHA-256
+`1badb0ab278c4f2a70bf86a205fa40d50996638c36db12ac9cca6fbb1d9a9f65`, and
+`Metro-0.2.0-composer-28ba4e225761-windows-x64.zip`, SHA-256
+`89ef0dbfdc5821b999bbc055aa23f41fe5012252d373308e17be27971bc2c585`.
+The package audit found the Windows launcher's icon group with all seven
+frames (16 to 256 px), and on Linux the optional `./install-desktop
+--install` wrote a menu entry with the exact launcher, icon and window
+class, plus a 256×256 PNG and a scalable SVG; `--uninstall` removed them.
+
+**Native Linux GTK, the packaged archive (Xvfb, read-only install).** The
+archive's own `metro-server` ran with a fresh database and disposable
+synthetic accounts. All 70 `RELEASE.json` digests matched. The chat model
+was a scripted loopback `device-openai-oauth` worker that advertised two
+approved model IDs; no vendor endpoint or account was used.
+
+| What the tester did | What was checked |
+| --- | --- |
+| Opened **Model** in an empty personal Chat | The picker showed **Default** and the two approved models; five thinking levels for the chosen one |
+| Typed a question with no mention, pressed Return | **Ask agent ↵** was the visible primary action. Exactly one model call, with the chosen model and level; the reply appeared in Chat |
+| Pressed **Save note** | The note was saved; no model call |
+| Attached a file through the native GTK chooser, sent with an empty message | One attachment saved; no model call |
+| In a Space lobby, chose another model and `low`, sent `@bob` only | Bob was the recipient; no model call |
+| Pressed **Ask agent** on an unmentioned Space question | Exactly one model call, with that Space's chosen model and level; the reply appeared in the room |
+
+Exactly two model calls were seen over the whole run. Screenshots of the
+picker, the levels, the Ask default and both replies were reviewed and
+contain only synthetic content.
+
+**Windows, under Wine 10 on Linux only.**
+
+- The packaged launcher started its UI child, the window was titled Metro,
+  and the bundled server answered health checks (`/v1/me` 401 without a
+  token, 200 with a fixture token).
+- The window rendered **blank** under Wine, and Wine reported no live window
+  icon. Native Windows rendering, input and icons are **not verified**.
+- The Windows connector's ChatGPT sign-in tests (Windows x64 executables run
+  under Wine against scripted loopback services, no network): 10 passed, 0
+  failed. They covered first chat, history, tool-call continuation,
+  `high`/`max` effort, 16 vendor error cases with bounded messages,
+  token refresh under eight concurrent callers, and plan-scope loss. No real
+  account, live entitlement or effort support was tested.
+
+**Not covered:** native Windows, macOS, a real vendor account or sign-in,
+the real connector's HTTP translation in the native GUI run (covered only by
+`crates/connector/tests/openai_oauth.rs`), and publishing.
+
+**Receipts** are kept locally, outside git, under
+`dist/ui-review/composer-models/28ba4e225761/` (`verification.json`,
+`backend-receipt.json`, `package-audit.log`, `windows-inference.md`,
+`native/RECEIPT.md`, JUnit report). The results above are the record; the
+files are supporting evidence only.
+
+## Staged: startup server, attachments and device sign-in at ba07516 (2026-11-23, project manager, local)
+
+A local test cut, **not a release**. Nothing was published.
+
+**Source.** `ba07516bec5c0a02bb046be9d061d64f14693e4e` (desktop), with the
+server identical to `f82b606`.
+
+| Check | Result |
+| --- | --- |
+| Rust tests | **596 passed**, 2 ignored on purpose |
+| e2e scripts | 8/8, as above |
+| Packaging tests | 8/8; startup integration checks 6/6 |
+| Desktop: `nsh check`, release build, `nsh test` | Pass; **311/311**, with 0 failures or skips |
+
+Test archives (local only): Windows
+`Metro-0.2.0-dev-ba07516bec5c-windows-x64.zip`, SHA-256
+`2260ba0b0e9b1b7fc5f2dcd241edba7934f0d0009eb28100c25b57cab2d0f904`; Linux
+`Metro-0.2.0-dev-ba07516bec5c-linux-x64.tar.gz`, SHA-256
+`a3d7923df029c3fd79c104f49d7ba6bdc00ba14bbbaecd215d43c6442d3a8be5`.
+
+**Native Linux GTK, the packaged archive:**
+
+- **Startup server.** Thirteen steps were each confirmed on screen: a clean
+  start, adding a server, ordinary use, setting a remote server as the
+  startup server, a cold start into it, a refused token, signing in, reset,
+  reset to local, forgetting a server, after forgetting, signing out, and a
+  stable restart. *Observation:* after a server is forgotten, its address can
+  still prefill the generic connection form. It's gone from the saved list and
+  the startup choice, and no request went to it.
+- **Attachments** (three synthetic accounts: owner, member, outsider; real
+  GTK file chooser, real file bytes):
+  - Cancelling the chooser, or removing a staged file, uploaded nothing.
+  - In personal Chat and in a Space room, a staged file uploaded only on
+    **Send**, then opened from the transcript in the Library with the right
+    badge and the exact bytes.
+  - The Library listed exactly those two files. The private file returned 200
+    to its owner and 404 to the others; the Space file 200 to both members
+    and 404 to the outsider.
+- **ChatGPT sign-in with no network** (Docker `--network none`, no vendor
+  account): after consent and pairing, **Sign in with ChatGPT** showed an
+  actionable error that no browser was opened and the sign-in service was
+  unreachable, with **Retry ChatGPT sign-in**. Retry returned the same error.
+  No link or token appeared. Minor copy issue: the banner repeats that no
+  browser opened. Waiting, cancel and a successful sign-in weren't
+  exercised.
+
+**Windows, under Wine 10 only:** fixture sign-in retry flows (25 completed)
+and concurrent credential writes (50 successes). Native Windows and a live
+vendor sign-in are **not verified**.
+
+**Receipts** are kept locally, outside git, under
+`dist/ui-review/ux-round2/ba07516bec5c/`.
+
 ## Staged: Windows test build at 5035545 (2026-11-23, project manager, local)
 
 A local, unreleased Windows x64 test build, for handing off to Windows
@@ -1177,6 +1309,11 @@ server connection and sign-in weren't tested.
 - The desktop app on macOS, or on native Windows. Windows has run only
   under Wine, using the launcher and server executables that are byte-identical
   in the final ZIP ([0.2.0 local release](#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)).
+- A recorded desktop GUI run on a Linux distribution other than Debian 13
+  (for example Arch or CachyOS). Their runtime package names are documented
+  as troubleshooting only.
+- Monitoring events (`797eac1`, `322dc9b`) in a packaged build: so far only
+  their automated tests exist in the source.
 - Automatic vendor or CLI sign-in from the app, or a real vendor account
   through the in-app device flow. That flow was verified only against a
   local test endpoint.

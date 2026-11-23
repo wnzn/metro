@@ -68,8 +68,9 @@ default.
   else's connection, so the operator's model is never billed for it.
 - The first connection you save with a model becomes your default if you
   don't have one yet. You can change the default at any time.
-- **Per-message choice in personal Chat.** A message to the agent in your own
-  Chat can name one of your other connections for that one reply
+- **Per-message choice.** In the 0.2.0 release this exists only in personal
+  Chat, and only as a connection: a message to the agent in your own Chat
+  can name one of your other connections for that one reply
   (`provider_connection_id` on `POST /v1/chat/messages`). It doesn't change
   your saved default.
   - The choice only works on a message addressed to the agent (`@agent` or
@@ -78,7 +79,30 @@ default.
     nothing is posted.
   - If the chosen connection can't be used, that reply fails. It doesn't fall
     back to your default or to `METRO_MODEL`.
-  - Space rooms and threads always use the initiator's default.
+- **Per-turn model and thinking level, in Chat and Spaces** (current source
+  after 0.2.0, not released; verified in a local test cut,
+  [acceptance](acceptance.md#staged-composer-models-and-ask-from-personal-chat-at-28ba4e2-2026-11-23-project-manager-local)).
+  A message to the agent, in your Chat or in a Space room, can also carry
+  `model_id` and `reasoning_effort` with `provider_connection_id`, on
+  `POST /v1/chat/messages` and on room messages. The desktop composer's
+  **Model** button sets them for that place.
+  - `GET /v1/models/available?space_id=SID` (or without it, for your Chat)
+    lists what you may choose there: every model of your own connections
+    (for a device connection, only the models you approved, and only while
+    it's online), and the one saved model of each connection shared with
+    you, with that Space or with the organization. Each model lists its
+    `reasoning_efforts`.
+  - Levels are offered only for exact model IDs Metro knows: Sign in with
+    ChatGPT, and OpenAI or Anthropic API profiles on their standard
+    endpoints. Anywhere else, the list is empty and a level is refused.
+  - `model_id` or `reasoning_effort` without `provider_connection_id` is a
+    `400`. A model or level that isn't offered there is refused before
+    anything is stored.
+  - The choice is checked again when the run starts. If the connection, its
+    sharing, the device's approved models or your membership changed, the
+    turn fails with an error. It never falls back to another model.
+  - Notes, file-only messages and people-only messages never call a model,
+    whatever is chosen.
 - *Demo* never calls a model.
 
 Connections are private unless their owner [shares](#sharing-a-connection)
@@ -214,8 +238,12 @@ key. The server relays each request to your machine and the answer back.
 > Vendor software stays separate. Metro never installs, updates or signs in
 > to tools such as the Claude Code CLI for you.
 
-**What Metro sees.** The server never receives your vendor credential, the
-vendor's base URL or your list of approved models. It does see the content of
+**What Metro sees.** The server never receives your vendor credential or the
+vendor's base URL. In 0.2.0 it doesn't receive your list of approved models
+either. In the current source after 0.2.0, a device that's online reports
+the model IDs you approved, so the composer's **Model** list can offer
+exactly those; the server keeps that list in memory and uses it only while
+the device is online. It does see the content of
 each request and response it relays: the conversation, tool definitions and
 the model's reply. That content isn't end-to-end encrypted, and it's held in
 memory only while the job is open. Tool calls in a reply are run by Metro's
@@ -237,8 +265,12 @@ Once paired, the button becomes **Manage connection**. Earlier development
 builds showed a **Set up metro-connector** guide instead
 ([screenshot](screenshots/settings-device-onboarding.png)). The app never
 signs in to a vendor CLI for you. **Test
-connection** lists models once the device is online. Don't paste the token
-into a command line or a chat.
+connection** lists models once the device is online: exactly the models you
+approved on that device. A list proves the device is paired and online; it
+doesn't send a question to the vendor, so a reply can still fail (an expired
+sign-in, a model or thinking level the plan doesn't include). Don't paste
+the token into a command line or a chat, and don't share it, sign-in files
+or raw logs when you ask for help.
 
 Over the API, the same steps are `POST /v1/providers` with
 `{"name", "provider_id": "device-…"}`, then

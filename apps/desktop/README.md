@@ -13,15 +13,23 @@ published yet.** The 0.2.0 files have been built and verified locally
 checkout or a terminal to use the app; the build commands further down are
 for contributors.
 
-- **Linux x64:** `Metro-<version>-linux-x64.tar.gz`. Extract it and start
-  its launcher. Needs glibc ≥ 2.39, GTK ≥ 4.14 and WebKitGTK 6.0.
+- **Linux x64:** `Metro-<version>-linux-x64.tar.gz`. Extract the whole
+  archive and start `Metro` at its top level. Keep `metro-server` and the
+  `ui` folder next to it. Needs glibc ≥ 2.39, GTK ≥ 4.14, WebKitGTK 6.0 and
+  the GStreamer base plugins ([runtime requirements](#runtime-requirements)).
+  In the current source after 0.2.0, the archive also holds an optional
+  `install-desktop` script: `./install-desktop --install` (no `sudo`) adds
+  Metro and its icon to your applications menu, and `./install-desktop
+  --uninstall` removes them without touching your Metro data. Run it again
+  if you move the folder. A local test archive of that source passed this
+  check; it isn't released.
 - **Windows x64:** `Metro-<version>-windows-x64.zip`, a portable ZIP. See
   [Windows portable package](#windows-portable-package).
 
 Check each download against the `.sha256` file published beside it. The
 0.2.0 names are verified targets but aren't published yet.
 
-The first screen, **Connect to Metro**, offers two choices:
+In 0.2.0, the first screen, **Connect to Metro**, offers two choices:
 
 - **On this computer → Use locally:** a private workspace that the app
   runs on this computer, just for you. It needs no server address or
@@ -29,6 +37,23 @@ The first screen, **Connect to Metro**, offers two choices:
   connect to.
 - **Or connect to a server:** the URL and token your admin gave you
   ([README](../../README.md#install-and-use-prebuilt-only)).
+
+In the current source after 0.2.0 (checked natively in a Linux test
+archive, [acceptance](../../docs/acceptance.md#staged-startup-server-attachments-and-device-sign-in-at-ba07516-2026-11-23-project-manager-local);
+not released):
+
+- Metro opens your private workspace **On this computer** at launch by
+  default.
+- To use a shared server, open the account menu and choose **Add a
+  server…**. Saved servers are a name and an address only; a token is never
+  stored. **Stay signed in until Metro quits** (off by default) keeps it
+  in memory for that run only.
+- **Startup server…** in the account menu chooses what opens at launch:
+  **On this computer** or one of your saved servers. **Manage saved
+  servers…** renames or forgets them.
+- Switching checks the target first and never needs a sign-out. If you have
+  a message you haven't sent, Metro asks (**Leave your unsent message?**)
+  before switching.
 
 ### Verified in the 0.2.0 Linux candidate
 
@@ -120,9 +145,16 @@ private folder on this computer, per Space, while Metro is open.
   source fixes this: badges now move to *Serving from here* or *On* in the
   open view, which automated tests cover. The final archive hasn't been
   re-checked in the GUI.
-- **Windows:** the candidate opened a Metro window and its server answered
-  `/healthz` under Wine. Nobody has checked that it draws or takes input,
-  or run it on native Windows.
+- **Windows:** every Windows check so far ran under Wine on Linux, never on
+  native Windows. The 0.2.0 candidate and the later test archives opened a
+  Metro window and their bundled server answered health checks, but the
+  window rendered blank under Wine and Wine reported no live window icon.
+  Nobody has checked that the Windows app draws, takes input, shows its
+  icon or signs in to a vendor.
+- **Linux:** native GUI checks ran in Debian 13 under Xvfb, with scripted
+  local model endpoints only. Other distributions, such as Arch or CachyOS,
+  have no recorded GUI run; see
+  [troubleshooting](#troubleshooting) for their runtime packages.
 - App-wide consistency of icons and type: icons appear in the sidebar and
   Settings, but no app-wide check was recorded.
 - **Local tools:** `workspace.read` hasn't been exercised in the app, and
@@ -152,6 +184,39 @@ private folder on this computer, per Space, while Metro is open.
   agent** ("To: agent in Acme › #lobby"). Follow up opens the same form, and
   Close folds it while keeping your draft. This is separate from
   **Scheduled tasks › New task**, which creates a schedule.
+- **Asking in Chat** (current source after 0.2.0; checked natively in a
+  Linux test archive, [acceptance](../../docs/acceptance.md#staged-composer-models-and-ask-from-personal-chat-at-28ba4e2-2026-11-23-project-manager-local)):
+  - When a chat model is ready for your Chat and you haven't set up System
+    One, a typed message shows **Ask agent ↵** as the primary action, and
+    **Return** asks the agent.
+  - **Save note** beside it saves the text without asking the agent and
+    without calling any model.
+  - Files sent with no text are only saved to your Library, never sent to
+    the agent. With text, **Ask agent** asks about the text; attached files
+    still go to the Library, not to the model.
+  - If no chat model is ready, or System One is set up, Return sends
+    ordinary text as a note, and **Ask agent** (or `@agent`) asks. The
+    choice is made when you start typing, so a list that finishes loading
+    while you write never changes what Return does.
+- **Model for agent turns** (current source after 0.2.0): the **Model**
+  button in the composer picks the model, and where supported the
+  **Thinking level**, for agent turns you start in that place: your Chat,
+  or a Space. **Default** keeps your normal routing or default connection.
+  - The list holds only chat models you may use there: all models of your
+    own connections (for a device connection, only the ones you approved,
+    and only while it's online), plus the one saved model of each
+    connection shared with you, with that Space or with the organization.
+  - Thinking levels show only for models Metro knows exactly: Sign in with
+    ChatGPT, and OpenAI or Anthropic API keys on their standard endpoints.
+    **Provider default** sends no level.
+  - The choice applies only to messages to the agent (**Ask agent**,
+    `@agent`). Notes, files and people-only messages never call a model.
+  - The server checks the choice when you send and again when the run
+    starts. If it's no longer allowed or available, that turn fails with an
+    error; it never falls back to another model.
+  - With no chat models at all, the picker offers **Model providers** to
+    set one up. **Fetch models from …** asks your own server-stored
+    connection for its list.
 - **Spaces:** a Space has its own rooms (starting with its `lobby`), members,
   and optional paired runner. A new account has no Spaces. It sees how to
   create one. Your user ID, to give an owner, is under **Settings →
@@ -323,9 +388,14 @@ by automated tests. Windows and macOS weren't checked.
 
 ## Runtime requirements
 
-- **Linux x64:** glibc ≥ 2.39, GTK ≥ 4.14 and **WebKitGTK 6.0**
-  (`libwebkitgtk-6.0-4` on Debian and Ubuntu). The app's native host links
-  WebKitGTK even though Metro shows no web views. GStreamer is optional.
+- **Linux x64:** glibc ≥ 2.39 (for example Ubuntu 24.04, Debian 13 or a
+  current Arch-based system), GTK ≥ 4.14, **WebKitGTK 6.0** and the
+  GStreamer base plugins. The app's native host links WebKitGTK even though
+  Metro shows no web views.
+  - Debian and Ubuntu: `sudo apt install libgtk-4-1 libwebkitgtk-6.0-4
+    gstreamer1.0-plugins-base`
+  - Arch, CachyOS and other Arch-based systems: `sudo pacman -S --needed
+    webkitgtk-6.0 gtk4 gst-plugins-base-libs gst-plugins-base`
 - **Windows x64:** 64-bit Windows 10 1809 or later, or Windows 11 (see
   [below](#windows-portable-package)). Not yet tested on native Windows.
 - **macOS:** not tried.
@@ -333,6 +403,52 @@ by automated tests. Windows and macOS weren't checked.
 Building, testing and capturing screenshots of the app from source are for
 contributors only, in
 [docs/development.md](../../docs/development.md#the-desktop-app).
+
+## Troubleshooting
+
+- **Linux: Metro doesn't open, or exits at once.** Usually a runtime
+  library is missing, most often WebKitGTK 6.0. Install the packages for
+  your distribution listed under
+  [runtime requirements](#runtime-requirements), then start `Metro` again
+  from the extracted folder. On CachyOS and other Arch-based systems the
+  package is `webkitgtk-6.0` (with `gtk4` and the GStreamer base plugins).
+- **Test connection lists models, but the agent doesn't answer.** For a
+  connection **On this computer**, **Test connection** asks the Metro
+  server for the connection's models, and it answers with exactly the
+  models you approved on this computer, while the app is open and serving
+  it. That proves the pairing works and the device is online. It doesn't
+  send a question to the vendor. A reply is a separate request, which can
+  still fail, for example if the vendor sign-in expired, the plan doesn't
+  include that model, or the thinking level isn't supported. Read the error
+  shown in the conversation, check the model and level chosen under
+  **Model**, and sign in again under **Manage connection** if asked.
+- **A model is missing from the composer's Model list.** For a device
+  connection, approve it under **Approved models → Change…** and keep Metro
+  open so the device is online. A connection someone shared with you
+  offers only its one saved model.
+- **A runner is attached, but tools never run.** *Attached* only means the
+  Space's jobs go to that runner, not that it's online. A runner connects
+  out to the Metro server and needs no inbound port, so it must be able to
+  reach the server's address. Inside a container, `127.0.0.1` is the
+  container itself: set `METRO_SERVER_URL` to the server's `https://`
+  address, or to its Compose service name on the same Docker network
+  ([runners.md](../../docs/runners.md#3-choose-a-server-url-the-container-can-reach)).
+  Local tools in **Use locally** need no runner.
+- **Metro's own errors on this computer** (current source after 0.2.0,
+  `322dc9b`; covered by automated tests, in no recorded test cut, and with
+  no screen in that source yet). The packaged app keeps a short private list
+  of its own failures on this computer: the launcher or window failing to
+  start (including exit status 127, usually a missing library), the bundled
+  local server stopping, and the device connection going offline, being
+  refused or failing to list models. It holds at most 100 entries, each only
+  a time and a fixed code with its fixed summary, never message text,
+  vendor error text, paths, addresses or tokens. It stays on this computer
+  (`monitoring/events.json` in the app's data folder:
+  `~/.config/metro-desktop` on Linux, `%LOCALAPPDATA%\Metro\Desktop` on
+  Windows) and isn't sent to any server.
+- **Asking for help.** Describe what you did and the exact message Metro
+  showed. Never send anyone your tokens, keys, sign-in files, `.env` files,
+  databases or raw logs, and don't post screenshots that show a token.
 
 ## Windows portable package
 
