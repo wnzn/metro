@@ -109,7 +109,7 @@ jobs:
         run: |
           set -eu
           name="Metro-runner-$VERSION-linux-x64.tar.gz"
-          test "$(ls dist | sort | tr '\n' ' ')" = "$name $name.sha256 " \
+          test "$(find dist -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | tr '\n' ' ')" = "$name $name.sha256 " \
             || { echo "unexpected dist contents" >&2; ls dist; exit 1; }
           (cd dist && sha256sum --check "$name.sha256")
           out="$(mktemp -d "$RUNNER_TEMP/runner-extract.XXXXXX")"
@@ -123,6 +123,31 @@ jobs:
           set -e
           echo "exit code without configuration: $code"
           [ "$code" -ne 124 ] && [ "$code" -lt 128 ]
+      - name: Per-user runner installer (throwaway home with spaces; nothing started)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          home="$(mktemp -d "$RUNNER_TEMP/runner home.XXXXXX")"
+          export HOME="$home"
+          unset XDG_CONFIG_HOME XDG_DATA_HOME
+          i="$GITHUB_WORKSPACE/packaging/install-metro-runner-linux.sh"
+          a="$GITHUB_WORKSPACE/dist/Metro-runner-$VERSION-linux-x64.tar.gz"
+          sh "$i" install --archive "$a"
+          mkdir "$home/work space"
+          # Throwaway credential, never printed and never accepted by any server.
+          head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$home/runner token"
+          chmod 600 "$home/runner token"
+          if sh "$i" configure --server-url http://192.0.2.1:8787 --workspace "$home/work space" --token-file "$home/runner token"; then
+            echo "plain http to a non-loopback host was accepted" >&2; exit 1
+          fi
+          sh "$i" configure --server-url https://metro.invalid --workspace "$home/work space" --token-file "$home/runner token"
+          sh "$i" doctor
+          sh "$i" update --archive "$a"
+          test "$(readlink "$home/.local/share/metro-runner/current")" = "versions/$VERSION"
+          sh "$i" uninstall
+          test ! -e "$home/.local/share/metro-runner"
+          test -f "$home/.config/metro-runner/runner.env" && test -f "$home/runner token" && test -d "$home/work space"
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-runner-linux-x64
@@ -485,6 +510,34 @@ jobs:
           }
           $left = Get-Process -Name 'Metro', 'metro-desktop' -ErrorAction SilentlyContinue
           if ($left) { $left | Stop-Process -Force; throw "processes left behind after closing: $(($left | ForEach-Object Name) -join ', ')" }
+      - name: Per-user installer (install, update, uninstall keeps data; path with spaces)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          # Ephemeral CI VM: the Start menu shortcut and HKCU entry are real and removed again.
+          $env:METRO_INSTALL_DIR = Join-Path $env:RUNNER_TEMP 'Metro install dir'
+          $data = Join-Path $env:LOCALAPPDATA 'Metro\Desktop'
+          New-Item -ItemType Directory -Force $data | Out-Null
+          Set-Content (Join-Path $data 'ci-keep.txt') 'keep'
+          $i = Join-Path $env:GITHUB_WORKSPACE 'packaging\install-metro-windows.ps1'
+          $a = Join-Path $env:GITHUB_WORKSPACE "dist\Metro-$env:VERSION-windows-x64.zip"
+          function Run-Installer { & powershell -NoProfile -ExecutionPolicy Bypass -File $i @args; if ($LASTEXITCODE -ne 0) { throw "installer failed: $args" } }
+          Run-Installer -Action Install -Archive $a
+          $dir = Join-Path $env:METRO_INSTALL_DIR "versions\$env:VERSION"
+          foreach ($f in 'Metro.exe', 'metro-server.exe', 'ui\Metro.exe', 'enable-local-runner') {
+            if (-not (Test-Path -LiteralPath (Join-Path $dir $f) -PathType Leaf)) { throw "missing $f after install" }
+          }
+          $lnk = Join-Path ([Environment]::GetFolderPath('Programs')) 'Metro.lnk'
+          if ((New-Object -ComObject WScript.Shell).CreateShortcut($lnk).TargetPath -ne (Join-Path $dir 'Metro.exe')) { throw 'Start menu shortcut is wrong' }
+          $key = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\dev.metro.desktop'
+          if ((Get-ItemProperty $key).DisplayVersion -ne $env:VERSION) { throw 'uninstall entry is wrong' }
+          Run-Installer -Action Update -Archive $a -NoLocalRunner
+          if (Test-Path -LiteralPath (Join-Path $dir 'enable-local-runner')) { throw '-NoLocalRunner left the marker' }
+          Run-Installer -Action Update -Archive $a
+          if (Test-Path -LiteralPath (Join-Path $dir 'enable-local-runner')) { throw 'update did not keep the previous choice' }
+          Run-Installer -Action Uninstall
+          if ((Test-Path -LiteralPath $env:METRO_INSTALL_DIR) -or (Test-Path -LiteralPath $lnk) -or (Test-Path $key)) { throw 'uninstall left files, shortcut or entry' }
+          if ((Get-Content (Join-Path $data 'ci-keep.txt')) -ne 'keep') { throw 'uninstall touched Metro data' }
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         if: always()
         with:
@@ -546,7 +599,7 @@ jobs:
         run: |
           set -eu
           name="Metro-$VERSION-linux-x64.tar.gz"
-          test "$(ls dist | sort | tr '\n' ' ')" = "$name $name.sha256 " \
+          test "$(find dist -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | tr '\n' ' ')" = "$name $name.sha256 " \
             || { echo "unexpected dist contents" >&2; ls dist; exit 1; }
           (cd dist && sha256sum --check "$name.sha256")
           out="$(mktemp -d "$RUNNER_TEMP/desktop-extract.XXXXXX")"
@@ -558,7 +611,8 @@ jobs:
           test -x "$root/Metro" && test -x "$root/metro-server" && test -x "$root/ui/Metro"
           python3 -I packaging/package.py verify-desktop-icons --target linux-x64 "$root"
           # No standalone runner: runner packages are separate.
-          ! find "$out" -name 'metro-runner*' | grep -q .
+          # (`! cmd` would not stop the step under set -e.)
+          if find "$out" -name 'metro-runner*' | grep -q .; then echo "desktop package contains the runner" >&2; exit 1; fi
           echo "METRO_ROOT=$root" >> "$GITHUB_ENV"
       - name: The packaged app uses the real capability manifest
         env:
@@ -595,6 +649,38 @@ jobs:
             sleep 1
           done
           echo "metro-server did not answer /healthz" >&2; exit 1
+      - name: Per-user desktop installer (explains missing libraries, --install-deps, update, uninstall keeps data)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          home="$(mktemp -d "$RUNNER_TEMP/desktop home.XXXXXX")"
+          export HOME="$home"
+          unset XDG_CONFIG_HOME XDG_DATA_HOME
+          i="$GITHUB_WORKSPACE/packaging/install-metro-linux.sh"
+          a="$GITHUB_WORKSPACE/dist/Metro-$VERSION-linux-x64.tar.gz"
+          mkdir -p "$home/.config/metro-desktop" && echo keep > "$home/.config/metro-desktop/marker"
+          if ldd "$METRO_ROOT/ui/Metro" | grep -q 'not found'; then
+            # Without --install-deps nothing on the system changes and the exact command is shown.
+            if sh "$i" install --archive "$a" 2>"$RUNNER_TEMP/deps.err"; then
+              echo "installed without its runtime libraries" >&2; exit 1
+            fi
+            grep -F 'sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 gstreamer1.0-plugins-base' "$RUNNER_TEMP/deps.err"
+            test ! -e "$home/.local/share/metro-desktop-app"
+          fi
+          # apt-get asks before installing; the CI answers for the person.
+          yes | DEBIAN_FRONTEND=noninteractive sh "$i" install --archive "$a" --install-deps
+          test -f "$home/.local/share/metro-desktop-app/current/enable-local-runner"
+          grep -F "Exec=/usr/bin/env \"$home/.local/share/metro-desktop-app/versions/$VERSION/Metro\"" \
+            "$home/.local/share/applications/dev.metro.desktop.desktop"
+          sh "$i" check-deps
+          sh "$i" update --archive "$a" --no-local-runner
+          test ! -e "$home/.local/share/metro-desktop-app/current/enable-local-runner"
+          sh "$i" update --archive "$a"
+          test ! -e "$home/.local/share/metro-desktop-app/current/enable-local-runner"
+          sh "$i" uninstall
+          test ! -e "$home/.local/share/metro-desktop-app" && test ! -e "$home/.local/share/applications/dev.metro.desktop.desktop"
+          test "$(cat "$home/.config/metro-desktop/marker")" = keep
       - name: Launch under Xvfb (best effort)
         continue-on-error: true
         run: |
@@ -603,6 +689,7 @@ jobs:
           sudo apt-get install -y -qq --no-install-recommends xvfb xdotool x11-utils imagemagick libwebkitgtk-6.0-4 libgtk-4-1
           work="$(mktemp -d "$RUNNER_TEMP/desktop-run.XXXXXX")"
           mkdir -p "$RUNNER_TEMP/shot"
+          # shellcheck disable=SC2016 # the inner script expands its own variables
           for attempt in 1 2 3; do
             if GDK_BACKEND=x11 METRO_DESKTOP_HOME="$work/home" xvfb-run -a --server-args='-screen 0 1280x800x24' bash -c '
               set -eu
@@ -639,6 +726,218 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
+  # macOS: NOT YET VERIFIED, CI PREVIEW ONLY. Native jobs per architecture
+  # (macos-15 = Apple silicon, macos-15-intel = Intel; GitHub offers Intel
+  # macOS runners until August 2027). They build and test the launcher and
+  # server natively, package the stock NSH macOS runtime (pinned asset and
+  # runtime digests) as the inner MetroUI.app, assemble and ad hoc sign the
+  # outer Metro.app, install it with install-metro-macos.sh into a path with
+  # spaces and check a clean start and shutdown. There is no Developer ID
+  # signing or notarization (no credentials), so these artifacts are never
+  # attached to the draft release, and nothing here changes Gatekeeper.
+  desktop-macos:
+    needs: meta
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            target: macos-arm64
+            rust: aarch64-apple-darwin
+            arch: arm64
+            nsh_asset: nsh-macos-arm64.tar.gz
+            nsh_sha256: ee1aed2a4d111fe90e6cceca4b9d5f834c9e11cfda525f8be984261a329c06de
+          - runner: macos-15-intel
+            target: macos-x64
+            rust: x86_64-apple-darwin
+            arch: x86_64
+            nsh_asset: nsh-macos-x86_64.tar.gz
+            nsh_sha256: 23ccbfa71f50eb312e57862b7b843a15b23c1b9a9464cfc30735b1c07a18e324
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    env:
+      TARGET: ${{ matrix.target }}
+      RUST_TARGET: ${{ matrix.rust }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+      - name: Runner architecture matches the target
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -eu
+          test "$(uname -m)" = "$ARCH"
+          sw_vers
+      - name: Install pinned NSH for macOS (asset digest, then runtime digest in package.py)
+        env:
+          NSH_ASSET: ${{ matrix.nsh_asset }}
+          NSH_ASSET_SHA256: ${{ matrix.nsh_sha256 }}
+        run: |
+          set -eu
+          archive="$RUNNER_TEMP/$NSH_ASSET"
+          curl --fail --silent --show-error --location --retry 3 --output "$archive" \
+            "https://github.com/longbridge/nsh/releases/download/$NSH_VERSION/$NSH_ASSET"
+          printf '%s  %s\n' "$NSH_ASSET_SHA256" "$archive" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/nsh-macos"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/nsh-macos"
+          printf '%s\n' "$RUNNER_TEMP/nsh-macos/nsh/bin" >> "$GITHUB_PATH"
+      - name: nsh package --target macos (inner MetroUI bundle, its own identifier)
+        working-directory: apps/desktop
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          nsh package App.tsx --target macos --id dev.metro.desktop.ui --app-version "${VERSION#v}" \
+            --icon assets/metro-256.png --out "$RUNNER_TEMP/out-macos"
+          find "$RUNNER_TEMP/out-macos" | head -40
+          plutil -p "$RUNNER_TEMP/out-macos/Metro.app/Contents/Info.plist"
+          codesign --verify --strict --verbose=2 "$RUNNER_TEMP/out-macos/Metro.app"
+      - name: Toolchain, locked fetch and native tests of the launcher
+        run: |
+          set -eu
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal --target "$RUST_TARGET"
+          cargo fetch --locked --target "$RUST_TARGET"
+          python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
+          cargo test --locked --release --target "$RUST_TARGET" -p metro-desktop
+      - name: Build metro-desktop and metro-server (native, locked)
+        run: cargo build --locked --release --target "$RUST_TARGET" --bin metro-desktop --bin metro-server
+      - name: Third-party notices
+        run: |
+          python3 -I packaging/cargo-notices.py --target "$RUST_TARGET" \
+            --package metro-desktop --package metro-server --out "$RUNNER_TEMP/notices-desktop.txt"
+      - name: Package (outer Metro.app, ad hoc signed preview)
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -eu
+          rel="target/$RUST_TARGET/release"
+          python3 -I packaging/package.py desktop --target "$TARGET" --version "$VERSION" \
+            --launcher "$rel/metro-desktop" --server "$rel/metro-server" \
+            --ui-dir "$RUNNER_TEMP/out-macos/Metro.app" --nsh-root "$RUNNER_TEMP/nsh-macos/nsh" \
+            --notices "$RUNNER_TEMP/notices-desktop.txt" --out-dir dist-macos
+          ls -l dist-macos
+      - name: Install into a path with spaces, then a clean start and shutdown
+        timeout-minutes: 8
+        shell: bash
+        env:
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          home="$(mktemp -d "$RUNNER_TEMP/mac home.XXXXXX")"
+          home="$(cd "$home" && pwd -P)"
+          a="$GITHUB_WORKSPACE/dist-macos/Metro-$VERSION-$TARGET.tar.gz"
+          i="$GITHUB_WORKSPACE/packaging/install-metro-macos.sh"
+          HOME="$home" sh "$i" install --archive "$a"
+          dir="$home/Applications/Metro Desktop"
+          app="$dir/Metro.app"
+          launcher="$app/Contents/MacOS/Metro"
+          server_exe="$app/Contents/MacOS/metro-server"
+          ui="$app/Contents/Helpers/MetroUI.app/Contents/MacOS/Metro"
+          test "$(find "$dir" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | tr '\n' ' ')" = "Metro.app enable-local-runner "
+          codesign --verify --deep --strict "$app"
+          codesign --verify --strict "$app/Contents/Helpers/MetroUI.app"
+          plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist" | grep -qx dev.metro.desktop
+          plutil -extract CFBundleIdentifier raw "$app/Contents/Helpers/MetroUI.app/Contents/Info.plist" | grep -qx dev.metro.desktop.ui
+
+          # Preflight: the renderer is the packaged (pinned-runtime) one, and the
+          # launcher is neither the renderer nor the server.
+          digest() { shasum -a 256 "$1" | cut -c1-64; }
+          want_ui="$(python3 -I -c 'import json, sys; print(json.load(open(sys.argv[1]))["renderer"]["packaged_signed_sha256"])' \
+            "$home/Library/Application Support/Metro/Installer/RELEASE.json")"
+          test "$(digest "$ui")" = "$want_ui"
+          test "$(digest "$launcher")" != "$want_ui"
+          test "$(digest "$launcher")" != "$(digest "$server_exe")"
+
+          # Hard bound: RLIMIT_NPROC (per user on macOS) for the launcher and
+          # everything it starts, a little above what this user already runs.
+          used="$(ps -axo uid= | awk -v u="$(id -u)" '$1 == u' | wc -l | tr -d ' ')"
+          cap=$((used + 24))
+          ( ulimit -u "$cap" && test "$(ulimit -u)" = "$cap" ) || { echo "cannot enforce a process limit; not launching" >&2; exit 1; }
+
+          # Processes by exact executable path (ps comm is the full path on macOS).
+          procs() { ps -axo pid=,ppid=,comm= | awk '{ pid = $1; ppid = $2; sub(/^ *[0-9]+ +[0-9]+ /, ""); print pid "\t" ppid "\t" $0 }'; }
+          children() { procs | awk -F '\t' -v p="$1" -v e="$2" '$2 == p && $3 == e { print $1 }'; }
+          in_bundle() { procs | awk -F '\t' -v pre="$app/Contents/" 'index($3, pre) == 1 { print $1 }'; }
+          count() { grep -c . || true; }
+          # Launcher, guardian, UI and server, plus one transient process.
+          budget() {
+            n="$(in_bundle | count)"
+            [ "$n" -le 5 ] || { echo "process budget exceeded: $n processes from the bundle" >&2; exit 1; }
+          }
+          cleanup() { in_bundle | xargs kill -KILL 2>/dev/null || true; }
+          trap cleanup EXIT
+
+          export METRO_DESKTOP_HOME="$home/desktop data"
+          mkdir -p "$METRO_DESKTOP_HOME" "$RUNNER_TEMP/shot"
+          # The launcher's log stays on the runner; it is not printed.
+          ( ulimit -u "$cap"; exec "$launcher" ) >"$RUNNER_TEMP/launcher.log" 2>&1 &
+          pid=$!
+          healthy=0
+          for _ in $(seq 1 90); do
+            budget
+            kill -0 "$pid" 2>/dev/null || { echo "the launcher exited early" >&2; exit 1; }
+            server="$(children "$pid" "$server_exe")"
+            if [ "$(printf '%s\n' "$server" | count)" = 1 ]; then
+              listen="$(lsof -nP -a -p "$server" -iTCP -sTCP:LISTEN -Fn 2>/dev/null | sed -n 's/^n//p' || true)"
+              if printf '%s\n' "$listen" | grep . | grep -vqE '^(127\.0\.0\.1|\[::1\]):'; then
+                echo "the bundled metro-server listens beyond loopback" >&2; exit 1
+              fi
+              port="$(printf '%s\n' "$listen" | sed -n 's/^127\.0\.0\.1://p' | head -n1)"
+              if [ -n "$port" ] && [ "$(curl --noproxy '*' --silent --output /dev/null --write-out '%{http_code}' \
+                  --max-time 2 "http://127.0.0.1:$port/healthz" || true)" = 200 ]; then
+                healthy=1; break
+              fi
+            fi
+            sleep 1
+          done
+          [ "$healthy" = 1 ] || { echo "the bundled metro-server never answered /healthz with 200" >&2; exit 1; }
+
+          # Exactly one guardian (the launcher's own executable, guardian argument
+          # only) under the launcher, and exactly one UI under that guardian.
+          guardian="$(children "$pid" "$launcher")"
+          [ "$(printf '%s\n' "$guardian" | count)" = 1 ] || { echo "expected exactly one guardian under the launcher" >&2; exit 1; }
+          [ "$(ps -o args= -p "$guardian")" = "$launcher --metro-ui-guardian" ] || { echo "unexpected guardian command line" >&2; exit 1; }
+          uiproc=
+          for _ in $(seq 1 30); do
+            budget
+            uiproc="$(children "$guardian" "$ui")"
+            [ -n "$uiproc" ] && break
+            sleep 1
+          done
+          [ "$(printf '%s\n' "$uiproc" | count)" = 1 ] || { echo "expected exactly one UI under the guardian" >&2; exit 1; }
+          [ -z "$(children "$uiproc" "$launcher")" ] || { echo "a launcher runs below the UI" >&2; exit 1; }
+          sleep 5
+          budget
+          screencapture -x "$RUNNER_TEMP/shot/desktop-$TARGET.png" || true
+
+          kill -TERM "$pid"
+          for _ in $(seq 1 20); do kill -0 "$pid" 2>/dev/null || break; sleep 1; done
+          if kill -0 "$pid" 2>/dev/null; then echo "the launcher did not stop on SIGTERM" >&2; exit 1; fi
+          sleep 3
+          [ -z "$(in_bundle)" ] || { echo "a guardian, UI or server outlived the launcher" >&2; exit 1; }
+          trap - EXIT
+
+          HOME="$home" sh "$i" update --archive "$a" --no-local-runner
+          test ! -e "$dir/enable-local-runner"
+          HOME="$home" sh "$i" uninstall
+          test ! -e "$dir"
+          test -d "$METRO_DESKTOP_HOME"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: smoke-${{ matrix.target }}-screenshot
+          path: ${{ runner.temp }}/shot
+          if-no-files-found: ignore
+          retention-days: 7
+      # Named so it cannot be mistaken for a release asset.
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: preview-not-verified-adhoc-${{ matrix.target }}
+          path: dist-macos/
+          if-no-files-found: error
+          retention-days: 7
+
   # Combines every archive, writes one SHA256SUMS and (tag builds only) creates a
   # DRAFT release for a human to review and publish. Nothing is public until then.
   assets:
@@ -647,12 +946,15 @@ jobs:
     permissions:
       contents: read
     steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
       - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           pattern: dist-*
           path: ${{ runner.temp }}/collected
           merge-multiple: true
-      - name: SHA256SUMS
+      - name: SHA256SUMS (archives and the standalone installer scripts)
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
@@ -660,12 +962,18 @@ jobs:
           mkdir release
           cp "$RUNNER_TEMP"/collected/* release/
           expected="Metro-$VERSION-linux-x64.tar.gz Metro-$VERSION-windows-x64.zip Metro-runner-$VERSION-linux-x64.tar.gz"
+          # shellcheck disable=SC2086 # $expected is a fixed list of file names
           for f in $expected; do
             test -f "release/$f" && test -f "release/$f.sha256" || { echo "missing $f or its .sha256" >&2; ls release; exit 1; }
           done
-          test "$(ls release | wc -l)" -eq 6 || { echo "unexpected release files" >&2; ls release; exit 1; }
+          test "$(find release -mindepth 1 -maxdepth 1 | wc -l)" -eq 6 || { echo "unexpected release files" >&2; ls release; exit 1; }
           (cd release && for f in $expected; do sha256sum --check "$f.sha256"; done)
-          (cd release && sha256sum $expected | sort -k2 > SHA256SUMS && cat SHA256SUMS && sha256sum --check SHA256SUMS)
+          # Independent downloads; each checks the archive you give it against SHA256SUMS.
+          # (install-metro-macos.sh is not published until a notarized macOS build exists.)
+          scripts="install-metro-linux.sh install-metro-windows.ps1 install-metro-runner-linux.sh metro-runner-container.sh metro-runner-container.ps1"
+          for s in $scripts; do install -m 644 "packaging/$s" "release/$s"; done
+          # shellcheck disable=SC2086
+          (cd release && sha256sum $expected $scripts | sort -k2 > SHA256SUMS && cat SHA256SUMS && sha256sum --check SHA256SUMS)
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: release-assets

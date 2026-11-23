@@ -12,6 +12,7 @@ import shutil
 import stat
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import xml.etree.ElementTree as ET
@@ -23,6 +24,15 @@ NSH_APPS = {
     "windows": ("nsh-windows-app.exe", "3cde53d3a3d7d7bfc5eb30c670739116629034d3c3da89232c1ccbd90e01fd0f"),
     "linux": ("nsh-linux-app", "0a382b9e76ae45b5a28afc7d9ba0ea169e8390c8a21b94e74874907907d6d517"),
 }
+# Stock macOS runtimes from nsh-macos-<arch>.tar.gz (runtime/macos/nsh-macos-app).
+# `nsh package --target macos` copies this binary into the .app and ad hoc
+# signs it on a Mac, so the packaged copy is compared with its signature removed.
+NSH_MACOS_APPS = {
+    "macos-arm64": ("7b972892cf7d368abe31c1ce7d5ecc4f0ef5972e0aa5ca77048f13e75ca371b5", 0x0100000C),
+    "macos-x64": ("4fef59fd1f8813261e81326946750f5dc41302b6631f6dc75b30b3348be6ea89", 0x01000007),
+}
+MACOS_UI_ID = "dev.metro.desktop.ui"
+MACOS_MIN = "14.0"
 NSH_LICENSE_SHA = "ec75427ad955e3c740f22e7dc3f6db6fc5b2cc1d9135c2af91cece8dd47a2d38"
 WINDOWS_SYSTEM = set("""
 advapi32 bcrypt bcryptprimitives cfgmgr32 combase comctl32 coremessaging crypt32 d2d1 d3d11
@@ -284,12 +294,12 @@ def nsh_assets(actual, source):
     return found
 
 
-def nsh_resources(ui_dir, source, version):
+def nsh_resources(ui_dir, source, version, app_id=APP_ID):
     resources = directory(directory(ui_dir) / "nsh")
     require({p.name for p in resources.iterdir()} == {"app.json", "bundle.nshc", "capabilities.json", "assets"},
             "expected NSH resources (app.json, bundle.nshc, capabilities.json, assets) and no extras")
     app = read_json(resources / "app.json")
-    require((app.get("name"), app.get("id"), app.get("version")) == ("Metro", APP_ID, version),
+    require((app.get("name"), app.get("id"), app.get("version")) == ("Metro", app_id, version),
             "NSH manifest name, ID or version does not match; set --app-version when running nsh package")
     require(not any(app.get(key) for key in ("singleInstance", "schemes", "fileTypes")),
             "the stock renderer must not register itself as the top-level launcher")
@@ -424,6 +434,130 @@ def desktop(args, stage):
     return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked"}
 
 
+def macho(path, cputype):
+    """A thin 64-bit Mach-O executable for one architecture, linking only system libraries."""
+    with regular(path).open("rb") as stream:
+        header = stream.read(16)
+    require(len(header) == 16 and header[:4] == b"\xcf\xfa\xed\xfe"
+            and struct.unpack_from("<I", header, 4)[0] == cputype
+            and struct.unpack_from("<I", header, 12)[0] == 2,  # MH_EXECUTE
+            f"{path}: expected a thin 64-bit Mach-O executable for cputype {cputype:#x}")
+    output = subprocess.check_output(["otool", "-L", str(path)], text=True)
+    libs = [line.split(" (", 1)[0].strip() for line in output.splitlines()[1:] if line.strip()]
+    unknown = [lib for lib in libs if not lib.startswith(("/usr/lib/", "/System/Library/"))]
+    require(not unknown, f"{path}: links non-system libraries: {', '.join(unknown)}")
+    return {"needed": sorted(libs)}
+
+
+def codesign(*args):
+    subprocess.run(["codesign", *args], check=True, capture_output=True, text=True)
+
+
+def unsigned_bytes(path, work):
+    """The executable with its code signature removed, for comparison with the stock runtime."""
+    copy_path = work / f"unsigned-{len(list(work.iterdir()))}"
+    shutil.copyfile(regular(path), copy_path)
+    copy_path.chmod(0o755)
+    result = subprocess.run(["codesign", "--remove-signature", str(copy_path)], capture_output=True, text=True)
+    require(result.returncode == 0 or "not signed" in result.stderr,
+            f"{path}: cannot remove its code signature: {result.stderr.strip()}")
+    return copy_path.read_bytes()
+
+
+def macos(args, stage):
+    """Outer Metro.app (launcher + server) around the stock, signed NSH MetroUI.app."""
+    import plistlib
+    require(sys.platform == "darwin", "macOS packages are assembled on macOS (codesign is required)")
+    stock_sha, cputype = NSH_MACOS_APPS[args.target]
+    version = args.version.removeprefix("v")
+    base_version = version.split("-")[0].split("+")[0]
+    stock = args.nsh_root / "runtime/macos/nsh-macos-app"
+    require(sha256(stock) == stock_sha, f"--nsh-root must be the official NSH {NSH_VERSION} {args.target} runtime")
+    license_path = args.nsh_root / "LICENSE-APACHE"
+    require(sha256(license_path) == NSH_LICENSE_SHA, "unexpected NSH license text")
+
+    ui = directory(args.ui_dir)
+    require(ui.name.endswith(".app"), "--ui-dir must be the Metro.app that `nsh package --target macos` wrote")
+    contents = directory(ui / "Contents")
+    info = plistlib.loads(regular(contents / "Info.plist").read_bytes())
+    require((info.get("CFBundleExecutable"), info.get("CFBundleIdentifier"), info.get("CFBundleShortVersionString"))
+            == ("Metro", MACOS_UI_ID, version) and info.get("LSMinimumSystemVersion") == MACOS_MIN,
+            f"inner NSH Info.plist must have executable Metro, identifier {MACOS_UI_ID} and version {version}; "
+            f"run nsh package with --id {MACOS_UI_ID} --app-version {version}")
+    icon = info.get("CFBundleIconFile")
+    if icon and not icon.endswith(".icns"):
+        icon += ".icns"
+    require({p.name for p in contents.iterdir()} <= {"Info.plist", "MacOS", "Resources", "_CodeSignature", "PkgInfo"}
+            and {p.name for p in directory(contents / "MacOS").iterdir()} == {"Metro"}
+            and {p.name for p in directory(contents / "Resources").iterdir()} <= {"nsh", *([icon] if icon else [])},
+            "unexpected files in the NSH app bundle")
+    require(not any(p.is_symlink() for p in ui.rglob("*")), "the NSH app bundle must not contain links")
+    nsh_resources(contents / "Resources", RENDERER_SOURCE, version, MACOS_UI_ID)
+    inner_exe = contents / "MacOS/Metro"
+    codesign("--verify", "--strict", str(ui))
+    # Digests of the signed inner app as NSH produced it (after its ad hoc
+    # codesign); the stock runtime digest above is the unsigned original.
+    source_seal = sha256(contents / "_CodeSignature/CodeResources")
+    source_exe = sha256(inner_exe)
+    with tempfile.TemporaryDirectory() as work:
+        work = Path(work)
+        require(unsigned_bytes(inner_exe, work) == unsigned_bytes(stock, work),
+                f"inner executable must be the stock NSH {NSH_VERSION} {args.target} runtime")
+    deps = {"Metro.app/Contents/Helpers/MetroUI.app/Contents/MacOS/Metro": macho(inner_exe, cputype),
+            "Metro.app/Contents/MacOS/Metro": macho(args.launcher, cputype),
+            "Metro.app/Contents/MacOS/metro-server": macho(args.server, cputype)}
+    require(len({sha256(args.launcher), sha256(args.server), sha256(inner_exe)}) == 3,
+            "launcher, server and NSH renderer must be separate executables")
+
+    app = stage / "Metro.app"
+    out_contents = app / "Contents"
+    inner = out_contents / "Helpers/MetroUI.app"
+    shutil.copytree(ui, inner, symlinks=False, copy_function=shutil.copy2)
+
+    def inner_unchanged(when):
+        require(sha256(inner / "Contents/_CodeSignature/CodeResources") == source_seal
+                and sha256(inner / "Contents/MacOS/Metro") == source_exe,
+                f"the inner NSH app changed {when}")
+        codesign("--verify", "--strict", str(inner))
+    inner_unchanged("while it was copied")
+    copy(args.launcher, out_contents / "MacOS/Metro", True)
+    copy(args.server, out_contents / "MacOS/metro-server", True)
+    outer_info = {
+        "CFBundleDevelopmentRegion": "en", "CFBundleExecutable": "Metro", "CFBundleIdentifier": APP_ID,
+        "CFBundleName": "Metro", "CFBundleDisplayName": "Metro", "CFBundlePackageType": "APPL",
+        "CFBundleShortVersionString": base_version,
+        "CFBundleVersion": str(read_json(RENDERER_SOURCE / "nsh.json").get("build", 1)),
+        "CFBundleSupportedPlatforms": ["MacOSX"], "LSMinimumSystemVersion": MACOS_MIN,
+        "NSHighResolutionCapable": True, "NSPrincipalClass": "NSApplication",
+    }
+    if icon:
+        copy(contents / "Resources" / icon, out_contents / "Resources" / icon)
+        outer_info["CFBundleIconFile"] = icon
+    (out_contents / "Info.plist").write_bytes(plistlib.dumps(outer_info))
+    (out_contents / "Info.plist").chmod(0o644)
+    # Ad hoc signatures only (CI preview). Sign nested code first; never --deep,
+    # which would re-sign the stock inner app.
+    codesign("--force", "--sign", "-", "--timestamp=none", str(out_contents / "MacOS/metro-server"))
+    codesign("--force", "--sign", "-", "--timestamp=none", str(app))
+    codesign("--verify", "--deep", "--strict", str(app))
+    inner_unchanged("when the outer app was signed")
+    copy(license_path, stage / "licenses/NSH-LICENSE-APACHE.txt")
+    copy(brand_notice(RENDERER_SOURCE, nsh_resources(contents / "Resources", RENDERER_SOURCE, version, MACOS_UI_ID)),
+         stage / "licenses/BRAND-MARKS.txt")
+    write(stage / "START.txt",
+          "Metro for macOS — CI PREVIEW, NOT YET VERIFIED.\n"
+          "This build is ad hoc signed. It is not Developer ID signed or notarized,\n"
+          "so macOS may refuse to open it. Do not change Gatekeeper settings for it.\n\n"
+          f"Requires macOS {MACOS_MIN} or newer on {'Apple silicon' if args.target == 'macos-arm64' else 'an Intel Mac'}.\n"
+          "Install with install-metro-macos.sh, which places Metro.app in\n"
+          "~/Applications/Metro Desktop/ and keeps your data in\n"
+          "~/Library/Application Support/Metro/Desktop.\n")
+    return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked", "signing": "adhoc",
+            "status": "preview-not-verified",
+            "renderer": {"stock_unsigned_sha256": stock_sha, "packaged_signed_sha256": source_exe,
+                         "code_resources_sha256": source_seal}}
+
+
 def runner(args, stage):
     deps = elf(args.binary, (2, 36))
     copy(args.binary, stage / "metro-runner", True)
@@ -489,7 +623,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     kinds = parser.add_subparsers(dest="kind", required=True)
     d = kinds.add_parser("desktop")
-    d.add_argument("--target", required=True, choices=("windows-x64", "linux-x64"))
+    d.add_argument("--target", required=True, choices=("windows-x64", "linux-x64", "macos-arm64", "macos-x64"))
     d.add_argument("--launcher", required=True, type=Path)
     d.add_argument("--server", required=True, type=Path)
     d.add_argument("--ui-dir", required=True, type=Path)
@@ -521,7 +655,12 @@ def main():
         with tempfile.TemporaryDirectory(prefix=".metro-package-", dir=args.out_dir) as work:
             stage = Path(work) / "stage"
             stage.mkdir()
-            manifest = (desktop if args.kind == "desktop" else runner)(args, stage)
+            if args.kind == "runner":
+                manifest = runner(args, stage)
+            elif args.target.startswith("macos-"):
+                manifest = macos(args, stage)
+            else:
+                manifest = desktop(args, stage)
             copy(args.notices, stage / "licenses/THIRD-PARTY-NOTICES.txt")
             if args.metro_license:
                 copy(args.metro_license, stage / "licenses/METRO-LICENSE.txt")

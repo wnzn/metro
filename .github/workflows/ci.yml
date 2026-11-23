@@ -191,6 +191,32 @@ jobs:
               -c 'test "$(id -u)" != 0 && mkdir -p /workspace/spaces/s-a /workspace/spaces/s-b && : > /workspace/spaces/s-a/f && test -w /workspace/spaces/s-b'
           done
           docker volume rm metro-ci-workspaces
+      - name: Container runner script runs the image without exposing the token (no port, volume kept)
+        run: |
+          set -eu
+          home="$(mktemp -d "$RUNNER_TEMP/container home.XXXXXX")"
+          export HOME="$home"
+          unset XDG_CONFIG_HOME
+          s="$GITHUB_WORKSPACE/packaging/metro-runner-container.sh"
+          # On Linux the bind-mounted mode-600 token file must belong to the image's runner
+          # user (uid 1000 in the published image); build a variant for this CI user's uid.
+          docker build -q --target runner --build-arg "RUNNER_UID=$(id -u)" --build-arg "RUNNER_GID=$(id -g)" \
+            -t metro-runner:ci-uid "$GITHUB_WORKSPACE" >/dev/null
+          head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$home/runner token"
+          chmod 600 "$home/runner token"
+          sh "$s" setup --server-url https://metro.invalid --token-file "$home/runner token" \
+            --image metro-runner:ci-uid --name metro-ci-runner --volume metro-ci-runner-ws
+          sh "$s" start
+          sleep 5
+          test "$(docker inspect -f '{{.State.Running}} {{.HostConfig.ReadonlyRootfs}} {{.HostConfig.NetworkMode}} {{json .HostConfig.PortBindings}}' metro-ci-runner)" = 'true true bridge {}'
+          if docker inspect metro-ci-runner | grep -qF "$(cat "$home/runner token")" ||
+             docker logs metro-ci-runner 2>&1 | grep -qF "$(cat "$home/runner token")"; then
+            echo "the token is visible in the container configuration or log" >&2; exit 1
+          fi
+          docker logs metro-ci-runner 2>&1 | grep -q 'metro.invalid'
+          sh "$s" remove --purge-config
+          docker volume inspect metro-ci-runner-ws >/dev/null
+          docker volume rm metro-ci-runner-ws
 
       - name: Media protocol and preprocessing tests (test-double encoder, no model weights)
         run: |
@@ -263,10 +289,13 @@ jobs:
           set -eu
           bad="$(grep -hE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s+\./' | grep -vE 'uses:[[:space:]]+[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$)' || true)"
           [ -z "$bad" ] || { printf 'unpinned actions:\n%s\n' "$bad" >&2; exit 1; }
-      - name: Desktop packaging tests (PE resources, Linux icons and app-menu integration)
+      - name: Packaging and installer tests (PE resources, app-menu integration, isolated installers)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends desktop-file-utils libglib2.0-bin
+          sudo apt-get install -y -qq --no-install-recommends desktop-file-utils libglib2.0-bin shellcheck
+          shellcheck -s sh packaging/*.sh
+          # pwsh ships with the ubuntu-24.04 image; the PowerShell tests skip without it.
+          command -v pwsh
           python3 -B -m unittest discover -s packaging -v
 
   # Build and package everything a tag would release, but publish nothing.
