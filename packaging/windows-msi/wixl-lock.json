@@ -1,0 +1,47 @@
+{
+  "comment": "Pinned MSI build toolchain: Debian 13 (trixie) msitools 0.106+repack-1 (wixl, msibuild, msiinfo, msiextract) and the two libraries it needs that are not in a base Debian/Ubuntu image. Each .deb is checked against sha256 (from Debian's signed Packages index) before use; the extracted tree is then checked against tree_sha256. glib, libxml2, bzip2 and zlib come from the build host (Debian 13 or debian:trixie-slim).",
+  "tool_version": "0.106",
+  "debs": [
+    {
+      "name": "wixl_0.106+repack-1_amd64.deb",
+      "sha256": "79a743974007a76cbb3344354ca3246ef212318fdf60f80dfbf65d5e9f7ef150",
+      "urls": [
+        "https://snapshot.debian.org/archive/debian/20250501T000000Z/pool/main/m/msitools/wixl_0.106%2Brepack-1_amd64.deb",
+        "https://deb.debian.org/debian/pool/main/m/msitools/wixl_0.106%2Brepack-1_amd64.deb"
+      ]
+    },
+    {
+      "name": "msitools_0.106+repack-1_amd64.deb",
+      "sha256": "e0ed499506109b9ba28bcb7b0dcf9fcb2f094703721b835c33a0bef004513f69",
+      "urls": [
+        "https://snapshot.debian.org/archive/debian/20250501T000000Z/pool/main/m/msitools/msitools_0.106%2Brepack-1_amd64.deb",
+        "https://deb.debian.org/debian/pool/main/m/msitools/msitools_0.106%2Brepack-1_amd64.deb"
+      ]
+    },
+    {
+      "name": "libmsi-1.0-0_0.106+repack-1_amd64.deb",
+      "sha256": "6accb125b906b780c197eb2d5ab7e38f9e5d4b53f7543ba783235f503959169f",
+      "urls": [
+        "https://snapshot.debian.org/archive/debian/20250501T000000Z/pool/main/m/msitools/libmsi-1.0-0_0.106%2Brepack-1_amd64.deb",
+        "https://deb.debian.org/debian/pool/main/m/msitools/libmsi-1.0-0_0.106%2Brepack-1_amd64.deb"
+      ]
+    },
+    {
+      "name": "libgcab-1.0-0_1.6-1+b3_amd64.deb",
+      "sha256": "da0c5707a3f4e19cf2a10e310d44ec18b6bc66c7abac5054d2130345c65ffef6",
+      "urls": [
+        "https://snapshot.debian.org/archive/debian/20250501T000000Z/pool/main/g/gcab/libgcab-1.0-0_1.6-1%2Bb3_amd64.deb",
+        "https://deb.debian.org/debian/pool/main/g/gcab/libgcab-1.0-0_1.6-1%2Bb3_amd64.deb"
+      ]
+    },
+    {
+      "name": "libgsf-1-114_1.14.53-1_amd64.deb",
+      "sha256": "5e17ffb14343ee891da0abce4e32511c2d07dac964dc293ec740e78f89ed061c",
+      "urls": [
+        "https://snapshot.debian.org/archive/debian/20250501T000000Z/pool/main/libg/libgsf/libgsf-1-114_1.14.53-1_amd64.deb",
+        "https://deb.debian.org/debian/pool/main/libg/libgsf/libgsf-1-114_1.14.53-1_amd64.deb"
+      ]
+    }
+  ],
+  "tree_sha256": "65d7a17128e20cc0bf4de9842e06440261c4f7257095c71f5488b5473f11da2b"
+}

@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Metro's own shared UI definitions. wixl loads ui/Common.wxs and
+     ui/CancelDlg.wxs from the extension directory whenever the ui extension is on;
+     build_msi.py points the extension directory here so no third-party dialog files are used. -->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Fragment>
+    <UI Id="MetroCommon">
+      <TextStyle Id="MetroNormal" FaceName="Tahoma" Size="8" />
+      <TextStyle Id="MetroTitle" FaceName="Tahoma" Size="9" Bold="yes" />
+      <TextStyle Id="MetroBigger" FaceName="Tahoma" Size="12" />
+      <TextStyle Id="MetroWarning" FaceName="Tahoma" Size="8" Bold="yes" />
+
+      <UIText Id="AbsentPath" />
+      <UIText Id="bytes" Value="bytes" />
+      <UIText Id="KB" Value="KB" />
+      <UIText Id="MB" Value="MB" />
+      <UIText Id="GB" Value="GB" />
+      <UIText Id="NewFolder" Value="Folder|New Folder" />
+      <UIText Id="TimeRemaining" Value="Time remaining: {[1] minutes }{[2] seconds}" />
+      <UIText Id="VolumeCostAvailable" Value="Available" />
+      <UIText Id="VolumeCostDifference" Value="Difference" />
+      <UIText Id="VolumeCostRequired" Value="Required" />
+      <UIText Id="VolumeCostSize" Value="Disk Size" />
+      <UIText Id="VolumeCostVolume" Value="Volume" />
+    </UI>
+  </Fragment>
+</Wix>

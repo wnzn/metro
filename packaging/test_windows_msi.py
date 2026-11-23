@@ -1,0 +1,291 @@
+"""Tests for the Windows MSI builder (packaging/windows-msi/build_msi.py).
+
+Pure-Python checks (versions, payload validation, ZIP extraction, names) always
+run. Tests that compile MSIs need the pinned msitools tree from
+`build_msi.py fetch-tools`; point METRO_MSI_TOOLS at it, otherwise they skip.
+Nothing here installs anything: native msiexec checks are
+windows-msi/test-msi-windows.ps1 (Windows CI only).
+"""
+
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+import xml.etree.ElementTree as ET
+import zipfile
+
+HERE = Path(__file__).resolve().parent
+MSI_DIR = HERE / "windows-msi"
+sys.path.insert(0, str(MSI_DIR))
+import build_msi as b  # noqa: E402
+
+TOOLS = os.environ.get("METRO_MSI_TOOLS")
+
+
+def tmpdir(test):
+    d = tempfile.mkdtemp(prefix="metro-msi-test-")
+    test.addCleanup(shutil.rmtree, d, True)
+    return Path(d)
+
+
+class Versions(unittest.TestCase):
+    def pv(self, v):
+        return tuple(int(x) for x in b.windows_version(v)[0].split("."))
+
+    def test_order_follows_semver_for_supported_channels(self):
+        order = ["0.1.9", "0.2.0-setup-57409bb309ee", "0.2.0-alpha", "0.2.0-alpha.1", "0.2.0-beta.2",
+                 "0.2.0-rc.1", "0.2.0-rc.12", "0.2.0", "0.2.1-dev.x", "0.2.1-rc.1", "0.2.1", "0.3.0", "1.0.0"]
+        pvs = [self.pv(v) for v in order]
+        self.assertEqual(pvs, sorted(pvs))
+        self.assertEqual(len(set(pvs)), len(pvs))
+
+    def test_examples(self):
+        self.assertEqual(b.windows_version("0.2.0"), ("0.2.99", "release"))
+        self.assertEqual(b.windows_version("0.2.0-setup-57409bb309ee"), ("0.2.0", "dev"))
+        self.assertEqual(b.windows_version("0.2.0-rc.1"), ("0.2.51", "rc"))
+        self.assertEqual(b.windows_version("1.0.0+build.7"), ("1.0.99", "release"))
+
+    def test_unordered_builds_share_a_version_and_build_metadata_is_ignored(self):
+        self.assertEqual(self.pv("0.2.0-dev.aaa"), self.pv("0.2.0-dev.bbb"))
+        self.assertEqual(self.pv("0.2.0+a"), self.pv("0.2.0+b"))
+        self.assertNotEqual(b.product_code("release", "0.2.0-dev.aaa"), b.product_code("release", "0.2.0-dev.bbb"))
+
+    def test_limits(self):
+        for bad in ("256.0.0", "0.256.0", "0.0.655", "0.2.0-rc.49", "0.2.0-alpha.20", "v0.2.0", "0.2", "01.2.3",
+                    "0.2.0-", ""):
+            with self.subTest(bad=bad), self.assertRaises(b.Fail):
+                b.windows_version(bad)
+        self.assertEqual(b.windows_version("255.255.654")[0], "255.255.65499")
+
+    def test_identity_is_stable(self):
+        # Changing these breaks upgrades of installed copies.
+        self.assertEqual(b.IDENTITIES["release"]["upgrade_code"], "{29BBE899-7D6A-49A7-B60E-F9644544D683}")
+        self.assertEqual(b.product_code("release", "0.2.0"), b.product_code("release", "0.2.0"))
+        self.assertNotEqual(b.IDENTITIES["fixture"]["upgrade_code"], b.IDENTITIES["release"]["upgrade_code"])
+        self.assertNotEqual(b.IDENTITIES["fixture"]["default_dir"], b.IDENTITIES["release"]["default_dir"])
+        self.assertNotEqual(b.IDENTITIES["fixture"]["reg_key"], b.IDENTITIES["release"]["reg_key"])
+        # Never the script-managed folder (install-metro-windows.ps1 uses Programs\Metro).
+        self.assertNotEqual(b.IDENTITIES["release"]["default_dir"], "Metro")
+
+
+class Payload(unittest.TestCase):
+    def setUp(self):
+        self.root = tmpdir(self)
+        self.p = b.fake_payload(self.root, "1.0.0")
+
+    def manifest(self):
+        return json.loads((self.p / "RELEASE.json").read_text())
+
+    def write_manifest(self, m):
+        (self.p / "RELEASE.json").write_text(json.dumps(m))
+
+    def test_valid(self):
+        m, entries, digest = b.validate_payload(self.p, "1.0.0", required=("metro-tui.exe",))
+        self.assertIn("RELEASE.json", [e[0] for e in entries])
+        self.assertEqual(len(digest), 64)
+
+    def test_rejections(self):
+        cases = []
+
+        def tamper_hash():
+            (self.p / "Metro.exe").write_bytes(b"other")
+        cases.append(("does not match", tamper_hash))
+
+        def extra_file():
+            (self.p / "extra.dll").write_bytes(b"x")
+        cases.append(("does not list", extra_file))
+
+        def marker_in_payload():
+            (self.p / "enable-local-runner").write_bytes(b"")
+        cases.append(("does not list", marker_in_payload))
+
+        def link():
+            (self.p / "Metro.exe").unlink()
+            (self.p / "Metro.exe").symlink_to(self.p / "metro-server.exe")
+        cases.append(("missing", link))
+
+        def wrong_version():
+            m = self.manifest(); m["version"] = "1.0.1"; self.write_manifest(m)
+        cases.append(("version", wrong_version))
+
+        def no_marker_support():
+            m = self.manifest(); del m["local_runner"]; self.write_manifest(m)
+        cases.append(("local_runner", no_marker_support))
+
+        def missing_required():
+            m = self.manifest(); del m["files"]["metro-server.exe"]; self.write_manifest(m)
+            (self.p / "metro-server.exe").unlink()
+        cases.append(("missing metro-server.exe", missing_required))
+
+        for bad in ("../x", "a/../b", "a\\b", "CON.txt", "x:y", "trail.", "/abs"):
+            def bad_name(bad=bad):
+                m = self.manifest(); m["files"][bad] = "0" * 64; self.write_manifest(m)
+            cases.append(("", bad_name))
+
+        def case_collision():
+            (self.p / "METRO.exe").write_bytes(b"x")
+            m = self.manifest(); m["files"]["METRO.exe"] = hashlib.sha256(b"x").hexdigest(); self.write_manifest(m)
+        cases.append(("case", case_collision))
+
+        for want, fn in cases:
+            with self.subTest(fn=fn.__name__):
+                shutil.rmtree(self.root)
+                self.root.mkdir()
+                self.p = b.fake_payload(self.root, "1.0.0")
+                fn()
+                with self.assertRaises(b.Fail) as ctx:
+                    b.validate_payload(self.p, "1.0.0")
+                self.assertIn(want, str(ctx.exception))
+
+    def test_require_file(self):
+        m = self.manifest()
+        del m["files"]["metro-tui.exe"]
+        self.write_manifest(m)
+        (self.p / "metro-tui.exe").unlink()
+        b.validate_payload(self.p, "1.0.0")
+        with self.assertRaises(b.Fail):
+            b.validate_payload(self.p, "1.0.0", required=("metro-tui.exe",))
+
+
+class Extract(unittest.TestCase):
+    def make_zip(self, d, name, members):
+        z = d / name
+        with zipfile.ZipFile(z, "w") as f:
+            for n, data in members.items():
+                f.writestr(n, data)
+        return z, b.sha256_file(z)
+
+    def test_roundtrip_and_refusals(self):
+        d = tmpdir(self)
+        src = b.fake_payload(d / "src", "1.0.0")
+        members = {f"{src.name}/{p.relative_to(src).as_posix()}": p.read_bytes()
+                   for p in src.rglob("*") if p.is_file()}
+        z, digest = self.make_zip(d, "Metro-1.0.0-windows-x64.zip", members)
+        payload, semver = b.extract_zip(z, digest, d / "out")
+        self.assertEqual(semver, "1.0.0")
+        b.validate_payload(payload, "1.0.0")
+        with self.assertRaises(b.Fail):
+            b.extract_zip(z, "0" * 64, d / "out2")
+        with self.assertRaises(b.Fail):
+            b.extract_zip(z, digest, d / "out")  # not empty
+        bads = ("../evil", "Metro-1.0.0-windows-x64/../evil", "other/x", "Metro-1.0.0-windows-x64/a\\b",
+                "Metro-1.0.0-windows-x64/c:x", "Metro-1.0.0-windows-x64/dir/")
+        for i, bad in enumerate(bads):
+            with self.subTest(bad=bad):
+                (d / f"z{i}").mkdir()
+                z2, dg2 = self.make_zip(d / f"z{i}", "Metro-1.0.0-windows-x64.zip", {bad: b"x"})
+                with self.assertRaises(b.Fail):
+                    b.extract_zip(z2, dg2, d / f"o{i}")
+                self.assertFalse((d / "evil").exists())
+        with self.assertRaises(b.Fail):
+            b.extract_zip(d / "Metro-1.0.0-linux-x64.tar.gz", digest, d / "o3")
+
+
+class Sources(unittest.TestCase):
+    def test_wxs_files_are_wellformed(self):
+        for p in [MSI_DIR / "metro-ui.wxs", *sorted((MSI_DIR / "wixl-ext/ui").glob("*.wxs"))]:
+            with self.subTest(p=p.name):
+                ET.parse(p)
+
+    def test_generated_product_is_wellformed(self):
+        d = tmpdir(self)
+        p = b.fake_payload(d, "1.0.0")
+        _, entries, _ = b.validate_payload(p, "1.0.0")
+        xml = b.product_wxs("release", "1.0.0", "1.0.99", entries, p, d / "marker", False)
+        root = ET.fromstring(xml)
+        self.assertEqual(len(root.findall(".//{*}CustomAction")), 9)
+        self.assertFalse([c for c in root.iter() if c.tag.endswith("CustomAction")
+                          and set(c.attrib) - {"Id", "Property", "Value"}], "only property-setting actions")
+
+    def test_short_names(self):
+        used = set()
+        self.assertEqual(b.msi_name("Metro.exe", "Metro.exe", used), "Metro.exe")
+        n = b.msi_name("metro-server.exe", "metro-server.exe", used)
+        self.assertRegex(n, r"^[0-9A-F]{8}\.exe\|metro-server\.exe$")
+        self.assertEqual(b.msi_name("Metro.exe", "x/Metro.exe", used).split("|")[1], "Metro.exe")  # collision
+
+    def test_lock_is_pinned(self):
+        lock = json.loads((MSI_DIR / "wixl-lock.json").read_text())
+        self.assertRegex(lock["tree_sha256"], r"^[0-9a-f]{64}$")
+        for deb in lock["debs"]:
+            self.assertRegex(deb["sha256"], r"^[0-9a-f]{64}$")
+            self.assertTrue(all(u.startswith("https://") for u in deb["urls"]))
+
+
+@unittest.skipUnless(TOOLS, "set METRO_MSI_TOOLS to a `build_msi.py fetch-tools` directory")
+class Build(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.tools = b.Tools(TOOLS)
+
+    def build(self, d, v="1.0.0", **kw):
+        p = b.fake_payload(d / ("p-" + v), v)
+        out = d / kw.pop("name", f"Metro-{v}-windows-x64.msi")
+        return p, out, b.build(self.tools, p, v, out, epoch=315532800, **kw)
+
+    def test_build_inspect_reproducible(self):
+        d1, d2 = tmpdir(self), tmpdir(self)
+        p, out1, info = self.build(d1)
+        _, out2, _ = self.build(d2)
+        self.assertEqual(out1.read_bytes(), out2.read_bytes())
+        self.assertEqual(info["signing"], "unsigned")
+        self.assertTrue(info["payload"]["has_metro_tui"])
+        b.inspect(self.tools, out1, "1.0.0", payload=p)
+        with self.assertRaises(b.Fail):
+            b.inspect(self.tools, out1, "1.0.0", payload=p, preview=True)
+
+    def test_names_and_overwrite(self):
+        d = tmpdir(self)
+        with self.assertRaises(b.Fail):
+            self.build(d, name="metro.msi")
+        with self.assertRaises(b.Fail):
+            self.build(d, name="Metro-1.0.0-windows-x64.msi", preview=True)
+        _, out, _ = self.build(d, name="Metro-1.0.0-windows-x64.unsigned-preview.msi", preview=True)
+        b.inspect(self.tools, out, "1.0.0", preview=True)
+        existing = d / "Metro-1.0.0-windows-x64.msi"
+        existing.write_bytes(b"signed already")
+        with self.assertRaises(b.Fail):
+            self.build(d)
+        self.assertEqual(existing.read_bytes(), b"signed already")
+
+    def test_package_code_follows_payload(self):
+        d = tmpdir(self)
+        p, out, info = self.build(d)
+        # Same version, different bytes (e.g. signed EXEs): same ProductCode, new PackageCode.
+        (p / "Metro.exe").write_bytes(b"signed")
+        m = json.loads((p / "RELEASE.json").read_text())
+        m["files"]["Metro.exe"] = hashlib.sha256(b"signed").hexdigest()
+        (p / "RELEASE.json").write_text(json.dumps(m))
+        out2 = d / "again" / out.name
+        out2.parent.mkdir()
+        info2 = b.build(self.tools, p, "1.0.0", out2, epoch=315532800)
+        self.assertEqual(info["product_code"], info2["product_code"])
+        self.assertNotEqual(info["package_code"], info2["package_code"])
+
+    def test_inspect_catches_a_missing_browse_dialog(self):
+        d = tmpdir(self)
+        p, out, _ = self.build(d)
+        self.tools.run("msibuild", out, "-q", "DELETE FROM `Control` WHERE `Dialog_` = 'BrowseDlg' "
+                                              "AND `Control` = 'DirectoryList'")
+        with self.assertRaises(b.Fail) as ctx:
+            b.inspect(self.tools, out, "1.0.0", payload=p)
+        self.assertIn("DirectoryList", str(ctx.exception))
+
+    def test_inspect_catches_changed_bytes(self):
+        d = tmpdir(self)
+        p, out, _ = self.build(d)
+        (p / "ui/Metro.exe").write_bytes(b"different")
+        m = json.loads((p / "RELEASE.json").read_text())
+        m["files"]["ui/Metro.exe"] = hashlib.sha256(b"different").hexdigest()
+        (p / "RELEASE.json").write_text(json.dumps(m))
+        with self.assertRaises(b.Fail):
+            b.inspect(self.tools, out, "1.0.0", payload=p)
+
+
+if __name__ == "__main__":
+    unittest.main()
