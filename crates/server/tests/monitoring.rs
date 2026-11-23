@@ -53,11 +53,18 @@ fn auth() -> Arc<FakeAuth> {
     ])))
 }
 
-/// A model endpoint nobody listens on.
-fn dead_model() -> ModelConfig {
-    let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+/// A model endpoint that drops every connection unanswered. It keeps its
+/// port, so no other test's server can take it and answer instead.
+async fn dead_model() -> ModelConfig {
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = l.local_addr().unwrap();
+    tokio::spawn(async move {
+        while let Ok((conn, _)) = l.accept().await {
+            drop(conn);
+        }
+    });
     ModelConfig {
-        base_url: format!("http://{}/v1", l.local_addr().unwrap()),
+        base_url: format!("http://{addr}/v1"),
         model: "mock".into(),
         api_key: "sk-test-monitoring-secret".into(),
     }
@@ -239,7 +246,7 @@ fn pair(c: &str, k: &str) -> (String, String) {
 
 #[tokio::test]
 async fn space_events_are_owner_only_scoped_and_carry_no_raw_text() {
-    let model = dead_model();
+    let model = dead_model().await;
     let model_addr = model.base_url.clone();
     let s = Server::start(
         config(Some(model), 500, Duration::from_secs(3600)),
@@ -437,4 +444,281 @@ async fn retention_by_count_and_age_holds_across_restarts() {
     let s = restart(&path, 500, hour).await;
     assert!(s.codes(ALICE, &q).await.is_empty());
     assert_eq!(s.codes(DAVE, "").await, vec![pair("server", "started"); 2]);
+}
+
+// ---- Personal scope (`?scope=me`) ----
+
+/// A model endpoint that answers every call with `text`, or never answers.
+async fn mock_model(hang: bool) -> ModelConfig {
+    use axum::routing::post;
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(move || async move {
+            if hang {
+                tokio::time::sleep(Duration::from_secs(120)).await;
+            }
+            axum::Json(json!({
+                "id": "chatcmpl-1", "object": "chat.completion", "created": 0, "model": "mock",
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant", "content": "fine"}}],
+                "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    ModelConfig {
+        base_url,
+        model: "mock".into(),
+        api_key: "test-key".into(),
+    }
+}
+
+impl Server {
+    /// Ask the agent in `token`'s personal Chat and wait for the turn to end.
+    async fn personal_turn(&self, token: &str, text: &str, phase: &str) {
+        let before = self.chat_phases(token, phase).await;
+        let (s, v) = self
+            .post(
+                token,
+                "/v1/chat/messages",
+                json!({"text": text, "invoke_agent": true}),
+            )
+            .await;
+        assert!(s.is_success(), "{v}");
+        for _ in 0..400 {
+            if self.chat_phases(token, phase).await > before {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("no personal turn ended {phase}");
+    }
+
+    async fn chat_phases(&self, token: &str, phase: &str) -> usize {
+        let (_, v) = self.get(token, "/v1/chat/events").await;
+        v["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["activity"]["phase"] == phase)
+            .count()
+    }
+}
+
+#[tokio::test]
+async fn personal_events_belong_to_the_caller_alone_and_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metro.sqlite3");
+    let model = dead_model().await;
+    let s = Server::start(
+        config(Some(model.clone()), 500, Duration::from_secs(3600)),
+        Db::open(&path).unwrap(),
+    )
+    .await;
+    let a = s.space(ALICE, "alpha").await;
+    s.add(ALICE, &a, "bob").await;
+    s.personal_turn(ALICE, "my private question about /home/alice?x=1", "failed")
+        .await;
+
+    let me = "?scope=me";
+    assert_eq!(s.codes(ALICE, me).await, [pair("provider", "unreachable")]);
+    let (_, raw) = s.monitoring(ALICE, me).await;
+    for secret in [
+        "private question",
+        "/home/alice",
+        "x=1",
+        "127.0.0.1",
+        "alice",
+    ] {
+        assert!(!raw.to_string().contains(secret), "{secret} leaked: {raw}");
+    }
+    // Another account, the org admin included, sees only their own (none).
+    assert!(s.codes(BOB, me).await.is_empty());
+    assert!(s.codes(DAVE, me).await.is_empty());
+    // No overlap: the personal event is in no Space and not in the instance.
+    assert!(s.codes(ALICE, &format!("?space_id={a}")).await.is_empty());
+    assert_eq!(s.codes(DAVE, "").await, [pair("server", "started")]);
+
+    // Malicious combinations name no other scope: refused, never Alice's.
+    for query in [
+        format!("?scope=me&space_id={a}"),
+        format!("?space_id={a}&scope=me"),
+        "?scope=alice".to_owned(),
+        "?scope=user".to_owned(),
+        "?scope=instance".to_owned(),
+        "?scope=ME".to_owned(),
+        "?scope=".to_owned(),
+        "?scope=me&user_id=alice".to_owned(),
+        "?user_id=alice".to_owned(),
+        "?scope=me&scope=alice".to_owned(),
+        "?scope=me&scope=me".to_owned(),
+    ] {
+        let (st, v) = s.monitoring(DAVE, &query).await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{query}: {v}");
+        assert!(v.get("events").is_none(), "{query}");
+    }
+    // A user id passed as a Space id is just an unknown Space.
+    assert_eq!(
+        s.monitoring(DAVE, "?space_id=alice").await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s.monitoring(ALICE, "?space_id=alice").await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    // Refusal before a turn starts is recorded too (no usable model).
+    let s = Server::start(
+        config(None, 500, Duration::from_secs(3600)),
+        Db::open(&path).unwrap(),
+    )
+    .await;
+    let (st, _) = s
+        .post(
+            BOB,
+            "/v1/chat/messages",
+            json!({"text": "hi", "invoke_agent": true}),
+        )
+        .await;
+    assert!(st.is_success() || st.is_client_error());
+    for _ in 0..200 {
+        if !s.codes(BOB, me).await.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(s.codes(BOB, me).await, [pair("provider", "unavailable")]);
+    // Alice's event persisted across the restart, still hers alone.
+    assert_eq!(s.codes(ALICE, me).await, [pair("provider", "unreachable")]);
+    assert!(s.codes(DAVE, me).await.is_empty());
+    assert_eq!(s.codes(DAVE, "").await, vec![pair("server", "started"); 2]);
+}
+
+#[tokio::test]
+async fn success_notes_cancellation_and_lost_membership_record_nothing() {
+    // Success and notes.
+    let s = Server::start(
+        config(
+            Some(mock_model(false).await),
+            500,
+            Duration::from_secs(3600),
+        ),
+        Db::open_in_memory().unwrap(),
+    )
+    .await;
+    let a = s.space(ALICE, "alpha").await;
+    s.personal_turn(ALICE, "hello", "completed").await;
+    s.post(ALICE, "/v1/chat/messages", json!({"text": "note to self"}))
+        .await;
+    s.post(
+        ALICE,
+        &format!("/v1/spaces/{a}/rooms/lobby/messages"),
+        json!({"text": "hi", "invoke_agent": true}),
+    )
+    .await;
+    s.wait_phase(ALICE, &a, "completed", 1).await;
+    s.post(
+        ALICE,
+        &format!("/v1/spaces/{a}/rooms/lobby/messages"),
+        json!({"text": "just a note for people"}),
+    )
+    .await;
+    assert!(s.codes(ALICE, "?scope=me").await.is_empty());
+    assert!(s.codes(ALICE, &format!("?space_id={a}")).await.is_empty());
+
+    // Cancellation, and a member removed mid-run.
+    let s = Server::start(
+        config(Some(mock_model(true).await), 500, Duration::from_secs(3600)),
+        Db::open_in_memory().unwrap(),
+    )
+    .await;
+    let a = s.space(ALICE, "alpha").await;
+    s.add(ALICE, &a, "bob").await;
+    let ask = |token: &'static str| {
+        let path = format!("/v1/spaces/{a}/rooms/lobby/messages");
+        let s = &s;
+        async move {
+            let (st, v) = s
+                .post(token, &path, json!({"text": "work", "invoke_agent": true}))
+                .await;
+            assert!(st.is_success(), "{v}");
+        }
+    };
+    ask(ALICE).await;
+    let (_, runs) = s.get(ALICE, "/v1/runs").await;
+    let run = runs["runs"][0]["id"].as_str().unwrap().to_owned();
+    let (st, v) = s
+        .post(ALICE, &format!("/v1/runs/{run}/stop"), json!({}))
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    s.wait_phase(ALICE, &a, "cancelled", 1).await;
+
+    ask(BOB).await;
+    let (st, _) = s
+        .send(
+            reqwest::Method::DELETE,
+            ALICE,
+            &format!("/v1/spaces/{a}/members"),
+            Some(json!({"user_id": "bob"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    s.wait_phase(ALICE, &a, "cancelled", 2).await;
+    // Bob's next ask is refused for membership: no event anywhere.
+    let (st, _) = s
+        .post(
+            BOB,
+            &format!("/v1/spaces/{a}/rooms/lobby/messages"),
+            json!({"text": "again", "invoke_agent": true}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    assert!(s.codes(ALICE, &format!("?space_id={a}")).await.is_empty());
+    assert!(s.codes(ALICE, "?scope=me").await.is_empty());
+    assert!(s.codes(BOB, "?scope=me").await.is_empty());
+}
+
+#[tokio::test]
+async fn the_first_layout_and_older_databases_migrate_on_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("metro.sqlite3");
+    let s = restart(&path, 500, Duration::from_secs(3600)).await;
+    let a = s.space(ALICE, "alpha").await;
+
+    // Turn the file into one written by 797eac1: the first layout.
+    let now = chrono::Utc::now().timestamp_millis();
+    {
+        let conn = rusqlite::Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "DROP TABLE monitoring_log;
+             CREATE TABLE monitoring_events (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, space_id TEXT,
+                 component TEXT NOT NULL, code TEXT NOT NULL, created_at INTEGER NOT NULL);
+             CREATE INDEX monitoring_events_scope ON monitoring_events (space_id, id);
+             CREATE INDEX monitoring_events_age ON monitoring_events (created_at);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO monitoring_events (space_id, component, code, created_at)
+             VALUES (?1, 'runner', 'not_claimed', ?2), (NULL, 'server', 'started', ?2)",
+            rusqlite::params![a, now],
+        )
+        .unwrap();
+    }
+    let s = restart(&path, 500, Duration::from_secs(3600)).await;
+    let q = format!("?space_id={a}");
+    assert_eq!(s.codes(ALICE, &q).await, [pair("runner", "not_claimed")]);
+    assert_eq!(s.codes(DAVE, "").await, vec![pair("server", "started"); 2]);
+    assert!(s.codes(ALICE, "?scope=me").await.is_empty());
+
+    // A database from before monitoring existed: the log is created empty.
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch("DROP TABLE monitoring_log;")
+        .unwrap();
+    let s = restart(&path, 500, Duration::from_secs(3600)).await;
+    assert!(s.codes(ALICE, &q).await.is_empty());
+    assert_eq!(s.codes(DAVE, "").await, [pair("server", "started")]);
 }

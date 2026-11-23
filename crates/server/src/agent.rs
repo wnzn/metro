@@ -1071,14 +1071,19 @@ async fn run_personal(
         }
     };
     let append = |kind: &'static str, text: String| append_as(kind, text, None);
+    // Refusals are recorded only in this person's own scope, as a code.
     let model = match route_model(&state, &user_id, None, &mut route).await {
         Ok(model) => model,
         Err(message) => {
             append(kind::ERROR, message.clone()).await;
+            state
+                .monitor_personal(&user_id, Code::ProviderUnavailable)
+                .await;
             return Err(message);
         }
     };
     let Ok(permit) = state.agent_runs.clone().try_acquire_owned() else {
+        state.monitor_personal(&user_id, Code::AgentBusy).await;
         let message = "The agent is busy with other requests; try again shortly.".to_owned();
         append(kind::ERROR, message.clone()).await;
         return Err(message);
@@ -1144,6 +1149,9 @@ async fn execute_personal_run(
         Ok(events) => events,
         Err(e) => {
             tracing::error!(error = %format!("{e:#}"), "loading personal history");
+            state
+                .monitor_personal(&user_id, Code::AgentHistoryUnavailable)
+                .await;
             tagged(
                 kind::ERROR,
                 "The agent could not read your Chat history.".to_owned(),
@@ -1186,8 +1194,9 @@ async fn execute_personal_run(
             }
             activity::COMPLETED
         }
-        // Personal Chat is private: its failures are never monitoring events.
-        Outcome::Failed(text, _) => {
+        // Only the person whose Chat this is can read it, and only the code.
+        Outcome::Failed(text, code) => {
+            state.monitor_personal(&user_id, code).await;
             tagged(kind::ERROR, text).await;
             activity::FAILED
         }
