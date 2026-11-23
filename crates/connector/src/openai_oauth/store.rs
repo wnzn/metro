@@ -1,5 +1,12 @@
-//! The per-connection profile directory: mode-0700 dir, atomic mode-0600
+//! The per-connection profile directory: a private directory, atomic private
 //! JSON files, and a cross-process lock file.
+//!
+//! - Unix: a mode-0700 directory of mode-0600 files, checked on every open.
+//! - Windows: a directory with a protected DACL (this user and SYSTEM only,
+//!   inherited by its files), re-applied whenever a sign-in opens it, and every
+//!   file sealed with DPAPI for the current user, so a copied or mis-shared
+//!   file still can't be read by another account. Nothing is ever written in
+//!   plain text there.
 
 use std::fs;
 use std::io::Write;
@@ -91,13 +98,13 @@ impl Profile {
                         dir.display()
                     );
                 }
-                check_mode(&meta, 0o700, dir)?;
+                check_dir(&meta, dir, create)?;
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 if !create {
                     return Ok(None);
                 }
-                create_dir_700(dir)?;
+                create_private_dir(dir)?;
             }
             Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
         }
@@ -186,6 +193,7 @@ impl Profile {
             bail!("{name} in the connection profile is too large");
         }
         let bytes = fs::read(&path).with_context(|| format!("reading {name}"))?;
+        let bytes = unseal(bytes).with_context(|| format!("reading {name}"))?;
         // The error never includes file contents.
         let value = serde_json::from_slice(&bytes).map_err(|e| {
             anyhow::anyhow!(
@@ -197,7 +205,8 @@ impl Profile {
     }
 
     fn write<T: Serialize>(&self, name: &str, value: &T) -> Result<()> {
-        let bytes = serde_json::to_vec_pretty(value).context("encoding profile file")?;
+        let bytes = seal(serde_json::to_vec_pretty(value).context("encoding profile file")?)
+            .with_context(|| format!("writing {name}"))?;
         let tmp = self
             .dir
             .join(format!(".{name}.tmp-{}", hex(&random_bytes::<8>())));
@@ -258,9 +267,14 @@ fn platform_check() -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn platform_check() -> Result<()> {
-    bail!("the OpenAI device connection needs Unix file permissions for its credential store")
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn platform_check() -> Result<()> {
+    bail!("the OpenAI device connection has no private credential store on this platform")
 }
 
 #[cfg(unix)]
@@ -276,13 +290,37 @@ fn check_mode(meta: &fs::Metadata, want: u32, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Windows files carry no mode: they inherit the directory's protected DACL
+/// and their contents are DPAPI-sealed (see `seal`).
 #[cfg(not(unix))]
 fn check_mode(_: &fs::Metadata, _: u32, _: &Path) -> Result<()> {
     platform_check()
 }
 
 #[cfg(unix)]
-fn create_dir_700(dir: &Path) -> Result<()> {
+fn check_dir(meta: &fs::Metadata, dir: &Path, _create: bool) -> Result<()> {
+    check_mode(meta, 0o700, dir)
+}
+
+/// A sign-in (`create`) re-applies the protected DACL, so a directory whose
+/// ACL was widened is narrowed before anything is written into it. Reads
+/// don't rewrite ACLs: every file is DPAPI-sealed for this user anyway.
+#[cfg(windows)]
+fn check_dir(_meta: &fs::Metadata, dir: &Path, create: bool) -> Result<()> {
+    if create {
+        crate::desktop::store::protect_private_dir(dir)
+            .with_context(|| format!("securing {}", dir.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn check_dir(_: &fs::Metadata, _: &Path, _: bool) -> Result<()> {
+    platform_check()
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
     fs::DirBuilder::new()
         .mode(0o700)
@@ -293,8 +331,15 @@ fn create_dir_700(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(unix))]
-fn create_dir_700(_: &Path) -> Result<()> {
+#[cfg(windows)]
+fn create_private_dir(dir: &Path) -> Result<()> {
+    fs::create_dir(dir).with_context(|| format!("creating {}", dir.display()))?;
+    crate::desktop::store::protect_private_dir(dir)
+        .with_context(|| format!("securing {}", dir.display()))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn create_private_dir(_: &Path) -> Result<()> {
     platform_check()
 }
 
@@ -317,7 +362,33 @@ fn open_private(path: &Path, create: bool) -> Result<fs::File> {
     Ok(f)
 }
 
-#[cfg(not(unix))]
+/// The lock file holds nothing secret; it only has to be a plain file, never
+/// a link, inside the protected directory.
+#[cfg(windows)]
+fn open_private(path: &Path, create: bool) -> Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // FILE_FLAG_OPEN_REPARSE_POINT: open a link itself, never its target.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    if let Ok(meta) = fs::symlink_metadata(path)
+        && (!meta.is_file() || meta.file_type().is_symlink())
+    {
+        bail!("{} is not a regular file", path.display());
+    }
+    let f = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(create)
+        .truncate(false)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    if !f.metadata()?.is_file() {
+        bail!("{} is not a regular file", path.display());
+    }
+    Ok(f)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn open_private(_: &Path, _: bool) -> Result<fs::File> {
     platform_check()?;
     unreachable!()
@@ -333,10 +404,136 @@ fn create_new_private(path: &Path) -> Result<fs::File> {
         .open(path)?)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn create_new_private(path: &Path) -> Result<fs::File> {
+    Ok(fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn create_new_private(_: &Path) -> Result<fs::File> {
     platform_check()?;
     unreachable!()
+}
+
+/// Unix files are already private by mode: stored as they are.
+#[cfg(not(windows))]
+fn seal(plain: Vec<u8>) -> Result<Vec<u8>> {
+    Ok(plain)
+}
+
+#[cfg(not(windows))]
+fn unseal(stored: Vec<u8>) -> Result<Vec<u8>> {
+    Ok(stored)
+}
+
+#[cfg(windows)]
+fn seal(mut plain: Vec<u8>) -> Result<Vec<u8>> {
+    let r = dpapi::protect(&plain);
+    zeroize::Zeroize::zeroize(&mut plain);
+    r
+}
+
+#[cfg(windows)]
+fn unseal(stored: Vec<u8>) -> Result<Vec<u8>> {
+    dpapi::unprotect(&stored)
+}
+
+/// DPAPI for the current Windows user (`CryptProtectData` without
+/// `CRYPTPROTECT_LOCAL_MACHINE`): only this account on this computer can
+/// unseal what it seals.
+#[cfg(windows)]
+mod dpapi {
+    use anyhow::{Result, bail};
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Cryptography::{
+        CRYPT_INTEGER_BLOB, CRYPTPROTECT_UI_FORBIDDEN, CryptProtectData, CryptUnprotectData,
+    };
+
+    /// Marks a sealed file. A file without it is refused, never read as plain text.
+    const MAGIC: &[u8] = b"metro-dpapi-v1\n";
+    /// Binds the blobs to this store: another DPAPI user can't reuse them.
+    const ENTROPY: &[u8] = b"metro-connector openai_oauth profile v1";
+
+    fn blob(b: &[u8]) -> CRYPT_INTEGER_BLOB {
+        CRYPT_INTEGER_BLOB {
+            cbData: b.len() as u32,
+            pbData: b.as_ptr() as *mut u8,
+        }
+    }
+
+    /// Copies DPAPI's output, wipes it and frees it.
+    ///
+    /// SAFETY: `out` must be a blob DPAPI allocated with LocalAlloc.
+    unsafe fn take(out: CRYPT_INTEGER_BLOB) -> Vec<u8> {
+        unsafe {
+            let s = std::slice::from_raw_parts_mut(out.pbData, out.cbData as usize);
+            let v = s.to_vec();
+            s.fill(0);
+            LocalFree(out.pbData.cast());
+            v
+        }
+    }
+
+    pub fn protect(plain: &[u8]) -> Result<Vec<u8>> {
+        let input = blob(plain);
+        let entropy = blob(ENTROPY);
+        let mut out = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        // SAFETY: the input blobs borrow live slices; DPAPI allocates `out`.
+        let ok = unsafe {
+            CryptProtectData(
+                &input,
+                std::ptr::null(),
+                &entropy,
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out,
+            )
+        };
+        if ok == 0 || out.pbData.is_null() {
+            bail!("Windows could not protect the sign-in data for this user (DPAPI)");
+        }
+        // SAFETY: allocated by CryptProtectData.
+        let sealed = unsafe { take(out) };
+        let mut v = MAGIC.to_vec();
+        v.extend_from_slice(&sealed);
+        Ok(v)
+    }
+
+    pub fn unprotect(stored: &[u8]) -> Result<Vec<u8>> {
+        let Some(sealed) = stored.strip_prefix(MAGIC) else {
+            bail!("the file is not sealed for this Windows user; sign in again");
+        };
+        let input = blob(sealed);
+        let entropy = blob(ENTROPY);
+        let mut out = CRYPT_INTEGER_BLOB {
+            cbData: 0,
+            pbData: std::ptr::null_mut(),
+        };
+        // SAFETY: as in `protect`.
+        let ok = unsafe {
+            CryptUnprotectData(
+                &input,
+                std::ptr::null_mut(),
+                &entropy,
+                std::ptr::null(),
+                std::ptr::null(),
+                CRYPTPROTECT_UI_FORBIDDEN,
+                &mut out,
+            )
+        };
+        if ok == 0 || out.pbData.is_null() {
+            bail!("the file can't be unsealed by this Windows user; sign in again");
+        }
+        // SAFETY: allocated by CryptUnprotectData.
+        Ok(unsafe { take(out) })
+    }
 }
 
 fn sync_dir(dir: &Path) -> Result<()> {

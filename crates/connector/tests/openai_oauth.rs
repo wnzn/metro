@@ -6,541 +6,44 @@
 //! calls the loopback callback. Nothing here contacts OpenAI, runs a model
 //! CLI, or reads any real credentials. The signing key is generated per run.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+mod common;
+
 use std::time::Duration;
 
-use aws_lc_rs::encoding::AsDer;
-use axum::Router;
-use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
-use base64::Engine;
-use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
-use jsonwebtoken::jwk::Jwk;
-use jsonwebtoken::{Algorithm, EncodingKey, Header};
-use metro_connector::openai_oauth::{self as oa, Endpoints, LoginOptions};
+use common::*;
+use metro_connector::openai_oauth as oa;
 use serde_json::{Value, json};
-use sha2::{Digest, Sha256};
 
-const RESOURCE: &str = "https://api.openai.com/v1";
-const ISSUED: &str = "oaiapp_fixture_client";
-const PLAN_SCOPES: &str =
-    "chatgpt.tokens.use.direct email offline_access openid profile resource.invoke";
-
-// ------------------------------------------------------------------ fixture
-
-#[derive(Clone)]
-enum Browser {
-    /// Approve, and sign the ID token for `sub` with the given scope.
-    Approve {
-        sub: &'static str,
-        scope: &'static str,
-    },
-    /// Send a forged-state callback first, then approve.
-    ForgedStateFirst,
-    Deny,
-    /// Approve, but sign the ID token with a different nonce.
-    BadNonce,
-    /// New registration whose callback omits client_id.
-    NoClientId,
-}
-
-struct Pending {
-    client_id: String,
-    challenge: String,
-    redirect_uri: String,
-    nonce: String,
-    sub: String,
-    scope: String,
-    bad_nonce: bool,
-}
-
-struct Fx {
-    issuer: String,
-    enc: EncodingKey,
-    jwk: Value,
-    browser: Browser,
-    codes: HashMap<String, Pending>,
-    /// Authorize query parameters seen by the browser, per sign-in.
-    authorize: Vec<HashMap<String, String>>,
-    first_expires_in: u64,
-    access: Option<String>,
-    refresh: Option<String>,
-    refresh_count: u32,
-    refresh_error: Option<&'static str>,
-    revoked: Vec<HashMap<String, String>>,
-    responses_bodies: Vec<Value>,
-    sse_mode: &'static str,
-    sub_for_refresh: String,
-}
-
-type S = Arc<Mutex<Fx>>;
-
-fn rsa() -> (EncodingKey, Value) {
-    let kp = aws_lc_rs::rsa::KeyPair::generate(aws_lc_rs::rsa::KeySize::Rsa2048).unwrap();
-    let der = AsDer::<aws_lc_rs::encoding::Pkcs8V1Der>::as_der(&kp).unwrap();
-    let b64 = STANDARD.encode(der.as_ref());
-    let lines: Vec<&str> = b64
-        .as_bytes()
-        .chunks(64)
-        .map(|c| std::str::from_utf8(c).unwrap())
-        .collect();
-    let pem = format!(
-        "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-        lines.join("\n")
-    );
-    let enc = EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
-    let mut jwk =
-        serde_json::to_value(Jwk::from_encoding_key(&enc, Algorithm::RS256).unwrap()).unwrap();
-    jwk["kid"] = json!("k1");
-    jwk["use"] = json!("sig");
-    (enc, jwk)
-}
-
-fn now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
-fn form(body: &str) -> HashMap<String, String> {
-    url::form_urlencoded::parse(body.as_bytes())
-        .into_owned()
-        .collect()
-}
-
-fn fake_access(issuer: &str, client_id: &str, n: u32) -> String {
-    let h = URL_SAFE_NO_PAD.encode(br#"{"alg":"none"}"#);
-    let p = URL_SAFE_NO_PAD.encode(
-        json!({"aud": RESOURCE, "client_id": client_id, "iss": issuer, "sub": "opaque", "n": n, "exp": now() + 3600})
-            .to_string(),
-    );
-    format!("{h}.{p}.sig")
-}
-
-impl Fx {
-    fn id_token(&self, client_id: &str, sub: &str, nonce: Option<&str>) -> String {
-        let mut claims = json!({
-            "iss": self.issuer, "aud": [client_id], "sub": sub, "email": "person@example.test",
-            "email_verified": true, "iat": now(), "exp": now() + 3600,
-        });
-        if let Some(n) = nonce {
-            claims["nonce"] = json!(n);
-        }
-        let mut h = Header::new(Algorithm::RS256);
-        h.kid = Some("k1".into());
-        jsonwebtoken::encode(&h, &claims, &self.enc).unwrap()
-    }
-}
-
-async fn discovery(State(s): State<S>) -> Response {
-    let i = s.lock().unwrap().issuer.clone();
-    axum::Json(json!({
-        "issuer": i,
-        "authorization_endpoint": format!("{i}/api/accounts/authorize"),
-        "token_endpoint": format!("{i}/api/accounts/oauth/token"),
-        "jwks_uri": format!("{i}/.well-known/jwks.json"),
-        "revocation_endpoint": format!("{i}/oauth/revoke"),
-    }))
-    .into_response()
-}
-
-async fn jwks(State(s): State<S>) -> Response {
-    axum::Json(json!({ "keys": [s.lock().unwrap().jwk.clone()] })).into_response()
-}
-
-fn oauth_err(code: &str) -> Response {
-    (StatusCode::BAD_REQUEST, axum::Json(json!({"error": code}))).into_response()
-}
-
-async fn token(State(s): State<S>, body: String) -> Response {
-    let f = form(&body);
-    let mut fx = s.lock().unwrap();
-    match f.get("grant_type").map(String::as_str) {
-        Some("authorization_code") => {
-            let Some(p) = fx
-                .codes
-                .remove(f.get("code").map(String::as_str).unwrap_or(""))
-            else {
-                return oauth_err("invalid_grant");
-            };
-            let verifier = f.get("code_verifier").cloned().unwrap_or_default();
-            let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
-            if challenge != p.challenge
-                || f.get("client_id") != Some(&p.client_id)
-                || f.get("redirect_uri") != Some(&p.redirect_uri)
-                || f.get("resource").map(String::as_str) != Some(RESOURCE)
-                || f.contains_key("client_secret")
-            {
-                return oauth_err("invalid_grant");
-            }
-            let nonce = if p.bad_nonce {
-                "not-the-nonce".to_owned()
-            } else {
-                p.nonce.clone()
-            };
-            let id = fx.id_token(&p.client_id, &p.sub, Some(&nonce));
-            let access = fake_access(&fx.issuer, &p.client_id, 0);
-            fx.access = Some(access.clone());
-            fx.refresh = Some("rt-0".into());
-            fx.sub_for_refresh = p.sub.clone();
-            axum::Json(json!({
-                "access_token": access, "refresh_token": "rt-0", "id_token": id, "token_type": "Bearer",
-                "expires_in": fx.first_expires_in, "scope": p.scope,
-            }))
-            .into_response()
-        }
-        Some("refresh_token") => {
-            if let Some(code) = fx.refresh_error {
-                return oauth_err(code);
-            }
-            if f.get("client_id").map(String::as_str) != Some(ISSUED)
-                || f.get("resource").map(String::as_str) != Some(RESOURCE)
-                || f.contains_key("scope")
-                || f.get("refresh_token") != fx.refresh.as_ref()
-            {
-                // A refresh with a superseded token behaves like reuse.
-                return oauth_err("refresh_token_reused");
-            }
-            fx.refresh_count += 1;
-            let n = fx.refresh_count;
-            let access = fake_access(&fx.issuer, ISSUED, n);
-            let rt = format!("rt-{n}");
-            fx.access = Some(access.clone());
-            fx.refresh = Some(rt.clone());
-            let sub = fx.sub_for_refresh.clone();
-            let id = fx.id_token(ISSUED, &sub, None);
-            axum::Json(json!({
-                "access_token": access, "refresh_token": rt, "id_token": id, "token_type": "Bearer",
-                "expires_in": 3600, "scope": PLAN_SCOPES,
-            }))
-            .into_response()
-        }
-        _ => oauth_err("unsupported_grant_type"),
-    }
-}
-
-async fn revoke(State(s): State<S>, body: String) -> Response {
-    s.lock().unwrap().revoked.push(form(&body));
-    StatusCode::OK.into_response()
-}
-
-fn bearer_ok(fx: &Fx, h: &HeaderMap) -> bool {
-    let want = fx.access.as_ref().map(|a| format!("Bearer {a}"));
-    h.get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_owned)
-        == want
-}
-
-async fn models(State(s): State<S>, h: HeaderMap) -> Response {
-    let fx = s.lock().unwrap();
-    if !bearer_ok(&fx, &h) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({"detail": "bad token"})),
-        )
-            .into_response();
-    }
-    axum::Json(json!({"models": [
-        {"slug": "gpt-fixture-a", "display_name": "Fixture A", "visibility": "list"},
-        {"slug": "gpt-hidden", "display_name": "Hidden", "visibility": "hide"},
-        {"slug": "gpt-fixture-b", "display_name": "Fixture B", "visibility": "list"},
-    ]}))
-    .into_response()
-}
-
-fn sse(events: &[Value]) -> String {
-    events
-        .iter()
-        .map(|e| format!("event: {}\ndata: {}\n\n", e["type"].as_str().unwrap(), e))
-        .collect()
-}
-
-async fn responses(State(s): State<S>, h: HeaderMap, body: String) -> Response {
-    let mut fx = s.lock().unwrap();
-    if !bearer_ok(&fx, &h) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            axum::Json(json!({"detail": "bad token"})),
-        )
-            .into_response();
-    }
-    let body: Value = serde_json::from_str(&body).unwrap();
-    fx.responses_bodies.push(body.clone());
-    if body["store"] != json!(false) || body["stream"] != json!(true) {
-        return (
-            StatusCode::BAD_REQUEST,
-            axum::Json(json!({"error": {"code": "bad", "message": "store/stream"}})),
-        )
-            .into_response();
-    }
-    let leak = |status: StatusCode, body: Value| {
-        (
-            status,
-            [("x-request-id", "req_SENSITIVE_ID")],
-            axum::Json(body),
-        )
-            .into_response()
-    };
-    match fx.sse_mode {
-        "http400" => {
-            return leak(
-                StatusCode::BAD_REQUEST,
-                json!({"error": {"code": "weird_code", "message": "SENSITIVE-ECHO of the user's prompt"}}),
+/// A stored profile file as text on Unix (mode 0600 is its protection). On
+/// Windows it must be DPAPI-sealed, with no token or client ID readable in
+/// it; its contents aren't returned.
+fn stored(p: &std::path::Path) -> Option<String> {
+    let bytes = std::fs::read(p).unwrap();
+    if cfg!(windows) {
+        assert!(
+            bytes.starts_with(b"metro-dpapi-v1\n"),
+            "{} is not sealed",
+            p.display()
+        );
+        let text = String::from_utf8_lossy(&bytes);
+        for plain in [
+            "rt-",
+            "access_token",
+            "refresh_token",
+            ISSUED,
+            "urn:uuid:",
+            "person@example.test",
+        ] {
+            assert!(
+                !text.contains(plain),
+                "{} holds {plain} in plain text",
+                p.display()
             );
         }
-        "http503" => {
-            return leak(
-                StatusCode::SERVICE_UNAVAILABLE,
-                json!({"detail": "SENSITIVE-DETAIL"}),
-            );
-        }
-        "http403" => {
-            return leak(
-                StatusCode::FORBIDDEN,
-                json!({"detail": "SENSITIVE region text"}),
-            );
-        }
-        "capability" => {
-            return leak(
-                StatusCode::BAD_REQUEST,
-                json!({"error": {"code": "subscription_sharing_unsupported_capability", "param": "SENSITIVE-PARAM", "message": "SENSITIVE-MSG"}}),
-            );
-        }
-        _ => {}
+        None
+    } else {
+        Some(String::from_utf8(bytes).unwrap())
     }
-    let has_result = body["input"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .any(|i| i["type"] == "function_call_output");
-    let resp = |output: Value| json!({"id": "resp_1", "object": "response", "created_at": 1_790_000_000, "model": body["model"], "status": "completed", "output": output, "usage": {"input_tokens": 10, "output_tokens": 5, "total_tokens": 15}});
-    let events = match fx.sse_mode {
-        "limit" => vec![
-            json!({"type": "response.created", "response": {"id": "resp_1"}}),
-            json!({"type": "response.output_text.delta", "delta": "par"}),
-            json!({"type": "response.failed", "response": {"id": "resp_SENSITIVE", "error": {"code": "subscription_sharing_usage_limit_exceeded", "message": "SENSITIVE limit text"}}}),
-        ],
-        "truncated" => vec![json!({"type": "response.output_text.delta", "delta": "Hel"})],
-        "hosted" => vec![
-            json!({"type": "response.completed", "response": resp(json!([{"type": "web_search_call", "id": "ws"}]))}),
-        ],
-        _ if has_result => {
-            let item = json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "It is sunny."}]});
-            vec![
-                json!({"type": "response.output_text.delta", "delta": "It is sunny."}),
-                json!({"type": "response.output_item.done", "output_index": 1, "item": item}),
-                json!({"type": "response.output_item.done", "output_index": 0, "item": {"type": "reasoning", "id": "rs", "summary": [], "encrypted_content": "SECRET-REASONING"}}),
-                // `output` left empty to check that output_item.done is used.
-                json!({"type": "response.completed", "response": resp(json!([]))}),
-            ]
-        }
-        _ => {
-            let out = json!([
-                {"type": "reasoning", "id": "rs", "summary": []},
-                {"type": "function_call", "id": "fc_1", "call_id": "call_A", "namespace": "metro", "name": "workspace_list", "arguments": "{\"path\":\".\"}"},
-                {"type": "function_call", "id": "fc_2", "call_id": "call_B", "namespace": "metro", "name": "workspace_read", "arguments": "{\"path\":\"README.md\"}"},
-            ]);
-            vec![json!({"type": "response.completed", "response": resp(out)})]
-        }
-    };
-    ([(header::CONTENT_TYPE, "text/event-stream")], sse(&events)).into_response()
-}
-
-struct Fixture {
-    s: S,
-    ep: Endpoints,
-    _dir: TempDir,
-    profile: PathBuf,
-}
-
-async fn fixture(browser: Browser) -> Fixture {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let issuer = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    let (enc, jwk) = rsa();
-    let s: S = Arc::new(Mutex::new(Fx {
-        issuer: issuer.clone(),
-        enc,
-        jwk,
-        browser,
-        codes: HashMap::new(),
-        authorize: Vec::new(),
-        first_expires_in: 3600,
-        access: None,
-        refresh: None,
-        refresh_count: 0,
-        refresh_error: None,
-        revoked: Vec::new(),
-        responses_bodies: Vec::new(),
-        sse_mode: "",
-        sub_for_refresh: String::new(),
-    }));
-    let app = Router::new()
-        .route("/.well-known/openid-configuration", get(discovery))
-        .route("/.well-known/jwks.json", get(jwks))
-        .route("/api/accounts/oauth/token", post(token))
-        .route("/oauth/revoke", post(revoke))
-        .route("/v1/models", get(models))
-        .route("/v1/responses", post(responses))
-        .with_state(s.clone());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let dir = TempDir::new();
-    let profile = dir.0.join("conn");
-    Fixture {
-        s,
-        ep: Endpoints {
-            issuer: issuer.clone(),
-            api_base: format!("{issuer}/v1"),
-            resource: RESOURCE.into(),
-        },
-        _dir: dir,
-        profile,
-    }
-}
-
-/// The browser half. It follows the start redirect, checks what a real
-/// authorize endpoint would see, and calls the loopback callback.
-async fn browse(s: S, start: String) {
-    let http = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let r = http.get(&start).send().await.unwrap();
-    assert_eq!(r.status(), 302, "start link must redirect");
-    let loc = r.headers()[header::LOCATION].to_str().unwrap().to_owned();
-    // The start link is single-use.
-    assert_eq!(http.get(&start).send().await.unwrap().status(), 410);
-
-    let u = url::Url::parse(&loc).unwrap();
-    let q: HashMap<String, String> = u.query_pairs().into_owned().collect();
-    let redirect = q["redirect_uri"].clone();
-    let (browser, issuer) = {
-        let mut fx = s.lock().unwrap();
-        fx.authorize.push(q.clone());
-        (fx.browser.clone(), fx.issuer.clone())
-    };
-    assert!(loc.starts_with(&format!("{issuer}/api/accounts/authorize?")));
-    let new_reg = q["client_id"] == "dynamic_agent_client";
-    let code = format!("code-{}", rand_hex());
-    let mut cb = url::Url::parse(&redirect).unwrap();
-    let (sub, scope, bad_nonce) = match &browser {
-        Browser::Approve { sub, scope } => (*sub, *scope, false),
-        Browser::BadNonce => ("user-1", PLAN_SCOPES, true),
-        _ => ("user-1", PLAN_SCOPES, false),
-    };
-    match browser {
-        Browser::Deny => {
-            cb.query_pairs_mut()
-                .append_pair("error", "access_denied")
-                .append_pair("state", &q["state"]);
-        }
-        _ => {
-            if matches!(browser, Browser::ForgedStateFirst) {
-                let mut forged = cb.clone();
-                forged
-                    .query_pairs_mut()
-                    .append_pair("code", "evil")
-                    .append_pair("state", "forged")
-                    .append_pair("client_id", "oaiapp_evil");
-                assert_eq!(
-                    http.get(forged.as_str()).send().await.unwrap().status(),
-                    400
-                );
-            }
-            let client_id = if new_reg {
-                ISSUED.to_owned()
-            } else {
-                q["client_id"].clone()
-            };
-            s.lock().unwrap().codes.insert(
-                code.clone(),
-                Pending {
-                    client_id: client_id.clone(),
-                    challenge: q["code_challenge"].clone(),
-                    redirect_uri: redirect.clone(),
-                    nonce: q["nonce"].clone(),
-                    sub: sub.into(),
-                    scope: scope.into(),
-                    bad_nonce,
-                },
-            );
-            let mut qp = cb.query_pairs_mut();
-            qp.append_pair("code", &code)
-                .append_pair("scope", scope)
-                .append_pair("state", &q["state"]);
-            if new_reg && !matches!(browser, Browser::NoClientId) {
-                qp.append_pair("client_id", ISSUED);
-            }
-        }
-    }
-    let r = http.get(cb.as_str()).send().await.unwrap();
-    assert_eq!(r.status(), 200);
-}
-
-fn rand_hex() -> String {
-    let n = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    format!("{n:x}")
-}
-
-fn opts(f: &Fixture) -> LoginOptions {
-    let s = f.s.clone();
-    LoginOptions {
-        endpoints: f.ep.clone(),
-        open_browser: Box::new(move |url: &str| {
-            let url = url.to_owned();
-            assert!(url.starts_with("http://127.0.0.1:") && url.contains("/auth/start?k="));
-            tokio::spawn(browse(s, url));
-            Ok(())
-        }),
-        preferred_port: 0,
-        timeout: Duration::from_secs(20),
-    }
-}
-
-struct TempDir(PathBuf);
-impl TempDir {
-    fn new() -> Self {
-        let p = std::env::temp_dir().join(format!(
-            "metro-oauth-test-{}-{}",
-            std::process::id(),
-            rand_hex()
-        ));
-        std::fs::create_dir_all(&p).unwrap();
-        Self(p)
-    }
-}
-impl Drop for TempDir {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-fn mode(p: &Path) -> u32 {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).unwrap().permissions().mode() & 0o777
-}
-
-fn tool_request() -> Value {
-    json!({
-        "model": "gpt-fixture-a",
-        "messages": [
-            {"role": "system", "content": "You are Metro's agent."},
-            {"role": "user", "content": "List the workspace."},
-        ],
-        "tools": [
-            {"type": "function", "function": {"name": "workspace_list", "description": "List", "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}}},
-            {"type": "function", "function": {"name": "workspace_read", "description": "Read", "parameters": {"type": "object"}}},
-        ],
-        "tool_choice": "auto",
-    })
 }
 
 // -------------------------------------------------------------------- tests
@@ -573,17 +76,25 @@ async fn sign_in_list_models_tool_round_and_sign_out() {
     );
     assert!(!q.contains_key("id_token_hint") && !q.contains_key("prompt"));
 
-    // Storage: 0700 dir, 0600 files, nothing secret in account.json.
-    assert_eq!(mode(&f.profile), 0o700);
-    for file in ["host.json", "account.json", "tokens.json"] {
-        assert_eq!(mode(&f.profile.join(file)), 0o600, "{file}");
+    // Storage: Unix 0700 dir and 0600 files; Windows DPAPI-sealed files.
+    // Nothing secret in account.json either way.
+    #[cfg(unix)]
+    {
+        assert_eq!(mode(&f.profile), 0o700);
+        for file in ["host.json", "account.json", "tokens.json"] {
+            assert_eq!(mode(&f.profile.join(file)), 0o600, "{file}");
+        }
     }
-    let account = std::fs::read_to_string(f.profile.join("account.json")).unwrap();
-    assert!(
-        account.contains(ISSUED)
-            && !account.contains("dynamic_agent_client")
-            && !account.contains("rt-0")
-    );
+    for file in ["host.json", "account.json", "tokens.json"] {
+        stored(&f.profile.join(file));
+    }
+    if let Some(account) = stored(&f.profile.join("account.json")) {
+        assert!(
+            account.contains(ISSUED)
+                && !account.contains("dynamic_agent_client")
+                && !account.contains("rt-0")
+        );
+    }
 
     let st = oa::status(&f.profile).await.unwrap();
     assert!(st.signed_in && st.registered && st.plan_usage_enabled);
@@ -718,8 +229,9 @@ async fn expiry_refresh_is_serialized_and_rotates() {
     assert_eq!(fx.refresh_count, 1);
     assert_eq!(fx.refresh.as_deref(), Some("rt-1"));
     drop(fx);
-    let tokens = std::fs::read_to_string(f.profile.join("tokens.json")).unwrap();
-    assert!(tokens.contains("rt-1") && !tokens.contains("\"rt-0\""));
+    if let Some(tokens) = stored(&f.profile.join("tokens.json")) {
+        assert!(tokens.contains("rt-1") && !tokens.contains("\"rt-0\""));
+    }
 }
 
 #[tokio::test]
@@ -758,15 +270,18 @@ async fn forged_state_is_ignored_then_real_callback_completes() {
     oa::login_with(&f.profile, opts(&f))
         .await
         .expect("login despite forged callback");
-    let account = std::fs::read_to_string(f.profile.join("account.json")).unwrap();
-    assert!(!account.contains("oaiapp_evil"));
+    if let Some(account) = stored(&f.profile.join("account.json")) {
+        assert!(!account.contains("oaiapp_evil"));
+    }
 }
 
 #[tokio::test]
 async fn declined_consent_stores_nothing() {
     let f = fixture(Browser::Deny).await;
     let e = oa::login_with(&f.profile, opts(&f)).await.unwrap_err();
-    assert!(e.to_string().contains("declined"), "{e}");
+    assert!(format!("{e:#}").contains("declined"), "{e:#}");
+    assert_eq!(oa::sign_in_stage(&e), Some(oa::SignInStage::Response));
+    assert!(safe(&e).contains("declined"), "{e:#}");
     assert!(!f.profile.join("tokens.json").exists());
     assert!(!f.profile.join("account.json").exists());
 }
@@ -775,7 +290,13 @@ async fn declined_consent_stores_nothing() {
 async fn bad_nonce_is_rejected() {
     let f = fixture(Browser::BadNonce).await;
     let e = oa::login_with(&f.profile, opts(&f)).await.unwrap_err();
-    assert!(e.to_string().contains("nonce"), "{e}");
+    assert!(format!("{e:#}").contains("nonce"), "{e:#}");
+    assert_eq!(oa::sign_in_stage(&e), Some(oa::SignInStage::Exchange));
+    // The person sees what to do, not the verifier's detail.
+    assert!(
+        !safe(&e).contains("nonce") && safe(&e).contains("Start the sign-in again"),
+        "{e:#}"
+    );
     assert!(!f.profile.join("tokens.json").exists());
 }
 
@@ -783,7 +304,10 @@ async fn bad_nonce_is_rejected() {
 async fn registration_without_issued_client_id_is_incomplete() {
     let f = fixture(Browser::NoClientId).await;
     let e = oa::login_with(&f.profile, opts(&f)).await.unwrap_err();
-    assert!(e.to_string().contains("registration incomplete"), "{e}");
+    assert!(
+        format!("{e:#}").contains("registration incomplete"),
+        "{e:#}"
+    );
 }
 
 #[tokio::test]
@@ -794,7 +318,11 @@ async fn missing_plan_scope_signs_in_but_never_calls_inference() {
     })
     .await;
     let e = oa::login_with(&f.profile, opts(&f)).await.unwrap_err();
-    assert!(e.to_string().contains("chatgpt.tokens.use.direct"), "{e}");
+    assert!(
+        format!("{e:#}").contains("chatgpt.tokens.use.direct"),
+        "{e:#}"
+    );
+    assert!(safe(&e).contains("plan usage wasn't granted"), "{e:#}");
     let st = oa::status(&f.profile).await.unwrap();
     assert!(st.signed_in && !st.plan_usage_enabled);
     assert!(
@@ -831,7 +359,11 @@ async fn different_account_cannot_overwrite_registration() {
         scope: PLAN_SCOPES,
     };
     let e = oa::login_with(&f.profile, opts(&f)).await.unwrap_err();
-    assert!(e.to_string().contains("different ChatGPT account"), "{e}");
+    assert!(
+        format!("{e:#}").contains("different ChatGPT account"),
+        "{e:#}"
+    );
+    assert!(safe(&e).contains("different ChatGPT account"), "{e:#}");
     assert_eq!(
         oa::status(&f.profile).await.unwrap().subject.as_deref(),
         Some("user-1")
@@ -873,6 +405,7 @@ async fn stream_failures_are_visible() {
     assert!(e.contains("web_search_call"), "{e}");
 }
 
+#[cfg(unix)]
 #[tokio::test]
 async fn profile_must_be_private_and_endpoints_bound() {
     use std::os::unix::fs::PermissionsExt;
@@ -884,7 +417,11 @@ async fn profile_must_be_private_and_endpoints_bound() {
     std::fs::create_dir(&f.profile).unwrap();
     std::fs::set_permissions(&f.profile, std::fs::Permissions::from_mode(0o755)).unwrap();
     let e = oa::login_with(&f.profile, opts(&f)).await.unwrap_err();
-    assert!(e.to_string().contains("mode 700"), "{e}");
+    assert!(format!("{e:#}").contains("mode 700"), "{e:#}");
+    // Before any browser: no start link was ever handed out.
+    assert_eq!(oa::sign_in_stage(&e), Some(oa::SignInStage::Storage));
+    assert!(safe(&e).contains("so no browser was opened"), "{e:#}");
+    assert!(f.s.lock().unwrap().authorize.is_empty());
     std::fs::set_permissions(&f.profile, std::fs::Permissions::from_mode(0o700)).unwrap();
     oa::login_with(&f.profile, opts(&f)).await.unwrap();
     // A signed-in fixture profile refuses production endpoints, and the other
@@ -927,7 +464,8 @@ async fn loopback_rejects_foreign_host_header() {
     s.read_to_string(&mut buf).await.unwrap();
     assert!(buf.starts_with("HTTP/1.1 421"), "{buf}");
     let e = login.await.unwrap().unwrap_err();
-    assert!(e.to_string().contains("timed out"), "{e}");
+    assert!(format!("{e:#}").contains("timed out"), "{e:#}");
+    assert_eq!(oa::sign_in_stage(&e), Some(oa::SignInStage::Waiting));
 }
 
 #[test]

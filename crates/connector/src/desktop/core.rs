@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 use serde_json::{Value, json};
-use tokio::sync::watch;
+use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
 
 use super::local::{LocalState, LocalWorkspaceHost, SessionCtx, ToolsHook};
@@ -56,6 +56,14 @@ pub fn err(status: u16, code: &'static str, message: impl AsRef<str>) -> BridgeE
 
 type R<T> = Result<T, BridgeError>;
 
+fn no_login() -> BridgeError {
+    err(
+        409,
+        "no_login",
+        "No sign-in is waiting on this computer; start it again",
+    )
+}
+
 fn api_err(e: ApiError) -> BridgeError {
     match e {
         ApiError::Rejected => err(
@@ -77,8 +85,10 @@ fn api_err(e: ApiError) -> BridgeError {
 /// chain, else `fallback`. Other error text (it may quote a provider) stays
 /// out of the UI.
 fn safe_text(e: &anyhow::Error, fallback: &str) -> String {
-    e.chain()
-        .find_map(|c| c.downcast_ref::<SafeError>())
+    // A SafeError added as context is found by `downcast_ref` on the error;
+    // one at the root, also through the chain.
+    e.downcast_ref::<SafeError>()
+        .or_else(|| e.chain().find_map(|c| c.downcast_ref::<SafeError>()))
         .map(|s| s.as_str().to_string())
         .unwrap_or_else(|| fallback.to_string())
 }
@@ -96,12 +106,53 @@ pub enum WorkerState {
     Error,
 }
 
+/// A sign-in in progress or just ended, as the UI sees it.
 #[derive(Clone, Debug, Serialize)]
 pub struct LoginView {
+    /// `waiting`, `done` or `failed`.
     pub state: &'static str,
-    pub auth_url: Option<String>,
+    /// This waiting attempt has a private start link; the UI can ask to open
+    /// it when `browser` isn't `opening`.
+    pub browser_ready: bool,
+    /// What went wrong, in words a person can act on.
     pub error: Option<String>,
+    /// Where it stopped (`storage`, `discovery`, `callback`, `waiting`,
+    /// `response`, `exchange`), when it failed.
+    pub stage: Option<&'static str>,
+    /// It failed before a browser was needed (nothing was opened).
+    pub before_browser: bool,
+    /// The default browser: `not_requested`, `opening`, `opened` or `failed`.
+    pub browser: &'static str,
+    /// Why the browser didn't open, when `browser` is `failed`.
+    pub browser_error: Option<String>,
 }
+
+impl LoginView {
+    fn waiting(open_browser: bool) -> Self {
+        LoginView {
+            state: "waiting",
+            browser_ready: false,
+            error: None,
+            stage: None,
+            before_browser: false,
+            browser: if open_browser {
+                "opening"
+            } else {
+                "not_requested"
+            },
+            browser_error: None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct LoginAttempt {
+    generation: u64,
+    id: u64,
+}
+
+// No link ever travels through a bridge response, including its notification.
+type BrowserFinished = oneshot::Receiver<()>;
 
 #[derive(Default)]
 struct Live {
@@ -112,6 +163,10 @@ struct Live {
     task: Option<JoinHandle<()>>,
     login: Option<LoginView>,
     login_task: Option<JoinHandle<()>>,
+    /// The attempt `login` describes: a finished or cancelled attempt never
+    /// writes over a newer one.
+    login_attempt: Option<LoginAttempt>,
+    login_url: Option<Secret>,
 }
 
 struct Session {
@@ -125,9 +180,31 @@ struct State {
     session: Option<Session>,
     live: HashMap<String, Live>,
     epoch: u64,
+    /// Bumped whenever everything stops (sign-out, account switch): a sign-in
+    /// started before then is aborted, never kept or acted on.
+    session_gen: u64,
+    next_attempt: u64,
 }
 
-pub type Opener = Arc<dyn Fn(&str) + Send + Sync>;
+impl State {
+    fn login_for(&mut self, name: &str, attempt: LoginAttempt) -> Option<&mut Live> {
+        if self.session_gen != attempt.generation {
+            return None;
+        }
+        self.live
+            .get_mut(name)
+            .filter(|l| l.login_attempt == Some(attempt))
+    }
+}
+
+/// Opens a start link in the default browser. `Err` is a short message for
+/// the person (never the URL).
+pub type Opener = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
+/// How long the default browser may take to come up before Metro reports it.
+const BROWSER_WAIT: Duration = Duration::from_secs(30);
+/// How long a bridge request waits for sign-in preparation to finish.
+const PREPARE_WAIT: Duration = Duration::from_secs(45);
 
 /// How the service is set up. The launcher uses [`DesktopConfig::new`];
 /// tests shorten the poll interval and replace the browser opener.
@@ -139,6 +216,8 @@ pub struct DesktopConfig {
     /// The desktop tools lane (`/v1/local-tools…`), when built in.
     pub tools: Option<Arc<dyn ToolsHook>>,
     pub poll_interval: Duration,
+    /// Bridge reply deadline for preparation, not the sign-in lifetime.
+    pub prepare_wait: Duration,
     /// Opens a sign-in URL in the person's browser.
     pub open_browser: Opener,
     pub oauth_endpoints: Endpoints,
@@ -152,40 +231,17 @@ impl DesktopConfig {
             local,
             tools: None,
             poll_interval: Duration::from_secs(2),
+            prepare_wait: PREPARE_WAIT,
             open_browser: Arc::new(open_system_browser),
             oauth_endpoints: Endpoints::openai(),
         }
     }
 }
 
-/// Opens a URL with the system's opener, by absolute path only (no PATH
-/// lookup). Failure is silent: the UI also gets the URL to open itself.
-pub fn open_system_browser(url: &str) {
-    if !(url.starts_with("http://127.0.0.1:") || url.starts_with("https://")) {
-        return;
-    }
-    #[cfg(windows)]
-    let candidates: Vec<PathBuf> = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .filter(|p| p.is_absolute())
-        .map(|r| vec![r.join("explorer.exe")])
-        .unwrap_or_default();
-    #[cfg(target_os = "macos")]
-    let candidates = vec![PathBuf::from("/usr/bin/open")];
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let candidates = vec![
-        PathBuf::from("/usr/bin/xdg-open"),
-        PathBuf::from("/usr/local/bin/xdg-open"),
-        PathBuf::from("/bin/xdg-open"),
-    ];
-    if let Some(bin) = candidates.into_iter().find(|p| p.is_file()) {
-        let _ = std::process::Command::new(bin)
-            .arg(url)
-            .stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .spawn();
-    }
+/// Opens Metro's own loopback start link in the default browser and reports
+/// whether that worked (see [`crate::opener`]). Any other URL is refused.
+pub fn open_system_browser(url: &str) -> Result<(), String> {
+    crate::opener::open_start_link(url)
 }
 
 pub struct Desktop {
@@ -602,13 +658,19 @@ impl Desktop {
             if let Some(t) = l.login_task.take() {
                 t.abort();
             }
+            l.login_attempt = None;
+            l.login_url = None;
             l.login = None;
         }
     }
 
     /// Stop everything: workers and sign-ins.
     async fn stop_all(&self) {
-        let names: Vec<String> = lock(&self.state).live.keys().cloned().collect();
+        let names: Vec<String> = {
+            let mut st = lock(&self.state);
+            st.session_gen += 1;
+            st.live.keys().cloned().collect()
+        };
         for n in &names {
             self.cancel_login(n);
         }
@@ -932,9 +994,13 @@ impl Desktop {
     ) -> R<Value> {
         let _g = self.ops.lock().await;
         let mut b = self.bound(id)?;
-        b.profile
-            .ensure()
-            .map_err(|_| err(500, "storage_error", "Couldn't prepare the profile"))?;
+        // The OAuth flow opens and protects its own store and reports failures
+        // at the storage stage. Don't mask that result with a generic error.
+        if b.binding.kind != Kind::OpenAiOAuth {
+            b.profile
+                .ensure()
+                .map_err(|_| err(500, "storage_error", "Couldn't prepare the profile"))?;
+        }
         match b.binding.kind {
             k if k.uses_endpoint() => {
                 let base = b.config.base_url.clone().unwrap_or_default();
@@ -998,8 +1064,16 @@ impl Desktop {
                         "This connection signs in with ChatGPT; send no key",
                     ));
                 }
+                let ready = self.start_oauth(b, open_browser)?;
                 drop(_g);
-                return self.start_oauth(b, open_browser).await;
+                // A deadline (or HTTP disconnect) drops only this notification,
+                // never the attempt's receiver for the private start link.
+                if let Ok(Ok(Some(opened))) =
+                    tokio::time::timeout(self.cfg.prepare_wait, ready).await
+                {
+                    let _ = opened.await;
+                }
+                return self.connection(id).await;
             }
             _ => return Err(err(422, "unsupported", "Unsupported connection kind")),
         }
@@ -1008,93 +1082,211 @@ impl Desktop {
         Ok(self.view(&b.profile, &b.binding).await)
     }
 
-    async fn start_oauth(self: &Arc<Self>, b: Bound, open_browser: bool) -> R<Value> {
-        let name = b.profile.name.clone();
-        let connection_id = b.binding.connection_id.clone();
-        {
-            let mut st = lock(&self.state);
-            let l = st.live.entry(name.clone()).or_default();
-            if l.login_task.as_ref().is_some_and(|t| !t.is_finished()) {
-                return Err(err(
-                    409,
-                    "login_in_progress",
-                    "A sign-in is already waiting in the browser",
-                ));
-            }
-            l.login = Some(LoginView {
-                state: "waiting",
-                auth_url: None,
-                error: None,
-            });
+    // Called with `ops` held so the bound profile and generation agree.
+    fn start_oauth(
+        self: &Arc<Self>,
+        b: Bound,
+        open_browser: bool,
+    ) -> R<oneshot::Receiver<Option<BrowserFinished>>> {
+        let mut st = lock(&self.state);
+        st.next_attempt += 1;
+        let attempt = LoginAttempt {
+            generation: st.session_gen,
+            id: st.next_attempt,
+        };
+        let l = st.live.entry(b.profile.name.clone()).or_default();
+        if l.login_task.as_ref().is_some_and(|t| !t.is_finished()) {
+            return Err(err(
+                409,
+                "login_in_progress",
+                "A sign-in is already waiting. Open the browser again, or cancel it first.",
+            ));
         }
-        let (url_tx, url_rx) = tokio::sync::oneshot::channel::<String>();
-        let opener = self.cfg.open_browser.clone();
+        l.login_attempt = Some(attempt);
+        l.login_url = None;
+        l.login = Some(LoginView::waiting(open_browser));
+
+        let (ready_tx, ready_rx) = oneshot::channel();
+        let (url_tx, url_rx) = oneshot::channel();
         let options = LoginOptions {
             endpoints: self.cfg.oauth_endpoints.clone(),
             open_browser: Box::new(move |url: &str| {
-                let _ = url_tx.send(url.to_string());
-                if open_browser {
-                    opener(url);
-                }
+                let _ = url_tx.send(Secret::new(url));
                 Ok(())
             }),
             ..LoginOptions::default()
         };
         let me = self.clone();
         let vendor = b.profile.vendor_dir();
-        let t_name = name.clone();
-        let task = tokio::spawn(async move {
-            let r = openai_oauth::login_with(&vendor, options).await;
-            let view = match &r {
-                Ok(()) => LoginView {
-                    state: "done",
-                    auth_url: None,
-                    error: None,
-                },
-                Err(e) => LoginView {
-                    state: "failed",
-                    auth_url: None,
-                    error: Some(safe_text(e, "Sign-in did not finish; try again")),
-                },
+        l.login_task = Some(tokio::spawn(async move {
+            let name = &b.profile.name;
+            let flow = openai_oauth::login_with(&vendor, options);
+            tokio::pin!(flow);
+            let mut ready_tx = Some(ready_tx);
+            let r = tokio::select! {
+                biased;
+                r = &mut flow => r,
+                Ok(url) = url_rx => {
+                    let opened = {
+                        let mut st = lock(&me.state);
+                        let Some(l) = st.login_for(name, attempt) else { return };
+                        let Some(v) = l.login.as_mut().filter(|v| v.state == "waiting") else {
+                            return;
+                        };
+                        l.login_url = Some(url.clone());
+                        v.browser_ready = true;
+                        open_browser.then(|| me.launch_browser(name, attempt, url, v))
+                    };
+                    if let Some(tx) = ready_tx.take() {
+                        let _ = tx.send(opened);
+                    }
+                    flow.await
+                }
             };
-            if let Some(l) = lock(&me.state).live.get_mut(&t_name) {
-                l.login = Some(view);
+            {
+                let mut st = lock(&me.state);
+                let Some(l) = st.login_for(name, attempt) else {
+                    return;
+                };
+                let Some(v) = l.login.as_mut().filter(|v| v.state == "waiting") else {
+                    return;
+                };
+                l.login_url = None;
+                if let Err(e) = &r {
+                    let stage = openai_oauth::sign_in_stage(e);
+                    v.state = "failed";
+                    v.error = Some(safe_text(
+                        e,
+                        "The sign-in stopped before it finished. Start it again.",
+                    ));
+                    v.stage = stage.map(|s| s.as_str());
+                    v.before_browser = stage.is_some_and(|s| s.before_browser());
+                    if v.before_browser && !v.browser_ready {
+                        v.browser = "not_requested";
+                    }
+                } else {
+                    v.state = "done";
+                    // A returned callback proves the browser got there even
+                    // if the OS opener hasn't reported back yet.
+                    v.browser = "opened";
+                    v.browser_error = None;
+                }
+                v.browser_ready = false;
             }
+            // A failure before handoff is now visible to the request.
+            drop(ready_tx);
             if r.is_ok() {
                 let _g = me.ops.lock().await;
-                me.refresh_worker(&b.profile, &b.binding).await;
-            }
-        });
-        if let Some(l) = lock(&self.state).live.get_mut(&name) {
-            l.login_task = Some(task);
-        }
-        match tokio::time::timeout(Duration::from_secs(20), url_rx).await {
-            Ok(Ok(url)) => {
-                let mut st = lock(&self.state);
-                if let Some(l) = st.live.get_mut(&name)
-                    && let Some(v) = l.login.as_mut()
-                    && v.state == "waiting"
-                {
-                    v.auth_url = Some(url);
+                if lock(&me.state).login_for(name, attempt).is_some() {
+                    me.refresh_worker(&b.profile, &b.binding).await;
                 }
             }
-            _ => {
-                // Failed before a browser was needed: give the task a moment
-                // to record why.
-                for _ in 0..40 {
-                    let done = lock(&self.state)
-                        .live
-                        .get(&name)
-                        .and_then(|l| l.login.as_ref())
-                        .is_some_and(|v| v.state != "waiting");
-                    if done {
-                        break;
+        }));
+        Ok(ready_rx)
+    }
+
+    // The caller holds the state lock and has validated this waiting attempt.
+    // Reserve the open under that lock so concurrent reopens cannot race it.
+    fn launch_browser(
+        &self,
+        name: &str,
+        attempt: LoginAttempt,
+        url: Secret,
+        view: &mut LoginView,
+    ) -> BrowserFinished {
+        view.browser = "opening";
+        view.browser_error = None;
+        let name = name.to_owned();
+        let state = self.state.clone();
+        let opener = self.cfg.open_browser.clone();
+        let (tx, rx) = oneshot::channel();
+        tokio::spawn(async move {
+            let dispatch_state = state.clone();
+            let dispatch_name = name.clone();
+            let mut worker = tokio::task::spawn_blocking(move || {
+                // A queued dispatch may start after cancel/close/switch.
+                let active = lock(&dispatch_state)
+                    .login_for(&dispatch_name, attempt)
+                    .and_then(|l| l.login.as_ref())
+                    .is_some_and(|v| v.state == "waiting" && v.browser == "opening");
+                active.then(|| opener(url.expose()))
+            });
+            let outcome = match tokio::time::timeout(BROWSER_WAIT, &mut worker).await {
+                Ok(Ok(Some(r))) => r,
+                Ok(Ok(None)) => return,
+                Ok(Err(_)) => {
+                    Err("The default browser couldn't be started. Open the browser again.".into())
+                }
+                Err(_) => {
+                    worker.abort(); // Prevent dispatch if still queued.
+                    Err("The default browser didn't respond. Open the browser again.".into())
+                }
+            };
+            if let Some(v) = lock(&state)
+                .login_for(&name, attempt)
+                .and_then(|l| l.login.as_mut())
+                .filter(|v| v.state == "waiting")
+            {
+                match outcome {
+                    Ok(()) => v.browser = "opened",
+                    Err(why) => {
+                        v.browser = "failed";
+                        v.browser_error = Some(clean_line(&why, 300));
                     }
-                    tokio::time::sleep(Duration::from_millis(50)).await;
                 }
             }
+            let _ = tx.send(());
+        });
+        rx
+    }
+
+    /// Opens the waiting sign-in's own start link in the default browser
+    /// again, and reports whether that worked. It never takes a URL.
+    pub async fn reopen_sign_in(&self, id: &str) -> R<Value> {
+        let opened = {
+            let _g = self.ops.lock().await;
+            let b = self.bound(id)?;
+            let name = &b.profile.name;
+            let mut st = lock(&self.state);
+            let attempt = st
+                .live
+                .get(name)
+                .and_then(|l| l.login_attempt)
+                .ok_or_else(no_login)?;
+            let l = st.login_for(name, attempt).ok_or_else(no_login)?;
+            let v = l
+                .login
+                .as_mut()
+                .filter(|v| v.state == "waiting")
+                .ok_or_else(no_login)?;
+            let Some(url) = l.login_url.clone() else {
+                return Err(err(
+                    409,
+                    "login_preparing",
+                    "The sign-in is still getting ready; try again in a moment",
+                ));
+            };
+            if v.browser == "opening" {
+                return Err(err(
+                    409,
+                    "browser_opening",
+                    "The browser is already being opened",
+                ));
+            }
+            self.launch_browser(name, attempt, url, v)
+        };
+        let _ = opened.await;
+        self.connection(id).await
+    }
+
+    /// Stops a waiting sign-in: its local link stops working at once.
+    pub async fn cancel_sign_in(&self, id: &str) -> R<Value> {
+        {
+            let _g = self.ops.lock().await;
+            let b = self.bound(id)?;
+            self.cancel_login(&b.profile.name);
         }
-        self.connection(&connection_id).await
+        self.connection(id).await
     }
 
     pub async fn delete_credentials(&self, id: &str) -> R<Value> {

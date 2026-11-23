@@ -134,6 +134,59 @@ impl Endpoints {
 
 /// Receives the local start URL and shows it to the user, normally by
 /// opening the system browser.
+/// Where a sign-in stopped. Carried in the error chain next to a
+/// [`crate::SafeError`] that says, in words a person can act on, what failed.
+/// The steps before `Waiting` happen before any browser is opened.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignInStage {
+    /// The private credential store on this device.
+    Storage,
+    /// Reaching the issuer's sign-in service (OIDC discovery).
+    Discovery,
+    /// Listening on 127.0.0.1 for the browser to come back.
+    Callback,
+    /// Waiting for the person to finish in the browser.
+    Waiting,
+    /// The browser came back with an error or without a code.
+    Response,
+    /// Exchanging the code and checking the tokens.
+    Exchange,
+}
+
+impl SignInStage {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SignInStage::Storage => "storage",
+            SignInStage::Discovery => "discovery",
+            SignInStage::Callback => "callback",
+            SignInStage::Waiting => "waiting",
+            SignInStage::Response => "response",
+            SignInStage::Exchange => "exchange",
+        }
+    }
+
+    /// True when the failure came before the browser was needed.
+    pub fn before_browser(self) -> bool {
+        matches!(
+            self,
+            SignInStage::Storage | SignInStage::Discovery | SignInStage::Callback
+        )
+    }
+}
+
+impl std::fmt::Display for SignInStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Sign in with ChatGPT ({})", self.as_str())
+    }
+}
+
+/// The step a failed sign-in stopped at, if it was one of ours.
+pub fn sign_in_stage(e: &anyhow::Error) -> Option<SignInStage> {
+    // Contexts are found by `downcast_ref` on the error, through every layer.
+    e.downcast_ref::<SignInStage>().copied()
+}
+
 pub type BrowserOpener = Box<dyn FnOnce(&str) -> anyhow::Result<()> + Send>;
 
 /// How [`login_with`] runs the browser half of the sign-in.

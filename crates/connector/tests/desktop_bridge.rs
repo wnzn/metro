@@ -283,7 +283,7 @@ fn config(
 ) -> DesktopConfig {
     let mut c = DesktopConfig::new(root.to_path_buf(), primary, local);
     c.poll_interval = Duration::from_millis(30);
-    c.open_browser = Arc::new(|_| {});
+    c.open_browser = Arc::new(|_| Ok(()));
     // Nothing listens there: the sign-in fails at discovery, no vendor call.
     c.oauth_endpoints = Endpoints {
         issuer: "http://127.0.0.1:9".into(),

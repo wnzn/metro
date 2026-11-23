@@ -23,7 +23,7 @@ use axum::extract::{DefaultBodyLimit, Path, Request, State};
 use axum::http::{HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{any, get, post, put};
+use axum::routing::{any, delete, get, post, put};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
 use serde::Deserialize;
@@ -252,6 +252,8 @@ fn router(ctx: Arc<Ctx>) -> Router {
             "/v1/connections/{id}/available-models",
             get(available_models),
         )
+        .route("/v1/connections/{id}/login", delete(login_cancel))
+        .route("/v1/connections/{id}/login/open", post(login_open))
         .route("/v1/connections/{id}/models", put(models))
         .route("/v1/connections/{id}/endpoint", put(endpoint))
         .route("/v1/connections/{id}/forget", post(forget))
@@ -379,6 +381,18 @@ async fn credentials_set(
         }
         Err(e) => e.into_response(),
     }
+}
+
+/// Opens the waiting sign-in's own start link again; the body is empty (no URL is accepted).
+async fn login_open(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>, b: Bytes) -> Response {
+    match body::<Empty>(&b) {
+        Ok(_) => reply(ctx.desktop.reopen_sign_in(&id).await),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn login_cancel(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Response {
+    reply(ctx.desktop.cancel_sign_in(&id).await)
 }
 
 async fn credentials_delete(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Response {

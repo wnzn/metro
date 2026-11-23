@@ -82,6 +82,14 @@ pub fn prepare_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Gives `dir` the protected DACL of the desktop root: full control for this
+/// user and SYSTEM only, inherited by what is created inside. Also used by the
+/// ChatGPT credential store for its own profile directory.
+#[cfg(windows)]
+pub(crate) fn protect_private_dir(dir: &Path) -> Result<()> {
+    win::protect_dir(dir)
+}
+
 /// Held for the life of the primary instance; released when dropped or
 /// when the process ends.
 pub struct InstanceLock {

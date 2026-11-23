@@ -1,8 +1,11 @@
 //! Loopback listener on 127.0.0.1. It serves two routes:
 //!
-//! - `GET /auth/start?k=<one-time key>` answers with a 302 to the
-//!   authorization URL. That keeps the URL, and the `id_token_hint` in it, out
-//!   of the browser process's argv.
+//! - `GET /auth/start?k=<key>` answers with a 302 to the authorization URL.
+//!   That keeps the URL, and the `id_token_hint` in it, out of the browser
+//!   process's argv. The key is random per attempt; the link works only while
+//!   this attempt waits and at most `MAX_STARTS` times, so opening it again
+//!   (a browser that didn't come up, a copied link) continues the same
+//!   attempt: same state, nonce and PKCE.
 //! - `GET /auth/callback?...` checks `state` and returns the callback
 //!   parameters.
 //!
@@ -21,6 +24,8 @@ use tokio::time::Instant;
 
 const MAX_REQUEST: usize = 16 * 1024;
 const CONN_TIMEOUT: Duration = Duration::from_secs(10);
+/// How many times one attempt's start link may be opened.
+const MAX_STARTS: u32 = 5;
 
 pub(crate) struct Loopback {
     listener: TcpListener,
@@ -66,7 +71,7 @@ impl Loopback {
     ) -> Result<Callback> {
         let deadline = Instant::now() + timeout;
         let host = format!("127.0.0.1:{}", self.port);
-        let mut started = false;
+        let mut starts = 0u32;
         loop {
             let accept = tokio::time::timeout_at(deadline, self.listener.accept()).await;
             let (mut stream, _) = match accept {
@@ -104,8 +109,8 @@ impl Loopback {
             match req.path.as_str() {
                 "/auth/start" => {
                     let k = q.get("k").map(String::as_str).unwrap_or("");
-                    if !started && bool::from(k.as_bytes().ct_eq(start_key.as_bytes())) {
-                        started = true;
+                    if starts < MAX_STARTS && bool::from(k.as_bytes().ct_eq(start_key.as_bytes())) {
+                        starts += 1;
                         let _ = respond(
                             &mut stream,
                             302,
@@ -114,7 +119,7 @@ impl Loopback {
                         )
                         .await;
                     } else {
-                        let _ = respond(&mut stream, 410, "This sign-in link was already used or is not valid. Start again from Metro.", None).await;
+                        let _ = respond(&mut stream, 410, "This sign-in link is no longer valid. Start the sign-in again from Metro.", None).await;
                     }
                 }
                 "/auth/callback" => {

@@ -36,6 +36,7 @@ pub mod http;
 pub mod metro;
 pub mod netpolicy;
 pub mod openai_compat;
+pub mod opener;
 pub mod policy;
 pub mod profile;
 pub mod provider;

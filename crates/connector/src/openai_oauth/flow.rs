@@ -14,9 +14,10 @@ use super::sse;
 use super::store::{Account, Profile, Tokens, now};
 use super::translate;
 use super::{
-    AGENT_NAME, DYNAMIC_CLIENT_ID, Endpoints, LoginOptions, ModelInfo, PLAN_SCOPE, SCOPES, Status,
-    USAGE_URL,
+    AGENT_NAME, DYNAMIC_CLIENT_ID, Endpoints, LoginOptions, ModelInfo, PLAN_SCOPE, SCOPES,
+    SignInStage, Status, USAGE_URL,
 };
+use crate::SafeError;
 
 /// Refresh this many seconds before `exp`.
 const REFRESH_SKEW: u64 = 120;
@@ -46,47 +47,76 @@ struct TokenResponse {
     earliest_refresh_at: Option<Value>,
 }
 
-/// Prints the one-time local start URL. It carries no tokens, and only
-/// redirects to OpenAI once. Then it opens the system browser. Opener failure
-/// isn't fatal, because the printed URL still works.
+/// Opens the private start link without writing it to the terminal.
 pub(crate) fn open_system_browser(url: &str) -> Result<()> {
-    eprintln!("Continue with ChatGPT in your browser. If it did not open, visit:\n  {url}");
-    #[cfg(target_os = "macos")]
-    let cmd = ("open", vec![url]);
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let cmd = ("xdg-open", vec![url]);
-    #[cfg(windows)]
-    let cmd = ("explorer", vec![url]);
-    let _ = std::process::Command::new(cmd.0)
-        .args(cmd.1)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn();
+    match crate::opener::open_start_link(url) {
+        Ok(()) => eprintln!("Continue with ChatGPT in your browser."),
+        Err(why) => {
+            eprintln!("{why} Press Ctrl+C, then run the sign-in again after fixing the browser.");
+        }
+    }
     Ok(())
 }
 
+/// Marks `e` as a failure at `stage`. Unless it already carries a
+/// [`SafeError`] of its own, `safe` is what a person is told; the rest of the
+/// chain (which may quote a provider or a path) stays out of the UI.
+fn at(stage: SignInStage, safe: &'static str) -> impl FnOnce(anyhow::Error) -> anyhow::Error {
+    move |e| {
+        let has_safe = e.downcast_ref::<SafeError>().is_some()
+            || e.chain().any(|c| c.downcast_ref::<SafeError>().is_some());
+        let e = if has_safe {
+            e
+        } else {
+            e.context(SafeError::new(safe))
+        };
+        e.context(stage)
+    }
+}
+
+/// A Metro-authored message a person can act on, as the error itself.
+fn safe(stage: SignInStage, msg: impl AsRef<str>) -> anyhow::Error {
+    anyhow::Error::new(SafeError::new(msg)).context(stage)
+}
+
+const STORAGE_FAILED: &str = "Metro couldn't prepare this connection's private sign-in storage on this computer, so no browser was opened. Try again; if it keeps failing, use Forget this computer and set the connection up again.";
+const DISCOVERY_FAILED: &str = "Metro couldn't reach ChatGPT's sign-in service from this computer, so no browser was opened. Check the internet connection, proxy or firewall, then try again.";
+const CALLBACK_FAILED: &str = "Metro couldn't listen on 127.0.0.1 for the sign-in to come back, so no browser was opened. Security software may be blocking local connections; allow Metro, then try again.";
+const EXCHANGE_FAILED: &str = "Metro received the browser sign-in but couldn't complete it with ChatGPT. Start the sign-in again.";
+
 pub(crate) async fn login(dir: &Path, opts: LoginOptions) -> Result<()> {
     let ep = opts.endpoints.clone();
-    http::check_endpoints(&ep)?;
-    let profile = Profile::open(dir, true)?.expect("created");
-    let host = {
-        let lock = profile.lock().await?;
-        profile.host_or_create(&lock)?
-    };
-    let account = profile.account()?;
+    http::check_endpoints(&ep).map_err(at(SignInStage::Discovery, DISCOVERY_FAILED))?;
+
+    // Before any browser: the private store, the host ID, the issuer, the port.
+    let (profile, host, account, retained) = async {
+        let profile = Profile::open(dir, true)?.expect("created");
+        let host = {
+            let lock = profile.lock().await?;
+            profile.host_or_create(&lock)?
+        };
+        let account = profile.account()?;
+        let retained = profile.tokens()?;
+        anyhow::Ok((profile, host, account, retained))
+    }
+    .await
+    .map_err(at(SignInStage::Storage, STORAGE_FAILED))?;
     if let Some(a) = &account
         && a.endpoints != ep
     {
-        bail!(
-            "this connection profile is bound to a different OpenAI issuer/API; use a new profile"
-        );
+        return Err(safe(
+            SignInStage::Storage,
+            "This connection's sign-in on this computer belongs to a different ChatGPT service. Use Forget this computer, then set it up again.",
+        ));
     }
-    let retained = profile.tokens()?;
-    let client = http::client_for(&ep)?;
-    let disc = oidc::discover(&client, &ep.issuer).await?;
+    let client = http::client_for(&ep).map_err(at(SignInStage::Discovery, DISCOVERY_FAILED))?;
+    let disc = oidc::discover(&client, &ep.issuer)
+        .await
+        .map_err(at(SignInStage::Discovery, DISCOVERY_FAILED))?;
 
-    let lb = Loopback::bind(opts.preferred_port).await?;
+    let lb = Loopback::bind(opts.preferred_port)
+        .await
+        .map_err(at(SignInStage::Callback, CALLBACK_FAILED))?;
     let redirect_uri = lb.redirect_uri();
     let state = oidc::random_token();
     let nonce = oidc::random_token();
@@ -136,35 +166,86 @@ pub(crate) async fn login(dir: &Path, opts: LoginOptions) -> Result<()> {
             .join("&")
     );
 
-    (opts.open_browser)(&lb.start_url(&start_key))
-        .context("opening the browser for Sign in with ChatGPT")?;
+    // The start page keeps working (and can be opened again) whatever the
+    // opener says: an opener failure is the caller's to report, never fatal.
+    let _ = (opts.open_browser)(&lb.start_url(&start_key));
+    let minutes = opts.timeout.as_secs().div_ceil(60).max(1);
     let cb = lb
         .wait(&start_key, &authorize_url, &state, opts.timeout)
-        .await?;
+        .await
+        .map_err(|e| {
+            e.context(SafeError::new(format!(
+                "The browser sign-in wasn't finished within {minutes} minute{}. Start it again.",
+                if minutes == 1 { "" } else { "s" }
+            )))
+            .context(SignInStage::Waiting)
+        })?;
     drop(authorize_url);
 
     if let Some(err) = cb.error.as_deref() {
         let err = http::clean(err, 64);
         if err == "access_denied" {
-            bail!(
+            return Err(safe(
+                SignInStage::Response,
                 "Sign in with ChatGPT was declined, so ChatGPT plan usage is not enabled for Metro. \
-                 Sign in again to approve it, or configure another model connection"
-            );
+                 Sign in again to approve it, or use another model connection.",
+            ));
         }
+        let code: String = err
+            .chars()
+            .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+            .take(64)
+            .collect();
         let desc = cb
             .error_description
             .as_deref()
             .map(|d| format!(": {}", http::clean(d, 200)))
             .unwrap_or_default();
-        bail!("Sign in with ChatGPT returned error {err}{desc}");
+        return Err(anyhow!("Sign in with ChatGPT returned error {err}{desc}")
+            .context(SafeError::new(format!(
+                "ChatGPT's sign-in page returned an error ({code}). Start the sign-in again."
+            )))
+            .context(SignInStage::Response));
     }
-    let code = cb
-        .code
-        .filter(|c| !c.is_empty())
-        .ok_or_else(|| anyhow!("sign-in callback carried no authorization code"))?;
+    let code = cb.code.filter(|c| !c.is_empty()).ok_or_else(|| {
+        safe(
+            SignInStage::Response,
+            "The browser came back without a sign-in code. Start the sign-in again.",
+        )
+    })?;
+    finish(
+        &profile,
+        &ep,
+        &client,
+        &disc,
+        saved_client,
+        cb.client_id,
+        code,
+        &pkce.verifier,
+        &redirect_uri,
+        &nonce,
+    )
+    .await
+    .map_err(at(SignInStage::Exchange, EXCHANGE_FAILED))
+}
 
+/// After the browser: the client ID, the code exchange, the ID token, and
+/// saving the account and tokens.
+#[allow(clippy::too_many_arguments)]
+async fn finish(
+    profile: &Profile,
+    ep: &Endpoints,
+    client: &reqwest::Client,
+    disc: &Discovery,
+    saved_client: Option<String>,
+    cb_client_id: Option<String>,
+    code: String,
+    verifier: &str,
+    redirect_uri: &str,
+    nonce: &str,
+) -> Result<()> {
     // Work out the client ID for the exchange.
-    let client_id = match (&saved_client, cb.client_id.as_deref()) {
+    let client_id = match (&saved_client, cb_client_id.as_deref()) {
         (Some(saved), Some(got)) if got != saved => {
             bail!(
                 "sign-in callback named a different client than this connection's registration; nothing was changed"
@@ -202,12 +283,12 @@ pub(crate) async fn login(dir: &Path, opts: LoginOptions) -> Result<()> {
         ("grant_type", "authorization_code"),
         ("client_id", &client_id),
         ("code", &code),
-        ("code_verifier", &pkce.verifier),
-        ("redirect_uri", &redirect_uri),
+        ("code_verifier", verifier),
+        ("redirect_uri", redirect_uri),
         ("resource", &ep.resource),
     ]);
     let tr = token_request(
-        &client,
+        client,
         &disc.token_endpoint,
         body,
         "authorization code exchange",
@@ -225,8 +306,8 @@ pub(crate) async fn login(dir: &Path, opts: LoginOptions) -> Result<()> {
         .id_token
         .clone()
         .ok_or_else(|| anyhow!("token response carried no ID token"))?;
-    let keys = oidc::fetch_jwks(&client, &disc.jwks_uri).await?;
-    let claims = oidc::verify_id_token(&id_token, &keys, &disc.issuer, &client_id, Some(&nonce))?;
+    let keys = oidc::fetch_jwks(client, &disc.jwks_uri).await?;
+    let claims = oidc::verify_id_token(&id_token, &keys, &disc.issuer, &client_id, Some(nonce))?;
     let access_scope =
         oidc::check_access_token(&tr.access_token, &disc.issuer, &ep.resource, &client_id)?;
     let tokens = build_tokens(tr, id_token, access_scope, None)?;
@@ -239,10 +320,9 @@ pub(crate) async fn login(dir: &Path, opts: LoginOptions) -> Result<()> {
     if let Some(sub) = &current.subject
         && *sub != claims.sub
     {
-        bail!(
-            "you signed in to a different ChatGPT account than this connection belongs to; \
-                 nothing was changed. Add a new connection for the other account"
-        );
+        return Err(anyhow::Error::new(SafeError::new(
+            "You signed in to a different ChatGPT account than this connection belongs to, so nothing was changed. Add a new connection for the other account.",
+        )));
     }
     profile.write_account(
         &lock,
@@ -258,10 +338,12 @@ pub(crate) async fn login(dir: &Path, opts: LoginOptions) -> Result<()> {
     drop(lock);
 
     if !plan {
-        bail!(
-            "signed in, but ChatGPT plan usage was not granted (no {PLAN_SCOPE} scope), so Metro will \
-             not send requests with this connection. Sign in again to approve it"
-        );
+        return Err(anyhow!(
+            "signed in, but ChatGPT plan usage was not granted (no {PLAN_SCOPE} scope)"
+        )
+        .context(SafeError::new(
+            "Signed in, but ChatGPT plan usage wasn't granted, so Metro won't send requests with this connection. Sign in again and approve it.",
+        )));
     }
     Ok(())
 }
