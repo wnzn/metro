@@ -227,6 +227,24 @@ class Sources(unittest.TestCase):
                 self.assertLessEqual(used, declared)
                 self.assertIsNone(re.search(r"\$(installer|db|view|record|list)\.\w+\(", text, re.I))
 
+    def test_msi_automation_returns_objects_unenumerated(self):
+        # A plain `return <InvokeMember result>` enumerated RelatedProducts' StringList:
+        # no items -> $null ("Cannot bind argument to parameter 'Object'"), one -> a string.
+        helper = (MSI_DIR / "MsiAutomation.ps1").read_text(encoding="utf-8")
+        self.assertIn("    return , $result\n}", helper)
+        self.assertNotIn("return $target.GetType().InvokeMember", helper)
+
+    @unittest.skipUnless(os.environ.get("METRO_PWSH") or shutil.which("pwsh"), "PowerShell 7 (pwsh) not available")
+    def test_msi_automation_with_stand_ins(self):
+        pwsh = os.environ.get("METRO_PWSH") or shutil.which("pwsh")
+        env = dict(os.environ, POWERSHELL_TELEMETRY_OPTOUT="1")
+        p = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(MSI_DIR / "test-msi-automation.ps1")],
+                           capture_output=True, text=True, timeout=300, env=env)
+        self.assertEqual(p.returncode, 0, p.stdout[-4000:] + p.stderr[-2000:])
+        self.assertIn("fails=0", p.stdout)
+        self.assertNotIn("FAIL ", p.stdout)
+        self.assertEqual(p.stdout.count("PASS "), 25)
+
     def test_lock_is_pinned(self):
         lock = json.loads((MSI_DIR / "wixl-lock.json").read_text())
         self.assertRegex(lock["tree_sha256"], r"^[0-9a-f]{64}$")
