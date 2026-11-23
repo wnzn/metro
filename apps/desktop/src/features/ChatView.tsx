@@ -118,7 +118,7 @@ export function ChatView() {
 function ChatEmpty() {
   const typed = () => draft().trim().length > 0;
   return (
-    <EmptyState testID="chat-empty" title="Start a conversation" text="Ask your agent anything. A suggestion only fills the message box; nothing is sent until you send it.">
+    <EmptyState testID="chat-empty" title="Start a conversation" text="A suggestion only fills the message box.">
       <Row gap={2} wrap justify="center">
         <Each of={[...CHAT_SUGGESTIONS]} key={(s) => s.label}>
           {(s) => (
@@ -146,7 +146,7 @@ function Onboarding() {
       <Column grow gap={2}>
         <Label variant="strong">You're not in any Space yet</Label>
         <Label variant="caption" color="muted">
-          A Space has its own rooms, members and optional runner. Create one, or ask a Space owner to add you.
+          Create one, or ask a Space owner to add you.
         </Label>
         <Row gap={2} align="center">
           <Field testID="onboarding-space-name" accessibilityLabel="New Space name" value={name()} onChange={name.set} placeholder="Name your first Space" grow maxLength={80} onSubmit={() => void createSpace(name())} />
