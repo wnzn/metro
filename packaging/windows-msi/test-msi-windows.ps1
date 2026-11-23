@@ -33,7 +33,9 @@ param(
     [string] $Version,
     [string[]] $RequireFile = @(),
     [string] $LogDir,
-    [switch] $IAcceptChangesToThisWindowsProfile
+    [switch] $IAcceptChangesToThisWindowsProfile,
+    # GitHub-hosted CI only: allow DisableMsi=0 for the non-admin install (see step 11).
+    [switch] $ClientPolicyFixture
 )
 
 Set-StrictMode -Version 3.0
@@ -94,6 +96,37 @@ function Assert-Installed([string] $Dir, $Files, [bool] $Marker, [string[]] $Ext
     }
     if ($Marker) { Check ((Get-Item -LiteralPath (Join-Path $Dir 'enable-local-runner')).Length -eq 0) "$What`: marker must be empty" }
     Pass "$What`: files exact (marker $(if ($Marker) {'on'} else {'off'}))"
+}
+
+# Installs $Package into $Dir with a Basic-user token (runas /trustlevel:0x20000),
+# checks the token really is non-admin (whoami /groups), returns msiexec's exit code.
+function Invoke-BasicUserMsi([string] $Package, [string] $Dir, [string] $Tag) {
+    $script:Step++
+    $log = Join-Path $LogDir ('{0:D2}-basic-user-{1}-msiexec.log' -f $script:Step, $Tag)
+    $rc = Join-Path $Work "basic-$Tag-rc.txt"
+    $groups = Join-Path $Work "basic-$Tag-groups.csv"
+    # runas takes one program string; a .cmd file avoids nested quoting.
+    $cmd = Join-Path ([System.IO.Path]::GetTempPath()) ('metro-msi-basic-' + [Guid]::NewGuid().ToString('N') + '.cmd')
+    if ($cmd.Contains(' ')) { throw "temporary folder path has a space; runas needs one without: $cmd" }
+    Set-Content -LiteralPath $cmd -Encoding ASCII -Value @(
+        '@echo off',
+        "`"%SystemRoot%\System32\whoami.exe`" /groups /fo csv /nh >`"$groups`"",
+        "`"%SystemRoot%\System32\msiexec.exe`" /i `"$Package`" INSTALLDIR=`"$Dir`" /qn /norestart /l*v `"$log`"",
+        "echo %errorlevel%>`"$rc`"")
+    try {
+        $r = Start-Process -FilePath "$env:SystemRoot\System32\runas.exe" -ArgumentList @('/trustlevel:0x20000', $cmd) -PassThru -WindowStyle Hidden
+        $null = $r.Handle  # cache the handle so ExitCode is available after the wait
+        $exited = $r.WaitForExit(30000)
+        Check (-not $exited -or $r.ExitCode -eq 0) "runas /trustlevel could not start the Basic-user command (runas exit $(if ($exited) { $r.ExitCode }))"
+        $deadline = (Get-Date).AddMinutes(5)
+        while (-not (Test-Path -LiteralPath $rc) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
+        Check (Test-Path -LiteralPath $rc) "the Basic-user command did not finish within 5 minutes (log $log)"
+        $problem = Get-NonAdminTokenProblem @(Get-Content -LiteralPath $groups)
+        Check ($problem -eq '') "the runas /trustlevel token is not a non-admin token: $problem"
+        $code = [int] (Get-Content -LiteralPath $rc -Raw).Trim()
+        Pass "Basic-user ($Tag) msiexec ran with a Medium-integrity, non-admin token; exit $code (log $log)"
+        return $code
+    } finally { Remove-Item -LiteralPath $cmd -Force -ErrorAction SilentlyContinue }
 }
 
 function Assert-Single([string] $UpgradeCode, [string] $ProductCode, [string] $What) {
@@ -201,30 +234,48 @@ try {
         Remove-Item -LiteralPath (Split-Path -Parent $dDir) -Recurse -Force -ErrorAction SilentlyContinue
     } else { Skip 'install on another drive (no writable D:)' }
 
-    # 11. Without administrator rights: Basic-user token through runas /trustlevel.
+    # 11. Without administrator rights: a Basic-user token (runas /trustlevel:0x20000),
+    # policy-aware. Under the machine's own Windows Installer policy the outcome must
+    # be the documented one: success, or refusal (1625) with nothing installed. A
+    # refusal never counts as the non-admin install; that then needs
+    # -ClientPolicyFixture (GitHub-hosted runners only), which sets DisableMsi=0
+    # (Windows client behaviour) for that install and restores the exact old state.
+    $policyStore = New-HklmStore
+    $policy = Get-RegistryValueState $policyStore $script:MsiPolicyKey $script:MsiPolicyValue
+    $isServer = [int] (Get-CimInstance -ClassName Win32_OperatingSystem).ProductType -ne 1
+    $expectation = Get-BasicUserPolicyExpectation $policy $isServer
+    Write-Host "Installer policy: DisableMsi $(Format-RegistryValueState $policy); $(if ($isServer) { 'Windows Server' } else { 'Windows client' }); non-admin per-user install expected: $expectation"
     $basicDir = Join-Path $Work 'Basic User'
-    $rc = Join-Path $Work 'basic-rc.txt'
-    $blog = Join-Path $LogDir 'basic-user-msiexec.log'
-    # runas takes one program string; a .cmd file avoids nested quoting.
-    $basicCmd = Join-Path ([System.IO.Path]::GetTempPath()) ('metro-msi-basic-' + [Guid]::NewGuid().ToString('N') + '.cmd')
-    if ($basicCmd.Contains(' ')) { throw "temporary folder path has a space; runas needs one without: $basicCmd" }
-    Set-Content -LiteralPath $basicCmd -Encoding ASCII -Value @(
-        '@echo off',
-        "`"%SystemRoot%\System32\msiexec.exe`" /i `"$($fixtureMsi['1.0.0'])`" INSTALLDIR=`"$basicDir`" /qn /norestart /l*v `"$blog`"",
-        "echo %errorlevel%>`"$rc`"")
-    $r = Start-Process -FilePath "$env:SystemRoot\System32\runas.exe" -ArgumentList @('/trustlevel:0x20000', $basicCmd) -PassThru -WindowStyle Hidden
-    $null = $r.Handle  # cache the handle so ExitCode is available after the wait
-    $runasExited = $r.WaitForExit(30000)
-    # runas exits non-zero when it could not start the command; then nothing runs and there is nothing to wait for.
-    $deadline = if ($runasExited -and $r.ExitCode -ne 0) { Get-Date } else { (Get-Date).AddMinutes(5) }
-    while (-not (Test-Path -LiteralPath $rc) -and (Get-Date) -lt $deadline) { Start-Sleep -Seconds 2 }
-    if (Test-Path -LiteralPath $rc) {
-        $code = (Get-Content -LiteralPath $rc -Raw).Trim()
-        Check ($code -eq '0') "Basic-user (non-admin token) install exit $code (log $blog)"
-        Assert-Installed $basicDir $fx.'1.0.0'.files $true @() 'Basic-user install'
-        Invoke-Msi "/x $($pc['1.0.0'])" 0 'uninstall Basic-user install' | Out-Null
-    } else { Skip "Basic-user (runas /trustlevel) install: runas did not run the command on this machine (runas exit $(if ($runasExited) { $r.ExitCode } else { 'pending' }))" }
-    Remove-Item -LiteralPath $basicCmd -Force -ErrorAction SilentlyContinue
+    $nonAdminInstalled = $false
+    $outcome = Invoke-BasicUserMsi $fixtureMsi['1.0.0'] $basicDir 'host-policy'
+    if ($expectation -eq 'allowed') {
+        Check ($outcome -eq 0) "Basic-user install under this machine's policy: exit $outcome, expected 0"
+        $nonAdminInstalled = $true
+    } else {
+        Check ($outcome -eq 1625) "Basic-user install under this machine's policy: exit $outcome, expected 1625 (forbidden by policy)"
+        Check ((Get-RelatedProducts $Installer $uc).Count -eq 0) 'refused Basic-user install registered nothing'
+        Check (-not (Test-Path -LiteralPath $basicDir) -or (Get-Tree $basicDir).Count -eq 0) 'refused Basic-user install wrote no files'
+        Pass "machine policy refuses a non-elevated per-user install (1625), as documented for DisableMsi $(Format-RegistryValueState $policy)"
+        if ($ClientPolicyFixture) {
+            $isAdmin = ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+            $envMap = @{ GITHUB_ACTIONS = $env:GITHUB_ACTIONS; CI = $env:CI; RUNNER_ENVIRONMENT = $env:RUNNER_ENVIRONMENT }
+            $refusal = Get-PolicyFixtureRefusal $envMap $isAdmin
+            Check ($refusal -eq '') "client-policy fixture refused: $refusal"
+            Invoke-WithClientMsiPolicy $policyStore {
+                $code = Invoke-BasicUserMsi $fixtureMsi['1.0.0'] $basicDir 'client-policy'
+                Check ($code -eq 0) "Basic-user install with DisableMsi=0 (client policy): exit $code, expected 0"
+            }
+            Pass "installer policy restored: DisableMsi $(Format-RegistryValueState (Get-RegistryValueState $policyStore $script:MsiPolicyKey $script:MsiPolicyValue))"
+            $nonAdminInstalled = $true
+        }
+    }
+    Check $nonAdminInstalled ("no non-admin install could be verified: this machine's policy blocks it; " +
+        'on a GitHub-hosted runner pass -ClientPolicyFixture (never on other machines)')
+    Assert-Installed $basicDir $fx.'1.0.0'.files $true @() 'Basic-user install'
+    Assert-Single $uc $pc['1.0.0'] 'Basic-user install'
+    Check ((Get-ProductFacts $Installer $pc['1.0.0']).InstallLocation.TrimEnd('\') -eq $basicDir) 'Basic-user install went into the chosen folder'
+    Invoke-Msi "/x $($pc['1.0.0'])" 0 'uninstall Basic-user install' | Out-Null
+    Check ((Get-RelatedProducts $Installer $uc).Count -eq 0) 'Basic-user install removed'
 
     # Part 2: the real MSI.
     if ($Msi) {

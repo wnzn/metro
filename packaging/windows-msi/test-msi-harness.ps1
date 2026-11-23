@@ -193,5 +193,75 @@ try {
     Check ($loc -like 'at fail.ps1:2; stack: *' -and $loc -match 'at Inner, fail\.ps1: line 2' -and $loc -notmatch 'private dir' -and $loc -notmatch 'ARG-VALUE-123') "failure location names file and line only ($loc)"
 } finally { Remove-Item -LiteralPath $fdir -Recurse -Force }
 
+# ---- 6. Windows Installer policy (DisableMsi) -------------------------------------
+$st = { param($exists, $kind, $data) @{ KeyExists = $true; ValueExists = $exists; Kind = $kind; Data = $data } }
+$cases = @(
+    @(@{ KeyExists = $false; ValueExists = $false; Kind = ''; Data = $null }, $true, 'refused', 'absent key on Windows Server'),
+    @(@{ KeyExists = $false; ValueExists = $false; Kind = ''; Data = $null }, $false, 'allowed', 'absent key on Windows client'),
+    @((& $st $true 'DWord' 0), $true, 'allowed', 'DisableMsi=0 on Server'),
+    @((& $st $true 'DWord' 1), $false, 'refused', 'DisableMsi=1 on client'),
+    @((& $st $true 'DWord' 2), $false, 'refused', 'DisableMsi=2'),
+    @((& $st $true 'DWord' 5), $true, 'refused', 'other number on Server'),
+    @((& $st $true 'DWord' 5), $false, 'allowed', 'other number on client'),
+    @((& $st $true 'String' '0'), $true, 'refused', 'REG_SZ "0" is not the DWORD policy (Server default)'))
+foreach ($c in $cases) {
+    $got = Get-BasicUserPolicyExpectation $c[0] $c[1]
+    Check ($got -eq $c[2]) "policy expectation: $($c[3]) -> $($c[2]) (got $got)"
+}
+$hosted = @{ GITHUB_ACTIONS = 'true'; CI = 'true'; RUNNER_ENVIRONMENT = 'github-hosted' }
+Check ((Get-PolicyFixtureRefusal $hosted $true) -eq '') 'policy fixture allowed on an elevated GitHub-hosted runner'
+Check ((Get-PolicyFixtureRefusal @{ GITHUB_ACTIONS = 'true'; CI = 'true'; RUNNER_ENVIRONMENT = 'self-hosted' } $true) -like 'runner is not GitHub-hosted*') 'policy fixture refused on a self-hosted runner'
+Check ((Get-PolicyFixtureRefusal @{ CI = 'true'; RUNNER_ENVIRONMENT = 'github-hosted' } $true) -eq 'not running in GitHub Actions') 'policy fixture refused outside GitHub Actions'
+Check ((Get-PolicyFixtureRefusal @{} $true) -ne '') 'policy fixture refused on a developer machine'
+Check ((Get-PolicyFixtureRefusal $hosted $false) -like 'the test process is not elevated*') 'policy fixture refused without elevation (none is attempted)'
+
+# Fake registry store: path -> @{ name -> @{ Kind; Data } }.
+function New-FakeStore([hashtable] $Keys) {
+    $k = $Keys
+    return @{
+        Keys = $k
+        KeyExists = { param($p) $k.ContainsKey($p) }.GetNewClosure()
+        Read = { param($p, $n) if ($k.ContainsKey($p) -and $k[$p].ContainsKey($n)) { @{ Exists = $true; Kind = $k[$p][$n].Kind; Data = $k[$p][$n].Data } } else { @{ Exists = $false; Kind = ''; Data = $null } } }.GetNewClosure()
+        Write = { param($p, $n, $kind, $data) $k[$p][$n] = @{ Kind = [string] $kind; Data = $data } }.GetNewClosure()
+        DeleteValue = { param($p, $n) $k[$p].Remove($n) }.GetNewClosure()
+        CreateKey = { param($p) $k[$p] = @{} }.GetNewClosure()
+        KeyIsEmpty = { param($p) $k[$p].Count -eq 0 }.GetNewClosure()
+        DeleteKey = { param($p) $k.Remove($p) }.GetNewClosure()
+    }
+}
+$key = 'SOFTWARE\Policies\Microsoft\Windows\Installer'
+$during = $null
+$fs = New-FakeStore @{}
+Invoke-WithClientMsiPolicy $fs { $script:during = (& $fs.Read $key 'DisableMsi') }
+Check ($during.Exists -and $during.Kind -eq 'DWord' -and [int] $during.Data -eq 0 -and -not $fs.Keys.ContainsKey($key)) 'absent key: DisableMsi=0 during the body, key absent again after'
+$fs = New-FakeStore @{ $key = @{ Other = @{ Kind = 'String'; Data = 'x' } } }
+Invoke-WithClientMsiPolicy $fs { }
+Check ($fs.Keys[$key].Count -eq 1 -and $fs.Keys[$key]['Other'].Data -eq 'x') 'key present, value absent: value removed again, other values untouched'
+foreach ($old in @(@{ Kind = 'DWord'; Data = 1 }, @{ Kind = 'String'; Data = '1' })) {
+    $fs = New-FakeStore @{ $key = @{ DisableMsi = @{ Kind = $old.Kind; Data = $old.Data } } }
+    Invoke-WithClientMsiPolicy $fs { }
+    $v = $fs.Keys[$key]['DisableMsi']
+    Check ($v.Kind -ceq $old.Kind -and [string] $v.Data -ceq [string] $old.Data) "existing $($old.Kind) $($old.Data): restored with the same kind and data"
+}
+$fs = New-FakeStore @{ $key = @{ DisableMsi = @{ Kind = 'DWord'; Data = 1 } } }
+$msg = ''
+try { Invoke-WithClientMsiPolicy $fs { throw 'FAIL  inner install' } } catch { $msg = $_.Exception.Message }
+Check ($msg -eq 'FAIL  inner install' -and [int] $fs.Keys[$key]['DisableMsi'].Data -eq 1) 'a failing body is rethrown after the policy is restored'
+$fs = New-FakeStore @{}
+$msg = ''
+try { Invoke-WithClientMsiPolicy $fs { & $fs.Write $key 'SomethingElse' 'DWord' 3 } } catch { $msg = $_.Exception.Message }
+Check ($msg -like '*gained other values*' -and $fs.Keys.ContainsKey($key) -and -not $fs.Keys[$key].ContainsKey('DisableMsi')) 'a key that gained other values is not deleted, and the test fails'
+
+# whoami /groups /fo csv /nh lines (name, type, SID, attributes).
+$admDeny = '"BUILTIN\Administrators","Alias","S-1-5-32-544","Group used for deny only"'
+$admOn = '"BUILTIN\Administrators","Alias","S-1-5-32-544","Mandatory group, Enabled by default, Enabled group, Group owner"'
+$users = '"BUILTIN\Users","Alias","S-1-5-32-545","Mandatory group, Enabled by default, Enabled group"'
+$medium = '"Mandatory Label\Medium Mandatory Level","Label","S-1-16-8192",""'
+$high = '"Mandatory Label\High Mandatory Level","Label","S-1-16-12288",""'
+Check ((Get-NonAdminTokenProblem @($users, $admDeny, $medium)) -eq '') 'token: Medium integrity with Administrators deny-only is non-admin'
+Check ((Get-NonAdminTokenProblem @($users, $admOn, $high)) -eq 'token has High or System integrity') 'token: an elevated token is rejected'
+Check ((Get-NonAdminTokenProblem @($users, $admOn, $medium)) -eq 'Administrators group is enabled in the token') 'token: enabled Administrators group is rejected'
+Check ((Get-NonAdminTokenProblem @('')) -eq 'no groups were recorded for the token') 'token: no recorded groups is rejected'
+
 "fails=$script:fails"
 exit $script:fails

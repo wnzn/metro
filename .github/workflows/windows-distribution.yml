@@ -211,13 +211,18 @@ jobs:
           $t = $env:RUNNER_TEMP
           Test-MetroScriptMsiCoexistence -Msi "$t\dist\$env:MSI_NAME" -Zip "$t\dist\Metro-$env:VERSION-windows-x64.zip" `
             -Script (Join-Path $env:GITHUB_WORKSPACE 'packaging\install-metro-windows.ps1') -Version $env:VERSION -LogDir "$t\logs"
+      # Windows Server blocks non-elevated per-user MSI installs by default (DisableMsi);
+      # the harness checks that refusal, then on this disposable GitHub-hosted runner
+      # sets the Windows client default (DisableMsi=0) for one Basic-user install and
+      # restores the exact previous state.
       - name: MSI lane native tests (fixtures, upgrade, repair, downgrade, uninstall; then the preview MSI)
         run: |
           $t = $env:RUNNER_TEMP
           $require = @()
           if (Test-Path -LiteralPath "$t\tree\metro-tui.exe") { $require = @('-RequireFile', 'metro-tui.exe') }
           & pwsh -NoProfile -NonInteractive -File (Join-Path $env:GITHUB_WORKSPACE 'packaging\windows-msi\test-msi-windows.ps1') `
-            -FixturesDir "$t\fixtures" -Msi "$t\dist\$env:MSI_NAME" -Version $env:VERSION -LogDir "$t\logs\msi-lane" @require
+            -FixturesDir "$t\fixtures" -Msi "$t\dist\$env:MSI_NAME" -Version $env:VERSION -LogDir "$t\logs\msi-lane" @require `
+            -ClientPolicyFixture
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Verifier self-test with a throwaway certificate (never trusted, never shipped)
         run: |

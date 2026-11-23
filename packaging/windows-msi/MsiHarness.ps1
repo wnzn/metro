@@ -117,3 +117,123 @@ function Format-FailureLocation([Management.Automation.ErrorRecord] $Record) {
     })
     return "at ${file}:$line; stack: $($stack -join ' <- ')"
 }
+
+# ---------------------------------------------------------------- installer policy
+# DisableMsi (HKLM\Software\Policies\Microsoft\Windows\Installer, REG_DWORD), per
+# https://learn.microsoft.com/en-us/windows/win32/msi/disablemsi:
+#   0: all installs allowed (what Windows client editions do when it is absent)
+#   1: non-elevated per-user installs blocked (error 1625)
+#   2: Windows Installer disabled
+#   absent, or any other value: client editions allow everything; Windows Server
+#   blocks non-elevated per-user installs, as for 1.
+$script:MsiPolicyKey = 'SOFTWARE\Policies\Microsoft\Windows\Installer'
+$script:MsiPolicyValue = 'DisableMsi'
+
+# 'allowed' or 'refused' for a non-elevated per-user install.
+function Get-BasicUserPolicyExpectation($State, [bool] $IsServer) {
+    $n = $null
+    if ($State.ValueExists -and $State.Kind -eq 'DWord') { $n = [int64] $State.Data }
+    if ($n -eq 0) { return 'allowed' }
+    if ($n -eq 1 -or $n -eq 2) { return 'refused' }
+    if ($IsServer) { return 'refused' } else { return 'allowed' }
+}
+
+# '' when the client-policy fixture may change this machine, else why not. Only
+# disposable GitHub-hosted runners qualify; never a self-hosted, operator or
+# developer machine.
+function Get-PolicyFixtureRefusal([hashtable] $Environment, [bool] $IsAdministrator) {
+    if ($Environment['GITHUB_ACTIONS'] -cne 'true' -or $Environment['CI'] -cne 'true') { return 'not running in GitHub Actions' }
+    if ($Environment['RUNNER_ENVIRONMENT'] -cne 'github-hosted') { return "runner is not GitHub-hosted (RUNNER_ENVIRONMENT=$($Environment['RUNNER_ENVIRONMENT']))" }
+    if (-not $IsAdministrator) { return 'the test process is not elevated, so it cannot set machine policy (no elevation is attempted)' }
+    return ''
+}
+
+# A registry store is a hashtable of scriptblocks (Windows: New-HklmStore; tests: a fake):
+#   KeyExists(path) ; Read(path, name) -> @{Exists; Kind; Data} ; Write(path, name, kind, data)
+#   DeleteValue(path, name) ; CreateKey(path) ; KeyIsEmpty(path) ; DeleteKey(path)
+function New-HklmStore {
+    $hklm = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    return @{
+        KeyExists   = { param($p) $k = $hklm.OpenSubKey($p); if ($k) { $k.Dispose(); $true } else { $false } }.GetNewClosure()
+        Read        = { param($p, $n)
+            $k = $hklm.OpenSubKey($p)
+            if (-not $k) { return @{ Exists = $false; Kind = ''; Data = $null } }
+            try {
+                if ($k.GetValueNames() -notcontains $n) { return @{ Exists = $false; Kind = ''; Data = $null } }
+                return @{ Exists = $true; Kind = [string] $k.GetValueKind($n)
+                          Data = $k.GetValue($n, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames) }
+            } finally { $k.Dispose() } }.GetNewClosure()
+        Write       = { param($p, $n, $kind, $data)
+            $k = $hklm.OpenSubKey($p, $true); try { $k.SetValue($n, $data, [Microsoft.Win32.RegistryValueKind] $kind) } finally { $k.Dispose() } }.GetNewClosure()
+        DeleteValue = { param($p, $n) $k = $hklm.OpenSubKey($p, $true); try { $k.DeleteValue($n) } finally { $k.Dispose() } }.GetNewClosure()
+        CreateKey   = { param($p) $hklm.CreateSubKey($p).Dispose() }.GetNewClosure()
+        KeyIsEmpty  = { param($p) $k = $hklm.OpenSubKey($p); try { $k.ValueCount -eq 0 -and $k.SubKeyCount -eq 0 } finally { $k.Dispose() } }.GetNewClosure()
+        DeleteKey   = { param($p) $hklm.DeleteSubKey($p, $true) }.GetNewClosure()
+    }
+}
+
+function Get-RegistryValueState($Store, [string] $Path, [string] $Name) {
+    $key = [bool] (& $Store.KeyExists $Path)
+    $v = if ($key) { & $Store.Read $Path $Name } else { @{ Exists = $false; Kind = ''; Data = $null } }
+    return @{ KeyExists = $key; ValueExists = [bool] $v.Exists; Kind = [string] $v.Kind; Data = $v.Data }
+}
+
+function Format-RegistryValueState($State) {
+    if (-not $State.KeyExists) { return 'key absent' }
+    if (-not $State.ValueExists) { return 'key present, value absent' }
+    $d = if ($State.Data -is [array]) { $State.Data -join ',' } else { [string] $State.Data }
+    return "value $($State.Kind) $d"
+}
+
+function Test-SameRegistryValueState($A, $B) {
+    if ($A.KeyExists -ne $B.KeyExists -or $A.ValueExists -ne $B.ValueExists) { return $false }
+    if (-not $A.ValueExists) { return $true }
+    if ($A.Kind -cne $B.Kind) { return $false }
+    if ($A.Data -is [array] -or $B.Data -is [array]) { return (@($A.Data) -join "`0") -ceq (@($B.Data) -join "`0") }
+    return [string] $A.Data -ceq [string] $B.Data
+}
+
+# Runs $Body with DisableMsi=0 (the Windows client behaviour), then puts back
+# exactly what was there: the old kind and data, or no value, or no key. A
+# failure to restore is an error; it never deletes anything it did not create.
+function Invoke-WithClientMsiPolicy($Store, [scriptblock] $Body) {
+    $path = $script:MsiPolicyKey; $name = $script:MsiPolicyValue
+    $before = Get-RegistryValueState $Store $path $name
+    $bodyError = $null
+    try {
+        if (-not $before.KeyExists) { & $Store.CreateKey $path }
+        & $Store.Write $path $name 'DWord' 0
+        try { & $Body } catch { $bodyError = $_ }
+    } finally {
+        if ($before.ValueExists) { & $Store.Write $path $name $before.Kind $before.Data }
+        elseif ((& $Store.KeyExists $path) -and (& $Store.Read $path $name).Exists) { & $Store.DeleteValue $path $name }
+        if (-not $before.KeyExists -and (& $Store.KeyExists $path)) {
+            if (-not (& $Store.KeyIsEmpty $path)) {
+                throw "installer policy key gained other values or subkeys during the test; not deleting it (was absent before)"
+            }
+            & $Store.DeleteKey $path
+        }
+        $after = Get-RegistryValueState $Store $path $name
+        if (-not (Test-SameRegistryValueState $before $after)) {
+            throw "installer policy not restored: before '$(Format-RegistryValueState $before)', after '$(Format-RegistryValueState $after)'"
+        }
+    }
+    if ($bodyError) { throw $bodyError }
+}
+
+# A genuinely non-admin token: Medium integrity (S-1-16-8192), not High
+# (S-1-16-12288), and the Administrators group (S-1-5-32-544) only for deny.
+# $GroupsCsv is `whoami /groups /fo csv /nh` output: name, type, SID, attributes.
+function Get-NonAdminTokenProblem([string[]] $GroupsCsv) {
+    $sids = @{}
+    foreach ($line in $GroupsCsv) {
+        if (-not $line) { continue }
+        $f = @($line | ConvertFrom-Csv -Header Name, Type, Sid, Attributes)
+        if ($f.Count -eq 1 -and $f[0].Sid) { $sids[[string] $f[0].Sid] = [string] $f[0].Attributes }
+    }
+    if ($sids.Count -eq 0) { return 'no groups were recorded for the token' }
+    if ($sids.ContainsKey('S-1-16-12288') -or $sids.ContainsKey('S-1-16-16384')) { return 'token has High or System integrity' }
+    if (-not $sids.ContainsKey('S-1-16-8192')) { return 'token is not Medium integrity' }
+    if ($sids.ContainsKey('S-1-5-32-544') -and $sids['S-1-5-32-544'] -notmatch 'deny') { return 'Administrators group is enabled in the token' }
+    return ''
+}

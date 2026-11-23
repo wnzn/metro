@@ -9,6 +9,7 @@ windows-msi/test-msi-windows.ps1 (Windows CI only).
 
 import hashlib
 import json
+import re
 import os
 from pathlib import Path
 import shutil
@@ -282,8 +283,34 @@ class Sources(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout[-4000:] + proc.stderr[-2000:])
         self.assertIn("fails=0", proc.stdout)
         self.assertNotIn("FAIL ", proc.stdout)
-        self.assertEqual(proc.stdout.count("PASS "), 27)
+        self.assertEqual(proc.stdout.count("PASS "), 50)
         self.assertIn("exported from packages built by build_msi.py" if real else "written in this test", proc.stdout)
+
+    def test_policy_fixture_only_on_hosted_harness_runs(self):
+        # Both CI calls of the native harness run on GitHub-hosted windows-2025 and ask for the
+        # client-policy fixture; the harness itself refuses it anywhere else.
+        root = HERE.parent / ".github" / "workflows"
+        for wf, job in (("windows-distribution.yml", "preview"), ("windows-sign.yml", "verify")):
+            with self.subTest(wf=wf):
+                text = (root / wf).read_text(encoding="utf-8")
+                start = text.index(f"\n  {job}:\n")
+                nxt = re.search(r"\n  [a-z][a-z0-9-]*:\n", text[start + 3:])
+                body = text[start: start + 3 + nxt.start()] if nxt else text[start:]
+                self.assertIn("runs-on: windows-2025", body)
+                self.assertIn("test-msi-windows.ps1", body)
+                self.assertIn("-ClientPolicyFixture", body)
+        harness = (MSI_DIR / "test-msi-windows.ps1").read_text(encoding="utf-8")
+        self.assertIn("Get-PolicyFixtureRefusal", harness)
+        self.assertIn("Invoke-WithClientMsiPolicy", harness)
+        self.assertNotIn("AlwaysInstallElevated", harness)
+
+    def test_installer_is_policy_neutral(self):
+        d = tmpdir(self)
+        p = b.fake_payload(d, "1.0.0")
+        _, entries, _ = b.validate_payload(p, "1.0.0")
+        xml = b.product_wxs("release", "1.0.0", "1.0.99", entries, p, d / "marker", False)
+        for word in ("Policies", "DisableMsi", "AlwaysInstallElevated", "Root=\"HKLM\" Key=\"SOFTWARE\\Policies"):
+            self.assertNotIn(word, xml)
 
     def test_lock_is_pinned(self):
         lock = json.loads((MSI_DIR / "wixl-lock.json").read_text())
