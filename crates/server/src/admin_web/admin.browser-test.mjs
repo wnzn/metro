@@ -267,6 +267,97 @@ await test("every button has an accessible name; inputs have labels", async () =
   assert(unlabeled === 0, unlabeled + " unlabeled inputs");
 });
 
+await test("brand, text, control edges and focus meet contrast targets in light and dark", async () => {
+  try {
+    for (const scheme of ["light", "dark"]) {
+      await page("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: scheme }] });
+      // Check actual CSS, including resolved color-mix() badge backgrounds.
+      const checks = await evaluate(`(() => {
+        const style = s => getComputedStyle(document.querySelector(s));
+        const canvas = document.createElement("canvas");
+        canvas.width = canvas.height = 1;
+        const ctx = canvas.getContext("2d", { willReadFrequently: true });
+        const luminance = color => {
+          ctx.fillStyle = color;
+          ctx.fillRect(0, 0, 1, 1);
+          const rgb = ctx.getImageData(0, 0, 1, 1).data;
+          return [0.2126, 0.7152, 0.0722].reduce((sum, weight, i) => {
+            const c = rgb[i] / 255;
+            return sum + weight * (c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4);
+          }, 0);
+        };
+        const results = [];
+        const check = (name, front, back, min) => {
+          const [a, b] = [luminance(front), luminance(back)].sort((a, b) => b - a);
+          results.push([name, (a + 0.05) / (b + 0.05), min]);
+        };
+        const bg = s => style(s).backgroundColor;
+        const ink = (s, background = s, min = 4.5) => check(s, style(s).color, bg(background), min);
+        const edge = (s, background) => check(s + " border", style(s).borderTopColor, bg(background), 3);
+        const brandSvg = style(".brand-mark path");
+        check("train", brandSvg.fill, bg(".topbar"), 3);
+        ink(".brand-lockup", ".topbar");
+        ink(".brand-descriptor", ".topbar");
+        ink("body");
+        ink("#add-title", "#panel > section");
+        ink("#add-hint", "#panel > section");
+        ink("#add-name");
+        ink("#add-submit");
+        ink("#refresh");
+        ink(".btn-ghost-danger:not(:disabled)", "#users-card");
+        ink(".badge-ok");
+        ink(".badge-none");
+        ink(".notice-danger");
+        ink(".notice-warning");
+        ink(".alert-danger");
+        ink(".alert-warning");
+        check("primary button edge", bg("#add-submit"), bg("#panel > section"), 3);
+        edge("#add-name", "#panel > section");
+        edge("#refresh", "#users-card");
+        edge(".btn-ghost-danger:not(:disabled)", "#users-card");
+        edge(".secret", "body");
+        document.getElementById("add-name").focus();
+        const input = style("#add-name");
+        if (input.outlineStyle !== "solid" || parseFloat(input.outlineWidth) < 2) {
+          throw new Error("missing focus-visible outline on text field");
+        }
+        check("focus outline", input.outlineColor, bg("#panel > section"), 3);
+        return results;
+      })()`);
+      for (const [name, ratio, min] of checks) {
+        assert(ratio >= min, `${scheme} ${name}: ${ratio.toFixed(2)}:1, minimum ${min}:1`);
+      }
+    }
+  } finally {
+    await page("Emulation.setEmulatedMedia", { features: [] });
+  }
+});
+
+await test("keyboard focus and the train remain visible in forced colors", async () => {
+  try {
+    await page("Emulation.setEmulatedMedia", { features: [{ name: "forced-colors", value: "active" }] });
+    await evaluate("document.getElementById('add-name').focus()");
+    for (const type of ["keyDown", "keyUp"]) {
+      await page("Input.dispatchKeyEvent", { type, key: "Tab", code: "Tab", windowsVirtualKeyCode: 9 });
+    }
+    const styles = await evaluate(`(() => {
+      const button = document.getElementById("add-submit");
+      const { outlineStyle, outlineWidth } = getComputedStyle(button);
+      const mark = document.querySelector(".brand-mark");
+      return {
+        buttonFocused: document.activeElement === button && button.matches(":focus-visible"),
+        outlineStyle, outlineWidth,
+        markVisible: mark.getBoundingClientRect().width > 0 &&
+          getComputedStyle(mark.querySelector("path")).fill !== getComputedStyle(mark.closest("header")).backgroundColor,
+      };
+    })()`);
+    assert(styles.buttonFocused && styles.outlineStyle === "solid" && parseFloat(styles.outlineWidth) >= 2, "missing button focus outline");
+    assert(styles.markVisible, "train not distinguishable from background");
+  } finally {
+    await page("Emulation.setEmulatedMedia", { features: [] });
+  }
+});
+
 await test("names over 64 characters are refused without a request", async () => {
   assert(await evaluate("document.getElementById('add-name').maxLength") === 64, "maxlength");
   const before = apiCalls().length;
