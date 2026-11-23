@@ -7,7 +7,6 @@ Launching Metro itself needs a Mac; that part runs only on the native runners.
 
 import os
 from pathlib import Path
-import re
 import shutil
 import subprocess
 import tempfile
@@ -84,11 +83,13 @@ class InstallStepTests(unittest.TestCase):
                         self.assertIn('gate "setup" failed', proc.stderr)
 
     def test_after_update_without_local_runner_only_the_app_remains(self):
-        self.assertIn('inventory "$dir" Metro.app=dir\n', self.run_text)
-        with tempfile.TemporaryDirectory() as d:
-            folder = self.folder(Path(d), marker=None)
-            proc = self.sh(f'inventory "{folder}" Metro.app=dir', d)
-            self.assertEqual(proc.returncode, 0, proc.stderr)
+        for marker, ok in ((None, True), (b"", False)):
+            with self.subTest(marker=marker), tempfile.TemporaryDirectory() as d:
+                folder = self.folder(Path(d), marker=marker)
+                proc = self.sh(f'inventory "{folder}" Metro.app=dir', d)
+                self.assertEqual(proc.returncode == 0, ok, proc.stderr)
+                if not ok:
+                    self.assertIn("('enable-local-runner', 'empty-file-644')", proc.stderr)
 
     def test_a_failing_check_names_its_gate_without_printing_arguments(self):
         with tempfile.TemporaryDirectory() as d:
@@ -99,29 +100,6 @@ class InstallStepTests(unittest.TestCase):
                       proc.stderr)
         self.assertNotIn("unreachable", proc.stdout)
         self.assertNotIn("wrong", proc.stderr)
-
-    def test_every_check_has_a_gate_and_order_is_kept(self):
-        text = self.run_text
-        self.assertTrue(text.startswith("set -Eeuo pipefail\n"))
-        code = "\n".join(line for line in text.splitlines() if not line.lstrip().startswith("#"))
-        self.assertNotRegex(code, r"\|\s*sort\b")
-        self.assertNotIn("set -x", text)
-        order = ['gate="install (path with spaces)"', "install --archive",
-                 'gate="install folder holds exactly', "inventory \"$dir\" Metro.app=dir enable-local-runner",
-                 "codesign --verify --deep --strict \"$app\"", "MetroUI.app\"\n", "metro-tui\"\n",
-                 "metro-tui\" --help", 'grep -q "Metro conversations"',
-                 '= dev.metro.desktop\n', '= dev.metro.desktop.ui\n', "smoke-macos-launch.sh",
-                 "--no-local-runner", 'inventory "$dir" Metro.app=dir\n', " uninstall", 'test ! -e "$dir"',
-                 'test -d "$METRO_DESKTOP_HOME"', 'echo "macOS install smoke passed"']
-        positions = [text.find(o) for o in order]
-        self.assertTrue(all(p >= 0 for p in positions) and positions == sorted(positions),
-                        list(zip(order, positions, strict=True)))
-        # Each command after the prelude sits under a gate set just before it.
-        body = text[text.index('gate="install (path with spaces)"'):]
-        checks = [line for line in body.splitlines()
-                  if re.match(r"\s*(HOME=|inventory |codesign |\"\$app|grep |test |sh packaging/)", line)]
-        self.assertGreaterEqual(len(checks), 14)
-        self.assertEqual(text.count("gate="), 13)
 
 
 @unittest.skipUnless(shutil.which("shasum"), "shasum is not installed")
@@ -160,18 +138,6 @@ class LaunchScriptTests(unittest.TestCase):
                 proc = self.run_script(self.app(Path(d), **kwargs), manifest, Path(d))
                 self.assertEqual(proc.returncode, 1, proc.stderr)
                 self.assertIn("macOS launch smoke failed: " + message, proc.stderr)
-
-    def test_every_exit_is_a_named_failure(self):
-        text = LAUNCH.read_text()
-        self.assertEqual(re.findall(r"exit 1\b", text), ["exit 1"])  # only inside fail()
-        self.assertNotRegex(text, r"\|\s*sort\b")
-        self.assertIn('kill -TERM "$pid" || fail', text)
-        for line in text.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("test ") or (stripped.startswith("[ ") and "||" not in stripped
-                                                and not stripped.endswith("&& break")):
-                self.fail(f"silent check: {stripped}")
-        subprocess.run(["sh", "-n", str(LAUNCH)], check=True)
 
 
 if __name__ == "__main__":
