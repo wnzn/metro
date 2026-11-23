@@ -5,13 +5,18 @@
 // password; server-stored API profiles take a key that is sent once and
 // never shown again.
 //
-// Layout: your connections grouped by provider, each a compact row with one
-// Manage control that opens everything else about it; then the Documents &
-// media model (./library owns it); then Add a connection: what it's for, one
-// compact drop-down of providers (one entry per provider however many ways it
-// has), and that provider's ways to connect, each saying how you sign in,
-// where it runs and who pays. Grouping is ./providerGroups. Feedback shows in
-// the page's fixed footer, so it's seen wherever the page is scrolled.
+// Layout: the title with one primary action, Add connection; each
+// capability's default on one line; your connections grouped by provider,
+// each a compact row with one Manage control that opens everything else about
+// it; then the Documents & media model (./library owns it).
+//
+// Add connection opens one picker that lists every provider's ways to connect
+// at once (OpenAI · Sign in with ChatGPT, OpenAI · Chat API key, ...), each a
+// single row with its capability and one line on where it runs and who pays,
+// searchable and filterable by capability. Choosing a row asks only for what
+// that way needs. What must be said is said where it applies: at the key
+// field, on the way's row, and in Sharing. Grouping is ./providerGroups.
+// Feedback shows in the page's fixed footer.
 
 import { signal } from "nsh";
 import {
@@ -57,23 +62,14 @@ import {
 } from "../settings";
 import type { Capability, CatalogProvider, ProviderConnection } from "../settings";
 import { onSessionEnd, spaces } from "../store";
-import { Action, ActionBar, Badge, Banner, BrandMark, BrandPicker, Chip, Column, compactWidth, FactList, Field, Label, LearnMore, PageHeader, PageLayout, Row, SegmentedControl, SettingRow, SettingsGroup } from "../ui";
-import type { BrandItem } from "../ui";
+import { Action, ActionBar, Badge, Banner, BrandMark, Chip, Column, compactWidth, Field, Label, PageHeader, PageLayout, Row, SegmentedControl, SettingRow, SettingsGroup } from "../ui";
+import { DefaultsLine, MethodRow, PickerPanel, VendorHeading } from "../ui/providers";
 import { MediaModelSettings } from "./library/LibraryView";
-import { CAPABILITY_TONE, describePath, groupCatalog, vendorOf, wayLabel } from "./providerGroups";
+import { CAPABILITY_TONE, describePath, groupCatalog, methodDetail, pickerGroups, vendorOf, wayLabel } from "./providerGroups";
 import type { VendorGroup } from "./providerGroups";
 import { LocalDeviceBadge } from "../device/DeviceSetup";
 import { packaged } from "../device/state";
 import { DeviceStatusBadge, deviceStatusText, ListingResult, TokenReveal } from "./TokenReveal";
-
-// Used only when the server's catalog gives no description of its own.
-const FALLBACK_DESCRIPTION: Record<string, string> = {
-  "device-openai-oauth": "Sign in with ChatGPT (eligible local integrations; preview). You approve it in your browser on the computer that runs metro-connector. Metro never asks for an OAuth code or token.",
-  "device-claude-code": "Uses your Anthropic API key on this device with the installed Claude Code CLI. API billing; Claude Pro/Max subscriptions are not used.",
-  "device-openai-compatible": "A local or private OpenAI-compatible endpoint you run. Its URL and key stay on this computer.",
-  "device-systemone": "System One from metro-connector on this computer, with your own TypeSafe key there. Metro never receives it.",
-  "device-embeddings": "An OpenAI-compatible embeddings endpoint reached from metro-connector on this computer, such as a local server you run.",
-};
 
 const SHARE_OPTIONS = [
   { value: "personal", label: "Only me" },
@@ -82,20 +78,6 @@ const SHARE_OPTIONS = [
 ] as const;
 
 const SHARE_BADGE: Record<Exclude<ShareVisibility, "personal">, string> = { spaces: "Shared with Spaces", organization: "Shared with organization" };
-
-/** The packaged app sets device connections up itself; it never names a helper process. */
-const PACKAGED_DEVICE_TEXT =
-  "Runs in Metro on this computer, with your own sign-in or key kept here. The Metro server relays requests and never receives them. You connect it next, in Metro.";
-
-function describeProvider(p: CatalogProvider): string {
-  if (p.execution === "device" && packaged()) return PACKAGED_DEVICE_TEXT;
-  if (p.description) return p.description;
-  if (FALLBACK_DESCRIPTION[p.id]) return FALLBACK_DESCRIPTION[p.id];
-  if (p.execution === "device") return "Runs in metro-connector on this computer.";
-  const parts = [p.requiresKey ? "Needs an API key, stored encrypted on the server." : "No API key needed."];
-  if (p.allowCustomUrl) parts.push("Custom endpoints the operator approved.");
-  return parts.join(" ");
-}
 
 /** Connection rows the user opened to manage. Ids only; dropped at sign-out. */
 const managing = signal<ReadonlySet<string>>(new Set());
@@ -108,6 +90,24 @@ function setManaging(id: string, open: boolean) {
 }
 onSessionEnd(() => managing.set(new Set()));
 
+/** The add flow: closed, the picker open, or the form of one chosen way (a catalog id). */
+type Adding = { step: "closed" } | { step: "picking" } | { step: "form"; providerId: string };
+const adding = signal<Adding>({ step: "closed" });
+const pickQuery = signal("");
+const pickCapability = signal<Capability | "all">("all");
+const pickVendor = signal<string | null>(null);
+onSessionEnd(() => adding.set({ step: "closed" }));
+
+/** Opens the picker afresh; pressing Add connection while it's open changes nothing. */
+function openPicker() {
+  if (adding().step === "picking") return;
+  pickQuery.set("");
+  pickCapability.set("all");
+  pickVendor.set(null);
+  adding.set({ step: "picking" });
+}
+const closeAdding = () => adding.set({ step: "closed" });
+
 export function ProvidersSettings() {
   const device = () => revealed()?.kind === "device";
   const hasMessages = () => !device() && !!(catalogError() || connectionsError() || providerNotice());
@@ -117,21 +117,13 @@ export function ProvidersSettings() {
         when={device()}
         else={
           <Column gap={6}>
-            <Column gap={2}>
-              <PageHeader title="Model providers" subtitle="Your model connections, private unless you share one." />
-              <LearnMore testID="providers-learn-more">
-                <FactList
-                  facts={[
-                    { label: "Capability", value: "Each connection serves one: chat, System One or embeddings. Each capability has its own default." },
-                    { label: "Your runs", value: "Your runs, and the threads they start, use your default chat connection unless Model routing picks another." },
-                  ]}
-                />
-              </LearnMore>
-            </Column>
+            <PageHeader title="Model providers">
+              <Action testID="provider-picker" label="Add connection" icon="plus" variant="primary" accessibilityLabel="Add a model connection" onPress={openPicker} />
+            </PageHeader>
+            <AddConnection />
             <ConnectionList />
             {/* Documents & media's own form and Save (./library). Mounting it only loads the choice: nothing is indexed or sent. */}
             <MediaModelSettings />
-            <AddConnection />
           </Column>
         }
       >
@@ -179,24 +171,27 @@ function groupConnections(list: readonly ProviderConnection[]): ConnectionGroup[
   return [...groups.values()].sort((a, b) => rank(a.key) - rank(b.key) || a.name.localeCompare(b.name));
 }
 
+/** Each capability's default connection, by name; capabilities the server doesn't offer are left out. */
+function defaultEntries(list: readonly ProviderConnection[]) {
+  const offered = new Set((catalog()?.providers ?? []).map((p) => p.capability));
+  return (["chat", "system_one", "embeddings"] as const)
+    .filter((cap) => offered.has(cap) || list.some((c) => connectionCapability(c) === cap))
+    .map((cap) => ({ key: cap, label: CAPABILITY_LABEL[cap], tone: CAPABILITY_TONE[cap], value: list.find((c) => c.isDefault && connectionCapability(c) === cap)?.name ?? null }));
+}
+
 function ConnectionList() {
   return (
     <Column gap={3} testID="connection-list">
-      <Column gap={1}>
-        <Label variant="heading" heading>
-          Your connections
-        </Label>
-        <Label variant="caption" color="muted">
-          Only you can change these. A saved key is never shown again, and sharing never reveals it.
-        </Label>
-      </Column>
       <If when={connections()} else={<SettingsGroup><SettingRow label="Loading your connections…" /></SettingsGroup>}>
         {(list) => (
           <Column gap={4}>
             <If when={list().length === 0}>
               <SettingsGroup>
-                <SettingRow label="No connections yet" description="Add one below. Until then, Ask agent uses what the server operator configured, if anything." />
+                <SettingRow label="No connections yet" description="Until you add one, Ask agent uses what the server operator configured, if anything." />
               </SettingsGroup>
+            </If>
+            <If when={list().length > 0}>
+              <DefaultsLine testID="provider-defaults" entries={defaultEntries(list())} />
             </If>
             <Each of={groupConnections(list())} key={(g) => g.key}>
               {(g) => (
@@ -635,9 +630,33 @@ function SharingPanel(props: { connection: ProviderConnection }) {
 // ------------------------------------------------------------------ adding a connection
 
 function AddConnection() {
-  const kind = signal<Capability | "all">("all");
-  const vendor = signal<string | null>(null);
-  const chosen = signal<string | null>(null);
+  const chosen = () => {
+    const a = adding();
+    return a.step === "form" ? providerById(a.providerId) ?? null : null;
+  };
+  // Keyed by way: choosing another one starts a fresh form (and drops a typed key).
+  return (
+    <If when={adding().step !== "closed"}>
+      <If when={chosen()} else={<Picker />}>
+        {(p) => (
+          <Each of={[p()]} key={(x) => x.id}>
+            {(x) => (
+              <If when={x().execution === "device"} else={<ServerForm provider={x()} onDone={closeAdding} />}>
+                <DeviceForm provider={x()} onDone={closeAdding} />
+              </If>
+            )}
+          </Each>
+        )}
+      </If>
+    </If>
+  );
+}
+
+/**
+ * Every provider's ways to connect, as one list: search, a capability filter,
+ * and a row per way. A provider's heading narrows the list to it.
+ */
+function Picker() {
   const kinds = () => {
     const offered = new Set((catalog()?.providers ?? []).map((p) => p.capability));
     return [
@@ -645,132 +664,93 @@ function AddConnection() {
       ...(["chat", "system_one", "embeddings"] as const).map((c) => ({ value: c, label: CAPABILITY_LABEL[c], disabled: !offered.has(c) })),
     ];
   };
-  /** The catalog by provider, keeping only the ways that serve the chosen capability. */
-  const groups = () =>
-    groupCatalog(catalog()?.providers ?? [])
-      .map((g) => ({ ...g, paths: g.paths.filter((p) => kind() === "all" || p.capability === kind()) }))
-      .filter((g) => g.paths.length > 0);
-  const items = (): BrandItem[] =>
-    groups().map((g) => ({
-      value: g.key,
-      label: g.name,
-      mark: g.mark,
-      hint: `${g.paths.length === 1 ? describePath(g.paths[0]).method : `${g.paths.length} ways to connect`} · ${g.capabilities.filter((c) => g.paths.some((p) => p.capability === c)).map((c) => CAPABILITY_LABEL[c]).join(", ")}`,
-    }));
-  const group = () => groups().find((g) => g.key === vendor()) ?? null;
-  const selected = () => {
-    const id = chosen();
-    const g = group();
-    return id && g ? g.paths.find((p) => p.id === id) ?? null : null;
-  };
-  const chooseVendor = (key: string | null) => {
-    vendor.set(key);
-    const g = groups().find((x) => x.key === key);
-    // One way only: nothing more to choose.
-    chosen.set(g && g.paths.length === 1 ? g.paths[0].id : null);
-  };
-  const chooseKind = (value: Capability | "all") => {
-    kind.set(value);
-    const g = group();
-    if (!g) {
-      vendor.set(null);
-      chosen.set(null);
-    } else if (!g.paths.some((p) => p.id === chosen())) chosen.set(g.paths.length === 1 ? g.paths[0].id : null);
-  };
+  const groups = () => pickerGroups(catalog()?.providers ?? [], { query: pickQuery(), capability: pickCapability(), vendor: pickVendor() }, { packaged: packaged() });
   return (
-    <Column gap={4} testID="add-connection">
-      <Column gap={1}>
-        <Label variant="heading" heading>
-          Add a connection
-        </Label>
-        <Label variant="caption" color="muted">
-          Pick a provider, then how to connect. On your device is preferred: your sign-in or key stays on your computer.
-        </Label>
-      </Column>
+    <PickerPanel testID="add-connection" accessibilityLabel="Add a connection">
+      <Row align="center" gap={2} wrap>
+        <Field testID="provider-search" accessibilityLabel="Search providers and ways to connect" placeholder="Search providers" value={pickQuery()} onChange={pickQuery.set} grow autoFocus maxLength={80} />
+        <SegmentedControl testID="provider-capability" accessibilityLabel="Capability" options={kinds()} value={pickCapability()} onChange={pickCapability.set} />
+        <Action testID="provider-add-close" label="Close" variant="ghost" compact onPress={closeAdding} />
+      </Row>
       <If when={catalog()} else={<Label variant="caption" color="muted">{catalogError() ? "The provider list couldn't be loaded." : "Loading providers…"}</Label>}>
         {(cat) => (
-          <Column gap={4}>
+          <Column gap={3}>
+            <If when={pickVendor()}>
+              <Row>
+                <Action testID="provider-picker-all" label="All providers" variant="ghost" compact onPress={() => pickVendor.set(null)} />
+              </Row>
+            </If>
             <If when={cat().providers.length === 0}>
               <Label variant="caption" color="muted">
                 This server offers no model providers.
               </Label>
             </If>
-            <SettingsGroup>
-              <SettingRow label="For" description="Chat answers, System One decides, Embeddings index for search. A connection serves only one.">
-                <SegmentedControl testID="provider-capability" accessibilityLabel="What the connection is for" options={kinds()} value={kind()} onChange={chooseKind} />
-              </SettingRow>
-              <SettingRow label="Provider" description="Only what this server supports." stacked>
-                <BrandPicker testID="provider-picker" accessibilityLabel="Provider" placeholder="Choose a provider" items={items()} value={group() ? vendor() : null} onChange={chooseVendor} />
-              </SettingRow>
-            </SettingsGroup>
-            <If when={group()}>
-              {(g) => <WaysToConnect group={g()} chosen={chosen()} onChoose={chosen.set} />}
+            <If when={cat().providers.length > 0 && groups().length === 0}>
+              <Label variant="caption" color="muted" testID="provider-search-empty">
+                Nothing matches.
+              </Label>
             </If>
-            {/* Keyed by provider: choosing another one starts a fresh form (and drops a typed key). */}
-            <Each of={selected() ? [selected()!] : []} key={(p) => p.id}>
-              {(p) => (
-                <If when={p().execution === "device"} else={<ServerForm provider={p()} onDone={() => chosen.set(null)} />}>
-                  <DeviceForm provider={p()} onDone={() => chosen.set(null)} />
-                </If>
-              )}
+            <Each of={groups()} key={(g) => g.key}>
+              {(g) => <PickerGroup group={g()} />}
             </Each>
           </Column>
         )}
       </If>
+    </PickerPanel>
+  );
+}
+
+function PickerGroup(props: { group: VendorGroup }) {
+  const g = () => props.group;
+  return (
+    <Column gap={1}>
+      <VendorHeading
+        testID={`provider-picker:${g().key}`}
+        mark={g().mark}
+        name={g().name}
+        selected={pickVendor() === g().key}
+        accessibilityLabel={pickVendor() === g().key ? `${g().name}, shown alone` : `Show only ${g().name}`}
+        onPress={() => pickVendor.set(pickVendor() === g().key ? null : g().key)}
+      />
+      <Column testID={`provider-ways:${g().key}`}>
+        <Each of={g().paths} key={(p) => p.id}>
+          {(p) => {
+            const label = () => wayLabel(p(), { packaged: packaged() });
+            return (
+              <Column testID={`provider-way:${p().id}`}>
+                <MethodRow
+                  testID={`provider:${p().id}`}
+                  label={label()}
+                  detail={methodDetail(p(), { packaged: packaged() })}
+                  capability={{ label: CAPABILITY_LABEL[p().capability], tone: CAPABILITY_TONE[p().capability] }}
+                  accessibilityLabel={`${g().name} · ${label()}, ${CAPABILITY_LABEL[p().capability]}`}
+                  onPress={() => adding.set({ step: "form", providerId: p().id })}
+                />
+              </Column>
+            );
+          }}
+        </Each>
+      </Column>
     </Column>
   );
 }
 
-/** A provider's ways to connect: how you sign in, where it runs, who pays, and what it's for. */
-function WaysToConnect(props: { group: VendorGroup; chosen: string | null; onChoose: (id: string) => void }) {
-  return (
-    <SettingsGroup
-      title={`Connect ${props.group.name}`}
-      description={props.group.paths.length === 1 ? "One way to connect on this server." : `${props.group.paths.length} ways to connect on this server. Each makes its own connection.`}
-      testID={`provider-ways:${props.group.key}`}
-    >
-      <Each of={props.group.paths} key={(p) => p.id}>
-        {(p) => {
-          const how = () => describePath(p(), { packaged: packaged() });
-          const label = () => wayLabel(p(), { packaged: packaged() });
-          const chosen = () => props.chosen === p().id;
-          return (
-            <SettingRow label={label()} description={`${how().where} · ${how().billing}`} testID={`provider-way:${p().id}`}>
-              <Row align="center" gap={2}>
-                <Badge tone={CAPABILITY_TONE[p().capability]} label={CAPABILITY_LABEL[p().capability]} />
-                <Action
-                  testID={`provider:${p().id}`}
-                  label={chosen() ? "Setting up" : "Set up"}
-                  accessibilityLabel={chosen() ? `Setting up ${label()}, below` : `Set up ${label()}`}
-                  disabled={chosen()}
-                  onPress={() => props.onChoose(p().id)}
-                />
-              </Row>
-            </SettingRow>
-          );
-        }}
-      </Each>
-    </SettingsGroup>
-  );
-}
-
-/** What the chosen way means, shown on its form: the way, where it runs, who pays, what it's for and who can use it. */
+/** The chosen way, as the form's heading: provider, way, where it runs, capability and who can use it, then who pays. */
 function ChoiceSummary(props: { provider: CatalogProvider }) {
   const how = () => describePath(props.provider, { packaged: packaged() });
   const v = () => vendorOf(props.provider);
   return (
     <Row align="center" gap={2} wrap padX={4} padY={3} testID="provider-choice">
       <BrandMark mark={v().mark} />
-      <Label variant="strong">{v().name}</Label>
+      <Label variant="strong" heading>
+        {v().name}
+      </Label>
       <Badge tone="neutral" variant="outline" label={how().method} />
       <Badge tone="neutral" variant="outline" label={how().where} />
       <Badge tone={CAPABILITY_TONE[props.provider.capability]} label={CAPABILITY_LABEL[props.provider.capability]} />
       <Badge tone="neutral" variant="outline" label={how().scope} />
       <Label variant="caption" color="muted">
         {how().billing}
-      </Label>
-      <Label variant="caption" color="muted" testID="provider-choice-description">
-        {describeProvider(props.provider)}
       </Label>
     </Row>
   );
@@ -785,20 +765,17 @@ function DeviceForm(props: { provider: CatalogProvider; onDone: () => void }) {
     props.onDone();
   };
   return (
-    <SettingsGroup
-      title={`New ${props.provider.name} connection`}
-      description={
-        packaged()
-          ? "No vendor key or password goes to the Metro server. Next, Metro asks your consent and connects this computer: you sign in to the provider here and choose the models it may serve."
-          : "No vendor key or password goes into Metro. You'll get a device token for metro-connector, and you sign in to the provider there."
-      }
-      testID="device-form"
-    >
+    <SettingsGroup testID="device-form">
       <ChoiceSummary provider={props.provider} />
       <SettingRow label="Name" stacked>
         <Field testID="provider-name" accessibilityLabel="Connection name" value={name()} onChange={name.set} maxLength={80} onSubmit={() => void submit()} />
       </SettingRow>
-      <Row padX={4} padY={3} gap={2} justify="end" wrap>
+      <Row padX={4} padY={3} gap={2} justify="end" align="center" wrap>
+        <Column grow>
+          <Label variant="caption" color="muted" testID="device-form-next">
+            {packaged() ? "Next: sign in on this computer. Your sign-in or key stays here; the server never receives it." : "Next: a device token for metro-connector. You sign in there; Metro never receives your key."}
+          </Label>
+        </Column>
         <Action label="Cancel" variant="ghost" onPress={props.onDone} />
         <Action testID="provider-create-device" label={packaged() ? "Connect this device" : "Create and get device token"} busyLabel="Creating…" busy={providerBusy() === "create"} variant="primary" onPress={() => void submit()} />
       </Row>
@@ -857,13 +834,13 @@ function ServerForm(props: { provider: CatalogProvider; onDone: () => void }) {
     props.onDone();
   };
   return (
-    <SettingsGroup title={`New ${p.name} profile`} description="Stored on the server for you only. The server calls this provider directly." testID="server-form">
+    <SettingsGroup testID="server-form">
       <ChoiceSummary provider={p} />
       <SettingRow label="Name" stacked>
         <Field testID="provider-name" accessibilityLabel="Connection name" value={name()} onChange={name.set} maxLength={80} />
       </SettingRow>
       <If when={p.allowCustomUrl}>
-        <SettingRow label="Endpoint" description="Only endpoints the server operator approved, exactly as listed." stacked>
+        <SettingRow label="Endpoint" description="Only endpoints the operator approved." stacked>
           <Column gap={2}>
             <Row gap={1} wrap testID="provider-url-options">
               <Each of={urlOptions()} key={(u) => u}>
@@ -879,15 +856,18 @@ function ServerForm(props: { provider: CatalogProvider; onDone: () => void }) {
           </Column>
         </SettingRow>
       </If>
-      <SettingRow label={p.requiresKey ? "API key" : "API key (optional)"} description="Sent once and stored encrypted. Metro never shows it again, to you or anyone." stacked>
+      <SettingRow label={p.requiresKey ? "API key" : "API key (optional)"} description="Stored encrypted on the server · never shown again" stacked>
         <Field testID="provider-key" accessibilityLabel="API key" value={apiKey()} onChange={apiKey.set} placeholder="API key" masked />
       </SettingRow>
-      <SettingRow
-        label={p.listsModels ? "Model (optional)" : "Model"}
-        description={p.listsModels ? "Leave empty to pick from the list after saving, or enter a model ID by hand." : "This provider can't list its models: enter the model ID it documents."}
-        stacked
-      >
-        <Field testID="provider-model" accessibilityLabel="Model ID" value={model()} onChange={model.set} placeholder="Model ID" maxLength={200} />
+      <SettingRow label={p.listsModels ? "Model (optional)" : "Model"} stacked>
+        <Field
+          testID="provider-model"
+          accessibilityLabel="Model ID"
+          value={model()}
+          onChange={model.set}
+          placeholder={p.listsModels ? "Model ID, or pick one after saving" : "Model ID, as the provider documents it"}
+          maxLength={200}
+        />
       </SettingRow>
       <If when={formError()}>
         {(message) => (

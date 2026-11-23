@@ -4,9 +4,9 @@
 // shared ActionsMenu (./primitives).
 // Feature code passes only semantic props; every class decision lives here.
 
-import { Image, Text, View, token } from "nsh";
-import type { JSX } from "nsh";
-import { Button } from "nsh/base";
+import { Image, Text, View, effect, token, untracked } from "nsh";
+import type { JSX, ViewRef } from "nsh";
+import { Button, Menu, MenuItem } from "nsh/base";
 import fileAudioIcon from "./icons/file-audio.svg";
 import fileDocumentIcon from "./icons/file-document.svg";
 import fileImageIcon from "./icons/file-image.svg";
@@ -14,7 +14,7 @@ import fileVideoIcon from "./icons/file-video.svg";
 import pauseIcon from "./icons/pause.svg";
 import playIcon from "./icons/play.svg";
 import uploadIcon from "./icons/upload.svg";
-import { cx } from "./tokens";
+import { cx, popoverClass, popoverItemClass } from "./tokens";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
 
@@ -164,6 +164,72 @@ export function Thumbnail(props: Testable & { src: string }) {
   return (
     <View class="size-[48px] overflow-hidden rounded-(--radius-sm) border border-border bg-muted" testID={props.testID}>
       <Image src={props.src} class="w-full h-full" style={{ objectFit: "cover" }} accessibilityLabel={props.accessibilityLabel} />
+    </View>
+  );
+}
+
+// ---------------------------------------------------------------- upload
+
+export type UploadDestination = { id: string; label: string; detail: string };
+
+/**
+ * The primary Upload button as a menu of destinations: each item names where
+ * the files go and who will see them, and choosing one is the whole step (the
+ * feature then opens the system's file picker). `note` (the accepted types
+ * and size) heads the menu. Items' testIDs are `${testID}:${id}`.
+ */
+export function UploadMenu(
+  props: Testable & { label: string; busyLabel?: string; busy?: boolean; note?: string; destinations: readonly UploadDestination[]; onChoose: (id: string) => void },
+) {
+  return (
+    <Menu
+      placement="bottom"
+      align="end"
+      offset={4}
+      popupClass={cx(popoverClass, "min-w-[260px] max-w-[360px]")}
+      trigger={
+        <Button
+          class={cx("flex-row items-center gap-(--space-2) min-h-[32px] rounded-(--radius-sm) px-(--space-3) py-(--space-2) bg-primary hover:bg-primary/90 active:bg-primary/85 disabled:opacity-50", focusRing)}
+          disabled={props.busy}
+          testID={props.testID}
+          accessibilityLabel={props.accessibilityLabel ?? props.label}
+        >
+          <MediaGlyphIcon name="upload" tone="primary-foreground" />
+          <Text class="text-(length:--text-sm) font-medium text-primary-foreground">{props.busy ? props.busyLabel ?? props.label : props.label}</Text>
+          <Text class="text-(length:--text-xs) text-primary-foreground">▾</Text>
+        </Button>
+      }
+    >
+      <If when={props.note}>
+        <Text class="px-(--space-2) pt-(--space-1) pb-(--space-2) text-(length:--text-xs) text-muted-foreground">{props.note}</Text>
+      </If>
+      <Each of={props.destinations} key={(d) => d.id}>
+        {(d) => (
+          <MenuItem class={popoverItemClass} onSelect={() => props.onChoose(d().id)} testID={props.testID ? `${props.testID}:${d().id}` : undefined} accessibilityLabel={`${d().label}. ${d().detail}`}>
+            <View class="flex-col gap-px">
+              <Text class="text-(length:--text-sm) text-popover-foreground">{d().label}</Text>
+              <Text class="text-(length:--text-xs) text-muted-foreground">{d().detail}</Text>
+            </View>
+          </MenuItem>
+        )}
+      </Each>
+    </Menu>
+  );
+}
+
+/** Content that scrolls itself into view when `active` turns true (a "take me there" from another page), then calls `onShown`. */
+export function RevealAnchor(props: { active: boolean; onShown?: () => void; children?: JSX.Element; testID?: string }) {
+  let node: ViewRef | undefined;
+  effect(() => {
+    if (!props.active) return;
+    untracked(() => {
+      node?.reveal({ vertical: "start" });
+      props.onShown?.();
+    });
+  });
+  return (
+    <View ref={(n: ViewRef) => (node = n)} class="flex-col" testID={props.testID}>
+      {props.children}
     </View>
   );
 }

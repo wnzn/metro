@@ -12,7 +12,7 @@
 //
 // Message search (Search's Conversations mode) is a separate corpus.
 
-import { untracked } from "nsh";
+import { signal, untracked } from "nsh";
 import { me, openPlace, openSettings, spaces } from "../../store";
 import { ACCEPTED } from "../../api/library";
 import type { AvailableModel } from "../../api/client";
@@ -28,7 +28,6 @@ import {
   FileIcon,
   FileList,
   FileRow,
-  GlyphAction,
   Label,
   MarkedText,
   MediaImage,
@@ -38,12 +37,14 @@ import {
   Row,
   RowDetail,
   ResultCard,
+  RevealAnchor,
   ScrollArea,
   SettingRow,
   SettingsGroup,
   Surface,
   TextSection,
   Thumbnail,
+  UploadMenu,
 } from "../../ui";
 import type { PickerItem, Tone } from "../../ui";
 import { ConnectionBanner } from "../Conversation";
@@ -166,37 +167,46 @@ export function LibraryHome() {
 function LibraryFiles() {
   return (
     <Column gap={6} testID="library-view">
-      <PageHeader
-        title="Library"
-        subtitle="Your personal uploads and files uploaded by members of your Spaces."
-      >
-        <GlyphAction testID="library-choose" glyph="upload" label="Upload" busyLabel="Uploading…" busy={uploading()} accessibilityLabel={`Upload files to ${scopeLabel(uploadTarget())}`} onPress={() => void chooseAndUpload()} />
+      <PageHeader title="Library">
+        <UploadButton />
       </PageHeader>
-      <UploadTarget />
+      <UploadOutcomes />
       <ModelStatus />
       <FilesSection />
     </Column>
   );
 }
 
-function UploadTarget() {
-  const items = (): PickerItem[] => [{ value: "personal", label: "Your personal library" }, ...spaceItems()];
-  const who = () => (uploadTarget().kind === "personal" ? "Only you will see these files." : `Every current member of ${scopeLabel(uploadTarget())} will see these files.`);
+/**
+ * Upload ▾: each destination with who will see the files, chosen at the
+ * moment of picking. Choosing one sets the upload target (apart from the
+ * list's scope) and opens the system's file picker; nothing else is sent.
+ */
+function UploadButton() {
+  const destinations = () => [
+    { id: "personal", label: "Your personal library", detail: "Only you see these files." },
+    ...spaces().map((s) => ({ id: `space:${s.id}`, label: s.name, detail: `Adds to ${s.name}'s library · its members can see them.` })),
+  ];
+  return (
+    <UploadMenu
+      testID="library-choose"
+      label="Upload"
+      busyLabel="Uploading…"
+      busy={uploading()}
+      accessibilityLabel="Upload files: choose where they go"
+      note={`TXT, Markdown, PDF, DOCX, PNG, JPEG, WAV, MP3, MP4 or WebM, up to ${formatSize(maxFileBytes())} each. Uploading sends nothing to a model.`}
+      destinations={destinations()}
+      onChoose={(id) => {
+        setUploadTarget(id.startsWith("space:") ? { kind: "space", spaceId: id.slice("space:".length) } : { kind: "personal" });
+        void chooseAndUpload();
+      }}
+    />
+  );
+}
+
+function UploadOutcomes() {
   return (
     <Column gap={2} testID="library-upload">
-      <SettingsGroup>
-        <SettingRow label="Upload to" description={who()}>
-          <Picker
-            testID="library-upload-target"
-            accessibilityLabel="Upload to"
-            items={items()}
-            value={scopeValue(uploadTarget())}
-            onChange={(v) => setUploadTarget(v?.startsWith("space:") ? { kind: "space", spaceId: v.slice(6) } : { kind: "personal" })}
-          />
-        </SettingRow>
-        <SettingRow label="Accepted" description={`TXT, Markdown, PDF, DOCX, PNG, JPEG, WAV, MP3, MP4 and WebM, up to ${formatSize(maxFileBytes())} each.`} />
-        <SettingRow label="Where files go" description="Only to your Metro server. Uploading sends nothing to a model, and Metro never scans runner files, workspaces or disks." />
-      </SettingsGroup>
       <If when={uploadOutcomes().length > 0}>
         <Column gap={1} testID="library-upload-outcomes">
           <Each of={uploadOutcomes()} key={(o) => o.key}>
@@ -212,23 +222,44 @@ function UploadTarget() {
   );
 }
 
-/** Which media model Index uses; the choice itself lives in Settings › Model providers. */
+/**
+ * Asked from a file's Index while no media model is saved: Settings › Model
+ * providers opens with the media model choice scrolled into view.
+ */
+const mediaModelAsked = signal(false);
+/** Scroll the media model choice into view once, when Settings opens on it. */
+const revealMediaModel = signal(false);
+
+function chooseMediaModel() {
+  mediaModelAsked.set(true);
+  revealMediaModel.set(true);
+  openSettings("providers");
+}
+
+/** Where Index sends a file, said before any Index (only once a media model is chosen; without one, Index leads to choosing it). */
 function ModelStatus() {
-  const text = () => {
-    if (modelError()) return modelError()!;
-    if (!modelsLoaded()) return "Checking your media model…";
-    const m = savedModel();
-    return m ? `Index sends a file to ${m.name}${m.owned ? "" : `, shared by ${m.ownerId ?? "someone"}`}, only when you press Index.` : "No media model is chosen, so nothing can be indexed or searched yet.";
-  };
   return (
-    <Banner tone={modelsLoaded() && !savedModel() ? "warning" : "neutral"} testID="library-model-status">
-      <Column grow>
-        <Label variant="caption" color={modelsLoaded() && !savedModel() ? "warning" : "default"}>
-          {text()}
-        </Label>
-      </Column>
-      <Action testID="library-open-model-settings" label={savedModel() ? "Change" : "Choose a media model"} variant="ghost" onPress={() => openSettings("providers")} />
-    </Banner>
+    <>
+      <If when={modelError()}>
+        {(e) => (
+          <Banner tone="warning" testID="library-model-status">
+            <Label variant="caption" color="warning">
+              {e()}
+            </Label>
+          </Banner>
+        )}
+      </If>
+      <If when={modelError() ? null : savedModel()}>
+        {(m) => (
+          <Row align="center" gap={2} wrap testID="library-model-status">
+            <Label variant="caption" color="muted">
+              {`Index sends the whole file to ${m().name}${m().owned ? "" : `, shared by ${m().ownerId ?? "someone"}`}; whoever runs it can see it.`}
+            </Label>
+            <Action testID="library-open-model-settings" label="Change" variant="ghost" onPress={chooseMediaModel} />
+          </Row>
+        )}
+      </If>
+    </>
   );
 }
 
@@ -271,7 +302,7 @@ function FilesSection() {
         }
       >
         <SettingsGroup testID="library-file-list">
-          <SettingRow label="No files yet" description={`Nothing in ${scopeLabel(listScope())}. Upload some with Upload above.`} testID="library-files-empty" />
+          <SettingRow label="No files yet" description={`Nothing in ${scopeLabel(listScope())}.`} testID="library-files-empty" />
         </SettingsGroup>
       </If>
       <If when={nextCursor()}>
@@ -302,12 +333,15 @@ function AssetRow(props: { asset: LibraryAsset }) {
             label="More"
             accessibilityLabel={`More actions for ${a().name}`}
             items={[
-              {
-                id: `library-index:${a().id}`,
-                label: state()?.state === "indexing" ? "Indexing…" : state()?.state === "indexed" ? "Index again" : "Index",
-                disabled: !savedModelId() || state()?.state === "indexing",
-                onPress: () => void indexAsset(a()),
-              },
+              modelsLoaded() && !savedModelId()
+                ? // No media model yet: this leads straight to choosing one; nothing is sent.
+                  { id: `library-index:${a().id}`, label: "Choose a media model to index", onPress: chooseMediaModel }
+                : {
+                    id: `library-index:${a().id}`,
+                    label: state()?.state === "indexing" ? "Indexing…" : state()?.state === "indexed" ? "Index again" : "Index",
+                    disabled: !savedModelId() || state()?.state === "indexing",
+                    onPress: () => void indexAsset(a()),
+                  },
               ...(canDelete(a()) ? [{ id: `library-delete:${a().id}`, label: "Delete…", destructive: true, onPress: () => askDelete(a().id) }] : []),
             ]}
           />
@@ -379,11 +413,19 @@ export function MediaModelSettings() {
     return id && id !== savedModelId() ? mediaModels().find((m) => m.connectionId === id) ?? null : null;
   };
   return (
+    <RevealAnchor active={revealMediaModel()} onShown={() => revealMediaModel.set(false)} testID="library-model-anchor">
     <SettingsGroup
       title="Documents & media"
-      description="Indexing and searching your files use the media embeddings connection you choose here, and nothing else. A text-only embeddings connection can't stand in."
+      description="Indexing and file search use only the media connection chosen here. A text-only embeddings connection can't stand in."
       testID="library-model"
     >
+      <If when={mediaModelAsked() && !savedModelId()}>
+        <Column padX={4} padY={2}>
+          <Label variant="caption" color="warning" testID="library-model-asked">
+            Choose a media model and Save, then use Index on your file again. Nothing has been sent.
+          </Label>
+        </Column>
+      </If>
       <SettingRow
         label="Index and search with"
         description={
@@ -422,9 +464,22 @@ export function MediaModelSettings() {
         <If when={suggestion()}>
           {(s) => <Action testID="library-model-suggested" label={`Use ${s().name}`} variant="ghost" onPress={() => modelDraft.set(s().connectionId)} />}
         </If>
-        <Action testID="library-model-save" label="Save" busyLabel="Saving…" busy={savingModel()} disabled={!dirty()} variant="primary" onPress={() => void saveModel()} />
+        <Action
+          testID="library-model-save"
+          label="Save"
+          busyLabel="Saving…"
+          busy={savingModel()}
+          disabled={!dirty()}
+          variant="primary"
+          onPress={() =>
+            void saveModel().then(() => {
+              if (savedModelId()) mediaModelAsked.set(false);
+            })
+          }
+        />
       </Row>
     </SettingsGroup>
+    </RevealAnchor>
   );
 }
 

@@ -8,7 +8,7 @@ import type { ScheduleInput, ScheduleRun, ScheduleSpec, ScheduleTarget, Schedule
 import { apiClient, onSessionEnd, roomsOf, sessionGuard, spaces } from "../../store";
 import type { Room } from "../../store";
 import { discovery, failure, serverDetail, statusOf } from "./access";
-import { cronOf, cronShapeError, looksLikeZone, onceInstant, pickDeviceZone, recurrenceOf, todayIn } from "./time";
+import { cronOf, cronShapeError, looksLikeZone, onceInstant, pickDeviceZone, recurrenceOf, wallIn, zoneFormattable } from "./time";
 import type { Recurrence } from "./time";
 
 export type { ScheduleRun, ScheduleTarget, ScheduledTask };
@@ -148,13 +148,38 @@ export function closeForm() {
   });
 }
 
+/**
+ * A new task's suggested moment: the next whole hour in `zone`, at least ten
+ * minutes from now, as the form's date and time. Only a suggestion the form
+ * shows; nothing is scheduled until the user saves.
+ */
+export function nextHourIn(nowMs: number, zone: string): { date: string; time: string } {
+  const z = zone === "UTC" || zoneFormattable(zone) ? zone : "UTC";
+  const minuteStart = nowMs - (nowMs % 60_000);
+  const w = wallIn(minuteStart, z);
+  let ahead = 60 - w.minute;
+  if (ahead < 10) ahead += 60;
+  const at = wallIn(minuteStart + ahead * 60_000, z);
+  const pad = (n: number) => String(n).padStart(2, "0");
+  return { date: `${at.year}-${pad(at.month)}-${pad(at.day)}`, time: `${pad(at.hour)}:${pad(at.minute)}` };
+}
+
+/** The name a task gets when the user leaves Name empty: its prompt's first line, shortened. */
+export function nameFromPrompt(prompt: string): string {
+  const line = prompt.trim().split("\n")[0]!.replace(/\s+/g, " ").trim();
+  const max = Math.min(MAX_NAME_CHARS, 48);
+  return line.length > max ? `${line.slice(0, max - 1).trimEnd()}…` : line;
+}
+
 function resetForm() {
   formName.set("");
   formPrompt.set("");
   formDestination.set({ kind: "chat" });
-  formWhen.set("recurring");
-  formOnceDate.set(todayIn(Date.now(), deviceZone()));
-  formOnceTime.set("09:00");
+  // A new task is a one-time reminder at the next hour, in this device's zone: shown, editable, never saved by itself.
+  formWhen.set("once");
+  const next = nextHourIn(Date.now(), deviceZone());
+  formOnceDate.set(next.date);
+  formOnceTime.set(next.time);
   formOnceZone.set("device");
   formRecurrence.set("daily");
   formRecurTime.set("09:00");
@@ -213,11 +238,10 @@ async function loadDestinationRooms(spaceId: string): Promise<void> {
 
 /** The form as the server's input, or why it can't be saved yet. */
 export function formInput(nowMs = Date.now()): { ok: true; input: ScheduleInput } | { ok: false; error: string } {
-  const name = formName().trim();
-  if (!name) return { ok: false, error: "Give the task a name." };
-  if (name.length > MAX_NAME_CHARS) return { ok: false, error: `Names are at most ${MAX_NAME_CHARS} characters.` };
   const prompt = formPrompt().trim();
   if (!prompt) return { ok: false, error: "Write the prompt the agent should get." };
+  const name = formName().trim() || nameFromPrompt(prompt);
+  if (name.length > MAX_NAME_CHARS) return { ok: false, error: `Names are at most ${MAX_NAME_CHARS} characters.` };
   if (prompt.length > MAX_PROMPT_CHARS) return { ok: false, error: `Prompts are at most ${MAX_PROMPT_CHARS} characters.` };
 
   const d = formDestination();

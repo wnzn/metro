@@ -141,6 +141,7 @@ test("the time zone is one choice: this device, UTC or another IANA name, shown 
   const app = await signIn(w, "UTC");
   await app.press("id:h-schedules");
   await app.press("id:schedule-new");
+  await app.press("id:schedule-when:recurring"); // a new task starts as a one-time reminder
   await app.waitFor("id:schedule-zone:device");
   expect(app.value("id:schedule-timezone")).toBe("UTC");
   await app.press("id:schedule-zone:other");
@@ -159,9 +160,37 @@ test("the time zone is one choice: this device, UTC or another IANA name, shown 
 
   // A one-time task on a UTC device: both choices are live, the chosen one filled.
   await app.press("id:schedule-new");
-  await app.press("id:schedule-when:once");
   await app.waitFor("id:schedule-once-zone:device");
   expect(text(app)).toContain("This device (UTC)");
   await app.press("id:schedule-once-zone:utc");
   await app.press("id:schedule-once-zone:device");
+});
+
+test("a simple reminder is the prompt and Schedule: the next whole hour in the device's zone is shown first, and nothing is scheduled before Schedule", async () => {
+  const w = discoveryWorld();
+  const app = await signIn(w, "Asia/Manila");
+  await app.press("id:h-schedules");
+  await app.press("id:schedule-new");
+  await app.waitFor("id:schedule-once-preview");
+  // Prefilled, visible and editable: once, the next whole hour, this device's zone, the personal Chat.
+  const time = app.value("id:schedule-once-time")!;
+  expect(time).toMatch(/^\d{2}:00$/);
+  expect(app.value("id:schedule-once-date")).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+  expect(text(app)).toContain("This device (Asia/Manila)");
+  expect(text(app)).toMatch(/Fires [^|]*Asia\/Manila/);
+  expect(text(app)).toContain("To: the agent in your personal Chat");
+  expect(w.d.log.filter((l) => l.path === "/v1/schedules" && l.method === "POST")).toHaveLength(0);
+
+  await app.type("id:schedule-prompt", "Send the weekly report.\nAttach the numbers.");
+  await app.press("id:schedule-save");
+  await app.waitFor("text:Scheduled “Send the weekly report.”.");
+  const body = lastBody(w, "/v1/schedules") as { name: string; space_id: unknown; schedule: { kind: string; at: string } };
+  expect(body.name).toBe("Send the weekly report."); // the prompt's first line, as Name was left empty
+  expect(body.space_id).toBeNull();
+  expect(body.schedule.kind).toBe("once");
+  const at = Date.parse(body.schedule.at);
+  // The exact moment shown: that hour on Manila's clock.
+  expect(new Intl.DateTimeFormat("en-GB", { timeZone: "Asia/Manila", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).format(new Date(at))).toBe(time);
+  expect(at - Date.now()).toBeGreaterThan(9 * 60_000);
+  expect(at - Date.now()).toBeLessThan(71 * 60_000);
 });

@@ -190,3 +190,48 @@ export function describePath(p: CatalogProvider, opts: { packaged?: boolean } = 
   }
   return { method: "API key optional", variant, where: "Called by the server", billing: "Whoever runs the endpoint", scope };
 }
+
+// ------------------------------------------------------------------ the add-connection picker
+
+/** What the picker is narrowed to: typed words, one capability, one provider. */
+export type PickerFilter = { query: string; capability: Capability | "all"; vendor: string | null };
+
+/**
+ * A way's one line in the picker: where it runs and who pays (or, for a
+ * subscription sign-in, that it can't be shared).
+ */
+export function methodDetail(p: CatalogProvider, opts: { packaged?: boolean } = {}): string {
+  const how = describePath(p, opts);
+  return `${how.where} · ${how.billing}`;
+}
+
+/** Every typed word appears in the provider's name, the way's name or its capability. */
+export function matchesQuery(vendorName: string, p: CatalogProvider, query: string, opts: { packaged?: boolean } = {}): boolean {
+  const words = query.toLowerCase().split(/\s+/).filter(Boolean);
+  if (words.length === 0) return true;
+  const hay = [vendorName, p.name, wayLabel(p, opts), describePath(p, opts).method, CAPABILITY_WORD[p.capability]].join(" ").toLowerCase();
+  return words.every((w) => hay.includes(w));
+}
+
+/**
+ * The catalog as the picker lists it: providers in catalog order, each with
+ * the ways that pass the filter, chat first, then on-device before
+ * server-stored. Providers with no way left are dropped. Only what the server
+ * offers is ever listed.
+ */
+export function pickerGroups(providers: readonly CatalogProvider[], filter: PickerFilter, opts: { packaged?: boolean } = {}): VendorGroup[] {
+  return groupCatalog(providers)
+    .filter((g) => filter.vendor === null || g.key === filter.vendor)
+    .map((g) => ({
+      ...g,
+      paths: g.paths
+        .filter((p) => (filter.capability === "all" || p.capability === filter.capability) && matchesQuery(g.name, p, filter.query, opts))
+        .sort(
+          (a, b) =>
+            CAPABILITY_ORDER[a.capability] - CAPABILITY_ORDER[b.capability] ||
+            (a.execution === "device" ? 0 : 1) - (b.execution === "device" ? 0 : 1) ||
+            a.name.localeCompare(b.name),
+        ),
+    }))
+    .filter((g) => g.paths.length > 0);
+}

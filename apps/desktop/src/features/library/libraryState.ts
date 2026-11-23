@@ -642,6 +642,16 @@ export function openAsset(asset: LibraryAsset) {
   void openTarget({ assetId: asset.id, name: asset.name, mimeType: asset.mimeType, kind: asset.kind, spaceId: asset.spaceId, locator: null, excerpt: null, query: null, from: "library" });
 }
 
+/**
+ * A file uploaded elsewhere (a message's attachment) joins the list when it
+ * belongs to the scope shown, as the Library's own uploads do.
+ */
+export function noteUploaded(asset: LibraryAsset) {
+  const scope = listScope();
+  const belongs = scope.kind === "all" || (scope.kind === "personal" && asset.spaceId === null) || (scope.kind === "space" && asset.spaceId === scope.spaceId);
+  if (belongs && assetsLoaded()) assets.set([asset, ...assets().filter((a) => a.id !== asset.id)]);
+}
+
 export function openLibraryHit(hit: LibraryHit) {
   const known = assets().find((a) => a.id === hit.assetId);
   void openTarget({

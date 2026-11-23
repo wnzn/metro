@@ -224,7 +224,8 @@ test("a daily 09:00 task in Asia/Manila goes to a chosen room, shows its next fi
   await app.press("id:schedule-destination");
   await app.press("text:Acme");
   await app.waitFor("text:To: the agent in Acme · #lobby");
-  // Every day at 09:00 is the default shape; the zone defaults to the device's and is visible.
+  // A new task starts as a one-time reminder; Repeats gives every day at 09:00, in the device's zone.
+  await app.press("id:schedule-when:recurring");
   expect(app.value("id:schedule-timezone")).toBe("UTC");
   await app.press("id:schedule-zone:other");
   await app.clear("id:schedule-timezone");
@@ -283,8 +284,7 @@ test("a one-time task in UTC or the device's zone is sent with its offset; past 
   await app.press("id:schedule-new");
   await app.type("id:schedule-name", "Reminder");
   await app.type("id:schedule-prompt", "Remind me about the release.");
-  await app.press("id:schedule-when:once");
-  await app.waitFor("id:schedule-once-date");
+  await app.waitFor("id:schedule-once-date"); // once is where a new task starts
   // This device is UTC: the device choice is UTC itself.
   expect(text(app)).toContain("This device (UTC)");
   await app.press("id:schedule-once-zone:utc");

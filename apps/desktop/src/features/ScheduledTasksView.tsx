@@ -2,6 +2,11 @@
 // or on a recurrence, in their personal Chat or a Space room. Each counts as
 // the user asking the agent. This file is the page and its form; the list of
 // tasks, their cards and history are in ScheduledTaskList.tsx.
+//
+// A new task opens as a one-time reminder at the next whole hour in this
+// device's time zone, to the user's personal Chat: typing the prompt and
+// confirming the shown time is enough. Everything stays editable, and
+// nothing is scheduled until Schedule is pressed.
 
 import { cleanup, effect, untracked } from "nsh";
 import { spaces } from "../store";
@@ -36,6 +41,7 @@ import {
   MAX_NAME_CHARS,
   MAX_ONCE_AHEAD_DAYS,
   MAX_PROMPT_CHARS,
+  nameFromPrompt,
   onceZoneName,
   openNewTask,
   roomsFor,
@@ -66,10 +72,7 @@ export function ScheduledTasksView() {
       <ConnectionBanner />
       <ScrollArea pad={6}>
         <Surface variant="content" gap={6}>
-          <PageHeader
-            title="Scheduled tasks"
-            subtitle="Prompts the server sends to the agent for you, once or on a schedule. Each counts as you asking, with your model connection. Only you see them."
-          >
+          <PageHeader title="Scheduled tasks">
             <If when={!formOpen()}>
               <Action testID="schedule-new" label="New task" variant="primary" disabled={atTaskLimit()} onPress={openNewTask} />
             </If>
@@ -109,26 +112,19 @@ function Messages() {
 function TaskForm() {
   const editing = () => formOpen()?.mode === "edit";
   return (
-    <SettingsGroup
-      title={editing() ? "Edit task" : "New task"}
-      description="The agent gets the prompt at each firing, as if you'd asked it there."
-      testID="schedule-form"
-    >
-      <SettingRow label="Name" stacked>
-        <Field testID="schedule-name" accessibilityLabel="Task name" value={formName()} onChange={formName.set} placeholder="Morning summary" maxLength={MAX_NAME_CHARS} />
-      </SettingRow>
-      <SettingRow label="Prompt" description="What the agent is asked each time." stacked>
+    <SettingsGroup title={editing() ? "Edit task" : "New task"} testID="schedule-form">
+      <SettingRow label="Prompt" stacked>
         <Field
           testID="schedule-prompt"
-          accessibilityLabel="Prompt"
+          accessibilityLabel="Prompt the agent gets"
           value={formPrompt()}
           onChange={formPrompt.set}
-          placeholder="Summarise yesterday's messages and list open questions."
+          placeholder="Remind me to send the weekly report."
           multiline
+          autoFocus={!editing()}
           maxLength={MAX_PROMPT_CHARS}
         />
       </SettingRow>
-      <DestinationRows />
       <SettingRow label="When">
         <SegmentedControl
           testID="schedule-when"
@@ -144,7 +140,18 @@ function TaskForm() {
       <If when={formWhen() === "once"} else={<RecurringRows />}>
         <OnceRows />
       </If>
-      <SettingRow label="Active" description={formEnabled() ? "It fires on schedule." : "Saved paused. It won't fire until you resume it."}>
+      <DestinationRows />
+      <SettingRow label="Name" stacked>
+        <Field
+          testID="schedule-name"
+          accessibilityLabel="Task name (optional)"
+          value={formName()}
+          onChange={formName.set}
+          placeholder={nameFromPrompt(formPrompt()) || "Optional: the prompt's first line"}
+          maxLength={MAX_NAME_CHARS}
+        />
+      </SettingRow>
+      <SettingRow label="Active" description={formEnabled() ? undefined : "Saved paused: it won't fire until you resume it."}>
         <Toggle testID="schedule-enabled" label="Active" checked={formEnabled()} onChange={formEnabled.set} />
       </SettingRow>
       <If when={formError()}>
@@ -194,7 +201,7 @@ function DestinationRows() {
     return room ? `To: the agent in ${space.name} · #${room.name}` : `Pick a room in ${space.name}.`;
   };
   return (
-    <SettingRow label="Where" description="Your personal Chat, or a room or thread of a Space you're in." stacked>
+    <SettingRow label="Where" stacked>
       <Column gap={2}>
         <Row gap={2} wrap>
           <Picker testID="schedule-destination" accessibilityLabel="Where the prompt goes" items={items()} value={value()} onChange={onChange} />
@@ -244,13 +251,13 @@ function OnceRows() {
   };
   return (
     <Column>
-      <SettingRow label="Date and time" description={`24-hour clock. In the future, at most ${MAX_ONCE_AHEAD_DAYS} days ahead.`} stacked>
+      <SettingRow label="Date and time" stacked>
         <Row gap={2} align="center">
-          <Field testID="schedule-once-date" accessibilityLabel="Date, YYYY-MM-DD" value={formOnceDate()} onChange={formOnceDate.set} placeholder="YYYY-MM-DD" maxLength={10} />
-          <Field testID="schedule-once-time" accessibilityLabel="Time, HH:MM" value={formOnceTime()} onChange={formOnceTime.set} placeholder="HH:MM" maxLength={5} />
+          <Field testID="schedule-once-date" accessibilityLabel={`Date, YYYY-MM-DD, at most ${MAX_ONCE_AHEAD_DAYS} days ahead`} value={formOnceDate()} onChange={formOnceDate.set} placeholder="YYYY-MM-DD" maxLength={10} />
+          <Field testID="schedule-once-time" accessibilityLabel="Time, HH:MM, 24-hour" value={formOnceTime()} onChange={formOnceTime.set} placeholder="HH:MM" maxLength={5} />
         </Row>
       </SettingRow>
-      <SettingRow label="Time zone" description="The server stores the exact moment, in UTC.">
+      <SettingRow label="Time zone">
         <SegmentedControl
           testID="schedule-once-zone"
           accessibilityLabel="Time zone of the date and time"
@@ -293,9 +300,9 @@ function RecurringRows() {
       <If
         when={formRecurrence() === "custom"}
         else={
-          <SettingRow label="At" description="24-hour clock, in the time zone below." stacked>
+          <SettingRow label="At" stacked>
             <Row gap={2} align="center">
-              <Field testID="schedule-repeat-time" accessibilityLabel="Time, HH:MM" value={formRecurTime()} onChange={formRecurTime.set} placeholder="HH:MM" maxLength={5} />
+              <Field testID="schedule-repeat-time" accessibilityLabel="Time, HH:MM, 24-hour" value={formRecurTime()} onChange={formRecurTime.set} placeholder="HH:MM" maxLength={5} />
               <If when={formRecurrence() === "weekly"}>
                 <Picker testID="schedule-weekday" accessibilityLabel="Day of the week" items={weekdayItems} value={String(formWeekday())} onChange={(v) => v !== null && formWeekday.set(Number(v))} />
               </If>
@@ -305,13 +312,13 @@ function RecurringRows() {
       >
         <SettingRow
           label="Cron expression"
-          description="Minute, hour, day of month, month, weekday: 30 8 * * 1-5 is 08:30 on weekdays. Names like mon work. At most every 15 minutes."
+          description="Minute hour day month weekday: 30 8 * * 1-5 is 08:30 on weekdays. At most every 15 minutes."
           stacked
         >
           <Field testID="schedule-cron" accessibilityLabel="Cron expression" value={formCron()} onChange={formCron.set} placeholder="0 9 * * 1-5" maxLength={100} />
         </SettingRow>
       </If>
-      <SettingRow label="Time zone" description="The time above is read in it, across clock changes." stacked>
+      <SettingRow label="Time zone" stacked>
         <Column gap={2}>
           <SegmentedControl<ZoneChoice>
             testID="schedule-zone"
@@ -330,7 +337,7 @@ function RecurringRows() {
       <Column padX={4} padY={2}>
         <Label variant="caption" color={formCronPreview() ? "muted" : "danger"} testID="schedule-cron-preview">
           {formCronPreview()
-            ? `Sends cron “${formCronPreview()}” in ${zone() || "(no time zone)"}. The server works out each firing; on a clock change a skipped time fires at the gap's end, a repeated one once.`
+            ? `Sends cron “${formCronPreview()}” in ${zone() || "(no time zone)"}.`
             : "Enter the time as HH:MM, for example 09:00."}
         </Label>
       </Column>

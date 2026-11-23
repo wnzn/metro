@@ -4,7 +4,7 @@
 
 import { expect, test } from "nsh/test";
 import type { CatalogProvider } from "../settings";
-import { CAPABILITY_TONE, describePath, groupCatalog, vendorOf, wayLabel } from "./providerGroups";
+import { CAPABILITY_TONE, describePath, groupCatalog, matchesQuery, methodDetail, pickerGroups, vendorOf, wayLabel } from "./providerGroups";
 
 function entry(id: string, name: string, more: Partial<CatalogProvider> = {}): CatalogProvider {
   const device = id.startsWith("device-");
@@ -124,4 +124,42 @@ test("two ways of one provider never read the same: a chat API key and an embedd
 
 test("each capability has its own badge tone", () => {
   expect(new Set(Object.values(CAPABILITY_TONE)).size).toBe(3);
+});
+
+// ------------------------------------------------------------------ the add-connection picker
+
+const ALL = { query: "", capability: "all" as const, vendor: null };
+const ids = (groups: ReturnType<typeof pickerGroups>) => groups.flatMap((g) => g.paths.map((p) => p.id));
+
+test("the picker lists every way of every provider at once, chat first, on-device before server-stored", () => {
+  const groups = pickerGroups(CATALOG, ALL);
+  expect(groups.map((g) => g.key)).toEqual(groupCatalog(CATALOG).map((g) => g.key));
+  expect(groups.find((g) => g.key === "openai")!.paths.map((p) => p.id)).toEqual(["device-openai-oauth", "openai/anthropic", "openai", "openai-embeddings"]);
+  expect(groups.find((g) => g.key === "systemone")!.paths.map((p) => p.id)).toEqual(["device-systemone", "systemone"]);
+  // Exactly the catalog: nothing added, nothing lost.
+  expect(ids(groups).sort()).toEqual(CATALOG.map((p) => p.id).sort());
+});
+
+test("search matches the provider, the way and the capability; every word must match", () => {
+  expect(ids(pickerGroups(CATALOG, { ...ALL, query: "chatgpt" }))).toEqual(["device-openai-oauth"]);
+  expect(ids(pickerGroups(CATALOG, { ...ALL, query: "OpenAI sign in" }))).toEqual(["device-openai-oauth"]);
+  expect(ids(pickerGroups(CATALOG, { ...ALL, query: "anthropic api key" }))).toContain("anthropic");
+  expect(ids(pickerGroups(CATALOG, { ...ALL, query: "embeddings" })).sort()).toEqual(["custom-embeddings", "device-embeddinggemma-2", "embeddinggemma-2", "openai-embeddings"]);
+  expect(pickerGroups(CATALOG, { ...ALL, query: "no such provider" })).toEqual([]);
+  expect(matchesQuery("OpenAI", CATALOG.find((p) => p.id === "openai")!, "  ")).toBe(true);
+});
+
+test("the capability filter and a chosen provider narrow the list", () => {
+  expect(ids(pickerGroups(CATALOG, { ...ALL, capability: "system_one" }))).toEqual(["device-systemone", "systemone"]);
+  const openaiEmb = pickerGroups(CATALOG, { ...ALL, capability: "embeddings", vendor: "openai" });
+  expect(openaiEmb.map((g) => g.key)).toEqual(["openai"]);
+  expect(ids(openaiEmb)).toEqual(["openai-embeddings"]);
+  expect(pickerGroups(CATALOG, { ...ALL, capability: "system_one", vendor: "anthropic" })).toEqual([]);
+});
+
+test("each way's one line says where it runs and who pays; a ChatGPT sign-in can't be shared", () => {
+  const by = (id: string) => CATALOG.find((p) => p.id === id)!;
+  expect(methodDetail(by("device-openai-oauth"))).toBe("On your device · Your own ChatGPT plan; can't be shared or lent");
+  expect(methodDetail(by("openai"))).toBe("Key stored encrypted on the server · Billed to the key's account");
+  expect(methodDetail(by("device-openai-compatible"), { packaged: true })).toBe("On your device · Whoever runs the endpoint");
 });

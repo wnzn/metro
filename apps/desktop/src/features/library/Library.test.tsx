@@ -85,11 +85,22 @@ test("Library is its own page listing only what I can access; Search's file mode
   expect(text(app)).toContain("Personal");
   expect(text(app)).toContain("Acme");
   expect(lib(w, "/v1/library/assets")[0]!.url).toBe(`${BASE}/v1/library/assets?scope=all`);
-  // The media model is chosen in Settings, not here: only its status and a way there.
-  expect(app.shows("id:library-model-status")).toBe(true);
+  // No page intro, no media model form here; with no media model there's no Index line either.
   expect(app.shows("id:library-model-picker")).toBe(false);
-  expect(text(app)).toContain("No media model is chosen");
+  expect(app.shows("id:library-model-status")).toBe(false);
   expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
+
+  // A first Index with no media model leads straight to the choice in Settings › Model providers: nothing is sent.
+  await app.press(`id:library-actions:${s.mine.id}`);
+  await app.waitFor("text:Choose a media model to index");
+  await app.press(`id:library-index:${s.mine.id}`);
+  await app.waitFor("id:library-model");
+  await app.waitFor("id:library-model-asked");
+  expect(app.shows("id:library-model-picker")).toBe(true);
+  expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
+  expect(lib(w, "/v1/library/settings", "PUT").length).toBe(0);
+  await app.back(); // Escape closes Settings, back on the Library
+  await app.waitFor("id:library-view");
 
   await app.press("id:library-list-scope");
   await app.waitFor("text:Side project");
@@ -129,7 +140,6 @@ test("uploads come from the system picker as raw bytes, to the chosen Space, wit
   const app = await signIn(w);
   await openLibrary(app);
   await app.waitFor("id:library-files-empty");
-  await app.waitFor("text:/up to 1.0 KB each/");
   app.onPick((pick) => {
     expect(pick.kind).toBe("files");
     expect(pick.multiple).toBe(true);
@@ -142,11 +152,15 @@ test("uploads come from the system picker as raw bytes, to the chosen Space, wit
       { name: "tool.exe", type: "application/octet-stream", data: enc.encode("MZ") },
     ];
   });
-  await app.press("id:library-upload-target");
-  await app.press("text:Acme >> nth=1");
-  await app.waitFor("text:/Every current member of Acme will see these files/");
+  // Upload ▾ says where each destination puts the files, and who sees them; choosing one opens the picker.
   await app.press("id:library-choose");
+  await app.waitFor("text:/up to 1.0 KB each/");
+  expect(text(app)).toContain("Only you see these files.");
+  expect(text(app)).toContain("Adds to Acme's library · its members can see them.");
+  expect(app.picks().length).toBe(0);
+  await app.press("id:library-choose:space:acme");
   await app.waitFor("id:library-upload-outcomes");
+  expect(app.picks().length).toBe(1);
   await app.waitFor("text:/plan.md: Uploaded to Acme/");
   expect(text(app)).toContain("Nothing was sent to a model.");
   expect(text(app)).toContain("huge.pdf: Not uploaded: it's 4.0 KB; files are limited to 1.0 KB.");
@@ -176,13 +190,14 @@ test("the media model settings offer only media-capable connections and disclose
   await connect(app, "alice");
   await app.waitFor("id:library-model");
   await app.waitFor(`id:library-file:${s.mine.id}`);
-  // Index is in the row's More menu, and can't be chosen without a saved model.
+  // Index is in the row's More menu; without a saved model it leads to the choice and sends nothing.
   expect(app.shows(`id:library-index:${s.mine.id}`)).toBe(false);
   await app.press(`id:library-actions:${s.mine.id}`);
   await app.waitFor(`id:library-index:${s.mine.id}`);
-  expect(app.enabled(`id:library-index:${s.mine.id}`)).toBe(false);
-  await app.back();
-  await app.waitFor(`id:library-index:${s.mine.id}`, { state: "gone" });
+  expect(text(app)).toContain("Choose a media model to index");
+  await app.press(`id:library-index:${s.mine.id}`);
+  await app.waitFor("id:library-model-asked");
+  expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
   expect(text(app)).toContain("Nothing is chosen, so nothing can be indexed or searched.");
 
   await app.press("id:library-model-picker");
@@ -204,7 +219,8 @@ test("the media model settings offer only media-capable connections and disclose
   await app.waitFor("text:Saved: My EG2.");
   expect(lib(w, "/v1/library/settings", "PUT")[0]!.body).toBe(JSON.stringify({ embedding_id: own }));
   expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
-  await app.waitFor("text:/Index sends a file to My EG2, only when you press Index/");
+  await app.waitFor("text:/Index sends the whole file to My EG2; whoever runs it can see it/");
+  expect(app.shows("id:library-model-asked")).toBe(false);
 
   await app.press(`id:library-actions:${s.mine.id}`);
   await app.press(`id:library-index:${s.mine.id}`);

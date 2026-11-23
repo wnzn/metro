@@ -226,8 +226,10 @@ test("each capability has its own default; a System One connection never becomes
   await settings(app, "providers");
   await app.waitFor(`id:connection:${chat.id}`);
   expect(app.shows(`id:connection-default:${chat.id} >> text:Default chat`)).toBe(true);
-  await app.press("id:providers-learn-more:toggle");
-  await app.waitFor("text:Each connection serves one: chat, System One or embeddings. Each capability has its own default.");
+  // Each capability's default, on one line at the top of the page.
+  expect(app.shows(`id:provider-defaults:chat >> text:${chat.name}`)).toBe(true);
+  expect(app.shows("id:provider-defaults:system_one >> text:Alice System One")).toBe(true);
+  expect(app.shows("id:provider-defaults:embeddings >> text:Home embeddings")).toBe(true);
   const s1b = f.addConnection("alice", "device-systemone", "Laptop System One", "jev-latest");
   await app.press("id:settings-close");
   await settings(app, "providers");
@@ -247,9 +249,11 @@ test("the provider list filters by capability; an embeddings endpoint that can't
   const { f } = routingWorld();
   const app = await signIn(f, "alice");
   await settings(app, "providers");
+  // The capability filter lives in the Add connection picker.
+  await app.press("id:provider-picker");
   await app.waitFor("id:provider-capability");
   await app.press("id:provider-capability:embeddings");
-  await app.press("id:provider-picker");
+  await app.press("id:provider-picker"); // pressing Add connection again keeps the filter
   // Only providers with an embeddings way are offered; OpenAI keeps just that way.
   await app.waitFor("id:provider-picker:custom");
   expect(app.shows("id:provider-picker:openai")).toBe(true);
