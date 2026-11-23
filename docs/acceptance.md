@@ -24,6 +24,47 @@ crate with build targets (the desktop jobs fail on `cargo metadata` until
 `crates/tui` builds), the five macOS signing secrets, a `v*` tag ruleset
 (`github.ref_protected`), and a first native run of every gate on GitHub.
 
+## Source only: terminal client at 142bc85 (2026-11-23, project manager, local)
+
+`metro-tui` ([terminal.md](terminal.md)) is in the source at `142bc85`. It
+isn't in any packaged, tested or released download, and the 57409bb setup
+cut below doesn't contain it. Until a standalone build of it is verified,
+this entry records only what its committed test covers.
+
+**The committed test.** `crates/tui/tests/pty_qa.py` runs the real Linux
+`metro-tui` binary in a pseudo-terminal against a real, isolated
+`metro-server`, with two synthetic accounts and a scripted loopback model.
+It uses no real vendor or credentials. It checks, in order:
+
+- Opening makes no model call. Only the caller's Spaces are listed; another
+  account's Space never appears.
+- **F1** opens help. In personal Chat, **F3 Save note** posts with no model
+  call, and **Enter** on a question asks the agent with the default model.
+- A Chat draft survives moving to a room. In the room, `@bob` alone and a
+  plain **F3** post call no model, and **F2** asks with the default.
+- **F4** chooses another connection, and **F2** uses exactly it. After that
+  connection is deleted, sending is refused with a prompt to choose again:
+  the draft stays, nothing is posted, and no model is called. Choosing again
+  works.
+- A synthetic paired device advertises a model with thinking levels; **F4**
+  picks `high`, and the relayed job carries exactly that model and level.
+- A draft containing the sign-in token is refused. An escape sequence in a
+  message and the tokens never appear in the terminal output.
+- Resizing to 6×32 and back redraws, and Ctrl-C quits with the terminal
+  restored.
+- The hidden `Metro token:` prompt signs in; Ctrl-C at the prompt exits
+  cleanly.
+- A wrong token shows HTTP 401. A token file with mode 644 is refused
+  (`chmod 600`). A redirecting server shows HTTP 302 and isn't followed.
+  Proxy variables pointed at the model aren't used.
+
+The terminal client's lane reported this test passing at `142bc85`. No run
+receipt is stored with this record, and the docs lane didn't re-run it. The built binary's
+`--help` output was checked against the committed source.
+
+**Not covered:** a packaged or released `metro-tui`, native Windows or macOS
+terminals, a real vendor or account, and real network conditions.
+
 ## Staged: installers and setup at 57409bb (2026-11-23, project manager, local)
 
 A frozen local integration cut, **not a release**. Nothing was published or

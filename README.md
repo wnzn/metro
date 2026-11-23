@@ -268,6 +268,10 @@ library check (`--install-deps` is opt-in), are described in
 cut on Debian 13 and CachyOS; none is released or signed, and the Windows,
 macOS and container ones haven't been run in a recorded test.
 
+A terminal client, `metro-tui`, for Chat and Spaces over SSH or without a
+desktop, is in the source only; it's planned to ship inside the desktop
+downloads ([docs/terminal.md](docs/terminal.md)).
+
 - **Linux:** extract `Metro-<version>-linux-x64.tar.gz` and start its
   launcher. Needs glibc ≥ 2.39, GTK ≥ 4.14, WebKitGTK 6.0 and the GStreamer
   base plugins; the package names for Debian, Ubuntu, Arch and CachyOS are
