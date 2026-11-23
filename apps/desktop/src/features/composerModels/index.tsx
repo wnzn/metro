@@ -1,5 +1,5 @@
 import { cleanup, effect, signal, untracked } from "nsh";
-import { activeSpaceId, apiClient, composerScope, mainPlace, me, onSessionEnd, sessionGuard, settingsOpen } from "../../store";
+import { activeSpaceId, apiClient, composerScope, mainPlace, me, onSessionEnd, openSettings, sessionGuard, settingsOpen } from "../../store";
 import { Action, Column, Label, Modal, Picker } from "../../ui";
 import { ComposerModelTrigger } from "../../ui/composerModelTrigger";
 import { createComposerCatalog } from "./catalog";
@@ -67,14 +67,21 @@ export function ComposerModelControls() {
         <Column pad={3} gap={2}>
           <Label variant="strong">Model for agent turns</Label>
           <Label variant="caption">Default uses your normal routing.</Label>
-          <If when={current()?.phase !== "ready"}>
-            <Label>{current()?.phase === "failed" ? "Could not load available models. Reopen to retry." : "Loading available models…"}</Label>
-          </If>
-          <If when={current()?.phase === "ready"}>
-            <Picker testID="composer-model-options" accessibilityLabel="Model" searchable
+           <If when={current()?.phase !== "ready"}>
+             <Label>{current()?.phase === "failed" ? "Could not load available models." : "Loading available models…"}</Label>
+             <If when={current()?.phase === "failed"}>
+               <Action compact label="Try again" testID="composer-retry-catalog" onPress={refresh} />
+             </If>
+           </If>
+           <If when={current()?.phase === "ready"}>
+             <If when={current()?.targets.length === 0}>
+               <Label variant="caption">No chat models are ready here. Connect a provider or check its approved models.</Label>
+               <Action compact label="Model providers" testID="composer-open-providers" onPress={() => { close(); openSettings("providers"); }} />
+             </If>
+             <If when={!!current()?.targets.length || !!current()?.pin}><Picker testID="composer-model-options" accessibilityLabel="Model" searchable
               items={[{ value: "", label: "Default" }, ...(current()?.targets ?? []).map(t => ({ value: t.key, label: t.label, detail: t.detail }))]}
               placeholder="Choose a model" value={selected()?.key ?? (current()?.pin ? null : "")}
-              onChange={k => { if (k !== null) pick(k || null); }} />
+               onChange={k => { if (k !== null) pick(k || null); }} /></If>
             <If when={selected()?.detail}>{d => <Label variant="caption">{d()}</Label>}</If>
             <If when={selected()?.fetchFrom}>{name =>
               <Action compact variant="ghost" testID="composer-fetch-models" label={`Fetch models from ${name()}`}

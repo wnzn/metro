@@ -124,6 +124,17 @@ test("a file-only personal draft with a pinned chat connection still saves with 
   });
 });
 
+test("an empty composer catalog offers the provider setup without contacting a model", async () => {
+  const f = world();
+  const app = await chat(f);
+  await app.press("id:composer-model");
+  await app.waitFor("id:composer-open-providers");
+  expect(app.shows("id:composer-model-options")).toBe(false);
+  await app.press("id:composer-open-providers");
+  await app.waitFor("id:provider-picker");
+  expect(f.posts().filter(p => p.path.endsWith("/models") || p.path.endsWith("/messages"))).toHaveLength(0);
+});
+
 test("catalog completion cannot promote an in-progress personal note into an Ask", async () => {
   const { f, posts } = setup();
   f.state.delays.set("/v1/models/available", 600);
