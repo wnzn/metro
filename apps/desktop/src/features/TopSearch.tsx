@@ -14,10 +14,11 @@
 // - Focus alone changes nothing (no change of context on focus), so Tab can
 //   pass through it.
 
+import { computed } from "nsh";
 import { mainPlace } from "../store";
-import { SearchBox, SearchFileRow, SearchMoreRow, SearchResultGlyph, SearchResultRow, SearchResultStatus } from "../ui";
+import { SearchBox, SearchFileRow, SearchGroupHeader, SearchMoreRow, SearchResultGlyph, SearchResultRow, SearchResultStatus } from "../ui";
 import { MAX_QUERY_CHARS, searchQuery, spaceName } from "./discovery/searchState";
-import { QuickAssetPreview } from "./library/QuickAssetPreview";
+import { previewLabel, QuickPreviewDetail, QuickPreviewTile, useQuickPreview } from "./library/QuickAssetPreview";
 import { libQuery, searchSurface } from "./library/libraryState";
 import type { LibraryAsset } from "./library/libraryState";
 import {
@@ -44,13 +45,30 @@ export function extensionOf(name: string): string {
   return dot > 0 && dot < name.length - 1 ? name.slice(dot).toLowerCase() : "";
 }
 
-const fileSource = (a: LibraryAsset) => (a.spaceId === null ? "Your personal library" : spaceName(a.spaceId));
-const messageSource = (m: QuickMessage) => (m.spaceId === null ? "Your personal Chat" : spaceName(m.spaceId));
-
-export function assetMeta(a: LibraryAsset): string {
-  const ext = extensionOf(a.name);
-  return ext ? `${ext} · ${fileSource(a)}` : fileSource(a);
+/** The name without its extension, for the row's title (the extension is its badge). */
+export function baseNameOf(name: string): string {
+  const ext = extensionOf(name);
+  return ext ? name.slice(0, name.length - ext.length) : name;
 }
+
+/** Where a file is, in full (screen readers), and short (the row, only when needed). */
+const fileSource = (a: LibraryAsset) => (a.spaceId === null ? "Your personal library" : spaceName(a.spaceId));
+const shortFileSource = (a: LibraryAsset) => (a.spaceId === null ? "Personal" : spaceName(a.spaceId));
+const messageSource = (m: QuickMessage) => (m.spaceId === null ? "Chat" : spaceName(m.spaceId));
+const messageSourceFull = (m: QuickMessage) => (m.spaceId === null ? "your personal Chat" : spaceName(m.spaceId));
+
+/** Names shown by more than one file row now: those rows say where each file is. */
+const sharedNames = computed(() => {
+  const seen = new Map<string, number>();
+  for (const r of quickRows()) if (r.kind === "asset") seen.set(r.asset.name, (seen.get(r.asset.name) ?? 0) + 1);
+  return new Set([...seen].filter(([, n]) => n > 1).map(([name]) => name));
+});
+
+/** Files and messages both found: each group gets a heading. */
+const mixed = computed(() => {
+  const rows = quickRows();
+  return rows.some((r) => r.kind === "asset") && rows.some((r) => r.kind === "message");
+});
 
 /** Where the lookup looks, said in the list. */
 function scopeText(): string {
@@ -133,28 +151,53 @@ function Row(props: { row: QuickRow; index: number; id: string }) {
   const open = () => quickActivate(props.row);
   const row = props.row;
   if (row.kind === "more") return <SearchMoreRow testID={props.id} label="More results" accessibilityLabel="More results in full Search" selected={selected()} onPress={open} />;
-  if (row.kind === "asset") {
-    return (
-      <SearchFileRow
-        testID={props.id}
-        preview={<QuickAssetPreview asset={row.asset} />}
-        label={row.asset.name}
-        meta={assetMeta(row.asset)}
-        selected={selected()}
-        onPress={open}
-      />
-    );
-  }
-  const m = row.message;
+  // A heading before the first of each kind, only when both kinds are listed. Not a row: Up and Down skip it.
+  const first = () => {
+    const rows = quickRows();
+    const at = props.index;
+    return at === 0 || rows[at - 1]?.kind !== row.kind;
+  };
+  const header = () => (mixed() && first() ? (row.kind === "asset" ? "Files" : "Messages") : null);
+  return (
+    <>
+      <If when={header()}>{(h) => <SearchGroupHeader testID={`quick-group:${row.kind === "asset" ? "files" : "messages"}`} label={h()} />}</If>
+      {row.kind === "asset" ? <FileResult asset={row.asset} id={props.id} selected={selected()} onPress={open} /> : <MessageResult message={row.message} id={props.id} selected={selected()} onPress={open} />}
+    </>
+  );
+}
+
+/** One file: its tile and detail from one preview, its name, its extension badge, its source when two share a name. */
+function FileResult(props: { asset: LibraryAsset; id: string; selected: boolean; onPress: () => void }) {
+  const preview = useQuickPreview(() => props.asset);
+  const a = props.asset;
+  const label = () => `${a.name}, ${fileSource(a)}. ${previewLabel(a.name, preview())}`;
+  return (
+    <SearchFileRow
+      testID={props.id}
+      accessibilityLabel={label()}
+      tile={<QuickPreviewTile asset={a} preview={preview} />}
+      title={baseNameOf(a.name)}
+      detail={<QuickPreviewDetail asset={a} preview={preview} />}
+      badge={extensionOf(a.name)}
+      source={sharedNames().has(a.name) ? shortFileSource(a) : undefined}
+      selected={props.selected}
+      onPress={props.onPress}
+    />
+  );
+}
+
+/** One message: a glyph of its place, one line of its text, then who and where. */
+function MessageResult(props: { message: QuickMessage; id: string; selected: boolean; onPress: () => void }) {
+  const m = props.message;
   return (
     <SearchResultRow
       testID={props.id}
+      accessibilityLabel={`${m.text}. By ${m.actor} in ${messageSourceFull(m)}`}
       preview={<SearchResultGlyph icon={m.spaceId === null ? "chat" : "hash"} />}
       label={m.text}
-      lines={2}
       meta={`${m.actor} · ${messageSource(m)}`}
-      selected={selected()}
-      onPress={open}
+      selected={props.selected}
+      onPress={props.onPress}
     />
   );
 }

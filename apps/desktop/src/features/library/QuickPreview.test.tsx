@@ -95,15 +95,18 @@ test("each file shows what it holds, or says why not; reads are authenticated, r
   for (let i = 20; i < 40; i++) expect(bar(s.half.id, i)).toBe(flat);
   for (let i = 0; i < 40; i++) expect(bar(s.quiet.id, i)).toBe(flat);
   expect(text).toContain("0:00 · silent");
-  // Honest fallbacks, never a made-up preview.
-  expect(text).toContain("PDF: no preview here. Open it to read.");
+  // Honest fallbacks, never a made-up preview: the type's glyph, with the reason in its accessible name (no paragraph in the list).
+  const reason = (id: string, why: string) => app.shows(`id:quick-preview-none:${id}`) && app.shows(`label:No preview of ${nameOf(id)}. ${why}`);
+  const nameOf = (id: string) => Object.values(s).find((a) => a.id === id)!.name;
+  expect(reason(s.pdf.id, "PDF: no preview here. Open it to read.")).toBe(true);
+  expect(text).not.toContain("PDF: no preview here. Open it to read.");
   // MP3: its own tags (metadata, not a picture of its sound), or an honest line without them.
   await app.waitFor(`id:quick-preview-tags:${s.song.id}`);
   expect(app.texts()).toContain("“Harbor Song” · Ana Reyes · Dockside");
   await app.waitFor(`id:quick-preview-none:${s.untagged.id}`);
-  expect(app.texts().join(" | ")).toContain("MP3 audio without a title or artist tag. Open it to play.");
-  expect(text).toContain("Word file: no readable text found.");
-  expect(text).toContain("PNG image of 5.0 MB: too large for a quick preview.");
+  expect(reason(s.untagged.id, "MP3 audio without a title or artist tag. Open it to play.")).toBe(true);
+  expect(reason(s.word.id, "Word file: no readable text found.")).toBe(true);
+  expect(reason(s.huge.id, "PNG image of 5.0 MB: too large for a quick preview.")).toBe(true);
 
   // What was read: one authenticated read per previewable file; text and WAV a prefix only.
   for (const id of [s.pdf.id, s.huge.id]) expect(reads(w, id)).toHaveLength(0);
@@ -180,7 +183,7 @@ test("losing a Space drops its previews at once; sign-out drops everything and a
   w.f.state.spaces.get("acme")!.members.delete("alice");
   await app.waitFor(`id:quick-preview-none:${s.acme.id}`, { timeout: 15_000 });
   expect(app.shows(`id:quick-preview-image:${s.acme.id}`)).toBe(false);
-  expect(app.texts().join(" | ")).toContain("You're no longer a member of this file's Space.");
+  expect(app.shows(`label:/^No preview of roadmap\\.png\\. You're no longer a member of this file's Space\\./`)).toBe(true); // said to screen readers, not drawn
   expect(app.shows(`id:quick-preview-image:${s.photo.id}`)).toBe(true); // personal files stay
 
   // Hide, then park reads, show again and sign out while they're parked.
@@ -209,6 +212,8 @@ test("past the row budget a preview says so instead of reading", async () => {
   const { app } = await signIn(w);
   await app.waitUntil(() => ids.filter((id) => app.shows(`id:quick-preview-text:${id}`)).length === 12);
   await app.wait(200);
-  expect(app.texts().filter((t) => t === "Preview skipped: too many files at once.")).toHaveLength(2);
+  // The two past the budget show their type's glyph, with the reason in its accessible name.
+  expect(ids.filter((id) => app.shows(`id:quick-preview-none:${id}`))).toHaveLength(2);
+  expect(app.count("label:/Preview skipped: too many files at once\\./")).toBe(2);
   expect(reads(w).length).toBe(12);
 });

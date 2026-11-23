@@ -632,7 +632,7 @@ export function SearchBox(
               accessibilityLabel={popup().accessibilityLabel}
             >
               <Scroll style={{ maxHeight: Math.max(140, Math.min(440, room() - 16)) }}>
-                <View class="flex-col gap-[2px]">{popup().children}</View>
+                <View class="flex-col">{popup().children}</View>
               </Scroll>
             </View>
           </Overlay>
@@ -642,17 +642,40 @@ export function SearchBox(
   );
 }
 
+// Quick results are compact rows, one line of identity each, divided by a
+// hairline: a leading column 72 wide (a file's tile, a message's glyph), the
+// name in the middle as the strongest text with at most one quiet line under
+// it, and on the right a file's source (only when it tells two apart) and its
+// extension as a small badge. The highlighted row (Up and Down) has the
+// accent surface and a primary bar at its leading edge in both themes. Rows
+// never take the keyboard focus: the field keeps it.
+
+const resultRow = cx("flex-row items-center gap-(--space-3) min-h-[56px] border-b border-border pr-(--space-2) py-[6px] hover:bg-muted", transitionClass);
+
+/** The leading edge of a row: a primary bar while it is highlighted, nothing otherwise. */
+function SelectionBar(props: { selected: boolean }) {
+  return <View class={cx("w-[3px] self-stretch rounded-full", props.selected ? "bg-primary" : "bg-transparent")} accessibilityElementsHidden />;
+}
+
+function RowTitle(props: { text: string; selected: boolean; weight: "semibold" | "normal" }) {
+  return (
+    <Text
+      class={cx(textClass.sm, props.weight === "semibold" ? "font-semibold" : "font-normal", props.selected ? "text-accent-foreground" : "text-popover-foreground")}
+      style={{ numberOfLines: 1 }}
+    >
+      {props.text}
+    </Text>
+  );
+}
+
 /**
- * A quick result for a message: a small glyph of its place beside up to two
- * lines of its text, then a quiet line (who, where). Never takes the keyboard
- * focus: the field keeps it.
+ * A quick result for a message: its place's glyph in the leading column, one
+ * line of its text, then who and where, quieter.
  */
 export function SearchResultRow(
   props: Testable & {
     preview: JSX.Element;
     label: string;
-    /** Up to two lines (a message's text); one otherwise. */
-    lines?: 1 | 2;
     meta: string;
     selected: boolean;
     onPress: () => void;
@@ -662,7 +685,7 @@ export function SearchResultRow(
   return (
     <View
       ref={row}
-      class={cx("flex-row items-start gap-(--space-3) rounded-(--radius-sm) px-(--space-2) py-[6px] hover:bg-muted", transitionClass, props.selected && "bg-accent")}
+      class={cx(resultRow, props.selected && "bg-accent")}
       focusable={false}
       role="option"
       accessibilityState={{ selected: props.selected }}
@@ -670,23 +693,34 @@ export function SearchResultRow(
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? `${props.label}, ${props.meta}`}
     >
-      <View class="size-[28px] shrink-0 items-center justify-center rounded-(--radius-sm) bg-muted">{props.preview}</View>
-      <ResultText label={props.label} lines={props.lines ?? 1} meta={props.meta} selected={props.selected} />
+      <SelectionBar selected={props.selected} />
+      <View class="w-[72px] shrink-0 items-center justify-center" accessibilityElementsHidden>
+        {props.preview}
+      </View>
+      <View class="flex-1 min-w-0 flex-col gap-px">
+        <RowTitle text={props.label} selected={props.selected} weight="normal" />
+        <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+          {props.meta}
+        </Text>
+      </View>
     </View>
   );
 }
 
 /**
- * A quick result for a file: its preview on top, at its own size and never
- * clipped (an image or frame, a waveform with its length, a few lines of
- * text), left-aligned and as wide as the row allows; then the file's name and
- * a quiet line (its extension, where it is).
+ * A quick result for a file: its tile, its name (without the extension) as
+ * the strongest text with an optional quiet line under it (the start of its
+ * text, its tags, a length), then on the right its source when it is needed
+ * to tell two files apart, and its extension as a badge.
  */
 export function SearchFileRow(
   props: Testable & {
-    preview: JSX.Element;
-    label: string;
-    meta: string;
+    tile: JSX.Element;
+    title: string;
+    detail?: JSX.Element;
+    /** The extension with its dot (".jpg"), or empty. */
+    badge?: string;
+    source?: string;
     selected: boolean;
     onPress: () => void;
   },
@@ -695,29 +729,39 @@ export function SearchFileRow(
   return (
     <View
       ref={row}
-      class={cx("flex-col items-stretch gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-[8px] hover:bg-muted", transitionClass, props.selected && "bg-accent")}
+      class={cx(resultRow, props.selected && "bg-accent")}
       focusable={false}
       role="option"
       accessibilityState={{ selected: props.selected }}
       onPress={props.onPress}
       testID={props.testID}
-      accessibilityLabel={props.accessibilityLabel ?? `${props.label}, ${props.meta}`}
+      accessibilityLabel={props.accessibilityLabel ?? props.title}
     >
-      <View class="flex-row items-start justify-start min-w-0 max-w-full">{props.preview}</View>
-      <ResultText label={props.label} lines={1} meta={props.meta} selected={props.selected} />
+      <SelectionBar selected={props.selected} />
+      {props.tile}
+      <View class="flex-1 min-w-0 flex-col gap-px">
+        <RowTitle text={props.title} selected={props.selected} weight="semibold" />
+        {props.detail}
+      </View>
+      <If when={props.source}>
+        <Text class={cx("max-w-[112px]", textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+          {props.source}
+        </Text>
+      </If>
+      <If when={props.badge}>
+        <View class="shrink-0 rounded-[5px] border border-border bg-muted px-[6px] py-px">
+          <Text class={cx(textClass.xs, "font-medium font-mono text-muted-foreground")}>{props.badge}</Text>
+        </View>
+      </If>
     </View>
   );
 }
 
-function ResultText(props: { label: string; lines: 1 | 2; meta: string; selected: boolean }) {
+/** A heading over a group of results (Files, Messages): not a row, never highlighted. */
+export function SearchGroupHeader(props: Testable & { label: string }) {
   return (
-    <View class="flex-1 min-w-0 flex-col">
-      <Text class={cx(textClass.sm, "font-medium", props.selected ? "text-accent-foreground" : "text-popover-foreground")} style={{ numberOfLines: props.lines }}>
-        {props.label}
-      </Text>
-      <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
-        {props.meta}
-      </Text>
+    <View class="px-(--space-2) pt-(--space-2) pb-[4px] border-b border-border" testID={props.testID} role="header">
+      <Text class={cx(textClass.xs, "font-semibold text-muted-foreground")}>{props.label}</Text>
     </View>
   );
 }
@@ -741,25 +785,29 @@ function revealWhenSelected(selected: () => boolean): (node: ViewRef) => void {
 
 /** A message's or a place's glyph, as a quick result's preview. */
 export function SearchResultGlyph(props: { icon: IconName }) {
-  return <Icon name={props.icon} color="muted" size={16} />;
+  return (
+    <View class="size-[28px] items-center justify-center rounded-(--radius-sm) bg-muted">
+      <Icon name={props.icon} color="muted" size={16} />
+    </View>
+  );
 }
 
 /** A line in place of results: searching, nothing found, a failure, not available. */
 export function SearchResultStatus(props: Testable & { text: string; tone?: "muted" | "danger" }) {
   return (
-    <View class="px-(--space-2) py-(--space-2)" testID={props.testID} role={props.tone === "danger" ? "alert" : undefined}>
+    <View class="px-(--space-2) py-(--space-3) border-b border-border" testID={props.testID} role={props.tone === "danger" ? "alert" : undefined}>
       <Text class={cx(textClass.sm, props.tone === "danger" ? "text-tone-danger-foreground" : "text-muted-foreground")}>{props.text}</Text>
     </View>
   );
 }
 
-/** The last row: more results in full Search. */
+/** The list's footer, always last: more results in full Search. */
 export function SearchMoreRow(props: Testable & { label: string; selected: boolean; onPress: () => void }) {
   const row = revealWhenSelected(() => props.selected);
   return (
     <View
       ref={row}
-      class={cx("flex-row items-center gap-(--space-2) mt-[2px] border-t border-border rounded-(--radius-sm) px-(--space-2) py-[8px] hover:bg-muted", transitionClass, props.selected && "bg-accent")}
+      class={cx("flex-row items-center gap-(--space-2) mt-[4px] rounded-(--radius-sm) pr-(--space-2) py-[8px] hover:bg-accent", transitionClass, props.selected ? "bg-accent" : "bg-muted")}
       focusable={false}
       role="option"
       accessibilityState={{ selected: props.selected }}
@@ -767,8 +815,9 @@ export function SearchMoreRow(props: Testable & { label: string; selected: boole
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.label}
     >
+      <SelectionBar selected={props.selected} />
       <Icon name="search" color="muted" />
-      <Text class={cx("flex-1", textClass.sm, "font-medium text-popover-foreground")}>{props.label}</Text>
+      <Text class={cx("flex-1", textClass.sm, "font-medium", props.selected ? "text-accent-foreground" : "text-popover-foreground")}>{props.label}</Text>
       <Icon name="chevron-right" color="muted" size={14} />
     </View>
   );

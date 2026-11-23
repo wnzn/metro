@@ -115,8 +115,11 @@ test("typing shows loading, then results with the file's own name and extension 
   await app.waitFor("id:quick-loading");
   expect(app.shows("id:quick-more")).toBe(true);
   await app.waitFor(`id:quick-asset:${photo.id}`);
-  expect(app.shows(`id:quick-asset:${photo.id} >> text:Roadmap Q3.jpg`)).toBe(true);
-  expect(app.shows(`id:quick-asset:${photo.id} >> text:.jpg · Your personal library`)).toBe(true);
+  // The name as the title, its own extension as a badge; the full name and where it is for screen readers.
+  expect(app.shows(`id:quick-asset:${photo.id} >> text:Roadmap Q3`)).toBe(true);
+  expect(app.shows(`id:quick-asset:${photo.id} >> text:.jpg`)).toBe(true);
+  expect(app.shows(`label:/^Roadmap Q3\\.jpg, Your personal library\\./`)).toBe(true);
+  expect(text(app)).not.toContain("Your personal library"); // one file of that name: no source drawn
   expect(app.shows(`id:quick-message:acme:lobby:${ev.id} >> text:the roadmap review moved to Thursday`)).toBe(true);
   expect(app.shows(`id:quick-message:acme:lobby:${ev.id} >> text:bob · Acme`)).toBe(true);
   // Global on the Chat page (typing may have asked for partial queries on the way); no semantic search, no indexing, no model.
@@ -180,7 +183,8 @@ test("a global lookup that found only files opens More in Documents & media, wit
   const app = await signIn(w);
   await app.type("id:top-search", "budget");
   await app.waitFor(`id:quick-asset:${doc.id}`);
-  expect(app.shows(`id:quick-asset:${doc.id} >> text:.md · Your personal library`)).toBe(true);
+  expect(app.shows(`id:quick-asset:${doc.id} >> text:budget notes`)).toBe(true);
+  expect(app.shows(`id:quick-asset:${doc.id} >> text:.md`)).toBe(true);
   await app.press("id:quick-more");
   await app.waitFor("id:search-view");
   await app.waitUntil(() => w.l.log.some((l) => l.path === "/v1/library/search"));
@@ -458,4 +462,41 @@ test("More from the general bar searches everything in its corpus, keeping the q
   await app.waitUntil(() => semantic(w).length === 1);
   expect(semantic(w)[0]!.body).toEqual({ query: "roadmap", scope: "all", limit: 20 });
   expect(app.value("id:top-search")).toBe("roadmap");
+});
+
+test("files and messages are grouped under headings Up and Down skip; two files of one name say where each is", async () => {
+  const w = quickWorld();
+  const mine = w.addAsset("alice", null, "plan.md", "# mine");
+  const team = w.addAsset("bob", "acme", "plan.md", "# team");
+  const ev = w.f.post("acme/lobby", { kind: "message", actor: "bob", text: "the plan is in the library" });
+  w.q.answers.set("plan", () => ({
+    assets: [w.wireAsset(mine), w.wireAsset(team)],
+    messages: [{ space_id: "acme", room_id: "lobby", event_id: ev.id, actor: "bob", text: "the plan is in the library" }],
+  }));
+  const app = await signIn(w);
+  await app.type("id:top-search", "plan");
+  await lookedUp(app, w, { query: "plan", scope: "all", mode: "all" });
+  await app.waitFor(`id:quick-asset:${team.id}`);
+  expect(app.shows("id:quick-group:files")).toBe(true);
+  expect(app.shows("id:quick-group:messages")).toBe(true);
+  expect(app.shows(`id:quick-asset:${mine.id} >> text:Personal`)).toBe(true);
+  expect(app.shows(`id:quick-asset:${team.id} >> text:Acme`)).toBe(true);
+  expect(app.shows(`label:/^plan\\.md, Acme\\./`)).toBe(true);
+  // Down goes to the first file, not a heading; three more reach More.
+  await app.keyboard.press("down");
+  await app.keyboard.press("down");
+  await app.keyboard.press("down");
+  await app.keyboard.press("enter"); // the message
+  await app.waitFor("text:# lobby");
+});
+
+test("only files: no headings, and the source is left out", async () => {
+  const w = quickWorld();
+  const doc = w.addAsset("alice", null, "budget notes.md", "# budget");
+  w.q.answers.set("budget", () => ({ assets: [w.wireAsset(doc)], messages: [] }));
+  const app = await signIn(w);
+  await app.type("id:top-search", "budget");
+  await app.waitFor(`id:quick-asset:${doc.id}`);
+  expect(app.shows("id:quick-group:files")).toBe(false);
+  expect(app.shows(`id:quick-asset:${doc.id} >> text:Personal`)).toBe(false);
 });
