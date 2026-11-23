@@ -111,9 +111,11 @@ function Invoke-StandardUserPhase([pscredential] $Credential, [string] $Root, [s
 # Ephemeral standard local account (Users only), its profile and a test root
 # readable by it; removed again in all cases. Only on a GitHub-hosted runner.
 function Invoke-StandardUserMsiFixture([string] $Package, $Spec, [string] $Expectation, $PolicyStore) {
-    $name = 'metromsi' + [Guid]::NewGuid().ToString('N').Substring(0, 8)
+    # 8 characters, valid as an 8.3 name, so the profile and its TEMP have no ~1 alias.
+    $name = 'm' + [Guid]::NewGuid().ToString('N').Substring(0, 7)
     $root = Join-Path $env:SystemDrive ('MetroMsiStdUser-' + [Guid]::NewGuid().ToString('N').Substring(0, 8))
-    $sid = $null
+    $sid = $null            # set only once New-LocalUser has created the account
+    $createdRoot = $false   # set only once this run created the test root
     $failure = $null
     $password = $null
     try {
@@ -130,7 +132,8 @@ function Invoke-StandardUserMsiFixture([string] $Package, $Spec, [string] $Expec
         Pass "ephemeral standard account created (SID $sid; Users only)"
         # Test root: SYSTEM and Administrators full control, the test account read
         # (and modify only on out\); no inherited access.
-        New-Item -ItemType Directory -Path $root | Out-Null
+        New-Item -ItemType Directory -Path $root | Out-Null   # fails if it already exists
+        $createdRoot = $true
         New-Item -ItemType Directory -Path (Join-Path $root 'out') | Out-Null
         foreach ($f in 'standard-user-msi.ps1', 'MsiAutomation.ps1', 'MsiHarness.ps1') { Copy-Item -LiteralPath (Join-Path $PSScriptRoot $f) -Destination $root }
         Copy-Item -LiteralPath $Package -Destination (Join-Path $root ([string] $Spec.package))
@@ -168,7 +171,7 @@ function Invoke-StandardUserMsiFixture([string] $Package, $Spec, [string] $Expec
             Pass "installer policy restored: DisableMsi $(Format-RegistryValueState (Get-RegistryValueState $PolicyStore $script:MsiPolicyKey $script:MsiPolicyValue))"
         }
     } catch { $failure = $_ } finally {
-        if (Test-Path -LiteralPath (Join-Path $root 'out')) {
+        if ($createdRoot -and (Test-Path -LiteralPath (Join-Path $root 'out'))) {
             Copy-Item -Path (Join-Path $root 'out\*') -Destination $LogDir -Force -ErrorAction SilentlyContinue
         }
         if ($password) { $password.Dispose() }
@@ -185,10 +188,15 @@ function Invoke-StandardUserMsiFixture([string] $Package, $Spec, [string] $Expec
             } while ((Get-Date) -lt $deadline)
             if (Get-CimInstance -ClassName Win32_UserProfile -Filter "SID = '$sid'") { $cleanup.Add('the test profile could not be removed') }
         }
-        if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) { Remove-LocalUser -Name $name }
-        if (Get-LocalUser -Name $name -ErrorAction SilentlyContinue) { $cleanup.Add('the test account could not be removed') }
-        if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
-        if (Test-Path -LiteralPath $root) { $cleanup.Add('the test root could not be removed') }
+        # Only what this run created: the account by its SID, the root if we made it.
+        if ($sid) {
+            if (Get-LocalUser -SID $sid -ErrorAction SilentlyContinue) { Remove-LocalUser -SID $sid }
+            if (Get-LocalUser -SID $sid -ErrorAction SilentlyContinue) { $cleanup.Add('the test account could not be removed') }
+        }
+        if ($createdRoot) {
+            if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue }
+            if (Test-Path -LiteralPath $root) { $cleanup.Add('the test root could not be removed') }
+        }
         if ($cleanup.Count -gt 0) {
             if ($failure) { Write-Host "standard-user cleanup also failed: $($cleanup -join '; ')" }
             else { throw "FAIL  standard-user cleanup: $($cleanup -join '; ')" }

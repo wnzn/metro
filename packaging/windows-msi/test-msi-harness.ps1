@@ -416,5 +416,47 @@ $firstUse = ($childLines | Select-String -Pattern 'Invoke-Msiexec "|New-Object -
 Check ($initLine -gt 0 -and $initLine -lt $firstUse) "child initializes its own environment (line $initLine) before Windows Installer or msiexec (line $firstUse)"
 Check ($childText -notmatch 'GetFolderPath|\$env:(LOCALAPPDATA|USERPROFILE|APPDATA|TEMP)') 'child takes no path from the inherited environment or GetFolderPath'
 
+# ---- 10. Fixture cleanup touches only what it created ------------------------------
+# The real Invoke-StandardUserMsiFixture, with the account and file cmdlets stubbed.
+$hAst = [Management.Automation.Language.Parser]::ParseFile($Harness, [ref] $null, [ref] $null)
+$fixtureFn = $hAst.Find({ param($n) $n -is [Management.Automation.Language.FunctionDefinitionAst] -and $n.Name -eq 'Invoke-StandardUserMsiFixture' }, $true)
+$nameLine = @($fixtureFn.Extent.Text -split "`n" | Where-Object { $_ -match '^\s*\$name = ' })[0]
+$generated = & ([scriptblock]::Create(($nameLine.Trim()) + '; $name'))
+Check ($generated -cmatch '^m[0-9a-f]{7}$') "account name is 8 characters and 8.3-safe ($generated)"
+function Invoke-FixtureScenario([string] $Scenario) {
+    $script:calls = [Collections.Generic.List[string]]::new()
+    $script:scenario = $Scenario
+    $sb = [scriptblock]::Create(@'
+function New-LocalUser { param($Name, $Password, [switch] $AccountNeverExpires, [switch] $PasswordNeverExpires, [switch] $UserMayNotChangePassword, $Description)
+    $script:calls.Add('attempt New-LocalUser')
+    if ($script:scenario -eq 'user exists') { throw "The user account $Name already exists." }
+    $script:calls.Add('New-LocalUser'); [pscustomobject] @{ SID = [pscustomobject] @{ Value = 'S-1-5-21-9-9-9-1001' } } }
+function Join-Path { param($Path, $ChildPath) "$Path\$ChildPath" }
+function Get-LocalGroupMember { param($SID) @() }
+function Add-LocalGroupMember { param($SID, $Member) $script:calls.Add("Add-LocalGroupMember $SID $Member") }
+function New-Item { param($ItemType, $Path, [switch] $Force) if ($script:scenario -eq 'root exists') { throw "An item with the specified name $Path already exists." }; $script:calls.Add("New-Item $Path") }
+function Get-LocalUser { param($Name, $SID, $ErrorAction) if ($SID -and -not $script:calls.Contains("Remove-LocalUser -SID $SID")) { [pscustomobject] @{ SID = $SID } } }
+function Remove-LocalUser { param($Name, $SID) $script:calls.Add($(if ($SID) { "Remove-LocalUser -SID $SID" } else { "Remove-LocalUser -Name $Name" })) }
+function Remove-Item { param($LiteralPath, [switch] $Recurse, [switch] $Force, $ErrorAction) $script:calls.Add("Remove-Item $LiteralPath") }
+function Test-Path { param($LiteralPath) $true }
+function Copy-Item { param($Path, $LiteralPath, $Destination, [switch] $Force, $ErrorAction) $script:calls.Add("Copy-Item $Path$LiteralPath") }
+function Get-Process { param([switch] $IncludeUserName, $ErrorAction) }
+function Get-CimInstance { param($ClassName, $Filter) }
+function Pass { param($What) }
+function Check { param([bool] $Cond, $What) if (-not $Cond) { throw "FAIL  $What" } }
+'@ + $fixtureFn.Extent.Text + @'
+
+$LogDir = 'C:\logs'
+try { Invoke-StandardUserMsiFixture 'C:\fx\a.msi' @{ package = 'a.msi' } 'refused' $null } catch { $script:calls.Add("threw: $($_.Exception.Message)") }
+'@)
+    . $sb
+    return , $script:calls.ToArray()
+}
+$c = Invoke-FixtureScenario 'user exists'
+Check ($c -contains 'attempt New-LocalUser' -and ($c -match '^threw: The user account m[0-9a-f]{7} already exists') -and -not ($c -match 'Remove-LocalUser|Remove-Item|Copy-Item|New-Item')) "name collision with an existing account: nothing removed, created or copied ($($c -join '; '))"
+$c = Invoke-FixtureScenario 'root exists'
+Check (($c -match '^threw: An item with the specified name .*MetroMsiStdUser-.* already exists') -and ($c -contains 'Remove-LocalUser -SID S-1-5-21-9-9-9-1001') -and -not ($c -match 'Remove-LocalUser -Name|Remove-Item|Copy-Item')) "existing test root: only the account this run created is removed, by SID ($($c -join '; '))"
+Check (-not ($fixtureFn.Extent.Text -match 'Remove-LocalUser -Name|Get-LocalUser -Name')) 'the fixture never looks up or removes an account by name'
+
 "fails=$script:fails"
 exit $script:fails
