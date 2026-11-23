@@ -32,6 +32,7 @@ from smoke import (  # noqa: E402
 )
 
 F1, F2, F3, F4, F5 = b"\x1bOP", b"\x1bOQ", b"\x1bOR", b"\x1bOS", b"\x1b[15~"
+F7 = b"\x1b[18~"
 UP, DOWN, ENTER = b"\x1b[A", b"\x1b[B", b"\r"
 ENTER_SCREEN, EXIT_SCREEN = b"\x1b[?1049h", b"\x1b[?1049l"
 CLEAR = b"\x1b[2J"
@@ -276,6 +277,7 @@ def main(server, tui):
         require(not endpoint.calls, "entering TUI started model work")
         ui.send(F1)
         ui.wait("KEYBOARD HELP")
+        ui.wait("F7          Hide / show sidebar")
         ui.send(F1)
         ui.wait("Enter Send")
         ui.paste("Save this note")
@@ -302,6 +304,38 @@ def main(server, tui):
         ui.wait("QA Space / lobby", absent="Unsent chat draft")
         ui.wait("No messages yet.")
         ui.paste("@bob human-only")
+        ui.wait("@bob human-only")
+        ui.wait("F7 Hide sidebar")
+        ui.send(b"\t" + UP)
+        ui.wait("CONVERSATIONS  <")
+        ui.wait("> − QA Space")
+        ui.send(F7)
+        ui.wait("F7 Show sidebar", absent="CONVERSATIONS")
+        ui.wait(b"\x1b[3;1HQA Space / lobby")  # the conversation uses the reclaimed width
+        ui.wait("@bob human-only")
+
+        ui.resize(14, 60)
+        ui.wait("QA Space / lobby", absent="F7 Show sidebar")
+        ui.send(F7 + b"\t")
+        ui.wait("CONVERSATIONS  <", absent="QA Space / lobby")
+        ui.wait("> − QA Space")
+        ui.wait("Enter open · Tab draft · F1 help", absent="F7 Hide sidebar")
+        ui.send(b"\t")
+        ui.wait("@bob human-only", absent="CONVERSATIONS")
+        ui.resize(36, 132)
+        ui.wait("F7 Show sidebar", absent="CONVERSATIONS")
+        ui.send(F7)
+        ui.wait("F7 Hide sidebar", absent="CONVERSATIONS  <")
+        ui.wait("> − QA Space")
+        ui.send(F7)
+        ui.wait("F7 Show sidebar", absent="CONVERSATIONS")
+        ui.send(b"\t")
+        ui.wait("CONVERSATIONS  <")
+        ui.wait("> − QA Space")
+        ui.send(b"\t")
+        ui.wait("@bob human-only", absent="CONVERSATIONS  <")
+        require(not read_events(call, bob, room) and endpoint.calls == ["qa-default"],
+                "sidebar navigation sent a draft or started a model")
         ui.send(ENTER)
         ui.wait("alice → @bob")
         check_message(call, bob, room, "@bob human-only", [{"kind": "user", "id": "bob"}])

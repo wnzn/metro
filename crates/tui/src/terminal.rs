@@ -27,6 +27,7 @@ const HELP: &[&str] = &[
     "F4          Pick a model and an advertised thinking level",
     "F5          Refresh Spaces, rooms, transcript, and available models",
     "F6          Insert a newline in the draft",
+    "F7          Hide / show sidebar in a wide terminal",
     "PgUp/PgDn   Scroll transcript when the draft has focus",
     "← / →       Move the caret; Home / End jumps to draft boundaries",
     "",
@@ -39,6 +40,7 @@ pub struct Screen {
     out: Stdout,
     paste: bool,
     mode: Mode,
+    split_available: bool,
     _raw: RawMode,
 }
 
@@ -64,6 +66,7 @@ impl Screen {
             out: io::stdout(),
             paste: false,
             mode: Mode::detect(),
+            split_available: false,
             _raw: raw,
         };
         execute!(screen.out, EnterAlternateScreen, Hide)?;
@@ -75,6 +78,7 @@ impl Screen {
 
     pub fn draw(&mut self, app: &mut App, secret: &str) -> io::Result<()> {
         let (cols, rows) = terminal::size()?;
+        self.split_available = cols.saturating_sub(1) >= 78 && rows >= 7;
         let mut frame = Frame {
             out: &mut self.out,
             mode: self.mode,
@@ -158,7 +162,7 @@ impl Screen {
             frame.line(0, height - 1, width, "F10 / Ctrl-C quit")?;
         } else {
             let browser = app.focus == Focus::Browser;
-            let split = width >= 78;
+            let split = self.split_available && app.nav_visible_in_split();
             let nav_width = if split { (width / 3).min(32) } else { width };
             if split || browser {
                 let heading = if browser {
@@ -200,14 +204,25 @@ impl Screen {
                     )?;
                 }
             }
-            if !split && browser {
+            if split {
+                frame.line(0, height - 1, nav_width, "F7 Hide sidebar")?;
+            }
+            if !self.split_available && browser {
                 frame.line(0, height - 1, width, "Enter open · Tab draft · F1 help")?;
             } else {
                 let x = if split { nav_width + 2 } else { 0 };
                 frame.conversation(app, x, width - x, height)?;
+                if self.split_available && !split {
+                    let hint = "F7 Show sidebar";
+                    frame.line(width - hint.len(), height - 1, hint.len(), hint)?;
+                }
             }
         }
         frame.out.flush()
+    }
+
+    pub fn split_available(&self) -> bool {
+        self.split_available
     }
 }
 

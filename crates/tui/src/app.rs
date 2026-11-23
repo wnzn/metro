@@ -84,6 +84,7 @@ pub struct App {
     rooms: Vec<Named>,
     expanded: Option<String>,
     pub nav_selected: usize,
+    nav_collapsed: bool,
     pub nav_status: String,
     pub model_selected: usize,
     pub focus: Focus,
@@ -127,6 +128,7 @@ impl App {
             rooms: vec![],
             expanded: None,
             nav_selected: 0,
+            nav_collapsed: false,
             nav_status: String::new(),
             model_selected: 0,
             focus: Focus::Draft,
@@ -714,7 +716,18 @@ impl App {
         });
     }
 
-    pub fn key(&mut self, key: KeyEvent, repeat: bool) -> bool {
+    pub fn nav_visible_in_split(&self) -> bool {
+        !self.nav_collapsed || self.focus == Focus::Browser
+    }
+
+    fn focus_browser(&mut self, split_available: bool) {
+        if split_available {
+            self.nav_collapsed = false;
+        }
+        self.focus = Focus::Browser;
+    }
+
+    pub fn key(&mut self, key: KeyEvent, repeat: bool, split_available: bool) -> bool {
         use KeyCode::*;
         if key.code == Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return false;
@@ -760,6 +773,12 @@ impl App {
         }
         match key.code {
             F(5) => self.refresh(),
+            F(7) if split_available && !self.fatal => {
+                self.nav_collapsed = self.nav_visible_in_split();
+                if self.nav_collapsed {
+                    self.focus = Focus::Draft;
+                }
+            }
             F(4) if self.signed_in => {
                 if self.catalog_job.is_none() {
                     self.load_catalog();
@@ -768,13 +787,13 @@ impl App {
                 self.overlay = Some(Overlay::Models);
             }
             Tab | BackTab => {
-                self.focus = if self.focus == Focus::Draft {
-                    Focus::Browser
+                if self.focus == Focus::Draft {
+                    self.focus_browser(split_available);
                 } else {
-                    Focus::Draft
-                };
+                    self.focus = Focus::Draft;
+                }
             }
-            Esc => self.focus = Focus::Browser,
+            Esc => self.focus_browser(split_available),
             _ if self.focus == Focus::Browser => match key.code {
                 Up | Down | PageUp | PageDown | Home | End => {
                     let length = self.nav_rows().len();

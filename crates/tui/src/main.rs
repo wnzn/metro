@@ -188,7 +188,11 @@ fn interact(
         if event::poll(INPUT_TICK).map_err(|_| IO_ERROR)? {
             match event::read().map_err(|_| IO_ERROR)? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
-                    if !app.key(key, key.kind == KeyEventKind::Repeat) {
+                    if !app.key(
+                        key,
+                        key.kind == KeyEventKind::Repeat,
+                        screen.split_available(),
+                    ) {
                         break;
                     }
                     redraw = true;
