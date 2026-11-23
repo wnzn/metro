@@ -24,7 +24,16 @@ export const isEndpointKind = (kind: string) => ENDPOINT_KINDS.includes(kind);
 
 export type Credential = "signed_in" | "signed_out" | "key_saved" | "no_key" | "missing";
 export type Worker = "stopped" | "needs_setup" | "starting" | "online" | "offline" | "unauthorized" | "error";
-export type LoginState = { state: "waiting" | "done" | "failed"; authUrl: string | null; error: string | null };
+type LoginStage = "storage" | "discovery" | "callback" | "waiting" | "response" | "exchange";
+export type LoginState = {
+  state: "waiting" | "done" | "failed";
+  browserReady: boolean;
+  browser: "not_requested" | "opening" | "opened" | "failed" | null;
+  browserError: string | null;
+  stage: LoginStage | null;
+  beforeBrowser: boolean;
+  error: string | null;
+};
 
 /** One connection paired on this computer, for the current session. */
 export type LocalConnection = {
@@ -100,8 +109,14 @@ function parseLogin(v: unknown): LoginState | null {
   if (!isObj(v)) return null;
   const state = v.state === "waiting" || v.state === "done" || v.state === "failed" ? v.state : null;
   if (!state) return null;
-  const error = str(v.error);
-  return { state, authUrl: str(v.auth_url), error: error === null ? null : scrub(error) };
+  const { stage, browser } = v;
+  const safe = (text: unknown) => typeof text === "string" ? scrub(text.replace(/https?:\/\/\S+/gi, "[link hidden]")) : null;
+  return {
+    state, error: safe(v.error), browserError: safe(v.browser_error),
+    browserReady: v.browser_ready === true, beforeBrowser: v.before_browser === true,
+    stage: stage === "storage" || stage === "discovery" || stage === "callback" || stage === "waiting" || stage === "response" || stage === "exchange" ? stage : null,
+    browser: browser === "opening" || browser === "opened" || browser === "failed" || browser === "not_requested" ? browser : null,
+  };
 }
 
 export function parseConnection(v: unknown): LocalConnection {
@@ -149,6 +164,8 @@ export type Bridge = {
   rotate(connectionId: string): Promise<LocalConnection>;
   setCredentials(connectionId: string, body: CredentialsBody): Promise<LocalConnection>;
   clearCredentials(connectionId: string): Promise<LocalConnection>;
+  openLogin(connectionId: string): Promise<LocalConnection>;
+  cancelLogin(connectionId: string): Promise<LocalConnection>;
   availableModels(connectionId: string): Promise<string[]>;
   setModels(connectionId: string, models: string[]): Promise<LocalConnection>;
   setEndpoint(connectionId: string, baseUrl: string): Promise<LocalConnection>;
@@ -217,6 +234,8 @@ export function createBridge(endpoint: BridgeEndpoint): Bridge {
     rotate: (id) => conn(call("POST", `${seg(id)}/rotate`, {})),
     setCredentials: (id, body) => conn(call("POST", `${seg(id)}/credentials`, body)),
     clearCredentials: (id) => conn(call("DELETE", `${seg(id)}/credentials`)),
+    openLogin: (id) => conn(call("POST", `${seg(id)}/login/open`, {})),
+    cancelLogin: (id) => conn(call("DELETE", `${seg(id)}/login`)),
     availableModels: async (id) => {
       const data = await call("GET", `${seg(id)}/available-models`);
       if (!isObj(data) || !Array.isArray(data.models)) throw new BridgeError("protocol", "Metro's device helper didn't list models.");

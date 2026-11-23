@@ -52,7 +52,8 @@ test("status and connections parse the contract's snake_case", () => {
     local: "running",
   });
   expect(s.session).toEqual({ serverUrl: "http://127.0.0.1:8787", accountId: "bob" });
-  expect(s.connections[0]!.login).toEqual({ state: "waiting", authUrl: "http://127.0.0.1:5/auth/start?k=x", error: null });
+  // An older helper's start link is discarded; its presence cannot enable Open.
+  expect(s.connections[0]!.login).toEqual({ state: "waiting", browserReady: false, browser: null, beforeBrowser: false, stage: null, error: null, browserError: null });
   expect(s.local).toBe("running");
   expect(() => parseStatus({ bridge: 2 })).toThrow();
   expect(() => parseConnection({ kind: "x" })).toThrow();

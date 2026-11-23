@@ -301,8 +301,10 @@ async function act<T>(busy: string, id: string, job: (b: Bridge) => Promise<T>, 
     pairError.set(`${what}: ${message(error, "Metro's device helper didn't answer")}`);
     return null;
   } finally {
-    if (ok()) pairBusy.set(null);
-    notify(id);
+    if (ok()) {
+      pairBusy.set(null);
+      notify(id);
+    }
   }
 }
 
@@ -348,6 +350,13 @@ export async function signOutHere(connectionId: string): Promise<boolean> {
   applyConnection(c);
   pairNotice.set("Signed out on this computer. It stopped serving this connection; sign in again to resume.");
   return true;
+}
+
+export async function manageLoginHere(id: string, action: "open" | "cancel"): Promise<void> {
+  const ok = sessionGuard();
+  const c = await act(`${action}:${id}`, id, (b) => action === "open" ? b.openLogin(id) : b.cancelLogin(id),
+    action === "open" ? "Couldn't open the browser" : "Couldn't cancel sign-in");
+  if (ok() && c) applyConnection(c);
 }
 
 export async function setEndpointHere(connectionId: string, baseUrl: string): Promise<boolean> {

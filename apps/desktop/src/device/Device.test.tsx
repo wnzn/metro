@@ -13,9 +13,9 @@ type B = ReturnType<typeof fakeBridge>;
 
 const VENDOR_KEY = "sk-vendor-fixture-not-real-123456";
 
-async function openPackaged(f: F, b: B | null, env: object | null = bridgeEnv()) {
+async function openPackaged(f: F, b: B | null, env: object | null = bridgeEnv(), platform: "linux" | "windows" = "linux") {
   const network = { ...(f.network as any), ...(b ? (b.network as any) : {}) };
-  return open("../../App.tsx", { network, platform: "linux", width: 1280, height: 900, ...(env ? { modules: env as any } : {}) });
+  return open("../../App.tsx", { network, platform, width: 1280, height: 900, ...(env ? { modules: env as any } : {}) });
 }
 
 async function signIn(app: App, user: string) {
@@ -139,10 +139,10 @@ test("packaged: an endpoint connection is set up in-app with consent; the UI nev
   expectNoSecrets(app);
 });
 
-test("packaged: ChatGPT sign-in happens in the browser and the page follows it", async () => {
+test("packaged Windows UI: ChatGPT sign-in prepares, reopens through the helper, cancels, retries and finishes", async () => {
   const f = world();
   const b = fakeBridge(f);
-  const app = await openPackaged(f, b);
+  const app = await openPackaged(f, b, bridgeEnv(), "windows");
   await signIn(app, "bob");
   await openProviders(app);
   await createDevice(app, "device-openai-oauth", "Work ChatGPT");
@@ -156,6 +156,34 @@ test("packaged: ChatGPT sign-in happens in the browser and the page follows it",
   await app.press("id:device-sign-in");
   await app.waitFor("id:device-signing-in");
   expect(b.calls(`/v1/connections/${c.id}/credentials`, "POST")[0]!.body).toEqual({ open_browser: true });
+  const local = b.state.connections.get(c.id)!;
+  Object.assign(local.login!, { browser_ready: false, browser: "opening" });
+  await app.press("id:device-signin-check");
+  await app.waitUntil(() => text(app).includes("Preparing sign-in on this computer"));
+  expect(app.shows("id:device-open-signin")).toBe(false);
+  Object.assign(local.login!, { browser_ready: true, browser: "failed", browser_error: "No default browser." });
+  await app.press("id:device-signin-check");
+  await app.waitFor("id:device-open-signin");
+  expect(text(app)).toContain("No default browser.");
+  await app.press("id:device-open-signin");
+  await app.waitUntil(() => text(app).includes("Approve the sign-in in your browser"));
+  expect(b.calls(`/v1/connections/${c.id}/login/open`, "POST")[0]!.body).toEqual({});
+  expect(app.openedUrls()).toEqual([]);
+  expect(app.clipboard() ?? "").toBe("");
+  await app.press("id:device-cancel-signin");
+  await app.waitFor("id:device-sign-in");
+  expect(b.calls(`/v1/connections/${c.id}/login`, "DELETE")).toHaveLength(1);
+  expect(b.calls(`/v1/connections/${c.id}/credentials`, "DELETE")).toHaveLength(0);
+  await app.press("id:device-sign-in");
+  await app.waitFor("id:device-signing-in");
+  Object.assign(local.login!, { state: "failed", stage: "discovery", before_browser: true, browser_ready: false, browser: "not_requested" });
+  await app.press("id:device-signin-check");
+  await app.waitFor("id:device-signin-failed");
+  expect(text(app)).toContain("No browser was opened.");
+  expect(text(app)).toContain("reach OpenAI");
+  expect(app.shows("id:device-open-signin")).toBe(false);
+  await app.press("id:device-sign-in");
+  await app.waitFor("id:device-signing-in");
   b.finishLogin(c.id);
   await app.waitFor("id:device-models"); // polled, no press needed
   await app.waitFor(`id:device-model:${LOCAL_MODELS[0]}`);

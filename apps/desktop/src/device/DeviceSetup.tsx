@@ -7,7 +7,7 @@
 // A vendor key typed here lives in this panel's signal until it is sent to
 // the bridge or the panel closes, and is cleared either way.
 
-import { cleanup, effect, openUrl, signal, untracked } from "nsh";
+import { cleanup, effect, signal, untracked } from "nsh";
 import { connectedTo } from "../store";
 import { fetchModels, modelListings, providerById } from "../settings";
 import { Action, ActionBar, Badge, Banner, Column, Field, Row, SettingRow, SettingsGroup, Toggle } from "../ui";
@@ -24,6 +24,7 @@ import {
   localBadge,
   localConnections,
   localStep,
+  manageLoginHere,
   pairBusy,
   pairError,
   pairHere,
@@ -42,12 +43,6 @@ function credentialWords(kind: string): string {
   if (kind === "device-openai-oauth") return "You sign in with ChatGPT in your browser on this computer. The sign-in stays here; Metro's server never receives it.";
   if (kind === "device-claude-code") return "Your Anthropic API key is saved on this computer only and used with the Claude Code CLI installed here. That is API billing; Claude Pro/Max subscriptions are not used.";
   return "The endpoint's URL and key are saved on this computer only, bound to that endpoint. Metro's server never receives the key.";
-}
-
-/** A URL the sign-in flow may open: the bridge's one-time loopback page, or an https page. */
-function openable(url: string | null): string | null {
-  if (!url) return null;
-  return /^http:\/\/127\.0\.0\.1:[0-9]{1,5}\//.test(url) || /^https:\/\//.test(url) ? url : null;
 }
 
 /** The status of Metro's device helper itself, when it can't serve this session. Renders nothing when it can. */
@@ -133,7 +128,7 @@ export function DeviceSetup(props: { connectionId: string; connectionName: strin
             <Credentials connectionId={props.connectionId} kind={props.providerId} local={local()} />
           </If>
           <If when={step() === "signing-in"}>
-            <SigningIn local={local()} />
+            <SigningIn connectionId={props.connectionId} local={local()} />
           </If>
           <If when={step() === "models"}>
             <Models connectionId={props.connectionId} current={[]} />
@@ -213,7 +208,16 @@ function Credentials(props: { connectionId: string; kind: string; local: LocalCo
   const key = signal("");
   const keyless = signal(false);
   cleanup(() => key.set(""));
-  const failed = () => (props.local?.login?.state === "failed" ? props.local.login.error ?? "The sign-in didn't finish." : null);
+  const failed = () => {
+    const login = props.local?.login;
+    if (login?.state !== "failed") return null;
+    if (!login.beforeBrowser) return login.error ?? "Start a new sign-in and finish it in your browser.";
+    const help = login.stage === "discovery" ? "Check that this computer can reach OpenAI, then try again."
+      : login.stage === "callback" ? "Close any other ChatGPT sign-in on this computer, then try again."
+      : login.stage === "storage" ? "Check that Metro can save files on this computer, then try again."
+      : "Try signing in again.";
+    return ["No browser was opened.", login.error, help].filter(Boolean).join(" ");
+  };
   const save = async () => {
     const value = key().trim();
     key.set(""); // never kept, whatever the outcome
@@ -282,8 +286,8 @@ function Credentials(props: { connectionId: string; kind: string; local: LocalCo
           <Row padX={4} padY={3} justify="end">
             <Action
               testID="device-sign-in"
-              label="Sign in with ChatGPT"
-              busyLabel="Opening your browser…"
+              label={failed() ? "Retry ChatGPT sign-in" : "Sign in with ChatGPT"}
+              busyLabel="Preparing sign-in…"
               busy={pairBusy() === `signin:${props.connectionId}`}
               disabled={!!pairBusy()}
               variant="primary"
@@ -296,14 +300,23 @@ function Credentials(props: { connectionId: string; kind: string; local: LocalCo
   );
 }
 
-function SigningIn(props: { local: LocalConnection | undefined }) {
-  const url = () => openable(props.local?.login?.authUrl ?? null);
+function SigningIn(props: { connectionId: string; local: LocalConnection | undefined }) {
+  const login = () => props.local?.login;
+  const description = () => {
+    const l = login();
+    if (!l?.browserReady) return "Preparing sign-in on this computer…";
+    if (l.browser === "failed") return `${l.browserError ?? "The browser didn't open."} Check your default browser, then open it again.`;
+    if (l.browser === "opening") return "Opening your default browser…";
+    if (l.browser === "opened") return "Approve the sign-in in your browser on this computer. This page continues by itself when it's done.";
+    return "Open your browser to continue signing in.";
+  };
   return (
-    <SettingsGroup title="Finish signing in" description="Approve the sign-in in your browser on this computer. This page continues by itself when it's done." testID="device-signing-in">
+    <SettingsGroup title="Finish signing in" description={description()} testID="device-signing-in">
       <Row padX={4} padY={3} gap={2} wrap>
-        <If when={url()}>
-          {(u) => <Action testID="device-open-signin" label="Open the sign-in page again" variant="ghost" onPress={() => void openUrl(u()).catch(() => {})} />}
+        <If when={login()?.browserReady && login()?.browser && login()?.browser !== "opening"}>
+          <Action testID="device-open-signin" label="Open browser" variant="ghost" disabled={!!pairBusy()} onPress={() => void manageLoginHere(props.connectionId, "open")} />
         </If>
+        <Action testID="device-cancel-signin" label="Cancel sign-in" variant="ghost" disabled={!!pairBusy()} onPress={() => void manageLoginHere(props.connectionId, "cancel")} />
         <Action testID="device-signin-check" label="Check now" variant="ghost" onPress={() => void refreshHelper()} />
       </Row>
     </SettingsGroup>

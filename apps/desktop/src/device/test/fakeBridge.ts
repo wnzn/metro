@@ -26,7 +26,11 @@ type Local = {
   credential: string;
   worker: string;
   detail: string | null;
-  login: null | { state: "waiting" | "done" | "failed"; auth_url: string | null; error: string | null };
+  login: null | {
+    state: "waiting" | "done" | "failed"; browser_ready: boolean; before_browser: boolean;
+    browser: "opening" | "opened" | "failed" | "not_requested"; browser_error: string | null;
+    stage: string | null; error: string | null;
+  };
 };
 
 const ENDPOINT = ["device-openai-compatible", "device-systemone", "device-embeddings", "device-embeddinggemma-2"];
@@ -95,7 +99,7 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
       for (const c of state.connections.values()) ready(c);
       return ok(status());
     }
-    const m = /^\/v1\/connections\/([^/]+)\/([a-z-]+)$/.exec(path);
+    const m = /^\/v1\/connections\/([^/]+)\/([a-z-]+|login\/open)$/.exec(path);
     if (!m) return err(404, "not_found", "Unknown path.");
     if (!state.session) return err(409, "no_session", "Sign in to Metro first.");
     const id = decodeURIComponent(m[1]);
@@ -127,7 +131,7 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
       case "POST credentials": {
         if (!c) return err(404, "not_paired", "Not paired here.");
         if (c.kind === "device-openai-oauth") {
-          c.login = { state: "waiting", auth_url: "http://127.0.0.1:47999/auth/start?k=fake", error: null };
+          c.login = { state: "waiting", browser_ready: true, before_browser: false, browser: "opened", browser_error: null, stage: null, error: null };
           return ok(c);
         }
         if (body?.no_api_key) {
@@ -140,6 +144,15 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
         ready(c);
         return ok(c);
       }
+      case "POST login/open":
+        if (!c?.login?.browser_ready || c.login.browser === "opening") return err(409, "login_preparing", "Sign-in is not ready.");
+        c.login.browser = "opened";
+        c.login.browser_error = null;
+        return ok(c);
+      case "DELETE login":
+        if (!c) return err(404, "not_paired", "Not paired here.");
+        c.login = null;
+        return ok(c);
       case "DELETE credentials":
         if (!c) return err(404, "not_paired", "Not paired here.");
         c.credential = ENDPOINT.includes(c.kind) ? "missing" : "signed_out";
@@ -176,7 +189,7 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
   /** Finishes (or fails) a browser sign-in, as the user would in the browser. */
   const finishLogin = (id: string, success = true) => {
     const c = state.connections.get(id)!;
-    c.login = { state: success ? "done" : "failed", auth_url: null, error: success ? null : "The browser sign-in was cancelled." };
+    c.login = { ...c.login!, state: success ? "done" : "failed", browser_ready: false, error: success ? null : "The browser sign-in was cancelled." };
     if (success) c.credential = "signed_in";
     ready(c);
   };
