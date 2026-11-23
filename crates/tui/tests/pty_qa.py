@@ -232,7 +232,9 @@ def main(server, tui):
         stack.callback(thread.join, 2)
         stack.callback(endpoint.shutdown)
         base = f"http://{HOST}:{endpoint.server_port}/v1"
-        env = clean_env(directory) | {"TMPDIR": os.environ["TMPDIR"], "TERM": "xterm-256color"}
+        child_tmp = state / "tmp"
+        child_tmp.mkdir(mode=0o700)
+        env = clean_env(directory) | {"TMPDIR": str(child_tmp), "TERM": "xterm-256color"}
         port = server_port()
         children = [start_child(stack, "server", server, state, env | {
             "METRO_BIND": f"{HOST}:{port}",
