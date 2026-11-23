@@ -456,7 +456,7 @@ function LibraryFilters() {
     const m = savedModel();
     if (!m) return null;
     const who = m.owned ? "" : m.execution === "device" ? `, which runs on ${m.ownerId ?? "its owner"}'s device` : `, shared by ${m.ownerId ?? "someone"}: whoever runs it sees the query`;
-    return libSearching() ? "Searching…" : `Return in the search box at the top sends your query to ${m.name}${who}; typing or changing a filter sends nothing. ${RERANK_NOTE}`;
+    return libSearching() ? "Searching…" : `Return in the search box at the top, or More results under it, sends your query to ${m.name}${who}. While you type, Metro only looks up literal matches itself, with no model; changing a filter sends nothing. ${RERANK_NOTE}`;
   };
   return (
     <Column gap={3} testID="library-search-form">

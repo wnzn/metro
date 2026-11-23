@@ -7,9 +7,11 @@
 // - Documents & media (./library): the separate corpus of files people
 //   uploaded.
 //
-// The query is typed only in the search box at the top (TopSearch). Return
-// there is the only thing that sends it anywhere; typing, changing a mode or a
-// filter sends nothing.
+// The query is typed only in the search box at the top (TopSearch). Typing
+// there shows quick results: literal matches Metro looks up itself, with no
+// model. Only Return with no quick result chosen, or More results, sends the
+// query on to the searcher's connections; changing a mode or a filter sends
+// nothing.
 
 import { openSettings, roomsOf, spaces } from "../store";
 import { Action, Badge, Banner, Chip, Column, Disclosure, Label, MarkedText, PageHeader, ResultCard, Row, ScrollArea, SegmentedControl, SettingRow, SettingsGroup, Surface } from "../ui";
@@ -114,7 +116,7 @@ function Filters() {
       <Label variant="caption" color="muted" testID="search-disclosure">
         {searching()
           ? "Searching…"
-          : "Return in the search box at the top sends your query to your embeddings connection, and, if you have a System One connection, a short list of matching messages you can read to it for reranking. Typing or changing a filter sends nothing."}
+          : "Return in the search box at the top, or More results under it, sends your query to your embeddings connection, and, if you have a System One connection, a short list of matching messages you can read to it for reranking. While you type, Metro only looks up literal matches itself, with no model; changing a filter sends nothing."}
       </Label>
     </Column>
   );

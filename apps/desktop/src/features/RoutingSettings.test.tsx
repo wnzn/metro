@@ -355,7 +355,8 @@ test("Search is the box at the top of every page and Scheduled tasks a sidebar d
   await app.waitFor("id:top-search");
   await app.type("id:top-search", "pricing");
   await app.wait(300);
-  expect(f.posts().some((p) => p.path.startsWith("/v1/search"))).toBe(false); // typing sends nothing
+  // Typing may ask Metro for literal quick matches (/v1/search/quick); it never runs the semantic search or indexing.
+  expect(f.posts().some((p) => p.path === "/v1/search" || p.path === "/v1/search/index")).toBe(false);
   await app.submit("id:top-search"); // Return opens Search
   await app.waitFor("id:search-view");
   await app.press("id:nav-schedules");
