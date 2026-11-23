@@ -71,23 +71,9 @@ jobs:
         run: timeout --kill-after=15s 240s python3 -B crates/tui/tests/pty_qa.py --bin-dir target/debug
 
   desktop:
-    # Only trusted Metro source goes to the desktop runner. This chooses a
-    # queue, not a fallback if the selected runner is offline.
-    runs-on: >-
-      ${{ github.repository == 'wnzn/metro' && github.repository_id == '1467654868'
-      && github.actor == github.triggering_actor && github.actor == github.event.sender.login
-      && github.event.sender.type == 'User' && github.actor != 'dependabot[bot]'
-      && ((github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref_protected
-           && github.event.deleted == false && github.event.forced == false)
-          || (github.event_name == 'pull_request' && github.event.pull_request.base.ref == 'main'
-              && github.event.pull_request.base.repo.id == 1467654868
-              && github.event.pull_request.head.repo.id == 1467654868
-              && github.event.pull_request.user.type == 'User'
-              && github.actor == github.event.pull_request.user.login
-              && (github.event.pull_request.author_association == 'OWNER'
-                  || github.event.pull_request.author_association == 'MEMBER'
-                  || github.event.pull_request.author_association == 'COLLABORATOR')))
-      && 'metro-ci-linux-x64' || 'ubuntu-24.04' }}
+    needs: workflows
+    # Choose a queue, not a fallback if the selected runner is offline.
+    runs-on: ${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' && 'metro-ci-linux-x64' || 'ubuntu-24.04' }}
     env:
       NSH_VERSION: v0.6.1
       NSH_ARCHIVE_SHA256: 9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070
@@ -99,7 +85,7 @@ jobs:
           NSH_CLI_SHA256: 8eb4cedc71aaaeeda729d4dba7d0fb2040db29cce98cd6ff3dad6df7d5d5bafd
         run: |
           set -euo pipefail
-          # Actions expressions ignore case. Refuse case-variant refs before checkout.
+          # Recheck the repository and ref before checking out on this runner.
           test "$GITHUB_REPOSITORY" = wnzn/metro
           test "$GITHUB_REPOSITORY_ID" = 1467654868
           case "$GITHUB_EVENT_NAME" in
@@ -324,10 +310,60 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       docs_only: ${{ steps.preview-policy.outputs.docs_only }}
+      desktop_runner: ${{ steps.desktop-route.outputs.desktop_runner }}
     env:
       ACTIONLINT_VERSION: 1.7.12
       ACTIONLINT_SHA256: 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
     steps:
+      - name: Select the desktop runner from the GitHub event
+        id: desktop-route
+        run: |
+          python3 -I - <<'PY'
+          import json
+          import os
+
+          def select(env, event):
+              if env.get("GITHUB_REPOSITORY") != "wnzn/metro" or env.get("GITHUB_REPOSITORY_ID") != "1467654868":
+                  return False, "not the official Metro repository"
+              actor = env.get("GITHUB_ACTOR", "")
+              if not actor or actor.lower().endswith("[bot]"):
+                  return False, "missing or bot workflow actor"
+              kind = env.get("GITHUB_EVENT_NAME")
+              if kind == "pull_request":
+                  pr = event["pull_request"]
+                  if pr["base"]["ref"] != "main":
+                      return False, "PR does not target literal main"
+                  if pr["base"]["repo"]["id"] != 1467654868 or pr["head"]["repo"]["id"] != 1467654868:
+                      return False, "PR head or base is not in the official repository"
+                  author = pr["user"]
+                  login = author.get("login", "")
+                  if not login or author["type"] != "User" or login.lower().endswith("[bot]"):
+                      return False, "missing or bot PR author"
+                  if pr["author_association"] not in ("OWNER", "MEMBER", "COLLABORATOR"):
+                      return False, "PR author association is not trusted"
+                  if (event.get("sender") or {}).get("type") == "Bot":
+                      return False, "PR event sender is a bot"
+                  return True, "trusted same-repository PR to main"
+              if kind == "push":
+                  if env.get("GITHUB_REF") != "refs/heads/main" or event["ref"] != "refs/heads/main":
+                      return False, "push is not to literal main"
+                  if env.get("GITHUB_REF_PROTECTED") != "true":
+                      return False, "main is not protected"
+                  if event["deleted"] is not False or event["forced"] is not False or event["sender"]["type"] != "User":
+                      return False, "push is deleted, forced, or has no human sender"
+                  return True, "protected main push"
+              return False, "not a push or pull_request"
+
+          try:
+              with open(os.environ["GITHUB_EVENT_PATH"], encoding="utf-8") as stream:
+                  use_metro, reason = select(os.environ, json.load(stream))
+          except (OSError, ValueError, KeyError, TypeError, AttributeError):
+              use_metro, reason = False, "event payload is missing or incomplete"
+          runner = "metro-ci-linux-x64" if use_metro else "ubuntu-24.04"
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"desktop_runner={runner}", file=output)
+          print(f"Desktop runner: {runner} ({reason}).")
+          PY
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           persist-credentials: false
