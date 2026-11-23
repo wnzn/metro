@@ -308,16 +308,59 @@ function Test-MetroMsiStructure {
 }
 
 # A copy with one extra Property row: every hashed stream stays, the content changes.
+# The edit runs in a short child pwsh that has exited before this returns. Windows
+# Installer automation is in-process COM (msi.dll): the database file stays open
+# while anything references the Database, and the View holds such a reference, as
+# PowerShell's adapters may. Releasing only the Database left tampered.msi open
+# ("being used by another process" in Get-AuthenticodeSignature). Process exit
+# closes every handle the editor had; the child still releases view, database and
+# installer in reverse order. The caller then requires an exclusive open.
 function New-TamperedMsiCopy([string] $Path, [string] $Dest) {
     Copy-Item -LiteralPath $Path -Destination $Dest
-    $installer = New-Object -ComObject WindowsInstaller.Installer
-    $db = Invoke-MsiAutomation $installer 'Installer.OpenDatabase' @($Dest, 1)
-    $view = Invoke-MsiAutomation $db 'Database.OpenView' @("INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('MetroTamperCheck', '1')")
-    Invoke-MsiAutomation $view 'View.Execute' | Out-Null
-    Invoke-MsiAutomation $view 'View.Close' | Out-Null
-    Invoke-MsiAutomation $db 'Database.Commit' | Out-Null
-    [Runtime.InteropServices.Marshal]::FinalReleaseComObject($db) | Out-Null
+    $editor = {
+        param([string] $Automation, [string] $Msi)
+        Set-StrictMode -Version 3.0
+        $ErrorActionPreference = 'Stop'
+        . $Automation
+        $installer = $db = $view = $null
+        try {
+            $installer = New-Object -ComObject WindowsInstaller.Installer
+            $db = Invoke-MsiAutomation $installer 'Installer.OpenDatabase' @($Msi, 1)
+            $view = Invoke-MsiAutomation $db 'Database.OpenView' @("INSERT INTO ``Property`` (``Property``, ``Value``) VALUES ('MetroTamperCheck', '1')")
+            Invoke-MsiAutomation $view 'View.Execute' | Out-Null
+            Invoke-MsiAutomation $view 'View.Close' | Out-Null
+            Invoke-MsiAutomation $db 'Database.Commit' | Out-Null
+        } finally {
+            foreach ($o in $view, $db, $installer) {
+                if ($null -ne $o) { [void] [Runtime.InteropServices.Marshal]::FinalReleaseComObject($o.PSObject.BaseObject) }
+            }
+        }
+    }
+    Invoke-MetroChildEditor $editor @((Join-Path $PSScriptRoot '..\windows-msi\MsiAutomation.ps1'), $Dest) 'the MSI editor'
+    Assert-MetroFileClosed $Dest 'the tampered MSI'
+    if ((Get-FileHash -LiteralPath $Path).Hash -eq (Get-FileHash -LiteralPath $Dest).Hash) { Fail 'the MSI editor did not change the copy' }
     return $Dest
+}
+
+# Runs $Block in a child pwsh (this executable) and waits for it to exit.
+function Invoke-MetroChildEditor([scriptblock] $Block, [object[]] $BlockArgs, [string] $What) {
+    $PSNativeCommandUseErrorActionPreference = $false
+    $out = & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -Command $Block -args $BlockArgs 2>&1
+    if ($LASTEXITCODE -ne 0) { Fail "$What exited with code $LASTEXITCODE`: $(($out | Out-String).Trim())" }
+    $global:LASTEXITCODE = 0
+}
+
+# Fails unless no process, this one included, still has the file open: only then
+# does an exclusive (FileShare None) open succeed. No retry: a held handle is a bug.
+function Assert-MetroFileClosed([string] $Path, [string] $What) {
+    try {
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::None)
+    } catch {
+        $e = $_.Exception
+        while ($e.InnerException) { $e = $e.InnerException }
+        Fail "$What is still open after its editor exited: $($e.Message)"
+    }
+    $stream.Dispose()
 }
 
 function Get-MetroMsiProductState([string] $ProductCode) {
