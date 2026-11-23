@@ -737,7 +737,9 @@ const extensionInk: Record<ExtensionTone, string> = {
 export function ExtensionBadge(props: { ext: string; testID?: string }) {
   return (
     <View class={cx("shrink-0 rounded-[5px] px-[6px] py-px", extensionFill[extensionTone(props.ext)])} testID={props.testID} accessibilityElementsHidden>
-      <Text class={cx(textClass.xs, "font-semibold font-mono", extensionInk[extensionTone(props.ext)])}>{props.ext}</Text>
+      <Text class={cx(textClass.xs, "font-semibold font-mono", extensionInk[extensionTone(props.ext)])} style={{ numberOfLines: 1 }}>
+        {props.ext}
+      </Text>
     </View>
   );
 }
@@ -833,7 +835,8 @@ export function SearchFileRow(
           {props.source}
         </Text>
       </If>
-      <View class="w-[52px] shrink-0 items-end">
+      {/* At least 52 wide so common badges line up at one right edge; a long one (".markdown") widens it, and the title gives way. */}
+      <View class="min-w-[52px] shrink-0 items-end">
         <If when={props.badge}>{(ext) => <ExtensionBadge ext={ext()} testID={props.testID ? `${props.testID}:ext` : undefined} />}</If>
       </View>
     </View>

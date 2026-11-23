@@ -507,3 +507,17 @@ test("only files: no headings, and the source is left out", async () => {
   expect(app.shows("id:quick-group:files")).toBe(false);
   expect(app.shows(`id:quick-asset:${doc.id} >> text:Personal`)).toBe(false);
 });
+
+test("a long, uppercase extension keeps its own text and family colour", async () => {
+  const w = quickWorld();
+  const id = "00000000-0000-4000-8000-00000000aaaa";
+  const wire = { id, name: "Release NOTES.MARKDOWN", mime_type: "text/markdown", kind: "markdown", size_bytes: 12, space_id: null, uploader_id: "alice", sha256: "ab".repeat(32), created_at: 1_700_000_000_000 };
+  w.q.answers.set("release", () => ({ assets: [wire], messages: [] }));
+  const app = await signIn(w);
+  await app.type("id:top-search", "release");
+  await app.waitFor(`id:quick-asset:${id}`);
+  expect(app.shows(`id:quick-asset:${id} >> text:Release NOTES`)).toBe(true);
+  expect(app.shows(`id:quick-asset:${id}:ext >> text:.MARKDOWN`)).toBe(true);
+  expect(app.viewStyle(`id:quick-asset:${id}:ext`)?.backgroundColor).toBe(themeColor("dark", "ext-markdown"));
+  expect(app.shows(`label:/^Release NOTES\\.MARKDOWN, Your personal library\\./`)).toBe(true);
+});
