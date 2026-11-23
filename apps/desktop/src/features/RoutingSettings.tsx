@@ -88,10 +88,7 @@ export function RoutingSettings() {
         </Column>
       }
     >
-      <PageHeader
-        title="Model routing"
-        subtitle="Use-case routing and starting the agent without @agent are off until you turn them on, and apply only to messages you write."
-      />
+      <PageHeader title="Model routing" />
       <If when={!routingUnsupported()} else={<Unsupported />}>
         <If when={draft()} else={<Label variant="caption" color="muted">{routingError() ? "" : "Loading your model routing…"}</Label>}>
           {(d) => (
@@ -234,13 +231,13 @@ function ClassifierGroup(props: { draft: RoutingDraft }) {
   return (
     <SettingsGroup
       title="System One classifier"
-      description="Routing, the opt-in below and search use this System One connection; a chat model never stands in for it."
+      description="Used by routing, the opt-in below and search. A chat model never stands in for it."
       testID="routing-classifier-group"
     >
       <SectionMore testID="classifier-learn-more">
         <FactList facts={[{ label: "Answers", value: "Typed questions: Noul, choice and score." }, { label: "Used by", value: "Use-case routing, the opt-in below, and search, which reranks with it." }]} />
       </SectionMore>
-      <SettingRow label="Classifier" description="Only System One connections are offered." stacked>
+      <SettingRow label="Classifier" stacked>
         <ModelPicker
           testID="routing-classifier"
           label="System One classifier"
@@ -260,7 +257,7 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
   return (
     <SettingsGroup
       title="Use-case routing"
-      description="When agent work starts for you, System One picks the use case and that use case's model answers."
+      description="System One picks a use case; that use case's model answers."
       testID="routing-group"
     >
       <SectionMore testID="routing-learn-more">
@@ -269,13 +266,14 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
             { label: "Starts on", value: "@agent, Ask agent, or a start the opt-in below allowed." },
             { label: "Override", value: "A model you pick for one turn overrides it." },
             { label: "When off", value: "Your default chat connection answers." },
+            { label: "Use cases", value: "System One reads each name and description to tell them apart." },
           ]}
         />
       </SectionMore>
-      <SettingRow label="Route by use case" description="Off by default.">
+      <SettingRow label="Route by use case" description="Off by default. When on, each agent request you start is sent to System One to pick a model.">
         <Toggle testID="routing-enabled" label="Route by use case" checked={d().enabled} onChange={(on) => editRouting({ enabled: on })} />
       </SettingRow>
-      <SettingRow label="Minimum confidence" description="Route only when System One is at least this sure of the use case, 0 to 100%. Below it, the fallback model answers." stacked>
+      <SettingRow label="Minimum confidence" description="0 to 100%. Below it, the fallback model answers." stacked>
         <PercentField
           testID="routing-min-route"
           accessibilityLabel="Minimum confidence to route"
@@ -285,7 +283,7 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
           placeholder="65"
         />
       </SettingRow>
-      <SettingRow label="Fallback answer model" description="Used when System One returns no match or a score below your threshold. If the classifier fails, no answering model is called." stacked>
+      <SettingRow label="Fallback answer model" description="Answers when there's no match or the confidence is below the minimum. If System One fails, no model answers." stacked>
         <ModelPicker
           testID="routing-default-chat"
           label="Fallback answer model"
@@ -299,7 +297,7 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
         {(c, i) => <CaseRow item={c()} index={i()} />}
       </Each>
       <If when={d().cases.length === 0}>
-        <SettingRow label="No use cases yet" description="Add one for each kind of request you want a particular model to answer, such as Code review or Quick question." />
+        <SettingRow label="No use cases yet" description="Add one per kind of request, such as Code review." />
       </If>
       <NoneOf capability="chat" what="chat" testID="routing-no-chat" />
       <Row padX={4} padY={3} gap={2} align="center">
@@ -316,7 +314,7 @@ function CaseRow(props: { item: DraftCase; index: number }) {
   const c = () => props.item;
   const n = () => props.index;
   return (
-    <SettingRow label={c().label.trim() || `Use case ${n() + 1}`} description="System One reads the name and description to tell use cases apart." stacked testID={`case:${n()}`}>
+    <SettingRow label={c().label.trim() || `Use case ${n() + 1}`} stacked testID={`case:${n()}`}>
       <Column gap={2}>
         <Field testID={`case-label:${n()}`} accessibilityLabel={`Name of use case ${n() + 1}`} value={c().label} onChange={(v) => editCase(c().uid, { label: v })} placeholder="Name, such as Code review" maxLength={MAX_LABEL} />
         <Field
@@ -352,11 +350,7 @@ function CaseRow(props: { item: DraftCase; index: number }) {
 function AddressingGroup(props: { draft: RoutingDraft }) {
   const d = () => props.draft;
   return (
-    <SettingsGroup
-      title="Start the agent without @agent (opt in)"
-      description="While this is on, System One judges only messages you write that mention nobody."
-      testID="addressing-group"
-    >
+    <SettingsGroup title="Start the agent without @agent (opt in)" testID="addressing-group">
       <SectionMore testID="addressing-learn-more">
         <FactList
           facts={[
@@ -366,12 +360,15 @@ function AddressingGroup(props: { draft: RoutingDraft }) {
           ]}
         />
       </SectionMore>
-      <SettingRow label="Classify my unaddressed messages" description="Off by default. In rooms and in your Chat. A start it allows runs as you, with your connections.">
+      <SettingRow
+        label="Classify my unaddressed messages"
+        description="Off by default. When on, each message you write that mentions nobody is sent to System One, in rooms and your Chat. A start it allows runs as you."
+      >
         <Toggle testID="routing-infer" label="Classify my unaddressed messages" checked={d().inferAddressing} onChange={(on) => editRouting({ inferAddressing: on })} />
       </SettingRow>
       <SettingRow
         label="Minimum confidence"
-        description={`Start the agent only when System One is at least this sure the message asks it, ${FLOOR_PERCENT} to 100%. Below it, the message stays ordinary conversation.`}
+        description={`${FLOOR_PERCENT} to 100%. Below it, the message stays ordinary conversation.`}
         stacked
       >
         <PercentField
@@ -389,8 +386,8 @@ function AddressingGroup(props: { draft: RoutingDraft }) {
 
 function SearchGroup(props: { draft: RoutingDraft }) {
   return (
-    <SettingsGroup title="Search" description="Search finds messages by meaning in your Chat and in the Spaces you're in now. It needs an embeddings model." testID="search-model-group">
-      <SettingRow label="Embeddings model" description="Only embeddings connections are offered: a cloud API, an endpoint your operator approved, or one on your device." stacked>
+    <SettingsGroup title="Search" description="Finds messages by meaning in your Chat and the Spaces you're in. Needs an embeddings model." testID="search-model-group">
+      <SettingRow label="Embeddings model" stacked>
         <ModelPicker
           testID="routing-embedding"
           label="Embeddings model"
@@ -455,7 +452,7 @@ function DataFlow(props: { draft: RoutingDraft }) {
   const classifier = () => findAvailable(d().classifierId);
   const embedding = () => findAvailable(d().embeddingId);
   return (
-    <SettingsGroup title="Where your text goes" description="From what is chosen above. Nothing here is sent until you save." testID="routing-dataflow">
+    <SettingsGroup title="Where your text goes" description="Nothing is sent until you save." testID="routing-dataflow">
       <FlowRow
         label="Use-case routing"
         on={d().enabled}
@@ -490,7 +487,7 @@ function DataFlow(props: { draft: RoutingDraft }) {
       />
       <SettingRow
         label="Never sent"
-        description="Messages that mention only people, and other members' messages for routing or classification. Your settings apply to messages you write, and never to anyone else's."
+        description="Messages that mention only people, and other members' messages for routing or classification. Your settings cover only what you write."
         testID="dataflow-never"
       />
     </SettingsGroup>

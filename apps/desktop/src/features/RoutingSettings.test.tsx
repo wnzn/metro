@@ -17,7 +17,7 @@ async function signIn(f: F, user: string, existing?: App) {
   return app;
 }
 
-async function settings(app: App, section: "providers" | "routing") {
+async function settings(app: App, section: "providers" | "routing" | "runners") {
   if (!app.shows(`id:nav-settings:${section}`)) await app.press("id:nav-settings");
   await app.press(`id:nav-settings:${section}`);
   await app.waitFor(`id:${section}-settings`);
@@ -63,8 +63,11 @@ test("Model routing is off by default and says nothing is sent", async () => {
   expect(text(app)).toContain("Messages that mention only people, and other members' messages for routing or classification.");
   expect(app.enabled("id:routing-save")).toBe(false); // nothing changed
   // Section headers are one sentence; the rest is under Learn more, closed until asked.
-  expect(app.shows("text:Off by default.")).toBe(true); // the opt-in's default stays visible
-  expect(app.shows("text:While this is on, System One judges only messages you write that mention nobody.")).toBe(true);
+  // Each opt-in says, beside its toggle, that it's off by default and what it sends where.
+  expect(app.shows("text:Off by default. When on, each agent request you start is sent to System One to pick a model.")).toBe(true);
+  expect(
+    app.shows("text:Off by default. When on, each message you write that mentions nobody is sent to System One, in rooms and your Chat. A start it allows runs as you."),
+  ).toBe(true);
   expect(app.shows("text:A model you pick for one turn overrides it.")).toBe(false);
   await app.press("id:routing-learn-more:toggle");
   await app.waitFor("text:A model you pick for one turn overrides it.");
@@ -366,4 +369,24 @@ test("Search is the box at the top of every page and Scheduled tasks a sidebar d
   await app.press("id:nav-chat");
   await app.waitFor("id:onboarding");
   expect(app.shows("id:top-search")).toBe(true);
+});
+
+test("in the narrowest window the opt-ins, their consent lines, Save and the runner controls stay reachable", async () => {
+  const { f } = routingWorld();
+  const app = await open("../../App.tsx", { network: f.network as any, platform: "linux", width: 720, height: 560 });
+  await signIn(f, "alice", app);
+  await settings(app, "routing");
+  await app.waitFor("id:routing-enabled");
+  // Consent sits beside each toggle, not behind hover or a disclosure.
+  expect(app.shows("text:Off by default. When on, each agent request you start is sent to System One to pick a model.")).toBe(true);
+  expect(app.shows("text:/each message you write that mentions nobody is sent to System One/")).toBe(true);
+  await app.press("id:routing-infer");
+  expect(app.shows("id:routing-save")).toBe(true); // the fixed footer
+  expect(app.enabled("id:routing-save")).toBe(true);
+  expect(app.shows("id:dataflow-addressing-facts >> text:Each message you write that mentions nobody and isn't sent with Ask agent")).toBe(true);
+  await app.press("id:routing-revert");
+  await settings(app, "runners");
+  await app.waitFor("id:runner-name");
+  expect(app.shows("id:add-runner")).toBe(true);
+  expect(app.shows("text:You'll get its token once, with the steps to start it.")).toBe(true);
 });
