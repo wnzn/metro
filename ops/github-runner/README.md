@@ -14,11 +14,7 @@ GitHub-hosted Windows and macOS jobs aren't affected.
 > - the manual workflow: `b9934f1`.
 >
 > Nobody has yet recorded the runner online in GitHub, running a job, then
-> showing offline after `down`. Two setup choices are still open:
->
-> - the repository's fork pull request approval policy (see
->   [Who can run jobs on it](#who-can-run-jobs-on-it));
-> - how to handle the host's inode limit (see [Prerequisites](#prerequisites)).
+> showing offline after `down`.
 
 ## What it is, and what it isn't
 
@@ -47,10 +43,26 @@ GitHub-hosted Windows and macOS jobs aren't affected.
   which the proxy doesn't allow. GitHub's documentation lists that storage
   for job summaries and logs too. Whether a job's logs still reach GitHub
   through this proxy is part of the pending live check.
-- **Each job starts clean.** Only the registration is kept, in the Docker
-  volume `metro-ci-runner-state`. The runner program, the work folder,
-  `HOME` and `/tmp` are recreated at every start, and they're cleaned before
-  and after every job.
+- **A persistent runner, not a fresh machine per job.** Jobs run one after
+  another in the same container, as the same user (UID 1001), for as long
+  as it runs.
+  - **When the container starts,** the runner program is copied fresh from
+    the read-only image, and `HOME` and `/tmp` start empty.
+  - **Around each job,** two hooks delete files:
+    - *before the job:* the contents of `HOME`, `/tmp` and the tool cache
+      (`_work/_tool`);
+    - *after the job:* the contents of the whole work folder, `HOME` and
+      `/tmp`.
+  - **What persists between jobs, until the container restarts:**
+    - processes a job leaves running;
+    - changes to the runner's own writable copy of its program.
+
+    Nothing is reset per job beyond those hook deletions.
+  - **A job can read the runner's registration credentials.** They're in
+    the `metro-ci-runner-state` volume, which this user can read. A job
+    could use them to act as this runner.
+
+  So run only code you trust on it.
 
 ## Prerequisites
 
@@ -67,10 +79,13 @@ GitHub-hosted Windows and macOS jobs aren't affected.
   a pinned `snapshot.ubuntu.com` date, the base images from Docker Hub, and
   the actions runner and NSH archives from GitHub. Each is checked by digest
   or SHA-256.
-- **Free disk and inodes** where Docker keeps its data. **Open:** this host
-  has run out of inodes on a tmpfs before, and how to handle that here is
-  still to be decided. Check `df -h` and `df -i` for Docker's data folder
-  first.
+- **A local Docker daemon.** The helper refuses unless the Docker context
+  is a local `unix://` socket, so a token can never go to another machine's
+  daemon.
+- **Free disk space and inodes** for Docker's data. If a build or start
+  fails with "no space left on device" while `df -h` shows free space, you
+  may be out of inodes. Check them with `df -i /tmp` and
+  `df -i "$(docker info --format '{{.DockerRootDir}}')"`.
 - **The repository setting** that `setup` checks
   ([below](#who-can-run-jobs-on-it)).
 
@@ -96,13 +111,16 @@ ops/github-runner/runner.sh status
    There's nothing to paste.
 
 Running `setup` again is safe. It reports that the runner is already
-registered, or explains what to fix.
+registered (checked by the GitHub runner id stored locally), or explains
+what to fix. It never replaces or deletes a runner. If GitHub already lists
+a runner with this machine's name but this installation has no
+registration for it, `setup` stops. See [Lost registration](#lost-registration).
 
 `status` shows:
 
 - the local registration;
-- what GitHub reports for this runner: online or offline, busy, and its
-  labels;
+- what GitHub reports for the runner with exactly that stored id: online or
+  offline, busy, and its labels;
 - the Compose containers.
 
 It never prints a token or a credential.
@@ -123,9 +141,9 @@ ops/github-runner/runner.sh status
 - **A running job is interrupted.** Stopping waits up to 2 minutes for the
   runner to shut down. A job that's still running then fails or is
   cancelled.
-- **Don't use `down -v`.** It deletes the local registration, but the runner
-  stays registered on GitHub. If that happens, run `runner.sh remove`, then
-  `setup`.
+- **Don't use `down -v`.** It deletes the local registration, but the
+  runner stays registered on GitHub, and this installation can no longer
+  remove it ([Lost registration](#lost-registration)).
 
 ## Run the workflow
 
@@ -156,16 +174,29 @@ docker volume rm metro-ci-runner-state     # optional: remove's work left it emp
 `remove`:
 
 1. Stops the runner.
-2. Deregisters it with a short-lived removal token from your `gh` login,
-   passed the same way as at setup.
+2. Deregisters exactly the GitHub runner whose id is in the local
+   registration, and only if GitHub still shows it with this name and the
+   `metro-ci-linux-x64` label. It uses a short-lived removal token from your
+   `gh` login, passed the same way as at setup.
 3. Deletes the local registration.
 
-It also cleans up a half-finished state. If only GitHub knows the runner, it
-deletes that one runner, and only if it carries the `metro-ci-linux-x64`
-label. Running it again is safe.
+If GitHub no longer has that runner, `remove` only forgets the local
+registration. Running it again is safe.
 
-If this host is gone, a repository admin can remove the runner on GitHub
-under **Settings → Actions → Runners**.
+### Lost registration
+
+Without a local registration (the volume was deleted, or the host is gone),
+`remove` deletes nothing on GitHub. It never deletes a runner by its name
+alone, because a cloned machine can have the same name. If GitHub still
+lists a runner with this machine's name, `remove` says so.
+
+A repository admin then decides under **Settings → Actions → Runners**:
+
+1. Open the runner and check its labels, its status and when it was last
+   seen.
+2. Delete it only if it's really the lost one.
+
+After that, `setup` can register again.
 
 ## Who can run jobs on it
 
@@ -176,9 +207,12 @@ requires **Settings → Actions → General → Approval for running fork pull
 request workflows from contributors → Require approval for all external
 contributors** (`all_external_contributors`), and refuses otherwise.
 
-**Pending JM's decision:** keep that setting, or use a different access
-model. Only the setting above is implemented today. There's no variant that
-limits the runner to a selected group of workflows.
+That approval is the safeguard. **Never approve a fork's workflow run that
+targets `metro-ci-linux-x64`**, or that changes workflow files, unless
+you've read it and trust it. Approving it runs that code on this runner,
+with the access described [above](#what-it-is-and-what-it-isnt). This is
+the only access model the helper supports. There's no variant that limits
+the runner to a selected group of workflows.
 
 ## Keeping it current
 
