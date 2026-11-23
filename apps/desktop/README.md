@@ -204,18 +204,25 @@ private folder on this computer, per Space, while Metro is open.
   System One**, never as an `@agent` its sender typed. The app never sends
   `addressed_by`; only the server sets it.
 - **Search** (the box at the top of the window; <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>K</kbd>
-  focuses it): typing sends nothing, and **Return** runs the search. The
+  focuses it): **Return** runs the full search. The
   Search page has two modes, **Conversations** (messages you can read) and
   **Documents & media** (your indexed files), and no second query field.
   A result opens your Chat, or the room or thread it came from, if you're
   still a member. Results show no raw scores.
-  *In development, not in the app yet:* quick search as you type. After
-  a short pause, it sends a literal lookup to your Metro server only (no
-  indexing, embedding, reranking or model). It shows a bounded, scrollable
-  list of matching messages and files (with file names and extensions)
-  from your personal Chat and library and the Spaces you can access now.
-  Choosing one opens it, and **More results** opens full search with the
-  query. **Return** with nothing chosen still runs full semantic search.
+  **Quick results:** about 220 ms after you stop typing, the app sends a
+  literal lookup to your Metro server only (`POST /v1/search/quick`). It
+  doesn't index, embed, rerank or call a model.
+  - Up to 8 suggestions show in a scrollable list: messages, with a
+    snippet, and file names with their extensions.
+  - Suggestions come only from what you can read now: your personal Chat
+    and library, and your current Spaces, threads included. On Search and
+    Library they follow that page's mode and scope.
+  - Choosing a suggestion opens it, with access checked again.
+  - **More results**, always last, opens full Search with the query and
+    runs it. **Return** with nothing chosen runs the full search.
+  - A query over 200 characters gets no quick lookup, but Return still
+    works.
+  - See [system-one.md](../../docs/system-one.md#quick-results-as-you-type).
 - **Library** (sidebar): your personal library and the files of Spaces
   you're in. **Upload**, then **Open** on each row. The row's **More** menu
   holds **Index** (or **Index again**), and **Delete…** for the uploader or
@@ -230,8 +237,10 @@ private folder on this computer, per Space, while Metro is open.
 
 Chat, Search, Library and Scheduled tasks are your own pages, outside every
 Space, and work with or without any Space. The entries above describe the
-current source after 0.2.0, which isn't released. Return-only search with
-its scope and type filters, folded zero-similarity results, the Library
+current source after 0.2.0, which isn't released. Quick results are
+covered by automated tests, with no native check recorded yet. Before they
+were added, native runs checked the full search's Return behaviour with its
+scope and type filters, folded zero-similarity results, the Library
 page, the media model in Settings, scheduled-task cards with the History
 menu, the routing badge's percentage, the account row, and Chat's **New
 task** form were checked in a native Linux GTK run, in dark and light themes,

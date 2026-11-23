@@ -454,6 +454,7 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 | Action | What is sent | To whom |
 | --- | --- | --- |
 | Upload, list, read metadata, download, delete | **Nothing**, to any model | No model. A download goes only to you, after the access check. |
+| **Quick results** while you type (file names only) | Your typed text, to your **Metro server** only | No model or connection. The server matches file names it already holds. A file row's preview is read back to you through the same access check. |
 | **Index** (you press it, for files you can read now) | The **whole original file** | Your chosen media connection, for that file's own destination (none for a personal file, its Space otherwise) |
 | **Search** files you've already indexed | Your **query text** | Your chosen media connection, for each destination searched |
 | Search, with a System One connection chosen | At most 10 **document text excerpts** (at most 1,000 characters each) and your query, one pair per call, each sent for its own source | Your System One connection |
@@ -483,18 +484,20 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 > below). You choose the media model in **Settings ›
 > Model providers › Documents & media** (**Index and search with**, then
 > **Save**). There you'll also find **Where your files go**. To search files, type in the search box at the
-> top of the window (on the Library page it searches documents and media)
-> and press **Return**, or choose **Documents & media** in Search. Typing
-> sends nothing, and only Return runs the search. (A quick search as you
-> type is in development and not in the app yet. As planned, it sends only
-> a literal lookup to your Metro server, never to a
-> model, and **Return** still runs this search. See
-> [system-one.md](system-one.md#semantic-search).) Results show no raw
-> scores, and matches with no measurable similarity are folded away.
-> The Library page, the media model in Settings, and Return-only search
-> with its scope and type filters were checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. It isn't a release,
-> and Windows and macOS weren't checked. The Delete confirmation is covered
-> by automated tests.
+> top of the window (on the Library page it searches documents and media).
+> While you type, [quick results](system-one.md#quick-results-as-you-type)
+> match file **names** and extensions, indexed or not, through a literal
+> lookup on your Metro server. It never looks inside a file and never calls a
+> model. Press **Return**, or choose **More results**, to run the full
+> search by content below, or choose **Documents & media** in Search.
+> Results show no raw scores, and matches with no measurable similarity are
+> folded away.
+>
+> The Library page, the media model in Settings, and the full search with
+> its scope and type filters were checked in a native Linux GTK run, in dark
+> and light themes, of the source after 0.2.0, before quick results were
+> added. It isn't a release, and Windows and macOS weren't checked. The
+> Delete confirmation and quick results are covered by automated tests.
 
 The screenshots below are historical: they show the 0.2.0-era layout, where
 files and the media model were under Search. They're native Linux captures,

@@ -250,13 +250,12 @@ message search doesn't change.
 
    `partial: true`, with a `notice`, means not everything was searched yet.
 
-**In the desktop app** (current source after 0.2.0, not released). Return-only
-search, the scope chips and the folded **Less relevant** results were
-checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. The keyboard shortcut is covered by automated tests. Type
-in the search box at the
-top of the window (<kbd>Ctrl</kbd>+<kbd>K</kbd>, or <kbd>⌘</kbd>+<kbd>K</kbd>
-on macOS, focuses it) and press **Return**. Typing or changing a filter
-sends nothing. Only Return runs the search. Search opens in
+**In the desktop app** (current source after 0.2.0, not released). Type in
+the search box at the top of the window (<kbd>Ctrl</kbd>+<kbd>K</kbd>, or
+<kbd>⌘</kbd>+<kbd>K</kbd> on macOS, focuses it). While you type, [quick
+results](#quick-results-as-you-type) appear under it. Press **Return**, or
+choose **More results**, to run the full search described here. Changing a
+filter doesn't run it. Search opens in
 **Conversations** mode. Pick where to search with the **In** chips:
 **Everything**, **Personal Chat**, or one of your Spaces. The
 **Documents & media** mode searches your files instead
@@ -275,21 +274,56 @@ sends nothing. Only Return runs the search. Search opens in
     notice says why.
 - When the search is partial, the app says so and offers **Index more**.
 
-**Quick search as you type: in development.** It isn't in the app yet and
-hasn't been verified. As planned:
+Earlier native GTK runs of the source after 0.2.0, before quick results
+were added, checked the full search's Return behaviour, the scope chips and
+the folded **Less relevant** results. The keyboard shortcut is covered by
+automated tests.
 
-- After a short pause in typing, the app sends a **literal** (exact-text)
-  lookup of what you typed to your Metro server. It doesn't index, embed,
-  rerank or call any model, and nothing goes to a connection.
-- Suggestions appear in a bounded, scrollable list under the search box.
-  They cover only what you can read at that moment: your personal Chat and
-  library, and the Spaces you're a member of. Files show their name and
-  extension.
-- Choosing a suggestion opens that message or file. **More results**, at
-  the end of the list, opens full search with your query. **Return** with
-  no suggestion chosen still runs the full semantic search described here.
+#### Quick results as you type
 
-Until it ships, typing sends nothing, as described above.
+This describes the current source after 0.2.0. It isn't released. It's
+covered by automated tests, but no native GTK check of it is recorded yet.
+
+- About 220 ms after you stop typing, the app sends what you typed to your
+  Metro server (`POST /v1/search/quick`) as a **literal** lookup: a
+  substring match, case-insensitive for ASCII letters only. Nothing is
+  embedded, indexed or reranked, and nothing goes to any model or
+  connection. It works without an embeddings or media connection.
+- It matches:
+  - the text of people's messages and the agent's final replies in your
+    personal Chat, and in the rooms and threads of Spaces you're a member
+    of now;
+  - the **names** (and so the extensions) of files in your personal library
+    and in those Spaces' libraries, indexed or not.
+- It never looks inside files. Text or a file name containing a Metro
+  credential prefix never matches.
+- Each conversation is looked up over its 10,000 most recent messages, in at
+  most 100 rooms and threads, the most recently active first. Use full
+  search for anything older.
+- It shows at most 8 suggestions in a scrollable list under the box:
+  - a message shows a snippet around the match and where it is;
+  - a file shows its name with its extension. A file row may show a small
+    preview, which the app reads from the file through your Metro session.
+    It isn't sent to a model.
+- Where it looks follows the page you're on:
+  - in Search, the mode and scope you picked;
+  - in Library, files only, within the Library's scope;
+  - anywhere else, files and messages across everything you can read.
+
+  It never widens a page's filters.
+- **Choosing a suggestion** opens that message or file. Your access is
+  checked again when it opens.
+- **More results**, always the last row, opens full Search with your query
+  and runs it.
+- **Return** with no suggestion chosen runs the full search.
+- A query longer than 200 characters gets no quick lookup. Return still
+  runs the full search, which takes up to 1,000.
+- Editing the query, leaving the box, changing the scope, losing a Space or
+  signing out drops any answer still on its way. Suggestions from a Space
+  you've left are never shown.
+
+Only the full search sends your query to your embeddings connection (and
+a shortlist to System One), as described above. Quick results don't.
 
 The [screenshot](screenshots/semantic-search.png) is historical: it shows
 the 0.2.0-era page, with a query field and button on the page and a score
@@ -319,6 +353,7 @@ unexpected dimension are refused.
 | --- | --- |
 | `POST /v1/search` `{"query", "scope": "chat"\|"space"\|"all", "space_id"?, "limit"?}` | `{"results": [{"space_id", "room_id", "event_id", "actor", "text", "score"}], "ranking", "partial", "notice"?}`. `space_id` is required with `"space"` and refused otherwise. |
 | `POST /v1/search/index` `{"scope", "space_id"?}` | `{"indexed", "skipped", "remaining", "done", "notice"?}`. It indexes the next bounded batch. Call it again until `done`. |
+| `POST /v1/search/quick` `{"query", "scope": "all"\|"chat"\|"personal"\|"space", "space_id"?, "mode": "all"\|"conversations"\|"library", "kind"?: "document"\|"image"\|"audio"\|"video"}` | `{"assets": [Asset], "messages": [{"space_id", "room_id", "event_id", "actor", "text"}]}`, at most 8 in total, with `Cache-Control: no-store`. A literal lookup with no model, described [above](#quick-results-as-you-type). The query is trimmed, and is 1–200 characters. The full contract is in [`crates/server/src/search/API.md`](../crates/server/src/search/API.md#post-v1searchquick). |
 
 A search also indexes a small batch before it ranks, so a small history
 doesn't need `/index`.

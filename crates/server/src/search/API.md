@@ -2,7 +2,8 @@
 
 Lane: `crates/server/src/search.rs`, `crates/server/src/search/**`. This file
 is the agreement the desktop UI codes against. It covers only what the
-module implements.
+module implements, plus the quick lookup at the end, which lives in
+`crates/server/src/quick_search.rs`.
 
 Everything requires a human bearer token (the same `Human` auth as the other
 `/v1/*` routes). Request bodies are JSON and share the 64 KiB human body
@@ -116,3 +117,77 @@ Search uses the caller's own routing preferences
 `classifier_id` (optional). Changing either connection or its model changes
 the fingerprint: old vectors are discarded and indexing restarts; the next
 search reports `partial: true` until it catches up.
+
+## `POST /v1/search/quick`
+
+A literal, model-free lookup for typeahead. It's implemented in
+`crates/server/src/quick_search.rs`, outside this module. Nothing is
+embedded, indexed, cached or sent to a model, and no file bytes are read.
+It needs no embeddings, System One or media connection.
+
+Request:
+
+```json
+{ "query": "deploy", "scope": "all" | "chat" | "personal" | "space", "space_id": "sp_…",
+  "mode": "all" | "conversations" | "library", "kind": "document" | "image" | "audio" | "video" }
+```
+
+- `query`: required. It's trimmed, and must then be 1–200 Unicode
+  characters. Empty or longer → `400`.
+- `scope`: required. It never widens.
+  - `chat`: the personal Chat's messages only.
+  - `personal`: the personal library only.
+  - `space`: one Space's rooms, threads and library. It needs `space_id`.
+  - `all`: all of these.
+- `space_id`: only with `"space"`. It's refused with any other scope
+  (`400`). Missing with `"space"` → `400`. A Space the caller isn't a member
+  of, a Space that doesn't exist, or a malformed id → `404` (`"space not
+  found"`).
+- `mode`: required. `conversations` returns messages only, `library` files
+  only, and `all` both.
+- `kind`: optional. It narrows files to one category: `document` is TXT,
+  Markdown, PDF and DOCX; `image` is PNG and JPEG; `audio` is WAV and MP3;
+  `video` is MP4 and WebM. It's refused with `mode: "conversations"`
+  (`400`).
+- Unknown fields are refused. A malformed JSON body gets the JSON
+  extractor's own status, with its message.
+
+Matching:
+
+- The query is a plain substring. It's case-insensitive for ASCII only, and
+  `%`, `_` and `\` are matched literally.
+- **Messages:** only `message` and `agent` events in the caller's own
+  personal Chat, and in the rooms and threads of Spaces they're a member of
+  at the time of the request.
+  - Each conversation is searched over its 10,000 most recent messages.
+  - At most 100 readable rooms and threads are searched, the most recently
+    active first.
+- **Files:** library asset **names**, and so their extensions, that the
+  caller may read now: their personal library and their Spaces' libraries.
+  Unindexed files match too. File contents are never matched.
+- Text or a file name that contains a Metro credential prefix (`metro_rt_`,
+  `metro_pc_`, or the managed-account token prefix) never matches. It's
+  excluded in SQL before any limit is applied.
+- Visibility is checked in the same SQL statement that returns each row.
+  The whole lookup runs under one hold of the database lock, so every row
+  reflects the same moment.
+
+Response `200`, with `Cache-Control: no-store`:
+
+```json
+{
+  "assets": [Asset],                 // the library's Asset shape (docs/library.md), newest first
+  "messages": [
+    { "space_id": null, "room_id": null, "event_id": 42, "actor": "alice", "text": "…" }
+  ]                                  // newest first; null ids mean the personal Chat
+}
+```
+
+- At most **8** results, messages and files together. When both match, each
+  kind keeps up to 4 if the other has more than 4.
+- A message's `text` is a snippet of at most 160 characters around its
+  first match, with whitespace flattened and `…` where it was cut.
+
+The desktop sends this about 220 ms after the last keystroke, for queries of
+200 characters or fewer. Return and **More results** call `POST /v1/search`
+or `POST /v1/library/search`, never this route.
