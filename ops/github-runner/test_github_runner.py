@@ -27,7 +27,9 @@ class Dockerfile(unittest.TestCase):
     text = (HERE / "Dockerfile").read_text(encoding="utf-8")
 
     def test_pinned_inputs(self):
-        self.assertRegex(self.text, r"(?m)^FROM ubuntu:24\.04@sha256:[0-9a-f]{64}$")
+        self.assertRegex(self.text, r"(?m)^FROM docker\.io/library/ubuntu:24\.04@sha256:[0-9a-f]{64}$")
+        for line in re.findall(r"(?m)^FROM \S+", self.text):
+            self.assertRegex(line, r"@sha256:[0-9a-f]{64}$")
         self.assertIn("ARG RUNNER_VERSION=2.338.2\n", self.text)
         self.assertIn("ARG RUNNER_SHA256=baebf204307bac6193480852732f0aba2ae97b6c5597c244f4d5558390147c40\n", self.text)
         ci = (REPO / ".github/workflows/ci.yml").read_text(encoding="utf-8")
@@ -35,7 +37,10 @@ class Dockerfile(unittest.TestCase):
         self.assertIn(f"ARG NSH_SHA256={nsh}\n", self.text)
         self.assertIn("ARG NSH_VERSION=v0.6.1\n", self.text)
         self.assertEqual(self.text.count("sha256sum --check -"), 2)
-        self.assertRegex(self.text, r'--snapshot "\$UBUNTU_SNAPSHOT"')
+        self.assertIn("URIs: https://snapshot.ubuntu.com/ubuntu/${UBUNTU_SNAPSHOT}/", self.text)
+        self.assertIn("Acquire::https::Verify-Peer=true", self.text)
+        for weak in ("Verify-Peer=false", "AllowInsecure", "allow-unauthenticated", "trusted=yes", "Check-Valid-Until=false"):
+            self.assertNotIn(weak, self.text)
 
     def test_nsh_is_first_on_path_for_the_self_hosted_workflow(self):
         # .github/workflows/self-hosted-ci.yml resolves `nsh` from PATH and checks its hash.
