@@ -68,7 +68,13 @@
 //! Errors from [`models`] and [`complete`] reach Metro (and the local log)
 //! as fixed recovery text. The adapter can classify known machine-readable
 //! fields, but never reports provider text, IDs or request contents.
+//!
+//! Under that text the error carries a [`LocalFailure`] for the device's own
+//! log: operation, phase, numeric HTTP status and allowlisted provider code
+//! and parameter, nothing else. Read it with [`local_failure`]. Metro's job
+//! result uses only the fixed text.
 
+mod diagnostic;
 mod flow;
 mod http;
 mod loopback;
@@ -82,6 +88,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
+pub use diagnostic::{LocalFailure, Operation, Phase, UNRECOGNIZED, local_failure};
 pub use flow::LogoutOutcome;
 
 /// `agent_name_hint` sent on first registration. It's also the display name in
@@ -322,7 +329,7 @@ pub async fn model_catalog(
 ) -> anyhow::Result<Vec<ModelInfo>> {
     flow::model_catalog(profile, endpoints)
         .await
-        .map_err(for_metro)
+        .map_err(|e| for_metro(Operation::Catalog, e))
 }
 
 /// Runs one Chat Completions request through the Responses API on the user's
@@ -341,25 +348,35 @@ pub async fn complete_with(
 ) -> anyhow::Result<serde_json::Value> {
     flow::complete(profile, endpoints, request)
         .await
-        .map_err(for_metro)
+        .map_err(|e| for_metro(Operation::Inference, e))
 }
 
 /// Errors returned from [`models`] and [`complete`], which the connector
 /// reports to Metro. Discard the cause here: the same error is also logged
 /// locally, and redacting credential shapes isn't enough to remove prompts,
-/// arbitrary fields, or personal information.
-fn for_metro(e: anyhow::Error) -> anyhow::Error {
-    let safe = e
-        .downcast_ref::<crate::SafeError>()
-        .cloned()
-        .unwrap_or_else(|| {
-            let category = e
-                .downcast_ref::<http::Category>()
-                .copied()
-                .unwrap_or(http::Category::UnexpectedResponse);
-            crate::SafeError::new(category.user_text())
-        });
-    safe.into()
+/// arbitrary fields, or personal information. What's kept is the fixed
+/// `SafeError` and, under it, the allowlisted [`LocalFailure`].
+fn for_metro(operation: Operation, e: anyhow::Error) -> anyhow::Error {
+    let category = e.downcast_ref::<http::Category>().copied();
+    let own_safe = e.downcast_ref::<crate::SafeError>().cloned();
+    let safe = own_safe.clone().unwrap_or_else(|| {
+        crate::SafeError::new(
+            category
+                .unwrap_or(http::Category::UnexpectedResponse)
+                .user_text(),
+        )
+    });
+    let outcome = match (category, own_safe) {
+        (Some(c), _) => c,
+        (None, Some(_)) => http::Category::Other,
+        (None, None) => http::Category::UnexpectedResponse,
+    };
+    let local = LocalFailure::new(
+        operation,
+        e.downcast_ref::<diagnostic::Detail>().copied(),
+        outcome,
+    );
+    anyhow::Error::new(local).context(safe)
 }
 
 /// The local sign-in state. It reads no tokens out and makes no network calls.

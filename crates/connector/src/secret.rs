@@ -92,6 +92,11 @@ pub fn clean_line(s: &str, max: usize) -> String {
 /// The message sent to Metro for an error: the `SafeError` text if the chain
 /// holds one, else a generic message.
 pub fn metro_error_text(err: &anyhow::Error) -> String {
+    // A SafeError added as context is found only by `downcast_ref` on the
+    // error itself; one at the root, also through the chain.
+    if let Some(safe) = err.downcast_ref::<SafeError>() {
+        return safe.0.clone();
+    }
     for cause in err.chain() {
         if let Some(safe) = cause.downcast_ref::<SafeError>() {
             return safe.0.clone();

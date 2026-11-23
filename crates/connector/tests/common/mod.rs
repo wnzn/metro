@@ -352,6 +352,11 @@ pub async fn responses(State(s): State<S>, h: HeaderMap, body: String) -> Respon
                 json!({"error": {"code": "model_not_found", "param": "model", "message": "SENSITIVE-MODEL"}}),
             );
         }
+        // Drop the connection before any response: a transport failure.
+        "drop" => {
+            drop(fx);
+            panic!("fixture drops the connection");
+        }
         "non_sse" => return ([(header::CONTENT_TYPE, "text/html")], "SENSITIVE").into_response(),
         "reasoning" => {
             return leak(
@@ -417,6 +422,10 @@ pub async fn responses(State(s): State<S>, h: HeaderMap, body: String) -> Respon
             json!({"type": "response.failed", "response": {"id": "resp_SENSITIVE", "error": {"code": "subscription_sharing_usage_limit_exceeded", "message": "SENSITIVE limit text"}}}),
         ],
         "truncated" => vec![json!({"type": "response.output_text.delta", "delta": "Hel"})],
+        "stream_unknown" => vec![
+            json!({"type": "response.failed", "response": {"id": "resp_SENSITIVE",
+            "error": {"code": "SENSITIVE_unknown_code", "param": "SENSITIVE", "message": "SENSITIVE"}}}),
+        ],
         "flat_error" => vec![json!({"type": "error", "sequence_number": 7,
             "code": "context_length_exceeded", "param": "input", "message": "SENSITIVE prompt text"})],
         "incomplete" => vec![json!({"type": "response.incomplete", "response": {

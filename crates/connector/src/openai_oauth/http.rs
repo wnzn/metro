@@ -7,6 +7,7 @@ use serde_json::Value;
 use url::Url;
 
 use super::Endpoints;
+use super::diagnostic::{Detail, Phase, mark};
 
 pub(crate) const MAX_JSON: usize = 4 << 20;
 
@@ -34,9 +35,38 @@ pub(crate) enum Category {
     UnexpectedResponse,
     Rejected,
     Unavailable,
+    /// Inference answered 503 with no documented code: the service is down,
+    /// or direct plan routing isn't enabled. The status alone can't tell.
+    ServiceOrRouting,
+    /// Not a category of its own: the failure carried its own fixed
+    /// `SafeError` text. Used only for the local diagnostic token.
+    Other,
 }
 
 impl Category {
+    pub(crate) const ALL: [Category; 20] = [
+        Category::SignIn,
+        Category::Registration,
+        Category::Route,
+        Category::Storage,
+        Category::Refresh,
+        Category::Consent,
+        Category::PlanNotAvailable,
+        Category::UsageLimit,
+        Category::Unsupported,
+        Category::Model,
+        Category::ReasoningEffort,
+        Category::ContextLength,
+        Category::ContentFilter,
+        Category::Incomplete,
+        Category::Interrupted,
+        Category::UnexpectedResponse,
+        Category::Rejected,
+        Category::Unavailable,
+        Category::ServiceOrRouting,
+        Category::Other,
+    ];
+
     /// At most 200 characters (`MAX_SAFE_ERROR`).
     pub(crate) fn user_text(self) -> &'static str {
         match self {
@@ -99,6 +129,39 @@ impl Category {
                 "OpenAI couldn't be reached from the device or is temporarily unavailable. Try \
                  again later."
             }
+            Category::ServiceOrRouting => {
+                "OpenAI's ChatGPT plan service is unavailable, or direct plan routing isn't enabled \
+                 for this connection. Try again later; if it continues, check ChatGPT plan usage."
+            }
+            Category::Other => {
+                "The ChatGPT request failed on this device. Try again; if it keeps failing, update Metro."
+            }
+        }
+    }
+
+    /// A stable token for device-local diagnostics.
+    pub(crate) fn code(self) -> &'static str {
+        match self {
+            Category::SignIn => "chatgpt_sign_in",
+            Category::Registration => "chatgpt_registration",
+            Category::Route => "chatgpt_route",
+            Category::Storage => "chatgpt_storage",
+            Category::Refresh => "chatgpt_refresh",
+            Category::Consent => "chatgpt_consent",
+            Category::PlanNotAvailable => "chatgpt_plan_not_available",
+            Category::UsageLimit => "chatgpt_usage_limit",
+            Category::Unsupported => "chatgpt_unsupported",
+            Category::Model => "chatgpt_model",
+            Category::ReasoningEffort => "chatgpt_reasoning_effort",
+            Category::ContextLength => "chatgpt_context_length",
+            Category::ContentFilter => "chatgpt_content_filter",
+            Category::Incomplete => "chatgpt_incomplete",
+            Category::Interrupted => "chatgpt_interrupted",
+            Category::UnexpectedResponse => "chatgpt_unexpected_response",
+            Category::Rejected => "chatgpt_rejected",
+            Category::Unavailable => "chatgpt_unavailable",
+            Category::ServiceOrRouting => "chatgpt_service_or_routing_unavailable",
+            Category::Other => "chatgpt_failed",
         }
     }
 }
@@ -244,9 +307,12 @@ pub(crate) fn net(e: reqwest::Error) -> anyhow::Error {
     } else {
         "request failed"
     };
-    tagged(
-        anyhow!("network error: {kind}"),
-        Some(Category::Unavailable),
+    mark(
+        tagged(
+            anyhow!("network error: {kind}"),
+            Some(Category::Unavailable),
+        ),
+        Detail::phase(Phase::Transport),
     )
 }
 
@@ -281,7 +347,26 @@ impl Failure {
     }
 
     pub fn error(&self, what: &str) -> anyhow::Error {
-        tagged(anyhow!(self.describe(what)), self.category())
+        mark(
+            tagged(anyhow!(self.describe(what)), self.category()),
+            self.detail(Phase::Http),
+        )
+    }
+
+    /// The allowlisted facts of this failure.
+    pub fn detail(&self, phase: Phase) -> Detail {
+        Detail::http(
+            phase,
+            self.status,
+            self.code.as_deref(),
+            self.param.as_deref(),
+        )
+    }
+
+    /// The category from a documented code alone, ignoring the status.
+    pub fn code_category(&self) -> Option<Category> {
+        self.code.as_deref()?;
+        categorize(None, self.code.as_deref(), self.param.as_deref())
     }
 
     pub fn category(&self) -> Option<Category> {
@@ -353,6 +438,8 @@ mod tests {
             UnexpectedResponse,
             Rejected,
             Unavailable,
+            ServiceOrRouting,
+            Other,
         ] {
             let t = c.user_text();
             assert!(t.chars().count() <= 200, "{c}: {}", t.chars().count());

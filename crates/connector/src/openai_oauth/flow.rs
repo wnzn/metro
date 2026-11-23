@@ -7,6 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use super::diagnostic::{Detail, Phase, mark};
 use super::http::{self, Category, Failure, MAX_JSON, form, pct, tagged};
 use super::loopback::Loopback;
 use super::oidc::{self, Discovery};
@@ -410,7 +411,8 @@ async fn token_request(
         let bytes = http::read_bounded(resp, MAX_JSON).await.unwrap_or_default();
         let f = Failure::parse(status.as_u16(), &bytes);
         let description = f.describe(what);
-        return Err(TokenError(f)).context(description);
+        let detail = f.detail(Phase::Http);
+        return Err(TokenError(f)).context(description).context(detail);
     }
     let bytes = http::read_bounded(resp, MAX_JSON).await?;
     serde_json::from_slice(&bytes).map_err(|_| anyhow!("{what}: token response is malformed"))
@@ -440,8 +442,20 @@ const UNUSABLE_REFRESH: &[&str] = &[
 ];
 
 /// A usable access token, refreshed under the profile lock when it's near
-/// expiry.
+/// expiry. Every failure here is the local session's, whatever HTTP status
+/// a refresh met.
 async fn access(dir: &Path, ep: &Endpoints) -> Result<(Account, Tokens)> {
+    access_inner(dir, ep).await.map_err(|e| {
+        let inner = e.downcast_ref::<Detail>().copied();
+        let d = Detail {
+            phase: Phase::Session,
+            ..inner.unwrap_or(Detail::phase(Phase::Session))
+        };
+        e.context(d)
+    })
+}
+
+async fn access_inner(dir: &Path, ep: &Endpoints) -> Result<(Account, Tokens)> {
     http::check_endpoints(ep)?;
     let profile = Profile::open(dir, false)
         .context(Category::Storage)?
@@ -673,13 +687,14 @@ pub(crate) async fn model_catalog(dir: &Path, ep: &Endpoints) -> Result<Vec<Mode
         let body = http::read_bounded(resp, MAX_JSON).await.unwrap_or_default();
         return Err(Failure::parse(status.as_u16(), &body).error("model list"));
     }
-    let body = http::read_bounded(resp, MAX_JSON).await?;
-    let v: Value =
-        serde_json::from_slice(&body).map_err(|_| anyhow!("model list response is malformed"))?;
+    let shape = |e: anyhow::Error| mark(e, Detail::http(Phase::Http, status.as_u16(), None, None));
+    let body = http::read_bounded(resp, MAX_JSON).await.map_err(shape)?;
+    let v: Value = serde_json::from_slice(&body)
+        .map_err(|_| shape(anyhow!("model list response is malformed")))?;
     let models = v
         .get("models")
         .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("model list response has no `models` array"))?;
+        .ok_or_else(|| shape(anyhow!("model list response has no `models` array")))?;
     Ok(models
         .iter()
         .filter(|m| m.get("visibility").and_then(Value::as_str) == Some("list"))
@@ -698,8 +713,12 @@ pub(crate) async fn model_catalog(dir: &Path, ep: &Endpoints) -> Result<Vec<Mode
 pub(crate) async fn complete(dir: &Path, ep: &Endpoints, request: Value) -> Result<Value> {
     // Translate first, so an unsupported request never touches the network or
     // the refresh path.
-    let body =
-        translate::to_responses(&request).map_err(|e| tagged(e, Some(Category::Unsupported)))?;
+    let body = translate::to_responses(&request).map_err(|e| {
+        mark(
+            tagged(e, Some(Category::Unsupported)),
+            Detail::phase(Phase::Translation),
+        )
+    })?;
     let (_, tokens) = access(dir, ep).await?;
     let client = http::client_for(ep)?;
     let resp = client
@@ -716,7 +735,20 @@ pub(crate) async fn complete(dir: &Path, ep: &Endpoints, request: Value) -> Resu
         let bytes = http::read_bounded(resp, 64 * 1024)
             .await
             .unwrap_or_default();
-        return Err(Failure::parse(status.as_u16(), &bytes).error("Responses request"));
+        let failure = Failure::parse(status.as_u16(), &bytes);
+        // Without a documented code, a 503 is either the service being down
+        // or direct plan routing not being enabled; neither is the device's
+        // network, and neither is a permanent rejection.
+        if failure.status == 503 && failure.code_category().is_none() {
+            return Err(mark(
+                tagged(
+                    anyhow!("{}", failure.describe("Responses request")),
+                    Some(Category::ServiceOrRouting),
+                ),
+                failure.detail(Phase::Http),
+            ));
+        }
+        return Err(failure.error("Responses request"));
     }
     let media_type = resp
         .headers()
@@ -733,8 +765,14 @@ pub(crate) async fn complete(dir: &Path, ep: &Endpoints, request: Value) -> Resu
                 return Err(failure.error("Responses request"));
             }
         }
-        bail!("Responses did not return an event stream");
+        return Err(mark(
+            anyhow!("Responses did not return an event stream"),
+            Detail::http(Phase::Http, status.as_u16(), None, None),
+        ));
     }
-    let completed = sse::collect(resp, sse::Limits::default()).await?;
+    let completed = sse::collect(resp, sse::Limits::default())
+        .await
+        .map_err(|e| mark(e, Detail::phase(Phase::Stream)))?;
     translate::to_chat_completion(&completed)
+        .map_err(|e| mark(e, Detail::phase(Phase::Translation)))
 }

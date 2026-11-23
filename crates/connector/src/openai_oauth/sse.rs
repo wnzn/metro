@@ -10,6 +10,7 @@ use anyhow::{Result, anyhow};
 use serde_json::Value;
 use tokio::time::Instant;
 
+use super::diagnostic::{Detail, Phase, mark};
 use super::http::{self, Category, categorize, error_code, tagged};
 
 #[derive(Clone, Copy, Debug)]
@@ -242,12 +243,17 @@ fn too_large() -> anyhow::Error {
 
 /// A mid-stream error has no separate HTTP status; inspect machine fields only.
 fn stream_error(e: &Value) -> anyhow::Error {
-    tagged(
-        anyhow!("Responses stream reported a failure"),
-        Some(
-            categorize(None, error_code(e), e.get("param").and_then(Value::as_str))
-                .unwrap_or(Category::Rejected),
+    let code = error_code(e);
+    let param = e.get("param").and_then(Value::as_str);
+    let mut detail = Detail::phase(Phase::Stream);
+    detail.code = super::diagnostic::provider_code(code);
+    detail.param = super::diagnostic::param(param);
+    mark(
+        tagged(
+            anyhow!("Responses stream reported a failure"),
+            Some(categorize(None, code, param).unwrap_or(Category::Rejected)),
         ),
+        detail,
     )
 }
 

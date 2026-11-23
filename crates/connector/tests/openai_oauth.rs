@@ -564,34 +564,223 @@ async fn metro_sees_only_fixed_error_categories() {
     let e = oa::complete_with(&f.profile, &f.ep, r).await.unwrap_err();
     let (metro, local) = metro_and_local(&e);
     assert!(metro.contains("doesn't support"), "{metro}");
-    assert_eq!(local, metro, "no error detail is logged");
+    let d = oa::local_failure(&e).unwrap();
+    assert_eq!(
+        (d.operation(), d.phase(), d.http_status(), d.code()),
+        (
+            oa::Operation::Inference,
+            oa::Phase::Translation,
+            None,
+            "chatgpt_unsupported"
+        )
+    );
+    assert_eq!(
+        local,
+        format!("{metro}: {}", d.summary()),
+        "only the diagnostic is added locally"
+    );
 
-    let cases = [
-        ("limit", "usage limit reached"),
-        ("capability", "doesn't support"),
-        ("reasoning", "rejected the reasoning effort"),
-        ("model_missing", "Refresh the model list"),
-        ("http503", "temporarily unavailable"),
-        ("http403", "isn't available for this connection"),
-        ("http401", "Sign in again on the device"),
-        ("truncated", "ended early or was interrupted"),
-        ("http400", "rejected the ChatGPT request"),
-        ("flat_error", "context limit"),
-        ("incomplete", "shorter answer"),
-        ("filtered", "content filter"),
-        ("bad_completion", "unexpected response"),
-        ("malformed", "unexpected response"),
-        ("non_sse", "unexpected response"),
-        ("hosted", "unexpected response"),
+    use oa::Phase::{Http, Stream, Translation};
+    // Mode, Metro text, then the local diagnostic: phase, status, provider
+    // code, provider param, outcome token.
+    type Want = (
+        &'static str,
+        &'static str,
+        oa::Phase,
+        Option<u16>,
+        Option<&'static str>,
+        Option<&'static str>,
+        &'static str,
+    );
+    let cases: [Want; 16] = [
+        (
+            "limit",
+            "usage limit reached",
+            Stream,
+            None,
+            Some("subscription_sharing_usage_limit_exceeded"),
+            None,
+            "chatgpt_usage_limit",
+        ),
+        (
+            "capability",
+            "doesn't support",
+            Http,
+            Some(400),
+            Some("subscription_sharing_unsupported_capability"),
+            Some(oa::UNRECOGNIZED),
+            "chatgpt_unsupported",
+        ),
+        (
+            "reasoning",
+            "rejected the reasoning effort",
+            Http,
+            Some(400),
+            Some("unsupported_value"),
+            Some("reasoning.effort"),
+            "chatgpt_reasoning_effort",
+        ),
+        (
+            "model_missing",
+            "Refresh the model list",
+            Http,
+            Some(404),
+            Some("model_not_found"),
+            Some("model"),
+            "chatgpt_model",
+        ),
+        (
+            "http503",
+            "direct plan routing isn't enabled",
+            Http,
+            Some(503),
+            None,
+            None,
+            "chatgpt_service_or_routing_unavailable",
+        ),
+        (
+            "http403",
+            "isn't available for this connection",
+            Http,
+            Some(403),
+            None,
+            None,
+            "chatgpt_plan_not_available",
+        ),
+        (
+            "http401",
+            "Sign in again on the device",
+            Http,
+            Some(401),
+            None,
+            None,
+            "chatgpt_sign_in",
+        ),
+        (
+            "truncated",
+            "ended early or was interrupted",
+            Stream,
+            None,
+            None,
+            None,
+            "chatgpt_interrupted",
+        ),
+        (
+            "http400",
+            "rejected the ChatGPT request",
+            Http,
+            Some(400),
+            Some(oa::UNRECOGNIZED),
+            None,
+            "chatgpt_rejected",
+        ),
+        (
+            "flat_error",
+            "context limit",
+            Stream,
+            None,
+            Some("context_length_exceeded"),
+            Some("input"),
+            "chatgpt_context_length",
+        ),
+        (
+            "incomplete",
+            "shorter answer",
+            Stream,
+            None,
+            None,
+            None,
+            "chatgpt_incomplete",
+        ),
+        (
+            "filtered",
+            "content filter",
+            Stream,
+            None,
+            None,
+            None,
+            "chatgpt_content_filter",
+        ),
+        (
+            "bad_completion",
+            "unexpected response",
+            Stream,
+            None,
+            None,
+            None,
+            "chatgpt_unexpected_response",
+        ),
+        (
+            "malformed",
+            "unexpected response",
+            Stream,
+            None,
+            None,
+            None,
+            "chatgpt_unexpected_response",
+        ),
+        (
+            "non_sse",
+            "unexpected response",
+            Http,
+            Some(200),
+            None,
+            None,
+            "chatgpt_unexpected_response",
+        ),
+        (
+            "hosted",
+            "unexpected response",
+            Translation,
+            None,
+            None,
+            None,
+            "chatgpt_unexpected_response",
+        ),
     ];
-    for (mode, want) in cases {
+    for (mode, want, phase, status, code, param, outcome) in cases {
         f.s.lock().unwrap().sse_mode = mode;
         let e = oa::complete_with(&f.profile, &f.ep, tool_request())
             .await
             .unwrap_err();
         let (metro, local) = metro_and_local(&e);
         assert!(metro.contains(want), "{mode}: {metro}");
-        assert_eq!(metro, local, "{mode}");
+        let d = oa::local_failure(&e).unwrap();
+        assert_eq!(
+            (
+                d.operation(),
+                d.phase(),
+                d.http_status(),
+                d.provider_code(),
+                d.provider_param(),
+                d.code()
+            ),
+            (
+                oa::Operation::Inference,
+                phase,
+                status,
+                code,
+                param,
+                outcome
+            ),
+            "{mode}"
+        );
+        assert_eq!(local, format!("{metro}: {}", d.summary()), "{mode}");
+        let stored = serde_json::to_string(&d).unwrap();
+        for leak in [
+            "SENSITIVE",
+            "https://",
+            "example.test",
+            "req_",
+            "resp_",
+            "weird_code",
+            "\"",
+        ] {
+            assert!(!local.contains(leak), "{mode}: {leak:?} logged: {local}");
+            if leak != "\"" {
+                assert!(!stored.contains(leak), "{mode}: {leak:?} stored: {stored}");
+            }
+        }
         for leak in [
             "SENSITIVE",
             "https://",
@@ -617,6 +806,216 @@ async fn metro_sees_only_fixed_error_categories() {
     o.api_base = format!("{}/missing", f.ep.issuer);
     let e = oa::models_with(&f.profile, &o).await.unwrap_err();
     assert!(!metro_and_local(&e).0.contains("missing"));
+    let d = oa::local_failure(&e).unwrap();
+    assert_eq!(
+        (d.operation(), d.phase(), d.http_status()),
+        // A profile refuses endpoints it didn't sign in with.
+        (oa::Operation::Catalog, oa::Phase::Session, None)
+    );
+}
+
+/// The relay body for each failure is exactly `{"ok":false,"error":<fixed
+/// text>}`, as before this diagnostic existed. The one deliberate change is
+/// an inference 503 without a documented code, which no longer claims the
+/// device's network is at fault.
+#[tokio::test]
+async fn relay_error_bodies_are_unchanged_and_carry_no_diagnostic() {
+    let f = fixture(Browser::Approve {
+        sub: "user-1",
+        scope: PLAN_SCOPES,
+    })
+    .await;
+    oa::login_with(&f.profile, opts(&f)).await.unwrap();
+    const REJECTED: &str = "OpenAI rejected the ChatGPT request. Try a new chat with default model settings; if it keeps failing, update Metro.";
+    const UNEXPECTED: &str = "OpenAI returned an unexpected response. Try again; if it keeps failing, update Metro or select another ChatGPT model.";
+    const INTERRUPTED: &str = "The OpenAI response stream ended early or was interrupted. Check this device's connection and try again.";
+    const UNAVAILABLE: &str = "OpenAI couldn't be reached from the device or is temporarily unavailable. Try again later.";
+    const PLAN: &str = "ChatGPT plan usage isn't available for this connection (not approved, or not allowed for the account, workspace or region). Check your ChatGPT account and workspace settings.";
+    const SIGN_IN: &str = "The ChatGPT sign-in for this connection ended or was not accepted. Sign in again on the device.";
+    const LIMIT: &str = "ChatGPT plan usage limit reached. Review it in ChatGPT Settings under Usage. Metro doesn't switch to another billing path.";
+    const ROUTING: &str = "OpenAI's ChatGPT plan service is unavailable, or direct plan routing isn't enabled for this connection. Try again later; if it continues, check ChatGPT plan usage.";
+    for (mode, text) in [
+        ("http400", REJECTED),
+        ("http401", SIGN_IN),
+        ("http403", PLAN),
+        ("limit", LIMIT),
+        ("truncated", INTERRUPTED),
+        ("malformed", UNEXPECTED),
+        ("http503", ROUTING),
+        ("drop", UNAVAILABLE),
+    ] {
+        f.s.lock().unwrap().sse_mode = mode;
+        let e = oa::complete_with(&f.profile, &f.ep, tool_request())
+            .await
+            .unwrap_err();
+        // What `run::handle_job` posts for an error.
+        let body = json!({"ok": false, "error": metro_connector::secret::metro_error_text(&e)});
+        assert_eq!(body, json!({"ok": false, "error": text}), "{mode}");
+        let wire = body.to_string();
+        for token in [
+            "phase",
+            "operation",
+            "http_status",
+            "unrecognized",
+            "chatgpt_",
+            "503",
+            "400",
+        ] {
+            assert!(!wire.contains(token), "{mode}: {token:?} in {wire}");
+        }
+    }
+}
+
+/// Transport, unrecognized 400 and unrecognized stream failures, and an
+/// uncoded 503, all give distinct local diagnostics.
+#[tokio::test]
+async fn transport_503_and_unrecognized_failures_are_distinct() {
+    let f = fixture(Browser::Approve {
+        sub: "user-1",
+        scope: PLAN_SCOPES,
+    })
+    .await;
+    oa::login_with(&f.profile, opts(&f)).await.unwrap();
+    let mut seen = Vec::new();
+    for mode in ["http400", "http503"] {
+        f.s.lock().unwrap().sse_mode = mode;
+        let e = oa::complete_with(&f.profile, &f.ep, tool_request())
+            .await
+            .unwrap_err();
+        seen.push(oa::local_failure(&e).unwrap());
+    }
+    // An unknown mid-stream error code.
+    f.s.lock().unwrap().sse_mode = "stream_unknown";
+    let e = oa::complete_with(&f.profile, &f.ep, tool_request())
+        .await
+        .unwrap_err();
+    seen.push(oa::local_failure(&e).unwrap());
+    // Transport: the API stops answering after sign-in.
+    f.s.lock().unwrap().sse_mode = "drop";
+    let e = oa::complete_with(&f.profile, &f.ep, tool_request())
+        .await
+        .unwrap_err();
+    seen.push(oa::local_failure(&e).unwrap());
+
+    let shape: Vec<_> = seen
+        .iter()
+        .map(|d| (d.phase(), d.http_status(), d.provider_code(), d.code()))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (
+                oa::Phase::Http,
+                Some(400),
+                Some(oa::UNRECOGNIZED),
+                "chatgpt_rejected"
+            ),
+            (
+                oa::Phase::Http,
+                Some(503),
+                None,
+                "chatgpt_service_or_routing_unavailable"
+            ),
+            (
+                oa::Phase::Stream,
+                None,
+                Some(oa::UNRECOGNIZED),
+                "chatgpt_rejected"
+            ),
+            (oa::Phase::Transport, None, None, "chatgpt_unavailable"),
+        ]
+    );
+    for d in &seen {
+        assert!(!d.summary().contains("SENSITIVE"));
+    }
+}
+
+/// The worker hands each failed ChatGPT job's diagnostic to the observer
+/// exactly once, and never for a request the local policy refused.
+#[tokio::test]
+async fn worker_observer_sees_each_chatgpt_failure_once() {
+    use metro_connector::metro::Job;
+    use metro_connector::profile::{Kind, Profile, ProfileConfig};
+    use metro_connector::provider::Provider;
+    use metro_connector::run::{FailureObserver, handle_job, handle_job_observed};
+    use std::sync::{Arc, Mutex};
+
+    let dir = tempfile::tempdir().unwrap();
+    let config = ProfileConfig {
+        version: 1,
+        kind: Kind::OpenAiOAuth,
+        models: vec!["gpt-6.2-sol".into()],
+        server_url: "http://127.0.0.1:9".into(),
+        base_url: None,
+        request_timeout_secs: 5,
+    };
+    let profile = Profile::open(dir.path(), "unsigned").unwrap();
+    let provider = Provider {
+        config: &config,
+        profile: &profile,
+    };
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let observer: FailureObserver = {
+        let seen = Arc::clone(&seen);
+        Arc::new(move |f| seen.lock().unwrap().push(f))
+    };
+    let chat =
+        json!({"model": "gpt-6.2-sol", "messages": [{"role": "user", "content": "SENSITIVE-hi"}]});
+    let mut unsupported = chat.clone();
+    unsupported["temperature"] = json!(0.2);
+    let mut refused = chat.clone();
+    refused["model"] = json!("not-approved");
+    let jobs = [
+        ("complete", chat),
+        ("complete", unsupported),
+        ("models", json!({})),
+        ("complete", refused),
+    ];
+    let mut bodies = Vec::new();
+    for (i, (operation, request)) in jobs.into_iter().enumerate() {
+        let job = Job {
+            id: format!("j{i}"),
+            operation: operation.into(),
+            request,
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let observed = handle_job_observed(&provider, &job, deadline, Some(&observer)).await;
+        let plain = handle_job(&provider, &job, deadline).await;
+        assert_eq!(observed, plain, "the observer never changes the result");
+        assert_eq!(observed["ok"], false);
+        assert_eq!(observed.as_object().unwrap().len(), 2);
+        bodies.push(observed.to_string());
+    }
+    let seen = seen.lock().unwrap();
+    let shape: Vec<_> = seen
+        .iter()
+        .map(|d| (d.operation(), d.phase(), d.code()))
+        .collect();
+    assert_eq!(
+        shape,
+        [
+            (
+                oa::Operation::Inference,
+                oa::Phase::Session,
+                "chatgpt_sign_in"
+            ),
+            (
+                oa::Operation::Inference,
+                oa::Phase::Translation,
+                "chatgpt_unsupported"
+            ),
+            (
+                oa::Operation::Catalog,
+                oa::Phase::Session,
+                "chatgpt_sign_in"
+            ),
+        ]
+    );
+    for b in bodies {
+        for token in ["phase", "chatgpt_", "SENSITIVE", "operation="] {
+            assert!(!b.contains(token), "{token:?} in {b}");
+        }
+    }
 }
 
 #[tokio::test]

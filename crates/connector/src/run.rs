@@ -126,11 +126,27 @@ pub const DELIVERY_SAFETY_GAP: Duration = Duration::from_secs(5);
 /// One result post never waits longer than this.
 pub const RESULT_POST_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// Receives the device-local diagnostic of each failed ChatGPT catalog or
+/// inference job, once per job, on this device only.
+pub type FailureObserver = std::sync::Arc<dyn Fn(crate::openai_oauth::LocalFailure) + Send + Sync>;
+
 /// Run one job and build the result body. Never returns provider error text
 /// unless it is a `SafeError`. The adapter call is bounded by `deadline`:
 /// when it passes, the adapter's future is dropped, which cancels its HTTP
 /// requests and (claude_code) kills the CLI's process group.
 pub async fn handle_job(provider: &Provider<'_>, job: &Job, deadline: Instant) -> Value {
+    handle_job_observed(provider, job, deadline, None).await
+}
+
+/// [`handle_job`], also handing a failed ChatGPT catalog or inference call's
+/// [`crate::openai_oauth::LocalFailure`] to `on_failure`. The result body is
+/// the same either way: the diagnostic is never put in it.
+pub async fn handle_job_observed(
+    provider: &Provider<'_>,
+    job: &Job,
+    deadline: Instant,
+    on_failure: Option<&FailureObserver>,
+) -> Value {
     let secrets = provider.known_secrets();
     let secret_refs: Vec<&crate::Secret> = secrets.iter().collect();
     let op = match parse_operation(&job.operation, &job.request) {
@@ -184,6 +200,11 @@ pub async fn handle_job(provider: &Provider<'_>, job: &Job, deadline: Instant) -
         }
         Err(err) => {
             log(format!("job {}: {}", job.id, log_text(&err, &secret_refs)));
+            if let (Some(observe), Some(failure)) =
+                (on_failure, crate::openai_oauth::local_failure(&err))
+            {
+                observe(failure);
+            }
             json!({"ok": false, "error": metro_error_text(&err)})
         }
     }
@@ -241,6 +262,26 @@ async fn sleep_or_shutdown(d: Duration, opts: &RunOptions) -> bool {
 }
 
 pub async fn run(client: &MetroClient, provider: &Provider<'_>, opts: &RunOptions) -> Stop {
+    run_inner(client, provider, opts, None).await
+}
+
+/// [`run`], handing each failed ChatGPT catalog or inference job's local
+/// diagnostic to `on_failure` (see [`handle_job_observed`]).
+pub async fn run_with_failure_observer(
+    client: &MetroClient,
+    provider: &Provider<'_>,
+    opts: &RunOptions,
+    on_failure: FailureObserver,
+) -> Stop {
+    run_inner(client, provider, opts, Some(&on_failure)).await
+}
+
+async fn run_inner(
+    client: &MetroClient,
+    provider: &Provider<'_>,
+    opts: &RunOptions,
+    on_failure: Option<&FailureObserver>,
+) -> Stop {
     let approved_models = (provider.config.kind.capability() == crate::profile::Capability::Chat)
         .then_some(provider.config.models.as_slice());
     let mut backoff = Duration::from_secs(1);
@@ -292,7 +333,7 @@ pub async fn run(client: &MetroClient, provider: &Provider<'_>, opts: &RunOption
                     claim_sent,
                     Duration::from_secs(provider.config.request_timeout_secs),
                 );
-                let body = handle_job(provider, &job, deadlines.work).await;
+                let body = handle_job_observed(provider, &job, deadlines.work, on_failure).await;
                 let ok = body["ok"] == Value::Bool(true);
                 log(format!(
                     "job {} {}: {} in {:.1}s",
