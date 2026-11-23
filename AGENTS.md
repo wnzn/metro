@@ -11,7 +11,7 @@ whatever model `METRO_MODEL` names.
 | Role | Owner |
 | --- | --- |
 | Project manager and orchestrator: decides architecture, scope and trade-offs; assigns and directs subagents; accepts results only once they are verified | **Astra 6.2** |
-| Writing (README, AGENTS.md, docs/), frontend (`apps/desktop`), complex code | **Opus 5.5**, only through OpenChamber subagents |
+| Writing (README, AGENTS.md, docs/), frontend (`apps/desktop`), complex code | **Opus 5.5**, only through OpenChamber subagents; **Astra 6.2** may directly edit and test `apps/desktop` for UX Round 2 only. |
 | Mid-level code (assigned to either, at Astra's discretion) | **Sol 6.2** or **Sonnet 5.5**, both through OpenChamber subagents |
 
 Opus 5.5 never edits directly in the root session, and nobody calls the
