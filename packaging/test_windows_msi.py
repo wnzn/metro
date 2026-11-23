@@ -216,16 +216,24 @@ class Sources(unittest.TestCase):
         helper = (MSI_DIR / "MsiAutomation.ps1").read_text(encoding="utf-8")
         declared = set(re.findall(r"^\s+'(\w+\.\w+)'\s+= @\('(?:Method|Property)'", helper, re.M))
         self.assertIn("Record.StringData", declared)
-        users = [MSI_DIR / "test-msi-windows.ps1", HERE / "windows-signing" / "MetroWindowsSigning.psm1"]
+        users = [MSI_DIR / "MsiHarness.ps1", HERE / "windows-signing" / "MetroWindowsSigning.psm1"]
         for p in users:
             with self.subTest(p=p.name):
                 text = p.read_text(encoding="utf-8")
-                self.assertIn("MsiAutomation.ps1", text)
                 self.assertNotIn("InvokeMember", text)
                 used = set(re.findall(r"Invoke-MsiAutomation \$\w+ '(\w+\.\w+)'", text))
                 self.assertTrue(used, "no Windows Installer calls found")
                 self.assertLessEqual(used, declared)
                 self.assertIsNone(re.search(r"\$(installer|db|view|record|list)\.\w+\(", text, re.I))
+        self.assertIn("MsiAutomation.ps1", (HERE / "windows-signing" / "MetroWindowsSigning.psm1").read_text(encoding="utf-8"))
+        # The native harness reaches Windows Installer only through MsiHarness.ps1's helpers.
+        harness = (MSI_DIR / "test-msi-windows.ps1").read_text(encoding="utf-8")
+        self.assertIn(". (Join-Path $PSScriptRoot 'MsiAutomation.ps1')", harness)
+        self.assertIn(". (Join-Path $PSScriptRoot 'MsiHarness.ps1')", harness)
+        self.assertNotIn("InvokeMember", harness)
+        self.assertNotIn("Invoke-MsiAutomation", harness)
+        self.assertIsNone(re.search(r"\$(installer|db|view|record|list)\.\w+\(", harness, re.I))
+        self.assertNotIn("Get-ArpKey", harness)  # per-user MSI ARP keys live under HKLM; context comes from ProductInfo
 
     def test_msi_automation_returns_objects_unenumerated(self):
         # A plain `return <InvokeMember result>` enumerated RelatedProducts' StringList:
@@ -244,6 +252,38 @@ class Sources(unittest.TestCase):
         self.assertIn("fails=0", p.stdout)
         self.assertNotIn("FAIL ", p.stdout)
         self.assertEqual(p.stdout.count("PASS "), 25)
+
+    @unittest.skipUnless(os.environ.get("METRO_PWSH") or shutil.which("pwsh"), "PowerShell 7 (pwsh) not available")
+    def test_native_harness_helpers_with_stand_ins(self):
+        # test-msi-windows.ps1 helpers and its parameter/variable rule, without Windows.
+        # With the msitools tree, identity checks read tables of real build_msi.py output.
+        pwsh = os.environ.get("METRO_PWSH") or shutil.which("pwsh")
+        env = dict(os.environ, POWERSHELL_TELEMETRY_OPTOUT="1")
+        env.pop("METRO_MSI_FACTS_JSON", None)
+        real = bool(TOOLS)
+        if real:
+            tools = b.Tools(TOOLS)
+            d = tmpdir(self)
+            p = b.fake_payload(d / "p", "1.0.0")
+            facts = {"version": "1.0.0"}
+            for kind, preview in (("release", False), ("preview", True)):
+                out = d / kind / b.out_name("1.0.0", preview)
+                out.parent.mkdir()
+                b.build(tools, p, "1.0.0", out, preview=preview, epoch=315532800)
+                facts[kind] = {
+                    "file": out.name,
+                    "Property": [[r["Property"], r["Value"]] for r in tools.table(out, "Property")],
+                    "Shortcut": [[r["Name"], r["Directory_"]] for r in tools.table(out, "Shortcut")],
+                }
+            (d / "facts.json").write_text(json.dumps(facts))
+            env["METRO_MSI_FACTS_JSON"] = str(d / "facts.json")
+        proc = subprocess.run([pwsh, "-NoProfile", "-NonInteractive", "-File", str(MSI_DIR / "test-msi-harness.ps1")],
+                              capture_output=True, text=True, timeout=300, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stdout[-4000:] + proc.stderr[-2000:])
+        self.assertIn("fails=0", proc.stdout)
+        self.assertNotIn("FAIL ", proc.stdout)
+        self.assertEqual(proc.stdout.count("PASS "), 27)
+        self.assertIn("exported from packages built by build_msi.py" if real else "written in this test", proc.stdout)
 
     def test_lock_is_pinned(self):
         lock = json.loads((MSI_DIR / "wixl-lock.json").read_text())
