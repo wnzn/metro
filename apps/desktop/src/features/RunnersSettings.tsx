@@ -22,8 +22,10 @@ import {
 import type { RegisteredRunner, RunnerVisibility } from "../settings";
 import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field, LearnMore, PageHeader, PageLayout, Row, SegmentedControl, SettingRow, SettingsGroup } from "../ui";
 import { TokenReveal } from "./TokenReveal";
+import { InstalledRunnerSection, watchInstalledRunner } from "./installedRunner/InstalledRunnerSection";
 
 export function RunnersSettings() {
+  watchInstalledRunner();
   const token = () => revealed()?.kind === "runner";
   const hasMessages = () => !token() && !!(runnersError() || runnerNotice());
   return (
@@ -43,6 +45,7 @@ export function RunnersSettings() {
                 />
               </LearnMore>
             </Column>
+            <InstalledRunnerSection />
             <AddRunner />
             <RunnerList />
           </Column>

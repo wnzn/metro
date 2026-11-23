@@ -60,6 +60,8 @@ export function parseStatus(v: unknown): LocalToolsStatus {
 const SPACE_ID_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 type Client = {
+  /** The bridge call itself, for this computer's personal runner (../installedRunner). */
+  call(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown>;
   status(): Promise<LocalToolsStatus>;
   enable(spaceId: string): Promise<LocalToolsSpace>;
   disable(spaceId: string): Promise<LocalToolsSpace>;
@@ -103,6 +105,7 @@ function createClient(endpoint: BridgeEndpoint): Client {
     return `/v1/local-tools/spaces/${sid}`;
   };
   return {
+    call,
     status: async () => parseStatus(await call("GET", "/v1/local-tools")),
     enable: async (sid) => parseSpace(await call("POST", `${seg(sid)}/enable`, {})),
     disable: async (sid) => parseSpace(await call("POST", `${seg(sid)}/disable`, {})),
@@ -111,6 +114,21 @@ function createClient(endpoint: BridgeEndpoint): Client {
 
 const env = readBridgeEnv();
 const client: Client | null = env.present ? createClient(env.endpoint) : null;
+
+/**
+ * A request to the packaged launcher's bridge on this computer, under
+ * `/v1/local-tools/runner` only. Never reaches a Metro server: the bridge
+ * answers, using the session it already holds. Null without the launcher.
+ */
+export function localRunnerCall(): ((method: "GET" | "POST", path: string) => Promise<unknown>) | null {
+  if (!client) return null;
+  return (method, path) => {
+    if (path !== "/v1/local-tools/runner" && !path.startsWith("/v1/local-tools/runner/")) {
+      return Promise.reject(new BridgeError("invalid", "Not a local runner request."));
+    }
+    return client.call(method, path, method === "POST" ? {} : undefined);
+  };
+}
 
 /** The bridge's answer, or null before it answered / without the launcher. */
 export const localTools = signal<LocalToolsStatus | null>(null);
