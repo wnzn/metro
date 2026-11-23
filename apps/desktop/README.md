@@ -29,6 +29,11 @@ for contributors.
 Check each download against the `.sha256` file published beside it. The
 0.2.0 names are verified targets but aren't published yet.
 
+Per-user installer scripts for Linux, Windows and macOS (preview), which
+check the download, add a menu entry and optionally install Linux
+libraries, are described in [docs/install.md](../../docs/install.md). They're
+in the source, not yet in a tested or published download.
+
 In 0.2.0, the first screen, **Connect to Metro**, offers two choices:
 
 - **On this computer → Use locally:** a private workspace that the app
@@ -142,17 +147,18 @@ They never stand in for each other.
 | --- | --- | --- | --- |
 | What it is | Per-Space pairing in **Use locally** | A real registered personal runner, run by the app | `metro-runner`, installed separately (binary or image) |
 | Server | This app's own local workspace | This app's own local workspace | Any Metro server, local or remote |
-| Who turns it on | The Space owner, under **Manage** | An installer request (below) | Its operator |
+| Who turns it on | The Space owner, under **Manage** | The desktop installer (on by default; `--no-local-runner` leaves it off) | Its operator |
 | Attached to Spaces | That one Space | None until the owner attaches it under **Manage**, like any runner | As its owner or the Space owners choose |
 | Tools | List and read | List and read | List and read; check and MCP when configured ([runners.md](../../docs/runners.md)) |
 | Runs while | Metro is open | Metro is open and signed in to its local workspace | Its process or container runs |
 
-**The app's personal runner** (current source after 0.2.0, `baff3f0` and
-`e0982d7`; tested against a real local server with two Spaces in automated
-tests only, not delivered, no installer for it committed yet):
+**The app's personal runner** (source only: `baff3f0`, `e0982d7`, installers
+at `fb7cb06`, Settings screen at `57409bb`; tested against a real local
+server with two Spaces in automated tests only; no tested download yet).
+Installing and recovery are in [docs/install.md](../../docs/install.md#the-desktops-own-runner).
 
-- It's created only if an installer left its request marker next to the
-  launcher, and only on the app's own local workspace. It's one personal
+- It's created only if the desktop installer left its `enable-local-runner`
+  marker next to the launcher, and only on the app's own local workspace. It's one personal
   runner owned by the local account, listed in **Settings → Runners**. Its
   credential is kept in one private file on this computer.
 - Metro **never attaches it** to a Space. Attach it yourself under
@@ -162,9 +168,11 @@ tests only, not delivered, no installer for it committed yet):
   Metro doesn't recreate it on its own. If creating it was interrupted (for
   example the app quit before the server answered), it stops in an
   *interrupted* state and nothing is created or rotated automatically.
-- Recovery is explicit: a reconnect either rotates the recorded runner (only
-  if it's still yours), uses a runner you pick from your own list, or
-  creates a new one. No button for this is committed yet.
+- Recovery is explicit: **Settings → Runners → This computer's runner →
+  Reconnect…** explains the effect first, then rotates the recorded runner's
+  token if it's still one of your personal runners, or otherwise creates a
+  new, unattached personal runner. (The launcher's local API can also take
+  a runner ID you choose; the screen doesn't offer that.)
 - Each job must name a Space, and reads only that Space's own folder under
   the app's data folder. It refuses checks, MCP and commands, uses no
   Docker, and opens no inbound port. It stops on sign-out, on switching
@@ -456,6 +464,9 @@ contributors only, in
   [runtime requirements](#runtime-requirements), then start `Metro` again
   from the extracted folder. On CachyOS and other Arch-based systems the
   package is `webkitgtk-6.0` (with `gtk4` and the GStreamer base plugins).
+  In the source at `fb7cb06`, `install-metro-linux.sh check-deps` names
+  what's missing, and `--install-deps` (opt-in) runs that fixed package
+  command through `sudo` ([install.md](../../docs/install.md#desktop-on-linux-install-metro-linuxsh)).
 - **Test connection lists models, but the agent doesn't answer.** For a
   connection **On this computer**, **Test connection** goes through the
   Metro server to this computer, which asks the vendor for its model list

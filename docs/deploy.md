@@ -185,6 +185,12 @@ images to the
 Publishing hasn't run yet; the first tagged release will be its first real
 run. What CI has verified so far is in [acceptance.md](acceptance.md).
 
+Tagged releases of the Windows, macOS and Linux desktop apps and the GHCR
+images are planned, with signing and image publishing being finished
+separately. Exact tag-release steps, names and verification will be added
+here and in [install.md](install.md#official-releases) once a release has
+actually been published. Until then, nothing here describes a hosted build.
+
 ## Trust boundaries
 
 - **Identity provider:** decides who exists. Anyone it issues a valid token to

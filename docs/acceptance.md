@@ -1316,6 +1316,10 @@ server connection and sign-in weren't tested.
   diagnostics of `9144e1c` and `38749f3`) and the app's installer-requested
   personal runner (`baff3f0`, `e0982d7`) in a packaged build, or with a real
   account: so far only their automated tests exist in the source.
+- The per-user installers (`fb7cb06`) and the **This computer's runner**
+  screen (`57409bb`) in a tested download, on native Windows, or on macOS.
+  Their documented interface ([install.md](install.md)) is source only.
+- Any tagged CI release, signed build or published GHCR image.
 - Automatic vendor or CLI sign-in from the app, or a real vendor account
   through the in-app device flow. That flow was verified only against a
   local test endpoint.
