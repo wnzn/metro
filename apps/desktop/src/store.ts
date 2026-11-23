@@ -35,7 +35,7 @@
 
 import { batch, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError, createClient, parseReaction } from "./api/client";
-import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space } from "./api/client";
+import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, TurnModelChoice } from "./api/client";
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl } from "./api/serverUrl";
 
@@ -716,7 +716,7 @@ export const ASK_NEEDS_TEXT = "Type a question to ask the agent. Attached files 
  * first; if one fails nothing is posted and the draft and files stay. A
  * message may be files only, unless it asks the agent.
  */
-export async function send(invokeAgent: boolean): Promise<void> {
+export async function send(invokeAgent: boolean, choice?: TurnModelChoice): Promise<void> {
   const chat = basePlace() === "chat";
   const text = draft().trim();
   const sid = activeSpaceId();
@@ -762,8 +762,8 @@ export async function send(invokeAgent: boolean): Promise<void> {
       ids = up.ids;
       keys = up.keys;
     }
-    if (chat) await c.sendChatMessage(text, invokeAgent, ids);
-    else await c.sendMessage(sid!, rid!, text, invokeAgent, sentMentions, ids);
+    if (chat) await c.sendChatMessage(text, invokeAgent, ids, choice);
+    else await c.sendMessage(sid!, rid!, text, invokeAgent, sentMentions, ids, choice);
     if (!ok()) return;
     if (keys.length) attachments?.sent(scope, keys, to);
     if (activeScope() === scope && draft().trim() === text) {

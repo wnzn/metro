@@ -1,5 +1,5 @@
 import { cleanup, effect, signal, untracked } from "nsh";
-import { activeSpaceId, apiClient, composerScope, mainPlace, me, onSessionEnd, sessionGuard } from "../../store";
+import { activeSpaceId, apiClient, composerScope, mainPlace, me, onSessionEnd, sessionGuard, settingsOpen } from "../../store";
 import { Action, Column, Label, Modal, Picker } from "../../ui";
 import { ComposerModelTrigger } from "../../ui/composerModelTrigger";
 import { createComposerCatalog } from "./catalog";
@@ -54,6 +54,9 @@ export function ComposerModelControls() {
     scope();
     composerScope();
     me();
+    // Settings can pair a device, change its approved models, remove a share
+    // or change the classifier while Chat is still mounted underneath it.
+    if (settingsOpen()) { untracked(close); return; }
     untracked(() => { close(); refresh(); });
   });
   return (

@@ -35,7 +35,7 @@ export async function loadAvailable(): Promise<void> {
   const seq = ++availableSeq;
   const ok = sessionGuard();
   try {
-    const list = await c.availableModels("any");
+    const list = await c.availableModels();
     if (!ok() || seq !== availableSeq) return;
     batch(() => {
       available.set(list);

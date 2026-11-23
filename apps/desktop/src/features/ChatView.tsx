@@ -98,7 +98,7 @@ export function ChatView() {
             </Column>
           )}
         </If>
-        <Composer placeholder="Message your Chat — Return to send" agentHint="No runner, workspace or thread tools here." disabled={!!chatUnavailable()} />
+        <Composer placeholder="Message your Chat" agentHint="No runner, workspace or thread tools here." disabled={!!chatUnavailable()} />
       </Surface>
       {/* Wide windows keep the runs beside the Chat; narrower ones open them
           in a dialog, so the Chat (and its draft) keeps its full width. */}

@@ -21,7 +21,7 @@
 // never asks the agent by itself; who a message reaches is the store's and
 // the server's rule (explicit recipients decide).
 
-import { Clipboard, announce, cleanup, computed, localeSettings, signal } from "nsh";
+import { Clipboard, announce, cleanup, computed, effect, localeSettings, signal, untracked } from "nsh";
 import type { CaretEvent, InputRef, JSX, ViewRef } from "nsh";
 import {
   activeEvents,
@@ -33,6 +33,8 @@ import {
   draft,
   isReactable,
   me,
+  members,
+  mentions,
   notice,
   mainPlace,
   REACTION_EMOJI,
@@ -45,6 +47,8 @@ import {
   toggleReaction,
 } from "../store";
 import type { RoomEvent } from "../store";
+import { choiceForTurn, ComposerModelControls, knownNoSystemOne } from "./composerModels";
+import { composerAddress } from "./composerAddress";
 import type { AttachedFile } from "../api/client";
 import {
   Action,
@@ -612,9 +616,32 @@ export function Composer(props: {
   const canSend = () => ready() && (draft().trim().length > 0 || hasFiles());
   // Asking the agent needs a typed question: files alone are saved, not sent to it.
   const canAsk = () => ready() && draft().trim().length > 0;
+  const personal = () => mainPlace() === "chat";
+  const addressed = computed(() => composerAddress(draft(), personal() ? [] : (members() ?? []).map(m => m.userId)));
+  const toAgent = () => addressed().agent || (!personal() && mentions().some(m => m.kind === "agent"));
+  // Decide once when a new draft starts (including a suggestion). A catalog
+  // that finishes loading while somebody writes must never promote their Send.
+  const askDraft = signal(false);
+  let started = false;
+  effect(() => {
+    const filled = personal() && !!draft().trim();
+    if (filled !== started) {
+      started = filled;
+      askDraft.set(filled && untracked(knownNoSystemOne));
+    }
+  });
+  const primaryAsk = () => personal() && askDraft() && !!draft().trim() && (!addressed().people || toAgent());
+  const post = (ask: boolean) => {
+    if (!(ask ? canAsk() : canSend())) return;
+    if (draft().trim() && (ask || toAgent())) {
+      const { error, choice } = choiceForTurn();
+      if (error) { actionError.set(error); return; }
+      void send(ask, choice);
+    } else void send(false);
+  };
   const submit = () => {
     if (props.onSubmitIntercept?.()) return;
-    void send(false);
+    post(primaryAsk());
   };
   return (
     <Column padX={4} padY={3} gap={2}>
@@ -647,27 +674,30 @@ export function Composer(props: {
                 onPress={() => void pickAttachments()}
               />
               {props.tools}
+              <ComposerModelControls />
             </>
           }
           trailing={
             <>
               <AskAgentButton
                 testID="ask-agent"
-                label="Ask agent"
+                primary={primaryAsk()}
+                label={primaryAsk() ? "Ask agent ↵" : "Ask agent"}
                 busyLabel="Asking…"
-                accessibilityLabel={`Send and ask the agent to answer. ${props.agentHint}${hasFiles() ? " Attached files are saved to the Library, not sent to the agent." : ""}`}
-                tooltip={props.agentHint}
+                accessibilityLabel={`Send and ask the agent to answer. ${primaryAsk() ? "Return asks the agent. " : ""}${props.agentHint}${hasFiles() ? " Attached files are saved to the Library, not sent to the agent." : ""}`}
+                tooltip={primaryAsk() ? "Ask agent (Return)" : props.agentHint}
                 busy={sending() === "agent"}
                 disabled={!canAsk()}
-                onPress={() => void send(true)}
+                onPress={() => post(true)}
               />
               <SendButton
                 testID="send"
-                accessibilityLabel={hasFiles() ? "Send with files" : "Send"}
-                tooltip="Send (Return)"
+                note={primaryAsk() && !toAgent()}
+                accessibilityLabel={primaryAsk() && !toAgent() ? "Save note without asking the agent" : hasFiles() ? "Send with files" : "Send"}
+                tooltip={primaryAsk() ? (toAgent() ? "Send to mentioned recipients" : "Save note without asking the agent") : "Send (Return)"}
                 busy={sending() === "message"}
                 disabled={!canSend()}
-                onPress={() => void send(false)}
+                onPress={() => post(false)}
               />
             </>
           }

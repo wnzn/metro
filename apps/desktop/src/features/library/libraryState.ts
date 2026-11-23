@@ -299,7 +299,7 @@ export async function loadModels(): Promise<void> {
     const api = library();
     const c = apiClient();
     if (!api || !c) return;
-    const [models, settings] = await Promise.all([c.availableModels("any"), api.librarySettings()]);
+    const [models, settings] = await Promise.all([c.availableModels(), api.librarySettings()]);
     if (!ok()) return;
     batch(() => {
       // Only adapters that embed media themselves: a text-only embeddings connection never stands in.

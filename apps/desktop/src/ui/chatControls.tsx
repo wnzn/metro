@@ -457,14 +457,14 @@ const sendInactive = "bg-muted border border-border";
  * "Ask agent": a rounded chip in the agent's tone with its glyph. Pressing it
  * sends and explicitly asks the agent; it never reads as the plain send.
  */
-export function AskAgentButton(props: Testable & { label: string; busyLabel: string; busy: boolean; disabled: boolean; onPress: () => void; tooltip?: string }) {
+export function AskAgentButton(props: Testable & { primary?: boolean; label: string; busyLabel: string; busy: boolean; disabled: boolean; onPress: () => void; tooltip?: string }) {
   const inactive = () => props.disabled || props.busy;
   return (
     <Button
       class={cx(
         "flex-row items-center gap-(--space-1) h-[36px] rounded-full px-(--space-3)",
         focusRing,
-        inactive() ? sendInactive : "bg-tone-agent border border-tone-agent-foreground/40 hover:border-tone-agent-foreground active:opacity-90",
+        inactive() ? sendInactive : props.primary ? "bg-primary hover:bg-primary/90" : "bg-tone-agent border border-tone-agent-foreground/40 hover:border-tone-agent-foreground active:opacity-90",
       )}
       disabled={inactive()}
       onPress={props.onPress}
@@ -472,8 +472,8 @@ export function AskAgentButton(props: Testable & { label: string; busyLabel: str
       accessibilityLabel={props.accessibilityLabel ?? props.label}
       tooltip={props.tooltip ? <TooltipText text={props.tooltip} /> : undefined}
     >
-      <ChatGlyph name="agent" color={inactive() ? "muted" : "agent"} />
-      <Text class={cx("text-(length:--text-sm) font-medium", inactive() ? "text-muted-foreground" : "text-tone-agent-foreground")}>
+      <ChatGlyph name="agent" color={inactive() ? "muted" : props.primary ? "on-primary" : "agent"} />
+      <Text class={cx("text-(length:--text-sm) font-medium", inactive() ? "text-muted-foreground" : props.primary ? "text-primary-foreground" : "text-tone-agent-foreground")}>
         {props.busy ? props.busyLabel : props.label}
       </Text>
     </Button>
@@ -481,14 +481,14 @@ export function AskAgentButton(props: Testable & { label: string; busyLabel: str
 }
 
 /** The plain send, at the bottom right: an arrow on the primary color while it can send, muted otherwise. */
-export function SendButton(props: Testable & { busy: boolean; disabled: boolean; onPress: () => void; tooltip?: string }) {
+export function SendButton(props: Testable & { note?: boolean; busy: boolean; disabled: boolean; onPress: () => void; tooltip?: string }) {
   const inactive = () => props.disabled || props.busy;
   return (
     <Button
       class={cx(
-        "items-center justify-center size-[36px] rounded-full",
+        "items-center justify-center rounded-full", props.note ? "h-[36px] px-(--space-2)" : "size-[36px]",
         focusRing,
-        inactive() ? sendInactive : "bg-primary hover:bg-primary/90 active:bg-primary/85",
+        inactive() ? sendInactive : props.note ? "bg-muted hover:bg-accent" : "bg-primary hover:bg-primary/90 active:bg-primary/85",
       )}
       disabled={inactive()}
       onPress={props.onPress}
@@ -496,7 +496,9 @@ export function SendButton(props: Testable & { busy: boolean; disabled: boolean;
       accessibilityLabel={props.busy ? "Sending…" : props.accessibilityLabel ?? "Send"}
       tooltip={props.tooltip ? <TooltipText text={props.tooltip} /> : undefined}
     >
-      <ChatGlyph name="send" color={inactive() ? "muted" : "on-primary"} />
+      <If when={props.note} else={<ChatGlyph name="send" color={inactive() ? "muted" : "on-primary"} />}>
+        <Text class="text-(length:--text-sm) text-muted-foreground">Save note</Text>
+      </If>
     </Button>
   );
 }

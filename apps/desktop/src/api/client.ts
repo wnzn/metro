@@ -180,7 +180,21 @@ export type AvailableModel = {
   isDefault: boolean;
   /** An embeddings adapter that embeds documents, images, audio and video itself (never a text-only `/v1/embeddings`). */
   mediaInputs?: boolean;
+  /** Absent on older servers (pinned model only); an empty list explicitly offers no chat model. */
+  chatModels?: { id: string; reasoningEfforts: string[] }[];
 };
+
+/** Snapshot of the user's explicit choice for this agent turn; does not change the connection default. */
+export type TurnModelChoice = Readonly<{ connectionId: string; modelId?: string; reasoningEffort?: string }>;
+
+function turnModelBody(choice?: TurnModelChoice) {
+  if (!choice) return {};
+  return {
+    provider_connection_id: choice.connectionId,
+    ...(choice.modelId ? { model_id: choice.modelId } : {}),
+    ...(choice.reasoningEffort ? { reasoning_effort: choice.reasoningEffort } : {}),
+  };
+}
 
 /** One named use case and the chat connection that answers it. */
 export type RoutingCase = { key: string; label: string; description: string; connectionId: string | null };
@@ -481,9 +495,10 @@ export function createClient(options: ClientOptions) {
       return data === null ? { visibility: body.visibility, spaceIds: body.space_ids } : toSharing(data, "PUT …/sharing");
     },
 
-    /** Models the user may pick: their own and those shared with them. `scope`: "any", or a Space id. */
-    async availableModels(scope = "any"): Promise<AvailableModel[]> {
-      const data = await request("GET", `/v1/models/available?scope=${encodeURIComponent(scope)}`);
+    /** null = personal Chat, a string = exact Space, omitted = Settings across all usable scopes. */
+    async availableModels(scope?: string | null): Promise<AvailableModel[]> {
+      const query = scope === null ? "" : scope === undefined ? "?scope=any" : `?space_id=${encodeURIComponent(scope)}`;
+      const data = await request("GET", `/v1/models/available${query}`);
       const models = isObject(data) ? data.models : undefined;
       if (!Array.isArray(models)) throw new ApiError("protocol", "GET /v1/models/available did not return { models: [...] }.");
       const seen = new Set<string>();
@@ -582,8 +597,8 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendMessage(spaceId: string, roomId: string, text: string, invokeAgent: boolean, mentions?: Mention[], assetIds?: readonly string[]): Promise<void> {
-      const body: Record<string, unknown> = { text, invoke_agent: invokeAgent };
+    async sendMessage(spaceId: string, roomId: string, text: string, invokeAgent: boolean, mentions?: Mention[], assetIds?: readonly string[], choice?: TurnModelChoice): Promise<void> {
+      const body: Record<string, unknown> = { text, invoke_agent: invokeAgent, ...turnModelBody(choice) };
       // Only what a person can type: never `addressed_by`, which only the server sets.
       if (mentions && mentions.length > 0) body.mentions = mentions.map((m) => (m.kind === "agent" ? { kind: "agent" } : { kind: "user", id: m.id }));
       const ids = assetIdsBody(assetIds);
@@ -603,8 +618,8 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendChatMessage(text: string, invokeAgent: boolean, assetIds?: readonly string[]): Promise<void> {
-      const body: Record<string, unknown> = { text, invoke_agent: invokeAgent };
+    async sendChatMessage(text: string, invokeAgent: boolean, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<void> {
+      const body: Record<string, unknown> = { text, invoke_agent: invokeAgent, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
       await request("POST", "/v1/chat/messages", body);
@@ -728,7 +743,21 @@ function toAvailableModel(v: unknown): AvailableModel | null {
     ready: typeof v.ready === "boolean" ? v.ready : null,
     isDefault: v.is_default === true,
     mediaInputs: v.capability === "embeddings" && v.media_inputs === true,
+    ...(v.capability === "chat" && Object.prototype.hasOwnProperty.call(v, "chat_models") ? { chatModels: parseChatModels(v.chat_models) } : {}),
   };
+}
+
+function parseChatModels(value: unknown): NonNullable<AvailableModel["chatModels"]> {
+  if (!Array.isArray(value)) return [];
+  const result: NonNullable<AvailableModel["chatModels"]> = [];
+  const seen = new Set<string>();
+  for (const row of value) {
+    if (!isObject(row) || typeof row.id !== "string" || !row.id.trim() || seen.has(row.id)) continue;
+    seen.add(row.id);
+    const levels = Array.isArray(row.reasoning_efforts) ? row.reasoning_efforts : [];
+    result.push({ id: row.id, reasoningEfforts: [...new Set(levels.filter((x): x is string => typeof x === "string" && /^(none|minimal|low|medium|high|xhigh|max)$/.test(x)))] });
+  }
+  return result;
 }
 
 const optionalId = (v: unknown): string | null => (isId(v) && String(v) !== "" ? String(v) : null);

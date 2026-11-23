@@ -105,10 +105,14 @@ export function fakeServer() {
   const runnerJson = (r: Runner, user: string) => ({ id: r.id, name: r.name, visibility: r.visibility, can_manage: r.visibility === "personal" ? r.owner === user : admin(user) });
   const connJson = (c: Conn) => ({ id: c.id, name: c.name, provider_id: c.provider_id, base_url: c.base_url, model: c.model, is_default: c.is_default, has_key: !!c.key, capability: c.capability, visibility: c.share.visibility });
   /** Whether `user` may use `c`: their own, or shared with the organization or a Space both are in now. */
-  const usable = (c: Conn, user: string) =>
+  const usable = (c: Conn, user: string, scope?: string | null) =>
     c.owner === user ||
     c.share.visibility === "organization" ||
-    (c.share.visibility === "spaces" && c.share.space_ids.some((sid) => { const s = state.spaces.get(sid); return !!s && s.members.has(user) && s.members.has(c.owner); }));
+    (c.share.visibility === "spaces" && c.share.space_ids.some((sid) => {
+      if (scope !== undefined && sid !== scope) return false;
+      const s = state.spaces.get(sid);
+      return !!s && s.members.has(user) && s.members.has(c.owner);
+    }));
   const usableAs = (id: unknown, capability: Capability, user: string) => {
     const c = typeof id === "string" ? state.connections.get(id) : undefined;
     return !!c && c.capability === capability && usable(c, user) && !!c.model;
@@ -174,8 +178,11 @@ export function fakeServer() {
       return ok({ connection: connJson(c) }, 201);
     }
     if (path === "/v1/models/available" && req.method === "GET") {
+      const sid = url.searchParams.get("space_id");
+      if (sid !== null && !state.spaces.get(sid)?.members.has(user)) return err(404, "no such Space");
+      const scope = url.searchParams.get("scope") === "any" ? undefined : sid;
       const models = [...state.connections.values()]
-        .filter((c) => usable(c, user) && !!c.model) // as the server: nothing without a model
+        .filter((c) => usable(c, user, scope) && !!c.model)
         .map((c) => {
           const owned = c.owner === user;
           const preset = !owned && c.provider_id === "device-openai-oauth";
