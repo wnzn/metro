@@ -235,14 +235,19 @@ A room's agent can delegate work to **child threads** with the tools
 
 ## Monitoring events
 
-**Status.** In the current source after 0.2.0 (`797eac1`), covered by the
-server's automated tests (`crates/server/tests/monitoring.rs`). It's in no
-recorded test cut or release yet, and the desktop app has no screen for it
-in that source.
+**Status.** In the current source after 0.2.0 (`797eac1`, with the personal
+scope added in `c5e2753`), covered by the server's automated tests
+(`crates/server/tests/monitoring.rs`). It's in no recorded test cut or
+release yet, and no desktop screen for it is committed.
 
-The server keeps a short log of things that went wrong, so a Space's owner
-or an operator can see that something failed without anyone sharing logs.
+The server keeps a short log of things that went wrong, so a Space's owner,
+a person, or an operator can see that something failed without anyone
+sharing logs. A read names exactly one scope; nothing combines them.
 
+- `GET /v1/monitoring/events?scope=me` returns **your own** personal Chat
+  events: your Chat turns that failed or were refused, and problems with the
+  model connection they used. The owner is the signed-in person, taken from
+  authentication only. Nobody else can read them, **org admins included**.
 - `GET /v1/monitoring/events?space_id=SID` returns `{"events": [...]}` for
   one Space: failed, timed-out or refused agent runs, problems with the
   model connection a run used (unreachable, credentials rejected, rate
@@ -253,13 +258,18 @@ or an operator can see that something failed without anyone sharing logs.
 - `GET /v1/monitoring/events` with no `space_id` returns the server's own
   events (started, scheduler failures). Only
   [organization admins](deploy.md) may read it; everyone else gets 403.
-- Each event is only a time, a component, a fixed code and that code's
-  fixed one-line summary. No message text, prompt, error text from a vendor
-  or device, path, URL, token or user id is ever stored. **Personal Chat
-  turns are never recorded**, and no Space event appears in the server-wide
-  log.
-- Events are kept for 30 days and at most 500 per Space (or for the
-  server), across restarts. A read returns the newest 100.
+- Each event is only its scope, a time, a component, a fixed code and that
+  code's fixed one-line summary. A personal event's scope is its owner's
+  stable user id; nothing else about a person is stored. No message text,
+  prompt, error text from a vendor or device, path, URL or token is ever
+  stored. Personal and Space events never appear in the server-wide log.
+  (The first version, `797eac1`, recorded no personal Chat events at all.)
+- Events are kept for 30 days and at most 500 per scope, across restarts.
+  A read returns the newest 100.
+- Summaries are deliberately coarse, such as *The model service rejected
+  the connection's credentials.* Details of a failed Sign in with ChatGPT
+  call stay on the device that made it ([desktop
+  README](../apps/desktop/README.md#troubleshooting)).
 
 ## Runner pairing
 

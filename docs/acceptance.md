@@ -1312,8 +1312,10 @@ server connection and sign-in weren't tested.
 - A recorded desktop GUI run on a Linux distribution other than Debian 13
   (for example Arch or CachyOS). Their runtime package names are documented
   as troubleshooting only.
-- Monitoring events (`797eac1`, `322dc9b`) in a packaged build: so far only
-  their automated tests exist in the source.
+- Monitoring events (`797eac1`, `322dc9b`, `c5e2753`, and the ChatGPT
+  diagnostics of `9144e1c` and `38749f3`) and the app's installer-requested
+  personal runner (`baff3f0`, `e0982d7`) in a packaged build, or with a real
+  account: so far only their automated tests exist in the source.
 - Automatic vendor or CLI sign-in from the app, or a real vendor account
   through the in-app device flow. That flow was verified only against a
   local test endpoint.

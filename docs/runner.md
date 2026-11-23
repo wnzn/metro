@@ -153,7 +153,10 @@ jobs.
 
 ### Option A: runner container, no sandbox
 
-Put the token in a mode-600 env file, then fill in the quoted values:
+Put the token in a mode-600 env file, then fill in the quoted values. The
+token stays out of the command line, but it's in the container's
+environment, so anyone who can `docker inspect` the container can read it
+([details](runners.md#1-register-the-runner-and-save-its-credential)):
 
 ```sh
 TOKEN_FILE="$HOME/.config/metro-dev/space.runner-token"

@@ -134,6 +134,42 @@ private folder on this computer, per Space, while Metro is open.
 - Checks, MCP and commands, and tools for a shared server, need a separately
   installed runner run by an operator ([runners.md](../../docs/runners.md)).
 
+### Three different ways to give a Space tools
+
+They never stand in for each other.
+
+| | Local tools | The app's personal runner | A standalone runner |
+| --- | --- | --- | --- |
+| What it is | Per-Space pairing in **Use locally** | A real registered personal runner, run by the app | `metro-runner`, installed separately (binary or image) |
+| Server | This app's own local workspace | This app's own local workspace | Any Metro server, local or remote |
+| Who turns it on | The Space owner, under **Manage** | An installer request (below) | Its operator |
+| Attached to Spaces | That one Space | None until the owner attaches it under **Manage**, like any runner | As its owner or the Space owners choose |
+| Tools | List and read | List and read | List and read; check and MCP when configured ([runners.md](../../docs/runners.md)) |
+| Runs while | Metro is open | Metro is open and signed in to its local workspace | Its process or container runs |
+
+**The app's personal runner** (current source after 0.2.0, `baff3f0` and
+`e0982d7`; tested against a real local server with two Spaces in automated
+tests only, not delivered, no installer for it committed yet):
+
+- It's created only if an installer left its request marker next to the
+  launcher, and only on the app's own local workspace. It's one personal
+  runner owned by the local account, listed in **Settings → Runners**. Its
+  credential is kept in one private file on this computer.
+- Metro **never attaches it** to a Space. Attach it yourself under
+  **Manage**, as with any runner.
+- It's identified by its runner ID only, never by its display name.
+- Later starts reuse it. If it's deleted, revoked or rotated elsewhere,
+  Metro doesn't recreate it on its own. If creating it was interrupted (for
+  example the app quit before the server answered), it stops in an
+  *interrupted* state and nothing is created or rotated automatically.
+- Recovery is explicit: a reconnect either rotates the recorded runner (only
+  if it's still yours), uses a runner you pick from your own list, or
+  creates a new one. No button for this is committed yet.
+- Each job must name a Space, and reads only that Space's own folder under
+  the app's data folder. It refuses checks, MCP and commands, uses no
+  Docker, and opens no inbound port. It stops on sign-out, on switching
+  server or account, and when Metro quits.
+
 ### Not verified yet
 
 - **Device connections with a real vendor:** the in-app flow was verified
@@ -453,18 +489,29 @@ contributors only, in
   address, or to its Compose service name on the same Docker network
   ([runners.md](../../docs/runners.md#3-choose-a-server-url-the-container-can-reach)).
   Local tools in **Use locally** need no runner.
-- **Metro's own errors on this computer** (current source after 0.2.0,
-  `322dc9b`; covered by automated tests, in no recorded test cut, and with
-  no screen in that source yet). The packaged app keeps a short private list
-  of its own failures on this computer: the launcher or window failing to
-  start (including exit status 127, usually a missing library), the bundled
-  local server stopping, and the device connection going offline, being
-  refused or failing to list models. It holds at most 100 entries, each only
-  a time and a fixed code with its fixed summary, never message text,
-  vendor error text, paths, addresses or tokens. It stays on this computer
-  (`monitoring/events.json` in the app's data folder:
-  `~/.config/metro-desktop` on Linux, `%LOCALAPPDATA%\Metro\Desktop` on
-  Windows) and isn't sent to any server.
+- **Metro's own errors on this computer** (current source after 0.2.0:
+  `322dc9b`, with Sign in with ChatGPT details from `9144e1c` and
+  `38749f3`; covered by automated tests, in no recorded test cut, no
+  real-account run, and no committed screen yet). The packaged app keeps a
+  short private list of its own failures on this computer: the launcher or
+  window failing to start (including exit status 127, usually a missing
+  library), the bundled local server stopping, and the device connection
+  going offline, being refused or failing to list models.
+  - For a failed Sign in with ChatGPT call, an entry also records, in a
+    fixed form: whether it was the model list or a chat turn; where it
+    stopped (the sign-in on this computer, the HTTP answer, the response
+    stream, the network, or translating the request); the numeric HTTP
+    status; and OpenAI's error code and parameter only when they're on a
+    fixed list of documented values, otherwise `unrecognized`. Response
+    bodies, vendor messages, request IDs and headers are never kept.
+  - Those details stay on this computer. The Metro server only gets the
+    fixed, coarser error text, such as asking you to sign in again on the
+    device.
+  - At most 100 entries, never message text, paths, addresses or tokens.
+    The file is `monitoring/events.json` in the app's data folder
+    (`~/.config/metro-desktop` on Linux, `%LOCALAPPDATA%\Metro\Desktop` on
+    Windows). The app reads it through the launcher's local service, which
+    refuses requests without the app's own credential.
 - **Asking for help.** Describe what you did and the exact message Metro
   showed. Never send anyone your tokens, keys, sign-in files, `.env` files,
   databases or raw logs, and don't post screenshots that show a token.

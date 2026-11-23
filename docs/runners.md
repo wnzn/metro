@@ -177,8 +177,13 @@ mkdir -p "$D" && chmod 700 "$D"
 ```
 
 `runner.env` is mode 600 and lives outside any project directory. Docker reads it with
-`--env-file`, so the credential never appears in a command line or in
-`docker inspect` output that you'd otherwise type.
+`--env-file`, so the credential never appears in a command line or in your
+shell history. It does become part of the container's environment: anyone
+who can run `docker inspect` on that container (any Docker administrator on
+the machine) can read it. Treat Docker access as access to the credential.
+The runner image reads its credential only from `METRO_RUNNER_TOKEN`; a
+mounted secret file for containers isn't in the committed source yet. Once
+container installers with a secret file land, prefer that.
 
 ### 2. Pull the runner image
 

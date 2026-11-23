@@ -164,8 +164,9 @@ specific to your deployment; Metro's only built-in address is loopback.
 - In the current source after 0.2.0 (not released), org admins listed in
   `METRO_ORG_ADMINS` can read the server's own monitoring events with
   `GET /v1/monitoring/events`, and each Space's owner reads that Space's
-  with `?space_id=SID`. Events hold only fixed codes, never message text,
-  prompts or credentials, and personal Chat is never recorded. See
+  with `?space_id=SID`. Each person reads their own personal Chat events
+  with `?scope=me`; org admins can't read those. Events hold only fixed
+  codes, never message text, prompts or credentials. See
   [spaces.md](spaces.md#monitoring-events).
 
 To upgrade from the single-room build, see
