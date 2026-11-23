@@ -34,8 +34,10 @@ pub(super) fn server_chat(entry: &Entry, row: &Row) -> bool {
 
 fn fingerprint(row: &Row) -> [u8; 32] {
     let mut hash = Sha256::new();
-    // Deliberately independent of the pinned model: choosing a model in
-    // Settings doesn't change what this endpoint and credential can list.
+    // A credential round trip can restore the same ciphertext field (None
+    // before and after), but never the same configuration revision. Pinning
+    // a different model also starts a new revision.
+    hash.update(row.config_rev.to_be_bytes());
     for part in [
         Some(row.id.as_bytes()),
         Some(row.user_id.as_bytes()),
@@ -209,13 +211,18 @@ mod tests {
 
     use axum::body::Bytes;
     use axum::extract::{Path, State};
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use axum::{Json, Router, routing::get};
+    use base64::Engine;
     use serde_json::json;
     use tokio::net::TcpListener;
+    use tokio::sync::Notify;
 
     use super::*;
     use crate::auth::{AuthFailure, AuthFuture, Human, HumanAuth};
     use crate::providers::api;
+    use crate::providers::secret::MasterKey;
     use crate::{AppState, Config, Limits};
 
     fn profile() -> Row {
@@ -245,6 +252,35 @@ mod tests {
         }
     }
 
+    async fn with_upstream(upstream: Router) -> (AppState, Row, tokio::task::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}/v1", listener.local_addr().unwrap());
+        let upstream = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let config = Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            db_path: ":memory:".into(),
+            model: None,
+            limits: Limits::default(),
+            org_admins: Vec::new(),
+        };
+        let db = Db::open_in_memory().unwrap();
+        let mut state = AppState::new(config, db, Arc::new(NoAuth)).await.unwrap();
+        let encoded = base64::engine::general_purpose::STANDARD.encode([42; 32]);
+        let master = MasterKey::parse(&encoded).unwrap();
+        state.providers = ProviderService::new(Some(master), vec![base.clone()]).unwrap();
+        let mut row = profile();
+        row.base_url = Some(base);
+        assert!(store::insert(&mut state.db.lock(), &row, 20).unwrap());
+        (state, row, upstream)
+    }
+
+    fn human(id: &str) -> Human {
+        Human {
+            id: id.into(),
+            name: id.into(),
+        }
+    }
+
     #[tokio::test]
     async fn explicit_owner_fetch_populates_local_chat_suggestions() {
         let calls = Arc::new(AtomicUsize::new(0));
@@ -271,22 +307,7 @@ mod tests {
                 }
             }),
         );
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let base = format!("http://{}/v1", listener.local_addr().unwrap());
-        let upstream = tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
-        let config = Config {
-            bind: "127.0.0.1:0".parse().unwrap(),
-            db_path: ":memory:".into(),
-            model: None,
-            limits: Limits::default(),
-            org_admins: Vec::new(),
-        };
-        let db = Db::open_in_memory().unwrap();
-        let mut state = AppState::new(config, db, Arc::new(NoAuth)).await.unwrap();
-        state.providers = ProviderService::new(None, vec![base.clone()]).unwrap();
-        let mut row = profile();
-        row.base_url = Some(base);
-        assert!(store::insert(&mut state.db.lock(), &row, 20).unwrap());
+        let (state, row, upstream) = with_upstream(upstream).await;
 
         let read = || state.providers.listed_chat_models(&row);
         assert_eq!(read(), ["pinned"]);
@@ -294,10 +315,7 @@ mod tests {
         let fetch = |id: &str| {
             api::models(
                 State(state.clone()),
-                Human {
-                    id: id.into(),
-                    name: id.into(),
-                },
+                human(id),
                 Path(row.id.clone()),
                 Bytes::from_static(b"{}"),
             )
@@ -329,6 +347,98 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn adding_then_removing_a_key_invalidates_cached_and_in_flight_listings() {
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let upstream = Router::new().route(
+            "/v1/models",
+            get({
+                let entered = entered.clone();
+                let release = release.clone();
+                let calls = Arc::new(AtomicUsize::new(0));
+                move || {
+                    let (entered, release, calls) =
+                        (entered.clone(), release.clone(), calls.clone());
+                    async move {
+                        let id = match calls.fetch_add(1, Ordering::SeqCst) {
+                            0 => "old-cached",
+                            1 => {
+                                entered.notify_one();
+                                release.notified().await;
+                                "old-in-flight"
+                            }
+                            _ => "fresh",
+                        };
+                        Json(json!({"data": [{"id": id}]}))
+                    }
+                }
+            }),
+        );
+        let (state, row, upstream) = with_upstream(upstream).await;
+        let fetch = || {
+            api::models(
+                State(state.clone()),
+                human("alice"),
+                Path(row.id.clone()),
+                Bytes::from_static(b"{}"),
+            )
+        };
+        let write = |body| {
+            api::update(
+                State(state.clone()),
+                human("alice"),
+                Path(row.id.clone()),
+                Ok(Json(serde_json::from_value(body).unwrap())),
+            )
+        };
+        let read = || {
+            store::get(&state.db.lock(), "alice", &row.id)
+                .unwrap()
+                .unwrap()
+        };
+        let _ = fetch().await.unwrap();
+        assert_eq!(
+            state.providers.listed_chat_models(&read()),
+            ["pinned", "old-cached"]
+        );
+        let delayed = tokio::spawn(fetch());
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("upstream received the delayed listing");
+        assert!(
+            write(json!({"api_key": "fixture-key"}))
+                .await
+                .unwrap()
+                .0
+                .has_key
+        );
+        assert!(!write(json!({"api_key": null})).await.unwrap().0.has_key);
+        let current = read();
+        assert_eq!(current.config_rev, row.config_rev + 2);
+        assert!(current.sealed_key.is_none());
+        assert_eq!(state.providers.listed_chat_models(&current), ["pinned"]);
+
+        release.notify_one();
+        let rejected = delayed.await.unwrap().unwrap_err();
+        assert_eq!(rejected.into_response().status(), StatusCode::CONFLICT);
+        assert_eq!(state.providers.listed_chat_models(&read()), ["pinned"]);
+
+        let _ = fetch().await.unwrap();
+        assert_eq!(
+            state.providers.listed_chat_models(&read()),
+            ["pinned", "fresh"]
+        );
+        let _ = write(json!({"name": "New name"})).await.unwrap();
+        assert_eq!(
+            state.providers.listed_chat_models(&read()),
+            ["pinned", "fresh"]
+        );
+        let _ = write(json!({"model": "new-pinned"})).await.unwrap();
+        assert_eq!(state.providers.listed_chat_models(&read()), ["new-pinned"]);
+        upstream.abort();
+    }
+
+    #[tokio::test]
     async fn delayed_fetch_cannot_publish_after_credential_change_or_delete() {
         let db = Db::open_in_memory().unwrap();
         let providers = ProviderService::new(None, vec![]).unwrap();
@@ -344,7 +454,7 @@ mod tests {
         );
         let mut current = old.clone();
         current.sealed_key = Some(vec![2]);
-        store::update(&mut db.lock(), &current).unwrap().unwrap();
+        current.config_rev = store::update(&mut db.lock(), &current).unwrap().unwrap();
         assert_eq!(providers.listed_chat_models(&current), ["pinned"]);
         assert!(
             providers
@@ -400,11 +510,6 @@ mod tests {
         ] {
             assert!(cache.get(&changed, later).is_empty());
         }
-        let re_pinned = Row {
-            model: "new-pinned".into(),
-            ..row.clone()
-        };
-        assert_eq!(cache.get(&re_pinned, later), ["newer"]);
         assert!(cache.get(&row, later + TTL).is_empty());
 
         let after_expiry = later + TTL;

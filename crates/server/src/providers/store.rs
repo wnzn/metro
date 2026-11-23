@@ -23,8 +23,8 @@ pub struct Row {
     /// Fixed when the connection is created; rows from before capabilities
     /// existed are `chat`.
     pub capability: Capability,
-    /// Bumped whenever what the connection computes could change (its
-    /// model), so search indexes built with it can tell they are stale.
+    /// Bumped on model changes for search indexes, and on chat credential
+    /// changes so an older authorization or model listing can't be reused.
     pub config_rev: i64,
 }
 
@@ -232,9 +232,10 @@ pub fn insert(conn: &mut Connection, row: &Row, max: usize) -> rusqlite::Result<
 }
 
 /// Write `row` back (matched by owner and id), clearing the owner's other
-/// default of the same capability when `row.is_default`. A model change
-/// bumps `config_rev`. The capability and base URL never change. `None`
-/// when the row no longer exists, otherwise the stored `config_rev`.
+/// default of the same capability when `row.is_default`. A model change or
+/// a chat credential change bumps `config_rev`. The capability and base URL
+/// never change. `None` when the row no longer exists, otherwise the stored
+/// `config_rev`.
 pub fn update(conn: &mut Connection, row: &Row) -> rusqlite::Result<Option<i64>> {
     let tx = conn.transaction()?;
     let old_model: Option<String> = tx
@@ -255,7 +256,9 @@ pub fn update(conn: &mut Connection, row: &Row) -> rusqlite::Result<Option<i64>>
         .query_row(
             "UPDATE provider_connections
              SET name = ?3, is_default = ?5, sealed_key = ?6, updated_at = ?7,
-                 config_rev = config_rev + (model <> ?4), model = ?4
+                  config_rev = config_rev + (model <> ?4
+                      OR (capability = 'chat' AND sealed_key IS NOT ?6)),
+                  model = ?4
              WHERE user_id = ?1 AND id = ?2
              RETURNING config_rev",
             params![
