@@ -78,7 +78,9 @@ class Layout:
         self.archives = {f"Metro-{version}-{t}{'.zip' if t == 'windows-x64' else '.tar.gz'}": ("desktop", t)
                          for t in desktop}
         self.archives[f"Metro-runner-{version}-linux-x64.tar.gz"] = ("runner", "linux-x64")
-        self.msi = f"Metro-{version}-windows-x64.msi"
+        # windows-distribution.yml names its unsigned preview MSI distinctly; only
+        # windows-sign.yml produces the release name.
+        self.msi = f"Metro-{version}-windows-x64{'.msi' if mode == 'release' else '.unsigned-preview.msi'}"
         self.ps1 = PS1_SCRIPTS
         self.sh = SH_SCRIPTS + ((MACOS_SCRIPT,) if mode == "release" else ())
 
@@ -132,9 +134,14 @@ def authenticode_present(data):
         return False
 
 
-def ps1_signed(data):
-    text = data.decode("utf-8-sig", errors="replace")
-    return "\n# SIG # Begin signature block" in text and text.rstrip().endswith("# SIG # End signature block")
+# One PowerShell signature block appended to the script (winsign.py SIG_BLOCK).
+SIG_BLOCK = re.compile(rb"(?:\r?\n)?# SIG # Begin signature block\r?\n(?:# [A-Za-z0-9+/=]{1,128}\r?\n)+"
+                       rb"# SIG # End signature block\r?\n?\Z")
+
+
+def ps1_signed(data, source):
+    """`data` is exactly `source` followed by one signature block (as winsign.py signs)."""
+    return data.startswith(source) and bool(SIG_BLOCK.fullmatch(data[len(source):]))
 
 
 def check_archive(path, version, kind, target, release):
@@ -155,10 +162,7 @@ def check_archive(path, version, kind, target, release):
     for name, digest in listed.items():
         require(sha256_bytes(files[f"{top}/{name}"]) == digest, f"{path.name}: {name} does not match RELEASE.json")
     if kind == "desktop":
-        tui = manifest.get("tui")
-        require(tui in (None, TUI[target]) and (tui is None or tui in listed),
-                f"{path.name}: RELEASE.json names an unexpected terminal client")
-        require(tui or not release, f"{path.name}: a release desktop archive must include {TUI[target]}")
+        require(TUI[target] in listed or not release, f"{path.name}: a release desktop archive must include {TUI[target]}")
     if target.startswith("macos-"):
         n = manifest.get("notarization") or {}
         require(manifest.get("signing") == "developer-id" and manifest.get("status") == "notarized"
@@ -169,7 +173,12 @@ def check_archive(path, version, kind, target, release):
         for ticket in n.get("ticket_files") or [None]:
             require(ticket and f"{top}/{ticket}" in files, f"{path.name}: the stapled ticket is missing")
     elif target == "windows-x64":
-        require(manifest.get("signing") != "adhoc", f"{path.name}: unexpected signing status")
+        # windows-distribution.yml / windows-sign.yml: {"signing": {"mode": ...}} (absent in old seeds).
+        mode = (manifest.get("signing") or {}).get("mode") if isinstance(manifest.get("signing"), dict) else \
+            manifest.get("signing")
+        require(mode == "authenticode" if release else mode in (None, "unsigned-preview"),
+                f"{path.name}: RELEASE.json signing mode {mode!r} is not "
+                + ("authenticode" if release else "an unsigned preview"))
         if release:
             code = [n for n in files if n.lower().endswith((".exe", ".dll"))]
             require(code, f"{path.name}: no Windows executables")
@@ -187,14 +196,18 @@ def check_sidecar(path):
     require(sidecar.read_text() == f"{sha256(path)}  {path.name}\n", f"{sidecar.name} does not match {path.name}")
 
 
-def check_windows_extras(folder, layout):
+def check_windows_extras(folder, layout, scripts_dir=HERE):
     check_sidecar(folder / layout.msi)
     msi = (folder / layout.msi).read_bytes()
     require(msi[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", f"{layout.msi} is not an MSI (OLE) file")
+    for script in layout.ps1:
+        data, source = (folder / script).read_bytes(), (scripts_dir / script).read_bytes()
+        if layout.mode == "release":
+            require(ps1_signed(data, source), f"{script} is not this checkout's script plus one Authenticode block")
+        else:
+            require(data == source, f"{script} differs from this checkout's script")
     if layout.mode == "release":
         require(MSI_SIGNATURE in msi, f"{layout.msi} is not Authenticode signed")
-        for script in layout.ps1:
-            require(ps1_signed((folder / script).read_bytes()), f"{script} is not Authenticode signed")
 
 
 def check_contents(folder, layout):

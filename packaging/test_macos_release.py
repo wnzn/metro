@@ -261,7 +261,6 @@ def make_adhoc_archive(folder, version="0.3.0", target="macos-arm64", ents=None,
             {"kind": "adhoc", "id": "dev.metro.desktop", "time": 0, "ents": {},
              "sealed": {"MetroUI.app": 0, "metro-server": 0}}))
         manifest = {"kind": "desktop", "target": target, "version": version, "signing": "adhoc",
-                    **({"tui": "Metro.app/Contents/MacOS/metro-tui"} if tui else {}),
                     "status": "preview-not-verified", "local_runner": "installer-marker",
                     "renderer": {"stock_unsigned_sha256": "0" * 64, "packaged_signed_sha256": "1" * 64,
                                  "code_resources_sha256": "2" * 64},
@@ -511,16 +510,20 @@ class MacosReleaseTests(unittest.TestCase):
         self.assertIn("--timestamp", tui_sign)
         self.assertEqual(tui_sign[tui_sign.index("--identifier") + 1], "metro-tui")
         manifest = mr.verify_archive(fake, final, TEAM)
-        self.assertEqual(manifest["tui"], "Metro.app/Contents/MacOS/metro-tui")
+        self.assertIn("Metro.app/Contents/MacOS/metro-tui", manifest["files"])
+        self.assertNotIn("tui", manifest)  # no new RELEASE.json key; readers use "files"
         self.assertTrue(any(c[0] == "codesign" and c[-1].endswith("/Contents/MacOS/metro-tui") and "-d" in c
                             for c in fake.calls[-12:]), "the extracted terminal client was not checked")
         release_assets.check_archive(final, "0.3.0", "desktop", "macos-arm64", True)
 
     def test_terminal_client_must_match_the_manifest(self):
-        undeclared = lambda m: m.pop("tui")  # noqa: E731
-        for label, kw in (("binary without manifest entry", dict(tui=True, manifest_fix=undeclared)),
-                          ("manifest entry without binary", dict(manifest_fix=lambda m: m.update(
-                              tui="Metro.app/Contents/MacOS/metro-tui")))):
+        def unlist(m):
+            m["files"].pop("Metro.app/Contents/MacOS/metro-tui")
+
+        def phantom(m):
+            m["files"]["Metro.app/Contents/MacOS/metro-tui"] = "0" * 64
+        for label, kw in (("binary not in RELEASE.json", dict(tui=True, manifest_fix=unlist)),
+                          ("RELEASE.json lists a missing binary", dict(manifest_fix=phantom))):
             with self.subTest(label):
                 shutil.rmtree(self.adhoc_dir)
                 self.adhoc_dir.mkdir()
@@ -528,6 +531,8 @@ class MacosReleaseTests(unittest.TestCase):
                 with self.assertRaises(mr.ReleaseError):
                     self.sign(fake, make_adhoc_archive(self.adhoc_dir, **kw))
                 self.assertEqual(fake.signs(), [])
+        # Packages from before the terminal client still sign (readers stay compatible).
+        self.assertEqual(mr.executables({"files": {}}), [mr.INNER_EXE, mr.SERVER, mr.LAUNCHER])
 
     def test_existing_output_is_never_overwritten(self):
         self.sign(FakeApple())

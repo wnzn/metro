@@ -306,47 +306,26 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --lib openai_oauth::store::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-      # metro-tui ships inside the desktop archives once its crate exists. Until then
-      # pull requests package without it, and release_assets.py refuses a tag.
-      - name: Is the metro-tui terminal client in this commit?
-        id: tui
-        run: |
-          cargo metadata --locked --no-deps --format-version 1 > "$env:RUNNER_TEMP\cargo-metadata.json"
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          $meta = Get-Content -Raw "$env:RUNNER_TEMP\cargo-metadata.json" | ConvertFrom-Json
-          $present = @($meta.packages | Where-Object { $_.name -eq 'metro-tui' }).Count -gt 0
-          "present=$($present.ToString().ToLower())" >> $env:GITHUB_OUTPUT
       - name: Build metro-desktop, metro-server and metro-tui (native, locked)
-        env:
-          TUI: ${{ steps.tui.outputs.present }}
         run: |
-          $bins = @('--bin', 'metro-desktop', '--bin', 'metro-server')
-          $files = @('metro-desktop.exe', 'metro-server.exe')
-          if ($env:TUI -eq 'true') { $bins += @('--bin', 'metro-tui'); $files += 'metro-tui.exe' }
-          cargo build --locked --release --target x86_64-pc-windows-msvc @bins
+          cargo build --locked --release --target x86_64-pc-windows-msvc --bin metro-desktop --bin metro-server --bin metro-tui
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          foreach ($f in $files) {
+          foreach ($f in 'metro-desktop.exe', 'metro-server.exe', 'metro-tui.exe') {
             if (-not (Test-Path "target\x86_64-pc-windows-msvc\release\$f")) { throw "missing $f" }
           }
       - name: Third-party notices
-        env:
-          TUI: ${{ steps.tui.outputs.present }}
         run: |
-          $pkgs = @('--package', 'metro-desktop', '--package', 'metro-server')
-          if ($env:TUI -eq 'true') { $pkgs += @('--package', 'metro-tui') }
-          python -I packaging/cargo-notices.py --target x86_64-pc-windows-msvc @pkgs `
+          python -I packaging/cargo-notices.py --target x86_64-pc-windows-msvc `
+            --package metro-desktop --package metro-server --package metro-tui `
             --out "$env:RUNNER_TEMP\notices-desktop.txt"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Package
         env:
           VERSION: ${{ needs.meta.outputs.version }}
-          TUI: ${{ steps.tui.outputs.present }}
         run: |
           $rel = 'target\x86_64-pc-windows-msvc\release'
-          $tui = @()
-          if ($env:TUI -eq 'true') { $tui = @('--tui', "$rel\metro-tui.exe") }
           python -I packaging/package.py desktop --target windows-x64 --version $env:VERSION `
-            --launcher "$rel\metro-desktop.exe" --server "$rel\metro-server.exe" @tui `
+            --launcher "$rel\metro-desktop.exe" --server "$rel\metro-server.exe" --tui "$rel\metro-tui.exe" `
             --ui-dir "$env:RUNNER_TEMP\stage\ui" --nsh-root "$env:RUNNER_TEMP\stage\nsh-root" `
             --notices "$env:RUNNER_TEMP\notices-desktop.txt" --out-dir dist
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -365,9 +344,13 @@ jobs:
           New-Item -ItemType Directory $dest | Out-Null
           Expand-Archive "dist\$name" -DestinationPath $dest
           $root = Join-Path $dest "Metro-$env:VERSION-windows-x64"
-          foreach ($f in 'Metro.exe', 'metro-server.exe', 'ui\Metro.exe', 'ui\nsh\bundle.nshc', 'ui\nsh\app.json', 'ui\nsh\capabilities.json', 'ui\nsh\icon.ico') {
+          foreach ($f in 'Metro.exe', 'metro-server.exe', 'metro-tui.exe', 'ui\Metro.exe', 'ui\nsh\bundle.nshc', 'ui\nsh\app.json', 'ui\nsh\capabilities.json', 'ui\nsh\icon.ico') {
             if (-not (Test-Path (Join-Path $root $f))) { throw "package is missing $f" }
           }
+          # The staged terminal client runs natively (console subsystem, no server needed for --help).
+          $help = & (Join-Path $root 'metro-tui.exe') --help
+          if ($LASTEXITCODE -ne 0) { throw "metro-tui.exe --help failed with $LASTEXITCODE" }
+          if (-not (($help -join "`n") -match 'Metro conversations')) { throw 'unexpected metro-tui.exe --help output' }
           python -I packaging/package.py verify-desktop-icons --target windows-x64 $root
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           # No standalone runner: it is Linux-only (openat2 confinement).
@@ -651,43 +634,23 @@ jobs:
           python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
           readelf --version | head -1
           cargo test --locked --release -p metro-desktop
-      # metro-tui ships inside the desktop archives once its crate exists. Until then
-      # pull requests package without it, and release_assets.py refuses a tag.
-      - name: Is the metro-tui terminal client in this commit?
-        id: tui
-        run: |
-          set -eu
-          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
-          present="$(python3 -I -c 'import json, sys; print(str(any(p["name"] == "metro-tui" for p in json.load(open(sys.argv[1]))["packages"])).lower())' "$RUNNER_TEMP/cargo-metadata.json")"
-          echo "present=$present" >> "$GITHUB_OUTPUT"
       - name: Build metro-desktop, metro-server and metro-tui (locked)
-        env:
-          TUI: ${{ steps.tui.outputs.present }}
         run: |
           set -eu
-          set -- --bin metro-desktop --bin metro-server
-          [ "$TUI" = true ] && set -- "$@" --bin metro-tui
-          cargo build --locked --release --target x86_64-unknown-linux-gnu "$@"
+          cargo build --locked --release --target x86_64-unknown-linux-gnu --bin metro-desktop --bin metro-server --bin metro-tui
       - name: Third-party notices
-        env:
-          TUI: ${{ steps.tui.outputs.present }}
         run: |
           set -eu
-          set -- --package metro-desktop --package metro-server
-          [ "$TUI" = true ] && set -- "$@" --package metro-tui
-          python3 -I packaging/cargo-notices.py --target x86_64-unknown-linux-gnu "$@" \
-            --out "$RUNNER_TEMP/notices-desktop.txt"
+          python3 -I packaging/cargo-notices.py --target x86_64-unknown-linux-gnu \
+            --package metro-desktop --package metro-server --package metro-tui --out "$RUNNER_TEMP/notices-desktop.txt"
       - name: Package
         env:
           VERSION: ${{ needs.meta.outputs.version }}
-          TUI: ${{ steps.tui.outputs.present }}
         run: |
           set -eu
           rel=target/x86_64-unknown-linux-gnu/release
-          set --
-          [ "$TUI" = true ] && set -- --tui "$rel/metro-tui"
-          python3 -I packaging/package.py desktop --target linux-x64 --version "$VERSION" "$@" \
-            --launcher "$rel/metro-desktop" --server "$rel/metro-server" \
+          python3 -I packaging/package.py desktop --target linux-x64 --version "$VERSION" \
+            --launcher "$rel/metro-desktop" --server "$rel/metro-server" --tui "$rel/metro-tui" \
             --ui-dir "$RUNNER_TEMP/stage/ui" --nsh-root "$RUNNER_TEMP/stage/nsh-root" \
             --notices "$RUNNER_TEMP/notices-desktop.txt" --out-dir dist
           ls -l dist
@@ -703,10 +666,13 @@ jobs:
           out="$(mktemp -d "$RUNNER_TEMP/desktop-extract.XXXXXX")"
           tar -xzf "dist/$name" -C "$out"
           root="$out/Metro-$VERSION-linux-x64"
-          for f in Metro metro-server ui/Metro ui/nsh/bundle.nshc ui/nsh/app.json ui/nsh/capabilities.json; do
+          for f in Metro metro-server metro-tui ui/Metro ui/nsh/bundle.nshc ui/nsh/app.json ui/nsh/capabilities.json; do
             test -e "$root/$f" || { echo "package is missing $f" >&2; exit 1; }
           done
-          test -x "$root/Metro" && test -x "$root/metro-server" && test -x "$root/ui/Metro"
+          test -x "$root/Metro" && test -x "$root/metro-server" && test -x "$root/metro-tui" && test -x "$root/ui/Metro"
+          # The staged terminal client runs (no server needed for --help).
+          "$root/metro-tui" --help > "$RUNNER_TEMP/tui-help.txt"
+          grep -q "Metro conversations" "$RUNNER_TEMP/tui-help.txt"
           python3 -I packaging/package.py verify-desktop-icons --target linux-x64 "$root"
           # No standalone runner: runner packages are separate.
           # (`! cmd` would not stop the step under set -e.)
@@ -899,42 +865,23 @@ jobs:
           cargo fetch --locked --target "$RUST_TARGET"
           python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
           cargo test --locked --release --target "$RUST_TARGET" -p metro-desktop
-      # metro-tui ships inside the desktop archives once its crate exists. Until then
-      # pull requests package without it, and release_assets.py refuses a tag.
-      - name: Is the metro-tui terminal client in this commit?
-        id: tui
-        run: |
-          set -eu
-          cargo metadata --locked --no-deps --format-version 1 > "$RUNNER_TEMP/cargo-metadata.json"
-          present="$(python3 -I -c 'import json, sys; print(str(any(p["name"] == "metro-tui" for p in json.load(open(sys.argv[1]))["packages"])).lower())' "$RUNNER_TEMP/cargo-metadata.json")"
-          echo "present=$present" >> "$GITHUB_OUTPUT"
       - name: Build metro-desktop, metro-server and metro-tui (native, locked)
-        env:
-          TUI: ${{ steps.tui.outputs.present }}
         run: |
           set -eu
-          set -- --bin metro-desktop --bin metro-server
-          [ "$TUI" = true ] && set -- "$@" --bin metro-tui
-          cargo build --locked --release --target "$RUST_TARGET" "$@"
+          cargo build --locked --release --target "$RUST_TARGET" --bin metro-desktop --bin metro-server --bin metro-tui
       - name: Third-party notices
-        env:
-          TUI: ${{ steps.tui.outputs.present }}
         run: |
           set -eu
-          set -- --package metro-desktop --package metro-server
-          [ "$TUI" = true ] && set -- "$@" --package metro-tui
-          python3 -I packaging/cargo-notices.py --target "$RUST_TARGET" "$@" --out "$RUNNER_TEMP/notices-desktop.txt"
+          python3 -I packaging/cargo-notices.py --target "$RUST_TARGET" \
+            --package metro-desktop --package metro-server --package metro-tui --out "$RUNNER_TEMP/notices-desktop.txt"
       - name: Package (outer Metro.app, ad hoc signed preview)
         env:
           VERSION: ${{ needs.meta.outputs.version }}
-          TUI: ${{ steps.tui.outputs.present }}
         run: |
           set -eu
           rel="target/$RUST_TARGET/release"
-          set --
-          [ "$TUI" = true ] && set -- --tui "$rel/metro-tui"
-          python3 -I packaging/package.py desktop --target "$TARGET" --version "$VERSION" "$@" \
-            --launcher "$rel/metro-desktop" --server "$rel/metro-server" \
+          python3 -I packaging/package.py desktop --target "$TARGET" --version "$VERSION" \
+            --launcher "$rel/metro-desktop" --server "$rel/metro-server" --tui "$rel/metro-tui" \
             --ui-dir "$RUNNER_TEMP/out-macos/Metro.app" --nsh-root "$RUNNER_TEMP/nsh-macos/nsh" \
             --notices "$RUNNER_TEMP/notices-desktop.txt" --out-dir dist-macos
           ls -l dist-macos
@@ -955,6 +902,9 @@ jobs:
           test "$(find "$dir" -mindepth 1 -maxdepth 1 -exec basename {} \; | sort | tr '\n' ' ')" = "Metro.app enable-local-runner "
           codesign --verify --deep --strict "$app"
           codesign --verify --strict "$app/Contents/Helpers/MetroUI.app"
+          codesign --verify --strict "$app/Contents/MacOS/metro-tui"
+          "$app/Contents/MacOS/metro-tui" --help > "$RUNNER_TEMP/tui-help.txt"
+          grep -q "Metro conversations" "$RUNNER_TEMP/tui-help.txt"
           plutil -extract CFBundleIdentifier raw "$app/Contents/Info.plist" | grep -qx dev.metro.desktop
           plutil -extract CFBundleIdentifier raw "$app/Contents/Helpers/MetroUI.app/Contents/Info.plist" | grep -qx dev.metro.desktop.ui
 
@@ -1071,6 +1021,9 @@ jobs:
           manifest="$home/Library/Application Support/Metro/Installer/RELEASE.json"
           # The ticket survived the archive, the installer's copy and its move.
           python3 -I packaging/macos_release.py verify-app --app "$app" --manifest "$manifest"
+          # The signed terminal client runs under the hardened runtime from the installed bundle.
+          "$app/Contents/MacOS/metro-tui" --help > "$RUNNER_TEMP/tui-help.txt"
+          grep -q "Metro conversations" "$RUNNER_TEMP/tui-help.txt"
           export METRO_DESKTOP_HOME="$home/desktop data"
           sh packaging/smoke-macos-launch.sh "$app" "$manifest" "$RUNNER_TEMP/shot" "release-$TARGET"
           HOME="$home" sh "$i" uninstall

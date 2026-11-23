@@ -307,9 +307,9 @@ def unsigned_digest(run, path, work):
 
 
 def executables(manifest):
-    """The executables Metro.app must hold: RELEASE.json decides whether metro-tui ships."""
-    tui = manifest.get("tui")
-    require(tui in (None, "Metro.app/" + TUI), "RELEASE.json names an unexpected terminal client")
+    """The executables Metro.app must hold; metro-tui ships when RELEASE.json lists it
+    (older packages without it remain readable)."""
+    tui = "Metro.app/" + TUI in manifest.get("files", {})
     return [INNER_EXE, SERVER, *([TUI] if tui else []), LAUNCHER]
 
 

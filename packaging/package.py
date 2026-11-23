@@ -34,7 +34,7 @@ NSH_MACOS_APPS = {
 MACOS_UI_ID = "dev.metro.desktop.ui"
 # RELEASE.json capability: this launcher acts on the installer's marker.
 LOCAL_RUNNER = "installer-marker"
-# The terminal client inside each desktop archive (RELEASE.json "tui" names it).
+# The terminal client inside each desktop archive (listed in RELEASE.json "files").
 TUI_NAMES = {"linux": "metro-tui", "windows": "metro-tui.exe", "macos": "Contents/MacOS/metro-tui"}
 MACOS_MIN = "14.0"
 NSH_LICENSE_SHA = "ec75427ad955e3c740f22e7dc3f6db6fc5b2cc1d9135c2af91cece8dd47a2d38"
@@ -428,13 +428,12 @@ def desktop(args, stage):
     server_name = "metro-server.exe" if windows else "metro-server"
     deps[server_name] = pe(args.server) if windows else elf(args.server, (2, 39))
     copy(args.server, stage / server_name, True)
-    extra = {}
     if args.tui:
-        # The terminal client ships in the same archive under a fixed name.
+        # The terminal client ships in the same archive under a fixed name. Readers find it in
+        # "files"; RELEASE.json gets no new key (winsign.py checks an exact key set).
         tui_name = TUI_NAMES[platform]
         deps[tui_name] = pe(args.tui) if windows else elf(args.tui, (2, 39))
         copy(args.tui, stage / tui_name, True)
-        extra["tui"] = tui_name
         integration += f"\nTerminal client: run {tui_name} from a terminal in this folder.\n"
     write(stage / "START.txt", f"Extract this entire archive. Launch {executable} at the top level.\n"
           "Keep the bundled server and ui directory next to the launcher.\n\n"
@@ -446,7 +445,7 @@ def desktop(args, stage):
           + prerequisites)
     # The launcher reads the installer's enable-local-runner marker (see
     # desktop_tools::runner). Archives without this field predate that.
-    return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked", "local_runner": LOCAL_RUNNER, **extra}
+    return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked", "local_runner": LOCAL_RUNNER}
 
 
 def macho(path, cputype):
@@ -575,7 +574,6 @@ def macos(args, stage):
           "~/Applications/Metro Desktop/ and keeps your data in\n"
           "~/Library/Application Support/Metro/Desktop.\n")
     return {"nsh": NSH_VERSION, "dependencies": deps, "connector": "linked", "local_runner": LOCAL_RUNNER,
-            **({"tui": "Metro.app/" + TUI_NAMES["macos"]} if args.tui else {}),
             "signing": "adhoc",
             "status": "preview-not-verified",
             "renderer": {"stock_unsigned_sha256": stock_sha, "packaged_signed_sha256": source_exe,

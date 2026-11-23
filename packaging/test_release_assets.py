@@ -1,5 +1,6 @@
 """Contract tests for release_assets.py: the release aggregate, image evidence and signed set."""
 
+import ast
 import hashlib
 import io
 import json
@@ -14,16 +15,20 @@ import tempfile
 import unittest
 import zipfile
 
+import package
 import release_assets as ra
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "release-signatures"))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "windows-signing"))
 import release_signatures  # noqa: E402
+import winsign  # noqa: E402  (the Windows lane's own verifier: manifest keys, script signature format)
 
 HERE = Path(__file__).resolve().parent
 V = "0.3.0"
 OWNER = "wnzn"  # release_signatures.py pins the wnzn/metro repository
 REV = "a" * 40
-PS1_SIG = "\r\n# SIG # Begin signature block\r\n# MIIFakeBase64==\r\n# SIG # End signature block\r\n"
+# One PowerShell signature block around a tiny, well-formed DER object (winsign.parse_exact accepts it).
+PS1_SIG = b"# SIG # Begin signature block\r\n# MAMCAQE=\r\n# SIG # End signature block\r\n"
 
 
 def sha(data):
@@ -80,31 +85,43 @@ def mac_fields(**over):
     return fields
 
 
-def collected(folder, mode="release", windows_signed=True, mac=None, msi_signed=True, ps1_signed=True, tui=True):
-    """What the dist-* artifacts of one run hold."""
+def windows_fields(files, mode):
+    """RELEASE.json beyond kind/target/version/files, in winsign.py's exact schema."""
+    exes = [n for n in winsign.SIGNED_EXES if n in files]
+    fields = {"nsh": package.NSH_VERSION, "connector": "linked", "local_runner": package.LOCAL_RUNNER,
+              "dependencies": {n: {"imports": ["kernel32.dll"]} for n in exes}}
+    if mode:
+        fields["signing"] = {"mode": mode, "seed_sha256": "0" * 64, "stock_renderer_unsigned_sha256": "1" * 64,
+                             "files": {}}
+    return fields
+
+
+def collected(folder, mode="release", windows_signed=True, mac=None, msi_signed=True, ps1_signed=True, tui=True,
+              win_mode=None):
+    """What the dist-* artifacts of one run hold, named and shaped as the real producers write them."""
     folder.mkdir(parents=True, exist_ok=True)
     linux = {"Metro": b"\x7fELF launcher", "START.txt": b"s", **({"metro-tui": b"\x7fELF tui"} if tui else {})}
-    write_archive(folder, f"Metro-{V}-linux-x64", linux, "desktop", "linux-x64", {"tui": "metro-tui"} if tui else None)
+    write_archive(folder, f"Metro-{V}-linux-x64", linux, "desktop", "linux-x64")
     write_archive(folder, f"Metro-runner-{V}-linux-x64", {"metro-runner": b"\x7fELF runner"}, "runner", "linux-x64")
-    write_archive(folder, f"Metro-{V}-windows-x64",
-                  {"Metro.exe": pe(windows_signed), "metro-server.exe": pe(windows_signed),
-                   "ui/Metro.exe": pe(windows_signed), "START.txt": b"s",
-                   **({"metro-tui.exe": pe(windows_signed)} if tui else {})}, "desktop", "windows-x64",
-                  {**({"signing": "authenticode"} if windows_signed else {}), **({"tui": "metro-tui.exe"} if tui else {})})
-    msi = folder / f"Metro-{V}-windows-x64.msi"
+    win = {"Metro.exe": pe(windows_signed), "metro-server.exe": pe(windows_signed),
+           "ui/Metro.exe": pe(windows_signed), "START.txt": b"s",
+           **({"metro-tui.exe": pe(windows_signed)} if tui else {})}
+    signing_mode = win_mode or ("authenticode" if mode == "release" else "unsigned-preview")
+    write_archive(folder, f"Metro-{V}-windows-x64", win, "desktop", "windows-x64", windows_fields(win, signing_mode))
+    msi = folder / ra.Layout(V, mode).msi
     msi.write_bytes(b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1" + b"\0" * 64
                     + (ra.MSI_SIGNATURE if msi_signed else b"") + b"\0" * 32)
     sidecar(msi)
     for script in ra.PS1_SCRIPTS:
-        body = f"# {script} from the Windows signer\r\nWrite-Output 'x'\r\n" + (PS1_SIG if ps1_signed else "")
-        (folder / script).write_text(body)
+        source = (HERE / script).read_bytes()  # preview: unchanged source; tag: source + one signature block
+        (folder / script).write_bytes(source + (PS1_SIG if ps1_signed and mode == "release" else b""))
     if mode == "release":
         for target in ("macos-arm64", "macos-x64"):
             write_archive(folder, f"Metro-{V}-{target}",
                           {"Metro.app/Contents/MacOS/Metro": b"\xcf\xfa\xed\xfe",
                            "Metro.app/Contents/MacOS/metro-tui": b"\xcf\xfa\xed\xfe tui",
                            "Metro.app/Contents/CodeResources": b"ticket"},
-                          "desktop", target, {"tui": "Metro.app/Contents/MacOS/metro-tui", **(mac or mac_fields())})
+                          "desktop", target, mac or mac_fields())
     return folder
 
 
@@ -158,10 +175,13 @@ class AssembleTests(unittest.TestCase):
         for line in sums:
             digest, name = line.split("  ")
             self.assertEqual(sha((self.out / name).read_bytes()), digest)
-        # The signed .ps1 scripts are the Windows signer's, never checkout copies.
+        # The signed .ps1 scripts are the Windows signer's bytes, never checkout copies, and the
+        # Windows lane's own parser accepts them as source + one signature block.
         for script in ra.PS1_SCRIPTS:
-            self.assertIn("# SIG # Begin signature block", (self.out / script).read_text())
-            self.assertNotEqual((self.out / script).read_bytes(), (HERE / script).read_bytes())
+            signed, source = (self.out / script).read_bytes(), (HERE / script).read_bytes()
+            self.assertNotEqual(signed, source)
+            info = winsign.script_unsigned_info(source, script)
+            self.assertEqual(winsign.script_split(signed, info, script)[0], source)
         for script in ("install-metro-linux.sh", "install-metro-macos.sh"):
             self.assertEqual((self.out / script).read_bytes(), (HERE / script).read_bytes())
 
@@ -169,7 +189,45 @@ class AssembleTests(unittest.TestCase):
         self.assemble("smoke", windows_signed=False, msi_signed=False, ps1_signed=False, tui=False)
         names = {p.name for p in self.out.iterdir()}
         self.assertFalse(any("macos" in n for n in names))
-        self.assertIn(f"Metro-{V}-windows-x64.msi", names)
+        # windows-distribution.yml's preview name; the release name never appears on a preview.
+        self.assertIn(f"Metro-{V}-windows-x64.unsigned-preview.msi", names)
+        self.assertNotIn(f"Metro-{V}-windows-x64.msi", names)
+        for script in ra.PS1_SCRIPTS:
+            self.assertEqual((self.out / script).read_bytes(), (HERE / script).read_bytes())
+
+    def test_names_and_schema_match_the_real_windows_producers(self):
+        workflow = (HERE.parent / ".github/workflows/windows-distribution.yml").read_text()
+        self.assertIn('Metro-$VERSION-windows-x64.unsigned-preview.msi', workflow)
+        self.assertIn("name: dist-desktop-windows-x64", workflow)
+        sign = (HERE.parent / ".github/workflows/windows-sign.yml").read_text()
+        self.assertIn("name: dist-desktop-windows-x64", sign)
+        self.assertEqual(set(ra.PS1_SCRIPTS), set(winsign.SCRIPTS))
+        self.assertEqual(ra.TUI["windows-x64"], winsign.TUI_EXE)
+        for mode, official in (("release", True), ("smoke", False)):
+            src = collected(self.root / f"real-{mode}", mode)
+            name = f"Metro-{V}-windows-x64.zip"
+            with zipfile.ZipFile(src / name) as z:
+                manifest = json.loads(z.read(f"Metro-{V}-windows-x64/RELEASE.json"))
+            winsign.check_manifest(manifest, V, True, official)
+            self.assertEqual({"mode": "authenticode" if official else "unsigned-preview"}["mode"],
+                             manifest["signing"]["mode"])
+        # package.py writes exactly winsign.MANIFEST_KEYS for Windows (no extra key such as "tui").
+        tree = ast.parse((HERE / "package.py").read_text())
+        desktop = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "desktop")
+        returned = next(n.value for n in ast.walk(desktop) if isinstance(n, ast.Return))
+        keys = {k.value for k in returned.keys if isinstance(k, ast.Constant)}
+        self.assertEqual(keys | {"version", "target", "kind", "files"}, winsign.MANIFEST_KEYS)
+
+    def test_ps1_must_be_this_checkouts_script(self):
+        src = collected(self.root / "collected", "smoke")
+        (src / "metro-runner-container.ps1").write_bytes(b"Write-Output 'other'\r\n")
+        with self.assertRaisesRegex(ra.AssetError, "differs from this checkout"):
+            ra.assemble(V, "smoke", src, self.out)
+        shutil.rmtree(src)
+        src = collected(self.root / "collected")
+        (src / "install-metro-windows.ps1").write_bytes(b"# changed\r\n" + PS1_SIG)
+        with self.assertRaisesRegex(ra.AssetError, "plus one Authenticode block"):
+            ra.assemble(V, "release", src, self.out)
 
     def test_release_refuses_what_must_never_ship(self):
         cases = {
@@ -180,6 +238,7 @@ class AssembleTests(unittest.TestCase):
             "unsigned Windows seed": dict(windows_signed=False),
             "unsigned MSI": dict(msi_signed=False),
             "unsigned ps1": dict(ps1_signed=False),
+            "preview-mode Windows ZIP": dict(win_mode="unsigned-preview"),
             "no terminal client": dict(tui=False),
         }
         for label, kw in cases.items():
@@ -239,8 +298,12 @@ class AssembleTests(unittest.TestCase):
         self.assertTrue(ra.authenticode_present(pe(True)))
         self.assertFalse(ra.authenticode_present(pe(False)))
         self.assertFalse(ra.authenticode_present(b"MZ" + b"\0" * 10))
-        self.assertTrue(ra.ps1_signed(("x\n" + PS1_SIG).encode()))
-        self.assertFalse(ra.ps1_signed(b"# SIG # Begin signature block\n"))
+        self.assertTrue(ra.ps1_signed(b"x\r\n" + PS1_SIG, b"x\r\n"))
+        self.assertTrue(ra.ps1_signed(b"x" + b"\r\n" + PS1_SIG, b"x"))
+        self.assertFalse(ra.ps1_signed(b"x\r\n" + PS1_SIG + PS1_SIG, b"x\r\n"))
+        self.assertFalse(ra.ps1_signed(b"y\r\n" + PS1_SIG, b"x\r\n"))
+        self.assertFalse(ra.ps1_signed(b"x\r\n# SIG # Begin signature block\r\n", b"x\r\n"))
+        self.assertTrue(winsign.SIG_BLOCK.match(PS1_SIG))
 
 
 class SignerContractTests(unittest.TestCase):

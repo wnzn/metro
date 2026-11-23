@@ -270,6 +270,31 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("already published; refusing", text)
         self.assertIn("IMAGES.txt", text)
 
+    def test_every_desktop_build_ships_and_runs_the_terminal_client(self):
+        jobs = self.release["jobs"]
+        for name in ("desktop-windows", "desktop-linux", "desktop-macos"):
+            text = steps_text(jobs[name])
+            self.assertNotIn("steps.tui", yaml.safe_dump(jobs[name]), name)  # no optional discovery
+            self.assertRegex(text, r"cargo build --locked --release --target \S+ --bin metro-desktop --bin metro-server "
+                                   r"--bin metro-tui", name)
+            self.assertIn("--package metro-desktop --package metro-server --package metro-tui", text, name)
+            self.assertRegex(text, r'--tui "\$rel[\\/]metro-tui(\.exe)?"', name)
+            self.assertIn("--help", text[text.find("--tui"):], name)
+            self.assertIn("Metro conversations", text, name)
+        gate = steps_text(jobs["macos-sign"])
+        self.assertLess(gate.find("verify-app"), gate.find("Contents/MacOS/metro-tui\" --help"))
+
+    def test_ci_runs_the_terminal_client_in_a_real_pty(self):
+        rust = self.ci["jobs"]["rust"]
+        builds = [s["run"] for s in rust["steps"] if "--bin metro-runner" in str(s.get("run", ""))]
+        self.assertEqual(builds, ["cargo build --locked --bin metro-server --bin metro-runner --bin metro-connector "
+                                  "--bin metro-tui"])
+        pty = [s for s in rust["steps"] if "pty_qa.py" in str(s.get("run", ""))]
+        self.assertEqual(len(pty), 1)
+        self.assertLessEqual(pty[0]["timeout-minutes"], 10)
+        self.assertIn("python3 -B crates/tui/tests/pty_qa.py --bin-dir target/debug", pty[0]["run"])
+        self.assertIn("timeout --kill-after=", pty[0]["run"])
+
     def test_signer_and_image_contracts_line_up(self):
         signer = (WF / "sign-release-assets.yml").read_text()
         self.assertIn("name: release-assets", signer)

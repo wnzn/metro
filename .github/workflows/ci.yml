@@ -26,7 +26,7 @@ jobs:
       - run: cargo test --locked --workspace
       - run: ./examples/workspace/check.sh
       - name: Locked debug build of every binary the end-to-end tests run
-        run: cargo build --locked --bin metro-server --bin metro-runner --bin metro-connector
+        run: cargo build --locked --bin metro-server --bin metro-runner --bin metro-connector --bin metro-tui
       - name: Release build of the Linux connector companion
         run: |
           set -eu
@@ -58,6 +58,9 @@ jobs:
         run: python3 tests/e2e/library.py --bin-dir target/debug --timeout 120
       - name: Chat attachments survive restart and follow Library access
         run: python3 tests/e2e/attachments.py --bin-dir target/debug --timeout 60
+      - name: metro-tui in a real PTY against an isolated server and a scripted model
+        timeout-minutes: 5
+        run: timeout --kill-after=15s 240s python3 -B crates/tui/tests/pty_qa.py --bin-dir target/debug
 
   desktop:
     runs-on: ubuntu-24.04
