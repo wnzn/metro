@@ -9,8 +9,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
+use crate::openai_oauth::LocalFailure;
+
 const LIMIT: usize = 100;
-const MAX_BYTES: u64 = 16 * 1024;
+const MAX_BYTES: u64 = 64 * 1024;
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,7 +103,51 @@ impl EventKind {
 #[serde(deny_unknown_fields)]
 struct Record {
     unix_seconds: u64,
-    kind: EventKind,
+    kind: StoredKind,
+}
+
+/// Keep the existing on-disk category strings readable. A diagnostic is a
+/// distinct typed record, not a generic event plus a second diagnostic.
+#[derive(Deserialize, Serialize)]
+#[serde(untagged)]
+enum StoredKind {
+    Basic(EventKind),
+    ChatGpt(ChatGptRecord),
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ChatGptRecord {
+    #[serde(deserialize_with = "canonical_diagnostic")]
+    chatgpt: LocalFailure,
+}
+
+fn canonical_diagnostic<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> std::result::Result<LocalFailure, D::Error> {
+    use serde::de::Error;
+
+    let stored = serde_json::Value::deserialize(deserializer)?;
+    let detail: LocalFailure = serde_json::from_value(stored.clone()).map_err(Error::custom)?;
+    // Provider input can be normalized to safe labels. The persisted record
+    // must already be canonical: if normalization changed any value, refuse
+    // it. There is only one copy of the allowlists (in LocalFailure).
+    if serde_json::to_value(detail).map_err(Error::custom)? != stored {
+        return Err(Error::custom("invalid stored diagnostic"));
+    }
+    Ok(detail)
+}
+
+impl From<EventKind> for StoredKind {
+    fn from(kind: EventKind) -> Self {
+        Self::Basic(kind)
+    }
+}
+
+impl From<LocalFailure> for StoredKind {
+    fn from(chatgpt: LocalFailure) -> Self {
+        Self::ChatGpt(ChatGptRecord { chatgpt })
+    }
 }
 
 #[derive(Serialize)]
@@ -109,7 +155,7 @@ pub struct Event {
     timestamp: String,
     component: &'static str,
     code: &'static str,
-    summary: &'static str,
+    summary: String,
 }
 
 #[derive(Clone)]
@@ -130,6 +176,10 @@ impl Events {
         let _ = self.append(kind);
     }
 
+    pub(super) fn record_chatgpt(&self, failure: LocalFailure) {
+        let _ = self.append(failure);
+    }
+
     pub fn recent(&self) -> Result<Vec<Event>> {
         // A reader can use either snapshot during an atomic replacement.
         // Verify both directories even on the read-only path.
@@ -143,7 +193,17 @@ impl Events {
             .into_iter()
             .rev()
             .map(|r| {
-                let (component, code, summary) = r.kind.fields();
+                let (component, code, summary) = match r.kind {
+                    StoredKind::Basic(kind) => {
+                        let (component, code, summary) = kind.fields();
+                        (component, code, summary.to_owned())
+                    }
+                    StoredKind::ChatGpt(detail) => (
+                        "device_connector",
+                        detail.chatgpt.code(),
+                        detail.chatgpt.summary(),
+                    ),
+                };
                 Event {
                     timestamp: timestamp(r.unix_seconds),
                     component,
@@ -154,7 +214,7 @@ impl Events {
             .collect())
     }
 
-    fn append(&self, kind: EventKind) -> Result<()> {
+    fn append(&self, kind: impl Into<StoredKind>) -> Result<()> {
         if self.0.parent().is_none_or(|p| !p.is_absolute()) {
             bail!("monitoring root must be absolute");
         }
@@ -184,11 +244,17 @@ impl Events {
 
         let unix_seconds = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
         let mut records = self.read_snapshot(true)?;
-        records.push(Record { unix_seconds, kind });
+        records.push(Record {
+            unix_seconds,
+            kind: kind.into(),
+        });
         if records.len() > LIMIT {
             records.remove(0);
         }
         let bytes = serde_json::to_vec(&records)?;
+        if bytes.len() as u64 > MAX_BYTES {
+            bail!("monitoring snapshot exceeded its size limit");
+        }
         // Exactly one bounded staging file, even if a launcher is killed
         // before the rename. Never truncate an existing file in place.
         let temp = self.0.join("events.tmp");
@@ -341,6 +407,8 @@ fn timestamp(seconds: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::desktop::bridge;
+    use crate::desktop::core::{Desktop, DesktopConfig};
 
     #[test]
     fn rotates_and_reopens_private_allowlisted_snapshots() {
@@ -392,6 +460,164 @@ mod tests {
         assert!(events.recent().is_err());
         events.append(EventKind::LocalServerExited).unwrap();
         assert_eq!(events.recent().unwrap()[0].code, "local_server_exited");
+    }
+
+    fn diagnostic_fixture() -> serde_json::Value {
+        serde_json::json!({
+            "operation": "inference",
+            "phase": "http",
+            "http_status": 503,
+            "provider_code": "unrecognized",
+            "provider_param": "reasoning.effort",
+            "code": "chatgpt_service_or_routing_unavailable",
+        })
+    }
+
+    #[tokio::test]
+    async fn chatgpt_diagnostic_is_only_on_the_authenticated_device_view() {
+        let failure: LocalFailure = serde_json::from_value(diagnostic_fixture()).unwrap();
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("desktop");
+        let events = Events::new(&root);
+        events.record_chatgpt(failure);
+        let text = fs::read_to_string(events.path()).unwrap();
+        assert!(!text.contains("\"summary\""));
+
+        let desktop = Desktop::new(DesktopConfig::new(root, true, None));
+        let bridge = bridge::start(desktop).await.unwrap();
+        let endpoint = format!("{}/v1/monitoring/events", bridge.url);
+        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let refused = client.get(&endpoint).send().await.unwrap();
+        assert_eq!(refused.status(), 401);
+        assert!(!refused.text().await.unwrap().contains(failure.code()));
+        let response = client
+            .get(&endpoint)
+            .bearer_auth(bridge.token.expose())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        let response = crate::http::read_json(response, MAX_BYTES as usize)
+            .await
+            .unwrap();
+        let list = response["events"].as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["component"], "device_connector");
+        assert_eq!(list[0]["code"], failure.code());
+        assert_eq!(list[0]["summary"], failure.summary());
+        assert_eq!(list[0].as_object().unwrap().len(), 4);
+        bridge.stop().await;
+
+        let other = Desktop::new(DesktopConfig::new(t.path().join("other"), true, None));
+        let other = bridge::start(other).await.unwrap();
+        let response = client
+            .get(format!("{}/v1/monitoring/events", other.url))
+            .bearer_auth(other.token.expose())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            crate::http::read_json(response, MAX_BYTES as usize)
+                .await
+                .unwrap(),
+            serde_json::json!({"events": []}),
+        );
+        other.stop().await;
+    }
+
+    #[tokio::test]
+    async fn observed_job_keeps_the_relay_body_fixed() {
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        use crate::metro::Job;
+        use crate::profile::{DEFAULT_REQUEST_TIMEOUT_SECS, Kind, Profile, ProfileConfig};
+        use crate::provider::Provider;
+        use crate::run::{FailureObserver, handle_job_observed};
+
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("desktop");
+        let events = Events::new(&root);
+        let profile = Profile::open(&root, "test").unwrap();
+        let config = ProfileConfig {
+            version: 1,
+            kind: Kind::OpenAiOAuth,
+            server_url: "http://127.0.0.1:1".into(),
+            models: vec!["gpt-6.2-sol".into()],
+            base_url: None,
+            request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+        };
+        // No sign-in means a deterministic, offline failure before any
+        // provider HTTP request. The body is what the worker posts to Metro.
+        let provider = Provider {
+            profile: &profile,
+            config: &config,
+        };
+        let job = Job {
+            id: "fixture-job".into(),
+            operation: "complete".into(),
+            request: serde_json::json!({
+                "model": "gpt-6.2-sol",
+                "messages": [{"role": "user", "content": "private-prompt-canary"}],
+            }),
+        };
+        let record = events.clone();
+        let observer: FailureObserver = Arc::new(move |failure| record.record_chatgpt(failure));
+        let result = handle_job_observed(
+            &provider,
+            &job,
+            Instant::now() + Duration::from_secs(5),
+            Some(&observer),
+        )
+        .await;
+        assert_eq!(
+            result,
+            serde_json::json!({
+                "ok": false,
+                "error": "The ChatGPT sign-in for this connection ended or was not accepted. Sign in again on the device.",
+            })
+        );
+        let saved = events.recent().unwrap();
+        assert_eq!(saved.len(), 1);
+        assert_eq!(saved[0].code, "chatgpt_sign_in");
+        assert!(
+            saved[0]
+                .summary
+                .contains("operation=inference phase=session")
+        );
+        assert!(
+            !fs::read_to_string(events.path())
+                .unwrap()
+                .contains("private-prompt-canary")
+        );
+    }
+
+    #[test]
+    fn reloading_a_chatgpt_diagnostic_validates_every_field() {
+        let t = tempfile::tempdir().unwrap();
+        let events = Events::new(&t.path().join("desktop"));
+        events.append(EventKind::DeviceWorkerFailed).unwrap();
+        for (field, value) in [
+            ("operation", serde_json::json!("private-operation")),
+            ("phase", serde_json::json!("private-phase")),
+            ("http_status", serde_json::json!(999)),
+            ("http_status", serde_json::json!("503")),
+            ("provider_code", serde_json::json!("user@example.test")),
+            ("provider_param", serde_json::json!("tools[0].private")),
+            ("code", serde_json::json!("private-category")),
+            ("summary", serde_json::json!("private-summary")),
+        ] {
+            let mut fixture = diagnostic_fixture();
+            fixture[field] = value;
+            let raw = serde_json::json!([{
+                "unix_seconds": 42,
+                "kind": { "chatgpt": fixture },
+            }]);
+            fs::write(events.path(), serde_json::to_vec(&raw).unwrap()).unwrap();
+            assert!(events.recent().is_err(), "accepted invalid {field}");
+        }
     }
 
     #[cfg(unix)]

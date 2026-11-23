@@ -35,7 +35,7 @@ use crate::profile::{
     validate_provider_key,
 };
 use crate::provider::Provider;
-use crate::run::{RunOptions, RunState, Stop, run};
+use crate::run::{RunOptions, RunState, Stop, run_with_failure_observer};
 use crate::secret::clean_line;
 use crate::{SafeError, Secret, claude_code};
 
@@ -52,6 +52,68 @@ pub fn err(status: u16, code: &'static str, message: impl AsRef<str>) -> BridgeE
         status,
         code,
         message: clean_line(message.as_ref(), 300),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn direct_catalog_failure_records_one_local_diagnostic() {
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("desktop");
+        store::prepare_private_dir(&root).unwrap();
+        let desktop = Desktop::new(DesktopConfig::new(root.clone(), true, None));
+        let server = "http://127.0.0.1:1";
+        let account = "private-account-canary";
+        let connection = "catalog-fixture";
+        lock(&desktop.state).session = Some(Session {
+            server_url: server.into(),
+            account_id: account.into(),
+            token: Secret::new("private-token-canary"),
+        });
+        let profile = store::profile_for(&root, server, account, connection).unwrap();
+        profile
+            .save(&ProfileConfig {
+                version: 1,
+                kind: Kind::OpenAiOAuth,
+                server_url: server.into(),
+                models: vec![],
+                base_url: None,
+                request_timeout_secs: DEFAULT_REQUEST_TIMEOUT_SECS,
+            })
+            .unwrap();
+        store::save_binding(
+            &profile,
+            &Binding {
+                version: 1,
+                server_url: server.into(),
+                account_id: account.into(),
+                connection_id: connection.into(),
+                kind: Kind::OpenAiOAuth,
+                keyless: false,
+            },
+        )
+        .unwrap();
+
+        // No sign-in: the real adapter fails before making a network call.
+        let error = desktop.available_models(connection).await.unwrap_err();
+        assert_eq!(error.code, "provider_error");
+        assert!(error.message.contains("Sign in again on the device."));
+        assert!(!error.message.contains("operation="));
+
+        let events = json!(desktop.events.recent().unwrap());
+        let list = events.as_array().unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["code"], "chatgpt_sign_in");
+        assert!(
+            list[0]["summary"]
+                .as_str()
+                .unwrap()
+                .contains("operation=catalog phase=session")
+        );
+        assert!(!events.to_string().contains("private-"));
     }
 }
 
@@ -606,7 +668,14 @@ impl Desktop {
                         profile: &p,
                         config: &cfg,
                     };
-                    run(&client, &provider, &opts).await
+                    let diagnostics = events.clone();
+                    run_with_failure_observer(
+                        &client,
+                        &provider,
+                        &opts,
+                        Arc::new(move |failure| diagnostics.record_chatgpt(failure)),
+                    )
+                    .await
                 }
                 Err(_) => Stop::Fatal("cannot start the HTTP client".into()),
             };
@@ -1334,8 +1403,13 @@ impl Desktop {
             config: &b.config,
         };
         let result = tokio::time::timeout(Duration::from_secs(60), p.available_models()).await;
-        if !matches!(&result, Ok(Ok(_))) {
-            self.events.record(EventKind::DeviceModelDiscoveryFailed);
+        match &result {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => match openai_oauth::local_failure(e) {
+                Some(failure) => self.events.record_chatgpt(failure),
+                None => self.events.record(EventKind::DeviceModelDiscoveryFailed),
+            },
+            Err(_) => self.events.record(EventKind::DeviceModelDiscoveryFailed),
         }
         match result {
             Ok(Ok(models)) => Ok(json!({"models": models})),
