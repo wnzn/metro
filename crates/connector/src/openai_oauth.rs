@@ -26,7 +26,11 @@
 //!    `chatgpt.tokens.use.direct`.
 //! 4. **Inference.** Requests go to `POST {api}/responses` with
 //!    `store:false, stream:true`. The SSE stream is read within fixed limits
-//!    and only `response.completed` counts as success. Models come from
+//!    and only `response.completed` counts as success. A whole JSON Responses
+//!    object with `status: completed` is accepted too, and a success body
+//!    without a recognized `content-type` is sniffed as SSE or JSON. Reasoning
+//!    *summaries* pass through as `reasoning_content`; encrypted or raw
+//!    reasoning never does. Models come from
 //!    `GET {api}/models` (`visibility == "list"`).
 //! 5. **Refresh and sign-out.** Refreshes are serialized across processes by
 //!    a lock file in the profile, and the rotating refresh token is replaced
@@ -70,8 +74,9 @@
 //! fields, but never reports provider text, IDs or request contents.
 //!
 //! Under that text the error carries a [`LocalFailure`] for the device's own
-//! log: operation, phase, numeric HTTP status and allowlisted provider code
-//! and parameter, nothing else. Read it with [`local_failure`]. Metro's job
+//! log: operation, phase, numeric HTTP status, allowlisted provider code and
+//! parameter, and for success answers the class of their `content-type`
+//! ([`MediaType`]), nothing else. Read it with [`local_failure`]. Metro's job
 //! result uses only the fixed text.
 
 mod diagnostic;
@@ -88,7 +93,7 @@ use std::time::Duration;
 
 use serde::Serialize;
 
-pub use diagnostic::{LocalFailure, Operation, Phase, UNRECOGNIZED, local_failure};
+pub use diagnostic::{LocalFailure, MediaType, Operation, Phase, UNRECOGNIZED, local_failure};
 pub use flow::LogoutOutcome;
 
 /// `agent_name_hint` sent on first registration. It's also the display name in

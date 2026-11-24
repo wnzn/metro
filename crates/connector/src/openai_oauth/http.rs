@@ -33,6 +33,10 @@ pub(crate) enum Category {
     Incomplete,
     Interrupted,
     UnexpectedResponse,
+    /// OpenAI answered with success, but not with an answer Metro can use:
+    /// an unrecognized body, or a completed response with no text, refusal
+    /// or tool call that Metro reads.
+    UnusableResponse,
     Rejected,
     Unavailable,
     /// Inference answered 503 with no documented code: the service is down,
@@ -44,7 +48,7 @@ pub(crate) enum Category {
 }
 
 impl Category {
-    pub(crate) const ALL: [Category; 20] = [
+    pub(crate) const ALL: [Category; 21] = [
         Category::SignIn,
         Category::Registration,
         Category::Route,
@@ -61,6 +65,7 @@ impl Category {
         Category::Incomplete,
         Category::Interrupted,
         Category::UnexpectedResponse,
+        Category::UnusableResponse,
         Category::Rejected,
         Category::Unavailable,
         Category::ServiceOrRouting,
@@ -122,6 +127,10 @@ impl Category {
             Category::UnexpectedResponse => {
                 "OpenAI returned an unexpected response. Try again; if it keeps failing, update Metro or select another ChatGPT model."
             }
+            Category::UnusableResponse => {
+                "OpenAI accepted the ChatGPT request, but Metro couldn't read an answer from the \
+                 response. Try again; if it keeps failing, update Metro."
+            }
             Category::Rejected => {
                 "OpenAI rejected the ChatGPT request. Try a new chat with default model settings; if it keeps failing, update Metro."
             }
@@ -158,6 +167,7 @@ impl Category {
             Category::Incomplete => "chatgpt_incomplete",
             Category::Interrupted => "chatgpt_interrupted",
             Category::UnexpectedResponse => "chatgpt_unexpected_response",
+            Category::UnusableResponse => "chatgpt_unusable_response",
             Category::Rejected => "chatgpt_rejected",
             Category::Unavailable => "chatgpt_unavailable",
             Category::ServiceOrRouting => "chatgpt_service_or_routing_unavailable",
@@ -436,6 +446,7 @@ mod tests {
             Incomplete,
             Interrupted,
             UnexpectedResponse,
+            UnusableResponse,
             Rejected,
             Unavailable,
             ServiceOrRouting,

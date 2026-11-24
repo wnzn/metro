@@ -34,31 +34,21 @@ impl Default for Limits {
 
 /// Returns the `response` object from `response.completed`. If that object's
 /// `output` is empty, it's filled from the `response.output_item.done`
-/// events.
-pub(crate) async fn collect(mut resp: reqwest::Response, limits: Limits) -> Result<Value> {
-    let deadline = Instant::now() + limits.overall;
+/// events. `prefix` is what was already read from `resp` (see [`sniff`]).
+pub(crate) async fn collect_after(
+    mut resp: reqwest::Response,
+    prefix: Vec<u8>,
+    deadline: Instant,
+    limits: Limits,
+) -> Result<Value> {
     let mut parser = Parser::new(limits);
+    if !prefix.is_empty()
+        && let Some(done) = parser.feed(&prefix)?
+    {
+        return Ok(done);
+    }
     loop {
-        let idle = Instant::now() + limits.idle;
-        let chunk = tokio::time::timeout_at(deadline.min(idle), resp.chunk())
-            .await
-            .map_err(|_| {
-                tagged(
-                    anyhow!(
-                        "Responses stream stalled or exceeded its time limit before response.completed"
-                    ),
-                    Some(Category::Interrupted),
-                )
-            })?
-            .map_err(|e| {
-                tagged(
-                    anyhow!(
-                        "Responses stream interrupted before response.completed ({})",
-                        http::net(e)
-                    ),
-                    Some(Category::Interrupted),
-                )
-            })?;
+        let chunk = next_chunk(&mut resp, deadline, limits).await?;
         let Some(chunk) = chunk else {
             if let Some(done) = parser.finish()? {
                 return Ok(done);
@@ -68,8 +58,98 @@ pub(crate) async fn collect(mut resp: reqwest::Response, limits: Limits) -> Resu
                 Some(Category::Interrupted),
             ));
         };
-        if let Some(done) = parser.feed(&chunk)? {
+        if let Some(done) = parser.feed(chunk.as_ref())? {
             return Ok(done);
+        }
+    }
+}
+
+async fn next_chunk(
+    resp: &mut reqwest::Response,
+    deadline: Instant,
+    limits: Limits,
+) -> Result<Option<impl AsRef<[u8]> + use<>>> {
+    let idle = Instant::now() + limits.idle;
+    tokio::time::timeout_at(deadline.min(idle), resp.chunk())
+        .await
+        .map_err(|_| {
+            tagged(
+                anyhow!(
+                    "Responses stream stalled or exceeded its time limit before response.completed"
+                ),
+                Some(Category::Interrupted),
+            )
+        })?
+        .map_err(|e| {
+            tagged(
+                anyhow!(
+                    "Responses stream interrupted before response.completed ({})",
+                    http::net(e)
+                ),
+                Some(Category::Interrupted),
+            )
+        })
+}
+
+/// What a success body without a recognized `content-type` looks like.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Sniffed {
+    EventStream,
+    Json,
+    Unknown,
+}
+
+/// How many bytes [`sniff`] reads at most before deciding.
+const SNIFF_MAX: usize = 4096;
+
+/// Classifies the start of a body: SSE field or comment lines, or a JSON
+/// object. Leading BOM and whitespace are ignored.
+pub(crate) fn classify(prefix: &[u8]) -> Option<Sniffed> {
+    let p = prefix.strip_prefix(b"\xef\xbb\xbf").unwrap_or(prefix);
+    let start = p.iter().position(|b| !b.is_ascii_whitespace())?;
+    let p = &p[start..];
+    if p[0] == b'{' {
+        return Some(Sniffed::Json);
+    }
+    if p[0] == b':' {
+        return Some(Sniffed::EventStream);
+    }
+    if !p[0].is_ascii_lowercase() {
+        return Some(Sniffed::Unknown);
+    }
+    // A field name ends at ':' or at the end of the line.
+    let end = p
+        .iter()
+        .position(|&b| matches!(b, b':' | b'\r' | b'\n'))
+        .or((p.len() >= 6).then_some(p.len()));
+    let Some(end) = end else {
+        return None; // Need more bytes to read a whole field name.
+    };
+    Some(match &p[..end] {
+        b"event" | b"data" | b"id" | b"retry" => Sniffed::EventStream,
+        _ => Sniffed::Unknown,
+    })
+}
+
+/// Reads the start of `resp` (within the idle and overall limits) until
+/// [`classify`] can decide, at most [`SNIFF_MAX`] bytes. Returns the bytes
+/// read, which belong to the body.
+pub(crate) async fn sniff(
+    resp: &mut reqwest::Response,
+    deadline: Instant,
+    limits: Limits,
+) -> Result<(Sniffed, Vec<u8>)> {
+    let mut buf = Vec::new();
+    loop {
+        if let Some(kind) = classify(&buf) {
+            return Ok((kind, buf));
+        }
+        if buf.len() >= SNIFF_MAX {
+            return Ok((Sniffed::Unknown, buf));
+        }
+        match next_chunk(resp, deadline, limits).await? {
+            Some(c) => buf.extend_from_slice(c.as_ref()),
+            None => return Ok((classify(&buf).unwrap_or(Sniffed::Unknown), buf)),
         }
     }
 }
@@ -321,5 +401,20 @@ mod tests {
         assert_eq!(e.downcast_ref::<Category>(), Some(&Category::Incomplete));
         let mut p = Parser::new(Limits::default());
         assert!(p.feed(b"data: not json\n\n").is_err());
+    }
+
+    #[test]
+    fn sniffing_needs_a_whole_field_name() {
+        assert_eq!(classify(b""), None);
+        assert_eq!(classify(b"  \n"), None);
+        assert_eq!(classify(b"\xef\xbb\xbf\n{\"a\":1}"), Some(Sniffed::Json));
+        assert_eq!(classify(b": keepalive"), Some(Sniffed::EventStream));
+        assert_eq!(classify(b"event: x"), Some(Sniffed::EventStream));
+        assert_eq!(classify(b"data:{}"), Some(Sniffed::EventStream));
+        assert_eq!(classify(b"retry: 1\n"), Some(Sniffed::EventStream));
+        assert_eq!(classify(b"even"), None);
+        assert_eq!(classify(b"<html>"), Some(Sniffed::Unknown));
+        assert_eq!(classify(b"[1,2]"), Some(Sniffed::Unknown));
+        assert_eq!(classify(b"datum: x"), Some(Sniffed::Unknown));
     }
 }

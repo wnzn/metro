@@ -7,7 +7,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use super::diagnostic::{Detail, Phase, mark};
+use super::diagnostic::{Detail, MediaType, Phase, mark};
 use super::http::{self, Category, Failure, MAX_JSON, form, pct, tagged};
 use super::loopback::Loopback;
 use super::oidc::{self, Discovery};
@@ -750,29 +750,155 @@ pub(crate) async fn complete(dir: &Path, ep: &Endpoints, request: Value) -> Resu
         }
         return Err(failure.error("Responses request"));
     }
-    let media_type = resp
-        .headers()
-        .get("content-type")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.split(';').next())
-        .unwrap_or("")
-        .trim();
-    if !media_type.eq_ignore_ascii_case("text/event-stream") {
-        if media_type.eq_ignore_ascii_case("application/json") {
-            let bytes = http::read_bounded(resp, 64 * 1024).await?;
-            let failure = Failure::parse(status.as_u16(), &bytes);
-            if failure.category().is_some() {
-                return Err(failure.error("Responses request"));
+    let media = match resp.headers().get("content-type") {
+        None => MediaType::Missing,
+        // A header that isn't visible ASCII is present but not one we know.
+        Some(v) => MediaType::classify(Some(v.to_str().unwrap_or("?/?"))),
+    };
+    let completed = read_success(resp, status.as_u16(), media).await?;
+    translate::to_chat_completion(&completed).map_err(|e| {
+        mark(
+            unusable(e),
+            Detail::phase(Phase::Translation).with_media(media),
+        )
+    })
+}
+
+/// Reads a 2xx Responses answer to a completed `response` object. The
+/// documented answer is an event stream; a whole JSON Responses object is
+/// accepted too, and a body without a recognized `content-type` is sniffed.
+/// Anything else fails as [`Category::UnusableResponse`], with only the
+/// media-type class recorded.
+async fn read_success(mut resp: reqwest::Response, status: u16, media: MediaType) -> Result<Value> {
+    let limits = sse::Limits::default();
+    let deadline = tokio::time::Instant::now() + limits.overall;
+    let http_detail = Detail::http(Phase::Http, status, None, None).with_media(media);
+    let stream = |prefix: Vec<u8>, resp: reqwest::Response| async move {
+        sse::collect_after(resp, prefix, deadline, limits)
+            .await
+            .map_err(|e| mark(e, Detail::phase(Phase::Stream).with_media(media)))
+    };
+    match media {
+        MediaType::EventStream => stream(Vec::new(), resp).await,
+        MediaType::Json => {
+            let body = read_rest(resp, Vec::new())
+                .await
+                .map_err(|e| mark(unusable(e), http_detail))?;
+            json_response(&body, http_detail)
+        }
+        MediaType::Other | MediaType::Missing => {
+            let (kind, prefix) = sse::sniff(&mut resp, deadline, limits)
+                .await
+                .map_err(|e| mark(e, http_detail))?;
+            match kind {
+                sse::Sniffed::EventStream => stream(prefix, resp).await,
+                sse::Sniffed::Json => {
+                    let body = read_rest(resp, prefix)
+                        .await
+                        .map_err(|e| mark(unusable(e), http_detail))?;
+                    json_response(&body, http_detail)
+                }
+                sse::Sniffed::Unknown => Err(mark(
+                    unusable(anyhow!("Responses answered with an unrecognized body")),
+                    http_detail,
+                )),
             }
         }
+    }
+}
+
+/// The rest of a JSON body after `prefix`, within [`MAX_JSON`].
+async fn read_rest(mut resp: reqwest::Response, mut body: Vec<u8>) -> Result<Vec<u8>> {
+    if body.len() > MAX_JSON {
+        bail!("response body exceeded {MAX_JSON} bytes");
+    }
+    while let Some(chunk) = resp.chunk().await.map_err(http::net)? {
+        if body.len() + chunk.len() > MAX_JSON {
+            bail!("response body exceeded {MAX_JSON} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
+/// A whole (non-streamed) Responses answer. A completed response is returned
+/// for translation; an error object, a failed or an incomplete response
+/// fails as the stream path would. Only machine fields are inspected.
+fn json_response(body: &[u8], detail: Detail) -> Result<Value> {
+    let v: Value = serde_json::from_slice(body).map_err(|_| {
+        mark(
+            unusable(anyhow!("Responses JSON answer is malformed")),
+            detail,
+        )
+    })?;
+    // A single streamed event delivered as JSON: unwrap `response.*`.
+    let r = match v.get("type").and_then(Value::as_str) {
+        Some(t)
+            if t.starts_with("response.") && v.get("response").is_some_and(Value::is_object) =>
+        {
+            &v["response"]
+        }
+        _ => &v,
+    };
+    let error = r
+        .get("error")
+        .filter(|e| e.is_object())
+        .or_else(|| v.get("error").filter(|e| e.is_object()));
+    let state = r.get("status").and_then(Value::as_str);
+    let provider_failure = |e: &Value| {
+        let code = http::error_code(e);
+        let param = e.get("param").and_then(Value::as_str);
+        let mut d = detail;
+        d.code = super::diagnostic::provider_code(code);
+        d.param = super::diagnostic::param(param);
+        mark(
+            tagged(
+                anyhow!("Responses JSON answer reported a failure"),
+                Some(http::categorize(None, code, param).unwrap_or(Category::Rejected)),
+            ),
+            d,
+        )
+    };
+    if state == Some("incomplete") {
+        let category = match r
+            .pointer("/incomplete_details/reason")
+            .and_then(Value::as_str)
+        {
+            Some("content_filter") => Category::ContentFilter,
+            _ => Category::Incomplete,
+        };
         return Err(mark(
-            anyhow!("Responses did not return an event stream"),
-            Detail::http(Phase::Http, status.as_u16(), None, None),
+            tagged(
+                anyhow!("Responses reported an incomplete response"),
+                Some(category),
+            ),
+            detail,
         ));
     }
-    let completed = sse::collect(resp, sse::Limits::default())
-        .await
-        .map_err(|e| mark(e, Detail::phase(Phase::Stream)))?;
-    translate::to_chat_completion(&completed)
-        .map_err(|e| mark(e, Detail::phase(Phase::Translation)))
+    if let Some(e) = error {
+        return Err(provider_failure(e));
+    }
+    if state == Some("failed") {
+        return Err(provider_failure(&Value::Null));
+    }
+    let looks_like_response = r.get("object").and_then(Value::as_str) == Some("response")
+        || r.get("output").is_some()
+        || state.is_some();
+    if !looks_like_response || state.is_some_and(|s| s != "completed") {
+        return Err(mark(
+            unusable(anyhow!("Responses JSON answer is not a completed response")),
+            detail,
+        ));
+    }
+    Ok(r.clone())
+}
+
+/// Tags a local failure to read a success answer, unless it already has a
+/// category (for example a provider error found inside it).
+fn unusable(e: anyhow::Error) -> anyhow::Error {
+    if e.downcast_ref::<Category>().is_some() {
+        e
+    } else {
+        tagged(e, Some(Category::UnusableResponse))
+    }
 }

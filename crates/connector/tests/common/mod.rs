@@ -448,6 +448,80 @@ pub async fn responses(State(s): State<S>, h: HeaderMap, body: String) -> Respon
         "hosted" => vec![
             json!({"type": "response.completed", "response": resp(json!([{"type": "web_search_call", "id": "ws"}]))}),
         ],
+        // A whole Responses object as JSON (no stream), with a reasoning
+        // summary, an item and a content part Metro doesn't read.
+        "json_ok" => {
+            let out = json!([
+                {"type": "reasoning", "id": "rs", "encrypted_content": "SECRET-REASONING",
+                 "content": [{"type": "reasoning_text", "text": "SECRET-RAW"}],
+                 "summary": [{"type": "summary_text", "text": "Checked the listing first."}]},
+                {"type": "web_search_call", "id": "ws", "status": "completed"},
+                {"type": "message", "role": "assistant", "content": [
+                    {"type": "output_audio", "data": "SENSITIVE"},
+                    {"type": "output_text", "text": "Hello from JSON."}]},
+            ]);
+            return (
+                [(header::CONTENT_TYPE, "application/json")],
+                resp(out).to_string(),
+            )
+                .into_response();
+        }
+        "json_error" => {
+            return (
+                [(header::CONTENT_TYPE, "application/json; charset=utf-8")],
+                json!({"id": "resp_SENSITIVE", "object": "response", "status": "failed",
+                    "error": {"code": "subscription_sharing_usage_limit_exceeded",
+                        "message": "SENSITIVE limit text"}, "output": []})
+                .to_string(),
+            )
+                .into_response();
+        }
+        "json_incomplete" => {
+            return (
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({"object": "response", "status": "incomplete", "error": null,
+                    "incomplete_details": {"reason": "content_filter"}, "output": []})
+                .to_string(),
+            )
+                .into_response();
+        }
+        "json_other" => {
+            return (
+                [(header::CONTENT_TYPE, "application/json")],
+                json!({"SENSITIVE": "not a response"}).to_string(),
+            )
+                .into_response();
+        }
+        // An event stream without any content-type header.
+        "untyped_sse" => {
+            let item = json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Untyped stream."}]});
+            let text = format!(
+                ": keepalive\n\n{}",
+                sse(&[
+                    json!({"type": "response.output_item.done", "output_index": 0, "item": item}),
+                    json!({"type": "response.completed", "response": resp(json!([]))}),
+                ])
+            );
+            return Response::new(axum::body::Body::from(text));
+        }
+        // A whole JSON response without any content-type header.
+        "untyped_json" => {
+            let out = json!([{"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Untyped JSON."}]}]);
+            return Response::new(axum::body::Body::from(format!("\n{}", resp(out))));
+        }
+        // A streamed turn with a reasoning summary and a hosted-tool item
+        // next to the text.
+        "summary" => vec![
+            json!({"type": "response.output_item.done", "output_index": 0, "item": {
+                "type": "reasoning", "id": "rs", "encrypted_content": "SECRET-REASONING",
+                "summary": [{"type": "summary_text", "text": "Looked first."},
+                            {"type": "summary_text", "text": "Then answered."}]}}),
+            json!({"type": "response.output_item.done", "output_index": 1, "item": {
+                "type": "web_search_call", "id": "ws", "status": "completed"}}),
+            json!({"type": "response.output_item.done", "output_index": 2, "item": {
+                "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Done."}]}}),
+            json!({"type": "response.completed", "response": resp(json!([]))}),
+        ],
         _ if has_result => {
             let item = json!({"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "It is sunny."}]});
             vec![
