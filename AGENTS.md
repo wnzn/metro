@@ -257,7 +257,11 @@ runtime.
     scripts, 6 packaging tests, and desktop `nsh test` 159/159. The
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
-    milestones.
+    milestones. The latest gate on unreleased source (4175475, several
+    agents per Space, per-connection model lists, the desktop redesign) is
+    staged, not a release: 686 Rust tests, eight e2e scripts (not
+    `library_reference.py`) and desktop `nsh test` 400/400, with no
+    packaging tests, real vendor run or native Windows check.
   - Don't claim a real commercial provider, production auth, a published
     release, pretrained `google/embeddinggemma-2` ranking quality, or
     native audio and video playback, seeking or the native file picker for

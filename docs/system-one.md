@@ -8,6 +8,10 @@
 > is a historical milestone.
 > The earlier [System One milestone gate](acceptance.md#historical-final-gate-for-the-system-one-milestone-2026-11-22-independent-reviewer-local),
 > with 403 Rust tests, is kept as a record.
+> The latest [staged gate on unreleased source](acceptance.md#staged-spaces-with-several-agents-per-connection-model-lists-and-the-desktop-redesign-at-4175475-2026-11-25-project-manager-local)
+> (686 Rust tests, eight e2e scripts including `intelligence.py`, desktop
+> `nsh test` 400/400) covers per-Space classification over a Space's agents.
+> It isn't a release.
 >
 > - Every part is documented from its code.
 > - `tests/e2e/intelligence.py` passed against the primary workspace's
@@ -22,7 +26,7 @@
 | --- | --- | --- |
 | [Connection capabilities](settings.md#capabilities) (`chat`, `system_one`, `embeddings`) | yes | Component tests, and `tests/e2e/intelligence.py` |
 | [Sharing a connection](settings.md#sharing-a-connection) with Spaces or the organization | yes | Component tests, and `tests/e2e/intelligence.py` across users, on a local endpoint and on a device, including revocation |
-| [Opt-in classification](#opt-in-classification-of-unaddressed-messages) of unaddressed messages | yes | Component tests, and `tests/e2e/intelligence.py` |
+| [Opt-in classification](#opt-in-classification-of-unaddressed-messages) of unaddressed messages | yes | Component tests, and `tests/e2e/intelligence.py`, including the per-Space Choice over a Space's agents plus *No agent* |
 | [Use-case routing](#use-case-routing) to an answering model | yes | Component tests, and `tests/e2e/intelligence.py` |
 | [Semantic search](#semantic-search) with a System One rerank | yes | 14 unit + 4 HTTP tests, `tests/e2e/intelligence.py`, and the native desktop screen ([screenshot](screenshots/semantic-search.png)) |
 | [Scheduled prompts](schedules.md) | yes | 30 unit + 2 HTTP tests, `tests/e2e/schedules.py`, a live hourly cron run, and the native desktop screen ([screenshot](screenshots/scheduled-tasks.png)), all with scripted models |
