@@ -743,6 +743,41 @@ jobs:
             sleep 1
           done
           echo "metro-server did not answer /healthz" >&2; exit 1
+      # Previews only, like the Rust cache: the real --install-deps run below
+      # reuses the .debs an earlier main push downloaded (about 60 MB from a
+      # slow mirror). `apt-get update` still runs, and apt checks every cached
+      # .deb against those signed indexes, so a stale or odd archive only costs
+      # a download. Only main pushes save; release builds never use it.
+      - name: Apt archive cache key (previews only)
+        id: apt-key
+        if: ${{ !inputs.release }}
+        run: |
+          set -eu
+          # The installer uses apt-get, which keeps what it downloads unless a
+          # hook deletes it (as Docker's docker-clean does).
+          if apt-config dump | grep -i 'Post-Invoke' | grep -q 'archives'; then
+            echo "::warning::an apt hook deletes downloaded archives; nothing will be cached"
+          fi
+          . /etc/os-release
+          echo "prefix=desktop-linux-apt-$ID-$VERSION_ID-$(dpkg --print-architecture)-" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: apt-cache
+        if: ${{ !inputs.release }}
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: ${{ steps.apt-key.outputs.prefix }}${{ hashFiles('packaging/install-metro-linux.sh') }}
+          restore-keys: |
+            ${{ steps.apt-key.outputs.prefix }}${{ hashFiles('packaging/install-metro-linux.sh') }}-
+            ${{ steps.apt-key.outputs.prefix }}
+      - name: Hand the restored archives to apt (previews only)
+        if: ${{ !inputs.release }}
+        run: |
+          set -eu
+          dir="$RUNNER_TEMP/apt-archives"
+          if [ -d "$dir" ]; then
+            find "$dir" -maxdepth 1 -type f -name '*.deb' -exec sudo cp -t /var/cache/apt/archives/ -- {} +
+          fi
+          echo "$(find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' | wc -l) .deb archives in apt's cache"
       - name: Per-user desktop installer (explains missing libraries, --install-deps, update, uninstall keeps data)
         env:
           VERSION: ${{ needs.meta.outputs.version }}
@@ -775,6 +810,39 @@ jobs:
           sh "$i" uninstall
           test ! -e "$home/.local/share/metro-desktop-app" && test ! -e "$home/.local/share/applications/dev.metro.desktop.desktop"
           test "$(cat "$home/.config/metro-desktop/marker")" = keep
+      # The archives of the package versions now installed, so older ones drop
+      # out; the key changes only when that set does.
+      - name: Collect the installer's apt archives (main pushes only)
+        id: apt-collect
+        if: ${{ !inputs.release && github.ref == 'refs/heads/main' }}
+        env:
+          KEY_PREFIX: ${{ steps.apt-key.outputs.prefix }}${{ hashFiles('packaging/install-metro-linux.sh') }}-
+        run: |
+          set -eu
+          out="$RUNNER_TEMP/apt-archives"
+          rm -rf -- "$out"
+          mkdir -- "$out"
+          for deb in /var/cache/apt/archives/*.deb; do
+            [ -f "$deb" ] || continue
+            pkg="$(dpkg-deb -f "$deb" Package)"
+            want="$(dpkg-deb -f "$deb" Version) $(dpkg-deb -f "$deb" Architecture)"
+            if dpkg-query -W -f='${Version} ${Architecture}\n' "$pkg" 2>/dev/null | grep -qxF -- "$want"; then
+              cp -- "$deb" "$out/"
+            fi
+          done
+          n="$(find "$out" -maxdepth 1 -type f -name '*.deb' | wc -l)"
+          echo "$n .deb archives to cache"
+          if [ "$n" -gt 0 ]; then
+            names="$(find "$out" -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | LC_ALL=C sort)"
+            echo "key=$KEY_PREFIX$(printf '%s\n' "$names" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        if: >-
+          ${{ !inputs.release && github.ref == 'refs/heads/main'
+          && steps.apt-collect.outputs.key != '' && steps.apt-collect.outputs.key != steps.apt-cache.outputs.cache-matched-key }}
+        with:
+          path: ${{ runner.temp }}/apt-archives
+          key: ${{ steps.apt-collect.outputs.key }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-desktop-linux-x64

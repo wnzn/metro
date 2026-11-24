@@ -63,6 +63,41 @@ answer `false`, `false`, `true`. In a throwaway clone, one-file commits on
 `3933776` gave: `Dockerfile` false, false, true; `.github/workflows/release.yml`
 false, false, false; `docs/screenshots/new.png` true, true, false.
 
+**Desktop tests and the wall clock (`ad8f994`).** Three schedule-card
+tests compared fixed November 2026 firings with the app's `Date.now()`
+and broke as the real date moved on. They now run on NSH's manual clock
+from Mon, Nov 23, 2026 12:00 UTC. Desktop `nsh test`: 353/353, and
+`nsh check` passed (NSH 0.6.1).
+
+**`desktop-linux` apt archive cache.** The installer step's real
+`--install-deps` run downloaded 58.5 MB at about 76 kB/s, which took
+10–16 minutes. Test builds now restore the `.deb` files an earlier `main`
+push saved and copy them into `/var/cache/apt/archives` before that step.
+Afterwards, on `main` only, they collect the archives of the package
+versions now installed and save them when that set has changed. This uses
+`actions/cache/restore` and `actions/cache/save` at
+`55cc8345863c7cc4c66a329aec7e433d2d1c52a9` (tag `v6.1.0`, per
+`git ls-remote`). The key is the OS release, the architecture and
+`hashFiles('packaging/install-metro-linux.sh')`, with prefix restore keys.
+Release builds skip every cache step. `test_release_workflow.py` checks
+the pins and the guards. Checked locally:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean, also with shellcheck (koalaman/shellcheck:stable)
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging    # 201 tests, OK (15 skipped, as above)
+python -B -m unittest discover -s packaging/release-signatures  # OK (1 skipped)
+python -B -m unittest discover -s packaging/windows-signing     # OK (6 skipped)
+python3 -B -m unittest discover -s ops/github-runner            # 33 tests, OK
+```
+
+The collect loop was also run on a Debian 13 host against two locally
+built `.deb` files: it kept the one whose version is installed and dropped
+the other.
+
+**Not yet shown:** a GitHub run with a cache hit. The first `main` push
+after merging saves the cache; only the next one can use it.
+
 ## Source only: releases from `main` on a version bump (2026-11-24, CI lane, local)
 
 Uncommitted changes on `fix/ci-cleanup`, on top of `106e5da`
