@@ -10,6 +10,7 @@ export * from "./primitives";
 export * from "./chrome";
 export * from "./media";
 export * from "./chat";
+export * from "./agentAvatar";
 export type { Space, Tone } from "./tokens";
 export * from "./settings";
 export * from "./modelPicker";

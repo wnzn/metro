@@ -1341,6 +1341,20 @@ async function lostAccess(spaceId: string | null, roomId: string | null) {
   }
 }
 
+/**
+ * The user just deleted or left a Space (src/features/space): reload the
+ * list, which forgets it and leaves it if it was open, then say what happened.
+ */
+export async function spaceGone(spaceId: string, message: string): Promise<void> {
+  await lostAccess(spaceId, null);
+  if (!spaces().some((s) => s.id === spaceId)) notice.set(message);
+}
+
+/** A Space's name changed (src/features/space): show it everywhere at once. */
+export function spaceRenamed(spaceId: string, name: string) {
+  spaces.set(spaces().map((s) => (s.id === spaceId ? { ...s, name } : s)));
+}
+
 /** Reloads the Space list and the active Space's rooms. */
 async function refreshLists(force = false) {
   const c = client;

@@ -6,6 +6,7 @@ import { discoveryApi } from "./discovery";
 import { libraryApi } from "./library";
 import { monitoringApi } from "./monitoring";
 import { profileApi } from "./profile";
+import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
 
 /** `parentRoomId`: set on a thread an agent delegated from that room. */
@@ -461,6 +462,8 @@ export function createClient(options: ClientOptions) {
     ...libraryApi(request, binary),
     // Profiles (src/api/profile.ts): JSON on `request`, pictures on `binary`.
     ...profileApi(request, binary),
+    // A Space's settings, agents and the person's own preferences there (src/api/spaces.ts).
+    ...spacesApi(request, binary),
     // Monitoring events (src/api/monitoring.ts): one Space, My Chat or the instance; never an aggregate.
     ...monitoringApi(request),
 
