@@ -3,7 +3,7 @@ name: Release images
 # Reusable workflow that builds, smoke-tests, publishes, signs and verifies
 # Metro's container images. It has no triggers of its own.
 #
-# Publishing happens only for a push to the protected branch `master` of
+# Publishing happens only for a push to the protected branch `main` of
 # wnzn/metro, run by .github/workflows/ci.yml. Manually pushed tags, other
 # branches, forks, pull requests and manual runs never write an image. The
 # release pipeline creates the immutable tag v<version> at the triggering
@@ -11,7 +11,7 @@ name: Release images
 # checks that the tag exists and points at exactly that commit. It never
 # creates or moves a git tag, and image tags come from inputs.version only.
 #
-# Interface (caller: ci.yml -> release-publish.yml on a push to master):
+# Interface (caller: ci.yml -> release-publish.yml on a push to main):
 #   uses: ./.github/workflows/release-images.yml
 #   with:
 #     version: 0.2.0            # required, without the leading v; tag v<version> must already name github.sha
@@ -34,13 +34,13 @@ name: Release images
 # That artifact is uploaded only after every image was pushed by exact digest,
 # read back with the expected platform descriptors, signed keyless and every
 # signature verified against: the identity
-#   https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/master
+#   https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/main
 # (issuer https://token.actions.githubusercontent.com), the Fulcio claims
-# repository wnzn/metro, ref refs/heads/master, trigger push and commit
+# repository wnzn/metro, ref refs/heads/main, trigger push and commit
 # github.sha, the exact image digest, and the signed annotations
 # org.opencontainers.image.revision=<github.sha>, org.opencontainers.image.version=v<version>,
 # org.opencontainers.image.source=https://github.com/wnzn/metro and
-# dev.metro.source-ref=refs/heads/master. If any step fails the workflow fails,
+# dev.metro.source-ref=refs/heads/main. If any step fails the workflow fails,
 # so a caller that needs this job never drafts a release.
 #
 # Images: ghcr.io/wnzn/metro-server:v<version> and metro-runner:v<version>
@@ -58,7 +58,7 @@ on:
         type: string
         required: true
       push:
-        description: 'Publish (protected master push of wnzn/metro only): push, read back and sign. False builds and smoke-tests only.'
+        description: 'Publish (protected main push of wnzn/metro only): push, read back and sign. False builds and smoke-tests only.'
         type: boolean
         default: true
       media:
@@ -90,8 +90,8 @@ env:
   # The only source that may publish.
   OFFICIAL_REPOSITORY: wnzn/metro
   OFFICIAL_REPOSITORY_ID: '1467654868'
-  OFFICIAL_REF: refs/heads/master
-  OFFICIAL_CALLER: wnzn/metro/.github/workflows/ci.yml@refs/heads/master
+  OFFICIAL_REF: refs/heads/main
+  OFFICIAL_CALLER: wnzn/metro/.github/workflows/ci.yml@refs/heads/main
 
 jobs:
   guard:
@@ -103,7 +103,7 @@ jobs:
       platforms: ${{ steps.meta.outputs.platforms }}
       matrix: ${{ steps.meta.outputs.matrix }}
     steps:
-      - name: Only a push to protected master of wnzn/metro, run by ci.yml, publishes
+      - name: Only a push to protected main of wnzn/metro, run by ci.yml, publishes
         env:
           PUSH: ${{ inputs.push }}
           VERSION: ${{ inputs.version }}
@@ -317,9 +317,9 @@ jobs:
     # Second, independent gate: the guard already checked all of this.
     if: >-
       inputs.push && github.event_name == 'push' && github.repository == 'wnzn/metro' && github.repository_id == '1467654868' &&
-      github.ref == 'refs/heads/master' && github.ref_type == 'branch' && github.ref_protected &&
+      github.ref == 'refs/heads/main' && github.ref_type == 'branch' && github.ref_protected &&
       toJSON(github.event.deleted) == 'false' && github.event.after == github.sha &&
-      github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master' &&
+      github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main' &&
       !cancelled() && needs.guard.result == 'success' && needs.build.result == 'success' &&
       ((inputs.media && needs.media.result == 'success') || (!inputs.media && needs.media.result == 'skipped'))
     runs-on: ubuntu-24.04
@@ -398,14 +398,14 @@ jobs:
           retention-days: 7
 
   # Keyless Sigstore signatures bind each pushed digest to this workflow at
-  # refs/heads/master (GitHub OIDC). Only this job can mint an ID token.
+  # refs/heads/main (GitHub OIDC). Only this job can mint an ID token.
   sign:
     needs: [guard, publish]
     if: >-
       inputs.push && github.event_name == 'push' && github.repository == 'wnzn/metro' && github.repository_id == '1467654868' &&
-      github.ref == 'refs/heads/master' && github.ref_type == 'branch' && github.ref_protected &&
+      github.ref == 'refs/heads/main' && github.ref_type == 'branch' && github.ref_protected &&
       toJSON(github.event.deleted) == 'false' && github.event.after == github.sha &&
-      github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master' &&
+      github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main' &&
       needs.guard.result == 'success' && needs.publish.result == 'success'
     runs-on: ubuntu-24.04
     timeout-minutes: 20

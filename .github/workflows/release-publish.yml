@@ -1,7 +1,7 @@
 name: Release publication
 
 # CI calls this only after its tests and the platform smoke gates pass on the
-# official protected master push. Sign and verify Windows, pin v<version> at
+# official protected main push. Sign and verify Windows, pin v<version> at
 # that commit, then sign macOS, assemble the set, verify GHCR and Sigstore
 # signatures, and publicly promote the complete release. The tag is a marker,
 # not a workflow trigger.
@@ -39,7 +39,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Recheck exact protected master provenance and eligibility before signing Windows
+      - name: Recheck exact protected main provenance and eligibility before signing Windows
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
@@ -73,7 +73,7 @@ jobs:
         with:
           ref: ${{ github.sha }}
           persist-credentials: false
-      - name: Verify protected master provenance, create the tag if missing and read it back
+      - name: Verify protected main provenance, create the tag if missing and read it back
         id: pin
         env:
           GH_TOKEN: ${{ github.token }}
@@ -122,7 +122,7 @@ jobs:
           name: preview-not-verified-adhoc-${{ matrix.target }}
           path: ${{ runner.temp }}/adhoc
           digest-mismatch: error
-      - name: Verify the exact tag and protected master push before any Apple credentials
+      - name: Verify the exact tag and protected main push before any Apple credentials
         env:
           GH_TOKEN: ${{ github.token }}
           REF_PROTECTED: ${{ github.ref_protected }}

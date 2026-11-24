@@ -10,8 +10,8 @@ name: Windows distribution
 #                   installs it on a fresh Windows VM, runs the MSI lane's native
 #                   tests and self-tests the verifiers with a throwaway
 #                   certificate. Uploads dist-desktop-windows-x64.
-#   release: true   Only a push (not a deletion) to protected master of
-#                   wnzn/metro whose top-level workflow is ci.yml on master,
+#   release: true   Only a push (not a deletion) to protected main of
+#                   wnzn/metro whose top-level workflow is ci.yml on main,
 #                   with exactly github.sha checked out; tags, pull requests
 #                   and other branches are refused. Verifies the seed for an
 #                   official release (metro-tui.exe required) and uploads
@@ -23,7 +23,7 @@ on:
   workflow_call:
     inputs:
       release:
-        description: 'Official master release: hand the verified seed to windows-sign.yml when true; unsigned preview when false.'
+        description: 'Official main release: hand the verified seed to windows-sign.yml when true; unsigned preview when false.'
         type: boolean
         default: false
       version:
@@ -32,7 +32,7 @@ on:
         required: true
     outputs:
       mode:
-        description: 'official (master release hand-off) or preview'
+        description: 'official (main release hand-off) or preview'
         value: ${{ jobs.seed.outputs.mode }}
       seed-sha256:
         value: ${{ jobs.seed.outputs.seed-sha256 }}
@@ -57,7 +57,7 @@ jobs:
         with:
           persist-credentials: false
       - id: mode
-        name: Mode (official only for a push to protected master of wnzn/metro from ci.yml)
+        name: Mode (official only for a push to protected main of wnzn/metro from ci.yml)
         env:
           RELEASE: ${{ inputs.release }}
           VERSION: ${{ inputs.version }}

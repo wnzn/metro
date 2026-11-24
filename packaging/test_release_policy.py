@@ -18,8 +18,8 @@ V = "0.3.0"
 SHA = "a" * 40
 OTHER = "b" * 40
 OFFICIAL = {
-    "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/master", "GITHUB_REPOSITORY": "wnzn/metro",
-    "GITHUB_REPOSITORY_ID": "1467654868", "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master",
+    "GITHUB_EVENT_NAME": "push", "GITHUB_REF": "refs/heads/main", "GITHUB_REPOSITORY": "wnzn/metro",
+    "GITHUB_REPOSITORY_ID": "1467654868", "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/main",
     "REF_PROTECTED": "true", "EVENT_DELETED": "false", "EVENT_FORCED": "false", "EVENT_AFTER": SHA,
     "EVENT_BEFORE": OTHER, "GITHUB_SHA": SHA,
 }
@@ -141,26 +141,26 @@ class VersionTests(unittest.TestCase):
                 rp.previous_version("HEAD", root)
 
 class ProvenanceTests(unittest.TestCase):
-    def test_only_the_protected_master_push_of_ci_yml(self):
+    def test_only_the_protected_main_push_of_ci_yml(self):
         self.assertEqual(rp.check_provenance(OFFICIAL, SHA), SHA)
         bad = {
-            "tag push (even pointing at master)": {"GITHUB_REF": "refs/tags/v0.3.0"},
-            "pull request into master": {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/7/merge"},
+            "tag push (even pointing at main)": {"GITHUB_REF": "refs/tags/v0.3.0"},
+            "pull request into main": {"GITHUB_EVENT_NAME": "pull_request", "GITHUB_REF": "refs/pull/7/merge"},
             "pull_request_target": {"GITHUB_EVENT_NAME": "pull_request_target"},
-            "manual run on master": {"GITHUB_EVENT_NAME": "workflow_dispatch"},
+            "manual run on main": {"GITHUB_EVENT_NAME": "workflow_dispatch"},
             "schedule": {"GITHUB_EVENT_NAME": "schedule"},
-            "push to main": {"GITHUB_REF": "refs/heads/main"},
-            "push to another branch": {"GITHUB_REF": "refs/heads/master-copy"},
+            "push to a retired branch name": {"GITHUB_REF": "refs/heads/dev"},
+            "push to another branch": {"GITHUB_REF": "refs/heads/release-copy"},
             "fork or other repository": {"GITHUB_REPOSITORY": "someone/metro"},
             "renamed repository id": {"GITHUB_REPOSITORY_ID": "1"},
-            "other top-level workflow": {"GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/other.yml@refs/heads/master"},
+            "other top-level workflow": {"GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/other.yml@refs/heads/main"},
             "ci.yml from a tag": {"GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/tags/v0.3.0"},
-            "unprotected master": {"REF_PROTECTED": "false"},
+            "unprotected main": {"REF_PROTECTED": "false"},
             "branch deletion": {"EVENT_DELETED": "true"},
             "missing deleted flag": {"EVENT_DELETED": ""},
             "force push": {"EVENT_FORCED": "true"},
             "missing forced flag": {"EVENT_FORCED": ""},
-            "nonliteral branch": {"GITHUB_REF": "refs/heads/Master"},
+            "nonliteral branch": {"GITHUB_REF": "refs/heads/Main"},
             "pushed commit differs": {"EVENT_AFTER": OTHER},
             "invalid sha": {"GITHUB_SHA": "HEAD", "EVENT_AFTER": "HEAD"},
         }

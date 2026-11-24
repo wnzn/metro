@@ -42,7 +42,7 @@ def make_archive(path, arch, user="10001:10001", nested=False, payload=b"metro",
     layer = gzip.compress(payload + arch.encode(), mtime=0)
     config = json.dumps({
         "architecture": arch, "os": "linux",
-        "config": {"User": user, "Labels": ir.source_annotations("1.2.3", revision, "https://x/y", "refs/heads/master")},
+        "config": {"User": user, "Labels": ir.source_annotations("1.2.3", revision, "https://x/y", "refs/heads/main")},
         "rootfs": {"type": "layers", "diff_ids": [digest(payload)]},
     }).encode()
     manifest = json.dumps({
@@ -251,7 +251,7 @@ class RegistryTests(unittest.TestCase):
         result = self.dir / f"{repo}.json"
         code, out, err = run(["push", "--repository", f"{reg.host}/owner/{repo}", "--allow-http-loopback",
                               "--user", "actor", "--token-env", "TEST_REGISTRY_TOKEN",
-                              "--version", version, "--revision", REV, "--source", "https://x/y", "--source-ref", "refs/heads/master",
+                              "--version", version, "--revision", REV, "--source", "https://x/y", "--source-ref", "refs/heads/main",
                               "--expect-platforms", "linux/amd64,linux/arm64", "--result", str(result),
                               *map(str, archives)])
         self.assertNotIn(SECRET, out + err)
@@ -272,7 +272,7 @@ class RegistryTests(unittest.TestCase):
             self.assertNotIn("latest", {ref for _, ref in reg.manifests})
             self.assertEqual(index["annotations"], {
                 "org.opencontainers.image.version": "v1.2.3", "org.opencontainers.image.revision": REV,
-                "org.opencontainers.image.source": "https://x/y", "dev.metro.source-ref": "refs/heads/master"})
+                "org.opencontainers.image.source": "https://x/y", "dev.metro.source-ref": "refs/heads/main"})
             self.assertEqual(data["revision"], REV)
             code, out, err = run(["verify", "--repository", f"{reg.host}/owner/metro-server",
                                   "--allow-http-loopback", "--expect", str(result)])
@@ -335,8 +335,8 @@ class RegistryTests(unittest.TestCase):
             _, _, runner = self.push(reg, self.amd, self.arm, repo="metro-runner")
             out = self.dir / "evidence"
             code, _, err = run(["evidence", "--version", "1.2.3", "--revision", REV, "--out", str(out),
-                                "--source-url", "https://github.com/wnzn/metro", "--source-ref", "refs/heads/master",
-                                "--signer-identity", "https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/master",
+                                "--source-url", "https://github.com/wnzn/metro", "--source-ref", "refs/heads/main",
+                                "--signer-identity", "https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/main",
                                 "--signer-issuer", "https://token.actions.githubusercontent.com",
                                 str(server), str(runner)])
             self.assertEqual(code, 0, err)
@@ -349,11 +349,11 @@ class RegistryTests(unittest.TestCase):
                     self.assertIn(f"{desc['ref']}  {platform}", text)
             self.assertEqual(data["signature"]["type"], "sigstore-cosign-keyless")
             self.assertIn("certificate identity: https://github.com/wnzn/metro/.github/workflows/"
-                          "release-images.yml@refs/heads/master", text)
+                          "release-images.yml@refs/heads/main", text)
             self.assertIn(f"# Source commit: {REV}", text)
-            self.assertIn(f"refs/heads/master (git tag v1.2.3 -> {REV})", text)
+            self.assertIn(f"refs/heads/main (git tag v1.2.3 -> {REV})", text)
             self.assertIn(f"org.opencontainers.image.revision={REV}", text)
-            self.assertEqual(data["source"], {"url": "https://github.com/wnzn/metro", "ref": "refs/heads/master",
+            self.assertEqual(data["source"], {"url": "https://github.com/wnzn/metro", "ref": "refs/heads/main",
                                               "tag": "v1.2.3", "revision": REV})
             self.assertEqual(data["signature"]["revision"], REV)
             for f in out.iterdir():
@@ -388,7 +388,7 @@ class PublishedSourceTests(unittest.TestCase):
             self.assertIn("does not name a commit", run(args)[2])
 
     def test_signature_output_requires_exact_digest_and_signed_source(self):
-        repo, ref = "ghcr.io/wnzn/metro-server", "refs/heads/master"
+        repo, ref = "ghcr.io/wnzn/metro-server", "refs/heads/main"
         source = "https://github.com/wnzn/metro"
         identity = f"{source}/.github/workflows/release-images.yml@{ref}"
         image_digest = digest(b"index")
@@ -495,7 +495,7 @@ class CheckTagTests(unittest.TestCase):
 class CheckSignaturesTests(unittest.TestCase):
     REPO = "ghcr.io/wnzn/metro-server"
     DIGEST = "sha256:" + "7" * 64
-    IDENTITY = "https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/master"
+    IDENTITY = "https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/main"
     ISSUER = "https://token.actions.githubusercontent.com"
 
     def entry(self, keyless=True):
@@ -503,13 +503,13 @@ class CheckSignaturesTests(unittest.TestCase):
         # optional holds the signed annotations and, for keyless, the certificate claims.
         optional = {"org.opencontainers.image.revision": REV, "org.opencontainers.image.version": "v1.2.3",
                     "org.opencontainers.image.source": "https://github.com/wnzn/metro",
-                    "dev.metro.source-ref": "refs/heads/master"}
+                    "dev.metro.source-ref": "refs/heads/main"}
         if keyless:
             optional |= {"Issuer": self.ISSUER, "Subject": self.IDENTITY,
                          "1.3.6.1.4.1.57264.1.1": self.ISSUER, "1.3.6.1.4.1.57264.1.2": "push",
                          "1.3.6.1.4.1.57264.1.3": REV, "1.3.6.1.4.1.57264.1.5": "wnzn/metro",
-                         "1.3.6.1.4.1.57264.1.6": "refs/heads/master",
-                         "githubWorkflowRef": "refs/heads/master", "githubWorkflowRepository": "wnzn/metro",
+                         "1.3.6.1.4.1.57264.1.6": "refs/heads/main",
+                         "githubWorkflowRef": "refs/heads/main", "githubWorkflowRepository": "wnzn/metro",
                          "githubWorkflowSha": REV, "githubWorkflowTrigger": "push"}
         return {"critical": {"identity": {"docker-reference": f"{self.REPO}@{self.DIGEST}"},
                              "image": {"docker-manifest-digest": self.DIGEST},
@@ -522,7 +522,7 @@ class CheckSignaturesTests(unittest.TestCase):
         self.addCleanup(os.unlink, f.name)
         return run(["check-signatures", "--cosign-json", f.name, "--repository", self.REPO,
                     "--digest", self.DIGEST, "--revision", REV, "--version", "1.2.3",
-                    "--source-url", "https://github.com/wnzn/metro", "--source-ref", "refs/heads/master",
+                    "--source-url", "https://github.com/wnzn/metro", "--source-ref", "refs/heads/main",
                     "--identity", self.IDENTITY, "--issuer", self.ISSUER, "--workflow-repository", "wnzn/metro"])
 
     def test_accepts_exact_digest_annotations_and_claims(self):
@@ -545,7 +545,7 @@ class CheckSignaturesTests(unittest.TestCase):
             "tag workflow ref": lambda e: e["optional"].update({"githubWorkflowRef": "refs/tags/v1.2.3"}),
             "other commit claim": lambda e: e["optional"].update({"1.3.6.1.4.1.57264.1.3": "0" * 40}),
             "other identity": lambda e: e["optional"].update(
-                {"Subject": self.IDENTITY.replace("refs/heads/master", "refs/heads/dev")}),
+                {"Subject": self.IDENTITY.replace("refs/heads/main", "refs/heads/dev")}),
             "other trigger": lambda e: e["optional"].update({"githubWorkflowTrigger": "workflow_dispatch"}),
             "fork repository": lambda e: e["optional"].update({"githubWorkflowRepository": "evil/metro"}),
         }
@@ -589,11 +589,11 @@ class WorkflowContractTests(unittest.TestCase):
                 want["id-token"] = "write"
             self.assertEqual(granted, want, name)
 
-    def test_publishes_only_from_protected_master_of_wnzn_metro_via_ci(self):
+    def test_publishes_only_from_protected_main_of_wnzn_metro_via_ci(self):
         head = self.text.split("\njobs:\n", 1)[0]
         for needle in ("OFFICIAL_REPOSITORY: wnzn/metro\n", "OFFICIAL_REPOSITORY_ID: '1467654868'\n",
-                       "OFFICIAL_REF: refs/heads/master\n",
-                       "OFFICIAL_CALLER: wnzn/metro/.github/workflows/ci.yml@refs/heads/master\n"):
+                       "OFFICIAL_REF: refs/heads/main\n",
+                       "OFFICIAL_CALLER: wnzn/metro/.github/workflows/ci.yml@refs/heads/main\n"):
             self.assertIn(needle, head)
         guard = self.jobs["guard"]
         for needle in ('[ "$EVENT" = push ]', '[ "$REPOSITORY" = "$OFFICIAL_REPOSITORY" ]',
@@ -606,9 +606,9 @@ class WorkflowContractTests(unittest.TestCase):
         # push: false exits before the checks; everything after the exit is the publish gate.
         self.assertLess(guard.index('[ "$PUSH" = true ] ||'), guard.index('[ "$EVENT" = push ]'))
         gate = ("if: >- inputs.push && github.event_name == 'push' && github.repository == 'wnzn/metro' && "
-                "github.repository_id == '1467654868' && github.ref == 'refs/heads/master' && github.ref_type == 'branch' && "
+                "github.repository_id == '1467654868' && github.ref == 'refs/heads/main' && github.ref_type == 'branch' && "
                 "github.ref_protected && toJSON(github.event.deleted) == 'false' && github.event.after == github.sha && "
-                "github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master' &&")
+                "github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main' &&")
         for job in ("publish", "sign"):
             self.assertIn(gate, " ".join(self.jobs[job].split()), job)
         # Outputs come only from the sign job, which runs only when publishing.
@@ -620,14 +620,14 @@ class WorkflowContractTests(unittest.TestCase):
     def test_runtime_guard_refuses_nonofficial_events(self):
         guard = self.jobs["guard"].split("        run: |\n", 1)[1].split("      - uses:", 1)[0]
         cmd = ["bash", "-c", textwrap.dedent(guard)]
-        caller = "wnzn/metro/.github/workflows/ci.yml@refs/heads/master"
+        caller = "wnzn/metro/.github/workflows/ci.yml@refs/heads/main"
         env = dict(os.environ, PUSH="true", VERSION="1.2.3", EVENT="push", REPOSITORY="wnzn/metro",
-                   REPOSITORY_ID="1467654868", REF="refs/heads/master", REF_TYPE="branch", REF_PROTECTED="true",
+                   REPOSITORY_ID="1467654868", REF="refs/heads/main", REF_TYPE="branch", REF_PROTECTED="true",
                    DELETED="false", AFTER=REV, GITHUB_SHA=REV, CALLER=caller, OFFICIAL_REPOSITORY="wnzn/metro",
-                   OFFICIAL_REPOSITORY_ID="1467654868", OFFICIAL_REF="refs/heads/master", OFFICIAL_CALLER=caller)
+                   OFFICIAL_REPOSITORY_ID="1467654868", OFFICIAL_REF="refs/heads/main", OFFICIAL_CALLER=caller)
         self.assertEqual(subprocess.run(cmd, env=env, capture_output=True).returncode, 0)
-        for bad in (dict(REF="refs/tags/v1.2.3", REF_TYPE="tag"), dict(REF="refs/heads/main"),
-                    dict(REF="refs/heads/Master"), dict(EVENT="pull_request"), dict(EVENT="workflow_dispatch"),
+        for bad in (dict(REF="refs/tags/v1.2.3", REF_TYPE="tag"), dict(REF="refs/heads/dev"),
+                    dict(REF="refs/heads/Main"), dict(EVENT="pull_request"), dict(EVENT="workflow_dispatch"),
                     dict(REPOSITORY_ID="1"), dict(REPOSITORY="WNZN/metro"), dict(REF_PROTECTED="false"),
                     dict(DELETED="true"), dict(DELETED=""), dict(AFTER="0" * 40), dict(CALLER=caller.replace("ci.yml", "other.yml"))):
             with self.subTest(bad):

@@ -2,9 +2,9 @@
 """Metro's public release policy: who may release, which version, and when.
 
 The only official trigger is a protected, non-deleted, non-force `push` to
-refs/heads/master of wnzn/metro, run by the top-level ci.yml at that branch,
+refs/heads/main of wnzn/metro, run by the top-level ci.yml at that branch,
 for exactly the pushed commit. Tags, pull requests (including ones targeting
-master), other branches and manual runs never release or publish.
+main), other branches and manual runs never release or publish.
 
 The version is the checked-in one: Cargo `[workspace.package] version` and
 apps/desktop/nsh.json `version` must be the same semantic version (a
@@ -13,7 +13,7 @@ latest). Its immutable marker is the tag v<version>, created by this workflow
 after CI, the platform smoke gates and Windows signing and verification.
 It is never moved.
 
-Eligibility for a master push (`decide`):
+Eligibility for a main push (`decide`):
 
   tag v<version>     published release   state       outcome
   missing            none                new         release
@@ -28,7 +28,7 @@ Eligibility for a master push (`decide`):
 Commands (GitHub API via GH_TOKEN; the token is never printed):
 
   version      print the checked-in version
-  provenance   fail unless this is the official master push (no network)
+  provenance   fail unless this is the official main push (no network)
   decide       provenance, version, eligibility; writes GITHUB_OUTPUT
   authorize    recheck the eligible version before Windows signing (read only)
   tag          create refs/tags/v<version> at this commit (idempotent, never moved)
@@ -55,7 +55,7 @@ import release_signatures  # noqa: E402  (the signer's exact final file set)
 
 REPOSITORY = "wnzn/metro"
 REPOSITORY_ID = "1467654868"
-BRANCH_REF = "refs/heads/master"
+BRANCH_REF = "refs/heads/main"
 CALLER = f"{REPOSITORY}/.github/workflows/ci.yml@{BRANCH_REF}"
 # Use the subset supported by the packaging, MSI, image and signature tools.
 SEMVER = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(?:-([0-9A-Za-z]+(?:[.-][0-9A-Za-z]+)*))?")
@@ -319,7 +319,7 @@ def publish(api, version, sha, folder, prerelease):
         require(public.get("prerelease") is prerelease, f"published v{version} has the wrong prerelease status")
         check_assets(public, local, f"published v{version}")
         return "already published"
-    # ci.yml serializes master runs. Replace only a proven, interrupted staging
+    # ci.yml serializes main runs. Replace only a proven, interrupted staging
     # draft for this SHA, never a manual draft or a release that was published.
     old = api.releases(f"v{version}")
     require(len(old) <= 1, f"more than one release or staging draft for v{version}")

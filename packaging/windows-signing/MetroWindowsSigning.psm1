@@ -94,14 +94,14 @@ function Invoke-MetroSigning {
 }
 
 # The only context in which release credentials may be used: a push (not a
-# deletion) to the protected literal master branch of wnzn/metro, whose
-# top-level workflow is ci.yml on master, with the pushed commit checked out.
+# deletion) to the protected literal main branch of wnzn/metro, whose
+# top-level workflow is ci.yml on main, with the pushed commit checked out.
 # winsign.py release-context holds the rules (and their tests).
 function Assert-MetroReleaseContext([string] $Version) {
     $head = & git -C $env:GITHUB_WORKSPACE rev-parse HEAD
     if ($LASTEXITCODE -ne 0 -or -not $head) { Fail 'cannot read the checked-out commit' }
     & python -I (Join-Path $PSScriptRoot 'winsign.py') release-context --version $Version --head ([string] $head).Trim() | Out-Null
-    if ($LASTEXITCODE -ne 0) { Fail 'release signing runs only for a push to protected master of wnzn/metro from ci.yml' }
+    if ($LASTEXITCODE -ne 0) { Fail 'release signing runs only for a push to protected main of wnzn/metro from ci.yml' }
 }
 
 function Install-MetroArtifactSigningClient([string] $Version, [string] $Sha256, [string] $Dest) {
@@ -132,7 +132,7 @@ function Install-MetroArtifactSigningClient([string] $Version, [string] $Sha256,
 # that only lives for the signing call. The value is masked and never printed.
 function New-GitHubOidcTokenFile([string] $Path) {
     if (-not $env:ACTIONS_ID_TOKEN_REQUEST_URL -or -not $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN) {
-        Fail 'no GitHub OIDC token is available: the official master call must grant id-token: write'
+        Fail 'no GitHub OIDC token is available: the official main call must grant id-token: write'
     }
     $uri = $env:ACTIONS_ID_TOKEN_REQUEST_URL + '&audience=api://AzureADTokenExchange'
     $token = (Invoke-RestMethod -Uri $uri -Headers @{ Authorization = "bearer $env:ACTIONS_ID_TOKEN_REQUEST_TOKEN" }).value
@@ -539,8 +539,8 @@ function Test-MetroScriptMsiCoexistence {
 function Invoke-MetroVerifierSelfTest {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $Tree, [Parameter(Mandatory)] [string] $Msi, [Parameter(Mandatory)] [string] $SourceScripts)
-    if ($env:GITHUB_REF_TYPE -eq 'tag' -or ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF -eq 'refs/heads/master')) {
-        Fail 'the throwaway-certificate self-test never runs for master pushes or tags'
+    if ($env:GITHUB_REF_TYPE -eq 'tag' -or ($env:GITHUB_EVENT_NAME -eq 'push' -and $env:GITHUB_REF -eq 'refs/heads/main')) {
+        Fail 'the throwaway-certificate self-test never runs for main pushes or tags'
     }
     $tool = Get-MetroSignTool
     $subject = 'Metro CI throwaway self-test (not a release signer)'

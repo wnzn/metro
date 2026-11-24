@@ -539,20 +539,20 @@ class ReleaseContext(unittest.TestCase):
     VERSION = json.loads((HERE.parents[1] / "apps/desktop/nsh.json").read_text())["version"]
 
     def context(self, tmp, event=None, **env):
-        payload = {"ref": "refs/heads/master", "after": self.SHA, "deleted": False,
+        payload = {"ref": "refs/heads/main", "after": self.SHA, "deleted": False,
                    "repository": {"full_name": "wnzn/metro", "id": 1467654868}}
         payload.update(event or {})
         path = Path(tmp) / "event.json"
         path.write_text(json.dumps(payload))
-        base = {"GITHUB_EVENT_NAME": "push", "GITHUB_REPOSITORY": "wnzn/metro", "GITHUB_REF": "refs/heads/master",
+        base = {"GITHUB_EVENT_NAME": "push", "GITHUB_REPOSITORY": "wnzn/metro", "GITHUB_REF": "refs/heads/main",
                  "GITHUB_REPOSITORY_ID": "1467654868",
                 "GITHUB_REF_TYPE": "branch", "GITHUB_REF_PROTECTED": "true", "GITHUB_SHA": self.SHA,
-                "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master",
+                "GITHUB_WORKFLOW_REF": "wnzn/metro/.github/workflows/ci.yml@refs/heads/main",
                 "GITHUB_EVENT_PATH": str(path)}
         base.update(env)
         return base
 
-    def test_official_master_push(self):
+    def test_official_main_push(self):
         with tempfile.TemporaryDirectory() as tmp:
             self.assertEqual(winsign.release_context(self.context(tmp), self.SHA, self.VERSION), self.SHA)
 
@@ -578,13 +578,13 @@ class ReleaseContext(unittest.TestCase):
             "pull request": dict(GITHUB_EVENT_NAME="pull_request", GITHUB_REF="refs/pull/1/merge"),
             "pull_request_target": dict(GITHUB_EVENT_NAME="pull_request_target"),
             "workflow_dispatch": dict(GITHUB_EVENT_NAME="workflow_dispatch"),
-            "main branch": dict(GITHUB_REF="refs/heads/main",
-                                GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/ci.yml@refs/heads/main"),
-            "master-like branch": dict(GITHUB_REF="refs/heads/master2"),
-            "unprotected master": dict(GITHUB_REF_PROTECTED="false"),
+            "other branch": dict(GITHUB_REF="refs/heads/dev",
+                                 GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/ci.yml@refs/heads/dev"),
+            "main-like branch": dict(GITHUB_REF="refs/heads/main2"),
+            "unprotected main": dict(GITHUB_REF_PROTECTED="false"),
             "fork": dict(GITHUB_REPOSITORY="someone/metro"),
             "reused repository name": dict(GITHUB_REPOSITORY_ID="123"),
-            "other workflow": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/release.yml@refs/heads/master"),
+            "other workflow": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/release.yml@refs/heads/main"),
             "workflow from a tag": dict(GITHUB_WORKFLOW_REF="wnzn/metro/.github/workflows/ci.yml@refs/tags/v0.3.0"),
             "no sha": dict(GITHUB_SHA=""),
         }
@@ -601,13 +601,13 @@ class ReleaseContext(unittest.TestCase):
                     winsign.release_context(self.context(tmp, event), self.SHA, "0.3.0")
             with self.assertRaisesRegex(winsign.Failure, "checked-out commit"):
                 winsign.release_context(self.context(tmp), other, "0.3.0")
-            for version in ("", "v0.3.0", "master", "0.3"):
+            for version in ("", "v0.3.0", "main", "0.3"):
                 with self.subTest(version), self.assertRaisesRegex(winsign.Failure, "invalid version"):
                     winsign.release_context(self.context(tmp), self.SHA, version)
             with self.assertRaisesRegex(winsign.Failure, "unreadable event"):
                 winsign.release_context(self.context(tmp, GITHUB_EVENT_PATH=str(Path(tmp) / "missing.json")), self.SHA, "0.3.0")
 
-    def test_official_finalize_refuses_outside_master(self):
+    def test_official_finalize_refuses_outside_main(self):
         import os
         from unittest import mock
         with tempfile.TemporaryDirectory() as tmp, mock.patch.dict(os.environ, self.context(tmp, GITHUB_REF="refs/tags/v0.3.0")), \
@@ -619,11 +619,11 @@ class ReleaseContext(unittest.TestCase):
 
 
 class SigningEnvironment(unittest.TestCase):
-    def test_only_one_literal_master_branch_rule(self):
+    def test_only_one_literal_main_branch_rule(self):
         with tempfile.TemporaryDirectory() as tmp:
             args = winsign.argparse.Namespace(environment=Path(tmp) / "environment", policies=Path(tmp) / "policies")
             custom = {"protected_branches": False, "custom_branch_policies": True}
-            master = {"name": "master", "type": "branch"}
+            main_rule = {"name": "main", "type": "branch"}
 
             def check(policy, *rules, total=None):
                 args.environment.write_text(json.dumps({"name": "windows-release-signing", "deployment_branch_policy": policy}))
@@ -631,12 +631,12 @@ class SigningEnvironment(unittest.TestCase):
                                                     "branch_policies": rules}))
                 winsign.check_signing_environment(args)
 
-            check(custom, master)
+            check(custom, main_rule)
             for policy, rules, total in (
-                (None, [], 0), ({"protected_branches": True, "custom_branch_policies": False}, [master], 1),
-                (custom, [{"name": "master", "type": "tag"}], 1),
-                (custom, [{"name": "master*", "type": "branch"}], 1),
-                (custom, [master, {"name": "v*", "type": "tag"}], 2), (custom, [master], 2),
+                (None, [], 0), ({"protected_branches": True, "custom_branch_policies": False}, [main_rule], 1),
+                (custom, [{"name": "main", "type": "tag"}], 1),
+                (custom, [{"name": "main*", "type": "branch"}], 1),
+                (custom, [main_rule, {"name": "v*", "type": "tag"}], 2), (custom, [main_rule], 2),
             ):
                 with self.subTest(policy=policy, rules=rules, total=total), self.assertRaisesRegex(winsign.Failure, "no tags"):
                     check(policy, *rules, total=total)
@@ -779,7 +779,7 @@ class Workflows(unittest.TestCase):
                 self.assertNotIn(forbidden, text, name)
         self.assertIn("winsign.py release-context", jobs(self.read("windows-distribution.yml"))["seed"])
 
-    def test_signing_is_master_only_and_isolated(self):
+    def test_signing_is_main_only_and_isolated(self):
         text = self.read("windows-sign.yml")
         self.check_common(text)
         head = text.split("\njobs:", 1)[0]
@@ -801,9 +801,9 @@ class Workflows(unittest.TestCase):
         self.assertIn("winsign.py release-context", all_jobs["guard"])
         self.assertIn("winsign.py signing-environment", all_jobs["guard"])
         guard_if = ("if: >- github.event_name == 'push' && github.repository == 'wnzn/metro' && "
-                    "github.repository_id == '1467654868' && github.ref == 'refs/heads/master' && "
+                    "github.repository_id == '1467654868' && github.ref == 'refs/heads/main' && "
                     "github.ref_type == 'branch' && github.ref_protected && toJSON(github.event.deleted) == 'false' && "
-                    "github.event.after == github.sha && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'")
+                    "github.event.after == github.sha && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main'")
         for job in ("sign", "sign-msi"):
             # Job-level, so no runner (self-hosted included) is assigned outside the official context.
             self.assertIn(guard_if, " ".join(all_jobs[job].split()))

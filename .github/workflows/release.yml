@@ -1,7 +1,7 @@
 name: Release artifacts
 
 # Reusable, read-only platform build and smoke gates. Main and PRs get preview
-# artifacts only. Eligible protected master pushes instead hand off the verified
+# artifacts only. Eligible protected main pushes instead hand off the verified
 # Windows ZIP seed, the ad hoc macOS archives and Linux archives. No job in
 # this tree can sign with credentials or publish.
 
@@ -9,7 +9,7 @@ on:
   workflow_call:
     inputs:
       release:
-        description: 'Stage native signing inputs for an official master release; false yields a preview.'
+        description: 'Stage native signing inputs for an official main release; false yields a preview.'
         type: boolean
         default: false
       version:
@@ -47,7 +47,7 @@ jobs:
         run: |
           set -eu
           if [ "$RELEASE" = true ]; then
-            # Official builds only for the protected master push (release_policy.py), and only
+            # Official builds only for the protected main push (release_policy.py), and only
             # for the checked-in version that the caller's release decision chose.
             python3 -I packaging/release_policy.py provenance > "$RUNNER_TEMP/policy.txt"
             version="$(sed -n 's/^version=//p' "$RUNNER_TEMP/policy.txt")"
@@ -607,7 +607,7 @@ jobs:
   # Windows distribution (owned by the Windows lane): turns the seed into the
   # ZIP, the MSI and the two PowerShell scripts, the ZIP and MSI each with a
   # .sha256. Pull requests and main: uploaded as dist-desktop-windows-x64
-  # (unsigned preview). Official master: uploaded as unsigned-desktop-windows-x64 for
+  # (unsigned preview). Official main: uploaded as unsigned-desktop-windows-x64 for
   # windows-sign.yml in release-publish.yml, the only place that may hold
   # id-token: write. This call grants contents: read only, so nothing in its
   # tree may request more (GitHub checks nested permissions before any `if:`).
@@ -809,7 +809,7 @@ jobs:
   # shutdown. This job never sees signing credentials (it runs third-party build
   # code). Its ad hoc output is uploaded as preview-not-verified-adhoc-*, never
   # matched by the release collection; release-publish.yml signs and notarizes
-  # it on eligible master pushes.
+  # it on eligible main pushes.
   desktop-macos:
     needs: meta
     strategy:

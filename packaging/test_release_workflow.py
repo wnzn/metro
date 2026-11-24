@@ -23,10 +23,10 @@ WF = ROOT / ".github/workflows"
 LEVEL = {"none": 0, "read": 1, "write": 2}
 SCOPES = ("actions", "attestations", "checks", "contents", "deployments", "id-token", "issues", "discussions",
           "packages", "pages", "pull-requests", "security-events", "statuses")
-MASTER_IF = """github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master'
+MAIN_IF = """github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/main'
 && github.repository_id == '1467654868' && github.ref_protected
 && github.event.deleted == false && github.event.forced == false && github.event.after == github.sha
-&& github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'"""
+&& github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main'"""
 
 
 def load(name):
@@ -160,16 +160,16 @@ class ReleaseWorkflowTests(unittest.TestCase):
     def test_triggers_and_official_jobs(self):
         on = self.ci["on"]
         self.assertEqual(set(on), {"pull_request", "push"})
-        self.assertEqual(on["push"], {"branches": ["main", "master"]})
+        self.assertEqual(on["push"], {"branches": ["main"]})
         self.assertEqual(set(self.release["on"]), {"workflow_call"})
         self.assertEqual(set(self.publish["on"]), {"workflow_call"})
         for name in ("ci.yml", "release.yml", "release-publish.yml"):
             self.assertNotIn("pull_request_target", (WF / name).read_text())
             self.assertNotIn("secrets: inherit", (WF / name).read_text())
         release, publish = self.ci["jobs"]["release"], self.ci["jobs"]["publish"]
-        self.assertEqual(" ".join(self.ci["jobs"]["release-policy"]["if"].split()), " ".join(MASTER_IF.split()))
+        self.assertEqual(" ".join(self.ci["jobs"]["release-policy"]["if"].split()), " ".join(MAIN_IF.split()))
         self.assertEqual(" ".join(publish["if"].split()),
-                         "needs.release-policy.outputs.release == 'true' && " + " ".join(MASTER_IF.split()))
+                         "needs.release-policy.outputs.release == 'true' && " + " ".join(MAIN_IF.split()))
         self.assertEqual(release["if"], "needs.release-policy.outputs.release == 'true'")
         self.assertEqual(release["with"], {"release": True, "version": "${{ needs.release-policy.outputs.version }}"})
         self.assertEqual(release["permissions"], {"contents": "read"})
@@ -179,30 +179,30 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(publish["permissions"], {"contents": "write", "packages": "write", "id-token": "write"})
         self.assertEqual(publish["with"], {"version": "${{ needs.release-policy.outputs.version }}"})
         self.assertIs(self.ci["concurrency"]["cancel-in-progress"], False)
-        self.assertIn("'metro-official-master'", self.ci["concurrency"]["group"])
+        self.assertIn("'metro-official-main'", self.ci["concurrency"]["group"])
 
     def test_real_job_guards_admit_only_eligible_official_pushes(self):
         jobs = self.ci["jobs"]
         official = {"github.event_name": "push", "github.repository": "wnzn/metro", "github.repository_id": "1467654868",
-                    "github.ref": "refs/heads/master", "github.ref_protected": True,
+                    "github.ref": "refs/heads/main", "github.ref_protected": True,
                     "github.event.deleted": False, "github.event.forced": False,
                     "github.event.after": "a" * 40, "github.sha": "a" * 40,
-                    "github.workflow_ref": "wnzn/metro/.github/workflows/ci.yml@refs/heads/master",
+                    "github.workflow_ref": "wnzn/metro/.github/workflows/ci.yml@refs/heads/main",
                     "needs.release-policy.outputs.release": "true"}
         cases = (
-            ("master", {}, True),
+            ("main", {}, True),
             ("already public", {"needs.release-policy.outputs.release": "false"}, True),
             ("tag", {"github.ref": "refs/tags/v0.3.0"}, False),
-            ("main", {"github.ref": "refs/heads/main"}, False),
-            ("other branch", {"github.ref": "refs/heads/master-copy"}, False),
-            ("PR to master", {"github.event_name": "pull_request", "github.ref": "refs/pull/1/merge"}, False),
-            ("manual master", {"github.event_name": "workflow_dispatch"}, False),
-            ("deleted master", {"github.event.deleted": True}, False),
-            ("forced master", {"github.event.forced": True}, False),
-            ("unprotected master", {"github.ref_protected": False}, False),
+            ("trunk", {"github.ref": "refs/heads/trunk"}, False),
+            ("other branch", {"github.ref": "refs/heads/main-copy"}, False),
+            ("PR to main", {"github.event_name": "pull_request", "github.ref": "refs/pull/1/merge"}, False),
+            ("manual main", {"github.event_name": "workflow_dispatch"}, False),
+            ("deleted main", {"github.event.deleted": True}, False),
+            ("forced main", {"github.event.forced": True}, False),
+            ("unprotected main", {"github.ref_protected": False}, False),
             ("wrong repo ID", {"github.repository_id": "123"}, False),
             ("fork", {"github.repository": "someone/metro"}, False),
-            ("wrong workflow", {"github.workflow_ref": "wnzn/metro/.github/workflows/extra.yml@refs/heads/master"}, False),
+            ("wrong workflow", {"github.workflow_ref": "wnzn/metro/.github/workflows/extra.yml@refs/heads/main"}, False),
             ("wrong revision", {"github.event.after": "b" * 40}, False),
         )
         for name, update, policy in cases:

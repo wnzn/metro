@@ -17,7 +17,7 @@ import tarfile
 REPOSITORY = "https://github.com/wnzn/metro"
 REPOSITORY_ID = "1467654868"
 ISSUER = "https://token.actions.githubusercontent.com"
-SOURCE_REF = "refs/heads/master"
+SOURCE_REF = "refs/heads/main"
 MANIFEST = "SHA256SUMS"
 BUNDLE = ".sigstore.json"
 SIGNER_WORKFLOW = "sign-release-assets.yml"

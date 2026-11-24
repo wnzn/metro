@@ -1,20 +1,20 @@
 name: CI
 
-# Public releases come only from a protected push to refs/heads/master (see
-# packaging/release_policy.py). Pull requests (including into master) and
-# main run read-only previews; tag pushes start nothing here.
+# Public releases come only from a protected push to refs/heads/main (see
+# packaging/release_policy.py). Pull requests and unprotected branches run
+# read-only previews; tag pushes start nothing here.
 on:
   pull_request:
   push:
-    branches: [main, master]
+    branches: [main]
 
 permissions:
   contents: read
 
-# Official master runs are serialized. A new run may replace a pending one,
+# Official main runs are serialized. A new run may replace a pending one,
 # but cannot interrupt the run already signing or publishing.
 concurrency:
-  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/master' && github.ref_protected && !github.event.deleted && !github.event.forced && 'metro-official-master' || format('ci-{0}', github.run_id) }}
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && github.ref_protected && !github.event.deleted && !github.event.forced && 'metro-official-main' || format('ci-{0}', github.run_id) }}
   cancel-in-progress: false
 
 jobs:
@@ -434,16 +434,16 @@ jobs:
             echo 'docs_only=false' >> "$GITHUB_OUTPUT"
           fi
 
-  # The release decision for the official master push: provenance first (no
+  # The release decision for the official main push: provenance first (no
   # secrets, read-only token), then the checked-in version and its eligibility
   # (new / resume -> release; unchanged / done -> CI only). Skipped for every
   # other event, so nothing else can release.
   release-policy:
     if: >-
-      github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master'
+      github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/main'
       && github.repository_id == '1467654868' && github.ref_protected
       && github.event.deleted == false && github.event.forced == false && github.event.after == github.sha
-      && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
+      && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       contents: read
@@ -469,7 +469,7 @@ jobs:
 
   # Build and package everything a release would ship, but publish nothing:
   # PRs except proven docs-only changes to main, main pushes, and already
-  # released master versions. Unknown PR diffs still build.
+  # released main versions. Unknown PR diffs still build.
   # No secrets and contents: read only (release.yml's whole tree stays read-only).
   package-smoke:
     needs: [workflows, release-policy]
@@ -503,10 +503,10 @@ jobs:
     needs: [release-policy, release]
     if: >-
       needs.release-policy.outputs.release == 'true'
-      && github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/master'
+      && github.event_name == 'push' && github.repository == 'wnzn/metro' && github.ref == 'refs/heads/main'
       && github.repository_id == '1467654868' && github.ref_protected
       && github.event.deleted == false && github.event.forced == false && github.event.after == github.sha
-      && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/master'
+      && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main'
     uses: ./.github/workflows/release-publish.yml
     with:
       version: ${{ needs.release-policy.outputs.version }}
