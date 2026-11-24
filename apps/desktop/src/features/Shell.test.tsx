@@ -286,3 +286,15 @@ test("the Spaces heading's + is quiet until hover, and a Space running an agent 
   await app.waitFor("id:new-space-name");
   expect(app.viewStyle("id:new-space-toggle")?.opacity).toBe(1); // Cancel stays shown while the form is open
 });
+
+test("in a narrow header a thread's link back to its parent stays reachable", async () => {
+  const f = world();
+  f.addRoom("acme", { id: "fix", name: "a-thread-with-a-rather-long-name", parent_room_id: "lobby" } as any);
+  const app = await openApp(f, { width: 920 });
+  await signIn(app, "alice");
+  await app.press("id:space:acme");
+  await app.press("id:room:fix");
+  await app.waitFor("id:open-parent");
+  await app.press("id:open-parent");
+  await app.waitFor("text:hello from bob in acme");
+});

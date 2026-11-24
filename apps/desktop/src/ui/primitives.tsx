@@ -160,12 +160,13 @@ export function CenteredToolbar(props: Children & Testable & { leading: JSX.Elem
   const split = () => !!(props.title || props.trailing);
   // One tree either way, so the search box keeps its focus as the place changes.
   return (
-    <Surface variant="topbar" testID={props.testID} gap={split() ? 3 : 2}>
+    <Surface variant="topbar" testID={props.testID} gap={2}>
       <View class="shrink-0" onLayout={e => leadingWidth.set(e.bounds.size.width)}>{props.leading}</View>
       <If when={split()}>
-        <View class="flex-1 min-w-0 flex-row items-center">{props.title}</View>
+        {/* The title keeps at least 150 points; the search box gives way first (down to 120). */}
+        <View class="flex-1 min-w-[150px] flex-row items-center overflow-hidden">{props.title}</View>
       </If>
-      <View class={split() ? "w-[340px] shrink min-w-[180px] flex-col items-stretch" : "flex-1 min-w-0 flex-col items-center"}>{props.children}</View>
+      <View class={split() ? "w-[300px] shrink min-w-[120px] flex-col items-stretch" : "flex-1 min-w-0 flex-col items-center"}>{props.children}</View>
       <View class="shrink-0 flex-row items-center gap-(--space-2)" style={split() ? undefined : { width: leadingWidth() }} accessibilityElementsHidden={!split()}>
         {props.trailing}
       </View>

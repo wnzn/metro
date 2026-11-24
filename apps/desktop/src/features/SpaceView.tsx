@@ -92,7 +92,8 @@ export function RoomHeaderTitle() {
     return id ? rooms().find((r) => r.id === id) ?? null : null;
   };
   return (
-    <Row align="center" gap={2} testID="room-header">
+    // Grows into the room the header row leaves; the names truncate before the parent's link does.
+    <Row grow align="center" gap={2} testID="room-header">
       <Label variant="body" color="muted" lines={1} tooltip={ROOM_DESCRIPTION}>
         {activeSpace()?.name ?? ""}
       </Label>
