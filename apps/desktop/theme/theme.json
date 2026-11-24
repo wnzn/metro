@@ -16,6 +16,7 @@
       "space-16": "64px",
       "app-max-width": "1280px",
       "sidebar-width": "256px",
+      "header-height": "52px",
       "content-width": "720px",
       "control-height": "36px",
       "control-height-sm": "28px",

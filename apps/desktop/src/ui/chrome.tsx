@@ -276,7 +276,8 @@ export function RailButton(props: {
 
 /** A single tinted silhouette and wordmark, with one accessible name. */
 export function MetroMark(props: { size?: "sm" | "lg"; symbolOnly?: boolean }) {
-  const width = () => props.symbolOnly ? 50 : props.size === "lg" ? 174 : 126;
+  // The symbol alone: 50 wide, or 34 in the 56-wide icon rail (size "sm").
+  const width = () => props.symbolOnly ? (props.size === "sm" ? 34 : 50) : props.size === "lg" ? 174 : 126;
   const height = () => width() * 96 / (props.symbolOnly ? 200 : 498);
   return (
     <Image
@@ -824,7 +825,7 @@ export function SearchBox(
       ref={(node) => box.set(node)}
       onLayout={(e) => width.set(e.bounds.size.width)}
       class={cx(
-        "flex-row items-center gap-(--space-2) w-full max-w-[560px] min-w-0 rounded-full border bg-popover pl-(--space-3) pr-[6px] focus-within:border-ring focus-within:bg-background",
+        "flex-row items-center gap-(--space-2) w-full min-w-0 rounded-(--radius-md) border bg-popover pl-(--space-3) pr-[6px] focus-within:border-ring focus-within:bg-background",
         controlEdgeClass,
         controlHeightClass.default,
         transitionClass,

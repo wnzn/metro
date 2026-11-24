@@ -24,7 +24,7 @@ import {
   view,
 } from "../store";
 import type { Room } from "../store";
-import { AccountMenu, Action, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailButton, ResizeHandle, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
+import { AccountMenu, Action, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailBrand, RailButton, ResizeHandle, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
 import type { AccountMenuItem, Tone } from "../ui";
 import { loadSavedServers, signOut } from "../savedWorkspaces";
 import { WorkspaceDialogs, workspaceItems, WorkspaceNotice } from "./WorkspaceSwitcher";
@@ -51,7 +51,7 @@ export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
           <MetroMark />
         </SidebarBrand>
 
-        <ScrollArea padX={2} gap={1}>
+        <ScrollArea padX={2} padY={3} gap={1}>
           <NavItem
             testID="nav-chat"
             label="Chat"
@@ -88,6 +88,9 @@ function SidebarRail() {
   const runs = () => activeRunCount();
   return (
     <Surface variant="rail" testID="sidebar-rail" accessibilityLabel="Workspace navigation">
+      <RailBrand>
+        <MetroMark symbolOnly size="sm" />
+      </RailBrand>
       <RailButton testID="rail-chat" label={runs() ? `Chat, ${runs()} running` : "Chat"} icon="chat" selected={mainPlace() === "chat"} onPress={openChat} />
       <RailButton testID="rail-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
       <RailButton testID="rail-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />

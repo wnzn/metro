@@ -127,7 +127,8 @@ const surfaceClass: Record<SurfaceVariant, string> = {
   section: "border-b border-border",
   scroll: "flex-1 min-h-0",
   content: "w-full max-w-(--content-width) self-center",
-  topbar: "flex-row items-center justify-center min-h-[52px] px-(--space-4) py-(--space-2) border-b border-border bg-background",
+  // One height with the sidebar's brand header and the rail's (--header-height), its divider inside it, so both dividers share one y.
+  topbar: "flex-row items-center justify-center shrink-0 h-(--header-height) px-(--space-4) border-b border-border bg-background",
   popover: "bg-popover border border-border rounded-(--radius-lg) shadow-lg",
 };
 
@@ -151,10 +152,10 @@ export function Divider() {
 
 /**
  * The main pane's one header row, divided from the content under it by a
- * line. Alone, `children` (the search box) stays on the pane's centerline:
- * the leading control's actual width is reserved on both sides. With a
- * `title` (a room's breadcrumb, truncated first) and `trailing` actions the
- * row reads leading, title, search, actions.
+ * line. Alone, `children` (the search box) fills the row and stays on the
+ * pane's centerline: the leading control's actual width is reserved on both
+ * sides. With a `title` (a room's breadcrumb) and `trailing` actions the row
+ * reads leading, title, search, actions, the search filling the middle.
  */
 export function CenteredToolbar(props: Children & Testable & { leading: JSX.Element; title?: JSX.Element; trailing?: JSX.Element }) {
   const leadingWidth = signal(0);
@@ -164,10 +165,11 @@ export function CenteredToolbar(props: Children & Testable & { leading: JSX.Elem
     <Surface variant="topbar" testID={props.testID} gap={2}>
       <View class="shrink-0" onLayout={e => leadingWidth.set(e.bounds.size.width)}>{props.leading}</View>
       <If when={split()}>
-        {/* The title keeps at least 150 points; the search box gives way first (down to 120). */}
-        <View class="flex-1 min-w-[150px] flex-row items-center overflow-hidden">{props.title}</View>
+        {/* The title takes what it needs; when the row is tight the search box gives way first (to 180), then the title (to 120). */}
+        <View class="shrink min-w-[120px] max-w-[40%] flex-row items-center overflow-hidden">{props.title}</View>
       </If>
-      <View class={split() ? "w-[300px] shrink min-w-[120px] flex-col items-stretch" : "flex-1 min-w-0 flex-col items-center"}>{props.children}</View>
+      {/* The search box fills the space between the leading toggle (and a title) and the trailing actions, inset from both. */}
+      <View class={cx("flex-1 flex-col items-stretch px-(--space-2)", split() ? "min-w-[180px]" : "min-w-0")}>{props.children}</View>
       <View class="shrink-0 flex-row items-center gap-(--space-2)" style={split() ? undefined : { width: leadingWidth() }} accessibilityElementsHidden={!split()}>
         {props.trailing}
       </View>
@@ -554,9 +556,14 @@ export function SectionHeader(
   );
 }
 
-/** The top of a sidebar: the logo with room around it. */
+/** The top of a sidebar: the logo, centred, in a band as tall as the main panel's header row, its divider on the same line. */
+/** The top of the icon rail: the compact mark in a band as tall as the main panel's header row, its divider on the same line. Pulled up over the rail's top padding. */
+export function RailBrand(props: { children?: JSX.Element }) {
+  return <View class="self-stretch shrink-0 items-center justify-center h-(--header-height) mt-[-12px] mb-(--space-2) border-b border-sidebar-border/70">{props.children}</View>;
+}
+
 export function SidebarBrand(props: { children?: JSX.Element }) {
-  return <View class="flex-row items-center justify-center px-(--space-4) pt-(--space-6) pb-(--space-4)">{props.children}</View>;
+  return <View class="flex-row shrink-0 items-center justify-center h-(--header-height) px-(--space-4) border-b border-sidebar-border/70">{props.children}</View>;
 }
 
 /** A small selectable pill (targets, filters). */
