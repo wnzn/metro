@@ -3,6 +3,58 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: CI runs only the segments a change needs (2026-11-24, CI lane, local)
+
+Uncommitted changes on `ci/path-segmentation`, on top of `17b6e3c`, to
+`ci.yml` and `packaging/package_smoke_policy.py`, renamed to
+`packaging/ci_changes.py` ([deploy.md](deploy.md#ci-and-publishing)):
+
+- The `workflows` job classifies pull requests into `main` (from the merge
+  base) and now also pushes to `main` (from `github.event.before`) into five
+  segments: `rust`, `desktop`, `containers`, `packaging` and `previews`
+  (`package-smoke`). Each of those jobs runs only when its segment isn't
+  `false`; an empty answer runs it.
+- Documentation, `apps/desktop/dev`, `ops/`, `.gitignore` and
+  `.env.example` need no segment. `ci.yml`, `.gitattributes`, `Cargo.toml`,
+  `apps/desktop/nsh.json` and unknown paths need all of them. So does a
+  push that is forced, deletes the branch, creates it, or whose `before`
+  isn't an ancestor, and any empty or unreadable diff.
+- `rust`, `containers`, `packaging` and `desktop` also run whenever
+  `release-policy` decides to release, so they now also wait for it. The
+  `release` job requires each of its gates' result to be `success`.
+
+**Not yet shown:** any GitHub run of these changes. That a skipped job
+satisfies the required checks was seen on PR #6 only for pull requests.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean, also with shellcheck enabled
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+shellcheck -s sh packaging/*.sh                # clean (koalaman/shellcheck:stable)
+python -B -m unittest discover -s packaging    # 209 tests, OK (15 skipped: no pwsh, MSI tools or macOS runtimes, macOS jobs off)
+python -B -m unittest discover -s packaging/release-signatures  # 17 tests, OK (1 skipped)
+python -B -m unittest discover -s packaging/windows-signing     # 39 tests, OK (6 skipped)
+python -B -m unittest discover -s ops/github-runner             # 33 tests, OK
+```
+
+The classifier was also run by hand as a push to `main` (`before` = first
+parent) on this repository's history:
+
+| Commit | Changes | rust | desktop | containers | packaging | previews |
+| --- | --- | --- | --- | --- | --- | --- |
+| `17b6e3c` | README, screenshots, docs, `apps/desktop/dev` | skip | skip | skip | skip | skip |
+| `eea7221` | `ci.yml`, `release.yml`, desktop tests | run | run | run | run | run |
+| `0a84b10` | `crates/connector` tests | run | skip | run | skip | run |
+| `7194081` | `AGENTS.md`, `docs/acceptance.md` | skip | skip | skip | skip | skip |
+| `c838263` | `packaging`, `release.yml` | skip | skip | skip | run | run |
+| `7452f6f` | `ops/github-runner` | skip | skip | skip | skip | skip |
+
+`17b6e3c` with an all-zero `before`, or marked forced, ran everything. The
+`17b6e3c` push was also classified in a fresh depth-1 clone of
+`github.com/wnzn/metro`, as CI checks it out; the classifier fetched
+`before` and gave the same answer.
+
 ## Screenshots refreshed from main `eea7221` (2026-11-24, docs lane, local)
 
 Uncommitted changes on `docs/readme-refresh`, on top of `eea7221` (then

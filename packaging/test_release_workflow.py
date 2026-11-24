@@ -32,6 +32,11 @@ MAIN_IF = """github.event_name == 'push' && github.repository == 'wnzn/metro' &&
 && github.workflow_ref == 'wnzn/metro/.github/workflows/ci.yml@refs/heads/main'"""
 
 
+GATES = ("rust", "desktop", "containers", "workflows", "packaging")
+RELEASE_IF = "needs.release-policy.outputs.release == 'true' && " + " && ".join(
+    f"needs.{gate}.result == 'success'" for gate in GATES)
+
+
 def load(name):
     data = yaml.safe_load((WF / name).read_text())
     data["on"] = data.pop(True, data.get("on"))
@@ -173,7 +178,7 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(" ".join(self.ci["jobs"]["release-policy"]["if"].split()), " ".join(MAIN_IF.split()))
         self.assertEqual(" ".join(publish["if"].split()),
                          "needs.release-policy.outputs.release == 'true' && " + " ".join(MAIN_IF.split()))
-        self.assertEqual(release["if"], "needs.release-policy.outputs.release == 'true'")
+        self.assertEqual(" ".join(release["if"].split()), RELEASE_IF)
         self.assertEqual(release["with"], {"release": True, "version": "${{ needs.release-policy.outputs.version }}"})
         self.assertEqual(release["permissions"], {"contents": "read"})
         self.assertEqual(set(release["needs"]), {"rust", "desktop", "containers", "workflows", "packaging",
@@ -183,6 +188,25 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertEqual(publish["permissions"], {"contents": "write", "packages": "write", "id-token": "write"})
         self.assertEqual(publish["with"], {"version": "${{ needs.release-policy.outputs.version }}"})
         self.assertEqual(publish["concurrency"], {"group": "metro-official-release", "cancel-in-progress": False})
+
+    def test_a_release_needs_every_gate_to_have_run_and_passed(self):
+        """A gate skipped by its CI segment, failed or cancelled stops the release; it never waives it."""
+        release = self.ci["jobs"]["release"]
+        self.assertEqual(set(release["needs"]), set(GATES) | {"release-policy"})
+        base = {"needs.release-policy.outputs.release": "true"} | {f"needs.{gate}.result": "success" for gate in GATES}
+        self.assertTrue(matches_conjunction(release["if"], base))
+        self.assertFalse(matches_conjunction(release["if"], base | {"needs.release-policy.outputs.release": "false"}))
+        for gate in GATES:
+            for result in ("skipped", "failure", "cancelled"):
+                with self.subTest(gate=gate, result=result):
+                    self.assertFalse(matches_conjunction(release["if"], base | {f"needs.{gate}.result": result}))
+        # And on a release run every gated job runs whatever its segment says.
+        for gate in ("rust", "desktop", "containers", "packaging"):
+            job = self.ci["jobs"][gate]
+            self.assertIn("release-policy", job["needs"], gate)
+            self.assertIn(f"(needs.workflows.outputs.{gate} != 'false' || needs.release-policy.outputs.release == 'true')",
+                          " ".join(job["if"].split()), gate)
+        self.assertNotIn("if", self.ci["jobs"]["workflows"])
 
     def test_main_is_the_only_release_branch(self):
         for path in sorted(WF.glob("*.yml")):
