@@ -153,13 +153,14 @@ sys.exit({status!r})
             body = expression.removeprefix("${{ ").removesuffix(" }}")
             runner = ("needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' "
                       "&& needs.release-policy.outputs.release != 'true' && 'metro-ci-linux-x64' || 'ubuntu-24.04'")
-            gate = ("!cancelled() && needs.workflows.result == 'success' "
-                    "&& needs.release-policy.result != 'failure'")
+            gate = ("!cancelled() && needs.workflows.result == 'success' && needs.release-policy.result != 'failure' "
+                    "&& needs.workflows.outputs.docs_only != 'true'")
             if body == runner:
                 local = ctx["selected"] == LOCAL and ctx["release"] != "true"
                 return LOCAL if local else HOSTED
-            self.assertEqual(body, gate)
-            return not ctx["cancelled"] and ctx["workflows"] == "success" and ctx["policy"] != "failure"
+            self.assertEqual(" ".join(body.split()), gate)
+            return (not ctx["cancelled"] and ctx["workflows"] == "success" and ctx["policy"] != "failure"
+                    and ctx.get("docs_only", "") != "true")
 
         cases = (
             # (release-policy result, release output, selector choice) -> (desktop runs, runner)
@@ -181,6 +182,10 @@ sys.exit({status!r})
             self.assertFalse(evaluate(self.desktop["if"], {"policy": "skipped", "workflows": workflows,
                                                            "cancelled": False}))
         self.assertFalse(evaluate(self.desktop["if"], {"policy": "success", "workflows": "success", "cancelled": True}))
+        # A documentation-only PR skips the desktop job; any other classification runs it.
+        for docs_only, runs in (("true", False), ("false", True), ("", True)):
+            self.assertIs(evaluate(self.desktop["if"], {"policy": "skipped", "workflows": "success", "cancelled": False,
+                                                        "docs_only": docs_only}), runs)
 
     def test_single_read_only_desktop_job_and_one_toolchain_per_runner(self):
         self.assertEqual(self.ci["permissions"], {"contents": "read"})
@@ -194,8 +199,9 @@ sys.exit({status!r})
                          "${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' "
                          "&& needs.release-policy.outputs.release != 'true' "
                          "&& 'metro-ci-linux-x64' || 'ubuntu-24.04' }}")
-        self.assertEqual(self.desktop["if"], "${{ !cancelled() && needs.workflows.result == 'success' "
-                                             "&& needs.release-policy.result != 'failure' }}")
+        self.assertEqual(" ".join(self.desktop["if"].split()),
+                         "${{ !cancelled() && needs.workflows.result == 'success' "
+                         "&& needs.release-policy.result != 'failure' && needs.workflows.outputs.docs_only != 'true' }}")
         self.assertIn("desktop", self.ci["jobs"]["release"]["needs"])
         for job in ("rust", "containers", "workflows", "packaging", "release-policy"):
             self.assertEqual(self.ci["jobs"][job]["runs-on"], HOSTED)
@@ -218,5 +224,7 @@ sys.exit({status!r})
         self.assertIn("curl", install["run"])
         self.assertEqual(commands, [
             {"run": command, "working-directory": "apps/desktop"}
-            for command in ("nsh check", "nsh test", "nsh build --release")
+            for command in ("nsh check", "nsh test")
         ])
+        # The release build is package-smoke's `ui` job, not this one.
+        self.assertNotIn("nsh build", yaml.safe_dump(self.desktop))

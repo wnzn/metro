@@ -3,6 +3,104 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: leaner pull request CI (2026-11-24, CI lane, local)
+
+Uncommitted changes on `ci/trim-steps`, on top of `3933776`, to `ci.yml`,
+`release.yml` and `packaging/package_smoke_policy.py`
+([deploy.md](deploy.md#ci-and-publishing)):
+
+- The `workflows` job's policy step reads one diff of a pull request into
+  `main` and gives three answers: `skip_previews` (as before),
+  `docs_only` and `containers`. Pushes, other bases, empty or unreadable
+  diffs, symlinks and unknown paths answer `skip_previews=false`,
+  `docs_only=false`, `containers=true`.
+- `docs_only=true` skips `rust`, `containers` and `desktop`. Documentation
+  means Markdown and images under `docs/`, top-level Markdown and Markdown
+  under `ops/`, and nothing else.
+- `containers=false` skips `containers`. Its inputs are the Dockerfile,
+  `.dockerignore`, `.gitattributes`, the Cargo files, `crates/`, the
+  Compose files, `services/`, the two container runner scripts,
+  `tests/e2e/`, `rust-toolchain*` and `ci.yml`. Only paths under `docs/`,
+  `apps/`, `examples/`, `ops/`, other `packaging/` and `tests/` files,
+  other `.github/` files, `.cargo/`, top-level Markdown, `.env.example`
+  and `.gitignore` can skip it.
+- `rust` and `containers` now wait for `workflows`, and always run on
+  pushes, including when `workflows` fails.
+- The `desktop` job no longer runs `nsh build --release`; it keeps
+  `nsh check` and `nsh test`.
+- `release.yml`'s `desktop-linux` no longer has the best-effort Xvfb
+  launch (`continue-on-error`) or its screenshot upload.
+
+**Not yet shown:** any GitHub run of these changes. That a job skipped by
+`if:` satisfies the required `rust` and `containers` checks, and the job
+conditions themselves, were checked only by the contract tests below, not
+on GitHub.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging    # 200 tests, OK (15 skipped: no pwsh, MSI tools or macOS runtimes, macOS jobs off)
+python -B -m unittest discover -s packaging/release-signatures  # 17 tests, OK (1 skipped)
+python -B -m unittest discover -s packaging/windows-signing     # 39 tests, OK (6 skipped)
+python3 -B -m unittest discover -s ops/github-runner            # 33 tests, OK
+```
+
+The policy was also run by hand on this repository's history, as a pull
+request into `main` from each commit's parent:
+
+| Commit | Changes | skip_previews | docs_only | containers |
+| --- | --- | --- | --- | --- |
+| `ff787b7` | `docs/acceptance.md` | true | true | false |
+| `1719366` | `tests/e2e/schedules.py` | true | false | true |
+| `0a84b10` | `crates/connector` tests | false | false | true |
+| `057284a` | `apps/desktop` and docs | false | false | false |
+| `82ff919` | `compose.prebuilt.yaml`, a packaging test | false | false | true |
+
+`ff787b7` as a push or as a pull request into `master`, and an invalid SHA,
+answer `false`, `false`, `true`. In a throwaway clone, one-file commits on
+`3933776` gave: `Dockerfile` false, false, true; `.github/workflows/release.yml`
+false, false, false; `docs/screenshots/new.png` true, true, false.
+
+**Desktop tests and the wall clock (`ad8f994`).** Three schedule-card
+tests compared fixed November 2026 firings with the app's `Date.now()`
+and broke as the real date moved on. They now run on NSH's manual clock
+from Mon, Nov 23, 2026 12:00 UTC. Desktop `nsh test`: 353/353, and
+`nsh check` passed (NSH 0.6.1).
+
+**`desktop-linux` installer check without a download.** The installer
+step's real `--install-deps` run downloaded about 58.5 MB from GitHub's
+Ubuntu mirror. That took 10–16 minutes, and in run 45320397101 more than
+57 minutes before the run was cancelled. A cache of the `.deb` files was
+tried (`2decebd`) and removed again: only a `main` run that suffered the
+same download could fill it, and it added five steps. The step now needs no
+network:
+
+- Where `ldd` finds libraries missing, it checks that the installer
+  without `--install-deps` refuses, prints the exact
+  `sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 gstreamer1.0-plugins-base`
+  line and installs nothing.
+- Where the libraries are already present, it runs the real install,
+  `check-deps`, both updates and the uninstall.
+
+`--install-deps` itself, and install, update and uninstall without the
+libraries, are covered by `packaging/test_installers.py` with fake tools.
+`desktop-linux`, `desktop-windows` and `runner-linux` now have job
+timeouts of 30, 40 and 20 minutes. Recent runs took about 5–7, 7–15 and
+4 minutes. Checked locally:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean, also with shellcheck (koalaman/shellcheck:stable)
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging    # 202 tests, OK (15 skipped, as above)
+python -B -m unittest discover -s packaging/release-signatures  # OK (1 skipped)
+python -B -m unittest discover -s packaging/windows-signing     # OK (6 skipped)
+python3 -B -m unittest discover -s ops/github-runner            # 33 tests, OK
+```
+
+**Not yet shown:** this step on GitHub.
+
 ## Source only: releases from `main` on a version bump (2026-11-24, CI lane, local)
 
 Uncommitted changes on `fix/ci-cleanup`, on top of `106e5da`

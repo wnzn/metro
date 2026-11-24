@@ -76,6 +76,7 @@ jobs:
   runner-linux:
     needs: meta
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -254,6 +255,7 @@ jobs:
   desktop-windows:
     needs: [meta, ui]
     runs-on: windows-2025
+    timeout-minutes: 40
     defaults:
       run:
         shell: pwsh
@@ -635,12 +637,12 @@ jobs:
     permissions:
       contents: read
 
-  # Linux x64 desktop. The GUI launch is best-effort on a headless runner
-  # (Xvfb + WebKitGTK); native tests, layout, checksum, capability and server
-  # checks are blocking.
+  # Linux x64 desktop: build, package, layout, checksum, capability, server
+  # and installer checks, all blocking. There is no GUI launch here.
   desktop-linux:
     needs: [meta, ui]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -744,7 +746,10 @@ jobs:
             sleep 1
           done
           echo "metro-server did not answer /healthz" >&2; exit 1
-      - name: Per-user desktop installer (explains missing libraries, --install-deps, update, uninstall keeps data)
+      # No network: --install-deps (a ~60 MB download from a slow mirror) and
+      # install, update and uninstall without the libraries are covered by
+      # packaging/test_installers.py with fake tools.
+      - name: Per-user desktop installer (explains missing libraries; install, update, uninstall when present)
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
@@ -754,67 +759,31 @@ jobs:
           unset XDG_CONFIG_HOME XDG_DATA_HOME
           i="$GITHUB_WORKSPACE/packaging/install-metro-linux.sh"
           a="$GITHUB_WORKSPACE/dist/Metro-$VERSION-linux-x64.tar.gz"
+          app="$home/.local/share/metro-desktop-app"
+          entry="$home/.local/share/applications/dev.metro.desktop.desktop"
           mkdir -p "$home/.config/metro-desktop" && echo keep > "$home/.config/metro-desktop/marker"
-          if ldd "$METRO_ROOT/ui/Metro" | grep -q 'not found'; then
-            # Without --install-deps nothing on the system changes and the exact command is shown.
-            if sh "$i" install --archive "$a" 2>"$RUNNER_TEMP/deps.err"; then
+          if ldd "$METRO_ROOT/Metro" "$METRO_ROOT/metro-server" "$METRO_ROOT/ui/Metro" | grep -q 'not found'; then
+            # Without --install-deps it refuses, shows the exact command and changes nothing.
+            if sh "$i" install --archive "$a" </dev/null 2>"$RUNNER_TEMP/deps.err"; then
               echo "installed without its runtime libraries" >&2; exit 1
             fi
             grep -F 'sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 gstreamer1.0-plugins-base' "$RUNNER_TEMP/deps.err"
-            test ! -e "$home/.local/share/metro-desktop-app"
+            grep -F -- '--install-deps' "$RUNNER_TEMP/deps.err"
+            test ! -e "$app" && test ! -e "$entry"
+          else
+            # The libraries are already here, so the real lifecycle needs no download.
+            sh "$i" install --archive "$a" </dev/null
+            test -f "$app/current/enable-local-runner"
+            grep -F "Exec=/usr/bin/env \"$app/versions/$VERSION/Metro\"" "$entry"
+            sh "$i" check-deps
+            sh "$i" update --archive "$a" --no-local-runner
+            test ! -e "$app/current/enable-local-runner"
+            sh "$i" update --archive "$a"
+            test ! -e "$app/current/enable-local-runner"
+            sh "$i" uninstall
+            test ! -e "$app" && test ! -e "$entry"
           fi
-          # apt-get asks before installing; the CI answers for the person.
-          yes | DEBIAN_FRONTEND=noninteractive sh "$i" install --archive "$a" --install-deps
-          test -f "$home/.local/share/metro-desktop-app/current/enable-local-runner"
-          grep -F "Exec=/usr/bin/env \"$home/.local/share/metro-desktop-app/versions/$VERSION/Metro\"" \
-            "$home/.local/share/applications/dev.metro.desktop.desktop"
-          sh "$i" check-deps
-          sh "$i" update --archive "$a" --no-local-runner
-          test ! -e "$home/.local/share/metro-desktop-app/current/enable-local-runner"
-          sh "$i" update --archive "$a"
-          test ! -e "$home/.local/share/metro-desktop-app/current/enable-local-runner"
-          sh "$i" uninstall
-          test ! -e "$home/.local/share/metro-desktop-app" && test ! -e "$home/.local/share/applications/dev.metro.desktop.desktop"
           test "$(cat "$home/.config/metro-desktop/marker")" = keep
-      - name: Launch under Xvfb (best effort)
-        continue-on-error: true
-        run: |
-          set -eu
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends xvfb xdotool x11-utils imagemagick libwebkitgtk-6.0-4 libgtk-4-1
-          work="$(mktemp -d "$RUNNER_TEMP/desktop-run.XXXXXX")"
-          mkdir -p "$RUNNER_TEMP/shot"
-          # shellcheck disable=SC2016 # the inner script expands its own variables
-          for attempt in 1 2 3; do
-            if GDK_BACKEND=x11 METRO_DESKTOP_HOME="$work/home" xvfb-run -a --server-args='-screen 0 1280x800x24' bash -c '
-              set -eu
-              mkdir -p "$METRO_DESKTOP_HOME"
-              cd "$1"
-              HOME="$1" "$METRO_ROOT/Metro" &
-              pid=$!
-              for _ in $(seq 1 45); do
-                kill -0 "$pid" 2>/dev/null || { echo "launcher exited early" >&2; exit 1; }
-                xdotool search --name "^Metro$" >/dev/null 2>&1 && break
-                sleep 1
-              done
-              wid="$(xdotool search --name "^Metro$" | head -n 1)"
-              xprop -id "$wid" WM_CLASS | grep -F dev.metro.desktop
-              sleep 8
-              kill -0 "$pid"
-              import -window root "$2/desktop-linux.png" || true
-              kill "$pid"
-            ' _ "$work" "$RUNNER_TEMP/shot"; then exit 0; fi
-            echo "attempt $attempt failed" >&2
-          done
-          exit 1
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: smoke-linux-screenshot
-          path: ${{ runner.temp }}/shot
-          if-no-files-found: ignore
-          overwrite: true
-          retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-desktop-linux-x64

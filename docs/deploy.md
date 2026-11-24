@@ -188,7 +188,7 @@ It runs:
 
 - the Rust format, lint and test suites and the end-to-end scripts;
 - the terminal client's pseudo-terminal test;
-- the desktop checks and release build;
+- the desktop checks and tests (the test builds below package the app);
 - both container targets;
 - the packaging and workflow tests;
 - unsigned test builds for Linux and Windows
@@ -206,12 +206,24 @@ Some of this is cut down for pull requests, to keep them fast:
   something a build reads: the workflows, `apps/desktop`, `crates`,
   `packaging`, `services`, the Cargo files, the Dockerfile and a few other
   build files. A change only to docs, `tests`, `examples`, `ops` or the
-  Compose files skips them. If CI can't read the change, it builds.
+  Compose files skips them.
+- A pull request into `main` that changes only documentation (Markdown and
+  images under `docs/`, top-level Markdown such as `README.md`, and
+  Markdown under `ops/`) also skips the Rust, container and desktop jobs.
+  The workflow and packaging tests still run.
+- A pull request into `main` runs the container job only when it changes
+  something that job reads: the Dockerfile and `.dockerignore`, the Cargo
+  files and `crates`, the Compose files, `services`, the container runner
+  scripts, `tests/e2e`, the Rust toolchain pin or `ci.yml`. A change only
+  to `apps`, other `packaging` files, other workflows, `examples`, `ops` or
+  docs skips it.
+- A skipped job counts as passed for the required checks. If CI can't read
+  the change, or meets a path it doesn't know, it runs everything.
 - Pull requests into any other branch always get test builds.
 - A new push to a pull request cancels that pull request's older run.
   Pushes are never cancelled.
 
-Pushes to `main` build everything.
+Pushes to `main` run and build everything.
 
 The Rust jobs keep a build cache. Only pushes to `main` write it. Pull
 requests and other pushes only read it. Release builds never use it, so

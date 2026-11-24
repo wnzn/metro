@@ -9,8 +9,16 @@ import { discoveryWorld } from "./test/fixtures";
 
 type W = ReturnType<typeof discoveryWorld>;
 
-async function signIn(w: W, zone = "UTC"): Promise<App> {
-  const app = await open("./test/Harness.tsx", { network: w.network as any, platform: "linux", width: 1280, height: 900, localeSettings: { timeZone: zone } });
+// A fixed "now" for cards that leave out the current year (st2's
+// "Once · Sun, Nov 22 · 18:00 UTC"): the app reads Date.now(), so those tests
+// run on NSH's manual clock, starting here.
+const NOW = Date.UTC(2026, 10, 23, 12, 0); // Mon, Nov 23, 2026 · 12:00 UTC
+
+async function signIn(w: W, zone = "UTC", now?: number): Promise<App> {
+  const app = await open("./test/Harness.tsx", {
+    network: w.network as any, platform: "linux", width: 1280, height: 900, localeSettings: { timeZone: zone },
+    clock: now === undefined ? null : { time: now },
+  });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);
@@ -72,7 +80,7 @@ function seed(w: W) {
 test("a card shows a compact schedule, the next firing relative and in its own zone, the destination and a one-line prompt", async () => {
   const w = discoveryWorld();
   seed(w);
-  const app = await signIn(w);
+  const app = await signIn(w, "UTC", NOW);
   await app.press("id:h-schedules");
   await app.waitFor("id:schedule:st1");
   expect(text(app)).toContain("Every day at 09:00 · Asia/Manila");

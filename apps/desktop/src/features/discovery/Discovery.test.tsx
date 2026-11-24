@@ -8,8 +8,16 @@ import { discoveryWorld } from "./test/fixtures";
 
 type W = ReturnType<typeof discoveryWorld>;
 
-async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice", zone = "UTC"): Promise<App> {
-  const app = await open("./test/Harness.tsx", { network: w.network as any, platform: "linux", width: 1280, height: 900, localeSettings: { timeZone: zone } });
+// A fixed "now" for cards whose relative time and year depend on it: the
+// fixtures' next firings are on Tue, Nov 24, 2026. The app reads Date.now(),
+// so these tests run on NSH's manual clock, starting here.
+const NOW = Date.UTC(2026, 10, 23, 12, 0); // Mon, Nov 23, 2026 · 12:00 UTC
+
+async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice", zone = "UTC", now?: number): Promise<App> {
+  const app = await open("./test/Harness.tsx", {
+    network: w.network as any, platform: "linux", width: 1280, height: 900, localeSettings: { timeZone: zone },
+    clock: now === undefined ? null : { time: now },
+  });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
@@ -214,7 +222,7 @@ test("search without an embedding model points to Model providers; nothing is ca
 
 test("a daily 09:00 task in Asia/Manila goes to a chosen room, shows its next firing and destination", async () => {
   const w = discoveryWorld();
-  const app = await signIn(w, "alice", "UTC");
+  const app = await signIn(w, "alice", "UTC", NOW);
   await app.press("id:h-schedules");
   await app.waitFor("text:No scheduled tasks yet");
   await app.press("id:schedule-new");
@@ -246,7 +254,8 @@ test("a daily 09:00 task in Asia/Manila goes to a chosen room, shows its next fi
   await app.waitFor(`id:schedule:${id}`);
   expect(text(app)).toContain("Every day at 09:00 · Asia/Manila");
   // The card: how far off, then the server's wall time in the task's own zone.
-  expect(text(app)).toMatch(/Next (in|ago) [^|]* · Tue, Nov 24(, 2026)? · 09:00 Asia\/Manila/);
+  // 13 h after NOW, less the little the clock moved while the test waited.
+  expect(text(app)).toMatch(/Next in (13 h|12 h \d+ min) · Tue, Nov 24 · 09:00 Asia\/Manila/);
   expect(app.shows(`id:schedule:${id} >> text:Acme · #lobby`)).toBe(true);
   // The exact instant, with its offset and in UTC, is behind History.
   expect(text(app)).not.toContain("01:00 UTC");
@@ -336,12 +345,12 @@ test("pause, resume, history (dispatched is not completed) and delete with confi
     { id: 2, due_at: "2026-11-23T09:00:00Z", status: "dispatched", detail: null, claimed_at: "2026-11-23T09:00:01Z", finished_at: "2026-11-23T09:00:02Z" },
     { id: 1, due_at: "2026-11-22T09:00:00Z", status: "missed", detail: "1 occurrence skipped", claimed_at: "2026-11-22T09:20:00Z", finished_at: null },
   ]);
-  const app = await signIn(w);
+  const app = await signIn(w, "alice", "UTC", NOW);
   await app.press("id:h-schedules");
   await app.waitFor("id:schedule:st9");
   expect(text(app)).not.toContain("Bob's own task");
   expect(text(app)).toContain("Every day at 09:00 · UTC");
-  expect(text(app)).toMatch(/Next (in|ago) [^|]* · Tue, Nov 24(, 2026)? · 09:00 UTC/);
+  expect(text(app)).toMatch(/Next in (21 h|20 h \d+ min) · Tue, Nov 24 · 09:00 UTC/);
 
   await app.waitFor("id:schedule:st11");
   // Already fired, nothing left: the badge says so and there's no "next" line.

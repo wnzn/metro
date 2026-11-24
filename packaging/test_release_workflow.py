@@ -297,6 +297,34 @@ class ReleaseWorkflowTests(unittest.TestCase):
         for path in sorted(WF.glob("*.yml")):
             self.assertEqual(re.findall(r"secrets\.([A-Z0-9_]+)", path.read_text()), [], path.name)
 
+    def test_linux_desktop_job_has_only_blocking_steps(self):
+        # The best-effort Xvfb launch could never fail CI, so it and its screenshot are gone.
+        job = self.release["jobs"]["desktop-linux"]
+        self.assertFalse([s for s in job["steps"] if "continue-on-error" in s])
+        self.assertNotIn("xvfb", steps_text(job).lower())
+        self.assertEqual(uploads(job), ["dist-desktop-linux-x64"])
+
+    def test_linux_desktop_installer_check_needs_no_network(self):
+        step, = [s for s in self.release["jobs"]["desktop-linux"]["steps"]
+                 if "install-metro-linux.sh" in str(s.get("run", ""))]
+        run = step["run"]
+        # The real refusal on this runner: the exact command, and nothing installed.
+        self.assertIn("grep -F 'sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 "
+                      "gstreamer1.0-plugins-base' \"$RUNNER_TEMP/deps.err\"", run)
+        self.assertIn('test ! -e "$app" && test ! -e "$entry"', run)
+        # --install-deps and apt only in what it checks, never run (packaging/test_installers.py covers them).
+        commands = [line.strip() for line in run.splitlines() if line.strip().startswith(("sh ", "yes ", "sudo "))]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertNotIn("--install-deps", command)
+        self.assertNotRegex(run, r"(?m)^\s*(sudo\s+)?apt(-get)?\s")
+        self.assertNotIn("yes |", run)
+
+    def test_platform_build_jobs_have_timeouts(self):
+        jobs = self.release["jobs"]
+        self.assertEqual({name: jobs[name].get("timeout-minutes") for name in ("desktop-linux", "desktop-windows", "runner-linux")},
+                         {"desktop-linux": 30, "desktop-windows": 40, "runner-linux": 20})
+
     def test_only_final_outputs_are_named_dist(self):
         names = {(job, u) for job, j in self.release["jobs"].items() for u in uploads(j) if u.startswith("dist-")}
         self.assertEqual(names, {("runner-linux", "dist-runner-linux-x64"),
