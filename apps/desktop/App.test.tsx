@@ -198,6 +198,37 @@ test("a message that mentions me is highlighted as @you", async () => {
   expect(app.shows("text:to the agent and people")).toBe(false);
 });
 
+test("drafts are per place: a room, another room and the personal Chat each keep their own", async () => {
+  const f = world();
+  f.addRoom("acme", { id: "design", name: "design" } as any);
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await openAcme(app);
+  await app.type("id:composer", "lobby draft");
+
+  await app.press("id:nav-chat");
+  await app.waitFor("id:chat-view");
+  expect(app.value("id:composer")).toBe("");
+  await app.type("id:composer", "chat draft");
+
+  await app.press("id:space:acme");
+  await app.waitFor("text:hello from bob in acme");
+  expect(app.value("id:composer")).toBe("lobby draft");
+
+  await app.press("id:room:design");
+  await app.waitUntil(() => app.value("id:composer") === "");
+  await app.type("id:composer", "design draft");
+
+  await app.press("id:room:lobby");
+  await app.waitUntil(() => app.value("id:composer") === "lobby draft");
+  await app.press("id:nav-chat");
+  await app.waitUntil(() => app.value("id:composer") === "chat draft");
+  await app.press("id:space:acme");
+  await app.press("id:room:design");
+  await app.waitUntil(() => app.value("id:composer") === "design draft");
+  expect(f.posts().some((p) => p.path.endsWith("/messages"))).toBe(false); // nothing was sent
+});
+
 test("reactions: add and remove mine, fold the agent's acknowledgement, no extra rows", async () => {
   const f = world();
   const app = await openApp(f);
@@ -247,12 +278,15 @@ test("Test runner lives with the runner controls, needs this Space's runner and 
   await app.waitFor("id:runner-card >> id:test-runner");
   await app.press("id:close-manage");
 
-  // A Space without a runner, which alice doesn't own: nothing to test, no runner controls.
+  // A Space without a runner, which alice doesn't own: its status, nothing to test, no management.
   await app.press("id:space:side");
   await app.waitFor("text:No runner");
   await app.press("id:space-settings-open");
-  expect(app.shows("id:space-settings-tab:members")).toBe(false);
+  await app.press("id:space-settings-tab:members");
+  await app.waitFor("id:space-runner-status");
+  expect(app.shows("id:space-runner-status >> text:No runner")).toBe(true);
   expect(app.shows("id:test-runner")).toBe(false);
+  expect(app.shows("id:open-manage")).toBe(false);
 });
 
 test("owners manage members and see a runner token once; members can't manage", async () => {

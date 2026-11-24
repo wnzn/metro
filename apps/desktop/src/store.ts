@@ -598,6 +598,7 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     return next;
   };
   batch(() => {
+    stashedDrafts.set(strip(stashedDrafts()));
     const { [spaceId]: _gone, ...restRooms } = roomsBySpace();
     roomsBySpace.set(restRooms);
     eventsByScope.set(strip(eventsByScope()));
@@ -772,6 +773,10 @@ export async function send(invokeAgent: boolean, choice?: TurnModelChoice, agent
         draft.set("");
         if (!chat) mentions.set([]);
       });
+    } else if (stashedDrafts()[scope]?.text.trim() === text) {
+      // Sent from a place the user has since left: its stashed draft is gone too.
+      const { [scope]: _sent, ...rest } = stashedDrafts();
+      stashedDrafts.set(rest);
     }
     if (chat) {
       if (chatUnavailable()) chatUnavailable.set(null);
@@ -1176,15 +1181,30 @@ function clearTransient() {
   for (const fn of transientClearers) fn();
 }
 
-// Mentions belong to one room: forget them whenever the room, Space or place changes.
+// Drafts are per place: each room or thread, and the personal Chat, keeps its
+// own text and mention chips. `draft` and `mentions` are the active place's;
+// switching stashes them under the place left and restores the new one's.
+const stashedDrafts = signal<Record<string, { text: string; mentions: Mention[] }>>({});
+/** Some place other than the active one has a draft not sent yet. */
+export const stashedDraftPending = computed(() => Object.values(stashedDrafts()).some((d) => d.text.trim().length > 0));
 let mentionScope = "";
 effect(() => {
   const scope = activeScope();
   untracked(() => {
     if (scope === mentionScope) return;
+    const left = mentionScope;
     mentionScope = scope;
-    if (mentions().length) mentions.set([]);
-    if (membersError()) membersError.set(null);
+    const stash = { ...stashedDrafts() };
+    if (left && (draft() || mentions().length)) stash[left] = { text: draft(), mentions: mentions() };
+    else delete stash[left];
+    const back = stash[scope];
+    delete stash[scope];
+    batch(() => {
+      stashedDrafts.set(stash);
+      draft.set(back?.text ?? "");
+      mentions.set(back?.mentions ?? []);
+      if (membersError()) membersError.set(null);
+    });
   });
 });
 
@@ -1235,6 +1255,7 @@ function endSession() {
     reactionPending.set(null);
     view.set("room");
     draft.set("");
+    stashedDrafts.set({});
     sending.set(null);
     demoPending.set(false);
     creatingRoom.set(false);
