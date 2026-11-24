@@ -5,6 +5,7 @@
 // preference) before the app's first frame: see ./appearance.
 export * from "./appearance";
 export * from "./panels";
+export * from "./resize";
 import "./fonts/InterVariable.ttf";
 export * from "./primitives";
 export * from "./chrome";

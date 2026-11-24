@@ -24,7 +24,6 @@ import {
   activeSpace,
   activeSpaceId,
   addMention,
-  demoPending,
   draft,
   loadMembersForMentions,
   me,
@@ -35,7 +34,6 @@ import {
   openManage,
   removeMention,
   rooms,
-  runDemo,
   selectRoom,
   setDraft,
   status,
@@ -87,7 +85,7 @@ const ROOM_IDEAS: DraftIdea[] = [
 ];
 
 export function SpaceView() {
-  // Its header (breadcrumb, runner, Run demo, Manage) is the Shell's one
+  // Its header (breadcrumb, runner, Manage, Space settings) is the Shell's one
   // header row: RoomHeaderTitle and RoomHeaderActions below.
   return (
     <Surface variant="panel" grow testID="space-view">
@@ -132,21 +130,12 @@ export function RoomHeaderTitle() {
   );
 }
 
-/** The room's actions at the end of the header row: whether a runner serves it, Run demo, Manage (owners). */
+/** The room's actions at the end of the header row: whether a runner serves it, Manage (owners), Space settings. Test runner lives with the runner controls (Space settings › Members and runner, Manage). */
 export function RoomHeaderActions() {
   const paired = () => !!activeSpace()?.runnerPaired;
   return (
     <>
       <Badge testID="runner-state" tone={paired() ? "runner" : "neutral"} label={paired() ? "Runner attached" : "No runner"} />
-      <Action
-        testID="run-demo"
-        label="Run demo"
-        busyLabel="Requesting…"
-        accessibilityLabel={paired() ? "Run the deterministic runner demo (workspace.list)" : "Run demo (needs a runner attached to this Space)"}
-        busy={demoPending()}
-        disabled={!activeRoom() || !paired() || status().phase !== "online"}
-        onPress={() => void runDemo()}
-      />
       <If when={activeSpace()?.role === "owner"}>
         <Action testID="manage-space" label="Manage" onPress={() => void openManage()} />
       </If>

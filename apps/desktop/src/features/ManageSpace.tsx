@@ -7,7 +7,7 @@
 
 import { signal } from "nsh";
 import type { JSX } from "nsh";
-import { activeSpace, addMember, closeManage, manageError, me, memberBusy, members, notice, openSettings, removeMember } from "../store";
+import { activeRoom, activeSpace, activeSpaceId, addMember, closeManage, manageError, me, memberBusy, members, notice, openSettings, removeMember } from "../store";
 import {
   activeSpaceRunner,
   attachableRunners,
@@ -25,6 +25,7 @@ import type { SpaceRunner } from "../settings";
 import { Action, Badge, Banner, Column, Divider, Field, Label, Row, ScrollArea, Spacer, Surface } from "../ui";
 import { ConnectionBanner } from "./Conversation";
 import { TokenReveal } from "./TokenReveal";
+import { TEST_RUNNER_DESCRIPTION, TEST_RUNNER_LABEL, TestRunnerAction } from "./space/TestRunner";
 import { LocalToolsCard } from "./localtools/LocalToolsCard";
 import { clearLocalToolsMessages, loadLocalTools } from "./localtools/localTools";
 
@@ -187,6 +188,17 @@ function RunnerCard() {
         </Column>
         <Badge testID="runner-paired" tone={badge().tone} label={badge().label} />
       </Row>
+
+      {/* Test runner: only while a runner is attached or paired. */}
+      <If when={activeSpace()?.runnerPaired}>
+        <Row align="center" gap={3} testID="test-runner-row">
+          <Column grow gap={1}>
+            <Label variant="strong">{TEST_RUNNER_LABEL}</Label>
+            <Label variant="caption" color="muted">{`${TEST_RUNNER_DESCRIPTION}. The listing is posted in # ${activeRoom()?.name ?? "the room you have open"}.`}</Label>
+          </Column>
+          <TestRunnerAction spaceId={activeSpaceId()} />
+        </Row>
+      </If>
 
       <If when={runner() === undefined}>
         <Label variant="caption" color="muted">

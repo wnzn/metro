@@ -39,6 +39,7 @@ import { MAX_AGENT_DESCRIPTION, MAX_AGENT_HANDLE, MAX_AGENT_INSTRUCTIONS, MAX_AG
 import type { SpaceAgent } from "../../api/spaces";
 import { agentList, spaceAgents } from "./agents";
 import { SpaceAgentAvatar } from "./SpaceAgentAvatar";
+import { TEST_RUNNER_DESCRIPTION, TEST_RUNNER_LABEL, TestRunnerAction } from "./TestRunner";
 import { effortsOf, selectionOf, shownValue, spaceModelOptions, thinkingOptions, unlisted, withEffort } from "./modelOptions";
 import { ThinkingChoice } from "../../ui/composerModelTrigger";
 import {
@@ -414,6 +415,9 @@ function MembersPage() {
       <SettingsGroup>
         <SettingRow label="Manage members and the runner" description="Add or remove members by their user ID, attach or detach a runner, or pair a dedicated one. Only you, the owner, can do this.">
           <Action testID="open-manage" label="Open" onPress={() => void open()} />
+        </SettingRow>
+        <SettingRow label={TEST_RUNNER_LABEL} description={`${TEST_RUNNER_DESCRIPTION}. The listing is posted in the room you have open.`} testID="test-runner-row">
+          <TestRunnerAction spaceId={spaceSettingsFor()} />
         </SettingRow>
       </SettingsGroup>
     </PageLayout>

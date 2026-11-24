@@ -82,6 +82,8 @@ import {
   transitionClass,
 } from "./tokens";
 import type { Tone } from "./tokens";
+import { settingsPanel } from "./panels";
+import { ResizeHandle } from "./resize";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
 
@@ -167,19 +169,23 @@ export function IconButton(props: { icon: IconName; accessibilityLabel: string; 
 }
 
 /** Kept outside the panel it controls: one target to collapse and restore,
- * including when navigating with a keyboard or a screen reader. */
+ * including when navigating with a keyboard or a screen reader. Icon only:
+ * what it does (and `status`, such as "1 active") is its tooltip and
+ * accessible name; `attention` adds a small dot on the icon. */
 export function PanelToggle(props: {
-  side: "left" | "right"; expanded: boolean; name: string; caption?: string;
+  side: "left" | "right"; expanded: boolean; name: string; status?: string; attention?: boolean;
   shortcut?: "B" | "Shift+B"; testID: string; onPress: () => void;
 }) {
-  const label = () => `${props.expanded ? "Hide" : "Show"} ${props.name}`;
+  const label = () => `${props.expanded ? "Hide" : "Show"} ${props.name}${props.status ? `, ${props.status}` : ""}`;
   const shortcut = () => props.shortcut ? ` (${keymap.label("mod+" + props.shortcut.toLowerCase())})` : "";
   return (
-    <View role="button" focusable class={cx("flex-row shrink-0 min-w-[36px] min-h-[36px] items-center justify-center gap-(--space-1) px-(--space-2) rounded-(--radius-md) hover:bg-muted", transitionClass, focusRing)}
+    <View role="button" focusable class={cx("relative shrink-0 size-[36px] items-center justify-center rounded-(--radius-md) hover:bg-muted", transitionClass, focusRing)}
       testID={props.testID} accessibilityLabel={label()} accessibilityState={{ expanded: props.expanded }}
       tooltip={<Text class={tooltipClass}>{label() + shortcut()}</Text>} onPress={props.onPress}>
       <Icon name={props.side === "left" ? "panel-left" : "panel-right"} color={props.expanded ? "accent" : "muted"} size={20} />
-      <If when={props.caption}>{(caption) => <Text class={cx(textClass.sm, "font-medium text-foreground")}>{caption()}</Text>}</If>
+      <If when={props.attention}>
+        <View class="absolute right-[6px] top-[6px] size-[7px] rounded-full bg-primary border border-background" accessibilityElementsHidden testID={`${props.testID}-attention`} />
+      </If>
     </View>
   );
 }
@@ -551,9 +557,14 @@ export function Modal(props: Testable & { open: boolean; title: string; onClose:
 /** The side navigation of a modal (Settings' sections). */
 export function ModalNav(props: Testable & { children?: JSX.Element }) {
   return (
-    <View class="w-[228px] flex-col gap-(--space-1) bg-sidebar border-r border-sidebar-border px-(--space-2) py-(--space-3)" testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="tablist">
-      {props.children}
-    </View>
+    <>
+      <View class="shrink-0 flex-col gap-(--space-1) bg-sidebar border-r border-sidebar-border px-(--space-2) py-(--space-3)" style={{ width: settingsPanel.width() }}
+        testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="tablist">
+        {props.children}
+      </View>
+      {/* One width for every modal's sections (Settings, Space settings). */}
+      <ResizeHandle panel={settingsPanel} edge="end" name="sections" testID={props.testID ? `${props.testID}-resize` : undefined} />
+    </>
   );
 }
 

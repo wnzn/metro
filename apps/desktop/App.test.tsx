@@ -5,6 +5,7 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, fakeServer, header, TOKENS, world } from "./test/fakeServer";
 import { serverPlace } from "./src/features/Sidebar";
+import { spaceWorld } from "./src/features/space/test/fixtures";
 
 async function openApp(f: ReturnType<typeof fakeServer>, storage: Record<string, string> = {}) {
   return open("./App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
@@ -219,22 +220,39 @@ test("reactions: add and remove mine, fold the agent's acknowledgement, no extra
   expect(text(app)).not.toContain("target_event_id");
 });
 
-test("Demo needs this Space's runner and shows its tool output collapsed", async () => {
-  const f = world();
-  const app = await openApp(f);
+test("Test runner lives with the runner controls, needs this Space's runner and shows its tool output collapsed", async () => {
+  const w = spaceWorld();
+  const f = w.f;
+  const app = await open("./App.tsx", { network: w.network as any, platform: "linux", width: 1200, height: 800 });
   await signIn(app, "alice");
   await openAcme(app);
   expect(app.shows("text:Runner attached")).toBe(true);
-  await app.press("id:run-demo");
-  // One collapsed Runner activity group: Demo is deterministic, so nothing says "thinking".
+  // Not in the room's header any more.
+  expect(app.shows("id:run-demo")).toBe(false);
+  expect(app.shows("id:test-runner")).toBe(false);
+  await app.press("id:space-settings-open");
+  await app.press("id:space-settings-tab:members");
+  expect(app.shows("text:Lists the workspace on this Space's runner; no model is used. The listing is posted in the room you have open.")).toBe(true);
+  await app.press("id:test-runner");
+  await app.waitFor("text:Requested. The listing appears in # lobby as Runner activity.");
+  expect(f.posts().at(-1)).toMatchObject({ path: "/v1/spaces/acme/rooms/lobby/demo", body: {} });
+  await app.press("id:space-settings-close");
+  // One collapsed Runner activity group: the test is deterministic, so nothing says "thinking".
   await app.waitFor("text:Runner activity");
   expect(app.shows("text:/thinking/")).toBe(false);
   expect(app.shows("text:README.md\nsrc/")).toBe(false); // collapsed until opened
-  expect(f.posts().at(-1)).toMatchObject({ path: "/v1/spaces/acme/rooms/lobby/demo", body: {} });
 
+  // Manage offers it beside the runner's status, only while a runner is attached.
+  await app.press("id:manage-space");
+  await app.waitFor("id:runner-card >> id:test-runner");
+  await app.press("id:close-manage");
+
+  // A Space without a runner, which alice doesn't own: nothing to test, no runner controls.
   await app.press("id:space:side");
   await app.waitFor("text:No runner");
-  expect(app.enabled("id:run-demo")).toBe(false);
+  await app.press("id:space-settings-open");
+  expect(app.shows("id:space-settings-tab:members")).toBe(false);
+  expect(app.shows("id:test-runner")).toBe(false);
 });
 
 test("owners manage members and see a runner token once; members can't manage", async () => {

@@ -131,10 +131,11 @@ const surfaceClass: Record<SurfaceVariant, string> = {
   popover: "bg-popover border border-border rounded-(--radius-lg) shadow-lg",
 };
 
-export function Surface(props: StackProps & { variant: SurfaceVariant; hidden?: boolean }) {
+export function Surface(props: StackProps & { variant: SurfaceVariant; hidden?: boolean; /** A side panel's width the user chose (points), over the variant's own. */ width?: number }) {
   return (
     <View
-      class={cx(surfaceClass[props.variant], stackClass({ ...props, grow: false }, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col"), props.grow && "flex-1 min-h-0", props.hidden && "hidden")}
+      class={cx(surfaceClass[props.variant], stackClass({ ...props, grow: false }, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col"), props.grow && "flex-1 min-h-0", props.hidden && "hidden", props.width !== undefined && "shrink-0")}
+      style={props.width !== undefined ? { width: props.width } : undefined}
       accessibilityElementsHidden={props.hidden}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
@@ -555,7 +556,7 @@ export function SectionHeader(
 
 /** The top of a sidebar: the logo with room around it. */
 export function SidebarBrand(props: { children?: JSX.Element }) {
-  return <View class="flex-row items-center px-(--space-4) pt-(--space-6) pb-(--space-4)">{props.children}</View>;
+  return <View class="flex-row items-center justify-center px-(--space-4) pt-(--space-6) pb-(--space-4)">{props.children}</View>;
 }
 
 /** A small selectable pill (targets, filters). */

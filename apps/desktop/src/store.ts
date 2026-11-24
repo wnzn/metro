@@ -972,12 +972,16 @@ async function refreshRuns() {
   }
 }
 
-/** Asks the server to run the deterministic runner demo (workspace.list) with this Space's runner. */
-export async function runDemo(): Promise<void> {
+/**
+ * Test runner: asks the server to run the deterministic `workspace.list` on
+ * this Space's runner (POST …/demo; no model is used). Its listing is posted
+ * in the active room. True once the server took the request.
+ */
+export async function runDemo(): Promise<boolean> {
   const sid = activeSpaceId();
   const rid = activeRoomId();
   const c = client;
-  if (!sid || !rid || !c || demoPending()) return;
+  if (!sid || !rid || !c || demoPending()) return false;
   const ok = guard(sid);
   batch(() => {
     demoPending.set(true);
@@ -986,11 +990,12 @@ export async function runDemo(): Promise<void> {
   });
   try {
     await c.runDemo(sid, rid);
-    if (!ok()) return;
-    notice.set("Demo requested: this Space's runner will answer with workspace.list in this room.");
+    if (!ok()) return false;
     kick();
+    return true;
   } catch (error) {
-    if (ok()) handleActionError(error, "Could not start the demo", sid);
+    if (ok()) handleActionError(error, "Could not test the runner", sid);
+    return false;
   } finally {
     if (ok()) demoPending.set(false);
   }

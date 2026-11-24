@@ -39,7 +39,7 @@ import {
   stopRun,
 } from "../store";
 import type { Run } from "../store";
-import { Action, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, PanelToggle, Row, runsPanel, ScrollArea, Spacer, Surface } from "../ui";
+import { Action, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, PanelToggle, ResizeHandle, Row, runsPanel, ScrollArea, Spacer, Surface } from "../ui";
 import { EmptyState, sidePanelFits, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
 import { Composer, ConnectionBanner, Transcript } from "./Conversation";
@@ -76,7 +76,8 @@ export function ChatView() {
             </Label>
           </Column>
           <PanelToggle side="right" name="agent runs" testID="runs-toggle"
-            caption={runs().some(isActiveRun) ? `Runs · ${runs().filter(isActiveRun).length} active` : "Runs"}
+            status={runs().some(isActiveRun) ? `${runs().filter(isActiveRun).length} active` : undefined}
+            attention={runs().some(isActiveRun)}
             expanded={sidePanelFits() ? runsPanel.open() : runsDialogOpen()} shortcut="Shift+B" onPress={showRuns} />
         </Surface>
         <ConnectionBanner />
@@ -102,7 +103,8 @@ export function ChatView() {
       {/* Wide windows keep the runs beside the Chat; narrower ones open them
           in a dialog, so the Chat (and its draft) keeps its full width. */}
       <If when={sidePanelFits() && runsPanel.open()}>
-        <Surface variant="aside" testID="runs-aside">
+        <ResizeHandle panel={runsPanel} edge="start" name="agent runs" testID="resize-runs" />
+        <Surface variant="aside" testID="runs-aside" width={runsPanel.width()}>
           <RunsPanel />
         </Surface>
       </If>

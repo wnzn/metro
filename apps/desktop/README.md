@@ -225,7 +225,9 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   you see it. Its agent can't see your Spaces, and its only tool is
   acknowledging with a reaction. Next to it, the Chat shows active and recent
   **agent runs** in your Spaces (in a side panel at 1100 points and wider,
-  or behind **Runs** in a dialog when narrower), with three actions:
+  or in a dialog when narrower; the icon-only panel button at the end of the
+  Chat's header, or <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd>,
+  shows and hides it, and a dot on it means a run is active), with three actions:
   Open (go to the room or thread), Follow up, and Stop. **New task** there
   sends a task right away, once, to the agent of a Space and room or thread
   that you pick explicitly. The recipient is spelled out before **Send to
@@ -308,11 +310,15 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   acknowledgement is labelled "agent", and screen readers hear who reacted.
   Reactions are folded from `reaction` events and are never shown as
   transcript lines.
-- **Run demo:** runs the deterministic `workspace.list` on this Space's
-  runner. It is disabled when the Space has no runner. Attached or paired
-  means jobs go to that runner. It does not mean the runner is online. The
-  call and its listing show as one collapsed **Runner activity** group. Demo
-  never calls a model, so it never says "thinking".
+- **Test runner** (owners; in Space settings › **Members and runner** and
+  next to the runner's status under **Manage**, not in the room header):
+  lists the workspace on this Space's runner; no model is used. It runs the
+  deterministic `workspace.list` and posts the listing in the room you have
+  open in that Space. It is offered only while the Space has a runner
+  attached or paired. Attached or paired means jobs go to that runner. It
+  does not mean the runner is online. The call and its listing show as one
+  collapsed **Runner activity** group, and since no model is called it never
+  says "thinking".
 - **Agent activity:** each agent turn shows as **one** collapsed group, not a
   row per tool. In the current source after 0.2.0 (covered by automated
   tests; not released), a Space turn shows its agent's name and picture (or
@@ -385,6 +391,17 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   collapses it to a rail of icons: Chat, Library, Scheduled tasks, each Space
   as its initial tile, Settings and your picture. Each name is the icon's
   tooltip and accessible name.
+- **Resizable panels** (current source; covered by automated tests; not
+  released): drag the thin handle on the inner edge of the sidebar
+  (200–400 points), of Chat's agent runs (260–520) or of the Settings and
+  Space settings sections (180–320, one width for both). Double-click the
+  handle to restore the default width (headless tests can't double-click,
+  so that part is unchecked). The handle is also a keyboard stop:
+  <kbd>←</kbd>/<kbd>→</kbd> move the edge by 16 points (with
+  <kbd>Shift</kbd>, 64), <kbd>Home</kbd>/<kbd>End</kbd> go to the narrowest
+  and widest, and <kbd>Return</kbd> restores the default. Dragging the
+  sidebar well below its narrowest width collapses it to the icon rail. Each
+  width is remembered on this device, like the collapsed state.
 - **Space settings** (current source after 0.2.0; covered by automated
   tests; not released): every member opens a Space's settings from the cog
   in the room's header, from the **⋯** that shows when hovering the Space in

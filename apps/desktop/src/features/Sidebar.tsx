@@ -24,7 +24,7 @@ import {
   view,
 } from "../store";
 import type { Room } from "../store";
-import { AccountMenu, Action, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailButton, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
+import { AccountMenu, Action, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailButton, ResizeHandle, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
 import type { AccountMenuItem, Tone } from "../ui";
 import { loadSavedServers, signOut } from "../savedWorkspaces";
 import { WorkspaceDialogs, workspaceItems, WorkspaceNotice } from "./WorkspaceSwitcher";
@@ -46,7 +46,7 @@ import { openSpaceSettings } from "./space/spaceSettingsState";
 export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
   return (
     <>
-      <Surface variant="sidebar" testID="sidebar" hidden={props.mode !== "full"}>
+      <Surface variant="sidebar" testID="sidebar" hidden={props.mode !== "full"} width={navigationPanel.width()}>
         <SidebarBrand>
           <MetroMark />
         </SidebarBrand>
@@ -71,6 +71,9 @@ export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
         </Column>
         <AccountFooter />
       </Surface>
+      <If when={props.mode === "full"}>
+        <ResizeHandle panel={navigationPanel} edge="end" name="workspace navigation" collapsible testID="resize-navigation" />
+      </If>
       <If when={props.mode === "rail"}>
         <SidebarRail />
       </If>
