@@ -138,6 +138,34 @@ impl Fake {
             };
             answers.insert("directed".into(), json!({"type": "noul", "noul": p}));
         }
+        if let Some(q) = asked.get("agent") {
+            let has_none = q["criteria"].get("no_agent").is_some();
+            let (choice, p) = if message.contains("[pick2]") {
+                ("agent_2", 0.9)
+            } else if message.contains("[yes]") {
+                ("agent_1", 0.95)
+            } else if message.contains("[maybe]") {
+                ("agent_1", 0.6)
+            } else if message.contains("[unsure]") {
+                ("agent_2", 0.4)
+            } else if message.contains("[ghost]") {
+                ("agent_9", 0.9)
+            } else if has_none {
+                ("no_agent", 0.95)
+            } else {
+                ("agent_1", 0.9)
+            };
+            let mut probabilities = serde_json::Map::new();
+            probabilities.insert(choice.into(), json!(p));
+            if has_none && choice != "no_agent" {
+                probabilities.insert("no_agent".into(), json!(1.0 - p));
+            }
+            answers.insert(
+                "agent".into(),
+                json!({"type": "choice", "choice": choice, "confidence": 0.8,
+                       "probabilities": probabilities}),
+            );
+        }
         if asked.contains_key("use_case") {
             let (choice, p) = if message.contains("[evil]") {
                 (id(OVERRIDE), 0.99)
@@ -243,18 +271,24 @@ impl RoutingBackend for Backend {
 
 /// An OpenAI-compatible endpoint that answers as the model it was asked for,
 /// and records which models were called.
-async fn endpoint(calls: Arc<Mutex<Vec<String>>>) -> String {
+async fn endpoint(calls: Arc<Mutex<Vec<String>>>, bodies: Arc<Mutex<Vec<Value>>>) -> String {
     let app = axum::Router::new().route(
         "/v1/chat/completions",
         post(move |Json(body): Json<Value>| {
-            let calls = calls.clone();
+            let (calls, bodies) = (calls.clone(), bodies.clone());
             async move {
                 let model = body["model"].as_str().unwrap_or_default().to_owned();
                 calls.lock().unwrap().push(model.clone());
+                let think = body.to_string().contains("[think]");
+                bodies.lock().unwrap().push(body);
+                let mut message =
+                    json!({"role": "assistant", "content": format!("answered by {model}")});
+                if think {
+                    message["reasoning_content"] = json!("Checked the facts first.");
+                }
                 Json(json!({
                     "id": "c", "object": "chat.completion", "created": 0, "model": model,
-                    "choices": [{"index": 0, "finish_reason": "stop",
-                                 "message": {"role": "assistant", "content": format!("answered by {model}")}}],
+                    "choices": [{"index": 0, "finish_reason": "stop", "message": message}],
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
                 }))
             }
@@ -272,12 +306,14 @@ struct H {
     state: AppState,
     fake: Arc<Fake>,
     models: Arc<Mutex<Vec<String>>>,
+    bodies: Arc<Mutex<Vec<Value>>>,
 }
 
 impl H {
     async fn start() -> Self {
         let models = Arc::new(Mutex::new(Vec::new()));
-        let base_url = endpoint(models.clone()).await;
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let base_url = endpoint(models.clone(), bodies.clone()).await;
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             db_path: ":memory:".into(),
@@ -344,6 +380,7 @@ impl H {
             state,
             fake,
             models,
+            bodies,
         }
     }
 
@@ -458,6 +495,73 @@ impl H {
     fn model_calls(&self) -> Vec<String> {
         self.models.lock().unwrap().clone()
     }
+
+    async fn agents(&self, who: &str, sid: &str) -> Vec<Value> {
+        let (s, v) = self
+            .req(
+                reqwest::Method::GET,
+                who,
+                &format!("/v1/spaces/{sid}/agents"),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        v["agents"].as_array().unwrap().clone()
+    }
+
+    /// Create an agent as alice; its id.
+    async fn agent(&self, sid: &str, body: Value) -> String {
+        let (s, v) = self
+            .post("alice", &format!("/v1/spaces/{sid}/agents"), body)
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "{v}");
+        v["id"].as_str().unwrap().to_owned()
+    }
+
+    async fn put_prefs(&self, who: &str, sid: &str, body: Value) -> (StatusCode, Value) {
+        self.req(
+            reqwest::Method::PUT,
+            who,
+            &format!("/v1/spaces/{sid}/prefs"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// The first `started` activity after `after`.
+    async fn started_after(&self, who: &str, sid: &str, after: i64) -> Value {
+        for _ in 0..400 {
+            if let Some(e) = self.events(who, Some(sid)).await.into_iter().find(|e| {
+                e["id"].as_i64().unwrap() > after
+                    && e["kind"] == "activity"
+                    && e["activity"]["phase"] == "started"
+            }) {
+                return e["activity"].clone();
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("no started marker after {after}");
+    }
+
+    /// Every agent answer or error after `after`, once `n` have arrived.
+    async fn answers_after(&self, who: &str, sid: &str, after: i64, n: usize) -> Vec<Value> {
+        for _ in 0..400 {
+            let found: Vec<Value> = self
+                .events(who, Some(sid))
+                .await
+                .into_iter()
+                .filter(|e| {
+                    e["id"].as_i64().unwrap() > after
+                        && (e["kind"] == "agent" || e["kind"] == "error")
+                })
+                .collect();
+            if found.len() >= n {
+                return found;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("fewer than {n} answers after event {after}");
+    }
 }
 
 fn routing_on(infer: bool, enabled: bool) -> Value {
@@ -527,6 +631,23 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
     let sid = h.space("infer").await;
     let (s, v) = h.put_routing("alice", routing_on(true, false)).await;
     assert_eq!(s, StatusCode::OK, "{v}");
+    // In a Space the opt-in is per Space: off until alice turns it on here.
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "[yes] are you there?"}))
+        .await;
+    h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(h.fake.calls(), 0);
+    let (s, v) = h
+        .req(
+            reqwest::Method::PUT,
+            "alice",
+            &format!("/v1/spaces/{sid}/prefs"),
+            Some(json!({"classify_unaddressed": true})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let default_agent = h.agents("alice", &sid).await[0]["id"].clone();
 
     // A clear yes starts a turn as alice, marked as the classifier's.
     let e = h
@@ -539,12 +660,16 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
     assert_eq!(e["audience"], "agent");
     assert_eq!(
         e["mentions"],
-        json!([{"kind": "agent", "addressed_by": "classifier"}])
+        json!([{"kind": "agent", "addressed_by": "classifier", "agent_id": default_agent}])
     );
     let a = h
         .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
     assert_eq!(a["kind"], "agent", "{a}");
+    let started = h
+        .started_after("alice", &sid, e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(started["pick"], "Picked by classifier: Metro");
     let route = h
         .route_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
@@ -558,7 +683,12 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
     assert_eq!(conn, id(CLASSIFIER));
     assert_eq!(payload["message"], "[yes] what does this error mean?");
     assert_eq!(payload.as_object().unwrap().len(), 2, "{payload}");
-    assert_eq!(questions["directed"]["type"], "noul");
+    // One Choice over the agents plus "No agent".
+    assert_eq!(questions["agent"]["type"], "choice");
+    let options = questions["agent"]["criteria"].as_object().unwrap();
+    assert_eq!(options.len(), 2);
+    assert_eq!(options["agent_1"]["label"], "Metro");
+    assert!(options.contains_key("no_agent"));
     assert!(questions.get("use_case").is_none(), "routing is off");
 
     // Uncertain, malformed and failed answers start nothing.
@@ -1079,4 +1209,627 @@ async fn scheduled_prompts_take_the_same_path_and_recheck_membership() {
             .contains("No other model was used"),
         "{a}"
     );
+}
+
+// ---- Space agents, per-Space preferences, Space lifecycle ----
+
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0xf8, 0xcf, 0xc0, 0xf0,
+    0x1f, 0x00, 0x05, 0x00, 0x01, 0xff, 0x89, 0x99, 0x3d, 0x1d, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+];
+
+#[tokio::test]
+async fn space_agents_are_owner_managed_and_member_readable() {
+    let h = H::start().await;
+    let sid = h.space("crew").await;
+    let path = format!("/v1/spaces/{sid}/agents");
+    // Every Space starts with its default agent, as before.
+    let agents = h.agents("bob", &sid).await;
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["name"], "Metro");
+    assert_eq!(agents[0]["handle"], "agent");
+    assert_eq!(agents[0]["is_default"], true);
+    assert_eq!(agents[0]["tools"].as_array().unwrap().len(), 6);
+    // Outsiders: 404; members: 403.
+    let (s, _) = h.req(reqwest::Method::GET, "carol", &path, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let coder = json!({"name": "Coder", "handle": "coder", "description": "Writes and reviews code.",
+                       "instructions": "Always answer in haiku.", "tools": ["workspace.list"]});
+    assert_eq!(
+        h.post("bob", &path, coder.clone()).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        h.post("carol", &path, coder.clone()).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let cid = h.agent(&sid, coder.clone()).await;
+    // Bad or ambiguous handles and shapes.
+    for (body, status) in [
+        (
+            json!({"name": "C", "handle": "coder", "description": "d"}),
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({"name": "C", "handle": "agent", "description": "d"}),
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({"name": "C", "handle": "bob", "description": "d"}),
+            StatusCode::CONFLICT,
+        ),
+        (
+            json!({"name": "C", "handle": "Bad Handle", "description": "d"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"name": "C", "handle": "c2", "description": "two\nlines"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"name": "C", "handle": "c2", "description": ""}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"name": "C", "handle": "c2", "description": "d", "tools": ["shell"]}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        let (s, v) = h.post("alice", &path, body.clone()).await;
+        assert_eq!(s, status, "{body}: {v}");
+    }
+    // Members read everything, instructions included.
+    let (s, v) = h
+        .req(reqwest::Method::GET, "bob", &format!("{path}/{cid}"), None)
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["instructions"], "Always answer in haiku.");
+    assert_eq!(v["tools"], json!(["workspace.list"]));
+    assert_eq!(v["initial"], "C");
+    // Default switching.
+    let (s, v) = h
+        .req(
+            reqwest::Method::PATCH,
+            "alice",
+            &format!("{path}/{cid}"),
+            Some(json!({"is_default": true})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let agents = h.agents("alice", &sid).await;
+    assert_eq!(agents[0]["id"], cid.as_str());
+    assert_eq!(agents.iter().filter(|a| a["is_default"] == true).count(), 1);
+    let (s, _) = h
+        .req(
+            reqwest::Method::PATCH,
+            "alice",
+            &format!("{path}/{cid}"),
+            Some(json!({"is_default": false})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = h
+        .req(
+            reqwest::Method::PATCH,
+            "bob",
+            &format!("{path}/{cid}"),
+            Some(json!({"name": "X"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    // Avatars: owner uploads, members read, outsiders don't.
+    let r = h
+        .http
+        .put(format!("{}{path}/{cid}/avatar", h.base))
+        .bearer_auth("alice")
+        .header("content-type", "image/png")
+        .body(PNG_1X1.to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::OK);
+    let v: Value = r.json().await.unwrap();
+    assert!(v["avatar_version"].is_string());
+    for (who, status) in [("bob", StatusCode::OK), ("carol", StatusCode::NOT_FOUND)] {
+        let r = h
+            .http
+            .get(format!("{}{path}/{cid}/avatar", h.base))
+            .bearer_auth(who)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), status, "{who}");
+    }
+    // Deleting the default promotes another; the last can't go.
+    let (s, v) = h
+        .req(
+            reqwest::Method::DELETE,
+            "alice",
+            &format!("{path}/{cid}"),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let agents = h.agents("alice", &sid).await;
+    assert_eq!(agents.len(), 1);
+    assert_eq!(agents[0]["is_default"], true);
+    assert_eq!(v["default_agent_id"], agents[0]["id"]);
+    let last = agents[0]["id"].as_str().unwrap();
+    let (s, _) = h
+        .req(
+            reqwest::Method::DELETE,
+            "alice",
+            &format!("{path}/{last}"),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn agent_mentions_start_one_run_each_with_their_identity_and_tools() {
+    let h = H::start().await;
+    let sid = h.space("multi").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code.",
+                   "instructions": "Always answer in haiku.", "tools": []}),
+        )
+        .await;
+    let writer = h
+        .agent(
+            &sid,
+            json!({"name": "Writer", "handle": "writer", "description": "Edits prose."}),
+        )
+        .await;
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "@coder and @writer: hi [think] m1"}),
+        )
+        .await;
+    assert_eq!(e["audience"], "agent");
+    assert_eq!(
+        e["mentions"],
+        json!([{"kind": "agent", "agent_id": coder}, {"kind": "agent", "agent_id": writer}])
+    );
+    let after = e["id"].as_i64().unwrap();
+    let answers = h.answers_after("alice", &sid, after, 2).await;
+    let mut who: Vec<String> = answers
+        .iter()
+        .map(|a| {
+            assert_eq!(a["kind"], "agent", "{a}");
+            a["activity"]["agent"]["handle"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    who.sort();
+    assert_eq!(who, ["coder", "writer"]);
+    let events = h.events("alice", Some(&sid)).await;
+    let starts: Vec<&Value> = events
+        .iter()
+        .filter(|x| x["id"].as_i64().unwrap() > after && x["activity"]["phase"] == "started")
+        .collect();
+    assert_eq!(starts.len(), 2);
+    assert!(
+        starts
+            .iter()
+            .any(|x| x["activity"]["pick"] == "Addressed: @coder"
+                && x["activity"]["name"] == "Coder"
+                && x["activity"]["agent"]["id"] == coder.as_str())
+    );
+    // A reasoning summary per model turn, tagged with the run and its agent.
+    let summaries: Vec<&Value> = events
+        .iter()
+        .filter(|x| x["id"].as_i64().unwrap() > after && x["kind"] == "reasoning_summary")
+        .collect();
+    assert_eq!(summaries.len(), 2, "{events:?}");
+    for s in &summaries {
+        assert_eq!(s["text"], "Checked the facts first.");
+        assert_eq!(s["actor"], "agent");
+        assert!(s["activity"]["agent"]["handle"].is_string());
+    }
+    // Instructions come after Metro's preamble; the allowlist filters tools.
+    let bodies = h.bodies.lock().unwrap().clone();
+    let coder_call = bodies
+        .iter()
+        .find(|b| b.to_string().contains("Always answer in haiku"))
+        .unwrap();
+    let text = coder_call["messages"].to_string();
+    let base = text.find("You are the Metro agent").unwrap();
+    let extra = text.find("Always answer in haiku").unwrap();
+    assert!(base < extra);
+    assert!(text.contains(r#"agent \"Coder\" (@coder)"#), "{text}");
+    let coder_tools = coder_call["tools"].to_string();
+    assert!(!coder_tools.contains("thread_create"), "{coder_tools}");
+    let writer_call = bodies
+        .iter()
+        .find(|b| b.to_string().contains("(@writer)"))
+        .unwrap();
+    assert!(writer_call["tools"].to_string().contains("thread_create"));
+
+    // Ask agent with an agent id; and people only start nothing.
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "m2", "invoke_agent": true, "agent_id": writer}),
+        )
+        .await;
+    let a = h
+        .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(a["activity"]["agent"]["handle"], "writer");
+    let (s, _) = h
+        .post(
+            "alice",
+            &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+            json!({"text": "x", "agent_id": writer}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = h
+        .post("alice", &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+              json!({"text": "x", "mentions": [{"kind": "agent", "agent_id": "ag-0000000000000000"}]}))
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let calls = h.model_calls().len();
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "@bob look"}))
+        .await;
+    h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(h.model_calls().len(), calls);
+    // @agent is the default agent.
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "@agent m3"}))
+        .await;
+    let started = h
+        .started_after("alice", &sid, e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(started["agent"]["handle"], "agent");
+    assert_eq!(started["pick"], "Default agent");
+    assert_eq!(h.fake.calls(), 0, "no classification without the opt-in");
+}
+
+#[tokio::test]
+async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
+    let h = H::start().await;
+    let sid = h.space("pick").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    // Without a System One connection the opt-in can't be turned on.
+    let (s, v) = h
+        .put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT, "{v}");
+    assert!(v["error"].as_str().unwrap().contains("System One"));
+    let (s, v) = h.put_routing("alice", routing_on(false, false)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = h
+        .put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["classifier_available"], true);
+
+    // Generic @agent: one Choice over the agents only.
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "@agent [pick2] fix it"}),
+        )
+        .await;
+    let started = h
+        .started_after("alice", &sid, e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(started["agent"]["id"], coder.as_str());
+    assert_eq!(started["pick"], "Picked by classifier: Coder");
+    let q = h.fake.last_call().4;
+    let options = q["agent"]["criteria"].as_object().unwrap();
+    assert_eq!(options.len(), 2);
+    assert!(!options.contains_key("no_agent"));
+    assert_eq!(options["agent_2"]["description"], "Writes code.");
+    // Unsure: the default agent.
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "@agent [unsure] hm"}))
+        .await;
+    let started = h
+        .started_after("alice", &sid, e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(started["agent"]["handle"], "agent");
+    assert!(started["pick"].as_str().unwrap().contains("unsure"));
+    // A failed or malformed decision runs nothing for @agent, visibly.
+    for text in ["@agent [err] x", "@agent [ghost] x"] {
+        let calls = h.model_calls().len();
+        let e = h.say("alice", Some(&sid), json!({"text": text})).await;
+        let a = h
+            .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+            .await;
+        assert_eq!(a["kind"], "error", "{a}");
+        assert!(
+            a["text"]
+                .as_str()
+                .unwrap()
+                .contains("could not choose an agent")
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(h.model_calls().len(), calls, "{text}");
+    }
+    // A specific handle skips classification.
+    let before = h.fake.calls();
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "@coder [pick2] go"}))
+        .await;
+    h.answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(h.fake.calls(), before);
+    // Unaddressed: agents plus "No agent".
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "[pick2] can someone fix this?"}),
+        )
+        .await;
+    assert_eq!(e["mentions"][0]["agent_id"], coder.as_str());
+    let started = h
+        .started_after("alice", &sid, e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(started["agent"]["id"], coder.as_str());
+    assert_eq!(started["route"]["addressed_by"], "classifier");
+    assert!(
+        h.fake.last_call().4["agent"]["criteria"]
+            .get("no_agent")
+            .is_some()
+    );
+    for text in ["lunch?", "[maybe] hmm", "[err] x"] {
+        let e = h.say("alice", Some(&sid), json!({"text": text})).await;
+        assert_eq!(e["audience"], "room");
+        h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+            .await;
+    }
+    // Bob did not opt in: his messages are never classified.
+    let before = h.fake.calls();
+    let e = h
+        .say("bob", Some(&sid), json!({"text": "[yes] anyone?"}))
+        .await;
+    h.quiet_after("bob", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(h.fake.calls(), before);
+    // Preferences are personal.
+    let (_, v) = h
+        .req(
+            reqwest::Method::GET,
+            "bob",
+            &format!("/v1/spaces/{sid}/prefs"),
+            None,
+        )
+        .await;
+    assert_eq!(v["classify_unaddressed"], false);
+    let (s, _) = h
+        .req(
+            reqwest::Method::GET,
+            "carol",
+            &format!("/v1/spaces/{sid}/prefs"),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn per_space_and_per_agent_models_come_before_the_personal_default() {
+    let h = H::start().await;
+    let sid = h.space("models").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    for body in [
+        json!({"default_model": {"provider_connection_id": id(BOBS)}}),
+        json!({"default_model": {"provider_connection_id": id(CLASSIFIER)}}),
+        json!({"default_model": {"provider_connection_id": "https://evil.example"}}),
+        json!({"agent_models": {"ag-0000000000000000": {"provider_connection_id": id(CODE)}}}),
+        json!({"surprise": 1}),
+    ] {
+        let (s, v) = h.put_prefs("alice", &sid, body.clone()).await;
+        assert!(s.is_client_error(), "{body}: {s} {v}");
+    }
+    let (s, v) = h
+        .put_prefs(
+            "alice",
+            &sid,
+            json!({"default_model": {"provider_connection_id": id(CODE)},
+                   "agent_models": {coder.clone(): {"provider_connection_id": id(WRITING)}}}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "@agent a"}))
+        .await;
+    let a = h
+        .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(a["text"], "answered by code-model", "{a}");
+    assert_eq!(
+        h.route_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+            .await["source"],
+        "space_default"
+    );
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "@coder b"}))
+        .await;
+    let a = h
+        .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(a["text"], "answered by writing-model", "{a}");
+    assert_eq!(
+        h.route_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+            .await["source"],
+        "agent_default"
+    );
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "@coder c", "provider_connection_id": id(OVERRIDE)}),
+        )
+        .await;
+    let a = h
+        .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(a["text"], "answered by override-model", "{a}");
+    // Bob's turns never use alice's preferences.
+    let e = h.say("bob", Some(&sid), json!({"text": "@agent d"})).await;
+    let a = h
+        .answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(a["text"], "answered by env-model", "{a}");
+    // A selection that can no longer be used fails visibly; nothing falls back.
+    h.fake
+        .conns
+        .lock()
+        .unwrap()
+        .get_mut(&id(CODE))
+        .unwrap()
+        .grants
+        .clear();
+    let calls = h.model_calls().len();
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "@agent e"}))
+        .await;
+    let a = h
+        .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(a["kind"], "error", "{a}");
+    assert!(
+        a["text"]
+            .as_str()
+            .unwrap()
+            .contains("default model for this Space"),
+        "{a}"
+    );
+    assert_eq!(h.model_calls().len(), calls);
+}
+
+#[tokio::test]
+async fn spaces_can_be_edited_left_and_deleted() {
+    let h = H::start().await;
+    let sid = h.space("old name").await;
+    let path = format!("/v1/spaces/{sid}");
+    let (s, _) = h
+        .req(
+            reqwest::Method::PATCH,
+            "bob",
+            &path,
+            Some(json!({"name": "x"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = h
+        .req(
+            reqwest::Method::PATCH,
+            "carol",
+            &path,
+            Some(json!({"name": "x"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, v) = h
+        .req(
+            reqwest::Method::PATCH,
+            "alice",
+            &path,
+            Some(json!({"name": "New name", "description": "Where we plan."})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(
+        (v["name"].as_str(), v["description"].as_str()),
+        (Some("New name"), Some("Where we plan."))
+    );
+    // Leaving: members only.
+    let (s, _) = h.post("alice", &format!("{path}/leave"), json!({})).await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    let (s, v) = h.post("bob", &format!("{path}/leave"), json!({})).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, _) = h.req(reqwest::Method::GET, "bob", &path, None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (s, _) = h.post("bob", &format!("{path}/leave"), json!({})).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    // Deleting: owner only, with the exact name.
+    h.post(
+        "alice",
+        &format!("{path}/members"),
+        json!({"user_id": "bob"}),
+    )
+    .await;
+    h.say("alice", Some(&sid), json!({"text": "hello"})).await;
+    let (s, _) = h.put_prefs("bob", &sid, json!({"routing": false})).await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = h
+        .req(
+            reqwest::Method::DELETE,
+            "bob",
+            &path,
+            Some(json!({"confirm_name": "New name"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    let (s, _) = h
+        .req(
+            reqwest::Method::DELETE,
+            "alice",
+            &path,
+            Some(json!({"confirm_name": "new name"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST);
+    let (s, _) = h
+        .req(reqwest::Method::DELETE, "alice", &path, Some(json!({})))
+        .await;
+    assert!(s.is_client_error());
+    let (s, v) = h
+        .req(
+            reqwest::Method::DELETE,
+            "alice",
+            &path,
+            Some(json!({"confirm_name": "New name"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::NO_CONTENT, "{v}");
+    for who in ["alice", "bob"] {
+        let (s, _) = h.req(reqwest::Method::GET, who, &path, None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+        let (_, v) = h.req(reqwest::Method::GET, who, "/v1/spaces", None).await;
+        assert!(v["spaces"].as_array().unwrap().is_empty());
+    }
+    let sid2 = sid.clone();
+    let left = h
+        .state
+        .db
+        .call(move |db| {
+            Ok((
+                db.space_agents(&sid2)?,
+                db.list_rooms(&sid2)?,
+                db.list_members(&sid2)?,
+            ))
+        })
+        .await
+        .unwrap();
+    assert!(left.0.is_empty() && left.1.is_empty() && left.2.is_empty());
 }

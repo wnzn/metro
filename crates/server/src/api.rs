@@ -14,7 +14,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::AppState;
-use crate::agent::{start_personal_run, start_room_run, stop_runs_of};
+use crate::agent::{start_personal_run, stop_runs_of};
 use crate::attachments::{self, Append, IdsError, Place};
 use crate::auth::{Human, Runner, RunnerCredential, new_runner_token, runner_token_hash, valid_id};
 use crate::db::reactions::{ReactionScope, Reactor, valid_emoji};
@@ -542,6 +542,10 @@ pub struct PostMessage {
     text: String,
     #[serde(default)]
     invoke_agent: bool,
+    /// With `invoke_agent`: ask this agent of the Space instead of the
+    /// generic one.
+    #[serde(default)]
+    agent_id: Option<String>,
     #[serde(default)]
     mentions: Vec<Mention>,
     /// Answer with this model connection instead of the sender's routing or
@@ -678,13 +682,28 @@ pub async fn post_message(
     )
     .await?;
     let space_id = space.id.clone();
-    let member_ids: Vec<String> = db(&state, move |db| db.list_members(&space_id))
-        .await?
-        .into_iter()
-        .map(|m| m.user_id)
+    let (member_ids, agents) = db(&state, move |db| {
+        let members: Vec<String> = db
+            .list_members(&space_id)?
+            .into_iter()
+            .map(|m| m.user_id)
+            .collect();
+        Ok((members, db.space_agents(&space_id)?))
+    })
+    .await?;
+    let agent_handles: Vec<(String, String)> = agents
+        .iter()
+        .map(|a| (a.id.clone(), a.handle.clone()))
         .collect();
-    let resolved = mentions::resolve(&text, &body.mentions, body.invoke_agent, &member_ids)
-        .map_err(ApiError::bad_request)?;
+    let resolved = mentions::resolve_with_agents(
+        &text,
+        &body.mentions,
+        body.invoke_agent,
+        body.agent_id.as_deref(),
+        &member_ids,
+        &agent_handles,
+    )
+    .map_err(ApiError::bad_request)?;
     let addressing = Addressing::of(&resolved);
     agent_needs_text(&text, addressing)?;
     let chosen = check_choice(
@@ -697,8 +716,30 @@ pub async fn post_message(
         addressing,
     )
     .await?;
-    let (addressed, turn) =
-        dispatch_of(&state, &who, Some(&space.id), &text, &resolved, addressing).await?;
+    // People-only messages never reach System One or the preferences.
+    let (settings, prefs) = if addressing == Addressing::PeopleOnly {
+        (
+            RoutingSettings::default(),
+            crate::space_prefs::SpacePrefs::default(),
+        )
+    } else {
+        (
+            routing::preferences(&state, &who.id)
+                .await
+                .map_err(ApiError::internal)?,
+            crate::space_prefs::load(&state, &space.id, &who.id)
+                .await
+                .map_err(ApiError::internal)?,
+        )
+    };
+    let plan = crate::agent_dispatch::plan(
+        &state, &who.id, &space.id, &text, &resolved, addressing, &settings, &prefs, &agents,
+    )
+    .await;
+    let addressed = plan
+        .classified
+        .clone()
+        .unwrap_or_else(|| addressed(&resolved));
     let author = who.author();
     let event = if body.asset_ids.is_empty() {
         let (sid, rid, author, text) = (
@@ -727,36 +768,30 @@ pub async fn post_message(
             Append::NoAsset => return Err(no_attachment()),
         }
     };
-    // Mentioning only people never starts agent work.
-    let Some((addressed_by, settings)) = turn else {
-        return Ok((StatusCode::ACCEPTED, Json(event)));
-    };
-    let route = match chosen {
-        Some(route) => route,
-        None => {
-            routing::route_turn(
-                &state,
-                &who.id,
-                Some(&space.id),
-                &settings,
-                &text,
-                addressed_by,
-                None,
-            )
-            .await
-        }
-    };
-    if let Err(reason) = start_room_run(&state, &space.id, &room, &author, &event, route).await {
+    for reason in &plan.errors {
         state
             .append(
                 &space.id,
                 &room.id,
                 kind::ERROR,
                 &Author::server(actor::SYSTEM),
-                &reason,
+                reason,
             )
             .await;
     }
+    // Mentioning only people never starts agent work.
+    crate::agent_dispatch::start_runs(
+        &state,
+        &space.id,
+        &room,
+        &author,
+        &event,
+        plan.targets,
+        chosen,
+        &settings,
+        &prefs,
+    )
+    .await;
     Ok((StatusCode::ACCEPTED, Json(event)))
 }
 
