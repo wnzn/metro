@@ -3,6 +3,78 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Screenshots refreshed from main `eea7221` (2026-11-24, docs lane, local)
+
+Uncommitted changes on `docs/readme-refresh`, on top of `eea7221` (then
+`origin/main`). The desktop screenshots in `docs/screenshots/` were retaken
+from that source, natively on NSH 0.6.1's Linux (GTK 4) host under Xvfb in
+the `metro-desktop-shots:trixie` and `:trixie-media` images, against
+debug `metro-server` and `metro-runner` built with `cargo build --locked`
+at `eea7221`, on loopback, in the default dark theme. Every model was a
+local double: `scripted_model.py` for chat, and keyless loopback fixtures
+for System One, embeddings and media embeddings. No real vendor was called.
+
+| Script | Files written to `docs/screenshots/` | Result |
+| --- | --- | --- |
+| `apps/desktop/dev/screenshots/capture.sh` (all scenarios) | `connection`, `connection-error`, `room-runner`, `space-members`, `agent-thinking`, `agent-activity-expanded`, `chat-runs`, `thread`, `settings-runners`, `settings-providers`, `settings-device-onboarding`, `settings-appearance`, `settings-space-runner` | pass; the compact profile save was checked on the server |
+| `capture-routing.sh` | `model-routing`, `model-routing-dataflow`, `model-sharing`, `route-attribution` | pass, after the fixes below |
+| `capture-library.sh` | `library-assets`, `library-search`, `library-open-page`, `library-open-image`, `library-revocation-before`, `library-revocation-after` | pass, after the fixes below |
+| `capture-discovery.sh` (new) | `semantic-search`, `scheduled-tasks` | pass; System One was called, and the one-time task dispatched |
+
+That's 25 regenerated files, with the same names. Each script's own check
+found none of its tokens or keys in the output, the checkout or the staged
+app. Every new image was also reviewed by eye against the old one: no token
+on screen (the device token is masked), no error banner except the intended
+`401` in `connection-error`, and a fully drawn window. They were then
+optimized with `optipng -o5 -strip all`. ImageMagick `compare` found them
+pixel-identical before and after.
+
+Two referenced files were **kept unchanged**: `local-workspace-relaunch.png`
+and `settings-profile.png`. They're the 0.2.0 Linux-candidate QA shots of a
+packaged archive across a relaunch, with the native file picker
+([below](#staged-020-linux-candidate-local-workspace-and-desktop-qa-2026-11-22-project-manager-local)).
+The screenshot scripts can't reproduce that flow, and these shots show the
+older UI.
+
+Script fixes, all dev tooling under `apps/desktop/dev/screenshots/`:
+
+- `capture-routing.sh` and `capture-library.sh` use a random private X
+  display per run, like `capture.sh`. With the default `:99` and
+  `--network host`, two captures at once collided.
+- `routing-steps.mjs`:
+  - opens a connection's **Manage** before its sharing control;
+  - waits for the route badge *Routed: Incident review*;
+  - scrolls the Settings window to the use cases, and to the whole sharing
+    warning.
+- `library-steps.mjs` and `capture-library.sh` follow the current layout:
+  - the Library in the sidebar;
+  - the media model saved in Settings › Model providers (session
+    `alice-model`);
+  - Index from each row's **More** menu (session `alice-index`, which also
+    takes `library-assets.png`, because index status lives only in that
+    session);
+  - search from the box at the top, in Search › Documents & media.
+- The unpublished `library-open-time.png` was dropped. In the container,
+  the player refuses to play because its preview folder isn't private
+  (mode 755). That's the app's own check, not a script fault.
+- New: `capture-discovery.sh`, `discovery-steps.mjs` and
+  `search_fixture.py`, a keyless word-overlap embeddings and System One
+  double. It isn't a semantic model. It follows the same rules as
+  `capture.sh`: a staged read-only app copy, tokens only in mode-600 files,
+  and redacted output.
+
+Older entries in this file that link these file names, such as the routing,
+Documents & media, search, scheduled-tasks and settings captures, now show
+the current UI rather than what those runs saw. Their text still describes
+those runs. In particular, `model-routing.png` now shows the use cases
+rather than the classifier and the routing switch, `library-search.png` is
+in similarity order (not reranked), and `semantic-search.png` no longer has
+per-result score labels.
+
+Not checked here: the desktop `nsh test` suite and the Rust gate (no
+application source changed), the light theme, Windows and macOS, and real
+vendors.
+
 ## Source only: leaner pull request CI (2026-11-24, CI lane, local)
 
 Uncommitted changes on `ci/trim-steps`, on top of `3933776`, to `ci.yml`,

@@ -501,9 +501,10 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 > including finding an unindexed Markdown file by its name, were checked
 > natively later, at `95a3d2b` ([acceptance](acceptance.md#staged-quick-search-as-you-type-2026-11-23-project-manager-local)).
 
-The screenshots below are historical: they show the 0.2.0-era layout, where
-files and the media model were under Search. They're native Linux captures,
-taken against the real `metro-server`
+The screenshots below were retaken on 2026-11-24 from `eea7221` and show
+the current layout: the Library page in the sidebar, the media model in
+Settings › Model providers, and file search in Search › Documents & media.
+They're native Linux captures, taken against the real `metro-server`
 binary, with a **scripted** media endpoint, so the scores show only that
 the wiring works and say nothing about ranking quality. The files in them
 were uploaded through the real authorized HTTP upload. The native file
@@ -512,15 +513,15 @@ verified.
 
 | | |
 | --- | --- |
-| ![Documents & media: upload, the chosen media model, the egress notice and the file list](screenshots/library-assets.png) | ![Search results with page, image, time and section locators](screenshots/library-search.png) |
-| Files, media model and the notice about where files go | Results: similarity order, no System One chosen |
+| ![The Library page: Upload, the notice about where Index sends files, and five indexed files with Personal or Acme badges](screenshots/library-assets.png) | ![Documents & media search: a PDF page match in similarity order, with the rest folded under Less relevant](screenshots/library-search.png) |
+| The Library: Upload, where Index sends files, and each file indexed in your own index | Results in similarity order (no System One chosen): one PDF page match, and *Less relevant (8)* folded away |
 | ![A PDF result opened at its page, with the indexed page text](screenshots/library-open-page.png) | ![An image result shown inside the app](screenshots/library-open-image.png) |
 | A PDF match: the indexed text of page 2 | An image match, shown in the app |
-| ![Bob viewing a Space file before he's removed](screenshots/library-revocation-before.png) | ![After removal: the viewer closed and only Bob's personal files remain](screenshots/library-revocation-after.png) |
+| ![Bob viewing a Space file in the Library before he's removed](screenshots/library-revocation-before.png) | ![After removal: the viewer closed, Acme gone from the sidebar, and only Bob's personal file remains](screenshots/library-revocation-after.png) |
 | Bob viewing an Acme file… | …after the owner removes him: personal files only |
 
-**What the screens did in that layout** (the current source differs as
-described above):
+**What the screens did in the 0.2.0-era layout**, where files and the media
+model were under Search (the current source differs as described above):
 
 - **Upload** to your personal library or to a Space you're in. The screen
   lists the accepted types and the size limit, and says that uploading
