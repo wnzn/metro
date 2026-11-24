@@ -6,7 +6,7 @@
 import { List, Scroll, signal, Text, View } from "nsh";
 import type { JSX, ListRef } from "nsh";
 import { Button, Collapsible, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
-import { Icon } from "./chrome";
+import { Icon, SpaceTile } from "./chrome";
 import type { IconColor, IconName } from "./chrome";
 import {
   actionDisabledClass,
@@ -113,9 +113,10 @@ export type SurfaceVariant =
 
 const surfaceClass: Record<SurfaceVariant, string> = {
   app: "flex-1 flex-row bg-background",
-  sidebar: "w-(--sidebar-width) bg-sidebar border-r border-sidebar-border",
+  // Navy deepening toward a lighter tone, ended by a hairline rather than a hard border.
+  sidebar: "w-(--sidebar-width) bg-sidebar bg-linear-to-b from-sidebar to-sidebar-gradient-end border-r border-sidebar-border/70",
   /** A collapsed sidebar: one column of icons, the account at the bottom. */
-  rail: "w-[56px] shrink-0 items-center bg-sidebar border-r border-sidebar-border py-(--space-3) gap-(--space-1)",
+  rail: "w-[56px] shrink-0 items-center bg-sidebar bg-linear-to-b from-sidebar to-sidebar-gradient-end border-r border-sidebar-border/70 py-(--space-3) gap-(--space-1)",
   panel: "flex-1 min-w-0 bg-background",
   // Cards are flat: a border, no shadow. Only popovers and dialogs float.
   card: "bg-card border border-border rounded-(--radius)",
@@ -351,8 +352,8 @@ export function ActionBar(props: Testable & { children?: JSX.Element; justify?: 
 
 // Nesting is inner padding, never a margin: a nested row's selected pill
 // keeps the list's full width, and its glyph lines up under its parent's
-// name (the parent's 16-point icon plus the 8-point gap: 24 more).
-const indentClass = ["pl-(--space-3)", "pl-[36px]", "pl-[52px]", "pl-[68px]", "pl-[84px]"];
+// name (the parent's 20-point leading slot plus the 8-point gap: 28 more).
+const indentClass = ["pl-(--space-3)", "pl-[40px]", "pl-[56px]", "pl-[72px]", "pl-[88px]"];
 
 /** A selectable row in a navigation list (Chat, Spaces, rooms, threads). */
 export function NavItem(
@@ -360,12 +361,18 @@ export function NavItem(
     label: string;
     selected: boolean;
     onPress: () => void;
-    /** A short glyph before the label ("#", "›"). Ignored when `icon` is set. */
+    /** A short glyph before the label ("#", "›"). Ignored when `icon` or `tile` is set. */
     prefix?: string;
     /** An icon of the app's family before the label, in place of `prefix`. */
     icon?: IconName;
+    /** A rounded letter tile before the label (a Space), its color fixed by `seed`. */
+    tile?: { initial: string; seed: string };
+    /** A chevron at the end: the row opens a group (a Space's rooms). */
+    expanded?: boolean;
     /** A quiet note after the label (a role, a count). */
     trailing?: string;
+    /** A small accent dot at the end (something is working there); its words for screen readers. */
+    dot?: string;
     /** Nesting level (threads under their parent room). */
     depth?: number;
     emphasis?: boolean;
@@ -376,8 +383,8 @@ export function NavItem(
   return (
     <Button
       class={cx(
-        // 40 high: a comfortable list row; the selected one takes the accent tint.
-        "flex-row items-center gap-(--space-2) min-h-[40px] rounded-(--radius-sm) pr-(--space-3) py-[8px]",
+        // 40 high: a comfortable list row; the selected one is a soft pill with an accent bar.
+        "relative flex-row items-center gap-(--space-2) min-h-[40px] rounded-(--radius-md) pr-(--space-3) py-[8px]",
         focusRing,
         transitionClass,
         indentClass[Math.min(props.depth ?? 0, indentClass.length - 1)],
@@ -386,19 +393,31 @@ export function NavItem(
       selected={props.selected}
       onPress={props.onPress}
       testID={props.testID}
-      accessibilityLabel={props.accessibilityLabel ?? props.label}
+      accessibilityLabel={(props.accessibilityLabel ?? props.label) + (props.dot ? `, ${props.dot}` : "")}
       tooltip={props.tooltip ? <Text class={tooltipClass}>{props.tooltip}</Text> : undefined}
     >
-      <If
-        when={props.icon}
-        else={
-          <If when={props.prefix !== ""}>
-            <Text class={cx("w-[12px]", textClass.sm, "text-muted-foreground")}>{props.prefix ?? "#"}</Text>
-          </If>
-        }
-      >
-        {(name) => <Icon name={name()} color={props.selected ? "sidebar-active" : "sidebar"} />}
+      <If when={props.selected}>
+        <View class="absolute left-0 top-[9px] bottom-[9px] w-[3px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
       </If>
+      <View class="w-[20px] shrink-0 items-center justify-center" accessibilityElementsHidden>
+        <If
+          when={props.tile}
+          else={
+            <If
+              when={props.icon}
+              else={
+                <If when={props.prefix !== ""}>
+                  <Text class={cx(textClass.sm, "text-muted-foreground")}>{props.prefix ?? "#"}</Text>
+                </If>
+              }
+            >
+              {(name) => <Icon name={name()} color={props.selected ? "sidebar-indicator" : "sidebar"} />}
+            </If>
+          }
+        >
+          {(t) => <SpaceTile initial={t().initial} seed={t().seed} />}
+        </If>
+      </View>
       <Text
         class={cx(
           "flex-1",
@@ -412,8 +431,71 @@ export function NavItem(
       <If when={props.trailing}>
         <Text class={cx(textClass.xs, "text-muted-foreground")}>{props.trailing}</Text>
       </If>
+      <If when={props.dot}>
+        <View class="size-[7px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
+      </If>
+      <If when={props.expanded !== undefined}>
+        <Icon name={props.expanded ? "chevron-down" : "chevron-right"} color="muted" size={12} />
+      </If>
     </Button>
   );
+}
+
+/**
+ * Rows nested under a NavItem (a Space's rooms), joined by a thin vertical
+ * guide under the parent's tile. The rows keep the list's full width; their
+ * own padding indents them.
+ */
+export function NavGroup(props: Testable & { children?: JSX.Element }) {
+  return (
+    <View class="relative flex-col gap-(--space-1)" testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
+      <View class="absolute left-[21px] top-[4px] bottom-[4px] w-px bg-sidebar-guide" accessibilityElementsHidden />
+      {props.children}
+    </View>
+  );
+}
+
+/**
+ * A section's heading in a sidebar ("SPACES"): small, uppercase, wide
+ * tracking, muted, with an optional action that shows on hover and keyboard
+ * focus (always on touch screens, and while `actionShown`).
+ */
+export function SectionHeader(
+  props: Testable & {
+    label: string;
+    action?: { icon: IconName; label: string; tooltip?: string; onPress: () => void; testID?: string; shown?: boolean };
+  },
+) {
+  return (
+    <View class="group/section flex-row items-center min-h-[30px] pl-(--space-3) pr-[5px]" testID={props.testID}>
+      <Text class={cx("flex-1 uppercase tracking-wider font-semibold text-muted-foreground", textClass.xs)} role="header" style={{ numberOfLines: 1 }}>
+        {props.label}
+      </Text>
+      <If when={props.action}>
+        {(a) => (
+          <Button
+            class={cx(
+              "items-center justify-center size-[26px] rounded-(--radius-sm) hover:bg-sidebar-hover active:bg-sidebar-hover",
+              transitionClass,
+              focusRing,
+              a().shown ? "opacity-100" : "opacity-0 group-hover/section:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100",
+            )}
+            onPress={a().onPress}
+            testID={a().testID}
+            accessibilityLabel={a().label}
+            tooltip={<Text class={tooltipClass}>{a().tooltip ?? a().label}</Text>}
+          >
+            <Icon name={a().icon} color="sidebar" size={14} />
+          </Button>
+        )}
+      </If>
+    </View>
+  );
+}
+
+/** The top of a sidebar: the logo with room around it. */
+export function SidebarBrand(props: { children?: JSX.Element }) {
+  return <View class="flex-row items-center px-(--space-4) pt-(--space-6) pb-(--space-4)">{props.children}</View>;
 }
 
 /** A small selectable pill (targets, filters). */

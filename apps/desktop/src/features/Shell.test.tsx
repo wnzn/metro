@@ -5,7 +5,7 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
-import { serverPlace } from "./Sidebar";
+import { serverPlace, spaceInitial } from "./Sidebar";
 
 type F = ReturnType<typeof world>;
 
@@ -266,4 +266,23 @@ test("a room's breadcrumb and actions share the one header row with the search b
   await app.press("id:nav-chat");
   await app.waitFor("id:chat-view");
   expect(app.shows("id:top-bar >> id:manage-space")).toBe(false);
+});
+
+test("a Space's rail tile is its first letter or digit", () => {
+  expect(spaceInitial("acme")).toBe("A");
+  expect(spaceInitial("  #ops-2")).toBe("O");
+  expect(spaceInitial("42 club")).toBe("4");
+  expect(spaceInitial("---")).toBe("#");
+});
+
+test("the Spaces heading's + is quiet until hover, and a Space running an agent shows a dot", async () => {
+  const f = world();
+  f.state.runs.push({ id: "run_x", space_id: "acme", room_id: "lobby", status: "running", actor: "alice", task: "t" });
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await app.waitFor("label:Acme, the agent is working here");
+  expect(app.viewStyle("id:new-space-toggle")?.opacity).toBe(0);
+  await app.press("id:new-space-toggle"); // still a target for the keyboard and pointer
+  await app.waitFor("id:new-space-name");
+  expect(app.viewStyle("id:new-space-toggle")?.opacity).toBe(1); // Cancel stays shown while the form is open
 });

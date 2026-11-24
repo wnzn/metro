@@ -24,7 +24,7 @@ import {
   view,
 } from "../store";
 import type { Room } from "../store";
-import { AccountMenu, Action, Column, Field, IconButton, Label, MetroMark, NavItem, navigationPanel, RailButton, Row, ScrollArea, Spacer, Surface } from "../ui";
+import { AccountMenu, Action, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailButton, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
 import type { AccountMenuItem, Tone } from "../ui";
 import { loadSavedServers, signOut } from "../savedWorkspaces";
 import { WorkspaceDialogs, workspaceItems, WorkspaceNotice } from "./WorkspaceSwitcher";
@@ -46,9 +46,9 @@ export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
   return (
     <>
       <Surface variant="sidebar" testID="sidebar" hidden={props.mode !== "full"}>
-        <Row align="center" padX={4} padY={3}>
+        <SidebarBrand>
           <MetroMark />
-        </Row>
+        </SidebarBrand>
 
         <ScrollArea padX={2} gap={1}>
           <NavItem
@@ -94,6 +94,7 @@ function SidebarRail() {
               testID={`rail-space:${space().id}`}
               label={`Space ${space().name}`}
               initial={spaceInitial(space().name)}
+              seed={space().id}
               selected={space().id === activeSpaceId() && mainPlace() === "space"}
               onPress={() => void selectSpace(space().id)}
             />
@@ -125,6 +126,8 @@ export function spaceInitial(name: string): string {
 const addingSpace = signal(false);
 
 const activeRunCount = () => runs().filter(isActiveRun).length;
+/** An agent run is going on in this Space (from the runs the app already loaded). */
+const spaceRunning = (sid: string) => runs().some((r) => r.spaceId === sid && isActiveRun(r));
 
 function SpacesSection() {
   const adding = addingSpace;
@@ -137,20 +140,18 @@ function SpacesSection() {
   };
   return (
     <Column gap={1} padY={2}>
-      {/* The same 12-point inset as the rows' icons. */}
-      <Row align="center" padX={3}>
-        <Label variant="caption" color="muted">
-          Spaces
-        </Label>
-        <Spacer />
-        <IconButton
-          testID="new-space-toggle"
-          icon={adding() ? "close" : "plus"}
-          accessibilityLabel={adding() ? "Cancel new Space" : "New Space"}
-          tooltip={adding() ? "Cancel" : "New Space"}
-          onPress={() => adding.set(!adding())}
-        />
-      </Row>
+      {/* The same 12-point inset as the rows' icons; + shows on hover and focus. */}
+      <SectionHeader
+        label="Spaces"
+        action={{
+          icon: adding() ? "close" : "plus",
+          label: adding() ? "Cancel new Space" : "New Space",
+          tooltip: adding() ? "Cancel" : "New Space",
+          testID: "new-space-toggle",
+          shown: adding() || spaces().length === 0,
+          onPress: () => adding.set(!adding()),
+        }}
+      />
       <If when={adding()}>
         <Column padX={2} padY={1} gap={2}>
           <Field testID="new-space-name" accessibilityLabel="New Space name" value={name()} onChange={name.set} placeholder="Space name" autoFocus maxLength={80} onSubmit={() => void submit()} />
@@ -163,7 +164,9 @@ function SpacesSection() {
             <NavItem
               testID={`space:${space().id}`}
               label={space().name}
-              icon={space().id === activeSpaceId() && mainPlace() === "space" ? "chevron-down" : "chevron-right"}
+              tile={{ initial: spaceInitial(space().name), seed: space().id }}
+              expanded={space().id === activeSpaceId() && mainPlace() === "space"}
+              dot={spaceRunning(space().id) ? "the agent is working here" : undefined}
               tooltip={space().role === "owner" ? `${space().name} · you own this Space` : undefined}
               emphasis={space().id === activeSpaceId()}
               selected={false}
@@ -221,7 +224,7 @@ function RoomTree() {
     }
   };
   return (
-    <Column gap={1} testID="room-list">
+    <NavGroup testID="room-list">
       <Each of={roomTree(rooms())} key={(row) => row.room.id}>
         {(row) => (
           <NavItem
@@ -249,7 +252,7 @@ function RoomTree() {
           </Row>
         </Column>
       </If>
-    </Column>
+    </NavGroup>
   );
 }
 

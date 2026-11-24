@@ -72,6 +72,7 @@ import {
   popoverClass,
   popoverItemClass,
   popoverMotion,
+  spaceTileFor,
   textClass,
   toneSolidClass,
   toneSurfaceClass,
@@ -119,13 +120,14 @@ const ICONS = {
 } as const;
 
 export type IconName = keyof typeof ICONS;
-export type IconColor = "default" | "muted" | "sidebar" | "sidebar-active" | "accent" | "danger" | "on-primary";
+export type IconColor = "default" | "muted" | "sidebar" | "sidebar-active" | "sidebar-indicator" | "accent" | "danger" | "on-primary";
 
 const ICON_TOKEN = {
   default: "foreground",
   muted: "muted-foreground",
   sidebar: "sidebar-foreground",
   "sidebar-active": "sidebar-accent-foreground",
+  "sidebar-indicator": "sidebar-indicator",
   accent: "accent-foreground",
   danger: "destructive",
   "on-primary": "primary-foreground",
@@ -182,6 +184,17 @@ export function PanelToggle(props: {
 
 // ---------------------------------------------------------------- rail
 
+/** A Space's rounded letter tile; its color comes from `seed` (the Space's id), the same every time. */
+export function SpaceTile(props: { initial: string; seed: string; size?: "sm" | "md" }) {
+  const md = () => props.size === "md";
+  return (
+    <View class={cx("items-center justify-center", md() ? "size-[28px] rounded-(--radius-md)" : "size-[20px] rounded-[5px]", spaceTileFor(props.seed))} accessibilityElementsHidden>
+      <Text class={cx("font-semibold text-space-tile-foreground", md() ? textClass.sm : "text-[11px]")}>{props.initial}</Text>
+    </View>
+  );
+}
+
+
 /**
  * One place in a collapsed panel's icon rail: an icon, a letter tile (a
  * Space's initial) or any small picture (`content`, an avatar). Its name is
@@ -192,8 +205,9 @@ export function RailButton(props: {
   selected?: boolean;
   onPress: () => void;
   icon?: IconName;
-  /** A letter tile instead of an icon. */
+  /** A letter tile instead of an icon (a Space), its color fixed by `seed`. */
   initial?: string;
+  seed?: string;
   /** Any small picture instead (an avatar). */
   content?: JSX.Element;
   testID?: string;
@@ -201,30 +215,29 @@ export function RailButton(props: {
   return (
     <Button
       class={cx(
-        "items-center justify-center size-[40px] shrink-0 rounded-(--radius-md)",
+        "relative items-center justify-center size-[40px] shrink-0 rounded-(--radius-md)",
         transitionClass,
         focusRing,
         props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-hover active:bg-sidebar-hover",
       )}
-      role={props.selected !== undefined ? "tab" : undefined}
       selected={props.selected}
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={props.label}
       tooltip={<Text class={tooltipClass}>{props.label}</Text>}
     >
+      {/* The selected place: an accent bar at the rail's edge, as in the open sidebar. */}
+      <If when={props.selected}>
+        <View class="absolute left-[-8px] top-[10px] bottom-[10px] w-[3px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
+      </If>
       <If
         when={props.content}
         else={
           <If
             when={props.initial}
-            else={<Icon name={props.icon ?? "more"} color={props.selected ? "sidebar-active" : "sidebar"} size={20} />}
+            else={<Icon name={props.icon ?? "more"} color={props.selected ? "sidebar-indicator" : "sidebar"} size={20} />}
           >
-            {(letter) => (
-              <View class={cx("size-[28px] items-center justify-center rounded-(--radius-sm)", props.selected ? "bg-primary" : "bg-muted")}>
-                <Text class={cx(textClass.sm, "font-semibold", props.selected ? "text-primary-foreground" : "text-foreground")}>{letter()}</Text>
-              </View>
-            )}
+            {(letter) => <SpaceTile initial={letter()} seed={props.seed ?? letter()} size="md" />}
           </If>
         }
       >
@@ -315,7 +328,12 @@ export function AccountMenu(props: {
           when={props.compact}
           else={
             <View
-              class={cx("flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-(--space-2) hover:bg-sidebar-hover active:bg-sidebar-hover", transitionClass, focusRing)}
+              class={cx(
+                // A raised compact card, set apart by space rather than a line.
+                "flex-row items-center gap-(--space-2) rounded-(--radius-lg) border border-sidebar-border/70 bg-sidebar-card px-(--space-3) py-[9px] shadow-sm hover:bg-sidebar-hover active:bg-sidebar-hover",
+                transitionClass,
+                focusRing,
+              )}
               focusable
               testID={props.testID}
               accessibilityLabel={props.accessibilityLabel}
