@@ -3,6 +3,47 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: image load on Docker's classic image store, version 0.3.2 (2026-11-24, packaging lane, local)
+
+The 0.3.1 release run failed in `release-images.yml`, job `build`, step
+"Load exactly those archives": `docker load -i <name>-<arch>.oci.tar` exited
+1. The orchestrator reproduced it against `docker:28.0.4-dind` (the Docker
+version of GitHub's ubuntu-24.04 runners, classic overlay2 image store):
+`open /var/lib/docker/tmp/docker-import-…/blobs/json: no such file or
+directory`. The archives are pure OCI layouts from buildx, without a Docker
+`manifest.json`, which the classic store needs and the containerd store
+(Docker 29) doesn't.
+
+Fix, in `packaging/image_release.py` `load` only: it writes a temporary
+copy of the archive (in a private temporary directory that's removed
+afterwards) with an added Docker `manifest.json` whose `Config` and
+`Layers` (in manifest order) are the blobs of the same manifest `describe`
+resolves through `index.json`, and loads that copy. `index.json` stays in
+the copy, so the containerd store still loads by manifest digest. The
+built archive, its digests and what `push` publishes don't change. An
+archive that already has a `manifest.json` is accepted only if it names
+exactly that image. The checks after loading are unchanged (exactly one
+image id, equal to the config or manifest digest, then tag and platform),
+and a failed `docker load` now reports Docker's error output. The version
+moves to `0.3.2` (Cargo workspace, `apps/desktop/nsh.json`, `Cargo.lock`,
+the file names in `docs/deploy.md` and `docs/runner.md`), because `v0.3.1`
+is already tagged.
+
+Ran locally on Debian 13 (Python 3.13, PyYAML in a throwaway uv
+environment; no PowerShell, so its tests skipped). No Docker daemon was
+used; `docker` is mocked in the new tests:
+
+| Check | Result |
+| --- | --- |
+| `python3 -I packaging/release_policy.py version` | `version=0.3.2` |
+| `cargo metadata --locked --format-version 1` | passed |
+| `python3 -B -m unittest discover -s packaging -v` | 226 tests, 15 skipped, passed in a throwaway clone with the change committed; in the uncommitted worktree, one test fails only because `HEAD` is still 0.3.1 |
+| New `LoadTests` (5): `manifest.json` paths and layer order, plain and index-wrapped layouts, source archive unchanged and temporary copy removed, classic and containerd ids, Docker's error shown, wrong id or platform refused, a disagreeing `manifest.json` refused before `docker` runs | passed |
+
+**Not yet shown here:** a real `docker load` of a buildx archive on Docker
+28.0.4 (classic store) or Docker 29 (containerd store) with this change,
+and the release run on GitHub.
+
 ## Source only: releases ship Windows unsigned, version 0.3.1 (2026-11-24, packaging lane, local)
 
 The maintainer reported that the 0.3.0 bump's run on `main` (GitHub Actions

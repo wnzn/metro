@@ -9,6 +9,9 @@ never from argv, and are never printed.
             (plus a JSON description) with `docker buildx build`
   describe  check an OCI archive's blobs and print its manifest, config and
             platform as JSON
+  load      `docker load` exactly the described image from an OCI archive, via a
+            temporary copy that adds a Docker manifest.json (the classic image
+            store needs it); the archive itself is never changed
   push      upload the exact blobs and manifests of one or more single-platform
             OCI archives, then publish one image index under a version tag
             (refuses to move a tag that already names different content)
@@ -25,6 +28,7 @@ import argparse
 import base64
 import hashlib
 import http.client
+import io
 import json
 import os
 from pathlib import Path
@@ -32,6 +36,7 @@ import re
 import subprocess
 import sys
 import tarfile
+import tempfile
 from urllib.parse import urlencode, urljoin, urlsplit
 
 INDEX_TYPES = (
@@ -129,7 +134,8 @@ class Archive:
     def open_blob(self, digest):
         return self.tar.extractfile(self.members[self.blob_name(digest)])
 
-    def describe(self):
+    def resolve(self):
+        """The one image manifest the layout names, as (descriptor, parsed manifest)."""
         layout = json.loads(self.read("oci-layout"))
         require(layout.get("imageLayoutVersion") == "1.0.0", f"{self.path.name}: not an OCI layout")
         index = json.loads(self.read("index.json"))
@@ -146,6 +152,24 @@ class Archive:
         manifest = json.loads(raw)
         require(manifest.get("mediaType", desc["mediaType"]) == desc["mediaType"],
                 f"{self.path.name}: manifest media type mismatch")
+        return desc, manifest
+
+    def docker_manifest(self):
+        """The Docker-archive manifest.json for the resolved image.
+
+        The classic (overlay2) image store of `docker load` reads only this file,
+        not index.json; the containerd store reads index.json. Paths point at the
+        same blobs the OCI manifest names, layers in the manifest's order.
+        """
+        _, manifest = self.resolve()
+        return [{
+            "Config": self.blob_name(manifest["config"]["digest"]),
+            "RepoTags": None,
+            "Layers": [self.blob_name(layer["digest"]) for layer in manifest["layers"]],
+        }]
+
+    def describe(self):
+        desc, manifest = self.resolve()
         config_desc = manifest["config"]
         config_raw = self.blob(config_desc["digest"])
         require(len(config_raw) == config_desc["size"], f"{self.path.name}: config size mismatch")
@@ -246,11 +270,51 @@ def build(args):
     print(json.dumps({k: info[k] for k in ("image", "platform", "manifest_digest", "config_digest")}))
 
 
+def write_loadable(archive, dest):
+    """Copy an OCI archive to dest, adding the Docker-archive manifest.json.
+
+    The source archive is only read, so published archives and their digests
+    never change. An existing manifest.json is accepted only if it names exactly
+    the image index.json resolves to; it is then replaced by the same content.
+    """
+    entries = archive.docker_manifest()
+    existing = archive.members.get("manifest.json")
+    if existing is not None:
+        require(json.loads(archive.read("manifest.json")) == entries,
+                f"{archive.path.name}: manifest.json names a different image than index.json")
+    data = json.dumps(entries, separators=(",", ":")).encode()
+    with tarfile.open(dest, "w", format=tarfile.PAX_FORMAT) as out:
+        for member in archive.tar.getmembers():
+            name = member.name[2:] if member.name.startswith("./") else member.name
+            if name == "manifest.json":
+                continue
+            require(member.isfile() or member.isdir(), f"{archive.path.name}: unexpected entry {member.name}")
+            if member.isfile():
+                with archive.tar.extractfile(member) as f:
+                    out.addfile(member, f)
+            else:
+                out.addfile(member)
+        info = tarfile.TarInfo("manifest.json")
+        info.size = len(data)
+        info.mode = 0o644
+        out.addfile(info, io.BytesIO(data))
+    return entries
+
+
 def load(args):
     """docker load an archive and tag the exact image it described."""
     info = describe(args.archive, args.platform)
-    proc = subprocess.run(["docker", "load", "-i", str(args.archive)], check=True,
-                          capture_output=True, text=True)
+    archive = Archive(args.archive)
+    try:
+        with tempfile.TemporaryDirectory(prefix="metro-image-load-") as tmp:
+            loadable = Path(tmp) / "image.tar"
+            write_loadable(archive, loadable)
+            proc = subprocess.run(["docker", "load", "-i", str(loadable)],
+                                  capture_output=True, text=True)
+    finally:
+        archive.close()
+    require(proc.returncode == 0, f"docker load failed (exit {proc.returncode}): "
+            + (proc.stderr.strip() or proc.stdout.strip())[-2000:])
     ids = re.findall(r"sha256:[0-9a-f]{64}", proc.stdout)
     # The classic store names images by config digest, the containerd store by manifest digest.
     wanted = {info["config_digest"], info["manifest_digest"]}
