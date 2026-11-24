@@ -231,6 +231,165 @@ class ArchiveTests(unittest.TestCase):
             ir.describe(bad)
 
 
+def make_multilayer_archive(path, arch="amd64", nested=False, extra=None):
+    """Three layers in a deliberate, non-sorted order, plus optional extra tar members."""
+    layers = [gzip.compress(b"layer-%d-" % i + arch.encode(), mtime=0) for i in (2, 0, 1)]
+    config = json.dumps({
+        "architecture": arch, "os": "linux", "config": {"User": "10001:10001"},
+        "rootfs": {"type": "layers", "diff_ids": [digest(gzip.decompress(x)) for x in layers]},
+    }).encode()
+    manifest = json.dumps({
+        "schemaVersion": 2, "mediaType": ir.MANIFEST_TYPES[0],
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json",
+                   "digest": digest(config), "size": len(config)},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": digest(x), "size": len(x)} for x in layers],
+    }).encode()
+    desc = {"mediaType": ir.MANIFEST_TYPES[0], "digest": digest(manifest), "size": len(manifest)}
+    blobs = [*layers, config, manifest]
+    if nested:
+        inner = json.dumps({"schemaVersion": 2, "mediaType": ir.OCI_INDEX, "manifests": [desc]}).encode()
+        blobs.append(inner)
+        desc = {"mediaType": ir.OCI_INDEX, "digest": digest(inner), "size": len(inner)}
+    index = json.dumps({"schemaVersion": 2, "manifests": [desc]}).encode()
+    with tarfile.open(path, "w") as tar:
+        def add(name, data):
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tar.addfile(info, io.BytesIO(data))
+        add("oci-layout", b'{"imageLayoutVersion":"1.0.0"}')
+        add("index.json", index)
+        for blob in sorted(blobs, key=digest):
+            add("blobs/sha256/" + digest(blob).split(":")[1], blob)
+        for name, data in (extra or {}).items():
+            add(name, data)
+    return {"manifest": digest(manifest), "config": digest(config),
+            "layers": ["blobs/sha256/" + digest(x).split(":")[1] for x in layers]}
+
+
+class FakeDocker:
+    """Stands in for subprocess.run: records what `docker load` was given."""
+
+    def __init__(self, image_id, platform="linux/amd64", load_rc=0, load_stderr=""):
+        self.image_id, self.platform = image_id, platform
+        self.load_rc, self.load_stderr = load_rc, load_stderr
+        self.calls, self.loaded, self.loaded_path = [], None, None
+
+    def __call__(self, cmd, check=False, capture_output=False, text=False, **_):
+        self.calls.append(cmd)
+        if cmd[:3] == ["docker", "load", "-i"]:
+            self.loaded_path = Path(cmd[3])
+            with tarfile.open(cmd[3]) as tar:
+                self.loaded = {m.name: tar.extractfile(m).read() for m in tar.getmembers() if m.isfile()}
+            stdout = f"Loaded image ID: {self.image_id}\n" if self.load_rc == 0 else ""
+            proc = subprocess.CompletedProcess(cmd, self.load_rc, stdout, self.load_stderr)
+        elif cmd[:2] == ["docker", "tag"]:
+            proc = subprocess.CompletedProcess(cmd, 0, "", "")
+        elif cmd[:3] == ["docker", "image", "inspect"]:
+            proc = subprocess.CompletedProcess(cmd, 0, f"{self.image_id} {self.platform}\n", "")
+        else:
+            raise AssertionError(f"unexpected command {cmd}")
+        if check and proc.returncode:
+            raise subprocess.CalledProcessError(proc.returncode, cmd, proc.stdout, proc.stderr)
+        return proc
+
+
+class LoadTests(unittest.TestCase):
+    def setUp(self):
+        self.dir = Path(tempfile.mkdtemp(prefix="metro-image-load-test-"))
+        self.addCleanup(shutil.rmtree, self.dir)
+
+    def load(self, path, fake, platform="linux/amd64"):
+        real = ir.subprocess.run
+        ir.subprocess.run = fake
+        try:
+            return run(["load", str(path), "--platform", platform, "--tag", "metro-smoke/x:amd64"])
+        finally:
+            ir.subprocess.run = real
+
+    def test_docker_manifest_names_config_and_layers_in_order(self):
+        for nested in (False, True):
+            path = self.dir / f"m{nested}.tar"
+            want = make_multilayer_archive(path, nested=nested)
+            archive = ir.Archive(path)
+            try:
+                entries = archive.docker_manifest()
+            finally:
+                archive.close()
+            self.assertEqual(entries, [{
+                "Config": "blobs/sha256/" + want["config"].split(":")[1],
+                "RepoTags": None,
+                "Layers": want["layers"],
+            }])
+
+    def test_load_adds_manifest_json_to_a_temporary_copy_only(self):
+        for nested in (False, True):
+            path = self.dir / f"l{nested}.tar"
+            want = make_multilayer_archive(path, nested=nested)
+            before = path.read_bytes()
+            with tarfile.open(path) as tar:
+                source = {m.name: tar.extractfile(m).read() for m in tar.getmembers()}
+            # The classic store answers with the config digest.
+            fake = FakeDocker(want["config"])
+            code, out, err = self.load(path, fake)
+            self.assertEqual(code, 0, err)
+            self.assertEqual(path.read_bytes(), before, "the source archive changed")
+            self.assertNotEqual(fake.loaded_path, path)
+            self.assertFalse(fake.loaded_path.exists(), "the temporary archive was left behind")
+            self.assertEqual({k: v for k, v in fake.loaded.items() if k != "manifest.json"}, source)
+            self.assertEqual(json.loads(fake.loaded["manifest.json"]), [{
+                "Config": "blobs/sha256/" + want["config"].split(":")[1],
+                "RepoTags": None, "Layers": want["layers"]}])
+            self.assertIn("index.json", fake.loaded)
+            result = json.loads(out)
+            self.assertEqual((result["id"], result["manifest_digest"]), (want["config"], want["manifest"]))
+            self.assertEqual(fake.calls[1], ["docker", "tag", want["config"], "metro-smoke/x:amd64"])
+
+    def test_load_accepts_the_containerd_manifest_digest_id(self):
+        path = self.dir / "c.tar"
+        want = make_multilayer_archive(path)
+        code, out, err = self.load(path, FakeDocker(want["manifest"]))
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(out)["id"], want["manifest"])
+
+    def test_load_reports_docker_stderr_and_refuses_other_images(self):
+        path = self.dir / "f.tar"
+        want = make_multilayer_archive(path)
+        fake = FakeDocker(want["config"], load_rc=1, load_stderr="open /var/lib/docker/tmp/x/blobs/json: no such file")
+        code, _, err = self.load(path, fake)
+        self.assertEqual(code, 1)
+        self.assertIn("docker load failed (exit 1)", err)
+        self.assertIn("blobs/json: no such file", err)
+        self.assertEqual(len(fake.calls), 1)
+        code, _, err = self.load(path, FakeDocker(digest(b"some other image")))
+        self.assertEqual(code, 1)
+        self.assertIn("did not load exactly the described image", err)
+        code, _, err = self.load(path, FakeDocker(want["config"], platform="linux/arm64"))
+        self.assertEqual(code, 1)
+        self.assertIn("is not the described image", err)
+
+    def test_existing_manifest_json_must_match_index(self):
+        probe = self.dir / "probe.tar"
+        want = make_multilayer_archive(probe)
+        same = json.dumps([{"Config": "blobs/sha256/" + want["config"].split(":")[1],
+                            "RepoTags": None, "Layers": want["layers"]}]).encode()
+        ok = self.dir / "same.tar"
+        make_multilayer_archive(ok, extra={"manifest.json": same})
+        fake = FakeDocker(want["config"])
+        code, _, err = self.load(ok, fake)
+        self.assertEqual(code, 0, err)
+        self.assertEqual(json.loads(fake.loaded["manifest.json"]), json.loads(same))
+        other = json.dumps([{"Config": "blobs/sha256/" + want["config"].split(":")[1],
+                             "RepoTags": None, "Layers": list(reversed(want["layers"]))}]).encode()
+        bad = self.dir / "other.tar"
+        make_multilayer_archive(bad, extra={"manifest.json": other})
+        fake = FakeDocker(want["config"])
+        code, _, err = self.load(bad, fake)
+        self.assertEqual(code, 1)
+        self.assertIn("manifest.json names a different image", err)
+        self.assertEqual(fake.calls, [])
+
+
 class RegistryTests(unittest.TestCase):
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp(prefix="metro-image-test-"))

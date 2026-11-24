@@ -21,11 +21,11 @@ source is for contributors: [development.md](development.md).
 | --- | --- | --- |
 | Server image | GitHub Container Registry | `ghcr.io/wnzn/metro-server:<tag>` |
 | Runner image | GitHub Container Registry | `ghcr.io/wnzn/metro-runner:<tag>` |
-| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases) | `Metro-0.3.1-windows-x64.zip` (+ `.sha256`), **unsigned** |
-| Desktop, Linux x64 | Releases | `Metro-0.3.1-linux-x64.tar.gz` (+ `.sha256`) |
-| Runner, Linux x64 binary | Releases | `Metro-runner-0.3.1-linux-x64.tar.gz` (+ `.sha256`) |
+| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases) | `Metro-0.3.2-windows-x64.zip` (+ `.sha256`), **unsigned** |
+| Desktop, Linux x64 | Releases | `Metro-0.3.2-linux-x64.tar.gz` (+ `.sha256`) |
+| Runner, Linux x64 binary | Releases | `Metro-runner-0.3.2-linux-x64.tar.gz` (+ `.sha256`) |
 
-`<tag>` is the release tag, `v` plus the version (for example `v0.3.1`).
+`<tag>` is the release tag, `v` plus the version (for example `v0.3.2`).
 The Windows files ship without an Authenticode signature until a
 code-signing certificate is set up
 ([Windows releases](#windows-releases-signed-or-unsigned)); expect
