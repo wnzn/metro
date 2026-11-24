@@ -1,4 +1,4 @@
-"""Exercise the package preview policy against real Git histories."""
+"""Exercise the PR change classification (previews, docs only, containers) against real Git histories."""
 
 import os
 from pathlib import Path
@@ -11,7 +11,7 @@ import package_smoke_policy as policy
 from test_release_workflow import load, yaml
 
 
-class SkipPreviewsTests(unittest.TestCase):
+class GitFixture(unittest.TestCase):
     def setUp(self):
         scratch = tempfile.TemporaryDirectory()
         self.addCleanup(scratch.cleanup)
@@ -44,6 +44,8 @@ class SkipPreviewsTests(unittest.TestCase):
         self.git("commit", "-qm", "fixture")
         return self.git("rev-parse", "HEAD")
 
+
+class SkipPreviewsTests(GitFixture):
     def skips(self, *changes):
         self.git("checkout", "-q", "--detach", self.base)
         for path in changes:
@@ -128,33 +130,173 @@ class SkipPreviewsTests(unittest.TestCase):
         self.git("remote", "set-url", "origin", str(self.scratch / "not-a-repository"), cwd=missing)
         self.assertFalse(policy.skip_previews(self.base, head, root=missing))
 
-    def test_only_prs_to_literal_main_can_skip(self):
+    def outputs(self, kind, ref, head):
+        env = dict(os.environ, GITHUB_EVENT_NAME=kind, GITHUB_BASE_REF=ref, PR_BASE=self.base, PR_HEAD=head)
+        r = subprocess.run(["python3", "-I", str(Path(policy.__file__).resolve())], cwd=self.repo,
+                           env=env, capture_output=True, text=True, check=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        lines = r.stdout.splitlines()
+        self.assertEqual([line.split("=")[0] for line in lines], ["skip_previews", "docs_only", "containers"])
+        return dict(line.split("=", 1) for line in lines)
+
+    def test_only_prs_to_literal_main_are_classified(self):
         self.write("README.md", "edited readme")
         self.write("tests/e2e/smoke.py", "edited e2e")
-        docs = self.commit()
+        tests = self.commit()
         self.write("crates/server/src/main.rs", "edited source")
         crate = self.commit()
-        for kind, ref, head, code in (("pull_request", "main", docs, 0), ("pull_request", "main", crate, 1),
-                                      ("pull_request", "master", docs, 1), ("pull_request", "Main", docs, 1),
-                                      ("push", "", docs, 1), ("push", "main", docs, 1)):
+        self.git("checkout", "-q", "--detach", self.base)
+        self.write("docs/acceptance.md", "edited doc")
+        docs = self.commit()
+        everything = {"skip_previews": "false", "docs_only": "false", "containers": "true"}
+        for kind, ref, head, expected in (
+                ("pull_request", "main", docs, {"skip_previews": "true", "docs_only": "true", "containers": "false"}),
+                ("pull_request", "main", tests, {"skip_previews": "true", "docs_only": "false", "containers": "true"}),
+                ("pull_request", "main", crate, everything),
+                ("pull_request", "master", docs, everything), ("pull_request", "Main", docs, everything),
+                ("push", "", docs, everything), ("push", "main", docs, everything)):
             with self.subTest(kind=kind, ref=ref, head=head):
-                env = dict(os.environ, GITHUB_EVENT_NAME=kind, GITHUB_BASE_REF=ref, PR_BASE=self.base, PR_HEAD=head)
-                r = subprocess.run(["python3", "-I", str(Path(policy.__file__).resolve())], cwd=self.repo,
-                                   env=env, capture_output=True, check=False)
-                self.assertEqual(r.returncode, code, r.stdout + r.stderr)
+                self.assertEqual(self.outputs(kind, ref, head), expected)
 
-    @unittest.skipIf(yaml is None and not os.environ.get("CI"), "PyYAML is not installed")
-    def test_only_package_smoke_uses_the_policy_output(self):
-        jobs = load("ci.yml")["jobs"]
-        workflow_job = jobs["workflows"]
-        self.assertEqual(workflow_job["outputs"]["skip_previews"], "${{ steps.preview-policy.outputs.skip_previews }}")
-        step, = [step for step in workflow_job["steps"] if step.get("id") == "preview-policy"]
-        self.assertIn("github.event_name == 'pull_request' && github.base_ref == 'main'", step["if"])
+
+class ClassifyTests(GitFixture):
+    """docs_only and containers come from the same diff as skip_previews."""
+
+    def classify(self, *changes):
+        self.git("checkout", "-q", "--detach", self.base)
+        for path in changes:
+            self.write(path, f"edited {path}\n")
+        return policy.classify(self.base, self.commit(), root=self.repo)
+
+    def test_documentation_only_skips_rust_containers_and_desktop(self):
+        for paths in (["docs/acceptance.md"], ["README.md", "AGENTS.md"], ["docs/screenshots/new.png"],
+                      ["docs/deploy.md", "docs/diagrams/flow.svg", "docs/a.jpg", "docs/b.jpeg", "docs/c.gif",
+                       "docs/d.webp"],
+                      ["ops/github-runner/README.md", "ops/github-runner/egress/README.md"], ["CONTRIBUTING.md"]):
+            with self.subTest(paths=paths):
+                self.assertEqual(self.classify(*paths),
+                                 {"skip_previews": True, "docs_only": True, "containers": False})
+
+    def test_everything_else_is_not_documentation(self):
+        for path in ("tests/e2e/smoke.py", "examples/workspace/README.md", "examples/workspace/check.sh",
+                     "crates/auth/README.md", "apps/desktop/README.md", "packaging/README.md",
+                     "services/embeddinggemma2/README.md", ".github/workflows/README.md", "tests/README.md",
+                     "dev/screenshots/README.md", "docs/script.py", "docs/data.json", "docs/page.html",
+                     "docs/x.md.orig", "Docs/x.md", "ops/github-runner/runner.sh", "compose.yaml", ".env.example",
+                     ".gitignore", "LICENSE", "scripts/build.sh"):
+            with self.subTest(path=path):
+                self.assertFalse(self.classify("docs/acceptance.md", path)["docs_only"])
+
+    def test_test_only_change_skips_previews_but_runs_rust_and_containers(self):
+        self.assertEqual(self.classify("tests/e2e/smoke.py"),
+                         {"skip_previews": True, "docs_only": False, "containers": True})
+        self.assertEqual(self.classify("tests/e2e/library_reference.py", "docs/acceptance.md"),
+                         {"skip_previews": True, "docs_only": False, "containers": True})
+
+    def test_container_inputs_run_the_containers_job(self):
+        for path in ("Dockerfile", ".dockerignore", "compose.yaml", "compose.media.yaml", "compose.prebuilt.yaml",
+                     "compose.provider-key-file.yaml", "services/embeddinggemma2/Dockerfile",
+                     "services/embeddinggemma2/metro_eg2/main.py", "packaging/metro-runner-container.sh",
+                     "packaging/metro-runner-container.ps1", "tests/e2e/library_reference.py",
+                     "tests/e2e/library.py", "tests/e2e/new_module.py", "Cargo.toml", "Cargo.lock",
+                     "rust-toolchain", "rust-toolchain.toml", ".github/workflows/ci.yml", ".gitattributes",
+                     # The images compile crates/ and the job runs the resulting server and runner.
+                     "crates/server/src/main.rs", "crates/runner/src/main.rs", "crates/desktop/src/main.rs",
+                     # Unknown locations run it too.
+                     "LICENSE", "scripts/build.sh", "dev/screenshots/capture.sh", "compose.yaml.orig",
+                     "Docs/x.md"):
+            with self.subTest(path=path):
+                self.assertTrue(self.classify("docs/acceptance.md", path)["containers"])
+
+    def test_paths_the_containers_job_never_reads_skip_it(self):
+        for paths in (["apps/desktop/App.tsx"], ["packaging/package.py", "packaging/windows-msi/build_msi.py"],
+                      [".github/workflows/release.yml", ".github/actionlint.yaml"], ["examples/workspace/check.sh"],
+                      ["ops/github-runner/compose.yaml", "ops/github-runner/Dockerfile"], [".cargo/config.toml"],
+                      ["tests/README.md"], [".env.example", ".gitignore", "docs/install.md"]):
+            with self.subTest(paths=paths):
+                self.assertFalse(self.classify(*paths)["containers"])
+
+    def test_unreadable_or_unusual_diffs_run_everything(self):
+        everything = {"skip_previews": False, "docs_only": False, "containers": True}
+        self.assertEqual(policy.classify(self.base, self.base, root=self.repo), everything)
+        self.assertEqual(policy.classify(self.base, "f" * 40, root=self.repo), everything)
+        self.assertEqual(policy.classify("", "", root=self.repo), everything)
+        self.git("checkout", "-q", "--detach", self.base)
+        (self.repo / "docs/link.md").symlink_to("acceptance.md")
+        self.assertEqual(policy.classify(self.base, self.commit(), root=self.repo), everything)
+        self.git("checkout", "-q", "--detach", self.base)
+        self.write("docs/acceptance.md", "edited doc")
+        head = self.commit()
+        with patch.object(policy, "git", side_effect=subprocess.TimeoutExpired("git", 40)):
+            self.assertEqual(policy.classify(self.base, head, root=self.repo), everything)
+        # Documentation is always a subset of what the package previews may skip.
+        self.git("checkout", "-q", "--detach", self.base)
+        self.git("mv", "crates/server/src/main.rs", "docs/renamed.md")
+        self.assertEqual(policy.classify(self.base, self.commit(), root=self.repo), everything)
+
+
+def evaluate(expression, event, outputs, workflows="success", cancelled=False):
+    """The two shapes ci.yml's rust and containers conditions use; anything else fails."""
+    body = " ".join(expression.split()).removeprefix("${{ ").removesuffix(" }}")
+    rust = ("!cancelled() && (github.event_name == 'push' || needs.workflows.outputs.docs_only != 'true')")
+    containers = ("!cancelled() && (github.event_name == 'push' || (needs.workflows.outputs.docs_only != 'true' "
+                  "&& needs.workflows.outputs.containers != 'false'))")
+    assert body in (rust, containers), body
+    pr_runs = outputs.get("docs_only", "") != "true"
+    if body == containers:
+        pr_runs = pr_runs and outputs.get("containers", "") != "false"
+    return not cancelled and (event == "push" or pr_runs)
+
+
+@unittest.skipIf(yaml is None and not os.environ.get("CI"), "PyYAML is not installed")
+class WorkflowWiringTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.jobs = load("ci.yml")["jobs"]
+
+    def test_one_step_sets_all_three_outputs(self):
+        workflow_job = self.jobs["workflows"]
+        for name in ("skip_previews", "docs_only", "containers"):
+            self.assertEqual(workflow_job["outputs"][name], f"${{{{ steps.change-policy.outputs.{name} }}}}")
+        step, = [step for step in workflow_job["steps"] if step.get("id") == "change-policy"]
+        self.assertEqual(step["if"], "github.event_name == 'pull_request' && github.base_ref == 'main'")
         self.assertEqual(step["env"], {"PR_BASE": "${{ github.event.pull_request.base.sha }}",
                                        "PR_HEAD": "${{ github.event.pull_request.head.sha }}"})
-        self.assertIn("skip_previews=true", step["run"])
-        self.assertIn("needs.workflows.outputs.skip_previews != 'true'", jobs["package-smoke"]["if"])
-        for name, job in jobs.items():
-            if name not in {"package-smoke", "workflows"}:
-                self.assertNotIn("skip_previews", yaml.safe_dump(job), name)
-        self.assertNotIn("docs_only", yaml.safe_dump(jobs))
+        self.assertEqual(step["run"], 'python3 -I packaging/package_smoke_policy.py >> "$GITHUB_OUTPUT"')
+        self.assertEqual(sum("package_smoke_policy" in str(s.get("run", "")) for s in workflow_job["steps"]), 1)
+
+    def test_each_output_is_read_only_where_intended(self):
+        self.assertIn("needs.workflows.outputs.skip_previews != 'true'", self.jobs["package-smoke"]["if"])
+        readers = {name: {output for output in ("skip_previews", "docs_only", "containers")
+                          if f"needs.workflows.outputs.{output}" in yaml.safe_dump(job)}
+                   for name, job in self.jobs.items()}
+        self.assertEqual({name: found for name, found in readers.items() if found},
+                         {"package-smoke": {"skip_previews"}, "rust": {"docs_only"},
+                          "desktop": {"docs_only"}, "containers": {"docs_only", "containers"}})
+        for name in ("rust", "containers"):
+            self.assertEqual(self.jobs[name]["needs"], "workflows", name)
+        self.assertNotIn("if", self.jobs["workflows"])
+        self.assertNotIn("if", self.jobs["packaging"])
+        self.assertTrue({"rust", "containers", "desktop", "workflows", "packaging"} <= set(self.jobs["release"]["needs"]))
+
+    def test_pushes_always_run_rust_and_containers(self):
+        for name in ("rust", "containers"):
+            condition = self.jobs[name]["if"]
+            for outputs in ({}, {"docs_only": "true", "containers": "false"}):
+                for workflows in ("success", "failure", "skipped"):
+                    with self.subTest(job=name, outputs=outputs, workflows=workflows):
+                        self.assertTrue(evaluate(condition, "push", outputs, workflows))
+            self.assertFalse(evaluate(condition, "push", {}, cancelled=True))
+
+    def test_pull_requests_skip_only_on_an_explicit_classification(self):
+        cases = (  # outputs -> (rust runs, containers runs)
+            ({"skip_previews": "true", "docs_only": "true", "containers": "false"}, (False, False)),
+            ({"skip_previews": "true", "docs_only": "false", "containers": "true"}, (True, True)),
+            ({"skip_previews": "false", "docs_only": "false", "containers": "false"}, (True, False)),
+            ({"skip_previews": "false", "docs_only": "false", "containers": "true"}, (True, True)),
+            ({}, (True, True)),  # policy step skipped or workflows failed first: run everything
+        )
+        for outputs, (rust, containers) in cases:
+            with self.subTest(outputs=outputs):
+                self.assertIs(evaluate(self.jobs["rust"]["if"], "pull_request", outputs), rust)
+                self.assertIs(evaluate(self.jobs["containers"]["if"], "pull_request", outputs), containers)

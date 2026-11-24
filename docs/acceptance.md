@@ -3,6 +3,66 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: leaner pull request CI (2026-11-24, CI lane, local)
+
+Uncommitted changes on `ci/trim-steps`, on top of `3933776`, to `ci.yml`,
+`release.yml` and `packaging/package_smoke_policy.py`
+([deploy.md](deploy.md#ci-and-publishing)):
+
+- The `workflows` job's policy step reads one diff of a pull request into
+  `main` and gives three answers: `skip_previews` (as before),
+  `docs_only` and `containers`. Pushes, other bases, empty or unreadable
+  diffs, symlinks and unknown paths answer `skip_previews=false`,
+  `docs_only=false`, `containers=true`.
+- `docs_only=true` skips `rust`, `containers` and `desktop`. Documentation
+  means Markdown and images under `docs/`, top-level Markdown and Markdown
+  under `ops/`, and nothing else.
+- `containers=false` skips `containers`. Its inputs are the Dockerfile,
+  `.dockerignore`, `.gitattributes`, the Cargo files, `crates/`, the
+  Compose files, `services/`, the two container runner scripts,
+  `tests/e2e/`, `rust-toolchain*` and `ci.yml`. Only paths under `docs/`,
+  `apps/`, `examples/`, `ops/`, other `packaging/` and `tests/` files,
+  other `.github/` files, `.cargo/`, top-level Markdown, `.env.example`
+  and `.gitignore` can skip it.
+- `rust` and `containers` now wait for `workflows`, and always run on
+  pushes, including when `workflows` fails.
+- The `desktop` job no longer runs `nsh build --release`; it keeps
+  `nsh check` and `nsh test`.
+- `release.yml`'s `desktop-linux` no longer has the best-effort Xvfb
+  launch (`continue-on-error`) or its screenshot upload.
+
+**Not yet shown:** any GitHub run of these changes. That a job skipped by
+`if:` satisfies the required `rust` and `containers` checks, and the job
+conditions themselves, were checked only by the contract tests below, not
+on GitHub.
+
+Checked locally, with `TMPDIR` off `/tmp`:
+
+```sh
+~/.cache/actionlint-1.7.12/actionlint -color   # clean
+# ci.yml's "Every action is pinned" grep       # no unpinned actions
+python -B -m unittest discover -s packaging    # 200 tests, OK (15 skipped: no pwsh, MSI tools or macOS runtimes, macOS jobs off)
+python -B -m unittest discover -s packaging/release-signatures  # 17 tests, OK (1 skipped)
+python -B -m unittest discover -s packaging/windows-signing     # 39 tests, OK (6 skipped)
+python3 -B -m unittest discover -s ops/github-runner            # 33 tests, OK
+```
+
+The policy was also run by hand on this repository's history, as a pull
+request into `main` from each commit's parent:
+
+| Commit | Changes | skip_previews | docs_only | containers |
+| --- | --- | --- | --- | --- |
+| `ff787b7` | `docs/acceptance.md` | true | true | false |
+| `1719366` | `tests/e2e/schedules.py` | true | false | true |
+| `0a84b10` | `crates/connector` tests | false | false | true |
+| `057284a` | `apps/desktop` and docs | false | false | false |
+| `82ff919` | `compose.prebuilt.yaml`, a packaging test | false | false | true |
+
+`ff787b7` as a push or as a pull request into `master`, and an invalid SHA,
+answer `false`, `false`, `true`. In a throwaway clone, one-file commits on
+`3933776` gave: `Dockerfile` false, false, true; `.github/workflows/release.yml`
+false, false, false; `docs/screenshots/new.png` true, true, false.
+
 ## Source only: releases from `main` on a version bump (2026-11-24, CI lane, local)
 
 Uncommitted changes on `fix/ci-cleanup`, on top of `106e5da`

@@ -635,9 +635,8 @@ jobs:
     permissions:
       contents: read
 
-  # Linux x64 desktop. The GUI launch is best-effort on a headless runner
-  # (Xvfb + WebKitGTK); native tests, layout, checksum, capability and server
-  # checks are blocking.
+  # Linux x64 desktop: build, package, layout, checksum, capability, server
+  # and installer checks, all blocking. There is no GUI launch here.
   desktop-linux:
     needs: [meta, ui]
     runs-on: ubuntu-24.04
@@ -776,45 +775,6 @@ jobs:
           sh "$i" uninstall
           test ! -e "$home/.local/share/metro-desktop-app" && test ! -e "$home/.local/share/applications/dev.metro.desktop.desktop"
           test "$(cat "$home/.config/metro-desktop/marker")" = keep
-      - name: Launch under Xvfb (best effort)
-        continue-on-error: true
-        run: |
-          set -eu
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends xvfb xdotool x11-utils imagemagick libwebkitgtk-6.0-4 libgtk-4-1
-          work="$(mktemp -d "$RUNNER_TEMP/desktop-run.XXXXXX")"
-          mkdir -p "$RUNNER_TEMP/shot"
-          # shellcheck disable=SC2016 # the inner script expands its own variables
-          for attempt in 1 2 3; do
-            if GDK_BACKEND=x11 METRO_DESKTOP_HOME="$work/home" xvfb-run -a --server-args='-screen 0 1280x800x24' bash -c '
-              set -eu
-              mkdir -p "$METRO_DESKTOP_HOME"
-              cd "$1"
-              HOME="$1" "$METRO_ROOT/Metro" &
-              pid=$!
-              for _ in $(seq 1 45); do
-                kill -0 "$pid" 2>/dev/null || { echo "launcher exited early" >&2; exit 1; }
-                xdotool search --name "^Metro$" >/dev/null 2>&1 && break
-                sleep 1
-              done
-              wid="$(xdotool search --name "^Metro$" | head -n 1)"
-              xprop -id "$wid" WM_CLASS | grep -F dev.metro.desktop
-              sleep 8
-              kill -0 "$pid"
-              import -window root "$2/desktop-linux.png" || true
-              kill "$pid"
-            ' _ "$work" "$RUNNER_TEMP/shot"; then exit 0; fi
-            echo "attempt $attempt failed" >&2
-          done
-          exit 1
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        if: always()
-        with:
-          name: smoke-linux-screenshot
-          path: ${{ runner.temp }}/shot
-          if-no-files-found: ignore
-          overwrite: true
-          retention-days: 7
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-desktop-linux-x64

@@ -20,8 +20,16 @@ concurrency:
   group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# A pull request to main whose diff `workflows` classifies as documentation
+# only skips `rust`, `containers` and `desktop`; one that touches nothing the
+# containers job reads skips `containers` (packaging/package_smoke_policy.py).
+# A skipped job counts as passed for branch protection. Pushes always run them,
+# and so does an unknown or unreadable diff. If `workflows` fails, `rust` and
+# `containers` still run (and `desktop`, as before, does not).
 jobs:
   rust:
+    needs: workflows
+    if: ${{ !cancelled() && (github.event_name == 'push' || needs.workflows.outputs.docs_only != 'true') }}
     runs-on: ubuntu-24.04
     env:
       RUSTUP_TOOLCHAIN: 1.98.1
@@ -75,8 +83,11 @@ jobs:
     # only when the selector chose it and release-policy did not choose a
     # release (it is skipped for pull requests, and CI only for main pushes
     # without a version bump). Still runs when release-policy is skipped.
+    # Documentation-only PRs skip it, like `rust` and `containers`.
     needs: [workflows, release-policy]
-    if: ${{ !cancelled() && needs.workflows.result == 'success' && needs.release-policy.result != 'failure' }}
+    if: >-
+      ${{ !cancelled() && needs.workflows.result == 'success' && needs.release-policy.result != 'failure'
+      && needs.workflows.outputs.docs_only != 'true' }}
     # Choose a queue, not a fallback if the selected runner is offline.
     runs-on: ${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' && needs.release-policy.outputs.release != 'true' && 'metro-ci-linux-x64' || 'ubuntu-24.04' }}
     env:
@@ -124,12 +135,15 @@ jobs:
           printf '%s\n' "$install_dir/nsh/bin" >> "$GITHUB_PATH"
       - run: nsh check
         working-directory: apps/desktop
+      # The release build is package-smoke's `ui` job (any PR that changes it, every main push).
       - run: nsh test
-        working-directory: apps/desktop
-      - run: nsh build --release
         working-directory: apps/desktop
 
   containers:
+    needs: workflows
+    if: >-
+      ${{ !cancelled() && (github.event_name == 'push'
+      || (needs.workflows.outputs.docs_only != 'true' && needs.workflows.outputs.containers != 'false')) }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -314,7 +328,9 @@ jobs:
   workflows:
     runs-on: ubuntu-24.04
     outputs:
-      skip_previews: ${{ steps.preview-policy.outputs.skip_previews }}
+      skip_previews: ${{ steps.change-policy.outputs.skip_previews }}
+      docs_only: ${{ steps.change-policy.outputs.docs_only }}
+      containers: ${{ steps.change-policy.outputs.containers }}
       desktop_runner: ${{ steps.desktop-route.outputs.desktop_runner }}
     env:
       ACTIONLINT_VERSION: 1.7.12
@@ -418,18 +434,15 @@ jobs:
           set -eu
           bad="$(grep -hE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s+\./' | grep -vE 'uses:[[:space:]]+[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$)' || true)"
           [ -z "$bad" ] || { printf 'unpinned actions:\n%s\n' "$bad" >&2; exit 1; }
-      - name: Check whether this PR needs the optional package previews
-        id: preview-policy
+      # One diff, three answers: skip_previews, docs_only, containers. Not run
+      # for pushes, so their outputs stay empty and nothing is skipped.
+      - name: Classify this PR's changes (package previews, docs only, containers)
+        id: change-policy
         if: github.event_name == 'pull_request' && github.base_ref == 'main'
         env:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: |
-          if python3 -I packaging/package_smoke_policy.py; then
-            echo 'skip_previews=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'skip_previews=false' >> "$GITHUB_OUTPUT"
-          fi
+        run: python3 -I packaging/package_smoke_policy.py >> "$GITHUB_OUTPUT"
 
   # Separate from `workflows`, so the desktop job and package previews do not
   # wait for these tests. Official releases still need them.

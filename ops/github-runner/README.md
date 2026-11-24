@@ -28,7 +28,8 @@ GitHub-hosted Windows jobs aren't affected. (There are no macOS jobs for now.)
   - **`ci.yml`'s `desktop` job,** automatically. That covers pull requests
     from branches of `wnzn/metro` itself into `main` by trusted authors (not
     forks, not Dependabot) and pushes to the protected `main` branch that
-    don't release.
+    don't release. It runs `nsh check` and `nsh test`; pull requests that
+    change only documentation skip it.
   - **`.github/workflows/self-hosted-ci.yml`,** a manual run on the literal
     `main` branch ([below](#run-the-workflow)).
 - **What stays on GitHub's runners:** everything else, including:

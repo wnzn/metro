@@ -297,6 +297,13 @@ class ReleaseWorkflowTests(unittest.TestCase):
         for path in sorted(WF.glob("*.yml")):
             self.assertEqual(re.findall(r"secrets\.([A-Z0-9_]+)", path.read_text()), [], path.name)
 
+    def test_linux_desktop_job_has_only_blocking_steps(self):
+        # The best-effort Xvfb launch could never fail CI, so it and its screenshot are gone.
+        job = self.release["jobs"]["desktop-linux"]
+        self.assertFalse([s for s in job["steps"] if "continue-on-error" in s])
+        self.assertNotIn("xvfb", steps_text(job).lower())
+        self.assertEqual(uploads(job), ["dist-desktop-linux-x64"])
+
     def test_only_final_outputs_are_named_dist(self):
         names = {(job, u) for job, j in self.release["jobs"].items() for u in uploads(j) if u.startswith("dist-")}
         self.assertEqual(names, {("runner-linux", "dist-runner-linux-x64"),
