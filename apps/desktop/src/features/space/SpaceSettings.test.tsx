@@ -81,7 +81,14 @@ test("a member reads General and the agents, can't edit them, and can leave", as
   await app.waitFor("id:space-name-readonly");
   expect(app.shows("id:space-name")).toBe(false);
   expect(app.shows("id:delete-space")).toBe(false);
-  expect(app.shows("id:space-settings-tab:members")).toBe(false);
+  // Members and runner: the runner's status and Test runner, no management.
+  await app.press("id:space-settings-tab:members");
+  await app.waitFor("id:space-members");
+  expect(app.shows("id:open-manage")).toBe(false);
+  expect(app.shows("id:space-runner-status >> text:Runner attached")).toBe(true);
+  await app.press("id:test-runner");
+  await app.waitFor("text:/^Requested\\. The listing appears in # lobby/");
+  expect(w.f.posts().at(-1)).toMatchObject({ path: "/v1/spaces/acme/rooms/lobby/demo" });
 
   await app.press("id:space-settings-tab:agents");
   await app.waitFor("id:agent-list");

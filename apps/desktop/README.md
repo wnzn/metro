@@ -282,6 +282,9 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
 - **Rooms and threads:** threads that an agent delegated
   (`parent_room_id`) appear under their parent room. A thread links back to
   its parent.
+- **Drafts are per place:** each room, thread and the personal Chat keeps
+  its own unsent text and mention chips while you move between them in a
+  session. Switching workspaces asks first if any place still has one.
 - **Mentions:** type `@` or press **@** to mention `@agent`, one of the
   Space's named agents by its `@handle`, or a Space member by their stable
   user ID. In the current source after 0.2.0 (covered by automated tests;
@@ -310,8 +313,9 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   acknowledgement is labelled "agent", and screen readers hear who reacted.
   Reactions are folded from `reaction` events and are never shown as
   transcript lines.
-- **Test runner** (owners; in Space settings › **Members and runner** and
-  next to the runner's status under **Manage**, not in the room header):
+- **Test runner** (every member, in Space settings › **Members and runner**,
+  which shows every member the runner's status; owners also have it next to
+  the runner's status under **Manage**; not in the room header):
   lists the workspace on this Space's runner; no model is used. It runs the
   deterministic `workspace.list` and posts the listing in the room you have
   open in that Space. It is offered only while the Space has a runner
@@ -414,6 +418,9 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   are only yours: classification of your own unaddressed messages there,
   model routing on or off there, and your default model in the Space and per
   agent, each with its thinking level when the model offers levels.
+  **Members and runner** shows every member the runner's status and, while
+  a runner is attached, **Test runner**; only the owner also gets **Open**
+  to manage members and the runner.
 
 Chat, Search, Library and Scheduled tasks are your own pages, outside every
 Space, and work with or without any Space. The entries above describe the

@@ -1,7 +1,8 @@
 // Space settings: a modal over the app, opened per Space
 // (openSpaceSettings). Every member sees General (owners edit it), Agents
-// (owners edit them) and Your preferences (their own); owners also get
-// Members and runner. Closing returns to where the user was.
+// (owners edit them), Your preferences (their own) and Members and runner
+// (the runner's status and Test runner; owners also manage there).
+// Closing returns to where the user was.
 //
 // Destructive steps follow the app's pattern: an outlined first press, then
 // a filled confirmation that says what happens (Delete also needs the
@@ -103,7 +104,7 @@ import type { SpaceSettingsSection } from "./spaceSettingsState";
 
 const PAGES: readonly { section: SpaceSettingsSection; label: string; icon: IconName; ownerOnly?: boolean }[] = [
   { section: "general", label: "General", icon: "settings" },
-  { section: "members", label: "Members and runner", icon: "person", ownerOnly: true },
+  { section: "members", label: "Members and runner", icon: "person" },
   { section: "agents", label: "Agents", icon: "agent" },
   { section: "preferences", label: "Your preferences", icon: "routing" },
 ];
@@ -191,7 +192,7 @@ function Page() {
       <If when={spaceSettingsSection() === "general"}>
         <GeneralPage />
       </If>
-      <If when={spaceSettingsSection() === "members" && isSettingsOwner()}>
+      <If when={spaceSettingsSection() === "members"}>
         <MembersPage />
       </If>
       <If when={spaceSettingsSection() === "agents"}>
@@ -399,7 +400,7 @@ function DangerZone() {
 
 // ---------------------------------------------------------------- Members and runner
 
-/** Members and the runner keep their own page (Manage, owner only); this opens it. */
+/** The runner's status and Test runner for every member; owners also open Manage (members and the runner). */
 function MembersPage() {
   const open = async () => {
     const sid = spaceSettingsFor();
@@ -409,16 +410,32 @@ function MembersPage() {
     closeManage();
     await openManage();
   };
+  const paired = () => !!settingsSpace()?.runnerPaired;
   return (
     <PageLayout testID="space-members" pad={pad()} gap={6}>
-      <PageHeader title="Members and runner" subtitle="Who is in this Space, and which runner serves it." />
+      <PageHeader
+        title="Members and runner"
+        subtitle={isSettingsOwner() ? "Who is in this Space, and which runner serves it." : "Which runner serves this Space. Only the owner manages members and the runner."}
+      />
       <SettingsGroup>
-        <SettingRow label="Manage members and the runner" description="Add or remove members by their user ID, attach or detach a runner, or pair a dedicated one. Only you, the owner, can do this.">
-          <Action testID="open-manage" label="Open" onPress={() => void open()} />
+        {/* Management stays the owner's; every member sees the runner's status and can test it. */}
+        <If when={isSettingsOwner()}>
+          <SettingRow label="Manage members and the runner" description="Add or remove members by their user ID, attach or detach a runner, or pair a dedicated one. Only you, the owner, can do this.">
+            <Action testID="open-manage" label="Open" onPress={() => void open()} />
+          </SettingRow>
+        </If>
+        <SettingRow
+          label="Runner"
+          description={paired() ? "Attached: this Space's jobs go to it. That doesn't mean the runner is online." : "No runner is attached; agents still answer, without workspace tools."}
+          testID="runner-status-row"
+        >
+          <Badge testID="space-runner-status" tone={paired() ? "runner" : "neutral"} label={paired() ? "Runner attached" : "No runner"} />
         </SettingRow>
-        <SettingRow label={TEST_RUNNER_LABEL} description={`${TEST_RUNNER_DESCRIPTION}. The listing is posted in the room you have open.`} testID="test-runner-row">
-          <TestRunnerAction spaceId={spaceSettingsFor()} />
-        </SettingRow>
+        <If when={paired()}>
+          <SettingRow label={TEST_RUNNER_LABEL} description={`${TEST_RUNNER_DESCRIPTION}. The listing is posted in the room you have open.`} testID="test-runner-row">
+            <TestRunnerAction spaceId={spaceSettingsFor()} />
+          </SettingRow>
+        </If>
       </SettingsGroup>
     </PageLayout>
   );

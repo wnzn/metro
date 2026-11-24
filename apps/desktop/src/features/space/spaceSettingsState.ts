@@ -101,7 +101,7 @@ export function openSpaceSettings(spaceId: string, section: SpaceSettingsSection
   if (changed) resetPages();
   batch(() => {
     spaceSettingsFor.set(spaceId);
-    spaceSettingsSection.set(section === "members" && space.role !== "owner" ? "general" : section);
+    spaceSettingsSection.set(section);
   });
   if (changed) {
     void loadDetails();
