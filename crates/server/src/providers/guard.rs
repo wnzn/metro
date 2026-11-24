@@ -139,7 +139,7 @@ impl Grant {
                             return Ok(false);
                         }
                         if let Some(check) = turn_check {
-                            check.selection.recheck(&check.state, &a)?;
+                            check.selection.recheck(&check.state, &conn, &a)?;
                         }
                         Ok(true)
                     });

@@ -104,7 +104,8 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS provider_share_spaces_space
              ON provider_share_spaces (space_id);",
-    )
+    )?;
+    super::models::init(conn)
 }
 
 fn now() -> i64 {
@@ -227,6 +228,8 @@ pub fn insert(conn: &mut Connection, row: &Row, max: usize) -> rusqlite::Result<
             t
         ],
     )?;
+    // The connection's model is always one of its enabled models.
+    super::models::ensure_enabled(&tx, &row.id, &row.model)?;
     tx.commit()?;
     Ok(true)
 }
@@ -273,6 +276,9 @@ pub fn update(conn: &mut Connection, row: &Row) -> rusqlite::Result<Option<i64>>
             |r| r.get(0),
         )
         .optional()?;
+    if rev.is_some() {
+        super::models::ensure_enabled(&tx, &row.id, &row.model)?;
+    }
     // A media connection that now computes something else: everyone's
     // library vectors built with it are stale, in this same transaction.
     // A rename, default flag or key rotation leaves them valid.
@@ -311,6 +317,21 @@ pub fn delete(conn: &Connection, user_id: &str, id: &str) -> rusqlite::Result<Op
         && media(&row.provider_id)
     {
         crate::library_search::hooks::connection_changed(&tx, &row.id)?;
+    }
+    // The owner's default for that capability is gone: their oldest
+    // remaining connection of it that has a model takes over.
+    if let Some(row) = &row
+        && row.is_default
+    {
+        tx.execute(
+            "UPDATE provider_connections SET is_default = 1
+             WHERE id = (SELECT id FROM provider_connections
+                         WHERE user_id = ?1 AND capability = ?2 AND model <> ''
+                         ORDER BY created_at, rowid LIMIT 1)
+               AND NOT EXISTS (SELECT 1 FROM provider_connections
+                               WHERE user_id = ?1 AND capability = ?2 AND is_default = 1)",
+            params![row.user_id, row.capability.as_str()],
+        )?;
     }
     tx.commit()?;
     Ok(row)

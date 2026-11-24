@@ -59,6 +59,9 @@ impl ApiError {
     fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, message)
     }
+    pub(crate) fn message(&self) -> &str {
+        &self.message
+    }
     pub fn internal(e: anyhow::Error) -> Self {
         tracing::error!(error = %format!("{e:#}"), "internal error");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")

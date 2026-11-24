@@ -1,30 +1,13 @@
-//! Short-lived owner-only model suggestions from explicit server listings.
-//! Composer reads never ask the provider for models.
-
-use std::collections::HashMap;
-use std::time::{Duration, Instant};
+//! Merging an explicit model listing into a chat connection's model list.
+//! Composer reads never ask the provider for models: they read the stored
+//! list ([`super::models`]).
 
 use sha2::{Digest, Sha256};
 
-use super::catalog::{self, Adapter, Capability, Entry};
+use super::catalog::{Adapter, Capability, Entry};
+use super::models::{self, Synced};
 use super::store::{self, Row};
-use super::{MAX_LISTED_MODELS, ProviderService};
 use crate::db::Db;
-
-const TTL: Duration = Duration::from_secs(10 * 60);
-const MAX_PROFILES: usize = 32;
-
-#[derive(Default)]
-pub(super) struct Cache {
-    by_id: HashMap<String, Listing>,
-}
-
-struct Listing {
-    config: [u8; 32],
-    started_at: Instant,
-    expires_at: Instant,
-    ids: Vec<String>,
-}
 
 pub(super) fn server_chat(entry: &Entry, row: &Row) -> bool {
     row.capability == Capability::Chat
@@ -32,11 +15,10 @@ pub(super) fn server_chat(entry: &Entry, row: &Row) -> bool {
         && matches!(entry.adapter, Adapter::Registered(_) | Adapter::Custom)
 }
 
+/// What a listing was made with: a listing made with an older key, endpoint
+/// or revision is never merged.
 fn fingerprint(row: &Row) -> [u8; 32] {
     let mut hash = Sha256::new();
-    // A credential round trip can restore the same ciphertext field (None
-    // before and after), but never the same configuration revision. Pinning
-    // a different model also starts a new revision.
     hash.update(row.config_rev.to_be_bytes());
     for part in [
         Some(row.id.as_bytes()),
@@ -60,7 +42,7 @@ fn fingerprint(row: &Row) -> [u8; 32] {
 
 // Listing APIs often mix inference products in the same response. Remove
 // known non-chat IDs/families, not arbitrary IDs based on words in the name.
-fn known_non_chat(id: &str) -> bool {
+pub(super) fn known_non_chat(id: &str) -> bool {
     let name = id.rsplit('/').next().unwrap_or(id);
     let name = name.split_once(':').map_or(name, |(name, _)| name);
     matches!(
@@ -102,112 +84,45 @@ fn known_non_chat(id: &str) -> bool {
     .any(|prefix| name.starts_with(prefix))
 }
 
-impl Cache {
-    fn get(&self, row: &Row, now: Instant) -> &[String] {
-        self.by_id
-            .get(&row.id)
-            .filter(|entry| now < entry.expires_at && entry.config == fingerprint(row))
-            .map_or(&[], |entry| entry.ids.as_slice())
-    }
-
-    fn insert(&mut self, row: &Row, ids: Vec<String>, started_at: Instant, now: Instant) {
-        let config = fingerprint(row);
-        self.by_id.retain(|_, entry| now < entry.expires_at);
-        if self
-            .by_id
-            .get(&row.id)
-            .is_some_and(|previous| previous.config == config && previous.started_at > started_at)
-        {
-            return;
+/// Merge `listed` (cleaned ids with catalog names) into the chat connection
+/// `row` was when the listing started, then settle its model and default.
+/// `None` when the connection changed or was deleted meanwhile (nothing is
+/// merged). The DB lock is held across the recheck and the merge, never
+/// across the upstream call.
+pub(super) async fn merge_chat_listing(
+    db: &Db,
+    row: Row,
+    listed: Vec<(String, Option<String>)>,
+) -> anyhow::Result<Option<(Row, Synced)>> {
+    let listed: Vec<(String, Option<String>)> = listed
+        .into_iter()
+        .filter(|(id, _)| !known_non_chat(id))
+        .take(models::MAX_MODELS_PER_CONNECTION)
+        .collect();
+    db.call(move |db| {
+        let mut conn = db.lock();
+        let Some(current) = store::get(&conn, &row.user_id, &row.id)? else {
+            return Ok(None);
+        };
+        if fingerprint(&row) != fingerprint(&current) {
+            return Ok(None);
         }
-        if !self.by_id.contains_key(&row.id)
-            && self.by_id.len() >= MAX_PROFILES
-            && let Some(oldest) = self
-                .by_id
-                .iter()
-                .min_by_key(|(_, entry)| entry.expires_at)
-                .map(|(id, _)| id.clone())
-        {
-            self.by_id.remove(&oldest);
-        }
-        self.by_id.insert(
-            row.id.clone(),
-            Listing {
-                config,
-                started_at,
-                expires_at: now + TTL,
-                ids,
-            },
-        );
-    }
-}
-
-impl ProviderService {
-    /// The pinned model and suggestions for a server-stored chat profile.
-    /// Call only with a currently authorized, owner-scoped row (`Access::Own`).
-    /// Borrowers and presets must not use or see the cached suggestions.
-    pub(crate) fn listed_chat_models(&self, row: &Row) -> Vec<String> {
-        if !catalog::find(&row.provider_id).is_some_and(|entry| server_chat(entry, row)) {
-            return vec![];
-        }
-        let cache = self
-            .inner
-            .listed_chat
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let listed = cache.get(row, Instant::now());
-        // Keep the explicitly pinned choice, even if absent from the list.
-        // Never let the discovery list crowd it out.
-        let pinned = (!row.model.is_empty()).then_some(&row.model);
-        pinned
-            .into_iter()
-            .chain(listed.iter().filter(|id| Some(*id) != pinned))
-            .take(MAX_LISTED_MODELS)
-            .cloned()
-            .collect()
-    }
-
-    /// Publish only if the owner still has the same listing configuration.
-    /// Hold the DB lock across recheck and insertion, not the upstream call.
-    /// Readers also check the fingerprint against their own authorized row.
-    pub(super) async fn remember_chat_listing(
-        &self,
-        db: &Db,
-        row: Row,
-        started_at: Instant,
-        cleaned_ids: &[String],
-    ) -> anyhow::Result<bool> {
-        let ids = cleaned_ids
-            .iter()
-            .filter(|id| !known_non_chat(id))
-            .take(MAX_LISTED_MODELS)
-            .cloned()
-            .collect();
-        let service = self.clone();
-        db.call(move |db| {
-            let conn = db.lock();
-            let Some(current) = store::get(&conn, &row.user_id, &row.id)? else {
-                return Ok(false);
-            };
-            if fingerprint(&row) != fingerprint(&current) {
-                return Ok(false);
-            }
-            service
-                .inner
-                .listed_chat
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .insert(&current, ids, started_at, Instant::now());
-            Ok(true)
-        })
-        .await
-    }
+        let tx = conn.transaction()?;
+        let synced = models::sync_listed(&tx, &row.id, &listed)?;
+        tx.commit()?;
+        let Some(settled) = models::settle(&mut conn, &row.user_id, &row.id)? else {
+            return Ok(None);
+        };
+        Ok(Some((settled, synced)))
+    })
+    .await
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
 
     use axum::body::Bytes;
     use axum::extract::{Path, State};
@@ -221,8 +136,8 @@ mod tests {
 
     use super::*;
     use crate::auth::{AuthFailure, AuthFuture, Human, HumanAuth};
-    use crate::providers::api;
     use crate::providers::secret::MasterKey;
+    use crate::providers::{ProviderService, api, catalog};
     use crate::{AppState, Config, Limits};
 
     fn profile() -> Row {
@@ -281,8 +196,16 @@ mod tests {
         }
     }
 
+    fn enabled(state: &AppState, row: &Row) -> Vec<String> {
+        models::enabled(&state.db.lock(), &row.id)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.model_id)
+            .collect()
+    }
+
     #[tokio::test]
-    async fn explicit_owner_fetch_populates_local_chat_suggestions() {
+    async fn explicit_owner_fetch_adds_chat_models_enabled() {
         let calls = Arc::new(AtomicUsize::new(0));
         let upstream = Router::new().route(
             "/v1/models",
@@ -293,7 +216,7 @@ mod tests {
                     async move {
                         calls.fetch_add(1, Ordering::SeqCst);
                         Json(json!({"data": [
-                            {"id": "chat-b"},
+                            {"id": "chat-b", "name": "Chat B"},
                             {"id": "chat-a"},
                             {"id": "chat-a"},
                             {"id": "text-embedding-3-small"},
@@ -308,10 +231,7 @@ mod tests {
             }),
         );
         let (state, row, upstream) = with_upstream(upstream).await;
-
-        let read = || state.providers.listed_chat_models(&row);
-        assert_eq!(read(), ["pinned"]);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(enabled(&state, &row), ["pinned"]);
         let fetch = |id: &str| {
             api::models(
                 State(state.clone()),
@@ -323,31 +243,28 @@ mod tests {
         assert!(fetch("bob").await.is_err());
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let Json(body) = fetch("alice").await.unwrap();
-        // The owner-facing Settings endpoint preserves its existing list.
+        // The owner-facing Settings answer keeps the raw list.
         assert!(
             body["models"]
                 .as_array()
                 .unwrap()
                 .contains(&json!("whisper-1"))
         );
+        assert_eq!(body["added"], 3);
         assert_eq!(
-            read(),
-            ["pinned", "chat-a", "chat-b", "org/chat-with-image-input"]
+            enabled(&state, &row),
+            ["pinned", "chat-b", "chat-a", "org/chat-with-image-input"]
         );
-        assert_eq!(read().len(), 4);
+        let b = models::get(&state.db.lock(), &row.id, "chat-b")
+            .unwrap()
+            .unwrap();
+        assert_eq!(b.name(), "Chat B");
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-
-        let mut other = row.clone();
-        other.id = "pc_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".into();
-        assert_eq!(state.providers.listed_chat_models(&other), ["pinned"]);
-        other = row.clone();
-        other.capability = Capability::Embeddings;
-        assert!(state.providers.listed_chat_models(&other).is_empty());
         upstream.abort();
     }
 
     #[tokio::test]
-    async fn adding_then_removing_a_key_invalidates_cached_and_in_flight_listings() {
+    async fn a_listing_made_before_a_credential_change_is_not_merged() {
         let entered = Arc::new(Notify::new());
         let release = Arc::new(Notify::new());
         let upstream = Router::new().route(
@@ -361,8 +278,7 @@ mod tests {
                         (entered.clone(), release.clone(), calls.clone());
                     async move {
                         let id = match calls.fetch_add(1, Ordering::SeqCst) {
-                            0 => "old-cached",
-                            1 => {
+                            0 => {
                                 entered.notify_one();
                                 release.notified().await;
                                 "old-in-flight"
@@ -383,146 +299,41 @@ mod tests {
                 Bytes::from_static(b"{}"),
             )
         };
-        let write = |body| {
-            api::update(
-                State(state.clone()),
-                human("alice"),
-                Path(row.id.clone()),
-                Ok(Json(serde_json::from_value(body).unwrap())),
-            )
-        };
-        let read = || {
-            store::get(&state.db.lock(), "alice", &row.id)
-                .unwrap()
-                .unwrap()
-        };
-        let _ = fetch().await.unwrap();
-        assert_eq!(
-            state.providers.listed_chat_models(&read()),
-            ["pinned", "old-cached"]
-        );
         let delayed = tokio::spawn(fetch());
         tokio::time::timeout(Duration::from_secs(5), entered.notified())
             .await
             .expect("upstream received the delayed listing");
-        assert!(
-            write(json!({"api_key": "fixture-key"}))
-                .await
-                .unwrap()
-                .0
-                .has_key
-        );
-        assert!(!write(json!({"api_key": null})).await.unwrap().0.has_key);
-        let current = read();
-        assert_eq!(current.config_rev, row.config_rev + 2);
-        assert!(current.sealed_key.is_none());
-        assert_eq!(state.providers.listed_chat_models(&current), ["pinned"]);
-
+        let write = api::update(
+            State(state.clone()),
+            human("alice"),
+            Path(row.id.clone()),
+            Ok(Json(
+                serde_json::from_value(json!({"api_key": "fixture-key"})).unwrap(),
+            )),
+        )
+        .await
+        .unwrap();
+        assert!(write.0.has_key);
         release.notify_one();
         let rejected = delayed.await.unwrap().unwrap_err();
         assert_eq!(rejected.into_response().status(), StatusCode::CONFLICT);
-        assert_eq!(state.providers.listed_chat_models(&read()), ["pinned"]);
-
+        assert_eq!(enabled(&state, &row), ["pinned"]);
         let _ = fetch().await.unwrap();
-        assert_eq!(
-            state.providers.listed_chat_models(&read()),
-            ["pinned", "fresh"]
-        );
-        let _ = write(json!({"name": "New name"})).await.unwrap();
-        assert_eq!(
-            state.providers.listed_chat_models(&read()),
-            ["pinned", "fresh"]
-        );
-        let _ = write(json!({"model": "new-pinned"})).await.unwrap();
-        assert_eq!(state.providers.listed_chat_models(&read()), ["new-pinned"]);
+        assert_eq!(enabled(&state, &row), ["pinned", "fresh"]);
         upstream.abort();
     }
 
     #[tokio::test]
-    async fn delayed_fetch_cannot_publish_after_credential_change_or_delete() {
+    async fn merge_after_delete_is_dropped() {
         let db = Db::open_in_memory().unwrap();
-        let providers = ProviderService::new(None, vec![]).unwrap();
-        let mut old = profile();
-        old.sealed_key = Some(vec![1]);
-        assert!(store::insert(&mut db.lock(), &old, 20).unwrap());
-        let started = Instant::now();
-        assert!(
-            providers
-                .remember_chat_listing(&db, old.clone(), started, &["old-chat".into()])
-                .await
-                .unwrap()
-        );
-        let mut current = old.clone();
-        current.sealed_key = Some(vec![2]);
-        current.config_rev = store::update(&mut db.lock(), &current).unwrap().unwrap();
-        assert_eq!(providers.listed_chat_models(&current), ["pinned"]);
-        assert!(
-            providers
-                .remember_chat_listing(&db, current.clone(), started, &["new-chat".into()])
-                .await
-                .unwrap()
-        );
-        assert!(
-            !providers
-                .remember_chat_listing(&db, old, started, &["stale".into()])
-                .await
-                .unwrap()
-        );
-        assert_eq!(
-            providers.listed_chat_models(&current),
-            ["pinned", "new-chat"]
-        );
-        store::delete(&db.lock(), &current.user_id, &current.id).unwrap();
-        assert!(
-            !providers
-                .remember_chat_listing(&db, current, started, &["deleted".into()])
-                .await
-                .unwrap()
-        );
-    }
-
-    #[test]
-    fn cache_bounds_expiry_identity_and_concurrent_refreshes() {
-        let mut cache = Cache::default();
         let row = profile();
-        let start = Instant::now();
-        let later = start + Duration::from_secs(1);
-        cache.insert(&row, vec!["newer".into()], later, later);
-        cache.insert(&row, vec!["older".into()], start, later);
-        assert_eq!(cache.get(&row, later), ["newer"]);
-        for changed in [
-            Row {
-                user_id: "bob".into(),
-                ..row.clone()
-            },
-            Row {
-                provider_id: "openai".into(),
-                ..row.clone()
-            },
-            Row {
-                base_url: Some("http://127.0.0.1:9877/v1".into()),
-                ..row.clone()
-            },
-            Row {
-                sealed_key: Some(vec![1]),
-                ..row.clone()
-            },
-        ] {
-            assert!(cache.get(&changed, later).is_empty());
-        }
-        assert!(cache.get(&row, later + TTL).is_empty());
-
-        let after_expiry = later + TTL;
-        cache.insert(&row, vec!["oldest".into()], after_expiry, after_expiry);
-        let next = after_expiry + Duration::from_secs(1);
-        for n in 0..MAX_PROFILES {
-            let other = Row {
-                id: format!("pc_{n:032x}"),
-                ..row.clone()
-            };
-            cache.insert(&other, vec!["available".into()], next, next);
-        }
-        assert_eq!(cache.by_id.len(), MAX_PROFILES);
-        assert!(cache.get(&row, next).is_empty());
+        assert!(store::insert(&mut db.lock(), &row, 20).unwrap());
+        store::delete(&db.lock(), &row.user_id, &row.id).unwrap();
+        assert!(
+            merge_chat_listing(&db, row, vec![("x".into(), None)])
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 }

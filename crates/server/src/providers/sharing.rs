@@ -355,6 +355,8 @@ pub struct AvailableModel {
     pub name: String,
     pub model: String,
     pub provider_id: String,
+    /// The provider's display name from the catalog.
+    pub provider_name: String,
     pub capability: Capability,
     pub visibility: Visibility,
     pub owned: bool,
@@ -420,7 +422,7 @@ fn available_entry(
     }
     let chat_models = if row.capability == Capability::Chat {
         let models = match authorize(conn, caller, space, &row.id) {
-            Ok(authorized) => super::turn::models(state, &authorized).unwrap_or_default(),
+            Ok(authorized) => super::turn::models(state, conn, &authorized).unwrap_or_default(),
             Err(_) => vec![],
         };
         // Preserve the omission of unconfigured rows unless the owner has
@@ -437,6 +439,7 @@ fn available_entry(
         name: row.name.clone(),
         model: row.model.clone(),
         provider_id: row.provider_id.clone(),
+        provider_name: entry.name.clone(),
         capability: row.capability,
         visibility,
         owned,
@@ -507,10 +510,95 @@ pub async fn available(
                     visibility,
                 )?);
             }
-            Ok(Some(out))
+            let has_default = store::default_for(&conn, &caller, Capability::Chat)?.is_some();
+            Ok(Some((out, has_default)))
         })
         .await
         .map_err(ApiError::internal)?
         .ok_or_else(no_space)?;
-    Ok(Json(json!({ "models": models })))
+    let (models, has_default) = models;
+    // Ask agent runs the operator's model only for someone without a
+    // default chat connection; it is never a fallback after a failure.
+    let operator = match (&state.config.model, has_default) {
+        (Some(config), false) => Some(config.model.clone()),
+        _ => None,
+    };
+    let chat_providers = group_chat(&models, operator.as_deref());
+    Ok(Json(json!({
+        "models": models,
+        "chat_providers": chat_providers,
+        "operator_model": operator.map(|m| json!({"model_id": m, "label": OPERATOR_LABEL})),
+    })))
+}
+
+/// How pickers label the operator's `METRO_MODEL`.
+pub const OPERATOR_LABEL: &str = "Server model (operator)";
+
+/// Usable chat connections grouped by provider, in listing order (own
+/// first), each with its selectable models; then the operator's model when
+/// it is what Ask agent uses for this person.
+fn group_chat(models: &[AvailableModel], operator: Option<&str>) -> Vec<serde_json::Value> {
+    let mut groups: Vec<(String, String, Vec<serde_json::Value>)> = Vec::new();
+    for m in models {
+        let Some(chat) = m.chat_models.as_ref().filter(|c| !c.is_empty()) else {
+            continue;
+        };
+        let connection = json!({
+            "connection_id": m.connection_id,
+            "name": m.name,
+            "owned": m.owned,
+            "owner_id": m.owner_id,
+            "visibility": m.visibility,
+            "execution": m.execution,
+            "runs_on": m.runs_on,
+            "billing": m.billing,
+            "ready": m.ready,
+            "is_default": m.is_default,
+            "default_model": m.model,
+            "operator": false,
+            "models": chat,
+        });
+        match groups.iter_mut().find(|(id, ..)| *id == m.provider_id) {
+            Some((.., list)) => list.push(connection),
+            None => groups.push((
+                m.provider_id.clone(),
+                m.provider_name.clone(),
+                vec![connection],
+            )),
+        }
+    }
+    let mut out: Vec<serde_json::Value> = groups
+        .into_iter()
+        .map(|(id, name, connections)| {
+            json!({"provider_id": id, "provider_name": name, "connections": connections})
+        })
+        .collect();
+    if let Some(model) = operator {
+        out.push(json!({
+            "provider_id": "operator",
+            "provider_name": OPERATOR_LABEL,
+            "connections": [{
+                "connection_id": null,
+                "name": OPERATOR_LABEL,
+                "owned": false,
+                "owner_id": null,
+                "visibility": null,
+                "execution": "server",
+                "runs_on": "server",
+                "billing": "operator",
+                "ready": true,
+                "is_default": true,
+                "default_model": model,
+                "operator": true,
+                "models": [{
+                    "id": model,
+                    "display_name": model,
+                    "reasoning_efforts": [],
+                    "is_default": true,
+                    "available": true,
+                }],
+            }],
+        }));
+    }
+    out
 }

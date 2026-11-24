@@ -853,6 +853,37 @@ impl DeviceRelay {
         Ok(model_ids(&response))
     }
 
+    /// [`Self::models`] with the catalog name the device reports for each
+    /// model, if any (an optional `"display_names": {ID: NAME}` beside
+    /// `"models"`; names that are not short printable strings are dropped).
+    pub async fn models_named(
+        &self,
+        db: &Db,
+        owner: &str,
+        connection: &str,
+    ) -> Result<Vec<(String, Option<String>)>, DeviceError> {
+        let response = self
+            .dispatch(db, owner, connection, Operation::Models, json!({}))
+            .await?;
+        let names = response.get("display_names").and_then(Value::as_object);
+        Ok(model_ids(&response)
+            .into_iter()
+            .map(|id| {
+                let name = names
+                    .and_then(|n| n.get(&id))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|n| {
+                        !n.is_empty()
+                            && n.chars().count() <= 128
+                            && !n.chars().any(char::is_control)
+                    })
+                    .map(str::to_owned);
+                (id, name)
+            })
+            .collect())
+    }
+
     /// [`Self::models`] for `caller`, who may be borrowing the connection.
     pub async fn models_as(
         &self,
