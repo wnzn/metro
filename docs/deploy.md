@@ -21,11 +21,15 @@ source is for contributors: [development.md](development.md).
 | --- | --- | --- |
 | Server image | GitHub Container Registry | `ghcr.io/wnzn/metro-server:<tag>` |
 | Runner image | GitHub Container Registry | `ghcr.io/wnzn/metro-runner:<tag>` |
-| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases) | `Metro-0.3.0-windows-x64.zip` (+ `.sha256`) |
-| Desktop, Linux x64 | Releases | `Metro-0.3.0-linux-x64.tar.gz` (+ `.sha256`) |
-| Runner, Linux x64 binary | Releases | `Metro-runner-0.3.0-linux-x64.tar.gz` (+ `.sha256`) |
+| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases) | `Metro-0.3.1-windows-x64.zip` (+ `.sha256`), **unsigned** |
+| Desktop, Linux x64 | Releases | `Metro-0.3.1-linux-x64.tar.gz` (+ `.sha256`) |
+| Runner, Linux x64 binary | Releases | `Metro-runner-0.3.1-linux-x64.tar.gz` (+ `.sha256`) |
 
-`<tag>` is the release tag, `v` plus the version (for example `v0.3.0`).
+`<tag>` is the release tag, `v` plus the version (for example `v0.3.1`).
+The Windows files ship without an Authenticode signature until a
+code-signing certificate is set up
+([Windows releases](#windows-releases-signed-or-unsigned)); expect
+SmartScreen warnings, and check them with the Sigstore-signed `SHA256SUMS`.
 CI creates it on the released commit; it's never moved.
 For production, pin images by digest (`…@sha256:…`), not by tag.
 
@@ -263,7 +267,9 @@ To release:
 1. In a pull request, set the new version in both the Cargo workspace
    (`Cargo.toml`, `[workspace.package] version`) and `apps/desktop/nsh.json`.
 2. Merge it into `main`. That push to `main` builds, signs and publishes the
-   release.
+   release. While Windows ships unsigned
+   ([below](#windows-releases-signed-or-unsigned)), "signs" means the
+   Sigstore-signed `SHA256SUMS` and the signed images, not the Windows files.
 3. If the release fails, fix the cause (for example a missing signing
    setting) and **re-run that same workflow run** in GitHub Actions. It
    resumes from the tag it already created. If the fix needs a code change,
@@ -293,7 +299,11 @@ Re-run that run; it still releases. The order, in `release.yml` and then
 
 1. Build and test every platform.
 2. Recheck the version bump and eligibility.
-3. Windows signing and verification.
+3. The Windows gate. With Windows signed: Authenticode signing and
+   verification (`windows-sign.yml`). With Windows unsigned (now): no
+   signing step; the unsigned Windows build was already installed and
+   self-tested natively in step 1, and its ZIP, MSI and scripts go into the
+   release as they are.
 4. Create the immutable `v<version>` tag on exactly that commit, with the
    workflow's own token.
 5. The exact release set: Windows and Linux only, no macOS for now.
@@ -315,7 +325,9 @@ Before the first release, a maintainer sets up:
 - **macOS:** nothing for now. Releases don't build or sign a Mac, and no
   workflow reads the Apple signing secrets. If they're already set, they're
   unused.
-- **Windows:** the `windows-release-signing` environment, with deployment
+- **Windows:** nothing while releases ship Windows unsigned
+  ([below](#windows-releases-signed-or-unsigned)). Before switching to
+  signed: the `windows-release-signing` environment, with deployment
   allowed only from the `main` branch and never from tags (the signing job
   checks this). Reviewers are recommended. It also needs repository
   variables:
@@ -339,6 +351,43 @@ Before the first release, a maintainer sets up:
 
 Never paste a key, certificate, password or token into chat, an issue or a
 log. Enter them only in GitHub's secret and variable settings.
+
+### Windows releases: signed or unsigned
+
+One checked-in file decides how a release ships Windows:
+`packaging/windows-release-signing.txt`. It holds exactly one value line,
+`signed` or `unsigned`; anything else fails the release. Nothing else
+switches it: no variable, input or fallback.
+
+**It says `unsigned` now**, because Metro has no Windows code-signing
+certificate yet. Then a release:
+
+- never calls `windows-sign.yml`, so it reads no signing variable, never
+  requests the `windows-release-signing` environment and requests no OIDC
+  token for Windows;
+- still checks the Windows seed as strictly as a signed release would
+  (`metro-tui.exe` required), and goes ahead only if the unsigned ZIP and
+  MSI pass the same native checks as a test build on a fresh `windows-2025`
+  runner in the same run (MSI install and removal, the MSI lane's upgrade,
+  repair and downgrade tests, and the verifier self-test). Those native
+  checks haven't passed on GitHub yet
+  ([install.md](install.md#desktop-on-windows));
+- ships `Metro-<version>-windows-x64.zip` (its `RELEASE.json` says
+  `unsigned-preview` and names the commit),
+  `Metro-<version>-windows-x64.unsigned-preview.msi`, their `.sha256` files
+  and the two unsigned `.ps1` scripts, all listed in the Sigstore-signed
+  `SHA256SUMS`;
+- says in its release notes that the Windows files aren't code-signed, that
+  SmartScreen and "Unknown publisher" warnings are expected, and how to
+  check them with `SHA256SUMS` and Sigstore.
+
+**To sign again,** set up a backend and the environment as described above
+(a CA certificate in an HSM or KSP works through the `kms` backend), then
+change the value line to `signed` in a pull request. Signed releases fail
+closed exactly as before: without `METRO_WINDOWS_SIGNING_BACKEND` set to
+`azure` or `kms`, or without the environment, `windows-sign.yml` stops the
+release before the tag, and nothing falls back to unsigned. Bump the version
+in the same or a later pull request, because only a version bump releases.
 
 ## Trust boundaries
 

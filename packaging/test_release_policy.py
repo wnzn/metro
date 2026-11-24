@@ -10,6 +10,7 @@ import sys
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import release_policy as rp
 
@@ -132,14 +133,26 @@ class VersionTests(unittest.TestCase):
                     rp.read_version(Path(d))
 
     def test_expected_assets_are_the_signers_set(self):
-        names = rp.expected_assets(V)
-        self.assertIn(f"Metro-{V}-windows-x64.msi", names)
-        self.assertIn(f"Metro-{V}-linux-x64.tar.gz.sha256", names)
-        self.assertIn(f"Metro-{V}-windows-x64.zip.sha256", names)
-        self.assertFalse(any("macos" in n for n in names))  # macOS builds are off for now: Windows and Linux only
-        self.assertIn("SHA256SUMS.sigstore.json", names)
-        self.assertIn("IMAGES.txt", names)
-        self.assertNotIn(f"Metro-{V}-windows-x64.unsigned-preview.msi", names)
+        signatures = rp.release_signatures
+        for mode, msi, other in (("signed", f"Metro-{V}-windows-x64.msi", f"Metro-{V}-windows-x64.unsigned-preview.msi"),
+                                 ("unsigned", f"Metro-{V}-windows-x64.unsigned-preview.msi", f"Metro-{V}-windows-x64.msi")):
+            with self.subTest(mode), mock.patch.object(signatures, "windows_signing", return_value=mode):
+                names = rp.expected_assets(V)
+                self.assertIn(msi, names)
+                self.assertIn(msi + ".sha256", names)
+                self.assertNotIn(other, names)
+                self.assertIn(f"Metro-{V}-linux-x64.tar.gz.sha256", names)
+                self.assertIn(f"Metro-{V}-windows-x64.zip", names)  # the ZIP keeps its name either way
+                self.assertIn(f"Metro-{V}-windows-x64.zip.sha256", names)
+                self.assertFalse(any("macos" in n for n in names))  # macOS builds are off for now
+                self.assertIn("SHA256SUMS.sigstore.json", names)
+                self.assertIn("IMAGES.txt", names)
+                self.assertEqual(names, signatures.binaries(V, mode) | signatures.INSTALLERS
+                                 | {f"{n}.sha256" for n in signatures.binaries(V, mode)}
+                                 | {"SHA256SUMS", "IMAGES.txt", "SHA256SUMS.sigstore.json",
+                                    f"Metro-{V}-linux-x64.tar.gz.sigstore.json",
+                                    f"Metro-runner-{V}-linux-x64.tar.gz.sigstore.json"})
+
 
     def test_prior_version_comes_from_the_push_before_commit_not_working_tree(self):
         with tempfile.TemporaryDirectory() as d:
@@ -160,6 +173,55 @@ class VersionTests(unittest.TestCase):
             for before in (None, "", "0" * 40, "HEAD", good.upper(), good[:12], good + "\n", OTHER):
                 with self.subTest(before=before):
                     self.assertIsNone(rp.previous_version(before, root))
+
+class WindowsSigningSwitchTests(unittest.TestCase):
+    """packaging/windows-release-signing.txt: an explicit, checked-in choice, never a fallback."""
+
+    def test_checked_in_value_is_unsigned_for_now(self):
+        self.assertEqual(rp.release_signatures.windows_signing(), "unsigned")
+        r = subprocess.run([sys.executable, "-I", str(HERE / "release_policy.py"), "windows-signing"],
+                           env={"PATH": os.environ["PATH"]}, capture_output=True, text=True)
+        self.assertEqual((r.returncode, r.stdout), (0, "windows_signing=unsigned\n"), r.stderr)
+
+    def test_only_one_exact_value_is_accepted(self):
+        parse = rp.release_signatures.parse_windows_signing
+        self.assertEqual(parse("# comment\nsigned\n"), "signed")
+        self.assertEqual(parse("unsigned\r\n"), "unsigned")
+        for text in ("", "# only a comment\n", "Signed\n", "yes\n", "signed\nunsigned\n", "signed unsigned\n",
+                     "azure\n", "kms\n", "unsigned-preview\n"):
+            with self.subTest(text=text), self.assertRaisesRegex(rp.release_signatures.ReleaseError, "exactly one"):
+                parse(text)
+
+    def test_missing_or_invalid_switch_fails_every_release_command(self):
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "windows-release-signing.txt"
+            for content in (None, "maybe\n"):
+                if content is not None:
+                    path.write_text(content)
+                with self.subTest(content=content), \
+                        mock.patch.object(rp.release_signatures, "WINDOWS_SIGNING_FILE", path):
+                    with self.assertRaises(rp.release_signatures.ReleaseError if content else OSError):
+                        rp.expected_assets(V)
+                    with self.assertRaises((rp.release_signatures.ReleaseError, OSError)):
+                        rp.release_notes(V, SHA)
+
+    def test_release_notes_say_plainly_that_windows_is_unsigned(self):
+        signed, unsigned = rp.release_notes(V, SHA, "signed"), rp.release_notes(V, SHA, "unsigned")
+        self.assertTrue(signed.endswith(f"<!-- metro-release: {SHA} -->"))
+        self.assertTrue(unsigned.endswith(f"<!-- metro-release: {SHA} -->"))
+        self.assertNotIn("not code-signed", signed)
+        for needle in ("The Windows downloads are not code-signed", f"Metro-{V}-windows-x64.zip",
+                       f"Metro-{V}-windows-x64.unsigned-preview.msi", "SmartScreen", "Unknown publisher",
+                       "SHA256SUMS.sigstore.json", "cosign verify-blob",
+                       "sign-release-assets.yml@refs/heads/main", "--certificate-github-workflow-ref refs/heads/main",
+                       f"--certificate-github-workflow-sha {SHA}", "Get-FileHash",
+                       "sha256sum -c --ignore-missing SHA256SUMS", "docs/install.md#check-a-download"):
+            self.assertIn(needle, unsigned)
+        with self.assertRaisesRegex(rp.PolicyError, "unknown Windows signing mode"):
+            rp.release_notes(V, SHA, "maybe")
+        # Without an explicit mode the notes follow the checked-in switch.
+        self.assertEqual(rp.release_notes(V, SHA), unsigned)
+
 
 
 class ProvenanceTests(unittest.TestCase):
@@ -484,6 +546,7 @@ class CliTests(unittest.TestCase):
                 r = self.run_cli("decide", env=env)
                 self.assertEqual(r.returncode, 0, r.stderr)
                 self.assertIn(f"release=false\nstate={state}\nversion={version}\n", r.stdout)
+                self.assertIn("windows_signing=unsigned\n", r.stdout)
                 for command in (f"authorize --version {version}", f"tag --version {version}"):
                     r = self.run_cli(*command.split(), env=env)
                     self.assertEqual(r.returncode, 1, command)
@@ -502,6 +565,8 @@ class CliTests(unittest.TestCase):
             script.write_bytes((HERE / "release_policy.py").read_bytes())
             (root / "packaging/release-signatures/release_signatures.py").write_bytes(
                 (HERE / "release-signatures/release_signatures.py").read_bytes())
+            (root / "packaging/windows-release-signing.txt").write_bytes(
+                (HERE / "windows-release-signing.txt").read_bytes())
             subprocess.run(["git", "init", "-q", d], check=True)
             shas = []
             for version in (PREV, V):

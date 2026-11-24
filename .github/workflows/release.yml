@@ -2,8 +2,10 @@ name: Release artifacts
 
 # Reusable, read-only platform build and smoke gates. PRs and main pushes that
 # do not release get preview artifacts only. An eligible protected main push (a
-# version bump) instead hands off the verified Windows ZIP seed and the Linux
-# archives. No job in this tree can sign with credentials or publish.
+# version bump) instead hands off the Linux archives and, per
+# packaging/windows-release-signing.txt, either the verified Windows ZIP seed
+# for signing (signed) or the natively tested unsigned Windows build
+# (unsigned). No job in this tree can sign with credentials or publish.
 #
 # macOS builds are off for now, for every event: GitHub's macOS runners queued
 # for 15+ minutes and the jobs were cancelled. The macOS packaging code stays
@@ -624,10 +626,14 @@ jobs:
   # Windows distribution (owned by the Windows lane): turns the seed into the
   # ZIP, the MSI and the two PowerShell scripts, the ZIP and MSI each with a
   # .sha256. Pull requests and main pushes without a release: uploaded as
-  # dist-desktop-windows-x64 (unsigned preview). Official main release: uploaded as unsigned-desktop-windows-x64 for
-  # windows-sign.yml in release-publish.yml, the only place that may hold
-  # id-token: write. This call grants contents: read only, so nothing in its
-  # tree may request more (GitHub checks nested permissions before any `if:`).
+  # dist-desktop-windows-x64 (unsigned preview). Official main release, signed
+  # (packaging/windows-release-signing.txt): the seed is uploaded as
+  # unsigned-desktop-windows-x64 for windows-sign.yml in release-publish.yml,
+  # the only place that may hold id-token: write. Official main release,
+  # unsigned: the same unsigned build as a preview, tested natively, uploaded
+  # as dist-desktop-windows-x64 for release-publish.yml. This call grants
+  # contents: read only, so nothing in its tree may request more (GitHub
+  # checks nested permissions before any `if:`).
   windows-distribution:
     needs: [meta, desktop-windows]
     uses: ./.github/workflows/windows-distribution.yml

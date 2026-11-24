@@ -76,6 +76,16 @@ sh install-metro-linux.sh check-deps [--install-deps]
 There are two Windows downloads with the same app inside: the per-user
 **MSI** and the **portable ZIP**.
 
+**Releases ship Windows unsigned for now.** Metro doesn't have a Windows
+code-signing certificate yet, so the release's ZIP, MSI and `.ps1` scripts
+carry no Authenticode signature. Windows SmartScreen warnings and an
+"Unknown publisher" prompt are expected. Check every Windows download
+against the Sigstore-verified `SHA256SUMS` before you run it
+([check a download](#check-a-download)). The checked-in switch
+`packaging/windows-release-signing.txt` says `unsigned`; signed releases
+come back once a certificate is set up and it says `signed`
+([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
+
 **Not verified on native Windows.** The MSI's native Windows Installer
 checks are written for a Windows CI runner but haven't passed there yet,
 and its wizard hasn't been seen on screen. Its install, upgrade and removal
@@ -83,7 +93,7 @@ were checked only under Wine on Linux, which has its own Windows Installer
 ([MSI notes](../packaging/windows-msi/README.md)). Every other Windows check
 so far also ran under Wine ([acceptance.md](acceptance.md)).
 
-### The MSI (`Metro-<version>-windows-x64.msi`)
+### The MSI
 
 - **Per user.** No administrator rights are needed when the folder you pick
   is writable by you. The setup window uses Windows' own Segoe UI font.
@@ -97,11 +107,13 @@ so far also ran under Wine ([acceptance.md](acceptance.md)).
   **Settings → Apps → Installed apps**. Removal deletes only what it
   installed, so files you added stay, and your data in
   `%LOCALAPPDATA%\Metro\Desktop` is never touched.
-- **Test or public.** A test build's MSI is named
-  `Metro-<version>-windows-x64.unsigned-preview.msi`. It installs as
-  "Metro (unsigned preview)" and warns on its first page. It isn't signed,
-  so Windows SmartScreen may warn about it. Only a public release has
-  `Metro-<version>-windows-x64.msi`, signed with Authenticode ([check
+- **Its name says whether it's signed.** An unsigned MSI is named
+  `Metro-<version>-windows-x64.unsigned-preview.msi`, in test builds and,
+  for now, in releases too. It installs as "Metro (unsigned)", and its
+  first page says the build isn't code-signed, that Windows may warn about
+  an unknown publisher, and to check the file against its SHA-256 checksum
+  (`SHA256SUMS`) before installing. Windows SmartScreen may warn about it. Only a signed release
+  has `Metro-<version>-windows-x64.msi`, signed with Authenticode ([check
   it](#check-a-download)). No public MSI exists yet.
 
 ### The portable ZIP and `install-metro-windows.ps1`
@@ -120,10 +132,10 @@ The ZIP runs from any folder you extract it to
   for you, the script refuses `Install` and `Update` and tells you to update
   or remove Metro with the MSI instead. It never installs a second copy or
   changes the MSI's.
-- In a test build the script is the unsigned source copy, so Windows
-  PowerShell's execution policy may refuse to run it. A public release's
-  copy is Authenticode signed. Don't weaken or bypass your execution policy
-  for Metro.
+- In a test build, and in a release while Windows ships unsigned, the
+  script is the unsigned source copy, so Windows PowerShell's execution
+  policy may refuse to run it. A signed release's copy is Authenticode
+  signed. Don't weaken or bypass your execution policy for Metro.
 
 ## Desktop on macOS
 
@@ -296,9 +308,9 @@ that.
 
 > **No public release exists yet.** The process below is in the source
 > (policy `1b3edab`, Windows and images `1cb6094`, Sigstore `2cfdc24`, MSI
-> `f642616` and `6171c75`). It hasn't run on GitHub with real credentials,
-> and the signing setup it needs isn't configured yet
-> ([deploy.md](deploy.md#ci-and-publishing)).
+> `f642616` and `6171c75`). It hasn't run on GitHub with real credentials.
+> There's no Windows code-signing setup, so releases ship Windows unsigned
+> for now ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 
 Releases are made by CI, not by hand. A release starts only from a
 **protected, non-deleted, non-forced push to the `main` branch** of
@@ -313,8 +325,10 @@ workspace and the desktop app's `nsh.json` must name the same version.
 - **A new version is released once.** A bump to a version that's already
   in use, or that finds a conflicting tag, fails instead.
 - **The tag is immutable.** CI creates `v<version>` on exactly that commit
-  after the tests, the platform checks, and Windows signing and verification.
-  It's never moved.
+  after the tests, the platform checks, and the Windows gate: Windows
+  signing and verification, or, while Windows ships unsigned, the native
+  install and self-test of the unsigned Windows build in the same run. It's
+  never moved.
 - **Then:** every file is checked, the GHCR
   images are pushed and signed, and `SHA256SUMS` is signed with Sigstore.
 - **Publishing is automatic.** CI uploads the files and checks every digest
@@ -332,7 +346,8 @@ workspace and the desktop app's `nsh.json` must name the same version.
 - The desktop archives `Metro-X.Y.Z-linux-x64.tar.gz` and
   `Metro-X.Y.Z-windows-x64.zip`, each with `metro-tui` inside. There's no
   macOS archive for now ([macOS](#desktop-on-macos)).
-- `Metro-X.Y.Z-windows-x64.msi`.
+- The MSI: `Metro-X.Y.Z-windows-x64.unsigned-preview.msi` while Windows
+  ships unsigned (now), `Metro-X.Y.Z-windows-x64.msi` once it's signed.
 - The runner archive `Metro-runner-X.Y.Z-linux-x64.tar.gz`.
 - A `.sha256` beside each archive and the MSI.
 - The five installer scripts (all except `install-metro-macos.sh`).
@@ -363,16 +378,26 @@ workspace and the desktop app's `nsh.json` must name the same version.
    --version X.Y.Z --revision "$commit" SHA256SUMS` runs the same check. It
    also checks the certificate's repository, branch, trigger and workflow
    fields.
-2. **Windows.** Right-click the MSI or `Metro.exe` → **Properties → Digital
-   Signatures**. The signer must be the publisher named in the release
-   notes, with a timestamp. Or, in PowerShell,
-   `Get-AuthenticodeSignature .\Metro-X.Y.Z-windows-x64.msi` should say
-   `Valid` with that publisher. The publisher isn't known yet; it's the
-   validated name on the certificate the maintainers obtain. The release
-   copies of the two PowerShell scripts are signed too, so a policy that
-   requires signed scripts (`RemoteSigned` or `AllSigned`) can run them.
-   SmartScreen may still warn about a new publisher until it builds
-   reputation, which signing alone doesn't guarantee.
+2. **Windows.**
+   - **Unsigned release (now).** There's no Authenticode signature to check,
+     so step 1 is the check: after `SHA256SUMS` verifies with cosign, compare
+     each Windows file with it. In PowerShell,
+     `(Get-FileHash .\Metro-X.Y.Z-windows-x64.zip -Algorithm SHA256).Hash`
+     prints the hash in capitals; ignoring case, it must equal the hash on
+     that file's line in `SHA256SUMS`. The ZIP's `RELEASE.json` says `"mode": "unsigned-preview"` and
+     names the release commit under `signing.commit`. Expect SmartScreen
+     and an "Unknown publisher" prompt; `Get-AuthenticodeSignature` reports
+     `NotSigned`.
+   - **Signed release (later).** Right-click the MSI or `Metro.exe` →
+     **Properties → Digital Signatures**. The signer must be the publisher
+     named in the release notes, with a timestamp. Or, in PowerShell,
+     `Get-AuthenticodeSignature .\Metro-X.Y.Z-windows-x64.msi` should say
+     `Valid` with that publisher. The publisher isn't known yet; it's the
+     validated name on the certificate the maintainers obtain. The release
+     copies of the two PowerShell scripts are signed too, so a policy that
+     requires signed scripts (`RemoteSigned` or `AllSigned`) can run them.
+     SmartScreen may still warn about a new publisher until it builds
+     reputation, which signing alone doesn't guarantee.
 3. **Images.** `IMAGES.txt` lists each image by digest:
    `ghcr.io/wnzn/metro-server` and `ghcr.io/wnzn/metro-runner` for
    `linux/amd64` and `linux/arm64`, and the optional media image

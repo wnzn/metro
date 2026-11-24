@@ -5,7 +5,35 @@ This folder holds the helpers behind two reusable workflows:
 - `.github/workflows/windows-distribution.yml`, which runs on every build and
   never signs anything;
 - `.github/workflows/windows-sign.yml`, which runs only for an official
-  release from `main` (a version bump) and signs.
+  release from `main` (a version bump) while
+  `packaging/windows-release-signing.txt` says `signed`, and signs.
+
+## Release mode: signed or unsigned
+
+`packaging/windows-release-signing.txt` holds exactly one value line,
+`signed` or `unsigned`. `release_signatures.windows_signing()` reads it for
+`release_policy.py` (`windows-signing`, and the `windows_signing` output of
+`decide` and `authorize`), `release_assets.py` and `release_signatures.py`;
+any other content fails. No variable, input or environment can change it.
+
+**It says `unsigned` now**, because there's no Windows code-signing
+certificate yet. An official release then:
+
+- verifies the seed in official mode (all four EXEs, `metro-tui.exe`
+  included) and builds the same unsigned distribution as a preview, from the
+  same seed matched by hash, with the MSI built with
+  `--require-file metro-tui.exe`;
+- runs the `preview` job's native checks and self-test on it, and uploads
+  `dist-desktop-windows-x64` from there;
+- never calls `windows-sign.yml`: no signing variable, no
+  `windows-release-signing` environment and no OIDC token for Windows.
+
+To sign again, do the [repository setup](#repository-setup-for-official-releases)
+(a CA certificate in an HSM or KSP fits the `kms` backend), then change the
+value line to `signed` in a pull request. Signed mode keeps failing closed:
+`guard` refuses unless the file says `signed` and
+`METRO_WINDOWS_SIGNING_BACKEND` is `azure` or `kms`, and nothing falls back to
+unsigned.
 
 ## Official release context
 
@@ -28,7 +56,8 @@ commit must equal `github.sha`. The push event payload must agree on the
 The rules are in `winsign.py release-context`, together with their negative
 tests. The following places check them:
 
-- the `seed` job of `windows-distribution.yml`, before the hand-off
+- the `seed` job of `windows-distribution.yml`, before the hand-off or the
+  unsigned release build
 - the `guard` job of `windows-sign.yml`
 - a job-level `if:` on `sign` and `sign-msi`, so no runner (self-hosted
   included) is assigned outside this context
@@ -70,22 +99,34 @@ synthetic signatures on real 0.2.0 binaries.
   self-tests them. No environment, variable, OIDC token or self-hosted runner
   is used.
 - **`release: true`**: allowed only in the official release context above.
-  The seed is verified in official mode, which requires `metro-tui.exe`, and
-  then exactly the seed ZIP and its `.sha256` are uploaded as
-  `unsigned-desktop-windows-x64`. This mode is still read-only.
-- **Outputs:** `mode` and `seed-sha256`.
+  The seed is verified in official mode, which requires `metro-tui.exe`.
+  Then, as `packaging/windows-release-signing.txt` says:
+  - `signed` (output `mode` `official`): exactly the seed ZIP and its
+    `.sha256` are uploaded as `unsigned-desktop-windows-x64` for
+    `windows-sign.yml`.
+  - `unsigned` (output `mode` `unsigned-release`): the same seed, checked
+    again in preview mode with the same hash, goes through the
+    `release: false` path above, and the `preview` job uploads the same six
+    files as `dist-desktop-windows-x64`. The MSI always requires
+    `metro-tui.exe`.
+
+  This mode is still read-only.
+- **Outputs:** `mode` (`preview`, `official` or `unsigned-release`) and
+  `seed-sha256`.
 
 ### `windows-sign.yml`
 
 - **Inputs:** `version` only.
 - **Caller:** called only by `release-publish.yml`, only in the official
-  release context, with `permissions: { contents: read, id-token: write }`.
+  release context and only when `packaging/windows-release-signing.txt` says
+  `signed`, with `permissions: { contents: read, id-token: write }`.
   It must run in the same workflow run as `windows-distribution.yml`
   (`release: true`), because it downloads `unsigned-desktop-windows-x64`
   without a run id.
 - **Jobs:**
   - `guard`: runs on hosted Ubuntu with no credentials. It checks the release
-    context and the backend, then verifies the hand-off again.
+    context, that the switch says `signed`, and the backend, then verifies
+    the hand-off again.
   - `sign`: runs in the `windows-release-signing` environment with
     `id-token: write`. It signs `Metro.exe`, `metro-server.exe`,
     `metro-tui.exe`, `ui/Metro.exe`, `install-metro-windows.ps1` and
@@ -182,8 +223,8 @@ Internal artifacts, kept for three days and never named `dist-*`:
 - **MSI.**
   - **Before signing (Linux):** the MSI lane's own inspection runs, and
     `winsign.py msi-state` confirms the MSI has no signature.
-  - **On Windows:** the unsigned preview, or the official MSI after signing,
-    goes through these checks:
+  - **On Windows:** the unsigned MSI (test builds and unsigned releases),
+    or the official MSI after signing, goes through these checks:
     - The MSI has no rows in `MsiEmbeddedUI`,
       `MsiEmbeddedChainer`, `ServiceInstall`, `ServiceControl`, `SelfReg` or
       `MsiDigitalSignature`.
@@ -207,10 +248,10 @@ Internal artifacts, kept for three days and never named `dist-*`:
   the MSI signature. Both verifiers must reject the throwaway signature, and
   tampering must show as `HashMismatch`. The certificate is removed
   afterwards, and nothing from the self-test is uploaded. The self-test runs
-  only in the preview job (never when `release` is true). It refuses to run
-  unless that job sets `METRO_WINDOWS_SELF_TEST=preview`, for tags, and in
-  any job that can request a GitHub OIDC token. It doesn't exist in
-  `windows-sign.yml`.
+  only in the preview job, for previews and unsigned releases (never for a
+  signed release). It refuses to run unless that job sets
+  `METRO_WINDOWS_SELF_TEST=preview`, for tags, and in any job that can
+  request a GitHub OIDC token. It doesn't exist in `windows-sign.yml`.
 
 ## MSI lane interface (`packaging/windows-msi`)
 
@@ -237,6 +278,9 @@ pwsh -File packaging/windows-msi/test-msi-windows.ps1 -FixturesDir "$FIXTURES" -
     installed.
 
 ## Repository setup for official releases
+
+Needed only for signed releases. While `packaging/windows-release-signing.txt`
+says `unsigned`, none of this is read.
 
 All of these are **variables**, not secrets. No secret is needed.
 
@@ -340,6 +384,9 @@ you. The workflow, the verifiers and the release output are the same for both.
 
 ## Not covered or not verified yet
 
+- **Releases ship Windows unsigned for now.** The unsigned release path is
+  covered by the contract tests in `packaging/` and `test_winsign.py`; it
+  runs for real only on a version bump pushed to `main`.
 - **No real signing has run.** No release certificate exists in this
   repository. The official path, both backends, SignTool's handling of the LF
   ASCII `.ps1` files, and the trust checks on a hosted VM have never been run.

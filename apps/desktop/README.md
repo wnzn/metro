@@ -546,11 +546,11 @@ contributors only, in
 
 The release file will be `Metro-<version>-windows-x64.zip`, a portable build
 with no installer. The package recorded so far was built locally as
-`Metro-windows-x64.zip`. It isn't signed or published yet, and it hasn't been started on native Windows. The 0.2.0 candidate has only been started under Wine. Its
+`Metro-windows-x64.zip`. It isn't published yet, and release ZIPs ship without an Authenticode signature for now ([install.md](../../docs/install.md#desktop-on-windows)). It hasn't been started on native Windows. The 0.2.0 candidate has only been started under Wine. Its
 checks are in [acceptance](../../docs/acceptance.md#verified-windows-x64-portable-package-built-on-linux-2026-11-22-packaging-local).
 
 1. Check the ZIP against its `.sha256` file, for example with
-   `Get-FileHash Metro-0.3.0-windows-x64.zip -Algorithm SHA256` in PowerShell.
+   `Get-FileHash Metro-<version>-windows-x64.zip -Algorithm SHA256` in PowerShell.
 2. Extract the **whole** ZIP. Don't run the app from inside the archive.
 3. Run `Metro\Metro.exe`. Keep the `nsh` folder next to it, because it holds
    the app bundle.

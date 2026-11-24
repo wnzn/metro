@@ -8,8 +8,7 @@ the release folder with SHA256SUMS:
     `release` mode, none for now: see MACOS); the Linux runner archive; each
     with its .sha256
   - the Windows MSI and its .sha256, and the two PowerShell scripts, exactly as
-    windows-distribution.yml produced them (signed on tags; never replaced by
-    checkout copies)
+    the Windows lane produced them (never replaced by checkout copies)
   - the shell installers from this checkout (install-metro-macos.sh only in
     release mode, next to notarized macOS archives, so not for now)
 
@@ -17,10 +16,21 @@ Every archive is opened and checked against its sidecar and RELEASE.json.
 Release mode also requires: the metro-tui terminal client in every desktop
 archive (named by RELEASE.json "tui"), every macOS archive (if any) notarized, stapled Developer ID
 builds per RELEASE.json (the native macOS gate already verified the real
-signature and ticket), and an Authenticode signature present on every Windows
-executable, the MSI and both .ps1 scripts (validity is checked natively by the
-Windows signer). Anything else in the input, such as an ad hoc preview or an
-unsigned seed, is refused.
+signature and ticket), and Windows as packaging/windows-release-signing.txt
+says:
+
+  signed    an Authenticode signature present on every Windows executable, the
+            MSI and both .ps1 scripts (validity is checked natively by
+            windows-sign.yml), RELEASE.json signing mode "authenticode", and
+            the MSI named Metro-<v>-windows-x64.msi;
+  unsigned  windows-distribution.yml's natively tested unsigned build, labelled
+            as such: RELEASE.json signing mode "unsigned-preview" with the
+            commit it was built from, no signature in the MSI, the .ps1
+            scripts exactly this checkout's, and the MSI named
+            Metro-<v>-windows-x64.unsigned-preview.msi.
+
+Anything else in the input, such as an ad hoc preview, or a Windows build that
+doesn't match the checked-in mode, is refused.
 
 The output is the `release-assets` artifact that sign-release-assets.yml
 (release_signatures.py prepare) takes as is: SHA256SUMS lists every file except
@@ -34,10 +44,13 @@ from pathlib import Path
 import re
 import shutil
 import struct
+import sys
 import tarfile
 import zipfile
 
 HERE = Path(__file__).resolve().parent
+sys.path.insert(0, str(HERE / "release-signatures"))
+import release_signatures  # noqa: E402  (the checked-in Windows signing mode and the signer's names)
 # The Macs a release ships: none for now. macOS builds are off in CI (GitHub's
 # macOS runners queued for 15+ minutes and jobs were cancelled; see
 # release.yml). The macOS checks below stay for when they return
@@ -75,18 +88,26 @@ def sha256(path):
 class Layout:
     """The file names of one release (or pull-request preview) folder."""
 
-    def __init__(self, version, mode):
+    def __init__(self, version, mode, windows=None):
         require(VERSION.fullmatch(version), f"bad version {version!r}")
         require(mode in ("release", "smoke"), f"bad mode {mode!r}")
         require(mode == "smoke" or not version.endswith("-ci"), "release mode needs a tag version")
         self.version, self.mode = version, mode
+        # Previews are always unsigned; a release follows the checked-in switch.
+        if mode == "smoke":
+            require(windows in (None, "unsigned"), "previews are never signed")
+            windows = "unsigned"
+        elif windows is None:
+            windows = release_signatures.windows_signing()
+        require(windows in release_signatures.WINDOWS_SIGNING_MODES, f"bad Windows signing mode {windows!r}")
+        self.windows_signed = windows == "signed"
         desktop = DESKTOP + (MACOS if mode == "release" else ())
         self.archives = {f"Metro-{version}-{t}{'.zip' if t == 'windows-x64' else '.tar.gz'}": ("desktop", t)
                          for t in desktop}
         self.archives[f"Metro-runner-{version}-linux-x64.tar.gz"] = ("runner", "linux-x64")
-        # windows-distribution.yml names its unsigned preview MSI distinctly; only
-        # windows-sign.yml produces the release name.
-        self.msi = f"Metro-{version}-windows-x64{'.msi' if mode == 'release' else '.unsigned-preview.msi'}"
+        # windows-distribution.yml names its unsigned MSI distinctly (previews and
+        # unsigned releases); only windows-sign.yml produces the signed name.
+        self.msi = release_signatures.windows_msi(version, windows)
         self.ps1 = PS1_SCRIPTS
         self.sh = SH_SCRIPTS + ((MACOS_SCRIPT,) if mode == "release" and MACOS else ())
 
@@ -150,7 +171,9 @@ def ps1_signed(data, source):
     return data.startswith(source) and bool(SIG_BLOCK.fullmatch(data[len(source):]))
 
 
-def check_archive(path, version, kind, target, release):
+def check_archive(path, version, kind, target, release, windows_signed=None):
+    windows_signed = release if windows_signed is None else windows_signed
+    require(release or not windows_signed, "previews are never signed")
     top = path.name.removesuffix(".zip").removesuffix(".tar.gz")
     files = members(path)
     require(all(n.startswith(top + "/") and ".." not in n.split("/") for n in files),
@@ -182,10 +205,16 @@ def check_archive(path, version, kind, target, release):
         # windows-distribution.yml / windows-sign.yml: {"signing": {"mode": ...}} (absent in old seeds).
         mode = (manifest.get("signing") or {}).get("mode") if isinstance(manifest.get("signing"), dict) else \
             manifest.get("signing")
-        require(mode == "authenticode" if release else mode in (None, "unsigned-preview"),
-                f"{path.name}: RELEASE.json signing mode {mode!r} is not "
-                + ("authenticode" if release else "an unsigned preview"))
-        if release:
+        if windows_signed:
+            ok, want = mode == "authenticode", "authenticode"
+        elif release:  # an unsigned release: labelled, and traceable to the commit it was built from
+            signing = manifest["signing"] if isinstance(manifest.get("signing"), dict) else {}
+            ok = mode == "unsigned-preview" and bool(re.fullmatch(r"[0-9a-f]{40}", str(signing.get("commit", ""))))
+            want = "unsigned-preview with its commit"
+        else:
+            ok, want = mode in (None, "unsigned-preview"), "an unsigned preview"
+        require(ok, f"{path.name}: RELEASE.json signing mode {mode!r} is not {want}")
+        if windows_signed:
             code = [n for n in files if n.lower().endswith((".exe", ".dll"))]
             require(code, f"{path.name}: no Windows executables")
             unsigned = [n.split("/", 1)[1] for n in code if not authenticode_present(files[n])]
@@ -208,18 +237,20 @@ def check_windows_extras(folder, layout, scripts_dir=HERE):
     require(msi[:8] == b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1", f"{layout.msi} is not an MSI (OLE) file")
     for script in layout.ps1:
         data, source = (folder / script).read_bytes(), (scripts_dir / script).read_bytes()
-        if layout.mode == "release":
+        if layout.windows_signed:
             require(ps1_signed(data, source), f"{script} is not this checkout's script plus one Authenticode block")
         else:
             require(data == source, f"{script} differs from this checkout's script")
-    if layout.mode == "release":
+    if layout.windows_signed:
         require(MSI_SIGNATURE in msi, f"{layout.msi} is not Authenticode signed")
+    elif layout.mode == "release":  # labelled unsigned, so it must really be unsigned
+        require(MSI_SIGNATURE not in msi, f"{layout.msi} is named unsigned but carries a signature")
 
 
 def check_contents(folder, layout):
     for name, (kind, target) in layout.archives.items():
         check_sidecar(folder / name)
-        check_archive(folder / name, layout.version, kind, target, layout.mode == "release")
+        check_archive(folder / name, layout.version, kind, target, layout.mode == "release", layout.windows_signed)
     check_windows_extras(folder, layout)
 
 
@@ -288,7 +319,8 @@ def main():
         else:
             verify(args.version, args.mode, args.release)
             print(f"release folder for {args.version} ({args.mode}) verified")
-    except (OSError, ValueError, KeyError, tarfile.TarError, zipfile.BadZipFile, AssetError) as error:
+    except (OSError, ValueError, KeyError, tarfile.TarError, zipfile.BadZipFile, AssetError,
+            release_signatures.ReleaseError) as error:
         parser.exit(1, f"release_assets: {error}\n")
 
 

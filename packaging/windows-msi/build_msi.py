@@ -55,6 +55,8 @@ from xml.sax.saxutils import escape, quoteattr
 HERE = Path(__file__).resolve().parent
 LOCK = HERE / "wixl-lock.json"
 UI_WXS = HERE / "metro-ui.wxs"
+# ProductName suffix of an unsigned (--preview) build; MsiHarness.ps1 checks the same name.
+UNSIGNED_SUFFIX = " (unsigned)"
 EXT_DIR = HERE / "wixl-ext"
 APP_ICON = HERE.parents[1] / "apps/desktop/assets/metro.ico"
 SETUP_MARK = "MetroSetupMark"
@@ -504,9 +506,11 @@ def product_wxs(identity, semver, pv, entries, files_root, marker_path, preview)
     root_names = set()
     default_dir = msi_name(idn["default_dir"], "root:" + idn["default_dir"], root_names)
     data_dir = idn["data_dir"]
-    pname = idn["product_name"] + (" (unsigned preview)" if preview else "")
+    # Unsigned builds (pull request previews and, while packaging/windows-release-signing.txt
+    # says unsigned, official releases): wording that is true for both.
+    pname = idn["product_name"] + (UNSIGNED_SUFFIX if preview else "")
     comments = (f"{idn['product_name']} {semver}" +
-                (". UNSIGNED LOCAL PREVIEW: not a Metro release, not Authenticode signed." if preview else ""))
+                (". Unsigned build: not Authenticode signed; check it against its SHA-256 checksum." if preview else ""))
     legacy = idn["legacy_key"]
 
     def ca(id_, prop, value):
@@ -838,7 +842,7 @@ def inspect(tools, msi, semver, payload=None, preview=False, identity="release",
     check(prop.get("UpgradeCode") == idn["upgrade_code"], "UpgradeCode mismatch")
     check(prop.get("MetroSemver") == semver, "MetroSemver mismatch")
     check(prop.get("MetroPreview") == ("1" if preview else "0"), "preview flag mismatch")
-    check(("unsigned preview" in prop.get("ProductName", "")) == preview, "preview name mismatch")
+    check(prop.get("ProductName", "").endswith(UNSIGNED_SUFFIX) == preview, "preview name mismatch")
     for p in ("ALLUSERS", "MSIINSTALLPERUSER", "LOCALRUNNER", "STARTMENUSHORTCUT", "LRBOX", "SCBOX", "INSTALLDIR"):
         check(p not in prop, f"Property table must not preset {p}")
     check(prop.get("WIXUI_INSTALLDIR") == "INSTALLDIR", "WIXUI_INSTALLDIR must name INSTALLDIR")

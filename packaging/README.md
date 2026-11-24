@@ -153,22 +153,35 @@ Only a push to `main` that changes the version releases.
 No workflow reads a repository secret. Windows signing, images, the tag and
 Sigstore use GitHub OIDC and the workflow's own token.
 
+How a release ships Windows is the checked-in
+`windows-release-signing.txt`: `signed` or `unsigned`, nothing else. It says
+**`unsigned`** for now (no certificate yet); see
+[docs/deploy.md](../docs/deploy.md#windows-releases-signed-or-unsigned).
+
 Release order, on an eligible protected `main` push (a version bump):
 
 1. `release.yml` builds and tests every platform. Its Windows seed goes to
-   `windows-distribution.yml`.
+   `windows-distribution.yml`, which checks it in official mode. Unsigned:
+   it also builds the unsigned ZIP and MSI and tests them natively, as for a
+   test build, and uploads them as `dist-desktop-windows-x64`. Signed: it
+   hands the seed to `windows-sign.yml`.
 2. `release-publish.yml` rechecks the version bump and eligibility
-   (`release_policy.py authorize`), then runs Windows signing and
-   verification (`windows-sign.yml`).
+   (`release_policy.py authorize`), then, only when signed, runs Windows
+   signing and verification (`windows-sign.yml`). Unsigned skips it.
 3. `release_policy.py tag` creates the immutable `v<version>` tag on exactly
    the pushed commit, or accepts it there on a rerun. It's never moved.
 4. `release_assets.py` assembles the release. It requires the Linux and
    Windows desktop archives, the MSI, the runner, the sidecars, the five
    scripts and `metro-tui` in every desktop archive, and refuses any macOS
-   archive.
+   archive. The Windows files must match the switch: signed ones carry
+   Authenticode signatures; unsigned ones are labelled `unsigned-preview`
+   with their commit, the MSI is `….unsigned-preview.msi` without a
+   signature, and the scripts are this checkout's.
 5. GHCR images are pushed, read back and signed (`release-images.yml`).
 6. `SHA256SUMS` and the Linux archives get Sigstore signatures
    (`sign-release-assets.yml`), bound to `refs/heads/main` and the commit.
 7. `release_policy.py publish` uploads exactly that set to a staging draft,
    compares every digest GitHub reports, then makes the release public. It
-   never overwrites a published release.
+   never overwrites a published release. When Windows is unsigned, the
+   release notes say so, warn about SmartScreen and "Unknown publisher",
+   and explain how to check the files with `SHA256SUMS` and Sigstore.

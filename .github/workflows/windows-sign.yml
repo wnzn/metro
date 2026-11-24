@@ -8,7 +8,8 @@ name: Windows signing
 # winsign.py release-context before any credential is touched. There is no
 # version-tag lookup: Windows signs the pinned commit before tag creation. Called only by
 # release-publish.yml, in the same workflow run as windows-distribution.yml
-# (release: true), with
+# (release: true), and only when packaging/windows-release-signing.txt says
+# `signed` (with `unsigned`, release-publish.yml skips this workflow), with
 #   permissions: { contents: read, id-token: write }
 # No triggers of its own and no secrets: Azure Artifact Signing authenticates
 # with GitHub OIDC; the kms backend uses a certificate pre-provisioned in the
@@ -59,6 +60,9 @@ jobs:
         run: |
           set -eu
           python3 -I packaging/windows-signing/winsign.py release-context --version "$VERSION" --head "$(git rev-parse HEAD)" >/dev/null
+          GITHUB_OUTPUT=/dev/null python3 -I packaging/release_policy.py windows-signing > "$RUNNER_TEMP/windows-signing.txt"
+          grep -qx 'windows_signing=signed' "$RUNNER_TEMP/windows-signing.txt" \
+            || { echo "packaging/windows-release-signing.txt does not say signed" >&2; exit 1; }
           case "$BACKEND" in azure|kms) ;; *) echo "METRO_WINDOWS_SIGNING_BACKEND must be azure or kms" >&2; exit 1 ;; esac
       - name: Require the signing environment to allow only the main branch and no tags
         run: |

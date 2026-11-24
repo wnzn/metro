@@ -193,6 +193,32 @@ class Sources(unittest.TestCase):
             with self.subTest(p=p.name):
                 ET.parse(p)
 
+    def test_unsigned_wording_is_true_for_previews_and_unsigned_releases(self):
+        """The --preview MSI ships in test builds and, while Windows releases are unsigned, in
+        official releases: its name and first page must be accurate for both."""
+        ui = ET.parse(MSI_DIR / "metro-ui.wxs").getroot()
+        note, = [c for c in ui.iter() if c.tag.endswith("Control") and c.get("Id") == "PreviewNote"]
+        text = note.get("Text")
+        self.assertEqual(text, "{\\MetroWarning}This Metro build isn't code-signed, so Windows may warn about an "
+                               "unknown publisher. Before you install it, check the file against its SHA-256 "
+                               "checksum (SHA256SUMS).")
+        self.assertEqual(note.get("ShowCondition"), 'MetroPreview = "1"')
+        self.assertEqual(b.UNSIGNED_SUFFIX, " (unsigned)")
+        d = tmpdir(self)
+        p = b.fake_payload(d, "1.0.0")
+        _, entries, _ = b.validate_payload(p, "1.0.0")
+        unsigned = b.product_wxs("release", "1.0.0", "1.0.99", entries, p, d / "marker", True)
+        signed = b.product_wxs("release", "1.0.0", "1.0.99", entries, p, d / "marker", False)
+        self.assertRegex(unsigned, r'<Product [^>]*Name="Metro \(unsigned\)"')
+        self.assertRegex(signed, r'<Product [^>]*Name="Metro" ')
+        for wording in (text, unsigned, (MSI_DIR / "build_msi.py").read_text(encoding="utf-8")):
+            for stale in ("not a Metro release", "local preview", "LOCAL PREVIEW", "unsigned preview)"):
+                self.assertNotIn(stale, wording)
+        # The native harness expects exactly this product name for a .unsigned-preview.msi.
+        harness = (MSI_DIR / "MsiHarness.ps1").read_text(encoding="utf-8")
+        self.assertIn("$wantName = if ($preview) { 'Metro (unsigned)' } else { 'Metro' }", harness)
+        self.assertIn("@('ProductName', 'Metro (unsigned)')", (MSI_DIR / "test-msi-harness.ps1").read_text(encoding="utf-8"))
+
     def test_generated_product_is_wellformed(self):
         d = tmpdir(self)
         p = b.fake_payload(d, "1.0.0")

@@ -59,10 +59,13 @@ python3 -I packaging/windows-msi/build_msi.py build --tools "$TOOLS" \
   with its Browse dialog, tab order, upgrade rows, launch conditions, per-user
   flags, HKCU-only registry writes, and (with `--payload`) the extracted bytes
   of every file. `build` runs it automatically.
-- `--preview` is only for local test builds. It requires the name
-  `Metro-<version>-windows-x64.unsigned-preview.msi`, names the product
-  "Metro (unsigned preview)" and shows a warning on the first page of the
-  wizard.
+- `--preview` builds the unsigned MSI: test builds, and official releases
+  while `packaging/windows-release-signing.txt` says `unsigned`. It requires
+  the name `Metro-<version>-windows-x64.unsigned-preview.msi`, names the
+  product "Metro (unsigned)" and shows a note on the first page of the
+  wizard: the build isn't code-signed, Windows may warn about an unknown
+  publisher, and the file should be checked against its SHA-256 checksum
+  (`SHA256SUMS`). The wording is true for test builds and releases alike.
 
 The build host needs x86-64 Linux with glib and libxml2, and Python 3.12+.
 Builds have been verified on a Debian 13 host. A `debian:trixie-slim`

@@ -68,24 +68,53 @@ class ReleaseInputs(unittest.TestCase):
 
     def test_release_ships_windows_and_linux_only_while_macos_is_off(self):
         self.assertEqual(release.MACOS_TARGETS, ())
-        self.assertEqual(release.binaries(self.version), {
-            f"Metro-{self.version}-linux-x64.tar.gz", f"Metro-runner-{self.version}-linux-x64.tar.gz",
-            f"Metro-{self.version}-windows-x64.zip", f"Metro-{self.version}-windows-x64.msi"})
+        base = {f"Metro-{self.version}-linux-x64.tar.gz", f"Metro-runner-{self.version}-linux-x64.tar.gz",
+                f"Metro-{self.version}-windows-x64.zip"}
+        self.assertEqual(release.binaries(self.version, "signed"), base | {f"Metro-{self.version}-windows-x64.msi"})
+        self.assertEqual(release.binaries(self.version, "unsigned"),
+                         base | {f"Metro-{self.version}-windows-x64.unsigned-preview.msi"})
+        self.assertEqual(release.binaries(self.version), release.binaries(self.version, release.windows_signing()))
         self.assertFalse(any("macos" in name for name in release.INSTALLERS))
         (self.assets / f"Metro-{self.version}-macos-x64.tar.gz").touch()
         with self.assertRaisesRegex(release.ReleaseError, "unexpected.*macos-x64"):
             self.prepare()
 
     def test_missing_or_extra_platform_or_msi_is_rejected(self):
-        msi = self.assets / f"Metro-{self.version}-windows-x64.msi"
+        msi = self.assets / release.windows_msi(self.version)
         msi.unlink()
-        with self.assertRaisesRegex(release.ReleaseError, "missing.*windows-x64.msi"):
+        with self.assertRaisesRegex(release.ReleaseError, "missing.*windows-x64.*msi"):
             self.prepare()
         msi.write_bytes(msi.name.encode())
         (self.assets / f"Metro-{self.version}-windows-arm64.msi").touch()
         with self.assertRaisesRegex(release.ReleaseError, "unexpected.*windows-arm64.msi"):
             self.prepare()
         self.assertFalse(self.out.exists())
+
+    def test_the_msi_name_follows_the_checked_in_switch_only(self):
+        unsigned = f"Metro-{self.version}-windows-x64.unsigned-preview.msi"
+        signed = f"Metro-{self.version}-windows-x64.msi"
+        self.assertEqual(release.windows_signing(), "unsigned")  # checked in for now
+        self.assertEqual(release.windows_msi(self.version), unsigned)
+        # The other mode's MSI is never accepted in place of the checked-in one.
+        (self.assets / unsigned).rename(self.assets / signed)
+        (self.assets / (unsigned + ".sha256")).rename(self.assets / (signed + ".sha256"))
+        with self.assertRaisesRegex(release.ReleaseError, "missing.*unsigned-preview.msi"):
+            self.prepare()
+        with patch.dict(os.environ, {"METRO_WINDOWS_RELEASE_SIGNING": "signed"}):  # no environment override
+            self.assertEqual(release.windows_signing(), "unsigned")
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "windows-release-signing.txt"
+            for text, want in (("signed\n", "signed"), ("# note\n\nunsigned\n", "unsigned")):
+                path.write_text(text)
+                with patch.object(release, "WINDOWS_SIGNING_FILE", path):
+                    self.assertEqual(release.windows_signing(), want)
+            for text in ("", "signed\nsigned\n", "SIGNED\n", "azure\n"):
+                path.write_text(text)
+                with self.subTest(text=text), patch.object(release, "WINDOWS_SIGNING_FILE", path), \
+                        self.assertRaisesRegex(release.ReleaseError, "exactly one value|empty"):
+                    release.windows_signing()
+            with self.assertRaisesRegex(release.ReleaseError, "unknown Windows signing mode"):
+                release.windows_msi(self.version, "maybe")
 
     def test_changed_pre_signing_archive_even_with_recomputed_manifest_is_rejected(self):
         (self.assets / release.direct_archives(self.version)[0]).write_bytes(b"modified")

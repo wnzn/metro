@@ -1,0 +1,17 @@
+# How official releases ship Windows: exactly one value line, `signed` or
+# `unsigned`. Read by release_signatures.windows_signing() for
+# release_policy.py, release_assets.py, release_signatures.py,
+# windows-distribution.yml and release-publish.yml. Anything else fails.
+#
+#   signed    Authenticode through windows-sign.yml (azure or kms backend).
+#             Fails closed when signing isn't configured: no fallback.
+#   unsigned  The release ships the Windows build that windows-distribution.yml
+#             builds and tests natively, unsigned and labelled so
+#             (RELEASE.json signing.mode unsigned-preview,
+#             Metro-<v>-windows-x64.unsigned-preview.msi). Never reads signing
+#             variables, the windows-release-signing environment or OIDC for
+#             Windows signing.
+#
+# To sign again once a certificate is set up (packaging/windows-signing/README.md),
+# change the line below to `signed` in a pull request.
+unsigned

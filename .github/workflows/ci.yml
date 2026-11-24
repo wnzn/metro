@@ -548,7 +548,8 @@ jobs:
     permissions:
       contents: read
 
-  # Then: Windows signing and verification, exact-commit tag,
+  # Then: Windows signing and verification (skipped when
+  # packaging/windows-release-signing.txt says unsigned), exact-commit tag,
   # GHCR images, Sigstore, and automatic public release of the verified set.
   # No tag event is used.
   publish:
