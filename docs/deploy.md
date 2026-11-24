@@ -200,30 +200,36 @@ the Mac jobs are switched off. The macOS packaging code stays in the source;
 the jobs can be restored from git history (see the comment at the top of
 `release.yml`).
 
-Some of this is cut down for pull requests, to keep them fast:
+Each pull request into `main` and each push to `main` runs only the jobs its
+changes need. The `workflows` job (workflow lint, action pins) always runs
+and sorts the changed files with `packaging/ci_changes.py`. A pull request
+is compared with its merge base, a push with the previous tip of `main`.
+Each job then runs only if a changed path needs it:
 
-- A pull request into `main` gets test builds only when it changes
-  something a build reads: the workflows, `apps/desktop`, `crates`,
-  `packaging`, `services`, the Cargo files, the Dockerfile and a few other
-  build files. A change only to docs, `tests`, `examples`, `ops` or the
-  Compose files skips them.
-- A pull request into `main` that changes only documentation (Markdown and
-  images under `docs/`, top-level Markdown such as `README.md`, and
-  Markdown under `ops/`) also skips the Rust, container and desktop jobs.
-  The workflow and packaging tests still run.
-- A pull request into `main` runs the container job only when it changes
-  something that job reads: the Dockerfile and `.dockerignore`, the Cargo
-  files and `crates`, the Compose files, `services`, the container runner
-  scripts, `tests/e2e`, the Rust toolchain pin or `ci.yml`. A change only
-  to `apps`, other `packaging` files, other workflows, `examples`, `ops` or
-  docs skips it.
-- A skipped job counts as passed for the required checks. If CI can't read
-  the change, or meets a path it doesn't know, it runs everything.
-- Pull requests into any other branch always get test builds.
+| Job | Runs when the change touches |
+| --- | --- |
+| `rust` | `crates`, `Cargo.lock`, `.cargo`, `rust-toolchain`, `tests`, `examples`, `apps/desktop/assets` |
+| `desktop` | `apps/desktop`, except `apps/desktop/dev` and Markdown |
+| `containers` | `crates`, `Cargo.lock`, `rust-toolchain`, the Dockerfile and `.dockerignore`, the Compose files, `services`, `tests/e2e`, the container runner scripts |
+| `packaging` | `packaging`, `.github`, the Compose files, `apps/desktop/assets` and `apps/desktop/src/ui` |
+| Test builds | `crates`, `Cargo.lock`, `.cargo`, `rust-toolchain`, the Dockerfile and `.dockerignore`, `services`, `packaging`, `.github`, `apps/desktop` (except `dev` and Markdown) |
+| All of them | `ci.yml`, `.gitattributes`, the version files (`Cargo.toml`, `apps/desktop/nsh.json`), and any path not listed here |
+
+A change made only of documentation runs none of them: Markdown and images
+under `docs/`, top-level Markdown such as `README.md`, and Markdown under
+`ops/` and `apps/desktop/`. Nor does a change only to `apps/desktop/dev`
+(screenshot scripts), `ops/` (the runner stack there has its own workflow,
+`check-runner-stack.yml`), `.gitignore` or `.env.example`.
+
+- A skipped job counts as passed for the required checks.
+- Everything runs when CI can't tell what changed: an unreadable or empty
+  diff, a symlink or submodule, a new branch, a forced push, a push whose
+  previous commit is missing, or a classifier that didn't answer.
+- A release run always runs every job a release needs, whatever changed,
+  and the release goes ahead only if each of them ran and passed.
+- Pull requests into any other branch run everything.
 - A new push to a pull request cancels that pull request's older run.
   Pushes are never cancelled.
-
-Pushes to `main` run and build everything.
 
 The Rust jobs keep a build cache. Only pushes to `main` write it. Pull
 requests and other pushes only read it. Release builds never use it, so

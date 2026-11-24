@@ -20,16 +20,21 @@ concurrency:
   group: ${{ github.event_name == 'pull_request' && format('ci-pr-{0}', github.event.pull_request.number) || format('ci-{0}', github.run_id) }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
-# A pull request to main whose diff `workflows` classifies as documentation
-# only skips `rust`, `containers` and `desktop`; one that touches nothing the
-# containers job reads skips `containers` (packaging/package_smoke_policy.py).
-# A skipped job counts as passed for branch protection. Pushes always run them,
-# and so does an unknown or unreadable diff. If `workflows` fails, `rust` and
-# `containers` still run (and `desktop`, as before, does not).
+# `workflows` always runs. It classifies the diff of a pull request into main
+# (from the merge base) or of a push to main (from github.event.before) into
+# segments (packaging/ci_changes.py), and each job below runs only when its
+# segment is not 'false'. An empty answer (classifier skipped, failed or not
+# reached) runs the job. A skipped job counts as passed for branch protection.
+# When release-policy decides to release, every gate the `release` job needs
+# runs whatever the classifier said, and `release` requires each to succeed.
+# If `workflows` fails, `rust`, `containers` and `packaging` still run
+# (`desktop` and `package-smoke`, as before, do not).
 jobs:
   rust:
-    needs: workflows
-    if: ${{ !cancelled() && (github.event_name == 'push' || needs.workflows.outputs.docs_only != 'true') }}
+    needs: [workflows, release-policy]
+    if: >-
+      ${{ !cancelled() && (needs.workflows.outputs.rust != 'false'
+      || needs.release-policy.outputs.release == 'true') }}
     runs-on: ubuntu-24.04
     env:
       RUSTUP_TOOLCHAIN: 1.98.1
@@ -83,11 +88,10 @@ jobs:
     # only when the selector chose it and release-policy did not choose a
     # release (it is skipped for pull requests, and CI only for main pushes
     # without a version bump). Still runs when release-policy is skipped.
-    # Documentation-only PRs skip it, like `rust` and `containers`.
     needs: [workflows, release-policy]
     if: >-
       ${{ !cancelled() && needs.workflows.result == 'success' && needs.release-policy.result != 'failure'
-      && needs.workflows.outputs.docs_only != 'true' }}
+      && (needs.workflows.outputs.desktop != 'false' || needs.release-policy.outputs.release == 'true') }}
     # Choose a queue, not a fallback if the selected runner is offline.
     runs-on: ${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' && needs.release-policy.outputs.release != 'true' && 'metro-ci-linux-x64' || 'ubuntu-24.04' }}
     env:
@@ -135,15 +139,15 @@ jobs:
           printf '%s\n' "$install_dir/nsh/bin" >> "$GITHUB_PATH"
       - run: nsh check
         working-directory: apps/desktop
-      # The release build is package-smoke's `ui` job (any PR that changes it, every main push).
+      # The release build is package-smoke's `ui` job (when the `previews` segment runs).
       - run: nsh test
         working-directory: apps/desktop
 
   containers:
-    needs: workflows
+    needs: [workflows, release-policy]
     if: >-
-      ${{ !cancelled() && (github.event_name == 'push'
-      || (needs.workflows.outputs.docs_only != 'true' && needs.workflows.outputs.containers != 'false')) }}
+      ${{ !cancelled() && (needs.workflows.outputs.containers != 'false'
+      || needs.release-policy.outputs.release == 'true') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -328,9 +332,11 @@ jobs:
   workflows:
     runs-on: ubuntu-24.04
     outputs:
-      skip_previews: ${{ steps.change-policy.outputs.skip_previews }}
-      docs_only: ${{ steps.change-policy.outputs.docs_only }}
-      containers: ${{ steps.change-policy.outputs.containers }}
+      rust: ${{ steps.changes.outputs.rust }}
+      desktop: ${{ steps.changes.outputs.desktop }}
+      containers: ${{ steps.changes.outputs.containers }}
+      packaging: ${{ steps.changes.outputs.packaging }}
+      previews: ${{ steps.changes.outputs.previews }}
       desktop_runner: ${{ steps.desktop-route.outputs.desktop_runner }}
     env:
       ACTIONLINT_VERSION: 1.7.12
@@ -434,19 +440,27 @@ jobs:
           set -eu
           bad="$(grep -hE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s+\./' | grep -vE 'uses:[[:space:]]+[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$)' || true)"
           [ -z "$bad" ] || { printf 'unpinned actions:\n%s\n' "$bad" >&2; exit 1; }
-      # One diff, three answers: skip_previews, docs_only, containers. Not run
-      # for pushes, so their outputs stay empty and nothing is skipped.
-      - name: Classify this PR's changes (package previews, docs only, containers)
-        id: change-policy
-        if: github.event_name == 'pull_request' && github.base_ref == 'main'
+      # One diff, one answer per segment (rust, desktop, containers, packaging,
+      # previews). Pull requests into main and pushes to main are classified;
+      # anything else, and any doubt, answers 'true' everywhere.
+      - name: Classify the changes into CI segments
+        id: changes
         env:
           PR_BASE: ${{ github.event.pull_request.base.sha }}
           PR_HEAD: ${{ github.event.pull_request.head.sha }}
-        run: python3 -I packaging/package_smoke_policy.py >> "$GITHUB_OUTPUT"
+          EVENT_BEFORE: ${{ github.event.before }}
+          EVENT_AFTER: ${{ github.event.after }}
+          EVENT_FORCED: ${{ github.event.forced }}
+          EVENT_DELETED: ${{ github.event.deleted }}
+        run: python3 -I packaging/ci_changes.py >> "$GITHUB_OUTPUT"
 
   # Separate from `workflows`, so the desktop job and package previews do not
   # wait for these tests. Official releases still need them.
   packaging:
+    needs: [workflows, release-policy]
+    if: >-
+      ${{ !cancelled() && (needs.workflows.outputs.packaging != 'false'
+      || needs.release-policy.outputs.release == 'true') }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -500,15 +514,15 @@ jobs:
         run: python3 -I packaging/release_policy.py decide
 
   # Build and package everything a release would ship, but publish nothing:
-  # PRs to main that change a build input, PRs to other branches, and main
-  # pushes that do not release. Unknown or unreadable PR diffs still
-  # build. No macOS builds for now (see release.yml).
+  # pull requests and main pushes that change a build input (the `previews`
+  # segment), and every PR to another branch, but never a release run.
+  # Unknown or unreadable diffs still build. No macOS builds for now (see release.yml).
   # No secrets and contents: read only (release.yml's whole tree stays read-only).
   package-smoke:
     needs: [workflows, release-policy]
     if: >-
       ${{ !cancelled() && needs.workflows.result == 'success'
-      && needs.workflows.outputs.skip_previews != 'true'
+      && needs.workflows.outputs.previews != 'false'
       && (needs.release-policy.result == 'skipped'
           || (needs.release-policy.result == 'success' && needs.release-policy.outputs.release != 'true')) }}
     uses: ./.github/workflows/release.yml
@@ -518,10 +532,15 @@ jobs:
       contents: read
 
   # Build and exercise every platform on the exact protected push revision.
-  # This tree cannot write or see signing credentials.
+  # This tree cannot write or see signing credentials. Every gate must have
+  # run and passed: a skipped gate stops the release, never waives it.
   release:
     needs: [rust, desktop, containers, workflows, packaging, release-policy]
-    if: needs.release-policy.outputs.release == 'true'
+    if: >-
+      needs.release-policy.outputs.release == 'true'
+      && needs.rust.result == 'success' && needs.desktop.result == 'success'
+      && needs.containers.result == 'success' && needs.workflows.result == 'success'
+      && needs.packaging.result == 'success'
     uses: ./.github/workflows/release.yml
     with:
       release: true

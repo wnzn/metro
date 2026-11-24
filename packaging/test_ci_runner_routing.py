@@ -154,13 +154,13 @@ sys.exit({status!r})
             runner = ("needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' "
                       "&& needs.release-policy.outputs.release != 'true' && 'metro-ci-linux-x64' || 'ubuntu-24.04'")
             gate = ("!cancelled() && needs.workflows.result == 'success' && needs.release-policy.result != 'failure' "
-                    "&& needs.workflows.outputs.docs_only != 'true'")
+                    "&& (needs.workflows.outputs.desktop != 'false' || needs.release-policy.outputs.release == 'true')")
             if body == runner:
                 local = ctx["selected"] == LOCAL and ctx["release"] != "true"
                 return LOCAL if local else HOSTED
             self.assertEqual(" ".join(body.split()), gate)
             return (not ctx["cancelled"] and ctx["workflows"] == "success" and ctx["policy"] != "failure"
-                    and ctx.get("docs_only", "") != "true")
+                    and (ctx.get("desktop", "") != "false" or ctx.get("release") == "true"))
 
         cases = (
             # (release-policy result, release output, selector choice) -> (desktop runs, runner)
@@ -182,10 +182,12 @@ sys.exit({status!r})
             self.assertFalse(evaluate(self.desktop["if"], {"policy": "skipped", "workflows": workflows,
                                                            "cancelled": False}))
         self.assertFalse(evaluate(self.desktop["if"], {"policy": "success", "workflows": "success", "cancelled": True}))
-        # A documentation-only PR skips the desktop job; any other classification runs it.
-        for docs_only, runs in (("true", False), ("false", True), ("", True)):
-            self.assertIs(evaluate(self.desktop["if"], {"policy": "skipped", "workflows": "success", "cancelled": False,
-                                                        "docs_only": docs_only}), runs)
+        # Only an explicit desktop=false skips it (PR or push); a release run still runs it.
+        for desktop, release, runs in (("false", "", False), ("false", "false", False), ("true", "", True),
+                                       ("", "", True), ("false", "true", True)):
+            self.assertIs(evaluate(self.desktop["if"], {"policy": "success" if release else "skipped",
+                                                        "workflows": "success", "cancelled": False,
+                                                        "desktop": desktop, "release": release}), runs)
 
     def test_single_read_only_desktop_job_and_one_toolchain_per_runner(self):
         self.assertEqual(self.ci["permissions"], {"contents": "read"})
@@ -201,13 +203,14 @@ sys.exit({status!r})
                          "&& 'metro-ci-linux-x64' || 'ubuntu-24.04' }}")
         self.assertEqual(" ".join(self.desktop["if"].split()),
                          "${{ !cancelled() && needs.workflows.result == 'success' "
-                         "&& needs.release-policy.result != 'failure' && needs.workflows.outputs.docs_only != 'true' }}")
+                         "&& needs.release-policy.result != 'failure' && (needs.workflows.outputs.desktop != 'false' "
+                         "|| needs.release-policy.outputs.release == 'true') }}")
         self.assertIn("desktop", self.ci["jobs"]["release"]["needs"])
         for job in ("rust", "containers", "workflows", "packaging", "release-policy"):
             self.assertEqual(self.ci["jobs"][job]["runs-on"], HOSTED)
         # The slow packaging tests run in their own job, so they do not hold up the desktop job.
         packaging = self.ci["jobs"]["packaging"]
-        self.assertNotIn("needs", packaging)
+        self.assertEqual(packaging["needs"], ["workflows", "release-policy"])
         self.assertEqual(packaging["steps"][0]["with"], {"persist-credentials": False})
         for suite in ("packaging", "packaging/release-signatures", "packaging/windows-signing"):
             self.assertIn(f"python3 -B -m unittest discover -s {suite} -v\n", packaging["steps"][1]["run"])
