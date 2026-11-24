@@ -470,7 +470,7 @@ pub(crate) fn valid_reasoning_effort(v: &Value) -> bool {
 /// Check and rebuild a `complete` request. `allowed_models` is the profile's
 /// local allowlist.
 pub fn sanitize_complete(request: &Value, allowed_models: &[String]) -> R<Value> {
-    sanitize_chat(request, allowed_models, false)
+    sanitize_chat(request, allowed_models, Effort::Refused)
 }
 
 /// As [`sanitize_complete`], with options explicitly supported by `kind`.
@@ -479,17 +479,55 @@ pub fn sanitize_complete_for_kind(
     allowed_models: &[String],
     kind: Kind,
 ) -> R<Value> {
-    sanitize_chat(request, allowed_models, kind == Kind::OpenAiOAuth)
+    let effort = match kind {
+        Kind::OpenAiOAuth => Effort::Responses,
+        Kind::OpenAiCompatible => Effort::Custom,
+        _ => Effort::Refused,
+    };
+    sanitize_chat(request, allowed_models, effort)
 }
 
-fn sanitize_chat(request: &Value, allowed_models: &[String], reasoning: bool) -> R<Value> {
+/// Which thinking-effort fields a connection kind forwards.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Effort {
+    /// None: the field is refused.
+    Refused,
+    /// ChatGPT plan usage: top-level `reasoning_effort` with the Responses
+    /// vocabulary; the adapter maps it to `reasoning.effort`.
+    Responses,
+    /// A self-hosted OpenAI-compatible endpoint: the model's own thinking
+    /// options, as top-level `reasoning_effort` or `reasoning: {effort}`,
+    /// passed through unchanged.
+    Custom,
+}
+
+/// The longest custom effort value Metro sends (its per-model thinking
+/// options use 1-32 characters of `a-z`, `0-9`, `_` or `-`).
+const MAX_CUSTOM_EFFORT: usize = 32;
+
+fn valid_custom_effort(v: &Value) -> bool {
+    v.as_str().is_some_and(|s| {
+        !s.is_empty()
+            && s.len() <= MAX_CUSTOM_EFFORT
+            && s.bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-'))
+    })
+}
+
+const CUSTOM_EFFORT_ERROR: &str =
+    "reasoning effort must be 1-32 characters of a-z, 0-9, '_' or '-'";
+
+fn sanitize_chat(request: &Value, allowed_models: &[String], effort: Effort) -> R<Value> {
     let obj = request
         .as_object()
         .ok_or_else(|| bad("'request' must be an object"))?;
-    if !reasoning && obj.contains_key("reasoning_effort") {
+    if effort == Effort::Refused && obj.contains_key("reasoning_effort") {
         return Err(bad(
             "'reasoning_effort' is not supported by this connection",
         ));
+    }
+    if effort != Effort::Custom && obj.contains_key("reasoning") {
+        return Err(bad("'reasoning' is not supported by this connection"));
     }
     only_keys(
         obj,
@@ -509,6 +547,7 @@ fn sanitize_chat(request: &Value, allowed_models: &[String], reasoning: bool) ->
             "frequency_penalty",
             "response_format",
             "reasoning_effort",
+            "reasoning",
             "n",
             "stream",
         ],
@@ -590,6 +629,12 @@ fn sanitize_chat(request: &Value, allowed_models: &[String], reasoning: bool) ->
                 _ => return Err(bad("'stop' must be a string or up to 4 strings")),
             },
             "response_format" => response_format(v)?,
+            "reasoning_effort" if effort == Effort::Custom => {
+                if !valid_custom_effort(v) {
+                    return Err(bad(CUSTOM_EFFORT_ERROR));
+                }
+                v.clone()
+            }
             "reasoning_effort" => {
                 if !valid_reasoning_effort(v) {
                     return Err(bad(
@@ -597,6 +642,21 @@ fn sanitize_chat(request: &Value, allowed_models: &[String], reasoning: bool) ->
                     ));
                 }
                 v.clone()
+            }
+            // Only reached for `Effort::Custom` (refused above otherwise).
+            // Rebuilt with `effort` alone, so nothing else rides along.
+            "reasoning" => {
+                let o = v
+                    .as_object()
+                    .ok_or_else(|| bad("'reasoning' must be an object"))?;
+                only_keys(o, &["effort"], "reasoning")?;
+                let e = o
+                    .get("effort")
+                    .ok_or_else(|| bad("'reasoning.effort' is required"))?;
+                if !valid_custom_effort(e) {
+                    return Err(bad(CUSTOM_EFFORT_ERROR));
+                }
+                json!({ "effort": e })
             }
             _ => continue, // handled above
         };
@@ -721,6 +781,38 @@ pub fn approved_models(allowed: &[String], available: Option<&[String]>) -> Valu
     json!({ "models": models })
 }
 
+/// The longest display name sent to Metro, in characters.
+pub const MAX_DISPLAY_NAME: usize = 128;
+
+/// As [`approved_models`], from a catalog that may name its models. Adds
+/// `"display_names": {ID: NAME}` for the approved models that have a short,
+/// printable name; the key is left out when there are none, so the answer
+/// keeps the older shape.
+pub fn approved_models_named(allowed: &[String], available: &[(String, Option<String>)]) -> Value {
+    let ids: Vec<String> = available.iter().map(|(id, _)| id.clone()).collect();
+    let mut out = approved_models(allowed, Some(&ids));
+    let mut names = Map::new();
+    for (id, name) in available {
+        if !allowed.contains(id) || names.contains_key(id) {
+            continue;
+        }
+        let Some(name) = name.as_deref().map(str::trim) else {
+            continue;
+        };
+        if name.is_empty()
+            || name.chars().count() > MAX_DISPLAY_NAME
+            || name.chars().any(char::is_control)
+        {
+            continue;
+        }
+        names.insert(id.clone(), Value::String(name.to_owned()));
+    }
+    if !names.is_empty() {
+        out["display_names"] = Value::Object(names);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -785,9 +877,8 @@ mod tests {
                 chat_to_responses(&clean).unwrap()["reasoning"]["effort"],
                 level
             );
-            for kind in [Kind::ClaudeCode, Kind::OpenAiCompatible] {
-                assert!(sanitize_complete_for_kind(&r, &allowed(), kind).is_err());
-            }
+            assert!(sanitize_complete_for_kind(&r, &allowed(), Kind::ClaudeCode).is_err());
+            assert!(sanitize_complete(&r, &allowed()).is_err());
         }
         for v in [json!("private@example.test"), json!(6), json!({})] {
             r["reasoning_effort"] = v;
@@ -805,6 +896,97 @@ mod tests {
                 .unwrap()
                 .get("reasoning")
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn openai_compatible_passes_custom_thinking_through() {
+        let base = json!({
+            "model": "gpt-5.5",
+            "messages": [{"role": "user", "content": "private prompt"}],
+        });
+        let compat = |r: &Value| sanitize_complete_for_kind(r, &allowed(), Kind::OpenAiCompatible);
+
+        // Top-level wire, including values outside the Responses vocabulary.
+        for level in ["high", "think-hard", "on", "budget_2"] {
+            let mut r = base.clone();
+            r["reasoning_effort"] = json!(level);
+            assert_eq!(compat(&r).unwrap()["reasoning_effort"], level);
+        }
+        // Nested wire, rebuilt with `effort` alone.
+        let mut r = base.clone();
+        r["reasoning"] = json!({"effort": "medium"});
+        let clean = compat(&r).unwrap();
+        assert_eq!(clean["reasoning"], json!({"effort": "medium"}));
+        assert!(clean.get("reasoning_effort").is_none());
+        // Null means unset.
+        r["reasoning"] = Value::Null;
+        assert!(compat(&r).unwrap().get("reasoning").is_none());
+
+        // Bad shapes and values are refused without echoing them.
+        for (key, v) in [
+            ("reasoning_effort", json!("Private@Example")),
+            ("reasoning_effort", json!("")),
+            ("reasoning_effort", json!("x".repeat(33))),
+            ("reasoning_effort", json!(3)),
+            ("reasoning", json!("high")),
+            ("reasoning", json!({})),
+            ("reasoning", json!({"effort": "UPPER"})),
+            ("reasoning", json!({"effort": "low", "summary": "auto"})),
+        ] {
+            let mut r = base.clone();
+            r[key] = v;
+            let e = compat(&r).unwrap_err().to_string();
+            assert!(!e.contains("Private") && !e.contains("private"), "{e}");
+        }
+
+        // Other kinds never forward the nested form.
+        let mut r = base.clone();
+        r["reasoning"] = json!({"effort": "high"});
+        for kind in [Kind::OpenAiOAuth, Kind::ClaudeCode] {
+            assert!(sanitize_complete_for_kind(&r, &allowed(), kind).is_err());
+        }
+        assert!(sanitize_complete(&r, &allowed()).is_err());
+        // ChatGPT plan usage keeps the Responses vocabulary.
+        let mut r = base.clone();
+        r["reasoning_effort"] = json!("think-hard");
+        assert!(sanitize_complete_for_kind(&r, &allowed(), Kind::OpenAiOAuth).is_err());
+    }
+
+    #[test]
+    fn display_names_are_bounded_and_only_for_approved_models() {
+        let a = allowed();
+        let catalog = vec![
+            ("gpt-5.5".to_string(), Some("  GPT-5.5  ".to_string())),
+            ("llama3".to_string(), None),
+            ("unapproved".to_string(), Some("Hidden".to_string())),
+        ];
+        assert_eq!(
+            approved_models_named(&a, &catalog),
+            json!({"models": ["gpt-5.5", "llama3"], "display_names": {"gpt-5.5": "GPT-5.5"}})
+        );
+        // No usable names: the older shape, exactly.
+        for name in [
+            None,
+            Some(String::new()),
+            Some("   ".into()),
+            Some("bad\nname".into()),
+            Some("x".repeat(MAX_DISPLAY_NAME + 1)),
+        ] {
+            let c = vec![("gpt-5.5".to_string(), name)];
+            assert_eq!(
+                approved_models_named(&a, &c),
+                json!({"models": ["gpt-5.5"]})
+            );
+        }
+        let c = vec![("gpt-5.5".to_string(), Some("é".repeat(MAX_DISPLAY_NAME)))];
+        assert_eq!(
+            approved_models_named(&a, &c)["display_names"]["gpt-5.5"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count(),
+            MAX_DISPLAY_NAME
         );
     }
 

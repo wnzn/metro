@@ -653,6 +653,37 @@ async fn models_and_complete_roundtrip() {
     metro_never_saw_key(&e);
 }
 
+/// Metro sends a self-hosted model's thinking option on the wire the owner
+/// chose for it; the connector forwards it to the endpoint unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn custom_thinking_reaches_the_endpoint() {
+    let e = env().await;
+    setup(&e, true).await;
+    let mut top = chat("local-small");
+    top["reasoning_effort"] = json!("think-hard");
+    let mut nested = chat("local-big");
+    nested["reasoning"] = json!({"effort": "low"});
+    for (id, req) in [("dj_t", top), ("dj_n", nested)] {
+        push_job(
+            &e,
+            json!({"id": id, "operation": "complete", "request": req}),
+        );
+        let out = run_once(&e).await;
+        assert_eq!(out.code, 0, "{}", out.stderr);
+        let (got, body) = last_result(&e);
+        assert_eq!(got, id);
+        assert_eq!(body["ok"], true, "{body}");
+    }
+    let m = e.model.lock().unwrap();
+    assert_eq!(m.completions.len(), 2);
+    assert_eq!(m.completions[0]["reasoning_effort"], "think-hard");
+    assert!(m.completions[0].get("reasoning").is_none());
+    assert_eq!(m.completions[1]["reasoning"], json!({"effort": "low"}));
+    assert!(m.completions[1].get("reasoning_effort").is_none());
+    drop(m);
+    metro_never_saw_key(&e);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn no_key_endpoint_sends_no_auth() {
     let e = env().await;

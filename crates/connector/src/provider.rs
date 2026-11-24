@@ -102,6 +102,27 @@ impl Provider<'_> {
         }
     }
 
+    /// As [`Provider::available_models`], with the catalog display name of
+    /// each model when the provider reports one (ChatGPT plan usage only).
+    pub async fn available_models_named(&self) -> Result<Vec<(String, Option<String>)>> {
+        match self.config.kind {
+            Kind::OpenAiOAuth => Ok(openai_oauth::model_catalog(
+                &self.profile.vendor_dir(),
+                &openai_oauth::Endpoints::openai(),
+            )
+            .await?
+            .into_iter()
+            .map(|m| (m.slug, m.display_name))
+            .collect()),
+            _ => Ok(self
+                .available_models()
+                .await?
+                .into_iter()
+                .map(|m| (m, None))
+                .collect()),
+        }
+    }
+
     async fn typed_models(&self, kind: &str) -> Result<Vec<String>> {
         let ep = self.endpoint()?;
         let key = ep.key.as_ref().map(|k| k.expose());
