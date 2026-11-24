@@ -45,8 +45,11 @@ As seen in the 0.2.0 Linux candidate:
 
 The ways map to the provider ids below: the `device-*` kinds run on your
 device, and the others are [server-stored API profiles](#server-stored-api-profiles).
-The [older screenshot](screenshots/settings-providers.png) is from a
-development build, before the vendor dropdown.
+The [screenshot](screenshots/settings-providers.png), retaken on
+2026-11-24 from a development build, shows the current page in the
+Settings window: **Add connection**, the **Defaults** row, and a keyless
+local test endpoint under **Custom & self-hosted**, opened with **Manage**
+to its model list. The vendor dropdown isn't open in it.
 
 ## Which model a run uses
 
@@ -262,8 +265,12 @@ replaces the old one, and revoking it or deleting the connection fails that
 connection's pending jobs.
 
 Once paired, the button becomes **Manage connection**. Earlier development
-builds showed a **Set up metro-connector** guide instead
-([screenshot](screenshots/settings-device-onboarding.png)). The app never
+builds showed a **Set up metro-connector** guide instead. The
+[screenshot](screenshots/settings-device-onboarding.png), retaken on
+2026-11-24, shows a development build without the launcher right after it
+created an on-device connection, *Home GPU*: the device token shown once
+and masked, and the steps for `metro-connector` on a headless computer. It
+isn't the packaged app's in-app pairing, which never shows the token. The app never
 signs in to a vendor CLI for you. **Test
 connection** lists models once the device is online. The device asks the
 vendor for its model list with your sign-in or key (for Sign in with

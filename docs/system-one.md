@@ -339,14 +339,15 @@ checked in native Linux GTK, in dark and light themes, at `95a3d2b`
 Only the full search sends your query to your embeddings connection (and
 a shortlist to System One), as described above. Quick results don't.
 
-The [screenshot](screenshots/semantic-search.png) is historical: it shows
-the 0.2.0-era page, with a query field and button on the page and a score
-label on each result (*System One relevance 0.95*, *similarity 0.81*, or
-just *score* for partly reranked results). It shows *Reranked by System
-One* because the keyless fixture's System One endpoint did score every
-result. Its scores and its order prove that the wiring works, and say
-nothing about how good the ranking is with a real model. The API still
-returns each result's `score`.
+The [screenshot](screenshots/semantic-search.png), retaken on 2026-11-24
+from `eea7221`, shows the current page: the query typed in the search box at
+the top, the **Conversations** mode with its scope chips, and seven results
+from Personal Chat and Acme's rooms, with the query's words highlighted.
+Results carry no score label. The *Reranked by System One* badge is there
+because the keyless loopback fixture's System One endpoint did score every
+result (the fixture scores word overlap; it isn't a semantic model). Its
+order proves that the wiring works, and says nothing about how good the
+ranking is with a real model. The API still returns each result's `score`.
 
 **Privacy checks.** Your access is checked when candidates are read, again
 just before any text goes to a model, and again on the final results. Each

@@ -15,7 +15,8 @@ room or thread in a Space you belong to.
 > See [acceptance.md](acceptance.md#demonstrated-scheduled-prompts-end-to-end-2026-11-22-scheduler-lane-local).
 > The desktop's **Scheduled tasks** screen has also been checked natively
 > against the real backend: a prompt fired, and its history shows
-> `dispatched` ([screenshot](screenshots/scheduled-tasks.png)). Both are
+> `dispatched`. (The [screenshot](screenshots/scheduled-tasks.png) was
+> retaken on 2026-11-24; see below.) Both are
 > part of the
 > [Documents & media local gate](acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local),
 > along with desktop `nsh test` 106/106. The models were local scripted stubs,
@@ -26,8 +27,13 @@ room or thread in a Space you belong to.
 This section describes the current source after 0.2.0. It isn't released.
 The task cards and their **More** menu with **History** were checked in
 a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. The form's other changes are covered by automated tests. The
-[screenshot](screenshots/scheduled-tasks.png) is historical and shows the
-0.2.0-era cards.
+[screenshot](screenshots/scheduled-tasks.png), retaken on 2026-11-24 from
+`eea7221` against the real server with a scripted model, shows four cards:
+two active daily and weekday tasks, each with its next firing in the task's
+own zone; a paused one (*Won't fire while paused*); and a one-time task that
+really fired, reading *No more firings* and *Last firing … UTC ·
+Dispatched*. History is in each card's **More** menu and isn't open in the
+shot.
 
 Open **Scheduled tasks** in the sidebar. Each task's card shows:
 

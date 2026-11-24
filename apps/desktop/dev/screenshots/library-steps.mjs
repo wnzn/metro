@@ -3,7 +3,7 @@
 // 600) and JSON-quoted into a `type` step; every screenshot is taken after
 // it has gone from the screen.
 //
-//   URL=… IDS=<json name->asset id> MEDIA=<connection id> SHOTS=/shots TOKEN_FILE=… node library-steps.mjs alice|alice-open|bob
+//   URL=… IDS=<json name->asset id> MEDIA=<connection id> SHOTS=/shots TOKEN_FILE=… node library-steps.mjs alice-model|alice-index|alice|alice-open|bob
 import { readFileSync } from "node:fs";
 
 const q = JSON.stringify;
@@ -15,6 +15,7 @@ const shot = (name) => `await app.screenshot(${q(`${SHOTS}/${name}`)})`;
 const T = { timeout: 30000 };
 const wait = (sel, t = T) => `await app.waitFor(${q(sel)}, ${q(t)})`;
 
+// The Library page, from the sidebar.
 const signIn = [
   `await app.setViewport(1200, 1040)`,
   `await app.clear("id:server-url")`,
@@ -22,43 +23,57 @@ const signIn = [
   `await app.type("id:access-token", ${q(token)})`,
   `await app.press("id:connect")`,
   wait("id:workspace"),
-  `await app.submit("id:top-search")`,
-  wait("id:search-view"),
-  `await app.press("id:search-surface:library")`,
+  `await app.press("id:nav-library")`,
   wait("id:library-view"),
 ];
 
+// Search › Documents & media; Return in the search box at the top sends the query.
 const search = (query) => [
   `await app.clear("id:top-search")`,
   `await app.type("id:top-search", ${q(query)})`,
-  `await app.press("id:library-search-submit")`,
+  `await app.submit("id:top-search")`,
+  wait("id:search-view"),
+  `if (!app.shows("id:library-search")) await app.press("id:search-surface:library")`,
   wait("id:library-results"),
 ];
 
-function alice() {
-  if (!MEDIA) throw new Error("MEDIA is required for alice");
+/** Settings › Model providers: choose and save the media model (its own session: stdin steps get 30 s each). */
+function aliceModel() {
   return [
     ...signIn,
-    wait(`id:library-file:${ids["shipping-contract.pdf"]}`),
-    // Choose the media model in the app, then index each file on request.
+    `await app.press("id:nav-settings")`,
+    `await app.press("id:nav-settings:providers")`,
+    wait("id:library-model"),
     `await app.press("id:library-model-picker")`,
     `await app.press("text:/Capture EG2 fixture/")`,
     wait("id:library-model-dataflow"),
     `await app.press("id:library-model-save")`,
     wait("text:Saved: Capture EG2 fixture."),
-    ...Object.values(ids).flatMap((id) => [
-      `await app.press(${q(`id:library-index:${id}`)})`,
-      wait(`text:/^Indexed \\d+ parts? in your own index/`),
-      wait(`id:library-index-state:${id}`),
-    ]),
-    `await app.waitUntil(() => app.texts().filter((t) => t.startsWith("Indexed ")).length >= ${Object.keys(ids).length}, ${q(T)})`,
-    `await app.scroll("id:library-view", 120)`,
-    `await app.wait(400)`,
-    shot("library-assets.png"),
+  ];
+}
 
+/** Index each file on request, from its row's More menu (the media model was saved in alice-model). */
+function aliceIndex() {
+  return [
+    ...signIn,
+    wait(`id:library-file:${ids["shipping-contract.pdf"]}`),
+    ...Object.values(ids).flatMap((id, i) => [
+      `await app.press(${q(`id:library-actions:${id}`)})`,
+      wait(`id:library-index:${id}`),
+      `await app.press(${q(`id:library-index:${id}`)})`,
+      wait(`id:library-index-state:${id}`),
+      `await app.waitUntil(() => app.texts().filter((t) => /^Indexed \\d+ parts? in your own index/.test(t)).length >= ${i + 1}, ${q(T)})`,
+    ]),
+    `await app.wait(400)`,
+    shot("library-assets.png"), // index states are this session's own
+  ];
+}
+
+function alice() {
+  return [
+    ...signIn,
     // A page of a PDF, found by its own text.
     ...search("which page has the cargo manifest?"),
-    `await app.scroll("id:library-view", 1000)`,
     `await app.wait(400)`,
     shot("library-search.png"),
     `await app.press("text:Open at page 2")`,
@@ -68,23 +83,10 @@ function alice() {
   ];
 }
 
-/** A second session (stdin steps get 30 s each): the model is saved and the files indexed. */
+/** A second session (stdin steps get 30 s each). */
 function aliceOpen() {
   return [
     ...signIn,
-    wait("text:Saved: Capture EG2 fixture."),
-    // A time range of a recording, found by what it sounds like.
-    ...search("the thunder in the standup recording"),
-    `await app.press("text:/^Play from 0:05$/ >> nth=0")`,
-    wait("id:library-viewer-player"),
-    `await app.wait(1500)`,
-    `await app.press("id:library-play-match")`,
-    wait("id:library-player-position"),
-    `await app.wait(700)`,
-    shot("library-open-time.png"),
-    `await app.press("id:library-viewer-back")`,
-    wait("id:library-results"),
-
     // An image, found by its pixels.
     ...search("a crimson whiteboard photo"),
     `await app.press("text:Open image >> nth=0")`,
@@ -113,7 +115,7 @@ function bob() {
   ];
 }
 
-const runs = { alice, "alice-open": aliceOpen, bob };
+const runs = { "alice-model": aliceModel, "alice-index": aliceIndex, alice, "alice-open": aliceOpen, bob };
 const who = process.argv[2];
-if (!(who in runs)) throw new Error("usage: library-steps.mjs alice|alice-open|bob");
+if (!(who in runs)) throw new Error("usage: library-steps.mjs alice-model|alice-index|alice|alice-open|bob");
 process.stdout.write(runs[who]().join("\n") + "\n");

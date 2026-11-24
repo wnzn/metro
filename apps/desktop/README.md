@@ -45,7 +45,7 @@ In 0.2.0, the first screen, **Connect to Metro**, offers two choices:
   token, and its data stays on this computer, separate from any server you
   connect to.
 - **Or connect to a server:** the URL and token your admin gave you
-  ([README](../../README.md#install-and-use-prebuilt-only)).
+  ([README](../../README.md#get-started)).
 
 In the current source after 0.2.0 (checked natively in a Linux test
 archive, [acceptance](../../docs/acceptance.md#staged-startup-server-attachments-and-device-sign-in-at-ba07516-2026-11-23-project-manager-local);

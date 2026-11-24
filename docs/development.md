@@ -189,6 +189,7 @@ turns up under the output or the app.
 
 ```sh
 dev/screenshots/capture-routing.sh ../../docs/screenshots   # same image and NSH_DIST / METRO_BIN as above
+dev/screenshots/capture-discovery.sh ../../docs/screenshots # semantic-search.png and scheduled-tasks.png, with search_fixture.py (word overlap) and scripted_model.py
 ```
 
 ## metro-connector (developer CLI)
