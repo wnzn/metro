@@ -3,6 +3,36 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: the release version moves to 0.3.0 (2026-11-24, packaging lane, local)
+
+A protected `main` push releases only when it changes the checked-in version,
+and the version has been `0.2.0` since `89eedf7` (2026-11-22). Every `main`
+push since releases were retargeted to `main` therefore decided
+`unchanged (before: 0.2.0, now: 0.2.0); CI only, no release` — as run 45361682056
+logged — so `release` and `publish` skipped and nothing was ever published.
+
+This bumps the version that the next release will carry: Cargo
+`[workspace.package] version`, `apps/desktop/nsh.json` (which must match) and
+`Cargo.lock` move to `0.3.0` together, and the three named release-file targets
+in [deploy.md](deploy.md#release-files-and-images),
+[runner.md](runner.md#separate-remote-runner) and the desktop README's download
+names move with them. `0.3.0` rather than another `0.2.x`: `0.2.0` was never
+published, and the source is well past it. Provenance prose — the 0.2.0
+candidate, the current source after 0.2.0 — is left as written, because those
+records still describe exactly what was verified.
+
+**Not yet shown:** no release, file or image exists, and no official run has
+been attempted. Merging a version bump into `main` starts the first attempt,
+and it publishes nothing until the `windows-release-signing` environment exists
+with its one `main` branch rule and `METRO_WINDOWS_SIGNING_BACKEND` and
+`METRO_WINDOWS_PUBLISHER_CN` are set, because `windows-sign` runs before
+`release_policy.py tag`. A bump to a prerelease such as `0.3.0-rc.1` would
+publish as a prerelease instead of `latest`.
+
+Checked locally, `python3 -m unittest discover -s packaging` with PyYAML
+installed: 209 tests pass (15 skipped: no PowerShell 7, `METRO_MSI_TOOLS`
+unset). `cargo metadata --locked` confirms `Cargo.lock` matches the manifests.
+
 ## Source only: CI runs only the segments a change needs (2026-11-24, CI lane, local)
 
 Uncommitted changes on `ci/path-segmentation`, on top of `17b6e3c`, to

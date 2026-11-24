@@ -10,7 +10,8 @@ source is for contributors: [development.md](development.md).
 > [Releases page](https://github.com/wnzn/metro/releases), published
 > automatically when a version bump is merged into the protected `main`
 > branch ([CI and publishing](#ci-and-publishing)). No public release, file or image
-> exists yet. The 0.2.0 names below were built and verified locally
+> exists yet. The names below are what the next release publishes; the files
+> built and verified locally so far were the 0.2.0 candidate
 > ([acceptance](acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)).
 > Each release file comes with a `.sha256` file beside it. The full release
 > file list, including the MSI, is in
@@ -20,11 +21,11 @@ source is for contributors: [development.md](development.md).
 | --- | --- | --- |
 | Server image | GitHub Container Registry | `ghcr.io/wnzn/metro-server:<tag>` |
 | Runner image | GitHub Container Registry | `ghcr.io/wnzn/metro-runner:<tag>` |
-| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases) | `Metro-0.2.0-windows-x64.zip` (+ `.sha256`) |
-| Desktop, Linux x64 | Releases | `Metro-0.2.0-linux-x64.tar.gz` (+ `.sha256`) |
-| Runner, Linux x64 binary | Releases | `Metro-runner-0.2.0-linux-x64.tar.gz` (+ `.sha256`) |
+| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases) | `Metro-0.3.0-windows-x64.zip` (+ `.sha256`) |
+| Desktop, Linux x64 | Releases | `Metro-0.3.0-linux-x64.tar.gz` (+ `.sha256`) |
+| Runner, Linux x64 binary | Releases | `Metro-runner-0.3.0-linux-x64.tar.gz` (+ `.sha256`) |
 
-`<tag>` is the release tag, `v` plus the version (for example `v0.2.0`).
+`<tag>` is the release tag, `v` plus the version (for example `v0.3.0`).
 CI creates it on the released commit; it's never moved.
 For production, pin images by digest (`…@sha256:…`), not by tag.
 

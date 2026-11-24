@@ -8,7 +8,8 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
 
 Download the build for your system from
 [Releases](https://github.com/wnzn/metro/releases). **No release has been
-published yet.** The 0.2.0 files have been built and verified locally
+published yet.** The files built and verified locally so far were the
+0.2.0 candidate
 ([evidence](../../docs/acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)), but there are no files to download yet. You never need NSH, a
 checkout or a terminal to use the app; the build commands further down are
 for contributors.
@@ -26,8 +27,8 @@ for contributors.
 - **Windows x64:** `Metro-<version>-windows-x64.zip`, a portable ZIP. See
   [Windows portable package](#windows-portable-package).
 
-Check each download against the `.sha256` file published beside it. The
-0.2.0 names are verified targets but aren't published yet.
+Check each download against the `.sha256` file published beside it. No
+version has been published yet.
 
 Per-user installer scripts for Linux and Windows, which check the
 download, add a menu entry and optionally install Linux libraries, are
@@ -549,7 +550,7 @@ with no installer. The package recorded so far was built locally as
 checks are in [acceptance](../../docs/acceptance.md#verified-windows-x64-portable-package-built-on-linux-2026-11-22-packaging-local).
 
 1. Check the ZIP against its `.sha256` file, for example with
-   `Get-FileHash Metro-0.2.0-windows-x64.zip -Algorithm SHA256` in PowerShell.
+   `Get-FileHash Metro-0.3.0-windows-x64.zip -Algorithm SHA256` in PowerShell.
 2. Extract the **whole** ZIP. Don't run the app from inside the archive.
 3. Run `Metro\Metro.exe`. Keep the `nsh` folder next to it, because it holds
    the app bundle.
