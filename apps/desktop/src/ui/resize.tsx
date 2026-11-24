@@ -2,8 +2,9 @@
 //
 // - Pointer: drag it (PanResponder; the width follows each move, and is
 //   saved when the drag ends). The resize cursor while over it, a line in
-//   the ring colour while hovered, focused or dragged. A double click puts
-//   the default width back.
+//   the ring colour while hovered, dragged or focused from the keyboard. A
+//   double click puts the default width back. No tooltip: on a band as tall
+//   as the panel it would cover the header's controls; the cursor says it.
 // - Keyboard: it is a stop of the focus (a press focuses it too); Left and
 //   Right move the edge by 16 points (Shift: 64), Home and End go to the
 //   narrowest and widest, Return or Space (its activation) restores the
@@ -15,10 +16,10 @@
 // the panel instead (the navigation snaps to its icon rail), keeping the
 // width it had for when it opens again.
 
-import { effect, keymap, PanResponder, signal, Text, untracked, View } from "nsh";
+import { effect, keymap, PanResponder, signal, untracked, View } from "nsh";
 import type { ViewRef } from "nsh";
 import type { LayoutPanel } from "./panels";
-import { cx, tooltipClass, transitionClass } from "./tokens";
+import { cx, transitionClass } from "./tokens";
 
 const STEP = 16;
 const BIG_STEP = 64;
@@ -31,7 +32,7 @@ export function ResizeHandle(props: {
   panel: LayoutPanel;
   /** Which edge of the panel the handle is on: `end` for a panel on the left (the navigation), `start` for one on the right (the runs). */
   edge: "start" | "end";
-  /** What it resizes, as screen readers and the tooltip say it ("workspace navigation"). */
+  /** What it resizes, as screen readers say it ("workspace navigation"). */
   name: string;
   collapsible?: boolean;
   testID?: string;
@@ -126,13 +127,13 @@ export function ResizeHandle(props: {
       }}
       onFocus={() => focused.set(true)}
       onBlur={() => focused.set(false)}
-      tooltip={<Text class={tooltipClass}>{`${label()} · double-click to reset`}</Text>}
     >
       <View
         class={cx(
           "h-full w-[2px] rounded-full group-hover:bg-ring group-focus-visible:bg-ring",
           transitionClass,
-          dragging() || focused() ? "bg-ring" : "bg-transparent",
+          // Lit while dragged; focus shows only when the keyboard moved it there (focus-visible).
+          dragging() ? "bg-ring" : "bg-transparent",
         )}
         accessibilityElementsHidden
       />
