@@ -388,7 +388,7 @@ function RoomComposer() {
               testID="mention-picker"
               accessibilityLabel={`Mention in #${activeRoom()?.name ?? ""}`}
             >
-              <PopoverNote text={`Mention in #${activeRoom()?.name ?? ""} · ${activeSpace()?.name ?? "this Space"}'s agents and members only · ↑↓ then Return`} />
+              <PopoverNote text={`Agents and members of ${activeSpace()?.name ?? "this Space"} · ↑↓ then Return`} />
               <SuggestionList accessibilityLabel="Mention suggestions">
                 <Each of={options()} key={(o) => o.key}>
                   {(o, index) => (
@@ -484,7 +484,7 @@ function askChooser(): JSX.Element | undefined {
       out.push({
         id: CLASSIFIER_CHOICE,
         title: "Let the classifier choose",
-        detail: "System One picks the agent for each question",
+        detail: "Your System One picks per question",
         leading: <AuthorGlyph kind="agent" tone="agent" size="sm" />,
         checked: current === CLASSIFIER_CHOICE,
         accessibilityLabel: "Let the classifier choose: your System One connection picks the agent for each question",
@@ -497,7 +497,7 @@ function askChooser(): JSX.Element | undefined {
   return (
     <AskAgentChooser
       testID="ask-agent-choose"
-      heading="Ask agent asks"
+      heading="Which agent to ask"
       choices={choices()}
       disabled={!activeRoom() || status().phase === "signedOut"}
       accessibilityLabel={`Choose which agent Ask agent asks (now ${askLabel()?.replace(/^Ask /, "") ?? "the default"})`}

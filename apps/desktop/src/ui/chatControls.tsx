@@ -271,7 +271,7 @@ export function EmojiChoice(
 /** A vertical list of suggestions (mentions): Up and Down move once the focus is in it, Return or Space picks; the composer drives it while the caret stays there. */
 export function SuggestionList(props: Testable & { accessibilityLabel: string; children?: JSX.Element }) {
   return (
-    <Toolbar axis="vertical" class="flex-col min-w-[260px] max-w-[360px] gap-px" accessibilityLabel={props.accessibilityLabel} testID={props.testID}>
+    <Toolbar axis="vertical" class="self-stretch flex-col min-w-[260px] max-w-[360px] gap-px" accessibilityLabel={props.accessibilityLabel} testID={props.testID}>
       {props.children}
     </Toolbar>
   );

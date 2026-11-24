@@ -431,12 +431,15 @@ function AgentsPage() {
       pad={pad()}
       gap={6}
       footer={
-        <Column gap={2}>
-          <Notice />
-          <If when={editing()}>
-            <EditorFooter />
-          </If>
-        </Column>
+        // Only when there is something to say or save: an empty footer would draw a bare bar.
+        spaceNotice() || editing() ? (
+          <Column gap={2}>
+            <Notice />
+            <If when={editing()}>
+              <EditorFooter />
+            </If>
+          </Column>
+        ) : undefined
       }
     >
       <If
@@ -447,8 +450,8 @@ function AgentsPage() {
               title="Agents"
               subtitle={
                 isSettingsOwner()
-                  ? "Members address an agent with its @handle; @agent and Ask agent start the default one."
-                  : "Members address an agent with its @handle; @agent and Ask agent start the default one. Only the owner can change agents."
+                  ? "Members address an agent with its @handle. @agent and Ask agent start the default one, or the agent a member's own classifier picks when they turned it on."
+                  : "Members address an agent with its @handle. @agent and Ask agent start the default one, or your classifier's pick when you turn it on. Only the owner can change agents."
               }
             >
               <If when={isSettingsOwner()}>
@@ -707,7 +710,7 @@ function PreferencesPage() {
   const spaceOptions = () => spaceModelOptions(catalog(), fallbackDetail());
   const agentOptions = () => spaceModelOptions(catalog(), "Your model for this Space, or the rule after it");
   return (
-    <PageLayout testID="space-preferences" pad={pad()} gap={6} footer={<Notice />}>
+    <PageLayout testID="space-preferences" pad={pad()} gap={6} footer={spaceNotice() ? <Notice /> : undefined}>
       <PageHeader title="Your preferences" subtitle="Only you see and change these. They apply to your own messages in this Space." />
       <If when={prefsError()}>
         {(m) => <Banner variant="inline" tone="danger" testID="prefs-error" message={m()} action={<Action label="Try again" onPress={() => void loadPreferences()} />} />}
