@@ -182,8 +182,11 @@ app, from a disposable copy in the temp directory (so the step file `nsh
 test` writes, which holds the typed token, never lands in the checkout),
 captures `model-routing.png`, `model-routing-dataflow.png`,
 `model-sharing.png` and `route-attribution.png`. The last one is a real
-turn: Alice's unaddressed message, judged by the System One fixture under
-her opt-in and routed to a use case that Bob's shared connection answers.
+turn: Alice's unaddressed message, picked up for the Space's agent by the
+System One fixture under her opt-in for that Space (`classify_unaddressed`
+in `PUT /v1/spaces/{sid}/prefs`; her `infer_addressing` covers only her
+personal Chat), and routed to a use case that Bob's shared connection
+answers.
 The script fails if a fixture rejected a request, or if any token or key
 turns up under the output or the app.
 

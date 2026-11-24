@@ -8,7 +8,7 @@ sections in this order (as verified in the 0.2.0 Linux candidate):
 | **Profile** | Your picture, display name and bio, and your **User ID**; see [spaces.md](spaces.md#profiles) |
 | **Runners** | Your registered runners; see [runners.md](runners.md) |
 | **Model providers** | Your model connections, described on this page |
-| **Model routing** | Opt-in use-case routing and classification; see [system-one.md](system-one.md#how-a-message-reaches-the-agent) |
+| **Model routing** | Opt-in use-case routing and personal Chat classification (Spaces have their own opt-in, in each Space's settings); see [system-one.md](system-one.md#how-a-message-reaches-the-agent) |
 | **Appearance** | Color scheme, [below](#appearance) |
 
 In the current source after 0.2.0, which isn't released, **Settings** is still a
@@ -18,7 +18,12 @@ searches your files ([library.md](library.md#in-the-desktop-app)). That
 choice was checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. Your account is in the sidebar's account row.
 Its menu offers **Copy server URL**, **Copy ID** and **Sign out**. The
 account row was checked in the same native GTK review, and its menu items
-are covered by automated tests.
+are covered by automated tests. Since then (not released, covered by
+automated tests only), the account card also shows the connection to the
+server (*Connecting*, *Reconnecting*, or online), and collapsing the
+sidebar leaves an icon rail with the same places: Chat, Library, Scheduled
+tasks, one tile per Space, New Space and Settings. In a very narrow window
+the sidebar hides completely.
 
 This page also covers the server settings that operators set behind them.
 
@@ -51,23 +56,45 @@ development build, before the vendor dropdown.
 ## Which model a run uses
 
 Model connections are **personal**. Each person can save up to 20, and mark
-one as their **default**. A connection needs a model before it can be the
-default.
+one as their **default** for each capability. A connection needs a model
+before it can be the default.
 
-- Every agent run uses the default connection of **the person who started
-  it**. That holds in personal Chat, in Space rooms, and in the child threads
-  that run delegates to. It never falls back to another member's
-  connection. A shared connection is used only when someone picks it
+- Every agent run uses the connections of **the person who started it**.
+  That holds in personal Chat, in Space rooms, and in the child threads that
+  run delegates to. It never falls back to another member's connection. A
+  shared connection is used only when someone picks it
   ([sharing](#sharing-a-connection)).
-- If that person has no default connection, the run uses the operator's
-  `METRO_MODEL` environment model, as before. If neither exists, Ask agent
-  reports that no model is configured.
-- If the default connection can't be used (a device that's offline, a key
-  that can't be decrypted, a revoked device token), the run **fails with a
-  clear error**. It never quietly switches to `METRO_MODEL` or to anyone
-  else's connection, so the operator's model is never billed for it.
-- The first connection you save with a model becomes your default if you
-  don't have one yet. You can change the default at any time.
+- **The order** (current source after 0.2.0, not released). A run in a
+  Space uses the first of these that is set:
+  1. the model the sender chose for that turn (the composer's **Model**);
+  2. the sender's model for that agent in this Space;
+  3. the sender's default model in this Space
+     ([per-Space preferences](spaces.md#your-preferences-in-a-space));
+  4. the sender's [use-case routing](system-one.md#use-case-routing), if
+     they turned it on and haven't turned it off for this Space;
+  5. the sender's default chat connection.
+
+  Personal Chat uses 1, 4 and 5. Every choice is one of the sender's own
+  usable connections, or one shared with them there, and it's checked again
+  when the run starts.
+- If the person has no default chat connection, the run uses the operator's
+  `METRO_MODEL` environment model, as before. Pickers show it as **Server
+  model (operator)**, and only to people with no default chat connection. If
+  neither exists, Ask agent reports that no model is configured.
+- If the chosen connection can't be used (a device that's offline, a key
+  that can't be decrypted, a revoked device token, a model that's no longer
+  enabled), the run **fails with a clear error**. It never quietly switches
+  to the next item in the order, to `METRO_MODEL` or to anyone else's
+  connection, so the operator's model is never billed for it.
+- **Defaults are automatic.** The first connection of a capability that
+  gets a model becomes your default for that capability if you don't have
+  one yet. Deleting your default makes your oldest remaining connection of
+  that capability (with a model) the default. You can change the default at
+  any time.
+- **When nothing can answer** (no chat connection of your own, none shared
+  with you, and no operator model), the desktop's **Model providers** page
+  shows an *Add a model to start chatting* card with the ways this server
+  offers.
 - **Per-message choice.** In the 0.2.0 release this exists only in personal
   Chat, and only as a connection: a message to the agent in your own Chat
   can name one of your other connections for that one reply
@@ -87,14 +114,21 @@ default.
   `POST /v1/chat/messages` and on room messages. The desktop composer's
   **Model** button sets them for that place.
   - `GET /v1/models/available?space_id=SID` (or without it, for your Chat)
-    lists what you may choose there: every model of your own connections
-    (for a device connection, only the models you approved, and only while
-    it's online), and the one saved model of each connection shared with
-    you, with that Space or with the organization. Each model lists its
-    `reasoning_efforts`.
-  - Levels are offered only for exact model IDs Metro knows: Sign in with
+    lists what you may choose there: the enabled models of your own
+    connections, and of each connection shared with you, with that Space or
+    with the organization (for a device connection, only the models
+    approved on the device, and only while it's online). A shared Sign in
+    with ChatGPT preset offers only its one model. Each chat connection's
+    `chat_models` gives each model's `id`, `display_name` and
+    `reasoning_efforts`. `chat_providers` groups the usable chat
+    connections by provider for pickers, and `operator_model` is the
+    **Server model (operator)** when it's what Ask agent would use for you
+    (otherwise `null`).
+  - Levels are offered for exact model IDs Metro knows (Sign in with
     ChatGPT, and OpenAI or Anthropic API profiles on their standard
-    endpoints. Anywhere else, the list is empty and a level is refused.
+    endpoints), and for the thinking options the owner set on a model of a
+    self-hosted endpoint ([model lists](#each-connections-model-list)).
+    Anywhere else, the list is empty and a level is refused.
   - `model_id` or `reasoning_effort` without `provider_connection_id` is a
     `400`. A model or level that isn't offered there is refused before
     anything is stored.
@@ -143,6 +177,10 @@ connections.
 
 - **Use only.** Borrowers never see the base URL, key, sign-in or pairing
   token, and they can't manage, share or delete the connection.
+- **Any model the owner left enabled.** A borrower may pick any enabled
+  model of the connection's [model list](#each-connections-model-list).
+  The owner controls this by disabling models; a model the owner disables
+  stops being offered, and a turn already set to it fails.
 - **The owner sees and pays.** A borrowed connection runs on the owner's
   endpoint, key or device. The owner can see those requests, and may be
   billed for them. The model list marks these entries `runs_on:
@@ -361,10 +399,23 @@ connector says so. Then disconnect Metro in ChatGPT's settings.
 
 **Models and requests.**
 
-- Listing models asks OpenAI for your account's models.
+- Listing models asks OpenAI for your account's models. In the current
+  source after 0.2.0, the device also reports the catalog's display names
+  (short, printable names only), which the model list shows.
 - Requests go to the Responses API with `store: false`, and only a completed
   response counts as success. Tool calls come back to Metro, and the
   connector runs no tools itself.
+- In the current source after 0.2.0, a successful (`200`) answer is read
+  as an event stream, as a whole JSON Responses object, or, without a
+  recognized `content-type`, by checking which of the two it is. Output
+  items and message parts it doesn't know are skipped. An answer it still
+  can't read fails as `chatgpt_unusable_response`, and the device's own
+  failure record adds only the answer's media-type class (`event_stream`,
+  `json`, `other` or `missing`).
+- When the answer includes a reasoning summary, its text is passed on and
+  shown in the run's activity as a `reasoning_summary` event. Encrypted or
+  raw reasoning is never passed on, and the request itself is unchanged:
+  Metro doesn't ask for a summary.
 - Request options that this route doesn't support are **rejected**, never
   silently dropped. These include `temperature`, `top_p`, `max_tokens`,
   `stop`, `seed`, the penalties and `n` > 1.
@@ -417,7 +468,12 @@ setup ([commands](development.md#metro-connector-developer-cli)).
 
 Your own OpenAI-compatible endpoint, such as a local inference server or a
 gateway. Use it with your own key, or `--no-api-key`. The base URL is set
-on your machine only.
+on your machine only. In the current source after 0.2.0, a thinking level
+you set up for one of its models ([model lists](#each-connections-model-list))
+is forwarded unchanged as `reasoning_effort` or `reasoning: {"effort"}`
+(1–32 characters of `a-z`, `0-9`, `_`, `-`). Sign in with ChatGPT accepts
+only its own level names and refuses the nested form, and the other kinds
+refuse both.
 
 ### What has been tested
 
@@ -473,21 +529,75 @@ enter once.
   allowed.
 - `POST /v1/providers/{id}/models` asks that connection's provider (or your
   connector, for a device connection) for its current models. The list comes
-  back sorted, without duplicates, and capped at 1000 ids. If listing isn't
-  available or fails, type the model id yourself.
+  back sorted, without duplicates, and capped at 1000 ids. For a chat
+  connection, the answer is also merged into its
+  [model list](#each-connections-model-list). If listing isn't available or
+  fails, add the model id yourself.
 
 | Request | Result |
 | --- | --- |
 | `GET /v1/provider-catalog` | What this server can connect to |
-| `GET /v1/providers` | Your connections: `id`, `name`, `provider_id`, `base_url`, `model`, `is_default`, `has_key`, `execution` |
-| `POST /v1/providers` `{"name", "provider_id", "base_url"?, "api_key"?, "model"?, "is_default"?}` | `201` with the connection. With a model, and no default yet, it becomes your default. |
+| `GET /v1/providers` | Your connections: `id`, `name`, `provider_id`, `base_url`, `model`, `is_default`, `has_key`, `execution`, `custom_thinking` and `models` (the model list) |
+| `POST /v1/providers` `{"name", "provider_id", "base_url"?, "api_key"?, "model"?, "is_default"?, "fetch_models"?, "models"?}` | `201` with the connection. `fetch_models: true` lists the provider's chat models right after saving and adds them all, enabled; a failed listing doesn't fail the create and is reported in `models_error`. `models` adds model ids by hand: `[{"model_id", "display_name"?, "thinking"?}]`. With a model, and no default yet, it becomes your default. |
 | `PATCH` / `DELETE /v1/providers/{id}` | Change or delete your connection |
-| `POST /v1/providers/{id}/models` | List the provider's models: server-side for API profiles, through your connector for device connections |
+| `POST /v1/providers/{id}/models` | List the provider's models: server-side for API profiles, through your connector for device connections. For chat connections it also returns `added`, `unavailable` and the updated `connection`. |
 | `POST` / `GET` / `DELETE /v1/providers/{id}/device-token` | Device connections only: create or replace, show pairing and online state, revoke |
 
 Only the owner can see or manage a connection. Other people's ids get `404`.
 A share lets someone else *use* it ([sharing](#sharing-a-connection)), but
 never see or manage it.
+
+## Each connection's model list
+
+(Current source after 0.2.0, not released.) Each chat connection keeps its
+own list of the models that may be picked on it. The connection's `model`
+is its default model and is always one of its enabled models.
+
+- **Listed models are opt-out.** When the owner fetches a provider's list
+  (on create with `fetch_models`, or later with **Refresh models**), every
+  listed model is added **enabled**, up to 1,000. The owner turns off the
+  ones they don't want offered.
+- **Refresh** adds newly listed models, enabled, and marks models that are
+  no longer listed **unavailable**. It never deletes the owner's entries or
+  the names they gave.
+- **Names.** A model shows the owner's own name, else the provider's
+  catalog name (for Sign in with ChatGPT, the names the device reports),
+  else its id.
+- **Manual models.** The owner can add any model id by hand, which is the
+  way for custom and self-hosted endpoints whose provider has no listing.
+  A model can be removed (a listed one comes back, enabled, on the next
+  refresh, so turn it off instead). The default model can't be removed or
+  disabled until another one is the default.
+- **Thinking options for self-hosted endpoints.** On `custom`,
+  `device-openai-compatible` and the registered OpenAI-format gateways other
+  than OpenAI itself, each model can carry its own thinking options: up to 8
+  effort values (1–32 characters of `a-z`, `0-9`, `_`, `-`) and the
+  **wire** they're sent with: `none` (nothing is sent),
+  `reasoning_effort` (Chat Completions' top-level `"reasoning_effort"`) or
+  `reasoning` (`"reasoning": {"effort": …}`). The connection's
+  `custom_thinking` says whether it takes them. Other providers use Metro's
+  documented lists and refuse thinking options.
+- For a device connection, the device's approved models are its listing:
+  each one is offered unless the owner disabled it here.
+- Only the owner manages the list. A share grants use of the enabled
+  models, never management.
+
+| Request | Result |
+| --- | --- |
+| `GET /v1/providers/{id}/model-list` | `{"connection_id", "default_model", "custom_thinking", "models": [{"model_id", "display_name", "custom_name", "listed_name", "enabled", "available", "source": "listed"\|"manual", "position", "is_default", "thinking", "reasoning_efforts"}]}` |
+| `POST /v1/providers/{id}/model-list` `{"model_id", "display_name"?, "thinking"?, "enabled"?, "default"?}` | Add a model by hand |
+| `PATCH /v1/providers/{id}/model-list` `{"model_id", "display_name"?, "enabled"?, "thinking"?, "position"?, "default"?}` | Rename (`null` or `""` goes back to the catalog name), enable or disable, set or clear (`null`) thinking options, reorder, or make it the default model |
+| `DELETE /v1/providers/{id}/model-list?model_id=ID` | Remove a model (not the default model) |
+| `POST /v1/providers/{id}/model-list/refresh` | The same as `POST /v1/providers/{id}/models` |
+
+In the desktop app, **Model providers** groups your connections by
+capability (Chat, System One, Embeddings) in compact rows. A connection's
+details page has its **Models** (switches, names, **Make default**,
+**Refresh models**, **Add model** with thinking levels and wire for
+self-hosted endpoints), and its device, key, sharing and delete controls.
+The composer and **Model routing** use one searchable model picker, grouped
+by provider, that shows each model's name with its id, whose connection it
+is, and the **Server model (operator)** when it applies.
 
 ## Operator settings
 
@@ -497,7 +607,7 @@ never see or manage it.
 | `METRO_PROVIDER_KEY_FILE` | The same value, read from a file. Set only one of the two. The server warns if the file is readable by others, or if it sits beside the database. |
 | `METRO_PROVIDER_ALLOWED_BASE_URLS` | JSON array of the exact custom base URLs people may use, for example `'["https://llm.internal.example/v1"]'` |
 | `METRO_ORG_ADMINS` | JSON array of stable user ids, see [below](#organization-admins) |
-| `METRO_MODEL`, `METRO_MODEL_BASE_URL`, `METRO_MODEL_API_KEY` | The fallback model for people with no default connection |
+| `METRO_MODEL`, `METRO_MODEL_BASE_URL`, `METRO_MODEL_API_KEY` | The model for people with no default chat connection, shown to them as **Server model (operator)**. It's never used after someone's own connection fails. |
 
 **Without a master key**, nobody can save an API key (`409`), and keyless and
 device connections still work. **If the master key changes or is lost**, saved
@@ -561,6 +671,16 @@ isn't secret and never leaves the device.
   - A routed turn's group can show its route, for example *detected by
     System One* and the use case. It never shows connection ids, prompts or
     credentials ([screenshot](screenshots/route-attribution.png)).
+  - In the current source after 0.2.0 (not released), the group is named
+    after the Space agent working the turn, can show how that agent was
+    chosen (for example *Picked by classifier: Coder*), and shows the
+    provider's reasoning summaries (`reasoning_summary` events) as
+    plain text. Collapsed, the group is one summary line (for example
+    *thought 12s · 2 tools*); while live it names the current step and
+    offers **Stop** when the run can still be stopped. Opened, it's a
+    timeline: the route, each tool call with its short arguments and its
+    output in a bounded, copyable code view, the reasoning summaries, and
+    any failure as one sentence with the technical text under **Details**.
 - Demo never calls a model. Its call and listing show as one collapsed
   *Runner activity* group.
 - People's messages, the agent's replies, errors and reactions always stay

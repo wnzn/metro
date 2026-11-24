@@ -73,12 +73,31 @@ The live dev service's profile read endpoints were also checked.
 - Only the **owner** adds or removes members, and chooses the Space's runner.
   Nobody can add themselves, and the owner can't be removed. Removing a member
   also stops their running agent runs in that Space.
+- Only the owner renames the Space and edits its **description** (optional,
+  at most 500 characters). Every member sees both.
+- **Leaving.** Any member except the owner can leave. Leaving works exactly
+  like being removed: their runs in the Space stop, and their own
+  [library index rows](library.md) and [per-Space
+  preferences](#your-preferences-in-a-space) for it are deleted. The owner
+  can't leave; they can only delete the Space.
+- **Deleting** is permanent and owner-only, and the owner must type the
+  Space's exact name to confirm (`confirm_name`). One transaction removes
+  everything in it: rooms, threads, messages and other events, reactions,
+  attachment links, the Space's library files and everyone's index rows of
+  them, search vectors, scheduled prompts, connection shares to the Space,
+  everyone's per-Space preferences, its agents and its monitoring events.
+  Its registered runner is detached, and its dedicated runner token is
+  revoked, so queued and claimed jobs fail. Its running agent runs stop.
 - A Space holds at most 100 members and 200 rooms, threads included.
 
 | Request | Who | Result |
 | --- | --- | --- |
-| `GET /v1/spaces` | anyone | `{"spaces": [{"id", "name", "role", "runner_paired"}]}`, only your Spaces |
+| `GET /v1/spaces` | anyone | `{"spaces": [{"id", "name", "description", "role", "runner_paired"}]}`, only your Spaces. `description` is `""` when none was set. |
 | `POST /v1/spaces` `{"name"}` | anyone | `201` with the Space, `role: "owner"` |
+| `GET /v1/spaces/{sid}` | members | The Space, in the same shape |
+| `PATCH /v1/spaces/{sid}` `{"name"?, "description"?}` | owner | The changed Space |
+| `DELETE /v1/spaces/{sid}` `{"confirm_name"}` | owner | `204`. A name that doesn't match exactly gets `400`, and nothing is deleted. |
+| `POST /v1/spaces/{sid}/leave` `{}` | members except the owner | `{"left": true, "stopped_runs": n}`. The owner gets `409`. |
 | `GET /v1/spaces/{sid}/members` | members | `{"members": [{"user_id", "role"}]}` |
 | `POST /v1/spaces/{sid}/members` `{"user_id"}` | owner | `201` when added, `200` if already a member |
 | `DELETE /v1/spaces/{sid}/members` `{"user_id"}` | owner | `{"removed": true, "stopped_runs": n}` |
@@ -88,30 +107,128 @@ People outside a Space get **404**, the same as for a Space that doesn't
 exist, so Metro never reveals whether a Space exists. Members who try an
 owner-only action get **403**.
 
+## Agents
+
+A Space has one or more **agents**, at most 16. Each has:
+
+- a **name** (up to 64 characters) and a **@handle** (up to 32 of `a-z`,
+  `0-9`, `_` and `-`), unique in the Space and different from every
+  member's id. Members mention it as `@handle`;
+- a required one-line **description** (up to 160 characters), which the
+  [classifier](#messages-and-addressing) uses to choose between agents;
+- optional **instructions** (up to 4,000 characters). They're added after
+  Metro's built-in instructions and can't replace or lift them;
+- a **picture** (PNG or JPEG, re-encoded like a profile avatar), or its
+  initial on one of eight colours;
+- a **tool allowlist**: a subset of the run's tools (`workspace.list`,
+  `workspace.read`, `workspace.check`, `workspace.mcp_list`,
+  `workspace.mcp` and `threads`). With none,
+  it can only answer. The allowlist only narrows what the run would have
+  anyway: a Space without a runner still has no workspace tools, and a
+  thread never gets thread tools.
+
+Exactly one agent is the Space's **default**. Every Space starts with one
+default agent, named *Metro*, with the handle `agent` and every tool; Spaces
+created before agents existed get the same one, so they behave as before.
+`agent` is reserved: only that agent may keep it, and the generic `@agent`
+always means "the default agent, or the one the classifier picks" (below).
+
+- Only the owner creates, edits and deletes agents, sets pictures and picks
+  the default. Members read everything, instructions included. Outsiders
+  get `404`, and members who try to change an agent get `403`.
+- The last agent can't be deleted. Deleting the default makes the oldest
+  remaining agent the default.
+- Each run records its agent, and every event of the run carries it
+  (`activity.agent`: id, handle, name, picture version and colour). Its
+  `started` marker also says how the agent was chosen (`activity.pick`, for
+  example *Addressed: @coder*, *Default agent* or *Picked by classifier:
+  Coder*).
+- Threads an agent's run creates keep that agent.
+- [Scheduled prompts](schedules.md) in a Space use its default agent.
+
+| Request | Who | Result |
+| --- | --- | --- |
+| `GET /v1/spaces/{sid}/agents` | members | `{"agents": [...], "tools": [...]}`, the default first. `tools` lists every allowlist entry. |
+| `POST /v1/spaces/{sid}/agents` `{"name", "handle", "description", "instructions"?, "tools"?, "color"?, "is_default"?}` | owner | `201` with the agent. Without `tools`, it gets every tool. |
+| `GET` / `PATCH` / `DELETE /v1/spaces/{sid}/agents/{aid}` | members read, owner changes | `PATCH` takes the same fields. `is_default` can only be set to `true`. A taken handle, `agent` for another agent, a 17th agent or deleting the last one gets `409`. |
+| `GET` / `PUT` / `DELETE /v1/spaces/{sid}/agents/{aid}/avatar` | members read, owner changes | The picture, read with your bearer token only and never cached |
+
+## Your preferences in a Space
+
+Each member has their own preferences in each Space
+(`GET` / `PUT /v1/spaces/{sid}/prefs`). Only they read or write them, and
+leaving or being removed deletes them.
+
+| Field | Meaning |
+| --- | --- |
+| `classify_unaddressed` | Let your System One connection decide whether your unaddressed messages here are for one of the Space's agents, and which. Off by default. It can be turned on only while you have a System One connection usable in this Space (otherwise `409`); `classifier_available` in the answer says whether you do. See [system-one.md](system-one.md#opt-in-classification-of-unaddressed-messages). |
+| `default_model` | `{"provider_connection_id", "model_id"?, "reasoning_effort"?}`: your chat model for every agent here |
+| `agent_models` | Per agent id, your chat model for that agent here |
+| `routing` | Whether your [use-case routing](system-one.md#use-case-routing), if you turned it on, applies here. Default on. |
+
+Every model you pick must be a chat connection you can use in this Space:
+your own, or one shared with this Space or the organization. It's checked
+when you save and again on every run. The order a run's model is chosen in
+is in [settings.md](settings.md#which-model-a-run-uses).
+
+**In the desktop app** (current source after 0.2.0, not released), a Space's
+settings window has four pages: **General** (name and description; **Leave
+Space…** for members, **Delete Space…** with the typed name for the owner),
+**Members and runner** (a link to the owner's member and runner
+management), **Agents** (cards with picture, handle, description and a
+*Default* tag; the owner adds, edits, makes default and deletes, and the
+editor says that members can read the instructions) and **Your
+preferences** (the classification opt-in, offered only when you have a
+usable System One connection, your default model here and per agent, and
+whether your model routing applies here). In the composer, `@` lists the
+Space's agents and members: **↑**/**↓** move, **Tab** or **Return**
+inserts, **Esc** closes the list.
+
 ## Messages and addressing
 
-| You write | Addressed to | Agent starts? |
+| You write | Addressed to | Which agent runs |
 | --- | --- | --- |
-| `Can someone review this?` | the room | no |
-| `@bob can you review this?` | Bob | no |
-| `@agent summarize today` | the agent | yes |
-| `@bob @agent check greet.sh` | Bob and the agent | yes |
-| any text sent with **Ask agent** | the agent | yes |
+| `Can someone review this?` | the room | none (unless you [opted in](#your-preferences-in-a-space), below) |
+| `@bob can you review this?` | Bob | none, ever |
+| `@coder fix the build` | the agent `@coder` | `@coder` |
+| `@coder @writer draft and check this` | both agents | one run each |
+| `@agent summarize today` | the generic agent | the default agent, or the classifier's pick |
+| `@bob @agent check greet.sh` | Bob and the generic agent | as for `@agent` |
+| any text sent with **Ask agent** | the generic agent, or the agent you picked | as for `@agent`, or that agent |
 
-Mentioning a person never starts agent work. Only `@agent` or Ask agent does.
-That's the default. A [scheduled prompt](schedules.md) counts as its owner
-writing `@agent`.
-A person can also opt in to having System One judge their own unaddressed
-messages ([system-one.md](system-one.md#opt-in-classification-of-unaddressed-messages)).
-It's off by default, and it only ever judges messages with no mention that
-weren't sent with Ask agent. Explicit recipients always decide who a message is
-addressed to. In text, `@agent` and `@<member id>` count only as standalone handles, and
-`@<member id>` only for current members of the Space. The agent's history shows each message's
+Explicit recipients always decide who a message is addressed to:
+
+- **People only** (`@bob`, no agent, not sent with Ask agent) never starts
+  an agent and is never sent to System One.
+- **An agent's `@handle`** (or Ask agent with that agent chosen) starts that
+  agent, with no classification. Several agents mentioned start one run
+  each; one agent mentioned twice still runs once.
+- **`@agent` or Ask agent without an agent** starts the default agent. If
+  the sender [opted in](#your-preferences-in-a-space) to classification in
+  this Space (which needs a usable System One connection) and the Space has
+  more than one agent, one System One Choice over the agents (with no "no
+  agent" option) picks one instead, on the sender's System One connection.
+  An unsure answer keeps the default agent. If the decision fails (the
+  connection errs, times out, answers malformed or can no longer be used),
+  the room shows an error and no agent runs for `@agent`.
+- **Unaddressed** text is ordinary conversation, unless the sender opted in
+  here. Then one System One Choice over the agents plus *No agent* decides;
+  only a clear pick starts that agent, as the sender. *No agent*, an unsure,
+  malformed or failed answer starts nothing. See
+  [system-one.md](system-one.md#opt-in-classification-of-unaddressed-messages).
+
+A [scheduled prompt](schedules.md) counts as its creator asking the Space's
+default agent, with no classification. In text, `@agent`, `@<agent handle>`
+and `@<member id>` count only as standalone handles, and `@<member id>` only
+for current members of the Space. The agent's history shows each message's
 author and recipients, so it can tell a question for Bob from one for itself.
 
 - `POST /v1/spaces/{sid}/rooms/{rid}/messages`
-  `{"text", "invoke_agent"?, "mentions"?}` returns `202` with the event.
-  `mentions` is a list of up to 32 recipients, each `{"kind":"agent"}` or
+  `{"text", "invoke_agent"?, "agent_id"?, "mentions"?}` returns `202` with
+  the event. `agent_id` goes with `invoke_agent` to ask one agent instead of
+  the generic one. `mentions` is a list of up to 32 recipients, each
+  `{"kind":"agent"}` (the generic `@agent`),
+  `{"kind":"agent","agent_id":"ag-…"}` (one agent) or
   `{"kind":"user","id":"<member id>"}`. The desktop picker sends these, which
   also works for opaque OIDC ids that nobody would type.
   In the current source after 0.2.0 (not released), a message to the agent
@@ -121,7 +238,12 @@ author and recipients, so it can tell a question for Bob from one for itself.
   [settings.md](settings.md#which-model-a-run-uses).
 - `GET /v1/spaces/{sid}/rooms/{rid}/events?after=<id>` returns
   `{"events": [...]}`. Message events carry `mentions` and an `audience`:
-  `room`, `agent`, `users` or `mixed`.
+  `room`, `agent`, `users` or `mixed`. A `reasoning_summary` event holds the
+  reasoning summary a provider returned for one model turn of a run (for
+  example ChatGPT's, through a device connection), as the provider sent it,
+  at most 4,000 characters, tagged with the run's activity. It's never a
+  message, never part of the model's history and never indexed for search.
+  Metro never writes one of its own, and redacted reasoning is skipped.
 - `POST /v1/spaces/{sid}/rooms/{rid}/demo` `{}` runs `workspace.list` on the
   Space's runner and never calls a model. It returns `409` if the Space has no
   paired runner.
@@ -178,8 +300,10 @@ A room's agent can delegate work to **child threads** with the tools
 
 - A thread is a child room with its own persistent transcript. The desktop
   shows it under its parent room (`parent_room_id`), with a link back.
-- A thread inherits its Space's members and paired runner. Its results are
-  posted back to the parent room as `thread` events.
+- A thread inherits its Space's members and paired runner, and keeps the
+  agent and the model connection of the run that created it. Its results
+  are posted back to the parent room as `thread` events.
+- Only an agent whose allowlist includes `threads` gets the thread tools.
 - Threads go only one level deep: a thread can't create threads. A room can
   have at most 16 of them.
 

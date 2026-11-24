@@ -6,7 +6,9 @@ Metro is a self-hosted place where people and an agent work together.
   even when they belong to no Spaces, and it shows their agent runs across
   Spaces.
 - **Spaces:** private groups of rooms. Anyone can create one, and its owner
-  decides who else joins. A Space's agent can hand work to **child threads**.
+  decides who else joins. A Space has one or more agents, each with its own
+  `@handle`, instructions and tools, and they can hand work to **child
+  threads**.
 - **Runners:** a Space can use one optional runner, a process on someone's
   machine that gives the agent tools over that Space's directory. It's either
   dedicated to the Space, or a registered personal or organization runner
@@ -91,12 +93,17 @@ on native Windows. macOS hasn't been tried.
   Both are verified at the API, and editing your profile was verified in
   the 0.2.0 Linux candidate ([details](docs/spaces.md#profiles)).
 - **Spaces are private.** Only members see a Space, its rooms and its threads.
-  Only the owner adds or removes members, or chooses the Space's runner.
-  Nobody can add themselves.
-- **Addressing.** `@bob` speaks to Bob and never wakes the agent. `@agent`, or
-  the **Ask agent** button, starts an agent reply. You can tag both in one
-  message. Text with no tag is ordinary room conversation, and in your
-  personal Chat it's a note to yourself. In the current source after 0.2.0
+  Only the owner adds or removes members, chooses the Space's runner,
+  renames or deletes the Space, and manages its agents. Nobody can add
+  themselves, and any member except the owner can leave. Members can read
+  every agent's settings, instructions included
+  ([details](docs/spaces.md#agents)).
+- **Addressing.** `@bob` speaks to Bob and never wakes an agent. An agent's
+  `@handle` starts that agent (one run per agent mentioned). `@agent`, or the
+  **Ask agent** button, starts the Space's default agent, or the one your
+  opt-in classifier picks. You can tag people and agents in one message.
+  Text with no tag is ordinary room conversation, and in your personal Chat
+  it's a note to yourself. In the current source after 0.2.0
   (not released), personal Chat makes **Ask agent** the default for typed
   text when a chat model is ready and System One isn't set up, with **Save
   note** beside it ([details](apps/desktop/README.md#what-it-does)).
@@ -111,11 +118,13 @@ on native Windows. macOS hasn't been tried.
 - **Runs.** Chat lists the agent runs in your Spaces. You can open one, follow
   up, or stop it. You can stop your own runs, and an owner can stop any run in
   their Space.
-- **Whose model.** Every agent run, child threads included, uses the default
-  model connection of the person who started it. People without one fall
-  back to the server's `METRO_MODEL`. A connection that can't be used fails
-  the run with a clear error and never falls back silently
-  ([details](docs/settings.md)). In the current source after 0.2.0 (not
+- **Whose model.** Every agent run, child threads included, uses the model
+  connections of the person who started it: a model picked for that turn,
+  else their model for that agent or Space, else their routing or default
+  chat connection. People without a default chat connection use the
+  server's `METRO_MODEL`, shown as *Server model (operator)*. A connection
+  that can't be used fails the run with a clear error and never falls back
+  silently ([details](docs/settings.md#which-model-a-run-uses)). In the current source after 0.2.0 (not
   released), the composer's **Model** button can choose a model, and where
   supported a thinking level, for agent turns in your Chat or in a Space,
   from the connections you may use there. The server checks the choice
@@ -138,7 +147,7 @@ The full behaviour and the API are in [docs/spaces.md](docs/spaces.md).
 - [Separate chat, System One and embeddings connections](docs/settings.md#capabilities).
 - [Sharing a connection](docs/settings.md#sharing-a-connection) with Spaces
   or the organization.
-- [Opt-in classification and use-case routing](docs/system-one.md#how-a-message-reaches-the-agent).
+- [Opt-in classification (per Space) and use-case routing](docs/system-one.md#how-a-message-reaches-the-agent).
 - [Semantic search](docs/system-one.md#semantic-search).
 - [Documents & media](docs/library.md): a library of files you upload
   yourself, with search by content.
