@@ -64,23 +64,30 @@ fn pid_alive(pid: u32) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
-/// The process has fully exited, so its parent's wait can see it: gone, or
-/// only its main thread is left and that is a zombie. (The main thread turns
-/// into a zombie while other threads are still exiting, and the OS holds its
-/// exit back until they have all been removed.)
+/// The server (a child of this test process) has exited and its parent's
+/// wait can see it. Asks the OS directly with `WNOWAIT`, so the launcher can
+/// still reap it; `ECHILD` means the launcher already has. (Guessing this
+/// from `/proc` thread lists raced with the kernel's delayed exit report of a
+/// multithreaded process and failed CI once.)
 fn exited(pid: u32) -> bool {
-    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
-        return true;
+    // SAFETY: an all-zero siginfo_t is valid; waitid only fills it in.
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    // SAFETY: WNOWAIT leaves the child waitable; `info` outlives the call.
+    let r = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
     };
-    let names: Vec<String> = tasks
-        .flatten()
-        .map(|t| t.file_name().to_string_lossy().into_owned())
-        .collect();
-    names == [pid.to_string()]
-        && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|stat| {
-            stat.rsplit_once(')')
-                .is_some_and(|(_, rest)| rest.trim_start().starts_with('Z'))
-        })
+    if r != 0 {
+        let err = std::io::Error::last_os_error();
+        assert_eq!(err.raw_os_error(), Some(libc::ECHILD), "waitid: {err}");
+        return true;
+    }
+    // With WNOHANG and nothing to report, the zeroed siginfo stays zero.
+    info.si_signo == libc::SIGCHLD
 }
 
 fn server_pid(root: &Path) -> u32 {
