@@ -276,9 +276,11 @@ export function RailButton(props: {
 
 /** A single tinted silhouette and wordmark, with one accessible name. */
 export function MetroMark(props: { size?: "sm" | "lg"; symbolOnly?: boolean }) {
-  // The symbol alone: 50 wide, or 34 in the 56-wide icon rail (size "sm").
-  const width = () => props.symbolOnly ? (props.size === "sm" ? 34 : 50) : props.size === "lg" ? 174 : 126;
-  const height = () => width() * 96 / (props.symbolOnly ? 200 : 498);
+  // Whole, even heights, as the header's 36-point controls have: centred in
+  // the same band they round to the same rows (no half-pixel drift). The
+  // symbol alone is 16 high in the 56-wide icon rail (size "sm"), else 24.
+  const height = () => props.symbolOnly ? (props.size === "sm" ? 16 : 24) : props.size === "lg" ? 34 : 24;
+  const width = () => height() * (props.symbolOnly ? 200 : 498) / 96;
   return (
     <Image
       src={props.symbolOnly ? metroIcon : metroHorizontal}
