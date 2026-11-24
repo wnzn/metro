@@ -76,6 +76,7 @@ jobs:
   runner-linux:
     needs: meta
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -254,6 +255,7 @@ jobs:
   desktop-windows:
     needs: [meta, ui]
     runs-on: windows-2025
+    timeout-minutes: 40
     defaults:
       run:
         shell: pwsh
@@ -640,6 +642,7 @@ jobs:
   desktop-linux:
     needs: [meta, ui]
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
@@ -743,42 +746,10 @@ jobs:
             sleep 1
           done
           echo "metro-server did not answer /healthz" >&2; exit 1
-      # Previews only, like the Rust cache: the real --install-deps run below
-      # reuses the .debs an earlier main push downloaded (about 60 MB from a
-      # slow mirror). `apt-get update` still runs, and apt checks every cached
-      # .deb against those signed indexes, so a stale or odd archive only costs
-      # a download. Only main pushes save; release builds never use it.
-      - name: Apt archive cache key (previews only)
-        id: apt-key
-        if: ${{ !inputs.release }}
-        run: |
-          set -eu
-          # The installer uses apt-get, which keeps what it downloads unless a
-          # hook deletes it (as Docker's docker-clean does).
-          if apt-config dump | grep -i 'Post-Invoke' | grep -q 'archives'; then
-            echo "::warning::an apt hook deletes downloaded archives; nothing will be cached"
-          fi
-          . /etc/os-release
-          echo "prefix=desktop-linux-apt-$ID-$VERSION_ID-$(dpkg --print-architecture)-" >> "$GITHUB_OUTPUT"
-      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        id: apt-cache
-        if: ${{ !inputs.release }}
-        with:
-          path: ${{ runner.temp }}/apt-archives
-          key: ${{ steps.apt-key.outputs.prefix }}${{ hashFiles('packaging/install-metro-linux.sh') }}
-          restore-keys: |
-            ${{ steps.apt-key.outputs.prefix }}${{ hashFiles('packaging/install-metro-linux.sh') }}-
-            ${{ steps.apt-key.outputs.prefix }}
-      - name: Hand the restored archives to apt (previews only)
-        if: ${{ !inputs.release }}
-        run: |
-          set -eu
-          dir="$RUNNER_TEMP/apt-archives"
-          if [ -d "$dir" ]; then
-            find "$dir" -maxdepth 1 -type f -name '*.deb' -exec sudo cp -t /var/cache/apt/archives/ -- {} +
-          fi
-          echo "$(find /var/cache/apt/archives -maxdepth 1 -type f -name '*.deb' | wc -l) .deb archives in apt's cache"
-      - name: Per-user desktop installer (explains missing libraries, --install-deps, update, uninstall keeps data)
+      # No network: --install-deps (a ~60 MB download from a slow mirror) and
+      # install, update and uninstall without the libraries are covered by
+      # packaging/test_installers.py with fake tools.
+      - name: Per-user desktop installer (explains missing libraries; install, update, uninstall when present)
         env:
           VERSION: ${{ needs.meta.outputs.version }}
         run: |
@@ -788,61 +759,31 @@ jobs:
           unset XDG_CONFIG_HOME XDG_DATA_HOME
           i="$GITHUB_WORKSPACE/packaging/install-metro-linux.sh"
           a="$GITHUB_WORKSPACE/dist/Metro-$VERSION-linux-x64.tar.gz"
+          app="$home/.local/share/metro-desktop-app"
+          entry="$home/.local/share/applications/dev.metro.desktop.desktop"
           mkdir -p "$home/.config/metro-desktop" && echo keep > "$home/.config/metro-desktop/marker"
-          if ldd "$METRO_ROOT/ui/Metro" | grep -q 'not found'; then
-            # Without --install-deps nothing on the system changes and the exact command is shown.
-            if sh "$i" install --archive "$a" 2>"$RUNNER_TEMP/deps.err"; then
+          if ldd "$METRO_ROOT/Metro" "$METRO_ROOT/metro-server" "$METRO_ROOT/ui/Metro" | grep -q 'not found'; then
+            # Without --install-deps it refuses, shows the exact command and changes nothing.
+            if sh "$i" install --archive "$a" </dev/null 2>"$RUNNER_TEMP/deps.err"; then
               echo "installed without its runtime libraries" >&2; exit 1
             fi
             grep -F 'sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 gstreamer1.0-plugins-base' "$RUNNER_TEMP/deps.err"
-            test ! -e "$home/.local/share/metro-desktop-app"
+            grep -F -- '--install-deps' "$RUNNER_TEMP/deps.err"
+            test ! -e "$app" && test ! -e "$entry"
+          else
+            # The libraries are already here, so the real lifecycle needs no download.
+            sh "$i" install --archive "$a" </dev/null
+            test -f "$app/current/enable-local-runner"
+            grep -F "Exec=/usr/bin/env \"$app/versions/$VERSION/Metro\"" "$entry"
+            sh "$i" check-deps
+            sh "$i" update --archive "$a" --no-local-runner
+            test ! -e "$app/current/enable-local-runner"
+            sh "$i" update --archive "$a"
+            test ! -e "$app/current/enable-local-runner"
+            sh "$i" uninstall
+            test ! -e "$app" && test ! -e "$entry"
           fi
-          # apt-get asks before installing; the CI answers for the person.
-          yes | DEBIAN_FRONTEND=noninteractive sh "$i" install --archive "$a" --install-deps
-          test -f "$home/.local/share/metro-desktop-app/current/enable-local-runner"
-          grep -F "Exec=/usr/bin/env \"$home/.local/share/metro-desktop-app/versions/$VERSION/Metro\"" \
-            "$home/.local/share/applications/dev.metro.desktop.desktop"
-          sh "$i" check-deps
-          sh "$i" update --archive "$a" --no-local-runner
-          test ! -e "$home/.local/share/metro-desktop-app/current/enable-local-runner"
-          sh "$i" update --archive "$a"
-          test ! -e "$home/.local/share/metro-desktop-app/current/enable-local-runner"
-          sh "$i" uninstall
-          test ! -e "$home/.local/share/metro-desktop-app" && test ! -e "$home/.local/share/applications/dev.metro.desktop.desktop"
           test "$(cat "$home/.config/metro-desktop/marker")" = keep
-      # The archives of the package versions now installed, so older ones drop
-      # out; the key changes only when that set does.
-      - name: Collect the installer's apt archives (main pushes only)
-        id: apt-collect
-        if: ${{ !inputs.release && github.ref == 'refs/heads/main' }}
-        env:
-          KEY_PREFIX: ${{ steps.apt-key.outputs.prefix }}${{ hashFiles('packaging/install-metro-linux.sh') }}-
-        run: |
-          set -eu
-          out="$RUNNER_TEMP/apt-archives"
-          rm -rf -- "$out"
-          mkdir -- "$out"
-          for deb in /var/cache/apt/archives/*.deb; do
-            [ -f "$deb" ] || continue
-            pkg="$(dpkg-deb -f "$deb" Package)"
-            want="$(dpkg-deb -f "$deb" Version) $(dpkg-deb -f "$deb" Architecture)"
-            if dpkg-query -W -f='${Version} ${Architecture}\n' "$pkg" 2>/dev/null | grep -qxF -- "$want"; then
-              cp -- "$deb" "$out/"
-            fi
-          done
-          n="$(find "$out" -maxdepth 1 -type f -name '*.deb' | wc -l)"
-          echo "$n .deb archives to cache"
-          if [ "$n" -gt 0 ]; then
-            names="$(find "$out" -maxdepth 1 -type f -name '*.deb' -printf '%f\n' | LC_ALL=C sort)"
-            echo "key=$KEY_PREFIX$(printf '%s\n' "$names" | sha256sum | cut -c1-16)" >> "$GITHUB_OUTPUT"
-          fi
-      - uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        if: >-
-          ${{ !inputs.release && github.ref == 'refs/heads/main'
-          && steps.apt-collect.outputs.key != '' && steps.apt-collect.outputs.key != steps.apt-cache.outputs.cache-matched-key }}
-        with:
-          path: ${{ runner.temp }}/apt-archives
-          key: ${{ steps.apt-collect.outputs.key }}
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-desktop-linux-x64

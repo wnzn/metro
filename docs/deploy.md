@@ -225,13 +225,9 @@ Some of this is cut down for pull requests, to keep them fast:
 
 Pushes to `main` run and build everything.
 
-The Rust jobs keep a build cache. The Linux desktop test build also caches
-the Ubuntu packages its installer test downloads with `--install-deps`
-(about 60 MB); the install itself still runs, and `apt` checks each cached
-package against the package lists it has just downloaded. Only pushes to
-`main` write these caches. Pull requests and other pushes only read them.
-Release builds never use them, so they always compile and download from
-scratch.
+The Rust jobs keep a build cache. Only pushes to `main` write it. Pull
+requests and other pushes only read it. Release builds never use it, so
+they always compile from scratch.
 
 A tag push starts nothing, and there's no manual trigger. What has been
 verified so far is in [acceptance.md](acceptance.md).

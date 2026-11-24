@@ -304,6 +304,27 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertNotIn("xvfb", steps_text(job).lower())
         self.assertEqual(uploads(job), ["dist-desktop-linux-x64"])
 
+    def test_linux_desktop_installer_check_needs_no_network(self):
+        step, = [s for s in self.release["jobs"]["desktop-linux"]["steps"]
+                 if "install-metro-linux.sh" in str(s.get("run", ""))]
+        run = step["run"]
+        # The real refusal on this runner: the exact command, and nothing installed.
+        self.assertIn("grep -F 'sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 "
+                      "gstreamer1.0-plugins-base' \"$RUNNER_TEMP/deps.err\"", run)
+        self.assertIn('test ! -e "$app" && test ! -e "$entry"', run)
+        # --install-deps and apt only in what it checks, never run (packaging/test_installers.py covers them).
+        commands = [line.strip() for line in run.splitlines() if line.strip().startswith(("sh ", "yes ", "sudo "))]
+        self.assertTrue(commands)
+        for command in commands:
+            self.assertNotIn("--install-deps", command)
+        self.assertNotRegex(run, r"(?m)^\s*(sudo\s+)?apt(-get)?\s")
+        self.assertNotIn("yes |", run)
+
+    def test_platform_build_jobs_have_timeouts(self):
+        jobs = self.release["jobs"]
+        self.assertEqual({name: jobs[name].get("timeout-minutes") for name in ("desktop-linux", "desktop-windows", "runner-linux")},
+                         {"desktop-linux": 30, "desktop-windows": 40, "runner-linux": 20})
+
     def test_only_final_outputs_are_named_dist(self):
         names = {(job, u) for job, j in self.release["jobs"].items() for u in uploads(j) if u.startswith("dist-")}
         self.assertEqual(names, {("runner-linux", "dist-runner-linux-x64"),
@@ -414,57 +435,6 @@ class ReleaseWorkflowTests(unittest.TestCase):
                          {"desktop-linux": "x86_64-unknown-linux-gnu", "desktop-windows": "x86_64-pc-windows-msvc"})
         # release.yml never runs an official build with a cache: every use is in a guarded step.
         self.assertEqual((WF / "release.yml").read_text().count("rust-cache@"), 2)
-
-    def test_apt_archive_cache_is_preview_only_and_written_by_main_only(self):
-        """Every actions/cache step: pinned, never in a release build, saved only by main pushes."""
-        pins = {"actions/cache/restore": "actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9",
-                "actions/cache/save": "actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9"}
-        preview = "${{ !inputs.release }}"
-        main_save = "${{ !inputs.release && github.ref == 'refs/heads/main'"
-        found = {}
-        for path in sorted(WF.glob("*.yml")):
-            for name, job in load(path.name)["jobs"].items():
-                for step in job.get("steps", []):
-                    uses = str(step.get("uses", ""))
-                    if not uses.startswith("actions/cache"):
-                        continue
-                    # Separate restore and save steps only; the combined action saves in a post step.
-                    action = uses.split("@")[0]
-                    self.assertIn(action, pins, f"{path.name}:{name}")
-                    self.assertEqual(uses, pins[action], f"{path.name}:{name}")
-                    found.setdefault((path.name, name), []).append(action)
-                    condition = " ".join(step["if"].split())
-                    if action == "actions/cache/restore":
-                        self.assertEqual(condition, preview, name)
-                    else:
-                        self.assertTrue(condition.startswith(main_save), condition)
-        self.assertEqual(found, {("release.yml", "desktop-linux"): ["actions/cache/restore", "actions/cache/save"]})
-        steps = self.release["jobs"]["desktop-linux"]["steps"]
-        index = {step.get("id") or step.get("name"): i for i, step in enumerate(steps)}
-        installer = next(i for i, s in enumerate(steps) if "--install-deps" in str(s.get("run", "")))
-        # Key, restore and the copy into apt's cache come before the real install; collect and save after it.
-        self.assertLess(index["apt-key"], index["apt-cache"])
-        self.assertLess(index["apt-cache"], installer)
-        load_step = steps[installer - 1]
-        self.assertEqual(load_step["if"], preview)
-        self.assertIn("sudo cp -t /var/cache/apt/archives/", load_step["run"])
-        self.assertIn("-type f -name '*.deb'", load_step["run"])
-        self.assertEqual(steps[index["apt-key"]]["if"], preview)
-        collect = steps[index["apt-collect"]]
-        self.assertGreater(index["apt-collect"], installer)
-        self.assertEqual(collect["if"], main_save + " }}")
-        save = steps[index["apt-collect"] + 1]
-        self.assertEqual(save["with"], {"path": "${{ runner.temp }}/apt-archives",
-                                        "key": "${{ steps.apt-collect.outputs.key }}"})
-        self.assertIn("steps.apt-collect.outputs.key != steps.apt-cache.outputs.cache-matched-key", save["if"])
-        restore = steps[index["apt-cache"]]
-        self.assertEqual(restore["with"]["path"], save["with"]["path"])
-        self.assertIn("hashFiles('packaging/install-metro-linux.sh')", restore["with"]["key"])
-        self.assertTrue(restore["with"]["restore-keys"].strip().endswith("${{ steps.apt-key.outputs.prefix }}"))
-        # The installer itself keeps using apt-get (which keeps archives); nothing CI-only is added to it.
-        installer_text = (ROOT / "packaging/install-metro-linux.sh").read_text()
-        self.assertIn('debian) echo "apt-get install --no-install-recommends', installer_text)
-        self.assertNotIn("Keep-Downloaded-Packages", installer_text)
 
     def test_ci_compiles_each_profile_once(self):
         rust = [s.get("run", "") for s in self.ci["jobs"]["rust"]["steps"]]

@@ -69,34 +69,37 @@ and broke as the real date moved on. They now run on NSH's manual clock
 from Mon, Nov 23, 2026 12:00 UTC. Desktop `nsh test`: 353/353, and
 `nsh check` passed (NSH 0.6.1).
 
-**`desktop-linux` apt archive cache.** The installer step's real
-`--install-deps` run downloaded 58.5 MB at about 76 kB/s, which took
-10–16 minutes. Test builds now restore the `.deb` files an earlier `main`
-push saved and copy them into `/var/cache/apt/archives` before that step.
-Afterwards, on `main` only, they collect the archives of the package
-versions now installed and save them when that set has changed. This uses
-`actions/cache/restore` and `actions/cache/save` at
-`55cc8345863c7cc4c66a329aec7e433d2d1c52a9` (tag `v6.1.0`, per
-`git ls-remote`). The key is the OS release, the architecture and
-`hashFiles('packaging/install-metro-linux.sh')`, with prefix restore keys.
-Release builds skip every cache step. `test_release_workflow.py` checks
-the pins and the guards. Checked locally:
+**`desktop-linux` installer check without a download.** The installer
+step's real `--install-deps` run downloaded about 58.5 MB from GitHub's
+Ubuntu mirror. That took 10–16 minutes, and in run 45320397101 more than
+57 minutes before the run was cancelled. A cache of the `.deb` files was
+tried (`2decebd`) and removed again: only a `main` run that suffered the
+same download could fill it, and it added five steps. The step now needs no
+network:
+
+- Where `ldd` finds libraries missing, it checks that the installer
+  without `--install-deps` refuses, prints the exact
+  `sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 gstreamer1.0-plugins-base`
+  line and installs nothing.
+- Where the libraries are already present, it runs the real install,
+  `check-deps`, both updates and the uninstall.
+
+`--install-deps` itself, and install, update and uninstall without the
+libraries, are covered by `packaging/test_installers.py` with fake tools.
+`desktop-linux`, `desktop-windows` and `runner-linux` now have job
+timeouts of 30, 40 and 20 minutes. Recent runs took about 5–7, 7–15 and
+4 minutes. Checked locally:
 
 ```sh
 ~/.cache/actionlint-1.7.12/actionlint -color   # clean, also with shellcheck (koalaman/shellcheck:stable)
 # ci.yml's "Every action is pinned" grep       # no unpinned actions
-python -B -m unittest discover -s packaging    # 201 tests, OK (15 skipped, as above)
+python -B -m unittest discover -s packaging    # 202 tests, OK (15 skipped, as above)
 python -B -m unittest discover -s packaging/release-signatures  # OK (1 skipped)
 python -B -m unittest discover -s packaging/windows-signing     # OK (6 skipped)
 python3 -B -m unittest discover -s ops/github-runner            # 33 tests, OK
 ```
 
-The collect loop was also run on a Debian 13 host against two locally
-built `.deb` files: it kept the one whose version is installed and dropped
-the other.
-
-**Not yet shown:** a GitHub run with a cache hit. The first `main` push
-after merging saves the cache; only the next one can use it.
+**Not yet shown:** this step on GitHub.
 
 ## Source only: releases from `main` on a version bump (2026-11-24, CI lane, local)
 
