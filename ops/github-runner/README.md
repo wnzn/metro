@@ -31,7 +31,7 @@ GitHub-hosted Windows and macOS jobs aren't affected.
   - **`.github/workflows/self-hosted-ci.yml`,** a manual run on the literal
     `main` branch ([below](#run-the-workflow)).
 - **What stays on GitHub's runners:** everything else, including:
-  - official `master` release runs;
+  - official `main` release runs;
   - pull requests from forks;
   - the Rust jobs and anything that needs Docker;
   - the native macOS and Windows jobs.

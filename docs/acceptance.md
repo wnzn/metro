@@ -3,6 +3,73 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Partial: the release pipeline retargeted to the protected main branch (2026-11-24, docs lane, local and GitHub)
+
+**Nothing was published or signed here, and nothing new has run in CI.** This
+is a documentation and CI configuration change only: still no release, no
+GHCR image, no signed asset. Everything below stays prepublication.
+
+**Why no release ever ran.** The pipeline — `packaging/release_policy.py`,
+`ci.yml` and the release workflows — was pinned to a **protected,
+non-deleted, non-forced push to `refs/heads/master`**, and `wnzn/metro` has
+never had a `master` branch: its only trunk is the protected `main` (the
+default branch, with required status checks, no force push and no deletion).
+The release decision job's condition could therefore never be true, and the
+`workflow_call` release workflows (`release.yml`, `release-publish.yml`,
+`windows-sign.yml`, `release-images.yml`, `sign-release-assets.yml`) have
+never started. Checked against the public repository:
+
+| Check | Result |
+| --- | --- |
+| `git ls-remote --tags origin` | no tags |
+| `GET /repos/wnzn/metro/releases/latest` | `{"message":"Not Found"}` |
+| `GET /repos/wnzn/metro/releases` | 0 releases |
+| `GET /repos/wnzn/metro/tags` | empty |
+| `GET /repos/wnzn/metro/actions/runs` | only **CI** and **Runner stack preflight** have ever run, up to run 37, all on `main` or on pull requests |
+
+The earlier entry that recorded the same repository state,
+[automatic releases from protected master](#partial-automatic-releases-from-protected-master-branding-and-the-first-github-run-2026-11-23-docs-lane-local-and-github),
+is left as written.
+
+**A local `v0.2.0` tag must not be pushed.** `v0.2.0` exists as a local
+annotated tag on `1397150b8b0af43b4cc2cf26f25d8604d40bf6d3`, and was never
+pushed (the tag lookups above show nothing upstream). CI reads the tag from
+GitHub, so an unpushed tag is invisible to it; but `release_policy.py`
+refuses a `v<version>` tag that is unpublished and sits on another commit
+than the release push: `fail (conflicting unpublished tag)`. So delete it
+locally (`git tag -d v0.2.0`) before the first official push, and never push
+it: CI creates `v<version>` itself, on exactly the released commit.
+
+**The change.** In the source, the single protected trunk `main` is now the
+official release branch: the pipeline was retargeted to `main` rather than
+renaming any branch (CI lane: `3ca0932`). No branch was renamed, and no
+`master` was created. This lane's files are the docs:
+[deploy.md](deploy.md#ci-and-publishing),
+[install.md](install.md#official-releases), [../packaging/README.md](../packaging/README.md#release-signing-protected-main-only),
+and the release-signatures, windows-signing and ops runner READMEs. The
+cosign identities in [install.md](install.md#check-a-download) are now
+`https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/main`
+and
+`https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/main`,
+with `--certificate-github-workflow-ref refs/heads/main`. Pull requests
+(including into `main`), other branches, tag pushes and manual runs stay
+read-only previews: they never sign, create a tag, push an image or publish.
+No version changed: `0.2.0` in the Cargo workspace and in
+`apps/desktop/nsh.json`.
+
+**The first official run still needs operator setup:**
+
+- the `windows-release-signing` environment's deployment branches: selected
+  branches only, exactly `main`, with no tag rules;
+- the five macOS Developer ID signing and notarization repository secrets.
+
+A `windows-release-signing` environment that doesn't allow `main` fails the
+`windows-sign` job, which runs before the tag. A release push without the
+macOS secrets fails `macos-sign`, which runs **after** `release_policy.py
+tag` has pinned `v<version>` on that commit; the tag stays there, and a rerun
+once the setup is in place resumes from it. Neither has been done, and no
+official run has been attempted.
+
 ## Partial: macOS installer previews on hosted Macs at b7f693b (2026-11-24, docs lane, GitHub)
 
 Pull request #3 (`fix/macos-installer-chmod`), run

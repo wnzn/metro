@@ -5,7 +5,7 @@
 for one person, without compiling anything. Each one is a standalone file
 that's also published as a release asset next to the archives, and each is
 listed in `SHA256SUMS`. Nothing is published yet. Until the first release
-from the protected `master` branch, use archives you built or CI's unsigned
+from the protected `main` branch, use archives you built or CI's unsigned
 test builds ([docs/install.md](../docs/install.md#test-builds-from-github-actions)).
 
 Every installer checks the archive's SHA-256 before it extracts anything.
@@ -122,17 +122,17 @@ This is **not yet verified**, and there are no production builds.
 - An x64 build under Rosetta isn't supported.
 - We never ask anyone to change Gatekeeper.
 
-## Release signing (protected `master` only)
+## Release signing (protected `main` only)
 
 The pipeline below is implemented and covered by local contract tests. It
 has **never run with real credentials**, so no notarized or signed release
 exists yet. Who may release, which version, and when: `release_policy.py`
-and [docs/deploy.md](../docs/deploy.md#releases-from-master-in-the-source-never-run-with-real-credentials).
+and [docs/deploy.md](../docs/deploy.md#releases-from-main-in-the-source-never-run-with-real-credentials).
 
 `ci.yml` passes five repository secrets by name, only to the official
-`master` publication workflow (`release-publish.yml`). There they reach
+`main` publication workflow (`release-publish.yml`). There they reach
 only the signing steps of its `macos-sign` job. That job first verifies the
-exact `v<version>` tag and the protected `master` push. It runs separately
+exact `v<version>` tag and the protected `main` push. It runs separately
 from the build, which runs third-party build code.
 
 | Secret | Contents |
@@ -173,7 +173,7 @@ Missing secrets fail the release run, which lists their names. A release
 never ships without macOS. Ad hoc previews are never renamed into release
 names.
 
-Release order, on an eligible protected `master` push:
+Release order, on an eligible protected `main` push:
 
 1. `release.yml` builds and tests every platform. Its Windows seed goes to
    `windows-distribution.yml`.
@@ -187,7 +187,7 @@ Release order, on an eligible protected `master` push:
    `metro-tui` in every desktop archive.
 6. GHCR images are pushed, read back and signed (`release-images.yml`).
 7. `SHA256SUMS` and the Linux archives get Sigstore signatures
-   (`sign-release-assets.yml`), bound to `refs/heads/master` and the commit.
+   (`sign-release-assets.yml`), bound to `refs/heads/main` and the commit.
 8. `release_policy.py publish` uploads exactly that set to a staging draft,
    compares every digest GitHub reports, then makes the release public. It
    never overwrites a published release.

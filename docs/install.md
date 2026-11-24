@@ -2,7 +2,7 @@
 
 > **Status: no public release yet.** <https://github.com/wnzn/metro/releases>
 > is where public downloads will appear, published automatically from the
-> protected `master` branch ([how](#official-releases)). Nothing has been
+> protected `main` branch ([how](#official-releases)). Nothing has been
 > released or signed for real so far. Until there's a release, the only
 > builds are temporary, unsigned **test builds** from GitHub Actions
 > ([below](#test-builds-from-github-actions)).
@@ -269,8 +269,8 @@ native runner with `METRO_SANDBOX=docker` ([runner.md](runner.md)).
 
 ## Test builds from GitHub Actions
 
-**For testing only.** Every pull request, every push to `main`, and every
-push to `master` that doesn't release builds installable test files. A test build is **not a release**,
+**For testing only.** Every pull request, and every push to `main` that
+doesn't release, builds installable test files. A test build is **not a release**,
 **not signed**, and kept only for a short time. Use one only if you accept
 that.
 
@@ -294,11 +294,13 @@ that.
 > **No public release exists yet.** The process below is in the source
 > (policy `1b3edab`, Windows and images `1cb6094`, Sigstore `2cfdc24`, MSI
 > `f642616` and `6171c75`). It hasn't run on GitHub with real credentials,
-> and the protected `master` branch and signing setup it needs aren't
-> configured yet ([deploy.md](deploy.md#ci-and-publishing)).
+> and the macOS secrets and Windows signing environment it needs aren't
+> configured yet ([deploy.md](deploy.md#ci-and-publishing)). `main` is the
+> repository's only trunk and its protected release branch; no other branch,
+> tag or manual run ever releases.
 
 Releases are made by CI, not by hand. A release starts only from a
-**protected, non-deleted, non-forced push to the `master` branch** of
+**protected, non-deleted, non-forced push to the `main` branch** of
 `wnzn/metro`, run by its own `ci.yml`, for exactly the pushed commit. The
 version is the checked-in one. The Cargo workspace and the desktop app's
 `nsh.json` must name the same version.
@@ -317,8 +319,8 @@ version is the checked-in one. The Cargo workspace and the desktop app's
   GitHub reports, then makes the release public. A rerun after a failure
   picks up where it stopped. A rerun after success changes nothing. An
   existing public release is never overwritten.
-- **Never from anything else.** Pushing a tag, pushing to `main`, a pull
-  request (also one into `master`) or a manual run never signs, creates a
+- **Never from anything else.** Pushing a tag, a pull request (also one into
+  `main`), a push to any other branch or a manual run never signs, creates a
   tag, pushes an image or publishes anything.
 - A prerelease version (for example `0.3.0-rc.1`) is published as a GitHub
   prerelease and never marked latest. Images have no `latest` tag.
@@ -340,7 +342,7 @@ version is the checked-in one. The Cargo workspace and the desktop app's
 ### Check a download
 
 1. **The checksum list is signed** by the release workflow, for the release's
-   commit on `master`. Find that commit with
+   commit on `main`. Find that commit with
    `git ls-remote https://github.com/wnzn/metro refs/tags/vX.Y.Z`. Then
    check it with
    [cosign](https://docs.sigstore.dev/cosign/system_config/installation/):
@@ -348,9 +350,9 @@ version is the checked-in one. The Cargo workspace and the desktop app's
    ```sh
    commit=<the 40-character commit from git ls-remote>
    cosign verify-blob --bundle SHA256SUMS.sigstore.json \
-     --certificate-identity 'https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/master' \
+     --certificate-identity 'https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/main' \
      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-     --certificate-github-workflow-ref refs/heads/master \
+     --certificate-github-workflow-ref refs/heads/main \
      --certificate-github-workflow-sha "$commit" SHA256SUMS
    sha256sum -c --ignore-missing SHA256SUMS
    ```
@@ -380,9 +382,9 @@ version is the checked-in one. The Cargo workspace and the desktop app's
 
    ```sh
    cosign verify \
-     --certificate-identity 'https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/master' \
+     --certificate-identity 'https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/main' \
      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-     --certificate-github-workflow-ref refs/heads/master \
+     --certificate-github-workflow-ref refs/heads/main \
      --certificate-github-workflow-sha "$commit" \
      'ghcr.io/wnzn/metro-server:vX.Y.Z@sha256:…'
    ```

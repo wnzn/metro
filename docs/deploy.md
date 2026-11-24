@@ -8,7 +8,7 @@ source is for contributors: [development.md](development.md).
 > **Not published yet.** The repository is
 > <https://github.com/wnzn/metro>. Releases will appear on its
 > [Releases page](https://github.com/wnzn/metro/releases), published
-> automatically from the protected `master` branch
+> automatically from the protected `main` branch
 > ([CI and publishing](#ci-and-publishing)). No public release, file or image
 > exists yet. The 0.2.0 names below were built and verified locally
 > ([acceptance](acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)).
@@ -182,8 +182,8 @@ fresh volume.
 
 ## CI and publishing
 
-`.github/workflows/ci.yml` runs on pull requests and on pushes to `main` and
-`master`. It runs:
+`.github/workflows/ci.yml` runs on pull requests and on pushes to `main`.
+It runs:
 
 - the Rust format, lint and test suites and the end-to-end scripts;
 - the terminal client's pseudo-terminal test;
@@ -196,15 +196,15 @@ fresh volume.
 A tag push starts nothing, and there's no manual trigger. What has been
 verified so far is in [acceptance.md](acceptance.md).
 
-### Releases from `master` (in the source; never run with real credentials)
+### Releases from `main` (in the source; never run with real credentials)
 
 `packaging/release_policy.py` decides. A release runs only for a
-**protected, non-deleted, non-forced push to `refs/heads/master`** of
+**protected, non-deleted, non-forced push to `refs/heads/main`** of
 `wnzn/metro` (repository id 1467654868). `ci.yml` itself must be the
 top-level workflow at that branch, and `github.sha` must equal the pushed
 commit. Every job that signs, creates the tag, pushes images or publishes
 checks this again before it touches a credential. Pull requests (also into
-`master`), `main`, tags and manual runs never do any of that.
+`main`), other branches, tags and manual runs never do any of that.
 
 The version is the one checked in. The Cargo workspace version and
 `apps/desktop/nsh.json` must match. For each eligible push:
@@ -219,6 +219,11 @@ The version is the one checked in. The Cargo workspace version and
 | on another commit | none | fail (conflicting unpublished tag) |
 | missing | exists | fail |
 | on this commit | other files | fail (never overwritten) |
+
+The tag is looked up on GitHub, not in a local clone. A local tag that was
+never pushed can't be seen by CI, but it must not be pushed either: on a
+different commit than the release push it makes that run fail as a
+conflicting unpublished tag. CI creates `v<version>` itself.
 
 Official runs are serialized. The order, in `release.yml` and then
 `release-publish.yml`:
@@ -236,23 +241,25 @@ Official runs are serialized. The order, in `release.yml` and then
    GitHub reports is compared with the verified files, and only then does
    the release become public.
 
-Image and file signatures are bound to `refs/heads/master` and to the exact
+Image and file signatures are bound to `refs/heads/main` and to the exact
 commit. A rerun after a failure resumes, and a rerun after success changes
 nothing. A prerelease version is never marked latest.
 
 Before the first release, a maintainer sets up:
 
-- **The `master` branch,** protected by a ruleset (no deletion or force
-  push). Today the public repository has only `main`.
+- **The `main` branch,** the repository's only trunk and its release branch,
+  protected with a ruleset: required status checks, no force push, no
+  deletion. It is already protected this way. The pipeline was retargeted to
+  `main` rather than renaming a branch; `wnzn/metro` never had a `master`.
 - **macOS:** the five repository secrets listed in
-  [packaging/README.md](../packaging/README.md#release-signing-protected-master-only):
+  [packaging/README.md](../packaging/README.md#release-signing-protected-main-only):
   - the Developer ID `.p12` and its password;
   - the App Store Connect notary key ID, issuer ID and `.p8`.
 
   There's also an optional `MACOS_SIGNING_TEAM_ID` variable. A release push
   without them fails.
 - **Windows:** the `windows-release-signing` environment, with deployment
-  allowed only from the `master` branch and never from tags (the signing job
+  allowed only from the `main` branch and never from tags (the signing job
   checks this). Reviewers are recommended. It also needs repository
   variables:
   - `METRO_WINDOWS_SIGNING_BACKEND`;
@@ -272,6 +279,11 @@ Before the first release, a maintainer sets up:
   [packaging/windows-signing/README.md](../packaging/windows-signing/README.md#repository-setup-for-official-releases).
 - **Images, the tag and Sigstore** need no secret. They use the workflow's
   own GitHub token and OIDC identity.
+
+Set all of this up before pushing. The `windows-release-signing` check fails
+the signing job, which runs before the tag; macOS signing runs **after**
+`v<version>` is pinned on that commit, so a missing secret there leaves the
+tag where it is. A rerun once the setup is in place resumes from it.
 
 Never paste a key, certificate, password or token into chat, an issue or a
 log. Enter them only in GitHub's secret and variable settings.
