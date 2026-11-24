@@ -28,6 +28,7 @@ import {
 } from "../../api/spaces";
 import type { AgentPatch, ModelSelection, SpaceAgent, SpaceDetails, SpacePrefs, SpacePrefsView } from "../../api/spaces";
 import { apiClient, describe, disconnect, isAborted, onSessionEnd, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
+import { noteClassifierPrefs } from "./askAgent";
 import { adoptAgent, agentList, dropAgent, ensureSpaceAgents, forgetSpaceAgents, invalidateSpaceAgents, showPicture, spaceAgents } from "./agents";
 
 export type SpaceSettingsSection = "general" | "members" | "agents" | "preferences";
@@ -665,7 +666,10 @@ export async function loadPreferences(): Promise<void> {
   void ensureSpaceAgents(sid);
   const [p, c] = await Promise.allSettled([api.spacePrefs(sid), api.availableCatalog(sid)]);
   if (!live()) return;
-  if (p.status === "fulfilled") prefs.set(p.value);
+  if (p.status === "fulfilled") {
+    prefs.set(p.value);
+    noteClassifierPrefs(sid, p.value.classifierAvailable && p.value.classifyUnaddressed);
+  }
   else if (!lost(p.reason, sid)) prefsError.set(reason(p.reason, "Couldn't load your preferences for this Space"));
   if (!live()) return;
   if (c.status === "fulfilled") catalog.set(c.value);
@@ -685,6 +689,7 @@ async function putPrefs(next: SpacePrefs, busy: string, what: string): Promise<b
     const saved = await api.putSpacePrefs(sid, next);
     if (!live()) return false;
     prefs.set(saved);
+    noteClassifierPrefs(sid, saved.classifierAvailable && saved.classifyUnaddressed);
     return true;
   } catch (error) {
     if (!live() || lost(error, sid)) return false;

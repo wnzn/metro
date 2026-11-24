@@ -39,7 +39,8 @@ import { MAX_AGENT_DESCRIPTION, MAX_AGENT_HANDLE, MAX_AGENT_INSTRUCTIONS, MAX_AG
 import type { SpaceAgent } from "../../api/spaces";
 import { agentList, spaceAgents } from "./agents";
 import { SpaceAgentAvatar } from "./SpaceAgentAvatar";
-import { selectionOf, shownValue, spaceModelOptions, unlisted } from "./modelOptions";
+import { effortsOf, selectionOf, shownValue, spaceModelOptions, thinkingOptions, unlisted, withEffort } from "./modelOptions";
+import { ThinkingChoice } from "../../ui/composerModelTrigger";
 import {
   agentBusy,
   agentDraft,
@@ -126,7 +127,7 @@ function Wide() {
   return (
     <Row grow testID="space-settings">
       <ModalNav testID="space-settings-nav" accessibilityLabel="Space settings sections">
-        <Row padX={2} padY={2}>
+        <Row padX={3} padY={2}>
           <Label variant="heading" heading lines={1}>
             {settingsSpace()?.name ?? ""}
           </Label>
@@ -777,6 +778,21 @@ function PreferencesPage() {
                   disabled={prefsBusy() !== null || !catalog()}
                   onChange={(value) => setSpaceDefaultModel(selectionOf(value))}
                 />
+                <If when={v().defaultModel && effortsOf(catalog(), v().defaultModel).length ? v().defaultModel : null}>
+                  {(sel) => (
+                    <Column gap={1}>
+                      <Label variant="caption" color="muted">
+                        Thinking level
+                      </Label>
+                      <ThinkingChoice
+                        testID="space-default-thinking"
+                        options={thinkingOptions(effortsOf(catalog(), sel()))}
+                        value={sel().reasoningEffort ?? ""}
+                        onChange={(effort) => setSpaceDefaultModel(withEffort(sel(), effort))}
+                      />
+                    </Column>
+                  )}
+                </If>
                 <If when={catalog() && unlisted(spaceOptions(), v().defaultModel)}>
                   <Label variant="caption" color="warning" testID="space-default-unlisted">
                     {v().defaultModel?.modelId
@@ -809,6 +825,21 @@ function PreferencesPage() {
                           disabled={prefsBusy() !== null || !catalog()}
                           onChange={(value) => setAgentModel(a().id, selectionOf(value))}
                         />
+                        <If when={v().agentModels[a().id] && effortsOf(catalog(), v().agentModels[a().id]).length ? v().agentModels[a().id] : null}>
+                          {(sel) => (
+                            <Column gap={1} padY={1}>
+                              <Label variant="caption" color="muted">
+                                Thinking level
+                              </Label>
+                              <ThinkingChoice
+                                testID={`agent-thinking:${a().id}`}
+                                options={thinkingOptions(effortsOf(catalog(), sel()))}
+                                value={sel().reasoningEffort ?? ""}
+                                onChange={(effort) => setAgentModel(a().id, withEffort(sel(), effort))}
+                              />
+                            </Column>
+                          )}
+                        </If>
                       </Column>
                     </Row>
                   </SettingRow>

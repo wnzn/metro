@@ -3,9 +3,9 @@
 // in theme/theme.json. To swap the design system, replace this module while
 // keeping its exports' props.
 
-import { List, Scroll, signal, Text, View } from "nsh";
+import { effect, keymap, List, Scroll, signal, Text, View } from "nsh";
 import type { JSX, ListRef } from "nsh";
-import { Button, Collapsible, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
+import { Button, Collapsible, ContextMenu, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
 import { Icon, SpaceTile } from "./chrome";
 import type { IconColor, IconName } from "./chrome";
 import {
@@ -379,13 +379,20 @@ export function NavItem(
     emphasis?: boolean;
     /** A quiet extra shown on hover (a role), never in the row. */
     tooltip?: string;
+    /**
+     * The row's own actions ("Space settings"): a ⋯ button at its end that
+     * shows on hover and keyboard focus (always on touch screens), and the
+     * same items on a secondary click of the row.
+     */
+    menu?: { items: readonly ActionsMenuItem[]; accessibilityLabel: string; testID?: string };
   },
 ) {
-  return (
+  const row = (
     <Button
       class={cx(
         // 40 high: a comfortable list row; the selected one is a soft pill with an accent bar.
-        "relative flex-row items-center gap-(--space-2) min-h-[40px] rounded-(--radius-md) pr-(--space-3) py-[8px]",
+        "relative flex-row items-center gap-(--space-2) min-h-[40px] rounded-(--radius-md) py-[8px]",
+        props.menu ? "pr-[40px]" : "pr-(--space-3)",
         focusRing,
         transitionClass,
         indentClass[Math.min(props.depth ?? 0, indentClass.length - 1)],
@@ -439,6 +446,58 @@ export function NavItem(
         <Icon name={props.expanded ? "chevron-down" : "chevron-right"} color="muted" size={12} />
       </If>
     </Button>
+  );
+  const items = (onSelect: (item: ActionsMenuItem) => void) => (
+    <Each of={[...(props.menu?.items ?? [])]} key={(item) => item.id}>
+      {(item) => (
+        <MenuItem class={popoverItemClass} disabled={item().disabled} onSelect={() => onSelect(item())} testID={item().id}>
+          <Text class={cx(textClass.sm, item().destructive ? "text-destructive" : "text-popover-foreground")}>{item().label}</Text>
+        </MenuItem>
+      )}
+    </Each>
+  );
+  return (
+    <If when={props.menu} else={row}>
+      {(menu) => (
+        <View class="group/nav relative">
+          <ContextMenu
+            popupClass={cx(popoverClass, "min-w-[180px]")}
+            popupStartingClass={popoverMotion.starting}
+            popupEndingClass={popoverMotion.ending}
+            trigger={row}
+          >
+            {items((item) => item.onPress())}
+          </ContextMenu>
+          <View class="absolute right-[6px] top-0 bottom-0 justify-center">
+            <Menu
+              placement="bottom"
+              align="end"
+              offset={4}
+              popupClass={cx(popoverClass, "min-w-[180px]")}
+              popupStartingClass={popoverMotion.starting}
+              popupEndingClass={popoverMotion.ending}
+              trigger={
+                <Button
+                  class={cx(
+                    "items-center justify-center size-[26px] rounded-(--radius-sm) hover:bg-sidebar-hover active:bg-sidebar-hover aria-expanded:bg-sidebar-hover aria-expanded:opacity-100",
+                    "opacity-0 group-hover/nav:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100",
+                    focusRing,
+                    transitionClass,
+                  )}
+                  testID={menu().testID}
+                  accessibilityLabel={menu().accessibilityLabel}
+                  tooltip={<Text class={tooltipClass}>More</Text>}
+                >
+                  <Icon name="more" color="sidebar" size={14} />
+                </Button>
+              }
+            >
+              {items((item) => item.onPress())}
+            </Menu>
+          </View>
+        </View>
+      )}
+    </If>
   );
 }
 
@@ -578,10 +637,20 @@ export function Field(
     onSubmit?: () => void;
     keepFocusOnSubmit?: boolean;
     maxLength?: number;
+    /** Escape in the field (an inline edit's cancel). */
+    onCancel?: () => void;
   },
 ) {
+  // Escape cancels while the field has the focus: an app binding that wins over the field's own keys.
+  const focused = signal(false);
+  effect(() => {
+    if (!props.onCancel || !focused()) return;
+    return keymap.bind("escape", () => props.onCancel?.(), { when: "always" });
+  });
   return (
     <Input
+      onFocus={() => focused.set(true)}
+      onBlur={() => focused.set(false)}
       class={cx(
         "rounded-(--radius-md) border bg-background px-(--space-3) py-[7px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring",
         controlEdgeClass,

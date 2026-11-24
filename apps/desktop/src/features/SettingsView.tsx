@@ -66,7 +66,7 @@ function WideSettings() {
         }
       >
         <ModalNav testID="settings-nav" accessibilityLabel="Settings sections">
-          <Row padX={2} padY={2}>
+          <Row padX={3} padY={2}>
             <Label variant="heading" heading>Settings</Label>
           </Row>
           <Tabs compact={false} />

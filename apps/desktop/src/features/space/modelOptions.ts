@@ -54,8 +54,9 @@ export function spaceModelOptions(c: AvailableCatalog | null, noChoiceDetail: st
             model: name,
             modelId: m.id,
             detail: off ? `${detail} · not available right now` : detail,
-            title: [name, m.id, conn.name, p.providerName].join(" — "),
+            title: [name, m.id, conn.name, p.providerName, ...(m.reasoningEfforts.length ? [`thinking ${m.reasoningEfforts.join(", ")}`] : [])].join(" — "),
             provider: { name: v.name, mark: v.mark },
+            thinking: m.reasoningEfforts.length ? `Thinking: ${m.reasoningEfforts.join(" · ")}` : undefined,
             disabled: off,
           });
         }
@@ -92,4 +93,33 @@ export function shownValue(options: readonly ModelOption[], sel: ModelSelection 
 /** A saved selection that isn't among the options (no longer usable here, or saved as a connection only). */
 export function unlisted(options: readonly ModelOption[], sel: ModelSelection | null | undefined): boolean {
   return !!sel && !options.some((o) => o.value === selectionValue(sel));
+}
+
+/** The thinking levels the selected model offers (empty when none, or when it isn't listed). */
+export function effortsOf(c: AvailableCatalog | null, sel: ModelSelection | null | undefined): string[] {
+  if (!c || !sel?.modelId) return [];
+  if (!c.chatProviders) {
+    // An older server without the grouped list.
+    const conn = c.models.find((m) => m.connectionId === sel.connectionId);
+    return conn?.chatModels?.find((m) => m.id === sel.modelId)?.reasoningEfforts ?? [];
+  }
+  for (const p of c.chatProviders) {
+    for (const conn of p.connections) {
+      if (conn.connectionId !== sel.connectionId) continue;
+      return conn.models.find((m) => m.id === sel.modelId)?.reasoningEfforts ?? [];
+    }
+  }
+  return [];
+}
+
+/** "Provider default" (no level sent), then each level the model offers; for the shared ThinkingChoice row. */
+export const PROVIDER_DEFAULT = "Provider default";
+export function thinkingOptions(efforts: readonly string[]): { value: string; label: string }[] {
+  return [{ value: "", label: PROVIDER_DEFAULT }, ...efforts.map((e) => ({ value: e, label: e }))];
+}
+
+/** The selection with `effort` ("" drops it), keeping its connection and model. */
+export function withEffort(sel: ModelSelection, effort: string): ModelSelection {
+  const { reasoningEffort: _old, ...rest } = sel;
+  return effort ? { ...rest, reasoningEffort: effort } : rest;
 }

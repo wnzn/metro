@@ -30,6 +30,7 @@ import { loadSavedServers, signOut } from "../savedWorkspaces";
 import { WorkspaceDialogs, workspaceItems, WorkspaceNotice } from "./WorkspaceSwitcher";
 import { PersonAvatar } from "./profile/PersonAvatar";
 import { profileName } from "./profile/profileState";
+import { openSpaceSettings } from "./space/spaceSettingsState";
 
 /**
  * The app's navigation: Chat, Library, Scheduled tasks, the Spaces and their
@@ -97,6 +98,7 @@ function SidebarRail() {
               seed={space().id}
               selected={space().id === activeSpaceId() && mainPlace() === "space"}
               onPress={() => void selectSpace(space().id)}
+              menu={[{ id: `rail-space-settings:${space().id}`, label: "Space settings", onPress: () => openSpaceSettings(space().id) }]}
             />
           )}
         </Each>
@@ -171,6 +173,15 @@ function SpacesSection() {
               emphasis={space().id === activeSpaceId()}
               selected={false}
               onPress={() => void selectSpace(space().id)}
+              menu={{
+                testID: `space-menu:${space().id}`,
+                accessibilityLabel: `More for ${space().name}`,
+                items: [
+                  { id: `space-settings:${space().id}`, label: "Space settings", onPress: () => openSpaceSettings(space().id) },
+                  { id: `space-agents:${space().id}`, label: "Agents", onPress: () => openSpaceSettings(space().id, "agents") },
+                  { id: `space-prefs:${space().id}`, label: "Your preferences", onPress: () => openSpaceSettings(space().id, "preferences") },
+                ],
+              }}
             />
             <If when={space().id === activeSpaceId() && mainPlace() === "space"}>
               <RoomTree />

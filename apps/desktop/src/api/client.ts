@@ -13,12 +13,15 @@ import type { RawFn } from "./profile";
 export type Room = { id: string; name: string; parentRoomId?: string };
 /**
  * Who a message addresses: the Space's agent, or a member by their stable
- * user id. On received events only, an agent mention may say it wasn't typed:
+ * user id. An agent mention with `agentId` names one of the Space's agents
+ * (`@handle`); without it, it is the generic `@agent` (the Space's default
+ * agent, or the sender's classifier pick). `handle` is only the draft's text
+ * for it (`@coder`), never sent. On received events only, an agent mention may say it wasn't typed:
  * `classifier` (the sender's opt-in System One judgement started the agent
  * from an unaddressed message) or `schedule` (the creator's scheduled
  * prompt). The server sets it; the app never sends it.
  */
-export type Mention = { kind: "agent"; addressedBy?: "classifier" | "schedule" } | { kind: "user"; id: string };
+export type Mention = { kind: "agent"; agentId?: string; handle?: string; addressedBy?: "classifier" | "schedule" } | { kind: "user"; id: string };
 /** For messages: who it was addressed to ("room" = nobody in particular). */
 export type Audience = "room" | "agent" | "users" | "mixed";
 /** Where a turn's activity comes from: an agent run, or the deterministic Demo (no model). */
@@ -30,7 +33,19 @@ export type ActivityPhase = "started" | "completed" | "failed" | "cancelled" | "
  * event of the turn — its lifecycle (`kind: "activity"`), tool calls and
  * results — carries the same `id`, `name` and `source`.
  */
-export type EventActivity = { id: string; name: string; source: ActivitySource; phase?: ActivityPhase; route?: ActivityRoute };
+export type EventActivity = {
+  id: string;
+  name: string;
+  source: ActivitySource;
+  phase?: ActivityPhase;
+  route?: ActivityRoute;
+  /** The Space agent working this turn, on every event of it (absent in personal Chat, Demo and older history). */
+  agent?: EventAgent;
+  /** Only on a Space turn's `started` marker: how its agent was chosen ("Picked by classifier: Coder"). */
+  pick?: string;
+};
+/** A Space agent as a run's events show it: enough for its name and avatar. */
+export type EventAgent = { id: string; handle: string; name: string; avatar_version?: string; color: string };
 
 /** Where a turn's model came from (`activity.route` on its `started` marker). */
 export type RouteSource = "override" | "case" | "routing_default" | "default" | "environment" | "inherited";
@@ -718,10 +733,22 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendMessage(spaceId: string, roomId: string, text: string, invokeAgent: boolean, mentions?: Mention[], assetIds?: readonly string[], choice?: TurnModelChoice): Promise<void> {
+    /** `agentId` (with `invokeAgent`): Ask agent asks that agent of the Space instead of the default (or the classifier's pick). */
+    async sendMessage(
+      spaceId: string,
+      roomId: string,
+      text: string,
+      invokeAgent: boolean,
+      mentions?: Mention[],
+      assetIds?: readonly string[],
+      choice?: TurnModelChoice,
+      agentId?: string,
+    ): Promise<void> {
       const body: Record<string, unknown> = { text, invoke_agent: invokeAgent, ...turnModelBody(choice) };
+      if (invokeAgent && agentId) body.agent_id = agentId;
       // Only what a person can type: never `addressed_by`, which only the server sets.
-      if (mentions && mentions.length > 0) body.mentions = mentions.map((m) => (m.kind === "agent" ? { kind: "agent" } : { kind: "user", id: m.id }));
+      if (mentions && mentions.length > 0)
+        body.mentions = mentions.map((m) => (m.kind === "agent" ? (m.agentId ? { kind: "agent", agent_id: m.agentId } : { kind: "agent" }) : { kind: "user", id: m.id }));
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
       await request("POST", `${room(spaceId, roomId)}/messages`, body);
@@ -1046,7 +1073,10 @@ function toEvent(v: RoomEvent): RoomEvent {
     const mentions: Mention[] = [];
     for (const m of raw.mentions) {
       if (isObject(m) && m.kind === "agent") {
-        mentions.push(m.addressed_by === "classifier" || m.addressed_by === "schedule" ? { kind: "agent", addressedBy: m.addressed_by } : { kind: "agent" });
+        const mention: Mention = { kind: "agent" };
+        if (typeof m.agent_id === "string" && m.agent_id.trim()) mention.agentId = m.agent_id.trim();
+        if (m.addressed_by === "classifier" || m.addressed_by === "schedule") mention.addressedBy = m.addressed_by;
+        mentions.push(mention);
       }
       else if (isObject(m) && m.kind === "user" && isId(m.id)) mentions.push({ kind: "user", id: String(m.id) });
     }
@@ -1131,7 +1161,24 @@ export function toActivity(v: unknown): EventActivity | undefined {
   if (typeof v.phase === "string" && ACTIVITY_PHASES.includes(v.phase)) activity.phase = v.phase as ActivityPhase;
   const route = toRoute(v.route);
   if (route) activity.route = route;
+  const agent = toEventAgent(v.agent);
+  if (agent) activity.agent = agent;
+  const pick = shortText(v.pick, 200);
+  if (pick) activity.pick = pick;
   return activity;
+}
+
+/** A run's agent badge (`activity.agent`), or undefined when missing or malformed. */
+export function toEventAgent(v: unknown): EventAgent | undefined {
+  if (!isObject(v) || typeof v.id !== "string" || !v.id.trim() || typeof v.name !== "string" || !v.name.trim()) return undefined;
+  const agent: EventAgent = {
+    id: v.id.trim(),
+    handle: typeof v.handle === "string" ? v.handle.trim() : "",
+    name: v.name.trim().slice(0, 64),
+    color: typeof v.color === "string" && /^#[0-9a-f]{6}$/i.test(v.color) ? v.color : "#4f46e5",
+  };
+  if (typeof v.avatar_version === "string" && v.avatar_version.trim()) agent.avatar_version = v.avatar_version.trim();
+  return agent;
 }
 
 const ROUTE_SOURCES: readonly string[] = ["override", "case", "routing_default", "default", "environment", "inherited"];

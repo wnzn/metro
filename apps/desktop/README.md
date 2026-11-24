@@ -280,12 +280,29 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
 - **Rooms and threads:** threads that an agent delegated
   (`parent_room_id`) appear under their parent room. A thread links back to
   its parent.
-- **Mentions:** type `@` or press **@** to mention `@agent` or a Space member
-  by their stable user ID. Picked mentions show as chips. A chip goes away
-  when its text is deleted, and all chips are cleared when you change room or
-  Space. Mentioning a person never starts agent work. Only `@agent` or
+- **Mentions:** type `@` or press **@** to mention `@agent`, one of the
+  Space's named agents by its `@handle`, or a Space member by their stable
+  user ID. In the current source after 0.2.0 (covered by automated tests;
+  not released), the list shows each agent with its picture (or its initial
+  on its colour) and each person with theirs. `@agent` is the generic agent:
+  the Space's default agent, or your classifier's pick if you turned
+  classification on in that Space. A named agent is sent by its id. Keys
+  while the list is open and the caret is in the message box: <kbd>↑</kbd>
+  and <kbd>↓</kbd> move (wrapping), <kbd>Tab</kbd> or <kbd>Return</kbd>
+  inserts the highlighted one without sending, and <kbd>Esc</kbd> closes the
+  list. Picked mentions show as chips. A chip goes away when its text is
+  deleted, and all chips are cleared when you change room or Space.
+  Mentioning a person never starts agent work. Only an agent mention or
   **Ask agent** does. Messages show their audience and recipients, and
   `@you` is highlighted.
+- **Ask agent in a Space with several agents** (current source after 0.2.0;
+  covered by automated tests; not released): **Ask agent** gets a small
+  chevron that chooses which agent it asks. The Space's default agent is
+  preselected and the button names the chosen one (**Ask Coder**). **Let the
+  classifier choose** is offered only when you have a System One connection
+  you can use there and turned classification on in that Space's
+  preferences; then no agent is named and your classifier picks. A Space
+  with one agent shows no chooser.
 - **Reactions:** 👍 👀 ✅ 🙏 ❤️ 🎉 on human and agent messages, in rooms,
   threads and the Chat. Your own reaction is highlighted. The agent's
   acknowledgement is labelled "agent", and screen readers hear who reacted.
@@ -297,7 +314,14 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   call and its listing show as one collapsed **Runner activity** group. Demo
   never calls a model, so it never says "thinking".
 - **Agent activity:** each agent turn shows as **one** collapsed group, not a
-  row per tool. The turn is identified by the event's `activity` metadata
+  row per tool. In the current source after 0.2.0 (covered by automated
+  tests; not released), a Space turn shows its agent's name and picture (or
+  initial), and its reply in the transcript does too, instead of the generic
+  agent mark. The collapsed line also says how the agent was chosen when
+  that adds something, such as **Picked by classifier: Coder**; the opened
+  timeline repeats it first, then the route, the reasoning summaries the
+  provider returned (`reasoning_summary` events) and each tool call with its
+  output. The turn is identified by the event's `activity` metadata
   (`id`, `name`, `source`, and a lifecycle `phase` on `kind: "activity"`
   events). While the turn runs, the group reads **`<name> is thinking…`**
   (`Metro` when the server sends no name), even before its first tool. Once
@@ -353,8 +377,26 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
 - **Scheduled tasks** (sidebar): **New task** creates a schedule. Each card
   has **Edit**, and **History**, **Pause**/**Resume** and **Delete…** in
   its **More** menu. See [docs/schedules.md](../../docs/schedules.md).
-- **Account row** (sidebar footer): your picture, name and host. Its menu
-  offers **Copy server URL**, **Copy ID** and **Sign out**.
+- **Account row** (sidebar footer): your picture, name and host, with the
+  connection's status as a dot (and words only while reconnecting or
+  connecting). Its menu offers **Copy server URL**, **Copy ID** and **Sign
+  out**.
+- **Icon rail:** the sidebar's toggle (<kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>B</kbd>)
+  collapses it to a rail of icons: Chat, Library, Scheduled tasks, each Space
+  as its initial tile, Settings and your picture. Each name is the icon's
+  tooltip and accessible name.
+- **Space settings** (current source after 0.2.0; covered by automated
+  tests; not released): every member opens a Space's settings from the cog
+  in the room's header, from the **⋯** that shows when hovering the Space in
+  the sidebar (**Space settings**, **Agents**, **Your preferences**), or with
+  a secondary click on its tile in the icon rail. **General** renames and
+  describes the Space and deletes it (owner, with its exact name typed), or
+  leaves it (other members). **Agents**: everyone reads each agent's name,
+  handle, description, instructions and tools; only the owner adds, edits,
+  deletes, sets the picture and makes one the default. **Your preferences**
+  are only yours: classification of your own unaddressed messages there,
+  model routing on or off there, and your default model in the Space and per
+  agent, each with its thinking level when the model offers levels.
 
 Chat, Search, Library and Scheduled tasks are your own pages, outside every
 Space, and work with or without any Space. The entries above describe the
@@ -421,7 +463,10 @@ by automated tests. Windows and macOS weren't checked.
     requests through it and use your credits, plan or device, you can see
     what they send and may pay for it, and they never see its base URL, key,
     sign-in or device token. A connection needs a model before it can be
-    shared. A Sign in with ChatGPT connection shares only a bring-your-own
+    shared. In a connection's details, each model of its list shows its
+    display name as text with its ID beneath; the pencil (or a press on the
+    name) renames it in place, <kbd>Return</kbd> saves and <kbd>Esc</kbd>
+    cancels. A Sign in with ChatGPT connection shares only a bring-your-own
     preset: each person signs in with their own account.
     In the current source after 0.2.0, this page also holds **Documents &
     media**: **Index and search with** picks your media model (only
@@ -523,6 +568,11 @@ contributors only, in
   - Those details stay on this computer. The Metro server only gets the
     fixed, coarser error text, such as asking you to sign in again on the
     device.
+  - In the current source after 0.2.0 (covered by automated tests; no
+    real-account run), a successful ChatGPT answer Metro still can't read
+    is recorded as `chatgpt_unusable_response`, with only the class of its
+    media type (`event_stream`, `json`, `other` or `missing`), never the
+    body. Try again; if it keeps failing, update Metro.
   - At most 100 entries, never message text, paths, addresses or tokens.
     The file is `monitoring/events.json` in the app's data folder
     (`~/.config/metro-desktop` on Linux, `%LOCALAPPDATA%\Metro\Desktop` on
@@ -627,12 +677,18 @@ These IDs are used by the tests and screenshot steps; keep them stable:
   `copy-id`, `disconnect`, `connection-state`, `server-origin`
 - **Room:** `space-view`, `room-title`, `open-parent`, `runner-state`,
   `run-demo`, `manage-space`, `transcript`, `event:<id>`, `composer`, `send`,
-  `ask-agent`, `mention`, `mention-picker`, `pick:agent`, `pick:<user>`,
-  `mention-chips`, `mention-chip:agent`, `mention-chip:<user>`,
-  `recipient:<event>:<agent|user>`, `reactions:<id>`, `react:<id>`,
+  `ask-agent`, `ask-agent-choose`, `ask-agent-choose:<agent id|classifier>`,
+  `mention`, `mention-picker`, `pick:agent`, `pick-agent:<agent id>`,
+  `pick:<user>`, `mention-chips`, `mention-chip:agent`,
+  `mention-chip:agent:<agent id>`, `mention-chip:<user>`,
+  `recipient:<event>:<agent|agent:<agent id>|user>`, `space-settings-open`, `reactions:<id>`, `react:<id>`,
   `palette:<id>`, `pick-reaction:<id>:<emoji>`, `reaction:<id>:<emoji>`,
   `notice`, `action-error`, `connection-banner`, `retry-now`
-- **Chat:** `chat-view`, `onboarding`, `onboarding-id`,
+- **Space settings:** `space-menu:<sid>`, `space-settings:<sid>`,
+  `space-agents:<sid>`, `space-prefs:<sid>`, `rail-space-settings:<sid>`,
+  `space-settings`, `space-settings-close`, `space-default-thinking`,
+  `agent-thinking:<agent id>`
+- **Chat:** `chat-view`, `chat-onboarding`, `chat-onboarding:<way>`, `onboarding`, `onboarding-id`,
   `onboarding-space-name`, `onboarding-create-space`, `runs-aside`,
   `runs-list`, `runs-error`, `run:<id>`, `run-open:<id>`, `run-follow:<id>`,
   `run-stop:<id>`, `dispatch`, `dispatch-space:<sid>`,
@@ -643,7 +699,8 @@ These IDs are used by the tests and screenshot steps; keep them stable:
   uncorrelated event: `activity:<key>`, `activity-toggle:<key>`,
   `activity-title:<key>` (no steps yet), `activity-outcome:<key>`,
   `activity-details:<key>`, `activity-route-badge:<key>`,
-  `activity-route:<key>` (opened), and `activity-step:<event id>` for each step
+  `activity-route:<key>` (opened), `activity-pick:<key>`,
+  `activity-pick-text:<key>` (opened), and `activity-step:<event id>` for each step
 - **Manage:** `manage-space`, `close-manage`, `members-card`,
   `members-list`, `member:<user>`, `remove-member:<user>`, `add-member-id`,
   `add-member`, `runner-card`, `runner-paired`, `attached-runner`,

@@ -98,7 +98,7 @@ import {
   Toggle,
 } from "../ui";
 import type { Tone } from "../ui";
-import { BackLink, ConnectionHeading, ConnectionItem, MethodRow, ModelItem, MoreMenu, PickerPanel, ProblemNote, VendorHeading } from "../ui/providers";
+import { BackLink, ConnectionHeading, ConnectionItem, EditableName, MethodRow, ModelItem, MoreMenu, PickerPanel, ProblemNote, VendorHeading } from "../ui/providers";
 import type { MoreMenuItem } from "../ui/providers";
 import { MediaModelSettings } from "./library/LibraryView";
 import { ModelOnboarding, needsChatModel } from "./ModelOnboarding";
@@ -594,13 +594,27 @@ function ModelRow(props: { connection: ProviderConnection; model: ConnectionMode
   const c = () => props.connection;
   const m = () => props.model;
   const name = signal(m().customName ?? "");
+  /** The name is being edited in place (pencil or a press on it): Return saves, Escape cancels. */
+  const editingName = signal(false);
   const editingThinking = signal(false);
   const busy = () => !!providerBusy();
   const key = () => `${c().id}:${m().modelId}`;
   const changed = () => name().trim() !== (m().customName ?? "");
-  const saveName = () => {
-    if (!changed()) return;
-    void patchConnectionModel(c().id, { model_id: m().modelId, display_name: name().trim() || null });
+  const startEditName = () => {
+    name.set(m().customName ?? "");
+    editingName.set(true);
+  };
+  const cancelName = () => {
+    name.set(m().customName ?? "");
+    editingName.set(false);
+  };
+  const saveName = async () => {
+    if (!changed()) {
+      editingName.set(false);
+      return;
+    }
+    const ok = await patchConnectionModel(c().id, { model_id: m().modelId, display_name: name().trim() || null });
+    if (ok) editingName.set(false);
   };
   const thinkingText = () => {
     const t = m().thinking;
@@ -622,21 +636,35 @@ function ModelRow(props: { connection: ProviderConnection; model: ConnectionMode
           />
         }
         name={
-          <Row gap={1} align="center">
-            <Field
-              testID={`model-name:${key()}`}
-              accessibilityLabel={`Name shown for ${m().modelId}`}
-              value={name()}
-              onChange={name.set}
-              placeholder={m().listedName ?? m().modelId}
-              maxLength={128}
-              grow
-              onSubmit={saveName}
-            />
-            <If when={changed()}>
-              <Action testID={`model-name-save:${key()}`} label="Save name" compact disabled={busy()} onPress={saveName} />
-            </If>
-          </Row>
+          <If
+            when={editingName()}
+            else={
+              <EditableName
+                testID={`model-name-edit:${key()}`}
+                name={m().displayName}
+                accessibilityLabel={`Rename ${m().displayName} (${m().modelId})`}
+                disabled={busy()}
+                onEdit={startEditName}
+              />
+            }
+          >
+            <Row gap={1} align="center">
+              <Field
+                testID={`model-name:${key()}`}
+                accessibilityLabel={`Name shown for ${m().modelId}. Return saves, Escape cancels; empty uses the listed name`}
+                value={name()}
+                onChange={name.set}
+                placeholder={m().listedName ?? m().modelId}
+                maxLength={128}
+                grow
+                autoFocus
+                onSubmit={() => void saveName()}
+                onCancel={cancelName}
+              />
+              <Action testID={`model-name-save:${key()}`} label="Save" compact disabled={busy()} onPress={() => void saveName()} />
+              <Action testID={`model-name-cancel:${key()}`} label="Cancel" variant="ghost" compact onPress={cancelName} />
+            </Row>
+          </If>
         }
         tags={
           <>

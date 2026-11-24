@@ -7,6 +7,7 @@ import { ManageSpace } from "./ManageSpace";
 import { ScheduledTasksView } from "./ScheduledTasksView";
 import { SearchView } from "./SearchView";
 import { SettingsModal } from "./SettingsView";
+import { SpaceSettingsModal } from "./space/SpaceSettings";
 import { Sidebar } from "./Sidebar";
 import { RoomHeaderActions, RoomHeaderTitle, SpaceView } from "./SpaceView";
 import { TopSearch } from "./TopSearch";
@@ -64,6 +65,7 @@ export function Shell() {
         </If>
       </Column>
       <SettingsModal />
+      <SpaceSettingsModal />
     </Surface>
   );
 }

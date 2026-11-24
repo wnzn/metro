@@ -1,7 +1,7 @@
 import { expect, test } from "nsh/test";
 import type { EventActivity, RoomEvent } from "../../api/client";
 import { toActivity } from "../../api/client";
-import { currentStep, durationText, groupAccessibleLabel, groupOutcomeText, groupTitle, groupTranscript, liveTitle, routeBadge, routeConfidence, routeText, shortArgs, summaryParts, timeline, toolCount } from "./group";
+import { currentStep, durationText, groupAccessibleLabel, groupOutcomeText, groupTitle, groupTranscript, liveTitle, pickBadge, routeBadge, routeConfidence, routeText, shortArgs, summaryParts, timeline, toolCount } from "./group";
 import type { ActivityGroup, TranscriptItem } from "./group";
 
 let nextId = 1;
@@ -179,7 +179,20 @@ test("short arguments, the live step, and the summary's parts", () => {
     ev("tool_call", "agent", "workspace.list {}", run("c")),
     ev("activity", "agent", "", run("c", "Metro", "cancelled")),
   ]))[0]!;
-  expect(summaryParts(g)).toEqual({ duration: null, tools: "1 tool", route: null, stopped: "cancelled" });
+  expect(summaryParts(g)).toEqual({ pick: null, duration: null, tools: "1 tool", route: null, stopped: "cancelled" });
+  // How a Space turn's agent was chosen: on the collapsed line only when it says more than the name.
+  expect(summaryParts({ ...g, pick: "Picked by classifier: Coder" }).pick).toBe("Picked by classifier: Coder");
+  expect(pickBadge("Default agent")).toBe(null);
+  expect(pickBadge("Addressed: @coder")).toBe(null);
+  expect(pickBadge("Default agent (the classifier was unsure: best Coder at 0.41)")).toBe("Default agent (the classifier was unsure: best Coder at 0.41)");
+  // The started marker's agent and pick reach the group.
+  const badge = { id: "ag-2", handle: "coder", name: "Coder", color: "#059669" };
+  const picked = groups(groupTranscript([
+    ev("activity", "agent", "", { ...run("p", "Coder", "started"), agent: badge, pick: "Picked by classifier: Coder" } as any),
+    ev("activity", "agent", "", { ...run("p", "Coder", "completed"), agent: badge } as any),
+  ]))[0]!;
+  expect(picked.agent).toEqual(badge);
+  expect(picked.pick).toBe("Picked by classifier: Coder");
   expect(durationText({ ...g, firstMs: 0, lastMs: 12_400 })).toBe("thought 12s");
   expect(durationText({ ...g, firstMs: 0, lastMs: 400 })).toBe(null);
   expect(durationText({ ...g, outcome: "live", firstMs: 0, lastMs: 9_000 })).toBe(null);

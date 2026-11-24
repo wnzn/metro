@@ -154,7 +154,7 @@ export function SummaryParts(props: { parts: readonly { text: string; testID?: s
 export function AgentMark(props: { picture?: JSX.Element }) {
   return (
     <If when={props.picture} else={<View class="size-[20px] items-center justify-center rounded-full bg-tone-agent" accessibilityElementsHidden><Glyph src={agentIcon} tint="tone-agent-foreground" size={12} /></View>}>
-      <View class="size-[20px] items-center justify-center overflow-hidden rounded-full" accessibilityElementsHidden>{props.picture}</View>
+      <View class="size-[20px] items-center justify-center" accessibilityElementsHidden>{props.picture}</View>
     </If>
   );
 }

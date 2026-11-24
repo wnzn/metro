@@ -1,6 +1,6 @@
-// Test-only entry: the real connect screen and Shell, plus the Space
-// settings modal and a button that opens it for the active Space, so this
-// lane's pages are tested before the sidebar's Space menu routes them.
+// Test-only entry: the real connect screen and Shell (which holds the Space
+// settings modal), plus a button that opens the settings for the active
+// Space, so the pages are tested without going through a menu.
 
 import { mount } from "nsh";
 import { activeSpaceId, restorePreferences, status } from "../../../store";
@@ -8,7 +8,6 @@ import { Action, Row, Surface } from "../../../ui";
 import { ConnectScreen } from "../../ConnectScreen";
 import { Shell } from "../../Shell";
 import { openSpaceSettings } from "../spaceSettingsState";
-import { SpaceSettingsModal } from "../SpaceSettings";
 
 function Harness() {
   void restorePreferences();
@@ -23,7 +22,6 @@ function Harness() {
           <Shell />
         </Surface>
       </Surface>
-      <SpaceSettingsModal />
     </If>
   );
 }

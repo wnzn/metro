@@ -14,7 +14,8 @@
 
 import { Image, Overlay, Text, View, signal, token } from "nsh";
 import type { Bounds, CaretEvent, InputRef, JSX, ViewRef } from "nsh";
-import { Button, Input, Toolbar } from "nsh/base";
+import { Button, Input, Menu, MenuItem, MenuSeparator, Toolbar } from "nsh/base";
+import { Icon } from "./chrome";
 import agentIcon from "./icons/agent.svg";
 import atIcon from "./icons/at.svg";
 import attachIcon from "./icons/attach.svg";
@@ -26,10 +27,11 @@ import reactionIcon from "./icons/reaction.svg";
 import runnerIcon from "./icons/runner.svg";
 import sendIcon from "./icons/send.svg";
 import serverIcon from "./icons/server.svg";
+import settingsIcon from "./icons/settings.svg";
 import threadIcon from "./icons/thread.svg";
 import { MediaGlyphIcon } from "./library";
 import type { FileKind } from "./library";
-import { cx, toneSurfaceClass, toneTextClass } from "./tokens";
+import { cx, popoverClass, popoverItemClass, popoverMotion, toneSurfaceClass, toneTextClass } from "./tokens";
 import type { Tone } from "./tokens";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
@@ -50,6 +52,7 @@ const GLYPHS = {
   runner: runnerIcon,
   send: sendIcon,
   server: serverIcon,
+  settings: settingsIcon,
   thread: threadIcon,
 } as const;
 
@@ -460,12 +463,27 @@ const sendInactive = "bg-muted border border-border";
  * "Ask agent": a rounded chip in the agent's tone with its glyph. Pressing it
  * sends and explicitly asks the agent; it never reads as the plain send.
  */
-export function AskAgentButton(props: Testable & { primary?: boolean; label: string; busyLabel: string; busy: boolean; disabled: boolean; onPress: () => void; tooltip?: string }) {
+export function AskAgentButton(
+  props: Testable & {
+    primary?: boolean;
+    label: string;
+    busyLabel: string;
+    busy: boolean;
+    disabled: boolean;
+    onPress: () => void;
+    tooltip?: string;
+    /** An agent chooser joined to its end (AskAgentChooser): the two read as one split button. */
+    chooser?: JSX.Element;
+    /** The chosen agent's picture in place of the agent glyph. */
+    picture?: JSX.Element;
+  },
+) {
   const inactive = () => props.disabled || props.busy;
-  return (
+  const button = (
     <Button
       class={cx(
-        "flex-row items-center gap-(--space-1) h-[36px] rounded-full px-(--space-3)",
+        "flex-row items-center gap-(--space-1) h-[36px] px-(--space-3)",
+        props.chooser ? "rounded-l-full pr-(--space-2)" : "rounded-full",
         focusRing,
         inactive() ? sendInactive : props.primary ? "bg-primary hover:bg-primary/90" : "bg-tone-agent border border-tone-agent-foreground/40 hover:border-tone-agent-foreground active:opacity-90",
       )}
@@ -475,11 +493,99 @@ export function AskAgentButton(props: Testable & { primary?: boolean; label: str
       accessibilityLabel={props.accessibilityLabel ?? props.label}
       tooltip={props.tooltip ? <TooltipText text={props.tooltip} /> : undefined}
     >
-      <ChatGlyph name="agent" color={inactive() ? "muted" : props.primary ? "on-primary" : "agent"} />
-      <Text class={cx("text-(length:--text-sm) font-medium", inactive() ? "text-muted-foreground" : props.primary ? "text-primary-foreground" : "text-tone-agent-foreground")}>
+      <If when={props.picture} else={<ChatGlyph name="agent" color={inactive() ? "muted" : props.primary ? "on-primary" : "agent"} />}>
+        {props.picture}
+      </If>
+      <Text class={cx("text-(length:--text-sm) font-medium", inactive() ? "text-muted-foreground" : props.primary ? "text-primary-foreground" : "text-tone-agent-foreground")} style={{ numberOfLines: 1 }}>
         {props.busy ? props.busyLabel : props.label}
       </Text>
     </Button>
+  );
+  return (
+    <If when={props.chooser} else={button}>
+      <View class="flex-row items-center">
+        {button}
+        {props.chooser}
+      </View>
+    </If>
+  );
+}
+
+/** One choice of the Ask-agent chooser: an agent (its picture in `leading`), or "Let the classifier choose". */
+export type AskAgentChoice = { id: string; title: string; detail?: string; leading?: JSX.Element; checked: boolean; accessibilityLabel: string; onSelect: () => void; separated?: boolean };
+
+/**
+ * The chevron end of the Ask-agent split button: a menu of the Space's
+ * agents (one checked) and, when the person may use it, "Let the classifier
+ * choose". Keyboard as NSH's Menu: Return, Space or Down open it on the
+ * first item, arrows move, typeahead by name, Escape closes. Item testIDs
+ * are `${testID}:${id}`.
+ */
+export function AskAgentChooser(props: Testable & { choices: readonly AskAgentChoice[]; primary?: boolean; disabled?: boolean; heading?: string }) {
+  return (
+    <Menu
+      placement="top"
+      align="end"
+      offset={6}
+      popupClass={cx(popoverClass, "min-w-[240px] max-w-[340px]")}
+      popupStartingClass={popoverMotion.starting}
+      popupEndingClass={popoverMotion.ending}
+      trigger={
+        <Button
+          class={cx(
+            "items-center justify-center h-[36px] w-[30px] rounded-r-full border-l",
+            focusRing,
+            props.disabled
+              ? "bg-muted border border-border"
+              : props.primary
+                ? "bg-primary border-primary-foreground/30 hover:bg-primary/90"
+                : "bg-tone-agent border border-tone-agent-foreground/40 hover:border-tone-agent-foreground aria-expanded:border-tone-agent-foreground",
+          )}
+          disabled={props.disabled}
+          testID={props.testID}
+          accessibilityLabel={props.accessibilityLabel ?? "Choose which agent to ask"}
+          tooltip={<TooltipText text="Choose the agent" />}
+        >
+          <Icon name="chevron-down" size={14} color={props.disabled ? "muted" : props.primary ? "on-primary" : "default"} />
+        </Button>
+      }
+    >
+      <If when={props.heading}>
+        <Text class="px-(--space-2) pt-[3px] pb-[5px] text-(length:--text-xs) text-muted-foreground">{props.heading}</Text>
+      </If>
+      <Each of={[...props.choices]} key={(c) => c.id}>
+        {(c) => (
+          <>
+            <If when={c().separated}>
+              <MenuSeparator class="my-[4px] h-px bg-border" />
+            </If>
+            <MenuItem
+              class={cx(popoverItemClass, "group flex-row items-center gap-(--space-2)")}
+              role="menuitemradio"
+              checked={c().checked}
+              onSelect={c().onSelect}
+              testID={props.testID ? `${props.testID}:${c().id}` : undefined}
+              accessibilityLabel={c().accessibilityLabel}
+            >
+              {c().leading}
+              <View class="flex-1 min-w-0 flex-col gap-px">
+                <Text class="text-(length:--text-sm) font-medium text-popover-foreground" style={{ numberOfLines: 1 }}>
+                  {c().title}
+                </Text>
+                <If when={c().detail}>
+                  <Text class="text-(length:--text-xs) text-muted-foreground" style={{ numberOfLines: 1 }}>
+                    {c().detail}
+                  </Text>
+                </If>
+              </View>
+              <View class={cx("size-[16px] items-center justify-center", c().checked ? "opacity-100" : "opacity-0")}>
+                <ChatGlyph name="check" size={14} color="agent" />
+              </View>
+            </MenuItem>
+          </>
+        )}
+      </Each>
+    </Menu>
   );
 }
 

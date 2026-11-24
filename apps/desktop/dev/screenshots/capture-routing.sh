@@ -124,6 +124,8 @@ api alice PUT /v1/model-routing "$(cat <<JSON
           {"key":"quick_question","label":"Quick question","description":"A short factual question with a one-line answer.","connection_id":"$team"}]}
 JSON
 )" >/dev/null
+# Classification is opted into per Space: without it an unaddressed message stays conversation and no turn is routed.
+api alice PUT "/v1/spaces/$sid/prefs" '{"classify_unaddressed":true}' >/dev/null
 
 # --- the app, natively, in the container, from the disposable copy -------------
 TOKEN_FILE="$sec/alice" URL="$url" SPACE="$sid" SHARED="$local_qwen" SHOTS=/shots node "$here/routing-steps.mjs" alice |

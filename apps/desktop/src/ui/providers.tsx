@@ -10,7 +10,7 @@ import { Button, Menu, MenuItem, MenuSeparator } from "nsh/base";
 import { BrandMark, Icon } from "./chrome";
 import type { Mark } from "./chrome";
 import { Badge, StatusDot } from "./primitives";
-import { cx, disabledClass, focusRingClass, popoverClass, popoverItemClass, popoverMotion, textClass, toneTextClass, transitionClass } from "./tokens";
+import { cx, disabledClass, focusRingClass, popoverClass, popoverItemClass, popoverMotion, textClass, toneTextClass, tooltipClass, transitionClass } from "./tokens";
 import type { Tone } from "./tokens";
 
 /** The add-connection picker: a quiet card holding its search, filter and rows. */
@@ -299,3 +299,29 @@ export function ModelItem(props: {
     </View>
   );
 }
+
+/**
+ * A model's display name as plain text with a small pencil: pressing either
+ * (or Return or Space on it) starts editing it in place (`onEdit`). The
+ * pencil shows on hover and keyboard focus, always on touch screens.
+ */
+export function EditableName(props: { name: string; accessibilityLabel: string; onEdit: () => void; disabled?: boolean; testID?: string }) {
+  return (
+    <Button
+      class={cx("group self-start max-w-full flex-row items-center gap-(--space-1) rounded-(--radius-sm) -mx-[4px] px-[4px] py-[1px] hover:bg-muted", focusRingClass, transitionClass, disabledClass)}
+      onPress={props.onEdit}
+      disabled={props.disabled}
+      testID={props.testID}
+      accessibilityLabel={props.accessibilityLabel}
+      tooltip={<Text class={tooltipClass}>Rename</Text>}
+    >
+      <Text class={cx(textClass.sm, "font-medium text-foreground shrink")} style={{ numberOfLines: 1 }}>
+        {props.name}
+      </Text>
+      <View class="opacity-0 group-hover:opacity-100 group-focus-visible:opacity-100 pointer-coarse:opacity-100">
+        <Icon name="pencil" color="muted" size={12} />
+      </View>
+    </Button>
+  );
+}
+

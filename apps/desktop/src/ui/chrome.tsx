@@ -12,7 +12,7 @@
 
 import { Image, Overlay, Scroll, Text, View, cleanup, effect, keymap, reduceMotion, signal, token, untracked, windowSize } from "nsh";
 import type { ImageAsset, InputRef, JSX, ViewRef } from "nsh";
-import { Button, Dialog, Input, Menu, MenuItem, MenuSeparator, Select } from "nsh/base";
+import { Button, ContextMenu, Dialog, Input, Menu, MenuItem, MenuSeparator, Select } from "nsh/base";
 import agentIcon from "./icons/agent.svg";
 import appearanceIcon from "./icons/appearance.svg";
 import chatIcon from "./icons/chat.svg";
@@ -30,6 +30,7 @@ import chevronRightIcon from "./icons/chevron-right.svg";
 import clockIcon from "./icons/clock.svg";
 import closeIcon from "./icons/close.svg";
 import copyIcon from "./icons/copy.svg";
+import pencilIcon from "./icons/pencil.svg";
 import deviceIcon from "./icons/device.svg";
 import hashIcon from "./icons/hash.svg";
 import logoutIcon from "./icons/logout.svg";
@@ -98,6 +99,7 @@ const ICONS = {
   clock: clockIcon,
   close: closeIcon,
   copy: copyIcon,
+  pencil: pencilIcon,
   device: deviceIcon,
   file: fileIcon,
   hash: hashIcon,
@@ -211,8 +213,10 @@ export function RailButton(props: {
   /** Any small picture instead (an avatar). */
   content?: JSX.Element;
   testID?: string;
+  /** Its own actions on a secondary click (a Space's settings); the tooltip says so. */
+  menu?: readonly { id: string; label: string; onPress: () => void }[];
 }) {
-  return (
+  const button = (
     <Button
       class={cx(
         "relative items-center justify-center size-[40px] shrink-0 rounded-(--radius-md)",
@@ -224,7 +228,7 @@ export function RailButton(props: {
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={props.label}
-      tooltip={<Text class={tooltipClass}>{props.label}</Text>}
+      tooltip={<Text class={tooltipClass}>{props.menu?.length ? `${props.label} · right-click for more` : props.label}</Text>}
     >
       {/* The selected place: an accent bar at the rail's edge, as in the open sidebar. */}
       <If when={props.selected}>
@@ -244,6 +248,21 @@ export function RailButton(props: {
         {props.content}
       </If>
     </Button>
+  );
+  return (
+    <If when={props.menu?.length ? props.menu : null} else={button}>
+      {(items) => (
+        <ContextMenu popupClass={cx(popoverClass, "min-w-[180px]")} popupStartingClass={popoverMotion.starting} popupEndingClass={popoverMotion.ending} trigger={button}>
+          <Each of={[...items()]} key={(item) => item.id}>
+            {(item) => (
+              <MenuItem class={popoverItemClass} onSelect={() => item().onPress()} testID={item().id}>
+                <Text class={cx(textClass.sm, "text-popover-foreground")}>{item().label}</Text>
+              </MenuItem>
+            )}
+          </Each>
+        </ContextMenu>
+      )}
+    </If>
   );
 }
 
@@ -532,7 +551,7 @@ export function Modal(props: Testable & { open: boolean; title: string; onClose:
 /** The side navigation of a modal (Settings' sections). */
 export function ModalNav(props: Testable & { children?: JSX.Element }) {
   return (
-    <View class="w-[228px] flex-col gap-[2px] bg-sidebar border-r border-sidebar-border px-(--space-2) py-(--space-3)" testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="tablist">
+    <View class="w-[228px] flex-col gap-(--space-1) bg-sidebar border-r border-sidebar-border px-(--space-2) py-(--space-3)" testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="tablist">
       {props.children}
     </View>
   );
@@ -543,11 +562,12 @@ export function ModalTab(props: { label: string; icon: IconName; selected: boole
   return (
     <Button
       class={cx(
-        "flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-[7px]",
+        // As the main sidebar's rows (NavItem): a soft pill with an accent bar at its start, the same insets.
+        "relative flex-row items-center gap-(--space-2) rounded-(--radius-md) px-(--space-3)",
         transitionClass,
         focusRing,
         // 40px rows in the side nav; the compact row of tabs keeps its own height.
-        props.compact ? "px-(--space-3)" : "min-h-[40px]",
+        props.compact ? "py-[7px]" : "min-h-[40px] py-[8px]",
         props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-hover active:bg-sidebar-hover",
       )}
       role="tab"
@@ -556,7 +576,10 @@ export function ModalTab(props: { label: string; icon: IconName; selected: boole
       testID={props.testID}
       accessibilityLabel={props.label}
     >
-      <Icon name={props.icon} color={props.selected ? "sidebar-active" : "sidebar"} />
+      <If when={props.selected && !props.compact}>
+        <View class="absolute left-0 top-[9px] bottom-[9px] w-[3px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
+      </If>
+      <Icon name={props.icon} color={props.selected ? "sidebar-indicator" : "sidebar"} />
       <Text class={cx("text-(length:--text-sm)", props.selected ? "font-semibold text-sidebar-accent-foreground" : "text-sidebar-foreground")} style={{ numberOfLines: 1 }}>
         {props.label}
       </Text>

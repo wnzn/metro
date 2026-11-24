@@ -100,7 +100,7 @@ export function ModelOnboarding(props: { testID?: string }) {
             <Each of={list()} key={(c) => c.id}>
               {(c) => (
                 <MethodRow
-                  testID={`onboarding:${c().id}`}
+                  testID={`${props.testID && props.testID !== "model-onboarding" ? props.testID : "onboarding"}:${c().id}`}
                   label={c().title}
                   detail={c().detail}
                   capability={{ label: "Chat", tone: CAPABILITY_TONE.chat }}

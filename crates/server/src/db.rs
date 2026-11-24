@@ -159,7 +159,7 @@ pub struct Activity {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentBadge>,
     /// Only on a Space turn's `started` event: how its agent was chosen,
-    /// e.g. `Picked by classifier: Coder` or `Mentioned: @coder`.
+    /// e.g. `Picked by classifier: Coder` or `Addressed: @coder`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick: Option<String>,
 }

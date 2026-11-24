@@ -559,9 +559,22 @@ test("Model providers come from the server's catalog: an API key saves with ever
   await app.waitUntil(() => app.enabled(`id:model-enabled:${c.id}:gpt-fixture-1`));
   await app.press(`id:model-enabled:${c.id}:gpt-fixture-1`);
   await app.waitUntil(() => f.state.connections.get(c.id)!.models.find((m) => m.model_id === "gpt-fixture-1")!.enabled === false);
+  // Names are plain text until the pencil (or a press on the name) opens the field; Escape cancels.
+  expect(app.shows(`id:model-name:${c.id}:gpt-fixture-2`)).toBe(false);
+  await app.press(`id:model-name-edit:${c.id}:gpt-fixture-2`);
+  await app.waitFor(`id:model-name:${c.id}:gpt-fixture-2`);
+  await app.type(`id:model-name:${c.id}:gpt-fixture-2`, "Draft name");
+  await app.keyboard.press("escape");
+  await app.waitUntil(() => !app.shows(`id:model-name:${c.id}:gpt-fixture-2`));
+  expect(f.state.connections.get(c.id)!.models.find((m) => m.model_id === "gpt-fixture-2")!.display_name ?? null).toBe(null);
+  await app.press(`id:model-name-edit:${c.id}:gpt-fixture-2`);
+  await app.waitFor(`id:model-name:${c.id}:gpt-fixture-2`);
+  expect(app.value(`id:model-name:${c.id}:gpt-fixture-2`)).toBe("");
   await app.type(`id:model-name:${c.id}:gpt-fixture-2`, "Work GPT");
   await app.press(`id:model-name-save:${c.id}:gpt-fixture-2`);
   await app.waitUntil(() => f.state.connections.get(c.id)!.models.find((m) => m.model_id === "gpt-fixture-2")!.display_name === "Work GPT");
+  await app.waitUntil(() => !app.shows(`id:model-name:${c.id}:gpt-fixture-2`));
+  expect(app.shows(`id:model-name-edit:${c.id}:gpt-fixture-2 >> text:Work GPT`)).toBe(true);
   expect(text(app)).not.toContain("sk-test-not-real"); // never read back
 
   // Back to the list: one compact row with its Default tag and one status line, no button rows.

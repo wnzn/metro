@@ -49,7 +49,9 @@ import {
 import type { RoomEvent } from "../store";
 import { choiceForTurn, ComposerModelControls, knownNoSystemOne } from "./composerModels";
 import { composerAddress } from "./composerAddress";
-import type { AttachedFile } from "../api/client";
+import type { AttachedFile, EventAgent } from "../api/client";
+import { agentById } from "./space/agents";
+import { SpaceAgentAvatar } from "./space/SpaceAgentAvatar";
 import {
   Action,
   AnchoredPopover,
@@ -214,7 +216,11 @@ function TranscriptRowView(props: { row: () => TranscriptRow }) {
         <If when={as("group")} else={<MessageRow row={() => row() as Of<"event">} />}>
           {(g) => (
             <MessageFrame gutter={<StampGutter stamp={g().stamp} id={g().key} />} continued>
-              <ActivityGroupRow group={g().group} />
+              <ActivityGroupRow
+                group={g().group}
+                agentName={g().group.agent?.name}
+                agentAvatar={g().group.agent && activeSpace()?.id ? <SpaceAgentAvatar spaceId={activeSpace()!.id} agent={g().group.agent!} size="sm" /> : undefined}
+              />
             </MessageFrame>
           )}
         </If>
@@ -239,7 +245,7 @@ const isFailureKind = (kind: string) => /(error|fail)/.test(kind.trim().toLowerC
 /** Who wrote an event, as the transcript shows them. */
 type Author =
   | { kind: "person"; userId: string | null; name: string; mine: boolean }
-  | { kind: "agent"; name: string }
+  | { kind: "agent"; name: string; badge: EventAgent | null }
   | { kind: "server"; name: string; tone: Tone; label: string };
 
 function authorOf(e: RoomEvent, myId: string | null): Author {
@@ -249,12 +255,22 @@ function authorOf(e: RoomEvent, myId: string | null): Author {
     const userId = e.actorId ?? null;
     return { kind: "person", userId, name: profileName(userId) ?? (e.actor.trim() || userId || "unknown"), mine: !!userId && userId === myId };
   }
-  if (kind === "agent") return { kind: "agent", name: e.activity?.name || DEFAULT_AGENT_NAME };
+  if (kind === "agent") {
+    // A Space agent's reply shows that agent (a thread's agent keeps the thread's name).
+    const badge = mainPlace() === "space" ? e.activity?.agent ?? null : null;
+    return { kind: "agent", name: e.activity?.name || badge?.name || DEFAULT_AGENT_NAME, badge };
+  }
   return { kind: "server", name: e.actor.trim() || "system", tone: toneForEvent(e.kind, e.actor), label: kindLabel(e.kind) };
 }
 
 /** "@you", "@<their display name>" or "@<id>" when no profile is known; agent mentions as eventKinds says. */
 function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null): string {
+  if (m.kind === "agent" && m.agentId) {
+    const a = agentById(activeSpace()?.id, m.agentId);
+    if (m.addressedBy === "classifier") return `${a?.name ?? "agent"} · detected by System One`;
+    if (m.addressedBy === "schedule") return `${a?.name ?? "agent"} · scheduled prompt`;
+    return a ? `@${a.handle}` : "@agent";
+  }
   if (m.kind === "user" && m.id !== myId) {
     const name = profileName(m.id);
     if (name) return `@${name}`;
@@ -264,6 +280,10 @@ function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: stri
 
 /** What a screen reader hears for a recipient: the display name and the stable id behind it. */
 function recipientDescription(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null): string {
+  if (m.kind === "agent" && m.agentId) {
+    const a = agentById(activeSpace()?.id, m.agentId);
+    return `Addressed to ${a ? `${a.name} (@${a.handle})` : "an agent"}${m.addressedBy ? ` (${recipientText(m, myId)})` : ""}`;
+  }
   if (m.kind === "agent") return `Addressed to the agent${m.addressedBy ? ` (${mentionText(m, myId)})` : ""}`;
   if (m.id === myId) return "Addressed to you";
   const name = profileName(m.id);
@@ -293,6 +313,11 @@ function MessageRow(props: { row: () => Of<"event"> }) {
   const server = () => {
     const a = author();
     return a.kind === "server" ? a : null;
+  };
+  /** The Space agent that wrote it, when its event names one: its picture replaces the generic glyph. */
+  const agentBadge = () => {
+    const a = author();
+    return a.kind === "agent" && a.badge && activeSpace()?.id ? a.badge : null;
   };
   const reactable = () => isReactable(event());
   const copyable = () => event().text.trim().length > 0;
@@ -353,11 +378,18 @@ function MessageRow(props: { row: () => Of<"event"> }) {
           <If
             when={person()}
             else={
-              <AuthorGlyph
-                testID={`avatar:${event().id}`}
-                kind={author().kind === "agent" ? "agent" : server()?.tone === "runner" ? "runner" : "system"}
-                tone={author().kind === "agent" ? "agent" : server()?.tone ?? "neutral"}
-              />
+              <If
+                when={agentBadge()}
+                else={
+                  <AuthorGlyph
+                    testID={`avatar:${event().id}`}
+                    kind={author().kind === "agent" ? "agent" : server()?.tone === "runner" ? "runner" : "system"}
+                    tone={author().kind === "agent" ? "agent" : server()?.tone ?? "neutral"}
+                  />
+                }
+              >
+                {(b) => <SpaceAgentAvatar testID={`avatar:${event().id}`} spaceId={activeSpace()!.id} agent={b()} />}
+              </If>
             }
           >
             {(p) => <PersonAvatar userId={p().userId} name={p().name} testID={`avatar:${event().id}`} />}
@@ -395,10 +427,10 @@ function MessageRow(props: { row: () => Of<"event"> }) {
               accessibilityLabel={`${audience().spoken ?? "Addressed to the agent"} (Ask agent)`}
             />
           </If>
-          <Each of={event().mentions ?? []} key={(m) => (m.kind === "agent" ? "agent" : `user:${m.id}`)}>
+          <Each of={event().mentions ?? []} key={(m) => (m.kind === "agent" ? `agent:${m.agentId ?? ""}` : `user:${m.id}`)}>
             {(m) => (
               <RecipientTag
-                testID={`recipient:${event().id}:${m().kind === "agent" ? "agent" : (m() as { id: string }).id}`}
+                testID={`recipient:${event().id}:${m().kind === "agent" ? ((m() as { agentId?: string }).agentId ? `agent:${(m() as { agentId: string }).agentId}` : "agent") : (m() as { id: string }).id}`}
                 tone={m().kind === "agent" ? "agent" : "neutral"}
                 slim={continued()}
                 self={m().kind === "user" && (m() as { id: string }).id === me()}
@@ -631,6 +663,14 @@ export function Composer(props: {
   onCaretMove?: (e: CaretEvent) => void;
   /** The field took or lost the keyboard focus. */
   onFocusChange?: (focused: boolean) => void;
+  /** The agent Ask agent asks (a Space with several agents); none: the default (or the classifier's pick). */
+  askAgentId?: string;
+  /** Ask agent's label when it names the chosen agent ("Ask Coder"). */
+  askLabel?: string;
+  /** The chosen agent's picture on Ask agent. */
+  askPicture?: JSX.Element;
+  /** The agent chooser joined to Ask agent. */
+  askChooser?: JSX.Element;
 }) {
   const hasFiles = () => stagedFor(composerScope()).length > 0;
   const ready = () => !props.disabled && status().phase !== "signedOut" && !sending();
@@ -657,7 +697,7 @@ export function Composer(props: {
     if (draft().trim() && (ask || toAgent())) {
       const { error, choice } = choiceForTurn();
       if (error) { actionError.set(error); return; }
-      void send(ask, choice);
+      void send(ask, choice, ask ? props.askAgentId : undefined);
     } else void send(false);
   };
   const submit = () => {
@@ -703,7 +743,9 @@ export function Composer(props: {
               <AskAgentButton
                 testID="ask-agent"
                 primary={primaryAsk()}
-                label={primaryAsk() ? "Ask agent ↵" : "Ask agent"}
+                label={`${props.askLabel ?? "Ask agent"}${primaryAsk() ? " ↵" : ""}`}
+                picture={props.askPicture}
+                chooser={props.askChooser}
                 busyLabel="Asking…"
                 accessibilityLabel={`Send and ask the agent to answer. ${primaryAsk() ? "Return asks the agent. " : ""}${props.agentHint}${hasFiles() ? " Attached files are saved to the Library, not sent to the agent." : ""}`}
                 tooltip={primaryAsk() ? "Ask agent (Return)" : props.agentHint}

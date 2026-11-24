@@ -237,6 +237,50 @@ test("your default model in this Space is one of your own chat connections; No p
   expect(calls(w, "PUT", "/v1/spaces/acme/prefs")[2]!.body.default_model).toBe(null);
 });
 
+test("a model with thinking levels offers them under your Space and per-agent choices; Provider default drops the level", async () => {
+  const w = spaceWorld();
+  const chat = w.f.addConnection("alice", "openai", "My OpenAI", "gpt-test");
+  chat.models.find((m) => m.model_id === "gpt-test")!.thinking = { efforts: ["low", "high"], wire: "reasoning_effort" };
+  // The grouped list the server sends (`chat_providers`), with the levels each model offers.
+  const base = w.network[`GET ${BASE}/v1/*`]!;
+  w.network[`GET ${BASE}/v1/*`] = (req: any) => {
+    const res = base(req) as any;
+    if (!new URL(req.url).pathname.endsWith("/models/available") || res?.status !== 200) return res;
+    const chat_providers = [
+      {
+        provider_id: "openai",
+        provider_name: "OpenAI",
+        connections: [
+          { connection_id: chat.id, name: chat.name, owned: true, owner_id: "alice", models: [{ id: "gpt-test", display_name: "gpt-test", reasoning_efforts: ["low", "high"], available: true }] },
+        ],
+      },
+    ];
+    return { ...res, body: { ...res.body, chat_providers } };
+  };
+  const app = await signIn(w);
+  await openSettingsFor(app);
+  await app.press("id:space-settings-tab:preferences");
+  await app.waitFor("id:space-default-model");
+  expect(app.shows("id:space-default-thinking")).toBe(false); // nothing chosen yet
+  await app.press("id:space-default-model");
+  await app.press(`id:space-default-model:${chat.id}\u0001gpt-test`);
+  await app.waitFor("id:space-default-thinking");
+  await app.press("id:space-default-thinking:high");
+  await app.waitUntil(() => calls(w, "PUT", "/v1/spaces/acme/prefs").length === 2);
+  expect(calls(w, "PUT", "/v1/spaces/acme/prefs")[1]!.body.default_model).toEqual({ provider_connection_id: chat.id, model_id: "gpt-test", reasoning_effort: "high" });
+  await app.press("id:space-default-thinking:");
+  await app.waitUntil(() => calls(w, "PUT", "/v1/spaces/acme/prefs").length === 3);
+  expect(calls(w, "PUT", "/v1/spaces/acme/prefs")[2]!.body.default_model).toEqual({ provider_connection_id: chat.id, model_id: "gpt-test" });
+  // Per agent, the same row.
+  const def = w.s.agents.get("acme")![0]!;
+  await app.press(`id:agent-model:${def.id}`);
+  await app.press(`id:agent-model:${def.id}:${chat.id}\u0001gpt-test`);
+  await app.waitFor(`id:agent-thinking:${def.id}`);
+  await app.press(`id:agent-thinking:${def.id}:low`);
+  await app.waitUntil(() => calls(w, "PUT", "/v1/spaces/acme/prefs").length === 5);
+  expect(calls(w, "PUT", "/v1/spaces/acme/prefs")[4]!.body.agent_models).toEqual({ [def.id]: { provider_connection_id: chat.id, model_id: "gpt-test", reasoning_effort: "low" } });
+});
+
 test("an agent's picture comes from the file picker, checked by its bytes; a new agent's is sent after it's created", async () => {
   const w = spaceWorld();
   const app = await signIn(w);

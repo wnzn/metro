@@ -43,6 +43,7 @@ import { Action, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Mo
 import { EmptyState, sidePanelFits, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
 import { Composer, ConnectionBanner, Transcript } from "./Conversation";
+import { ModelOnboarding, needsChatModel } from "./ModelOnboarding";
 import { roomTree } from "./Sidebar";
 
 /** The task form is open (folded behind "New task" otherwise). */
@@ -116,7 +117,12 @@ export function ChatView() {
 function ChatEmpty() {
   const typed = () => draft().trim().length > 0;
   return (
-    <EmptyState testID="chat-empty" title="Start a conversation" text="A suggestion only fills the message box.">
+    <Column grow>
+      {/* Shows only while nothing can answer yet (no model of mine, none shared, no operator model). */}
+      <Column padX={6} padY={needsChatModel() ? 4 : 0}>
+        <ModelOnboarding testID="chat-onboarding" />
+      </Column>
+      <EmptyState testID="chat-empty" title="Start a conversation" text="A suggestion only fills the message box.">
       <Row gap={2} wrap justify="center">
         <Each of={[...CHAT_SUGGESTIONS]} key={(s) => s.label}>
           {(s) => (
@@ -133,7 +139,8 @@ function ChatEmpty() {
           )}
         </Each>
       </Row>
-    </EmptyState>
+      </EmptyState>
+    </Column>
   );
 }
 
