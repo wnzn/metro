@@ -34,8 +34,9 @@ import type { AvailableModel, DraftCase, RoutingDraft } from "../routing";
 import { providerById } from "../settings";
 import type { Capability } from "../settings";
 import { openSettings } from "../store";
-import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field, Label, LearnMore, PageHeader, PageLayout, PercentField, Picker, Row, SettingRow, SettingsGroup, Toggle } from "../ui";
-import type { Fact, PickerItem } from "../ui";
+import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field, Label, LearnMore, ModelPicker, PageHeader, PageLayout, PercentField, Row, SettingRow, SettingsGroup, Toggle } from "../ui";
+import type { Fact, ModelOption } from "../ui";
+import { vendorOf } from "./providerGroups";
 
 const NONE = "";
 
@@ -130,42 +131,47 @@ function Messages() {
 
 // ------------------------------------------------------------------ pickers
 
-const GROUP: Record<AvailableModel["visibility"], string> = {
-  personal: "Yours",
-  spaces: "Shared with a Space you're in",
-  organization: "Shared with the organization",
-};
-
-/** An option's first line: the connection and its model. */
-function modelLabel(m: AvailableModel): string {
-  return `${m.name} · ${m.model ?? "no model chosen yet"}`;
+/** The default model of a usable connection, by the name pickers show, else its id. */
+function defaultModelOf(m: AvailableModel): string | null {
+  const d = m.chatModels?.find((x) => x.isDefault) ?? m.chatModels?.find((x) => x.id === m.model);
+  return d?.displayName ?? m.model;
 }
 
 /**
- * An option's second line: its provider, whose it is, and why it can't be
- * picked yet. Never a base URL, key or sign-in: a borrowed model's owner keeps those.
+ * An option's muted line: its model, whose it is, and why it can't be picked
+ * yet. Never a base URL, key or sign-in: a borrowed model's owner keeps those.
+ * A shared one says its owner sees the requests.
  */
 function modelDetail(m: AvailableModel): string {
-  const provider = providerById(m.providerId)?.name ?? m.providerId;
-  const whose = m.owned ? "Yours" : m.runsOn === "your_own_sign_in" ? `Preset from ${m.ownerId ?? "someone"}` : `Shared by ${m.ownerId ?? "someone"}`;
-  const notReady = m.ready === false ? " · Sign in with your own account first" : "";
-  return `${provider} · ${whose}${notReady}`;
+  const whose = m.owned
+    ? "Yours"
+    : m.runsOn === "your_own_sign_in"
+      ? `Preset from ${m.ownerId ?? "someone"} · runs on your own sign-in`
+      : `Shared by ${m.ownerId ?? "someone"}, who can see these requests`;
+  const model = defaultModelOf(m);
+  const notReady = !m.model ? " · Add a model to it first" : m.ready === false ? " · Sign in with your own account first" : "";
+  return [model, whose].filter(Boolean).join(" · ") + notReady;
 }
 
 /**
- * Your own first, then shared ones. Something that can't answer can't be
- * picked: no model chosen, or a preset you have no connection of your own for.
+ * Your own first, then shared ones, grouped by provider. Something that
+ * can't answer can't be picked: no model, or a preset you have no connection
+ * of your own for.
  */
-function itemsFor(capability: Capability, first?: PickerItem): PickerItem[] {
+function optionsFor(capability: Capability, none?: string): ModelOption[] {
   const models = [...modelsFor(capability)].sort((a, b) => Number(b.owned) - Number(a.owned));
-  const items: PickerItem[] = models.map((m) => ({
-    value: m.connectionId,
-    label: modelLabel(m),
-    detail: modelDetail(m),
-    disabled: !m.model || m.ready === false,
-    group: m.owned ? GROUP.personal : GROUP[m.visibility === "personal" ? "spaces" : m.visibility],
-  }));
-  return first ? [first, ...items] : items;
+  const options: ModelOption[] = models.map((m) => {
+    const v = vendorOf({ id: m.providerId, name: providerById(m.providerId)?.name ?? m.providerId });
+    return {
+      value: m.connectionId,
+      model: m.name,
+      detail: modelDetail(m),
+      title: [m.name, defaultModelOf(m), m.model, v.name, m.owned ? "yours" : m.ownerId].filter(Boolean).join(" · "),
+      provider: { name: v.name, mark: v.mark },
+      disabled: !m.model || m.ready === false,
+    };
+  });
+  return none ? [{ value: NONE, model: none, title: none }, ...options] : options;
 }
 
 /** A model saved earlier that is no longer available (deleted, or its share revoked). */
@@ -179,24 +185,24 @@ function Missing(props: { id: string | null; testID: string }) {
   );
 }
 
-function ModelPicker(props: {
+function RoutingModelPicker(props: {
   testID: string;
   label: string;
   capability: Capability;
   value: string | null;
   onChange: (id: string | null) => void;
-  none: string;
+  none?: string;
+  placeholder?: string;
 }) {
   return (
     <Column gap={1}>
-      <Picker
+      <ModelPicker
         testID={props.testID}
         accessibilityLabel={props.label}
-        items={itemsFor(props.capability, { value: NONE, label: props.none })}
-        value={props.value && findAvailable(props.value) ? props.value : NONE}
+        options={optionsFor(props.capability, props.none)}
+        value={props.value && findAvailable(props.value) ? props.value : props.none ? NONE : null}
         onChange={(v) => props.onChange(v ? v : null)}
-        placeholder={props.none}
-        searchable
+        placeholder={props.placeholder ?? props.none ?? "Choose a model"}
       />
       <Missing id={props.value} testID={`${props.testID}-missing`} />
     </Column>
@@ -238,7 +244,7 @@ function ClassifierGroup(props: { draft: RoutingDraft }) {
         <FactList facts={[{ label: "Answers", value: "Typed questions: Noul, choice and score." }, { label: "Used by", value: "Use-case routing, the opt-in below, and search, which reranks with it." }]} />
       </SectionMore>
       <SettingRow label="Classifier" stacked>
-        <ModelPicker
+        <RoutingModelPicker
           testID="routing-classifier"
           label="System One classifier"
           capability="system_one"
@@ -284,7 +290,7 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
         />
       </SettingRow>
       <SettingRow label="Fallback answer model" description="Answers when there's no match or the confidence is below the minimum. If System One fails, no model answers." stacked>
-        <ModelPicker
+        <RoutingModelPicker
           testID="routing-default-chat"
           label="Fallback answer model"
           capability="chat"
@@ -330,15 +336,16 @@ function CaseRow(props: { item: DraftCase; index: number }) {
           <Label variant="caption" color="muted">
             Answered by
           </Label>
-          <Picker
-            testID={`case-model:${n()}`}
-            accessibilityLabel={`Model that answers use case ${n() + 1}`}
-            items={itemsFor("chat")}
-            value={c().connectionId && findAvailable(c().connectionId) ? c().connectionId : null}
-            onChange={(v) => editCase(c().uid, { connectionId: v })}
-            placeholder="Choose a chat model"
-            searchable
-          />
+          <Column grow>
+            <ModelPicker
+              testID={`case-model:${n()}`}
+              accessibilityLabel={`Model that answers use case ${n() + 1}`}
+              options={optionsFor("chat")}
+              value={c().connectionId && findAvailable(c().connectionId) ? c().connectionId : null}
+              onChange={(v) => editCase(c().uid, { connectionId: v || null })}
+              placeholder="Choose a chat model"
+            />
+          </Column>
           <Action testID={`case-remove:${n()}`} label="Remove" accessibilityLabel={`Remove use case ${n() + 1}`} variant="destructive" edgeAligned onPress={() => removeCase(c().uid)} />
         </Row>
         <Missing id={c().connectionId} testID={`case-missing:${n()}`} />
@@ -388,7 +395,7 @@ function SearchGroup(props: { draft: RoutingDraft }) {
   return (
     <SettingsGroup title="Search" description="Finds messages by meaning in your Chat and the Spaces you're in. Needs an embeddings model." testID="search-model-group">
       <SettingRow label="Embeddings model" stacked>
-        <ModelPicker
+        <RoutingModelPicker
           testID="routing-embedding"
           label="Embeddings model"
           capability="embeddings"

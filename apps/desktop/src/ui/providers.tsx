@@ -1,15 +1,16 @@
 // Model providers primitives: the add-connection picker's frame, a
-// provider's heading, one way to connect as a single pressable row, and the
-// one-line summary of per-capability defaults. Like ./primitives, feature code
+// provider's heading, one way to connect as a single pressable row, the
+// one-line summary of per-capability defaults, and a saved connection's
+// compact row, ⋯ menu, problem note, details heading and model rows. Like ./primitives, feature code
 // passes only semantic props; every class lives here.
 
 import { Text, View } from "nsh";
 import type { JSX } from "nsh";
-import { Button } from "nsh/base";
-import { BrandMark } from "./chrome";
+import { Button, Menu, MenuItem, MenuSeparator } from "nsh/base";
+import { BrandMark, Icon } from "./chrome";
 import type { Mark } from "./chrome";
-import { Badge } from "./primitives";
-import { cx, focusRingClass, textClass, transitionClass } from "./tokens";
+import { Badge, StatusDot } from "./primitives";
+import { cx, disabledClass, focusRingClass, popoverClass, popoverItemClass, popoverMotion, textClass, toneTextClass, transitionClass } from "./tokens";
 import type { Tone } from "./tokens";
 
 /** The add-connection picker: a quiet card holding its search, filter and rows. */
@@ -97,6 +98,204 @@ export function DefaultsLine(props: { entries: readonly DefaultEntry[]; testID?:
           </View>
         )}
       </Each>
+    </View>
+  );
+}
+
+// ------------------------------------------------------------------ saved connections
+
+/**
+ * One saved connection as a compact row: its provider's mark, its name with a
+ * quiet "Default" tag, and one status line led by a coloured dot. Pressing
+ * the row opens its details (`onPress`); `trailing` holds its ⋯ menu, outside
+ * the pressable area. `children` go under the row (a problem and its fix).
+ */
+export function ConnectionItem(props: {
+  mark: Mark;
+  name: string;
+  isDefault: boolean;
+  status: { tone: Tone; text: string };
+  onPress: () => void;
+  trailing?: JSX.Element;
+  children?: JSX.Element;
+  testID?: string;
+  accessibilityLabel?: string;
+}) {
+  return (
+    <View class="flex-col" testID={props.testID}>
+      <View class="flex-row items-center gap-(--space-2) px-(--space-2) py-(--space-1)">
+        <Button
+          class={cx("flex-1 min-w-0 flex-row items-center gap-(--space-3) rounded-(--radius-sm) px-(--space-2) py-(--space-2) hover:bg-muted active:bg-muted", transitionClass, focusRingClass)}
+          onPress={props.onPress}
+          accessibilityLabel={props.accessibilityLabel ?? `${props.name}${props.isDefault ? ", default" : ""}, ${props.status.text}`}
+          testID={props.testID ? `${props.testID}:open` : undefined}
+        >
+          <BrandMark mark={props.mark} size="md" />
+          <View class="flex-1 min-w-0 flex-col gap-px">
+            <View class="flex-row items-center gap-(--space-2)">
+              <Text class={cx(textClass.sm, "font-medium text-foreground")} style={{ numberOfLines: 1 }}>
+                {props.name}
+              </Text>
+              <If when={props.isDefault}>
+                <Badge tone="neutral" variant="outline" label="Default" testID={props.testID ? `${props.testID}:default` : undefined} />
+              </If>
+            </View>
+            <StatusLine tone={props.status.tone} text={props.status.text} testID={props.testID ? `${props.testID}:status` : undefined} />
+          </View>
+          <Icon name="chevron-right" color="muted" size={14} />
+        </Button>
+        {props.trailing}
+      </View>
+      {props.children}
+    </View>
+  );
+}
+
+/** A coloured dot and one short line of status ("Online · this computer"). */
+export function StatusLine(props: { tone: Tone; text: string; testID?: string }) {
+  return (
+    <View class="flex-row items-center gap-(--space-2)" testID={props.testID}>
+      <StatusDot tone={props.tone} />
+      <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+        {props.text}
+      </Text>
+    </View>
+  );
+}
+
+/**
+ * A problem with a connection, as one plain sentence and at most one fix
+ * (`action`), under its row or at the top of its details. Never technical text.
+ */
+export function ProblemNote(props: { text: string; tone?: Tone; action?: JSX.Element; testID?: string }) {
+  const tone = () => props.tone ?? "warning";
+  return (
+    <View class="flex-row flex-wrap items-center gap-(--space-2) pl-[56px] pr-(--space-4) pb-(--space-2)" testID={props.testID} role="alert">
+      <Text class={cx(textClass.xs, toneTextClass[tone()])}>{props.text}</Text>
+      {props.action}
+    </View>
+  );
+}
+
+export type MoreMenuItem = {
+  /** Unique among the items; also the item's testID. */
+  id: string;
+  label: string;
+  onPress: () => void;
+  disabled?: boolean;
+  /** Removes or revokes something: danger ink, after a separator. */
+  destructive?: boolean;
+};
+
+/**
+ * A row's ⋯ menu: an icon-only trigger (`testID`, said as
+ * `accessibilityLabel`) and its items in a popover, with a separator before
+ * the first destructive item. Keyboard as NSH's Menu.
+ */
+export function MoreMenu(props: { items: readonly MoreMenuItem[]; accessibilityLabel: string; testID?: string; disabled?: boolean }) {
+  const rows = () => props.items.map((item, i) => ({ item, separated: !!item.destructive && i > 0 && !props.items[i - 1].destructive }));
+  return (
+    <Menu
+      placement="bottom"
+      align="end"
+      offset={4}
+      popupClass={cx(popoverClass, "min-w-[220px]")}
+      popupStartingClass={popoverMotion.starting}
+      popupEndingClass={popoverMotion.ending}
+      trigger={
+        <Button
+          class={cx("items-center justify-center size-[32px] rounded-(--radius-sm) hover:bg-muted active:bg-muted aria-expanded:bg-muted", focusRingClass, transitionClass, disabledClass)}
+          disabled={props.disabled}
+          accessibilityLabel={props.accessibilityLabel}
+          testID={props.testID}
+        >
+          <Icon name="more" color="muted" size={16} />
+        </Button>
+      }
+    >
+      <Each of={rows()} key={(row) => row.item.id}>
+        {(row) => (
+          <>
+            <If when={row().separated}>
+              <MenuSeparator class="my-[4px] h-px bg-border" />
+            </If>
+            <MenuItem class={popoverItemClass} disabled={row().item.disabled} onSelect={() => row().item.onPress()} testID={row().item.id}>
+              <Text class={cx(textClass.sm, row().item.destructive ? "text-destructive" : "text-popover-foreground")}>{row().item.label}</Text>
+            </MenuItem>
+          </>
+        )}
+      </Each>
+    </Menu>
+  );
+}
+
+/** A details sub-view's way back: "← Model providers". */
+export function BackLink(props: { label: string; onPress: () => void; testID?: string }) {
+  return (
+    <Button
+      class={cx("flex-row items-center self-start gap-(--space-1) rounded-(--radius-sm) px-(--space-2) py-[3px] -ml-2 hover:bg-muted active:bg-muted", transitionClass, focusRingClass)}
+      onPress={props.onPress}
+      accessibilityLabel={`Back to ${props.label}`}
+      testID={props.testID}
+    >
+      <Text class={cx(textClass.sm, "text-muted-foreground")}>← {props.label}</Text>
+    </Button>
+  );
+}
+
+/**
+ * The heading of a connection's details: its mark, name and status line,
+ * with `children` (its ⋯ menu or main action) at the end.
+ */
+export function ConnectionHeading(props: { mark: Mark; name: string; isDefault: boolean; status: { tone: Tone; text: string }; children?: JSX.Element; testID?: string }) {
+  return (
+    <View class="flex-row items-center gap-(--space-3)" testID={props.testID}>
+      <BrandMark mark={props.mark} size="md" />
+      <View class="flex-1 min-w-0 flex-col gap-px">
+        <View class="flex-row items-center gap-(--space-2)">
+          <Text class={cx(textClass.lg, "font-semibold text-foreground")} role="header" style={{ numberOfLines: 1 }}>
+            {props.name}
+          </Text>
+          <If when={props.isDefault}>
+            <Badge tone="neutral" variant="outline" label="Default" />
+          </If>
+        </View>
+        <StatusLine tone={props.status.tone} text={props.status.text} testID={props.testID ? `${props.testID}:status` : undefined} />
+      </View>
+      {props.children}
+    </View>
+  );
+}
+
+/**
+ * One model of a connection, as a row: its switch (`control`), its name
+ * (`name`, an editable field) with the model id muted beneath, its tags, and
+ * its actions at the end. Dimmed while switched off.
+ */
+export function ModelItem(props: {
+  control: JSX.Element;
+  name: JSX.Element;
+  modelId: string;
+  tags?: JSX.Element;
+  actions?: JSX.Element;
+  enabled: boolean;
+  testID?: string;
+}) {
+  return (
+    <View class="flex-row items-center gap-(--space-3) px-(--space-4) py-(--space-2)" testID={props.testID}>
+      {props.control}
+      <View class={cx("flex-1 min-w-0 flex-col gap-[2px]", !props.enabled && "opacity-60")}>
+        {props.name}
+        <View class="flex-row flex-wrap items-center gap-(--space-2)">
+          <Text class={cx(textClass.xs, "font-mono text-muted-foreground")} style={{ numberOfLines: 1 }}>
+            {props.modelId}
+          </Text>
+          {props.tags}
+        </View>
+      </View>
+      <If when={props.actions}>
+        <View class="shrink-0 flex-row items-center gap-(--space-1)">{props.actions}</View>
+      </If>
     </View>
   );
 }

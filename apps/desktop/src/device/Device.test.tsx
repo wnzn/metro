@@ -132,9 +132,10 @@ test("packaged: an endpoint connection is set up in-app with consent; the UI nev
   await app.waitFor(`id:listing-ok:${c.id}`);
   expectNoSecrets(app);
 
-  // Done: back to the list, where its row says this computer serves it.
+  // Done: its details, which say this computer serves it, with the models it listed by itself.
   await app.press("id:device-setup-done");
-  await app.waitFor(`id:connection:${c.id}`);
+  await app.waitFor(`id:connection-details:${c.id}`);
+  await app.waitFor(`id:connection-heading:${c.id}:status >> text:/Online · this computer/`);
   await app.waitUntil(() => app.texts().some((s) => s.startsWith("This computer serves it")));
   expectNoSecrets(app);
 });
@@ -201,9 +202,9 @@ test("packaged: re-pair, sign out and forget ask first; forget revokes", async (
   await signIn(app, "bob");
   await openProviders(app);
   await app.waitFor(`id:connection:${c.id}`);
-  // The row's token action opens in-app setup in the packaged app; it issues nothing.
-  await app.press(`id:connection-manage:${c.id}`);
-  await app.press(`id:connection-token:${c.id}`);
+  // The row's one fix opens in-app setup in the packaged app; it issues nothing.
+  await app.waitFor(`id:connection-problem:${c.id} >> text:This device isn't set up here yet.`);
+  await app.press(`id:connection-fix:${c.id}`);
   await app.waitFor("id:device-consent");
   expect(f.posts().map((p) => p.path)).not.toContain(`/v1/providers/${c.id}/device-token`);
   await app.type("id:device-endpoint-url", "http://127.0.0.1:8000/v1");
@@ -328,8 +329,8 @@ test("packaged: following a starting worker stops when the page closes or the us
   const app = await openPackaged(f, b);
   await signIn(app, "bob");
   await openProviders(app);
-  await app.press(`id:connection-manage:${c.id}`);
-  await app.press(`id:connection-token:${c.id}`);
+  await app.waitFor(`id:connection-fix:${c.id}`);
+  await app.press(`id:connection-fix:${c.id}`);
   await app.type("id:device-endpoint-url", "http://127.0.0.1:8000/v1");
   await app.press("id:device-consent-agree");
   await app.press("id:device-pair");

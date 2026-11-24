@@ -7,6 +7,8 @@ import { createComposerCatalog } from "./catalog";
 import type { ProviderName, Target } from "./catalog";
 
 const catalog = createComposerCatalog();
+/** The operator's model, when Default runs it for me (no default chat connection of my own); per scope load. */
+const operatorModel = signal<{ modelId: string; label: string } | null>(null);
 const scope = () => mainPlace() === "chat" ? null : mainPlace() === "space" ? activeSpaceId() ?? undefined : undefined;
 let registered = false;
 export const knownNoSystemOne = () => catalog.knownNoSystemOne(scope());
@@ -29,14 +31,19 @@ function refresh() {
   const id = scope(), client = apiClient();
   if (id === undefined || !client) { catalog.clear(); return; }
   const guard = sessionGuard(id ?? undefined);
-  void catalog.load(id, () => guard() && scope() === id && apiClient() === client, () => client.availableModels(id), () => namesFor(client));
+  const valid = () => guard() && scope() === id && apiClient() === client;
+  void catalog.load(id, valid, async () => {
+    const answer = await client.availableCatalog(id);
+    if (valid()) operatorModel.set(answer.operatorModel);
+    return answer.models;
+  }, () => namesFor(client));
 }
 
 const PROVIDER_DEFAULT = "Provider default";
 const levelsText = (t: Target) => t.levels.join(" · ");
 function option(t: Target, chosen: boolean, effort: string | undefined): ModelOption {
   return {
-    value: t.key, model: t.model, provider: t.provider,
+    value: t.key, model: t.model, modelId: t.modelId, provider: t.provider,
     detail: [t.connection, t.detail].filter(Boolean).join(" · "),
     title: [t.label, t.detail, t.levels.length ? `Thinking ${t.levels.join(" ")}` : ""].filter(Boolean).join(" — "),
     // The chosen row says the level that will be sent; others say what they offer.
@@ -45,7 +52,7 @@ function option(t: Target, chosen: boolean, effort: string | undefined): ModelOp
 }
 
 export function ComposerModelControls() {
-  if (!registered) { onSessionEnd(catalog.clear); registered = true; }
+  if (!registered) { onSessionEnd(() => { catalog.clear(); operatorModel.set(null); }); registered = true; }
   const open = signal(false);
   const fetching = signal(false);
   const fetchError = signal("");
@@ -86,8 +93,10 @@ export function ComposerModelControls() {
   };
   const options = (): ModelOption[] => {
     const s = current(), chosen = selected()?.key, effort = s?.pin?.reasoningEffort;
-    return [{ value: "", model: "Default model", title: `Default model — your normal routing — Thinking ${PROVIDER_DEFAULT}`,
-      detail: "Your normal routing", thinking: `Thinking: ${PROVIDER_DEFAULT}` },
+    const op = operatorModel();
+    const detail = op ? `${op.label}: ${op.modelId}` : "Your normal routing";
+    return [{ value: "", model: "Default model", title: `Default model — ${detail} — Thinking ${PROVIDER_DEFAULT}`,
+      detail, thinking: `Thinking: ${PROVIDER_DEFAULT}` },
       ...(s?.targets ?? []).map(t => option(t, t.key === chosen, effort))];
   };
   effect(() => {
@@ -116,11 +125,14 @@ export function ComposerModelControls() {
              </If>
            </If>
            <If when={current()?.phase === "ready"}>
-             <If when={current()?.targets.length === 0}>
+             <If when={current()?.targets.length === 0 ? operatorModel() : null}>
+               {op => <Label variant="caption" testID="composer-operator-model">{`Default runs ${op().label.toLowerCase()}: ${op().modelId}. Add your own model in Model providers.`}</Label>}
+             </If>
+             <If when={current()?.targets.length === 0 && !operatorModel()}>
                <Label variant="caption">No chat models are ready here. Connect a provider or check its approved models.</Label>
                <Action compact label="Model providers" testID="composer-open-providers" onPress={() => { close(); openSettings("providers"); }} />
              </If>
-             <If when={!!current()?.targets.length || !!current()?.pin}><ModelOptionPicker testID="composer-model-options"
+             <If when={!!current()?.targets.length || !!current()?.pin || !!operatorModel()}><ModelOptionPicker testID="composer-model-options"
               options={options()} value={selected()?.key ?? (current()?.pin ? null : "")}
               onChange={k => pick(k || null)} /></If>
             <If when={selected()?.detail}>{d => <Label variant="caption">{d()}</Label>}</If>

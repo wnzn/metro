@@ -521,7 +521,7 @@ test("a Space owner attaches and detaches a runner from the same list; attached 
   await app.waitFor("id:runners-settings");
 });
 
-test("Model providers come from the server's catalog: an API profile with a key, Save and fetch models, then pick one", async () => {
+test("Model providers come from the server's catalog: an API key saves with every listed model on, and the first becomes the default by itself", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "alice");
@@ -535,27 +535,45 @@ test("Model providers come from the server's catalog: an API profile with a key,
   await app.waitFor("id:server-form");
   expect(app.shows("id:provider-choice >> text:API key")).toBe(true);
   expect(app.shows("id:provider-choice >> text:Only you, until you share it")).toBe(true);
-  await app.press("id:provider-save-fetch");
+  await app.press("id:provider-save");
   await app.waitFor("id:provider-form-error"); // a key is required
   await app.type("id:provider-key", "sk-test-not-real");
-  await app.press("id:provider-save-fetch");
-  const c = await waitConnection(app, f, "OpenAI API");
-  expect(f.posts().find((p) => p.path === "/v1/providers")?.body).toMatchObject({ provider_id: "openai", api_key: "sk-test-not-real" });
-  await app.waitFor(`id:model:${c.id}:gpt-fixture-2`);
-  await app.press(`id:model:${c.id}:gpt-fixture-2`);
+  await app.press("id:provider-save");
+  await app.waitUntil(() => [...f.state.connections.values()].some((c) => c.name === "OpenAI API"));
+  const c = [...f.state.connections.values()].find((x) => x.name === "OpenAI API")!;
+  // One request: saved and listed together, every listed model on.
+  expect(f.posts().find((p) => p.path === "/v1/providers")?.body).toMatchObject({ provider_id: "openai", api_key: "sk-test-not-real", fetch_models: true });
+  await app.waitFor(`id:connection-details:${c.id}`);
+  await app.waitFor(`id:model-row:${c.id}:gpt-fixture-1`);
+  expect(app.shows(`id:model-row:${c.id}:gpt-fixture-2 >> text:gpt-fixture-2`)).toBe(true); // the id, muted under its name
+  expect(f.state.connections.get(c.id)!.models.map((m) => [m.model_id, m.enabled])).toEqual([["gpt-fixture-1", true], ["gpt-fixture-2", true]]);
+  // Nobody picks a default by hand: the first connection and its first model are defaults already.
+  expect(f.state.connections.get(c.id)!.is_default).toBe(true);
+  expect(f.state.connections.get(c.id)!.model).toBe("gpt-fixture-1");
+  expect(app.shows(`id:model-default-tag:${c.id}:gpt-fixture-1`)).toBe(true);
+  expect(app.enabled(`id:model-enabled:${c.id}:gpt-fixture-1`)).toBe(false); // the default stays on
+
+  // Opt out of one, rename another, make it the default.
+  await app.press(`id:model-default:${c.id}:gpt-fixture-2`);
   await app.waitUntil(() => f.state.connections.get(c.id)!.model === "gpt-fixture-2");
+  await app.waitUntil(() => app.enabled(`id:model-enabled:${c.id}:gpt-fixture-1`));
+  await app.press(`id:model-enabled:${c.id}:gpt-fixture-1`);
+  await app.waitUntil(() => f.state.connections.get(c.id)!.models.find((m) => m.model_id === "gpt-fixture-1")!.enabled === false);
+  await app.type(`id:model-name:${c.id}:gpt-fixture-2`, "Work GPT");
+  await app.press(`id:model-name-save:${c.id}:gpt-fixture-2`);
+  await app.waitUntil(() => f.state.connections.get(c.id)!.models.find((m) => m.model_id === "gpt-fixture-2")!.display_name === "Work GPT");
   expect(text(app)).not.toContain("sk-test-not-real"); // never read back
-  expect(app.shows(`id:connection-default:${c.id}`)).toBe(true);
+
+  // Back to the list: one compact row with its Default tag and one status line, no button rows.
+  await app.press("id:connection-back");
+  await app.waitFor(`id:connection:${c.id}`);
+  expect(app.shows(`id:connection-group:chat >> id:connection:${c.id}`)).toBe(true);
+  expect(app.shows(`id:connection:${c.id}:default`)).toBe(true);
+  expect(app.shows(`id:connection:${c.id}:status >> text:/Key saved · Work GPT/`)).toBe(true);
+  expect(app.shows(`id:connection-delete:${c.id}`)).toBe(false); // inside the ⋯ menu until opened
 });
 
-async function waitConnection(app: App, f: ReturnType<typeof fakeServer>, name: string) {
-  await app.waitUntil(() => [...f.state.connections.values()].some((c) => c.name === name));
-  const c = [...f.state.connections.values()].find((x) => x.name === name)!;
-  await app.waitFor(`id:connection:${c.id}`);
-  return c;
-}
-
-test("custom endpoints must be approved exactly; an endpoint that can't list models asks for a model ID", async () => {
+test("custom endpoints must be approved exactly; one that can't list models says so plainly and takes models by hand, with thinking options", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "alice");
@@ -563,22 +581,73 @@ test("custom endpoints must be approved exactly; an endpoint that can't list mod
   await chooseProvider(app, "custom", "custom");
   await app.type("id:provider-base-url", "http://127.0.0.1:11434/v1/other");
   const before = f.posts().length;
-  await app.press("id:provider-save-fetch");
+  await app.press("id:provider-save");
   await app.waitFor("text:/isn't on the server's approved list/");
   expect(f.posts().length).toBe(before); // refused before any request
 
   await app.clear("id:provider-base-url");
   await app.press("id:provider-url:http://127.0.0.1:11434/v1");
-  await app.press("id:provider-save-fetch");
-  const c = await waitConnection(app, f, "Custom OpenAI-compatible endpoint");
-  await app.waitFor(`id:listing-error:${c.id}`);
-  expect(text(app)).toContain("enter the model ID by hand");
-  await app.type(`id:connection-model-input:${c.id}`, "llama-local");
-  await app.press(`id:connection-model-save:${c.id}`);
-  await app.waitUntil(() => f.state.connections.get(c.id)!.model === "llama-local");
+  // Two models before saving, one with a name and thinking levels.
+  await app.type("id:provider-model-id", "llama-local");
+  await app.type("id:provider-model-name", "Llama (home)");
+  await app.press("id:provider-model-thinking:toggle");
+  await app.type("id:provider-model-thinking-fields-effort-input", "low");
+  await app.press("id:provider-model-thinking-fields-effort-add");
+  await app.type("id:provider-model-thinking-fields-effort-input", "high");
+  await app.press("id:provider-model-thinking-fields-effort-add");
+  await app.waitFor("text:/at the top level of the request/");
+  await app.press("id:provider-model-save");
+  await app.waitFor("id:provider-model-draft:llama-local");
+  await app.type("id:provider-model-id", "qwen-local");
+  await app.press("id:provider-model-save");
+  await app.waitFor("id:provider-model-draft:qwen-local");
+  await app.press("id:provider-save");
+  await app.waitUntil(() => [...f.state.connections.values()].some((c) => c.name === "Custom OpenAI-compatible endpoint"));
+  const c = [...f.state.connections.values()].find((x) => x.name === "Custom OpenAI-compatible endpoint")!;
+  expect(f.posts().find((p) => p.path === "/v1/providers")?.body).toMatchObject({
+    models: [{ model_id: "llama-local", display_name: "Llama (home)", thinking: { efforts: ["low", "high"], wire: "reasoning_effort" } }, { model_id: "qwen-local" }],
+  });
+  expect(c.model).toBe("llama-local");
+  await app.waitFor(`id:connection-details:${c.id}`);
+  await app.waitFor(`id:model-row:${c.id}:qwen-local`);
+  // The endpoint didn't list: one plain sentence, technical text only on request.
+  await app.waitFor(`id:connection-problem:${c.id} >> text:/models couldn't be listed/`);
+  expect(text(app)).not.toContain("HTTP");
+  expect(text(app)).not.toContain("this endpoint does not list models");
+  await app.press(`id:technical:${c.id}:toggle`);
+  await app.waitFor("text:this endpoint does not list models");
+
+  // Add one more by hand on the details page; remove it again.
+  await app.press(`id:model-add-open:${c.id}`);
+  await app.type(`id:model-add:${c.id}-id`, "mistral-local");
+  await app.press(`id:model-add:${c.id}-save`);
+  await app.waitFor(`id:model-row:${c.id}:mistral-local`);
+  await app.press(`id:model-remove:${c.id}:mistral-local`);
+  await app.waitFor(`id:model-row:${c.id}:mistral-local`, { state: "gone" });
+  expect(f.state.connections.get(c.id)!.models.map((m) => m.model_id)).toEqual(["llama-local", "qwen-local"]);
 });
 
-test("a device connection: no vendor key in Metro, a masked device token with metro-connector steps, offline then online", async () => {
+test("a server error reads as a sentence; the HTTP status is only under Technical details", async () => {
+  const f = world();
+  const api = f.addConnection("alice", "openai", "Work API", "gpt-fixture-2");
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  await openSettings(app, "providers");
+  await app.press(`id:connection:${api.id}:open`);
+  await app.waitFor(`id:model-row:${api.id}:gpt-fixture-2`);
+  // The server refuses removing the default model (the app hides Remove for it; ask the server directly as a stale client might).
+  f.state.connections.get(api.id)!.models.push({ model_id: "old", display_name: null, listed_name: null, enabled: true, available: true, source: "manual", position: 1, thinking: null });
+  await app.press(`id:model-add-open:${api.id}`);
+  await app.type(`id:model-add:${api.id}-id`, "old");
+  await app.press(`id:model-add:${api.id}-save`);
+  await app.waitFor("id:providers-error");
+  expect(app.shows("id:providers-error >> text:Couldn't add the model. That connection already has this model.")).toBe(true);
+  expect(app.shows("id:providers-error >> text:/HTTP 409/")).toBe(false);
+  await app.press("id:providers-error-technical:toggle");
+  await app.waitFor("text:/HTTP 409/");
+});
+
+test("a device connection: no vendor key in Metro, a masked device token with metro-connector steps, offline then online with its models listed", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "bob");
@@ -607,30 +676,58 @@ test("a device connection: no vendor key in Metro, a masked device token with me
   await app.waitFor(`id:listing-ok:${c.id}`);
   await app.waitFor(`id:device-status:${c.id} >> text:Online`);
   await app.press("id:hide-runner-token");
-  await app.waitFor(`id:connection:${c.id}`);
-  expect(app.shows(`id:connection:${c.id} >> text:Online`)).toBe(true);
+  // Its details follow, with the models it listed already there and on.
+  await app.waitFor(`id:connection-details:${c.id}`);
+  await app.waitFor(`id:model-row:${c.id}:fixture-local-large`);
+  expect(app.shows(`id:connection-heading:${c.id}:status >> text:/Online · metro-connector/`)).toBe(true);
   expect(text(app)).not.toContain(DEVICE_SECRET);
-  await app.press(`id:model:${c.id}:fixture-local-large`);
+  expect(f.state.connections.get(c.id)!.model).toBe("fixture-local-small"); // the first listed, by itself
+  await app.press(`id:model-default:${c.id}:fixture-local-large`);
   await app.waitUntil(() => f.state.connections.get(c.id)!.model === "fixture-local-large");
 
   // Unpairing asks first and leaves the connection (and Metro sign-in) in place.
-  await app.press(`id:connection-unpair:${c.id}`);
+  await app.press(`id:connection-unpair-open:${c.id}`);
   await app.waitFor(`id:connection-confirm-unpair:${c.id}`);
   await app.press(`id:connection-confirm-unpair-now:${c.id}`);
-  await app.waitFor(`id:device-status:${c.id} >> text:Not paired`);
+  await app.waitFor(`id:connection-problem:${c.id} >> text:No device is paired yet.`);
   expect(f.state.connections.get(c.id)!.deviceToken).toBe(null);
   expect(app.shows("id:workspace")).toBe(true);
 
-  // A new device token pairs it again; delete asks first.
-  await app.press(`id:connection-token:${c.id}`);
+  // The one fix pairs it again; delete asks first.
+  await app.press(`id:connection-fix:${c.id}`);
   await app.waitFor("text:/New device token for/");
   await app.press("id:settings-close"); // closing Settings wipes it
   await openSettings(app, "providers");
   expect(text(app)).not.toContain(DEVICE_SECRET);
+  await app.press(`id:connection-menu:${c.id}`);
   await app.press(`id:connection-delete:${c.id}`);
   await app.press(`id:connection-confirm-delete-now:${c.id}`);
-  await app.waitFor(`id:connection:${c.id}`, { state: "gone" });
+  await app.waitUntil(() => !f.state.connections.has(c.id));
+  await app.waitFor("id:provider-picker");
+  expect(app.shows(`id:connection:${c.id}`)).toBe(false);
   expect(f.state.connections.has(c.id)).toBe(false);
+});
+
+test("a paired device lists its models by itself once it comes online; nobody presses Refresh", async () => {
+  const f = world();
+  const c = f.addConnection("bob", "device-openai-compatible", "Desk GPU", null);
+  f.state.connections.get(c.id)!.deviceToken = `${DEVICE_SECRET}-fixture`;
+  const app = await openApp(f);
+  await signIn(app, "bob");
+  await openSettings(app, "providers");
+  await app.waitFor(`id:connection:${c.id}:status >> text:/Offline · metro-connector · No models yet/`);
+  expect(app.shows(`id:connection-problem:${c.id} >> text:/metro-connector isn't running/`)).toBe(true);
+  const refresh = `/v1/providers/${c.id}/model-list/refresh`;
+  expect(f.posts().some((p) => p.path === refresh)).toBe(false);
+
+  f.state.online.add(c.id);
+  await app.press("id:settings-close");
+  await openSettings(app, "providers");
+  await app.waitUntil(() => f.posts().some((p) => p.path === refresh));
+  await app.waitFor(`id:connection:${c.id}:status >> text:/Online · metro-connector · 2 models/`);
+  expect(f.state.connections.get(c.id)!.model).toBe("fixture-local-small"); // its default, chosen by the server
+  expect(app.shows(`id:connection-problem:${c.id}`)).toBe(false);
+  expect(text(app)).not.toContain(DEVICE_SECRET);
 });
 
 test("Appearance is a Settings page", async () => {
@@ -769,7 +866,7 @@ test("the provider picker is one compact drop-down; OpenAI and Anthropic each gr
   expect(app.shows("id:provider:openai")).toBe(false);
 });
 
-test("saved connections are grouped by provider, two ways of one provider under one heading", async () => {
+test("saved connections are grouped by capability as compact rows: one status line, a ⋯ menu, and the details a press away", async () => {
   const f = world();
   const api = f.addConnection("alice", "openai", "Work API", "gpt-fixture-2");
   const sub = f.addConnection("alice", "device-openai-oauth", "My ChatGPT", "gpt-sub");
@@ -777,19 +874,66 @@ test("saved connections are grouped by provider, two ways of one provider under 
   const app = await openApp(f);
   await signIn(app, "alice");
   await openSettings(app, "providers");
-  await app.waitFor("id:connection-group:openai");
-  expect(app.shows(`id:connection-group:openai >> id:connection:${api.id}`)).toBe(true);
-  expect(app.shows(`id:connection-group:openai >> id:connection:${sub.id}`)).toBe(true);
-  expect(app.shows(`id:connection-group:custom >> id:connection:${emb.id}`)).toBe(true);
-  expect(app.count("id:connection-group:openai >> id:mark-logo:openai")).toBe(1); // one heading for both ways
-  expect(app.shows("id:connection-group:custom >> id:mark-letters:{}")).toBe(true);
-  expect(app.shows(`id:connection:${api.id} >> text:/API key · gpt-fixture-2/`)).toBe(true);
-  expect(app.shows(`id:connection:${sub.id} >> text:/Sign in with ChatGPT · gpt-sub/`)).toBe(true);
-  // Compact until opened: management controls stay hidden.
+  await app.waitFor("id:connection-group:chat");
+  expect(app.shows(`id:connection-group:chat >> id:connection:${api.id}`)).toBe(true);
+  expect(app.shows(`id:connection-group:chat >> id:connection:${sub.id}`)).toBe(true);
+  expect(app.shows(`id:connection-group:embeddings >> id:connection:${emb.id}`)).toBe(true);
+  // The provider's mark on each row; the first of each capability is its default.
+  expect(app.shows(`id:connection:${api.id} >> id:mark-logo:openai`)).toBe(true);
+  expect(app.shows(`id:connection:${emb.id} >> id:mark-letters:{}`)).toBe(true);
+  expect(app.shows(`id:connection:${api.id}:default`)).toBe(true);
+  expect(app.shows(`id:connection:${sub.id}:default`)).toBe(false);
+  expect(app.shows(`id:connection:${emb.id}:default`)).toBe(true);
+  expect(app.shows(`id:connection:${api.id}:status >> text:/Key saved · gpt-fixture-2/`)).toBe(true);
+  // A device not set up: one plain sentence and one fix, no badges.
+  expect(app.shows(`id:connection-problem:${sub.id} >> text:No device is paired yet.`)).toBe(true);
+  expect(app.shows(`id:connection-fix:${sub.id}`)).toBe(true);
+  // Everything else is in the ⋯ menu.
   expect(app.shows(`id:connection-delete:${api.id}`)).toBe(false);
-  await app.press(`id:connection-manage:${api.id}`);
-  await app.waitFor(`id:connection-delete:${api.id}`);
+  await app.press(`id:connection-menu:${sub.id}`);
+  await app.waitFor(`id:connection-make-default:${sub.id}`);
+  expect(app.shows(`id:connection-delete:${sub.id}`)).toBe(true);
+  await app.press(`id:connection-make-default:${sub.id}`);
+  await app.waitUntil(() => f.state.connections.get(sub.id)!.is_default);
+  await app.waitFor(`id:connection:${sub.id}:default`);
+  expect(f.state.connections.get(api.id)!.is_default).toBe(false);
+  expect(f.state.connections.get(emb.id)!.is_default).toBe(true); // another capability's default is unchanged
+  // The row opens its details; back returns to the list.
+  await app.press(`id:connection:${api.id}:open`);
+  await app.waitFor(`id:connection-details:${api.id}`);
+  expect(app.shows(`id:key-section:${api.id}`)).toBe(true);
+  expect(app.shows(`id:sharing-section:${api.id} >> text:Only you can use it.`)).toBe(true);
+  expect(app.shows(`id:danger-section:${api.id}`)).toBe(true);
   expect(text(app)).not.toContain("sk-fixture-not-real");
+  await app.press("id:connection-back");
+  await app.waitFor(`id:connection:${api.id}`);
+});
+
+test("with no chat model and no operator model, Model providers starts with one onboarding card; with the operator's model it doesn't", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "carol");
+  await openSettings(app, "providers");
+  await app.waitFor("id:model-onboarding");
+  expect(app.shows("id:onboarding:device-openai-oauth >> text:Sign in with ChatGPT")).toBe(true);
+  expect(app.shows("id:onboarding:device-openai-compatible")).toBe(true);
+  expect(app.shows("id:onboarding:chat")).toBe(true);
+  await app.press("id:onboarding:chat");
+  await app.waitFor("id:add-connection");
+  expect(app.shows("id:provider:openai")).toBe(true);
+  expect(app.shows("id:provider:openai-embeddings")).toBe(false); // the picker opens on chat ways
+});
+
+test("with the operator's model, no onboarding card shows: Chat already works", async () => {
+  const f = world();
+  f.state.operatorModel = "operator-fixture";
+  const app = await openApp(f);
+  await signIn(app, "carol");
+  await openSettings(app, "providers");
+  await app.waitFor("id:provider-picker");
+  await app.waitUntil(() => f.state.log.some((l) => l.path.startsWith("/v1/models/available")));
+  await app.waitFor("id:connections-empty");
+  expect(app.shows("id:model-onboarding")).toBe(false);
 });
 
 test("a late settings answer never lands after sign-out or in the next user's session", async () => {
