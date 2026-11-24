@@ -378,21 +378,26 @@ class ReleaseWorkflowTests(unittest.TestCase):
             if name not in ("authorize", "windows-sign", "tag"):
                 self.assertIn("tag", job["needs"] if isinstance(job["needs"], list) else [job["needs"]], name)
         # Nothing after the tag runs unless tag pinned v<version> at this commit: assets is
-        # gated directly, and images, sign and publish all need assets.
-        self.assertEqual(self.publish["jobs"]["assets"]["if"], "needs.tag.outputs.proceed == 'true'")
+        # gated directly, and images, sign and publish all need assets, each succeeded.
+        self.assertEqual(self.publish["jobs"]["assets"]["if"],
+                         "${{ !cancelled() && needs.tag.result == 'success' && needs.tag.outputs.proceed == 'true' }}")
         for name in ("images", "sign", "publish"):
             self.assertIn("assets", self.publish["jobs"][name]["needs"], name)
+            for need in self.publish["jobs"][name]["needs"]:
+                self.assertIn(f"needs.{need}.result == 'success'", self.publish["jobs"][name]["if"], name)
 
     def test_publication_order_and_promotion(self):
         jobs = self.publish["jobs"]
         self.assertEqual(set(jobs), {"authorize", "tag", "windows-sign", "assets", "images", "sign", "publish"})
         self.assertIn('release_policy.py authorize --version "$VERSION"', steps_text(jobs["authorize"]))
         self.assertEqual(jobs["windows-sign"]["needs"], "authorize")
-        self.assertEqual(jobs["windows-sign"]["if"], "needs.authorize.outputs.proceed == 'true'")
+        self.assertEqual(jobs["windows-sign"]["if"], "needs.authorize.outputs.proceed == 'true' "
+                                                     "&& needs.authorize.outputs.windows_signing == 'signed'")
         self.assertEqual(jobs["windows-sign"]["uses"], "./.github/workflows/windows-sign.yml")
         self.assertEqual(jobs["windows-sign"]["with"], {"version": "${{ inputs.version }}"})
         self.assertEqual(jobs["windows-sign"]["permissions"], {"contents": "read", "id-token": "write"})
-        self.assertEqual(jobs["tag"]["needs"], "windows-sign")
+        self.assertEqual(jobs["tag"]["needs"], ["authorize", "windows-sign"])
+        self.assertEqual(jobs["authorize"]["outputs"]["windows_signing"], "${{ steps.check.outputs.windows_signing }}")
         assets = jobs["assets"]
         self.assertEqual(assets["needs"], "tag")
         self.assertNotIn("permissions", assets)
@@ -420,6 +425,71 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("release_policy.py publish", text)
         self.assertLess(text.find("release_signatures.py verify"), text.find("release_policy.py publish"))
         self.assertEqual(draft["steps"][0]["with"]["ref"], "${{ github.sha }}")
+
+    def simulate_publication(self, windows, proceed="true", failing=()):
+        """Each release-publish.yml job's result under GitHub's rules: a job without a status
+        function in its `if` needs every ancestor to have succeeded; `!cancelled()` lifts that."""
+        jobs = self.publish["jobs"]
+        results, outputs = {}, {"authorize": {"proceed": proceed, "windows_signing": windows},
+                                "tag": {"proceed": proceed}}
+
+        def ancestors(name):
+            needs = jobs[name].get("needs", [])
+            needs = [needs] if isinstance(needs, str) else needs
+            return set(needs).union(*(ancestors(n) for n in needs)) if needs else set()
+
+        def evaluate(expression):
+            text = expression.strip().removeprefix("${{").removesuffix("}}")
+            text = re.sub(r"needs\.([a-z-]+)\.result", lambda m: repr(results[m[1]]), text)
+            text = re.sub(r"needs\.([a-z-]+)\.outputs\.([a-z_]+)",
+                          lambda m: repr(outputs.get(m[1], {}).get(m[2], "") if results[m[1]] == "success" else ""), text)
+            text = text.replace("!cancelled()", "True").replace("&&", " and ").replace("||", " or ")
+            self.assertRegex(text, r"^[\sA-Za-z_'()=-]*$")  # nothing but the comparisons above
+            return eval(text, {"__builtins__": {}}, {})  # noqa: S307 (the workflow's own guard, sanitized)
+
+        for name in ("authorize", "windows-sign", "tag", "assets", "images", "sign", "publish"):
+            guard = jobs[name].get("if")
+            implicit = guard is None or "cancelled()" not in guard
+            runs = (not implicit or all(results[a] == "success" for a in ancestors(name))) \
+                and (guard is None or evaluate(guard))
+            results[name] = ("failure" if name in failing else "success") if runs else "skipped"
+        return results
+
+    def test_unsigned_mode_skips_only_windows_signing_and_signed_mode_fails_closed(self):
+        everything = {"authorize", "windows-sign", "tag", "assets", "images", "sign", "publish"}
+        after = everything - {"authorize", "windows-sign"}
+        signed = self.simulate_publication("signed")
+        self.assertEqual({n for n, r in signed.items() if r == "success"}, everything)
+        unsigned = self.simulate_publication("unsigned")
+        self.assertEqual(unsigned["windows-sign"], "skipped")
+        self.assertEqual({n for n, r in unsigned.items() if r == "success"}, everything - {"windows-sign"})
+        # A signed release whose Windows signing fails (e.g. no azure/kms backend) stops before the tag.
+        failed = self.simulate_publication("signed", failing={"windows-sign"})
+        self.assertEqual({failed[n] for n in after}, {"skipped"})
+        # An unknown mode, or no release to make, starts nothing at all.
+        for case in (self.simulate_publication(""), self.simulate_publication("maybe"),
+                     self.simulate_publication("unsigned", proceed="false"),
+                     self.simulate_publication("signed", proceed="false")):
+            self.assertEqual({case[n] for n in after | {"windows-sign"}}, {"skipped"})
+        # Every later failure still stops everything after it, in both modes.
+        for mode in ("signed", "unsigned"):
+            for broken, stopped in (("tag", after - {"tag"}), ("assets", {"images", "sign", "publish"}),
+                                    ("images", {"sign", "publish"}), ("sign", {"publish"})):
+                with self.subTest(mode=mode, broken=broken):
+                    run = self.simulate_publication(mode, failing={broken})
+                    self.assertEqual({run[n] for n in stopped}, {"skipped"})
+
+    def test_unsigned_windows_dist_comes_only_from_the_release_tree(self):
+        """With windows-sign skipped, the only dist-desktop-windows-x64 producer in the run is
+        windows-distribution.yml's natively tested preview job (contents: read)."""
+        dist = load("windows-distribution.yml")
+        self.assertIn("dist-desktop-windows-x64", uploads(dist["jobs"]["preview"]))
+        self.assertEqual(dist["jobs"]["preview"]["permissions"], {"contents": "read"})
+        self.assertEqual(dist["jobs"]["preview"]["if"],
+                         "needs.seed.outputs.mode == 'preview' || needs.seed.outputs.mode == 'unsigned-release'")
+        sign = load("windows-sign.yml")
+        self.assertIn("dist-desktop-windows-x64", uploads(sign["jobs"]["verify"]))
+        self.assertNotIn("dist-desktop-windows-x64", uploads(dist["jobs"]["seed"]))
 
     def test_every_desktop_build_ships_and_runs_the_terminal_client(self):
         jobs = self.release["jobs"]

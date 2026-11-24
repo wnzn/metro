@@ -1537,7 +1537,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "metro-auth"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "aws-lc-rs",
  "base64 0.22.1",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "metro-connector"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "aws-lc-rs",
@@ -1584,7 +1584,7 @@ dependencies = [
 
 [[package]]
 name = "metro-desktop"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "libc",
  "metro-connector",
@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "metro-model-protocol"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "metro-runner"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "libc",
  "serde",
@@ -1620,7 +1620,7 @@ dependencies = [
 
 [[package]]
 name = "metro-server"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -1653,7 +1653,7 @@ dependencies = [
 
 [[package]]
 name = "metro-tui"
-version = "0.3.0"
+version = "0.3.1"
 dependencies = [
  "clap",
  "crossterm",

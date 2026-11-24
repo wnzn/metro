@@ -541,8 +541,10 @@ function Test-MetroScriptMsiCoexistence {
 # Fail-closed guard. The branch no longer tells a release apart (main pushes
 # without a version bump run previews too), so the caller must say so
 # explicitly: windows-distribution.yml's preview job sets
-# METRO_WINDOWS_SELF_TEST=preview from `!inputs.release`. It never runs for a
-# tag, or in a job that can request a GitHub OIDC token (release signing).
+# METRO_WINDOWS_SELF_TEST=preview when its seed mode is preview or
+# unsigned-release (an unsigned release's native checks; scratch copies only,
+# nothing shipped). It never runs for a tag, or in a job that can request a
+# GitHub OIDC token (release signing).
 function Invoke-MetroVerifierSelfTest {
     [CmdletBinding()]
     param([Parameter(Mandatory)] [string] $Tree, [Parameter(Mandatory)] [string] $Msi, [Parameter(Mandatory)] [string] $SourceScripts)

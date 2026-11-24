@@ -772,8 +772,39 @@ class Workflows(unittest.TestCase):
                           "vars."):
             self.assertNotIn(forbidden, text)
         self.assertEqual(set(jobs(text)), {"seed", "preview"})
-        self.assertIn("if: ${{ !inputs.release }}", jobs(text)["preview"])
+        self.assertIn("if: needs.seed.outputs.mode == 'preview' || needs.seed.outputs.mode == 'unsigned-release'",
+                      jobs(text)["preview"])
         self.assertIn("name: unsigned-desktop-windows-x64", jobs(text)["seed"])
+
+    def test_distribution_release_mode_comes_from_the_checked_in_switch(self):
+        """A release run is `official` (signed hand-off) or `unsigned-release`, only as
+        packaging/windows-release-signing.txt says, after the release-context check."""
+        import re
+        seed = jobs(self.read("windows-distribution.yml"))["seed"]
+        mode = seed[seed.index("- id: mode"):seed.index("- name: Signing helper tests")]
+        self.assertLess(mode.index("winsign.py release-context"), mode.index("release_policy.py windows-signing"))
+        self.assertIn("signed) echo mode=official >> \"$GITHUB_OUTPUT\" ;;", mode)
+        self.assertIn("unsigned) echo mode=unsigned-release >> \"$GITHUB_OUTPUT\" ;;", mode)
+        self.assertIn('*) echo "unknown Windows release signing mode" >&2; exit 1 ;;', mode)
+        self.assertEqual(re.findall(r"echo mode=([a-z-]+)", mode), ["official", "unsigned-release", "preview"])
+        # Every release, signed or not, passes the official seed checks (metro-tui.exe required);
+        # the unsigned build is the same seed, matched by hash.
+        verify = seed[seed.index("- id: verify"):]
+        self.assertIn("official|unsigned-release)", verify)
+        self.assertIn('--mode official --work "$RUNNER_TEMP/official-check"', verify)
+        self.assertIn('${sha:+--expect-sha256 "$sha"}', verify)
+        # The signed hand-off is uploaded only in official mode; everything unsigned in the others.
+        self.assertIn("- if: steps.mode.outputs.mode == 'official'\n        uses: actions/upload-artifact", seed)
+        self.assertEqual(seed.count("if: steps.mode.outputs.mode != 'official'"), 4)
+        self.assertNotIn("inputs.release }}\n", seed.replace("RELEASE: ${{ inputs.release }}\n", ""))
+        build = seed[seed.index("- id: preview"):]
+        self.assertIn('if [ "$MODE" = unsigned-release ] || [ -e "$RUNNER_TEMP/tree/metro-tui.exe" ]; then', build)
+        self.assertIn('finalize --work "$RUNNER_TEMP/work" --mode preview', build)
+        # The unsigned release dist is the preview job's, verified natively against this commit.
+        preview = jobs(self.read("windows-distribution.yml"))["preview"]
+        self.assertIn("--expect-commit $env:COMMIT", preview)
+        self.assertIn("COMMIT: ${{ github.sha }}", preview)
+        self.assertIn("name: dist-desktop-windows-x64", preview)
 
     def test_no_tag_or_ref_name_release_logic(self):
         for name in ("windows-distribution.yml", "windows-sign.yml"):
@@ -803,6 +834,14 @@ class Workflows(unittest.TestCase):
                 self.assertIn("runs-on: ubuntu-24.04" if job in ("guard", "msi") else "runs-on: windows-2025", body)
         self.assertIn("winsign.py release-context", all_jobs["guard"])
         self.assertIn("winsign.py signing-environment", all_jobs["guard"])
+        # Signed mode still fails closed without a configured backend, and only runs when
+        # packaging/windows-release-signing.txt says signed.
+        guard = all_jobs["guard"]
+        backend = 'case "$BACKEND" in azure|kms) ;; *) echo "METRO_WINDOWS_SIGNING_BACKEND must be azure or kms" >&2; exit 1 ;; esac'
+        self.assertIn(backend, guard)
+        self.assertIn("grep -qx 'windows_signing=signed'", guard)
+        self.assertLess(guard.index("release_policy.py windows-signing"), guard.index(backend))
+        self.assertLess(guard.index(backend), guard.index("winsign.py signing-environment"))
         guard_if = ("if: >- github.event_name == 'push' && github.repository == 'wnzn/metro' && "
                     "github.repository_id == '1467654868' && github.ref == 'refs/heads/main' && "
                     "github.ref_type == 'branch' && github.ref_protected && toJSON(github.event.deleted) == 'false' && "
@@ -814,6 +853,28 @@ class Workflows(unittest.TestCase):
             self.assertIn("--commit $env:GITHUB_SHA" if job == "sign" else "Assert-MetroReleaseContext", all_jobs[job])
         self.assertIn("--expect-commit $env:GITHUB_SHA", all_jobs["verify"])
         self.assertIn("name: dist-desktop-windows-x64", all_jobs["verify"])
+
+    def test_release_publication_calls_windows_signing_only_in_signed_mode(self):
+        import re
+        text = self.read("release-publish.yml")
+        all_jobs = jobs(text)
+        sign = all_jobs["windows-sign"]
+        self.assertIn("if: needs.authorize.outputs.proceed == 'true' && needs.authorize.outputs.windows_signing == 'signed'",
+                      sign)
+        self.assertIn("uses: ./.github/workflows/windows-sign.yml", sign)
+        self.assertIn("windows_signing: ${{ steps.check.outputs.windows_signing }}", all_jobs["authorize"])
+        # Only windows-sign (the Windows signer), images and sign (Sigstore/GHCR) may hold id-token.
+        self.assertEqual({name for name, body in all_jobs.items() if "id-token: write" in body},
+                         {"windows-sign", "images", "sign"})
+        self.assertEqual(len(re.findall(r"windows-sign\.yml", text)), 1)
+        self.assertNotIn("vars.", text)
+        self.assertNotIn("environment:", text)
+        # The tag needs a successful signed Windows gate, or windows-sign skipped in unsigned mode.
+        tag = " ".join(all_jobs["tag"].split())
+        self.assertIn("needs: [authorize, windows-sign]", tag)
+        self.assertIn("(needs.authorize.outputs.windows_signing == 'signed' && needs.windows-sign.result == 'success')", tag)
+        self.assertIn("(needs.authorize.outputs.windows_signing == 'unsigned' && needs.windows-sign.result == 'skipped')",
+                      tag)
 
     def test_module_allowlist_matches_winsign(self):
         module = (HERE / "MetroWindowsSigning.psm1").read_text(encoding="utf-8")
@@ -835,9 +896,11 @@ class VerifierSelfTestGuard(unittest.TestCase):
         self.assertIn("$env:METRO_WINDOWS_SELF_TEST -cne 'preview'", body)
         text = (HERE.parents[1] / ".github/workflows/windows-distribution.yml").read_text(encoding="utf-8")
         preview = jobs(text)["preview"]
-        self.assertIn("if: ${{ !inputs.release }}", preview)
+        self.assertIn("if: needs.seed.outputs.mode == 'preview' || needs.seed.outputs.mode == 'unsigned-release'", preview)
         step = preview[preview.index("Invoke-MetroVerifierSelfTest") - 800:preview.index("Invoke-MetroVerifierSelfTest")]
-        self.assertIn("METRO_WINDOWS_SELF_TEST: ${{ !inputs.release && 'preview' || 'release' }}", step)
+        self.assertIn("METRO_WINDOWS_SELF_TEST: ${{ (needs.seed.outputs.mode == 'preview' || "
+                      "needs.seed.outputs.mode == 'unsigned-release') && 'preview' || 'release' }}", step)
+        self.assertNotIn("permissions:\n      contents: read\n      id-token", preview)
         self.assertEqual(text.count("METRO_WINDOWS_SELF_TEST"), 1)
         self.assertNotIn("Invoke-MetroVerifierSelfTest", jobs(text)["seed"])
 

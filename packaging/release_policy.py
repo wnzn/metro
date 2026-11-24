@@ -10,8 +10,11 @@ The version is the checked-in one: Cargo `[workspace.package] version` and
 apps/desktop/nsh.json `version` must be the same semantic version (a
 prerelease such as 0.3.0-rc.1 is published as a GitHub prerelease, never
 latest). Its immutable marker is the tag v<version>, created by this workflow
-after CI, the platform smoke gates and Windows signing and verification.
-It is never moved.
+after CI, the platform smoke gates and the Windows gate: Authenticode signing
+and verification (windows-sign.yml) when packaging/windows-release-signing.txt
+says `signed`, or, when it says `unsigned`, the unsigned Windows build that
+windows-distribution.yml built and tested natively in the release run. It is
+never moved.
 
 Only a version bump releases. A main push whose checked-in version equals the
 version at push.before is CI only, and so is a push whose before commit is
@@ -35,9 +38,11 @@ Without a bump the state is `unchanged` (same version as push.before) or
 Commands (GitHub API via GH_TOKEN; the token is never printed):
 
   version      print the checked-in version
+  windows-signing  print the checked-in Windows release mode (signed or unsigned; no network)
   provenance   fail unless this is the official main push (no network)
   decide       provenance, version bump, eligibility; writes GITHUB_OUTPUT
-  authorize    recheck the bump and eligibility before Windows signing (read only)
+  authorize    recheck the bump and eligibility before the Windows gate (read only);
+               also outputs windows_signing for release-publish.yml
   tag          create refs/tags/v<version> at this commit (idempotent, never moved)
   verify-tag   verify the exact tag before signing (read only)
   publish      stage a draft with exactly the verified files, check every
@@ -323,10 +328,37 @@ def check_assets(release, expected, where):
             require(digest == "sha256:" + expected[asset["name"]], f"{where}: {asset['name']} has other bytes")
 
 
-def release_notes(version, sha):
-    return (f"Metro {version}. Verify downloads with SHA256SUMS and its Sigstore bundle "
-            "SHA256SUMS.sigstore.json. Container images by digest: IMAGES.txt.\n\n"
-            f"<!-- metro-release: {sha} -->")
+def release_notes(version, sha, windows=None):
+    """The release body. `windows` is the signing mode (default: the checked-in one)."""
+    windows = release_signatures.windows_signing() if windows is None else windows
+    notes = (f"Metro {version}. Verify downloads with SHA256SUMS and its Sigstore bundle "
+             "SHA256SUMS.sigstore.json. Container images by digest: IMAGES.txt.\n\n")
+    if windows == "unsigned":
+        msi = release_signatures.windows_msi(version, windows)
+        notes += (
+            "**The Windows downloads are not code-signed.** Metro doesn't have a Windows code-signing "
+            f"certificate yet, so Metro-{version}-windows-x64.zip (its RELEASE.json says "
+            f"`unsigned-preview`), {msi} and the two .ps1 scripts carry no Authenticode signature. "
+            "The MSI installs as \"Metro (unsigned)\" and says so on its first page. Windows SmartScreen "
+            "warnings and an \"Unknown publisher\" prompt are expected, and PowerShell may refuse the scripts under a policy that requires signed "
+            "scripts.\n\n"
+            "Before you run a Windows file, verify SHA256SUMS with its Sigstore bundle, then check the "
+            "file against it:\n\n"
+            "```sh\n"
+            "cosign verify-blob --bundle SHA256SUMS.sigstore.json \\\n"
+            "  --certificate-identity "
+            "'https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/main' \\\n"
+            "  --certificate-oidc-issuer https://token.actions.githubusercontent.com \\\n"
+            "  --certificate-github-workflow-ref refs/heads/main \\\n"
+            f"  --certificate-github-workflow-sha {sha} SHA256SUMS\n"
+            "sha256sum -c --ignore-missing SHA256SUMS\n"
+            "```\n\n"
+            "On Windows, compare `(Get-FileHash <file> -Algorithm SHA256).Hash` with the file's line in "
+            "SHA256SUMS, ignoring case. Details: "
+            "https://github.com/wnzn/metro/blob/main/docs/install.md#check-a-download\n\n")
+    else:
+        require(windows == "signed", f"unknown Windows signing mode {windows!r}")
+    return notes + f"<!-- metro-release: {sha} -->"
 
 
 def require_own_draft(release, version, sha):
@@ -391,6 +423,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("version")
+    sub.add_parser("windows-signing")
     sub.add_parser("provenance")
     sub.add_parser("decide")
     for name in ("authorize", "tag", "verify-tag", "publish"):
@@ -403,6 +436,11 @@ def main():
         version, prerelease = read_version()
         if args.command == "version":
             outputs({"version": version, "prerelease": str(prerelease).lower()})
+            return
+        # The checked-in switch; an unreadable or unknown value fails every other command.
+        windows = release_signatures.windows_signing()
+        if args.command == "windows-signing":
+            outputs({"windows_signing": windows})
             return
         sha = check_provenance(os.environ, git_head())
         if args.command == "provenance":
@@ -423,13 +461,13 @@ def main():
                 print(f"release_policy: {quiet} (before: {prior or 'none'}, now: {version}); CI only, no release",
                       file=sys.stderr)
                 outputs({"release": "false", "state": quiet, "version": version,
-                         "prerelease": str(prerelease).lower()})
+                         "prerelease": str(prerelease).lower(), "windows_signing": windows})
                 return
         api = GitHub(os.environ.get("GH_TOKEN", ""), api=os.environ.get("GITHUB_API_URL", "https://api.github.com"))
         if args.command == "decide":
             state = decide(api, version, sha, prior)
             outputs({"release": str(state in ("new", "resume")).lower(), "state": state, "version": version,
-                     "prerelease": str(prerelease).lower()})
+                     "prerelease": str(prerelease).lower(), "windows_signing": windows})
             return
         if args.command in ("authorize", "tag"):
             proceed = decide(api, version, sha, prior) in ("new", "resume")
@@ -437,15 +475,15 @@ def main():
                 create_tag(api, version, sha)
                 # Close the race with an out-of-band publisher during tagging.
                 proceed = decide(api, version, sha, prior) == "resume"
-            outputs({"proceed": str(proceed).lower()})
+            outputs({"proceed": str(proceed).lower(), "windows_signing": windows})
         elif args.command == "verify-tag":
             require(api.tag_commit(version) == sha, f"tag v{version} does not point at {sha[:12]}")
             require(api.public_release(version) is None, "the version is already public; refusing to sign again")
         else:
             outputs({"result": publish(api, version, sha, args.dir, prerelease),
                      "url": f"https://github.com/{REPOSITORY}/releases/tag/v{version}"})
-    except (PolicyError, OSError, ValueError, KeyError, TypeError, http.client.HTTPException,
-            subprocess.CalledProcessError, tomllib.TOMLDecodeError) as error:
+    except (PolicyError, release_signatures.ReleaseError, OSError, ValueError, KeyError, TypeError,
+            http.client.HTTPException, subprocess.CalledProcessError, tomllib.TOMLDecodeError) as error:
         parser.exit(1, f"release_policy: {error}\n")
 
 

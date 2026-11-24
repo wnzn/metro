@@ -76,6 +76,10 @@ app refuses plain `http://` to any other host.
 > `Metro-runner-<version>-linux-x64.tar.gz` (each with a `.sha256`), and
 > the images `ghcr.io/wnzn/metro-server` and `ghcr.io/wnzn/metro-runner`.
 > There's no macOS build for now, and Windows hasn't been tested natively.
+> Windows release files will ship **unsigned** (no Authenticode signature)
+> until a code-signing certificate is set up, so expect SmartScreen
+> warnings and check them against the Sigstore-signed `SHA256SUMS`
+> ([docs/install.md](docs/install.md#desktop-on-windows)).
 > What's verified so far: [docs/acceptance.md](docs/acceptance.md).
 
 ## Repository layout

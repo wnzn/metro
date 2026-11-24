@@ -3,6 +3,64 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Source only: releases ship Windows unsigned, version 0.3.1 (2026-11-24, packaging lane, local)
+
+The maintainer reported that the 0.3.0 bump's run on `main` (GitHub Actions
+run 45372491546) passed its build and test gates and then stopped in
+`publish / windows-sign / guard` with `METRO_WINDOWS_SIGNING_BACKEND must be
+azure or kms`: the repository has no Windows code-signing certificate, no
+`windows-release-signing` environment and no signing variables. Nothing was
+tagged or published. That run wasn't repeated here.
+
+Decision: release with Windows unsigned, labelled so, until a certificate
+exists. The new checked-in switch `packaging/windows-release-signing.txt`
+says `unsigned`. In that mode `windows-distribution.yml` checks the seed in
+official mode, then builds and natively tests the unsigned build as for a
+test build, and `release-publish.yml` skips `windows-sign.yml`. The release
+ships `Metro-0.3.1-windows-x64.zip`
+(`RELEASE.json` `unsigned-preview`, with its commit),
+`Metro-0.3.1-windows-x64.unsigned-preview.msi`, their `.sha256` files and
+the unsigned `.ps1` scripts. Its release notes say the Windows files aren't
+code-signed and how to check them. The version moves to `0.3.1` (Cargo
+workspace, `apps/desktop/nsh.json`, `Cargo.lock`), because 0.3.0's bump
+push has already happened.
+
+Ran locally on Debian 13 (Python 3.13, PyYAML 6.0.4 and ShellCheck 0.11.0 in
+a throwaway virtualenv; no PowerShell, so its tests skipped):
+
+| Check | Result |
+| --- | --- |
+| `python3 -I packaging/release_policy.py version` | `version=0.3.1` |
+| `python3 -I packaging/release_policy.py windows-signing` | `windows_signing=unsigned` |
+| `cargo metadata --locked --format-version 1` | passed |
+| `shellcheck -s sh packaging/*.sh` | passed |
+| actionlint 1.7.12 (checksum as in `ci.yml`), with ShellCheck | passed |
+| Every action pinned to a full SHA (the `ci.yml` check) | passed |
+| `python3 -B -m unittest discover -s packaging -v` | 220 tests, 15 skipped, passed in a throwaway clone with the change committed; in the uncommitted worktree, one test fails only because `HEAD` is still 0.3.0 |
+| `python3 -B -m unittest discover -s packaging/release-signatures -v` | 18 tests, 1 skipped, passed |
+| `python3 -B -m unittest discover -s packaging/windows-signing -v` | 41 tests, 6 skipped, passed |
+
+The unsigned (`--preview`) MSI's wording now fits both its uses, test
+builds and unsigned releases. Its product name is "Metro (unsigned)", not
+"Metro (unsigned preview)". Its first page says: "This Metro build isn't
+code-signed, so Windows may warn about an unknown publisher. Before you
+install it, check the file against its SHA-256 checksum (SHA256SUMS)." It
+no longer says it "is not a Metro release". With the pinned MSI toolchain
+(`build_msi.py fetch-tools`, hashes from `wixl-lock.json`),
+`METRO_MSI_TOOLS=… python3 -B -m unittest test_windows_msi` ran 26 tests,
+with 2 skipped for lack of PowerShell, and passed. That includes the real
+`--preview` builds and their inspection. A `--preview` MSI built from the
+lane's fake payload showed, through `msiinfo`, `ProductName` "Metro
+(unsigned)", the new `PreviewNote` text, the new Comments, and no
+"not a Metro release" or "local preview" anywhere in its `Control` table.
+`MsiHarness.ps1` and `test-msi-harness.ps1` expect the new name, but
+without `pwsh` they weren't run here.
+
+**Not yet shown:** nothing ran on GitHub. The unsigned release path, the
+native Windows checks in it (including the PowerShell harness's product-name
+check), the wizard on screen, and the publication of 0.3.1 run only when the
+bump reaches `main`.
+
 ## Source only: the release version moves to 0.3.0 (2026-11-24, packaging lane, local)
 
 A protected `main` push releases only when it changes the checked-in version,

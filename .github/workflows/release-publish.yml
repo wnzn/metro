@@ -2,10 +2,17 @@ name: Release publication
 
 # CI calls this only after its tests and the platform smoke gates pass on the
 # official protected main push that bumped the version. Sign and verify
-# Windows, pin v<version> at that commit, assemble the set, verify GHCR and
-# Sigstore signatures, and publicly promote the complete release. The tag is a
-# marker, not a workflow trigger. A release ships Windows and Linux only:
-# macOS builds and signing are off for now (see release.yml).
+# Windows (or, when packaging/windows-release-signing.txt says `unsigned`,
+# skip signing and ship the unsigned Windows build that release.yml's
+# windows-distribution built and tested natively), pin v<version> at that
+# commit, assemble the set, verify GHCR and Sigstore signatures, and publicly
+# promote the complete release. The tag is a marker, not a workflow trigger.
+# A release ships Windows and Linux only: macOS builds and signing are off for
+# now (see release.yml).
+#
+# Every job after windows-sign states its own condition: with windows-sign
+# skipped (unsigned), GitHub would otherwise skip everything that depends on
+# it. Each one still needs every earlier job to have succeeded.
 
 on:
   workflow_call:
@@ -24,13 +31,15 @@ jobs:
     timeout-minutes: 5
     outputs:
       proceed: ${{ steps.check.outputs.proceed }}
+      # signed or unsigned, from the checked-in packaging/windows-release-signing.txt.
+      windows_signing: ${{ steps.check.outputs.windows_signing }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0  # the push's before commit, to recheck the version bump
           persist-credentials: false
-      - name: Recheck exact protected main provenance, the version bump and eligibility before signing Windows
+      - name: Recheck exact protected main provenance, the version bump and eligibility before the Windows gate
         id: check
         env:
           GH_TOKEN: ${{ github.token }}
@@ -42,9 +51,11 @@ jobs:
           EVENT_AFTER: ${{ github.event.after }}
         run: python3 -I packaging/release_policy.py authorize --version "$VERSION"
 
+  # Signed releases only. With `unsigned` this is skipped: no signing variables,
+  # no windows-release-signing environment and no OIDC token for Windows.
   windows-sign:
     needs: authorize
-    if: needs.authorize.outputs.proceed == 'true'
+    if: needs.authorize.outputs.proceed == 'true' && needs.authorize.outputs.windows_signing == 'signed'
     uses: ./.github/workflows/windows-sign.yml
     with:
       version: ${{ inputs.version }}
@@ -52,8 +63,14 @@ jobs:
       contents: read
       id-token: write
 
+  # Signed: only after windows-sign succeeded. Unsigned: only with windows-sign
+  # skipped; the unsigned Windows build was already tested in release.yml.
   tag:
-    needs: windows-sign
+    needs: [authorize, windows-sign]
+    if: >-
+      ${{ !cancelled() && needs.authorize.result == 'success' && needs.authorize.outputs.proceed == 'true'
+      && ((needs.authorize.outputs.windows_signing == 'signed' && needs.windows-sign.result == 'success')
+      || (needs.authorize.outputs.windows_signing == 'unsigned' && needs.windows-sign.result == 'skipped')) }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -81,7 +98,7 @@ jobs:
   # Only after tag pinned v<version> here; otherwise nothing below runs.
   assets:
     needs: tag
-    if: needs.tag.outputs.proceed == 'true'
+    if: ${{ !cancelled() && needs.tag.result == 'success' && needs.tag.outputs.proceed == 'true' }}
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
@@ -109,6 +126,7 @@ jobs:
 
   images:
     needs: [tag, assets]
+    if: ${{ !cancelled() && needs.tag.result == 'success' && needs.assets.result == 'success' }}
     uses: ./.github/workflows/release-images.yml
     with:
       version: ${{ inputs.version }}
@@ -120,6 +138,9 @@ jobs:
 
   sign:
     needs: [tag, assets, images]
+    if: >-
+      ${{ !cancelled() && needs.tag.result == 'success' && needs.assets.result == 'success'
+      && needs.images.result == 'success' }}
     uses: ./.github/workflows/sign-release-assets.yml
     with:
       version: ${{ inputs.version }}
@@ -130,6 +151,9 @@ jobs:
 
   publish:
     needs: [tag, assets, images, sign]
+    if: >-
+      ${{ !cancelled() && needs.tag.result == 'success' && needs.assets.result == 'success'
+      && needs.images.result == 'success' && needs.sign.result == 'success' }}
     runs-on: ubuntu-24.04
     permissions:
       contents: write
