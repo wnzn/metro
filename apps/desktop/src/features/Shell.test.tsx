@@ -201,3 +201,69 @@ test("compact window: mod+k focuses search, and the account menu opens, copies a
   await app.press("id:disconnect");
   await app.waitFor("id:connect-screen");
 });
+
+test("collapsed, the navigation is an icon rail with names on hover; a narrow window hides it", async () => {
+  const app = await openApp(world());
+  await signIn(app, "alice");
+  // The toggle is an icon: its caption is only its tooltip and accessible name.
+  expect(app.shows("id:toggle-navigation >> text:Navigation")).toBe(false);
+  await app.press("label:Hide workspace navigation");
+  await app.waitFor("id:sidebar-rail");
+  expect(app.shows("id:nav-chat")).toBe(false);
+  for (const id of ["rail-chat", "rail-library", "rail-schedules", "rail-space:acme", "rail-new-space", "rail-settings", "rail-account-menu"]) {
+    expect(app.shows(`id:${id}`)).toBe(true);
+  }
+  expect(app.shows("id:rail-space:acme >> text:A")).toBe(true); // the Space's initial
+  expect(app.shows("label:Space Acme")).toBe(true);
+  expect(app.shows("label:Library")).toBe(true);
+  await app.press("id:rail-space:acme");
+  await app.waitFor("text:hello from bob in acme");
+  await app.press("id:rail-library");
+  await app.waitFor("id:library-home");
+  await app.setViewport(760, 800);
+  await app.waitFor("id:sidebar-rail", { state: "gone" });
+  await app.setViewport(1200, 800);
+  await app.waitFor("id:sidebar-rail");
+  // New Space opens the whole panel on its form.
+  await app.press("id:rail-new-space");
+  await app.waitFor("id:new-space-name");
+  expect(app.storage()["metro.layout.navigation"]).toBe("expanded");
+});
+
+test("collapsed Settings sections stay as a rail of their icons", async () => {
+  const app = await openApp(world());
+  await signIn(app, "alice");
+  await app.press("id:nav-settings");
+  expect(app.shows("id:toggle-settings-sections >> text:Sections")).toBe(false);
+  await app.press("label:Hide settings sections");
+  await app.waitFor("id:settings-rail");
+  await app.press("id:rail-settings:appearance");
+  await app.waitFor("id:appearance-settings");
+  expect(app.shows("label:Model providers")).toBe(true);
+});
+
+test("the connection is a dot on the account's server line; words only when not online", async () => {
+  const f = world();
+  const app = await openApp(f);
+  await signIn(app, "alice");
+  expect(app.shows("id:sidebar >> id:metro-mark")).toBe(true);
+  expect(app.shows("id:active-server >> id:connection-state")).toBe(true);
+  expect(app.shows("label:Connection: Online")).toBe(true);
+  expect(app.shows("text:Online")).toBe(false);
+  expect(app.shows("label:/^alice, connected to 127\\.0\\.0\\.1:8787\\. Connection: Online\\. Account menu$/")).toBe(true);
+});
+
+test("a room's breadcrumb and actions share the one header row with the search box", async () => {
+  const app = await openApp(world());
+  await signIn(app, "alice");
+  await app.press("id:space:acme");
+  await app.waitFor("id:room-title");
+  expect(app.shows("id:top-bar >> id:room-title")).toBe(true);
+  expect(app.shows("id:top-bar >> id:top-search")).toBe(true);
+  expect(app.shows("id:top-bar >> id:manage-space")).toBe(true);
+  expect(app.shows("id:top-bar >> id:toggle-navigation")).toBe(true);
+  expect(app.shows("text:Members of this Space share its rooms and its agent.")).toBe(false); // its tooltip
+  await app.press("id:nav-chat");
+  await app.waitFor("id:chat-view");
+  expect(app.shows("id:top-bar >> id:manage-space")).toBe(false);
+});

@@ -28,6 +28,7 @@ import {
   toneSolidClass,
   toneSurfaceClass,
   toneTextClass,
+  tooltipClass,
   transitionClass,
 } from "./tokens";
 import type { Space, Tone } from "./tokens";
@@ -94,6 +95,7 @@ export function Spacer() {
 export type SurfaceVariant =
   | "app"
   | "sidebar"
+  | "rail"
   | "panel"
   | "card"
   | "dialog"
@@ -112,6 +114,8 @@ export type SurfaceVariant =
 const surfaceClass: Record<SurfaceVariant, string> = {
   app: "flex-1 flex-row bg-background",
   sidebar: "w-(--sidebar-width) bg-sidebar border-r border-sidebar-border",
+  /** A collapsed sidebar: one column of icons, the account at the bottom. */
+  rail: "w-[56px] shrink-0 items-center bg-sidebar border-r border-sidebar-border py-(--space-3) gap-(--space-1)",
   panel: "flex-1 min-w-0 bg-background",
   // Cards are flat: a border, no shadow. Only popovers and dialogs float.
   card: "bg-card border border-border rounded-(--radius)",
@@ -143,15 +147,27 @@ export function Divider() {
   return <View class="h-px bg-border" />;
 }
 
-/** Keep search on the main pane's centerline. Reserve the actual width of
- * the leading control on both sides, including when it becomes icon-only. */
-export function CenteredToolbar(props: Children & Testable & { leading: JSX.Element }) {
+/**
+ * The main pane's one header row, divided from the content under it by a
+ * line. Alone, `children` (the search box) stays on the pane's centerline:
+ * the leading control's actual width is reserved on both sides. With a
+ * `title` (a room's breadcrumb, truncated first) and `trailing` actions the
+ * row reads leading, title, search, actions.
+ */
+export function CenteredToolbar(props: Children & Testable & { leading: JSX.Element; title?: JSX.Element; trailing?: JSX.Element }) {
   const leadingWidth = signal(0);
+  const split = () => !!(props.title || props.trailing);
+  // One tree either way, so the search box keeps its focus as the place changes.
   return (
-    <Surface variant="topbar" testID={props.testID} gap={2}>
+    <Surface variant="topbar" testID={props.testID} gap={split() ? 3 : 2}>
       <View class="shrink-0" onLayout={e => leadingWidth.set(e.bounds.size.width)}>{props.leading}</View>
-      <Column grow align="center">{props.children}</Column>
-      <View class="shrink-0" style={{ width: leadingWidth() }} accessibilityElementsHidden />
+      <If when={split()}>
+        <View class="flex-1 min-w-0 flex-row items-center">{props.title}</View>
+      </If>
+      <View class={split() ? "w-[340px] shrink min-w-[180px] flex-col items-stretch" : "flex-1 min-w-0 flex-col items-center"}>{props.children}</View>
+      <View class="shrink-0 flex-row items-center gap-(--space-2)" style={split() ? undefined : { width: leadingWidth() }} accessibilityElementsHidden={!split()}>
+        {props.trailing}
+      </View>
     </Surface>
   );
 }
@@ -201,6 +217,8 @@ export function Label(
     lines?: number;
     /** Screen readers treat it as a heading (page and section titles). */
     heading?: boolean;
+    /** More words on hover (a description that has no room on screen). */
+    tooltip?: string;
     children?: JSX.Element;
   },
 ) {
@@ -211,6 +229,7 @@ export function Label(
       role={props.heading ? "header" : undefined}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
+      tooltip={props.tooltip ? <Text class={tooltipClass}>{props.tooltip}</Text> : undefined}
     >
       {props.children}
     </Text>
@@ -330,7 +349,10 @@ export function ActionBar(props: Testable & { children?: JSX.Element; justify?: 
   );
 }
 
-const indentClass = ["", "ml-(--space-4)", "ml-[32px]", "ml-[48px]", "ml-[64px]"];
+// Nesting is inner padding, never a margin: a nested row's selected pill
+// keeps the list's full width, and its glyph lines up under its parent's
+// name (the parent's 16-point icon plus the 8-point gap: 24 more).
+const indentClass = ["pl-(--space-3)", "pl-[36px]", "pl-[52px]", "pl-[68px]", "pl-[84px]"];
 
 /** A selectable row in a navigation list (Chat, Spaces, rooms, threads). */
 export function NavItem(
@@ -347,13 +369,15 @@ export function NavItem(
     /** Nesting level (threads under their parent room). */
     depth?: number;
     emphasis?: boolean;
+    /** A quiet extra shown on hover (a role), never in the row. */
+    tooltip?: string;
   },
 ) {
   return (
     <Button
       class={cx(
         // 40 high: a comfortable list row; the selected one takes the accent tint.
-        "flex-row items-center gap-(--space-2) min-h-[40px] rounded-(--radius-sm) px-(--space-3) py-[8px]",
+        "flex-row items-center gap-(--space-2) min-h-[40px] rounded-(--radius-sm) pr-(--space-3) py-[8px]",
         focusRing,
         transitionClass,
         indentClass[Math.min(props.depth ?? 0, indentClass.length - 1)],
@@ -363,6 +387,7 @@ export function NavItem(
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.label}
+      tooltip={props.tooltip ? <Text class={tooltipClass}>{props.tooltip}</Text> : undefined}
     >
       <If
         when={props.icon}

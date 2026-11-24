@@ -73,6 +73,7 @@ import {
   popoverItemClass,
   popoverMotion,
   textClass,
+  toneSolidClass,
   toneSurfaceClass,
   toneTextClass,
   tooltipClass,
@@ -179,6 +180,60 @@ export function PanelToggle(props: {
   );
 }
 
+// ---------------------------------------------------------------- rail
+
+/**
+ * One place in a collapsed panel's icon rail: an icon, a letter tile (a
+ * Space's initial) or any small picture (`content`, an avatar). Its name is
+ * the tooltip and all a screen reader hears; `selected` takes the accent.
+ */
+export function RailButton(props: {
+  label: string;
+  selected?: boolean;
+  onPress: () => void;
+  icon?: IconName;
+  /** A letter tile instead of an icon. */
+  initial?: string;
+  /** Any small picture instead (an avatar). */
+  content?: JSX.Element;
+  testID?: string;
+}) {
+  return (
+    <Button
+      class={cx(
+        "items-center justify-center size-[40px] shrink-0 rounded-(--radius-md)",
+        transitionClass,
+        focusRing,
+        props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-hover active:bg-sidebar-hover",
+      )}
+      role={props.selected !== undefined ? "tab" : undefined}
+      selected={props.selected}
+      onPress={props.onPress}
+      testID={props.testID}
+      accessibilityLabel={props.label}
+      tooltip={<Text class={tooltipClass}>{props.label}</Text>}
+    >
+      <If
+        when={props.content}
+        else={
+          <If
+            when={props.initial}
+            else={<Icon name={props.icon ?? "more"} color={props.selected ? "sidebar-active" : "sidebar"} size={20} />}
+          >
+            {(letter) => (
+              <View class={cx("size-[28px] items-center justify-center rounded-(--radius-sm)", props.selected ? "bg-primary" : "bg-muted")}>
+                <Text class={cx(textClass.sm, "font-semibold", props.selected ? "text-primary-foreground" : "text-foreground")}>{letter()}</Text>
+              </View>
+            )}
+          </If>
+        }
+      >
+        {props.content}
+      </If>
+    </Button>
+  );
+}
+
 // ---------------------------------------------------------------- brand
 
 /** A single tinted silhouette and wordmark, with one accessible name. */
@@ -229,12 +284,23 @@ export function AccountMenu(props: {
   name: string;
   detail: string;
   detailIcon?: IconName;
+  /**
+   * The connection to the server, beside `detail`: a dot in `tone`, `text`
+   * after it only when there is something to say (Reconnecting), and the
+   * whole status (`label`) as its tooltip.
+   */
+  status?: { tone: Tone; label: string; text?: string; testID?: string };
+  /** Only the avatar, for an icon rail; the name and server are its tooltip. */
+  compact?: boolean;
   note?: string;
   items: readonly AccountMenuItem[];
 }) {
   const plain = () => props.items.filter((i) => !i.destructive);
   const ending = () => props.items.filter((i) => i.destructive);
   const still = () => reduceMotion();
+  const dot = (s: { tone: Tone; label: string; testID?: string }, extra?: string) => (
+    <View class={cx("size-2 shrink-0 rounded-full", toneSolidClass[s.tone], extra)} testID={s.testID} accessibilityLabel={s.label} />
+  );
   return (
     <Menu
       placement="top"
@@ -245,26 +311,53 @@ export function AccountMenu(props: {
       popupEndingClass={still() ? undefined : popoverMotion.ending}
       backdropClass="bg-black/40"
       trigger={
-        <View
-          class={cx("flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-(--space-2) hover:bg-sidebar-hover active:bg-sidebar-hover", transitionClass, focusRing)}
-          focusable
-          testID={props.testID}
-          accessibilityLabel={props.accessibilityLabel}
-        >
-          {props.avatar}
-          <View class="flex-1 min-w-0 flex-col">
-            <Text class={cx(textClass.sm, "font-semibold text-sidebar-foreground")} style={{ numberOfLines: 1 }}>
-              {props.name}
-            </Text>
-            <View class="flex-row items-center gap-[4px] min-w-0">
-              <If when={props.detailIcon}>{(name) => <Icon name={name()} color="muted" size={12} />}</If>
-              <Text class={cx("flex-1", textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
-                {props.detail}
-              </Text>
+        <If
+          when={props.compact}
+          else={
+            <View
+              class={cx("flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-(--space-2) hover:bg-sidebar-hover active:bg-sidebar-hover", transitionClass, focusRing)}
+              focusable
+              testID={props.testID}
+              accessibilityLabel={props.accessibilityLabel}
+            >
+              {props.avatar}
+              <View class="flex-1 min-w-0 flex-col">
+                <Text class={cx(textClass.sm, "font-semibold text-sidebar-foreground")} style={{ numberOfLines: 1 }}>
+                  {props.name}
+                </Text>
+                <View class="flex-row items-center gap-[4px] min-w-0">
+                  <If when={props.detailIcon}>{(name) => <Icon name={name()} color="muted" size={12} />}</If>
+                  <Text class={cx("shrink min-w-0", textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+                    {props.detail}
+                  </Text>
+                  <If when={props.status}>
+                    {(s) => (
+                      <View class="flex-row items-center gap-[4px] shrink-0" tooltip={<Text class={tooltipClass}>{s().label}</Text>}>
+                        {dot(s())}
+                        <If when={s().text}>
+                          {(t) => <Text class={cx(textClass.xs, toneTextClass[s().tone])} style={{ numberOfLines: 1 }}>{t()}</Text>}
+                        </If>
+                      </View>
+                    )}
+                  </If>
+                  <View class="flex-1" />
+                </View>
+              </View>
+              <Icon name="more" color="muted" />
             </View>
+          }
+        >
+          <View
+            class={cx("relative items-center justify-center size-[40px] rounded-(--radius-md) hover:bg-sidebar-hover active:bg-sidebar-hover", transitionClass, focusRing)}
+            focusable
+            testID={props.testID}
+            accessibilityLabel={props.accessibilityLabel}
+            tooltip={<Text class={tooltipClass}>{[props.name, props.detail, props.status?.label].filter(Boolean).join(" · ")}</Text>}
+          >
+            {props.avatar}
+            <If when={props.status}>{(s) => dot(s(), "absolute right-[5px] bottom-[5px] border border-sidebar")}</If>
           </View>
-          <Icon name="more" color="muted" />
-        </View>
+        </If>
       }
     >
       <If when={props.note}>

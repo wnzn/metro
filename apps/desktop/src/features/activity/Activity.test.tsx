@@ -1,5 +1,7 @@
-// Each agent turn shows as one collapsed group; people's messages, the agent's
-// final reply and errors stay visible. Real NSH engine, fake server.
+// Each agent turn shows as one block, collapsed to a summary line (name ·
+// thought Ns · K tools · route, a pill only on failure; while live, the
+// current step); opened, a timeline. People's messages, the agent's final
+// reply and errors stay visible. Real NSH engine, fake server.
 
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
@@ -40,22 +42,23 @@ function finishTurn(f: F, a: Act) {
 
 const shown = (app: App, s: string) => app.shows(s);
 
-test("a live turn is one collapsed 'thinking' group that becomes the agent's activity", async () => {
+test("a live turn is one line with its current step that settles into the summary", async () => {
   const f = world();
   const a = turn("run-1");
   const { ask, call } = startTurn(f, a);
   const app = await signedIntoAcme(f);
-  await app.waitFor("text:Metro is thinking…");
+  await app.waitFor("text:Metro · Listing the workspace…");
   expect(shown(app, "id:activity-toggle:agent:run-1")).toBe(true);
-  expect(shown(app, "text:1 step")).toBe(true);
   expect(shown(app, 'text:/"path"/')).toBe(false);
   expect(shown(app, `id:activity-step:${call.id}`)).toBe(false);
 
   const { result, summary, reply } = finishTurn(f, a);
   await app.waitFor("text:The workspace has a README and a src folder.");
-  await app.waitFor("text:Metro’s activity");
-  expect(shown(app, "text:Metro is thinking…")).toBe(false);
-  expect(shown(app, "text:3 steps")).toBe(true);
+  await app.waitFor("id:activity-tools:agent:run-1");
+  expect(shown(app, "text:Metro · Listing the workspace…")).toBe(false);
+  expect(shown(app, "id:activity-toggle:agent:run-1 >> text:Metro")).toBe(true);
+  expect(shown(app, "id:activity-tools:agent:run-1 >> text:1 tool")).toBe(true);
+  expect(shown(app, "id:activity-outcome:agent:run-1")).toBe(false); // no pill unless it failed
   // Only one disclosure for the whole turn: no per-step toggles.
   expect(shown(app, `id:activity-toggle:event:${call.id}`)).toBe(false);
   expect(shown(app, `id:activity-toggle:event:${result.id}`)).toBe(false);
@@ -66,13 +69,16 @@ test("a live turn is one collapsed 'thinking' group that becomes the agent's act
   expect(shown(app, `id:react:${reply.id}`)).toBe(true);
   expect(shown(app, `id:react:${result.id}`)).toBe(false);
 
-  // One press shows every step, in order, with arguments, output and the provider's summary.
+  // One press shows the timeline: the tool with its short arguments and output, then the provider's summary as text.
   await app.press("id:activity-toggle:agent:run-1");
   await app.waitFor("id:activity-details:agent:run-1");
   for (const id of [call.id, result.id, summary.id]) expect(shown(app, `id:activity-step:${id}`)).toBe(true);
-  expect(shown(app, 'text:workspace.list {"path":"."}')).toBe(true);
+  expect(shown(app, `id:activity-step:${call.id} >> text:List workspace`)).toBe(true);
+  expect(shown(app, `id:activity-args:${call.id}`)).toBe(true); // "." in mono, after the tool's name
+  expect(shown(app, 'text:workspace.list {"path":"."}')).toBe(false); // short arguments, not the raw call
+  expect(shown(app, `id:activity-output:${result.id}`)).toBe(true); // its output, in the call's entry
   expect(shown(app, "text:README.md\nsrc/")).toBe(true);
-  expect(shown(app, "text:Thinking · summary shared by the model provider")).toBe(true);
+  expect(shown(app, "text:Reasoning summary from the model provider")).toBe(true);
   expect(shown(app, "text:Listed the root before answering.")).toBe(true);
   await app.press("id:activity-toggle:agent:run-1");
   await app.waitFor("id:activity-details:agent:run-1", { state: "gone" });
@@ -87,7 +93,7 @@ test("a live turn shows before its first tool; an ended empty one leaves nothing
   post(f, { kind: "agent", actor: "agent", text: "plain answer", activity: turn("done") });
   const app = await signedIntoAcme(f);
   await app.waitFor("text:plain answer");
-  expect(shown(app, "id:activity-title:agent:early")).toBe(true); // no steps yet: a plain status, nothing to open
+  expect(shown(app, "id:activity-title:agent:early")).toBe(true); // no steps yet: a plain status line, nothing to open
   expect(shown(app, "text:Scout is thinking…")).toBe(true);
   expect(shown(app, "id:activity-toggle:agent:early")).toBe(false);
   expect(shown(app, "id:activity:agent:done")).toBe(false);
@@ -108,14 +114,14 @@ test("later steps join their group in place and keep it open across polls", asyn
   await app.waitFor("text:carol speaks last");
   await app.waitFor(`id:activity-step:${later.id}`);
   expect(shown(app, "id:activity-details:agent:run-2")).toBe(true); // still open
-  expect(shown(app, "text:2 steps")).toBe(true);
+  await app.waitFor("text:Metro · Reading README.md…"); // the live line follows the latest step
   // The group stays where it started; people's messages keep their order.
   const t = app.texts();
   const at = (s: string) => t.indexOf(s);
-  for (const s of ["Metro is thinking…", "bob speaks after the call", "carol speaks last", 'workspace.read {"path":"README.md"}']) expect(at(s)).toBeGreaterThan(-1);
-  expect(at("Metro is thinking…")).toBeLessThan(at("bob speaks after the call"));
+  for (const s of ["Metro · Reading README.md…", "bob speaks after the call", "carol speaks last", "README.md"]) expect(at(s)).toBeGreaterThan(-1);
+  expect(at("Metro · Reading README.md…")).toBeLessThan(at("bob speaks after the call"));
   expect(at("bob speaks after the call")).toBeLessThan(at("carol speaks last"));
-  expect(at('workspace.read {"path":"README.md"}')).toBeLessThan(at("bob speaks after the call"));
+  expect(at("README.md")).toBeLessThan(at("bob speaks after the call"));
 });
 
 test("interleaved runs with the same name are separate groups", async () => {
@@ -129,11 +135,13 @@ test("interleaved runs with the same name are separate groups", async () => {
   post(f, { kind: "activity", actor: "agent", text: "", activity: phase(two, "completed") });
   const app = await signedIntoAcme(f);
   await app.waitFor("id:activity:agent:run-b");
-  expect(shown(app, "id:activity:agent:run-a >> text:Metro is thinking…")).toBe(true);
-  expect(shown(app, "id:activity:agent:run-b >> text:Metro’s activity")).toBe(true);
+  expect(shown(app, "id:activity:agent:run-a >> text:Metro · Reading A.md…")).toBe(true);
+  expect(shown(app, "id:activity:agent:run-b >> text:Metro")).toBe(true);
+  expect(shown(app, "id:activity:agent:run-b >> text:/Reading/")).toBe(false);
   await app.press("id:activity-toggle:agent:run-b");
-  await app.waitFor("text:/B\\.md/");
-  expect(shown(app, "text:/A\\.md/")).toBe(false);
+  await app.waitFor(`id:activity-details:agent:run-b`);
+  expect(shown(app, "id:activity-details:agent:run-b >> text:B.md")).toBe(true);
+  expect(shown(app, "id:activity-details:agent:run-b >> text:A.md")).toBe(false);
   expect(shown(app, "id:activity-details:agent:run-a")).toBe(false);
 });
 
@@ -156,9 +164,11 @@ test("failed, cancelled and interrupted turns say so while collapsed; errors sta
   await app.waitFor("text:workspace.read failed: runner offline");
   expect(shown(app, "text:The agent run was cancelled.")).toBe(true);
   expect(shown(app, "text:/thinking/")).toBe(false);
+  // A pill only for the failure; a stop is a quiet part of the summary.
   expect(shown(app, "id:activity-outcome:agent:bad >> text:failed")).toBe(true);
   expect(shown(app, "id:activity-outcome:agent:stop >> text:cancelled")).toBe(true);
   expect(shown(app, "id:activity-outcome:agent:cut >> text:interrupted")).toBe(true);
+  expect(app.count("text:failed")).toBe(1);
   expect(shown(app, "text:exit status 1")).toBe(false);
   await app.press("id:activity-toggle:agent:cut");
   await app.waitFor("text:The server restarted.");
@@ -168,7 +178,7 @@ test("Demo is Runner activity, not thinking, and never the person's name", async
   const f = world();
   const app = await signedIntoAcme(f);
   await app.press("id:run-demo");
-  await app.waitFor("text:Runner activity");
+  await app.waitFor("text:/^Runner (activity|is working…)$/");
   expect(shown(app, "text:/thinking/")).toBe(false);
   expect(shown(app, "text:Demo: workspace.list on the Space's runner")).toBe(true); // the request stays top-level
   expect(shown(app, "text:/alice’s activity/")).toBe(false);
@@ -185,7 +195,7 @@ test("older events without metadata each stay collapsed on their own", async () 
   const human = post(f, { kind: "tool_call", actor: "bob", text: "workspace.list {}" });
   const app = await signedIntoAcme(f);
   await app.waitFor(`id:activity-toggle:event:${result.id}`);
-  expect(shown(app, `id:activity:event:${call.id} >> text:Metro’s activity`)).toBe(true);
+  expect(shown(app, `id:activity:event:${call.id} >> text:Metro`)).toBe(true);
   expect(shown(app, `id:activity:event:${result.id} >> text:Runner activity`)).toBe(true);
   expect(shown(app, `id:activity:event:${human.id} >> text:Runner activity`)).toBe(true);
   expect(shown(app, "text:/bob’s activity|runner is thinking/i")).toBe(false);
@@ -215,17 +225,17 @@ test("another Space with the same activity id doesn't inherit an open group", as
   await app.waitFor("text:/README\\.md/"); // still open where the user opened it
 });
 
-test("screen readers hear the group's title, outcome, size and whether it is open", async () => {
+test("screen readers hear the summary, the outcome and whether it is open", async () => {
   const f = world();
   const a = turn("kb");
   startTurn(f, a);
   finishTurn(f, a);
   const app = await signedIntoAcme(f);
   // The toggle is NSH's Button: a keyboard focus stop that Space and Return press.
-  await app.waitFor("label:Show details: Metro\u2019s activity, completed, 3 steps");
-  await app.press("label:Show details: Metro\u2019s activity, completed, 3 steps");
+  await app.waitFor("label:Show details: Metro, 1 tool, completed");
+  await app.press("label:Show details: Metro, 1 tool, completed");
   await app.waitFor("id:activity-details:agent:kb");
-  expect(shown(app, "label:Hide details: Metro\u2019s activity, completed, 3 steps")).toBe(true);
+  expect(shown(app, "label:Hide details: Metro, 1 tool, completed")).toBe(true);
 });
 
 test("a live turn shows a working indicator beside its title, gone once the turn ends", async () => {
@@ -234,11 +244,11 @@ test("a live turn shows a working indicator beside its title, gone once the turn
   startTurn(f, a);
   const app = await signedIntoAcme(f);
   await app.waitFor("id:activity-live:agent:live");
-  expect(shown(app, "id:activity-toggle:agent:live >> id:activity-live:agent:live")).toBe(true);
-  // Decorative: screen readers hear the title, not the dots.
-  expect(shown(app, "label:Show details: Metro is thinking…, in progress, 1 step")).toBe(true);
+  expect(shown(app, "id:activity:agent:live >> id:activity-live:agent:live")).toBe(true);
+  // Decorative: screen readers hear the current step, not the dots.
+  expect(shown(app, "label:Show details: Metro · Listing the workspace…, 1 tool, in progress")).toBe(true);
   finishTurn(f, a);
-  await app.waitFor("text:Metro’s activity");
+  await app.waitFor("id:activity-tools:agent:live");
   expect(shown(app, "id:activity-live:agent:live")).toBe(false);
 });
 
@@ -254,7 +264,7 @@ test("with reduced motion the working indicator is drawn still, with no motion",
   const calm = await signedIntoAcme(g, "alice", { reducedMotion: true });
   await calm.waitFor("id:activity-live-dots:agent:calm:still");
   expect(calm.shows("id:activity-live-dots:agent:calm:moving")).toBe(false);
-  expect(calm.shows("text:Metro is thinking…")).toBe(true); // the words say it either way
+  expect(calm.shows("text:Metro · Listing the workspace…")).toBe(true); // the words say it either way
 });
 
 test("each step has a phase icon; tool output is a box that can be copied whole", async () => {
@@ -266,8 +276,8 @@ test("each step has a phase icon; tool output is a box that can be copied whole"
   const app = await signedIntoAcme(f);
   await app.press("id:activity-toggle:agent:icons");
   await app.waitFor("id:activity-details:agent:icons");
-  expect(shown(app, `id:activity-step-icon:${call.id}:called`)).toBe(true);
-  expect(shown(app, `id:activity-step-icon:${result.id}:complete`)).toBe(true);
+  // A call and its result are one entry: its icon says how the tool did.
+  expect(shown(app, `id:activity-step-icon:${call.id}:complete`)).toBe(true);
   expect(shown(app, `id:activity-step-icon:${summary.id}:thinking`)).toBe(true);
   expect(shown(app, `id:activity-step-icon:${bad.id}:failed`)).toBe(true);
   // The provider's summary is prose, not a code box.
@@ -293,4 +303,62 @@ test("long tool output in a turn folds to a few lines, shows all N on demand, an
   await app.waitFor(`id:activity-output:${out.id}:fold >> text:Show less`);
   await app.press(`id:activity-output:${out.id}:copy`);
   await app.waitUntil(() => app.clipboard() === lines.join("\n"));
+});
+
+test("a failed turn: one pill on its summary, one plain sentence inside, the provider's error under Details", async () => {
+  const f = world();
+  const a = turn("oops");
+  post(f, { kind: "activity", actor: "agent", text: "", activity: phase(a, "started") });
+  post(f, { kind: "tool_call", actor: "agent", text: 'workspace.read {"path":"README.md"}', activity: a });
+  const raw = 'The agent failed: CompletionError: ProviderError: HTTP 401 Unauthorized {"error":{"message":"invalid api key"}}';
+  const end = post(f, { kind: "activity", actor: "agent", text: raw, activity: phase(a, "failed") });
+  const app = await signedIntoAcme(f);
+  await app.waitFor("id:activity-outcome:agent:oops");
+  expect(app.count("id:activity:agent:oops >> text:failed")).toBe(1);
+  expect(shown(app, "text:/ProviderError/")).toBe(false);
+  await app.press("id:activity-toggle:agent:oops");
+  await app.waitFor(`id:activity-failure:${end.id}`);
+  expect(shown(app, "text:The model provider refused the sign-in or key.")).toBe(true);
+  expect(shown(app, "text:/ProviderError/")).toBe(false); // folded
+  await app.press(`id:activity-failure:${end.id}:details`);
+  await app.waitFor(`id:activity-failure:${end.id}:text`);
+  expect(shown(app, `id:activity-failure:${end.id}:text >> text:/ProviderError: HTTP 401/`)).toBe(true);
+});
+
+test("an ended turn's summary says how long it thought, how many tools and the route, in one line", async () => {
+  const f = world();
+  const a = turn("timed");
+  const at = (s: number) => new Date(Date.UTC(2026, 10, 25, 9, 0, s)).toISOString();
+  const ev = (e: Parameters<typeof post>[1], s: number) => post(f, { ...e, created_at: at(s) } as any);
+  ev({ kind: "activity", actor: "agent", text: "", activity: { ...phase(a, "started"), route: { source: "override", addressed_by: "explicit", reason: "chosen" } } as any }, 0);
+  ev({ kind: "tool_call", actor: "agent", text: 'workspace.list {"path":"."}', activity: a }, 2);
+  ev({ kind: "tool_result", actor: "runner", text: "workspace.list ok\nREADME.md", activity: a }, 3);
+  ev({ kind: "tool_call", actor: "agent", text: 'workspace.read {"path":"README.md"}', activity: a }, 5);
+  ev({ kind: "tool_result", actor: "runner", text: "workspace.read ok\n# hi", activity: a }, 7);
+  ev({ kind: "activity", actor: "agent", text: "", activity: phase(a, "completed") }, 12);
+  const app = await signedIntoAcme(f);
+  await app.waitFor("id:activity-tools:agent:timed");
+  expect(shown(app, "id:activity-toggle:agent:timed >> text:thought 12s")).toBe(true);
+  expect(shown(app, "id:activity-tools:agent:timed >> text:2 tools")).toBe(true);
+  expect(shown(app, "id:activity-route-badge:agent:timed >> text:Routed: chosen model")).toBe(true);
+  expect(shown(app, "label:Show details: Metro, thought 12s, 2 tools, Routed: chosen model, completed")).toBe(true);
+});
+
+test("a live Space run shows Stop on its line, which stops that run", async () => {
+  const f = world();
+  f.state.runs.push({ id: "run_live", space_id: "acme", room_id: "lobby", status: "running", actor: "alice", task: "look" });
+  startTurn(f, turn("run_live"));
+  const app = await signedIntoAcme(f);
+  await app.waitFor("id:activity-stop:agent:run_live");
+  await app.press("id:activity-stop:agent:run_live");
+  await app.waitUntil(() => f.posts().some((p) => p.path === "/v1/runs/run_live/stop"));
+});
+
+test("an agent turn can carry its own agent's name and picture", async () => {
+  // Rendered through the transcript, the fallback is the group's name; a
+  // caller with per-agent data passes agentName and agentAvatar instead.
+  const f = world();
+  startTurn(f, turn("named", "Coder"));
+  const app = await signedIntoAcme(f);
+  await app.waitFor("text:Coder · Listing the workspace…");
 });

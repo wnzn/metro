@@ -1,7 +1,7 @@
 import { expect, test } from "nsh/test";
 import type { EventActivity, RoomEvent } from "../../api/client";
 import { toActivity } from "../../api/client";
-import { groupAccessibleLabel, groupOutcomeText, groupTitle, groupTranscript, routeBadge, routeConfidence, routeText } from "./group";
+import { currentStep, durationText, groupAccessibleLabel, groupOutcomeText, groupTitle, groupTranscript, liveTitle, routeBadge, routeConfidence, routeText, shortArgs, summaryParts, timeline, toolCount } from "./group";
 import type { ActivityGroup, TranscriptItem } from "./group";
 
 let nextId = 1;
@@ -34,7 +34,7 @@ test("a live turn says it is thinking, even before its first tool", () => {
   expect(g!.outcome).toBe("live");
   expect(g!.steps).toEqual([]);
   expect(groupTitle(g!)).toBe("Scout is thinking…");
-  expect(groupAccessibleLabel(g!)).toBe("Scout is thinking…, in progress, no steps yet");
+  expect(groupAccessibleLabel(g!)).toBe("Scout is thinking…, in progress");
 });
 
 test("keys and positions don't move as later steps arrive", () => {
@@ -143,4 +143,44 @@ test("route attribution: a compact badge, and the full sentence in words, never 
   // An out-of-range probability is dropped, not shown.
   expect(routeConfidence(route({ reason: "matched (p 7.5)" }))).toBe(null);
   expect(routeText(route({ reason: "matched (p 7.5)" }))).not.toContain("p 7.5");
+});
+
+test("the timeline pairs each tool call with its result; thoughts and notes keep their place", () => {
+  const [g] = groups(groupTranscript([
+    ev("activity", "agent", "", run("t", "Metro", "started")),
+    ev("tool_call", "agent", 'workspace.read {"path":"README.md"}', run("t")),
+    ev("reasoning_summary", "agent", "Read the README first.", run("t")),
+    ev("tool_result", "runner", "workspace.read ok\n# hi", run("t")),
+    ev("tool_call", "agent", 'workspace.check {"name":"tests"}', run("t")),
+    ev("tool_result", "runner", "workspace.check failed\nexit 1", run("t")),
+    ev("tool_result", "runner", "workspace.list ok\norphan", run("t")),
+  ]));
+  const items = timeline(g!);
+  expect(items.map((i) => i.type)).toEqual(["tool", "thought", "tool", "tool"]);
+  const [read, , check, orphan] = items as Extract<ReturnType<typeof timeline>[number], { type: "tool" }>[];
+  expect([read!.name, read!.args, read!.result?.activity.details, read!.failed]).toEqual(["Read file", "README.md", "# hi", false]);
+  expect([check!.name, check!.args, check!.failed]).toEqual(["Run check", "tests", true]);
+  expect([orphan!.call, orphan!.name]).toEqual([null, "List workspace"]);
+  expect(toolCount(g!)).toBe(2);
+});
+
+test("short arguments, the live step, and the summary's parts", () => {
+  expect(shortArgs('{"path":"src/lib.rs"}')).toBe("src/lib.rs");
+  expect(shortArgs("{}")).toBe("");
+  expect(shortArgs('{"a":1,"b":"two"}')).toBe("1 two");
+  expect(shortArgs("x".repeat(80))).toHaveLength(60);
+  const live = (text: string) => groups(groupTranscript([ev("activity", "agent", "", run("l", "Scout", "started")), ev("tool_call", "agent", text, run("l"))]))[0]!;
+  expect(liveTitle(live('workspace.read {"path":"a.md"}'))).toBe("Scout · Reading a.md…");
+  expect(liveTitle(live('workspace.list {"path":"."}'))).toBe("Scout · Listing the workspace…");
+  expect(liveTitle(live("web_search {}"))).toBe("Scout · Using Web search…");
+  expect(currentStep(groups(groupTranscript([ev("activity", "agent", "", run("e", "Scout", "started"))]))[0]!)).toBe("Scout is thinking…");
+  const g = groups(groupTranscript([
+    ev("activity", "agent", "", run("c", "Metro", "started")),
+    ev("tool_call", "agent", "workspace.list {}", run("c")),
+    ev("activity", "agent", "", run("c", "Metro", "cancelled")),
+  ]))[0]!;
+  expect(summaryParts(g)).toEqual({ duration: null, tools: "1 tool", route: null, stopped: "cancelled" });
+  expect(durationText({ ...g, firstMs: 0, lastMs: 12_400 })).toBe("thought 12s");
+  expect(durationText({ ...g, firstMs: 0, lastMs: 400 })).toBe(null);
+  expect(durationText({ ...g, outcome: "live", firstMs: 0, lastMs: 9_000 })).toBe(null);
 });

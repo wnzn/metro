@@ -24,7 +24,7 @@ import {
   view,
 } from "../store";
 import type { Room } from "../store";
-import { AccountMenu, Action, Column, Field, IconButton, Label, MetroMark, NavItem, Row, ScrollArea, Spacer, StatusDot, Surface } from "../ui";
+import { AccountMenu, Action, Column, Field, IconButton, Label, MetroMark, NavItem, navigationPanel, RailButton, Row, ScrollArea, Spacer, Surface } from "../ui";
 import type { AccountMenuItem, Tone } from "../ui";
 import { loadSavedServers, signOut } from "../savedWorkspaces";
 import { WorkspaceDialogs, workspaceItems, WorkspaceNotice } from "./WorkspaceSwitcher";
@@ -34,44 +34,100 @@ import { profileName } from "./profile/profileState";
 /**
  * The app's navigation: Chat, Library, Scheduled tasks, the Spaces and their
  * rooms, and Settings (a modal). Search is the box at the top of the main
- * panel. Who is signed in, and where, is the account menu at the bottom.
+ * panel. Who is signed in, where, and whether the connection is up, is the
+ * account menu at the bottom.
+ *
+ * `mode`: the whole panel; collapsed to an icon `rail` (the same places,
+ * each Space as its initial, the account at the bottom); or `hidden` (a
+ * narrow window). The panel stays mounted while collapsed, so a half-typed
+ * Space name is still there when it opens again.
  */
-export function Sidebar(props: { hidden?: boolean }) {
+export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
   return (
-    <Surface variant="sidebar" testID="sidebar" hidden={props.hidden}>
-      <Row align="center" gap={2} padX={4} padY={3}>
-        <MetroMark />
-        <Spacer />
-        <ConnectionDot />
-      </Row>
+    <>
+      <Surface variant="sidebar" testID="sidebar" hidden={props.mode !== "full"}>
+        <Row align="center" padX={4} padY={3}>
+          <MetroMark />
+        </Row>
 
-      <ScrollArea padX={2} gap={1}>
-        <NavItem
-          testID="nav-chat"
-          label="Chat"
-          icon="chat"
-          emphasis
-          trailing={activeRunCount() ? `${activeRunCount()} running` : undefined}
-          selected={mainPlace() === "chat"}
-          onPress={openChat}
+        <ScrollArea padX={2} gap={1}>
+          <NavItem
+            testID="nav-chat"
+            label="Chat"
+            icon="chat"
+            emphasis
+            trailing={activeRunCount() ? `${activeRunCount()} running` : undefined}
+            selected={mainPlace() === "chat"}
+            onPress={openChat}
+          />
+          <NavItem testID="nav-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
+          <NavItem testID="nav-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
+          <SpacesSection />
+        </ScrollArea>
+
+        <Column padX={2} padY={2} gap={1}>
+          <NavItem testID="nav-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
+        </Column>
+        <AccountFooter />
+      </Surface>
+      <If when={props.mode === "rail"}>
+        <SidebarRail />
+      </If>
+      {/* Once, whichever form the navigation has: the account menu in either opens them. */}
+      <WorkspaceDialogs />
+    </>
+  );
+}
+
+/** The collapsed navigation: the same places as icons, each with its name as tooltip and accessible name. */
+function SidebarRail() {
+  const runs = () => activeRunCount();
+  return (
+    <Surface variant="rail" testID="sidebar-rail" accessibilityLabel="Workspace navigation">
+      <RailButton testID="rail-chat" label={runs() ? `Chat, ${runs()} running` : "Chat"} icon="chat" selected={mainPlace() === "chat"} onPress={openChat} />
+      <RailButton testID="rail-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
+      <RailButton testID="rail-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
+      <ScrollArea gap={1} align="center" padY={2}>
+        <Each of={spaces()} key={(space) => space.id}>
+          {(space) => (
+            <RailButton
+              testID={`rail-space:${space().id}`}
+              label={`Space ${space().name}`}
+              initial={spaceInitial(space().name)}
+              selected={space().id === activeSpaceId() && mainPlace() === "space"}
+              onPress={() => void selectSpace(space().id)}
+            />
+          )}
+        </Each>
+        <RailButton
+          testID="rail-new-space"
+          label="New Space"
+          icon="plus"
+          onPress={() => {
+            addingSpace.set(true);
+            navigationPanel.toggle();
+          }}
         />
-        <NavItem testID="nav-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
-        <NavItem testID="nav-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
-        <SpacesSection />
       </ScrollArea>
-
-      <Column padX={2} padY={2} gap={1}>
-        <NavItem testID="nav-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
-      </Column>
-      <AccountFooter />
+      <RailButton testID="rail-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
+      <AccountFooter compact />
     </Surface>
   );
 }
 
+/** A Space's tile in the rail: the first letter or digit of its name. */
+export function spaceInitial(name: string): string {
+  const ch = [...name.trim()].find((c) => /[\p{L}\p{N}]/u.test(c));
+  return (ch ?? "#").toLocaleUpperCase();
+}
+
+/** The new-Space form is open (the rail's New Space opens the panel on it). */
+const addingSpace = signal(false);
+
 const activeRunCount = () => runs().filter(isActiveRun).length;
 
 function SpacesSection() {
-  const adding = signal(false);
+  const adding = addingSpace;
   const name = signal("");
   const submit = async () => {
     if (await createSpace(name())) {
@@ -81,7 +137,8 @@ function SpacesSection() {
   };
   return (
     <Column gap={1} padY={2}>
-      <Row align="center" padX={2}>
+      {/* The same 12-point inset as the rows' icons. */}
+      <Row align="center" padX={3}>
         <Label variant="caption" color="muted">
           Spaces
         </Label>
@@ -107,7 +164,7 @@ function SpacesSection() {
               testID={`space:${space().id}`}
               label={space().name}
               icon={space().id === activeSpaceId() && mainPlace() === "space" ? "chevron-down" : "chevron-right"}
-              trailing={space().role === "owner" ? "owner" : undefined}
+              tooltip={space().role === "owner" ? `${space().name} · you own this Space` : undefined}
               emphasis={space().id === activeSpaceId()}
               selected={false}
               onPress={() => void selectSpace(space().id)}
@@ -212,13 +269,21 @@ export function serverPlace(url: string | null, hosted: boolean): { local: boole
   }
 }
 
+/** The connection as the account line shows it: a dot, words only when not online. */
+export function connectionStatus(phase: "online" | "retrying" | string): { tone: Tone; label: string; text?: string } {
+  if (phase === "online") return { tone: "success", label: "Connection: Online" };
+  if (phase === "retrying") return { tone: "warning", label: "Connection: Reconnecting", text: "Reconnecting" };
+  return { tone: "neutral", label: "Connection: Connecting", text: "Connecting" };
+}
+
 /**
  * Who is signed in (picture, profile name), and where, once: "On this
- * device" for the app-hosted workspace, else the server's host. The menu
- * copies the server URL or the user's stable ID (what Space owners add),
- * and signs out.
+ * device" for the app-hosted workspace, else the server's host, with the
+ * connection's dot beside it. The menu copies the server URL or the user's
+ * stable ID (what Space owners add), and signs out. `compact`: only the
+ * picture, for the rail.
  */
-function AccountFooter() {
+function AccountFooter(props: { compact?: boolean }) {
   const copied = signal<string | null>(null);
   let timer: ReturnType<typeof setTimeout> | undefined;
   cleanup(() => timer && clearTimeout(timer));
@@ -235,6 +300,7 @@ function AccountFooter() {
   };
   const server = () => serverPlace(connectedTo(), onLocalWorkspace());
   const name = () => profileName(me()) ?? me() ?? "";
+  const connection = () => connectionStatus(status().phase);
   void loadSavedServers();
   // Item ids are the testIDs: account-menu opens them. The Workspaces group
   // switches straight to this computer's workspace or a saved server. Sign
@@ -245,21 +311,25 @@ function AccountFooter() {
     { id: "copy-id", label: "Copy ID", icon: "copy", onPress: () => copy(me(), "ID copied") },
     { id: "disconnect", label: "Sign out", icon: "logout", destructive: true, onPress: () => signOut() },
   ];
+  const where = () => (server().local ? "on this device" : `connected to ${server().title}`);
   return (
-    <Column padX={2} padY={2} gap={1} testID="active-server">
+    <Column padX={props.compact ? 0 : 2} padY={2} gap={1} testID={props.compact ? "rail-account" : "active-server"}>
       <AccountMenu
-        testID="account-menu"
-        accessibilityLabel={`${name()}, ${server().local ? "on this device" : `connected to ${server().title}`}. Account menu`}
-        avatar={<PersonAvatar userId={me()} name={name()} size="sm" />}
+        testID={props.compact ? "rail-account-menu" : "account-menu"}
+        compact={props.compact}
+        accessibilityLabel={`${name()}, ${where()}. ${connection().label}. Account menu`}
+        avatar={<PersonAvatar userId={me()} name={name()} size={props.compact ? "md" : "sm"} />}
         name={name()}
         detail={server().title}
         detailIcon={server().local ? "device" : "server"}
+        status={{ ...connection(), testID: props.compact ? "rail-connection-state" : "connection-state" }}
         note={me() ?? undefined}
         items={items()}
       />
-      <WorkspaceDialogs />
-      <WorkspaceNotice />
-      <If when={copied()}>
+      <If when={!props.compact}>
+        <WorkspaceNotice />
+      </If>
+      <If when={props.compact ? null : copied()}>
         {(message) => (
           <Row padX={2}>
             <Label variant="caption" color="success" testID="account-copied">
@@ -269,24 +339,5 @@ function AccountFooter() {
         )}
       </If>
     </Column>
-  );
-}
-
-function ConnectionDot() {
-  const tone = (): Tone => {
-    const s = status();
-    return s.phase === "online" ? "success" : s.phase === "retrying" ? "warning" : "neutral";
-  };
-  const label = () => {
-    const s = status();
-    return s.phase === "online" ? "Online" : s.phase === "retrying" ? "Reconnecting" : "Connecting";
-  };
-  return (
-    <Row align="center" gap={1} accessibilityLabel={`Connection: ${label()}`} testID="connection-state">
-      <StatusDot tone={tone()} />
-      <Label variant="caption" color="muted">
-        {label()}
-      </Label>
-    </Row>
   );
 }

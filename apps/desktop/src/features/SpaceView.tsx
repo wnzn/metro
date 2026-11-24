@@ -3,13 +3,15 @@
 //
 // Mentions: typing "@" opens suggestions at the caret (the field's
 // `onCaretMove` box in the window), the @ button opens them under itself
-// with the focus on the first one. Return in the field picks the highlighted
-// suggestion and sends nothing; Tab moves into the list, where Up and Down
-// move and Return or Space picks; Escape or a press outside closes it, and
-// so does leaving the room. Only the agent and members of this Space are
+// with the focus on the first one. While the list is open and the caret is
+// in the field, Up and Down move the highlight (wrapping, each move
+// announced), Tab or Return inserts the highlighted suggestion and sends
+// nothing, and Escape or a press outside closes it, as leaving the room
+// does; Return sends only while the list is closed. In the list itself (the
+// @ button puts the focus there) Up and Down move and Return or Space picks. Only the agent and members of this Space are
 // offered, each person by display name and picture with their stable id.
 
-import { computed, effect, keymap, signal, untracked } from "nsh";
+import { announce, computed, effect, keymap, signal, untracked } from "nsh";
 import type { Bounds, ViewRef } from "nsh";
 import {
   activeRoom,
@@ -37,7 +39,6 @@ import {
   AnchoredPopover,
   AuthorGlyph,
   Badge,
-  Column,
   InlineLink,
   Label,
   PopoverNote,
@@ -71,9 +72,10 @@ const ROOM_IDEAS: DraftIdea[] = [
 ];
 
 export function SpaceView() {
+  // Its header (breadcrumb, runner, Run demo, Manage) is the Shell's one
+  // header row: RoomHeaderTitle and RoomHeaderActions below.
   return (
     <Surface variant="panel" grow testID="space-view">
-      <RoomHeader />
       <ConnectionBanner />
       <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
       <RoomComposer />
@@ -81,44 +83,44 @@ export function SpaceView() {
   );
 }
 
-function RoomHeader() {
+const ROOM_DESCRIPTION = "Members of this Space share its rooms and its agent.";
+
+/** The room's breadcrumb: Space › # room; a thread links back to its parent. The description is its tooltip. */
+export function RoomHeaderTitle() {
   const parent = () => {
     const id = activeRoom()?.parentRoomId;
     return id ? rooms().find((r) => r.id === id) ?? null : null;
   };
+  return (
+    <Row align="center" gap={2} testID="room-header">
+      <Label variant="body" color="muted" lines={1} tooltip={ROOM_DESCRIPTION}>
+        {activeSpace()?.name ?? ""}
+      </Label>
+      <Label variant="body" color="muted">
+        ›
+      </Label>
+      <Label variant="heading" lines={1} testID="room-title" heading tooltip={parent() ? undefined : ROOM_DESCRIPTION}>
+        {activeRoom() ? `# ${activeRoom()!.name}` : "No room selected"}
+      </Label>
+      <If when={parent()}>
+        {(p) => (
+          <Row align="center" gap={1}>
+            <Label variant="caption" color="muted" lines={1}>
+              from
+            </Label>
+            <InlineLink testID="open-parent" label={`# ${p().name}`} accessibilityLabel={`Thread delegated from # ${p().name}. Open the parent room`} onPress={() => selectRoom(p().id)} />
+          </Row>
+        )}
+      </If>
+    </Row>
+  );
+}
+
+/** The room's actions at the end of the header row: whether a runner serves it, Run demo, Manage (owners). */
+export function RoomHeaderActions() {
   const paired = () => !!activeSpace()?.runnerPaired;
   return (
-    <Surface variant="toolbar" padX={4} padY={2} gap={3}>
-      <Column grow gap={1}>
-        <Row align="center" gap={2}>
-          <Label variant="caption" color="muted" lines={1}>
-            {activeSpace()?.name ?? ""}
-          </Label>
-          <Label variant="caption" color="muted">
-            ›
-          </Label>
-          <Label variant="heading" lines={1} testID="room-title">
-            {activeRoom() ? `# ${activeRoom()!.name}` : "No room selected"}
-          </Label>
-        </Row>
-        <If
-          when={parent()}
-          else={
-            <Label variant="caption" color="muted" lines={1}>
-              Members of this Space share its rooms and its agent.
-            </Label>
-          }
-        >
-          {(p) => (
-            <Row align="center" gap={1}>
-              <Label variant="caption" color="muted">
-                Thread delegated from
-              </Label>
-              <InlineLink testID="open-parent" label={`# ${p().name}`} accessibilityLabel={`Open the parent room # ${p().name}`} onPress={() => selectRoom(p().id)} />
-            </Row>
-          )}
-        </If>
-      </Column>
+    <>
       <Badge testID="runner-state" tone={paired() ? "runner" : "neutral"} label={paired() ? "Runner attached" : "No runner"} />
       <Action
         testID="run-demo"
@@ -132,7 +134,7 @@ function RoomHeader() {
       <If when={activeSpace()?.role === "owner"}>
         <Action testID="manage-space" label="Manage" onPress={() => void openManage()} />
       </If>
-    </Surface>
+    </>
   );
 }
 
@@ -218,13 +220,22 @@ function RoomComposer() {
   // input would move its caret. Bound only then; removed on blur, close,
   // room switch and unmount (the effect's cleanup), so the caret keeps its
   // arrows otherwise.
+  //
+  // Tab inserts the highlighted suggestion as Return does (and is bound only
+  // then, so Tab leaves the field as usual otherwise). Each move is
+  // announced, so a screen reader says the option the caret's keys now pick.
   effect(() => {
     if (!open() || !fieldFocused() || options().length === 0) return;
     const move = (step: number) => () => {
       const n = options().length;
-      if (n > 0) highlighted.set((active() + step + n) % n);
+      if (n === 0) return;
+      highlighted.set((active() + step + n) % n);
+      announce(`${options()[active()]!.label}, ${active() + 1} of ${n}`);
     };
-    return keymap.bind({ down: move(1), up: move(-1) }, { when: "always", repeat: true });
+    return keymap.bind(
+      { down: move(1), up: move(-1), tab: () => void intercept() },
+      { when: "always", repeat: true },
+    );
   });
   // Typing something that is not a mention closes the list the button opened.
   effect(() => {

@@ -1,123 +1,255 @@
-// One agent turn's activity in the transcript: a single collapsed disclosure
-// ("Metro is thinking…" with a live indicator while it works, "Metro’s
-// activity" once ended) that opens to every step in order: tool calls with
-// their arguments, results, and summaries the model provider shared. Each step
-// has a phase icon; tool output sits in a bounded box that folds past a few
-// lines and can be copied whole. A routed turn shows a compact "Routed: …"
-// badge; the full sentence about why is only in the opened details.
+// One agent turn's activity in the transcript, as one block.
+//
+// Collapsed (the default) it is a single summary line: the agent's name (and
+// picture, once events carry one), then "thought 12s · 2 tools · Routed: …",
+// and a pill only when the turn failed. While the turn is live the line says
+// what it is doing now ("Reading README.md…") with a working indicator and,
+// when the run is known, Stop; once it ends it settles into the summary.
+//
+// Opened, it is a vertical timeline: the route the turn took (which model
+// answered and why), then each tool call with its short arguments and its
+// output in a bounded code view that can be copied whole, the reasoning
+// summaries the model provider shared as plain text, and any failure as one
+// sentence with the technical text folded under "Details".
 //
 // Opened with a press, Space or Return; the open state lives in the
 // disclosure store under the group's stable key, so polls never reset it.
 
 import { Clipboard, announce, signal } from "nsh";
-import { Action, Badge, Column, Label, Rail, Row } from "../../ui";
-import type { Tone } from "../../ui";
-import { CodeOutput, DisclosureToggle, StepIcon, ThinkingIndicator } from "../../ui/activity";
+import type { JSX } from "nsh";
+import { isActiveRun, runBusy, runs, stopRun } from "../../store";
+import { Action, Badge, Column, Label, Row } from "../../ui";
+import { AgentMark, CodeOutput, DisclosureToggle, SummaryParts, ThinkingIndicator, TimelineEntry } from "../../ui/activity";
 import { stepPhase } from "./classify";
 import { disclosureKey, disclosureScope, isOpen, toggle } from "./disclosure";
-import type { ActivityGroup, Step } from "./group";
-import { groupAccessibleLabel, groupOutcomeText, groupTitle, routeBadge, routeText } from "./group";
+import { failureText } from "./failure";
+import type { ActivityGroup, Step, TimelineItem } from "./group";
+import { groupAccessibleLabel, liveTitle, groupOutcomeText, routeText, summaryParts, timeline } from "./group";
 import { FOLD_LINES, outputView } from "./output";
 
-function railTone(g: ActivityGroup): Tone {
-  if (groupOutcomeText(g) === "failed") return "danger";
-  if (g.outcome === "cancelled" || g.outcome === "interrupted") return "warning";
-  return g.source === "agent" ? "agent" : "runner";
-}
-
-export function ActivityGroupRow(props: { group: ActivityGroup }) {
-  const key = () => disclosureKey(disclosureScope(), props.group.key);
+export function ActivityGroupRow(props: {
+  group: ActivityGroup;
+  /** The agent working this turn, once events name one per agent; else the group's own name. */
+  agentName?: string;
+  /** Its picture (an avatar element); else the agent glyph. */
+  agentAvatar?: JSX.Element;
+}) {
+  const g = () => props.group;
+  const key = () => disclosureKey(disclosureScope(), g().key);
   const expanded = () => isOpen(key());
-  const hasSteps = () => props.group.steps.length > 0;
+  const id = () => g().key;
+  const name = () => (g().source === "agent" ? props.agentName || g().name : "Runner activity");
   /** Something to open: its steps, or the route it took. */
-  const hasDetails = () => hasSteps() || !!props.group.route;
-  const outcome = () => groupOutcomeText(props.group);
-  /** Still working, and nothing has failed: the live indicator shows. */
-  const working = () => props.group.outcome === "live" && !props.group.failed;
-  const id = () => props.group.key;
+  const hasDetails = () => g().steps.length > 0 || !!g().route;
+  /** Still working, and nothing has failed: the live line shows. */
+  const working = () => g().outcome === "live" && !g().failed;
+  const failed = () => groupOutcomeText(g()) === "failed";
+  const title = () => (working() ? liveTitle(g(), name()) : name());
+  const parts = () => {
+    if (working()) return [];
+    const p = summaryParts(g());
+    return [
+      p.duration && { text: p.duration },
+      p.tools && { text: p.tools, testID: `activity-tools:${id()}` },
+      p.route && { text: p.route, testID: `activity-route-badge:${id()}` },
+      p.stopped && { text: p.stopped, testID: `activity-outcome:${id()}` },
+    ].filter((x): x is { text: string; testID?: string } => !!x);
+  };
+  // While live, a route still shows: it says which model is answering.
+  const liveRoute = () => (working() ? summaryParts(g()).route : null);
+  /** The Space run behind this turn, while it can still be stopped. */
+  const run = () => {
+    const aid = g().activityId;
+    return working() && aid ? runs().find((r) => r.id === aid && isActiveRun(r)) ?? null : null;
+  };
+  const label = () => groupAccessibleLabel(g(), name());
+  const mark = () => (g().source === "agent" ? <AgentMark picture={props.agentAvatar} /> : undefined);
   return (
-    <Row gap={3} testID={`activity:${id()}`}>
-      <Rail tone={railTone(props.group)} />
-      <Column grow gap={2} padY={1}>
-        <Row align="center" gap={2} wrap>
-          <If
-            when={hasDetails()}
-            else={
-              <Row align="center" gap={2}>
-                <Label variant="caption" color="muted" testID={`activity-title:${id()}`} accessibilityLabel={groupAccessibleLabel(props.group)}>
-                  {groupTitle(props.group)}
-                </Label>
-                <If when={working()}>
-                  <Row testID={`activity-live:${id()}`}>
-                    <ThinkingIndicator tone={props.group.source === "agent" ? "agent" : "runner"} testID={`activity-live-dots:${id()}`} />
-                  </Row>
-                </If>
-              </Row>
-            }
+    <Column gap={2} padY={1} testID={`activity:${id()}`}>
+      <Row align="center" gap={2}>
+        <If
+          when={hasDetails()}
+          else={
+            <Row align="center" gap={2}>
+              {mark()}
+              <Label variant="caption" color="muted" testID={`activity-title:${id()}`} accessibilityLabel={label()}>
+                {title()}
+              </Label>
+              <SummaryParts parts={parts()} />
+            </Row>
+          }
+        >
+          <DisclosureToggle
+            testID={`activity-toggle:${id()}`}
+            label={title()}
+            leading={mark()}
+            expanded={expanded()}
+            accessibilityLabel={`${expanded() ? "Hide" : "Show"} details: ${label()}`}
+            onPress={() => toggle(key())}
           >
-            <DisclosureToggle
-              testID={`activity-toggle:${id()}`}
-              label={groupTitle(props.group)}
-              expanded={expanded()}
-              accessibilityLabel={`${expanded() ? "Hide" : "Show"} details: ${groupAccessibleLabel(props.group)}`}
-              onPress={() => toggle(key())}
-            >
-              <If when={working()}>
-                <Row testID={`activity-live:${id()}`}>
-                  <ThinkingIndicator tone={props.group.source === "agent" ? "agent" : "runner"} testID={`activity-live-dots:${id()}`} />
-                </Row>
-              </If>
-            </DisclosureToggle>
-          </If>
-          <If when={outcome()}>
-            {(text) => <Badge testID={`activity-outcome:${id()}`} tone={text() === "failed" ? "danger" : text() === "running" ? "runner" : "warning"} label={text()} />}
-          </If>
-          <If when={hasSteps()}>
-            <Label variant="caption" color="muted">
-              {props.group.steps.length === 1 ? "1 step" : `${props.group.steps.length} steps`}
-            </Label>
-          </If>
-          <If when={routeBadge(props.group.route)}>
-            {(text) => <Badge testID={`activity-route-badge:${id()}`} tone="agent" label={text()} />}
-          </If>
-        </Row>
-        <If when={hasDetails() && expanded()}>
-          <Column gap={3} selectable testID={`activity-details:${id()}`}>
-            <If when={props.group.route}>
-              {(r) => (
+            <SummaryParts parts={parts()} />
+            <If when={liveRoute()}>{(r) => <SummaryParts parts={[{ text: r(), testID: `activity-route-badge:${id()}` }]} />}</If>
+          </DisclosureToggle>
+        </If>
+        <If when={working()}>
+          <Row testID={`activity-live:${id()}`}>
+            <ThinkingIndicator tone={g().source === "agent" ? "agent" : "runner"} testID={`activity-live-dots:${id()}`} />
+          </Row>
+        </If>
+        <If when={failed()}>
+          <Badge testID={`activity-outcome:${id()}`} tone="danger" label="failed" />
+        </If>
+        <If when={run()}>
+          {(r) => (
+            <Action
+              testID={`activity-stop:${id()}`}
+              label="Stop"
+              busyLabel="Stopping…"
+              busy={runBusy() === r().id}
+              variant="destructive"
+              accessibilityLabel={`Stop ${name()}`}
+              onPress={() => void stopRun(r())}
+            />
+          )}
+        </If>
+      </Row>
+      <If when={hasDetails() && expanded()}>
+        <Column gap={0} selectable testID={`activity-details:${id()}`}>
+          <If when={g().route}>
+            {(r) => (
+              <TimelineEntry phase="progress" last={g().steps.length === 0}>
                 <Label variant="caption" color="muted" testID={`activity-route:${id()}`}>
                   {routeText(r())}
                 </Label>
-              )}
-            </If>
-            <Each of={props.group.steps} key={(s) => String(s.eventId)}>
-              {(step) => <StepView groupKey={id()} step={step()} />}
-            </Each>
-          </Column>
-        </If>
-      </Column>
-    </Row>
+              </TimelineEntry>
+            )}
+          </If>
+          <Each of={timeline(g())} key={(item) => item.key}>
+            {(item, index) => <TimelineView groupKey={id()} item={item()} last={index() === timeline(g()).length - 1} />}
+          </Each>
+        </Column>
+      </If>
+    </Column>
   );
 }
 
-function StepView(props: { groupKey: string; step: Step }) {
-  const a = () => props.step.activity;
-  const stateKey = () => disclosureKey(disclosureScope(), props.groupKey, `all:${props.step.eventId}`);
+function TimelineView(props: { groupKey: string; item: TimelineItem; last: boolean }) {
+  const as = <T extends TimelineItem["type"]>(type: T) => (props.item.type === type ? (props.item as Extract<TimelineItem, { type: T }>) : null);
   return (
-    <Column gap={1} testID={`activity-step:${props.step.eventId}`}>
+    <If when={as("tool")} else={<If when={as("thought")} else={<NoteView groupKey={props.groupKey} step={(props.item as Extract<TimelineItem, { type: "note" }>).step} last={props.last} />}>{(t) => <ThoughtView groupKey={props.groupKey} step={t().step} last={props.last} />}</If>}>
+      {(t) => <ToolView groupKey={props.groupKey} item={t()} last={props.last} />}
+    </If>
+  );
+}
+
+/** A tool call: its name and short arguments, then its output (or failure) in a bounded code view. */
+function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type: "tool" }>; last: boolean }) {
+  const first = () => (props.item.call ?? props.item.result)!;
+  const phase = () => (props.item.failed ? "failed" : props.item.result ? "complete" : "called");
+  const stateKey = (s: Step) => disclosureKey(disclosureScope(), props.groupKey, `all:${s.eventId}`);
+  return (
+    <TimelineEntry
+      phase={phase()}
+      iconTestID={`activity-step-icon:${first().eventId}:${phase()}`}
+      last={props.last}
+      testID={`activity-step:${first().eventId}`}
+    >
       <Row align="center" gap={2} wrap>
-        <StepIcon phase={stepPhase(a())} testID={`activity-step-icon:${props.step.eventId}:${stepPhase(a())}`} />
-        <Label variant="caption" color={a().tone === "danger" ? "danger" : "muted"}>
-          {a().summary}
-        </Label>
-        <If when={a().tone === "danger"}>
-          <Badge tone="danger" label="failed" />
+        <Label variant="strong">{props.item.name}</Label>
+        <If when={props.item.args}>
+          {(a) => (
+            <Label variant="mono" color="muted" lines={1} testID={`activity-args:${first().eventId}`}>
+              {a()}
+            </Label>
+          )}
+        </If>
+        <If when={props.item.failed}>
+          <Label variant="caption" color="danger">
+            failed
+          </Label>
         </If>
       </Row>
-      <If when={a().details.length > 0}>
-        <If when={a().mono} else={<FoldableText text={a().details} mono={false} stateKey={stateKey()} />}>
-          <StepOutput text={a().details} stateKey={stateKey()} testID={`activity-output:${props.step.eventId}`} />
-        </If>
+      <If when={props.item.result && props.item.call ? props.item.result : null}>
+        {(r) => (
+          <Column testID={`activity-step:${r().eventId}`}>
+            <If when={r().activity.details.length > 0}>
+              <StepOutput text={r().activity.details} stateKey={stateKey(r())} testID={`activity-output:${r().eventId}`} />
+            </If>
+          </Column>
+        )}
+      </If>
+      <If when={!props.item.call && props.item.result && props.item.result.activity.details.length > 0 ? props.item.result : null}>
+        {(r) => <StepOutput text={r().activity.details} stateKey={stateKey(r())} testID={`activity-output:${r().eventId}`} />}
+      </If>
+    </TimelineEntry>
+  );
+}
+
+/** A reasoning summary the model provider shared: readable text, never a code box. */
+function ThoughtView(props: { groupKey: string; step: Step; last: boolean }) {
+  return (
+    <TimelineEntry phase="thinking" iconTestID={`activity-step-icon:${props.step.eventId}:thinking`} last={props.last} testID={`activity-step:${props.step.eventId}`}>
+      <Label variant="caption" color="muted">
+        Reasoning summary from the model provider
+      </Label>
+      <If when={props.step.activity.details.length > 0}>
+        <FoldableText text={props.step.activity.details} mono={false} stateKey={disclosureKey(disclosureScope(), props.groupKey, `all:${props.step.eventId}`)} />
+      </If>
+    </TimelineEntry>
+  );
+}
+
+/** Progress and lifecycle notes; a failure says one sentence and folds the rest under Details. */
+function NoteView(props: { groupKey: string; step: Step; last: boolean }) {
+  const a = () => props.step.activity;
+  const phase = () => stepPhase(a());
+  const stateKey = () => disclosureKey(disclosureScope(), props.groupKey, `all:${props.step.eventId}`);
+  return (
+    <TimelineEntry phase={phase()} iconTestID={`activity-step-icon:${props.step.eventId}:${phase()}`} last={props.last} testID={`activity-step:${props.step.eventId}`}>
+      <If
+        when={a().tone === "danger"}
+        else={
+          <>
+            <Label variant="caption" color="muted">
+              {a().summary}
+            </Label>
+            <If when={a().details.length > 0}>
+              <If when={a().mono} else={<FoldableText text={a().details} mono={false} stateKey={stateKey()} />}>
+                <StepOutput text={a().details} stateKey={stateKey()} testID={`activity-output:${props.step.eventId}`} />
+              </If>
+            </If>
+          </>
+        }
+      >
+        <FailureBody {...failureText(a().details || a().summary)} stateKey={disclosureKey(disclosureScope(), props.groupKey, `details:${props.step.eventId}`)} testID={`activity-failure:${props.step.eventId}`} />
+      </If>
+    </TimelineEntry>
+  );
+}
+
+/** A failure: one plain sentence; the technical text, when there is more, under a "Details" fold. */
+export function FailureBody(props: { sentence: string; details: string | null; stateKey: string; testID?: string }) {
+  const open = () => isOpen(props.stateKey);
+  return (
+    <Column gap={1} testID={props.testID}>
+      <Label color="danger">{props.sentence}</Label>
+      <If when={props.details}>
+        {(details) => (
+          <Column gap={1}>
+            <Row>
+              <DisclosureToggle
+                label="Details"
+                expanded={open()}
+                accessibilityLabel={`${open() ? "Hide" : "Show"} the technical details`}
+                testID={props.testID ? `${props.testID}:details` : undefined}
+                onPress={() => toggle(props.stateKey)}
+              />
+            </Row>
+            <If when={open()}>
+              <StepOutput text={details()} stateKey={`${props.stateKey}:all`} testID={props.testID ? `${props.testID}:text` : "failure-details"} />
+            </If>
+          </Column>
+        )}
       </If>
     </Column>
   );

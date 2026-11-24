@@ -7,8 +7,10 @@
 // are `nsh/base` Toolbars (WAI-ARIA's toolbar pattern): one Tab stop each,
 // arrows move between items, Home and End jump, Space and Return press. A
 // focused Input owns its own keys (nsh.dev/docs/forms-and-keyboard), so
-// while the caret is in the composer the mention list is driven by Return
-// (the composer's submit) and Tab moves into the list for the arrows.
+// while the caret is in the composer and the mention list is open, the
+// feature binds Up and Down (move the highlight, wrapping), Tab (insert it)
+// with app keymaps that win over the field, and Return (the composer's
+// submit) inserts instead of sending; Escape closes the list.
 
 import { Image, Overlay, Text, View, signal, token } from "nsh";
 import type { Bounds, CaretEvent, InputRef, JSX, ViewRef } from "nsh";
@@ -110,10 +112,11 @@ export function AuthorGlyph(props: Testable & { kind: "agent" | "runner" | "syst
  * accessible label names the stable id where the shown name is a display
  * name.
  */
-export function RecipientTag(props: Testable & { label: string; tone: Tone; self?: boolean }) {
+export function RecipientTag(props: Testable & { label: string; tone: Tone; self?: boolean; slim?: boolean }) {
+  // `slim`: plain words in the tone's ink (a follow-up message's quiet header).
   return (
     <View
-      class={cx("rounded-(--radius-sm) px-[6px] py-px", props.self ? "bg-tone-warning" : toneSurfaceClass[props.tone])}
+      class={cx(props.slim ? "" : "rounded-(--radius-sm) px-[6px] py-px", props.slim ? "" : props.self ? "bg-tone-warning" : toneSurfaceClass[props.tone])}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
     >
@@ -262,7 +265,7 @@ export function EmojiChoice(
   );
 }
 
-/** A vertical list of suggestions (mentions): Up and Down move once the focus is in it, Return or Space picks. */
+/** A vertical list of suggestions (mentions): Up and Down move once the focus is in it, Return or Space picks; the composer drives it while the caret stays there. */
 export function SuggestionList(props: Testable & { accessibilityLabel: string; children?: JSX.Element }) {
   return (
     <Toolbar axis="vertical" class="flex-col min-w-[260px] max-w-[360px] gap-px" accessibilityLabel={props.accessibilityLabel} testID={props.testID}>

@@ -89,14 +89,15 @@ import {
 } from "../ui";
 import type { ChatGlyphName, Tone } from "../ui";
 import { audienceText, kindLabel, mentionsMe, mentionText, reactionSummary, toneForEvent } from "./eventKinds";
-import { ActivityGroupRow, FoldableText } from "./activity/ActivityRow";
+import { ActivityGroupRow, FailureBody, FoldableText } from "./activity/ActivityRow";
+import { failureText } from "./activity/failure";
 import { disclosureKey, disclosureScope } from "./activity/disclosure";
 import { DEFAULT_AGENT_NAME, groupTranscript } from "./activity/group";
 import { clockFor } from "./chatTime";
 import type { Stamp } from "./chatTime";
 import { PersonAvatar } from "./profile/PersonAvatar";
 import { profileName } from "./profile/profileState";
-import { headerAudience, transcriptRows } from "./transcriptRows";
+import { headerAudience, textNamesRecipients, transcriptRows } from "./transcriptRows";
 import type { TranscriptRow } from "./transcriptRows";
 import { stagedFor } from "./attachments/attachmentDraft";
 import type { StagedFile } from "./attachments/attachmentDraft";
@@ -232,6 +233,9 @@ function StampGutter(props: { stamp: Stamp | null; id: string | number }): JSX.E
   );
 }
 
+/** An error or failure the server posted (never a person's message). */
+const isFailureKind = (kind: string) => /(error|fail)/.test(kind.trim().toLowerCase());
+
 /** Who wrote an event, as the transcript shows them. */
 type Author =
   | { kind: "person"; userId: string | null; name: string; mine: boolean }
@@ -274,6 +278,14 @@ function MessageRow(props: { row: () => Of<"event"> }) {
   const audience = () => headerAudience(event().audience, event().mentions);
   const hasRecipients = () => audience().agentBadge || audience().peopleNote || (event().mentions?.length ?? 0) > 0;
   const continued = () => props.row().continued;
+  /**
+   * A follow-up's recipients: in a slim line level with the time in the
+   * gutter, and left out when the text already starts by naming them all.
+   */
+  const followUpRecipients = () =>
+    continued() && hasRecipients() && !(textNamesRecipients(event().text, event().mentions) && !audience().agentBadge && !audience().peopleNote);
+  /** A failure says one plain sentence; the technical text folds under Details. */
+  const failure = () => (isFailureKind(event().kind) ? failureText(event().text) : null);
   const person = () => {
     const a = author();
     return a.kind === "person" ? a : null;
@@ -353,8 +365,8 @@ function MessageRow(props: { row: () => Of<"event"> }) {
         </If>
       }
     >
-      <If when={!continued() || hasRecipients()}>
-        <MessageHeader testID={`header:${event().id}`}>
+      <If when={!continued() || followUpRecipients()}>
+        <MessageHeader testID={`header:${event().id}`} slim={continued()}>
           <If when={!continued()}>
             <AuthorName
               testID={`author:${event().id}`}
@@ -377,6 +389,7 @@ function MessageRow(props: { row: () => Of<"event"> }) {
           <If when={audience().agentBadge}>
             <RecipientTag
               testID={`recipient:${event().id}:ask-agent`}
+              slim={continued()}
               tone="agent"
               label="to the agent"
               accessibilityLabel={`${audience().spoken ?? "Addressed to the agent"} (Ask agent)`}
@@ -387,6 +400,7 @@ function MessageRow(props: { row: () => Of<"event"> }) {
               <RecipientTag
                 testID={`recipient:${event().id}:${m().kind === "agent" ? "agent" : (m() as { id: string }).id}`}
                 tone={m().kind === "agent" ? "agent" : "neutral"}
+                slim={continued()}
                 self={m().kind === "user" && (m() as { id: string }).id === me()}
                 label={recipientText(m(), me())}
                 accessibilityLabel={recipientDescription(m(), me())}
@@ -395,8 +409,15 @@ function MessageRow(props: { row: () => Of<"event"> }) {
           </Each>
         </MessageHeader>
       </If>
-      <If when={event().text.trim().length > 0}>
-        <FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />
+      <If
+        when={failure()}
+        else={
+          <If when={event().text.trim().length > 0}>
+            <FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />
+          </If>
+        }
+      >
+        {(f) => <FailureBody sentence={f().sentence} details={f().details} stateKey={disclosureKey(disclosureScope(), event().id, "details")} testID={`failure:${event().id}`} />}
       </If>
       <If when={event().attachments?.length ? event().attachments! : null}>
         {(files) => (
