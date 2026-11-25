@@ -192,8 +192,12 @@ test("switching accounts during remembered room load cannot start the old transc
   ]);
 });
 
-for (const openExisting of [false, true]) {
-  test(`${openExisting ? "opening another Space" : "creating a Space"} during remembered room load does not duplicate transcript requests`, async () => {
+for (const [nextSpace, action] of [
+  [null, "creating a Space"],
+  ["other", "opening another Space"],
+  ["solo", "returning to the remembered Space"],
+] as const) {
+  test(`${action} during remembered room load does not duplicate transcript requests`, async () => {
     const local = fakeServer();
     local.addSpace("solo", "Solo", "carol");
     local.addSpace("other", "Other", "carol");
@@ -208,11 +212,12 @@ for (const openExisting of [false, true]) {
     const created = [...local.state.spaces.values()].find((space) => space.name === "New Space")!;
     const expected = [`/v1/spaces/${created.id}/rooms/lobby/events?after=0`];
 
-    if (openExisting) {
+    if (nextSpace) {
       // Ordinary Space selection is blocked while a selection is pending.
       // Creating a Space lets us move again before the original reply arrives.
-      await app.press("id:space:other");
-      expected.push("/v1/spaces/other/rooms/lobby/events?after=0");
+      if (nextSpace === "solo") local.answerLate(localRooms, LOCAL_TOKEN, 10);
+      await app.press(`id:space:${nextSpace}`);
+      expected.push(`/v1/spaces/${nextSpace}/rooms/lobby/events?after=0`);
       await app.waitUntil(() => roomEventPaths(local).length >= 2, { timeout: 200 });
     }
     expect(roomEventPaths(local)).toEqual(expected);

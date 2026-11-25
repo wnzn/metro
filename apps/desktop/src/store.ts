@@ -169,6 +169,7 @@ export const memberBusy = signal<string | null>(null);
 let client: Client | null = null;
 let abort: AbortController | null = null;
 let session = 0;
+let navigationGeneration = 0;
 let timer: number | undefined;
 let ticking = false;
 let tickAgain = false;
@@ -307,12 +308,15 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
       // Show the shell now; kick the first tick after enterSpace settles,
       // bounded by listRooms' client timeout.
       const current = guard();
-      void enterSpace(initial.id, { place: "chat", spaceId: null }).then(() => {
+      const entering = enterSpace(initial.id, { place: "chat", spaceId: null });
+      const navigation = navigationGeneration; // enterSpace starts navigation before its first await
+      void entering.then(() => {
         // A running tick reads the active room after any refreshLists await.
         if (!current() || ticking) return;
-        const stillTarget = basePlace() === "space" && activeSpaceId() === initial.id && activeRoomId() !== null && view() === "room";
-        // Don't wake a different Space. If no loop started, kick it anyway
-        // (for example, membership was refused and we fell back to Chat).
+        const stillTarget = navigation === navigationGeneration &&
+          basePlace() === "space" && activeSpaceId() === initial.id && activeRoomId() !== null && view() === "room";
+        // Don't wake a later navigation, even if it returned to this Space.
+        // Still start the loop if none is scheduled (e.g. after falling back to Chat).
         if (stillTarget || timer === undefined) kick();
       });
     } else {
@@ -373,6 +377,7 @@ export function retryNow() {
 
 export function openChat() {
   if (basePlace() === "chat" && !settingsOpen()) return;
+  navigationGeneration++;
   batch(() => {
     clearTransient();
     view.set("room");
@@ -388,6 +393,7 @@ export function openChat() {
 /** Opens Search, Library or Scheduled tasks: the user's own pages, outside every Space. */
 export function openPlace(where: "search" | "library" | "schedules") {
   if (basePlace() === where && !settingsOpen()) return;
+  navigationGeneration++;
   batch(() => {
     clearTransient();
     view.set("room");
@@ -478,6 +484,7 @@ export async function selectSpace(spaceId: string): Promise<void> {
   if (switchingSpace()) return;
   if (spaceId === activeSpaceId() && roomsBySpace()[spaceId]) {
     if (basePlace() === "space" && !settingsOpen()) return;
+    navigationGeneration++;
     batch(() => {
       clearTransient();
       view.set("room");
@@ -529,6 +536,7 @@ export async function createSpace(nameInput: string): Promise<boolean> {
 async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId: string | null }): Promise<void> {
   const c = client;
   if (!c) return;
+  navigationGeneration++;
   const currentSession = guard();
   const ok = guard(spaceId);
   batch(() => {
@@ -645,6 +653,7 @@ function rememberSpace(spaceId: string) {
 export function selectRoom(roomId: string) {
   const sid = activeSpaceId();
   if (!sid || (roomId === activeRoomId() && view() === "room" && basePlace() === "space" && !settingsOpen())) return;
+  navigationGeneration++;
   lastRoomBySpace.set(sid, roomId);
   batch(() => {
     clearTransient();
