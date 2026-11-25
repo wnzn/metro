@@ -692,6 +692,8 @@ pub async fn start_room_run(
             return Err(e.into());
         }
     };
+    // Ends the run if this start is abandoned before the worker owns it.
+    let registration = crate::orchestration::Registration::new(state.runs.clone(), info.id.clone());
     // The turn is shown as the agent that works it: a thread's agent by the
     // thread's name, otherwise the Space agent's name; never the person who
     // asked. Every event carries the agent's identity.
@@ -727,6 +729,8 @@ pub async fn start_room_run(
     );
     tokio::spawn(async move {
         let _permit = permit;
+        // The worker owns the run now; dropped when it ends, even by panic.
+        let _registration = registration;
         execute_room_run(
             &state, &space_id, &room, &initiator, &trigger, &run_id, &turn, &route, model, cancel,
             &agent,

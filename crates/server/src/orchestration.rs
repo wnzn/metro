@@ -134,10 +134,13 @@ struct Inner {
 }
 
 impl Inner {
+    /// Runs whose work may still be going on: running, or stopped while
+    /// their worker hasn't recorded its end yet. They count against the
+    /// cap.
     fn running(&self) -> usize {
         self.entries
             .iter()
-            .filter(|e| e.info.status == RunStatus::Running)
+            .filter(|e| e.info.status == RunStatus::Running || !e.settled)
             .count()
     }
 
@@ -358,6 +361,29 @@ impl RunRegistry {
         }
         inner.evict(self.max_history);
         true
+    }
+}
+
+/// A run's registration, owned by whoever is responsible for ending it:
+/// first the code starting it, then its worker. Dropped without the worker
+/// having recorded the run's end (the start was abandoned or cancelled
+/// before the hand-over, or the worker panicked), it ends the run as
+/// failed and settles it, so it never holds a slot or the history.
+pub struct Registration {
+    runs: std::sync::Arc<RunRegistry>,
+    id: String,
+}
+
+impl Registration {
+    pub fn new(runs: std::sync::Arc<RunRegistry>, id: String) -> Self {
+        Self { runs, id }
+    }
+}
+
+impl Drop for Registration {
+    fn drop(&mut self) {
+        // A no-op beyond settling when the worker already ended the run.
+        self.runs.finish_with(&self.id, RunStatus::Failed, None);
     }
 }
 
@@ -904,6 +930,28 @@ mod tests {
         let (info, _rx) = start(&reg, "done");
         reg.finish_with(&info.id, RunStatus::Completed, Some(failure()));
         assert_eq!(reg.get_with_failure(&info.id).unwrap().1, None);
+    }
+
+    #[test]
+    fn an_abandoned_registration_ends_and_frees_its_run() {
+        let reg = std::sync::Arc::new(RunRegistry::with_limits(1, 10));
+        // Registered, then cancelled before any worker took it over.
+        let (info, _rx) = reg.start("s", "r", "u", "first").unwrap();
+        let registration = Registration::new(reg.clone(), info.id.clone());
+        assert!(reg.stop(&info.id));
+        // Unsettled, it still holds the only slot.
+        assert!(reg.start("s", "r", "u", "second").is_err());
+        // The start is abandoned: its registration settles the run.
+        drop(registration);
+        assert_eq!(reg.get(&info.id).unwrap().status, RunStatus::Cancelled);
+        assert_eq!(reg.get_with_failure(&info.id).unwrap().1, None);
+        let (next, _rx) = reg.start("s", "r", "u", "second").unwrap();
+
+        // Abandoned without a stop: the run ends as failed.
+        let registration = Registration::new(reg.clone(), next.id.clone());
+        drop(registration);
+        assert_eq!(reg.get(&next.id).unwrap().status, RunStatus::Failed);
+        assert!(reg.start("s", "r", "u", "third").is_ok());
     }
 
     #[test]
