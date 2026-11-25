@@ -759,13 +759,13 @@ type EndpointResult =
   | { kind: "refused"; message: string; detail?: string }
   | { kind: "changed"; listing?: ModelListing };
 
-type EndpointCheck = { from: string | null; to: string; detail?: string; phase: "unknown" | "reload-failed" | "saved" | "unchanged" | "different" };
+type EndpointCheck = { from: string | null; to: string; detail?: string; phase: "unknown" | "reload-failed" | "saved" | "not-settled" };
 /** A lost acknowledgement stays unresolved if the editor closes or remounts. */
 export const endpointChecks = signal<Partial<Record<string, EndpointCheck>>>({});
 
 export function endpointNeedsReload(id: string): boolean {
   const phase = endpointChecks()[id]?.phase;
-  return phase === "unknown" || phase === "reload-failed";
+  return phase === "unknown" || phase === "reload-failed" || phase === "not-settled";
 }
 
 export function dismissEndpointCheck(id: string) {
@@ -799,7 +799,9 @@ export async function reloadEndpoint(id: string): Promise<void> {
       if (connection?.baseUrl !== check.from) invalidateEndpointListing(id);
       const checks = { ...endpointChecks() };
       if (!connection) delete checks[id];
-      else checks[id] = { ...check, phase: connection.baseUrl === check.to ? "saved" : connection.baseUrl === check.from ? "unchanged" : "different" };
+      // A GET is a snapshot, not proof the original PATCH has stopped.
+      // Only seeing the requested endpoint settles this attempt.
+      else checks[id] = { ...check, phase: connection.baseUrl === check.to ? "saved" : "not-settled" };
       endpointChecks.set(checks);
     });
   } finally {

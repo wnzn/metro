@@ -220,10 +220,13 @@ function endpointCheckFeedback(id: string): EndpointFeedback | null {
   if (!check) return null;
   switch (check.phase) {
     case "unknown":
-    case "reload-failed": return {
+    case "reload-failed":
+    case "not-settled": return {
       id, tone: "warning", detail: check.detail,
       message: check.phase === "reload-failed"
         ? "The reload didn't confirm the current endpoint. Try reloading again."
+        : check.phase === "not-settled"
+          ? "The server hasn't reported the proposed endpoint. The first test may still be running. Reload again; Metro won't send another change while this one is unresolved."
         : "Metro couldn't confirm the endpoint change. Reload the connection before changing it again.",
       action: { label: "Reload connection", run: () => void reloadEndpoint(id), busy: () => providerBusy() === `endpoint-reload:${id}` },
     };
@@ -233,8 +236,6 @@ function endpointCheckFeedback(id: string): EndpointFeedback | null {
         ? "The server confirmed the new endpoint was saved. Use Refresh models to update the list."
         : "The server confirmed the new endpoint was saved." };
     }
-    case "unchanged": return { id, tone: "warning", message: "The server still reports the previous endpoint. You can test and save the new URL again." };
-    case "different": return { id, tone: "warning", message: "The server reports a different endpoint. Review the current URL before making another change." };
   }
 }
 
@@ -630,13 +631,7 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
   };
   effect(() => {
     const result = endpointChecks()[id];
-    if (result?.phase === "unchanged") {
-      value.set(result.to);
-      editing.set(true);
-    } else if (result?.phase === "saved" || result?.phase === "different") {
-      // A committed or superseded draft is never offered for replay.
-      editing.set(false);
-    }
+    if (result?.phase === "saved") editing.set(false);
   });
   return (
     <SettingsGroup title="Endpoint" description="Only endpoints the operator approved. Metro tests the new one before it switches." testID={`endpoint-section:${id}`}>

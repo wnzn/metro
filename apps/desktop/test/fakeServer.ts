@@ -75,6 +75,9 @@ export function fakeServer() {
     endpointProbes: [] as string[],
     /** Break only the response to a committed endpoint PATCH. */
     endpointAck: new Map<string, "lost" | "malformed">(),
+    /** Proxy 504 while the server is still probing, released by the test. */
+    heldEndpointProbes: new Set<string>(),
+    finishEndpointProbes: new Map<string, () => void>(),
     providersReadStatus: 200,
     /** Scenario opts into modern flat chat inventory; other callers exercise the older shape. */
     chatInventory: false,
@@ -411,6 +414,14 @@ export function fakeServer() {
           if (!state.allowedBaseUrls.includes(url)) return err(400, "base_url must be exactly one of this server's allowed_base_urls");
           if (url !== c.base_url) {
             state.endpointProbes.push(url);
+            if (state.heldEndpointProbes.delete(url)) {
+              const previous = c.base_url;
+              state.finishEndpointProbes.set(url, () => {
+                state.finishEndpointProbes.delete(url);
+                if (state.connections.get(c.id) === c && c.base_url === previous) c.base_url = url;
+              });
+              return err(504, "Gateway Timeout");
+            }
             const refusal = state.endpointRefusals.get(url);
             if (refusal) return err(refusal.status, refusal.error);
             c.base_url = url;

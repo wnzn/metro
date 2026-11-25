@@ -152,15 +152,17 @@ for (const ack of ["lost", "malformed"] as const) {
   });
 }
 
-test("a failed endpoint reload keeps the editor locked; a later success can confirm the old endpoint", async () => {
+test("an unchanged reload after a proxy 504 cannot requeue a held probe, even after reopening", async () => {
   const { f, custom } = fixture();
   // An intermediary's generic 504 is not proof the server refused its probe.
-  f.state.endpointRefusals.set(NEW, { status: 504, error: "Gateway Timeout" });
+  f.state.heldEndpointProbes.add(NEW);
   const app = await signIn(f, "alice");
   await edit(app, custom.id);
   await app.press(`id:endpoint-section:${custom.id} >> label:${NEW}`);
   await app.press(`id:endpoint-save:${custom.id}`);
   await app.waitFor("id:endpoint-feedback >> label:Reload connection");
+  expect(custom.base_url).toBe(OLD);
+  expect(f.state.finishEndpointProbes.has(NEW)).toBe(true);
   await app.press("id:connection-back");
   await app.press(`id:connection:${custom.id}:open`);
   await app.waitFor("id:endpoint-feedback >> label:Reload connection");
@@ -172,8 +174,23 @@ test("a failed endpoint reload keeps the editor locked; a later success can conf
   expect(patches(f, custom.id)).toHaveLength(1);
   f.state.providersReadStatus = 200;
   await app.press("id:endpoint-feedback >> label:Reload connection");
-  await app.waitFor("id:endpoint-feedback >> text:/still reports the previous endpoint/");
-  expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(true);
+  await app.waitFor("id:endpoint-feedback >> text:/first test may still be running/");
+  expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(false);
+  expect(app.shows("id:endpoint-feedback >> label:Try again")).toBe(false);
+  expect(patches(f, custom.id)).toHaveLength(1);
+  await app.press("id:settings-close");
+  await app.press("id:nav-settings");
+  await app.press(`id:connection:${custom.id}:open`);
+  await app.waitFor("id:endpoint-feedback >> label:Reload connection");
+  expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(false);
+  expect(f.state.endpointProbes).toEqual([NEW]);
+
+  // Finish the original server probe only after both reads observed OLD.
+  f.state.finishEndpointProbes.get(NEW)!();
+  await app.press("id:endpoint-feedback >> label:Reload connection");
+  await app.waitFor("id:endpoint-feedback >> text:/confirmed the new endpoint was saved/");
+  await app.waitFor(`id:endpoint-current:${custom.id} >> text:${NEW}`);
+  expect(app.shows(`id:endpoint-input:${custom.id}`)).toBe(false);
   expect(patches(f, custom.id)).toHaveLength(1);
 });
 
