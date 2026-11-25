@@ -12,7 +12,7 @@ use crate::AppState;
 use crate::api::{self, ApiError, ApiResult, JsonBody};
 use crate::auth::{Human, valid_id};
 use crate::db::reactions::{Reaction, valid_emoji};
-use crate::db::{Event, event_time, kind, now_ms, rfc3339_utc, short_id};
+use crate::db::{Event, MessageMeta, event_time, kind, now_ms, rfc3339_utc, row_event, short_id};
 use crate::directory::{self, Card};
 
 pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
@@ -237,48 +237,12 @@ fn conversations(
     .collect()
 }
 
-#[derive(Default, Serialize, Deserialize)]
-pub(crate) struct MessageMeta {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reply_to: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub forwarded: Option<Value>,
-}
-
-// Keep the adapter to L1's shared event fields confined to these definitions.
-#[derive(Serialize)]
-pub(crate) struct MessageEvent {
-    #[serde(flatten)]
-    pub event: Event,
-    #[serde(flatten)]
-    metadata: MessageMeta,
-}
-
-fn event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<MessageEvent> {
-    let metadata = row
-        .get::<_, Option<String>>(5)?
-        .map(|json| serde_json::from_str(&json))
-        .transpose()
-        .map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e))
-        })?
-        .unwrap_or_default();
-    Ok(MessageEvent {
-        event: Event {
-            id: row.get(0)?,
-            kind: row.get(1)?,
-            actor: row.get(2)?,
-            actor_id: row.get(3)?,
-            text: row.get(4)?,
-            mentions: json!([]),
-            spans: Some(Vec::new()),
-            audience: "room".into(),
-            activity: None,
-            created_at: event_time(row.get(6)?),
-            attachments: Vec::new(),
-        },
-        metadata,
-    })
+// The SELECTs project the shared row layout with no mentions and room
+// audience. Empty spans are authoritative even on DMs with no metadata.
+fn event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
+    let mut event = row_event(row)?;
+    event.spans = Some(Vec::new());
+    Ok(event)
 }
 
 pub(crate) fn visible_event(
@@ -286,9 +250,9 @@ pub(crate) fn visible_event(
     id: &str,
     user: &str,
     event: i64,
-) -> rusqlite::Result<Option<MessageEvent>> {
+) -> rusqlite::Result<Option<Event>> {
     tx.query_row(
-        "SELECT e.id, e.kind, e.actor, e.actor_id, e.text, e.activity, e.created_at
+        "SELECT e.id, e.kind, e.actor, e.actor_id, e.text, '[]', 'room', e.activity, e.created_at
          FROM dm_events e JOIN dms d ON d.id = e.dm_id
          LEFT JOIN dm_state s ON s.dm_id = d.id AND s.user_id = ?2
          WHERE d.id = ?1 AND ?2 IN (d.user_lo, d.user_hi)
@@ -305,7 +269,7 @@ pub(crate) fn append_message(
     who: &Human,
     text: &str,
     meta: &MessageMeta,
-) -> DmResult<MessageEvent> {
+) -> DmResult<Event> {
     hidden_before(tx, id, &who.id)?;
     if let Some(reply) = meta.reply_to
         && visible_event(tx, id, &who.id, reply)?.is_none()
@@ -314,13 +278,21 @@ pub(crate) fn append_message(
             ApiError::bad_request("reply_to must name a visible message in this DM").into(),
         );
     }
-    let activity = (meta.reply_to.is_some() || meta.forwarded.is_some())
+    if meta.via.is_some()
+        || meta
+            .forwarded
+            .as_ref()
+            .is_some_and(|f| f.same_space.is_some())
+    {
+        return Err(ApiError::bad_request("Space-only metadata is not allowed in a DM").into());
+    }
+    let activity = (!meta.is_empty())
         .then(|| serde_json::to_string(meta))
         .transpose()?;
     Ok(tx.query_row(
         "INSERT INTO dm_events (dm_id, kind, actor, actor_id, text, activity, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         RETURNING id, kind, actor, actor_id, text, activity, created_at",
+         RETURNING id, kind, actor, actor_id, text, '[]', 'room', activity, created_at",
         params![
             id,
             kind::MESSAGE,
@@ -398,7 +370,7 @@ struct After {
 
 #[derive(Serialize)]
 struct Events {
-    events: Vec<MessageEvent>,
+    events: Vec<Event>,
     reactions: Vec<Reaction>,
 }
 
@@ -417,14 +389,14 @@ async fn events(
             return Err(ApiError::bad_request("after must be a non-negative integer").into());
         }
         let mut stmt = tx.prepare_cached(
-            "SELECT id, kind, actor, actor_id, text, activity, created_at FROM dm_events
+            "SELECT id, kind, actor, actor_id, text, '[]', 'room', activity, created_at FROM dm_events
              WHERE dm_id = ?1 AND id > ?2 ORDER BY id LIMIT ?3",
         )?;
         let events = stmt
             .query_map(params![id, after.max(floor), page], event_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let start = events.first().map(|e| e.event.id);
-        let end = events.last().map(|e| e.event.id);
+        let start = events.first().map(|e| e.id);
+        let end = events.last().map(|e| e.id);
         let mut stmt = tx.prepare_cached(
             "SELECT event_id, emoji, user_id FROM dm_reactions
              WHERE dm_id = ?1 AND event_id BETWEEN ?2 AND ?3
@@ -452,34 +424,24 @@ struct Post {
     reply_to: Option<i64>,
 }
 
-// Matches api::check_text on the pre-L1 branch. Share the validator when
-// L1 exposes it; DM posting itself must never use the Space dispatch path.
-fn check_text(text: &str, max: usize) -> ApiResult<&str> {
-    let text = text.trim();
-    if text.is_empty() || text.chars().count() > max {
-        return Err(ApiError::bad_request(format!(
-            "text must be 1..={max} characters"
-        )));
-    }
-    Ok(text)
-}
-
 async fn post(
     State(state): State<AppState>,
     who: Human,
     Path(id): Path<String>,
     body: JsonBody<Post>,
-) -> ApiResult<(StatusCode, Json<MessageEvent>)> {
-    let max = state.config.limits.max_message_chars;
-    transact(&state, TransactionBehavior::Immediate, move |tx| {
-        hidden_before(tx, &id, &who.id)?;
-        let Json(body) = body.map_err(ApiError::from)?;
-        let text = check_text(&body.text, max)?;
+) -> ApiResult<(StatusCode, Json<Event>)> {
+    let message = body.map_err(ApiError::from).and_then(|Json(body)| {
+        let text = api::check_text(&state, &body.text)?;
         let meta = MessageMeta {
             reply_to: body.reply_to,
-            forwarded: None,
+            ..MessageMeta::default()
         };
-        let event = append_message(tx, &id, &who, text, &meta)?;
+        Ok((text, meta))
+    });
+    transact(&state, TransactionBehavior::Immediate, move |tx| {
+        hidden_before(tx, &id, &who.id)?;
+        let (text, meta) = message?;
+        let event = append_message(tx, &id, &who, &text, &meta)?;
         Ok((StatusCode::CREATED, Json(event)))
     })
     .await
@@ -607,7 +569,48 @@ pub(crate) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::Db;
+    use crate::db::{Db, Forwarded, ForwardedAuthor, SameSpace, Via};
+
+    #[test]
+    fn forwarded_metadata_uses_the_shared_event_without_space_details() {
+        let db = Db::open_in_memory().unwrap();
+        db.resolve_display_name("b", "B").unwrap();
+        let mut conn = db.lock();
+        let tx = conn.transaction().unwrap();
+        let who = Human {
+            id: "a".into(),
+            name: "A".into(),
+        };
+        let (id, _) = get_or_create(&tx, &who.id, "b").unwrap();
+        let mut meta = MessageMeta {
+            forwarded: Some(Forwarded {
+                author_name: "Source author".into(),
+                author_kind: ForwardedAuthor::Agent,
+                sent_at: None,
+                same_space: None,
+            }),
+            ..MessageMeta::default()
+        };
+        let text = "  verbatim **Markdown**  ";
+        let sent = append_message(&tx, &id, &who, text, &meta).unwrap();
+        assert_eq!(sent.text, text);
+        assert_eq!(sent.meta, meta);
+        assert!(
+            visible_event(&tx, &id, "outsider", sent.id)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(visible_event(&tx, &id, "b", sent.id).unwrap(), Some(sent));
+
+        meta.forwarded.as_mut().unwrap().same_space = Some(SameSpace {
+            room_id: "private room".into(),
+            event_id: 42,
+        });
+        assert!(append_message(&tx, &id, &who, text, &meta).is_err());
+        meta.forwarded = None;
+        meta.via = Some(Via::Metro);
+        assert!(append_message(&tx, &id, &who, text, &meta).is_err());
+    }
 
     #[test]
     fn additive_schema_reopens_and_purge_removes_every_dm_row() {
@@ -626,7 +629,7 @@ mod tests {
                 name: "A".into(),
             };
             let event = append_message(&tx, &id, &who, "hi", &MessageMeta::default()).unwrap();
-            let event_id = event.event.id;
+            let event_id = event.id;
             tx.execute(
                 "INSERT INTO dm_reactions (dm_id, event_id, user_id, emoji) VALUES (?1, ?2, 'b', '👍')",
                 params![id, event_id],
@@ -655,7 +658,7 @@ mod tests {
         };
         for _ in 0..100 {
             let e = append_message(&tx, &next, &who, "new", &MessageMeta::default()).unwrap();
-            assert!(e.event.id > event_id);
+            assert!(e.id > event_id);
         }
         assert_eq!(conversations(&tx, "a", None).unwrap()[0].unread, 99);
         assert_eq!(conversations(&tx, "b", None).unwrap()[0].unread, 0);
