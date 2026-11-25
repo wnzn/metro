@@ -49,6 +49,9 @@ pub mod env {
     pub const TOKEN: &str = "METRO_RUNNER_TOKEN";
     pub const SERVER_URL: &str = "METRO_SERVER_URL";
     pub const WORKSPACE: &str = "METRO_WORKSPACE";
+    /// Deprecated and ignored: plain HTTP no longer needs an opt-in (see
+    /// `Config::plain_http_warning`). Still accepted, with any value, so
+    /// existing deployments keep starting.
     pub const ALLOW_INSECURE_HTTP: &str = "METRO_ALLOW_INSECURE_HTTP";
     pub const POLL_INTERVAL_MS: &str = "METRO_POLL_INTERVAL_MS";
     pub const HTTP_TIMEOUT_SECS: &str = "METRO_HTTP_TIMEOUT_SECS";
@@ -155,15 +158,13 @@ impl Config {
             ));
         }
 
-        let allow_insecure = parse_bool(
-            get(env::ALLOW_INSECURE_HTTP).as_deref(),
-            env::ALLOW_INSECURE_HTTP,
-        )?;
+        // env::ALLOW_INSECURE_HTTP is deliberately not read: plain HTTP is
+        // allowed to every host, with a warning for hosts that are neither
+        // loopback nor Tailscale.
         let server_url = validate_server_url(
             get(env::SERVER_URL)
                 .as_deref()
                 .unwrap_or(DEFAULT_SERVER_URL),
-            allow_insecure,
         )?;
 
         let workspace = match get(env::WORKSPACE) {
@@ -292,14 +293,6 @@ impl Config {
     }
 }
 
-fn parse_bool(v: Option<&str>, key: &str) -> Result<bool, ConfigError> {
-    match v {
-        None | Some("0") | Some("false") => Ok(false),
-        Some("1") | Some("true") => Ok(true),
-        Some(o) => err(format!("{key}: expected 0/1/true/false, got {o:?}")),
-    }
-}
-
 fn parse_u64(
     v: Option<String>,
     key: &str,
@@ -335,7 +328,7 @@ pub fn parse_argv(v: &str, key: &str) -> Result<Vec<String>, ConfigError> {
     Ok(argv)
 }
 
-fn validate_server_url(raw: &str, allow_insecure: bool) -> Result<String, ConfigError> {
+fn validate_server_url(raw: &str) -> Result<String, ConfigError> {
     let url = raw.trim_end_matches('/');
     let (scheme, rest) = match url.split_once("://") {
         Some(x) => x,
@@ -358,32 +351,30 @@ fn validate_server_url(raw: &str, allow_insecure: bool) -> Result<String, Config
     if authority.is_empty() {
         return err(format!("{}: missing host", env::SERVER_URL));
     }
-    if scheme == "http" && !allow_insecure && !is_loopback_authority(authority) {
-        return err(format!(
-            "{}: plain http to a non-loopback host would send the runner token in cleartext; use https or set {}=1",
-            env::SERVER_URL,
-            env::ALLOW_INSECURE_HTTP
-        ));
-    }
     Ok(format!("{scheme}://{rest}"))
 }
 
-fn is_loopback_authority(authority: &str) -> bool {
-    let host = if let Some(stripped) = authority.strip_prefix('[') {
-        stripped.split(']').next().unwrap_or("")
-    } else {
-        authority
-            .rsplit_once(':')
-            .map(|(h, _)| h)
-            .unwrap_or(authority)
-    };
-    let host = host.to_ascii_lowercase();
-    if host == "localhost" {
-        return true;
+/// The host part of a validated `scheme://authority[/path]` URL, with IPv6
+/// brackets, without the port.
+fn url_host(url: &str) -> &str {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split('/').next().unwrap_or("");
+    if authority.starts_with('[') {
+        return authority
+            .split_once(']')
+            .map_or(authority, |(h, _)| &authority[..h.len() + 1]);
     }
-    host.parse::<std::net::IpAddr>()
-        .map(|ip| ip.is_loopback())
-        .unwrap_or(false)
+    authority.rsplit_once(':').map_or(authority, |(h, _)| h)
+}
+
+impl Config {
+    /// One warning line for plain HTTP to a server that is neither loopback
+    /// nor Tailscale (the runner token crosses the network unencrypted), or
+    /// `None`. Names the host only, never the token.
+    pub fn plain_http_warning(&self) -> Option<String> {
+        let scheme = self.server_url.split_once("://").map_or("", |(s, _)| s);
+        metro_url_policy::plain_http_warning(scheme, url_host(&self.server_url), "runner token")
+    }
 }
 
 fn parse_docker(
@@ -570,17 +561,76 @@ mod tests {
         assert!(cfg(&[(env::SERVER_URL, "http://localhost:1/")]).is_ok());
         assert!(cfg(&[(env::SERVER_URL, "http://[::1]:8787")]).is_ok());
         assert!(cfg(&[(env::SERVER_URL, "https://metro.example.com")]).is_ok());
-        assert!(cfg(&[(env::SERVER_URL, "http://metro.example.com")]).is_err());
-        assert!(
-            cfg(&[
-                (env::SERVER_URL, "http://metro.example.com"),
-                (env::ALLOW_INSECURE_HTTP, "1")
-            ])
-            .is_ok()
-        );
+        // Plain HTTP works to every host; no opt-in needed.
+        assert!(cfg(&[(env::SERVER_URL, "http://metro.example.com")]).is_ok());
+        assert!(cfg(&[(env::SERVER_URL, "http://192.168.1.5:8787")]).is_ok());
+        // The old opt-in is still accepted (and ignored), whatever its value.
+        for v in ["1", "0", "true", "anything"] {
+            assert!(
+                cfg(&[
+                    (env::SERVER_URL, "http://metro.example.com"),
+                    (env::ALLOW_INSECURE_HTTP, v)
+                ])
+                .is_ok(),
+                "{v}"
+            );
+        }
+        assert!(cfg(&[(env::SERVER_URL, "http://u:p@192.168.1.5")]).is_err());
+        assert!(cfg(&[(env::SERVER_URL, "http://192.168.1.5/#x")]).is_err());
         assert!(cfg(&[(env::SERVER_URL, "https://u:p@h")]).is_err());
         assert!(cfg(&[(env::SERVER_URL, "ftp://h")]).is_err());
         assert!(cfg(&[(env::SERVER_URL, "https://h/?x=1")]).is_err());
+    }
+
+    #[test]
+    fn plain_http_warning_only_outside_loopback_and_tailscale() {
+        let warn = |url: &str| {
+            cfg(&[
+                (env::SERVER_URL, url),
+                (env::TOKEN, "metro_rt_v2_secret-value"),
+            ])
+            .unwrap()
+            .plain_http_warning()
+        };
+        for quiet in [
+            "http://127.0.0.1:8787",
+            "http://localhost:8787/",
+            "http://[::1]:8787",
+            "http://100.101.102.103:8787",
+            "http://[fd7a:115c:a1e0::1]:8787/metro",
+            "http://metro.tail1234.ts.net",
+            "https://192.168.1.5",
+            "https://metro.example.com",
+        ] {
+            assert_eq!(warn(quiet), None, "{quiet}");
+        }
+        for loud in [
+            "http://192.168.1.5:8787",
+            "http://metro.example.com/base",
+            "http://100.128.0.1",
+            "http://[fd7a:115c:a1e1::1]:8787",
+            "http://ts.net",
+        ] {
+            let w = warn(loud).unwrap_or_else(|| panic!("{loud}"));
+            assert!(
+                w.contains("isn't encrypted") && w.contains("runner token"),
+                "{w}"
+            );
+            assert!(
+                !w.contains("secret-value"),
+                "the warning must never contain the token"
+            );
+        }
+        assert!(
+            warn("http://192.168.1.5:8787")
+                .unwrap()
+                .contains("192.168.1.5")
+        );
+        assert!(
+            warn("http://[fd7a:115c:a1e1::1]:8787")
+                .unwrap()
+                .contains("[fd7a:115c:a1e1::1]")
+        );
     }
 
     #[test]

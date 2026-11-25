@@ -1,0 +1,12 @@
+[package]
+name = "metro-url-policy"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+publish = false
+description = "How Metro clients treat a plain-HTTP Metro server URL: loopback and Tailscale hosts silently, any other host with a clear warning. No dependencies."
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "metro_url_policy"
+path = "src/lib.rs"

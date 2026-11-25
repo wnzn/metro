@@ -1612,6 +1612,7 @@ name = "metro-runner"
 version = "0.4.0"
 dependencies = [
  "libc",
+ "metro-url-policy",
  "serde",
  "serde_json",
  "tempfile",
@@ -1668,6 +1669,10 @@ dependencies = [
  "unicode-width",
  "url",
 ]
+
+[[package]]
+name = "metro-url-policy"
+version = "0.4.0"
 
 [[package]]
 name = "mime"
