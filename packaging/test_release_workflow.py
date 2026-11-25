@@ -6,6 +6,7 @@ workflow (validated before any `if:`), the input contracts of each call, who
 sees which secret, and the order in which release jobs run.
 """
 
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,10 @@ MAIN_IF = """github.event_name == 'push' && github.repository == 'wnzn/metro' &&
 GATES = ("rust", "desktop", "containers", "workflows", "packaging")
 RELEASE_IF = "needs.release-policy.outputs.release == 'true' && " + " && ".join(
     f"needs.{gate}.result == 'success'" for gate in GATES)
+E2E_RELEASE_MARKERS = ("e2e-test-release", "metro-release/e2e", "--all-features",
+                       "METRO_TEST_RELEASE_", "METRO_TEST_CRASH_VERSION",
+                       "metro-update-e2e-target")
+E2E_RELEASE_WORKFLOW_MARKERS = E2E_RELEASE_MARKERS + ("tests/e2e/updates.py",)
 
 
 def load(name):
@@ -103,10 +108,12 @@ class E2eTestHooksNeverShipTests(unittest.TestCase):
         paths = sorted(WF.glob("*.yml")) + [ROOT / "Dockerfile", ROOT / "packaging/Dockerfile.build"]
         paths += sorted((ROOT / "packaging").glob("*.py")) + sorted((ROOT / "packaging").glob("*.sh"))
         for path in paths:
-            if path.name == Path(__file__).name or not path.is_file():
+            # ci.yml has one step-level exception, checked on the parsed workflow below.
+            if path in (WF / "ci.yml", Path(__file__).resolve()) or not path.is_file():
                 continue
             text = path.read_text(encoding="utf-8")
-            for needle in ("e2e-test-release", "metro-release/e2e", "--all-features"):
+            markers = E2E_RELEASE_WORKFLOW_MARKERS if path.parent == WF else E2E_RELEASE_MARKERS
+            for needle in markers:
                 self.assertNotIn(needle, text, f"{path.name} mentions {needle}")
 
 
@@ -609,6 +616,44 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertLessEqual(pty[0]["timeout-minutes"], 10)
         self.assertIn("python3 -B crates/tui/tests/pty_qa.py --bin-dir target/debug", pty[0]["run"])
         self.assertIn("timeout --kill-after=", pty[0]["run"])
+
+    def test_ci_pages_and_web_search_use_the_normal_build_once(self):
+        jobs = self.ci["jobs"]
+        rust = jobs["rust"]["steps"]
+        build, = [i for i, s in enumerate(rust) if str(s.get("run", "")).startswith("cargo build --locked --bin ")]
+        for fixture, timeout in (("pages.py", 60), ("agent_pages.py", 90), ("web_search.py", 90)):
+            path = f"tests/e2e/{fixture}"
+            with self.subTest(fixture=fixture):
+                (job, index, step), = [(name, i, step) for name, job in jobs.items()
+                                       for i, step in enumerate(job.get("steps", []))
+                                       if path in str(step.get("run", ""))]
+                self.assertEqual(job, "rust")
+                self.assertGreater(index, build)
+                self.assertEqual(step["run"], f"python3 {path} --bin-dir target/debug --timeout {timeout}")
+                self.assertEqual(set(step), {"name", "run"})  # no independent skip, override, or allowed failure
+
+    def test_ci_updater_fixture_is_blocking_and_confined_to_one_step(self):
+        ci = deepcopy(self.ci)
+        rust = ci["jobs"]["rust"]
+        # Last step, still subject to implicit success() and part of the required rust check.
+        fixture = rust["steps"].pop()
+        self.assertEqual(fixture, {
+            "name": "Build and run the isolated updater fixture",
+            "if": "${{ needs.workflows.outputs.updates != 'false' || needs.release-policy.outputs.release == 'true' }}",
+            "timeout-minutes": 15,
+            "run": (
+                'set -eu\n'
+                'target="$RUNNER_TEMP/metro-update-e2e-target"\n'
+                'CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \\\n'
+                '  cargo build --locked -p metro-server -p metro-runner --target-dir "$target" \\\n'
+                '    --features metro-server/e2e-test-release,metro-runner/e2e-test-release\n'
+                'python3 tests/e2e/updates.py --bin-dir "$target/debug" --timeout 120\n'
+            ),
+        })
+        self.assertNotIn("continue-on-error", rust)
+        self.assertEqual(uploads(rust), [])
+        for needle in E2E_RELEASE_WORKFLOW_MARKERS:
+            self.assertNotIn(needle, yaml.safe_dump(ci))
 
     def test_signer_and_image_contracts_line_up(self):
         signer = (WF / "sign-release-assets.yml").read_text()
