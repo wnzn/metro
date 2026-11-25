@@ -1,6 +1,5 @@
 import { signal } from "nsh";
 import type { RegisteredRunner, SpaceRunner } from "../../api/client";
-import { revealed } from "../../settings";
 import { activeRoom, activeSpaceId, mainPlace, me, openSettings } from "../../store";
 import { Action, Badge, Banner, Column, compactWidth, ConfirmInline, ConnectionItem, Disclosure, Field, Label, PageHeader, PageLayout, SettingRow, SettingsGroup } from "../../ui";
 import { LocalToolsCard } from "../localtools/LocalToolsCard";
@@ -10,7 +9,7 @@ import { profileName } from "../profile/profileState";
 import { TokenReveal } from "../TokenReveal";
 import { TEST_RUNNER_DESCRIPTION, TEST_RUNNER_LABEL, TestRunnerAction } from "./TestRunner";
 import {
-  changeMember, changeRunner, closeSpaceSettings, isSettingsOwner, loadMembers, loadRunner, loadRunnerInventory,
+  changeMember, changeRunner, closeSpaceSettings, dedicatedRevealIsCurrent, isSettingsOwner, loadMembers, loadRunner, loadRunnerInventory,
   memberBusy, memberNotice, preferredSpaceRunner, roster, rosterError, runnerAdvanced, runnerBusy, runnerError,
   runnerInventory, runnerInventoryError, runnerNotice, runnerSnapshot, setRunnerAdvanced, spaceSettingsFor,
 } from "./spaceSettingsState";
@@ -91,10 +90,7 @@ export function RunnerPage() {
   };
   const sameRoom = () => mainPlace() === "space" && activeSpaceId() === spaceSettingsFor() ? activeRoom() : null;
   const showLocalFeedback = () => isSettingsOwner() && runnerAdvanced();
-  const reveal = () => {
-    const token = revealed();
-    return isSettingsOwner() && runnerAdvanced() && token?.kind === "dedicated" && token.spaceId === spaceSettingsFor();
-  };
+  const reveal = dedicatedRevealIsCurrent;
   return (
     <PageLayout testID="space-runner" pad={pad()} gap={6} footer={
       !reveal() && (runnerError() || runnerInventoryError() || runnerNotice() || (showLocalFeedback() && (localToolsError() || localToolsNotice()))) ? <Column gap={2}>
@@ -239,10 +235,10 @@ function DetachRunner(props: { runner: Extract<SpaceRunner, { kind: "registered"
   );
 }
 
-function GuardedRemovalUnavailable() {
+function GuardedRemovalUnavailable(props: { tokenChange?: boolean }) {
   return (
-    <Column gap={1} testID="space-runner-removal-unavailable">
-      <Label variant="caption" color="muted">Safe removal is unavailable for this assignment.</Label>
+    <Column gap={1} testID={props.tokenChange ? "space-runner-token-change-unavailable" : "space-runner-removal-unavailable"}>
+      <Label variant="caption" color="muted">{props.tokenChange ? "Guarded token changes are unavailable." : "Safe removal is unavailable for this assignment."}</Label>
       <Action label="Refresh status" variant="ghost" disabled={busy()} onPress={() => void loadRunner()} />
     </Column>
   );
@@ -250,20 +246,29 @@ function GuardedRemovalUnavailable() {
 
 function DedicatedAndLocalTools() {
   const runner = () => runnerSnapshot()?.runner;
+  const tokenChanges = () => runnerSnapshot()?.guardedTokenChanges;
   return (
     <Column gap={3}>
       <SettingsGroup title="Dedicated token" description="Pair a runner that serves only this Space. A new token is shown once.">
         <If when={runner() === null}>
           <SettingRow label="No dedicated token">
-            <Action testID="issue-runner-token" label="Issue dedicated token" busyLabel="Issuing…" busy={runnerBusy() === "issue"}
-              disabled={busy()} onPress={() => void changeRunner({ kind: "issue" })} />
+            <If when={tokenChanges()} else={<GuardedRemovalUnavailable tokenChange />}>
+              <Action testID="issue-runner-token" label="Issue dedicated token" busyLabel="Issuing…" busy={runnerBusy() === "issue"}
+                disabled={busy()} onPress={() => void changeRunner({ kind: "issue" })} />
+            </If>
           </SettingRow>
         </If>
         <If when={runner()?.kind === "dedicated"}>
           <Column testID="dedicated-runner">
-            <SettingRow label="Rotate the token" description="The old token stops working. The runner needs the new one.">
-              <Action testID="issue-runner-token" label="Rotate token" busyLabel="Rotating…" busy={runnerBusy() === "rotate"}
-                disabled={busy()} onPress={() => void changeRunner({ kind: "rotate" })} />
+            <SettingRow label="Rotate the token" description="The old token stops working. The runner needs the new one." stacked>
+              <If when={tokenChanges() ? runner()?.assignmentRevision : undefined} else={<GuardedRemovalUnavailable tokenChange />}>
+                {(revision) => (
+                  <ConfirmInline testID="issue-runner-token" triggerLabel="Rotate…" confirmLabel="Rotate the token"
+                    message="The current dedicated token stops working. The new one can be copied once."
+                    scopeKey={`${spaceSettingsFor()}:dedicated:${revision()}`} disabled={busy()}
+                    onConfirm={() => void changeRunner({ kind: "rotate", revision: revision() })} />
+                )}
+              </If>
             </SettingRow>
             <SettingRow label="Revoke the token" stacked>
               <If when={runner()?.assignmentRevision} else={<GuardedRemovalUnavailable />}>

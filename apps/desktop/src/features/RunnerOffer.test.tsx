@@ -327,6 +327,43 @@ test("the follow-up read also detects a newer assignment made outside this app",
   expect(words(app)).toContain(other.name);
 });
 
+test("a superseded Space settings attach neither dismisses the offer nor records a folder", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("manual", "Manual", "alice");
+  const t = fixture(f, r.id);
+  t.gate.attach = 800;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.waitFor(offer);
+  await app.press("id:space:manual");
+  await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
+  await app.press(`id:space-runner-attach:${r.id}`);
+  await app.waitUntil(() => f.state.attached.get("manual") === r.id);
+  await app.press("id:space-settings-close");
+
+  await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitFor("id:space-runner-status >> text:No runner");
+  await app.clock!.runFor(800);
+  await app.press("id:space-settings-close");
+  expect(app.shows(offer)).toBe(true);
+  expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+  expect(runnerWrites(f).map((p) => p.path)).toEqual([
+    "/v1/spaces/manual/runner/attach-if-empty", "/v1/spaces/manual/runner/detach-if-current",
+  ]);
+
+  t.status.delay = 1_000; // Check the cache before a new folder refresh can replace it.
+  await app.press("id:nav-settings");
+  await app.waitFor("id:runners-settings");
+  expect(app.shows("id:installed-runner-space:manual")).toBe(false);
+  await app.clock!.runFor(1_000);
+  await app.waitFor("id:runner-attach-pick:manual");
+});
+
 test("changing and restoring consent while the create response is held never posts an attach or duplicate create", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");

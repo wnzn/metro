@@ -117,6 +117,113 @@ async fn guarded_detach_rejects_replacement_aba_and_dedicated_rotation() {
     assert!(empty.get("assignment_revision").is_none());
 }
 
+#[tokio::test]
+async fn guarded_dedicated_issue_and_rotate_require_the_current_assignment() {
+    let s = Server::start().await;
+    let sid = s.space(ALICE, "Guarded dedicated").await;
+    s.add(ALICE, &sid, "bob").await;
+    let base = format!("/v1/spaces/{sid}/runner-token");
+    let issue = format!("{base}/issue-if-empty");
+    let rotate = format!("{base}/rotate-if-current");
+    let assignment = s.runner_snapshot(ALICE, &sid).await;
+    assert!(assignment["runner"].is_null());
+    assert_eq!(assignment["guarded_token_changes"], true);
+    assert!(
+        s.runner_snapshot(BOB, &sid)
+            .await
+            .get("guarded_token_changes")
+            .is_none()
+    );
+    assert_eq!(
+        s.post(BOB, &issue, json!({})).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    // Pair after the new UI saw an empty Space, before its issue request.
+    let (runner, _) = s.register(ALICE, "Registered", "personal").await;
+    assert_eq!(
+        s.attach_if_empty(ALICE, &sid, &runner).await.0,
+        StatusCode::OK
+    );
+    let attached = s.runner_snapshot(ALICE, &sid).await;
+    let (status, body) = s.post(ALICE, &issue, json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.get("token").is_none());
+    assert_eq!(
+        s.post(
+            ALICE,
+            &rotate,
+            json!({"assignment_revision": attached["assignment_revision"]})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(s.runner_snapshot(ALICE, &sid).await["runner"]["id"], runner);
+    assert_eq!(
+        s.guarded_detach(ALICE, &sid, &attached["assignment_revision"])
+            .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let receipt = s
+        .http
+        .post(format!("{}{issue}", s.base))
+        .bearer_auth(ALICE)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(receipt.status(), StatusCode::OK);
+    assert_eq!(receipt.headers()["cache-control"], "no-store");
+    let receipt: Value = receipt.json().await.unwrap();
+    assert!(receipt["token"].is_string());
+    let issued_revision = receipt["assignment_revision"].clone();
+    assert_eq!(
+        s.runner_snapshot(ALICE, &sid).await["assignment_revision"],
+        issued_revision
+    );
+    assert_eq!(
+        s.post(ALICE, &issue, json!({})).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        s.runner_snapshot(ALICE, &sid).await["assignment_revision"],
+        issued_revision
+    );
+
+    let request = json!({"assignment_revision": issued_revision});
+    let (status, rotated) = s.post(ALICE, &rotate, request.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(rotated["token"].is_string());
+    assert_ne!(rotated["assignment_revision"], issued_revision);
+    let (status, rejected) = s.post(ALICE, &rotate, request).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(rejected.get("token").is_none());
+    let current_revision = &rotated["assignment_revision"];
+    assert_eq!(
+        s.runner_snapshot(ALICE, &sid).await["assignment_revision"],
+        *current_revision
+    );
+
+    // A revoke makes the old rotate request stale and cannot recreate a token.
+    assert_eq!(
+        s.guarded_detach(ALICE, &sid, current_revision).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        s.post(
+            ALICE,
+            &rotate,
+            json!({"assignment_revision": current_revision})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert!(s.runner_snapshot(ALICE, &sid).await["runner"].is_null());
+}
+
 struct FakeAuth(HashMap<String, UserIdentity>);
 
 impl HumanAuth for FakeAuth {
@@ -280,9 +387,16 @@ impl Server {
     }
 
     async fn runner_snapshot(&self, user: &str, sid: &str) -> Value {
-        let (status, view) = self.get(user, &format!("/v1/spaces/{sid}/runner")).await;
-        assert_eq!(status, StatusCode::OK);
-        view
+        let response = self
+            .http
+            .get(format!("{}/v1/spaces/{sid}/runner", self.base))
+            .bearer_auth(user)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        response.json().await.unwrap()
     }
 
     async fn guarded_detach(&self, user: &str, sid: &str, revision: &Value) -> StatusCode {
@@ -733,7 +847,7 @@ async fn detach_and_reassign_cancel_in_flight_jobs() {
         StatusCode::NOT_FOUND
     );
     let (_, body) = s.get(ALICE, &format!("/v1/spaces/{a}/runner")).await;
-    assert_eq!(body, json!({"runner": null}));
+    assert_eq!(body, json!({"runner": null, "guarded_token_changes": true}));
     assert_eq!(s.demo(ALICE, &a).await, StatusCode::CONFLICT);
     // Detaching again is a no-op.
     assert_eq!(
@@ -795,7 +909,7 @@ async fn rotation_and_deletion_revoke_the_token() {
         StatusCode::UNAUTHORIZED
     );
     let (_, body) = s.get(ALICE, &format!("/v1/spaces/{a}/runner")).await;
-    assert_eq!(body, json!({"runner": null}));
+    assert_eq!(body, json!({"runner": null, "guarded_token_changes": true}));
     let (_, body) = s.get(ALICE, "/v1/runners").await;
     assert!(ids(&body).is_empty());
     assert_eq!(

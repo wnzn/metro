@@ -267,8 +267,9 @@ test("Test runner lives with the runner controls, needs this Space's runner and 
   expect(app.shows("id:run-demo")).toBe(false);
   expect(app.shows("id:test-runner")).toBe(false);
   await app.press("id:space-settings-open");
-  await app.press("id:space-settings-tab:members");
-  expect(app.shows("text:Lists the workspace on this Space's runner; no model is used. The listing is posted in the room you have open.")).toBe(true);
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:test-runner-row");
+  expect(app.shows("text:Lists the workspace on this Space's runner; no model is used. The listing is posted in # lobby.")).toBe(true);
   await app.press("id:test-runner");
   await app.waitFor("text:Requested. The listing appears in # lobby as Runner activity.");
   expect(f.posts().at(-1)).toMatchObject({ path: "/v1/spaces/acme/rooms/lobby/demo", body: {} });
@@ -278,25 +279,28 @@ test("Test runner lives with the runner controls, needs this Space's runner and 
   expect(app.shows("text:/thinking/")).toBe(false);
   expect(app.shows("text:README.md\nsrc/")).toBe(false); // collapsed until opened
 
-  // Manage offers it beside the runner's status, only while a runner is attached.
+  // The old Manage shortcut opens Members; Runner houses the one test control.
   await app.press("id:manage-space");
+  await app.waitFor("id:space-members");
+  expect(app.shows("id:test-runner")).toBe(false);
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:runner-card >> id:test-runner");
-  await app.press("id:close-manage");
+  await app.press("id:space-settings-close");
 
   // A Space without a runner, which alice doesn't own: its status, nothing to test, no management.
   await app.press("id:space:side");
   await app.waitFor("text:No runner");
   await app.press("id:space-settings-open");
-  await app.press("id:space-settings-tab:members");
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:space-runner-status");
   expect(app.shows("id:space-runner-status >> text:No runner")).toBe(true);
   expect(app.shows("id:test-runner")).toBe(false);
-  expect(app.shows("id:open-manage")).toBe(false);
+  expect(app.shows("id:space-runner-advanced:toggle")).toBe(false);
 });
 
 test("owners manage members and see a runner token once; members can't manage", async () => {
-  const f = world();
-  const app = await openApp(f);
+  const w = spaceWorld();
+  const app = await open("./App.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1200, height: 800 });
   await signIn(app, "alice");
   await openAcme(app);
   await app.press("id:manage-space");
@@ -305,26 +309,37 @@ test("owners manage members and see a runner token once; members can't manage", 
   await app.press("id:add-member");
   await app.waitFor("id:member:carol");
   await app.press("id:remove-member:carol");
+  await app.press("id:remove-member:carol:confirm");
   await app.waitFor("id:member:carol", { state: "gone" });
 
   // Acme has a dedicated (legacy) token: the owner can still rotate it.
+  await app.press("id:space-settings-tab:runner");
+  await app.press("id:space-runner-advanced:toggle");
   await app.waitFor("id:dedicated-runner");
   await app.press("id:issue-runner-token");
+  await app.press("id:issue-runner-token:confirm");
   await app.waitFor("id:runner-token-value");
   expect(text(app)).not.toContain("secret-runner-token-"); // masked until asked
   await app.press("id:copy-runner-token");
   expect(app.clipboard()).toContain("secret-runner-token-");
   await app.press("id:reveal-toggle");
   expect(text(app)).toContain("secret-runner-token-");
-  await app.press("id:close-manage"); // leaving the view forgets it
+  await app.press("id:space-settings-close"); // leaving the dialog forgets it
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:runner-card");
+  expect(app.shows("id:token-reveal")).toBe(false);
   expect(text(app)).not.toContain("secret-runner-token-");
   expect(JSON.stringify(app.storage())).not.toContain("secret-runner-token-");
 
+  await app.press("id:space-settings-close");
   await app.press("id:space:side"); // Bob owns Side; Alice is a member
   await app.waitFor("text:side lobby only");
   expect(app.shows("id:manage-space")).toBe(false);
+  await app.press("id:space-settings-open");
+  await app.press("id:space-settings-tab:members");
+  await app.waitFor("id:member:bob");
+  expect(app.shows("id:add-member")).toBe(false);
 });
 
 test("losing membership purges the Space and returns to the Chat", async () => {
@@ -559,23 +574,26 @@ test("a Space owner attaches and detaches a runner from the same list; attached 
   await app.press("id:space:side");
   await app.waitFor("text:side lobby only");
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:attach-runner-list");
+  await app.waitFor(`id:space-runner-attach:${mine.id}`);
   expect(app.shows(`id:attachable:${org.id}`)).toBe(true);
   expect(app.shows(`id:attachable:${mine.id}`)).toBe(true);
   expect(app.shows("text:Alice private")).toBe(false);
 
-  await app.press(`id:attach-runner:${mine.id}`);
+  await app.press(`id:space-runner-attach:${mine.id}`);
   await app.waitFor("id:attached-runner");
-  expect(f.posts().at(-1)).toMatchObject({ method: "PUT", path: "/v1/spaces/side/runner", body: { runner_id: mine.id } });
+  expect(f.posts().at(-1)).toMatchObject({ method: "POST", path: "/v1/spaces/side/runner/attach-if-empty", body: { runner_id: mine.id } });
   // Attached only routes this Space's jobs; it never claims the runner is up.
-  expect(text(app)).toMatch(/Attached or paired means [^|]*(it doesn't mean the runner is online|not that it[’']s online)/);
+  expect(text(app)).toContain("The assignment doesn't mean it's online.");
   expect(app.shows("id:runner-card >> text:Online")).toBe(false);
   expect(text(app)).not.toContain(mine.token);
 
-  await app.press("id:detach-runner");
-  await app.press("id:confirm-detach");
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
   await app.waitFor("id:attach-runner-list");
   expect(f.state.attached.has("side")).toBe(false);
+  expect(f.posts().at(-1)).toMatchObject({ method: "POST", path: "/v1/spaces/side/runner/detach-if-current" });
   await app.press("id:open-runner-settings");
   await app.waitFor("id:runners-settings");
 });
@@ -877,13 +895,15 @@ test("Settings opens as a modal over a room and closes back to the same room and
   expect(app.shows("text:hello from bob in acme")).toBe(true);
 });
 
-test("Settings opened from a Space's management returns to it; a runner token shown in Settings is gone after closing", async () => {
+test("Settings opened from a Space's Runner page returns to its room and draft, and forgets the runner token", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "bob");
   await app.press("id:space:side");
   await app.waitFor("text:side lobby only");
+  await app.type("id:composer", "Half-written Side draft");
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:attach-runner-list");
   await app.press("id:open-runner-settings");
   await app.waitFor("id:runners-settings");
@@ -892,7 +912,13 @@ test("Settings opened from a Space's management returns to it; a runner token sh
   await app.press("id:add-runner");
   await app.waitFor("id:token-reveal");
   await app.press("id:settings-close");
-  await app.waitFor("id:attach-runner-list"); // still managing Side
+  await app.waitFor("id:settings-dialog", { state: "gone" });
+  expect(app.shows("text:side lobby only")).toBe(true);
+  expect(app.value("id:composer")).toBe("Half-written Side draft");
+  await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:attach-runner-list");
+  await app.press("id:space-settings-close");
   await app.press("id:nav-settings");
   await app.waitFor("id:runners-settings");
   expect(app.shows("id:token-reveal")).toBe(false);
@@ -1021,7 +1047,8 @@ test("a late settings answer never lands after sign-out or in the next user's se
   f.state.delays.delete("/v1/runners");
   await signIn(app, "bob");
   await openSettings(app, "runners");
-  await app.waitFor("text:No runners yet");
+  await app.waitFor("text:No other personal runners");
+  await app.waitFor("text:No organization runners");
   await app.wait(800);
   expect(app.shows("text:Alice private")).toBe(false);
 });

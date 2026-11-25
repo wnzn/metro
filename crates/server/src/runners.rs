@@ -33,7 +33,7 @@ use serde_json::json;
 
 use crate::AppState;
 use crate::api::{self, ApiError, ApiResult, JsonBody, owner_of};
-use crate::auth::{Human, new_registered_token, runner_token_hash};
+use crate::auth::{Human, new_registered_token, new_runner_token, runner_token_hash};
 use crate::db::{Db, LimitError, now_ms, short_id};
 
 pub(crate) fn init(conn: &Connection) -> rusqlite::Result<()> {
@@ -135,11 +135,28 @@ pub enum Attach {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-enum GuardedDetach {
+enum GuardedAssignment {
     NotMember,
     NotOwner,
     Changed,
-    Detached(u64),
+    Applied(u64),
+}
+
+impl GuardedAssignment {
+    fn generation(self) -> ApiResult<u64> {
+        match self {
+            Self::NotMember => Err(ApiError::not_found("no such Space")),
+            Self::NotOwner => Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "only the Space owner can do this",
+            )),
+            Self::Changed => Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "this Space's runner assignment changed; nothing was changed",
+            )),
+            Self::Applied(generation) => Ok(generation),
+        }
+    }
 }
 
 /// Spaces and their new runner generations after a change.
@@ -341,12 +358,12 @@ impl Db {
     }
 
     /// Read membership, assignment and its revision in one SQLite snapshot.
-    /// Only an owner of an assigned Space gets a confirmation revision.
+    /// Only the owner gets the capability and, if assigned, a revision.
     fn space_runner_for(
         &self,
         space_id: &str,
         actor: &str,
-    ) -> anyhow::Result<Option<(SpaceRunner, Option<i64>)>> {
+    ) -> anyhow::Result<Option<(SpaceRunner, bool, i64)>> {
         Ok(self
             .lock()
             .query_row(
@@ -365,12 +382,7 @@ impl Db {
                     } else {
                         SpaceRunner::None
                     };
-                    let revision = if runner != SpaceRunner::None && row.get::<_, bool>(5)? {
-                        Some(row.get(6)?)
-                    } else {
-                        None
-                    };
-                    Ok((runner, revision))
+                    Ok((runner, row.get(5)?, row.get(6)?))
                 },
             )
             .optional()?)
@@ -490,33 +502,74 @@ impl Db {
         space_id: &str,
         actor: &str,
         revision: i64,
-    ) -> anyhow::Result<GuardedDetach> {
+    ) -> anyhow::Result<GuardedAssignment> {
         let mut conn = self.lock();
         // Acquire the write reservation before checking live ownership or
         // generation, including when another process uses this database.
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let current: Option<(bool, i64)> = tx
-            .query_row(
-                "SELECT m.role = 'owner', s.runner_generation
-                 FROM spaces s JOIN space_members m ON m.space_id = s.id
-                 WHERE s.id = ?1 AND m.user_id = ?2",
-                params![space_id, actor],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        match current {
-            None => return Ok(GuardedDetach::NotMember),
-            Some((false, _)) => return Ok(GuardedDetach::NotOwner),
+        match Self::assignment_owner(&tx, space_id, actor)? {
+            None => return Ok(GuardedAssignment::NotMember),
+            Some((false, _)) => return Ok(GuardedAssignment::NotOwner),
             Some((true, generation)) if generation != revision => {
-                return Ok(GuardedDetach::Changed);
+                return Ok(GuardedAssignment::Changed);
             }
             Some((true, _)) => {}
         }
         let Some(generation) = Self::remove_assignment(&tx, space_id)? else {
-            return Ok(GuardedDetach::Changed);
+            return Ok(GuardedAssignment::Changed);
         };
         tx.commit()?;
-        Ok(GuardedDetach::Detached(generation))
+        Ok(GuardedAssignment::Applied(generation))
+    }
+
+    /// Issue only when empty, or rotate the exact dedicated revision. Live
+    /// ownership and the assignment predicate are checked under the same write
+    /// reservation. Returns only the committed generation, never a secret.
+    fn set_dedicated_token_guarded(
+        &self,
+        space_id: &str,
+        actor: &str,
+        revision: Option<i64>,
+        hash: &[u8],
+    ) -> anyhow::Result<GuardedAssignment> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        match Self::assignment_owner(&tx, space_id, actor)? {
+            None => return Ok(GuardedAssignment::NotMember),
+            Some((false, _)) => return Ok(GuardedAssignment::NotOwner),
+            Some((true, _)) => {}
+        }
+        let generation: Option<i64> = tx
+            .query_row(
+                "UPDATE spaces SET runner_token_hash = ?2, runner_generation = runner_generation + 1
+                 WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM space_runners WHERE space_id = ?1)
+                   AND ((?3 IS NULL AND runner_token_hash IS NULL)
+                     OR (runner_generation = ?3 AND runner_token_hash IS NOT NULL))
+                 RETURNING runner_generation",
+                params![space_id, hash, revision],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(generation) = generation else {
+            return Ok(GuardedAssignment::Changed);
+        };
+        tx.commit()?;
+        Ok(GuardedAssignment::Applied(generation as u64))
+    }
+
+    fn assignment_owner(
+        tx: &Connection,
+        space_id: &str,
+        actor: &str,
+    ) -> rusqlite::Result<Option<(bool, i64)>> {
+        tx.query_row(
+            "SELECT m.role = 'owner', s.runner_generation
+             FROM spaces s JOIN space_members m ON m.space_id = s.id
+             WHERE s.id = ?1 AND m.user_id = ?2",
+            params![space_id, actor],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
     }
 
     fn remove_assignment(tx: &Connection, space_id: &str) -> anyhow::Result<Option<u64>> {
@@ -722,19 +775,25 @@ pub async fn get_space_runner(
     State(state): State<AppState>,
     who: Human,
     Path(sid): Path<String>,
-) -> ApiResult<Json<serde_json::Value>> {
+) -> ApiResult<Response> {
     if crate::config::validate_id(&sid).is_err() {
         return Err(ApiError::not_found("no such Space"));
     }
     let space_id = sid.clone();
-    let (runner, revision) = api::db(&state, move |db| db.space_runner_for(&space_id, &who.id))
-        .await?
-        .ok_or_else(|| ApiError::not_found("no such Space"))?;
+    let (runner, owner, revision) =
+        api::db(&state, move |db| db.space_runner_for(&space_id, &who.id))
+            .await?
+            .ok_or_else(|| ApiError::not_found("no such Space"))?;
     let mut body = json!({"runner": space_view(&state, &sid, &runner)});
-    if let Some(revision) = revision {
-        body["assignment_revision"] = json!(revision.to_string());
+    if owner {
+        body["guarded_token_changes"] = json!(true);
+        if runner != SpaceRunner::None {
+            body["assignment_revision"] = json!(revision.to_string());
+        }
     }
-    Ok(Json(body))
+    // Confirmations and token receipts rely on a fresh assignment, not a
+    // cached response from before a pairing change.
+    Ok(api::no_store(StatusCode::OK, body))
 }
 
 #[derive(Deserialize)]
@@ -829,9 +888,16 @@ pub async fn delete_space_runner(
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DetachIfCurrentBody {
+pub struct AssignmentRevisionBody {
     /// Decimal string, not a JSON number: SQLite's integer can exceed JS precision.
     assignment_revision: String,
+}
+
+fn assignment_revision(raw: &str) -> ApiResult<i64> {
+    raw.parse::<i64>()
+        .ok()
+        .filter(|r| *r >= 0 && r.to_string() == raw)
+        .ok_or_else(|| ApiError::bad_request("invalid runner assignment revision"))
 }
 
 /// A separate action route: a client must never fall back to unconditional DELETE.
@@ -839,37 +905,66 @@ pub async fn post_detach_space_runner_if_current(
     State(state): State<AppState>,
     who: Human,
     Path(sid): Path<String>,
-    body: JsonBody<DetachIfCurrentBody>,
+    body: JsonBody<AssignmentRevisionBody>,
 ) -> ApiResult<StatusCode> {
     let space = owner_of(&state, &sid, &who).await?;
     let Json(body) = body?;
-    let revision = body
-        .assignment_revision
-        .parse::<i64>()
-        .ok()
-        .filter(|r| *r >= 0 && r.to_string() == body.assignment_revision)
-        .ok_or_else(|| ApiError::bad_request("invalid runner assignment revision"))?;
+    let revision = assignment_revision(&body.assignment_revision)?;
     let space_id = space.id.clone();
-    match api::db(&state, move |db| {
+    let generation = api::db(&state, move |db| {
         db.detach_runner_if_current(&space_id, &who.id, revision)
     })
     .await?
-    {
-        GuardedDetach::NotMember => Err(ApiError::not_found("no such Space")),
-        GuardedDetach::NotOwner => Err(ApiError::new(
-            StatusCode::FORBIDDEN,
-            "only the Space owner can do this",
-        )),
-        GuardedDetach::Changed => Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "this Space's runner assignment changed; nothing was removed",
-        )),
-        GuardedDetach::Detached(generation) => {
-            state.jobs.revoke(&space.id, generation);
-            tracing::info!(space = %space.id, generation, "runner removed (guarded)");
-            Ok(StatusCode::NO_CONTENT)
-        }
-    }
+    .generation()?;
+    state.jobs.revoke(&space.id, generation);
+    tracing::info!(space = %space.id, generation, "runner removed (guarded)");
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// Separate from the legacy issue-or-rotate route so old servers fail closed.
+pub async fn post_issue_dedicated_token_if_empty(
+    State(state): State<AppState>,
+    who: Human,
+    Path(sid): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Response> {
+    let space = owner_of(&state, &sid, &who).await?;
+    api::empty_object(&body)?;
+    change_dedicated_token(&state, who, space.id, None).await
+}
+
+pub async fn post_rotate_dedicated_token_if_current(
+    State(state): State<AppState>,
+    who: Human,
+    Path(sid): Path<String>,
+    body: JsonBody<AssignmentRevisionBody>,
+) -> ApiResult<Response> {
+    let space = owner_of(&state, &sid, &who).await?;
+    let Json(body) = body?;
+    let revision = assignment_revision(&body.assignment_revision)?;
+    change_dedicated_token(&state, who, space.id, Some(revision)).await
+}
+
+async fn change_dedicated_token(
+    state: &AppState,
+    who: Human,
+    sid: String,
+    revision: Option<i64>,
+) -> ApiResult<Response> {
+    let token = new_runner_token().map_err(ApiError::internal)?;
+    let hash = runner_token_hash(&token);
+    let space_id = sid.clone();
+    let generation = api::db(state, move |db| {
+        db.set_dedicated_token_guarded(&space_id, &who.id, revision, &hash)
+    })
+    .await?
+    .generation()?;
+    state.jobs.rotate(&sid, generation);
+    tracing::info!(space = %sid, generation, "dedicated runner token changed (guarded)");
+    Ok(api::no_store(
+        StatusCode::OK,
+        json!({"token": token, "assignment_revision": generation.to_string()}),
+    ))
 }
 
 #[cfg(test)]
@@ -883,7 +978,7 @@ mod tests {
     }
 
     #[test]
-    fn guarded_detach_rechecks_live_owner_even_with_current_revision() {
+    fn guarded_runner_writes_recheck_live_owner_even_with_current_revision() {
         let (db, sid) = db_with_space("alice");
         let generation = db.set_runner_token(&sid, b"fixture-hash").unwrap().unwrap();
         let revision = i64::try_from(generation).unwrap();
@@ -898,7 +993,12 @@ mod tests {
         assert_eq!(
             db.detach_runner_if_current(&sid, "alice", revision)
                 .unwrap(),
-            GuardedDetach::NotOwner
+            GuardedAssignment::NotOwner
+        );
+        assert_eq!(
+            db.set_dedicated_token_guarded(&sid, "alice", Some(revision), b"fixture-new-hash")
+                .unwrap(),
+            GuardedAssignment::NotOwner
         );
         db.lock()
             .execute(
@@ -909,7 +1009,12 @@ mod tests {
         assert_eq!(
             db.detach_runner_if_current(&sid, "alice", revision)
                 .unwrap(),
-            GuardedDetach::NotMember
+            GuardedAssignment::NotMember
+        );
+        assert_eq!(
+            db.set_dedicated_token_guarded(&sid, "alice", None, b"fixture-new-hash")
+                .unwrap(),
+            GuardedAssignment::NotMember
         );
         assert_eq!(db.space_runner(&sid).unwrap(), SpaceRunner::Dedicated);
         assert_eq!(db.space_runner_generation(&sid).unwrap(), Some(generation));

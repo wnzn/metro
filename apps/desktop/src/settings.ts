@@ -59,7 +59,7 @@ export type { Capability, CatalogProvider, ConnectionModel, DeviceStatus, ModelT
 
 export type Reveal =
   | { kind: "runner"; reason: "created" | "rotated"; runnerId: string; runnerName: string; token: string }
-  | { kind: "dedicated"; spaceId: string; spaceName: string; token: string }
+  | { kind: "dedicated"; spaceId: string; spaceName: string; token: string; revision: string }
   /**
    * A device connection. `token` is the device token for a manual
    * metro-connector (unpackaged app only), or null in the packaged app: the
@@ -91,8 +91,8 @@ function reveal(next: Reveal) {
 }
 
 /** Receive a just-issued token from the still-open, owner-only Runner page. */
-export function revealDedicatedToken(spaceId: string, spaceName: string, token: string) {
-  reveal({ kind: "dedicated", spaceId, spaceName, token });
+export function revealDedicatedToken(spaceId: string, spaceName: string, token: string, revision: string) {
+  reveal({ kind: "dedicated", spaceId, spaceName, token, revision });
 }
 
 // ------------------------------------------------------------------ registered runners

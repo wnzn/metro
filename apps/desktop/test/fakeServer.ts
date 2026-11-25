@@ -74,6 +74,8 @@ export function fakeServer() {
     guardedDetachSupported: true,
     missingGuardedDetachRoute: false,
     beforeGuardedDetach: null as ((sid: string) => void) | null,
+    guardedTokenChanges: true,
+    beforeGuardedTokenChange: null as ((sid: string) => void) | null,
     runnerRelease: new Map<string, { presence: Record<string, unknown>; update: Record<string, unknown> }>(),
     rejectRunnerUpdate: new Set<string>(),
     connections: new Map<string, Conn>(),
@@ -499,6 +501,17 @@ export function fakeServer() {
         assignmentRevision(space);
         return ok({});
       }
+      if (req.method === "POST" && (rest === "/runner-token/issue-if-empty" || rest === "/runner-token/rotate-if-current")) {
+        if (!state.guardedTokenChanges) return err(404, "unknown route");
+        state.beforeGuardedTokenChange?.(space.id);
+        if (!space.members.has(user)) return err(404, "no such Space");
+        if (space.owner !== user) return err(403, "only the owner manages the runner");
+        const issue = rest.endsWith("issue-if-empty");
+        const confirmed = issue ? !space.runnerToken : !!space.runnerToken && assignmentRevision(space) === body?.assignment_revision;
+        if (!confirmed || state.attached.has(space.id)) return err(409, "the runner assignment changed");
+        space.runnerToken = `secret-runner-token-${nextId++}`;
+        return ok({ token: space.runnerToken, assignment_revision: assignmentRevision(space) });
+      }
       if (rest === "/runner/attach-if-empty" && req.method === "POST") {
         if (!state.attachIfEmpty || state.missingEmptyAttachRoute) return err(404, "unknown route");
         if (!owner) return err(403, "only the owner manages the runner");
@@ -526,7 +539,11 @@ export function fakeServer() {
       if (rest === "/runner") {
         if (req.method === "GET") {
           const runner = spaceRunnerJson(space);
-          return ok({ runner, ...(owner && runner && state.guardedDetachSupported ? { assignment_revision: assignmentRevision(space) } : {}) });
+          return ok({
+            runner,
+            ...(owner && runner && state.guardedDetachSupported ? { assignment_revision: assignmentRevision(space) } : {}),
+            ...(owner && state.guardedTokenChanges ? { guarded_token_changes: true } : {}),
+          });
         }
         if (!owner) return err(403, "only the owner manages the runner");
         if (req.method === "PUT") {

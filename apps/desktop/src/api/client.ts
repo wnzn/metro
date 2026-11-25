@@ -499,6 +499,19 @@ export function createClient(options: ClientOptions) {
     return { runners: data.runners.filter(isRegisteredRunner).map(toRegisteredRunner), attachIfEmpty: data.attach_if_empty === true };
   }
 
+  const isAssignmentRevision = (value: unknown): value is string =>
+    typeof value === "string" && /^(0|[1-9][0-9]{0,18})$/.test(value);
+
+  async function getSpaceRunnerAssignment(spaceId: string) {
+    const data = await request("GET", `${sp(spaceId)}/runner`);
+    if (!isObject(data) || !("runner" in data)) throw new ApiError("protocol", "GET …/runner did not return { runner }.");
+    const runner = toSpaceRunner(data.runner);
+    return {
+      runner: runner && isAssignmentRevision(data.assignment_revision) ? { ...runner, assignmentRevision: data.assignment_revision } : runner,
+      guardedTokenChanges: data.guarded_token_changes === true,
+    };
+  }
+
   return {
     baseUrl: options.baseUrl,
     // Search and scheduled prompts (src/api/discovery.ts), on the same transport.
@@ -547,14 +560,8 @@ export function createClient(options: ClientOptions) {
       await request("DELETE", `/v1/runners/${encodeURIComponent(runnerId)}`);
     },
 
-    async getSpaceRunner(spaceId: string): Promise<SpaceRunner | null> {
-      const data = await request("GET", `${sp(spaceId)}/runner`);
-      if (!isObject(data) || !("runner" in data)) throw new ApiError("protocol", "GET …/runner did not return { runner }.");
-      const runner = toSpaceRunner(data.runner);
-      const revision = data.assignment_revision;
-      return runner && typeof revision === "string" && /^(0|[1-9][0-9]{0,18})$/.test(revision)
-        ? { ...runner, assignmentRevision: revision } : runner;
-    },
+    getSpaceRunnerAssignment,
+    async getSpaceRunner(spaceId: string): Promise<SpaceRunner | null> { return (await getSpaceRunnerAssignment(spaceId)).runner; },
 
     async attachRunner(spaceId: string, runnerId: string): Promise<SpaceRunner | null> {
       const data = await request("PUT", `${sp(spaceId)}/runner`, { runner_id: runnerId });
@@ -746,17 +753,15 @@ export function createClient(options: ClientOptions) {
       await request("DELETE", `${sp(spaceId)}/members`, { user_id: userId });
     },
 
-    /** Issues (or rotates) the space's runner token. The caller must not keep it longer than it is shown. */
-    async issueRunnerToken(spaceId: string): Promise<string> {
-      const data = await request("POST", `${sp(spaceId)}/runner-token`, {});
-      if (!isObject(data) || typeof data.token !== "string" || !data.token) {
-        throw new ApiError("protocol", "POST …/runner-token did not return { token }.");
+    /** Guarded only: issue to an empty Space or rotate the dedicated revision shown. */
+    async changeDedicatedToken(spaceId: string, change: { kind: "issue" } | { kind: "rotate"; revision: string }) {
+      const route = change.kind === "issue" ? "issue-if-empty" : "rotate-if-current";
+      const data = await request("POST", `${sp(spaceId)}/runner-token/${route}`,
+        change.kind === "issue" ? {} : { assignment_revision: change.revision });
+      if (!isObject(data) || !isToken(data.token) || !isAssignmentRevision(data.assignment_revision)) {
+        throw new ApiError("protocol", "The server did not confirm the dedicated token change.");
       }
-      return data.token;
-    },
-
-    async revokeRunnerToken(spaceId: string): Promise<void> {
-      await request("DELETE", `${sp(spaceId)}/runner-token`);
+      return { token: data.token, revision: data.assignment_revision };
     },
 
     async listRooms(spaceId: string): Promise<Room[]> {

@@ -439,6 +439,104 @@ test("a dedicated token starts masked and cannot be recovered by reopening Runne
   expect(app.shows("id:copy-runner-token")).toBe(false);
 });
 
+test("issue refuses both kinds of runner paired before the guarded request commits", async () => {
+  for (const kind of ["registered", "dedicated"]) {
+    const w = spaceWorld();
+    w.f.addSpace("empty", "Empty", "alice");
+    const r = w.f.addRunner("Racing runner", "personal", "alice");
+    const dedicated = "fixture-concurrent-pair";
+    const app = await signIn(w);
+    await openSettingsFor(app, "empty");
+    await app.press("id:space-settings-tab:runner");
+    await app.press("id:space-runner-advanced:toggle");
+    w.f.state.beforeGuardedTokenChange = (sid) => {
+      if (kind === "registered") w.f.state.attached.set(sid, r.id);
+      else w.f.state.spaces.get(sid)!.runnerToken = dedicated;
+    };
+    await app.press("id:issue-runner-token");
+    await app.waitFor("id:manage-error");
+    const status = kind === "registered" ? "Attached · Racing runner" : "Dedicated token";
+    await app.waitFor(`id:space-runner-status >> text:${status}`);
+    expect(app.shows("id:token-reveal")).toBe(false);
+    expect(w.f.state.attached.get("empty")).toBe(kind === "registered" ? r.id : undefined);
+    expect(w.f.state.spaces.get("empty")!.runnerToken === (kind === "dedicated" ? dedicated : null)).toBe(true);
+    expect(w.f.posts().map((p) => p.path)).toEqual(["/v1/spaces/empty/runner-token/issue-if-empty"]);
+  }
+});
+
+test("a server without guarded token changes receives no dedicated token write", async () => {
+  const w = spaceWorld();
+  w.f.addSpace("empty", "Empty", "alice");
+  w.f.state.guardedTokenChanges = false;
+  const app = await signIn(w);
+  for (const sid of ["empty", "acme"]) {
+    await openSettingsFor(app, sid);
+    await app.press("id:space-settings-tab:runner");
+    await app.press("id:space-runner-advanced:toggle");
+    await app.waitFor("id:space-runner-token-change-unavailable");
+    expect(app.shows("id:issue-runner-token")).toBe(false);
+    await app.press("id:space-settings-close");
+  }
+  expect(w.f.posts()).toEqual([]);
+});
+
+test("rotate refuses a dedicated revision revoked or rotated after the confirmation opened", async () => {
+  for (const revoked of [true, false]) {
+    const w = spaceWorld();
+    const changed = revoked ? null : "fixture-concurrent-rotation";
+    const app = await signIn(w);
+    await openSettingsFor(app);
+    await app.press("id:space-settings-tab:runner");
+    await app.press("id:space-runner-advanced:toggle");
+    await app.press("id:issue-runner-token");
+    expect(w.f.posts()).toEqual([]); // The prompt itself is only a review.
+    w.f.state.beforeGuardedTokenChange = (sid) => { w.f.state.spaces.get(sid)!.runnerToken = changed; };
+    await app.press("id:issue-runner-token:confirm");
+    await app.waitFor("id:manage-error");
+    await app.waitFor(`id:space-runner-status >> text:${revoked ? "No runner" : "Dedicated token"}`);
+    expect(app.shows("id:token-reveal")).toBe(false);
+    expect(app.shows("id:issue-runner-token:confirm")).toBe(false);
+    expect(w.f.state.spaces.get("acme")!.runnerToken === changed).toBe(true);
+    expect(w.f.posts().map((p) => p.path)).toEqual(["/v1/spaces/acme/runner-token/rotate-if-current"]);
+  }
+});
+
+test("a delayed or missing token receipt never reveals a superseded token or retries the write", async () => {
+  for (const mode of ["changed", "lost", "scope left"]) {
+    const w = spaceWorld();
+    const key = `POST ${BASE}/v1/*`;
+    const respond = w.network[key]!;
+    const route = "/v1/spaces/acme/runner-token/rotate-if-current";
+    w.network[key] = (req) => {
+      const reply = respond(req);
+      if (new URL(req.url).pathname !== route) return reply;
+      return mode === "lost" ? { status: 200, body: {}, delay: 800 } : { ...(reply as object), delay: 800 };
+    };
+    const app = await signIn(w, "alice", true);
+    await openSettingsFor(app);
+    await app.press("id:space-settings-tab:runner");
+    await app.press("id:space-runner-advanced:toggle");
+    await app.press("id:issue-runner-token");
+    await app.press("id:issue-runner-token:confirm");
+    await app.waitUntil(() => w.f.posts().some((p) => p.path === route));
+    const candidate = w.f.state.spaces.get("acme")!.runnerToken!;
+    if (mode === "changed") w.f.state.spaces.get("acme")!.runnerToken = "fixture-newer-dedicated";
+    if (mode === "scope left") await app.press("id:space-settings-tab:members");
+    await app.clock!.runFor(800);
+    if (mode === "scope left") {
+      await app.press("id:space-settings-tab:runner");
+      await app.waitFor("id:space-runner-status >> text:Dedicated token");
+    } else {
+      await app.waitFor("id:manage-error");
+      expect(app.texts().join(" ")).toContain(mode === "lost" ? "Check the current runner before deciding" : "No token was shown");
+    }
+    expect(app.shows("id:token-reveal")).toBe(false);
+    expect(app.texts().some((t) => t.includes(candidate))).toBe(false);
+    expect(JSON.stringify(app.storage()).includes(candidate)).toBe(false);
+    expect(w.f.posts().map((p) => p.path)).toEqual([route]);
+  }
+});
+
 test("the owner adds an agent with live handle checks, makes it the default and deletes the other", async () => {
   const w = spaceWorld();
   const app = await signIn(w);

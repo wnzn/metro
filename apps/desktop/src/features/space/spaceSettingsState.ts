@@ -62,13 +62,13 @@ export const rosterError = signal<string | null>(null);
 export const memberBusy = signal<string | null>(null);
 export const memberNotice = signal<{ ok: boolean; message: string } | null>(null);
 
-type RunnerSnapshot = { runner: SpaceRunner | null; legacy: boolean };
-const runnerSource = signal<{ sid: string; legacy: boolean } | null>(null);
+type RunnerSnapshot = { runner: SpaceRunner | null; legacy: boolean; guardedTokenChanges: boolean };
+const runnerSource = signal<(Omit<RunnerSnapshot, "runner"> & { sid: string }) | null>(null);
 export const runnerSnapshot = computed<RunnerSnapshot | null>(() => {
   const source = runnerSource();
   if (!source) return null;
   const runner = spaceRunners()[source.sid];
-  return runner === undefined ? null : { runner, legacy: source.legacy };
+  return runner === undefined ? null : { runner, legacy: source.legacy, guardedTokenChanges: source.guardedTokenChanges };
 });
 export const runnerError = signal<string | null>(null);
 export const runnerInventory = signal<{ attachIfEmpty: boolean; runners: RegisteredRunner[] } | null>(null);
@@ -353,14 +353,14 @@ const canAttach = (r: RegisteredRunner) => r.visibility === "organization" || r.
 
 async function readRunner(api: Client, sid: string): Promise<RunnerSnapshot> {
   try {
-    return { runner: await api.getSpaceRunner(sid), legacy: false };
+    return { ...await api.getSpaceRunnerAssignment(sid), legacy: false };
   } catch (error) {
     if (!(error instanceof ApiError) || error.kind !== "not_found") throw error;
     // Older servers lack GET …/runner. Prove access before showing any
     // fallback from the Space record; a revoked membership also returns 404.
     const space = (await api.listSpaces()).find((s) => s.id === sid);
     if (!space) throw error;
-    return { runner: space.runnerPaired ? dedicatedRunner : null, legacy: true };
+    return { runner: space.runnerPaired ? dedicatedRunner : null, legacy: true, guardedTokenChanges: false };
   }
 }
 
@@ -373,7 +373,7 @@ async function refreshAssignment(api: Client, sid: string, current: () => boolea
     batch(() => {
       rememberSpaceRunner(sid, next.runner);
       if (show()) {
-        runnerSource.set({ sid, legacy: next.legacy });
+        runnerSource.set({ sid, legacy: next.legacy, guardedTokenChanges: next.guardedTokenChanges });
         runnerError.set(null);
       }
     });
@@ -432,7 +432,23 @@ type RunnerAction =
   | { kind: "attach"; id: string; installed: boolean }
   | { kind: "detach"; id: string; revision: string }
   | { kind: "revoke"; revision: string }
-  | { kind: "issue" | "rotate" };
+  | { kind: "issue" }
+  | { kind: "rotate"; revision: string };
+
+// A later local read/write can invalidate a reveal even after it first opened.
+export function dedicatedRevealIsCurrent() {
+  const reveal = revealed();
+  const r = runnerSnapshot()?.runner;
+  return reveal?.kind === "dedicated" && reveal.spaceId === spaceSettingsFor() &&
+    spaceSettingsSection() === "runner" && runnerAdvanced() && isSettingsOwner() &&
+    r?.kind === "dedicated" && r.assignmentRevision === reveal.revision;
+}
+
+effect(() => {
+  if (revealed()?.kind === "dedicated" && !dedicatedRevealIsCurrent()) untracked(dismissReveal);
+});
+
+const tokenUnconfirmed = "Metro couldn’t confirm the token change. Check the current runner before deciding what to do next. An issued token can’t be recovered here.";
 
 export async function changeRunner(action: RunnerAction): Promise<void> {
   const api = apiClient();
@@ -447,11 +463,13 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
   const stillConsented = () => live() && (!dedicatedAction || (runnerAdvanced() && advancedGeneration === advanced));
   if (!stillConsented()) return;
   const guardedRemoval = action.kind === "detach" || action.kind === "revoke";
+  const tokenChange = action.kind === "issue" || action.kind === "rotate";
   const expected = (runner: SpaceRunner | null) =>
     action.kind === "attach" || action.kind === "issue" ? runner === null :
       action.kind === "detach" ? runner?.kind === "registered" && runner.id === action.id : runner?.kind === "dedicated";
   if (!expected(before.runner)) return;
-  if (guardedRemoval && before.runner?.assignmentRevision !== action.revision) return;
+  if ((guardedRemoval || action.kind === "rotate") && before.runner?.assignmentRevision !== action.revision) return;
+  if (tokenChange && !before.guardedTokenChanges) return;
   if (action.kind === "attach" && (before.legacy || !runnerInventory()?.attachIfEmpty || !runnerInventory()?.runners.some((r) => r.id === action.id))) return;
   const installed = action.kind === "attach" && action.installed ? snapshotInstalledRunner(action.id) : null;
   if (action.kind === "attach" && action.installed && !installed) return;
@@ -461,7 +479,7 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
   let pendingWrite: (() => boolean) | undefined;
   const writeCurrent = () => !!pendingWrite?.() && owns();
   try {
-    let token: string | null = null;
+    let receipt: { token: string; revision: string } | null = null;
     if (action.kind === "attach") {
       const inventoryRequest = ++inventoryRead;
       const inventory = await api.listRunnerInventory();
@@ -476,37 +494,49 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       }
       pendingWrite = beginSpaceRunnerWrite(sid);
       await api.attachRunnerIfEmpty(sid, action.id);
-      if (installed?.isCurrent()) dismissRunnerOffer();
     } else if (guardedRemoval) {
       pendingWrite = beginSpaceRunnerWrite(sid);
       await api.detachRunnerIfCurrent(sid, action.revision);
     } else {
-      const current = await refreshAssignment(api, sid, stillConsented, live);
-      if (!current || !stillConsented()) return;
-      if (!expected(current.runner)) return reject("This Space's runner changed. Nothing was changed by this action.");
       pendingWrite = beginSpaceRunnerWrite(sid);
-      token = await api.issueRunnerToken(sid);
+      receipt = await api.changeDedicatedToken(sid, action);
     }
     if (!writeCurrent()) return;
     // A delayed write reply describes history, not the current assignment.
     // Use the shared exact-Space guards even when the originating page closed.
     const actual = await refreshAssignment(api, sid, writeCurrent, live);
-    if (!actual) return;
+    if (!actual) {
+      if (receipt && writeCurrent() && stillConsented()) reject(tokenUnconfirmed);
+      return;
+    }
     const r = actual.runner;
+    if (!live() || !writeCurrent()) return;
+    // Don't associate a credential or an installed-runner side effect with a
+    // newer assignment that was already published by another request.
+    if (spaceRunners()[sid] !== r) {
+      if (receipt && stillConsented()) reject(tokenUnconfirmed);
+      return;
+    }
     const confirmed = action.kind === "attach" ? r?.kind === "registered" && r.id === action.id :
-      action.kind === "detach" || action.kind === "revoke" ? r === null : r?.kind === "dedicated";
-    if (!confirmed) return reject("The runner assignment changed. Check the current runner above.");
+      guardedRemoval ? r === null : !!receipt && r?.kind === "dedicated" && r.assignmentRevision === receipt.revision;
+    if (!confirmed) return reject(tokenChange
+      ? "The runner assignment changed after the token request. No token was shown. Review the current runner above."
+      : "The runner assignment changed. Check the current runner above.");
     if (action.kind === "attach" && installed?.isCurrent()) {
       const space = spaces().find((s) => s.id === sid && s.role === "owner");
-      if (space) recordAttachedFolder(space);
+      if (space) {
+        dismissRunnerOffer();
+        recordAttachedFolder(space);
+      }
     }
-    if (!live() || !writeCurrent()) return;
     const message = action.kind === "attach" ? `Attached “${r?.name}”. This Space now sends its runner jobs there.` :
       action.kind === "detach" ? "Runner detached from this Space. Its other Spaces are unchanged." :
         action.kind === "revoke" ? "Dedicated token revoked. The runner can no longer serve this Space." :
           "Dedicated token issued. Rotate it if you need a new copy.";
     runnerNotice.set({ ok: true, message });
-    if (token && stillConsented()) revealDedicatedToken(sid, settingsSpace()?.name ?? sid, token);
+    if (receipt && stillConsented() && writeCurrent() && spaceRunners()[sid] === r) {
+      revealDedicatedToken(sid, settingsSpace()?.name ?? sid, receipt.token, receipt.revision);
+    }
   } catch (error) {
     if (!live() || (pendingWrite && !pendingWrite()) || isAborted(error)) return;
     if (error instanceof ApiError && error.kind === "auth") {
@@ -514,13 +544,18 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       return;
     }
     // Don't echo server bodies from runner mutations, including token endpoints.
-    if (guardedRemoval && error instanceof ApiError && error.status === 409) {
+    if ((guardedRemoval || tokenChange) && error instanceof ApiError && error.status === 409) {
       // Hide the old revision immediately; a new confirmation must show a
       // fresh assignment, not the one the server already rejected.
       runnerSource.set(null);
-      reject("The runner assignment changed. Nothing was removed. Review the current runner before confirming again.");
-    } else if (guardedRemoval && error instanceof ApiError && (error.status === 404 || error.status === 405)) {
-      reject("The guarded removal route is unavailable. No unguarded removal was attempted.");
+      reject(tokenChange ? "The runner assignment changed. No token was issued or rotated by this request. Review the current runner."
+        : "The runner assignment changed. Nothing was removed. Review the current runner before confirming again.");
+    } else if ((guardedRemoval || tokenChange) && error instanceof ApiError && (error.status === 404 || error.status === 405)) {
+      reject(tokenChange ? "Guarded token changes are unavailable. No unguarded token change was attempted."
+        : "The guarded removal route is unavailable. No unguarded removal was attempted.");
+    } else if (tokenChange && !(error instanceof ApiError && error.kind === "forbidden")) {
+      runnerSource.set(null);
+      reject(tokenUnconfirmed);
     } else {
       reject(error instanceof ApiError && error.status === 409
         ? "This Space already has a runner or its assignment changed. No replacement was made."
@@ -528,7 +563,7 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
           ? "Only the owner can change this."
           : "The server did not confirm the runner change. Check its status before trying again.");
     }
-    await loadRunner();
+    await loadRunner(pendingWrite ? writeCurrent : undefined);
   } finally {
     if (page()) runnerBusy.set(null);
   }
