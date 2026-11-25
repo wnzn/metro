@@ -1,5 +1,8 @@
 # Installers: desktop and runners
 
+This guide uses published installers. The [update controls and Linux
+journal diagnostic](updates.md) are in the source, not released.
+
 > **Latest release: [Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0)**
 > (2026-11-25, from `1a743e5`). Releases are published automatically when a
 > version bump is merged into the protected `main` branch

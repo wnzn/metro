@@ -1,5 +1,8 @@
 # Metro desktop
 
+For changes since the published 0.4.0 app, see
+[In the source, not released](../../docs/next-source.md).
+
 The Metro desktop client, written in TSX on [Native Shell (NSH)](https://nsh.dev).
 NSH renders it with each platform's own views: GTK 4 on Linux, AppKit on macOS,
 and Win32 on Windows. No npm or Node is needed to build or run it.

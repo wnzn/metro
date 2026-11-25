@@ -1,5 +1,10 @@
 # Settings: model connections, appearance and org admins
 
+This guide uses the published 0.4.0 Settings. For the reorganized
+[Settings pages](next-source.md#settings), [Web search and privacy](web-search.md)
+and [About & updates](updates.md), see the source-only guides. They don't
+describe the 0.4.0 app.
+
 The desktop app's **Settings** opens as a window over the app, with five
 sections in this order (as verified in the 0.2.0 Linux candidate):
 

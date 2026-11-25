@@ -103,6 +103,30 @@ anyone outside the release workflow; macOS (not built); real vendor
 accounts and sign-ins; pretrained `google/embeddinggemma-2` ranking.
 Windows files carry no Authenticode signature.
 
+## Source only: documentation cut at d82c07f
+
+The [source preview](next-source.md) was checked against merged source
+`d82c07fed0e4232a45154066ec8430eb2f11ae70`. The documentation pass
+checked local Markdown links and anchors and ran `git diff --check`.
+It did not run builds, runtime tests, live services, or release checks.
+The updater results below belong to the earlier cuts named there;
+they are not acceptance for this source.
+
+**Documentation follow-ups, after integration:**
+
+- Unified Space settings (U9): update owner/member navigation,
+  old deep links and the runner recovery entry point.
+- Composer and mentions (U11): document name and ID resolution,
+  ambiguity handling, and recipient display only after desktop wiring
+  and verification.
+- Notices (U12): document the sender-only classification and routing
+  feedback and its lifetime after the UI is wired and verified.
+- Startup medium: update contributor and troubleshooting docs only for
+  merged changes with measured evidence.
+- Final acceptance: record the exact verified integration commit,
+  checks and exceptions. Update published instructions and release
+  facts only after publication is recorded.
+
 ## Source only: updater lane and reviewed integration (2026-11-25, local)
 
 Local merge on `lane/updates-backend` of approved updater
