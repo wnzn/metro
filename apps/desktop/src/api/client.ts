@@ -921,6 +921,12 @@ export function createClient(options: ClientOptions) {
       }));
     },
 
+    async getRun(id: string, signal?: AbortSignal): Promise<Run> {
+      const run = await request("GET", `/v1/runs/${encodeURIComponent(id)}`, undefined, signal);
+      if (!isRun(run) || String(run.id) !== id) throw new ApiError("protocol", "Metro did not return the requested run.");
+      return { id, spaceId: String(run.space_id), roomId: String(run.room_id), status: run.status, actor: run.actor, task: run.task };
+    },
+
     /**
      * Adds or removes the user's reaction on an event. `scope` is the Chat or
      * a room; the server echoes it as a `reaction` event in the same stream.

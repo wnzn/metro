@@ -3,7 +3,7 @@ import { MAX_DEPTH, own, safeName, str } from "./renderPlan";
 
 /** A schedule can only invoke the Space's default agent in a normal room.
  * Find the matching literal button for a form prefill, not an execution. */
-export function answerSchedule(spec: PageSpec, key: string) {
+export function answerScheduling(spec: PageSpec, key: string) {
   let left = 400;
   const nodes: unknown[] = [];
   const visit = (items: unknown, depth: number) => {
@@ -35,5 +35,5 @@ export function answerSchedule(spec: PageSpec, key: string) {
     const prompt = str(own(action, "prompt"));
     return prompt ? [{ key: k, agent: agentId, prompt, roomId }] : [];
   });
-  if (candidates.length === 1) return candidates[0];
+  return { button: candidates.length === 1 ? candidates[0] : undefined };
 }

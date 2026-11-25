@@ -10,13 +10,14 @@ type Interactions = {
   data: PageValues | null;
   readOnly?: boolean;
   busy?: boolean;
+  waitingForAgent?: boolean;
   changed?: ReadonlySet<string>;
   onAction?: (key: string, kind: ActionKind) => void;
-  onEdit?: (key: string) => void;
+  onEdit?: (key: string, label: string) => void;
   onLink?: (url: string) => void;
   onFile?: (id: string) => void;
   onSchedule?: (block: string) => void;
-  canSchedule?: (block: string) => boolean;
+  scheduling?: (block: string) => "available" | "no-prompt" | undefined;
 };
 
 const toneOf = (v: unknown): Tone => v === "info" ? "system"
@@ -38,14 +39,21 @@ export function PageRenderer(props: Interactions & { spec: PageSpec; pending?: b
 
 function Block(props: { node: PlanBlock; interactions: Interactions }) {
   const key = () => props.node.key;
+  const name = () => blockLabel(props.node);
   return <If when={props.node.type !== "Show" || props.node.issue || props.node.children.length || (!!key() && props.interactions.onEdit)}>
-    <PageBlockFrame blockKey={key()} changed={!!key() && props.interactions.changed?.has(key()!)}
-      onEdit={key() && props.interactions.onEdit ? () => props.interactions.onEdit?.(key()!) : undefined}>
+    <PageBlockFrame blockKey={key()} blockLabel={name()} changed={!!key() && props.interactions.changed?.has(key()!)}
+      onEdit={key() && props.interactions.onEdit ? () => props.interactions.onEdit?.(key()!, name()) : undefined}>
       <If when={props.node.issue !== undefined} else={<BlockBody node={props.node} interactions={props.interactions} />}>
         <Label variant="caption" color="muted" testID="page-source-state">{props.node.issue}</Label>
       </If>
     </PageBlockFrame>
   </If>;
+}
+
+function blockLabel(node: PlanBlock) {
+  const type = node.type.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
+  const title = str(node.p.title) || str(node.p.label) || (node.type === "Heading" ? node.text : "");
+  return title ? `${type}: ${title.slice(0, 120)}` : `${type} block`;
 }
 
 function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
@@ -90,7 +98,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
       <PageChart points={n().points ?? []} label={label() || "Chart"} kind={p().kind === "bar" ? "bar" : "line"} />
     </If>;
     case "Table": return <If when={n().rows?.length} else={<Label color="muted">{empty()}</Label>}>
-      <PageTable headings={n().headings ?? []} rows={n().rows ?? []} />
+      <PageTable label={label()} headings={n().headings ?? []} rows={n().rows ?? []} />
     </If>;
     case "List": return <If when={n().children.length} else={<Label color="muted">{empty()}</Label>}>
       <Column gap={1}>{children()}</Column>
@@ -98,7 +106,9 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
     case "Each": case "Show": return <Column gap={2}>{children()}</Column>;
     case "AgentAnswer": {
       const answer = () => n().answer;
+      const scheduling = () => !props.interactions.readOnly && n().key ? props.interactions.scheduling?.(n().key!) : undefined;
       return <Column gap={2}>
+        <If when={scheduling()}><Label variant="meta">Latest room answer</Label></If>
         <If when={answer()} else={<Label color="muted">{empty("No answer yet.")}</Label>}>{item => <>
           <Row gap={2} align="center" wrap>
             <Badge tone={item().status.tone ?? "agent"} label={item().status.label} />
@@ -109,9 +119,10 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
           </If>
           <If when={item().error}>{t => <Label color="warning">{t()}</Label>}</If>
         </>}</If>
-        <If when={!props.interactions.readOnly && props.interactions.onSchedule && n().key && props.interactions.canSchedule?.(n().key!) ? n().key : undefined}>
-          {key => <Row><Action compact variant="ghost" label="Keep this answer fresh…" testID={`page-schedule:${key()}`} onPress={() => props.interactions.onSchedule?.(key())} /></Row>}
-        </If>
+        <If when={scheduling() === "available"}><Row><Action compact variant="ghost" label="Schedule brief…"
+          accessibilityLabel="Schedule a brief for this room answer" testID={`page-schedule:${n().key}`}
+          disabled={props.interactions.busy} onPress={() => { if (n().key) props.interactions.onSchedule?.(n().key!); }} /></Row></If>
+        <If when={scheduling() === "no-prompt"}><Label variant="caption" color="muted">Scheduling needs one matching agent button with a prompt.</Label></If>
       </Column>;
     }
     case "RunList": case "MessageFeed": case "ScheduleCard": case "FileList":
@@ -132,7 +143,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
                 }</If>
               </If>
               <If when={!props.interactions.readOnly && props.interactions.onFile ? item().fileId : undefined}>{id =>
-                <Row><Action compact variant="ghost" label="Open file" onPress={() => props.interactions.onFile?.(id())} /></Row>
+                <Row><Action compact variant="ghost" label="Open file" accessibilityLabel={`Open file: ${item().title || "Untitled"}`} onPress={() => props.interactions.onFile?.(id())} /></Row>
               }</If>
             </Surface>;
           }}</Each>
@@ -144,7 +155,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
       const reason = () => props.interactions.readOnly ? "Preview only" : n().disabledReason || "Action unavailable";
       return <Column gap={1} align="start">
         <Action testID={`page-action:${n().key}`} label={label() || "Action"} variant={n().type === "Link" ? "ghost" : tone() === "danger" ? "destructive" : tone() === "system" ? "primary" : "secondary"}
-          disabled={disabled() || props.interactions.busy}
+          disabled={disabled() || props.interactions.busy || (n().action === "runAgent" && props.interactions.waitingForAgent)}
           onPress={() => { if (!disabled() && !props.interactions.busy && n().key && n().action) props.interactions.onAction?.(n().key!, n().action!); }} />
         <If when={disabled()}><Label variant="caption" color="muted">{reason()}</Label></If>
       </Column>;
