@@ -414,16 +414,26 @@ export function openPlace(where: "search" | "library" | "pages" | "schedules") {
  * with a fresh membership-checked list before changing navigation. */
 export async function openExactRoom(spaceId: string, roomId: string, stillHere: () => boolean): Promise<boolean> {
   const c = client;
-  if (!c || !roomId || !spaces().some(s => s.id === spaceId)) return false;
+  if (!c || switchingSpace() || !roomId || !spaces().some(s => s.id === spaceId)) return false;
   const valid = guard(spaceId);
   const generation = navigationGeneration;
   const list = await c.listRooms(spaceId);
-  if (!valid() || generation !== navigationGeneration || !stillHere() || !list.some(r => r.id === roomId)) return false;
-  roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+  if (!valid() || switchingSpace() || generation !== navigationGeneration || !stillHere() || !list.some(r => r.id === roomId)) return false;
+  navigationGeneration++;
   lastRoomBySpace.set(spaceId, roomId);
-  await selectSpace(spaceId);
-  if (!valid() || basePlace() !== "space" || activeSpaceId() !== spaceId) return false;
-  selectRoom(roomId);
+  batch(() => {
+    clearTransient();
+    roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+    activeSpaceId.set(spaceId);
+    activeRoomId.set(roomId);
+    view.set("room");
+    settingsOpen.set(false);
+    basePlace.set("space");
+    actionError.set(null);
+    notice.set(null);
+  });
+  rememberSpace(spaceId);
+  kick();
   return true;
 }
 

@@ -5,12 +5,16 @@ import { ApiError, apiClient, describe, disconnect, isAborted, mainPlace, onSess
 export type PagesRoute =
   | { kind: "home"; spaceId?: string }
   | { kind: "page"; id: string; spaceId?: string }
-  | { kind: "draft"; id: string; spaceId?: string; returnPage?: string };
+  | { kind: "draft"; id: string; spaceId?: string; returnPage?: string; returnRoom?: string };
 
 const route = signal<PagesRoute>({ kind: "home" });
 const entries = signal<{ page: PageMeta; valid?: () => boolean }[]>([]);
+type DraftRoute = Extract<PagesRoute, { kind: "draft" }>;
+const draftLinks = signal<{ route: DraftRoute; valid: () => boolean }[]>([]);
 export const pagesRoute = computed(route);
 export const pages = computed(() => entries().filter(e => scopeVisible(e.page) && (e.valid?.() ?? true)).map(e => e.page));
+/** Session-only handles; no draft source, prompt, or preview is cached here. */
+export const recentPageDrafts = computed(() => draftLinks().filter(entry => hasSpace(entry.route.spaceId) && entry.valid()).map(entry => entry.route));
 export const pagesError = signal("");
 export const pagesLoading = signal(false);
 let listRequest = 0;
@@ -27,9 +31,14 @@ export function scopeVisible(page: { scope: string; space_id: string | null }) {
 export function goPages(next: PagesRoute = { kind: "home" }) {
   if (!apiClient() || !hasSpace(next.spaceId)) return;
   batch(() => {
+    if (next.kind === "draft") draftLinks.set([{ route: { ...next }, valid: sessionGuard(next.spaceId) }, ...draftLinks().filter(entry => entry.route.id !== next.id && entry.valid())].slice(0, 20));
     route.set(next);
     openPlace("pages");
   });
+}
+
+export function forgetPageDraft(id: string) {
+  draftLinks.set(draftLinks().filter(entry => entry.route.id !== id));
 }
 
 export function pageGuard(current: PagesRoute, spaceId = current.spaceId) {
@@ -73,6 +82,7 @@ export async function refreshPages() {
 onSessionEnd(() => {
   listRequest++;
   entries.set([]);
+  draftLinks.set([]);
   pagesError.set("");
   pagesLoading.set(false);
   route.set({ kind: "home" });

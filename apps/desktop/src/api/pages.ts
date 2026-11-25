@@ -75,8 +75,13 @@ export function targetOf(page: Pick<PageMeta, "scope" | "space_id">): PageTarget
 
 export function pagesApi(request: RequestFn) {
   const root = "/v1/pages";
-  const page = (id: string) => `${root}/${encodeURIComponent(id)}`;
-  const draft = (id: string) => `${root}/drafts/${encodeURIComponent(id)}`;
+  const segment = (id: string, kind: "page" | "draft") => {
+    const pattern = kind === "page" ? /^pg_[A-Za-z0-9_-]{1,96}$/ : /^pgd_[A-Za-z0-9_-]{1,96}$/;
+    if (!pattern.test(id)) throw new ApiError("protocol", `Invalid ${kind} identifier.`);
+    return id;
+  };
+  const page = (id: string) => `${root}/${segment(id, "page")}`;
+  const draft = (id: string) => `${root}/drafts/${segment(id, "draft")}`;
   // The transport parses JSON; the renderer separately treats the tree, data
   // paths and action capabilities as untrusted values.
   async function json<T>(method: Parameters<RequestFn>[0], path: string, body?: unknown): Promise<T> {
