@@ -38,7 +38,7 @@ own files.
 - **Native desktop app** with reactions, profiles, and dark and light themes.
 
 Several agents per Space, `@handle` addressing, per-Space classification and
-per-connection model lists are in the source for 0.4.0, not yet recorded as published.
+per-connection model lists are released in 0.4.0.
 
 Opt-in extras:
 
@@ -75,13 +75,13 @@ connects with the server's URL and their own token. Details:
 Send tokens only over loopback, an SSH port forward or HTTPS. The desktop
 app refuses plain `http://` to any other host.
 
-> **Latest release: [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2)**
-> (2026-11-24). Downloads: `Metro-0.3.2-linux-x64.tar.gz`,
-> `Metro-0.3.2-windows-x64.zip`, `Metro-0.3.2-windows-x64.unsigned-preview.msi`
-> and `Metro-runner-0.3.2-linux-x64.tar.gz` (each with a `.sha256`), the
+> **Latest release: [Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0)**
+> (2026-11-25). Downloads: `Metro-0.4.0-linux-x64.tar.gz`,
+> `Metro-0.4.0-windows-x64.zip`, `Metro-0.4.0-windows-x64.unsigned-preview.msi`
+> and `Metro-runner-0.4.0-linux-x64.tar.gz` (each with a `.sha256`), the
 > installer scripts, and `SHA256SUMS` with its Sigstore bundle. Images,
 > listed by digest in the release's `IMAGES.txt`:
-> `ghcr.io/wnzn/metro-server:v0.3.2` and `ghcr.io/wnzn/metro-runner:v0.3.2`
+> `ghcr.io/wnzn/metro-server:v0.4.0` and `ghcr.io/wnzn/metro-runner:v0.4.0`
 > (`linux/amd64`, `linux/arm64`). There's no macOS build for now. Windows
 > files are **unsigned** (no Authenticode signature), so expect SmartScreen
 > warnings and check them against the Sigstore-signed `SHA256SUMS`

@@ -258,17 +258,18 @@ runtime.
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
     milestones.
-  - **Metro 0.3.2 is published**: GitHub release `v0.3.2` (2026-11-24),
-    tag on `d943797`, made by CI run 45418420759, with Sigstore-signed
+  - **Metro 0.4.0 is published**: GitHub release `v0.4.0` (2026-11-25),
+    tag on `1a743e5`, made by CI run 45560122825, with Sigstore-signed
     `SHA256SUMS`, unsigned Windows files and GHCR images signed by the release workflow
-    (`docs/acceptance.md`). Native Windows by a person, real vendor
-    accounts and real sign-ins are still unverified.
-  - The latest gate on the source for 0.4.0, not yet recorded as published (4175475, several
-    agents per Space, per-connection model lists, the desktop redesign) is
-    staged, not a release: 686 Rust tests, eight e2e scripts (not
+    (`docs/acceptance.md`). Metro 0.3.2 (`v0.3.2` on `d943797`, CI run
+    45418420759) was the release before it. Native Windows by a person,
+    real vendor accounts and real sign-ins are still unverified.
+  - The latest gate (4175475, several agents per Space, per-connection
+    model lists, the desktop redesign) ran on local builds of source that
+    is now released in 0.4.0: 686 Rust tests, eight e2e scripts (not
     `library_reference.py`) and desktop `nsh test` 400/400, with no
-    packaging tests, real vendor run or native Windows check. None of the
-    0.3.0, 0.3.1 or 0.3.2 releases contains that staged source.
+    packaging tests, real vendor run or native Windows check. The 0.3.x
+    releases don't contain it.
   - Don't claim a real commercial provider, production auth, a release
     other than the recorded ones, pretrained `google/embeddinggemma-2` ranking quality, or
     native audio and video playback, seeking or the native file picker for
@@ -280,16 +281,16 @@ runtime.
   sidecar next to the desktop app. Source builds live only in
   [docs/development.md](docs/development.md). Docs point to the published
   release by the names and URLs recorded in `docs/acceptance.md`: the
-  current one is **Metro 0.3.2**
-  (https://github.com/wnzn/metro/releases/tag/v0.3.2, tag `v0.3.2` on
-  `d943797`), with `Metro-0.3.2-linux-x64.tar.gz`,
-  `Metro-0.3.2-windows-x64.zip`,
-  `Metro-0.3.2-windows-x64.unsigned-preview.msi`,
-  `Metro-runner-0.3.2-linux-x64.tar.gz` (each with `.sha256`), the
+  current one is **Metro 0.4.0**
+  (https://github.com/wnzn/metro/releases/tag/v0.4.0, tag `v0.4.0` on
+  `1a743e5`), with `Metro-0.4.0-linux-x64.tar.gz`,
+  `Metro-0.4.0-windows-x64.zip`,
+  `Metro-0.4.0-windows-x64.unsigned-preview.msi`,
+  `Metro-runner-0.4.0-linux-x64.tar.gz` (each with `.sha256`), the
   installer scripts, `SHA256SUMS` with its Sigstore bundle, `IMAGES.txt`,
-  and the images `ghcr.io/wnzn/metro-server:v0.3.2`,
-  `ghcr.io/wnzn/metro-runner:v0.3.2` and
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.3.2` (pinned by digest). Windows
+  and the images `ghcr.io/wnzn/metro-server:v0.4.0`,
+  `ghcr.io/wnzn/metro-runner:v0.4.0` and
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.4.0` (pinned by digest). Windows
   files are **unsigned** (no Authenticode). Docs never present source
   that came after a release's commit as part of that release; label it
   "in the source, not released". A newer release is named in docs only

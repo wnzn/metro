@@ -8,10 +8,11 @@
 > is a historical milestone.
 > The earlier [System One milestone gate](acceptance.md#historical-final-gate-for-the-system-one-milestone-2026-11-22-independent-reviewer-local),
 > with 403 Rust tests, is kept as a record.
-> The latest [staged gate on unreleased source](acceptance.md#staged-spaces-with-several-agents-per-connection-model-lists-and-the-desktop-redesign-at-4175475-2026-11-25-project-manager-local)
+> The latest [staged gate](acceptance.md#staged-spaces-with-several-agents-per-connection-model-lists-and-the-desktop-redesign-at-4175475-2026-11-25-project-manager-local)
 > (686 Rust tests, eight e2e scripts including `intelligence.py`, desktop
 > `nsh test` 400/400) covers per-Space classification over a Space's agents.
-> It isn't a release, and the published 0.3.2 release doesn't contain it.
+> It wasn't run on release files; its source (`4175475`) is part of the
+> published 0.4.0 release, not of 0.3.2.
 >
 > - Every part is documented from its code.
 > - `tests/e2e/intelligence.py` passed against the primary workspace's

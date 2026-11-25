@@ -171,7 +171,7 @@ your own, or one shared with this Space or the organization. It's checked
 when you save and again on every run. The order a run's model is chosen in
 is in [settings.md](settings.md#which-model-a-run-uses).
 
-**In the desktop app** (in the source for 0.4.0, not yet recorded as published), a Space's
+**In the desktop app** (released in 0.4.0), a Space's
 settings window has four pages: **General** (name and description; **Leave
 Space…** for members, **Delete Space…** with the typed name for the owner),
 **Members and runner** (a link to the owner's member and runner

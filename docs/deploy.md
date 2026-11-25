@@ -5,27 +5,27 @@ source is for contributors: [development.md](development.md).
 
 ## Release files and images
 
-> **Latest release: [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2)**,
-> published 2026-11-24 from commit `d943797` of
+> **Latest release: [Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0)**,
+> published 2026-11-25 from commit `1a743e5` of
 > <https://github.com/wnzn/metro>. Releases are published automatically
 > when a version bump is merged into the protected `main` branch
 > ([CI and publishing](#ci-and-publishing)). Each release file comes with a
 > `.sha256` file beside it. The full release file list, including the MSI,
 > is in [install.md](install.md#official-releases); what was checked is in
-> [acceptance](acceptance.md#published-metro-032-2026-11-24-github-release-v032).
+> [acceptance](acceptance.md#published-metro-040-2026-11-25-github-release-v040).
 > The image digests are in the release's
-> [`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.3.2/IMAGES.txt).
+> [`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.4.0/IMAGES.txt).
 
-| Part | Where | Name in 0.3.2 |
+| Part | Where | Name in 0.4.0 |
 | --- | --- | --- |
-| Server image | GitHub Container Registry | `ghcr.io/wnzn/metro-server:v0.3.2` (`linux/amd64`, `linux/arm64`) |
-| Runner image | GitHub Container Registry | `ghcr.io/wnzn/metro-runner:v0.3.2` (`linux/amd64`, `linux/arm64`) |
-| Media embedding image (optional) | GitHub Container Registry | `ghcr.io/wnzn/metro-embeddinggemma2:v0.3.2` (`linux/amd64`, no weights) |
-| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases/tag/v0.3.2) | `Metro-0.3.2-windows-x64.zip` and `Metro-0.3.2-windows-x64.unsigned-preview.msi` (+ `.sha256`), **unsigned** |
-| Desktop, Linux x64 | Releases | `Metro-0.3.2-linux-x64.tar.gz` (+ `.sha256`) |
-| Runner, Linux x64 binary | Releases | `Metro-runner-0.3.2-linux-x64.tar.gz` (+ `.sha256`) |
+| Server image | GitHub Container Registry | `ghcr.io/wnzn/metro-server:v0.4.0` (`linux/amd64`, `linux/arm64`) |
+| Runner image | GitHub Container Registry | `ghcr.io/wnzn/metro-runner:v0.4.0` (`linux/amd64`, `linux/arm64`) |
+| Media embedding image (optional) | GitHub Container Registry | `ghcr.io/wnzn/metro-embeddinggemma2:v0.4.0` (`linux/amd64`, no weights) |
+| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases/tag/v0.4.0) | `Metro-0.4.0-windows-x64.zip` and `Metro-0.4.0-windows-x64.unsigned-preview.msi` (+ `.sha256`), **unsigned** |
+| Desktop, Linux x64 | Releases | `Metro-0.4.0-linux-x64.tar.gz` (+ `.sha256`) |
+| Runner, Linux x64 binary | Releases | `Metro-runner-0.4.0-linux-x64.tar.gz` (+ `.sha256`) |
 
-`<tag>` is the release tag, `v` plus the version (for example `v0.3.2`).
+`<tag>` is the release tag, `v` plus the version (for example `v0.4.0`).
 The Windows files ship without an Authenticode signature until a
 code-signing certificate is set up
 ([Windows releases](#windows-releases-signed-or-unsigned)); expect
@@ -245,9 +245,10 @@ verified so far is in [acceptance.md](acceptance.md).
 
 ### Releases from `main` on a version bump
 
-This process published Metro 0.3.2 from `d943797` in CI run
-[45418420759](https://github.com/wnzn/metro/actions/runs/45418420759)
-([acceptance](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
+This process published Metro 0.4.0 from `1a743e5` in CI run
+[45560122825](https://github.com/wnzn/metro/actions/runs/45560122825)
+([acceptance](acceptance.md#published-metro-040-2026-11-25-github-release-v040)), and Metro 0.3.2 from `d943797`
+before it ([acceptance](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
 
 `packaging/release_policy.py` decides. A release runs only for a
 **protected, non-deleted, non-forced push to `refs/heads/main`** of
@@ -321,7 +322,7 @@ Image and file signatures are bound to `refs/heads/main` and to the exact
 commit. A rerun after a failure resumes, and a rerun after success changes
 nothing. A prerelease version is never marked latest.
 
-A release needs this setup, which was in place for 0.3.2:
+A release needs this setup, which was in place for 0.3.2 and 0.4.0:
 
 - **The `main` branch,** the repository's default branch, protected against
   deletion and force pushes. Changes, including version bumps, arrive

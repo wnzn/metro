@@ -1,7 +1,8 @@
 # Documents & media
 
 > **Status: verified locally with fixtures.** It's in the published
-> [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2) code;
+> [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2) and
+> [0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0) code;
 > the checks below were local runs, not runs of the release files. It's part of the
 > [final local gate](acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local):
 > 497 Rust tests, all seven e2e scripts (`library.py` ran twice), the 83
@@ -34,7 +35,7 @@
 >     no weights have been downloaded,
 >   - native audio or video playback or seeking, or the native file picker
 >     (portal), and
->   - any run of the 0.3.2 release files or images with this feature.
+>   - any run of the 0.3.2 or 0.4.0 release files or images with this feature.
 > - **Desktop:** `nsh check` is clean, and `nsh test .` passed 106/106 twice.
 >   Six native Linux screenshots were taken against the real server, with a
 >   scripted media endpoint. See [In the desktop app](#in-the-desktop-app).
@@ -737,7 +738,7 @@ around `google/embeddinggemma-2`. Upload, listing, preview and download work
 without one.
 
 - **The reference service image is published** as
-  `ghcr.io/wnzn/metro-embeddinggemma2:v0.3.2` (`linux/amd64` only, no
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.4.0` (`linux/amd64` only, no
   weights; pin the digest from the release's `IMAGES.txt`). Running that
   image from the registry hasn't been recorded, and this page doesn't yet
   describe running it outside the `compose.media.yaml` override, which
@@ -790,7 +791,7 @@ This page doesn't claim any of the following until a run is recorded in
 - Native audio or video playback or seeking in the desktop app, and the
   desktop on macOS or Windows.
 - A native (portal) file-picker upload. It was tested headless only.
-- Any run of the published 0.3.2 files or images with this feature,
+- Any run of the published 0.3.2 or 0.4.0 files or images with this feature,
   including the `metro-embeddinggemma2` image.
 - The real-weight smoke, or any run with pretrained weights, and its
   timings, memory and ranking. **No real retrieval quality has been
