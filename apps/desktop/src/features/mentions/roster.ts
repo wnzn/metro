@@ -1,6 +1,5 @@
 import { signal } from "nsh";
-import { activeSpaceId, inSpaceComposer, me, members, membersError, mentionVisitGuard, mentionVisitVerified, registerMentionDirectory, status } from "../../store";
-import { personState, profileName } from "../profile/profileState";
+import { activeSpaceId, inSpaceComposer, me, members, membersError, mentionMemberNames, mentionVisitGuard, mentionVisitVerified, registerMentionDirectory, status } from "../../store";
 import { agentList, loadSpaceAgentsForVisit } from "../space/agents";
 import type { MentionDirectory } from "./draft";
 
@@ -24,16 +23,9 @@ export function verifiedAgents(sid: string) {
 }
 
 export function spaceMentionDirectory(sid: string): MentionDirectory | null {
-  const people = verifiedMembers(sid), agents = verifiedAgents(sid);
+  const people = mentionMemberNames(sid), agents = verifiedAgents(sid);
   if (!people || !agents) return null;
-  // A loaded profile with no name (or a permission-checked 404) is
-  // different from a name that is still arriving. A partial directory could
-  // silently resolve a short id that is the prefix of a longer name.
-  if (people.some(({ userId }) => {
-    const state = personState(userId)?.status;
-    return state !== "ready" && state !== "hidden";
-  })) return null;
-  return { members: people.map(({ userId }) => ({ id: userId, displayName: profileName(userId) })), agents };
+  return { members: people, agents };
 }
 
 /** Verify agents independently of members, including on re-entry to a cached Space. */

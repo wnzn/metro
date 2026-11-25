@@ -176,6 +176,19 @@ const memberVersions = new Map<string, number>();
 const memberEvidence = signal<Record<string, { version: number; roster: object }>>({});
 type MentionVisit = { sid: string; scope: string; navigation: number; token: object; verified: boolean };
 const mentionVisit = signal<MentionVisit | null>(null);
+type MemberAlias = { order: number; displayName: string | null };
+const aliasVisit = computed(() => {
+  const visit = mentionVisit();
+  return visit?.verified && currentMentionVisit(visit) ? visit.token : null;
+});
+const aliasRoster = computed(() => {
+  const sid = activeSpaceId();
+  return sid && !memberFailures()[sid] && members()?.some(m => m.userId === me()) ? memberEvidence()[sid]?.roster : null;
+});
+// Only the current verified visit and roster can share name evidence. Identical
+// roster replies preserve the scope; cached profiles from elsewhere cannot seed it.
+const memberAliasScope = computed(() => aliasVisit() && aliasRoster()
+  ? { entries: signal<ReadonlyMap<string, MemberAlias>>(new Map()), next: 0 } : null);
 
 const EMPTY_DIRECTORY: MentionDirectory = { members: [], agents: [] };
 const EMPTY_MENTION_DRAFT: MentionDraft = { text: "", anchors: [] };
@@ -1278,6 +1291,35 @@ export function mentionVisitKey() {
   return scope && inSpaceComposer() ? `${navigationGeneration}:${scope}` : null;
 }
 
+/** Read evidence for a current member, shared by preflight and profile refresh. */
+export function mentionProfileEvidence(userId: string) {
+  const scope = memberAliasScope();
+  if (!scope || !members()?.some(m => m.userId === userId)) return null;
+  return {
+    scope,
+    verified: scope.entries().has(userId),
+    start: () => {
+      if (memberAliasScope() !== scope) return null;
+      const order = ++scope.next;
+      return (displayName: string | null | undefined) => {
+        if (memberAliasScope() !== scope) return;
+        const entries = scope.entries();
+        if ((entries.get(userId)?.order ?? 0) >= order) return;
+        scope.entries.set(new Map(entries).set(userId, { order, displayName: displayName || null }));
+      };
+    },
+  };
+}
+
+/** Require every current member, including verified profiles with no readable name. */
+export function mentionMemberNames(sid: string): MentionDirectory["members"] | null {
+  if (activeSpaceId() !== sid) return null;
+  const entries = memberAliasScope()?.entries();
+  const list = members();
+  if (!entries || !list || !list.every(m => entries.has(m.userId))) return null;
+  return list.map(({ userId }) => ({ id: userId, displayName: entries.get(userId)!.displayName }));
+}
+
 /** A new visit must not reuse an older visit's in-flight roster request. */
 export function loadMembersForMentions(fresh = false): Promise<void> {
   const sid = activeSpaceId();
@@ -1477,23 +1519,33 @@ async function verifySpaceRecipients(
   let aliasesCurrent = () => true;
   if (checkAliases) {
     if (!members || !members.some(m => m.userId === me())) return { kind: "unverified" };
-    const freshPeople: MentionDirectory["members"][number][] = [];
     for (let i = 0; i < members.length; i += 8) {
-      const batch = await Promise.all(members.slice(i, i + 8).map(async ({ userId }) => ({
-        id: userId, displayName: (await c.profileOf(userId))?.displayName,
-      })));
+      const read = await Promise.all(members.slice(i, i + 8).map(async ({ userId }) => {
+        const complete = mentionProfileEvidence(userId)?.start();
+        if (!complete) return false;
+        const profile = await c.profileOf(userId);
+        if (profile && profile.id !== userId) return false;
+        if (mayPost()) complete(profile?.displayName);
+        return true;
+      }));
       if (!mayPost()) return null;
-      freshPeople.push(...batch);
+      if (read.some(ok => !ok)) return { kind: "unverified" };
     }
     currentAgents = await refreshAgentsForMentions?.(sid, mayPost) ?? null;
     if (!mayPost()) return null;
     const rosterCurrent = () => checked?.evidence === memberEvidence()[sid]?.roster
       && !membersError() && sameMemberIds(membersBySpace()[sid], members);
-    if (!currentAgents || !rosterCurrent()) return { kind: "unverified" };
+    // Use the newest completed observations, not necessarily the replies
+    // from this send: a newer background read may have resolved first.
+    const freshPeople = mentionMemberNames(sid);
+    if (!currentAgents || !freshPeople || !rosterCurrent()) return { kind: "unverified" };
     const directory = { members: freshPeople, agents: currentAgents };
+    const personNames = new Map(freshPeople.map(m => [m.id, m.displayName]));
     const agentNames = new Map(currentAgents.map(a => [a.id, a]));
     aliasesCurrent = () => {
       if (!visit() || !rosterCurrent()) return false;
+      const people = mentionMemberNames(sid);
+      if (!people || people.length !== personNames.size || !people.every(m => personNames.get(m.id) === m.displayName)) return false;
       const latest = verifiedMentionAgents(sid);
       return !!latest && latest.length === agentNames.size && latest.every(a => {
         const saved = agentNames.get(a.id);

@@ -69,7 +69,7 @@ import { RESERVED_HANDLE } from "../api/spaces";
 import { Composer, ConnectionBanner, fillDraft, focusComposer, Transcript } from "./Conversation";
 import type { DraftIdea } from "./Conversation";
 import { PersonAvatar } from "./profile/PersonAvatar";
-import { ensurePerson, profileName } from "./profile/profileState";
+import { ensureMentionPerson } from "./profile/profileState";
 import { agentById, agentMentionOptions, defaultAgent, spaceAgents } from "./space/agents";
 import { askAgentId, askChoice, chooseAskAgent, classifierOffered, CLASSIFIER_CHOICE, hasAgentChoice } from "./space/askAgent";
 import { SpaceAgentAvatar } from "./space/SpaceAgentAvatar";
@@ -175,15 +175,15 @@ type MentionOption = { key: string; mention: MentionRecipient; title: string; de
 export function mentionOptions(
   query: string,
   list: readonly { userId: string; role?: string }[] | null,
+  verifiedPeople: MentionDirectory["members"],
   myId: string | null,
   spaceId?: string | null,
   choices?: readonly MentionRecipient[],
-  verifiedPeople?: MentionDirectory["members"],
 ): MentionOption[] {
   const q = query.toLowerCase();
   const out: MentionOption[] = [];
   const keys = choices && new Set(choices.map(mentionIdentityKey));
-  const names = verifiedPeople && new Map(verifiedPeople.map(m => [m.id, m.displayName]));
+  const names = new Map(verifiedPeople.map(m => [m.id, m.displayName]));
   const def = defaultAgent(spaceId);
   const several = spaceAgents(spaceId).length > 1;
   if (keys ? keys.has("generic") : "agent".startsWith(q)) {
@@ -210,8 +210,8 @@ export function mentionOptions(
       label: `Mention ${a.name} (${detail}): ${a.description}`, agent: a });
   }
   for (const m of list ?? []) {
-    if (names && !names.has(m.userId)) continue;
-    const name = names ? names.get(m.userId) : profileName(m.userId);
+    if (!names.has(m.userId)) continue;
+    const name = names.get(m.userId);
     if (keys ? !keys.has(`user:${m.userId}`)
       : m.userId === myId || (!m.userId.toLowerCase().includes(q) && !(name ?? "").toLowerCase().includes(q))) continue;
     const owner = m.role === "owner";
@@ -270,8 +270,7 @@ function RoomComposer() {
     const directory = currentDirectory();
     if (!directory) return [];
     const decision = ambiguous();
-    return mentionOptions(query(), members(), me(), activeSpaceId(), decision?.choices,
-      decision?.preflight ? directory.members : undefined);
+    return mentionOptions(query(), members(), directory.members, me(), activeSpaceId(), decision?.choices);
   });
   const deliberate = () => options().findIndex(o => o.key === highlighted());
   const active = () => {
@@ -301,7 +300,7 @@ function RoomComposer() {
   effect(() => {
     const sid = activeSpaceId();
     const ids = (sid ? verifiedMembers(sid) : null)?.map(m => m.userId) ?? [];
-    untracked(() => { for (const id of ids) void ensurePerson(id); });
+    untracked(() => { for (const id of ids) void ensureMentionPerson(id); });
   });
   // Keep a deliberated stable key through reorder, never through a different
   // occurrence or an option disappearing from the current roster.
@@ -496,7 +495,7 @@ function RoomComposer() {
                               {(a) => <SpaceAgentAvatar spaceId={activeSpaceId()!} agent={a()} size="sm" />}
                             </If>
                           ) : (
-                            <PersonAvatar userId={(o().mention as { id: string }).id} name={o().title} verifiedName={ambiguous()?.preflight} size="sm" />
+                            <PersonAvatar userId={(o().mention as { id: string }).id} name={o().title} verifiedName size="sm" />
                           )
                         }
                         ref={(node) => {

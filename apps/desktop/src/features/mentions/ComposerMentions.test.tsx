@@ -384,6 +384,129 @@ test("same-visit name moves use fresh labels for confirmation rows and insertion
   }
 });
 
+for (const refresh of ["pending", "identical", "moved"] as const) {
+  test(`held send profiles merge ordered background name evidence: ${refresh}`, async () => {
+    const f = world();
+    f.state.spaces.get("acme")!.members.add("carol");
+    const base = f.network[get]!;
+    let racing = false, renamedAfterPick = false;
+    const reads = { bob: 0, carol: 0 };
+    f.network[get] = req => {
+      const id = new URL(req.url).pathname.match(/^\/v1\/profiles\/(bob|carol)$/)?.[1] as "bob" | "carol" | undefined;
+      if (!id) return base(req);
+      const count = racing ? ++reads[id] : 0;
+      const background = count > 1;
+      const moved = background && refresh === "moved";
+      const display_name = id === "bob" ? moved ? "Robert Tan" : "River Tan"
+        : renamedAfterPick ? "Robert Tan" : moved ? "River Tan" : "Carol Tan";
+      const delay = count === 1 && id === "bob" ? 8_000 : background && refresh === "pending" ? 8_000 : 0;
+      return { status: 200, delay, body: { id, display_name } };
+    };
+    const app = await inAcme(f.network, 720, true);
+    await waitDirectory(app);
+    const text = "🌿 @River Tan please check";
+    await app.type("id:composer", text);
+    await app.waitFor("id:mention-chip:bob");
+    await app.clock!.runFor(57_000);
+    racing = true;
+    await app.press("id:send");
+    await app.waitUntil(() => reads.bob === 1 && reads.carol === 1, { timeout: 1_000 });
+    await app.clock!.runFor(4_000);
+    expect(reads.bob).toBe(2);
+    expect(reads.carol).toBe(2);
+    expect(requests(app)).toHaveLength(0);
+    await app.clock!.runFor(4_100);
+    if (refresh === "moved") {
+      await app.waitFor("text:/Pick who you mean\\. Nothing was sent/");
+      expect(app.value("id:composer")).toBe(text);
+      expect(requests(app)).toHaveLength(0);
+      if (!app.shows("id:mention-picker")) await app.press("id:mention");
+      await app.waitFor("label:Mention Robert Tan (@bob): notifies them only");
+      await app.waitFor("label:Mention River Tan (@carol): notifies them only");
+      await app.press("id:pick:bob");
+      const picked = text.replace("River Tan", "Robert Tan");
+      expect(app.value("id:composer")).toBe(picked);
+      racing = false;
+      renamedAfterPick = true;
+      await app.clock!.runFor(61_000);
+      await app.waitFor("id:mention-chip:bob >> text:@River Tan");
+      expect(app.value("id:composer")).toBe(picked);
+      await app.press("id:send");
+      await app.waitUntil(() => requests(app).length === 1);
+      expect(JSON.parse(requests(app)[0].body!)).toMatchObject({
+        text: picked, mentions: [{ kind: "user", id: "bob" }], spans: [span(picked, "@Robert Tan", 0)],
+      });
+    } else {
+      await app.waitUntil(() => requests(app).length === 1);
+      expect(JSON.parse(requests(app)[0].body!)).toMatchObject({ text, mentions: [{ kind: "user", id: "bob" }] });
+    }
+  });
+}
+
+test("a completed name swap expires an open confirmation without a membership change", async () => {
+  const f = world();
+  f.state.spaces.get("acme")!.members.add("carol");
+  const base = f.network[get]!;
+  let version = 0;
+  const started = { bob: 0, carol: 0 };
+  f.network[get] = req => {
+    const id = new URL(req.url).pathname.match(/^\/v1\/profiles\/(bob|carol)$/)?.[1] as "bob" | "carol" | undefined;
+    if (!id) return base(req);
+    if (version === 2) started[id]++;
+    const names = [{ bob: "River Tan", carol: "Carol Tan" },
+      { bob: "Robert Tan", carol: "River Tan" }, { bob: "River Tan", carol: "Robert Tan" }];
+    return { status: 200, delay: version === 2 ? 3_500 : 0, body: { id, display_name: names[version]![id] } };
+  };
+  const app = await inAcme(f.network, 720, true);
+  await waitDirectory(app);
+  const text = "🌿 @River Tan please check";
+  await app.type("id:composer", text);
+  await app.waitFor("id:mention-chip:bob");
+  version = 1;
+  await app.press("id:send");
+  await app.waitFor("text:/Pick who you mean\\. Nothing was sent/");
+  if (!app.shows("id:mention-picker")) await app.press("id:mention");
+  await app.waitFor("label:Mention River Tan (@carol): notifies them only");
+  await app.keyboard.press("down");
+  version = 2;
+  await app.clock!.runFor(61_000);
+  expect(started.bob).toBe(1);
+  expect(started.carol).toBe(1);
+  expect(app.shows("label:Mention River Tan (@carol): notifies them only")).toBe(true);
+  await app.clock!.runFor(3_600);
+  await app.waitFor("id:mention-none");
+  expect(app.shows("id:pick:carol")).toBe(false);
+  expect(app.shows("id:pick:bob")).toBe(false);
+  await app.keyboard.press("return");
+  expect(app.value("id:composer")).toBe(text);
+  expect(requests(app)).toHaveLength(0);
+});
+
+test("a fresh Space visit cannot seed aliases from a cached actor profile", async () => {
+  const f = world();
+  const base = f.network[get]!;
+  let renamed = false, held = 0;
+  f.network[get] = req => {
+    if (new URL(req.url).pathname !== "/v1/profiles/bob") return base(req);
+    if (renamed) held++;
+    return { status: 200, delay: renamed ? 4_000 : 0,
+      body: { id: "bob", display_name: renamed ? "Robert Tan" : "River Tan" } };
+  };
+  const app = await inAcme(f.network, 720, true);
+  await waitDirectory(app);
+  await app.press("id:nav-chat");
+  await app.waitFor("id:chat-view");
+  renamed = true;
+  await app.press("id:space:acme");
+  await app.waitUntil(() => held > 0, { timeout: 1_000 });
+  await app.press("id:mention");
+  await app.waitFor("id:mention-none");
+  expect(app.shows("id:pick:bob")).toBe(false);
+  await app.clock!.runFor(4_100);
+  await app.waitFor("label:Mention Robert Tan (@bob): notifies them only");
+  expect(app.shows("label:Mention River Tan (@bob): notifies them only")).toBe(false);
+});
+
 for (const change of ["pending", "identical", "revoked", "agent-alias"] as const) {
   test(`roster poll overlapping held send profiles: ${change}`, async () => {
     const w = spaceWorld();
