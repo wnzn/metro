@@ -128,10 +128,14 @@ test("search finds models by provider name across connections; Default stays apa
   expect(app.shows("id:composer-model-options-group:Custom & self-hosted")).toBe(true);
   expect(app.shows("id:mark-letters:{}")).toBe(true);
   expect(app.shows("text:Thinking: low · medium · high")).toBe(true);
+  await app.press("id:composer-model-options-group-toggle:OpenAI");
+  await app.waitFor("label:OpenAI, 2 models, collapsed");
+  expect(app.shows('id:composer-model-options:["plan","gpt-x"]')).toBe(false);
   await app.type("id:composer-model-options-search", "OpenAI");
   await app.waitFor('id:composer-model-options:["claude","opus"]', { state: "gone" });
   expect(app.shows('id:composer-model-options:["plan","gpt-x"]')).toBe(true);
   expect(app.shows('id:composer-model-options:["api","gpt-x"]')).toBe(true);
+  expect(app.shows("id:composer-model-options:")).toBe(true);
   // Same model id on two connections of one provider: each keeps its own connection and levels.
   await app.press('id:composer-model-options:["api","gpt-x"]');
   expect(app.shows("id:composer-thinking-options")).toBe(false);
@@ -140,6 +144,7 @@ test("search finds models by provider name across connections; Default stays apa
   await app.press("id:composer-model");
   await app.waitFor("id:composer-model-options");
   await app.press("id:composer-model-options");
+  expect(app.shows("id:composer-model-options-group-toggle:OpenAI")).toBe(false); // selection keeps it open
   await app.press('id:composer-model-options:["plan","gpt-x"]');
   await app.press("id:composer-thinking-options:medium");
   await app.press("label:Done");
@@ -150,6 +155,9 @@ test("search finds models by provider name across connections; Default stays apa
   await app.press("id:composer-model-options:");
   await app.press("label:Done");
   await app.waitFor(DEFAULT_LABEL);
+  await app.press("id:composer-model");
+  await app.press("id:composer-model-options");
+  await app.waitFor("label:OpenAI, 2 models, collapsed"); // selection never overwrites disclosure memory
 });
 
 test("names that fail or arrive late never block choosing; they rename groups in place and keep the pin and effort", async () => {
