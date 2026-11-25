@@ -24,9 +24,9 @@ room or thread in a Space you belong to.
 
 ## In the desktop app
 
-This section describes the current source after 0.2.0. It isn't released.
+This section describes the source after 0.2.0, released in 0.3.2.
 The task cards and their **More** menu with **History** were checked in
-a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. The form's other changes are covered by automated tests. The
+a native Linux GTK run, in dark and light themes, of the source after 0.2.0 (before 0.3.2; not of the release files). The form's other changes are covered by automated tests. The
 [screenshot](screenshots/scheduled-tasks.png), retaken on 2026-11-24 from
 `eea7221` against the real server with a scripted model, shows four cards:
 two active daily and weekday tasks, each with its next firing in the task's

@@ -1,12 +1,11 @@
 # Installers: desktop and runners
 
-> **Status: no public release yet.** <https://github.com/wnzn/metro/releases>
-> is where public downloads will appear, published automatically when a
+> **Latest release: [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2)**
+> (2026-11-24, from `d943797`). Releases are published automatically when a
 > version bump is merged into the protected `main` branch
-> ([how](#official-releases)). Nothing has been
-> released or signed for real so far. Until there's a release, the only
-> builds are temporary, unsigned **test builds** from GitHub Actions
-> ([below](#test-builds-from-github-actions)).
+> ([how](#official-releases)). Its `SHA256SUMS` is signed with Sigstore; its
+> Windows files are **not** code-signed. What was checked is in
+> [acceptance](acceptance.md#published-metro-032-2026-11-24-github-release-v032).
 >
 > This page describes the per-user installer scripts at `fb7cb06`, the
 > Windows MSI from `ff28b09` onwards, and the desktop's runner screen at
@@ -26,8 +25,7 @@
 > Nothing on this page needs a compiler, NSH or a source checkout.
 
 Each installer is a single script, published beside the release archives
-and listed in their `SHA256SUMS` once a release exists
-([file list](#official-releases)).
+and listed in their `SHA256SUMS` ([file list](#official-releases)).
 
 What every installer does:
 
@@ -86,12 +84,15 @@ against the Sigstore-verified `SHA256SUMS` before you run it
 come back once a certificate is set up and it says `signed`
 ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 
-**Not verified on native Windows.** The MSI's native Windows Installer
-checks are written for a Windows CI runner but haven't passed there yet,
-and its wizard hasn't been seen on screen. Its install, upgrade and removal
-were checked only under Wine on Linux, which has its own Windows Installer
-([MSI notes](../packaging/windows-msi/README.md)). Every other Windows check
-so far also ran under Wine ([acceptance.md](acceptance.md)).
+**Not verified by a person on native Windows.** For 0.3.2, the release
+run's `windows-distribution / preview` job, on a GitHub `windows-2025`
+runner, installed the unsigned MSI into a chosen folder, checked its
+payload, ran the server and uninstalled it, and passed the MSI lane's
+native tests (upgrade, repair, downgrade, uninstall), all unattended
+([acceptance](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
+Nobody has seen its wizard or the desktop app on screen on Windows. Other
+Windows checks ran under Wine on Linux, which has its own Windows Installer
+([MSI notes](../packaging/windows-msi/README.md), [acceptance.md](acceptance.md)).
 
 ### The MSI
 
@@ -114,7 +115,8 @@ so far also ran under Wine ([acceptance.md](acceptance.md)).
   an unknown publisher, and to check the file against its SHA-256 checksum
   (`SHA256SUMS`) before installing. Windows SmartScreen may warn about it. Only a signed release
   has `Metro-<version>-windows-x64.msi`, signed with Authenticode ([check
-  it](#check-a-download)). No public MSI exists yet.
+  it](#check-a-download)). The 0.3.2 release has the unsigned
+  `Metro-0.3.2-windows-x64.unsigned-preview.msi` only.
 
 ### The portable ZIP and `install-metro-windows.ps1`
 
@@ -256,8 +258,9 @@ sh metro-runner-container.sh status
   manual `--env-file` setup in [runners.md](runners.md).
 - On a Linux host, the token file must be readable by the image's runner
   user (uid 1000); otherwise use the native runner.
-- The image named by `--version` is the planned GHCR runner image, which
-  isn't published yet.
+- The image named by `--version` is the GHCR runner image
+  `ghcr.io/wnzn/metro-runner:v<version>`, published for 0.3.2
+  (`linux/amd64`, `linux/arm64`).
 
 ### Networking
 
@@ -306,9 +309,9 @@ that.
 
 ## Official releases
 
-> **No public release exists yet.** The process below is in the source
-> (policy `1b3edab`, Windows and images `1cb6094`, Sigstore `2cfdc24`, MSI
-> `f642616` and `6171c75`). It hasn't run on GitHub with real credentials.
+> **This process published [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2)**
+> on 2026-11-24, from `d943797`, in CI run
+> [45418420759](https://github.com/wnzn/metro/actions/runs/45418420759).
 > There's no Windows code-signing setup, so releases ship Windows unsigned
 > for now ([deploy.md](deploy.md#windows-releases-signed-or-unsigned)).
 

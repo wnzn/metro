@@ -11,11 +11,11 @@ sections in this order (as verified in the 0.2.0 Linux candidate):
 | **Model routing** | Opt-in use-case routing and personal Chat classification (Spaces have their own opt-in, in each Space's settings); see [system-one.md](system-one.md#how-a-message-reaches-the-agent) |
 | **Appearance** | Color scheme, [below](#appearance) |
 
-In the current source after 0.2.0, which isn't released, **Settings** is still a
+Since 0.3.2, **Settings** is still a
 sidebar entry with these sections. **Model providers** also holds
 **Documents & media**, where you choose the media model that indexes and
 searches your files ([library.md](library.md#in-the-desktop-app)). That
-choice was checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. Your account is in the sidebar's account row.
+choice was checked in a native Linux GTK run, in dark and light themes, of the source after 0.2.0 (before 0.3.2; not of the release files). Your account is in the sidebar's account row.
 Its menu offers **Copy server URL**, **Copy ID** and **Sign out**. The
 account row was checked in the same native GTK review, and its menu items
 are covered by automated tests. Since then (not released, covered by
@@ -67,7 +67,7 @@ before it can be the default.
   run delegates to. It never falls back to another member's connection. A
   shared connection is used only when someone picks it
   ([sharing](#sharing-a-connection)).
-- **The order** (current source after 0.2.0, not released). A run in a
+- **The order** (source since 0.3.2, not released). A run in a
   Space uses the first of these that is set:
   1. the model the sender chose for that turn (the composer's **Model**);
   2. the sender's model for that agent in this Space;
@@ -109,8 +109,8 @@ before it can be the default.
     nothing is posted.
   - If the chosen connection can't be used, that reply fails. It doesn't fall
     back to your default or to `METRO_MODEL`.
-- **Per-turn model and thinking level, in Chat and Spaces** (current source
-  after 0.2.0, not released; verified in a local test cut,
+- **Per-turn model and thinking level, in Chat and Spaces** (since 0.3.2;
+  verified in a local test cut,
   [acceptance](acceptance.md#staged-composer-models-and-ask-from-personal-chat-at-28ba4e2-2026-11-23-project-manager-local)).
   A message to the agent, in your Chat or in a Space room, can also carry
   `model_id` and `reasoning_effort` with `provider_connection_id`, on
@@ -406,13 +406,13 @@ connector says so. Then disconnect Metro in ChatGPT's settings.
 
 **Models and requests.**
 
-- Listing models asks OpenAI for your account's models. In the current
-  source after 0.2.0, the device also reports the catalog's display names
+- Listing models asks OpenAI for your account's models. In the
+  source since 0.3.2 (not released), the device also reports the catalog's display names
   (short, printable names only), which the model list shows.
 - Requests go to the Responses API with `store: false`, and only a completed
   response counts as success. Tool calls come back to Metro, and the
   connector runs no tools itself.
-- In the current source after 0.2.0, a successful (`200`) answer is read
+- In the source since 0.3.2 (not released), a successful (`200`) answer is read
   as an event stream, as a whole JSON Responses object, or, without a
   recognized `content-type`, by checking which of the two it is. Output
   items and message parts it doesn't know are skipped. An answer it still
@@ -475,7 +475,7 @@ setup ([commands](development.md#metro-connector-developer-cli)).
 
 Your own OpenAI-compatible endpoint, such as a local inference server or a
 gateway. Use it with your own key, or `--no-api-key`. The base URL is set
-on your machine only. In the current source after 0.2.0, a thinking level
+on your machine only. In the source since 0.3.2 (not released), a thinking level
 you set up for one of its models ([model lists](#each-connections-model-list))
 is forwarded unchanged as `reasoning_effort` or `reasoning: {"effort"}`
 (1–32 characters of `a-z`, `0-9`, `_`, `-`). Sign in with ChatGPT accepts
@@ -556,7 +556,7 @@ never see or manage it.
 
 ## Each connection's model list
 
-(Current source after 0.2.0, not released.) Each chat connection keeps its
+(Source since 0.3.2, not released.) Each chat connection keeps its
 own list of the models that may be picked on it. The connection's `model`
 is its default model and is always one of its enabled models.
 
@@ -678,7 +678,7 @@ isn't secret and never leaves the device.
   - A routed turn's group can show its route, for example *detected by
     System One* and the use case. It never shows connection ids, prompts or
     credentials ([screenshot](screenshots/route-attribution.png)).
-  - In the current source after 0.2.0 (not released), the group is named
+  - In the source since 0.3.2 (not released), the group is named
     after the Space agent working the turn, can show how that agent was
     chosen (for example *Picked by classifier: Coder*), and shows the
     provider's reasoning summaries (`reasoning_summary` events) as

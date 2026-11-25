@@ -1,6 +1,8 @@
 # Documents & media
 
-> **Status: verified locally with fixtures. Not released.** It's part of the
+> **Status: verified locally with fixtures.** It's in the published
+> [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2) code;
+> the checks below were local runs, not runs of the release files. It's part of the
 > [final local gate](acceptance.md#demonstrated-final-local-gate-with-documents--media-2026-11-22-primary-workspace-local):
 > 497 Rust tests, all seven e2e scripts (`library.py` ran twice), the 83
 > hardened media-service tests, and desktop `nsh test` 106/106. **No
@@ -32,7 +34,7 @@
 >     no weights have been downloaded,
 >   - native audio or video playback or seeking, or the native file picker
 >     (portal), and
->   - any public release.
+>   - any run of the 0.3.2 release files or images with this feature.
 > - **Desktop:** `nsh check` is clean, and `nsh test .` passed 106/106 twice.
 >   Six native Linux screenshots were taken against the real server, with a
 >   scripted media endpoint. See [In the desktop app](#in-the-desktop-app).
@@ -473,7 +475,7 @@ POST {base_url}/media/embeddings        (base_url includes /v1; Bearer key if se
 
 ## In the desktop app
 
-> **Navigation in the current source (after 0.2.0, not released).** Files
+> **Navigation since 0.3.2.** Files
 > live on their own **Library** page in the sidebar: **Upload** and the file
 > list. Each row shows **Open**. Its **More** menu holds **Index** (or
 > **Index again**), and **Delete…** for the uploader or the Space owner,
@@ -734,9 +736,12 @@ Indexing files by content needs a media-capable embedding endpoint built
 around `google/embeddinggemma-2`. Upload, listing, preview and download work
 without one.
 
-- **No media-service image is published.** The reference service runs from
-  the `compose.media.yaml` override, which builds from a Metro checkout.
-  Its setup, hardening, protocol and limits are in
+- **The reference service image is published** as
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.3.2` (`linux/amd64` only, no
+  weights; pin the digest from the release's `IMAGES.txt`). Running that
+  image from the registry hasn't been recorded, and this page doesn't yet
+  describe running it outside the `compose.media.yaml` override, which
+  builds from a Metro checkout. Its setup, hardening, protocol and limits are in
   [development.md](development.md#media-embedding-service-composemediayaml).
 - **With an endpoint that's already running** (one you or your operator
   trusts, over HTTPS), the operator adds its exact base URL to
@@ -785,7 +790,8 @@ This page doesn't claim any of the following until a run is recorded in
 - Native audio or video playback or seeking in the desktop app, and the
   desktop on macOS or Windows.
 - A native (portal) file-picker upload. It was tested headless only.
-- A public release. Nothing has been published.
+- Any run of the published 0.3.2 files or images with this feature,
+  including the `metro-embeddinggemma2` image.
 - The real-weight smoke, or any run with pretrained weights, and its
   timings, memory and ranking. **No real retrieval quality has been
   tested.**
