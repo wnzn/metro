@@ -361,6 +361,57 @@ test("a verified Space settings attach dismisses the offer and records its folde
   expect(runnerWrites(f).map((p) => p.path)).toEqual(["/v1/spaces/manual/runner/attach-if-empty"]);
 });
 
+test("a member-readable or unversioned assignment cannot dismiss the offer or record a folder", async () => {
+  for (const dropsRole of [true, false]) {
+    const f = world();
+    const r = f.addRunner("This PC", "personal", "alice");
+    f.addSpace("manual", "Manual", "alice", ["bob"]);
+    f.addSpace("eligible", "Still eligible", "alice");
+    // Mixed server in the first case: revision support but no token-change flag.
+    f.state.guardedTokenChanges = false;
+    f.state.guardedDetachSupported = dropsRole;
+    const t = fixture(f, r.id);
+    t.gate.attach = 800;
+    const rule = `GET ${BASE}/v1/*`;
+    const get = t.network[rule]!;
+    const manual = f.state.spaces.get("manual")!;
+    let listSawOwner = false;
+    let receivedAssignment = false;
+    t.network[rule] = (req) => {
+      const path = new URL(req.url).pathname;
+      if (path === "/v1/spaces" && manual.owner === "alice") listSawOwner = true;
+      if (path === "/v1/spaces/manual/runner" && f.state.attached.get("manual") === r.id) {
+        receivedAssignment = true;
+        if (dropsRole) manual.owner = "bob"; // Alice still belongs and still sees the same runner.
+      }
+      return get(req);
+    };
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    await app.waitFor(offer);
+    expect(listSawOwner).toBe(true);
+    await app.press("id:space:manual");
+    await app.press("id:manage-space");
+    await app.press("id:space-settings-tab:runner");
+    await app.press(`id:space-runner-attach:${r.id}`);
+    await app.waitUntil(() => f.state.attached.get("manual") === r.id);
+    await app.press("id:space-settings-close");
+    t.status.delay = 2_000;
+    await app.press("id:nav-settings");
+    await app.waitFor("id:runners-settings");
+    await app.clock!.runFor(800);
+    await app.waitUntil(() => receivedAssignment);
+    await app.waitFor("id:runner-state >> text:Runner attached");
+    expect(manual.owner).toBe(dropsRole ? "bob" : "alice");
+    expect(manual.members.has("alice")).toBe(true);
+    expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+    expect(app.shows(offer)).toBe(true);
+    expect(app.shows("id:installed-runner-space:manual")).toBe(false);
+    expect(f.state.attached.get("manual")).toBe(r.id);
+    expect(runnerWrites(f).map((p) => p.path)).toEqual(["/v1/spaces/manual/runner/attach-if-empty"]);
+  }
+});
+
 test("a superseded Space settings attach neither dismisses the offer nor records a folder", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");

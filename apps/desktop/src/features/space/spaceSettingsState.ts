@@ -502,12 +502,6 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       receipt = await api.changeDedicatedToken(sid, action);
     }
     if (!writeCurrent()) return;
-    // Older servers with empty-only attach don't include owner-only metadata
-    // on the assignment read. Verify ownership before reading that assignment.
-    const legacyOwner = installed && !before.guardedTokenChanges
-      ? await api.listSpaces().then((list) => list.some((s) => s.id === sid && s.role === "owner"), () => false)
-      : false;
-    if (!writeCurrent()) return;
     // A delayed write reply describes history, not the current assignment.
     // Use the shared exact-Space guards even when the originating page closed.
     const actual = await refreshAssignment(api, sid, writeCurrent, live);
@@ -528,11 +522,10 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
     if (!confirmed) return reject(tokenChange
       ? "The runner assignment changed after the token request. No token was shown. Review the current runner above."
       : "The runner assignment changed. Check the current runner above.");
-    // This is session bookkeeping for the submitted attach, not feedback
-    // for whichever settings page happens to be open now.
-    const ownerVerified = (actual.guardedTokenChanges && !!r?.assignmentRevision) ||
-      (!before.guardedTokenChanges && legacyOwner);
-    if (action.kind === "attach" && ownerVerified && installed?.isCurrent()) {
+    // Bookkeeping can outlive the page, but needs owner-only proof from
+    // this very assignment read. A member view or an older server's
+    // unversioned answer can update status, not personal bookkeeping.
+    if (action.kind === "attach" && r?.assignmentRevision && installed?.isCurrent()) {
       const space = spaces().find((s) => s.id === sid && s.role === "owner");
       if (space) {
         dismissRunnerOffer();
