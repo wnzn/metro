@@ -292,12 +292,10 @@ async fn space_events_are_owner_only_scoped_and_carry_no_raw_text() {
 
     let space_query = format!("?space_id={a}");
     let codes = s.codes(ALICE, &space_query).await;
+    // A model failure during a run has one public code in a Space.
     assert_eq!(
         codes,
-        [
-            pair("provider", "unreachable"),
-            pair("runner", "not_claimed")
-        ]
+        [pair("provider", "failed"), pair("runner", "not_claimed")]
     );
     // No raw text: not the prompt, path, query, endpoint, key or token.
     let (_, raw) = s.monitoring(ALICE, &space_query).await;

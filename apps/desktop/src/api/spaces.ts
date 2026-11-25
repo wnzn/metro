@@ -46,7 +46,13 @@ export type SpaceAgent = {
   initial: string;
 };
 
-export type SpaceAgents = { agents: SpaceAgent[]; tools: string[] };
+export type SpaceAgents = { agents: SpaceAgent[]; tools: string[]; defaultTools: string[] };
+
+// Only the original defaults are safe to assume on servers that don't
+// advertise defaults. A tool's presence in the catalogue is not consent.
+const LEGACY_AGENT_DEFAULTS = new Set([
+  "workspace.list", "workspace.read", "workspace.check", "workspace.mcp_list", "workspace.mcp", "threads",
+]);
 
 export type NewAgent = {
   name: string;
@@ -221,9 +227,12 @@ export function spacesApi(request: RequestFn, raw: RawFn) {
     async spaceAgents(sid: string): Promise<SpaceAgents> {
       const data = await request("GET", `${sp(sid)}/agents`);
       if (!isObject(data) || !Array.isArray(data.agents)) throw new ApiError("protocol", "GET …/agents did not return { agents: [...] }.");
+      const tools = Array.isArray(data.tools) ? data.tools.filter((t): t is string => typeof t === "string") : [];
+      const defaults = Array.isArray(data.default_tools) ? new Set(data.default_tools) : LEGACY_AGENT_DEFAULTS;
       return {
         agents: data.agents.flatMap((a) => parseAgent(a) ?? []),
-        tools: Array.isArray(data.tools) ? data.tools.filter((t): t is string => typeof t === "string") : [],
+        tools,
+        defaultTools: tools.filter((tool) => defaults.has(tool)),
       };
     },
     async createAgent(sid: string, agent: NewAgent): Promise<SpaceAgent> {

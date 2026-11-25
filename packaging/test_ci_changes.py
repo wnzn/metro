@@ -36,6 +36,7 @@ class GitFixture(unittest.TestCase):
         self.write("README.md", "readme\n")
         self.write("AGENTS.md", "agents\n")
         self.write("docs/acceptance.md", "doc\n")
+        self.write("packaging/README.md", "packaging prose\n")
         self.write("tests/e2e/smoke.py", "e2e\n")
         self.base = self.commit()
 
@@ -65,6 +66,11 @@ class GitFixture(unittest.TestCase):
 
 
 class SegmentTests(GitFixture):
+    def test_packaging_readme_with_trailing_newline_is_not_exempt(self):
+        for push in (False, True):
+            with self.subTest(push=push):
+                self.assertEqual(self.classify("packaging/README.md\n", push=push), EVERYTHING)
+
     def test_documentation_only_runs_nothing(self):
         for paths in (["README.md"], ["docs/acceptance.md"], ["README.md", "AGENTS.md"], ["docs/screenshots/new.png"],
                       ["docs/deploy.md", "docs/diagrams/flow.svg", "docs/a.jpg", "docs/b.jpeg", "docs/c.gif",
@@ -116,7 +122,9 @@ class SegmentTests(GitFixture):
             "compose.prebuilt.yaml": only("containers", "packaging"),
             "compose.provider-key-file.yaml": only("containers", "packaging"),
             "packaging/package.py": only("packaging", "previews"),
-            "packaging/README.md": only("packaging", "previews"),
+            "packaging/nsh_ci_tests.py": only("desktop", "packaging", "previews"),
+            "packaging/README.md": NOTHING,
+            "packaging/windows-msi/README.md": only("packaging", "previews"),
             "packaging/windows-msi/build_msi.py": only("packaging", "previews"),
             "packaging/release-signatures/release_signatures.py": only("packaging", "previews"),
             "packaging/metro-runner-container.sh": only("containers", "packaging", "previews"),
@@ -271,6 +279,8 @@ class EnvironmentTests(GitFixture):
 
     def test_pushes_and_pull_requests_get_the_same_segments(self):
         for paths, expected in ((["apps/desktop/dev/screenshots/capture.sh"], NOTHING),
+                                (["docs/acceptance.md", "packaging/README.md"], NOTHING),
+                                (["Cargo.toml", "packaging/README.md"], EVERYTHING),
                                 (["crates/server/src/main.rs"], only("rust", "containers", "previews")),
                                 (["apps/desktop/src/features/Shell.tsx"], only("desktop", "previews")),
                                 (["packaging/package.py"], only("packaging", "previews")),
@@ -280,6 +290,14 @@ class EnvironmentTests(GitFixture):
             with self.subTest(paths=paths):
                 self.assertEqual(self.push(self.base, head), expected)
                 self.assertEqual(self.pull_request(head), expected)
+
+    def test_packaging_readme_symlink_is_not_exempt(self):
+        readme = self.repo / "packaging/README.md"
+        readme.unlink()
+        readme.symlink_to("../README.md")
+        head = self.commit()
+        self.assertEqual(self.push(self.base, head), EVERYTHING)
+        self.assertEqual(self.pull_request(head), EVERYTHING)
 
     def test_unverifiable_pushes_run_everything(self):
         docs = self.change("README.md")

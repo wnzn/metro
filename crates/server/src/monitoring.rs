@@ -28,6 +28,16 @@
 //!   personal Chat or any Space is written there, and no Space or personal
 //!   event is ever folded into them.
 //!
+//! A Space owner needn't own the model connection a run used, nor have
+//! started the run, so a Space event about a person's model records one
+//! code per stage: `provider/unavailable` when the model couldn't be used
+//! at the start of a run, `provider/failed` for any model failure during
+//! it. A revoked share, a changed connection, a rate limit, a server error
+//! and a malformed reply all read alike there, even when the owner also
+//! owns the connection (a Space event is not per viewer). The distinction
+//! goes only to the run's initiator: their `GET /v1/runs` failure and, for
+//! personal Chat, their own personal events, which keep the category.
+//!
 //! A scope is a kind plus an id (`space`/SID, `user`/UID, `instance`/""),
 //! so a Space id and a user id that happen to be the same string never
 //! share events. A read names exactly one scope; nothing aggregates them.
@@ -185,6 +195,8 @@ codes! {
     RunnerUpdateRequested => ("runner", "update_requested", "An update of a runner was requested."),
     RunnerUpdated => ("runner", "updated", "A runner updated itself to the requested version."),
     RunnerUpdateFailed => ("runner", "update_failed", "A runner could not update itself and kept its version."),
+    // Space or personal: web tools.
+    WebSearchUnavailable => ("web", "search_unavailable", "A web search or page fetch could not run on the computer of the person who asked."),
     // Instance.
     ServerStarted => ("server", "started", "The server started."),
     ServerUpdateAvailable => ("server", "update_available", "A newer verified Metro release is available."),

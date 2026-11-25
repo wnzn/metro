@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::fsutil::{ensure_private_dir, read_private, remove_private, write_private};
-use crate::netpolicy::validate_base_url;
+use crate::netpolicy::{validate_base_url, validate_server_url};
 use crate::{SafeError, Secret};
 
 pub const ENV_HOME: &str = "METRO_CONNECTOR_HOME";
@@ -196,7 +196,7 @@ impl ProfileConfig {
         if self.version != 1 {
             bail!("profile.json: unsupported version {}", self.version);
         }
-        if validate_base_url(&self.server_url, "server_url")? != self.server_url {
+        if validate_server_url(&self.server_url, "server_url")? != self.server_url {
             bail!("profile.json: server_url is not normalized");
         }
         match (self.kind.uses_endpoint(), &self.base_url) {
@@ -459,7 +459,7 @@ impl Profile {
     /// Save the device token bound to `server_url` (one atomic write).
     pub fn save_device_token(&self, server_url: &str, t: &Secret) -> Result<()> {
         validate_device_token(t)?;
-        validate_base_url(server_url, "server_url")?;
+        validate_server_url(server_url, "server_url")?;
         self.write_record("device-token", server_url, t)
     }
 

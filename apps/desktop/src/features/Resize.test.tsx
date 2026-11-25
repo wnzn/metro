@@ -8,11 +8,12 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
 import { spaceWorld } from "./space/test/fixtures";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof world>;
 
 async function inChat(f: F | ReturnType<typeof spaceWorld>, storage?: Record<string, string>) {
-  const app = await open("../../App.tsx", { network: f.network as any, platform: "linux", width: 1400, height: 800, storage });
+  const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1400, height: 800, storage });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);

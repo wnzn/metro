@@ -255,6 +255,10 @@ fn main() -> ExitCode {
         },
     );
 
+    if let Some(w) = cfg.plain_http_warning() {
+        eprintln!("metro-runner: warning: {w}");
+    }
+
     if let SubprocessPolicy::Disabled(why) = SubprocessPolicy::for_config(&cfg)
         && (cfg.check_argv.is_some() || cfg.mcp_argv.is_some())
     {

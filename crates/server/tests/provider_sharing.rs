@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::http::HeaderMap;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use base64::Engine;
 use metro_server::auth::{AuthFailure, AuthFuture, HumanAuth, UserIdentity};
@@ -28,6 +29,9 @@ const ALICE: &str = "alice-token";
 const BOB: &str = "bob-token";
 const CAROL: &str = "carol-token";
 const ALICE_KEY: &str = "sk-alice-very-secret-0123456789";
+/// Text only a provider's own error carries: it must never reach a room, a
+/// run's private failure, a personal Chat or a log line.
+const SENTINEL: &str = "SENTINEL-provider-text-7f3a91";
 
 struct FakeAuth(HashMap<String, UserIdentity>);
 
@@ -82,7 +86,7 @@ impl Fixture {
     async fn start() -> Self {
         let seen = Arc::new(Mutex::new(Vec::<Seen>::new()));
         let gate = Arc::new(tokio::sync::RwLock::new(()));
-        let (g1, g2) = (gate.clone(), gate.clone());
+        let (g1, g2, g3) = (gate.clone(), gate.clone(), gate.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let record = |seen: &Arc<Mutex<Vec<Seen>>>, path: &str, h: &HeaderMap, body: Value| {
@@ -154,9 +158,52 @@ impl Fixture {
             .route(
                 "/v1/chat/completions",
                 post(move |h: HeaderMap, Json(body): Json<Value>| {
-                    let seen = s4.clone();
+                    let (seen, gate) = (s4.clone(), g3.clone());
                     async move {
                         record(&seen, "/v1/chat/completions", &h, body.clone());
+                        let messages = body["messages"].as_array().cloned().unwrap_or_default();
+                        let asked = messages
+                            .iter()
+                            .rev()
+                            .find(|m| m["role"] == "user")
+                            .map(|m| m["content"].to_string())
+                            .unwrap_or_default();
+                        let replied = messages.iter().any(|m| m["role"] == "tool");
+                        // A two-request run: a tool call first (held at the
+                        // gate), so a share can end between the requests.
+                        if asked.contains("[tool]") && !replied {
+                            let _open = gate.read().await;
+                            let tool = body["tools"][0]["function"]["name"].clone();
+                            return Json(json!({
+                                "id": "chatcmpl-1", "object": "chat.completion", "created": 0,
+                                "model": body["model"],
+                                "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                             "message": {"role": "assistant", "content": null,
+                                                         "tool_calls": [{"id": "call_1", "type": "function",
+                                                             "function": {"name": tool, "arguments": "{}"}}]}}],
+                                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                                          "total_tokens": 2}
+                            }))
+                            .into_response();
+                        }
+                        // An upstream failure whose text names the account
+                        // and echoes the credential it was sent.
+                        if asked.contains("[fail]") && !asked.contains("[tool]") && !asked.contains("[garbage]") {
+                            let echoed = h
+                                .get("authorization")
+                                .map(|v| v.to_str().unwrap().to_owned())
+                                .unwrap_or_default();
+                            return (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": {"message":
+                                    format!("{SENTINEL}: quota exceeded; you sent {echoed}")}})),
+                            )
+                                .into_response();
+                        }
+                        // A malformed reply.
+                        if asked.contains("[garbage]") && !asked.contains("[tool]") {
+                            return format!("not json {SENTINEL}").into_response();
+                        }
                         Json(json!({
                             "id": "chatcmpl-1", "object": "chat.completion", "created": 0,
                             "model": body["model"],
@@ -165,6 +212,7 @@ impl Fixture {
                             "usage": {"prompt_tokens": 1, "completion_tokens": 1,
                                       "total_tokens": 2}
                         }))
+                        .into_response()
                     }
                 }),
             );
@@ -198,11 +246,20 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// With `operator`, the server's own `METRO_MODEL` is the fixture too.
+    async fn start_with(operator: bool) -> Self {
         let fixture = Fixture::start().await;
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             db_path: ":memory:".into(),
-            model: None,
+            model: operator.then(|| metro_server::ModelConfig {
+                base_url: fixture.base_url.clone(),
+                model: "operator-model".into(),
+                api_key: "sk-operator-0123456789".into(),
+            }),
             limits: Limits {
                 agent_timeout: Duration::from_secs(20),
                 ..Limits::default()
@@ -613,7 +670,7 @@ async fn capabilities_are_fixed_and_each_has_its_own_default() {
         // The first connection of each capability is its default.
         assert_eq!(c["is_default"], true, "{c}");
     }
-    let default = providers::default_model(&s.state, "alice")
+    let default = providers::default_model(&s.state, "alice", None)
         .await
         .unwrap()
         .unwrap();
@@ -802,8 +859,11 @@ async fn subscription_sign_ins_are_shared_only_as_bring_your_own_presets() {
     let selected = providers::connection_model_for(&s.state, "bob", None, &id)
         .await
         .unwrap();
+    assert_eq!(selected.connection_id, id);
     assert_eq!(selected.provider_id, "device-openai-oauth");
     assert_eq!(selected.model_id, "gpt-5.5");
+    assert!(selected.effective_device.is_some());
+    assert!(!format!("{selected:?}").contains(&own));
     assert_ne!(own, id);
     // Bob's device relay never serves Alice's sign-in: her connection is not
     // usable through the relay by anyone else.
@@ -1364,4 +1424,757 @@ async fn borrowed_server_typed_answers_are_withheld_after_a_revoke_mid_call() {
 
     // The owner's own calls are unaffected by any of this.
     s.decide("alice", None, &s1).await.unwrap();
+}
+
+/// The first error event after event `after` in `sid`'s lobby, as `token`
+/// reads it.
+async fn error_after(s: &Server, token: &str, sid: &str, after: i64) -> Value {
+    for _ in 0..400 {
+        let (_, events) = s
+            .get(token, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
+            .await;
+        if let Some(e) = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"].as_i64().unwrap() > after && e["kind"] == "error")
+        {
+            return e.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no error after {after}");
+}
+
+/// The run of `token`'s view of `GET /v1/runs` whose task contains `task`.
+async fn run_for(s: &Server, token: &str, task: &str) -> Value {
+    let (status, runs) = s.get(token, "/v1/runs").await;
+    assert_eq!(status, StatusCode::OK, "{runs}");
+    runs["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["task"].as_str().unwrap().contains(task))
+        .cloned()
+        .unwrap_or_else(|| panic!("no run for {task}: {runs}"))
+}
+
+#[tokio::test]
+async fn a_share_revoked_mid_run_reads_like_an_upstream_failure_to_the_room() {
+    let s = Server::start().await;
+    let id = s.connect(ALICE, "custom", "alice-model", true).await;
+    let sid = s.space(ALICE, "mid-run", &["bob", "carol"]).await;
+    let (status, body) = s
+        .share(
+            ALICE,
+            &id,
+            json!({"visibility": "spaces", "space_ids": [sid]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Bob answers with Alice's shared connection in this Space.
+    let (status, body) = s
+        .put(
+            BOB,
+            &format!("/v1/spaces/{sid}/prefs"),
+            json!({"default_model": {"provider_connection_id": id}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lobby = format!("/v1/spaces/{sid}/rooms/lobby/messages");
+
+    // An upstream failure.
+    let (status, failed) = s
+        .post(BOB, &lobby, json!({"text": "@agent [fail] first"}))
+        .await;
+    assert!(status.is_success(), "{failed}");
+    let upstream = error_after(&s, CAROL, &sid, failed["id"].as_i64().unwrap()).await;
+    let (status, garbled) = s
+        .post(BOB, &lobby, json!({"text": "@agent [garbage] third"}))
+        .await;
+    assert!(status.is_success(), "{garbled}");
+    let malformed = error_after(&s, CAROL, &sid, garbled["id"].as_i64().unwrap()).await;
+
+    // The share ends between the run's two model requests.
+    let held = s.fixture.gate.write().await;
+    let (status, asked) = s
+        .post(BOB, &lobby, json!({"text": "@agent [tool] second"}))
+        .await;
+    assert!(status.is_success(), "{asked}");
+    for _ in 0..400 {
+        if s.fixture
+            .seen("/v1/chat/completions")
+            .iter()
+            .any(|c| c.body.to_string().contains("[tool] second"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let (status, _) = s.share(ALICE, &id, json!({"visibility": "personal"})).await;
+    assert_eq!(status, StatusCode::OK);
+    drop(held);
+    let revoked = error_after(&s, CAROL, &sid, asked["id"].as_i64().unwrap()).await;
+    let requests = s
+        .fixture
+        .seen("/v1/chat/completions")
+        .iter()
+        .filter(|c| c.body.to_string().contains("[tool] second"))
+        .count();
+    assert_eq!(requests, 1, "the request after the revoke was never sent");
+
+    // Carol (and Alice, the Space owner) can't tell the three apart: every
+    // error event and its fields read the same.
+    let fields = |e: &Value| (e["kind"].clone(), e["actor"].clone(), e["text"].clone());
+    assert_eq!(fields(&upstream), fields(&revoked));
+    assert_eq!(fields(&upstream), fields(&malformed));
+    assert_eq!(
+        upstream["text"],
+        "The agent stopped: the sender's model failed or is no longer available to this run."
+    );
+    for token in [CAROL, ALICE] {
+        let (_, events) = s
+            .get(token, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
+            .await;
+        let errors: Vec<&Value> = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["kind"] == "error")
+            .collect();
+        assert_eq!(errors.len(), 3, "{token}");
+        assert!(
+            errors.iter().all(|e| e["text"] == upstream["text"]),
+            "{token}"
+        );
+        let transcript = events.to_string();
+        for leak in [
+            "has ended",
+            SENTINEL,
+            ALICE_KEY,
+            s.fixture.base_url.as_str(),
+            "not_allowed",
+            "model_error",
+        ] {
+            assert!(!transcript.contains(leak), "{token}: {leak}");
+        }
+        // Their run views carry no reason.
+        for task in ["[fail] first", "[tool] second", "[garbage] third"] {
+            let run = run_for(&s, token, task).await;
+            assert_eq!(run["status"], "failed", "{run}");
+            assert!(run.get("failure").is_none(), "{token}: {run}");
+            let (status, one) = s
+                .get(token, &format!("/v1/runs/{}", run["id"].as_str().unwrap()))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(one.get("failure").is_none(), "{token}: {one}");
+        }
+    }
+
+    // Alice owns the Space but started none of these runs: her monitoring
+    // view has one public code for all three.
+    let (status, monitoring) = s
+        .get(ALICE, &format!("/v1/monitoring/events?space_id={sid}"))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{monitoring}");
+    let codes: Vec<(String, String)> = monitoring["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| {
+            (
+                e["component"].as_str().unwrap().to_owned(),
+                e["code"].as_str().unwrap().to_owned(),
+            )
+        })
+        .collect();
+    assert_eq!(codes, vec![("provider".to_owned(), "failed".to_owned()); 3]);
+
+    // Bob, who started the runs, learns each reason privately: Metro's own
+    // refusal, or the provider failure's category, never its text.
+    for (task, category) in [
+        ("[fail] first", "server error"),
+        ("[garbage] third", "reply"),
+    ] {
+        let run = run_for(&s, BOB, task).await;
+        assert_eq!(run["failure"]["reason"], "model_error", "{run}");
+        let message = run["failure"]["message"].as_str().unwrap();
+        assert!(message.contains(category), "{message}");
+        for leak in [SENTINEL, ALICE_KEY, s.fixture.base_url.as_str()] {
+            assert!(!message.contains(leak), "{message}");
+        }
+    }
+    let run = run_for(&s, BOB, "[tool] second").await;
+    assert_eq!(run["failure"]["reason"], "not_allowed", "{run}");
+    let message = run["failure"]["message"].as_str().unwrap();
+    assert!(message.starts_with("The agent stopped."), "{message}");
+    assert!(
+        message.contains("default model for this Space"),
+        "{message}"
+    );
+    let (status, one) = s
+        .get(BOB, &format!("/v1/runs/{}", run["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one["failure"], run["failure"]);
+    assert!(!message.contains(ALICE_KEY));
+
+    // Someone outside the Space can't see the run at all.
+    s.remove_member(ALICE, &sid, "carol").await;
+    let (status, _) = s
+        .get(CAROL, &format!("/v1/runs/{}", run["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_borrowers_chat_never_shows_the_owners_provider_text() {
+    let s = Server::start().await;
+    let id = s.connect(ALICE, "custom", "alice-model", true).await;
+    let (status, _) = s
+        .share(ALICE, &id, json!({"visibility": "organization"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = s
+        .put(
+            CAROL,
+            "/v1/model-routing",
+            json!({"enabled": true, "default_chat_id": id}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ask = |token: &'static str| {
+        let s = &s;
+        async move {
+            let (status, sent) = s
+                .post(
+                    token,
+                    "/v1/chat/messages",
+                    json!({"text": "@agent [fail] hi"}),
+                )
+                .await;
+            assert!(status.is_success(), "{sent}");
+            for _ in 0..400 {
+                let (_, events) = s.get(token, "/v1/chat/events").await;
+                if let Some(e) = events["events"].as_array().unwrap().iter().find(|e| {
+                    e["id"].as_i64().unwrap() > sent["id"].as_i64().unwrap() && e["kind"] == "error"
+                }) {
+                    return e["text"].as_str().unwrap().to_owned();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("no error");
+        }
+    };
+    // Neither the borrower's nor the owner's own Chat shows the provider's
+    // text (which echoes the key): its category and status only.
+    let carol = ask(CAROL).await;
+    assert_eq!(
+        carol,
+        "The agent failed. The model service reported a server error. (HTTP 500)"
+    );
+    let (status, body) = s
+        .put(
+            ALICE,
+            "/v1/model-routing",
+            json!({"enabled": true, "default_chat_id": id}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let alice = ask(ALICE).await;
+    assert_eq!(alice, carol);
+    for text in [&carol, &alice] {
+        for leak in [SENTINEL, ALICE_KEY, s.fixture.base_url.as_str()] {
+            assert!(!text.contains(leak), "{text}");
+        }
+    }
+}
+
+/// Everything Metro logs, in this test binary.
+#[derive(Clone, Default)]
+struct Captured {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    written: Arc<tokio::sync::Notify>,
+}
+
+/// The process-wide capture of Metro's logs, installed once. A process-wide
+/// subscriber (not a thread's) sees every callsite whichever thread first
+/// reached it.
+fn captured_logs() -> Captured {
+    static CAPTURED: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
+    CAPTURED
+        .get_or_init(|| {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_env_filter(tracing_subscriber::EnvFilter::new("metro_server=trace"))
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+            captured
+        })
+        .clone()
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.lock().unwrap().extend_from_slice(buf);
+        self.written.notify_waiters();
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Captured {
+    async fn wait_for_enqueue(&self, connection: &str) {
+        let field = format!("connection={connection}");
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                // Register the notification before looking at the buffer.
+                let next_write = self.written.notified();
+                let logged = String::from_utf8_lossy(&self.bytes.lock().unwrap())
+                    .lines()
+                    .any(|line| line.contains("device job queued") && line.contains(&field));
+                if logged {
+                    return;
+                }
+                next_write.await;
+            }
+        })
+        .await
+        .expect("the device job was enqueued");
+    }
+}
+
+#[tokio::test]
+async fn a_device_classifiers_own_text_reaches_no_log_response_or_room() {
+    let captured = captured_logs();
+
+    let s = Arc::new(Server::start().await);
+    let id = s
+        .connect(ALICE, "device-systemone", "jev-local", false)
+        .await;
+    let (status, issued) = s
+        .post(
+            ALICE,
+            &format!("/v1/providers/{id}/device-token"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    let token = issued["token"].as_str().unwrap().to_owned();
+    assert!(claim(&s, &token).await.is_none()); // online now
+    let sid = s.space(ALICE, "Device classifier", &["bob"]).await;
+    let (status, body) = s
+        .put(ALICE, "/v1/model-routing", json!({"classifier_id": id}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s
+        .put(
+            ALICE,
+            &format!("/v1/spaces/{sid}/prefs"),
+            json!({"classify_unaddressed": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The device fails with its own text, then answers malformed with it.
+    let results = [
+        json!({"ok": false, "error": format!("{SENTINEL}: vendor said no")}),
+        json!({"ok": true, "response": {"model": SENTINEL, "answers": {SENTINEL: SENTINEL}}}),
+    ];
+    for (n, result) in results.into_iter().enumerate() {
+        let sent = {
+            let (s, sid) = (s.clone(), sid.clone());
+            tokio::spawn(async move {
+                s.post(
+                    ALICE,
+                    &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+                    json!({"text": format!("lunch plans {n}?")}),
+                )
+                .await
+            })
+        };
+        let job = claim_soon(&s, &token).await;
+        s.http
+            .post(format!(
+                "{}/v1/device/jobs/{}/result",
+                s.base,
+                job["id"].as_str().unwrap()
+            ))
+            .bearer_auth(&token)
+            .json(&result)
+            .send()
+            .await
+            .unwrap();
+        let (status, response) = sent.await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+        let expected = ["unreachable", "invalid_answer"][n];
+        assert_eq!(
+            response["addressing_note"],
+            json!({"kind": "classification_failed", "reason": expected})
+        );
+        assert!(!response.to_string().contains(SENTINEL), "{response}");
+    }
+    for token in [ALICE, BOB] {
+        let (_, events) = s
+            .get(token, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
+            .await;
+        assert!(!events.to_string().contains(SENTINEL), "{events}");
+    }
+    let logs = String::from_utf8(captured.bytes.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("typed model call failed"), "{logs}");
+    assert!(logs.contains("device_error"), "{logs}");
+    assert!(
+        !logs.contains(SENTINEL),
+        "a log line carries the device's text:\n{logs}"
+    );
+}
+
+#[tokio::test]
+async fn a_member_removed_mid_run_stops_its_next_request() {
+    // The operator's model serves anyone without a saved default (Carol).
+    let s = Server::start_with(true).await;
+    // Bob's own default, and an organization-wide share of Alice's: neither
+    // is tied to a Space, and neither run picks an explicit model.
+    s.connect(BOB, "custom", "bob-model", true).await;
+    let shared = s.connect(ALICE, "custom", "alice-model", true).await;
+    let (status, _) = s
+        .share(ALICE, &shared, json!({"visibility": "organization"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for (label, sender, selection) in [
+        ("own", BOB, None),
+        ("shared", BOB, Some(shared.clone())),
+        ("operator", CAROL, None),
+    ] {
+        let user = sender.trim_end_matches("-token");
+        let sid = s.space(ALICE, &format!("removal {label}"), &[user]).await;
+        if let Some(id) = selection {
+            let (status, body) = s
+                .put(
+                    sender,
+                    &format!("/v1/spaces/{sid}/prefs"),
+                    json!({"default_model": {"provider_connection_id": id}}),
+                )
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let text = format!("@agent [tool] {label} run");
+        let requests = || {
+            s.fixture
+                .seen("/v1/chat/completions")
+                .iter()
+                .filter(|c| c.body.to_string().contains(&text))
+                .count()
+        };
+        let held = s.fixture.gate.write().await;
+        let (status, sent) = s
+            .post(
+                sender,
+                &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+                json!({"text": text}),
+            )
+            .await;
+        assert!(status.is_success(), "{sent}");
+        for _ in 0..400 {
+            if requests() == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(requests(), 1, "{label}: the first request arrived");
+        if label == "operator" {
+            let first = s.fixture.seen("/v1/chat/completions");
+            let first = first
+                .iter()
+                .find(|c| c.body.to_string().contains(&text))
+                .unwrap();
+            assert_eq!(
+                first.body["model"], "operator-model",
+                "{label}: the operator's model"
+            );
+        }
+        // The membership ends between the run's two requests. (Removal also
+        // stops the person's runs, but only after it commits: this is that gap.)
+        s.state.db.remove_member(&sid, user).unwrap();
+        drop(held);
+        let mut ended = false;
+        for _ in 0..400 {
+            if s.state
+                .runs
+                .list()
+                .iter()
+                .any(|r| r.space_id == sid && r.status.is_terminal())
+            {
+                ended = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(ended, "{label}: the run ended");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(requests(), 1, "{label}: no request after the removal");
+    }
+}
+
+/// Alice's run in `sid` for `text`, held at its first model request while
+/// `between` runs, then released; her private failure for it.
+async fn failure_after_change<F, Fut>(s: &Server, sid: &str, text: &str, between: F) -> Value
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let requests = || {
+        s.fixture
+            .seen("/v1/chat/completions")
+            .iter()
+            .filter(|c| c.body.to_string().contains(text))
+            .count()
+    };
+    let held = s.fixture.gate.write().await;
+    let (status, sent) = s
+        .post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+            json!({"text": text}),
+        )
+        .await;
+    assert!(status.is_success(), "{sent}");
+    for _ in 0..400 {
+        if requests() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(requests(), 1, "the first request arrived");
+    between().await;
+    drop(held);
+    for _ in 0..400 {
+        let (_, runs) = s.get(ALICE, "/v1/runs").await;
+        if let Some(run) = runs["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["task"].as_str().unwrap().contains(text) && r["status"] == "failed")
+        {
+            assert_eq!(requests(), 1, "no request after the change");
+            return run["failure"].clone();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the run did not fail");
+}
+
+#[tokio::test]
+async fn an_explicit_models_changed_connection_is_reported_as_changed() {
+    let s = Server::start().await;
+    let id = s.connect(ALICE, "custom", "alice-model", true).await;
+    let sid = s.space(ALICE, "explicit", &[]).await;
+    // An explicit model (with its model id) as Alice's default in the Space.
+    let (status, body) = s
+        .put(
+            ALICE,
+            &format!("/v1/spaces/{sid}/prefs"),
+            json!({"default_model": {"provider_connection_id": id, "model_id": "alice-model"}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let failure = failure_after_change(&s, &sid, "@agent [tool] explicit", || async {
+        // A new key changes the connection the selection was checked against.
+        let (status, body) = s
+            .patch(
+                ALICE,
+                &format!("/v1/providers/{id}"),
+                json!({"api_key": "sk-alice-rotated-0123456789"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    })
+    .await;
+    assert_eq!(failure["reason"], "connection_changed", "{failure}");
+}
+
+#[tokio::test]
+async fn a_default_replaced_mid_run_is_reported_as_changed() {
+    let s = Server::start().await;
+    // Two connections at the same revision: only identity tells them apart.
+    let first = s.connect(ALICE, "custom", "alice-model", true).await;
+    let second = s.connect(ALICE, "custom", "alice-model-2", true).await;
+    let sid = s.space(ALICE, "replaced", &[]).await;
+    let failure = failure_after_change(&s, &sid, "@agent [tool] replaced", || async {
+        // The default is deleted; the other connection becomes the default.
+        let (status, body) = s
+            .send(
+                reqwest::Method::DELETE,
+                ALICE,
+                &format!("/v1/providers/{first}"),
+                None,
+            )
+            .await;
+        assert!(status.is_success(), "{body}");
+    })
+    .await;
+    assert_eq!(failure["reason"], "connection_changed", "{failure}");
+    assert!(
+        failure["message"]
+            .as_str()
+            .unwrap()
+            .contains("changed or was replaced"),
+        "{failure}"
+    );
+    let _ = second;
+}
+
+/// A `device-systemone` connection of `token`'s person, paired and online:
+/// its id and device token.
+async fn online_device(s: &Server, token: &str) -> (String, String) {
+    let id = s
+        .connect(token, "device-systemone", "jev-local", false)
+        .await;
+    let (status, issued) = s
+        .post(
+            token,
+            &format!("/v1/providers/{id}/device-token"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    let device = issued["token"].as_str().unwrap().to_owned();
+    assert!(claim(s, &device).await.is_none()); // online now
+    (id, device)
+}
+
+#[tokio::test]
+async fn device_claims_never_deliver_a_retired_typed_model() {
+    let captured = captured_logs();
+    let s = Arc::new(Server::start().await);
+    let sid = s.space(ALICE, "Pinned device jobs", &["bob"]).await;
+    for owner in [BOB, ALICE] {
+        let (id, device) = online_device(&s, owner).await;
+        if owner == ALICE {
+            let (status, body) = s
+                .share(ALICE, &id, json!({"visibility": "organization"}))
+                .await;
+            assert_eq!(status, StatusCode::OK, "{body}");
+        }
+        let pending = {
+            let (s, sid, id) = (s.clone(), sid.clone(), id.clone());
+            tokio::spawn(async move { s.decide("bob", Some(&sid), &id).await })
+        };
+        captured.wait_for_enqueue(&id).await;
+        let (status, body) = s
+            .patch(
+                owner,
+                &format!("/v1/providers/{id}"),
+                json!({"model": "jev-replacement"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert!(
+            claim(&s, &device).await.is_none(),
+            "claim released a stale payload"
+        );
+        let err = pending.await.unwrap().unwrap_err();
+        assert_eq!(
+            err,
+            ProviderError::Device(metro_server::device_relay::DeviceError::AccessRevoked)
+        );
+        assert_eq!(err.status(), StatusCode::FORBIDDEN);
+    }
+}
+
+#[tokio::test]
+async fn space_work_queued_for_a_device_is_withheld_after_the_caller_leaves() {
+    let captured = captured_logs();
+    let s = Arc::new(Server::start().await);
+    // Bob's own device, and Alice's shared with the whole organization.
+    let (own, own_device) = online_device(&s, BOB).await;
+    let (shared, shared_device) = online_device(&s, ALICE).await;
+    let (status, _) = s
+        .share(ALICE, &shared, json!({"visibility": "organization"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for (label, id, device) in [("own", own, own_device), ("shared", shared, shared_device)] {
+        let sid = s.space(ALICE, &format!("leaving {label}"), &["bob"]).await;
+        let pending = {
+            let (s, sid, id) = (s.clone(), sid.clone(), id.clone());
+            tokio::spawn(async move { s.decide("bob", Some(&sid), &id).await })
+        };
+        // The relay logged this specific job after inserting it in the queue.
+        captured.wait_for_enqueue(&id).await;
+        assert!(
+            !pending.is_finished(),
+            "{label}: still waiting for the device"
+        );
+        s.state.db.remove_member(&sid, "bob").unwrap();
+        // The device never receives the Space's payload.
+        assert!(
+            claim(&s, &device).await.is_none(),
+            "{label}: released after removal"
+        );
+        let r = pending.await.unwrap();
+        assert_eq!(
+            r,
+            Err(ProviderError::Device(
+                metro_server::device_relay::DeviceError::AccessRevoked
+            )),
+            "{label}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn typed_calls_for_a_space_need_the_caller_still_a_member() {
+    let s = Arc::new(Server::start().await);
+    // Bob's own System One, and Alice's shared with the whole organization.
+    let own = s.connect(BOB, "custom-systemone", "jev-latest", true).await;
+    let shared = s
+        .connect(ALICE, "custom-systemone", "jev-latest", true)
+        .await;
+    let (status, _) = s
+        .share(ALICE, &shared, json!({"visibility": "organization"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent = || s.fixture.seen("/v1/systemone").len();
+    for (label, id) in [("own", own), ("shared", shared)] {
+        // Removed after the message was admitted, before the classifier
+        // call is dispatched: nothing is sent.
+        let sid = s.space(ALICE, &format!("typed {label}"), &["bob"]).await;
+        s.state.db.remove_member(&sid, "bob").unwrap();
+        let before = sent();
+        let r = s.decide("bob", Some(&sid), &id).await;
+        assert!(r.is_err(), "{label}: {r:?}");
+        assert_eq!(sent(), before, "{label}: nothing reached the endpoint");
+        // Personal use is unaffected.
+        assert!(s.decide("bob", None, &id).await.is_ok(), "{label}");
+
+        // Removed while the endpoint works: the answer is withheld.
+        let sid = s
+            .space(ALICE, &format!("typed late {label}"), &["bob"])
+            .await;
+        let held = s.fixture.gate.write().await;
+        let before = sent();
+        let pending = {
+            let (s, sid, id) = (s.clone(), sid.clone(), id.clone());
+            tokio::spawn(async move { s.decide("bob", Some(&sid), &id).await })
+        };
+        for _ in 0..400 {
+            if sent() > before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(sent(), before + 1, "{label}: the call was sent");
+        s.state.db.remove_member(&sid, "bob").unwrap();
+        drop(held);
+        let r = pending.await.unwrap();
+        assert!(
+            matches!(r, Err(ProviderError::Use(UseError::Revoked))),
+            "{label}: {r:?}"
+        );
+    }
 }

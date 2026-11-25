@@ -6,11 +6,13 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { BOB_PNG, profileWorld } from "./test/fixtures";
+import { launched } from "../../../test/launched";
 
 type W = ReturnType<typeof profileWorld>;
 
 async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice"): Promise<App> {
   const app = await open("./test/Harness.tsx", {
+    modules: launched(),
     network: w.network as any,
     platform: "linux",
     width: 1280,
@@ -236,7 +238,7 @@ test("a server without profiles: the page says so, the transcript still works", 
     const inner = network[key]!;
     network[key] = (req: any) => (new URL(req.url).pathname.includes("profile") ? { status: 404, body: { error: "not found" } } : inner(req));
   }
-  const app = await open("./test/Harness.tsx", { network: network as any, platform: "linux", width: 1280, height: 900, localeSettings: { timeZone: "UTC" } });
+  const app = await open("./test/Harness.tsx", { modules: launched(), network: network as any, platform: "linux", width: 1280, height: 900, localeSettings: { timeZone: "UTC" } });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);

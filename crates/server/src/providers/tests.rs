@@ -442,6 +442,73 @@ fn old_connections_migrate_additively_as_chat() {
 }
 
 #[test]
+fn patches_merge_only_their_fields_into_the_committed_row() {
+    use super::store::{self, Patch, Patched};
+    let mut conn = old_schema_db();
+    store::init(&conn).unwrap();
+    let mut c = row(3, "alice", "openai", "");
+    c.sealed_key = Some(vec![1; 40]);
+    assert!(store::insert(&mut conn, &c, 20).unwrap());
+    let snapshot = store::get(&conn, "alice", &c.id).unwrap().unwrap();
+
+    // Committed after the snapshot: a key rotation and a model.
+    let rotate = Patch {
+        sealed_key: Some(Some(vec![2; 40])),
+        model: Some("gpt-new".into()),
+        ..Patch::default()
+    };
+    let Patched::Saved(rotated) = store::patch(&mut conn, "alice", &c.id, &rotate, None).unwrap()
+    else {
+        panic!("rotation not saved");
+    };
+    assert_eq!(rotated.config_rev, snapshot.config_rev + 1);
+
+    // A rename and a default flag prepared from the snapshot keep both.
+    let flag = Patch {
+        name: Some("Renamed".into()),
+        is_default: Some(true),
+        ..Patch::default()
+    };
+    let Patched::Saved(saved) = store::patch(&mut conn, "alice", &c.id, &flag, None).unwrap()
+    else {
+        panic!("rename not saved");
+    };
+    assert_eq!(saved.name, "Renamed");
+    assert!(saved.is_default);
+    assert_eq!(saved.sealed_key, Some(vec![2; 40]));
+    assert_eq!(saved.model, "gpt-new");
+    assert_eq!(saved.config_rev, rotated.config_rev);
+
+    // The default check sees the committed row, not the caller's.
+    let clear = Patch {
+        model: Some(String::new()),
+        ..Patch::default()
+    };
+    assert!(matches!(
+        store::patch(&mut conn, "alice", &c.id, &clear, None).unwrap(),
+        Patched::DefaultNeedsModel
+    ));
+    // Endpoint changes are compare-and-set only.
+    let endpoint = Patch {
+        base_url: Some("https://example.invalid/v1".into()),
+        ..Patch::default()
+    };
+    assert!(matches!(
+        store::patch(&mut conn, "alice", &c.id, &endpoint, None).unwrap(),
+        Patched::Changed
+    ));
+    assert!(matches!(
+        store::patch(&mut conn, "alice", &c.id, &endpoint, Some(&snapshot)).unwrap(),
+        Patched::Changed
+    ));
+    assert!(matches!(
+        store::patch(&mut conn, "bob", &c.id, &flag, None).unwrap(),
+        Patched::Missing
+    ));
+    assert_eq!(store::get(&conn, "alice", &c.id).unwrap().unwrap(), saved);
+}
+
+#[test]
 fn presets_run_only_on_the_callers_own_connection() {
     use super::{sharing, store};
     let mut conn = old_schema_db();

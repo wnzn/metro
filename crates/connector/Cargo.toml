@@ -23,6 +23,8 @@ anyhow = "1.0.100"
 metro-model-protocol = { path = "../model-protocol" }
 # The desktop updater: release verification and the anonymous release check.
 metro-release = { path = "../release", features = ["async"] }
+# netpolicy.rs: how a plain-HTTP Metro server URL is treated.
+metro-url-policy = { path = "../url-policy" }
 # openai_oauth: PKCE and state encoding.
 base64 = "0.22"
 # openai_oauth: ID-token parsing. Same single crypto backend as metro-auth;

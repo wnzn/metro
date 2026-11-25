@@ -45,6 +45,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "s
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["v4"] }
+url = "2.5"
 
 # main.rs: a listening socket inherited from the desktop launcher
 # (METRO_LISTEN_FD / METRO_LISTEN_PROTOCOL_INFO), checked before use.

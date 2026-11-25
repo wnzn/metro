@@ -117,7 +117,7 @@ async function startChrome() {
   chrome = spawn(executable, [
     "--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
     `--user-data-dir=${profile}`, "--remote-debugging-port=0",
-    "--host-resolver-rules=MAP metro.lan 127.0.0.1", "about:blank",
+    "--host-resolver-rules=MAP metro.lan 127.0.0.1, MAP metro.tail1234.ts.net 127.0.0.1", "about:blank",
   ], { stdio: "ignore" });
   chromeClosed = new Promise((resolve) => { chrome.once("close", resolve); });
 
@@ -606,32 +606,169 @@ await test("credentials in the URL are ignored and scrubbed", async () => {
   assert(apiCalls().length === 0, "used the URL token");
 });
 
-await test("plain HTTP on a non-loopback host refuses sign-in before any request", async () => {
+await test("plain HTTP on a Tailscale name signs in without a warning", async () => {
   mock.log.length = 0;
-  await goto(`http://metro.lan:${port}/admin`);
-  assert(await evaluate(vis("unsafe")), "warning not shown");
-  assert(!(await evaluate(vis("signin"))), "sign-in shown");
-  assert((await text("unsafe-ssh")).includes(`8080:127.0.0.1:${port}`) && (await text("unsafe-ssh")).includes("metro.lan"), "ssh hint");
-  // Even if someone un-hides the form, submission sends nothing.
+  const ts = `http://metro.tail1234.ts.net:${port}`;
+  await goto(ts + "/admin");
+  assert(await evaluate(vis("signin")), "sign-in hidden");
+  assert(!(await evaluate(vis("plain-http"))), "warning shown on Tailscale");
+  assert(!(await evaluate(vis("unsafe"))), "refused on Tailscale");
+  assert(!(await evaluate(vis("plain-http-note"))), "unencrypted note on Tailscale");
+  await signIn(ADMIN);
+  await waitFor(vis("panel"));
+  assert(apiCalls().length > 0 && apiCalls().every((r) => r.authOk), "sign-in didn't reach the server");
+  await click("#sign-out");
+});
+
+await test("plain HTTP on another host warns first; the token goes out only after Sign in anyway", async () => {
+  mock.log.length = 0;
+  const lan = `http://metro.lan:${port}`;
+  await goto(lan + "/admin");
+  await evaluate("localStorage.clear()");
+  await goto(lan + "/admin");
+  assert(await evaluate(vis("plain-http")), "warning not shown");
+  assert(!(await evaluate(vis("signin"))), "token field shown before the warning was accepted");
+  assert(!(await evaluate(vis("unsafe"))), "plain HTTP is refused outright");
+  const reason = await text("plain-http-reason");
+  assert(reason.includes(`metro.lan:${port}`) && reason.includes("could read the admin token"), "warning text: " + reason);
+  assert((await text("plain-http-accept")) === "Sign in anyway", "button label");
+  assert(await evaluate("document.activeElement.id") === "plain-http-accept", "warning button not focused");
+  // Even if someone un-hides the form, submission sends nothing before the warning is accepted.
   await evaluate("document.getElementById('signin').hidden = false");
   await signIn(ADMIN);
   await sleep(200);
-  assert(apiCalls().length === 0, "credential sent over plain HTTP");
+  assert(apiCalls().length === 0, "credential sent before Sign in anyway");
   assert(await evaluate("document.getElementById('token').value") === "", "token left in field");
-  await shot("admin-insecure.png", 900, 700);
+  assert(await evaluate(vis("plain-http")) && !(await evaluate(vis("signin"))), "warning not back");
+  await shot("admin-plain-http.png", 900, 700);
   await page("Emulation.clearDeviceMetricsOverride");
+
+  await click("#plain-http-accept");
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "form not shown after accepting");
+  assert(await evaluate(vis("plain-http-note")), "no unencrypted note");
+  assert(await evaluate("document.activeElement.id") === "token", "token field not focused");
+  await signIn(ADMIN);
+  await waitFor(vis("panel"));
+  assert(apiCalls().every((r) => r.authOk && !r.cookie), "bad request");
+  // The choice, never the token, is remembered for this server.
+  const stored = await evaluate("JSON.stringify(Object.entries(localStorage))");
+  assert(stored === JSON.stringify([["metro.admin.plainHttpAccepted", "1"]]), "storage: " + stored.replace(/metro_[a-f0-9]{36}/g, "<redacted>"));
+  await click("#sign-out");
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "asked again after sign-out");
+
+  await goto(lan + "/admin");
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "asked again on reload");
+  assert(await evaluate(vis("plain-http-note")), "no unencrypted note on reload");
+  await evaluate("localStorage.clear()");
+});
+
+await test("Forget this choice withdraws the plain-HTTP choice; sign-out alone keeps it", async () => {
+  mock.log.length = 0;
+  const lan = `http://metro.lan:${port}`;
+  await goto(lan + "/admin");
+  await evaluate("localStorage.clear()");
+  await goto(lan + "/admin");
+  await click("#plain-http-accept");
+  await signIn(ADMIN);
+  await waitFor(vis("panel"));
+  await click("#sign-out");
+  // Signing out keeps the choice.
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "sign-out dropped the choice");
+  assert(await evaluate(vis("plain-http-note")), "no note after sign-out");
+  assert((await text("plain-http-forget")) === "Forget this choice", "forget label");
+  await type("token", "typed-but-not-sent");
+  await click("#plain-http-forget");
+  assert(await evaluate("localStorage.getItem('metro.admin.plainHttpAccepted')") === null, "choice still stored");
+  assert(await evaluate(vis("plain-http")) && !(await evaluate(vis("signin"))), "warning not shown again");
+  assert(await evaluate("document.getElementById('token').value") === "", "token left in the field");
+  await goto(lan + "/admin");
+  assert(await evaluate(vis("plain-http")) && !(await evaluate(vis("signin"))), "warning not shown after reload");
+  assert(!(await evaluate(vis("plain-http-note"))), "note shown without a choice");
+  assert(apiCalls().filter((r) => r.url === "/v1/me").length === 1, "unexpected sign-in requests");
+  await evaluate("localStorage.clear()");
+});
+
+await test("withdrawing the choice in another tab signs this one out; the stored choice is checked before every send", async () => {
+  const lan = `http://metro.lan:${port}`;
+  await goto(lan + "/admin");
+  await evaluate("localStorage.clear()");
+  await goto(lan + "/admin");
+  await click("#plain-http-accept");
+  await signIn(ADMIN);
+  await waitFor(vis("panel") + " && document.querySelectorAll('#users-body tr').length > 0");
+
+  // Same tab: the choice disappears from storage (no event here); the next
+  // send is refused before any request.
+  mock.log.length = 0;
+  await evaluate("localStorage.removeItem('metro.admin.plainHttpAccepted')");
+  await click("#refresh");
+  await sleep(300);
+  assert(apiCalls().length === 0, "a request went out without the stored choice");
+  await evaluate("localStorage.setItem('metro.admin.plainHttpAccepted', '1')");
+
+  // A second tab of the same server withdraws it.
+  const { targetId: other } = await cdp("Target.createTarget", { url: "about:blank" });
+  const { sessionId: otherSession } = await cdp("Target.attachToTarget", { targetId: other, flatten: true });
+  const tab2 = (m, p) => cdp(m, p, otherSession);
+  const eval2 = async (expr) => (await tab2("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true })).result.value;
+  await tab2("Runtime.enable");
+  await tab2("Page.enable");
+  const navigation = await tab2("Page.navigate", { url: lan + "/admin" });
+  assert(!navigation.errorText, "second tab navigation failed: " + navigation.errorText);
+  const sharedChoice = `location.origin === ${JSON.stringify(lan)} && document.readyState === 'complete'
+    && document.getElementById('signin')?.hidden === false
+    && document.getElementById('plain-http-note')?.hidden === false`;
+  for (const end = Date.now() + 5000; Date.now() < end; await sleep(50)) {
+    if (await eval2(sharedChoice)) break;
+  }
+  assert(await eval2(sharedChoice), "second tab didn't share the choice: " + await eval2(
+    `JSON.stringify({origin: location.origin, ready: document.readyState,
+      warning: document.getElementById('plain-http')?.hidden === false,
+      accepted: location.origin === ${JSON.stringify(lan)} && localStorage.getItem('metro.admin.plainHttpAccepted') === '1'})`
+  ));
+  mock.log.length = 0;
+  await eval2("document.getElementById('plain-http-forget').click()");
+  await waitFor(`document.getElementById('panel').hidden && ${vis("plain-http")} && document.getElementById('signin').hidden`);
+  assert((await text("plain-http-status")).includes("withdrawn in another tab"), "no explanation: " + (await text("plain-http-status")));
+  assert(await evaluate("document.querySelectorAll('#users-body tr').length") === 0, "data kept after sign-out");
+  await sleep(300);
+  assert(apiCalls().length === 0, "a request went out after the choice was withdrawn");
+  await cdp("Target.closeTarget", { targetId: other });
+  await evaluate("localStorage.clear()");
+});
+
+await test("hostClass matches the shared host vectors (crates/url-policy/testdata/host_vectors.json)", async () => {
+  const src = readFileSync(join(here, "admin.js"), "utf8");
+  const begin = src.indexOf("// host-class:begin"), end = src.indexOf("// host-class:end");
+  assert(begin > 0 && end > begin, "host-class markers missing");
+  const hostClass = new Function(src.slice(begin, end) + "\nreturn hostClass;")();
+  const { hosts } = JSON.parse(readFileSync(join(here, "../../../url-policy/testdata/host_vectors.json"), "utf8"));
+  assert(hosts.length > 40, "too few vectors");
+  const wrong = hosts.filter((v) => hostClass(v.host) !== v.class).map((v) => `${JSON.stringify(v.host)}: ${hostClass(v.host)}`);
+  assert(wrong.length === 0, "mismatches: " + wrong.join(", "));
+});
+
+await test("loopback pages never show the plain-HTTP warning", async () => {
+  await goto(base + "/admin");
+  assert(await evaluate(vis("signin")), "sign-in hidden");
+  assert(!(await evaluate(vis("plain-http"))) && !(await evaluate(vis("plain-http-note"))), "warning on loopback");
 });
 
 await test("a framed panel refuses sign-in", async () => {
   await page("Page.navigate", { url: base + "/frame.html" });
-  await sleep(600);
-  const { frameTree } = await page("Page.getFrameTree");
-  const child = frameTree.childFrames?.[0]?.frame;
-  assert(child, "no iframe");
-  const { executionContextId } = await page("Page.createIsolatedWorld", { frameId: child.id });
-  const r = await page("Runtime.evaluate", { contextId: executionContextId, returnByValue: true,
-    expression: "!document.getElementById('unsafe').hidden && document.getElementById('signin').hidden" });
-  assert(r.result.value === true, "framed page offers sign-in");
+  // Poll rather than sleep: under load the frame and its script take longer.
+  let refused = false;
+  for (const end = Date.now() + 5000; !refused && Date.now() < end; await sleep(100)) {
+    const { frameTree } = await page("Page.getFrameTree");
+    const child = frameTree.childFrames?.[0]?.frame;
+    if (!child) continue;
+    const { executionContextId } = await page("Page.createIsolatedWorld", { frameId: child.id });
+    const r = await page("Runtime.evaluate", { contextId: executionContextId, returnByValue: true,
+      expression: "document.readyState === 'complete' && !!document.getElementById('unsafe') && " +
+        "!document.getElementById('unsafe').hidden && document.getElementById('signin').hidden" });
+    refused = r.result.value === true;
+  }
+  assert(refused, "framed page offers sign-in");
 });
 
 await test("the page never logs to the console and has no CSP violations", async () => {

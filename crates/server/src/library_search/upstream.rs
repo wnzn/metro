@@ -122,11 +122,17 @@ pub struct ProviderModels<'a> {
 /// connection itself can no longer serve this caller here (deleted, share
 /// revoked, wrong capability, not a media adapter, no model, a device
 /// connection revoked or removed); transient otherwise (busy, offline,
-/// timeouts, endpoint errors, key or configuration trouble).
+/// timeouts, endpoint errors, key or configuration trouble). Metro faults
+/// remain internal errors rather than being reported as upstream failures.
 fn provider_error(e: crate::providers::ProviderError) -> MediaError {
     use crate::device_relay::DeviceError as D;
     use crate::providers::{ProviderError as P, UseError as U};
-    let gone = matches!(
+    if matches!(
+        &e,
+        P::Internal | P::Use(U::Internal) | P::Device(D::Internal)
+    ) {
+        MediaError::internal(e.to_string())
+    } else if matches!(
         &e,
         P::Use(
             U::NotFound
@@ -136,10 +142,10 @@ fn provider_error(e: crate::providers::ProviderError) -> MediaError {
                 | U::Unsupported
                 | U::NoModel
         ) | P::Device(D::AccessRevoked | D::NotFound | D::CredentialChanged)
-    );
-    MediaError {
-        message: e.to_string(),
-        gone,
+    ) {
+        MediaError::gone(e.to_string())
+    } else {
+        MediaError::transient(e.to_string())
     }
 }
 
@@ -200,7 +206,10 @@ impl MediaModels for ProviderModels<'_> {
                     ))
                 })
                 .await
-                .map_err(|_| MediaError::transient("internal error reading the connection"))?;
+                .map_err(|e| {
+                    tracing::error!(%e, "reading the media embedding connection");
+                    MediaError::internal("internal error reading the connection")
+                })?;
             let a = grant.map_err(use_error)?;
             Ok(a.row.capability == crate::providers::Capability::Embeddings
                 && crate::providers::catalog::find(&a.row.provider_id).is_some_and(|e| {
@@ -279,4 +288,26 @@ pub async fn put_settings(
     Ok(Json(
         engine::save_settings(&state.db, &models, &who.id, body).await?,
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::device_relay::DeviceError as D;
+    use crate::providers::{ProviderError as P, UseError as U};
+
+    #[test]
+    fn library_keeps_provider_and_relay_internal_failures_distinct() {
+        for e in [P::Internal, P::Use(U::Internal), P::Device(D::Internal)] {
+            assert_eq!(provider_error(e).kind, MediaFailure::Internal);
+        }
+        assert_eq!(
+            provider_error(P::Device(D::AccessRevoked)).kind,
+            MediaFailure::Gone
+        );
+        assert_eq!(
+            provider_error(P::Endpoint("unavailable".into())).kind,
+            MediaFailure::Upstream
+        );
+    }
 }

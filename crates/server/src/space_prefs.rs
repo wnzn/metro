@@ -308,7 +308,12 @@ async fn selection_route(
         .await
         {
             Ok(selection) => route.turn_selection = Some(selection),
-            Err(e) => route.blocked = Some(route.unavailable(&e)),
+            Err(e) => {
+                // A Space route: the room reads a generic failure.
+                let refusal = route.refused(Some(space), &e);
+                route.blocked = Some(refusal.shown);
+                route.sender_note = refusal.note;
+            }
         }
     }
     route
@@ -503,7 +508,12 @@ mod tests {
                 assert_eq!(agents[0].handle, "agent");
                 assert_eq!(agents[0].name, "Metro");
                 assert!(agents[0].is_default);
-                assert_eq!(agents[0].tools, crate::space_agents::all_tools());
+                assert_eq!(agents[0].tools, crate::space_agents::default_tools());
+                assert!(
+                    crate::pages::agent_tools::NAMES
+                        .iter()
+                        .all(|tool| !agents[0].allows(tool))
+                );
             }
             let conn = db.lock();
             assert!(load_in(&conn, &a, "alice").unwrap().classify_unaddressed);

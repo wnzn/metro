@@ -12,6 +12,7 @@ import { checkPicked, pickAttachments, picking, pickNote } from "./attachmentSen
 import { disconnect, openChat, openPlace } from "../../store";
 import { toAttachments } from "../../api/client";
 import { clearAllStaged, dropSent, hasPendingAttachments, markUploaded, stage, stagedFor } from "./attachmentDraft";
+import { launched } from "../../../test/launched";
 
 type W = ReturnType<typeof attachmentWorld>;
 const enc = new TextEncoder();
@@ -19,7 +20,7 @@ const NOTE = { name: "notes.txt", type: "text/plain", data: enc.encode("meeting 
 const PLAN = { name: "plan.md", type: "text/markdown", data: enc.encode("# Plan") };
 
 async function signIn(w: W, user = "alice") {
-  const app = await open("../../../App.tsx", { network: w.network as any, platform: "linux", width: 1200, height: 800 });
+  const app = await open("../../../App.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1200, height: 800 });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);

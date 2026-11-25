@@ -187,7 +187,7 @@ impl<'a> Engine<'a> {
                     fingerprint: fp,
                 }),
                 Err(e) => {
-                    tracing::debug!(error = %e, source = %source.key(), "search source skipped");
+                    tracing::debug!(source = %source.key(), "search source skipped");
                     report.partial = true;
                     report.failed.push(e.0.clone());
                     match source {
@@ -633,8 +633,8 @@ impl<'a> Engine<'a> {
                     }
                     None => failed += 1,
                 },
-                Ok(Err(e)) => {
-                    tracing::debug!(error = %e, "System One rerank failed");
+                Ok(Err(_)) => {
+                    tracing::debug!("System One rerank failed");
                     failed += 1;
                 }
                 Err(_) => failed += 1,

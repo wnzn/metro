@@ -5,11 +5,12 @@
 
 import { expect, open, test } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof world>;
 
 async function inChat(f: F, width = 1200, user: "alice" | "carol" = "alice") {
-  const app = await open("../../App.tsx", { network: f.network as any, platform: "linux", width, height: 800 });
+  const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width, height: 800 });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);

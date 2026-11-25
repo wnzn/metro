@@ -57,6 +57,7 @@ async fn main() -> anyhow::Result<()> {
     metro_server::schedules::spawn(state.clone());
     // The daily verified release check (release builds, METRO_UPDATE_CHECK on).
     metro_server::updates::spawn(state.clone());
+    metro_server::pages::spawn_cleanup(state.clone());
 
     // Read before the stdin watcher starts: on Windows the inherited
     // socket's description is the first line of stdin.

@@ -4,11 +4,12 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof world>;
 
 async function signIn(f: F, user: string, existing?: App) {
-  const app = existing ?? (await open("../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 900 }));
+  const app = existing ?? (await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 900 }));
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
@@ -388,7 +389,7 @@ test("Search is the box at the top of every page and Scheduled tasks a sidebar d
 
 test("in the narrowest window the opt-ins, their consent lines, Save and the runner controls stay reachable", async () => {
   const { f } = routingWorld();
-  const app = await open("../../App.tsx", { network: f.network as any, platform: "linux", width: 720, height: 560 });
+  const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 720, height: 560 });
   await signIn(f, "alice", app);
   await settings(app, "routing");
   await app.waitFor("id:routing-enabled");

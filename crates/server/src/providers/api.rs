@@ -13,19 +13,22 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use rig_core::completion::CompletionRequest;
 use rig_core::error::ProviderError as RigProviderError;
 use rig_core::model::ModelList;
 use rig_core::providers::registry::ProviderConfig;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
+use std::time::Duration;
 
+use super::budget::{BudgetedHttp, LISTING_MAX_RESPONSE_BYTES, PROBE_MAX_RESPONSE_BYTES};
 use super::catalog::{self, Adapter, Capability, Entry, Execution};
 use super::models::{self, ModelView, Thinking};
 use super::secret::MAX_API_KEY_BYTES;
 use super::store::{self, Row};
 use super::{
     LIST_TIMEOUT, MAX_CONNECTIONS_PER_USER, MAX_LISTED_MODELS, MAX_MODEL_CHARS, MAX_NAME_CHARS,
-    UseError, normalize_base_url,
+    ProviderError, UseError, normalize_base_url,
 };
 use crate::AppState;
 use crate::api::ApiError;
@@ -314,16 +317,7 @@ pub async fn create(
         (None, None)
     } else {
         let base_url = match body.base_url.as_deref() {
-            Some(url) => {
-                let url = normalize_base_url(url)
-                    .map_err(|e| bad_request(format!("base_url is invalid: {e}")))?;
-                if !state.providers.allowed_base_urls().contains(&url) {
-                    return Err(bad_request(
-                        "base_url must be exactly one of this server's allowed_base_urls",
-                    ));
-                }
-                Some(url)
-            }
+            Some(url) => Some(approved_base_url(&state, url)?),
             None if entry.default_base_url.is_some() => None,
             None => {
                 return Err(bad_request(
@@ -424,15 +418,22 @@ pub async fn create(
                     }
                 }
                 if explicit == Some(false) && row.is_default {
-                    row.is_default = false;
-                    let r = row.clone();
-                    if let Some(rev) = state
+                    // Only the flag: anything else changed since the listing
+                    // keeps its committed value.
+                    let (user, cid) = (row.user_id.clone(), row.id.clone());
+                    let unset = store::Patch {
+                        is_default: Some(false),
+                        ..store::Patch::default()
+                    };
+                    if let store::Patched::Saved(saved) = state
                         .db
-                        .call(move |db| Ok(store::update(&mut db.lock(), &r)?))
+                        .call(move |db| {
+                            Ok(store::patch(&mut db.lock(), &user, &cid, &unset, None)?)
+                        })
                         .await
                         .map_err(ApiError::internal)?
                     {
-                        row.config_rev = rev;
+                        row = saved;
                     }
                 }
             }
@@ -469,6 +470,17 @@ where
     Option::<T>::deserialize(d).map(Some)
 }
 
+fn approved_base_url(state: &AppState, url: &str) -> ApiResult<String> {
+    let url =
+        normalize_base_url(url).map_err(|e| bad_request(format!("base_url is invalid: {e}")))?;
+    if !state.providers.allowed_base_urls().contains(&url) {
+        return Err(bad_request(
+            "base_url must be exactly one of this server's allowed_base_urls",
+        ));
+    }
+    Ok(url)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateBody {
@@ -483,6 +495,9 @@ pub struct UpdateBody {
     /// (only for providers that do not need one).
     #[serde(default, deserialize_with = "explicit_null")]
     api_key: Option<Option<String>>,
+    /// Absent: unchanged. An explicit null cannot reset the endpoint.
+    #[serde(default, deserialize_with = "explicit_null")]
+    base_url: Option<Option<String>>,
 }
 
 pub async fn update(
@@ -491,15 +506,51 @@ pub async fn update(
     Path(id): Path<String>,
     body: Result<Json<UpdateBody>, JsonRejection>,
 ) -> ApiResult<Json<ConnectionView>> {
-    let mut row = load(&state, &who, &id).await?;
+    let previous = load(&state, &who, &id).await?;
     let Json(body) = body?;
-    let entry = catalog::find(&row.provider_id)
+    let entry = catalog::find(&previous.provider_id)
         .ok_or_else(|| conflict("this connection's provider is no longer supported"))?;
+    let patch = patch_of(&state, entry, &previous, body)?;
+    match save_update(&state, entry, patch, previous).await? {
+        store::Patched::Saved(row) => Ok(Json(view_of(&state, row).await?)),
+        store::Patched::Missing => Err(not_found()),
+        store::Patched::DefaultNeedsModel => Err(default_needs_model()),
+        store::Patched::Changed => {
+            load(&state, &who, &id).await?;
+            Err(conflict(
+                "the connection changed while this change was being saved; reload it and try \
+                 again",
+            ))
+        }
+    }
+}
+
+/// The checked change `body` asks for on `previous`.
+fn patch_of(
+    state: &AppState,
+    entry: &Entry,
+    previous: &Row,
+    body: UpdateBody,
+) -> ApiResult<store::Patch> {
+    let mut patch = store::Patch::default();
+    if let Some(url) = body.base_url {
+        if entry.is_device() {
+            return Err(device_has_no_key());
+        }
+        let url = url.ok_or_else(|| bad_request("base_url must be an approved URL, not null"))?;
+        let url = approved_base_url(state, &url)?;
+        if previous.base_url.as_deref() == Some(url.as_str()) {
+            // Named but unchanged: still a precondition of the write.
+            patch.base_url_is = Some(url);
+        } else {
+            patch.base_url = Some(url);
+        }
+    }
     if let Some(name) = &body.name {
-        row.name = check_name(name)?;
+        patch.name = Some(check_name(name)?);
     }
     if let Some(model) = &body.model {
-        row.model = check_model(model.as_deref().unwrap_or(""))?;
+        patch.model = Some(check_model(model.as_deref().unwrap_or(""))?);
     }
     match &body.api_key {
         None => {}
@@ -509,38 +560,527 @@ pub async fn update(
                 "this provider needs an api_key; it cannot be removed",
             ));
         }
-        Some(None) => row.sealed_key = None,
+        Some(None) => patch.sealed_key = Some(None),
         Some(Some(key)) => {
             let key = check_key(key)?;
             let master = state.providers.master().ok_or_else(no_master_key)?;
-            row.sealed_key = Some(
+            patch.sealed_key = Some(Some(
                 master
-                    .seal(&row.user_id, &row.id, &key)
+                    .seal(&previous.user_id, &previous.id, &key)
                     .map_err(ApiError::internal)?,
+            ));
+        }
+    }
+    patch.is_default = body.is_default;
+    Ok(patch)
+}
+
+fn default_needs_model() -> ApiError {
+    conflict("a default connection needs a model; choose one first")
+}
+
+/// The connection as `patch` would leave `previous`.
+fn patched(previous: &Row, patch: &store::Patch) -> Row {
+    let mut row = previous.clone();
+    if let Some(name) = &patch.name {
+        row.name = name.clone();
+    }
+    if let Some(model) = &patch.model {
+        row.model = model.clone();
+    }
+    if let Some(flag) = patch.is_default {
+        row.is_default = flag;
+    }
+    if let Some(key) = &patch.sealed_key {
+        row.sealed_key = key.clone();
+    }
+    if let Some(url) = &patch.base_url {
+        row.base_url = Some(url.clone());
+    }
+    row
+}
+
+/// Save `patch`. Fields it doesn't set keep their committed values. A new
+/// endpoint is first tested with the connection as `previous` plus the
+/// patch, then saved only while the connection still equals `previous`.
+async fn save_update(
+    state: &AppState,
+    entry: &Entry,
+    patch: store::Patch,
+    previous: Row,
+) -> ApiResult<store::Patched> {
+    let expected = if patch.base_url.is_some() {
+        let candidate = patched(&previous, &patch);
+        if candidate.is_default && candidate.model.is_empty() {
+            return Err(default_needs_model());
+        }
+        test_endpoint(state, entry, &candidate).await?;
+        Some(previous.clone())
+    } else {
+        None
+    };
+    state
+        .db
+        .call(move |db| {
+            Ok(store::patch(
+                &mut db.lock(),
+                &previous.user_id,
+                &previous.id,
+                &patch,
+                expected.as_ref(),
+            )?)
+        })
+        .await
+        .map_err(ApiError::internal)
+}
+
+/// Test only the candidate config. Never include upstream response bodies,
+/// request data, or arbitrary provider error text in logs or the API response.
+async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<()> {
+    probe(state, entry, row, LIST_TIMEOUT).await
+}
+
+/// [`test_endpoint`] with every upstream call bounded by `deadline`.
+async fn probe(state: &AppState, entry: &Entry, row: &Row, deadline: Duration) -> ApiResult<()> {
+    if entry.lists_models {
+        let result = match entry.adapter {
+            Adapter::SystemOne | Adapter::Embeddings => {
+                list_typed_models_within(state, entry, row, deadline)
+                    .await
+                    .map(|_| ())
+            }
+            _ => list_server_models_within(state, entry, row, deadline)
+                .await
+                .map(|_| ()),
+        };
+        return result.map_err(|e| match e.status() {
+            StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => ApiError::new(
+                e.status(),
+                format!(
+                    "the new endpoint failed its model listing test: {}",
+                    e.message()
+                ),
+            ),
+            _ => e,
+        });
+    }
+    if row.model.is_empty() {
+        return Err(bad_request(
+            "choose a model before testing an endpoint that does not list models",
+        ));
+    }
+    let Ok(_permit) = state.providers.inner.listings.try_acquire() else {
+        return Err(ApiError::unavailable(
+            "too many endpoint tests are running; try again shortly",
+        ));
+    };
+    // A spent deadline is a gateway timeout; any other upstream failure is
+    // a bad gateway.
+    let failed = |what: &str| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("the new endpoint failed its {what} test"),
+        )
+    };
+    let timed_out = |what: &str| {
+        ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("the new endpoint failed its {what} test (timed out)"),
+        )
+    };
+    let typed_failed = |what: &str, e: ProviderError| match e.status() {
+        StatusCode::GATEWAY_TIMEOUT => timed_out(what),
+        _ => failed(what),
+    };
+    match entry.adapter {
+        Adapter::SystemOne => {
+            let (base, key) = state
+                .providers
+                .typed_endpoint(entry, row)
+                .map_err(use_error)?;
+            let request = super::typed::decision_request(
+                &row.model,
+                json!({"value": true}),
+                json!({"check": {"type": "noul", "instructions": "Is value true?"}}),
+            )
+            .map_err(|_| failed("System One request setup"))?;
+            match tokio::time::timeout(
+                deadline,
+                super::typed::decide(&base, key.as_deref(), request),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(typed_failed("System One Noul", e)),
+                Err(_) => Err(timed_out("System One Noul")),
+            }
+        }
+        Adapter::Embeddings => {
+            let (base, key) = state
+                .providers
+                .typed_endpoint(entry, row)
+                .map_err(use_error)?;
+            let request =
+                super::typed::embedding_request(&row.model, &["Metro connection test".into()])
+                    .map_err(|_| failed("embeddings request setup"))?;
+            match tokio::time::timeout(
+                deadline,
+                super::typed::embed(&base, key.as_deref(), request),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) => Err(typed_failed("embeddings", e)),
+                Err(_) => Err(timed_out("embeddings")),
+            }
+        }
+        Adapter::Registered(_) | Adapter::Custom => {
+            let config = state
+                .providers
+                .server_config(entry, row)
+                .map_err(use_error)?;
+            let http = BudgetedHttp::client(state.providers.http(), PROBE_MAX_RESPONSE_BYTES);
+            let model = config.completion_model(&row.model, http, Default::default());
+            let request = CompletionRequest::new("Reply OK.").max_tokens(16);
+            match tokio::time::timeout(deadline, model.call(request)).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) if too_large(&e) => Err(failed("chat completion (response too large)")),
+                Ok(Err(_)) => Err(failed("chat completion")),
+                Err(_) => Err(timed_out("chat completion")),
+            }
+        }
+        Adapter::Device => Err(device_has_no_key()),
+    }
+}
+
+/// A state with no master key whose providers may use `allowed`.
+#[cfg(test)]
+pub(crate) async fn probe_state(allowed: Vec<String>) -> AppState {
+    use std::sync::Arc;
+
+    let auth = metro_auth::Authenticator::from_lookup(|key| {
+        Ok((key == metro_auth::env::DEV_USERS).then(|| r#"{"user":"fixture-dev-token"}"#.into()))
+    })
+    .await
+    .unwrap();
+    let config = crate::Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        db_path: ":memory:".into(),
+        model: None,
+        limits: crate::Limits::default(),
+        org_admins: vec![],
+    };
+    let mut state = AppState::new(
+        config,
+        crate::db::Db::open_in_memory().unwrap(),
+        Arc::new(auth),
+    )
+    .await
+    .unwrap();
+    state.providers = super::ProviderService::new(None, allowed).unwrap();
+    state
+}
+
+/// A saved connection of `provider` at `base_url` with model `probe-model`.
+#[cfg(test)]
+pub(crate) fn probe_row(state: &AppState, provider: &str, base_url: &str) -> Row {
+    let row = Row {
+        id: new_connection_id(),
+        user_id: "user".into(),
+        name: "fixture".into(),
+        provider_id: provider.into(),
+        base_url: Some(base_url.into()),
+        model: "probe-model".into(),
+        is_default: false,
+        sealed_key: None,
+        capability: catalog::find(provider).unwrap().capability,
+        config_rev: 0,
+    };
+    assert!(store::insert(&mut state.db.lock(), &row, 20).unwrap());
+    row
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn oversized_probe_responses_fail_the_change_and_stop_reading() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::body::Body;
+    use axum::{Router, routing::get, routing::post};
+
+    const PAD: usize = 64 * 1024;
+    const PADS: usize = 1024; // 64 MiB, chunked, valid JSON
+    fn padded(head: &'static str, tail: &'static str, produced: Arc<AtomicUsize>) -> Body {
+        let pads = futures::stream::iter(0..PADS).map(move |_| {
+            produced.fetch_add(PAD, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; PAD]))
+        });
+        let stream = futures::stream::once(async move { Ok(Bytes::from(head)) })
+            .chain(pads)
+            .chain(futures::stream::once(async move { Ok(Bytes::from(tail)) }));
+        Body::from_stream(stream)
+    }
+    use futures::StreamExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (original, big) = (format!("{origin}/original/v1"), format!("{origin}/big/v1"));
+    let produced = Arc::new(AtomicUsize::new(0));
+    let (listing, completion) = (produced.clone(), produced.clone());
+    let app = Router::new()
+        .route(
+            "/big/v1/models",
+            get(move || {
+                let produced = listing.clone();
+                async move {
+                    padded(
+                        r#"{"object":"list","data":[{"id":"probe-model","object":"model","created":0,"owned_by":"x","pad":""#,
+                        r#""}]}"#,
+                        produced,
+                    )
+                }
+            }),
+        )
+        .route(
+            "/big/v1/chat/completions",
+            post(move || {
+                let produced = completion.clone();
+                async move {
+                    padded(
+                        r#"{"id":"c","object":"chat.completion","model":"probe-model","created":0,"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"OK"}}],"pad":""#,
+                        r#""}"#,
+                        produced,
+                    )
+                }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let state = probe_state(vec![original.clone(), big.clone()]).await;
+
+    for lists_models in [true, false] {
+        let mut entry = catalog::find(catalog::CUSTOM).unwrap().clone();
+        entry.lists_models = lists_models;
+        let previous = probe_row(&state, catalog::CUSTOM, &original);
+        produced.store(0, Ordering::SeqCst);
+        let change = store::Patch {
+            base_url: Some(big.clone()),
+            ..store::Patch::default()
+        };
+        let err = save_update(&state, &entry, change, previous.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY, "{}", err.message());
+        assert!(err.message().contains("too large"), "{}", err.message());
+        let saved = store::get(&state.db.lock(), &previous.user_id, &previous.id).unwrap();
+        assert_eq!(saved.as_ref(), Some(&previous));
+        // Reading stopped near the budget (plus socket buffers), far short
+        // of the 64 MiB the endpoint would have sent.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sent = produced.load(Ordering::SeqCst);
+        assert!(sent < 32 * 1024 * 1024, "{sent} bytes produced");
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn probes_past_their_deadline_answer_gateway_timeout() {
+    use std::time::Duration;
+
+    use axum::{Router, routing::any};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let slow = format!("{origin}/v1");
+    let app = Router::new().route(
+        "/v1/{*rest}",
+        any(|| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            StatusCode::OK
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let state = probe_state(vec![slow.clone()]).await;
+    for id in [
+        catalog::CUSTOM_SYSTEMONE,
+        catalog::CUSTOM_EMBEDDINGS,
+        catalog::CUSTOM,
+    ] {
+        let row = probe_row(&state, id, &slow);
+        for lists_models in [true, false] {
+            let mut entry = catalog::find(id).unwrap().clone();
+            entry.lists_models = lists_models;
+            let err = probe(&state, &entry, &row, Duration::from_millis(300))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "{id} lists={lists_models}: {}",
+                err.message()
             );
         }
     }
-    if let Some(flag) = body.is_default {
-        row.is_default = flag;
-    }
-    if row.is_default && row.model.is_empty() {
-        return Err(conflict(
-            "a default connection needs a model; choose one first",
-        ));
-    }
-    let saved = {
-        let row = row.clone();
-        state
-            .db
-            .call(move |db| Ok(store::update(&mut db.lock(), &row)?))
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
+    use axum::{Router, routing::post};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let base = format!("{origin}/v1");
+    let failing = format!("{origin}/failed/v1");
+    let original = format!("{origin}/original/v1");
+    let app = Router::new()
+            .route(
+                "/v1/systemone",
+                post(|Json(req): Json<serde_json::Value>| async move {
+                    assert_eq!(req["model"], "probe-model");
+                    assert_eq!(req["state"], json!({"value": true}));
+                    assert_eq!(req["questions"].as_object().unwrap().len(), 1);
+                    assert_eq!(req["questions"]["check"]["type"], "noul");
+                    Json(json!({"model": "probe-model", "answers": {
+                        "check": {"type": "noul", "noul": 0.9}
+                    }}))
+                }),
+            )
+            .route(
+                "/v1/embeddings",
+                post(|Json(req): Json<serde_json::Value>| async move {
+                    assert_eq!(req["model"], "probe-model");
+                    assert_eq!(req["input"], json!(["Metro connection test"]));
+                    Json(json!({"data": [{"index": 0, "embedding": [1.0]}]}))
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|Json(req): Json<serde_json::Value>| async move {
+                    assert_eq!(req["model"], "probe-model");
+                    assert!(req.get("tools").is_none());
+                    assert_eq!(req["messages"].as_array().unwrap().len(), 1);
+                    assert_eq!(req["messages"][0]["content"], "Reply OK.");
+                    Json(json!({
+                        "id": "c", "object": "chat.completion", "model": "probe-model", "created": 0,
+                        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "OK"}}],
+                    }))
+                }),
+            )
+            .fallback(|| async { StatusCode::BAD_GATEWAY });
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let state = probe_state(vec![base.clone(), original.clone(), failing.clone()]).await;
+    for (id, operation) in [
+        (catalog::CUSTOM_SYSTEMONE, "System One Noul"),
+        (catalog::CUSTOM_EMBEDDINGS, "embeddings"),
+        (catalog::CUSTOM, "chat completion"),
+    ] {
+        let mut entry = catalog::find(id).unwrap().clone();
+        let previous = Row {
+            id: new_connection_id(),
+            user_id: "user".into(),
+            name: "fixture".into(),
+            provider_id: id.into(),
+            base_url: Some(original.clone()),
+            model: "probe-model".into(),
+            is_default: false,
+            sealed_key: None,
+            capability: entry.capability,
+            config_rev: 0,
+        };
+        assert!(store::insert(&mut state.db.lock(), &previous, 20).unwrap());
+
+        let to = |url: &str| store::Patch {
+            base_url: Some(url.to_owned()),
+            ..store::Patch::default()
+        };
+        let permit = state
+            .providers
+            .inner
+            .listings
+            .try_acquire_many(super::MAX_LISTINGS as u32)
+            .unwrap();
+        for lists_models in [true, false] {
+            entry.lists_models = lists_models;
+            let err = save_update(&state, &entry, to(&failing), previous.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!err.message().contains("failed its model listing test"));
+        }
+        drop(permit);
+
+        // Listing errors local to Metro must keep their status and message.
+        entry.lists_models = true;
+        let keyed = store::Patch {
+            sealed_key: Some(Some(vec![0])),
+            ..to(&failing)
+        };
+        let err = save_update(&state, &entry, keyed, previous.clone())
             .await
-            .map_err(ApiError::internal)?
-    };
-    let Some(rev) = saved else {
-        return Err(not_found());
-    };
-    row.config_rev = rev;
-    Ok(Json(view_of(&state, row).await?))
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+        assert_eq!(err.message(), UseError::NoMasterKey.to_string());
+
+        // Exercise the minimal wire even when today's catalog lists models.
+        entry.lists_models = false;
+        let err = save_update(&state, &entry, to(&failing), previous.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            err.message()
+                .contains(&format!("failed its {operation} test"))
+        );
+        let saved = store::get(&state.db.lock(), &previous.user_id, &previous.id).unwrap();
+        assert_eq!(saved.as_ref(), Some(&previous));
+
+        let store::Patched::Saved(saved) = save_update(&state, &entry, to(&base), previous.clone())
+            .await
+            .unwrap()
+        else {
+            panic!("the tested endpoint was not saved");
+        };
+        assert_eq!(saved.base_url.as_deref(), Some(base.as_str()));
+
+        // A rename read `saved`; before it writes, an endpoint, key and model
+        // rotation commits. The rename must keep all three.
+        let rotation = store::Patch {
+            model: Some("rotated-model".into()),
+            sealed_key: Some(Some(vec![7; 40])),
+            ..to(&original)
+        };
+        let store::Patched::Saved(rotated) = store::patch(
+            &mut state.db.lock(),
+            &saved.user_id,
+            &saved.id,
+            &rotation,
+            Some(&saved),
+        )
+        .unwrap() else {
+            panic!("the rotation was not saved");
+        };
+        let rename = store::Patch {
+            name: Some("Renamed".into()),
+            ..store::Patch::default()
+        };
+        let store::Patched::Saved(renamed) =
+            save_update(&state, &entry, rename, saved).await.unwrap()
+        else {
+            panic!("the rename was not saved");
+        };
+        assert_eq!(renamed.name, "Renamed");
+        assert_eq!(renamed.base_url.as_deref(), Some(original.as_str()));
+        assert_eq!(renamed.sealed_key, Some(vec![7; 40]));
+        assert_eq!(renamed.model, "rotated-model");
+        assert_eq!(renamed.config_rev, rotated.config_rev);
+
+        // An endpoint change tested from a stale snapshot is not saved.
+        let stale = save_update(&state, &entry, to(&base), previous.clone())
+            .await
+            .unwrap();
+        assert!(matches!(stale, store::Patched::Changed));
+    }
 }
 
 pub async fn remove(
@@ -671,6 +1211,15 @@ async fn list_server_models(
     entry: &Entry,
     row: &Row,
 ) -> ApiResult<Vec<(String, Option<String>)>> {
+    list_server_models_within(state, entry, row, LIST_TIMEOUT).await
+}
+
+async fn list_server_models_within(
+    state: &AppState,
+    entry: &Entry,
+    row: &Row,
+    deadline: Duration,
+) -> ApiResult<Vec<(String, Option<String>)>> {
     if !entry.lists_models {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -686,7 +1235,9 @@ async fn list_server_models(
             "too many model listings are running; try again shortly",
         ));
     };
-    match tokio::time::timeout(LIST_TIMEOUT, list_upstream(config, state.providers.http())).await {
+    // Every page together reads at most this many bytes.
+    let http = BudgetedHttp::client(state.providers.http(), LISTING_MAX_RESPONSE_BYTES);
+    match tokio::time::timeout(deadline, list_upstream(config, http)).await {
         Ok(Ok(list)) => Ok(list.data.into_iter().map(|m| (m.id, m.name)).collect()),
         Ok(Err(e)) => {
             // Only the error's kind is logged: upstream text may echo input.
@@ -701,6 +1252,10 @@ async fn list_server_models(
                 match e {
                     RigProviderError::InvalidAuthentication(_) => {
                         "the provider rejected the API key"
+                    }
+                    e if too_large(&e) => {
+                        "the provider's model list is too large; you can still enter the model \
+                         id yourself"
                     }
                     _ => {
                         "the provider did not return a model list; you can still enter the \
@@ -719,6 +1274,15 @@ async fn list_server_models(
 /// A System One (`{models: [{name}]}`) or embeddings (`{data: [{id}]}`)
 /// listing, with the connection's own endpoint and key, no redirects.
 async fn list_typed_models(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<Vec<String>> {
+    list_typed_models_within(state, entry, row, LIST_TIMEOUT).await
+}
+
+async fn list_typed_models_within(
+    state: &AppState,
+    entry: &Entry,
+    row: &Row,
+    deadline: Duration,
+) -> ApiResult<Vec<String>> {
     let (base, key) = state
         .providers
         .typed_endpoint(entry, row)
@@ -728,7 +1292,17 @@ async fn list_typed_models(state: &AppState, entry: &Entry, row: &Row) -> ApiRes
             "too many model listings are running; try again shortly",
         ));
     };
-    match super::typed::list_models(&base, key.as_deref(), entry.capability).await {
+    let listed = tokio::time::timeout(
+        deadline,
+        super::typed::list_models(&base, key.as_deref(), entry.capability),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(ProviderError::Endpoint(
+            "the model endpoint did not answer in time".into(),
+        ))
+    });
+    match listed {
         // OpenAI lists every model; only its embedding models apply here.
         Ok(models) if entry.id == catalog::OPENAI_EMBEDDINGS => Ok(models
             .into_iter()
@@ -736,7 +1310,8 @@ async fn list_typed_models(state: &AppState, entry: &Entry, row: &Row) -> ApiRes
             .collect()),
         Ok(models) => Ok(models),
         Err(e) => {
-            tracing::warn!(connection = %row.id, provider = %row.provider_id, error = %e,
+            tracing::warn!(connection = %row.id, provider = %row.provider_id,
+                category = e.category(), status = e.status().as_u16(),
                 "typed model listing failed");
             Err(ApiError::new(
                 e.status(),
@@ -760,6 +1335,14 @@ async fn list_upstream(
     }
 }
 
+/// Whether Rig's error came from a spent response budget.
+fn too_large(e: &RigProviderError) -> bool {
+    match e {
+        RigProviderError::Http(e) => super::budget::is_too_large(&**e),
+        e => super::budget::is_too_large(e),
+    }
+}
+
 fn error_kind(e: &RigProviderError) -> &'static str {
     match e {
         RigProviderError::Http(_) => "http",
@@ -772,4 +1355,95 @@ fn error_kind(e: &RigProviderError) -> &'static str {
         RigProviderError::InvalidAuthentication(_) => "invalid_authentication",
         _ => "other",
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_named_unchanged_endpoint_is_a_precondition_in_both_commit_orders() {
+    use base64::Engine;
+
+    let (a, b) = (
+        "https://a.example.invalid/v1".to_owned(),
+        "https://b.example.invalid/v1".to_owned(),
+    );
+    let mut state = probe_state(vec![a.clone(), b.clone()]).await;
+    let master = super::secret::MasterKey::parse(
+        &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
+    )
+    .unwrap();
+    state.providers =
+        super::ProviderService::new(Some(master), vec![a.clone(), b.clone()]).unwrap();
+    let entry = catalog::find(catalog::CUSTOM).unwrap();
+    // The new key, sent together with the endpoint it is meant for.
+    let body = || -> UpdateBody {
+        serde_json::from_value(json!({"base_url": a, "api_key": "sk-new-key-for-a"})).unwrap()
+    };
+    let switch_to_b = |_: &Row| store::Patch {
+        base_url: Some(b.clone()),
+        ..store::Patch::default()
+    };
+
+    // Order 1: a switch to B commits between the PATCH's read and write.
+    let snapshot = probe_row(&state, catalog::CUSTOM, &a);
+    let patch = patch_of(&state, entry, &snapshot, body()).unwrap();
+    assert_eq!(patch.base_url, None);
+    assert_eq!(patch.base_url_is.as_deref(), Some(a.as_str()));
+    let store::Patched::Saved(switched) = store::patch(
+        &mut state.db.lock(),
+        &snapshot.user_id,
+        &snapshot.id,
+        &switch_to_b(&snapshot),
+        Some(&snapshot),
+    )
+    .unwrap() else {
+        panic!("switch not saved");
+    };
+    let saved = save_update(&state, entry, patch, snapshot.clone())
+        .await
+        .unwrap();
+    assert!(matches!(saved, store::Patched::Changed), "{saved:?}");
+    let now = store::get(&state.db.lock(), &snapshot.user_id, &snapshot.id).unwrap();
+    assert_eq!(now.as_ref(), Some(&switched), "nothing was written");
+    assert_eq!(
+        now.unwrap().sealed_key,
+        None,
+        "the key for A never reached B"
+    );
+
+    // Order 2: the PATCH commits first; the switch, prepared from the older
+    // snapshot, is then refused.
+    let snapshot = probe_row(&state, catalog::CUSTOM, &a);
+    let patch = patch_of(&state, entry, &snapshot, body()).unwrap();
+    let store::Patched::Saved(keyed) = save_update(&state, entry, patch, snapshot.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("key not saved");
+    };
+    assert_eq!(keyed.base_url.as_deref(), Some(a.as_str()));
+    assert!(keyed.sealed_key.is_some());
+    let late = store::patch(
+        &mut state.db.lock(),
+        &snapshot.user_id,
+        &snapshot.id,
+        &switch_to_b(&snapshot),
+        Some(&snapshot),
+    )
+    .unwrap();
+    assert!(matches!(late, store::Patched::Changed), "{late:?}");
+    let now = store::get(&state.db.lock(), &snapshot.user_id, &snapshot.id).unwrap();
+    assert_eq!(now.as_ref(), Some(&keyed));
+
+    // Omitting the endpoint merges into whatever is committed.
+    let omitted: UpdateBody = serde_json::from_value(json!({"name": "Renamed"})).unwrap();
+    let patch = patch_of(&state, entry, &snapshot, omitted).unwrap();
+    assert_eq!(patch.base_url_is, None);
+    let store::Patched::Saved(renamed) = save_update(&state, entry, patch, snapshot.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("rename not saved");
+    };
+    assert_eq!(renamed.name, "Renamed");
+    assert_eq!(renamed.sealed_key, keyed.sealed_key);
 }

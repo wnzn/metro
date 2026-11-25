@@ -6,11 +6,12 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
 import { serverPlace, spaceInitial } from "./Sidebar";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof world>;
 
 async function openApp(f: F, opts: { reducedMotion?: boolean; width?: number; height?: number } = {}) {
-  return open("../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, ...opts });
+  return open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800, ...opts });
 }
 
 async function signIn(app: App, user: string, ready = "id:account-menu") {
@@ -55,7 +56,7 @@ test("navigation collapses and restores with its draft, and stays collapsed acro
   await app.keyboard.press("mod+b");
   await app.waitFor("id:new-space-name");
   expect(app.value("id:new-space-name")).toBe("Unfinished space");
-  const second = await open("../../App.tsx", { network: world().network as any, platform: "linux", width: 760, height: 560, storage });
+  const second = await open("../../App.tsx", { modules: launched(), network: world().network as any, platform: "linux", width: 760, height: 560, storage });
   await second.press("id:show-server-form");
   await signIn(second, "alice", "id:toggle-navigation");
   await second.waitFor("label:Show workspace navigation");

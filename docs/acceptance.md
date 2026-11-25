@@ -103,6 +103,38 @@ anyone outside the release workflow; macOS (not built); real vendor
 accounts and sign-ins; pretrained `google/embeddinggemma-2` ranking.
 Windows files carry no Authenticode signature.
 
+## Source only: updater lane and reviewed integration (2026-11-25, local)
+
+Local merge on `lane/updates-backend` of approved updater
+`8ee22c9a67530ccef1a9be0761bfbb821518eb0f` and reviewed integration
+`02a0cb73c78347c07d7da1e213307bf6505a9bef`. No integration branch update,
+push, deployment, or release.
+
+- `cargo build --locked --workspace` and formatting passed with normal
+  features. The normal binaries passed `smoke`, `pages`, `agent_pages`,
+  `web_search`, `settings`, `device_connector`, `intelligence`, and
+  `library` end to end.
+- Locked tests for release, URL policy, model protocol, connector,
+  desktop, runner, server, and TUI: 1,034 passed, 3 ignored. Strict
+  workspace Clippy (`--all-targets -- -D warnings`) passed.
+- `tests/e2e/updates.py` passed against separately built fixture server
+  and runner binaries. A build combining the `e2e` verifier feature with
+  `METRO_RELEASE_CHANNEL=release` was refused at compile time as intended.
+- The installer suite passed 41/41 (PowerShell ran on Linux). It covered
+  the published installer locks and the case where an installed runner
+  script knows self-update but predates the HTTP and proxy handling.
+- The admin browser suite passed 27/27 in
+  `mcr.microsoft.com/playwright:v1.58.2-noble`. The unmodified integration
+  tip reproduced a second-tab consent test failure. The merged test
+  enables Page events and waits for the correct origin and consent UI;
+  this did not change the panel's credential or consent behavior.
+
+The connector and launcher passed an offline locked
+`x86_64-pc-windows-gnu` check with pre-existing connector warnings.
+Windows updates remain manual-only. Native Windows MSI and helper death,
+live TUF refresh, and a published-to-published update were not tested.
+The legacy installer and shared-workspace recovery limits below still apply.
+
 ## Source only: shared-workspace updater re-review (2026-11-25, local)
 
 Verified on `lane/updates-backend` at `d57420e`, after `b451766`. This is

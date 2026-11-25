@@ -3,6 +3,7 @@ import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
 import { composerAddress } from "./composerAddress";
 import { attachmentWorld } from "./attachments/test/fixtures";
+import { launched } from "../../test/launched";
 
 function setup(systemOne = false) {
   const f = world();
@@ -21,7 +22,7 @@ function setup(systemOne = false) {
 }
 
 async function chat(f: Pick<ReturnType<typeof world>, "network">) {
-  const app = await open("../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800 });
+  const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800 });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);

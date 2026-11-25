@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::Secret;
-use crate::http::{client, read_capped};
+use crate::http::read_capped;
 use crate::profile::validate_device_token;
 
 const MAX_BODY: usize = 1024 * 1024;
@@ -32,22 +32,36 @@ pub struct MetroApi {
 }
 
 impl MetroApi {
-    /// `base` must already be validated (`netpolicy::validate_base_url`).
+    /// `base` must already be validated (`netpolicy::validate_server_url`).
     pub fn new(base: &str, token: Secret) -> Result<Self, ApiError> {
         Ok(MetroApi {
-            http: client(TIMEOUT).map_err(|_| ApiError::Server("cannot start HTTP".into()))?,
+            http: crate::http::client_for_server(TIMEOUT, base)
+                .map_err(|_| ApiError::Server("cannot start HTTP".into()))?,
             base: base.trim_end_matches('/').to_string(),
             token,
         })
     }
 
     async fn call(&self, method: reqwest::Method, path: &str) -> Result<(u16, Value), ApiError> {
+        self.call_with(method, path, None).await
+    }
+
+    async fn call_with(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<(u16, Value), ApiError> {
         let mut rb = self
             .http
             .request(method.clone(), format!("{}{}", self.base, path))
             .bearer_auth(self.token.expose())
             .header("Accept", "application/json");
-        if method == reqwest::Method::POST {
+        if let Some(b) = body {
+            rb = rb
+                .header("Content-Type", "application/json")
+                .body(b.to_string());
+        } else if method == reqwest::Method::POST {
             rb = rb.header("Content-Type", "application/json").body("{}");
         }
         let resp = rb.send().await.map_err(|_| ApiError::Unreachable)?;
@@ -125,6 +139,53 @@ impl MetroApi {
             ApiError::Server("the Metro server returned no valid device token".into())
         })?;
         Ok(t)
+    }
+
+    /// Register this computer as one of the person's web search devices
+    /// (`POST /v1/web-devices`): its id, and its device token (which goes
+    /// only to this device's profile).
+    pub async fn create_web_device(&self, label: &str) -> Result<(String, Secret), ApiError> {
+        let (_, v) = self
+            .call_with(
+                reqwest::Method::POST,
+                "/v1/web-devices",
+                Some(&serde_json::json!({ "label": label })),
+            )
+            .await?;
+        let id = v
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| crate::metro::valid_job_id(id) && id.starts_with("wd_"))
+            .ok_or_else(|| ApiError::Server("the Metro server returned no web device id".into()))?
+            .to_owned();
+        let t = Secret::new(v.get("token").and_then(Value::as_str).unwrap_or_default());
+        validate_device_token(&t).map_err(|_| {
+            ApiError::Server("the Metro server returned no valid device token".into())
+        })?;
+        Ok((id, t))
+    }
+
+    /// Rotate the token of one of the person's web devices
+    /// (`POST /v1/web-devices/{id}/token`); 404 when it isn't theirs (any more).
+    pub async fn rotate_web_device(&self, id: &str) -> Result<Secret, ApiError> {
+        let (_, v) = self
+            .call(
+                reqwest::Method::POST,
+                &format!("/v1/web-devices/{id}/token"),
+            )
+            .await?;
+        let t = Secret::new(v.get("token").and_then(Value::as_str).unwrap_or_default());
+        validate_device_token(&t).map_err(|_| {
+            ApiError::Server("the Metro server returned no valid device token".into())
+        })?;
+        Ok(t)
+    }
+
+    /// Remove one of the person's web search devices (revokes its token).
+    pub async fn delete_web_device(&self, id: &str) -> Result<(), ApiError> {
+        self.call(reqwest::Method::DELETE, &format!("/v1/web-devices/{id}"))
+            .await
+            .map(|_| ())
     }
 
     pub async fn revoke_device_token(&self, id: &str) -> Result<(), ApiError> {
