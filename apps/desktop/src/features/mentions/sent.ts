@@ -84,6 +84,20 @@ export function sentMentions(event: RoomEvent): MentionPiece[] {
   return out;
 }
 
+/** A slim follow-up can omit its To line only if the leading bindings cover every stored recipient. */
+export function leadingMentionsCoverRecipients(event: RoomEvent, pieces: readonly MentionPiece[]): boolean {
+  if (!event.mentions?.length || !pieces.length) return false;
+  const seen = new Set<number>();
+  let end = 0;
+  for (const piece of pieces) {
+    const gap = event.text.slice(end, piece.start);
+    if (!(end === 0 ? /^\p{White_Space}*$/u : /^[\p{White_Space},:;.!?]*$/u).test(gap)) break;
+    seen.add(piece.index);
+    end = piece.end;
+  }
+  return event.mentions.every((_mention, index) => seen.has(index));
+}
+
 export function copyMentionText(text: string, pieces: readonly MentionPiece[], label: (piece: MentionPiece) => string): string {
   let end = 0, out = "";
   for (const piece of pieces) {

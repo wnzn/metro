@@ -68,13 +68,13 @@ import { Composer, ConnectionBanner, fillDraft, focusComposer, Transcript } from
 import type { DraftIdea } from "./Conversation";
 import { PersonAvatar } from "./profile/PersonAvatar";
 import { ensurePerson, profileName } from "./profile/profileState";
-import { agentById, agentMentionOptions, defaultAgent, ensureSpaceAgents, spaceAgents } from "./space/agents";
+import { agentById, agentMentionOptions, defaultAgent, spaceAgents } from "./space/agents";
 import { askAgentId, askChoice, chooseAskAgent, classifierOffered, CLASSIFIER_CHOICE, hasAgentChoice } from "./space/askAgent";
 import { SpaceAgentAvatar } from "./space/SpaceAgentAvatar";
 import { openSpaceSettings, spaceSettingsFor } from "./space/spaceSettingsState";
 import { mentionIdentityKey, scanMentionDraft } from "./mentions/draft";
 import type { MentionRecipient } from "./mentions/draft";
-import { spaceMentionDirectory, verifiedMembers } from "./mentions/roster";
+import { beginMentionAgentVisit, refreshMentionAgents, spaceMentionDirectory, verifiedMembers } from "./mentions/roster";
 import { mentionSuggestion } from "./mentions/suggestions";
 
 /** Suggestions of an empty room: they fill the draft (and its recipients), never send. */
@@ -278,14 +278,14 @@ function RoomComposer() {
     const scope = composerScope();
     if (!sid || !inSpaceComposer() || spaceSettingsFor() || !scope) return;
     const endVisit = untracked(() => beginMentionVisit(sid, scope));
+    const endAgentVisit = untracked(() => beginMentionAgentVisit(sid));
     const refresh = () => {
       if (!inSpaceComposer() || activeSpaceId() !== sid) return;
       void loadMembersForMentions();
-      void ensureSpaceAgents(sid, true);
+      refreshMentionAgents(sid);
     };
-    untracked(() => void ensureSpaceAgents(sid, true));
     const timer = setInterval(refresh, 10_000);
-    return () => { clearInterval(timer); endVisit(); };
+    return () => { clearInterval(timer); endAgentVisit(); endVisit(); };
   });
   effect(() => {
     const sid = activeSpaceId();
@@ -381,7 +381,7 @@ function RoomComposer() {
       if (!currentDirectory()) {
         void loadMembersForMentions();
         const sid = activeSpaceId();
-        if (sid) void ensureSpaceAgents(sid);
+        if (sid) refreshMentionAgents(sid);
       }
     }
   };

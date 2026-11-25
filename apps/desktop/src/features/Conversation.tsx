@@ -105,7 +105,8 @@ import { unstage } from "./attachments/attachmentDraft";
 import { formatSize } from "./library/libraryState";
 import { mediaKindOf } from "../api/library";
 import { MentionedBody, localMentionIdentity, sentMentionLabel } from "./mentions/MentionedBody";
-import { copyMentionText, sentMentions } from "./mentions/sent";
+import { verifiedAgents } from "./mentions/roster";
+import { copyMentionText, leadingMentionsCoverRecipients, sentMentions } from "./mentions/sent";
 
 /** The active place's transcript, with each agent turn folded into one group. */
 const transcriptItems = computed(() => groupTranscript(activeEvents()));
@@ -269,10 +270,15 @@ function authorOf(e: RoomEvent, myId: string | null): Author {
   return { kind: "server", name: e.actor.trim() || "system", tone: toneForEvent(e.kind, e.actor), label: kindLabel(e.kind) };
 }
 
+function recipientAgent(id: string | undefined) {
+  const sid = activeSpace()?.id;
+  return mainPlace() === "space" ? (sid ? verifiedAgents(sid)?.find(a => a.id === id) : undefined) : agentById(sid, id);
+}
+
 function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null, lastKnown?: string): string {
   if (m.kind === "agent" && !m.addressedBy && mainPlace() === "chat") return "to the agent";
   if (m.kind === "agent" && m.addressedBy && (m.agentId || mainPlace() === "space")) {
-    const a = agentById(activeSpace()?.id, m.agentId);
+    const a = recipientAgent(m.agentId);
     return `${a?.name ?? "agent"} · ${m.addressedBy === "classifier" ? "detected by System One" : "scheduled prompt"}`;
   }
   if (mainPlace() === "space") {
@@ -290,7 +296,7 @@ function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: stri
 /** What a screen reader hears for a recipient: the display name and the stable id behind it. */
 function recipientDescription(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null, lastKnown?: string): string {
   if (m.kind === "agent" && m.agentId) {
-    const a = agentById(activeSpace()?.id, m.agentId);
+    const a = recipientAgent(m.agentId);
     return `Addressed to ${a ? `${a.name} (@${a.handle})` : "an agent"}${m.addressedBy ? ` (${recipientText(m, myId)})` : ""}`;
   }
   if (m.kind === "agent") return `Addressed to the agent${m.addressedBy ? ` (${mentionText(m, myId)})` : ""}`;
@@ -319,10 +325,13 @@ function MessageRow(props: { row: () => Of<"event"> }) {
   const continued = () => props.row().continued;
   /**
    * A follow-up's recipients: in a slim line level with the time in the
-   * gutter, and left out when the text already starts by naming them all.
+   * gutter. In a Space only actual leading bindings can stand in for it.
    */
+  const leadingRecipients = () => spaceId()
+    ? leadingMentionsCoverRecipients(event(), pieces())
+    : textNamesRecipients(event().text, event().mentions);
   const followUpRecipients = () =>
-    continued() && hasRecipients() && !(textNamesRecipients(event().text, event().mentions) && !audience().agentBadge && !audience().peopleNote);
+    continued() && hasRecipients() && !(leadingRecipients() && !audience().agentBadge && !audience().peopleNote);
   /** A failure says one plain sentence; the technical text folds under Details. */
   const failure = () => (isFailureKind(event().kind) ? failureText(event().text) : null);
   const person = () => {

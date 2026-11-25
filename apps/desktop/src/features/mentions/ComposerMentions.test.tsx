@@ -440,6 +440,78 @@ test("a delayed re-entry never exposes a removed person's cached card but curren
   expect(app.clipboard()).toBe("carol");
 });
 
+test("fast members do not verify a cached agent alias or card while the exact re-entry roster is held", async () => {
+  const w = spaceWorld();
+  const a = w.agent("acme", { handle: "coder", name: "Original Coder" });
+  const b = w.agent("acme", { handle: "review", name: "Current Coder", description: "The new owner of the handle." });
+  const gone = w.agent("acme", { handle: "gone", name: "Deleted Agent" });
+  const text = "Earlier we asked @coder, @gone and @review with @bob.";
+  const e = w.f.post("acme/lobby", {
+    kind: "message", actor: "Alice", text,
+    mentions: [
+      { kind: "agent", agent_id: a.id }, { kind: "agent", agent_id: gone.id },
+      { kind: "agent", agent_id: b.id }, { kind: "user", id: "bob" },
+    ],
+    spans: ["@coder", "@gone", "@review", "@bob"].map((name, i) => span(text, name, i)),
+  });
+  let delay = 0, oldReads = 0, newReads = 0;
+  const base = w.network[get]!;
+  w.network[get] = req => {
+    const answer = base(req);
+    if (new URL(req.url).pathname !== "/v1/spaces/acme/agents" || !delay) return answer;
+    if (delay === 6500) oldReads++;
+    else newReads++;
+    return { ...answer as object, delay };
+  };
+  const app = await inAcme(w.network, 720, true);
+  await app.waitFor("label:Deleted Agent, mentioned. Open card.");
+  // A refresh launched on the old visit still holds a snapshot containing A
+  // and the removed agent. It will arrive after the new visit's response.
+  delay = 6500;
+  await app.clock!.runFor(10_100);
+  expect(oldReads).toBe(1);
+  await app.press("id:nav-chat");
+  await app.waitFor("id:chat-view");
+  a.handle = "former";
+  b.handle = "coder";
+  w.s.agents.set("acme", w.s.agents.get("acme")!.filter(agent => agent.id !== gone.id));
+  delay = 4000;
+  await app.press("id:space:acme");
+  await app.waitUntil(() => newReads === 1, { timeout: 1000 });
+  // A usable member card proves that members finished before the agents.
+  await app.waitFor("label:bob, mentioned. Open card.", { timeout: 1000 });
+  expect(app.shows("label:Original Coder, mentioned. Open card.")).toBe(false);
+  expect(app.shows("label:Current Coder, mentioned. Open card.")).toBe(false);
+  expect(app.shows("label:Deleted Agent, mentioned. Open card.")).toBe(false);
+  expect(app.shows("id:identity-card")).toBe(false);
+  expect(app.shows("label:/Addressed to Original Coder/")).toBe(false);
+  const unresolved = "@coder stays literal";
+  await app.type("id:composer", unresolved);
+  await app.waitFor("id:mention-unresolved", { timeout: 1000 });
+  expect(app.shows(`id:mention-chip:agent:${a.id}`)).toBe(false);
+
+  await app.clock!.runFor(4100);
+  await app.waitFor("label:Current Coder, mentioned. Open card.");
+  delay = 0;
+  await app.clock!.runFor(2600); // old response cannot undo the successful new visit
+  expect(app.shows("label:Deleted Agent, mentioned. Open card.")).toBe(false);
+  await app.press(`id:mention-token:${e.id}:2`);
+  await app.waitFor("id:identity-card >> text:The new owner of the handle.");
+  expect(app.shows("id:identity-card >> text:@coder")).toBe(true);
+  await app.keyboard.press("escape");
+  await app.press("id:send");
+  await app.waitUntil(() => requests(app).length === 1);
+  expect(JSON.parse(requests(app)[0].body!)).toEqual({
+    text: unresolved, infer_text_mentions: false, invoke_agent: false,
+  });
+  await app.type("id:composer", "@coder please review");
+  await app.waitFor(`id:mention-chip:agent:${b.id}`);
+  expect(app.shows(`id:mention-chip:agent:${a.id}`)).toBe(false);
+  await app.press("id:send");
+  await app.waitUntil(() => requests(app).length === 2);
+  expect(JSON.parse(requests(app)[1].body!)).toMatchObject({ mentions: [{ kind: "agent", agent_id: b.id }] });
+});
+
 test("unsupported or uncertain Space POST is never replayed and keeps the exact draft", async () => {
   for (const code of [422, 503]) {
     const f = world();

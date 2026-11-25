@@ -1231,6 +1231,12 @@ export function mentionVisitVerified(sid: string) {
   return !!visit?.verified && visit.sid === sid && currentMentionVisit(visit);
 }
 
+export function mentionVisitGuard(sid: string) {
+  const visit = mentionVisit();
+  const ok = guard(sid);
+  return () => !!visit && visit.sid === sid && ok() && currentMentionVisit(visit);
+}
+
 /** A new visit must not reuse an older visit's in-flight roster request. */
 export function loadMembersForMentions(fresh = false): Promise<void> {
   const sid = activeSpaceId();
