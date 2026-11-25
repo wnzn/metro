@@ -1,4 +1,6 @@
 import type { ActionKind, Capability, PageValues, SourceResult } from "../../api/pages";
+import type { TextViewDocument } from "nsh/base";
+import { pageRichText } from "../../ui/pageMarkdown";
 
 // Match pages/spec.rs and pages/tsx.rs, even for a malformed response.
 export const MAX_RENDERED = 5_000;
@@ -103,12 +105,15 @@ export type PlanBlock = {
   type: string; instance: string; key?: string; issue?: string; text: string; p: Record<string, unknown>;
   children: PlanBlock[]; headings?: string[]; rows?: Cell[][]; values?: unknown[];
   points?: { label: string; value: number }[]; answer?: unknown; action?: ActionKind;
+  document?: TextViewDocument; messages?: (TextViewDocument | undefined)[];
 };
 const PROPS = ["title", "collapsed", "columns", "level", "tone", "muted", "label", "value", "format", "hint", "rows",
   "empty", "items", "as", "when", "max", "kind", "data", "x", "y", "from"];
 
 export function planPage(spec: unknown, data: PageValues | null, pending: boolean, limit = MAX_RENDERED) {
   const supported = own(spec, "format") === 1;
+  const rich = pageRichText();
+  const document = (value: unknown) => typeof value === "string" ? rich.document([value]) : undefined;
   let left = Math.min(MAX_RENDERED, Math.max(0, limit)), truncated = false;
   const initial = left;
   const spend = (count = 1) => {
@@ -147,11 +152,16 @@ export function planPage(spec: unknown, data: PageValues | null, pending: boolea
       };
       const props = own(b, "props");
       for (const prop of PROPS) p[prop] = read(own(props, prop));
-      node.text = items(own(b, "content")).map(v => {
+      const parts = items(own(b, "content")).map(v => {
         const scalar = read(v);
-        return scalar == null ? "" : cell(scalar).label;
-      }).join("").slice(0, 65_536);
+        return typeof scalar === "string" ? scalar : scalar == null ? "" : cell(scalar).label;
+      });
       if (node.issue) continue;
+      if (type === "Markdown") node.document = rich.document(parts);
+      else for (const part of parts) {
+        if (node.text.length >= 65_536) break;
+        node.text += part.slice(0, 65_536 - node.text.length);
+      }
       const children = own(b, "children");
       switch (type) {
         case "Section": case "Row": case "Grid":
@@ -187,9 +197,13 @@ export function planPage(spec: unknown, data: PageValues | null, pending: boolea
             return y !== undefined && spend() ? [{ label: cell(own(r, p.x)).label, value: y }] : [];
           });
           break;
-        case "AgentAnswer": node.answer = p.from; break;
+        case "AgentAnswer":
+          node.answer = p.from;
+          node.document = document(own(p.from, "text"));
+          break;
         case "RunList": case "MessageFeed": case "ScheduleCard": case "FileList":
           node.values = items(own(p.from, "items")).filter(() => spend());
+          if (type === "MessageFeed") node.messages = node.values.map(row => document(own(row, "text")));
           break;
         case "Button": case "Link": {
           const kind = own(own(b, "action"), "kind");
@@ -202,5 +216,5 @@ export function planPage(spec: unknown, data: PageValues | null, pending: boolea
   }
   // The Page root is depth 1 in the compiler; its first block is depth 2.
   const blocks = supported ? walk(own(spec, "blocks"), "", 2) : [];
-  return { blocks, supported, truncated, count: initial - left };
+  return { blocks, supported, truncated, count: initial - left, richText: rich.usage() };
 }

@@ -26,6 +26,9 @@ export function PageRenderer(props: Interactions & { spec: PageSpec; pending?: b
   const plan = computed(() => planPage(props.spec, props.data, !!props.pending));
   return <Column gap={3} testID="page-renderer">
     <If when={!plan().supported}><Label color="warning">This page format is not supported by this version of Metro.</Label></If>
+    <If when={plan().richText.limited}>
+      <Label color="warning" testID="page-rich-text-limit">Some rich text was shortened because this page reached its display limit.</Label>
+    </If>
     <Each of={plan().blocks} key={b => b.instance}>
       {block => <Block node={block()} interactions={props} />}
     </Each>
@@ -67,7 +70,9 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
     case "Heading": return <Label heading variant={p().level === 1 ? "title" : p().level === 3 ? "strong" : "heading"}>{n().text}</Label>;
     case "Text": return <Label color={p().muted === true ? "muted" : tone() === "neutral" ? "default" : tone()}>{n().text}</Label>;
     case "Empty": return <Label variant="caption" color="muted">{n().text || empty()}</Label>;
-    case "Markdown": return <PageMarkdown text={n().text} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />;
+    case "Markdown": return <If when={n().document}>{document =>
+      <PageMarkdown document={document()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />
+    }</If>;
     case "Badge": return <Row><Badge tone={tone()} label={n().text} /></Row>;
     case "Stat": return <Surface variant="card" pad={3} gap={1}>
       <Label variant="caption" color="muted">{label()}</Label>
@@ -100,8 +105,8 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
             <Badge tone={status().tone ?? "agent"} label={status().label} />
             <Label variant="meta">{[str(own(answer(), "agent")), str(own(answer(), "room")), cell(own(answer(), "at"), "relative").label].filter(x => x && x !== "—").join(" · ")}</Label>
           </Row>
-          <If when={str(own(answer(), "text"))}>
-            {text => <PageMarkdown text={text()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />}
+          <If when={n().document}>
+            {document => <PageMarkdown document={document()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />}
           </If>
           <If when={str(own(answer(), "error"))}>{t => <Label color="warning">{t()}</Label>}</If>
         </If>
@@ -113,7 +118,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
     case "RunList": case "MessageFeed": case "ScheduleCard": case "FileList":
       return <If when={n().values?.length} else={<Label color="muted">{empty()}</Label>}>
         <Column gap={2}>
-          <Each of={n().values ?? []}>{item => {
+          <Each of={n().values ?? []}>{(item, index) => {
             const field = (name: string) => own(item(), name);
             const title = () => str(field(n().type === "RunList" ? "task" : n().type === "MessageFeed" ? "author" : "name"));
             const status = () => cell(field(n().type === "ScheduleCard" ? "last_status" : "status"), "status");
@@ -129,7 +134,9 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
                   n().type === "FileList" ? cell(field("size"), "bytes").label : n().type === "ScheduleCard" && field("enabled") === false ? "Paused" : "",
                 ].filter(x => x && x !== "—").join(" · ")}</Label>
               }>
-                <PageMarkdown text={str(field("text"))} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />
+                <If when={n().messages?.[index()]}>{document =>
+                  <PageMarkdown document={document()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />
+                }</If>
               </If>
               <If when={!props.interactions.readOnly && n().type === "FileList" && props.interactions.onFile && str(field("id"))}>
                 <Row><Action compact variant="ghost" label="Open file" onPress={() => props.interactions.onFile?.(str(field("id")))} /></Row>

@@ -1,6 +1,6 @@
 import { expect, open, test } from "nsh/test";
 import type { PageBlock } from "../../api/pages";
-import { httpsLink, safePageMarkdown } from "../../ui/pageBlocks";
+import { httpsLink, MAX_PAGE_MARKDOWN_BYTES, MAX_PAGE_MARKDOWN_NODES, pageRichText } from "../../ui/pageMarkdown";
 import { MAX_RENDERED, own, planPage } from "./renderPlan";
 import { bind, lit, sample, sampleData } from "./test/sample";
 
@@ -71,7 +71,7 @@ test("PageSpec render budget counts expanded rows and cells and stops deep trees
 });
 
 test("Page Markdown drops image nodes and insecure links in nested content", () => {
-  const document = safePageMarkdown([
+  const document = pageRichText().document([[
     "> [![Alt only](https://example.invalid/pixel)](https://example.invalid/good)",
     "",
     "- [Insecure](http://example.invalid/)",
@@ -79,7 +79,7 @@ test("Page Markdown drops image nodes and insecure links in nested content", () 
     "- [Mail](mailto:a@example.invalid)",
     "",
     "<img src=\"https://example.invalid/not-rendered\" />",
-  ].join("\n"));
+  ].join("\n")]);
   const encoded = JSON.stringify(document);
   expect(encoded).toContain("Alt only");
   expect(encoded).toContain("https://example.invalid/good");
@@ -92,4 +92,42 @@ test("Page Markdown drops image nodes and insecure links in nested content", () 
     expect(httpsLink(url)).toBe(null);
   }
   expect(httpsLink("https://example.invalid/a")).toBe("https://example.invalid/a");
+});
+
+test("One UTF-8 quota covers literal Markdown, answers and repeated message documents", () => {
+  const spec = { format: 1, data: [{ name: "answer" }, { name: "feed" }, { name: "rows" }], blocks: [
+    { type: "Markdown", key: "md", content: [lit("日本語".repeat(2_000))] },
+    { type: "AgentAnswer", key: "answer", props: { from: bind("answer") } },
+    { type: "Each", key: "items", props: { items: bind("rows"), as: lit("one") }, children: [
+      { type: "MessageFeed", key: "feed", props: { from: bind("feed") } },
+    ] },
+    { type: "Markdown", key: "later", content: [lit("Must not mount after the quota")] },
+  ] };
+  const result = planPage(spec, { ...sampleData, data: {
+    answer: { ok: true, value: { text: "🛰".repeat(5_000) } },
+    feed: { ok: true, value: { items: [{ text: "é".repeat(4_000) }, { text: "🛠".repeat(2_000) }] } },
+    rows: { ok: true, value: Array.from({ length: 30 }, (_, i) => i) },
+  } }, false);
+  expect(result.richText.limited).toBe(true);
+  expect(result.richText.bytes).toBe(MAX_PAGE_MARKDOWN_BYTES);
+  expect(result.blocks[2]?.children.filter(b => b.messages?.some(Boolean)).length).toBeLessThan(30);
+  expect(result.blocks[3]?.document).toBe(undefined);
+  const scalarBound = pageRichText(5);
+  const clipped = scalarBound.document(["é🛰"]);
+  expect(scalarBound.usage()).toEqual({ bytes: 2, nodes: 3, limited: true });
+  expect(JSON.stringify(clipped)).not.toContain("🛰");
+});
+
+test("The emitted Markdown budget charges lists and tables across small documents", () => {
+  const spec = { format: 1, data: [{ name: "feed" }], blocks: Array.from({ length: 100 }, (_, i) => ({
+    type: "MessageFeed", key: `feed-${i}`, props: { from: bind("feed") },
+  })) };
+  const text = "A | B\n---|---\nC | D\n\n- **one**\n- *two*";
+  const data = { ...sampleData, data: { feed: { ok: true as const, value: { items: Array.from({ length: 8 }, () => ({ text })) } } } };
+  const result = planPage(spec, data, false);
+  expect(result.richText.nodes).toBe(MAX_PAGE_MARKDOWN_NODES);
+  expect(result.richText.bytes).toBeLessThan(MAX_PAGE_MARKDOWN_BYTES);
+  expect(result.richText.limited).toBe(true);
+  expect(result.blocks[0]?.messages?.every(Boolean)).toBe(true);
+  expect(result.blocks[99]?.messages?.some(Boolean)).toBe(false);
 });

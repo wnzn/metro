@@ -1,11 +1,13 @@
 import { Action, Badge, Column, Label, Row } from "./primitives";
 import { DiffView, Editor, Progress, TextView } from "nsh/base";
-import type { EditorDiagnostic, TextViewBlock, TextViewDocument, TextViewInline } from "nsh/base";
+import type { EditorDiagnostic, TextViewDocument } from "nsh/base";
 import { Bar, Line, Plot, PlotAxis } from "nsh/base/plot";
-import { computed, View } from "nsh";
+import { View } from "nsh";
 import type { JSX } from "nsh";
 import { cx, toneSolidClass } from "./tokens";
 import type { Tone } from "./tokens";
+import { httpsLink } from "./pageMarkdown";
+export { httpsLink } from "./pageMarkdown";
 
 export function PageBlockFrame(props: { children?: JSX.Element; blockKey?: string; changed?: boolean; onEdit?: () => void }) {
   return (
@@ -65,66 +67,8 @@ export function PageTable(props: { headings: string[]; rows: TableCell[][] }) {
   </Column>;
 }
 
-export function httpsLink(url: string): string | null {
-  if (!/^https:\/\/[^/\s\\]/i.test(url) || /[\s\\\p{Cc}]/u.test(url)) return null;
-  try {
-    const parsed = new URL(url);
-    return parsed.protocol === "https:" && parsed.hostname && !parsed.username && !parsed.password ? parsed.href : null;
-  } catch { return null; }
-}
-
-// Parse Markdown as data with HTML disabled, then build a fresh allowlisted
-// document. No image node or source URL can reach a rendering component (not
-// even for an image hidden inside a link, list, table or quote).
-export function safePageMarkdown(text: string): TextViewDocument {
-  const parsed = TextView.parse(text.slice(0, 65_536), { html: false });
-  let left = 600;
-  const take = (depth: number) => depth <= 12 && --left >= 0;
-  function inlines(nodes: TextViewInline[], depth: number): TextViewInline[] {
-    return nodes.slice(0, Math.max(0, left)).flatMap((n): TextViewInline[] => {
-      if (!take(depth)) return [];
-      switch (n.type) {
-        case "text": case "code": case "break": return [n];
-        case "strong": case "emphasis": case "strikethrough":
-          return [{ type: n.type, content: inlines(n.content, depth + 1) }];
-        case "link": {
-          const body = inlines(n.content, depth + 1);
-          const url = httpsLink(n.url);
-          return url ? [{ type: "link", url, content: body }] : body;
-        }
-        case "image": return [{ type: "text", text: n.alt || "[Image]" }];
-        default: return [];
-      }
-    });
-  }
-  function blocks(nodes: TextViewBlock[], depth: number): TextViewBlock[] {
-    return nodes.slice(0, Math.max(0, left)).flatMap((n): TextViewBlock[] => {
-      if (!take(depth)) return [];
-      switch (n.type) {
-        case "paragraph": return [{ type: "paragraph", content: inlines(n.content, depth + 1) }];
-        case "heading": return [{ type: "heading", level: n.level, content: inlines(n.content, depth + 1) }];
-        case "blockquote": return [{ type: "blockquote", children: blocks(n.children, depth + 1) }];
-        case "list": return [{ type: "list", ordered: n.ordered, start: n.start,
-          items: n.items.slice(0, 50).filter(() => take(depth + 1)).map(i => ({ children: blocks(i.children, depth + 2) })) }];
-        case "table": {
-          const cells = (row: typeof n.head) => row.slice(0, 12).filter(() => take(depth + 1))
-            .map(c => ({ content: inlines(c.content, depth + 2) }));
-          const head = cells(n.head);
-          const rows = (n.rows ?? []).slice(0, 50).map(cells).filter(row => row.length === head.length);
-          return head.length ? [{ type: "table", head, rows }] : [];
-        }
-        case "rule": return [{ type: "rule" }];
-        case "codeBlock": return [{ type: "codeBlock", code: n.code }];
-        default: return [];
-      }
-    });
-  }
-  return { blocks: blocks(parsed.blocks, 1) };
-}
-
-export function PageMarkdown(props: { text: string; onLink?: (url: string) => void }) {
-  const document = computed(() => safePageMarkdown(props.text));
-  return <TextView document={document()} links="report" selectable onLinkPress={e => {
+export function PageMarkdown(props: { document: TextViewDocument; onLink?: (url: string) => void }) {
+  return <TextView document={props.document} links="report" selectable onLinkPress={e => {
     const url = httpsLink(e.url);
     if (url) props.onLink?.(url);
   }} />;
