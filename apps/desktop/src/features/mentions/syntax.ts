@@ -16,29 +16,49 @@ export function opensMention(text: string, start: number): boolean {
 
 function escaped(text: string, i: number, opaque: readonly MentionRange[]): boolean {
   let before = i - 1;
-  while (text[before] === "\\" && !overlapsRanges({ start: before, end: before + 1 }, opaque)) before--;
+  while (before >= 0 && text[before] === "\\" && !overlapsRanges({ start: before, end: before + 1 }, opaque)) before--;
   return (i - before) % 2 === 0;
 }
 
-export function quotedEmailRanges(text: string, opaque: readonly MentionRange[]): MentionRange[] {
-  // The legacy scanner can read both mentions inside a quoted local part
-  // and its closing `"@agent` as addressing. Keep those at-signs plain,
-  // without excluding ordinary quoted mentions such as `"@coder"`.
-  const quoted: MentionRange[] = [];
-  const opens = new Map<string, number>();
-  for (const match of text.matchAll(/["'\r\n\u2028\u2029]/gu)) {
-    const char = match[0], i = match.index!;
-    if (char !== '"' && char !== "'") {
-      opens.clear();
-    } else if (!overlapsRanges({ start: i, end: i + 1 }, opaque) && !escaped(text, i, opaque)) {
-      const start = opens.get(char);
-      if (start !== undefined) {
-        // Inspect the original @ even if anchored: an adjoining edit can
-        // turn a formerly standalone mention into the domain of an email.
-        if (text[i + 1] === "@") quoted.push({ start, end: i + 2 });
-        opens.delete(char);
-      } else if (opensMention(text, i)) opens.set(char, i);
+function visibleQuote(text: string, i: number, opaque: readonly MentionRange[]): boolean {
+  return !overlapsRanges({ start: i, end: i + 1 }, opaque) && !escaped(text, i, opaque);
+}
+
+/** Find a complete local part ending at this quote, without pairing unrelated prose quotes. */
+export function quotedLocalStart(text: string, close: number, opaque: readonly MentionRange[]): number | null {
+  if (close < 1 || close >= text.length) return null;
+  const quote = text[close];
+  if ((quote !== '"' && quote !== "'") || !visibleQuote(text, close, opaque)) return null;
+  for (let i = close - 1; i >= 0; i--) {
+    if (/[\r\n\u0085\u2028\u2029]/u.test(text[i])) break;
+    if (text[i] === quote && visibleQuote(text, i, opaque)) {
+      // An unescaped inner quote makes this local part incomplete; do
+      // not skip it to grab an earlier quote with a better boundary.
+      return opensMention(text, i) ? i : null;
     }
+  }
+  return null;
+}
+
+function quotedEmailRanges(text: string, opaque: readonly MentionRange[]): MentionRange[] {
+  const quoted: MentionRange[] = [];
+  // A domain can be a single label or a bracketed literal. This is only
+  // a plausibility check, not full email validation.
+  const domain = /[\p{L}\p{N}][\p{L}\p{N}\p{M}.-]*|\[[\p{L}\p{N}:][\p{L}\p{N}.:%_-]*\]/uy;
+  for (const match of text.matchAll(/["']@/gu)) {
+    const close = match.index!;
+    domain.lastIndex = close + 2;
+    if (!domain.test(text)) continue;
+    // Give an ordinary quoted mention its own closing quote. Otherwise
+    // `"Hello!" "@coder"` could look like a local part starting at `!"`.
+    const end = domain.lastIndex;
+    const punctuation = /^[.,;:!?]*/.exec(text.slice(end))![0].length;
+    const after = end + punctuation;
+    if (text[after] === text[close] && visibleQuote(text, after, opaque)) continue;
+    const start = quotedLocalStart(text, close, opaque);
+    // Use the original @ even when it starts an anchor: an adjoining
+    // edit can turn a formerly standalone mention into an email domain.
+    if (start !== null) quoted.push({ start, end: close + 2 });
   }
   return quoted;
 }
