@@ -160,10 +160,6 @@ impl RoutingSettings {
         self.enabled && !self.cases.is_empty() && self.classifier_id.is_some()
     }
 
-    fn wants_inference(&self) -> bool {
-        self.infer_addressing && self.classifier_id.is_some()
-    }
-
     /// Shape checks that need no database.
     fn check_shape(&self) -> Result<(), String> {
         let unit = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
@@ -426,7 +422,7 @@ impl RoutingBackend for ProviderBackend {
         Box::pin(async move {
             crate::providers::decide(state, user, space, id, state_payload, questions)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map_err(anyhow::Error::new)
         })
     }
 
@@ -721,8 +717,81 @@ pub const NO_MATCH_KEY: &str = "no_match";
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decision<T> {
     Answered(T),
-    /// No answer: no connection, busy, timed out, failed or malformed.
-    Failed(&'static str),
+    Failed(DecisionFailure),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionFailure {
+    Unreachable,
+    Timeout,
+    InvalidAnswer,
+    NoClassifier,
+    NotAllowed,
+    Busy,
+    InvalidQuestion,
+}
+
+impl std::fmt::Display for DecisionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unreachable => "the System One call failed",
+            Self::Timeout => "System One took too long",
+            Self::InvalidAnswer => "System One's answer was malformed",
+            Self::NoClassifier => "no System One connection is set",
+            Self::NotAllowed => "the System One connection is not usable here",
+            Self::Busy => "System One is busy",
+            Self::InvalidQuestion => "the routing question is invalid",
+        })
+    }
+}
+
+impl DecisionFailure {
+    fn upstream(error: &anyhow::Error) -> Self {
+        use crate::providers::ProviderError;
+        match error.downcast_ref::<ProviderError>() {
+            Some(ProviderError::Use(UseError::Busy) | ProviderError::Busy) => Self::Busy,
+            Some(ProviderError::Use(UseError::DeviceOffline | UseError::Internal)) => {
+                Self::Unreachable
+            }
+            Some(ProviderError::Use(_)) => Self::NotAllowed,
+            Some(error) if error.status() == axum::http::StatusCode::GATEWAY_TIMEOUT => {
+                Self::Timeout
+            }
+            // Only locally generated protocol errors reach this branch, never an
+            // upstream error body. The shared client currently returns fixed text.
+            Some(ProviderError::Endpoint(text))
+                if text
+                    .starts_with("the model endpoint returned an invalid System One response")
+                    || text == "the model endpoint's response is not JSON"
+                    || text == "the model endpoint's response is too large" =>
+            {
+                Self::InvalidAnswer
+            }
+            _ => Self::Unreachable,
+        }
+    }
+}
+
+/// Extra metadata on the sender's POST response only; never on an Event.
+#[derive(Clone, Copy, Debug, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AddressingNote {
+    ClassificationFailed { reason: &'static str },
+}
+
+impl From<DecisionFailure> for AddressingNote {
+    fn from(reason: DecisionFailure) -> Self {
+        let reason = match reason {
+            DecisionFailure::Unreachable
+            | DecisionFailure::Busy
+            | DecisionFailure::InvalidQuestion => "unreachable",
+            DecisionFailure::Timeout => "timeout",
+            DecisionFailure::InvalidAnswer => "invalid_answer",
+            DecisionFailure::NoClassifier => "no_classifier",
+            DecisionFailure::NotAllowed => "not_allowed",
+        };
+        Self::ClassificationFailed { reason }
+    }
 }
 
 /// The use-case Choice's answer: the option and its probability.
@@ -778,12 +847,12 @@ async fn ask_one(
     question: Question,
 ) -> Decision<protocol::Answer> {
     let Some(classifier) = settings.classifier_id.as_deref() else {
-        return Decision::Failed("no System One connection is set");
+        return Decision::Failed(DecisionFailure::NoClassifier);
     };
     let mut asked = Questions::new();
     asked.insert(id.to_owned(), question);
     if protocol::validate_questions(&asked).is_err() {
-        return Decision::Failed("the routing question is invalid");
+        return Decision::Failed(DecisionFailure::InvalidQuestion);
     }
     let message: String = text.chars().take(MAX_CLASSIFIED_CHARS).collect();
     let payload = json!({
@@ -791,7 +860,7 @@ async fn ask_one(
         "where": if space.is_some() { "a shared room" } else { "the sender's private chat with the assistant" },
     });
     let Ok(_slot) = state.routing.decisions.clone().try_acquire_owned() else {
-        return Decision::Failed("System One is busy");
+        return Decision::Failed(DecisionFailure::Busy);
     };
     let call = state.routing.backend.system_one(
         state,
@@ -804,21 +873,22 @@ async fn ask_one(
     let response = match tokio::time::timeout(DECISION_TIMEOUT, call).await {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => {
-            tracing::warn!(error = %format!("{e:#}"), "System One call failed");
-            return Decision::Failed("the System One call failed");
+            let failure = DecisionFailure::upstream(&e);
+            tracing::warn!(%failure, "System One call failed");
+            return Decision::Failed(failure);
         }
-        Err(_) => return Decision::Failed("System One took too long"),
+        Err(_) => return Decision::Failed(DecisionFailure::Timeout),
     };
     let answers: Answers = match protocol::parse_answers(&asked, &response) {
         Ok(a) => a,
-        Err(e) => {
-            tracing::warn!(error = %e, "System One answer rejected");
-            return Decision::Failed("System One's answer was malformed");
+        Err(_) => {
+            tracing::warn!("System One answer rejected");
+            return Decision::Failed(DecisionFailure::InvalidAnswer);
         }
     };
     match answers.into_values().next() {
         Some(answer) => Decision::Answered(answer),
-        None => Decision::Failed("System One's answer was malformed"),
+        None => Decision::Failed(DecisionFailure::InvalidAnswer),
     }
 }
 
@@ -843,7 +913,7 @@ pub async fn directedness(
     {
         Decision::Answered(a) => match a.as_noul() {
             Some(p) => Decision::Answered(p),
-            None => Decision::Failed("System One's answer was malformed"),
+            None => Decision::Failed(DecisionFailure::InvalidAnswer),
         },
         Decision::Failed(why) => Decision::Failed(why),
     }
@@ -873,7 +943,7 @@ pub async fn use_case(
                 key: key.to_owned(),
                 probability: p.unwrap_or(0.0),
             }),
-            None => Decision::Failed("System One's answer was malformed"),
+            None => Decision::Failed(DecisionFailure::InvalidAnswer),
         },
         Decision::Failed(why) => Decision::Failed(why),
     }
@@ -957,7 +1027,7 @@ pub async fn pick_agent(
         ..
     } = &answer
     else {
-        return Decision::Failed("System One's answer was malformed");
+        return Decision::Failed(DecisionFailure::InvalidAnswer);
     };
     let probability = probabilities.get(choice).copied().unwrap_or(0.0);
     let index = if with_none && choice == NO_AGENT_KEY {
@@ -966,7 +1036,7 @@ pub async fn pick_agent(
         match (0..agents.len()).find(|i| agent_key(*i) == *choice) {
             Some(i) => Some(i),
             // An option that was never offered.
-            None => return Decision::Failed("System One's answer was malformed"),
+            None => return Decision::Failed(DecisionFailure::InvalidAnswer),
         }
     };
     let directed = match (with_none, probabilities.get(NO_AGENT_KEY)) {
@@ -990,12 +1060,14 @@ pub async fn infer_addressed(
     space: Option<&str>,
     settings: &RoutingSettings,
     text: &str,
-) -> bool {
-    settings.wants_inference()
-        && matches!(
-            directedness(state, user, space, settings, text).await,
-            Decision::Answered(p) if p >= settings.min_directedness
-        )
+) -> Result<bool, DecisionFailure> {
+    if !settings.infer_addressing {
+        return Ok(false);
+    }
+    match directedness(state, user, space, settings, text).await {
+        Decision::Answered(p) => Ok(p >= settings.min_directedness),
+        Decision::Failed(why) => Err(why),
+    }
 }
 
 /// The route of a turn `user` starts. `chosen` (an explicit model for this

@@ -69,6 +69,9 @@ async fn fixture(seen: Arc<Mutex<Seen>>) -> String {
                             .into_response();
                     }
                     let message = body["state"]["message"].as_str().unwrap_or_default();
+                    if message == "[bad-answer]" {
+                        return Json(json!({"answers": []})).into_response();
+                    }
                     let (id, q) = questions.into_iter().next().unwrap();
                     let answer = match q["type"].as_str() {
                         Some("noul") => {
@@ -259,6 +262,38 @@ fn keys(body: &Value) -> Vec<String> {
         .keys()
         .cloned()
         .collect()
+}
+
+#[tokio::test]
+async fn malformed_response_from_the_real_typed_client_has_a_private_note() {
+    let h = H::start().await;
+    let classifier = h.connect("custom-systemone", "jev-1.14.0", true).await;
+    let (status, settings) = h
+        .req(
+            reqwest::Method::PUT,
+            "alice",
+            "/v1/model-routing",
+            Some(json!({"infer_addressing": true, "classifier_id": classifier})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{settings}");
+    let (status, sent) = h
+        .req(
+            reqwest::Method::POST,
+            "alice",
+            "/v1/chat/messages",
+            Some(json!({"text": "[bad-answer]"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED);
+    assert_eq!(
+        sent["addressing_note"],
+        json!({"kind": "classification_failed", "reason": "invalid_answer"})
+    );
+    let events = h.events().await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["id"], sent["id"]);
+    assert!(events[0].get("addressing_note").is_none());
 }
 
 #[tokio::test]

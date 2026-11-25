@@ -25,7 +25,8 @@ use crate::AppState;
 use crate::db::{Addressed, Author, Event, Room, actor, kind};
 use crate::mentions::Mention;
 use crate::model_routing::{
-    self as routing, AddressedBy, Addressing, Decision, Route, RoutingSettings,
+    self as routing, AddressedBy, Addressing, AddressingNote, Decision, DecisionFailure, Route,
+    RoutingSettings,
 };
 use crate::space_agents::SpaceAgent;
 use crate::space_prefs::SpacePrefs;
@@ -44,6 +45,8 @@ pub struct Plan {
     pub targets: Vec<Target>,
     /// Shown in the room after the message, e.g. a failed agent decision.
     pub errors: Vec<String>,
+    /// Only returned to the sender; this never becomes a room event.
+    pub addressing_note: Option<AddressingNote>,
     /// Set when the classifier addressed an unaddressed message: the
     /// mentions to store instead of the empty ones.
     pub classified: Option<Addressed>,
@@ -91,12 +94,15 @@ pub async fn plan(
         // Attachments alone are ordinary conversation: never classified.
         Addressing::Unaddressed if text.is_empty() => {}
         Addressing::Unaddressed => {
-            if !classifies(prefs, settings) {
+            if !prefs.classify_unaddressed {
                 return plan;
             }
             let answer =
                 routing::pick_agent(state, user, space, settings, text, &options(agents), true)
                     .await;
+            if let Decision::Failed(why) = answer {
+                plan.addressing_note = Some(why.into());
+            }
             if let Decision::Answered(a) = answer
                 && let Some(i) = a.index
                 && a.directed >= settings.min_directedness
@@ -134,7 +140,16 @@ pub async fn plan(
                             .await
                         {
                             Ok(t) => push(&mut plan.targets, t),
-                            Err(e) => plan.errors.push(e),
+                            Err(why) => {
+                                plan.addressing_note = Some(why.into());
+                                // Generic @agent was explicitly addressed; keep
+                                // the existing visible error for this case.
+                                plan.errors.push(format!(
+                                    "Your classifier could not choose an agent for this message: \
+                                     {why}. No agent ran for @agent; mention an agent by its \
+                                     handle, or check your System One connection in Settings."
+                                ));
+                            }
                         }
                     }
                     Mention::User { .. } => {}
@@ -156,7 +171,7 @@ async fn generic(
     prefs: &SpacePrefs,
     agents: &[SpaceAgent],
     default: &SpaceAgent,
-) -> Result<Target, String> {
+) -> Result<Target, DecisionFailure> {
     let default_target = |pick: String| Target {
         agent: default.clone(),
         pick,
@@ -178,11 +193,7 @@ async fn generic(
             ))),
             None => Ok(default_target("Default agent".to_owned())),
         },
-        Decision::Failed(why) => Err(format!(
-            "Your classifier could not choose an agent for this message: {why}. No agent ran \
-             for @agent; mention an agent by its handle, or check your System One connection \
-             in Settings."
-        )),
+        Decision::Failed(why) => Err(why),
     }
 }
 

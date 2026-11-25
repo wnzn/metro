@@ -10,7 +10,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::AppState;
@@ -24,7 +24,9 @@ use crate::db::{
 };
 use crate::jobs::{CompleteError, JobOutcome};
 use crate::mentions::{self, Mention};
-use crate::model_routing::{self as routing, AddressedBy, Addressing, RoutingSettings};
+use crate::model_routing::{
+    self as routing, AddressedBy, Addressing, AddressingNote, RoutingSettings,
+};
 use crate::orchestration::RunStatus;
 use crate::tools::RunnerTool;
 
@@ -636,32 +638,52 @@ async fn dispatch_of(
     text: &str,
     resolved: &[Mention],
     addressing: Addressing,
-) -> ApiResult<(Addressed, Option<(AddressedBy, RoutingSettings)>)> {
+) -> ApiResult<PersonalDispatch> {
     let settings = || async {
         routing::preferences(state, &who.id)
             .await
             .map_err(ApiError::internal)
     };
-    Ok(match addressing {
+    let (addressed, turn, note) = match addressing {
         // Attachments alone are ordinary conversation: never classified.
-        Addressing::Unaddressed if text.is_empty() => (addressed(resolved), None),
-        Addressing::PeopleOnly => (addressed(resolved), None),
+        Addressing::Unaddressed if text.is_empty() => (addressed(resolved), None, None),
+        Addressing::PeopleOnly => (addressed(resolved), None, None),
         Addressing::Agent => (
             addressed(resolved),
             Some((AddressedBy::Explicit, settings().await?)),
+            None,
         ),
         Addressing::Unaddressed => {
             let settings = settings().await?;
-            if routing::infer_addressed(state, &who.id, space, &settings, text).await {
-                (
+            match routing::infer_addressed(state, &who.id, space, &settings, text).await {
+                Ok(true) => (
                     routing::classifier_addressed(),
                     Some((AddressedBy::Classifier, settings)),
-                )
-            } else {
-                (addressed(resolved), None)
+                    None,
+                ),
+                Ok(false) => (addressed(resolved), None, None),
+                Err(why) => (addressed(resolved), None, Some(why.into())),
             }
         }
+    };
+    Ok(PersonalDispatch {
+        addressed,
+        turn,
+        note,
     })
+}
+
+struct PersonalDispatch {
+    addressed: Addressed,
+    turn: Option<(AddressedBy, RoutingSettings)>,
+    note: Option<AddressingNote>,
+}
+
+#[derive(Serialize)]
+pub struct PostedMessage {
+    #[serde(flatten)]
+    event: Event,
+    addressing_note: Option<AddressingNote>,
 }
 
 pub async fn post_message(
@@ -669,7 +691,7 @@ pub async fn post_message(
     who: Human,
     Path((sid, rid)): Path<(String, String)>,
     body: JsonBody<PostMessage>,
-) -> ApiResult<(StatusCode, Json<Event>)> {
+) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
     let Json(body) = body?;
     let space = member_of(&state, &sid, &who).await?;
     let room = room_of(&state, &space, &rid).await?;
@@ -792,7 +814,13 @@ pub async fn post_message(
         &prefs,
     )
     .await;
-    Ok((StatusCode::ACCEPTED, Json(event)))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PostedMessage {
+            event,
+            addressing_note: plan.addressing_note,
+        }),
+    ))
 }
 
 /// Demo: a deterministic `workspace.list` of the workspace root on the
@@ -1006,7 +1034,7 @@ pub async fn chat_message(
     State(state): State<AppState>,
     who: Human,
     body: JsonBody<ChatMessage>,
-) -> ApiResult<(StatusCode, Json<Event>)> {
+) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
     let Json(body) = body?;
     let text = check_message(&state, &who.id, None, &body.text, &body.asset_ids).await?;
     // Personal Chat has no other members: only `@agent` or the flag resolve.
@@ -1024,7 +1052,11 @@ pub async fn chat_message(
         addressing,
     )
     .await?;
-    let (addressed, turn) = dispatch_of(&state, &who, None, &text, &resolved, addressing).await?;
+    let PersonalDispatch {
+        addressed,
+        turn,
+        note,
+    } = dispatch_of(&state, &who, None, &text, &resolved, addressing).await?;
     let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
     let event = if body.asset_ids.is_empty() {
         db(&state, move |db| {
@@ -1060,7 +1092,13 @@ pub async fn chat_message(
             let _ = start_personal_run(&state, &uid, &event, route).await;
         });
     }
-    Ok((StatusCode::ACCEPTED, Json(event)))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PostedMessage {
+            event,
+            addressing_note: note,
+        }),
+    ))
 }
 
 // ---- Runs ----

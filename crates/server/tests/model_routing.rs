@@ -20,7 +20,7 @@ use metro_model_protocol::Capability;
 use metro_server::auth::{AuthFailure, AuthFuture, HumanAuth, UserIdentity};
 use metro_server::db::Db;
 use metro_server::model_routing::{BoxFuture, Routing, RoutingBackend, submit_scheduled};
-use metro_server::providers::{SelectedModel, UseError};
+use metro_server::providers::{ProviderError, SelectedModel, UseError};
 use metro_server::{AppState, Config, Limits, ModelConfig, router};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
@@ -212,9 +212,12 @@ impl RoutingBackend for Backend {
             match conn {
                 Some(c)
                     if c.capability == Capability::SystemOne && self.0.usable(user, space, &c) => {}
-                _ => anyhow::bail!("not found"),
+                _ => return Err(ProviderError::Use(UseError::NotFound).into()),
             }
             let message = state_payload["message"].as_str().unwrap_or_default();
+            if message.contains("[timeout]") {
+                return std::future::pending().await;
+            }
             Fake::answer(message, &questions).map_err(anyhow::Error::msg)
         })
     }
@@ -745,6 +748,86 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
         )
         .await;
     assert_ne!(s, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn failed_classification_is_returned_only_on_the_senders_post() {
+    let h = H::start().await;
+    let sid = h.space("private classifier notes").await;
+    assert_eq!(
+        h.put_routing("alice", routing_on(true, false)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    for (text, reason) in [
+        ("[err] service failed", Some("unreachable")),
+        ("[bad] malformed", Some("invalid_answer")),
+        ("[timeout] delayed", Some("timeout")),
+        ("[maybe] not sure", None),
+        ("Lunch?", None),
+    ] {
+        let expected = match reason {
+            Some(reason) => json!({"kind": "classification_failed", "reason": reason}),
+            None => Value::Null,
+        };
+        let (room, chat) = tokio::join!(
+            h.say("alice", Some(&sid), json!({"text": text})),
+            h.say("alice", None, json!({"text": text})),
+        );
+        for post in [&room, &chat] {
+            assert_eq!(post.get("addressing_note"), Some(&expected));
+        }
+        for (who, space, post) in [
+            ("alice", Some(sid.as_str()), &room),
+            ("bob", Some(sid.as_str()), &room),
+            ("alice", None, &chat),
+        ] {
+            let events = h.events(who, space).await;
+            let stored = events.last().unwrap();
+            assert_eq!(stored["id"], post["id"]);
+            assert_eq!(stored["kind"], "message");
+            assert_eq!(stored["text"], text);
+            assert!(stored.get("addressing_note").is_none());
+        }
+    }
+
+    // An opted-in Space loses the classifier with routing settings reset,
+    // and can also lose access to a classifier configured just before a
+    // concurrent share revocation/deletion.
+    h.fake
+        .conns
+        .lock()
+        .unwrap()
+        .remove(&id(CLASSIFIER))
+        .unwrap();
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "lost access"}))
+        .await;
+    assert_eq!(e["addressing_note"]["reason"], "not_allowed");
+    assert_eq!(
+        h.put_routing(
+            "alice",
+            json!({"infer_addressing": false, "classifier_id": null})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "no classifier"}))
+        .await;
+    assert_eq!(e["addressing_note"]["reason"], "no_classifier");
+    let bobs_events = h.events("bob", Some(&sid)).await;
+    assert!(
+        bobs_events
+            .iter()
+            .all(|e| e["kind"] == "message" && e.get("addressing_note").is_none())
+    );
 }
 
 #[tokio::test]
@@ -1551,9 +1634,16 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
     assert_eq!(started["agent"]["handle"], "agent");
     assert!(started["pick"].as_str().unwrap().contains("unsure"));
     // A failed or malformed decision runs nothing for @agent, visibly.
-    for text in ["@agent [err] x", "@agent [ghost] x"] {
+    for (text, reason) in [
+        ("@agent [err] x", "unreachable"),
+        ("@agent [ghost] x", "invalid_answer"),
+    ] {
         let calls = h.model_calls().len();
         let e = h.say("alice", Some(&sid), json!({"text": text})).await;
+        assert_eq!(
+            e["addressing_note"],
+            json!({"kind": "classification_failed", "reason": reason})
+        );
         let a = h
             .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
             .await;
@@ -1566,6 +1656,12 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(h.model_calls().len(), calls, "{text}");
+        assert!(
+            h.events("bob", Some(&sid))
+                .await
+                .iter()
+                .all(|e| e.get("addressing_note").is_none())
+        );
     }
     // A specific handle skips classification.
     let before = h.fake.calls();
