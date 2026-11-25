@@ -432,6 +432,7 @@ test("in the narrowest window routing consent, Save and the runner controls stay
   expect(app.shows("id:dataflow-addressing >> text:/This never applies to personal Chat/")).toBe(true);
   await app.press("id:routing-revert");
   await settings(app, "runners");
+  await app.press("id:runner-add-toggle");
   await app.waitFor("id:runner-name");
   expect(app.shows("id:add-runner")).toBe(true);
   expect(app.shows("text:You'll get its token once, with the steps to start it.")).toBe(true);

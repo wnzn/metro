@@ -36,6 +36,7 @@ import type {
   ProviderConnection,
   ProviderPatch,
   RegisteredRunner,
+  RunnerPending,
   RunnerVisibility,
   SpaceRunner,
 } from "./api/client";
@@ -133,6 +134,22 @@ export async function loadRunners(): Promise<void> {
     if (!ok() || seq !== runnersSeq) return;
     settingsError(error, runnersError, "Could not load runners");
   }
+}
+
+/** Put an acknowledged update behind the same read fence as runner creation/deletion. */
+export function recordRunnerUpdateAccepted(id: string, pending: RunnerPending, valid: () => boolean): void {
+  if (!valid()) return;
+  runnersSeq++;
+  const list = runners();
+  const runner = list?.find((r) => r.id === id);
+  const update = runner?.update;
+  if (!list || !runner || !update) return;
+  // A late POST acknowledgement must not roll back progress a roster read
+  // has already reported. Later GETs replace this provisional pending value.
+  if (runner.presence?.version === pending.target ||
+      (update.pending && update.pending.requestedAt >= pending.requestedAt) ||
+      (update.lastResult?.target === pending.target && update.lastResult.at > pending.requestedAt)) return;
+  runners.set(list.map((r) => r.id === id ? { ...r, update: { ...update, pending } } : r));
 }
 
 export async function createRunner(nameInput: string, visibility: RunnerVisibility): Promise<boolean> {

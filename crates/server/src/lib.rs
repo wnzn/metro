@@ -265,6 +265,10 @@ pub fn router(state: AppState) -> Router {
                 .put(runners::put_space_runner)
                 .delete(runners::delete_space_runner),
         )
+        .route(
+            "/v1/spaces/{sid}/runner/attach-if-empty",
+            post(runners::post_space_runner_if_empty),
+        )
         // Provider routes carry their full paths and authenticate people
         // themselves; they share the human body limit.
         .merge(crate::providers::router())
