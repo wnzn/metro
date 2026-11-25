@@ -1961,3 +1961,55 @@ async fn a_default_replaced_mid_run_is_reported_as_changed() {
     );
     let _ = second;
 }
+
+/// A `device-systemone` connection of `token`'s person, paired and online:
+/// its id and device token.
+async fn online_device(s: &Server, token: &str) -> (String, String) {
+    let id = s
+        .connect(token, "device-systemone", "jev-local", false)
+        .await;
+    let (status, issued) = s
+        .post(
+            token,
+            &format!("/v1/providers/{id}/device-token"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    let device = issued["token"].as_str().unwrap().to_owned();
+    assert!(claim(s, &device).await.is_none()); // online now
+    (id, device)
+}
+
+#[tokio::test]
+async fn space_work_queued_for_a_device_is_withheld_after_the_caller_leaves() {
+    let s = Arc::new(Server::start().await);
+    // Bob's own device, and Alice's shared with the whole organization.
+    let (own, own_device) = online_device(&s, BOB).await;
+    let (shared, shared_device) = online_device(&s, ALICE).await;
+    let (status, _) = s
+        .share(ALICE, &shared, json!({"visibility": "organization"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    for (label, id, device) in [("own", own, own_device), ("shared", shared, shared_device)] {
+        let sid = s.space(ALICE, &format!("leaving {label}"), &["bob"]).await;
+        let pending = {
+            let (s, sid, id) = (s.clone(), sid.clone(), id.clone());
+            tokio::spawn(async move { s.decide("bob", Some(&sid), &id).await })
+        };
+        // Queued (admitted while Bob was a member), not yet claimed.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(
+            !pending.is_finished(),
+            "{label}: still waiting for the device"
+        );
+        s.state.db.remove_member(&sid, "bob").unwrap();
+        // The device never receives the Space's payload.
+        assert!(
+            claim(&s, &device).await.is_none(),
+            "{label}: released after removal"
+        );
+        let r = pending.await.unwrap();
+        assert!(r.is_err(), "{label}: {r:?}");
+    }
+}

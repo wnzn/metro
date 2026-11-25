@@ -235,6 +235,14 @@ pub trait ConnectionDirectory: Send + Sync + 'static {
     ) -> anyhow::Result<bool> {
         Ok(false)
     }
+
+    /// Whether `user` is a member of Space `space` right now. Same locking
+    /// rule. Space-scoped work (the owner's own included) is released to a
+    /// device, and its result back, only while this holds. The default
+    /// answers no.
+    fn member(&self, _conn: &Connection, _space: &str, _user: &str) -> anyhow::Result<bool> {
+        Ok(false)
+    }
 }
 
 /// Bounds of the relay.
@@ -604,6 +612,9 @@ struct Job {
     media_bytes: usize,
     /// The stable user id the job is for (owner or borrower).
     caller: String,
+    /// For work in a Space: who asked, and where. Rechecked for current
+    /// membership right before the payload is released to the device.
+    in_space: Option<Caller>,
     state: JobState,
     tx: oneshot::Sender<Result<Value, DeviceError>>,
 }
@@ -800,6 +811,7 @@ enum Next {
         id: String,
         caller: Option<Caller>,
         grant: Option<Arc<crate::providers::guard::DeviceClaimGrant>>,
+        in_space: Option<Caller>,
         owner: String,
         operation: Operation,
     },
@@ -1231,6 +1243,7 @@ impl DeviceRelay {
                     request: Some(request),
                     media_bytes,
                     caller: caller.user.clone(),
+                    in_space: caller.space.is_some().then(|| caller.clone()),
                     state: JobState::Queued,
                     tx,
                 },
@@ -1281,7 +1294,28 @@ impl DeviceRelay {
             tracing::debug!(job = %id, "borrowed device result withheld: access revoked");
             return Err(DeviceError::AccessRevoked);
         }
+        // And work for a Space only while its caller is still a member.
+        if outcome.is_ok() && !self.member_now(db, caller).await {
+            tracing::debug!(job = %id, "device result withheld: no longer a member");
+            return Err(DeviceError::AccessRevoked);
+        }
         outcome
+    }
+
+    /// Whether `caller` is still a member of their Space; `true` for
+    /// personal work. Errors count as no.
+    async fn member_now(&self, db: &Db, caller: &Caller) -> bool {
+        let Some(space) = caller.space.clone() else {
+            return true;
+        };
+        let directory = self.directory.clone();
+        let user = caller.user.clone();
+        db.call(move |db| directory.member(&db.lock(), &space, &user))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %format!("{e:#}"), "device relay membership check");
+                false
+            })
     }
 
     /// Whether `caller` may still borrow `connection` from `owner` for
@@ -1380,7 +1414,8 @@ impl DeviceRelay {
             }
             let caller = job.borrowed.clone();
             let grant = job.claim_grant.clone();
-            if caller.is_some() || grant.is_some() {
+            let in_space = job.in_space.clone();
+            if caller.is_some() || grant.is_some() || in_space.is_some() {
                 if !borrowed {
                     continue;
                 }
@@ -1391,6 +1426,7 @@ impl DeviceRelay {
                     id,
                     caller,
                     grant,
+                    in_space,
                     owner,
                     operation,
                 });
@@ -1423,18 +1459,24 @@ impl DeviceRelay {
     /// Recheck access before handing out borrowed or explicitly selected work.
     pub async fn claim_checked(&self, db: &Db, device: &Device) -> Option<ClaimedDeviceJob> {
         loop {
-            let (id, caller, grant, owner, operation) = match self.next_job(device, true)? {
-                Next::Ready(job) => return Some(job),
-                Next::Check {
-                    id,
-                    caller,
-                    grant,
-                    owner,
-                    operation,
-                } => (id, caller, grant, owner, operation),
+            let (id, caller, grant, in_space, owner, operation) =
+                match self.next_job(device, true)? {
+                    Next::Ready(job) => return Some(job),
+                    Next::Check {
+                        id,
+                        caller,
+                        grant,
+                        in_space,
+                        owner,
+                        operation,
+                    } => (id, caller, grant, in_space, owner, operation),
+                };
+            // Space work leaves Metro only while its caller is a member.
+            let mut ok = match &in_space {
+                Some(who) => self.member_now(db, who).await,
+                None => true,
             };
-            let mut ok = true;
-            if let Some(caller) = caller {
+            if ok && let Some(caller) = caller {
                 ok = self
                     .entitled(db, &caller, &device.connection, &owner, operation)
                     .await;

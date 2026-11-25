@@ -16,6 +16,8 @@ struct MockDirectory {
     conns: Mutex<HashMap<String, DeviceConnection>>,
     /// (connection, user, space) grants a share store would answer yes to.
     shares: Mutex<HashSet<(String, String, Option<String>)>>,
+    /// (space, user) pairs that are no longer members.
+    left: Mutex<HashSet<(String, String)>>,
 }
 
 impl MockDirectory {
@@ -47,6 +49,14 @@ impl MockDirectory {
 }
 
 impl ConnectionDirectory for MockDirectory {
+    fn member(&self, _conn: &Connection, space: &str, user: &str) -> anyhow::Result<bool> {
+        Ok(!self
+            .left
+            .lock()
+            .unwrap()
+            .contains(&(space.to_owned(), user.to_owned())))
+    }
+
     fn device_connection(
         &self,
         _conn: &Connection,

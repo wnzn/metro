@@ -1355,6 +1355,10 @@ impl crate::device_relay::ConnectionDirectory for DeviceDirectory {
     ) -> anyhow::Result<bool> {
         device_shared_use_allowed(conn, connection, user, space)
     }
+
+    fn member(&self, conn: &rusqlite::Connection, space: &str, user: &str) -> anyhow::Result<bool> {
+        Ok(store::is_member(conn, space, user)?)
+    }
 }
 
 /// Whether `user` (not the owner) may use device connection `connection`
