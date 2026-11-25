@@ -412,6 +412,42 @@ test("a member-readable or unversioned assignment cannot dismiss the offer or re
   }
 });
 
+test("detach and reattach of the same runner supersedes a held Space settings receipt", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("manual", "Manual", "alice");
+  f.addSpace("eligible", "Still eligible", "alice");
+  const t = fixture(f, r.id);
+  t.gate.attach = 800;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.waitFor(offer);
+  await app.press("id:space:manual");
+  await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
+  await app.press(`id:space-runner-attach:${r.id}`);
+  await app.waitUntil(() => f.state.attached.get("manual") === r.id);
+  // Another client changes the assignment, without moving this app's write marker.
+  const headers = { authorization: `Bearer ${TOKENS.alice}` };
+  const path = "/v1/spaces/manual/runner";
+  await f.network[`DELETE ${BASE}/v1/*`]!({ method: "DELETE", url: BASE + path, headers });
+  await f.network[`POST ${BASE}/v1/*`]!({ method: "POST", url: BASE + path + "/attach-if-empty", headers,
+    body: JSON.stringify({ runner_id: r.id }) });
+  expect(f.state.attached.get("manual")).toBe(r.id);
+  await app.clock!.runFor(800);
+  await app.waitFor("id:manage-error");
+  expect(app.shows("id:manage-notice")).toBe(false);
+  await app.waitFor("id:space-runner-status >> text:Attached · This PC");
+  expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+  expect(app.shows(offer)).toBe(true);
+  expect(runnerWrites(f)).toHaveLength(3);
+  await app.press("id:space-settings-close");
+  t.status.delay = 2_000;
+  await app.press("id:nav-settings");
+  await app.waitFor("id:runners-settings");
+  expect(app.shows("id:installed-runner-space:manual")).toBe(false);
+});
+
 test("a superseded Space settings attach neither dismisses the offer nor records a folder", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");

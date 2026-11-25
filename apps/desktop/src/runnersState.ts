@@ -206,15 +206,16 @@ export async function attachCreatedSpaceRunner(
     // The server repeats ownership and emptiness checks atomically. No fallback
     // to the replacing route, including for servers missing this endpoint.
     pendingWrite = beginSpaceRunnerWrite(sid);
-    await c.attachRunnerIfEmpty(sid, choice.id);
+    const receipt = await c.attachRunnerIfEmpty(sid, choice.id);
     accepted = true;
-    if (sessionOK()) dismissRunnerOffer();
     if (!pendingWrite()) return { kind: "superseded" };
     // Reconcile the actual assignment instead of replaying a delayed POST
     // response. Folder membership is read authoritatively on Settings open.
     const current = await reconcileOwnedSpaceRunner(sid, () => !!pendingWrite?.() && choice.isCurrent());
     if (current === undefined) return { kind: "unconfirmed" };
-    if (current?.kind !== "registered" || current.id !== choice.id) return { kind: "superseded" };
+    if (!pendingWrite() || !choice.isCurrent() || current?.kind !== "registered" || current.id !== choice.id ||
+        current.assignmentRevision !== receipt.assignmentRevision || spaceRunners()[sid] !== current) return { kind: "superseded" };
+    if (sessionOK()) dismissRunnerOffer();
     return { kind: "attached", state: local.state };
   } catch (error) {
     if (!pendingWrite) return notAttached("Metro couldn't verify the runner and the new Space.");
@@ -290,13 +291,18 @@ export async function attachMany(spaceIds: readonly string[]) {
           continue;
         }
         pendingWrite = beginSpaceRunnerWrite(s.id);
-        const result = await c.attachRunnerIfEmpty(s.id, runner.id);
+        const receipt = await c.attachRunnerIfEmpty(s.id, runner.id);
         if (!valid()) return;
+        const currentAssignment = await reconcileOwnedSpaceRunner(s.id, () => valid() && !!pendingWrite?.() && matches());
+        if (!valid()) return;
+        if (!pendingWrite() || currentAssignment?.kind !== "registered" ||
+            currentAssignment.id !== runner.id || currentAssignment.assignmentRevision !== receipt.assignmentRevision ||
+            spaceRunners()[s.id] !== currentAssignment) {
+          failures.push(`${s.name}: The current assignment could not be confirmed.`);
+          continue;
+        }
         attached++;
         dismissRunnerOffer();
-        if (!pendingWrite() || !spaceOK() || !spaces().some((space) => space.id === s.id && space.role === "owner")) continue;
-        setRunnerPaired(s.id, true);
-        spaceRunners.set({ ...spaceRunners(), [s.id]: result });
         if (matches()) recordAttachedFolder({ id: s.id, name: s.name });
       } catch (error) {
         if (!valid()) return;

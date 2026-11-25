@@ -866,9 +866,12 @@ async fn attach_space_runner(
             // Whatever was queued or claimed for the previous runner fails.
             state.jobs.revoke(&space.id, generation);
             tracing::info!(space = %space.id, runner = %runner.id, generation, "runner attached");
-            Ok(Json(
-                json!({"runner": space_view(&state, &space.id, &SpaceRunner::Registered(runner))}),
-            ))
+            let mut body =
+                json!({"runner": space_view(&state, &space.id, &SpaceRunner::Registered(runner))});
+            if empty_only {
+                body["assignment_revision"] = json!(generation.to_string());
+            }
+            Ok(Json(body))
         }
     }
 }

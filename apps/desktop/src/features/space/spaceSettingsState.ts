@@ -480,6 +480,7 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
   const writeCurrent = () => !!pendingWrite?.() && owns();
   try {
     let receipt: { token: string; revision: string } | null = null;
+    let attachedRevision: string | null = null;
     if (action.kind === "attach") {
       const inventoryRequest = ++inventoryRead;
       const inventory = await api.listRunnerInventory();
@@ -493,7 +494,7 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
         return reject("That runner is no longer available to attach.");
       }
       pendingWrite = beginSpaceRunnerWrite(sid);
-      await api.attachRunnerIfEmpty(sid, action.id);
+      attachedRevision = (await api.attachRunnerIfEmpty(sid, action.id)).assignmentRevision;
     } else if (guardedRemoval) {
       pendingWrite = beginSpaceRunnerWrite(sid);
       await api.detachRunnerIfCurrent(sid, action.revision);
@@ -517,7 +518,7 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       if (receipt && stillConsented()) reject(tokenUnconfirmed);
       return;
     }
-    const confirmed = action.kind === "attach" ? r?.kind === "registered" && r.id === action.id :
+    const confirmed = action.kind === "attach" ? r?.kind === "registered" && r.id === action.id && r.assignmentRevision === attachedRevision :
       guardedRemoval ? r === null : !!receipt && r?.kind === "dedicated" && r.assignmentRevision === receipt.revision;
     if (!confirmed) return reject(tokenChange
       ? "The runner assignment changed after the token request. No token was shown. Review the current runner above."

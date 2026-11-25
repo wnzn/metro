@@ -520,8 +520,7 @@ export function fakeServer() {
         state.beforeEmptyAttach?.(space.id);
         if (space.runnerToken || state.attached.has(space.id)) return err(409, "this Space already has a runner");
         state.attached.set(space.id, runner!.id);
-        assignmentRevision(space);
-        return ok({ runner: spaceRunnerJson(space) });
+        return ok({ runner: spaceRunnerJson(space), assignment_revision: assignmentRevision(space) });
       }
       if (rest === "/runner/detach-if-current" && req.method === "POST") {
         if (!state.guardedDetachSupported || state.missingGuardedDetachRoute) return err(404, "unknown route");

@@ -572,10 +572,11 @@ export function createClient(options: ClientOptions) {
     async attachRunnerIfEmpty(spaceId: string, runnerId: string) {
       const data = await request("POST", `${sp(spaceId)}/runner/attach-if-empty`, { runner_id: runnerId });
       const attached = isObject(data) && "runner" in data ? toSpaceRunner(data.runner) : null;
-      if (attached?.kind !== "registered" || attached.id !== runnerId) {
-        throw new ApiError("protocol", "The server did not confirm which runner was attached.");
+      if (attached?.kind !== "registered" || attached.id !== runnerId ||
+          !isObject(data) || !isAssignmentRevision(data.assignment_revision)) {
+        throw new ApiError("protocol", "The server did not confirm the exact runner assignment.");
       }
-      return attached;
+      return { ...attached, assignmentRevision: data.assignment_revision };
     },
 
     async requestRunnerUpdate(runnerId: string, version: string): Promise<RunnerPending> {
