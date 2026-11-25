@@ -62,9 +62,9 @@ function servers() {
   return { a, b, local };
 }
 
-async function launch(s: ReturnType<typeof servers>, opts: { storage?: Record<string, string>; bridge?: ReturnType<typeof launcher>; manualClock?: boolean } = {}): Promise<App> {
+async function launch(s: ReturnType<typeof servers>, opts: { storage?: Record<string, string>; bridge?: ReturnType<typeof launcher>; manualClock?: boolean; probe?: boolean } = {}): Promise<App> {
   const network = { ...(s.a.network as any), ...at(REMOTE, s.b), ...at(LOCAL, s.local), ...(opts.bridge ? opts.bridge.network : {}) };
-  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 820,
+  return open(opts.probe ? "../StartupAccessProbe.fixture.tsx" : "../App.tsx", { network, platform: "linux", width: 1200, height: 820,
     storage: opts.storage ?? {}, modules: (opts.bridge ? env : launched()) as any, ...(opts.manualClock ? { clock: {} } : {}) });
 }
 
@@ -584,6 +584,108 @@ test("a newer Dispatch refusal wins over an older successful room snapshot", asy
   await app.clock!.runFor(750);
   expect(app.shows("id:space:beta")).toBe(false);
   expect(app.shows("id:dispatch-room:lobby")).toBe(false);
+  expect(firstRoomPages(s)).toEqual([]);
+});
+
+async function launchWithoutBeta(s: ReturnType<typeof servers>) {
+  s.b.state.spaces.get("beta")!.members.delete("bob");
+  const app = await launch(s, { storage: { ...rememberedRemote, "metro.lastSpace": "" }, manualClock: true, probe: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:workspace", { timeout: 120 });
+  expect(app.shows("id:space:beta")).toBe(false);
+  return app;
+}
+
+async function startMembershipProbe(s: ReturnType<typeof servers>, app: App, delay: number) {
+  const request = s.b.answerLate("/v1/spaces", TOKENS.bob!, delay);
+  await app.press("id:probe-refresh");
+  await app.waitUntil(() => request.arrived() === 1, { timeout: 100 });
+}
+
+test("a newer complete list can omit a Space that an older list discovered midflight", async () => {
+  const s = servers();
+  const app = await launchWithoutBeta(s);
+  const members = s.b.state.spaces.get("beta")!.members;
+  members.add("bob");
+  await startMembershipProbe(s, app, 250);
+  members.delete("bob");
+  await startMembershipProbe(s, app, 650);
+  await app.waitFor("id:space:beta", { timeout: 300 });
+  await app.waitFor("id:space:beta", { state: "gone", timeout: 500 });
+  expect(remotePaths(s).filter(p => p === "/v1/spaces")).toHaveLength(3);
+  expect(remotePaths(s)).not.toContain(betaRooms);
+  expect(firstRoomPages(s)).toEqual([]);
+});
+
+test("a late older complete list cannot discover a Space omitted by an already settled newer list", async () => {
+  const s = servers();
+  const app = await launchWithoutBeta(s);
+  const members = s.b.state.spaces.get("beta")!.members;
+  members.add("bob");
+  await startMembershipProbe(s, app, 650);
+  members.delete("bob");
+  await startMembershipProbe(s, app, 150);
+  await app.clock!.runFor(750);
+  expect(app.shows("id:space:beta")).toBe(false);
+  expect(remotePaths(s).filter(p => p === "/v1/spaces")).toHaveLength(3);
+  expect(firstRoomPages(s)).toEqual([]);
+});
+
+test("a list started before discovery can't resurrect a Space after its newer exact denial", async () => {
+  const s = servers();
+  const app = await launchWithoutBeta(s);
+  const members = s.b.state.spaces.get("beta")!.members;
+  members.add("bob");
+  await startMembershipProbe(s, app, 250);
+  await startMembershipProbe(s, app, 750); // also captured Beta, but the client doesn't know it yet
+  await app.waitFor("id:space:beta", { timeout: 300 });
+  members.delete("bob");
+  await app.press("id:space:beta");
+  await app.waitFor("id:space:beta", { state: "gone", timeout: 150 });
+  await app.clock!.runFor(600);
+  expect(app.shows("id:space:beta")).toBe(false);
+  expect(firstRoomPages(s)).toEqual([]);
+  expect(app.requests().filter(r => r.url === REMOTE + betaRooms)).toHaveLength(1);
+
+  members.add("bob");
+  await startMembershipProbe(s, app, 30);
+  await app.waitFor("id:space:beta", { timeout: 150 }); // a real newer rejoin is allowed
+});
+
+test("a late background Space denial doesn't cancel an unrelated personal Chat file pick", async () => {
+  const s = servers();
+  holdBetaDenial(s, 404);
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true, probe: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:rooms-loading", { timeout: 120 });
+  await app.press("id:nav-chat");
+  await app.waitFor("id:chat-view", { timeout: 120 });
+  await app.press("id:probe-hold-pick");
+  await app.waitFor("id:space:beta", { state: "gone", timeout: 700 });
+  await app.press("id:probe-finish-pick");
+  await app.waitFor("id:staged:personal.txt", { timeout: 150 });
+  expect(app.shows("id:chat-view")).toBe(true);
+  expect(firstRoomPages(s)).toEqual([]);
+  expect(app.requests().filter(r => r.method === "POST" && r.url.includes("/v1/library/assets"))).toHaveLength(0);
+});
+
+test("a held Dispatch read can't replace a newer room choice in the same Space", async () => {
+  const s = servers();
+  s.b.addRoom("beta", { id: "other", name: "other" });
+  const app = await launch(s, { storage: { ...rememberedRemote, "metro.lastSpace": "" }, manualClock: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:chat-empty", { timeout: 120 });
+  await app.press("id:dispatch-new");
+  const old = s.b.answerLate(betaRooms, TOKENS.bob!, 650);
+  await app.press("id:dispatch-space:beta");
+  await app.waitUntil(() => old.arrived() === 1, { timeout: 100 });
+  s.b.answerLate(betaRooms, TOKENS.bob!, 30);
+  await app.press("id:dispatch-space:beta");
+  await app.waitFor("id:dispatch-room:other", { timeout: 140 });
+  await app.press("id:dispatch-room:other");
+  await app.clock!.runFor(700);
+  expect(app.texts()).toContain("To: agent in Beta › #other");
+  expect(app.shows("id:dispatch-error")).toBe(false);
   expect(firstRoomPages(s)).toEqual([]);
 });
 

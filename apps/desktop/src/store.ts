@@ -205,31 +205,48 @@ function verifyAccess(key: string, request: number) {
   if (!newerAccess(key, request)) verifiedAccess.set(key, request);
 }
 const pendingSpaceReads = new Map<string, Map<number, Promise<void>>>();
+// A complete list observes every Space, including ids unknown at dispatch.
+const pendingMembershipReads = new Map<number, Promise<void>>();
 const spaceDenials = new Map<string, number>();
 const roomListRequests = new Map<string, number>();
+// A newer complete snapshot also supersedes older discoveries of unknown ids.
 let lastMembershipRequest = 0;
+
+function trackAccessRead(reads: Map<number, Promise<void>>, request: number) {
+  let resolve!: () => void;
+  reads.set(request, new Promise<void>(done => { resolve = done; }));
+  return () => {
+    reads.delete(request);
+    resolve();
+  };
+}
+
+function newerSpaceDenial(sid: string, request: number) {
+  return (spaceDenials.get(sid) ?? 0) > request;
+}
+
+function currentSpaceEvidence(sid: string, request: number) {
+  return !newerAccess(scopeKey(sid, ""), request) && !newerSpaceDenial(sid, request);
+}
 
 /** All membership and room-list reads are evidence for the exact Space. */
 function beginSpaceRead(sid: string, request = nextAccessRequest()) {
   const key = scopeKey(sid, "");
   const valid = guard(sid);
-  let pending = pendingSpaceReads.get(sid);
-  if (!pending) pendingSpaceReads.set(sid, pending = new Map());
-  const reads = pending;
-  let resolve!: () => void;
-  reads.set(request, new Promise<void>(done => { resolve = done; }));
+  const reads = pendingSpaceReads.get(sid) ?? new Map<number, Promise<void>>();
+  pendingSpaceReads.set(sid, reads);
+  const settle = trackAccessRead(reads, request);
   function finish(verified = false) {
-    if (verified && valid()) verifyAccess(key, request);
-    reads.delete(request);
+    if (verified && valid() && !newerSpaceDenial(sid, request)) verifyAccess(key, request);
+    settle();
     if (!reads.size && pendingSpaceReads.get(sid) === reads) pendingSpaceReads.delete(sid);
-    resolve();
   }
   return {
     valid,
     finish,
     finishRooms() {
       finish(true);
-      if (!valid() || (spaceDenials.get(sid) ?? 0) > request || (roomListRequests.get(sid) ?? 0) > request) return false;
+      if (!valid() || newerSpaceDenial(sid, request) || (roomListRequests.get(sid) ?? 0) > request) return false;
       roomListRequests.set(sid, request);
       return true;
     },
@@ -238,10 +255,10 @@ function beginSpaceRead(sid: string, request = nextAccessRequest()) {
     },
     async deny(apply: () => void) {
       finish();
-      if (!valid() || newerAccess(key, request) || (spaceDenials.get(sid) ?? 0) > request) return false;
+      if (!valid() || !currentSpaceEvidence(sid, request)) return false;
       spaceDenials.set(sid, request);
       while (valid() && !newerAccess(key, request) && spaceDenials.get(sid) === request) {
-        const newer = [...(pendingSpaceReads.get(sid) ?? [])].find(([id]) => id > request);
+        const newer = [...(pendingSpaceReads.get(sid) ?? []), ...pendingMembershipReads].find(([id]) => id > request);
         if (!newer) {
           apply(); // stamp/epoch and cache change together, without an intervening await
           return true;
@@ -765,7 +782,8 @@ function pickRoom(spaceId: string, list: readonly Room[]): string | null {
 function purgeSpace(spaceId: string, unlist: boolean) {
   spaceEpoch.set(spaceId, epochOf(spaceId) + 1);
   pendingSpaceReads.delete(spaceId);
-  spaceDenials.delete(spaceId);
+  // Keep denial evidence for the session. A complete list may still be on
+  // the wire from before the denial, even if this id was unknown to it.
   roomListRequests.delete(spaceId);
   const prefix = scopeKey(spaceId, "");
   for (const key of [...cursors.keys()]) if (key.startsWith(prefix)) cursors.delete(key);
@@ -788,7 +806,7 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     if (dispatchTarget()?.spaceId === spaceId) dispatchTarget.set(null);
     const { [spaceId]: _members, ...restMembers } = membersBySpace();
     membersBySpace.set(restMembers);
-    if (activeSpaceId() === spaceId) clearTransient();
+    if (basePlace() === "space" && !settingsOpen() && activeSpaceId() === spaceId) clearTransient();
   });
 }
 
@@ -1038,17 +1056,19 @@ export async function followUp(run: Run): Promise<void> {
 
 export async function setDispatchSpace(spaceId: string, roomId?: string): Promise<void> {
   if (!spaces().some((s) => s.id === spaceId)) return;
+  const valid = guard(spaceId);
+  const intent = { spaceId, roomId: roomId ?? null };
+  const current = () => valid() && dispatchTarget() === intent;
   dispatchError.set(null);
   dispatchNotice.set(null);
-  dispatchTarget.set({ spaceId, roomId: roomId ?? null });
+  dispatchTarget.set(intent);
   try {
     const list = await ensureRooms(spaceId);
-    const current = dispatchTarget();
-    if (current?.spaceId !== spaceId) return;
+    if (!current()) return;
     const chosen = roomId && list.some((r) => r.id === roomId) ? roomId : pickRoom(spaceId, list);
     dispatchTarget.set({ spaceId, roomId: chosen });
   } catch (error) {
-    if (dispatchTarget()?.spaceId === spaceId) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+    if (current()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
   }
 }
 
@@ -1444,6 +1464,7 @@ function endSession() {
   spaceEpoch.clear();
   roomEntryNavigation = undefined;
   pendingSpaceReads.clear();
+  pendingMembershipReads.clear();
   spaceDenials.clear();
   roomListRequests.clear();
   verifiedAccess.clear();
@@ -1612,38 +1633,30 @@ async function refreshLists(force = false) {
   if (!force && Date.now() - lastListsRefresh < LISTS_REFRESH_MS) return;
   const ok = guard();
   const request = nextAccessRequest();
-  const reads = new Map(spaces().map(s => [s.id, beginSpaceRead(s.id, request)]));
-  let list: Space[];
+  const settle = trackAccessRead(pendingMembershipReads, request);
   try {
-    list = await c.listSpaces();
-  } catch (error) {
-    for (const read of reads.values()) read.finish();
-    throw error;
-  }
-  if (!ok()) {
-    for (const read of reads.values()) read.finish();
-    return;
-  }
-  lastListsRefresh = Date.now();
-  const listed = new Set(list.map(s => s.id));
-  batch(() => {
-    const accepted = list.filter(s => {
-      const read = reads.get(s.id);
-      const key = scopeKey(s.id, "");
-      const current = read?.valid() ?? (request > lastMembershipRequest);
-      read?.finish(true);
-      if (!current || newerAccess(key, request) || (spaceDenials.get(s.id) ?? 0) > request) return false;
-      verifyAccess(key, request);
-      return true;
+    const list = await c.listSpaces();
+    if (!ok() || request <= lastMembershipRequest) return;
+    lastMembershipRequest = request;
+    lastListsRefresh = Date.now();
+    const listed = new Set(list.map(s => s.id));
+    batch(() => {
+      const accepted = list.filter(s => {
+        if (!currentSpaceEvidence(s.id, request)) return false;
+        verifyAccess(scopeKey(s.id, ""), request);
+        return true;
+      });
+      // Include ids published by an earlier list while this one was in
+      // flight. Scope evidence still outranks an older complete snapshot.
+      for (const { id } of spaces()) {
+        if (!listed.has(id)) void beginSpaceRead(id, request).deny(() => dropLostSpace(id));
+      }
+      const updated = new Set(accepted.map(s => s.id));
+      spaces.set([...accepted, ...spaces().filter(s => !updated.has(s.id))]);
     });
-    lastMembershipRequest = Math.max(lastMembershipRequest, request);
-    for (const [sid, read] of reads) {
-      // Don't wait in the list loop for a different scope's newer read.
-      if (!listed.has(sid)) void read.deny(() => dropLostSpace(sid));
-    }
-    const updated = new Set(accepted.map(s => s.id));
-    spaces.set([...accepted, ...spaces().filter(s => !updated.has(s.id))]);
-  });
+  } finally {
+    settle();
+  }
   const active = basePlace() === "space" && !switchingSpace() ? activeSpaceId() : null;
   if (active) {
     const read = beginSpaceRead(active);
