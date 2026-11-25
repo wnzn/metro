@@ -189,7 +189,10 @@ impl<'a> Engine<'a> {
         conn: &str,
         snapshot: i64,
     ) -> LibrarySearchError {
-        if e.gone
+        if e.kind == MediaFailure::Internal {
+            return LibrarySearchError::Internal(e.message);
+        }
+        if e.kind == MediaFailure::Gone
             && let Err(err) = self.drop_source(source, conn, snapshot).await
         {
             return err;
@@ -224,6 +227,20 @@ impl<'a> Engine<'a> {
             .db
             .call(move |db| Ok(store::is_member(&db.lock(), &sid, &user)?))
             .await?)
+    }
+
+    async fn check_failed_search_scope(
+        &self,
+        sources: &[Source],
+    ) -> Result<(), LibrarySearchError> {
+        // Resolve explicit Space access again instead of inferring it from
+        // the provider's failure. All-sources searches also include Personal.
+        if let [Source::Space(sid)] = sources
+            && !self.member(sid).await?
+        {
+            return Err(LibrarySearchError::NotFound("space"));
+        }
+        Ok(())
     }
 
     // ---- Indexing ----
@@ -357,15 +374,27 @@ impl<'a> Engine<'a> {
         self.still_same(&read).await?;
         let input = protocol::asset_request(&read.name, &read.mime_type, &bytes);
         drop(bytes);
-        let answer = match tokio::time::timeout(
+        let result = tokio::time::timeout(
             INDEX_TIMEOUT,
             self.models.embed(dest.as_deref(), conn, input),
         )
-        .await
-        {
+        .await;
+
+        // Check access before interpreting even an unsuccessful call: a
+        // withheld reply after membership loss is a missing file, not a
+        // broken connection. An access-check fault is internal.
+        if let Err(e) = self.still_same(&read).await {
+            if matches!(e, LibrarySearchError::NotFound(_)) {
+                self.forget(asset_id, None, snapshot).await?;
+            }
+            return Err(e);
+        }
+        let answer = match result {
             Ok(Ok(a)) => a,
-            Ok(Err(e)) if e.gone => return Err(self.unusable(e, &source, conn, snapshot).await),
-            Ok(Err(e)) => return Err(LibrarySearchError::Upstream(e.message)),
+            Ok(Err(e)) if e.kind == MediaFailure::Upstream => {
+                return Err(LibrarySearchError::Upstream(e.message));
+            }
+            Ok(Err(e)) => return Err(self.unusable(e, &source, conn, snapshot).await),
             Err(_) => {
                 return Err(LibrarySearchError::Upstream(
                     "the media embedding model timed out".into(),
@@ -375,13 +404,8 @@ impl<'a> Engine<'a> {
         let parsed = protocol::read_asset(&answer, kind, source_text.as_deref())
             .map_err(|e| LibrarySearchError::Upstream(e.0))?;
 
-        // After the model answered and before anything is stored: the file
-        // is still readable and unchanged, and the connection still
-        // computes the same thing for this destination.
-        if let Err(e) = self.still_same(&read).await {
-            self.forget(asset_id, None, snapshot).await?;
-            return Err(e);
-        }
+        // Before storing, the connection must still compute the same thing
+        // for this destination.
         match self.models.fingerprint(dest.as_deref(), conn).await {
             Ok(fp) if fp == fingerprint => {}
             Ok(_) => return Err(switched()),
@@ -401,7 +425,7 @@ impl<'a> Engine<'a> {
         let outcome = self
             .db
             .call(move |db| {
-                Ok(store::store_asset(
+                store::store_asset(
                     &mut db.lock(),
                     &user,
                     &NewAsset {
@@ -420,7 +444,7 @@ impl<'a> Engine<'a> {
                     &grant,
                     &grant_key,
                     MAX_SEGMENTS_PER_USER,
-                )?)
+                )
             })
             .await?;
         match outcome {
@@ -735,10 +759,14 @@ impl<'a> Engine<'a> {
             let conn = self.embedding()?;
             let fp = match self.models.fingerprint(source.destination(), conn).await {
                 Ok(fp) => fp,
+                Err(e) if e.kind == MediaFailure::Internal => {
+                    self.check_failed_search_scope(sources).await?;
+                    return Err(LibrarySearchError::Internal(e.message));
+                }
                 Err(e) => {
                     report.partial = true;
                     report.failed.push(e.message.clone());
-                    if e.gone {
+                    if e.kind == MediaFailure::Gone {
                         removed += self.drop_source(source, conn, snapshot).await?;
                     }
                     match source {
@@ -756,10 +784,14 @@ impl<'a> Engine<'a> {
             }
             let q = match self.query_vector(source, &fp, &query).await {
                 Ok(q) => q,
+                Err(e) if e.kind == MediaFailure::Internal => {
+                    self.check_failed_search_scope(sources).await?;
+                    return Err(LibrarySearchError::Internal(e.message));
+                }
                 Err(e) => {
                     report.partial = true;
                     report.failed.push(e.message.clone());
-                    if e.gone {
+                    if e.kind == MediaFailure::Gone {
                         removed += self.drop_source(source, conn, snapshot).await?;
                     }
                     report.notice(match source {
@@ -783,14 +815,7 @@ impl<'a> Engine<'a> {
             }
         }
         if served == 0 && !report.failed.is_empty() {
-            // An explicit Space search that lost access in flight is a
-            // missing Space, not an upstream outage. Recheck membership
-            // rather than inferring it from the model's error.
-            if let [Source::Space(sid)] = sources
-                && !self.member(sid).await?
-            {
-                return Err(LibrarySearchError::NotFound("space"));
-            }
+            self.check_failed_search_scope(sources).await?;
             return Err(LibrarySearchError::Upstream(format!(
                 "file search is unavailable: {}",
                 report.failed[0]
@@ -973,6 +998,9 @@ pub async fn save_settings(
         match models.media_capable(None, id).await {
             Ok(true) => {}
             Ok(false) => return Err(LibrarySearchError::NotMediaCapable),
+            Err(e) if e.kind == MediaFailure::Internal => {
+                return Err(LibrarySearchError::Internal(e.message));
+            }
             Err(e) => return Err(LibrarySearchError::Unusable(e.message)),
         }
     }

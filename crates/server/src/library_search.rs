@@ -195,28 +195,42 @@ pub trait Library: Send + Sync {
 }
 
 /// A failed model or connection call. `message` is shown to people, so it
-/// never holds key material. `gone` says the failure is definitive for the
-/// index (the connection was deleted, its share revoked, it no longer
-/// serves media embeddings): index rows built with it are deleted. A
-/// transient failure (busy, offline, timeout, endpoint error) only skips.
+/// never holds key material.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MediaError {
     pub message: String,
-    pub gone: bool,
+    pub(crate) kind: MediaFailure,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MediaFailure {
+    /// The connection can no longer serve this index; drop its rows.
+    Gone,
+    /// Busy, offline, timeout or endpoint failure; keep existing rows.
+    Upstream,
+    /// A Metro fault, not an upstream outage or a revocation.
+    Internal,
 }
 
 impl MediaError {
     pub fn transient(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            gone: false,
+            kind: MediaFailure::Upstream,
         }
     }
 
     pub fn gone(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
-            gone: true,
+            kind: MediaFailure::Gone,
+        }
+    }
+
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            kind: MediaFailure::Internal,
         }
     }
 }

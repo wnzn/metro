@@ -532,8 +532,7 @@ struct Sent {
     mime: Option<String>,
 }
 
-type Hook = Box<dyn Fn() + Send + Sync>;
-type QueryHook = Box<dyn Fn() -> Option<MediaError> + Send + Sync>;
+type EmbedHook = Box<dyn Fn() -> Option<MediaError> + Send + Sync>;
 
 struct Fixture {
     sent: Mutex<Vec<Sent>>,
@@ -546,9 +545,9 @@ struct Fixture {
     pad: Mutex<usize>,
     nouls: Mutex<HashMap<String, f64>>,
     /// Runs while an asset request is "in flight".
-    on_embed: Mutex<Option<Hook>>,
+    on_embed: Mutex<Option<EmbedHook>>,
     /// Runs while a query request is "in flight".
-    on_query: Mutex<Option<QueryHook>>,
+    on_query: Mutex<Option<EmbedHook>>,
     /// Destinations whose connection is temporarily unavailable.
     outage: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
     /// Make the text model return words that aren't in the file.
@@ -662,11 +661,12 @@ impl MediaModels for Fixture {
         };
         let is_asset = sent.bytes_sha.is_some();
         self.sent.lock().unwrap().push(sent);
-        if is_asset {
-            if let Some(hook) = self.on_embed.lock().unwrap().as_ref() {
-                hook();
-            }
-        } else if let Some(hook) = self.on_query.lock().unwrap().as_ref()
+        let hook = if is_asset {
+            &self.on_embed
+        } else {
+            &self.on_query
+        };
+        if let Some(hook) = hook.lock().unwrap().as_ref()
             && let Some(error) = hook()
         {
             return Box::pin(async move { Err(error) });
@@ -1430,6 +1430,7 @@ async fn revoked_while_the_model_runs_stores_nothing() {
     let s2 = sid.clone();
     *w.fx.on_embed.lock().unwrap() = Some(Box::new(move || {
         db.remove_member(&s2, "bob").unwrap();
+        None
     }));
     assert_eq!(
         w.index("bob", "s").await.unwrap_err(),
@@ -1685,6 +1686,7 @@ async fn connection_changed_during_indexing() {
         fps.lock()
             .unwrap()
             .insert("personal".into(), format!("fp-{n}"));
+        None
     }));
     assert!(matches!(
         w.index("alice", "a").await,
@@ -2318,7 +2320,70 @@ fn reference_service_extras_are_accepted() {
 
 fn hold(w: &World, f: impl Fn(&Db) + Send + Sync + 'static) {
     let db = w.db.clone();
-    *w.fx.on_embed.lock().unwrap() = Some(Box::new(move || f(&db)));
+    *w.fx.on_embed.lock().unwrap() = Some(Box::new(move || {
+        f(&db);
+        None
+    }));
+}
+
+#[tokio::test]
+async fn unsuccessful_file_embed_rechecks_access_and_preserves_error_kinds() {
+    let w = World::new();
+    let sid = w.space("alice", &["bob"]);
+    w.upload(
+        "s",
+        "alice",
+        Some(&sid),
+        "plan.txt",
+        "text/plain",
+        INVOICE_DOC.into(),
+    );
+    w.index("bob", "s").await.unwrap();
+    let indexed = w.segments("bob");
+
+    *w.fx.on_embed.lock().unwrap() =
+        Some(Box::new(|| Some(MediaError::transient("backend offline"))));
+    let e = w.index("bob", "s").await.unwrap_err();
+    assert_eq!(e.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(e.message(), "backend offline");
+
+    *w.fx.on_embed.lock().unwrap() = Some(Box::new(|| {
+        Some(MediaError::internal("relay database fault"))
+    }));
+    let e = w.index("bob", "s").await.unwrap_err();
+    assert_eq!(e.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(e.message(), "internal error");
+
+    let db = w.db.clone();
+    *w.fx.on_embed.lock().unwrap() = Some(Box::new(move || {
+        // Fail the actual access query after the embed reached the backend.
+        db.lock()
+            .execute("ALTER TABLE space_members RENAME TO held_members", [])
+            .unwrap();
+        Some(MediaError::transient("backend offline"))
+    }));
+    let e = w.index("bob", "s").await.unwrap_err();
+    assert_eq!(e.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(e.message(), "internal error");
+    w.db.lock()
+        .execute("ALTER TABLE held_members RENAME TO space_members", [])
+        .unwrap();
+    assert_eq!(
+        w.segments("bob"),
+        indexed,
+        "faults must not purge valid rows"
+    );
+
+    let db = w.db.clone();
+    *w.fx.on_embed.lock().unwrap() = Some(Box::new(move || {
+        db.remove_member(&sid, "bob").unwrap();
+        Some(MediaError::gone("provider withheld the held answer"))
+    }));
+    assert_eq!(
+        w.index("bob", "s").await.unwrap_err(),
+        LibrarySearchError::NotFound("file")
+    );
+    assert_eq!(w.segments("bob"), 0);
 }
 
 #[tokio::test]
@@ -2778,6 +2843,15 @@ async fn failed_query_after_membership_loss_reads_as_not_found() {
             .await,
         Err(LibrarySearchError::Upstream(_))
     ));
+    *w.fx.on_query.lock().unwrap() = Some(Box::new(|| {
+        Some(MediaError::internal("relay database fault"))
+    }));
+    let e = w
+        .search("bob", false, Scope::Space, Some(&sid), "invoice", None)
+        .await
+        .unwrap_err();
+    assert_eq!(e.status(), StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(e.message(), "internal error");
     // The typed provider withholds this result after Bob is removed.
     let (db, space) = (w.db.clone(), sid.clone());
     *w.fx.on_query.lock().unwrap() = Some(Box::new(move || {
