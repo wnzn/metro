@@ -48,7 +48,7 @@ const GROUPS: readonly { id: string; label: string; pages: readonly Page[] }[] =
 ];
 const isExtension = (section: SettingsSection): section is SettingsExtension => section === "websearch" || section === "about";
 const visible = (pages: readonly Page[]) => pages.filter((p) => !isExtension(p.section) || settingsExtensionAvailable(p.section));
-const pageDot = (page: Page) => isExtension(page.section) ? extensions[page.section]?.dot?.() : undefined;
+export const settingsPageDot = (section: SettingsSection) => isExtension(section) ? extensions[section]?.dot?.() : undefined;
 const tabHook = (page: Page) => page.hook ?? page.section; // keep existing automation hooks
 
 /** The Settings modal. Mounted once by the Shell; shown while Settings is open. */
@@ -57,82 +57,73 @@ export function SettingsModal() {
     <Modal open={settingsOpen()} title="Settings" onClose={closeSettings} testID="settings-dialog">
       {/* Unmounted while closed: a typed key or a half-filled form never outlives the modal. */}
       <If when={settingsOpen()}>
-        <If when={compactWidth()} else={<WideSettings />}>
-          <CompactSettings />
-        </If>
+        <SettingsContent />
       </If>
     </Modal>
   );
 }
 
-function WideSettings() {
+function SettingsContent() {
+  const compact = compactWidth;
   return (
-    <Row grow testID="settings">
-      {/* Collapsed, the sections stay as a rail of their icons. */}
-      <If
-        when={settingsPanel.open()}
-        else={
-          <Surface variant="rail" testID="settings-rail" accessibilityLabel="Settings sections">
-            <Each of={GROUPS} key={(g) => g.id}>
-              {(g, i) => (
-                <>
-                  <If when={i() > 0}><Divider /></If>
-                  <Each of={visible(g().pages)} key={(p) => p.section}>
-                    {(p) => (
-                      <RailButton
-                        testID={`rail-settings:${tabHook(p())}`}
-                        label={p().label}
-                        icon={p().icon}
-                        dot={pageDot(p())}
-                        dotTestID={`rail-settings:${tabHook(p())}:dot`}
-                        selected={settingsSection() === p().section}
-                        onPress={() => openSettings(p().section)}
-                      />
-                    )}
-                  </Each>
-                </>
-              )}
-            </Each>
-          </Surface>
-        }
-      >
-        <ModalNav testID="settings-nav" accessibilityLabel="Settings sections">
-          <Row padX={3} padY={2}>
-            <Label variant="heading" heading>Settings</Label>
-          </Row>
-          <Tabs compact={false} />
-        </ModalNav>
-      </If>
+    <Row grow stacked={compact()} testID="settings">
+      <If when={!compact()}><WideSections /></If>
       <Column grow>
-        <Row align="center" padX={3} padY={2}>
+        <Row align="center" padX={compact() ? 4 : 3} padY={2} gap={compact() ? 2 : undefined}>
+          <If when={compact()}><Label variant="heading" heading>Settings</Label></If>
           <SectionsToggle />
           <Spacer />
           <CloseButton />
         </Row>
+        <If when={compact() && settingsPanel.open()}>
+          <ModalTabRow testID="settings-nav">
+            <Tabs compact />
+          </ModalTabRow>
+        </If>
+        {/* Switching widths replaces the navigation, not the open page or its reads. */}
         <SettingsPage />
       </Column>
     </Row>
   );
 }
 
-function CompactSettings() {
+function WideSections() {
+  // Collapsed, the sections stay as a rail of their icons.
   return (
-    <Column grow testID="settings">
-      <Row align="center" padX={4} padY={2} gap={2}>
-        <Label variant="heading" heading>
-          Settings
-        </Label>
-        <SectionsToggle />
-        <Spacer />
-        <CloseButton />
-      </Row>
-      <If when={settingsPanel.open()}>
-        <ModalTabRow testID="settings-nav">
-          <Tabs compact />
-        </ModalTabRow>
-      </If>
-      <SettingsPage />
-    </Column>
+    <If
+      when={settingsPanel.open()}
+      else={
+        <Surface variant="rail" testID="settings-rail" accessibilityLabel="Settings sections">
+          <Each of={GROUPS} key={(g) => g.id}>
+            {(g, i) => (
+              <>
+                <If when={i() > 0}><Divider /></If>
+                <Each of={visible(g().pages)} key={(p) => p.section}>
+                  {(p) => (
+                    <RailButton
+                      testID={`rail-settings:${tabHook(p())}`}
+                      label={p().label}
+                      icon={p().icon}
+                      dot={settingsPageDot(p().section)}
+                      dotTestID={`rail-settings:${tabHook(p())}:dot`}
+                      selected={settingsSection() === p().section}
+                      onPress={() => openSettings(p().section)}
+                    />
+                  )}
+                </Each>
+              </>
+            )}
+          </Each>
+        </Surface>
+      }
+    >
+      <ModalNav testID="settings-nav" accessibilityLabel="Settings sections">
+        <Row padX={3} padY={2}>
+          <Label variant="heading" heading>Settings</Label>
+        </Row>
+        <Tabs compact={false} />
+      </ModalNav>
+    </If>
   );
 }
 
@@ -153,7 +144,7 @@ function Tabs(props: { compact: boolean }) {
                 testID={`nav-settings:${tabHook(p())}`}
                 label={p().label}
                 icon={p().icon}
-                dot={pageDot(p())}
+                dot={settingsPageDot(p().section)}
                 compact={props.compact}
                 selected={settingsSection() === p().section}
                 onPress={() => openSettings(p().section)}

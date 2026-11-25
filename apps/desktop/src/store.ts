@@ -110,6 +110,7 @@ export const place = computed<Place>(() => (settingsOpen() ? "settings" : basePl
 /** The main panel's place, under the Settings modal too. */
 export const mainPlace = computed<MainPlace>(() => basePlace());
 export const settingsSection = signal<SettingsSection>("profile");
+export const settingsAnchor = signal<"privacy" | null>(null);
 export const spaces = signal<Space[]>([]);
 export const activeSpaceId = signal<string | null>(null);
 export const activeSpace = computed(() => spaces().find((s) => s.id === activeSpaceId()) ?? null);
@@ -503,11 +504,13 @@ export async function openLocation(target: Location): Promise<boolean> {
  * (place, Space, room, view, drafts, scroll) is kept for closeSettings; only
  * what is shown once (tokens, confirmations) is dropped, as on any move.
  */
-export function openSettings(section: SettingsSection | SettingsAlias = settingsSection()) {
-  const page = section === "providers" ? "connections" : section === "routing" ? "models" : section;
+export function openSettings(section: SettingsSection | SettingsAlias | "about-privacy" = settingsSection()) {
+  const page = section === "providers" ? "connections" : section === "routing" ? "models"
+    : section === "about-privacy" ? "about" : section;
   if ((page === "about" || page === "websearch") && !settingsExtensionAvailable(page)) return;
-  if (settingsOpen() && settingsSection() === page) return;
   batch(() => {
+    settingsAnchor.set(section === "about-privacy" ? "privacy" : null);
+    if (settingsOpen() && settingsSection() === page) return;
     clearTransient();
     settingsSection.set(page);
     settingsOpen.set(true);
@@ -520,6 +523,7 @@ export function closeSettings() {
   batch(() => {
     clearTransient();
     settingsOpen.set(false);
+    settingsAnchor.set(null);
   });
 }
 
@@ -1351,6 +1355,7 @@ function endSession() {
     memberBusy.set(null);
     orgAdmin.set(false);
     settingsSection.set("profile");
+    settingsAnchor.set(null);
     for (const fn of sessionEnders) fn();
   });
 }
