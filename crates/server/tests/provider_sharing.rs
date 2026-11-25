@@ -2039,3 +2039,55 @@ async fn space_work_queued_for_a_device_is_withheld_after_the_caller_leaves() {
         assert!(r.is_err(), "{label}: {r:?}");
     }
 }
+
+#[tokio::test]
+async fn typed_calls_for_a_space_need_the_caller_still_a_member() {
+    let s = Arc::new(Server::start().await);
+    // Bob's own System One, and Alice's shared with the whole organization.
+    let own = s.connect(BOB, "custom-systemone", "jev-latest", true).await;
+    let shared = s
+        .connect(ALICE, "custom-systemone", "jev-latest", true)
+        .await;
+    let (status, _) = s
+        .share(ALICE, &shared, json!({"visibility": "organization"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let sent = || s.fixture.seen("/v1/systemone").len();
+    for (label, id) in [("own", own), ("shared", shared)] {
+        // Removed after the message was admitted, before the classifier
+        // call is dispatched: nothing is sent.
+        let sid = s.space(ALICE, &format!("typed {label}"), &["bob"]).await;
+        s.state.db.remove_member(&sid, "bob").unwrap();
+        let before = sent();
+        let r = s.decide("bob", Some(&sid), &id).await;
+        assert!(r.is_err(), "{label}: {r:?}");
+        assert_eq!(sent(), before, "{label}: nothing reached the endpoint");
+        // Personal use is unaffected.
+        assert!(s.decide("bob", None, &id).await.is_ok(), "{label}");
+
+        // Removed while the endpoint works: the answer is withheld.
+        let sid = s
+            .space(ALICE, &format!("typed late {label}"), &["bob"])
+            .await;
+        let held = s.fixture.gate.write().await;
+        let before = sent();
+        let pending = {
+            let (s, sid, id) = (s.clone(), sid.clone(), id.clone());
+            tokio::spawn(async move { s.decide("bob", Some(&sid), &id).await })
+        };
+        for _ in 0..400 {
+            if sent() > before {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(sent(), before + 1, "{label}: the call was sent");
+        s.state.db.remove_member(&sid, "bob").unwrap();
+        drop(held);
+        let r = pending.await.unwrap();
+        assert!(
+            matches!(r, Err(ProviderError::Use(UseError::Revoked))),
+            "{label}: {r:?}"
+        );
+    }
+}

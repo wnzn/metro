@@ -1042,6 +1042,10 @@ async fn typed_use(
 /// runs. The payload already sent cannot be unsent: this only keeps the
 /// result from someone who lost access meanwhile. Own connections pass.
 async fn recheck_typed(state: &AppState, u: &TypedUse) -> Result<(), ProviderError> {
+    // Whatever the connection, a Space's answer only while still a member.
+    if still_member(state, u).await.is_err() {
+        return Err(UseError::Revoked.into());
+    }
     if u.access == Access::Own {
         return Ok(());
     }
@@ -1067,6 +1071,26 @@ async fn recheck_typed(state: &AppState, u: &TypedUse) -> Result<(), ProviderErr
         Ok(())
     } else {
         Err(UseError::Revoked.into())
+    }
+}
+
+/// For a typed call in a Space: the caller must be a member right now,
+/// whatever connection runs it (their own, a Space share or an organization
+/// share), or nothing of the Space is sent. Personal calls pass.
+async fn still_member(state: &AppState, u: &TypedUse) -> Result<(), ProviderError> {
+    let Some(space) = u.space.clone() else {
+        return Ok(());
+    };
+    let caller = u.caller.clone();
+    let member = state
+        .db
+        .call(move |db| Ok(store::is_member(&db.lock(), &space, &caller)?))
+        .await
+        .map_err(read_error)?;
+    if member {
+        Ok(())
+    } else {
+        Err(UseError::NotFound.into())
     }
 }
 
@@ -1114,6 +1138,7 @@ pub async fn decide(
 ) -> Result<serde_json::Value, ProviderError> {
     let u = typed_use(state, caller, space, id, Capability::SystemOne).await?;
     let request = typed::decision_request(&u.row.model, state_payload, questions)?;
+    still_member(state, &u).await?;
     let answer = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => typed::decide(&base, key.as_deref(), request).await,
         TypedTarget::Device => state
@@ -1138,6 +1163,7 @@ pub async fn embed(
 ) -> Result<Vec<Vec<f32>>, ProviderError> {
     let u = typed_use(state, caller, space, id, Capability::Embeddings).await?;
     let request = typed::embedding_request(&u.row.model, &inputs)?;
+    still_member(state, &u).await?;
     let vectors = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => typed::embed(&base, key.as_deref(), request).await,
         TypedTarget::Device => state
@@ -1195,6 +1221,7 @@ pub async fn media_embed(
     // The slot is taken before the payload is checked or sent.
     let _media = state.providers.media_slot(caller, &u.row.id)?;
     let request = typed::media_request(&u.row.model, input)?;
+    still_member(state, &u).await?;
     let answer = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => {
             typed::media_embed(&base, key.as_deref(), request).await
