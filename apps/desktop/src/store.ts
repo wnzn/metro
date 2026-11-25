@@ -1270,27 +1270,53 @@ export async function setDispatchSpace(spaceId: string, roomId?: string): Promis
   const c = client;
   if (!c || !spaces().some((s) => s.id === spaceId)) return;
   const ok = guard(spaceId);
+  const navigation = navigationGeneration;
   const pending = { spaceId, roomId: null };
+  const here = () => basePlace() === "chat" && navigation === navigationGeneration && dispatchTarget() === pending;
   dispatchError.set(null);
   dispatchNotice.set(null);
   dispatchTarget.set(pending);
+  const request = nextAccessRequest();
   try {
     // Follow up at the exact requested room or thread. A cached list can
     // miss a new thread or still contain one that no longer exists.
-    const request = nextAccessRequest();
     const list = roomId === undefined ? await ensureRooms(spaceId) : await c.listRooms(spaceId);
-    if (!ok() || dispatchTarget() !== pending) return;
+    if (!ok()) return;
     if (roomId === undefined) {
-      dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
+      if (dispatchTarget() === pending) dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
     } else {
       verifyAccess(scopeKey(spaceId, ""), request);
       for (const r of list) verifyRoomAccess(spaceId, r.id, request);
-      roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
-      if (list.some(r => r.id === roomId)) dispatchTarget.set({ spaceId, roomId });
-      else dispatchError.set("That room or thread is no longer available. Choose another destination.");
+      const listed = new Set(list.map(r => r.id));
+      const found = listed.has(roomId);
+      const stale = !found && newerAccess(scopeKey(spaceId, roomId), request);
+      batch(() => {
+        if (!stale) {
+          // Keep newer verified rooms and leave other active room views
+          // alone; their own poll is responsible for confirming a loss.
+          const keep = roomsOf(spaceId).filter(r => !listed.has(r.id) &&
+            (newerAccess(scopeKey(spaceId, r.id), request) ||
+              (r.id !== roomId && activeSpaceId() === spaceId && activeRoomId() === r.id)));
+          roomsBySpace.set({ ...roomsBySpace(), [spaceId]: [...list, ...keep] });
+          if (!found) dropLostRoom(spaceId, roomId, request, false);
+        }
+        if (found && dispatchTarget() === pending) dispatchTarget.set({ spaceId, roomId });
+        else if (!found && here()) dispatchError.set(stale
+          ? "Couldn't verify that destination. Follow up again or choose another room."
+          : "That room or thread is no longer available. Choose another destination.");
+      });
     }
   } catch (error) {
-    if (ok() && dispatchTarget() === pending) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+    if (!ok()) return;
+    const show = here();
+    const denied = roomId !== undefined && isAccessDenial(error);
+    const stale = denied && newerAccess(scopeKey(spaceId, ""), request);
+    batch(() => {
+      if (denied && !stale) dropLostSpace(spaceId, request, false);
+      if (show) dispatchError.set(stale
+        ? "Couldn't verify that destination. Follow up again or choose another room."
+        : describe(error, "Could not load that Space's rooms"));
+    });
   }
 }
 
@@ -2096,7 +2122,7 @@ async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind:
       const list = await c.listRooms(spaceId);
       if (!current()) return;
       if (list.some(r => r.id === roomId)) verifyRoomAccess(spaceId, roomId, roomRequest);
-      else if (!newerAccess(scope, roomRequest)) dropLostRoom(spaceId, roomId, show);
+      else dropLostRoom(spaceId, roomId, roomRequest, show);
     } catch (error) {
       if (current() && isAccessDenial(error)) dropLostSpace(spaceId, roomRequest, show);
     }
@@ -2105,8 +2131,9 @@ async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind:
   }
 }
 
-function dropLostRoom(spaceId: string, roomId: string, show: boolean) {
+function dropLostRoom(spaceId: string, roomId: string, request: number, show: boolean) {
   const key = scopeKey(spaceId, roomId);
+  if (newerAccess(key, request)) return;
   cursors.delete(key);
   batch(() => {
     forgetSenderNotices(key);

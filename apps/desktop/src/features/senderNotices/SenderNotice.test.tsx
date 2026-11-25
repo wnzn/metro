@@ -111,6 +111,42 @@ async function dispatch(app: App, text: string, sid = "side") {
   await app.press("id:dispatch-send");
 }
 
+async function cachedFollowUp() {
+  const w = fixture();
+  w.f.addRoom("side", { id: "follow-thread", name: "Follow-up", parent_room_id: "lobby" });
+  w.f.state.runs.push({ id: "follow-run", space_id: "side", room_id: "follow-thread", status: "completed", actor: "alice", task: "Earlier task" });
+  const base = w.network[get]!;
+  let next: { status: number; body: unknown; delay?: number } | undefined;
+  w.network[get] = req => {
+    if (!next || new URL(req.url).pathname !== "/v1/spaces/side/rooms") return base(req);
+    const response = next;
+    next = undefined;
+    return response;
+  };
+  const app = await launch(w);
+  await space(app);
+  await space(app, "side");
+  w.reply("cached lobby notice", { addressing_note: pickup });
+  await send(app, "cached lobby notice");
+  await app.waitUntil(() => w.sent.has("cached lobby notice"));
+  const lobby = w.sent.get("cached lobby notice")!.id;
+  await app.waitFor(note(lobby));
+  await app.press("id:room:follow-thread");
+  w.reply("cached thread notice", { addressing_note: pickup });
+  await send(app, "cached thread notice");
+  await app.waitUntil(() => w.sent.has("cached thread notice"));
+  const thread = w.sent.get("cached thread notice")!.id;
+  await app.waitFor(note(thread));
+  const arm = (reply: NonNullable<typeof next>) => {
+    next = reply;
+    return () => next === undefined;
+  };
+  const omitThread = (delay?: number) => ({
+    status: 200, body: { rooms: w.f.state.rooms.get("side")!.filter(r => r.id !== "follow-thread") }, delay,
+  });
+  return { w, app, arm, omitThread, lobby, thread };
+}
+
 test("classification note is under its message; Settings opens Space preferences and Ask agent only prepares or focuses", async () => {
   const w = fixture();
   w.reply("plan together", { addressing_note: pickup });
@@ -627,6 +663,113 @@ test("a real room loss between recheck legs outranks access verified before the 
   expect(app.shows("id:room:lobby")).toBe(false);
   expect(app.shows(note(id))).toBe(false);
 });
+
+for (const status of [403, 404]) {
+  test(`an exact Follow up HTTP ${status} purges the original Space and its cached notices without a fallback`, async () => {
+    const { w, app, arm, lobby, thread } = await cachedFollowUp();
+    await app.press("id:nav-chat");
+    await app.waitFor("id:run-follow:follow-run");
+    const issued = arm({ status, body: { error: "membership denied" }, delay: 2_000 });
+    await app.press("id:run-follow:follow-run");
+    await app.waitUntil(issued);
+    await app.type("id:dispatch-text", "keep this task");
+    const members = w.f.state.spaces.get("side")!.members;
+    members.delete("alice");
+    if (status === 404) {
+      await space(app);
+      await app.type("id:composer", "unrelated Acme draft");
+    }
+    await app.waitFor("id:space:side", { state: "gone" });
+    if (status === 403) {
+      await app.waitFor("id:dispatch-error");
+      expect(app.shows("text:/HTTP 403.*membership denied/")).toBe(true);
+    } else {
+      expect(app.value("id:composer")).toBe("unrelated Acme draft");
+      expect(app.shows("id:action-error")).toBe(false);
+      await app.press("id:nav-chat");
+      expect(app.shows("id:dispatch-error")).toBe(false);
+    }
+    expect(app.shows("text:Choose a Space and a room.")).toBe(true);
+    expect(app.enabled("id:dispatch-send")).toBe(false);
+    expect(app.value("id:dispatch-text")).toBe("keep this task");
+    expect(w.messages()).toHaveLength(2);
+
+    members.add("alice");
+    await app.clock!.runFor(12_000);
+    await space(app, "side");
+    await app.waitFor(`id:event:${lobby}`);
+    expect(app.shows(note(lobby))).toBe(false);
+    await app.press("id:room:follow-thread");
+    await app.waitFor(`id:event:${thread}`);
+    expect(app.shows(note(thread))).toBe(false);
+  });
+}
+
+test("an exact Follow up list omitting the thread invalidates only that room and its pending receipt", async () => {
+  const { w, app, arm, omitThread, lobby, thread } = await cachedFollowUp();
+  w.reply("held accepted thread send", { addressing_note: pickup }, 5_000);
+  await send(app, "held accepted thread send");
+  await app.waitUntil(() => w.sent.has("held accepted thread send"));
+  const held = w.sent.get("held accepted thread send")!.id;
+  await app.press("id:nav-chat");
+  await app.waitFor("id:run-follow:follow-run");
+  const issued = arm(omitThread());
+  await app.press("id:run-follow:follow-run");
+  await app.waitUntil(issued);
+  await app.waitFor("id:dispatch-error");
+  expect(app.shows("text:/That room or thread is no longer available/")).toBe(true);
+  expect(app.shows("text:Choose a Space and a room.")).toBe(true);
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+  expect(app.shows("id:space:side")).toBe(true);
+  expect(w.messages()).toHaveLength(3);
+
+  // The next fresh lookup can see the same thread again, but it cannot
+  // restore a cached receipt or accept the earlier POST's late receipt.
+  await app.press("id:run-follow:follow-run");
+  await app.waitFor("text:To: agent in Side project › #Follow-up");
+  await space(app, "side");
+  expect(app.shows(note(lobby))).toBe(true);
+  await app.press("id:room:follow-thread");
+  await app.waitFor(`id:event:${thread}`);
+  await app.clock!.runFor(5_200);
+  await app.waitFor(`id:event:${held}`);
+  expect(app.shows(note(thread))).toBe(false);
+  expect(app.shows(note(held))).toBe(false);
+  expect(w.messages()).toHaveLength(3);
+});
+
+for (const denied of [false, true]) {
+  test(`a held Follow up ${denied ? "denial" : "omission"} cannot evict newer verified access or touch another view`, async () => {
+    const { w, app, arm, omitThread, thread } = await cachedFollowUp();
+    await app.press("id:nav-chat");
+    await app.waitFor("id:run-follow:follow-run");
+    const issued = arm(denied ? { status: 404, body: { error: "stale denial" }, delay: 5_000 } : omitThread(5_000));
+    await app.press("id:run-follow:follow-run");
+    await app.waitUntil(issued);
+    await app.press("id:space:side");
+    await app.press("id:room:follow-thread");
+    w.reply("newer thread receipt", { addressing_note: pickup });
+    await send(app, "newer thread receipt");
+    await app.waitUntil(() => w.sent.has("newer thread receipt"));
+    const newer = w.sent.get("newer thread receipt")!.id;
+    await app.waitFor(note(newer));
+    await space(app);
+    await app.type("id:composer", "unchanged Acme draft");
+    await app.clock!.runFor(5_200);
+    expect(app.shows("id:space:side")).toBe(true);
+    expect(app.value("id:composer")).toBe("unchanged Acme draft");
+    expect(app.shows("id:action-error")).toBe(false);
+    await app.press("id:nav-chat");
+    expect(app.shows("id:dispatch-error")).toBe(false);
+    expect(app.shows("text:Choose a Space and a room.")).toBe(true);
+    expect(app.enabled("id:dispatch-send")).toBe(false);
+    expect(w.messages()).toHaveLength(3);
+    await app.press("id:space:side");
+    await app.press("id:room:follow-thread");
+    expect(app.shows(note(thread))).toBe(true);
+    expect(app.shows(note(newer))).toBe(true);
+  });
+}
 
 for (const probe of ["post-room", "post-space", "poll-space"] as const) {
   test(`${probe}: a held negative recheck cannot purge newer verified access and its corroborated notice`, async () => {
