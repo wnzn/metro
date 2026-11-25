@@ -2231,6 +2231,60 @@ async fn recipient_race_after_message_commit_refuses_deleted_agent_at_run_accept
 }
 
 #[tokio::test]
+async fn authoritative_dispatch_keeps_exact_text_and_never_infers_recipients() {
+    let h = H::start().await;
+    let sid = h.space("Exact dispatch text").await;
+    let thread = h
+        .state
+        .db
+        .create_room(&sid, "follow-up", Some("lobby"), 10, 10)
+        .unwrap();
+    let text = "\u{2003}  🌿 @bob, résumé\ncheck the task  \t";
+    let path = format!("/v1/spaces/{sid}/rooms/{}", thread.id);
+    let (status, posted) = h
+        .post(
+            "alice",
+            &format!("{path}/messages"),
+            json!({"text":text,"invoke_agent":true,"infer_text_mentions":false}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{posted}");
+    assert_eq!(posted["text"], text);
+    assert_eq!(posted["mentions"], json!([{"kind":"agent"}]));
+    assert_eq!(posted["spans"], json!([]));
+    let (status, polled) = h
+        .req(reqwest::Method::GET, "bob", &format!("{path}/events"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{polled}");
+    assert_eq!(polled["events"][0]["text"], text);
+    assert_eq!(polled["events"][0]["mentions"], posted["mentions"]);
+    assert_eq!(polled["events"][0]["spans"], posted["spans"]);
+    assert!(
+        h.events("bob", Some(&sid))
+            .await
+            .iter()
+            .all(|event| event["kind"] != "message"),
+        "thread activity may appear in the lobby, but the message must not"
+    );
+    let legacy = h.say("alice", Some(&sid), json!({"text":text})).await;
+    assert_eq!(legacy["text"], text.trim());
+    assert_eq!(legacy["mentions"], json!([{"kind":"user","id":"bob"}]));
+    assert!(legacy.get("spans").is_none());
+
+    let start = text.find('@').unwrap();
+    let span = json!({"start":start,"end":start+4,"index":0});
+    let bound = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text":text,"infer_text_mentions":false,"mentions":[{"kind":"user","id":"bob"}],"spans":[span]}),
+        )
+        .await;
+    assert_eq!(bound["text"], text);
+    assert_eq!(bound["spans"], json!([span]));
+}
+
+#[tokio::test]
 async fn authoritative_mentions_leave_stale_text_unaddressed() {
     let h = H::start().await;
     let sid = h.space("stale mention directory").await;

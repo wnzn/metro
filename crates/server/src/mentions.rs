@@ -76,8 +76,8 @@ impl<'de> Deserialize<'de> for MentionSpan {
     }
 }
 
-/// Sorted, non-overlapping ranges normalized to the stored (`trim()`ed)
-/// text. Until resolution, indices still refer to the submitted list.
+/// Sorted, non-overlapping ranges in the text that will be stored. Until
+/// resolution, indices still refer to the submitted list.
 #[derive(Default)]
 pub(crate) struct ValidatedSpans(Vec<MentionSpan>);
 
@@ -85,7 +85,16 @@ impl ValidatedSpans {
     pub(crate) fn new(
         raw_text: &str,
         explicit_count: usize,
+        spans: Vec<MentionSpan>,
+    ) -> Result<Self, &'static str> {
+        Self::for_message(raw_text, explicit_count, spans, true)
+    }
+
+    pub(crate) fn for_message(
+        raw_text: &str,
+        explicit_count: usize,
         mut spans: Vec<MentionSpan>,
+        trim_for_storage: bool,
     ) -> Result<Self, &'static str> {
         const INVALID: &str = "invalid mention span";
         if spans.len() > MAX_SPANS {
@@ -114,8 +123,10 @@ impl ValidatedSpans {
                 return Err(INVALID);
             }
             previous_end = span.end;
-            span.start -= offset;
-            span.end -= offset;
+            if trim_for_storage {
+                span.start -= offset;
+                span.end -= offset;
+            }
         }
         Ok(Self(spans))
     }
