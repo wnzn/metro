@@ -498,6 +498,7 @@ impl Db {
         crate::admin_users::init(&conn)?;
         crate::admin_settings::init(&conn)?;
         crate::profiles::init(&conn)?;
+        crate::dms::init(&conn)?;
         crate::providers::init(&conn)?;
         crate::device_relay::init(&conn)?;
         crate::web_devices::init(&conn)?;
