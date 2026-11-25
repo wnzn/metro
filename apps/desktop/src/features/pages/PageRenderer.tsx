@@ -16,6 +16,7 @@ type Interactions = {
   onLink?: (url: string) => void;
   onFile?: (id: string) => void;
   onSchedule?: (block: string) => void;
+  canSchedule?: (block: string) => boolean;
 };
 
 const toneOf = (v: unknown): Tone => v === "info" ? "system"
@@ -103,7 +104,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
           <If when={str(own(answer(), "text"))}>{t => markdown(t())}</If>
           <If when={str(own(answer(), "error"))}>{t => <Label color="warning">{t()}</Label>}</If>
         </If>
-        <If when={!props.interactions.readOnly && props.interactions.onSchedule ? n().key : undefined}>
+        <If when={!props.interactions.readOnly && props.interactions.onSchedule && n().key && props.interactions.canSchedule?.(n().key!) ? n().key : undefined}>
           {key => <Row><Action compact variant="ghost" label="Keep this answer fresh…" testID={`page-schedule:${key()}`} onPress={() => props.interactions.onSchedule?.(key())} /></Row>}
         </If>
       </Column>;
