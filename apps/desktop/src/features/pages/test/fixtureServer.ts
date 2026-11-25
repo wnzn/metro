@@ -27,7 +27,9 @@ export function pagesFixture() {
   const prefs = new Map<string, boolean>();
   const log: { user: string; method: string; path: string; body: any }[] = [];
   let nextId = 1;
-  const state = { revision: 3, delayPage: "", delay: 0, actionDelay: 0, stale: false, outside: false, generating: 0, started: 0, applied: 0 };
+  const state = { revision: 3, delayPage: "", delay: 0, dataDelay: 0, draftDelay: 0, previewDelay: 0,
+    actionDelay: 0, createDelay: 0, restoreDelay: 0, answer: "",
+    stale: false, staleSource: false, outside: false, generating: 0, started: 0, applied: 0 };
   const visible = (p: PageMeta, user: string) => p.scope === "personal" ? p.creator_id === user : !!p.space_id && f.state.spaces.get(p.space_id)?.members.has(user);
   const caps = (p: Page, user: string): Page => {
     const can_manage = p.creator_id === user || (!!p.space_id && f.state.spaces.get(p.space_id)?.owner === user);
@@ -58,7 +60,9 @@ export function pagesFixture() {
   function dataOf(p: Page, user: string): PageData {
     const confirm = !confirmations.has(`${user}/${p.id}/${p.head_version}`);
     return { ...sampleData, version: p.head_version,
-      data: p.id === PERSONAL && state.started ? { ...sampleData.data, answer: { ok: true, value: { text: "Private page-only answer", status: "done" } } } : sampleData.data,
+      data: state.answer || (p.id === PERSONAL && state.started) ? { ...sampleData.data, answer: { ok: true, value: {
+        text: state.answer || "Private page-only answer", status: "done",
+      } } } : sampleData.data,
       actions: { ...sampleData.actions, ask: { enabled: true, confirm }, run: p.scope === "personal" ? { enabled: false, reason: "Space only" } : { enabled: true, confirm, schedule_revision: state.revision } } };
   }
   function handle(req: Req) {
@@ -78,7 +82,8 @@ export function pagesFixture() {
         return ok({ pages: [...entries.values()].filter(p => visible(p, user) && !!p.deleted_at === deleted)
           .map(p => { const { source: _source, spec: _spec, version: _version, ...meta } = caps(p, user); return meta; }) });
       }
-      return create(pageOf(`pg_${nextId++}`, body.template === "files" ? "Recent files" : "Fixture page", user, body.space_id ?? null));
+      return { ...create(pageOf(`pg_${nextId++}`, body.template === "files" ? "Recent files" : "Fixture page", user, body.space_id ?? null)),
+        delay: state.createDelay };
     }
     if (id === "templates") return ok({ templates: [
       { id: "files", title: "Files", description: "Recent library files", scopes: ["personal", "space"] },
@@ -95,7 +100,8 @@ export function pagesFixture() {
       if (method === "DELETE") { privateDrafts.delete(op!); return { status: 204 }; }
       if (detail === "data") {
         const { version: _version, ...fixture } = sampleData;
-        return ok(fixture);
+        return { ...ok({ ...fixture, data: state.answer ? { ...fixture.data, answer: { ok: true, value: { text: state.answer, status: "done" } } } : fixture.data }),
+          delay: state.previewDelay };
       }
       if (detail === "apply") {
         if (d.outside_selection.length && !body.confirm_outside) return fail(409, "outside selection", { outside_selection: d.outside_selection });
@@ -110,8 +116,11 @@ export function pagesFixture() {
         if (!base) return create(pageOf(`pg_${nextId++}`, d.spec!.title, user, d.space_id, d.spec!));
         return ok(caps(save(base.id, { source: d.source!, spec: d.spec!, title: d.spec!.title }, "prompt", user), user), 201);
       }
-      if (state.generating > 0) { state.generating--; return ok({ ...d, status: "generating", spec: null, source: null }); }
-      return ok(d);
+      if (state.generating > 0) {
+        state.generating--;
+        return { ...ok({ ...d, status: "generating", spec: null, source: null }), delay: state.draftDelay };
+      }
+      return { ...ok(d), delay: state.draftDelay };
     }
     const page = entries.get(id);
     if (!page || !visible(page, user) || (page.deleted_at && op !== "undelete")) return fail(404, "no such page");
@@ -123,10 +132,18 @@ export function pagesFixture() {
     if (!op && method === "DELETE") { entries.set(id, { ...page, deleted_at: stamp }); return { status: 204 }; }
     if (!op) return { ...ok(view), delay: state.delayPage === id ? state.delay : 0 };
     if (op === "prefs") { prefs.set(`${user}/${id}`, body.pinned); return ok({ pinned: body.pinned, position: null }); }
-    if (op === "undelete") { entries.set(id, { ...page, deleted_at: null }); return ok(caps(entries.get(id)!, user)); }
-    if (op === "data") return ok(dataOf(page, user));
+    if (op === "undelete") {
+      entries.set(id, { ...page, deleted_at: null });
+      return { ...ok(caps(entries.get(id)!, user)), delay: state.restoreDelay };
+    }
+    if (op === "data") return { ...ok(dataOf(page, user)), delay: state.dataDelay };
     if (op === "versions") {
       if (!detail && method === "POST") {
+        if (state.staleSource) {
+          state.staleSource = false;
+          const changed = save(id, { source: sourceOf("Another editor published this") }, "manual", "bob");
+          return fail(409, "head changed", { head_version: changed.head_version });
+        }
         if (body.base_version !== page.head_version) return fail(409, "head changed", { head_version: page.head_version });
         return ok(caps(save(id, { source: body.source }, "manual", user), user), 201);
       }

@@ -43,6 +43,7 @@ export const sample: PageSpec = {
     { type: "Button", key: "run", props: { label: lit("Run schedule") }, action: { kind: "runSchedule" } },
     { type: "Link", key: "room", props: { label: lit("Open missing room") }, action: { kind: "openRoom" } },
     { type: "Link", key: "other", props: { label: lit("Open another page") }, action: { kind: "openPage" } },
+    { type: "Button", key: "refresh", props: { label: lit("Refresh this page") }, action: { kind: "refresh" } },
   ],
 };
 
@@ -59,5 +60,6 @@ export const sampleData: PageData = {
   actions: {
     ask: { enabled: true, confirm: true }, run: { enabled: true, confirm: true, schedule_revision: 3 },
     room: { enabled: true, space_id: "acme", room_id: "missing" }, other: { enabled: true, page_id: "pg_personal" },
+    refresh: { enabled: true },
   },
 };
