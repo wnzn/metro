@@ -11,7 +11,6 @@ import {
   confirmRunnerAction,
   createRunner,
   deleteRunner,
-  loadRunners,
   revealed,
   rotateRunner,
   runnerBusy,
@@ -39,13 +38,6 @@ export function RunnersSettings() {
   effect(() => {
     runnerSessionKey();
     adding.set(false);
-  });
-  // Pending means accepted, not necessarily delivered yet. Only read while
-  // waiting for a runner to report success or failure; no update is triggered here.
-  effect(() => {
-    if (!runners()?.some((r) => r.update?.pending)) return;
-    const timer = setInterval(() => { if (!runnerBusy() && !runnerUpdateBusy()) void loadRunners(); }, 5000);
-    cleanup(() => clearInterval(timer));
   });
   return (
     <PageLayout testID="runners-settings" pad={compactWidth() ? 4 : 6} gap={6} footer={hasMessages() ? <Messages /> : undefined}>

@@ -2,10 +2,10 @@
 import { cleanup, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError } from "./api/client";
 import type { Client, RegisteredRunner, Space, SpaceRunner } from "./api/client";
-import { beginSpaceRunnerWrite, loadRunners, reconcileOwnedSpaceRunner, runnerBusy, runners, snapshotSpaceRunnerWrite, spaceRunners } from "./settings";
-import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, spaces } from "./store";
+import { beginSpaceRunnerWrite, loadRunners, reconcileOwnedSpaceRunner, recordRunnerUpdateAccepted, runnerBusy, runners, snapshotSpaceRunnerWrite, spaceRunners } from "./settings";
+import { apiClient, connectedTo, me, onSessionEnd, place, sessionGuard, settingsSection, spaces } from "./store";
 import { helper } from "./device/state";
-import { installedBusy, installedRunner, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner } from "./features/installedRunner/installedRunner";
+import { installedBusy, installedFolderSnapshot, installedRunner, installedRunnerSeen, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner } from "./features/installedRunner/installedRunner";
 import type { InstalledRunnerState } from "./features/installedRunner/installedRunner";
 
 export const runnerSessionKey = () => JSON.stringify([connectedTo(), me()]);
@@ -17,7 +17,10 @@ const dismissedThisLaunch = new Set<string>();
 const offerFresh = signal(false);
 const watchers = signal(0);
 const watching = computed(() => watchers() > 0);
-const OFFER_REFRESH_MS = 5000;
+const folderWatchers = signal(0);
+const watchingFolders = computed(() => folderWatchers() > 0);
+const RUNNER_REFRESH_MS = 5000;
+const FOLDER_REFRESH_BUDGET_MS = 30_000;
 const OFFER_REFRESH_GRACE_MS = 2000;
 const attachFeedback = signal<{ message: string; incomplete: boolean } | null>(null);
 export const runnerAttachFeedback = () => attachFeedback();
@@ -95,16 +98,62 @@ export function dismissRunnerOffer() {
 export function watchInstalledRunner(refreshFoldersOnOpen = false) {
   watchers.set(untracked(watchers) + 1);
   cleanup(() => watchers.set(untracked(watchers) - 1));
-  if (refreshFoldersOnOpen) effect(() => {
-    if (!offerKey() || !bridgeSessionMatches()) return;
-    const valid = sessionGuard();
-    let wanted = true;
-    cleanup(() => { wanted = false; });
-    // A mounted Settings page needs folders, even when joining a Sidebar
-    // status read. Closing the page withdraws just this folder demand.
-    untracked(() => void loadInstalledRunner(true, () => wanted && valid()));
-  });
+  if (!refreshFoldersOnOpen) return;
+  folderWatchers.set(untracked(folderWatchers) + 1);
+  cleanup(() => folderWatchers.set(untracked(folderWatchers) - 1));
 }
+
+type FolderInterest = { baseline: number | null; valid: () => boolean; expired: () => boolean; started: boolean };
+const folderInterest = signal<FolderInterest | null>(null);
+const folderRetry = signal(0);
+const needsFolderRead = (interest: FolderInterest | null) => {
+  if (!interest || folderInterest() !== interest || !interest.valid()) return false;
+  const snapshot = installedFolderSnapshot();
+  return snapshot === null || snapshot === interest.baseline;
+};
+const wantsFolderRead = (interest: FolderInterest | null) =>
+  !!interest && !interest.expired() && needsFolderRead(interest) && bridgeSessionMatches();
+const canCheckFolders = () => installedRunnerStatusWatchable() || installedRunnerSeen();
+const folderReadReady = computed(() => bridgeSessionMatches() && !runnerAttachBusy() && !installedBusy());
+
+export const installedFolderRefreshExhausted = computed(() => {
+  const interest = folderInterest();
+  return !!interest?.expired() && needsFolderRead(interest) && canCheckFolders();
+});
+
+/** Retry the current Settings scope; never reset a running budget. */
+export function retryInstalledFolderRefresh() {
+  if (installedFolderRefreshExhausted()) folderRetry.set(folderRetry() + 1);
+}
+
+effect(() => {
+  if (!watchingFolders() || !offerKey()) return;
+  folderRetry();
+  const expired = signal(false);
+  const interest: FolderInterest = {
+    baseline: untracked(installedFolderSnapshot), valid: sessionGuard(), expired, started: false,
+  };
+  // One budget per mounted Settings scope, not per response, watcher or
+  // bridge phase. It also bounds retries when the Sidebar offer is dismissed.
+  const timer = setTimeout(() => expired.set(true), FOLDER_REFRESH_BUDGET_MS);
+  folderInterest.set(interest);
+  cleanup(() => {
+    clearTimeout(timer);
+    folderInterest.set(null);
+  });
+});
+
+effect(() => {
+  const interest = folderInterest();
+  if (!interest || !folderReadReady()) return;
+  // Try on open, joining any Sidebar read already in flight. If this attempt
+  // can't verify the candidate, the mounted demand survives for a later read.
+  untracked(() => {
+    if (interest.started || !wantsFolderRead(interest)) return;
+    interest.started = true;
+    void loadInstalledRunner(true, () => wantsFolderRead(interest));
+  });
+});
 
 effect(() => {
   if (watching() && offerKey()) untracked(() => void loadOfferDismissal());
@@ -125,28 +174,33 @@ const shouldWatchOffer = computed(() => {
   return !!key && state?.key === key && !state.dismissed && spaces().some(isEmptyOwned);
 });
 
+const shouldRefreshRunner = computed(() => shouldWatchOffer() ||
+  (canCheckFolders() && folderReadReady() && wantsFolderRead(folderInterest())));
+
 effect(() => {
-  if (!shouldWatchOffer()) {
-    offerFresh.set(false);
-    return;
-  }
+  if (!shouldWatchOffer()) offerFresh.set(false);
+});
+
+effect(() => {
+  if (!shouldRefreshRunner()) return;
   const valid = sessionGuard();
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let expiry: ReturnType<typeof setTimeout> | undefined;
   const tick = async () => {
-    if (stopped || !valid() || !shouldWatchOffer()) return;
+    if (stopped || !valid() || !shouldRefreshRunner()) return;
     // A hung bridge (with a longer transport timeout) must not leave an
     // online offer on screen. Keep the last verified Create choice separate.
-    expiry = setTimeout(() => offerFresh.set(false), OFFER_REFRESH_GRACE_MS);
-    // Same runner: only ask the bridge for liveness. Don't reload every
-    // Space's folders while Sidebar is sitting open.
-    await loadInstalledRunner(false);
+    if (shouldWatchOffer()) expiry = setTimeout(() => offerFresh.set(false), OFFER_REFRESH_GRACE_MS);
+    const interest = folderInterest();
+    // Share one cadence. Once Settings has a complete snapshot, Sidebar
+    // checks liveness only until the registration changes or is invalidated.
+    await loadInstalledRunner(wantsFolderRead(interest), () => wantsFolderRead(interest));
     if (expiry !== undefined) clearTimeout(expiry);
     expiry = undefined;
-    if (stopped || !valid() || !shouldWatchOffer()) return;
-    offerFresh.set(true);
-    timer = setTimeout(() => void tick(), OFFER_REFRESH_MS);
+    if (stopped || !valid() || !shouldRefreshRunner()) return;
+    if (shouldWatchOffer()) offerFresh.set(true);
+    timer = setTimeout(() => void tick(), RUNNER_REFRESH_MS);
   };
   cleanup(() => {
     stopped = true;
@@ -369,6 +423,30 @@ export function pinnedRunnerImage(r: RegisteredRunner): string | null {
 export const runnerUpdateBusy = signal<string | null>(null);
 export const runnerUpdateErrors = signal<Record<string, string>>({});
 
+// One read-only poll for the visible Runners page while an accepted update
+// is pending. Keep the flight across roster changes and page lifetimes;
+// the session client aborts it on disconnect, not on a roster mutation.
+let runnerRosterPoll: Promise<void> | null = null;
+const shouldPollRunnerRoster = computed(() =>
+  place() === "settings" && settingsSection() === "runners" && !!runners()?.some((r) => r.update?.pending));
+
+effect(() => {
+  if (!shouldPollRunnerRoster()) return;
+  const valid = sessionGuard();
+  const timer = setInterval(async () => {
+    if (!valid() || !shouldPollRunnerRoster() || runnerRosterPoll || runnerBusy() || runnerUpdateBusy()) return;
+    const read = loadRunners();
+    runnerRosterPoll = read;
+    try {
+      await read;
+    } finally {
+      // A cancelled old session must not release a new session's flight.
+      if (runnerRosterPoll === read) runnerRosterPoll = null;
+    }
+  }, RUNNER_REFRESH_MS);
+  cleanup(() => clearInterval(timer));
+});
+
 /** Only called from a scoped confirmation. Re-read before sending; never retarget. */
 export async function requestRunnerUpdate(id: string, target: string) {
   const c = apiClient();
@@ -389,8 +467,7 @@ export async function requestRunnerUpdate(id: string, target: string) {
       return;
     }
     const pending = await c.requestRunnerUpdate(id, target);
-    if (!valid()) return;
-    runners.set(runners()?.map((r) => r.id === id && r.update ? { ...r, update: { ...r.update, pending } } : r) ?? null);
+    recordRunnerUpdateAccepted(id, pending, valid);
   } catch (error) {
     if (!valid()) return;
     const message = actionError(error, error instanceof ApiError && error.status === 409
@@ -409,6 +486,7 @@ onSessionEnd(() => {
   offerFresh.set(false);
   attachFeedback.set(null);
   runnerAttachBusy.set(false);
+  runnerRosterPoll = null;
   runnerUpdateBusy.set(null);
   runnerUpdateErrors.set({});
 });

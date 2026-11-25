@@ -107,6 +107,16 @@ async function startSidebar(app: App, name: string, hasChoice = true) {
   await app.type("id:new-space-name", name);
 }
 
+// U5 won't start a new folder demand during a batch. Begin the Settings
+// snapshot first, and hold just its status reply until the interesting race.
+async function openWithHeldFolderStatus(app: App, t: ReturnType<typeof fixture>, delay: number) {
+  const before = t.status.reads;
+  t.status.delay = delay;
+  await app.press("id:nav-settings");
+  await app.waitUntil(() => t.status.reads > before);
+  t.status.delay = 0;
+}
+
 test("sidebar requires submit consent, supports keyboard, and starts each new form checked", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");
@@ -395,40 +405,43 @@ test("an older folder snapshot preserves newer presence or absence for A and sti
     const other = f.addRunner("Other computer", "personal", "alice");
     const attaches = final === "attached";
     const expectedRunner = attaches ? r.id : final === "reassigned" ? other.id : undefined;
+    f.state.attached.set("solo", r.id);
     f.state.attached.set("keep", r.id);
     f.state.attached.set("removed", r.id);
     const t = fixture(f, r.id);
-    t.gate.attach = 800;
+    t.gate.attach = 900;
     const app = await launch(t, { manual: true });
     await signIn(app);
-    await app.press("id:nav-settings");
-    await app.waitFor("id:runner-attach-pick:solo");
-    await app.press("id:runner-attach-pick:added"); // Not part of this batch.
-    await app.press("id:runner-attach-many");
-    await app.waitUntil(() => f.state.attached.get("solo") === r.id);
-
-    // Settings can see the assignment while the batch is still waiting for
-    // its POST reply. Park a second folder snapshot of that same assignment.
-    await app.press("id:settings-close");
     await app.press("id:nav-settings");
     await app.waitFor("id:installed-runner-space:solo");
     expect(app.shows("id:installed-runner-space:keep")).toBe(true);
     expect(app.shows("id:installed-runner-space:added")).toBe(false);
     expect(app.shows("id:installed-runner-space:removed")).toBe(true);
+    // The normal Space list can see an external detach before the installed
+    // runner's next full folder snapshot has replaced its cached row.
+    f.state.attached.delete("solo");
+    await app.clock!.runFor(11_000);
+    await app.waitFor("id:runner-attach-pick:solo");
+    expect(app.shows("id:installed-runner-space:solo")).toBe(true);
     await app.press("id:settings-close");
-    const folderRead = { sid: "solo", delay: 1200, parked: false };
+    await openWithHeldFolderStatus(app, t, 300);
+    await app.press("id:runner-attach-pick:added"); // Not part of this batch.
+    await app.press("id:runner-attach-many");
+    await app.waitUntil(() => f.state.attached.get("solo") === r.id);
+
+    const folderRead = { sid: "solo", delay: 1000, parked: false };
     t.gate.runnerRead = folderRead;
     f.state.attached.set("added", r.id);
     f.state.attached.delete("removed");
     if (attaches) f.state.attached.delete("solo"); // The held snapshot sees absence.
-    await app.press("id:nav-settings");
+    await app.clock!.runFor(300);
     await app.waitUntil(() => folderRead.parked);
     expect(app.shows("id:installed-runner-space:solo")).toBe(true);
 
     if (expectedRunner) f.state.attached.set("solo", expectedRunner);
     else f.state.attached.delete("solo");
 
-    await app.clock!.runFor(800);
+    await app.clock!.runFor(600);
     await app.waitFor("id:runner-attach-result");
     if (attaches) expect(words(app)).toContain("Attached to 1 Space.");
     else {
@@ -470,7 +483,8 @@ test("a newer folder observation for A wins over a delayed reconciliation withou
     t.gate.attach = 500;
     const app = await launch(t, { manual: true });
     await signIn(app);
-    await app.press("id:nav-settings");
+    await app.waitFor(offer);
+    await openWithHeldFolderStatus(app, t, 800);
     await app.waitFor("id:runner-attach-pick:solo");
     await app.press("id:runner-attach-many");
     await app.waitUntil(() => f.state.attached.get("solo") === r.id);
@@ -483,12 +497,11 @@ test("a newer folder observation for A wins over a delayed reconciliation withou
     if (oldMatch) f.state.attached.delete("solo");
     else f.state.attached.set("solo", r.id);
     f.state.attached.set("marker", r.id);
-    await app.press("id:settings-close");
-    await app.press("id:nav-settings");
+    await app.clock!.runFor(300);
     await app.waitFor("id:installed-runner-space:marker"); // The newer snapshot has merged.
     await app.waitFor(oldMatch ? "id:runner-attach-pick:solo" : "id:installed-runner-space:solo");
 
-    await app.clock!.runFor(1000);
+    await app.clock!.runFor(700);
     await app.waitFor("id:runner-attach-result");
     expect(words(app)).toContain("Attached to 0 of 1 Space. Solo: The attachment wasn't confirmed.");
     expect(app.shows("id:installed-runner-space:solo")).toBe(!oldMatch);

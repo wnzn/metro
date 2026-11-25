@@ -24,17 +24,17 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
   const b = fakeBridge(f);
   const log: { method: string; path: string; body: string | null | undefined }[] = [];
   const t = { log };
-  const st = { state: opts.state ?? "online", canReconnect: opts.canReconnect ?? false, runnerId, delay: 0 };
+  const st = { state: opts.state ?? "online", canReconnect: opts.canReconnect ?? false, runnerId, delay: 0, status: 200, available: opts.available ?? true };
   const status = () => ({
     requested: opts.requested ?? true,
     marker: opts.requested === false ? "absent" : "accepted",
     marker_detail: null,
-    available: opts.available ?? true,
-    state: opts.available === false ? "unavailable" : st.state,
+    available: st.available,
+    state: !st.available ? "unavailable" : st.state,
     detail: st.state === "revoked" ? "This computer's runner is no longer accepted by the local Metro server." : null,
-    runner: opts.available === false || !st.runnerId ? null : { id: st.runnerId, name },
+    runner: !st.available || !st.runnerId ? null : { id: st.runnerId, name },
     ...(opts.unconfirmedName && !st.runnerId ? { unconfirmed_name: opts.unconfirmedName } : {}),
-    spaces_folder: opts.available === false ? null : ROOT,
+    spaces_folder: !st.available ? null : ROOT,
     tools: ["workspace.list", "workspace.read"],
     can_reconnect: st.canReconnect,
   });
@@ -47,7 +47,8 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
       if (opts.unavailableFor && b.state.session?.account_id === opts.unavailableFor) {
         return { status: 200, body: { ...status(), available: false, runner: null, state: "unavailable" } };
       }
-      return { status: 200, body: status(), ...(st.delay ? { delay: st.delay } : {}) };
+      const body = st.status === 200 ? status() : { error: { code: "unavailable", message: "try again" } };
+      return { status: st.status, body, ...(st.delay ? { delay: st.delay } : {}) };
     }
     if (path === "/v1/local-tools/runner/reconnect" && req.method === "POST") {
       st.state = "online";
@@ -386,7 +387,8 @@ test("persistent concurrent consumers see late online and subsequent offline; di
   expect(reads()).toBe(1); // Both watchers use the initial read.
   expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
   await app.clock!.runFor(36_000); // Longer than the old six-try window.
-  expect(reads()).toBe(8);
+  expect(reads()).toBeGreaterThanOrEqual(7);
+  expect(reads()).toBeLessThanOrEqual(8); // At most one poll per five seconds.
   expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
 
   t.st.state = "online";
@@ -488,6 +490,139 @@ test("Settings upgrades a held Sidebar poll to one folder fetch for the still-mo
       expect(folders()).toBe(0);
     }
     expect(reads()).toBe(2);
+    t.st.delay = 0;
+    await app.clock!.runFor(5300);
+    if (change === "different runner") {
+      await app.waitFor(`text:Create choice: ${replacement.id}`);
+      await app.waitFor("id:installed-runner-folder:solo");
+    }
+    expect(folders()).toBe(change === "unmounted" ? 0 : 1);
+    expect(posts(t)).toEqual([]);
+  }
+});
+
+test("mounted Settings retries a failed or empty joined read after offer dismissal, then stops after one folder refresh", async () => {
+  for (const failure of ["error", "no runner", "temporarily unavailable", "unmounted"]) {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    const mine = f.addRunner("This PC", "personal", "alice");
+    const t = bridgeWithRunner(f, mine.id, mine.name);
+    const reads = () => t.log.filter((l) => l.method === "GET" && l.path === "/v1/local-tools/runner").length;
+    const folderReads = () => f.state.log.filter((l) => l.method === "GET" && l.path === "/v1/spaces/solo/runner").length;
+    const app = await open("./runnerWatch.fixture.tsx", {
+      network: { ...f.network, ...t.network } as any, modules: bridgeEnv() as any, platform: "linux", width: 1280, height: 900, clock: {},
+    });
+    await app.press("id:fixture-connect");
+    await app.waitFor("id:dismiss-fixture-offer");
+    expect(reads()).toBe(1);
+    f.state.attached.set("solo", mine.id);
+    t.st.delay = 1800;
+    if (failure === "temporarily unavailable") t.st.available = false;
+    else if (failure === "error" || failure === "unmounted") t.st.status = 503;
+    else {
+      t.st.runnerId = null;
+      t.st.state = "starting";
+    }
+    await app.clock!.runFor(5100);
+    await app.press("id:toggle-runner-settings");
+    await app.waitFor("id:runners-settings");
+    await app.press("id:dismiss-fixture-offer");
+    await app.clock!.runFor(6400);
+    expect(reads()).toBe(2); // The failed read didn't trigger an eager retry.
+    expect(folderReads()).toBe(0);
+    expect(app.shows("id:installed-runner-folder:solo")).toBe(false);
+
+    t.st.delay = 0;
+    if (failure === "unmounted") {
+      await app.press("id:toggle-runner-settings");
+      t.st.status = 200;
+      await app.clock!.runFor(15_000);
+      expect(reads()).toBe(2);
+      expect(folderReads()).toBe(0);
+      continue;
+    }
+    await app.clock!.runFor(600);
+    expect(reads()).toBe(3); // One shared retry, despite two mounted folder consumers.
+    expect(folderReads()).toBe(0);
+
+    t.st.status = 200;
+    t.st.available = true;
+    t.st.runnerId = mine.id;
+    t.st.state = "online";
+    await app.clock!.runFor(5000);
+    await app.waitFor("id:installed-runner-folder:solo");
+    expect(reads()).toBe(4);
+    expect(folderReads()).toBe(1);
+    await app.clock!.runFor(15_000);
+    expect(reads()).toBe(4);
+    expect(folderReads()).toBe(1);
+    expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
+    expect(posts(t)).toEqual([]);
+  }
+});
+
+test("persistent folder failures exhaust the mounted Settings budget without stopping Sidebar liveness", async () => {
+  for (const mode of ["bridge failure", "unregistered", "offer still active"]) {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    f.addSpace("empty", "Empty", "alice");
+    const mine = f.addRunner("This PC", "personal", "alice");
+    const t = bridgeWithRunner(f, mine.id, mine.name);
+    const reads = () => t.log.filter((l) => l.method === "GET" && l.path === "/v1/local-tools/runner").length;
+    const folderReads = () => f.state.log.filter((l) => l.method === "GET" && l.path === "/v1/spaces/solo/runner").length;
+    const app = await open("./runnerWatch.fixture.tsx", {
+      network: { ...f.network, ...t.network } as any, modules: bridgeEnv() as any, platform: "linux", width: 1280, height: 900, clock: {},
+    });
+    await app.press("id:fixture-connect");
+    await app.waitFor("id:dismiss-fixture-offer");
+    if (mode !== "offer still active") await app.press("id:dismiss-fixture-offer");
+    if (mode === "unregistered") {
+      t.st.runnerId = "no-longer-registered";
+      t.st.state = "revoked";
+      t.st.canReconnect = true;
+    } else t.st.status = 503;
+    f.state.attached.set("solo", mine.id);
+
+    await app.press("id:toggle-runner-settings");
+    await app.waitFor("id:runners-settings");
+    await app.clock!.runFor(24_000);
+    expect(app.shows("id:installed-runner-folders-retry")).toBe(false);
+    // A duplicate consumer mounting mid-budget doesn't restart the clock.
+    const beforeDuplicate = reads();
+    await app.press("id:toggle-folder-watch");
+    await app.press("id:toggle-folder-watch");
+    expect(reads()).toBe(beforeDuplicate);
+    await app.clock!.runFor(7000);
+    await app.waitFor("id:installed-runner-folders-retry");
+    expect(text(app)).toContain("Automatic checks stopped.");
+    expect(folderReads()).toBe(0);
+    const atExpiry = reads();
+    expect(atExpiry).toBeGreaterThan(2);
+    expect(atExpiry).toBeLessThanOrEqual(8); // Initial read plus bounded retries.
+
+    t.st.status = 200;
+    t.st.runnerId = mine.id;
+    t.st.state = "online";
+    t.st.canReconnect = false;
+    await app.clock!.runFor(45_000);
+    if (mode === "offer still active") {
+      expect(reads()).toBeGreaterThan(atExpiry);
+      expect(app.shows(`text:Create choice: ${mine.id}`)).toBe(true);
+      expect(app.shows("id:dismiss-fixture-offer")).toBe(true);
+    } else {
+      expect(reads()).toBe(atExpiry); // Settings stayed mounted, but stopped polling.
+    }
+    expect(folderReads()).toBe(0); // Liveness doesn't reset the folder budget.
+    expect(app.shows("id:installed-runner-folders-retry")).toBe(true);
+
+    await app.press("id:installed-runner-folders-retry");
+    await app.waitFor("id:installed-runner-folder:solo");
+    expect(app.shows("id:installed-runner-folders-retry")).toBe(false);
+    expect(folderReads()).toBe(1);
+    await app.clock!.runFor(35_000);
+    expect(folderReads()).toBe(1);
+    // A stale registration ID needs one guarded follow-up for the new ID.
+    if (mode !== "offer still active") expect(reads()).toBe(atExpiry + (mode === "unregistered" ? 2 : 1));
     expect(posts(t)).toEqual([]);
   }
 });
@@ -549,6 +684,91 @@ test("managed runner updates require confirmation, report denial and accepted pr
   await app.waitFor("text:v0.5.0 · Online");
   expect(app.shows(id)).toBe(false);
   expect(posts()).toHaveLength(3);
+});
+
+test("an accepted update waits for the held pre-acceptance poll before polling again", async () => {
+  const f = world();
+  const mine = f.addRunner("Build box", "personal", "alice");
+  const other = f.addRunner("Already updating", "personal", "alice");
+  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update"));
+  f.state.runnerRelease.set(other.id, fixtureRelease("managed", "self_update", {
+    pending: { target: "0.5.0", requested_at: Date.now() },
+  }));
+  const app = await openWith(f, null, true);
+  await signInToRunners(app, "alice");
+  const id = `id:runner-update:${mine.id}`;
+  const pending = `id:runner-update-result:${mine.id} >> text:Update to 0.5.0 requested`;
+  await app.waitFor(`id:runner-update-result:${other.id} >> text:Update to 0.5.0 requested`);
+
+  // The existing pending row causes a production roster poll. Its old answer
+  // knows neither row as pending: the unrelated update has already finished.
+  f.state.runnerRelease.set(other.id, fixtureRelease("managed", "none", { available: false }));
+  const held = f.answerLate("/v1/runners", TOKENS.alice!, 8000);
+  await app.clock!.runFor(5100);
+  expect(held.arrived()).toBe(1);
+  f.answerLate("/v1/runners", TOKENS.alice!, 0);
+  // Don't mutate the release object captured by the held reply.
+  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update"));
+  await app.press(id);
+  await app.press(`${id}:confirm`);
+  await app.waitFor(pending);
+
+  const completed = fixtureRelease("managed", "none", { available: false });
+  completed.presence.version = "0.5.0";
+  f.state.runnerRelease.set(mine.id, completed);
+  const authoritative = f.answerLate("/v1/runners", TOKENS.alice!, 6300);
+
+  await app.clock!.runFor(5600); // A tick passes with the old GET still held.
+  expect(authoritative.arrived()).toBe(0);
+  expect(app.shows(pending)).toBe(true);
+  expect(app.shows(id)).toBe(false);
+
+  await app.clock!.runFor(2800); // The old answer is released, but is stale.
+  expect(authoritative.arrived()).toBe(0);
+  expect(app.shows(pending)).toBe(true);
+  expect(app.shows(id)).toBe(false);
+
+  await app.clock!.runFor(6900); // A fresh poll starts; its next tick must not overlap.
+  expect(authoritative.arrived()).toBe(1);
+  expect(app.shows(pending)).toBe(true);
+  await app.clock!.runFor(1700);
+  await app.waitFor("text:v0.5.0 · Online");
+  expect(app.shows(pending)).toBe(false);
+  expect(app.shows(id)).toBe(false);
+  await app.clock!.runFor(6000);
+  expect(authoritative.arrived()).toBe(1);
+  expect(f.posts().filter((p) => p.path.endsWith("/update"))).toEqual([
+    { user: "alice", method: "POST", path: `/v1/runners/${mine.id}/update`, body: { version: "0.5.0" } },
+  ]);
+});
+
+test("a delayed update acknowledgement cannot stamp the next account's runner roster", async () => {
+  const f = world();
+  const shared = f.addRunner("Shared build box", "organization", "alice");
+  const path = `/v1/runners/${shared.id}/update`;
+  f.state.runnerRelease.set(shared.id, fixtureRelease("managed", "self_update"));
+  const held = f.answerLate(path, TOKENS.alice!, 3000);
+  const app = await openWith(f, null, true);
+  await signInToRunners(app, "alice");
+  const id = `id:runner-update:${shared.id}`;
+  await app.press(id);
+  await app.press(`${id}:confirm`);
+  await app.waitFor(`${id}:busy`);
+  expect(held.arrived()).toBe(1);
+
+  await app.press("id:settings-close");
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+  await app.waitFor("id:connect");
+  // Bob can still see the same registered ID but the server isn't reporting
+  // a pending update anymore.
+  f.state.runnerRelease.set(shared.id, fixtureRelease("managed", "self_update"));
+  await signInToRunners(app, "bob");
+  await app.waitFor("text:Shared build box");
+  await app.clock!.runFor(3100);
+  expect(app.shows("text:Update to 0.5.0 requested")).toBe(false);
+  expect(app.shows(id)).toBe(false);
+  expect(f.posts().filter((p) => p.path === path).map((p) => p.user)).toEqual(["alice"]);
 });
 
 test("an update offer changed while confirming never requests a different target", async () => {

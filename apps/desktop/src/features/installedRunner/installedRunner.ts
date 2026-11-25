@@ -87,8 +87,12 @@ export const ownedInstalledRunner = signal<{ id: string; attachIfEmpty: boolean 
 export const checkingInstalledScope = signal(false);
 /** A provisioned (or temporarily unreachable) launcher worth watching for the offer. */
 export const installedRunnerStatusWatchable = signal(false);
+/** This session has had a supported local runner status, even if its bridge context is now missing. */
+export const installedRunnerSeen = signal(false);
 /** Owned Spaces whose runner is this one, by stable id. */
 export const runnerSpaces = signal<{ id: string; name: string }[]>([]);
+/** Serial of the last complete folder read for the current verified runner, if any. */
+export const installedFolderSnapshot = signal<number | null>(null);
 export const installedBusy = signal<null | "reconnect" | `folder:${string}`>(null);
 export const installedError = signal<string | null>(null);
 export const installedNotice = signal<string | null>(null);
@@ -96,6 +100,7 @@ export const folders = signal<Record<string, RunnerFolder>>({});
 
 let gen = 0;
 let folderRoot = 0;
+let folderSnapshotSerial = 0;
 const sessionKey = () => `${connectedTo() ?? ""}\n${me() ?? ""}`;
 
 /** Still the same session and the latest request. */
@@ -110,6 +115,7 @@ function clearAttached() {
   folderRoot++;
   runnerSpaces.set([]);
   folders.set({});
+  installedFolderSnapshot.set(null);
 }
 
 function reset() {
@@ -125,6 +131,7 @@ onSessionEnd(() => {
   gen++;
   inflight = null;
   installedRunnerStatusWatchable.set(false);
+  installedRunnerSeen.set(false);
   installedBusy.set(null);
   reset();
 });
@@ -155,6 +162,9 @@ async function loadAttached(runnerId: string, valid: () => boolean): Promise<voi
       res.value.observation.publish(res.value.runner);
     }
     for (const { id } of runnerSpaces()) if (!stillOwned.has(id)) removeFolder(id);
+    // Keep U5's complete-snapshot signal for the bounded refresh demand;
+    // individual Space updates don't satisfy or restart that demand.
+    if (checks.every((res) => res.status === "fulfilled")) installedFolderSnapshot.set(++folderSnapshotSerial);
   });
 }
 
@@ -216,6 +226,7 @@ async function readStatus(read: InstalledRead): Promise<void> {
   try {
     const { runner: next, watchable } = await readBridgeStatus();
     if (!valid()) return;
+    if (next) installedRunnerSeen.set(true);
     installedRunnerStatusWatchable.set(watchable);
     if (!next || next.runner?.id !== installedRunner()?.runner?.id) reset();
     installedRunner.set(next);
@@ -239,9 +250,12 @@ async function readBridgeStatus(): Promise<{ runner: InstalledRunner | null; wat
   const call = localRunnerCall();
   if (!call || !apiClient() || !me()) return { runner: null, watchable: false };
   try {
-    const runner = parseInstalledRunner(await call("GET", "/v1/local-tools/runner"));
-    // An answered "not installed / not this workspace" isn't a transient failure.
-    return { runner, watchable: runner !== null };
+    const body = await call("GET", "/v1/local-tools/runner");
+    const runner = parseInstalledRunner(body);
+    // A definitive "not installed / not this workspace" doesn't need another
+    // read. An empty or incomprehensible answer may be transient.
+    const unavailable = isObj(body) && (body.requested === false || body.available === false);
+    return { runner, watchable: !unavailable };
   } catch (error) {
     const unsupported = error instanceof BridgeError && [404, 405].includes(error.status ?? 0);
     return { runner: null, watchable: !unsupported };
