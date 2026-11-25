@@ -617,11 +617,12 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertIn("python3 -B crates/tui/tests/pty_qa.py --bin-dir target/debug", pty[0]["run"])
         self.assertIn("timeout --kill-after=", pty[0]["run"])
 
-    def test_ci_pages_and_web_search_use_the_normal_build_once(self):
+    def test_ci_feature_fixtures_use_the_normal_build_once(self):
         jobs = self.ci["jobs"]
         rust = jobs["rust"]["steps"]
         build, = [i for i, s in enumerate(rust) if str(s.get("run", "")).startswith("cargo build --locked --bin ")]
-        for fixture, timeout in (("pages.py", 60), ("agent_pages.py", 90), ("web_search.py", 90)):
+        for fixture, timeout in (("pages.py", 60), ("agent_pages.py", 90), ("web_search.py", 90),
+                                 ("messaging.py", 60), ("meta_agent.py", 90)):
             path = f"tests/e2e/{fixture}"
             with self.subTest(fixture=fixture):
                 (job, index, step), = [(name, i, step) for name, job in jobs.items()

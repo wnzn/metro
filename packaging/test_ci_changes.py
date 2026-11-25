@@ -152,6 +152,9 @@ class SegmentTests(GitFixture):
             "crates/connector/src/lib.rs": only("rust", "containers", "previews"),
             "tests/e2e/pages.py": only("rust", "containers"),
             "tests/e2e/agent_pages.py": only("rust", "containers"),
+            "tests/e2e/messaging.py": only("rust", "containers"),
+            "tests/e2e/messaging_fixture.py": only("rust", "containers"),
+            "tests/e2e/meta_agent.py": only("rust", "containers"),
             "tests/e2e/web_search.py": only("rust", "containers"),
         }
         for path, expected in cases.items():
