@@ -132,7 +132,7 @@ pub fn get_or_create(
     Ok(Ok((thread, true)))
 }
 
-fn event_in(
+pub(crate) fn event_in(
     conn: &Connection,
     space_id: &str,
     room_id: &str,

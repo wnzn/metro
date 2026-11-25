@@ -57,7 +57,7 @@ pub const MAX_CASE_KEY: usize = 32;
 pub const MAX_CASE_LABEL: usize = 64;
 /// Longest case description (the criterion System One judges), in characters.
 pub const MAX_CASE_DESCRIPTION: usize = 500;
-pub const DEFAULT_MIN_DIRECTEDNESS: f64 = 0.85;
+pub const DEFAULT_MIN_DIRECTEDNESS: f64 = 0.35;
 pub const DEFAULT_MIN_ROUTE_PROBABILITY: f64 = 0.65;
 /// Longest message text sent to System One, in characters.
 pub const MAX_CLASSIFIED_CHARS: usize = 4_000;
@@ -147,8 +147,8 @@ impl RoutingSettings {
     /// Shape checks that need no database.
     fn check_shape(&self) -> Result<(), String> {
         let unit = |v: f64| v.is_finite() && (0.0..=1.0).contains(&v);
-        if !unit(self.min_directedness) || self.min_directedness < 0.5 {
-            return Err("min_directedness must be a number from 0.5 to 1".to_owned());
+        if !unit(self.min_directedness) || self.min_directedness < 0.2 {
+            return Err("min_directedness must be a number from 0.2 to 1".to_owned());
         }
         if !unit(self.min_route_probability) {
             return Err("min_route_probability must be a number from 0 to 1".to_owned());
@@ -208,7 +208,7 @@ impl RoutingSettings {
     }
 }
 
-/// Create the settings table. Called from `Db::init`.
+/// Create the settings table and migrate the old default once. Called from `Db::init`.
 pub fn init(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS model_routing_settings (
@@ -217,6 +217,22 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
              updated_at INTEGER NOT NULL
          );",
     )?;
+    let tx = conn.unchecked_transaction()?;
+    if tx.execute(
+        "INSERT INTO metro_meta (key, value) VALUES ('routing_directedness_v2', '1')
+         ON CONFLICT (key) DO NOTHING",
+        [],
+    )? == 1
+    {
+        tx.execute(
+            "UPDATE model_routing_settings
+             SET settings = json_set(settings, '$.min_directedness', ?1)
+             WHERE CASE WHEN json_valid(settings)
+                        THEN json_extract(settings, '$.min_directedness') = 0.85 END",
+            [DEFAULT_MIN_DIRECTEDNESS],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -970,15 +986,21 @@ fn case_question(settings: &RoutingSettings) -> Question {
     }
 }
 
-/// Ask the sender's System One exactly one question about `text` (the one
-/// new message, bounded; never room history). Some System One endpoints
-/// accept only one typed question per request, so Metro never bundles.
+fn message_payload(text: &str, in_space: bool) -> Value {
+    let message: String = text.chars().take(MAX_CLASSIFIED_CHARS).collect();
+    json!({
+        "message": message,
+        "where": if in_space { "a shared room" } else { "the sender's private chat with the assistant" },
+    })
+}
+
+/// Some System One endpoints accept only one typed question per request.
 async fn ask_one(
     state: &AppState,
     user: &str,
     space: Option<&str>,
     settings: &RoutingSettings,
-    text: &str,
+    payload: Value,
     id: &str,
     question: Question,
 ) -> Decision<protocol::Answer> {
@@ -990,11 +1012,6 @@ async fn ask_one(
     if protocol::validate_questions(&asked).is_err() {
         return Decision::Failed(DecisionFailure::InvalidQuestion);
     }
-    let message: String = text.chars().take(MAX_CLASSIFIED_CHARS).collect();
-    let payload = json!({
-        "message": message,
-        "where": if space.is_some() { "a shared room" } else { "the sender's private chat with the assistant" },
-    });
     let Ok(_slot) = state.routing.decisions.clone().try_acquire_owned() else {
         return Decision::Failed(DecisionFailure::Busy);
     };
@@ -1041,7 +1058,7 @@ pub async fn use_case(
         user,
         space,
         settings,
-        text,
+        message_payload(text, space.is_some()),
         Q_USE_CASE,
         case_question(settings),
     )
@@ -1061,8 +1078,8 @@ pub async fn use_case(
 /// The agent Choice's answer.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AgentAnswer {
-    /// The index of the chosen agent in the options, or `None` for
-    /// [`NO_AGENT_KEY`].
+    /// The index of the chosen agent, or the strongest agent option if
+    /// System One chose "No agent" but the directedness clears the floor.
     pub index: Option<usize>,
     /// The chosen option's probability (0 when none was given).
     pub probability: f64,
@@ -1070,6 +1087,13 @@ pub struct AgentAnswer {
     /// probability of [`NO_AGENT_KEY`] when it was offered and answered,
     /// otherwise the chosen agent's probability.
     pub directed: f64,
+}
+
+impl AgentAnswer {
+    pub fn meets_directedness(&self, floor: f64) -> bool {
+        // A complement such as 1 - 0.8 can land just below 0.2.
+        self.directed + f64::EPSILON >= floor
+    }
 }
 
 fn agent_key(i: usize) -> String {
@@ -1090,13 +1114,17 @@ fn agent_question(agents: &[(String, String)], with_none: bool) -> Question {
     if with_none {
         criteria.insert(
             NO_AGENT_KEY.to_owned(),
-            json!({"label": "No agent", "description": "The message is conversation between \
-                   people, a status update or a remark, not a request to any of the agents"}),
+            json!({"label": "No agent", "description": "Clearly only conversation between people, \
+                   with nothing an agent could usefully add."}),
         );
     }
     Question::Choice {
         instructions: json!(if with_none {
-            "Which agent, if any, is `message` asking to answer or do something?"
+            "Metro may let one agent decide whether to answer `message`. Pick the agent that would be \
+             most useful to see it: anything that is a question, request, task, or a remark an agent could help with, \
+             or a follow-up to an agent's recent reply in `previous`. Pick No agent only when `message` is clearly \
+             people talking only to each other (greetings, social chat, a reply to another person) and no agent could \
+             usefully add anything. When unsure, pick an agent."
         } else {
             "`message` asks an agent to answer or do something. Which agent fits it best?"
         }),
@@ -1104,9 +1132,8 @@ fn agent_question(agents: &[(String, String)], with_none: bool) -> Question {
     }
 }
 
-/// One typed System One Choice over a Space's agents (`(name,
-/// description)`, in order), plus [`NO_AGENT_KEY`] when `with_none`. Only
-/// the one new message is sent; never history, ids or instructions.
+/// One typed System One Choice over a Space's agents. A room id opts into
+/// unaddressed classification with context; generic `@agent` passes `None`.
 pub async fn pick_agent(
     state: &AppState,
     user: &str,
@@ -1114,14 +1141,38 @@ pub async fn pick_agent(
     settings: &RoutingSettings,
     text: &str,
     agents: &[(String, String)],
-    with_none: bool,
+    unaddressed_room: Option<&str>,
 ) -> Decision<AgentAnswer> {
+    let with_none = unaddressed_room.is_some();
+    let mut payload = message_payload(text, true);
+    if let Some(room) = unaddressed_room {
+        if settings.classifier_id.is_none() {
+            return Decision::Failed(DecisionFailure::NoClassifier);
+        }
+        let (user, space, room) = (user.to_owned(), space.to_owned(), room.to_owned());
+        match state
+            .db
+            .call(move |db| classifier_context(&db.lock(), &user, &space, &room))
+            .await
+        {
+            Ok(Some(context)) => {
+                for (key, value) in context {
+                    payload[key] = value;
+                }
+            }
+            Ok(None) => return Decision::Failed(DecisionFailure::NotAllowed),
+            Err(e) => {
+                tracing::warn!(error = %e, "loading Space classification context");
+                return Decision::Failed(DecisionFailure::Unreachable);
+            }
+        }
+    }
     let answer = ask_one(
         state,
         user,
         Some(space),
         settings,
-        text,
+        payload,
         Q_AGENT,
         agent_question(agents, with_none),
     )
@@ -1153,11 +1204,62 @@ pub async fn pick_agent(
         _ if index.is_some() => probability,
         _ => 0.0,
     };
-    Decision::Answered(AgentAnswer {
+    let mut answer = AgentAnswer {
         index,
         probability,
         directed,
-    })
+    };
+    if answer.index.is_none() && answer.meets_directedness(settings.min_directedness) {
+        // Missing scores are zero; ties retain the first agent in option order.
+        let score = |i| probabilities.get(&agent_key(i)).copied().unwrap_or(0.0);
+        answer.index = (0..agents.len())
+            .rev()
+            .max_by(|&a, &b| score(a).total_cmp(&score(b)));
+        answer.probability = answer.index.map_or(0.0, score);
+    }
+    Decision::Answered(answer)
+}
+
+fn classifier_context(
+    conn: &Connection,
+    user: &str,
+    space: &str,
+    room: &str,
+) -> anyhow::Result<Option<[(&'static str, Value); 3]>> {
+    if !crate::db::Db::room_member_in(conn, space, room, user)? {
+        return Ok(None);
+    }
+    let (name, description, room_name): (String, String, String) = conn.query_row(
+        "SELECT s.name, s.description, r.name FROM spaces s
+         JOIN space_rooms r ON r.space_id = s.id WHERE s.id = ?1 AND r.id = ?2",
+        params![space, room],
+        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+    )?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT kind, actor, substr(text, 1, 400), json_extract(activity, '$.agent.name')
+         FROM space_events WHERE space_id = ?1 AND room_id = ?2 AND kind IN ('message', 'agent')
+         ORDER BY id DESC LIMIT 3",
+    )?;
+    let mut previous = stmt
+        .query_map(params![space, room], |r| {
+            let kind: String = r.get(0)?;
+            let actor: String = r.get(1)?;
+            let text: String = r.get(2)?;
+            let agent: Option<String> = r.get(3)?;
+            Ok(json!({
+                "speaker_kind": if kind == crate::db::kind::AGENT { "agent" } else { "person" },
+                "speaker": agent.unwrap_or(actor),
+                "text": text,
+            }))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    previous.reverse();
+    let description: String = description.chars().take(300).collect();
+    Ok(Some([
+        ("space", json!({"name": name, "description": description})),
+        ("room", json!(room_name)),
+        ("previous", json!(previous)),
+    ]))
 }
 
 /// The route of a turn `user` starts. `chosen` (an explicit model for this
@@ -1398,7 +1500,7 @@ mod tests {
         let d: RoutingSettings = serde_json::from_value(json!({})).unwrap();
         assert_eq!(d, RoutingSettings::default());
         assert!(!d.enabled && !d.infer_addressing);
-        assert_eq!(d.min_directedness, 0.85);
+        assert_eq!(d.min_directedness, 0.35);
         assert_eq!(d.min_route_probability, 0.65);
         assert!(d.check_shape().is_ok());
         assert!(serde_json::from_value::<RoutingSettings>(json!({"surprise": 1})).is_err());
@@ -1424,8 +1526,10 @@ mod tests {
         s.cases = vec![case("code")];
         s.min_directedness = f64::NAN;
         assert!(s.check_shape().is_err());
-        s.min_directedness = 0.3;
+        s.min_directedness = 0.19;
         assert!(s.check_shape().is_err());
+        s.min_directedness = 0.2;
+        assert!(s.check_shape().is_ok());
         s.min_directedness = 0.9;
         s.min_route_probability = 1.5;
         assert!(s.check_shape().is_err());
@@ -1436,6 +1540,62 @@ mod tests {
         assert!(s.check_shape().is_ok(), "off routing may keep cases");
         s.infer_addressing = true;
         assert!(s.check_shape().is_ok(), "the legacy flag is ignored");
+    }
+
+    #[test]
+    fn directedness_migration_rewrites_only_old_defaults_and_runs_once() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let conn = db.lock();
+        conn.execute(
+            "DELETE FROM metro_meta WHERE key = 'routing_directedness_v2'",
+            [],
+        )
+        .unwrap();
+        for (id, raw) in [
+            (
+                "old",
+                r#"{"min_directedness":0.85,"infer_addressing":true,"min_route_probability":0.8}"#,
+            ),
+            (
+                "custom",
+                r#"{"min_directedness":0.9,"infer_addressing":true}"#,
+            ),
+            ("missing", r#"{"infer_addressing":true}"#),
+            ("bad", "not json"),
+        ] {
+            conn.execute(
+                "INSERT INTO model_routing_settings (user_id, settings, updated_at) VALUES (?1, ?2, 42)",
+                params![id, raw],
+            ).unwrap();
+        }
+        init(&conn).unwrap();
+        let old = load(&conn, "old").unwrap();
+        assert_eq!(old.min_directedness, 0.35);
+        assert_eq!(old.min_route_probability, 0.8);
+        assert!(old.infer_addressing);
+        assert_eq!(load(&conn, "custom").unwrap().min_directedness, 0.9);
+        assert_eq!(load(&conn, "missing").unwrap().min_directedness, 0.35);
+        assert_eq!(load(&conn, "bad").unwrap(), RoutingSettings::default());
+
+        let updated_at: i64 = conn
+            .query_row(
+                "SELECT updated_at FROM model_routing_settings WHERE user_id = 'old'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_at, 42);
+        store(
+            &conn,
+            "old",
+            &RoutingSettings {
+                min_directedness: 0.85,
+                ..old
+            },
+        )
+        .unwrap();
+        init(&conn).unwrap();
+        assert_eq!(load(&conn, "old").unwrap().min_directedness, 0.85);
     }
 
     #[test]

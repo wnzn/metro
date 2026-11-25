@@ -215,6 +215,7 @@ pub async fn post_room_message(
         state,
         &who.id,
         &space.id,
+        &room.id,
         &text,
         &resolved,
         addressing,

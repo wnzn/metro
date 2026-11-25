@@ -26,7 +26,7 @@ type ConnModel = { model_id: string; display_name: string | null; listed_name: s
 type Conn = { id: string; owner: string; name: string; provider_id: string; base_url: string | null; model: string | null; is_default: boolean; key: string | null; deviceToken: string | null; capability: Capability; share: Share; models: ConnModel[] };
 type RoutingCase = { key: string; label: string; description: string; connection_id: string | null };
 type Routing = { enabled: boolean; infer_addressing: boolean; classifier_id: string | null; embedding_id: string | null; default_chat_id: string | null; min_directedness: number; min_route_probability: number; cases: RoutingCase[] };
-const DEFAULT_ROUTING: Routing = { enabled: false, infer_addressing: false, classifier_id: null, embedding_id: null, default_chat_id: null, min_directedness: 0.85, min_route_probability: 0.65, cases: [] };
+const DEFAULT_ROUTING: Routing = { enabled: false, infer_addressing: false, classifier_id: null, embedding_id: null, default_chat_id: null, min_directedness: 0.35, min_route_probability: 0.65, cases: [] };
 
 /** The catalog this double offers: chat, System One and embeddings adapters, on devices and on the server. */
 export const CATALOG: { providers: { id: string; name: string; requires_key: boolean; allow_custom_url: boolean; default_base_url?: string; execution: string; capability: Capability; lists_models: boolean }[]; allowed_base_urls: string[] } = {
@@ -377,7 +377,7 @@ export function fakeServer() {
       if (req.method === "PUT") {
         const b = body as Routing;
         const p = (n: unknown) => typeof n === "number" && n >= 0 && n <= 1;
-        if (!p(b.min_directedness) || b.min_directedness < 0.5 || !p(b.min_route_probability)) return err(400, "min_directedness must be 0.5..=1, min_route_probability 0..=1");
+        if (!p(b.min_directedness) || b.min_directedness < 0.2 || !p(b.min_route_probability)) return err(400, "min_directedness must be 0.2..=1, min_route_probability 0..=1");
         if ((b.cases ?? []).length > 16 || (b.cases ?? []).some((c) => !/^[a-z][a-z0-9_]{0,31}$/.test(c.key))) return err(400, "bad cases");
         if (b.classifier_id && !usableAs(b.classifier_id, "system_one", user)) return err(400, "classifier_id is not a System One connection you can use");
         if (b.embedding_id && !usableAs(b.embedding_id, "embeddings", user)) return err(400, "embedding_id is not an embeddings connection you can use");

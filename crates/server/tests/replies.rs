@@ -93,18 +93,45 @@ impl RoutingBackend for Backend {
     }
 }
 
-/// An OpenAI-compatible endpoint that always answers "ok"; counts calls.
-async fn model(calls: Arc<Mutex<usize>>) -> String {
+fn content_parts(message: &Value) -> Vec<&str> {
+    match &message["content"] {
+        Value::String(s) => vec![s],
+        Value::Array(parts) => parts.iter().filter_map(|p| p["text"].as_str()).collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// An OpenAI-compatible endpoint with a few scripted room outcomes.
+async fn model(calls: Arc<Mutex<Vec<Value>>>) -> String {
     let app = axum::Router::new().route(
         "/v1/chat/completions",
         post(move |Json(body): Json<Value>| {
             let calls = calls.clone();
             async move {
-                *calls.lock().unwrap() += 1;
+                calls.lock().unwrap().push(body.clone());
+                let messages = body["messages"].as_array().unwrap();
+                let last = messages.last().unwrap();
+                let parts = content_parts(last);
+                let input = parts.last().copied().unwrap_or_default();
+                let mut choice = json!({"index": 0, "finish_reason": "stop",
+                                        "message": {"role": "assistant", "content": "ok"}});
+                if last["role"] == "tool" || input.contains("[unplaced]") {
+                    choice["message"]["content"] = json!("METRO_REACTION_ONLY");
+                } else if input.contains("[react]") {
+                    choice = json!({"index": 0, "finish_reason": "tool_calls", "message": {
+                        "role": "assistant", "content": null, "tool_calls": [{
+                            "id": "react-1", "type": "function",
+                            "function": {"name": "react_to_message", "arguments": "{\"emoji\":\"👍\"}"}
+                        }]
+                    }});
+                } else if input.contains("[quiet]") {
+                    choice["message"]["content"] = json!("METRO_NO_REPLY");
+                } else if input.contains("[empty]") {
+                    choice["message"]["content"] = json!("");
+                }
                 Json(json!({
                     "id": "c", "object": "chat.completion", "created": 0, "model": body["model"],
-                    "choices": [{"index": 0, "finish_reason": "stop",
-                                 "message": {"role": "assistant", "content": "ok"}}],
+                    "choices": [choice],
                     "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
                 }))
             }
@@ -121,7 +148,7 @@ struct H {
     http: reqwest::Client,
     state: AppState,
     backend: Arc<Backend>,
-    model_calls: Arc<Mutex<usize>>,
+    model_calls: Arc<Mutex<Vec<Value>>>,
 }
 
 impl H {
@@ -130,7 +157,7 @@ impl H {
     }
 
     async fn start_with(limits: Limits) -> Self {
-        let model_calls = Arc::new(Mutex::new(0));
+        let model_calls = Arc::new(Mutex::new(Vec::new()));
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             db_path: ":memory:".into(),
@@ -613,13 +640,187 @@ async fn a_reply_to_an_agent_asks_it_without_classification() {
 }
 
 #[tokio::test]
+async fn reply_thread_prompt_has_the_anchor_first_and_never_mirrors() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    let room = "lobby";
+    let anchor = h
+        .sent("bob", &sid, room, json!({"text": "the original anchor"}))
+        .await;
+    let thread = h.thread_of(&sid, id(&anchor)).await;
+    let unrelated = h
+        .sent("bob", &sid, room, json!({"text": "parent-only context"}))
+        .await;
+    h.sent(
+        "bob",
+        &sid,
+        &thread,
+        json!({"text": "thread-local context"}),
+    )
+    .await;
+    let trigger = h
+        .sent(
+            "alice",
+            &sid,
+            &thread,
+            json!({"text": "@agent please answer here"}),
+        )
+        .await;
+    let completed = h
+        .wait_for(&sid, &thread, id(&trigger), |e| {
+            e["activity"]["phase"] == "completed"
+        })
+        .await;
+    assert_eq!(completed["activity"]["outcome"], "reply");
+    assert_eq!(completed["activity"]["name"], "Metro");
+    h.quiet_after(&sid, room, id(&unrelated)).await;
+
+    let request = h.model_calls.lock().unwrap().last().unwrap().clone();
+    let messages = request["messages"].as_array().unwrap();
+    let system = messages
+        .iter()
+        .filter(|m| m["role"] == "system")
+        .flat_map(content_parts)
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(system.contains("are context, not requests to you."));
+    assert!(system.contains("concisely, in Markdown when it helps"));
+    assert!(system.contains("exactly METRO_NO_REPLY"));
+    assert!(system.contains("You are this Space's general helper."));
+    assert!(system.contains("Keep answers focused on that conversation."));
+    assert!(!system.contains("Your final answer is posted back to the parent room."));
+    assert!(!system.contains("exactly METRO_REACTION_ONLY and nothing else"));
+    assert!(!request["tools"].to_string().contains("thread_create"));
+    let context: Value = serde_json::from_str(
+        system
+            .lines()
+            .find(|line| line.starts_with('{') && line.contains("\"participants\""))
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(context["space"]["id"], sid);
+    assert_eq!(context["room"]["kind"], "reply_thread");
+    assert_eq!(
+        context["room"]["parent_room"],
+        json!({"id":"lobby", "name":"lobby"})
+    );
+    assert_eq!(
+        context["room"]["replying_to"],
+        json!({
+            "event_id": id(&anchor), "author": "bob", "excerpt": "the original anchor"
+        })
+    );
+    assert_eq!(
+        context["participants"],
+        json!([
+            {"id": "alice", "name": "alice", "role": "owner"},
+            {"id": "bob", "name": "bob", "role": "member"},
+        ])
+    );
+    let chat: Vec<_> = messages
+        .iter()
+        .filter(|m| m["role"] == "user")
+        .flat_map(content_parts)
+        .filter(|text| !text.starts_with("metro-context: "))
+        .collect();
+    assert_eq!(
+        chat,
+        [
+            "the original anchor",
+            "thread-local context",
+            "@agent please answer here"
+        ]
+    );
+    assert!(!request.to_string().contains("parent-only context"));
+
+    let (status, result) = h
+        .post(
+            "alice",
+            "/v1/search/quick",
+            json!({"query": "context", "scope": "all", "mode": "conversations"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    let hits = result["messages"].as_array().unwrap();
+    assert!(hits.iter().any(|m| m["event_id"] == id(&unrelated)));
+    assert!(hits.iter().all(|m| m["room_id"] != thread));
+}
+
+#[tokio::test]
+async fn quiet_and_reaction_only_runs_complete_without_reply_events() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    for (input, outcome) in [
+        ("[quiet]", "no_reply"),
+        ("[empty]", "no_reply"),
+        ("[unplaced]", "no_reply"),
+        ("[react]", "reaction"),
+    ] {
+        let trigger = h
+            .sent(
+                "alice",
+                &sid,
+                "lobby",
+                json!({"text": format!("@agent {input}")}),
+            )
+            .await;
+        let terminal = h
+            .wait_for(&sid, "lobby", id(&trigger), |e| {
+                matches!(
+                    e["activity"]["phase"].as_str(),
+                    Some("completed" | "failed")
+                )
+            })
+            .await;
+        assert_eq!(
+            terminal["activity"]["outcome"], outcome,
+            "{input}: {terminal}"
+        );
+        let events = h.events("alice", &sid, "lobby").await;
+        assert!(
+            events
+                .iter()
+                .filter(|e| id(e) > id(&trigger))
+                .all(|e| { !matches!(e["kind"].as_str(), Some("agent" | "error")) }),
+            "{events:?}"
+        );
+        let has_reaction = events.iter().filter(|e| e["kind"] == "reaction").any(|e| {
+            let reaction: Value = serde_json::from_str(e["text"].as_str().unwrap()).unwrap();
+            reaction["target_event_id"] == id(&trigger) && reaction["emoji"] == "👍"
+        });
+        assert_eq!(has_reaction, outcome == "reaction", "{events:?}");
+    }
+}
+
+#[tokio::test]
+async fn agent_created_threads_still_mirror_a_quiet_completion() {
+    let h = H::start().await;
+    let sid = h.space().await;
+    let thread = h
+        .state
+        .db
+        .create_room(&sid, "research", Some("lobby"), 10, 10)
+        .unwrap();
+    let trigger = h
+        .sent("alice", &sid, &thread.id, json!({"text": "@agent [quiet]"}))
+        .await;
+    let mirror = h
+        .wait_for(&sid, "lobby", id(&trigger), |e| e["kind"] == "thread")
+        .await;
+    assert_eq!(
+        mirror["text"],
+        "Thread \"research\" completed without a reply."
+    );
+}
+
+#[tokio::test]
 async fn opting_out_or_replying_to_people_follows_the_normal_rules() {
     let h = H::start().await;
     let sid = h.space().await;
     let r = h.agent_reply(&sid, "agent").await;
     let tid = h.thread_of(&sid, r).await;
     let m = h.sent("bob", &sid, &tid, json!({"text": "me too"})).await;
-    let calls = *h.model_calls.lock().unwrap();
+    let calls = h.model_calls.lock().unwrap().len();
     for body in [
         json!({"text": "no thanks", "reply_to": r, "reply_to_agent": false}),
         json!({"text": "to bob", "reply_to": id(&m)}),
@@ -629,7 +830,7 @@ async fn opting_out_or_replying_to_people_follows_the_normal_rules() {
         assert_eq!(e["reply_to"], body["reply_to"]);
         h.quiet_after(&sid, &tid, id(&e)).await;
     }
-    assert_eq!(*h.model_calls.lock().unwrap(), calls);
+    assert_eq!(h.model_calls.lock().unwrap().len(), calls);
     // With classification on, an opted-out reply is unaddressed text.
     h.classify(&sid).await;
     let before = h.classifier_calls();
