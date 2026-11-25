@@ -25,6 +25,7 @@ pub enum TrialOutcome {
     Committed,
     NotConfirmed,
     RolledBack(String),
+    NeedsRecovery,
 }
 
 /// Paths the watchdog needs.
@@ -35,21 +36,45 @@ pub struct TrialPaths {
 }
 
 /// Snapshot the DB and journal `trial` (before the trial starts).
-pub fn begin_trial(p: &TrialPaths, j: &mut Journal) -> std::io::Result<()> {
+pub fn begin_trial(p: &TrialPaths, j: &mut Journal, lock: &install::Lock) -> std::io::Result<()> {
+    lock.check(&p.root)?;
+    install::ensure_script_transition(&p.root, j, &["staged"])?;
     j.local_db_snapshot = install::snapshot_db(&p.desktop_root, &p.update_dir)?;
-    j.phase = "trial".into();
+    j.phase = install::JournalPhase::Trial;
     j.watchdog_pid = Some(std::process::id());
     install::write_journal(&p.root.join(install::JOURNAL), j)
 }
 
 /// Start the new launcher for its trial.
 pub fn spawn_trial(exe: &Path, id: &str) -> std::io::Result<tokio::process::Child> {
+    spawn(exe, exe, id)
+}
+
+/// On Linux, execute the exact verified inode; on Windows the verified
+/// executable's handle excludes changes and deletion through spawn.
+pub fn spawn_checked_trial(
+    exe: install::CheckedFile,
+    id: &str,
+) -> std::io::Result<tokio::process::Child> {
+    #[cfg(target_os = "linux")]
+    let path = {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", exe.file.as_raw_fd()))
+    };
+    #[cfg(not(target_os = "linux"))]
+    let path = exe.path.clone();
+    let child = spawn(&path, &exe.path, id);
+    drop(exe);
+    child
+}
+
+fn spawn(exe: &Path, installed: &Path, id: &str) -> std::io::Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("--update-trial")
         .arg(id)
         .stdin(std::process::Stdio::null())
         .kill_on_drop(false);
-    if let Some(dir) = exe.parent() {
+    if let Some(dir) = installed.parent() {
         cmd.current_dir(dir);
     }
     #[cfg(unix)]
@@ -68,18 +93,18 @@ pub fn spawn_trial(exe: &Path, id: &str) -> std::io::Result<tokio::process::Chil
     cmd.spawn()
 }
 
-async fn kill(child: &mut tokio::process::Child) {
+async fn kill(child: &mut tokio::process::Child) -> bool {
     #[cfg(unix)]
     if let Some(pid) = child.id() {
         // SAFETY: signalling the trial's own process group.
         unsafe {
             libc::kill(-(pid as i32), libc::SIGTERM);
         }
-        if tokio::time::timeout(Duration::from_secs(5), child.wait())
-            .await
-            .is_ok()
-        {
-            return;
+        if matches!(
+            tokio::time::timeout(Duration::from_secs(5), child.wait()).await,
+            Ok(Ok(_))
+        ) {
+            return true;
         }
         // SAFETY: as above.
         unsafe {
@@ -87,26 +112,27 @@ async fn kill(child: &mut tokio::process::Child) {
         }
     }
     let _ = child.kill().await;
-    let _ = child.wait().await;
+    child.wait().await.is_ok()
 }
 
 /// Watch the trial and decide (script installs).
 pub async fn watch_trial(
     p: &TrialPaths,
     j: &mut Journal,
+    lock: &install::Lock,
     child: &mut tokio::process::Child,
     timeout: Duration,
 ) -> TrialOutcome {
     let started = tokio::time::Instant::now();
     loop {
         if install::trial_ok(&p.update_dir, &j.id) {
-            return match install::commit(&p.root, j) {
+            return match install::commit(&p.root, j, lock) {
                 Ok(()) => TrialOutcome::Committed,
                 Err(e) => {
                     // The new version runs and is healthy; a failed pointer
                     // write is finished (or undone) by the next start.
                     eprintln!("metro-desktop: committing the update failed: {}", e.kind());
-                    TrialOutcome::Committed
+                    TrialOutcome::NeedsRecovery
                 }
             };
         }
@@ -118,45 +144,62 @@ pub async fn watch_trial(
                 if status.success() {
                     // Closed before its first render: nothing is committed,
                     // and whatever the new server wrote is undone too.
-                    let _ = install::rollback(
+                    let restored = install::rollback(
                         &p.root,
                         &p.desktop_root,
                         &p.update_dir,
                         j,
+                        lock,
                         "not_confirmed",
                         None,
                     );
-                    return TrialOutcome::NotConfirmed;
+                    return if restored.is_ok() {
+                        TrialOutcome::NotConfirmed
+                    } else {
+                        TrialOutcome::NeedsRecovery
+                    };
                 }
                 let detail = format!(
                     "exited with {}",
                     status.code().map_or("a signal".into(), |c| c.to_string())
                 );
-                let _ = install::rollback(
+                let restored = install::rollback(
                     &p.root,
                     &p.desktop_root,
                     &p.update_dir,
                     j,
+                    lock,
                     "rolled_back",
                     Some(detail.clone()),
                 );
-                return TrialOutcome::RolledBack(detail);
+                return if restored.is_ok() {
+                    TrialOutcome::RolledBack(detail)
+                } else {
+                    TrialOutcome::NeedsRecovery
+                };
             }
             Ok(None) => {}
             Err(_) => {}
         }
         if started.elapsed() > timeout {
-            kill(child).await;
+            if !kill(child).await {
+                return TrialOutcome::NeedsRecovery;
+            }
             let detail = "didn't start in time".to_string();
-            let _ = install::rollback(
+            let restored = install::rollback(
                 &p.root,
                 &p.desktop_root,
                 &p.update_dir,
                 j,
+                lock,
                 "rolled_back",
                 Some(detail.clone()),
             );
-            return TrialOutcome::RolledBack(detail);
+            return if restored.is_ok() {
+                TrialOutcome::RolledBack(detail)
+            } else {
+                TrialOutcome::NeedsRecovery
+            };
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }

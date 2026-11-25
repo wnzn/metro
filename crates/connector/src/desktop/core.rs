@@ -916,9 +916,15 @@ impl Desktop {
 
     /// App exit: stop everything, forget the session, stop the local workspace.
     pub async fn shutdown(&self) {
+        let _ = self.shutdown_confirmed().await;
+    }
+
+    pub async fn shutdown_confirmed(&self) -> bool {
         self.close_session().await;
         if let Some(h) = &self.cfg.local {
-            h.shutdown().await;
+            h.shutdown_confirmed().await
+        } else {
+            true
         }
     }
 

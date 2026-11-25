@@ -556,10 +556,10 @@ async fn update_settings(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
         Err(e) => return error_response(&e),
     };
     match updater(&ctx) {
-        Some(u) => {
-            u.set_auto_check(s.auto_check);
-            update_view(&ctx, u)
-        }
+        Some(u) => match u.set_auto_check(s.auto_check) {
+            Ok(()) => update_view(&ctx, u),
+            Err(r) => refusal(r),
+        },
         None => unavailable(),
     }
 }

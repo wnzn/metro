@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use metro_release::fetch::{AsyncFetcher, CheckOutcome, Source};
-use metro_release::{Channel, Offer, ReleaseVerifier, Version};
+use metro_release::{Channel, ReleaseVerifier, VerifiedRelease, Version};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -47,6 +47,7 @@ pub fn now_ms() -> i64 {
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Settings {
     pub version: u32,
     pub auto_check: bool,
@@ -91,8 +92,12 @@ pub struct Status {
     /// `never`, `up_to_date`, `available`, `error`.
     pub last_result: Option<String>,
     pub error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anomaly: Option<String>,
     pub highest_seen: Option<String>,
     pub latest: Option<LatestInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<metro_release::release::Evidence>,
     /// No automatic or manual check before this (rate limit), ms.
     pub not_before: Option<i64>,
     pub last_update: Option<LastUpdate>,
@@ -160,6 +165,8 @@ struct Inner {
     /// The staged version and its journal id.
     staged: Option<(Version, String)>,
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
+    settings_error: bool,
+    status_error: bool,
 }
 
 /// An error answer for the bridge: HTTP status, stable code, message.
@@ -248,15 +255,14 @@ impl UpdaterConfig {
         let own = Version::parse(env!("CARGO_PKG_VERSION"))?;
         let channel = Channel::current();
         let kind = install::detect(install_dir, &own, channel, trial.as_deref());
+        let dir = desktop_root.join("update");
+        crate::desktop::store::prepare_private_dir(&dir).ok()?;
         let trust = Arc::new(
-            metro_release::trust_refresh::TrustRefresh::new(
-                &desktop_root.join("update").join("trust-cache"),
-            )
-            .ok()?,
+            metro_release::trust_refresh::TrustRefresh::new(&dir.join("trust-cache")).ok()?,
         );
         let verifier: Arc<dyn ReleaseVerifier> = trust.verifier.clone();
         Some(UpdaterConfig {
-            dir: desktop_root.join("update"),
+            dir,
             install_dir: install_dir.to_path_buf(),
             own,
             channel,
@@ -277,34 +283,137 @@ pub struct Updater {
     apply_tx: tokio::sync::watch::Sender<Option<ApplyRequest>>,
 }
 
-fn read_json<T: for<'de> Deserialize<'de>>(path: &Path) -> Option<T> {
-    let raw = std::fs::read(path).ok()?;
-    if raw.len() > 512 * 1024 {
-        return None;
+fn read_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+    limit: usize,
+) -> std::io::Result<Option<T>> {
+    use std::io::{ErrorKind, Read};
+    let f = match install::open_input(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut raw = Vec::new();
+    f.take((limit + 1) as u64).read_to_end(&mut raw)?;
+    if raw.len() > limit {
+        return Err(ErrorKind::InvalidData.into());
     }
-    serde_json::from_slice(&raw).ok()
+    serde_json::from_slice(&raw)
+        .map(Some)
+        .map_err(std::io::Error::other)
+}
+
+const STATUS_LIMIT: usize =
+    4 * (metro_release::MAX_MANIFEST + metro_release::MAX_BUNDLE) + 512 * 1024;
+
+fn offered(status: &Status, own: Version, target: Version) -> bool {
+    target > own
+        && status.highest_seen.as_deref().and_then(Version::parse) == Some(target)
+        && status
+            .latest
+            .as_ref()
+            .is_some_and(|l| Version::parse(&l.version) == Some(target))
+        && status.evidence.is_some()
+}
+
+fn latest_info(
+    release: &VerifiedRelease,
+    notes: Option<String>,
+    notes_truncated: bool,
+) -> LatestInfo {
+    LatestInfo {
+        version: release.version.to_string(),
+        commit: release.commit.clone(),
+        signed_at: release.signed_at,
+        notes,
+        notes_truncated,
+        release_url: metro_release::release_url(&release.version),
+    }
+}
+
+enum Checked {
+    NotNewer(Version),
+    Verified(LatestInfo, metro_release::release::Evidence),
+}
+
+struct Download(PathBuf);
+
+impl Drop for Download {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 impl Updater {
     pub fn new(cfg: UpdaterConfig) -> Arc<Updater> {
-        let _ = crate::desktop::store::prepare_private_dir(&cfg.dir);
-        let settings: Settings = read_json(&cfg.dir.join("settings.json")).unwrap_or_default();
-        let mut status: Status = read_json(&cfg.dir.join("status.json")).unwrap_or_default();
+        let private = crate::desktop::store::prepare_private_dir(&cfg.dir).is_ok();
+        let settings = private
+            .then(|| read_json::<Settings>(&cfg.dir.join("settings.json"), 4096))
+            .and_then(Result::ok)
+            .and_then(|s| match s {
+                Some(s) if s.version != 1 => None,
+                s => Some(s.unwrap_or_default()),
+            });
+        let settings_error = settings.is_none();
+        let settings = settings.unwrap_or(Settings {
+            version: 1,
+            auto_check: false,
+        });
+        let saved = private
+            .then(|| read_json::<Status>(&cfg.dir.join("status.json"), STATUS_LIMIT))
+            .and_then(Result::ok)
+            .and_then(|s| match s {
+                Some(s) if s.version != 1 => None,
+                s => Some(s.unwrap_or_default()),
+            });
+        let mut status_error = saved.is_none();
+        let mut status = saved.unwrap_or_default();
         status.version = 1;
+        // Cached display data does not authorize downloads. Reconstruct the
+        // floor and offer from the signed evidence, not the persisted version.
+        if let Some(release) = status
+            .evidence
+            .as_ref()
+            .and_then(|e| e.verify(cfg.verifier.as_ref()).ok())
+        {
+            let version = release.version;
+            let notes = status
+                .latest
+                .take()
+                .filter(|l| l.version == version.to_string());
+            status.highest_seen = Some(version.to_string());
+            if version > cfg.own
+                && cfg.channel == Channel::Release
+                && !matches!(cfg.kind, InstallKind::Unsupported(_))
+            {
+                let truncated = notes.as_ref().is_some_and(|l| l.notes_truncated);
+                status.latest = Some(latest_info(
+                    &release,
+                    notes.and_then(|l| l.notes),
+                    truncated,
+                ));
+            } else {
+                status.last_result = Some("up_to_date".into());
+            }
+        } else {
+            status_error |= status.evidence.is_some();
+            status.evidence = None;
+            status.latest = None;
+            status.highest_seen = None;
+            if status.last_result.as_deref() == Some("available") {
+                status.last_result = None;
+            }
+        }
         // A journal that ended since the last start becomes `last_update`.
-        if let Some(done) = install::take_finished(&cfg.kind, &cfg.dir, &cfg.own) {
+        let finished = install::take_finished(&cfg.kind, &cfg.dir, &cfg.own);
+        let save_finished = finished.is_some();
+        if let Some(done) = finished {
             status.last_update = Some(done);
         }
         // A staged version is offered again while it is still the latest.
         // Otherwise (an older or superseded version) it is deleted.
         let found = install::staged(&cfg.kind, &cfg.dir);
-        let staged = found.clone().filter(|(v, _)| {
-            *v > cfg.own
-                && status
-                    .latest
-                    .as_ref()
-                    .is_some_and(|l| l.version == v.to_string())
-        });
+        let staged = found.clone().filter(|(v, _)| offered(&status, cfg.own, *v));
         if found.is_some() && staged.is_none() {
             install::discard_staged(&cfg.kind, &cfg.dir);
         }
@@ -324,11 +433,16 @@ impl Updater {
                 failure: None,
                 staged,
                 cancel: None,
+                settings_error,
+                status_error,
             }),
             checking: tokio::sync::Mutex::new(()),
             apply_tx,
         });
-        updater.save_status();
+        if save_finished {
+            let mut inner = updater.lock();
+            updater.save_status(&mut inner);
+        }
         updater
     }
 
@@ -364,25 +478,18 @@ impl Updater {
             )
     }
 
-    fn save_status(&self) {
-        let (settings, status) = {
-            let inner = self.lock();
-            (inner.settings.clone(), inner.status.clone())
-        };
-        let _ = install::write_atomic(
-            &self.cfg.dir.join("settings.json"),
-            &serde_json::to_vec(&settings).unwrap_or_default(),
-        );
-        let _ = install::write_atomic(
-            &self.cfg.dir.join("status.json"),
-            &serde_json::to_vec(&status).unwrap_or_default(),
-        );
+    fn save_status(&self, inner: &mut Inner) {
+        inner.status_error = serde_json::to_vec(&inner.status)
+            .map_err(std::io::Error::other)
+            .and_then(|data| install::write_atomic(&self.cfg.dir.join("status.json"), &data))
+            .is_err();
     }
 
     /// Record how the last update ended (the launcher, after a rollback).
     pub fn record_outcome(&self, outcome: LastUpdate) {
-        self.lock().status.last_update = Some(outcome);
-        self.save_status();
+        let mut inner = self.lock();
+        inner.status.last_update = Some(outcome);
+        self.save_status(&mut inner);
     }
 
     /// The `UpdateState` the UI reads (`GET /v1/update`).
@@ -415,9 +522,18 @@ impl Updater {
         if let Some(e) = &inner.status.error {
             v["error"] = e.clone().into();
         }
-        if inner.status.last_result.as_deref() == Some("available")
-            && let Some(l) = &inner.status.latest
-        {
+        if let Some(anomaly) = &inner.status.anomaly {
+            v["anomaly"] = anomaly.clone().into();
+        }
+        if inner.settings_error || inner.status_error {
+            v["persistence_error"] = if inner.settings_error {
+                "settings_io"
+            } else {
+                "status_io"
+            }
+            .into();
+        }
+        if let Some(l) = &inner.status.latest {
             v["latest"] = serde_json::to_value(l).unwrap_or(Value::Null);
         }
         if let Some((done, total)) = inner.progress {
@@ -435,9 +551,19 @@ impl Updater {
         v
     }
 
-    pub fn set_auto_check(&self, on: bool) {
-        self.lock().settings.auto_check = on;
-        self.save_status();
+    pub fn set_auto_check(&self, on: bool) -> Result<(), Refusal> {
+        let mut inner = self.lock();
+        let settings = Settings {
+            version: 1,
+            auto_check: on,
+        };
+        let result = serde_json::to_vec(&settings)
+            .map_err(std::io::Error::other)
+            .and_then(|data| install::write_atomic(&self.cfg.dir.join("settings.json"), &data));
+        inner.settings_error = result.is_err();
+        result.map_err(|_| refuse(500, "io", message_for("io")))?;
+        inner.settings = settings;
+        Ok(())
     }
 
     /// One check. `manual` ignores the 20-hour rule, never the rate-limit wait.
@@ -455,6 +581,9 @@ impl Updater {
         let now = now_ms();
         {
             let mut inner = self.lock();
+            if inner.phase == Phase::Applying {
+                return Err(refuse(409, "busy", "An update is being applied."));
+            }
             if inner.status.not_before.is_some_and(|nb| now < nb) {
                 return Err(refuse(429, "rate_limited", message_for("rate_limited")));
             }
@@ -485,17 +614,50 @@ impl Updater {
             inner.phase = Phase::Idle;
         }
         inner.status.last_checked_at = Some(now_ms());
+        inner.status.anomaly = None;
+        let floor = inner
+            .status
+            .highest_seen
+            .as_deref()
+            .and_then(Version::parse);
         match result {
-            Ok((latest, available, highest)) => {
+            Ok(checked) => {
                 inner.status.error = None;
-                inner.status.last_result =
-                    Some(if available { "available" } else { "up_to_date" }.into());
-                if let Some(h) = highest {
-                    inner.status.highest_seen = Some(h);
+                match checked {
+                    Checked::NotNewer(seen) if floor.is_some_and(|f| seen < f) => {
+                        inner.status.anomaly = Some("older_release_served".into());
+                    }
+                    Checked::NotNewer(_) => {
+                        inner.status.latest = None;
+                    }
+                    Checked::Verified(latest, evidence) => {
+                        let seen =
+                            Version::parse(&latest.version).expect("canonical verified version");
+                        if floor.is_some_and(|f| seen < f) {
+                            inner.status.anomaly = Some("older_release_served".into());
+                        } else if floor == Some(seen)
+                            && inner
+                                .status
+                                .evidence
+                                .as_ref()
+                                .is_some_and(|before| before.manifest != evidence.manifest)
+                        {
+                            inner.status.anomaly = Some("release_changed".into());
+                        } else {
+                            inner.status.highest_seen = Some(latest.version.clone());
+                            inner.status.latest = Some(latest);
+                            inner.status.evidence = Some(evidence);
+                        }
+                    }
                 }
-                if let Some(l) = latest {
-                    inner.status.latest = Some(l);
-                }
+                inner.status.last_result = Some(
+                    if inner.status.latest.is_some() {
+                        "available"
+                    } else {
+                        "up_to_date"
+                    }
+                    .into(),
+                );
             }
             Err(e) => {
                 inner.status.last_result = Some("error".into());
@@ -505,20 +667,33 @@ impl Updater {
                 }
             }
         }
-        drop(inner);
-        self.save_status();
+        let superseded = inner
+            .staged
+            .as_ref()
+            .is_some_and(|(v, _)| !offered(&inner.status, self.cfg.own, *v));
+        if superseded {
+            inner.staged = None;
+            if inner.phase == Phase::Ready {
+                inner.phase = Phase::Idle;
+            }
+        }
+        self.save_status(&mut inner);
+        if superseded {
+            install::discard_staged(&self.cfg.kind, &self.cfg.dir);
+        }
+        if inner.status_error {
+            return Err(refuse(500, "io", message_for("io")));
+        }
         Ok(())
     }
 
-    async fn check_inner(
-        &self,
-    ) -> Result<(Option<LatestInfo>, bool, Option<String>), metro_release::Error> {
+    async fn check_inner(&self) -> Result<Checked, metro_release::Error> {
         let fetcher = AsyncFetcher::new(self.cfg.source.clone(), Duration::from_secs(60))?;
         match fetcher
             .check(self.cfg.verifier.as_ref(), &self.cfg.own)
             .await?
         {
-            CheckOutcome::NotNewer { .. } => Ok((None, false, None)),
+            CheckOutcome::NotNewer { latest } => Ok(Checked::NotNewer(latest)),
             CheckOutcome::Newer(release) => {
                 let highest = self
                     .lock()
@@ -526,31 +701,18 @@ impl Updater {
                     .highest_seen
                     .as_deref()
                     .and_then(Version::parse);
-                match metro_release::version::offer(
-                    &self.cfg.own,
-                    self.cfg.channel,
+                let v = release.version;
+                let notes = if highest.is_none_or(|f| v >= f) {
+                    fetcher.notes(&v).await
+                } else {
+                    None
+                };
+                let info = latest_info(
                     &release,
-                    highest.as_ref(),
-                ) {
-                    Offer::Available(v) => {
-                        let notes = fetcher.notes(&v).await;
-                        let info = LatestInfo {
-                            version: v.to_string(),
-                            signed_at: release.signed_at,
-                            commit: release.commit.clone(),
-                            notes: notes.as_ref().map(|n| n.body.clone()),
-                            notes_truncated: notes.as_ref().is_some_and(|n| n.truncated),
-                            release_url: metro_release::release_url(&v),
-                        };
-                        Ok((Some(info), true, Some(v.to_string())))
-                    }
-                    _ => {
-                        eprintln!(
-                            "metro-desktop: a release older than one verified before was served as latest; ignored"
-                        );
-                        Ok((None, false, None))
-                    }
-                }
+                    notes.as_ref().map(|n| n.body.clone()),
+                    notes.as_ref().is_some_and(|n| n.truncated),
+                );
+                Ok(Checked::Verified(info, release.evidence))
             }
         }
     }
@@ -586,15 +748,12 @@ impl Updater {
             ));
         }
         let mut inner = self.lock();
-        let latest = inner.status.latest.as_ref().map(|l| l.version.clone());
-        if inner.status.last_result.as_deref() != Some("available")
-            || latest.as_deref() != Some(version)
-        {
-            return Err(refuse(409, "not_latest", message_for("not_latest")));
-        }
         let Some(target) = Version::parse(version) else {
             return Err(refuse(400, "bad_request", "version must be X.Y.Z"));
         };
+        if !offered(&inner.status, self.cfg.own, target) || inner.status_error {
+            return Err(refuse(409, "not_latest", message_for("not_latest")));
+        }
         match inner.phase {
             Phase::Downloading
             | Phase::Verifying
@@ -621,9 +780,14 @@ impl Updater {
             inner.cancel = None;
             inner.progress = None;
             match result {
-                Ok(id) => {
+                Ok(id) if offered(&inner.status, me.cfg.own, target) && !inner.status_error => {
                     inner.phase = Phase::Ready;
                     inner.staged = Some((target, id));
+                }
+                Ok(_) => {
+                    inner.phase = Phase::Idle;
+                    inner.staged = None;
+                    install::discard_staged(&me.cfg.kind, &me.cfg.dir);
                 }
                 Err(f) => {
                     eprintln!("metro-desktop: update to {target} failed: {}", f.code);
@@ -663,6 +827,26 @@ impl Updater {
             .fetch_release(self.cfg.verifier.as_ref(), &target)
             .await
             .map_err(|e| release_error(&e))?;
+        let current_offer = |inner: &Inner| {
+            offered(&inner.status, self.cfg.own, target)
+                && !inner.status_error
+                && inner
+                    .status
+                    .evidence
+                    .as_ref()
+                    .is_some_and(|e| e.manifest == release.evidence.manifest)
+        };
+        let not_latest = || Failure {
+            code: "not_latest".into(),
+            message: message_for("not_latest").into(),
+        };
+        let io = || Failure {
+            code: "io".into(),
+            message: message_for("io").into(),
+        };
+        if !current_offer(&self.lock()) {
+            return Err(not_latest());
+        }
         let name = match &self.cfg.kind {
             InstallKind::LinuxInstaller { .. } => release.desktop_linux(),
             InstallKind::WindowsScript { .. } => release.desktop_windows_zip(),
@@ -674,12 +858,12 @@ impl Updater {
                 });
             }
         };
-        let dl = self.cfg.dir.join("dl").join(target.to_string());
-        let _ = std::fs::remove_dir_all(self.cfg.dir.join("dl"));
-        std::fs::create_dir_all(&dl).map_err(|_| Failure {
-            code: "io".into(),
-            message: message_for("io").into(),
-        })?;
+        let dl = self
+            .cfg
+            .dir
+            .join(format!(".download-{}", install::new_id()));
+        install::private_mkdir(&dl).map_err(|_| io())?;
+        let dl = Download(dl);
         let url = fetcher
             .source
             .asset_url(&target, &name)
@@ -688,7 +872,7 @@ impl Updater {
         let progress = move |done: u64, total: u64| {
             me.lock().progress = Some((done, total));
         };
-        let dest = dl.join(&name);
+        let dest = dl.0.join(&name);
         let (digest, part) = fetcher
             .download(&url, &dest, metro_release::MAX_ARCHIVE, &progress)
             .await
@@ -715,14 +899,19 @@ impl Updater {
                 .check_archive_signature(self.cfg.verifier.as_ref(), &name, &digest, &bundle)
                 .map_err(|e| release_error(&e))?;
         }
-        std::fs::rename(&part, &dest).map_err(|_| Failure {
-            code: "io".into(),
-            message: message_for("io").into(),
-        })?;
+        // Serialize publication with checks, so a newly checked version can
+        // never be superseded by an older download finishing late.
+        let _check = self.checking.lock().await;
         if let Some(f) = cancelled() {
             return Err(f);
         }
-        self.lock().phase = Phase::Staging;
+        {
+            let mut inner = self.lock();
+            if !current_offer(&inner) {
+                return Err(not_latest());
+            }
+            inner.phase = Phase::Staging;
+        }
         let kind = self.cfg.kind.clone();
         let (dir, install_dir, own, ldd) = (
             self.cfg.dir.clone(),
@@ -731,24 +920,12 @@ impl Updater {
             self.cfg.ldd.clone(),
         );
         let staged = tokio::task::spawn_blocking(move || {
-            install::stage(
-                &kind,
-                &dir,
-                &install_dir,
-                &own,
-                &target,
-                (&dest, &digest),
-                &ldd,
-            )
+            // Keep the private download alive even if the caller is dropped.
+            let _download = dl;
+            install::stage(&kind, &dir, &install_dir, &own, &release, &part, &ldd)
         })
         .await
-        .map_err(|_| Failure {
-            code: "io".into(),
-            message: message_for("io").into(),
-        })?;
-        if !matches!(self.cfg.kind, InstallKind::WindowsMsi { .. }) {
-            let _ = std::fs::remove_dir_all(self.cfg.dir.join("dl"));
-        }
+        .map_err(|_| io())?;
         staged.map_err(|e| Failure {
             message: e.message.clone(),
             code: e.code.to_string(),
@@ -779,6 +956,9 @@ impl Updater {
         confirm_interrupt: bool,
         busy: Busy,
     ) -> Result<(), Refusal> {
+        let Ok(_check) = self.checking.try_lock() else {
+            return Err(refuse(409, "busy", "A check is already running."));
+        };
         let mut inner = self.lock();
         let Some((staged, id)) = inner.staged.clone() else {
             return Err(refuse(
@@ -787,7 +967,11 @@ impl Updater {
                 "The update isn't downloaded and verified yet.",
             ));
         };
-        if inner.phase != Phase::Ready || staged.to_string() != version {
+        if inner.phase != Phase::Ready
+            || staged.to_string() != version
+            || !offered(&inner.status, self.cfg.own, staged)
+            || inner.status_error
+        {
             return Err(refuse(
                 409,
                 "not_ready",
@@ -815,11 +999,75 @@ impl Updater {
         self.apply_tx.subscribe()
     }
 
+    /// Revalidate the exact staged package after the launcher has stopped
+    /// local work and taken the installer lock.
+    pub fn verify_apply(
+        &self,
+        req: &ApplyRequest,
+        lock: &install::Lock,
+    ) -> std::io::Result<(Journal, install::CheckedFile)> {
+        use std::io::{Error, ErrorKind};
+        let invalid = || {
+            Error::new(
+                ErrorKind::InvalidData,
+                "the update is no longer staged and offered",
+            )
+        };
+        let manifest = {
+            let inner = self.lock();
+            if inner.phase != Phase::Applying
+                || inner.status_error
+                || !offered(&inner.status, self.cfg.own, req.version)
+                || inner.staged.as_ref() != Some(&(req.version, req.journal_id.clone()))
+            {
+                return Err(invalid());
+            }
+            inner
+                .status
+                .evidence
+                .as_ref()
+                .ok_or_else(invalid)?
+                .manifest
+                .clone()
+        };
+        let path = install::journal_path(&self.cfg.kind, &self.cfg.dir).ok_or_else(invalid)?;
+        let j = install::load_journal(&path)?
+            .filter(|j| {
+                j.phase == "staged"
+                    && j.id == req.journal_id
+                    && j.from == self.cfg.own.to_string()
+                    && j.to == req.version.to_string()
+            })
+            .ok_or_else(invalid)?;
+        let file = install::verify_staged(
+            &self.cfg.kind,
+            &self.cfg.dir,
+            &j,
+            self.cfg.verifier.as_ref(),
+            Some(&manifest),
+            lock,
+        )?;
+        Ok((j, file))
+    }
+
     /// `POST /v1/update/started`: the UI rendered (trial health signal).
     pub fn started(&self) -> bool {
-        match &self.cfg.trial {
-            Some(id) => install::mark_trial_ok(&self.cfg.dir, id).is_ok(),
-            None => false,
-        }
+        let Some(id) = &self.cfg.trial else {
+            return false;
+        };
+        let Some(path) = install::journal_path(&self.cfg.kind, &self.cfg.dir) else {
+            return false;
+        };
+        install::read_journal(&path).is_some_and(|j| {
+            j.phase == "trial"
+                && j.id == *id
+                && j.to == self.cfg.own.to_string()
+                && j.watchdog_pid.is_some_and(install::pid_alive)
+                && self
+                    .cfg
+                    .kind
+                    .root()
+                    .is_none_or(|root| install::script_state(root, &j.from))
+        }) && install::mark_trial_ok(&self.cfg.dir, id).is_ok()
     }
 }

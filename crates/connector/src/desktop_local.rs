@@ -247,19 +247,34 @@ impl LocalServer {
         }
     }
 
-    async fn shutdown_inner(&self) {
+    async fn shutdown_inner(&self) -> bool {
         self.shared.closing.store(true, Ordering::SeqCst);
         let mut slot = self.shared.running.lock().await;
         self.shared.set_current(None);
-        if let Some(running) = slot.take() {
+        if let Some(running) = slot.as_ref() {
             let child = running.child.clone();
-            drop(running); // token wiped, lock released after the stop below
-            let _ = tokio::task::spawn_blocking(move || child.stop(STOP_GRACE)).await;
+            let stopped = tokio::task::spawn_blocking(move || {
+                child.stop(STOP_GRACE);
+                child
+                    .child
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .try_wait()
+                    .is_ok_and(|s| s.is_some())
+            })
+            .await
+            .unwrap_or(false);
+            if !stopped {
+                self.shared.set_state(LocalState::Failed);
+                return false;
+            }
+            drop(slot.take());
         }
         // The app is closing: nothing calls the local address any more.
         drop(lock(&self.shared.lease).take());
         self.shared.set_state(LocalState::Stopped);
         self.shared.closing.store(false, Ordering::SeqCst);
+        true
     }
 
     async fn start(&self) -> Result<Running, SafeError> {
@@ -446,6 +461,12 @@ impl LocalWorkspaceHost for LocalServer {
     }
 
     fn shutdown(&self) -> BoxFut<'_, ()> {
+        Box::pin(async {
+            let _ = self.shutdown_inner().await;
+        })
+    }
+
+    fn shutdown_confirmed(&self) -> BoxFut<'_, bool> {
         Box::pin(self.shutdown_inner())
     }
 

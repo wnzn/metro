@@ -15,7 +15,7 @@ use std::time::Duration;
 use metro_connector::desktop::bridge;
 use metro_connector::desktop::core::{Desktop, DesktopConfig};
 use metro_connector::desktop::update::apply::{self, TrialOutcome, TrialPaths};
-use metro_connector::desktop::update::install::{self, InstallKind, Journal};
+use metro_connector::desktop::update::install::{self, InstallKind, Journal, JournalPhase};
 use metro_connector::desktop::update::{Busy, Updater, UpdaterConfig};
 use metro_release::fetch::Source;
 use metro_release::testing::{FixtureRelease, TestVerifier, release_json, tar_gz};
@@ -127,11 +127,16 @@ fn install() -> Install {
     let root = dir.path().join("metro-desktop-app");
     let install_dir = root.join("versions").join(OLD);
     exec_file(&install_dir.join("Metro"), b"#!/bin/sh\n");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    }
     fs::write(install_dir.join(install::LOCAL_RUNNER_MARKER), b"").unwrap();
     fs::write(root.join(install::MARKER), b"managed").unwrap();
     install::set_pointer(&root, OLD).unwrap();
     let desktop_root = dir.path().join("desktop");
     fs::create_dir_all(desktop_root.join("local/db")).unwrap();
+    metro_connector::desktop::store::prepare_private_dir(&desktop_root.join("update")).unwrap();
     fs::write(
         desktop_root.join("local/db/metro.sqlite3"),
         b"original database",
@@ -220,13 +225,12 @@ fn detection() {
         id: "abcdef0123456789".into(),
         from: OLD.into(),
         to: NEW.into(),
-        phase: "trial".into(),
+        phase: JournalPhase::Trial,
         outcome: None,
         detail: None,
         local_db_snapshot: false,
-        msi: None,
-        sha256: None,
         watchdog_pid: None,
+        source_pid: None,
         reported: false,
         started_at: 0,
     };
@@ -356,7 +360,7 @@ async fn refusals_and_schedule_rules() {
     u.check(true).await.unwrap();
     assert!(f.hits.load(Ordering::SeqCst) > after_first);
     // The switch persists.
-    u.set_auto_check(false);
+    u.set_auto_check(false).unwrap();
     let u2 = updater(&i, &f, Channel::Release);
     assert_eq!(u2.state(Busy::default())["auto_check"], false);
 
@@ -455,13 +459,12 @@ fn staged_journal(i: &Install) -> Journal {
         id: "0123456789abcdef".into(),
         from: OLD.into(),
         to: NEW.into(),
-        phase: "staged".into(),
+        phase: JournalPhase::Staged,
         outcome: None,
         detail: None,
         local_db_snapshot: false,
-        msi: None,
-        sha256: None,
         watchdog_pid: None,
+        source_pid: None,
         reported: false,
         started_at: 0,
     };
@@ -511,11 +514,12 @@ async fn trial_confirmed_commits() {
     let mut j = staged_journal(&i);
     let p = paths(&i);
     fs::create_dir_all(&p.update_dir).unwrap();
-    apply::begin_trial(&p, &mut j).unwrap();
+    let lock = install::Lock::take(&p.root).unwrap();
+    apply::begin_trial(&p, &mut j, &lock).unwrap();
     assert!(j.local_db_snapshot);
     let exe = trial_stub(&i, &p.update_dir, &j.id, "printf ok > '$OK'\nsleep 5");
     let mut child = apply::spawn_trial(&exe, &j.id).unwrap();
-    let out = apply::watch_trial(&p, &mut j, &mut child, Duration::from_secs(10)).await;
+    let out = apply::watch_trial(&p, &mut j, &lock, &mut child, Duration::from_secs(10)).await;
     assert_eq!(out, TrialOutcome::Committed);
     assert_eq!(install::read_pointer(&i.root).as_deref(), Some(NEW));
     let jj = install::read_journal(&i.root.join(install::JOURNAL)).unwrap();
@@ -524,6 +528,7 @@ async fn trial_confirmed_commits() {
         ("committed", Some("updated"))
     );
     let _ = child.kill().await;
+    drop(lock);
     // The next start of the new version reports and cleans up.
     let new = Version::parse(NEW).unwrap();
     let done = install::take_finished(
@@ -538,7 +543,10 @@ async fn trial_confirmed_commits() {
         (done.from.as_str(), done.to.as_str(), done.outcome.as_str()),
         (OLD, NEW, "updated")
     );
-    assert!(!i.root.join("versions").join(OLD).exists());
+    assert!(
+        i.root.join("versions").join(OLD).exists(),
+        "the last known-good copy is kept"
+    );
     assert!(!p.update_dir.join("db-snapshot").exists());
 }
 
@@ -549,14 +557,16 @@ async fn trial_crash_rolls_back_and_restores_the_database() {
     let mut j = staged_journal(&i);
     let p = paths(&i);
     fs::create_dir_all(&p.update_dir).unwrap();
-    apply::begin_trial(&p, &mut j).unwrap();
+    let lock = install::Lock::take(&p.root).unwrap();
+    apply::begin_trial(&p, &mut j, &lock).unwrap();
     let exe = trial_stub(&i, &p.update_dir, &j.id, "exit 3");
     let mut child = apply::spawn_trial(&exe, &j.id).unwrap();
-    let out = apply::watch_trial(&p, &mut j, &mut child, Duration::from_secs(10)).await;
+    let out = apply::watch_trial(&p, &mut j, &lock, &mut child, Duration::from_secs(10)).await;
     assert_eq!(out, TrialOutcome::RolledBack("exited with 3".into()));
     assert_eq!(install::read_pointer(&i.root).as_deref(), Some(OLD));
     assert_eq!(db(&i), before, "database restored byte for byte");
     assert!(!i.root.join("versions").join(NEW).exists());
+    drop(lock);
     let own = Version::parse(OLD).unwrap();
     let done = install::take_finished(
         &InstallKind::LinuxInstaller {
@@ -576,10 +586,11 @@ async fn trial_timeout_kills_and_rolls_back() {
     let mut j = staged_journal(&i);
     let p = paths(&i);
     fs::create_dir_all(&p.update_dir).unwrap();
-    apply::begin_trial(&p, &mut j).unwrap();
+    let lock = install::Lock::take(&p.root).unwrap();
+    apply::begin_trial(&p, &mut j, &lock).unwrap();
     let exe = trial_stub(&i, &p.update_dir, &j.id, "exec sleep 60");
     let mut child = apply::spawn_trial(&exe, &j.id).unwrap();
-    let out = apply::watch_trial(&p, &mut j, &mut child, Duration::from_millis(800)).await;
+    let out = apply::watch_trial(&p, &mut j, &lock, &mut child, Duration::from_millis(800)).await;
     assert!(matches!(out, TrialOutcome::RolledBack(_)));
     assert!(child.try_wait().unwrap().is_some(), "the trial was killed");
     assert_eq!(install::read_pointer(&i.root).as_deref(), Some(OLD));
@@ -593,11 +604,12 @@ async fn trial_closed_at_once_is_not_committed() {
     let mut j = staged_journal(&i);
     let p = paths(&i);
     fs::create_dir_all(&p.update_dir).unwrap();
-    apply::begin_trial(&p, &mut j).unwrap();
+    let lock = install::Lock::take(&p.root).unwrap();
+    apply::begin_trial(&p, &mut j, &lock).unwrap();
     let exe = trial_stub(&i, &p.update_dir, &j.id, "exit 0");
     let mut child = apply::spawn_trial(&exe, &j.id).unwrap();
     assert_eq!(
-        apply::watch_trial(&p, &mut j, &mut child, Duration::from_secs(10)).await,
+        apply::watch_trial(&p, &mut j, &lock, &mut child, Duration::from_secs(10)).await,
         TrialOutcome::NotConfirmed
     );
     assert_eq!(install::read_pointer(&i.root).as_deref(), Some(OLD));
@@ -627,7 +639,7 @@ fn msi_install_failed_keeps_and_restores_the_snapshot() {
     .unwrap();
     let mut j = staged_journal(&i);
     let _ = fs::remove_file(i.root.join(install::JOURNAL));
-    j.phase = "failed".into();
+    j.phase = JournalPhase::Failed;
     j.outcome = Some("install_failed".into());
     j.local_db_snapshot = true;
     install::write_journal(&update_dir.join(install::MSI_JOURNAL), &j).unwrap();
@@ -655,7 +667,7 @@ fn msi_install_failed_keeps_and_restores_the_snapshot() {
     assert!(!update_dir.join("helper-0123456789abcdef").exists());
     // A successful MSI update drops the snapshot at once.
     install::snapshot_db(&i.desktop_root, &update_dir).unwrap();
-    j.phase = "committed".into();
+    j.phase = JournalPhase::Committed;
     j.outcome = Some("updated".into());
     j.reported = false;
     install::write_journal(&update_dir.join(install::MSI_JOURNAL), &j).unwrap();
@@ -671,22 +683,69 @@ fn msi_install_failed_keeps_and_restores_the_snapshot() {
 #[test]
 fn msi_is_hashed_again_before_it_runs() {
     let i = install();
-    let msi = i.desktop_root.join("Metro.msi");
-    fs::write(&msi, b"verified installer").unwrap();
-    let mut j = staged_journal(&i);
-    j.msi = Some(msi.clone());
-    assert!(install::verified_msi(&j).is_err(), "no recorded hash");
-    j.sha256 = Some(metro_release::hex(&metro_release::sha256(
-        b"verified installer",
-    )));
-    assert_eq!(install::verified_msi(&j).unwrap(), msi);
+    let j = staged_journal(&i);
+    let update_dir = i.desktop_root.join("update");
+    let assets = update_dir.join(format!("stage-{}", j.id));
+    fs::create_dir_all(&assets).unwrap();
+    install::write_journal(&update_dir.join(install::MSI_JOURNAL), &j).unwrap();
+    let fixture = release(desktop_archive(NEW, "desktop"));
+    let manifest = &fixture.files["SHA256SUMS"];
+    let bundle = &fixture.files["SHA256SUMS.sigstore.json"];
+    let release = metro_release::release::verify_manifest(&TestVerifier, manifest, bundle).unwrap();
+    let msi = assets.join("package.msi");
+    fs::write(&msi, &fixture.files[&release.msi]).unwrap();
+    let lock = install::Lock::take(&update_dir).unwrap();
+    let kind = InstallKind::WindowsMsi {
+        dir: i.install_dir.clone(),
+    };
+    let verify =
+        || install::verify_staged(&kind, &update_dir, &j, &TestVerifier, Some(manifest), &lock);
+    assert!(verify().is_err(), "no signed evidence");
+    fs::write(assets.join("SHA256SUMS"), manifest).unwrap();
+    fs::write(assets.join("SHA256SUMS.sigstore.json"), bundle).unwrap();
+    assert_eq!(verify().unwrap().path, msi);
     fs::write(&msi, b"swapped installer").unwrap();
-    assert_eq!(
-        install::verified_msi(&j).unwrap_err(),
-        "the downloaded installer changed after it was verified"
-    );
+    assert!(verify().is_err(), "changed installer");
     fs::remove_file(&msi).unwrap();
-    assert!(install::verified_msi(&j).is_err());
+    assert!(verify().is_err(), "missing installer");
+}
+
+#[test]
+fn interrupted_msi_recovery_keeps_failed_restore_retryable() {
+    let i = install();
+    let original = db(&i);
+    let dir = i.desktop_root.join("update");
+    let path = dir.join(install::MSI_JOURNAL);
+    let old = Version::parse(OLD).unwrap();
+    let new = Version::parse(NEW).unwrap();
+    let mut j = staged_journal(&i);
+    j.phase = JournalPhase::Installing;
+    j.local_db_snapshot = install::snapshot_db(&i.desktop_root, &dir).unwrap();
+    j.source_pid = Some(100);
+    j.watchdog_pid = Some(101);
+    install::write_journal(&path, &j).unwrap();
+    fs::write(
+        i.desktop_root.join("local/db/metro.sqlite3"),
+        b"trial output",
+    )
+    .unwrap();
+    let snapshot = dir.join("db-snapshot/metro.sqlite3-wal");
+    let saved = fs::read(&snapshot).unwrap();
+    fs::remove_file(&snapshot).unwrap();
+    assert!(install::recover_msi(&i.desktop_root, &dir, &old).is_err());
+    let failed = install::read_journal(&path).unwrap();
+    assert_eq!(failed.phase, JournalPhase::Failed);
+    assert!(failed.local_db_snapshot);
+    assert_eq!(db(&i).0, b"trial output");
+    install::recover_msi(&i.desktop_root, &dir, &new).unwrap();
+    assert!(
+        dir.join("db-snapshot").is_dir(),
+        "the new version cannot consume the old backup"
+    );
+    fs::write(snapshot, saved).unwrap();
+    install::recover_msi(&i.desktop_root, &dir, &old).unwrap();
+    assert_eq!(db(&i), original);
+    assert!(!install::read_journal(&path).unwrap().local_db_snapshot);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -704,22 +763,193 @@ async fn a_staged_version_no_longer_offered_is_deleted() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn backwards_check_preserves_the_offer_but_manual_upgrade_invalidates_it() {
+    let i = install();
+    let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
+    let u = updater(&i, &f, Channel::Release);
+    u.check(true).await.unwrap();
+    u.start_download(NEW).unwrap();
+    assert_eq!(until_settled(&u).await["phase"], "ready");
+    *f.files.lock().unwrap() = FixtureRelease::new(OLD, BTreeMap::new()).files;
+    u.check(true).await.unwrap();
+    let state = u.state(Busy::default());
+    assert_eq!(state["latest"]["version"], NEW);
+    assert_eq!(state["result"], "available");
+    assert_eq!(state["anomaly"], "older_release_served");
+    assert_eq!(state["phase"], "ready");
+    drop(u);
+
+    // A manual update moved the pointer but left the old cached check and
+    // stage intact. Neither can authorize a reinstall of the running build.
+    install::set_pointer(&i.root, NEW).unwrap();
+    let own = Version::parse(NEW).unwrap();
+    let mut newer = i;
+    newer.install_dir = newer.root.join("versions").join(NEW);
+    let dir = newer.desktop_root.join("update");
+    let u = Updater::new(UpdaterConfig {
+        dir,
+        install_dir: newer.install_dir.clone(),
+        own,
+        channel: Channel::Release,
+        kind: install::detect(&newer.install_dir, &own, Channel::Release, None),
+        source: Source::loopback_fixture(&f.base).unwrap(),
+        verifier: Arc::new(TestVerifier),
+        trial: None,
+        ldd: newer.ldd.clone(),
+        trust: None,
+    });
+    assert!(u.state(Busy::default())["latest"].is_null());
+    assert_eq!(u.start_download(NEW).unwrap_err().code, "not_latest");
+    assert!(u.request_apply(NEW, true, Busy::default()).is_err());
+    assert!(newer.install_dir.join("Metro").is_file());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn resumed_apply_requires_signed_evidence_and_every_staged_file() {
+    let i = install();
+    let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
+    let u = updater(&i, &f, Channel::Release);
+    u.check(true).await.unwrap();
+    u.start_download(NEW).unwrap();
+    assert_eq!(until_settled(&u).await["phase"], "ready");
+    drop(u);
+
+    let u = updater(&i, &f, Channel::Release);
+    let rx = u.apply_requests();
+    u.request_apply(NEW, true, Busy::default()).unwrap();
+    let req = rx.borrow().clone().unwrap();
+    let lock = install::Lock::take(&i.root).unwrap();
+    u.verify_apply(&req, &lock).unwrap();
+    let stage = i.root.join("versions").join(NEW);
+    let app_file = stage.join("ui/Metro");
+    let original = fs::read(&app_file).unwrap();
+    fs::write(&app_file, b"changed after staging").unwrap();
+    assert!(u.verify_apply(&req, &lock).is_err());
+    fs::write(&app_file, original).unwrap();
+    let assets = i
+        .desktop_root
+        .join("update")
+        .join(format!("stage-{}", req.journal_id));
+    let package = assets.join("package.tar.gz");
+    let archive = fs::read(&package).unwrap();
+    fs::write(&package, b"not the authenticated archive").unwrap();
+    assert!(u.verify_apply(&req, &lock).is_err());
+    fs::write(&package, archive).unwrap();
+    fs::write(assets.join("SHA256SUMS.sigstore.json"), b"changed proof").unwrap();
+    assert!(u.verify_apply(&req, &lock).is_err());
+    assert_eq!(install::read_pointer(&i.root).as_deref(), Some(OLD));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupted_settings_stay_off_and_failed_writes_are_reported() {
+    let i = install();
+    let f = serve(BTreeMap::new(), vec![]);
+    let dir = i.desktop_root.join("update");
+    fs::create_dir_all(&dir).unwrap();
+    let settings = dir.join("settings.json");
+    fs::write(&settings, b"{no").unwrap();
+    let u = updater(&i, &f, Channel::Release);
+    let state = u.state(Busy::default());
+    assert_eq!(state["auto_check"], false);
+    assert_eq!(state["persistence_error"], "settings_io");
+    assert_eq!(fs::read(&settings).unwrap(), b"{no");
+    fs::remove_file(&settings).unwrap();
+    fs::create_dir(&settings).unwrap();
+    assert_eq!(u.set_auto_check(true).unwrap_err().status, 500);
+    assert_eq!(u.state(Busy::default())["auto_check"], false);
+    assert!(settings.is_dir());
+    fs::remove_dir(&settings).unwrap();
+    u.set_auto_check(true).unwrap();
+    assert_eq!(u.state(Busy::default())["auto_check"], true);
+    assert!(u.state(Busy::default())["persistence_error"].is_null());
+}
+
+#[test]
+fn failed_restore_keeps_the_snapshot_and_blocks_the_old_version_until_retry() {
+    let i = install();
+    let before = db(&i);
+    let mut j = staged_journal(&i);
+    let p = paths(&i);
+    fs::create_dir_all(&p.update_dir).unwrap();
+    let lock = install::Lock::take(&p.root).unwrap();
+    apply::begin_trial(&p, &mut j, &lock).unwrap();
+    drop(lock);
+    let snap = p.update_dir.join("db-snapshot/metro.sqlite3-wal");
+    let saved = fs::read(&snap).unwrap();
+    fs::remove_file(&snap).unwrap();
+    fs::write(
+        i.desktop_root.join("local/db/metro.sqlite3"),
+        b"trial output",
+    )
+    .unwrap();
+    let old = Version::parse(OLD).unwrap();
+    assert_eq!(
+        install::recover(&p.root, &p.desktop_root, &p.update_dir, &old),
+        install::Recovery::Blocked
+    );
+    assert_eq!(
+        install::read_journal(&p.root.join(install::JOURNAL))
+            .unwrap()
+            .phase,
+        JournalPhase::RollingBack
+    );
+    assert_eq!(db(&i).0, b"trial output", "no partial restoration");
+    assert!(snap.parent().unwrap().join("metro.sqlite3").is_file());
+    assert!(p.root.join("versions").join(NEW).is_dir());
+    fs::write(&snap, saved).unwrap();
+    assert_eq!(
+        install::recover(&p.root, &p.desktop_root, &p.update_dir, &old),
+        install::Recovery::RolledBack
+    );
+    assert_eq!(db(&i), before);
+}
+
+#[test]
+fn unknown_or_foreign_journal_is_never_consumed() {
+    let i = install();
+    let mut j = staged_journal(&i);
+    let p = paths(&i);
+    let path = p.root.join(install::JOURNAL);
+    let old = Version::parse(OLD).unwrap();
+    for raw in [
+        br#"{"version":99,"id":"01","phase":"trial"}"#.as_slice(),
+        br#"{"version":1,"id":"../../outside","from":"0.9.0","to":"0.9.1","phase":"trial","started_at":0}"#,
+        br#"{"version":1,"id":"0123456789abcdef","from":"0.9.1","to":"0.9.0","phase":"trial","started_at":0}"#,
+    ] {
+        fs::write(&path, raw).unwrap();
+        assert_eq!(install::recover(&p.root, &p.desktop_root, &p.update_dir, &old), install::Recovery::Blocked);
+        assert_eq!(fs::read(&path).unwrap(), raw);
+    }
+    j.phase = JournalPhase::Trial;
+    install::write_journal(&path, &j).unwrap();
+    install::set_pointer(&p.root, "0.9.2").unwrap();
+    assert_eq!(
+        install::recover(&p.root, &p.desktop_root, &p.update_dir, &old),
+        install::Recovery::Blocked
+    );
+    assert_eq!(install::read_journal(&path), Some(j));
+    assert_eq!(install::read_pointer(&p.root).as_deref(), Some("0.9.2"));
+}
+
 #[test]
 fn a_trial_with_a_live_watchdog_is_left_alone() {
     let i = install();
     let mut j = staged_journal(&i);
     let p = paths(&i);
     fs::create_dir_all(&p.update_dir).unwrap();
-    apply::begin_trial(&p, &mut j).unwrap();
+    let lock = install::Lock::take(&p.root).unwrap();
+    apply::begin_trial(&p, &mut j, &lock).unwrap();
     assert_eq!(j.watchdog_pid, Some(std::process::id()));
     assert!(install::trial_in_progress(&i.root));
     // A second start of the old version while the trial runs: no rollback.
     let old = Version::parse(OLD).unwrap();
     assert_eq!(
         install::recover(&i.root, &i.desktop_root, &p.update_dir, &old),
-        install::Recovery::Nothing
+        install::Recovery::Blocked
     );
     assert!(i.root.join("versions").join(NEW).join("Metro").is_file());
+    drop(lock);
     // Once the watchdog is gone, the same state is an interrupted update.
     j.watchdog_pid = Some(i32::MAX as u32 - 1);
     install::write_journal(&i.root.join(install::JOURNAL), &j).unwrap();
@@ -735,13 +965,14 @@ fn a_trial_with_a_live_watchdog_is_left_alone() {
 fn recovery_after_interruptions() {
     let old = Version::parse(OLD).unwrap();
     let new = Version::parse(NEW).unwrap();
+    use JournalPhase::*;
     for (phase, pointer, running, expect_pointer, expect) in [
-        ("staged", OLD, &old, OLD, install::Recovery::Nothing),
-        ("trial", OLD, &old, OLD, install::Recovery::RolledBack),
-        ("committing", OLD, &old, OLD, install::Recovery::RolledBack),
-        ("committing", NEW, &old, OLD, install::Recovery::RolledBack),
-        ("committing", OLD, &new, NEW, install::Recovery::Committed),
-        ("committing", NEW, &new, NEW, install::Recovery::Committed),
+        (Staged, OLD, &old, OLD, install::Recovery::Nothing),
+        (Trial, OLD, &old, OLD, install::Recovery::RolledBack),
+        (Committing, OLD, &old, OLD, install::Recovery::RolledBack),
+        (Committing, NEW, &old, OLD, install::Recovery::RolledBack),
+        (Committing, OLD, &new, NEW, install::Recovery::Committed),
+        (Committing, NEW, &new, NEW, install::Recovery::Committed),
     ] {
         let i = install();
         let before = db(&i);
@@ -749,28 +980,29 @@ fn recovery_after_interruptions() {
         let p = paths(&i);
         fs::create_dir_all(&p.update_dir).unwrap();
         if phase != "staged" {
-            apply::begin_trial(&p, &mut j).unwrap();
+            let lock = install::Lock::take(&p.root).unwrap();
+            apply::begin_trial(&p, &mut j, &lock).unwrap();
             fs::write(i.desktop_root.join("local/db/metro.sqlite3"), b"migrated").unwrap();
         }
-        j.phase = phase.into();
+        j.phase = phase;
         // The process that was watching has crashed.
         j.watchdog_pid = j.watchdog_pid.map(|_| i32::MAX as u32 - 1);
         install::write_journal(&i.root.join(install::JOURNAL), &j).unwrap();
         install::set_pointer(&i.root, pointer).unwrap();
         let r = install::recover(&i.root, &i.desktop_root, &p.update_dir, running);
-        assert_eq!(r, expect, "{phase} {pointer} {running}");
+        assert_eq!(r, expect, "{phase:?} {pointer} {running}");
         assert_eq!(
             install::read_pointer(&i.root).as_deref(),
             Some(expect_pointer),
-            "{phase} {pointer} {running}"
+            "{phase:?} {pointer} {running}"
         );
         let target = i.root.join("versions").join(expect_pointer);
         assert!(
             target.join("Metro").is_file(),
-            "pointer names a missing version: {phase}"
+            "pointer names a missing version: {phase:?}"
         );
         if expect == install::Recovery::RolledBack {
-            assert_eq!(db(&i), before, "{phase}");
+            assert_eq!(db(&i), before, "{phase:?}");
             assert!(!i.root.join("versions").join(NEW).exists());
         }
     }
@@ -893,10 +1125,15 @@ async fn bridge_update_endpoints() {
 async fn trial_started_writes_the_ok_file() {
     let i = install();
     let f = serve(BTreeMap::new(), vec![]);
-    let own = Version::parse(OLD).unwrap();
+    let own = Version::parse(NEW).unwrap();
+    let mut j = staged_journal(&i);
+    j.id = "00112233aabbccdd".into();
+    j.phase = JournalPhase::Trial;
+    j.watchdog_pid = Some(std::process::id());
+    install::write_journal(&i.root.join(install::JOURNAL), &j).unwrap();
     let u = Updater::new(UpdaterConfig {
         dir: i.desktop_root.join("update"),
-        install_dir: i.install_dir.clone(),
+        install_dir: i.root.join("versions").join(NEW),
         own,
         channel: Channel::Release,
         kind: InstallKind::LinuxInstaller {

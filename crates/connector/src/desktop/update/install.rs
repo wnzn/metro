@@ -11,11 +11,11 @@
 //! the MSI's own transaction replaces the files.
 
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
-use metro_release::archive::{Expect, extract_tar_gz};
-use metro_release::{Channel, Version};
+use metro_release::archive::{self, Expect, HashingReader};
+use metro_release::{Channel, ReleaseVerifier, VerifiedRelease, Version};
 use serde::{Deserialize, Serialize};
 
 use super::{LastUpdate, now_ms};
@@ -122,7 +122,8 @@ pub fn detect(
 /// `current.txt`).
 pub fn read_pointer(root: &Path) -> Option<String> {
     if cfg!(windows) {
-        let raw = fs::read_to_string(root.join("current.txt")).ok()?;
+        let raw = read_evidence_file(&root.join("current.txt"), 128).ok()?;
+        let raw = std::str::from_utf8(&raw).ok()?;
         let v = raw.trim().to_string();
         Version::parse(&v).map(|_| v)
     } else {
@@ -135,18 +136,21 @@ pub fn read_pointer(root: &Path) -> Option<String> {
 
 /// Point the install at `version` with one atomic rename.
 pub fn set_pointer(root: &Path, version: &str) -> io::Result<()> {
+    if Version::parse(version).is_none() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
     if cfg!(windows) {
         write_atomic(&root.join("current.txt"), version.as_bytes())
     } else {
         #[cfg(unix)]
         {
-            let tmp = root.join(".current.new");
-            let _ = fs::remove_file(&tmp);
+            let tmp = root.join(format!(".current.{}", new_id()));
             std::os::unix::fs::symlink(Path::new("versions").join(version), &tmp)?;
-            fs::rename(&tmp, root.join("current"))?;
-            if let Ok(d) = fs::File::open(root) {
-                let _ = d.sync_all();
-            }
+            let path = root.join("current");
+            fs::rename(&tmp, &path).inspect_err(|_| {
+                let _ = fs::remove_file(&tmp);
+            })?;
+            metro_release::sync_parent(&path)?;
         }
         Ok(())
     }
@@ -154,47 +158,93 @@ pub fn set_pointer(root: &Path, version: &str) -> io::Result<()> {
 
 /// Write a file atomically (temp, fsync, rename).
 pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    use std::io::Write;
-    let name = path
-        .file_name()
-        .unwrap_or_default()
-        .to_string_lossy()
-        .to_string();
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    let mut f = fs::File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    drop(f);
-    fs::rename(&tmp, path).inspect_err(|_| {
-        let _ = fs::remove_file(&tmp);
-    })
+    metro_release::write_atomic(path, bytes)
+}
+
+/// Open the regular file itself, never a symlink, junction, pipe or device.
+/// Windows also denies new conflicting writes and renames while held.
+pub fn open_input(path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.share_mode(1).custom_flags(0x0020_0000); // FILE_SHARE_READ, OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & 0x400 != 0 {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+    }
+    Ok(file)
 }
 
 // ---- the journal ----
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JournalPhase {
+    Staged,
+    Trial,
+    Installing,
+    Committing,
+    RollingBack,
+    Committed,
+    Failed,
+}
+
+impl JournalPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Staged => "staged",
+            Self::Trial => "trial",
+            Self::Installing => "installing",
+            Self::Committing => "committing",
+            Self::RollingBack => "rolling_back",
+            Self::Committed => "committed",
+            Self::Failed => "failed",
+        }
+    }
+}
+
+impl PartialEq<&str> for JournalPhase {
+    fn eq(&self, other: &&str) -> bool {
+        self.as_str() == *other
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Journal {
     pub version: u32,
     pub id: String,
     pub from: String,
     pub to: String,
-    /// `staged`, `trial`, `committing`, `committed`, `failed`.
-    pub phase: String,
+    pub phase: JournalPhase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub outcome: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
     #[serde(default)]
     pub local_db_snapshot: bool,
-    /// MSI: the verified MSI and the helper copy.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub msi: Option<PathBuf>,
-    /// MSI: the verified file's SHA-256, checked again just before msiexec.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sha256: Option<String>,
     /// The watchdog (old launcher) during a trial.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub watchdog_pid: Option<u32>,
+    /// MSI only: the old launcher must exit before msiexec can replace it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_pid: Option<u32>,
     /// An outcome kept for later (MSI snapshot) was already shown once.
     #[serde(default)]
     pub reported: bool,
@@ -202,14 +252,64 @@ pub struct Journal {
 }
 
 pub fn read_journal(path: &Path) -> Option<Journal> {
-    let raw = fs::read(path).ok()?;
-    if raw.len() > 64 * 1024 {
-        return None;
+    load_journal(path).ok().flatten()
+}
+
+pub fn valid_id(id: &str) -> bool {
+    id.len() == 16 && id.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+impl Journal {
+    fn valid(&self, msi: bool) -> bool {
+        let phase = self.phase.as_str();
+        let outcome = match phase {
+            "failed" => matches!(
+                self.outcome.as_deref(),
+                Some("rolled_back" | "not_confirmed" | "install_failed")
+            ),
+            "committed" => self.outcome.as_deref() == Some("updated"),
+            "staged" | "trial" | "committing" | "rolling_back" | "installing" => {
+                self.outcome.is_none()
+            }
+            _ => false,
+        };
+        self.version == 1
+            && valid_id(&self.id)
+            && matches!((Version::parse(&self.from), Version::parse(&self.to)), (Some(a), Some(b)) if a < b)
+            && outcome
+            && self.watchdog_pid != Some(0)
+            && self.source_pid != Some(0)
+            && (phase != "staged" || (!self.local_db_snapshot && self.watchdog_pid.is_none()))
+            && (msi || (phase != "installing" && self.source_pid.is_none()))
+            && (!msi || !matches!(phase, "committing" | "rolling_back"))
+            && (!msi
+                || !matches!(phase, "installing" | "trial")
+                || (self.source_pid.is_some() && self.watchdog_pid.is_some()))
     }
-    serde_json::from_slice(&raw).ok()
+}
+
+pub fn load_journal(path: &Path) -> io::Result<Option<Journal>> {
+    let f = match open_input(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let mut raw = Vec::new();
+    f.take(64 * 1024 + 1).read_to_end(&mut raw)?;
+    if raw.len() > 64 * 1024 {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let j: Journal = serde_json::from_slice(&raw).map_err(io::Error::other)?;
+    if !j.valid(path.file_name() == Some(MSI_JOURNAL.as_ref())) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(Some(j))
 }
 
 pub fn write_journal(path: &Path, j: &Journal) -> io::Result<()> {
+    if !j.valid(path.file_name() == Some(MSI_JOURNAL.as_ref())) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
     write_atomic(path, &serde_json::to_vec(j).map_err(io::Error::other)?)
 }
 
@@ -224,7 +324,7 @@ pub fn journal_path(kind: &InstallKind, update_dir: &Path) -> Option<PathBuf> {
     }
 }
 
-fn new_id() -> String {
+pub(super) fn new_id() -> String {
     let mut b = [0u8; 8];
     let _ = getrandom_fill(&mut b);
     b.iter().map(|x| format!("{x:02x}")).collect()
@@ -258,17 +358,21 @@ pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Op
     // The MSI journal, whichever way this version was installed (the person
     // may reinstall the previous version from the ZIP).
     let msi_path = update_dir.join(MSI_JOURNAL);
-    if let Some(mut j) =
-        read_journal(&msi_path).filter(|j| matches!(j.phase.as_str(), "committed" | "failed"))
+    if let Ok(_lock) = Lock::take(update_dir)
+        && let Some(mut j) =
+            read_journal(&msi_path).filter(|j| matches!(j.phase.as_str(), "committed" | "failed"))
+        && (own_s == j.from || own_s == j.to)
     {
         let keep = j.outcome.as_deref() == Some("install_failed") && j.local_db_snapshot;
         if keep && own_s == j.from {
             // The previous version is back: so is the data from before the update.
-            let restored = restore_db(desktop_root, update_dir).is_ok();
-            discard_msi(update_dir);
-            let detail =
-                restored.then(|| "Your data from before the update was restored.".to_string());
-            result = Some(last(&j, detail));
+            if restore_db(desktop_root, update_dir).is_ok() {
+                discard_msi(update_dir, &j);
+                result = Some(last(
+                    &j,
+                    Some("Your data from before the update was restored.".to_string()),
+                ));
+            }
         } else if keep {
             // Keep the snapshot until the previous version starts again.
             if !j.reported {
@@ -277,18 +381,27 @@ pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Op
                 result = Some(last(&j, None));
             }
         } else {
-            discard_msi(update_dir);
+            discard_msi(update_dir, &j);
             result = Some(last(&j, None));
         }
     }
-    if let Some(root) = kind.root() {
+    if let Some(root) = kind.root()
+        && let Ok(_lock) = Lock::take(root)
+        && script_state(root, &own_s)
+    {
         let path = root.join(JOURNAL);
         if let Some(j) =
             read_journal(&path).filter(|j| matches!(j.phase.as_str(), "committed" | "failed"))
+            && ((j.phase == "committed" && own_s == j.to)
+                || (j.phase == "failed" && own_s == j.from))
         {
-            let _ = fs::remove_file(&path);
-            let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
-            cleanup_versions(root, own);
+            if fs::remove_file(&path).is_ok() {
+                let _ = metro_release::sync_parent(&path);
+                if j.local_db_snapshot {
+                    let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
+                }
+                let _ = fs::remove_dir_all(stage_assets(update_dir, &j.id));
+            }
             result = result.or(Some(last(&j, None)));
         }
     }
@@ -296,16 +409,15 @@ pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Op
 }
 
 /// Remove an MSI update's journal, snapshot, download and helper copies.
-fn discard_msi(update_dir: &Path) {
-    let _ = fs::remove_file(update_dir.join(MSI_JOURNAL));
-    let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
-    let _ = fs::remove_dir_all(update_dir.join("dl"));
-    if let Ok(entries) = fs::read_dir(update_dir) {
-        for e in entries.flatten() {
-            if e.file_name().to_string_lossy().starts_with("helper-") {
-                let _ = fs::remove_dir_all(e.path());
-            }
+fn discard_msi(update_dir: &Path, j: &Journal) {
+    let journal = update_dir.join(MSI_JOURNAL);
+    if fs::remove_file(&journal).is_ok() {
+        let _ = metro_release::sync_parent(&journal);
+        if j.local_db_snapshot {
+            let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
         }
+        let _ = fs::remove_dir_all(stage_assets(update_dir, &j.id));
+        let _ = fs::remove_dir_all(update_dir.join(format!("helper-{}", j.id))); // legacy layout
     }
 }
 
@@ -316,39 +428,79 @@ pub fn discard_staged(kind: &InstallKind, update_dir: &Path) {
     let Some(path) = journal_path(kind, update_dir) else {
         return;
     };
+    let Ok(_lock) = Lock::take(lock_root(kind, update_dir)) else {
+        return;
+    };
     let Some(j) = read_journal(&path).filter(|j| j.phase == "staged") else {
         return;
     };
     match kind {
         InstallKind::LinuxInstaller { root } | InstallKind::WindowsScript { root } => {
-            if read_pointer(root).as_deref() != Some(j.to.as_str())
-                && Version::parse(&j.to).is_some()
-            {
-                let _ = fs::remove_dir_all(root.join("versions").join(&j.to));
+            if script_state(root, &j.from) {
+                let dest = root.join("versions").join(&j.to);
+                if plain_dir(&dest) {
+                    let _ = fs::remove_dir_all(dest);
+                }
+                let _ = fs::remove_dir_all(stage_assets(update_dir, &j.id));
+                let _ = fs::remove_file(&path);
             }
-            let _ = fs::remove_file(&path);
         }
-        InstallKind::WindowsMsi { .. } => discard_msi(update_dir),
+        InstallKind::WindowsMsi { .. } => discard_msi(update_dir, &j),
         _ => {}
     }
-}
-
-/// MSI: the staged file, if it still has the verified SHA-256.
-pub fn verified_msi(j: &Journal) -> Result<PathBuf, &'static str> {
-    let msi = j.msi.clone().ok_or("no installer recorded")?;
-    let want = j.sha256.as_deref().ok_or("no installer hash recorded")?;
-    let have =
-        metro_release::archive::sha256_file(&msi).map_err(|_| "the installer can't be read")?;
-    if metro_release::hex(&have) != want {
-        return Err("the downloaded installer changed after it was verified");
-    }
-    Ok(msi)
 }
 
 /// A trial whose watchdog is still alive.
 pub fn trial_in_progress(root: &Path) -> bool {
     read_journal(&root.join(JOURNAL))
         .is_some_and(|j| j.phase == "trial" && j.watchdog_pid.is_some_and(pid_alive))
+}
+
+pub fn msi_in_progress(update_dir: &Path) -> bool {
+    read_journal(&update_dir.join(MSI_JOURNAL)).is_some_and(|j| {
+        matches!(j.phase.as_str(), "installing" | "trial") && j.watchdog_pid.is_some_and(pid_alive)
+    })
+}
+
+#[cfg(windows)]
+pub fn msi_registered_dir(own: &Version) -> Option<PathBuf> {
+    msi::registered_dir(own)
+}
+
+/// Recover a helper that stopped in the middle of an MSI update. Never
+/// automatically downgrade; restore data only when the old version is back.
+pub fn recover_msi(desktop_root: &Path, update_dir: &Path, own: &Version) -> io::Result<()> {
+    let path = update_dir.join(MSI_JOURNAL);
+    if load_journal(&path)?.is_none() {
+        return Ok(());
+    }
+    let _lock = Lock::take(update_dir).map_err(|e| io::Error::other(e.message))?;
+    let Some(mut j) = load_journal(&path)? else {
+        return Ok(());
+    };
+    let version = own.to_string();
+    if version != j.from && version != j.to {
+        return Ok(()); // unrelated version; never consume its snapshot
+    }
+    if matches!(j.phase.as_str(), "installing" | "trial") {
+        if j.phase == "trial" && version == j.to && trial_ok(update_dir, &j.id) {
+            j.phase = JournalPhase::Committed;
+            j.outcome = Some("updated".into());
+        } else {
+            j.phase = JournalPhase::Failed;
+            j.outcome = Some("install_failed".into());
+            j.detail = Some("The installer was interrupted.".into());
+        }
+        write_journal(&path, &j)?;
+    }
+    if j.phase == "failed" && j.local_db_snapshot && j.from == version {
+        restore_db(desktop_root, update_dir)?;
+        j.local_db_snapshot = false;
+        j.detail = Some("Your data from before the update was restored.".into());
+        write_journal(&path, &j)?;
+        let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
+    }
+    Ok(())
 }
 
 /// A staged update waiting for its restart.
@@ -360,39 +512,241 @@ pub fn staged(kind: &InstallKind, update_dir: &Path) -> Option<(Version, String)
     let v = Version::parse(&j.to)?;
     let present = match kind {
         InstallKind::LinuxInstaller { root } | InstallKind::WindowsScript { root } => {
-            root.join("versions").join(&j.to).join(LAUNCHER).is_file()
+            script_state(root, &j.from) && version_present(root, &j.to)
         }
-        InstallKind::WindowsMsi { .. } => j.msi.as_ref().is_some_and(|m| m.is_file()),
+        InstallKind::WindowsMsi { .. } => {
+            open_input(&stage_assets(update_dir, &j.id).join("package.msi")).is_ok()
+        }
         _ => false,
     };
     present.then_some((v, j.id))
 }
 
-/// Remove every `versions/*` except `keep`, and leftover `.stage.*`/`.old.*`.
-pub fn cleanup_versions(root: &Path, keep: &Version) {
-    let keep = keep.to_string();
-    let pointer = read_pointer(root);
-    if let Ok(entries) = fs::read_dir(root.join("versions")) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name != keep && Some(&name) != pointer.as_ref() {
-                let _ = fs::remove_dir_all(e.path());
-            }
-        }
+fn stage_assets(update_dir: &Path, id: &str) -> PathBuf {
+    debug_assert!(valid_id(id));
+    update_dir.join(format!("stage-{id}"))
+}
+
+fn package_name(kind: &InstallKind) -> &'static str {
+    match kind {
+        InstallKind::LinuxInstaller { .. } => "package.tar.gz",
+        InstallKind::WindowsScript { .. } => "package.zip",
+        _ => "package.msi",
     }
-    if let Ok(entries) = fs::read_dir(root) {
-        for e in entries.flatten() {
-            let name = e.file_name().to_string_lossy().to_string();
-            if name.starts_with(".stage.") || name.starts_with(".old.") {
-                let _ = fs::remove_dir_all(e.path());
-            }
-        }
+}
+
+fn asset_name(kind: &InstallKind, release: &VerifiedRelease) -> Result<String, StageError> {
+    match kind {
+        InstallKind::LinuxInstaller { .. } => Ok(release.desktop_linux()),
+        InstallKind::WindowsScript { .. } => Ok(release.desktop_windows_zip()),
+        InstallKind::WindowsMsi { .. } => Ok(release.msi.clone()),
+        _ => Err(stage_err("not_in_app")),
     }
+}
+
+fn expect<'a>(kind: &InstallKind, target: &'a Version) -> Expect<'a> {
+    Expect {
+        kind: "desktop",
+        target: if matches!(kind, InstallKind::WindowsScript { .. }) {
+            "windows-x64"
+        } else {
+            "linux-x64"
+        },
+        version: target,
+    }
+}
+
+fn archive_err(e: metro_release::Error) -> StageError {
+    let code = if e.code == metro_release::ErrorCode::NotVerified {
+        "not_verified"
+    } else {
+        "archive"
+    };
+    stage_err(code)
+}
+
+fn read_evidence_file(path: &Path, cap: usize) -> io::Result<Vec<u8>> {
+    let mut data = Vec::new();
+    open_input(path)?
+        .take((cap + 1) as u64)
+        .read_to_end(&mut data)?;
+    if data.len() > cap {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(data)
+}
+
+/// Authenticated staged package/launcher. The caller keeps the file open
+/// through use. In particular, Windows uses a deny-write/delete handle on
+/// the MSI for the entire msiexec call and on the launcher through spawn.
+pub struct CheckedFile {
+    pub path: PathBuf,
+    pub file: fs::File,
+    #[cfg(windows)]
+    _parents: Vec<fs::File>,
+}
+
+pub fn verify_staged(
+    kind: &InstallKind,
+    update_dir: &Path,
+    j: &Journal,
+    verifier: &dyn ReleaseVerifier,
+    offer_manifest: Option<&[u8]>,
+    lock: &Lock,
+) -> io::Result<CheckedFile> {
+    let no = || {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "staged update no longer verifies",
+        )
+    };
+    lock.check(lock_root(kind, update_dir))?;
+    let path = journal_path(kind, update_dir).ok_or_else(no)?;
+    if load_journal(&path)?.as_ref() != Some(j) {
+        return Err(no());
+    }
+    let version = Version::parse(&j.to).ok_or_else(no)?;
+    let assets = stage_assets(update_dir, &j.id);
+    if !plain_dir(&assets) {
+        return Err(no());
+    }
+    let manifest = read_evidence_file(&assets.join("SHA256SUMS"), metro_release::MAX_MANIFEST)?;
+    if offer_manifest.is_some_and(|m| m != manifest) {
+        return Err(no());
+    }
+    let bundle = read_evidence_file(
+        &assets.join("SHA256SUMS.sigstore.json"),
+        metro_release::MAX_BUNDLE,
+    )?;
+    let release = metro_release::release::verify_manifest(verifier, &manifest, &bundle)
+        .map_err(io::Error::other)?;
+    if release.version != version {
+        return Err(no());
+    }
+    let name = asset_name(kind, &release).map_err(|_| no())?;
+    let digest = release.sha256_of(&name).map_err(io::Error::other)?;
+    let package = assets.join(package_name(kind));
+    #[cfg(windows)]
+    let package_parents = archive::pin_windows_dirs(&assets)?;
+    let mut input = open_input(&package)?;
+    let Some(root) = kind.root() else {
+        if !matches!(kind, InstallKind::WindowsMsi { .. })
+            || !matches!(j.phase.as_str(), "staged" | "installing")
+            || HashingReader::new(&input)
+                .finish()
+                .map_err(io::Error::other)?
+                != digest
+        {
+            return Err(no());
+        }
+        return Ok(CheckedFile {
+            path: package,
+            file: input,
+            #[cfg(windows)]
+            _parents: package_parents,
+        });
+    };
+    ensure_script_transition(root, j, &["staged"])?;
+    let top = metro_release::manifest::archive_top(&name).ok_or_else(no)?;
+    let expect = expect(kind, &version);
+    let tree = if name.ends_with(".zip") {
+        // The Windows input handle excludes in-place writes and deletion.
+        use std::io::{Seek, SeekFrom};
+        if HashingReader::new(&input)
+            .finish()
+            .map_err(io::Error::other)?
+            != digest
+        {
+            return Err(no());
+        }
+        input.seek(SeekFrom::Start(0))?;
+        archive::inspect_zip(&mut input, top, &expect).map_err(io::Error::other)?
+    } else {
+        let mut input = HashingReader::new(input);
+        let tree = archive::inspect_tar_gz(&mut input, top, &expect).map_err(io::Error::other)?;
+        if input.finish().map_err(io::Error::other)? != digest {
+            return Err(no());
+        }
+        tree
+    };
+    let staged = root.join("versions").join(&j.to);
+    let launcher = staged.join(LAUNCHER);
+    #[cfg(windows)]
+    let launcher_parents = archive::pin_windows_dirs(&staged)?;
+    let file = open_input(&launcher)?;
+    archive::verify_tree(&staged, &tree, &[LOCAL_RUNNER_MARKER]).map_err(io::Error::other)?;
+    if tree.files.get(LAUNCHER)
+        != Some(
+            &HashingReader::new(&file)
+                .finish()
+                .map_err(io::Error::other)?,
+        )
+    {
+        return Err(no());
+    }
+    Ok(CheckedFile {
+        path: launcher,
+        file,
+        #[cfg(windows)]
+        _parents: launcher_parents,
+    })
+}
+
+/// Make and verify a fresh private helper from this installation's own
+/// launcher. It is not taken from unauthenticated journal fields.
+pub fn prepare_msi_helper(
+    update_dir: &Path,
+    j: &Journal,
+    source: &Path,
+    lock: &Lock,
+) -> io::Result<CheckedFile> {
+    lock.check(update_dir)?;
+    if j.phase != "staged" || load_journal(&update_dir.join(MSI_JOURNAL))?.as_ref() != Some(j) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let assets = stage_assets(update_dir, &j.id);
+    if !plain_dir(&assets) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let input = open_input(source)?;
+    let mut read = HashingReader::new(input);
+    let dir = assets.join(format!("helper-{}", new_id()));
+    private_mkdir(&dir)?;
+    #[cfg(windows)]
+    let parents = archive::pin_windows_dirs(&dir)?;
+    let path = dir.join("metro-update-helper.exe");
+    let mut output = fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .open(&path)?;
+    io::copy(
+        &mut (&mut read).take(metro_release::MAX_ARCHIVE + 1),
+        &mut output,
+    )?;
+    output.sync_all()?;
+    drop(output);
+    let file = open_input(&path)?;
+    if HashingReader::new(&file)
+        .finish()
+        .map_err(io::Error::other)?
+        != read.finish().map_err(io::Error::other)?
+    {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(CheckedFile {
+        path,
+        file,
+        #[cfg(windows)]
+        _parents: parents,
+    })
 }
 
 // ---- the installers' lock ----
 
-pub struct Lock(PathBuf);
+pub struct Lock {
+    root: PathBuf,
+    handle: fs::File,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StageError {
@@ -408,43 +762,122 @@ fn stage_err(code: &'static str) -> StageError {
 }
 
 impl Lock {
-    /// `mkdir <root>/.lock` with an owner file; a lock this app left behind
-    /// (dead pid, > 10 minutes) is taken over, any other means busy.
+    /// The same kernel lock the manual installers use. Never remove another
+    /// holder's lock, or use wall-clock age to guess that it is free.
     pub fn take(root: &Path) -> Result<Lock, StageError> {
-        let path = root.join(LOCK);
-        for _ in 0..2 {
-            match fs::create_dir(&path) {
-                Ok(()) => {
-                    let owner = serde_json::json!({"pid": std::process::id(), "started_at": now_ms(), "by": "metro-desktop"});
-                    let _ = fs::write(path.join("owner"), owner.to_string());
-                    return Ok(Lock(path));
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    let stale = fs::read(path.join("owner"))
-                        .ok()
-                        .and_then(|r| serde_json::from_slice::<serde_json::Value>(&r).ok())
-                        .is_some_and(|v| {
-                            v["by"] == "metro-desktop"
-                                && now_ms() - v["started_at"].as_i64().unwrap_or(i64::MAX)
-                                    > 10 * 60 * 1000
-                                && !pid_alive(v["pid"].as_u64().unwrap_or(0) as u32)
-                        });
-                    if !stale {
-                        return Err(stage_err("installer_busy"));
-                    }
-                    let _ = fs::remove_dir_all(&path);
-                }
-                Err(_) => return Err(stage_err("io")),
+        if !plain_dir(root) {
+            return Err(stage_err("io"));
+        }
+        #[cfg(unix)]
+        let handle = {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+                .open(root)
+        };
+        #[cfg(windows)]
+        let handle = {
+            use std::os::windows::fs::OpenOptionsExt;
+            let parent = root.parent().ok_or_else(|| stage_err("io"))?;
+            let name = root.file_name().ok_or_else(|| stage_err("io"))?;
+            let path = parent.join(format!(".{}.install.lock", name.to_string_lossy()));
+            fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .custom_flags(0x0020_0000)
+                .share_mode(3)
+                .open(path)
+        };
+        let handle = handle.map_err(|_| stage_err("io"))?;
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if !handle
+                .metadata()
+                .is_ok_and(|m| m.is_file() && m.file_attributes() & 0x400 == 0)
+            {
+                return Err(stage_err("io"));
             }
         }
-        Err(stage_err("installer_busy"))
+        match handle.try_lock() {
+            Ok(()) => {}
+            Err(fs::TryLockError::WouldBlock) => return Err(stage_err("installer_busy")),
+            Err(fs::TryLockError::Error(_)) => return Err(stage_err("io")),
+        }
+        if !matches!(fs::symlink_metadata(root.join(LOCK)), Err(e) if e.kind() == io::ErrorKind::NotFound)
+        {
+            return Err(stage_err("installer_busy"));
+        }
+        let lock = Self {
+            root: root.to_path_buf(),
+            handle,
+        };
+        lock.check(root).map_err(|_| stage_err("installer_busy"))?;
+        Ok(lock)
+    }
+
+    pub fn check(&self, root: &Path) -> io::Result<()> {
+        if self.root != root || !plain_dir(root) {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let held = self.handle.metadata()?;
+            let named = fs::symlink_metadata(root)?;
+            // SAFETY: geteuid has no preconditions.
+            if (held.dev(), held.ino()) != (named.dev(), named.ino())
+                || held.uid() != unsafe { libc::geteuid() }
+                || held.mode() & 0o022 != 0
+            {
+                return Err(io::ErrorKind::InvalidData.into());
+            }
+        }
+        #[cfg(windows)]
+        self.handle.metadata()?;
+        Ok(())
     }
 }
 
 impl Drop for Lock {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        // Unlock this open file description only. A concurrently starting
+        // process can briefly inherit the descriptor before its exec closes
+        // it, and must not accidentally extend the watchdog's lock lifetime.
+        let _ = self.handle.unlock();
     }
+}
+
+fn plain_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| {
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if m.file_attributes() & 0x400 != 0 {
+                return false;
+            }
+        }
+        m.is_dir() && !m.file_type().is_symlink()
+    })
+}
+
+pub fn lock_root<'a>(kind: &'a InstallKind, update_dir: &'a Path) -> &'a Path {
+    kind.root().unwrap_or(update_dir)
+}
+
+pub fn script_state(root: &Path, version: &str) -> bool {
+    fs::symlink_metadata(root.join(MARKER)).is_ok_and(|m| m.is_file())
+        && read_pointer(root).as_deref() == Some(version)
+        && version_present(root, version)
+}
+
+fn version_present(root: &Path, version: &str) -> bool {
+    let versions = root.join("versions");
+    let dir = versions.join(version);
+    plain_dir(&versions) && plain_dir(&dir) && open_input(&dir.join(LAUNCHER)).is_ok()
 }
 
 pub fn pid_alive(pid: u32) -> bool {
@@ -489,117 +922,137 @@ pub fn stage(
     update_dir: &Path,
     install_dir: &Path,
     own: &Version,
-    target: &Version,
-    (download, digest): (&Path, &[u8; 32]),
+    release: &VerifiedRelease,
+    download: &Path,
     ldd: &Path,
 ) -> Result<String, StageError> {
+    let target = &release.version;
+    if target <= own {
+        return Err(stage_err("not_latest"));
+    }
+    let path = journal_path(kind, update_dir).ok_or_else(|| stage_err("not_in_app"))?;
+    let locked_root = lock_root(kind, update_dir);
+    let lock = Lock::take(locked_root)?;
+    let from = own.to_string();
+    if kind.root().is_some_and(|root| {
+        !script_state(root, &from) || install_dir != root.join("versions").join(&from)
+    }) {
+        return Err(stage_err("installer_busy"));
+    }
+    if load_journal(&path)
+        .map_err(|_| stage_err("installer_busy"))?
+        .is_some()
+    {
+        return Err(stage_err("installer_busy"));
+    }
     let id = new_id();
     let journal = Journal {
         version: 1,
         id: id.clone(),
-        from: own.to_string(),
+        from,
         to: target.to_string(),
-        phase: "staged".into(),
+        phase: JournalPhase::Staged,
         outcome: None,
         detail: None,
         local_db_snapshot: false,
-        msi: None,
-        sha256: None,
         watchdog_pid: None,
+        source_pid: None,
         reported: false,
         started_at: now_ms(),
     };
-    match kind {
-        InstallKind::LinuxInstaller { root } | InstallKind::WindowsScript { root } => {
-            let lock = Lock::take(root)?;
-            let stage = root.join(format!(".stage.{id}"));
-            fs::create_dir(&stage).map_err(|_| stage_err("io"))?;
-            let result = (|| {
-                let name = download
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or_default();
-                let top = metro_release::manifest::archive_top(name)
-                    .unwrap_or_default()
-                    .to_string();
-                let target_s = if matches!(kind, InstallKind::WindowsScript { .. }) {
-                    "windows-x64"
-                } else {
-                    "linux-x64"
-                };
-                let expect = Expect {
-                    kind: "desktop",
-                    target: target_s,
-                    version: target,
-                };
-                let to_err = |e: metro_release::Error| StageError {
-                    code: if e.code == metro_release::ErrorCode::NotVerified {
-                        "not_verified"
+    let assets = stage_assets(update_dir, &id);
+    private_mkdir(&assets).map_err(|_| stage_err("io"))?;
+    let result = (|| {
+        let name = asset_name(kind, release)?;
+        let digest = release.sha256_of(&name).map_err(archive_err)?;
+        let package = assets.join(package_name(kind));
+        let mut input = open_input(download).map_err(|_| stage_err("io"))?;
+        let file =
+            archive::private_copy_verified(&mut input, &digest, &package).map_err(archive_err)?;
+        write_atomic(&assets.join("SHA256SUMS"), &release.evidence.manifest)
+            .map_err(|_| stage_err("io"))?;
+        write_atomic(
+            &assets.join("SHA256SUMS.sigstore.json"),
+            &release.evidence.bundle,
+        )
+        .map_err(|_| stage_err("io"))?;
+        match kind {
+            InstallKind::LinuxInstaller { root } | InstallKind::WindowsScript { root } => {
+                let stage = root.join(format!(".stage.{id}"));
+                private_mkdir(&stage).map_err(|_| stage_err("io"))?;
+                let result = (|| {
+                    let top = metro_release::manifest::archive_top(&name)
+                        .ok_or_else(|| stage_err("archive"))?;
+                    let expect = expect(kind, target);
+                    let tree = if name.ends_with(".zip") {
+                        archive::extract_zip(&mut { file }, top, &stage, &expect)
+                            .map_err(archive_err)?
                     } else {
-                        "archive"
-                    },
-                    message: super::message_for("archive").into(),
-                };
-                if name.ends_with(".zip") {
-                    let mut f = fs::File::open(download).map_err(|_| stage_err("io"))?;
-                    metro_release::archive::extract_zip(&mut f, &top, &stage, &expect)
-                        .map_err(to_err)?;
-                } else {
-                    let f = fs::File::open(download).map_err(|_| stage_err("io"))?;
-                    extract_tar_gz(io::BufReader::new(f), &top, &stage, &expect).map_err(to_err)?;
-                }
-                if matches!(kind, InstallKind::LinuxInstaller { .. }) {
-                    let missing = missing_libraries(ldd, &stage);
-                    if !missing.is_empty() {
-                        return Err(StageError {
-                            code: "missing_libraries",
-                            message: format!(
-                                "This version needs system libraries that aren't installed: {}. Install GTK 4, WebKitGTK 6.0 and the GStreamer base plugins with your package manager (for example: sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 gstreamer1.0-plugins-base), then try again.",
-                                missing.join(", ")
-                            ),
-                        });
+                        archive::extract_tar_gz_verified(file, &digest, top, &stage, &expect)
+                            .map_err(archive_err)?
+                    };
+                    if matches!(kind, InstallKind::LinuxInstaller { .. }) {
+                        let missing = missing_libraries(ldd, &stage);
+                        if !missing.is_empty() {
+                            return Err(StageError {
+                                code: "missing_libraries",
+                                message: format!(
+                                    "This version needs system libraries that aren't installed: {}. Install GTK 4, WebKitGTK 6.0 and the GStreamer base plugins with your package manager (for example: sudo apt-get install --no-install-recommends libgtk-4-1 libwebkitgtk-6.0-4 gstreamer1.0-plugins-base), then try again.",
+                                    missing.join(", ")
+                                ),
+                            });
+                        }
                     }
-                }
-                // Keep this computer's local-runner choice.
-                if install_dir.join(LOCAL_RUNNER_MARKER).is_file() {
-                    fs::write(stage.join(LOCAL_RUNNER_MARKER), b"").map_err(|_| stage_err("io"))?;
-                }
-                let dest = root.join("versions").join(target.to_string());
-                if fs::symlink_metadata(&dest).is_ok() {
-                    if read_pointer(root).as_deref() == Some(target.to_string().as_str()) {
+                    // Keep this computer's local-runner choice.
+                    if install_dir.join(LOCAL_RUNNER_MARKER).is_file() {
+                        fs::write(stage.join(LOCAL_RUNNER_MARKER), b"")
+                            .map_err(|_| stage_err("io"))?;
+                    }
+                    let dest = root.join("versions").join(target.to_string());
+                    lock.check(root).map_err(|_| stage_err("installer_busy"))?;
+                    if !script_state(root, &journal.from) {
                         return Err(stage_err("installer_busy"));
                     }
-                    let old = root.join(format!(".old.{id}"));
-                    fs::rename(&dest, &old).map_err(|_| stage_err("io"))?;
-                    let _ = fs::remove_dir_all(&old);
-                }
-                fs::rename(&stage, &dest).map_err(|_| stage_err("io"))?;
-                write_journal(&root.join(JOURNAL), &journal).map_err(|_| stage_err("io"))?;
-                Ok(())
-            })();
-            if result.is_err() {
+                    let moved = match fs::symlink_metadata(&dest) {
+                        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                            fs::rename(&stage, &dest).map_err(|_| stage_err("io"))?;
+                            true
+                        }
+                        Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {
+                            archive::verify_tree(&dest, &tree, &[LOCAL_RUNNER_MARKER])
+                                .map_err(archive_err)?;
+                            false
+                        }
+                        _ => return Err(stage_err("installer_busy")),
+                    };
+                    let published = metro_release::sync_parent(&dest)
+                        .and_then(|()| write_journal(&path, &journal));
+                    if published.is_err() {
+                        // If the journal became visible before a sync error,
+                        // keep both pieces for retry rather than orphaning it.
+                        if moved && matches!(load_journal(&path), Ok(None)) {
+                            let _ = fs::remove_dir_all(&dest);
+                        }
+                        return Err(stage_err("io"));
+                    }
+                    Ok(())
+                })();
                 let _ = fs::remove_dir_all(&stage);
+                result
             }
-            drop(lock);
-            result.map(|_| id)
+            InstallKind::WindowsMsi { .. } => {
+                drop(file);
+                lock.check(locked_root)
+                    .map_err(|_| stage_err("installer_busy"))?;
+                write_journal(&path, &journal).map_err(|_| stage_err("io"))
+            }
+            _ => Err(stage_err("not_in_app")),
         }
-        InstallKind::WindowsMsi { .. } => {
-            // Windows can't replace a running EXE: a helper copy outside the
-            // install folder runs msiexec after this process exits.
-            let helper = update_dir.join(format!("helper-{id}"));
-            fs::create_dir_all(&helper).map_err(|_| stage_err("io"))?;
-            let exe = std::env::current_exe().map_err(|_| stage_err("io"))?;
-            fs::copy(&exe, helper.join("metro-update-helper.exe")).map_err(|_| stage_err("io"))?;
-            let j = Journal {
-                msi: Some(download.to_path_buf()),
-                sha256: Some(metro_release::hex(digest)),
-                ..journal
-            };
-            write_journal(&update_dir.join(MSI_JOURNAL), &j).map_err(|_| stage_err("io"))?;
-            Ok(id)
-        }
-        _ => Err(stage_err("not_in_app")),
+    })();
+    if result.is_err() && matches!(load_journal(&path), Ok(None)) {
+        let _ = fs::remove_dir_all(assets);
     }
+    result.map(|()| id)
 }
 
 /// `ldd` on the launcher, server and UI; the sonames it can't find.
@@ -628,14 +1081,16 @@ pub fn missing_libraries(ldd: &Path, app: &Path) -> Vec<String> {
 }
 
 pub fn mark_trial_ok(update_dir: &Path, id: &str) -> io::Result<()> {
-    if id.is_empty() || !id.bytes().all(|c| c.is_ascii_hexdigit()) {
+    if !valid_id(id) {
         return Err(io::Error::from(io::ErrorKind::InvalidInput));
     }
     write_atomic(&update_dir.join(format!("trial-{id}.ok")), b"ok")
 }
 
 pub fn trial_ok(update_dir: &Path, id: &str) -> bool {
-    update_dir.join(format!("trial-{id}.ok")).is_file()
+    valid_id(id)
+        && read_evidence_file(&update_dir.join(format!("trial-{id}.ok")), 2)
+            .is_ok_and(|raw| raw == b"ok")
 }
 
 // ---- local database snapshot ----
@@ -652,50 +1107,146 @@ fn db_files(desktop_root: &Path) -> Vec<PathBuf> {
 /// Copy the local database aside (the server must be stopped).
 pub fn snapshot_db(desktop_root: &Path, update_dir: &Path) -> io::Result<bool> {
     let snap = update_dir.join("db-snapshot");
-    let _ = fs::remove_dir_all(&snap);
+    if !matches!(fs::symlink_metadata(&snap), Err(e) if e.kind() == io::ErrorKind::NotFound) {
+        return Err(io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "a previous DB snapshot is kept",
+        ));
+    }
     let files = db_files(desktop_root);
-    if !files[0].is_file() {
+    let mut inputs = Vec::new();
+    for path in &files {
+        inputs.push(match open_input(path) {
+            Ok(f) => Some(f),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+            Err(e) => return Err(e),
+        });
+    }
+    if inputs[0].is_none() {
+        if inputs.iter().any(Option::is_some) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "database sidecar without its main file",
+            ));
+        }
         return Ok(false);
     }
-    fs::create_dir_all(&snap)?;
-    for f in files.iter().filter(|f| f.is_file()) {
-        fs::copy(f, snap.join(f.file_name().unwrap_or_default()))?;
+    let tmp = update_dir.join(format!(".snapshot-{}", new_id()));
+    private_mkdir(&tmp)?;
+    let result = (|| {
+        let mut present = [false; 3];
+        for (index, (path, input)) in files.iter().zip(inputs).enumerate() {
+            if let Some(input) = input {
+                copy_synced(input, &tmp.join(path.file_name().unwrap_or_default()))?;
+                present[index] = true;
+            }
+        }
+        write_atomic(
+            &tmp.join("snapshot.json"),
+            &serde_json::to_vec(&present).map_err(io::Error::other)?,
+        )?;
+        metro_release::rename_durable(&tmp, &snap)
+    })();
+    if result.is_err() {
+        let _ = fs::remove_dir_all(&tmp);
     }
-    if let Ok(d) = fs::File::open(&snap) {
-        let _ = d.sync_all();
-    }
+    result?;
     Ok(true)
 }
 
-/// Put the snapshot back byte for byte (removing a newer WAL/SHM).
-pub fn restore_db(desktop_root: &Path, update_dir: &Path) -> io::Result<()> {
-    let snap = update_dir.join("db-snapshot");
-    if !snap.join("metro.sqlite3").is_file() {
-        return Ok(());
+pub fn private_mkdir(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new().mode(0o700).create(path)?;
     }
-    for f in db_files(desktop_root) {
-        let saved = snap.join(f.file_name().unwrap_or_default());
-        if saved.is_file() {
-            let tmp = f.with_extension("restore");
-            fs::copy(&saved, &tmp)?;
-            fs::rename(&tmp, &f)?;
-        } else {
-            let _ = fs::remove_file(&f);
+    #[cfg(windows)]
+    {
+        fs::create_dir(path)?;
+        if let Err(e) = crate::desktop::store::protect_private_dir(path) {
+            let _ = fs::remove_dir(path);
+            return Err(io::Error::other(e));
         }
     }
     Ok(())
 }
 
+fn copy_synced(mut input: fs::File, dest: &Path) -> io::Result<()> {
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options.open(dest)?;
+    io::copy(&mut input, &mut output)?;
+    output.sync_all()
+}
+
+/// Put the snapshot back byte for byte (removing a newer WAL/SHM).
+pub fn restore_db(desktop_root: &Path, update_dir: &Path) -> io::Result<()> {
+    let snap = update_dir.join("db-snapshot");
+    if !plain_dir(&snap) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let mut raw = Vec::new();
+    open_input(&snap.join("snapshot.json"))?
+        .take(128)
+        .read_to_end(&mut raw)?;
+    let present: [bool; 3] = serde_json::from_slice(&raw).map_err(io::Error::other)?;
+    if !present[0] {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let files = db_files(desktop_root);
+    let dir = files[0].parent().ok_or(io::ErrorKind::InvalidData)?;
+    if !plain_dir(dir) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    let tmp = dir.join(format!(".restore-{}", new_id()));
+    private_mkdir(&tmp)?;
+    let result = (|| {
+        // Finish every copy before changing any live filename. The caller
+        // must keep recovery pending and must not open the DB until all
+        // renames/removals and the directory sync succeed.
+        for (path, present) in files.iter().zip(present) {
+            if present {
+                let name = path.file_name().ok_or(io::ErrorKind::InvalidData)?;
+                copy_synced(open_input(&snap.join(name))?, &tmp.join(name))?;
+            }
+        }
+        for (path, present) in files.iter().zip(present).rev() {
+            if present {
+                metro_release::rename_durable(
+                    &tmp.join(path.file_name().ok_or(io::ErrorKind::InvalidData)?),
+                    path,
+                )?;
+            } else {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        metro_release::sync_parent(&files[0])
+    })();
+    let _ = fs::remove_dir_all(&tmp);
+    result
+}
+
 // ---- commit and rollback (script installs) ----
 
 /// Move the pointer (and the menu entry / shortcut) to `j.to`. Idempotent.
-pub fn commit(root: &Path, j: &mut Journal) -> io::Result<()> {
+pub fn commit(root: &Path, j: &mut Journal, lock: &Lock) -> io::Result<()> {
     let path = root.join(JOURNAL);
-    j.phase = "committing".into();
+    lock.check(root)?;
+    ensure_script_transition(root, j, &["trial", "committing"])?;
+    j.phase = JournalPhase::Committing;
     write_journal(&path, j)?;
     set_pointer(root, &j.to)?;
     move_launch_entry(root, &j.from, &j.to);
-    j.phase = "committed".into();
+    j.phase = JournalPhase::Committed;
     j.outcome = Some("updated".into());
     write_journal(&path, j)
 }
@@ -707,20 +1258,48 @@ pub fn rollback(
     desktop_root: &Path,
     update_dir: &Path,
     j: &mut Journal,
+    lock: &Lock,
     outcome: &str,
     detail: Option<String>,
 ) -> io::Result<()> {
-    if read_pointer(root).as_deref() != Some(j.from.as_str()) {
-        set_pointer(root, &j.from)?;
-    }
+    let path = root.join(JOURNAL);
+    lock.check(root)?;
+    ensure_script_transition(root, j, &["trial", "committing", "rolling_back"])?;
+    j.phase = JournalPhase::RollingBack;
+    j.detail = detail;
+    write_journal(&path, j)?;
     if j.local_db_snapshot {
         restore_db(desktop_root, update_dir)?;
     }
-    let _ = fs::remove_dir_all(root.join("versions").join(&j.to));
-    j.phase = "failed".into();
+    // Move the pointer only after the DB is safe. Keep the old executable
+    // and the snapshot until the terminal state is durable.
+    if read_pointer(root).as_deref() != Some(j.from.as_str()) {
+        set_pointer(root, &j.from)?;
+    }
+    j.phase = JournalPhase::Failed;
     j.outcome = Some(outcome.into());
-    j.detail = detail;
-    write_journal(&root.join(JOURNAL), j)
+    write_journal(&path, j)?;
+    let _ = fs::remove_dir_all(root.join("versions").join(&j.to));
+    Ok(())
+}
+
+pub fn ensure_script_transition(root: &Path, j: &Journal, phases: &[&str]) -> io::Result<()> {
+    if !j.valid(false)
+        || !phases.contains(&j.phase.as_str())
+        || load_journal(&root.join(JOURNAL))?.as_ref() != Some(j)
+        || !version_present(root, &j.from)
+        || !version_present(root, &j.to)
+        || !fs::symlink_metadata(root.join(MARKER)).is_ok_and(|m| m.is_file())
+        || !read_pointer(root).is_some_and(|v| {
+            v == j.from || (v == j.to && matches!(j.phase.as_str(), "committing" | "rolling_back"))
+        })
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "update journal does not match this installation",
+        ));
+    }
+    Ok(())
 }
 
 /// What a normal (non-trial) start does with an unfinished journal.
@@ -731,36 +1310,50 @@ pub enum Recovery {
     Committed,
     /// Rolled back an interrupted update.
     RolledBack,
+    /// Cannot safely open the database or install until recovery succeeds.
+    Blocked,
 }
 
 pub fn recover(root: &Path, desktop_root: &Path, update_dir: &Path, own: &Version) -> Recovery {
     let path = root.join(JOURNAL);
-    let Some(mut j) = read_journal(&path) else {
+    if matches!(load_journal(&path), Ok(None)) {
         return Recovery::Nothing;
+    }
+    let Ok(lock) = Lock::take(root) else {
+        return Recovery::Blocked;
+    };
+    let mut j = match load_journal(&path) {
+        Ok(Some(j)) => j,
+        Ok(None) => return Recovery::Nothing,
+        Err(_) => return Recovery::Blocked,
     };
     let own = own.to_string();
     match j.phase.as_str() {
         "committing" if own == j.to => {
-            if commit(root, &mut j).is_ok() {
+            if commit(root, &mut j, &lock).is_ok() {
                 Recovery::Committed
             } else {
-                Recovery::Nothing
+                Recovery::Blocked
             }
         }
-        // A trial whose watchdog still runs is in progress, not interrupted.
-        "trial" if j.watchdog_pid.is_some_and(pid_alive) => Recovery::Nothing,
-        "committing" | "trial" if own == j.from => {
-            // The watchdog is gone (we are a fresh start of the old version).
-            let _ = rollback(
+        "committing" | "trial" | "rolling_back" if own == j.from || own == j.to => {
+            match rollback(
                 root,
                 desktop_root,
                 update_dir,
                 &mut j,
+                &lock,
                 "rolled_back",
                 Some("interrupted".into()),
-            );
-            Recovery::RolledBack
+            ) {
+                Ok(()) => Recovery::RolledBack,
+                Err(e) => {
+                    eprintln!("metro-desktop: update recovery blocked: {e}");
+                    Recovery::Blocked
+                }
+            }
         }
+        "committing" | "trial" | "rolling_back" => Recovery::Blocked,
         _ => Recovery::Nothing,
     }
 }

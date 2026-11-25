@@ -276,17 +276,24 @@ async fn launch(
     let lock = if trial.is_some() {
         update::lock_for_trial(&root).await
     } else {
-        update::wait_for_trial(&dir).await;
+        update::wait_for_trial(&dir, &root).await;
         store::try_lock_instance(&root)
             .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?
     };
     let primary = lock.is_some();
+    if let Some(id) = &trial
+        && (!primary || !update::is_expected_trial(id, &dir, &root))
+    {
+        return Err(start_failed(
+            "this update trial is not the one prepared for this installation".into(),
+        ));
+    }
 
     // Updates: primary instance only. A normal start first finishes or
     // undoes an interrupted update.
     let updater: Option<Arc<Updater>> = if primary {
         if trial.is_none() {
-            update::recover_at_start(&dir, &root);
+            update::recover_at_start(&dir, &root).map_err(start_failed)?;
         }
         UpdaterConfig::for_app(&root, &dir, trial.clone()).map(Updater::new)
     } else {
@@ -426,14 +433,18 @@ async fn launch(
     };
     // The UI is gone: nothing may keep serving on its behalf.
     bridge.stop().await;
-    if tokio::time::timeout(Duration::from_secs(15), desktop.shutdown())
-        .await
-        .is_err()
-    {
+    let stopped = matches!(
+        tokio::time::timeout(Duration::from_secs(15), desktop.shutdown_confirmed()).await,
+        Ok(true)
+    );
+    if !stopped {
         eprintln!("Metro: some on-device work did not stop in time; ending it");
     }
     drop(desktop);
     if let (Some(req), Some(u)) = (apply_request, updater) {
+        if !stopped {
+            return Err((EventKind::LauncherStartFailed, "the update was not started because the local workspace did not stop. Close Metro and try again.".into()));
+        }
         return Ok(match update::apply(&u, req, &root, lock).await {
             update::After::Exit(code) => Launched::Exit(code),
             update::After::Relaunch => Launched::Relaunch,
