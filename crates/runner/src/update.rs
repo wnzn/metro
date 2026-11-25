@@ -390,6 +390,7 @@ pub struct Switch {
     pending: CString,
     pending_bytes: Option<Vec<u8>>,
     exe: Executable,
+    authenticated_tree: Option<metro_release::archive::VerifiedTree>,
     // The strings and the NULL-terminated pointer arrays into them (heap
     // data, so moving the struct keeps the pointers valid).
     _argv: Vec<CString>,
@@ -463,6 +464,7 @@ impl Switch {
             pending_tmp: cpath(&root.join(unique(".update-pending.")))?,
             pending: cpath(&root.join(PENDING))?,
             pending_bytes: pending.map(|p| serde_json::to_vec(p).expect("json")),
+            authenticated_tree: None,
             _argv: argv,
             _envp: envp,
             argv_ptrs,
@@ -513,6 +515,37 @@ impl Switch {
     /// Write pending intent, durably move `current`, and execute the checked
     /// descriptor. If exec fails, the lock is still held during recovery.
     pub fn exec(self) -> io::Error {
+        // Normal self-updates must still match the signed tree immediately
+        // before switching. Prepared rollback and fixture switches use a
+        // separately opened, previously installed version instead.
+        if let Some(tree) = &self.authenticated_tree {
+            let check = || {
+                metro_release::archive::verify_tree(&tree.root, tree, &[]).map_err(from_release)?;
+                let want = tree.files.get(BINARY).ok_or_else(|| {
+                    UpdateError::new("not_verified", "the authenticated tree has no executable")
+                })?;
+                self.exe.verify(want)?;
+                let path = tree.root.join(BINARY);
+                let current = fs::symlink_metadata(path)
+                    .map_err(|e| io_err("io", "rechecking the executable", e))?;
+                let held = self
+                    .exe
+                    .file
+                    .metadata()
+                    .map_err(|e| io_err("io", "rechecking the executable", e))?;
+                if !current.is_file() || (current.dev(), current.ino()) != (held.dev(), held.ino())
+                {
+                    return Err(UpdateError::new(
+                        "not_verified",
+                        "the staged executable was replaced",
+                    ));
+                }
+                Ok(())
+            };
+            if let Err(e) = check() {
+                return io::Error::new(io::ErrorKind::InvalidData, e.detail);
+            }
+        }
         // SAFETY: only libc calls on buffers prepared in `new`; nothing is
         // allocated here, so this is also safe in a forked child.
         unsafe {
@@ -522,6 +555,12 @@ impl Switch {
             let root_fd = self.lock.dir.as_raw_fd();
             let mut wrote = false;
             if let Some(bytes) = &self.pending_bytes {
+                let mut existing = std::mem::MaybeUninit::<libc::stat>::uninit();
+                if libc::lstat(self.pending.as_ptr(), existing.as_mut_ptr()) == 0
+                    || io::Error::last_os_error().kind() != io::ErrorKind::NotFound
+                {
+                    return io::ErrorKind::InvalidData.into();
+                }
                 let fd = libc::open(
                     self.pending_tmp.as_ptr(),
                     libc::O_WRONLY
@@ -819,8 +858,8 @@ impl Updater {
         if lock.owns_path(&self.root) {
             let _ = fs::remove_dir_all(&dl);
         }
-        let (exe, pending) = result?;
-        Switch::with_executable(
+        let (exe, pending, tree) = result?;
+        let mut switch = Switch::with_executable(
             &pending.to,
             &pending.from,
             Some(&pending),
@@ -828,7 +867,9 @@ impl Updater {
             lock,
             exe,
         )
-        .map_err(|e| io_err("io", "preparing the switch", e))
+        .map_err(|e| io_err("io", "preparing the switch", e))?;
+        switch.authenticated_tree = Some(tree);
+        Ok(switch)
     }
 
     fn stage(
@@ -837,7 +878,14 @@ impl Updater {
         name: &str,
         dl: &Path,
         lock: &Lock,
-    ) -> Result<(Executable, PendingFile), UpdateError> {
+    ) -> Result<
+        (
+            Executable,
+            PendingFile,
+            metro_release::archive::VerifiedTree,
+        ),
+        UpdateError,
+    > {
         let url = |n: &str| {
             self.fetcher
                 .source
@@ -880,7 +928,7 @@ impl Updater {
         };
         // Extract from one open handle, proving the bytes read are the
         // verified ones (signed row and the archive's own bundle).
-        let tree = fs::OpenOptions::new()
+        let mut tree = fs::OpenOptions::new()
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
             .open(&part)
@@ -937,7 +985,8 @@ impl Updater {
             rolling_back: false,
         };
         // The switch keeps the installers' lock until the exec itself.
-        Ok((exe, pending))
+        tree.root = dest;
+        Ok((exe, pending, tree))
     }
 }
 

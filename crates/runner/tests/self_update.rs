@@ -299,6 +299,23 @@ fn a_failed_exec_points_current_back() {
 }
 
 #[test]
+fn changing_a_non_executable_after_prepare_refuses_the_switch() {
+    let root = managed_root();
+    let rel = release(runner_archive(NEW, "runner", &stub(0)));
+    let f = serve(rel.files, NEW);
+    let switch = updater(&root.path, &f).prepare(NEW).unwrap();
+    fs::write(
+        root.path.join("versions").join(NEW).join("run-runner"),
+        b"changed",
+    )
+    .unwrap();
+    assert_eq!(switch.exec().kind(), std::io::ErrorKind::InvalidData);
+    assert_eq!(current(&root.path), Path::new("versions/0.9.0"));
+    assert!(!root.path.join(update::PENDING).exists());
+    assert!(update::Lock::take(&root.path).is_ok());
+}
+
+#[test]
 fn failed_rollback_exec_keeps_retry_intent_and_the_previous_copy() {
     let root = managed_root();
     let old = root.path.join("versions").join(OLD).join(update::BINARY);
