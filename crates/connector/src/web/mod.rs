@@ -153,6 +153,9 @@ pub enum Outcome {
     BadResponse,
     SkippedCooldown,
     SkippedNoKey,
+    /// Turned off (the master switch or this provider) while the job ran:
+    /// no further request was made.
+    SkippedDisabled,
 }
 
 impl Outcome {
@@ -168,6 +171,7 @@ impl Outcome {
             Outcome::BadResponse => "bad_response",
             Outcome::SkippedCooldown => "skipped_cooldown",
             Outcome::SkippedNoKey => "skipped_no_key",
+            Outcome::SkippedDisabled => "skipped_disabled",
         }
     }
 
@@ -183,6 +187,7 @@ impl Outcome {
             Outcome::BadResponse,
             Outcome::SkippedCooldown,
             Outcome::SkippedNoKey,
+            Outcome::SkippedDisabled,
         ]
         .into_iter()
         .find(|o| o.as_str() == s)
@@ -688,6 +693,20 @@ impl Endpoints {
 // ---------------------------------------------------------------------------
 // The engine: rotation over the person's providers, per job.
 
+pub const TURNED_OFF: &str = "web search is turned off on this computer";
+pub const SETTINGS_UNREADABLE: &str = "the web search settings on this computer can't be read";
+pub const KEYS_UNREADABLE: &str =
+    "the saved web search keys on this computer can't be read; reset them in Settings → Web Search";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Consent {
+    Yes,
+    /// Web search is on, but this provider is turned off.
+    ProviderOff,
+    /// The master switch is off, or the settings can't be read.
+    Off,
+}
+
 /// Per-attempt timeouts, always within the job's own deadline.
 const SEARCH_ATTEMPT: Duration = Duration::from_secs(20);
 const FETCH_ATTEMPT: Duration = Duration::from_secs(60);
@@ -703,6 +722,9 @@ pub fn system_clock() -> Clock {
 
 /// One provider call's context.
 pub(crate) struct Call<'a> {
+    /// Consent right now: re-read before every outbound request of this
+    /// attempt. `false` means stop without sending anything more.
+    pub gate: &'a (dyn Fn() -> bool + Sync),
     pub http: &'a reqwest::Client,
     pub key: Option<&'a Secret>,
     pub timeout: Duration,
@@ -771,16 +793,11 @@ impl Engine {
             Ok(op) => op,
             Err(e) => return json!({"ok": false, "error": e.as_str()}),
         };
-        let settings = match settings::load(&self.dir) {
-            Ok(s) => s,
-            Err(_) => {
-                return json!({"ok": false, "error": "the web search settings on this computer can't be read"});
-            }
+
+        let response = match self.rotate_inner(job_id, &op, deadline).await {
+            Ok(r) => r,
+            Err(why) => return json!({"ok": false, "error": why}),
         };
-        if !settings.enabled {
-            return json!({"ok": false, "error": "web search is turned off on this computer"});
-        }
-        let response = self.rotate(job_id, &op, deadline).await;
         let len = serde_json::to_vec(&response).map_or(usize::MAX, |b| b.len());
         if len > MAX_ANSWER_BYTES {
             return json!({"ok": false, "error": "the web answer is too large to send to Metro"});
@@ -818,16 +835,39 @@ impl Engine {
     /// Try the person's providers in order until one answers. Always returns
     /// Metro's answer object; `provider: null` when every one failed.
     pub async fn rotate(&self, job_id: &str, op: &Op, deadline: Instant) -> Value {
-        // Consent at the time of the job: unreadable preferences, or web
-        // search turned off (by anyone, in any process), contact nobody.
+        self.rotate_inner(job_id, op, deadline)
+            .await
+            .unwrap_or_else(|_| json!({"v": 1, "provider": null, "attempts": []}))
+    }
+
+    /// [`Self::rotate`], or the fixed reason no provider may be contacted.
+    /// Consent is checked again before every attempt and every outbound
+    /// request; any doubt (an unreadable file, the switch off) stops the job
+    /// without contacting anyone further.
+    async fn rotate_inner(
+        &self,
+        job_id: &str,
+        op: &Op,
+        deadline: Instant,
+    ) -> Result<Value, &'static str> {
         let snapshot = match settings::load(&self.dir) {
             Ok(s) if s.enabled => s,
-            _ => return json!({"v": 1, "provider": null, "attempts": []}),
+            Ok(_) => return Err(TURNED_OFF),
+            Err(_) => return Err(SETTINGS_UNREADABLE),
         };
-        let keys = keys::KeyStore::new(&self.dir).load().unwrap_or_else(|_| {
-            log(job_id, op, None, None, "saved keys unreadable; using none");
-            Default::default()
-        });
+        let keys = match keys::KeyStore::new(&self.dir).load() {
+            Ok(k) => k,
+            Err(_) => {
+                log(
+                    job_id,
+                    op,
+                    None,
+                    None,
+                    "saved keys unreadable; nothing sent",
+                );
+                return Err(KEYS_UNREADABLE);
+            }
+        };
         let per_attempt = match op {
             Op::Search(_) => SEARCH_ATTEMPT,
             Op::Fetch(_) => FETCH_ATTEMPT,
@@ -872,7 +912,16 @@ impl Engine {
             if left < MIN_ATTEMPT {
                 break;
             }
+            // Right before contacting this provider: still on, and this
+            // provider still allowed?
+            match self.consent(Some(p)) {
+                Consent::Yes => {}
+                Consent::ProviderOff => continue,
+                Consent::Off => return Err(TURNED_OFF),
+            }
+            let gate = || self.consent(Some(p)) == Consent::Yes;
             let call = Call {
+                gate: &gate,
                 http: self.client(p, mode),
                 key,
                 timeout: per_attempt.min(left),
@@ -901,6 +950,14 @@ impl Engine {
                     answer = Some((p, mode, a));
                     break;
                 }
+                Err(f) if f.outcome == Outcome::SkippedDisabled => {
+                    // Turned off during this attempt: nothing more was sent.
+                    log(job_id, op, Some(p), Some(mode), "stopped: turned off");
+                    if self.consent(None) == Consent::Off {
+                        self.record(job_id, op, &updates).await;
+                        return Err(TURNED_OFF);
+                    }
+                }
                 Err(f) => {
                     log(job_id, op, Some(p), Some(mode), f.outcome.as_str());
                     updates.last.push((p, f.outcome, now));
@@ -923,18 +980,7 @@ impl Engine {
                 }
             }
         }
-        {
-            let _g = self.write.lock().await;
-            if let Err(e) = settings::apply(&self.dir, &updates) {
-                log(
-                    job_id,
-                    op,
-                    None,
-                    None,
-                    &format!("settings not saved: {}", clean_line(&e.to_string(), 80)),
-                );
-            }
-        }
+        self.record(job_id, op, &updates).await;
         let mut out = json!({"v": 1, "attempts": attempts});
         match answer {
             Some((p, mode, body)) => {
@@ -948,22 +994,60 @@ impl Engine {
             }
             None => out["provider"] = Value::Null,
         }
-        out
+        Ok(out)
+    }
+
+    async fn record(&self, job_id: &str, op: &Op, updates: &settings::Updates) {
+        let _g = self.write.lock().await;
+        if let Err(e) = settings::apply(&self.dir, updates) {
+            log(
+                job_id,
+                op,
+                None,
+                None,
+                &format!("settings not saved: {}", clean_line(&e.to_string(), 80)),
+            );
+        }
+    }
+
+    /// Consent now, from the files as they are (any process may have
+    /// changed them): the master switch, and `p`'s own switch.
+    fn consent(&self, p: Option<ProviderId>) -> Consent {
+        match settings::load(&self.dir) {
+            Ok(s) if !s.enabled => Consent::Off,
+            Err(_) => Consent::Off,
+            Ok(s) => match p {
+                Some(p) if !s.providers.iter().any(|x| x.id == p && x.enabled) => {
+                    Consent::ProviderOff
+                }
+                _ => Consent::Yes,
+            },
+        }
     }
 
     /// One user-initiated test of `p` with a fixed query, ignoring (and not
-    /// setting) cooldowns. Returns the outcome word.
-    pub async fn test_provider(&self, p: ProviderId) -> Outcome {
-        let keys = keys::KeyStore::new(&self.dir).load().unwrap_or_default();
+    /// setting) cooldowns. Returns the outcome word, or the fixed reason
+    /// nothing was sent (web search off, unreadable settings or keys).
+    pub async fn test_provider(&self, p: ProviderId) -> Result<Outcome, &'static str> {
+        match settings::load(&self.dir) {
+            Ok(s) if s.enabled => {}
+            Ok(_) => return Err(TURNED_OFF),
+            Err(_) => return Err(SETTINGS_UNREADABLE),
+        }
+        let keys = keys::KeyStore::new(&self.dir)
+            .load()
+            .map_err(|_| KEYS_UNREADABLE)?;
         let key = keys.get(p.as_str());
         if key.is_none() && !p.keyless() {
-            return Outcome::SkippedNoKey;
+            return Ok(Outcome::SkippedNoKey);
         }
         let mode = if key.is_some() {
             Mode::Key
         } else {
             Mode::Keyless
         };
+        // An explicit test of one provider: only the master switch counts.
+        let gate = || self.consent(None) == Consent::Yes;
         let op = Op::Search(SearchReq {
             query: "Metro web search test".into(),
             keywords: Vec::new(),
@@ -971,6 +1055,7 @@ impl Engine {
         });
         let now = self.now();
         let call = Call {
+            gate: &gate,
             http: self.client(p, mode),
             key,
             timeout: SEARCH_ATTEMPT,
@@ -994,7 +1079,7 @@ impl Engine {
         }
         let _g = self.write.lock().await;
         let _ = settings::apply(&self.dir, &updates);
-        outcome
+        Ok(outcome)
     }
 
     /// Serialize a settings change made elsewhere (the bridge) with jobs.

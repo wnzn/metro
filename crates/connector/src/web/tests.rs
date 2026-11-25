@@ -502,7 +502,7 @@ async fn tinyfish_without_a_key_sends_nothing() {
     assert!(s.fixture.seen().is_empty());
     assert_eq!(
         s.engine().test_provider(ProviderId::TinyFish).await,
-        Outcome::SkippedNoKey
+        Ok(Outcome::SkippedNoKey)
     );
     assert!(s.fixture.seen().is_empty());
 }
@@ -988,11 +988,34 @@ async fn keys_stay_private_and_never_leave() {
         .contains(CANARY)
     );
 
-    // A corrupt key file: an error, and no key is used.
+    // A corrupt key file fails closed: a fixed local error and no request
+    // at all (never a silent switch to free mode).
     crate::fsutil::write_private(&s.dir.join(keys::FILE), b"{not json").unwrap();
     assert!(keys::KeyStore::new(&s.dir).load().is_err());
+    let n = s.fixture.seen().len();
     s.fixture.push("/tavily/search", tavily_ok());
-    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    let e = s.engine();
+    let r = e
+        .handle(
+            "j",
+            "web_search",
+            &json!({"v": 1, "query": "q"}),
+            deadline(),
+        )
+        .await;
+    assert_eq!(r, json!({"ok": false, "error": KEYS_UNREADABLE}));
+    assert_eq!(
+        e.rotate("j", &search("q"), deadline()).await["attempts"],
+        json!([])
+    );
+    assert_eq!(
+        e.test_provider(ProviderId::Tavily).await,
+        Err(KEYS_UNREADABLE)
+    );
+    assert_eq!(s.fixture.seen().len(), n, "zero outbound requests");
+    // A missing key store is simply "no keys".
+    keys::KeyStore::new(&s.dir).reset().unwrap();
+    let v = e.rotate("j", &search("q"), deadline()).await;
     assert_eq!(v["mode"], "keyless");
 }
 
@@ -1510,4 +1533,246 @@ fn the_settings_lock_excludes_a_second_holder_until_released() {
     drop(first);
     rx.recv_timeout(Duration::from_secs(5)).expect("released");
     waiter.join().unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_off_mid_job_stops_before_the_next_provider_and_the_next_url() {
+    // Master switch off while the first provider is answering: the second
+    // provider receives nothing.
+    let s = Setup::new(&[ProviderId::Tavily, ProviderId::Firecrawl]).await;
+    let mut slow = with(reply(429, json!({})), "retry-after", "1");
+    slow.delay_ms = 400;
+    s.fixture.push("/tavily/search", slow);
+    let e = Arc::new(s.engine());
+    let job = {
+        let e = e.clone();
+        tokio::spawn(async move {
+            e.handle(
+                "j",
+                "web_search",
+                &json!({"v": 1, "query": "q"}),
+                deadline(),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    settings::update_prefs(&s.dir, true, |st| {
+        st.enabled = false;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        job.await.unwrap(),
+        json!({"ok": false, "error": TURNED_OFF})
+    );
+    assert!(
+        s.fixture.seen_at("/firecrawl").is_empty(),
+        "rotated after the switch"
+    );
+
+    // Only the next provider turned off: it is skipped, the job goes on.
+    let s = Setup::new(&[ProviderId::Tavily, ProviderId::Firecrawl, ProviderId::Exa]).await;
+    let mut slow = reply(429, json!({}));
+    slow.delay_ms = 300;
+    s.fixture.push("/tavily/search", slow);
+    s.fixture.push("/exa#tools/call", mcp_result(EXA_TEXT));
+    let e = Arc::new(s.engine());
+    let job = {
+        let e = e.clone();
+        tokio::spawn(async move { e.rotate("j", &search("q"), deadline()).await })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    settings::update_prefs(&s.dir, false, |st| {
+        let list: Vec<(ProviderId, bool)> = st
+            .providers
+            .iter()
+            .map(|p| (p.id, p.id != ProviderId::Firecrawl))
+            .collect();
+        st.set_providers(&list).map_err(anyhow::Error::msg)
+    })
+    .unwrap();
+    let v = job.await.unwrap();
+    assert_eq!(v["provider"], "exa");
+    assert!(s.fixture.seen_at("/firecrawl").is_empty());
+
+    // Multi-URL fetch: turned off after the first page, no second request.
+    let s = Setup::new(&[ProviderId::Firecrawl]).await;
+    let mut page = reply(
+        200,
+        json!({"data": {"markdown": "a", "metadata": {"statusCode": 200}}}),
+    );
+    page.delay_ms = 300;
+    s.fixture.push("/firecrawl/scrape", page);
+    s.fixture.push(
+        "/firecrawl/scrape",
+        reply(
+            200,
+            json!({"data": {"markdown": "b", "metadata": {"statusCode": 200}}}),
+        ),
+    );
+    let e = Arc::new(s.engine());
+    let job = {
+        let e = e.clone();
+        tokio::spawn(async move {
+            e.handle(
+                "j",
+                "web_fetch",
+                &json!({"v": 1, "urls": ["https://a.example/", "https://b.example/"]}),
+                deadline(),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    settings::update_prefs(&s.dir, true, |st| {
+        st.enabled = false;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        job.await.unwrap(),
+        json!({"ok": false, "error": TURNED_OFF})
+    );
+    assert_eq!(
+        s.fixture.seen_at("/firecrawl/scrape").len(),
+        1,
+        "second URL never requested"
+    );
+
+    // MCP: off between initialize and the call.
+    let s = Setup::new(&[ProviderId::Exa]).await;
+    let mut init = reply(
+        200,
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"protocolVersion": "2025-11-25", "capabilities": {}}}),
+    );
+    init.delay_ms = 300;
+    s.fixture.push("/exa#initialize", init);
+    let e = Arc::new(s.engine());
+    let job = {
+        let e = e.clone();
+        tokio::spawn(async move {
+            e.handle(
+                "j",
+                "web_search",
+                &json!({"v": 1, "query": "q"}),
+                deadline(),
+            )
+            .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    settings::update_prefs(&s.dir, true, |st| {
+        st.enabled = false;
+        Ok(())
+    })
+    .unwrap();
+    assert_eq!(
+        job.await.unwrap(),
+        json!({"ok": false, "error": TURNED_OFF})
+    );
+    let methods: Vec<String> = s
+        .fixture
+        .seen_at("/exa")
+        .iter()
+        .map(|r| r.json()["method"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(methods, vec!["initialize"], "nothing after the switch");
+}
+
+#[test]
+fn unsupported_settings_versions_fail_closed() {
+    let t = tempfile::tempdir().unwrap();
+    for (file, body) in [
+        (settings::FILE, &b"{\"v\":2,\"enabled\":true}"[..]),
+        (settings::STATE_FILE, &b"{\"v\":7}"[..]),
+    ] {
+        let dir = t.path().join(file);
+        crate::fsutil::ensure_private_dir(&dir).unwrap();
+        crate::fsutil::write_private(&dir.join(file), body).unwrap();
+        assert!(settings::load(&dir).is_err(), "{file}");
+        let e = Engine::new(&dir, Endpoints::vendor()).unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let r = rt.block_on(e.handle(
+            "j",
+            "web_search",
+            &json!({"v": 1, "query": "q"}),
+            deadline(),
+        ));
+        assert_eq!(
+            r,
+            json!({"ok": false, "error": SETTINGS_UNREADABLE}),
+            "{file}"
+        );
+        assert_eq!(
+            std::fs::read(dir.join(file)).unwrap(),
+            body,
+            "left as it was"
+        );
+    }
+}
+
+#[test]
+fn key_edits_wait_for_the_lock_and_never_lose_an_update() {
+    let t = tempfile::tempdir().unwrap();
+    let dir = t.path().join("web");
+    crate::fsutil::ensure_private_dir(&dir).unwrap();
+    // Another process holds the lock: an edit and a reset both wait.
+    let held = crate::fsutil::lock_exclusive(&dir.join(keys::LOCK_FILE)).unwrap();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for op in ["set", "reset"] {
+        let (d, tx) = (dir.clone(), tx.clone());
+        std::thread::spawn(move || {
+            let s = keys::KeyStore::new(&d);
+            match op {
+                "set" => s.set(ProviderId::Exa, Secret::new(CANARY)).map(|_| ()),
+                _ => s.reset().map(|_| ()),
+            }
+            .unwrap();
+            tx.send(op).unwrap();
+        });
+    }
+    assert!(
+        rx.recv_timeout(Duration::from_millis(300)).is_err(),
+        "an edit didn't wait"
+    );
+    assert!(!dir.join(keys::FILE).exists());
+    drop(held);
+    let mut done = vec![
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(5)).unwrap(),
+    ];
+    done.sort();
+    assert_eq!(done, vec!["reset", "set"]);
+    // Whichever went last decides; a reset can't be undone by a stale edit.
+    let has = keys::KeyStore::new(&dir).load().unwrap().has("exa");
+    assert!(has || !dir.join(keys::FILE).exists());
+
+    // Concurrent edits to different providers (separate stores, like
+    // separate processes) never lose one another's key.
+    keys::KeyStore::new(&dir).reset().unwrap();
+    let threads: Vec<_> = [
+        ProviderId::Tavily,
+        ProviderId::Firecrawl,
+        ProviderId::TinyFish,
+    ]
+    .into_iter()
+    .map(|p| {
+        let d = dir.clone();
+        std::thread::spawn(move || {
+            for i in 0..30 {
+                keys::KeyStore::new(&d)
+                    .set(p, Secret::new(format!("{}-key-{i:04}", p.as_str())))
+                    .unwrap();
+            }
+        })
+    })
+    .collect();
+    for t in threads {
+        t.join().unwrap();
+    }
+    let k = keys::KeyStore::new(&dir).load().unwrap();
+    for p in ["tavily", "firecrawl", "tinyfish"] {
+        assert!(k.has(p), "{p} lost");
+    }
 }

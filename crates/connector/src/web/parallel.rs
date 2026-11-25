@@ -43,6 +43,7 @@ fn error(c: &Call<'_>, e: McpError) -> Failure {
         McpError::Status { .. } => Failure::of(Outcome::Unavailable),
         McpError::Transport(f) => f,
         McpError::Bad => Failure::of(Outcome::BadResponse),
+        McpError::Stopped => Failure::of(Outcome::SkippedDisabled),
     }
 }
 
@@ -62,6 +63,7 @@ async fn call(
         None => (HeaderMap::new(), "keyless", String::new()),
     };
     let t = Target {
+        gate: c.gate,
         http: c.http,
         url: &url,
         auth,

@@ -436,3 +436,76 @@ async fn an_enable_that_lands_after_sign_out_starts_nothing() {
     assert_eq!(s.lock().unwrap().created.len(), 1);
     web.session_ended().await;
 }
+
+/// An explicit "off" stops this computer and removes it from Metro even
+/// when the settings file was unreadable (so the previous state is
+/// unknown); each kind of unreadable file says how to recover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn turning_off_always_stops_and_revokes_whatever_the_file_said() {
+    use metro_connector::desktop::monitoring::Events;
+    use metro_connector::desktop::web::WebSearch;
+    use metro_connector::web::settings;
+
+    let (base, s) = fake().await;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("desktop");
+    let web = Arc::new(
+        WebSearch::new(&root, true, Duration::from_millis(30), Events::new(&root))
+            .with_endpoints(endpoints(&base)),
+    );
+    let session = metro_connector::Secret::new("tok-alice");
+    web.session_bound(&base, "alice", &session, 1).await;
+    wait_for("polling", || s.lock().unwrap().claims > 0).await;
+    let device = s.lock().unwrap().created[0].0.clone();
+    let p =
+        metro_connector::desktop::store::profile_for(&root, &base, "alice", "web-search").unwrap();
+
+    // Worker-state file unreadable: its own message, search paused.
+    metro_connector::fsutil::write_private(&p.dir.join(settings::STATE_FILE), b"[").unwrap();
+    let v = web.state(&base, "alice").await.unwrap();
+    assert!(
+        v["settings_error"]
+            .as_str()
+            .unwrap()
+            .contains("Try again now"),
+        "{v}"
+    );
+    assert_eq!(v["enabled"], false);
+    web.clear_cooldown(&base, "alice", 1, "tavily")
+        .await
+        .unwrap();
+    assert_eq!(
+        web.state(&base, "alice").await.unwrap()["settings_error"],
+        Value::Null
+    );
+
+    // Preferences unreadable: their own message.
+    metro_connector::fsutil::write_private(&p.dir.join(settings::FILE), b"{broken").unwrap();
+    let v = web.state(&base, "alice").await.unwrap();
+    assert!(
+        v["settings_error"]
+            .as_str()
+            .unwrap()
+            .contains("Turn web search off"),
+        "{v}"
+    );
+
+    // Off: workers stop and the device is removed, though "before" was
+    // unknown.
+    let v = web
+        .update(&base, "alice", 1, &session, Some(false), None, None)
+        .await
+        .unwrap();
+    assert_eq!(v["enabled"], false);
+    assert_eq!(v["device"]["paired"], false);
+    assert_eq!(s.lock().unwrap().deleted, vec![device]);
+    let claims = s.lock().unwrap().claims;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(s.lock().unwrap().claims, claims, "a worker kept polling");
+    // Idempotent.
+    web.update(&base, "alice", 1, &session, Some(false), None, None)
+        .await
+        .unwrap();
+    assert_eq!(s.lock().unwrap().deleted.len(), 1);
+    web.session_ended().await;
+}

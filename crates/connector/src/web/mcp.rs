@@ -71,10 +71,14 @@ pub enum McpError {
     Transport(Failure),
     /// An unreadable reply or a JSON-RPC error.
     Bad,
+    /// Consent was withdrawn: nothing more was sent.
+    Stopped,
 }
 
 /// One MCP request's context.
 pub struct Target<'a> {
+    /// Re-read before every message sent (initialize, initialized, call).
+    pub gate: &'a (dyn Fn() -> bool + Sync),
     pub http: &'a reqwest::Client,
     pub url: &'a str,
     /// Credential headers (already marked sensitive); empty when keyless.
@@ -96,6 +100,9 @@ async fn post(
     body: &Value,
     want: Option<u64>,
 ) -> Result<Reply, McpError> {
+    if !(t.gate)() {
+        return Err(McpError::Stopped);
+    }
     let mut rb = t
         .http
         .post(t.url)

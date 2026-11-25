@@ -164,6 +164,10 @@ fn read_prefs(dir: &Path, s: &mut Settings) -> Result<()> {
         return Ok(());
     };
     let w: PrefsWire = serde_json::from_slice(&bytes).context("web-settings.json is not valid")?;
+    // A version this build doesn't know is unreadable: web search off.
+    if w.v != 1 {
+        anyhow::bail!("web-settings.json has an unsupported version");
+    }
     let mut providers: Vec<ProviderSetting> = Vec::new();
     for p in &w.providers {
         if let Some(id) = ProviderId::parse(&p.id)
@@ -191,6 +195,9 @@ fn read_state(dir: &Path, s: &mut Settings) -> Result<()> {
         return Ok(());
     };
     let w: StateWire = serde_json::from_slice(&bytes).context("web-state.json is not valid")?;
+    if w.v != 1 {
+        anyhow::bail!("web-state.json has an unsupported version");
+    }
     s.cooldowns = w.cooldowns;
     s.rejected_keys = w.rejected_keys;
     s.last = w.last;
@@ -243,6 +250,15 @@ pub fn load(dir: &Path) -> Result<Settings> {
     read_prefs(dir, &mut s)?;
     read_state(dir, &mut s)?;
     Ok(s)
+}
+
+/// Which file can't be read: `(preferences, job state)`.
+pub fn unreadable(dir: &Path) -> (bool, bool) {
+    let mut s = Settings::default();
+    (
+        read_prefs(dir, &mut s).is_err(),
+        read_state(dir, &mut s).is_err(),
+    )
 }
 
 /// Save everything (setup and tests). Under the lock.

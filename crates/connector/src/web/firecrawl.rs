@@ -93,6 +93,10 @@ pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<An
 pub(crate) async fn fetch(c: &Call<'_>, base: &str, r: &FetchReq) -> Result<Answer, Failure> {
     let mut out = Answer::default();
     for url in &r.urls {
+        // Each URL is its own request: consent is checked before each.
+        if !(c.gate)() {
+            return Err(Failure::of(Outcome::SkippedDisabled));
+        }
         let resp = request(
             c,
             format!("{base}/scrape"),

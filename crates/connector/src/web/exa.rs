@@ -30,6 +30,7 @@ fn target<'a>(c: &Call<'a>, base: &'a str, url: &'a str) -> Result<Target<'a>, F
     };
     let _ = base;
     Ok(Target {
+        gate: c.gate,
         http: c.http,
         url,
         auth,
@@ -56,6 +57,7 @@ fn error(c: &Call<'_>, e: McpError) -> Failure {
         McpError::Status { .. } => Failure::of(Outcome::Unavailable),
         McpError::Transport(f) => f,
         McpError::Bad => Failure::of(Outcome::BadResponse),
+        McpError::Stopped => Failure::of(Outcome::SkippedDisabled),
     }
 }
 

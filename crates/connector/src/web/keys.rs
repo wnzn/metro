@@ -21,6 +21,8 @@ use crate::openai_oauth::store::{seal, unseal};
 use crate::{SafeError, Secret};
 
 pub const FILE: &str = "web-keys.json";
+/// Held across every read-modify-write of the key file, in any process.
+pub const LOCK_FILE: &str = "web-keys.lock";
 
 /// The saved keys, by provider id.
 #[derive(Default)]
@@ -98,6 +100,12 @@ impl KeyStore {
         self.dir.join(FILE)
     }
 
+    fn locked<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+        ensure_private_dir(&self.dir)?;
+        let _lock = crate::fsutil::lock_exclusive(&self.dir.join(LOCK_FILE))?;
+        f()
+    }
+
     /// The saved keys; none when nothing is saved. A file that can't be read
     /// is an error, and no key from it is used.
     pub fn load(&self) -> Result<Keys> {
@@ -150,23 +158,27 @@ impl KeyStore {
     /// is the explicit way out.
     pub fn set(&self, p: ProviderId, key: Secret) -> Result<()> {
         validate_key(&key)?;
-        let mut keys = self.load()?.0;
-        keys.insert(p.as_str().into(), key);
-        self.store(&keys)
+        self.locked(|| {
+            let mut keys = self.load()?.0;
+            keys.insert(p.as_str().into(), key);
+            self.store(&keys)
+        })
     }
 
     /// Delete every saved key, readable or not: the explicit recovery from a
     /// key file that can't be read. `true` if there was a file.
     pub fn reset(&self) -> Result<bool> {
-        remove_private(&self.path())
+        self.locked(|| remove_private(&self.path()))
     }
 
     /// Delete `p`'s key; `true` if there was one. The provider goes back to
     /// its free mode.
     pub fn delete(&self, p: ProviderId) -> Result<bool> {
-        let mut keys = self.load()?.0;
-        let had = keys.remove(p.as_str()).is_some();
-        self.store(&keys)?;
-        Ok(had)
+        self.locked(|| {
+            let mut keys = self.load()?.0;
+            let had = keys.remove(p.as_str()).is_some();
+            self.store(&keys)?;
+            Ok(had)
+        })
     }
 }

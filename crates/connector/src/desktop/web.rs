@@ -434,10 +434,17 @@ impl WebSearch {
     fn view(&self, p: &Profile, server: &str, account: &str) -> Value {
         // Unreadable settings are shown as off, with the reason.
         let loaded = settings::load(&p.dir);
-        let settings_error = loaded
-            .as_ref()
-            .err()
-            .map(|_| "The web search settings on this computer can't be read; turn web search off to reset them".to_owned());
+        // Each file has its own way out.
+        let settings_error = loaded.as_ref().err().map(|_| {
+            match settings::unreadable(&p.dir) {
+                (true, _) => "Your web search settings on this computer can't be read, so web search is off. \
+                              Turn web search off to reset them."
+                    .to_owned(),
+                _ => "Saved provider pauses on this computer can't be read, so web search is paused. \
+                      Use \"Try again now\" on any provider to reset them."
+                    .to_owned(),
+            }
+        });
         let s = loaded.unwrap_or_else(|_| settings::Settings {
             enabled: false,
             ..Default::default()
@@ -524,19 +531,21 @@ impl WebSearch {
             .map_err(|e| {
                 let b = local(e, "The settings can't be saved");
                 err(422, "invalid", b.message)
-            })?;
-        if changed {
-            if enabled == Some(false) {
-                self.stop().await;
-                if let Some(problem) = self.unpair(&p, server, account, session).await {
-                    let mut l = lock(&self.live);
-                    l.detail = Some(format!(
-                        "Turned off here, but Metro couldn't be told ({problem}); it will see this computer as offline"
-                    ));
-                }
-            } else {
-                self.start_locked(server, account, session).await?;
+            });
+        // An explicit "off" always stops this computer and removes it from
+        // Metro, whatever the file said before and even if saving failed;
+        // both steps are idempotent.
+        if enabled == Some(false) {
+            self.stop().await;
+            if let Some(problem) = self.unpair(&p, server, account, session).await {
+                let mut l = lock(&self.live);
+                l.detail = Some(format!(
+                    "Turned off here, but Metro couldn't be told ({problem}); it will see this computer as offline"
+                ));
             }
+            changed?;
+        } else if changed? {
+            self.start_locked(server, account, session).await?;
         }
         Ok(self.view(&p, server, account))
     }
@@ -595,7 +604,10 @@ impl WebSearch {
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
-        let outcome = engine.test_provider(pid).await;
+        let outcome = engine
+            .test_provider(pid)
+            .await
+            .map_err(|why| err(409, "not_sent", why))?;
         let mut row = self.row(&p, pid)?;
         row["test"] = json!({"outcome": outcome.as_str()});
         Ok(row)
