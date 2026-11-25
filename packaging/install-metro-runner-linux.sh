@@ -165,11 +165,14 @@ host_problems() { # $1 = runner binary (optional); prints one problem per line
 }
 
 # ---------------------------------------------------------------- config
-# Plain http works to any host (the brief's item 12). The runner token is sent
+# url-rule:begin (test_installers.py runs this block against
+# crates/url-policy/testdata/host_vectors.json)
+# Plain http works to any host. The runner token is sent
 # as given, so the host decides how it's said:
 # - loopback: only the exact literals localhost, 127.0.0.1 or [::1] with an
 #   explicit port 1-65535 (anything else that names this machine, such as
-#   127.1 or LOCALHOST, is refused as ambiguous);
+#   127.1, LOCALHOST, [::ffff:7f00:1] or a trailing dot, is refused as
+#   ambiguous: a trailing dot sends even an address through the resolver);
 # - Tailscale (100.64.0.0/10, fd7a:115c:a1e0::/48, names ending in .ts.net):
 #   encrypted by Tailscale itself, used silently;
 # - any other host: allowed, with one warning that the token crosses the
@@ -191,8 +194,9 @@ http_class() {
     fi
     case "$url_host" in
         \[*\]) inner=${url_host#\[}; inner=${inner%\]}
-               case "$inner" in ''|*[!0-9A-Fa-f:.]*) return 1 ;; esac ;;
-        ''|.*|-*|*.|*..*|*[!A-Za-z0-9.-]*) return 1 ;;
+               case "$inner" in ''|*[!0-9A-Fa-f:]*|::[fF][fF][fF][fF]:*) return 1 ;; esac ;;
+        # Labels of letters, digits and inner hyphens; no trailing dot.
+        ''|.*|-*|*.|*-|*..*|*-.*|*.-*|*[!A-Za-z0-9.-]*) return 1 ;;
     esac
     if [ "$has_port" = 1 ]; then
         case "$url_host" in localhost|127.0.0.1|\[::1\]) url_class=loopback; return 0 ;; esac
@@ -219,6 +223,8 @@ http_class() {
     esac
     url_class=other
 }
+
+# url-rule:end
 
 plain_http_warning() { # $1 = host; never mentions the token's value
     printf '%s: warning: plain HTTP to %s isn'"'"'t encrypted: anyone on the network between this machine and %s could read the runner token. Use it only on networks you trust, such as Tailscale or a VPN, or use https://.\n' "$PROG" "$1" "$1" >&2

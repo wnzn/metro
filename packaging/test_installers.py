@@ -48,6 +48,7 @@ OTHER_HTTP = ("http://metro.example", "http://10.0.0.5:8787", "http://192.168.1.
               "http://100.128.0.1", "http://100.63.255.255:80", "http://[fe80::1]:8787", "http://ts.net")
 BAD_HTTP = ("http://1.2.3.999", "http://.metro.example", "http://a..b", "http://-x:80", "http://[::]:80",
             "http://[fd7a::1", "http://metro.example:0", "http://metro.example:65536", "http://metro.example:")
+VECTORS = HERE.parent / "crates/url-policy/testdata/host_vectors.json"
 HOST_MUTATORS = {"docker", "podman", "sudo", "doas", "pkexec", "su", "systemctl", "apt", "apt-get", "dpkg",
                  "pacman", "dnf", "yum", "rpm", "zypper", "flatpak", "snap"}
 
@@ -592,6 +593,54 @@ class ContainerScriptTests(unittest.TestCase):
         r = self.box.run(CONTAINER, "setup", "--server-url", "https://m.example", "--token-file", self.token,
                          "--version", "0.3.0")
         self.assertIn("Docker or Podman is required", r.stderr)
+
+
+def url_rule_block(script, comment):
+    """The installer's own URL rule, between its url-rule markers."""
+    text = script.read_text()
+    begin, end = text.index(f"{comment} url-rule:begin"), text.index(f"{comment} url-rule:end")
+    return text[begin:end]
+
+
+def vector_cases():
+    """(url, expected) for every shared host vector: loopback, tailscale, other or refused."""
+    hosts = json.loads(VECTORS.read_text())["hosts"]
+    assert len(hosts) > 40
+    return [(f"http://{v['host']}:8787", v.get("installer", v["class"])) for v in hosts]
+
+
+class UrlRuleVectorTests(unittest.TestCase):
+    """The installers classify every shared host vector like metro-url-policy,
+    the desktop app and the admin panel (crates/url-policy/testdata/host_vectors.json)."""
+
+    def check(self, got_lines, cases):
+        self.assertEqual(len(got_lines), len(cases), got_lines)
+        wrong = [f"{u}: {g}, expected {e}" for (u, e), g in zip(cases, got_lines) if g != e]
+        self.assertEqual(wrong, [])
+
+    def test_shell_scripts(self):
+        cases = vector_cases()
+        for script in (RUNNER, CONTAINER):
+            with self.subTest(script=script.name), tempfile.TemporaryDirectory() as d:
+                harness = Path(d) / "rule.sh"
+                harness.write_text("PROG=t\n" + url_rule_block(script, "#") +
+                                   'for u in "$@"; do if http_class "$u"; then echo "$url_class"; '
+                                   'else echo refused; fi; done\n')
+                r = subprocess.run(["sh", harness, *[u for u, _ in cases]], text=True, capture_output=True,
+                                   check=True)
+                self.check(r.stdout.splitlines(), cases)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
+    def test_powershell_script(self):
+        cases = vector_cases()
+        with tempfile.TemporaryDirectory() as d:
+            harness = Path(d) / "rule.ps1"
+            harness.write_text("$Prog = 't'\nfunction Fail([string] $Message) { throw $Message }\n" +
+                               url_rule_block(CONTAINER_PS1, "#") +
+                               "foreach ($u in $args) { try { Test-Url $u } catch { 'refused' } }\n")
+            r = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", harness,
+                                *[u for u, _ in cases]], text=True, capture_output=True, timeout=120, check=True)
+            self.check(r.stdout.splitlines(), cases)
 
 
 class MacosInstallerTests(unittest.TestCase):

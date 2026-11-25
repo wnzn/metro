@@ -54,6 +54,8 @@ $Docker = if ($env:METRO_DOCKER_BIN) { $env:METRO_DOCKER_BIN } else { 'docker' }
 
 function Fail([string] $Message) { throw "${Prog}: $Message" }
 
+# url-rule:begin (test_installers.py runs this block against
+# crates/url-policy/testdata/host_vectors.json)
 # Plain http only to an exact loopback literal (localhost, 127.0.0.1 or [::1])
 # with an explicit numeric port 1-65535, then an optional path.
 function Test-LoopbackHttp([string] $Url) {
@@ -65,17 +67,19 @@ function Test-LoopbackHttp([string] $Url) {
 # Plain http works to any host. Loopback (the exact literals above) and
 # Tailscale hosts are used silently; any other host gets one warning, because
 # the runner token crosses the network unencrypted. Other names for this
-# computer (127.1, LOCALHOST, [0:0:0:0:0:0:0:1], 0.0.0.0, ...) are refused as
-# ambiguous. Returns loopback, tailscale or other; $null when malformed.
+# computer (127.1, LOCALHOST, [0:0:0:0:0:0:0:1], [::ffff:7f00:1], 0.0.0.0,
+# a trailing dot, ...) are refused as ambiguous: a trailing dot sends even an
+# address through the resolver. Returns loopback, tailscale or other; $null when malformed.
 function Get-HttpClass([string] $Url) {
     if (Test-LoopbackHttp $Url) { return 'loopback' }
     $label = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?'
-    if (-not ($Url -cmatch "^http://(\[[0-9A-Fa-f:.]+\]|$label(?:\.$label)*)(?::([0-9]{1,5}))?(/[^?#@]*)?$")) { return $null }
+    if (-not ($Url -cmatch "^http://(\[[0-9A-Fa-f:]+\]|$label(?:\.$label)*)(?::([0-9]{1,5}))?(/[^?#@]*)?$")) { return $null }
     $hostPart = $Matches[1].ToLowerInvariant()
     $portText = $Matches[2]
     if ($portText) { $port = [int] $portText; if ($port -lt 1 -or $port -gt 65535) { return $null } }
     if ($hostPart -like 'localhost*' -or $hostPart -like '127.*' -or $hostPart -eq '0.0.0.0' -or $hostPart -eq '0') { return $null }
     if ($hostPart.StartsWith('[')) {
+        if ($hostPart.StartsWith('[::ffff:')) { return $null }
         $bits = $hostPart -replace '[\[\]0:]', ''
         if ($bits -eq '' -or $bits -eq '1') { return $null }
         if ($hostPart.StartsWith('[fd7a:115c:a1e0:')) { return 'tailscale' }
@@ -105,6 +109,8 @@ function Test-Url([string] $Url) {
     }
     Fail '-ServerUrl must start with https:// or http://'
 }
+
+# url-rule:end
 
 function Get-PlainHttpWarning([string] $Url) {
     $h = ([Uri] $Url).Authority -replace ':[0-9]+$', ''
