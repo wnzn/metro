@@ -1575,11 +1575,29 @@ export function SettingsGroup(props: Testable & { title?: string; description?: 
 }
 
 /** The name and the whole row are a single navigation target. */
-export function SettingsLinkRow(props: Testable & { label: string; description?: string; mark?: string; onPress: () => void; trailing?: JSX.Element }) {
-  return <Button class={cx("group flex-row items-center gap-(--space-3) min-h-[52px] border-t border-border px-(--space-2) py-(--space-2) hover:bg-muted",
-    focusRing)} onPress={props.onPress} testID={props.testID} accessibilityLabel={props.accessibilityLabel ?? props.label}>
+export function SettingsLinkRow(props: Testable & { label: string; description?: string; mark?: string; icon?: IconName; onPress: () => void; trailing?: JSX.Element }) {
+  return <Button class={cx("group", itemRowClass, "hover:bg-muted", focusRing)} onPress={props.onPress} testID={props.testID}
+    accessibilityLabel={props.accessibilityLabel ?? props.label}>
+    <ItemRowBody label={props.label} description={props.description} mark={props.mark} icon={props.icon} />
+    {props.trailing}
+    <Icon name="chevron-right" size={14} color="muted" />
+  </Button>;
+}
+
+/** A non-navigating row aligned with `SettingsLinkRow`; its controls sit on the right. */
+export function SettingsItemRow(props: Testable & { label: string; description?: string; mark?: string; icon?: IconName; children?: JSX.Element }) {
+  return <View class={itemRowClass} testID={props.testID}>
+    <ItemRowBody label={props.label} description={props.description} mark={props.mark} icon={props.icon} />
+    {props.children}
+  </View>;
+}
+
+const itemRowClass = "flex-row items-center gap-(--space-3) min-h-[52px] border-t border-border px-(--space-2) py-(--space-2)";
+
+function ItemRowBody(props: { label: string; description?: string; mark?: string; icon?: IconName }) {
+  return <>
     <View class="size-[32px] shrink-0 items-center justify-center rounded-(--radius-sm) bg-muted" accessibilityElementsHidden>
-      <If when={props.mark} else={<Icon name="file" size={16} color="muted" />}>
+      <If when={props.mark} else={<Icon name={props.icon ?? "file"} size={16} color="muted" />}>
         <Text class={cx(textClass.sm, "text-foreground")} style={{ numberOfLines: 1 }}>{props.mark}</Text>
       </If>
     </View>
@@ -1587,9 +1605,7 @@ export function SettingsLinkRow(props: Testable & { label: string; description?:
       <Text class={cx(textClass.sm, "font-medium text-foreground")} style={{ numberOfLines: 2 }}>{props.label}</Text>
       <If when={props.description}><Text class={cx(textClass.xs, "text-muted-foreground")}>{props.description}</Text></If>
     </View>
-    {props.trailing}
-    <Icon name="chevron-right" size={14} color="muted" />
-  </Button>;
+  </>;
 }
 
 /**

@@ -4,7 +4,7 @@ import { isPageStatus, pageFailure } from "../../api/pages";
 import { forgetPageDraft, goPages, hasSpace, pageDrafts, pageDraftsError, pageGuard, pages, pagesError, pagesLoading, pagesProblem, refreshPageDrafts, refreshPages, scopeVisible, spaceGrants, watchPageScope } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
 import { apiClient, sessionGuard, spaces } from "../../store";
-import { Action, ActionBar, Badge, Banner, Column, compactWidth, Label, Modal, PageHeader, PageLayout, Picker, Row, SegmentedControl, SettingRow, SettingsGroup, SettingsLinkRow } from "../../ui";
+import { Action, ActionBar, Badge, Banner, Column, compactWidth, Label, Modal, PageHeader, PageLayout, Picker, Row, SegmentedControl, SettingsGroup, SettingsItemRow, SettingsLinkRow } from "../../ui";
 import { profileName } from "../profile/profileState";
 import { Diagnostics, DraftPrompt, PagesError, scopeAudience, scopeName, showDraft, showPage } from "./controls";
 import { cell } from "./renderPlan";
@@ -80,7 +80,7 @@ export function PagesHome(props: { route: Home }) {
         <If when={templates().some(t => !inSpace() || t.scopes.includes("space"))}>
           <SettingsGroup flat title="Templates">
             <Each of={templates().filter(t => !inSpace() || t.scopes.includes("space"))} key={t => t.id}>
-              {t => <SettingRow label={t().title} description={t().description} />}
+              {t => <SettingsItemRow label={t().title} description={t().description} />}
             </Each>
           </SettingsGroup>
         </If>
@@ -130,7 +130,7 @@ function DraftGroup(props: { route: Home }) {
     <PagesError message={error()} />
     <If when={rows().length}>
       <SettingsGroup flat title="Drafts" description="Only you can review or apply your drafts.">
-        <Each of={rows()} key={d => d.id}>{draft => <SettingRow label={`${title(draft())} · ${draft().space_name ?? "Personal"}`}
+        <Each of={rows()} key={d => d.id}>{draft => <SettingsItemRow icon="pencil" label={`${title(draft())} · ${draft().space_name ?? "Personal"}`}
           description={`${({ generating: "Building", ready: "Ready", failed: "Failed" })[draft().status]} · Updated ${cell(draft().updated_at, "relative").label.toLowerCase()}`}>
           <Row gap={1} wrap>
             <Action compact label="Resume" accessibilityLabel={`Resume draft: ${title(draft())}`} testID={`continue-page-draft:${draft().id}`}
@@ -138,7 +138,7 @@ function DraftGroup(props: { route: Home }) {
             <Action compact variant="ghost" label="Discard…" accessibilityLabel={`Discard draft: ${title(draft())}`} testID={`discard-listed-draft:${draft().id}`}
               onPress={() => { error.set(""); selected.set(draft()); }} />
           </Row>
-        </SettingRow>}</Each>
+        </SettingsItemRow>}</Each>
       </SettingsGroup>
     </If>
     <If when={selected() && rows().some(d => d.id === selected()?.id)}>
