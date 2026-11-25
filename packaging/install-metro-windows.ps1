@@ -395,7 +395,8 @@ function Install-Metro {
             $ptr.Write($bytes, 0, $bytes.Length)
             $ptr.Flush($true)
         } finally { $ptr.Dispose() }
-        if (Test-Path -LiteralPath $current) { [IO.File]::Replace($tmp, $current, $null) }
+        # File.Replace needs a null backup path; PowerShell binds $null to an empty string here.
+        if (Test-Path -LiteralPath $current) { [IO.File]::Replace($tmp, $current, [NullString]::Value) }
         else { [IO.File]::Move($tmp, $current) }
         if ($stagedVersion -and $stagedVersion -ne $version) {
             $superseded = Join-Path $versions $stagedVersion
