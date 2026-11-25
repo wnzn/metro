@@ -1051,6 +1051,56 @@ impl Db {
         ))
     }
 
+    pub(crate) fn room_member_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+        user_id: &str,
+    ) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)
+                AND EXISTS (SELECT 1 FROM space_rooms WHERE space_id = ?1 AND id = ?3)",
+            params![space_id, user_id, room_id],
+            |r| r.get(0),
+        )
+    }
+
+    pub(crate) fn space_agent_exists_in(
+        conn: &Connection,
+        space_id: &str,
+        agent_id: &str,
+    ) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM space_agents WHERE space_id = ?1 AND id = ?2)",
+            params![space_id, agent_id],
+            |r| r.get(0),
+        )
+    }
+
+    /// Recheck the concrete recipients in the transaction that writes a room message.
+    pub(crate) fn recipients_current_in(
+        conn: &Connection,
+        space_id: &str,
+        recipients: &[crate::mentions::Mention],
+    ) -> rusqlite::Result<bool> {
+        use crate::mentions::Mention;
+        for m in recipients {
+            let exists: bool = match m {
+                Mention::Agent => continue,
+                Mention::AgentId { agent_id } => Self::space_agent_exists_in(conn, space_id, agent_id)?,
+                Mention::User { id } => conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)",
+                    params![space_id, id],
+                    |r| r.get(0),
+                )?,
+            };
+            if !exists {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Append a message written by `author` (a person) to `room_id` of
     /// `space_id`, in one transaction with the check that they are a
     /// member of the Space now and the room exists. `None`, with nothing
@@ -1069,13 +1119,7 @@ impl Db {
         };
         let conn = self.lock();
         let tx = conn.unchecked_transaction()?;
-        let allowed: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)
-                AND EXISTS (SELECT 1 FROM space_rooms WHERE space_id = ?1 AND id = ?3)",
-            params![space_id, user_id, room_id],
-            |r| r.get(0),
-        )?;
-        if !allowed {
+        if !Self::room_member_in(&tx, space_id, room_id, user_id)? {
             return Ok(None);
         }
         let event =

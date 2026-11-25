@@ -885,17 +885,63 @@ pub async fn start_room_run(
             "The agent is busy with other requests; try again shortly.",
         ));
     };
-    let task = truncate(&trigger.text, 200);
-    // The registry's `actor` is the initiator's stable id: it authorizes stops.
-    let (info, cancel) = match state.runs.start(space_id, &room.id, &user_id, &task) {
+    enum AcceptanceError {
+        Room,
+        Agent,
+        Registry(String),
+    }
+    let (sid, rid, aid, task, runs) = (
+        space_id.to_owned(),
+        room.id.clone(),
+        agent.id.clone(),
+        truncate(&trigger.text, 200),
+        state.runs.clone(),
+    );
+    // Serialize the last existence check with other writers through the
+    // instant the run is registered. Routing/model selection may have
+    // awaited since the message was committed. Never substitute an agent.
+    let accepted = state
+        .db
+        .call(move |db| {
+            let mut conn = db.lock();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !crate::db::Db::room_member_in(&tx, &sid, &rid, &user_id)? {
+                return Ok(Err(AcceptanceError::Room));
+            }
+            if !crate::db::Db::space_agent_exists_in(&tx, &sid, &aid)? {
+                return Ok(Err(AcceptanceError::Agent));
+            }
+            // The stable user id authorizes stops. Create the guard here
+            // too in case the caller goes away before receiving the result.
+            let (info, cancel) = match runs.start(&sid, &rid, &user_id, &task) {
+                Ok(started) => started,
+                Err(error) => return Ok(Err(AcceptanceError::Registry(error))),
+            };
+            let registration = crate::orchestration::Registration::new(runs, info.id.clone());
+            Ok(Ok((info, cancel, registration)))
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "could not check Space run acceptance");
+            Refusal::shown("Could not verify this Space's run. No agent ran.")
+        })?;
+    let (info, cancel, registration) = match accepted {
         Ok(started) => started,
-        Err(e) => {
+        Err(AcceptanceError::Room) => {
+            return Err(Refusal::shown(
+                "This room is no longer available to the sender. No agent ran.",
+            ));
+        }
+        Err(AcceptanceError::Agent) => {
+            return Err(Refusal::shown(
+                "The requested agent is no longer available in this Space. No agent ran.",
+            ));
+        }
+        Err(AcceptanceError::Registry(e)) => {
             state.monitor_space(space_id, Code::AgentBusy).await;
             return Err(e.into());
         }
     };
-    // Ends the run if this start is abandoned before the worker owns it.
-    let registration = crate::orchestration::Registration::new(state.runs.clone(), info.id.clone());
     // The turn is shown as the agent that works it: a thread's agent by the
     // thread's name, otherwise the Space agent's name; never the person who
     // asked. Every event carries the agent's identity.
