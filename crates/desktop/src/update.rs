@@ -7,7 +7,7 @@ use std::sync::Arc;
 use metro_connector::desktop::store::InstanceLock;
 use metro_connector::desktop::update::apply::{self, RootGate, TrialOutcome, TrialPaths};
 use metro_connector::desktop::update::install::{self, InstallKind};
-use metro_connector::desktop::update::{ApplyRequest, LastUpdate, Updater, now_ms};
+use metro_connector::desktop::update::{ApplyRequest, InstallFailure, Updater};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Mode {
@@ -45,19 +45,11 @@ pub async fn apply(
         desktop_root: desktop_root.to_path_buf(),
         update_dir: updater.dir().to_path_buf(),
     };
-    let record_failure = |detail: &str| {
-        updater.record_outcome(LastUpdate {
-            from: updater.own().to_string(),
-            to: req.version.to_string(),
-            outcome: "install_failed".into(),
-            at: now_ms(),
-            detail: Some(detail.into()),
-        });
-    };
+    let record_failure = |reason| updater.record_install_failure(req.version, reason);
     let install_lock = match install::Lock::take(&paths.root) {
         Ok(lock) => lock,
         Err(_) => {
-            record_failure("The installer is busy. Close the other installer and try again.");
+            record_failure(InstallFailure::InstallerBusy);
             return After::Relaunch;
         }
     };
@@ -65,15 +57,18 @@ pub async fn apply(
         Ok(stage) => stage,
         Err(e) => {
             eprintln!("metro-desktop: the staged update wasn't used: {e}");
-            record_failure(
-                "The staged update could not be verified. Check again before restarting.",
-            );
+            if !record_failure(InstallFailure::StageVerificationFailed) {
+                crate::fatal(
+                    "Metro could not save its update status. The staged update was not used. Use Metro's official installer to update manually.",
+                );
+                return After::Exit(1);
+            }
             return After::Relaunch;
         }
     };
     if let Err(e) = apply::begin_trial(&paths, &mut j, &install_lock, &instance_lock) {
         eprintln!("metro-desktop: preparing the update failed: {}", e.kind());
-        record_failure("The local workspace could not be backed up. The update was not started.");
+        record_failure(InstallFailure::BackupFailed);
         return After::Relaunch;
     }
     let retire = |id: &str| RootGate::retire(desktop_root, &paths.root, id, &instance_lock);

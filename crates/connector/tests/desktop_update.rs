@@ -16,7 +16,7 @@ use metro_connector::desktop::bridge;
 use metro_connector::desktop::core::{Desktop, DesktopConfig};
 use metro_connector::desktop::update::apply::{self, TrialOutcome, TrialPaths};
 use metro_connector::desktop::update::install::{self, InstallKind, Journal, JournalPhase};
-use metro_connector::desktop::update::{Busy, Updater, UpdaterConfig};
+use metro_connector::desktop::update::{Busy, InstallFailure, Updater, UpdaterConfig};
 use metro_release::fetch::Source;
 use metro_release::testing::{FixtureRelease, TestVerifier, release_json, tar_gz};
 use metro_release::{Channel, Version};
@@ -1198,6 +1198,10 @@ async fn resumed_apply_requires_signed_evidence_and_every_staged_file() {
     drop(u);
 
     let u = updater(&i, &f, Channel::Release);
+    let stage_revision = u.state(Busy::default())["stage_revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let rx = u.apply_requests();
     u.request_apply(NEW, true, Busy::default()).unwrap();
     let req = rx.borrow().clone().unwrap();
@@ -1220,6 +1224,32 @@ async fn resumed_apply_requires_signed_evidence_and_every_staged_file() {
     fs::write(&package, archive).unwrap();
     fs::write(assets.join("SHA256SUMS.sigstore.json"), b"changed proof").unwrap();
     assert!(u.verify_apply(&req, &lock).is_err());
+    assert_ne!(stage_revision, req.journal_id);
+    let journal = fs::read(i.root.join(install::JOURNAL)).unwrap();
+    assert!(u.record_install_failure(req.version, InstallFailure::StageVerificationFailed));
+    drop(lock);
+    drop(u);
+
+    // Real release metadata still verifies, but it says nothing about the
+    // staged bytes. Neither relaunch nor a fresh check repairs that stage.
+    let u = updater(&i, &f, Channel::Release);
+    assert_eq!(u.state(Busy::default())["phase"], "idle");
+    u.check(true).await.unwrap();
+    let view = u.state(Busy::default());
+    assert_eq!(view["phase"], "idle");
+    assert_eq!(view["latest"]["version"], NEW);
+    assert_eq!(
+        view["last_update"]["failure_code"],
+        "stage_verification_failed"
+    );
+    assert!(view.get("stage_revision").is_none());
+    assert!(u.request_apply(NEW, true, Busy::default()).is_err());
+    assert_eq!(
+        u.start_download(NEW).unwrap_err().code,
+        "stage_verification_failed"
+    );
+    assert_eq!(fs::read(i.root.join(install::JOURNAL)).unwrap(), journal);
+    assert!(stage.is_dir() && package.is_file());
     assert_eq!(install::read_pointer(&i.root).as_deref(), Some(OLD));
 }
 

@@ -372,6 +372,7 @@ pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Op
         }),
         at: now_ms(),
         detail: detail.or_else(|| j.detail.clone()),
+        failure_code: None,
     };
     // Legacy MSI records and their unowned backup are never consumed here.
     // A failed record from the old helper could mean its wait call failed,
