@@ -31,7 +31,7 @@ use crate::AppState;
 use crate::config::ModelConfig;
 use crate::db::reactions::{ReactToMessageTool, ReactionScope};
 use crate::db::{Activity, Addressed, Author, Event, LimitError, Room, activity, actor, kind};
-use crate::model_routing::{AddressedBy, Route, RouteSource};
+use crate::model_routing::{AddressedBy, Refusal, Route, RouteSource};
 use crate::monitoring::Code;
 use crate::orchestration::{
     RunInfo, RunStatus, ThreadAction, ThreadControl, ThreadCreateTool, ThreadSendTool,
@@ -158,9 +158,12 @@ async fn route_model(
     user_id: &str,
     space: Option<&str>,
     route: &mut Route,
-) -> Result<RunModel, String> {
+) -> Result<RunModel, Refusal> {
     if let Some(why) = &route.blocked {
-        return Err(why.clone());
+        return Err(Refusal {
+            shown: why.clone(),
+            note: route.sender_note.clone(),
+        });
     }
     let note = &mut route.note;
     match route.connection_id.clone() {
@@ -190,7 +193,7 @@ async fn route_model(
                         params: selection.and_then(|s| s.params(&selected.provider_id)),
                     })
                 }
-                Err(e) => Err(route.unavailable(&e)),
+                Err(e) => Err(route.refused(space, &e)),
             }
         }
         None => match crate::providers::default_model(state, user_id).await {
@@ -217,9 +220,9 @@ async fn route_model(
                         params: None,
                     })
                 }
-                None => Err(NO_MODEL.to_owned()),
+                None => Err(Refusal::shown(NO_MODEL)),
             },
-            Err(e) => Err(format!("Ask agent is unavailable: {e}.")),
+            Err(e) => Err(route.refused(space, &e)),
         },
     }
 }
@@ -518,9 +521,9 @@ pub async fn start_room_run(
     mut route: Route,
     agent: &SpaceAgent,
     pick: Option<String>,
-) -> Result<RunInfo, String> {
+) -> Result<RunInfo, Refusal> {
     let Some(user_id) = initiator.id.clone() else {
-        return Err("runs must be started on behalf of a person".to_owned());
+        return Err(Refusal::shown("runs must be started on behalf of a person"));
     };
     // Rechecked at acceptance, before any model is built or called.
     ensure_member(state, space_id, initiator).await?;
@@ -541,14 +544,15 @@ pub async fn start_room_run(
         .count();
     if active >= state.config.limits.max_space_runs {
         state.monitor_space(space_id, Code::AgentBusy).await;
-        return Err(
-            "This Space already has the most agent runs it may have at once; try again shortly."
-                .to_owned(),
-        );
+        return Err(Refusal::shown(
+            "This Space already has the most agent runs it may have at once; try again shortly.",
+        ));
     }
     let Ok(permit) = state.agent_runs.clone().try_acquire_owned() else {
         state.monitor_space(space_id, Code::AgentBusy).await;
-        return Err("The agent is busy with other requests; try again shortly.".to_owned());
+        return Err(Refusal::shown(
+            "The agent is busy with other requests; try again shortly.",
+        ));
     };
     let task = truncate(&trigger.text, 200);
     // The registry's `actor` is the initiator's stable id: it authorizes stops.
@@ -556,7 +560,7 @@ pub async fn start_room_run(
         Ok(started) => started,
         Err(e) => {
             state.monitor_space(space_id, Code::AgentBusy).await;
-            return Err(e);
+            return Err(e.into());
         }
     };
     // The turn is shown as the agent that works it: a thread's agent by the
@@ -964,6 +968,8 @@ impl Threads {
             Some(format!("Thread of {}", self.agent.name)),
         )
         .await
+        // The parent agent may repeat this in the room: the shown text only.
+        .map_err(|refusal| refusal.shown)
     }
 
     fn check_text(&self, what: &str, text: &str) -> Result<String, String> {
@@ -1216,7 +1222,9 @@ async fn run_personal(
     // Refusals are recorded only in this person's own scope, as a code.
     let model = match route_model(&state, &user_id, None, &mut route).await {
         Ok(model) => model,
-        Err(message) => {
+        Err(refusal) => {
+            // Personal Chat: `shown` is already the full reason.
+            let message = refusal.shown;
             append(kind::ERROR, message.clone()).await;
             state
                 .monitor_personal(&user_id, Code::ProviderUnavailable)

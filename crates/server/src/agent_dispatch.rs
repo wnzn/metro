@@ -200,10 +200,10 @@ async fn generic(
 /// What [`start_runs`] did.
 #[derive(Debug, Default)]
 pub struct Started {
-    /// Why runs could not start, as posted in the room.
+    /// Why runs could not start, in full, for the person who asked (a
+    /// scheduled prompt's creator); the room got the shown text.
     pub failures: Vec<String>,
-    /// The sender's own routing failure in full, for their POST response
-    /// only; the room got the generic text.
+    /// The first sender-only note, for their POST response only.
     pub note: Option<AddressingNote>,
 }
 
@@ -241,12 +241,7 @@ pub async fn start_runs(
                 .await
             }
         };
-        if let Some(why) = route.routing_failure
-            && started.note.is_none()
-        {
-            started.note = Some(AddressingNote::routing_failed(why));
-        }
-        if let Err(reason) = crate::agent::start_room_run(
+        if let Err(refusal) = crate::agent::start_room_run(
             state,
             space,
             room,
@@ -264,10 +259,13 @@ pub async fn start_runs(
                     &room.id,
                     kind::ERROR,
                     &Author::server(actor::SYSTEM),
-                    &reason,
+                    &refusal.shown,
                 )
                 .await;
-            started.failures.push(reason);
+            started.failures.push(refusal.private().to_owned());
+            if started.note.is_none() {
+                started.note = refusal.note;
+            }
         }
     }
     started

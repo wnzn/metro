@@ -617,10 +617,10 @@ pub struct Route {
     /// the turn fails with this text before any model is called. Never a
     /// silent switch to another model.
     pub blocked: Option<String>,
-    /// Why the person's routing could not decide, in full. Only for the
-    /// sender's own POST response: in a Space room, `blocked` names a
-    /// failure other members can't tell apart from an upstream one.
-    pub routing_failure: Option<DecisionFailure>,
+    /// Why the turn can't run, in full, for the sender's own POST response
+    /// only: in a Space room, `blocked` reads the same for a lost grant as
+    /// for an upstream failure.
+    pub sender_note: Option<AddressingNote>,
 }
 
 impl Route {
@@ -630,7 +630,7 @@ impl Route {
             connection_id: None,
             turn_selection: None,
             blocked: None,
-            routing_failure: None,
+            sender_note: None,
             note: RouteNote {
                 source: RouteSource::Default,
                 addressed_by,
@@ -651,7 +651,7 @@ impl Route {
             connection_id: Some(connection_id.to_owned()),
             turn_selection: None,
             blocked: None,
-            routing_failure: None,
+            sender_note: None,
             note: RouteNote {
                 source: RouteSource::Override,
                 addressed_by,
@@ -678,12 +678,32 @@ impl Route {
             connection_id: parent.connection_id.clone(),
             turn_selection: parent.turn_selection.clone(),
             blocked: None,
-            routing_failure: None,
+            sender_note: None,
             note,
         }
     }
 
-    /// Why a turn on this route could not get its model.
+    /// Why a turn on this route could not get its model, as it is shown:
+    /// `space` is the Space whose members read it (`None`: the person's own
+    /// Chat, which shows the full reason). In a Space room a lost share or
+    /// connection reads exactly like any other failure, and the full reason
+    /// goes to the sender alone, as the note.
+    pub fn refused(&self, space: Option<&str>, error: &UseError) -> Refusal {
+        let message = self.unavailable(error);
+        match space {
+            None => Refusal::shown(message),
+            Some(_) => Refusal {
+                shown: MODEL_UNAVAILABLE_IN_ROOM.to_owned(),
+                note: Some(AddressingNote::ModelUnavailable {
+                    source: self.note.source,
+                    reason: use_reason(error),
+                    message,
+                }),
+            },
+        }
+    }
+
+    /// Why a turn on this route could not get its model, in full.
     pub fn unavailable(&self, error: &UseError) -> String {
         match (&self.note.source, error) {
             (RouteSource::Override, UseError::NotFound) => {
@@ -713,6 +733,69 @@ impl Route {
             ),
             (_, e) => format!("Ask agent is unavailable: {e}."),
         }
+    }
+}
+
+/// What other members of a Space room read when a turn couldn't get the
+/// sender's model, whatever the reason: a revoked share, a deleted or
+/// misconfigured connection, a busy or offline device.
+pub const MODEL_UNAVAILABLE_IN_ROOM: &str =
+    "This run couldn't use the sender's model, so no agent answered. No other model was used.";
+
+/// A turn that could not start: `shown` is posted where the turn was
+/// asked for; `note` is the full reason for the sender's POST response.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Refusal {
+    pub shown: String,
+    pub note: Option<AddressingNote>,
+}
+
+impl Refusal {
+    pub fn shown(text: impl Into<String>) -> Self {
+        Self {
+            shown: text.into(),
+            note: None,
+        }
+    }
+
+    /// The text for the person who asked: the note's full message if any.
+    pub fn private(&self) -> &str {
+        match &self.note {
+            Some(
+                AddressingNote::RoutingFailed { message, .. }
+                | AddressingNote::ModelUnavailable { message, .. },
+            ) => message,
+            _ => &self.shown,
+        }
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(text: String) -> Self {
+        Self::shown(text)
+    }
+}
+
+/// A coarse, stable code for why a connection can't be used.
+fn use_reason(error: &UseError) -> &'static str {
+    match error {
+        UseError::NotFound
+        | UseError::Revoked
+        | UseError::PresetNeedsOwnConnection(_)
+        | UseError::WrongCapability { .. }
+        | UseError::TurnModelNotAllowed
+        | UseError::TurnEffortNotAllowed
+        | UseError::TurnChanged => "not_allowed",
+        UseError::Busy => "busy",
+        UseError::DeviceOffline => "offline",
+        UseError::NoModel
+        | UseError::NoMasterKey
+        | UseError::KeyUnreadable
+        | UseError::KeyMissing
+        | UseError::EndpointNotApproved
+        | UseError::Unsupported
+        | UseError::MediaUnsupported => "misconfigured",
+        UseError::Internal => "internal",
     }
 }
 
@@ -796,26 +879,33 @@ impl DecisionFailure {
     }
 }
 
-/// Extra metadata on the sender's POST response only; never on an Event.
-#[derive(Clone, Copy, Debug, Serialize)]
+/// Extra metadata on the sender's POST response only; never on an Event
+/// and never stored.
+///
+/// `addressing_note` carries `classification_failed`. `routing_note`
+/// carries the other two, for a turn the message started in a Space room
+/// whose room error is generic: `routing_failed` (use-case routing could
+/// not decide) and `model_unavailable` (the turn's model connection can't
+/// be used). Both have a stable `reason` code and the full, actionable
+/// `message`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum AddressingNote {
     ClassificationFailed {
         reason: &'static str,
     },
-    /// Use-case routing could not choose a model for a turn the message
-    /// started; the room shows only a generic failure.
+    /// `reason` as for `classification_failed`.
     RoutingFailed {
         reason: &'static str,
+        message: String,
     },
-}
-
-impl AddressingNote {
-    pub fn routing_failed(why: DecisionFailure) -> Self {
-        Self::RoutingFailed {
-            reason: why.reason(),
-        }
-    }
+    /// `reason`: `not_allowed`, `busy`, `offline`, `misconfigured` or
+    /// `internal`; `source` says which of the sender's choices it was.
+    ModelUnavailable {
+        source: RouteSource,
+        reason: &'static str,
+        message: String,
+    },
 }
 
 impl From<DecisionFailure> for AddressingNote {
@@ -1140,7 +1230,7 @@ pub async fn route_turn(
                 connection_id: Some(id.clone()),
                 turn_selection: None,
                 blocked: None,
-                routing_failure: None,
+                sender_note: None,
                 note: RouteNote {
                     source: RouteSource::RoutingDefault,
                     connection_id: Some(id.clone()),
@@ -1165,15 +1255,21 @@ pub async fn route_turn(
         // connection could not answer, so nothing answers in its place.
         Decision::Failed(why) => {
             let mut route = Route::default_for(addressed_by);
+            let text = |why: DecisionFailure| {
+                format!(
+                    "Your model routing could not choose a model for this message: {why}. No \
+                     model was used; check your System One connection in Settings."
+                )
+            };
             // In a Space room every member reads this; the detail is
-            // returned to the sender alone (`routing_failure`).
+            // returned to the sender alone.
             let shown = if space.is_some() { why.shared() } else { why };
-            route.blocked = Some(format!(
-                "Your model routing could not choose a model for this message: {shown}. No \
-                 model was used; check your System One connection in Settings."
-            ));
+            route.blocked = Some(text(shown));
             route.note.reason = format!("routing failed: {shown}");
-            route.routing_failure = Some(why);
+            route.sender_note = Some(AddressingNote::RoutingFailed {
+                reason: why.reason(),
+                message: text(why),
+            });
             return route;
         }
     };
@@ -1196,7 +1292,7 @@ pub async fn route_turn(
         connection_id: Some(case.connection_id.clone()),
         turn_selection: None,
         blocked: None,
-        routing_failure: None,
+        sender_note: None,
         note: RouteNote {
             source: RouteSource::Case,
             addressed_by,

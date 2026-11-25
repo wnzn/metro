@@ -20,6 +20,7 @@ use metro_model_protocol::Capability;
 use metro_server::auth::{AuthFailure, AuthFuture, HumanAuth, UserIdentity};
 use metro_server::db::Db;
 use metro_server::device_relay::DeviceError;
+use metro_server::model_routing::MODEL_UNAVAILABLE_IN_ROOM;
 use metro_server::model_routing::{BoxFuture, Routing, RoutingBackend, submit_scheduled};
 use metro_server::providers::{ProviderError, SelectedModel, UseError};
 use metro_server::{AppState, Config, Limits, ModelConfig, router};
@@ -83,6 +84,9 @@ struct Fake {
     calls: Mutex<Vec<Call>>,
     base_url: Mutex<String>,
     members: Mutex<Vec<(String, String)>>,
+    /// Connections whose (device) endpoint is offline: an upstream-side
+    /// failure that has nothing to do with access.
+    offline: Mutex<Vec<String>>,
 }
 
 impl Fake {
@@ -269,6 +273,9 @@ impl RoutingBackend for Backend {
             };
             if conn.capability != Capability::Chat {
                 return Err(UseError::NotFound);
+            }
+            if self.0.offline.lock().unwrap().iter().any(|o| o == id) {
+                return Err(UseError::DeviceOffline);
             }
             let base_url = self.0.base_url.lock().unwrap().clone();
             Ok(SelectedModel {
@@ -885,9 +892,13 @@ async fn routing_failures_in_a_room_do_not_reveal_the_senders_access() {
     let upstream = h
         .say("alice", Some(&sid), json!({"text": "@coder [err] code"}))
         .await;
-    assert_eq!(
-        upstream["routing_note"],
-        json!({"kind": "routing_failed", "reason": "unreachable"})
+    assert_eq!(upstream["routing_note"]["kind"], "routing_failed");
+    assert_eq!(upstream["routing_note"]["reason"], "unreachable");
+    assert!(
+        upstream["routing_note"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(": the System One call failed.")
     );
     assert_eq!(upstream["addressing_note"], Value::Null);
     let upstream_seen = h
@@ -907,9 +918,14 @@ async fn routing_failures_in_a_room_do_not_reveal_the_senders_access() {
     let revoked = h
         .say("alice", Some(&sid), json!({"text": "@coder review code"}))
         .await;
-    assert_eq!(
-        revoked["routing_note"],
-        json!({"kind": "routing_failed", "reason": "not_allowed"})
+    assert_eq!(revoked["routing_note"]["kind"], "routing_failed");
+    assert_eq!(revoked["routing_note"]["reason"], "not_allowed");
+    // The sender alone learns what to fix.
+    assert!(
+        revoked["routing_note"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(": the System One connection is not usable here.")
     );
     let revoked_seen = h
         .answer_after("bob", Some(&sid), revoked["id"].as_i64().unwrap())
@@ -1167,7 +1183,19 @@ async fn weak_unknown_and_failed_routes_use_the_default_or_fail_clearly() {
         .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
     assert_eq!(a["kind"], "error", "{a}");
-    let text = a["text"].as_str().unwrap();
+    assert_eq!(a["text"], MODEL_UNAVAILABLE_IN_ROOM, "{a}");
+    // The full reason is the sender's alone, on their POST response.
+    let note = &e["routing_note"];
+    assert_eq!(
+        (
+            note["kind"].as_str(),
+            note["source"].as_str(),
+            note["reason"].as_str()
+        ),
+        (Some("model_unavailable"), Some("case"), Some("not_allowed")),
+        "{note}"
+    );
+    let text = note["message"].as_str().unwrap();
     assert!(
         text.contains("\"Coding\"") && text.contains("No other model was used"),
         "{text}"
@@ -1947,14 +1975,134 @@ async fn per_space_and_per_agent_models_come_before_the_personal_default() {
         .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
     assert_eq!(a["kind"], "error", "{a}");
+    assert_eq!(a["text"], MODEL_UNAVAILABLE_IN_ROOM, "{a}");
+    let note = &e["routing_note"];
+    assert_eq!(
+        (note["kind"].as_str(), note["source"].as_str()),
+        (Some("model_unavailable"), Some("space_default")),
+        "{note}"
+    );
     assert!(
-        a["text"]
+        note["message"]
             .as_str()
             .unwrap()
             .contains("default model for this Space"),
-        "{a}"
+        "{note}"
     );
     assert_eq!(h.model_calls().len(), calls);
+}
+
+#[tokio::test]
+async fn a_lost_model_connection_reads_like_any_failure_to_other_members() {
+    let h = H::start().await;
+    let sid = h.space("private model failures").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let (s, v) = h
+        .put_prefs(
+            "alice",
+            &sid,
+            json!({"default_model": {"provider_connection_id": id(CODE)},
+                   "agent_models": {coder.clone(): {"provider_connection_id": id(WRITING)}}}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    // Alice's Space default fails for a reason unrelated to access...
+    h.fake.offline.lock().unwrap().push(id(CODE));
+    let calls = h.model_calls().len();
+    let offline = h
+        .say("alice", Some(&sid), json!({"text": "@agent a"}))
+        .await;
+    // ...and her model for @coder loses its share.
+    h.fake
+        .conns
+        .lock()
+        .unwrap()
+        .get_mut(&id(WRITING))
+        .unwrap()
+        .grants
+        .clear();
+    let revoked = h
+        .say("alice", Some(&sid), json!({"text": "@coder b"}))
+        .await;
+
+    let mut seen = Vec::new();
+    for e in [&offline, &revoked] {
+        let a = h
+            .answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
+            .await;
+        assert_eq!(a["kind"], "error", "{a}");
+        seen.push(a["text"].clone());
+    }
+    assert_eq!(seen[0], seen[1], "bob can't tell them apart");
+    assert_eq!(seen[0], MODEL_UNAVAILABLE_IN_ROOM);
+    assert_eq!(
+        h.model_calls().len(),
+        calls,
+        "no model ran, nothing fell back"
+    );
+    let transcript = serde_json::to_string(&h.events("bob", Some(&sid)).await).unwrap();
+    for leak in [
+        "routing_note",
+        "not_allowed",
+        "offline",
+        "default model for this",
+        "can't be used here",
+    ] {
+        assert!(!transcript.contains(leak), "{leak}");
+    }
+    assert_eq!(
+        h.events("alice", Some(&sid)).await.len(),
+        h.events("bob", Some(&sid)).await.len()
+    );
+
+    // Alice still gets an actionable reason for each, privately.
+    let note = &offline["routing_note"];
+    assert_eq!(
+        (
+            note["kind"].as_str(),
+            note["source"].as_str(),
+            note["reason"].as_str()
+        ),
+        (
+            Some("model_unavailable"),
+            Some("space_default"),
+            Some("offline")
+        ),
+        "{note}"
+    );
+    assert!(
+        note["message"]
+            .as_str()
+            .unwrap()
+            .contains("default model for this Space")
+    );
+    let note = &revoked["routing_note"];
+    assert_eq!(
+        (
+            note["kind"].as_str(),
+            note["source"].as_str(),
+            note["reason"].as_str()
+        ),
+        (
+            Some("model_unavailable"),
+            Some("agent_default"),
+            Some("not_allowed")
+        ),
+        "{note}"
+    );
+    assert!(
+        note["message"]
+            .as_str()
+            .unwrap()
+            .contains("default model for this agent in this Space")
+    );
+    assert!(offline.get("addressing_note").is_some_and(Value::is_null));
 }
 
 #[tokio::test]

@@ -308,7 +308,12 @@ async fn selection_route(
         .await
         {
             Ok(selection) => route.turn_selection = Some(selection),
-            Err(e) => route.blocked = Some(route.unavailable(&e)),
+            Err(e) => {
+                // A Space route: the room reads a generic failure.
+                let refusal = route.refused(Some(space), &e);
+                route.blocked = Some(refusal.shown);
+                route.sender_note = refusal.note;
+            }
         }
     }
     route
