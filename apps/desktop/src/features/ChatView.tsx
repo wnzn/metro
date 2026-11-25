@@ -13,8 +13,6 @@ import {
   activeEvents,
   activeLoaded,
   chatUnavailable,
-  createSpace,
-  creatingSpace,
   dispatchDraft,
   dispatchError,
   dispatching,
@@ -43,6 +41,7 @@ import { Action, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Mo
 import { EmptyState, sidePanelFits, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
 import { Composer, ConnectionBanner, Transcript } from "./Conversation";
+import { CreateSpaceForm } from "./CreateSpaceForm";
 import { ModelOnboarding, needsChatModel } from "./ModelOnboarding";
 import { roomTree } from "./Sidebar";
 
@@ -155,10 +154,7 @@ function Onboarding() {
         <Label variant="caption" color="muted">
           Create one, or ask a Space owner to add you.
         </Label>
-        <Row gap={2} align="center">
-          <Field testID="onboarding-space-name" accessibilityLabel="New Space name" value={name()} onChange={name.set} placeholder="Name your first Space" grow maxLength={80} onSubmit={() => void createSpace(name())} />
-          <Action testID="onboarding-create-space" label="Create Space" busyLabel="Creating…" busy={creatingSpace()} variant="primary" onPress={() => void createSpace(name())} />
-        </Row>
+        <CreateSpaceForm onboarding name={name} setName={name.set} />
       </Column>
     </Banner>
   );

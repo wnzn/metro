@@ -63,7 +63,7 @@ test("picking only stages; Remove and a cancelled pick upload nothing; Send uplo
   expect(uploads(w).length).toBe(1);
   expect(uploads(w)[0]!.url).toBe(`${BASE}/v1/library/assets?scope=space&space_id=acme&name=notes.txt`);
   const id = w.l.assets[0]!.id;
-  expect(posts(w).at(-1)!.body).toEqual({ text: "see attached", invoke_agent: false, asset_ids: [id] });
+  expect(posts(w).at(-1)!.body).toEqual({ text: "see attached", invoke_agent: false, asset_ids: [id], infer_text_mentions: false });
   expect(w.f.state.log.some((l) => l.path.includes("/library/index"))).toBe(false); // never indexed
   const ev = lastFiles(w, "acme/lobby");
   await app.waitFor(`id:file:${ev.id}:${id}`);
@@ -181,7 +181,7 @@ test("a failed post keeps the draft and files; Send again doesn't upload twice",
   w.knobs.failPosts = 1;
   await app.press("id:send");
   await app.waitFor("id:action-error");
-  expect(app.shows("text:/Send again won't upload them twice/")).toBe(true);
+  expect(app.shows("text:/Check the conversation before sending again/")).toBe(true);
   expect(app.value("id:composer")).toBe("retry me");
   expect(app.shows("id:staged:notes.txt >> text:/in the Library/")).toBe(true);
   expect(uploads(w).length).toBe(1);

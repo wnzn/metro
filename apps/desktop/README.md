@@ -1,5 +1,8 @@
 # Metro desktop
 
+For changes since the published 0.4.0 app, see
+[In the source, not released](../../docs/next-source.md).
+
 The Metro desktop client, written in TSX on [Native Shell (NSH)](https://nsh.dev).
 NSH renders it with each platform's own views: GTK 4 on Linux, AppKit on macOS,
 and Win32 on Windows. No npm or Node is needed to build or run it.
@@ -198,12 +201,14 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   source fixes this: badges now move to *Serving from here* or *On* in the
   open view, which automated tests cover. The final archive hasn't been
   re-checked in the GUI.
-- **Windows:** every Windows check so far ran under Wine on Linux, never on
-  native Windows. The 0.2.0 candidate and the later test archives opened a
-  Metro window and their bundled server answered health checks, but the
-  window rendered blank under Wine and Wine reported no live window icon.
-  Nobody has checked that the Windows app draws, takes input, shows its
-  icon or signs in to a vendor.
+- **Windows GUI:** earlier local GUI smoke tests ran under Wine on Linux,
+  not on native Windows. The 0.2.0 candidate and later test archives
+  opened a Metro window and their bundled server answered health checks,
+  but the window rendered blank in later Wine checks and Wine reported
+  no live window icon. Separately, the 0.4.0 release CI passed unattended
+  MSI checks on a native Windows runner. No person has verified the
+  desktop GUI or the MSI wizard on native Windows. See the
+  [release record](../../docs/acceptance.md#published-metro-040-2026-11-25-github-release-v040).
 - **Linux:** native GUI checks ran in Debian 13 under Xvfb, with scripted
   local model endpoints only. Other distributions, such as Arch or CachyOS,
   have no recorded GUI run; see
@@ -449,6 +454,8 @@ by automated tests. Windows and macOS weren't checked.
   owner can still issue one on purpose. A Space uses at most one runner, so
   attaching needs the dedicated token revoked first.
 - **Settings** (sidebar, available with or without any Space):
+  - **Profile:** edit your display name, bio and picture, and copy your
+    stable User ID.
   - **Runners:** add a named runner, either personal or (for org admins)
     organization-wide. Its token is shown once, masked until you press Show,
     next to copyable steps for the prebuilt runner of this app's version:
@@ -510,6 +517,9 @@ by automated tests. Windows and macOS weren't checked.
     threshold (0.5 to 1). **Where your text goes** says, from what is chosen,
     which endpoint receives which text, whose it is, and what is never sent.
     The page saves the whole draft at once; leaving it drops unsaved edits.
+  - **Monitoring:** choose one source: **This computer** when the helper
+    is available, **My Chat**, one Space you own, or **Organization**
+    if you're an org admin. Events from different sources aren't combined.
   - **Appearance:** Dark (the default), Light or System.
   - Every token or key shown once is wiped from memory when you press Done,
     change page, Space or room, or disconnect. None of them is stored.
@@ -525,7 +535,8 @@ by automated tests. Windows and macOS weren't checked.
   - Arch, CachyOS and other Arch-based systems: `sudo pacman -S --needed
     webkitgtk-6.0 gtk4 gst-plugins-base-libs gst-plugins-base`
 - **Windows x64:** 64-bit Windows 10 1809 or later, or Windows 11 (see
-  [below](#windows-portable-package)). Not yet tested on native Windows.
+  [below](#windows-portable-package)). Native CI checks were unattended;
+  the GUI hasn't been verified by a person on native Windows.
 - **macOS:** not tried.
 
 Building, testing and capturing screenshots of the app from source are for
@@ -621,10 +632,10 @@ contributors only, in
 The release file is `Metro-<version>-windows-x64.zip` (for 0.4.0,
 `Metro-0.4.0-windows-x64.zip`), a portable build with no installer.
 Release ZIPs ship without an Authenticode signature for now
-([install.md](../../docs/install.md#desktop-on-windows)). Nobody has
-started the app from it on native Windows; the 0.2.0 candidate has only
-been started under Wine. Its
-checks are in [acceptance](../../docs/acceptance.md#verified-windows-x64-portable-package-built-on-linux-2026-11-22-packaging-local).
+([install.md](../../docs/install.md#desktop-on-windows)). No native Windows
+GUI check by a person is recorded. Earlier
+[portable GUI smoke tests](../../docs/acceptance.md#verified-windows-x64-portable-package-built-on-linux-2026-11-22-packaging-local)
+ran under Wine on Linux; the release's native CI MSI checks are separate.
 
 1. Check the ZIP against its `.sha256` file, for example with
    `Get-FileHash Metro-<version>-windows-x64.zip -Algorithm SHA256` in PowerShell.

@@ -6,12 +6,12 @@ import type { AvatarSize } from "../../ui";
 import { initialsOf, personTone } from "./identity";
 import { ensurePerson, personState, pictureFailed, profileName } from "./profileState";
 
-export function PersonAvatar(props: { userId: string | null | undefined; name: string; size?: AvatarSize; testID?: string; accessibilityLabel?: string }) {
+export function PersonAvatar(props: { userId: string | null | undefined; name: string; verifiedName?: boolean; size?: AvatarSize; testID?: string; accessibilityLabel?: string }) {
   effect(() => {
     const id = props.userId;
     if (id) void ensurePerson(id);
   });
-  const shownName = () => profileName(props.userId) ?? props.name;
+  const shownName = () => props.verifiedName ? props.name : profileName(props.userId) ?? props.name;
   return (
     <Avatar
       testID={props.testID}

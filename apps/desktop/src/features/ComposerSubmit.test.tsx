@@ -1,7 +1,7 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
-import { composerAddress } from "./composerAddress";
+import { prepareMentionSend } from "./mentions/draft";
 import { attachmentWorld } from "./attachments/test/fixtures";
 import { launched } from "../../test/launched";
 
@@ -100,7 +100,6 @@ test("with System One available, Send still asks directly; a stale pin blocks Se
   await app.press("text:Done");
   // Rust treats NEL as whitespace, so legacy false + this text would ask.
   const text = "keep this\u0085@agent as literal text";
-  expect(composerAddress(text).agent).toBe(false);
   await app.type("id:composer", text);
   await app.press("id:send");
   await app.waitFor("id:action-error");
@@ -170,7 +169,7 @@ test("an empty composer catalog offers the provider setup without contacting a m
 
 test("unloaded and loaded catalogs give Chat Send the same direct behavior", async () => {
   const { f, posts } = setup();
-  f.state.delays.set("/v1/models/available", 600);
+  f.answerLate("/v1/models/available", TOKENS.alice!, 600);
   const app = await chat(f);
   await app.type("id:composer", "already writing");
   await app.submit("id:composer");
@@ -184,10 +183,15 @@ test("unloaded and loaded catalogs give Chat Send the same direct behavior", asy
 });
 
 test("agent addressing matches standalone handles outside inline and fenced code", () => {
+  const addresses = (text: string, ids: string[] = []) => {
+    const prepared = prepareMentionSend({ text, anchors: [] }, { members: ids.map(id => ({ id })), agents: [] });
+    if (!prepared.ok) throw new Error(prepared.reason);
+    return { agent: !!prepared.body.mentions?.some(m => m.kind === "agent"), people: !!prepared.body.mentions?.some(m => m.kind === "user") };
+  };
   for (const text of ["` @agent `", "`` odd ` @agent ``", "```sh\n@agent\n```", "~~~js\n@agent", "mail@agent", "\\@agent", "@agent.example", "@agent's", "@agent/foo", "@agent/@bob", "https://x/@agent"])
-    expect(composerAddress(text).agent).toBe(false);
+    expect(addresses(text).agent).toBe(false);
   for (const text of ["@agent", "(@AgEnT), hi", "unmatched ` @agent?", "```\n@agent\n```\n @agent!"])
-    expect(composerAddress(text).agent).toBe(true);
-  expect(composerAddress("@agent.", ["agent."])).toEqual({ agent: false, people: true });
-  expect(composerAddress("@bob @agent now")).toEqual({ agent: true, people: true });
+    expect(addresses(text).agent).toBe(true);
+  expect(addresses("@agent.", ["agent."])).toEqual({ agent: false, people: true });
+  expect(addresses("@bob @agent now", ["bob"])).toEqual({ agent: true, people: true });
 });
