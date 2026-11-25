@@ -1458,6 +1458,31 @@ async fn execute_personal_run(
 mod tests {
     use super::*;
 
+    #[test]
+    fn web_tool_events_never_become_model_history() {
+        let key = TurnKey::new();
+        let web = "<web-data id=\"abc\" source=\"exa\">page text</web-data id=\"abc\">";
+        let events = vec![
+            event(kind::MESSAGE, "search please", Some(1)),
+            event(kind::TOOL_CALL, "web_search \"q\"", Some(2)),
+            event(kind::TOOL_RESULT, web, Some(3)),
+            event(
+                kind::ERROR,
+                "web_fetch refused: a URL didn't come from a person",
+                Some(4),
+            ),
+            event(kind::REASONING_SUMMARY, web, Some(5)),
+            event(kind::AGENT, "my own summary", Some(6)),
+        ];
+        let h = history(&events, &key);
+        assert_eq!(h.len(), 2);
+        let all = format!("{h:?}");
+        assert!(
+            !all.contains("web-data") && !all.contains("page text") && !all.contains("refused")
+        );
+        assert!(all.contains("my own summary"));
+    }
+
     fn event(kind: &str, text: &str, created_at: Option<i64>) -> Event {
         Event {
             id: 7,

@@ -15,7 +15,12 @@ Checks:
 2. Bob has no web device: his run gets no web tools and a note instead.
 3. Carol registered a computer that isn't running: her search fails at once
    with a visible error, and the agent still answers.
-4. Every provider limited: the error lists each one, TinyFish needs a key.
+   The model gets the result framed as untrusted web data; the scripted
+   model answers with its own summary (never an echo), and the next turn's
+   history carries neither the web text nor its framing.
+4. Every provider limited, and Firecrawl echoes Alice's key back in a
+   successful answer: that answer is refused on her computer; the error
+   lists each provider; TinyFish needs a key.
 5. A scheduled prompt of Carol's (offline computer) answers without web
    data, with the error visible in the room.
 6. The Firecrawl key never reaches the server's database, its output or
@@ -79,11 +84,11 @@ class Fixture(HTTPServer):
         last_user = "\n".join(content_parts(users[-1].get("content"))) if users else ""
         with self.lock:
             self.model_requests.append({"tools": tools, "system": system, "user": last_user,
-                                        "last": messages[-1]})
+                                        "last": messages[-1], "all": json.dumps(messages)})
         last = messages[-1]
         if last["role"] == "tool":
-            told = "\n".join(content_parts(last.get("content")))
-            return text_reply(f"ANSWER after tool: {told[:3000]}")
+            # A summary of the assistant's own: never an echo of tool output.
+            return text_reply(f"ANSWER summarized {uuid.uuid4().hex[:8]}")
         if "SEARCH-ME" in last_user and "web_search" in tools:
             return tool_reply(f"call_{uuid.uuid4().hex}", {
                 "name": "web_search", "arguments": json.dumps({"query": self.query}),
@@ -122,6 +127,11 @@ class Fixture(HTTPServer):
             return 429, {"error": "limited"}
         if mode == "ok":
             return 200, {"results": [{"title": "T", "url": "https://t.example/", "content": "c"}]}
+        if mode == "reflect":
+            # A vendor that echoes the credential back in a successful answer.
+            echoed = (headers.get("Authorization") or "").removeprefix("Bearer ")
+            return 200, {"success": True, "data": {"web": [
+                {"title": f"echo {echoed}", "url": "https://r.example/", "description": "d"}]}}
         return 429, {"error": "limited"}
 
 
@@ -308,15 +318,25 @@ def web_search(server_binary, connector, timeout):
         results = [e for e in mine if e["kind"] == "tool_result"]
         require(len(results) == 1, "expected one web_search result")
         summary = results[0]["text"]
-        require(summary.startswith("web_search via Exa (free): 1 result"), "wrong provider summary")
-        require(fx.exa_title in summary and "Tried: Tavily (free) rate-limited" in summary
+        # Exa's text output is shown as text, never turned into results.
+        require(summary.startswith("web_search via Exa (free): results as text"),
+                "wrong provider summary")
+        require("Tried: Tavily (free) rate-limited" in summary
                 and "→ Exa (free) ok" in summary, "the rotation was not shown")
+        require(fx.exa_title not in json.dumps(mine), "web text reached the room")
         note = results[0]["activity"]["tool"]
         require(note["provider"] == "exa" and [a["outcome"] for a in note["attempts"]] ==
                 ["limited", "ok"], "activity.tool did not carry the attempts")
+        # The framing is checked on the tool message the model received.
+        tool_msgs = [r["last"] for r in fx.model_requests if r["last"]["role"] == "tool"]
+        require(len(tool_msgs) == 1, "expected one tool message")
+        told = "\n".join(content_parts(tool_msgs[0].get("content")))
+        require(told.startswith("<web-data id=\"") and 'source="exa"' in told
+                and fx.exa_title in told and told.rstrip().endswith("\">")
+                and "</web-data id=\"" in told, "the tool result was not framed as web data")
         reply = agent_reply_after(events, sent["id"])[0]["text"]
-        require("<web-data id=" in reply and fx.exa_title in reply,
-                "the model did not get the wrapped result")
+        require(reply.startswith("ANSWER summarized") and fx.exa_title not in reply,
+                "the fixture must not echo tool output")
         require(fx.vendor_hits[:1] == ["tavily"] and "exa" in fx.vendor_hits,
                 "the vendors were not tried in order")
         require("tinyfish" not in fx.vendor_hits, "TinyFish was called without a key")
@@ -330,6 +350,10 @@ def web_search(server_binary, connector, timeout):
         req = fx.model_requests[before]
         require("web_search" not in req["tools"] and "Web search isn't set up for the person who asked"
                 in req["system"], "Bob's run got web tools or no note")
+        # Tool results are never history: the next turn in the room carries
+        # neither the web text nor its framing.
+        require(fx.exa_title not in req["all"] and "web-data" not in req["all"],
+                "a tool result became model history")
 
         # 3. Carol's computer isn't running: a visible error at once.
         started = time.monotonic()
@@ -342,8 +366,10 @@ def web_search(server_binary, connector, timeout):
         require(any("Metro isn't running on carol's computer" in t for t in errors),
                 "no visible offline error")
 
-        # 4. Everything limited: each provider is listed.
+        # 4. Everything limited, and Firecrawl echoes Alice's key back in a
+        # successful answer: that answer is refused on her computer.
         fx.mode["exa"] = "limited"
+        fx.mode["firecrawl"] = "reflect"
         call(alice, "POST", "/v1/web-search/prefs", expect=(405,), label="prefs is GET/PUT")
         hits = len(fx.vendor_hits)
         sent = call(alice, "POST", f"{room}/messages", body={"text": "@agent SEARCH-ME again"},
@@ -354,12 +380,16 @@ def web_search(server_binary, connector, timeout):
         require(len(errors) == 1, "expected one exhausted error")
         for part in ("every web search provider on alice's computer is unavailable",
                      "Tavily (free): paused after an earlier limit", "Exa (free): rate-limited",
-                     "Parallel (free): rate-limited", "Firecrawl (your key): rate-limited",
+                     "Parallel (free): rate-limited", "Firecrawl (your key): sent an unusable answer",
                      "TinyFish: needs a free key"):
             require(part in errors[0], f"exhausted error is missing {part!r}")
         require("tavily" not in fx.vendor_hits[hits:], "a cooling provider was called")
         require(fx.firecrawl_auth and all(a == f"Bearer {canary}" for a in fx.firecrawl_auth),
                 "Firecrawl did not get Alice's key")
+        require(canary not in json.dumps(read_events(call, bob, room)),
+                "the echoed key reached the room")
+        require(all(canary not in r["all"] for r in fx.model_requests),
+                "the echoed key reached the model")
 
         # 5. Carol's scheduled prompt: answered without web data.
         at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=3)
