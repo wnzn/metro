@@ -106,20 +106,56 @@ pub fn is_commit(text: &str) -> bool {
     text.len() == 40 && text.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// Write a file atomically (temp file, fsync, rename).
+/// Write a file atomically: a new, uniquely named temp file next to it
+/// (created exclusively, never following a link), fsync, rename over the
+/// target, fsync the parent folder. Errors are returned, never swallowed.
 pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
     let name = path
         .file_name()
         .unwrap_or_default()
         .to_string_lossy()
         .to_string();
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    let mut f = std::fs::File::create(&tmp)?;
-    f.write_all(bytes)?;
-    f.sync_all()?;
-    drop(f);
-    std::fs::rename(&tmp, path).inspect_err(|_| {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+        ^ COUNTER.fetch_add(1, Ordering::Relaxed).rotate_left(32);
+    let tmp = path.with_file_name(format!(".{name}.{}.{nonce:016x}.tmp", std::process::id()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let result = (|| {
+        let mut f = options.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)?;
+        sync_parent(path)
+    })();
+    if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
-    })
+    }
+    result
+}
+
+/// fsync a path's parent folder (Unix; Windows has no folder handles to sync).
+pub fn sync_parent(path: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(unix)]
+    if let Some(parent) = path.parent() {
+        let dir = if parent.as_os_str().is_empty() {
+            std::path::Path::new(".")
+        } else {
+            parent
+        };
+        std::fs::File::open(dir)?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
 }

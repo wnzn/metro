@@ -380,3 +380,160 @@ fn zip_happy_path_and_refusals() {
     // Truncated.
     assert!(zip_extract(&good[..good.len() - 5]).is_err());
 }
+
+#[test]
+fn windows_aliases_are_refused() {
+    for name in [
+        "CON", "nul.txt", "Aux.json", "com1", "LPT9.log", "COM¹", "conin$", "file.", "file ",
+        "dir./x", "a /b",
+    ] {
+        let h = ustar_header(&format!("{TOP}/{name}"), 1, 0o644, b'0');
+        assert_eq!(
+            refused(&raw_tar(&[(h, b"x")])),
+            ErrorCode::Archive,
+            "{name}"
+        );
+    }
+    // Look-alikes that are fine.
+    for name in ["CONFIG", "console.txt", "COM10", "LPT", "nul_x"] {
+        let h = ustar_header(&format!("{TOP}/{name}"), 1, 0o644, b'0');
+        // Not refused for the name: it fails later only because RELEASE.json is missing.
+        let e = extract(&raw_tar(&[(h, b"x")])).unwrap_err();
+        assert!(e.detail.contains("RELEASE.json"), "{name}: {e}");
+    }
+}
+
+#[test]
+fn trailing_padding_is_bounded() {
+    let raw = |pad: usize| {
+        let mut files = payload();
+        let rj = release_json("runner", "linux-x64", "0.5.0", &payload());
+        let rj: &'static [u8] = Box::leak(rj.into_boxed_slice());
+        files.insert(0, ("RELEASE.json", rj, 0o644));
+        let mut tar = Vec::new();
+        for (n, d, m) in &files {
+            tar.extend_from_slice(&ustar_header(
+                &format!("{TOP}/{n}"),
+                d.len() as u64,
+                *m,
+                b'0',
+            ));
+            tar.extend_from_slice(d);
+            tar.resize(tar.len().div_ceil(512) * 512, 0);
+        }
+        tar.extend_from_slice(&[0u8; 1024]);
+        tar.resize(tar.len() + pad, 0);
+        gzip(&tar)
+    };
+    assert!(extract(&raw(10 * 1024)).is_ok(), "Python's record padding");
+    assert_eq!(refused(&raw(512 * 1024)), ErrorCode::Archive);
+}
+
+#[test]
+fn verified_extraction_is_bound_to_the_bytes_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = good_archive();
+    let path = dir.path().join("a.tar.gz");
+    std::fs::write(&path, &archive).unwrap();
+    let v = v();
+    let good = metro_release::sha256(&archive);
+    let dest = dir.path().join("ok");
+    std::fs::create_dir(&dest).unwrap();
+    metro_release::archive::extract_tar_gz_verified(
+        std::fs::File::open(&path).unwrap(),
+        &good,
+        TOP,
+        &dest,
+        &expect(&v),
+    )
+    .unwrap();
+    let mut wrong = good;
+    wrong[0] ^= 1;
+    let dest = dir.path().join("bad");
+    std::fs::create_dir(&dest).unwrap();
+    let e = metro_release::archive::extract_tar_gz_verified(
+        std::fs::File::open(&path).unwrap(),
+        &wrong,
+        TOP,
+        &dest,
+        &expect(&v),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotVerified);
+    // Private copies too.
+    let mut src = std::fs::File::open(&path).unwrap();
+    let mut copy =
+        metro_release::archive::private_copy_verified(&mut src, &good, &dir.path().join("copy"))
+            .unwrap();
+    let mut back = Vec::new();
+    std::io::Read::read_to_end(&mut copy, &mut back).unwrap();
+    assert_eq!(back, archive);
+    assert!(
+        metro_release::archive::private_copy_verified(&mut src, &wrong, &dir.path().join("copy2"))
+            .is_err()
+    );
+    assert!(
+        metro_release::archive::private_copy_verified(&mut src, &good, &dir.path().join("copy"))
+            .is_err(),
+        "never replaces"
+    );
+}
+
+#[test]
+fn staged_trees_are_checked_against_the_authentic_archive() {
+    use metro_release::archive::{inspect_tar_gz, verify_tree};
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("stage");
+    std::fs::create_dir(&dest).unwrap();
+    let v = v();
+    let archive = good_archive();
+    let extracted = extract_tar_gz(archive.as_slice(), TOP, &dest, &expect(&v)).unwrap();
+    let authentic = inspect_tar_gz(archive.as_slice(), TOP, &expect(&v)).unwrap();
+    assert_eq!(extracted.files, authentic.files);
+    assert_eq!(extracted.release_json_sha256, authentic.release_json_sha256);
+    verify_tree(&dest, &authentic, &["enable-local-runner"]).unwrap();
+    std::fs::write(dest.join("enable-local-runner"), b"").unwrap();
+    verify_tree(&dest, &authentic, &["enable-local-runner"]).unwrap();
+    std::fs::write(dest.join("enable-local-runner"), b"x").unwrap();
+    assert!(
+        verify_tree(&dest, &authentic, &["enable-local-runner"]).is_err(),
+        "marker with content"
+    );
+    std::fs::remove_file(dest.join("enable-local-runner")).unwrap();
+    for change in ["edit", "extra", "missing", "link", "release"] {
+        let d = dir.path().join(change);
+        std::fs::create_dir(&d).unwrap();
+        extract_tar_gz(archive.as_slice(), TOP, &d, &expect(&v)).unwrap();
+        match change {
+            "edit" => std::fs::write(d.join("run-runner"), b"#!/bin/sh\nevil\n").unwrap(),
+            "extra" => std::fs::write(d.join("evil.so"), b"x").unwrap(),
+            "missing" => std::fs::remove_file(d.join("run-runner")).unwrap(),
+            "link" => {
+                std::fs::remove_file(d.join("run-runner")).unwrap();
+                std::os::unix::fs::symlink("/bin/sh", d.join("run-runner")).unwrap();
+            }
+            _ => std::fs::write(d.join("RELEASE.json"), b"{}").unwrap(),
+        }
+        assert_eq!(
+            verify_tree(&d, &authentic, &[]).unwrap_err().code,
+            ErrorCode::NotVerified,
+            "{change}"
+        );
+    }
+}
+
+#[test]
+fn zip_central_directory_is_capped_before_it_is_read() {
+    // A file whose end record claims a 5 MiB central directory.
+    let size: u32 = 5 * 1024 * 1024;
+    let mut bytes = vec![0u8; size as usize];
+    bytes.extend_from_slice(&0x0605_4b50u32.to_le_bytes());
+    bytes.extend_from_slice(&[0; 4]);
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&1u16.to_le_bytes());
+    bytes.extend_from_slice(&size.to_le_bytes());
+    bytes.extend_from_slice(&0u32.to_le_bytes());
+    bytes.extend_from_slice(&0u16.to_le_bytes());
+    let e = zip_extract(&bytes).unwrap_err();
+    assert_eq!(e.code, ErrorCode::TooLarge, "{e}");
+}

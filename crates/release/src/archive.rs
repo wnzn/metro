@@ -22,6 +22,13 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 pub const MAX_ENTRIES: usize = 20_000;
+/// Everything a tar.gz may expand to: the files plus headers and padding.
+pub const MAX_EXPANDED: u64 = MAX_ARCHIVE + (MAX_ENTRIES as u64) * 1024 + 64 * 1024;
+/// Zero padding accepted after the tar end marker (Python pads to 10 KiB).
+pub const MAX_TRAILING_ZEROS: usize = 64 * 1024;
+/// Central directory size cap (a release's is a few kilobytes; 4 MiB still
+/// holds every entry with a 150-byte name).
+pub const MAX_CENTRAL_DIRECTORY: u64 = 4 * 1024 * 1024;
 const MAX_RELEASE_JSON: u64 = 64 * 1024;
 pub const RELEASE_JSON: &str = "RELEASE.json";
 
@@ -41,6 +48,8 @@ pub struct VerifiedTree {
     pub files: BTreeMap<String, [u8; 32]>,
     /// The whole parsed `RELEASE.json`.
     pub release: serde_json::Value,
+    /// SHA-256 of the `RELEASE.json` bytes themselves.
+    pub release_json_sha256: [u8; 32],
 }
 
 fn archive_error(detail: &str) -> Error {
@@ -64,6 +73,11 @@ fn relative<'n>(name: &'n str, top: &str) -> Result<&'n str, Error> {
     )?;
     for part in rel.split('/') {
         require(
+            !windows_alias(part),
+            ErrorCode::Archive,
+            "bad entry path (a reserved Windows name or a trailing dot or space)",
+        )?;
+        require(
             !part.is_empty()
                 && part != "."
                 && part != ".."
@@ -80,8 +94,93 @@ fn relative<'n>(name: &'n str, top: &str) -> Result<&'n str, Error> {
     Ok(rel)
 }
 
+/// Names Windows maps to devices (`CON`, `NUL.txt`, `COM1`…) or silently
+/// rewrites (`a.`, `a `): refused on every platform, so a tree means the same
+/// files everywhere.
+fn windows_alias(part: &str) -> bool {
+    if part.ends_with('.') || part.ends_with(' ') {
+        return true;
+    }
+    let stem = part
+        .split('.')
+        .next()
+        .unwrap_or(part)
+        .trim_end()
+        .to_uppercase();
+    if matches!(
+        stem.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) {
+        return true;
+    }
+    match stem
+        .strip_prefix("COM")
+        .or_else(|| stem.strip_prefix("LPT"))
+    {
+        Some(n) => matches!(
+            n,
+            "0" | "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+        ),
+        None => false,
+    }
+}
+
+/// Create the folders of `rel` under `dest` one by one, never following a
+/// link (refusing anything that isn't a plain folder we can see).
+fn make_parents(dest: &Path, rel: &str) -> Result<PathBuf, Error> {
+    let mut path = dest.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for part in &parts[..parts.len() - 1] {
+        path.push(part);
+        match fs::symlink_metadata(&path) {
+            Ok(m) if m.is_dir() && !m.file_type().is_symlink() => {}
+            Ok(_) => return Err(archive_error("an entry's folder is not a plain folder")),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                fs::create_dir(&path).map_err(|e| io_error("creating a folder", e))?
+            }
+            Err(e) => return Err(io_error("creating a folder", e)),
+        }
+    }
+    path.push(parts[parts.len() - 1]);
+    Ok(path)
+}
+
+/// A new file for an archive entry: never replaces anything, never follows
+/// a link, synced to disk when the writer is dropped by `Sink::file`.
+struct NewFile(File);
+
+impl Write for NewFile {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.sync_all()
+    }
+}
+
+fn open_new(path: &Path, executable: bool) -> Result<NewFile, Error> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(if executable { 0o755 } else { 0o644 });
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    #[cfg(not(unix))]
+    let _ = executable;
+    options.open(path).map(NewFile).map_err(|e| {
+        if e.kind() == io::ErrorKind::AlreadyExists {
+            archive_error("archive repeats an entry")
+        } else {
+            io_error("writing a file", e)
+        }
+    })
+}
+
 struct Sink<'a> {
-    dest: &'a Path,
+    /// `None`: inspect only (hash every file, write nothing).
+    dest: Option<&'a Path>,
     top: &'a str,
     files: BTreeMap<String, [u8; 32]>,
     release_json: Option<Vec<u8>>,
@@ -96,13 +195,22 @@ impl<'a> Sink<'a> {
             ErrorCode::Io,
             "staging folder isn't empty",
         )?;
-        Ok(Sink {
-            dest,
+        Ok(Sink::inspect(top).with_dest(dest))
+    }
+
+    fn with_dest(mut self, dest: &'a Path) -> Self {
+        self.dest = Some(dest);
+        self
+    }
+
+    fn inspect(top: &'a str) -> Self {
+        Sink {
+            dest: None,
             top,
             files: BTreeMap::new(),
             release_json: None,
             total: 0,
-        })
+        }
     }
 
     fn file(
@@ -129,28 +237,10 @@ impl<'a> Sink<'a> {
             ErrorCode::Archive,
             "archive repeats an entry",
         )?;
-        let path = rel
-            .split('/')
-            .fold(self.dest.to_path_buf(), |p, part| p.join(part));
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| io_error("creating a folder", e))?;
-        }
-        let mut options = OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(if executable { 0o755 } else { 0o644 });
-        }
-        #[cfg(not(unix))]
-        let _ = executable;
-        let mut out = options.open(&path).map_err(|e| {
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                archive_error("archive repeats an entry")
-            } else {
-                io_error("writing a file", e)
-            }
-        })?;
+        let mut out: Box<dyn Write> = match self.dest {
+            None => Box::new(io::sink()),
+            Some(dest) => Box::new(open_new(&make_parents(dest, &rel)?, executable)?),
+        };
         let keep = rel == RELEASE_JSON;
         if keep {
             require(
@@ -177,7 +267,8 @@ impl<'a> Sink<'a> {
             }
             remaining -= got as u64;
         }
-        out.sync_all().map_err(|e| io_error("syncing a file", e))?;
+        out.flush().map_err(|e| io_error("syncing a file", e))?;
+        drop(out);
         if keep {
             self.release_json = Some(kept);
         }
@@ -189,6 +280,7 @@ impl<'a> Sink<'a> {
         let raw = self
             .release_json
             .ok_or_else(|| archive_error("archive lacks RELEASE.json"))?;
+        let release_json_sha256 = crate::sha256(&raw);
         let release: serde_json::Value =
             serde_json::from_slice(&raw).map_err(|_| archive_error("RELEASE.json is not JSON"))?;
         let field = |k: &str| release.get(k).and_then(|v| v.as_str());
@@ -244,9 +336,10 @@ impl<'a> Sink<'a> {
             "archive lacks a file RELEASE.json lists",
         )?;
         Ok(VerifiedTree {
-            root: self.dest.to_path_buf(),
+            root: self.dest.map(Path::to_path_buf).unwrap_or_default(),
             files: have,
             release,
+            release_json_sha256,
         })
     }
 }
@@ -292,8 +385,27 @@ pub fn extract_tar_gz(
     dest: &Path,
     expect: &Expect,
 ) -> Result<VerifiedTree, Error> {
-    let mut sink = Sink::new(dest, top)?;
-    let mut tar = flate2::read::GzDecoder::new(reader.take(MAX_ARCHIVE));
+    tar_gz_into(reader, Sink::new(dest, top)?, expect)
+}
+
+/// Read a `.tar.gz` release archive without writing anything: every file's
+/// SHA-256 and its checked `RELEASE.json`.
+pub fn inspect_tar_gz(
+    reader: impl Read,
+    top: &str,
+    expect: &Expect,
+) -> Result<VerifiedTree, Error> {
+    tar_gz_into(reader, Sink::inspect(top), expect)
+}
+
+fn tar_gz_into(
+    reader: impl Read,
+    mut sink: Sink<'_>,
+    expect: &Expect,
+) -> Result<VerifiedTree, Error> {
+    // Bound what the gzip stream may expand to (headers and padding count),
+    // not only the compressed input.
+    let mut tar = flate2::read::GzDecoder::new(reader.take(MAX_ARCHIVE)).take(MAX_EXPANDED);
     let mut header = [0u8; 512];
     loop {
         tar.read_exact(&mut header)
@@ -307,6 +419,7 @@ pub fn extract_tar_gz(
                 "tar end marker is malformed",
             )?;
             let mut rest = [0u8; 4096];
+            let mut trailing = 0usize;
             loop {
                 let n = tar
                     .read(&mut rest)
@@ -314,6 +427,12 @@ pub fn extract_tar_gz(
                 if n == 0 {
                     break;
                 }
+                trailing += n;
+                require(
+                    trailing <= MAX_TRAILING_ZEROS,
+                    ErrorCode::Archive,
+                    "too much padding after the tar end marker",
+                )?;
                 require(
                     rest[..n].iter().all(|&b| b == 0),
                     ErrorCode::Archive,
@@ -398,6 +517,15 @@ pub fn extract_zip(
     dest: &Path,
     expect: &Expect,
 ) -> Result<VerifiedTree, Error> {
+    zip_into(file, Sink::new(dest, top)?, expect)
+}
+
+/// Read a `.zip` release archive without writing anything.
+pub fn inspect_zip(file: &mut File, top: &str, expect: &Expect) -> Result<VerifiedTree, Error> {
+    zip_into(file, Sink::inspect(top), expect)
+}
+
+fn zip_into(file: &mut File, mut sink: Sink<'_>, expect: &Expect) -> Result<VerifiedTree, Error> {
     let corrupt = || archive_error("zip archive is malformed");
     let len = file
         .metadata()
@@ -446,6 +574,11 @@ pub fn extract_zip(
         usize::from(count) <= MAX_ENTRIES,
         ErrorCode::TooLarge,
         "archive has too many entries",
+    )?;
+    require(
+        cd_size <= MAX_CENTRAL_DIRECTORY,
+        ErrorCode::TooLarge,
+        "zip central directory is too large",
     )?;
     let mut cd = vec![0u8; cd_size as usize];
     file.seek(SeekFrom::Start(cd_offset))
@@ -533,7 +666,6 @@ pub fn extract_zip(
         "zip central directory is malformed",
     )?;
 
-    let mut sink = Sink::new(dest, top)?;
     for entry in entries {
         file.seek(SeekFrom::Start(entry.local_offset))
             .map_err(|e| io_error("reading the archive", e))?;
@@ -627,4 +759,208 @@ pub fn sha256_file(path: &Path) -> Result<[u8; 32], Error> {
 /// For logs: a digest's short form.
 pub fn short(digest: &[u8; 32]) -> String {
     hex(digest)[..12].to_string()
+}
+
+/// Reads through to `inner` and hashes exactly the bytes it returns, so a
+/// check of [`HashingReader::finish`] covers the very bytes consumed.
+pub struct HashingReader<R: Read> {
+    inner: R,
+    hasher: sha2::Sha256,
+    total: u64,
+}
+
+impl<R: Read> HashingReader<R> {
+    pub fn new(inner: R) -> Self {
+        HashingReader {
+            inner,
+            hasher: sha2::Sha256::new(),
+            total: 0,
+        }
+    }
+
+    /// Read to the end (bounded) and return the digest of everything read.
+    pub fn finish(mut self) -> Result<[u8; 32], Error> {
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let n = self
+                .read(&mut buf)
+                .map_err(|e| io_error("reading the archive", e))?;
+            if n == 0 {
+                break;
+            }
+            require(
+                self.total <= MAX_ARCHIVE,
+                ErrorCode::TooLarge,
+                "archive is too large",
+            )?;
+        }
+        Ok(self.hasher.finalize().into())
+    }
+}
+
+impl<R: Read> Read for HashingReader<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.hasher.update(&buf[..n]);
+        self.total += n as u64;
+        Ok(n)
+    }
+}
+
+/// Extract a `.tar.gz` from an open handle and prove, from the same bytes,
+/// that they are the verified ones: the digest of everything this read must
+/// equal `expected`, or the extracted tree is refused (the caller removes it).
+pub fn extract_tar_gz_verified(
+    file: File,
+    expected: &[u8; 32],
+    top: &str,
+    dest: &Path,
+    expect: &Expect,
+) -> Result<VerifiedTree, Error> {
+    let mut reader = HashingReader::new(io::BufReader::new(file));
+    let tree = extract_tar_gz(&mut reader, top, dest, expect)?;
+    require(
+        reader.finish()? == *expected,
+        ErrorCode::NotVerified,
+        "the archive changed after it was verified",
+    )?;
+    Ok(tree)
+}
+
+/// Copy an open download into a new private file (`dest`, created
+/// exclusively), hashing the copied bytes; return the copy's handle, rewound,
+/// only when they are the verified ones. Seek-based readers (zip) then read
+/// that handle, never the path.
+pub fn private_copy_verified(
+    src: &mut File,
+    expected: &[u8; 32],
+    dest: &Path,
+) -> Result<File, Error> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut copy = options
+        .open(dest)
+        .map_err(|e| io_error("copying the download", e))?;
+    src.seek(SeekFrom::Start(0))
+        .map_err(|e| io_error("reading the download", e))?;
+    let mut reader = HashingReader::new(&mut *src);
+    io::copy(&mut (&mut reader).take(MAX_ARCHIVE + 1), &mut copy)
+        .map_err(|e| io_error("copying the download", e))?;
+    require(
+        reader.total <= MAX_ARCHIVE,
+        ErrorCode::TooLarge,
+        "download is too large",
+    )?;
+    let digest: [u8; 32] = reader.hasher.finalize().into();
+    copy.sync_all()
+        .map_err(|e| io_error("copying the download", e))?;
+    require(
+        digest == *expected,
+        ErrorCode::NotVerified,
+        "the download changed after it was verified",
+    )?;
+    copy.seek(SeekFrom::Start(0))
+        .map_err(|e| io_error("reading the download", e))?;
+    Ok(copy)
+}
+
+/// Check an installed or staged tree against an authenticated archive's
+/// contents (from [`inspect_tar_gz`]/[`inspect_zip`] of a verified archive):
+/// exactly its files with their hashes and the same `RELEASE.json` bytes,
+/// regular files and folders only (no links), plus at most the named empty
+/// marker files.
+pub fn verify_tree(
+    root: &Path,
+    authentic: &VerifiedTree,
+    empty_markers: &[&str],
+) -> Result<(), Error> {
+    let mut seen = BTreeMap::new();
+    walk(root, root, &mut seen)?;
+    for (rel, (digest, len)) in &seen {
+        if rel == RELEASE_JSON {
+            require(
+                digest == &authentic.release_json_sha256,
+                ErrorCode::NotVerified,
+                "RELEASE.json changed",
+            )?;
+        } else if empty_markers.contains(&rel.as_str()) {
+            require(
+                *len == 0,
+                ErrorCode::NotVerified,
+                "a marker file isn't empty",
+            )?;
+        } else {
+            match authentic.files.get(rel) {
+                Some(want) if want == digest => {}
+                Some(_) => {
+                    return Err(Error::new(
+                        ErrorCode::NotVerified,
+                        format!("file changed: {rel}"),
+                    ));
+                }
+                None => {
+                    return Err(Error::new(
+                        ErrorCode::NotVerified,
+                        format!("unexpected file: {rel}"),
+                    ));
+                }
+            }
+        }
+    }
+    require(
+        seen.contains_key(RELEASE_JSON),
+        ErrorCode::NotVerified,
+        "RELEASE.json is missing",
+    )?;
+    for rel in authentic.files.keys() {
+        require(
+            seen.contains_key(rel),
+            ErrorCode::NotVerified,
+            "a release file is missing",
+        )?;
+    }
+    Ok(())
+}
+
+fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, ([u8; 32], u64)>) -> Result<(), Error> {
+    for entry in fs::read_dir(dir).map_err(|e| io_error("reading the staged tree", e))? {
+        let entry = entry.map_err(|e| io_error("reading the staged tree", e))?;
+        let path = entry.path();
+        let meta =
+            fs::symlink_metadata(&path).map_err(|e| io_error("reading the staged tree", e))?;
+        require(
+            out.len() < MAX_ENTRIES,
+            ErrorCode::TooLarge,
+            "too many files",
+        )?;
+        if meta.file_type().is_symlink() {
+            return Err(Error::new(
+                ErrorCode::NotVerified,
+                "the staged tree contains a link",
+            ));
+        } else if meta.is_dir() {
+            walk(root, &path, out)?;
+        } else if meta.is_file() {
+            let rel = path
+                .strip_prefix(root)
+                .map_err(|_| archive_error("bad path"))?
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            out.insert(rel, (sha256_file(&path)?, meta.len()));
+        } else {
+            return Err(Error::new(
+                ErrorCode::NotVerified,
+                "the staged tree contains a special file",
+            ));
+        }
+    }
+    Ok(())
 }

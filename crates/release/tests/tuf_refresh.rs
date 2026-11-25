@@ -107,6 +107,7 @@ fn real_sigstore_metadata_refreshes_and_verifies_the_release() {
     let dir = tempfile::tempdir().unwrap();
     let c = cache(&repo, dir.path(), VENDORED_TUF_ROOT);
     assert!(c.refresh_due(now()));
+    assert!(c.reserve(now()).unwrap(), "the first refresh is reserved");
     let v = rt().block_on(c.refresh(now())).expect("refresh");
     // The refreshed root verifies the published 0.4.0 release.
     let facts = v.verify(Signed::Bytes(MANIFEST), BUNDLE).unwrap();
@@ -117,13 +118,15 @@ fn real_sigstore_metadata_refreshes_and_verifies_the_release() {
         )),
         TARGET_SHA
     );
-    assert!(c.cached_verifier().is_some());
+    assert!(c.cached_verifier(now()).is_some());
     // At most weekly.
     assert!(!c.refresh_due(now()));
+    assert!(!c.reserve(now()).unwrap());
     let later = now()
         .checked_add(jiff::SignedDuration::from_secs(REFRESH_INTERVAL_SECS))
         .unwrap();
     assert!(c.refresh_due(later));
+    assert!(c.reserve(later).unwrap());
     let log = repo.log.lock().unwrap().clone();
     assert_eq!(
         log,
@@ -443,16 +446,122 @@ fn the_cached_root_is_checked_against_its_tuf_metadata() {
     let dir = tempfile::tempdir().unwrap();
     let c = cache(&repo, dir.path(), VENDORED_TUF_ROOT);
     rt().block_on(c.refresh(now())).unwrap();
-    assert!(c.cached_verifier().is_some());
-    // A changed cached root is ignored.
+    assert!(c.cached_verifier(now()).is_some());
     let path = dir.path().join("trusted_root.json");
+    let targets_path = dir.path().join("tuf/targets.json");
     let good = std::fs::read(&path).unwrap();
+    let good_targets = std::fs::read(&targets_path).unwrap();
+    let restore = || {
+        std::fs::write(&path, &good).unwrap();
+        std::fs::write(&targets_path, &good_targets).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&targets_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
+    };
+    // A changed cached root is ignored.
     let mut bad = good.clone();
     bad[200] ^= 1;
     std::fs::write(&path, &bad).unwrap();
-    assert!(c.cached_verifier().is_none());
-    // So is one without its TUF metadata.
-    std::fs::write(&path, &good).unwrap();
-    std::fs::remove_file(dir.path().join("tuf/targets.json")).unwrap();
-    assert!(c.cached_verifier().is_none());
+    assert!(c.cached_verifier(now()).is_none());
+    // So is one whose targets.json was edited to match it: the targets
+    // signature no longer verifies from the vendored root.
+    let mut t: Value = serde_json::from_slice(&good_targets).unwrap();
+    t["signed"]["targets"]["trusted_root.json"]["hashes"]["sha256"] = hex(&sha256(&bad)).into();
+    std::fs::write(&targets_path, serde_json::to_vec(&t).unwrap()).unwrap();
+    assert!(
+        c.cached_verifier(now()).is_none(),
+        "consistently tampered targets.json + trusted_root.json"
+    );
+    restore();
+    // A tampered snapshot or timestamp breaks the chain too.
+    for name in ["tuf/snapshot.json", "tuf/timestamp.json"] {
+        let p = dir.path().join(name);
+        let orig = std::fs::read(&p).unwrap();
+        let mut v: Value = serde_json::from_slice(&orig).unwrap();
+        v["signed"]["version"] = (v["signed"]["version"].as_u64().unwrap() + 1).into();
+        std::fs::write(&p, serde_json::to_vec(&v).unwrap()).unwrap();
+        assert!(c.cached_verifier(now()).is_none(), "{name}");
+        std::fs::write(&p, orig).unwrap();
+    }
+    assert!(c.cached_verifier(now()).is_some());
+    // Without its TUF metadata.
+    std::fs::remove_file(&targets_path).unwrap();
+    assert!(c.cached_verifier(now()).is_none());
+    restore();
+    // The verification time: in the future, or too old.
+    let at = dir.path().join("verified_at");
+    let ok = std::fs::read(&at).unwrap();
+    std::fs::write(&at, (now().as_second() + 86_400).to_string()).unwrap();
+    assert!(c.cached_verifier(now()).is_none(), "future");
+    std::fs::write(&at, &ok).unwrap();
+    let much_later = now()
+        .checked_add(jiff::SignedDuration::from_hours(24 * 120))
+        .unwrap();
+    assert!(c.cached_verifier(much_later).is_none(), "too old");
+    assert!(c.cached_verifier(now()).is_some());
+}
+
+#[cfg(unix)]
+#[test]
+fn unsafe_cache_folders_are_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = serve(real_files());
+    let dir = tempfile::tempdir().unwrap();
+    let cache_dir = dir.path().join("cache");
+    let c = cache(&repo, &cache_dir, VENDORED_TUF_ROOT);
+    rt().block_on(c.refresh(now())).unwrap();
+    assert!(c.cached_verifier(now()).is_some());
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(c.cached_verifier(now()).is_none(), "readable by others");
+    std::fs::set_permissions(&cache_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let tuf = cache_dir.join("tuf");
+    std::fs::set_permissions(&tuf, std::fs::Permissions::from_mode(0o777)).unwrap();
+    assert!(c.cached_verifier(now()).is_none(), "writable by others");
+    std::fs::set_permissions(&tuf, std::fs::Permissions::from_mode(0o700)).unwrap();
+    // A linked tuf folder.
+    std::fs::rename(&tuf, dir.path().join("elsewhere")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("elsewhere"), &tuf).unwrap();
+    assert!(c.cached_verifier(now()).is_none(), "link");
+    std::fs::remove_file(&tuf).unwrap();
+    std::fs::rename(dir.path().join("elsewhere"), &tuf).unwrap();
+    // A linked cached root.
+    let target = cache_dir.join("trusted_root.json");
+    std::fs::rename(&target, dir.path().join("root.json")).unwrap();
+    std::os::unix::fs::symlink(dir.path().join("root.json"), &target).unwrap();
+    assert!(c.cached_verifier(now()).is_none(), "linked target");
+}
+
+#[test]
+fn the_weekly_reservation_is_atomic_and_clock_conservative() {
+    let repo = serve(real_files());
+    let dir = tempfile::tempdir().unwrap();
+    let c = cache(&repo, dir.path(), VENDORED_TUF_ROOT);
+    // Another process is deciding.
+    std::fs::create_dir_all(dir.path()).unwrap();
+    std::fs::write(dir.path().join("refresh.lock"), b"").unwrap();
+    assert!(!c.reserve(now()).unwrap());
+    std::fs::remove_file(dir.path().join("refresh.lock")).unwrap();
+    assert!(c.reserve(now()).unwrap());
+    // The clock went back a day: nothing is reserved, and the week restarts now.
+    let earlier = now()
+        .checked_sub(jiff::SignedDuration::from_hours(24))
+        .unwrap();
+    assert!(!c.reserve(earlier).unwrap());
+    assert!(!c.refresh_due(now()));
+    let week = jiff::SignedDuration::from_secs(REFRESH_INTERVAL_SECS);
+    assert!(
+        !c.reserve(
+            now()
+                .checked_add(week)
+                .unwrap()
+                .checked_sub(jiff::SignedDuration::from_hours(25))
+                .unwrap()
+        )
+        .unwrap()
+    );
+    assert!(c.reserve(earlier.checked_add(week).unwrap()).unwrap());
+    assert!(!dir.path().join("refresh.lock").exists());
 }
