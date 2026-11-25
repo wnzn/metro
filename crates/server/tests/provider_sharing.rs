@@ -246,11 +246,20 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_with(false).await
+    }
+
+    /// With `operator`, the server's own `METRO_MODEL` is the fixture too.
+    async fn start_with(operator: bool) -> Self {
         let fixture = Fixture::start().await;
         let config = Config {
             bind: "127.0.0.1:0".parse().unwrap(),
             db_path: ":memory:".into(),
-            model: None,
+            model: operator.then(|| metro_server::ModelConfig {
+                base_url: fixture.base_url.clone(),
+                model: "operator-model".into(),
+                api_key: "sk-operator-0123456789".into(),
+            }),
             limits: Limits {
                 agent_timeout: Duration::from_secs(20),
                 ..Limits::default()
@@ -1786,7 +1795,8 @@ async fn a_device_classifiers_own_text_reaches_no_log_response_or_room() {
 
 #[tokio::test]
 async fn a_member_removed_mid_run_stops_its_next_request() {
-    let s = Server::start().await;
+    // The operator's model serves anyone without a saved default (Carol).
+    let s = Server::start_with(true).await;
     // Bob's own default, and an organization-wide share of Alice's: neither
     // is tied to a Space, and neither run picks an explicit model.
     s.connect(BOB, "custom", "bob-model", true).await;
@@ -1795,12 +1805,17 @@ async fn a_member_removed_mid_run_stops_its_next_request() {
         .share(ALICE, &shared, json!({"visibility": "organization"}))
         .await;
     assert_eq!(status, StatusCode::OK);
-    for (label, selection) in [("own", None), ("shared", Some(shared.clone()))] {
-        let sid = s.space(ALICE, &format!("removal {label}"), &["bob"]).await;
+    for (label, sender, selection) in [
+        ("own", BOB, None),
+        ("shared", BOB, Some(shared.clone())),
+        ("operator", CAROL, None),
+    ] {
+        let user = sender.trim_end_matches("-token");
+        let sid = s.space(ALICE, &format!("removal {label}"), &[user]).await;
         if let Some(id) = selection {
             let (status, body) = s
                 .put(
-                    BOB,
+                    sender,
                     &format!("/v1/spaces/{sid}/prefs"),
                     json!({"default_model": {"provider_connection_id": id}}),
                 )
@@ -1818,7 +1833,7 @@ async fn a_member_removed_mid_run_stops_its_next_request() {
         let held = s.fixture.gate.write().await;
         let (status, sent) = s
             .post(
-                BOB,
+                sender,
                 &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
                 json!({"text": text}),
             )
@@ -1831,9 +1846,20 @@ async fn a_member_removed_mid_run_stops_its_next_request() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert_eq!(requests(), 1, "{label}: the first request arrived");
-        // Bob's membership ends between the run's two requests. (Removal
-        // also stops his runs, but only after it commits: this is that gap.)
-        s.state.db.remove_member(&sid, "bob").unwrap();
+        if label == "operator" {
+            let first = s.fixture.seen("/v1/chat/completions");
+            let first = first
+                .iter()
+                .find(|c| c.body.to_string().contains(&text))
+                .unwrap();
+            assert_eq!(
+                first.body["model"], "operator-model",
+                "{label}: the operator's model"
+            );
+        }
+        // The membership ends between the run's two requests. (Removal also
+        // stops the person's runs, but only after it commits: this is that gap.)
+        s.state.db.remove_member(&sid, user).unwrap();
         drop(held);
         let mut ended = false;
         for _ in 0..400 {

@@ -248,6 +248,71 @@ impl HttpClientExt for GuardedHttp {
     }
 }
 
+/// An HTTP client for a Space's work on an endpoint no connection guards
+/// (the operator's `METRO_MODEL`): before each request, the person must
+/// still be a member of the Space, or nothing of the Space leaves Metro.
+#[derive(Clone)]
+pub struct SpaceMemberHttp {
+    pub(crate) inner: DynHttpClient,
+    pub(crate) db: Db,
+    pub(crate) space: String,
+    pub(crate) user: String,
+}
+
+impl SpaceMemberHttp {
+    async fn admit(&self) -> http_client::Result<()> {
+        let (space, user) = (self.space.clone(), self.user.clone());
+        let member = self
+            .db
+            .call(move |db| Ok(super::store::is_member(&db.lock(), &space, &user)?))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %format!("{e:#}"), "rechecking Space membership");
+                false
+            });
+        if member {
+            Ok(())
+        } else {
+            Err(refused(UseError::Revoked))
+        }
+    }
+}
+
+impl HttpClientExt for SpaceMemberHttp {
+    fn send(
+        &self,
+        req: Request<Bytes>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody>>> + Send + 'static {
+        let this = self.clone();
+        async move {
+            this.admit().await?;
+            HttpClientExt::send(&this.inner, req).await
+        }
+    }
+
+    fn send_multipart(
+        &self,
+        req: Request<MultipartForm>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody>>> + Send + 'static {
+        let this = self.clone();
+        async move {
+            this.admit().await?;
+            HttpClientExt::send_multipart(&this.inner, req).await
+        }
+    }
+
+    fn send_streaming(
+        &self,
+        req: Request<Bytes>,
+    ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + Send {
+        let this = self.clone();
+        async move {
+            this.admit().await?;
+            HttpClientExt::send_streaming(&this.inner, req).await
+        }
+    }
+}
+
 /// The (unused) URL and dialect Rig encodes device chat requests with: the
 /// transport relays only the JSON body.
 pub(crate) const DEVICE_WIRE_URL: &str = "http://metro-device.invalid/v1";

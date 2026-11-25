@@ -119,6 +119,27 @@ fn model(config: &ModelConfig) -> rig_core::Model<rig_core::providers::openai::w
         .chat(config.model.clone())
 }
 
+/// The operator's model for a run `user` starts in Space `space`: every
+/// request first checks that they are still a member.
+fn space_model(
+    state: &AppState,
+    config: &ModelConfig,
+    user: &str,
+    space: &str,
+) -> DynModel<Completion> {
+    let http = crate::providers::guard::SpaceMemberHttp {
+        inner: rig_reqwest::shared(),
+        db: state.db.clone(),
+        space: space.to_owned(),
+        user: user.to_owned(),
+    };
+    OpenAIConfig::with_key(&METRO_DIALECT, config.api_key.clone())
+        .with_base_url(config.base_url.clone())
+        .connect(http)
+        .chat(config.model.clone())
+        .into()
+}
+
 /// A plain OpenAI-compatible chat model, as the environment model is built;
 /// for embedders and test backends that hand routing a model.
 pub fn openai_compatible_model(config: &ModelConfig) -> DynModel<Completion> {
@@ -220,7 +241,10 @@ async fn route_model(
                     note.reason =
                         "this server's model (you have no default chat connection)".to_owned();
                     Ok(RunModel {
-                        model: model(config).into(),
+                        model: match space {
+                            Some(sid) => space_model(state, config, user_id, sid),
+                            None => model(config).into(),
+                        },
                         max_tokens: None,
                         params: None,
                         built_from: None,
