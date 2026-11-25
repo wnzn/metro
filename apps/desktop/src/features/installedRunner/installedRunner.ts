@@ -180,13 +180,13 @@ function removeFolder(sid: string) {
 
 // This runs as part of the same accepted observation that updates the paired
 // flag and assignment cache, whether the read came from Settings or an attach.
-onSpaceRunnerObserved((sid, runner) => {
+onSpaceRunnerObserved((sid, runner, allowFolderAdd) => {
   const id = ownedInstalledRunner()?.id;
   if (!id || installedRunner()?.runner?.id !== id || !SPACE_ID_RE.test(sid)) return;
   const space = spaces().find((s) => s.id === sid && s.role === "owner");
   if (!space || runner?.kind !== "registered" || runner.id !== id || runner.visibility !== "personal") {
     removeFolder(sid);
-  } else if (!runnerSpaces().some((s) => s.id === sid)) {
+  } else if (allowFolderAdd && !runnerSpaces().some((s) => s.id === sid)) {
     runnerSpaces.set([...runnerSpaces(), { id: sid, name: space.name }]);
   }
 });

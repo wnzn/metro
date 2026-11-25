@@ -249,11 +249,11 @@ async function attachAndReconcile(
       r.assignmentRevision === receipt.assignmentRevision;
     accepted = true;
     if (!latest()) return newerRunnerAction;
-    const current = await reconcileOwnedSpaceRunner(sid, stillScoped);
+    const current = await reconcileOwnedSpaceRunner(sid, stillScoped, matches);
     if (!latest()) return newerRunnerAction;
     if (current === undefined) return { kind: "unconfirmed" };
     if (!matches(current)) return { kind: "superseded", reason: "The runner assignment changed." };
-    return { kind: "attached", stillVerified: () => stillScoped() && matches(spaceRunners()[sid]) };
+    return { kind: "attached", stillVerified: () => stillScoped() && spaceRunners()[sid] === current };
   } catch (error) {
     if (!latest()) return newerRunnerAction;
     if (!accepted && error instanceof ApiError && error.kind !== "protocol") {

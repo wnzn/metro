@@ -28,7 +28,7 @@ import {
 import type { AgentPatch, ModelSelection, SpaceAgent, SpaceDetails, SpacePrefs, SpacePrefsView } from "../../api/spaces";
 import { apiClient, closeSettings, describe, disconnect, isAborted, me, onManageOpen, onSessionEnd, onTransientClear, rememberMembers, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
 import { beginSpaceRunnerWrite, dismissReveal, revealDedicatedToken, revealed, spaceRunners } from "../../settings";
-import { beginSpaceRunnerObservation } from "../../spaceRunnerObservations";
+import { beginSpaceRunnerObservation, forgetDisprovedSpaceRunner } from "../../spaceRunnerObservations";
 import { dismissRunnerOffer, installedRunnerChoice, snapshotInstalledRunner } from "../../runnersState";
 import { clearLocalToolsMessages, localToolsBusy } from "../localtools/localTools";
 import { noteClassifierPrefs } from "./askAgent";
@@ -364,14 +364,17 @@ async function readRunner(api: Client, sid: string): Promise<RunnerSnapshot> {
   }
 }
 
-async function refreshAssignment(api: Client, sid: string, current: () => boolean, show: () => boolean) {
+async function refreshAssignment(
+  api: Client, sid: string, current: () => boolean, show: () => boolean,
+  allowFolderAdd?: (runner: SpaceRunner | null) => boolean,
+) {
   const observation = beginSpaceRunnerObservation(sid);
   const valid = () => observation.isCurrent() && current();
   try {
     const next = await readRunner(api, sid);
     if (!valid()) return undefined;
     batch(() => {
-      observation.publish(next.runner);
+      observation.publish(next.runner, allowFolderAdd?.(next.runner) === true);
       if (show()) {
         runnerSource.set({ sid, legacy: next.legacy, guardedTokenChanges: next.guardedTokenChanges });
         runnerError.set(null);
@@ -503,9 +506,18 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       receipt = await api.changeDedicatedToken(sid, action);
     }
     if (!writeCurrent()) return;
+    // U10's ack fence expires pre-commit observations and mid-write consent
+    // for this Space only. Keep newer assignment evidence if it already won.
+    const afterAck = beginSpaceRunnerWrite(sid, writeCurrent);
+    if (!afterAck) return;
+    pendingWrite = afterAck;
+    forgetDisprovedSpaceRunner(sid, before.runner);
     // A delayed write reply describes history, not the current assignment.
     // Use the shared exact-Space guards even when the originating page closed.
-    const actual = await refreshAssignment(api, sid, writeCurrent, live);
+    const attachConfirmed = (r: SpaceRunner | null) => action.kind === "attach" &&
+      r?.kind === "registered" && r.id === action.id && r.assignmentRevision === attachedRevision;
+    const actual = await refreshAssignment(api, sid, writeCurrent, live,
+      (r) => attachConfirmed(r) && !!installed?.isCurrent());
     if (!actual) {
       if (receipt && writeCurrent() && stillConsented()) reject(tokenUnconfirmed);
       return;
@@ -518,7 +530,7 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       if (receipt && stillConsented()) reject(tokenUnconfirmed);
       return;
     }
-    const confirmed = action.kind === "attach" ? r?.kind === "registered" && r.id === action.id && r.assignmentRevision === attachedRevision :
+    const confirmed = action.kind === "attach" ? attachConfirmed(r) :
       guardedRemoval ? r === null : !!receipt && r?.kind === "dedicated" && r.assignmentRevision === receipt.revision;
     if (!confirmed) return reject(tokenChange
       ? "The runner assignment changed after the token request. No token was shown. Review the current runner above."

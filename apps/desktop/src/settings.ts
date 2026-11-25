@@ -321,13 +321,15 @@ export function beginSpaceRunnerWrite(sid: string, expected?: () => boolean) {
 }
 
 /** The POST's reply is historical by the time it arrives. Read the actual assignment. */
-export async function reconcileOwnedSpaceRunner(sid: string, stillLatest: () => boolean) {
+export async function reconcileOwnedSpaceRunner(
+  sid: string, stillLatest: () => boolean, matchesReceipt: (runner: SpaceRunner | null) => boolean,
+) {
   const c = apiClient();
   const owns = () => spaces().some((s) => s.id === sid && s.role === "owner");
   if (!c || !stillLatest() || !owns()) return undefined;
   const observation = beginSpaceRunnerObservation(sid);
   const current = await c.getSpaceRunner(sid);
-  if (!stillLatest() || !owns() || !observation.publish(current)) return undefined;
+  if (!stillLatest() || !owns() || !observation.publish(current, matchesReceipt(current))) return undefined;
   return current;
 }
 

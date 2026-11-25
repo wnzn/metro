@@ -444,6 +444,39 @@ test("the follow-up read also detects a newer assignment made outside this app",
   expect(words(app)).toContain(other.name);
 });
 
+for (const mode of ["create", "bulk"] as const) {
+  test(`${mode} attach does not confirm a same-runner replacement revision`, async () => {
+    const f = world();
+    const r = f.addRunner("This PC", "personal", "alice");
+    if (mode === "bulk") f.addSpace("solo", "Solo", "alice");
+    const t = fixture(f, r.id);
+    t.gate.attach = 800;
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    if (mode === "create") {
+      await startSidebar(app, "Same runner ABA");
+      await app.press("id:create-space");
+    } else {
+      await openRunnerSettings(app);
+      await app.waitFor("id:runner-attach-pick:solo");
+      await app.press("id:runner-attach-many");
+    }
+    const sid = () => mode === "bulk" ? "solo" : space(f, "Same runner ABA")?.id;
+    await app.waitUntil(() => !!sid() && f.state.attached.get(sid()!) === r.id);
+    const path = `${BASE}/v1/spaces/${sid()}/runner`;
+    const headers = { authorization: `Bearer ${TOKENS.alice}` };
+    await f.network[`DELETE ${BASE}/v1/*`]!({ method: "DELETE", url: path, headers });
+    await f.network[`POST ${BASE}/v1/*`]!({ method: "POST", url: `${path}/attach-if-empty`, headers,
+      body: JSON.stringify({ runner_id: r.id }) });
+    await app.clock!.runFor(800);
+    await app.waitFor(mode === "create" ? failure : "id:runner-attach-result");
+    expect(words(app)).toContain("The runner assignment changed.");
+    expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+    expect(app.shows(success)).toBe(false);
+    expect(app.shows(`id:installed-runner-space:${sid()}`)).toBe(false);
+  });
+}
+
 test("a verified Space settings attach dismisses the offer and records its folder after Runner closes", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");
@@ -824,6 +857,9 @@ test("a current Manage detach fences a pre-commit folder read without losing B o
   const app = await launch(t, { manual: true });
   await signIn(app);
   await app.waitFor(offer);
+  await openRunnerSettings(app);
+  await app.waitFor("id:installed-runner-space:alpha");
+  await app.press("id:settings-close");
   await app.press("id:space:alpha");
   await openSpaceRunner(app);
   await app.waitFor("id:attached-runner");
