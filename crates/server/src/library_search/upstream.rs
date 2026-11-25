@@ -286,7 +286,27 @@ pub async fn put_settings(
     let Json(body) = body?;
     let (_, models) = seams(&state, &who);
     Ok(Json(
-        engine::save_settings(&state.db, &models, &who.id, body).await?,
+        engine::save_settings(&state.db, &models, &who.id, body.embedding_id, None).await?,
+    ))
+}
+
+/// `PUT /v1/library/settings/selection`: guarded write, never routed to the legacy PUT.
+pub async fn put_selection(
+    State(state): State<AppState>,
+    who: Human,
+    body: Result<Json<CheckedSettings>, JsonRejection>,
+) -> Result<Json<SettingsView>, ApiError> {
+    let Json(body) = body?;
+    let (_, models) = seams(&state, &who);
+    Ok(Json(
+        engine::save_settings(
+            &state.db,
+            &models,
+            &who.id,
+            body.embedding_id,
+            Some(body.expected_embedding_id),
+        )
+        .await?,
     ))
 }
 

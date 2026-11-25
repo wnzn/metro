@@ -150,24 +150,26 @@ pub fn embedding_id(conn: &Connection, user: &str) -> rusqlite::Result<Option<St
         .flatten())
 }
 
-/// Save `user`'s media embedding connection. A different connection than
-/// before discards their whole library index in the same transaction.
+#[derive(Debug, PartialEq, Eq)]
+pub enum SelectionWrite {
+    Saved,
+    Stale,
+}
+
+/// Compare (if supplied), save and purge the old index in one write
+/// transaction. A stale write leaves both the selection and index intact.
 pub fn set_embedding_id(
     conn: &mut Connection,
     user: &str,
     id: Option<&str>,
-) -> rusqlite::Result<bool> {
-    let tx = conn.transaction()?;
-    let before: Option<String> = tx
-        .query_row(
-            "SELECT embedding_id FROM library_search_settings WHERE user_id = ?1",
-            [user],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()?
-        .flatten();
-    let changed = before.as_deref() != id;
-    if changed {
+    expected: Option<Option<&str>>,
+) -> rusqlite::Result<SelectionWrite> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let before = embedding_id(&tx, user)?;
+    if expected.is_some_and(|expected| expected != before.as_deref()) {
+        return Ok(SelectionWrite::Stale);
+    }
+    if before.as_deref() != id {
         tx.execute(
             "DELETE FROM library_search_segments WHERE user_id = ?1",
             [user],
@@ -185,7 +187,7 @@ pub fn set_embedding_id(
         params![user, id, now_ms()],
     )?;
     tx.commit()?;
-    Ok(changed)
+    Ok(SelectionWrite::Saved)
 }
 
 // ---- Access ----

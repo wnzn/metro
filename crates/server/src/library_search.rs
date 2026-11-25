@@ -5,7 +5,7 @@
 //! This is separate from message search (`crate::search`, `/v1/search`),
 //! which it does not change. It has its own setting, a media-capable
 //! embeddings connection the person chose explicitly
-//! (`GET|PUT /v1/library/settings`), and it never falls back to another
+//! (`GET /v1/library/settings`, `PUT /v1/library/settings/selection`), and it never falls back to another
 //! connection.
 //!
 //! - **Nothing leaves without an explicit index.** Uploading, listing and
@@ -101,13 +101,17 @@ pub fn init(conn: &rusqlite::Connection) -> anyhow::Result<()> {
     store::init(conn).context("creating library search tables")
 }
 
-/// `GET|PUT /v1/library/settings`, `POST /v1/library/index`,
+/// Media model settings, `POST /v1/library/index`,
 /// `POST /v1/library/search`. Registered by the library owner.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route(
             "/v1/library/settings",
             get(upstream::get_settings).put(upstream::put_settings),
+        )
+        .route(
+            "/v1/library/settings/selection",
+            axum::routing::put(upstream::put_selection),
         )
         .route("/v1/library/index", post(index))
         .route("/v1/library/search", post(search))
@@ -345,12 +349,31 @@ pub struct Settings {
     pub embedding_id: Option<String>,
 }
 
+/// Both fields must be present, even when either selection is null.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CheckedSettings {
+    #[serde(deserialize_with = "required_nullable_id")]
+    pub embedding_id: Option<String>,
+    #[serde(deserialize_with = "required_nullable_id")]
+    pub expected_embedding_id: Option<String>,
+}
+
+fn required_nullable_id<'de, D>(d: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(d)
+}
+
 /// `GET /v1/library/settings`.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct SettingsView {
     /// The chosen media embedding connection; `null` until the person
     /// chooses one. Never filled in automatically.
     pub embedding_id: Option<String>,
+    /// New clients require this before sending a guarded write.
+    pub selection_precondition: bool,
     /// The person's message-search embedding connection, offered only
     /// when it is confirmed media-capable. A suggestion to show; it is not
     /// used until saved with `PUT`.
@@ -462,6 +485,8 @@ pub enum LibrarySearchError {
     NoMediaModel,
     /// The connection is not a media embeddings connection.
     NotMediaCapable,
+    /// The write compared against a different saved model.
+    SelectionChanged,
     /// The connection may not be used for that destination.
     Unusable(String),
     Unsupported(String),
@@ -484,7 +509,9 @@ impl LibrarySearchError {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::NotFound(_) => StatusCode::NOT_FOUND,
-            Self::NoMediaModel | Self::Unusable(_) | Self::Full => StatusCode::CONFLICT,
+            Self::NoMediaModel | Self::SelectionChanged | Self::Unusable(_) | Self::Full => {
+                StatusCode::CONFLICT
+            }
             Self::NotMediaCapable => StatusCode::UNPROCESSABLE_ENTITY,
             Self::Unsupported(_) => StatusCode::UNSUPPORTED_MEDIA_TYPE,
             Self::TooLarge => StatusCode::PAYLOAD_TOO_LARGE,
@@ -505,6 +532,9 @@ impl LibrarySearchError {
             }
             Self::NotMediaCapable => {
                 "that connection cannot embed documents, images, audio or video".into()
+            }
+            Self::SelectionChanged => {
+                "the saved media model changed; reload it before saving".into()
             }
             Self::TooLarge => format!(
                 "the file is larger than {} MiB, the most Metro sends to a media model",
