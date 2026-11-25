@@ -1,0 +1,1033 @@
+//! Web search adapters and rotation against scripted loopback vendor
+//! fixtures. No real vendor is ever called.
+
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+
+use axum::body::Bytes;
+use axum::http::{HeaderMap, Method, StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
+
+use super::*;
+
+/// 2026-11-26T01:00:00Z: the next 00:00 UTC is 23 h away.
+const NOW: u64 = 1_795_654_800;
+const CANARY: &str = "canary-key-0123456789";
+
+#[derive(Clone, Debug)]
+struct Seen {
+    method: String,
+    path: String,
+    query: String,
+    headers: HeaderMap,
+    body: String,
+}
+
+impl Seen {
+    fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).and_then(|v| v.to_str().ok())
+    }
+    fn json(&self) -> Value {
+        serde_json::from_str(&self.body).unwrap_or(Value::Null)
+    }
+}
+
+#[derive(Clone)]
+struct Reply {
+    status: u16,
+    headers: Vec<(&'static str, String)>,
+    body: Vec<u8>,
+}
+
+fn reply(status: u16, body: Value) -> Reply {
+    Reply {
+        status,
+        headers: vec![("content-type", "application/json".into())],
+        body: body.to_string().into_bytes(),
+    }
+}
+
+fn with(mut r: Reply, name: &'static str, value: &str) -> Reply {
+    r.headers.push((name, value.into()));
+    r
+}
+
+#[derive(Clone, Default)]
+struct Fixture {
+    seen: Arc<Mutex<Vec<Seen>>>,
+    /// Key: `path` or `path#jsonrpc-method`.
+    script: Arc<Mutex<HashMap<String, VecDeque<Reply>>>>,
+    /// Answer every MCP `initialize` / `notifications/initialized`.
+    mcp_session: Arc<Mutex<Option<String>>>,
+}
+
+impl Fixture {
+    async fn start() -> (Self, String) {
+        let f = Fixture::default();
+        let state = f.clone();
+        let app = axum::Router::new().fallback(
+            move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
+                let f = state.clone();
+                async move { f.handle(method, uri, headers, body) }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (f, base)
+    }
+
+    fn handle(&self, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> Response {
+        let body = String::from_utf8_lossy(&body).to_string();
+        let path = uri.path().to_owned();
+        let rpc = serde_json::from_str::<Value>(&body)
+            .ok()
+            .and_then(|v| v["method"].as_str().map(str::to_owned));
+        self.seen.lock().unwrap().push(Seen {
+            method: method.to_string(),
+            path: path.clone(),
+            query: uri.query().unwrap_or_default().to_owned(),
+            headers,
+            body,
+        });
+        let scripted = {
+            let mut s = self.script.lock().unwrap();
+            rpc.as_ref()
+                .and_then(|m| {
+                    s.get_mut(&format!("{path}#{m}"))
+                        .and_then(VecDeque::pop_front)
+                })
+                .or_else(|| s.get_mut(&path).and_then(VecDeque::pop_front))
+        };
+        let r = match (scripted, rpc.as_deref()) {
+            (Some(r), _) => r,
+            (None, Some("initialize")) => {
+                let mut r = reply(
+                    200,
+                    json!({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2025-11-25", "capabilities": {}, "serverInfo": {"name": "fixture"}}}),
+                );
+                if let Some(s) = self.mcp_session.lock().unwrap().clone() {
+                    r.headers.push(("mcp-session-id", s));
+                }
+                r
+            }
+            (None, Some("notifications/initialized")) => Reply {
+                status: 202,
+                headers: vec![],
+                body: vec![],
+            },
+            _ => reply(500, json!({"error": "unscripted"})),
+        };
+        let mut resp = (StatusCode::from_u16(r.status).unwrap(), r.body).into_response();
+        for (k, v) in r.headers {
+            resp.headers_mut().insert(k, v.parse().unwrap());
+        }
+        resp
+    }
+
+    fn push(&self, key: &str, r: Reply) {
+        self.script
+            .lock()
+            .unwrap()
+            .entry(key.to_owned())
+            .or_default()
+            .push_back(r);
+    }
+
+    fn seen(&self) -> Vec<Seen> {
+        self.seen.lock().unwrap().clone()
+    }
+
+    fn seen_at(&self, prefix: &str) -> Vec<Seen> {
+        self.seen()
+            .into_iter()
+            .filter(|s| s.path.starts_with(prefix))
+            .collect()
+    }
+}
+
+fn endpoints(base: &str) -> Endpoints {
+    Endpoints {
+        tavily: format!("{base}/tavily"),
+        exa: format!("{base}/exa"),
+        parallel: format!("{base}/parallel"),
+        firecrawl: format!("{base}/firecrawl"),
+        tinyfish_search: format!("{base}/tinyfish-search"),
+        tinyfish_fetch: format!("{base}/tinyfish-fetch"),
+    }
+}
+
+struct Setup {
+    _dir: tempfile::TempDir,
+    dir: PathBuf,
+    fixture: Fixture,
+    base: String,
+    now: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl Setup {
+    async fn new(order: &[ProviderId]) -> Self {
+        let t = tempfile::tempdir().unwrap();
+        let dir = t.path().join("web");
+        crate::fsutil::ensure_private_dir(&dir).unwrap();
+        let mut s = settings::Settings::default();
+        let mut list: Vec<(ProviderId, bool)> = order.iter().map(|&p| (p, true)).collect();
+        for p in ProviderId::ALL {
+            if !order.contains(&p) {
+                list.push((p, false));
+            }
+        }
+        s.set_providers(&list).unwrap();
+        settings::save(&dir, &s).unwrap();
+        let (fixture, base) = Fixture::start().await;
+        Self {
+            _dir: t,
+            dir,
+            fixture,
+            base,
+            now: Arc::new(std::sync::atomic::AtomicU64::new(NOW)),
+        }
+    }
+
+    fn engine(&self) -> Engine {
+        let now = self.now.clone();
+        Engine::with_clock(
+            &self.dir,
+            endpoints(&self.base),
+            Arc::new(move || now.load(std::sync::atomic::Ordering::SeqCst)),
+        )
+        .unwrap()
+    }
+
+    fn key(&self, p: ProviderId, k: &str) {
+        keys::KeyStore::new(&self.dir)
+            .set(p, Secret::new(k))
+            .unwrap();
+    }
+
+    fn settings(&self) -> settings::Settings {
+        settings::load(&self.dir).unwrap()
+    }
+}
+
+fn search(q: &str) -> Op {
+    Op::Search(SearchReq {
+        query: q.into(),
+        keywords: vec![],
+        max_results: 5,
+    })
+}
+
+fn fetch(urls: &[&str]) -> Op {
+    Op::Fetch(FetchReq {
+        urls: urls.iter().map(|u| u.to_string()).collect(),
+        focus: None,
+    })
+}
+
+fn deadline() -> Instant {
+    Instant::now() + Duration::from_secs(30)
+}
+
+fn outcomes(v: &Value) -> Vec<(String, String, String)> {
+    v["attempts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| {
+            (
+                a["provider"].as_str().unwrap().into(),
+                a["mode"].as_str().unwrap().into(),
+                a["outcome"].as_str().unwrap().into(),
+            )
+        })
+        .collect()
+}
+
+fn o(p: &str, m: &str, out: &str) -> (String, String, String) {
+    (p.into(), m.into(), out.into())
+}
+
+fn tavily_ok() -> Reply {
+    reply(
+        200,
+        json!({"results": [
+            {"title": "One", "url": "https://one.example/", "content": "first\u{0007} result", "published_date": "2026-11-01"},
+            {"title": "Private", "url": "http://10.0.0.1/x", "content": "dropped"}
+        ]}),
+    )
+}
+
+// ---------------------------------------------------------------- Tavily
+
+#[tokio::test]
+async fn tavily_keyless_and_keyed_headers_and_errors() {
+    let s = Setup::new(&[ProviderId::Tavily]).await;
+    s.fixture.push("/tavily/search", tavily_ok());
+    let v = s.engine().rotate("j1", &search("rust"), deadline()).await;
+    assert_eq!(v["provider"], "tavily");
+    assert_eq!(v["mode"], "keyless");
+    assert_eq!(
+        v["results"].as_array().unwrap().len(),
+        1,
+        "private URL dropped"
+    );
+    assert_eq!(v["results"][0]["snippet"], "first  result");
+    assert_eq!(v["results"][0]["published"], "2026-11-01");
+    let req = &s.fixture.seen_at("/tavily")[0];
+    assert_eq!(req.header("x-tavily-access-mode"), Some("keyless"));
+    assert_eq!(req.header("authorization"), None);
+    assert_eq!(req.json()["query"], "rust");
+    assert_eq!(req.json()["search_depth"], "basic");
+
+    // With a key: Bearer, no keyless header.
+    s.key(ProviderId::Tavily, CANARY);
+    s.fixture.push("/tavily/search", tavily_ok());
+    let v = s.engine().rotate("j2", &search("rust"), deadline()).await;
+    assert_eq!(v["mode"], "key");
+    let req = s.fixture.seen_at("/tavily").pop().unwrap();
+    assert_eq!(
+        req.header("authorization"),
+        Some(format!("Bearer {CANARY}").as_str())
+    );
+    assert_eq!(req.header("x-tavily-access-mode"), None);
+
+    // A rejected key is never silently replaced by keyless.
+    s.fixture.push("/tavily/search", reply(401, json!({})));
+    let n = s.fixture.seen().len();
+    let v = s.engine().rotate("j3", &search("rust"), deadline()).await;
+    assert_eq!(v["provider"], Value::Null);
+    assert_eq!(outcomes(&v), vec![o("tavily", "key", "key_rejected")]);
+    assert_eq!(s.fixture.seen().len(), n + 1);
+    // ... and stays skipped until the key changes.
+    let v = s.engine().rotate("j4", &search("rust"), deadline()).await;
+    assert_eq!(outcomes(&v), vec![o("tavily", "key", "key_rejected")]);
+    assert_eq!(
+        s.fixture.seen().len(),
+        n + 1,
+        "no request with a rejected key"
+    );
+    s.key(ProviderId::Tavily, "another-key-123456");
+    s.fixture.push("/tavily/search", tavily_ok());
+    let v = s.engine().rotate("j5", &search("rust"), deadline()).await;
+    assert_eq!(v["provider"], "tavily");
+    // Deleting the key goes back to free mode.
+    keys::KeyStore::new(&s.dir)
+        .delete(ProviderId::Tavily)
+        .unwrap();
+    s.fixture.push("/tavily/search", tavily_ok());
+    let v = s.engine().rotate("j6", &search("rust"), deadline()).await;
+    assert_eq!(v["mode"], "keyless");
+}
+
+#[tokio::test]
+async fn tavily_limits_set_cooldowns() {
+    let s = Setup::new(&[ProviderId::Tavily]).await;
+    s.fixture.push(
+        "/tavily/search",
+        with(reply(429, json!({})), "retry-after", "120"),
+    );
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["outcome"], "limited");
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 120));
+    assert_eq!(
+        s.settings()
+            .cooldown_until(ProviderId::Tavily, Mode::Keyless, NOW),
+        Some(NOW + 120)
+    );
+    // The next job skips it without a request.
+    let n = s.fixture.seen().len();
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(
+        outcomes(&v),
+        vec![o("tavily", "keyless", "skipped_cooldown")]
+    );
+    assert_eq!(s.fixture.seen().len(), n);
+    // After it, a 432 is out of credits for 6 h.
+    s.now.store(NOW + 121, std::sync::atomic::Ordering::SeqCst);
+    s.fixture.push("/tavily/search", reply(432, json!({})));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["outcome"], "out_of_credits");
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 121 + 6 * 3600));
+    // 434 is unavailable for a minute.
+    s.now
+        .store(NOW + 7 * 3600, std::sync::atomic::Ordering::SeqCst);
+    s.fixture.push("/tavily/search", reply(434, json!({})));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["outcome"], "unavailable");
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 7 * 3600 + 60));
+}
+
+#[tokio::test]
+async fn tavily_extract_maps_pages_and_failures() {
+    let s = Setup::new(&[ProviderId::Tavily]).await;
+    s.fixture.push(
+        "/tavily/extract",
+        reply(
+            200,
+            json!({"results": [{"url": "https://a.example/", "raw_content": "# A\npage"}],
+                   "failed_results": [{"url": "https://b.example/", "error": "vendor words"}]}),
+        ),
+    );
+    let v = s
+        .engine()
+        .rotate(
+            "j",
+            &fetch(&["https://a.example/", "https://b.example/"]),
+            deadline(),
+        )
+        .await;
+    assert_eq!(v["pages"][0]["text"], "# A\npage");
+    assert_eq!(
+        v["failed_urls"],
+        json!([{"url": "https://b.example/", "reason": "failed"}])
+    );
+    assert!(!v.to_string().contains("vendor words"));
+    let req = s.fixture.seen_at("/tavily/extract").pop().unwrap();
+    assert_eq!(req.json()["format"], "markdown");
+}
+
+// ---------------------------------------------------------------- Firecrawl
+
+#[tokio::test]
+async fn firecrawl_keyless_omits_authorization_and_limits_until_midnight() {
+    let s = Setup::new(&[ProviderId::Firecrawl]).await;
+    s.fixture.push(
+        "/firecrawl/search",
+        reply(200, json!({"success": true, "data": {"web": [{"title": "F", "url": "https://f.example/", "description": "d"}]}})),
+    );
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["results"][0]["url"], "https://f.example/");
+    let req = &s.fixture.seen_at("/firecrawl")[0];
+    assert!(
+        req.headers.get("authorization").is_none(),
+        "absent, not empty"
+    );
+    assert_eq!(req.json(), json!({"query": "q", "limit": 5}));
+
+    s.fixture
+        .push("/firecrawl/search", reply(429, json!({"error": "x"})));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["outcome"], "limited");
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 23 * 3600));
+
+    // Keyed: a 402 is out of credits until midnight; 401 is the key.
+    s.key(ProviderId::Firecrawl, CANARY);
+    s.fixture.push("/firecrawl/search", reply(402, json!({})));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(
+        v["attempts"][0],
+        json!({"provider": "firecrawl", "mode": "key", "outcome": "out_of_credits", "until": rfc3339(NOW + 23 * 3600)})
+    );
+    let req = s.fixture.seen_at("/firecrawl").pop().unwrap();
+    assert_eq!(
+        req.header("authorization"),
+        Some(format!("Bearer {CANARY}").as_str())
+    );
+}
+
+#[tokio::test]
+async fn firecrawl_scrapes_one_url_at_a_time_and_page_errors_never_rotate() {
+    let s = Setup::new(&[ProviderId::Firecrawl, ProviderId::Tavily]).await;
+    s.fixture.push(
+        "/firecrawl/scrape",
+        reply(200, json!({"success": true, "data": {"markdown": "page a", "metadata": {"title": "A", "sourceURL": "https://a.example/", "statusCode": 200}}})),
+    );
+    s.fixture
+        .push("/firecrawl/scrape", reply(404, json!({"error": "nope"})));
+    s.fixture.push(
+        "/firecrawl/scrape",
+        reply(
+            200,
+            json!({"success": true, "data": {"markdown": "", "metadata": {"statusCode": 404}}}),
+        ),
+    );
+    let v = s
+        .engine()
+        .rotate(
+            "j",
+            &fetch(&[
+                "https://a.example/",
+                "https://b.example/",
+                "https://c.example/",
+            ]),
+            deadline(),
+        )
+        .await;
+    assert_eq!(v["provider"], "firecrawl");
+    assert_eq!(v["pages"].as_array().unwrap().len(), 1);
+    assert_eq!(v["pages"][0]["title"], "A");
+    assert_eq!(
+        v["failed_urls"],
+        json!([{"url": "https://b.example/", "reason": "page_not_found"}, {"url": "https://c.example/", "reason": "page_not_found"}])
+    );
+    let scrapes = s.fixture.seen_at("/firecrawl/scrape");
+    assert_eq!(scrapes.len(), 3);
+    assert_eq!(scrapes[1].json()["url"], "https://b.example/");
+    assert_eq!(scrapes[0].json()["formats"], json!(["markdown"]));
+    assert!(s.fixture.seen_at("/tavily").is_empty(), "no rotation");
+}
+
+// ---------------------------------------------------------------- TinyFish
+
+#[tokio::test]
+async fn tinyfish_without_a_key_sends_nothing() {
+    let s = Setup::new(&[ProviderId::TinyFish]).await;
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["provider"], Value::Null);
+    assert_eq!(
+        outcomes(&v),
+        vec![o("tinyfish", "keyless", "skipped_no_key")]
+    );
+    assert!(s.fixture.seen().is_empty());
+    assert_eq!(
+        s.engine().test_provider(ProviderId::TinyFish).await,
+        Outcome::SkippedNoKey
+    );
+    assert!(s.fixture.seen().is_empty());
+}
+
+#[tokio::test]
+async fn tinyfish_keyed_search_fetch_and_daily_limits() {
+    let s = Setup::new(&[ProviderId::TinyFish]).await;
+    s.key(ProviderId::TinyFish, CANARY);
+    s.fixture.push(
+        "/tinyfish-search",
+        reply(200, json!({"results": [{"title": "T", "url": "https://t.example/", "snippet": "s", "date": "2026-11-20"}]})),
+    );
+    let v = s
+        .engine()
+        .rotate("j", &search("fish & chips"), deadline())
+        .await;
+    assert_eq!(v["results"][0]["published"], "2026-11-20");
+    let req = s.fixture.seen_at("/tinyfish-search").pop().unwrap();
+    assert_eq!(req.method, "GET");
+    assert_eq!(req.header("x-api-key"), Some(CANARY));
+    assert_eq!(req.query, "query=fish+%26+chips");
+
+    s.fixture.push(
+        "/tinyfish-fetch",
+        reply(200, json!({"results": [{"url": "https://t.example/", "final_url": "https://t.example/home", "title": "T", "text": "body"}],
+                          "errors": [{"url": "https://u.example/", "code": "TIMEOUT"}]})),
+    );
+    let v = s
+        .engine()
+        .rotate(
+            "j",
+            &fetch(&["https://t.example/", "https://u.example/"]),
+            deadline(),
+        )
+        .await;
+    assert_eq!(v["pages"][0]["final_url"], "https://t.example/home");
+    assert_eq!(
+        v["failed_urls"],
+        json!([{"url": "https://u.example/", "reason": "timeout"}])
+    );
+    assert_eq!(
+        s.fixture.seen_at("/tinyfish-fetch")[0].json(),
+        json!({"urls": ["https://t.example/", "https://u.example/"], "format": "markdown", "per_url_timeout_ms": 45000})
+    );
+
+    s.fixture.push(
+        "/tinyfish-search",
+        reply(429, json!({"error": {"code": "RATE_LIMIT_EXCEEDED", "details": {"reason": "free_allowance_exhausted"}}})),
+    );
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 23 * 3600));
+    s.now
+        .store(NOW + 24 * 3600, std::sync::atomic::Ordering::SeqCst);
+    s.fixture.push(
+        "/tinyfish-search",
+        reply(429, json!({"error": {"code": "RATE_LIMIT_EXCEEDED"}})),
+    );
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 24 * 3600 + 60));
+    s.now
+        .store(NOW + 25 * 3600, std::sync::atomic::Ordering::SeqCst);
+    s.fixture.push(
+        "/tinyfish-search",
+        reply(402, json!({"error": {"code": "INSUFFICIENT_CREDITS"}})),
+    );
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["outcome"], "out_of_credits");
+}
+
+// ---------------------------------------------------------------- MCP: Exa, Parallel
+
+fn mcp_result(text: &str) -> Reply {
+    reply(
+        200,
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": text}]}}),
+    )
+}
+
+fn mcp_sse(text: &str) -> Reply {
+    let note =
+        json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info"}});
+    let res =
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"content": [{"type": "text", "text": text}]}});
+    Reply {
+        status: 200,
+        headers: vec![("content-type", "text/event-stream".into())],
+        body: format!("event: message\ndata: {note}\n\nevent: message\ndata: {res}\n\n")
+            .into_bytes(),
+    }
+}
+
+const EXA_TEXT: &str = "Title: Exa One\nURL: https://exa.example/1\nPublished: 2026-10-01\nHighlights:\nSome text here\n\nTitle: Exa Two\nURL: https://exa.example/2\nPublished: N/A\n";
+
+#[tokio::test]
+async fn exa_mcp_session_order_json_and_sse() {
+    let s = Setup::new(&[ProviderId::Exa]).await;
+    *s.fixture.mcp_session.lock().unwrap() = Some("sess-1".into());
+    s.fixture.push("/exa#tools/call", mcp_result(EXA_TEXT));
+    let engine = s.engine();
+    let v = engine.rotate("j", &search("exa q"), deadline()).await;
+    assert_eq!(v["provider"], "exa");
+    assert_eq!(v["results"][0]["title"], "Exa One");
+    assert_eq!(v["results"][0]["published"], "2026-10-01");
+    assert_eq!(v["results"][1]["url"], "https://exa.example/2");
+    assert!(v["results"][1].get("published").is_none());
+    assert!(v["text"].as_str().unwrap().contains("Exa One"));
+    let seen = s.fixture.seen_at("/exa");
+    let methods: Vec<String> = seen
+        .iter()
+        .map(|r| r.json()["method"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(
+        methods,
+        vec!["initialize", "notifications/initialized", "tools/call"]
+    );
+    assert_eq!(seen[0].query, "tools=web_search_exa,web_fetch_exa");
+    assert_eq!(seen[0].header("mcp-session-id"), None);
+    assert_eq!(seen[1].header("mcp-session-id"), Some("sess-1"));
+    assert_eq!(seen[2].header("mcp-session-id"), Some("sess-1"));
+    assert_eq!(seen[2].header("mcp-protocol-version"), Some("2025-11-25"));
+    assert!(
+        seen[2]
+            .header("accept")
+            .unwrap()
+            .contains("text/event-stream")
+    );
+    assert_eq!(
+        seen[2].json()["params"],
+        json!({"name": "web_search_exa", "arguments": {"query": "exa q", "numResults": 5}})
+    );
+    assert!(seen.iter().all(|r| r.header("x-api-key").is_none()));
+
+    // Cached session; an SSE reply parses.
+    s.fixture.push("/exa#tools/call", mcp_sse(EXA_TEXT));
+    let v = engine.rotate("j", &search("again"), deadline()).await;
+    assert_eq!(v["provider"], "exa");
+    assert_eq!(s.fixture.seen_at("/exa").len(), 4, "no new initialize");
+
+    // A forgotten session re-initializes once.
+    s.fixture.push("/exa#tools/call", reply(404, json!({})));
+    s.fixture.push("/exa#tools/call", mcp_result(EXA_TEXT));
+    let v = engine.rotate("j", &search("third"), deadline()).await;
+    assert_eq!(v["provider"], "exa");
+    let methods: Vec<String> = s.fixture.seen_at("/exa")[4..]
+        .iter()
+        .map(|r| r.json()["method"].as_str().unwrap_or("").to_owned())
+        .collect();
+    assert_eq!(
+        methods,
+        vec![
+            "tools/call",
+            "initialize",
+            "notifications/initialized",
+            "tools/call"
+        ]
+    );
+}
+
+#[tokio::test]
+async fn exa_limits_blocks_and_keys() {
+    let s = Setup::new(&[ProviderId::Exa]).await;
+    s.fixture.push(
+        "/exa#tools/call",
+        reply(200, json!({"jsonrpc": "2.0", "id": 2, "result": {"isError": true, "content": [{"type": "text", "text": "slow down"}], "_meta": {"ai.exa/rateLimited": true}}})),
+    );
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["outcome"], "limited");
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 600));
+    assert!(!v.to_string().contains("slow down"));
+
+    s.now.store(NOW + 601, std::sync::atomic::Ordering::SeqCst);
+    s.fixture.push("/exa#tools/call", reply(429, json!({})));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["outcome"], "limited");
+
+    s.now.store(NOW + 3000, std::sync::atomic::Ordering::SeqCst);
+    s.fixture.push("/exa#initialize", reply(403, json!({})));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["outcome"], "blocked");
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 3000 + 3600));
+
+    // With a key: x-api-key, and its own cooldown slot.
+    s.key(ProviderId::Exa, CANARY);
+    s.fixture.push("/exa#tools/call", mcp_result(EXA_TEXT));
+    let v = s
+        .engine()
+        .rotate("j", &fetch(&["https://exa.example/1"]), deadline())
+        .await;
+    assert_eq!(v["mode"], "key");
+    assert!(v["text"].as_str().unwrap().contains("Exa One"));
+    let seen = s.fixture.seen_at("/exa");
+    let call = seen.last().unwrap();
+    assert_eq!(call.header("x-api-key"), Some(CANARY));
+    assert_eq!(call.json()["params"]["name"], "web_fetch_exa");
+    s.fixture.push("/exa#initialize", reply(401, json!({})));
+    let engine = s.engine();
+    let v = engine.rotate("j", &search("q"), deadline()).await;
+    // A fresh engine has no session: initialize gets the 401.
+    assert_eq!(v["attempts"][0]["outcome"], "key_rejected");
+}
+
+#[tokio::test]
+async fn parallel_mcp_arguments_headers_and_credits() {
+    let s = Setup::new(&[ProviderId::Parallel]).await;
+    s.fixture.push(
+        "/parallel#tools/call",
+        mcp_result(&json!({"results": [{"url": "https://p.example/", "title": "P", "excerpts": ["a", "b"]}]}).to_string()),
+    );
+    let op = Op::Search(SearchReq {
+        query: "long objective".into(),
+        keywords: vec!["k one".into(), "k two".into()],
+        max_results: 3,
+    });
+    let v = s.engine().rotate("j", &op, deadline()).await;
+    assert_eq!(v["results"][0]["snippet"], "a b");
+    let seen = s.fixture.seen_at("/parallel");
+    assert_eq!(seen[0].query, "tools=web_search,web_fetch");
+    assert!(
+        seen.iter()
+            .all(|r| r.header("x-parallel-mcp-config").is_none())
+    );
+    assert!(seen.iter().all(|r| r.header("authorization").is_none()));
+    assert_eq!(
+        seen[2].json()["params"]["arguments"],
+        json!({"objective": "long objective", "search_queries": ["k one", "k two"]})
+    );
+    assert_eq!(
+        parallel::search_arguments(&SearchReq {
+            query: "x".repeat(300),
+            keywords: vec![],
+            max_results: 5
+        })["search_queries"][0]
+            .as_str()
+            .unwrap()
+            .len(),
+        200
+    );
+
+    s.key(ProviderId::Parallel, CANARY);
+    s.fixture
+        .push("/parallel#tools/call", reply(402, json!({})));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["attempts"][0]["outcome"], "out_of_credits");
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 6 * 3600));
+    let seen = s.fixture.seen_at("/parallel");
+    assert_eq!(
+        seen.last().unwrap().header("authorization"),
+        Some(format!("Bearer {CANARY}").as_str())
+    );
+}
+
+// ---------------------------------------------------------------- Rotation
+
+#[tokio::test]
+async fn rotation_follows_the_order_and_reports_every_attempt() {
+    let s = Setup::new(&[ProviderId::Tavily, ProviderId::Exa, ProviderId::Firecrawl]).await;
+    s.fixture.push("/tavily/search", reply(429, json!({})));
+    s.fixture.push("/exa#tools/call", mcp_result(EXA_TEXT));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["provider"], "exa");
+    assert_eq!(
+        outcomes(&v),
+        vec![o("tavily", "keyless", "limited"), o("exa", "keyless", "ok")]
+    );
+    assert_eq!(v["attempts"][0]["until"], rfc3339(NOW + 600));
+    assert!(s.fixture.seen_at("/firecrawl").is_empty());
+    // Parallel and TinyFish are turned off: never contacted, not listed.
+    assert!(s.fixture.seen_at("/parallel").is_empty());
+    assert!(!v.to_string().contains("parallel"));
+
+    // Next job: Tavily is cooling down, Exa answers right away.
+    s.fixture.push("/exa#tools/call", mcp_result(EXA_TEXT));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(
+        outcomes(&v),
+        vec![
+            o("tavily", "keyless", "skipped_cooldown"),
+            o("exa", "keyless", "ok")
+        ]
+    );
+    // Cooldowns survive a restart (a new engine reads them from disk) and
+    // can be cleared.
+    let mut st = s.settings();
+    assert!(
+        st.cooldown_until(ProviderId::Tavily, Mode::Keyless, NOW)
+            .is_some()
+    );
+    settings::clear_cooldowns(&mut st, ProviderId::Tavily);
+    settings::save(&s.dir, &st).unwrap();
+    s.fixture.push("/tavily/search", tavily_ok());
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(outcomes(&v), vec![o("tavily", "keyless", "ok")]);
+    assert_eq!(s.settings().last["tavily"].outcome, "ok");
+}
+
+#[tokio::test]
+async fn all_exhausted_and_malformed_answers() {
+    let s = Setup::new(&ProviderId::ALL).await;
+    s.fixture
+        .push("/tavily/search", reply(200, json!({"results": "nope"})));
+    s.fixture.push(
+        "/exa#tools/call",
+        reply(
+            200,
+            json!({"jsonrpc": "2.0", "id": 2, "result": {"content": []}}),
+        ),
+    );
+    s.fixture
+        .push("/parallel#initialize", reply(200, json!("not an object")));
+    s.fixture.push("/firecrawl/search", reply(503, json!({})));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["provider"], Value::Null);
+    assert_eq!(
+        outcomes(&v),
+        vec![
+            o("tavily", "keyless", "bad_response"),
+            o("exa", "keyless", "bad_response"),
+            o("parallel", "keyless", "bad_response"),
+            o("firecrawl", "keyless", "unavailable"),
+            o("tinyfish", "keyless", "skipped_no_key"),
+        ]
+    );
+    // Each failed one now cools down for a minute.
+    let n = s.fixture.seen().len();
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert!(outcomes(&v)[..4].iter().all(|a| a.2 == "skipped_cooldown"));
+    assert_eq!(s.fixture.seen().len(), n);
+}
+
+#[tokio::test]
+async fn caps_redirects_and_deadlines() {
+    let s = Setup::new(&[ProviderId::Tavily, ProviderId::Firecrawl]).await;
+    // A vendor body over 2 MiB is refused, not buffered.
+    s.fixture.push(
+        "/tavily/search",
+        Reply {
+            status: 200,
+            headers: vec![("content-type", "application/json".into())],
+            body: vec![b' '; 3 * 1024 * 1024],
+        },
+    );
+    // A redirect is never followed.
+    s.fixture.push(
+        "/firecrawl/search",
+        with(
+            reply(302, json!({})),
+            "location",
+            &format!("{}/elsewhere", s.base),
+        ),
+    );
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(
+        outcomes(&v),
+        vec![
+            o("tavily", "keyless", "bad_response"),
+            o("firecrawl", "keyless", "unavailable")
+        ]
+    );
+    assert!(s.fixture.seen_at("/elsewhere").is_empty());
+
+    // Page text is cut per page and in total, control characters dropped.
+    s.now.store(NOW + 3600, std::sync::atomic::Ordering::SeqCst);
+    let big = format!("a\u{0001}b{}", "x".repeat(40 * 1024));
+    let pages: Vec<Value> = (0..5)
+        .map(|i| json!({"url": format!("https://p{i}.example/"), "raw_content": big}))
+        .collect();
+    s.fixture
+        .push("/tavily/extract", reply(200, json!({"results": pages})));
+    let urls: Vec<String> = (0..5).map(|i| format!("https://p{i}.example/")).collect();
+    let refs: Vec<&str> = urls.iter().map(String::as_str).collect();
+    let v = s.engine().rotate("j", &fetch(&refs), deadline()).await;
+    let pages = v["pages"].as_array().unwrap();
+    assert!(pages[0]["text"].as_str().unwrap().starts_with("abx"));
+    assert_eq!(pages[0]["text"].as_str().unwrap().len(), MAX_PAGE_BYTES);
+    assert!(pages.iter().all(|p| p["truncated"] == true));
+    let total: usize = pages
+        .iter()
+        .map(|p| p["text"].as_str().unwrap().len())
+        .sum();
+    assert!(total <= MAX_PAGES_BYTES);
+
+    // No time left: no provider is started.
+    let n = s.fixture.seen().len();
+    let v = s
+        .engine()
+        .rotate(
+            "j",
+            &search("q"),
+            Instant::now() + Duration::from_millis(100),
+        )
+        .await;
+    assert_eq!(v["provider"], Value::Null);
+    assert_eq!(s.fixture.seen().len(), n);
+}
+
+#[tokio::test]
+async fn handle_refuses_bad_jobs_and_a_turned_off_computer() {
+    let s = Setup::new(&[ProviderId::Tavily]).await;
+    let e = s.engine();
+    for (op, req) in [
+        ("complete", json!({"v": 1})),
+        ("models", json!({})),
+        ("web_search", json!({"v": 2, "query": "q"})),
+        ("web_search", json!({"v": 1, "query": ""})),
+        ("web_search", json!({"v": 1, "query": "q", "extra": 1})),
+        (
+            "web_search",
+            json!({"v": 1, "query": "q", "max_results": 11}),
+        ),
+        (
+            "web_fetch",
+            json!({"v": 1, "urls": ["http://192.168.1.1/"]}),
+        ),
+        ("web_fetch", json!({"v": 1, "urls": ["http://intranet/"]})),
+        ("web_fetch", json!({"v": 1, "urls": []})),
+    ] {
+        let r = e.handle("j", op, &req, deadline()).await;
+        assert_eq!(r["ok"], false, "{op} {req}");
+    }
+    assert!(s.fixture.seen().is_empty());
+    s.fixture.push("/tavily/search", tavily_ok());
+    let r = e
+        .handle(
+            "j",
+            "web_search",
+            &json!({"v": 1, "query": "q"}),
+            deadline(),
+        )
+        .await;
+    assert_eq!(r["ok"], true);
+    assert_eq!(r["response"]["v"], 1);
+
+    let mut st = s.settings();
+    st.enabled = false;
+    settings::save(&s.dir, &st).unwrap();
+    let r = e
+        .handle(
+            "j",
+            "web_search",
+            &json!({"v": 1, "query": "q"}),
+            deadline(),
+        )
+        .await;
+    assert_eq!(
+        r,
+        json!({"ok": false, "error": "web search is turned off on this computer"})
+    );
+
+    // A model profile never serves web jobs.
+    assert!(crate::policy::parse_operation("web_search", &json!({"v": 1})).is_err());
+}
+
+#[tokio::test]
+async fn keys_stay_private_and_never_leave() {
+    let s = Setup::new(&[ProviderId::Tavily]).await;
+    s.key(ProviderId::Tavily, CANARY);
+    assert!(keys::validate_key(&Secret::new("short")).is_err());
+    assert!(keys::validate_key(&Secret::new("has space inside")).is_err());
+    assert!(
+        keys::KeyStore::new(&s.dir)
+            .set(ProviderId::Exa, Secret::new("x"))
+            .is_err()
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&s.dir.join(keys::FILE)), 0o600);
+        assert_eq!(mode(&s.dir), 0o700);
+        assert_eq!(mode(&s.dir.join(settings::FILE)), 0o600);
+    }
+    s.fixture
+        .push("/tavily/search", reply(401, json!({"detail": CANARY})));
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert!(!v.to_string().contains(CANARY));
+    let settings_file = std::fs::read_to_string(s.dir.join(settings::FILE)).unwrap();
+    assert!(!settings_file.contains(CANARY));
+    assert!(
+        !format!(
+            "{:?}",
+            keys::KeyStore::new(&s.dir).load().unwrap().get("tavily")
+        )
+        .contains(CANARY)
+    );
+
+    // A corrupt key file: an error, and no key is used.
+    crate::fsutil::write_private(&s.dir.join(keys::FILE), b"{not json").unwrap();
+    assert!(keys::KeyStore::new(&s.dir).load().is_err());
+    s.fixture.push("/tavily/search", tavily_ok());
+    let v = s.engine().rotate("j", &search("q"), deadline()).await;
+    assert_eq!(v["mode"], "keyless");
+}
+
+#[test]
+fn test_overrides_must_be_loopback() {
+    let e = Endpoints::with_overrides(|k| {
+        (k == "METRO_WEB_TEST_BASE_TAVILY").then(|| "http://127.0.0.1:9/t".to_owned())
+    })
+    .unwrap();
+    assert_eq!(e.tavily, "http://127.0.0.1:9/t");
+    assert_eq!(e.exa, Endpoints::vendor().exa);
+    for bad in ["https://evil.example", "http://10.0.0.1:80"] {
+        assert!(
+            Endpoints::with_overrides(|k| (k == "METRO_WEB_TEST_BASE_EXA").then(|| bad.to_owned()))
+                .is_err(),
+            "{bad}"
+        );
+    }
+}
+
+#[test]
+fn settings_normalize_and_order() {
+    let t = tempfile::tempdir().unwrap();
+    crate::fsutil::write_private(
+        &t.path().join(settings::FILE),
+        br#"{"v":1,"providers":[{"id":"exa","enabled":false},{"id":"bing","enabled":true},{"id":"exa","enabled":true}]}"#,
+    )
+    .unwrap();
+    let s = settings::load(t.path()).unwrap();
+    assert!(s.enabled, "on by default");
+    assert!(!s.notice_acknowledged);
+    let ids: Vec<&str> = s.providers.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(
+        ids,
+        vec!["exa", "tavily", "parallel", "firecrawl", "tinyfish"]
+    );
+    assert!(!s.providers[0].enabled);
+    let mut s = s;
+    assert!(s.set_providers(&[(ProviderId::Exa, true)]).is_err());
+    assert!(
+        s.set_providers(&[
+            (ProviderId::Exa, true),
+            (ProviderId::Exa, true),
+            (ProviderId::Tavily, true),
+            (ProviderId::Parallel, true),
+            (ProviderId::Firecrawl, true)
+        ])
+        .is_err()
+    );
+}
+
+#[test]
+fn exa_text_parsing_is_best_effort() {
+    assert!(exa::parse_results("no structure at all").is_empty());
+    let r = exa::parse_results(EXA_TEXT);
+    assert_eq!(r.len(), 2);
+    assert_eq!(r[0].snippet, "Some text here");
+}

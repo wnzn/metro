@@ -85,7 +85,7 @@ mod http;
 mod loopback;
 mod oidc;
 mod sse;
-mod store;
+pub(crate) mod store;
 mod translate;
 
 use std::path::Path;
