@@ -384,20 +384,26 @@ test("the follow-up read also detects a newer assignment made outside this app",
   expect(words(app)).toContain(other.name);
 });
 
-test("bulk attach doesn't count a held success after an external detach or reassignment", async () => {
-  for (const replaced of [false, true]) {
+test("an older folder snapshot preserves newer presence or absence for A and still adds and removes fresh B rows", async () => {
+  for (const final of ["detached", "reassigned", "attached"]) {
     const f = world();
     f.addSpace("solo", "Solo", "alice");
     f.addSpace("keep", "Keep folder", "alice");
+    f.addSpace("added", "New folder", "alice");
+    f.addSpace("removed", "Old folder", "alice");
     const r = f.addRunner("This PC", "personal", "alice");
     const other = f.addRunner("Other computer", "personal", "alice");
+    const attaches = final === "attached";
+    const expectedRunner = attaches ? r.id : final === "reassigned" ? other.id : undefined;
     f.state.attached.set("keep", r.id);
+    f.state.attached.set("removed", r.id);
     const t = fixture(f, r.id);
     t.gate.attach = 800;
     const app = await launch(t, { manual: true });
     await signIn(app);
     await app.press("id:nav-settings");
     await app.waitFor("id:runner-attach-pick:solo");
+    await app.press("id:runner-attach-pick:added"); // Not part of this batch.
     await app.press("id:runner-attach-many");
     await app.waitUntil(() => f.state.attached.get("solo") === r.id);
 
@@ -407,30 +413,40 @@ test("bulk attach doesn't count a held success after an external detach or reass
     await app.press("id:nav-settings");
     await app.waitFor("id:installed-runner-space:solo");
     expect(app.shows("id:installed-runner-space:keep")).toBe(true);
+    expect(app.shows("id:installed-runner-space:added")).toBe(false);
+    expect(app.shows("id:installed-runner-space:removed")).toBe(true);
     await app.press("id:settings-close");
     const folderRead = { sid: "solo", delay: 1200, parked: false };
     t.gate.runnerRead = folderRead;
+    f.state.attached.set("added", r.id);
+    f.state.attached.delete("removed");
+    if (attaches) f.state.attached.delete("solo"); // The held snapshot sees absence.
     await app.press("id:nav-settings");
     await app.waitUntil(() => folderRead.parked);
     expect(app.shows("id:installed-runner-space:solo")).toBe(true);
 
-    if (replaced) f.state.attached.set("solo", other.id);
+    if (expectedRunner) f.state.attached.set("solo", expectedRunner);
     else f.state.attached.delete("solo");
 
     await app.clock!.runFor(800);
     await app.waitFor("id:runner-attach-result");
-    expect(words(app)).toContain("Attached to 0 of 1 Space. Solo: The runner assignment changed.");
-    expect(words(app)).toContain("Check this Space before retrying.");
-    expect(f.state.attached.get("solo")).toBe(replaced ? other.id : undefined);
-    expect(app.shows("id:runner-attach-pick:solo")).toBe(!replaced); // Authoritative paired flag.
-    expect(app.shows("id:installed-runner-space:solo")).toBe(false);
-    await app.clock!.runFor(400); // The older folder snapshot must not restore the row.
-    expect(app.shows("id:installed-runner-space:solo")).toBe(false);
+    if (attaches) expect(words(app)).toContain("Attached to 1 Space.");
+    else {
+      expect(words(app)).toContain("Attached to 0 of 1 Space. Solo: The runner assignment changed.");
+      expect(words(app)).toContain("Check this Space before retrying.");
+    }
+    expect(f.state.attached.get("solo")).toBe(expectedRunner);
+    expect(app.shows("id:runner-attach-pick:solo")).toBe(final === "detached"); // Authoritative paired flag.
+    expect(app.shows("id:installed-runner-space:solo")).toBe(attaches);
+    await app.clock!.runFor(400); // Merge the other rows without rolling back A.
+    expect(app.shows("id:installed-runner-space:solo")).toBe(attaches);
     expect(app.shows("id:installed-runner-space:keep")).toBe(true);
-    expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+    expect(app.shows("id:installed-runner-space:added")).toBe(true);
+    expect(app.shows("id:installed-runner-space:removed")).toBe(false);
+    expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(attaches ? "dismissed" : undefined);
     expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["POST", "/v1/spaces/solo/runner/attach-if-empty"]]);
 
-    if (replaced) {
+    if (final === "reassigned") {
       // Check the cache before opening Manage can get its own fresh reply.
       f.answerLate("/v1/spaces/solo/runner", TOKENS.alice!, 1200);
       await app.press("id:settings-close");
@@ -439,6 +455,54 @@ test("bulk attach doesn't count a held success after an external detach or reass
       await app.waitFor("id:attached-runner");
       expect(words(app)).toContain(other.name);
     }
+  }
+});
+
+test("a newer folder observation for A wins over a delayed reconciliation without confirming the old batch", async () => {
+  for (const oldMatch of [false, true]) {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    f.addSpace("marker", "Snapshot marker", "alice");
+    const r = f.addRunner("This PC", "personal", "alice");
+    const other = f.addRunner("Other computer", "personal", "alice");
+    f.state.attached.set("marker", other.id);
+    const t = fixture(f, r.id);
+    t.gate.attach = 500;
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    await app.press("id:nav-settings");
+    await app.waitFor("id:runner-attach-pick:solo");
+    await app.press("id:runner-attach-many");
+    await app.waitUntil(() => f.state.attached.get("solo") === r.id);
+    if (!oldMatch) f.state.attached.delete("solo");
+    const reconciliation = { sid: "solo", delay: 1000, parked: false };
+    t.gate.runnerRead = reconciliation;
+    await app.clock!.runFor(500);
+    await app.waitUntil(() => reconciliation.parked);
+
+    if (oldMatch) f.state.attached.delete("solo");
+    else f.state.attached.set("solo", r.id);
+    f.state.attached.set("marker", r.id);
+    await app.press("id:settings-close");
+    await app.press("id:nav-settings");
+    await app.waitFor("id:installed-runner-space:marker"); // The newer snapshot has merged.
+    await app.waitFor(oldMatch ? "id:runner-attach-pick:solo" : "id:installed-runner-space:solo");
+
+    await app.clock!.runFor(1000);
+    await app.waitFor("id:runner-attach-result");
+    expect(words(app)).toContain("Attached to 0 of 1 Space. Solo: The attachment wasn't confirmed.");
+    expect(app.shows("id:installed-runner-space:solo")).toBe(!oldMatch);
+    expect(app.shows("id:runner-attach-pick:solo")).toBe(oldMatch);
+    expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+    expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["POST", "/v1/spaces/solo/runner/attach-if-empty"]]);
+
+    // Hold Manage's own read so its initial UI proves what survived in cache.
+    f.answerLate("/v1/spaces/solo/runner", TOKENS.alice!, 1200);
+    await app.press("id:settings-close");
+    await app.press("id:space:solo");
+    await app.press("id:manage-space");
+    await app.waitFor(oldMatch ? `id:attach-runner:${r.id}` : "id:attached-runner");
+    expect(app.shows("id:attached-runner")).toBe(!oldMatch);
   }
 });
 

@@ -19,8 +19,9 @@
 // - Every answer is applied only if the session (server and account) and the
 //   request generation are still the same.
 
-import { signal } from "nsh";
+import { batch, signal } from "nsh";
 import { BridgeError, scrub } from "../../device/bridge";
+import { beginSpaceRunnerObservation, onSpaceRunnerObserved } from "../../spaceRunnerObservations";
 import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, spaces } from "../../store";
 import { localRunnerCall } from "../localtools/localTools";
 
@@ -94,7 +95,7 @@ export const installedNotice = signal<string | null>(null);
 export const folders = signal<Record<string, RunnerFolder>>({});
 
 let gen = 0;
-let attachedSeq = 0;
+let folderRoot = 0;
 const sessionKey = () => `${connectedTo() ?? ""}\n${me() ?? ""}`;
 
 /** Still the same session and the latest request. */
@@ -105,12 +106,17 @@ function stillValid(): () => boolean {
   return () => mine === gen && key === sessionKey() && ok();
 }
 
+function clearAttached() {
+  folderRoot++;
+  runnerSpaces.set([]);
+  folders.set({});
+}
+
 function reset() {
   installedRunner.set(null);
   ownedInstalledRunner.set(null);
   checkingInstalledScope.set(false);
-  runnerSpaces.set([]);
-  folders.set({});
+  clearAttached();
   installedError.set(null);
   installedNotice.set(null);
 }
@@ -130,31 +136,29 @@ function message(error: unknown, what: string): string {
 /** Which Spaces this user owns use this runner, by stable id (read-only GETs). */
 async function loadAttached(runnerId: string, valid: () => boolean): Promise<void> {
   const c = apiClient();
-  if (!c || !valid() || installedRunner()?.runner?.id !== runnerId || ownedInstalledRunner()?.id !== runnerId) return;
-  const seq = ++attachedSeq;
+  const root = folderRoot;
+  const stillScoped = () => valid() && root === folderRoot &&
+    installedRunner()?.runner?.id === runnerId && ownedInstalledRunner()?.id === runnerId;
+  if (!c || !stillScoped()) return;
   const owned = spaces().filter((s) => s.role === "owner" && SPACE_ID_RE.test(s.id));
-  const checks = await Promise.allSettled(owned.map(async (s) => ({ s, r: await c.getSpaceRunner(s.id) })));
-  if (!valid() || seq !== attachedSeq || installedRunner()?.runner?.id !== runnerId || ownedInstalledRunner()?.id !== runnerId) return;
-  const list: { id: string; name: string }[] = [];
-  for (const res of checks) {
-    if (res.status === "fulfilled" && res.value.r?.kind === "registered" && res.value.r.id === runnerId) list.push({ id: res.value.s.id, name: res.value.s.name });
-  }
-  runnerSpaces.set(list);
+  const checks = await Promise.allSettled(owned.map(async ({ id }) => {
+    const observation = beginSpaceRunnerObservation(id);
+    return { id, observation, runner: await c.getSpaceRunner(id) };
+  }));
+  if (!stillScoped()) return;
+  const stillOwned = new Set(spaces().filter((s) => s.role === "owner").map((s) => s.id));
+  batch(() => {
+    // Merge exact observations: an older answer for A doesn't discard
+    // fresh answers for B. A failed read isn't a detach.
+    for (const res of checks) {
+      if (res.status !== "fulfilled" || !stillOwned.has(res.value.id)) continue;
+      res.value.observation.publish(res.value.runner);
+    }
+    for (const { id } of runnerSpaces()) if (!stillOwned.has(id)) removeFolder(id);
+  });
 }
 
-/** Don't allow an older folder-list read to undo a just-confirmed attachment. */
-export function recordAttachedFolder(space: { id: string; name: string }) {
-  attachedSeq++;
-  if (!runnerSpaces().some((s) => s.id === space.id)) runnerSpaces.set([...runnerSpaces(), space]);
-}
-
-/** Called under the exact-Space write guard after a fresh assignment read. */
-export function forgetAttachedFolder(runnerId: string, sid: string) {
-  if (installedRunner()?.runner?.id !== runnerId || ownedInstalledRunner()?.id !== runnerId ||
-      !spaces().some((s) => s.id === sid && s.role === "owner")) return;
-  // An older folder snapshot can still include this Space, even if it wasn't
-  // in the published list when the assignment changed.
-  attachedSeq++;
+function removeFolder(sid: string) {
   if (runnerSpaces().some((s) => s.id === sid)) runnerSpaces.set(runnerSpaces().filter((s) => s.id !== sid));
   const all = folders();
   if (Object.prototype.hasOwnProperty.call(all, sid)) {
@@ -164,14 +168,26 @@ export function forgetAttachedFolder(runnerId: string, sid: string) {
   }
 }
 
+// This runs as part of the same accepted observation that updates the paired
+// flag and assignment cache, whether the read came from Settings or an attach.
+onSpaceRunnerObserved((sid, runner) => {
+  const id = ownedInstalledRunner()?.id;
+  if (!id || installedRunner()?.runner?.id !== id || !SPACE_ID_RE.test(sid)) return;
+  const space = spaces().find((s) => s.id === sid && s.role === "owner");
+  if (!space || runner?.kind !== "registered" || runner.id !== id || runner.visibility !== "personal") {
+    removeFolder(sid);
+  } else if (!runnerSpaces().some((s) => s.id === sid)) {
+    runnerSpaces.set([...runnerSpaces(), { id: sid, name: space.name }]);
+  }
+});
+
 /** The owner deleted this registration. An older bridge read can't revive its controls. */
 export function refreshAfterInstalledRunnerDeletion(id: string) {
   if (ownedInstalledRunner()?.id !== id) return;
   gen++;
   inflight = null;
   ownedInstalledRunner.set(null);
-  runnerSpaces.set([]);
-  folders.set({});
+  clearAttached();
   void loadInstalledRunner();
 }
 
@@ -243,12 +259,12 @@ async function loadInstalledScope(runnerId: string, valid: () => boolean) {
       ownedInstalledRunner.set({ id: runnerId, attachIfEmpty: list.attachIfEmpty });
     } else {
       ownedInstalledRunner.set(null);
-      runnerSpaces.set([]);
+      clearAttached();
     }
   } catch {
     if (valid()) {
       ownedInstalledRunner.set(null);
-      runnerSpaces.set([]);
+      clearAttached();
     }
   } finally {
     if (valid()) checkingInstalledScope.set(false);
@@ -266,15 +282,14 @@ export async function reconnectInstalledRunner(): Promise<void> {
   try {
     const next = parseInstalledRunner(await call("POST", "/v1/local-tools/runner/reconnect"));
     if (!valid()) return;
+    clearAttached();
     installedRunner.set(next);
-    folders.set({});
     installedNotice.set("Reconnected. Choose Spaces without a runner below to attach it.");
     if (next?.runner) {
       await loadInstalledScope(next.runner.id, valid);
       await loadAttached(next.runner.id, valid);
     } else {
       ownedInstalledRunner.set(null);
-      runnerSpaces.set([]);
     }
   } catch (error) {
     if (valid()) installedError.set(message(error, "Reconnecting this computer's runner"));

@@ -5,7 +5,7 @@ import type { Client, RegisteredRunner, Space, SpaceRunner } from "./api/client"
 import { beginSpaceRunnerWrite, loadRunners, reconcileOwnedSpaceRunner, runnerBusy, runners, snapshotSpaceRunnerWrite, spaceRunners } from "./settings";
 import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, spaces } from "./store";
 import { helper } from "./device/state";
-import { forgetAttachedFolder, installedBusy, installedRunner, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner, recordAttachedFolder } from "./features/installedRunner/installedRunner";
+import { installedBusy, installedRunner, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner } from "./features/installedRunner/installedRunner";
 import type { InstalledRunnerState } from "./features/installedRunner/installedRunner";
 
 export const runnerSessionKey = () => JSON.stringify([connectedTo(), me()]);
@@ -194,9 +194,7 @@ async function attachAndReconcile(
     await c.attachRunnerIfEmpty(sid, choice.id);
     accepted = true;
     if (!latest()) return newerRunnerAction;
-    const current = await reconcileOwnedSpaceRunner(sid, stillScoped, (assignment) => {
-      if (!matches(assignment)) forgetAttachedFolder(choice.id, sid);
-    });
+    const current = await reconcileOwnedSpaceRunner(sid, stillScoped);
     if (!latest()) return newerRunnerAction;
     if (current === undefined) return { kind: "unconfirmed" };
     if (!matches(current)) return { kind: "superseded", reason: "The runner assignment changed." };
@@ -319,7 +317,6 @@ export async function attachMany(spaceIds: readonly string[]) {
         if (result.kind === "attached" && result.stillVerified()) {
           attached++;
           dismissRunnerOffer();
-          recordAttachedFolder({ id: s.id, name: s.name });
         } else {
           const detail = result.kind === "not-attached" ? result.reason
             : result.kind === "superseded" ? `${result.reason} Check this Space before retrying.`
