@@ -281,6 +281,68 @@ test("escaped local parts and multiple quoted addresses stay plain without shift
   expect(out.spans?.map(s => new TextDecoder().decode(bytes.slice(s.start, s.end)))).toEqual(["@bo"]);
 });
 
+test("each adjacent quoted address ends at its own immediate separator", () => {
+  for (const text of [
+    'Use "first"@agent," second"@agent',
+    'Use "first"@agent, " second"@agent',
+    'Use "first"@coder;"second"@agent',
+    'Use <"first"@agent>,<"second"@coder>',
+    'Use <"first @agent"@[IPv6:2001:db8::1]>," second"@coder',
+    'Use ("first"@agent),(" second"@coder)',
+    String.raw`Use "first \"quote\""@agent," second"@coder`,
+  ]) {
+    expect(scanMentionDraft(draft(text), roster)).toEqual([]);
+    expect(send(text)).toEqual({ ok: true, body: { text } });
+  }
+  expect(body(send('Use "first"@coder,"@agent"')).mentions).toEqual([generic]);
+});
+
+test("a prose closing quote is not the opener of an email around a full mention", () => {
+  for (const text of [
+    'Say "hello!" "@Alice Moreno"',
+    '🌿 Say "hello?" "@Alice Moreno", then done.',
+    'Say "hello,"then "@Alice Moreno".',
+    'Use "first"@agent,"@Alice Moreno"',
+  ]) {
+    const out = body(send(text));
+    expect(out.mentions).toEqual([alice]);
+    const bytes = new TextEncoder().encode(text);
+    expect(out.spans?.map(s => new TextDecoder().decode(bytes.slice(s.start, s.end))))
+      .toEqual(["@Alice Moreno"]);
+  }
+});
+
+test("an ambiguous quote boundary requires a deliberate agent choice", () => {
+  const source = draft('Say "hello " then "@agent"');
+  const [match] = scanMentionDraft(source, roster);
+  expect(match.kind).toBe("ambiguous");
+  const result = prepareMentionSend(source, roster);
+  expect(result.ok ? null : result.reason).toBe("ambiguous");
+  const chosen = pickMention(source, match, generic, roster)!;
+  expect(body(prepareMentionSend(chosen, roster)).mentions).toEqual([generic]);
+
+  // An @ inside the possible local part is also uncertain, even if the
+  // domain itself would never resolve to anyone in the Space.
+  const inside = draft('Say "hello " then @agent please "@outside');
+  const [insideMatch] = scanMentionDraft(inside, roster);
+  expect([insideMatch.kind, insideMatch.literal]).toEqual(["ambiguous", "@agent"]);
+  const insideResult = prepareMentionSend(inside, roster);
+  expect(insideResult.ok ? null : insideResult.reason).toBe("ambiguous");
+});
+
+test("an email-like invalid host stays in the chooser even after its agent changes handle", () => {
+  const initial = {
+    ...roster, agents: roster.agents.map(a => a.id === coder.agentId ? { ...a, handle: "_coder" } : a),
+  };
+  const text = 'Use "local"@_coder';
+  const source = captureTypedMentions(draft(text), initial, { finalize: true });
+  const [match] = scanMentionDraft(source, roster, { finalize: true });
+  expect(match.kind).toBe("ambiguous");
+  const chosen = pickMention(source, match, coder, roster)!;
+  expect(body(prepareMentionSend(chosen, roster)).mentions).toEqual([{ kind: "agent", agent_id: coder.agentId }]);
+  expect(chosen.anchors[0]?.literal).toBe("@_coder");
+});
+
 test("an incomplete or implausible address suffix does not hide an ordinary mention", () => {
   for (const text of ['Say "ask @bo now"@', 'Say "ask @bo now"@.', 'Say "ask @bo now"\n"@']) {
     expect(body(send(text)).mentions).toEqual([{ kind: "user", id: "bo" }]);

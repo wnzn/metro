@@ -24,43 +24,74 @@ function visibleQuote(text: string, i: number, opaque: readonly MentionRange[]):
   return !overlapsRanges({ start: i, end: i + 1 }, opaque) && !escaped(text, i, opaque);
 }
 
+function previousQuote(text: string, before: number, opaque: readonly MentionRange[]): number | null {
+  const quote = text[before];
+  for (let i = before - 1; i >= 0; i--) {
+    if (/[\r\n\u0085\u2028\u2029]/u.test(text[i])) break;
+    if (text[i] === quote && visibleQuote(text, i, opaque)) return i;
+  }
+  return null;
+}
+
+function startsQuotedToken(text: string, start: number): boolean {
+  // Narrower than a mention boundary: the quote in `hello!"`, for example,
+  // closes prose rather than starting a new local-part token.
+  return start === 0 || /[\p{White_Space}([{<,;:]/u.test(text[start - 1]);
+}
+
 /** Find a complete local part ending at this quote, without pairing unrelated prose quotes. */
 export function quotedLocalStart(text: string, close: number, opaque: readonly MentionRange[]): number | null {
   if (close < 1 || close >= text.length) return null;
   const quote = text[close];
   if ((quote !== '"' && quote !== "'") || !visibleQuote(text, close, opaque)) return null;
-  for (let i = close - 1; i >= 0; i--) {
-    if (/[\r\n\u0085\u2028\u2029]/u.test(text[i])) break;
-    if (text[i] === quote && visibleQuote(text, i, opaque)) {
-      // An unescaped inner quote makes this local part incomplete; do
-      // not skip it to grab an earlier quote with a better boundary.
-      return opensMention(text, i) ? i : null;
-    }
-  }
-  return null;
+  const start = previousQuote(text, close, opaque);
+  // An unescaped inner quote makes this local part incomplete; do not
+  // skip it to grab an earlier quote with a better boundary.
+  return start !== null && startsQuotedToken(text, start) ? start : null;
 }
 
-function quotedEmailRanges(text: string, opaque: readonly MentionRange[]): MentionRange[] {
+function couldCloseProse(text: string, start: number, opaque: readonly MentionRange[]): boolean {
+  if (start === 0) return false;
+  const before = text[start - 1];
+  if (!/[,;:]/.test(before) && !(space.test(before) && space.test(text[start + 1]))) return false;
+  const earlier = previousQuote(text, start, opaque);
+  // The preceding quote may already close a local part, as in
+  // `"first"@host," second"@host`; it cannot open prose at the separator.
+  return earlier !== null && startsQuotedToken(text, earlier) && text[earlier + 1] !== "@";
+}
+
+function quotedEmailSyntax(text: string, opaque: readonly MentionRange[]) {
   const quoted: MentionRange[] = [];
-  // A domain can be a single label or a bracketed literal. This is only
-  // a plausibility check, not full email validation.
+  const uncertain: MentionRange[] = [];
+  // A domain can be a single label or a bracketed literal. Stop at its
+  // immediate separator; a following address may begin with another quote.
   const domain = /[\p{L}\p{N}][\p{L}\p{N}\p{M}.-]*|\[[\p{L}\p{N}:][\p{L}\p{N}.:%_-]*\]/uy;
+  const domainLabel = /^[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}-]*[\p{L}\p{N}\p{M}])?$/u;
   for (const match of text.matchAll(/["']@/gu)) {
     const close = match.index!;
-    domain.lastIndex = close + 2;
-    if (!domain.test(text)) continue;
-    // Give an ordinary quoted mention its own closing quote. Otherwise
-    // `"Hello!" "@coder"` could look like a local part starting at `!"`.
-    const end = domain.lastIndex;
-    const punctuation = /^[.,;:!?]*/.exec(text.slice(end))![0].length;
-    const after = end + punctuation;
-    if (text[after] === text[close] && visibleQuote(text, after, opaque)) continue;
     const start = quotedLocalStart(text, close, opaque);
+    if (start === null) continue;
     // Use the original @ even when it starts an anchor: an adjoining
     // edit can turn a formerly standalone mention into an email domain.
-    if (start !== null) quoted.push({ start, end: close + 2 });
+    const range = { start, end: close + 2 };
+    domain.lastIndex = close + 2;
+    const host = domain.exec(text)?.[0];
+    if (!host) {
+      // These can start a Metro agent handle but not a host name.
+      if (/[_-]/.test(text[close + 2])) uncertain.push(range);
+      continue;
+    }
+    const end = domain.lastIndex;
+    const completeHost = host.startsWith("[") || host.replace(/\.$/, "").split(".").every(label => domainLabel.test(label));
+    const boundary = end === text.length || /[\p{White_Space},;:!?)\]}>"']/u.test(text[end]);
+    if (!completeHost || !boundary || couldCloseProse(text, start, opaque)
+      || (text[end] === text[close] && visibleQuote(text, end, opaque))) {
+      uncertain.push(range);
+      continue;
+    }
+    quoted.push(range);
   }
-  return quoted;
+  return { quoted, uncertain };
 }
 
 export function closesMention(rest: string): boolean {
@@ -169,7 +200,8 @@ export function mentionSyntaxRanges(text: string, anchors: readonly MentionRange
   // Neither code nor a selected label supplies quotes to the prose parser.
   // Scan the original text around them so UTF-16 ranges and escapes stay intact.
   const quoteOpaque = [...code, ...anchors];
-  return { quoteOpaque, ignored: [...code, ...quotedEmailRanges(text, quoteOpaque)] };
+  const { quoted, uncertain } = quotedEmailSyntax(text, quoteOpaque);
+  return { quoteOpaque, ignored: [...code, ...quoted], uncertain };
 }
 
 export function overlapsRanges(range: MentionRange, ranges: readonly MentionRange[]): boolean {
