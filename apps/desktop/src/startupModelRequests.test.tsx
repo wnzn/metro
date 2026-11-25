@@ -99,6 +99,7 @@ test("pending exact-Space availability never serves another Space or the next ac
   // Return to Acme so the new account will restore the same Space and endpoint.
   await app.press("id:space:acme");
   await app.waitFor("text:hello from bob in acme", { timeout: 150 });
+  expect(calls(f, acmeModels, "alice")).toBe(2); // a new visit doesn't reuse the previous visit's read
   await app.press("id:account-menu");
   await app.press("id:disconnect");
   await app.waitFor("id:connect-screen", { timeout: 100 });

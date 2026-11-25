@@ -1,5 +1,5 @@
 import type { AvailableCatalog, Client, ProviderCatalog } from "./api/client";
-import { sessionGuard } from "./store";
+import { startupReadGuard } from "./store";
 
 type PendingModels = { result: Promise<AvailableCatalog>; current: () => boolean };
 const models = new WeakMap<Client, Map<string | null, PendingModels>>();
@@ -14,7 +14,7 @@ export function readStartupModels(client: Client, spaceId: string | null, fresh 
 
   // Explicit refreshes (e.g. after editing providers) must not join a request
   // sent before the change. Subsequent startup readers can join the newer read.
-  const current = sessionGuard(spaceId ?? undefined);
+  const current = startupReadGuard(spaceId ?? undefined);
   const result = client.availableCatalog(spaceId).finally(() => {
     if (byScope.get(spaceId)?.result === result) byScope.delete(spaceId);
   });

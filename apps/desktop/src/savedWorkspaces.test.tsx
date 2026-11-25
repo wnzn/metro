@@ -372,6 +372,25 @@ test("a 401 during remote room hydration clears the Shell without committing a n
   expect(remotePaths(s).some(p => p.includes("/events"))).toBe(false);
 });
 
+test("a delayed room refusal removes the Space without undoing deliberate navigation", async () => {
+  const s = servers();
+  const get = s.b.network[`GET ${BASE}/v1/*`]!;
+  s.b.network[`GET ${BASE}/v1/*`] = req => {
+    if (new URL(req.url).pathname === betaRooms) s.b.state.spaces.get("beta")!.members.delete("bob");
+    return get(req);
+  };
+  s.b.answerLate(betaRooms, TOKENS.bob!, 300);
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:rooms-loading", { timeout: 100 });
+  await app.press("id:nav-library");
+  await app.waitFor("id:library-view", { timeout: 150 });
+  await app.waitFor("id:space:beta", { state: "gone", timeout: 350 });
+  expect(app.shows("id:library-view")).toBe(true);
+  expect(app.shows("id:chat-view")).toBe(false);
+  expect(remotePaths(s).some(p => p.includes("/events"))).toBe(false);
+});
+
 test("signing out during remote hydration aborts the old room and never saves its token", async () => {
   const s = servers();
   const rooms = s.b.answerLate(betaRooms, TOKENS.bob!, 500);

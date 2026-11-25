@@ -180,6 +180,7 @@ let client: Client | null = null;
 let abort: AbortController | null = null;
 let session = 0;
 let navigationGeneration = 0;
+let roomEntryNavigation: number | undefined;
 let timer: number | undefined;
 let ticking = false;
 let tickAgain = false;
@@ -251,6 +252,13 @@ export async function restorePreferences(mayRestore: () => boolean = () => true)
 }
 
 // ------------------------------------------------------------------ connect / disconnect
+
+/** A pending startup read is reusable only during the same verified navigation. */
+export function startupReadGuard(spaceId?: string) {
+  const valid = guard(spaceId);
+  const navigation = navigationGeneration;
+  return () => valid() && navigation === navigationGeneration;
+}
 
 export type PreparedConnection = Readonly<{ baseUrl: string }>;
 const candidates = new WeakMap<PreparedConnection, {
@@ -585,6 +593,7 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
   const c = client;
   if (!c) return;
   const navigation = ++navigationGeneration;
+  roomEntryNavigation = navigation;
   const currentSession = guard();
   const ok = guard(spaceId);
   batch(() => {
@@ -601,7 +610,7 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
   try {
     if (!roomsBySpace()[spaceId]) {
       const list = await c.listRooms(spaceId);
-      if (!ok()) return;
+      if (!ok() || navigation !== navigationGeneration) return;
       batch(() => {
         roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
         if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, list));
@@ -614,9 +623,23 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
       disconnect(error.message);
       return;
     }
+    const denied = error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found");
+    if (navigation !== navigationGeneration) {
+      // A deliberate move to another pane wins, but the latest room entry
+      // still tells us whether the Space can remain in the sidebar.
+      if (denied && roomEntryNavigation === navigation) {
+        batch(() => {
+          purgeSpace(spaceId, true);
+          if (activeSpaceId() === spaceId) {
+            activeSpaceId.set(null);
+            activeRoomId.set(null);
+          }
+        });
+      }
+      return;
+    }
     const name = spaces().find((s) => s.id === spaceId)?.name ?? spaceId;
-    if (navigation !== navigationGeneration) return; // a newer navigation owns the main panel
-    if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) purgeSpace(spaceId, true);
+    if (denied) purgeSpace(spaceId, true);
     else purgeSpace(spaceId, false); // keep it listed; just don't keep half-loaded state
     const back = previous.spaceId && spaces().some((s) => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
     batch(() => {
@@ -626,7 +649,10 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
       actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
     });
   } finally {
-    if (currentSession()) switchingSpace.set(false);
+    if (currentSession() && roomEntryNavigation === navigation) {
+      roomEntryNavigation = undefined;
+      switchingSpace.set(false);
+    }
   }
 }
 
