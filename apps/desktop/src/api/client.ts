@@ -4,6 +4,8 @@
 
 import { discoveryApi } from "./discovery";
 import { libraryApi } from "./library";
+import { metaApi, readMetaNote, readSpacePost } from "./meta";
+import type { MetaNote, SpacePost } from "./meta";
 import { monitoringApi } from "./monitoring";
 import { pagesApi } from "./pages";
 import type { PageDraftEvent } from "./pages";
@@ -63,6 +65,8 @@ export type EventActivity = {
   page_draft?: PageDraftEvent;
   /** Public, bounded web tool metadata. Never includes credentials or raw vendor errors. */
   tool?: WebToolNote;
+  meta?: MetaNote;
+  spacePost?: SpacePost;
 };
 /** A Space agent as a run's events show it: enough for its name and avatar. */
 export type EventAgent = { id: string; handle: string; name: string; avatar_version?: string; color: string };
@@ -123,7 +127,10 @@ export type SpaceRole = "owner" | "member";
 export type Space = { id: string; name: string; role: SpaceRole; runnerPaired: boolean | null };
 export type Member = { userId: string; role: SpaceRole };
 /** An agent run in a Space the user belongs to (GET /v1/runs, newest first). */
-export type Run = { id: string; spaceId: string; roomId: string; status: string; actor: string; task: string };
+export type Run = {
+  id: string; spaceId: string; roomId: string; status: string; actor: string; task: string;
+  kind?: "room"; agentId?: string; triggerEventId?: number; startedAt?: string;
+};
 
 /** Who is signed in. `isOrgAdmin`: may create and manage organization runners. */
 export type Me = { id: string; canonicalId: string | null; isOrgAdmin: boolean };
@@ -569,6 +576,7 @@ export function createClient(options: ClientOptions) {
     ...profileApi(request, binary),
     // A Space's settings, agents and the person's own preferences there (src/api/spaces.ts).
     ...spacesApi(request, binary),
+    ...metaApi(request),
     // Monitoring events (src/api/monitoring.ts): one Space, My Chat or the instance; never an aggregate.
     ...monitoringApi(request),
     ...webSearchPrefsApi(request),
@@ -930,14 +938,15 @@ export function createClient(options: ClientOptions) {
       const data = await request("GET", "/v1/runs");
       const runs = isObject(data) ? data.runs : undefined;
       if (!Array.isArray(runs)) throw new ApiError("protocol", "GET /v1/runs did not return { runs: [...] }.");
-      return runs.filter(isRun).map((r) => ({
-        id: String(r.id),
-        spaceId: String(r.space_id),
-        roomId: String(r.room_id),
-        status: r.status,
-        actor: r.actor,
-        task: r.task,
-      }));
+      return runs.filter(isRun).map(toRun);
+    },
+
+    async retryRun(runId: string): Promise<Run> {
+      const v = await request("POST", `/v1/runs/${encodeURIComponent(runId)}/retry`, {});
+      if (!isRun(v) || String(v.id) === runId || v.kind !== "room") {
+        throw new ApiError("protocol", "Metro Server did not confirm a new run.");
+      }
+      return toRun(v);
     },
 
     /**
@@ -1254,7 +1263,9 @@ function toRoom(v: WireRoom): Room {
   };
 }
 
-function isRun(v: unknown): v is { id: string | number; space_id: string | number; room_id: string | number; status: string; actor: string; task: string } {
+type WireRun = { id: string | number; space_id: string | number; room_id: string | number; status: string; actor: string; task: string;
+  kind?: unknown; agent_id?: unknown; trigger_event_id?: unknown; started_at?: unknown };
+function isRun(v: unknown): v is WireRun {
   return (
     isObject(v) &&
     isId(v.id) &&
@@ -1264,6 +1275,18 @@ function isRun(v: unknown): v is { id: string | number; space_id: string | numbe
     typeof v.actor === "string" &&
     typeof v.task === "string"
   );
+}
+
+function toRun(r: WireRun): Run {
+  const startedAt = toCreatedAt(r.started_at);
+  return {
+    id: String(r.id), spaceId: String(r.space_id), roomId: String(r.room_id),
+    status: r.status, actor: r.actor, task: r.task,
+    ...(r.kind === "room" ? { kind: r.kind } : {}),
+    ...(typeof r.agent_id === "string" && r.agent_id ? { agentId: r.agent_id } : {}),
+    ...(isEventId(r.trigger_event_id) ? { triggerEventId: r.trigger_event_id } : {}),
+    ...(startedAt ? { startedAt } : {}),
+  };
 }
 
 // Leave legacy rendering alone. Private receipt corroboration additionally
@@ -1302,6 +1325,12 @@ function toEvent(v: RoomEvent): RoomEvent {
   if (raw.audience === "room" || raw.audience === "agent" || raw.audience === "users" || raw.audience === "mixed") event.audience = raw.audience;
   const activity = toActivity(raw.activity);
   if (activity) {
+    if (activity.source === "agent" && isObject(raw.activity)) {
+      if (event.kind === "space_post") activity.spacePost = readSpacePost(raw.activity.space_post);
+      if (event.kind === "tool_call" || event.kind === "tool_result" || event.kind === "error") {
+        activity.meta = readMetaNote(raw.activity.meta);
+      }
+    }
     if (event.kind === "page_draft" && event.actor === "agent" && activity.source === "agent" && isObject(raw.activity)) {
       const draft = toPageDraftCard(raw.activity.page_draft);
       if (draft) activity.page_draft = draft;

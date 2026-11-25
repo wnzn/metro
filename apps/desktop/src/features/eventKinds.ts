@@ -6,6 +6,7 @@ import type { Tone } from "../ui";
 export function toneForEvent(kind: string, actor: string): Tone {
   const k = kind.toLowerCase();
   const a = actor.toLowerCase();
+  if (k === "space_post") return "agent";
   if (/(error|fail|denied|reject)/.test(k)) return "danger";
   if (/(runner|tool|workspace|demo|check|mcp)/.test(k) || a === "runner" || a.startsWith("runner:")) return "runner";
   if (/(agent|assistant|model)/.test(k) || a === "agent" || a === "assistant") return "agent";

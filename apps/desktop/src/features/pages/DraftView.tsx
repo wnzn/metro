@@ -4,7 +4,7 @@ import type { Draft, Page, PageDiagnostic, PageValues } from "../../api/pages";
 import { isPageStatus, pageFailure, targetOf } from "../../api/pages";
 import { forgetPageDraft, goPages, pageGuard, pagesProblem, sameSpaceGrants, scopeVisible, spaceGrants } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
-import { apiClient, openExactRoom, sessionGuard } from "../../store";
+import { apiClient, openChat, openExactRoom, sessionGuard } from "../../store";
 import { Action, ActionBar, Badge, Banner, Column, Label, modalOpen, PageHeader, Row, ScrollArea, SegmentedControl } from "../../ui";
 import { PageCode, PageDiff } from "../../ui/pageBlocks";
 import { Diagnostics, DraftPrompt, PagesError, scopeName, showDraft, showPage } from "./controls";
@@ -133,7 +133,8 @@ export function DraftView(props: { route: DraftRoute }) {
 
   function back() {
     if (!valid() || busy()) return;
-    if (route.returnRoom && route.spaceId) {
+    if (route.returnChat) openChat();
+    else if (route.returnRoom && route.spaceId) {
       void openExactRoom(route.spaceId, route.returnRoom, valid).then(opened => {
         if (!opened && valid()) error.set("The room where this draft was proposed is no longer available. Use All pages to leave this review.");
       }, e => { if (valid()) error.set(pagesProblem(e)); });
@@ -195,7 +196,7 @@ export function DraftView(props: { route: DraftRoute }) {
       // if that fails it remains private and expires on the server.
       void client.discardPageDraft(review.id).catch(() => {});
       forgetPageDraft(review.id);
-      if (route.returnRoom) goPages({ ...route, id: next.id });
+      if (route.returnRoom || route.returnChat) goPages({ ...route, id: next.id });
       else showDraft(next);
     } catch (e) {
       // A missing selected block or newly revoked edit grant must never
@@ -215,9 +216,9 @@ export function DraftView(props: { route: DraftRoute }) {
   return <Column grow pad={6} gap={6} testID="page-draft-view">
     <Column gap={2}>
       <Row gap={2} wrap>
-        <Action compact testID="page-draft-back" label={route.returnRoom ? "‹ Back to room" : route.returnPage ? "‹ Back to page" : "‹ Back to pages"}
+        <Action compact testID="page-draft-back" label={route.returnChat ? "‹ Back to Chat" : route.returnRoom ? "‹ Back to room" : route.returnPage ? "‹ Back to page" : "‹ Back to pages"}
           variant="ghost" disabled={busy()} onPress={back} />
-        <If when={route.returnRoom || route.returnPage}><Action compact variant="ghost" label="All pages" onPress={() => goPages()} /></If>
+        <If when={route.returnChat || route.returnRoom || route.returnPage}><Action compact variant="ghost" label="All pages" onPress={() => goPages()} /></If>
       </Row>
       <PageHeader title={title()} subtitle="Review the draft before it changes a page.">
         <Badge label={scopeName(route.spaceId)} tone="system" />

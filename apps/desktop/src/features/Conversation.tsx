@@ -102,6 +102,7 @@ import { failureText } from "./activity/failure";
 import { disclosureKey, disclosureScope } from "./activity/disclosure";
 import { DEFAULT_AGENT_NAME, groupTranscript } from "./activity/group";
 import { PageDraftCard } from "./pages/PageDraftCard";
+import { SpacePostRow } from "./meta/SpacePostRow";
 import { clockFor, stampOf } from "./chatTime";
 import type { Stamp } from "./chatTime";
 import { PersonAvatar } from "./profile/PersonAvatar";
@@ -239,15 +240,22 @@ type Of<T extends TranscriptRow["type"]> = Extract<TranscriptRow, { type: T }>;
 function TranscriptRowView(props: { row: () => TranscriptRow; actions: TranscriptActions }) {
   const row = props.row;
   const as = <T extends TranscriptRow["type"]>(type: T) => (row().type === type ? (row() as Of<T>) : null);
+  const card = () => {
+    const entry = as("event"), where = mainPlace();
+    if (!entry) return null;
+    if (entry.event.kind === "page_draft" && (where === "space" || where === "chat")) return entry;
+    return where === "chat" && entry.event.kind === "space_post" && entry.event.activity?.spacePost ? entry : null;
+  };
   return (
     <If
       when={as("day")}
       else={
         <If when={as("group")} else={
-          <If when={mainPlace() === "space" && as("event")?.event.kind === "page_draft" ? as("event") : null}
-            else={<MessageRow row={() => row() as Of<"event">} actions={props.actions} />}>
+          <If when={card()} else={<MessageRow row={() => row() as Of<"event">} actions={props.actions} />}>
             {entry => <MessageFrame gutter={<StampGutter stamp={entry().stamp} id={entry().event.id} />} continued>
-              <PageDraftCard event={entry().event} />
+              <If when={entry().event.kind === "space_post"} else={<PageDraftCard event={entry().event} />}>
+                <SpacePostRow event={entry().event} />
+              </If>
             </MessageFrame>}
           </If>
         }>
@@ -796,6 +804,8 @@ export function Composer(props: {
   askPicture?: JSX.Element;
   /** The agent chooser joined to Ask agent. */
   askChooser?: JSX.Element;
+  /** Replaces Chat Send while a reply is running; saving a note remains separate. */
+  stopReply?: JSX.Element;
 }) {
   const hasFiles = () => stagedFor(composerScope()).length > 0;
   const ready = () => !props.disabled && status().phase !== "signedOut" && !sending();
@@ -804,7 +814,7 @@ export function Composer(props: {
   const canAsk = () => ready() && draft().trim().length > 0;
   const personal = () => mainPlace() === "chat";
   const post = (ask: boolean) => {
-    if (!(ask && !personal() ? canAsk() : canSend())) return;
+    if ((personal() && props.stopReply) || !(ask && !personal() ? canAsk() : canSend())) return;
     if (!personal()) {
       void send(ask, choiceForTurn, ask ? props.askAgentId : undefined, props.replyAgentId);
     } else if (ask) {
@@ -886,14 +896,14 @@ export function Composer(props: {
                 disabled={!canSend()}
                 onPress={() => void saveChatNote()}
               />
-              <SendButton
+              {props.stopReply ?? <SendButton
                 testID="send"
                 accessibilityLabel={hasFiles() ? "Send to your agent. The agent cannot read attached files." : "Send to your agent"}
                 tooltip="Send to your agent (Return)"
                 busy={sending() === "agent"}
                 disabled={!canSend()}
                 onPress={() => post(true)}
-              />
+              />}
             </If>
           }
         />

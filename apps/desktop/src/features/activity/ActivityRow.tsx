@@ -171,6 +171,7 @@ function TimelineView(props: { groupKey: string; item: TimelineItem; last: boole
 function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type: "tool" }>; last: boolean }) {
   const first = () => (props.item.call ?? props.item.result)!;
   const phase = () => (props.item.failed ? "failed" : props.item.result ? "complete" : "called");
+  const metaResult = () => props.item.result?.activity.details;
   const stateKey = (s: Step) => disclosureKey(disclosureScope(), props.groupKey, `all:${s.eventId}`);
   return (
     <TimelineEntry
@@ -179,7 +180,7 @@ function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type:
       last={props.last}
       testID={`activity-step:${first().eventId}`}
     >
-      <If when={first().activity.web} else={<>
+      <If when={first().activity.meta} else={<If when={first().activity.web} else={<>
       <Row align="center" gap={2} wrap>
         <Label variant="strong">{props.item.name}</Label>
         <If when={props.item.args}>
@@ -209,6 +210,10 @@ function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type:
       </If>
       </>}>
         <WebToolView item={props.item} groupKey={props.groupKey} />
+      </If>}>
+        <Label variant="caption" color={props.item.failed ? "danger" : "default"} testID={`activity-meta:${first().eventId}`}>
+          {props.item.failed ? `${props.item.name}: ${metaResult() || "failed"}` : metaResult() || props.item.name}
+        </Label>
       </If>
     </TimelineEntry>
   );

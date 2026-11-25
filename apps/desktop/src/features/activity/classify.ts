@@ -7,8 +7,9 @@
 // one group (by their `activity` metadata) happens in ./group.
 
 import type { Tone } from "../../ui";
-import { webOfflineOwner, webResultCount, webToolLabel } from "./web";
+import { metaToolLabel, webOfflineOwner, webResultCount, webToolLabel } from "./web";
 import type { WebToolNote } from "../../api/webSearch";
+import type { MetaNote } from "../../api/meta";
 
 export type ActivityKind = "tool_call" | "tool_result" | "thinking" | "progress";
 
@@ -22,6 +23,7 @@ export type Activity = {
   /** Monospace details (tool arguments and output). */
   mono: boolean;
   web?: { note: WebToolNote; offlineOwner?: string | null };
+  meta?: MetaNote;
 };
 
 const TOOL_NAMES: Record<string, string> = {
@@ -61,7 +63,7 @@ export function stepPhase(a: Activity): "called" | "complete" | "failed" | "thin
 }
 
 /** The event's activity, or null when it should stay visible as it is. */
-export function activityOf(event: { kind: string; text: string; actorId?: string; activity?: { tool?: WebToolNote } }): Activity | null {
+export function activityOf(event: { kind: string; text: string; actorId?: string; activity?: { tool?: WebToolNote; meta?: MetaNote } }): Activity | null {
   const k = norm(event.kind);
   const text = event.text ?? "";
   const note = event.activity?.tool;
@@ -73,6 +75,15 @@ export function activityOf(event: { kind: string; text: string; actorId?: string
     if (k === "tool_result") return { kind: "tool_result", summary, tone: "runner", details: webResultCount(text), mono: false, web };
     if (k === "tool_call") return { kind: "tool_call", summary, tone: "runner",
       details: text.startsWith(`${note.name} `) ? text.slice(note.name.length + 1) : "", mono: false, web };
+  }
+  const meta = event.activity?.meta;
+  if (meta && !event.actorId && (k === "error" || k === "tool_call" || k === "tool_result")) {
+    const label = metaToolLabel(meta.tool);
+    const details = k === "tool_call" ? "" : text.trim().replace(new RegExp(`^${meta.tool} refused: `), "");
+    return {
+      kind: k === "tool_call" ? "tool_call" : "tool_result", summary: label,
+      tone: k === "error" ? "danger" : "runner", details, mono: false, meta,
+    };
   }
   // Errors and failures are never hidden, whatever else their kind says.
   if (/(error|fail|denied|reject)/.test(k)) return null;

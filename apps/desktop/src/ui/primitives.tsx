@@ -338,6 +338,7 @@ export function Action(
     disabled?: boolean;
     busy?: boolean;
     busyLabel?: string;
+    tooltip?: string;
     /** A disclosure: shows a chevron (right closed, down open) before the label. Say the state in `accessibilityLabel` too. */
     expanded?: boolean;
     /** 28 high instead of 36, tighter padding: in rows, lists and table cells. */
@@ -378,6 +379,7 @@ export function Action(
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.label}
+      tooltip={props.tooltip ? <Text class={tooltipClass}>{props.tooltip}</Text> : undefined}
     >
       <If when={props.expanded !== undefined ? iconColor() : null}>
         {(color) => <Icon name={props.expanded ? "chevron-down" : "chevron-right"} color={color()} size={14} />}
