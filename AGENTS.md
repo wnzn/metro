@@ -50,7 +50,9 @@ The rules below describe the current source. For behaviour added after
 - Deleting a Space is permanent, owner-only and needs the Space's exact name
   typed as confirmation. It removes everything of the Space in one
   transaction (see [docs/spaces.md](docs/spaces.md#spaces-and-members)),
-  revokes its dedicated token, detaches its runner and stops its runs. Any
+  including published Pages, their versions, recently deleted Pages and
+  drafts. There is no Trash recovery for a deleted Space. It revokes its
+  dedicated token, detaches its runner and stops its runs. Any
   member except the owner can leave. Leaving is the same as being removed,
   including the purge of that person's index rows and preferences for the
   Space. The owner can't leave.
@@ -93,6 +95,18 @@ The rules below describe the current source. For behaviour added after
   fall back to a replacing route. Reconnect rotates the existing
   registration's token without changing attachments; a new one starts
   unattached.
+- **Space settings** combines General, Members, Runner, Agents and Your
+  preferences. Members can read and change their own preferences;
+  preserve owner-only management and the old Manage entry to Members.
+  Runner attachment and dedicated token issue require an empty slot.
+  Detach, revoke and rotate require the reviewed
+  assignment revision; never retry unguarded. Don't show a dedicated
+  token from an unconfirmed or superseded assignment. Rotation
+  invalidates claimed work under the old credential and can preserve
+  waiting work for the same runner; removing or replacing an assignment
+  drops old work rather than transferring it. **Test runner** posts its
+  listing as Runner activity in the open Space room, not privately in
+  Settings, and never calls a model.
 - A registered runner never runs check or MCP commands as unsandboxed host
   processes, because they could read sibling Spaces' roots. By default it
   offers only list and read. Check and MCP need `METRO_SANDBOX=docker`, which
@@ -179,6 +193,14 @@ The rules below describe the current source. For behaviour added after
 
   The same routing below still applies to choose each run's answering
   model. The agent's history shows each message's author and recipients.
+- The desktop sends verified Space mentions as stable IDs and validated
+  text ranges. Never silently retarget an ambiguous, changed or stale
+  mention; keep the original draft when send is refused. Dispatch from
+  Chat is an explicit generic request to the verified room or thread,
+  with no implicit recipients from its text. Follow up checks the exact
+  destination and doesn't silently change it. Generic `@agent` isn't an
+  identity card. Don't fall back to legacy text inference on a server
+  refusal.
 - **Opt-in classification** decides only which agent, if any, an outgoing
   message is for. A person turns it on for their own messages **per
   Space**, only while they have a System One connection usable in that
@@ -194,6 +216,13 @@ The rules below describe the current source. For behaviour added after
   starts runs as that person. It's never used on people-only messages,
   messages to a named agent or other people's messages. With it off, which
   is the default, unaddressed text is ordinary conversation.
+- Sender-only notice details are POST metadata, never a polled event,
+  search result or model history. Either or both fields may be present.
+  Bind them to the originating authenticated sender, destination and
+  matching transcript row. Don't replay them after dismissal, session
+  reset or access loss, or expose private model details in a shared
+  room. Direct Personal Chat failures
+  in this server appear in the private Chat, not as addressing notices.
 - **Personal Chat is direct.** Send starts the Chat agent, including for
   attachment-only messages. No addressing classifier or marker is needed.
   **Save note** stores the message without starting a run and overrides
@@ -307,6 +336,11 @@ The rules below describe the current source. For behaviour added after
   membership.
 - The database is pinned to one identity namespace. Never assign legacy or
   foreign history to anyone.
+- Desktop startup can show the Shell after verifying identity and
+  membership, before the remembered room finishes loading. Don't show
+  an old transcript before verification or let late startup work
+  override a newer navigation, session or authoritative access change.
+  Only reuse in-flight model reads for the same session and scope.
 - *Demo* must stay deterministic and must never call a model.
 - Sandboxing is opt-in, and `docker` mode fails closed. Check and MCP commands
   are operator-defined JSON argv and are never run through a shell.

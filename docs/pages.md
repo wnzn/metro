@@ -16,9 +16,17 @@ components, data sources and actions, and Metro renders the result with
 native components. It doesn't execute JavaScript from a page or give
 the page arbitrary network, filesystem or token access. Editors can
 edit the source and check it before saving. **Page history** lets you
-review retained versions; restoring one creates a new version. People
-who can manage a page can restore it from **Recently deleted** within
-30 days, subject to the live Page limit.
+review retained versions; restoring one creates a new version.
+
+## Deleting Pages and Spaces
+
+People who can manage an individual Page can restore it from
+**Recently deleted** within 30 days, subject to the live Page limit.
+Deleting the entire Space is different: it permanently removes the
+Space's published Pages, their version history, any Pages already in
+**Recently deleted**, and Space Page drafts. There is no Trash or
+restore path after [deleting the Space](spaces.md#spaces-and-members).
+Personal Pages aren't deleted with the Space.
 
 ## Who can see, edit, and run things
 
@@ -39,12 +47,14 @@ who can manage a page can restore it from **Recently deleted** within
   agent in one of its own top-level rooms or run one of the clicker's
   own scheduled tasks for such a room.
 - If you didn't author the action and haven't confirmed that page
-  version, Metro asks for confirmation. **Confirming one action grants
-  consent for the whole page version.** Other agent and schedule
-  buttons on that version can then run when clicked without another
-  version-consent prompt. Review the page as well as the prompt,
-  destination, and model scope in the confirmation. Consent doesn't
-  run the other buttons by itself or carry over to a new version.
+  version, Metro asks for confirmation. **Approve version and run**
+  grants consent for the whole page version but runs only the clicked
+  action. The confirmation shows that action's prompt, destination and
+  model scope, plus up to four other available agent or schedule button
+  labels and a count of any more. Review the page too: approval covers
+  its agent and schedule buttons, not just the ones listed. Other buttons
+  still need a click, but won't ask for approval again on that version.
+  Approval doesn't carry over to a new version.
 - Each click still checks the current page version, the clicker's
   access, and the action's destination. Running a schedule still
   requires the clicker to own it and pass the task's checks. The desktop

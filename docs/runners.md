@@ -1,7 +1,8 @@
 # Runners: dedicated and registered
 
 The setup steps below are for published releases. The desktop's
-[guarded local runner offer](next-source.md#this-computers-runner) and
+[guarded local runner offer](next-source.md#this-computers-runner),
+[Space Runner settings](next-source.md#guarded-runner-changes) and
 [runner update controls](updates.md#runner-and-server-updates) are in
 the source, not released.
 

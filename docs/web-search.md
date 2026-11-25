@@ -119,6 +119,11 @@ The activity text is subject to the server's event length limit.
 Space members who can read the room can see the activity; Personal
 Chat activity is private to that account in the app.
 
+In the source, not released, the desktop uses [neutral Web Activity
+labels](next-source.md#page-consent-and-web-activity). **Saved key** and
+**no key** describe how an attempt was made, not what the provider charges
+or which limits apply.
+
 ## Which URLs Metro can fetch
 
 Metro checks URL provenance: the normalized HTTP or HTTPS URL must
