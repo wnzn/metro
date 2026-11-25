@@ -19,14 +19,16 @@ use rig_core::model::ModelList;
 use rig_core::providers::registry::ProviderConfig;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
+use std::time::Duration;
 
+use super::budget::{BudgetedHttp, LISTING_MAX_RESPONSE_BYTES, PROBE_MAX_RESPONSE_BYTES};
 use super::catalog::{self, Adapter, Capability, Entry, Execution};
 use super::models::{self, ModelView, Thinking};
 use super::secret::MAX_API_KEY_BYTES;
 use super::store::{self, Row};
 use super::{
     LIST_TIMEOUT, MAX_CONNECTIONS_PER_USER, MAX_LISTED_MODELS, MAX_MODEL_CHARS, MAX_NAME_CHARS,
-    UseError, normalize_base_url,
+    ProviderError, UseError, normalize_base_url,
 };
 use crate::AppState;
 use crate::api::ApiError;
@@ -620,12 +622,21 @@ async fn save_update(
 /// Test only the candidate config. Never include upstream response bodies,
 /// request data, or arbitrary provider error text in logs or the API response.
 async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<()> {
+    probe(state, entry, row, LIST_TIMEOUT).await
+}
+
+/// [`test_endpoint`] with every upstream call bounded by `deadline`.
+async fn probe(state: &AppState, entry: &Entry, row: &Row, deadline: Duration) -> ApiResult<()> {
     if entry.lists_models {
         let result = match entry.adapter {
             Adapter::SystemOne | Adapter::Embeddings => {
-                list_typed_models(state, entry, row).await.map(|_| ())
+                list_typed_models_within(state, entry, row, deadline)
+                    .await
+                    .map(|_| ())
             }
-            _ => list_server_models(state, entry, row).await.map(|_| ()),
+            _ => list_server_models_within(state, entry, row, deadline)
+                .await
+                .map(|_| ()),
         };
         return result.map_err(|e| match e.status() {
             StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => ApiError::new(
@@ -648,11 +659,23 @@ async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<
             "too many endpoint tests are running; try again shortly",
         ));
     };
+    // A spent deadline is a gateway timeout; any other upstream failure is
+    // a bad gateway.
     let failed = |what: &str| {
         ApiError::new(
             StatusCode::BAD_GATEWAY,
             format!("the new endpoint failed its {what} test"),
         )
+    };
+    let timed_out = |what: &str| {
+        ApiError::new(
+            StatusCode::GATEWAY_TIMEOUT,
+            format!("the new endpoint failed its {what} test (timed out)"),
+        )
+    };
+    let typed_failed = |what: &str, e: ProviderError| match e.status() {
+        StatusCode::GATEWAY_TIMEOUT => timed_out(what),
+        _ => failed(what),
     };
     match entry.adapter {
         Adapter::SystemOne => {
@@ -667,14 +690,14 @@ async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<
             )
             .map_err(|_| failed("System One request setup"))?;
             match tokio::time::timeout(
-                LIST_TIMEOUT,
+                deadline,
                 super::typed::decide(&base, key.as_deref(), request),
             )
             .await
             {
                 Ok(Ok(_)) => Ok(()),
-                Ok(Err(_)) => Err(failed("System One Noul")),
-                Err(_) => Err(failed("System One Noul (timed out)")),
+                Ok(Err(e)) => Err(typed_failed("System One Noul", e)),
+                Err(_) => Err(timed_out("System One Noul")),
             }
         }
         Adapter::Embeddings => {
@@ -686,14 +709,14 @@ async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<
                 super::typed::embedding_request(&row.model, &["Metro connection test".into()])
                     .map_err(|_| failed("embeddings request setup"))?;
             match tokio::time::timeout(
-                LIST_TIMEOUT,
+                deadline,
                 super::typed::embed(&base, key.as_deref(), request),
             )
             .await
             {
                 Ok(Ok(_)) => Ok(()),
-                Ok(Err(_)) => Err(failed("embeddings")),
-                Err(_) => Err(failed("embeddings (timed out)")),
+                Ok(Err(e)) => Err(typed_failed("embeddings", e)),
+                Err(_) => Err(timed_out("embeddings")),
             }
         }
         Adapter::Registered(_) | Adapter::Custom => {
@@ -701,24 +724,193 @@ async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<
                 .providers
                 .server_config(entry, row)
                 .map_err(use_error)?;
-            let model =
-                config.completion_model(&row.model, state.providers.http(), Default::default());
+            let http = BudgetedHttp::client(state.providers.http(), PROBE_MAX_RESPONSE_BYTES);
+            let model = config.completion_model(&row.model, http, Default::default());
             let request = CompletionRequest::new("Reply OK.").max_tokens(16);
-            match tokio::time::timeout(LIST_TIMEOUT, model.call(request)).await {
+            match tokio::time::timeout(deadline, model.call(request)).await {
                 Ok(Ok(_)) => Ok(()),
+                Ok(Err(e)) if too_large(&e) => Err(failed("chat completion (response too large)")),
                 Ok(Err(_)) => Err(failed("chat completion")),
-                Err(_) => Err(failed("chat completion (timed out)")),
+                Err(_) => Err(timed_out("chat completion")),
             }
         }
         Adapter::Device => Err(device_has_no_key()),
     }
 }
 
+/// A state with no master key whose providers may use `allowed`.
+#[cfg(test)]
+async fn probe_state(allowed: Vec<String>) -> AppState {
+    use std::sync::Arc;
+
+    let auth = metro_auth::Authenticator::from_lookup(|key| {
+        Ok((key == metro_auth::env::DEV_USERS).then(|| r#"{"user":"fixture-dev-token"}"#.into()))
+    })
+    .await
+    .unwrap();
+    let config = crate::Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        db_path: ":memory:".into(),
+        model: None,
+        limits: crate::Limits::default(),
+        org_admins: vec![],
+    };
+    let mut state = AppState::new(
+        config,
+        crate::db::Db::open_in_memory().unwrap(),
+        Arc::new(auth),
+    )
+    .await
+    .unwrap();
+    state.providers = super::ProviderService::new(None, allowed).unwrap();
+    state
+}
+
+/// A saved connection of `provider` at `base_url` with model `probe-model`.
+#[cfg(test)]
+fn probe_row(state: &AppState, provider: &str, base_url: &str) -> Row {
+    let row = Row {
+        id: new_connection_id(),
+        user_id: "user".into(),
+        name: "fixture".into(),
+        provider_id: provider.into(),
+        base_url: Some(base_url.into()),
+        model: "probe-model".into(),
+        is_default: false,
+        sealed_key: None,
+        capability: catalog::find(provider).unwrap().capability,
+        config_rev: 0,
+    };
+    assert!(store::insert(&mut state.db.lock(), &row, 20).unwrap());
+    row
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn oversized_probe_responses_fail_the_change_and_stop_reading() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use axum::body::Body;
+    use axum::{Router, routing::get, routing::post};
+
+    const PAD: usize = 64 * 1024;
+    const PADS: usize = 1024; // 64 MiB, chunked, valid JSON
+    fn padded(head: &'static str, tail: &'static str, produced: Arc<AtomicUsize>) -> Body {
+        let pads = futures::stream::iter(0..PADS).map(move |_| {
+            produced.fetch_add(PAD, Ordering::SeqCst);
+            Ok::<_, std::io::Error>(Bytes::from(vec![b'a'; PAD]))
+        });
+        let stream = futures::stream::once(async move { Ok(Bytes::from(head)) })
+            .chain(pads)
+            .chain(futures::stream::once(async move { Ok(Bytes::from(tail)) }));
+        Body::from_stream(stream)
+    }
+    use futures::StreamExt;
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (original, big) = (format!("{origin}/original/v1"), format!("{origin}/big/v1"));
+    let produced = Arc::new(AtomicUsize::new(0));
+    let (listing, completion) = (produced.clone(), produced.clone());
+    let app = Router::new()
+        .route(
+            "/big/v1/models",
+            get(move || {
+                let produced = listing.clone();
+                async move {
+                    padded(
+                        r#"{"object":"list","data":[{"id":"probe-model","object":"model","created":0,"owned_by":"x","pad":""#,
+                        r#""}]}"#,
+                        produced,
+                    )
+                }
+            }),
+        )
+        .route(
+            "/big/v1/chat/completions",
+            post(move || {
+                let produced = completion.clone();
+                async move {
+                    padded(
+                        r#"{"id":"c","object":"chat.completion","model":"probe-model","created":0,"choices":[{"index":0,"finish_reason":"stop","message":{"role":"assistant","content":"OK"}}],"pad":""#,
+                        r#""}"#,
+                        produced,
+                    )
+                }
+            }),
+        );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let state = probe_state(vec![original.clone(), big.clone()]).await;
+
+    for lists_models in [true, false] {
+        let mut entry = catalog::find(catalog::CUSTOM).unwrap().clone();
+        entry.lists_models = lists_models;
+        let previous = probe_row(&state, catalog::CUSTOM, &original);
+        produced.store(0, Ordering::SeqCst);
+        let change = store::Patch {
+            base_url: Some(big.clone()),
+            ..store::Patch::default()
+        };
+        let err = save_update(&state, &entry, change, previous.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY, "{}", err.message());
+        assert!(err.message().contains("too large"), "{}", err.message());
+        let saved = store::get(&state.db.lock(), &previous.user_id, &previous.id).unwrap();
+        assert_eq!(saved.as_ref(), Some(&previous));
+        // Reading stopped near the budget (plus socket buffers), far short
+        // of the 64 MiB the endpoint would have sent.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let sent = produced.load(Ordering::SeqCst);
+        assert!(sent < 32 * 1024 * 1024, "{sent} bytes produced");
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn probes_past_their_deadline_answer_gateway_timeout() {
+    use std::time::Duration;
+
+    use axum::{Router, routing::any};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let slow = format!("{origin}/v1");
+    let app = Router::new().route(
+        "/v1/{*rest}",
+        any(|| async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            StatusCode::OK
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let state = probe_state(vec![slow.clone()]).await;
+    for id in [
+        catalog::CUSTOM_SYSTEMONE,
+        catalog::CUSTOM_EMBEDDINGS,
+        catalog::CUSTOM,
+    ] {
+        let row = probe_row(&state, id, &slow);
+        for lists_models in [true, false] {
+            let mut entry = catalog::find(id).unwrap().clone();
+            entry.lists_models = lists_models;
+            let err = probe(&state, &entry, &row, Duration::from_millis(300))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.status(),
+                StatusCode::GATEWAY_TIMEOUT,
+                "{id} lists={lists_models}: {}",
+                err.message()
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 #[tokio::test]
 async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
-    use std::sync::Arc;
-
     use axum::{Router, routing::post};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -762,28 +954,7 @@ async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
             )
             .fallback(|| async { StatusCode::BAD_GATEWAY });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    let auth = metro_auth::Authenticator::from_lookup(|key| {
-        Ok((key == metro_auth::env::DEV_USERS).then(|| r#"{"user":"fixture-dev-token"}"#.into()))
-    })
-    .await
-    .unwrap();
-    let config = crate::Config {
-        bind: "127.0.0.1:0".parse().unwrap(),
-        db_path: ":memory:".into(),
-        model: None,
-        limits: crate::Limits::default(),
-        org_admins: vec![],
-    };
-    let mut state = AppState::new(
-        config,
-        crate::db::Db::open_in_memory().unwrap(),
-        Arc::new(auth),
-    )
-    .await
-    .unwrap();
-    state.providers =
-        super::ProviderService::new(None, vec![base.clone(), original.clone(), failing.clone()])
-            .unwrap();
+    let state = probe_state(vec![base.clone(), original.clone(), failing.clone()]).await;
     for (id, operation) in [
         (catalog::CUSTOM_SYSTEMONE, "System One Noul"),
         (catalog::CUSTOM_EMBEDDINGS, "embeddings"),
@@ -1025,6 +1196,15 @@ async fn list_server_models(
     entry: &Entry,
     row: &Row,
 ) -> ApiResult<Vec<(String, Option<String>)>> {
+    list_server_models_within(state, entry, row, LIST_TIMEOUT).await
+}
+
+async fn list_server_models_within(
+    state: &AppState,
+    entry: &Entry,
+    row: &Row,
+    deadline: Duration,
+) -> ApiResult<Vec<(String, Option<String>)>> {
     if !entry.lists_models {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1040,7 +1220,9 @@ async fn list_server_models(
             "too many model listings are running; try again shortly",
         ));
     };
-    match tokio::time::timeout(LIST_TIMEOUT, list_upstream(config, state.providers.http())).await {
+    // Every page together reads at most this many bytes.
+    let http = BudgetedHttp::client(state.providers.http(), LISTING_MAX_RESPONSE_BYTES);
+    match tokio::time::timeout(deadline, list_upstream(config, http)).await {
         Ok(Ok(list)) => Ok(list.data.into_iter().map(|m| (m.id, m.name)).collect()),
         Ok(Err(e)) => {
             // Only the error's kind is logged: upstream text may echo input.
@@ -1055,6 +1237,10 @@ async fn list_server_models(
                 match e {
                     RigProviderError::InvalidAuthentication(_) => {
                         "the provider rejected the API key"
+                    }
+                    e if too_large(&e) => {
+                        "the provider's model list is too large; you can still enter the model \
+                         id yourself"
                     }
                     _ => {
                         "the provider did not return a model list; you can still enter the \
@@ -1073,6 +1259,15 @@ async fn list_server_models(
 /// A System One (`{models: [{name}]}`) or embeddings (`{data: [{id}]}`)
 /// listing, with the connection's own endpoint and key, no redirects.
 async fn list_typed_models(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<Vec<String>> {
+    list_typed_models_within(state, entry, row, LIST_TIMEOUT).await
+}
+
+async fn list_typed_models_within(
+    state: &AppState,
+    entry: &Entry,
+    row: &Row,
+    deadline: Duration,
+) -> ApiResult<Vec<String>> {
     let (base, key) = state
         .providers
         .typed_endpoint(entry, row)
@@ -1082,7 +1277,17 @@ async fn list_typed_models(state: &AppState, entry: &Entry, row: &Row) -> ApiRes
             "too many model listings are running; try again shortly",
         ));
     };
-    match super::typed::list_models(&base, key.as_deref(), entry.capability).await {
+    let listed = tokio::time::timeout(
+        deadline,
+        super::typed::list_models(&base, key.as_deref(), entry.capability),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        Err(ProviderError::Endpoint(
+            "the model endpoint did not answer in time".into(),
+        ))
+    });
+    match listed {
         // OpenAI lists every model; only its embedding models apply here.
         Ok(models) if entry.id == catalog::OPENAI_EMBEDDINGS => Ok(models
             .into_iter()
@@ -1111,6 +1316,14 @@ async fn list_upstream(
         ProviderConfig::OpenAi(c) => c.connect(http).list_models().await,
         ProviderConfig::Anthropic(c) => c.connect(http).list_models().await,
         ProviderConfig::Gemini(c) => c.connect(http).list_models().await,
+    }
+}
+
+/// Whether Rig's error came from a spent response budget.
+fn too_large(e: &RigProviderError) -> bool {
+    match e {
+        RigProviderError::Http(e) => super::budget::is_too_large(&**e),
+        e => super::budget::is_too_large(e),
     }
 }
 

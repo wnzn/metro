@@ -40,6 +40,7 @@
 //! stands in for media: it answers [`UseError::MediaUnsupported`].
 
 pub mod api;
+mod budget;
 pub mod catalog;
 pub mod guard;
 mod listed;
