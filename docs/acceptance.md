@@ -124,7 +124,7 @@ accepted arguments and event summaries, current-run model output, URL
 provenance and host checks, and the hosted MCP initialization sequence.
 This was local source inspection, not a live provider or retention test.
 
-**Runtime copy follow-ups for UX (no code change in this pass):**
+**Runtime copy findings at this earlier cut (no code change in that pass):**
 
 - Web Search and About & updates → Privacy use singular provider
   wording and refer to “this computer.” Explain that any contacted
@@ -141,20 +141,97 @@ This was local source inspection, not a live provider or retention test.
   is remembered for that page version. Say explicitly that it also
   covers other buttons in the version.
 
-**Documentation follow-ups, after integration:**
+See the following entry for the later source cutoff and outstanding UX
+review items.
 
-- Unified Space settings (U9): update owner/member navigation,
-  old deep links and the runner recovery entry point.
-- Composer and mentions (U11): document name and ID resolution,
-  ambiguity handling, and recipient display only after desktop wiring
-  and verification.
-- Notices (U12): document the sender-only classification and routing
-  feedback and its lifetime after the UI is wired and verified.
-- Startup medium: update contributor and troubleshooting docs only for
-  merged changes with measured evidence.
-- Final acceptance: record the exact verified integration commit,
-  checks and exceptions. Update published instructions and release
-  facts only after publication is recorded.
+## Source only: interim gate and startup evidence
+
+- **Interim desktop gate, `141a89ff131f8c1f99fdfcdb0d234f5d81a6ae12`.**
+  The archived full offline `nsh test` log and JUnit receipt agree:
+  **678/678 passed**, with no failures, errors or skips. This gate covers
+  the integration at that commit, not the later feature cut or a final
+  combined release matrix.
+- **Startup fixtures, `cf5fd97ff2f0a1ebe2d7fe1d73d78ddcdecfd379`.**
+  The startup handoff measured **70 ms to the authenticated Shell and
+  360 ms to first room text** for the saved remote path. The local
+  fixture measured **150/450 ms** for those same milestones. These are
+  offline NSH fixtures with controlled responses, compared with a
+  fixture baseline, not native app-launch or live network timings.
+  At this startup snapshot with the other conversation lanes merged in,
+  each steady remembered-room fixture made **12 server requests**,
+  not the 10 observed on the standalone startup lane. The empty-Chat
+  fixtures made 9 without an operator model and 8 with one. The
+  independent startup review checked focused regressions and request
+  assertions; it did not rerun the aggregate timings. The startup cut
+  is an ancestor of the guide's current feature cut; these measurements
+  were not rerun at the newer cut in the docs lane.
+- **Docs cutoff, `2cb1bebf55f06a168161404c1496fd9f20442a93`.**
+  The [source preview](next-source.md) was advanced after checking the
+  merged Space settings, guarded runner and token routes, mentions and
+  Dispatch, sender notices, startup, and Space deletion code. The
+  docs lane verified the local 0.4.0 tag and kept the published release
+  record unchanged. It ran local Markdown/link and diff checks only.
+
+**Open after the full UX review of `2cb1beb`:** small-window startup
+HTTP consent, live bulk runner selection, the in-app Space deletion
+warning, retargeting a nonempty **Follow up** draft, reviewing other
+actions covered by Page consent, and web activity labels for keys and
+limits. The docs describe the behavior at this cutoff, not the fixes
+under way. The admin browser fixture did not yield a usable result in
+that UX review.
+
+**Final acceptance pending.** The backend receipt below is separate.
+Record the completed desktop gate, UX fixes and combined results
+against their exact commits after independent verification. Don't add
+interim totals to the final matrix, or change published instructions
+until publication is recorded.
+
+## Source only: bounded backend gate at 2cb1beb
+
+The verified local backend gate ran on
+`2cb1bebf55f06a168161404c1496fd9f20442a93`, Git tree
+`8a84fc0e36ccd285d45c496be8fc3ee528740fbf`, with `crates/` tree
+`7242f3cb5a77486e51b43c3cad864499737572bb`. It used Rust, Cargo and
+Clippy 1.98.1 in an isolated loopback-only network namespace without
+deployment credentials. This is not the earlier **678/678** desktop
+gate at `141a89f`, a new desktop result, or release sign-off.
+
+- **Rust:** One locked, offline test run across `metro-server`,
+  `metro-connector`, `metro-runner`, `metro-auth`, `metro-url-policy`,
+  `metro-release` and `metro-model-protocol` passed **1,092 unique
+  cases** including doctests, with **0 failed, 3 ignored and 6
+  Docker-dependent tests excluded**. The normal server, runner and
+  connector built offline. `cargo fmt --all -- --check` and strict
+  `cargo clippy --locked --offline --all-targets … -- -D warnings`
+  passed for the recorded scope (Clippy: those seven packages).
+- **Loopback e2e:** The normal binaries passed all 11 scripts:
+  `smoke`, `settings`, `attachments`, `pages`, `device_connector`,
+  `threads`, `intelligence`, `agent_pages`, `web_search`, `library`
+  and `schedules`. These are the scripts in [`tests/e2e`](../tests/e2e).
+  The audited normal binaries had neither the test-release feature
+  nor the fixture verifier markers. The gate then freshly built
+  server and runner executables in a separate target with
+  `metro-server/e2e-test-release,metro-runner/e2e-test-release` and ran
+  [`updates.py`](../tests/e2e/updates.py) only against those binaries.
+  It passed owner-only update, in-place upgrade, refusal to claim
+  work during unsafe journal or rollback states, and rollback of a
+  crash-loop version after three restarts. This did not contact the
+  live release service or demonstrate live signed distribution.
+- **Packaging and tooling:** The Python suites in
+  [`packaging`](../packaging), [`release-signatures`](../packaging/release-signatures)
+  and [`windows-signing`](../packaging/windows-signing) passed **316**
+  tests with **11 skipped**, using PowerShell on Linux where needed.
+  ShellCheck, actionlint, the full-SHA action pin check and the
+  example workspace check passed. The
+  [`admin.browser-test.mjs`](../crates/server/src/admin_web/admin.browser-test.mjs)
+  mocked Chromium admin API suite passed **30** checks, separate from
+  the inconclusive browser attempt in the UX review.
+
+**Not verified by this gate:** Docker sandbox execution or container
+images; native Windows or macOS installs and signing; hosted CI or an
+actual release run; live auth, providers, signing or updates; live
+hourly recurrence; the media-reference e2e; or the separate desktop,
+TUI and UI matrices. Desktop acceptance and UX fixes remain pending.
 
 ## Source only: updater lane and reviewed integration (2026-11-25, local)
 

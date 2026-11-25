@@ -88,6 +88,11 @@ The live dev service's profile read endpoints were also checked.
   everyone's per-Space preferences, its agents and its monitoring events.
   Its registered runner is detached, and its dedicated runner token is
   revoked, so queued and claimed jobs fail. Its running agent runs stop.
+  In the source, not released, the same transaction also permanently
+  removes the Space's published Pages, their version history,
+  recently deleted Pages, and Space Page drafts, including drafts that
+  had not yet created a page. [Recently deleted](pages.md#deleting-pages-and-spaces)
+  cannot recover them after Space deletion. This is not a 0.4.0 Pages feature.
 - A Space holds at most 100 members and 200 rooms, threads included.
 
 | Request | Who | Result |
@@ -171,7 +176,9 @@ your own, or one shared with this Space or the organization. It's checked
 when you save and again on every run. The order a run's model is chosen in
 is in [settings.md](settings.md#which-model-a-run-uses).
 
-**In the desktop app** (released in 0.4.0), a Space's
+The [unified Space settings](next-source.md#space-settings) and
+[guarded runner changes](next-source.md#guarded-runner-changes) are in
+the source, not released. **In the published 0.4.0 app**, a Space's
 settings window has four pages: **General** (name and description; **Leave
 Space…** for members, **Delete Space…** with the typed name for the owner),
 **Members and runner** (a link to the owner's member and runner
@@ -186,8 +193,10 @@ inserts, **Esc** closes the list.
 
 ## Messages and addressing
 
-For client developers, the [source-only Space send protocol](next-source.md#space-send-protocol-client-developers)
-documents the new optional fields and sender-only response metadata.
+In the source, not released: [desktop mentions and Dispatch](next-source.md#mentions-in-rooms-and-threads),
+[private sender notices](next-source.md#private-sender-notices), and the
+[Space send protocol](next-source.md#space-send-protocol-client-developers).
+The following describes 0.4.0.
 
 | You write | Addressed to | Which agent runs |
 | --- | --- | --- |
@@ -402,6 +411,9 @@ sharing logs. A read names exactly one scope; nothing combines them.
   README](../apps/desktop/README.md#troubleshooting)).
 
 ## Runner pairing
+
+These are the published 0.4.0 routes and behavior. For the source-only
+desktop and revision-checked API, see [Guarded runner changes](next-source.md#guarded-runner-changes).
 
 A Space uses **at most one runner**, and only its owner chooses it. There are
 two kinds, described fully in [runners.md](runners.md):

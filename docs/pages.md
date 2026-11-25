@@ -16,9 +16,17 @@ components, data sources and actions, and Metro renders the result with
 native components. It doesn't execute JavaScript from a page or give
 the page arbitrary network, filesystem or token access. Editors can
 edit the source and check it before saving. **Page history** lets you
-review retained versions; restoring one creates a new version. People
-who can manage a page can restore it from **Recently deleted** within
-30 days, subject to the live Page limit.
+review retained versions; restoring one creates a new version.
+
+## Deleting Pages and Spaces
+
+People who can manage an individual Page can restore it from
+**Recently deleted** within 30 days, subject to the live Page limit.
+Deleting the entire Space is different: it permanently removes the
+Space's published Pages, their version history, any Pages already in
+**Recently deleted**, and Space Page drafts. There is no Trash or
+restore path after [deleting the Space](spaces.md#spaces-and-members).
+Personal Pages aren't deleted with the Space.
 
 ## Who can see, edit, and run things
 
