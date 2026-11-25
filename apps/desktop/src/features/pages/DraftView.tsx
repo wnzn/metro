@@ -1,6 +1,6 @@
 import { cleanup, effect, lifecycle, signal, untracked } from "nsh";
 import type { TurnModelChoice } from "../../api/client";
-import type { Draft, Page, PageData, PageDiagnostic } from "../../api/pages";
+import type { Draft, Page, PageDiagnostic, PageValues } from "../../api/pages";
 import { isPageStatus, pageFailure, targetOf } from "../../api/pages";
 import { forgetPageDraft, goPages, pageGuard, pagesProblem, scopeVisible } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
@@ -17,7 +17,7 @@ type Tab = "preview" | "changes" | "source";
 export function DraftView(props: { route: DraftRoute }) {
   const route = props.route, client = apiClient();
   const guard = pageGuard(route);
-  const draft = signal<Draft | null>(null), data = signal<PageData | null>(null);
+  const draft = signal<Draft | null>(null), data = signal<PageValues | null>(null);
   const diagnostics = signal<PageDiagnostic[]>([]);
   const currentHead = signal<Page | null>(null), stale = signal(false);
   const tab = signal<Tab>("preview"), error = signal("");
@@ -47,7 +47,8 @@ export function DraftView(props: { route: DraftRoute }) {
     try {
       const next = await client.getPageDraft(route.id);
       if (!available()) return;
-      if (next.id !== route.id || next.space_id !== (route.spaceId ?? null) || (next.space_id && !grants.get(next.space_id)?.()) || !scopeVisible(next)) { missing(); return; }
+      if (next.id !== route.id || next.space_id !== (route.spaceId ?? null) || (route.returnPage && next.page_id !== route.returnPage)
+        || (next.space_id && !grants.get(next.space_id)?.()) || !scopeVisible(next)) { missing(); return; }
       grant = sessionGuard(next.space_id ?? undefined);
       draft.set(next);
       diagnostics.set(next.diagnostics);
@@ -56,7 +57,7 @@ export function DraftView(props: { route: DraftRoute }) {
     } catch (e) { if (available()) problem(e); }
     finally { checking = false; if (valid()) loading.set(false); }
   }
-  visiblePolling(() => available() && (!draft() || draft()?.status === "generating"), () => 1_500, () => void load(), true);
+  visiblePolling(() => visible() && available() && (!draft() || draft()?.status === "generating"), () => 1_500, () => void load(), true);
   async function preview() {
     if (!client || !available() || draft()?.status !== "ready" || !draft()?.spec) return;
     const index = ++dataSeq, grants = spaces().map(s => sessionGuard(s.id));

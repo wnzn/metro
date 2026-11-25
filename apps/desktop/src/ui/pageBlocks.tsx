@@ -132,7 +132,7 @@ export function PageMarkdown(props: { text: string; onLink?: (url: string) => vo
 
 export function PageCode(props: { value: string; readOnly?: boolean; onChange?: (value: string) => void; diagnostics?: EditorDiagnostic[] }) {
   return <Editor class="min-h-[240px] flex-1 rounded-(--radius-sm) border border-border bg-background"
-    testID="page-code" accessibilityLabel="Page TSX source" language="tsx" value={props.value} readOnly={props.readOnly}
+    testID="page-code" accessibilityLabel="Page TSX source" language="tsx" value={props.value} readOnly={props.readOnly} autoFocus={!props.readOnly}
     onChange={props.onChange ? e => props.onChange?.(e.value) : undefined} diagnostics={props.diagnostics} scrollBeyondLastLine={false} />;
 }
 

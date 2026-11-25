@@ -48,7 +48,8 @@ export type Capability = {
   enabled: boolean; reason?: string; confirm?: boolean; schedule_revision?: number;
   space_id?: string; room_id?: string; page_id?: string; chat?: boolean;
 };
-export type PageData = { version: number | null; data: Record<string, SourceResult>; actions: Record<string, Capability>; resolved_at: string };
+export type PageValues = { data: Record<string, SourceResult>; actions: Record<string, Capability>; resolved_at: string };
+export type PageData = PageValues & { version: number };
 export type Confirmation = {
   page_id: string; version: number; block_key: string; edited_by: string; edited_at: string; runs_as: string;
   action:
@@ -78,7 +79,7 @@ export function pagesApi(request: RequestFn) {
   const segment = (id: string, kind: "page" | "draft") => {
     const pattern = kind === "page" ? /^pg_[A-Za-z0-9_-]{1,96}$/ : /^pgd_[A-Za-z0-9_-]{1,96}$/;
     if (!pattern.test(id)) throw new ApiError("protocol", `Invalid ${kind} identifier.`);
-    return id;
+    return encodeURIComponent(id);
   };
   const page = (id: string) => `${root}/${segment(id, "page")}`;
   const draft = (id: string) => `${root}/drafts/${segment(id, "draft")}`;
@@ -124,6 +125,6 @@ export function pagesApi(request: RequestFn) {
     getPageDraft: (id: string) => json<Draft>("GET", draft(id)),
     discardPageDraft: async (id: string) => { await request("DELETE", draft(id)); },
     applyPageDraft: (id: string, confirm_outside = false) => json<Page>("POST", `${draft(id)}/apply`, { confirm_outside }),
-    pageDraftData: (id: string) => json<PageData>("POST", `${draft(id)}/data`, {}),
+    pageDraftData: (id: string) => json<PageValues>("POST", `${draft(id)}/data`, {}),
   };
 }

@@ -108,7 +108,10 @@ function SidebarRail() {
               seed={space().id}
               selected={space().id === activeSpaceId() && mainPlace() === "space"}
               onPress={() => void selectSpace(space().id)}
-              menu={[{ id: `rail-space-settings:${space().id}`, label: "Space settings", onPress: () => openSpaceSettings(space().id) }]}
+              menu={[
+                { id: `rail-space-settings:${space().id}`, label: "Space settings", onPress: () => openSpaceSettings(space().id) },
+                { id: `rail-space-pages:${space().id}`, label: "Pages", onPress: () => goPages({ kind: "home", spaceId: space().id }) },
+              ]}
             />
           )}
         </Each>
@@ -192,6 +195,7 @@ function SpacesSection() {
                   { id: `space-settings:${space().id}`, label: "Space settings", onPress: () => openSpaceSettings(space().id) },
                   { id: `space-agents:${space().id}`, label: "Agents", onPress: () => openSpaceSettings(space().id, "agents") },
                   { id: `space-prefs:${space().id}`, label: "Your preferences", onPress: () => openSpaceSettings(space().id, "preferences") },
+                  { id: `space-menu-pages:${space().id}`, label: "Pages", onPress: () => goPages({ kind: "home", spaceId: space().id }) },
                 ],
               }}
             />
@@ -199,8 +203,15 @@ function SpacesSection() {
               <If when={space().id === activeSpaceId()}><RoomTree /></If>
               <NavGroup>
                 <NavItem testID={`space-pages:${space().id}`} label="Pages" icon="file" depth={1}
-                  selected={mainPlace() === "pages" && pagesRoute().spaceId === space().id}
+                  selected={mainPlace() === "pages" && pagesRoute().kind === "home" && pagesRoute().spaceId === space().id}
                   onPress={() => goPages({ kind: "home", spaceId: space().id })} />
+                <If when={mainPlace() === "pages" && pagesRoute().spaceId === space().id}>
+                  <Each of={pages().filter(page => page.space_id === space().id)} key={page => page.id}>
+                    {page => <NavItem testID={`space-page:${page().id}`} label={[page().icon, page().title].filter(Boolean).join(" ")}
+                      icon="file" depth={2} selected={selectedPage(page().id)}
+                      onPress={() => goPages({ kind: "page", id: page().id, spaceId: space().id })} />}
+                  </Each>
+                </If>
               </NavGroup>
             </If>
           </Column>
@@ -217,11 +228,12 @@ function SpacesSection() {
   );
 }
 
+function selectedPage(id: string) {
+  const route = pagesRoute();
+  return mainPlace() === "pages" && route.kind === "page" && route.id === id;
+}
+
 function PinnedPages() {
-  const selected = (id: string) => {
-    const route = pagesRoute();
-    return mainPlace() === "pages" && route.kind === "page" && route.id === id;
-  };
   const pinned = () => {
     const names = new Map(spaces().map(s => [s.id, s.name]));
     return pages().filter(p => p.pinned).sort((a, b) =>
@@ -234,7 +246,7 @@ function PinnedPages() {
     <NavGroup testID="pinned-pages">
       <Each of={pinned()} key={p => p.id}>{p =>
         <NavItem depth={1} icon="file" label={[p().icon, p().title].filter(Boolean).join(" ")}
-          testID={`pinned-page:${p().id}`} selected={selected(p().id)}
+          testID={`pinned-page:${p().id}`} selected={selectedPage(p().id)}
           onPress={() => goPages({ kind: "page", id: p().id, spaceId: p().space_id ?? undefined })} />
       }</Each>
     </NavGroup>

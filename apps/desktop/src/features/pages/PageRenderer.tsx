@@ -1,5 +1,5 @@
 import { computed, signal } from "nsh";
-import type { ActionKind, PageData, PageSpec } from "../../api/pages";
+import type { ActionKind, PageValues, PageSpec } from "../../api/pages";
 import { Action, Badge, Column, Disclosure, Divider, Label, Row, Surface } from "../../ui";
 import type { Tone } from "../../ui";
 import { PageBlockFrame, PageChart, PageGrid, PageGridCell, PageMarkdown, PageProgress, PageTable } from "../../ui/pageBlocks";
@@ -7,7 +7,7 @@ import { capabilityOf, cell, number, own, planPage, str } from "./renderPlan";
 import type { PlanBlock } from "./renderPlan";
 
 type Interactions = {
-  data: PageData | null;
+  data: PageValues | null;
   readOnly?: boolean;
   busy?: boolean;
   changed?: ReadonlySet<string>;
@@ -54,7 +54,6 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
   const children = () => <Each of={n().children} key={b => b.instance}>
     {child => <Block node={child()} interactions={props.interactions} />}
   </Each>;
-  const markdown = (text: string) => <PageMarkdown text={text} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />;
   switch (n().type) {
     case "Section": return <Section node={props.node}>{children()}</Section>;
     case "Row": return <Row wrap gap={3} align="start">{children()}</Row>;
@@ -101,7 +100,9 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
             <Badge tone={status().tone ?? "agent"} label={status().label} />
             <Label variant="meta">{[str(own(answer(), "agent")), str(own(answer(), "room")), cell(own(answer(), "at"), "relative").label].filter(x => x && x !== "—").join(" · ")}</Label>
           </Row>
-          <If when={str(own(answer(), "text"))}>{t => markdown(t())}</If>
+          <If when={str(own(answer(), "text"))}>
+            {text => <PageMarkdown text={text()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />}
+          </If>
           <If when={str(own(answer(), "error"))}>{t => <Label color="warning">{t()}</Label>}</If>
         </If>
         <If when={!props.interactions.readOnly && props.interactions.onSchedule && n().key && props.interactions.canSchedule?.(n().key!) ? n().key : undefined}>

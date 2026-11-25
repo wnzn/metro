@@ -1,4 +1,4 @@
-import type { ActionKind, Capability, PageData, SourceResult } from "../../api/pages";
+import type { ActionKind, Capability, PageValues, SourceResult } from "../../api/pages";
 
 // Match pages/spec.rs and pages/tsx.rs, even for a malformed response.
 export const MAX_RENDERED = 5_000;
@@ -94,7 +94,7 @@ export function cell(value: unknown, format?: string): Cell {
   return { label: raw };
 }
 
-export function capabilityOf(data: PageData | null, key: string): Capability | undefined {
+export function capabilityOf(data: PageValues | null, key: string): Capability | undefined {
   const c = own(data?.actions, key);
   return typeof own(c, "enabled") === "boolean" ? c as Capability : undefined;
 }
@@ -107,7 +107,7 @@ export type PlanBlock = {
 const PROPS = ["title", "collapsed", "columns", "level", "tone", "muted", "label", "value", "format", "hint", "rows",
   "empty", "items", "as", "when", "max", "kind", "data", "x", "y", "from"];
 
-export function planPage(spec: unknown, data: PageData | null, pending: boolean, limit = MAX_RENDERED) {
+export function planPage(spec: unknown, data: PageValues | null, pending: boolean, limit = MAX_RENDERED) {
   const supported = own(spec, "format") === 1;
   let left = Math.min(MAX_RENDERED, Math.max(0, limit)), truncated = false;
   const initial = left;
