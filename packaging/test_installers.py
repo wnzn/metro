@@ -383,6 +383,16 @@ class DesktopInstallerTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertTrue((self.app_root / "someone-elses-file").exists())
 
+    def test_refuses_foreign_install_directory_with_newline_entry(self):
+        self.app_root.mkdir(mode=0o700, parents=True)
+        foreign = self.app_root / "\n"
+        foreign.write_text("keep")
+        result = self.box.run(DESKTOP, "install", "--archive", self.archive())
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not created by this installer", result.stderr)
+        self.assertEqual(list(self.app_root.iterdir()), [foreign])
+        self.assertEqual(foreign.read_text(), "keep")
+
     def test_missing_runtime_explains_then_install_deps_runs_fixed_list(self):
         a = self.archive()
         self.box.missing.write_text("libwebkitgtk-6.0.so.4\nlibgtk-4.so.1\n")
@@ -468,6 +478,16 @@ class RunnerInstallerTests(unittest.TestCase):
 
     def test_published_runner_installer_and_the_current_installer_exclude_each_other(self):
         self.box.reciprocal_published_lock(RUNNER, self.archive, self.install_root / ".metro-runner-install")
+
+    def test_refuses_foreign_install_directory_with_newline_entry(self):
+        self.install_root.mkdir(mode=0o700, parents=True)
+        foreign = self.install_root / ".lock\n.lock"
+        foreign.write_text("keep")
+        result = self.box.run(RUNNER, "install", "--archive", self.archive)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not created by this installer", result.stderr)
+        self.assertEqual(list(self.install_root.iterdir()), [foreign])
+        self.assertEqual(foreign.read_text(), "keep")
 
     def test_full_lifecycle_never_exposes_the_token(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)

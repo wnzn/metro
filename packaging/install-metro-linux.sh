@@ -321,9 +321,19 @@ lock_busy() { # why $root/.lock exists
     die "another install is running (or a previous one crashed: remove $root/.lock and retry)"
 }
 
+install_root_has_entries() { # optionally skip the lock we just took
+    for root_entry in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+        [ "$root_entry" != "${1:-}" ] || continue
+        if [ -e "$root_entry" ] || [ -L "$root_entry" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 lock_install_root() {
     [ -d "$root" ] && [ ! -L "$root" ] || die "install directory is not a plain directory"
-    if [ -n "$(ls -A -- "$root" 2>/dev/null)" ] && { [ ! -f "$root/$MARK" ] || [ -L "$root/$MARK" ]; }; then
+    if install_root_has_entries && { [ ! -f "$root/$MARK" ] || [ -L "$root/$MARK" ]; }; then
         die "$root was not created by this installer; refusing to change it"
     fi
     [ "$(stat -c '%u' -- "$root")" = "$(id -u)" ] || die "install directory is not owned by you"
@@ -347,14 +357,15 @@ compat_retire() {
 
 compat_take() {
     compat_owner=$root/.lock/owner.metro-lock-v2
-    if [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; then
-        [ ! -L "$root/.lock" ] && [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
+    if { [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; } &&
+        ! { [ ! -L "$root/.lock" ] && [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
             [ "$(ls -A -- "$root/.lock")" = owner.metro-lock-v2 ] &&
             [ "$(stat -c '%s' -- "$compat_owner")" -le 128 ] &&
             [ "$(wc -l <"$compat_owner")" -eq 1 ] &&
             [ "$(LC_ALL=C grep -ac '^' "$compat_owner")" -eq 1 ] &&
             LC_ALL=C grep -aExq 'metro-lock-v2:[A-Za-z0-9._-]+' "$compat_owner" &&
-            compat_retire || lock_busy
+            compat_retire; }; then
+        lock_busy
     fi
     compat_new=$(mktemp -d -- "$root/.lock-new.XXXXXX")
     compat_token=metro-lock-v2:${compat_new##*/}
@@ -378,9 +389,11 @@ compat_release() {
 
 # ---------------------------------------------------------------- install
 lock() {
+    # Only the new install root is private; parent directories use the umask.
+    # shellcheck disable=SC2174
     mkdir -p -m 700 -- "$root"
     lock_install_root
-    if [ -e "$root/current" ] || [ -n "$(ls -A -- "$root" | grep -vxF .lock || :)" ]; then
+    if [ -e "$root/current" ] || install_root_has_entries "$root/.lock"; then
         [ -f "$root/$MARK" ] && [ ! -L "$root/$MARK" ] ||
             die "$root exists but was not created by this installer; refusing to change it"
     fi
