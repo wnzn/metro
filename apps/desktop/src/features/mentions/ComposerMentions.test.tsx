@@ -334,6 +334,112 @@ test("post-upload preflight detects a moved same-visit alias and keeps the draft
   });
 });
 
+test("same-visit name moves use fresh labels for confirmation rows and insertion, and expire on roster change", async () => {
+  for (const expire of [false, true]) {
+    const f = world();
+    const members = f.state.spaces.get("acme")!.members;
+    members.add("carol");
+    const base = f.network[get]!;
+    let moved = false;
+    f.network[get] = req => {
+      const id = new URL(req.url).pathname.match(/^\/v1\/profiles\/(bob|carol)$/)?.[1];
+      if (!id) return base(req);
+      const display_name = id === "bob" ? moved ? "Robert Tan" : "River Tan" : moved ? "River Tan" : "Carol Tan";
+      return { status: 200, body: { id, display_name } };
+    };
+    const app = await inAcme(f.network, 720, true);
+    await waitDirectory(app);
+    const text = "🌿 @River Tan please check";
+    await app.type("id:composer", text);
+    await app.waitFor("id:mention-chip:bob");
+    moved = true;
+    await app.press("id:send");
+    await app.waitFor("text:/Pick who you mean\\. Nothing was sent/");
+    expect(app.value("id:composer")).toBe(text);
+    expect(requests(app)).toHaveLength(0);
+    if (!app.shows("id:mention-picker")) await app.press("id:mention");
+    await app.waitFor("label:Mention Robert Tan (@bob): notifies them only");
+    await app.waitFor("label:Mention River Tan (@carol): notifies them only");
+    expect(app.shows("label:Mention Carol Tan (@carol): notifies them only")).toBe(false);
+    if (expire) {
+      await app.keyboard.press("down");
+      members.delete("carol");
+      await app.clock!.runFor(10_100);
+      await app.waitFor("id:mention-none");
+      expect(app.shows("id:pick:bob")).toBe(false);
+      expect(app.shows("id:pick:carol")).toBe(false);
+      await app.keyboard.press("return");
+      expect(app.value("id:composer")).toBe(text);
+      expect(requests(app)).toHaveLength(0);
+    } else {
+      await app.press("id:pick:carol");
+      await app.waitFor("id:mention-chip:carol");
+      expect(app.value("id:composer")).toBe(text);
+      await app.press("id:send");
+      await app.waitUntil(() => requests(app).length === 1);
+      expect(JSON.parse(requests(app)[0].body!)).toMatchObject({
+        text, mentions: [{ kind: "user", id: "carol" }], spans: [span(text, "@River Tan", 0)],
+      });
+    }
+  }
+});
+
+for (const change of ["pending", "identical", "revoked", "agent-alias"] as const) {
+  test(`roster poll overlapping held send profiles: ${change}`, async () => {
+    const w = spaceWorld();
+    const f = w.f;
+    const base = w.network[get]!;
+    const agentsPath = "/v1/spaces/acme/agents";
+    let preflighting = false, held = false, membersRead = 0, agentsRead = 0;
+    w.network[get] = req => {
+      const path = new URL(req.url).pathname;
+      if (preflighting && path === "/v1/profiles/bob" && !held) {
+        held = true;
+        return { status: 200, delay: 4_000, body: { id: "bob", display_name: "River Tan" } };
+      }
+      if (path === "/v1/profiles/bob") return { status: 200, body: { id: "bob", display_name: "River Tan" } };
+      const response = base(req);
+      if (preflighting && path === membersPath) {
+        membersRead++;
+        if (membersRead === 2 && change === "pending") return { ...response as object, delay: 5_000 };
+      }
+      if (preflighting && path === agentsPath) {
+        agentsRead++;
+        if (agentsRead === 1 && change === "pending") return { ...response as object, delay: 5_000 };
+      }
+      return response;
+    };
+    const app = await inAcme(w.network, 720, true);
+    await waitDirectory(app);
+    const text = "🌿 @River Tan please check";
+    await app.type("id:composer", text);
+    await app.waitFor("id:mention-chip:bob");
+    await app.clock!.runFor(8_000);
+    preflighting = true;
+    await app.press("id:send");
+    await app.waitUntil(() => held, { timeout: 1_000 });
+    expect(membersRead).toBe(1);
+    if (change === "revoked") f.state.spaces.get("acme")!.members.delete("bob");
+    if (change === "agent-alias") w.agent("acme", { name: "River Tan", handle: "river" });
+    await app.clock!.runFor(2_200);
+    expect(membersRead).toBe(2);
+    expect(agentsRead).toBe(1);
+    expect(requests(app)).toHaveLength(0);
+    await app.clock!.runFor(2_000);
+    if (change === "revoked" || change === "agent-alias") {
+      await app.waitFor(change === "revoked" ? "text:/Could not verify the current recipient list/"
+        : "text:/Pick who you mean\\. Nothing was sent/");
+      expect(app.value("id:composer")).toBe(text);
+      expect(requests(app)).toHaveLength(0);
+    } else {
+      await app.waitUntil(() => requests(app).length === 1, { timeout: 1_000 });
+      expect(JSON.parse(requests(app)[0].body!)).toMatchObject({
+        text, mentions: [{ kind: "user", id: "bob" }],
+      });
+    }
+  });
+}
+
 test("switching to a thread during an upload never posts the old room's draft into either place", async () => {
   const w = attachmentWorld();
   w.f.addRoom("acme", { id: "t1", name: "Follow-up", parent_room_id: "lobby" } as any);

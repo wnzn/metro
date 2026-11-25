@@ -73,4 +73,4 @@ export function refreshMentionAgents(sid: string) {
 registerMentionDirectory(spaceMentionDirectory, (sid, live) => {
   const visit = agentVisit();
   return visit?.sid === sid ? visit.forSend(live) : Promise.resolve(null);
-});
+}, verifiedAgents);

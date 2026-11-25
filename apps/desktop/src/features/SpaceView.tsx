@@ -33,6 +33,7 @@ import {
   members,
   membersError,
   mentionDraft,
+  mentionVisitKey,
   mentions,
   openManage,
   removeMention,
@@ -42,6 +43,7 @@ import {
   selectRoom,
   setDraft,
   status,
+  verifiedConfirmationDirectory,
 } from "../store";
 import {
   Action,
@@ -73,7 +75,7 @@ import { askAgentId, askChoice, chooseAskAgent, classifierOffered, CLASSIFIER_CH
 import { SpaceAgentAvatar } from "./space/SpaceAgentAvatar";
 import { openSpaceSettings, spaceSettingsFor } from "./space/spaceSettingsState";
 import { mentionIdentityKey, scanMentionDraft } from "./mentions/draft";
-import type { MentionRecipient } from "./mentions/draft";
+import type { MentionDirectory, MentionRecipient } from "./mentions/draft";
 import { beginMentionAgentVisit, refreshMentionAgents, spaceMentionDirectory, verifiedMembers } from "./mentions/roster";
 import { mentionSuggestion } from "./mentions/suggestions";
 
@@ -176,10 +178,12 @@ export function mentionOptions(
   myId: string | null,
   spaceId?: string | null,
   choices?: readonly MentionRecipient[],
+  verifiedPeople?: MentionDirectory["members"],
 ): MentionOption[] {
   const q = query.toLowerCase();
   const out: MentionOption[] = [];
   const keys = choices && new Set(choices.map(mentionIdentityKey));
+  const names = verifiedPeople && new Map(verifiedPeople.map(m => [m.id, m.displayName]));
   const def = defaultAgent(spaceId);
   const several = spaceAgents(spaceId).length > 1;
   if (keys ? keys.has("generic") : "agent".startsWith(q)) {
@@ -206,7 +210,8 @@ export function mentionOptions(
       label: `Mention ${a.name} (${detail}): ${a.description}`, agent: a });
   }
   for (const m of list ?? []) {
-    const name = profileName(m.userId);
+    if (names && !names.has(m.userId)) continue;
+    const name = names ? names.get(m.userId) : profileName(m.userId);
     if (keys ? !keys.has(`user:${m.userId}`)
       : m.userId === myId || (!m.userId.toLowerCase().includes(q) && !(name ?? "").toLowerCase().includes(q))) continue;
     const owner = m.role === "owner";
@@ -236,10 +241,11 @@ function RoomComposer() {
   /** The composer's field has the keyboard focus. */
   const fieldFocused = signal(false);
   let atButton: ViewRef | null = null;
-  const currentDirectory = () => activeSpaceId() ? spaceMentionDirectory(activeSpaceId()!) : null;
   const preview = computed(previewMentionDraft);
   const matches = computed(() => previewMentionMatches(preview()));
   const ambiguous = () => matches().find(d => d.kind === "ambiguous");
+  const currentDirectory = () => ambiguous()?.preflight ? verifiedConfirmationDirectory()
+    : activeSpaceId() ? spaceMentionDirectory(activeSpaceId()!) : null;
   const unresolved = () => matches().find(d => d.kind === "unresolved");
   const chips = computed(() => mentions().filter(a => !matches().some(m => m.kind === "ambiguous" && m.start === a.start)));
   const unresolvedHint = () => {
@@ -261,8 +267,11 @@ function RoomComposer() {
   });
   const query = () => partial()?.query ?? "";
   const options = computed(() => {
-    if (!currentDirectory()) return [];
-    return mentionOptions(query(), members(), me(), activeSpaceId(), ambiguous()?.choices);
+    const directory = currentDirectory();
+    if (!directory) return [];
+    const decision = ambiguous();
+    return mentionOptions(query(), members(), me(), activeSpaceId(), decision?.choices,
+      decision?.preflight ? directory.members : undefined);
   });
   const deliberate = () => options().findIndex(o => o.key === highlighted());
   const active = () => {
@@ -273,10 +282,12 @@ function RoomComposer() {
   const open = () => inSpaceComposer() && (explicit() || dismissedAt() !== draft() && (typing() || !!ambiguous() && fieldFocused()));
 
   // The same roster feeds sent chips even if the picker was never opened.
+  const visitKey = computed(() => spaceSettingsFor() ? null : mentionVisitKey());
   effect(() => {
-    const sid = activeSpaceId();
-    const scope = composerScope();
-    if (!sid || !inSpaceComposer() || spaceSettingsFor() || !scope) return;
+    if (!visitKey()) return;
+    const sid = untracked(activeSpaceId);
+    if (!sid) return;
+    const scope = untracked(composerScope);
     const endVisit = untracked(() => beginMentionVisit(sid, scope));
     const endAgentVisit = untracked(() => beginMentionAgentVisit(sid));
     const refresh = () => {
@@ -485,7 +496,7 @@ function RoomComposer() {
                               {(a) => <SpaceAgentAvatar spaceId={activeSpaceId()!} agent={a()} size="sm" />}
                             </If>
                           ) : (
-                            <PersonAvatar userId={(o().mention as { id: string }).id} name={o().title} size="sm" />
+                            <PersonAvatar userId={(o().mention as { id: string }).id} name={o().title} verifiedName={ambiguous()?.preflight} size="sm" />
                           )
                         }
                         ref={(node) => {
@@ -503,7 +514,9 @@ function RoomComposer() {
               </SuggestionList>
               <If when={membersError()}>{(message) => <PopoverNote lines={2} tone="danger" text={message()} />}</If>
               <If when={options().length === 0}>
-                <PopoverNote lines={2} testID="mention-none" text={!currentDirectory() ? "The recipient list isn't ready. Check your connection."
+                <PopoverNote lines={2} testID="mention-none" text={!currentDirectory() ? ambiguous()?.preflight
+                  ? "The recipient list changed. Edit or remove this mention before sending."
+                  : "The recipient list isn't ready. Check your connection."
                   : ambiguous() ? "Those recipients aren't available. Edit or remove the mention." : `No recipient matches “${query()}”.`} />
               </If>
             </AnchoredPopover>

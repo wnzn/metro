@@ -21,7 +21,7 @@ export function confirmChangedAutomaticMentions(draft: MentionDraft, directory: 
     const choices = [...new Set([...matches.map(mentionIdentityKey), pinned])]
       .flatMap(key => live.has(key) ? [live.get(key)!] : []);
     decisions.push({
-      kind: "ambiguous", start: a.start, end: a.end, literal: a.literal,
+      kind: "ambiguous", preflight: true, start: a.start, end: a.end, literal: a.literal,
       choices: choices.length ? choices : a.mention.kind === "user" ? people : agents,
     });
     changed.add(a.start);
