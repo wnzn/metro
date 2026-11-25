@@ -2036,6 +2036,83 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
 }
 
 #[tokio::test]
+async fn mention_spans_keep_generic_and_named_recipients_distinct_from_run_targets() {
+    let h = H::start().await;
+    let sid = h.space("span routing").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let (s, v) = h.put_routing("alice", routing_on(false, false)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = h
+        .put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let user = json!({"kind": "user", "id": "bob"});
+    let generic = json!({"kind": "agent"});
+    let named = json!({"kind": "agent", "agent_id": coder});
+    let before = h.fake.calls();
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({
+                "text": "@Bob @agent [pick2] go",
+                "mentions": [user, user, generic],
+                "spans": [{"start": 0, "end": 4, "index": 1}, {"start": 5, "end": 11, "index": 2}]
+            }),
+        )
+        .await;
+    let generic_id = e["id"].as_i64().unwrap();
+    let started = h.started_after("alice", &sid, generic_id).await;
+    assert_eq!(started["agent"]["id"], coder.as_str());
+    assert_eq!(started["pick"], "Picked by classifier: Coder");
+    assert_eq!(h.fake.calls(), before + 1);
+    assert_eq!(e["mentions"], json!([user, generic]));
+    assert_eq!(
+        e["spans"],
+        json!([{"start": 0, "end": 4, "index": 0}, {"start": 5, "end": 11, "index": 1}])
+    );
+    let polled = h
+        .events("bob", Some(&sid))
+        .await
+        .into_iter()
+        .find(|m| m["id"] == generic_id)
+        .unwrap();
+    assert_eq!(polled["mentions"], e["mentions"]);
+    assert_eq!(polled["spans"], e["spans"]);
+    h.answer_after("alice", Some(&sid), generic_id).await;
+
+    // A colliding token in a span refers to the selected named agent,
+    // never the user with that id; an unspanned @bob still adds the user.
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({
+                "text": "@bob [pick2] go, cc @bob",
+                "mentions": [named],
+                "spans": [{"start": 0, "end": 4, "index": 0}]
+            }),
+        )
+        .await;
+    let message = e["id"].as_i64().unwrap();
+    let started = h.started_after("alice", &sid, message).await;
+    assert_eq!(started["agent"]["id"], coder.as_str());
+    assert_eq!(e["mentions"], json!([named, user]));
+    h.answer_after("alice", Some(&sid), message).await;
+    assert_eq!(h.fake.calls(), before + 1);
+
+    let legacy = h.say("bob", Some(&sid), json!({"text": "cc @alice"})).await;
+    assert_eq!(legacy["mentions"], json!([{"kind": "user", "id": "alice"}]));
+    assert!(legacy.get("spans").is_none());
+}
+
+#[tokio::test]
 async fn per_space_and_per_agent_models_come_before_the_personal_default() {
     let h = H::start().await;
     let sid = h.space("models").await;

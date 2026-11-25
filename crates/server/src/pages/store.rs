@@ -1407,6 +1407,7 @@ pub fn claim_action(
                 let addressed = crate::db::Addressed {
                     mentions: serde_json::json!([{"kind": "agent", "agent_id": agent.id}]),
                     audience: "agent".to_owned(),
+                    spans: Vec::new(),
                 };
                 tx.execute(
                     "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, \
@@ -1611,6 +1612,7 @@ fn row_page_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         actor_id: r.get(3)?,
         text: r.get(4)?,
         mentions: serde_json::Value::Array(Vec::new()),
+        spans: Vec::new(),
         audience: "agent".to_owned(),
         activity: r
             .get::<_, Option<String>>(5)?

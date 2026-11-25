@@ -10,6 +10,7 @@
 //! 2. The `invoke_agent` flag, which adds [`Mention::Agent`].
 //! 3. `@agent` / `@<member-id>` written in the text, recognised only for
 //!    *current members* and only as standalone handles (see [`resolve`]).
+//!    Text in a validated explicit mention span is not scanned.
 //!
 //! This module never reads membership itself: the caller passes the member
 //! ids of the room's Space it has already authorised for this sender.
@@ -18,10 +19,108 @@ use serde::{Deserialize, Serialize};
 
 /// Most distinct recipients one message may address.
 pub const MAX_RECIPIENTS: usize = 32;
+/// Repeated references to one recipient each take a span.
+pub const MAX_SPANS: usize = 64;
 /// Longest member id the text parser will match as an `@handle`.
 const MAX_HANDLE_LEN: usize = 64;
 /// Reserved text handle for the room agent (matched case-insensitively).
 const AGENT_HANDLE: &str = "agent";
+
+/// A half-open UTF-8 byte range over message text (not JSON or UTF-16).
+/// In a POST, `index` addresses the submitted `mentions` array and the range
+/// addresses the decoded `text` before trimming. In an event, both address
+/// the corresponding returned fields: deduplicated `mentions` and trimmed
+/// `text`. Events list spans in text order. A label is not an identity.
+///
+/// A span starts at a standalone `@` and ends at a token boundary (as for
+/// legacy handles). The nonempty label may contain spaces between words,
+/// but no extra `@`, control characters, line breaks or edge whitespace.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub struct MentionSpan {
+    pub start: usize,
+    pub end: usize,
+    pub index: usize,
+}
+
+impl<'de> Deserialize<'de> for MentionSpan {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, Visitor, value::MapAccessDeserializer};
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Fields {
+            start: usize,
+            end: usize,
+            index: usize,
+        }
+
+        struct SpanVisitor;
+        impl<'de> Visitor<'de> for SpanVisitor {
+            type Value = MentionSpan;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a mention span object with start, end and index")
+            }
+
+            fn visit_map<M: MapAccess<'de>>(self, map: M) -> Result<MentionSpan, M::Error> {
+                let Fields { start, end, index } =
+                    Fields::deserialize(MapAccessDeserializer::new(map))?;
+                Ok(MentionSpan { start, end, index })
+            }
+        }
+
+        d.deserialize_map(SpanVisitor)
+    }
+}
+
+/// Sorted, non-overlapping ranges normalized to the stored (`trim()`ed)
+/// text. Until resolution, indices still refer to the submitted list.
+#[derive(Default)]
+pub(crate) struct ValidatedSpans(Vec<MentionSpan>);
+
+impl ValidatedSpans {
+    pub(crate) fn new(
+        raw_text: &str,
+        explicit_count: usize,
+        mut spans: Vec<MentionSpan>,
+    ) -> Result<Self, &'static str> {
+        const INVALID: &str = "invalid mention span";
+        if spans.len() > MAX_SPANS {
+            return Err("too many mention spans");
+        }
+        if spans.is_empty() {
+            return Ok(Self(spans));
+        }
+        let trimmed = raw_text.trim();
+        let offset = raw_text.len() - raw_text.trim_start().len();
+        let trimmed_end = offset + trimmed.len();
+        spans.sort_unstable_by_key(|s| s.start);
+        let mut previous_end = offset;
+        for span in &mut spans {
+            if span.start < previous_end || span.end > trimmed_end || span.index >= explicit_count {
+                return Err(INVALID);
+            }
+            let label = raw_text
+                .get(span.start..span.end)
+                .and_then(|s| s.strip_prefix('@'))
+                .ok_or(INVALID)?;
+            if label.is_empty()
+                || label.trim() != label
+                || label
+                    .chars()
+                    .any(|c| matches!(c, '@' | '\u{2028}' | '\u{2029}') || c.is_control())
+                || !opens_token(raw_text[..span.start].chars().next_back())
+                || !closes_token(&raw_text[span.end..])
+            {
+                return Err(INVALID);
+            }
+            previous_end = span.end;
+            span.start -= offset;
+            span.end -= offset;
+        }
+        Ok(Self(spans))
+    }
+}
 
 /// One addressed recipient.
 ///
@@ -136,12 +235,7 @@ pub fn resolve(
     resolve_with_agents(text, explicit, invoke_agent, None, member_ids, &[])
 }
 
-/// [`resolve`] in a Space with agents: `agents` are `(id, handle)` of the
-/// Space's agents. An explicit [`Mention::AgentId`] must name one of them;
-/// `invoke_agent` with `invoke_agent_id` adds that agent instead of the
-/// generic one. In text, `@handle` of an agent (any ASCII case) wins over a
-/// member id of the same length; the handle `agent` always stays the
-/// generic `@agent`.
+/// [`resolve`] in a Space with agents but without typed spans.
 pub fn resolve_with_agents(
     text: &str,
     explicit: &[Mention],
@@ -150,6 +244,35 @@ pub fn resolve_with_agents(
     member_ids: &[String],
     agents: &[(String, String)],
 ) -> Result<Vec<Mention>, String> {
+    let (resolved, _) = resolve_with_spans(
+        text,
+        explicit,
+        invoke_agent,
+        invoke_agent_id,
+        member_ids,
+        agents,
+        ValidatedSpans::default(),
+    )?;
+    Ok(resolved)
+}
+
+/// [`resolve`] in a Space with agents: `agents` are `(id, handle)` of the
+/// Space's agents. An explicit [`Mention::AgentId`] must name one of them;
+/// `invoke_agent` with `invoke_agent_id` adds that agent instead of the
+/// generic one. In text, `@handle` of an agent (any ASCII case) wins over a
+/// member id of the same length; the handle `agent` always stays the
+/// generic `@agent` outside explicit spans. `text` is the trimmed text
+/// against which the `spans` were validated. Returned spans refer to the
+/// canonical (deduplicated) list.
+pub(crate) fn resolve_with_spans(
+    text: &str,
+    explicit: &[Mention],
+    invoke_agent: bool,
+    invoke_agent_id: Option<&str>,
+    member_ids: &[String],
+    agents: &[(String, String)],
+    ValidatedSpans(mut spans): ValidatedSpans,
+) -> Result<(Vec<Mention>, Vec<MentionSpan>), String> {
     if explicit.len() > MAX_RECIPIENTS {
         return Err(ERR_TOO_MANY.to_owned());
     }
@@ -204,10 +327,18 @@ pub fn resolve_with_agents(
         .filter(|(_, h)| is_handle(h) && !h.eq_ignore_ascii_case(AGENT_HANDLE))
         .map(|(id, h)| (id.as_str(), h.as_str()))
         .collect();
-    for m in scan_text(text, &handles, &agent_handles) {
+    for m in scan_text(text, &handles, &agent_handles, &spans) {
         push(m, &mut out)?;
     }
-    Ok(out)
+    for span in &mut spans {
+        // Explicit recipients are validated and inserted first; the
+        // invoke flag and text only append, never replace them.
+        span.index = out
+            .iter()
+            .position(|m| m == &explicit[span.index])
+            .expect("an explicit recipient stays in the canonical list");
+    }
+    Ok((out, spans))
 }
 
 /// `"room"` (no recipients), `"agent"`, `"users"` or `"mixed"`.
@@ -338,15 +469,27 @@ fn code_ranges(text: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn scan_text(text: &str, handles: &[&str], agents: &[(&str, &str)]) -> Vec<Mention> {
+fn scan_text(
+    text: &str,
+    handles: &[&str],
+    agents: &[(&str, &str)],
+    spans: &[MentionSpan],
+) -> Vec<Mention> {
     let code = code_ranges(text);
     let in_code = |i: usize| code.iter().any(|&(s, e)| i >= s && i < e);
+    let mut spans = spans.iter().peekable();
     let mut found = Vec::new();
     let mut prev: Option<char> = None;
     for (i, c) in text.char_indices() {
         let p = prev;
         prev = Some(c);
-        if c != '@' || in_code(i) || !opens_token(p) {
+        if c != '@' {
+            continue;
+        }
+        while spans.peek().is_some_and(|s| s.end <= i) {
+            spans.next();
+        }
+        if spans.peek().is_some_and(|s| s.start <= i) || in_code(i) || !opens_token(p) {
             continue;
         }
         let rest = &text[i + 1..];
@@ -435,6 +578,62 @@ mod tests {
         ] {
             assert!(serde_json::from_str::<Mention>(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn span_wire_accepts_only_the_required_unsigned_object_fields() {
+        let valid = r#"{"start":0,"end":9,"index":1}"#;
+        let span = serde_json::from_str::<MentionSpan>(valid).unwrap();
+        assert_eq!(serde_json::to_string(&span).unwrap(), valid);
+        for bad in [
+            r#"[0,9,1]"#,
+            r#"{"start":0,"end":9}"#,
+            r#"{"start":0,"end":9,"index":null}"#,
+            r#"{"start":0,"end":"9","index":1}"#,
+            r#"{"start":0,"end":9.0,"index":1}"#,
+            r#"{"start":-1,"end":9,"index":1}"#,
+            r#"{"start":0,"end":9,"index":1,"kind":"user"}"#,
+            r#"{"start":0,"end":9,"index":1,"index":2}"#,
+        ] {
+            assert!(serde_json::from_str::<MentionSpan>(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn spans_reject_invalid_ranges_and_non_tokens() {
+        let span = |start, end| MentionSpan {
+            start,
+            end,
+            index: 0,
+        };
+        for (text, spans) in [
+            ("é @名", vec![span(1, 4)]), // UTF-8 start
+            ("é @名", vec![span(3, 5)]), // UTF-8 end
+            ("@x", vec![span(0, 0)]),    // empty
+            ("@x", vec![span(2, 1)]),    // reversed
+            ("@x", vec![span(0, 3)]),    // out of bounds
+            (" @x", vec![span(0, 3)]),   // includes trimmed prefix
+            ("@x ", vec![span(0, 3)]),   // includes trimmed suffix
+            ("@x @y", vec![span(0, 4), span(3, 5)]),
+            ("@x", vec![span(0, 2), span(0, 2)]),
+            ("x @", vec![span(0, 1)]),    // no @ prefix
+            ("x @", vec![span(2, 3)]),    // bare @
+            ("@ x", vec![span(0, 3)]),    // space immediately after @
+            ("@x\nY", vec![span(0, 4)]),  // across lines
+            ("@x@y", vec![span(0, 4)]),   // embedded @
+            ("a@x", vec![span(1, 3)]),    // email-like
+            (r"\@x", vec![span(1, 3)]),   // escaped
+            ("@agent", vec![span(0, 3)]), // partial token
+        ] {
+            assert!(
+                ValidatedSpans::new(text, 1, spans.clone()).is_err(),
+                "{text:?}: {spans:?}"
+            );
+        }
+        assert!(ValidatedSpans::new("@x", 0, vec![span(0, 2)]).is_err());
+        let many = |n| (0..n).map(|i| span(i * 3, i * 3 + 2)).collect();
+        assert!(ValidatedSpans::new(&"@x ".repeat(MAX_SPANS), 1, many(MAX_SPANS)).is_ok());
+        assert!(ValidatedSpans::new(&"@x ".repeat(MAX_SPANS + 1), 1, many(MAX_SPANS + 1)).is_err());
     }
 
     #[test]

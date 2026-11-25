@@ -592,6 +592,7 @@ mod tests {
         Addressed {
             mentions: json!([{"kind": "agent"}]),
             audience: "agent".into(),
+            spans: Vec::new(),
         }
     }
 
@@ -839,6 +840,7 @@ mod tests {
             &Addressed {
                 mentions: json!([{"kind":"agent"},{"kind":"user","id":"alice"}]),
                 audience: "mixed".into(),
+                spans: Vec::new(),
             },
         );
         let to_room = post(&db, &sid, kind::MESSAGE, &person("bob"), &Addressed::room());
@@ -850,6 +852,7 @@ mod tests {
             &Addressed {
                 mentions: json!([{"kind":"user","id":"alice"}]),
                 audience: "users".into(),
+                spans: Vec::new(),
             },
         );
         let reply = post(
