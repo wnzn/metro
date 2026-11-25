@@ -649,6 +649,46 @@ await test("Forget this choice withdraws the plain-HTTP choice; sign-out alone k
   await evaluate("localStorage.clear()");
 });
 
+await test("withdrawing the choice in another tab signs this one out; the stored choice is checked before every send", async () => {
+  const lan = `http://metro.lan:${port}`;
+  await goto(lan + "/admin");
+  await evaluate("localStorage.clear()");
+  await goto(lan + "/admin");
+  await click("#plain-http-accept");
+  await signIn(ADMIN);
+  await waitFor(vis("panel") + " && document.querySelectorAll('#users-body tr').length > 0");
+
+  // Same tab: the choice disappears from storage (no event here); the next
+  // send is refused before any request.
+  mock.log.length = 0;
+  await evaluate("localStorage.removeItem('metro.admin.plainHttpAccepted')");
+  await click("#refresh");
+  await sleep(300);
+  assert(apiCalls().length === 0, "a request went out without the stored choice");
+  await evaluate("localStorage.setItem('metro.admin.plainHttpAccepted', '1')");
+
+  // A second tab of the same server withdraws it.
+  const { targetId: other } = await cdp("Target.createTarget", { url: "about:blank" });
+  const { sessionId: otherSession } = await cdp("Target.attachToTarget", { targetId: other, flatten: true });
+  const tab2 = (m, p) => cdp(m, p, otherSession);
+  const eval2 = async (expr) => (await tab2("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true })).result.value;
+  await tab2("Runtime.enable");
+  await tab2("Page.navigate", { url: lan + "/admin" });
+  for (const end = Date.now() + 5000; Date.now() < end; await sleep(50)) {
+    if (await eval2("document.readyState === 'complete' && !!document.getElementById('plain-http-forget') && !document.getElementById('signin').hidden")) break;
+  }
+  assert(await eval2("!document.getElementById('signin').hidden && !document.getElementById('plain-http-note').hidden"), "second tab didn't share the choice");
+  mock.log.length = 0;
+  await eval2("document.getElementById('plain-http-forget').click()");
+  await waitFor(`document.getElementById('panel').hidden && ${vis("plain-http")} && document.getElementById('signin').hidden`);
+  assert((await text("plain-http-status")).includes("withdrawn in another tab"), "no explanation: " + (await text("plain-http-status")));
+  assert(await evaluate("document.querySelectorAll('#users-body tr').length") === 0, "data kept after sign-out");
+  await sleep(300);
+  assert(apiCalls().length === 0, "a request went out after the choice was withdrawn");
+  await cdp("Target.closeTarget", { targetId: other });
+  await evaluate("localStorage.clear()");
+});
+
 await test("hostClass matches the shared host vectors (crates/url-policy/testdata/host_vectors.json)", async () => {
   const src = readFileSync(join(here, "admin.js"), "utf8");
   const begin = src.indexOf("// host-class:begin"), end = src.indexOf("// host-class:end");

@@ -55,6 +55,7 @@
   <!-- Plain HTTP to a host that is neither loopback nor Tailscale: asked once per server, before the token field appears. -->
   <section id="plain-http" class="card notice notice-warning" hidden aria-labelledby="plain-http-title">
     <h1 id="plain-http-title">This connection isn't encrypted</h1>
+    <div id="plain-http-status" class="alert alert-danger" role="alert" hidden></div>
     <p id="plain-http-reason"></p>
     <p>HTTPS or an SSH tunnel to the server keeps the token private on any network.</p>
     <button type="button" id="plain-http-accept" class="btn btn-primary">Sign in anyway</button>

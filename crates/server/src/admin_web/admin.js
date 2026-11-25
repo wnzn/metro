@@ -24,7 +24,7 @@
     unsafe: $("unsafe"), unsafeReason: $("unsafe-reason"), unsafeSsh: $("unsafe-ssh"),
     unsafeLocal: $("unsafe-local"), unsafeLoopback: $("unsafe-loopback"),
     plainHttp: $("plain-http"), plainHttpReason: $("plain-http-reason"), plainHttpAccept: $("plain-http-accept"),
-    plainHttpNote: $("plain-http-note"), plainHttpForget: $("plain-http-forget"),
+    plainHttpNote: $("plain-http-note"), plainHttpForget: $("plain-http-forget"), plainHttpStatus: $("plain-http-status"),
     signin: $("signin"), signinForm: $("signin-form"), signinError: $("signin-error"),
     token: $("token"), signinSubmit: $("signin-submit"),
     denied: $("denied"), deniedId: $("denied-id"), deniedBack: $("denied-back"),
@@ -61,7 +61,7 @@
       if (labels !== "" && labels.split(".").every((l) => /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(l))) return "tailscale";
     }
     const ipv4 = (text) => {
-      const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text);
+      const m = /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/.exec(text);
       if (!m) return null;
       const o = m.slice(1).map(Number);
       return o.every((n) => n <= 255) ? o : null;
@@ -124,15 +124,31 @@
     return location.protocol === "http:" && hostClass(location.hostname) === "other";
   }
 
+  // The choice lives in localStorage, shared by this server's tabs, and is
+  // read again before every token send. Only when storage can't be used at
+  // all is it kept in this page's memory instead.
   const PLAIN_HTTP_KEY = "metro.admin.plainHttpAccepted";
-  let plainHttpAcceptedHere = false; // when localStorage isn't available
+  let plainHttpAcceptedHere = false; // only when localStorage is unavailable
+  let storageWorks = null;
+  function storageAvailable() {
+    if (storageWorks !== null) return storageWorks;
+    try {
+      const probe = PLAIN_HTTP_KEY + ".probe";
+      localStorage.setItem(probe, "1");
+      localStorage.removeItem(probe);
+      storageWorks = true;
+    } catch {
+      storageWorks = false;
+    }
+    return storageWorks;
+  }
   function plainHttpAccepted() {
-    if (plainHttpAcceptedHere) return true;
+    if (!storageAvailable()) return plainHttpAcceptedHere;
     try { return localStorage.getItem(PLAIN_HTTP_KEY) === "1"; } catch { return false; }
   }
   function acceptPlainHttp() {
-    plainHttpAcceptedHere = true;
-    try { localStorage.setItem(PLAIN_HTTP_KEY, "1"); } catch { /* kept for this page only */ }
+    if (!storageAvailable()) { plainHttpAcceptedHere = true; return; }
+    try { localStorage.setItem(PLAIN_HTTP_KEY, "1"); } catch { plainHttpAcceptedHere = true; storageWorks = false; }
   }
   // Withdraws the choice: the warning shows again before the next sign-in.
   // Signing out keeps it; only this does.
@@ -365,7 +381,10 @@
     el.denied.hidden = true;
     const reason = unsafeReason();
     if (reason) { showUnsafe(reason); return; }
-    if (!showSignIn()) return;
+    if (!showSignIn()) {
+      if (message) showAlert(el.plainHttpStatus, message); else hideAlert(el.plainHttpStatus);
+      return;
+    }
     if (message) showAlert(el.signinError, message); else hideAlert(el.signinError);
     el.token.focus();
   }
@@ -679,8 +698,22 @@
     el.secretCopy.addEventListener("click", copySecret);
     el.secretDone.addEventListener("click", finishSecret);
     el.plainHttpAccept.addEventListener("click", () => {
+      hideAlert(el.plainHttpStatus);
       acceptPlainHttp();
       if (showSignIn()) el.token.focus();
+    });
+    // Another tab of this server withdrew the choice (or cleared storage):
+    // a session here may not send its token again; it ends, and the warning
+    // shows before the next sign-in.
+    window.addEventListener("storage", (e) => {
+      if (e.key !== null && e.key !== PLAIN_HTTP_KEY) return;
+      if (!plainHttpRisk() || plainHttpAccepted()) return;
+      if (session) {
+        endSession("The choice to sign in over this unencrypted connection was withdrawn in another tab. You've been signed out.");
+      } else if (!el.signin.hidden) {
+        el.token.value = "";
+        showSignIn();
+      }
     });
     el.plainHttpForget.addEventListener("click", () => {
       forgetPlainHttp();
