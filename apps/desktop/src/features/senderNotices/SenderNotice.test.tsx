@@ -453,6 +453,8 @@ test("a held dispatch denial rechecks only its source after navigation and inval
   await app.press("id:nav-chat");
   await dispatch(app, "held Side task");
   await app.waitUntil(() => w.denied.has("held Side task"));
+  // No newer successful read of this room before the original denial.
+  w.f.answerLate("/v1/spaces/side/rooms/lobby/events", TOKENS.alice!, 4_500);
   await space(app, "side");
   await send(app, "concurrent Side send");
   await app.waitUntil(() => w.sent.has("concurrent Side send"));
@@ -493,6 +495,7 @@ test("a held composer 404 is applied to its thread even when another room of the
   await app.waitUntil(() => w.sent.has("thread notice"));
   const thread = w.sent.get("thread notice")!.id;
   await app.waitFor(note(thread));
+  w.f.answerLate("/v1/spaces/acme/rooms/t1/events", TOKENS.alice!, 4_500);
   await send(app, "held thread send");
   await app.waitUntil(() => w.denied.has("held thread send"));
   await app.press("id:room:lobby");
@@ -561,6 +564,66 @@ test("a delayed composer denial for a former account cannot clear the replacemen
   expect(app.shows("id:action-error")).toBe(false);
 });
 
+test("a delayed original POST denial cannot invalidate a newer same-room receipt", async () => {
+  const w = fixture();
+  w.deny("old dispatch denial", 404, 5_000);
+  w.reply("new same-room receipt", { addressing_note: pickup });
+  const app = await launch(w);
+  await dispatch(app, "old dispatch denial");
+  await app.waitUntil(() => w.denied.has("old dispatch denial"));
+  await space(app, "side");
+  await send(app, "new same-room receipt");
+  await app.waitUntil(() => w.sent.has("new same-room receipt"));
+  const id = w.sent.get("new same-room receipt")!.id;
+  await app.waitFor(note(id));
+  const probes = () => w.f.state.log.filter(r => r.method === "GET" && r.path === "/v1/spaces/side/rooms").length;
+  const before = probes();
+  await app.clock!.runFor(5_200);
+  expect(app.shows(note(id))).toBe(true);
+  expect(app.shows("id:action-error")).toBe(false);
+  expect(probes()).toBe(before);
+});
+
+test("a real room loss between recheck legs outranks access verified before the room read", async () => {
+  const w = fixture();
+  w.f.addRoom("side", { id: "backup", name: "backup" });
+  w.reply("visible during Space probe", { addressing_note: pickup });
+  w.deny("start a recheck", 403, 300);
+  const base = w.network[get]!;
+  let firstLeg = false;
+  let roomLeg = false;
+  let revoked = false;
+  w.network[get] = req => {
+    const path = new URL(req.url).pathname;
+    if (!firstLeg && w.denied.has("start a recheck") && path === "/v1/spaces") {
+      firstLeg = true;
+      return { ...(base(req) as object), delay: 5_000 };
+    }
+    if (firstLeg && revoked && path === "/v1/spaces/side/rooms") roomLeg = true;
+    return base(req);
+  };
+  const app = await launch(w);
+  await dispatch(app, "start a recheck");
+  await app.waitUntil(() => firstLeg);
+  await space(app, "side");
+  await send(app, "visible during Space probe");
+  await app.waitUntil(() => w.sent.has("visible during Space probe"));
+  const id = w.sent.get("visible during Space probe")!.id;
+  await app.waitFor(note(id));
+  // Stop polling this room before removing it. The follow-up listRooms,
+  // not a subsequent events denial, has to apply the loss.
+  await app.press("id:nav-chat");
+  revoked = true;
+  w.f.state.rooms.set("side", w.f.state.rooms.get("side")!.filter(room => room.id !== "lobby"));
+  w.f.state.events.delete("side/lobby");
+  await app.waitUntil(() => roomLeg, { timeout: 6_000 });
+  await app.clock!.runFor(100);
+  await app.press("id:space:side");
+  await app.waitFor("id:room:backup");
+  expect(app.shows("id:room:lobby")).toBe(false);
+  expect(app.shows(note(id))).toBe(false);
+});
+
 for (const probe of ["post-room", "post-space", "poll-space"] as const) {
   test(`${probe}: a held negative recheck cannot purge newer verified access and its corroborated notice`, async () => {
     const w = fixture();
@@ -627,8 +690,11 @@ for (const edit of [false, true]) {
     w.deny("dispatch denial", 403, 2_000);
     w.reply("accepted with a file", { addressing_note: pickup }, 4_500);
     const app = await launch(w);
+    await space(app, "side");
+    await app.press("id:nav-chat");
     await dispatch(app, "dispatch denial");
     await app.waitUntil(() => w.denied.has("dispatch denial"));
+    w.f.answerLate("/v1/spaces/side/rooms/lobby/events", TOKENS.alice!, 3_000);
     await space(app, "side");
     app.onPick(() => [{ name: "posted.txt", type: "text/plain", data: new Uint8Array([65]) }]);
     await app.press("id:attach");
@@ -654,6 +720,66 @@ for (const edit of [false, true]) {
     expect(w.messages().map(p => p.body.asset_ids)).toEqual([["asset-posted.txt"]]);
   });
 }
+
+for (const save of [false, true]) {
+  test(`an accepted Chat ${save ? "Save note" : "Send"} cleans up without overriding a newer poll denial`, async () => {
+    const w = fixture();
+    const text = save ? "private note with a file" : "direct send with a file";
+    w.reply(text, { routing_note: routing }, 4_000);
+    const base = w.network[get]!;
+    let inaccessible = false;
+    let denies = 0;
+    w.network[get] = req => {
+      if (inaccessible && new URL(req.url).pathname === "/v1/chat/events") {
+        denies++;
+        return { status: 403, body: { error: "temporarily unavailable" } };
+      }
+      return base(req);
+    };
+    const app = await launch(w);
+    await app.waitFor("id:chat-empty");
+    app.onPick(() => [{ name: "chat.txt", type: "text/plain", data: new Uint8Array([65]) }]);
+    await app.press("id:attach");
+    await app.waitFor("id:staged:chat.txt");
+    await send(app, text, save ? "save-note" : "send");
+    await app.waitUntil(() => w.sent.has(text));
+    const id = w.sent.get(text)!.id;
+    if (save) {
+      // A whitespace-only later edit is a different raw draft.
+      await app.clear("id:composer");
+      await app.type("id:composer", `${text} `);
+    }
+    inaccessible = true;
+    await app.waitFor("text:/Your Chat isn't available/");
+    expect(denies).toBe(1);
+    await app.clock!.runFor(4_200);
+    expect(app.shows("text:/Your Chat isn't available/")).toBe(true);
+    expect(app.value("id:composer")).toBe(save ? `${text} ` : "");
+    expect(app.shows("id:staged:chat.txt")).toBe(false);
+    expect(w.uploads).toEqual(["chat.txt"]);
+    expect(w.messages()).toHaveLength(1);
+    inaccessible = false;
+    await app.clock!.runFor(12_000);
+    await app.waitFor(`id:event:${id}`);
+    expect(app.shows(note(id))).toBe(false);
+    expect(app.shows("text:/Your Chat isn't available/")).toBe(false);
+    expect(app.value("id:composer")).toBe(save ? `${text} ` : "");
+    expect(w.messages()).toHaveLength(1);
+  });
+}
+
+test("an accepted Dispatch does not clear a whitespace-only later edit", async () => {
+  const w = fixture();
+  w.reply("dispatch draft", {}, 3_000);
+  const app = await launch(w);
+  await dispatch(app, "dispatch draft");
+  await app.waitUntil(() => w.sent.has("dispatch draft"));
+  await app.clear("id:dispatch-text");
+  await app.type("id:dispatch-text", "dispatch draft ");
+  await app.waitFor("id:dispatch-notice");
+  expect(app.value("id:dispatch-text")).toBe("dispatch draft ");
+  expect(w.messages()).toHaveLength(1);
+});
 
 test("a classified routing receipt needs matching canonical recipients in the echo and the rendered row", async () => {
   const w = fixture();

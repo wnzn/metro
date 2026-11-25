@@ -134,7 +134,7 @@ export const activeReactions = computed(() => reactionsByScope()[activeScope()] 
 export const reactionPending = signal<string | null>(null);
 
 export const view = signal<View>("room");
-/** Set when the server has no personal Chat for this user (403/404); polling it stops. */
+/** Why personal Chat is unavailable, until a newer check can read or post to it. */
 export const chatUnavailable = signal<string | null>(null);
 
 // Runs and dispatch (meta controls in the Chat)
@@ -207,7 +207,9 @@ const spaceEpoch = new Map<string, number>();
 // success proves both the room and its Space; a sibling proves only the Space.
 let accessSequence = 0;
 const verifiedAccess = new Map<string, number>();
-const accessProbes = new Map<string, number>();
+const accessProbes = new Map<string, { request: number }>();
+let chatAvailabilityRequest = 0;
+let chatProbeAfter = 0;
 const nextAccessRequest = () => ++accessSequence;
 const newerAccess = (key: string, request: number) => (verifiedAccess.get(key) ?? 0) > request;
 function verifyAccess(key: string, request: number) {
@@ -216,6 +218,17 @@ function verifyAccess(key: string, request: number) {
 function verifyRoomAccess(sid: string, rid: string, request: number) {
   verifyAccess(scopeKey(sid, ""), request);
   verifyAccess(scopeKey(sid, rid), request);
+}
+
+// A successful but older POST may retire its draft, not undo a newer denial.
+function observeChatAvailability(request: number, problem: string | null) {
+  if (request < chatAvailabilityRequest) return;
+  chatAvailabilityRequest = request;
+  chatProbeAfter = problem ? Date.now() + LISTS_REFRESH_MS : 0;
+  batch(() => {
+    if (problem) forgetSenderNotices(CHAT);
+    chatUnavailable.set(problem);
+  });
 }
 
 // Other state modules (src/settings.ts) hook into the session's lifecycle
@@ -833,7 +846,7 @@ function captureSendOrigin(c: Client, to: SendDestination) {
   const privateSender = noticeSenderId;
   const valid = guard(to.kind === "room" ? to.spaceId : undefined);
   const sameAccount = () => !!sender && me() === sender && client === c && valid();
-  const live = () => sameAccount() && noticeDestinationVisible(to);
+  const canRetireDraft = () => sameAccount() && (to.kind === "chat" || noticeDestinationVisible(to));
   const request = nextAccessRequest();
   const epoch = noticeEpoch(scope);
   const after = cursors.get(scope) ?? 0;
@@ -841,13 +854,16 @@ function captureSendOrigin(c: Client, to: SendDestination) {
   const current = () => sameAccount() && noticeEpoch(scope) === epoch;
   return {
     current,
-    live,
+    canRetireDraft,
     acknowledge(posted: PostedSenderNotes | null): boolean {
       if (!sameAccount()) return false;
-      if (to.kind === "room" && live()) verifyRoomAccess(to.spaceId, to.roomId, request);
-      else if (to.kind === "chat") verifyAccess(CHAT, request);
+      if (to.kind === "room" && noticeDestinationVisible(to)) verifyRoomAccess(to.spaceId, to.roomId, request);
+      else if (to.kind === "chat") {
+        verifyAccess(CHAT, request);
+        observeChatAvailability(request, null);
+      }
       if (!posted || posted.senderId !== privateSender || posted.eventId <= after ||
-        !wasVisible || !current() || !live()) return false;
+        !wasVisible || !current() || !noticeDestinationVisible(to)) return false;
       const notes = senderNotices()[scope];
       const key = pendingKey(scope, posted.eventId);
       if (notes?.has(posted.eventId) || pendingSenderNotices.has(key)) return false;
@@ -865,7 +881,7 @@ function captureSendOrigin(c: Client, to: SendDestination) {
       return true;
     },
     deny() {
-      if (!current()) return;
+      if (!current() || newerAccess(scope, request)) return;
       forgetSenderNotices(scope);
       if (to.kind === "room") void recheckRoomAccess(c, to, sameAccount, false);
     },
@@ -1080,7 +1096,7 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     }
     // The POST did succeed even if a concurrent denial made its private
     // notice unusable. Retire only its own unchanged draft and file keys.
-    if (!origin.live()) return;
+    if (!origin.canRetireDraft()) return;
     if (keys.length) attachments?.sent(scope, keys, to);
     if (activeScope() === scope && (chat ? draft() === submittedText : mentionDraft() === submittedDraft)) {
       // unless the user typed something new meanwhile
@@ -1093,10 +1109,7 @@ async function sendDraft(intent: DraftSend): Promise<void> {
       const { [scope]: _sent, ...rest } = stashedDrafts();
       stashedDrafts.set(rest);
     }
-    if (chat) {
-      if (chatUnavailable()) chatUnavailable.set(null);
-      lastRunsRefresh = 0;
-    }
+    if (chat) lastRunsRefresh = 0;
     kick();
   } catch (error) {
     if (sameSession() && error instanceof ApiError && error.kind === "auth") {
@@ -1167,7 +1180,8 @@ export function setDispatchRoom(roomId: string) {
 
 /** Sends the dispatch draft to the chosen Space and room and asks that Space's agent. */
 export async function sendDispatch(): Promise<void> {
-  const text = dispatchDraft().trim();
+  const submittedText = dispatchDraft();
+  const text = submittedText.trim();
   const target = dispatchTarget();
   const c = client;
   if (!text || !target?.roomId || !c || dispatching()) return;
@@ -1190,8 +1204,8 @@ export async function sendDispatch(): Promise<void> {
     // Dispatch is an explicit request to the chosen Space's agent, not a
     // mention composer. Its text cannot add recipients implicitly.
     const hadNotice = origin.acknowledge(await c.sendMessage(target.spaceId, target.roomId, { text, invoke_agent: true }));
-    if (!origin.live()) return;
-    if (dispatchTarget() === target && dispatchDraft().trim() === text) dispatchDraft.set("");
+    if (!origin.canRetireDraft()) return;
+    if (dispatchTarget() === target && dispatchDraft() === submittedText) dispatchDraft.set("");
     if (here()) dispatchNotice.set(hadNotice ? `Posted in ${space.name} › #${room.name}.` :
       `Sent to the agent in ${space.name} › #${room.name}.`);
     lastRunsRefresh = 0;
@@ -1651,6 +1665,8 @@ function endSession() {
   pendingSenderNotices.clear();
   verifiedAccess.clear();
   accessProbes.clear();
+  chatAvailabilityRequest = 0;
+  chatProbeAfter = 0;
   memberRequests.clear();
   memberVersions.clear();
   batch(() => {
@@ -1728,7 +1744,7 @@ async function tick(sess: number) {
     if (Date.now() - lastListsRefresh >= LISTS_REFRESH_MS) await refreshLists();
     if (sess !== session) return;
     if (basePlace() === "chat") {
-      if (!chatUnavailable()) await pollChat();
+      if (Date.now() >= chatProbeAfter) await pollChat();
       if (sess === session && Date.now() - lastRunsRefresh >= RUNS_REFRESH_MS) await refreshRuns();
     } else if (basePlace() === "space") {
       const sid = activeSpaceId();
@@ -1788,28 +1804,32 @@ async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind:
   const inProgress = accessProbes.get(scope);
   // A stream of denials must not keep replacing its own slow probe. A
   // denial after fresh positive evidence, however, needs a fresh check.
-  if (inProgress !== undefined && !newerAccess(scope, inProgress) && !newerAccess(spaceScope, inProgress)) return;
-  const request = nextAccessRequest();
-  accessProbes.set(scope, request);
-  const current = () => valid() && accessProbes.get(scope) === request;
+  if (inProgress && !newerAccess(scope, inProgress.request) && !newerAccess(spaceScope, inProgress.request)) return;
+  const spaceRequest = nextAccessRequest();
+  const probe = { request: spaceRequest };
+  accessProbes.set(scope, probe);
+  const current = () => valid() && accessProbes.get(scope) === probe;
   try {
     const visible = await c.listSpaces().catch(() => null);
     if (!current() || !visible) return;
-    if (!visible.some(s => s.id === spaceId)) {
-      if (!newerAccess(spaceScope, request)) dropLostSpace(spaceId, show);
+    if (visible.some(s => s.id === spaceId)) verifyAccess(spaceScope, spaceRequest);
+    else if (!newerAccess(spaceScope, spaceRequest)) {
+      dropLostSpace(spaceId, show);
       return;
     }
-    verifyAccess(spaceScope, request);
+    // The room read is a new observation. Access verified while the Space
+    // list was in flight does not outrank a denial on this later leg.
+    const roomRequest = probe.request = nextAccessRequest();
     try {
       const list = await c.listRooms(spaceId);
       if (!current()) return;
-      if (list.some(r => r.id === roomId)) verifyRoomAccess(spaceId, roomId, request);
-      else if (!newerAccess(scope, request)) dropLostRoom(spaceId, roomId, show);
+      if (list.some(r => r.id === roomId)) verifyRoomAccess(spaceId, roomId, roomRequest);
+      else if (!newerAccess(scope, roomRequest)) dropLostRoom(spaceId, roomId, show);
     } catch (error) {
-      if (current() && isAccessDenial(error) && !newerAccess(spaceScope, request)) dropLostSpace(spaceId, show);
+      if (current() && isAccessDenial(error) && !newerAccess(spaceScope, roomRequest)) dropLostSpace(spaceId, show);
     }
   } finally {
-    if (accessProbes.get(scope) === request) accessProbes.delete(scope);
+    if (accessProbes.get(scope) === probe) accessProbes.delete(scope);
   }
 }
 
@@ -1951,17 +1971,17 @@ async function pollChat(): Promise<void> {
     await poll(CHAT, ok, async (c, after) => {
       request = nextAccessRequest();
       const events = await c.listChatEvents(after);
-      if (ok()) verifyAccess(CHAT, request);
+      if (ok()) {
+        verifyAccess(CHAT, request);
+        observeChatAvailability(request, null);
+      }
       return events;
     });
   } catch (error) {
     if (!ok()) return;
     if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found" || error.kind === "protocol")) {
       if (!request || newerAccess(CHAT, request)) return;
-      batch(() => {
-        forgetSenderNotices(CHAT);
-        chatUnavailable.set(`Your Chat isn't available on this server: ${error.message}`);
-      });
+      observeChatAvailability(request, `Your Chat isn't available on this server: ${error.message}`);
       return;
     }
     throw error;
