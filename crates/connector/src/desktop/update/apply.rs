@@ -1,6 +1,7 @@
 //! Restarting into a staged update: the trial start, the watchdog and its
 //! decision. The launcher (`crates/desktop`) calls these after it closed the
-//! UI, stopped the bridge and every worker, and dropped its locks.
+//! UI and stopped the bridge and every worker. The existing instance lock
+//! stays held by the watchdog and is handed to the trial without a gap.
 //!
 //! 1. Snapshot the local database (the bundled server is stopped).
 //! 2. Journal `trial`, start `versions/<V>/Metro --update-trial <id>` in its
@@ -17,6 +18,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::install::{self, Journal};
+use crate::desktop::store::InstanceLock;
 
 pub const TRIAL_TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -35,8 +37,80 @@ pub struct TrialPaths {
     pub update_dir: PathBuf,
 }
 
+const ROOT_GATE: &str = "desktop-update.json";
+
+#[derive(serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct RootGate {
+    root: PathBuf,
+    id: String,
+}
+
+impl RootGate {
+    pub fn read(desktop_root: &Path) -> std::io::Result<Option<Self>> {
+        super::read_json(&desktop_root.join(ROOT_GATE), 16 * 1024)
+    }
+
+    pub fn matches(&self, root: &Path, id: &str) -> bool {
+        install::valid_id(id)
+            && id == self.id
+            && root.canonicalize().is_ok_and(|path| path == self.root)
+    }
+
+    fn publish(p: &TrialPaths, j: &Journal, instance: &InstanceLock) -> std::io::Result<()> {
+        instance.check(&p.desktop_root)?;
+        if Self::read(&p.desktop_root)?.is_some() {
+            return Err(std::io::ErrorKind::AlreadyExists.into());
+        }
+        let gate = Self {
+            root: p.root.canonicalize()?,
+            id: j.id.clone(),
+        };
+        install::write_atomic(
+            &p.desktop_root.join(ROOT_GATE),
+            &serde_json::to_vec(&gate).map_err(std::io::Error::other)?,
+        )
+    }
+
+    pub fn retire(
+        desktop_root: &Path,
+        root: &Path,
+        id: &str,
+        instance: &InstanceLock,
+    ) -> std::io::Result<()> {
+        instance.check(desktop_root)?;
+        if !Self::read(desktop_root)?.is_some_and(|gate| gate.matches(root, id)) {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        let path = desktop_root.join(ROOT_GATE);
+        std::fs::remove_file(&path)?;
+        metro_release::sync_parent(&path)
+    }
+
+    pub(crate) fn check(
+        p: &TrialPaths,
+        j: &Journal,
+        instance: &InstanceLock,
+    ) -> std::io::Result<()> {
+        instance.check(&p.desktop_root)?;
+        if !Self::read(&p.desktop_root)?.is_some_and(|gate| gate.matches(&p.root, &j.id)) {
+            return Err(std::io::ErrorKind::InvalidData.into());
+        }
+        Ok(())
+    }
+}
+
 /// Snapshot the DB and journal `trial` (before the trial starts).
-pub fn begin_trial(p: &TrialPaths, j: &mut Journal, lock: &install::Lock) -> std::io::Result<()> {
+pub fn begin_trial(
+    p: &TrialPaths,
+    j: &mut Journal,
+    lock: &install::Lock,
+    instance: &InstanceLock,
+) -> std::io::Result<()> {
+    lock.check(&p.root)?;
+    install::ensure_script_transition(&p.root, j, &["staged"])?;
+    RootGate::publish(p, j, instance)?;
+    let _writer = crate::desktop_local::update_writer_exclusion(&p.desktop_root)?;
     install::begin_backup(&p.root, j, lock)?;
     let (has_db, manifest) = install::snapshot_db(&p.desktop_root, &p.update_dir, j)?;
     j.local_db_snapshot = has_db;
@@ -48,7 +122,7 @@ pub fn begin_trial(p: &TrialPaths, j: &mut Journal, lock: &install::Lock) -> std
 
 /// Start the new launcher for its trial.
 pub fn spawn_trial(exe: &Path, id: &str) -> std::io::Result<tokio::process::Child> {
-    spawn(exe, exe, id)
+    spawn(exe, exe, id, std::process::Stdio::null())
 }
 
 /// On Linux, execute the exact verified inode; on Windows the verified
@@ -56,24 +130,32 @@ pub fn spawn_trial(exe: &Path, id: &str) -> std::io::Result<tokio::process::Chil
 pub fn spawn_checked_trial(
     exe: install::CheckedFile,
     id: &str,
+    instance: &InstanceLock,
 ) -> std::io::Result<tokio::process::Child> {
     #[cfg(target_os = "linux")]
     let path = {
         use std::os::fd::AsRawFd;
         PathBuf::from(format!("/proc/self/fd/{}", exe.file.as_raw_fd()))
     };
+    #[cfg(target_os = "linux")]
+    return spawn(&path, &exe.path, id, instance.trial_input()?);
     #[cfg(not(target_os = "linux"))]
-    let path = exe.path.clone();
-    let child = spawn(&path, &exe.path, id);
-    drop(exe);
-    child
+    {
+        let _ = (exe, id, instance);
+        Err(std::io::ErrorKind::Unsupported.into())
+    }
 }
 
-fn spawn(exe: &Path, installed: &Path, id: &str) -> std::io::Result<tokio::process::Child> {
+fn spawn(
+    exe: &Path,
+    installed: &Path,
+    id: &str,
+    input: std::process::Stdio,
+) -> std::io::Result<tokio::process::Child> {
     let mut cmd = tokio::process::Command::new(exe);
     cmd.arg("--update-trial")
         .arg(id)
-        .stdin(std::process::Stdio::null())
+        .stdin(input)
         .kill_on_drop(false);
     if let Some(dir) = installed.parent() {
         cmd.current_dir(dir);
@@ -121,13 +203,16 @@ pub async fn watch_trial(
     p: &TrialPaths,
     j: &mut Journal,
     lock: &install::Lock,
+    instance: &InstanceLock,
     child: &mut tokio::process::Child,
     timeout: Duration,
 ) -> TrialOutcome {
     let started = tokio::time::Instant::now();
     loop {
         if install::trial_ok(&p.update_dir, &j.id) {
-            return match install::commit(&p.root, j, lock) {
+            return match RootGate::check(p, j, instance)
+                .and_then(|()| install::commit(&p.root, j, lock))
+            {
                 Ok(()) => TrialOutcome::Committed,
                 Err(e) => {
                     // The new version runs and is healthy; a failed pointer
@@ -145,15 +230,7 @@ pub async fn watch_trial(
                 if status.success() {
                     // Closed before its first render: nothing is committed,
                     // and whatever the new server wrote is undone too.
-                    let restored = install::rollback(
-                        &p.root,
-                        &p.desktop_root,
-                        &p.update_dir,
-                        j,
-                        lock,
-                        "not_confirmed",
-                        None,
-                    );
+                    let restored = install::rollback(p, j, lock, instance, "not_confirmed", None);
                     return if restored.is_ok() {
                         TrialOutcome::NotConfirmed
                     } else {
@@ -164,15 +241,8 @@ pub async fn watch_trial(
                     "exited with {}",
                     status.code().map_or("a signal".into(), |c| c.to_string())
                 );
-                let restored = install::rollback(
-                    &p.root,
-                    &p.desktop_root,
-                    &p.update_dir,
-                    j,
-                    lock,
-                    "rolled_back",
-                    Some(detail.clone()),
-                );
+                let restored =
+                    install::rollback(p, j, lock, instance, "rolled_back", Some(detail.clone()));
                 return if restored.is_ok() {
                     TrialOutcome::RolledBack(detail)
                 } else {
@@ -187,15 +257,8 @@ pub async fn watch_trial(
                 return TrialOutcome::NeedsRecovery;
             }
             let detail = "didn't start in time".to_string();
-            let restored = install::rollback(
-                &p.root,
-                &p.desktop_root,
-                &p.update_dir,
-                j,
-                lock,
-                "rolled_back",
-                Some(detail.clone()),
-            );
+            let restored =
+                install::rollback(p, j, lock, instance, "rolled_back", Some(detail.clone()));
             return if restored.is_ok() {
                 TrialOutcome::RolledBack(detail)
             } else {

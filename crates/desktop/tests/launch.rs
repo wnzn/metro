@@ -146,6 +146,37 @@ fn alive(pid: i64) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_portable_launcher_cannot_open_a_shared_workspace_with_an_unfinished_trial() {
+    use metro_connector::desktop::store;
+    let dir = scratch("update-gate");
+    let launcher = layout(&dir, true);
+    let out = dir.join("ui.json");
+    let home = dir.join("home");
+    store::prepare_private_dir(&home).unwrap();
+    let lock = store::try_lock_instance(&home).unwrap().unwrap();
+    std::fs::write(
+        home.join("desktop-update.json"),
+        serde_json::json!({"root": dir.join("separate-managed-install"), "id":"0123456789abcdef"})
+            .to_string(),
+    )
+    .unwrap();
+    let check = || {
+        let o = retry(|| command(&dir, &launcher, &out, "home").output());
+        assert_eq!(o.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&o.stderr)
+                .contains("shared workspace has an unfinished update")
+        );
+        assert!(!out.exists(), "the portable launcher opened its UI/writer");
+        assert!(!home.join("local").exists());
+    };
+    check();
+    drop(lock);
+    check(); // The data-root gate survives the source watchdog.
+}
+
 #[test]
 fn launches_the_packaged_ui_with_a_private_bridge_and_cleans_up() {
     let dir = scratch("ok");

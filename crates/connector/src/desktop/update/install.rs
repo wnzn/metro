@@ -1287,17 +1287,26 @@ pub fn commit(root: &Path, j: &mut Journal, lock: &Lock) -> io::Result<()> {
 /// Undo a staged or tried update: restore the DB snapshot, remove the new
 /// version, keep the pointer on `from`, journal `failed`.
 pub fn rollback(
-    root: &Path,
-    desktop_root: &Path,
-    update_dir: &Path,
+    p: &super::apply::TrialPaths,
     j: &mut Journal,
     lock: &Lock,
+    instance: &crate::desktop::store::InstanceLock,
     outcome: &str,
     detail: Option<String>,
 ) -> io::Result<()> {
+    let super::apply::TrialPaths {
+        root,
+        desktop_root,
+        update_dir,
+    } = p;
+    super::apply::RootGate::check(p, j, instance)?;
     let path = root.join(JOURNAL);
     lock.check(root)?;
     ensure_script_transition(root, j, &["trial", "committing", "rolling_back"])?;
+    // The watchdog continuously holds the instance lock. An orphaned
+    // bundled server may outlive the launcher in its own process group;
+    // the inherited workspace lease, not the launcher's PID, excludes it.
+    let _writer = crate::desktop_local::update_writer_exclusion(desktop_root)?;
     j.phase = JournalPhase::RollingBack;
     j.detail = detail;
     write_journal(&path, j)?;
@@ -1341,15 +1350,11 @@ pub fn ensure_script_transition(root: &Path, j: &Journal, phases: &[&str]) -> io
 #[derive(Debug, PartialEq, Eq)]
 pub enum Recovery {
     Nothing,
-    /// Finished a commit the previous run started.
-    Committed,
-    /// Rolled back an interrupted update.
-    RolledBack,
     /// Cannot safely open the database or install until recovery succeeds.
     Blocked,
 }
 
-pub fn recover(root: &Path, desktop_root: &Path, update_dir: &Path, own: &Version) -> Recovery {
+pub fn recover(root: &Path, _desktop_root: &Path, update_dir: &Path, own: &Version) -> Recovery {
     let path = root.join(JOURNAL);
     if matches!(load_journal(&path), Ok(None)) {
         return Recovery::Nothing;
@@ -1369,6 +1374,7 @@ pub fn recover(root: &Path, desktop_root: &Path, update_dir: &Path, own: &Versio
             // on either side of snapshot publication leaves the live DB
             // authoritative, so retire only this attempt and retry staging.
             let reset = (|| {
+                lock.check(root)?;
                 ensure_script_transition(root, &j, &["backing_up"])?;
                 clean_backup(update_dir, &j)?;
                 j.phase = JournalPhase::Staged;
@@ -1381,30 +1387,9 @@ pub fn recover(root: &Path, desktop_root: &Path, update_dir: &Path, own: &Versio
             }
         }
         "backing_up" => Recovery::Blocked,
-        "committing" if own == j.to => {
-            if commit(root, &mut j, &lock).is_ok() {
-                Recovery::Committed
-            } else {
-                Recovery::Blocked
-            }
-        }
-        "committing" | "trial" | "rolling_back" if own == j.from || own == j.to => {
-            match rollback(
-                root,
-                desktop_root,
-                update_dir,
-                &mut j,
-                &lock,
-                "rolled_back",
-                Some("interrupted".into()),
-            ) {
-                Ok(()) => Recovery::RolledBack,
-                Err(e) => {
-                    eprintln!("metro-desktop: update recovery blocked: {e}");
-                    Recovery::Blocked
-                }
-            }
-        }
+        // Restart cannot establish uninterrupted ownership. In the gap
+        // an old launcher could have opened a writer that never inherited
+        // its lease. Only the original watchdog can safely restore.
         "committing" | "trial" | "rolling_back" => Recovery::Blocked,
         _ => Recovery::Nothing,
     }

@@ -166,6 +166,7 @@ struct Inner {
     cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
     settings_error: bool,
     status_error: bool,
+    floor_unreadable: bool,
 }
 
 /// An error answer for the bridge: HTTP status, stable code, message.
@@ -304,6 +305,12 @@ fn read_json<T: for<'de> Deserialize<'de>>(
 
 const STATUS_LIMIT: usize =
     4 * (metro_release::MAX_MANIFEST + metro_release::MAX_BUNDLE) + 512 * 1024;
+const FLOOR: &str = "release-floor.json";
+
+fn save_floor(dir: &Path, version: Version) -> std::io::Result<()> {
+    let raw = serde_json::to_vec(&version.to_string()).map_err(std::io::Error::other)?;
+    install::write_atomic(&dir.join(FLOOR), &raw)
+}
 
 fn offered(status: &Status, own: Version, target: Version) -> bool {
     target > own
@@ -369,15 +376,47 @@ impl Updater {
                 Some(s) if s.version != 1 => None,
                 s => Some(s.unwrap_or_default()),
             });
-        let mut status_error = saved.is_none();
+        let status_error = saved.is_none();
         let mut status = saved.unwrap_or_default();
         status.version = 1;
-        // Cached display data does not authorize downloads. Reconstruct the
-        // floor and offer from the signed evidence, not the persisted version.
-        if let Some(release) = status
+        // A saved floor only refuses older releases. It cannot authorize
+        // any version; evidence must still verify with current trust.
+        let stored_floor = read_json::<String>(&cfg.dir.join(FLOOR), 64).and_then(|s| {
+            s.map(|v| Version::parse(&v).ok_or(std::io::ErrorKind::InvalidData))
+                .transpose()
+                .map_err(Into::into)
+        });
+        let mut floor_unreadable = !private || stored_floor.is_err();
+        let saved_floor = stored_floor.ok().flatten();
+        // If the pre-migration record is damaged and there is no separate
+        // floor yet, we cannot distinguish first use from a lost floor.
+        floor_unreadable |= saved_floor.is_none() && status_error;
+        let cached = status
             .evidence
             .as_ref()
-            .and_then(|e| e.verify(cfg.verifier.as_ref()).ok())
+            .map(|e| e.verify(cfg.verifier.as_ref()));
+        // Migrate older status records even when their verification lease
+        // has expired. Treat their recorded version only as a lower bound.
+        let floor = saved_floor
+            .into_iter()
+            .chain(status.highest_seen.as_deref().and_then(Version::parse))
+            .chain(
+                cached
+                    .as_ref()
+                    .and_then(|c| c.as_ref().ok())
+                    .map(|r| r.version),
+            )
+            .max();
+        if let Some(floor) = floor
+            && !floor_unreadable
+            && saved_floor != Some(floor)
+        {
+            floor_unreadable = save_floor(&cfg.dir, floor).is_err();
+        }
+        status.highest_seen = floor.map(|v| v.to_string());
+        if let Some(Ok(release)) = cached.as_ref()
+            && !floor_unreadable
+            && floor == Some(release.version)
         {
             let version = release.version;
             let notes = status
@@ -390,19 +429,15 @@ impl Updater {
                 && !matches!(cfg.kind, InstallKind::Unsupported(_))
             {
                 let truncated = notes.as_ref().is_some_and(|l| l.notes_truncated);
-                status.latest = Some(latest_info(
-                    &release,
-                    notes.and_then(|l| l.notes),
-                    truncated,
-                ));
+                status.latest = Some(latest_info(release, notes.and_then(|l| l.notes), truncated));
             } else {
                 status.last_result = Some("up_to_date".into());
             }
         } else {
-            status_error |= status.evidence.is_some();
-            status.evidence = None;
+            if let Some(Err(e)) = cached {
+                status.error = Some(e.code().into());
+            }
             status.latest = None;
-            status.highest_seen = None;
             if status.last_result.as_deref() == Some("available") {
                 status.last_result = None;
             }
@@ -413,17 +448,22 @@ impl Updater {
         if let Some(done) = finished {
             status.last_update = Some(done);
         }
-        // A staged version is offered again while it is still the latest.
-        // Otherwise (an older or superseded version) it is deleted.
+        // Keep stage and evidence while awaiting revalidation; an unknown
+        // offer is not proof of supersession.
         let found =
             (private && cfg.channel == Channel::Release && supports_managed_update(&cfg.kind))
                 .then(|| install::staged(&cfg.kind, &cfg.dir))
                 .flatten();
-        let staged = found.clone().filter(|(v, _)| offered(&status, cfg.own, *v));
+        let staged = found
+            .clone()
+            .filter(|(v, _)| floor_unreadable || (*v > cfg.own && floor.is_none_or(|f| *v >= f)));
         if found.is_some() && staged.is_none() {
             install::discard_staged(&cfg.kind, &cfg.dir);
         }
-        let phase = if staged.is_some() {
+        let phase = if staged
+            .as_ref()
+            .is_some_and(|(v, _)| offered(&status, cfg.own, *v))
+        {
             Phase::Ready
         } else {
             Phase::Idle
@@ -441,6 +481,7 @@ impl Updater {
                 cancel: None,
                 settings_error,
                 status_error,
+                floor_unreadable,
             }),
             checking: tokio::sync::Mutex::new(()),
             apply_tx,
@@ -483,6 +524,16 @@ impl Updater {
             .map_err(std::io::Error::other)
             .and_then(|data| install::write_atomic(&self.cfg.dir.join("status.json"), &data))
             .is_err();
+    }
+
+    fn authorizes(&self, inner: &Inner, version: Version) -> bool {
+        !inner.floor_unreadable
+            && !inner.status_error
+            && offered(&inner.status, self.cfg.own, version)
+            && inner.status.evidence.as_ref().is_some_and(|e| {
+                e.verify(self.cfg.verifier.as_ref())
+                    .is_ok_and(|verified| verified.version == version)
+            })
     }
 
     /// Record how the last update ended (the launcher, after a rollback).
@@ -531,7 +582,7 @@ impl Updater {
         if let Some(anomaly) = &inner.status.anomaly {
             v["anomaly"] = anomaly.clone().into();
         }
-        if inner.settings_error || inner.status_error {
+        if inner.settings_error || inner.status_error || inner.floor_unreadable {
             v["persistence_error"] = if inner.settings_error {
                 "settings_io"
             } else {
@@ -587,6 +638,9 @@ impl Updater {
         let now = now_ms();
         {
             let mut inner = self.lock();
+            if inner.floor_unreadable {
+                return Err(refuse(500, "io", message_for("io")));
+            }
             if inner.phase == Phase::Applying {
                 return Err(refuse(409, "busy", "An update is being applied."));
             }
@@ -648,6 +702,11 @@ impl Updater {
                         {
                             inner.status.anomaly = Some("release_changed".into());
                         } else {
+                            if floor != Some(seen) && save_floor(&self.cfg.dir, seen).is_err() {
+                                inner.floor_unreadable = true;
+                                inner.status.latest = None;
+                                return Err(refuse(500, "io", message_for("io")));
+                            }
                             inner.status.highest_seen = Some(latest.version.clone());
                             inner.status.latest = Some(latest);
                             inner.status.evidence = Some(evidence);
@@ -664,6 +723,9 @@ impl Updater {
                 );
             }
             Err(e) => {
+                if e.code == metro_release::ErrorCode::TrustRootStale {
+                    inner.status.latest = None;
+                }
                 inner.status.last_result = Some("error".into());
                 inner.status.error = Some(e.code().to_string());
                 if let Some(wait) = e.retry_after_secs {
@@ -671,15 +733,29 @@ impl Updater {
                 }
             }
         }
+        let floor = inner
+            .status
+            .highest_seen
+            .as_deref()
+            .and_then(Version::parse);
         let superseded = inner
             .staged
             .as_ref()
-            .is_some_and(|(v, _)| !offered(&inner.status, self.cfg.own, *v));
+            .is_some_and(|(v, _)| *v <= self.cfg.own || floor.is_some_and(|f| *v < f));
         if superseded {
             inner.staged = None;
             if inner.phase == Phase::Ready {
                 inner.phase = Phase::Idle;
             }
+        }
+        if matches!(inner.phase, Phase::Idle | Phase::Ready | Phase::Failed)
+            && let Some((v, _)) = inner.staged.as_ref()
+        {
+            inner.phase = if offered(&inner.status, self.cfg.own, *v) {
+                Phase::Ready
+            } else {
+                Phase::Idle
+            };
         }
         self.save_status(&mut inner);
         if superseded {
@@ -755,7 +831,7 @@ impl Updater {
         let Some(target) = Version::parse(version) else {
             return Err(refuse(400, "bad_request", "version must be X.Y.Z"));
         };
-        if !offered(&inner.status, self.cfg.own, target) || inner.status_error {
+        if !self.authorizes(&inner, target) {
             return Err(refuse(409, "not_latest", message_for("not_latest")));
         }
         match inner.phase {
@@ -991,8 +1067,7 @@ impl Updater {
         };
         if inner.phase != Phase::Ready
             || staged.to_string() != version
-            || !offered(&inner.status, self.cfg.own, staged)
-            || inner.status_error
+            || !self.authorizes(&inner, staged)
         {
             return Err(refuse(
                 409,

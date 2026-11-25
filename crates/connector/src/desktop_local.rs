@@ -121,6 +121,8 @@ struct Shared {
     current: Mutex<Option<Current>>,
     /// The port this launcher owns, from the first open until shutdown.
     lease: Mutex<Option<Lease>>,
+    #[cfg(target_os = "linux")]
+    instance: Option<Arc<crate::desktop::store::InstanceLock>>,
 }
 
 /// The listening socket every server start serves, and the data root's lock.
@@ -172,8 +174,18 @@ impl LocalServer {
                 closing: AtomicBool::new(false),
                 current: Mutex::new(None),
                 lease: Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                instance: None,
             }),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_instance(mut self, instance: Arc<crate::desktop::store::InstanceLock>) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("new local server")
+            .instance = Some(instance);
+        self
     }
 
     /// The running local server's URL, `None` unless it runs. In-process
@@ -324,6 +336,20 @@ impl LocalServer {
             ))
             .stderr(Stdio::from(log));
         platform::configure(&mut cmd, socket);
+        #[cfg(target_os = "linux")]
+        {
+            let lease = lock(&self.shared.lease);
+            let writer = &lease
+                .as_ref()
+                .ok_or_else(|| SafeError::new("The local workspace lease was lost."))?
+                ._lock;
+            crate::desktop::store::inherit_lock(writer, &mut cmd)
+                .and_then(|()| match &self.shared.instance {
+                    Some(instance) => instance.inherit_in(&mut cmd),
+                    None => Ok(()),
+                })
+                .map_err(|e| fs_error("hand over its locks", e.into()))?;
+        }
 
         let child =
             ChildProc::spawn(cmd, move |c| platform::hand_over(c, socket)).map_err(|e| {
@@ -576,7 +602,9 @@ impl ChildProc {
         std::thread::Builder::new()
             .name("metro-local-server".into())
             .spawn(move || {
-                let proc = match cmd.spawn() {
+                let spawned = cmd.spawn();
+                drop(cmd);
+                let proc = match spawned {
                     Ok(mut child) => {
                         if let Err(e) = hand_over(&mut child) {
                             let _ = child.kill();
@@ -722,6 +750,15 @@ fn take_lock(path: &Path) -> Result<fs::File, SafeError> {
         )),
         Err(fs::TryLockError::Error(e)) => Err(fs_error("lock its folder", e.into())),
     }
+}
+
+/// Taken by the updater while inspecting or replacing SQLite files. The
+/// same lease is inherited by Linux bundled servers, even if their launcher
+/// dies before the server has stopped or been reaped.
+pub(crate) fn update_writer_exclusion(desktop_root: &Path) -> std::io::Result<fs::File> {
+    let local = desktop_root.join("local");
+    ensure_private_dir(&local).map_err(std::io::Error::other)?;
+    take_lock(&local.join("local.lock")).map_err(std::io::Error::other)
 }
 
 fn load_state(path: &Path) -> Result<SavedState, SafeError> {

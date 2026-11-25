@@ -96,6 +96,83 @@ pub struct InstanceLock {
     _file: File,
 }
 
+impl InstanceLock {
+    pub(crate) fn check(&self, root: &Path) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let expected = std::fs::symlink_metadata(root.join("instance.lock"))?;
+            let found = self._file.metadata()?;
+            if !expected.is_file() || expected.dev() != found.dev() || expected.ino() != found.ino()
+            {
+                return Err(std::io::ErrorKind::InvalidData.into());
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = root;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn trial_input(&self) -> std::io::Result<std::process::Stdio> {
+        Ok(self._file.try_clone()?.into())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn inherit_in(&self, cmd: &mut std::process::Command) -> std::io::Result<()> {
+        inherit_lock(&self._file, cmd)
+    }
+
+    /// A trial gets the already-locked file description as stdin. Confirm
+    /// this is the root's live lock, not merely an independently opened file.
+    #[cfg(target_os = "linux")]
+    pub fn adopt_trial(root: &Path) -> Result<Self> {
+        use std::os::fd::FromRawFd;
+        use std::os::unix::fs::MetadataExt;
+        // SAFETY: fcntl returns a new, owned descriptor or an error.
+        let fd = unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_DUPFD_CLOEXEC, 3) };
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: fd is the fresh descriptor returned above.
+        let file = unsafe { File::from_raw_fd(fd) };
+        let expected = std::fs::symlink_metadata(root.join("instance.lock"))?;
+        let found = file.metadata()?;
+        if !expected.is_file()
+            || expected.dev() != found.dev()
+            || expected.ino() != found.ino()
+            || try_lock_instance(root)?.is_some()
+            || file.try_lock().is_err()
+        {
+            bail!("trial did not inherit the live instance lock");
+        }
+        // Only explicit handoffs may inherit the lock from this launcher.
+        // SAFETY: fcntl changes the flags on stdin, not the file description.
+        if unsafe { libc::fcntl(libc::STDIN_FILENO, libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self { _file: file })
+    }
+}
+
+/// The child keeps a copy for its lifetime; only the forked child clears
+/// CLOEXEC. `Command` owns the duplicate until the actual spawn.
+#[cfg(target_os = "linux")]
+pub(crate) fn inherit_lock(file: &File, cmd: &mut std::process::Command) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let file = file.try_clone()?;
+    // SAFETY: the closure uses only the inherited FD and async-signal-safe fcntl.
+    unsafe {
+        cmd.pre_exec(move || {
+            if libc::fcntl(file.as_raw_fd(), libc::F_SETFD, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
 /// Try to become the primary instance. `Ok(None)`: another instance holds it.
 pub fn try_lock_instance(root: &Path) -> Result<Option<InstanceLock>> {
     let path = root.join("instance.lock");

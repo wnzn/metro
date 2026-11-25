@@ -274,29 +274,24 @@ async fn launch(
     store::prepare_private_dir(&root)
         .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
     update::gate_msi_at_start(&root).map_err(start_failed)?;
-    let lock = if trial.is_some() {
-        update::lock_for_trial(&root).await
+    let lock = if let Some(id) = &trial {
+        Some(update::trial_lock(id, &dir, &root).ok_or_else(|| {
+            start_failed("this trial did not inherit the active workspace lock".into())
+        })?)
     } else {
-        update::wait_for_trial(&dir).await;
         store::try_lock_instance(&root)
             .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?
-    };
+    }
+    .map(Arc::new);
     let primary = lock.is_some();
     update::gate_msi_at_start(&root).map_err(start_failed)?;
-    if let Some(id) = &trial
-        && (!primary || !update::is_expected_trial(id, &dir, &root))
-    {
-        return Err(start_failed(
-            "this update trial is not the one prepared for this installation".into(),
-        ));
+    if trial.is_none() {
+        update::recover_at_start(&dir, &root, lock.as_deref()).map_err(start_failed)?;
     }
 
-    // Updates: primary instance only. A normal start first finishes or
-    // undoes an interrupted update.
+    // Updates: primary instance only. Startup above reconciles safe
+    // cleanup or blocks if a prior trial lost its watchdog.
     let updater: Option<Arc<Updater>> = if primary {
-        if trial.is_none() {
-            update::recover_at_start(&dir, &root).map_err(start_failed)?;
-        }
         UpdaterConfig::for_app(&root, &dir, trial.clone()).map(Updater::new)
     } else {
         None
@@ -312,11 +307,12 @@ async fn launch(
         (Some(bin), true) => {
             let data = root.join("local");
             match store::prepare_private_dir(&data) {
-                Ok(()) => Some(Arc::new(LocalServer::with_events(
-                    bin.clone(),
-                    data,
-                    events.cloned(),
-                ))),
+                Ok(()) => {
+                    let server = LocalServer::with_events(bin.clone(), data, events.cloned());
+                    #[cfg(target_os = "linux")]
+                    let server = server.with_instance(lock.clone().expect("primary instance"));
+                    Some(Arc::new(server))
+                }
                 Err(e) => {
                     if let Some(events) = events {
                         events.record(EventKind::LocalServerStartFailed);
@@ -447,10 +443,12 @@ async fn launch(
         if !stopped {
             return Err((EventKind::LauncherStartFailed, "the update was not started because the local workspace did not stop. Close Metro and try again.".into()));
         }
-        return Ok(match update::apply(&u, req, &root, lock).await {
-            update::After::Exit(code) => Launched::Exit(code),
-            update::After::Relaunch => Launched::Relaunch,
-        });
+        return Ok(
+            match update::apply(&u, req, &root, lock.expect("primary updater")).await {
+                update::After::Exit(code) => Launched::Exit(code),
+                update::After::Relaunch => Launched::Relaunch,
+            },
+        );
     }
     drop(lock);
     Ok(Launched::Exit(exit_code(status)))
