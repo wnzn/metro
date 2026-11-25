@@ -101,6 +101,7 @@ let chain: Promise<unknown> = Promise.resolve();
 let bound = false;
 /** Includes a dispatched POST whose response is still pending or failed. */
 let bindDispatched = false;
+let bindIntent: string | null = null;
 /** A failed DELETE cannot be treated as proof that the previous binding ended. */
 let releasePending = false;
 let statusSeq = 0;
@@ -246,6 +247,7 @@ function resetLocal() {
   statusSeq++;
   bound = false;
   bindDispatched = false;
+  bindIntent = null;
   pairBusy.set(null);
   pairError.set(null);
   pairNotice.set(null);
@@ -275,9 +277,15 @@ onSessionStart(({ baseUrl, token }) => {
       return;
     }
     if (!ok()) return;
-    bindDispatched = true;
     try {
-      const status = await b.bindSession(baseUrl, token);
+      const intent = await b.reserveBindIntent();
+      if (!ok()) {
+        if (intent) void b.cancelBindIntent(intent).catch(() => {});
+        return;
+      }
+      bindIntent = intent;
+      bindDispatched = true;
+      const status = await b.bindSession(baseUrl, token, intent ?? undefined);
       if (!ok()) return;
       bound = true;
       statusSeq++;
@@ -300,6 +308,10 @@ onSessionStart(({ baseUrl, token }) => {
 
 onSessionEnd(() => {
   const b = bridge;
+  const intent = bindIntent;
+  if (b && intent) void b.cancelBindIntent(intent).catch(() => {
+    // The serialized DELETE below is still required, including after refusal.
+  });
   releasePending ||= bindDispatched;
   resetLocal();
   if (!b) return;

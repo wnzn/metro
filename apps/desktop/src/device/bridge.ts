@@ -163,8 +163,12 @@ export type CredentialsBody = { open_browser?: boolean } | { api_key: string } |
 
 export type Bridge = {
   status(): Promise<BridgeStatus>;
+  /** Reserve a single-use bind intent, or null for an older helper. */
+  reserveBindIntent(): Promise<string | null>;
+  /** Invalidate just this bind, without waiting for lifecycle cleanup. */
+  cancelBindIntent(intent: string): Promise<void>;
   /** Binds the signed-in session: the bridge learns the account and starts its paired workers. */
-  bindSession(serverUrl: string, sessionToken: string): Promise<BridgeStatus>;
+  bindSession(serverUrl: string, sessionToken: string, intent?: string): Promise<BridgeStatus>;
   /** Stops every worker and drops the session (sign-out, account switch). */
   unbindSession(): Promise<BridgeStatus>;
   pair(connectionId: string, body: { kind: string; base_url?: string; models?: string[] }): Promise<LocalConnection>;
@@ -259,7 +263,22 @@ export function createBridge(endpoint: BridgeEndpoint): Bridge {
 
   return {
     status: async () => parseStatus(await call("GET", "/v1/status", undefined, 10_000)),
-    bindSession: async (serverUrl, sessionToken) => parseStatus(await call("POST", "/v1/session", { server_url: serverUrl, session_token: sessionToken })),
+    reserveBindIntent: async () => {
+      try {
+        const value = await call("POST", "/v1/session/intent", {}, 10_000);
+        if (!isObj(value) || typeof value.intent !== "string" || !/^[a-f0-9]{64}$/.test(value.intent)) {
+          throw new BridgeError("protocol", "Metro's device helper didn't prepare sign-in.");
+        }
+        return value.intent;
+      } catch (error) {
+        if (error instanceof BridgeError && error.status === 404 && error.code === "not_found") return null;
+        throw error;
+      }
+    },
+    cancelBindIntent: async (intent) => { await call("DELETE", "/v1/session/intent", { intent }, 10_000); },
+    bindSession: async (serverUrl, sessionToken, intent) => parseStatus(await call("POST", "/v1/session", {
+      server_url: serverUrl, session_token: sessionToken, ...(intent ? { intent } : {}),
+    })),
     unbindSession: async () => parseStatus(await call("DELETE", "/v1/session")),
     pair: (id, body) => conn(call("POST", `${seg(id)}/pair`, body)),
     rotate: (id) => conn(call("POST", `${seg(id)}/rotate`, {})),

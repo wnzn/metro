@@ -82,7 +82,10 @@ async fn desktop_provider_test_binding_gates_mcp_sends_and_state_publication() {
     web.session_bound(&base, "alice", &session, 1).await;
     let profile = web.profile(&base, "alice").unwrap();
     let engine = web.engine(&profile).unwrap();
-    let lease = web.test_lease(&base, "alice", 1).await.unwrap();
+    let tavily = web
+        .test_permit(&base, "alice", 1, ProviderId::Tavily)
+        .await
+        .unwrap();
 
     // Have a result ready to save before the session ends. It must not
     // update status or clear an existing cooldown once the binding changes.
@@ -97,7 +100,7 @@ async fn desktop_provider_test_binding_gates_mcp_sends_and_state_publication() {
     };
     settings::apply(&profile.dir, &cooldown).unwrap();
     let completed = engine
-        .probe_provider(ProviderId::Tavily, &|| lease.has_changed().is_ok())
+        .probe_provider(ProviderId::Tavily, &|| tavily.check())
         .await;
     assert!(completed.is_ok());
     let state_path = profile.dir.join(settings::STATE_FILE);
@@ -106,9 +109,13 @@ async fn desktop_provider_test_binding_gates_mcp_sends_and_state_publication() {
     // Drive the same outbound gate without the outer cancellation select,
     // so it—not cancellation of the pending HTTP future—must stop the
     // second MCP message when the first reply arrives after sign-out.
+    let exa = web
+        .test_permit(&base, "alice", 1, ProviderId::Exa)
+        .await
+        .unwrap();
     let pending = tokio::spawn(async move {
         engine
-            .probe_provider(ProviderId::Exa, &|| lease.has_changed().is_ok())
+            .probe_provider(ProviderId::Exa, &|| exa.check())
             .await
     });
     tokio::time::timeout(Duration::from_secs(2), f.initialized.notified())
@@ -120,7 +127,7 @@ async fn desktop_provider_test_binding_gates_mcp_sends_and_state_publication() {
     assert!(matches!(pending.await.unwrap(), Err(web::BINDING_ENDED)));
     assert_eq!(f.mcp_sends.load(Ordering::SeqCst), 1);
     assert_eq!(
-        web.commit_test(&base, "alice", 1, &profile, ProviderId::Tavily, completed)
+        web.commit_test(&base, "alice", 1, &profile, &tavily, completed)
             .await
             .unwrap_err()
             .code,
@@ -169,9 +176,120 @@ async fn desktop_provider_off_blocks_initial_and_followup_mcp_test_sends() {
 enum Change {
     MasterOff,
     ProviderOff,
+    MasterCycle,
+    ProviderCycle,
+    FailedMasterOff,
+    FailedProviderOff,
     ReplaceKey,
     RestoreSameKey,
     DeleteKey,
+}
+
+async fn change_consent(
+    change: Change,
+    web: &WebSearch,
+    base: &str,
+    session: &Secret,
+    dir: &Path,
+    id: ProviderId,
+) {
+    match change {
+        Change::MasterOff => {
+            web.update(base, "alice", 1, session, Some(false), None, None)
+                .await
+                .unwrap();
+        }
+        Change::ProviderOff => toggle_provider(web, base, session, id, false).await,
+        Change::MasterCycle | Change::ProviderCycle => {
+            // This is the same interprocess transaction the CLI uses,
+            // without touching the desktop's in-memory barriers.
+            for enabled in [false, true] {
+                settings::update_prefs(dir, false, |s| {
+                    if matches!(change, Change::MasterCycle) {
+                        s.enabled = enabled;
+                    } else {
+                        s.providers.iter_mut().find(|p| p.id == id).unwrap().enabled = enabled;
+                    }
+                    Ok(())
+                })
+                .unwrap();
+            }
+            assert!(settings::load(dir).unwrap().enabled);
+            assert!(
+                settings::load(dir)
+                    .unwrap()
+                    .providers
+                    .iter()
+                    .any(|p| p.id == id && p.enabled)
+            );
+        }
+        Change::FailedMasterOff | Change::FailedProviderOff => {
+            // Neither preferences nor the interprocess counter can be
+            // saved. Remove the obstruction before the vendor replies:
+            // there is no lasting change on disk to invalidate the test.
+            let prefs = dir.join(settings::FILE);
+            let consent = dir.join(settings::CONSENT_FILE);
+            std::fs::create_dir(&prefs).unwrap();
+            std::fs::create_dir(&consent).unwrap();
+            let (master, providers) = if matches!(change, Change::FailedMasterOff) {
+                (Some(false), None)
+            } else {
+                (
+                    None,
+                    Some(
+                        ProviderId::ALL
+                            .into_iter()
+                            .map(|p| (p.as_str().into(), p != id))
+                            .collect(),
+                    ),
+                )
+            };
+            let refused = web
+                .update(base, "alice", 1, session, master, None, providers)
+                .await
+                .unwrap_err();
+            assert_eq!(refused.code, "invalid");
+            std::fs::remove_dir(prefs).unwrap();
+            std::fs::remove_dir(consent).unwrap();
+            let s = settings::load(dir).unwrap();
+            assert!(s.enabled && s.providers.iter().any(|p| p.id == id && p.enabled));
+        }
+        _ => unreachable!("not a consent change"),
+    }
+}
+
+#[tokio::test]
+async fn desktop_consent_cycles_and_failed_off_block_mcp_followups() {
+    for change in [
+        Change::MasterCycle,
+        Change::ProviderCycle,
+        Change::FailedMasterOff,
+        Change::FailedProviderOff,
+    ] {
+        let (base, f) = fixture().await;
+        let temp = tempfile::tempdir().unwrap();
+        let web = Arc::new(test_web(temp.path(), &base));
+        let session = Secret::new("fixture-session");
+        web.session_bound(&base, "alice", &session, 1).await;
+        let profile = web.profile(&base, "alice").unwrap();
+        let pending = {
+            let (web, base) = (web.clone(), base.clone());
+            tokio::spawn(async move { web.test(&base, "alice", 1, "exa").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), f.initialized.notified())
+            .await
+            .unwrap();
+        change_consent(change, &web, &base, &session, &profile.dir, ProviderId::Exa).await;
+        f.release_init.notify_one();
+        let refused = pending.await.unwrap().unwrap_err();
+        assert_eq!(refused.code, "not_sent", "{change:?}");
+        assert!(refused.message.contains("consent changed"), "{change:?}");
+        assert_eq!(f.mcp_sends.load(Ordering::SeqCst), 1, "{change:?}");
+        assert!(
+            !profile.dir.join(settings::STATE_FILE).exists(),
+            "{change:?}"
+        );
+    }
 }
 
 async fn held_test_response(change: Change) {
@@ -207,12 +325,6 @@ async fn held_test_response(change: Change) {
     // Each edit must finish while the vendor is still holding the response.
     tokio::time::timeout(Duration::from_secs(2), async {
         match change {
-            Change::MasterOff => {
-                web.update(&base, "alice", 1, &session, Some(false), None, None)
-                    .await
-                    .unwrap();
-            }
-            Change::ProviderOff => toggle_provider(&web, &base, &session, pid, false).await,
             Change::ReplaceKey | Change::RestoreSameKey => {
                 web.set_key(
                     &base,
@@ -236,6 +348,7 @@ async fn held_test_response(change: Change) {
                     .await
                     .unwrap();
             }
+            _ => change_consent(change, &web, &base, &session, &profile.dir, pid).await,
         }
     })
     .await
@@ -264,6 +377,18 @@ async fn held_test_response(change: Change) {
 #[tokio::test]
 async fn desktop_held_test_cannot_publish_after_master_or_provider_off() {
     for change in [Change::MasterOff, Change::ProviderOff] {
+        held_test_response(change).await;
+    }
+}
+
+#[tokio::test]
+async fn desktop_held_test_cannot_publish_after_consent_cycles_or_failed_off() {
+    for change in [
+        Change::MasterCycle,
+        Change::ProviderCycle,
+        Change::FailedMasterOff,
+        Change::FailedProviderOff,
+    ] {
         held_test_response(change).await;
     }
 }

@@ -243,6 +243,7 @@ fn router(ctx: Arc<Ctx>) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/monitoring/events", get(monitoring_events))
         .route("/v1/session", post(session_open).delete(session_close))
+        .route("/v1/session/intent", post(intent_open).delete(intent_close))
         .route("/v1/connections/{id}/pair", post(pair))
         .route("/v1/connections/{id}/rotate", post(rotate))
         .route(
@@ -326,6 +327,8 @@ async fn monitoring_events(State(ctx): State<Arc<Ctx>>) -> Response {
 struct SessionBody {
     server_url: String,
     session_token: String,
+    #[serde(default)]
+    intent: Option<String>,
 }
 
 async fn session_open(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
@@ -334,8 +337,41 @@ async fn session_open(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
         Err(e) => return e.into_response(),
     };
     let token = Secret::new(std::mem::take(&mut parsed.session_token));
-    match ctx.desktop.open_session(&parsed.server_url, token).await {
+    match ctx
+        .desktop
+        .open_session(&parsed.server_url, token, parsed.intent.as_deref())
+        .await
+    {
         Ok(v) => ok(v),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntentBody {
+    intent: String,
+}
+
+async fn intent_open(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    if let Err(e) = body::<Empty>(&b) {
+        return e.into_response();
+    }
+    match random_token() {
+        Ok(id) => {
+            ctx.desktop.intents.reserve(id.expose().to_owned());
+            ok(json!({"intent": id.expose()}))
+        }
+        Err(_) => err(500, "local_error", "Cannot prepare device sign-in").into_response(),
+    }
+}
+
+async fn intent_close(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    match body::<IntentBody>(&b) {
+        Ok(req) => {
+            ctx.desktop.intents.cancel(&req.intent);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => e.into_response(),
     }
 }

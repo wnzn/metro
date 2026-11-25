@@ -9,6 +9,8 @@
 //! | `GET /v1/status` | | bridge, version, instance, kinds, session (including generation), local, connections |
 //! | `GET /v1/monitoring/events` | | `{events: [...]}`; recent device-only operational errors |
 //! | `POST /v1/session` | `{server_url, session_token}` | status; verifies `GET /v1/me`, starts confirmed workers |
+//! | `POST /v1/session/intent` | `{}` | `{intent}`; pass it with `POST /v1/session` to make that bind cancellable |
+//! | `DELETE /v1/session/intent` | `{intent}` | 204; revoke just that intent without waiting for lifecycle cleanup |
 //! | `DELETE /v1/session` | | status; stops every worker and sign-in |
 //! | `POST /v1/connections/{id}/pair` | `{kind, base_url?, models?}` | connection; mints the device token itself |
 //! | `POST /v1/connections/{id}/rotate` | `{}` | connection |
@@ -35,6 +37,7 @@ pub mod core;
 pub mod local;
 pub mod metro_api;
 pub mod monitoring;
+mod session_intent;
 pub mod store;
 mod tools_glue;
 pub mod update;

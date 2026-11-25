@@ -95,6 +95,7 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
       if (!state.monitoring) return err(404, "not_found", "Unknown path.");
       return { ...ok({ events: state.monitoring }), delay: state.monitoringDelay };
     }
+    if (path === "/v1/session/intent") return err(404, "not_found", "Unknown path.");
     if (path === "/v1/session") {
       if (req.method === "DELETE") {
         state.session = null;

@@ -17,7 +17,9 @@
 //! - Workers run only while the session is bound, on the primary instance,
 //!   and stop with it.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -28,6 +30,7 @@ use tokio::task::JoinHandle;
 use super::core::{BridgeError, WorkerState, err};
 use super::metro_api::{ApiError, MetroApi};
 use super::monitoring::{EventKind, Events};
+use super::session_intent::Lease;
 use super::store;
 use crate::metro::MetroClient;
 use crate::profile::Profile;
@@ -64,6 +67,44 @@ struct BoundSession {
     epoch: u64,
     // No value is sent; dropping the sender cancels in-flight provider tests.
     ended: watch::Sender<()>,
+    lease: Lease,
+    test_master: Arc<AtomicBool>,
+    test_providers: BTreeMap<ProviderId, Arc<AtomicBool>>,
+}
+
+// In-process revocation happens before attempting a preference write.
+// The on-disk generations also cover changes by other connector processes.
+fn revoke(barrier: &mut Arc<AtomicBool>) {
+    barrier.store(true, Ordering::SeqCst);
+    *barrier = Arc::default();
+}
+
+struct TestPermit {
+    provider: ProviderId,
+    ended: watch::Receiver<()>,
+    lease: Lease,
+    master: Arc<AtomicBool>,
+    provider_off: Arc<AtomicBool>,
+}
+
+impl TestPermit {
+    fn check(&self) -> Result<(), web::GateStop> {
+        if !self.lease.live() || self.ended.has_changed().is_err() {
+            Err(web::GateStop::BindingEnded)
+        } else if self.master.load(Ordering::SeqCst) || self.provider_off.load(Ordering::SeqCst) {
+            Err(web::GateStop::ConsentRevoked)
+        } else {
+            Ok(())
+        }
+    }
+
+    async fn ended(&self) {
+        let mut rx = self.ended.clone();
+        tokio::select! {
+            _ = self.lease.ended() => {},
+            _ = rx.changed() => {},
+        }
+    }
 }
 
 pub struct WebSearch {
@@ -174,29 +215,36 @@ impl WebSearch {
     }
 
     /// Register this computer with Metro if it isn't yet (or its token is
-    /// gone). Returns the device id.
+    /// gone). Returns whether this call created the registration.
     async fn ensure_paired(
         &self,
         p: &Profile,
         server: &str,
         account: &str,
         session: &Secret,
-    ) -> R<String> {
-        if let Some(id) = Self::binding(p, server, account).and_then(|b| b.device_id) {
-            return Ok(id);
+        lease: &Lease,
+    ) -> R<bool> {
+        lease.check()?;
+        if Self::binding(p, server, account).is_some() {
+            return Ok(false);
         }
         let api = MetroApi::new(server, session.clone()).map_err(api_err)?;
-        let (id, token) = api
-            .create_web_device(&device_label())
-            .await
-            .map_err(|e| match e {
-                ApiError::NotFound => err(
-                    409,
-                    "unsupported",
-                    "This Metro server doesn't offer web search yet",
-                ),
-                e => api_err(e),
-            })?;
+        let label = device_label();
+        lease.check()?;
+        // Once sent, let this request return the created id so we can
+        // revoke it if sign-out won. Don't abandon a registration on cancel.
+        let (id, token) = api.create_web_device(&label).await.map_err(|e| match e {
+            ApiError::NotFound => err(
+                409,
+                "unsupported",
+                "This Metro server doesn't offer web search yet",
+            ),
+            e => api_err(e),
+        })?;
+        if let Err(cancelled) = lease.check() {
+            let _ = api.delete_web_device(&id).await;
+            return Err(cancelled);
+        }
         // One atomic record; a registration that can't be saved here is
         // removed again so it doesn't linger in Metro.
         let saved = Binding::new(server, &owner(account), Some(id.clone()), token)
@@ -205,7 +253,7 @@ impl WebSearch {
             let _ = api.delete_web_device(&id).await;
             return Err(local(e, "The web device can't be saved"));
         }
-        Ok(id)
+        Ok(true)
     }
 
     /// Remove this computer from Metro (best effort) and forget its token.
@@ -241,7 +289,7 @@ impl WebSearch {
         }
     }
 
-    fn spawn(&self, server: &str, token: Secret, engine: Arc<Engine>) {
+    fn spawn(&self, server: &str, token: Secret, engine: Arc<Engine>, lease: &Lease) {
         let (tx, rx) = watch::channel(false);
         let epoch = {
             let mut l = lock(&self.live);
@@ -264,6 +312,10 @@ impl WebSearch {
         };
         let mut tasks = Vec::new();
         for _ in 0..WORKERS {
+            if !lease.live() {
+                break;
+            }
+            let lease = lease.clone();
             let live = self.live.clone();
             let on_state = Arc::new(move |rs: RunState| {
                 let (w, d) = match rs {
@@ -292,7 +344,9 @@ impl WebSearch {
                 self.events.clone(),
             );
             tasks.push(tokio::spawn(async move {
-                let (w, d) = match web::worker::run(&client, &engine, &opts).await {
+                let admitted = || lease.live();
+                let run = web::worker::run_guarded(&client, &engine, &opts, &admitted);
+                let (w, d) = match lease.race(run).await.unwrap_or(Stop::Done) {
                     Stop::Done => return,
                     Stop::Unauthorized => {
                         events.record(EventKind::WebWorkerUnauthorized);
@@ -341,8 +395,15 @@ impl WebSearch {
         }
     }
 
-    async fn start_locked(&self, server: &str, account: &str, session: &Secret) -> R<()> {
+    async fn start_locked(
+        &self,
+        server: &str,
+        account: &str,
+        session: &Secret,
+        lease: &Lease,
+    ) -> R<()> {
         self.stop().await;
+        lease.check()?;
         if !self.primary {
             return Ok(());
         }
@@ -352,20 +413,34 @@ impl WebSearch {
             return Ok(());
         }
         let engine = self.engine(&p)?;
-        let paired = self.ensure_paired(&p, server, account, session).await;
-        if let Err(e) = paired {
-            let mut l = lock(&self.live);
-            l.worker = WorkerState::Error;
-            l.detail = Some(format!(
-                "Couldn't set up web search with Metro: {}",
-                e.message
-            ));
-            return Err(e);
-        }
+        let paired = self
+            .ensure_paired(&p, server, account, session, lease)
+            .await;
+        let created = match paired {
+            Ok(created) => created,
+            Err(e) => {
+                let mut l = lock(&self.live);
+                l.worker = WorkerState::Error;
+                l.detail = Some(format!(
+                    "Couldn't set up web search with Metro: {}",
+                    e.message
+                ));
+                return Err(e);
+            }
+        };
         let token = Self::binding(&p, server, account)
             .map(|b| b.token().clone())
             .ok_or_else(|| err(500, "local_error", "The device token can't be read"))?;
-        self.spawn(server, token, engine);
+        if lease.live() {
+            self.spawn(server, token, engine, lease);
+        }
+        if let Err(cancelled) = lease.check() {
+            self.stop().await;
+            if created {
+                self.unpair(&p, server, account, session).await;
+            }
+            return Err(cancelled);
+        }
         Ok(())
     }
 
@@ -377,9 +452,9 @@ impl WebSearch {
         epoch: u64,
     ) -> R<tokio::sync::MutexGuard<'_, Option<BoundSession>>> {
         let g = self.ops.lock().await;
-        if g.as_ref()
-            .is_some_and(|s| s.server == server && s.account == account && s.epoch == epoch)
-        {
+        if g.as_ref().is_some_and(|s| {
+            s.server == server && s.account == account && s.epoch == epoch && s.lease.live()
+        }) {
             Ok(g)
         } else {
             Err(err(409, "no_session", "Sign in to a Metro server first"))
@@ -388,14 +463,29 @@ impl WebSearch {
 
     /// A session was bound: serve web search for it, unless it's off here.
     pub async fn session_bound(&self, server: &str, account: &str, session: &Secret, epoch: u64) {
+        self.session_bound_with_lease(server, account, session, epoch, Lease::default())
+            .await;
+    }
+
+    pub(super) async fn session_bound_with_lease(
+        &self,
+        server: &str,
+        account: &str,
+        session: &Secret,
+        epoch: u64,
+        lease: Lease,
+    ) {
         let mut g = self.ops.lock().await;
         *g = Some(BoundSession {
             server: server.to_owned(),
             account: account.to_owned(),
             epoch,
             ended: watch::channel(()).0,
+            lease: lease.clone(),
+            test_master: Arc::default(),
+            test_providers: BTreeMap::new(),
         });
-        let _ = self.start_locked(server, account, session).await;
+        let _ = self.start_locked(server, account, session, &lease).await;
     }
 
     /// Sign-out, account switch or exit.
@@ -513,8 +603,12 @@ impl WebSearch {
         notice_acknowledged: Option<bool>,
         providers: Option<Vec<(String, bool)>>,
     ) -> R<Value> {
-        let _g = self.bound_ops(server, account, epoch).await?;
-        let p = self.profile(server, account)?;
+        let mut binding = self.bound_ops(server, account, epoch).await?;
+        let active = binding.as_mut().expect("bound session");
+        let turn_off = enabled == Some(false);
+        if turn_off {
+            revoke(&mut active.test_master);
+        }
         let list = match providers {
             Some(list) => Some(
                 list.iter()
@@ -523,7 +617,14 @@ impl WebSearch {
             ),
             None => None,
         };
-        let turn_off = enabled == Some(false);
+        if let Some(list) = &list {
+            for (provider, on) in list {
+                if !*on {
+                    revoke(active.test_providers.entry(*provider).or_default());
+                }
+            }
+        }
+        let p = self.profile(server, account)?;
         let was_on = !turn_off && settings::load(&p.dir).is_ok_and(|s| s.enabled);
         let save = |dir: &Path| {
             settings::update_prefs(dir, turn_off, |s| {
@@ -564,7 +665,8 @@ impl WebSearch {
             }
             changed?;
         } else if changed? {
-            self.start_locked(server, account, session).await?;
+            self.start_locked(server, account, session, &active.lease)
+                .await?;
         }
         Ok(self.view(&p, server, account))
     }
@@ -621,27 +723,36 @@ impl WebSearch {
         // Capture cancellation under the lifecycle lock, but don't hold it
         // across the vendor call. A replacement binding drops this sender,
         // including sign-out followed by sign-in to the very same account.
-        let mut ended = self.test_lease(server, account, epoch).await?;
         let pid = provider(id)?;
+        let permit = self.test_permit(server, account, epoch, pid).await?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
-        let lease = ended.clone();
-        let bound = || lease.has_changed().is_ok();
+        let admit = || permit.check();
         let result = tokio::select! {
             biased;
-            _ = ended.changed() => return Err(err(409, "no_session", web::BINDING_ENDED)),
-            result = engine.probe_provider(pid, &bound) => result,
+            _ = permit.ended() => return Err(err(409, "no_session", web::BINDING_ENDED)),
+            result = engine.probe_provider(pid, &admit) => result,
         };
-        self.commit_test(server, account, epoch, &p, pid, result)
+        self.commit_test(server, account, epoch, &p, &permit, result)
             .await
     }
 
-    async fn test_lease(&self, server: &str, account: &str, epoch: u64) -> R<watch::Receiver<()>> {
-        let g = self.bound_ops(server, account, epoch).await?;
-        Ok(g.as_ref()
-            .expect("bound_ops checked the session")
-            .ended
-            .subscribe())
+    async fn test_permit(
+        &self,
+        server: &str,
+        account: &str,
+        epoch: u64,
+        provider: ProviderId,
+    ) -> R<TestPermit> {
+        let mut g = self.bound_ops(server, account, epoch).await?;
+        let s = g.as_mut().expect("bound session");
+        Ok(TestPermit {
+            provider,
+            ended: s.ended.subscribe(),
+            lease: s.lease.clone(),
+            master: s.test_master.clone(),
+            provider_off: s.test_providers.entry(provider).or_default().clone(),
+        })
     }
 
     async fn commit_test(
@@ -650,24 +761,32 @@ impl WebSearch {
         account: &str,
         epoch: u64,
         p: &Profile,
-        pid: ProviderId,
+        permit: &TestPermit,
         result: Result<web::ProviderTest, &'static str>,
     ) -> R<Value> {
         // No vendor I/O under this lock. Hold it over the result's file
         // transaction as well as the response so a stale test cannot save
         // status or clear cooldowns in a replacement binding.
         let _g = self.bound_ops(server, account, epoch).await?;
+        let result = result.map_err(|why| err(409, "not_sent", why))?;
+        let stale = || {
+            err(
+                409,
+                "test_not_applied",
+                "The provider test result is no longer current or couldn't be saved",
+            )
+        };
+        permit.check().map_err(|_| stale())?;
         let outcome = result
-            .map_err(|why| err(409, "not_sent", why))?
-            .record(&p.dir)
-            .map_err(|_| {
-                err(
-                    409,
-                    "test_not_applied",
-                    "The provider test result is no longer current or couldn't be saved",
-                )
-            })?;
-        let mut row = self.row(p, pid)?;
+            .record(&p.dir, || {
+                permit
+                    .lease
+                    .publication()
+                    .map_err(|_| SafeError::new(web::BINDING_ENDED).into())
+            })
+            .map_err(|_| stale())?;
+        let mut row = self.row(p, permit.provider)?;
+        permit.check().map_err(|_| stale())?;
         row["test"] = json!({"outcome": outcome.as_str()});
         Ok(row)
     }
@@ -681,7 +800,7 @@ impl WebSearch {
         session: &Secret,
         id: &str,
     ) -> R<Value> {
-        let _g = self.bound_ops(server, account, epoch).await?;
+        let binding = self.bound_ops(server, account, epoch).await?;
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
@@ -701,7 +820,13 @@ impl WebSearch {
         // reconcile under this (still bound) session.
         let idle = lock(&self.live).tasks.iter().all(|t| t.is_finished());
         if idle && settings::load(&p.dir).is_ok_and(|s| s.enabled) {
-            self.start_locked(server, account, session).await?;
+            self.start_locked(
+                server,
+                account,
+                session,
+                &binding.as_ref().expect("bound session").lease,
+            )
+            .await?;
         }
         self.row(&p, pid)
     }

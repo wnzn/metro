@@ -38,12 +38,16 @@ function fixture() {
   const states = new Map([[`${BASE} alice`, alice], [`${BASE} bob`, bob], [`${OTHER} alice`, other]]);
   const calls: { method: string; path: string; binding: string; providers?: string[]; keyAccepted?: boolean; generation?: number; prefsBody?: unknown }[] = [];
   const lifecycle: { method: string; previous: number | null; next: number | null }[] = [];
+  const intentEvents: { action: string; id: string }[] = [];
+  let nextIntent = 0;
+  let activeIntent: string | null = null;
   let generation = 0;
   let workerGeneration: number | null = null;
   const chatWrites: { host: string; enabled: boolean }[] = [];
   const prefs = new Map<string, boolean>();
   const replies = { unsupported: false, oldServer: false, testRefused: false, staleTest: false, rejectKey: false, refusePrefs: false,
-    refuseOrder: false, writeDelay: 0, testDelay: 0, bindDelay: 0, unbindDelay: 0, failBind: false, failUnbind: false, noGeneration: false };
+    refuseOrder: false, writeDelay: 0, testDelay: 0, bindDelay: 0, unbindDelay: 0, failBind: false, failUnbind: false, noGeneration: false,
+    bindIntents: false };
   const ok = (body: unknown, delay = 0) => ({ status: 200, body, delay });
   const err = (status: number, code: string) => ({ status, body: { error: { code, message: REFLECTED } } });
   function web(req: Req) {
@@ -116,8 +120,30 @@ function fixture() {
     network[`${method} ${BRIDGE}/v1/*`] = (req: Req) => {
       const path = new URL(req.url).pathname;
       if (path.startsWith(PATH)) return web(req);
+      if (path === "/v1/session/intent" && replies.bindIntents) {
+        if (header(req, "authorization") !== `Bearer ${BRIDGE_TOKEN}`) return err(401, "unauthorized");
+        if (method === "POST") {
+          activeIntent = (++nextIntent).toString(16).padStart(64, "0");
+          intentEvents.push({ action: "reserve", id: activeIntent });
+          return ok({ intent: activeIntent });
+        }
+        if (method === "DELETE") {
+          const id = JSON.parse(req.body!).intent;
+          intentEvents.push({ action: "cancel", id });
+          if (id === activeIntent) {
+            activeIntent = null;
+            workerGeneration = null;
+          }
+          return { status: 204, body: "" };
+        }
+      }
       if (path === "/v1/session" && method === "POST" && replies.failBind) return { error: "fixture offline" };
       if (path === "/v1/session" && method === "DELETE" && replies.failUnbind) return { error: "fixture offline" };
+      if (path === "/v1/session" && method === "POST" && replies.bindIntents) {
+        const id = JSON.parse(req.body!).intent;
+        if (!activeIntent || id !== activeIntent) return err(409, "bind_cancelled");
+        intentEvents.push({ action: "bind", id });
+      }
       const answer = b.network[`${method} ${BRIDGE}/v1/*`]!(req) as {
         status: number; body: { session?: { generation?: number } | null };
       };
@@ -149,7 +175,7 @@ function fixture() {
       };
     }
   }
-  return { network, calls, chatWrites, replies, alice, bob, other, lifecycle, worker: () => workerGeneration };
+  return { network, calls, chatWrites, replies, alice, bob, other, lifecycle, intentEvents, worker: () => workerGeneration };
 }
 
 async function start(w: ReturnType<typeof fixture>, bridge = true) {
@@ -438,6 +464,29 @@ test("replacement sign-in to the same account waits for held bind and cleanup, w
     { method: "DELETE", previous: 1, next: null },
     { method: "POST", previous: null, next: 2 },
   ]);
+});
+
+test("supported helpers receive targeted cancellation before the pending bind returns", async () => {
+  const w = fixture();
+  w.replies.bindIntents = true;
+  w.replies.bindDelay = 3000;
+  const app = await start(w);
+  await app.waitUntil(() => w.worker() === 1, { timeout: 500 });
+  w.replies.bindDelay = 0;
+  await app.press("id:fixture-alice");
+  await app.waitUntil(() => w.intentEvents.length === 3, { timeout: 500 });
+  const first = w.intentEvents[0]!.id;
+  expect(w.intentEvents).toEqual([
+    { action: "reserve", id: first }, { action: "bind", id: first }, { action: "cancel", id: first },
+  ]);
+  expect(w.worker()).toBe(null);
+  expect(w.lifecycle.map((event) => event.method)).toEqual(["POST"]);
+  await app.waitFor("id:websearch-provider:exa");
+  expect(w.lifecycle.map((event) => event.method)).toEqual(["POST", "DELETE", "POST"]);
+  const second = w.intentEvents[3]!.id;
+  expect(second === first).toBe(false);
+  expect(w.intentEvents.slice(3)).toEqual([{ action: "reserve", id: second }, { action: "bind", id: second }]);
+  expect(w.worker()).toBe(2);
 });
 
 test("a failed cleanup must be confirmed before a replacement session can bind", async () => {
