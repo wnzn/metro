@@ -109,7 +109,8 @@ impl Db {
         Ok(conn
             .query_row(
                 "UPDATE spaces
-                    SET runner_token_hash = ?2, runner_generation = runner_generation + 1
+                     SET runner_token_hash = ?2, runner_generation = runner_generation + 1,
+                         runner_drop_before = runner_generation + 1
                   WHERE id = ?1
                     AND runner_token_hash IS NULL
                     AND NOT EXISTS (SELECT 1 FROM space_runners WHERE space_id = ?1)
@@ -135,7 +136,8 @@ impl Db {
         Ok(conn
             .query_row(
                 "UPDATE spaces
-                    SET runner_token_hash = NULL, runner_generation = runner_generation + 1
+                     SET runner_token_hash = NULL, runner_generation = runner_generation + 1,
+                         runner_drop_before = runner_generation + 1
                   WHERE id = ?1
                     AND runner_generation = ?2
                     AND runner_token_hash IS NOT NULL

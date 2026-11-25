@@ -433,6 +433,7 @@ impl Db {
                  owner_id          TEXT NOT NULL,
                  runner_token_hash BLOB UNIQUE,
                  runner_generation INTEGER NOT NULL DEFAULT 0,
+                 runner_drop_before INTEGER NOT NULL DEFAULT 0,
                  created_at        INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS spaces_owner ON spaces (owner_id);
@@ -487,6 +488,7 @@ impl Db {
         add_space_description(&conn)?;
         reactions::init(&conn)?;
         crate::runners::init(&conn)?;
+        add_runner_queue_floor(&conn)?;
         crate::admin_users::init(&conn)?;
         crate::admin_settings::init(&conn)?;
         crate::profiles::init(&conn)?;
@@ -761,7 +763,9 @@ impl Db {
             return Ok(None);
         }
         let generation: i64 = tx.query_row(
-            "UPDATE spaces SET runner_token_hash = ?2, runner_generation = runner_generation + 1
+            "UPDATE spaces SET runner_token_hash = ?2,
+                 runner_drop_before = CASE WHEN runner_token_hash IS NULL THEN runner_generation + 1 ELSE runner_drop_before END,
+                 runner_generation = runner_generation + 1
              WHERE id = ?1 RETURNING runner_generation",
             params![space_id, hash],
             |r| r.get(0),
@@ -785,7 +789,8 @@ impl Db {
             return Ok(None);
         }
         let generation: i64 = tx.query_row(
-            "UPDATE spaces SET runner_token_hash = NULL, runner_generation = runner_generation + 1
+            "UPDATE spaces SET runner_token_hash = NULL, runner_drop_before = runner_generation + 1,
+                 runner_generation = runner_generation + 1
              WHERE id = ?1 RETURNING runner_generation",
             [space_id],
             |r| r.get(0),
@@ -826,15 +831,51 @@ impl Db {
     /// serve the Space changes: dedicated token issued, rotated or revoked;
     /// registered runner attached, detached, reassigned, rotated or deleted.
     pub fn space_runner_generation(&self, space_id: &str) -> anyhow::Result<Option<u64>> {
-        let conn = self.lock();
-        Ok(conn
-            .query_row(
-                "SELECT runner_generation FROM spaces WHERE id = ?1",
-                [space_id],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-            .map(|g| g as u64))
+        Ok(read_runner_queue_version(&self.lock(), space_id)?.map(|v| v.generation))
+    }
+
+    /// Bind a new job to the current committed assignment and insert it
+    /// before another connection can change that assignment.
+    pub(crate) fn with_runner_queue_version<T>(
+        &self,
+        space_id: &str,
+        action: impl FnOnce(crate::jobs::RunnerVersion) -> T,
+    ) -> anyhow::Result<Option<T>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Ok(read_runner_queue_version(&tx, space_id)?.map(action))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runner_queue_version(
+        &self,
+        space_id: &str,
+    ) -> anyhow::Result<Option<crate::jobs::RunnerVersion>> {
+        Ok(read_runner_queue_version(&self.lock(), space_id)?)
+    }
+
+    /// Revalidate an authenticated runner's exact generations just before
+    /// accessing in-memory jobs. The transaction keeps assignment
+    /// writes out until this synchronous queue action is finished.
+    pub(crate) fn with_runner_queue_access<T>(
+        &self,
+        authenticated: &[(String, u64)],
+        action: impl FnOnce(&[(String, crate::jobs::RunnerVersion)]) -> T,
+    ) -> anyhow::Result<T> {
+        let mut conn = self.lock();
+        if authenticated.is_empty() {
+            return Ok(action(&[]));
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut verified = Vec::with_capacity(authenticated.len());
+        for (sid, generation) in authenticated {
+            if let Some(version) = read_runner_queue_version(&tx, sid)?
+                && version.generation == *generation
+            {
+                verified.push((sid.clone(), version));
+            }
+        }
+        Ok(action(&verified))
     }
 
     // ---- Rooms and events ----
@@ -1306,6 +1347,37 @@ fn add_space_description(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE spaces ADD COLUMN description TEXT NOT NULL DEFAULT ''")?;
     }
     Ok(())
+}
+
+fn add_runner_queue_floor(conn: &Connection) -> rusqlite::Result<()> {
+    let has = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('spaces') WHERE name = 'runner_drop_before')",
+        [], |r| r.get::<_, bool>(0),
+    )?;
+    if !has {
+        // Jobs are process-local, so there is no old queue to migrate.
+        conn.execute_batch(
+            "ALTER TABLE spaces ADD COLUMN runner_drop_before INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    Ok(())
+}
+
+fn read_runner_queue_version(
+    conn: &Connection,
+    sid: &str,
+) -> rusqlite::Result<Option<crate::jobs::RunnerVersion>> {
+    conn.query_row(
+        "SELECT runner_generation, runner_drop_before FROM spaces WHERE id = ?1",
+        [sid],
+        |r| {
+            Ok(crate::jobs::RunnerVersion {
+                generation: r.get::<_, i64>(0)? as u64,
+                drop_before: r.get::<_, i64>(1)? as u64,
+            })
+        },
+    )
+    .optional()
 }
 
 /// Additive: older databases gain a nullable `activity` column; their

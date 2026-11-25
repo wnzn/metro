@@ -225,23 +225,24 @@ pub async fn call_runner(
     // The job is bound to whoever serves the Space right now; if that
     // changes before a runner answers, the job fails instead of crossing to
     // the new runner.
-    let generation = {
+    let pending = {
         let space = space.to_owned();
+        let jobs = state.jobs.clone();
         state
             .db
-            .call(move |db| db.space_runner_generation(&space))
+            .call(move |db| {
+                db.with_runner_queue_version(&space, |version| {
+                    jobs.enqueue_at(&space, version, tool.runner_name(), arguments)
+                })
+            })
             .await
     };
-    let result = match generation {
-        Ok(Some(generation)) => {
-            state
-                .jobs
-                .run(space, generation, tool.runner_name(), arguments)
-                .await
-        }
+    let result = match pending {
+        Ok(Some(Ok(waiter))) => waiter.await,
+        Ok(Some(Err(e))) => Err(e),
         Ok(None) => Err(JobError::CredentialChanged),
         Err(e) => {
-            tracing::error!(error = %format!("{e:#}"), "reading the Space's runner generation");
+            tracing::error!(error = %format!("{e:#}"), "queuing work for the Space's current runner");
             Err(JobError::CredentialChanged)
         }
     };

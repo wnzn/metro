@@ -144,7 +144,8 @@ impl Db {
             return Ok(Deleted::NameMismatch);
         }
         let generation: i64 = tx.query_row(
-            "UPDATE spaces SET runner_token_hash = NULL, runner_generation = runner_generation + 1
+            "UPDATE spaces SET runner_token_hash = NULL, runner_generation = runner_generation + 1,
+                 runner_drop_before = runner_generation + 1
              WHERE id = ?1 RETURNING runner_generation",
             [space_id],
             |r| r.get(0),

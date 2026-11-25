@@ -121,6 +121,13 @@ struct SpaceQueue {
     queue: VecDeque<String>,
     /// Highest credential generation seen for this Space.
     generation: u64,
+    drop_before: u64,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RunnerVersion {
+    pub generation: u64,
+    pub drop_before: u64,
 }
 
 #[derive(Default)]
@@ -163,23 +170,23 @@ impl Inner {
 
     /// Note that `space` now uses runner `generation`. Returns false when
     /// the caller holds an older generation than one already seen. A newer
-    /// generation fails every job claimed under an older one, and with
-    /// `drop_queued` every job queued under an older one too.
-    fn observe(&mut self, space: &str, generation: u64, drop_queued: bool) -> bool {
+    /// generation fails older claims; the durable assignment floor fences
+    /// older queued jobs independently of credential rotation or HTTP order.
+    fn observe(&mut self, space: &str, version: RunnerVersion) -> bool {
         let q = self.spaces.entry(space.to_owned()).or_default();
-        if generation < q.generation {
-            return false;
-        }
-        let advanced = generation > q.generation;
+        let generation = q.generation.max(version.generation);
+        let floor = q.drop_before.max(version.drop_before);
+        let changed = generation != q.generation || floor != q.drop_before;
         q.generation = generation;
-        if advanced || drop_queued {
+        q.drop_before = floor;
+        if changed {
             let doomed: Vec<String> = self
                 .jobs
                 .iter()
                 .filter(|(_, job)| job.space == space)
                 .filter(|(_, job)| match job.state {
                     State::Claimed { generation: g, .. } => g < generation,
-                    State::Queued => drop_queued && job.generation < generation,
+                    State::Queued => job.generation < floor,
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
@@ -187,7 +194,7 @@ impl Inner {
                 self.fail(&id, Some(JobError::CredentialChanged));
             }
         }
-        true
+        version.generation == generation
     }
 }
 
@@ -216,24 +223,20 @@ impl JobQueue {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// Queue `tool` for `space`'s runner and wait for its result.
-    /// `generation` is the Space's runner generation as read from the
-    /// database just before; a job for a superseded generation is refused
-    /// at once, so it can never reach a runner attached later. Dropping the
-    /// future abandons the job: a queued job is withdrawn and a late result
-    /// is refused as expired.
-    pub async fn run(
+    /// Insert synchronously under the database's assignment fence, then
+    /// return a waiter that abandons the job if dropped, even before polling.
+    pub(crate) fn enqueue_at(
         &self,
         space: &str,
-        generation: u64,
+        version: RunnerVersion,
         tool: &str,
         arguments: serde_json::Value,
-    ) -> Result<JobOutcome, JobError> {
+    ) -> Result<impl Future<Output = Result<JobOutcome, JobError>> + Send + use<>, JobError> {
         let id = uuid::Uuid::new_v4().to_string();
         let (tx, mut rx) = oneshot::channel();
         {
             let mut inner = self.lock();
-            if !inner.observe(space, generation, false) {
+            if !inner.observe(space, version) {
                 return Err(JobError::CredentialChanged);
             }
             let seq = inner.next_seq;
@@ -248,7 +251,7 @@ impl JobQueue {
                 Job {
                     space: space.to_owned(),
                     seq,
-                    generation,
+                    generation: version.generation,
                     tool: tool.to_owned(),
                     arguments,
                     state: State::Queued,
@@ -256,47 +259,61 @@ impl JobQueue {
                 },
             );
         }
-        let guard = AbandonGuard {
-            queue: self,
-            id: &id,
-        };
-
         let claim_deadline = Instant::now() + self.claim_timeout;
-        if let Ok(result) = tokio::time::timeout_at(claim_deadline, &mut rx).await {
-            drop(guard);
-            return result.unwrap_or(Err(JobError::TimedOut));
-        }
-        // Not answered before the claim deadline: fail it if still queued,
-        // otherwise give it the rest of its run time.
-        let run_deadline = {
-            let mut inner = self.lock();
-            match inner.jobs.get(&id).map(|job| &job.state) {
-                Some(State::Queued) => {
-                    inner.fail(&id, None);
-                    return Err(JobError::NotClaimed);
-                }
-                Some(State::Claimed { at, .. }) => *at + self.run_timeout,
-                // Finished while we took the lock; the result is in `rx`.
-                None => Instant::now(),
+        let guard = AbandonGuard {
+            queue: self.clone(),
+            id,
+        };
+        Ok(async move {
+            let guard = guard;
+            if let Ok(result) = tokio::time::timeout_at(claim_deadline, &mut rx).await {
+                return result.unwrap_or(Err(JobError::TimedOut));
             }
-        };
-        let result = match tokio::time::timeout_at(run_deadline, &mut rx).await {
-            Ok(result) => result.unwrap_or(Err(JobError::TimedOut)),
-            Err(_) => rx.try_recv().unwrap_or(Err(JobError::TimedOut)),
-        };
-        drop(guard);
-        result
+            // Not answered before the claim deadline: fail it if still
+            // queued, otherwise give it the rest of its run time.
+            let run_deadline = {
+                let mut inner = guard.queue.lock();
+                match inner.jobs.get(&guard.id).map(|job| &job.state) {
+                    Some(State::Queued) => {
+                        inner.fail(&guard.id, None);
+                        return Err(JobError::NotClaimed);
+                    }
+                    Some(State::Claimed { at, .. }) => *at + guard.queue.run_timeout,
+                    // Finished while we took the lock; the result is in `rx`.
+                    None => Instant::now(),
+                }
+            };
+            match tokio::time::timeout_at(run_deadline, &mut rx).await {
+                Ok(result) => result.unwrap_or(Err(JobError::TimedOut)),
+                Err(_) => rx.try_recv().unwrap_or(Err(JobError::TimedOut)),
+            }
+        })
+    }
+
+    #[cfg(test)]
+    async fn run_at(
+        &self,
+        space: &str,
+        version: RunnerVersion,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<JobOutcome, JobError> {
+        self.enqueue_at(space, version, tool, arguments)?.await
     }
 
     /// The oldest queued job across `spaces` (each with the runner
     /// generation the caller holds for it), now claimed by `claimer`. `None`
     /// when there is none; Spaces whose generation has been superseded are
     /// skipped.
-    pub fn claim(&self, claimer: &str, spaces: &[(String, u64)]) -> Option<ClaimedJob> {
+    pub(crate) fn claim_at(
+        &self,
+        claimer: &str,
+        spaces: &[(String, RunnerVersion)],
+    ) -> Option<ClaimedJob> {
         let mut inner = self.lock();
         let mut best: Option<(u64, String, u64)> = None;
-        for (space, generation) in spaces {
-            if !inner.observe(space, *generation, false) {
+        for (space, version) in spaces {
+            if !inner.observe(space, *version) {
                 continue;
             }
             let inner = &mut *inner;
@@ -313,7 +330,7 @@ impl JobQueue {
             if let Some(job) = q.queue.front().and_then(|id| inner.jobs.get(id))
                 && best.as_ref().is_none_or(|(seq, _, _)| job.seq < *seq)
             {
-                best = Some((job.seq, space.clone(), *generation));
+                best = Some((job.seq, space.clone(), version.generation));
             }
         }
         let (_, space, generation) = best?;
@@ -335,10 +352,10 @@ impl JobQueue {
     /// Accept a result from `claimer`, which may serve `spaces` (each with
     /// the runner generation it holds). A job of any other Space is
     /// indistinguishable from an unknown one.
-    pub fn complete(
+    pub(crate) fn complete_at(
         &self,
         claimer: &str,
-        spaces: &[(String, u64)],
+        spaces: &[(String, RunnerVersion)],
         id: &str,
         outcome: JobOutcome,
     ) -> Result<(), CompleteError> {
@@ -360,10 +377,10 @@ impl JobQueue {
                 });
             }
         };
-        let Some((space, generation)) = served(&space) else {
+        let Some((space, version)) = served(&space) else {
             return Err(CompleteError::Unknown);
         };
-        if !inner.observe(&space, generation, false) {
+        if !inner.observe(&space, version) {
             return Err(CompleteError::Expired);
         }
         // `observe` may have failed the job just now.
@@ -375,7 +392,7 @@ impl JobQueue {
             State::Claimed { claimer: c, .. } if c != claimer => {
                 return Err(CompleteError::Unknown);
             }
-            State::Claimed { generation: g, .. } if *g != generation => {
+            State::Claimed { generation: g, .. } if *g != version.generation => {
                 inner.fail(id, Some(JobError::CredentialChanged));
                 return Err(CompleteError::Expired);
             }
@@ -397,31 +414,95 @@ impl JobQueue {
     /// generation): jobs claimed under the old token fail; queued jobs wait
     /// for the runner holding the new token.
     pub fn rotate(&self, space: &str, generation: u64) {
-        self.lock().observe(space, generation, false);
+        self.lock().observe(
+            space,
+            RunnerVersion {
+                generation,
+                drop_before: 0,
+            },
+        );
     }
 
     /// Who serves the Space changed (token revoked; runner attached,
     /// detached, reassigned or deleted; `generation` is the new one): every
     /// job queued or claimed before fails.
     pub fn revoke(&self, space: &str, generation: u64) {
-        self.lock().observe(space, generation, true);
+        self.lock().observe(
+            space,
+            RunnerVersion {
+                generation,
+                drop_before: generation,
+            },
+        );
     }
 
     #[cfg(test)]
     fn pending(&self) -> usize {
         self.lock().jobs.len()
     }
+
+    #[cfg(test)]
+    async fn run(
+        &self,
+        space: &str,
+        generation: u64,
+        tool: &str,
+        arguments: serde_json::Value,
+    ) -> Result<JobOutcome, JobError> {
+        self.run_at(
+            space,
+            RunnerVersion {
+                generation,
+                drop_before: 0,
+            },
+            tool,
+            arguments,
+        )
+        .await
+    }
+
+    #[cfg(test)]
+    fn claim(&self, claimer: &str, spaces: &[(String, u64)]) -> Option<ClaimedJob> {
+        self.claim_at(claimer, &test_versions(spaces))
+    }
+
+    #[cfg(test)]
+    fn complete(
+        &self,
+        claimer: &str,
+        spaces: &[(String, u64)],
+        id: &str,
+        outcome: JobOutcome,
+    ) -> Result<(), CompleteError> {
+        self.complete_at(claimer, &test_versions(spaces), id, outcome)
+    }
+}
+
+#[cfg(test)]
+fn test_versions(spaces: &[(String, u64)]) -> Vec<(String, RunnerVersion)> {
+    spaces
+        .iter()
+        .map(|(s, g)| {
+            (
+                s.clone(),
+                RunnerVersion {
+                    generation: *g,
+                    drop_before: 0,
+                },
+            )
+        })
+        .collect()
 }
 
 /// Withdraws an unfinished job when its waiter goes away.
-struct AbandonGuard<'a> {
-    queue: &'a JobQueue,
-    id: &'a str,
+struct AbandonGuard {
+    queue: JobQueue,
+    id: String,
 }
 
-impl Drop for AbandonGuard<'_> {
+impl Drop for AbandonGuard {
     fn drop(&mut self) {
-        self.queue.lock().fail(self.id, None);
+        self.queue.lock().fail(&self.id, None);
     }
 }
 
@@ -559,6 +640,113 @@ mod tests {
         assert_eq!(next.arguments, json!({"n": 2}));
         q.complete(D, &sp("s", 2), &next.id, ok("fresh")).unwrap();
         assert_eq!(b.await.unwrap().unwrap().output, "fresh");
+    }
+
+    #[tokio::test]
+    async fn committed_rotation_refuses_old_claims_and_results_before_notification() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let sid = db.create_space("alice", "A", 4).unwrap().id;
+        let q = JobQueue::new(4, Duration::from_secs(5), Duration::from_secs(5));
+        let old = db.set_runner_token(&sid, b"old").unwrap().unwrap();
+        let submit = |n| {
+            db.with_runner_queue_version(&sid, |v| q.enqueue_at(&sid, v, "t", json!(n)))
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        };
+        let dropped = submit(0);
+        assert_eq!(q.pending(), 1);
+        drop(dropped);
+        assert_eq!(q.pending(), 0);
+        let claimed = submit(1);
+        let queued = submit(2);
+        let old_access = [(sid.clone(), old)];
+        let first = db
+            .with_runner_queue_access(&old_access, |spaces| q.claim_at(D, spaces))
+            .unwrap()
+            .unwrap();
+        let new = db.set_runner_token(&sid, b"new").unwrap().unwrap();
+        // No queue notification from the rotation route has run.
+        db.with_runner_queue_access(&old_access, |spaces| {
+            assert!(q.claim_at(D, spaces).is_none());
+            assert_eq!(
+                q.complete_at(D, spaces, &first.id, ok("old")),
+                Err(CompleteError::Unknown)
+            );
+        })
+        .unwrap();
+        let new_access = [(sid, new)];
+        db.with_runner_queue_access(&new_access, |spaces| {
+            let second = q.claim_at(D, spaces).unwrap();
+            assert_eq!(second.arguments, json!(2));
+            q.complete_at(D, spaces, &second.id, ok("new")).unwrap();
+        })
+        .unwrap();
+        assert_eq!(claimed.await, Err(JobError::CredentialChanged));
+        assert_eq!(queued.await, Ok(ok("new")));
+    }
+
+    #[tokio::test]
+    async fn committed_detach_fences_before_delayed_revoke_and_keeps_other_spaces() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let a = db.create_space("alice", "A", 4).unwrap().id;
+        let b = db.create_space("alice", "B", 4).unwrap().id;
+        let q = JobQueue::new(4, Duration::from_secs(5), Duration::from_secs(5));
+        db.set_runner_token(&a, b"a-old").unwrap();
+        db.set_runner_token(&b, b"b-current").unwrap();
+        let old = db.runner_queue_version(&a).unwrap().unwrap();
+        let sibling = db.runner_queue_version(&b).unwrap().unwrap();
+        let spawn = |sid: &str, version, n| {
+            let q = q.clone();
+            let sid = sid.to_owned();
+            tokio::spawn(async move { q.run_at(&sid, version, "t", json!({"n": n})).await })
+        };
+        let left = spawn(&a, old, 1);
+        let right = spawn(&b, sibling, 2);
+        while q.pending() < 2 {
+            tokio::task::yield_now().await;
+        }
+
+        // The detach commits but its HTTP task hasn't notified the queue.
+        let detached = db.detach_runner(&a).unwrap().unwrap();
+        db.set_runner_token(&a, b"a-new").unwrap();
+        let rotated = db.set_runner_token(&a, b"a-rotated").unwrap().unwrap();
+        q.rotate(&a, rotated); // A later handler notification arrives first.
+        let claim = |hash| {
+            let auth = db.runner_by_token_hash(hash).unwrap().unwrap();
+            db.with_runner_queue_access(&[auth], |spaces| q.claim_at(D, spaces))
+                .unwrap()
+        };
+        assert!(claim(b"a-rotated").is_none());
+        assert_eq!(left.await.unwrap(), Err(JobError::CredentialChanged));
+        assert_eq!(
+            q.run_at(&a, old, "t", json!({})).await,
+            Err(JobError::CredentialChanged)
+        );
+        let bjob = claim(b"b-current").unwrap();
+        assert_eq!(bjob.arguments, json!({"n": 2}));
+
+        let after = db.runner_queue_version(&a).unwrap().unwrap();
+        let fresh = spawn(&a, after, 3);
+        while q.pending() < 2 {
+            tokio::task::yield_now().await;
+        }
+        q.revoke(&a, detached); // Late revocation can't consume post-detach work.
+        let newest = db
+            .set_runner_token(&a, b"a-rotated-again")
+            .unwrap()
+            .unwrap();
+        let ajob = claim(b"a-rotated-again").unwrap(); // Pure rotation kept it.
+        assert_eq!(ajob.arguments, json!({"n": 3}));
+        for (sid, generation, job) in [(&a, newest, ajob), (&b, sibling.generation, bjob)] {
+            db.with_runner_queue_access(&[(sid.clone(), generation)], |spaces| {
+                q.complete_at(D, spaces, &job.id, ok("done"))
+            })
+            .unwrap()
+            .unwrap();
+        }
+        assert!(fresh.await.unwrap().is_ok());
+        assert!(right.await.unwrap().is_ok());
     }
 
     #[tokio::test]

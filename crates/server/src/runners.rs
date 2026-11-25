@@ -174,13 +174,14 @@ fn row_runner(r: &rusqlite::Row<'_>) -> rusqlite::Result<RegisteredRunner> {
 const RUNNER_COLUMNS: &str = "id, name, visibility, owner_id";
 
 /// Bump the runner generation of every Space `runner_id` is attached to.
-fn bump_attached(conn: &Connection, runner_id: &str) -> rusqlite::Result<Bumped> {
+fn bump_attached(conn: &Connection, runner_id: &str, removing: bool) -> rusqlite::Result<Bumped> {
     let mut stmt = conn.prepare_cached(
-        "UPDATE spaces SET runner_generation = runner_generation + 1
+        "UPDATE spaces SET runner_generation = runner_generation + 1,
+             runner_drop_before = CASE WHEN ?2 THEN runner_generation + 1 ELSE runner_drop_before END
          WHERE id IN (SELECT space_id FROM space_runners WHERE runner_id = ?1)
          RETURNING id, runner_generation",
     )?;
-    let rows = stmt.query_map([runner_id], |r| {
+    let rows = stmt.query_map(params![runner_id, removing], |r| {
         Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as u64))
     })?;
     rows.collect()
@@ -273,7 +274,7 @@ impl Db {
         {
             return Ok(None);
         }
-        let bumped = bump_attached(&tx, id)?;
+        let bumped = bump_attached(&tx, id, false)?;
         tx.commit()?;
         Ok(Some(bumped))
     }
@@ -292,7 +293,7 @@ impl Db {
         if !exists {
             return Ok(None);
         }
-        let bumped = bump_attached(&tx, id)?;
+        let bumped = bump_attached(&tx, id, true)?;
         tx.execute("DELETE FROM space_runners WHERE runner_id = ?1", [id])?;
         tx.execute("DELETE FROM runners WHERE id = ?1", [id])?;
         tx.commit()?;
@@ -477,7 +478,8 @@ impl Db {
             params![space_id, runner_id, actor, now_ms()],
         )?;
         let generation: i64 = tx.query_row(
-            "UPDATE spaces SET runner_generation = runner_generation + 1
+            "UPDATE spaces SET runner_generation = runner_generation + 1,
+                 runner_drop_before = runner_generation + 1
              WHERE id = ?1 RETURNING runner_generation",
             [space_id],
             |r| r.get(0),
@@ -541,7 +543,8 @@ impl Db {
         }
         let generation: Option<i64> = tx
             .query_row(
-                "UPDATE spaces SET runner_token_hash = ?2, runner_generation = runner_generation + 1
+                "UPDATE spaces SET runner_token_hash = ?2, runner_generation = runner_generation + 1,
+                     runner_drop_before = CASE WHEN ?3 IS NULL THEN runner_generation + 1 ELSE runner_drop_before END
                  WHERE id = ?1 AND NOT EXISTS (SELECT 1 FROM space_runners WHERE space_id = ?1)
                    AND ((?3 IS NULL AND runner_token_hash IS NULL)
                      OR (runner_generation = ?3 AND runner_token_hash IS NOT NULL))
@@ -583,7 +586,8 @@ impl Db {
             return Ok(None);
         }
         let generation: i64 = tx.query_row(
-            "UPDATE spaces SET runner_generation = runner_generation + 1
+            "UPDATE spaces SET runner_generation = runner_generation + 1,
+                 runner_drop_before = runner_generation + 1
              WHERE id = ?1 RETURNING runner_generation",
             [space_id],
             |r| r.get(0),

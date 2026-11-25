@@ -16,7 +16,7 @@ use serde_json::json;
 use crate::AppState;
 use crate::agent::{start_personal_run, stop_runs_of};
 use crate::attachments::{self, Append, IdsError, Place};
-use crate::auth::{Human, Runner, RunnerCredential, new_runner_token, runner_token_hash, valid_id};
+use crate::auth::{Human, Runner, new_runner_token, runner_token_hash, valid_id};
 use crate::db::reactions::{ReactionScope, Reactor, valid_emoji};
 use crate::db::{
     Activity, AddMember, Addressed, Author, Event, LimitError, RemoveMember, Role, Room, SpaceView,
@@ -1217,15 +1217,23 @@ pub async fn runner_claim(
     body: axum::body::Bytes,
 ) -> Response {
     let update = crate::updates::on_claim(&state, &runner, crate::updates::claim_body(&body)).await;
-    let mut response = match state.jobs.claim(&runner.claimer(), &runner.spaces) {
-        Some(mut job) => {
-            if runner.protocol < 2 {
-                debug_assert_eq!(runner.credential, RunnerCredential::Dedicated);
+    let protocol = runner.protocol;
+    let jobs = state.jobs.clone();
+    let claimed = db(&state, move |db| {
+        db.with_runner_queue_access(&runner.spaces, |spaces| {
+            jobs.claim_at(&runner.claimer(), spaces)
+        })
+    })
+    .await;
+    let mut response = match claimed {
+        Ok(Some(mut job)) => {
+            if protocol < 2 {
                 job.space_id = None;
             }
             (StatusCode::OK, Json(job)).into_response()
         }
-        None => StatusCode::NO_CONTENT.into_response(),
+        Ok(None) => StatusCode::NO_CONTENT.into_response(),
+        Err(e) => return e.into_response(),
     };
     if let Some(version) = update
         && let Ok(value) = HeaderValue::from_str(&version)
@@ -1261,9 +1269,13 @@ pub async fn runner_result(
         ok: body.ok,
         output: body.output,
     };
-    match state
-        .jobs
-        .complete(&runner.claimer(), &runner.spaces, &id, outcome)
+    let jobs = state.jobs.clone();
+    match db(&state, move |db| {
+        db.with_runner_queue_access(&runner.spaces, |spaces| {
+            jobs.complete_at(&runner.claimer(), spaces, &id, outcome)
+        })
+    })
+    .await?
     {
         Ok(()) => Ok(Json(json!({"accepted": true}))),
         // A retried delivery of a result we already have: acknowledge it so
