@@ -433,15 +433,31 @@ pub async fn page_builder_turn<F, Fut>(
     preamble: &str,
     history: Vec<(bool, String)>,
     prompt: String,
+    pin_to_run: bool,
     recheck: F,
 ) -> Result<(String, crate::model_routing::RouteNote), PageTurnError>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
+    let expected = (
+        route.note.connection_id.clone(),
+        route.note.model_id.clone(),
+    );
     let model = route_model(state, user_id, space, &mut route)
         .await
         .map_err(PageTurnError::Failed)?;
+    if pin_to_run
+        && expected
+            != (
+                route.note.connection_id.clone(),
+                route.note.model_id.clone(),
+            )
+    {
+        return Err(PageTurnError::Failed(
+            "The model connection used by the room run changed; start a new run.".to_owned(),
+        ));
+    }
     // Its own small pool: page building never takes agent-run slots.
     let Ok(_permit) = state.page_builds.clone().try_acquire_owned() else {
         return Err(PageTurnError::Failed(
@@ -766,9 +782,16 @@ async fn execute_room_run(
                 .copied()
                 .filter(|t| agent.allows(t.runner_name()))
                 .collect();
-            let mut builder = model
-                .builder()
-                .preamble(PREAMBLE)
+            let page_tools = crate::pages::agent_tools::tools(
+                state, space_id, room, initiator, turn, route, agent,
+            );
+            let mut builder = model.builder().preamble(PREAMBLE);
+            if !page_tools.is_empty() {
+                builder = builder
+                    .append_preamble(crate::pages::agent_tools::PREAMBLE)
+                    .dynamic_tools(page_tools);
+            }
+            builder = builder
                 .append_preamble(&agent_preamble(agent))
                 .append_preamble(match (paired, allowed.is_empty()) {
                     (false, _) => NO_RUNNER_PREAMBLE,

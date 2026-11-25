@@ -1092,6 +1092,12 @@ async fn reserve_and_start(state: &AppState, r: DraftRequest) -> ApiResult<Respo
         Err(store::DraftError::Denied(store::Denied::Forbidden)) => {
             return Err(forbidden("you can't edit this page"));
         }
+        Err(store::DraftError::Stale) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "the draft base changed",
+            ));
+        }
     };
     let base_spaces = base
         .as_ref()
@@ -1107,6 +1113,7 @@ async fn reserve_and_start(state: &AppState, r: DraftRequest) -> ApiResult<Respo
         block_key: r.block_key,
         chosen: r.chosen,
         base_spaces,
+        agent_grant: None,
     };
     tokio::spawn(generate::run(state.clone(), job));
     Ok((

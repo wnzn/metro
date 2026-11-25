@@ -7,7 +7,7 @@
 //!   default agent (or the one the sender's opt-in classifier picks; see
 //!   [`crate::space_prefs`]). A Space created before agents existed gets
 //!   one default agent named [`Activity::AGENT_NAME`] with the handle
-//!   `agent` and every tool, so its behaviour is unchanged.
+//!   `agent` and the original default tools, so its behaviour is unchanged.
 //! - Members read every field, instructions included. Only the owner
 //!   creates, edits, deletes and sets avatars. Outsiders and unknown ids
 //!   get 404, members 403.
@@ -61,6 +61,14 @@ const NO_AGENT: &str = "no such agent";
 
 /// Every entry an agent's tool allowlist may hold.
 pub fn all_tools() -> Vec<String> {
+    default_tools()
+        .into_iter()
+        .chain(crate::pages::agent_tools::NAMES.map(str::to_owned))
+        .collect()
+}
+
+/// Page tools are opt-in, even for the Space's built-in agent.
+pub(crate) fn default_tools() -> Vec<String> {
     RunnerTool::ALL
         .iter()
         .map(|t| t.runner_name().to_owned())
@@ -77,8 +85,7 @@ pub struct SpaceAgent {
     pub handle: String,
     pub description: String,
     pub instructions: String,
-    /// Allowed tools: entries of [`all_tools`]. Empty: no workspace or
-    /// thread tools.
+    /// Allowed tools: entries of [`all_tools`]. Empty: no optional tools.
     pub tools: Vec<String>,
     pub is_default: bool,
     /// Changes on every avatar upload; `None` without an image.
@@ -180,7 +187,7 @@ fn insert_default(conn: &Connection, space_id: &str) -> rusqlite::Result<()> {
             Activity::AGENT_NAME,
             DEFAULT_HANDLE,
             "The Space's built-in agent.",
-            serde_json::to_string(&all_tools()).unwrap_or_else(|_| "[]".to_owned()),
+            serde_json::to_string(&default_tools()).unwrap_or_else(|_| "[]".to_owned()),
             COLORS[0],
             now,
         ],
@@ -550,7 +557,11 @@ async fn list(
 ) -> ApiResult<Json<serde_json::Value>> {
     let space = member_of(&state, &sid, &who).await?;
     let agents = db(&state, move |db| db.space_agents(&space.id)).await?;
-    Ok(Json(json!({"agents": agents, "tools": all_tools()})))
+    Ok(Json(json!({
+        "agents": agents,
+        "tools": all_tools(),
+        "default_tools": default_tools(),
+    })))
 }
 
 async fn agent_of(state: &AppState, sid: &str, aid: &str) -> ApiResult<SpaceAgent> {
@@ -580,7 +591,7 @@ pub struct CreateBody {
     description: String,
     #[serde(default)]
     instructions: String,
-    /// Default: every tool.
+    /// Default: the original workspace and thread tools.
     #[serde(default)]
     tools: Option<Vec<String>>,
     #[serde(default)]
@@ -611,7 +622,7 @@ async fn create_agent(
         instructions: Some(check_instructions(&body.instructions)?),
         tools: Some(match &body.tools {
             Some(tools) => check_tools(tools)?,
-            None => all_tools(),
+            None => default_tools(),
         }),
         color: body.color.as_deref().map(check_color).transpose()?,
         make_default: body.is_default,

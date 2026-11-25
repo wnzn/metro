@@ -14,7 +14,8 @@
 //! A failed check answers that one source with
 //! `{"ok": false, "error": "no_access"}` and a fixed message; other sources
 //! still resolve, and nothing about the hidden data leaks into the error.
-//! Data is never sent to a model and never indexed.
+//! The HTTP endpoint doesn't send these values to a model or index them.
+//! Opted-in Space agents can use the same resolver as their run's initiator.
 
 use std::collections::HashMap;
 
@@ -648,6 +649,30 @@ pub async fn resolve(
     viewer: String,
     only: Option<Vec<String>>,
 ) -> anyhow::Result<Json> {
+    resolve_with_actions(state, ctx, spec, viewer, only, true).await
+}
+
+/// The same `<Data>` values as `/data`, without action capabilities.
+/// Those are for a human deciding whether to click a button, and checking
+/// `openPage` could otherwise reveal access to a page outside this Space.
+pub(crate) async fn resolve_sources(
+    state: &AppState,
+    ctx: Context,
+    spec: PageSpec,
+    viewer: String,
+    only: Option<Vec<String>>,
+) -> anyhow::Result<Json> {
+    resolve_with_actions(state, ctx, spec, viewer, only, false).await
+}
+
+async fn resolve_with_actions(
+    state: &AppState,
+    ctx: Context,
+    spec: PageSpec,
+    viewer: String,
+    only: Option<Vec<String>>,
+    include_actions: bool,
+) -> anyhow::Result<Json> {
     let all_runs = state.runs.list();
     state
         .db
@@ -658,6 +683,12 @@ pub async fn resolve(
                     continue;
                 }
                 data.insert(d.name.clone(), source(db, &ctx, d, &viewer, &all_runs));
+            }
+            if !include_actions {
+                return Ok(json!({
+                    "data": data,
+                    "resolved_at": rfc3339_utc(crate::db::now_ms()),
+                }));
             }
             // What the viewer vouched for, once per request.
             let vouched = match (&ctx.page_id, ctx.version) {
