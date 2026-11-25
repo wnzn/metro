@@ -1,7 +1,8 @@
 import { batch, signal } from "nsh";
+import { ApiError } from "./api/client";
 import type { SpaceRunner } from "./api/client";
 import { onSessionEnd, sessionGuard, setRunnerPaired } from "./store";
-import { clearSpaceRunnerOrder, hasNewerSpaceRunnerStamp, isSpaceRunnerStampCurrent, nextSpaceRunnerStamp, recordSpaceAccessProof, recordSpaceRunnerStamp, spaceRunnerExactPending } from "./spaceRunnerOrder";
+import { clearSpaceRunnerOrder, discardSpaceAccessProof, hasNewerSpaceRunnerStamp, isSpaceRunnerStampCurrent, nextSpaceRunnerStamp, recordSpaceAccessProof, recordSpaceRunnerStamp, spaceRunnerExactPending } from "./spaceRunnerOrder";
 
 /** Missing means not observed; null is an observed empty assignment. */
 export const spaceRunners = signal<Record<string, SpaceRunner | null>>({});
@@ -17,6 +18,10 @@ export function invalidateSpaceRunnerObservations(sid: string) {
   recordSpaceRunnerStamp(sid, nextSpaceRunnerStamp(), spaceRunnerExactPending(sid));
 }
 
+export function isSpaceRunnerAccessDenied(error: unknown) {
+  return error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found");
+}
+
 /** A guarded ack disproves the pre-write assignment, not the current one. */
 export function forgetDisprovedSpaceRunner(sid: string, previous: SpaceRunner | null, atDispatch: SpaceRunner | null | undefined) {
   const all = spaceRunners();
@@ -24,10 +29,15 @@ export function forgetDisprovedSpaceRunner(sid: string, previous: SpaceRunner | 
   if (current !== undefined && current !== previous && !(previous === null && current === atDispatch) &&
       !(current && previous?.assignmentRevision &&
       current.kind === previous.kind && current.assignmentRevision === previous.assignmentRevision)) return;
+  hideSpaceRunner(sid, nextSpaceRunnerStamp());
+}
+
+function hideSpaceRunner(sid: string, stamp: number) {
+  const all = spaceRunners();
   const next = { ...all };
   delete next[sid];
   batch(() => {
-    recordSpaceRunnerStamp(sid, nextSpaceRunnerStamp(), true);
+    recordSpaceRunnerStamp(sid, stamp, true);
     spaceRunners.set(next);
     setRunnerPaired(sid, null);
     // Hide a stale folder, but don't claim the Space is now empty or attachable.
@@ -43,6 +53,12 @@ export function beginSpaceRunnerObservation(sid: string) {
   return {
     isCurrent,
     hasNewer: () => !inScope() || hasNewerSpaceRunnerStamp(sid, stamp),
+    denyAccess() {
+      if (!isCurrent()) return false;
+      discardSpaceAccessProof(sid, stamp);
+      hideSpaceRunner(sid, stamp);
+      return true;
+    },
     publish(runner: SpaceRunner | null, allowFolderAdd = true, exact = true) {
       if (!isCurrent()) return false;
       recordSpaceRunnerStamp(sid, stamp);

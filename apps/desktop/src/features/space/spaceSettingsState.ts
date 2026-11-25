@@ -28,7 +28,7 @@ import {
 import type { AgentPatch, ModelSelection, SpaceAgent, SpaceDetails, SpacePrefs, SpacePrefsView } from "../../api/spaces";
 import { apiClient, closeSettings, describe, disconnect, isAborted, me, onManageOpen, onSessionEnd, onTransientClear, rememberMembers, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
 import { acknowledgeSpaceRunnerWrite, beginSpaceRunnerWrite, dismissReveal, revealDedicatedToken, revealed, spaceRunners } from "../../settings";
-import { beginSpaceRunnerObservation } from "../../spaceRunnerObservations";
+import { beginSpaceRunnerObservation, isSpaceRunnerAccessDenied } from "../../spaceRunnerObservations";
 import { spaceRunnerExactPending } from "../../spaceRunnerOrder";
 import { dismissRunnerOffer, installedRunnerChoice, snapshotInstalledRunner } from "../../runnersState";
 import { clearLocalToolsMessages, localToolsBusy } from "../localtools/localTools";
@@ -356,7 +356,9 @@ async function readRunner(api: Client, sid: string, exact: boolean): Promise<Run
   try {
     return { ...await api.getSpaceRunnerAssignment(sid), legacy: false };
   } catch (error) {
-    if (exact || !(error instanceof ApiError) || error.kind !== "not_found") throw error;
+    // A versioned response already proved this endpoint exists. Its denial
+    // must not be reinterpreted as support for an older, unguarded server.
+    if (exact || spaceRunners()[sid]?.assignmentRevision || !(error instanceof ApiError) || error.kind !== "not_found") throw error;
     // Older servers lack GET …/runner. Prove access before showing any
     // fallback from the Space record; a revoked membership also returns 404.
     const space = (await api.listSpaces()).find((s) => s.id === sid);
@@ -384,7 +386,10 @@ async function refreshAssignment(
     });
     return next;
   } catch (error) {
-    if (valid()) throw error;
+    if (valid()) {
+      if (isSpaceRunnerAccessDenied(error)) observation.denyAccess();
+      throw error;
+    }
     return undefined;
   }
 }

@@ -25,7 +25,7 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
     attachSpace: null as string | null,
     uncommittedAttach: null as { delay: number; commit: (() => void) | null } | null,
     runnerReadError: null as string | null,
-    runnerRead: null as { sid: string; delay: number; parked: boolean } | null,
+    runnerRead: null as { sid: string; delay: number; parked: boolean; errorStatus?: number } | null,
     detach: null as { sid: string; beforeCommit: boolean; delay: number; commit: (() => void) | null } | null,
   };
   const runnerStatus = () => ({
@@ -61,6 +61,7 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
     const read = gate.runnerRead;
     if (read && !read.parked && path === `/v1/spaces/${read.sid}/runner`) {
       read.parked = true;
+      if (read.errorStatus) return { status: read.errorStatus, body: {}, delay: read.delay };
       return { ...(result as object), delay: read.delay };
     }
     return result;
@@ -632,6 +633,35 @@ test("a held pre-create Space list cannot purge the successfully attached new Sp
   await app.waitFor(`id:space:${id}`, { state: "gone" });
 });
 
+test("a newer exact assignment read protects an existing Space from an older omission", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("solo", "Solo", "alice");
+  f.state.attached.set("solo", r.id);
+  const get = f.network[`GET ${BASE}/v1/*`]!;
+  let armed = false;
+  let parked = false;
+  f.network[`GET ${BASE}/v1/*`] = (req) => {
+    const response = get(req);
+    if (!armed || parked || new URL(req.url).pathname !== "/v1/spaces") return response;
+    parked = true;
+    const reply = response as { status: number; body: { spaces: { id: string }[] } };
+    return { ...reply, body: { ...reply.body, spaces: reply.body.spaces.filter((s) => s.id !== "solo") }, delay: 2400 };
+  };
+  const app = await launch(fixture(f, r.id), { manual: true });
+  await signIn(app);
+  await app.waitFor("id:space:solo");
+  armed = true;
+  await app.clock!.runFor(11_000);
+  await app.waitUntil(() => parked);
+  await app.press("id:space:solo");
+  await openSpaceRunner(app);
+  await app.waitFor("id:attached-runner");
+  await app.clock!.runFor(2400);
+  expect(app.shows("id:space:solo")).toBe(true);
+  expect(app.shows("id:attached-runner")).toBe(true);
+});
+
 test("the follow-up read also detects a newer assignment made outside this app", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");
@@ -925,7 +955,8 @@ test("an older folder snapshot preserves newer presence or absence for A and sti
 });
 
 test("a newer folder observation for A wins over a delayed reconciliation without confirming the old batch", async () => {
-  for (const oldMatch of [false, true]) {
+  for (const older of ["absent", "attached", "denied"]) {
+    const oldMatch = older === "attached";
     const f = world();
     f.addSpace("solo", "Solo", "alice");
     f.addSpace("marker", "Snapshot marker", "alice");
@@ -942,7 +973,7 @@ test("a newer folder observation for A wins over a delayed reconciliation withou
     await app.press("id:runner-attach-many");
     await app.waitUntil(() => f.state.attached.get("solo") === r.id);
     if (!oldMatch) f.state.attached.delete("solo");
-    const reconciliation = { sid: "solo", delay: 1000, parked: false };
+    const reconciliation = { sid: "solo", delay: 1000, parked: false, ...(older === "denied" ? { errorStatus: 403 } : {}) };
     t.gate.runnerRead = reconciliation;
     await app.clock!.runFor(500);
     await app.waitUntil(() => reconciliation.parked);

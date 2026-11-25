@@ -148,6 +148,54 @@ for (const variant of ["member", "unversioned"] as const) {
   });
 }
 
+for (const denial of [403, 404]) {
+  test(`fresh ${denial} clears only the denied Space’s cached folder evidence`, async () => {
+    const f = world();
+    const mine = f.addRunner("This PC", "personal", "alice");
+    f.addSpace("target", "Target", "alice");
+    f.addSpace("sibling", "Sibling", "alice");
+    f.state.attached.set("target", mine.id);
+    const original = f.network[`GET ${BASE}/v1/*`]!;
+    let targetStatus = 200;
+    let targetCalls = 0;
+    f.network[`GET ${BASE}/v1/*`] = (req) => {
+      if (new URL(req.url).pathname === "/v1/spaces/target/runner") {
+        targetCalls++;
+        if (targetStatus !== 200) return { status: targetStatus, body: {} };
+      }
+      return original(req);
+    };
+    const t = bridgeWithRunner(f, mine.id, "This PC");
+    const app = await openWith(f, t, true);
+    await signIn(app, "alice");
+    await app.press("id:space:target");
+    await openRunners(app);
+    await app.waitFor("id:installed-runner-folder:target");
+    await app.press("id:installed-runner-folder:target");
+    await app.waitFor("id:installed-runner-path:target");
+    await app.press("id:settings-close");
+
+    targetStatus = 503;
+    f.state.attached.set("sibling", mine.id);
+    await openRunners(app);
+    await app.waitFor("id:installed-runner-folder:sibling");
+    expect(app.shows("id:installed-runner-path:target")).toBe(true);
+    await app.press("id:installed-runner-folder:sibling");
+    await app.waitFor("id:installed-runner-path:sibling");
+    await app.press("id:settings-close");
+
+    targetStatus = denial;
+    const before = targetCalls;
+    await openRunners(app);
+    await app.waitUntil(() => targetCalls > before);
+    await app.waitFor("id:installed-runner-space:target", { state: "gone" });
+    expect(app.shows("id:installed-runner-path:target")).toBe(false);
+    expect(app.shows("id:installed-runner-path:sibling")).toBe(true);
+    expect(app.shows("id:runner-attach-pick:target")).toBe(false);
+    await app.waitFor("id:runner-state >> text:Runner not confirmed");
+  });
+}
+
 test("shows the installer's runner, read-only tools and how to attach; opening only reads", async () => {
   const f = world();
   f.addSpace("solo", "Solo", "alice");

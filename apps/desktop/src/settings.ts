@@ -55,7 +55,7 @@ import {
   spaces,
 } from "./store";
 import { forgetQuietly, localConnections, localStep, onLocalPairingChanged, packaged, refreshHelper } from "./device/state";
-import { beginSpaceRunnerObservation, forgetDisprovedSpaceRunner, invalidateSpaceRunnerObservations, spaceRunners } from "./spaceRunnerObservations";
+import { beginSpaceRunnerObservation, forgetDisprovedSpaceRunner, invalidateSpaceRunnerObservations, isSpaceRunnerAccessDenied, spaceRunners } from "./spaceRunnerObservations";
 export { spaceRunners } from "./spaceRunnerObservations";
 
 export type { Capability, CatalogProvider, ConnectionModel, DeviceStatus, ModelThinking, NewConnectionModel, ProviderConnection, RegisteredRunner, RunnerVisibility, SpaceRunner };
@@ -217,7 +217,12 @@ export async function confirmRunnerAction(action: "rotate" | "delete", runnerId:
   // Only Spaces this user belongs to can be checked; others may use an organization runner too.
   const checks = await Promise.allSettled(spaces().map(async (s) => {
     const observation = beginSpaceRunnerObservation(s.id);
-    return { space: s, observation, runner: await c.getSpaceRunner(s.id) };
+    try {
+      return { space: s, observation, runner: await c.getSpaceRunner(s.id) };
+    } catch (error) {
+      if (opened() && isSpaceRunnerAccessDenied(error)) observation.denyAccess();
+      throw error;
+    }
   }));
   if (!opened()) return;
   const complete = () => membership() === membershipAtRead &&
@@ -365,7 +370,10 @@ async function reconcileSpaceRunner(
   const currentScope = () => stillLatest() && spaces().some((s) => s.id === sid);
   if (!c || !currentScope()) return undefined;
   const observation = beginSpaceRunnerObservation(sid);
-  const current = await c.getSpaceRunner(sid);
+  const current = await c.getSpaceRunner(sid).catch((error: unknown) => {
+    if (currentScope() && isSpaceRunnerAccessDenied(error)) observation.denyAccess();
+    throw error;
+  });
   if (!currentScope() || !observation.publish(current, allowFolderAdd(current))) return undefined;
   return current;
 }

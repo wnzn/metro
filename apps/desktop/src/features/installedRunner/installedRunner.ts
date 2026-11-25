@@ -21,7 +21,7 @@
 
 import { batch, signal } from "nsh";
 import { BridgeError, scrub } from "../../device/bridge";
-import { beginSpaceRunnerObservation, onSpaceRunnerObserved } from "../../spaceRunnerObservations";
+import { beginSpaceRunnerObservation, isSpaceRunnerAccessDenied, onSpaceRunnerObserved } from "../../spaceRunnerObservations";
 import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, spaces } from "../../store";
 import { localRunnerCall } from "../localtools/localTools";
 
@@ -148,23 +148,29 @@ async function loadAttached(runnerId: string, valid: () => boolean): Promise<voi
     installedRunner()?.runner?.id === runnerId && ownedInstalledRunner()?.id === runnerId;
   if (!c || !stillScoped()) return;
   const owned = spaces().filter((s) => s.role === "owner" && SPACE_ID_RE.test(s.id));
-  const checks = await Promise.allSettled(owned.map(async ({ id }) => {
+  const checks = await Promise.all(owned.map(async ({ id }) => {
     const observation = beginSpaceRunnerObservation(id);
-    return { id, observation, runner: await c.getSpaceRunner(id) };
+    try {
+      return { id, observation, ok: true as const, runner: await c.getSpaceRunner(id) };
+    } catch (error) {
+      return { id, observation, ok: false as const, denied: isSpaceRunnerAccessDenied(error) };
+    }
   }));
   if (!stillScoped()) return;
   const stillOwned = new Set(spaces().filter((s) => s.role === "owner").map((s) => s.id));
   batch(() => {
     // Merge exact observations: an older answer for A doesn't discard
-    // fresh answers for B. A failed read isn't a detach.
-    for (const res of checks) {
-      if (res.status !== "fulfilled" || !stillOwned.has(res.value.id)) continue;
-      res.value.observation.publish(res.value.runner);
+    // fresh answers for B. Denial withdraws evidence, not the assignment;
+    // transient failures leave existing rows and paths alone.
+    for (const check of checks) {
+      if (!stillOwned.has(check.id)) continue;
+      if (check.ok) check.observation.publish(check.runner);
+      else if (check.denied) check.observation.denyAccess();
     }
     for (const { id } of runnerSpaces()) if (!stillOwned.has(id)) removeFolder(id);
     // Keep U5's complete-snapshot signal for the bounded refresh demand;
     // individual Space updates don't satisfy or restart that demand.
-    if (checks.every((res) => res.status === "fulfilled")) installedFolderSnapshot.set(++folderSnapshotSerial);
+    if (checks.every((check) => check.ok || check.denied)) installedFolderSnapshot.set(++folderSnapshotSerial);
   });
 }
 
@@ -319,21 +325,28 @@ export async function reconnectInstalledRunner(): Promise<void> {
 export async function showRunnerFolder(sid: string): Promise<void> {
   const call = localRunnerCall();
   if (!call || installedBusy() || !SPACE_ID_RE.test(sid)) return;
-  if (!runnerSpaces().some((s) => s.id === sid)) return;
+  const row = runnerSpaces().find((s) => s.id === sid);
+  if (!row) return;
   const valid = stillValid();
+  const stillRow = () => valid() && runnerSpaces().includes(row);
+  const observation = beginSpaceRunnerObservation(sid);
   installedBusy.set(`folder:${sid}`);
   installedError.set(null);
   installedNotice.set(null);
   try {
     const f = parseFolder(await call("POST", `/v1/local-tools/runner/spaces/${sid}/folder`), sid);
-    if (!valid()) return;
+    if (!stillRow()) return;
     if (!f.attached) {
       installedError.set("This Space no longer uses this computer's runner.");
       return;
     }
-    if (runnerSpaces().some((s) => s.id === sid)) folders.set({ ...folders(), [sid]: f });
+    folders.set({ ...folders(), [sid]: f });
   } catch (error) {
-    if (valid()) installedError.set(message(error, "Opening the Space's folder"));
+    if (stillRow()) {
+      if (error instanceof BridgeError && ((error.status === 403 && error.code === "not_owner") ||
+          (error.status === 404 && error.code === "not_found"))) observation.denyAccess();
+      installedError.set(message(error, "Opening the Space's folder"));
+    }
   } finally {
     if (valid()) installedBusy.set(null);
   }
