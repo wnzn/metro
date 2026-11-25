@@ -379,7 +379,11 @@ async fn events_carry_the_server_recorded_time_and_clients_cannot_set_it() {
 
     // Personal Chat events carry it too.
     let (status, mine) = s
-        .post(ALICE, "/v1/chat/messages", json!({"text": "note to self"}))
+        .post(
+            ALICE,
+            "/v1/chat/messages",
+            json!({"text": "note to self", "save_note": true}),
+        )
         .await;
     assert!(status.is_success(), "{mine}");
     let listed = s.events(ALICE, "/v1/chat/events").await;
@@ -497,7 +501,7 @@ async fn personal_chat_and_scheduled_turns_carry_their_times() {
         .post(
             ALICE,
             "/v1/chat/messages",
-            json!({"text": "remember the dentist"}),
+            json!({"text": "remember the dentist", "invoke_agent": false}),
         )
         .await;
     let (_, ask) = s
@@ -690,7 +694,7 @@ async fn a_device_connection_sees_the_same_times() {
         .post(
             ALICE,
             "/v1/chat/messages",
-            json!({"text": "plan for friday"}),
+            json!({"text": "plan for friday", "invoke_agent": false}),
         )
         .await;
     let from = ms_floor(Utc::now());

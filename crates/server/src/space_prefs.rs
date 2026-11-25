@@ -4,8 +4,7 @@
 //!   connection decide whether their unaddressed messages in this Space are
 //!   for one of its agents, and which. It can be turned on only while they
 //!   have a System One connection usable in this Space (otherwise 409).
-//!   Personal Chat keeps its own setting (`infer_addressing` in
-//!   `/v1/model-routing`).
+//!   Personal Chat sends directly, without classification.
 //! - `default_model`: the person's default chat model in this Space.
 //! - `agent_models`: per agent id, the person's default chat model for that
 //!   agent here.

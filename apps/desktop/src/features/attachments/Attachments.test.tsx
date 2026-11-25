@@ -83,7 +83,7 @@ test("Chat: a file-only message goes to my personal Library; the file opens in t
   await app.waitFor("id:attachments", { state: "gone" });
   expect(uploads(w)[0]!.url).toBe(`${BASE}/v1/library/assets?scope=personal&name=notes.txt`);
   const id = w.l.assets[0]!.id;
-  expect(posts(w).at(-1)!.body).toEqual({ text: "", invoke_agent: false, asset_ids: [id] });
+  expect(posts(w).at(-1)!.body).toEqual({ text: "", invoke_agent: true, asset_ids: [id] });
   const ev = lastFiles(w, "chat:alice");
   await app.waitFor(`id:file:${ev.id}:${id}`);
 
@@ -94,6 +94,67 @@ test("Chat: a file-only message goes to my personal Library; the file opens in t
   expect(read.headers["authorization"]).toBe(`Bearer ${TOKENS.alice}`);
   expect(read.url).not.toContain(TOKENS.alice!);
 });
+
+test("Chat: Save note with files posts only note intent, even with a literal @agent", async () => {
+  const w = attachmentWorld();
+  const app = await signIn(w);
+  await app.waitFor("id:chat-view");
+  app.onPick(() => [NOTE]);
+  await app.press("id:attach");
+  await app.waitFor("id:staged:notes.txt");
+  await app.type("id:composer", "@agent is literal");
+  await app.press("id:save-note");
+  await app.waitFor("id:attachments", { state: "gone" });
+  expect(posts(w).at(-1)!.body).toEqual({
+    text: "@agent is literal", save_note: true, asset_ids: [w.l.assets[0]!.id],
+  });
+  expect(w.f.state.events.get("chat:alice")).toMatchObject([{ kind: "message", audience: "room" }]);
+});
+
+for (const noteOnly of [true, false]) {
+  const action = noteOnly ? "Save note" : "Send";
+  const button = noteOnly ? "id:save-note" : "id:send";
+  test(`Chat: a failed upload tells you to retry ${action} and reuses the uploaded file`, async () => {
+    const w = attachmentWorld();
+    const app = await signIn(w);
+    await app.waitFor("id:chat-view");
+    app.onPick(() => [NOTE, PLAN]);
+    await app.press("id:attach");
+    await app.waitFor("id:staged:plan.md");
+    await app.type("id:composer", "@agent with two files");
+    w.knobs.failUploadOf = PLAN.name;
+    const messageAttempts = () => app.requests().filter(r => r.method === "POST" && r.url === `${BASE}/v1/chat/messages`);
+    const uploadNames = () => app.requests()
+      .filter(r => r.method === "POST" && new URL(r.url).pathname === "/v1/library/assets")
+      .map(r => new URL(r.url).searchParams.get("name"));
+
+    await app.press(button);
+    await app.waitFor(`id:action-error >> text:/${action} again to retry/`);
+    if (noteOnly) expect(app.shows("id:action-error >> text:/Send again|Return/")).toBe(false);
+    expect(messageAttempts()).toHaveLength(0);
+    expect(uploadNames()).toEqual([NOTE.name, PLAN.name]);
+    expect(app.value("id:composer")).toBe("@agent with two files");
+    expect(app.shows("id:staged:notes.txt >> text:/in the Library/")).toBe(true);
+    expect(app.shows("id:staged:plan.md")).toBe(true);
+    expect(w.l.assets).toHaveLength(1);
+    const savedId = w.l.assets[0]!.id;
+
+    w.knobs.failUploadOf = null;
+    await app.press(button);
+    await app.waitFor("id:attachments", { state: "gone" });
+    expect(uploadNames()).toEqual([NOTE.name, PLAN.name, PLAN.name]);
+    expect(messageAttempts()).toHaveLength(1);
+    expect(w.l.assets).toHaveLength(2);
+    expect(posts(w)[0]!.body).toEqual({
+      text: "@agent with two files",
+      ...(noteOnly ? { save_note: true } : { invoke_agent: true }),
+      asset_ids: [savedId, w.l.assets.find(a => a.name === PLAN.name)!.id],
+    });
+    expect(w.f.state.events.get("chat:alice")?.map(e => e.kind))
+      .toEqual(noteOnly ? ["message"] : ["message", "agent"]);
+    expect(app.value("id:composer")).toBe("");
+  });
+}
 
 test("Ask agent with files sends the typed question; the files are saved, the model gets text", async () => {
   const w = attachmentWorld();
@@ -143,6 +204,7 @@ test("a failed upload posts nothing and says how many files made it", async () =
   await app.press("id:send");
   await app.waitFor("id:action-error");
   expect(app.shows("text:/“plan.md” wasn't uploaded: it's over the size limit or the Library's quota. 1 of 2 files is in Acme's Library; nothing was sent/")).toBe(true);
+  expect(app.shows("id:action-error >> text:/Send again to retry/")).toBe(true);
   expect(posts(w).length).toBe(before);
   expect(app.value("id:composer")).toBe("two files");
   w.knobs.failUploadOf = null;

@@ -3,10 +3,9 @@
 // Model routing (GET/PUT /v1/model-routing) is the signed-in user's own:
 // - Use-case routing: when agent work starts for them, System One picks
 //   which of their usable chat connections answers.
-// - Opt-in classification: System One judges whether an unaddressed message
-//   of theirs asks the agent.
+// - Confidence for unaddressed messages in Spaces where classification is on.
 // - The embeddings connection search uses (and the classifier reranks with).
-// Both opt-ins are off by default. The page edits a draft and saves it whole.
+// The page edits a draft and saves it whole.
 //
 // Sharing (GET/PUT /v1/providers/{id}/sharing) is decided by a connection's
 // owner only. It grants use of the connection, never its key, sign-in or
@@ -71,6 +70,7 @@ export function shareOf(connectionId: string): ShareVisibility | null {
 export type DraftCase = { uid: string; key: string | null; label: string; description: string; connectionId: string | null };
 export type RoutingDraft = {
   enabled: boolean;
+  /** Retained only to round-trip legacy settings. */
   inferAddressing: boolean;
   classifierId: string | null;
   embeddingId: string | null;
@@ -155,10 +155,10 @@ export function finalize(d: RoutingDraft, usable: readonly AvailableModel[]): { 
   // Shown as percentages, as the page asks for them; the values stay 0 to 1.
   if (minRouteProbability === null) return { ok: false, error: "The routing confidence must be a whole number from 0 to 100%, such as 65%." };
   if (minDirectedness === null || minDirectedness < MIN_DIRECTEDNESS_FLOOR) {
-    return { ok: false, error: `The “asking the agent” confidence must be a whole number from ${Math.round(MIN_DIRECTEDNESS_FLOOR * 100)} to 100%, such as 85%.` };
+    return { ok: false, error: `Space classification confidence must be a whole number from ${Math.round(MIN_DIRECTEDNESS_FLOOR * 100)} to 100%, such as 85%.` };
   }
-  if ((d.enabled || d.inferAddressing) && !d.classifierId) {
-    return { ok: false, error: "Choose a System One classifier first: routing and classification both need one." };
+  if (d.enabled && !d.classifierId) {
+    return { ok: false, error: "Choose a System One classifier to use model routing." };
   }
   if (d.classifierId && !has(d.classifierId, "system_one")) return { ok: false, error: "The classifier you chose isn't available to you any more. Choose another one." };
   if (d.embeddingId && !has(d.embeddingId, "embeddings")) return { ok: false, error: "The embeddings model you chose isn't available to you any more. Choose another one." };
@@ -301,9 +301,9 @@ export async function saveRouting(): Promise<boolean> {
 }
 
 function savedText(r: ModelRouting): string {
-  const parts = [r.enabled ? `Use-case routing is on (${r.cases.length} use case${r.cases.length === 1 ? "" : "s"})` : "Use-case routing is off"];
-  parts.push(r.inferAddressing ? "unaddressed messages of yours are classified" : "unaddressed messages stay ordinary conversation");
-  return `Saved. ${parts.join("; ")}.`;
+  return r.enabled
+    ? `Saved. Use-case routing is on (${r.cases.length} use case${r.cases.length === 1 ? "" : "s"}).`
+    : "Saved. Use-case routing is off.";
 }
 
 // ------------------------------------------------------------------ sharing (owner only)

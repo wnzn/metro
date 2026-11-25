@@ -1,6 +1,6 @@
 // Settings › Model routing: which of the user's usable models answers which
-// kind of request (use-case routing), the opt-in that lets System One start
-// the agent from an unaddressed message of theirs, and the embeddings model
+// kind of request (use-case routing), confidence for Space classification,
+// and the embeddings model
 // search uses. Every picker offers only models of the right capability that
 // the user owns or that someone shared with them. The page says, from what
 // is chosen, which endpoint receives which text.
@@ -237,11 +237,11 @@ function ClassifierGroup(props: { draft: RoutingDraft }) {
   return (
     <SettingsGroup
       title="System One classifier"
-      description="Used by routing, the opt-in below and search. A chat model never stands in for it."
+      description="Used by routing, Space classification and search. A chat model never stands in for it."
       testID="routing-classifier-group"
     >
       <SectionMore testID="classifier-learn-more">
-        <FactList facts={[{ label: "Answers", value: "Typed questions: Noul, choice and score." }, { label: "Used by", value: "Use-case routing, the opt-in below, and search, which reranks with it." }]} />
+        <FactList facts={[{ label: "Answers", value: "Typed questions: Noul, choice and score." }, { label: "Used by", value: "Use-case routing, Space classification when enabled, and search, which reranks with it." }]} />
       </SectionMore>
       <SettingRow label="Classifier" stacked>
         <RoutingModelPicker
@@ -357,22 +357,7 @@ function CaseRow(props: { item: DraftCase; index: number }) {
 function AddressingGroup(props: { draft: RoutingDraft }) {
   const d = () => props.draft;
   return (
-    <SettingsGroup title="Start the agent without @agent (opt in)" testID="addressing-group">
-      <SectionMore testID="addressing-learn-more">
-        <FactList
-          facts={[
-            { label: "Recipients", value: "Explicit recipients always decide." },
-            { label: "@person only", value: "A message that mentions a person only (@bob) never starts the agent and is never classified." },
-            { label: "@agent", value: "@agent and Ask agent start it with no classification." },
-          ]}
-        />
-      </SectionMore>
-      <SettingRow
-        label="Classify my unaddressed messages"
-        description="Off by default. When on, each message you write that mentions nobody is sent to System One, in rooms and your Chat. A start it allows runs as you."
-      >
-        <Toggle testID="routing-infer" label="Classify my unaddressed messages" checked={d().inferAddressing} onChange={(on) => editRouting({ inferAddressing: on })} />
-      </SettingRow>
+    <SettingsGroup title="Space classification" description="Turn classification on or off in each Space's preferences. Personal Chat sends directly to your agent." testID="addressing-group">
       <SettingRow
         label="Minimum confidence"
         description={`${FLOOR_PERCENT} to 100%. Below it, the message stays ordinary conversation.`}
@@ -380,7 +365,7 @@ function AddressingGroup(props: { draft: RoutingDraft }) {
       >
         <PercentField
           testID="routing-min-directed"
-          accessibilityLabel="Minimum confidence that a message asks the agent"
+          accessibilityLabel="Minimum confidence for unaddressed Space messages"
           value={percentText(d().minDirectedness)}
           onChange={(v) => editRouting({ minDirectedness: fromPercent(v) })}
           error={percentError(percentText(d().minDirectedness), FLOOR_PERCENT)}
@@ -472,12 +457,10 @@ function DataFlow(props: { draft: RoutingDraft }) {
           { label: "Then", value: "The model it picks answers as usual" },
         ]}
       />
-      <FlowRow
-        label="Unaddressed messages"
-        on={d().inferAddressing}
-        off="Off: your unaddressed messages are ordinary conversation and are sent to no model."
+      <SettingRow
+        label="Space classification"
+        description="In Spaces where you turn it on, System One gets your new unaddressed messages and requests to the generic agent to choose an agent. This never applies to personal Chat."
         testID="dataflow-addressing"
-        facts={[{ label: "Sends", value: "Each message you write that mentions nobody and isn't sent with Ask agent" }, ...endpointFacts(classifier())]}
       />
       <FlowRow
         label="Search"

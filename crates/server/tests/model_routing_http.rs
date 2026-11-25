@@ -268,20 +268,40 @@ fn keys(body: &Value) -> Vec<String> {
 async fn malformed_response_from_the_real_typed_client_has_a_private_note() {
     let h = H::start().await;
     let classifier = h.connect("custom-systemone", "jev-1.14.0", true).await;
+    let (status, space) = h
+        .req(
+            reqwest::Method::POST,
+            "alice",
+            "/v1/spaces",
+            Some(json!({"name": "Classifier failures"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{space}");
+    let sid = space["id"].as_str().unwrap();
     let (status, settings) = h
         .req(
             reqwest::Method::PUT,
             "alice",
             "/v1/model-routing",
-            Some(json!({"infer_addressing": true, "classifier_id": classifier})),
+            Some(json!({"classifier_id": classifier})),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{settings}");
+    let (status, prefs) = h
+        .req(
+            reqwest::Method::PUT,
+            "alice",
+            &format!("/v1/spaces/{sid}/prefs"),
+            Some(json!({"classify_unaddressed": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{prefs}");
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
     let (status, sent) = h
         .req(
             reqwest::Method::POST,
             "alice",
-            "/v1/chat/messages",
+            &format!("{room}/messages"),
             Some(json!({"text": "[bad-answer]"})),
         )
         .await;
@@ -290,7 +310,20 @@ async fn malformed_response_from_the_real_typed_client_has_a_private_note() {
         sent["addressing_note"],
         json!({"kind": "classification_failed", "reason": "invalid_answer"})
     );
-    let events = h.events().await;
+    assert_eq!(
+        h.systemone_since(0).iter().map(keys).collect::<Vec<_>>(),
+        vec![vec!["agent"]]
+    );
+    let (status, transcript) = h
+        .req(
+            reqwest::Method::GET,
+            "alice",
+            &format!("{room}/events"),
+            None,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let events = transcript["events"].as_array().unwrap();
     assert_eq!(events.len(), 1);
     assert_eq!(events[0]["id"], sent["id"]);
     assert!(events[0].get("addressing_note").is_none());
@@ -319,14 +352,14 @@ async fn one_question_per_request_through_the_real_client() {
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
 
-    // Unaddressed and clearly for the agent: a lone Noul, then a lone Choice.
+    // A plain Chat send is direct: a single Choice for model routing.
     let (n, _) = h.counts();
     let e = h.say(json!({"text": "[yes] please fix my code"})).await;
     let (a, route) = h.answer_after(e).await;
     assert_eq!(a["text"], "answered by code-model", "{a}");
     assert_eq!(route["source"], "case");
     assert_eq!(route["case_key"], "code");
-    assert_eq!(route["addressed_by"], "classifier");
+    assert_eq!(route["addressed_by"], "explicit");
     assert_eq!(route["model_id"], "code-model");
     assert!(
         !route.to_string().contains(&h.fixture),
@@ -335,11 +368,11 @@ async fn one_question_per_request_through_the_real_client() {
     let calls = h.systemone_since(n);
     assert_eq!(
         calls.iter().map(keys).collect::<Vec<_>>(),
-        vec![vec!["directed"], vec!["use_case"]]
+        vec![vec!["use_case"]]
     );
     assert_eq!(calls[0]["model"], "jev-latest");
-    assert_eq!(calls[0]["questions"]["directed"]["type"], "noul");
-    let options: Vec<String> = calls[1]["questions"]["use_case"]["criteria"]
+    assert_eq!(calls[0]["questions"]["use_case"]["type"], "choice");
+    let options: Vec<String> = calls[0]["questions"]["use_case"]["criteria"]
         .as_object()
         .unwrap()
         .keys()
@@ -352,9 +385,11 @@ async fn one_question_per_request_through_the_real_client() {
         assert_eq!(state["message"], "[yes] please fix my code");
     }
 
-    // Not for the agent: exactly one Noul, no Choice, no chat call.
+    // Explicit notes ask neither System One nor the chat model.
     let (n, chats) = h.counts();
-    let e = h.say(json!({"text": "lunch at noon, code later"})).await;
+    let e = h
+        .say(json!({"text": "lunch at noon, code later", "invoke_agent": false}))
+        .await;
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         h.events()
@@ -362,14 +397,10 @@ async fn one_question_per_request_through_the_real_client() {
             .iter()
             .all(|x| x["id"].as_i64().unwrap() <= e)
     );
-    let calls = h.systemone_since(n);
-    assert_eq!(
-        calls.iter().map(keys).collect::<Vec<_>>(),
-        vec![vec!["directed"]]
-    );
+    assert!(h.systemone_since(n).is_empty());
     assert_eq!(h.counts().1, chats);
 
-    // Explicit agent turn: no Noul, a lone Choice.
+    // The legacy explicit @agent form still uses one routing Choice.
     let (n, _) = h.counts();
     let e = h.say(json!({"text": "@agent tighten this prose"})).await;
     let (a, route) = h.answer_after(e).await;
@@ -391,7 +422,7 @@ async fn one_question_per_request_through_the_real_client() {
     // A chosen model asks System One nothing.
     let (n, _) = h.counts();
     let e = h
-        .say(json!({"text": "@agent fix code", "provider_connection_id": writing}))
+        .say(json!({"text": "fix code", "provider_connection_id": writing}))
         .await;
     let (a, route) = h.answer_after(e).await;
     assert_eq!(a["text"], "answered by writing-model", "{a}");
@@ -422,14 +453,15 @@ async fn one_question_per_request_through_the_real_client() {
         "{a}"
     );
     assert_eq!(h.counts(), before, "no System One or chat call");
-    // And opted-in unaddressed text no longer wakes the agent at all.
+    // A direct send gets the same routing failure, not silence or fallback.
     let e = h.say(json!({"text": "[yes] fix my code"})).await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (a, _) = h.answer_after(e).await;
+    assert_eq!(a["kind"], "error", "{a}");
     assert!(
-        h.events()
-            .await
-            .iter()
-            .all(|x| x["id"].as_i64().unwrap() <= e)
+        a["text"]
+            .as_str()
+            .unwrap()
+            .contains("could not choose a model")
     );
     assert_eq!(h.counts(), before);
 
