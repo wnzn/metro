@@ -19,7 +19,7 @@ const space = (f: Server, name: string) => [...f.state.spaces.values()].find((s)
 const words = (app: App) => app.texts().join(" | ");
 
 function fixture(f: Server, runnerId: string | null, state = "online") {
-  const status = { runnerId, state, available: true, reads: 0, failReads: 0 };
+  const status = { runnerId, state, available: true, reads: 0, failReads: 0, delay: 0 };
   const b = fakeBridge(f);
   const network = { ...f.network, ...b.network } as Record<string, (req: Request) => unknown>;
   const bridgeGet = network[`GET ${BRIDGE}/v1/*`]!;
@@ -29,7 +29,7 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
     status.reads++;
     if (status.reads <= status.failReads) return { status: 503, body: {} };
     return {
-      status: 200,
+      status: 200, delay: status.delay,
       body: {
         requested: true, available: status.available, state: status.state,
         runner: status.runnerId && { id: status.runnerId, name: "This PC" },
@@ -483,11 +483,13 @@ test("only a recently verified online status offers existing Spaces; becoming of
   expect(creates(f)).toEqual([]);
 });
 
-test("Settings reopen refreshes the folder list after both a manual attach and detach", async () => {
+test("Settings reopen joins held Sidebar liveness and refreshes folders after manual attach and detach", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");
   f.addSpace("manual", "Manual", "alice");
-  const app = await launch(fixture(f, r.id), { manual: true });
+  f.addSpace("eligible", "Keeps the Sidebar offer eligible", "alice");
+  const t = fixture(f, r.id);
+  const app = await launch(t, { manual: true });
   await signIn(app);
   await app.waitFor(offer);
   await app.press("id:runner-offer-choose");
@@ -499,7 +501,17 @@ test("Settings reopen refreshes the folder list after both a manual attach and d
   await app.waitFor(`id:attach-runner:${r.id}`);
   await app.press(`id:attach-runner:${r.id}`);
   await app.waitFor("id:attached-runner");
-  await app.press("id:nav-settings");
+  t.status.delay = 800;
+  const reopenDuringLiveness = async () => {
+    const before = t.status.reads;
+    await app.clock!.runFor(5000);
+    expect(t.status.reads).toBe(before + 1);
+    await app.press("id:nav-settings");
+    await app.waitFor("id:runners-settings");
+    expect(t.status.reads).toBe(before + 1); // Settings joins; no second bridge request.
+    await app.clock!.runFor(800);
+  };
+  await reopenDuringLiveness();
   await app.waitFor("id:installed-runner-space:manual");
   await app.press("id:settings-close");
   await app.press("id:detach-runner");
@@ -507,7 +519,7 @@ test("Settings reopen refreshes the folder list after both a manual attach and d
   await app.waitFor(`id:attach-runner:${r.id}`);
   const folderReads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/spaces/manual/runner").length;
   const before = folderReads();
-  await app.press("id:nav-settings");
+  await reopenDuringLiveness();
   await app.waitUntil(() => folderReads() > before);
   await app.waitUntil(() => !app.shows("id:installed-runner-space:manual"));
   expect(app.shows("id:runner-attach-pick:manual")).toBe(true);
