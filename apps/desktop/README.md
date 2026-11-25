@@ -1,7 +1,7 @@
 # Metro desktop
 
-For changes since the published 0.4.0 app, see
-[In the source, not released](../../docs/next-source.md).
+See [New in Metro 0.5.0](../../docs/released-0.5.0.md) for the published
+features or [In the source, not released](../../docs/next-source.md) for later work.
 
 The Metro desktop client, written in TSX on [Native Shell (NSH)](https://nsh.dev).
 NSH renders it with each platform's own views: GTK 4 on Linux, AppKit on macOS,
@@ -11,10 +11,10 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
 
 Download the build for your system from
 [Releases](https://github.com/wnzn/metro/releases). The latest is
-[Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0)
-([what was checked](../../docs/acceptance.md#published-metro-040-2026-11-25-github-release-v040)).
-Everything this README describes on `main` at `1a743e5` is in 0.4.0; the
-local checks it cites ran on local builds, not on the release files. You never need NSH, a
+[Metro 0.5.0](https://github.com/wnzn/metro/releases/tag/v0.5.0)
+([what was checked](../../docs/acceptance.md#published-metro-050-2026-11-25-github-release-v050)).
+Local checks cited here ran on local builds, not on the release files.
+You never need NSH, a
 checkout or a terminal to use the app; the build commands further down are
 for contributors.
 
@@ -27,7 +27,7 @@ for contributors.
   Metro and its icon to your applications menu, and `./install-desktop
   --uninstall` removes them without touching your Metro data. Run it again
   if you move the folder. A local test archive of that source passed this
-  check, and the 0.3.2 and 0.4.0 Linux archives contain `install-desktop`.
+  check; the 0.5.0 Linux archive contains `install-desktop`.
 - **Windows x64:** `Metro-<version>-windows-x64.zip`, a portable ZIP. See
   [Windows portable package](#windows-portable-package).
 
@@ -40,7 +40,7 @@ download, add a menu entry and optionally install Linux libraries, are
 described in [docs/install.md](../../docs/install.md). The Linux installer
 passed in a local test cut on Debian 13 and CachyOS
 ([acceptance](../../docs/acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)). They're published
-with each release since 0.3.2 (0.4.0 included) and listed in its signed `SHA256SUMS`; the scripts themselves
+with each release since 0.3.2 and listed in its signed `SHA256SUMS`; the scripts themselves
 aren't code-signed, and the Windows one hasn't been run in a recorded test. There's no
 Mac build or download for now: CI doesn't build macOS. The macOS installer
 script stays in the repository, untested, for when Mac builds return.
@@ -116,7 +116,7 @@ These were checked in a packaged Linux UI-validation build, with no CLI,
 separate runner or real vendor
 ([acceptance](../../docs/acceptance.md)):
 
-- **Device connection in the app:** **Settings → Model providers →
+- **Device connection in the app:** **Settings → Model connections →
   Connect this device** asked for consent before pairing, and no device
   token was ever shown or entered. A test endpoint offered two models, and
   only the approved one was listed by **Test connection** and used. The
@@ -134,8 +134,9 @@ Checked by tests:
 
 ### Local tools on this computer
 
-In the app's own local workspace, a Space's owner can open **Manage → Local
-tools on this computer → Turn on local tools**. The agents in that Space can
+In the app's own local workspace, a Space's owner can open **Space settings →
+Runner → Advanced: dedicated token and local tools** and turn on local
+tools. The agents in that Space can
 then list and read files (`workspace.list` and `workspace.read`) in one
 private folder on this computer, per Space, while Metro is open.
 
@@ -157,8 +158,8 @@ They never stand in for each other.
 | --- | --- | --- | --- |
 | What it is | Per-Space pairing in **Use locally** | A real registered personal runner, run by the app | `metro-runner`, installed separately (binary or image) |
 | Server | This app's own local workspace | This app's own local workspace | Any Metro server, local or remote |
-| Who turns it on | The Space owner, under **Manage** | The desktop installer (on by default; `--no-local-runner` leaves it off) | Its operator |
-| Attached to Spaces | That one Space | None until the owner attaches it under **Manage**, like any runner | As its owner or the Space owners choose |
+| Who turns it on | The Space owner, under **Space settings → Runner** | The desktop installer (on by default; `--no-local-runner` leaves it off) | Its operator |
+| Attached to Spaces | That one Space | Only the Spaces the owner [explicitly chooses](../../docs/released-0.5.0.md#this-computers-runner) | As its owner or the Space owners choose |
 | Tools | List and read | List and read | List and read; check and MCP when configured ([runners.md](../../docs/runners.md)) |
 | Runs while | Metro is open | Metro is open and signed in to its local workspace | Its process or container runs |
 
@@ -232,8 +233,9 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   `127.0.0.0/8`, `::1`). Remote servers need `https://`, so a token never
   crosses a network in clear text. Redirects are refused.
 - **Chat:** your personal thread with the agent, outside every Space. Only
-  you see it. Its agent can't see your Spaces, and its only tool is
-  acknowledging with a reaction. Next to it, the Chat shows active and recent
+  you see it. Its agent can't see your Spaces. It can acknowledge with a
+  reaction, and web tools require a separate [opt-in](../../docs/web-search.md).
+  Next to it, the Chat shows active and recent
   **agent runs** in your Spaces (in a side panel at 1100 points and wider,
   or in a dialog when narrower; the icon-only panel button at the end of the
   Chat's header, or <kbd>Ctrl</kbd>/<kbd>⌘</kbd>+<kbd>Shift</kbd>+<kbd>B</kbd>,
@@ -244,20 +246,10 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   agent** ("To: agent in Acme › #lobby"). Follow up opens the same form, and
   Close folds it while keeping your draft. This is separate from
   **Scheduled tasks › New task**, which creates a schedule.
-- **Asking in Chat** (released in 0.3.2; checked natively in a
-  Linux test archive, [acceptance](../../docs/acceptance.md#staged-composer-models-and-ask-from-personal-chat-at-28ba4e2-2026-11-23-project-manager-local)):
-  - When a chat model is ready for your Chat and you haven't set up System
-    One, a typed message shows **Ask agent ↵** as the primary action, and
-    **Return** asks the agent.
-  - **Save note** beside it saves the text without asking the agent and
-    without calling any model.
-  - Files sent with no text are only saved to your Library, never sent to
-    the agent. With text, **Ask agent** asks about the text; attached files
-    still go to the Library, not to the model.
-  - If no chat model is ready, or System One is set up, Return sends
-    ordinary text as a note, and **Ask agent** (or `@agent`) asks. The
-    choice is made when you start typing, so a list that finishes loading
-    while you write never changes what Return does.
+- **Asking in Chat:** **Send** or **Return** asks the agent directly, even
+  with only attachments. **Save note** doesn't start a run, including
+  when the text mentions `@agent`. Attached files go to your Library,
+  not to the model. See [Personal Chat](../../docs/released-0.5.0.md#personal-chat).
 - **Model for agent turns** (released in 0.3.2): the **Model**
   button in the composer picks the model, and where supported the
   **Thinking level**, for agent turns you start in that place: your Chat,
@@ -269,12 +261,12 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   - Thinking levels show only for models Metro knows exactly: Sign in with
     ChatGPT, and OpenAI or Anthropic API keys on their standard endpoints.
     **Provider default** sends no level.
-  - The choice applies only to messages to the agent (**Ask agent**,
-    `@agent`). Notes, files and people-only messages never call a model.
+  - The choice applies only to messages to the agent. Notes and people-only
+    Space messages don't start a run.
   - The server checks the choice when you send and again when the run
     starts. If it's no longer allowed or available, that turn fails with an
     error; it never falls back to another model.
-  - With no chat models at all, the picker offers **Model providers** to
+  - With no chat models at all, the picker offers **Model connections** to
     set one up. **Fetch models from …** asks your own server-stored
     connection for its list.
   - Since `93d7968` (checked in the native GTK app on Debian 13 in the
@@ -322,9 +314,7 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   acknowledgement is labelled "agent", and screen readers hear who reacted.
   Reactions are folded from `reaction` events and are never shown as
   transcript lines.
-- **Test runner** (every member, in Space settings › **Members and runner**,
-  which shows every member the runner's status; owners also have it next to
-  the runner's status under **Manage**; not in the room header):
+- **Test runner** (every member, in **Space settings → Runner**):
   lists the workspace on this Space's runner; no model is used. It runs the
   deterministic `workspace.list` and posts the listing in the room you have
   open in that Space. It is offered only while the Space has a runner
@@ -414,8 +404,7 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   and widest, and <kbd>Return</kbd> restores the default. Dragging the
   sidebar well below its narrowest width collapses it to the icon rail. Each
   width is remembered on this device, like the collapsed state.
-- **Space settings** (released in 0.4.0; covered by automated
-  tests): every member opens a Space's settings from the cog
+- **Space settings:** every member opens a Space's settings from the cog
   in the room's header, from the **⋯** that shows when hovering the Space in
   the sidebar (**Space settings**, **Agents**, **Your preferences**), or with
   a secondary click on its tile in the icon rail. **General** renames and
@@ -426,9 +415,9 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   are only yours: classification of your own unaddressed messages there,
   model routing on or off there, and your default model in the Space and per
   agent, each with its thinking level when the model offers levels.
-  **Members and runner** shows every member the runner's status and, while
-  a runner is attached, **Test runner**; only the owner also gets **Open**
-  to manage members and the runner.
+  **Members** shows the roster, and **Runner** shows the assignment and
+  **Test runner**. Only the owner manages members and the assignment.
+  See [Space settings](../../docs/released-0.5.0.md#space-settings).
 
 Chat, Search, Library and Scheduled tasks are your own pages, outside every
 Space, and work with or without any Space. The entries above describe the
@@ -447,12 +436,10 @@ composer hint stays clear of **Ask agent** and **Send**. In a room at 720
 points it wraps to two lines and ends with an ellipsis, and its accessible
 label keeps the full wording. The account menu's items and the Ctrl/⌘+K shortcut are covered
 by automated tests. Windows and macOS weren't checked.
-- **Manage (owners only):** list, add, and remove members. Pick which runner
-  serves the Space: attach one of your personal runners or an organization
-  runner from the same list as Settings › Runners, or detach it. A Space that
-  still has a dedicated (single-Space) token can rotate or revoke it, and an
-  owner can still issue one on purpose. A Space uses at most one runner, so
-  attaching needs the dedicated token revoked first.
+- **Manage** opens **Space settings → Members**. To change assignments,
+  use the [guarded Runner page](../../docs/released-0.5.0.md#guarded-runner-changes);
+  only the Space owner can attach or detach a runner or manage a
+  dedicated token.
 - **Settings** (sidebar, available with or without any Space):
   - **Profile:** edit your display name, bio and picture, and copy your
     stable User ID.
@@ -468,7 +455,7 @@ by automated tests. Windows and macOS weren't checked.
     No command or template contains the token. Rotate and delete are offered
     only to whoever manages the runner (its owner, or org admins). Both are
     confirmed first, with the Spaces you can see that use the runner.
-  - **Model providers:** the providers come from the server's
+  - **Model connections:** the providers come from the server's
     `/v1/provider-catalog`, grouped by vendor in a searchable dropdown.
     **On this device** connections run inside the packaged app: **Connect
     this device** pairs it without showing a token, and **Manage
@@ -506,15 +493,15 @@ by automated tests. Windows and macOS weren't checked.
     media**: **Index and search with** picks your media model (only
     media-capable connections), and **Where your files go** says what Index
     and search send, and to whom.
-  - **Model routing:** all off by default, and only ever about messages you
-    write. Pick a **System One classifier**, an **embeddings model** for
+  - **Model choices:** use-case routing is off by default and only applies
+    to your own runs. Pick a **System One** connection, an **embeddings model** for
     search, and a **fallback answer model**. Each picker offers only models of
     its capability that you own or that are shared with you, grouped by whose
     they are; one with no model, or a preset you can't run yet, can't be
     picked. **Use-case routing** has editable named use cases (name,
     description, answering chat model, up to 16) and a minimum confidence.
-    **Classify my unaddressed messages** is a separate opt-in with its own
-    threshold (0.5 to 1). **Where your text goes** says, from what is chosen,
+    Addressing classification is a separate opt-in in each Space's
+    **Your preferences**. **Where your text goes** says, from what is chosen,
     which endpoint receives which text, whose it is, and what is never sent.
     The page saves the whole draft at once; leaving it drops unsaved edits.
   - **Monitoring:** choose one source: **This computer** when the helper
@@ -576,8 +563,8 @@ contributors only, in
   you approved on that computer, as the device reported them while online
   (not checked against the vendor; use **Test connection** for that). So
   approve the model under **Approved models → Change…** and keep Metro open
-  so the device is online. A connection someone shared with you offers
-  only its one saved model. For your own server-stored connection, **Fetch
+  so the device is online. A shared connection offers the models its
+  owner left enabled and available. For your own server-stored connection, **Fetch
   models from …** in the picker asks the vendor for a fresh list.
 - **A runner is attached, but tools never run.** *Attached* only means the
   Space's jobs go to that runner, not that it's online. A runner connects
@@ -629,8 +616,8 @@ contributors only, in
 
 ## Windows portable package
 
-The release file is `Metro-<version>-windows-x64.zip` (for 0.4.0,
-`Metro-0.4.0-windows-x64.zip`), a portable build with no installer.
+The release file is `Metro-0.5.0-windows-x64.zip`, a portable build with
+no installer.
 Release ZIPs ship without an Authenticode signature for now
 ([install.md](../../docs/install.md#desktop-on-windows)). No native Windows
 GUI check by a person is recorded. Earlier

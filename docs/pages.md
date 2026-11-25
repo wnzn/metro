@@ -1,7 +1,8 @@
 # Pages and Daily briefs
 
-> **In the source, not released.** This describes [the source preview](next-source.md),
-> not Metro 0.4.0. Pages need a desktop app and server that include them.
+> **Released in Metro 0.5.0.** Use matching desktop and server releases.
+> Later [Pages 0.5.1 work](next-source.md#pages-051-work) is in the source,
+> not released.
 
 **Pages** in the sidebar holds personal dashboards and dashboards for
 Spaces you belong to. **New page** can start from a template or a prompt.

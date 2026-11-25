@@ -1,22 +1,14 @@
 # Settings: model connections, appearance and org admins
 
-This guide uses the published 0.4.0 Settings. For the reorganized
-[Settings pages](next-source.md#settings), [Web search and privacy](web-search.md)
-and [About & updates](updates.md), see the source-only guides. They don't
-describe the 0.4.0 app.
+In 0.5.0, **Settings** opens over the app and groups its pages as follows:
 
-In 0.4.0, **Settings** opens over the app, with six sections in this order:
-
-| Section | What it's for |
+| Group | Pages |
 | --- | --- |
-| **Profile** | Your picture, display name and bio, and your **User ID**; see [spaces.md](spaces.md#profiles) |
-| **Runners** | Your registered runners; see [runners.md](runners.md) |
-| **Model providers** | Your model connections, described on this page |
-| **Model routing** | Opt-in use-case routing and personal Chat classification (Spaces have their own opt-in, in each Space's settings); see [system-one.md](system-one.md#how-a-message-reaches-the-agent) |
-| **Monitoring** | Recent events from one source at a time: this computer's helper, My Chat, one owned Space, or the server for org admins |
-| **Appearance** | Color scheme, [below](#appearance) |
+| **You** | [Profile](spaces.md#profiles), Model connections, [Model choices](system-one.md#use-case-routing), [Runners](runners.md) |
+| **This computer** | [Web search](web-search.md), [Appearance](#appearance) |
+| **Metro** | [Monitoring](spaces.md#monitoring-events), [About & updates](updates.md) |
 
-Open **Settings** from the sidebar. **Model providers** also holds
+Open **Settings** from the sidebar. **Model connections** also holds
 **Documents & media**, where you choose the media model that indexes and
 searches your files ([library.md](library.md#in-the-desktop-app)). That
 choice was checked in a native Linux GTK run, in dark and light themes, of the source after 0.2.0 (before 0.3.2; not of the release files). Your account is in the sidebar's account row.
@@ -30,7 +22,7 @@ the sidebar hides completely.
 
 This page also covers the server settings that operators set behind them.
 
-## Adding a connection in Settings → Model providers
+## Adding a connection in Settings → Model connections
 
 As seen in the 0.2.0 Linux candidate:
 
@@ -98,7 +90,7 @@ before it can be the default.
   that capability (with a model) the default. You can change the default at
   any time.
 - **When nothing can answer** (no chat connection of your own, none shared
-  with you, and no operator model), the desktop's **Model providers** page
+  with you, and no operator model), the desktop's **Model connections** page
   shows an *Add a model to start chatting* card with the ways this server
   offers.
 - **Per-message choice.** In the 0.2.0 release this exists only in personal
@@ -296,7 +288,7 @@ agent loop, on the Space's runner as usual, and never on your device.
 
 ### Create the connection and its device token
 
-In **Settings → Model providers**, add a connection with a way to connect
+In **Settings → Model connections**, add a connection with a way to connect
 that runs on your device (a `device-*` provider). In the packaged app,
 click **Connect this device**; the app pairs itself and never shows you the
 token. Development builds without the launcher instead offer **New device
@@ -538,6 +530,9 @@ enter once.
   entry of the operator's `METRO_PROVIDER_ALLOWED_BASE_URLS`. Requests never
   follow redirects. That's how a self-hosted OpenAI-compatible endpoint is
   allowed.
+- On supported server-stored connections, the owner can
+  [test and change the endpoint](released-0.5.0.md#settings). The test
+  sends any configured API key to the approved candidate before saving.
 - `POST /v1/providers/{id}/models` asks that connection's provider (or your
   connector, for a device connection) for its current models. The list comes
   back sorted, without duplicates, and capped at 1000 ids. For a chat
@@ -601,12 +596,12 @@ is its default model and is always one of its enabled models.
 | `DELETE /v1/providers/{id}/model-list?model_id=ID` | Remove a model (not the default model) |
 | `POST /v1/providers/{id}/model-list/refresh` | The same as `POST /v1/providers/{id}/models` |
 
-In the desktop app, **Model providers** groups your connections by
+In the desktop app, **Model connections** groups your connections by
 capability (Chat, System One, Embeddings) in compact rows. A connection's
 details page has its **Models** (switches, names, **Make default**,
 **Refresh models**, **Add model** with thinking levels and wire for
 self-hosted endpoints), and its device, key, sharing and delete controls.
-The composer and **Model routing** use one searchable model picker, grouped
+The composer and **Model choices** use one searchable model picker, grouped
 by provider, that shows each model's name with its id, whose connection it
 is, and the **Server model (operator)** when it applies.
 

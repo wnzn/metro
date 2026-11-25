@@ -1,7 +1,6 @@
 # Web search and privacy
 
-> **In the source, not released.** This describes [the source preview](next-source.md),
-> not the Metro 0.4.0 app or server.
+> **Released in Metro 0.5.0.** Use matching desktop and server releases.
 
 **Settings → Web search** shows whether your computer is ready, lets you
 turn web search off, and lets you enable, reorder, test, or add keys to
@@ -119,8 +118,8 @@ The activity text is subject to the server's event length limit.
 Space members who can read the room can see the activity; Personal
 Chat activity is private to that account in the app.
 
-In the source, not released, the desktop uses [neutral Web Activity
-labels](next-source.md#page-consent-and-web-activity). **Saved key** and
+The desktop uses [neutral Web Activity
+labels](released-0.5.0.md#page-consent-and-web-activity). **Saved key** and
 **no key** describe how an attempt was made, not what the provider charges
 or which limits apply.
 
