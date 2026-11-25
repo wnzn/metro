@@ -166,13 +166,23 @@ const OFF_PREAMBLE: &str = "You are Metro, the user's own assistant in their pri
 this user sees this Chat. You have no access to the user's Spaces from here; they can turn it on in \
 Settings → Metro in Chat. Answer concisely; Markdown is fine.";
 
+/// [`OFF_PREAMBLE`] without web tools either.
+const NO_TOOLS_PREAMBLE: &str = "You are Metro, the user's own assistant in their private personal \
+Chat. Only this user sees this Chat. You have no tools and no access to the user's Spaces from here; \
+they can turn Space access on in Settings → Metro in Chat. Answer concisely; Markdown is fine.";
+
 const WEB_LINE: &str = "The user turned on web search for this Chat, so you may search the web and read \
 web pages for them.";
 
 /// The personal Chat preamble: with the Space tools when `spaces`, and the
 /// web line when the person turned web tools on.
 pub fn chat_preamble(spaces: bool, web: bool) -> String {
-    let mut out = if spaces { PREAMBLE } else { OFF_PREAMBLE }.to_owned();
+    let base = match (spaces, web) {
+        (true, _) => PREAMBLE,
+        (false, true) => OFF_PREAMBLE,
+        (false, false) => NO_TOOLS_PREAMBLE,
+    };
+    let mut out = base.to_owned();
     if web {
         out.push_str("\n\n");
         out.push_str(WEB_LINE);
