@@ -4,7 +4,10 @@ FROM rust-base AS build
 WORKDIR /build
 COPY Cargo.toml Cargo.lock ./
 COPY crates/ ./crates/
-RUN cargo build --locked --release --bin metro-server --bin metro-runner
+# `release` only from the official release image build; anything else is a
+# source build that never checks for or offers updates (metro-release).
+ARG METRO_RELEASE_CHANNEL=
+RUN METRO_RELEASE_CHANNEL="$METRO_RELEASE_CHANNEL" cargo build --locked --release --bin metro-server --bin metro-runner
 
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc AS runtime
 COPY --from=rust-base /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/ca-certificates.crt
@@ -41,5 +44,6 @@ USER ${RUNNER_UID}:${RUNNER_GID}
 WORKDIR /workspace
 ENV HOME=/home/metro \
     METRO_WORKSPACE=/workspace \
-    METRO_SANDBOX=none
+    METRO_SANDBOX=none \
+    METRO_RUNNER_PACKAGING=container
 ENTRYPOINT ["/usr/local/bin/metro-runner"]

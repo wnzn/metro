@@ -36,6 +36,8 @@
     usersCard: $("users-card"), usersUpdated: $("users-updated"), refresh: $("refresh"),
     usersError: $("users-error"), usersEmpty: $("users-empty"), usersLoading: $("users-loading"),
     usersTable: $("users-table"), usersBody: $("users-body"),
+    updateNotice: $("update-notice"), updateCurrent: $("update-current"), updateLatest: $("update-latest"),
+    updateImage: $("update-image"), updateLink: $("update-link"),
     announce: $("announce"),
     confirm: $("confirm"), confirmTitle: $("confirm-title"), confirmBody: $("confirm-body"),
     confirmOk: $("confirm-ok"), confirmCancel: $("confirm-cancel"),
@@ -340,6 +342,7 @@
       el.panel.hidden = false;
       announce("Signed in. Loading managed users.");
       el.addName.focus();
+      loadUpdateNotice(s);
       await loadUsers();
     } catch (e) {
       if (e instanceof SessionGone) return;
@@ -372,6 +375,7 @@
     el.whoName.textContent = "";
     el.whoId.textContent = "";
     el.panel.hidden = true;
+    el.updateNotice.hidden = true;
     el.sessionBar.hidden = true;
     if (el.confirm.open) el.confirm.close("cancel");
   }
@@ -387,6 +391,29 @@
     }
     if (message) showAlert(el.signinError, message); else hideAlert(el.signinError);
     el.token.focus();
+  }
+
+  // ---------------------------------------------------------------- updates
+
+  // Operator notice from the server's own verified daily release check.
+  // Optional: an older server (404) or an error just shows nothing.
+  async function loadUpdateNotice(s) {
+    try {
+      const u = await api("GET", "/v1/server/update");
+      if (session !== s) return;
+      el.updateNotice.hidden = true;
+      if (!u || u.available !== true || u.latest?.historical !== false) return;
+      const version = String(u.latest.version || "");
+      if (!/^[0-9]+\.[0-9]+\.[0-9]+$/.test(version)) return;
+      el.updateCurrent.textContent = String(u.current || "");
+      el.updateLatest.textContent = version;
+      el.updateImage.textContent = String((u.latest.images && u.latest.images.server) || "");
+      // Built from a constant and the checked version, never from a server URL.
+      el.updateLink.href = "https://github.com/wnzn/metro/releases/tag/v" + version;
+      el.updateNotice.hidden = false;
+    } catch (e) {
+      // No notice; never end the session for this optional call.
+    }
   }
 
   // ---------------------------------------------------------------- users

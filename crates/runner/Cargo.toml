@@ -15,7 +15,13 @@ path = "src/main.rs"
 name = "metro_runner"
 path = "src/lib.rs"
 
+[features]
+# tests/e2e/updates.py only: see metro_release::e2e. Never in a release build.
+e2e-test-release = ["metro-release/e2e"]
+
 [dependencies]
+# Self-update: verifies a release itself (Sigstore + SHA256SUMS + RELEASE.json).
+metro-release = { path = "../release", features = ["blocking"] }
 metro-url-policy = { path = "../url-policy" }
 libc = "0.2.180"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -23,4 +29,5 @@ serde_json = "1.0.150"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
+metro-release = { path = "../release", features = ["blocking", "testing"] }
 tempfile = "3.27.0"

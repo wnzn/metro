@@ -4,6 +4,7 @@ members = [
     "crates/connector",
     "crates/desktop",
     "crates/model-protocol",
+    "crates/release",
     "crates/runner",
     "crates/server",
     "crates/tui",

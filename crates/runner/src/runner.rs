@@ -63,6 +63,10 @@ pub struct Runner {
     pub poll_interval: Duration,
     pub error_backoff: Backoff,
     pub result_backoff: Backoff,
+    /// Version reporting and the opt-in self-update.
+    pub updates: crate::update::SelfUpdate,
+    /// A version the server asked for on the last claim.
+    pub update_request: Option<String>,
 }
 
 /// Outcome of a single loop iteration, for tests and logging.
@@ -104,13 +108,27 @@ impl Runner {
             poll_interval,
             error_backoff: Backoff::new(Duration::from_millis(500), Duration::from_secs(60)),
             result_backoff: Backoff::new(Duration::from_millis(250), Duration::from_secs(30)),
+            updates: crate::update::SelfUpdate::report_only(crate::update::InstallKind::Unmanaged),
+            update_request: None,
         }
+    }
+
+    /// Set how this runner reports itself and whether it may self-update.
+    pub fn with_updates(mut self, updates: crate::update::SelfUpdate) -> Self {
+        self.updates = updates;
+        self
     }
 
     /// Run until shutdown is requested.
     pub fn run(&mut self) {
         while !crate::shutdown_requested() {
-            match self.step() {
+            let step = self.step();
+            // Between jobs only: the loop runs one job at a time, so nothing
+            // is in flight here. On success this process is replaced.
+            if let Some(version) = self.update_request.take() {
+                self.updates.on_request(&version);
+            }
+            match step {
                 Step::Idle => {
                     sleep_interruptible(self.poll_interval);
                 }
@@ -125,7 +143,15 @@ impl Runner {
     }
 
     pub fn step(&mut self) -> Step {
-        let (id, result) = match self.client.claim() {
+        let claimed = self
+            .client
+            .claim_with(&self.updates.body())
+            .map(|(claim, update)| {
+                self.updates.claim_succeeded();
+                self.update_request = update;
+                claim
+            });
+        let (id, result) = match claimed {
             Ok(Claim::Idle) => {
                 self.error_backoff.reset();
                 return Step::Idle;

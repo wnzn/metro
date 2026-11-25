@@ -93,6 +93,23 @@ def matches_conjunction(expression, context):
     return all(matches(term) for term in expression.split("&&"))
 
 
+class E2eTestHooksNeverShipTests(unittest.TestCase):
+    """metro-server/metro-runner `e2e-test-release` (tests/e2e/updates.py) loads
+    a loopback release source and the test verifier. No build path that makes
+    shipped binaries may enable it (metro-release also refuses to compile it
+    with METRO_RELEASE_CHANNEL=release)."""
+
+    def test_no_release_build_enables_the_e2e_feature(self):
+        paths = sorted(WF.glob("*.yml")) + [ROOT / "Dockerfile", ROOT / "packaging/Dockerfile.build"]
+        paths += sorted((ROOT / "packaging").glob("*.py")) + sorted((ROOT / "packaging").glob("*.sh"))
+        for path in paths:
+            if path.name == Path(__file__).name or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            for needle in ("e2e-test-release", "metro-release/e2e", "--all-features"):
+                self.assertNotIn(needle, text, f"{path.name} mentions {needle}")
+
+
 @unittest.skipIf(yaml is None and not os.environ.get("CI"), "PyYAML is not installed (CI installs python3-yaml)")
 class ReleaseWorkflowTests(unittest.TestCase):
     @classmethod
@@ -320,6 +337,45 @@ class ReleaseWorkflowTests(unittest.TestCase):
         # The only secrets any workflow reads are none at all (signing uses OIDC and the workflow token).
         for path in sorted(WF.glob("*.yml")):
             self.assertEqual(re.findall(r"secrets\.([A-Z0-9_]+)", path.read_text()), [], path.name)
+
+    def test_only_official_release_builds_are_stamped_for_updates(self):
+        """METRO_RELEASE_CHANNEL=release (update checks) only on official releases.
+
+        release.yml stamps its three binary builds from inputs.release, which
+        ci.yml sets only on the release job; the PR package smoke calls it
+        with release: false. release-images.yml stamps from inputs.push.
+        Nothing else in the workflows sets the variable."""
+        expr = "${{ inputs.release && 'release' || '' }}"
+        builds = {
+            "runner-linux": "Build metro-runner in the bookworm toolchain image",
+            "desktop-windows": "Build metro-desktop, metro-server and metro-tui (native, locked)",
+            "desktop-linux": "Build metro-desktop, metro-server and metro-tui (locked)",
+        }
+        for job, step_name in builds.items():
+            steps = self.release["jobs"][job]["steps"]
+            stamped = [st for st in steps if "METRO_RELEASE_CHANNEL" in str(st)]
+            self.assertEqual([st.get("name") for st in stamped], [step_name], job)
+            self.assertEqual(stamped[0]["env"]["METRO_RELEASE_CHANNEL"], expr, job)
+        runner = next(st for st in self.release["jobs"]["runner-linux"]["steps"] if st.get("name") == builds["runner-linux"])
+        self.assertIn('--build-arg METRO_RELEASE_CHANNEL="$METRO_RELEASE_CHANNEL"', runner["run"])
+        self.assertNotIn("METRO_RELEASE_CHANNEL", str(self.release.get("env")))
+        for name, job in self.release["jobs"].items():
+            self.assertNotIn("METRO_RELEASE_CHANNEL", str(job.get("env")), name)
+            if name not in builds:
+                self.assertNotIn("METRO_RELEASE_CHANNEL", str(job), name)
+        # Previews and PR smoke are release: false; only the release job is true.
+        callers = {name: job for name, job in self.ci["jobs"].items() if job.get("uses") == "./.github/workflows/release.yml"}
+        for name, job in callers.items():
+            self.assertEqual(job["with"]["release"] is True, name == "release", name)
+        self.assertNotIn("METRO_RELEASE_CHANNEL", (WF / "ci.yml").read_text())
+        # Images: from inputs.push only, server and runner, never the media image.
+        images = load("release-images.yml")
+        step = next(st for st in images["jobs"]["build"]["steps"] if "RELEASE_CHANNEL" in str(st))
+        self.assertEqual(step["env"]["RELEASE_CHANNEL"], "${{ inputs.push && 'release' || '' }}")
+        self.assertIn('--release-channel "$RELEASE_CHANNEL"', step["run"])
+        self.assertNotIn("RELEASE_CHANNEL", str(images["jobs"]["media"]))
+        # The Dockerfile defaults to a source build.
+        self.assertIn("ARG METRO_RELEASE_CHANNEL=\n", (ROOT / "Dockerfile").read_text())
 
     def test_linux_desktop_job_has_only_blocking_steps(self):
         # The best-effort Xvfb launch could never fail CI, so it and its screenshot are gone.

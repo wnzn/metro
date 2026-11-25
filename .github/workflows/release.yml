@@ -84,9 +84,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Build metro-runner in the bookworm toolchain image
+        env:
+          # Official releases only: such a build checks for and offers updates
+          # (metro-release). Previews and PR package smoke stay source builds.
+          METRO_RELEASE_CHANNEL: ${{ inputs.release && 'release' || '' }}
         run: |
           set -eu
-          docker build --target build -t metro-build:release .
+          docker build --target build --build-arg METRO_RELEASE_CHANNEL="$METRO_RELEASE_CHANNEL" -t metro-build:release .
           cid="$(docker create metro-build:release)"
           trap 'docker rm "$cid" >/dev/null' EXIT
           mkdir -p "$RUNNER_TEMP/runner-bin"
@@ -294,6 +298,9 @@ jobs:
           cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --lib openai_oauth::store::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build metro-desktop, metro-server and metro-tui (native, locked)
+        env:
+          # Official releases only (see runner-linux).
+          METRO_RELEASE_CHANNEL: ${{ inputs.release && 'release' || '' }}
         run: |
           cargo build --locked --release --target x86_64-pc-windows-msvc --bin metro-desktop --bin metro-server --bin metro-tui
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -674,6 +681,9 @@ jobs:
           python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
           readelf --version | head -1
       - name: Build metro-desktop, metro-server and metro-tui (locked)
+        env:
+          # Official releases only (see runner-linux).
+          METRO_RELEASE_CHANNEL: ${{ inputs.release && 'release' || '' }}
         run: |
           set -eu
           cargo build --locked --release --target x86_64-unknown-linux-gnu --bin metro-desktop --bin metro-server --bin metro-tui

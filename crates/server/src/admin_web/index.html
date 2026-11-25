@@ -83,6 +83,12 @@
   </section>
 
   <div id="panel" hidden>
+    <section id="update-notice" class="card notice notice-warning" hidden role="status" aria-labelledby="update-title">
+      <h2 id="update-title">A newer Metro release is available</h2>
+      <p>This server runs <strong id="update-current"></strong>. Metro <strong id="update-latest"></strong> is published and its signature was verified. Update the server yourself; Metro never updates it.</p>
+      <p>Server image: <code id="update-image"></code></p>
+      <p><a id="update-link" href="https://github.com/wnzn/metro/releases" rel="noreferrer">Release notes</a></p>
+    </section>
     <div id="secret" class="card secret" hidden role="region" aria-labelledby="secret-title">
       <h2 id="secret-title">Token for <span id="secret-for"></span></h2>
       <p>Copy it now and hand it over privately. <strong>It's shown only once.</strong> Metro stores only a hash, so you can't see this token again.</p>

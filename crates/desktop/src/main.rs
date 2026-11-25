@@ -26,6 +26,7 @@
 
 #[cfg(unix)]
 mod macos;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -37,6 +38,7 @@ use metro_connector::desktop::core::{Desktop, DesktopConfig};
 use metro_connector::desktop::local::{LocalWorkspaceHost, ToolsHook};
 use metro_connector::desktop::monitoring::{EventKind, Events};
 use metro_connector::desktop::store;
+use metro_connector::desktop::update::{ApplyRequest, Updater, UpdaterConfig};
 use metro_connector::desktop_local::LocalServer;
 use metro_connector::desktop_tools::DesktopTools;
 
@@ -248,7 +250,34 @@ fn exit_code(status: Option<std::process::ExitStatus>) -> u8 {
     1
 }
 
-async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
+/// How one run of [`launch`] ended.
+enum Launched {
+    Exit(u8),
+    /// An update was rolled back: run the launcher again (this version).
+    Relaunch,
+}
+
+/// The next apply request from the updater; never resolves without one.
+async fn next_apply(
+    rx: &mut Option<tokio::sync::watch::Receiver<Option<ApplyRequest>>>,
+) -> ApplyRequest {
+    let Some(rx) = rx else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Some(req) = rx.borrow_and_update().clone() {
+            return req;
+        }
+        if rx.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
+}
+
+async fn launch(
+    events: Option<&Events>,
+    trial: Option<String>,
+) -> Result<Launched, (EventKind, String)> {
     let start_failed = |msg| (EventKind::LauncherStartFailed, msg);
     let dir = install_dir().map_err(start_failed)?;
     #[cfg(target_os = "macos")]
@@ -266,19 +295,46 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
         .map_err(|e| start_failed(format!("cannot find a place for Metro's data: {e}")))?;
     store::prepare_private_dir(&root)
         .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
-    let lock = store::try_lock_instance(&root)
-        .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
+    update::gate_msi_at_start(&root).map_err(start_failed)?;
+    let lock = if let Some(id) = &trial {
+        Some(update::trial_lock(id, &dir, &root).ok_or_else(|| {
+            start_failed("this trial did not inherit the active workspace lock".into())
+        })?)
+    } else {
+        store::try_lock_instance(&root)
+            .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?
+    }
+    .map(Arc::new);
     let primary = lock.is_some();
+    update::gate_msi_at_start(&root).map_err(start_failed)?;
+    if trial.is_none() {
+        update::recover_at_start(&dir, &root, lock.as_deref()).map_err(start_failed)?;
+    }
+
+    // Updates: primary instance only. Startup above reconciles safe
+    // cleanup or blocks if a prior trial lost its watchdog.
+    let updater: Option<Arc<Updater>> = if primary {
+        UpdaterConfig::for_app(&root, &dir, trial.clone()).map(Updater::new)
+    } else {
+        None
+    };
+    if let Some(u) = &updater
+        && trial.is_none()
+    {
+        u.spawn_schedule();
+    }
+    let mut apply_rx = updater.as_ref().map(|u| u.apply_requests());
 
     let local: Option<Arc<dyn LocalWorkspaceHost>> = match (&server, primary) {
         (Some(bin), true) => {
             let data = root.join("local");
             match store::prepare_private_dir(&data) {
-                Ok(()) => Some(Arc::new(LocalServer::with_events(
-                    bin.clone(),
-                    data,
-                    events.cloned(),
-                ))),
+                Ok(()) => {
+                    let server = LocalServer::with_events(bin.clone(), data, events.cloned());
+                    #[cfg(target_os = "linux")]
+                    let server = server.with_instance(lock.clone().expect("primary instance"));
+                    Some(Arc::new(server))
+                }
                 Err(e) => {
                     if let Some(events) = events {
                         events.record(EventKind::LocalServerStartFailed);
@@ -292,6 +348,7 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
     };
     let mut cfg = DesktopConfig::new(root.clone(), primary, local);
     cfg.tools = tools_hook(&root, primary);
+    cfg.updater = updater.clone();
     let desktop = Desktop::new(cfg);
     let bridge = bridge::start(desktop.clone()).await.map_err(|e| {
         start_failed(format!(
@@ -374,6 +431,7 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
     #[cfg(target_os = "macos")]
     let _liveness = child.stdin.take();
 
+    let mut apply_request = None;
     let status = tokio::select! {
         s = child.wait() => {
             let failure = match &s {
@@ -393,18 +451,34 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
             s.ok()
         },
         _ = stop_requested() => end_ui(&mut child).await,
+        req = next_apply(&mut apply_rx) => {
+            apply_request = Some(req);
+            end_ui(&mut child).await
+        }
     };
     // The UI is gone: nothing may keep serving on its behalf.
     bridge.stop().await;
-    if tokio::time::timeout(Duration::from_secs(15), desktop.shutdown())
-        .await
-        .is_err()
-    {
+    let stopped = matches!(
+        tokio::time::timeout(Duration::from_secs(15), desktop.shutdown_confirmed()).await,
+        Ok(true)
+    );
+    if !stopped {
         eprintln!("Metro: some on-device work did not stop in time; ending it");
     }
     drop(desktop);
+    if let (Some(req), Some(u)) = (apply_request, updater) {
+        if !stopped {
+            return Err((EventKind::LauncherStartFailed, "the update was not started because the local workspace did not stop. Close Metro and try again.".into()));
+        }
+        return Ok(
+            match update::apply(&u, req, &root, lock.expect("primary updater")).await {
+                update::After::Exit(code) => Launched::Exit(code),
+                update::After::Relaunch => Launched::Relaunch,
+            },
+        );
+    }
     drop(lock);
-    Ok(exit_code(status))
+    Ok(Launched::Exit(exit_code(status)))
 }
 
 /// Local workspace tools (read-only folders per hosted Space), primary
@@ -437,6 +511,13 @@ fn main() -> ExitCode {
         fatal("Metro can't start: this copy of Metro is damaged. Download Metro again.");
         return ExitCode::from(2);
     }
+    let mode = update::mode();
+    if mode == update::Mode::LegacyHelper {
+        fatal(
+            "In-app MSI updates are no longer supported. Use a verified manual installer; any existing backup was kept.",
+        );
+        return ExitCode::from(2);
+    }
     #[cfg(unix)]
     // SAFETY: umask has no preconditions.
     unsafe {
@@ -461,14 +542,21 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
-    let code = match rt.block_on(launch(events.as_ref())) {
-        Ok(code) => code,
-        Err((kind, msg)) => {
-            if let Some(events) = &events {
-                events.record(kind);
+    let mut trial = match &mode {
+        update::Mode::Trial(id) => Some(id.clone()),
+        _ => None,
+    };
+    let code = loop {
+        match rt.block_on(launch(events.as_ref(), trial.take())) {
+            Ok(Launched::Exit(code)) => break code,
+            Ok(Launched::Relaunch) => continue,
+            Err((kind, msg)) => {
+                if let Some(events) = &events {
+                    events.record(kind);
+                }
+                fatal(&format!("Metro can't start: {msg}"));
+                break 1;
             }
-            fatal(&format!("Metro can't start: {msg}"));
-            1
         }
     };
     // Don't wait for stuck provider calls; everything was told to stop.

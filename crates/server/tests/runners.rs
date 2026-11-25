@@ -321,7 +321,7 @@ async fn personal_runners_are_private_to_their_owner() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body["runner"],
+        without_update_fields(&body["runner"]),
         json!({"id": mine, "name": "alice laptop", "visibility": "personal", "kind": "registered"})
     );
     assert_eq!(
@@ -384,7 +384,7 @@ async fn organization_runners_are_managed_by_admins_and_attachable_by_space_owne
     let (org, _) = s.register(CAROL, "build farm", "organization").await;
     let (_, body) = s.get(ALICE, "/v1/runners").await;
     assert_eq!(
-        body["runners"],
+        without_update_fields(&body["runners"]),
         json!([{"id": org, "name": "build farm", "visibility": "organization", "can_manage": false}])
     );
     assert_eq!(
@@ -702,4 +702,23 @@ async fn attachments_survive_a_restart() {
     s.demo(ALICE, &a).await;
     let job = s.claim(&token, Some("2")).await;
     assert_eq!(job["space_id"], a.as_str());
+}
+
+/// A runner view without the display-only `presence` and `update` objects
+/// (covered in tests/updates.rs), which must be present on every view.
+fn without_update_fields(v: &Value) -> Value {
+    match v {
+        Value::Array(items) => Value::Array(items.iter().map(without_update_fields).collect()),
+        Value::Object(map) => {
+            assert!(
+                map["presence"].is_object() && map["update"].is_object(),
+                "{v}"
+            );
+            let mut map = map.clone();
+            map.remove("presence");
+            map.remove("update");
+            Value::Object(map)
+        }
+        other => other.clone(),
+    }
 }

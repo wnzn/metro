@@ -6,11 +6,13 @@ by recording fakes on PATH, so nothing on the host is installed, started or
 changed. Real engines are exercised only by the CI jobs.
 """
 
+import fcntl
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import stat
 import subprocess
@@ -163,6 +165,45 @@ esac
     def calls(self):
         return self.log.read_text().splitlines()
 
+    def reciprocal_published_lock(self, modern, archive, marker):
+        # The fixture is the actual published script, not a lock mock.
+        name = modern.name
+        published = HERE / "test-fixtures" / name.replace(".sh", "-0.4.0.sh")
+        sums = (HERE.parent / "crates/release/tests/fixtures/v0.4.0/SHA256SUMS").read_text()
+        assert f"{sha(published.read_bytes())}  {name}" in sums.splitlines()
+        self.run(published, "install", "--archive", archive, check=True)
+        assert marker.read_text() != "metro-update-lock-v2\n"
+        tar = shlex.quote(str(self.tools / "tar"))
+        probe = self.root / "lock-probe"
+        hook = self.bin / "tar"
+        for holder, contender in [(published, modern), (modern, published)]:
+            nested = shlex.join(["/bin/sh", str(contender), "update", "--archive", str(archive)])
+            write_exec(hook, f"""#!/bin/sh
+if [ -z "${{METRO_LOCK_PROBING:-}}" ]; then
+    METRO_LOCK_PROBING=1 {nested} >{shlex.quote(str(probe))} 2>&1
+fi
+exec {tar} "$@"
+""")
+            self.run(holder, "update", "--archive", archive, check=True)
+            assert "another install" in probe.read_text(), probe.read_text()
+            assert not (marker.parent / ".lock").exists()
+        hook.unlink()
+        self.run(modern, "update", "--archive", archive, "--migrate-update-lock", check=True)
+        assert marker.read_text() == "metro-update-lock-v2\n"
+        self.run(published, "update", "--archive", archive, check=True)
+        assert marker.read_text() != "metro-update-lock-v2\n"
+        lock = marker.parent / ".lock"
+        lock.mkdir()
+        owner = lock / "owner.metro-lock-v2"
+        invalid = "metro-lock-v2:.looks-valid\nforeign bytes"
+        owner.write_text(invalid)
+        result = self.run(modern, "update", "--archive", archive)
+        assert result.returncode and "another install" in result.stderr, result.stderr
+        assert owner.read_text() == invalid
+        owner.write_text("metro-lock-v2:.interrupted\n")
+        self.run(modern, "update", "--archive", archive, check=True)
+        assert not lock.exists()
+
 
 class DesktopInstallerTests(unittest.TestCase):
     def setUp(self):
@@ -199,7 +240,7 @@ class DesktopInstallerTests(unittest.TestCase):
         b = self.archive("0.3.1")
         self.box.run(DESKTOP, "update", "--archive", b, "--no-local-runner", check=True)
         self.assertEqual(os.readlink(current), "versions/0.3.1")
-        self.assertEqual(sorted(p.name for p in (self.app_root / "versions").iterdir()), ["0.3.1"])
+        self.assertEqual(sorted(p.name for p in (self.app_root / "versions").iterdir()), ["0.3.0", "0.3.1"])
         self.assertFalse(marker.exists())
         self.box.run(DESKTOP, "update", "--archive", b, check=True)  # keeps "off"
         self.assertFalse(marker.exists())
@@ -215,6 +256,68 @@ class DesktopInstallerTests(unittest.TestCase):
         self.assertFalse(entry.exists())
         self.assertEqual((self.data / "desktop.json").read_text(), "keep")
         self.assertEqual(self.box.calls(), [])  # no package manager, sudo or systemctl
+
+    def test_in_app_updates_are_never_clobbered(self):
+        self.box.run(DESKTOP, "install", "--archive", self.archive(), check=True)
+        journal = self.app_root / ".update.json"
+        b = self.archive("0.3.1")
+        for phase in ("trial", "committing"):
+            journal.write_text(json.dumps({"version": 1, "id": "ab12" * 4, "from": "0.3.0", "to": "0.3.2", "phase": phase, "started_at": 0},
+                                          separators=(",", ":")))
+            for args in (("update", "--archive", b), ("uninstall",)):
+                r = self.box.run(DESKTOP, *args)
+                self.assertNotEqual(r.returncode, 0, (phase, args))
+                self.assertIn("in the middle of updating itself to 0.3.2", r.stderr, (phase, args))
+            self.assertEqual(os.readlink(self.app_root / "current"), "versions/0.3.0")
+            self.assertTrue(journal.exists())
+        journal.write_text('{"phase":"exploded"}')
+        self.assertIn("unknown in-app update state", self.box.run(DESKTOP, "update", "--archive", b).stderr)
+        self.assertEqual(journal.read_text(), '{"phase":"exploded"}')
+        # The app holding the lock while it stages.
+        journal.unlink()
+        fd = os.open(self.app_root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for args in (("update", "--archive", b), ("uninstall",)):
+                self.assertIn("another install is running", self.box.run(DESKTOP, *args).stderr)
+        finally:
+            os.close(fd)
+        # Legacy .lock is respected but never reaped.
+        lock = self.app_root / ".lock"
+        lock.mkdir()
+        (lock / "owner").write_text('{"by":"metro-desktop","pid":1,"started_at":1}')
+        r = self.box.run(DESKTOP, "update", "--archive", b)
+        self.assertIn("preparing an in-app update right now", r.stderr)
+        self.assertTrue(lock.is_dir(), "the app's lock is left alone")
+        self.assertIn("preparing an in-app update right now", self.box.run(DESKTOP, "uninstall").stderr)
+        (lock / "owner").unlink()
+        self.assertIn("another install is running", self.box.run(DESKTOP, "update", "--archive", b).stderr)
+        shutil.rmtree(lock)
+        # A staged (not started) in-app update is superseded and its journal removed.
+        (self.app_root / "versions/0.3.2").mkdir()
+        journal.write_text('{"version":1,"id":"ab12ab12ab12ab12","from":"0.3.0","to":"0.3.2","phase":"staged","started_at":0}')
+        self.box.run(DESKTOP, "update", "--archive", b, check=True)
+        self.assertEqual(os.readlink(self.app_root / "current"), "versions/0.3.1")
+        self.assertFalse(journal.exists())
+        self.assertFalse((self.app_root / "versions/0.3.2").exists())
+
+    def test_manual_installer_leaves_backup_cleanup_to_the_journal_owner(self):
+        self.box.run(DESKTOP, "install", "--archive", self.archive(), check=True)
+        journal = self.app_root / ".update.json"
+        b = self.archive("0.3.1")
+        record = {"version": 2, "id": "ab12" * 4, "from": "0.3.0", "to": "0.3.2", "started_at": 0}
+        for extra in ({"phase": "backing_up"},
+                      {"phase": "failed", "backup_manifest": "a" * 64, "outcome": "rolled_back"}):
+            text = json.dumps(record | extra)
+            journal.write_text(text)
+            for args in (("update", "--archive", b), ("uninstall",)):
+                result = self.box.run(DESKTOP, *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("start it once", result.stderr)
+            self.assertEqual(journal.read_text(), text)
+
+    def test_published_desktop_installer_and_the_current_installer_exclude_each_other(self):
+        self.box.reciprocal_published_lock(DESKTOP, self.archive(), self.app_root / ".metro-desktop-install")
 
     def test_update_requires_install_and_old_archives_without_menu_script(self):
         # Like the early 0.2.0 candidates: no menu script, no local_runner capability.
@@ -336,6 +439,10 @@ printf 'NO_PROXY=%s no_proxy=%s HTTP_PROXY=%s\\n' "${NO_PROXY:-unset}" "${no_pro
 """
 
 
+# The runner script as published in Metro 0.4.0 (before METRO_RUNNER_SELF_UPDATE).
+OLD_RUNNER_SCRIPT = HERE / "test-fixtures/install-metro-runner-linux-0.4.0.sh"
+
+
 class RunnerInstallerTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -358,6 +465,9 @@ class RunnerInstallerTests(unittest.TestCase):
     def configure(self, url="https://metro.example", **kw):
         return self.box.run(RUNNER, "configure", "--server-url", url, "--workspace", kw.get("ws", self.ws),
                             "--token-file", kw.get("token", self.token))
+
+    def test_published_runner_installer_and_the_current_installer_exclude_each_other(self):
+        self.box.reciprocal_published_lock(RUNNER, self.archive, self.install_root / ".metro-runner-install")
 
     def test_full_lifecycle_never_exposes_the_token(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
@@ -447,6 +557,22 @@ class RunnerInstallerTests(unittest.TestCase):
         self.assertEqual(marker.read_text(), "keep")
         self.assertEqual(self.box.calls(), [])
 
+    def test_manual_runner_install_respects_a_live_update_lock_and_journal(self):
+        self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
+        fd = os.open(self.install_root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIn("another install is running", self.box.run(RUNNER, "update", "--archive", self.archive).stderr)
+            self.assertIn("another install is running", self.box.run(RUNNER, "uninstall").stderr)
+            self.assertIn("another install is running", self.configure().stderr)
+        finally:
+            os.close(fd)
+        journal = self.install_root / ".update-pending.json"
+        journal.write_text("malformed; leave for recovery")
+        self.assertIn("finish recovery", self.box.run(RUNNER, "uninstall").stderr)
+        self.assertEqual(journal.read_text(), "malformed; leave for recovery")
+        self.assertEqual(os.readlink(self.install_root / "current"), "versions/0.3.0")
+
     def test_configuration_is_validated(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
         for url in ("ftp://x", "https://u:p@metro.example", "http://u:p@metro.example",
@@ -473,6 +599,68 @@ class RunnerInstallerTests(unittest.TestCase):
             f.write("METRO_RUNNER_TOKEN=inline\n")
         r = self.box.run(RUNNER, "run")
         self.assertIn("unsupported setting METRO_RUNNER_TOKEN", r.stderr)
+
+    def test_self_update_choice(self):
+        self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
+        # A new configuration: on, with a line saying so.
+        r = self.configure()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="1"', self.config.read_text())
+        self.assertIn("Self-update is on", r.stdout)
+        self.assertIn("self-update: on", self.box.run(RUNNER, "status", check=True).stdout)
+        # Explicit off, then reconfiguring keeps it off.
+        args = ["configure", "--server-url", "https://metro.example", "--workspace", self.ws, "--token-file", self.token]
+        self.assertEqual(self.box.run(RUNNER, *args, "--self-update", "off").returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="0"', self.config.read_text())
+        self.assertEqual(self.configure().returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="0"', self.config.read_text())
+        self.assertIn("self-update: off", self.box.run(RUNNER, "status", check=True).stdout)
+        # A configuration from before this option stays off.
+        self.config.write_text(self.config.read_text().replace('METRO_RUNNER_SELF_UPDATE="0"\n', ""))
+        self.assertEqual(self.configure().returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="0"', self.config.read_text())
+        # Explicit on, and the run passes it to the runner.
+        self.assertEqual(self.box.run(RUNNER, *args, "--self-update", "on").returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="1"', self.config.read_text())
+        self.assertEqual(self.box.run(RUNNER, "run").returncode, 0)
+        self.assertIn("--self-update must be on or off", self.box.run(RUNNER, *args, "--self-update", "yes").stderr)
+
+    def test_configure_upgrades_an_old_installed_script_copy(self):
+        # The script as shipped before METRO_RUNNER_SELF_UPDATE existed (0.4.0).
+        old = self.root / "old" / "install-metro-runner-linux.sh"
+        old.parent.mkdir()
+        old.write_bytes(OLD_RUNNER_SCRIPT.read_bytes())
+        old.chmod(0o755)
+        self.assertNotIn(b"METRO_RUNNER_SELF_UPDATE", old.read_bytes())
+        self.box.run(old, "install", "--archive", self.archive, check=True)
+        installed = self.install_root / "install-metro-runner-linux.sh"
+        self.assertEqual(installed.read_bytes(), old.read_bytes())
+        # Configuring with the new script writes the new key and replaces the old copy...
+        r = self.configure()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="1"', self.config.read_text())
+        self.assertEqual(installed.read_bytes(), RUNNER.read_bytes())
+        self.assertIn("Updated the installed copy", r.stdout)
+        # ...so the installed copy (what the unit runs) accepts the settings.
+        r = self.box.run(installed, "run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # A copy with both capabilities is left alone.
+        self.assertNotIn("Updated the installed copy", self.configure().stdout)
+
+    def test_configure_refreshes_an_update_aware_script_without_http_support(self):
+        self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
+        installed = self.install_root / RUNNER.name
+        write_exec(installed, "#!/bin/sh\n# METRO_RUNNER_SELF_UPDATE\nexit 1\n")
+        marker = self.install_root / ".metro-runner-install"
+        before = marker.read_bytes()
+        result = self.configure("http://100.101.102.103:8787")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(installed.read_bytes(), RUNNER.read_bytes())
+        self.assertEqual(marker.read_bytes(), before)
+        run = self.box.run(installed, "run", check=True, env={"NO_PROXY": "corp.example"})
+        self.assertIn("insecure=1 ", run.stdout)
+        self.assertIn("NO_PROXY=corp.example,100.101.102.103 ", run.stdout)
+        self.assertFalse((self.install_root / ".lock").exists())
 
     def test_refuses_desktop_archive_and_bad_checksum(self):
         desk = build_archive(self.root, "Metro-runner-0.3.2-linux-x64", runner_files(FAKE_RUNNER),
@@ -878,6 +1066,27 @@ class MacosInstallerTests(unittest.TestCase):
             self.assertIn("for macOS", r.stderr)
 
 
+class WindowsInAppUpdateGuardTests(unittest.TestCase):
+    """Static checks (pwsh isn't needed): install and uninstall check the
+    journal under the installer lock before changing anything."""
+
+    def test_guard_runs_before_any_change(self):
+        text = WINDOWS.read_text()
+        install = text[text.index("function Install-Metro {"):text.index("function Uninstall-Metro {")]
+        uninstall = text[text.index("function Uninstall-Metro {"):]
+        self.assertLess(install.index("$lock = Enter-InstallLock"), install.index("Assert-NoInAppUpdate"))
+        self.assertLess(install.index("Assert-NoInAppUpdate"), install.index("Set-Content"))
+        self.assertLess(uninstall.index("$lock = Enter-InstallLock"), uninstall.index("Assert-NoInAppUpdate"))
+        self.assertLess(uninstall.index("Assert-NoInAppUpdate"), uninstall.index("Remove-Item"))
+        self.assertIn("$lock.Dispose()", uninstall)
+        guard = text[text.index("function Assert-NoInAppUpdate"):text.index("function Get-LockBusyMessage")]
+        self.assertIn("@('trial', 'committing', 'rolling_back')", guard)
+        self.assertIn("$handle.Lock(0, 1)", text)
+        self.assertIn('"by":"metro-desktop"', text)
+        self.assertLess(install.index("Remove-Item -LiteralPath (Join-Path $Root '.update.json')"),
+                        install.index("Keep a copy of this script"))
+
+
 @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
 class PowerShellTests(unittest.TestCase):
     def pwsh(self, *args, env=None):
@@ -889,6 +1098,66 @@ class PowerShellTests(unittest.TestCase):
             r = self.pwsh("-Command", f"$e=$null; [System.Management.Automation.Language.Parser]::ParseFile("
                                       f"'{script}', [ref]$null, [ref]$e) | Out-Null; if ($e) {{ $e; exit 1 }}")
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_published_windows_installer_and_current_installer_exclude_each_other(self):
+        published = HERE / "test-fixtures/install-metro-windows-0.4.0.ps1"
+        sums = (HERE.parent / "crates/release/tests/fixtures/v0.4.0/SHA256SUMS").read_text()
+        self.assertIn(f"{sha(published.read_bytes())}  {WINDOWS.name}", sums.splitlines())
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "install"
+            dest.mkdir()
+            (dest / ".metro-desktop-install").write_text("managed\n")
+            archive = Path(d) / "Metro-0.4.0-windows-x64.zip"
+            archive.write_bytes(b"not extracted")
+            harness = Path(d) / "hold.ps1"
+            # Run the unmodified Install-Metro body and its lock functions
+            # from each script; intercept prerequisite probes and stop at
+            # extraction, before any Windows-only install operations.
+            harness.write_text(r"""
+param($Installer, $Root, $Archive, $Contender)
+$ErrorActionPreference = 'Stop'
+$Action = 'Install'
+$Mark = '.metro-desktop-install'
+$Sha256 = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
+$Quiet = $true
+$UserData = Join-Path $Root 'unused'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$tokens, [ref]$errors)
+if ($errors) { throw 'could not parse installer' }
+$excluded = 'Test-Prerequisites', 'Get-MsiManagedMetro', 'Expand-Verified'
+foreach ($def in $ast.EndBlock.Statements) {
+    if ($def -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $def.Name -notin $excluded) {
+        . ([scriptblock]::Create($def.Extent.Text))
+    }
+}
+function Test-Prerequisites {}
+function Get-MsiManagedMetro {}
+function Expand-Verified {
+    if (-not $Contender) { throw 'contender got past the lock' }
+    $child = Join-Path $PSHOME 'pwsh'
+    $probe = & $child -NoProfile -NonInteractive -File $PSCommandPath $Contender $Root $Archive
+    if ($LASTEXITCODE -ne 0 -or $probe -notmatch 'another install is running') { throw "lock not honored: $probe" }
+    throw 'fixture stopped after verifying exclusion'
+}
+try {
+    Install-Metro
+    throw 'unexpected install result'
+} catch {
+    $message = $_.Exception.Message
+    if ($message -match 'another install is running|fixture stopped after verifying exclusion') {
+        Write-Output $message
+        exit 0
+    }
+    throw
+}
+""")
+            for holder, contender in ((published, WINDOWS), (WINDOWS, published)):
+                with self.subTest(holder=holder.name):
+                    result = self.pwsh("-File", harness, holder, dest, archive, contender)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("fixture stopped after verifying exclusion", result.stdout)
+                    self.assertFalse((dest / ".lock").exists())
 
     def test_container_url_validation(self):
         missing = "/nonexistent/metro-token"  # a valid URL gets as far as the token file

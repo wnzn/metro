@@ -189,10 +189,17 @@ codes! {
     RunnerNotClaimed => ("runner", "not_claimed", "No runner picked up a tool call in time."),
     RunnerTimedOut => ("runner", "timed_out", "The runner did not return a tool result in time."),
     RunnerChanged => ("runner", "changed", "A tool call was cancelled because the Space's runner changed."),
+    // A runner's update (scoped to who manages that runner: the Space owner
+    // for a dedicated runner, the owner of a personal runner, org admins
+    // for an organization runner).
+    RunnerUpdateRequested => ("runner", "update_requested", "An update of a runner was requested."),
+    RunnerUpdated => ("runner", "updated", "A runner updated itself to the requested version."),
+    RunnerUpdateFailed => ("runner", "update_failed", "A runner could not update itself and kept its version."),
     // Space or personal: web tools.
     WebSearchUnavailable => ("web", "search_unavailable", "A web search or page fetch could not run on the computer of the person who asked."),
     // Instance.
     ServerStarted => ("server", "started", "The server started."),
+    ServerUpdateAvailable => ("server", "update_available", "A newer verified Metro release is available."),
     SchedulerTickFailed => ("scheduler", "tick_failed", "The scheduler could not check scheduled prompts."),
     SchedulerRecoveryFailed => ("scheduler", "recovery_failed", "The scheduler could not recover occurrences interrupted by a restart."),
 }

@@ -1198,8 +1198,18 @@ pub async fn stop_run(
 /// Claim the oldest queued job of any Space this runner serves. Protocol 2
 /// claims name the job's `space_id`; a registered runner keeps a separate
 /// workspace per Space and must check it.
-pub async fn runner_claim(State(state): State<AppState>, runner: Runner) -> Response {
-    match state.jobs.claim(&runner.claimer(), &runner.spaces) {
+///
+/// The optional body (`{"runner": {version, install, …}}`, at most 2 KiB)
+/// is untrusted presence data for Settings → Runners; it never fails a
+/// claim. While its manager has asked this runner to update, the response
+/// carries `X-Metro-Runner-Update: X.Y.Z` and nothing else about it.
+pub async fn runner_claim(
+    State(state): State<AppState>,
+    runner: Runner,
+    body: axum::body::Bytes,
+) -> Response {
+    let update = crate::updates::on_claim(&state, &runner, crate::updates::claim_body(&body)).await;
+    let mut response = match state.jobs.claim(&runner.claimer(), &runner.spaces) {
         Some(mut job) => {
             if runner.protocol < 2 {
                 debug_assert_eq!(runner.credential, RunnerCredential::Dedicated);
@@ -1208,7 +1218,15 @@ pub async fn runner_claim(State(state): State<AppState>, runner: Runner) -> Resp
             (StatusCode::OK, Json(job)).into_response()
         }
         None => StatusCode::NO_CONTENT.into_response(),
+    };
+    if let Some(version) = update
+        && let Ok(value) = HeaderValue::from_str(&version)
+    {
+        response
+            .headers_mut()
+            .insert(crate::updates::UPDATE_HEADER, value);
     }
+    response
 }
 
 #[derive(Deserialize)]

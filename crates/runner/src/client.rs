@@ -26,6 +26,16 @@ pub const PROTOCOL_VERSION: &str = "2";
 /// Maximum length of a Space id the runner accepts.
 pub const MAX_SPACE_ID_LEN: usize = 64;
 
+/// The server's request to self-update (a version, nothing else).
+pub const UPDATE_HEADER: &str = "x-metro-runner-update";
+
+fn update_header(headers: &ureq::http::HeaderMap) -> Option<String> {
+    let mut values = headers.get_all(UPDATE_HEADER).iter();
+    let value = values.next()?.to_str().ok()?;
+    (values.next().is_none() && value.len() <= 32 && metro_release::Version::parse(value).is_some())
+        .then(|| value.to_owned())
+}
+
 pub const MAX_CLAIM_BODY: u64 = 8 * 1024 * 1024;
 const MAX_ERROR_BODY: u64 = 4 * 1024;
 
@@ -150,10 +160,18 @@ impl ServerClient {
 
     /// POST /v1/runner/claim {} -> 204 (idle) or 200 {id, tool, arguments}.
     pub fn claim(&self) -> Result<Claim, ClientError> {
-        let mut resp = self.post("/v1/runner/claim", "{}".into())?;
+        self.claim_with("{}").map(|(claim, _)| claim)
+    }
+
+    /// POST /v1/runner/claim with a presence body (see [`crate::update`]).
+    /// Also returns the server's `X-Metro-Runner-Update` version, if any:
+    /// the only thing a server ever says about updates.
+    pub fn claim_with(&self, body: &str) -> Result<(Claim, Option<String>), ClientError> {
+        let mut resp = self.post("/v1/runner/claim", body.to_owned())?;
         let status = resp.status().as_u16();
+        let update = update_header(resp.headers());
         match status {
-            204 => Ok(Claim::Idle),
+            204 => Ok((Claim::Idle, update)),
             200 => {
                 let body = resp
                     .body_mut()
@@ -161,7 +179,7 @@ impl ServerClient {
                     .limit(MAX_CLAIM_BODY)
                     .read_to_string()
                     .map_err(|e| retryable(format!("claim: reading body: {e}")))?;
-                parse_claim_for(&body, self.credential)
+                Ok((parse_claim_for(&body, self.credential)?, update))
             }
             _ => Err(status_error("claim", status, &mut resp)),
         }

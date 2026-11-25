@@ -23,6 +23,7 @@ import tempfile
 import textwrap
 import threading
 import unittest
+import unittest.mock
 from urllib.parse import parse_qs, urlsplit
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -888,6 +889,37 @@ class PrebuiltComposeTests(unittest.TestCase):
                 proc = self.config(**env)
                 self.assertNotEqual(proc.returncode, 0)
                 self.assertRegex(proc.stderr, rf'service "(?:{missing})" has neither an image nor a build context')
+
+class ReleaseChannelBuildArgTests(unittest.TestCase):
+    """--release-channel release becomes a build arg for server/runner only."""
+
+    def run_build(self, component, channel):
+        calls = []
+
+        def fake_run(cmd, **kw):
+            calls.append(cmd)
+            if cmd[:2] == ["git", "-C"]:
+                return subprocess.CompletedProcess(cmd, 0, stdout="1700000000\n", stderr="")
+            raise SystemExit("stop after the docker command")
+
+        with tempfile.TemporaryDirectory() as out, unittest.mock.patch.object(ir.subprocess, "run", fake_run):
+            argv = ["build", "--component", component, "--platform", "linux/amd64", "--version", "1.2.3",
+                    "--revision", "a" * 40, "--source", "https://github.com/wnzn/metro", "--out", out]
+            if channel is not None:
+                argv += ["--release-channel", channel]
+            with self.assertRaises(SystemExit):
+                ir.main(argv)
+        return next(c for c in calls if c[:3] == ["docker", "buildx", "build"])
+
+    def test_channel(self):
+        self.assertIn("METRO_RELEASE_CHANNEL=release", self.run_build("runner", "release"))
+        self.assertIn("METRO_RELEASE_CHANNEL=release", self.run_build("server", "release"))
+        for channel in (None, ""):
+            self.assertFalse(any("METRO_RELEASE_CHANNEL" in a for a in self.run_build("runner", channel)))
+        self.assertFalse(any("METRO_RELEASE_CHANNEL" in a for a in self.run_build("media", "release")))
+        with self.assertRaises(SystemExit), contextlib.redirect_stderr(io.StringIO()):
+            ir.main(["build", "--component", "runner", "--platform", "linux/amd64", "--version", "1.2.3",
+                     "--revision", "a" * 40, "--source", "x", "--out", "/nonexistent", "--release-channel", "preview"])
 
 
 if __name__ == "__main__":

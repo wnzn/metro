@@ -472,7 +472,13 @@ impl Hosted {
                 "/v1/runner/claim",
                 token,
                 &[(PROTOCOL_HEADER, "2")],
-                Some(&json!({})),
+                // Presence for Settings → Runners: this runner updates with the app.
+                Some(&json!({"runner": {
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "channel": metro_release::Channel::current().as_str(),
+                    "install": "desktop",
+                    "self_update": false,
+                }})),
                 MAX_CLAIM_BODY,
             )
             .await?;
