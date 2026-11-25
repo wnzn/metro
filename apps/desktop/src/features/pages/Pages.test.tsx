@@ -229,6 +229,25 @@ test("Live data stops polling in the background, under Settings, and on another 
   expect(reads()).toBe(before);
 });
 
+test("A completed action does not start a data refresh while the window is hidden", async () => {
+  const f = pagesFixture();
+  f.state.actionDelay = 3000;
+  const app = await start(f);
+  await jump(app, PERSONAL);
+  await app.press("id:page-action:ask");
+  await app.waitFor("id:page-action-confirm");
+  await app.press("id:page-action-run");
+  await app.waitUntil(() => f.state.started === 1);
+  await app.setLifecycle("background");
+  const reads = () => f.calls(`/${PERSONAL}/data`, "POST").length;
+  const before = reads();
+  await app.clock!.fastForward(4000);
+  expect(reads()).toBe(before);
+  await app.setLifecycle("active");
+  await app.waitFor("text:Private page-only answer");
+  expect(reads()).toBeGreaterThan(before);
+});
+
 test("A late Page definition from an old session never becomes visible to the next account", async () => {
   const f = pagesFixture();
   f.state.delayPage = PERSONAL;

@@ -27,7 +27,7 @@ export function pagesFixture() {
   const prefs = new Map<string, boolean>();
   const log: { user: string; method: string; path: string; body: any }[] = [];
   let nextId = 1;
-  const state = { revision: 3, delayPage: "", delay: 0, stale: false, outside: false, generating: 0, started: 0, applied: 0 };
+  const state = { revision: 3, delayPage: "", delay: 0, actionDelay: 0, stale: false, outside: false, generating: 0, started: 0, applied: 0 };
   const visible = (p: PageMeta, user: string) => p.scope === "personal" ? p.creator_id === user : !!p.space_id && f.state.spaces.get(p.space_id)?.members.has(user);
   const caps = (p: Page, user: string): Page => {
     const can_manage = p.creator_id === user || (!!p.space_id && f.state.spaces.get(p.space_id)?.owner === user);
@@ -154,7 +154,8 @@ export function pagesFixture() {
       if (schedule && body.schedule_revision !== state.revision) return fail(409, "schedule changed", { schedule_revision: state.revision });
       confirmations.add(key);
       state.started++;
-      return schedule ? ok({ kind: "runSchedule", run: { status: "done", detail: null } }) : ok({ kind: "runAgent", started: true }, 202);
+      return { ...(schedule ? ok({ kind: "runSchedule", run: { status: "done", detail: null } }) : ok({ kind: "runAgent", started: true }, 202)),
+        delay: state.actionDelay };
     }
     return fail(404, "unknown Pages fixture request");
   }

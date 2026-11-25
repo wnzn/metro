@@ -36,6 +36,7 @@ export function PageView(props: { route: ViewRoute }) {
   cleanup(() => { alive = false; });
   const valid = () => alive && guard() && scopeGuard() && hasSpace(page()?.space_id);
   const live = () => valid() && lifecycle() === "active";
+  const visible = () => live() && !modalOpen();
   const grants = () => new Map(spaces().map(s => [s.id, sessionGuard(s.id)]));
   const lost = () => {
     ++ticket;
@@ -60,7 +61,7 @@ export function PageView(props: { route: ViewRoute }) {
     return true;
   }
   async function refresh(loadHead = false) {
-    if (!client || !valid()) return;
+    if (!client || !visible()) return;
     const index = ++ticket, before = grants();
     const allowed = () => valid() && index === ticket && [...before.values()].every(ok => ok());
     refreshing.set(true);
@@ -70,12 +71,14 @@ export function PageView(props: { route: ViewRoute }) {
         const head = await client.getPage(route.id);
         if (!allowed() || !accept(head, before)) return;
       }
+      if (!visible()) return;
       let answer = await client.pageData(route.id);
       if (!allowed()) return;
       if (answer.version !== page()?.head_version) {
         data.set(null); confirm.set(null);
+        if (!visible()) return;
         const head = await client.getPage(route.id);
-        if (!allowed() || !accept(head, before)) return;
+        if (!allowed() || !accept(head, before) || !visible()) return;
         answer = await client.pageData(route.id);
       }
       if (!allowed()) return;
@@ -98,16 +101,16 @@ export function PageView(props: { route: ViewRoute }) {
   let membership: string | undefined, wasVisible = false, recheck = true;
   effect(() => {
     const now = JSON.stringify(spaces().map(s => s.id).sort());
-    const visible = live() && !modalOpen();
+    const shown = visible();
     const changed = membership !== undefined && now !== membership;
     membership = now;
     untracked(() => {
       if (changed) { ++ticket; data.set(null); confirm.set(null); external.set(null); schedule.set(undefined); refreshing.set(false); recheck = true; }
-      if (visible && (!wasVisible || recheck)) { recheck = false; void refresh(true); }
-      wasVisible = visible;
+      if (shown && (!wasVisible || recheck)) { recheck = false; void refresh(true); }
+      wasVisible = shown;
     });
   });
-  visiblePolling(() => live() && !modalOpen() && !!page(), () => intervalFor(page()?.spec?.refresh), () => {
+  visiblePolling(() => visible() && !!page(), () => intervalFor(page()?.spec?.refresh), () => {
     if (!busy() && !refreshing()) void refresh();
   });
 
