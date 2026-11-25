@@ -461,6 +461,64 @@ const PROP_HINTS: &[(&str, &str)] = &[
     ("html", "raw HTML isn't allowed; use <Markdown> or <Text>"),
 ];
 
+/// Why `md` can't be a page's `<Markdown>`, if it can't: images (a page
+/// never loads anything remote), raw HTML, or a link that isn't `https:`.
+pub fn markdown_problem(md: &str) -> Option<&'static str> {
+    const NO_IMAGES: &str =
+        "<Markdown> can't show images (![…](…)); pages never load remote content";
+    const HTTPS_ONLY: &str = "links in <Markdown> must be https:// links";
+    if md.contains("![") {
+        return Some(NO_IMAGES);
+    }
+    let lower = md.to_ascii_lowercase();
+    let b = lower.as_bytes();
+    for (i, c) in b.iter().enumerate() {
+        if *c == b'<'
+            && b.get(i + 1)
+                .is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, b'/' | b'!' | b'?'))
+        {
+            return Some("raw HTML and <…> autolinks aren't allowed in <Markdown>");
+        }
+    }
+    // Inline links and images: `](target`.
+    let mut rest = lower.as_str();
+    while let Some(p) = rest.find("](") {
+        let target = rest[p + 2..].trim_start().trim_start_matches('<');
+        if !target.starts_with("https://") {
+            return Some(HTTPS_ONLY);
+        }
+        rest = &rest[p + 2..];
+    }
+    // Reference definitions: `[label]: target`.
+    for line in lower.lines() {
+        let l = line.trim_start();
+        if l.starts_with('[')
+            && let Some(p) = l.find("]:")
+        {
+            let target = l[p + 2..].trim_start().trim_start_matches('<');
+            if !target.starts_with("https://") {
+                return Some(HTTPS_ONLY);
+            }
+        }
+    }
+    // Bare autolinked schemes other than https.
+    for scheme in [
+        "http://",
+        "javascript:",
+        "data:",
+        "file:",
+        "vbscript:",
+        "ftp://",
+        "mailto:",
+        "www.",
+    ] {
+        if lower.contains(scheme) {
+            return Some(HTTPS_ONLY);
+        }
+    }
+    None
+}
+
 // ---- Compiler ----
 
 struct Scope {
@@ -495,7 +553,8 @@ fn static_str(list: &'static [&'static str], s: &str) -> Option<&'static str> {
 }
 
 pub fn valid_key(k: &str) -> bool {
-    !k.is_empty()
+    !tsx::reserved(k)
+        && !k.is_empty()
         && k.len() <= MAX_KEY_CHARS
         && k.starts_with(|c: char| c.is_ascii_alphanumeric())
         && k.chars()
@@ -503,19 +562,20 @@ pub fn valid_key(k: &str) -> bool {
 }
 
 fn valid_ident(s: &str) -> bool {
-    !s.is_empty()
+    !tsx::reserved(s)
+        && !s.is_empty()
         && s.len() <= 32
         && s.starts_with(|c: char| c.is_ascii_alphabetic())
         && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
-/// A `<Column field>` path: `a` or `a.b.0`.
+/// A `<Column field>` or `<Chart x|y>` path: `a` or `a.b.0`.
 fn valid_field(s: &str) -> bool {
     !s.is_empty()
         && s.len() <= 128
         && s.split('.').all(|seg| {
             !seg.is_empty()
-                && !matches!(seg, "__proto__" | "constructor" | "prototype")
+                && !tsx::reserved(seg)
                 && seg.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         })
 }
@@ -725,7 +785,7 @@ impl<'a> Compiler<'a> {
                     AttrValue::Str(_) => self.push(
                         a.at,
                         key,
-                        "a key is 1..=64 letters, digits, - or _, starting with a letter or digit",
+                        "a key is 1..=64 letters, digits, - or _, starting with a letter or digit, and not a reserved name like constructor",
                     ),
                     _ => self.push(
                         a.at,
@@ -825,7 +885,7 @@ impl<'a> Compiler<'a> {
                         self.push(
                             a.at,
                             key,
-                            format!("`{name}` must be a simple name like \"runs\" or \"item\""),
+                            format!("`{name}` must be a simple name like \"runs\" or \"item\" (not a reserved name like constructor)"),
                         );
                         None
                     }
@@ -838,7 +898,9 @@ impl<'a> Compiler<'a> {
                             );
                             return None;
                         }
-                        if def.name == "Column" && name == "field" && !valid_field(&s) {
+                        let is_field = (def.name == "Column" && name == "field")
+                            || (def.name == "Chart" && (name == "x" || name == "y"));
+                        if is_field && !valid_field(&s) {
                             self.push(
                                 a.at,
                                 key,
@@ -982,7 +1044,22 @@ impl<'a> Compiler<'a> {
         true
     }
 
+    /// A `<Data>` declaration. It never disappears silently: if it can't
+    /// be used, the compile fails with a diagnostic.
     fn data(&mut self, e: &Element) -> Option<DataDecl> {
+        let before = self.diags.len();
+        let decl = self.data_inner(e);
+        if decl.is_none() && self.diags.len() == before {
+            self.push(
+                e.at,
+                None,
+                "this <Data> can't be used; check its name, source and parameters",
+            );
+        }
+        decl
+    }
+
+    fn data_inner(&mut self, e: &Element) -> Option<DataDecl> {
         let d = def("Data")?;
         let props = self.props(e, d, None, &Scope { names: vec![] });
         if !e.children.is_empty() {
@@ -1103,8 +1180,14 @@ impl<'a> Compiler<'a> {
     /// `space`, `room` and `agent` of a `<Data>` or an action, resolved.
     /// `room_optional`: the element may leave out a room.
     fn target(&mut self, e: &Element, key: Option<&str>, room_optional: bool) -> Option<Target> {
+        // `room="x"` and `room={"x"}` alike; other values were already
+        // reported by the property check.
         let lit = |n: &str| match e.attr(n).map(|a| &a.value) {
             Some(AttrValue::Str(s)) => Some(s.trim().to_owned()),
+            Some(AttrValue::Expr(x)) => match &x.kind {
+                ExprKind::Lit(serde_json::Value::String(s)) => Some(s.trim().to_owned()),
+                _ => None,
+            },
             _ => None,
         };
         let mut t = Target::default();
@@ -1361,6 +1444,20 @@ impl<'a> Compiler<'a> {
                 if len > MAX_TEXT_CHARS * 4 {
                     self.push(e.at, k, "this text is too long");
                 }
+                if d.kids == Kids::LiteralText {
+                    let text: String = block
+                        .content
+                        .iter()
+                        .filter_map(|v| match v {
+                            Value::Lit { v } => v.as_str().map(str::to_owned),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join("");
+                    if let Some(why) = markdown_problem(&text) {
+                        self.push(e.at, k, why);
+                    }
+                }
             }
             Kids::Columns => {
                 for c in &e.children {
@@ -1405,7 +1502,15 @@ impl<'a> Compiler<'a> {
         }
         if matches!(e.name.as_str(), "Button" | "Link") {
             self.actions += 1;
+            let before = self.diags.len();
             block.action = self.action(e, k, &block.props);
+            if block.action.is_none() && self.diags.len() == before {
+                self.push(
+                    e.at,
+                    k,
+                    "this button's action can't be used; check action= and its parameters",
+                );
+            }
             for p in ["space", "room", "agent", "prompt", "schedule", "page"] {
                 block.props.remove(p);
             }
@@ -1553,6 +1658,22 @@ pub fn compile(src: &str, resolver: &mut dyn Resolver) -> Compiled {
                     );
                 }
             }
+        }
+    }
+    // Invariant: what is stored can always be read back. The parser's caps
+    // keep specs shallow; this refuses anything that slipped past them.
+    if c.diags.is_empty()
+        && let Some(spec) = &spec
+    {
+        let back = serde_json::to_string(spec)
+            .ok()
+            .and_then(|j| serde_json::from_str::<PageSpec>(&j).ok());
+        if back.as_ref() != Some(spec) {
+            c.push(
+                root.at,
+                None,
+                "the page is too complex to store; simplify it",
+            );
         }
     }
     let diagnostics = c.diags;

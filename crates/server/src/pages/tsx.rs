@@ -16,6 +16,12 @@ pub const MAX_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_DEPTH: usize = 12;
 /// Deepest expression nesting (`!!x`, parentheses).
 const MAX_EXPR_DEPTH: usize = 8;
+/// Most operands of one `a ?? b ?? …` chain.
+pub const MAX_COALESCE: usize = 8;
+/// Most nodes (literals, reads, operators) in one `{…}` expression. With
+/// the operand and nesting caps this bounds every expression tree, so the
+/// compiler, the spec and its JSON never nest deeply.
+pub const MAX_EXPR_NODES: usize = 32;
 /// Most elements in one page, `<Data>` and `<Column>` included.
 pub const MAX_ELEMENTS: usize = 600;
 
@@ -168,7 +174,28 @@ impl Expr {
 
 /// Path segments that could reach an object's machinery in any JavaScript
 /// realm; never valid in a page, even though no page code runs.
-const FORBIDDEN_SEGMENTS: &[&str] = &["__proto__", "constructor", "prototype"];
+pub const RESERVED_NAMES: &[&str] = &[
+    "__proto__",
+    "constructor",
+    "prototype",
+    "toString",
+    "toLocaleString",
+    "valueOf",
+    "hasOwnProperty",
+    "isPrototypeOf",
+    "propertyIsEnumerable",
+    "__defineGetter__",
+    "__defineSetter__",
+    "__lookupGetter__",
+    "__lookupSetter__",
+];
+
+/// Whether `s` names an object's machinery in some JavaScript realm.
+pub fn reserved(s: &str) -> bool {
+    RESERVED_NAMES.contains(&s)
+}
+
+const FORBIDDEN_SEGMENTS: &[&str] = RESERVED_NAMES;
 
 /// Words that mean the model tried to write code.
 const CODE_WORDS: &[(&str, &str)] = &[
@@ -215,6 +242,8 @@ pub struct Parser<'a> {
     b: &'a [u8],
     i: usize,
     elements: usize,
+    /// Nodes of the expression being parsed.
+    expr_nodes: usize,
 }
 
 type PResult<T> = Result<T, Diagnostic>;
@@ -226,6 +255,7 @@ impl<'a> Parser<'a> {
             b: src.as_bytes(),
             i: 0,
             elements: 0,
+            expr_nodes: 0,
         }
     }
 
@@ -467,10 +497,12 @@ impl<'a> Parser<'a> {
                 };
                 let raw = &self.src[start..start + len];
                 self.i = start + len + 1;
+                let value = decode_entities(raw);
+                self.check_chars(start, &value)?;
                 Ok(Attr {
                     name,
                     at,
-                    value: AttrValue::Str(decode_entities(raw)),
+                    value: AttrValue::Str(value),
                     span: Some((start, start + len)),
                 })
             }
@@ -481,7 +513,7 @@ impl<'a> Parser<'a> {
                 if self.peek() == Some(b'}') {
                     return self.err(open, "empty `{}`: give a value");
                 }
-                let expr = self.expr(0)?;
+                let expr = self.top_expr()?;
                 self.skip_trivia()?;
                 self.close_brace(open)?;
                 Ok(Attr {
@@ -547,7 +579,7 @@ impl<'a> Parser<'a> {
                              use <Show when={…}>, to repeat them use <Each items={…} as=\"item\">",
                         );
                     }
-                    let expr = self.expr(0)?;
+                    let expr = self.top_expr()?;
                     self.skip_trivia()?;
                     if self.starts("&&") || self.starts("||") || self.peek() == Some(b'?') {
                         return self.err(
@@ -578,7 +610,9 @@ impl<'a> Parser<'a> {
                     }
                     let text = jsx_text(&self.src[start..self.i]);
                     if !text.is_empty() {
-                        out.push(Child::Text(decode_entities(&text), start));
+                        let text = decode_entities(&text);
+                        self.check_chars(start, &text)?;
+                        out.push(Child::Text(text, start));
                     }
                 }
             }
@@ -588,15 +622,42 @@ impl<'a> Parser<'a> {
     /// Expression grammar, lowest precedence first:
     /// `coalesce := cmp ("??" cmp)*`, `cmp := unary (op literal)?`,
     /// `unary := "!" unary | primary`.
+    /// One `{…}` expression, with its own node budget.
+    fn top_expr(&mut self) -> PResult<Expr> {
+        self.expr_nodes = 0;
+        self.expr(0)
+    }
+
+    /// Count one expression node; fails past [`MAX_EXPR_NODES`].
+    fn node(&mut self, at: usize) -> PResult<()> {
+        self.expr_nodes += 1;
+        if self.expr_nodes > MAX_EXPR_NODES {
+            return self.err(
+                at,
+                format!("the expression is too long (at most {MAX_EXPR_NODES} parts)"),
+            );
+        }
+        Ok(())
+    }
+
     fn expr(&mut self, depth: usize) -> PResult<Expr> {
         if depth > MAX_EXPR_DEPTH {
             return self.err(self.i, "the expression is nested too deeply");
         }
         let mut left = self.cmp(depth)?;
+        let mut operands = 1;
         loop {
             self.skip_trivia()?;
             if self.starts("??") {
                 let at = left.at;
+                operands += 1;
+                if operands > MAX_COALESCE {
+                    return self.err(
+                        self.i,
+                        format!("a ?? chain has at most {MAX_COALESCE} values"),
+                    );
+                }
+                self.node(at)?;
                 self.i += 2;
                 self.skip_trivia()?;
                 let right = self.cmp(depth + 1)?;
@@ -633,6 +694,7 @@ impl<'a> Parser<'a> {
         let Some((op, len)) = op else {
             return Ok(left);
         };
+        self.node(left.at)?;
         self.i += len;
         self.skip_trivia()?;
         let at = self.i;
@@ -656,6 +718,7 @@ impl<'a> Parser<'a> {
         self.skip_trivia()?;
         let at = self.i;
         if self.peek() == Some(b'!') && self.peek_at(1) != Some(b'=') {
+            self.node(at)?;
             self.i += 1;
             let inner = self.unary(depth + 1)?;
             return Ok(Expr {
@@ -668,6 +731,9 @@ impl<'a> Parser<'a> {
 
     fn primary(&mut self, depth: usize) -> PResult<Expr> {
         let at = self.i;
+        if self.peek() != Some(b'(') {
+            self.node(at)?;
+        }
         match self.peek() {
             Some(b'(') => {
                 self.i += 1;
@@ -689,6 +755,7 @@ impl<'a> Parser<'a> {
             }
             Some(q @ (b'"' | b'\'')) => {
                 let s = self.js_string(q)?;
+                self.check_chars(at, &s)?;
                 self.after_value()?;
                 Ok(Expr {
                     at,
@@ -712,6 +779,7 @@ impl<'a> Parser<'a> {
                 if raw.contains('\\') {
                     return self.err(at, "escapes in template strings aren't allowed");
                 }
+                self.check_chars(at, raw)?;
                 self.i = start + len + 1;
                 self.after_value()?;
                 Ok(Expr {
@@ -869,6 +937,22 @@ impl<'a> Parser<'a> {
         Ok(())
     }
 
+    /// Refuse control characters (other than line breaks and tabs) and
+    /// invisible direction overrides in a string's decoded value, however
+    /// they were written (raw, `\u…` escape or `&#…;` entity).
+    fn check_chars(&self, at: usize, s: &str) -> PResult<()> {
+        match s.chars().find(|c| forbidden_char(*c)) {
+            Some(c) => self.err(
+                at,
+                format!(
+                    "the character U+{:04X} isn't allowed in a page (control or text-direction character)",
+                    c as u32
+                ),
+            ),
+            None => Ok(()),
+        }
+    }
+
     fn unsupported<T>(&self) -> PResult<T> {
         self.err(
             self.i,
@@ -958,6 +1042,16 @@ impl<'a> Parser<'a> {
             ),
         }
     }
+}
+
+/// C0/C1 controls except `\n` and `\t`, bidi embeddings, overrides and
+/// isolates (U+202A–U+202E, U+2066–U+2069) and the LRM/RLM marks.
+pub fn forbidden_char(c: char) -> bool {
+    (c.is_control() && c != '\n' && c != '\t')
+        || ('\u{202A}'..='\u{202E}').contains(&c)
+        || ('\u{2066}'..='\u{2069}').contains(&c)
+        || c == '\u{200E}'
+        || c == '\u{200F}'
 }
 
 /// JSX whitespace rules: lines are trimmed, whitespace-only lines that

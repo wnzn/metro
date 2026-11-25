@@ -63,6 +63,55 @@ fn ok(c: &Compiled) {
         "expected success, got {:#?}",
         c.diagnostics
     );
+    invariants(c.spec.as_ref().unwrap());
+}
+
+/// What every accepted spec must satisfy: it reads back from its own JSON,
+/// and every data read starts at a declared `<Data>` or an enclosing `as`.
+#[track_caller]
+fn invariants(spec: &super::spec::PageSpec) {
+    let json = serde_json::to_string(spec).unwrap();
+    let back: super::spec::PageSpec = serde_json::from_str(&json)
+        .unwrap_or_else(|e| panic!("an accepted spec doesn't read back: {e}"));
+    assert_eq!(&back, spec);
+    fn roots(v: &Value, out: &mut Vec<String>) {
+        match v {
+            Value::Lit { .. } => {}
+            Value::Bind { path } => out.push(path[0].clone()),
+            Value::Not { a } => roots(a, out),
+            Value::Coalesce { a, b } => {
+                roots(a, out);
+                roots(b, out);
+            }
+            Value::Cmp { a, .. } => roots(a, out),
+        }
+    }
+    fn walk(b: &super::spec::Block, scope: &mut Vec<String>) {
+        let mut reads = Vec::new();
+        for v in b.props.values().chain(&b.content) {
+            roots(v, &mut reads);
+        }
+        for r in reads {
+            assert!(scope.contains(&r), "`{r}` read without a declaration");
+        }
+        let pushed = match b.props.get("as") {
+            Some(Value::Lit { v }) => {
+                scope.push(v.as_str().unwrap().to_owned());
+                true
+            }
+            _ => false,
+        };
+        for c in &b.children {
+            walk(c, scope);
+        }
+        if pushed {
+            scope.pop();
+        }
+    }
+    let mut scope: Vec<String> = spec.data.iter().map(|d| d.name.clone()).collect();
+    for b in &spec.blocks {
+        walk(b, &mut scope);
+    }
 }
 
 #[track_caller]
@@ -777,6 +826,9 @@ fn arbitrary_input_never_panics() {
         let src = String::from_utf8_lossy(&bytes);
         let c = space_page(&src);
         assert!(c.spec.is_some() != !c.diagnostics.is_empty());
+        if let Some(spec) = &c.spec {
+            invariants(spec);
+        }
     }
     for weird in [
         "\u{0}",
@@ -787,6 +839,207 @@ fn arbitrary_input_never_panics() {
     ] {
         let _ = space_page(weird);
     }
+}
+
+#[test]
+fn deep_and_long_expressions_are_refused_without_overflowing() {
+    let when = |expr: String| {
+        page(&format!(
+            "<Data name=\"r\" source=\"runs\"/><Show key=\"s\" when={{{expr}}}><Divider key=\"d\"/></Show>"
+        ))
+    };
+    // Review H1: a 15k-operand ?? chain used to recurse without bound.
+    for n in [15_000, 21_000] {
+        let chain = vec!["r"; n].join("??");
+        let src = when(chain);
+        assert!(src.len() < super::tsx::MAX_SOURCE_BYTES);
+        rejects(&space_page(&src), "at most 8 values");
+    }
+    let eight = vec!["r.active"; 8].join(" ?? ");
+    ok(&space_page(&when(eight)));
+    let nine = vec!["r.active"; 9].join(" ?? ");
+    rejects(&space_page(&when(nine)), "at most 8 values");
+    // Nesting, negation and long mixtures are bounded too.
+    let parens = format!("{}r{}", "(".repeat(15_000), ")".repeat(15_000));
+    rejects(&space_page(&when(parens)), "nested too deeply");
+    rejects(
+        &space_page(&when(format!("{}r", "!".repeat(15_000)))),
+        "nested too deeply",
+    );
+    let wide = vec!["(!!!!!r.active)"; 8].join(" ?? ");
+    rejects(&space_page(&when(wide)), "too long");
+    let nested_chains = format!(
+        "({0}) ?? ({0}) ?? ({0}) ?? ({0})",
+        vec!["(r.active ?? (r.items ?? (r.active ?? r.items)))"; 2].join(" ?? ")
+    );
+    let c = space_page(&when(nested_chains));
+    if let Some(spec) = &c.spec {
+        invariants(spec);
+    } else {
+        assert!(!c.diagnostics.is_empty());
+    }
+    // Thousands of nested elements stop at the depth limit.
+    let deep = format!(
+        "{}<Divider/>{}",
+        "<Row>".repeat(5_000),
+        "</Row>".repeat(5_000)
+    );
+    rejects(&space_page(&page(&deep)), "nested more than 12 deep");
+}
+
+#[test]
+fn control_and_direction_characters_are_refused_however_written() {
+    for bad in [
+        '\u{7}', '\u{1b}', '\u{85}', '\u{202E}', '\u{202A}', '\u{2066}', '\u{2069}', '\u{200E}',
+        '\u{200F}', '\r',
+    ] {
+        let raw = bad.to_string();
+        let escaped = format!("\\u{:04x}", bad as u32);
+        let entity = format!("&#x{:x};", bad as u32);
+        let cases = [
+            format!("<Text key=\"t\">a{raw}b</Text>"),
+            format!("<Stat key=\"s\" label=\"a{raw}b\" value={{1}}/>"),
+            format!("<Stat key=\"s\" label=\"a{entity}b\" value={{1}}/>"),
+            format!("<Text key=\"t\">a{entity}b</Text>"),
+            format!("<Stat key=\"s\" label={{\"a{escaped}b\"}} value={{1}}/>"),
+            format!("<Stat key=\"s\" label={{\"a{raw}b\"}} value={{1}}/>"),
+            format!("<Text key=\"t\">{{`a{raw}b`}}</Text>"),
+            format!(
+                "<Button key=\"b\" label=\"x\" action=\"runAgent\" agent=\"agent\" room=\"general\" prompt=\"run {raw}rm\"/>"
+            ),
+        ];
+        for body in cases {
+            let c = space_page(&page(&body));
+            // Numeric entities for C0/C1 controls stay literal text (they
+            // aren't decoded), which is harmless; everything else is refused.
+            if body.contains("&#x") && bad.is_control() {
+                if let Some(spec) = &c.spec {
+                    assert!(!serde_json::to_string(spec).unwrap().contains(bad));
+                    continue;
+                }
+            }
+            assert!(
+                c.spec.is_none(),
+                "accepted U+{:04X} in {body:?}",
+                bad as u32
+            );
+            assert!(
+                c.diagnostics
+                    .iter()
+                    .any(|d| d.message.contains("isn't allowed in a page")),
+                "{body:?}: {:#?}",
+                c.diagnostics
+            );
+        }
+    }
+    // Line breaks and tabs are fine.
+    ok(&space_page(&page(
+        "<Markdown key=\"m\">{\"a\\n\\tb\"}</Markdown>",
+    )));
+}
+
+#[test]
+fn markdown_never_loads_images_or_opens_other_schemes() {
+    for (md, needle) in [
+        ("![x](https://evil.example/p.png)", "can't show images"),
+        ("see [here](http://evil.example)", "https://"),
+        ("[x](javascript:alert(1))", "https://"),
+        ("[x]( JAVASCRIPT:alert(1))", "https://"),
+        ("[x](data:text/html,hi)", "https://"),
+        ("[x](file:///etc/passwd)", "https://"),
+        ("[x][r]\n\n[r]: http://evil.example", "https://"),
+        ("go to http://evil.example", "https://"),
+        ("go to www.evil.example", "https://"),
+        ("<img src=x>", "raw HTML"),
+        ("<https://evil.example>", "raw HTML"),
+        ("<!-- x -->", "raw HTML"),
+    ] {
+        let body = format!(
+            "<Markdown key=\"m\">{{{}}}</Markdown>",
+            serde_json::to_string(md).unwrap()
+        );
+        rejects(&space_page(&page(&body)), needle);
+    }
+    ok(&space_page(&page(
+        "<Markdown key=\"m\">See [the docs](https://example.com/docs) and a &lt; b.</Markdown>",
+    )));
+}
+
+#[test]
+fn data_declarations_are_never_silently_dropped() {
+    // A string in braces is the same string.
+    let c = space_page(&page(
+        "<Data name=\"m\" source=\"messages\" room={\"general\"} agent={\"agent\"}/><MessageFeed key=\"f\" from={m}/>",
+    ));
+    ok(&c);
+    let spec = c.spec.unwrap();
+    assert_eq!(spec.data[0].params.room_id.as_deref(), Some("r-general"));
+    assert_eq!(spec.data[0].params.agent_id.as_deref(), Some("ag-1"));
+    // Anything else fails the whole page with a diagnostic.
+    for body in [
+        "<Data name=\"m\" source=\"messages\" room={1}/><MessageFeed key=\"f\" from={m}/>",
+        "<Data name=\"m\" source=\"messages\" room={true}/><MessageFeed key=\"f\" from={m}/>",
+        "<Data name=\"m\" source=\"messages\" room={null}/><MessageFeed key=\"f\" from={m}/>",
+        "<Data name={\"m\"} source={1} room=\"general\"/><MessageFeed key=\"f\" from={m}/>",
+        "<Data name=\"m\" source=\"runs\" space={\"s-team\"}/><RunList key=\"f\" from={m}/>",
+        "<Data name=\"m\" source=\"messages\"/><MessageFeed key=\"f\" from={m}/>",
+    ] {
+        let c = space_page(&page(body));
+        assert!(c.spec.is_none(), "accepted {body}");
+        assert!(!c.diagnostics.is_empty());
+    }
+}
+
+#[test]
+fn reserved_names_and_chart_fields_are_checked() {
+    for (body, needle) in [
+        (
+            "<Stat key=\"constructor\" label=\"x\" value={1}/>",
+            "reserved name",
+        ),
+        (
+            "<Stat key=\"__proto__\" label=\"x\" value={1}/>",
+            "reserved name",
+        ),
+        (
+            "<Stat key=\"toString\" label=\"x\" value={1}/>",
+            "reserved name",
+        ),
+        (
+            "<Data name=\"constructor\" source=\"runs\"/>",
+            "reserved name",
+        ),
+        ("<Data name=\"valueOf\" source=\"runs\"/>", "reserved name"),
+        (
+            "<Data name=\"r\" source=\"runs\"/><Each key=\"e\" items={r.items} as=\"hasOwnProperty\"><Divider key=\"d\"/></Each>",
+            "reserved name",
+        ),
+        (
+            "<Data name=\"r\" source=\"runs\"/><Chart key=\"c\" kind=\"bar\" data={r.items} x=\"__proto__\" y=\"status\"/>",
+            "field must be a path",
+        ),
+        (
+            "<Data name=\"r\" source=\"runs\"/><Chart key=\"c\" kind=\"bar\" data={r.items} x=\"agent\" y=\"a.constructor\"/>",
+            "field must be a path",
+        ),
+        (
+            "<Data name=\"r\" source=\"runs\"/><Chart key=\"c\" kind=\"bar\" data={r.items} x=\"a b\" y=\"status\"/>",
+            "field must be a path",
+        ),
+        (
+            "<Data name=\"r\" source=\"runs\"/><Table key=\"t\" rows={r.items}><Column field=\"toString\" label=\"A\"/></Table>",
+            "field must be a path",
+        ),
+        (
+            "<Data name=\"r\" source=\"runs\"/><Stat key=\"s\" label=\"x\" value={r.items.valueOf}/>",
+            "can't be read",
+        ),
+    ] {
+        rejects(&space_page(&page(body)), needle);
+    }
+    ok(&space_page(&page(
+        "<Data name=\"r\" source=\"runs\"/><Chart key=\"c\" kind=\"bar\" data={r.items} x=\"agent\" y=\"status\"/>",
+    )));
 }
 
 mod store_tests {
@@ -870,7 +1123,7 @@ mod store_tests {
         }
         // A save based on an old head never overwrites.
         assert_eq!(
-            store::add_version(&db, &p.id, 3, &version("bob", "stale"), &limits).unwrap(),
+            store::add_version(&db, &p.id, 3, &version("alice", "stale"), &limits).unwrap(),
             Err(store::Conflict { head: 6 })
         );
         let kept: Vec<i64> = store::versions(&db, &p.id)
@@ -912,14 +1165,17 @@ mod store_tests {
                 prompt: "x",
             },
         )
-        .unwrap()
         .unwrap();
         db.remove_member(&sid, "bob").unwrap();
         assert!(!store::prefs(&db, "bob", &p.id).unwrap().pinned);
         assert!(!store::confirmed(&db, "bob", &p.id, 1).unwrap());
         let drafts: i64 = db
             .lock()
-            .query_row("SELECT COUNT(*) FROM page_drafts", [], |r| r.get(0))
+            .query_row(
+                "SELECT COUNT(*) FROM page_drafts",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(drafts, 0);
         // The page Bob created stays, like his messages.
