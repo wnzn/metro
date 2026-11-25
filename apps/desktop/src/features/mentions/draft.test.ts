@@ -260,6 +260,166 @@ test("quotes in inline and fenced code cannot interfere with quoted addresses", 
   ]);
 });
 
+test("quoted names do not pair backward through inline or fenced code", () => {
+  for (const text of [
+    '>"`quote"` then "@Alice Moreno"',
+    '>"``🌿 quote"`` then "@Alice Moreno"',
+    '>"`quote"` then <"local"@agent> and "@Alice Moreno"',
+    '>"`quote"`"local"@agent and "@Alice Moreno"',
+    '>"prose\n```text\nquote" @agent\n```\nthen <"local"@agent> and "@Alice Moreno"',
+  ]) {
+    const mention = "@Alice Moreno";
+    const start = new TextEncoder().encode(text.slice(0, text.indexOf(mention))).length;
+    expect(send(text)).toEqual({
+      ok: true, body: { text, mentions: [alice], spans: [{ start, end: start + mention.length, index: 0 }] },
+    });
+  }
+});
+
+test("a picked label is a quote boundary; an address that opens after it still stays plain", () => {
+  const ops = { kind: "user", id: "ops" } as const;
+  const directory = { ...roster, members: [...roster.members, { id: ops.id, displayName: 'Ops "desk' }] };
+  const picked = pick(draft('>" @o'), 3, 5, ops, directory);
+  for (const suffix of ['then "@Alice Moreno"', 'then <"local"@agent> and "@Alice Moreno"']) {
+    const edited = updateMentionDraft(picked, `${picked.text}${suffix}`);
+    expect(edited.anchors[0]?.picked).toBe(true);
+    const out = body(prepareMentionSend(edited, directory));
+    expect(out.mentions).toEqual([ops, alice]);
+    const bytes = new TextEncoder().encode(edited.text);
+    expect(out.spans?.map(s => new TextDecoder().decode(bytes.slice(s.start, s.end))))
+      .toEqual(['@Ops "desk', "@Alice Moreno"]);
+  }
+});
+
+test("an agent at an interrupted quote boundary requires an explicit choice", () => {
+  const source = draft('>"`quote"` then "@agent"');
+  const [match] = scanMentionDraft(source, roster);
+  expect(match.kind).toBe("ambiguous");
+  const blocked = prepareMentionSend(source, roster);
+  expect(blocked.ok ? null : blocked.reason).toBe("ambiguous");
+  const chosen = pickMention(source, match, generic, roster)!;
+  expect(body(prepareMentionSend(chosen, roster)).mentions).toEqual([generic]);
+
+  const before = '>"`quote"` then @agent ';
+  const captured = captureTypedMentions(draft(before), roster);
+  const start = before.indexOf("@agent");
+  const edited = editMentionDraft(captured, { start, end: start, replacement: '"' })!;
+  const afterEdit = prepareMentionSend(edited, roster);
+  expect(!afterEdit.ok && afterEdit.reason === "ambiguous" ? afterEdit.match.choices : null).toEqual([generic]);
+});
+
+test("agents inside an interrupted quoted local part require an explicit choice", () => {
+  for (const [text, expected] of [
+    ['Use "local `note` @agent here"@example.org', [["ambiguous", "@agent"]]],
+    ['Use "local `note`:@agent here"@example.org', [["ambiguous", "@agent"]]],
+    ['Use "done,"local `note` @agent here"@example.org', [["ambiguous", "@agent"]]],
+    ['Use "local `note` @agent. Still local"@example.org', [["ambiguous", "@agent"]]],
+    ['Use "local `note` @agent here "@example.org', [["ambiguous", "@agent"]]],
+    ['Use "local `first` @coder `last` @agent here"@example.org', [["ambiguous", "@coder"], ["ambiguous", "@agent"]]],
+    ['Use "hello " `note` @agent here "@example.org', [["ambiguous", "@agent"]]],
+    ['Say "hello " then " local `note` @agent here "@example.org', [["ambiguous", "@agent"]]],
+    ['Use "local @coder `note` said "hi!" @agent here"@example.org', [["ambiguous", "@coder"], ["ambiguous", "@agent"]]],
+    ['Use "local @coder `note` then " here @agent here"@example.org', [["ambiguous", "@coder"], ["ambiguous", "@agent"]]],
+    ['@coder then use "local `note` @agent here"@example.org', [["resolved", "@coder"], ["ambiguous", "@agent"]]],
+    ['Use "local `note` @agent " @bo', [["resolved", "@agent"], ["resolved", "@bo"]]],
+    ['Use `note`. @coder finished. Say "@Alice Moreno"', [["resolved", "@coder"], ["resolved", "@Alice Moreno"]]],
+    ['Use `note`. @coder finished. Say "@agent"', [["resolved", "@coder"], ["ambiguous", "@agent"]]],
+    ['Use "done," `note`. @coder finished. Say "@agent"', [["ambiguous", "@coder"], ["ambiguous", "@agent"]]],
+    ['Use "confirmed"@example.org `note`. @coder finished. Say "@agent"', [["resolved", "@coder"], ["ambiguous", "@agent"]]],
+    ['Use `note`. @coder finished. Then "local"@agent and "@Alice Moreno"', [["resolved", "@coder"], ["resolved", "@Alice Moreno"]]],
+    ['Use "local `note`\n@coder. Say "@Alice Moreno"', [["resolved", "@coder"], ["resolved", "@Alice Moreno"]]],
+    ['Use "local @coder `note`\nUse `other` Say "@agent"', [["resolved", "@coder"], ["ambiguous", "@agent"]]],
+  ] as const) {
+    const matches = scanMentionDraft(draft(text), roster, { finalize: true }).filter(m => m.kind !== "unresolved");
+    expect(matches.map(m => [m.kind, m.literal])).toEqual(expected);
+    const result = prepareMentionSend(draft(text), roster);
+    expect(result.ok ? null : result.reason).toBe(expected.some(([kind]) => kind === "ambiguous") ? "ambiguous" : null);
+  }
+});
+
+test("interrupted local parts recheck fresh and captured agents before, between, and after opaque ranges", () => {
+  for (const [opener, quote] of [
+    ['Use "local ', '"'],
+    ['Use "hello " then " local ', '"'],
+    ["Use 'hello ' then ' local ", "'"],
+  ] as const) {
+    for (const [token, recipient] of [["@coder", coder], ["@agent", generic]] as const) {
+      for (const placement of [`${token} \`first\` \`last\``, `\`first\` ${token} \`last\``, `\`first\` \`last\` ${token}`]) {
+        for (const closing of [quote, ` ${quote}`]) {
+          const before = `${opener}${placement} @Alice Moreno `;
+          const after = `${before}here${closing}@example.org`;
+          const captured = captureTypedMentions(draft(before), roster);
+          expect(captured.anchors.map(a => a.mention)).toEqual([recipient, alice]);
+          for (const candidate of [draft(after), updateMentionDraft(captured, after)]) {
+            const matches = scanMentionDraft(candidate, roster).filter(m => m.kind !== "unresolved");
+            expect(matches.map(m => [m.kind, m.literal])).toEqual([["ambiguous", token], ["resolved", "@Alice Moreno"]]);
+            const result = prepareMentionSend(candidate, roster);
+            expect(!result.ok && result.reason === "ambiguous" ? result.match.choices : null).toEqual([recipient]);
+          }
+        }
+      }
+    }
+  }
+});
+
+test("the interrupted examples block automatic captures after edits", () => {
+  for (const [before, suffix, expected] of [
+    ['Use "local `first` @coder `last` @agent ', 'here"@example.org', [coder, generic]],
+    ['Use "hello " `note` @agent ', 'here "@example.org', [generic]],
+  ] as const) {
+    const captured = captureTypedMentions(draft(before), roster);
+    expect(captured.anchors.map(a => a.mention)).toEqual(expected);
+    const edited = updateMentionDraft(captured, `${before}${suffix}`);
+    expect(scanMentionDraft(edited, roster).filter(m => m.kind === "ambiguous").flatMap(m => m.choices)).toEqual(expected);
+    const blocked = prepareMentionSend(edited, roster);
+    if (blocked.ok || blocked.reason !== "ambiguous") throw new Error("Expected an explicit recipient choice");
+    const confirmed = pickMention(edited, blocked.match, expected[0], roster)!;
+    const afterPick = prepareMentionSend(confirmed, roster);
+    if (expected.length > 1) {
+      expect(!afterPick.ok && afterPick.reason === "ambiguous" ? afterPick.match.choices : null).toEqual([generic]);
+    } else {
+      expect(body(afterPick).mentions).toEqual([generic]);
+    }
+  }
+  const before = 'Use "done," `note`. @coder finished. Say @agent ';
+  const captured = captureTypedMentions(draft(before), roster);
+  expect(captured.anchors.map(a => a.mention)).toEqual([coder, generic]);
+  const start = before.indexOf("@agent");
+  const opened = editMentionDraft(captured, { start, end: start, replacement: '"' })!;
+  const end = opened.text.length - 1;
+  const edited = editMentionDraft(opened, { start: end, end: end + 1, replacement: '"' })!;
+  expect(edited.text).toBe('Use "done," `note`. @coder finished. Say "@agent"');
+  expect(scanMentionDraft(edited, roster).filter(m => m.kind === "ambiguous").flatMap(m => m.choices))
+    .toEqual([coder, generic]);
+});
+
+test("an edit rechecks typed anchors but preserves a deliberate pick next to an interrupted local part", () => {
+  const before = 'Use "local `note` @agent ';
+  const after = `${before}here"@example.org`;
+  const captured = captureTypedMentions(draft(before), roster);
+  expect(body(prepareMentionSend(captured, roster)).mentions).toEqual([generic]);
+  const edited = captureTypedMentions(updateMentionDraft(captured, after), roster);
+  const blocked = prepareMentionSend(edited, roster);
+  expect(!blocked.ok && blocked.reason === "ambiguous" ? blocked.match.choices : null).toEqual([generic]);
+  const [match] = scanMentionDraft(edited, roster);
+  const confirmed = pickMention(edited, match, generic, roster)!;
+  expect(body(prepareMentionSend(confirmed, roster)).mentions).toEqual([generic]);
+
+  const start = before.indexOf("@agent");
+  const picked = pick(draft(before), start, start + 6, generic);
+  const withSuffix = updateMentionDraft(picked, after);
+  expect(withSuffix.anchors[0]?.picked).toBe(true);
+  const sent = body(prepareMentionSend(withSuffix, roster));
+  expect(sent).toEqual({ text: after, mentions: [generic], spans: [{ start, end: start + 6, index: 0 }] });
+
+  const person = pick(draft('Use "local @al and @agent '), 11, 14, alice);
+  const personAndAgent = captureTypedMentions(person, roster);
+  const afterPerson = updateMentionDraft(personAndAgent, `${personAndAgent.text}here"@example.org`);
+  const recipients = scanMentionDraft(afterPerson, roster).filter(m => m.kind !== "unresolved");
+  expect(recipients.map(m => [m.kind, m.literal])).toEqual([["resolved", "@Alice Moreno"], ["ambiguous", "@agent"]]);
+  expect(afterPerson.anchors[0]?.picked).toBe(true);
+});
+
 test("quoted addresses are recognized independently of unmatched prose quotes", () => {
   for (const text of [
     'Say "`quote`" then <"local"@agent>',
@@ -396,6 +556,62 @@ test("wrapped and emphasized quoted email never contributes an agent recipient o
         .toEqual(["@Alice Moreno"]);
     }
   }
+});
+
+test("quoted mail can start directly after a Markdown blockquote marker", () => {
+  const directory = {
+    ...roster, agents: [...roster.agents, { id: "ag-underscore", handle: "agent_", name: "Underscore" }],
+  };
+  for (const text of ['>"local"@agent', '>_"local"@agent_']) {
+    expect(scanMentionDraft(draft(text), directory, { finalize: true })).toEqual([]);
+    expect(send(text, directory)).toEqual({ ok: true, body: { text } });
+    const start = text.indexOf("@");
+    expect(pickMention(draft(text), { start, end: text.length, literal: text.slice(start) }, generic, directory)).toBe(null);
+  }
+});
+
+test("nested blockquote prefixes preserve wrapped addresses, adjacent addresses, and UTF-8 spans", () => {
+  const directory = {
+    ...roster, agents: [...roster.agents,
+      { id: "ag-underscore", handle: "agent_", name: "Underscore" },
+      { id: "ag-double-underscore", handle: "agent__", name: "Double Underscore" },
+    ],
+  };
+  for (const prefix of [">", ">>", "> >", "  > >>", ">\t>", "🌿 Earlier\r\n   >   >"]) {
+    for (const [left, right] of [["", ""], ["_", "_"], ["__", "__"], ["*", "*"], ["(*", "*)"], ["<", ">"]]) {
+      for (const suffix of ["", ',"second"@coder', ';_" second"@agent_']) {
+        const text = `${prefix}${left}"local"@agent${right}${suffix}\n🌿 Say "@Alice Moreno"`;
+        const mention = "@Alice Moreno";
+        const start = new TextEncoder().encode(text.slice(0, text.indexOf(mention))).length;
+        expect(send(text, directory)).toEqual({
+          ok: true, body: { text, mentions: [alice], spans: [{ start, end: start + mention.length, index: 0 }] },
+        });
+      }
+    }
+  }
+});
+
+test("an angle bracket outside a blockquote prefix does not change mention or chooser boundaries", () => {
+  for (const text of [
+    'See <tag>" "@Alice Moreno"',
+    'See <tag>_" "@Alice Moreno"',
+    '> See <tag>" "@Alice Moreno"',
+    '    >" "@Alice Moreno"',
+    '\\>" "@Alice Moreno"',
+    '>"@Alice Moreno"',
+  ]) expect(body(send(text)).mentions).toEqual([alice]);
+
+  const source = draft('>"@Alice Moreno"');
+  const [match] = scanMentionDraft(source, roster);
+  const chosen = pickMention(source, match, alice, roster)!;
+  expect(chosen.anchors[0]?.picked).toBe(true);
+  expect(body(prepareMentionSend(chosen, roster)).mentions).toEqual([alice]);
+  const text = ">@agent";
+  const selection = { start: 1, end: text.length, literal: "@agent" };
+  expect(send(text)).toEqual({ ok: true, body: { text } });
+  expect(pickMention(draft(text), selection, generic, roster)).toBe(null);
+  expect(prepareMentionSend({ text, anchors: [{ ...selection, mention: generic, picked: true }] }, roster))
+    .toEqual({ ok: false, reason: "invalid-anchor" });
 });
 
 test("an email-like invalid host stays in the chooser even after its agent changes handle", () => {

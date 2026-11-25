@@ -25,52 +25,114 @@ function visibleQuote(text: string, i: number, opaque: readonly MentionRange[]):
   return !overlapsRanges({ start: i, end: i + 1 }, opaque) && !escaped(text, i, opaque);
 }
 
-function previousQuote(text: string, before: number, opaque: readonly MentionRange[]): number | null {
-  const quote = text[before];
-  for (let i = before - 1; i >= 0; i--) {
-    if (/[\r\n\u0085\u2028\u2029]/u.test(text[i])) break;
+type QuoteLookback = number | MentionRange | null;
+const lineBreak = /[\r\n\u0085\u2028\u2029]/u;
+
+function visibleQuoteBefore(
+  text: string, before: number, floor: number, quote: string, opaque: readonly MentionRange[],
+): number | "line-break" | null {
+  for (let i = before - 1; i >= floor; i--) {
+    if (lineBreak.test(text[i])) return "line-break";
     if (text[i] === quote && visibleQuote(text, i, opaque)) return i;
   }
   return null;
 }
 
-function openingUnderscores(text: string, quote: number): number {
+function opaqueBefore(before: number, opaque: readonly MentionRange[]): MentionRange | null {
+  let boundary: MentionRange | null = null;
+  for (const range of opaque) {
+    if (range.start >= before) continue;
+    const end = Math.min(range.end, before);
+    if (!boundary || end > boundary.end || (end === boundary.end && range.start < boundary.start)) {
+      boundary = { start: range.start, end };
+    }
+  }
+  return boundary;
+}
+
+function previousQuote(text: string, before: number, opaque: readonly MentionRange[]): QuoteLookback {
+  const boundary = opaqueBefore(before, opaque);
+  // Code and selected labels split the line into quote-pairing regions.
+  // A hidden delimiter must not join visible quotes on opposite sides.
+  const prior = visibleQuoteBefore(text, before, boundary?.end ?? 0, text[before], opaque);
+  if (prior !== null) return prior === "line-break" ? null : prior;
+  return boundary && !lineBreak.test(text[boundary.end - 1]) ? boundary : null;
+}
+
+function startsEmailToken(text: string, start: number, opaque: readonly MentionRange[]): boolean {
+  // The right edge of opaque text can start a new token without a space.
+  if (start === 0 || sharedOpen.test(text[start - 1]) || opaque.some(range => range.end === start)) return true;
+  if (text[start - 1] !== ">") return false;
+  // A no-space `>` is an email boundary only at a Markdown line prefix.
+  // Do not admit a prose closing angle bracket or widen wire mention spans.
+  let prefix = start - 1;
+  while (prefix > 0 && /[> \t]/.test(text[prefix - 1])) prefix--;
+  return (prefix === 0 || /[\r\n]/.test(text[prefix - 1]))
+    && /^ {0,3}>(?:(?: {0,4}|\t {0,3})>)*$/.test(text.slice(prefix, start));
+}
+
+function openingUnderscores(text: string, quote: number, opaque: readonly MentionRange[]): number {
   // Underscore emphasis can wrap mail, but is not wire mention punctuation:
   // underscores are legal in handles and the server treats them as part of one.
   let start = quote;
   while (start > 0 && text[start - 1] === "_") start--;
-  return (start === 0 || sharedOpen.test(text[start - 1])) ? quote - start : 0;
+  return start < quote && startsEmailToken(text, start, opaque) ? quote - start : 0;
 }
 
-function startsQuotedToken(text: string, start: number): boolean {
+function startsQuotedToken(text: string, start: number, opaque: readonly MentionRange[]): boolean {
   // Narrower than a mention boundary: the quote in `hello!"`, for example,
   // closes prose rather than starting a new local-part token.
-  return start === 0 || sharedOpen.test(text[start - 1]) || openingUnderscores(text, start) > 0;
+  return startsEmailToken(text, start, opaque) || openingUnderscores(text, start, opaque) > 0;
 }
 
 function endsDelimitedToken(text: string, end: number): boolean {
   return end === text.length || space.test(text[end]) || trailing.test(text[end]);
 }
 
-/** Find a complete local part ending at this quote, without pairing unrelated prose quotes. */
-export function quotedLocalStart(text: string, close: number, opaque: readonly MentionRange[]): number | null {
-  if (close < 1 || close >= text.length) return null;
+function quotedLocalBoundary(text: string, close: number, opaque: readonly MentionRange[]): QuoteLookback | undefined {
+  if (close < 0 || close >= text.length) return undefined;
   const quote = text[close];
-  if ((quote !== '"' && quote !== "'") || !visibleQuote(text, close, opaque)) return null;
+  if ((quote !== '"' && quote !== "'") || !visibleQuote(text, close, opaque)) return undefined;
   const start = previousQuote(text, close, opaque);
   // An unescaped inner quote makes this local part incomplete; do not
   // skip it to grab an earlier quote with a better boundary.
-  return start !== null && startsQuotedToken(text, start) ? start : null;
+  return typeof start === "number" && !startsQuotedToken(text, start, opaque) ? null : start;
+}
+
+/** Find a complete local part ending at this quote, without pairing unrelated prose quotes. */
+export function quotedLocalStart(text: string, close: number, opaque: readonly MentionRange[]): number | null {
+  const start = quotedLocalBoundary(text, close, opaque);
+  return typeof start === "number" ? start : null;
+}
+
+function proseCloserShape(text: string, start: number): boolean {
+  const before = text[start - 1];
+  return /[,;:]/.test(before) || (space.test(before) && space.test(text[start + 1]));
 }
 
 function couldCloseProse(text: string, start: number, opaque: readonly MentionRange[]): boolean {
-  if (start === 0) return false;
-  const before = text[start - 1];
-  if (!/[,;:]/.test(before) && !(space.test(before) && space.test(text[start + 1]))) return false;
+  if (!proseCloserShape(text, start)) return false;
   const earlier = previousQuote(text, start, opaque);
   // The preceding quote may already close a local part, as in
   // `"first"@host," second"@host`; it cannot open prose at the separator.
-  return earlier !== null && startsQuotedToken(text, earlier) && text[earlier + 1] !== "@";
+  return typeof earlier === "number" && startsQuotedToken(text, earlier, opaque) && text[earlier + 1] !== "@";
+}
+
+function interruptedCandidateStart(
+  text: string, close: number, opaque: readonly MentionRange[], confirmed: readonly MentionRange[],
+): number | null {
+  const boundary = opaqueBefore(close, opaque);
+  if (!boundary) return null;
+  // Don't guess which of several same-line quotes belongs to prose. If a
+  // local part could cross an opaque region, ask before addressing any
+  // agent from the earliest plausible opener to the putative closing @.
+  // This is never a confirmed email and does not hide a person's mention.
+  let start: number | null = null;
+  for (let i = close - 1; i >= 0 && !lineBreak.test(text[i]); i--) {
+    if (i < boundary.start && text[i] === text[close] && visibleQuote(text, i, opaque) && startsQuotedToken(text, i, opaque)
+      && !overlapsRanges({ start: i, end: i + 1 }, confirmed)) start = i;
+  }
+  return start;
 }
 
 function quotedEmailSyntax(text: string, opaque: readonly MentionRange[]) {
@@ -82,30 +144,35 @@ function quotedEmailSyntax(text: string, opaque: readonly MentionRange[]) {
   const domainLabel = /^[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}-]*[\p{L}\p{N}\p{M}])?$/u;
   for (const match of text.matchAll(/["']@/gu)) {
     const close = match.index!;
-    const start = quotedLocalStart(text, close, opaque);
-    if (start === null) continue;
-    // Use the original @ even when it starts an anchor: an adjoining
-    // edit can turn a formerly standalone mention into an email domain.
-    const range = { start, end: close + 2 };
+    const local = quotedLocalBoundary(text, close, opaque);
+    if (local === undefined) continue;
     domain.lastIndex = close + 2;
     const host = domain.exec(text)?.[0];
-    if (!host) {
-      // These can start a Metro agent handle but not a host name.
-      if (/[_-]/.test(text[close + 2])) uncertain.push(range);
-      continue;
+    // A leading underscore or hyphen can start an agent handle, not a host.
+    if (!host && !/[_-]/.test(text[close + 2])) continue;
+    let interrupted: number | null | undefined;
+    if (host && typeof local === "number") {
+      const end = domain.lastIndex;
+      const completeHost = host.startsWith("[") || host.replace(/\.$/, "").split(".").every(label => domainLabel.test(label));
+      const underscores = text[end] === "_" ? openingUnderscores(text, local, opaque) : 0;
+      const closesEmphasis = underscores > 0 && text.startsWith("_".repeat(underscores), end)
+        && endsDelimitedToken(text, end + underscores);
+      const boundary = endsDelimitedToken(text, end) || closesEmphasis;
+      if (completeHost && boundary && !couldCloseProse(text, local, opaque)
+        && !(text[end] === text[close] && visibleQuote(text, end, opaque))) {
+        if (proseCloserShape(text, local)) interrupted = interruptedCandidateStart(text, close, opaque, quoted);
+        if (interrupted == null) {
+          // Use the original @ even when it starts an anchor: an adjoining
+          // edit can turn a formerly standalone mention into an email domain.
+          quoted.push({ start: local, end: close + 2 });
+          continue;
+        }
+      }
     }
-    const end = domain.lastIndex;
-    const completeHost = host.startsWith("[") || host.replace(/\.$/, "").split(".").every(label => domainLabel.test(label));
-    const underscores = text[end] === "_" ? openingUnderscores(text, start) : 0;
-    const closesEmphasis = underscores > 0 && text.startsWith("_".repeat(underscores), end)
-      && endsDelimitedToken(text, end + underscores);
-    const boundary = endsDelimitedToken(text, end) || closesEmphasis;
-    if (!completeHost || !boundary || couldCloseProse(text, start, opaque)
-      || (text[end] === text[close] && visibleQuote(text, end, opaque))) {
-      uncertain.push(range);
-      continue;
+    interrupted ??= interruptedCandidateStart(text, close, opaque, quoted);
+    if (local !== null || interrupted !== null) {
+      uncertain.push({ start: Math.min(typeof local === "number" ? local : close, interrupted ?? close), end: close + 2 });
     }
-    quoted.push(range);
   }
   return { quoted, uncertain };
 }
