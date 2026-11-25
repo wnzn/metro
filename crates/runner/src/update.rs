@@ -515,6 +515,15 @@ impl Switch {
     /// Write pending intent, durably move `current`, and execute the checked
     /// descriptor. If exec fails, the lock is still held during recovery.
     pub fn exec(self) -> io::Error {
+        let error = self.execute();
+        // Successful exec closed this descriptor via CLOEXEC. On error the
+        // switch is over; unlock this exact file description even if an
+        // unrelated concurrent fork briefly inherited a reference to it.
+        let _ = self.lock.dir.unlock();
+        error
+    }
+
+    fn execute(&self) -> io::Error {
         // Normal self-updates must still match the signed tree immediately
         // before switching. Prepared rollback and fixture switches use a
         // separately opened, previously installed version instead.
