@@ -326,6 +326,15 @@ impl Lock {
     }
 }
 
+impl Lock {
+    /// Hand the held lock over (to a [`Switch`], which releases it).
+    pub fn into_path(self) -> PathBuf {
+        let path = self.path.clone();
+        std::mem::forget(self);
+        path
+    }
+}
+
 impl Drop for Lock {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.path);
@@ -353,6 +362,16 @@ pub struct Switch {
     _envp: Vec<CString>,
     argv_ptrs: Vec<*const libc::c_char>,
     envp_ptrs: Vec<*const libc::c_char>,
+    /// The installers' lock (`owner` file, directory), held until the exec.
+    lock: Option<(CString, CString)>,
+}
+
+impl Drop for Switch {
+    /// A switch that is dropped (not exec'd, or after a failed exec) lets go
+    /// of the lock it holds.
+    fn drop(&mut self) {
+        self.release_lock();
+    }
 }
 
 fn cpath(p: &Path) -> io::Result<CString> {
@@ -367,8 +386,8 @@ impl Switch {
         revert: &str,
         pending: Option<&PendingFile>,
         remove_pending: bool,
-        argv: Vec<OsString>,
-        envp: Vec<(OsString, OsString)>,
+        (argv, envp): (Vec<OsString>, Vec<(OsString, OsString)>),
+        lock: Option<&Path>,
     ) -> io::Result<Switch> {
         let target_rel = Path::new("versions").join(target);
         let revert_rel = Path::new("versions").join(revert);
@@ -409,6 +428,10 @@ impl Switch {
             _envp: envp,
             argv_ptrs,
             envp_ptrs,
+            lock: match lock {
+                Some(l) => Some((cpath(&l.join("owner"))?, cpath(l)?)),
+                None => None,
+            },
         })
     }
 
@@ -423,6 +446,16 @@ impl Switch {
             libc::unlink(self.current_new.as_ptr());
             libc::symlink(rel.as_ptr(), self.current_new.as_ptr()) == 0
                 && libc::rename(self.current_new.as_ptr(), self.current.as_ptr()) == 0
+        }
+    }
+
+    fn release_lock(&self) {
+        if let Some((owner, dir)) = &self.lock {
+            // SAFETY: unlink/rmdir on our own NUL-terminated paths.
+            unsafe {
+                libc::unlink(owner.as_ptr());
+                libc::rmdir(dir.as_ptr());
+            }
         }
     }
 
@@ -479,6 +512,9 @@ impl Switch {
                 return e;
             }
             self.sync_root();
+            // The install is consistent again: let installers in, then become
+            // the new version.
+            self.release_lock();
             libc::execve(
                 self.exe.as_ptr(),
                 self.argv_ptrs.as_ptr(),
@@ -521,7 +557,15 @@ pub fn on_start(root: &Path, own: &Version) -> io::Result<StartAction> {
                 0o600,
             )?;
             let (argv, envp) = Switch::own_process();
-            let switch = Switch::new(root, &pending.from, &pending.to, None, true, argv, envp)?;
+            let switch = Switch::new(
+                root,
+                &pending.from,
+                &pending.to,
+                None,
+                true,
+                (argv, envp),
+                None,
+            )?;
             return Ok(StartAction::RollBack(Box::new(switch)));
         }
         write_atomic(
@@ -683,17 +727,22 @@ impl Updater {
             attempts: 0,
         };
         let (argv, envp) = Switch::own_process();
+        // The switch keeps the installers' lock until the exec itself, so no
+        // script can change the install between here and the new version.
+        let lock_path = lock.into_path();
         let switch = Switch::new(
             &self.root,
             &version,
             &self.own.to_string(),
             Some(&pending),
             false,
-            argv,
-            envp,
+            (argv, envp),
+            Some(&lock_path),
         )
-        .map_err(|e| io_err("io", "preparing the switch", e))?;
-        drop(lock);
+        .map_err(|e| {
+            let _ = fs::remove_dir_all(&lock_path);
+            io_err("io", "preparing the switch", e)
+        })?;
         Ok(switch)
     }
 }

@@ -159,12 +159,16 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
     assert_eq!(fs::read(&new_bin).unwrap(), stub(0));
     assert_eq!(fs::read(root.path.join(update::SCRIPT)).unwrap(), SCRIPT);
     assert_eq!(current(&root.path), Path::new("versions/0.9.0"));
+    // The prepared switch still holds the installers' lock...
+    assert_eq!(leftovers(&root.path), [".lock"]);
+    assert!(root.path.join(".lock/owner").is_file());
+    // ...and a dropped (abandoned) switch lets go of it.
+    drop(switch);
     assert!(
         leftovers(&root.path).is_empty(),
         "{:?}",
         leftovers(&root.path)
     );
-    drop(switch);
 
     // The switch itself, in a forked child: it must point `current` at the new
     // version, write the pending file, and execve the new binary with the
@@ -180,17 +184,20 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
             attempts: 0,
         }),
         false,
-        vec![OsString::from("metro-runner"), OsString::from("arg1")],
-        vec![
-            (
-                OsString::from("STUB_MARKER"),
-                marker.clone().into_os_string(),
-            ),
-            (
-                OsString::from("STUB_MARKER_VALUE"),
-                OsString::from("kept-env"),
-            ),
-        ],
+        (
+            vec![OsString::from("metro-runner"), OsString::from("arg1")],
+            vec![
+                (
+                    OsString::from("STUB_MARKER"),
+                    marker.clone().into_os_string(),
+                ),
+                (
+                    OsString::from("STUB_MARKER_VALUE"),
+                    OsString::from("kept-env"),
+                ),
+            ],
+        ),
+        Some(&update::Lock::take(&root.path).unwrap().into_path()),
     )
     .unwrap();
     // SAFETY: the child only runs Switch::exec (libc calls on prepared
@@ -209,6 +216,10 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
     );
     let line = fs::read_to_string(&marker).unwrap();
     assert!(line.ends_with("|arg1|kept-env\n"), "{line}");
+    assert!(
+        !root.path.join(".lock").exists(),
+        "the lock is released at the exec"
+    );
     assert_eq!(current(&root.path), Path::new("versions/0.9.1"));
     let pending: PendingFile =
         serde_json::from_slice(&fs::read(root.path.join(update::PENDING)).unwrap()).unwrap();
@@ -248,12 +259,16 @@ fn a_failed_exec_points_current_back() {
             attempts: 0,
         }),
         false,
-        vec![OsString::from("x")],
-        vec![],
+        (vec![OsString::from("x")], vec![]),
+        Some(&update::Lock::take(&root.path).unwrap().into_path()),
     )
     .unwrap();
     let e = switch.exec();
     assert_eq!(e.kind(), std::io::ErrorKind::NotFound);
+    assert!(
+        !root.path.join(".lock").exists(),
+        "a failed exec releases the lock"
+    );
     assert_eq!(current(&root.path), Path::new("versions/0.9.0"));
     assert!(!root.path.join(update::PENDING).exists());
 }
