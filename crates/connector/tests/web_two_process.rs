@@ -259,6 +259,68 @@ async fn web_session_setup_and_restart_use_the_saved_http_metro_server() {
     .unwrap();
 }
 
+#[tokio::test]
+async fn web_setup_status_and_run_round_trip_an_expanded_loopback_url() {
+    let prefix = format!("/{}", "%C3%A9".repeat(350));
+    let app = Router::new()
+        .route(&format!("{prefix}/v1/me"), axum::routing::get(me))
+        .route(&format!("{prefix}/v1/web-devices"), post(create))
+        .route(
+            &format!("{prefix}/v1/device/claim"),
+            post(|h: HeaderMap| async move {
+                if h.get("authorization").and_then(|v| v.to_str().ok())
+                    == Some(&format!("Bearer {TOKEN}"))
+                {
+                    StatusCode::NO_CONTENT
+                } else {
+                    StatusCode::UNAUTHORIZED
+                }
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    tokio::task::spawn_blocking(move || {
+        let t = tempfile::tempdir().unwrap();
+        let session = t.path().join("session");
+        metro_connector::fsutil::write_private(&session, b"tok-alice\n").unwrap();
+        let raw = format!("{base}/{}", "é".repeat(350));
+        let saved = format!("{base}{prefix}");
+        assert!(raw.len() < 2048 && saved.len() > 2048);
+        let setup = |server| {
+            cmd(
+                t.path(),
+                &base,
+                &[
+                    "web",
+                    "setup",
+                    "--server-url",
+                    server,
+                    "--session-token-file",
+                    session.to_str().unwrap(),
+                ],
+            )
+        };
+        let private = &[TOKEN, "tok-alice"];
+        // The expanded spelling is rejected as *input*, not on reload.
+        let rejected = checked_stderr(setup(&saved), 1, private);
+        assert!(rejected.contains("--server-url"));
+        let setup_log = checked_stderr(setup(&raw), 0, private);
+        assert!(!setup_log.contains("warning:"));
+        std::fs::remove_file(&session).unwrap();
+
+        let status = checked_stderr(cmd(t.path(), &base, &["web", "status"]), 0, private);
+        assert_eq!(
+            status.lines().next(),
+            Some(format!("server: {saved}").as_str())
+        );
+        let run = checked_stderr(cmd(t.path(), &base, &["web", "run", "--once"]), 0, private);
+        assert!(!run.contains("warning:"));
+    })
+    .await
+    .unwrap();
+}
+
 struct Kill(Child);
 
 impl Drop for Kill {

@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::fsutil::{read_private, remove_private, write_private};
-use crate::netpolicy::validate_server_url;
+use crate::netpolicy::validate_canonical_server_url;
 use crate::openai_oauth::store::{seal, unseal};
 use crate::profile::validate_device_token;
 use crate::{SafeError, Secret};
@@ -56,9 +56,7 @@ impl Binding {
     ) -> Result<Self> {
         // The URL is part of the identity. Don't silently change which
         // server a stored credential and the per-owner data are bound to.
-        if validate_server_url(server_url, "web binding server_url")? != server_url {
-            bail!("web binding server_url is not normalized");
-        }
+        validate_canonical_server_url(server_url, "web binding server_url")?;
         validate_device_token(&token)?;
         if owner.is_empty() || owner.len() > 300 || owner.chars().any(char::is_control) {
             bail!("invalid owner");

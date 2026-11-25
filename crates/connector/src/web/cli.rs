@@ -700,6 +700,37 @@ mod tests {
         a
     }
 
+    #[test]
+    fn a_legacy_encoded_binding_keeps_its_exact_owner_and_keys() {
+        let t = tempfile::tempdir().unwrap();
+        let p = profile(&args(&t.path().join("home"), &[])).unwrap();
+        let server = format!("http://127.0.0.1:8787/{}", "%C3%A9".repeat(350));
+        assert!(server.len() > 2048);
+        let owner = "account:alice";
+        let token = crate::Secret::new(token_of("alice", 1));
+        // Write the v1 format directly, as an older web setup would have.
+        let wire = json!({
+            "v": 1, "server_url": server, "owner": owner,
+            "device_id": "wd_fixture", "token": token.expose(),
+        });
+        let sealed = crate::openai_oauth::store::seal(serde_json::to_vec(&wire).unwrap()).unwrap();
+        write_private(&p.dir.join(binding::FILE), &sealed).unwrap();
+        let old_dir = owner_dir(&p, &server, owner).unwrap();
+        keys::KeyStore::new(&old_dir)
+            .set(ProviderId::Tavily, crate::Secret::new(KEY))
+            .unwrap();
+
+        let d = device(&p).unwrap();
+        assert_eq!(d.server_url, server);
+        assert_eq!(d.owner, owner);
+        assert_eq!(d.token_for(&server, owner).unwrap(), &token);
+        assert!(d.token_for(&server, "account:bob").is_err());
+        assert!(d.token_for(&format!("{server}-other"), owner).is_err());
+        let dir = data_dir(&p, &d).unwrap();
+        assert_eq!(dir, old_dir);
+        assert!(keys::KeyStore::new(&dir).load().unwrap().has("tavily"));
+    }
+
     async fn search_once(root: &std::path::Path, base: &str) -> Value {
         let a = args(root, &[]);
         let p = profile(&a).unwrap();
