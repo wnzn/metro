@@ -784,8 +784,9 @@ pub(crate) fn use_reason(error: &UseError) -> &'static str {
         | UseError::PresetNeedsOwnConnection(_)
         | UseError::WrongCapability { .. }
         | UseError::TurnModelNotAllowed
-        | UseError::TurnEffortNotAllowed
-        | UseError::TurnChanged => "not_allowed",
+        | UseError::TurnEffortNotAllowed => "not_allowed",
+        // The connection behind an explicit model changed: not a lost grant.
+        UseError::TurnChanged => "connection_changed",
         UseError::Busy => "busy",
         UseError::DeviceOffline => "offline",
         UseError::NoModel

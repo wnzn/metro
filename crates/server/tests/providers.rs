@@ -1573,7 +1573,7 @@ async fn a_run_stops_at_its_next_request_after_its_endpoint_changes() {
         answer["text"]
             .as_str()
             .unwrap()
-            .contains("model connection changed during this run"),
+            .contains("changed or was replaced during this run"),
         "{answer}"
     );
     tokio::time::sleep(Duration::from_millis(200)).await;

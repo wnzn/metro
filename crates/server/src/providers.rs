@@ -542,9 +542,10 @@ pub struct SelectedModel {
     /// An output cap the run must set: Anthropic's Messages API requires
     /// `max_tokens`, and Rig knows the limit only for catalogued models.
     pub max_tokens: Option<u64>,
-    /// The connection's `config_rev` this model was built from (its
-    /// endpoint, credential and model), when Metro tracks one.
-    pub config_rev: Option<i64>,
+    /// The connection that runs (for a preset, the person's own one, not
+    /// the preset) and its `config_rev` (endpoint, credential and model)
+    /// when this model was built, when Metro tracks one.
+    pub built_from: Option<(String, i64)>,
 }
 
 impl std::fmt::Debug for SelectedModel {
@@ -766,6 +767,7 @@ fn build_model_for_turn(
         });
     }
     let Authorized { row, chosen, .. } = authorized;
+    let built_from = Some((row.id.clone(), row.config_rev));
     let entry = catalog::find(&row.provider_id).ok_or(UseError::Unsupported)?;
     if row.model.is_empty() {
         return Err(UseError::NoModel);
@@ -861,7 +863,7 @@ fn build_model_for_turn(
         model_id: row.model,
         model,
         max_tokens,
-        config_rev: Some(row.config_rev),
+        built_from,
     })
 }
 

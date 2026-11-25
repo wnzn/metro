@@ -1853,3 +1853,111 @@ async fn a_member_removed_mid_run_stops_its_next_request() {
         assert_eq!(requests(), 1, "{label}: no request after the removal");
     }
 }
+
+/// Alice's run in `sid` for `text`, held at its first model request while
+/// `between` runs, then released; her private failure for it.
+async fn failure_after_change<F, Fut>(s: &Server, sid: &str, text: &str, between: F) -> Value
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    let requests = || {
+        s.fixture
+            .seen("/v1/chat/completions")
+            .iter()
+            .filter(|c| c.body.to_string().contains(text))
+            .count()
+    };
+    let held = s.fixture.gate.write().await;
+    let (status, sent) = s
+        .post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+            json!({"text": text}),
+        )
+        .await;
+    assert!(status.is_success(), "{sent}");
+    for _ in 0..400 {
+        if requests() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(requests(), 1, "the first request arrived");
+    between().await;
+    drop(held);
+    for _ in 0..400 {
+        let (_, runs) = s.get(ALICE, "/v1/runs").await;
+        if let Some(run) = runs["runs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["task"].as_str().unwrap().contains(text) && r["status"] == "failed")
+        {
+            assert_eq!(requests(), 1, "no request after the change");
+            return run["failure"].clone();
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("the run did not fail");
+}
+
+#[tokio::test]
+async fn an_explicit_models_changed_connection_is_reported_as_changed() {
+    let s = Server::start().await;
+    let id = s.connect(ALICE, "custom", "alice-model", true).await;
+    let sid = s.space(ALICE, "explicit", &[]).await;
+    // An explicit model (with its model id) as Alice's default in the Space.
+    let (status, body) = s
+        .put(
+            ALICE,
+            &format!("/v1/spaces/{sid}/prefs"),
+            json!({"default_model": {"provider_connection_id": id, "model_id": "alice-model"}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let failure = failure_after_change(&s, &sid, "@agent [tool] explicit", || async {
+        // A new key changes the connection the selection was checked against.
+        let (status, body) = s
+            .patch(
+                ALICE,
+                &format!("/v1/providers/{id}"),
+                json!({"api_key": "sk-alice-rotated-0123456789"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+    })
+    .await;
+    assert_eq!(failure["reason"], "connection_changed", "{failure}");
+}
+
+#[tokio::test]
+async fn a_default_replaced_mid_run_is_reported_as_changed() {
+    let s = Server::start().await;
+    // Two connections at the same revision: only identity tells them apart.
+    let first = s.connect(ALICE, "custom", "alice-model", true).await;
+    let second = s.connect(ALICE, "custom", "alice-model-2", true).await;
+    let sid = s.space(ALICE, "replaced", &[]).await;
+    let failure = failure_after_change(&s, &sid, "@agent [tool] replaced", || async {
+        // The default is deleted; the other connection becomes the default.
+        let (status, body) = s
+            .send(
+                reqwest::Method::DELETE,
+                ALICE,
+                &format!("/v1/providers/{first}"),
+                None,
+            )
+            .await;
+        assert!(status.is_success(), "{body}");
+    })
+    .await;
+    assert_eq!(failure["reason"], "connection_changed", "{failure}");
+    assert!(
+        failure["message"]
+            .as_str()
+            .unwrap()
+            .contains("changed or was replaced"),
+        "{failure}"
+    );
+    let _ = second;
+}

@@ -288,7 +288,7 @@ impl RoutingBackend for Backend {
                     api_key: String::new(),
                 }),
                 max_tokens: None,
-                config_rev: None,
+                built_from: None,
             })
         })
     }

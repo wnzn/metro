@@ -133,8 +133,9 @@ struct RunModel {
     model: DynModel<Completion>,
     max_tokens: Option<u64>,
     params: Option<serde_json::Value>,
-    /// The connection's `config_rev` the model was built from.
-    config_rev: Option<i64>,
+    /// The connection that runs and its `config_rev` when the model was
+    /// built (see [`crate::providers::SelectedModel::built_from`]).
+    built_from: Option<(String, i64)>,
 }
 
 impl RunModel {
@@ -193,7 +194,7 @@ async fn route_model(
                         model: selected.model,
                         max_tokens: selected.max_tokens,
                         params: selection.and_then(|s| s.params(&selected.provider_id)),
-                        config_rev: selected.config_rev,
+                        built_from: selected.built_from.clone(),
                     })
                 }
                 Err(e) => Err(route.refused(space, &e)),
@@ -208,7 +209,7 @@ async fn route_model(
                     model: selected.model,
                     max_tokens: selected.max_tokens,
                     params: None,
-                    config_rev: selected.config_rev,
+                    built_from: selected.built_from.clone(),
                 })
             }
             Ok(None) => match &state.config.model {
@@ -222,7 +223,7 @@ async fn route_model(
                         model: model(config).into(),
                         max_tokens: None,
                         params: None,
-                        config_rev: None,
+                        built_from: None,
                     })
                 }
                 None => Err(Refusal::shown(NO_MODEL)),
@@ -377,14 +378,14 @@ impl ModelFailure {
 /// built, if that is why: rechecked as a new turn would be (Rig reports
 /// Metro's own refusal of a request only as text, so the reason is never
 /// parsed from it). A grant that is gone, or a connection whose endpoint,
-/// credential or model changed since the model was built (`built_rev`).
+/// credential or model changed since the model was built (`built_from`).
 /// `(reason, message)` for the person alone.
 async fn refusal_after(
     state: &AppState,
     user_id: &str,
     space: Option<&str>,
     route: &Route,
-    built_rev: Option<i64>,
+    built_from: Option<(String, i64)>,
 ) -> Option<(String, String)> {
     use crate::model_routing::AddressingNote;
     let mut recheck = route.clone();
@@ -400,10 +401,12 @@ async fn refusal_after(
             "not_allowed".to_owned(),
             format!("The agent stopped. {}", refusal.private()),
         )),
-        Ok(now) if built_rev.is_some() && now.config_rev != built_rev => Some((
+        // Another connection, or the same one with another endpoint,
+        // credential or model: compared by identity and revision.
+        Ok(now) if built_from.is_some() && now.built_from != built_from => Some((
             "connection_changed".to_owned(),
-            "The agent stopped: its model connection changed during this run (its endpoint, \
-             key or model). Ask again to use the connection as it is now."
+            "The agent stopped: the model connection it was using changed or was replaced \
+             during this run. Ask again to use your model as it is now."
                 .to_owned(),
         )),
         Ok(_) => None,
@@ -717,7 +720,7 @@ async fn private_failure(
     space_id: &str,
     initiator: &Author,
     route: &Route,
-    built_rev: Option<i64>,
+    built_from: Option<(String, i64)>,
     failure: ModelFailure,
 ) -> crate::orchestration::RunFailure {
     use crate::orchestration::RunFailure;
@@ -728,7 +731,7 @@ async fn private_failure(
         };
     }
     let user_id = initiator.id.clone().unwrap_or_default();
-    match refusal_after(state, &user_id, Some(space_id), route, built_rev).await {
+    match refusal_after(state, &user_id, Some(space_id), route, built_from).await {
         Some((reason, message)) => RunFailure { reason, message },
         None => RunFailure {
             reason: "model_error".to_owned(),
@@ -751,7 +754,7 @@ async fn execute_room_run(
     cancel: watch::Receiver<bool>,
     agent: &SpaceAgent,
 ) {
-    let built_rev = model.config_rev;
+    let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
     let loaded = {
         let (space, room_id, before, n) = (
@@ -880,8 +883,9 @@ async fn execute_room_run(
         // from an upstream failure. The initiator gets the reason.
         Outcome::ModelFailed(model) => {
             state.monitor_space(space_id, Code::ProviderFailed).await;
-            failure =
-                Some(private_failure(state, space_id, initiator, route, built_rev, model).await);
+            failure = Some(
+                private_failure(state, space_id, initiator, route, built_from.clone(), model).await,
+            );
             (
                 RunStatus::Failed,
                 Some((kind::ERROR, MODEL_STOPPED_IN_ROOM.to_owned())),
@@ -1403,7 +1407,7 @@ async fn execute_personal_run(
     model: RunModel,
     _permit: tokio::sync::OwnedSemaphorePermit,
 ) {
-    let built_rev = model.config_rev;
+    let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
     let agent_author = Author::server(actor::AGENT);
     let turn = Activity::chat();
@@ -1510,7 +1514,7 @@ async fn execute_personal_run(
         }
         Outcome::ModelFailed(failure) => {
             state.monitor_personal(&user_id, failure.code).await;
-            let text = match refusal_after(&state, &user_id, None, &route, built_rev).await {
+            let text = match refusal_after(&state, &user_id, None, &route, built_from).await {
                 Some((_, message)) => message,
                 None => failure.text(),
             };
