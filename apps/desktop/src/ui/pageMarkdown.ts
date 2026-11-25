@@ -15,7 +15,7 @@ export function httpsLink(url: string): string | null {
 
 /** Scan only the prefix we might parse. A surrogate pair is one code point;
  * a lone surrogate takes 3 bytes (UTF-8's replacement character). */
-function utf8Prefix(text: string, available: number) {
+export function utf8Prefix(text: string, available: number) {
   let bytes = 0, end = 0;
   while (end < text.length) {
     const code = text.charCodeAt(end);

@@ -1,8 +1,8 @@
 import { expect, open, test } from "nsh/test";
 import type { PageBlock } from "../../api/pages";
 import { httpsLink, MAX_PAGE_MARKDOWN_BYTES, MAX_PAGE_MARKDOWN_NODES, pageRichText } from "../../ui/pageMarkdown";
-import { MAX_RENDERED, own, planPage } from "./renderPlan";
-import { bind, lit, sample, sampleData } from "./test/sample";
+import { MAX_PAGE_TEXT_BYTES, MAX_RENDERED, own, planPage } from "./renderPlan";
+import { bind, lit, plainBudgetData, plainBudgetSpec, sample, sampleData } from "./test/sample";
 
 test("PageSpec fixture draws native blocks, tables, repeated conditions and denied sources", async () => {
   const app = await open("./test/pages.fixture.tsx", { width: 1100, height: 850, platform: "linux" });
@@ -130,4 +130,22 @@ test("The emitted Markdown budget charges lists and tables across small document
   expect(result.richText.limited).toBe(true);
   expect(result.blocks[0]?.messages?.every(Boolean)).toBe(true);
   expect(result.blocks[99]?.messages?.some(Boolean)).toBe(false);
+});
+
+test("Repeated plain labels and table cells share a UTF-8 limit before mounting", async () => {
+  const plan = planPage(plainBudgetSpec, plainBudgetData, false);
+  expect(plan.plainText).toEqual({ limited: true, bytes: MAX_PAGE_TEXT_BYTES });
+  expect(plan.richText.limited).toBe(false);
+  const [repeat, table, after] = plan.blocks;
+  expect(repeat?.children).toHaveLength(10);
+  const cells = table?.rows?.map(row => row[0]?.label ?? "") ?? [];
+  expect(cells[0]?.length).toBe(4096);
+  expect(cells[3]?.length).toBeLessThan(4096);
+  expect(cells[4]).toBe("");
+  expect(after?.text).toBe("");
+
+  const app = await open("./test/pages.fixture.tsx", { width: 1100, height: 850, platform: "linux" });
+  await app.press("id:fixture-budget");
+  await app.waitFor("id:page-render-limit");
+  expect(app.texts().join(" ")).not.toContain("Must not mount after the plain text quota");
 });

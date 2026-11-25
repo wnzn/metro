@@ -3,7 +3,7 @@ import type { ActionKind, PageValues, PageSpec } from "../../api/pages";
 import { Action, Badge, Column, Disclosure, Divider, Label, Row, Surface } from "../../ui";
 import type { Tone } from "../../ui";
 import { PageBlockFrame, PageChart, PageGrid, PageGridCell, PageMarkdown, PageProgress, PageTable } from "../../ui/pageBlocks";
-import { capabilityOf, cell, number, own, planPage, str } from "./renderPlan";
+import { capabilityOf, number, planPage, str } from "./renderPlan";
 import type { PlanBlock } from "./renderPlan";
 
 type Interactions = {
@@ -41,8 +41,8 @@ function Block(props: { node: PlanBlock; interactions: Interactions }) {
   return <If when={props.node.type !== "Show" || props.node.issue || props.node.children.length || (!!key() && props.interactions.onEdit)}>
     <PageBlockFrame blockKey={key()} changed={!!key() && props.interactions.changed?.has(key()!)}
       onEdit={key() && props.interactions.onEdit ? () => props.interactions.onEdit?.(key()!) : undefined}>
-      <If when={props.node.issue} else={<BlockBody node={props.node} interactions={props.interactions} />}>
-        {issue => <Label variant="caption" color="muted" testID="page-source-state">{issue()}</Label>}
+      <If when={props.node.issue !== undefined} else={<BlockBody node={props.node} interactions={props.interactions} />}>
+        <Label variant="caption" color="muted" testID="page-source-state">{props.node.issue}</Label>
       </If>
     </PageBlockFrame>
   </If>;
@@ -76,7 +76,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
     case "Badge": return <Row><Badge tone={tone()} label={n().text} /></Row>;
     case "Stat": return <Surface variant="card" pad={3} gap={1}>
       <Label variant="caption" color="muted">{label()}</Label>
-      <Label variant="display" color={cell(p().value, str(p().format)).tone ?? (tone() === "neutral" ? "default" : tone())}>{cell(p().value, str(p().format)).label}</Label>
+      <Label variant="display" color={n().stat?.tone ?? (tone() === "neutral" ? "default" : tone())}>{n().stat?.label}</Label>
       <If when={p().hint}><Label variant="caption" color="muted">{str(p().hint)}</Label></If>
     </Surface>;
     case "Progress": {
@@ -98,49 +98,42 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
     case "Each": case "Show": return <Column gap={2}>{children()}</Column>;
     case "AgentAnswer": {
       const answer = () => n().answer;
-      const status = () => cell(own(answer(), "status"), "status");
       return <Column gap={2}>
-        <If when={answer()} else={<Label color="muted">{empty("No answer yet.")}</Label>}>
+        <If when={answer()} else={<Label color="muted">{empty("No answer yet.")}</Label>}>{item => <>
           <Row gap={2} align="center" wrap>
-            <Badge tone={status().tone ?? "agent"} label={status().label} />
-            <Label variant="meta">{[str(own(answer(), "agent")), str(own(answer(), "room")), cell(own(answer(), "at"), "relative").label].filter(x => x && x !== "—").join(" · ")}</Label>
+            <Badge tone={item().status.tone ?? "agent"} label={item().status.label} />
+            <Label variant="meta">{item().metadata}</Label>
           </Row>
           <If when={n().document}>
             {document => <PageMarkdown document={document()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />}
           </If>
-          <If when={str(own(answer(), "error"))}>{t => <Label color="warning">{t()}</Label>}</If>
-        </If>
+          <If when={item().error}>{t => <Label color="warning">{t()}</Label>}</If>
+        </>}</If>
         <If when={!props.interactions.readOnly && props.interactions.onSchedule && n().key && props.interactions.canSchedule?.(n().key!) ? n().key : undefined}>
           {key => <Row><Action compact variant="ghost" label="Keep this answer fresh…" testID={`page-schedule:${key()}`} onPress={() => props.interactions.onSchedule?.(key())} /></Row>}
         </If>
       </Column>;
     }
     case "RunList": case "MessageFeed": case "ScheduleCard": case "FileList":
-      return <If when={n().values?.length} else={<Label color="muted">{empty()}</Label>}>
+      return <If when={n().entries?.length} else={<Label color="muted">{empty()}</Label>}>
         <Column gap={2}>
-          <Each of={n().values ?? []}>{(item, index) => {
-            const field = (name: string) => own(item(), name);
-            const title = () => str(field(n().type === "RunList" ? "task" : n().type === "MessageFeed" ? "author" : "name"));
-            const status = () => cell(field(n().type === "ScheduleCard" ? "last_status" : "status"), "status");
+          <Each of={n().entries ?? []}>{(item, index) => {
+            const status = () => item().status;
             return <Surface variant="card" pad={2} gap={1}>
               <Row gap={2} wrap align="center">
-                <Label variant="strong">{title() || str(field("agent")) || "Untitled"}</Label>
-                <If when={status().label !== "—"}><Badge tone={status().tone ?? "neutral"} label={status().label} /></If>
+                <Label variant="strong">{item().title || "Untitled"}</Label>
+                <If when={status().label && status().label !== "—"}><Badge tone={status().tone ?? "neutral"} label={status().label} /></If>
               </Row>
               <If when={n().type === "MessageFeed"} else={
-                <Label variant="meta">{[
-                  str(field("room")), n().type === "RunList" ? str(field("agent")) : str(field("kind")),
-                  cell(field(n().type === "FileList" ? "uploaded" : n().type === "ScheduleCard" ? "next_run" : "started"), "relative").label,
-                  n().type === "FileList" ? cell(field("size"), "bytes").label : n().type === "ScheduleCard" && field("enabled") === false ? "Paused" : "",
-                ].filter(x => x && x !== "—").join(" · ")}</Label>
+                <Label variant="meta">{item().metadata}</Label>
               }>
                 <If when={n().messages?.[index()]}>{document =>
                   <PageMarkdown document={document()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />
                 }</If>
               </If>
-              <If when={!props.interactions.readOnly && n().type === "FileList" && props.interactions.onFile && str(field("id"))}>
-                <Row><Action compact variant="ghost" label="Open file" onPress={() => props.interactions.onFile?.(str(field("id")))} /></Row>
-              </If>
+              <If when={!props.interactions.readOnly && props.interactions.onFile ? item().fileId : undefined}>{id =>
+                <Row><Action compact variant="ghost" label="Open file" onPress={() => props.interactions.onFile?.(id())} /></Row>
+              }</If>
             </Surface>;
           }}</Each>
         </Column>
@@ -148,7 +141,7 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
     case "Button": case "Link": {
       const capability = () => n().key ? capabilityOf(props.interactions.data, n().key!) : undefined;
       const disabled = () => props.interactions.readOnly || !props.interactions.onAction || !n().action || capability()?.enabled !== true;
-      const reason = () => props.interactions.readOnly ? "Preview only" : str(capability()?.reason) || "Action unavailable";
+      const reason = () => props.interactions.readOnly ? "Preview only" : n().disabledReason || "Action unavailable";
       return <Column gap={1} align="start">
         <Action testID={`page-action:${n().key}`} label={label() || "Action"} variant={n().type === "Link" ? "ghost" : tone() === "danger" ? "destructive" : tone() === "system" ? "primary" : "secondary"}
           disabled={disabled() || props.interactions.busy}

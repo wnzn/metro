@@ -63,3 +63,18 @@ export const sampleData: PageData = {
     refresh: { enabled: true },
   },
 };
+
+const repeatedLabel = "🛰".repeat(2048);
+const repeatedCell = "日".repeat(4096);
+export const plainBudgetSpec: PageSpec = { format: 1, title: "Plain text fixture", refresh: "off", data: [{ name: "rows", source: "runs" }], blocks: [
+  { type: "Each", key: "rows", props: { items: bind("rows"), as: lit("row") }, children: [
+    { type: "Stat", key: "repeated", props: { label: lit(repeatedLabel), value: lit(1) } },
+  ] },
+  { type: "Table", key: "cells", props: { rows: bind("rows") }, children: [
+    { type: "Column", props: { field: lit("cell"), label: lit("Cells") } },
+  ] },
+  content("Text", "after-budget", lit("Must not mount after the plain text quota")),
+] };
+export const plainBudgetData: PageData = { ...sampleData, data: {
+  rows: { ok: true, value: Array.from({ length: 10 }, () => ({ cell: repeatedCell })) },
+} };
