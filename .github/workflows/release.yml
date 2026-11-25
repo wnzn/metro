@@ -154,8 +154,14 @@ jobs:
           # Throwaway credential, never printed and never accepted by any server.
           head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$home/runner token"
           chmod 600 "$home/runner token"
-          if sh "$i" configure --server-url http://192.0.2.1:8787 --workspace "$home/work space" --token-file "$home/runner token"; then
-            echo "plain http to a non-loopback host was accepted" >&2; exit 1
+          sh "$i" configure --server-url http://192.0.2.1:8787 --workspace "$home/work space" --token-file "$home/runner token" \
+            >"$home/configure.stdout" 2>"$home/configure.stderr"
+          grep -Fq "warning: plain HTTP to 192.0.2.1 isn't encrypted" "$home/configure.stderr" \
+            || { echo "missing unencrypted HTTP warning on stderr" >&2; exit 1; }
+          if grep -aFq -f "$home/runner token" "$home/configure.stdout" "$home/configure.stderr"; then
+            echo "HTTP configure printed the runner token" >&2; exit 1
+          else
+            test "$?" -eq 1
           fi
           sh "$i" configure --server-url https://metro.invalid --workspace "$home/work space" --token-file "$home/runner token"
           sh "$i" doctor
