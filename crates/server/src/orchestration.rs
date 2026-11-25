@@ -345,22 +345,22 @@ impl RunRegistry {
     }
 
     /// Cancel a running run: mark it `cancelled` and signal its receiver.
-    /// Returns `false` when the id is unknown or the run already ended.
-    pub fn stop(&self, id: &str) -> bool {
+    /// Returns the cancelled snapshot even if the worker immediately
+    /// settles and evicts the run. `None` if it is missing or already ended.
+    pub fn stop(&self, id: &str) -> Option<RunInfo> {
         let mut inner = self.lock();
-        let Some(entry) = inner.find(id) else {
-            return false;
-        };
+        let entry = inner.find(id)?;
         if entry.info.status != RunStatus::Running {
-            return false;
+            return None;
         }
         entry.info.status = RunStatus::Cancelled;
+        let stopped = entry.info.clone();
         if let Some(tx) = entry.cancel.take() {
             // `send_replace` stores the value even if the receiver is gone.
             tx.send_replace(true);
         }
         inner.evict(self.max_history);
-        true
+        Some(stopped)
     }
 }
 
@@ -828,14 +828,14 @@ mod tests {
         let reg = RunRegistry::new();
         let (info, rx) = start(&reg, "work");
         assert!(!*rx.borrow());
-        assert!(reg.stop(&info.id));
+        assert!(reg.stop(&info.id).is_some());
         assert!(*rx.borrow());
         assert_eq!(reg.get(&info.id).unwrap().status, RunStatus::Cancelled);
         // Already ended: no second stop, and finish does not overwrite.
-        assert!(!reg.stop(&info.id));
+        assert!(reg.stop(&info.id).is_none());
         reg.finish(&info.id, RunStatus::Completed);
         assert_eq!(reg.get(&info.id).unwrap().status, RunStatus::Cancelled);
-        assert!(!reg.stop("run_missing"));
+        assert!(reg.stop("run_missing").is_none());
     }
 
     #[test]
@@ -847,7 +847,7 @@ mod tests {
         reg.finish(&info.id, RunStatus::Failed);
         reg.finish(&info.id, RunStatus::Completed);
         assert_eq!(reg.get(&info.id).unwrap().status, RunStatus::Failed);
-        assert!(!reg.stop(&info.id));
+        assert!(reg.stop(&info.id).is_none());
         reg.finish("run_missing", RunStatus::Completed);
     }
 
@@ -856,7 +856,7 @@ mod tests {
         // History of one finished run.
         let reg = RunRegistry::with_limits(10, 1);
         let (stopped, _rx) = start(&reg, "stopped");
-        assert!(reg.stop(&stopped.id));
+        let cancelled = reg.stop(&stopped.id).unwrap();
         // Other runs finish meanwhile, past the bound.
         for task in ["a", "b", "c"] {
             let (other, _r) = start(&reg, task);
@@ -880,6 +880,15 @@ mod tests {
         let (last, _r) = start(&reg, "last");
         reg.finish_with(&last.id, RunStatus::Completed, None);
         assert!(reg.get(&stopped.id).is_none());
+        // An API response assembled after settlement and eviction still
+        // has the cancelled snapshot, not the original running snapshot.
+        assert_eq!(
+            cancelled,
+            RunInfo {
+                status: RunStatus::Cancelled,
+                ..stopped.clone()
+            }
+        );
         // A run the registry no longer knows: nothing to report.
         assert_eq!(reg.finish_with(&stopped.id, RunStatus::Failed, None), None);
         assert_eq!(
@@ -897,7 +906,7 @@ mod tests {
         };
         // A stop lands while the run works out why it failed.
         let (info, _rx) = start(&reg, "raced");
-        assert!(reg.stop(&info.id));
+        assert!(reg.stop(&info.id).is_some());
         let status = reg.finish_with(&info.id, RunStatus::Failed, Some(failure()));
         assert_eq!(
             status,
@@ -921,7 +930,10 @@ mod tests {
             reg.get_with_failure(&info.id).unwrap(),
             (reg.get(&info.id).unwrap(), Some(failure()))
         );
-        assert!(!reg.stop(&info.id), "a finished run can't be stopped");
+        assert!(
+            reg.stop(&info.id).is_none(),
+            "a finished run can't be stopped"
+        );
         let later = reg.finish_with(&info.id, RunStatus::Completed, None);
         assert_eq!(later, Some(RunStatus::Failed));
         assert_eq!(reg.get_with_failure(&info.id).unwrap().1, Some(failure()));
@@ -938,7 +950,7 @@ mod tests {
         // Registered, then cancelled before any worker took it over.
         let (info, _rx) = reg.start("s", "r", "u", "first").unwrap();
         let registration = Registration::new(reg.clone(), info.id.clone());
-        assert!(reg.stop(&info.id));
+        assert!(reg.stop(&info.id).is_some());
         // Unsettled, it still holds the only slot.
         assert!(reg.start("s", "r", "u", "second").is_err());
         // The start is abandoned: its registration settles the run.

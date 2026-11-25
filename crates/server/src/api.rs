@@ -1185,11 +1185,10 @@ pub async fn stop_run(
             "only the person who started a run, or the Space owner, can stop it",
         ));
     }
-    if !state.runs.stop(&id) {
-        return Err(ApiError::conflict("the run is not running"));
-    }
-    let run = state.runs.get(&id).unwrap_or(run);
-    debug_assert_eq!(run.status, RunStatus::Cancelled);
+    let run = state
+        .runs
+        .stop(&id)
+        .ok_or_else(|| ApiError::conflict("the run is not running"))?;
     Ok(Json(
         serde_json::to_value(run).map_err(|e| ApiError::internal(e.into()))?,
     ))

@@ -1286,7 +1286,7 @@ impl Threads {
                 let stopped = self
                     .active_runs(&child.id)
                     .iter()
-                    .filter(|r| self.state.runs.stop(&r.id))
+                    .filter(|r| self.state.runs.stop(&r.id).is_some())
                     .count();
                 Ok(json!({"thread_id": child.id, "stopped_runs": stopped}).to_string())
             }
@@ -1312,7 +1312,7 @@ pub fn stop_runs_of(state: &AppState, space_id: &str, user_id: &str) -> usize {
         .list()
         .iter()
         .filter(|r| r.space_id == space_id && r.actor == user_id && r.status == RunStatus::Running)
-        .filter(|r| state.runs.stop(&r.id))
+        .filter(|r| state.runs.stop(&r.id).is_some())
         .count()
 }
 
