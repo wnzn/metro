@@ -619,6 +619,7 @@ impl WebSearch {
         server: &str,
         account: &str,
         epoch: u64,
+        session: &Secret,
         id: &str,
     ) -> R<Value> {
         let _g = self.bound_ops(server, account, epoch).await?;
@@ -637,6 +638,12 @@ impl WebSearch {
             })
             .await
             .map_err(|e| local(e, "The settings can't be saved"))?;
+        // A repaired state file may be what kept workers from starting:
+        // reconcile under this (still bound) session.
+        let idle = lock(&self.live).tasks.iter().all(|t| t.is_finished());
+        if idle && settings::load(&p.dir).is_ok_and(|s| s.enabled) {
+            self.start_locked(server, account, session).await?;
+        }
         self.row(&p, pid)
     }
 

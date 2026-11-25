@@ -1,8 +1,9 @@
-//! Consent across real processes: one `metro-connector web run` is serving
-//! a search while a second `metro-connector web disable` turns web search
-//! off. The first provider is paused at that moment and then answers 429;
-//! the second provider must receive nothing, and Metro gets a refusal.
-//! Everything is loopback: a fake Metro and fake vendors in this test.
+//! Consent and credentials across real processes: one `metro-connector web
+//! run` is serving a search while a second `metro-connector` process turns
+//! web search off, or deletes a provider key. The first provider is paused
+//! at that moment and then answers 429; what happens next must follow the
+//! files as they are now. Everything is loopback: a fake Metro and fake
+//! vendors in this test.
 
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -22,6 +23,8 @@ struct Fake {
     results: Vec<Value>,
     tavily_hits: u32,
     firecrawl_hits: u32,
+    /// The Authorization header of each Firecrawl request.
+    firecrawl_auth: Vec<Option<String>>,
 }
 
 #[derive(Clone)]
@@ -68,13 +71,21 @@ async fn result(State(c): State<Ctx>, Path(_id): Path<String>, body: String) -> 
 
 async fn tavily(State(c): State<Ctx>) -> Response {
     c.fake.lock().unwrap().tavily_hits += 1;
-    // Paused until the test has turned web search off, then limited.
+    // Paused until the test has changed something in another process, then
+    // limited (one waiter: a stored permit means no wake-up is missed).
     c.release.notified().await;
     (StatusCode::TOO_MANY_REQUESTS, axum::Json(json!({}))).into_response()
 }
 
-async fn firecrawl(State(c): State<Ctx>) -> Response {
-    c.fake.lock().unwrap().firecrawl_hits += 1;
+async fn firecrawl(State(c): State<Ctx>, h: HeaderMap) -> Response {
+    let mut f = c.fake.lock().unwrap();
+    f.firecrawl_hits += 1;
+    f.firecrawl_auth.push(
+        h.get("authorization")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
+    );
+    drop(f);
     axum::Json(json!({"data": {"web": [{"title": "t", "url": "https://f.example/"}]}}))
         .into_response()
 }
@@ -121,79 +132,173 @@ async fn wait(what: &str, mut f: impl FnMut() -> bool) {
     }
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_disable_from_another_process_stops_rotation_before_the_next_provider() {
-    let ctx = Ctx {
-        fake: Arc::default(),
-        release: Arc::new(Notify::new()),
-    };
-    let app = Router::new()
-        .route("/v1/me", axum::routing::get(me))
-        .route("/v1/web-devices", post(create))
-        .route("/v1/device/claim", post(claim))
-        .route("/v1/device/jobs/{id}/result", post(result))
-        .route("/tavily/search", post(tavily))
-        .route("/firecrawl/search", post(firecrawl))
-        .with_state(ctx.clone());
-    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", l.local_addr().unwrap());
-    tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+const FIRECRAWL_KEY: &str = "fc-two-process-key-123456";
 
-    let t = tempfile::tempdir().unwrap();
-    let home = t.path().to_path_buf();
-    let session = home.join("session");
-    metro_connector::fsutil::write_private(&session, b"tok-alice\n").unwrap();
-    let s = session.to_string_lossy().into_owned();
-    let (h, b) = (home.clone(), base.clone());
-    tokio::task::spawn_blocking(move || {
-        run_ok(
-            cmd(
-                &h,
-                &b,
-                &[
-                    "web",
-                    "setup",
-                    "--server-url",
-                    &b,
-                    "--session-token-file",
-                    &s,
-                ],
-            ),
-            "setup",
+struct Harness {
+    ctx: Ctx,
+    base: String,
+    home: std::path::PathBuf,
+    _t: tempfile::TempDir,
+}
+
+impl Harness {
+    async fn start(firecrawl_key: bool) -> Self {
+        let ctx = Ctx {
+            fake: Arc::default(),
+            release: Arc::new(Notify::new()),
+        };
+        let app = Router::new()
+            .route("/v1/me", axum::routing::get(me))
+            .route("/v1/web-devices", post(create))
+            .route("/v1/device/claim", post(claim))
+            .route("/v1/device/jobs/{id}/result", post(result))
+            .route("/tavily/search", post(tavily))
+            .route("/firecrawl/search", post(firecrawl))
+            .with_state(ctx.clone());
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().to_path_buf();
+        let session = home.join("session");
+        metro_connector::fsutil::write_private(&session, b"tok-alice\n").unwrap();
+        let key = home.join("fc-key");
+        metro_connector::fsutil::write_private(&key, format!("{FIRECRAWL_KEY}\n").as_bytes())
+            .unwrap();
+        let (h, b) = (home.clone(), base.clone());
+        let (s, k) = (
+            session.to_string_lossy().into_owned(),
+            key.to_string_lossy().into_owned(),
         );
-        run_ok(cmd(&h, &b, &["web", "order", "tavily,firecrawl"]), "order");
-    })
-    .await
-    .unwrap();
-
-    // Process 1: the worker.
-    let _worker = Kill(cmd(&home, &base, &["web", "run"]).spawn().unwrap());
-    ctx.fake.lock().unwrap().job = Some(json!({
-        "id": "job-1", "operation": "web_search", "request": {"v": 1, "query": "q"}
-    }));
-    wait("the first provider is contacted", || {
-        ctx.fake.lock().unwrap().tavily_hits == 1
-    })
-    .await;
-
-    // Process 2: the person turns web search off; it returns first.
-    let (h, b) = (home.clone(), base.clone());
-    tokio::task::spawn_blocking(move || run_ok(cmd(&h, &b, &["web", "disable"]), "disable"))
+        tokio::task::spawn_blocking(move || {
+            run_ok(
+                cmd(
+                    &h,
+                    &b,
+                    &[
+                        "web",
+                        "setup",
+                        "--server-url",
+                        &b,
+                        "--session-token-file",
+                        &s,
+                    ],
+                ),
+                "setup",
+            );
+            run_ok(cmd(&h, &b, &["web", "order", "tavily,firecrawl"]), "order");
+            if firecrawl_key {
+                run_ok(
+                    cmd(
+                        &h,
+                        &b,
+                        &["web", "key", "set", "firecrawl", "--from-file", &k],
+                    ),
+                    "key set",
+                );
+            }
+        })
         .await
         .unwrap();
-    // Only now does the first provider answer (429).
-    ctx.release.notify_waiters();
-    wait("the job's result", || {
-        !ctx.fake.lock().unwrap().results.is_empty()
+        Self {
+            ctx,
+            base,
+            home,
+            _t: t,
+        }
+    }
+
+    fn worker(&self) -> Kill {
+        Kill(
+            cmd(&self.home, &self.base, &["web", "run"])
+                .spawn()
+                .unwrap(),
+        )
+    }
+
+    fn queue(&self, id: &str) {
+        self.ctx.fake.lock().unwrap().job = Some(json!({
+            "id": id, "operation": "web_search", "request": {"v": 1, "query": "q"}
+        }));
+    }
+
+    /// Another `metro-connector` process, run to completion.
+    async fn other_process(&self, args: &'static [&'static str]) {
+        let (h, b) = (self.home.clone(), self.base.clone());
+        tokio::task::spawn_blocking(move || run_ok(cmd(&h, &b, args), "other process"))
+            .await
+            .unwrap();
+    }
+
+    async fn result(&self, n: usize) -> Value {
+        let f = &self.ctx.fake;
+        wait("a job result", || f.lock().unwrap().results.len() >= n).await;
+        f.lock().unwrap().results[n - 1].clone()
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_disable_from_another_process_stops_rotation_before_the_next_provider() {
+    let h = Harness::start(false).await;
+    let _worker = h.worker();
+    h.queue("job-1");
+    wait("the first provider is contacted", || {
+        h.ctx.fake.lock().unwrap().tavily_hits == 1
     })
     .await;
-    let f = ctx.fake.lock().unwrap();
+    // Process 2: the person turns web search off; it returns first.
+    h.other_process(&["web", "disable"]).await;
+    // Only now does the first provider answer (429).
+    h.ctx.release.notify_one();
     assert_eq!(
-        f.results[0],
+        h.result(1).await,
         json!({"ok": false, "error": "web search is turned off on this computer"})
     );
     assert_eq!(
-        f.firecrawl_hits, 0,
+        h.ctx.fake.lock().unwrap().firecrawl_hits,
+        0,
         "the second provider was contacted after disable"
+    );
+    // The first provider's 429 was kept although the job ended early: after
+    // turning web search on again it is still cooling down.
+    h.other_process(&["web", "enable"]).await;
+    h.queue("job-2");
+    let r = h.result(2).await;
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["response"]["attempts"][0]["provider"], "tavily");
+    assert_eq!(r["response"]["attempts"][0]["outcome"], "skipped_cooldown");
+    assert_eq!(r["response"]["provider"], "firecrawl");
+    assert_eq!(
+        h.ctx.fake.lock().unwrap().tavily_hits,
+        1,
+        "contacted during its cooldown"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_deleted_by_another_process_during_rotation_is_not_used() {
+    let h = Harness::start(true).await;
+    let _worker = h.worker();
+    h.queue("job-1");
+    wait("the first provider is contacted", || {
+        h.ctx.fake.lock().unwrap().tavily_hits == 1
+    })
+    .await;
+    // Process 2: the person deletes the Firecrawl key; it returns first.
+    h.other_process(&["web", "key", "delete", "firecrawl"])
+        .await;
+    h.ctx.release.notify_one();
+    let r = h.result(1).await;
+    assert_eq!(r["ok"], true, "{r}");
+    assert_eq!(r["response"]["provider"], "firecrawl");
+    assert_eq!(
+        r["response"]["mode"], "keyless",
+        "the credential actually used"
+    );
+    assert_eq!(r["response"]["attempts"][1]["mode"], "keyless");
+    assert_eq!(
+        h.ctx.fake.lock().unwrap().firecrawl_auth,
+        vec![None],
+        "the deleted key was sent"
     );
 }

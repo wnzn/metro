@@ -1815,3 +1815,86 @@ fn key_edits_wait_for_the_lock_and_never_lose_an_update() {
         assert!(k.has(p), "{p} lost");
     }
 }
+
+#[tokio::test]
+async fn an_invalid_stored_key_makes_the_store_unreadable_not_free() {
+    let s = Setup::new(&[ProviderId::Tavily]).await;
+    // A known provider with a value no save would have written.
+    let body = br#"{"v":1,"keys":{"tavily":"x y"}}"#.to_vec();
+    let sealed = crate::openai_oauth::store::seal(body).unwrap();
+    let path = s.dir.join(keys::FILE);
+    crate::fsutil::write_private(&path, &sealed).unwrap();
+    let before = std::fs::read(&path).unwrap();
+    let e = s.engine();
+    let r = e
+        .handle(
+            "j",
+            "web_search",
+            &json!({"v": 1, "query": "q"}),
+            deadline(),
+        )
+        .await;
+    assert_eq!(r, json!({"ok": false, "error": KEYS_UNREADABLE}));
+    assert_eq!(
+        e.test_provider(ProviderId::Tavily).await,
+        Err(KEYS_UNREADABLE)
+    );
+    assert!(s.fixture.seen().is_empty(), "no vendor contact");
+    // Editing another provider's key leaves the file as it was.
+    assert!(
+        keys::KeyStore::new(&s.dir)
+            .set(ProviderId::Exa, Secret::new(CANARY))
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&path).unwrap(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_key_deleted_between_requests_restarts_the_attempt_with_the_current_credential() {
+    let s = Setup::new(&[ProviderId::Firecrawl]).await;
+    s.key(ProviderId::Firecrawl, CANARY);
+    let ok = |t: &str| {
+        reply(
+            200,
+            json!({"data": {"markdown": t, "metadata": {"statusCode": 200}}}),
+        )
+    };
+    let mut first = ok("a");
+    let release = hold(&mut first);
+    s.fixture.push("/firecrawl/scrape", first);
+    for t in ["a2", "b2"] {
+        s.fixture.push("/firecrawl/scrape", ok(t));
+    }
+    let e = Arc::new(s.engine());
+    let job = {
+        let e = e.clone();
+        tokio::spawn(async move {
+            e.rotate(
+                "j",
+                &fetch(&["https://a.example/", "https://b.example/"]),
+                deadline(),
+            )
+            .await
+        })
+    };
+    wait_seen(&s.fixture, "/firecrawl/scrape", 1).await;
+    keys::KeyStore::new(&s.dir)
+        .delete(ProviderId::Firecrawl)
+        .unwrap();
+    release.notify_one();
+    let v = job.await.unwrap();
+    assert_eq!(v["provider"], "firecrawl", "{v}");
+    assert_eq!(v["mode"], "keyless", "the mode actually used");
+    let auth: Vec<Option<String>> = s
+        .fixture
+        .seen_at("/firecrawl/scrape")
+        .iter()
+        .map(|r| r.header("authorization").map(str::to_owned))
+        .collect();
+    // The first request had the key; after the deletion none does.
+    assert_eq!(
+        auth,
+        vec![Some(format!("Bearer {CANARY}")), None, None],
+        "the deleted key was used again"
+    );
+}

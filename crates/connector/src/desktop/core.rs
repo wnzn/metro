@@ -1625,8 +1625,10 @@ impl Desktop {
 
     /// `POST /v1/web-search/providers/{id}/clear-cooldown`.
     pub async fn web_clear_cooldown(&self, id: &str) -> R<Value> {
-        let (server, account, _, epoch) = self.session_epoch()?;
-        self.web.clear_cooldown(&server, &account, epoch, id).await
+        let (server, account, token, epoch) = self.session_epoch()?;
+        self.web
+            .clear_cooldown(&server, &account, epoch, &token, id)
+            .await
     }
 
     pub async fn open_local(&self) -> R<(String, Secret)> {

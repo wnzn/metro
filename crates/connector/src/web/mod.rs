@@ -855,19 +855,18 @@ impl Engine {
             Ok(_) => return Err(TURNED_OFF),
             Err(_) => return Err(SETTINGS_UNREADABLE),
         };
-        let keys = match keys::KeyStore::new(&self.dir).load() {
-            Ok(k) => k,
-            Err(_) => {
-                log(
-                    job_id,
-                    op,
-                    None,
-                    None,
-                    "saved keys unreadable; nothing sent",
-                );
-                return Err(KEYS_UNREADABLE);
-            }
-        };
+        // Fail closed early on an unreadable key store; the credential
+        // itself is read again right before each provider is contacted.
+        if keys::KeyStore::new(&self.dir).load().is_err() {
+            log(
+                job_id,
+                op,
+                None,
+                None,
+                "saved keys unreadable; nothing sent",
+            );
+            return Err(KEYS_UNREADABLE);
+        }
         let per_attempt = match op {
             Op::Search(_) => SEARCH_ATTEMPT,
             Op::Fetch(_) => FETCH_ATTEMPT,
@@ -875,112 +874,153 @@ impl Engine {
         let mut attempts: Vec<Value> = Vec::new();
         let mut updates = settings::Updates::default();
         let mut answer: Option<(ProviderId, Mode, Value)> = None;
-        for ps in &snapshot.providers {
-            if !ps.enabled {
-                continue;
-            }
-            let p = ps.id;
-            let key = keys.get(p.as_str());
-            let mode = if key.is_some() {
-                Mode::Key
-            } else {
-                Mode::Keyless
-            };
-            let now = self.now();
-            let mut push = |outcome: Outcome, until: Option<u64>| {
-                let mut a = json!({"provider": p.as_str(), "mode": mode.as_str(), "outcome": outcome.as_str()});
-                if let Some(u) = until {
-                    a["until"] = json!(rfc3339(u));
+        // Every exit after an attempt leaves through here, so what completed
+        // attempts learned (cooldowns, rejected keys) is always kept.
+        let ended: Result<(), &'static str> = 'rotation: {
+            for ps in &snapshot.providers {
+                if !ps.enabled {
+                    continue;
                 }
-                attempts.push(a);
-            };
-            if key.is_none() && !p.keyless() {
-                push(Outcome::SkippedNoKey, None);
-                continue;
-            }
-            if let Some(k) = key
-                && snapshot.key_rejected(p, &keys::fingerprint(k))
-            {
-                push(Outcome::KeyRejected, None);
-                continue;
-            }
-            if let Some(until) = snapshot.cooldown_until(p, mode, now) {
-                push(Outcome::SkippedCooldown, Some(until));
-                continue;
-            }
-            let left = deadline.saturating_duration_since(Instant::now());
-            if left < MIN_ATTEMPT {
-                break;
-            }
-            // Right before contacting this provider: still on, and this
-            // provider still allowed?
-            match self.consent(Some(p)) {
-                Consent::Yes => {}
-                Consent::ProviderOff => continue,
-                Consent::Off => return Err(TURNED_OFF),
-            }
-            let gate = || self.consent(Some(p)) == Consent::Yes;
-            let call = Call {
-                gate: &gate,
-                http: self.client(p, mode),
-                key,
-                timeout: per_attempt.min(left),
-                now,
-                sessions: &self.sessions,
-            };
-            let result = match tokio::time::timeout(call.timeout, self.call(p, op, &call)).await {
-                Ok(r) => r,
-                Err(_) => Err(Failure::of(Outcome::Timeout)),
-            };
-            // What would leave this computer, checked for the key used on
-            // this request: a vendor that echoes it back fails the attempt,
-            // and nothing of that answer is delivered.
-            let result = result.and_then(|a| {
-                let body = answer_json(op, a);
-                match key {
-                    Some(k) if reflects(&body, k) => Err(Failure::of(Outcome::BadResponse)),
-                    _ => Ok(body),
-                }
-            });
-            match result {
-                Ok(a) => {
-                    push(Outcome::Ok, None);
-                    updates.last.push((p, Outcome::Ok, now));
-                    log(job_id, op, Some(p), Some(mode), "ok");
-                    answer = Some((p, mode, a));
-                    break;
-                }
-                Err(f) if f.outcome == Outcome::SkippedDisabled => {
-                    // Turned off during this attempt: nothing more was sent.
-                    log(job_id, op, Some(p), Some(mode), "stopped: turned off");
-                    if self.consent(None) == Consent::Off {
-                        self.record(job_id, op, &updates).await;
-                        return Err(TURNED_OFF);
+                let p = ps.id;
+                // A credential that changes during an attempt restarts it
+                // once with the new one.
+                let mut restarts = 0;
+                loop {
+                    // Right before contacting this provider: still on, this
+                    // provider still allowed, and its credential as it is
+                    // now (another process may have changed it).
+                    match self.consent(Some(p)) {
+                        Consent::Yes => {}
+                        Consent::ProviderOff => break,
+                        Consent::Off => break 'rotation Err(TURNED_OFF),
                     }
-                }
-                Err(f) => {
-                    log(job_id, op, Some(p), Some(mode), f.outcome.as_str());
-                    updates.last.push((p, f.outcome, now));
-                    if f.outcome == Outcome::KeyRejected {
-                        if let Some(k) = key {
-                            updates.rejected.push((p, keys::fingerprint(k)));
+                    let key = match self.current_key(p) {
+                        Ok(k) => k,
+                        Err(why) => break 'rotation Err(why),
+                    };
+                    let mode = if key.is_some() {
+                        Mode::Key
+                    } else {
+                        Mode::Keyless
+                    };
+                    let now = self.now();
+                    let mut push = |outcome: Outcome, until: Option<u64>| {
+                        let mut a = json!({"provider": p.as_str(), "mode": mode.as_str(), "outcome": outcome.as_str()});
+                        if let Some(u) = until {
+                            a["until"] = json!(rfc3339(u));
                         }
+                        attempts.push(a);
+                    };
+                    if key.is_none() && !p.keyless() {
+                        push(Outcome::SkippedNoKey, None);
+                        break;
+                    }
+                    if let Some(k) = &key
+                        && snapshot.key_rejected(p, &keys::fingerprint(k))
+                    {
                         push(Outcome::KeyRejected, None);
-                        continue;
+                        break;
                     }
-                    let secs = f
-                        .cooldown
-                        .or(f.outcome.default_cooldown())
-                        .map(|s| s.clamp(1, 24 * 3600));
-                    let until = secs.map(|s| now + s);
-                    if let Some(u) = until {
-                        updates.cooldowns.push((p, mode, u, f.outcome));
+                    if let Some(until) = snapshot.cooldown_until(p, mode, now) {
+                        push(Outcome::SkippedCooldown, Some(until));
+                        break;
                     }
-                    push(f.outcome, until);
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left < MIN_ATTEMPT {
+                        break 'rotation Ok(());
+                    }
+                    // Before every further request of this attempt: still
+                    // allowed, and still the same credential.
+                    let used = key.as_ref().map(keys::fingerprint);
+                    let gate = || {
+                        self.consent(Some(p)) == Consent::Yes
+                            && self
+                                .current_key(p)
+                                .is_ok_and(|k| k.as_ref().map(keys::fingerprint) == used)
+                    };
+                    let call = Call {
+                        gate: &gate,
+                        http: self.client(p, mode),
+                        key: key.as_ref(),
+                        timeout: per_attempt.min(left),
+                        now,
+                        sessions: &self.sessions,
+                    };
+                    let result =
+                        match tokio::time::timeout(call.timeout, self.call(p, op, &call)).await {
+                            Ok(r) => r,
+                            Err(_) => Err(Failure::of(Outcome::Timeout)),
+                        };
+                    // What would leave this computer, checked for the key
+                    // used on this request: a vendor that echoes it back
+                    // fails the attempt, and nothing of it is delivered.
+                    let result = result.and_then(|a| {
+                        let body = answer_json(op, a);
+                        match &key {
+                            Some(k) if reflects(&body, k) => Err(Failure::of(Outcome::BadResponse)),
+                            _ => Ok(body),
+                        }
+                    });
+                    match result {
+                        Ok(a) => {
+                            push(Outcome::Ok, None);
+                            updates.last.push((p, Outcome::Ok, now));
+                            log(job_id, op, Some(p), Some(mode), "ok");
+                            answer = Some((p, mode, a));
+                            break 'rotation Ok(());
+                        }
+                        Err(f) if f.outcome == Outcome::SkippedDisabled => {
+                            // Stopped mid-attempt: nothing more was sent.
+                            match self.consent(Some(p)) {
+                                Consent::Off => {
+                                    log(job_id, op, Some(p), Some(mode), "stopped: turned off");
+                                    break 'rotation Err(TURNED_OFF);
+                                }
+                                Consent::ProviderOff => break,
+                                // The credential changed: start over once
+                                // with the current one.
+                                Consent::Yes if restarts == 0 => {
+                                    log(
+                                        job_id,
+                                        op,
+                                        Some(p),
+                                        Some(mode),
+                                        "credential changed; restarting",
+                                    );
+                                    restarts += 1;
+                                    continue;
+                                }
+                                Consent::Yes => break,
+                            }
+                        }
+                        Err(f) => {
+                            log(job_id, op, Some(p), Some(mode), f.outcome.as_str());
+                            updates.last.push((p, f.outcome, now));
+                            if f.outcome == Outcome::KeyRejected {
+                                if let Some(k) = &key {
+                                    updates.rejected.push((p, keys::fingerprint(k)));
+                                }
+                                push(Outcome::KeyRejected, None);
+                                break;
+                            }
+                            let secs = f
+                                .cooldown
+                                .or(f.outcome.default_cooldown())
+                                .map(|s| s.clamp(1, 24 * 3600));
+                            let until = secs.map(|s| now + s);
+                            if let Some(u) = until {
+                                updates.cooldowns.push((p, mode, u, f.outcome));
+                            }
+                            push(f.outcome, until);
+                            break;
+                        }
+                    }
                 }
             }
-        }
+            Ok(())
+        };
         self.record(job_id, op, &updates).await;
+        ended?;
         let mut out = json!({"v": 1, "attempts": attempts});
         match answer {
             Some((p, mode, body)) => {
@@ -1008,6 +1048,15 @@ impl Engine {
                 &format!("settings not saved: {}", clean_line(&e.to_string(), 80)),
             );
         }
+    }
+
+    /// `p`'s credential as it is now (a consistent read of the key file,
+    /// which is only ever replaced atomically): `None` = free mode.
+    fn current_key(&self, p: ProviderId) -> Result<Option<Secret>, &'static str> {
+        keys::KeyStore::new(&self.dir)
+            .load()
+            .map(|k| k.get(p.as_str()).cloned())
+            .map_err(|_| KEYS_UNREADABLE)
     }
 
     /// Consent now, from the files as they are (any process may have
@@ -1046,8 +1095,15 @@ impl Engine {
         } else {
             Mode::Keyless
         };
-        // An explicit test of one provider: only the master switch counts.
-        let gate = || self.consent(None) == Consent::Yes;
+        // An explicit test of one provider: the master switch, and the same
+        // credential as when the test began.
+        let used = key.map(keys::fingerprint);
+        let gate = || {
+            self.consent(None) == Consent::Yes
+                && self
+                    .current_key(p)
+                    .is_ok_and(|k| k.as_ref().map(keys::fingerprint) == used)
+        };
         let op = Op::Search(SearchReq {
             query: "Metro web search test".into(),
             keywords: Vec::new(),

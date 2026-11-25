@@ -126,9 +126,12 @@ impl KeyStore {
         for (p, k) in &w.keys {
             if ProviderId::parse(p).is_some() {
                 let secret = Secret::new(k.as_str());
-                if validate_key(&secret).is_ok() {
-                    out.insert(p.clone(), secret);
+                // A stored key that isn't valid means the store isn't what
+                // the person saved: unreadable, never silently free mode.
+                if validate_key(&secret).is_err() {
+                    return Err(unreadable());
                 }
+                out.insert(p.clone(), secret);
             }
         }
         Ok(Keys(out))

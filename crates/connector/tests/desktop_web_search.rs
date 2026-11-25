@@ -471,7 +471,7 @@ async fn turning_off_always_stops_and_revokes_whatever_the_file_said() {
         "{v}"
     );
     assert_eq!(v["enabled"], false);
-    web.clear_cooldown(&base, "alice", 1, "tavily")
+    web.clear_cooldown(&base, "alice", 1, &session, "tavily")
         .await
         .unwrap();
     assert_eq!(
@@ -507,5 +507,56 @@ async fn turning_off_always_stops_and_revokes_whatever_the_file_said() {
         .await
         .unwrap();
     assert_eq!(s.lock().unwrap().deleted.len(), 1);
+    web.session_ended().await;
+}
+
+/// Web search is on but a damaged state file kept the workers from
+/// starting at sign-in; repairing it ("Try again now") starts them under
+/// the current session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn repairing_the_state_file_starts_the_workers() {
+    use metro_connector::desktop::monitoring::Events;
+    use metro_connector::desktop::web::WebSearch;
+    use metro_connector::web::settings;
+
+    let (base, s) = fake().await;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("desktop");
+    let web = Arc::new(
+        WebSearch::new(&root, true, Duration::from_millis(30), Events::new(&root))
+            .with_endpoints(endpoints(&base)),
+    );
+    let session = metro_connector::Secret::new("tok-alice");
+    let p =
+        metro_connector::desktop::store::profile_for(&root, &base, "alice", "web-search").unwrap();
+    p.ensure().unwrap();
+    metro_connector::fsutil::write_private(&p.dir.join(settings::STATE_FILE), b"[").unwrap();
+    web.session_bound(&base, "alice", &session, 1).await;
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(
+        s.lock().unwrap().claims,
+        0,
+        "no worker while the state is unreadable"
+    );
+    // A stale epoch can't repair-and-start.
+    assert_eq!(
+        web.clear_cooldown(&base, "alice", 0, &session, "tavily")
+            .await
+            .unwrap_err()
+            .code,
+        "no_session"
+    );
+    web.clear_cooldown(&base, "alice", 1, &session, "tavily")
+        .await
+        .unwrap();
+    wait_for("workers after the repair", || s.lock().unwrap().claims > 0).await;
+    let v = web.state(&base, "alice").await.unwrap();
+    assert_eq!(v["settings_error"], Value::Null);
+    assert_eq!(v["device"]["paired"], true);
+    // A second repair doesn't start a second set of workers.
+    web.clear_cooldown(&base, "alice", 1, &session, "exa")
+        .await
+        .unwrap();
+    assert_eq!(s.lock().unwrap().created.len(), 1);
     web.session_ended().await;
 }
