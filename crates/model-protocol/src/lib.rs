@@ -18,6 +18,7 @@ use std::collections::BTreeMap;
 
 mod client;
 mod media;
+pub mod web_privacy;
 pub use client::*;
 pub use media::*;
 

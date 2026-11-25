@@ -55,6 +55,8 @@ USAGE
                                       Set the approved models (replaces the list)
   metro-connector status  [--profile NAME]
   metro-connector list                List connection profiles
+  metro-connector web ...             Run web searches for Metro on this
+                                      computer (see `metro-connector web --help`)
   metro-connector help | --help | --version
 
 SETUP OPTIONS (anything you leave out is asked interactively)
@@ -894,6 +896,9 @@ pub async fn main_with(args: Vec<String>) -> i32 {
             return 2;
         }
     };
+    if cmd == "web" {
+        return crate::web::cli::main(rest).await;
+    }
     if matches!(cmd, "help" | "--help" | "-h") || rest.iter().any(|a| a == "--help" || a == "-h") {
         print!("{HELP}");
         return 0;

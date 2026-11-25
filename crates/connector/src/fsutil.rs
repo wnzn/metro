@@ -92,6 +92,36 @@ pub fn write_private(path: &Path, data: &[u8]) -> Result<()> {
     result
 }
 
+/// An exclusive lock on a lock file, held until dropped. Interprocess and
+/// cross-platform (`flock` on Unix, `LockFileEx` on Windows); two handles in
+/// one process also exclude each other.
+pub struct FileLock {
+    _file: fs::File,
+}
+
+/// Wait for the exclusive lock on `path` (created mode 600 if missing).
+/// Blocking: call from a blocking context.
+pub fn lock_exclusive(path: &Path) -> Result<FileLock> {
+    if let Ok(m) = fs::symlink_metadata(path)
+        && !m.is_file()
+    {
+        bail!("{} is not a regular file", path.display());
+    }
+    let mut opts = fs::OpenOptions::new();
+    opts.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let file = opts
+        .open(path)
+        .with_context(|| format!("opening {}", path.display()))?;
+    file.lock()
+        .with_context(|| format!("locking {}", path.display()))?;
+    Ok(FileLock { _file: file })
+}
+
 /// Read a private file of at most `cap` bytes. `Ok(None)` if it doesn't
 /// exist. Refuses symlinks, and on Unix files readable by group or others.
 pub fn read_private(path: &Path, cap: u64) -> Result<Option<Vec<u8>>> {

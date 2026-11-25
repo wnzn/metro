@@ -162,6 +162,11 @@ pub struct Activity {
     /// e.g. `Picked by classifier: Coder` or `Addressed: @coder`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick: Option<String>,
+    /// Only on a web tool's `tool_call` / `tool_result` / `error` events:
+    /// which tool, the provider that answered and every attempt
+    /// ([`crate::web_tools`]). Never a query result or page text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<crate::web_tools::ToolNote>,
 }
 
 /// A Space agent as shown on its events: enough to draw its name and
@@ -191,6 +196,7 @@ impl Activity {
             route: None,
             agent: None,
             pick: None,
+            tool: None,
         }
     }
 
@@ -217,6 +223,7 @@ impl Activity {
             route: None,
             agent: None,
             pick: None,
+            tool: None,
         }
     }
 
@@ -227,6 +234,18 @@ impl Activity {
             phase: Some(phase.to_owned()),
             route: None,
             pick: None,
+            tool: None,
+            ..self.clone()
+        }
+    }
+
+    /// This activity with a web tool's note.
+    pub fn with_tool(&self, tool: crate::web_tools::ToolNote) -> Self {
+        Self {
+            phase: None,
+            route: None,
+            pick: None,
+            tool: Some(tool),
             ..self.clone()
         }
     }
@@ -236,6 +255,12 @@ impl Activity {
         self.route = Some(route);
         self
     }
+}
+
+/// The server-written `thread` event a parent run posts in its room when it
+/// creates thread `id` named `name`.
+pub fn thread_started_text(name: &str, id: &str) -> String {
+    format!("Started thread \"{name}\" ({id}).")
 }
 
 /// Activity sources and lifecycle phases.
@@ -459,6 +484,7 @@ impl Db {
         crate::profiles::init(&conn)?;
         crate::providers::init(&conn)?;
         crate::device_relay::init(&conn)?;
+        crate::web_devices::init(&conn)?;
         crate::model_routing::init(&conn)?;
         crate::search::init(&conn)?;
         crate::schedules::init(&conn)?;
@@ -886,6 +912,40 @@ impl Db {
             name: name.to_owned(),
             parent_room_id: parent.map(str::to_owned),
         })
+    }
+
+    /// The parent-room events from before `thread` (a child room named
+    /// `name`) was created: those before the server-written `Started
+    /// thread` marker the parent run left there, newest `limit`. Empty when
+    /// there is no such marker, so nothing later (or forged) counts.
+    pub fn events_before_thread(
+        &self,
+        space_id: &str,
+        parent_room_id: &str,
+        thread_id: &str,
+        name: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        let marker: Option<i64> = {
+            let conn = self.lock();
+            conn.query_row(
+                "SELECT id FROM space_events
+                 WHERE space_id = ?1 AND room_id = ?2 AND kind = 'thread' AND actor_id IS NULL
+                   AND text = ?3
+                 ORDER BY id LIMIT 1",
+                params![
+                    space_id,
+                    parent_room_id,
+                    thread_started_text(name, thread_id)
+                ],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+        match marker {
+            Some(id) => self.events_before(space_id, parent_room_id, id, limit),
+            None => Ok(Vec::new()),
+        }
     }
 
     /// The most recent event of `kinds` in a room, if any.
@@ -1499,6 +1559,50 @@ mod activity_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_threads_parent_history_ends_at_its_creation_marker() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_space("alice", "a", 10).unwrap();
+        let alice = Author {
+            id: Some("alice".into()),
+            name: "Alice".into(),
+        };
+        let agent = Author::server(actor::AGENT);
+        let room = Addressed::room();
+        let msg = |author: &Author, k: &str, text: &str| {
+            db.append_event(&s.id, LOBBY_ID, k, author, text, &room)
+                .unwrap()
+        };
+        msg(&alice, kind::MESSAGE, "before https://a.example/");
+        // A person can't forge the marker.
+        msg(
+            &alice,
+            kind::MESSAGE,
+            &thread_started_text("research", "t1"),
+        );
+        let thread = db
+            .create_room(&s.id, "research", Some(LOBBY_ID), 10, 10)
+            .unwrap();
+        assert!(
+            db.events_before_thread(&s.id, LOBBY_ID, &thread.id, "research", 50)
+                .unwrap()
+                .is_empty(),
+            "no server marker yet: nothing counts"
+        );
+        msg(
+            &agent,
+            kind::THREAD,
+            &thread_started_text("research", &thread.id),
+        );
+        msg(&alice, kind::MESSAGE, "after https://b.example/");
+        let got = db
+            .events_before_thread(&s.id, LOBBY_ID, &thread.id, "research", 50)
+            .unwrap();
+        let texts: Vec<&str> = got.iter().map(|e| e.text.as_str()).collect();
+        assert!(texts.contains(&"before https://a.example/"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("b.example")), "{texts:?}");
+    }
 
     #[test]
     fn refuses_populated_legacy_database_and_accepts_empty_one() {
