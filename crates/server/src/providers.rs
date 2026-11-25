@@ -897,6 +897,18 @@ impl std::fmt::Display for ProviderError {
 impl std::error::Error for ProviderError {}
 
 impl ProviderError {
+    /// A fixed name of the failure, for logs.
+    pub fn category(&self) -> &'static str {
+        match self {
+            ProviderError::Use(_) => "unusable",
+            ProviderError::InvalidInput(_) => "invalid_input",
+            ProviderError::Device(e) => e.kind(),
+            ProviderError::Endpoint(_) => "endpoint",
+            ProviderError::Busy => "busy",
+            ProviderError::Internal => "internal",
+        }
+    }
+
     /// The HTTP status an API handler should answer with.
     pub fn status(&self) -> axum::http::StatusCode {
         use axum::http::StatusCode as S;
@@ -1053,11 +1065,14 @@ fn typed_target(state: &AppState, u: &TypedUse) -> Result<TypedTarget, ProviderE
     }
 }
 
+/// Fixed fields only: an endpoint's or device's own text never reaches a
+/// log.
 fn log_typed_failure(u: &TypedUse, e: &ProviderError) {
     tracing::warn!(
         connection = %u.row.id,
         provider = %u.row.provider_id,
-        error = %e,
+        category = e.category(),
+        status = e.status().as_u16(),
         "typed model call failed"
     );
 }

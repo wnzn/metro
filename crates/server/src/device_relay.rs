@@ -353,9 +353,14 @@ impl std::fmt::Display for DeviceError {
             DeviceError::AccessRevoked => f.write_str(
                 "access to this shared model connection was revoked; the request was cancelled",
             ),
-            DeviceError::Device(e) => write!(f, "your device connector reported: {e}"),
-            DeviceError::BadResponse(e) => {
-                write!(f, "your device connector returned an invalid response: {e}")
+            // The device's own text stays out of every message and log: it
+            // can carry whatever the vendor or the connector echoed. The
+            // connector keeps it in its own log.
+            DeviceError::Device(_) => {
+                f.write_str("your device connector reported an error; see its own log")
+            }
+            DeviceError::BadResponse(_) => {
+                f.write_str("your device connector returned an invalid response")
             }
             DeviceError::Internal => f.write_str("internal error in the device relay"),
         }
@@ -363,6 +368,27 @@ impl std::fmt::Display for DeviceError {
 }
 
 impl std::error::Error for DeviceError {}
+
+impl DeviceError {
+    /// A fixed name of the failure, for logs.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            DeviceError::NotFound => "not_found",
+            DeviceError::NotPaired => "not_paired",
+            DeviceError::Offline => "offline",
+            DeviceError::QueueFull => "queue_full",
+            DeviceError::NotClaimed => "not_claimed",
+            DeviceError::TimedOut => "timed_out",
+            DeviceError::CredentialChanged => "credential_changed",
+            DeviceError::TooLarge => "too_large",
+            DeviceError::InvalidRequest(_) => "invalid_request",
+            DeviceError::AccessRevoked => "access_revoked",
+            DeviceError::Device(_) => "device_error",
+            DeviceError::BadResponse(_) => "bad_response",
+            DeviceError::Internal => "internal",
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Storage: one device credential per connection, as a hash.
@@ -1238,7 +1264,7 @@ impl DeviceRelay {
                         Ok(end) => deadline = end,
                         Err(why) => {
                             inner.fail(&id, None);
-                            tracing::debug!(job = %id, %why, "device job failed");
+                            tracing::debug!(job = %id, kind = why.kind(), "device job failed");
                             return Err(why);
                         }
                     }

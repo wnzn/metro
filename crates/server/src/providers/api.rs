@@ -1310,7 +1310,8 @@ async fn list_typed_models_within(
             .collect()),
         Ok(models) => Ok(models),
         Err(e) => {
-            tracing::warn!(connection = %row.id, provider = %row.provider_id, error = %e,
+            tracing::warn!(connection = %row.id, provider = %row.provider_id,
+                category = e.category(), status = e.status().as_u16(),
                 "typed model listing failed");
             Err(ApiError::new(
                 e.status(),

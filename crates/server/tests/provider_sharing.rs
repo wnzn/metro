@@ -1677,3 +1677,109 @@ async fn a_borrowers_chat_never_shows_the_owners_provider_text() {
         }
     }
 }
+
+/// Everything Metro logs while it is alive, on this thread.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn a_device_classifiers_own_text_reaches_no_log_response_or_room() {
+    let captured = Captured::default();
+    let writer = captured.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_env_filter(tracing_subscriber::EnvFilter::new("metro_server=trace"))
+        .with_writer(move || writer.clone())
+        .finish();
+    let _logs = tracing::subscriber::set_default(subscriber);
+
+    let s = Arc::new(Server::start().await);
+    let id = s
+        .connect(ALICE, "device-systemone", "jev-local", false)
+        .await;
+    let (status, issued) = s
+        .post(
+            ALICE,
+            &format!("/v1/providers/{id}/device-token"),
+            json!({}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{issued}");
+    let token = issued["token"].as_str().unwrap().to_owned();
+    assert!(claim(&s, &token).await.is_none()); // online now
+    let sid = s.space(ALICE, "Device classifier", &["bob"]).await;
+    let (status, body) = s
+        .put(ALICE, "/v1/model-routing", json!({"classifier_id": id}))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let (status, body) = s
+        .put(
+            ALICE,
+            &format!("/v1/spaces/{sid}/prefs"),
+            json!({"classify_unaddressed": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+
+    // The device fails with its own text, then answers malformed with it.
+    let results = [
+        json!({"ok": false, "error": format!("{SENTINEL}: vendor said no")}),
+        json!({"ok": true, "response": {"model": SENTINEL, "answers": {SENTINEL: SENTINEL}}}),
+    ];
+    for (n, result) in results.into_iter().enumerate() {
+        let sent = {
+            let (s, sid) = (s.clone(), sid.clone());
+            tokio::spawn(async move {
+                s.post(
+                    ALICE,
+                    &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+                    json!({"text": format!("lunch plans {n}?")}),
+                )
+                .await
+            })
+        };
+        let job = claim_soon(&s, &token).await;
+        s.http
+            .post(format!(
+                "{}/v1/device/jobs/{}/result",
+                s.base,
+                job["id"].as_str().unwrap()
+            ))
+            .bearer_auth(&token)
+            .json(&result)
+            .send()
+            .await
+            .unwrap();
+        let (status, response) = sent.await.unwrap();
+        assert_eq!(status, StatusCode::ACCEPTED, "{response}");
+        let expected = ["unreachable", "invalid_answer"][n];
+        assert_eq!(
+            response["addressing_note"],
+            json!({"kind": "classification_failed", "reason": expected})
+        );
+        assert!(!response.to_string().contains(SENTINEL), "{response}");
+    }
+    for token in [ALICE, BOB] {
+        let (_, events) = s
+            .get(token, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
+            .await;
+        assert!(!events.to_string().contains(SENTINEL), "{events}");
+    }
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(logs.contains("typed model call failed"), "{logs}");
+    assert!(logs.contains("device_error"), "{logs}");
+    assert!(
+        !logs.contains(SENTINEL),
+        "a log line carries the device's text:\n{logs}"
+    );
+}
