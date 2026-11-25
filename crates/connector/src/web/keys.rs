@@ -17,12 +17,23 @@ use zeroize::Zeroize;
 
 use super::ProviderId;
 use crate::fsutil::{ensure_private_dir, read_private, remove_private, write_private};
-use crate::openai_oauth::store::{seal, unseal};
+use crate::openai_oauth::store::{random_bytes, seal, unseal};
 use crate::{SafeError, Secret};
 
 pub const FILE: &str = "web-keys.json";
 /// Held across every read-modify-write of the key file, in any process.
 pub const LOCK_FILE: &str = "web-keys.lock";
+// Separate from the v1 key file: older readers can still open that file.
+const GENERATION_FILE: &str = "web-keys-generation";
+
+/// In-memory identity of a test's credential: no key, hash, or mode is
+/// written here. The opaque file generation also detects A → B → A edits.
+#[derive(PartialEq, Eq)]
+pub(super) struct TestCredential {
+    generation: Option<[u8; 16]>,
+    // Absent is keyless; a keyed test must match the full digest.
+    digest: Option<[u8; 32]>,
+}
 
 /// The saved keys, by provider id.
 #[derive(Default)]
@@ -100,10 +111,32 @@ impl KeyStore {
         self.dir.join(FILE)
     }
 
-    fn locked<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    pub(super) fn locked<T>(&self, f: impl FnOnce() -> Result<T>) -> Result<T> {
         ensure_private_dir(&self.dir)?;
         let _lock = crate::fsutil::lock_exclusive(&self.dir.join(LOCK_FILE))?;
         f()
+    }
+
+    /// Called under `locked` so the key and its generation are one snapshot.
+    pub(super) fn test_credential(
+        &self,
+        p: ProviderId,
+    ) -> Result<(Option<Secret>, TestCredential)> {
+        let key = self.load()?.0.remove(p.as_str());
+        let generation = read_private(&self.dir.join(GENERATION_FILE), 16)
+            .map_err(|_| unreadable())?
+            .map(|bytes| bytes.try_into().map_err(|_| unreadable()))
+            .transpose()?;
+        let digest = key
+            .as_ref()
+            .map(|k| Sha256::digest(k.expose().as_bytes()).into());
+        Ok((key, TestCredential { generation, digest }))
+    }
+
+    /// Invalidate tests before mutating the keys, under the same file lock.
+    /// If the second write fails, refusing an in-flight test is still safe.
+    fn advance_generation(&self) -> Result<()> {
+        write_private(&self.dir.join(GENERATION_FILE), &random_bytes::<16>())
     }
 
     /// The saved keys; none when nothing is saved. A file that can't be read
@@ -139,6 +172,7 @@ impl KeyStore {
 
     fn store(&self, keys: &BTreeMap<String, Secret>) -> Result<()> {
         ensure_private_dir(&self.dir)?;
+        self.advance_generation()?;
         if keys.is_empty() {
             remove_private(&self.path())?;
             return Ok(());
@@ -171,7 +205,10 @@ impl KeyStore {
     /// Delete every saved key, readable or not: the explicit recovery from a
     /// key file that can't be read. `true` if there was a file.
     pub fn reset(&self) -> Result<bool> {
-        self.locked(|| remove_private(&self.path()))
+        self.locked(|| {
+            self.advance_generation()?;
+            remove_private(&self.path())
+        })
     }
 
     /// Delete `p`'s key; `true` if there was one. The provider goes back to
@@ -180,7 +217,9 @@ impl KeyStore {
         self.locked(|| {
             let mut keys = self.load()?.0;
             let had = keys.remove(p.as_str()).is_some();
-            self.store(&keys)?;
+            if had {
+                self.store(&keys)?;
+            }
             Ok(had)
         })
     }

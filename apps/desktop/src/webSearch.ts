@@ -25,6 +25,7 @@ type Message = { tone: "danger" | "success" | "warning"; text: string };
 function localProblem(error: unknown, fallback: string): string {
   if (error instanceof BridgeError) {
     if (error.code === "not_sent") return "The test was refused or interrupted by this computer. Check the web search and key settings before trying again.";
+    if (error.code === "test_not_applied") return "The provider test result was not saved. Refresh web search before trying again.";
     if (error.code === "no_session" || error.code === "session_rejected") return "Metro's helper isn't signed in to this account. Sign in again.";
     if (error.code === "other_instance") return "Use the first Metro window to change web search.";
     if (error.code === "unsupported") return "This Metro server doesn't support web search yet.";

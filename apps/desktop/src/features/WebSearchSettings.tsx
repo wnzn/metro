@@ -224,7 +224,7 @@ function ProviderRow(props: {
             items={[
               { id: `websearch-edit:${id}`, label: p().keySaved ? "Replace key…" : "Add key…",
                 disabled: props.blocked || props.state.keysError, onPress: () => props.setEdit(true) },
-              { id: `websearch-test:${id}`, label: "Test provider",
+              { id: `websearch-test:${id}`, label: p().enabled ? "Test provider" : "Enable provider to test",
                 disabled: !m.canTest() || props.blocked || !props.state.enabled || !p().enabled || props.state.keysError || (!p().keyless && !p().keySaved),
                 onPress: () => void m.test(id) },
               { id: `websearch-clear:${id}`, label: "Try again now",

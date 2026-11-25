@@ -327,8 +327,8 @@ pub struct Updates {
     pub cooldowns: Vec<(ProviderId, Mode, u64, Outcome)>,
     pub rejected: Vec<(ProviderId, String)>,
     pub last: Vec<(ProviderId, Outcome, u64)>,
-    /// Providers whose cooldowns end now (a successful test).
-    pub cleared: Vec<ProviderId>,
+    /// Provider modes whose cooldowns end now (a successful test).
+    pub cleared: Vec<(ProviderId, Mode)>,
 }
 
 impl Updates {
@@ -338,14 +338,8 @@ impl Updates {
             && self.last.is_empty()
             && self.cleared.is_empty()
     }
-}
-
-pub fn apply(dir: &Path, u: &Updates) -> Result<()> {
-    if u.is_empty() {
-        return Ok(());
-    }
-    update_state(dir, false, |s| {
-        for &(p, mode, until, outcome) in &u.cooldowns {
+    fn apply_to(&self, s: &mut Settings) {
+        for &(p, mode, until, outcome) in &self.cooldowns {
             s.cooldowns.insert(
                 cooldown_key(p, mode),
                 Cooldown {
@@ -354,10 +348,10 @@ pub fn apply(dir: &Path, u: &Updates) -> Result<()> {
                 },
             );
         }
-        for (p, fp) in &u.rejected {
+        for (p, fp) in &self.rejected {
             s.rejected_keys.insert(p.as_str().into(), fp.clone());
         }
-        for &(p, outcome, at) in &u.last {
+        for &(p, outcome, at) in &self.last {
             s.last.insert(
                 p.as_str().into(),
                 Last {
@@ -366,8 +360,36 @@ pub fn apply(dir: &Path, u: &Updates) -> Result<()> {
                 },
             );
         }
-        for p in &u.cleared {
-            clear_cooldowns(s, *p);
+        for &(p, mode) in &self.cleared {
+            s.cooldowns.remove(&cooldown_key(p, mode));
+        }
+    }
+}
+
+pub fn apply(dir: &Path, u: &Updates) -> Result<()> {
+    if u.is_empty() {
+        return Ok(());
+    }
+    update_state(dir, false, |s| {
+        u.apply_to(s);
+        Ok(())
+    })
+}
+
+/// Publish a test only if its final checks pass while we hold the same
+/// lock as preference changes and cooldown writes. The caller holds the
+/// key-store lock first and keeps it until this transaction ends.
+pub(super) fn apply_test(
+    dir: &Path,
+    u: &Updates,
+    verify: impl FnOnce(&Settings) -> Result<()>,
+) -> Result<()> {
+    locked(dir, || {
+        let mut s = load(dir)?;
+        verify(&s)?;
+        if !u.is_empty() {
+            u.apply_to(&mut s);
+            write_state(dir, &s)?;
         }
         Ok(())
     })

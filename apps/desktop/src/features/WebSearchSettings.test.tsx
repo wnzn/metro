@@ -42,7 +42,7 @@ function fixture() {
   let workerGeneration: number | null = null;
   const chatWrites: { host: string; enabled: boolean }[] = [];
   const prefs = new Map<string, boolean>();
-  const replies = { unsupported: false, oldServer: false, testRefused: false, rejectKey: false, refusePrefs: false,
+  const replies = { unsupported: false, oldServer: false, testRefused: false, staleTest: false, rejectKey: false, refusePrefs: false,
     refuseOrder: false, writeDelay: 0, testDelay: 0, bindDelay: 0, unbindDelay: 0, failBind: false, failUnbind: false, noGeneration: false };
   const ok = (body: unknown, delay = 0) => ({ status: 200, body, delay });
   const err = (status: number, code: string) => ({ status, body: { error: { code, message: REFLECTED } } });
@@ -98,6 +98,7 @@ function fixture() {
     if (action === "test") {
       record.generation = JSON.parse(req.body!).session_generation;
       if (record.generation !== generation) return err(409, "no_session");
+      if (replies.staleTest) return err(409, "test_not_applied");
       return replies.testRefused ? err(409, "not_sent") : ok({ ...row, test: { outcome: "ok" } }, replies.testDelay);
     }
     if (action === "clear-cooldown") {
@@ -337,11 +338,31 @@ test("explicit provider tests and cooldown clear use separate routes and never s
   await app.waitFor("text:/The test was refused/");
   expect(text(app)).not.toContain(REFLECTED);
   w.replies.testRefused = false;
+  w.replies.staleTest = true;
+  await item(app, "test");
+  await app.waitFor("text:/The provider test result was not saved/");
+  expect(text(app)).not.toContain(REFLECTED);
+  expect(app.shows("text:Exa test: worked.")).toBe(false);
+  w.replies.staleTest = false;
   await item(app, "test");
   await app.waitFor("text:Exa test: worked.");
   await item(app, "clear");
   await app.waitFor("text:/Exa is no longer paused/");
-  expect(w.calls.filter((r) => r.method === "POST").map((r) => r.path)).toEqual([`${PATH}/providers/exa/test`, `${PATH}/providers/exa/test`, `${PATH}/providers/exa/clear-cooldown`]);
+  expect(w.calls.filter((r) => r.method === "POST").map((r) => r.path)).toEqual([
+    `${PATH}/providers/exa/test`, `${PATH}/providers/exa/test`, `${PATH}/providers/exa/test`, `${PATH}/providers/exa/clear-cooldown`,
+  ]);
+});
+
+test("an off provider cannot be tested from Settings", async () => {
+  const w = fixture();
+  const app = await start(w);
+  await app.waitFor("id:websearch-enabled:exa");
+  await app.press("id:websearch-enabled:exa");
+  await app.waitFor("text:Exa is off.");
+  await app.press("id:websearch-menu:exa");
+  await app.waitFor("text:Enable provider to test");
+  expect(app.enabled("id:websearch-test:exa")).toBe(false);
+  expect(w.calls.some((r) => r.path.endsWith("/test"))).toBe(false);
 });
 
 test("missing and old helper, unsupported server and out-of-service worker never look ready", async () => {

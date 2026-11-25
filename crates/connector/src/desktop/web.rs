@@ -659,7 +659,14 @@ impl WebSearch {
         let _g = self.bound_ops(server, account, epoch).await?;
         let outcome = result
             .map_err(|why| err(409, "not_sent", why))?
-            .record(&p.dir);
+            .record(&p.dir)
+            .map_err(|_| {
+                err(
+                    409,
+                    "test_not_applied",
+                    "The provider test result is no longer current or couldn't be saved",
+                )
+            })?;
         let mut row = self.row(p, pid)?;
         row["test"] = json!({"outcome": outcome.as_str()});
         Ok(row)
