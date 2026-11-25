@@ -3,7 +3,7 @@
 // in theme/theme.json. To swap the design system, replace this module while
 // keeping its exports' props.
 
-import { effect, keymap, List, Scroll, signal, Text, untracked, View } from "nsh";
+import { cleanup, effect, keymap, List, Scroll, signal, Text, untracked, View } from "nsh";
 import type { InputRef, JSX, ListRef, ViewRef } from "nsh";
 import { Button, Checkbox as BaseCheckbox, Collapsible, ContextMenu, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
 import type { ButtonProps } from "nsh/base";
@@ -56,10 +56,11 @@ type StackProps = Children &
 const alignClass = { start: "items-start", center: "items-center", end: "items-end", stretch: "items-stretch" };
 const justifyClass = { start: "justify-start", center: "justify-center", end: "justify-end", between: "justify-between" };
 
-function stackClass(props: StackProps, direction: "row" | "col") {
+// Pass layout overrides separately: spreading NSH props evaluates their lazy children.
+function stackClass(props: StackProps, direction: "row" | "col", grow = props.grow) {
   return cx(
     direction === "row" ? "flex-row" : "flex-col",
-    props.grow && "flex-1 min-w-0 min-h-0",
+    grow && "flex-1 min-w-0 min-h-0",
     props.wrap && "flex-wrap",
     props.align && alignClass[props.align],
     props.justify && justifyClass[props.justify],
@@ -70,9 +71,9 @@ function stackClass(props: StackProps, direction: "row" | "col") {
   );
 }
 
-export function Row(props: StackProps) {
+export function Row(props: StackProps & { stacked?: boolean }) {
   return (
-    <View class={stackClass(props, "row")} selectable={props.selectable} testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
+    <View class={stackClass(props, props.stacked ? "col" : "row")} selectable={props.selectable} testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
       {props.children}
     </View>
   );
@@ -142,7 +143,7 @@ export function Surface(props: StackProps & {
 }) {
   return (
     <View
-      class={cx(surfaceClass[props.variant], stackClass({ ...props, grow: false }, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col"), props.grow && "flex-1 min-h-0", props.hidden && "hidden", props.width !== undefined && "shrink-0")}
+      class={cx(surfaceClass[props.variant], stackClass(props, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col", false), props.grow && "flex-1 min-h-0", props.hidden && "hidden", props.width !== undefined && "shrink-0")}
       style={props.width !== undefined ? { width: props.width } : undefined}
       accessibilityElementsHidden={props.hidden}
       testID={props.testID}
@@ -842,6 +843,16 @@ type ConfirmTrigger =
   | { triggerLabel: string; open?: boolean; onOpenChange?: (open: boolean) => void; returnFocus?: () => ViewRef | null | undefined }
   | { triggerLabel?: never; open: boolean; onOpenChange: (open: boolean) => void; returnFocus: () => ViewRef | null | undefined };
 
+/** An inline result that can receive keyboard focus after its action goes away. */
+export function StatusSummary(props: Testable & { focusable: boolean; viewRef: (node: ViewRef) => void; children?: JSX.Element }) {
+  return (
+    <View ref={props.viewRef} role={props.focusable ? "summary" : undefined} focusable={props.focusable}
+      class={focusRing} accessibilityLabel={props.accessibilityLabel} testID={props.testID}>
+      {props.children}
+    </View>
+  );
+}
+
 /**
  * A confirmation scoped to one row. `testID` names the trigger; the panel,
  * warning, input, Cancel, final action and busy status use `:panel`, `:warning`,
@@ -867,6 +878,10 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
   disabled?: boolean;
   busy?: boolean;
   busyLabel?: string;
+  /** Idle close in the same scope: use this when the opener has become unavailable. */
+  returnFocusOnClose?: () => ViewRef | null | undefined;
+  /** Controlled close after confirming: fall back to the opener if this returns no result control. */
+  returnFocusAfterBusy?: () => ViewRef | null | undefined;
 }) {
   const localOpen = signal(false);
   const session = signal<{ key?: string; opener?: ViewRef | null } | null>(null);
@@ -880,12 +895,31 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
   let trigger: ViewRef | undefined;
   let cancelControl: ViewRef | undefined;
   let busyFocus: ReturnType<typeof session> = null;
+  let submitted: ReturnType<typeof session> = null;
+  let focusedWhileBusy: ReturnType<typeof session> = null;
+  let mounted = true;
+  cleanup(() => { mounted = false; });
   let wasRequested = false;
   const changeOpen = (next: boolean) => {
     if (props.open === undefined) localOpen.set(next);
     props.onOpenChange?.(next);
   };
-  const restore = (active: { opener?: ViewRef | null }) => (active.opener ?? trigger)?.focus();
+  const restore = (active: NonNullable<ReturnType<typeof session>>) => {
+    const opener = active.opener ?? trigger;
+    const afterSubmit = submitted === active;
+    const choose = afterSubmit ? props.returnFocusAfterBusy : props.returnFocusOnClose;
+    if (!choose) {
+      opener?.focus();
+      return;
+    }
+    // Don't pull focus back from a different control the person moved to.
+    if (props.busy || (focusedWhileBusy === active && busyFocus !== active)) return;
+    const next = choose() ?? opener;
+    if (!next) return;
+    void next.measure().then((layout) => {
+      if (layout && mounted && session() === null && props.scopeKey === active.key) next.focus();
+    });
+  };
   // A true prop is a request to open only on its rising edge. Retargeting
   // invalidates the session even if the parent keeps requesting it, or the
   // original target comes back before the parent clears its request.
@@ -902,7 +936,7 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
       if (props.open === undefined) localOpen.set(false);
     } else if (active && !requested) {
       session.set(null);
-      restore(active);
+      untracked(() => restore(active));
     }
   });
   effect(() => {
@@ -924,6 +958,7 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
     if (!open() || !ready()) return;
     typed.set("");
     if (props.open === undefined) close();
+    else submitted = session();
     props.onConfirm();
   };
   const variant = () => props.variant ?? "destructive";
@@ -1008,7 +1043,7 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
                 ref={(node) => focusInPanel(node, true)}
                 role="summary" focusable captureKeys={["enter", "space"]}
                 accessibilityLabel={busyLabel()} accessibilityState={{ busy: true }} testID={id("busy")}
-                onFocus={() => { busyFocus = session(); busyEscape.onFocus(); }}
+                 onFocus={() => { focusedWhileBusy = busyFocus = session(); busyEscape.onFocus(); }}
                 onBlur={() => { if (props.busy) busyFocus = null; busyEscape.onBlur(); }}>
                 <Text class={cx(textClass.sm, "font-medium text-muted-foreground")} accessibilityElementsHidden>{busyLabel()}</Text>
               </View>
@@ -1182,7 +1217,7 @@ export function PageLayout(props: StackProps & { footer?: JSX.Element; wide?: bo
   return (
     <View class="flex-1 min-h-0 flex-col">
       <Scroll class="flex-1 min-h-0" testID={props.testID}>
-        <View class={cx(stackClass({ ...props, grow: false }, "col"), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>
+        <View class={cx(stackClass(props, "col", false), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>
       </Scroll>
       <If when={props.footer}>
         <View class="border-t border-border bg-background px-(--space-8) max-md:px-(--space-4) py-(--space-3)" testID={props.testID ? `${props.testID}:footer` : undefined}>
@@ -1482,15 +1517,29 @@ export function PageHeader(props: Testable & { title: string; subtitle?: string;
 
 /**
  * A titled group of SettingRows on one card. The rows draw the lines between
- * them; the card clips the first one's.
+ * them; the card clips the first one's. `focusTitle` is for navigation to a group.
  */
-export function SettingsGroup(props: Testable & { title?: string; description?: string; children?: JSX.Element }) {
+export function SettingsGroup(props: Testable & { title?: string; description?: string; focusTitle?: boolean; children?: JSX.Element }) {
+  const titleRef = signal<ViewRef | undefined>(undefined);
+  effect(() => {
+    if (!props.focusTitle) return;
+    const node = titleRef();
+    if (!node) return;
+    let live = true;
+    void node.measure().then((layout) => {
+      if (!live || !layout || layout.bounds.size.height <= 0) return;
+      node.reveal({ vertical: "start", animated: false });
+      node.focus();
+    });
+    return () => { live = false; };
+  });
   return (
     <View class="flex-col gap-(--space-2)" testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
       <If when={props.title || props.description}>
         <View class="flex-col gap-px px-(--space-1)">
           <If when={props.title}>
-            <Text class={cx(textClass.sm, "font-semibold text-foreground")} role="header">
+            <Text class={cx(textClass.sm, "font-semibold text-foreground")} role="header"
+              ref={props.focusTitle ? titleRef.set : undefined} focusable={props.focusTitle}>
               {props.title}
             </Text>
           </If>

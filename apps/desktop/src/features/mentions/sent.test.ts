@@ -20,12 +20,13 @@ test("legacy rendering binds only exact stored identities, not nearby text or at
   const e: RoomEvent = {
     id: 1, kind: "message", actor: "Sender",
     text: '@Bob, @bobby, @coder. ` @bob ` and <"a"@bob> then @agent and @carol.',
-    mentions: [{ kind: "user", id: "bob" }, { kind: "agent", agentId: "ag-1" }, { kind: "agent", addressedBy: "classifier" }],
+    mentions: [{ kind: "user", id: "bob" }, { kind: "agent", agentId: "ag-1", legacyHandle: "coder" }, { kind: "agent", addressedBy: "classifier" }],
   };
-  const pieces = sentMentions(e, id => id === "ag-1" ? "coder" : undefined);
+  const pieces = sentMentions(e);
   expect(pieces.map(p => p.literal)).toEqual(["@Bob", "@coder"]);
   expect(copyMentionText(e.text, pieces, p => p.index === 0 ? "@Bob Tan" : "@Refactor Coach"))
     .toBe('@Bob Tan, @bobby, @Refactor Coach. ` @bob ` and <"a"@bob> then @agent and @carol.');
-  expect(sentMentions({ ...e, spans: [] }, () => "coder")).toEqual([]);
-  expect(sentMentions({ ...e, mentions: [] }, () => "coder")).toEqual([]);
+  expect(sentMentions({ ...e, spans: [] })).toEqual([]);
+  expect(sentMentions({ ...e, mentions: [{ kind: "agent", agentId: "ag-1" }] })).toEqual([]);
+  expect(sentMentions({ ...e, mentions: [] })).toEqual([]);
 });

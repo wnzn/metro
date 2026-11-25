@@ -101,6 +101,50 @@ test("Follow up opens the folded form, aimed at the run's room", async () => {
   await app.waitFor("text:To: agent in Acme › #lobby");
 });
 
+test("Dispatch sends exact Unicode and whitespace to the explicit thread, never replays 422 or uncertain sends", async () => {
+  const f = world();
+  f.addRoom("acme", { id: "t1", name: "Thread", parent_room_id: "lobby" });
+  f.state.runs.push({ id: "held", space_id: "acme", room_id: "t1", status: "completed", actor: "alice", task: "Earlier task" });
+  const key = `POST ${BASE}/v1/*`;
+  const post = f.network[key]!;
+  const path = "/v1/spaces/acme/rooms/t1/messages";
+  let status = 422;
+  f.network[key] = req => new URL(req.url).pathname === path && status
+    ? { status, body: { error: "not supported" } } : post(req);
+  const app = await inChat(f);
+  await app.waitFor("id:run-follow:held");
+  await app.press("id:run-follow:held");
+  await app.waitFor("text:To: agent in Acme › #Thread");
+  const text = "\u2003  🌿 @bob, résumé\ncheck the task  \t";
+  await app.paste("id:dispatch-text", { text });
+  const posts = () => app.requests().filter(r => r.method === "POST" && r.url.endsWith("/messages"));
+  const body = { text, invoke_agent: true, infer_text_mentions: false };
+  for (const [i, code] of [422, 503, 0].entries()) {
+    status = code;
+    await app.press("id:dispatch-send");
+    if (code) {
+      await app.waitFor(code === 422 ? "text:/Update Metro Server/" : "text:/Check the conversation before sending again/");
+      expect(app.value("id:dispatch-text")).toBe(text);
+    } else await app.waitFor("id:dispatch-notice");
+    expect(posts()).toHaveLength(i + 1);
+    expect(new URL(posts()[i].url).pathname).toBe(path);
+    expect(JSON.parse(posts()[i].body!)).toEqual(body);
+  }
+});
+
+test("Follow up with a missing explicit thread stays unselected and never falls back to the lobby", async () => {
+  const f = world();
+  f.state.runs.push({ id: "missing", space_id: "acme", room_id: "missing", status: "completed", actor: "alice", task: "Earlier task" });
+  const app = await inChat(f);
+  await app.waitFor("id:run-follow:missing");
+  await app.press("id:run-follow:missing");
+  await app.waitFor("id:dispatch-error");
+  await app.type("id:dispatch-text", "keep this draft");
+  expect(app.shows("text:Choose a Space and a room.")).toBe(true);
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+  expect(f.posts().some(p => p.path.endsWith("/messages"))).toBe(false);
+});
+
 for (const width of [780, 860, 960]) {
   test(`at ${width} wide the runs open in a dialog over a full-width Chat; a task sent there leaves the Chat intact`, async () => {
     const f = world();

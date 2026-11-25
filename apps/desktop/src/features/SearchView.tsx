@@ -132,7 +132,7 @@ function Messages() {
               <Label color="danger">{e().message}</Label>
             </Column>
             <If when={e().needsEmbeddings}>
-              <Action testID="search-open-providers" label="Open Model providers" onPress={() => openSettings("providers")} />
+              <Action testID="search-open-providers" label="Open Model choices" onPress={() => openSettings("models")} />
             </If>
           </Banner>
         )}

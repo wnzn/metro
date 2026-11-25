@@ -520,7 +520,9 @@ pub fn runner_fields(state: &AppState, key: &str) -> (serde_json::Value, serde_j
         .as_ref()
         .and_then(|p| p.version.as_deref())
         .and_then(Version::parse);
-    let available = authorized && matches!((&latest, running), (Some(l), Some(r)) if l.version > r);
+    let available = authorized
+        && p.as_ref().is_some_and(|p| p.channel == Some("release"))
+        && matches!((&latest, running), (Some(l), Some(r)) if l.version > r);
     let action = match p.as_ref() {
         _ if !available => "none",
         Some(p) if p.self_update => "self_update",
@@ -605,7 +607,13 @@ fn refuse(code: &str, message: &str) -> Response {
 }
 
 /// Checks shared by both kinds; on success, records the pending request.
-async fn request_update(state: &AppState, key: &str, version: &str, scope: Scope) -> Response {
+async fn request_update(
+    state: &AppState,
+    key: &str,
+    version: &str,
+    scope: Scope,
+    requested_by: &str,
+) -> Response {
     let now = now_ms();
     let Some(target) = Version::parse(version) else {
         return ApiError::bad_request("version must be X.Y.Z").into_response();
@@ -672,7 +680,7 @@ async fn request_update(state: &AppState, key: &str, version: &str, scope: Scope
     match result {
         Err((code, message)) => refuse(code, message),
         Ok((pending, running)) => {
-            tracing::info!(runner = %key, from = ?running.map(|r| r.to_string()), to = %pending.target, "runner update requested");
+            tracing::info!(runner = %key, %requested_by, from = ?running.map(|r| r.to_string()), to = %pending.target, "runner update requested");
             state.monitor(scope, Code::RunnerUpdateRequested).await;
             api::no_store(StatusCode::ACCEPTED, json!({"pending": pending}))
         }
@@ -690,7 +698,7 @@ pub async fn request_registered_update(
     let runner = crate::runners::managed_runner(&state, &id, &who).await?;
     let Json(body) = body?;
     let key = format!("runner:{}", runner.id);
-    Ok(request_update(&state, &key, &body.version, scope_of(&runner)).await)
+    Ok(request_update(&state, &key, &body.version, scope_of(&runner), &who.id).await)
 }
 
 /// `POST /v1/spaces/{sid}/runner/update`: a dedicated runner; the Space
@@ -715,7 +723,7 @@ pub async fn request_dedicated_update(
         SpaceRunner::None => return Err(ApiError::not_found("this Space has no runner")),
     }
     let key = format!("space:{}", space.id);
-    Ok(request_update(&state, &key, &body.version, Scope::Space(space.id.clone())).await)
+    Ok(request_update(&state, &key, &body.version, Scope::Space(space.id), &who.id).await)
 }
 
 /// Claim handler helper: the claim body, bounded.

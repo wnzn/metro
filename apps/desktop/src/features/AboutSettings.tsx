@@ -127,8 +127,8 @@ function ServerNotice(props: { data: ServerUpdate }) {
   </SettingsGroup>;
 }
 
-function Privacy() {
-  return <SettingsGroup title="Privacy" testID="about-privacy">
+function Privacy(props: { focusTitle?: boolean }) {
+  return <SettingsGroup title="Privacy" testID="about-privacy" focusTitle={props.focusTitle}>
     <SettingRow label="Update checks"
       description="Metro contacts github.com and its release asset hosts (release-assets.githubusercontent.com or objects.githubusercontent.com). A newer release can also make a request to api.github.com for notes. If verification data is out of date, Metro can refresh it at tuf-repo-cdn.sigstore.dev. These requests don't send your account, device ID or usage data. If you're offline, the check can't confirm the latest release." />
     <SettingRow label="Web search"
@@ -385,7 +385,7 @@ function UpdatePanel(props: { updates: DesktopUpdates }) {
 }
 
 /** Settings page `about`; navigation and entry-point indicators belong to the Settings shell. */
-export function AboutSettings(props: { updates?: DesktopUpdates } = {}) {
+export function AboutSettings(props: { updates?: DesktopUpdates; focusPrivacy?: boolean } = {}) {
   const updates = props.updates ?? desktopUpdates;
   cleanup(updates.watch());
   const server = serverInfo();
@@ -416,6 +416,6 @@ export function AboutSettings(props: { updates?: DesktopUpdates } = {}) {
     </SettingsGroup>
     <UpdatePanel updates={updates} />
     <If when={server()}>{data => <ServerNotice data={data()} />}</If>
-    <Privacy />
+    <Privacy focusTitle={props.focusPrivacy} />
   </PageLayout>;
 }

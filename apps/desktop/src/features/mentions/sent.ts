@@ -40,7 +40,7 @@ export type MentionPiece = {
 };
 
 /** Position is authoritative if supplied. Text fallback only sees stored recipients, never the directory. */
-export function sentMentions(event: RoomEvent, handleOf: (agentId: string) => string | undefined): MentionPiece[] {
+export function sentMentions(event: RoomEvent): MentionPiece[] {
   const { mentions, spans, text } = event;
   if (event.kind !== "message" || !mentions?.length) return [];
   if (spans !== undefined) {
@@ -54,14 +54,15 @@ export function sentMentions(event: RoomEvent, handleOf: (agentId: string) => st
   }
   const aliases = mentions.flatMap((mention, index) => {
     const label = mention.kind === "user" ? mention.id
-      : mention.addressedBy ? undefined : mention.agentId ? handleOf(mention.agentId) : "agent";
+      : mention.addressedBy ? undefined : mention.agentId ? mention.legacyHandle : "agent";
     // An old named agent with the reserved handle must not claim generic text.
     return label && saneTypedLabel(label) && !/\p{White_Space}/u.test(label)
       && (label.toLowerCase() !== "agent" || (mention.kind === "agent" && !mention.agentId))
       ? [{ label: label.toLowerCase(), index, mention }] : [];
   });
   if (!aliases.length) return [];
-  const { ignored } = mentionSyntaxRanges(text, []);
+  const syntax = mentionSyntaxRanges(text, []);
+  const ignored = [...syntax.ignored, ...syntax.uncertain];
   const out: MentionPiece[] = [];
   for (let start = text.indexOf("@"); start >= 0 && out.length < MAX_MENTION_SPANS; start = text.indexOf("@", start + 1)) {
     if (out.length && start < out[out.length - 1].end) continue;
@@ -81,6 +82,20 @@ export function sentMentions(event: RoomEvent, handleOf: (agentId: string) => st
     }
   }
   return out;
+}
+
+/** A slim follow-up can omit its To line only if the leading bindings cover every stored recipient. */
+export function leadingMentionsCoverRecipients(event: RoomEvent, pieces: readonly MentionPiece[]): boolean {
+  if (!event.mentions?.length || !pieces.length) return false;
+  const seen = new Set<number>();
+  let end = 0;
+  for (const piece of pieces) {
+    const gap = event.text.slice(end, piece.start);
+    if (!(end === 0 ? /^\p{White_Space}*$/u : /^[\p{White_Space},:;.!?]*$/u).test(gap)) break;
+    seen.add(piece.index);
+    end = piece.end;
+  }
+  return event.mentions.every((_mention, index) => seen.has(index));
 }
 
 export function copyMentionText(text: string, pieces: readonly MentionPiece[], label: (piece: MentionPiece) => string): string {

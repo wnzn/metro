@@ -27,19 +27,47 @@ struct Fake {
     job: Option<Value>,
     results: Vec<Value>,
     claims: u32,
+    claim_requests: u32,
     /// Every request body Metro received.
     bodies: Vec<String>,
+    tests: u32,
+    hold_test: Option<Arc<tokio::sync::Notify>>,
+    hold_me: Option<Arc<Hold>>,
+    hold_create: Option<Arc<Hold>>,
 }
 
 type Shared = Arc<Mutex<Fake>>;
+
+#[derive(Default)]
+struct Hold {
+    arrived: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+}
+
+impl Hold {
+    async fn pause(&self) {
+        self.arrived.notify_one();
+        self.release.notified().await;
+    }
+
+    async fn arrived(&self) {
+        tokio::time::timeout(Duration::from_secs(2), self.arrived.notified())
+            .await
+            .expect("request did not reach the loopback fixture");
+    }
+}
 
 fn alice(h: &HeaderMap) -> bool {
     h.get("authorization").and_then(|v| v.to_str().ok()) == Some("Bearer tok-alice")
 }
 
-async fn me(h: HeaderMap) -> Response {
+async fn me(State(s): State<Shared>, h: HeaderMap) -> Response {
     if !alice(&h) {
         return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let hold = s.lock().unwrap().hold_me.take();
+    if let Some(hold) = hold {
+        hold.pause().await;
     }
     axum::Json(json!({"id": "alice", "actor": "alice"})).into_response()
 }
@@ -52,18 +80,24 @@ async fn create(State(s): State<Shared>, h: HeaderMap, body: String) -> Response
     if !alice(&h) {
         return StatusCode::UNAUTHORIZED.into_response();
     }
-    let mut f = s.lock().unwrap();
-    f.bodies.push(body.clone());
-    let label = serde_json::from_str::<Value>(&body).unwrap()["label"]
-        .as_str()
-        .unwrap()
-        .to_owned();
-    let n = f.created.len();
-    let id = format!("wd_{:032x}", n + 1);
-    let token = format!("metro_pc_{:064x}", n + 1);
-    f.created.push((id.clone(), label));
-    f.token = Some(token.clone());
-    f.device = Some(id.clone());
+    let (id, token, hold) = {
+        let mut f = s.lock().unwrap();
+        f.bodies.push(body.clone());
+        let label = serde_json::from_str::<Value>(&body).unwrap()["label"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let n = f.created.len();
+        let id = format!("wd_{:032x}", n + 1);
+        let token = format!("metro_pc_{:064x}", n + 1);
+        f.created.push((id.clone(), label));
+        f.token = Some(token.clone());
+        f.device = Some(id.clone());
+        (id, token, f.hold_create.take())
+    };
+    if let Some(hold) = hold {
+        hold.pause().await;
+    }
     (
         StatusCode::CREATED,
         axum::Json(json!({"id": id, "label": "x", "token": token})),
@@ -83,6 +117,7 @@ async fn remove(State(s): State<Shared>, Path(id): Path<String>, h: HeaderMap) -
 
 async fn claim(State(s): State<Shared>, h: HeaderMap, body: String) -> Response {
     let mut f = s.lock().unwrap();
+    f.claim_requests += 1;
     f.bodies.push(body);
     let auth = h.get("authorization").and_then(|v| v.to_str().ok());
     if f.token.as_ref().map(|t| format!("Bearer {t}")).as_deref() != auth {
@@ -103,10 +138,21 @@ async fn result(State(s): State<Shared>, Path(_id): Path<String>, body: String) 
 }
 
 async fn tavily(State(s): State<Shared>, h: HeaderMap, body: String) -> Response {
-    let mut f = s.lock().unwrap();
-    let keyed = h.get("authorization").is_some();
-    f.bodies.push(format!("tavily keyed={keyed}"));
-    let _ = body;
+    let test = serde_json::from_str::<Value>(&body).unwrap()["query"] == "Metro web search test";
+    let hold = {
+        let mut f = s.lock().unwrap();
+        f.bodies
+            .push(format!("tavily keyed={}", h.get("authorization").is_some()));
+        if test {
+            f.tests += 1;
+            f.hold_test.clone()
+        } else {
+            None
+        }
+    };
+    if let Some(hold) = hold {
+        hold.notified().await;
+    }
     axum::Json(json!({"results": [{"title": "T", "url": "https://t.example/", "content": "c"}]}))
         .into_response()
 }
@@ -152,6 +198,39 @@ impl Ui {
         assert!(!text.contains(CANARY), "key leaked: {text}");
         (status, serde_json::from_str(&text).unwrap_or(Value::Null))
     }
+
+    async fn reserve(&self) -> String {
+        let (status, response) = self
+            .call("POST", "/v1/session/intent", Some(json!({})))
+            .await;
+        assert_eq!(status, 200);
+        response["intent"].as_str().unwrap().to_owned()
+    }
+
+    async fn bind(&self, base: &str, intent: &str) -> (u16, Value) {
+        self.call(
+            "POST",
+            "/v1/session",
+            Some(json!({
+                "server_url": base, "session_token": "tok-alice", "intent": intent,
+            })),
+        )
+        .await
+    }
+
+    async fn cancel(&self, intent: &str) {
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            self.call(
+                "DELETE",
+                "/v1/session/intent",
+                Some(json!({"intent": intent})),
+            ),
+        )
+        .await
+        .expect("cancellation must not wait for the bind's lifecycle lock");
+        assert_eq!(reply.0, 204);
+    }
 }
 
 async fn wait_for(what: &str, mut f: impl FnMut() -> bool) {
@@ -173,6 +252,123 @@ fn endpoints(base: &str) -> Endpoints {
     }
 }
 
+async fn intent_fixture() -> (String, Shared, Arc<Ui>, tempfile::TempDir) {
+    let (base, s) = fake().await;
+    let t = tempfile::tempdir().unwrap();
+    let mut cfg = DesktopConfig::new(t.path().join("desktop"), true, None);
+    cfg.poll_interval = Duration::from_millis(30);
+    cfg.web_endpoints = Some(endpoints(&base));
+    let ui = Arc::new(Ui {
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
+        bridge: bridge::start(Desktop::new(cfg)).await.unwrap(),
+    });
+    (base, s, ui, t)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_pending_identity_cannot_register_or_claim_and_old_cancel_cannot_close_replacement()
+{
+    let (base, s, ui, _t) = intent_fixture().await;
+    let me = Arc::new(Hold::default());
+    s.lock().unwrap().hold_me = Some(me.clone());
+    let intent = ui.reserve().await;
+    let pending = {
+        let (ui, base, intent) = (ui.clone(), base.clone(), intent.clone());
+        tokio::spawn(async move { ui.bind(&base, &intent).await })
+    };
+    me.arrived().await;
+
+    // The new route goes through exactly the same bridge guard.
+    for (header, value, status) in [
+        ("origin", "http://127.0.0.1", 403),
+        ("host", "wrong.invalid", 403),
+        ("authorization", "Bearer wrong", 401),
+    ] {
+        let mut request = ui
+            .http
+            .delete(format!("{}/v1/session/intent", ui.bridge.url));
+        if header != "authorization" {
+            request = request.bearer_auth(ui.bridge.token.expose());
+        }
+        let response = request
+            .header(header, value)
+            .header("content-type", "application/json")
+            .body(json!({"intent": intent}).to_string())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), status, "{header}");
+    }
+    assert!(!pending.is_finished());
+
+    ui.cancel(&intent).await;
+    let (status, response) = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .expect("bind waited for /v1/me after cancellation")
+        .unwrap();
+    assert_eq!(status, 409);
+    assert_eq!(response["error"]["code"], "bind_cancelled");
+    assert_eq!(ui.call("DELETE", "/v1/session", None).await.0, 200);
+    me.release.notify_one();
+    {
+        let f = s.lock().unwrap();
+        assert!(f.created.is_empty());
+        assert_eq!(f.claim_requests, 0);
+    }
+    assert_eq!(ui.bind(&base, &intent).await.0, 409, "intent is single-use");
+
+    let replacement = ui.reserve().await;
+    let me = Arc::new(Hold::default());
+    s.lock().unwrap().hold_me = Some(me.clone());
+    let new = {
+        let (ui, base, replacement) = (ui.clone(), base.clone(), replacement.clone());
+        tokio::spawn(async move { ui.bind(&base, &replacement).await })
+    };
+    me.arrived().await;
+    ui.cancel(&intent).await;
+    me.release.notify_one();
+    assert_eq!(new.await.unwrap().0, 200);
+    wait_for("replacement polling", || s.lock().unwrap().claims > 0).await;
+    let claims = s.lock().unwrap().claims;
+    ui.cancel(&intent).await;
+    wait_for("replacement still polling", || {
+        s.lock().unwrap().claims > claims
+    })
+    .await;
+    assert_eq!(s.lock().unwrap().created.len(), 1);
+    assert_eq!(ui.call("DELETE", "/v1/session", None).await.0, 200);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closing_after_registration_dispatch_revokes_that_device_without_claiming() {
+    let (base, s, ui, _t) = intent_fixture().await;
+    let create = Arc::new(Hold::default());
+    s.lock().unwrap().hold_create = Some(create.clone());
+    let intent = ui.reserve().await;
+    let pending = {
+        let (ui, base, intent) = (ui.clone(), base.clone(), intent.clone());
+        tokio::spawn(async move { ui.bind(&base, &intent).await })
+    };
+    create.arrived().await;
+    let created = s.lock().unwrap().created[0].0.clone();
+    ui.cancel(&intent).await;
+    assert!(
+        !pending.is_finished(),
+        "need the registration id to clean up"
+    );
+    create.release.notify_one();
+    let (status, body) = tokio::time::timeout(Duration::from_secs(2), pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(status, 409);
+    assert_eq!(body["error"]["code"], "bind_cancelled");
+    assert_eq!(ui.call("DELETE", "/v1/session", None).await.0, 200);
+    let f = s.lock().unwrap();
+    assert_eq!(f.deleted, [created]);
+    assert_eq!(f.claim_requests, 0);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn web_search_is_on_by_default_serves_jobs_and_keeps_keys_local() {
     let (base, s) = fake().await;
@@ -188,7 +384,7 @@ async fn web_search_is_on_by_default_serves_jobs_and_keeps_keys_local() {
     // Before sign-in: no session.
     assert_eq!(ui.call("GET", "/v1/web-search", None).await.0, 409);
 
-    let (status, _) = ui
+    let (status, bound) = ui
         .call(
             "POST",
             "/v1/session",
@@ -221,6 +417,7 @@ async fn web_search_is_on_by_default_serves_jobs_and_keeps_keys_local() {
         vec!["tavily", "exa", "parallel", "firecrawl", "tinyfish"]
     );
     let tinyfish = &state["providers"][4];
+    assert_eq!(tinyfish["enabled"], true);
     assert_eq!(tinyfish["keyless"], false);
     assert_eq!(tinyfish["key_saved"], false);
 
@@ -313,7 +510,7 @@ async fn web_search_is_on_by_default_serves_jobs_and_keeps_keys_local() {
         .call(
             "POST",
             "/v1/web-search/providers/tinyfish/test",
-            Some(json!({})),
+            Some(json!({"session_generation": bound["session"]["generation"]})),
         )
         .await;
     assert_eq!(row["test"]["outcome"], "skipped_no_key");
@@ -354,6 +551,82 @@ async fn web_search_is_on_by_default_serves_jobs_and_keeps_keys_local() {
     assert!(s.lock().unwrap().bodies.iter().all(|b| !b.contains(CANARY)));
     desktop.shutdown().await;
     ui.bridge.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_test_cancels_on_sign_out_and_a_delayed_test_cannot_adopt_the_new_binding() {
+    let (base, s) = fake().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    s.lock().unwrap().hold_test = Some(release.clone());
+    let t = tempfile::tempdir().unwrap();
+    let mut cfg = DesktopConfig::new(t.path().join("desktop"), true, None);
+    cfg.poll_interval = Duration::from_millis(30);
+    cfg.web_endpoints = Some(endpoints(&base));
+    let desktop = Desktop::new(cfg);
+    let ui = Arc::new(Ui {
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
+        bridge: bridge::start(desktop.clone()).await.unwrap(),
+    });
+    let credentials = json!({"server_url": base, "session_token": "tok-alice"});
+    let (status, first) = ui
+        .call("POST", "/v1/session", Some(credentials.clone()))
+        .await;
+    assert_eq!(status, 200);
+    let route = "/v1/web-search/providers/tavily/test";
+    let old = json!({"session_generation": first["session"]["generation"]});
+    let running = {
+        let ui = ui.clone();
+        let old = old.clone();
+        tokio::spawn(async move { ui.call("POST", route, Some(old)).await })
+    };
+    wait_for("held vendor request", || s.lock().unwrap().tests == 1).await;
+    let (status, signed_out) = tokio::time::timeout(
+        Duration::from_secs(2),
+        ui.call("DELETE", "/v1/session", None),
+    )
+    .await
+    .expect("sign-out didn't wait for the vendor");
+    assert_eq!(status, 200);
+    assert!(signed_out["session"].is_null());
+    let (status, cancelled) = tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .expect("old test cancelled without releasing the vendor")
+        .unwrap();
+    assert_eq!(status, 409);
+    assert_eq!(cancelled["error"]["code"], "no_session");
+
+    // The same person signs back in before a different old request even
+    // reaches the loopback handler. Matching account/server alone is not enough.
+    let (status, second) = ui.call("POST", "/v1/session", Some(credentials)).await;
+    assert_eq!(status, 200);
+    assert_ne!(
+        first["session"]["generation"],
+        second["session"]["generation"]
+    );
+    let (status, stale) = ui.call("POST", route, Some(old)).await;
+    assert_eq!(status, 409);
+    assert_eq!(stale["error"]["code"], "no_session");
+    assert_eq!(ui.call("POST", route, Some(json!({}))).await.0, 400);
+    assert_eq!(s.lock().unwrap().tests, 1);
+    let (_, view) = ui.call("GET", "/v1/web-search", None).await;
+    assert!(
+        view["providers"][0]["last"].is_null(),
+        "cancelled test wasn't saved"
+    );
+    s.lock().unwrap().hold_test = None;
+    release.notify_one();
+    let (status, current) = ui
+        .call(
+            "POST",
+            route,
+            Some(json!({"session_generation": second["session"]["generation"]})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(current["test"]["outcome"], "ok");
+    assert_eq!(s.lock().unwrap().tests, 2);
+    desktop.shutdown().await;
+    Arc::try_unwrap(ui).ok().unwrap().bridge.stop().await;
 }
 
 /// A settings change that captured the session before a sign-out must not

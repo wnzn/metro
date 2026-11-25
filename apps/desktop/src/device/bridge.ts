@@ -11,6 +11,9 @@
 import { parseMonitoringEvents } from "../api/monitoring";
 import type { MonitoringList } from "../api/monitoring";
 import type { BridgeEndpoint } from "./env";
+import type { WebProvider } from "../api/webSearch";
+import { parseLocalWebSearch, parseWebProvider } from "./webSearch";
+import type { LocalWebSearch, WebProviderRow, WebUpdate } from "./webSearch";
 
 export type DeviceKind =
   | "device-openai-oauth"
@@ -56,7 +59,7 @@ export type BridgeStatus = {
   /** `secondary`: another Metro window of this user already serves device connections. */
   instance: "primary" | "secondary";
   kinds: string[];
-  session: { serverUrl: string; accountId: string } | null;
+  session: { serverUrl: string; accountId: string; generation?: number } | null;
   connections: LocalConnection[];
   /** The desktop-hosted solo workspace, when the bridge reports it. */
   local: LocalState | null;
@@ -141,7 +144,9 @@ export function parseConnection(v: unknown): LocalConnection {
 export function parseStatus(v: unknown): BridgeStatus {
   if (!isObj(v) || v.bridge !== 1) throw new BridgeError("protocol", "Metro's device helper speaks a version this app doesn't know.");
   const session = isObj(v.session) && typeof v.session.server_url === "string" && typeof v.session.account_id === "string"
-    ? { serverUrl: v.session.server_url, accountId: v.session.account_id }
+    ? { serverUrl: v.session.server_url, accountId: v.session.account_id,
+        ...(typeof v.session.generation === "number" && Number.isSafeInteger(v.session.generation) && v.session.generation > 0
+          ? { generation: v.session.generation } : {}) }
     : null;
   const local = str(v.local);
   return {
@@ -158,8 +163,12 @@ export type CredentialsBody = { open_browser?: boolean } | { api_key: string } |
 
 export type Bridge = {
   status(): Promise<BridgeStatus>;
+  /** Reserve a single-use bind intent, or null for an older helper. */
+  reserveBindIntent(): Promise<string | null>;
+  /** Invalidate just this bind, without waiting for lifecycle cleanup. */
+  cancelBindIntent(intent: string): Promise<void>;
   /** Binds the signed-in session: the bridge learns the account and starts its paired workers. */
-  bindSession(serverUrl: string, sessionToken: string): Promise<BridgeStatus>;
+  bindSession(serverUrl: string, sessionToken: string, intent?: string): Promise<BridgeStatus>;
   /** Stops every worker and drops the session (sign-out, account switch). */
   unbindSession(): Promise<BridgeStatus>;
   pair(connectionId: string, body: { kind: string; base_url?: string; models?: string[] }): Promise<LocalConnection>;
@@ -183,6 +192,13 @@ export type Bridge = {
    * first. An older helper answers 404: callers show that as unsupported.
    */
   monitoringEvents(): Promise<MonitoringList>;
+  webSearch(): Promise<LocalWebSearch>;
+  updateWebSearch(update: WebUpdate): Promise<LocalWebSearch>;
+  setWebSearchKey(id: WebProvider, key: string): Promise<WebProviderRow>;
+  removeWebSearchKey(id: WebProvider): Promise<WebProviderRow>;
+  resetWebSearchKeys(): Promise<LocalWebSearch>;
+  testWebSearchProvider(id: WebProvider, generation: number): Promise<WebProviderRow>;
+  clearWebSearchCooldown(id: WebProvider): Promise<WebProviderRow>;
 };
 
 type Method = "GET" | "POST" | "PUT" | "DELETE";
@@ -191,7 +207,7 @@ type Method = "GET" | "POST" | "PUT" | "DELETE";
 const DEADLINE_MS = 30_000;
 
 export function createBridge(endpoint: BridgeEndpoint): Bridge {
-  async function call(method: Method, path: string, body?: unknown, deadline = DEADLINE_MS): Promise<unknown> {
+  async function call(method: Method, path: string, body?: unknown, deadline = DEADLINE_MS, fixedErrors = false): Promise<unknown> {
     let response: Response;
     try {
       response = await fetch(endpoint.url + path, {
@@ -224,7 +240,7 @@ export function createBridge(endpoint: BridgeEndpoint): Bridge {
     if (!response.ok) {
       const e = isObj(data) && isObj(data.error) ? data.error : null;
       const code = (e && str(e.code)) || (response.status === 401 ? "unauthorized" : "protocol");
-      const message = (e && str(e.message)) || `Metro's device helper refused the request (HTTP ${response.status}).`;
+      const message = (!fixedErrors && e && str(e.message)) || `Metro's device helper refused the request (HTTP ${response.status}).`;
       throw new BridgeError(code, scrub(message), response.status);
     }
     return data;
@@ -232,10 +248,37 @@ export function createBridge(endpoint: BridgeEndpoint): Bridge {
 
   const seg = (id: string) => `/v1/connections/${encodeURIComponent(id)}`;
   const conn = async (p: Promise<unknown>) => parseConnection(await p);
+  const webPath = "/v1/web-search";
+  const webCall = (method: Method, path = "", body?: unknown) => call(method, webPath + path, body, DEADLINE_MS, true);
+  const webState = async (p: Promise<unknown>) => {
+    const state = parseLocalWebSearch(await p);
+    if (!state) throw new BridgeError("protocol", "Metro's helper sent unreadable web search settings.");
+    return state;
+  };
+  const webProvider = async (id: WebProvider, method: Method, action: string, body?: unknown) => {
+    const row = parseWebProvider(await webCall(method, `/providers/${encodeURIComponent(id)}/${action}`, body));
+    if (row?.id !== id || (action === "test" && !row.test)) throw new BridgeError("protocol", "Metro's helper sent an unreadable web search provider.");
+    return row;
+  };
 
   return {
     status: async () => parseStatus(await call("GET", "/v1/status", undefined, 10_000)),
-    bindSession: async (serverUrl, sessionToken) => parseStatus(await call("POST", "/v1/session", { server_url: serverUrl, session_token: sessionToken })),
+    reserveBindIntent: async () => {
+      try {
+        const value = await call("POST", "/v1/session/intent", {}, 10_000);
+        if (!isObj(value) || typeof value.intent !== "string" || !/^[a-f0-9]{64}$/.test(value.intent)) {
+          throw new BridgeError("protocol", "Metro's device helper didn't prepare sign-in.");
+        }
+        return value.intent;
+      } catch (error) {
+        if (error instanceof BridgeError && error.status === 404 && error.code === "not_found") return null;
+        throw error;
+      }
+    },
+    cancelBindIntent: async (intent) => { await call("DELETE", "/v1/session/intent", { intent }, 10_000); },
+    bindSession: async (serverUrl, sessionToken, intent) => parseStatus(await call("POST", "/v1/session", {
+      server_url: serverUrl, session_token: sessionToken, ...(intent ? { intent } : {}),
+    })),
     unbindSession: async () => parseStatus(await call("DELETE", "/v1/session")),
     pair: (id, body) => conn(call("POST", `${seg(id)}/pair`, body)),
     rotate: (id) => conn(call("POST", `${seg(id)}/rotate`, {})),
@@ -265,5 +308,12 @@ export function createBridge(endpoint: BridgeEndpoint): Bridge {
       if (!list) throw new BridgeError("protocol", "Metro's device helper sent monitoring events this app doesn't understand.");
       return list;
     },
+    webSearch: () => webState(webCall("GET")),
+    updateWebSearch: (update) => webState(webCall("PUT", "", update)),
+    setWebSearchKey: (id, key) => webProvider(id, "PUT", "key", { api_key: key }),
+    removeWebSearchKey: (id) => webProvider(id, "DELETE", "key"),
+    resetWebSearchKeys: () => webState(webCall("POST", "/keys/reset", {})),
+    testWebSearchProvider: (id, generation) => webProvider(id, "POST", "test", { session_generation: generation }),
+    clearWebSearchCooldown: (id) => webProvider(id, "POST", "clear-cooldown", {}),
   };
 }

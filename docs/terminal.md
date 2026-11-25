@@ -1,5 +1,8 @@
 # Terminal client (`metro-tui`)
 
+The terminal's [new server transport policy](next-source.md#http-tailscale-and-proxies)
+is in the source, not released. Follow the published client's steps below.
+
 > **Status: released in [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2).**
 > `metro-tui` has been in the source since `142bc85`. CI builds it into
 > every desktop download, including the unsigned

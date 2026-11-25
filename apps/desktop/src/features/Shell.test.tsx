@@ -79,6 +79,67 @@ test("collapsing Settings sections keeps the active page and leaves the workspac
   await app.waitFor("id:nav-settings");
 });
 
+test("Settings starts on Profile, groups its desktop navigation, and remembers the last page only in this session", async () => {
+  const app = await openApp(world());
+  await signIn(app, "alice");
+  await app.press("id:nav-settings");
+  await app.waitFor("id:profile-settings");
+  await app.waitFor("text:Your account on 127.0.0.1:8787");
+  for (const id of ["you", "computer", "metro"]) expect(app.shows(`id:settings-group:${id}`)).toBe(true);
+  expect(app.shows("label:Model connections")).toBe(true);
+  expect(app.shows("label:Model choices")).toBe(true);
+  await app.press("id:nav-settings:appearance");
+  await app.waitFor("text:This computer only");
+  await app.press("id:settings-close");
+  await app.press("id:nav-settings");
+  await app.waitFor("id:appearance-settings");
+  await app.press("id:settings-close");
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+  await signIn(app, "bob");
+  await app.press("id:nav-settings");
+  await app.waitFor("id:profile-settings");
+  expect(app.shows("id:appearance-settings")).toBe(false);
+});
+
+test("narrow Settings hides group headings, keeps the legacy hooks, and returns to the same page", async () => {
+  const app = await openApp(world(), { width: 760, height: 820 });
+  await signIn(app, "alice");
+  await app.press("id:nav-settings");
+  await app.waitFor("id:profile-settings");
+  expect(app.shows("id:settings-group:you")).toBe(false);
+  expect(app.shows("id:settings-group:computer")).toBe(false);
+  expect(app.shows("id:settings-group:metro")).toBe(false);
+  await app.press("id:nav-settings:providers");
+  await app.waitFor("id:providers-settings >> text:Model connections");
+  await app.press("id:settings-close");
+  await app.press("id:nav-settings");
+  await app.waitFor("id:providers-settings");
+  await app.press("id:nav-settings:routing");
+  await app.waitFor("id:routing-settings >> text:Model choices");
+  await app.waitFor("id:library-model");
+  expect(app.shows("id:providers-settings")).toBe(false);
+});
+
+test("aliased Settings routes work; optional pages need registration and About exposes its update dot", async () => {
+  const app = await open("./SettingsExtensions.fixture.tsx", { width: 1200, height: 820 });
+  await app.press("id:uninstalled-route");
+  expect(app.shows("id:settings-dialog")).toBe(false);
+  await app.press("id:legacy-providers-route");
+  await app.waitFor("id:providers-settings");
+  await app.press("id:settings-close");
+  await app.press("id:legacy-routing-route");
+  await app.waitFor("id:routing-settings");
+  await app.press("id:settings-close");
+  await app.press("id:installed-route");
+  await app.waitFor("id:about-fixture");
+  expect(app.shows("id:nav-settings:websearch")).toBe(false);
+  expect(app.shows("id:nav-settings:about:dot")).toBe(true);
+  expect(app.shows("label:About & updates, Update available")).toBe(true);
+  await app.press("label:Hide settings sections");
+  await app.waitFor("id:rail-settings:about:dot");
+});
+
 test("the account shows the host once, and its menu copies the server URL and the ID, then signs out", async () => {
   const app = await openApp(world());
   await signIn(app, "alice");
@@ -240,7 +301,7 @@ test("collapsed Settings sections stay as a rail of their icons", async () => {
   await app.waitFor("id:settings-rail");
   await app.press("id:rail-settings:appearance");
   await app.waitFor("id:appearance-settings");
-  expect(app.shows("label:Model providers")).toBe(true);
+  expect(app.shows("label:Model connections")).toBe(true);
 });
 
 test("the connection is a dot on the account's server line; words only when not online", async () => {

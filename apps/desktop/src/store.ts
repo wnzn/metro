@@ -43,6 +43,7 @@ import {
   captureTypedMentions, editMentionDraft, mentionIdentityKey, pickMention, prepareMentionSend, scanMentionDraft, updateMentionDraft,
 } from "./features/mentions/draft";
 import type { MentionDirectory, MentionDraft, MentionRecipient, MentionSelection, MentionSend } from "./features/mentions/draft";
+import { confirmChangedAutomaticMentions } from "./features/mentions/preflight";
 import type { PostedSenderNotes, SenderNoticeDetails } from "./features/senderNotices/response";
 import { renderedRecipientsKey } from "./features/senderNotices/response";
 
@@ -75,7 +76,15 @@ export type Place = "chat" | "space" | "settings" | "search" | "library" | "page
 /** Where the main panel is under any modal: never Settings. */
 export type MainPlace = Exclude<Place, "settings">;
 /** The pages of Settings. Reachable with or without any Space. */
-export type SettingsSection = "profile" | "runners" | "providers" | "routing" | "monitoring" | "appearance";
+export type SettingsExtension = "websearch" | "about";
+export type SettingsSection = "profile" | "runners" | "connections" | "models" | "monitoring" | "appearance" | SettingsExtension;
+type SettingsAlias = "providers" | "routing";
+const settingsExtensions = signal<readonly SettingsExtension[]>([]);
+export const settingsExtensionAvailable = (section: SettingsExtension) => settingsExtensions().includes(section);
+/** Called by the Settings shell when a real extension page is installed. */
+export function enableSettingsExtension(section: SettingsExtension) {
+  if (!settingsExtensionAvailable(section)) settingsExtensions.set([...settingsExtensions(), section]);
+}
 
 // ------------------------------------------------------------------ state
 
@@ -107,7 +116,8 @@ export const settingsOpen = signal(false);
 export const place = computed<Place>(() => (settingsOpen() ? "settings" : basePlace()));
 /** The main panel's place, under the Settings modal too. */
 export const mainPlace = computed<MainPlace>(() => basePlace());
-export const settingsSection = signal<SettingsSection>("runners");
+export const settingsSection = signal<SettingsSection>("profile");
+export const settingsAnchor = signal<"privacy" | null>(null);
 export const spaces = signal<Space[]>([]);
 export const activeSpaceId = signal<string | null>(null);
 export const activeSpace = computed(() => spaces().find((s) => s.id === activeSpaceId()) ?? null);
@@ -165,19 +175,45 @@ const memberFailures = signal<Record<string, string | null>>({});
 export const membersError = computed(() => memberFailures()[activeSpaceId() ?? ""] ?? null);
 const memberRequests = new Map<string, Promise<void>>();
 const memberVersions = new Map<string, number>();
+const memberEvidence = signal<Record<string, { version: number; roster: object }>>({});
+type MentionVisit = { sid: string; scope: string; navigation: number; token: object; verified: boolean };
+const mentionVisit = signal<MentionVisit | null>(null);
+type MemberAlias = { order: number; displayName: string | null };
+const aliasVisit = computed(() => {
+  const visit = mentionVisit();
+  return visit?.verified && currentMentionVisit(visit) ? visit.token : null;
+});
+const aliasRoster = computed(() => {
+  const sid = activeSpaceId();
+  return sid && !memberFailures()[sid] && members()?.some(m => m.userId === me()) ? memberEvidence()[sid]?.roster : null;
+});
+// Only the current verified visit and roster can share name evidence. Identical
+// roster replies preserve the scope; cached profiles from elsewhere cannot seed it.
+const memberAliasScope = computed(() => aliasVisit() && aliasRoster()
+  ? { entries: signal<ReadonlyMap<string, MemberAlias>>(new Map()), next: 0 } : null);
 
 const EMPTY_DIRECTORY: MentionDirectory = { members: [], agents: [] };
 const EMPTY_MENTION_DRAFT: MentionDraft = { text: "", anchors: [] };
 export const mentionDraft = signal<MentionDraft>(EMPTY_MENTION_DRAFT);
 const editDirectory = signal<MentionDirectory | null>(null);
+type MentionConfirmation = { directory: MentionDirectory; current: () => boolean };
+const mentionConfirmation = signal<MentionConfirmation | null>(null);
 export const mentions = computed(() =>
   [...new Map(mentionDraft().anchors.map(a => [mentionIdentityKey(a.mention), a])).values()]);
 
 // The composer supplies the locally verified names and handles; the store
 // independently verifies stable recipients before the POST.
 let directoryForMentions: (sid: string) => MentionDirectory | null = () => null;
-export function registerMentionDirectory(get: (sid: string) => MentionDirectory | null) {
+let verifiedMentionAgents: (sid: string) => MentionDirectory["agents"] | null = () => null;
+let refreshAgentsForMentions: ((sid: string, live: () => boolean) => Promise<MentionDirectory["agents"] | null>) | undefined;
+export function registerMentionDirectory(
+  get: (sid: string) => MentionDirectory | null,
+  refreshAgents: NonNullable<typeof refreshAgentsForMentions>,
+  getAgents: typeof verifiedMentionAgents,
+) {
   directoryForMentions = get;
+  refreshAgentsForMentions = refreshAgents;
+  verifiedMentionAgents = getAgents;
 }
 
 // Space management (owners)
@@ -553,11 +589,15 @@ export async function openLocation(target: Location): Promise<boolean> {
  * (place, Space, room, view, drafts, scroll) is kept for closeSettings; only
  * what is shown once (tokens, confirmations) is dropped, as on any move.
  */
-export function openSettings(section: SettingsSection = settingsSection()) {
-  if (settingsOpen() && settingsSection() === section) return;
+export function openSettings(section: SettingsSection | SettingsAlias | "about-privacy" = settingsSection()) {
+  const page = section === "providers" ? "connections" : section === "routing" ? "models"
+    : section === "about-privacy" ? "about" : section;
+  if ((page === "about" || page === "websearch") && !settingsExtensionAvailable(page)) return;
   batch(() => {
+    settingsAnchor.set(section === "about-privacy" ? "privacy" : null);
+    if (settingsOpen() && settingsSection() === page) return;
     clearTransient();
-    settingsSection.set(section);
+    settingsSection.set(page);
     settingsOpen.set(true);
   });
 }
@@ -568,6 +608,7 @@ export function closeSettings() {
   batch(() => {
     clearTransient();
     settingsOpen.set(false);
+    settingsAnchor.set(null);
   });
 }
 
@@ -591,7 +632,19 @@ export async function selectSpace(spaceId: string): Promise<void> {
   kick();
 }
 
-export async function createSpace(nameInput: string): Promise<boolean> {
+type CreateSpaceOptions = {
+  formIsCurrent: () => boolean;
+  attachRunner: (space: Space, scope: {
+    mayAttach: () => boolean;
+    mayShowOutcome: () => boolean;
+  }) => Promise<void>;
+};
+
+// Also catches a modal opened and closed while creating or checking the runner.
+let createSpaceContext = 0;
+onTransientClear(() => { createSpaceContext++; });
+
+export async function createSpace(nameInput: string, options?: CreateSpaceOptions): Promise<boolean> {
   const name = nameInput.trim();
   const c = client;
   if (!c || creatingSpace()) return false;
@@ -600,6 +653,8 @@ export async function createSpace(nameInput: string): Promise<boolean> {
     return false;
   }
   const ok = guard();
+  const source = createSpaceContext;
+  let created = false;
   batch(() => {
     creatingSpace.set(true);
     actionError.set(null);
@@ -609,11 +664,28 @@ export async function createSpace(nameInput: string): Promise<boolean> {
     const space = await c.createSpace(name);
     if (!ok()) return false;
     verifyAccess(scopeKey(space.id, ""), request);
+    created = true;
+    // Onboarding can unmount as soon as we publish the first Space. Check
+    // the submitting form before that expected transition.
+    const fromOriginalForm = source === createSpaceContext && !!options?.formIsCurrent();
+    const expectedContext = createSpaceContext + 1; // enterSpace clears transients once
+    const spaceOK = guard(space.id);
     spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
     await enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
     kick();
+    // Returning to the same Space can show a missing attachment, but cannot
+    // revive consent invalidated by a move or dialog.
+    const mayShowOutcome = () => spaceOK() && basePlace() === "space" && view() === "room" && activeSpaceId() === space.id;
+    if (options && mayShowOutcome()) {
+      await options.attachRunner(space, {
+        mayAttach: () => fromOriginalForm && createSpaceContext === expectedContext && mayShowOutcome(),
+        mayShowOutcome,
+      });
+    }
     return true;
   } catch (error) {
+    // A follow-up failure must not turn a confirmed creation into a retry.
+    if (created) return ok();
     if (ok()) handleActionError(error, "Could not create the Space");
     return false;
   } finally {
@@ -749,6 +821,8 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     membersBySpace.set(restMembers);
     const { [spaceId]: _error, ...restErrors } = memberFailures();
     memberFailures.set(restErrors);
+    const { [spaceId]: _evidence, ...restEvidence } = memberEvidence();
+    memberEvidence.set(restEvidence);
     memberRequests.delete(spaceId);
     memberVersions.delete(spaceId);
     if (activeSpaceId() === spaceId) {
@@ -1049,8 +1123,8 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     const directory = editDirectory();
     submittedDraft = captureForDirectory(mentionDraft(), directory, { finalize: true });
     writeMentionDraft(submittedDraft, directory);
-    // Finalization has already decided all typed occurrences. Validate
-    // preserved ids against a fresh roster after any uploads, not aliases.
+    // Finalize against the draft's directory. The fresh roster after any
+    // uploads can require confirmation, but never replaces a binding.
     const bound = submittedDraft.anchors.map(a => a.mention);
     const people = new Set((directory?.members ?? []).map(m => m.id));
     const named = new Set((directory?.agents ?? []).map(a => a.id));
@@ -1107,13 +1181,23 @@ async function sendDraft(intent: DraftSend): Promise<void> {
         return;
       }
       const body = address!;
-      if (!await verifySpaceRecipients(c, sid!, body, files, mayPost)) {
+      const verified = await verifySpaceRecipients(c, sid!, body, submittedDraft!, files, mayPost);
+      if (verified?.kind === "confirmation" && mayPost() && verified.confirmation.current()) {
+        batch(() => {
+          mentionConfirmation.set(verified.confirmation);
+          writeMentionDraft(verified.draft, verified.confirmation.directory);
+          actionError.set("A mention no longer has the same recipient. Pick who you mean. Nothing was sent.");
+        });
+        return;
+      }
+      if (verified?.kind !== "ok" || !mayPost() || !verified.current()) {
         if (here()) actionError.set(mayPost()
-          ? "A recipient is no longer in this Space. Remove their mention or choose someone else. Nothing was sent."
+          ? verified?.kind !== "stale"
+            ? "Could not verify the current recipient list. Nothing was sent."
+            : "A recipient is no longer in this Space. Remove their mention or choose someone else. Nothing was sent."
           : "The draft or destination changed. Nothing was sent; review the draft and send again.");
         return;
       }
-      if (!mayPost()) return;
       origin = captureSendOrigin(c, to);
       origin.acknowledge(await c.sendMessage(sid!, rid!, body, ids, selected.choice));
     }
@@ -1183,33 +1267,47 @@ export async function followUp(run: Run): Promise<void> {
 }
 
 export async function setDispatchSpace(spaceId: string, roomId?: string): Promise<void> {
-  if (!spaces().some((s) => s.id === spaceId)) return;
+  const c = client;
+  if (!c || !spaces().some((s) => s.id === spaceId)) return;
+  const ok = guard(spaceId);
+  const pending = { spaceId, roomId: null };
   dispatchError.set(null);
   dispatchNotice.set(null);
-  dispatchTarget.set({ spaceId, roomId: roomId ?? null });
+  dispatchTarget.set(pending);
   try {
-    const list = await ensureRooms(spaceId);
-    const current = dispatchTarget();
-    if (current?.spaceId !== spaceId) return;
-    const chosen = roomId && list.some((r) => r.id === roomId) ? roomId : pickRoom(spaceId, list);
-    dispatchTarget.set({ spaceId, roomId: chosen });
+    // Follow up at the exact requested room or thread. A cached list can
+    // miss a new thread or still contain one that no longer exists.
+    const request = nextAccessRequest();
+    const list = roomId === undefined ? await ensureRooms(spaceId) : await c.listRooms(spaceId);
+    if (!ok() || dispatchTarget() !== pending) return;
+    if (roomId === undefined) {
+      dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
+    } else {
+      verifyAccess(scopeKey(spaceId, ""), request);
+      for (const r of list) verifyRoomAccess(spaceId, r.id, request);
+      roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+      if (list.some(r => r.id === roomId)) dispatchTarget.set({ spaceId, roomId });
+      else dispatchError.set("That room or thread is no longer available. Choose another destination.");
+    }
   } catch (error) {
-    if (dispatchTarget()?.spaceId === spaceId) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+    if (ok() && dispatchTarget() === pending) dispatchError.set(describe(error, "Could not load that Space's rooms"));
   }
 }
 
 export function setDispatchRoom(roomId: string) {
   const t = dispatchTarget();
-  if (t) dispatchTarget.set({ spaceId: t.spaceId, roomId });
+  if (t && roomsBySpace()[t.spaceId]?.some(r => r.id === roomId)) {
+    dispatchTarget.set({ spaceId: t.spaceId, roomId });
+    dispatchError.set(null);
+  }
 }
 
 /** Sends the dispatch draft to the chosen Space and room and asks that Space's agent. */
 export async function sendDispatch(): Promise<void> {
-  const submittedText = dispatchDraft();
-  const text = submittedText.trim();
+  const text = dispatchDraft();
   const target = dispatchTarget();
   const c = client;
-  if (!text || !target?.roomId || !c || dispatching()) return;
+  if (!text.trim() || !target?.roomId || !c || dispatching()) return;
   const space = spaces().find((s) => s.id === target.spaceId);
   const room = roomsBySpace()[target.spaceId]?.find((r) => r.id === target.roomId);
   if (!space || !room) {
@@ -1230,7 +1328,7 @@ export async function sendDispatch(): Promise<void> {
     // mention composer. Its text cannot add recipients implicitly.
     const hadNotice = origin.acknowledge(await c.sendMessage(target.spaceId, target.roomId, { text, invoke_agent: true }));
     if (!origin.canRetireDraft()) return;
-    if (dispatchTarget() === target && dispatchDraft() === submittedText) dispatchDraft.set("");
+    if (dispatchTarget() === target && dispatchDraft() === text) dispatchDraft.set("");
     if (here()) dispatchNotice.set(hadNotice ? `Posted in ${space.name} › #${room.name}.` :
       `Sent to the agent in ${space.name} › #${room.name}.`);
     lastRunsRefresh = 0;
@@ -1407,27 +1505,92 @@ export async function reloadMembers(): Promise<void> {
     const list = await c.listMembers(sid);
     if (ok()) adoptMembers(sid, version, list);
   } catch (error) {
-    if (ok()) {
-      markMembersUnverified(sid, version, error);
+    if (ok() && !isAborted(error) && markMembersUnverified(sid, version, error)) {
       handleManageError(error, "Could not load members", sid);
     }
   }
 }
 
-/** Loads the active Space's members for the mention picker (any member may). */
-export function loadMembersForMentions(): Promise<void> {
+/** Start a distinct visit even on re-entry to the same cached Space. */
+export function beginMentionVisit(sid: string, scope: string) {
+  const visit: MentionVisit = { sid, scope, navigation: navigationGeneration, token: {}, verified: false };
+  mentionVisit.set(visit);
+  void loadMembersForMentions(true);
+  return () => {
+    if (mentionVisit()?.token === visit.token) mentionVisit.set(null);
+  };
+}
+
+function currentMentionVisit(visit: MentionVisit) {
+  return visit.navigation === navigationGeneration && activeScope() === visit.scope && inSpaceComposer()
+    && mentionVisit()?.token === visit.token;
+}
+
+export function mentionVisitVerified(sid: string) {
+  const visit = mentionVisit();
+  return !!visit?.verified && visit.sid === sid && currentMentionVisit(visit);
+}
+
+export function mentionVisitGuard(sid: string) {
+  const visit = mentionVisit();
+  const ok = guard(sid);
+  return () => !!visit && visit.sid === sid && ok() && currentMentionVisit(visit);
+}
+
+/** Same key through background cache refreshes, different on navigation or leaving the composer. */
+export function mentionVisitKey() {
+  const scope = activeScope();
+  return scope && inSpaceComposer() ? `${navigationGeneration}:${scope}` : null;
+}
+
+/** Read evidence for a current member, shared by preflight and profile refresh. */
+export function mentionProfileEvidence(userId: string) {
+  const scope = memberAliasScope();
+  if (!scope || !members()?.some(m => m.userId === userId)) return null;
+  return {
+    scope,
+    verified: scope.entries().has(userId),
+    start: () => {
+      if (memberAliasScope() !== scope) return null;
+      const order = ++scope.next;
+      return (displayName: string | null | undefined) => {
+        if (memberAliasScope() !== scope) return;
+        const entries = scope.entries();
+        if ((entries.get(userId)?.order ?? 0) >= order) return;
+        scope.entries.set(new Map(entries).set(userId, { order, displayName: displayName || null }));
+      };
+    },
+  };
+}
+
+/** Require every current member, including verified profiles with no readable name. */
+export function mentionMemberNames(sid: string): MentionDirectory["members"] | null {
+  if (activeSpaceId() !== sid) return null;
+  const entries = memberAliasScope()?.entries();
+  const list = members();
+  if (!entries || !list || !list.every(m => entries.has(m.userId))) return null;
+  return list.map(({ userId }) => ({ id: userId, displayName: entries.get(userId)!.displayName }));
+}
+
+/** A new visit must not reuse an older visit's in-flight roster request. */
+export function loadMembersForMentions(fresh = false): Promise<void> {
   const sid = activeSpaceId();
   const c = client;
-  if (!sid || !c) return Promise.resolve();
+  const visit = mentionVisit();
+  if (!sid || !c || !visit || visit.sid !== sid || !currentMentionVisit(visit)) return Promise.resolve();
   const existing = memberRequests.get(sid);
-  if (existing) return existing;
+  if (existing && !fresh) return existing;
   const ok = guard(sid);
   const version = nextMemberVersion(sid);
   const work = c.listMembers(sid).then(list => {
-    if (ok()) adoptMembers(sid, version, list);
+    if (ok() && currentMentionVisit(visit)) {
+      batch(() => {
+        if (adoptMembers(sid, version, list) && !visit.verified) mentionVisit.set({ ...visit, verified: true });
+      });
+    }
   }, error => {
-    if (!ok() || isAborted(error)) return;
-    markMembersUnverified(sid, version, error);
+    if (!ok() || !currentMentionVisit(visit) || isAborted(error)) return;
+    if (!markMembersUnverified(sid, version, error)) return;
     if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
     else if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) void lostAccess(sid, null);
   }).finally(() => {
@@ -1445,18 +1608,33 @@ function nextMemberVersion(sid: string) {
   return version;
 }
 
+function sameMemberIds(a: readonly Member[] | undefined, b: readonly Member[]) {
+  const ids = new Set(a?.map(m => m.userId));
+  return a?.length === b.length && b.every(m => ids.has(m.userId));
+}
+
 function adoptMembers(sid: string, version: number, list: Member[]) {
-  if (memberVersions.get(sid) !== version) return;
+  const before = memberEvidence()[sid];
+  if (before && version < before.version) return false;
+  // In-flight requests aren't evidence. Identical successful replies keep
+  // the same roster token, including reordering or changes to a role.
+  const roster = before && !memberFailures()[sid] && sameMemberIds(membersBySpace()[sid], list) ? before.roster : {};
   batch(() => {
     membersBySpace.set({ ...membersBySpace(), [sid]: list });
+    memberEvidence.set({ ...memberEvidence(), [sid]: { version, roster } });
     if (memberFailures()[sid]) memberFailures.set({ ...memberFailures(), [sid]: null });
   });
+  return true;
 }
 
 function markMembersUnverified(sid: string, version: number, error: unknown) {
-  if (memberVersions.get(sid) === version) {
+  const before = memberEvidence()[sid];
+  if (before && version < before.version) return false;
+  batch(() => {
+    memberEvidence.set({ ...memberEvidence(), [sid]: { version, roster: {} } });
     memberFailures.set({ ...memberFailures(), [sid]: describe(error, "Could not verify members") });
-  }
+  });
+  return true;
 }
 
 /** The visible, permission-scoped room/thread, never the Space left beneath another view. */
@@ -1479,6 +1657,7 @@ function captureForDirectory(value: MentionDraft, directory: MentionDirectory | 
 
 function writeMentionDraft(value: MentionDraft, directory: MentionDirectory | null) {
   batch(() => {
+    if (!value.decisions?.some(d => d.kind === "ambiguous" && d.preflight)) mentionConfirmation.set(null);
     mentionDraft.set(value);
     editDirectory.set(directory);
     draft.set(value.text);
@@ -1494,14 +1673,23 @@ export function previewMentionMatches(value: MentionDraft) {
   return scanMentionDraft(value, editDirectory() ?? EMPTY_DIRECTORY, { finalize: true });
 }
 
+/** Never fall back to cached profiles when a send required a fresh confirmation. */
+export function verifiedConfirmationDirectory() {
+  const confirmation = mentionConfirmation();
+  return confirmation?.current() ? confirmation.directory : null;
+}
+
 /** Picking can only use current data and the exact literal the chooser showed. */
 export function addMention(mention: MentionRecipient, selection?: MentionSelection): number | null {
   const sid = activeSpaceId();
   if (!sid || !inSpaceComposer()) return null;
   const value = mentionDraft();
-  const directory = directoryForMentions(sid);
   const end = value.text.length;
   const range = selection ?? { start: end, end, literal: "" };
+  const decision = value.decisions?.find(d => d.start === range.start && d.end === range.end && d.literal === range.literal);
+  const directory = decision?.kind === "ambiguous" && decision.preflight ? verifiedConfirmationDirectory() : directoryForMentions(sid);
+  if (decision?.kind === "ambiguous" && decision.preflight
+    && (!directory || !decision.choices.some(m => mentionIdentityKey(m) === mentionIdentityKey(mention)))) return null;
   const picked = pickMention(value, range, mention, directory ?? EMPTY_DIRECTORY);
   if (!picked) return null;
   writeMentionDraft(picked, editDirectory());
@@ -1554,32 +1742,84 @@ function setMentionSendError(result: Extract<MentionSend, { ok: false }>) {
   });
 }
 
+type SpaceRecipientCheck = { kind: "stale" | "unverified" }
+  | { kind: "ok"; current: () => boolean }
+  | { kind: "confirmation"; draft: MentionDraft; confirmation: MentionConfirmation };
+
 async function verifySpaceRecipients(
-  c: Client, sid: string, body: SpaceMessageBody, uploaded: boolean, mayPost: () => boolean,
-): Promise<boolean> {
+  c: Client, sid: string, body: SpaceMessageBody, submitted: MentionDraft, uploaded: boolean, mayPost: () => boolean,
+): Promise<SpaceRecipientCheck | null> {
   const people = body.mentions?.flatMap(m => m.kind === "user" ? [m.id] : []) ?? [];
   const agents = body.mentions?.flatMap(m => m.kind === "agent" && m.agent_id ? [m.agent_id] : []) ?? [];
   if (body.agent_id) agents.push(body.agent_id);
-  const checkMembers = uploaded || people.length > 0;
+  const checkAliases = submitted.anchors.some(a => !a.picked);
+  const checkMembers = checkAliases || uploaded || people.length > 0;
   const version = checkMembers ? nextMemberVersion(sid) : 0;
-  const ok = guard(sid);
+  const visit = mentionVisitGuard(sid);
   const roster = checkMembers ? c.listMembers(sid).then(list => {
-    if (ok()) adoptMembers(sid, version, list);
-    return list;
+    if (mayPost()) adoptMembers(sid, version, list);
+    return { list, evidence: memberEvidence()[sid]?.roster };
   }, error => {
-    if (ok() && !isAborted(error)) markMembersUnverified(sid, version, error);
+    if (mayPost() && !isAborted(error)) markMembersUnverified(sid, version, error);
     throw error;
   }) : null;
-  const [members, currentAgents] = await Promise.all([roster, agents.length ? c.spaceAgents(sid) : null]);
-  if (!mayPost()) return false;
-  if (checkMembers) {
-    // If a newer refresh won, don't let the older result restore a revoked
-    // identity. Require both snapshots to agree on the identities used.
-    const ids = [me(), ...people];
-    if (membersError() || ids.some(id => !members?.some(m => m.userId === id)
-      || !membersBySpace()[sid]?.some(m => m.userId === id))) return false;
+  const readAgents = () => c.spaceAgents(sid).then(list => list.agents.filter(a => a.spaceId === sid));
+  const [checked, explicitAgents] = await Promise.all([roster, !checkAliases && agents.length ? readAgents() : null]);
+  if (!mayPost()) return null;
+  const members = checked?.list;
+  let currentAgents: MentionDirectory["agents"] | null = explicitAgents;
+  let aliasesCurrent = () => true;
+  if (checkAliases) {
+    if (!members || !members.some(m => m.userId === me())) return { kind: "unverified" };
+    for (let i = 0; i < members.length; i += 8) {
+      const read = await Promise.all(members.slice(i, i + 8).map(async ({ userId }) => {
+        const complete = mentionProfileEvidence(userId)?.start();
+        if (!complete) return false;
+        const profile = await c.profileOf(userId);
+        if (profile && profile.id !== userId) return false;
+        if (mayPost()) complete(profile?.displayName);
+        return true;
+      }));
+      if (!mayPost()) return null;
+      if (read.some(ok => !ok)) return { kind: "unverified" };
+    }
+    currentAgents = await refreshAgentsForMentions?.(sid, mayPost) ?? null;
+    if (!mayPost()) return null;
+    const rosterCurrent = () => checked?.evidence === memberEvidence()[sid]?.roster
+      && !membersError() && sameMemberIds(membersBySpace()[sid], members);
+    // Use the newest completed observations, not necessarily the replies
+    // from this send: a newer background read may have resolved first.
+    const freshPeople = mentionMemberNames(sid);
+    if (!currentAgents || !freshPeople || !rosterCurrent()) return { kind: "unverified" };
+    const directory = { members: freshPeople, agents: currentAgents };
+    const personNames = new Map(freshPeople.map(m => [m.id, m.displayName]));
+    const agentNames = new Map(currentAgents.map(a => [a.id, a]));
+    aliasesCurrent = () => {
+      if (!visit() || !rosterCurrent()) return false;
+      const people = mentionMemberNames(sid);
+      if (!people || people.length !== personNames.size || !people.every(m => personNames.get(m.id) === m.displayName)) return false;
+      const latest = verifiedMentionAgents(sid);
+      return !!latest && latest.length === agentNames.size && latest.every(a => {
+        const saved = agentNames.get(a.id);
+        return saved?.name === a.name && saved.handle === a.handle;
+      });
+    };
+    const confirmed = confirmChangedAutomaticMentions(submitted, directory);
+    if (confirmed !== submitted) {
+      let expired = false;
+      const current = () => {
+        if (!expired && !aliasesCurrent()) expired = true;
+        return !expired;
+      };
+      return { kind: "confirmation", draft: confirmed, confirmation: { directory, current } };
+    }
   }
-  return agents.every(id => currentAgents?.agents.some(a => a.spaceId === sid && a.id === id));
+  // Require both snapshots to agree on the concrete members in use.
+  const ids = [me(), ...people];
+  const membersCurrent = () => !checkMembers || !membersError() && ids.every(id =>
+    members?.some(m => m.userId === id) && membersBySpace()[sid]?.some(m => m.userId === id));
+  if (!membersCurrent() || !agents.every(id => currentAgents?.some(a => a.id === id))) return { kind: "stale" };
+  return { kind: "ok", current: () => aliasesCurrent() && membersCurrent() };
 }
 
 export async function addMember(userIdInput: string): Promise<boolean> {
@@ -1662,6 +1902,7 @@ effect(() => {
       draft.set(back?.text ?? "");
       mentionDraft.set(back?.mention ?? EMPTY_MENTION_DRAFT);
       editDirectory.set(back?.directory ?? null);
+      mentionConfirmation.set(null);
     });
   });
 });
@@ -1733,12 +1974,16 @@ function endSession() {
     notice.set(null);
     membersBySpace.set({});
     memberFailures.set({});
+    memberEvidence.set({});
+    mentionVisit.set(null);
+    mentionConfirmation.set(null);
     mentionDraft.set(EMPTY_MENTION_DRAFT);
     editDirectory.set(null);
     manageError.set(null);
     memberBusy.set(null);
     orgAdmin.set(false);
-    settingsSection.set("runners");
+    settingsSection.set("profile");
+    settingsAnchor.set(null);
     for (const fn of sessionEnders) fn();
   });
 }

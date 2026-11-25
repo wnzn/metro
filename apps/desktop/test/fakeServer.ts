@@ -12,7 +12,7 @@ export const BASE = "http://127.0.0.1:8787";
 export const TOKENS: Record<string, string> = { alice: "tok-alice", bob: "tok-bob", carol: "tok-carol" };
 
 type Activity = { id: string; name: string; source: "agent" | "demo"; phase?: string };
-type Ev = { id: number; kind: string; actor: string; text: string; mentions?: unknown[]; audience?: string; activity?: Activity };
+type Ev = { id: number; kind: string; actor: string; text: string; mentions?: unknown[]; spans?: unknown; audience?: string; activity?: Activity };
 type Req = { method: string; url: string; headers: unknown; body?: string | null };
 type Space = { id: string; name: string; owner: string; members: Set<string>; runnerToken: string | null };
 type Room = { id: string; name: string; parent_room_id?: string };
@@ -47,6 +47,15 @@ export const CATALOG: { providers: { id: string; name: string; requires_key: boo
 };
 export const ORG_ADMINS = ["alice"];
 
+/** The Space server trims text and rebases byte spans; [] is not legacy. */
+export function spaceMessageText(body: { text: string; infer_text_mentions?: boolean; spans?: { start: number; end: number; index: number }[] }) {
+  const start = body.text.match(/^\p{White_Space}+/u)?.[0] ?? "";
+  const offset = new TextEncoder().encode(start).length;
+  const text = body.text.slice(start.length).replace(/\p{White_Space}+$/u, "");
+  if (body.infer_text_mentions !== false && !body.spans?.length) return { text };
+  return { text, spans: (body.spans ?? []).map(({ start, end, index }) => ({ start: start - offset, end: end - offset, index })) };
+}
+
 export function header(req: Req, name: string): string | undefined {
   const h = req.headers as any;
   if (!h) return undefined;
@@ -68,7 +77,30 @@ export function fakeServer() {
     afters: [] as string[],
     runners: new Map<string, Runner>(),
     attached: new Map<string, string>(), // space id -> runner id
+    attachIfEmpty: true,
+    missingEmptyAttachRoute: false,
+    beforeEmptyAttach: null as ((sid: string) => void) | null,
+    runnerRelease: new Map<string, { presence: Record<string, unknown>; update: Record<string, unknown> }>(),
+    rejectRunnerUpdate: new Set<string>(),
     connections: new Map<string, Conn>(),
+    allowedBaseUrls: [...CATALOG.allowed_base_urls],
+    /** Scripted endpoint test failures, before PATCH commits; never a live provider request. */
+    endpointRefusals: new Map<string, { status: number; error: string; code?: string }>(),
+    /** A different writer commits while Metro's endpoint test is running. */
+    endpointConcurrentEdits: new Map<string, { name: string; baseUrl: string }>(),
+    endpointProbes: [] as string[],
+    /** Break only the response to a committed endpoint PATCH. */
+    endpointAck: new Map<string, "lost" | "malformed">(),
+    /** Proxy 504 while the server is still probing, released by the test. */
+    heldEndpointProbes: new Set<string>(),
+    heldEndpointRequests: new Set<string>(),
+    forwardEndpointRequests: new Map<string, () => { status?: number; body?: unknown }>(),
+    endpointRevisions: new Map<string, number>(),
+    exposesEndpointRevision: true,
+    finishEndpointProbes: new Map<string, () => void>(),
+    providersReadStatus: 200,
+    /** Scenario opts into modern flat chat inventory; other callers exercise the older shape. */
+    chatInventory: false,
     /** Device connection ids whose metro-connector is online. */
     online: new Set<string>(),
     /** Model routing per user (missing: the defaults, all off). */
@@ -117,11 +149,15 @@ export function fakeServer() {
     return Object.keys(TOKENS).find((u) => auth === `Bearer ${TOKENS[u]}`);
   };
   const ok = (body: unknown, status = 200) => ({ status, body });
-  const err = (status: number, error: string) => ({ status, body: { error } });
+  const err = (status: number, error: string, code?: string) => ({ status, body: { error, ...(code ? { code } : {}) } });
   const spaceJson = (s: Space, user: string) => ({ id: s.id, name: s.name, role: s.owner === user ? "owner" : "member", runner_paired: !!s.runnerToken || state.attached.has(s.id) });
   const admin = (user: string) => ORG_ADMINS.includes(user);
   const visibleRunner = (r: Runner | undefined, user: string) => !!r && (r.visibility === "organization" || r.owner === user);
-  const runnerJson = (r: Runner, user: string) => ({ id: r.id, name: r.name, visibility: r.visibility, can_manage: r.visibility === "personal" ? r.owner === user : admin(user) });
+  const runnerJson = (r: Runner, user: string) => ({
+    id: r.id, name: r.name, visibility: r.visibility,
+    can_manage: r.visibility === "personal" ? r.owner === user : admin(user),
+    ...state.runnerRelease.get(r.id),
+  });
   /** Self-hosted OpenAI-compatible connections take per-model thinking options. */
   const customThinking = (c: Conn) => c.provider_id === "custom" || c.provider_id === "device-openai-compatible";
   const modelViews = (c: Conn) =>
@@ -130,7 +166,12 @@ export function fakeServer() {
       enabled: m.enabled, available: m.available, source: m.source, position: m.position, is_default: m.model_id === c.model,
       thinking: m.thinking, reasoning_efforts: m.thinking?.efforts ?? [],
     }));
-  const connJson = (c: Conn) => ({ id: c.id, name: c.name, provider_id: c.provider_id, base_url: c.base_url, model: c.model, is_default: c.is_default, has_key: !!c.key, capability: c.capability, visibility: c.share.visibility, custom_thinking: customThinking(c), models: modelViews(c) });
+  const endpointRev = (c: Conn) => state.endpointRevisions.get(c.id) ?? 0;
+  const bumpEndpointRev = (c: Conn) => state.endpointRevisions.set(c.id, endpointRev(c) + 1);
+  const connJson = (c: Conn) => ({ id: c.id, name: c.name, provider_id: c.provider_id, base_url: c.base_url,
+    ...(state.exposesEndpointRevision && !c.provider_id.startsWith("device-") && CATALOG.providers.find((p) => p.id === c.provider_id)?.allow_custom_url
+      ? { endpoint_revision: String(endpointRev(c)) } : {}),
+    model: c.model, is_default: c.is_default, has_key: !!c.key, capability: c.capability, visibility: c.share.visibility, custom_thinking: customThinking(c), models: modelViews(c) });
   const listView = (c: Conn) => ({ connection_id: c.id, default_model: c.model, custom_thinking: customThinking(c), models: modelViews(c) });
   /** The connection's model is always an enabled entry of its list; with none, the first enabled one becomes it. */
   const settle = (c: Conn) => {
@@ -221,7 +262,10 @@ export function fakeServer() {
     }
     if (path === "/v1/me" && req.method === "GET") return ok({ id: user, actor: user, is_org_admin: admin(user) });
     if (path === "/v1/runners" && req.method === "GET") {
-      return ok({ runners: [...state.runners.values()].filter((x) => visibleRunner(x, user)).map((x) => runnerJson(x, user)) });
+      return ok({
+        runners: [...state.runners.values()].filter((x) => visibleRunner(x, user)).map((x) => runnerJson(x, user)),
+        ...(state.attachIfEmpty ? { attach_if_empty: true } : {}),
+      });
     }
     if (path === "/v1/runners" && req.method === "POST") {
       if (!body?.name?.trim()) return err(400, "name is required");
@@ -229,11 +273,22 @@ export function fakeServer() {
       const created = addRunner(body.name.trim(), body.visibility, user);
       return ok({ runner: runnerJson(created, user), token: created.token }, 201);
     }
-    if ((r = m(/^\/v1\/runners\/([^/]+)(\/token)?$/))) {
+    if ((r = m(/^\/v1\/runners\/([^/]+)(\/token|\/update)?$/))) {
       const runner = state.runners.get(decodeURIComponent(r[1]));
       if (!visibleRunner(runner, user)) return err(404, "no such runner");
       if (!runnerJson(runner!, user).can_manage) return err(403, "only an organization admin can manage an organization runner");
-      if (r[2] && req.method === "POST") {
+      if (r[2] === "/update" && req.method === "POST") {
+        if (state.rejectRunnerUpdate.has(runner!.id)) return err(403, "not permitted to update this runner");
+        const release = state.runnerRelease.get(runner!.id);
+        if (!release || !release.update.available || release.update.latest !== body?.version ||
+            !release.presence.online || !release.presence.self_update || release.update.pending) {
+          return err(409, "runner isn't eligible");
+        }
+        const pending = { target: body.version, requested_at: Date.now() };
+        release.update.pending = pending;
+        return ok({ pending }, 202);
+      }
+      if (r[2] === "/token" && req.method === "POST") {
         runner!.token = `metro_rt_v2_secret${nextId++}`;
         return ok({ token: runner!.token });
       }
@@ -243,8 +298,9 @@ export function fakeServer() {
         return ok(undefined, 204);
       }
     }
-    if (path === "/v1/provider-catalog" && req.method === "GET") return ok(CATALOG);
+    if (path === "/v1/provider-catalog" && req.method === "GET") return ok({ ...CATALOG, allowed_base_urls: state.allowedBaseUrls });
     if (path === "/v1/providers" && req.method === "GET") {
+      if (state.providersReadStatus !== 200) return err(state.providersReadStatus, "could not load connections");
       return ok({ connections: [...state.connections.values()].filter((c) => c.owner === user).map(connJson) });
     }
     if (path === "/v1/providers" && req.method === "POST") {
@@ -283,6 +339,12 @@ export function fakeServer() {
             owner_id: c.owner, execution,
             runs_on: owned ? "your_connection" : preset ? "your_own_sign_in" : "owner_connection",
             billing: owned || preset ? "you" : "owner",
+            ...(state.chatInventory && c.capability === "chat" ? {
+              chat_models: modelViews(c).filter((m) => m.enabled).map((m) => ({
+                id: m.model_id, display_name: m.display_name, reasoning_efforts: m.reasoning_efforts,
+                is_default: m.is_default, available: m.available,
+              })),
+            } : {}),
             ...(preset ? { ready: [...state.connections.values()].some((x) => x.owner === user && x.provider_id === "device-openai-oauth" && !!x.model) } : {}),
             is_default: owned && c.is_default,
           };
@@ -388,6 +450,46 @@ export function fakeServer() {
         }
       }
       if (!r[2] && req.method === "PATCH") {
+        if (body.base_url !== undefined) {
+          const provider = CATALOG.providers.find((p) => p.id === c.provider_id);
+          if (device || !provider?.allow_custom_url) return err(400, "not a custom server connection", "endpoint_rejected");
+          const url = body.base_url;
+          const conflict = () => err(409, "the connection changed while this change was being saved; reload it and try again", "endpoint_conflict");
+          const revision = endpointRev(c);
+          if (body.expected_endpoint_revision !== undefined && body.expected_endpoint_revision !== String(revision)) return conflict();
+          if (!state.allowedBaseUrls.includes(url)) return err(400, "base_url must be exactly one of this server's allowed_base_urls", "endpoint_not_approved");
+          if (url !== c.base_url) {
+            const refusal = state.endpointRefusals.get(url);
+            if (refusal?.code === "endpoint_probe_busy") return err(refusal.status, refusal.error, refusal.code);
+            state.endpointProbes.push(url);
+            if (state.heldEndpointProbes.delete(url)) {
+              state.finishEndpointProbes.set(url, () => {
+                state.finishEndpointProbes.delete(url);
+                if (state.connections.get(c.id) === c && endpointRev(c) === revision) {
+                  c.base_url = url;
+                  bumpEndpointRev(c);
+                }
+              });
+              return err(504, "Gateway Timeout");
+            }
+            if (refusal) return err(refusal.status, refusal.error, refusal.code);
+            const concurrent = state.endpointConcurrentEdits.get(url);
+            if (concurrent) {
+              state.endpointConcurrentEdits.delete(url);
+              c.name = concurrent.name;
+              c.base_url = concurrent.baseUrl;
+              bumpEndpointRev(c);
+              return conflict();
+            }
+            c.base_url = url;
+            bumpEndpointRev(c);
+            const ack = state.endpointAck.get(url);
+            state.endpointAck.delete(url);
+            if (ack === "lost") return { error: "fixture lost the response" };
+            if (ack === "malformed") return ok({ unexpected: true });
+          }
+          return ok(connJson(c));
+        }
         if (body.name !== undefined) c.name = body.name;
         if (body.model !== undefined) {
           c.model = body.model;
@@ -395,6 +497,7 @@ export function fakeServer() {
         }
         if (body.api_key !== undefined) c.key = body.api_key || null;
         if (body.is_default) for (const x of state.connections.values()) if (x.owner === user && x.capability === c.capability) x.is_default = x.id === c.id;
+        bumpEndpointRev(c);
         return ok({ connection: connJson(c) });
       }
       if (!r[2] && req.method === "DELETE") {
@@ -461,6 +564,16 @@ export function fakeServer() {
         space.runnerToken = null;
         return ok({});
       }
+      if (rest === "/runner/attach-if-empty" && req.method === "POST") {
+        if (!state.attachIfEmpty || state.missingEmptyAttachRoute) return err(404, "unknown route");
+        if (!owner) return err(403, "only the owner manages the runner");
+        const runner = state.runners.get(body?.runner_id ?? "");
+        if (!visibleRunner(runner, user)) return err(404, "no such runner");
+        state.beforeEmptyAttach?.(space.id);
+        if (space.runnerToken || state.attached.has(space.id)) return err(409, "this Space already has a runner");
+        state.attached.set(space.id, runner!.id);
+        return ok({ runner: spaceRunnerJson(space) });
+      }
       if (rest === "/runner") {
         if (req.method === "GET") return ok({ runner: spaceRunnerJson(space) });
         if (!owner) return err(403, "only the owner manages the runner");
@@ -501,12 +614,12 @@ export function fakeServer() {
           const toAgent = body.invoke_agent || mentions.some((x: any) => x.kind === "agent");
           const toUsers = mentions.some((x: any) => x.kind === "user");
           const audience = toAgent && toUsers ? "mixed" : toAgent ? "agent" : toUsers ? "users" : "room";
-          const ev = post(key, { kind: "message", actor: user, text: body.text, mentions, audience });
+          const ev = post(key, { kind: "message", actor: user, ...spaceMessageText(body), mentions, audience });
           if (toAgent) {
             post(key, { kind: "agent", actor: "agent", text: `(agent) on it: ${body.text}` });
             react(key, ev.id, "👀", true, "agent", "agent");
           }
-          return ok({}, 202);
+          return ok({ ...ev, addressing_note: null, routing_note: null }, 202);
         }
         if (rr[2] === "demo") {
           if (!space.runnerToken && !state.attached.has(space.id)) return err(409, "this Space has no runner");
@@ -542,6 +655,16 @@ export function fakeServer() {
   for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"]) {
     network[`${method} ${BASE}/v1/*`] = (req: Req) => {
       const u = new URL(req.url);
+      if (method === "PATCH" && /^\/v1\/providers\/[^/]+$/.test(u.pathname) && req.body) {
+        const url = JSON.parse(req.body).base_url;
+        if (state.heldEndpointRequests.delete(url)) {
+          state.forwardEndpointRequests.set(url, () => {
+            state.forwardEndpointRequests.delete(url);
+            return handle(req) as { status?: number; body?: unknown };
+          });
+          return err(504, "Gateway Timeout");
+        }
+      }
       const token = (header(req, "authorization") ?? "").replace(/^Bearer /, "");
       const late = slow.get(`${u.pathname}${u.search} ${token}`) ?? slow.get(`${u.pathname} ${token}`);
       if (late) {

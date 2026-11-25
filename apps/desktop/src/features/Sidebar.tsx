@@ -5,7 +5,6 @@ import {
   activeSpaceId,
   connectedTo,
   createRoom,
-  createSpace,
   creatingRoom,
   creatingSpace,
   isActiveRun,
@@ -25,13 +24,16 @@ import {
 } from "../store";
 import type { Room } from "../store";
 import { goPages, pages, pagesRoute } from "../pagesState";
-import { AccountMenu, Action, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailBrand, RailButton, ResizeHandle, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
+import { dismissRunnerOffer, runnerOfferCount, watchInstalledRunner } from "../runnersState";
+import { AccountMenu, Action, Banner, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailBrand, RailButton, ResizeHandle, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
 import type { AccountMenuItem, Tone } from "../ui";
 import { loadSavedServers, signOut } from "../savedWorkspaces";
+import { settingsPageDot } from "./SettingsView";
 import { WorkspaceDialogs, workspaceItems, WorkspaceNotice } from "./WorkspaceSwitcher";
 import { PersonAvatar } from "./profile/PersonAvatar";
 import { profileName } from "./profile/profileState";
 import { openSpaceSettings } from "./space/spaceSettingsState";
+import { CreateSpaceForm } from "./CreateSpaceForm";
 
 /**
  * The app's navigation: Chat, Library, Scheduled tasks, the Spaces and their
@@ -45,6 +47,7 @@ import { openSpaceSettings } from "./space/spaceSettingsState";
  * Space name is still there when it opens again.
  */
 export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
+  watchInstalledRunner();
   return (
     <>
       <Surface variant="sidebar" testID="sidebar" hidden={props.mode !== "full"} width={navigationPanel.width()}>
@@ -66,11 +69,12 @@ export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
           <NavItem testID="nav-pages" label="Pages" icon="file" selected={mainPlace() === "pages" && pagesRoute().kind === "home" && !pagesRoute().spaceId} onPress={() => goPages()} />
           <PinnedPages />
           <NavItem testID="nav-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
-          <SpacesSection />
+          <SpacesSection visible={props.mode === "full"} />
         </ScrollArea>
 
         <Column padX={2} padY={2} gap={1}>
-          <NavItem testID="nav-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
+          <NavItem testID="nav-settings" label="Settings" icon="settings" dot={settingsPageDot("about")}
+            selected={settingsOpen()} onPress={() => openSettings()} />
         </Column>
         <AccountFooter />
       </Surface>
@@ -125,7 +129,8 @@ function SidebarRail() {
           }}
         />
       </ScrollArea>
-      <RailButton testID="rail-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
+      <RailButton testID="rail-settings" label="Settings" icon="settings" dot={settingsPageDot("about")} dotTestID="settings-update-dot"
+        selected={settingsOpen()} onPress={() => openSettings()} />
       <AccountFooter compact />
     </Surface>
   );
@@ -144,15 +149,9 @@ const activeRunCount = () => runs().filter(isActiveRun).length;
 /** An agent run is going on in this Space (from the runs the app already loaded). */
 const spaceRunning = (sid: string) => runs().some((r) => r.spaceId === sid && isActiveRun(r));
 
-function SpacesSection() {
+function SpacesSection(props: { visible: boolean }) {
   const adding = addingSpace;
   const name = signal("");
-  const submit = async () => {
-    if (await createSpace(name())) {
-      name.set("");
-      adding.set(false);
-    }
-  };
   const spaceExpanded = (sid: string) => (mainPlace() === "space" && activeSpaceId() === sid)
     || (mainPlace() === "pages" && pagesRoute().spaceId === sid);
   return (
@@ -169,10 +168,23 @@ function SpacesSection() {
           onPress: () => adding.set(!adding()),
         }}
       />
+      <If when={!creatingSpace() && runnerOfferCount()}>
+        {(count) => (
+          <Banner testID="runner-offer" tone="neutral" variant="inline" title="Use this computer's runner?"
+            message={`${count()} of your Spaces ${count() === 1 ? "has" : "have"} no runner. Attaching lets their agents list and read files in a folder on this computer.`}>
+            <Row gap={1} wrap>
+              <Action compact testID="runner-offer-choose" label="Choose Spaces…" variant="ghost"
+                onPress={() => { if (!creatingSpace() && runnerOfferCount()) openSettings("runners"); }} />
+              <Action compact testID="runner-offer-dismiss" label="Not now" variant="ghost"
+                onPress={() => { if (!creatingSpace() && runnerOfferCount()) dismissRunnerOffer(); }} />
+            </Row>
+          </Banner>
+        )}
+      </If>
       <If when={adding()}>
         <Column padX={2} padY={1} gap={2}>
-          <Field testID="new-space-name" accessibilityLabel="New Space name" value={name()} onChange={name.set} placeholder="Space name" autoFocus maxLength={80} onSubmit={() => void submit()} />
-          <Action testID="create-space" label="Create Space" busyLabel="Creating…" busy={creatingSpace()} variant="primary" onPress={() => void submit()} />
+          <CreateSpaceForm name={name} setName={name.set} visible={props.visible}
+            onCreated={() => { name.set(""); adding.set(false); }} />
         </Column>
       </If>
       <Each of={spaces()} key={(space) => space.id}>
@@ -374,6 +386,7 @@ function AccountFooter(props: { compact?: boolean }) {
   // out ends this session and forgets its server's token in memory.
   const items = (): readonly AccountMenuItem[] => [
     ...workspaceItems(),
+    ...(settingsPageDot("about") ? [{ id: "account-update", label: "Update available", onPress: () => openSettings("about") }] : []),
     { id: "copy-server-url", label: "Copy server URL", icon: "copy", onPress: () => copy(connectedTo(), "Server URL copied") },
     { id: "copy-id", label: "Copy ID", icon: "copy", onPress: () => copy(me(), "ID copied") },
     { id: "disconnect", label: "Sign out", icon: "logout", destructive: true, onPress: () => signOut() },

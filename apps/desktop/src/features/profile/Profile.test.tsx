@@ -149,6 +149,7 @@ test("Settings › Profile edits the name and bio, and sets, changes and removes
   await app.waitFor("id:profile-name");
   expect(app.value("id:profile-name")).toBe("Alice Moreno");
   expect(app.value("id:profile-bio")).toBe("Runs the Acme rollout.");
+  expect(app.shows("text:Your account on 127.0.0.1:8787")).toBe(true);
   expect(app.shows("id:profile-id")).toBe(true);
   // The stable id copies with one press; Save stays in the fixed footer.
   await app.press("id:profile-id-copy");
@@ -157,6 +158,11 @@ test("Settings › Profile edits the name and bio, and sets, changes and removes
   expect(app.shows("id:profile-settings:footer >> id:profile-save")).toBe(true);
   expect(app.enabled("id:profile-save")).toBe(false); // nothing changed yet
   expect(app.shows("id:profile-picture-remove")).toBe(false); // no picture: initials
+  await app.type("id:profile-bio", " Temporary.");
+  await app.waitFor("id:profile-unsaved");
+  await app.press("id:profile-revert");
+  expect(app.value("id:profile-bio")).toBe("Runs the Acme rollout.");
+  expect(calls(w, "/v1/me/profile", "PATCH")).toHaveLength(0);
 
   // Name and bio.
   await app.clear("id:profile-name");

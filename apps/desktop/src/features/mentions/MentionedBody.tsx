@@ -109,7 +109,9 @@ export function MentionedBody(props: { event: RoomEvent; sid: string; pieces: re
                     accessibilityLabel={info() ? `${info()!.name}, mentioned. Open card.` : generic() ? label() : `${label()}, unavailable`}
                     ref={node => { anchor = node; }}
                     onPress={info() ? () => {
-                      if (info() && anchor) card.set({ piece: piece(), eventId: props.event.id, scope: composerScope(), anchor });
+                      if (anchor && localMentionIdentity(props.sid, piece().mention)) {
+                        card.set({ piece: piece(), eventId: props.event.id, scope: composerScope(), anchor });
+                      }
                     } : undefined}
                   />;
                 }}

@@ -202,14 +202,18 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
-        Self::start_with(None).await
+        Self::start_with(None, &[]).await
     }
 
     /// A server on a database file, so a test can read its tables.
     async fn start_on_file() -> Self {
+        Self::start_on_file_allow(&[]).await
+    }
+
+    async fn start_on_file_allow(additional_endpoints: &[String]) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("metro.db");
-        Self::start_with(Some((dir, path))).await
+        Self::start_with(Some((dir, path)), additional_endpoints).await
     }
 
     fn sqlite(&self) -> rusqlite::Connection {
@@ -221,7 +225,10 @@ impl Server {
         conn
     }
 
-    async fn start_with(db_file: Option<(tempfile::TempDir, std::path::PathBuf)>) -> Self {
+    async fn start_with(
+        db_file: Option<(tempfile::TempDir, std::path::PathBuf)>,
+        additional_endpoints: &[String],
+    ) -> Self {
         let fixture = Fixture::start().await;
         let db = match &db_file {
             Some((_, path)) => Db::open(path).unwrap(),
@@ -240,8 +247,9 @@ impl Server {
         let mut state = AppState::new(config, db, auth()).await.unwrap();
         let master =
             MasterKey::parse(&base64::engine::general_purpose::STANDARD.encode([9u8; 32])).unwrap();
-        state.providers =
-            ProviderService::new(Some(master), vec![fixture.base_url.clone()]).unwrap();
+        let mut allowed = vec![fixture.base_url.clone()];
+        allowed.extend_from_slice(additional_endpoints);
+        state.providers = ProviderService::new(Some(master), allowed).unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let app = router(state.clone());
@@ -852,6 +860,418 @@ fn rows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         .iter()
         .map(|(u, a)| ((*u).to_owned(), (*a).to_owned()))
         .collect()
+}
+
+#[tokio::test]
+async fn library_model_compare_and_save_preserves_the_index_on_stale_writes() {
+    let s = Server::start_on_file().await;
+    let create = |name: &'static str| {
+        let s = &s;
+        async move {
+            s.create(
+                ALICE,
+                json!({"name": name, "provider_id": "embeddinggemma-2", "base_url": s.fixture.base_url}),
+            )
+            .await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let (a, b) = (create("A").await, create("B").await);
+    let path = "/v1/library/settings";
+    let guarded_path = "/v1/library/settings/selection";
+    let read = || s.send(reqwest::Method::GET, ALICE, path, None);
+    let put = |body| s.send(reqwest::Method::PUT, ALICE, guarded_path, Some(body));
+    let (status, initial) = read().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(initial["selection_precondition"], true);
+    assert_eq!(initial["embedding_id"], Value::Null);
+
+    // A's view still has no model; a legacy window can save B as before.
+    let (status, saved) = s
+        .send(
+            reqwest::Method::PUT,
+            ALICE,
+            path,
+            Some(json!({"embedding_id": b})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["embedding_id"], b);
+    seed_index(&s, "alice", "alice-index", &b);
+    seed_index(&s, "bob", "bob-index", &b);
+    let intact = (rows(&[("alice", "alice-index"), ("bob", "bob-index")]), 2);
+
+    for body in [
+        json!({"embedding_id": a, "expected_embedding_id": null}),
+        json!({"embedding_id": null, "expected_embedding_id": a}),
+        json!({"embedding_id": b, "expected_embedding_id": a}),
+    ] {
+        let (status, error) = put(body).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            error["error"],
+            "the saved media model changed; reload it before saving"
+        );
+        assert_eq!(read().await.1["embedding_id"], b);
+        assert_eq!(index_rows(&s), intact);
+    }
+    for body in [
+        json!({"embedding_id": null}),
+        json!({"expected_embedding_id": b}),
+        json!({"embedding_id": null, "expected_embedding_id": 1}),
+        json!({"embedding_id": null, "expected_embedding_id": b, "unknown": true}),
+    ] {
+        assert_eq!(put(body).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(index_rows(&s), intact);
+    }
+    assert_eq!(
+        put(json!({"embedding_id": b, "expected_embedding_id": b}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(index_rows(&s), intact);
+
+    let shared = s.space(ALICE, "Shared", &["bob"]).await;
+    s.share(
+        ALICE,
+        &a,
+        json!({"visibility": "spaces", "space_ids": [shared]}),
+    )
+    .await;
+    assert_eq!(
+        s.send(
+            reqwest::Method::PUT,
+            BOB,
+            guarded_path,
+            Some(json!({"embedding_id": a, "expected_embedding_id": null})),
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(index_rows(&s), intact);
+
+    let (status, replaced) = put(json!({"embedding_id": a, "expected_embedding_id": b})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replaced["embedding_id"], a);
+    let others = (rows(&[("bob", "bob-index")]), 1);
+    assert_eq!(index_rows(&s), others);
+    seed_index(&s, "alice", "alice-index", &a);
+    let (status, cleared) = put(json!({"embedding_id": null, "expected_embedding_id": a})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cleared["embedding_id"], Value::Null);
+    assert_eq!(index_rows(&s), others);
+    assert_eq!(
+        put(json!({"embedding_id": b, "expected_embedding_id": null}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
+async fn library_operations_reject_stale_selection_and_never_publish_after_aba() {
+    let s = Server::start_on_file().await;
+    let path = "/v1/library/settings";
+    let put = |id: String| {
+        s.send(
+            reqwest::Method::PUT,
+            ALICE,
+            path,
+            Some(json!({"embedding_id": id})),
+        )
+    };
+    let read = || s.send(reqwest::Method::GET, ALICE, path, None);
+    let index = |asset: String, rev: Value| {
+        s.post(
+            ALICE,
+            "/v1/library/index/selection",
+            json!({
+                "asset_id": asset, "selection_revision": rev,
+            }),
+        )
+    };
+    let search = |rev: Value| {
+        s.post(
+            ALICE,
+            "/v1/library/search/selection",
+            json!({
+                "query": "private query", "scope": "personal", "selection_revision": rev,
+            }),
+        )
+    };
+    let create = |name| {
+        s.create(
+            ALICE,
+            json!({
+                "name": name, "provider_id": "embeddinggemma-2", "base_url": s.fixture.base_url,
+            }),
+        )
+    };
+    let a = create("A").await["id"].as_str().unwrap().to_owned();
+    let b = create("B").await["id"].as_str().unwrap().to_owned();
+    let empty = read().await.1["selection_revision"].clone();
+    let saved_a = put(a.clone()).await;
+    assert_eq!(saved_a.0, StatusCode::OK);
+    let saved_b = put(b.clone()).await;
+    assert_eq!(saved_b.0, StatusCode::OK);
+    let b_rev = saved_b.1["selection_revision"].clone();
+    let uploaded = s
+        .http
+        .post(format!(
+            "{}/v1/library/assets?scope=personal&name=private.pdf",
+            s.base
+        ))
+        .bearer_auth(ALICE)
+        .header("content-type", "application/pdf")
+        .body("%PDF-1.7\nprivate PDF fixture")
+        .send()
+        .await
+        .unwrap();
+    let status = uploaded.status();
+    let asset: Value = uploaded.json().await.unwrap();
+    assert_eq!(status, StatusCode::CREATED, "{asset}");
+    let id = asset["id"].as_str().unwrap().to_owned();
+    let (status, answer) = index(id.clone(), b_rev.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let n = s.fixture.seen("/v1/media/embeddings").len();
+    assert_eq!(n, 1);
+    for stale in [empty, saved_a.1["selection_revision"].clone()] {
+        for (status, error) in [index(id.clone(), stale.clone()).await, search(stale).await] {
+            assert_eq!(status, StatusCode::CONFLICT, "{error}");
+            assert_eq!(error["code"], "library_selection_changed");
+        }
+    }
+    assert_eq!(
+        s.fixture.seen("/v1/media/embeddings").len(),
+        n,
+        "no file or query reached B"
+    );
+    let (status, answer) = search(b_rev.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(s.fixture.seen("/v1/media/embeddings").len(), n + 1);
+
+    let gate = s.fixture.gate.write().await;
+    let late = index(id, b_rev);
+    let switch = async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while s.fixture.seen("/v1/media/embeddings").len() < n + 2 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(put(a).await.0, StatusCode::OK);
+        assert_eq!(put(b).await.0, StatusCode::OK);
+        drop(gate);
+    };
+    let ((status, answer), ()) = tokio::join!(late, switch);
+    assert_eq!(status, StatusCode::CONFLICT, "{answer}");
+    assert_eq!(answer["code"], "library_selection_changed");
+    assert_eq!(index_rows(&s), (vec![], 0));
+}
+
+#[tokio::test]
+async fn library_endpoint_move_invalidates_owner_and_borrower_actions_for_the_same_id() {
+    let b = Fixture::start().await;
+    let s = Server::start_on_file_allow(std::slice::from_ref(&b.base_url)).await;
+    let a = &s.fixture;
+    let owner = s
+        .create(
+            ALICE,
+            json!({"name": "Shared", "provider_id": "embeddinggemma-2",
+                   "base_url": a.base_url, "api_key": MEDIA_KEY}),
+        )
+        .await;
+    let shared = owner["id"].as_str().unwrap();
+    s.share(ALICE, shared, json!({"visibility": "organization"}))
+        .await;
+    let unrelated = s
+        .create(
+            CAROL,
+            json!({"name": "Unrelated", "provider_id": "embeddinggemma-2", "base_url": a.base_url}),
+        )
+        .await;
+    let unrelated = unrelated["id"].as_str().unwrap();
+    let settings = "/v1/library/settings";
+    let select = |user, id| {
+        s.send(
+            reqwest::Method::PUT,
+            user,
+            settings,
+            Some(json!({"embedding_id": id})),
+        )
+    };
+    let read = |user| s.send(reqwest::Method::GET, user, settings, None);
+    let index = |user, asset, revision: Value| {
+        s.post(
+            user,
+            "/v1/library/index/selection",
+            json!({"asset_id": asset, "selection_revision": revision}),
+        )
+    };
+    let search = |revision: Value| {
+        s.post(
+            BOB,
+            "/v1/library/search/selection",
+            json!({"query": "borrower's private query", "scope": "personal",
+                   "selection_revision": revision}),
+        )
+    };
+    let prefs = "/v1/model-routing";
+    let (status, message_prefs) = s
+        .send(
+            reqwest::Method::PUT,
+            BOB,
+            prefs,
+            Some(json!({"embedding_id": shared})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{message_prefs}");
+
+    const PDF: &str = "%PDF-1.7\nprivate PDF fixture";
+    let mut entries = Vec::new();
+    for (user, connection) in [(ALICE, shared), (BOB, shared), (CAROL, unrelated)] {
+        let (status, saved) = select(user, connection).await;
+        assert_eq!(status, StatusCode::OK, "{saved}");
+        let response = s
+            .http
+            .post(format!(
+                "{}/v1/library/assets?scope=personal&name=private.pdf",
+                s.base
+            ))
+            .bearer_auth(user)
+            .header("content-type", "application/pdf")
+            .body(PDF)
+            .send()
+            .await
+            .unwrap();
+        let status = response.status();
+        let asset: Value = response.json().await.unwrap();
+        assert_eq!(status, StatusCode::CREATED, "{asset}");
+        let id = asset["id"].as_str().unwrap().to_owned();
+        let (status, answer) = index(user, id.clone(), saved["selection_revision"].clone()).await;
+        assert_eq!(status, StatusCode::OK, "{answer}");
+        entries.push((id, saved));
+    }
+    let [
+        (alice_asset, alice_old),
+        (bob_asset, bob_old),
+        (carol_asset, carol_old),
+    ] = entries.as_slice()
+    else {
+        unreachable!()
+    };
+    assert_eq!(a.seen("/v1/media/embeddings").len(), 3);
+    assert_eq!(index_rows(&s).1, 6);
+
+    let path = format!("/v1/providers/{shared}");
+    let patch = |url: &str| {
+        s.send(
+            reqwest::Method::PATCH,
+            ALICE,
+            &path,
+            Some(
+                json!({"base_url": url, "expected_endpoint_revision": owner["endpoint_revision"]}),
+            ),
+        )
+    };
+    // A no-op endpoint save changes neither consent nor the index.
+    assert_eq!(patch(&a.base_url).await.0, StatusCode::OK);
+    assert_eq!(read(BOB).await.1, *bob_old);
+    assert_eq!(index_rows(&s).1, 6);
+
+    // The borrower already sent a file to A, but the answer is held while
+    // the owner moves the connection. It cannot republish A's embeddings.
+    let gate = a.gate.write().await;
+    let held = index(
+        BOB,
+        bob_asset.clone(),
+        bob_old["selection_revision"].clone(),
+    );
+    let move_endpoint = async {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while a.seen("/v1/media/embeddings").len() < 4 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let (status, moved) = patch(&b.base_url).await;
+        assert_eq!(status, StatusCode::OK, "{moved}");
+        assert_eq!(moved["id"], shared);
+        assert_eq!(moved["base_url"], b.base_url);
+        assert_eq!(index_rows(&s), (rows(&[("carol", carol_asset)]), 2));
+        drop(gate);
+    };
+    let ((status, held_result), ()) = tokio::join!(held, move_endpoint);
+    assert_eq!(status, StatusCode::CONFLICT, "{held_result}");
+    assert_eq!(held_result["code"], "library_selection_changed");
+    assert_eq!(index_rows(&s), (rows(&[("carol", carol_asset)]), 2));
+    assert!(b.seen("/v1/media/embeddings").is_empty());
+
+    let alice_new = read(ALICE).await.1;
+    let bob_new = read(BOB).await.1;
+    for (before, after) in [(alice_old, &alice_new), (bob_old, &bob_new)] {
+        assert_eq!(after["embedding_id"], before["embedding_id"]);
+        assert_ne!(after["selection_revision"], before["selection_revision"]);
+    }
+    assert_eq!(read(CAROL).await.1, *carol_old);
+    assert_eq!(
+        s.send(reqwest::Method::GET, BOB, prefs, None).await,
+        (StatusCode::OK, message_prefs)
+    );
+    let rev = bob_new["selection_revision"].clone();
+    assert_eq!(
+        bob_new,
+        json!({"embedding_id": shared, "selection_precondition": true, "selection_revision": rev})
+    );
+    let models = s.available(BOB, "").await;
+    let borrowed = find(&models, shared).unwrap().to_string();
+    for private in [&b.base_url, &a.base_url, MEDIA_KEY, "endpoint_revision"] {
+        assert!(!borrowed.contains(private));
+    }
+
+    // Seed a live B index first, so a fail-open stale Search would send
+    // the query to B instead of simply finding an empty index.
+    let (status, answer) = index(BOB, bob_asset.clone(), rev.clone()).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    let sent = b.seen("/v1/media/embeddings");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0].body["asset"]["data_base64"], b64(PDF.as_bytes()));
+    for (status, error) in [
+        index(
+            BOB,
+            bob_asset.clone(),
+            bob_old["selection_revision"].clone(),
+        )
+        .await,
+        index(
+            ALICE,
+            alice_asset.clone(),
+            alice_old["selection_revision"].clone(),
+        )
+        .await,
+        search(bob_old["selection_revision"].clone()).await,
+    ] {
+        assert_eq!(status, StatusCode::CONFLICT, "{error}");
+        assert_eq!(error["code"], "library_selection_changed");
+    }
+    assert_eq!(
+        b.seen("/v1/media/embeddings").len(),
+        1,
+        "no stale file or query reached B"
+    );
+    let (status, answer) = search(rev).await;
+    assert_eq!(status, StatusCode::OK, "{answer}");
+    assert_eq!(answer["results"][0]["asset_id"], *bob_asset);
+    let sent = b.seen("/v1/media/embeddings");
+    assert_eq!(sent.len(), 2);
+    assert_eq!(sent[1].body["query"], "borrower's private query");
+    assert_eq!(a.seen("/v1/media/embeddings").len(), 4);
 }
 
 #[tokio::test]

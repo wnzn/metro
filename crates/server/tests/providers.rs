@@ -666,20 +666,33 @@ async fn changing_endpoint_tests_before_saving_and_keeps_connection_settings() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{initial_share}");
+    let (status, available) = s.get(BOB, "/v1/models/available").await;
+    assert_eq!(status, StatusCode::OK, "{available}");
+    let shared = available["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["connection_id"] == c["id"])
+        .unwrap();
+    assert!(shared.get("endpoint_revision").is_none());
 
-    assert_eq!(
-        s.patch(BOB, &path, json!({"base_url": new.base_url}))
-            .await
-            .0,
-        StatusCode::NOT_FOUND
-    );
-    for rejected in [
-        Value::Null,
-        json!(format!("{}/not-allowlisted", new.base_url)),
-        json!(format!("{}?not-allowed", new.base_url)),
+    let (status, body) = s.patch(BOB, &path, json!({"base_url": new.base_url})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "endpoint_missing");
+    for (rejected, code) in [
+        (Value::Null, "endpoint_rejected"),
+        (
+            json!(format!("{}/not-allowlisted", new.base_url)),
+            "endpoint_not_approved",
+        ),
+        (
+            json!(format!("{}?not-allowed", new.base_url)),
+            "endpoint_rejected",
+        ),
     ] {
-        let (status, _) = s.patch(ALICE, &path, json!({"base_url": rejected})).await;
+        let (status, body) = s.patch(ALICE, &path, json!({"base_url": rejected})).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], code);
     }
     let device = s
         .connect(
@@ -706,6 +719,7 @@ async fn changing_endpoint_tests_before_saving_and_keeps_connection_settings() {
             "base_url": fixture.base_url, "api_key": "failed-probe-key", "name": "not saved",
         })).await;
         assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+        assert_eq!(response["code"], "endpoint_probe_failed");
         assert!(
             response["error"]
                 .as_str()
@@ -847,7 +861,8 @@ async fn endpoint_probe_cannot_overwrite_a_concurrent_edit() {
         "name": "Connection", "provider_id": "custom", "base_url": old.base_url, "model": "keep",
     })).await;
     let path = format!("/v1/providers/{}", c["id"].as_str().unwrap());
-    let patch = s.patch(ALICE, &path, json!({"base_url": new}));
+    let stale_body = json!({"base_url": new, "expected_endpoint_revision": c["endpoint_revision"]});
+    let patch = s.patch(ALICE, &path, stale_body.clone());
     let concurrent = async {
         tokio::time::timeout(Duration::from_secs(5), arrived.notified())
             .await
@@ -863,9 +878,38 @@ async fn endpoint_probe_cannot_overwrite_a_concurrent_edit() {
     };
     let ((status, body), ()) = tokio::join!(patch, concurrent);
     assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "endpoint_conflict");
     let saved = s.connection(ALICE, &c["id"]).await;
     assert_eq!(saved["name"], "Name changed");
     assert_eq!(saved["base_url"], old.base_url);
+    assert_ne!(saved["endpoint_revision"], c["endpoint_revision"]);
+    // Like a request still at the gateway: Metro first reads the row only
+    // after the concurrent edit. It must not start another probe.
+    let (status, refused) =
+        tokio::time::timeout(Duration::from_secs(2), s.patch(ALICE, &path, stale_body))
+            .await
+            .expect("stale client token must fail before the held upstream");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(refused["code"], "endpoint_conflict");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), arrived.notified())
+            .await
+            .is_err()
+    );
+    // Only a new, explicit PATCH can make the change after reviewing the row.
+    reply.notify_one();
+    let (status, retried) = s
+        .patch(
+            ALICE,
+            &path,
+            json!({
+                "base_url": new, "expected_endpoint_revision": saved["endpoint_revision"],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{retried}");
+    assert_eq!(retried["base_url"], new);
+    assert_eq!(retried["name"], "Name changed");
 }
 
 #[tokio::test]

@@ -19,7 +19,9 @@
 //   form that holds it clears it as soon as it is sent.
 
 import { batch, computed, effect, signal, untracked } from "nsh";
-import { ApiError } from "./api/client";
+import { ApiError, EndpointPatchError } from "./api/client";
+import { serverHost } from "./api/serverUrl";
+import type { PageScope } from "./ui";
 import type {
   Capability,
   CatalogProvider,
@@ -34,6 +36,7 @@ import type {
   ProviderConnection,
   ProviderPatch,
   RegisteredRunner,
+  RunnerPending,
   RunnerVisibility,
   SpaceRunner,
 } from "./api/client";
@@ -41,6 +44,7 @@ import {
   activeSpace,
   activeSpaceId,
   apiClient,
+  connectedTo,
   describe,
   disconnect,
   handleManageError,
@@ -57,8 +61,15 @@ import {
   view,
 } from "./store";
 import { forgetQuietly, localConnections, localStep, onLocalPairingChanged, packaged, refreshHelper } from "./device/state";
+import { beginSpaceRunnerObservation, invalidateSpaceRunnerObservations, spaceRunners } from "./spaceRunnerObservations";
+export { spaceRunners } from "./spaceRunnerObservations";
 
 export type { Capability, CatalogProvider, ConnectionModel, DeviceStatus, ModelThinking, NewConnectionModel, ProviderConnection, RegisteredRunner, RunnerVisibility, SpaceRunner };
+
+export function settingsAccountScope(): PageScope | undefined {
+  const server = connectedTo();
+  return server ? { kind: "account", host: serverHost(server) } : undefined;
+}
 
 // ------------------------------------------------------------------ the one-time reveal
 
@@ -125,6 +136,22 @@ export async function loadRunners(): Promise<void> {
     if (!ok() || seq !== runnersSeq) return;
     settingsError(error, runnersError, "Could not load runners");
   }
+}
+
+/** Put an acknowledged update behind the same read fence as runner creation/deletion. */
+export function recordRunnerUpdateAccepted(id: string, pending: RunnerPending, valid: () => boolean): void {
+  if (!valid()) return;
+  runnersSeq++;
+  const list = runners();
+  const runner = list?.find((r) => r.id === id);
+  const update = runner?.update;
+  if (!list || !runner || !update) return;
+  // A late POST acknowledgement must not roll back progress a roster read
+  // has already reported. Later GETs replace this provisional pending value.
+  if (runner.presence?.version === pending.target ||
+      (update.pending && update.pending.requestedAt >= pending.requestedAt) ||
+      (update.lastResult?.target === pending.target && update.lastResult.at > pending.requestedAt)) return;
+  runners.set(list.map((r) => r.id === id ? { ...r, update: { ...update, pending } } : r));
 }
 
 export async function createRunner(nameInput: string, visibility: RunnerVisibility): Promise<boolean> {
@@ -244,10 +271,11 @@ export async function deleteRunner(runnerId: string): Promise<void> {
       runnerNotice.set(`Runner “${runner?.name ?? runnerId}” was deleted. It no longer serves any Space.`);
       // Spaces it served now have no runner; the next Space list refresh confirms it.
       const cached = spaceRunners();
-      const next: Record<string, SpaceRunner | null> = {};
-      for (const [sid, r] of Object.entries(cached)) next[sid] = r?.kind === "registered" && r.id === runnerId ? null : r;
-      spaceRunners.set(next);
-      for (const [sid, r] of Object.entries(cached)) if (r?.kind === "registered" && r.id === runnerId) setRunnerPaired(sid, false);
+      for (const [sid, r] of Object.entries(cached)) {
+        if (r?.kind !== "registered" || r.id !== runnerId) continue;
+        invalidateSpaceRunnerRequests(sid);
+        beginSpaceRunnerObservation(sid).publish(null);
+      }
     });
     void loadRunners();
   } catch (error) {
@@ -261,8 +289,6 @@ const onRunnersPage = () => place() === "settings" && settingsSection() === "run
 
 // ------------------------------------------------------------------ a Space's runner (owner's Manage view)
 
-/** Who serves each Space, as last loaded. Missing: not loaded yet. */
-export const spaceRunners = signal<Record<string, SpaceRunner | null>>({});
 export const activeSpaceRunner = computed(() => {
   const sid = activeSpaceId();
   if (!sid) return undefined;
@@ -274,22 +300,63 @@ export const registeredRunnersSupported = signal(true);
 /** What is in flight in the Manage view: "attach:<id>", "detach", "issue", "revoke". */
 export const spaceRunnerBusy = signal<string | null>(null);
 export const spaceRunnerNotice = signal<string | null>(null);
-let spaceRunnerSeq = 0;
+const spaceRunnerWrites = new Map<string, object>();
 
-export async function loadSpaceRunner(spaceId: string): Promise<void> {
+function runnerRequest(markers: Map<string, object>, sid: string) {
+  const mark = {};
+  markers.set(sid, mark);
+  const ok = sessionGuard(sid);
+  return () => ok() && markers.get(sid) === mark;
+}
+
+function invalidateSpaceRunnerRequests(sid: string) {
+  invalidateSpaceRunnerObservations(sid);
+  // Keep a new marker even after the action settles: becoming empty again
+  // must not restore consent captured before the action.
+  spaceRunnerWrites.set(sid, {});
+}
+
+/** Capture consent to write to this Space as it was at submission. */
+export function snapshotSpaceRunnerWrite(sid: string) {
+  const mark = spaceRunnerWrites.get(sid);
+  const ok = sessionGuard(sid);
+  return () => ok() && spaceRunnerWrites.get(sid) === mark;
+}
+
+/** Compare and mark an exact-Space write before the caller dispatches it in the same turn. */
+export function beginSpaceRunnerWrite(sid: string, expected?: () => boolean) {
+  if (expected && !expected()) return null;
+  invalidateSpaceRunnerObservations(sid);
+  return runnerRequest(spaceRunnerWrites, sid);
+}
+
+/** The POST's reply is historical by the time it arrives. Read the actual assignment. */
+export async function reconcileOwnedSpaceRunner(sid: string, stillLatest: () => boolean) {
   const c = apiClient();
-  if (!c) return;
-  const seq = ++spaceRunnerSeq;
-  const ok = sessionGuard(spaceId);
+  const owns = () => spaces().some((s) => s.id === sid && s.role === "owner");
+  if (!c || !stillLatest() || !owns()) return undefined;
+  const observation = beginSpaceRunnerObservation(sid);
+  const current = await c.getSpaceRunner(sid);
+  if (!stillLatest() || !owns() || !observation.publish(current)) return undefined;
+  return current;
+}
+
+export function loadSpaceRunner(spaceId: string): Promise<void> {
+  return readSpaceRunner(spaceId, () => true);
+}
+
+async function readSpaceRunner(spaceId: string, stillLatest: () => boolean): Promise<void> {
+  const c = apiClient();
+  if (!c || !stillLatest()) return;
+  const observation = beginSpaceRunnerObservation(spaceId);
   try {
     const runner = await c.getSpaceRunner(spaceId);
-    if (!ok() || seq !== spaceRunnerSeq) return;
+    if (!stillLatest()) return;
     batch(() => {
-      registeredRunnersSupported.set(true);
-      spaceRunners.set({ ...spaceRunners(), [spaceId]: runner });
+      if (observation.publish(runner)) registeredRunnersSupported.set(true);
     });
   } catch (error) {
-    if (!ok() || seq !== spaceRunnerSeq || isAborted(error)) return;
+    if (!stillLatest() || !observation.isCurrent() || isAborted(error)) return;
     // 404 for a Space we're still in: this server predates registered runners.
     if (error instanceof ApiError && error.kind === "not_found" && spaces().some((s) => s.id === spaceId)) {
       const legacy = spaces().find((s) => s.id === spaceId)?.runnerPaired;
@@ -299,8 +366,28 @@ export async function loadSpaceRunner(spaceId: string): Promise<void> {
       });
       return;
     }
-    handleManageError(error, "Could not load this Space's runner", spaceId);
+    if (activeSpaceId() === spaceId) handleManageError(error, "Could not load this Space's runner", spaceId);
   }
+}
+
+/** Fence the exact Space before publishing an ack or reading its current assignment. */
+function finishManageRunnerWrite(
+  sid: string, dispatched: () => boolean, runner: SpaceRunner | null | undefined,
+) {
+  // A read sent after dispatch but before this ack can still describe the
+  // pre-commit assignment. Fence it and expire consent captured mid-write.
+  const afterAck = beginSpaceRunnerWrite(sid, dispatched);
+  if (!afterAck) return false;
+  batch(() => {
+    if (runner !== undefined) beginSpaceRunnerObservation(sid).publish(runner);
+    else {
+      // An older server can accept an attach without returning a registration.
+      spaceRunners.set({ ...spaceRunners(), [sid]: null });
+      setRunnerPaired(sid, true);
+    }
+    void readSpaceRunner(sid, afterAck);
+  });
+  return true;
 }
 
 /** Attaches a registered runner to the active Space (owner only). Replaces nothing: detach first. */
@@ -308,7 +395,9 @@ export async function attachRunner(runnerId: string): Promise<void> {
   const sid = activeSpaceId();
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
-  const ok = sessionGuard(sid);
+  const ok = sessionGuard();
+  const dispatched = beginSpaceRunnerWrite(sid);
+  if (!dispatched) return;
   batch(() => {
     spaceRunnerBusy.set(`attach:${runnerId}`);
     spaceRunnerNotice.set(null);
@@ -316,18 +405,14 @@ export async function attachRunner(runnerId: string): Promise<void> {
   });
   try {
     const attached = await c.attachRunner(sid, runnerId);
-    if (!ok()) return;
-    spaceRunnerSeq++;
     const runner = runners()?.find((r) => r.id === runnerId);
-    const value: SpaceRunner | null = attached ?? (runner ? { kind: "registered", id: runner.id, name: runner.name, visibility: runner.visibility } : null);
+    const value: SpaceRunner | undefined = attached ?? (runner ? { kind: "registered", id: runner.id, name: runner.name, visibility: runner.visibility } : undefined);
     batch(() => {
-      spaceRunners.set({ ...spaceRunners(), [sid]: value });
-      setRunnerPaired(sid, true);
-      spaceRunnerNotice.set(`Attached “${value?.kind === "registered" ? value.name : runnerId}”. Jobs from this Space go to it from now on, in its own folder for this Space.`);
+      if (!finishManageRunnerWrite(sid, dispatched, value)) return;
+      spaceRunnerNotice.set(`Attached “${value?.name ?? runnerId}”. Jobs from this Space go to it from now on, in its own folder for this Space.`);
     });
-    if (!attached) void loadSpaceRunner(sid);
   } catch (error) {
-    if (ok()) handleManageError(error, "Could not attach the runner", sid);
+    if (dispatched()) handleManageError(error, "Could not attach the runner", sid);
   } finally {
     if (ok()) spaceRunnerBusy.set(null);
   }
@@ -338,22 +423,22 @@ export async function detachRunner(): Promise<void> {
   const sid = activeSpaceId();
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
-  const ok = sessionGuard(sid);
+  const ok = sessionGuard();
+  const dispatched = beginSpaceRunnerWrite(sid);
+  if (!dispatched) return;
   batch(() => {
     spaceRunnerBusy.set("detach");
     spaceRunnerNotice.set(null);
   });
   try {
     await c.detachRunner(sid);
-    if (!ok()) return;
-    spaceRunnerSeq++;
     batch(() => {
-      spaceRunners.set({ ...spaceRunners(), [sid]: null });
-      setRunnerPaired(sid, false);
-      spaceRunnerNotice.set("Runner detached. It no longer gets jobs from this Space; its other Spaces are unchanged.");
+      if (finishManageRunnerWrite(sid, dispatched, null)) {
+        spaceRunnerNotice.set("Runner detached. It no longer gets jobs from this Space; its other Spaces are unchanged.");
+      }
     });
   } catch (error) {
-    if (ok()) handleManageError(error, "Could not detach the runner", sid);
+    if (dispatched()) handleManageError(error, "Could not detach the runner", sid);
   } finally {
     if (ok()) spaceRunnerBusy.set(null);
   }
@@ -364,7 +449,9 @@ export async function issueDedicatedToken(): Promise<void> {
   const sid = activeSpaceId();
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
-  const ok = sessionGuard(sid);
+  const ok = sessionGuard();
+  const dispatched = beginSpaceRunnerWrite(sid);
+  if (!dispatched) return;
   batch(() => {
     spaceRunnerBusy.set("issue");
     spaceRunnerNotice.set(null);
@@ -372,18 +459,13 @@ export async function issueDedicatedToken(): Promise<void> {
   });
   try {
     const token = await c.issueRunnerToken(sid);
-    if (!ok()) return;
-    spaceRunnerSeq++;
-    batch(() => {
-      spaceRunners.set({ ...spaceRunners(), [sid]: { kind: "dedicated", name: "Dedicated Space runner" } });
-      setRunnerPaired(sid, true);
-    });
+    if (!finishManageRunnerWrite(sid, dispatched, { kind: "dedicated", name: "Dedicated Space runner" })) return;
     // Show it only if the owner is still looking at this Space's management view.
     if (activeSpaceId() === sid && view() === "manage" && place() === "space") {
       reveal({ kind: "dedicated", spaceId: sid, spaceName: activeSpace()?.name ?? sid, token });
     }
   } catch (error) {
-    if (ok()) handleManageError(error, "Could not issue a runner token", sid);
+    if (dispatched()) handleManageError(error, "Could not issue a runner token", sid);
   } finally {
     if (ok()) spaceRunnerBusy.set(null);
   }
@@ -393,7 +475,9 @@ export async function revokeDedicatedToken(): Promise<void> {
   const sid = activeSpaceId();
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
-  const ok = sessionGuard(sid);
+  const ok = sessionGuard();
+  const dispatched = beginSpaceRunnerWrite(sid);
+  if (!dispatched) return;
   batch(() => {
     spaceRunnerBusy.set("revoke");
     spaceRunnerNotice.set(null);
@@ -401,15 +485,13 @@ export async function revokeDedicatedToken(): Promise<void> {
   });
   try {
     await c.revokeRunnerToken(sid);
-    if (!ok()) return;
-    spaceRunnerSeq++;
     batch(() => {
-      spaceRunners.set({ ...spaceRunners(), [sid]: null });
-      setRunnerPaired(sid, false);
-      spaceRunnerNotice.set("Runner token revoked. The runner can no longer serve this Space.");
+      if (finishManageRunnerWrite(sid, dispatched, null)) {
+        spaceRunnerNotice.set("Runner token revoked. The runner can no longer serve this Space.");
+      }
     });
   } catch (error) {
-    if (ok()) handleManageError(error, "Could not revoke the runner token", sid);
+    if (dispatched()) handleManageError(error, "Could not revoke the runner token", sid);
   } finally {
     if (ok()) spaceRunnerBusy.set(null);
   }
@@ -489,21 +571,27 @@ async function loadCatalog(): Promise<void> {
 }
 
 export async function loadConnections(): Promise<void> {
+  await readConnections();
+}
+
+/** Returns only an authoritative list applied to this session, not a cached one. */
+async function readConnections(confirmEndpointOf?: string): Promise<ProviderConnection[] | null> {
   const c = apiClient();
-  if (!c) return;
+  if (!c) return null;
   const seq = ++connectionsSeq;
   const ok = sessionGuard();
   try {
-    const list = await c.listProviders();
-    if (!ok() || seq !== connectionsSeq) return;
+    const list = await c.listProviders(confirmEndpointOf);
+    if (!ok() || seq !== connectionsSeq) return null;
     batch(() => {
       connections.set(list);
       clearProviderError();
     });
     for (const x of list) if (isDeviceConnection(x)) void loadDeviceStatus(x.id);
+    return list;
   } catch (error) {
-    if (!ok() || seq !== connectionsSeq) return;
-    providerError(error, "Could not load your connections");
+    if (ok() && seq === connectionsSeq) providerError(error, "Could not load your connections");
+    return null;
   }
 }
 
@@ -575,9 +663,9 @@ export async function createConnection(body: NewProviderConnection, opts: { fetc
  * is dropped). For a device connection this is also its connection test: it
  * answers only while its metro-connector is online.
  */
-export async function fetchModels(id: string): Promise<void> {
+export async function fetchModels(id: string, afterEndpointChange = false): Promise<void> {
   const c = apiClient();
-  if (!c) return;
+  if (!c || endpointNeedsReload(id)) return;
   const seq = (modelsSeq.get(id) ?? 0) + 1;
   modelsSeq.set(id, seq);
   const ok = sessionGuard();
@@ -585,7 +673,7 @@ export async function fetchModels(id: string): Promise<void> {
   const known = connections()?.find((x) => x.id === id);
   if (known && isDeviceConnection(known)) void loadDeviceStatus(id);
   try {
-    const result = await c.refreshConnectionModels(id);
+    const result = await c.refreshConnectionModels(id, afterEndpointChange);
     if (!ok() || modelsSeq.get(id) !== seq) return;
     batch(() => {
       modelListings.set({ ...modelListings(), [id]: { state: "ok", models: result.models, added: result.added, unavailable: result.unavailable } });
@@ -740,6 +828,143 @@ export async function updateConnection(id: string, patch: ProviderPatch, done?: 
   }
 }
 
+type EndpointResult =
+  | { kind: "ignored" | "not-approved" | "unconfirmed" }
+  | { kind: "refused"; message: string; retry: boolean; detail?: string }
+  | { kind: "changed"; listing?: ModelListing };
+
+type EndpointCheck = {
+  from: string | null; to: string; detail?: string;
+  refusal?: "conflict" | "missing";
+  phase: "unknown" | "reload-failed" | "saved" | "not-settled" | "review";
+};
+/** A check survives editor closes/remounts. Only positive refusal evidence allows review instead of waiting for a possible commit. */
+export const endpointChecks = signal<Partial<Record<string, EndpointCheck>>>({});
+
+export function endpointNeedsReload(id: string): boolean {
+  const phase = endpointChecks()[id]?.phase;
+  return phase === "unknown" || phase === "reload-failed" || phase === "not-settled";
+}
+
+export function dismissEndpointCheck(id: string) {
+  if (!endpointChecks()[id] || endpointNeedsReload(id)) return;
+  const checks = { ...endpointChecks() };
+  delete checks[id];
+  endpointChecks.set(checks);
+}
+
+function invalidateEndpointListing(id: string) {
+  modelsSeq.set(id, (modelsSeq.get(id) ?? 0) + 1);
+  const listings = { ...modelListings() };
+  delete listings[id];
+  modelListings.set(listings);
+}
+
+export async function reloadEndpoint(id: string): Promise<void> {
+  const check = endpointChecks()[id];
+  if (!check || !endpointNeedsReload(id) || providerBusy() || !apiClient()) return;
+  const ok = sessionGuard();
+  providerBusy.set(`endpoint-reload:${id}`);
+  try {
+    const list = await readConnections(id);
+    if (!ok()) return;
+    if (!list) {
+      endpointChecks.set({ ...endpointChecks(), [id]: { ...check, phase: "reload-failed" } });
+      return;
+    }
+    const connection = list.find((x) => x.id === id) ?? null;
+    batch(() => {
+      if (connection?.baseUrl !== check.from) invalidateEndpointListing(id);
+      const checks = { ...endpointChecks() };
+      if (!connection) {
+        delete checks[id];
+        connectionsError.set("This connection is no longer available to edit.");
+      } else if (check.refusal) {
+        // A definite refusal never saved the draft, even if someone else
+        // has since chosen the same URL. Always ask for fresh review.
+        checks[id] = { ...check, phase: "review" };
+      } else {
+        // A GET is a snapshot, not proof an uncertain PATCH has stopped.
+        checks[id] = { ...check, phase: connection.baseUrl === check.to ? "saved" : "not-settled" };
+      }
+      endpointChecks.set(checks);
+    });
+  } finally {
+    if (ok()) providerBusy.set(null);
+  }
+}
+
+/** Keep the committed endpoint in state until the server confirms a successful test and save. */
+export async function updateEndpoint(id: string, url: string, revision: string): Promise<EndpointResult> {
+  const c = apiClient();
+  const current = connections()?.find((x) => x.id === id);
+  const provider = current && providerById(current.providerId);
+  if (!c || !current || !provider?.allowCustomUrl || isDeviceConnection(current) || providerBusy() || endpointNeedsReload(id) || url === current.baseUrl) {
+    return { kind: "ignored" };
+  }
+  if (catalogError() || !isAllowedBaseUrl(url)) return { kind: "not-approved" };
+  const ok = sessionGuard();
+  batch(() => {
+    dismissEndpointCheck(id);
+    providerBusy.set(`endpoint:${id}`);
+    clearProviderError();
+    providerNotice.set(null);
+  });
+  try {
+    const changed = await c.updateProviderEndpoint(id, url, revision);
+    if (!ok()) return { kind: "ignored" };
+    // Don't show a listing from the old endpoint, even if it finishes after the PATCH.
+    batch(() => {
+      invalidateEndpointListing(id);
+      replaceConnection(changed);
+      providerBusy.set(`endpoint-refresh:${id}`);
+    });
+    if (provider.listsModels) await fetchModels(id, true);
+    if (!ok()) return { kind: "ignored" };
+    return { kind: "changed", listing: modelListings()[id] };
+  } catch (error) {
+    if (!ok() || isAborted(error)) return { kind: "ignored" };
+    if (error instanceof ApiError && error.kind === "auth") {
+      disconnect(error.message);
+      return { kind: "ignored" };
+    }
+    const status = error instanceof ApiError ? error.status : null;
+    const detail = status ? `PATCH endpoint: HTTP ${status}` : undefined;
+    let refusal: EndpointCheck["refusal"];
+    if (error instanceof EndpointPatchError) {
+      switch (error.code) {
+        case "endpoint_not_approved":
+          void loadCatalog();
+          return { kind: "not-approved" };
+        case "endpoint_probe_busy":
+          return { kind: "refused", message: "The server has too many endpoint tests running. No change was saved. Try again shortly.", retry: true, detail };
+        case "endpoint_probe_failed": {
+          const reason = status === 504 ? "the test timed out" : "the connection test failed";
+          return { kind: "refused", message: `The new endpoint didn't answer (${reason}). The connection still uses the old one.`, retry: true, detail };
+        }
+        case "endpoint_rejected":
+          return { kind: "refused", message: `Metro didn't save the endpoint change: ${error.reason}`, retry: false, detail };
+        case "endpoint_conflict":
+          refusal = "conflict";
+          break;
+        case "endpoint_missing":
+          refusal = "missing";
+          break;
+      }
+    }
+    batch(() => {
+      // An old refresh's result can't later overwrite the reloaded endpoint.
+      invalidateEndpointListing(id);
+      endpointChecks.set({
+        ...endpointChecks(), [id]: { phase: "unknown", refusal, from: current.baseUrl, to: url, detail: detail ?? "Endpoint response was not confirmed" },
+      });
+    });
+    return { kind: "unconfirmed" };
+  } finally {
+    if (ok()) providerBusy.set(null);
+  }
+}
+
 export async function deleteConnection(id: string): Promise<void> {
   const c = apiClient();
   if (!c || providerBusy()) return;
@@ -882,12 +1107,12 @@ export async function rotateDeviceToken(id: string): Promise<void> {
   }
 }
 
-const onProvidersPage = () => place() === "settings" && settingsSection() === "providers";
+const onProvidersPage = () => place() === "settings" && settingsSection() === "connections";
 
 /** Whether `url` may be used as a custom base URL: exactly one of the server's allowed URLs. */
 export function isAllowedBaseUrl(url: string): boolean {
   const allowed = catalog()?.allowedBaseUrls ?? [];
-  return allowed.includes(url.trim());
+  return allowed.includes(url);
 }
 
 // ------------------------------------------------------------------ errors and lifecycle
@@ -960,7 +1185,7 @@ effect(() => {
   const here = place() === "settings" ? settingsSection() : null;
   untracked(() => {
     if (here === "runners") void loadRunners();
-    else if (here === "providers") {
+    else if (here === "connections") {
       void loadProviders();
       void refreshHelper();
     }
@@ -984,7 +1209,7 @@ onManageOpen((spaceId) => {
 onSessionEnd(() => {
   runnersSeq++;
   impactSeq++;
-  spaceRunnerSeq++;
+  spaceRunnerWrites.clear();
   catalogSeq++;
   connectionsSeq++;
   modelsSeq.clear();
@@ -996,13 +1221,13 @@ onSessionEnd(() => {
   runnerNotice.set(null);
   runnerConfirm.set(null);
   runnerImpact.set(null);
-  spaceRunners.set({});
   registeredRunnersSupported.set(true);
   spaceRunnerBusy.set(null);
   spaceRunnerNotice.set(null);
   catalog.set(null);
   catalogError.set(null);
   connections.set(null);
+  endpointChecks.set({});
   clearProviderError();
   providerBusy.set(null);
   providerNotice.set(null);

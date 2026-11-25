@@ -467,7 +467,8 @@ test("Settings work without any Space; a personal runner's token is shown once, 
   await signIn(app, "carol");
   await app.waitFor("id:onboarding");
   await openSettings(app, "runners");
-  await app.waitFor("text:No runners yet");
+  await app.waitFor("text:No other personal runners");
+  await app.press("id:runner-add-toggle");
   // Not an org admin: organization runners can't be chosen.
   expect(app.enabled("id:runner-visibility:organization")).toBe(false);
 
@@ -512,6 +513,7 @@ test("org admins add organization runners; others see them but can't manage them
   const app = await openApp(f);
   await signIn(app, "alice");
   await openSettings(app, "runners");
+  await app.press("id:runner-add-toggle");
   await app.type("id:runner-name", "Shared CI");
   await app.press("id:runner-visibility:organization");
   await app.press("id:add-runner");
@@ -524,14 +526,14 @@ test("org admins add organization runners; others see them but can't manage them
   await app.waitFor(`id:rotate-runner:${org.id}`);
   await app.press(`id:rotate-runner:${org.id}`);
   await app.waitFor("text:/Spaces you belong to that use it: Side project/");
-  await app.press("id:confirm-rotate-runner");
+  await app.press(`id:rotate-runner:${org.id}:confirm`);
   await app.waitFor("text:/New token for/");
   expect(text(app)).not.toContain(org.token);
   await app.press("id:hide-runner-token");
 
   await app.press(`id:delete-runner:${org.id}`);
-  await app.waitFor("text:/Deleting revokes its token/");
-  await app.press("id:confirm-delete-runner");
+  await app.waitFor("text:/Deleting .* revokes its token/");
+  await app.press(`id:delete-runner:${org.id}:confirm`);
   await app.waitFor("text:/It no longer serves any Space/");
   expect(f.state.runners.has(org.id)).toBe(false);
   expect(f.state.attached.has("side")).toBe(false);
@@ -544,7 +546,7 @@ test("org admins add organization runners; others see them but can't manage them
   await bob.waitFor("text:Org builder");
   expect(bob.shows(`id:rotate-runner:${other.id}`)).toBe(false);
   expect(bob.shows(`id:delete-runner:${other.id}`)).toBe(false);
-  expect(bob.shows("text:Organization · managed by org admins. You can attach it to Spaces you own.")).toBe(true);
+  expect(bob.shows("text:Any Space owner can attach these. Organization admins manage them.")).toBe(true);
 });
 
 test("a Space owner attaches and detaches a runner from the same list; attached is not online", async () => {
@@ -885,6 +887,7 @@ test("Settings opened from a Space's management returns to it; a runner token sh
   await app.waitFor("id:attach-runner-list");
   await app.press("id:open-runner-settings");
   await app.waitFor("id:runners-settings");
+  await app.press("id:runner-add-toggle");
   await app.type("id:runner-name", "Bob laptop");
   await app.press("id:add-runner");
   await app.waitFor("id:token-reveal");
@@ -1009,16 +1012,29 @@ test("with the operator's model, no onboarding card shows: Chat already works", 
 test("a late settings answer never lands after sign-out or in the next user's session", async () => {
   const f = world();
   f.addRunner("Alice private", "personal", "alice");
-  f.state.delays.set("/v1/runners", 600);
-  const app = await openApp(f);
+  const delay = 2000;
+  const held = f.answerLate("/v1/runners", TOKENS.alice!, delay);
+  const rosterReads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/runners").map((p) => p.user);
+  const app = await open("./App.tsx", {
+    modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800, clock: {},
+  });
   await signIn(app, "alice");
-  await app.press("id:nav-settings");
+  await openSettings(app, "runners");
+  await app.waitUntil(() => held.arrived() === 1, { timeout: 500 });
+  expect(app.shows("id:runner-list >> text:Loading runners…")).toBe(true);
   await app.press("id:settings-close");
   await signOut(app); // while GET /v1/runners is still on its way
-  f.state.delays.delete("/v1/runners");
+  await app.waitFor("id:connect");
   await signIn(app, "bob");
   await openSettings(app, "runners");
-  await app.waitFor("text:No runners yet");
-  await app.wait(800);
+  const noPersonal = "id:runner-list >> text:No other personal runners";
+  const noOrganization = "id:organization-runner-list >> text:No organization runners";
+  await app.waitFor(noPersonal, { timeout: 500 });
+  expect(app.shows(noOrganization)).toBe(true);
+  expect(rosterReads()).toEqual(["alice", "bob"]);
+  expect(app.shows("text:Alice private")).toBe(false);
+  await app.clock!.runFor(delay); // Alice's held response now comes due during Bob's session.
+  expect(app.shows(noPersonal)).toBe(true);
+  expect(app.shows(noOrganization)).toBe(true);
   expect(app.shows("text:Alice private")).toBe(false);
 });

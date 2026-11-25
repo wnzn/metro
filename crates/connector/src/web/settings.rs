@@ -33,6 +33,48 @@ use super::{Mode, Outcome, ProviderId};
 use crate::fsutil::{read_private, write_private};
 
 pub const FILE: &str = "web-settings.json";
+pub(crate) const CONSENT_FILE: &str = "web-test-consent.json";
+
+#[derive(Default, Serialize, Deserialize)]
+struct ConsentRevisions {
+    master: u64,
+    providers: BTreeMap<String, u64>,
+}
+
+pub(super) type ConsentRevision = (u64, u64);
+
+fn revisions(dir: &Path) -> Result<ConsentRevisions> {
+    read_private(&dir.join(CONSENT_FILE), 4096)?
+        .map(|bytes| {
+            serde_json::from_slice(&bytes).context("web consent generations are unreadable")
+        })
+        .unwrap_or_else(|| Ok(ConsentRevisions::default()))
+}
+
+fn revision(dir: &Path, p: ProviderId) -> Result<ConsentRevision> {
+    let r = revisions(dir)?;
+    Ok((r.master, r.providers.get(p.as_str()).copied().unwrap_or(0)))
+}
+
+pub(super) fn test_snapshot(dir: &Path, p: ProviderId) -> Result<(Settings, ConsentRevision)> {
+    locked(dir, || Ok((load(dir)?, revision(dir, p)?)))
+}
+
+fn advance_revisions(dir: &Path, master: bool, providers: &[ProviderId]) -> Result<()> {
+    if !master && providers.is_empty() {
+        return Ok(());
+    }
+    let mut r = revisions(dir)?;
+    let next = |n: u64| n.checked_add(1).context("web consent generation exhausted");
+    if master {
+        r.master = next(r.master)?;
+    }
+    for p in providers {
+        let entry = r.providers.entry(p.as_str().into()).or_default();
+        *entry = next(*entry)?;
+    }
+    write_private(&dir.join(CONSENT_FILE), &serde_json::to_vec(&r)?)
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProviderSetting {
@@ -292,7 +334,29 @@ pub fn update_prefs<T>(
                 ..Settings::default()
             };
         }
+        let before = s.clone();
         let out = f(&mut s)?;
+        let enabled = |settings: &Settings, p| {
+            settings
+                .providers
+                .iter()
+                .any(|row| row.id == p && row.enabled)
+        };
+        let changed: Vec<_> = ProviderId::ALL
+            .into_iter()
+            .filter(|&p| enabled(&before, p) != enabled(&s, p))
+            .collect();
+        // Advance before writing preferences: even a subsequent failed
+        // preference write must not revive an earlier test. Never make Off
+        // depend on the revision file, but don't re-enable without it.
+        let bumped = advance_revisions(
+            dir,
+            reset_unreadable || before.enabled != s.enabled,
+            &changed,
+        );
+        if (!before.enabled && s.enabled) || changed.iter().any(|&p| enabled(&s, p)) {
+            bumped?;
+        }
         write_prefs(dir, &s)?;
         Ok(out)
     })
@@ -327,8 +391,8 @@ pub struct Updates {
     pub cooldowns: Vec<(ProviderId, Mode, u64, Outcome)>,
     pub rejected: Vec<(ProviderId, String)>,
     pub last: Vec<(ProviderId, Outcome, u64)>,
-    /// Providers whose cooldowns end now (a successful test).
-    pub cleared: Vec<ProviderId>,
+    /// Provider modes whose cooldowns end now (a successful test).
+    pub cleared: Vec<(ProviderId, Mode)>,
 }
 
 impl Updates {
@@ -338,14 +402,8 @@ impl Updates {
             && self.last.is_empty()
             && self.cleared.is_empty()
     }
-}
-
-pub fn apply(dir: &Path, u: &Updates) -> Result<()> {
-    if u.is_empty() {
-        return Ok(());
-    }
-    update_state(dir, false, |s| {
-        for &(p, mode, until, outcome) in &u.cooldowns {
+    fn apply_to(&self, s: &mut Settings) {
+        for &(p, mode, until, outcome) in &self.cooldowns {
             s.cooldowns.insert(
                 cooldown_key(p, mode),
                 Cooldown {
@@ -354,10 +412,10 @@ pub fn apply(dir: &Path, u: &Updates) -> Result<()> {
                 },
             );
         }
-        for (p, fp) in &u.rejected {
+        for (p, fp) in &self.rejected {
             s.rejected_keys.insert(p.as_str().into(), fp.clone());
         }
-        for &(p, outcome, at) in &u.last {
+        for &(p, outcome, at) in &self.last {
             s.last.insert(
                 p.as_str().into(),
                 Last {
@@ -366,8 +424,37 @@ pub fn apply(dir: &Path, u: &Updates) -> Result<()> {
                 },
             );
         }
-        for p in &u.cleared {
-            clear_cooldowns(s, *p);
+        for &(p, mode) in &self.cleared {
+            s.cooldowns.remove(&cooldown_key(p, mode));
+        }
+    }
+}
+
+pub fn apply(dir: &Path, u: &Updates) -> Result<()> {
+    if u.is_empty() {
+        return Ok(());
+    }
+    update_state(dir, false, |s| {
+        u.apply_to(s);
+        Ok(())
+    })
+}
+
+/// Publish a test only if its final checks pass while we hold the same
+/// lock as preference changes and cooldown writes. The caller holds the
+/// key-store lock first and keeps it until this transaction ends.
+pub(super) fn apply_test<G>(
+    dir: &Path,
+    p: ProviderId,
+    u: &Updates,
+    verify: impl FnOnce(&Settings, ConsentRevision) -> Result<G>,
+) -> Result<()> {
+    locked(dir, || {
+        let mut s = load(dir)?;
+        let _publication = verify(&s, revision(dir, p)?)?;
+        if !u.is_empty() {
+            u.apply_to(&mut s);
+            write_state(dir, &s)?;
         }
         Ok(())
     })

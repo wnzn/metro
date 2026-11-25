@@ -388,6 +388,7 @@ fn row(id: u8, user: &str, provider: &str, model: &str) -> super::store::Row {
         sealed_key: None,
         capability: entry.capability,
         config_rev: 0,
+        edit_rev: 0,
     }
 }
 

@@ -16,7 +16,7 @@
 // Ask agent: with several agents, a chooser joined to it picks which agent it
 // asks (./space/askAgent).
 
-import { announce, computed, effect, keymap, signal, untracked } from "nsh";
+import { announce, cleanup, computed, effect, keymap, signal, untracked } from "nsh";
 import type { JSX } from "nsh";
 import type { Bounds, ViewRef } from "nsh";
 import {
@@ -24,6 +24,7 @@ import {
   activeSpace,
   activeSpaceId,
   addMention,
+  beginMentionVisit,
   composerScope,
   draft,
   inSpaceComposer,
@@ -32,6 +33,7 @@ import {
   members,
   membersError,
   mentionDraft,
+  mentionVisitKey,
   mentions,
   openManage,
   removeMention,
@@ -41,6 +43,7 @@ import {
   selectRoom,
   setDraft,
   status,
+  verifiedConfirmationDirectory,
 } from "../store";
 import {
   Action,
@@ -64,16 +67,17 @@ import type { AskAgentChoice } from "../ui";
 import type { SpaceAgent } from "../api/spaces";
 import { RESERVED_HANDLE } from "../api/spaces";
 import { Composer, ConnectionBanner, fillDraft, focusComposer, Transcript } from "./Conversation";
+import { NewSpaceRunnerFeedback } from "./CreateSpaceForm";
 import type { DraftIdea } from "./Conversation";
 import { PersonAvatar } from "./profile/PersonAvatar";
-import { ensurePerson, profileName } from "./profile/profileState";
-import { agentById, agentMentionOptions, defaultAgent, ensureSpaceAgents, spaceAgents } from "./space/agents";
+import { ensureMentionPerson } from "./profile/profileState";
+import { agentById, agentMentionOptions, defaultAgent, spaceAgents } from "./space/agents";
 import { askAgentId, askChoice, chooseAskAgent, classifierOffered, CLASSIFIER_CHOICE, hasAgentChoice } from "./space/askAgent";
 import { SpaceAgentAvatar } from "./space/SpaceAgentAvatar";
-import { openSpaceSettings } from "./space/spaceSettingsState";
+import { openSpaceSettings, spaceSettingsFor } from "./space/spaceSettingsState";
 import { mentionIdentityKey, scanMentionDraft } from "./mentions/draft";
-import type { MentionRecipient } from "./mentions/draft";
-import { spaceMentionDirectory } from "./mentions/roster";
+import type { MentionDirectory, MentionRecipient } from "./mentions/draft";
+import { beginMentionAgentVisit, refreshMentionAgents, spaceMentionDirectory, verifiedMembers } from "./mentions/roster";
 import { mentionSuggestion } from "./mentions/suggestions";
 
 /** Suggestions of an empty room: they fill the draft (and its recipients), never send. */
@@ -97,6 +101,7 @@ export function SpaceView() {
   return (
     <Surface variant="panel" grow testID="space-view">
       <ConnectionBanner />
+      <NewSpaceRunnerFeedback />
       <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
       <RoomComposer />
     </Surface>
@@ -172,6 +177,7 @@ type MentionOption = { key: string; mention: MentionRecipient; title: string; de
 export function mentionOptions(
   query: string,
   list: readonly { userId: string; role?: string }[] | null,
+  verifiedPeople: MentionDirectory["members"],
   myId: string | null,
   spaceId?: string | null,
   choices?: readonly MentionRecipient[],
@@ -179,6 +185,7 @@ export function mentionOptions(
   const q = query.toLowerCase();
   const out: MentionOption[] = [];
   const keys = choices && new Set(choices.map(mentionIdentityKey));
+  const names = new Map(verifiedPeople.map(m => [m.id, m.displayName]));
   const def = defaultAgent(spaceId);
   const several = spaceAgents(spaceId).length > 1;
   if (keys ? keys.has("generic") : "agent".startsWith(q)) {
@@ -205,7 +212,8 @@ export function mentionOptions(
       label: `Mention ${a.name} (${detail}): ${a.description}`, agent: a });
   }
   for (const m of list ?? []) {
-    const name = profileName(m.userId);
+    if (!names.has(m.userId)) continue;
+    const name = names.get(m.userId);
     if (keys ? !keys.has(`user:${m.userId}`)
       : m.userId === myId || (!m.userId.toLowerCase().includes(q) && !(name ?? "").toLowerCase().includes(q))) continue;
     const owner = m.role === "owner";
@@ -231,13 +239,15 @@ function RoomComposer() {
   const caret = signal<Bounds | null>(null);
   const selection = signal<{ start: number; end: number } | null>(null);
   const highlighted = signal<string | null>(null);
+  const optionRefs = new Map<string, ViewRef>();
   /** The composer's field has the keyboard focus. */
   const fieldFocused = signal(false);
   let atButton: ViewRef | null = null;
-  const currentDirectory = () => activeSpaceId() ? spaceMentionDirectory(activeSpaceId()!) : null;
   const preview = computed(previewMentionDraft);
   const matches = computed(() => previewMentionMatches(preview()));
   const ambiguous = () => matches().find(d => d.kind === "ambiguous");
+  const currentDirectory = () => ambiguous()?.preflight ? verifiedConfirmationDirectory()
+    : activeSpaceId() ? spaceMentionDirectory(activeSpaceId()!) : null;
   const unresolved = () => matches().find(d => d.kind === "unresolved");
   const chips = computed(() => mentions().filter(a => !matches().some(m => m.kind === "ambiguous" && m.start === a.start)));
   const unresolvedHint = () => {
@@ -259,39 +269,54 @@ function RoomComposer() {
   });
   const query = () => partial()?.query ?? "";
   const options = computed(() => {
-    if (!currentDirectory()) return [];
-    return mentionOptions(query(), members(), me(), activeSpaceId(), ambiguous()?.choices);
+    const directory = currentDirectory();
+    if (!directory) return [];
+    const decision = ambiguous();
+    return mentionOptions(query(), members(), directory.members, me(), activeSpaceId(), decision?.choices);
   });
+  const deliberate = () => options().findIndex(o => o.key === highlighted());
   const active = () => {
-    const index = options().findIndex(o => o.key === highlighted());
-    return index < 0 ? 0 : index;
+    const index = deliberate();
+    return index < 0 && !ambiguous() ? 0 : index;
   };
   const typing = () => !!partial() && fieldFocused() && (options().length > 0 || !currentDirectory() && !query());
   const open = () => inSpaceComposer() && (explicit() || dismissedAt() !== draft() && (typing() || !!ambiguous() && fieldFocused()));
 
   // The same roster feeds sent chips even if the picker was never opened.
+  const visitKey = computed(() => spaceSettingsFor() ? null : mentionVisitKey());
   effect(() => {
-    const sid = activeSpaceId();
-    const scope = composerScope();
-    if (!sid || !inSpaceComposer() || !scope) return;
+    if (!visitKey()) return;
+    const sid = untracked(activeSpaceId);
+    if (!sid) return;
+    const scope = untracked(composerScope);
+    const endVisit = untracked(() => beginMentionVisit(sid, scope));
+    const endAgentVisit = untracked(() => beginMentionAgentVisit(sid));
     const refresh = () => {
       if (!inSpaceComposer() || activeSpaceId() !== sid) return;
       void loadMembersForMentions();
-      void ensureSpaceAgents(sid, true);
+      refreshMentionAgents(sid);
     };
-    untracked(refresh);
     const timer = setInterval(refresh, 10_000);
-    return () => clearInterval(timer);
+    return () => { clearInterval(timer); endAgentVisit(); endVisit(); };
   });
   effect(() => {
-    const ids = members()?.map(m => m.userId) ?? [];
-    untracked(() => { for (const id of ids) void ensurePerson(id); });
+    const sid = activeSpaceId();
+    const ids = (sid ? verifiedMembers(sid) : null)?.map(m => m.userId) ?? [];
+    untracked(() => { for (const id of ids) void ensureMentionPerson(id); });
   });
-  // A new query starts at the first suggestion.
+  // Keep a deliberated stable key through reorder, never through a different
+  // occurrence or an option disappearing from the current roster.
+  let lastQuery = "";
   effect(() => {
-    query();
-    ambiguous()?.literal;
-    untracked(() => highlighted.set(null));
+    const m = ambiguous() ?? partial();
+    const key = `${composerScope()}:${m?.start ?? ""}:${m?.end ?? ""}:${m?.literal ?? ""}:${query()}:${!!ambiguous()}`;
+    const id = highlighted();
+    const present = id !== null && options().some(o => o.key === id);
+    untracked(() => {
+      if (key !== lastQuery || !present) highlighted.set(null);
+      else optionRefs.get(id)?.reveal({ vertical: "nearest", animated: false });
+      lastQuery = key;
+    });
   });
   // Leaving the room (or Space) closes it, whatever the draft still says.
   let shownFor: string | null = null;
@@ -301,6 +326,7 @@ function RoomComposer() {
     shownFor = key;
     untracked(() => {
       explicit.set(false);
+      highlighted.set(null);
       caret.set(null);
       selection.set(null);
       dismissedAt.set(draft());
@@ -320,28 +346,40 @@ function RoomComposer() {
     const move = (step: number) => () => {
       const n = options().length;
       if (n === 0) return;
-      highlighted.set(options()[(active() + step + n) % n].key);
-      announce(`${options()[active()]!.label}, ${active() + 1} of ${n}`);
+      const from = active();
+      const index = from < 0 ? (step > 0 ? 0 : n - 1) : (from + step + n) % n;
+      const option = options()[index];
+      highlighted.set(option.key);
+      optionRefs.get(option.key)?.reveal({ vertical: "nearest", animated: false });
+      announce(`${option.label}, ${index + 1} of ${n}`);
     };
     return keymap.bind(
-      options().length ? { down: move(1), up: move(-1), tab: () => void intercept(true), escape: close } : { escape: close },
+      { ...(options().length ? { down: move(1), up: move(-1) } : {}),
+        ...(options().length || ambiguous() ? { tab: () => void intercept() } : {}), escape: close },
       { when: "always", repeat: true },
     );
   });
   function close() {
     explicit.set(false);
+    highlighted.set(null);
     dismissedAt.set(draft());
     if (inSpaceComposer()) focusComposer(Math.min(selection()?.end ?? draft().length, draft().length));
   }
-  const choose = (m: MentionRecipient) => {
+  const choose = (key: string) => {
+    const option = open() && options().find(o => o.key === key);
+    if (!option) {
+      announce("That recipient is no longer available. Check the list and try again.");
+      return;
+    }
     const current = selection();
     const pos = current && current.start === current.end ? Math.min(current.end, draft().length) : draft().length;
-    const end = addMention(m, ambiguous() ?? partial() ?? { start: pos, end: pos, literal: "" });
+    const end = addMention(option.mention, ambiguous() ?? partial() ?? { start: pos, end: pos, literal: "" });
     if (end === null) {
       announce("That recipient is no longer available. Check the list and try again.");
       return;
     }
     explicit.set(false);
+    highlighted.set(null);
     caret.set(null);
     selection.set({ start: end, end });
     focusComposer(end);
@@ -351,22 +389,24 @@ function RoomComposer() {
     else {
       dismissedAt.set(null);
       explicit.set(true);
+      if (ambiguous()) focusComposer(Math.min(selection()?.end ?? draft().length, draft().length));
       if (!currentDirectory()) {
         void loadMembersForMentions();
         const sid = activeSpaceId();
-        if (sid) void ensureSpaceAgents(sid);
+        if (sid) refreshMentionAgents(sid);
       }
     }
   };
   /** Return in the field: picks the highlighted suggestion instead of sending. */
-  function intercept(tab = false) {
-    if (ambiguous() && (!open() || (!tab && !highlighted()) || !options().length)) {
+  function intercept() {
+    const option = options()[active()];
+    if (ambiguous() && (!open() || deliberate() < 0 || !option)) {
       dismissedAt.set(null);
       announce("Pick who you mean before sending.");
       return true;
     }
-    if (!open() || !options().length) return false;
-    choose(options()[active()]!.mention);
+    if (!open() || !option) return false;
+    choose(option.key);
     return true;
   }
   /** Next to the caret while typing; under the button when it opened the list or no caret was reported yet. */
@@ -431,43 +471,53 @@ function RoomComposer() {
               placement="top"
               align="start"
               role="listbox"
+              bounded
               testID="mention-picker"
               accessibilityLabel={`Mention in #${activeRoom()?.name ?? ""}`}
             >
-              <If when={ambiguous()} else={<PopoverNote text={`Agents and members of ${activeSpace()?.name ?? "this Space"} · ↑↓ then Return`} />}>
-                {(m) => <PopoverNote testID="mention-ambiguous" text={`Which ${m().literal.slice(1)}?`} />}
+              <If when={ambiguous()} else={<PopoverNote lines={2} text={`Agents and members of ${activeSpace()?.name ?? "this Space"} · ↑↓ then Return`} />}>
+                {(m) => <PopoverNote lines={2} testID="mention-ambiguous" text={`Which ${m().literal.slice(1)}?`} />}
               </If>
-              <SuggestionList accessibilityLabel="Mention suggestions">
+              <SuggestionList testID="mention-options-scroll" accessibilityLabel="Mention suggestions">
                 <Each of={options()} key={(o) => o.key}>
-                  {(o, index) => (
-                    <SuggestionOption
-                      testID={o().testID}
-                      title={o().title}
-                      detail={o().detail}
-                      note={o().note}
-                      active={index() === active()}
-                      accessibilityLabel={o().label}
-                      leading={
-                        o().mention.kind === "agent" ? (
-                          <If when={o().agent && activeSpaceId() ? o().agent : null} else={<AuthorGlyph kind="agent" tone="agent" size="sm" />}>
-                            {(a) => <SpaceAgentAvatar spaceId={activeSpaceId()!} agent={a()} size="sm" />}
-                          </If>
-                        ) : (
-                          <PersonAvatar userId={(o().mention as { id: string }).id} name={o().title} size="sm" />
-                        )
-                      }
-                      ref={(node) => {
-                        // The button moves the focus into the list; typing keeps it in the field.
-                        if (index() === 0 && explicit()) node.focus();
-                      }}
-                      onPress={() => choose(o().mention)}
-                    />
-                  )}
+                  {(o, index) => {
+                    const key = o().key;
+                    cleanup(() => optionRefs.delete(key));
+                    return (
+                      <SuggestionOption
+                        testID={o().testID}
+                        title={o().title}
+                        detail={o().detail}
+                        note={o().note}
+                        active={index() === active()}
+                        accessibilityLabel={o().label}
+                        leading={
+                          o().mention.kind === "agent" ? (
+                            <If when={o().agent && activeSpaceId() ? o().agent : null} else={<AuthorGlyph kind="agent" tone="agent" size="sm" />}>
+                              {(a) => <SpaceAgentAvatar spaceId={activeSpaceId()!} agent={a()} size="sm" />}
+                            </If>
+                          ) : (
+                            <PersonAvatar userId={(o().mention as { id: string }).id} name={o().title} verifiedName size="sm" />
+                          )
+                        }
+                        ref={(node) => {
+                         optionRefs.set(key, node);
+                         if (highlighted() === key) node.reveal({ vertical: "nearest", animated: false });
+                         // Never give an ambiguous chooser an implicit first row.
+                         if (index() === 0 && explicit() && !ambiguous()) node.focus();
+                       }}
+                        focusable={!ambiguous()}
+                        onPress={() => choose(key)}
+                      />
+                    );
+                  }}
                 </Each>
               </SuggestionList>
-              <If when={membersError()}>{(message) => <PopoverNote tone="danger" text={message()} />}</If>
+              <If when={membersError()}>{(message) => <PopoverNote lines={2} tone="danger" text={message()} />}</If>
               <If when={options().length === 0}>
-                <PopoverNote testID="mention-none" text={!currentDirectory() ? "The recipient list isn't ready. Check your connection."
+                <PopoverNote lines={2} testID="mention-none" text={!currentDirectory() ? ambiguous()?.preflight
+                  ? "The recipient list changed. Edit or remove this mention before sending."
+                  : "The recipient list isn't ready. Check your connection."
                   : ambiguous() ? "Those recipients aren't available. Edit or remove the mention." : `No recipient matches “${query()}”.`} />
               </If>
             </AnchoredPopover>

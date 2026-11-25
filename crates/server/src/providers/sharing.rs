@@ -500,12 +500,14 @@ pub async fn available(
                     visibility,
                 )?);
             }
-            for (row, visibility) in store::shared_with(&conn, &caller, space.as_deref(), any)? {
+            for (row, visibility, granted_space) in
+                store::shared_with(&conn, &caller, space.as_deref(), any)?
+            {
                 out.extend(available_entry(
                     &catalog_state,
                     &conn,
                     &caller,
-                    space.as_deref(),
+                    granted_space.as_deref().or(space.as_deref()),
                     &row,
                     visibility,
                 )?);

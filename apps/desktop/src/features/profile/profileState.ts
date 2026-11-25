@@ -17,7 +17,7 @@ import { batch, effect, Picker as SystemPicker, signal, untracked } from "nsh";
 import { ApiError } from "../../api/client";
 import { AVATAR_EXTENSIONS, MAX_AVATAR_BYTES, MAX_BIO, MAX_DISPLAY_NAME, sniffAvatar } from "../../api/profile";
 import type { AvatarMime, Profile } from "../../api/profile";
-import { activeSpaceId, apiClient, describe, disconnect, isAborted, me, members, onSessionEnd, sessionGuard, spaces } from "../../store";
+import { activeSpaceId, apiClient, describe, disconnect, isAborted, me, members, mentionProfileEvidence, onSessionEnd, sessionGuard, spaces } from "../../store";
 
 /** How long a seen profile is trusted before it is checked again. */
 export const RECHECK_MS = 60_000;
@@ -34,7 +34,8 @@ const people = signal<Record<string, PersonState>>({});
 
 // Internal bookkeeping, not rendered.
 const checkedAt = new Map<string, number>();
-const inflight = new Map<string, Promise<void>>();
+type ProfileRead = { scope?: object; work: Promise<void> };
+const inflight = new Map<string, ProfileRead>();
 /** The picture version each `blob:` URL shows. */
 const shownVersion = new Map<string, string>();
 /** Bumped by `resetProfiles`: answers that arrive later are dropped. */
@@ -64,30 +65,51 @@ function setPerson(userId: string, next: PersonState) {
 
 /** Loads someone's profile (and picture) once per `RECHECK_MS`; later calls are free. */
 export function ensurePerson(userId: string, force = false): Promise<void> {
-  if (!userId) return Promise.resolve();
-  const running = inflight.get(userId);
-  if (running) return running;
-  const last = checkedAt.get(userId);
-  if (!force && last !== undefined && Date.now() - last < RECHECK_MS) return Promise.resolve();
-  const work = loadPerson(userId).finally(() => inflight.delete(userId));
-  inflight.set(userId, work);
-  startRechecks();
-  return work;
+  return ensureProfile(userId, force, false);
 }
 
-async function loadPerson(userId: string): Promise<void> {
+export function ensureMentionPerson(userId: string): Promise<void> {
+  return ensureProfile(userId, false, true);
+}
+
+function ensureProfile(userId: string, force: boolean, forMention: boolean): Promise<void> {
+  if (!userId) return Promise.resolve();
+  const evidence = untracked(() => mentionProfileEvidence(userId));
+  const needsScopedRead = forMention && evidence && !evidence.verified;
+  const running = inflight.get(userId);
+  if (running && (!needsScopedRead || running.scope === evidence.scope)) return running.work;
+  const last = checkedAt.get(userId);
+  if (!force && !needsScopedRead && last !== undefined && Date.now() - last < RECHECK_MS) return Promise.resolve();
+  // Re-entry may need its own read even while a different visit's request
+  // is in flight. Only the current request updates the general profile cache.
+  const entry: ProfileRead = {
+    scope: evidence?.scope,
+    work: Promise.resolve().then(() => loadPerson(userId, evidence, () => inflight.get(userId) === entry)).finally(() => {
+      if (inflight.get(userId) === entry) inflight.delete(userId);
+    }),
+  };
+  inflight.set(userId, entry);
+  startRechecks();
+  return entry.work;
+}
+
+async function loadPerson(userId: string, evidence: ReturnType<typeof mentionProfileEvidence>, latest: () => boolean): Promise<void> {
   const api = apiClient();
-  if (!api) return;
+  if (!api || !latest()) return;
   const gen = generation;
   const ok = sessionGuard();
   const live = () => ok() && gen === generation;
   if (!untracked(people)[userId]) setPerson(userId, { status: "loading", profile: null, avatarUrl: null });
+  const complete = evidence?.start();
   let profile: Profile | null;
   try {
     profile = await api.profileOf(userId);
+    if (profile && profile.id !== userId) throw new Error("Profile identity did not match the request");
   } catch (error) {
     if (!live() || isAborted(error)) return;
     if (error instanceof ApiError && error.kind === "auth") return disconnect(error.message);
+    if (error instanceof ApiError && error.kind === "forbidden") complete?.(null);
+    if (!latest()) return;
     // Not allowed any more (403) is the same as hidden; anything else keeps what is shown.
     if (error instanceof ApiError && error.kind === "forbidden") {
       checkedAt.set(userId, Date.now());
@@ -99,6 +121,8 @@ async function loadPerson(userId: string): Promise<void> {
     return;
   }
   if (!live()) return;
+  complete?.(profile?.displayName);
+  if (!latest()) return;
   checkedAt.set(userId, Date.now());
   if (!profile) {
     setPerson(userId, { status: "hidden", profile: null, avatarUrl: null });
@@ -107,7 +131,7 @@ async function loadPerson(userId: string): Promise<void> {
   const current = untracked(people)[userId];
   const keepUrl = profile.avatarVersion && current?.avatarUrl && shownVersion.get(userId) === profile.avatarVersion ? current.avatarUrl : null;
   setPerson(userId, { status: "ready", profile, avatarUrl: keepUrl });
-  if (profile.avatarVersion && !keepUrl) await loadAvatar(userId, profile.avatarVersion, live);
+  if (profile.avatarVersion && !keepUrl) await loadAvatar(userId, profile.avatarVersion, () => live() && latest());
 }
 
 async function loadAvatar(userId: string, version: string, live: () => boolean): Promise<void> {
@@ -187,6 +211,16 @@ export function profileDirty(): boolean {
   return !!p && (nameDraft().trim() !== p.displayName || bioDraft().trim() !== p.bio.trim());
 }
 
+export function revertProfile() {
+  const p = myProfile();
+  if (!p || savingProfile()) return;
+  batch(() => {
+    nameDraft.set(p.displayName);
+    bioDraft.set(p.bio);
+    profileNotice.set(null);
+  });
+}
+
 function adoptMine(p: Profile, keepDrafts = false) {
   batch(() => {
     myProfile.set(p);
@@ -206,7 +240,7 @@ function adoptMine(p: Profile, keepDrafts = false) {
 export async function loadMyProfile(): Promise<void> {
   const api = apiClient();
   const id = me();
-  if (!api || !id || myProfileLoading()) return;
+  if (!api || !id || myProfileLoading() || savingProfile() || pictureBusy()) return;
   const gen = generation;
   const ok = sessionGuard();
   const live = () => ok() && gen === generation;
@@ -241,7 +275,7 @@ export function profileProblem(): string | null {
 export async function saveProfile(): Promise<void> {
   const api = apiClient();
   const p = myProfile();
-  if (!api || !p || savingProfile() || profileProblem()) return;
+  if (!api || !p || savingProfile() || myProfileLoading() || pictureBusy() || profileProblem()) return;
   const gen = generation;
   const ok = sessionGuard();
   const live = () => ok() && gen === generation;

@@ -12,7 +12,7 @@
 // with app keymaps that win over the field, and Return (the composer's
 // submit) inserts instead of sending; Escape closes the list.
 
-import { Image, Overlay, Text, View, signal, token } from "nsh";
+import { Image, Overlay, Scroll, Text, View, signal, token } from "nsh";
 import type { Bounds, CaretEvent, InputRef, JSX, ViewRef } from "nsh";
 import { Button, Input, Menu, MenuItem, MenuSeparator, Toolbar } from "nsh/base";
 import { Icon } from "./chrome";
@@ -212,9 +212,11 @@ export function AnchoredPopover(
     placement?: "top" | "bottom";
     align?: "start" | "center" | "end";
     role?: "menu" | "listbox" | "dialog";
+    bounded?: boolean;
     children?: JSX.Element;
   },
 ) {
+  const available = signal(192);
   return (
     <Overlay
       anchor={props.anchor ?? null}
@@ -222,11 +224,13 @@ export function AnchoredPopover(
       align={props.align ?? "end"}
       offset={6}
       margin={8}
+      onPosition={props.bounded ? (position) => available.set(position.available.height) : undefined}
       onPressOutside={props.onClose}
       onCancel={props.onClose}
     >
       <View
-        class="rounded-(--radius) border border-border bg-popover p-[4px] shadow-lg"
+        class="min-h-0 rounded-(--radius) border border-border bg-popover p-[4px] shadow-lg"
+        style={props.bounded ? { maxHeight: Math.min(248, available()) } : undefined}
         role={props.role ?? "dialog"}
         testID={props.testID}
         accessibilityLabel={props.accessibilityLabel}
@@ -271,9 +275,11 @@ export function EmojiChoice(
 /** A vertical list of suggestions (mentions): Up and Down move once the focus is in it, Return or Space picks; the composer drives it while the caret stays there. */
 export function SuggestionList(props: Testable & { accessibilityLabel: string; children?: JSX.Element }) {
   return (
-    <Toolbar axis="vertical" class="self-stretch flex-col min-w-[260px] max-w-[360px] gap-px" accessibilityLabel={props.accessibilityLabel} testID={props.testID}>
-      {props.children}
-    </Toolbar>
+    <Scroll class="shrink min-h-0 max-h-[192px] w-[280px] max-w-full" testID={props.testID}>
+      <Toolbar axis="vertical" class="self-stretch flex-col gap-px" accessibilityLabel={props.accessibilityLabel}>
+        {props.children}
+      </Toolbar>
+    </Scroll>
   );
 }
 
@@ -290,26 +296,21 @@ export function SuggestionOption(
     leading?: JSX.Element;
     active: boolean;
     onPress: () => void;
+    focusable?: boolean;
     ref?: (node: ViewRef) => void;
   },
 ) {
-  return (
-    <Button
-      class={cx("flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-[5px] hover:bg-muted", focusRing, props.active && "bg-accent")}
-      ref={props.ref}
-      role="option"
-      selected={props.active}
-      onPress={props.onPress}
-      testID={props.testID}
-      accessibilityLabel={props.accessibilityLabel}
-    >
+  const rowClass = () => cx("flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-[5px] hover:bg-muted", focusRing, props.active && "bg-accent");
+  const content = () => (
+    <>
       {props.leading}
-      <View class="flex-1 min-w-0 flex-row items-baseline gap-(--space-2)">
+      <View class="flex-1 min-w-0 flex-col">
         <Text class={cx("text-(length:--text-sm) font-medium", props.active ? "text-accent-foreground" : "text-popover-foreground")} style={{ numberOfLines: 1 }}>
           {props.title}
         </Text>
         <If when={props.detail}>
-          <Text class="shrink text-(length:--text-xs) text-muted-foreground" style={{ numberOfLines: 1 }}>
+          <Text class="shrink text-(length:--text-xs) text-muted-foreground" style={{ numberOfLines: 2 }}
+            testID={props.testID ? `${props.testID}:detail` : undefined}>
             {props.detail}
           </Text>
         </If>
@@ -317,15 +318,25 @@ export function SuggestionOption(
       <If when={props.note}>
         <Text class="text-(length:--text-xs) text-muted-foreground">{props.note}</Text>
       </If>
-    </Button>
+    </>
+  );
+  return (
+    <If when={props.focusable === false} else={
+      <Button class={rowClass()} ref={props.ref} role="option" selected={props.active} onPress={props.onPress}
+        testID={props.testID} accessibilityLabel={props.accessibilityLabel}>{content()}</Button>
+    }>
+      <View class={rowClass()} ref={props.ref} role="option" focusable={false} onPress={props.onPress}
+        accessibilityState={{ selected: props.active }} testID={props.testID} accessibilityLabel={props.accessibilityLabel}>{content()}</View>
+    </If>
   );
 }
 
 /** A small heading or note inside a popover ("Mention in #lobby"). */
-export function PopoverNote(props: Testable & { text: string; tone?: "muted" | "danger" }) {
+export function PopoverNote(props: Testable & { text: string; tone?: "muted" | "danger"; lines?: number }) {
   return (
     <Text
       class={cx("px-(--space-2) py-[3px] text-(length:--text-xs)", props.tone === "danger" ? "text-destructive" : "text-muted-foreground")}
+      style={{ numberOfLines: props.lines }}
       testID={props.testID}
     >
       {props.text}

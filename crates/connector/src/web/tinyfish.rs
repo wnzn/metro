@@ -47,15 +47,14 @@ fn key(c: &Call<'_>) -> Result<reqwest::header::HeaderMap, Failure> {
 pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<Answer, Failure> {
     let mut url = url::Url::parse(base).map_err(|_| Failure::of(Outcome::Unavailable))?;
     url.query_pairs_mut().append_pair("query", &r.query);
-    let resp = c
+    let rb = c
         .http
         .get(url)
         .timeout(c.timeout)
         .headers(key(c)?)
-        .header("Accept", "application/json")
-        .send()
-        .await
-        .map_err(|e| transport(&e))?;
+        .header("Accept", "application/json");
+    (c.gate)().map_err(Failure::Stopped)?;
+    let resp = rb.send().await.map_err(|e| transport(&e))?;
     if !resp.status().is_success() {
         return Err(failure(c, resp).await);
     }
@@ -82,7 +81,7 @@ pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<An
 }
 
 pub(crate) async fn fetch(c: &Call<'_>, base: &str, r: &FetchReq) -> Result<Answer, Failure> {
-    let resp = c
+    let rb = c
         .http
         .post(base)
         .timeout(c.timeout)
@@ -91,10 +90,9 @@ pub(crate) async fn fetch(c: &Call<'_>, base: &str, r: &FetchReq) -> Result<Answ
         .header("Accept", "application/json")
         .body(
             json!({"urls": r.urls, "format": "markdown", "per_url_timeout_ms": 45000}).to_string(),
-        )
-        .send()
-        .await
-        .map_err(|e| transport(&e))?;
+        );
+    (c.gate)().map_err(Failure::Stopped)?;
+    let resp = rb.send().await.map_err(|e| transport(&e))?;
     if !resp.status().is_success() {
         return Err(failure(c, resp).await);
     }

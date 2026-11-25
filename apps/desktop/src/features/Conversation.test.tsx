@@ -282,6 +282,32 @@ test("follow-ups: no lone recipient line when the text names them; 'you' is plai
   expect(app.viewStyle(`id:you:${mine.id}`)?.backgroundColor).toBeUndefined(); // muted words, no pill
 });
 
+test("Space follow-ups hide To only for leading bindings to the actual stored recipients", async () => {
+  const f = world();
+  const say = (text: string, mentions: unknown[] = [], metadata: Record<string, unknown> = {}) =>
+    f.post("acme/lobby", { kind: "message", actor: "alice", actor_id: "alice", text,
+      created_at: "2026-11-22T01:01:00.000Z", mentions, ...metadata } as any);
+  const bob = { kind: "user", id: "bob" };
+  const other = { kind: "user", id: "carol" };
+  say("first from alice");
+  const empty = say("@bob is just text", [bob], { spans: [] });
+  const malformed = say("@bob is just text too", [bob], { spans: [{ start: 0, end: 4, index: 9 }] });
+  const real = say("@Robert Smith please look", [bob], { spans: [{ start: 0, end: 13, index: 0 }] });
+  const wrong = say("@bob and @carol", [bob, other], { spans: [{ start: 0, end: 4, index: 1 }] });
+  const later = say("@bob words @Robert", [bob], { spans: [{ start: 11, end: 18, index: 0 }] });
+  const legacy = say("@bob legacy spelling", [bob]);
+  const noStoredHandle = say("@coder is just text", [{ kind: "agent", agent_id: "ag-coder" }]);
+  const storedHandle = say("@old-coder legacy spelling", [{ kind: "agent", agent_id: "ag-coder", handle: "old-coder" }]);
+  const app = await inAcme(f);
+  await app.waitFor(`id:event:${storedHandle.id}`);
+  for (const e of [empty, malformed, wrong, later]) {
+    expect(app.shows(`id:recipient:${e.id}:bob`)).toBe(true);
+    expect(app.shows(`id:author:${e.id}`)).toBe(false);
+  }
+  expect(app.shows(`id:recipient:${noStoredHandle.id}:agent:ag-coder`)).toBe(true);
+  for (const e of [real, legacy, storedHandle]) expect(app.shows(`id:header:${e.id}`)).toBe(false);
+});
+
 test("@ suggestions: Tab inserts the highlighted one like Return; Return sends only once the list is closed", async () => {
   const f = world();
   const app = await inAcme(f);

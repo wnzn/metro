@@ -1,6 +1,6 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
-import { BASE, TOKENS } from "../../../test/fakeServer";
+import { BASE, spaceMessageText, TOKENS } from "../../../test/fakeServer";
 import { launched } from "../../../test/launched";
 import { spaceWorld } from "../space/test/fixtures";
 
@@ -56,9 +56,13 @@ function fixture() {
     const answer = respond(req) as Reply;
     if (!path.endsWith("/messages") || answer.status !== 202) return answer;
     const call = w.f.posts().at(-1)!;
-    const key = path.startsWith("/v1/chat/") ? `chat:${call.user}` :
+    const chat = path.startsWith("/v1/chat/");
+    const key = chat ? `chat:${call.user}` :
       path.replace("/v1/spaces/", "").replace("/rooms/", "/").replace("/messages", "");
-    const event = w.f.state.events.get(key)!.findLast(e => e.kind === "message" && e.text === body.text)!;
+    // U11's fake applies the server's Space trim and span rebasing before
+    // inserting the event. Only the request log and fixture keys use raw text.
+    const stored = chat ? body.text : spaceMessageText(body).text;
+    const event = w.f.state.events.get(key)!.findLast(e => e.kind === "message" && e.text === stored)!;
     const text = event.text.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
     const mentions = [...(body.mentions ?? [])];
     if (body.invoke_agent && !mentions.some(m => m.kind === "agent" && m.agent_id === body.agent_id)) {

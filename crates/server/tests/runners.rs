@@ -172,6 +172,15 @@ impl Server {
         .await
     }
 
+    async fn attach_if_empty(&self, owner: &str, space: &str, runner: &str) -> (StatusCode, Value) {
+        self.post(
+            owner,
+            &format!("/v1/spaces/{space}/runner/attach-if-empty"),
+            json!({"runner_id": runner}),
+        )
+        .await
+    }
+
     async fn demo(&self, token: &str, space: &str) -> StatusCode {
         self.post(
             token,
@@ -244,6 +253,65 @@ impl Server {
         }
         panic!("no matching event in {space}");
     }
+}
+
+#[tokio::test]
+async fn empty_only_attachment_preserves_the_winner_and_dedicated_pairing() {
+    let s = Server::start().await;
+    let space = s.space(ALICE, "Concurrent").await;
+    s.add(ALICE, &space, "bob").await;
+    let (local, _) = s.register(ALICE, "Desktop", "personal").await;
+    let (org, _) = s.register(CAROL, "Shared", "organization").await;
+    let (bobs, _) = s.register(BOB, "Bob's", "personal").await;
+    let path = format!("/v1/spaces/{space}/runner");
+    assert_eq!(s.get(ALICE, "/v1/runners").await.1["attach_if_empty"], true);
+    assert_eq!(s.get(ALICE, &path).await.1["runner"], Value::Null);
+    assert_eq!(
+        s.attach_if_empty(BOB, &space, &org).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        s.attach_if_empty(CAROL, &space, &org).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s.attach_if_empty(ALICE, &space, &bobs).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    let (left, right) = tokio::join!(
+        s.attach_if_empty(ALICE, &space, &local),
+        s.attach_if_empty(ALICE, &space, &org)
+    );
+    let winner = match (left.0, right.0) {
+        (StatusCode::OK, StatusCode::CONFLICT) => &local,
+        (StatusCode::CONFLICT, StatusCode::OK) => &org,
+        _ => panic!("expected exactly one attachment"),
+    };
+    assert_eq!(s.get(ALICE, &path).await.1["runner"]["id"], *winner);
+    assert_eq!(
+        s.attach_if_empty(ALICE, &space, winner).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(s.get(ALICE, &path).await.1["runner"]["id"], *winner);
+    let replacement = if *winner == local { &org } else { &local };
+    assert_eq!(s.attach(ALICE, &space, replacement).await.0, StatusCode::OK);
+    assert_eq!(s.get(ALICE, &path).await.1["runner"]["id"], *replacement);
+
+    let dedicated_space = s.space(ALICE, "Dedicated").await;
+    let dedicated = format!("/v1/spaces/{dedicated_space}/runner");
+    assert_eq!(s.get(ALICE, &dedicated).await.1["runner"], Value::Null);
+    // Dedicated pairing can also win after a successful empty read.
+    let (status, _) = s.dedicated_token(ALICE, &dedicated_space).await;
+    assert!(status.is_success());
+    assert_eq!(
+        s.attach_if_empty(ALICE, &dedicated_space, &local).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        s.get(ALICE, &dedicated).await.1["runner"]["kind"],
+        "dedicated"
+    );
 }
 
 fn ids(body: &Value) -> Vec<String> {
