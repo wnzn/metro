@@ -47,7 +47,7 @@ test("thresholds are probabilities from 0 to 1, as decimals or percentages", () 
 
 test("a threshold that can't be saved is explained in percent; the values stay 0 to 1", () => {
   expect(finalize({ ...base(), minRouteProbability: "high" }, usable)).toEqual({ ok: false, error: "The routing confidence must be a whole number from 0 to 100%, such as 65%." });
-  expect(finalize({ ...base(), minDirectedness: "0.4" }, usable)).toEqual({ ok: false, error: "The “asking the agent” confidence must be a whole number from 50 to 100%, such as 85%." });
+  expect(finalize({ ...base(), minDirectedness: "0.4" }, usable)).toEqual({ ok: false, error: "Space classification confidence must be a whole number from 50 to 100%, such as 85%." });
   expect(finalizeOk({ ...base(), minRouteProbability: "70%", minDirectedness: "0.9" })).toMatchObject({ minRouteProbability: 0.7, minDirectedness: 0.9 });
 });
 
@@ -80,9 +80,9 @@ test("everything is off by default and saves with no classifier", () => {
   expect(done).toMatchObject({ ok: true, routing: { enabled: false, inferAddressing: false, classifierId: null, cases: [] } });
 });
 
-test("routing and classification need a System One classifier; routing needs a use case", () => {
-  expect(finalize({ ...base(), enabled: true }, usable)).toMatchObject({ ok: false, error: "Choose a System One classifier first: routing and classification both need one." });
-  expect(finalize({ ...base(), inferAddressing: true }, usable).ok).toBe(false);
+test("routing needs a System One classifier and a use case; the legacy flag is ignored", () => {
+  expect(finalize({ ...base(), enabled: true }, usable)).toMatchObject({ ok: false, error: "Choose a System One classifier to use model routing." });
+  expect(finalize({ ...base(), inferAddressing: true }, usable)).toMatchObject({ ok: true, routing: { inferAddressing: true } });
   expect(finalize({ ...base(), inferAddressing: true, classifierId: "s1" }, usable).ok).toBe(true);
   expect(finalize({ ...base(), enabled: true, classifierId: "s1" }, usable)).toMatchObject({ ok: false, error: "Add at least one use case, or turn use-case routing off." });
 });

@@ -302,7 +302,7 @@ export function fakeServer() {
         if (b.classifier_id && !usableAs(b.classifier_id, "system_one", user)) return err(400, "classifier_id is not a System One connection you can use");
         if (b.embedding_id && !usableAs(b.embedding_id, "embeddings", user)) return err(400, "embedding_id is not an embeddings connection you can use");
         if (b.default_chat_id && !usableAs(b.default_chat_id, "chat", user)) return err(400, "default_chat_id is not a chat connection you can use");
-        if ((b.enabled || b.infer_addressing) && !b.classifier_id) return err(400, "a classifier is required");
+        if ((b.enabled && b.cases?.length) && !b.classifier_id) return err(400, "a classifier is required");
         for (const c of b.cases ?? []) if (!usableAs(c.connection_id, "chat", user)) return err(400, `case ${c.key}: not a chat connection you can use`);
         const stored: Routing = { ...b, cases: (b.cases ?? []).map((c) => ({ ...c })) };
         state.routing.set(user, stored);
@@ -426,8 +426,9 @@ export function fakeServer() {
         return ok({ events: state.events.get(key)!.filter((e) => state.ignoreCursor || e.id > after) });
       }
       if (path === "/v1/chat/messages") {
-        post(key, { kind: "message", actor: user, text: body.text });
-        if (body.invoke_agent) post(key, { kind: "agent", actor: "agent", text: `(agent) re: ${body.text}` });
+        const asks = body.save_note !== true && body.invoke_agent !== false;
+        post(key, { kind: "message", actor: user, text: body.text, audience: asks ? "agent" : "room" });
+        if (asks) post(key, { kind: "agent", actor: "agent", text: `(agent) re: ${body.text}` });
         return ok({}, 202);
       }
       if ((r = m(/^\/v1\/chat\/events\/(\d+)\/reactions$/))) {

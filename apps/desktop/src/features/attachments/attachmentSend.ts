@@ -130,7 +130,7 @@ function uploadProblem(error: unknown): string {
 registerAttachments({
   pending: (scope) => stagedFor(scope).length > 0,
 
-  async upload(scope, to, ok) {
+  async upload(scope, to, retryAction, ok) {
     const list = stagedFor(scope);
     if (list.length > MAX_MESSAGE_ATTACHMENTS) return { error: `A message carries at most ${MAX_MESSAGE_ATTACHMENTS} files; remove some.` };
     if (to.kind === "room" && !spaces().some((s) => s.id === to.spaceId)) return { error: "You're no longer a member of this Space; nothing was sent." };
@@ -158,7 +158,7 @@ registerAttachments({
         }
         const done = ids.length + list.slice(ids.length).filter((x) => x.assetId).length;
         const saved = done === 0 ? "No file was uploaded" : `${done} of ${list.length} files ${done === 1 ? "is" : "are"} in ${placeOf(to)}`;
-        return { error: `“${f.name}” wasn't uploaded: ${uploadProblem(error)}. ${saved}; nothing was sent. Send again to retry (files already uploaded aren't uploaded twice), or remove it.` };
+        return { error: `“${f.name}” wasn't uploaded: ${uploadProblem(error)}. ${saved}; nothing was sent. ${retryAction} again to retry (files already uploaded aren't uploaded twice), or remove it.` };
       }
     }
     return { ids, keys: list.map((f) => f.key) };

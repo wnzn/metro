@@ -1670,7 +1670,7 @@ pub fn page_events_before(
 }
 
 /// The newest page-only event of `user` on `page` of one of `kinds`,
-/// optionally of one activity.
+/// optionally of one activity. Tool errors are not answers.
 pub fn last_page_event(
     db: &Db,
     page: &str,
@@ -1684,6 +1684,8 @@ pub fn last_page_event(
         .query_row(
             "SELECT id, kind, actor, actor_id, text, activity, created_at FROM page_events
              WHERE page_id = ?1 AND user_id = ?2 AND kind IN (SELECT value FROM json_each(?3))
+               AND (kind <> 'error' OR
+                    (actor = 'agent' AND actor_id IS NULL AND json_extract(activity, '$.tool') IS NULL))
                AND (?4 IS NULL OR json_extract(activity, '$.id') = ?4)
              ORDER BY id DESC LIMIT 1",
             params![page, user, kinds, activity_id],
@@ -1695,6 +1697,8 @@ pub fn last_page_event(
 /// Newest room events of `kinds` (optionally of one activity id or one
 /// agent id), newest first, read only while `viewer` is a member of the
 /// Space: the membership check is in the same statement as the rows.
+/// Page sources exclude scoped tool errors before applying the limit:
+/// only the worker's own unscoped error ends an agent run.
 #[allow(clippy::too_many_arguments)]
 pub fn room_events(
     db: &Db,
@@ -1711,6 +1715,8 @@ pub fn room_events(
     let mut stmt = conn.prepare_cached(
         "SELECT id, kind, actor, actor_id, text, activity, created_at FROM space_events
          WHERE space_id = ?1 AND room_id = ?2 AND kind IN (SELECT value FROM json_each(?3))
+           AND (kind <> 'error' OR
+                (actor = 'agent' AND actor_id IS NULL AND json_extract(activity, '$.tool') IS NULL))
            AND (?4 IS NULL OR json_extract(activity, '$.id') = ?4)
            AND (?5 IS NULL OR json_extract(activity, '$.agent.id') = ?5)
            AND EXISTS (SELECT 1 FROM space_members m

@@ -302,7 +302,7 @@ impl Server {
             reqwest::Method::POST,
             token,
             "/v1/chat/messages",
-            json!({"text": text}),
+            json!({"text": text, "save_note": true}),
         )
         .await;
     }

@@ -4,6 +4,7 @@
 //! personal or organization runner attached to it), and Rig agents whose
 //! tools run on that runner.
 
+pub mod admin_settings;
 pub mod admin_users;
 pub mod agent;
 pub mod agent_dispatch;
@@ -32,6 +33,7 @@ pub mod space_agents;
 pub mod space_prefs;
 pub mod spaces;
 pub mod tools;
+pub mod updates;
 pub mod web_devices;
 pub mod web_tools;
 
@@ -76,6 +78,8 @@ pub struct AppState {
     pub managed: crate::admin_users::Managed,
     /// Avatar re-encodes running at once (see [`crate::profiles`]).
     pub avatar_encodes: Arc<Semaphore>,
+    /// Release check, runner presence and runner update requests (memory only).
+    pub updates: crate::updates::Updates,
     /// Page builder model turns at once, apart from agent runs.
     pub page_builds: Arc<Semaphore>,
 }
@@ -107,6 +111,17 @@ impl AppState {
         db.call(move |db| crate::monitoring::prune(db, retention))
             .await?;
         let state = Self {
+            updates: {
+                let updates =
+                    crate::updates::Updates::new(crate::updates::check_enabled_from_env());
+                // The highest verified release survives restarts (beside the DB).
+                match config.db_path.to_str() {
+                    Some(":memory:") | None => updates,
+                    Some(_) => {
+                        updates.with_floor_file(config.db_path.with_extension("release-floor"))
+                    }
+                }
+            },
             avatar_encodes: Arc::new(Semaphore::new(crate::profiles::MAX_AVATAR_ENCODES)),
             page_builds: Arc::new(Semaphore::new(crate::pages::generate::MAX_PAGE_BUILDS)),
             managed,
@@ -236,6 +251,7 @@ pub fn router(state: AppState) -> Router {
             put(api::put_chat_reaction).delete(api::delete_chat_reaction),
         )
         .route("/v1/runs", get(api::list_runs))
+        .route("/v1/runs/{id}", get(api::get_run))
         .route("/v1/runs/{id}/stop", post(api::stop_run))
         .route(
             "/v1/runners",
@@ -269,6 +285,7 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::library_search::router())
         // Managed user accounts, for org admins (dev namespace only).
         .merge(crate::admin_users::api_router())
+        .merge(crate::admin_settings::router())
         // Personal profiles and avatars; the avatar upload sets its own limit.
         .merge(crate::profiles::router())
         // `GET /v1/monitoring/events`: Space owners and org admins.
@@ -277,6 +294,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::spaces::router())
         .merge(crate::space_agents::router())
         .merge(crate::space_prefs::router())
+        // Release check notice and runner update requests.
+        .merge(crate::updates::router())
         // Pages; routes that carry page source set their own limit.
         .merge(crate::pages::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));

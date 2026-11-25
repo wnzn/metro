@@ -4,8 +4,7 @@
 //!   connection decide whether their unaddressed messages in this Space are
 //!   for one of its agents, and which. It can be turned on only while they
 //!   have a System One connection usable in this Space (otherwise 409).
-//!   Personal Chat keeps its own setting (`infer_addressing` in
-//!   `/v1/model-routing`).
+//!   Personal Chat sends directly, without classification.
 //! - `default_model`: the person's default chat model in this Space.
 //! - `agent_models`: per agent id, the person's default chat model for that
 //!   agent here.
@@ -308,7 +307,12 @@ async fn selection_route(
         .await
         {
             Ok(selection) => route.turn_selection = Some(selection),
-            Err(e) => route.blocked = Some(route.unavailable(&e)),
+            Err(e) => {
+                // A Space route: the room reads a generic failure.
+                let refusal = route.refused(Some(space), &e);
+                route.blocked = Some(refusal.shown);
+                route.sender_note = refusal.note;
+            }
         }
     }
     route

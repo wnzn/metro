@@ -34,7 +34,7 @@ use metro_model_protocol::web_privacy;
 
 use crate::AppState;
 use crate::db::{Activity, Addressed, Author, Event, actor, kind};
-use crate::device_relay::{DeviceError, Operation};
+use crate::device_relay::{Caller, DeviceError, Operation};
 use crate::monitoring::Code;
 use crate::tools::truncate;
 use crate::web_devices::Unavailable;
@@ -117,6 +117,15 @@ person wrote in this conversation or that web_search returned in this run.";
 /// computer set up for web search.
 pub const NO_WEB_DEVICE_PREAMBLE: &str = "Web search isn't set up for the person who asked (no computer of \
 theirs runs Metro's web search), so you can't search the web or read web pages in this run.";
+
+pub(crate) fn device_unavailable_preamble(paired: Result<bool, DeviceError>) -> &'static str {
+    if paired.is_err() {
+        "Metro couldn't check the person's web devices because of an internal error. \
+         Web tools are unavailable for this run."
+    } else {
+        NO_WEB_DEVICE_PREAMBLE
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Model-facing schemas.
@@ -971,7 +980,11 @@ fn device_error_text(tool: &str, whose: &str, e: &DeviceError) -> (String, &'sta
             format!("{what} couldn't run: {whose} computer didn't answer in time."),
             "timed_out",
         ),
-        DeviceError::CredentialChanged | DeviceError::AccessRevoked => (
+        DeviceError::AccessRevoked => (
+            format!("{what} couldn't run: web permission was revoked."),
+            "revoked",
+        ),
+        DeviceError::CredentialChanged => (
             format!(
                 "{what} couldn't run: web search on {whose} computer was removed or set up again \
                  while it ran."
@@ -1030,7 +1043,57 @@ pub enum WebScope {
         room_id: String,
     },
     /// The initiator's own personal Chat.
-    Personal,
+    PersonalChat,
+}
+
+/// The person and scope to reauthorize for the exact queued operation.
+#[derive(Clone)]
+pub(crate) struct WebGrant {
+    pub(crate) caller: Caller,
+    agent_id: Option<String>,
+}
+
+impl WebGrant {
+    pub(crate) fn personal_chat(user: &str) -> Self {
+        Self {
+            caller: Caller::personal(user),
+            agent_id: None,
+        }
+    }
+
+    /// Read all permissions under one DB lock. A denial is not a DB error.
+    pub(crate) fn denial(
+        &self,
+        conn: &rusqlite::Connection,
+        operation: Operation,
+    ) -> anyhow::Result<Option<String>> {
+        let tool = match operation {
+            Operation::WebSearch => WEB_SEARCH,
+            Operation::WebFetch => WEB_FETCH,
+            _ => return Ok(Some("not a web tool".to_owned())),
+        };
+        let user = &self.caller.user;
+        if user.is_empty() {
+            return Ok(Some("this run has no person behind it".to_owned()));
+        }
+        if let Some(space) = &self.caller.space {
+            if !crate::providers::store::is_member(conn, space, user)? {
+                return Ok(Some(
+                    "the person who started this run is no longer a member of the Space".to_owned(),
+                ));
+            }
+            let allows = match &self.agent_id {
+                Some(agent) => {
+                    crate::space_agents::get_in(conn, space, agent)?.is_some_and(|a| a.allows(tool))
+                }
+                None => false,
+            };
+            Ok((!allows).then(|| format!("the Space owner no longer lets this agent use {tool}")))
+        } else {
+            Ok((!crate::web_devices::personal_chat_enabled(conn, user)?)
+                .then(|| "web tools were turned off for your personal Chat".to_owned()))
+        }
+    }
 }
 
 /// Everything a run's web tools are bound to.
@@ -1057,7 +1120,7 @@ impl WebContext {
     /// prompt's author carries).
     async fn whose(&self) -> String {
         match self.scope {
-            WebScope::Personal => "your".to_owned(),
+            WebScope::PersonalChat => "your".to_owned(),
             WebScope::Room { .. } => {
                 let user = self.user().to_owned();
                 let name = self
@@ -1082,7 +1145,7 @@ impl WebContext {
                     .append_with(space_id, room_id, kind, &author, &text, Some(&activity))
                     .await;
             }
-            WebScope::Personal => {
+            WebScope::PersonalChat => {
                 let user = self.user().to_owned();
                 let r = self
                     .state
@@ -1119,6 +1182,13 @@ impl WebContext {
         msg
     }
 
+    async fn fail(&self, text: String, note: ToolNote) -> ToolExecutionError {
+        self.append(kind::ERROR, Author::server(actor::SYSTEM), &text, note)
+            .await;
+        self.monitor().await;
+        ToolExecutionError::other(text)
+    }
+
     async fn monitor(&self) {
         match &self.scope {
             WebScope::Room { space_id, .. } => {
@@ -1126,7 +1196,7 @@ impl WebContext {
                     .monitor_space(space_id, Code::WebSearchUnavailable)
                     .await
             }
-            WebScope::Personal => {
+            WebScope::PersonalChat => {
                 self.state
                     .monitor_personal(self.user(), Code::WebSearchUnavailable)
                     .await
@@ -1134,62 +1204,13 @@ impl WebContext {
         }
     }
 
-    /// Re-checked on every call: still a member, and the run's agent still
-    /// exists and still allows `tool` (Space); still opted in (personal
-    /// Chat).
-    async fn allowed(&self, tool: &str) -> Result<(), String> {
-        let user = self.user().to_owned();
-        if user.is_empty() {
-            return Err("this run has no person behind it".to_owned());
-        }
+    fn grant(&self) -> WebGrant {
         match &self.scope {
-            WebScope::Room { space_id, .. } => {
-                let (space, agent, t) = (space_id.clone(), self.agent_id.clone(), tool.to_owned());
-                match self
-                    .state
-                    .db
-                    .call(move |db| {
-                        let member = db.membership(&space, &user)?.is_some();
-                        let agent_allows = match &agent {
-                            Some(aid) => db.space_agent(&space, aid)?.is_some_and(|a| a.allows(&t)),
-                            None => false,
-                        };
-                        Ok((member, agent_allows))
-                    })
-                    .await
-                {
-                    Ok((true, true)) => Ok(()),
-                    Ok((true, false)) => Err(format!(
-                        "the Space owner no longer lets this agent use {tool}"
-                    )),
-                    Ok((false, _)) => Err(
-                        "the person who started this run is no longer a member of the Space"
-                            .to_owned(),
-                    ),
-                    Err(e) => {
-                        tracing::error!(error = %format!("{e:#}"), "membership check");
-                        Err("membership could not be checked".to_owned())
-                    }
-                }
-            }
-            WebScope::Personal => match self
-                .state
-                .db
-                .call(move |db| {
-                    Ok(crate::web_devices::personal_chat_enabled(
-                        &db.lock(),
-                        &user,
-                    )?)
-                })
-                .await
-            {
-                Ok(true) => Ok(()),
-                Ok(false) => Err("web tools were turned off for your personal Chat".to_owned()),
-                Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), "web prefs check");
-                    Err("your web search setting could not be checked".to_owned())
-                }
+            WebScope::Room { space_id, .. } => WebGrant {
+                caller: Caller::in_space(self.user(), space_id),
+                agent_id: self.agent_id.clone(),
             },
+            WebScope::PersonalChat => WebGrant::personal_chat(self.user()),
         }
     }
 
@@ -1202,9 +1223,24 @@ impl WebContext {
         };
         // Still a member, agent still allowed (Space); still opted in
         // (personal Chat).
-        if let Err(why) = self.allowed(tool).await {
-            self.refuse(tool, &why, "not_allowed").await;
-            return Err(ToolExecutionError::permission_denied(why));
+        let grant = self.grant();
+        let admission = grant.clone();
+        match self
+            .state
+            .db
+            .call(move |db| admission.denial(&db.lock(), operation))
+            .await
+        {
+            Ok(None) => {}
+            Ok(Some(why)) => {
+                self.refuse(tool, &why, "not_allowed").await;
+                return Err(ToolExecutionError::permission_denied(why));
+            }
+            Err(e) => {
+                tracing::error!(%e, "checking web permission");
+                let (text, code) = device_error_text(tool, "", &DeviceError::Internal);
+                return Err(self.fail(text, ToolNote::failed(tool, code)).await);
+            }
         }
         // A refusal records the operation and a fixed reason only: the
         // rejected value is never copied into shared activity or the error.
@@ -1246,26 +1282,16 @@ impl WebContext {
         )
         .await;
         let whose = self.whose().await;
-        let fail = |text: String, note: ToolNote| async move {
-            self.append(kind::ERROR, Author::server(actor::SYSTEM), &text, note)
-                .await;
-            self.monitor().await;
-            Err(ToolExecutionError::other(text))
-        };
-        let device = match crate::web_devices::pick_device(&self.state, self.user()).await {
-            Ok(d) => d,
-            Err(why) => {
-                let code = match why {
-                    Unavailable::NoDevice => "no_device",
-                    Unavailable::Offline => "offline",
-                };
-                return fail(
-                    unavailable_text(tool, &whose, why),
-                    ToolNote::failed(tool, code),
-                )
-                .await;
-            }
-        };
+        let device =
+            match crate::web_devices::pick_device(&self.state.db, &self.state.device, self.user())
+                .await
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    let (text, code) = device_error_text(tool, &whose, &e);
+                    return Err(self.fail(text, ToolNote::failed(tool, code)).await);
+                }
+            };
         let timeout = if operation == Operation::WebFetch {
             FETCH_RUN_TIMEOUT
         } else {
@@ -1274,20 +1300,13 @@ impl WebContext {
         let response = match self
             .state
             .device
-            .dispatch_web(
-                &self.state.db,
-                self.user(),
-                &device,
-                operation,
-                request,
-                timeout,
-            )
+            .dispatch_web(&self.state.db, &grant, &device, operation, request, timeout)
             .await
         {
             Ok(r) => r,
             Err(e) => {
                 let (text, code) = device_error_text(tool, &whose, &e);
-                return fail(text, ToolNote::failed(tool, code)).await;
+                return Err(self.fail(text, ToolNote::failed(tool, code)).await);
             }
         };
         let answer = match normalize(operation, &response) {
@@ -1295,7 +1314,7 @@ impl WebContext {
             Err(_) => {
                 let (text, code) =
                     device_error_text(tool, &whose, &DeviceError::BadResponse(String::new()));
-                return fail(text, ToolNote::failed(tool, code)).await;
+                return Err(self.fail(text, ToolNote::failed(tool, code)).await);
             }
         };
         let note = ToolNote {
@@ -1307,14 +1326,15 @@ impl WebContext {
         };
         if answer.provider.is_none() {
             let text = exhausted_text(tool, &whose, &answer.attempts);
-            return fail(
-                text,
-                ToolNote {
-                    failure: Some("exhausted".to_owned()),
-                    ..note
-                },
-            )
-            .await;
+            return Err(self
+                .fail(
+                    text,
+                    ToolNote {
+                        failure: Some("exhausted".to_owned()),
+                        ..note
+                    },
+                )
+                .await);
         }
         if operation == Operation::WebSearch {
             for r in &answer.results {

@@ -55,6 +55,10 @@ pub struct Grant {
     pub(super) turn_check: Option<TurnCheck>,
     /// The in-flight cap of a borrowed connection; `None` for a preset.
     pub(crate) slots: Option<Arc<Semaphore>>,
+    /// The target's `config_rev` when the model was built: its endpoint,
+    /// credential and model. A request after any of them changed is
+    /// refused, so a run never keeps using a retired endpoint or key.
+    pub(crate) config_rev: Option<i64>,
 }
 
 /// Additional checks for a client-selected model, including owned connections.
@@ -73,24 +77,42 @@ pub(crate) struct DeviceClaimGrant {
     target: String,
     model: String,
     config_rev: i64,
+    /// Typed calls always use the saved model, even for their owner.
+    require_saved_model: bool,
 }
 
 impl DeviceClaimGrant {
+    pub(super) fn typed(
+        caller: &str,
+        space: Option<&str>,
+        chosen: &str,
+        row: &super::store::Row,
+    ) -> Self {
+        Self {
+            caller: caller.to_owned(),
+            space: space.map(str::to_owned),
+            chosen: chosen.to_owned(),
+            target: row.id.clone(),
+            model: row.model.clone(),
+            config_rev: row.config_rev,
+            require_saved_model: true,
+        }
+    }
+
     pub(crate) fn allowed(&self, conn: &rusqlite::Connection) -> anyhow::Result<bool> {
         if let Some(space) = &self.space
             && !super::store::is_member(conn, space, &self.caller)?
         {
             return Ok(false);
         }
-        Ok(
-            sharing::authorize(conn, &self.caller, self.space.as_deref(), &self.chosen).is_ok_and(
-                |a| {
-                    a.row.id == self.target
-                        && a.row.config_rev == self.config_rev
-                        && (a.access == sharing::Access::Own || a.row.model == self.model)
-                },
-            ),
-        )
+        match sharing::authorize(conn, &self.caller, self.space.as_deref(), &self.chosen) {
+            Ok(a) => Ok(a.row.id == self.target
+                && a.row.config_rev == self.config_rev
+                && ((!self.require_saved_model && a.access == sharing::Access::Own)
+                    || a.row.model == self.model)),
+            Err(UseError::Internal) => Err(super::ProviderError::Use(UseError::Internal).into()),
+            Err(_) => Ok(false),
+        }
     }
 }
 
@@ -115,19 +137,21 @@ impl Grant {
                 }
             }
         };
-        let (caller, space, chosen, target, turn_check) = (
+        let (caller, space, chosen, target, turn_check, config_rev) = (
             self.caller.clone(),
             self.space.clone(),
             self.chosen.clone(),
             self.target.clone(),
             self.turn_check.clone(),
+            self.config_rev,
         );
         let still = self
             .db
             .call(move |db| {
                 let conn = db.lock();
-                if turn_check.is_some()
-                    && let Some(sid) = &space
+                // A use in a Space needs the caller still in it, whatever
+                // connection runs (their own, or one shared organization-wide).
+                if let Some(sid) = &space
                     && !super::store::is_member(&conn, sid, &caller)?
                 {
                     return Ok(Err(UseError::NotFound));
@@ -136,6 +160,9 @@ impl Grant {
                     .and_then(|a| {
                         if a.row.id != target {
                             return Ok(false);
+                        }
+                        if config_rev.is_some_and(|rev| rev != a.row.config_rev) {
+                            return Err(UseError::TurnChanged);
                         }
                         if let Some(check) = turn_check {
                             check.selection.recheck(&check.state, &conn, &a)?;
@@ -157,21 +184,21 @@ impl Grant {
     }
 }
 
-/// A refused request, as the HTTP layer reports it. Carries only the
-/// [`UseError`] text.
+/// A refused request, as the HTTP layer reports it: the [`UseError`],
+/// shown as its text.
 #[derive(Debug)]
-struct Refused(String);
+struct Refused(UseError);
 
 impl std::fmt::Display for Refused {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        self.0.fmt(f)
     }
 }
 
 impl std::error::Error for Refused {}
 
 fn refused(e: UseError) -> http_client::Error {
-    http_client::Error::Permanent(Box::new(Refused(e.to_string())))
+    http_client::Error::Permanent(Box::new(Refused(e)))
 }
 
 /// The no-redirect provider client with a grant check before each request.
@@ -234,6 +261,71 @@ impl HttpClientExt for GuardedHttp {
                 chunk
             }));
             Ok(Response::from_parts(parts, body))
+        }
+    }
+}
+
+/// An HTTP client for a Space's work on an endpoint no connection guards
+/// (the operator's `METRO_MODEL`): before each request, the person must
+/// still be a member of the Space, or nothing of the Space leaves Metro.
+#[derive(Clone)]
+pub struct SpaceMemberHttp {
+    pub(crate) inner: DynHttpClient,
+    pub(crate) db: Db,
+    pub(crate) space: String,
+    pub(crate) user: String,
+}
+
+impl SpaceMemberHttp {
+    async fn admit(&self) -> Result<(), UseError> {
+        let (space, user) = (self.space.clone(), self.user.clone());
+        let member = self
+            .db
+            .call(move |db| Ok(super::store::is_member(&db.lock(), &space, &user)?))
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %format!("{e:#}"), "rechecking Space membership");
+                false
+            });
+        if member {
+            Ok(())
+        } else {
+            Err(UseError::Revoked)
+        }
+    }
+}
+
+impl HttpClientExt for SpaceMemberHttp {
+    fn send(
+        &self,
+        req: Request<Bytes>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody>>> + Send + 'static {
+        let this = self.clone();
+        async move {
+            this.admit().await.map_err(refused)?;
+            HttpClientExt::send(&this.inner, req).await
+        }
+    }
+
+    fn send_multipart(
+        &self,
+        req: Request<MultipartForm>,
+    ) -> impl Future<Output = http_client::Result<Response<LazyBody>>> + Send + 'static {
+        let this = self.clone();
+        async move {
+            this.admit().await.map_err(refused)?;
+            HttpClientExt::send_multipart(&this.inner, req).await
+        }
+    }
+
+    fn send_streaming(
+        &self,
+        req: Request<Bytes>,
+    ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + Send {
+        let this = self.clone();
+        async move {
+            this.admit().await.map_err(refused)?;
+            HttpClientExt::send_streaming(&this.inner, req).await
         }
     }
 }
@@ -311,6 +403,7 @@ impl Transport<Chat> for GuardedDeviceTransport {
                                 target: this.grant.target.clone(),
                                 model: check.selection.model_id.clone(),
                                 config_rev: check.selection.config_rev,
+                                require_saved_model: false,
                             },
                         )
                         .await

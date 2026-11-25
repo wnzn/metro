@@ -37,4 +37,5 @@ pub mod metro_api;
 pub mod monitoring;
 pub mod store;
 mod tools_glue;
+pub mod update;
 pub mod web;

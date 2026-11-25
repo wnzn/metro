@@ -232,6 +232,20 @@ impl Server {
         agent["tools"].clone()
     }
 
+    async fn personal_web(&self, token: &str, enabled: bool) {
+        let prefs = json!({"personal_chat": enabled});
+        assert_eq!(
+            self.send(
+                Method::PUT,
+                token,
+                "/v1/web-search/prefs",
+                Some(prefs.clone())
+            )
+            .await,
+            (StatusCode::OK, prefs)
+        );
+    }
+
     async fn events(&self, token: &str, path: &str) -> Vec<Value> {
         let (status, body) = self.get(token, path).await;
         assert_eq!(status, StatusCode::OK, "{body}");
@@ -877,12 +891,8 @@ async fn personal_chat_gets_web_tools_only_after_the_persons_opt_in() {
         json!({"personal_chat": false})
     );
 
-    s.post(
-        ALICE,
-        "/v1/chat/messages",
-        json!({"text": "hello", "invoke_agent": true}),
-    )
-    .await;
+    s.post(ALICE, "/v1/chat/messages", json!({"text": "hello"}))
+        .await;
     let job = s.model_job(&model).await;
     assert!(!tool_names(&job).iter().any(|n| n.starts_with("web_")));
     assert!(system_prompt(&job).contains("You have no tools"));
@@ -910,7 +920,7 @@ async fn personal_chat_gets_web_tools_only_after_the_persons_opt_in() {
     s.post(
         ALICE,
         "/v1/chat/messages",
-        json!({"text": "search the web", "invoke_agent": true}),
+        json!({"text": "search the web"}),
     )
     .await;
     let job = s.model_job(&model).await;
@@ -956,12 +966,8 @@ async fn personal_chat_gets_web_tools_only_after_the_persons_opt_in() {
         Some(json!({"personal_chat": false})),
     )
     .await;
-    s.post(
-        ALICE,
-        "/v1/chat/messages",
-        json!({"text": "again", "invoke_agent": true}),
-    )
-    .await;
+    s.post(ALICE, "/v1/chat/messages", json!({"text": "again"}))
+        .await;
     let job = s.model_job(&model).await;
     assert!(!tool_names(&job).iter().any(|n| n.starts_with("web_")));
     s.reply_text(&model, &job, "bye").await;
@@ -1113,6 +1119,325 @@ async fn a_thread_may_fetch_what_a_person_wrote_in_the_parent_room_not_its_task_
         step += 1;
     }
     s.idle(&alice_web).await;
+}
+
+#[derive(Clone, Default)]
+struct QueueTrace {
+    bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl std::io::Write for QueueTrace {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.bytes.lock().unwrap().extend_from_slice(bytes);
+        self.changed.notify_waiters();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn queue_trace() -> &'static QueueTrace {
+    // One process-wide subscriber, so a concurrent test's first use of the
+    // enqueue callsite doesn't make the event invisible to this fixture.
+    static TRACE: std::sync::OnceLock<QueueTrace> = std::sync::OnceLock::new();
+    TRACE.get_or_init(|| {
+        let trace = QueueTrace::default();
+        let writer = trace.clone();
+        tracing::subscriber::set_global_default(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_env_filter(tracing_subscriber::EnvFilter::new(
+                    "metro_server::device_relay=debug",
+                ))
+                .with_writer(move || writer.clone())
+                .finish(),
+        )
+        .unwrap();
+        trace
+    })
+}
+
+impl QueueTrace {
+    async fn wait_for_queue(&self, connection: &str) {
+        let marker = format!("connection={connection}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = self.changed.notified();
+                if String::from_utf8_lossy(&self.bytes.lock().unwrap())
+                    .lines()
+                    .any(|line| line.contains("device job queued") && line.contains(&marker))
+                {
+                    return;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("the web job reached the relay queue");
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Revocation {
+    Membership,
+    Allowlist,
+    ChatOptOut,
+}
+
+async fn queued_web_revocation(revoke: Revocation) {
+    let trace = queue_trace();
+    for remove_after_claim in [false, true] {
+        let s = Server::start().await;
+        let (space, room, viewer) = if matches!(revoke, Revocation::ChatOptOut) {
+            s.personal_web(ALICE, true).await;
+            (None, "/v1/chat".to_owned(), ALICE)
+        } else {
+            let sid = s.space(BOB, &["alice"]).await;
+            s.agent_tools(BOB, &sid, json!(["web_search", "web_fetch"]))
+                .await;
+            let room = format!("/v1/spaces/{sid}/rooms/lobby");
+            (Some(sid), room, BOB)
+        };
+        let (_, model) = s.chat_device(ALICE).await;
+        let (web_id, web) = s.web_device(ALICE, "laptop").await;
+        s.idle(&web).await;
+        let (status, _) = s
+            .post(
+                ALICE,
+                &format!("{room}/messages"),
+                json!({"text": "@agent search", "invoke_agent": true}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job = s.model_job(&model).await;
+        assert!(tool_names(&job).iter().any(|name| name == "web_search"));
+        s.reply_tool(
+            &model,
+            &job,
+            "web_search",
+            json!({"query": "loopback fixture query"}),
+        )
+        .await;
+        trace.wait_for_queue(&web_id).await;
+        let claimed = if remove_after_claim {
+            Some(s.job(&web, &json!({})).await)
+        } else {
+            None
+        };
+        match revoke {
+            Revocation::Membership => {
+                // Exercise the relay checks without the HTTP route also
+                // stopping the run.
+                s.state
+                    .db
+                    .remove_member(space.as_deref().unwrap(), "alice")
+                    .unwrap();
+            }
+            Revocation::Allowlist => {
+                // The other operation remains allowed.
+                s.agent_tools(BOB, space.as_deref().unwrap(), json!(["web_fetch"]))
+                    .await;
+            }
+            Revocation::ChatOptOut => s.personal_web(ALICE, false).await,
+        }
+        if let Some(job) = claimed {
+            assert_eq!(
+                s.answer(&web, &job, search_answer()).await,
+                StatusCode::NO_CONTENT
+            );
+        } else {
+            let (status, _) = s.post(&web, "/v1/device/claim", json!({})).await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "claim released a payload after {revoke:?}"
+            );
+        }
+        let events = s
+            .wait_for(
+                viewer,
+                &format!("{room}/events"),
+                "error",
+                "web permission was revoked",
+            )
+            .await;
+        assert!(!events.iter().any(|event| event["kind"] == "tool_result"));
+        if !matches!(revoke, Revocation::Membership) {
+            let next = s.model_job(&model).await;
+            let output = last_tool_message(&next);
+            assert!(output.contains("web permission was revoked"), "{output}");
+            assert!(
+                !output.contains("example.com"),
+                "the withheld result reached the model"
+            );
+            s.reply_text(&model, &next, "permission changed").await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn removed_initiator_cannot_claim_or_receive_queued_space_web_work() {
+    queued_web_revocation(Revocation::Membership).await;
+}
+
+#[tokio::test]
+async fn removed_tool_cannot_claim_or_return_queued_space_web_work() {
+    queued_web_revocation(Revocation::Allowlist).await;
+}
+
+#[tokio::test]
+async fn opted_out_chat_cannot_claim_or_receive_queued_web_work() {
+    queued_web_revocation(Revocation::ChatOptOut).await;
+}
+
+#[tokio::test]
+async fn personal_page_does_not_use_chat_web_opt_in_or_write_to_chat() {
+    let s = Server::start().await;
+    let (_, model) = s.chat_device(ALICE).await;
+    let (_, web) = s.web_device(ALICE, "paired laptop").await;
+    s.idle(&web).await;
+    s.personal_web(ALICE, true).await;
+    let before = s.events(ALICE, "/v1/chat/events").await;
+    let (status, page) = s
+        .post(
+            ALICE,
+            "/v1/pages",
+            json!({
+                "scope": "personal", "template": "daily-brief"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{page}");
+    let path = format!("/v1/pages/{}", page["id"].as_str().unwrap());
+    let (status, action) = s
+        .post(
+            ALICE,
+            &format!("{path}/actions"),
+            json!({
+                "version": 1, "block_key": "ask"
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{action}");
+    let job = s.model_job(&model).await;
+    assert!(tool_names(&job).is_empty());
+    assert!(!system_prompt(&job).contains("turned on web search"));
+    s.reply_text(&model, &job, "page only").await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let (status, data) = s.post(ALICE, &format!("{path}/data"), json!({})).await;
+            assert_eq!(status, StatusCode::OK, "{data}");
+            if data["data"]["brief"]["value"]["text"] == "page only" {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the Page got its answer");
+    assert_eq!(s.events(ALICE, "/v1/chat/events").await, before);
+    s.idle(&web).await;
+}
+
+#[tokio::test]
+async fn page_answer_stays_running_when_a_web_tool_fails_then_shows_the_terminal_outcome() {
+    let s = Server::start().await;
+    let sid = s.space(ALICE, &[]).await;
+    s.agent_tools(ALICE, &sid, json!(["web_search"])).await;
+    let (_, model) = s.chat_device(ALICE).await;
+    let _ = s.web_device(ALICE, "offline laptop").await;
+    let (status, page) = s.post(ALICE, "/v1/pages", json!({
+        "scope": "space",
+        "space_id": sid,
+        "source": r#"export default <Page title="Web answer">
+          <Data name="out" source="agentAnswer" room="lobby" block="ask" />
+          <Button key="ask" label="Ask" action="runAgent" room="lobby" agent="agent" prompt="Search for news" />
+        </Page>;"#
+    })).await;
+    assert_eq!(status, StatusCode::CREATED, "{page}");
+    let path = format!("/v1/pages/{}", page["id"].as_str().unwrap());
+    let room = format!("/v1/spaces/{sid}/rooms/lobby/events");
+    for terminal_failure in [false, true] {
+        let (status, action) = s
+            .post(
+                ALICE,
+                &format!("{path}/actions"),
+                json!({
+                    "version": 1, "block_key": "ask"
+                }),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{action}");
+        assert_eq!(action["started"], true);
+        let job = s.model_job(&model).await;
+        assert!(tool_names(&job).iter().any(|n| n == "web_search"));
+        s.reply_tool(&model, &job, "web_search", json!({"query":"fixture news"}))
+            .await;
+        // This continuation is gated until we reply; the tool error has
+        // already been recorded, but no real terminal outcome exists yet.
+        let continuation = s.model_job(&model).await;
+        assert!(last_tool_message(&continuation).contains("isn't running"));
+        let events = s.events(ALICE, &room).await;
+        assert!(events.iter().any(|e| e["kind"] == "error"
+            && e["activity"]["id"] == action["run_id"]
+            && e["activity"]["tool"]["name"] == "web_search"));
+        let (status, data) = s.post(ALICE, &format!("{path}/data"), json!({})).await;
+        assert_eq!(status, StatusCode::OK, "{data}");
+        assert_eq!(data["data"]["out"]["value"]["status"], "running", "{data}");
+        // A runner failure has the turn id and a system author, but does
+        // not carry a Web ToolNote. It also cannot end the Page action.
+        let turn = metro_server::db::Activity::agent(action["run_id"].as_str().unwrap(), "Metro");
+        s.state
+            .append_with(
+                &sid,
+                "lobby",
+                "error",
+                &metro_server::db::Author::server("system"),
+                "scoped runner fixture error",
+                Some(&turn),
+            )
+            .await;
+        let (_, data) = s.post(ALICE, &format!("{path}/data"), json!({})).await;
+        assert_eq!(data["data"]["out"]["value"]["status"], "running", "{data}");
+        if terminal_failure {
+            assert_eq!(
+                s.answer(
+                    &model,
+                    &continuation,
+                    json!({"ok": false, "error": "fixture failure"})
+                )
+                .await,
+                StatusCode::NO_CONTENT
+            );
+            s.wait_for(
+                ALICE,
+                &room,
+                "error",
+                metro_server::agent::MODEL_STOPPED_IN_ROOM,
+            )
+            .await;
+            let (_, data) = s.post(ALICE, &format!("{path}/data"), json!({})).await;
+            assert_eq!(data["data"]["out"]["value"]["status"], "failed", "{data}");
+            assert_eq!(
+                data["data"]["out"]["value"]["error"],
+                metro_server::agent::MODEL_STOPPED_IN_ROOM
+            );
+        } else {
+            s.reply_text(&model, &continuation, "answer after a tool error")
+                .await;
+            s.wait_for(ALICE, &room, "agent", "answer after a tool error")
+                .await;
+            let (_, data) = s.post(ALICE, &format!("{path}/data"), json!({})).await;
+            assert_eq!(data["data"]["out"]["value"]["status"], "done", "{data}");
+            assert_eq!(
+                data["data"]["out"]["value"]["text"],
+                "answer after a tool error"
+            );
+        }
+    }
 }
 
 #[tokio::test]

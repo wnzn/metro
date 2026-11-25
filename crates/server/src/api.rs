@@ -10,7 +10,7 @@ use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 use crate::AppState;
@@ -24,8 +24,9 @@ use crate::db::{
 };
 use crate::jobs::{CompleteError, JobOutcome};
 use crate::mentions::{self, Mention};
-use crate::model_routing::{self as routing, AddressedBy, Addressing, RoutingSettings};
-use crate::orchestration::RunStatus;
+use crate::model_routing::{
+    self as routing, AddressedBy, Addressing, AddressingNote, RoutingSettings,
+};
 use crate::tools::RunnerTool;
 
 #[derive(Debug)]
@@ -61,6 +62,9 @@ impl ApiError {
     }
     pub(crate) fn message(&self) -> &str {
         &self.message
+    }
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
     }
     pub fn internal(e: anyhow::Error) -> Self {
         tracing::error!(error = %format!("{e:#}"), "internal error");
@@ -625,43 +629,13 @@ async fn check_choice(
     }
 }
 
-/// How a new message of `who` is addressed and whether it starts a turn:
-/// people-only messages never do and never reach System One; explicit
-/// agent messages always do; unaddressed ones only when the sender opted
-/// in and System One clearly says the message is for the agent.
-async fn dispatch_of(
-    state: &AppState,
-    who: &Human,
-    space: Option<&str>,
-    text: &str,
-    resolved: &[Mention],
-    addressing: Addressing,
-) -> ApiResult<(Addressed, Option<(AddressedBy, RoutingSettings)>)> {
-    let settings = || async {
-        routing::preferences(state, &who.id)
-            .await
-            .map_err(ApiError::internal)
-    };
-    Ok(match addressing {
-        // Attachments alone are ordinary conversation: never classified.
-        Addressing::Unaddressed if text.is_empty() => (addressed(resolved), None),
-        Addressing::PeopleOnly => (addressed(resolved), None),
-        Addressing::Agent => (
-            addressed(resolved),
-            Some((AddressedBy::Explicit, settings().await?)),
-        ),
-        Addressing::Unaddressed => {
-            let settings = settings().await?;
-            if routing::infer_addressed(state, &who.id, space, &settings, text).await {
-                (
-                    routing::classifier_addressed(),
-                    Some((AddressedBy::Classifier, settings)),
-                )
-            } else {
-                (addressed(resolved), None)
-            }
-        }
-    })
+#[derive(Serialize)]
+pub struct PostedMessage {
+    #[serde(flatten)]
+    event: Event,
+    addressing_note: Option<AddressingNote>,
+    /// Sender-only: why their use-case routing could not choose a model.
+    routing_note: Option<AddressingNote>,
 }
 
 pub async fn post_message(
@@ -669,7 +643,7 @@ pub async fn post_message(
     who: Human,
     Path((sid, rid)): Path<(String, String)>,
     body: JsonBody<PostMessage>,
-) -> ApiResult<(StatusCode, Json<Event>)> {
+) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
     let Json(body) = body?;
     let space = member_of(&state, &sid, &who).await?;
     let room = room_of(&state, &space, &rid).await?;
@@ -780,7 +754,7 @@ pub async fn post_message(
             .await;
     }
     // Mentioning only people never starts agent work.
-    crate::agent_dispatch::start_runs(
+    let started = crate::agent_dispatch::start_runs(
         &state,
         &space.id,
         &room,
@@ -792,7 +766,14 @@ pub async fn post_message(
         &prefs,
     )
     .await;
-    Ok((StatusCode::ACCEPTED, Json(event)))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PostedMessage {
+            event,
+            addressing_note: plan.addressing_note,
+            routing_note: started.note,
+        }),
+    ))
 }
 
 /// Demo: a deterministic `workspace.list` of the workspace root on the
@@ -989,8 +970,13 @@ pub async fn chat_events(
 #[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     text: String,
-    #[serde(default)]
+    /// Omission is a normal direct send. Keep accepting the legacy flag:
+    /// false saves a note unless the message expressly mentions `@agent`.
+    #[serde(default = "chat_invokes_agent")]
     invoke_agent: bool,
+    /// Explicit Save note: takes precedence over the legacy flag and text.
+    #[serde(default)]
+    save_note: bool,
     /// Answer with this one of the sender's own model connections instead of
     /// their default. Never falls back to the default or the server model.
     #[serde(default)]
@@ -1002,29 +988,61 @@ pub struct ChatMessage {
     asset_ids: Vec<String>,
 }
 
+fn chat_invokes_agent() -> bool {
+    true
+}
+
+impl ChatMessage {
+    fn recipients(&self, text: &str) -> ApiResult<Vec<Mention>> {
+        if self.save_note {
+            Ok(Vec::new())
+        } else if self.invoke_agent {
+            Ok(vec![Mention::Agent])
+        } else {
+            mentions::resolve(text, &[], false, &[]).map_err(ApiError::bad_request)
+        }
+    }
+}
+
 pub async fn chat_message(
     State(state): State<AppState>,
     who: Human,
     body: JsonBody<ChatMessage>,
-) -> ApiResult<(StatusCode, Json<Event>)> {
+) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
     let Json(body) = body?;
     let text = check_message(&state, &who.id, None, &body.text, &body.asset_ids).await?;
-    // Personal Chat has no other members: only `@agent` or the flag resolve.
-    let resolved =
-        mentions::resolve(&text, &[], body.invoke_agent, &[]).map_err(ApiError::bad_request)?;
+    let resolved = body.recipients(&text)?;
     let addressing = Addressing::of(&resolved);
-    agent_needs_text(&text, addressing)?;
-    let chosen = check_choice(
-        &state,
-        &who,
-        None,
-        body.provider_connection_id,
-        body.model_id,
-        body.reasoning_effort,
-        addressing,
-    )
-    .await?;
-    let (addressed, turn) = dispatch_of(&state, &who, None, &text, &resolved, addressing).await?;
+    let chosen = if body.save_note {
+        if body.provider_connection_id.is_some()
+            || body.model_id.is_some()
+            || body.reasoning_effort.is_some()
+        {
+            return Err(ApiError::bad_request("a note cannot select a model"));
+        }
+        None
+    } else {
+        check_choice(
+            &state,
+            &who,
+            None,
+            body.provider_connection_id,
+            body.model_id,
+            body.reasoning_effort,
+            addressing,
+        )
+        .await?
+    };
+    let settings = if addressing == Addressing::Agent && chosen.is_none() {
+        Some(
+            routing::preferences(&state, &who.id)
+                .await
+                .map_err(ApiError::internal)?,
+        )
+    } else {
+        None
+    };
+    let addressed = addressed(&resolved);
     let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
     let event = if body.asset_ids.is_empty() {
         db(&state, move |db| {
@@ -1043,24 +1061,58 @@ pub async fn chat_message(
             Append::NoRoom | Append::NoAsset => return Err(no_attachment()),
         }
     };
-    if let Some((addressed_by, settings)) = turn {
-        // With a choice: only that connection. Otherwise routing, if the
-        // sender turned it on, or their default; a connection that cannot
-        // be used fails the reply.
-        let route = match chosen {
-            Some(route) => route,
-            None => {
-                routing::route_turn(&state, &who.id, None, &settings, &text, addressed_by, None)
-                    .await
-            }
-        };
-        let (state, uid, event) = (state.clone(), who.id.clone(), event.clone());
+    // With a choice: only that connection. Otherwise routing, if the sender
+    // turned it on, or their default; a connection that cannot be used fails
+    // the reply. Notes have neither a choice nor routing settings.
+    let route = if let Some(settings) = settings {
+        Some(
+            routing::route_turn(
+                &state,
+                &who.id,
+                None,
+                &settings,
+                &text,
+                AddressedBy::Explicit,
+                None,
+            )
+            .await,
+        )
+    } else {
+        chosen
+    };
+    if let Some(route) = route {
+        let event = event.clone();
         tokio::spawn(async move {
             // A turn that cannot start says why in the Chat.
-            let _ = start_personal_run(&state, &uid, &event, route).await;
+            let _ = start_personal_run(&state, &who.id, &event, route).await;
         });
     }
-    Ok((StatusCode::ACCEPTED, Json(event)))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(PostedMessage {
+            event,
+            addressing_note: None,
+            routing_note: None,
+        }),
+    ))
+}
+
+#[cfg(test)]
+#[test]
+fn explicit_chat_note_never_resolves_legacy_mentions() {
+    // Rust recognizes U+0085 as whitespace; JavaScript's \s doesn't.
+    for text in ["@agent ping", "line\u{0085}@agent ping"] {
+        let legacy: ChatMessage =
+            serde_json::from_value(json!({"text": text, "invoke_agent": false})).unwrap();
+        assert_eq!(legacy.recipients(text).unwrap(), [Mention::Agent]);
+        for invoke_agent in [false, true] {
+            let note: ChatMessage = serde_json::from_value(
+                json!({"text": text, "invoke_agent": invoke_agent, "save_note": true}),
+            )
+            .unwrap();
+            assert!(note.recipients(text).unwrap().is_empty());
+        }
+    }
 }
 
 // ---- Runs ----
@@ -1069,14 +1121,58 @@ pub async fn list_runs(
     State(state): State<AppState>,
     who: Human,
 ) -> ApiResult<Json<serde_json::Value>> {
-    let spaces = db(&state, move |db| db.list_spaces(&who.id)).await?;
+    let user = who.id.clone();
+    let spaces = db(&state, move |db| db.list_spaces(&user)).await?;
     let runs: Vec<_> = state
         .runs
-        .list()
+        .list_with_failures()
         .into_iter()
-        .filter(|r| spaces.iter().any(|s| s.id == r.space_id))
-        .collect();
+        .filter(|(r, _)| spaces.iter().any(|s| s.id == r.space_id))
+        .map(|(r, failure)| run_view(&who, r, failure))
+        .collect::<ApiResult<_>>()?;
     Ok(Json(json!({"runs": runs})))
+}
+
+/// A failed membership check on a run's Space, as the run's API answers
+/// it: not being a member reads like an unknown run (404); anything else
+/// (an internal error) keeps its own status.
+fn run_not_found(e: ApiError, not_found: impl FnOnce() -> ApiError) -> ApiError {
+    if e.status() == StatusCode::NOT_FOUND {
+        not_found()
+    } else {
+        e
+    }
+}
+
+/// One run, for a member of its Space: 404 for anyone else.
+pub async fn get_run(
+    State(state): State<AppState>,
+    who: Human,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let not_found = || ApiError::not_found("no such run");
+    let (run, failure) = state.runs.get_with_failure(&id).ok_or_else(not_found)?;
+    member_of(&state, &run.space_id, &who)
+        .await
+        .map_err(|e| run_not_found(e, not_found))?;
+    Ok(Json(run_view(&who, run, failure)?))
+}
+
+/// A run as `who` sees it: with `failure`, the full reason it failed, only
+/// when `who` started it (the room showed a generic error); never for
+/// other members, including the Space owner.
+fn run_view(
+    who: &Human,
+    run: crate::orchestration::RunInfo,
+    failure: Option<crate::orchestration::RunFailure>,
+) -> ApiResult<serde_json::Value> {
+    let failure = failure.filter(|_| run.actor == who.id);
+    let mut view = serde_json::to_value(&run).map_err(|e| ApiError::internal(e.into()))?;
+    if let Some(failure) = failure {
+        view["failure"] =
+            serde_json::to_value(failure).map_err(|e| ApiError::internal(e.into()))?;
+    }
+    Ok(view)
 }
 
 pub async fn stop_run(
@@ -1090,17 +1186,16 @@ pub async fn stop_run(
     let run = state.runs.get(&id).ok_or_else(not_found)?;
     let space = member_of(&state, &run.space_id, &who)
         .await
-        .map_err(|_| not_found())?;
+        .map_err(|e| run_not_found(e, not_found))?;
     if run.actor != who.id && space.role != Role::Owner {
         return Err(ApiError::forbidden(
             "only the person who started a run, or the Space owner, can stop it",
         ));
     }
-    if !state.runs.stop(&id) {
-        return Err(ApiError::conflict("the run is not running"));
-    }
-    let run = state.runs.get(&id).unwrap_or(run);
-    debug_assert_eq!(run.status, RunStatus::Cancelled);
+    let run = state
+        .runs
+        .stop(&id)
+        .ok_or_else(|| ApiError::conflict("the run is not running"))?;
     Ok(Json(
         serde_json::to_value(run).map_err(|e| ApiError::internal(e.into()))?,
     ))
@@ -1111,8 +1206,18 @@ pub async fn stop_run(
 /// Claim the oldest queued job of any Space this runner serves. Protocol 2
 /// claims name the job's `space_id`; a registered runner keeps a separate
 /// workspace per Space and must check it.
-pub async fn runner_claim(State(state): State<AppState>, runner: Runner) -> Response {
-    match state.jobs.claim(&runner.claimer(), &runner.spaces) {
+///
+/// The optional body (`{"runner": {version, install, …}}`, at most 2 KiB)
+/// is untrusted presence data for Settings → Runners; it never fails a
+/// claim. While its manager has asked this runner to update, the response
+/// carries `X-Metro-Runner-Update: X.Y.Z` and nothing else about it.
+pub async fn runner_claim(
+    State(state): State<AppState>,
+    runner: Runner,
+    body: axum::body::Bytes,
+) -> Response {
+    let update = crate::updates::on_claim(&state, &runner, crate::updates::claim_body(&body)).await;
+    let mut response = match state.jobs.claim(&runner.claimer(), &runner.spaces) {
         Some(mut job) => {
             if runner.protocol < 2 {
                 debug_assert_eq!(runner.credential, RunnerCredential::Dedicated);
@@ -1121,7 +1226,15 @@ pub async fn runner_claim(State(state): State<AppState>, runner: Runner) -> Resp
             (StatusCode::OK, Json(job)).into_response()
         }
         None => StatusCode::NO_CONTENT.into_response(),
+    };
+    if let Some(version) = update
+        && let Ok(value) = HeaderValue::from_str(&version)
+    {
+        response
+            .headers_mut()
+            .insert(crate::updates::UPDATE_HEADER, value);
     }
+    response
 }
 
 #[derive(Deserialize)]
@@ -1162,4 +1275,17 @@ pub async fn runner_result(
         Err(CompleteError::NotClaimed) => Err(ApiError::conflict("job has not been claimed")),
         Err(CompleteError::Unknown) => Err(ApiError::not_found("no such job")),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn only_a_failed_membership_reads_as_an_unknown_run() {
+    let unknown = || ApiError::not_found("no such run");
+    let outsider = run_not_found(ApiError::not_found(NO_SPACE), unknown);
+    assert_eq!(
+        (outsider.status(), outsider.message()),
+        (StatusCode::NOT_FOUND, "no such run")
+    );
+    let broken = run_not_found(ApiError::internal(anyhow::anyhow!("disk")), unknown);
+    assert_eq!(broken.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }

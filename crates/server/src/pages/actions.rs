@@ -199,20 +199,20 @@ async fn dispatch(
                                "event_id": event.id, "space_id": space_id, "room_id": room.id}),
                     ))
                 }
-                Err(reason) => {
+                Err(refusal) => {
                     state
                         .append(
                             &space_id,
                             &room.id,
                             kind::ERROR,
                             &Author::server(actor::SYSTEM),
-                            &reason,
+                            &refusal.shown,
                         )
                         .await;
-                    failed(state, page_run, &reason).await;
+                    failed(state, page_run, &refusal.shown).await;
                     Ok(reply(
                         StatusCode::ACCEPTED,
-                        json!({"kind": action::RUN_AGENT, "started": false, "error": reason,
+                        json!({"kind": action::RUN_AGENT, "started": false, "error": refusal.private(),
                                "event_id": event.id, "space_id": space_id, "room_id": room.id}),
                     ))
                 }

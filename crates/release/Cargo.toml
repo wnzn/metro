@@ -1,0 +1,61 @@
+[package]
+name = "metro-release"
+version.workspace = true
+edition = "2024"
+rust-version.workspace = true
+description = "Metro release verification: decides whether a published Metro release is genuine (Sigstore bundle against the pinned release workflow identity, SHA256SUMS, archives and IMAGES.txt)."
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+name = "metro_release"
+path = "src/lib.rs"
+
+[features]
+default = []
+# Test doubles (TestVerifier, fixture releases). Only from dev-dependencies.
+testing = []
+# End-to-end test builds only (tests/e2e/updates.py): a loopback release
+# source and the test verifier, from METRO_TEST_RELEASE_BASE. Never enabled
+# by a release build (packaging/test_release_workflow.py checks).
+e2e = ["testing", "blocking"]
+# Fetchers: `blocking` (ureq, the runner) and `async` (reqwest, desktop/server).
+blocking = ["dep:ureq"]
+async = ["dep:reqwest", "dep:sigstore-tuf", "dep:jiff"]
+
+[dependencies]
+# Pinned exactly: pre-1.0 with frequent breaking releases. Wrapped in
+# src/sigstore.rs only.
+sigstore-verify = { version = "=0.17.0", default-features = false, features = ["aws-lc-rs"] }
+# Trust-root refresh (desktop and server only): the transport-free TUF core;
+# Metro supplies the HTTP transport (no `client` feature, no reqwest/tokio of
+# its own). Same pin and release as sigstore-verify.
+sigstore-tuf = { version = "=0.17.0", default-features = false, features = ["aws-lc-rs"], optional = true }
+jiff = { version = "0.2", optional = true }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+sha2 = "0.11"
+# Fulcio claim parsing; the versions sigstore-verify already uses.
+x509-cert = { version = "0.2.5", default-features = false }
+der = { version = "0.7.10", features = ["oid", "alloc"] }
+# Archive gzip/deflate (already in Cargo.lock).
+flate2 = "1.1.11"
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"], optional = true }
+reqwest = { version = "0.13", default-features = false, features = ["rustls"], optional = true }
+
+# Archive extraction opens files with O_NOFOLLOW.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.180"
+rustix = { version = "1.1.6", features = ["fs"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[dev-dependencies]
+metro-release = { path = ".", features = ["testing", "blocking", "async"] }
+tokio = { version = "1.53.1", features = ["rt", "macros", "time"] }
+tempfile = "3.27.0"
+base64 = "0.22"
+aws-lc-rs = "1"
+jiff = "0.2"
+sigstore-verify = { version = "=0.17.0", default-features = false, features = ["aws-lc-rs"] }

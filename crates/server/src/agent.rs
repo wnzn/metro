@@ -31,7 +31,7 @@ use crate::AppState;
 use crate::config::ModelConfig;
 use crate::db::reactions::{ReactToMessageTool, ReactionScope};
 use crate::db::{Activity, Addressed, Author, Event, LimitError, Room, activity, actor, kind};
-use crate::model_routing::{AddressedBy, Route, RouteSource};
+use crate::model_routing::{AddressedBy, Refusal, Route, RouteSource};
 use crate::monitoring::Code;
 use crate::orchestration::{
     RunInfo, RunStatus, ThreadAction, ThreadControl, ThreadCreateTool, ThreadSendTool,
@@ -118,17 +118,40 @@ const PERSONAL_WEB_PREAMBLE: &str = "You are the Metro agent in the user's priva
 user sees this conversation. You have no access to the user's Spaces from here; the user turned on web search \
 for this Chat, so you may search the web and read web pages for them. Answer concisely in plain text.";
 
-fn model(config: &ModelConfig) -> rig_core::Model<rig_core::providers::openai::wire::Chat> {
+/// The operator's model on `http`, which must follow no redirect: a
+/// redirect would resend the conversation to another URL.
+fn model(
+    config: &ModelConfig,
+    http: rig_core::http_client::DynHttpClient,
+) -> rig_core::Model<rig_core::providers::openai::wire::Chat> {
     OpenAIConfig::with_key(&METRO_DIALECT, config.api_key.clone())
         .with_base_url(config.base_url.clone())
-        .client()
+        .connect(http)
         .chat(config.model.clone())
+}
+
+/// The operator's model for a run `user` starts in Space `space`: every
+/// request first checks that they are still a member.
+fn space_model(
+    state: &AppState,
+    config: &ModelConfig,
+    user: &str,
+    space: &str,
+) -> DynModel<Completion> {
+    let http = crate::providers::guard::SpaceMemberHttp {
+        // Metro's no-redirect client, as every model request uses.
+        inner: state.providers.http(),
+        db: state.db.clone(),
+        space: space.to_owned(),
+        user: user.to_owned(),
+    };
+    model(config, rig_core::http_client::DynHttpClient::new(http)).into()
 }
 
 /// A plain OpenAI-compatible chat model, as the environment model is built;
 /// for embedders and test backends that hand routing a model.
 pub fn openai_compatible_model(config: &ModelConfig) -> DynModel<Completion> {
-    model(config).into()
+    model(config, crate::providers::no_redirect_shared()).into()
 }
 
 const NO_MODEL: &str = "Ask agent is unavailable: you have no default model connection, and \
@@ -139,6 +162,9 @@ struct RunModel {
     model: DynModel<Completion>,
     max_tokens: Option<u64>,
     params: Option<serde_json::Value>,
+    /// The connection that runs and its `config_rev` when the model was
+    /// built (see [`crate::providers::SelectedModel::built_from`]).
+    built_from: Option<(String, i64)>,
     effective_device: Option<crate::providers::EffectiveDevice>,
 }
 
@@ -165,9 +191,12 @@ async fn route_model(
     user_id: &str,
     space: Option<&str>,
     route: &mut Route,
-) -> Result<RunModel, String> {
+) -> Result<RunModel, Refusal> {
     if let Some(why) = &route.blocked {
-        return Err(why.clone());
+        return Err(Refusal {
+            shown: why.clone(),
+            note: route.sender_note.clone(),
+        });
     }
     let note = &mut route.note;
     match route.connection_id.clone() {
@@ -195,13 +224,14 @@ async fn route_model(
                         model: selected.model,
                         max_tokens: selected.max_tokens,
                         params: selection.and_then(|s| s.params(&selected.provider_id)),
+                        built_from: selected.built_from,
                         effective_device: selected.effective_device,
                     })
                 }
-                Err(e) => Err(route.unavailable(&e)),
+                Err(e) => Err(route.refused(space, &e)),
             }
         }
-        None => match crate::providers::default_model(state, user_id).await {
+        None => match crate::providers::default_model(state, user_id, space).await {
             Ok(Some(selected)) => {
                 note.connection_id = Some(selected.connection_id.clone());
                 note.provider_id = Some(selected.provider_id.clone());
@@ -210,6 +240,7 @@ async fn route_model(
                     model: selected.model,
                     max_tokens: selected.max_tokens,
                     params: None,
+                    built_from: selected.built_from,
                     effective_device: selected.effective_device,
                 })
             }
@@ -221,15 +252,19 @@ async fn route_model(
                     note.reason =
                         "this server's model (you have no default chat connection)".to_owned();
                     Ok(RunModel {
-                        model: model(config).into(),
+                        model: match space {
+                            Some(sid) => space_model(state, config, user_id, sid),
+                            None => model(config, state.providers.http()).into(),
+                        },
                         max_tokens: None,
                         params: None,
+                        built_from: None,
                         effective_device: None,
                     })
                 }
-                None => Err(NO_MODEL.to_owned()),
+                None => Err(Refusal::shown(NO_MODEL)),
             },
-            Err(e) => Err(format!("Ask agent is unavailable: {e}.")),
+            Err(e) => Err(route.refused(space, &e)),
         },
     }
 }
@@ -328,10 +363,102 @@ async fn cancelled(mut cancel: watch::Receiver<bool>) {
 
 enum Outcome {
     Completed(String),
-    /// The text shown in the room, and the allowlisted monitoring code.
+    /// The run ended for its own reasons (its limits, a tool, its history):
+    /// the text, and the allowlisted monitoring code.
     Failed(String, Code),
+    /// The model or the connection serving it failed.
+    ModelFailed {
+        failure: ModelFailure,
+        redact_diagnostics: bool,
+    },
     Cancelled,
 }
+
+/// A run that failed because of its model or the connection serving it: a
+/// provider error, a transport error, or a request Metro refused (a revoked
+/// share, a lost membership, a changed connection), typed or relayed. The
+/// provider's own text is never kept: it can name an endpoint, an account
+/// or echo a credential, whoever owns the connection (the person, someone
+/// who shared it, or the operator). Only its allowlisted category and HTTP
+/// status are.
+#[derive(Clone, Copy, Debug)]
+struct ModelFailure {
+    code: Code,
+    status: Option<u16>,
+}
+
+impl ModelFailure {
+    /// `None` when `e` is not about the model or its connection (a tool's
+    /// own failure, the run's limits).
+    fn of(e: &PromptError) -> Option<Self> {
+        let status = match e {
+            PromptError::Provider(p) => rig_core::ErrorReport::from(p).http_status,
+            PromptError::Report(r) if !matches!(r.kind, rig_core::ErrorKind::Tool(_)) => {
+                r.http_status
+            }
+            _ => return None,
+        };
+        Some(Self {
+            code: failure_code(e),
+            status,
+        })
+    }
+
+    /// The failure's category and status. Never the provider's text.
+    fn text(&self) -> String {
+        match self.status {
+            Some(status) => format!("The agent failed. {} (HTTP {status})", self.code.summary()),
+            None => format!("The agent failed. {}", self.code.summary()),
+        }
+    }
+}
+
+/// Why the person whose run failed can no longer use its model as it was
+/// built, if that is why: rechecked as a new turn would be (Rig reports
+/// Metro's own refusal of a request only as text, so the reason is never
+/// parsed from it). A grant that is gone, or a connection whose endpoint,
+/// credential or model changed since the model was built (`built_from`).
+/// `(reason, message)` for the person alone.
+async fn refusal_after(
+    state: &AppState,
+    user_id: &str,
+    space: Option<&str>,
+    route: &Route,
+    built_from: Option<(String, i64)>,
+) -> Option<(String, String)> {
+    use crate::model_routing::AddressingNote;
+    let mut recheck = route.clone();
+    match route_model(state, user_id, space, &mut recheck).await {
+        Err(Refusal {
+            note:
+                Some(AddressingNote::ModelUnavailable {
+                    reason, message, ..
+                }),
+            ..
+        }) => Some((reason.to_owned(), format!("The agent stopped. {message}"))),
+        Err(refusal) => Some((
+            "not_allowed".to_owned(),
+            format!("The agent stopped. {}", refusal.private()),
+        )),
+        // Another connection, or the same one with another endpoint,
+        // credential or model: compared by identity and revision.
+        Ok(now) if built_from.is_some() && now.built_from != built_from => Some((
+            "connection_changed".to_owned(),
+            "The agent stopped: the model connection it was using changed or was replaced \
+             during this run. Ask again to use your model as it is now."
+                .to_owned(),
+        )),
+        Ok(_) => None,
+    }
+}
+
+/// What a Space room shows when a run's model failed or stopped being
+/// available, whatever the cause: other members can't tell a revoked share
+/// from an upstream failure. The initiator gets the reason privately
+/// ([`crate::orchestration::RunFailure`]).
+pub const MODEL_STOPPED_IN_ROOM: &str =
+    "The agent stopped: the sender's model failed or is no longer available to this run.";
+const PAGE_MODEL_FAILED: &str = "The agent could not complete the model turn.";
 
 /// The monitoring code of a failed run, from the error's type and
 /// classification only; its text is never recorded.
@@ -395,6 +522,7 @@ async fn drive(
     prompt: Message,
     history: Vec<Message>,
     cancel: Option<watch::Receiver<bool>>,
+    connection: Option<&str>,
     redact_diagnostics: bool,
 ) -> Outcome {
     let limits = &state.config.limits;
@@ -412,20 +540,28 @@ async fn drive(
         result = tokio::time::timeout(limits.agent_timeout, run) => match result {
             Ok(Ok(response)) => Outcome::Completed(response.output()),
             Ok(Err(e)) => {
-                // A provider can echo request bodies, credentials or its
-                // own account diagnostics. Keep only the classified code
-                // for Pages turns; don't log or publish the raw error.
+                let model_failure = ModelFailure::of(&e);
+                let code = model_failure.map_or_else(|| failure_code(&e), |failure| failure.code);
+                // Shared Pages errors publish only fixed wording. Keep the
+                // allowlisted model failure separately for the initiator.
                 if redact_diagnostics {
-                    let code = failure_code(&e);
-                    tracing::warn!(?code, "Pages model turn failed");
-                    return Outcome::Failed("The agent could not complete the model turn.".to_owned(), code);
+                    tracing::warn!(code = code.code(), "Pages model turn failed");
+                } else if let Some(failure) = model_failure {
+                    tracing::warn!(
+                        code = failure.code.code(),
+                        status = ?failure.status,
+                        connection = ?connection,
+                        "agent run failed: model"
+                    );
+                } else {
+                    tracing::warn!(code = code.code(), connection = ?connection, "agent run failed");
                 }
-                tracing::warn!(error = %e, "agent run failed");
-                Outcome::Failed(
-                    truncate(&format!("The agent failed: {e}"), 2_000),
-                    failure_code(&e),
-                )
-            }
+                match model_failure {
+                    Some(failure) => Outcome::ModelFailed { failure, redact_diagnostics },
+                    None if redact_diagnostics => Outcome::Failed(PAGE_MODEL_FAILED.to_owned(), code),
+                    None => Outcome::Failed(truncate(&format!("The agent failed: {e}"), 2_000), code),
+                }
+            },
             Err(_) => Outcome::Failed(
                 "The agent took too long and was stopped.".to_owned(),
                 Code::AgentTimedOut,
@@ -491,7 +627,14 @@ where
 {
     let model = route_model(state, user_id, space, &mut route)
         .await
-        .map_err(PageTurnError::Failed)?;
+        .map_err(|refusal| {
+            let text = if pin.is_some() {
+                refusal.shown
+            } else {
+                refusal.private().to_owned()
+            };
+            PageTurnError::Failed(text)
+        })?;
     // Its own small pool: page building never takes agent-run slots.
     let Ok(_permit) = state.page_builds.clone().try_acquire_owned() else {
         return Err(PageTurnError::Failed(
@@ -529,12 +672,21 @@ where
         Message::user(prompt),
         history,
         None,
+        route.note.connection_id.as_deref(),
         pin.is_some(),
     )
     .await
     {
         Outcome::Completed(text) => Ok((text, route.note)),
         Outcome::Failed(text, _) => Err(PageTurnError::Failed(text)),
+        Outcome::ModelFailed {
+            failure,
+            redact_diagnostics,
+        } => Err(PageTurnError::Failed(if redact_diagnostics {
+            PAGE_MODEL_FAILED.to_owned()
+        } else {
+            failure.text()
+        })),
         Outcome::Cancelled => Err(PageTurnError::Failed(
             "The page builder was stopped.".to_owned(),
         )),
@@ -699,9 +851,9 @@ pub async fn start_room_run(
     mut route: Route,
     agent: &SpaceAgent,
     pick: Option<String>,
-) -> Result<RunInfo, String> {
+) -> Result<RunInfo, Refusal> {
     let Some(user_id) = initiator.id.clone() else {
-        return Err("runs must be started on behalf of a person".to_owned());
+        return Err(Refusal::shown("runs must be started on behalf of a person"));
     };
     // Rechecked at acceptance, before any model is built or called.
     ensure_member(state, space_id, initiator).await?;
@@ -722,14 +874,15 @@ pub async fn start_room_run(
         .count();
     if active >= state.config.limits.max_space_runs {
         state.monitor_space(space_id, Code::AgentBusy).await;
-        return Err(
-            "This Space already has the most agent runs it may have at once; try again shortly."
-                .to_owned(),
-        );
+        return Err(Refusal::shown(
+            "This Space already has the most agent runs it may have at once; try again shortly.",
+        ));
     }
     let Ok(permit) = state.agent_runs.clone().try_acquire_owned() else {
         state.monitor_space(space_id, Code::AgentBusy).await;
-        return Err("The agent is busy with other requests; try again shortly.".to_owned());
+        return Err(Refusal::shown(
+            "The agent is busy with other requests; try again shortly.",
+        ));
     };
     let task = truncate(&trigger.text, 200);
     // The registry's `actor` is the initiator's stable id: it authorizes stops.
@@ -737,9 +890,11 @@ pub async fn start_room_run(
         Ok(started) => started,
         Err(e) => {
             state.monitor_space(space_id, Code::AgentBusy).await;
-            return Err(e);
+            return Err(e.into());
         }
     };
+    // Ends the run if this start is abandoned before the worker owns it.
+    let registration = crate::orchestration::Registration::new(state.runs.clone(), info.id.clone());
     // The turn is shown as the agent that works it: a thread's agent by the
     // thread's name, otherwise the Space agent's name; never the person who
     // asked. Every event carries the agent's identity.
@@ -775,6 +930,8 @@ pub async fn start_room_run(
     );
     tokio::spawn(async move {
         let _permit = permit;
+        // The worker owns the run now; dropped when it ends, even by panic.
+        let _registration = registration;
         execute_room_run(
             &state, &space_id, &room, &initiator, &trigger, &run_id, &turn, &route, model, cancel,
             &agent,
@@ -782,6 +939,34 @@ pub async fn start_room_run(
         .await;
     });
     Ok(info)
+}
+
+/// Why `initiator`'s run in `space_id` on `route` failed, for them alone:
+/// their lost membership, a refusal or change of the connection, or the
+/// failure's category.
+async fn private_failure(
+    state: &AppState,
+    space_id: &str,
+    initiator: &Author,
+    route: &Route,
+    built_from: Option<(String, i64)>,
+    failure: ModelFailure,
+) -> crate::orchestration::RunFailure {
+    use crate::orchestration::RunFailure;
+    if ensure_member(state, space_id, initiator).await.is_err() {
+        return RunFailure {
+            reason: "not_member".to_owned(),
+            message: "The agent stopped: you are no longer a member of this Space.".to_owned(),
+        };
+    }
+    let user_id = initiator.id.clone().unwrap_or_default();
+    match refusal_after(state, &user_id, Some(space_id), route, built_from).await {
+        Some((reason, message)) => RunFailure { reason, message },
+        None => RunFailure {
+            reason: "model_error".to_owned(),
+            message: failure.text(),
+        },
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -798,6 +983,7 @@ async fn execute_room_run(
     cancel: watch::Receiver<bool>,
     agent: &SpaceAgent,
 ) {
+    let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
     let loaded = {
         // A thread's task came from its parent room: URLs people wrote
@@ -888,7 +1074,8 @@ async fn execute_room_run(
             );
             if search || fetch {
                 let user = initiator.id.clone().unwrap_or_default();
-                if crate::web_devices::has_device(state, &user).await {
+                let paired = crate::web_devices::has_device(state, &user).await;
+                if matches!(paired, Ok(true)) {
                     let provenance = crate::web_tools::Provenance::from_messages(
                         parent_events
                             .iter()
@@ -910,7 +1097,8 @@ async fn execute_room_run(
                         .append_preamble(crate::web_tools::WEB_PREAMBLE)
                         .dynamic_tools(crate::web_tools::tools(&ctx, search, fetch));
                 } else {
-                    builder = builder.append_preamble(crate::web_tools::NO_WEB_DEVICE_PREAMBLE);
+                    builder = builder
+                        .append_preamble(crate::web_tools::device_unavailable_preamble(paired));
                 }
             }
             if is_thread {
@@ -961,6 +1149,7 @@ async fn execute_room_run(
                 prompt,
                 history(&earlier, &key),
                 Some(cancel),
+                route.note.connection_id.as_deref(),
                 offers_pages,
             )
             .await
@@ -973,6 +1162,7 @@ async fn execute_room_run(
         .get(run_id)
         .is_some_and(|r| r.status == RunStatus::Cancelled);
     let outcome = if stopped { Outcome::Cancelled } else { outcome };
+    let mut failure = None;
     let (status, posted) = match outcome {
         Outcome::Completed(text) => match final_reply(text, reacted.load(Ordering::SeqCst)) {
             Reply::Text(text) => (
@@ -986,10 +1176,41 @@ async fn execute_room_run(
             state.monitor_space(space_id, code).await;
             (RunStatus::Failed, Some((kind::ERROR, text)))
         }
-        Outcome::Cancelled => (
-            RunStatus::Cancelled,
-            Some((kind::STATUS, format!("Agent run {run_id} was cancelled."))),
-        ),
+        // One public category for every model failure, in the room and in
+        // the Space owner's monitoring: neither can tell a revoked share
+        // from an upstream failure. The initiator gets the reason.
+        Outcome::ModelFailed {
+            failure: model,
+            redact_diagnostics,
+        } => {
+            state.monitor_space(space_id, Code::ProviderFailed).await;
+            failure = Some(
+                private_failure(state, space_id, initiator, route, built_from.clone(), model).await,
+            );
+            (
+                RunStatus::Failed,
+                Some((
+                    kind::ERROR,
+                    if redact_diagnostics {
+                        PAGE_MODEL_FAILED
+                    } else {
+                        MODEL_STOPPED_IN_ROOM
+                    }
+                    .to_owned(),
+                )),
+            )
+        }
+        Outcome::Cancelled => (RunStatus::Cancelled, None),
+    };
+    // The status and its private failure are committed together; a stop
+    // that won in the meantime keeps the run cancelled, with no failure.
+    let Some(status) = state.runs.finish_with(run_id, status, failure) else {
+        tracing::warn!(run = %run_id, "the run is no longer registered; nothing published");
+        return;
+    };
+    let posted = match status {
+        RunStatus::Cancelled => Some((kind::STATUS, format!("Agent run {run_id} was cancelled."))),
+        _ => posted,
     };
     if let Some((event_kind, text)) = &posted {
         state
@@ -1018,7 +1239,6 @@ async fn execute_room_run(
             Some(&turn.at(phase)),
         )
         .await;
-    state.runs.finish(run_id, status);
     let text = posted
         .map(|(_, text)| text)
         .unwrap_or_else(|| "(reacted to the task without a reply)".to_owned());
@@ -1212,6 +1432,8 @@ impl Threads {
             Some(format!("Thread of {}", self.agent.name)),
         )
         .await
+        // The parent agent may repeat this in the room: the shown text only.
+        .map_err(|refusal| refusal.shown)
     }
 
     fn check_text(&self, what: &str, text: &str) -> Result<String, String> {
@@ -1343,7 +1565,7 @@ impl Threads {
                 let stopped = self
                     .active_runs(&child.id)
                     .iter()
-                    .filter(|r| self.state.runs.stop(&r.id))
+                    .filter(|r| self.state.runs.stop(&r.id).is_some())
                     .count();
                 Ok(json!({"thread_id": child.id, "stopped_runs": stopped}).to_string())
             }
@@ -1369,7 +1591,7 @@ pub fn stop_runs_of(state: &AppState, space_id: &str, user_id: &str) -> usize {
         .list()
         .iter()
         .filter(|r| r.space_id == space_id && r.actor == user_id && r.status == RunStatus::Running)
-        .filter(|r| state.runs.stop(&r.id))
+        .filter(|r| state.runs.stop(&r.id).is_some())
         .count()
 }
 
@@ -1502,7 +1724,9 @@ async fn run_personal(
     // Refusals are recorded only in this person's own scope, as a code.
     let model = match route_model(&state, &user_id, None, &mut route).await {
         Ok(model) => model,
-        Err(message) => {
+        Err(refusal) => {
+            // Personal Chat: `shown` is already the full reason.
+            let message = refusal.shown;
             append(kind::ERROR, message.clone()).await;
             state
                 .monitor_personal(&user_id, Code::ProviderUnavailable)
@@ -1536,6 +1760,7 @@ async fn execute_personal_run(
     lane: PersonalLane,
     turn: Activity,
 ) {
+    let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
     let agent_author = Author::server(actor::AGENT);
     let append_as = |kind: &'static str, text: String, activity: Option<Activity>| {
@@ -1615,11 +1840,18 @@ async fn execute_personal_run(
     } else {
         PERSONAL_PREAMBLE
     });
+    if lane == PersonalLane::Chat && trigger.text.is_empty() && !trigger.attachments.is_empty() {
+        builder = builder.append_preamble(
+            "The latest message contains only attachments. You cannot access those files. \
+             Ask what the user needs and invite them to paste the relevant text.",
+        );
+    }
     if web {
-        if crate::web_devices::has_device(&state, &user_id).await {
+        let paired = crate::web_devices::has_device(&state, &user_id).await;
+        if matches!(paired, Ok(true)) {
             let ctx = crate::web_tools::WebContext {
                 state: state.clone(),
-                scope: crate::web_tools::WebScope::Personal,
+                scope: crate::web_tools::WebScope::PersonalChat,
                 initiator: Author {
                     id: Some(user_id.clone()),
                     name: String::new(),
@@ -1634,7 +1866,8 @@ async fn execute_personal_run(
                 .append_preamble(crate::web_tools::WEB_PREAMBLE)
                 .dynamic_tools(crate::web_tools::tools(&ctx, true, true));
         } else {
-            builder = builder.append_preamble(crate::web_tools::NO_WEB_DEVICE_PREAMBLE);
+            builder =
+                builder.append_preamble(crate::web_tools::device_unavailable_preamble(paired));
         }
     }
     let mut reacted = Arc::new(AtomicBool::new(false));
@@ -1669,6 +1902,7 @@ async fn execute_personal_run(
         prompt,
         history(&earlier, &key),
         None,
+        route.note.connection_id.as_deref(),
         false,
     )
     .await
@@ -1682,6 +1916,15 @@ async fn execute_personal_run(
         // Only the person whose Chat this is can read it, and only the code.
         Outcome::Failed(text, code) => {
             state.monitor_personal(&user_id, code).await;
+            tagged(kind::ERROR, text).await;
+            activity::FAILED
+        }
+        Outcome::ModelFailed { failure, .. } => {
+            state.monitor_personal(&user_id, failure.code).await;
+            let text = match refusal_after(&state, &user_id, None, &route, built_from).await {
+                Some((_, message)) => message,
+                None => failure.text(),
+            };
             tagged(kind::ERROR, text).await;
             activity::FAILED
         }

@@ -292,12 +292,10 @@ async fn space_events_are_owner_only_scoped_and_carry_no_raw_text() {
 
     let space_query = format!("?space_id={a}");
     let codes = s.codes(ALICE, &space_query).await;
+    // A model failure during a run has one public code in a Space.
     assert_eq!(
         codes,
-        [
-            pair("provider", "unreachable"),
-            pair("runner", "not_claimed")
-        ]
+        [pair("provider", "failed"), pair("runner", "not_claimed")]
     );
     // No raw text: not the prompt, path, query, endpoint, key or token.
     let (_, raw) = s.monitoring(ALICE, &space_query).await;
@@ -610,8 +608,15 @@ async fn success_notes_cancellation_and_lost_membership_record_nothing() {
     .await;
     let a = s.space(ALICE, "alpha").await;
     s.personal_turn(ALICE, "hello", "completed").await;
-    s.post(ALICE, "/v1/chat/messages", json!({"text": "note to self"}))
+    let (status, note) = s
+        .post(
+            ALICE,
+            "/v1/chat/messages",
+            json!({"text": "@agent is literal in this note", "save_note": true}),
+        )
         .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{note}");
+    assert_eq!(note["audience"], "room");
     s.post(
         ALICE,
         &format!("/v1/spaces/{a}/rooms/lobby/messages"),
@@ -625,6 +630,14 @@ async fn success_notes_cancellation_and_lost_membership_record_nothing() {
         json!({"text": "just a note for people"}),
     )
     .await;
+    assert_eq!(s.chat_phases(ALICE, "started").await, 1);
+    let (_, after) = s
+        .get(
+            ALICE,
+            &format!("/v1/chat/events?after={}", note["id"].as_i64().unwrap()),
+        )
+        .await;
+    assert_eq!(after["events"], json!([]));
     assert!(s.codes(ALICE, "?scope=me").await.is_empty());
     assert!(s.codes(ALICE, &format!("?space_id={a}")).await.is_empty());
 

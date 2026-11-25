@@ -78,6 +78,7 @@ const server = createServer(async (req, res) => {
   if (!who) { res.setHeader("www-authenticate", "Bearer"); return send(res, 401, { error: "invalid token" }); }
   if (p === "/v1/me") return send(res, 200, { id: who === "admin" ? "jm" : "pat", actor: who === "admin" ? "JM" : "Pat", is_org_admin: who === "admin" });
   if (who !== "admin") return send(res, 403, { error: "only an organization admin can manage users" });
+  if (p === "/v1/server/update") return mock.serverUpdate ? send(res, 200, mock.serverUpdate) : send(res, 404, { error: "not found" });
   let body = "";
   for await (const c of req) body += c;
   if (p === "/v1/admin/users" && req.method === "GET") {
@@ -321,6 +322,44 @@ await test("admin signs in; names render as text", async () => {
   }
   assert(await evaluate("document.getElementById('token').value") === "", "token left in the field");
   assert(!(await evaluate("location.href")).includes("metro_"), "token in URL");
+});
+
+await test("the server update notice shows only a verified newer release", async () => {
+  const signedInFresh = async () => {
+    await goto(base + "/admin");
+    await signIn(ADMIN);
+    await waitFor(vis("panel") + " && document.querySelectorAll('#users-body tr').length > 0");
+    await delay(150);
+  };
+  mock.serverUpdate = null;
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown on a 404");
+  assert(await evaluate(vis("panel")), "a 404 ended the session");
+  mock.serverUpdate = { current: "0.5.0", available: false, latest: { version: "0.5.0", images: {} } };
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown when up to date");
+  mock.serverUpdate = { current: "0.5.0", available: true, latest: { historical: false, version: "0.5.1\"><img src=x onerror=window.__xss=1>", images: {} } };
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown for a malformed version");
+  const image = "ghcr.io/wnzn/metro-server:v0.5.1@sha256:" + "a".repeat(64);
+  mock.serverUpdate = { current: "0.5.0", available: true, latest: { historical: true, version: "0.5.1", images: { server: image } } };
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "historical notice was actionable");
+  mock.serverUpdate.latest.historical = false;
+  await signedInFresh();
+  await waitFor(vis("update-notice"));
+  assert((await text("update-latest")) === "0.5.1", "latest");
+  assert((await text("update-current")) === "0.5.0", "current");
+  assert((await text("update-image")) === image, "image");
+  assert(await evaluate("document.getElementById('update-link').href") === "https://github.com/wnzn/metro/releases/tag/v0.5.1", "link");
+  assert(await evaluate("window.__xss") === undefined, "script ran");
+  await click("#sign-out");
+  assert(!(await evaluate(vis("update-notice"))), "notice kept after sign-out");
+  mock.serverUpdate = null;
+  // Leave the page as "admin signs in" did: signed in, users listed, no
+  // notice (the following tests run in that session).
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown without an update");
 });
 
 await test("every button has an accessible name; inputs have labels", async () => {
@@ -673,11 +712,20 @@ await test("withdrawing the choice in another tab signs this one out; the stored
   const tab2 = (m, p) => cdp(m, p, otherSession);
   const eval2 = async (expr) => (await tab2("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true })).result.value;
   await tab2("Runtime.enable");
-  await tab2("Page.navigate", { url: lan + "/admin" });
+  await tab2("Page.enable");
+  const navigation = await tab2("Page.navigate", { url: lan + "/admin" });
+  assert(!navigation.errorText, "second tab navigation failed: " + navigation.errorText);
+  const sharedChoice = `location.origin === ${JSON.stringify(lan)} && document.readyState === 'complete'
+    && document.getElementById('signin')?.hidden === false
+    && document.getElementById('plain-http-note')?.hidden === false`;
   for (const end = Date.now() + 5000; Date.now() < end; await sleep(50)) {
-    if (await eval2("document.readyState === 'complete' && !!document.getElementById('plain-http-forget') && !document.getElementById('signin').hidden")) break;
+    if (await eval2(sharedChoice)) break;
   }
-  assert(await eval2("!document.getElementById('signin').hidden && !document.getElementById('plain-http-note').hidden"), "second tab didn't share the choice");
+  assert(await eval2(sharedChoice), "second tab didn't share the choice: " + await eval2(
+    `JSON.stringify({origin: location.origin, ready: document.readyState,
+      warning: document.getElementById('plain-http')?.hidden === false,
+      accepted: location.origin === ${JSON.stringify(lan)} && localStorage.getItem('metro.admin.plainHttpAccepted') === '1'})`
+  ));
   mock.log.length = 0;
   await eval2("document.getElementById('plain-http-forget').click()");
   await waitFor(`document.getElementById('panel').hidden && ${vis("plain-http")} && document.getElementById('signin').hidden`);

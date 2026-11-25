@@ -67,20 +67,17 @@ test("Model routing is off by default and says nothing is sent", async () => {
   expect(app.value("id:routing-min-route")).toBe("65");
   expect(app.value("id:routing-min-directed")).toBe("85");
   expect(text(app)).toContain("Off: nothing is sent to pick a model.");
-  expect(text(app)).toContain("Off: your unaddressed messages are ordinary conversation and are sent to no model.");
+  expect(text(app)).toContain("Personal Chat sends directly to your agent.");
   expect(text(app)).toContain("Messages that mention only people, and other members' messages for routing or classification.");
   expect(app.enabled("id:routing-save")).toBe(false); // nothing changed
   // Section headers are one sentence; the rest is under Learn more, closed until asked.
-  // Each opt-in says, beside its toggle, that it's off by default and what it sends where.
+  // The routing opt-in explains what it sends beside its toggle.
   expect(app.shows("text:Off by default. When on, each agent request you start is sent to System One to pick a model.")).toBe(true);
-  expect(
-    app.shows("text:Off by default. When on, each message you write that mentions nobody is sent to System One, in rooms and your Chat. A start it allows runs as you."),
-  ).toBe(true);
+  expect(app.shows("id:routing-infer")).toBe(false);
   expect(app.shows("text:A model you pick for one turn overrides it.")).toBe(false);
   await app.press("id:routing-learn-more:toggle");
   await app.waitFor("text:A model you pick for one turn overrides it.");
-  await app.press("id:addressing-learn-more:toggle");
-  await app.waitFor("text:A message that mentions a person only (@bob) never starts the agent and is never classified.");
+  expect(app.shows("id:dataflow-addressing >> text:/This never applies to personal Chat/")).toBe(true);
   await app.press("id:classifier-learn-more:toggle");
   await app.waitFor("text:Typed questions: Noul, choice and score.");
   expect(f.posts().some((p) => p.path === "/v1/model-routing")).toBe(false);
@@ -95,7 +92,7 @@ test("pickers offer only models of their capability that I can use, mine and sha
   // Turning routing on without a classifier is refused before any request.
   await app.press("id:routing-enabled");
   await app.press("id:routing-save");
-  await app.waitFor("text:Choose a System One classifier first: routing and classification both need one.");
+  await app.waitFor("text:Choose a System One classifier to use model routing.");
   expect(puts(f, "/v1/model-routing")).toHaveLength(0);
 
   // The classifier picker lists System One connections only.
@@ -137,7 +134,7 @@ test("pickers offer only models of their capability that I can use, mine and sha
 
   await app.press("id:routing-save");
   await app.waitFor("id:routing-notice");
-  expect(text(app)).toContain("Saved. Use-case routing is on (1 use case); unaddressed messages stay ordinary conversation.");
+  expect(text(app)).toContain("Saved. Use-case routing is on (1 use case).");
   expect(puts(f, "/v1/model-routing").at(-1)?.body).toEqual({
     enabled: true,
     infer_addressing: false,
@@ -158,14 +155,16 @@ test("pickers offer only models of their capability that I can use, mine and sha
   expect(app.value("id:routing-min-route")).toBe("70");
 });
 
-test("classification of my unaddressed messages is a separate opt-in and names the endpoint that receives them", async () => {
+test("the legacy Chat opt-in is hidden and round-trips; Space classification confidence remains editable", async () => {
   const { f, s1 } = routingWorld();
+  f.state.routing.set("alice", { enabled: false, infer_addressing: true, classifier_id: null, embedding_id: null, default_chat_id: null, min_directedness: 0.85, min_route_probability: 0.65, cases: [] });
   const app = await signIn(f, "alice");
   await settings(app, "routing");
+  await app.waitFor("id:addressing-group");
+  expect(app.shows("id:routing-infer")).toBe(false);
+  expect(app.enabled("id:routing-save")).toBe(false);
+  expect(app.shows("id:addressing-group >> text:/Turn classification on or off in each Space/")).toBe(true);
   await pick(app, "routing-classifier", s1.id);
-  await app.press("id:routing-infer");
-  expect(app.shows("id:dataflow-addressing-facts >> text:Each message you write that mentions nobody and isn't sent with Ask agent")).toBe(true);
-  expect(app.shows("id:dataflow-addressing-facts >> text:“Alice System One” (TypeSafe System One)")).toBe(true);
   // A percentage below the floor, or not a whole number, can't be saved.
   await app.clear("id:routing-min-directed");
   await app.type("id:routing-min-directed", "2");
@@ -387,19 +386,18 @@ test("Search is the box at the top of every page and Scheduled tasks a sidebar d
   expect(app.shows("id:top-search")).toBe(true);
 });
 
-test("in the narrowest window the opt-ins, their consent lines, Save and the runner controls stay reachable", async () => {
+test("in the narrowest window routing consent, Save and the runner controls stay reachable", async () => {
   const { f } = routingWorld();
   const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 720, height: 560 });
   await signIn(f, "alice", app);
   await settings(app, "routing");
   await app.waitFor("id:routing-enabled");
-  // Consent sits beside each toggle, not behind hover or a disclosure.
+  // Consent sits beside the routing toggle, not behind hover or a disclosure.
   expect(app.shows("text:Off by default. When on, each agent request you start is sent to System One to pick a model.")).toBe(true);
-  expect(app.shows("text:/each message you write that mentions nobody is sent to System One/")).toBe(true);
-  await app.press("id:routing-infer");
+  await app.press("id:routing-enabled");
   expect(app.shows("id:routing-save")).toBe(true); // the fixed footer
   expect(app.enabled("id:routing-save")).toBe(true);
-  expect(app.shows("id:dataflow-addressing-facts >> text:Each message you write that mentions nobody and isn't sent with Ask agent")).toBe(true);
+  expect(app.shows("id:dataflow-addressing >> text:/This never applies to personal Chat/")).toBe(true);
   await app.press("id:routing-revert");
   await settings(app, "runners");
   await app.waitFor("id:runner-name");

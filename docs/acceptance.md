@@ -103,6 +103,168 @@ anyone outside the release workflow; macOS (not built); real vendor
 accounts and sign-ins; pretrained `google/embeddinggemma-2` ranking.
 Windows files carry no Authenticode signature.
 
+## Source only: updater lane and reviewed integration (2026-11-25, local)
+
+Local merge on `lane/updates-backend` of approved updater
+`8ee22c9a67530ccef1a9be0761bfbb821518eb0f` and reviewed integration
+`02a0cb73c78347c07d7da1e213307bf6505a9bef`. No integration branch update,
+push, deployment, or release.
+
+- `cargo build --locked --workspace` and formatting passed with normal
+  features. The normal binaries passed `smoke`, `pages`, `agent_pages`,
+  `web_search`, `settings`, `device_connector`, `intelligence`, and
+  `library` end to end.
+- Locked tests for release, URL policy, model protocol, connector,
+  desktop, runner, server, and TUI: 1,034 passed, 3 ignored. Strict
+  workspace Clippy (`--all-targets -- -D warnings`) passed.
+- `tests/e2e/updates.py` passed against separately built fixture server
+  and runner binaries. A build combining the `e2e` verifier feature with
+  `METRO_RELEASE_CHANNEL=release` was refused at compile time as intended.
+- The installer suite passed 41/41 (PowerShell ran on Linux). It covered
+  the published installer locks and the case where an installed runner
+  script knows self-update but predates the HTTP and proxy handling.
+- The admin browser suite passed 27/27 in
+  `mcr.microsoft.com/playwright:v1.58.2-noble`. The unmodified integration
+  tip reproduced a second-tab consent test failure. The merged test
+  enables Page events and waits for the correct origin and consent UI;
+  this did not change the panel's credential or consent behavior.
+
+The connector and launcher passed an offline locked
+`x86_64-pc-windows-gnu` check with pre-existing connector warnings.
+Windows updates remain manual-only. Native Windows MSI and helper death,
+live TUF refresh, and a published-to-published update were not tested.
+The legacy installer and shared-workspace recovery limits below still apply.
+
+## Source only: shared-workspace updater re-review (2026-11-25, local)
+
+Verified on `lane/updates-backend` at `d57420e`, after `b451766`. This is
+unreleased source; nothing was pushed, merged, or deployed.
+
+- The Linux watchdog keeps the original `instance.lock` through the
+  trial handoff and rollback. The trial launcher verifies the handoff
+  against its parent and the workspace journal. The bundled server
+  inherits both the instance lock and the local workspace lease.
+  A portable launcher was refused before opening a workspace on the
+  same data root. In a separate fixture the bundled server outlived the
+  trial launcher: an independent holder of the old lock protocol could
+  not become primary, and the watchdog preserved the database, backup,
+  and journals instead of restoring over the live writer.
+- The desktop's durable floor survived both expiry of its cached
+  verification lease and absence of the cached status. A lower signed
+  release was not offered; the pending stage was retained until it
+  could be revalidated. The admin notice used the runner's shared-floor
+  decision: a below-floor release remained history with no update link
+  or image instructions.
+- 71 focused locked Rust tests passed; one child-process helper was
+  ignored as a standalone test and invoked by its parent test. These
+  suites included the published Linux installer lock regressions.
+  Formatting, strict Clippy, and the admin browser suite (22/22) passed.
+  `tests/e2e/updates.py` passed with separate test-release binaries. A
+  damaged or unprotected runner journal was left unchanged and the
+  runner exited with status 75 before sending a claim.
+
+**Manual recovery and legacy limits.** If a trial loses its watchdog and
+continuous exclusion cannot be proved, Metro does not restore on restart.
+The `desktop-update.json` gate and backup are kept. Stop Metro and its
+bundled server, keep both database copies, and resolve the installation
+and data together before resuming. Old launchers honor `instance.lock`
+while it is held but do not read the durable gate after the lock is
+released; do not run them against a workspace pending manual recovery.
+A server already orphaned by an older launcher did not inherit the new
+guards; older launchers and servers must be stopped before updating.
+Earlier installer migration restrictions still apply.
+
+Windows remains manual-only. The connector and launcher checked for
+`x86_64-pc-windows-gnu`, with pre-existing connector warnings. Native
+Windows MSI and helper-death tests remain deferred. No live update or
+TUF refresh was run.
+
+## Source only: updater re-review (2026-11-25, local)
+
+Verified locally on `lane/updates-backend` at `92979ca`, after `916f8da`.
+None of this is in Metro 0.4.0. Nothing was deployed, pushed, or merged.
+
+**Migration and recovery limits.** Linux desktop in-app updates and Linux
+runner self-update require an explicit migration. With the app or runner
+stopped and no installer running, use the installer and verified prebuilt
+archive for the build that includes these changes:
+`update --archive FILE --migrate-update-lock`. Retire old installer copies
+before restarting. The new lock excludes 0.4.0 operations that take `.lock`;
+published runner `configure` and `uninstall` and Windows script `Uninstall`
+bypass it. The migration does not make those old commands safe to run
+concurrently.
+
+Windows script and MSI updates are manual-only. The launcher won't start an
+MSI helper. If an old journal leaves completion uncertain, Metro stops
+before opening the workspace and preserves both the journal and the backup.
+Confirm the Windows Installer transaction has ended and resolve the
+installation and data manually before restarting. A dead helper PID is
+not proof. Unowned backups from older Metro builds are not consumed.
+
+**Local checks.**
+
+- Locked all-features tests for `metro-release`, `metro-runner`,
+  `metro-connector`, `metro-server` and `metro-desktop`: 740 passed,
+  2 ignored. Formatting and strict Clippy on those crates passed.
+  Regressions cover interruptions before and after backup publication and
+  during cleanup, a modified staged menu script, legacy MSI journals,
+  cached TUF expiry, and a shared release floor raised by another checker.
+  The desktop and runner update locks were also exercised in both
+  directions against the published Linux scripts.
+- `tests/e2e/updates.py` passed with separate test-release binaries. When
+  rollback was due and the previous executable was unavailable, the runner
+  saved rollback intent, exited with status 75, and sent no claim. The same
+  test exercised the in-place update and the rollback after three restarts.
+- Packaging, release-signature and Windows-signing suites: 286 passed,
+  11 skipped. Published installer fixtures matched the signed 0.4.0
+  `SHA256SUMS` entries. The Linux installers ran in throwaway homes. The
+  Windows fixture exercised the published and current lock paths in
+  PowerShell on Linux, stopping before extraction; it was not an MSI run.
+- The admin browser suite passed 22/22 in
+  `mcr.microsoft.com/playwright:v1.58.2-noble`. The release, connector and
+  desktop crates checked for `x86_64-pc-windows-gnu`, with pre-existing
+  connector warnings. This was cross-compilation only.
+
+Native Windows MSI transactions, helper death and shortcuts, live TUF
+refresh, and updates between published Metro releases were not tested.
+
+## Source only: updater review 2 (2026-11-25, local)
+
+Tested on `lane/updates-backend` at `3de67c1`. This work was not part of
+Metro 0.4.0 and was not published or merged.
+
+- The locked Rust workspace suite ran with `METRO_SERVER_BIN` pointed at
+  the local server binary: 803 passed, 2 ignored. Formatting and workspace
+  Clippy (`--all-targets --all-features -- -D warnings`) passed.
+- Locked all-features tests for `metro-release`, `metro-server`,
+  `metro-runner`, `metro-connector`, and `metro-desktop`: 730 passed,
+  2 ignored. This run omitted debug symbols to fit on disk.
+- The eight plain end-to-end scripts passed against builds without
+  test-release hooks: `smoke`, `threads`, `device_connector`, `settings`,
+  `schedules`, `intelligence`, `attachments`, and `library`.
+- `tests/e2e/updates.py` passed with separate test-release fixture
+  binaries. It verified the update notice and owner-only request, updated
+  the runner from 1.0.0 to 1.0.1 without restarting the process, then
+  rolled a crashing 1.0.2 back after three restarts and reported
+  `start_failed`.
+- A build check with the `e2e` feature and `METRO_RELEASE_CHANNEL=release`
+  was rejected by the compile-time guard as expected.
+- The packaging, release-signature, and Windows-signing suites ran with
+  PyYAML 6.0.4: 282 passed, 11 skipped. The PowerShell fixtures ran on Linux;
+  they are not native Windows install or signing tests.
+  Both Linux installers failed the new live-lock regressions when the same
+  tests were run against the scripts from `b04dd43`.
+- The admin browser suite passed 22/22 in
+  `mcr.microsoft.com/playwright:v1.58.2-noble`. `actionlint` 1.7.12 passed.
+- `metro-release`, `metro-connector`, and `metro-desktop` checked for
+  `x86_64-pc-windows-gnu` in `metro-package-builder:windows-gnu`. This was
+  a cross-check only. Native Windows MSI execution, shortcuts, and helper
+  handoff were not exercised.
+
+The trust tests replay CDN-captured signed TUF metadata locally and verify
+real Metro 0.4.0 Sigstore fixtures offline. They do not demonstrate a live
+TUF refresh or an update from one published Metro release to another.
+
 ## Staged: Spaces with several agents, per-connection model lists and the desktop redesign at 4175475 (2026-11-25, project manager, local)
 
 A **gate on unreleased source**, run on Linux and reported by the project

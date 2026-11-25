@@ -199,12 +199,17 @@ jobs:
       - name: Pinned BuildKit builder
         run: docker buildx create --name metro-release --driver docker-container --driver-opt "image=$BUILDKIT_IMAGE" --bootstrap
       - name: Build server and runner OCI archives (locked, from this commit)
+        env:
+          # Published images only: they check for updates (server notice,
+          # runner presence). Build-and-smoke runs stay source builds.
+          RELEASE_CHANNEL: ${{ inputs.push && 'release' || '' }}
         run: |
           set -eu
           for component in server runner; do
             python3 -I packaging/image_release.py build --component "$component" --platform "$PLATFORM" \
               --version "$VERSION" --revision "$GITHUB_SHA" --source "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
-              --source-ref "$GITHUB_REF" --builder metro-release --out "$RUNNER_TEMP/images"
+              --source-ref "$GITHUB_REF" --builder metro-release --out "$RUNNER_TEMP/images" \
+              --release-channel "$RELEASE_CHANNEL"
           done
       - name: Load exactly those archives
         run: |
