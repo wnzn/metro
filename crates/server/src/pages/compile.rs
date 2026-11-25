@@ -669,7 +669,7 @@ impl<'a> Compiler<'a> {
             match c {
                 Child::Element(e) if e.name == "Data" => {}
                 Child::Element(e) => {
-                    if let Some(b) = self.block(e, &scope, 2) {
+                    if let Some(b) = self.block(e, &scope) {
                         blocks.push(b);
                     }
                 }
@@ -1195,7 +1195,7 @@ impl<'a> Compiler<'a> {
         Some(t)
     }
 
-    fn block(&mut self, e: &Element, scope: &Scope, depth: usize) -> Option<Block> {
+    fn block(&mut self, e: &Element, scope: &Scope) -> Option<Block> {
         let Some(d) = def(&e.name) else {
             let mut names = block_names();
             names.retain(|n| *n != "Page");
@@ -1298,7 +1298,7 @@ impl<'a> Compiler<'a> {
                 for c in &e.children {
                     match c {
                         Child::Element(x) => {
-                            if let Some(b) = self.block(x, scope, depth + 1) {
+                            if let Some(b) = self.block(x, scope) {
                                 block.children.push(b);
                             }
                         }
@@ -1570,7 +1570,7 @@ pub fn compile(src: &str, resolver: &mut dyn Resolver) -> Compiled {
             }
         }
         offsets(&root, &c.generated, &mut inserts);
-        inserts.sort_by(|a, b| b.0.cmp(&a.0));
+        inserts.sort_by_key(|i| std::cmp::Reverse(i.0));
         for (at, text) in inserts {
             source.insert_str(at, &text);
         }

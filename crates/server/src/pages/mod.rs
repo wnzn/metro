@@ -7,9 +7,19 @@
 //! JSON tree ([`spec`]) that the desktop app draws with Metro's own
 //! components.
 
+pub mod access;
+pub mod actions;
+pub mod api;
 pub mod compile;
+pub mod data;
+pub mod generate;
+pub mod limits;
 pub mod spec;
+pub mod store;
 pub mod tsx;
+
+pub use api::router;
+pub use store::{hooks, init};
 
 #[cfg(test)]
 mod tests;

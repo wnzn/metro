@@ -270,6 +270,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::spaces::router())
         .merge(crate::space_agents::router())
         .merge(crate::space_prefs::router())
+        // Pages; routes that carry page source set their own limit.
+        .merge(crate::pages::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;

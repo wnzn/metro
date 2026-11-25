@@ -74,6 +74,8 @@ pub struct Element {
     pub at: usize,
     /// Byte offset just after the tag name, where a missing `key` is inserted.
     pub name_end: usize,
+    /// Byte offset just after the element's end (`/>` or its close tag).
+    pub end: usize,
     pub attrs: Vec<Attr>,
     pub children: Vec<Child>,
 }
@@ -400,6 +402,7 @@ impl<'a> Parser<'a> {
                         name,
                         at,
                         name_end,
+                        end: self.i,
                         attrs,
                         children: Vec::new(),
                     });
@@ -428,6 +431,7 @@ impl<'a> Parser<'a> {
             name,
             at,
             name_end,
+            end: self.i,
             attrs,
             children,
         })
@@ -925,11 +929,9 @@ impl<'a> Parser<'a> {
             }
         }
         while let Some(c) = self.peek() {
-            if c.is_ascii_digit() || c == b'.' || c == b'e' || c == b'E' || c == b'_' {
-                self.i += 1;
-            } else if (c == b'+' || c == b'-')
-                && matches!(self.b.get(self.i - 1), Some(b'e' | b'E'))
-            {
+            let exponent_sign =
+                (c == b'+' || c == b'-') && matches!(self.b.get(self.i - 1), Some(b'e' | b'E'));
+            if c.is_ascii_digit() || matches!(c, b'.' | b'e' | b'E' | b'_') || exponent_sign {
                 self.i += 1;
             } else {
                 break;
@@ -1038,8 +1040,29 @@ pub fn parse(src: &str) -> Result<Element, Diagnostic> {
             key: None,
         });
     }
-    if let Some(p) = src.find(|c: char| c == '\0') {
+    if let Some(p) = src.find('\0') {
         return Err(diag(src, p, "the source contains a NUL character"));
     }
     Parser::new(src).program()
+}
+
+/// The source text of the element with `key`, if any.
+pub fn element_source<'s>(src: &'s str, key: &str) -> Option<&'s str> {
+    fn find(e: &Element, key: &str) -> Option<(usize, usize)> {
+        if let Some(Attr {
+            value: AttrValue::Str(k),
+            ..
+        }) = e.attr("key")
+            && k == key
+        {
+            return Some((e.at, e.end));
+        }
+        e.children.iter().find_map(|c| match c {
+            Child::Element(x) => find(x, key),
+            _ => None,
+        })
+    }
+    let root = parse(src).ok()?;
+    let (a, b) = find(&root, key)?;
+    src.get(a..b)
 }

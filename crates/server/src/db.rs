@@ -471,6 +471,8 @@ impl Db {
         // After spaces, members and model routing settings exist.
         crate::space_agents::init(&conn)?;
         crate::space_prefs::init(&conn)?;
+        // After spaces (Space pages reference them).
+        crate::pages::init(&conn)?;
         let version: Option<String> = conn
             .query_row(
                 "SELECT value FROM metro_meta WHERE key = 'schema_version'",
@@ -698,6 +700,8 @@ impl Db {
                 crate::library_search::hooks::member_removed(&tx, space_id, user_id)?;
                 // Their per-Space preferences go with their membership.
                 crate::space_prefs::member_removed(&tx, space_id, user_id)?;
+                // Their page preferences, confirmations and drafts there too.
+                crate::pages::hooks::member_removed(&tx, space_id, user_id)?;
                 RemoveMember::Removed
             }
         };

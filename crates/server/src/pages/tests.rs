@@ -788,3 +788,180 @@ fn arbitrary_input_never_panics() {
         let _ = space_page(weird);
     }
 }
+
+mod store_tests {
+    use super::super::limits::PageLimits;
+    use super::super::store::{self, CreateError, NewVersion};
+    use crate::db::Db;
+
+    fn version(author: &str, title: &str) -> NewVersion {
+        NewVersion {
+            author_id: author.to_owned(),
+            kind: "manual",
+            prompt: None,
+            model_ref: None,
+            restored_from: None,
+            source: format!("export default <Page title=\"{title}\" />"),
+            spec: "{}".to_owned(),
+            title: title.to_owned(),
+        }
+    }
+
+    fn db_with_space() -> (Db, String) {
+        let db = Db::open_in_memory().unwrap();
+        let space = db.create_space("alice", "Team", 10).unwrap();
+        db.add_member(&space.id, "bob", 10).unwrap();
+        (db, space.id)
+    }
+
+    #[test]
+    fn page_limits_count_live_pages_per_space_and_person() {
+        let (db, sid) = db_with_space();
+        let limits = PageLimits {
+            pages_per_space: 2,
+            versions_per_page: 200,
+        };
+        let a = store::create(&db, Some(&sid), &version("alice", "A"), &limits)
+            .unwrap()
+            .unwrap();
+        store::create(&db, Some(&sid), &version("bob", "B"), &limits)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store::create(&db, Some(&sid), &version("alice", "C"), &limits).unwrap(),
+            Err(CreateError::TooMany(2))
+        );
+        // Personal pages count per person, separately.
+        store::create(&db, None, &version("alice", "Mine"), &limits)
+            .unwrap()
+            .unwrap();
+        // Deleting frees a slot; undeleting into a full Space is refused.
+        assert!(store::soft_delete(&db, &a.id, "alice").unwrap());
+        store::create(&db, Some(&sid), &version("alice", "C"), &limits)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store::undelete(&db, &a.id, &limits).unwrap(),
+            Err(CreateError::TooMany(2))
+        );
+    }
+
+    #[test]
+    fn versions_are_optimistic_and_pruned_keeping_the_first() {
+        let (db, sid) = db_with_space();
+        let limits = PageLimits {
+            pages_per_space: 50,
+            versions_per_page: 3,
+        };
+        let p = store::create(&db, Some(&sid), &version("alice", "v1"), &limits)
+            .unwrap()
+            .unwrap();
+        for n in 1..6 {
+            let head = store::add_version(
+                &db,
+                &p.id,
+                n,
+                &version("alice", &format!("v{}", n + 1)),
+                &limits,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(head, n + 1);
+        }
+        // A save based on an old head never overwrites.
+        assert_eq!(
+            store::add_version(&db, &p.id, 3, &version("bob", "stale"), &limits).unwrap(),
+            Err(store::Conflict { head: 6 })
+        );
+        let kept: Vec<i64> = store::versions(&db, &p.id)
+            .unwrap()
+            .iter()
+            .map(|v| v.version)
+            .collect();
+        assert_eq!(kept, vec![6, 5, 4, 1]);
+        let page = store::get(&db, &p.id).unwrap().unwrap();
+        assert_eq!(page.title, "v6");
+    }
+
+    #[test]
+    fn leaving_and_deleting_a_space_purge_page_state() {
+        let (db, sid) = db_with_space();
+        let limits = PageLimits::default();
+        let p = store::create(&db, Some(&sid), &version("bob", "Bob's"), &limits)
+            .unwrap()
+            .unwrap();
+        store::put_prefs(
+            &db,
+            "bob",
+            &p.id,
+            &store::Prefs {
+                pinned: true,
+                position: Some(1),
+            },
+        )
+        .unwrap();
+        store::confirm(&db, "bob", &p.id, 1).unwrap();
+        store::create_draft(
+            &db,
+            &store::NewDraft {
+                page_id: Some(&p.id),
+                space_id: Some(&sid),
+                author_id: "bob",
+                base_version: Some(1),
+                block_key: None,
+                prompt: "x",
+            },
+        )
+        .unwrap();
+        db.remove_member(&sid, "bob").unwrap();
+        assert!(!store::prefs(&db, "bob", &p.id).unwrap().pinned);
+        assert!(!store::confirmed(&db, "bob", &p.id, 1).unwrap());
+        let drafts: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM page_drafts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(drafts, 0);
+        // The page Bob created stays, like his messages.
+        assert!(store::get(&db, &p.id).unwrap().is_some());
+        // Deleting the Space removes its pages and versions.
+        let personal = store::create(&db, None, &version("alice", "Mine"), &limits)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            db.delete_space(&sid, "alice", "Team").unwrap(),
+            crate::spaces::Deleted::Done { .. }
+        ));
+        assert!(store::get(&db, &p.id).unwrap().is_none());
+        let versions: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM page_versions WHERE page_id = ?1",
+                [&p.id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(versions, 0);
+        assert!(store::get(&db, &personal.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn soft_deleted_pages_are_purged_after_retention() {
+        let (db, sid) = db_with_space();
+        let p = store::create(
+            &db,
+            Some(&sid),
+            &version("alice", "A"),
+            &PageLimits::default(),
+        )
+        .unwrap()
+        .unwrap();
+        store::soft_delete(&db, &p.id, "alice").unwrap();
+        let now = crate::db::now_ms();
+        assert_eq!(store::purge_expired(&db, now).unwrap(), 0);
+        assert_eq!(
+            store::purge_expired(&db, now + store::DELETED_RETENTION_MS + 1).unwrap(),
+            1
+        );
+        assert!(store::get(&db, &p.id).unwrap().is_none());
+    }
+}
