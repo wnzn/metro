@@ -1,4 +1,4 @@
-import { cleanup, effect, signal, untracked } from "nsh";
+import { cleanup, effect, lifecycle, signal, untracked } from "nsh";
 import type { EditorDiagnostic } from "nsh/base";
 import type { Page, PageDiagnostic, VersionMeta, Definition } from "../../api/pages";
 import { isPageStatus, pageFailure, targetOf } from "../../api/pages";
@@ -11,6 +11,7 @@ import { Diagnostics, PagesError } from "./controls";
 import { PageRenderer } from "./PageRenderer";
 import type { PageToolProps } from "./PageView";
 import { cell } from "./renderPlan";
+import { pageReadLane } from "./refresh";
 
 function useTool(props: PageToolProps) {
   const client = apiClient(), base = props.page;
@@ -28,46 +29,89 @@ const outOfDate = "The page changed. Close this editor and refresh before trying
 
 export function SourceEditor(props: PageToolProps) {
   const { base, client, valid, finish } = useTool(props);
+  const target = signal(base), latest = signal<Page | null>(null);
   const source = signal(base.source), diagnostics = signal<PageDiagnostic[]>([]);
   const status = signal<"checking" | "valid" | "invalid">("valid");
-  const error = signal(""), busy = signal(false), conflict = signal(false);
+  const error = signal(""), busy = signal(false), conflict = signal<number | null>(null);
+  const headError = signal(""), reading = signal(false);
+  const review = signal<"diff" | "source">("source");
+  const headReads = pageReadLane<number>();
   let checked = base.source, validationTicket = 0;
   effect(() => {
     const value = source();
     const ticket = ++validationTicket;
+    if (lifecycle() !== "active" || !valid()) return;
     if (value === checked) { status.set("valid"); diagnostics.set([]); return; }
     untracked(() => { status.set("checking"); diagnostics.set([]); error.set(""); });
+    const controller = new AbortController();
     const timer = setTimeout(() => {
       if (!client || !valid() || ticket !== validationTicket) return;
       if (new TextEncoder().encode(value).length > 65_536) {
         error.set("Page TSX cannot be larger than 64 KiB."); status.set("invalid"); return;
       }
-      void client.validatePage(targetOf(base), value).then(answer => {
-        if (!valid() || ticket !== validationTicket) return;
+      void client.validatePage(targetOf(base), value, controller.signal).then(answer => {
+        if (!valid() || controller.signal.aborted || ticket !== validationTicket) return;
         diagnostics.set(answer.diagnostics);
         if (answer.ok) checked = value;
         status.set(answer.ok ? "valid" : "invalid");
       }, e => {
-        if (!valid() || ticket !== validationTicket) return;
+        if (!valid() || controller.signal.aborted || ticket !== validationTicket) return;
         if (isPageStatus(e, 404) || isPageStatus(e, 403)) { props.lost(); return; }
         error.set(pagesProblem(e));
         status.set("invalid");
       });
     }, 350);
-    return () => clearTimeout(timer);
+    return () => { clearTimeout(timer); controller.abort(); };
+  });
+  function readHead() {
+    const minimum = conflict();
+    if (!client || minimum === null || latest() || !valid() || lifecycle() !== "active") return;
+    return headReads.run(minimum, async (signal, current) => {
+      const allowed = () => current() && valid() && lifecycle() === "active" && conflict() === minimum;
+      if (!allowed()) return;
+      reading.set(true); headError.set("");
+      try {
+        const head = await client.getPage(base.id, signal);
+        if (!allowed()) return;
+        if (head.id !== base.id || head.space_id !== base.space_id || !!head.deleted_at) { props.lost(); return; }
+        if (head.head_version < minimum) { headError.set("Metro did not return the current version. Try again."); return; }
+        latest.set(head);
+      } catch (e) {
+        if (!allowed()) return;
+        if (isPageStatus(e, 404) || isPageStatus(e, 403)) props.lost();
+        else headError.set(pagesProblem(e));
+      } finally { if (allowed()) reading.set(false); }
+    });
+  }
+  effect(() => {
+    const wanted = conflict() !== null && lifecycle() === "active" && valid() && review() === "diff";
+    untracked(() => {
+      if (wanted) void readHead();
+      else { headReads.cancel(); reading.set(false); }
+    });
   });
   async function save() {
-    if (!client || !valid() || !base.can_edit || busy() || conflict() || status() !== "valid" || source() !== checked) return;
+    const against = target(), edited = source();
+    if (!client || !valid() || !against.can_edit || busy() || conflict() !== null || status() !== "valid" || edited !== checked || edited === against.source) return;
     busy.set(true); error.set("");
-    try { finish(await client.savePage(base.id, base.head_version, source())); }
+    try { finish(await client.savePage(base.id, against.head_version, edited)); }
     catch (e) {
       if (!valid()) return;
       if (isPageStatus(e, 404)) { props.lost(); return; }
-      const changed = stale(e);
-      conflict.set(changed);
-      error.set(changed ? outOfDate : pagesProblem(e));
+      if (stale(e)) {
+        latest.set(null);
+        conflict.set(pageFailure(e).head_version!);
+        review.set("diff");
+      } else error.set(pagesProblem(e));
       diagnostics.set(pageFailure(e).diagnostics ?? []);
     } finally { if (valid()) busy.set(false); }
+  }
+  function useReviewedBase() {
+    const head = latest();
+    if (!head?.can_edit || busy() || !valid() || conflict() === null || review() !== "diff") return;
+    target.set(head);
+    conflict.set(null);
+    review.set("source");
   }
   const codeDiagnostics = (): EditorDiagnostic[] => diagnostics().flatMap(d => {
     if (!Number.isSafeInteger(d.line) || d.line < 1 || !Number.isSafeInteger(d.column) || d.column < 1) return [];
@@ -76,14 +120,38 @@ export function SourceEditor(props: PageToolProps) {
   });
   return <Modal open testID="page-source-sheet" title="Edit page source" onClose={() => { if (!busy()) props.close(); }}>
     <Column grow pad={4} gap={2}>
-      <PageHeader title="Edit page source" subtitle={`Page TSX · based on version ${base.head_version} · checked by Metro, never run as code.`} />
-      <PageCode value={source()} onChange={source.set} readOnly={busy()} diagnostics={codeDiagnostics()} />
+      <PageHeader title="Edit page source" subtitle={`Page TSX · based on version ${target().head_version} · checked by Metro, never run as code.`} />
+      <If when={conflict() !== null}>
+        <Banner tone="warning" variant="inline" title="The published page changed"
+          message="Your unsaved source is still here. Review the current version and merge any changes you want to keep. Nothing was overwritten." />
+        <SegmentedControl testID="page-source-conflict-tab" accessibilityLabel="Review source conflict" value={review()} onChange={review.set}
+          options={[{ value: "diff", label: "Compare" }, { value: "source", label: "Your source" }]} />
+      </If>
+      <If when={review() === "diff" && conflict() !== null} else={
+        <PageCode value={source()} onChange={source.set} readOnly={busy()} diagnostics={codeDiagnostics()} />
+      }>
+        <If when={latest()} else={<Column gap={2}>
+          <If when={reading()}><Label color="muted">Loading current source…</Label></If>
+          <PagesError message={headError()} onRetry={() => void readHead()} />
+        </Column>}>
+          {head => <>
+            <Label variant="caption" color="muted">{`Published version ${head().head_version} → your unsaved source`}</Label>
+            <PageDiff before={head().source} after={source()} />
+            <If when={!head().can_edit}><Label color="warning">You can no longer edit this page.</Label></If>
+            <If when={head().can_edit}>
+              <Label variant="caption" color="muted">Using this base keeps your source as-is. Saving later replaces the published source; Metro does not merge the edits.</Label>
+              <Row justify="end"><Action testID="page-use-current-base"
+                label={`Use version ${head().head_version} as base`} onPress={useReviewedBase} /></Row>
+            </If>
+          </>}
+        </If>
+      </If>
       <If when={status() === "checking"}><Label color="muted">Checking Page TSX…</Label></If>
       <If when={diagnostics().length}><ScrollArea><Diagnostics items={diagnostics()} /></ScrollArea></If>
       <PagesError message={error()} />
       <ActionBar><Action label="Close" variant="ghost" disabled={busy()} onPress={props.close} />
         <Action testID="page-save-source" label="Save source" variant="primary" busy={busy()}
-          disabled={source() === base.source || status() !== "valid" || conflict()} onPress={() => void save()} /></ActionBar>
+          disabled={!target().can_edit || source() === target().source || status() !== "valid" || conflict() !== null} onPress={() => void save()} /></ActionBar>
     </Column>
   </Modal>;
 }
