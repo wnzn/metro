@@ -13,6 +13,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
+use rig_core::completion::CompletionRequest;
 use rig_core::error::ProviderError as RigProviderError;
 use rig_core::model::ModelList;
 use rig_core::providers::registry::ProviderConfig;
@@ -314,16 +315,7 @@ pub async fn create(
         (None, None)
     } else {
         let base_url = match body.base_url.as_deref() {
-            Some(url) => {
-                let url = normalize_base_url(url)
-                    .map_err(|e| bad_request(format!("base_url is invalid: {e}")))?;
-                if !state.providers.allowed_base_urls().contains(&url) {
-                    return Err(bad_request(
-                        "base_url must be exactly one of this server's allowed_base_urls",
-                    ));
-                }
-                Some(url)
-            }
+            Some(url) => Some(approved_base_url(&state, url)?),
             None if entry.default_base_url.is_some() => None,
             None => {
                 return Err(bad_request(
@@ -469,6 +461,17 @@ where
     Option::<T>::deserialize(d).map(Some)
 }
 
+fn approved_base_url(state: &AppState, url: &str) -> ApiResult<String> {
+    let url =
+        normalize_base_url(url).map_err(|e| bad_request(format!("base_url is invalid: {e}")))?;
+    if !state.providers.allowed_base_urls().contains(&url) {
+        return Err(bad_request(
+            "base_url must be exactly one of this server's allowed_base_urls",
+        ));
+    }
+    Ok(url)
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateBody {
@@ -483,6 +486,9 @@ pub struct UpdateBody {
     /// (only for providers that do not need one).
     #[serde(default, deserialize_with = "explicit_null")]
     api_key: Option<Option<String>>,
+    /// Absent: unchanged. An explicit null cannot reset the endpoint.
+    #[serde(default, deserialize_with = "explicit_null")]
+    base_url: Option<Option<String>>,
 }
 
 pub async fn update(
@@ -493,8 +499,17 @@ pub async fn update(
 ) -> ApiResult<Json<ConnectionView>> {
     let mut row = load(&state, &who, &id).await?;
     let Json(body) = body?;
+    let previous = row.clone();
     let entry = catalog::find(&row.provider_id)
         .ok_or_else(|| conflict("this connection's provider is no longer supported"))?;
+    let changing_endpoint = body.base_url.is_some();
+    if let Some(url) = body.base_url {
+        if entry.is_device() {
+            return Err(device_has_no_key());
+        }
+        let url = url.ok_or_else(|| bad_request("base_url must be an approved URL, not null"))?;
+        row.base_url = Some(approved_base_url(&state, &url)?);
+    }
     if let Some(name) = &body.name {
         row.name = check_name(name)?;
     }
@@ -528,19 +543,212 @@ pub async fn update(
             "a default connection needs a model; choose one first",
         ));
     }
+    if changing_endpoint {
+        test_endpoint(&state, entry, &row).await?;
+    }
     let saved = {
         let row = row.clone();
         state
             .db
-            .call(move |db| Ok(store::update(&mut db.lock(), &row)?))
+            .call(move |db| Ok(store::update_if_current(&mut db.lock(), &row, &previous)?))
             .await
             .map_err(ApiError::internal)?
     };
     let Some(rev) = saved else {
-        return Err(not_found());
+        load(&state, &who, &id).await?;
+        return Err(conflict(if changing_endpoint {
+            "the connection changed while testing the endpoint; try again"
+        } else {
+            "the connection changed while saving; try again"
+        }));
     };
     row.config_rev = rev;
     Ok(Json(view_of(&state, row).await?))
+}
+
+/// Test only the candidate config. Never include upstream response bodies,
+/// request data, or arbitrary provider error text in logs or the API response.
+async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<()> {
+    if entry.lists_models {
+        let result = match entry.adapter {
+            Adapter::SystemOne | Adapter::Embeddings => {
+                list_typed_models(state, entry, row).await.map(|_| ())
+            }
+            _ => list_server_models(state, entry, row).await.map(|_| ()),
+        };
+        return result.map_err(|e| {
+            ApiError::new(
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "the new endpoint failed its model listing test: {}",
+                    e.message()
+                ),
+            )
+        });
+    }
+    if row.model.is_empty() {
+        return Err(bad_request(
+            "choose a model before testing an endpoint that does not list models",
+        ));
+    }
+    let Ok(_permit) = state.providers.inner.listings.try_acquire() else {
+        return Err(conflict(
+            "too many endpoint tests are running; try again shortly",
+        ));
+    };
+    let failed = |what: &str| {
+        ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            format!("the new endpoint failed its {what} test"),
+        )
+    };
+    match entry.adapter {
+        Adapter::SystemOne => {
+            let (base, key) = state
+                .providers
+                .typed_endpoint(entry, row)
+                .map_err(use_error)?;
+            let request = super::typed::decision_request(
+                &row.model,
+                json!({"value": true}),
+                json!({"check": {"type": "noul", "instructions": "Is value true?"}}),
+            )
+            .map_err(|_| failed("System One request setup"))?;
+            match tokio::time::timeout(
+                LIST_TIMEOUT,
+                super::typed::decide(&base, key.as_deref(), request),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(_)) => Err(failed("System One Noul")),
+                Err(_) => Err(failed("System One Noul (timed out)")),
+            }
+        }
+        Adapter::Embeddings => {
+            let (base, key) = state
+                .providers
+                .typed_endpoint(entry, row)
+                .map_err(use_error)?;
+            let request =
+                super::typed::embedding_request(&row.model, &["Metro connection test".into()])
+                    .map_err(|_| failed("embeddings request setup"))?;
+            match tokio::time::timeout(
+                LIST_TIMEOUT,
+                super::typed::embed(&base, key.as_deref(), request),
+            )
+            .await
+            {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(_)) => Err(failed("embeddings")),
+                Err(_) => Err(failed("embeddings (timed out)")),
+            }
+        }
+        Adapter::Registered(_) | Adapter::Custom => {
+            let config = state
+                .providers
+                .server_config(entry, row)
+                .map_err(use_error)?;
+            let model =
+                config.completion_model(&row.model, state.providers.http(), Default::default());
+            let request = CompletionRequest::new("Reply OK.").max_tokens(16);
+            match tokio::time::timeout(LIST_TIMEOUT, model.call(request)).await {
+                Ok(Ok(_)) => Ok(()),
+                Ok(Err(_)) => Err(failed("chat completion")),
+                Err(_) => Err(failed("chat completion (timed out)")),
+            }
+        }
+        Adapter::Device => Err(device_has_no_key()),
+    }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn providers_without_listing_get_only_a_minimal_capability_probe() {
+    use std::sync::Arc;
+
+    use axum::{Router, routing::post};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let app = Router::new()
+            .route(
+                "/v1/systemone",
+                post(|Json(req): Json<serde_json::Value>| async move {
+                    assert_eq!(req["model"], "probe-model");
+                    assert_eq!(req["state"], json!({"value": true}));
+                    assert_eq!(req["questions"].as_object().unwrap().len(), 1);
+                    assert_eq!(req["questions"]["check"]["type"], "noul");
+                    Json(json!({"model": "probe-model", "answers": {
+                        "check": {"type": "noul", "noul": 0.9}
+                    }}))
+                }),
+            )
+            .route(
+                "/v1/embeddings",
+                post(|Json(req): Json<serde_json::Value>| async move {
+                    assert_eq!(req["model"], "probe-model");
+                    assert_eq!(req["input"], json!(["Metro connection test"]));
+                    Json(json!({"data": [{"index": 0, "embedding": [1.0]}]}))
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|Json(req): Json<serde_json::Value>| async move {
+                    assert_eq!(req["model"], "probe-model");
+                    assert!(req.get("tools").is_none());
+                    assert_eq!(req["messages"].as_array().unwrap().len(), 1);
+                    assert_eq!(req["messages"][0]["content"], "Reply OK.");
+                    Json(json!({
+                        "id": "c", "object": "chat.completion", "model": "probe-model", "created": 0,
+                        "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "OK"}}],
+                    }))
+                }),
+            );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let auth = metro_auth::Authenticator::from_lookup(|key| {
+        Ok((key == metro_auth::env::DEV_USERS).then(|| r#"{"user":"fixture-dev-token"}"#.into()))
+    })
+    .await
+    .unwrap();
+    let config = crate::Config {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        db_path: ":memory:".into(),
+        model: None,
+        limits: crate::Limits::default(),
+        org_admins: vec![],
+    };
+    let mut state = AppState::new(
+        config,
+        crate::db::Db::open_in_memory().unwrap(),
+        Arc::new(auth),
+    )
+    .await
+    .unwrap();
+    state.providers = super::ProviderService::new(None, vec![base.clone()]).unwrap();
+    for id in [
+        catalog::CUSTOM_SYSTEMONE,
+        catalog::CUSTOM_EMBEDDINGS,
+        catalog::CUSTOM,
+    ] {
+        let mut entry = catalog::find(id).unwrap().clone();
+        // Exercise the fallback even for adapters that advertise listing
+        // in today's catalog. The fixture deliberately offers no /models.
+        entry.lists_models = false;
+        let row = Row {
+            id: new_connection_id(),
+            user_id: "user".into(),
+            name: "fixture".into(),
+            provider_id: id.into(),
+            base_url: Some(base.clone()),
+            model: "probe-model".into(),
+            is_default: false,
+            sealed_key: None,
+            capability: entry.capability,
+            config_rev: 0,
+        };
+        test_endpoint(&state, &entry, &row).await.unwrap();
+    }
 }
 
 pub async fn remove(

@@ -8,7 +8,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use super::catalog::Capability;
 
 /// A stored connection. `sealed_key` is the encrypted key, never plaintext.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Row {
     pub id: String,
     pub user_id: String,
@@ -23,8 +23,8 @@ pub struct Row {
     /// Fixed when the connection is created; rows from before capabilities
     /// existed are `chat`.
     pub capability: Capability,
-    /// Bumped on model changes for search indexes, and on chat credential
-    /// changes so an older authorization or model listing can't be reused.
+    /// Bumped on model or endpoint changes for search indexes, and on chat
+    /// credential changes so an older authorization or listing can't be reused.
     pub config_rev: i64,
 }
 
@@ -236,18 +236,37 @@ pub fn insert(conn: &mut Connection, row: &Row, max: usize) -> rusqlite::Result<
 
 /// Write `row` back (matched by owner and id), clearing the owner's other
 /// default of the same capability when `row.is_default`. A model change or
-/// a chat credential change bumps `config_rev`. The capability and base URL
-/// never change. `None` when the row no longer exists, otherwise the stored
+/// a chat credential change bumps `config_rev`. This does not write the
+/// capability or base URL. `None` when the row no longer exists, otherwise the stored
 /// `config_rev`.
 pub fn update(conn: &mut Connection, row: &Row) -> rusqlite::Result<Option<i64>> {
+    write_update(conn, row, None)
+}
+
+/// Save a patch only if the connection still matches the original snapshot.
+/// A patch can include an externally tested endpoint. The check and update
+/// share a transaction.
+pub fn update_if_current(
+    conn: &mut Connection,
+    row: &Row,
+    previous: &Row,
+) -> rusqlite::Result<Option<i64>> {
+    write_update(conn, row, Some(previous))
+}
+
+fn write_update(
+    conn: &mut Connection,
+    row: &Row,
+    previous: Option<&Row>,
+) -> rusqlite::Result<Option<i64>> {
     let tx = conn.transaction()?;
-    let old_model: Option<String> = tx
-        .query_row(
-            "SELECT model FROM provider_connections WHERE user_id = ?1 AND id = ?2",
-            params![row.user_id, row.id],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let Some(old) = get(&tx, &row.user_id, &row.id)? else {
+        return Ok(None);
+    };
+    if previous.is_some_and(|previous| previous != &old) {
+        return Ok(None);
+    }
+    let endpoint_changed = previous.is_some() && old.base_url != row.base_url;
     if row.is_default {
         tx.execute(
             "UPDATE provider_connections SET is_default = 0
@@ -260,8 +279,9 @@ pub fn update(conn: &mut Connection, row: &Row) -> rusqlite::Result<Option<i64>>
             "UPDATE provider_connections
              SET name = ?3, is_default = ?5, sealed_key = ?6, updated_at = ?7,
                   config_rev = config_rev + (model <> ?4
-                      OR (capability = 'chat' AND sealed_key IS NOT ?6)),
-                  model = ?4
+                      OR (capability = 'chat' AND sealed_key IS NOT ?6)
+                      OR ?8),
+                  model = ?4, base_url = ?9
              WHERE user_id = ?1 AND id = ?2
              RETURNING config_rev",
             params![
@@ -271,7 +291,13 @@ pub fn update(conn: &mut Connection, row: &Row) -> rusqlite::Result<Option<i64>>
                 row.model,
                 row.is_default,
                 row.sealed_key,
-                now()
+                now(),
+                endpoint_changed,
+                if endpoint_changed {
+                    &row.base_url
+                } else {
+                    &old.base_url
+                },
             ],
             |r| r.get(0),
         )
@@ -282,10 +308,7 @@ pub fn update(conn: &mut Connection, row: &Row) -> rusqlite::Result<Option<i64>>
     // A media connection that now computes something else: everyone's
     // library vectors built with it are stale, in this same transaction.
     // A rename, default flag or key rotation leaves them valid.
-    if rev.is_some()
-        && old_model.as_deref().is_some_and(|m| m != row.model)
-        && media(&row.provider_id)
-    {
+    if rev.is_some() && (old.model != row.model || endpoint_changed) && media(&row.provider_id) {
         crate::library_search::hooks::connection_changed(&tx, &row.id)?;
     }
     tx.commit()?;

@@ -265,6 +265,14 @@ impl Server {
         body["connections"].as_array().unwrap().clone()
     }
 
+    async fn connection(&self, token: &str, id: &Value) -> Value {
+        self.connections(token)
+            .await
+            .into_iter()
+            .find(|row| &row["id"] == id)
+            .unwrap()
+    }
+
     async fn chat_and_wait(&self, token: &str, text: &str) -> Value {
         let (status, body) = self
             .post(
@@ -620,6 +628,183 @@ async fn listing_failures_are_clear_and_redirects_are_not_followed() {
     let seen = redirect.seen();
     assert_eq!(seen.len(), 1, "the redirect was followed: {seen:?}");
     assert_eq!(seen[0].path, "/v1/models");
+}
+
+#[tokio::test]
+async fn changing_endpoint_tests_before_saving_and_keeps_connection_settings() {
+    let old = Fixture::start(&["retired", "keep"], Listing::Ok, "old").await;
+    let new = Fixture::start(&["keep", "new"], Listing::Ok, "new").await;
+    let missing = Fixture::start(&[], Listing::Missing, "missing").await;
+    let redirect = Fixture::start(&[], Listing::Redirect, "redirect").await;
+    let s = Server::start(
+        None,
+        Db::open_in_memory().unwrap(),
+        Some(master(1)),
+        [&old, &new, &missing, &redirect]
+            .map(|fixture| fixture.base_url.clone())
+            .into(),
+    )
+    .await;
+    let key = "endpoint-test-key";
+    let c = s
+        .connect(
+            ALICE,
+            json!({
+                "name": "Connection", "provider_id": "custom", "base_url": old.base_url,
+                "model": "keep", "api_key": key, "fetch_models": true,
+            }),
+        )
+        .await;
+    let path = format!("/v1/providers/{}", c["id"].as_str().unwrap());
+    let share = format!("{path}/sharing");
+    let (status, initial_share) = s
+        .send(
+            reqwest::Method::PUT,
+            ALICE,
+            &share,
+            Some(json!({"visibility": "organization"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{initial_share}");
+
+    assert_eq!(
+        s.patch(BOB, &path, json!({"base_url": new.base_url}))
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+    for rejected in [
+        Value::Null,
+        json!(format!("{}/not-allowlisted", new.base_url)),
+        json!(format!("{}?not-allowed", new.base_url)),
+    ] {
+        let (status, _) = s.patch(ALICE, &path, json!({"base_url": rejected})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    let device = s
+        .connect(
+            ALICE,
+            json!({
+                "name": "Device", "provider_id": "device-openai-compatible", "model": "local",
+            }),
+        )
+        .await;
+    let device_path = format!("/v1/providers/{}", device["id"].as_str().unwrap());
+    assert_eq!(
+        s.patch(ALICE, &device_path, json!({"base_url": new.base_url}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(
+        new.seen().is_empty(),
+        "refused changes must not test an endpoint"
+    );
+
+    for fixture in [&missing, &redirect] {
+        let (status, response) = s.patch(ALICE, &path, json!({
+            "base_url": fixture.base_url, "api_key": "failed-probe-key", "name": "not saved",
+        })).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("model listing test")
+        );
+        assert_no_secret(&response, "failed-probe-key");
+        assert_eq!(s.connection(ALICE, &c["id"]).await, c);
+        let calls = fixture.seen();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].path, "/v1/models");
+    }
+
+    let (status, changed) = s
+        .patch(
+            ALICE,
+            &path,
+            json!({
+                "base_url": format!("{}/", new.base_url),
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    assert_no_secret(&changed, key);
+    assert_eq!(changed["base_url"], new.base_url);
+    for field in ["id", "models", "model", "is_default", "has_key"] {
+        assert_eq!(changed[field], c[field], "{field}");
+    }
+    assert_eq!(s.get(ALICE, &share).await, (StatusCode::OK, initial_share));
+    let calls = new.seen();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].method, "GET");
+    assert_eq!(calls[0].path, "/v1/models");
+    assert!(
+        calls[0]
+            .authorization
+            .as_deref()
+            .is_some_and(|v| v == format!("Bearer {key}"))
+    );
+
+    let (status, refresh) = s.post(ALICE, &format!("{path}/models"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{refresh}");
+    assert_eq!(refresh["added"], 1);
+    assert_eq!(refresh["unavailable"], 1);
+    assert_eq!(refresh["connection"]["model"], "keep");
+}
+
+#[tokio::test]
+async fn endpoint_probe_cannot_overwrite_a_concurrent_edit() {
+    let old = Fixture::start(&["keep"], Listing::Ok, "old").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let new = format!("http://{}/v1", listener.local_addr().unwrap());
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let reply = Arc::new(tokio::sync::Notify::new());
+    let app = axum::Router::new().route(
+        "/v1/models",
+        get({
+            let (arrived, reply) = (arrived.clone(), reply.clone());
+            move || {
+                let (arrived, reply) = (arrived.clone(), reply.clone());
+                async move {
+                    arrived.notify_one();
+                    reply.notified().await;
+                    Json(json!({"data": [{"id": "keep"}]}))
+                }
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let s = Server::start(
+        None,
+        Db::open_in_memory().unwrap(),
+        None,
+        vec![old.base_url.clone(), new.clone()],
+    )
+    .await;
+    let c = s.connect(ALICE, json!({
+        "name": "Connection", "provider_id": "custom", "base_url": old.base_url, "model": "keep",
+    })).await;
+    let path = format!("/v1/providers/{}", c["id"].as_str().unwrap());
+    let patch = s.patch(ALICE, &path, json!({"base_url": new}));
+    let concurrent = async {
+        tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+            .await
+            .unwrap();
+        assert_eq!(s.connection(ALICE, &c["id"]).await, c);
+        assert_eq!(
+            s.patch(ALICE, &path, json!({"name": "Name changed"}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        reply.notify_one();
+    };
+    let ((status, body), ()) = tokio::join!(patch, concurrent);
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    let saved = s.connection(ALICE, &c["id"]).await;
+    assert_eq!(saved["name"], "Name changed");
+    assert_eq!(saved["base_url"], old.base_url);
 }
 
 #[tokio::test]
