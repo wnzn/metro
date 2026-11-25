@@ -1,17 +1,16 @@
-// The shared searchable model picker. Popover owns anchoring, outside clicks
-// and focus return. NSH 0.6.1 Command lacks a search testID and exposes every
-// item as an option, with no expanded state. Use real disclosure buttons
-// and keep the input's editing keys (Space, Left, Right) while it is focused.
+// The shared searchable model picker. The field takes the trigger's place
+// in the parent focus order. Rows float in an overlay, but keyboard navigation
+// highlights them without moving native focus into GTK's overlay focus order.
 
-import { Scroll, Storage, Text, View, batch, cleanup, computed, effect, keymap, reduceMotion, signal } from "nsh";
-import type { InputRef, ViewRef } from "nsh";
-import { Input, Popover } from "nsh/base";
+import { Overlay, Scroll, Storage, Text, View, announce, batch, cleanup, computed, effect, keymap, platform, screenReaderEnabled, signal } from "nsh";
+import type { ViewRef } from "nsh";
+import { Input } from "nsh/base";
 import { connectedTo, me, sessionGuard } from "../store";
 import { BrandMark, Icon } from "./chrome";
 import type { Mark } from "./chrome";
 import { createPickerMemory, pickerScopeKey } from "./pickerMemory";
 import type { PickerGroupMemory, PickerKind } from "./pickerMemory";
-import { cx, disabledClass, focusRingClass, popoverClass, popoverItemClass, popoverMotion, textClass, toneTextClass, transitionClass } from "./tokens";
+import { cx, disabledClass, focusRingClass, popoverClass, popoverItemClass, textClass, toneTextClass, transitionClass } from "./tokens";
 
 type Provider = { key: string; name: string; mark: Mark };
 
@@ -58,7 +57,7 @@ export function ModelPicker(props: PickerProps) {
   const open = signal(false);
   const menu = signal<MenuState | null>(null);
   const width = signal<number | undefined>(undefined);
-  const available = signal<number | undefined>(undefined);
+  const anchor = signal<ViewRef | null>(null);
   const triggerFocused = signal(false);
   let mounted = true;
   cleanup(() => { mounted = false; });
@@ -70,7 +69,6 @@ export function ModelPicker(props: PickerProps) {
     if (props.disabled || open()) return;
     const key = scope(), context = props.context, sameSession = sessionGuard();
     batch(() => {
-      available.set(undefined);
       menu.set({
         group: (provider) => (key ? memory : anonymous)(key, provider),
         valid: () => mounted && !props.disabled && scope() === key && props.context === context && sameSession(),
@@ -78,71 +76,73 @@ export function ModelPicker(props: PickerProps) {
       open.set(true);
     });
   };
-  const close = () => open.set(false);
+  const close = (restoreFocus: boolean) => {
+    open.set(false);
+    if (restoreFocus && !props.disabled) anchor()?.focus();
+  };
   effect(() => {
-    if (open() && !menu()?.valid()) close();
+    if (open() && !menu()?.valid()) close(true);
   });
   effect(() => {
     if (!triggerFocused() || open() || props.disabled) return;
     return keymap.bind({ down: show, up: show }, { forFocus: true });
   });
 
-  // No exit transition: in NSH 0.6.1 an exiting Popover still participates
-  // in Tab order and can eat the Escape intended for the parent dialog.
   return (
-    <Popover
-      open={open()}
-      onOpenChange={(event) => event.open ? show() : close()}
-      align="start"
-      offset={4}
-      margin={8}
-      popupClass={popoverClass}
-      popupStyle={{ width: width(), maxHeight: available() }}
-      onPosition={(position) => available.set(position.available.height)}
-      popupStartingClass={reduceMotion() ? undefined : popoverMotion.starting}
-      trigger={
-        <View
-          class={cx(
-            "flex-row items-center gap-(--space-2) min-h-[40px] w-full rounded-(--radius-sm) border border-input bg-background px-(--space-2) hover:bg-muted",
-            focusRingClass, transitionClass, disabledClass,
-          )}
-          role="button"
-          disabled={props.disabled}
-          focusable={!props.disabled}
-          testID={props.testID}
-          accessibilityLabel={`${props.accessibilityLabel ?? "Model"}: ${current()?.title ?? placeholder()}`}
-          onLayout={({ bounds }) => width.set(bounds.size.width)}
-          onFocus={() => triggerFocused.set(true)}
-          onBlur={() => triggerFocused.set(false)}
-        >
-          <If when={current()?.provider} else={<Icon name="providers" color="muted" />}>
-            {(p) => <BrandMark mark={p().mark} />}
-          </If>
-          <View class="flex-1 min-w-0 flex-col">
-            <Text
-              class={cx(textClass.sm, current() ? "font-medium text-foreground" : props.attention ? toneTextClass.warning : "text-muted-foreground")}
-              style={{ numberOfLines: 1 }}
-              testID={props.testID ? `${props.testID}-value` : undefined}
-            >
-              {current()?.model ?? placeholder()}
-            </Text>
-            <If when={current() ? current()!.provider?.name ?? current()!.detail : null}>
-              {(line) => (
-                <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>{line()}</Text>
-              )}
-            </If>
-          </View>
-          <Icon name="chevron-down" color="muted" size={14} />
-        </View>
-      }
+    <View
+      ref={anchor.set}
+      class={open() ? "w-full" : cx(
+        "flex-row items-center gap-(--space-2) min-h-[40px] w-full rounded-(--radius-sm) border border-input bg-background px-(--space-2) hover:bg-muted",
+        focusRingClass, transitionClass, disabledClass,
+      )}
+      role={open() ? undefined : "button"}
+      disabled={props.disabled}
+      focusable={!open() && !props.disabled}
+      testID={props.testID}
+      accessibilityLabel={open() ? undefined : `${props.accessibilityLabel ?? "Model"}: ${current()?.title ?? placeholder()}`}
+      accessibilityState={open() ? undefined : { expanded: false, hasPopup: true }}
+      onLayout={({ bounds }) => width.set(bounds.size.width)}
+      onFocus={() => triggerFocused.set(true)}
+      onBlur={() => triggerFocused.set(false)}
+      onPress={open() ? undefined : show}
     >
-      <Each of={menu() ? [menu()!] : []}>
-        {(item) => {
-          const state = item();
-          return <ModelPickerMenu picker={props} state={state} active={() => open() && menu() === state && state.valid()} onClose={close} />;
-        }}
-      </Each>
-    </Popover>
+      <If when={!open()} else={
+        <Each of={menu() ? [menu()!] : []}>
+          {(item) => {
+            const state = item();
+            return (
+              <ModelPickerMenu
+                picker={props}
+                state={state}
+                anchor={anchor()}
+                width={width()}
+                active={() => open() && menu() === state && state.valid()}
+                onClose={close}
+              />
+            );
+          }}
+        </Each>
+      }>
+        <If when={current()?.provider} else={<Icon name="providers" color="muted" />}>
+          {(p) => <BrandMark mark={p().mark} />}
+        </If>
+        <View class="flex-1 min-w-0 flex-col">
+          <Text
+            class={cx(textClass.sm, current() ? "font-medium text-foreground" : props.attention ? toneTextClass.warning : "text-muted-foreground")}
+            style={{ numberOfLines: 1 }}
+            testID={props.testID ? `${props.testID}-value` : undefined}
+          >
+            {current()?.model ?? placeholder()}
+          </Text>
+          <If when={current() ? current()!.provider?.name ?? current()!.detail : null}>
+            {(line) => (
+              <Text class={cx(textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>{line()}</Text>
+            )}
+          </If>
+        </View>
+        <Icon name="chevron-down" color="muted" size={14} />
+      </If>
+    </View>
   );
 }
 
@@ -158,14 +158,19 @@ const groupClass = "flex-row items-center gap-(--space-2)";
 function ModelPickerMenu(props: {
   picker: PickerProps;
   state: MenuState;
+  anchor: ViewRef | null;
+  width?: number;
   active: () => boolean;
-  onClose: () => void;
+  onClose: (restoreFocus: boolean) => void;
 }) {
   const query = signal("");
   const needle = () => query().trim().toLowerCase();
-  const focused = signal<string | null>(null);
-  let searchRef: InputRef | undefined;
+  const searchFocused = signal(false);
+  const highlighted = signal<string | null>(null);
+  const available = signal<number | undefined>(undefined);
+  const listRef = signal<ViewRef | null>(null);
   const refs = new Map<string, ViewRef>();
+  let tabbingOut = false;
   const picker = props.picker;
   const idOf = (suffix: string) => picker.testID ? `${picker.testID}${suffix}` : undefined;
   const matches = (o: ModelOption, q: string) =>
@@ -203,157 +208,222 @@ function ModelPickerMenu(props: {
   });
   const rows = () => result().rows;
   const lookup = (id: string) => rows().find((row) => row.id === id);
+  // Default/None remain visible and directly pressable during any search.
+  // They are not keyboard results unless the query actually matches them.
+  const navigable = computed(() => {
+    const q = needle();
+    return rows().filter((row) => rowEnabled(row) && (!q || row.kind === "option" && matches(row.option, q)));
+  });
   const changeGroup = (id: string, expand?: boolean) => {
-    if (!props.active()) return;
+    if (!props.active() || tabbingOut) return;
     const row = lookup(id);
     if (row?.kind !== "group" || !row.toggle) return;
-    props.state.group(row.provider.key).setCollapsed(expand === undefined ? row.expanded : !expand);
+    const next = expand ?? !row.expanded;
+    props.state.group(row.provider.key).setCollapsed(!next);
+    if (highlighted() === id && next !== row.expanded && screenReaderEnabled()) {
+      announce(disclosureLabel(row.provider.name, row.count, next));
+    }
   };
   const activate = (id: string) => {
-    if (!props.active()) return;
+    if (!props.active() || tabbingOut) return;
     const row = lookup(id);
     if (!row || !rowEnabled(row)) return;
     if (row.kind === "group") {
       changeGroup(id);
       return;
     }
-    props.onClose();
+    props.onClose(true);
     // Like Select, choosing the current value closes without resetting it
     // (in the composer that would also reset the chosen thinking level).
     if (row.option.value !== picker.value) picker.onChange(row.option.value);
   };
-  const acceptSearch = () => {
-    const q = needle();
-    if (!q) return;
-    const first = rows().find((row) => row.kind === "option" && !row.option.disabled && matches(row.option, q));
-    if (first) activate(first.id);
+  const accept = () => {
+    const results = navigable();
+    const id = highlighted();
+    const row = id !== null ? results.find((r) => r.id === id) : needle() ? results[0] : undefined;
+    if (row) activate(row.id);
   };
-  const blur = (id: string) => {
-    if (focused() === id) focused.set(null);
-  };
-  const goTo = (id?: string) => {
-    if (!props.active()) return;
-    if (!id) {
-      searchRef?.focus();
-      return;
+  const goTo = (row?: Row) => {
+    if (!props.active() || tabbingOut) return;
+    highlighted.set(row?.id ?? null);
+    if (!row) return;
+    refs.get(row.id)?.reveal({ vertical: "nearest", animated: false });
+    // As in NSH Command, announce the highlight on hosts that do not
+    // follow active descendants (NSH 0.6.1 supports them on macOS and web).
+    if (screenReaderEnabled() && platform.name !== "macos" && platform.name !== "web") {
+      announce(row.kind === "option" ? row.option.title : disclosureLabel(row.provider.name, row.count, row.expanded));
     }
-    const ref = refs.get(id);
-    ref?.focus();
-    ref?.reveal({ vertical: "nearest", animated: false });
   };
   const move = (by: -1 | 1) => {
-    const enabled = rows().filter(rowEnabled);
-    const at = enabled.findIndex((r) => r.id === focused());
-    goTo(enabled[at === -1 && by === -1 ? enabled.length - 1 : at + by]?.id);
+    const enabled = navigable();
+    const at = enabled.findIndex((r) => r.id === highlighted());
+    goTo(enabled[at === -1 && by === -1 ? enabled.length - 1 : at + by]);
   };
+  const editQuery = (value: string) => batch(() => {
+    highlighted.set(null);
+    query.set(value);
+  });
+  const dismiss = () => { if (props.active() && !tabbingOut) props.onClose(true); };
   effect(() => {
-    const at = focused();
-    if (!at || !props.active()) return;
+    if (!searchFocused() || !props.active()) return;
+    const at = highlighted();
     const navigating = { when: "always", forFocus: true } as const;
     const unbind = keymap.bind({
       down: () => move(1),
       up: () => move(-1),
-      escape: props.onClose,
-      ...(at === "search" ? { enter: acceptSearch } : {
-        home: () => goTo(rows().find(rowEnabled)?.id),
-        end: () => goTo(rows().filter(rowEnabled).at(-1)?.id),
-        ...(at.startsWith("group:") ? { left: () => changeGroup(at, false), right: () => changeGroup(at, true) } : {}),
-      }),
+      escape: dismiss,
+      ...(at ? {
+        home: () => goTo(navigable()[0]),
+        end: () => goTo(navigable().at(-1)),
+        space: accept,
+      } : {}),
+      ...(at?.startsWith("group:") ? {
+        left: () => changeGroup(at, false),
+        right: () => changeGroup(at, true),
+      } : {}),
     }, navigating);
-    // Unlike Select's virtual highlighting, these are real focus stops.
-    // Let Tab traverse them and dismiss only when it leaves the popover,
-    // after the platform has moved focus. Do not pull it back to the trigger.
-    const onTab = () => requestAnimationFrame(() => {
-      if (props.active() && !focused()) props.onClose();
-    });
+    // Let native traversal start at the inline field. Keep it mounted until
+    // the key has advanced focus, then close without stealing that focus.
+    const onTab = () => {
+      if (tabbingOut) return;
+      tabbingOut = true;
+      requestAnimationFrame(() => { if (props.active()) props.onClose(false); });
+    };
     const tabOut = keymap.bind({ tab: onTab, "shift+tab": onTab }, { ...navigating, passThrough: true });
     return () => { unbind(); tabOut(); };
   });
 
-  const rowClass = cx("group", popoverItemClass, "selected:bg-muted", focusRingClass);
+  const activeRow = () => {
+    const id = highlighted();
+    return id && navigable().some((row) => row.id === id) ? refs.get(id) : undefined;
+  };
   return (
-    <View class="shrink min-h-0" role="group" accessibilityLabel={picker.accessibilityLabel ?? "Model choices"}>
+    <>
       <Input
-        ref={(node) => { searchRef = node; }}
         autoFocus
         submitBehavior="submit"
         value={query()}
-        onChange={({ value }) => query.set(value)}
-        onSubmit={acceptSearch}
-        onFocus={() => focused.set("search")}
-        onBlur={() => blur("search")}
+        onChange={({ value }) => editQuery(value)}
+        onSubmit={accept}
+        onFocus={() => searchFocused.set(true)}
+        onBlur={() => searchFocused.set(false)}
         placeholder={SEARCH_LABEL}
         accessibilityLabel={SEARCH_LABEL}
+        accessibilityActiveDescendant={activeRow()}
+        accessibilityControls={listRef()}
+        accessibilityState={{ expanded: true, hasPopup: true }}
         testID={idOf("-search")}
-        class={cx("shrink-0 mb-[4px] rounded-(--radius-sm) border border-input bg-background px-(--space-2) py-(--space-1) text-foreground", textClass.sm)}
+        class={cx("min-h-[40px] w-full rounded-(--radius-sm) border border-input bg-background px-(--space-2) text-foreground", textClass.sm, focusRingClass)}
       />
-      <Scroll class="shrink min-h-0 max-h-[340px]" keyboardShouldPersistTaps="handled">
-        <Each of={rows()} key={(row) => row.id}>
-          {(row) => {
-            const { id, kind } = row(); // The keyed row keeps its kind and id.
-            const focusProps = {
-              ref: (node: ViewRef) => refs.set(id, node),
-              onFocus: () => focused.set(id),
-              onBlur: () => blur(id),
-              onPress: () => activate(id),
-            };
-            cleanup(() => refs.delete(id));
-            if (kind === "option") {
-              const option = () => (row() as OptionRow).option;
-              const selected = () => option().value === picker.value;
+      <Overlay
+        anchor={props.anchor}
+        align="start"
+        offset={4}
+        margin={8}
+        class={popoverClass}
+        style={{ width: props.width, maxHeight: available() }}
+        onPosition={(position) => available.set(position.available.height)}
+        onPressOutside={() => { if (props.active()) props.onClose(false); }}
+        onCancel={dismiss}
+      >
+        <Scroll
+          ref={listRef.set}
+          class="shrink min-h-0 max-h-[340px]"
+          keyboardShouldPersistTaps="handled"
+          role="group"
+          accessibilityLabel={picker.accessibilityLabel ?? "Model choices"}
+        >
+          <Each of={rows()} key={(row) => row.id}>
+            {(row) => {
+              const { id } = row();
+              cleanup(() => refs.delete(id));
               return (
-                <View
-                  {...focusProps}
-                  class={rowClass}
-                  role="button"
-                  focusable={!option().disabled}
-                  disabled={option().disabled}
-                  accessibilityLabel={option().title}
-                  accessibilityDescription={selected() ? "Current selection" : undefined}
-                  accessibilityState={{ selected: selected(), disabled: !!option().disabled }}
-                  testID={idOf(`:${option().value}`)}
-                >
-                  <ModelRow option={option()} />
-                </View>
+                <PickerRow
+                  row={row()}
+                  selected={picker.value}
+                  highlighted={highlighted() === id}
+                  idOf={idOf}
+                  rowRef={(node) => { refs.set(id, node); }}
+                  onPress={() => activate(id)}
+                />
               );
-            }
-            const group = () => row() as GroupRow;
-            const title = () => groupLabel(group().provider.name, group().count);
-            const groupID = () => idOf(`-group:${group().provider.name}`);
-            return (
-              <If when={group().toggle} else={
-                <View class={cx(groupClass, "px-(--space-2) pt-(--space-2) pb-(--space-1)")} role="header"
-                  accessibilityLabel={title()} testID={groupID()}>
-                  <GroupLabel provider={group().provider} count={group().count} />
-                </View>
-              }>
-                <View
-                  {...focusProps}
-                  class={cx(groupClass, rowClass)}
-                  role="button"
-                  focusable
-                  accessibilityLabel={`${title()}, ${group().expanded ? "expanded" : "collapsed"}`}
-                  accessibilityState={{ expanded: group().expanded }}
-                  testID={idOf(`-group-toggle:${group().provider.name}`)}
-                >
-                  <View class={groupClass} testID={groupID()}>
-                    <Icon name={group().expanded ? "chevron-down" : "chevron-right"} color="muted" size={14} />
-                    <GroupLabel provider={group().provider} count={group().count} />
-                  </View>
-                </View>
-              </If>
-            );
-          }}
-        </Each>
-        <If when={!result().hasMatch}>
-          <Text class={cx("px-(--space-2) py-(--space-2) text-muted-foreground", textClass.sm)}>No model matches.</Text>
-        </If>
-      </Scroll>
-    </View>
+            }}
+          </Each>
+          <If when={!result().hasMatch}>
+            <Text class={cx("px-(--space-2) py-(--space-2) text-muted-foreground", textClass.sm)}>No model matches.</Text>
+          </If>
+        </Scroll>
+      </Overlay>
+    </>
   );
 }
 
 const groupLabel = (name: string, count: number) => `${name}, ${count} ${count === 1 ? "model" : "models"}`;
+const disclosureLabel = (name: string, count: number, expanded: boolean) =>
+  `${groupLabel(name, count)}, ${expanded ? "expanded" : "collapsed"}`;
+
+function PickerRow(props: {
+  row: Row;
+  selected: string | null;
+  highlighted: boolean;
+  idOf: (suffix: string) => string | undefined;
+  rowRef: (node: ViewRef) => void;
+  onPress: () => void;
+}) {
+  // Rows are reachable by arrows, pointer, and assistive technology, but
+  // are not extra stops in the native Tab order.
+  const rowClass = () => cx("group", popoverItemClass, props.highlighted ? "bg-accent" : "selected:bg-muted");
+  if (props.row.kind === "option") {
+    const option = () => (props.row as OptionRow).option;
+    const selected = () => option().value === props.selected;
+    return (
+      <View
+        ref={props.rowRef}
+        class={rowClass()}
+        role="button"
+        focusable={false}
+        onPress={props.onPress}
+        disabled={option().disabled}
+        accessibilityLabel={option().title}
+        accessibilityDescription={selected() ? "Current selection" : undefined}
+        accessibilityState={{ selected: selected(), disabled: !!option().disabled }}
+        testID={props.idOf(`:${option().value}`)}
+      >
+        <ModelRow option={option()} />
+      </View>
+    );
+  }
+  const group = () => props.row as GroupRow;
+  const groupID = () => props.idOf(`-group:${group().provider.name}`);
+  return (
+    <If when={group().toggle} else={
+      <View
+        class={cx(groupClass, "px-(--space-2) pt-(--space-2) pb-(--space-1)")}
+        role="header"
+        accessibilityLabel={groupLabel(group().provider.name, group().count)}
+        testID={groupID()}
+      >
+        <GroupLabel provider={group().provider} count={group().count} />
+      </View>
+    }>
+      <View
+        ref={props.rowRef}
+        class={cx(groupClass, rowClass())}
+        role="button"
+        focusable={false}
+        onPress={props.onPress}
+        accessibilityLabel={disclosureLabel(group().provider.name, group().count, group().expanded)}
+        accessibilityState={{ expanded: group().expanded }}
+        testID={props.idOf(`-group-toggle:${group().provider.name}`)}
+      >
+        <View class={groupClass} testID={groupID()}>
+          <Icon name={group().expanded ? "chevron-down" : "chevron-right"} color="muted" size={14} />
+          <GroupLabel provider={group().provider} count={group().count} />
+        </View>
+      </View>
+    </If>
+  );
+}
 
 function GroupLabel(props: { provider: Provider; count: number }) {
   return (

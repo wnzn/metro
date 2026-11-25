@@ -23,7 +23,9 @@ function Fixture() {
   const open = signal(false);
   const value = signal("");
   const calls = signal(0);
+  const preceding = signal(0);
   const trailing = signal(0);
+  const parentFocus = signal<"previous" | "next" | null>(null);
   const context = signal("one");
   const kind = signal<PickerKind>("composer");
   const renamed = signal(false);
@@ -50,6 +52,9 @@ function Fixture() {
     .map((o) => renamed() && o.provider?.key === "openai"
       ? { ...o, provider: { ...o.provider, name: "OpenAI renamed" } }
       : o);
+  const blur = (target: "previous" | "next") => {
+    if (parentFocus() === target) parentFocus.set(null);
+  };
 
   return (
     <View class="flex-1">
@@ -58,7 +63,10 @@ function Fixture() {
       </Button>
       <Modal title="Picker fixture" size="compact" open={open()} onClose={() => open.set(false)}>
         <View class="gap-(--space-2)">
-          <Button onPress={() => {}} testID="outside"><Text>Outside picker</Text></Button>
+          <View role="button" testID="outside" onPress={() => preceding.set(preceding() + 1)}
+            onFocus={() => parentFocus.set("previous")} onBlur={() => blur("previous")}>
+            <Text>{`Previous control: ${preceding()}`}</Text>
+          </View>
           <ModelPicker
             options={options()}
             value={value()}
@@ -68,9 +76,11 @@ function Fixture() {
             disabled={disabled()}
             testID="picker"
           />
-          <Button onPress={() => trailing.set(trailing() + 1)} testID="next">
+          <View role="button" testID="next" onPress={() => trailing.set(trailing() + 1)}
+            onFocus={() => parentFocus.set("next")} onBlur={() => blur("next")}>
             <Text>{`Next control: ${trailing()}`}</Text>
-          </Button>
+          </View>
+          <Text>{`Parent focus: ${parentFocus() ?? "neither"}`}</Text>
           <Text>{`Choices: ${calls()}`}</Text>
         </View>
       </Modal>

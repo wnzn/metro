@@ -83,6 +83,51 @@ test("an explicit pick keeps its provider open without overwriting the collapse 
   expect(app.storage()[COLLAPSED]).toBe("collapsed");
 });
 
+test("search arrows never choose an unmatched Default, even with an existing pin and no matches", async () => {
+  const app = await launch();
+  await show(app);
+  await app.press(ALPHA);
+  await app.waitFor(SEARCH, { state: "gone" });
+  await app.waitFor("id:picker >> text:Alpha");
+
+  await show(app);
+  await app.type(SEARCH, "no model like this");
+  await app.waitFor("text:No model matches.");
+  expect(app.shows(DEFAULT)).toBe(true);
+  for (const key of ["down", "return", "up", "return"]) await app.keyboard.press(key);
+  expect(app.shows(SEARCH)).toBe(true);
+  expect(app.shows("text:Choices: 1")).toBe(true);
+  await app.keyboard.press("escape");
+  await app.waitFor("id:picker >> text:Alpha");
+
+  await show(app);
+  await app.type(SEARCH, "Claude");
+  await app.waitFor("id:picker:claude");
+  expect(app.shows(DEFAULT)).toBe(true);
+  await app.keyboard.press("down");
+  await app.keyboard.press("return");
+  await app.waitFor(SEARCH, { state: "gone" });
+  await app.waitFor("id:picker >> text:Claude");
+  await app.waitFor("text:Choices: 2");
+
+  await show(app);
+  await app.type(SEARCH, "Default");
+  await app.keyboard.press("down");
+  await app.keyboard.press("return");
+  await app.waitFor(SEARCH, { state: "gone" });
+  await app.waitFor("id:picker >> text:Default model");
+  await app.waitFor("text:Choices: 3");
+
+  await show(app);
+  await app.press(ALPHA);
+  await show(app);
+  await app.type(SEARCH, "Claude");
+  await app.press(DEFAULT); // a deliberate press still works despite the nonmatching query
+  await app.waitFor(SEARCH, { state: "gone" });
+  await app.waitFor("id:picker >> text:Default model");
+  await app.waitFor("text:Choices: 5");
+});
+
 test("picker closes on stale scope and restores only the same account, server and picker kind", async () => {
   const app = await launch({ [COLLAPSED]: "collapsed" });
   await show(app);
@@ -90,8 +135,7 @@ test("picker closes on stale scope and restores only the same account, server an
   await app.keyboard.press("mod+6"); // asynchronous display names may update in place
   await app.waitFor("label:OpenAI renamed, 2 models, collapsed");
   await app.type(SEARCH, "alpha");
-  await app.keyboard.press("down"); // Default
-  await app.keyboard.press("down"); // Alpha
+  await app.keyboard.press("down"); // Alpha, the only matching result
   await app.keyboard.press("mod+5"); // changed Space/catalog context, same preference partition
   await app.waitFor(SEARCH, { state: "gone" });
   await app.keyboard.press("return"); // focus goes back to the trigger, never to the stale row
@@ -143,18 +187,30 @@ test("keyboard navigates disclosure and choice in a modal and restores trigger f
   await app.keyboard.press("tab");
   await app.keyboard.press("return");
   await app.waitFor("text:Next control: 1");
-  await app.keyboard.press("shift+tab");
-  await app.keyboard.press("return");
-  await app.waitFor(SEARCH);
-  // Native Tab can reach the real buttons as well as arrows. After Default
-  // and Alpha, it reaches the other group's header. Collapsing it puts that
-  // header last, so the next Tab leaves the popup and dismisses it.
-  for (let i = 0; i < 3; i++) await app.keyboard.press("tab");
-  await app.keyboard.press("space");
-  await app.waitFor("label:Anthropic, 1 model, collapsed");
+});
+
+test("Tab and Shift+Tab exit to the trigger's adjacent parent controls without activating anything", async () => {
+  const app = await launch();
+  await show(app);
   await app.keyboard.press("tab");
+  await app.waitFor("text:Parent focus: next");
   await app.waitFor(SEARCH, { state: "gone" });
-  expect(app.shows("text:Choices: 1")).toBe(true);
+  expect(app.shows("text:Next control: 0")).toBe(true);
+  expect(app.shows("text:Choices: 0")).toBe(true);
+  await app.keyboard.press("return");
+  await app.waitFor("text:Next control: 1");
+
+  await show(app);
+  await app.type(SEARCH, "Claude");
+  await app.keyboard.press("down"); // a result is highlighted when we exit backwards
+  await app.keyboard.press("shift+tab");
+  await app.waitFor("text:Parent focus: previous");
+  await app.waitFor(SEARCH, { state: "gone" });
+  expect(app.shows("text:Previous control: 0")).toBe(true);
+  expect(app.shows("text:Choices: 0")).toBe(true);
+  await app.keyboard.press("return");
+  await app.waitFor("text:Previous control: 1");
+  expect(app.shows("id:picker")).toBe(true); // parent modal did not close
 });
 
 test("picker fits and scrolls a long catalog inside a narrow modal", async () => {
