@@ -186,6 +186,9 @@ inserts, **Esc** closes the list.
 
 ## Messages and addressing
 
+For client developers, the [source-only Space send protocol](next-source.md#space-send-protocol-client-developers)
+documents the new optional fields and sender-only response metadata.
+
 | You write | Addressed to | Which agent runs |
 | --- | --- | --- |
 | `Can someone review this?` | the room | none (unless you [opted in](#your-preferences-in-a-space), below) |
@@ -308,6 +311,9 @@ A room's agent can delegate work to **child threads** with the tools
   have at most 16 of them.
 
 ## Personal Chat
+
+The behaviour below is for 0.4.0. [Direct Send and explicit Save note](next-source.md#personal-chat)
+are in the source, not released.
 
 - Every user has a private Chat with the agent. Only that user can see it, and
   it works with zero Spaces.

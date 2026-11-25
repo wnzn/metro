@@ -26,6 +26,9 @@ server yourself, or let the desktop app run one just for you. Each person
 brings their own model, and each Space can give the agent tools over its
 own files.
 
+The install and feature guide below is for Metro 0.4.0. For changes after
+that release, see [In the source, not released](docs/next-source.md).
+
 ## Features
 
 - **Personal Chat:** a private conversation with the agent, plus your agent runs across Spaces.
@@ -72,8 +75,8 @@ local accounts or OIDC sign-in. Everyone else installs the desktop app and
 connects with the server's URL and their own token. Details:
 [docs/deploy.md](docs/deploy.md).
 
-Send tokens only over loopback, an SSH port forward or HTTPS. The desktop
-app refuses plain `http://` to any other host.
+With the 0.4.0 desktop app, send tokens only over loopback, an SSH port
+forward or HTTPS. That app refuses plain `http://` to any other host.
 
 > **Latest release: [Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0)**
 > (2026-11-25). Downloads: `Metro-0.4.0-linux-x64.tar.gz`,
