@@ -58,14 +58,11 @@ export function reconnectImpact(r: InstalledRunner): string {
   return `Reconnecting creates a new personal runner for this computer. ${fresh}`;
 }
 
-export function InstalledRunnerSection(props: { management?: JSX.Element } = {}) {
-  // Keep the review above the status branch: a refresh can remove that branch
-  // before a different registration is verified.
-  const picks = attachSelection();
+export function InstalledRunnerSection(props: { management?: JSX.Element; picks: AttachSelection }) {
   return (
     <>
       <If when={installedRunner()}>
-        {(r) => <Section r={r()} management={props.management} picks={picks} />}
+        {(r) => <Section r={r()} management={props.management} picks={props.picks} />}
       </If>
       <If when={installedFolderRefreshExhausted()}>
         <Banner variant="inline" tone="warning" testID="installed-runner-folders-unavailable"
@@ -188,7 +185,7 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: A
 
 const attachBusy = () => runnerAttachBusy() || !!installedBusy() || !!runnerBusy();
 
-function attachSelection() {
+export function createAttachSelection(listVisible: () => boolean) {
   const checked = signal<ReadonlySet<string>>(new Set());
   let initial = true;
   let previousRunnerId: string | undefined;
@@ -207,8 +204,8 @@ function attachSelection() {
       // A different or newly registered runner must not inherit defaults.
       initial = false;
       checked.set(new Set());
-    } else if (initial && choice) {
-      // The first verified snapshot is the only default, even if it's empty.
+    } else if (initial && choice && listVisible()) {
+      // Only default the first verified list shown to the user, even if empty.
       initial = false;
       checked.set(new Set(visible.map((s) => s.id)));
     } else {
@@ -230,7 +227,7 @@ function attachSelection() {
   };
 }
 
-type AttachSelection = ReturnType<typeof attachSelection>;
+type AttachSelection = ReturnType<typeof createAttachSelection>;
 
 function AttachPicks(props: { picks: AttachSelection }) {
   const selected = () => eligibleSpaces().filter((s) => props.picks.checked().has(s.id)).map((s) => s.id);

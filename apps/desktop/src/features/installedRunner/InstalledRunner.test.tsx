@@ -738,6 +738,126 @@ test("an empty first verified bulk list does not preselect the first later arriv
   expect(f.posts().filter((p) => p.path.includes("/runner"))).toEqual([]);
 });
 
+async function revealUnrelatedRunner(app: App) {
+  await app.press("id:runner-add-toggle");
+  await app.type("id:runner-name", "Unrelated runner");
+  await app.press("id:add-runner");
+  await app.waitFor("id:token-reveal");
+}
+
+test("adding an unrelated runner keeps Reviewed and Late unchecked through the token receipt", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("reviewed", "Reviewed", "alice");
+  const app = await openWith(f, bridgeWithRunner(f, mine.id, mine.name), true);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:runner-attach-many >> text:Attach to 1 Space");
+  await app.press("id:runner-attach-pick:reviewed");
+  f.addSpace("late", "Late", "alice");
+  await app.clock!.runFor(11_000);
+  await app.waitFor("id:runner-attach-pick:late");
+  expect(app.enabled("id:runner-attach-many")).toBe(false);
+
+  await revealUnrelatedRunner(app);
+  expect(app.shows("id:runner-attach-pick:reviewed")).toBe(false);
+  await app.press("id:hide-runner-token");
+  await app.waitFor("id:runner-attach-pick:reviewed");
+  await app.waitFor("id:runner-attach-pick:late");
+  expect(app.enabled("id:runner-attach-many")).toBe(false);
+  const writes = () => f.posts().filter((p) => p.path.endsWith("/runner/attach-if-empty"));
+  await app.press("id:runner-attach-many").catch(() => {});
+  expect(writes()).toEqual([]);
+
+  await app.press("id:runner-attach-pick:reviewed");
+  expect(writes()).toEqual([]);
+  await app.press("id:runner-attach-many");
+  await app.waitFor("id:runner-attach-result >> text:Attached to 1 Space.");
+  expect(writes()).toEqual([{
+    user: "alice", method: "POST", path: "/v1/spaces/reviewed/runner/attach-if-empty", body: { runner_id: mine.id },
+  }]);
+  expect(f.state.attached.has("late")).toBe(false);
+
+  await app.press("id:settings-close");
+  await openRunners(app);
+  await app.waitFor("id:runner-attach-pick:late");
+  await app.waitFor("id:runner-attach-many >> text:Attach to 1 Space"); // A new visit reviews a new list.
+  expect(writes()).toHaveLength(1);
+});
+
+test("the first verified bulk snapshot waits until the list is visible after the receipt", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("early", "Early", "alice");
+  const t = bridgeWithRunner(f, mine.id, mine.name);
+  t.st.delay = 1_000;
+  const app = await openWith(f, t, true);
+  await signInToRunners(app, "alice");
+  await revealUnrelatedRunner(app);
+  expect(app.shows("id:runner-attach-list")).toBe(false);
+
+  t.st.delay = 0;
+  await app.clock!.runFor(1_000);
+  await app.waitFor("id:runner-offer"); // The runner is now verified, but the receipt is still open.
+  f.addSpace("late", "Late", "alice");
+  await app.clock!.runFor(11_000);
+  await app.waitFor("id:space:late");
+  await app.press("id:hide-runner-token");
+  await app.waitFor("id:runner-attach-many >> text:Attach to 2 Spaces");
+  expect(f.posts().filter((p) => p.path.endsWith("/runner/attach-if-empty"))).toEqual([]);
+});
+
+test("the receipt preserves continuous picks but drops Spaces that lose eligibility while hidden", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("kept", "Kept", "alice");
+  f.addSpace("returning", "Returning", "alice");
+  const app = await openWith(f, bridgeWithRunner(f, mine.id, mine.name), true);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:runner-attach-many >> text:Attach to 2 Spaces");
+  await revealUnrelatedRunner(app);
+  const returning = f.state.spaces.get("returning")!;
+  returning.members.delete("alice");
+  await app.clock!.runFor(11_000);
+  await app.waitFor("id:space:returning", { state: "gone" });
+  returning.members.add("alice");
+  await app.clock!.runFor(11_000);
+  await app.waitFor("id:space:returning");
+  await app.press("id:hide-runner-token");
+  await app.waitFor("id:runner-attach-pick:returning");
+  await app.waitFor("id:runner-attach-many >> text:Attach to 1 Space");
+  await app.press("id:runner-attach-many");
+  await app.waitFor("id:runner-attach-result >> text:Attached to 1 Space.");
+  expect(f.posts().filter((p) => p.path.endsWith("/runner/attach-if-empty")).map((p) => p.path)).toEqual([
+    "/v1/spaces/kept/runner/attach-if-empty",
+  ]);
+});
+
+test("an installed runner change during the receipt clears picks even if the original returns", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  const other = f.addRunner("Other PC", "personal", "alice");
+  f.addSpace("reviewed", "Reviewed", "alice");
+  const t = bridgeWithRunner(f, mine.id, mine.name);
+  const app = await openWith(f, t, true);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:runner-attach-many >> text:Attach to 1 Space");
+  await app.waitFor("id:runner-offer");
+  await revealUnrelatedRunner(app);
+
+  t.st.runnerId = other.id;
+  t.st.state = "offline";
+  await app.clock!.runFor(5100);
+  await app.waitFor("id:runner-offer", { state: "gone" });
+  t.st.runnerId = mine.id;
+  t.st.state = "online";
+  await app.clock!.runFor(5100);
+  await app.waitFor("id:runner-offer");
+  await app.press("id:hide-runner-token");
+  await app.waitFor("id:runner-attach-pick:reviewed");
+  expect(app.enabled("id:runner-attach-many")).toBe(false);
+  expect(f.posts().filter((p) => p.path.endsWith("/runner/attach-if-empty"))).toEqual([]);
+});
+
 for (const change of ["new", "moved", "replaced"] as const) {
   test(`a ${change} installed runner starts unchecked in open Settings`, async () => {
     const f = world();
