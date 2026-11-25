@@ -149,8 +149,9 @@ registered runner it offers list and read only.
 These steps use the published runner image and need no Metro source. The
 workspaces live in a named Docker volume.
 
-> **Not published yet.** `ghcr.io/wnzn/metro-runner:<tag>` is the verified
-> release target, but it doesn't exist until the release is published
+> **Published:** `ghcr.io/wnzn/metro-runner:v0.3.2` is in
+> [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2). Pin it
+> by the digest in the release's `IMAGES.txt`
 > ([deploy.md](deploy.md#release-files-and-images)). Contributors can build
 > the same image themselves ([development.md](development.md#images-and-binaries)).
 

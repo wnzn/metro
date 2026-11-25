@@ -250,7 +250,7 @@ message search doesn't change.
 
    `partial: true`, with a `notice`, means not everything was searched yet.
 
-**In the desktop app** (current source after 0.2.0, not released). Type in
+**In the desktop app** (since 0.3.2). Type in
 the search box at the top of the window (<kbd>Ctrl</kbd>+<kbd>K</kbd>, or
 <kbd>⌘</kbd>+<kbd>K</kbd> on macOS, focuses it). While you type, [quick
 results](#quick-results-as-you-type) appear under it. Press **Return**, or
@@ -281,7 +281,7 @@ automated tests.
 
 #### Quick results as you type
 
-This describes the current source after 0.2.0. It isn't released. It was
+This describes the source after 0.2.0, released in 0.3.2. It was
 checked in native Linux GTK, in dark and light themes, at `95a3d2b`
 ([acceptance](acceptance.md#staged-quick-search-as-you-type-2026-11-23-project-manager-local)). Windows and macOS weren't checked.
 

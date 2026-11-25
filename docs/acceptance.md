@@ -3,6 +3,98 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Published: Metro 0.3.2 (2026-11-24, GitHub release v0.3.2)
+
+**What was published.** The GitHub release
+[Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2), tag
+`v0.3.2`, public (not a draft, not a prerelease, marked latest), published
+2026-11-24T15:30:55Z by `github-actions[bot]`. The tag points at commit
+`d943797a332f42bd38ca023f63f624e205af14cf` (the merge of pull request #12,
+the 0.3.2 bump on `main`). It was made by the push-to-`main` CI run
+[45418420759](https://github.com/wnzn/metro/actions/runs/45418420759)
+(conclusion `success`), whose jobs `release / *`,
+`release / windows-distribution / seed` and `/ preview`,
+`publish / authorize`, `/ tag`, `/ assets`, `/ images / guard`,
+`/ images / build` (amd64, arm64), `/ images / media`,
+`/ images / publish`, `/ images / sign`, `/ sign / authorize`, `/ sign / sign`
+and `/ publish` all passed; `publish / windows-sign` was skipped (Windows
+unsigned). `v0.3.1` is tagged on `a033e85` but has no release.
+
+It doesn't contain anything merged after `d943797` (for example the
+staged desktop redesign on `ui/providers-settings-redesign`).
+
+**Assets** (18):
+
+| File | Signature |
+| --- | --- |
+| `Metro-0.3.2-linux-x64.tar.gz` + `.sha256` | `Metro-0.3.2-linux-x64.tar.gz.sigstore.json` |
+| `Metro-0.3.2-windows-x64.zip` + `.sha256` | none (no Authenticode) |
+| `Metro-0.3.2-windows-x64.unsigned-preview.msi` + `.sha256` | none (no Authenticode) |
+| `Metro-runner-0.3.2-linux-x64.tar.gz` + `.sha256` | `Metro-runner-0.3.2-linux-x64.tar.gz.sigstore.json` |
+| `install-metro-linux.sh`, `install-metro-runner-linux.sh`, `install-metro-windows.ps1`, `metro-runner-container.sh`, `metro-runner-container.ps1` | none of their own; listed in `SHA256SUMS` |
+| `IMAGES.txt` | listed in `SHA256SUMS` |
+| `SHA256SUMS` | `SHA256SUMS.sigstore.json` |
+
+**Images** (public on GHCR, from `IMAGES.txt`; no `latest` tag):
+
+| Reference | Index digest | Platforms |
+| --- | --- | --- |
+| `ghcr.io/wnzn/metro-server:v0.3.2` | `sha256:3095c897e1e4659eef902cbd540ab762111a895232db7818a072929bf85112d5` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner:v0.3.2` | `sha256:1030ed8cf44bc145d33e1e5b03ad34653f8b62179392248acda61bc97462d324` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-embeddinggemma2:v0.3.2` | `sha256:5f979be7f017f890e56673442856fa29fbb4dca223ba509446471d9b6128fa68` | `linux/amd64` (no weights) |
+
+**How it was checked** (2026-11-25, docs lane, from a Debian 13 host; no
+downloaded file was executed):
+
+```sh
+gh release view v0.3.2 --repo wnzn/metro \
+  --json tagName,publishedAt,assets,targetCommitish,isDraft,isPrerelease   # 18 assets, isDraft false, isPrerelease false
+gh release list --repo wnzn/metro                                          # only "Metro 0.3.2  Latest  v0.3.2"
+gh api repos/wnzn/metro/git/ref/tags/v0.3.2                                # commit d943797a…
+git ls-remote --tags origin                                                # v0.3.1 a033e85, v0.3.2 d943797
+gh run view 45418420759 --repo wnzn/metro --json jobs                      # the jobs above, all success
+# Anonymous GHCR pull token, then HEAD on /v2/wnzn/<image>/manifests/v0.3.2:
+#   HTTP 200 for all three images; docker-content-digest equals IMAGES.txt
+gh release download v0.3.2 --repo wnzn/metro -p … # into a fresh, empty ~/.cache dir
+sha256sum -c --ignore-missing SHA256SUMS                                   # IMAGES.txt and the 3 archives + sidecars: OK
+sha256sum -c <each>.sha256                                                 # the 3 archives: OK
+```
+
+- The `SHA256SUMS.sigstore.json` bundle (Sigstore bundle v0.3, one Rekor
+  entry, log index 4081339195) signs a SHA-256 digest equal to
+  `SHA256SUMS`'s (`b77097ca…b6d5`). Its Fulcio certificate names
+  `https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/main`,
+  ref `refs/heads/main` and commit `d943797a…`. That was read from the
+  certificate with `openssl x509`; **`cosign verify-blob` wasn't run** here
+  (cosign isn't installed), so the signature itself and the Rekor
+  inclusion weren't checked by this run.
+- The image signatures weren't checked with `cosign verify` here either.
+  `IMAGES.txt` states the release workflow verified them, and the run's
+  `publish / images / sign` job passed.
+- Listing the archives (no extraction run): the Linux archive holds
+  `Metro`, `metro-server`, `metro-tui`, `ui/Metro`, `install-desktop` and
+  `RELEASE.json`; the Windows ZIP holds `Metro.exe`, `metro-server.exe`,
+  `metro-tui.exe`, `ui/Metro.exe` and `RELEASE.json`; the runner archive
+  holds `metro-runner`, `run-runner`, `START.txt`, `RELEASE.json` and its
+  licence notices.
+- `gh api /users/wnzn/packages` needs the `read:packages` scope, which this
+  host's token lacks; the images were checked through the registry API
+  instead.
+
+**Windows in the release run.** `release / windows-distribution / preview`
+ran on GitHub's `windows-2025` runner: it assembled and verified the
+preview, installed the unsigned MSI into a chosen folder, checked the
+payload, ran the server and uninstalled it, checked that the legacy script
+refuses to install next to the MSI, and ran the MSI lane's native tests
+(fixtures, upgrade, repair, downgrade, uninstall). All unattended.
+
+**Not verified:** the desktop app or the MSI wizard on screen on native
+Windows, by a person; any start of the released binaries or images (not
+run here); `cosign` verification of the file or image signatures by
+anyone outside the release workflow; macOS (not built); real vendor
+accounts and sign-ins; pretrained `google/embeddinggemma-2` ranking.
+Windows files carry no Authenticode signature.
+
 ## Source only: image load on Docker's classic image store, version 0.3.2 (2026-11-24, packaging lane, local)
 
 The 0.3.1 release run failed in `release-images.yml`, job `build`, step
@@ -357,7 +449,7 @@ python3 -B -m unittest discover -s ops/github-runner            # 33 tests, OK
 ## Source only: releases from `main` on a version bump (2026-11-24, CI lane, local)
 
 Uncommitted changes on `fix/ci-cleanup`, on top of `106e5da`
-([deploy.md](deploy.md#releases-from-main-on-a-version-bump-in-the-source-never-run-with-real-credentials)).
+([deploy.md](deploy.md#releases-from-main-on-a-version-bump)).
 `main` is the only long-lived branch. Earlier entries that name `master`
 describe the source as it was then.
 
