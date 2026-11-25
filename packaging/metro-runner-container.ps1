@@ -8,9 +8,13 @@
   rotates or prints a runner token: create one in Metro, save it to a file
   only you can read, and pass its path.
 
-  -ServerUrl must be https://..., or http://127.0.0.1:PORT for a Metro
-  server on this computer (stable port). Loopback needs Docker Desktop 4.34+
-  with Settings > Resources > Network > Enable host networking.
+  -ServerUrl is https://..., or http:// to any host. For a Metro server on
+  this computer use http://127.0.0.1:PORT (stable port); loopback needs
+  Docker Desktop 4.34+ with Settings > Resources > Network > Enable host
+  networking. Other hosts (a LAN address, Tailscale) need no host
+  networking. Plain http to a host other than this computer or a Tailscale
+  address (100.64.0.0/10, fd7a:115c:a1e0::/48, *.ts.net) works, with a
+  warning: the runner token crosses the network unencrypted.
   The named volume (default metro-runner-workspace) is mounted at /workspace;
   the runner keeps each Space's files in spaces/<space-id>/. Remove never
   deletes it.
@@ -58,18 +62,53 @@ function Test-LoopbackHttp([string] $Url) {
     return $port -ge 1 -and $port -le 65535
 }
 
+# Plain http works to any host. Loopback (the exact literals above) and
+# Tailscale hosts are used silently; any other host gets one warning, because
+# the runner token crosses the network unencrypted. Other names for this
+# computer (127.1, LOCALHOST, [0:0:0:0:0:0:0:1], 0.0.0.0, ...) are refused as
+# ambiguous. Returns loopback, tailscale or other; $null when malformed.
+function Get-HttpClass([string] $Url) {
+    if (Test-LoopbackHttp $Url) { return 'loopback' }
+    $label = '[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?'
+    if (-not ($Url -cmatch "^http://(\[[0-9A-Fa-f:.]+\]|$label(?:\.$label)*)(?::([0-9]{1,5}))?(/[^?#@]*)?$")) { return $null }
+    $hostPart = $Matches[1].ToLowerInvariant()
+    $portText = $Matches[2]
+    if ($portText) { $port = [int] $portText; if ($port -lt 1 -or $port -gt 65535) { return $null } }
+    if ($hostPart -like 'localhost*' -or $hostPart -like '127.*' -or $hostPart -eq '0.0.0.0' -or $hostPart -eq '0') { return $null }
+    if ($hostPart.StartsWith('[')) {
+        $bits = $hostPart -replace '[\[\]0:]', ''
+        if ($bits -eq '' -or $bits -eq '1') { return $null }
+        if ($hostPart.StartsWith('[fd7a:115c:a1e0:')) { return 'tailscale' }
+        return 'other'
+    }
+    if ($hostPart.EndsWith('.ts.net')) { return 'tailscale' }
+    if ($hostPart -match '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$') {
+        $o = @($hostPart.Split('.') | ForEach-Object { [int] $_ })
+        if (@($o | Where-Object { $_ -gt 255 }).Count -gt 0) { return $null }
+        if ($o[0] -eq 100 -and $o[1] -ge 64 -and $o[1] -le 127) { return 'tailscale' }
+    }
+    return 'other'
+}
+
+# Returns https, loopback, tailscale or other.
 function Test-Url([string] $Url) {
     if ($Url -match '[\s?#@"`$\\,]') { Fail '-ServerUrl must be a plain URL without spaces, credentials, query or fragment' }
     if ($Url -cmatch '^https://[^/:]') {
         $u = $null
         if (-not [Uri]::TryCreate($Url, [UriKind]::Absolute, [ref] $u) -or -not $u.Host -or $u.UserInfo) { Fail "invalid -ServerUrl: $Url" }
-        return
+        return 'https'
     }
     if ($Url -cmatch '^http://') {
-        if (Test-LoopbackHttp $Url) { return }
-        Fail 'plain http to a non-loopback host would send the runner token unencrypted; use https:// (http:// only to 127.0.0.1:PORT, localhost:PORT or [::1]:PORT)'
+        $class = Get-HttpClass $Url
+        if ($class) { return $class }
+        Fail "invalid -ServerUrl ${Url}: for this computer use exactly http://127.0.0.1:PORT, http://localhost:PORT or http://[::1]:PORT; otherwise host[:port] with a port of 1-65535"
     }
-    Fail '-ServerUrl must start with https:// (or http:// for loopback)'
+    Fail '-ServerUrl must start with https:// or http://'
+}
+
+function Get-PlainHttpWarning([string] $Url) {
+    $h = ([Uri] $Url).Authority -replace ':[0-9]+$', ''
+    "plain HTTP to $h isn't encrypted: anyone on the network between this computer and $h could read the runner token. Use it only on networks you trust, such as Tailscale or a VPN, or use https://."
 }
 
 # Never reads the token. On Windows, the file must be owned by you and not
@@ -121,7 +160,7 @@ function Assert-Engine {
 function Read-Config {
     if (-not (Test-Path -LiteralPath $Config -PathType Leaf)) { Fail "not set up: run -Action Setup first" }
     $c = Get-Content -LiteralPath $Config -Raw | ConvertFrom-Json
-    Test-Url $c.ServerUrl; Test-TokenFile $c.TokenFile; Test-Image $c.Image
+    Test-Url $c.ServerUrl | Out-Null; Test-TokenFile $c.TokenFile; Test-Image $c.Image
     Test-Name 'container name' $c.Name; Test-Name 'volume' $c.Volume
     if ($c.Network -notin 'host', 'default') { Fail "$Config has an invalid network setting" }
     return $c
@@ -135,6 +174,12 @@ function Write-Config($c) {
 }
 
 function Get-NetworkArgs($c) { if ($c.Network -eq 'host') { @('--network=host') } else { @() } }
+
+# Runner images up to 0.4.0 refuse plain http beyond loopback without this
+# opt-in; newer ones accept it, ignore it and print their own warning.
+function Get-InsecureArgs($c) {
+    if ((Test-Url $c.ServerUrl) -in 'tailscale', 'other') { @('--env', 'METRO_ALLOW_INSECURE_HTTP=1') } else { @() }
+}
 
 function Get-TokenMount($c) { "type=bind,source=$($c.TokenFile),target=$Secret,readonly" }
 
@@ -176,7 +221,7 @@ function Start-Runner($c) {
         '--cap-drop', 'ALL', '--security-opt', 'no-new-privileges:true', '--pids-limit', '256',
         '--mount', "type=volume,source=$($c.Volume),target=/workspace",
         '--mount', (Get-TokenMount $c),
-        '--env', "METRO_SERVER_URL=$($c.ServerUrl)",
+        '--env', "METRO_SERVER_URL=$($c.ServerUrl)") + (Get-InsecureArgs $c) + @(
         '--label', "dev.metro.managed-by=$Prog",
         '--entrypoint', '/bin/sh', $c.Image, '-c', $script)
     Invoke-Engine @a | Out-Null
@@ -203,14 +248,15 @@ try {
         'Setup' {
             if (-not $ServerUrl -or -not $TokenFile) { Fail 'Setup needs -ServerUrl and -TokenFile' }
             $url = $ServerUrl.TrimEnd('/')
-            Test-Url $url
+            $urlClass = Test-Url $url
+            if ($urlClass -eq 'other') { Write-Warning (Get-PlainHttpWarning $url) }
             $tokenPath = (Resolve-Path -LiteralPath $TokenFile).ProviderPath
             Test-TokenFile $tokenPath
             $c = [pscustomobject]@{
                 Image = (Get-ImageRef); ServerUrl = $url; TokenFile = $tokenPath
                 Name = $(if ($Name) { $Name } else { 'metro-runner' })
                 Volume = $(if ($Volume) { $Volume } else { 'metro-runner-workspace' })
-                Network = $(if (Test-LoopbackHttp $url) { 'host' } else { 'default' })
+                Network = $(if ($urlClass -eq 'loopback') { 'host' } else { 'default' })
             }
             Test-Name 'container name' $c.Name; Test-Name 'volume' $c.Volume
             Assert-Engine

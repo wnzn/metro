@@ -27,8 +27,11 @@ Usage:
   install-metro-runner-linux.sh status
   install-metro-runner-linux.sh uninstall [--purge-config]
 
---server-url must be https://, or http:// to this machine's loopback
-(127.0.0.1, ::1 or localhost) on a stable port.
+--server-url is https://, or http:// to any host. On this machine use
+http://127.0.0.1:PORT, http://localhost:PORT or http://[::1]:PORT (a stable
+port). Plain http to a host other than this machine or a Tailscale address
+(100.64.0.0/10, fd7a:115c:a1e0::/48, *.ts.net) works, with a warning: the
+runner token crosses the network unencrypted.
 --workspace is an existing directory owned by you; the runner keeps each
 Space's files in spaces/<space-id>/ inside it. It is never deleted.
 --token-file is a regular file owned by you with mode 600 holding the runner
@@ -162,29 +165,73 @@ host_problems() { # $1 = runner binary (optional); prints one problem per line
 }
 
 # ---------------------------------------------------------------- config
-# Plain http only to an exact loopback literal (localhost, 127.0.0.1 or
-# [::1]) with an explicit numeric port 1-65535, then an optional path.
-loopback_http() { # $1 = URL starting with http://
-    rest=${1#http://}; auth=${rest%%/*}
+# Plain http works to any host (the brief's item 12). The runner token is sent
+# as given, so the host decides how it's said:
+# - loopback: only the exact literals localhost, 127.0.0.1 or [::1] with an
+#   explicit port 1-65535 (anything else that names this machine, such as
+#   127.1 or LOCALHOST, is refused as ambiguous);
+# - Tailscale (100.64.0.0/10, fd7a:115c:a1e0::/48, names ending in .ts.net):
+#   encrypted by Tailscale itself, used silently;
+# - any other host: allowed, with one warning that the token crosses the
+#   network unencrypted.
+# http_class URL sets url_class (loopback, tailscale or other) and url_host;
+# it fails on a malformed or ambiguous authority.
+http_class() {
+    rest=${1#http://}; auth=${rest%%/*}; port='' has_port=0 url_class='' url_host=
     case "$auth" in
-        localhost:*) host=localhost; port=${auth#localhost:} ;;
-        127.0.0.1:*) host=127.0.0.1; port=${auth#127.0.0.1:} ;;
-        \[::1\]:*) host='[::1]'; port=${auth#\[::1\]:} ;;
-        *) return 1 ;;
+        \[*\]:*) url_host=${auth%%\]:*}']'; port=${auth##*\]:}; has_port=1 ;;
+        \[*\]) url_host=$auth ;;
+        *:*:*) return 1 ;;
+        *:*) url_host=${auth%:*}; port=${auth##*:}; has_port=1 ;;
+        *) url_host=$auth ;;
     esac
-    [ "$auth" = "$host:$port" ] || return 1
-    case "$port" in ''|*[!0-9]*) return 1 ;; esac
-    [ ${#port} -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]
+    if [ "$has_port" = 1 ]; then
+        case "$port" in ''|*[!0-9]*) return 1 ;; esac
+        [ ${#port} -le 5 ] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ] || return 1
+    fi
+    case "$url_host" in
+        \[*\]) inner=${url_host#\[}; inner=${inner%\]}
+               case "$inner" in ''|*[!0-9A-Fa-f:.]*) return 1 ;; esac ;;
+        ''|.*|-*|*.|*..*|*[!A-Za-z0-9.-]*) return 1 ;;
+    esac
+    if [ "$has_port" = 1 ]; then
+        case "$url_host" in localhost|127.0.0.1|\[::1\]) url_class=loopback; return 0 ;; esac
+    fi
+    lower=$(printf '%s' "$url_host" | tr '[:upper:]' '[:lower:]')
+    case "$lower" in
+        localhost*|127.*|0.0.0.0|0) return 1 ;;
+        \[*\]) bits=$(printf '%s' "$lower" | tr -d '[]0:')
+               [ -n "$bits" ] && [ "$bits" != 1 ] || return 1 ;;
+    esac
+    case "$lower" in
+        *.ts.net) url_class=tailscale; return 0 ;;
+        \[fd7a:115c:a1e0:*\]) url_class=tailscale; return 0 ;;
+    esac
+    case "$lower" in
+        *[!0-9.]*) ;;
+        *.*.*.*)
+            o1=${lower%%.*}; r=${lower#*.}; o2=${r%%.*}; r=${r#*.}; o3=${r%%.*}; o4=${r#*.}
+            for o in "$o1" "$o2" "$o3" "$o4"; do
+                case "$o" in ''|*[!0-9]*) return 1 ;; esac
+                [ ${#o} -le 3 ] && [ "$o" -le 255 ] || return 1
+            done
+            if [ "$o1" = 100 ] && [ "$o2" -ge 64 ] && [ "$o2" -le 127 ]; then url_class=tailscale; return 0; fi ;;
+    esac
+    url_class=other
 }
 
-check_url() {
+plain_http_warning() { # $1 = host; never mentions the token's value
+    printf '%s: warning: plain HTTP to %s isn'"'"'t encrypted: anyone on the network between this machine and %s could read the runner token. Use it only on networks you trust, such as Tailscale or a VPN, or use https://.\n' "$PROG" "$1" "$1" >&2
+}
+
+check_url() { # sets url_class (https, loopback, tailscale or other)
     u=$1
     case "$u" in *[[:space:]]*|*\?*|*\#*|*@*|*\"*|*\\*|*\$*|*\`*) die "--server-url must be a plain URL without spaces, credentials, query or fragment" ;; esac
     case "$u" in
-        https://[!/:]*) ;;
-        http://?*) loopback_http "$u" ||
-            die "plain http to a non-loopback host would send the runner token unencrypted; use an https:// URL (or http://127.0.0.1:PORT, http://localhost:PORT or http://[::1]:PORT on this machine)" ;;
-        *) die "--server-url must start with https:// (or http:// for loopback)" ;;
+        https://[!/:]*) url_class=https ;;
+        http://?*) http_class "$u" ||
+            die "invalid --server-url $u: for this machine use exactly http://127.0.0.1:PORT, http://localhost:PORT or http://[::1]:PORT; otherwise host[:port] with a port of 1-65535" ;;
+        *) die "--server-url must start with https:// or http://" ;;
     esac
 }
 
@@ -256,7 +303,10 @@ configure() {
     trap - EXIT
     say "Saved $config"
     say "The runner keeps each attached Space's files in $workspace/spaces/<space-id>/."
-    case "$server_url" in http://*) say "Note: the loopback port must stay the same; a server that picks a new port each start needs reconfiguring." ;; esac
+    case "$url_class" in
+        loopback) say "Note: the loopback port must stay the same; a server that picks a new port each start needs reconfiguring." ;;
+        other) plain_http_warning "$url_host" ;;
+    esac
 }
 
 run_runner() {
@@ -269,6 +319,9 @@ run_runner() {
     [ -z "$problems" ] || die "this host cannot run the runner: $problems"
     for k in $cfg_env; do eval "export $k=\"\$cfg_$k\""; done
     unset METRO_RUNNER_TOKEN METRO_ALLOW_INSECURE_HTTP
+    # Runners up to 0.4.0 refuse plain http beyond loopback without this
+    # opt-in; newer ones accept it, ignore it and print their own warning.
+    case "$url_class" in tailscale|other) export METRO_ALLOW_INSECURE_HTTP=1 ;; esac
     exec "$root/current/run-runner"
 }
 

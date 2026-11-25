@@ -41,6 +41,13 @@ BAD_LOOPBACK = (
 )
 GOOD_LOOPBACK = ("http://127.0.0.1:41234", "http://localhost:1", "http://[::1]:65535",
                  "http://localhost:41234/base")
+# Plain http beyond loopback is allowed: Tailscale silently, anything else with a warning.
+TAILSCALE_HTTP = ("http://100.64.0.1", "http://100.127.255.255:8787", "http://[fd7a:115c:a1e0::1]:8787",
+                  "http://metro.tail1234.ts.net", "http://Metro.Tail1234.TS.NET:8787/base")
+OTHER_HTTP = ("http://metro.example", "http://10.0.0.5:8787", "http://192.168.1.10:8787/base",
+              "http://100.128.0.1", "http://100.63.255.255:80", "http://[fe80::1]:8787", "http://ts.net")
+BAD_HTTP = ("http://1.2.3.999", "http://.metro.example", "http://a..b", "http://-x:80", "http://[::]:80",
+            "http://[fd7a::1", "http://metro.example:0", "http://metro.example:65536", "http://metro.example:")
 HOST_MUTATORS = {"docker", "podman", "sudo", "doas", "pkexec", "su", "systemctl", "apt", "apt-get", "dpkg",
                  "pacman", "dnf", "yum", "rpm", "zypper", "flatpak", "snap"}
 
@@ -355,6 +362,17 @@ class RunnerInstallerTests(unittest.TestCase):
         expected = sha(b"metro_rt_v2_secret-value")[:16]
         self.assertIn(f"url=https://metro.example ws={self.ws} token_sha={expected} insecure=unset file=unset", r.stdout)
         self.assertNotIn("secret-value", r.stdout + r.stderr)
+        # Plain http to a LAN host: a warning at configure time, and the old
+        # opt-in passed so runners up to 0.4.0 accept it too.
+        r = self.configure("http://192.168.1.10:8787")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr.count("isn't encrypted"), 1, r.stderr)
+        self.assertIn("192.168.1.10", r.stderr)
+        self.assertNotIn("secret-value", r.stdout + r.stderr)
+        r = self.box.run(RUNNER, "run", check=True, env={"METRO_RUNNER_TOKEN": "x"})
+        self.assertIn("url=http://192.168.1.10:8787 ", r.stdout)
+        self.assertIn("insecure=1 ", r.stdout)
+        self.assertEqual(self.configure("https://metro.example").returncode, 0)
 
         out = self.box.run(RUNNER, "install-service", check=True).stdout
         self.assertIn("not started", out)
@@ -405,12 +423,18 @@ class RunnerInstallerTests(unittest.TestCase):
 
     def test_configuration_is_validated(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
-        for url in ("http://metro.example", "http://10.0.0.5:8787", "ftp://x", "https://u:p@metro.example",
-                    "https://metro.example/?q", "https://", "https://:443", *BAD_LOOPBACK):
+        for url in ("ftp://x", "https://u:p@metro.example", "http://u:p@metro.example",
+                    "https://metro.example/?q", "https://", "https://:443", *BAD_LOOPBACK, *BAD_HTTP):
             r = self.configure(url)
             self.assertNotEqual(r.returncode, 0, url)
-        for url in GOOD_LOOPBACK:
-            self.assertEqual(self.configure(url).returncode, 0, url)
+        for url in GOOD_LOOPBACK + TAILSCALE_HTTP + ("https://metro.example",):
+            r = self.configure(url)
+            self.assertEqual(r.returncode, 0, url + r.stderr)
+            self.assertNotIn("isn't encrypted", r.stderr, url)
+        for url in OTHER_HTTP:
+            r = self.configure(url)
+            self.assertEqual(r.returncode, 0, url + r.stderr)
+            self.assertEqual(r.stderr.count("isn't encrypted"), 1, url)
         self.token.chmod(0o644)
         self.assertIn("mode 600", self.configure().stderr)
         self.token.chmod(0o600)
@@ -506,17 +530,38 @@ class ContainerScriptTests(unittest.TestCase):
         self.assertFalse(any("volume rm" in c for c in self.docker_calls()))
         self.assertTrue(self.token.exists())
 
-    def test_loopback_uses_host_network_and_http_elsewhere_is_refused(self):
+    def test_plain_http_elsewhere_warns_and_uses_the_default_network(self):
         r = self.box.run(CONTAINER, "setup", "--server-url", "http://192.168.1.10:8787", "--token-file", self.token,
-                         "--version", "0.3.0")
-        self.assertIn("unencrypted", r.stderr)
-        self.assertEqual(self.docker_calls(), [])
+                         "--version", "0.3.0", check=True)
+        self.assertEqual(r.stderr.count("isn't encrypted"), 1, r.stderr)
+        self.assertIn("192.168.1.10", r.stderr)
+        self.assertNotIn("secret-value", r.stdout + r.stderr)
+        self.assertIn("NETWORK=default", self.config.read_text())
+        self.box.run(CONTAINER, "start", check=True)
+        run = next(c for c in self.docker_calls() if c.startswith("docker run -d"))
+        self.assertNotIn("--network=host", run)
+        self.assertIn("METRO_SERVER_URL=http://192.168.1.10:8787", run)
+        self.assertIn("--env METRO_ALLOW_INSECURE_HTTP=1", run)  # for runner images up to 0.4.0
+        self.assertFalse(any("/dev/tcp/" in c for c in self.docker_calls()))
+        self.box.run(CONTAINER, "remove", check=True)
+
+        for url in TAILSCALE_HTTP:
+            r = self.box.run(CONTAINER, "setup", "--server-url", url, "--token-file", self.token, "--image", "m:ci",
+                             check=True)
+            self.assertNotIn("isn't encrypted", r.stderr, url)
+            self.assertIn("NETWORK=default", self.config.read_text())
+        for url in BAD_HTTP:
+            r = self.box.run(CONTAINER, "setup", "--server-url", url, "--token-file", self.token, "--image", "m:ci")
+            self.assertNotEqual(r.returncode, 0, url)
+
+    def test_loopback_uses_host_network(self):
         self.box.run(CONTAINER, "setup", "--server-url", "http://127.0.0.1:41234", "--token-file", self.token,
                      "--image", "metro-runner:ci", check=True)
         self.assertTrue(any("--network=host" in c and "/dev/tcp/127.0.0.1/41234" in c for c in self.docker_calls()))
         self.box.run(CONTAINER, "start", check=True)
         run = next(c for c in self.docker_calls() if c.startswith("docker run -d"))
         self.assertIn("--network=host", run)
+        self.assertNotIn("METRO_ALLOW_INSECURE_HTTP", run)
 
     def test_loopback_urls_are_exact_literals_with_a_port(self):
         for url in BAD_LOOPBACK:
@@ -681,16 +726,18 @@ class PowerShellTests(unittest.TestCase):
 
     def test_container_url_validation(self):
         missing = "/nonexistent/metro-token"  # a valid URL gets as far as the token file
-        for url in BAD_LOOPBACK + ("http://metro.example:80", "https://", "https://u@metro.example"):
+        for url in BAD_LOOPBACK + BAD_HTTP + ("https://", "https://u@metro.example", "http://u@metro.example"):
             r = self.pwsh("-File", CONTAINER_PS1, "-Action", "Setup", "-ServerUrl", url, "-TokenFile", missing,
                           "-Version", "0.3.0")
             self.assertNotEqual(r.returncode, 0, url)
             self.assertNotIn("Cannot find path", r.stderr, url)
-        for url in GOOD_LOOPBACK + ("https://metro.example", "https://metro.example:8443/base"):
+        for url in GOOD_LOOPBACK + TAILSCALE_HTTP + OTHER_HTTP + ("https://metro.example", "https://metro.example:8443/base"):
             r = self.pwsh("-File", CONTAINER_PS1, "-Action", "Setup", "-ServerUrl", url, "-TokenFile", missing,
                           "-Version", "0.3.0")
             self.assertNotEqual(r.returncode, 0, url)
             self.assertIn("Cannot find path", r.stderr, url)
+            # Only plain http beyond loopback and Tailscale warns.
+            self.assertEqual("isn't encrypted" in (r.stdout + r.stderr), url in OTHER_HTTP, url)
 
     def test_windows_installer_verifies_archives(self):
         with tempfile.TemporaryDirectory() as d:
