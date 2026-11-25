@@ -1,0 +1,103 @@
+//! Metro release verification.
+//!
+//! This crate is the one place that decides whether a published Metro release
+//! is genuine. A release counts only when:
+//!
+//! 1. `SHA256SUMS` carries a Sigstore v0.3 bundle that verifies against the
+//!    vendored Sigstore public-good trusted root, signed by the pinned release
+//!    workflow identity ([`SIGNER`], [`ISSUER`]) with the GitHub claims
+//!    `packaging/release-signatures/release_signatures.py` checks as well
+//!    ([`policy`]);
+//! 2. the signed `SHA256SUMS` names exactly one stable version and the
+//!    complete release file set ([`manifest`]);
+//! 3. every file Metro uses matches its signed row, and every archive
+//!    matches its own `RELEASE.json` ([`archive`]).
+//!
+//! The core has no network code. The optional fetchers in [`fetch`] only build
+//! URLs from constants and verified data.
+
+pub mod archive;
+pub mod channel;
+pub mod error;
+#[cfg(any(feature = "blocking", feature = "async"))]
+pub mod fetch;
+pub mod images;
+pub mod manifest;
+pub mod policy;
+pub mod release;
+pub mod sigstore;
+#[cfg(feature = "testing")]
+pub mod testing;
+pub mod version;
+
+pub use channel::Channel;
+pub use error::{Error, ErrorCode};
+pub use release::{ReleaseVerifier, Signed, SignedFacts, VerifiedRelease};
+pub use version::{Offer, Version};
+
+/// The only repository whose releases count.
+pub const REPO_URL: &str = "https://github.com/wnzn/metro";
+/// GitHub's numeric id for [`REPO_URL`]; survives renames, not re-creation.
+pub const REPO_ID: &str = "1467654868";
+/// GitHub Actions' OIDC issuer.
+pub const ISSUER: &str = "https://token.actions.githubusercontent.com";
+/// The reusable workflow that signs release assets (certificate SAN).
+pub const SIGNER: &str =
+    "https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/main";
+/// The top-level workflow that calls [`SIGNER`] on a protected `main` push.
+pub const CALLER: &str = "https://github.com/wnzn/metro/.github/workflows/ci.yml@refs/heads/main";
+/// The only ref releases are signed from.
+pub const SOURCE_REF: &str = "refs/heads/main";
+/// Release page prefix; a version is appended (`v1.2.3`).
+pub const RELEASE_PAGE_PREFIX: &str = "https://github.com/wnzn/metro/releases/tag/v";
+
+/// Size caps (bytes).
+pub const MAX_MANIFEST: usize = 64 * 1024;
+pub const MAX_BUNDLE: usize = 64 * 1024;
+pub const MAX_IMAGES: usize = 16 * 1024;
+pub const MAX_NOTES_JSON: usize = 256 * 1024;
+pub const MAX_ARCHIVE: u64 = 1024 * 1024 * 1024;
+
+/// Lowercase hex of a SHA-256 digest.
+pub fn hex(digest: &[u8; 32]) -> String {
+    let mut out = String::with_capacity(64);
+    for byte in digest {
+        out.push(char::from_digit(u32::from(byte >> 4), 16).unwrap_or('0'));
+        out.push(char::from_digit(u32::from(byte & 15), 16).unwrap_or('0'));
+    }
+    out
+}
+
+/// Parse exactly 64 lowercase hex characters.
+pub fn parse_hex32(text: &str) -> Option<[u8; 32]> {
+    let bytes = text.as_bytes();
+    if bytes.len() != 64 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    for (index, pair) in bytes.as_chunks::<2>().0.iter().enumerate() {
+        let nibble = |c: u8| match c {
+            b'0'..=b'9' => Some(c - b'0'),
+            b'a'..=b'f' => Some(c - b'a' + 10),
+            _ => None,
+        };
+        out[index] = (nibble(pair[0])? << 4) | nibble(pair[1])?;
+    }
+    Some(out)
+}
+
+/// SHA-256 of a byte slice.
+pub fn sha256(bytes: &[u8]) -> [u8; 32] {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes).into()
+}
+
+/// The release page for a version (built from a constant and a parsed version).
+pub fn release_url(version: &Version) -> String {
+    format!("{RELEASE_PAGE_PREFIX}{version}")
+}
+
+/// A 40-character lowercase hex commit.
+pub fn is_commit(text: &str) -> bool {
+    text.len() == 40 && text.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
