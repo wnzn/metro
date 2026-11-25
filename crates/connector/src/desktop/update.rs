@@ -296,13 +296,18 @@ impl Updater {
             status.last_update = Some(done);
         }
         // A staged version is offered again while it is still the latest.
-        let staged = install::staged(&cfg.kind, &cfg.dir).filter(|(v, _)| {
+        // Otherwise (an older or superseded version) it is deleted.
+        let found = install::staged(&cfg.kind, &cfg.dir);
+        let staged = found.clone().filter(|(v, _)| {
             *v > cfg.own
                 && status
                     .latest
                     .as_ref()
                     .is_some_and(|l| l.version == v.to_string())
         });
+        if found.is_some() && staged.is_none() {
+            install::discard_staged(&cfg.kind, &cfg.dir);
+        }
         let phase = if staged.is_some() {
             Phase::Ready
         } else {
@@ -647,8 +652,13 @@ impl Updater {
                     message: "Cancelled.".into(),
                 })
         };
-        let fetcher = AsyncFetcher::new(self.cfg.source.clone(), Duration::from_secs(600))
-            .map_err(|e| release_error(&e))?;
+        // Slow links are fine; a stalled one fails after a minute without data.
+        let fetcher = AsyncFetcher::for_downloads(
+            self.cfg.source.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(6 * 3600),
+        )
+        .map_err(|e| release_error(&e))?;
         let release = fetcher
             .fetch_release(self.cfg.verifier.as_ref(), &target)
             .await
@@ -721,7 +731,15 @@ impl Updater {
             self.cfg.ldd.clone(),
         );
         let staged = tokio::task::spawn_blocking(move || {
-            install::stage(&kind, &dir, &install_dir, &own, &target, &dest, &ldd)
+            install::stage(
+                &kind,
+                &dir,
+                &install_dir,
+                &own,
+                &target,
+                (&dest, &digest),
+                &ldd,
+            )
         })
         .await
         .map_err(|_| Failure {

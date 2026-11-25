@@ -157,6 +157,38 @@ pub async fn apply<L>(
     }
 }
 
+/// Before taking the instance lock: while a trial of an update runs under
+/// its watchdog, wait for it (it takes the lock the watchdog just let go),
+/// instead of racing it for the lock.
+pub async fn wait_for_trial(install_dir: &Path) {
+    let Some(root) = install_dir.parent().and_then(|v| v.parent()) else {
+        return;
+    };
+    if !root.join(install::MARKER).is_file() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    while install::trial_in_progress(root)
+        && started.elapsed() < apply::TRIAL_TIMEOUT + Duration::from_secs(30)
+    {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// A trial start takes the instance lock right after the watchdog let go of
+/// it; retry briefly rather than become a secondary instance.
+pub async fn lock_for_trial(
+    desktop_root: &Path,
+) -> Option<metro_connector::desktop::store::InstanceLock> {
+    for _ in 0..40 {
+        if let Ok(Some(lock)) = metro_connector::desktop::store::try_lock_instance(desktop_root) {
+            return Some(lock);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    None
+}
+
 /// At a normal start of a script install: finish or undo an interrupted
 /// update before anything else runs.
 pub fn recover_at_start(install_dir: &Path, desktop_root: &Path) {
@@ -190,7 +222,9 @@ pub fn run_helper(id: &str) -> u8 {
     else {
         return 2;
     };
-    let Some(msi) = j.msi.clone() else { return 2 };
+    if j.msi.is_none() {
+        return 2;
+    }
     // Wait for the old app to let go of its instance lock (it is exiting).
     for _ in 0..240 {
         match metro_connector::desktop::store::try_lock_instance(&desktop_root) {
@@ -201,14 +235,24 @@ pub fn run_helper(id: &str) -> u8 {
             _ => std::thread::sleep(Duration::from_millis(250)),
         }
     }
-    let log = update_dir.join(format!("msi-{}.log", j.to));
-    let code = run_msiexec(&msi, &log);
     let finish = |j: &mut install::Journal, phase: &str, outcome: &str, detail: Option<String>| {
         j.phase = phase.into();
         j.outcome = Some(outcome.into());
         j.detail = detail;
         let _ = install::write_journal(&jpath, j);
     };
+    // The MSI sat on disk since it was verified: check it again right before
+    // it runs, so msiexec only ever gets the verified bytes.
+    let msi = match install::verified_msi(&j) {
+        Ok(m) => m,
+        Err(why) => {
+            finish(&mut j, "failed", "install_failed", Some(why.to_string()));
+            start_installed(None);
+            return 1;
+        }
+    };
+    let log = update_dir.join(format!("msi-{}.log", j.to));
+    let code = run_msiexec(&msi, &log);
     match code {
         Some(0) | Some(3010) => {}
         other => {

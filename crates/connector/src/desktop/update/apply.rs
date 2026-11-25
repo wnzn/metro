@@ -38,6 +38,7 @@ pub struct TrialPaths {
 pub fn begin_trial(p: &TrialPaths, j: &mut Journal) -> std::io::Result<()> {
     j.local_db_snapshot = install::snapshot_db(&p.desktop_root, &p.update_dir)?;
     j.phase = "trial".into();
+    j.watchdog_pid = Some(std::process::id());
     install::write_journal(&p.root.join(install::JOURNAL), j)
 }
 
@@ -115,9 +116,16 @@ pub async fn watch_trial(
                     continue;
                 }
                 if status.success() {
-                    j.phase = "failed".into();
-                    j.outcome = Some("not_confirmed".into());
-                    let _ = install::write_journal(&p.root.join(install::JOURNAL), j);
+                    // Closed before its first render: nothing is committed,
+                    // and whatever the new server wrote is undone too.
+                    let _ = install::rollback(
+                        &p.root,
+                        &p.desktop_root,
+                        &p.update_dir,
+                        j,
+                        "not_confirmed",
+                        None,
+                    );
                     return TrialOutcome::NotConfirmed;
                 }
                 let detail = format!(

@@ -189,6 +189,15 @@ pub struct Journal {
     /// MSI: the verified MSI and the helper copy.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub msi: Option<PathBuf>,
+    /// MSI: the verified file's SHA-256, checked again just before msiexec.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
+    /// The watchdog (old launcher) during a trial.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub watchdog_pid: Option<u32>,
+    /// An outcome kept for later (MSI snapshot) was already shown once.
+    #[serde(default)]
+    pub reported: bool,
     pub started_at: i64,
 }
 
@@ -230,20 +239,12 @@ fn getrandom_fill(b: &mut [u8]) -> Result<(), ()> {
 /// A journal that ended (committed/failed) since the last start, as
 /// `last_update`; it is removed. Cleans leftovers of finished updates.
 pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Option<LastUpdate> {
-    let path = journal_path(kind, update_dir)?;
-    let j = read_journal(&path)?;
-    if !matches!(j.phase.as_str(), "committed" | "failed") {
-        return None;
-    }
-    let _ = fs::remove_file(&path);
-    let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
-    if let Some(root) = kind.root() {
-        cleanup_versions(root, own);
-    }
-    Some(LastUpdate {
-        from: j.from,
-        to: j.to,
-        outcome: j.outcome.unwrap_or_else(|| {
+    let desktop_root = update_dir.parent()?;
+    let own_s = own.to_string();
+    let last = |j: &Journal, detail: Option<String>| LastUpdate {
+        from: j.from.clone(),
+        to: j.to.clone(),
+        outcome: j.outcome.clone().unwrap_or_else(|| {
             if j.phase == "committed" {
                 "updated".into()
             } else {
@@ -251,8 +252,103 @@ pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Op
             }
         }),
         at: now_ms(),
-        detail: j.detail,
-    })
+        detail: detail.or_else(|| j.detail.clone()),
+    };
+    let mut result = None;
+    // The MSI journal, whichever way this version was installed (the person
+    // may reinstall the previous version from the ZIP).
+    let msi_path = update_dir.join(MSI_JOURNAL);
+    if let Some(mut j) =
+        read_journal(&msi_path).filter(|j| matches!(j.phase.as_str(), "committed" | "failed"))
+    {
+        let keep = j.outcome.as_deref() == Some("install_failed") && j.local_db_snapshot;
+        if keep && own_s == j.from {
+            // The previous version is back: so is the data from before the update.
+            let restored = restore_db(desktop_root, update_dir).is_ok();
+            discard_msi(update_dir);
+            let detail =
+                restored.then(|| "Your data from before the update was restored.".to_string());
+            result = Some(last(&j, detail));
+        } else if keep {
+            // Keep the snapshot until the previous version starts again.
+            if !j.reported {
+                j.reported = true;
+                let _ = write_journal(&msi_path, &j);
+                result = Some(last(&j, None));
+            }
+        } else {
+            discard_msi(update_dir);
+            result = Some(last(&j, None));
+        }
+    }
+    if let Some(root) = kind.root() {
+        let path = root.join(JOURNAL);
+        if let Some(j) =
+            read_journal(&path).filter(|j| matches!(j.phase.as_str(), "committed" | "failed"))
+        {
+            let _ = fs::remove_file(&path);
+            let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
+            cleanup_versions(root, own);
+            result = result.or(Some(last(&j, None)));
+        }
+    }
+    result
+}
+
+/// Remove an MSI update's journal, snapshot, download and helper copies.
+fn discard_msi(update_dir: &Path) {
+    let _ = fs::remove_file(update_dir.join(MSI_JOURNAL));
+    let _ = fs::remove_dir_all(update_dir.join("db-snapshot"));
+    let _ = fs::remove_dir_all(update_dir.join("dl"));
+    if let Ok(entries) = fs::read_dir(update_dir) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with("helper-") {
+                let _ = fs::remove_dir_all(e.path());
+            }
+        }
+    }
+}
+
+/// Drop a staged update that is no longer offered (design 3.5: "otherwise
+/// it is deleted"): its version folder (never the current one) or MSI
+/// download, and its journal.
+pub fn discard_staged(kind: &InstallKind, update_dir: &Path) {
+    let Some(path) = journal_path(kind, update_dir) else {
+        return;
+    };
+    let Some(j) = read_journal(&path).filter(|j| j.phase == "staged") else {
+        return;
+    };
+    match kind {
+        InstallKind::LinuxInstaller { root } | InstallKind::WindowsScript { root } => {
+            if read_pointer(root).as_deref() != Some(j.to.as_str())
+                && Version::parse(&j.to).is_some()
+            {
+                let _ = fs::remove_dir_all(root.join("versions").join(&j.to));
+            }
+            let _ = fs::remove_file(&path);
+        }
+        InstallKind::WindowsMsi { .. } => discard_msi(update_dir),
+        _ => {}
+    }
+}
+
+/// MSI: the staged file, if it still has the verified SHA-256.
+pub fn verified_msi(j: &Journal) -> Result<PathBuf, &'static str> {
+    let msi = j.msi.clone().ok_or("no installer recorded")?;
+    let want = j.sha256.as_deref().ok_or("no installer hash recorded")?;
+    let have =
+        metro_release::archive::sha256_file(&msi).map_err(|_| "the installer can't be read")?;
+    if metro_release::hex(&have) != want {
+        return Err("the downloaded installer changed after it was verified");
+    }
+    Ok(msi)
+}
+
+/// A trial whose watchdog is still alive.
+pub fn trial_in_progress(root: &Path) -> bool {
+    read_journal(&root.join(JOURNAL))
+        .is_some_and(|j| j.phase == "trial" && j.watchdog_pid.is_some_and(pid_alive))
 }
 
 /// A staged update waiting for its restart.
@@ -351,15 +447,36 @@ impl Drop for Lock {
     }
 }
 
-fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
         // SAFETY: signal 0 only checks existence.
         pid != 0 && pid <= i32::MAX as u32 && unsafe { libc::kill(pid as i32, 0) } == 0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        pid != 0 && pid == std::process::id()
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: a query-only handle, closed below.
+        unsafe {
+            let h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if h.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let ok = GetExitCodeProcess(h, &mut code) != 0;
+            CloseHandle(h);
+            ok && code == STILL_ACTIVE as u32
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        pid == std::process::id()
     }
 }
 
@@ -373,7 +490,7 @@ pub fn stage(
     install_dir: &Path,
     own: &Version,
     target: &Version,
-    download: &Path,
+    (download, digest): (&Path, &[u8; 32]),
     ldd: &Path,
 ) -> Result<String, StageError> {
     let id = new_id();
@@ -387,6 +504,9 @@ pub fn stage(
         detail: None,
         local_db_snapshot: false,
         msi: None,
+        sha256: None,
+        watchdog_pid: None,
+        reported: false,
         started_at: now_ms(),
     };
     match kind {
@@ -472,6 +592,7 @@ pub fn stage(
             fs::copy(&exe, helper.join("metro-update-helper.exe")).map_err(|_| stage_err("io"))?;
             let j = Journal {
                 msi: Some(download.to_path_buf()),
+                sha256: Some(metro_release::hex(digest)),
                 ..journal
             };
             write_journal(&update_dir.join(MSI_JOURNAL), &j).map_err(|_| stage_err("io"))?;
@@ -626,6 +747,8 @@ pub fn recover(root: &Path, desktop_root: &Path, update_dir: &Path, own: &Versio
                 Recovery::Nothing
             }
         }
+        // A trial whose watchdog still runs is in progress, not interrupted.
+        "trial" if j.watchdog_pid.is_some_and(pid_alive) => Recovery::Nothing,
         "committing" | "trial" if own == j.from => {
             // The watchdog is gone (we are a fresh start of the old version).
             let _ = rollback(

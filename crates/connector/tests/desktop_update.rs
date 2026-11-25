@@ -225,6 +225,9 @@ fn detection() {
         detail: None,
         local_db_snapshot: false,
         msi: None,
+        sha256: None,
+        watchdog_pid: None,
+        reported: false,
         started_at: 0,
     };
     install::write_journal(&i.root.join(install::JOURNAL), &j).unwrap();
@@ -457,6 +460,9 @@ fn staged_journal(i: &Install) -> Journal {
         detail: None,
         local_db_snapshot: false,
         msi: None,
+        sha256: None,
+        watchdog_pid: None,
+        reported: false,
         started_at: 0,
     };
     install::write_journal(&i.root.join(install::JOURNAL), &j).unwrap();
@@ -583,6 +589,7 @@ async fn trial_timeout_kills_and_rolls_back() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn trial_closed_at_once_is_not_committed() {
     let i = install();
+    let before = db(&i);
     let mut j = staged_journal(&i);
     let p = paths(&i);
     fs::create_dir_all(&p.update_dir).unwrap();
@@ -594,6 +601,133 @@ async fn trial_closed_at_once_is_not_committed() {
         TrialOutcome::NotConfirmed
     );
     assert_eq!(install::read_pointer(&i.root).as_deref(), Some(OLD));
+    // Whatever the new server wrote before it was closed is undone.
+    assert_eq!(db(&i), before);
+    assert!(!i.root.join("versions").join(NEW).exists());
+    let j = install::read_journal(&i.root.join(install::JOURNAL)).unwrap();
+    assert_eq!(
+        (j.phase.as_str(), j.outcome.as_deref()),
+        ("failed", Some("not_confirmed"))
+    );
+}
+
+/// MSI: "installed but didn't start" keeps the pre-update data until the
+/// previous version runs again, then restores it.
+#[test]
+fn msi_install_failed_keeps_and_restores_the_snapshot() {
+    let i = install();
+    let update_dir = i.desktop_root.join("update");
+    fs::create_dir_all(update_dir.join("helper-0123456789abcdef")).unwrap();
+    let before = db(&i);
+    assert!(install::snapshot_db(&i.desktop_root, &update_dir).unwrap());
+    fs::write(
+        i.desktop_root.join("local/db/metro.sqlite3"),
+        b"migrated by the new version",
+    )
+    .unwrap();
+    let mut j = staged_journal(&i);
+    let _ = fs::remove_file(i.root.join(install::JOURNAL));
+    j.phase = "failed".into();
+    j.outcome = Some("install_failed".into());
+    j.local_db_snapshot = true;
+    install::write_journal(&update_dir.join(install::MSI_JOURNAL), &j).unwrap();
+    let kind = InstallKind::Portable;
+    // The new (installed, broken) version or any other start: reported once, data kept.
+    let new = Version::parse(NEW).unwrap();
+    let first = install::take_finished(&kind, &update_dir, &new).unwrap();
+    assert_eq!(first.outcome, "install_failed");
+    assert!(
+        install::take_finished(&kind, &update_dir, &new).is_none(),
+        "reported once"
+    );
+    assert!(
+        update_dir.join("db-snapshot/metro.sqlite3").is_file(),
+        "the snapshot is kept"
+    );
+    assert_ne!(db(&i), before);
+    // The previous version is reinstalled and starts: the data comes back.
+    let old = Version::parse(OLD).unwrap();
+    let back = install::take_finished(&kind, &update_dir, &old).unwrap();
+    assert_eq!(db(&i), before, "restored byte for byte");
+    assert!(back.detail.unwrap().contains("restored"));
+    assert!(!update_dir.join("db-snapshot").exists());
+    assert!(!update_dir.join(install::MSI_JOURNAL).exists());
+    assert!(!update_dir.join("helper-0123456789abcdef").exists());
+    // A successful MSI update drops the snapshot at once.
+    install::snapshot_db(&i.desktop_root, &update_dir).unwrap();
+    j.phase = "committed".into();
+    j.outcome = Some("updated".into());
+    j.reported = false;
+    install::write_journal(&update_dir.join(install::MSI_JOURNAL), &j).unwrap();
+    assert_eq!(
+        install::take_finished(&kind, &update_dir, &new)
+            .unwrap()
+            .outcome,
+        "updated"
+    );
+    assert!(!update_dir.join("db-snapshot").exists());
+}
+
+#[test]
+fn msi_is_hashed_again_before_it_runs() {
+    let i = install();
+    let msi = i.desktop_root.join("Metro.msi");
+    fs::write(&msi, b"verified installer").unwrap();
+    let mut j = staged_journal(&i);
+    j.msi = Some(msi.clone());
+    assert!(install::verified_msi(&j).is_err(), "no recorded hash");
+    j.sha256 = Some(metro_release::hex(&metro_release::sha256(
+        b"verified installer",
+    )));
+    assert_eq!(install::verified_msi(&j).unwrap(), msi);
+    fs::write(&msi, b"swapped installer").unwrap();
+    assert_eq!(
+        install::verified_msi(&j).unwrap_err(),
+        "the downloaded installer changed after it was verified"
+    );
+    fs::remove_file(&msi).unwrap();
+    assert!(install::verified_msi(&j).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_staged_version_no_longer_offered_is_deleted() {
+    let i = install();
+    let f = serve(BTreeMap::new(), vec![]);
+    staged_journal(&i); // versions/NEW + journal "staged", but no check said NEW is the latest
+    let u = updater(&i, &f, Channel::Release);
+    assert_eq!(u.state(Busy::default())["phase"], "idle");
+    assert!(!i.root.join("versions").join(NEW).exists());
+    assert!(!i.root.join(install::JOURNAL).exists());
+    assert!(
+        i.root.join("versions").join(OLD).join("Metro").is_file(),
+        "the running version is kept"
+    );
+}
+
+#[test]
+fn a_trial_with_a_live_watchdog_is_left_alone() {
+    let i = install();
+    let mut j = staged_journal(&i);
+    let p = paths(&i);
+    fs::create_dir_all(&p.update_dir).unwrap();
+    apply::begin_trial(&p, &mut j).unwrap();
+    assert_eq!(j.watchdog_pid, Some(std::process::id()));
+    assert!(install::trial_in_progress(&i.root));
+    // A second start of the old version while the trial runs: no rollback.
+    let old = Version::parse(OLD).unwrap();
+    assert_eq!(
+        install::recover(&i.root, &i.desktop_root, &p.update_dir, &old),
+        install::Recovery::Nothing
+    );
+    assert!(i.root.join("versions").join(NEW).join("Metro").is_file());
+    // Once the watchdog is gone, the same state is an interrupted update.
+    j.watchdog_pid = Some(i32::MAX as u32 - 1);
+    install::write_journal(&i.root.join(install::JOURNAL), &j).unwrap();
+    assert!(!install::trial_in_progress(&i.root));
+    assert_eq!(
+        install::recover(&i.root, &i.desktop_root, &p.update_dir, &old),
+        install::Recovery::RolledBack
+    );
 }
 
 /// Interruption matrix: a crash after each journal phase ends consistent.
@@ -619,6 +753,8 @@ fn recovery_after_interruptions() {
             fs::write(i.desktop_root.join("local/db/metro.sqlite3"), b"migrated").unwrap();
         }
         j.phase = phase.into();
+        // The process that was watching has crashed.
+        j.watchdog_pid = j.watchdog_pid.map(|_| i32::MAX as u32 - 1);
         install::write_journal(&i.root.join(install::JOURNAL), &j).unwrap();
         install::set_pointer(&i.root, pointer).unwrap();
         let r = install::recover(&i.root, &i.desktop_root, &p.update_dir, running);

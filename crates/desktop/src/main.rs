@@ -273,8 +273,13 @@ async fn launch(
         .map_err(|e| start_failed(format!("cannot find a place for Metro's data: {e}")))?;
     store::prepare_private_dir(&root)
         .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
-    let lock = store::try_lock_instance(&root)
-        .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
+    let lock = if trial.is_some() {
+        update::lock_for_trial(&root).await
+    } else {
+        update::wait_for_trial(&dir).await;
+        store::try_lock_instance(&root)
+            .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?
+    };
     let primary = lock.is_some();
 
     // Updates: primary instance only. A normal start first finishes or
