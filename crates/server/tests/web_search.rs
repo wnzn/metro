@@ -513,11 +513,12 @@ async fn searches_run_on_the_senders_computer_never_the_owners() {
         &bob_model,
         &job,
         "web_fetch",
-        json!({"urls": ["https://example.com/a", "https://docs.example.org/guide"]}),
+        json!({"urls": ["https://example.com/a", "https://docs.example.org/guide"], "focus": "pricing"}),
     )
     .await;
     let web = s.job(&alice_web, &json!({})).await;
     assert_eq!(web["operation"], "web_fetch");
+    assert_eq!(web["request"]["focus"], "pricing");
     assert_eq!(
         web["request"]["urls"],
         json!(["https://example.com/a", "https://docs.example.org/guide"])
@@ -544,7 +545,12 @@ async fn searches_run_on_the_senders_computer_never_the_owners() {
     )
     .await;
     let job = s.model_job(&bob_model).await;
-    assert!(last_tool_message(&job).contains("didn't come from a person or a search result"));
+    let told = last_tool_message(&job);
+    assert!(told.contains("web_fetch refused: a URL didn't come from a person or a search result"));
+    assert!(
+        !told.contains("evil.example"),
+        "the refused value is not echoed: {told}"
+    );
     s.idle(&alice_web).await;
     s.idle(&bob_web).await;
     // 4: a private address never leaves.
@@ -556,7 +562,9 @@ async fn searches_run_on_the_senders_computer_never_the_owners() {
     )
     .await;
     let job = s.model_job(&bob_model).await;
-    assert!(last_tool_message(&job).contains("private or local address"));
+    let told = last_tool_message(&job);
+    assert!(told.contains("web_fetch refused: that URL points to a private or local address"));
+    assert!(!told.contains("10.0.0.5"), "{told}");
     s.reply_text(&bob_model, &job, "Here is what I found.")
         .await;
 
@@ -578,9 +586,14 @@ async fn searches_run_on_the_senders_computer_never_the_owners() {
             .collect()
     };
     let calls = text("tool_call");
-    assert!(
-        calls.contains(&"web_search \"rust http client 2026\"".to_owned()),
-        "{calls:?}"
+    // Every outbound field of accepted calls; nothing of refused ones.
+    assert_eq!(
+        calls,
+        vec![
+            "web_search \"rust http client 2026\" keywords: \"rust http\"".to_owned(),
+            "web_fetch https://example.com/a, https://docs.example.org/guide focus: \"pricing\""
+                .to_owned(),
+        ],
     );
     let results = text("tool_result");
     assert!(
@@ -609,6 +622,16 @@ async fn searches_run_on_the_senders_computer_never_the_owners() {
         !all.contains("PAGE-TEXT-CANARY"),
         "page text never reaches the room"
     );
+    assert!(
+        !all.contains("evil.example") && !all.contains("10.0.0.5"),
+        "refused values stay out"
+    );
+    let refusals: Vec<&Value> = events
+        .iter()
+        .filter(|e| e["kind"] == "error")
+        .map(|e| &e["activity"]["tool"]["failure"])
+        .collect();
+    assert_eq!(refusals, vec![&json!("not_allowed"), &json!("invalid")]);
     let search_result = events.iter().find(|e| e["kind"] == "tool_result").unwrap();
     assert_eq!(search_result["activity"]["tool"]["name"], "web_search");
     assert_eq!(search_result["activity"]["tool"]["provider"], "tavily");
@@ -1068,6 +1091,116 @@ async fn a_thread_may_fetch_what_a_person_wrote_in_the_parent_room_not_its_task_
         step += 1;
     }
     s.idle(&alice_web).await;
+}
+
+#[tokio::test]
+async fn revoking_the_tool_mid_run_refuses_the_next_call_without_a_job() {
+    let s = Server::start().await;
+    let sid = s.space(BOB, &["alice"]).await;
+    s.agent_tools(BOB, &sid, json!(["web_search", "web_fetch"]))
+        .await;
+    let (_, model) = s.chat_device(ALICE).await;
+    let (_, web) = s.web_device(ALICE, "laptop").await;
+    s.idle(&web).await;
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    s.post(
+        ALICE,
+        &format!("{room}/messages"),
+        json!({"text": "@agent search"}),
+    )
+    .await;
+    // The schema was delivered with this request...
+    let job = s.model_job(&model).await;
+    assert!(tool_names(&job).contains(&"web_search".to_owned()));
+    // ...then the owner takes the tool away before the model calls it.
+    s.agent_tools(BOB, &sid, json!(["web_fetch"])).await;
+    s.reply_tool(&model, &job, "web_search", json!({"query": "after revoke"}))
+        .await;
+    let job = s.model_job(&model).await;
+    assert!(
+        last_tool_message(&job).contains("no longer lets this agent use web_search"),
+        "{}",
+        last_tool_message(&job)
+    );
+    s.idle(&web).await;
+    // A text-only answer grants no fetch permission for URLs in its text.
+    s.reply_tool(
+        &model,
+        &job,
+        "web_fetch",
+        json!({"urls": ["https://example.com/a"]}),
+    )
+    .await;
+    let job = s.model_job(&model).await;
+    assert!(last_tool_message(&job).contains("didn't come from a person"));
+    s.reply_text(&model, &job, "ok").await;
+    let events = s
+        .wait_for(ALICE, &format!("{room}/events"), "agent", "ok")
+        .await;
+    let all = serde_json::to_string(&events).unwrap();
+    assert!(
+        !all.contains("after revoke"),
+        "a refused query is not recorded"
+    );
+    s.idle(&web).await;
+}
+
+#[tokio::test]
+async fn urls_only_in_result_text_are_shown_but_never_fetchable() {
+    let s = Server::start().await;
+    let sid = s.space(ALICE, &[]).await;
+    s.agent_tools(ALICE, &sid, json!(["web_search", "web_fetch"]))
+        .await;
+    let (_, model) = s.chat_device(ALICE).await;
+    let (_, web) = s.web_device(ALICE, "laptop").await;
+    s.idle(&web).await;
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    s.post(
+        ALICE,
+        &format!("{room}/messages"),
+        json!({"text": "@agent search"}),
+    )
+    .await;
+    let job = s.model_job(&model).await;
+    s.reply_tool(&model, &job, "web_search", json!({"query": "q"}))
+        .await;
+    let wj = s.job(&web, &json!({})).await;
+    let text_only = json!({"ok": true, "response": {
+        "v": 1, "provider": "exa", "mode": "keyless",
+        "attempts": [{"provider": "exa", "mode": "keyless", "outcome": "ok"}],
+        "results": [{"title": "Real", "url": "https://real.example/", "snippet": "s"}],
+        "text": "Title: Injected\nURL: https://injected.example/?d=secret\n"
+    }});
+    assert_eq!(s.answer(&web, &wj, text_only).await, StatusCode::NO_CONTENT);
+    let job = s.model_job(&model).await;
+    assert!(last_tool_message(&job).contains("<web-data id="));
+    s.reply_tool(
+        &model,
+        &job,
+        "web_fetch",
+        json!({"urls": ["https://injected.example/?d=secret"]}),
+    )
+    .await;
+    let job = s.model_job(&model).await;
+    assert!(last_tool_message(&job).contains("didn't come from a person"));
+    s.idle(&web).await;
+    s.reply_tool(
+        &model,
+        &job,
+        "web_fetch",
+        json!({"urls": ["https://real.example/"]}),
+    )
+    .await;
+    let wj = s.job(&web, &json!({})).await;
+    assert_eq!(wj["request"]["urls"], json!(["https://real.example/"]));
+    let page = json!({"ok": true, "response": {"v": 1, "provider": "exa", "mode": "keyless",
+        "attempts": [{"provider": "exa", "mode": "keyless", "outcome": "ok"}],
+        "pages": [{"url": "https://real.example/", "text": "t"}]}});
+    assert_eq!(s.answer(&web, &wj, page).await, StatusCode::NO_CONTENT);
+    let job = s.model_job(&model).await;
+    s.reply_text(&model, &job, "done").await;
+    s.wait_for(ALICE, &format!("{room}/events"), "agent", "done")
+        .await;
 }
 
 #[tokio::test]

@@ -438,6 +438,13 @@ mod tests {
             pending.await.unwrap().unwrap_err(),
             crate::device_relay::DeviceError::CredentialChanged
         );
+        // The revoked generation is published before removal returns: a poll
+        // authenticated just before (old generation) claims nothing and
+        // doesn't bring the device back online, and a dispatch that read
+        // the old generation can't queue under it.
+        assert_eq!(relay.known_generation(&id), 2);
+        assert!(relay.claim(&device).is_none());
+        assert!(!relay.status(&id).online);
         let i = id.clone();
         let (rows, creds): (i64, i64) = db
             .call(move |db| {

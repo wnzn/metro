@@ -165,7 +165,8 @@ fn object(args: &Value) -> Result<&Map<String, Value>, String> {
 
 fn reject_unknown(obj: &Map<String, Value>, known: &[&str]) -> Result<(), String> {
     match obj.keys().find(|k| !known.contains(&k.as_str())) {
-        Some(k) => Err(format!("unknown argument `{k}`")),
+        // The name itself is the model's text: never echoed.
+        Some(_) => Err("an unknown argument was given".to_owned()),
         None => Ok(()),
     }
 }
@@ -1037,6 +1038,9 @@ pub struct WebContext {
     pub initiator: Author,
     pub turn: Activity,
     pub provenance: Arc<Provenance>,
+    /// The Space agent working the run (`None` in personal Chat): it must
+    /// still exist and still allow the tool on every call.
+    pub agent_id: Option<String>,
 }
 
 impl WebContext {
@@ -1097,6 +1101,20 @@ impl WebContext {
         }
     }
 
+    /// Record a refused call: `{tool} refused: {why}` (fixed wording, no
+    /// argument values). Returns the text.
+    async fn refuse(&self, tool: &str, why: &str, code: &str) -> String {
+        let msg = format!("{tool} refused: {why}");
+        self.append(
+            kind::ERROR,
+            Author::server(actor::SYSTEM),
+            &msg,
+            ToolNote::failed(tool, code),
+        )
+        .await;
+        msg
+    }
+
     async fn monitor(&self) {
         match &self.scope {
             WebScope::Room { space_id, .. } => {
@@ -1112,24 +1130,35 @@ impl WebContext {
         }
     }
 
-    /// Re-checked on every call: still a member (Space), still opted in
-    /// (personal Chat).
-    async fn allowed(&self) -> Result<(), String> {
+    /// Re-checked on every call: still a member, and the run's agent still
+    /// exists and still allows `tool` (Space); still opted in (personal
+    /// Chat).
+    async fn allowed(&self, tool: &str) -> Result<(), String> {
         let user = self.user().to_owned();
         if user.is_empty() {
             return Err("this run has no person behind it".to_owned());
         }
         match &self.scope {
             WebScope::Room { space_id, .. } => {
-                let space = space_id.clone();
+                let (space, agent, t) = (space_id.clone(), self.agent_id.clone(), tool.to_owned());
                 match self
                     .state
                     .db
-                    .call(move |db| db.membership(&space, &user))
+                    .call(move |db| {
+                        let member = db.membership(&space, &user)?.is_some();
+                        let agent_allows = match &agent {
+                            Some(aid) => db.space_agent(&space, aid)?.is_some_and(|a| a.allows(&t)),
+                            None => false,
+                        };
+                        Ok((member, agent_allows))
+                    })
                     .await
                 {
-                    Ok(Some(_)) => Ok(()),
-                    Ok(None) => Err(
+                    Ok((true, true)) => Ok(()),
+                    Ok((true, false)) => Err(format!(
+                        "the Space owner no longer lets this agent use {tool}"
+                    )),
+                    Ok((false, _)) => Err(
                         "the person who started this run is no longer a member of the Space"
                             .to_owned(),
                     ),
@@ -1167,48 +1196,44 @@ impl WebContext {
         } else {
             WEB_SEARCH
         };
-        // Still a member (Space), still opted in (personal Chat).
-        self.allowed()
-            .await
-            .map_err(ToolExecutionError::permission_denied)?;
-        let (request, call_text) = match operation {
-            Operation::WebSearch => {
-                let (request, query) =
-                    search_request(&args).map_err(ToolExecutionError::invalid_args)?;
-                (request, format!("{WEB_SEARCH} \"{query}\""))
-            }
-            _ => {
-                let (urls, focus) =
-                    fetch_arguments(&args).map_err(ToolExecutionError::invalid_args)?;
-                let call_text = format!("{WEB_FETCH} {}", urls.join(", "));
-                if let Some(bad) = urls.iter().find(|u| !self.provenance.allows(u)) {
-                    let msg = format!(
-                        "{WEB_FETCH} refused {bad}: this URL didn't come from a person or a search \
-                         result in this run; ask the person to paste it"
-                    );
-                    self.append(
-                        kind::TOOL_CALL,
-                        Author::server(actor::AGENT),
-                        &call_text,
-                        ToolNote::named(tool),
-                    )
-                    .await;
-                    self.append(
-                        kind::ERROR,
-                        Author::server(actor::SYSTEM),
-                        &msg,
-                        ToolNote::failed(tool, "not_allowed"),
-                    )
-                    .await;
-                    return Err(ToolExecutionError::permission_denied(msg));
+        // Still a member, agent still allowed (Space); still opted in
+        // (personal Chat).
+        if let Err(why) = self.allowed(tool).await {
+            self.refuse(tool, &why, "not_allowed").await;
+            return Err(ToolExecutionError::permission_denied(why));
+        }
+        // A refusal records the operation and a fixed reason only: the
+        // rejected value is never copied into shared activity or the error.
+        let checked = match operation {
+            Operation::WebSearch => search_request(&args).map(|(request, _)| request),
+            _ => fetch_arguments(&args).and_then(|(urls, focus)| {
+                if urls.iter().any(|u| !self.provenance.allows(u)) {
+                    return Err(NOT_FROM_PERSON.to_owned());
                 }
                 let mut request = json!({"v": 1, "urls": urls});
                 if let Some(f) = focus {
                     request["focus"] = json!(f);
                 }
-                (request, call_text)
+                Ok(request)
+            }),
+        };
+        let request = match checked {
+            Ok(r) => r,
+            Err(why) => {
+                let code = if why == NOT_FROM_PERSON {
+                    "not_allowed"
+                } else {
+                    "invalid"
+                };
+                let msg = self.refuse(tool, &why, code).await;
+                return Err(if code == "not_allowed" {
+                    ToolExecutionError::permission_denied(msg)
+                } else {
+                    ToolExecutionError::invalid_args(msg)
+                });
             }
         };
+        let call_text = call_text(&request);
         self.append(
             kind::TOOL_CALL,
             Author::server(actor::AGENT),
@@ -1315,6 +1340,42 @@ fn dynamic(ctx: &WebContext, operation: Operation) -> DynamicTool {
         let ctx = ctx.clone();
         Box::pin(async move { ctx.call(operation, args).await.map(ToolOutput::text) })
     })
+}
+
+const NOT_FROM_PERSON: &str = "a URL didn't come from a person or a search result in this run; \
+ask the person to paste it";
+
+/// The `tool_call` text of an accepted call: every field that goes to the
+/// device and on to the vendors (query, keywords and result count; URLs and
+/// focus), so the room sees everything that leaves.
+pub fn call_text(request: &Value) -> String {
+    let quote = |v: &Value| format!("\"{}\"", v.as_str().unwrap_or_default());
+    if let Some(urls) = request["urls"].as_array() {
+        let mut s = format!(
+            "{WEB_FETCH} {}",
+            urls.iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        if let Some(f) = request.get("focus") {
+            s.push_str(&format!(" focus: {}", quote(f)));
+        }
+        return s;
+    }
+    let mut s = format!("{WEB_SEARCH} {}", quote(&request["query"]));
+    if let Some(k) = request["keywords"].as_array() {
+        s.push_str(&format!(
+            " keywords: {}",
+            k.iter().map(quote).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    if let Some(n) = request["max_results"].as_u64()
+        && n != DEFAULT_RESULTS
+    {
+        s.push_str(&format!(" max_results: {n}"));
+    }
+    s
 }
 
 /// The web tools for one run: `search` and/or `fetch`.

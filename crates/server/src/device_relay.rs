@@ -1633,18 +1633,39 @@ impl DeviceRelay {
     ) -> Result<(), IssueError> {
         let directory = self.directory.clone();
         let (o, c) = (owner.to_owned(), connection.to_owned());
-        db.call(move |db| {
-            let conn = db.lock();
-            if owned_device_connection(&*directory, &conn, &o, &c)?.is_none() {
-                return Ok(Err(IssueError::NotFound));
-            }
-            delete_credential(&conn, &c)?;
-            Ok(Ok(()))
-        })
-        .await
-        .map_err(IssueError::Internal)??;
-        self.lock().flush(connection);
+        let generation = db
+            .call(move |db| {
+                let conn = db.lock();
+                if owned_device_connection(&*directory, &conn, &o, &c)?.is_none() {
+                    return Ok(Err(IssueError::NotFound));
+                }
+                Ok(Ok(delete_credential(&conn, &c)?))
+            })
+            .await
+            .map_err(IssueError::Internal)??;
+        match generation {
+            Some(g) => self.retire(connection, g),
+            None => self.lock().flush(connection),
+        }
         Ok(())
+    }
+
+    /// Publish a committed revocation to the relay: fail every pending job of
+    /// `connection` and refuse polls and queueing under any generation
+    /// before `generation`, before the caller returns.
+    fn retire(&self, connection: &str, generation: u64) {
+        let mut inner = self.lock();
+        inner.flush(connection);
+        inner.observe(connection, generation);
+    }
+
+    /// The newest token generation the relay knows for `connection`.
+    #[cfg(test)]
+    pub(crate) fn known_generation(&self, connection: &str) -> u64 {
+        self.lock()
+            .conns
+            .get(connection)
+            .map_or(0, |q| q.generation)
     }
 
     /// Remove `owner`'s web device `id`: its token and its row go in one
@@ -1661,17 +1682,23 @@ impl DeviceRelay {
                     params![i, o],
                 )?;
                 if n == 0 {
-                    return Ok(false);
+                    return Ok(None);
                 }
-                delete_credential_in(&tx, &i)?;
+                let generation = delete_credential_in(&tx, &i)?;
                 tx.commit()?;
-                Ok(true)
+                Ok(Some(generation))
             })
             .await?;
-        if removed {
-            self.lock().flush(id);
+        match removed {
+            None => Ok(false),
+            Some(generation) => {
+                match generation {
+                    Some(g) => self.retire(id, g),
+                    None => self.lock().flush(id),
+                }
+                Ok(true)
+            }
         }
-        Ok(removed)
     }
 
     /// Whether `owner`'s `connection` has a device token; `None` when the

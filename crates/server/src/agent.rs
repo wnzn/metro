@@ -715,6 +715,7 @@ async fn execute_room_run(
                         initiator: initiator.clone(),
                         turn: turn.clone(),
                         provenance: Arc::new(provenance),
+                        agent_id: Some(agent.id.clone()),
                     };
                     builder = builder
                         .append_preamble(crate::web_tools::WEB_PREAMBLE)
@@ -1393,6 +1394,7 @@ async fn execute_personal_run(
                 provenance: Arc::new(crate::web_tools::Provenance::from_messages(
                     earlier.iter().chain(std::iter::once(&trigger)),
                 )),
+                agent_id: None,
             };
             builder = builder
                 .append_preamble(crate::web_tools::WEB_PREAMBLE)
