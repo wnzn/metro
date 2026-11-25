@@ -26,6 +26,7 @@
 
 #[cfg(unix)]
 mod macos;
+mod update;
 
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -37,6 +38,7 @@ use metro_connector::desktop::core::{Desktop, DesktopConfig};
 use metro_connector::desktop::local::{LocalWorkspaceHost, ToolsHook};
 use metro_connector::desktop::monitoring::{EventKind, Events};
 use metro_connector::desktop::store;
+use metro_connector::desktop::update::{ApplyRequest, Updater, UpdaterConfig};
 use metro_connector::desktop_local::LocalServer;
 use metro_connector::desktop_tools::DesktopTools;
 
@@ -105,11 +107,33 @@ fn component(path: &Path) -> Option<PathBuf> {
     (m.is_file() && !m.file_type().is_symlink()).then(|| path.to_path_buf())
 }
 
-/// `NO_PROXY` with the loopback hosts added: NSH's fetch (and our own
-/// clients) honour `HTTP_PROXY`, which must never see the bridge bearer or a
-/// local server's token.
+/// The UI's `NO_PROXY`: the person's own entries plus this machine's exact
+/// hosts in ureq's syntax (`metro_url_policy::loopback_no_proxy_entries`).
+/// NSH's fetch (ureq 3) honours `HTTP_PROXY` and friends, which must never
+/// see the bridge bearer or a local server's token. No prefixes (`127.`,
+/// `100.64.`): those would send ordinary names around the person's proxy.
+/// The UI gets this value as `METRO_PROXY_DIRECT_FOR` and the route as
+/// `METRO_PROXY_ROUTE` (never the proxy URLs, which can hold credentials),
+/// and only skips the plain-HTTP question for a loopback or Tailscale server
+/// it will reach directly (apps/desktop/src/api/proxyEnv.ts).
 fn no_proxy() -> String {
-    metro_connector::http::no_proxy_with_loopback()
+    ui_no_proxy(&metro_connector::http::no_proxy_with_loopback())
+}
+
+fn ui_no_proxy(base: &str) -> String {
+    let mut parts: Vec<String> = base
+        .split(',')
+        .map(str::to_string)
+        .filter(|p| !p.is_empty())
+        .collect();
+    if !parts.iter().any(|p| p == "*") {
+        for e in metro_url_policy::loopback_no_proxy_entries() {
+            if !parts.iter().any(|p| p.eq_ignore_ascii_case(&e)) {
+                parts.push(e);
+            }
+        }
+    }
+    parts.join(",")
 }
 
 #[cfg(windows)]
@@ -226,11 +250,39 @@ fn exit_code(status: Option<std::process::ExitStatus>) -> u8 {
     1
 }
 
-async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
+/// How one run of [`launch`] ended.
+enum Launched {
+    Exit(u8),
+    /// An update was rolled back: run the launcher again (this version).
+    Relaunch,
+}
+
+/// The next apply request from the updater; never resolves without one.
+async fn next_apply(
+    rx: &mut Option<tokio::sync::watch::Receiver<Option<ApplyRequest>>>,
+) -> ApplyRequest {
+    let Some(rx) = rx else {
+        return std::future::pending().await;
+    };
+    loop {
+        if let Some(req) = rx.borrow_and_update().clone() {
+            return req;
+        }
+        if rx.changed().await.is_err() {
+            return std::future::pending().await;
+        }
+    }
+}
+
+async fn launch(
+    events: Option<&Events>,
+    trial: Option<String>,
+    dir: &Path,
+    root: &Path,
+) -> Result<Launched, (EventKind, String)> {
     let start_failed = |msg| (EventKind::LauncherStartFailed, msg);
-    let dir = install_dir().map_err(start_failed)?;
     #[cfg(target_os = "macos")]
-    let ui = macos::ui_executable(&dir).map_err(start_failed)?;
+    let ui = macos::ui_executable(dir).map_err(start_failed)?;
     #[cfg(not(target_os = "macos"))]
     let ui = component(&dir.join("ui").join(UI_NAME)).ok_or_else(|| {
         start_failed(format!(
@@ -240,23 +292,48 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
     })?;
     let server = component(&dir.join(SERVER_NAME));
 
-    let root = store::desktop_root()
-        .map_err(|e| start_failed(format!("cannot find a place for Metro's data: {e}")))?;
-    store::prepare_private_dir(&root)
+    store::prepare_private_dir(root)
         .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
-    let lock = store::try_lock_instance(&root)
-        .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
+    update::gate_msi_at_start(root).map_err(start_failed)?;
+    let lock = if let Some(id) = &trial {
+        Some(update::trial_lock(id, dir, root).ok_or_else(|| {
+            start_failed("this trial did not inherit the active workspace lock".into())
+        })?)
+    } else {
+        store::try_lock_instance(root)
+            .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?
+    }
+    .map(Arc::new);
     let primary = lock.is_some();
+    update::gate_msi_at_start(root).map_err(start_failed)?;
+    if trial.is_none() {
+        update::recover_at_start(dir, root, lock.as_deref()).map_err(start_failed)?;
+    }
+
+    // Updates: primary instance only. Startup above reconciles safe
+    // cleanup or blocks if a prior trial lost its watchdog.
+    let updater: Option<Arc<Updater>> = if primary {
+        UpdaterConfig::for_app(root, dir, trial.clone()).map(Updater::new)
+    } else {
+        None
+    };
+    if let Some(u) = &updater
+        && trial.is_none()
+    {
+        u.spawn_schedule();
+    }
+    let mut apply_rx = updater.as_ref().map(|u| u.apply_requests());
 
     let local: Option<Arc<dyn LocalWorkspaceHost>> = match (&server, primary) {
         (Some(bin), true) => {
             let data = root.join("local");
             match store::prepare_private_dir(&data) {
-                Ok(()) => Some(Arc::new(LocalServer::with_events(
-                    bin.clone(),
-                    data,
-                    events.cloned(),
-                ))),
+                Ok(()) => {
+                    let server = LocalServer::with_events(bin.clone(), data, events.cloned());
+                    #[cfg(target_os = "linux")]
+                    let server = server.with_instance(lock.clone().expect("primary instance"));
+                    Some(Arc::new(server))
+                }
                 Err(e) => {
                     if let Some(events) = events {
                         events.record(EventKind::LocalServerStartFailed);
@@ -268,8 +345,9 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
         }
         _ => None,
     };
-    let mut cfg = DesktopConfig::new(root.clone(), primary, local);
-    cfg.tools = tools_hook(&root, primary);
+    let mut cfg = DesktopConfig::new(root.to_path_buf(), primary, local);
+    cfg.tools = tools_hook(root, primary);
+    cfg.updater = updater.clone();
     let desktop = Desktop::new(cfg);
     let bridge = bridge::start(desktop.clone()).await.map_err(|e| {
         start_failed(format!(
@@ -281,7 +359,7 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
     let mut cmd = tokio::process::Command::new(&ui);
     // The guardian starts `ui` itself and passes this environment on.
     #[cfg(target_os = "macos")]
-    let mut cmd = match macos::guardian_command(&dir) {
+    let mut cmd = match macos::guardian_command(dir) {
         Ok(cmd) => cmd,
         Err(e) => {
             bridge.stop().await;
@@ -300,6 +378,11 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
         .env(ENV_TOKEN, bridge.token.expose())
         .env("NO_PROXY", no_proxy())
         .env("no_proxy", no_proxy())
+        .env(
+            "METRO_PROXY_ROUTE",
+            metro_url_policy::proxy_route(|k| std::env::var(k).ok(), cfg!(windows)),
+        )
+        .env("METRO_PROXY_DIRECT_FOR", no_proxy())
         .stdin(std::process::Stdio::null())
         .kill_on_drop(true);
     // The guardian's stdin is its liveness pipe: when it closes (this
@@ -347,6 +430,7 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
     #[cfg(target_os = "macos")]
     let _liveness = child.stdin.take();
 
+    let mut apply_request = None;
     let status = tokio::select! {
         s = child.wait() => {
             let failure = match &s {
@@ -366,18 +450,34 @@ async fn launch(events: Option<&Events>) -> Result<u8, (EventKind, String)> {
             s.ok()
         },
         _ = stop_requested() => end_ui(&mut child).await,
+        req = next_apply(&mut apply_rx) => {
+            apply_request = Some(req);
+            end_ui(&mut child).await
+        }
     };
     // The UI is gone: nothing may keep serving on its behalf.
     bridge.stop().await;
-    if tokio::time::timeout(Duration::from_secs(15), desktop.shutdown())
-        .await
-        .is_err()
-    {
+    let stopped = matches!(
+        tokio::time::timeout(Duration::from_secs(15), desktop.shutdown_confirmed()).await,
+        Ok(true)
+    );
+    if !stopped {
         eprintln!("Metro: some on-device work did not stop in time; ending it");
     }
     drop(desktop);
+    if let (Some(req), Some(u)) = (apply_request, updater) {
+        if !stopped {
+            return Err((EventKind::LauncherStartFailed, "the update was not started because the local workspace did not stop. Close Metro and try again.".into()));
+        }
+        return Ok(
+            match update::apply(&u, req, root, lock.expect("primary updater")).await {
+                update::After::Exit(code) => Launched::Exit(code),
+                update::After::Relaunch => Launched::Relaunch,
+            },
+        );
+    }
     drop(lock);
-    Ok(exit_code(status))
+    Ok(Launched::Exit(exit_code(status)))
 }
 
 /// Local workspace tools (read-only folders per hosted Space), primary
@@ -410,6 +510,13 @@ fn main() -> ExitCode {
         fatal("Metro can't start: this copy of Metro is damaged. Download Metro again.");
         return ExitCode::from(2);
     }
+    let mode = update::mode();
+    if mode == update::Mode::LegacyHelper {
+        fatal(
+            "In-app MSI updates are no longer supported. Use a verified manual installer; any existing backup was kept.",
+        );
+        return ExitCode::from(2);
+    }
     #[cfg(unix)]
     // SAFETY: umask has no preconditions.
     unsafe {
@@ -419,7 +526,22 @@ fn main() -> ExitCode {
     unsafe {
         metro_connector::http::exempt_loopback_from_proxy();
     }
-    let events = store::desktop_root().ok().map(|root| Events::new(&root));
+    let paths = || -> Result<_, String> {
+        let dir = install_dir()?;
+        let root = store::desktop_root()
+            .map_err(|e| format!("cannot find a place for Metro's data: {e}"))?;
+        update::preflight_at_start(&dir, &root, matches!(mode, update::Mode::Trial(_)))?;
+        Ok((dir, root))
+    };
+    let (dir, root) = match paths() {
+        Ok(paths) => paths,
+        Err(msg) => {
+            // Refuse without even creating a monitoring record or lock file.
+            fatal(&format!("Metro can't start: {msg}"));
+            return ExitCode::from(1);
+        }
+    };
+    let events = Events::new(&root);
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -427,24 +549,69 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            if let Some(events) = &events {
-                events.record(EventKind::LauncherStartFailed);
-            }
+            events.record(EventKind::LauncherStartFailed);
             fatal(&format!("Metro can't start: {e}"));
             return ExitCode::from(1);
         }
     };
-    let code = match rt.block_on(launch(events.as_ref())) {
-        Ok(code) => code,
-        Err((kind, msg)) => {
-            if let Some(events) = &events {
-                events.record(kind);
+    let mut trial = match &mode {
+        update::Mode::Trial(id) => Some(id.clone()),
+        _ => None,
+    };
+    let code = loop {
+        match rt.block_on(launch(Some(&events), trial.take(), &dir, &root)) {
+            Ok(Launched::Exit(code)) => break code,
+            Ok(Launched::Relaunch) => {
+                if let Err(msg) = update::preflight_at_start(&dir, &root, false) {
+                    fatal(&format!("Metro can't start: {msg}"));
+                    break 1;
+                }
             }
-            fatal(&format!("Metro can't start: {msg}"));
-            1
+            Err((kind, msg)) => {
+                events.record(kind);
+                fatal(&format!("Metro can't start: {msg}"));
+                break 1;
+            }
         }
     };
     // Don't wait for stuck provider calls; everything was told to stop.
     rt.shutdown_timeout(Duration::from_secs(2));
     ExitCode::from(code)
+}
+
+#[cfg(test)]
+mod no_proxy_tests {
+    use super::ui_no_proxy;
+    use metro_url_policy::ureq_no_proxy_matches;
+
+    #[test]
+    fn keeps_the_persons_entries_and_adds_only_exact_loopback_hosts() {
+        let v = ui_no_proxy("corp.example,box.tail1234.ts.net,127.0.0.1,localhost,::1");
+        assert!(
+            v.starts_with("corp.example,box.tail1234.ts.net,127.0.0.1,localhost,::1,"),
+            "{v}"
+        );
+        for direct in [
+            "127.0.0.1",
+            "[::1]",
+            "localhost",
+            "box.tail1234.ts.net",
+            "corp.example",
+        ] {
+            assert!(ureq_no_proxy_matches(&v, direct), "{direct}");
+        }
+        // Not listed by the person: through the proxy (the UI then asks).
+        for proxied in [
+            "100.101.102.103",
+            "[fd7a:115c:a1e0::1]",
+            "other.tail1234.ts.net",
+            "100.64.office.example",
+            "127.foo.example",
+            "192.168.1.5",
+        ] {
+            assert!(!ureq_no_proxy_matches(&v, proxied), "{proxied}");
+        }
+        assert_eq!(v.matches("localhost").count(), 1, "no duplicates");
+        assert_eq!(ui_no_proxy("*"), "*");
+    }
 }

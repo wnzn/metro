@@ -14,6 +14,7 @@
 import type { ActivityPhase, ActivityRoute, EventAgent, RoomEvent } from "../../api/client";
 import { activityOf, toolName } from "./classify";
 import type { Activity } from "./classify";
+import { webRefusal } from "./web";
 
 /** "live": started and not ended yet. "ended": no outcome was recorded (it is never shown as ongoing). */
 export type GroupOutcome = "live" | "completed" | "failed" | "cancelled" | "interrupted" | "ended";
@@ -355,6 +356,7 @@ export function currentStep(g: ActivityGroup): string {
   const last = g.steps[g.steps.length - 1]?.activity;
   if (g.source !== "agent") return "Runner is working…";
   if (last?.kind === "tool_call") {
+    if (last.web) return `Using ${last.summary}…`;
     const { tool, args } = splitCall(last.details);
     const what = shortArgs(args);
     switch (tool.replace(/^workspace_/, "workspace.")) {
@@ -386,11 +388,18 @@ export function timeline(g: ActivityGroup): TimelineItem[] {
   for (const step of g.steps) {
     const a = step.activity;
     if (a.kind === "tool_call") {
+      if (a.web) {
+        out.push({ type: "tool", key: `step:${step.eventId}`, call: step, result: null, name: a.summary, args: "", failed: false });
+        continue;
+      }
       const { tool, args } = splitCall(a.details);
       out.push({ type: "tool", key: `step:${step.eventId}`, call: step, result: null, name: tool ? toolName(tool) : "Tool", args: shortArgs(args), failed: false });
     } else if (a.kind === "tool_result") {
-      const name = /^Tool · (.+) · (?:complete|failed)$/.exec(a.summary)?.[1] ?? "Tool";
-      const open = [...out].reverse().find((i): i is Extract<TimelineItem, { type: "tool" }> => i.type === "tool" && !i.result && i.name === name);
+      const name = a.web ? a.summary : /^Tool · (.+) · (?:complete|failed)$/.exec(a.summary)?.[1] ?? "Tool";
+      const open = a.web && webRefusal(a.web.note) ? undefined :
+        [...out].reverse().find((i): i is Extract<TimelineItem, { type: "tool" }> =>
+          i.type === "tool" && !i.result && i.name === name &&
+          i.call?.activity.web?.note.name === a.web?.note.name);
       if (open) {
         open.result = step;
         open.failed = a.tone === "danger";

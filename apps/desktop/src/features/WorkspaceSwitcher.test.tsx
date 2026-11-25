@@ -1,8 +1,9 @@
 import { expect, open, test } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
+import { launched } from "../../test/launched";
 
 test("Add verifies an explicit token even for the active URL, and renames only after success", async () => {
-  const app = await open("../../App.tsx", { network: world().network as any });
+  const app = await open("../../App.tsx", { modules: launched(), network: world().network as any });
   await app.type("id:access-token", TOKENS.alice!);
   await app.press("id:connect");
   const list = () => JSON.parse(app.storage()["metro.savedServers"] ?? "[]");
@@ -32,7 +33,7 @@ test("Add verifies an explicit token even for the active URL, and renames only a
 test("a file-only draft survives backing out while Add is checking a new account", async () => {
   const w = world();
   // A manual clock: Bob's verification answers only when the test moves time.
-  const app = await open("../../App.tsx", { network: w.network as any, platform: "linux", width: 1200, height: 820, clock: {} });
+  const app = await open("../../App.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1200, height: 820, clock: {} });
   await app.type("id:access-token", TOKENS.alice!);
   await app.press("id:connect");
   await app.waitFor("id:attach");
@@ -71,6 +72,7 @@ test("a file-only draft survives backing out while Add is checking a new account
 test("choosing the startup server persists its id without contacting it or leaving the current workspace", async () => {
   const server = { id: "other", name: "Other server", baseUrl: "https://other.example.org" };
   const app = await open("../../App.tsx", {
+    modules: launched(),
     network: world().network as any,
     storage: { "metro.savedServers": JSON.stringify([server]) },
   });

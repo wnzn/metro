@@ -16,6 +16,8 @@ struct MockDirectory {
     conns: Mutex<HashMap<String, DeviceConnection>>,
     /// (connection, user, space) grants a share store would answer yes to.
     shares: Mutex<HashSet<(String, String, Option<String>)>>,
+    /// (space, user) pairs that are no longer members.
+    left: Mutex<HashSet<(String, String)>>,
 }
 
 impl MockDirectory {
@@ -47,6 +49,14 @@ impl MockDirectory {
 }
 
 impl ConnectionDirectory for MockDirectory {
+    fn member(&self, _conn: &Connection, space: &str, user: &str) -> anyhow::Result<bool> {
+        Ok(!self
+            .left
+            .lock()
+            .unwrap()
+            .contains(&(space.to_owned(), user.to_owned())))
+    }
+
     fn device_connection(
         &self,
         _conn: &Connection,
@@ -492,11 +502,13 @@ fn device_errors_are_clear_and_contain_no_payload() {
     assert!(DeviceError::Offline.to_string().contains("offline"));
     assert!(DeviceError::NotPaired.to_string().contains("device token"));
     assert!(DeviceError::TimedOut.to_string().contains("in time"));
-    assert!(
-        DeviceError::Device("quota".into())
-            .to_string()
-            .contains("quota")
-    );
+    // The device's own text never reaches a message: it can echo anything.
+    let reported = DeviceError::Device("quota".into()).to_string();
+    assert!(!reported.contains("quota"), "{reported}");
+    assert!(reported.contains("reported an error"), "{reported}");
+    let malformed = DeviceError::BadResponse("missing choices".into()).to_string();
+    assert!(!malformed.contains("missing choices"), "{malformed}");
+    assert!(malformed.contains("invalid response"), "{malformed}");
 }
 
 fn read_tool() -> ToolDefinition {
@@ -605,7 +617,8 @@ async fn rig_model_reports_device_failures() {
         )
         .unwrap();
     let err = call.await.unwrap().unwrap_err();
-    assert!(err.to_string().contains("rate limited"), "{err}");
+    assert!(err.to_string().contains("reported an error"), "{err}");
+    assert!(!err.to_string().contains("rate limited"), "{err}");
     // Bob's adapter never reaches alice's device.
     let model = f.relay.rig_model(f.db.clone(), "bob", "c1", "m1");
     let err = model.call(CompletionRequest::new("hi")).await.unwrap_err();
@@ -634,6 +647,346 @@ fn decide_answer() -> Value {
         },
         "usage": {"input_tokens": 10, "output_tokens": 0}
     })
+}
+
+/// A real provider/relay pair so the claim reaches SQLite membership, model,
+/// sharing and pairing checks, without any external model request.
+async fn real_typed_device(shared: bool) -> (crate::AppState, Device, Caller) {
+    use crate::providers::{api, catalog, store};
+    let state = api::probe_state(vec![]).await;
+    let space = state.db.create_space("user", "relay", 10).unwrap();
+    let row = api::probe_row(&state, catalog::DEVICE_SYSTEMONE, "unused");
+    let caller = if shared {
+        state.db.add_member(&space.id, "borrower", 10).unwrap();
+        assert!(
+            store::set_share(
+                &mut state.db.lock(),
+                "user",
+                &row.id,
+                &store::Share {
+                    visibility: store::Visibility::Organization,
+                    space_ids: vec![],
+                },
+            )
+            .unwrap()
+        );
+        Caller::in_space("borrower", &space.id)
+    } else {
+        // The connection owner is not the Space owner, so membership can
+        // be removed independently of the connection's ownership.
+        let other = state.db.create_space("other", "own relay", 10).unwrap();
+        state.db.add_member(&other.id, "user", 10).unwrap();
+        Caller::in_space("user", &other.id)
+    };
+    let token = state
+        .device
+        .issue_token(&state.db, "user", &row.id)
+        .await
+        .unwrap();
+    let device = state
+        .device
+        .authenticate(&state.db, &token)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        state
+            .device
+            .claim_checked(&state.db, &device)
+            .await
+            .is_none()
+    );
+    (state, device, caller)
+}
+
+async fn queue_typed(
+    state: &crate::AppState,
+    device: &Device,
+    caller: &Caller,
+) -> tokio::task::JoinHandle<Result<Value, crate::providers::ProviderError>> {
+    let (owned, connection, caller) = (state.clone(), device.connection.clone(), caller.clone());
+    let waiter = tokio::spawn(async move {
+        let request = decide_request();
+        crate::providers::decide(
+            &owned,
+            &caller.user,
+            caller.space.as_deref(),
+            &connection,
+            request["state"].clone(),
+            request["questions"].clone(),
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let queued = state.device.lock().jobs.values().any(|job| {
+                job.connection == device.connection && matches!(job.state, JobState::Queued)
+            });
+            if queued {
+                break;
+            }
+            assert!(!waiter.is_finished(), "call ended before enqueue");
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("typed work was queued");
+    waiter
+}
+
+#[tokio::test]
+async fn queued_typed_device_payload_stays_pinned_until_claim() {
+    use crate::providers::{ProviderError, store};
+
+    for shared in [false, true] {
+        for change in ["model", "revision", "pairing"] {
+            let (state, device, caller) = real_typed_device(shared).await;
+            let waiter = queue_typed(&state, &device, &caller).await;
+            let expected = {
+                let mut conn = state.db.lock();
+                if change == "pairing" {
+                    // Persist a replacement before the relay is notified:
+                    // an already authenticated claim still carries the old
+                    // generation, and must not get this payload.
+                    let replacement = new_device_token().unwrap();
+                    let generation = store_credential(
+                        &conn,
+                        &device.connection,
+                        &device.owner,
+                        &device_token_hash(&replacement),
+                    )
+                    .unwrap();
+                    assert_ne!(generation, device.generation);
+                    DeviceError::CredentialChanged
+                } else {
+                    let models: &[&str] = if change == "revision" {
+                        &["different-model", "probe-model"]
+                    } else {
+                        &["different-model"]
+                    };
+                    for model in models {
+                        let patch = store::Patch {
+                            model: Some((*model).into()),
+                            ..Default::default()
+                        };
+                        assert!(matches!(
+                            store::patch(
+                                &mut conn,
+                                &device.owner,
+                                &device.connection,
+                                &patch,
+                                None
+                            )
+                            .unwrap(),
+                            store::Patched::Saved(_)
+                        ));
+                    }
+                    DeviceError::AccessRevoked
+                }
+            };
+            assert!(
+                state
+                    .device
+                    .claim_checked(&state.db, &device)
+                    .await
+                    .is_none(),
+                "{change}, shared={shared}: stale payload was released"
+            );
+            assert_eq!(waiter.await.unwrap(), Err(ProviderError::Device(expected)));
+        }
+    }
+}
+
+#[tokio::test]
+async fn device_access_db_failures_withhold_payloads_and_answers_as_internal_errors() {
+    use crate::providers::ProviderError;
+
+    for (shared, table) in [
+        (false, "space_members"),
+        (true, "provider_shares"),
+        (false, "provider_connections"),
+    ] {
+        for after_claim in [false, true] {
+            let (state, device, caller) = real_typed_device(shared).await;
+            let waiter = queue_typed(&state, &device, &caller).await;
+            let claimed = if after_claim {
+                Some(
+                    state
+                        .device
+                        .claim_checked(&state.db, &device)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            state
+                .db
+                .lock()
+                .execute_batch(&format!("ALTER TABLE {table} RENAME TO broken_{table}"))
+                .unwrap();
+            if let Some(job) = claimed {
+                state
+                    .device
+                    .complete_job(&device, &job.id, Ok(decide_answer()))
+                    .unwrap();
+            } else {
+                assert!(
+                    state
+                        .device
+                        .claim_checked(&state.db, &device)
+                        .await
+                        .is_none()
+                );
+            }
+            let err = waiter.await.unwrap().unwrap_err();
+            assert_eq!(
+                err,
+                ProviderError::Device(DeviceError::Internal),
+                "{table}, after_claim={after_claim}"
+            );
+            assert_eq!(err.status(), StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(err.to_string(), "internal error in the device relay");
+        }
+    }
+}
+
+#[tokio::test]
+async fn web_permission_db_failure_withholds_both_payload_and_answer() {
+    for after_claim in [false, true] {
+        let db = Db::open_in_memory().unwrap();
+        let id = format!("wd_{}", uuid::Uuid::new_v4().simple());
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO web_devices (id, owner_id, label, created_at) VALUES (?1, 'alice', 'test', 0)",
+                [&id],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO web_search_prefs (user_id, personal_chat, updated_at) VALUES ('alice', 1, 0)",
+                [],
+            ).unwrap();
+        }
+        let relay = DeviceRelay::new(
+            Default::default(),
+            Arc::new(crate::providers::DeviceDirectory),
+        );
+        relay.issue_token(&db, "alice", &id).await.unwrap();
+        let device = Device {
+            connection: id.clone(),
+            owner: "alice".to_owned(),
+            generation: 1,
+        };
+        assert!(relay.claim_checked(&db, &device).await.is_none());
+        let waiter = {
+            let (db, relay, id) = (db.clone(), relay.clone(), id.clone());
+            tokio::spawn(async move {
+                relay
+                    .dispatch_web(
+                        &db,
+                        &crate::web_tools::WebGrant::personal_chat("alice"),
+                        &id,
+                        Operation::WebSearch,
+                        json!({"v": 1, "query": "fixture"}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if relay
+                    .lock()
+                    .jobs
+                    .values()
+                    .any(|j| j.connection == id && matches!(j.state, JobState::Queued))
+                {
+                    break;
+                }
+                assert!(!waiter.is_finished());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("web work was queued");
+        let claimed = if after_claim {
+            Some(relay.claim_checked(&db, &device).await.unwrap())
+        } else {
+            None
+        };
+        db.lock()
+            .execute("DROP TABLE web_search_prefs", [])
+            .unwrap();
+        if let Some(job) = claimed {
+            relay
+                .complete_job(&device, &job.id, Ok(json!({"v": 1, "attempts": []})))
+                .unwrap();
+        } else {
+            assert!(relay.claim_checked(&db, &device).await.is_none());
+        }
+        let err = waiter.await.unwrap().unwrap_err();
+        assert_eq!(err, DeviceError::Internal);
+        assert_eq!(err.to_string(), "internal error in the device relay");
+    }
+}
+
+#[tokio::test]
+async fn genuine_device_grant_revocations_still_return_forbidden() {
+    use crate::providers::{ProviderError, store};
+
+    for shared in [false, true] {
+        for after_claim in [false, true] {
+            let (state, device, caller) = real_typed_device(shared).await;
+            let waiter = queue_typed(&state, &device, &caller).await;
+            let claimed = if after_claim {
+                Some(
+                    state
+                        .device
+                        .claim_checked(&state.db, &device)
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            if shared {
+                assert!(
+                    store::set_share(
+                        &mut state.db.lock(),
+                        &device.owner,
+                        &device.connection,
+                        &store::Share {
+                            visibility: store::Visibility::Personal,
+                            space_ids: vec![],
+                        }
+                    )
+                    .unwrap()
+                );
+            } else {
+                state
+                    .db
+                    .remove_member(caller.space.as_deref().unwrap(), &caller.user)
+                    .unwrap();
+            }
+            if let Some(job) = claimed {
+                state
+                    .device
+                    .complete_job(&device, &job.id, Ok(decide_answer()))
+                    .unwrap();
+            } else {
+                assert!(
+                    state
+                        .device
+                        .claim_checked(&state.db, &device)
+                        .await
+                        .is_none()
+                );
+            }
+            let err = waiter.await.unwrap().unwrap_err();
+            assert_eq!(err, ProviderError::Device(DeviceError::AccessRevoked));
+            assert_eq!(err.status(), StatusCode::FORBIDDEN);
+        }
+    }
 }
 
 impl Fixture {

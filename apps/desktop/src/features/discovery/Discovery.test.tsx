@@ -5,6 +5,7 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { discoveryWorld } from "./test/fixtures";
+import { launched } from "../../../test/launched";
 
 type W = ReturnType<typeof discoveryWorld>;
 
@@ -15,6 +16,7 @@ const NOW = Date.UTC(2026, 10, 23, 12, 0); // Mon, Nov 23, 2026 · 12:00 UTC
 
 async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice", zone = "UTC", now?: number): Promise<App> {
   const app = await open("./test/Harness.tsx", {
+    modules: launched(),
     network: w.network as any, platform: "linux", width: 1280, height: 900, localeSettings: { timeZone: zone },
     clock: now === undefined ? null : { time: now },
   });
@@ -187,7 +189,7 @@ test("similarity-only and incomplete answers say so; Index more advances indexin
   expect(app.shows("id:search-partial")).toBe(false);
 });
 
-test("search without an embedding model points to Model providers; nothing is cached after sign-out", async () => {
+test("search without an embedding model points to Model choices; nothing is cached after sign-out", async () => {
   const w = discoveryWorld();
   seedCorpus(w);
   const app = await signIn(w);
@@ -198,8 +200,10 @@ test("search without an embedding model points to Model providers; nothing is ca
   w.d.fail = { status: 409, error: "choose an embedding model in Settings to use search" };
   await searchAgain(app);
   await app.waitFor("id:search-error");
-  expect(text(app)).toContain("Search needs an embedding model: choose an embedding model in Settings to use search.");
-  expect(app.shows("id:search-open-providers")).toBe(true);
+  expect(text(app)).toContain("Choose one in Settings › Model choices.");
+  await app.press("id:search-open-providers");
+  await app.waitFor("id:routing-settings >> text:Model choices");
+  await app.press("id:settings-close");
 
   // Bob signs in on the same app: none of Alice's query or results remain.
   w.d.fail = null;

@@ -43,6 +43,13 @@ pub trait LocalWorkspaceHost: Send + Sync + 'static {
     /// Stop the server and its children, wipe in-memory credentials.
     /// Idempotent.
     fn shutdown(&self) -> BoxFut<'_, ()>;
+    /// Only true when no server can still be using the local database.
+    fn shutdown_confirmed(&self) -> BoxFut<'_, bool> {
+        Box::pin(async {
+            self.shutdown().await;
+            self.state() == LocalState::Stopped
+        })
+    }
     /// The running server's URL and bearer, without starting anything; used
     /// to tell whether a bound session is this app's own hosted workspace.
     /// In-process only.

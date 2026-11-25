@@ -453,26 +453,27 @@ fn create_new_private(_: &Path) -> Result<fs::File> {
     unreachable!()
 }
 
-/// Unix files are already private by mode: stored as they are.
+/// Unix files are already private by mode: stored as they are. Also used by
+/// the web search key store (`crate::web::keys`).
 #[cfg(not(windows))]
-fn seal(plain: Vec<u8>) -> Result<Vec<u8>> {
+pub(crate) fn seal(plain: Vec<u8>) -> Result<Vec<u8>> {
     Ok(plain)
 }
 
 #[cfg(not(windows))]
-fn unseal(stored: Vec<u8>) -> Result<Vec<u8>> {
+pub(crate) fn unseal(stored: Vec<u8>) -> Result<Vec<u8>> {
     Ok(stored)
 }
 
 #[cfg(windows)]
-fn seal(mut plain: Vec<u8>) -> Result<Vec<u8>> {
+pub(crate) fn seal(mut plain: Vec<u8>) -> Result<Vec<u8>> {
     let r = dpapi::protect(&plain);
     zeroize::Zeroize::zeroize(&mut plain);
     r
 }
 
 #[cfg(windows)]
-fn unseal(stored: Vec<u8>) -> Result<Vec<u8>> {
+pub(crate) fn unseal(stored: Vec<u8>) -> Result<Vec<u8>> {
     dpapi::unprotect(&stored)
 }
 

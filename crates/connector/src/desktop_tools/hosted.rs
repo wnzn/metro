@@ -4,8 +4,10 @@
 //! No redirects, no proxy (loopback only), bounded bodies, and tokens only in
 //! the `Authorization` header, never in a URL or a log line.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::Secret;
@@ -60,6 +62,13 @@ pub enum SpaceRunner {
     Registered(String),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpaceRole {
+    Owner,
+    Member,
+}
+
 #[derive(Debug)]
 pub struct Job {
     pub id: String,
@@ -112,6 +121,13 @@ fn server_message(v: &Value, fallback: &str) -> String {
     crate::secret::clean_line(m, 200)
 }
 
+/// The ETag stored by older launchers too; the decimal part is not a secret.
+pub(super) fn pairing_revision(etag: &str) -> Option<&str> {
+    let raw = etag.strip_prefix("\"rtg-")?.strip_suffix('"')?;
+    let value: u64 = raw.parse().ok()?;
+    (value <= i64::MAX as u64 && value.to_string() == raw).then_some(raw)
+}
+
 impl Hosted {
     pub fn new(base: &str) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
@@ -136,6 +152,25 @@ impl Hosted {
         body: Option<&Value>,
         cap: usize,
     ) -> Result<(u16, reqwest::header::HeaderMap, Value), CallError> {
+        let (status, headers, bytes) = self
+            .send_raw(method, path, bearer, headers, body, cap)
+            .await?;
+        Ok((
+            status,
+            headers,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        ))
+    }
+
+    async fn send_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        bearer: &Secret,
+        headers: &[(&str, &str)],
+        body: Option<&Value>,
+        cap: usize,
+    ) -> Result<(u16, reqwest::header::HeaderMap, Vec<u8>), CallError> {
         let mut req = self
             .http
             .request(method, format!("{}{}", self.base, path))
@@ -155,12 +190,7 @@ impl Hosted {
         let bytes = read_capped(resp, cap)
             .await
             .map_err(|_| CallError::Other("the local Metro server sent too much data".into()))?;
-        let v = if bytes.iter().all(u8::is_ascii_whitespace) {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        Ok((status, resp_headers, v))
+        Ok((status, resp_headers, bytes))
     }
 
     fn classify(status: u16, v: &Value) -> CallError {
@@ -191,11 +221,10 @@ impl Hosted {
             .ok_or_else(|| CallError::Other("the local Metro server sent no account id".into()))
     }
 
-    /// The caller's role in `sid` (`owner`/`member`), or `None` when the
-    /// Space isn't visible to them.
-    pub async fn role(&self, session: &Secret, sid: &str) -> Result<Option<String>, CallError> {
-        let (s, _, v) = self
-            .send(
+    /// `None` is proof of absence only in a fully valid roster.
+    pub async fn role(&self, session: &Secret, sid: &str) -> Result<Option<SpaceRole>, CallError> {
+        let (s, _, bytes) = self
+            .send_raw(
                 reqwest::Method::GET,
                 "/v1/spaces",
                 session,
@@ -205,18 +234,46 @@ impl Hosted {
             )
             .await?;
         if s != 200 {
-            return Err(Self::classify(s, &v));
+            return Err(Self::classify(
+                s,
+                &serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            ));
         }
-        let spaces = v
+        // Decode raw JSON so duplicate required fields aren't silently
+        // collapsed by Value. Extra Space metadata is not used for access.
+        #[derive(Deserialize)]
+        struct Roster {
+            spaces: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            id: String,
+            role: SpaceRole,
+        }
+        let invalid =
+            || CallError::Other("the local Metro server sent an invalid Space roster".into());
+        // Serde structs also accept positional arrays. Only JSON objects
+        // count as roster entries, regardless of their positional values.
+        let shape: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if !shape
             .get("spaces")
             .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(spaces
-            .iter()
-            .find(|sp| sp.get("id").and_then(Value::as_str) == Some(sid))
-            .and_then(|sp| sp.get("role").and_then(Value::as_str))
-            .map(str::to_owned))
+            .is_some_and(|rows| rows.iter().all(Value::is_object))
+        {
+            return Err(invalid());
+        }
+        let roster: Roster = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        let mut seen = HashSet::with_capacity(roster.spaces.len());
+        let mut role = None;
+        for sp in &roster.spaces {
+            if !super::store::valid_space_id(&sp.id) || !seen.insert(&sp.id) {
+                return Err(invalid());
+            }
+            if sp.id == sid {
+                role = Some(sp.role);
+            }
+        }
+        Ok(role)
     }
 
     pub async fn space_runner(
@@ -281,30 +338,32 @@ impl Hosted {
             .map(str::to_owned))
     }
 
-    /// `POST /v1/spaces/{sid}/runner-token` with `If-None-Match: *`: a new
-    /// dedicated token and its ETag, only if the Space has no runner.
+    /// Use a separate route so an older server cannot ignore the guard.
     pub async fn issue_guarded(
         &self,
         session: &Secret,
         sid: &str,
     ) -> Result<(Secret, String), CallError> {
-        let (s, h, mut v) = self
+        let (s, _, mut v) = self
             .send(
                 reqwest::Method::POST,
-                &format!("/v1/spaces/{sid}/runner-token"),
+                &format!("/v1/spaces/{sid}/runner-token/issue-if-empty"),
                 session,
-                &[("If-None-Match", "*")],
+                &[],
                 Some(&json!({})),
                 MAX_BODY,
             )
             .await?;
+        if s == 409 {
+            return Err(CallError::Precondition("the Space's runner changed".into()));
+        }
         if s != 200 {
             return Err(Self::classify(s, &v));
         }
-        let etag = h
-            .get(reqwest::header::ETAG)
-            .and_then(|e| e.to_str().ok())
-            .map(str::to_owned);
+        let etag = v
+            .get("assignment_revision")
+            .and_then(Value::as_str)
+            .map(|revision| format!("\"rtg-{revision}\""));
         let token = match v.get_mut("token") {
             Some(Value::String(t)) => {
                 let out = Secret::new(t.as_str());
@@ -324,8 +383,7 @@ impl Hosted {
                 "the local Metro server sent an unexpected token".into(),
             ));
         }
-        let Some(etag) = etag.filter(|e| e.len() <= 64 && e.starts_with('"') && e.ends_with('"'))
-        else {
+        let Some(etag) = etag.filter(|e| pairing_revision(e).is_some()) else {
             return Err(CallError::Other(
                 "the local Metro server doesn't support guarded pairing".into(),
             ));
@@ -333,25 +391,31 @@ impl Hosted {
         Ok((token, etag))
     }
 
-    /// `DELETE /v1/spaces/{sid}/runner-token` with `If-Match: <etag>`.
+    /// Revoke only a dedicated revision; never fall back to a legacy route.
     pub async fn revoke_guarded(
         &self,
         session: &Secret,
         sid: &str,
         etag: &str,
     ) -> Result<(), CallError> {
+        let revision = pairing_revision(etag).ok_or_else(|| {
+            CallError::Other("This local pairing has no supported revision.".into())
+        })?;
         let (s, _, v) = self
             .send(
-                reqwest::Method::DELETE,
-                &format!("/v1/spaces/{sid}/runner-token"),
+                reqwest::Method::POST,
+                &format!("/v1/spaces/{sid}/runner-token/revoke-if-current"),
                 session,
-                &[("If-Match", etag)],
-                None,
+                &[],
+                Some(&json!({"assignment_revision": revision})),
                 MAX_BODY,
             )
             .await?;
-        if s == 204 || s == 200 {
+        if s == 204 {
             return Ok(());
+        }
+        if s == 409 {
+            return Err(CallError::Precondition("the Space's runner changed".into()));
         }
         Err(Self::classify(s, &v))
     }
@@ -472,7 +536,13 @@ impl Hosted {
                 "/v1/runner/claim",
                 token,
                 &[(PROTOCOL_HEADER, "2")],
-                Some(&json!({})),
+                // Presence for Settings → Runners: this runner updates with the app.
+                Some(&json!({"runner": {
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "channel": metro_release::Channel::current().as_str(),
+                    "install": "desktop",
+                    "self_update": false,
+                }})),
                 MAX_CLAIM_BODY,
             )
             .await?;

@@ -1,5 +1,6 @@
 import { expect, open, test } from "nsh/test";
 import { BASE, world } from "../../../test/fakeServer";
+import { launched } from "../../../test/launched";
 
 const DEFAULT_LABEL = "label:Model: Default model, your normal routing · Thinking: Provider default";
 
@@ -19,7 +20,7 @@ test("composer refreshes exact-scope metadata on open and drops a shared model o
       chat_models: [{ id: "b", reasoning_efforts: ["high"] }],
     }] : [] } };
   };
-  const app = await open("./test/Harness.tsx", { network: f.network as any });
+  const app = await open("./test/Harness.tsx", { modules: launched(), network: f.network as any });
   await app.waitFor("id:composer-model");
   await app.waitUntil(() => requests.includes(""));
   await app.press("label:Acme");
@@ -78,7 +79,7 @@ test("listing an owned profile is explicit; only refreshed catalog rows become c
     listed = true;
     return { status: 200, body: { models: ["unverified"] } };
   };
-  const app = await open("./test/Harness.tsx", { network: f.network as any });
+  const app = await open("./test/Harness.tsx", { modules: launched(), network: f.network as any });
   await app.waitFor("id:composer-model");
   await app.press("label:Acme");
   await app.waitUntil(() => calls.includes("catalog?space_id=acme"));
@@ -118,7 +119,7 @@ test("search finds models by provider name across connections; Default stays apa
       row("lab", "Lab box", "custom", [{ id: "qwen", reasoning_efforts: [] }]),
     ] } };
   };
-  const app = await open("./test/Harness.tsx", { network: f.network as any });
+  const app = await open("./test/Harness.tsx", { modules: launched(), network: f.network as any });
   await app.waitFor(DEFAULT_LABEL);
   await app.press("id:composer-model");
   await app.waitFor("id:composer-model-options");
@@ -127,10 +128,14 @@ test("search finds models by provider name across connections; Default stays apa
   expect(app.shows("id:composer-model-options-group:Custom & self-hosted")).toBe(true);
   expect(app.shows("id:mark-letters:{}")).toBe(true);
   expect(app.shows("text:Thinking: low · medium · high")).toBe(true);
+  await app.press("id:composer-model-options-group-toggle:OpenAI");
+  await app.waitFor("label:OpenAI, 2 models, collapsed");
+  expect(app.shows('id:composer-model-options:["plan","gpt-x"]')).toBe(false);
   await app.type("id:composer-model-options-search", "OpenAI");
   await app.waitFor('id:composer-model-options:["claude","opus"]', { state: "gone" });
   expect(app.shows('id:composer-model-options:["plan","gpt-x"]')).toBe(true);
   expect(app.shows('id:composer-model-options:["api","gpt-x"]')).toBe(true);
+  expect(app.shows("id:composer-model-options:")).toBe(true);
   // Same model id on two connections of one provider: each keeps its own connection and levels.
   await app.press('id:composer-model-options:["api","gpt-x"]');
   expect(app.shows("id:composer-thinking-options")).toBe(false);
@@ -139,6 +144,7 @@ test("search finds models by provider name across connections; Default stays apa
   await app.press("id:composer-model");
   await app.waitFor("id:composer-model-options");
   await app.press("id:composer-model-options");
+  expect(app.shows("id:composer-model-options-group-toggle:OpenAI")).toBe(false); // selection keeps it open
   await app.press('id:composer-model-options:["plan","gpt-x"]');
   await app.press("id:composer-thinking-options:medium");
   await app.press("label:Done");
@@ -149,6 +155,9 @@ test("search finds models by provider name across connections; Default stays apa
   await app.press("id:composer-model-options:");
   await app.press("label:Done");
   await app.waitFor(DEFAULT_LABEL);
+  await app.press("id:composer-model");
+  await app.press("id:composer-model-options");
+  await app.waitFor("label:OpenAI, 2 models, collapsed"); // selection never overwrites disclosure memory
 });
 
 test("names that fail or arrive late never block choosing; they rename groups in place and keep the pin and effort", async () => {
@@ -172,7 +181,7 @@ test("names that fail or arrive late never block choosing; they rename groups in
     return { status: 200, body: { models: [{ connection_id: "ds", name: "DS key", provider_id: "deepseek", capability: "chat",
       owned: true, execution: "server", runs_on: "your_connection", chat_models: [{ id: "r1", reasoning_efforts: ["low", "high"] }] }] } };
   };
-  const app = await open("./test/Harness.tsx", { network: f.network as any });
+  const app = await open("./test/Harness.tsx", { modules: launched(), network: f.network as any });
   // The unpinned trigger says Default model and its default thinking, naming no routed model.
   await app.waitFor(DEFAULT_LABEL);
   await app.waitFor("text:Default model");
@@ -215,7 +224,7 @@ test("the keyboard alone searches, chooses a model and a thinking level", async 
         runs_on: "your_connection", chat_models: [{ id: "opus", reasoning_efforts: ["low", "high"] }] },
     ] } };
   };
-  const app = await open("./test/Harness.tsx", { network: f.network as any, platform: "linux" });
+  const app = await open("./test/Harness.tsx", { modules: launched(), network: f.network as any, platform: "linux" });
   await app.waitFor(DEFAULT_LABEL);
   await app.press("id:composer-model");
   await app.waitFor("id:composer-model-options");
@@ -247,7 +256,7 @@ test("rows show the model's display name with its id beneath, custom thinking le
     if (url.pathname !== "/v1/models/available") return base(req);
     return { status: 200, body: { models: rows, operator_model: operator } };
   };
-  const app = await open("./test/Harness.tsx", { network: f.network as any });
+  const app = await open("./test/Harness.tsx", { modules: launched(), network: f.network as any });
   await app.waitFor("id:composer-model");
   await app.press("id:composer-model");
   await app.press("id:composer-model-options");

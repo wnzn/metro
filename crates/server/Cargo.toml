@@ -15,9 +15,15 @@ path = "src/main.rs"
 name = "metro_server"
 path = "src/lib.rs"
 
+[features]
+# tests/e2e/updates.py only: see metro_release::e2e. Never in a release build.
+e2e-test-release = ["metro-release/e2e"]
+
 [dependencies]
 metro-auth = { path = "../auth" }
 metro-model-protocol = { path = "../model-protocol" }
+# Release verification for the daily operator notice and runner updates.
+metro-release = { path = "../release", features = ["async"] }
 anyhow = "1.0.100"
 base64 = "0.22"
 chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
@@ -39,6 +45,7 @@ tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "net", "s
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 uuid = { version = "1.18.1", features = ["v4"] }
+url = "2.5"
 
 # main.rs: a listening socket inherited from the desktop launcher
 # (METRO_LISTEN_FD / METRO_LISTEN_PROTOCOL_INFO), checked before use.
@@ -49,6 +56,7 @@ libc = "0.2.180"
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
+metro-release = { path = "../release", features = ["async", "testing"] }
 # tests/media_embeddings.rs: the real connector client and job runner against
 # this server's device routes.
 metro-connector = { path = "../connector" }

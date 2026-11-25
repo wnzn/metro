@@ -20,6 +20,8 @@ url = os.environ.get("METRO_DESKTOP_BRIDGE_URL", "")
 tok = os.environ.get("METRO_DESKTOP_BRIDGE_TOKEN", "")
 res = {"url": url, "token_len": len(tok), "token_hex": all(c in "0123456789abcdef" for c in tok),
        "nsh_app_dir": os.environ.get("NSH_APP_DIR"), "no_proxy": os.environ.get("NO_PROXY"),
+       "proxy_route": os.environ.get("METRO_PROXY_ROUTE"), "direct_for": os.environ.get("METRO_PROXY_DIRECT_FOR"),
+       "proxy_vars": sorted(k for k in ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy") if k in os.environ),
        "cwd": os.getcwd(), "argv": sys.argv[1:], "pid": os.getpid(), "pgid": os.getpgid(0)}
 hp = url[len("http://"):]
 host, port = hp.split(":")
@@ -146,6 +148,160 @@ fn alive(pid: i64) -> bool {
     unsafe { libc::kill(pid as i32, 0) == 0 }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn a_portable_launcher_cannot_open_a_shared_workspace_with_an_unfinished_trial() {
+    use metro_connector::desktop::store;
+    let dir = scratch("update-gate");
+    let launcher = layout(&dir, true);
+    let out = dir.join("ui.json");
+    let home = dir.join("home");
+    store::prepare_private_dir(&home).unwrap();
+    let lock = store::try_lock_instance(&home).unwrap().unwrap();
+    std::fs::write(
+        home.join("desktop-update.json"),
+        serde_json::json!({"root": dir.join("separate-managed-install"), "id":"0123456789abcdef"})
+            .to_string(),
+    )
+    .unwrap();
+    let check = || {
+        let o = retry(|| command(&dir, &launcher, &out, "home").output());
+        assert_eq!(o.status.code(), Some(1));
+        assert!(
+            String::from_utf8_lossy(&o.stderr)
+                .contains("shared workspace has an unfinished update")
+        );
+        assert!(!out.exists(), "the portable launcher opened its UI/writer");
+        assert!(!home.join("local").exists());
+    };
+    check();
+    drop(lock);
+    check(); // The data-root gate survives the source watchdog.
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ambiguous_journal_stops_packaged_launch_without_writes_or_lock_retirement() {
+    use std::fs;
+    use std::os::unix::fs::{MetadataExt, symlink};
+
+    let dir = scratch("malformed-update-journal");
+    layout(&dir, true);
+    let root = dir.join("install");
+    let version = env!("CARGO_PKG_VERSION");
+    let target = Path::new("versions").join(version);
+    fs::create_dir_all(root.join("versions")).unwrap();
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::rename(dir.join("app"), root.join(&target)).unwrap();
+    let launcher = root.join(&target).join("Metro");
+    fs::write(
+        root.join(".metro-desktop-install"),
+        b"metro-update-lock-v2\n",
+    )
+    .unwrap();
+    symlink(&target, root.join("current")).unwrap();
+    let journal = root.join(".update.json");
+
+    let home = dir.join("home");
+    metro_connector::desktop::store::prepare_private_dir(&home).unwrap();
+    let live_db = home.join("local/db/metro.sqlite3");
+    let backup = home.join("update/db-snapshot-0123456789abcdef/metro.sqlite3");
+    for (file, contents) in [(&live_db, b"live database"), (&backup, b"saved backup!")] {
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(file, contents).unwrap();
+    }
+    let out = dir.join("ui.json");
+    let gate_path = home.join("desktop-update.json");
+    let gate = serde_json::json!({"root": root, "id":"0123456789abcdef"}).to_string();
+    // Structurally valid, but this 'staged' record expects the source
+    // version to be current, not the version the fixture launched.
+    let mismatched = serde_json::json!({
+        "version": 1, "id": "0123456789abcdef", "from": "0.0.0",
+        "to": version, "phase": "staged", "started_at": 0
+    })
+    .to_string();
+    let compat = root.join(".lock");
+    let owner = compat.join("owner.metro-lock-v2");
+    let owner_bytes = b"metro-lock-v2:packaged-fixture\n";
+    let fingerprint = |path: &Path| {
+        let info = fs::symlink_metadata(path).unwrap();
+        (
+            info.ino(),
+            info.mode(),
+            info.mtime(),
+            info.mtime_nsec(),
+            info.ctime(),
+            info.ctime_nsec(),
+        )
+    };
+    for raw in [b"{".as_slice(), mismatched.as_bytes()] {
+        fs::write(&journal, raw).unwrap();
+        for with_gate in [false, true] {
+            if with_gate {
+                fs::write(&gate_path, &gate).unwrap();
+            }
+            for with_compat in [false, true] {
+                if with_compat {
+                    fs::create_dir(&compat).unwrap();
+                    fs::write(&owner, owner_bytes).unwrap();
+                }
+                let mut paths = vec![
+                    root.clone(),
+                    home.clone(),
+                    root.join("current"),
+                    journal.clone(),
+                    live_db.clone(),
+                    backup.clone(),
+                ];
+                if with_gate {
+                    paths.push(gate_path.clone());
+                }
+                if with_compat {
+                    paths.extend([compat.clone(), owner.clone()]);
+                }
+                let before = paths.iter().map(|p| fingerprint(p)).collect::<Vec<_>>();
+
+                let result = retry(|| command(&dir, &launcher, &out, "home").output());
+                assert_eq!(result.status.code(), Some(1));
+                let text = String::from_utf8_lossy(&result.stderr);
+                for required in [
+                    "[update_journal_unknown]",
+                    "sh install-metro-linux.sh status",
+                    "Do not run install, update or uninstall",
+                    "https://github.com/wnzn/metro/issues",
+                ] {
+                    assert!(text.contains(required), "{text}");
+                }
+                assert!(!out.exists(), "the launcher opened the UI");
+                assert!(!home.join("instance.lock").exists());
+                assert!(!home.join("monitoring").exists());
+                assert_eq!(fs::read_link(root.join("current")).unwrap(), target);
+                assert_eq!(fs::read(&journal).unwrap(), raw);
+                assert_eq!(fs::read(&live_db).unwrap(), b"live database");
+                assert_eq!(fs::read(&backup).unwrap(), b"saved backup!");
+                assert_eq!(
+                    paths.iter().map(|p| fingerprint(p)).collect::<Vec<_>>(),
+                    before,
+                    "startup changed filesystem metadata"
+                );
+                if with_gate {
+                    assert_eq!(fs::read_to_string(&gate_path).unwrap(), gate);
+                }
+                if with_compat {
+                    assert_eq!(fs::read(&owner).unwrap(), owner_bytes);
+                    fs::remove_dir_all(&compat).unwrap(); // fixture only
+                } else {
+                    assert!(!compat.exists());
+                }
+            }
+            if with_gate {
+                fs::remove_file(&gate_path).unwrap(); // fixture only
+            }
+        }
+    }
+    fs::remove_dir_all(&dir).unwrap();
+}
+
 #[test]
 fn launches_the_packaged_ui_with_a_private_bridge_and_cleans_up() {
     let dir = scratch("ok");
@@ -172,7 +328,23 @@ fn launches_the_packaged_ui_with_a_private_bridge_and_cleans_up() {
         Value::Null,
         "NSH_APP_DIR must not reach the UI"
     );
-    assert_eq!(r["no_proxy"], "example.com,127.0.0.1,localhost,::1");
+    // The person's entries and loopback first, then loopback and Tailscale in
+    // ureq's NO_PROXY syntax, so the UI reaches them without a proxy.
+    let mut expected = vec![
+        "example.com".to_string(),
+        "127.0.0.1".into(),
+        "localhost".into(),
+        "::1".into(),
+    ];
+    for e in metro_url_policy::loopback_no_proxy_entries() {
+        if !expected.contains(&e) {
+            expected.push(e);
+        }
+    }
+    assert_eq!(r["no_proxy"], expected.join(","));
+    // The UI learns the route and the direct-for list as non-secret metadata.
+    assert_eq!(r["direct_for"], expected.join(","));
+    assert_eq!(r["proxy_route"], "proxied", "the test sets HTTP_PROXY");
     assert_eq!(r["argv"], serde_json::json!([]));
     let ui_dir = std::fs::canonicalize(dir.join(UI_DIR)).unwrap();
     assert_eq!(Path::new(r["cwd"].as_str().unwrap()), ui_dir);

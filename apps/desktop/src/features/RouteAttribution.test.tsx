@@ -7,12 +7,13 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof world>;
 type Act = { id: string; name: string; source: "agent" | "demo"; phase?: string; route?: unknown };
 
 async function inAcme(f: F) {
-  const app = await open("../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800 });
+  const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800 });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);

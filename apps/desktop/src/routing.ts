@@ -3,10 +3,9 @@
 // Model routing (GET/PUT /v1/model-routing) is the signed-in user's own:
 // - Use-case routing: when agent work starts for them, System One picks
 //   which of their usable chat connections answers.
-// - Opt-in classification: System One judges whether an unaddressed message
-//   of theirs asks the agent.
+// - Confidence for unaddressed messages in Spaces where classification is on.
 // - The embeddings connection search uses (and the classifier reranks with).
-// Both opt-ins are off by default. The page edits a draft and saves it whole.
+// The page edits a draft and saves it whole.
 //
 // Sharing (GET/PUT /v1/providers/{id}/sharing) is decided by a connection's
 // owner only. It grants use of the connection, never its key, sign-in or
@@ -27,6 +26,7 @@ export type { AvailableModel, ModelRouting, RoutingCase, Sharing, ShareVisibilit
 
 export const available = signal<AvailableModel[] | null>(null);
 export const availableError = signal<string | null>(null);
+export const availableLoading = signal(false);
 let availableSeq = 0;
 
 export async function loadAvailable(): Promise<void> {
@@ -34,6 +34,7 @@ export async function loadAvailable(): Promise<void> {
   if (!c) return;
   const seq = ++availableSeq;
   const ok = sessionGuard();
+  availableLoading.set(true);
   try {
     const list = await c.availableModels();
     if (!ok() || seq !== availableSeq) return;
@@ -44,6 +45,8 @@ export async function loadAvailable(): Promise<void> {
   } catch (error) {
     if (!ok() || seq !== availableSeq) return;
     fail(error, availableError, "Could not load the models you can use");
+  } finally {
+    if (ok() && seq === availableSeq) availableLoading.set(false);
   }
 }
 
@@ -54,6 +57,12 @@ export function modelsFor(capability: Capability): AvailableModel[] {
 
 export function findAvailable(id: string | null): AvailableModel | null {
   return id ? (available() ?? []).find((m) => m.connectionId === id) ?? null : null;
+}
+
+/** Choices store a connection, so its pinned/default model must be usable. */
+export function modelChoiceUsable(m: AvailableModel, capability: Capability): boolean {
+  return m.capability === capability && !!m.model && m.ready !== false &&
+    (m.capability !== "chat" || !m.chatModels || m.chatModels.some((x) => x.id === m.model && x.available !== false));
 }
 
 /**
@@ -71,6 +80,7 @@ export function shareOf(connectionId: string): ShareVisibility | null {
 export type DraftCase = { uid: string; key: string | null; label: string; description: string; connectionId: string | null };
 export type RoutingDraft = {
   enabled: boolean;
+  /** Retained only to round-trip legacy settings. */
   inferAddressing: boolean;
   classifierId: string | null;
   embeddingId: string | null;
@@ -90,6 +100,7 @@ export const routingNotice = signal<string | null>(null);
 export const routingUnsupported = signal(false);
 export const routingSaving = signal(false);
 let routingSeq = 0;
+let routingVisit = 0;
 let uidSeq = 0;
 
 // The server's limits (crates/server/src/model_routing.rs).
@@ -149,16 +160,16 @@ export function caseKey(label: string, taken: ReadonlySet<string>): string {
  */
 export function finalize(d: RoutingDraft, usable: readonly AvailableModel[]): { ok: true; routing: ModelRouting } | { ok: false; error: string } {
   const has = (id: string | null, capability: Capability) =>
-    !!id && usable.some((m) => m.connectionId === id && m.capability === capability && !!m.model && m.ready !== false);
+    !!id && usable.some((m) => m.connectionId === id && modelChoiceUsable(m, capability));
   const minDirectedness = parseProbability(d.minDirectedness);
   const minRouteProbability = parseProbability(d.minRouteProbability);
   // Shown as percentages, as the page asks for them; the values stay 0 to 1.
   if (minRouteProbability === null) return { ok: false, error: "The routing confidence must be a whole number from 0 to 100%, such as 65%." };
   if (minDirectedness === null || minDirectedness < MIN_DIRECTEDNESS_FLOOR) {
-    return { ok: false, error: `The “asking the agent” confidence must be a whole number from ${Math.round(MIN_DIRECTEDNESS_FLOOR * 100)} to 100%, such as 85%.` };
+    return { ok: false, error: `Space classification confidence must be a whole number from ${Math.round(MIN_DIRECTEDNESS_FLOOR * 100)} to 100%, such as 85%.` };
   }
-  if ((d.enabled || d.inferAddressing) && !d.classifierId) {
-    return { ok: false, error: "Choose a System One classifier first: routing and classification both need one." };
+  if (d.enabled && !d.classifierId) {
+    return { ok: false, error: "Choose a System One classifier to use model routing." };
   }
   if (d.classifierId && !has(d.classifierId, "system_one")) return { ok: false, error: "The classifier you chose isn't available to you any more. Choose another one." };
   if (d.embeddingId && !has(d.embeddingId, "embeddings")) return { ok: false, error: "The embeddings model you chose isn't available to you any more. Choose another one." };
@@ -202,17 +213,23 @@ export const routingDirty = computed(() => {
   const d = draft();
   const r = routing();
   if (!d || !r) return false;
-  const done = finalize(d, available() ?? []);
-  const comparable = (x: ModelRouting) => JSON.stringify({ ...x, cases: x.cases.map((c) => ({ ...c, key: "" })) });
-  if (done.ok) return comparable(done.routing) !== comparable(r);
-  return true; // an invalid draft is always a change
+  // Availability changes independently of the draft. A revoked selection
+  // must be shown and resolved, but it isn't itself an unsaved edit.
+  return d.enabled !== r.enabled || d.classifierId !== r.classifierId || d.embeddingId !== r.embeddingId ||
+    d.defaultChatId !== r.defaultChatId || parseProbability(d.minDirectedness) !== parseProbability(formatProbability(r.minDirectedness)) ||
+    parseProbability(d.minRouteProbability) !== parseProbability(formatProbability(r.minRouteProbability)) ||
+    d.cases.length !== r.cases.length || d.cases.some((c, i) => {
+      const saved = r.cases[i];
+      return c.label.trim() !== saved.label || c.description.trim() !== saved.description || c.connectionId !== saved.connectionId;
+    });
 });
 
 export async function loadRouting(): Promise<void> {
   const c = apiClient();
-  if (!c) return;
+  if (!c || routingSaving()) return;
   const seq = ++routingSeq;
   const ok = sessionGuard();
+  routingError.set(null);
   try {
     const value = await c.getModelRouting();
     if (!ok() || seq !== routingSeq) return;
@@ -267,7 +284,7 @@ export function revertRouting() {
 export async function saveRouting(): Promise<boolean> {
   const c = apiClient();
   const d = draft();
-  if (!c || !d || routingSaving()) return false;
+  if (!c || !d || !available() || availableLoading() || availableError() || routingSaving()) return false;
   const done = finalize(d, available() ?? []);
   if (!done.ok) {
     batch(() => {
@@ -277,6 +294,7 @@ export async function saveRouting(): Promise<boolean> {
     return false;
   }
   const ok = sessionGuard();
+  const visit = routingVisit;
   batch(() => {
     routingSaving.set(true);
     routingError.set(null);
@@ -288,12 +306,18 @@ export async function saveRouting(): Promise<boolean> {
     routingSeq++; // an older GET must not bring back the old settings
     batch(() => {
       routing.set(stored);
-      draft.set(toDraft(stored));
-      routingNotice.set(savedText(stored));
+      if (onModelsPage()) draft.set(toDraft(stored));
+      if (visit === routingVisit) routingNotice.set(savedText(stored));
     });
     return true;
   } catch (error) {
-    if (ok()) fail(error, routingError, "Could not save your model routing");
+    if (ok()) {
+      if (visit === routingVisit || (error instanceof ApiError && error.kind === "auth")) fail(error, routingError, "Could not save your model choices");
+      else if (onModelsPage()) {
+        routingSaving.set(false);
+        void loadRouting();
+      }
+    }
     return false;
   } finally {
     if (ok()) routingSaving.set(false);
@@ -301,9 +325,9 @@ export async function saveRouting(): Promise<boolean> {
 }
 
 function savedText(r: ModelRouting): string {
-  const parts = [r.enabled ? `Use-case routing is on (${r.cases.length} use case${r.cases.length === 1 ? "" : "s"})` : "Use-case routing is off"];
-  parts.push(r.inferAddressing ? "unaddressed messages of yours are classified" : "unaddressed messages stay ordinary conversation");
-  return `Saved. ${parts.join("; ")}.`;
+  return r.enabled
+    ? `Saved. Use-case routing is on (${r.cases.length} use case${r.cases.length === 1 ? "" : "s"}).`
+    : "Saved. Use-case routing is off.";
 }
 
 // ------------------------------------------------------------------ sharing (owner only)
@@ -429,22 +453,27 @@ function fail(error: unknown, target: { set(v: string | null): void }, what: str
   target.set(error instanceof ApiError ? `${what}: ${error.message}` : describe(error, what));
 }
 
-// Opening Model routing loads it fresh, with the models the user may pick and
-// the catalog (to name providers). Model providers also needs what is
+// Opening Model choices loads it fresh, with the models the user may pick and
+// the catalog (to name providers). Model connections also needs what is
 // available to say what a share means.
+const onModelsPage = () => place() === "settings" && settingsSection() === "models";
 effect(() => {
   const here = place() === "settings" ? settingsSection() : null;
   untracked(() => {
-    if (here === "routing") {
+    if (here === "models") {
       void loadRouting();
       void loadAvailable();
       void loadProviders();
-    } else if (here === "providers") void loadAvailable(); // which of mine are shared
+    } else if (here === "connections") void loadAvailable(); // which of mine are shared
   });
 });
 
 // Leaving the page drops an unsaved draft and any open sharing panel.
 onTransientClear(() => {
+  if (onModelsPage()) {
+    routingVisit++;
+    routingSeq++;
+  }
   batch(() => {
     draft.set(null); // the next visit starts from what is stored
     routingError.set(null);
@@ -462,6 +491,7 @@ onSessionEnd(() => {
   shareSeq.clear();
   available.set(null);
   availableError.set(null);
+  availableLoading.set(false);
   routing.set(null);
   draft.set(null);
   routingError.set(null);

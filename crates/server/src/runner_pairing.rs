@@ -104,17 +104,21 @@ impl Db {
         &self,
         space_id: &str,
         hash: &[u8],
+        actor: &str,
     ) -> anyhow::Result<Option<u64>> {
         let conn = self.lock();
         Ok(conn
             .query_row(
                 "UPDATE spaces
-                    SET runner_token_hash = ?2, runner_generation = runner_generation + 1
+                     SET runner_token_hash = ?2, runner_generation = runner_generation + 1,
+                         runner_drop_before = runner_generation + 1
                   WHERE id = ?1
                     AND runner_token_hash IS NULL
                     AND NOT EXISTS (SELECT 1 FROM space_runners WHERE space_id = ?1)
+                    AND EXISTS (SELECT 1 FROM space_members
+                        WHERE space_id = ?1 AND user_id = ?3 AND role = 'owner')
                   RETURNING runner_generation",
-                params![space_id, hash],
+                params![space_id, hash, actor],
                 |r| r.get::<_, i64>(0),
             )
             .optional()?
@@ -127,6 +131,7 @@ impl Db {
         &self,
         space_id: &str,
         generation: u64,
+        actor: &str,
     ) -> anyhow::Result<Option<u64>> {
         let Ok(generation) = i64::try_from(generation) else {
             return Ok(None);
@@ -135,13 +140,16 @@ impl Db {
         Ok(conn
             .query_row(
                 "UPDATE spaces
-                    SET runner_token_hash = NULL, runner_generation = runner_generation + 1
+                     SET runner_token_hash = NULL, runner_generation = runner_generation + 1,
+                         runner_drop_before = runner_generation + 1
                   WHERE id = ?1
                     AND runner_generation = ?2
                     AND runner_token_hash IS NOT NULL
                     AND NOT EXISTS (SELECT 1 FROM space_runners WHERE space_id = ?1)
+                    AND EXISTS (SELECT 1 FROM space_members
+                        WHERE space_id = ?1 AND user_id = ?3 AND role = 'owner')
                   RETURNING runner_generation",
-                params![space_id, generation],
+                params![space_id, generation, actor],
                 |r| r.get::<_, i64>(0),
             )
             .optional()?
@@ -178,8 +186,9 @@ async fn issue_unpaired(
     let token = new_runner_token().map_err(ApiError::internal)?;
     let hash = runner_token_hash(&token);
     let space_id = space.id.clone();
+    let actor = who.id.clone();
     let Some(generation) = db(state, move |db| {
-        db.set_runner_token_if_unpaired(&space_id, &hash)
+        db.set_runner_token_if_unpaired(&space_id, &hash, &actor)
     })
     .await?
     else {
@@ -221,8 +230,9 @@ async fn revoke_generation(
 ) -> ApiResult<Response> {
     let space = owner_of(state, sid, who).await?;
     let space_id = space.id.clone();
+    let actor = who.id.clone();
     let Some(new_generation) = db(state, move |db| {
-        db.clear_runner_token_if_generation(&space_id, generation)
+        db.clear_runner_token_if_generation(&space_id, generation, &actor)
     })
     .await?
     else {

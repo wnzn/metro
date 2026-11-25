@@ -106,6 +106,12 @@ This is documented from the code in
 
 ## How a message reaches the agent
 
+The addressing behaviour below is for 0.4.0. In the source, not released,
+[Personal Chat sends directly](next-source.md#personal-chat); only
+Spaces still classify whom a message is for. Space senders can see
+[private notices](next-source.md#private-sender-notices) about failed
+decisions. Use-case routing is separate.
+
 Explicit recipients always decide who a message is addressed to. System One
 makes separate decisions, each behind the sender's own opt-in:
 

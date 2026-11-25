@@ -7,8 +7,13 @@
 //   or unloaded.
 // - Requests go only to this page's own origin, with the token in an
 //   Authorization header, no cookies, no redirects and no caching.
-// - Sign-in is refused before any network call on plain HTTP to a
-//   non-loopback host, inside a frame, or from a non-HTTP origin.
+// - Sign-in is refused before any network call inside a frame or from a
+//   non-HTTP origin.
+// - Plain HTTP works. On loopback and Tailscale hosts (100.64.0.0/10,
+//   fd7a:115c:a1e0::/48, *.ts.net) it's used without asking. On any other
+//   host the token field stays hidden until the person has read a warning
+//   and chosen "Sign in anyway"; that choice (never the token) is remembered
+//   for this server in localStorage.
 // - Server-supplied text is only ever written with textContent.
 "use strict";
 
@@ -18,6 +23,8 @@
     sessionBar: $("session-bar"), whoName: $("who-name"), whoId: $("who-id"), signOut: $("sign-out"),
     unsafe: $("unsafe"), unsafeReason: $("unsafe-reason"), unsafeSsh: $("unsafe-ssh"),
     unsafeLocal: $("unsafe-local"), unsafeLoopback: $("unsafe-loopback"),
+    plainHttp: $("plain-http"), plainHttpReason: $("plain-http-reason"), plainHttpAccept: $("plain-http-accept"),
+    plainHttpNote: $("plain-http-note"), plainHttpForget: $("plain-http-forget"), plainHttpStatus: $("plain-http-status"),
     signin: $("signin"), signinForm: $("signin-form"), signinError: $("signin-error"),
     token: $("token"), signinSubmit: $("signin-submit"),
     denied: $("denied"), deniedId: $("denied-id"), deniedBack: $("denied-back"),
@@ -29,6 +36,11 @@
     usersCard: $("users-card"), usersUpdated: $("users-updated"), refresh: $("refresh"),
     usersError: $("users-error"), usersEmpty: $("users-empty"), usersLoading: $("users-loading"),
     usersTable: $("users-table"), usersBody: $("users-body"),
+    pageLimitsForm: $("page-limits-form"), pageLimitsSave: $("page-limits-save"),
+    pageLimitsRetry: $("page-limits-retry"), pageLimitsError: $("page-limits-error"),
+    pageLimitsStatus: $("page-limits-status"),
+    updateNotice: $("update-notice"), updateCurrent: $("update-current"), updateLatest: $("update-latest"),
+    updateImage: $("update-image"), updateLink: $("update-link"),
     announce: $("announce"),
     confirm: $("confirm"), confirmTitle: $("confirm-title"), confirmBody: $("confirm-body"),
     confirmOk: $("confirm-ok"), confirmCancel: $("confirm-cancel"),
@@ -36,10 +48,118 @@
 
   // ---------------------------------------------------------------- safety
 
-  function isLoopbackHost(host) {
-    const h = host.toLowerCase();
-    return h === "localhost" || h.endsWith(".localhost") || h === "[::1]" ||
-      /^127(\.\d{1,3}){3}$/.test(h);
+  // host-class:begin (admin.browser-test.mjs runs this block against
+  // crates/url-policy/testdata/host_vectors.json)
+  // "loopback", "tailscale" or "other" for a host, taken exactly as given: a
+  // trailing dot makes it a name for the resolver ("other"); only a MagicDNS
+  // name may end in a dot. Same rules as apps/desktop/src/api/serverUrl.ts
+  // and the metro-url-policy crate. The page passes location.hostname, which
+  // the browser has already put in canonical form.
+  function hostClass(hostname) {
+    let h = hostname.toLowerCase();
+    if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+    if (!h) return "other";
+    if (h === "localhost") return "loopback";
+    const name = h.endsWith(".") ? h.slice(0, -1) : h;
+    if (name.endsWith(".ts.net")) {
+      const labels = name.slice(0, -".ts.net".length);
+      if (labels !== "" && labels.split(".").every((l) => /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(l))) return "tailscale";
+    }
+    const ipv4 = (text) => {
+      const m = /^(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})\.(0|[1-9]\d{0,2})$/.exec(text);
+      if (!m) return null;
+      const o = m.slice(1).map(Number);
+      return o.every((n) => n <= 255) ? o : null;
+    };
+    const classifyV4 = (o) => {
+      if (o[0] === 127) return "loopback";
+      if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return "tailscale";
+      return "other";
+    };
+    // The eight 16-bit groups of an IPv6 address (IPv4 tail allowed), or null.
+    const ipv6 = (host) => {
+      if (!host.includes(":") || !/^[0-9a-f:.]+$/.test(host)) return null;
+      let text = host;
+      const tail = [];
+      const cut = text.lastIndexOf(":");
+      const last = text.slice(cut + 1);
+      if (last.includes(".")) {
+        const v4 = ipv4(last);
+        if (!v4) return null;
+        tail.push((v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]);
+        text = text.slice(0, cut);
+        if (text.endsWith(":")) text += ":";
+      }
+      const halves = text.split("::");
+      if (halves.length > 2) return null;
+      const parse = (x) => (x === "" ? [] : x.split(":"));
+      const head = parse(halves[0]);
+      const rest = halves.length === 2 ? parse(halves[1]) : [];
+      if ([...head, ...rest].some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+      const hex = (g) => parseInt(g, 16);
+      const width = 8 - tail.length;
+      let groups;
+      if (halves.length === 2) {
+        const fill = width - head.length - rest.length;
+        if (fill < 1) return null;
+        groups = [...head.map(hex), ...new Array(fill).fill(0), ...rest.map(hex)];
+      } else {
+        if (head.length !== width) return null;
+        groups = head.map(hex);
+      }
+      return [...groups, ...tail];
+    };
+    const v4 = ipv4(h);
+    if (v4) return classifyV4(v4);
+    const v6 = ipv6(h);
+    if (v6) {
+      if (v6.slice(0, 7).every((g) => g === 0) && v6[7] === 1) return "loopback";
+      if (v6.slice(0, 5).every((g) => g === 0) && v6[5] === 0xffff) {
+        return classifyV4([v6[6] >> 8, v6[6] & 0xff, v6[7] >> 8, v6[7] & 0xff]);
+      }
+      if (v6[0] === 0xfd7a && v6[1] === 0x115c && v6[2] === 0xa1e0) return "tailscale";
+    }
+    return "other";
+  }
+  // host-class:end
+
+  // Plain HTTP to a host that is neither loopback nor Tailscale: the token
+  // would cross the network unencrypted, so the person is asked first.
+  function plainHttpRisk() {
+    return location.protocol === "http:" && hostClass(location.hostname) === "other";
+  }
+
+  // The choice lives in localStorage, shared by this server's tabs, and is
+  // read again before every token send. Only when storage can't be used at
+  // all is it kept in this page's memory instead.
+  const PLAIN_HTTP_KEY = "metro.admin.plainHttpAccepted";
+  let plainHttpAcceptedHere = false; // only when localStorage is unavailable
+  let storageWorks = null;
+  function storageAvailable() {
+    if (storageWorks !== null) return storageWorks;
+    try {
+      const probe = PLAIN_HTTP_KEY + ".probe";
+      localStorage.setItem(probe, "1");
+      localStorage.removeItem(probe);
+      storageWorks = true;
+    } catch {
+      storageWorks = false;
+    }
+    return storageWorks;
+  }
+  function plainHttpAccepted() {
+    if (!storageAvailable()) return plainHttpAcceptedHere;
+    try { return localStorage.getItem(PLAIN_HTTP_KEY) === "1"; } catch { return false; }
+  }
+  function acceptPlainHttp() {
+    if (!storageAvailable()) { plainHttpAcceptedHere = true; return; }
+    try { localStorage.setItem(PLAIN_HTTP_KEY, "1"); } catch { plainHttpAcceptedHere = true; storageWorks = false; }
+  }
+  // Withdraws the choice: the warning shows again before the next sign-in.
+  // Signing out keeps it; only this does.
+  function forgetPlainHttp() {
+    plainHttpAcceptedHere = false;
+    try { localStorage.removeItem(PLAIN_HTTP_KEY); } catch { /* nothing kept */ }
   }
 
   // Returns null when this page may take a credential, else the reason.
@@ -53,14 +173,29 @@
     if (proto !== "https:" && proto !== "http:") {
       return "This page wasn't loaded from a Metro server, so there's no server it can safely send a token to.";
     }
-    if (proto === "http:" && !isLoopbackHost(location.hostname)) {
-      return "This page was opened over plain HTTP from " + location.host +
-        ". Anyone on the network path could read an admin token sent from here.";
-    }
-    if (!window.isSecureContext) {
+    // Browsers never treat plain HTTP outside loopback as a secure context;
+    // that's what the plain-HTTP warning is for.
+    if (proto === "https:" && !window.isSecureContext) {
       return "Your browser doesn't treat this page as a secure context.";
     }
     return null;
+  }
+
+  // The sign-in form, or first the plain-HTTP warning when it applies and
+  // hasn't been accepted for this server yet.
+  function showSignIn() {
+    if (plainHttpRisk() && !plainHttpAccepted()) {
+      el.plainHttpReason.textContent = "Anyone on the network between you and " + location.host +
+        " could read the admin token you sign in with. Use it on networks you trust, such as Tailscale or a VPN.";
+      el.signin.hidden = true;
+      el.plainHttp.hidden = false;
+      el.plainHttpAccept.focus();
+      return false;
+    }
+    el.plainHttp.hidden = true;
+    el.plainHttpNote.hidden = !plainHttpRisk();
+    el.signin.hidden = false;
+    return true;
   }
 
   function showUnsafe(reason) {
@@ -70,6 +205,7 @@
     el.unsafeSsh.textContent = "ssh -N -L 8080:127.0.0.1:" + port + " <you>@" + host;
     el.unsafeLoopback.textContent = "http://127.0.0.1" + (location.port ? ":" + location.port : "") + "/admin";
     el.signin.hidden = true;
+    el.plainHttp.hidden = true;
     el.unsafe.hidden = false;
   }
 
@@ -95,13 +231,15 @@
   let state = freshState();
 
   function freshState() {
-    return { users: [], loadedAt: null, loading: false, busy: new Set() };
+    return { users: [], loadedAt: null, loading: false, busy: new Set(),
+      pageLimits: null, pageLimitsBusy: false };
   }
 
   async function api(method, path, body) {
     const s = session;
     if (!s) throw new SessionGone();
     if (unsafeReason()) throw new ApiError(0, "This page can't send credentials.");
+    if (plainHttpRisk() && !plainHttpAccepted()) throw new ApiError(0, "Confirm the unencrypted connection first.");
     const url = new URL(path, location.origin);
     if (url.origin !== location.origin) throw new ApiError(0, "Refusing a cross-origin request.");
     const headers = { Authorization: "Bearer " + s.token, Accept: "application/json" };
@@ -166,6 +304,7 @@
     hideAlert(el.signinError);
     const reason = unsafeReason();
     if (reason) { el.token.value = ""; showUnsafe(reason); return; }
+    if (plainHttpRisk() && !plainHttpAccepted()) { el.token.value = ""; showSignIn(); return; }
     let token = el.token.value.trim().replace(/^Bearer\s+/i, "");
     if (!token) {
       el.token.setAttribute("aria-invalid", "true");
@@ -207,6 +346,8 @@
       el.panel.hidden = false;
       announce("Signed in. Loading managed users.");
       el.addName.focus();
+      loadUpdateNotice(s);
+      loadPageLimits();
       await loadUsers();
     } catch (e) {
       if (e instanceof SessionGone) return;
@@ -220,7 +361,7 @@
   }
 
   // Forget everything tied to the session: token, in-flight requests,
-  // user list and any one-time secret.
+  // user list, Page limits and any one-time secret.
   function dropSession() {
     if (session) { session.abort.abort(); session.token = null; }
     session = null;
@@ -235,10 +376,12 @@
     hideAlert(el.usersError);
     hideAlert(el.addError);
     el.addName.value = "";
+    resetPageLimits();
     el.token.value = "";
     el.whoName.textContent = "";
     el.whoId.textContent = "";
     el.panel.hidden = true;
+    el.updateNotice.hidden = true;
     el.sessionBar.hidden = true;
     if (el.confirm.open) el.confirm.close("cancel");
   }
@@ -248,9 +391,143 @@
     el.denied.hidden = true;
     const reason = unsafeReason();
     if (reason) { showUnsafe(reason); return; }
-    el.signin.hidden = false;
+    if (!showSignIn()) {
+      if (message) showAlert(el.plainHttpStatus, message); else hideAlert(el.plainHttpStatus);
+      return;
+    }
     if (message) showAlert(el.signinError, message); else hideAlert(el.signinError);
     el.token.focus();
+  }
+
+  // ---------------------------------------------------------------- updates
+
+  // Operator notice from the server's own verified daily release check.
+  // Optional: an older server (404) or an error just shows nothing.
+  async function loadUpdateNotice(s) {
+    try {
+      const u = await api("GET", "/v1/server/update");
+      if (session !== s) return;
+      el.updateNotice.hidden = true;
+      if (!u || u.available !== true || u.latest?.historical !== false) return;
+      const version = String(u.latest.version || "");
+      if (!/^[0-9]+\.[0-9]+\.[0-9]+$/.test(version)) return;
+      el.updateCurrent.textContent = String(u.current || "");
+      el.updateLatest.textContent = version;
+      el.updateImage.textContent = String((u.latest.images && u.latest.images.server) || "");
+      // Built from a constant and the checked version, never from a server URL.
+      el.updateLink.href = "https://github.com/wnzn/metro/releases/tag/v" + version;
+      el.updateNotice.hidden = false;
+    } catch (e) {
+      // No notice; never end the session for this optional call.
+    }
+  }
+
+  // ---------------------------------------------------------------- Page limits
+
+  const PAGE_LIMITS = "/v1/admin/settings";
+  const limitFields = [
+    { key: "pages_per_space", input: $("pages-per-space") },
+    { key: "versions_per_page", input: $("versions-per-page") },
+  ];
+
+  function showPageLimits(data) {
+    if (!data || !limitFields.every(({ key }) => Number.isInteger(data[key]))) {
+      throw new ApiError(0, "The server didn't return both Page limits as whole numbers.");
+    }
+    state.pageLimits = data;
+    for (const { input, key } of limitFields) input.value = String(data[key]);
+    el.pageLimitsForm.hidden = false;
+  }
+
+  function resetPageLimits() {
+    el.pageLimitsForm.hidden = true;
+    el.pageLimitsRetry.hidden = true;
+    el.pageLimitsRetry.removeAttribute("aria-disabled");
+    el.pageLimitsSave.removeAttribute("aria-disabled");
+    el.pageLimitsStatus.textContent = "";
+    hideAlert(el.pageLimitsError);
+    for (const { input } of limitFields) {
+      input.value = "";
+      input.readOnly = false;
+      input.removeAttribute("aria-invalid");
+    }
+  }
+
+  async function loadPageLimits() {
+    if (!session?.me?.is_org_admin || state.pageLimitsBusy || state.pageLimits) return;
+    const s = session;
+    state.pageLimitsBusy = true;
+    el.pageLimitsRetry.setAttribute("aria-disabled", "true");
+    hideAlert(el.pageLimitsError);
+    el.pageLimitsStatus.textContent = "Loading Page limits…";
+    try {
+      const data = await api("GET", PAGE_LIMITS);
+      if (session !== s) return;
+      showPageLimits(data);
+      const moveFocus = document.activeElement === el.pageLimitsRetry;
+      el.pageLimitsRetry.hidden = true;
+      if (moveFocus) limitFields[0].input.focus();
+    } catch (e) {
+      if (e instanceof SessionGone || session !== s || handleForbidden(e)) return;
+      showAlert(el.pageLimitsError, "Couldn't load Page limits: " + errorText(e));
+      el.pageLimitsRetry.hidden = false;
+    } finally {
+      if (session === s) {
+        state.pageLimitsBusy = false;
+        el.pageLimitsRetry.removeAttribute("aria-disabled");
+        el.pageLimitsStatus.textContent = "";
+      }
+    }
+  }
+
+  async function savePageLimits(ev) {
+    ev.preventDefault();
+    if (!session?.me?.is_org_admin || !state.pageLimits || state.pageLimitsBusy) return;
+    const s = session;
+    hideAlert(el.pageLimitsError);
+    el.pageLimitsStatus.textContent = "";
+    const patch = {};
+    const invalid = [];
+    for (const { input, key } of limitFields) {
+      const value = input.valueAsNumber;
+      if (!input.validity.valid || !Number.isInteger(value)) {
+        input.setAttribute("aria-invalid", "true");
+        invalid.push(input);
+      } else if (value !== state.pageLimits[key]) {
+        patch[key] = value;
+      }
+    }
+    if (invalid.length) {
+      showAlert(el.pageLimitsError, invalid.map((input) =>
+        input.labels[0].textContent + ": enter a whole number from " + input.min + " to " + input.max + "."
+      ).join(" "));
+      invalid[0].focus();
+      return;
+    }
+    if (Object.keys(patch).length === 0) {
+      el.pageLimitsStatus.textContent = "No changes to save.";
+      return;
+    }
+    state.pageLimitsBusy = true;
+    el.pageLimitsSave.setAttribute("aria-disabled", "true");
+    el.pageLimitsStatus.textContent = "Saving Page limits…";
+    for (const { input } of limitFields) input.readOnly = true;
+    try {
+      const data = await api("PATCH", PAGE_LIMITS, patch);
+      if (session !== s) return;
+      showPageLimits(data);
+      el.pageLimitsStatus.textContent = "Page limits saved.";
+    } catch (e) {
+      if (e instanceof SessionGone || session !== s || handleForbidden(e)) return;
+      el.pageLimitsStatus.textContent = "";
+      showAlert(el.pageLimitsError, "Couldn't save Page limits: " + errorText(e) + " Select Save Page limits to retry.");
+    } finally {
+      if (session === s) {
+        state.pageLimitsBusy = false;
+        el.pageLimitsSave.removeAttribute("aria-disabled");
+        for (const { input } of limitFields) input.readOnly = false;
+      }
+    }
   }
 
   // ---------------------------------------------------------------- users
@@ -554,6 +831,14 @@
     const hadSecretInUrl = scrubUrl();
     el.signinForm.addEventListener("submit", signIn);
     el.addForm.addEventListener("submit", addUser);
+    el.pageLimitsForm.addEventListener("submit", savePageLimits);
+    el.pageLimitsRetry.addEventListener("click", loadPageLimits);
+    for (const { input } of limitFields) {
+      input.addEventListener("input", () => {
+        input.removeAttribute("aria-invalid");
+        el.pageLimitsStatus.textContent = "";
+      });
+    }
     el.signOut.addEventListener("click", () => { endSession(null); announce("Signed out."); });
     el.deniedBack.addEventListener("click", () => endSession(null));
     el.refresh.addEventListener("click", () => loadUsers());
@@ -561,6 +846,31 @@
       setRevealed(el.secretValue.type === "password"));
     el.secretCopy.addEventListener("click", copySecret);
     el.secretDone.addEventListener("click", finishSecret);
+    el.plainHttpAccept.addEventListener("click", () => {
+      hideAlert(el.plainHttpStatus);
+      acceptPlainHttp();
+      if (showSignIn()) el.token.focus();
+    });
+    // Another tab of this server withdrew the choice (or cleared storage):
+    // a session here may not send its token again; it ends, and the warning
+    // shows before the next sign-in.
+    window.addEventListener("storage", (e) => {
+      if (e.key !== null && e.key !== PLAIN_HTTP_KEY) return;
+      if (!plainHttpRisk() || plainHttpAccepted()) return;
+      if (session) {
+        endSession("The choice to sign in over this unencrypted connection was withdrawn in another tab. You've been signed out.");
+      } else if (!el.signin.hidden) {
+        el.token.value = "";
+        showSignIn();
+      }
+    });
+    el.plainHttpForget.addEventListener("click", () => {
+      forgetPlainHttp();
+      el.token.value = "";
+      hideAlert(el.signinError);
+      showSignIn();
+      announce("Choice forgotten. The warning shows again before you sign in.");
+    });
     el.token.addEventListener("input", () => el.token.removeAttribute("aria-invalid"));
     el.addName.addEventListener("input", () => el.addName.removeAttribute("aria-invalid"));
     // Don't let the browser keep the session in its back/forward cache.
@@ -569,12 +879,11 @@
 
     const reason = unsafeReason();
     if (reason) { showUnsafe(reason); return; }
-    el.signin.hidden = false;
     if (hadSecretInUrl) {
       showAlert(el.signinError,
         "This page ignores credentials in its address. If you put a token in a link, it may be in your history or logs; rotate it.");
     }
-    el.token.focus();
+    if (showSignIn()) el.token.focus();
   }
 
   if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);

@@ -822,8 +822,12 @@ async fn everything_survives_a_restart() {
         s.add(ALICE, &a, "bob").await;
         s.say(BOB, &a, "lobby", json!({"text": "remember me"}))
             .await;
-        s.post(ALICE, "/v1/chat/messages", json!({"text": "note to self"}))
-            .await;
+        s.post(
+            ALICE,
+            "/v1/chat/messages",
+            json!({"text": "note to self", "save_note": true}),
+        )
+        .await;
         (a.clone(), s.runner_token(ALICE, &a).await)
     };
     let s = Server::start(config(None), Db::open(&path).unwrap()).await;

@@ -1,0 +1,26 @@
+# Metro container images v0.4.0
+# Source commit: 1a743e59d4ec6c1da85d09d92c99457561f64e55
+# Source: https://github.com/wnzn/metro refs/heads/main (git tag v0.4.0 -> 1a743e59d4ec6c1da85d09d92c99457561f64e55)
+# Pull by digest. The tag is the version only; there is no 'latest'.
+# Every index and per-platform digest below is signed keyless with Sigstore cosign
+# and was verified before this file was written against this publisher identity,
+# the commit above (Fulcio claim and signed annotation) and the exact digest:
+#   certificate identity: https://github.com/wnzn/metro/.github/workflows/release-images.yml@refs/heads/main
+#   OIDC issuer:          https://token.actions.githubusercontent.com
+#   signed annotation:    org.opencontainers.image.revision=1a743e59d4ec6c1da85d09d92c99457561f64e55
+# Verify:  cosign verify --certificate-identity '<identity>' \
+#            --certificate-oidc-issuer '<issuer>' \
+#            --certificate-github-workflow-sha 1a743e59d4ec6c1da85d09d92c99457561f64e55 \
+#            -a org.opencontainers.image.revision=1a743e59d4ec6c1da85d09d92c99457561f64e55 '<reference@digest>'
+# Columns: reference  architecture(s)
+
+ghcr.io/wnzn/metro-embeddinggemma2:v0.4.0@sha256:a0c322d7135c08442b09065b28b4efb82b1959999b6f7f7c61592113a1494853  linux/amd64
+ghcr.io/wnzn/metro-embeddinggemma2@sha256:2b0a614d9b53f60959d9a18dcb42766fbb3aebea9772ca26aee46e36a0f7761f  linux/amd64
+
+ghcr.io/wnzn/metro-runner:v0.4.0@sha256:a3f12f00eea1bea5061eaa370da49108b756465f88fe9eea0f50c6681772d0b6  linux/amd64,linux/arm64
+ghcr.io/wnzn/metro-runner@sha256:389016bcea64c98fcc3ee12782858e745305e3b60365d84c186cbe344a9d1b0f  linux/amd64
+ghcr.io/wnzn/metro-runner@sha256:c8f294c039243e218cfd3b2465bba6bdea406ed69e67d1fdbac0a5bda05a2cdb  linux/arm64
+
+ghcr.io/wnzn/metro-server:v0.4.0@sha256:2bc9dd1b1ed45a91235299793200ceb517b0e927e920e8963fa303611ec0802c  linux/amd64,linux/arm64
+ghcr.io/wnzn/metro-server@sha256:d6c80fb254984fe1a83bc455022a2fd88007784912d53e434e368ca99bf8ce7a  linux/amd64
+ghcr.io/wnzn/metro-server@sha256:6cfe3cb642c6e4c10949cc9c68cc74e2d46536504d3836e79ae3db0f87757442  linux/arm64

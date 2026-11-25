@@ -47,6 +47,11 @@ const mock = {
   ],
   failUsers: false,
   slowUsers: 0,
+  settings: { pages_per_space: 50, versions_per_page: 200 },
+  failSettingsGet: 0,
+  failSettingsPatch: 0,
+  slowSettingsGet: 0,
+  settingsPatches: [],
   log: [],
 };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'";
@@ -78,8 +83,21 @@ const server = createServer(async (req, res) => {
   if (!who) { res.setHeader("www-authenticate", "Bearer"); return send(res, 401, { error: "invalid token" }); }
   if (p === "/v1/me") return send(res, 200, { id: who === "admin" ? "jm" : "pat", actor: who === "admin" ? "JM" : "Pat", is_org_admin: who === "admin" });
   if (who !== "admin") return send(res, 403, { error: "only an organization admin can manage users" });
+  if (p === "/v1/server/update") return mock.serverUpdate ? send(res, 200, mock.serverUpdate) : send(res, 404, { error: "not found" });
   let body = "";
   for await (const c of req) body += c;
+  if (p === "/v1/admin/settings" && req.method === "GET") {
+    if (mock.slowSettingsGet) await delay(mock.slowSettingsGet);
+    if (mock.failSettingsGet) return send(res, mock.failSettingsGet, { error: "settings unavailable" });
+    return send(res, 200, mock.settings);
+  }
+  if (p === "/v1/admin/settings" && req.method === "PATCH") {
+    const patch = JSON.parse(body);
+    mock.settingsPatches.push(patch);
+    if (mock.failSettingsPatch) return send(res, mock.failSettingsPatch, { error: "could not persist settings" });
+    Object.assign(mock.settings, patch);
+    return send(res, 200, mock.settings);
+  }
   if (p === "/v1/admin/users" && req.method === "GET") {
     if (mock.slowUsers) await new Promise((r) => setTimeout(r, mock.slowUsers));
     if (mock.failUsers) return send(res, 500, { error: "database is locked" });
@@ -116,7 +134,7 @@ async function startChrome() {
   chrome = spawn(executable, [
     "--headless=new", "--no-sandbox", "--disable-gpu", "--no-first-run", "--no-default-browser-check",
     `--user-data-dir=${profile}`, "--remote-debugging-port=0",
-    "--host-resolver-rules=MAP metro.lan 127.0.0.1", "about:blank",
+    "--host-resolver-rules=MAP metro.lan 127.0.0.1, MAP metro.tail1234.ts.net 127.0.0.1", "about:blank",
   ], { stdio: "ignore" });
   chromeClosed = new Promise((resolve) => { chrome.once("close", resolve); });
 
@@ -323,11 +341,110 @@ await test("admin signs in; names render as text", async () => {
   assert(!(await evaluate("location.href")).includes("metro_"), "token in URL");
 });
 
+await test("the server update notice shows only a verified newer release", async () => {
+  const signedInFresh = async () => {
+    await goto(base + "/admin");
+    await signIn(ADMIN);
+    await waitFor(vis("panel") + " && document.querySelectorAll('#users-body tr').length > 0");
+    await delay(150);
+  };
+  mock.serverUpdate = null;
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown on a 404");
+  assert(await evaluate(vis("panel")), "a 404 ended the session");
+  mock.serverUpdate = { current: "0.5.0", available: false, latest: { version: "0.5.0", images: {} } };
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown when up to date");
+  mock.serverUpdate = { current: "0.5.0", available: true, latest: { historical: false, version: "0.5.1\"><img src=x onerror=window.__xss=1>", images: {} } };
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown for a malformed version");
+  const image = "ghcr.io/wnzn/metro-server:v0.5.1@sha256:" + "a".repeat(64);
+  mock.serverUpdate = { current: "0.5.0", available: true, latest: { historical: true, version: "0.5.1", images: { server: image } } };
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "historical notice was actionable");
+  mock.serverUpdate.latest.historical = false;
+  await signedInFresh();
+  await waitFor(vis("update-notice"));
+  assert((await text("update-latest")) === "0.5.1", "latest");
+  assert((await text("update-current")) === "0.5.0", "current");
+  assert((await text("update-image")) === image, "image");
+  assert(await evaluate("document.getElementById('update-link').href") === "https://github.com/wnzn/metro/releases/tag/v0.5.1", "link");
+  assert(await evaluate("window.__xss") === undefined, "script ran");
+  await click("#sign-out");
+  assert(!(await evaluate(vis("update-notice"))), "notice kept after sign-out");
+  mock.serverUpdate = null;
+  // Leave the page as "admin signs in" did: signed in, users listed, no
+  // notice (the following tests run in that session).
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown without an update");
+});
+
 await test("every button has an accessible name; inputs have labels", async () => {
   const bad = await evaluate(`[...document.querySelectorAll('button')].filter(b => !(b.getAttribute('aria-label') || b.textContent.trim())).length`);
   assert(bad === 0, bad + " unnamed buttons");
   const unlabeled = await evaluate(`[...document.querySelectorAll('input')].filter(i => !document.querySelector('label[for="' + i.id + '"]')).length`);
   assert(unlabeled === 0, unlabeled + " unlabeled inputs");
+});
+
+const value = (id) => `document.getElementById(${JSON.stringify(id)}).value`;
+
+await test("Page limits load, validate with accessible errors, and save only changed settings", async () => {
+  await waitFor(vis("page-limits-form"));
+  assert(await evaluate(value("pages-per-space")) === "50", "wrong Page count");
+  assert(await evaluate(value("versions-per-page")) === "200", "wrong retention");
+  const before = mock.settingsPatches.length;
+  await submit("page-limits-form");
+  assert((await text("page-limits-status")).includes("No changes"), "no unchanged status");
+  for (const [input, bad, fix] of [
+    ["pages-per-space", "501", "50"],
+    ["versions-per-page", "2.5", "200"],
+    ["pages-per-space", "", "50"],
+    ["versions-per-page", "1", "200"],
+  ]) {
+    await type(input, bad);
+    await submit("page-limits-form");
+    assert(await evaluate(vis("page-limits-error")), "validation error missing");
+    assert(await evaluate("document.activeElement.id") === input, "invalid input not focused");
+    assert(await evaluate("document.activeElement.getAttribute('aria-invalid')") === "true", "field not marked invalid");
+    assert(await evaluate("document.activeElement.getAttribute('aria-errormessage')") === "page-limits-error", "error not associated");
+    await type(input, fix);
+  }
+  assert(mock.settingsPatches.length === before, "invalid or unchanged settings were sent");
+  // A different admin also changed retention since our GET. Do not overwrite
+  // that value, and show the authoritative result of this PATCH.
+  mock.settings.versions_per_page = 14;
+  await type("pages-per-space", "25");
+  await submit("page-limits-form");
+  await waitFor("document.getElementById('page-limits-status').textContent === 'Page limits saved.'");
+  assert(JSON.stringify(mock.settingsPatches.at(-1)) === JSON.stringify({ pages_per_space: 25 }), "sent more than the edited limit");
+  assert(await evaluate(value("versions-per-page")) === "14", "ignored the server's saved settings");
+  assert(!(await evaluate(vis("page-limits-error"))), "old error still visible");
+});
+
+await test("Page limits offer recovery from load and save errors without losing edits", async () => {
+  mock.failSettingsGet = 503;
+  await goto(base + "/admin");
+  await signIn(ADMIN);
+  await waitFor(vis("page-limits-retry"));
+  assert(!(await evaluate(vis("page-limits-form"))), "showed invented values on load failure");
+  assert((await text("page-limits-error")).includes("settings unavailable"), "load error missing");
+  mock.failSettingsGet = 0;
+  await evaluate("document.getElementById('page-limits-retry').focus()");
+  await click("#page-limits-retry");
+  await waitFor(vis("page-limits-form"));
+  assert(await evaluate("document.activeElement.id") === "pages-per-space", "focus lost on retry");
+  assert(await evaluate(value("pages-per-space")) === "25", "saved setting not shown on fresh sign-in");
+  mock.failSettingsPatch = 503;
+  await type("versions-per-page", "9");
+  await submit("page-limits-form");
+  await waitFor(vis("page-limits-error"));
+  assert((await text("page-limits-error")).includes("retry"), "save retry guidance missing");
+  assert(await evaluate(value("versions-per-page")) === "9", "unsaved edit lost");
+  assert(mock.settings.versions_per_page === 14, "fixture wrote a failed edit");
+  mock.failSettingsPatch = 0;
+  await submit("page-limits-form");
+  await waitFor("document.getElementById('page-limits-status').textContent === 'Page limits saved.'");
+  assert(mock.settings.versions_per_page === 9, "retry did not save");
 });
 
 await test("brand, text, control edges and focus meet contrast targets in light and dark", async () => {
@@ -559,6 +676,29 @@ await test("a 401 mid-session signs out with an explanation", async () => {
   server.on("request", origEmit);
 });
 
+await test("a forbidden Page limits request signs out; a late read cannot restore the form", async () => {
+  await goto(base + "/admin");
+  await signIn(ADMIN);
+  await waitFor(vis("page-limits-form"));
+  mock.failSettingsPatch = 403;
+  await type("pages-per-space", "30");
+  await submit("page-limits-form");
+  await waitFor(vis("signin") + " && " + vis("signin-error"));
+  assert((await text("signin-error")).includes("no longer an organization admin"), "no explanation");
+  assert(!(await evaluate(vis("page-limits-form"))), "form survived auth loss");
+  assert(await evaluate(value("pages-per-space")) === "", "settings left in DOM");
+  mock.failSettingsPatch = 0;
+
+  mock.slowSettingsGet = 400;
+  await signIn(ADMIN);
+  await waitFor("document.getElementById('page-limits-status').textContent === 'Loading Page limits…'");
+  await click("#sign-out");
+  await sleep(500);
+  mock.slowSettingsGet = 0;
+  assert(!(await evaluate(vis("page-limits-form"))), "late response repopulated the form");
+  assert(await evaluate(value("pages-per-space")) === "", "late response kept values");
+});
+
 await test("credentials in the URL are ignored and scrubbed", async () => {
   mock.log.length = 0;
   await goto(base + "/admin?token=" + tok());
@@ -567,32 +707,173 @@ await test("credentials in the URL are ignored and scrubbed", async () => {
   assert(apiCalls().length === 0, "used the URL token");
 });
 
-await test("plain HTTP on a non-loopback host refuses sign-in before any request", async () => {
+await test("plain HTTP on a Tailscale name signs in without a warning", async () => {
   mock.log.length = 0;
-  await goto(`http://metro.lan:${port}/admin`);
-  assert(await evaluate(vis("unsafe")), "warning not shown");
-  assert(!(await evaluate(vis("signin"))), "sign-in shown");
-  assert((await text("unsafe-ssh")).includes(`8080:127.0.0.1:${port}`) && (await text("unsafe-ssh")).includes("metro.lan"), "ssh hint");
-  // Even if someone un-hides the form, submission sends nothing.
+  const ts = `http://metro.tail1234.ts.net:${port}`;
+  await goto(ts + "/admin");
+  assert(await evaluate(vis("signin")), "sign-in hidden");
+  assert(!(await evaluate(vis("plain-http"))), "warning shown on Tailscale");
+  assert(!(await evaluate(vis("unsafe"))), "refused on Tailscale");
+  assert(!(await evaluate(vis("plain-http-note"))), "unencrypted note on Tailscale");
+  await signIn(ADMIN);
+  await waitFor(vis("panel"));
+  assert(apiCalls().length > 0 && apiCalls().every((r) => r.authOk), "sign-in didn't reach the server");
+  await click("#sign-out");
+});
+
+await test("plain HTTP on another host warns first; the token goes out only after Sign in anyway", async () => {
+  mock.log.length = 0;
+  const lan = `http://metro.lan:${port}`;
+  await goto(lan + "/admin");
+  await evaluate("localStorage.clear()");
+  await goto(lan + "/admin");
+  assert(await evaluate(vis("plain-http")), "warning not shown");
+  assert(!(await evaluate(vis("signin"))), "token field shown before the warning was accepted");
+  assert(!(await evaluate(vis("unsafe"))), "plain HTTP is refused outright");
+  const reason = await text("plain-http-reason");
+  assert(reason.includes(`metro.lan:${port}`) && reason.includes("could read the admin token"), "warning text: " + reason);
+  assert((await text("plain-http-accept")) === "Sign in anyway", "button label");
+  assert(await evaluate("document.activeElement.id") === "plain-http-accept", "warning button not focused");
+  // Even if someone un-hides the form, submission sends nothing before the warning is accepted.
   await evaluate("document.getElementById('signin').hidden = false");
   await signIn(ADMIN);
   await sleep(200);
-  assert(apiCalls().length === 0, "credential sent over plain HTTP");
+  assert(apiCalls().length === 0, "credential sent before Sign in anyway");
   assert(await evaluate("document.getElementById('token').value") === "", "token left in field");
-  await shot("admin-insecure.png", 900, 700);
+  assert(await evaluate(vis("plain-http")) && !(await evaluate(vis("signin"))), "warning not back");
+  await shot("admin-plain-http.png", 900, 700);
   await page("Emulation.clearDeviceMetricsOverride");
+
+  await click("#plain-http-accept");
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "form not shown after accepting");
+  assert(await evaluate(vis("plain-http-note")), "no unencrypted note");
+  assert(await evaluate("document.activeElement.id") === "token", "token field not focused");
+  await signIn(ADMIN);
+  await waitFor(vis("panel"));
+  assert(apiCalls().every((r) => r.authOk && !r.cookie), "bad request");
+  // The choice, never the token, is remembered for this server.
+  const stored = await evaluate("JSON.stringify(Object.entries(localStorage))");
+  assert(stored === JSON.stringify([["metro.admin.plainHttpAccepted", "1"]]), "storage: " + stored.replace(/metro_[a-f0-9]{36}/g, "<redacted>"));
+  await click("#sign-out");
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "asked again after sign-out");
+
+  await goto(lan + "/admin");
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "asked again on reload");
+  assert(await evaluate(vis("plain-http-note")), "no unencrypted note on reload");
+  await evaluate("localStorage.clear()");
+});
+
+await test("Forget this choice withdraws the plain-HTTP choice; sign-out alone keeps it", async () => {
+  mock.log.length = 0;
+  const lan = `http://metro.lan:${port}`;
+  await goto(lan + "/admin");
+  await evaluate("localStorage.clear()");
+  await goto(lan + "/admin");
+  await click("#plain-http-accept");
+  await signIn(ADMIN);
+  await waitFor(vis("panel"));
+  await click("#sign-out");
+  // Signing out keeps the choice.
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "sign-out dropped the choice");
+  assert(await evaluate(vis("plain-http-note")), "no note after sign-out");
+  assert((await text("plain-http-forget")) === "Forget this choice", "forget label");
+  await type("token", "typed-but-not-sent");
+  await click("#plain-http-forget");
+  assert(await evaluate("localStorage.getItem('metro.admin.plainHttpAccepted')") === null, "choice still stored");
+  assert(await evaluate(vis("plain-http")) && !(await evaluate(vis("signin"))), "warning not shown again");
+  assert(await evaluate("document.getElementById('token').value") === "", "token left in the field");
+  await goto(lan + "/admin");
+  assert(await evaluate(vis("plain-http")) && !(await evaluate(vis("signin"))), "warning not shown after reload");
+  assert(!(await evaluate(vis("plain-http-note"))), "note shown without a choice");
+  assert(apiCalls().filter((r) => r.url === "/v1/me").length === 1, "unexpected sign-in requests");
+  await evaluate("localStorage.clear()");
+});
+
+await test("withdrawing the choice in another tab signs this one out; the stored choice is checked before every send", async () => {
+  const lan = `http://metro.lan:${port}`;
+  await goto(lan + "/admin");
+  await evaluate("localStorage.clear()");
+  await goto(lan + "/admin");
+  await click("#plain-http-accept");
+  await signIn(ADMIN);
+  await waitFor(vis("panel") + " && " + vis("page-limits-form") +
+    " && document.querySelectorAll('#users-body tr').length > 0");
+
+  // Same tab: the choice disappears from storage (no event here); the next
+  // send is refused before any request.
+  mock.log.length = 0;
+  await evaluate("localStorage.removeItem('metro.admin.plainHttpAccepted')");
+  await click("#refresh");
+  await type("pages-per-space", "31");
+  await submit("page-limits-form");
+  await waitFor(vis("users-error") + " && " + vis("page-limits-error"));
+  assert((await text("page-limits-error")).includes("Confirm the unencrypted connection first"), "missing HTTP choice error");
+  assert(apiCalls().length === 0, "a request went out without the stored choice");
+  await evaluate("localStorage.setItem('metro.admin.plainHttpAccepted', '1')");
+
+  // A second tab of the same server withdraws it.
+  const { targetId: other } = await cdp("Target.createTarget", { url: "about:blank" });
+  const { sessionId: otherSession } = await cdp("Target.attachToTarget", { targetId: other, flatten: true });
+  const tab2 = (m, p) => cdp(m, p, otherSession);
+  const eval2 = async (expr) => (await tab2("Runtime.evaluate", { expression: expr, returnByValue: true, awaitPromise: true })).result.value;
+  await tab2("Runtime.enable");
+  await tab2("Page.enable");
+  const navigation = await tab2("Page.navigate", { url: lan + "/admin" });
+  assert(!navigation.errorText, "second tab navigation failed: " + navigation.errorText);
+  const sharedChoice = `location.origin === ${JSON.stringify(lan)} && document.readyState === 'complete'
+    && document.getElementById('signin')?.hidden === false
+    && document.getElementById('plain-http-note')?.hidden === false`;
+  for (const end = Date.now() + 5000; Date.now() < end; await sleep(50)) {
+    if (await eval2(sharedChoice)) break;
+  }
+  assert(await eval2(sharedChoice), "second tab didn't share the choice: " + await eval2(
+    `JSON.stringify({origin: location.origin, ready: document.readyState,
+      warning: document.getElementById('plain-http')?.hidden === false,
+      accepted: location.origin === ${JSON.stringify(lan)} && localStorage.getItem('metro.admin.plainHttpAccepted') === '1'})`
+  ));
+  mock.log.length = 0;
+  await eval2("document.getElementById('plain-http-forget').click()");
+  await waitFor(`document.getElementById('panel').hidden && ${vis("plain-http")} && document.getElementById('signin').hidden`);
+  assert((await text("plain-http-status")).includes("withdrawn in another tab"), "no explanation: " + (await text("plain-http-status")));
+  assert(await evaluate("document.querySelectorAll('#users-body tr').length") === 0, "data kept after sign-out");
+  await sleep(300);
+  assert(apiCalls().length === 0, "a request went out after the choice was withdrawn");
+  await cdp("Target.closeTarget", { targetId: other });
+  await evaluate("localStorage.clear()");
+});
+
+await test("hostClass matches the shared host vectors (crates/url-policy/testdata/host_vectors.json)", async () => {
+  const src = readFileSync(join(here, "admin.js"), "utf8");
+  const begin = src.indexOf("// host-class:begin"), end = src.indexOf("// host-class:end");
+  assert(begin > 0 && end > begin, "host-class markers missing");
+  const hostClass = new Function(src.slice(begin, end) + "\nreturn hostClass;")();
+  const { hosts } = JSON.parse(readFileSync(join(here, "../../../url-policy/testdata/host_vectors.json"), "utf8"));
+  assert(hosts.length > 40, "too few vectors");
+  const wrong = hosts.filter((v) => hostClass(v.host) !== v.class).map((v) => `${JSON.stringify(v.host)}: ${hostClass(v.host)}`);
+  assert(wrong.length === 0, "mismatches: " + wrong.join(", "));
+});
+
+await test("loopback pages never show the plain-HTTP warning", async () => {
+  await goto(base + "/admin");
+  assert(await evaluate(vis("signin")), "sign-in hidden");
+  assert(!(await evaluate(vis("plain-http"))) && !(await evaluate(vis("plain-http-note"))), "warning on loopback");
 });
 
 await test("a framed panel refuses sign-in", async () => {
   await page("Page.navigate", { url: base + "/frame.html" });
-  await sleep(600);
-  const { frameTree } = await page("Page.getFrameTree");
-  const child = frameTree.childFrames?.[0]?.frame;
-  assert(child, "no iframe");
-  const { executionContextId } = await page("Page.createIsolatedWorld", { frameId: child.id });
-  const r = await page("Runtime.evaluate", { contextId: executionContextId, returnByValue: true,
-    expression: "!document.getElementById('unsafe').hidden && document.getElementById('signin').hidden" });
-  assert(r.result.value === true, "framed page offers sign-in");
+  // Poll rather than sleep: under load the frame and its script take longer.
+  let refused = false;
+  for (const end = Date.now() + 5000; !refused && Date.now() < end; await sleep(100)) {
+    const { frameTree } = await page("Page.getFrameTree");
+    const child = frameTree.childFrames?.[0]?.frame;
+    if (!child) continue;
+    const { executionContextId } = await page("Page.createIsolatedWorld", { frameId: child.id });
+    const r = await page("Runtime.evaluate", { contextId: executionContextId, returnByValue: true,
+      expression: "document.readyState === 'complete' && !!document.getElementById('unsafe') && " +
+        "!document.getElementById('unsafe').hidden && document.getElementById('signin').hidden" });
+    refused = r.result.value === true;
+  }
+  assert(refused, "framed page offers sign-in");
 });
 
 await test("the page never logs to the console and has no CSP violations", async () => {

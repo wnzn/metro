@@ -14,7 +14,7 @@ import { signal } from "nsh";
 import { readBridgeEnv } from "../../device/env";
 import type { BridgeEndpoint } from "../../device/env";
 import { BridgeError, scrub } from "../../device/bridge";
-import { loadSpaceRunner } from "../../settings";
+import { onSessionEnd, sessionGuard } from "../../store";
 
 export type LocalToolsWorker = "starting" | "online" | "offline" | "revoked" | "stopped";
 
@@ -27,7 +27,11 @@ export type LocalToolsSpace = {
   detail: string | null;
   /** This Space's private folder on this computer: the only place the tools read. */
   folder: string;
+  /** Nonsecret revision of the exact local record; older launchers lack it. */
+  pairingRevision?: string;
 };
+
+export type LocalToolsDisableTarget = { spaceId: string; accountId: string; revision: string };
 
 export type LocalToolsStatus = { available: boolean; reason: string | null; spaces: LocalToolsSpace[] };
 
@@ -42,7 +46,9 @@ export function parseSpace(v: unknown): LocalToolsSpace {
   const state = v.state === "on" || v.state === "revoked" ? v.state : "off";
   const worker = WORKERS.includes(String(v.worker)) ? (v.worker as LocalToolsWorker) : "stopped";
   const detail = str(v.detail);
-  return { spaceId: v.space_id, enabled: v.enabled === true, state, worker, detail: detail === null ? null : scrub(detail), folder: v.folder };
+  const revision = v.pairing_revision;
+  return { spaceId: v.space_id, enabled: v.enabled === true, state, worker, detail: detail === null ? null : scrub(detail), folder: v.folder,
+    pairingRevision: typeof revision === "string" && /^(0|[1-9][0-9]{0,18})$/.test(revision) ? revision : undefined };
 }
 
 export function parseStatus(v: unknown): LocalToolsStatus {
@@ -64,7 +70,7 @@ type Client = {
   call(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown>;
   status(): Promise<LocalToolsStatus>;
   enable(spaceId: string): Promise<LocalToolsSpace>;
-  disable(spaceId: string): Promise<LocalToolsSpace>;
+  disable(target: LocalToolsDisableTarget): Promise<LocalToolsSpace>;
 };
 
 function createClient(endpoint: BridgeEndpoint): Client {
@@ -108,7 +114,10 @@ function createClient(endpoint: BridgeEndpoint): Client {
     call,
     status: async () => parseStatus(await call("GET", "/v1/local-tools")),
     enable: async (sid) => parseSpace(await call("POST", `${seg(sid)}/enable`, {})),
-    disable: async (sid) => parseSpace(await call("POST", `${seg(sid)}/disable`, {})),
+    // Do not send a confirmation to an older unguarded handler.
+    disable: async (target) => parseSpace(await call("POST", `${seg(target.spaceId)}/disable-if-current`, {
+      account_id: target.accountId, pairing_revision: target.revision,
+    })),
   };
 }
 
@@ -135,6 +144,7 @@ export const localTools = signal<LocalToolsStatus | null>(null);
 export const localToolsBusy = signal<null | "enable" | "disable">(null);
 export const localToolsError = signal<string | null>(null);
 export const localToolsNotice = signal<string | null>(null);
+let statusSeq = 0;
 
 /** The entry for one Space, or null when local tools are off for it. */
 export function localToolsFor(spaceId: string | undefined): LocalToolsSpace | null {
@@ -147,54 +157,67 @@ function message(error: unknown, what: string): string {
   return `${what} didn't work.`;
 }
 
-function merge(entry: LocalToolsSpace) {
-  const cur = localTools();
-  if (!cur) return;
-  const others = cur.spaces.filter((s) => s.spaceId !== entry.spaceId);
-  localTools.set({ ...cur, spaces: entry.state === "off" ? others : [...others, entry] });
-}
-
-/** Re-reads the bridge's local tools status. Never throws. */
-export async function loadLocalTools(): Promise<void> {
+/** Only an authoritative GET may publish status, in the shared read order. */
+export async function loadLocalTools(spaceId: string, stillOpen: () => boolean): Promise<LocalToolsStatus | undefined> {
   if (!client) return;
+  const live = sessionGuard(spaceId);
+  const seq = ++statusSeq;
+  const latest = () => seq === statusSeq && live() && stillOpen();
   try {
-    localTools.set(await client.status());
+    const next = await client.status();
+    if (!latest()) return;
+    localTools.set(next);
+    return next;
   } catch {
     // Unknown means hidden: the card never guesses.
-    localTools.set(null);
+    if (latest()) localTools.set(null);
   }
 }
 
-export async function enableLocalTools(spaceId: string): Promise<void> {
-  if (!client || localToolsBusy()) return;
-  localToolsBusy.set("enable");
-  localToolsError.set(null);
-  localToolsNotice.set(null);
-  try {
-    merge(await client.enable(spaceId));
-    localToolsNotice.set("Local tools are on for this Space.");
-  } catch (error) {
-    localToolsError.set(message(error, "Turning on local tools"));
-  } finally {
-    localToolsBusy.set(null);
-    void loadSpaceRunner(spaceId);
-  }
+export async function enableLocalTools(spaceId: string, stillOpen: () => boolean, onAck: () => void): Promise<void> {
+  if (client) await changeLocalTools("enable", spaceId, stillOpen, () => client!.enable(spaceId), onAck);
 }
 
-export async function disableLocalTools(spaceId: string): Promise<void> {
-  if (!client || localToolsBusy()) return;
-  localToolsBusy.set("disable");
+export async function disableLocalTools(target: LocalToolsDisableTarget, stillOpen: () => boolean, onAck: () => void): Promise<void> {
+  if (client) await changeLocalTools("disable", target.spaceId, stillOpen, () => client!.disable(target), onAck);
+}
+
+async function changeLocalTools(
+  action: "enable" | "disable",
+  spaceId: string,
+  stillOpen: () => boolean,
+  write: () => Promise<LocalToolsSpace>,
+  onAck: () => void,
+) {
+  if (!stillOpen() || localToolsBusy()) return;
+  const live = sessionGuard(spaceId);
+  const onPage = () => live() && stillOpen();
+  const session = sessionGuard();
+  statusSeq++;
+  localToolsBusy.set(action);
   localToolsError.set(null);
   localToolsNotice.set(null);
   try {
-    const entry = await client.disable(spaceId);
-    merge(entry);
-    localToolsNotice.set(entry.detail ?? "Local tools are off. The files in the folder stay on this computer.");
+    const receipt = await write();
+    if (!live() || receipt.spaceId !== spaceId) return;
+    if (receipt.state === (action === "enable" ? "on" : "off")) onAck();
+    // An acknowledgement can be delayed across replacement or page reopen.
+    // Only the originating page can publish bridge-status feedback.
+    if (!onPage()) return;
+    const current = await loadLocalTools(spaceId, onPage);
+    if (!onPage() || !current?.available || localTools() !== current) return;
+    const entry = current.spaces.find((s) => s.spaceId === spaceId);
+    if (action === "enable" && entry?.state === "on" && entry.pairingRevision === receipt.pairingRevision) {
+      localToolsNotice.set("Local tools are on for this Space.");
+    } else if (action === "disable" && !entry) {
+      localToolsNotice.set(receipt.detail ?? "Local tools are off. The files in the folder stay on this computer.");
+    }
   } catch (error) {
-    localToolsError.set(message(error, "Turning off local tools"));
+    if (!onPage()) return;
+    localToolsError.set(message(error, action === "enable" ? "Turning on local tools" : "Turning off local tools"));
+    if (error instanceof BridgeError && error.code === "pairing_changed") await loadLocalTools(spaceId, onPage);
   } finally {
-    localToolsBusy.set(null);
-    void loadSpaceRunner(spaceId);
+    if (session()) localToolsBusy.set(null);
   }
 }
 
@@ -213,12 +236,14 @@ let pollGen = 0;
  */
 export function followStarting(spaceId: string, stillValid: () => boolean): () => void {
   const gen = ++pollGen;
+  const scope = sessionGuard(spaceId);
   let timer: number | undefined;
   let left = STARTING_POLL_MAX;
-  const live = () => gen === pollGen && stillValid();
+  const live = () => gen === pollGen && scope() && stillValid();
   const tick = async () => {
     timer = undefined;
     if (!client || !live() || left-- <= 0) return;
+    const seq = ++statusSeq;
     let next: LocalToolsStatus;
     try {
       next = await client.status();
@@ -226,8 +251,8 @@ export function followStarting(spaceId: string, stillValid: () => boolean): () =
       return; // unknown: stop; the next visit reads again
     }
     if (!live()) return;
-    localTools.set(next);
-    const e = next.spaces.find((s) => s.spaceId === spaceId);
+    if (seq === statusSeq) localTools.set(next);
+    const e = localToolsFor(spaceId);
     if (e && e.state === "on" && e.worker === "starting") timer = setTimeout(() => void tick(), STARTING_POLL_MS);
   };
   timer = setTimeout(() => void tick(), STARTING_POLL_MS);
@@ -241,3 +266,9 @@ export function clearLocalToolsMessages() {
   localToolsError.set(null);
   localToolsNotice.set(null);
 }
+
+onSessionEnd(() => {
+  localTools.set(null);
+  localToolsBusy.set(null);
+  clearLocalToolsMessages();
+});

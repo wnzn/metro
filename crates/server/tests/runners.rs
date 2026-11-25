@@ -19,6 +19,211 @@ const BOB: &str = "bob-token";
 const CAROL: &str = "carol-token";
 const PROTOCOL: &str = "X-Metro-Runner-Protocol";
 
+#[tokio::test]
+async fn guarded_detach_rejects_replacement_aba_and_dedicated_rotation() {
+    let s = Server::start().await;
+    let a = s.space(ALICE, "Guarded").await;
+    let b = s.space(ALICE, "Unchanged sibling").await;
+    s.add(ALICE, &a, "bob").await;
+    let (first, _) = s.register(ALICE, "First", "personal").await;
+    let (second, _) = s.register(ALICE, "Second", "personal").await;
+    assert_eq!(s.attach_if_empty(ALICE, &a, &first).await.0, StatusCode::OK);
+    assert_eq!(
+        s.attach_if_empty(ALICE, &b, &second).await.0,
+        StatusCode::OK
+    );
+    let first_revision = s.runner_snapshot(ALICE, &a).await["assignment_revision"].clone();
+    assert!(first_revision.is_string());
+    assert!(
+        s.runner_snapshot(BOB, &a)
+            .await
+            .get("assignment_revision")
+            .is_none()
+    );
+    assert_eq!(
+        s.guarded_detach(BOB, &a, &first_revision).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        s.guarded_detach(CAROL, &a, &first_revision).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &json!(1)).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &json!("01")).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    // Old clients may still replace a registered runner using PUT.
+    assert_eq!(s.attach(ALICE, &a, &second).await.0, StatusCode::OK);
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &first_revision).await,
+        StatusCode::CONFLICT
+    );
+    let replacement = s.runner_snapshot(ALICE, &a).await;
+    assert_eq!(replacement["runner"]["id"], second);
+    let second_revision = &replacement["assignment_revision"];
+    let legacy = format!("/v1/spaces/{a}/runner");
+
+    // Same runner id, different assignment (including detach by an old client).
+    assert_eq!(s.delete(ALICE, &legacy).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.attach_if_empty(ALICE, &a, &second).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, second_revision).await,
+        StatusCode::CONFLICT
+    );
+    let reattached = s.runner_snapshot(ALICE, &a).await;
+    assert_eq!(reattached["runner"]["id"], second);
+    assert_ne!(&reattached["assignment_revision"], second_revision);
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &reattached["assignment_revision"])
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(s.runner_snapshot(ALICE, &b).await["runner"]["id"], second);
+
+    // A registered confirmation cannot remove a later dedicated pairing,
+    // and a dedicated confirmation cannot revoke a rotated credential.
+    assert_eq!(s.dedicated_token(ALICE, &a).await.0, StatusCode::OK);
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &reattached["assignment_revision"])
+            .await,
+        StatusCode::CONFLICT
+    );
+    let dedicated = s.runner_snapshot(ALICE, &a).await;
+    assert_eq!(dedicated["runner"]["kind"], "dedicated");
+    assert_eq!(s.dedicated_token(ALICE, &a).await.0, StatusCode::OK);
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &dedicated["assignment_revision"])
+            .await,
+        StatusCode::CONFLICT
+    );
+    let rotated = s.runner_snapshot(ALICE, &a).await;
+    assert_eq!(rotated["runner"]["kind"], "dedicated");
+    assert!(rotated.get("token").is_none());
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &rotated["assignment_revision"])
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    let empty = s.runner_snapshot(ALICE, &a).await;
+    assert!(empty["runner"].is_null());
+    assert!(empty.get("assignment_revision").is_none());
+}
+
+#[tokio::test]
+async fn guarded_dedicated_issue_and_rotate_require_the_current_assignment() {
+    let s = Server::start().await;
+    let sid = s.space(ALICE, "Guarded dedicated").await;
+    s.add(ALICE, &sid, "bob").await;
+    let base = format!("/v1/spaces/{sid}/runner-token");
+    let issue = format!("{base}/issue-if-empty");
+    let rotate = format!("{base}/rotate-if-current");
+    let assignment = s.runner_snapshot(ALICE, &sid).await;
+    assert!(assignment["runner"].is_null());
+    assert_eq!(assignment["guarded_token_changes"], true);
+    assert!(
+        s.runner_snapshot(BOB, &sid)
+            .await
+            .get("guarded_token_changes")
+            .is_none()
+    );
+    assert_eq!(
+        s.post(BOB, &issue, json!({})).await.0,
+        StatusCode::FORBIDDEN
+    );
+
+    // Pair after the new UI saw an empty Space, before its issue request.
+    let (runner, _) = s.register(ALICE, "Registered", "personal").await;
+    assert_eq!(
+        s.attach_if_empty(ALICE, &sid, &runner).await.0,
+        StatusCode::OK
+    );
+    let attached = s.runner_snapshot(ALICE, &sid).await;
+    let (status, body) = s.post(ALICE, &issue, json!({})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(body.get("token").is_none());
+    assert_eq!(
+        s.post(
+            ALICE,
+            &rotate,
+            json!({"assignment_revision": attached["assignment_revision"]})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(s.runner_snapshot(ALICE, &sid).await["runner"]["id"], runner);
+    assert_eq!(
+        s.guarded_detach(ALICE, &sid, &attached["assignment_revision"])
+            .await,
+        StatusCode::NO_CONTENT
+    );
+
+    let receipt = s
+        .http
+        .post(format!("{}{issue}", s.base))
+        .bearer_auth(ALICE)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(receipt.status(), StatusCode::OK);
+    assert_eq!(receipt.headers()["cache-control"], "no-store");
+    let receipt: Value = receipt.json().await.unwrap();
+    assert!(receipt["token"].is_string());
+    let issued_revision = receipt["assignment_revision"].clone();
+    assert_eq!(
+        s.runner_snapshot(ALICE, &sid).await["assignment_revision"],
+        issued_revision
+    );
+    assert_eq!(
+        s.post(ALICE, &issue, json!({})).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        s.runner_snapshot(ALICE, &sid).await["assignment_revision"],
+        issued_revision
+    );
+
+    let request = json!({"assignment_revision": issued_revision});
+    let (status, rotated) = s.post(ALICE, &rotate, request.clone()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(rotated["token"].is_string());
+    assert_ne!(rotated["assignment_revision"], issued_revision);
+    let (status, rejected) = s.post(ALICE, &rotate, request).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert!(rejected.get("token").is_none());
+    let current_revision = &rotated["assignment_revision"];
+    assert_eq!(
+        s.runner_snapshot(ALICE, &sid).await["assignment_revision"],
+        *current_revision
+    );
+
+    // A revoke makes the old rotate request stale and cannot recreate a token.
+    assert_eq!(
+        s.guarded_detach(ALICE, &sid, current_revision).await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        s.post(
+            ALICE,
+            &rotate,
+            json!({"assignment_revision": current_revision})
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert!(s.runner_snapshot(ALICE, &sid).await["runner"].is_null());
+}
+
 struct FakeAuth(HashMap<String, UserIdentity>);
 
 impl HumanAuth for FakeAuth {
@@ -172,6 +377,38 @@ impl Server {
         .await
     }
 
+    async fn attach_if_empty(&self, owner: &str, space: &str, runner: &str) -> (StatusCode, Value) {
+        self.post(
+            owner,
+            &format!("/v1/spaces/{space}/runner/attach-if-empty"),
+            json!({"runner_id": runner}),
+        )
+        .await
+    }
+
+    async fn runner_snapshot(&self, user: &str, sid: &str) -> Value {
+        let response = self
+            .http
+            .get(format!("{}/v1/spaces/{sid}/runner", self.base))
+            .bearer_auth(user)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        response.json().await.unwrap()
+    }
+
+    async fn guarded_detach(&self, user: &str, sid: &str, revision: &Value) -> StatusCode {
+        self.post(
+            user,
+            &format!("/v1/spaces/{sid}/runner/detach-if-current"),
+            json!({"assignment_revision": revision}),
+        )
+        .await
+        .0
+    }
+
     async fn demo(&self, token: &str, space: &str) -> StatusCode {
         self.post(
             token,
@@ -244,6 +481,65 @@ impl Server {
         }
         panic!("no matching event in {space}");
     }
+}
+
+#[tokio::test]
+async fn empty_only_attachment_preserves_the_winner_and_dedicated_pairing() {
+    let s = Server::start().await;
+    let space = s.space(ALICE, "Concurrent").await;
+    s.add(ALICE, &space, "bob").await;
+    let (local, _) = s.register(ALICE, "Desktop", "personal").await;
+    let (org, _) = s.register(CAROL, "Shared", "organization").await;
+    let (bobs, _) = s.register(BOB, "Bob's", "personal").await;
+    let path = format!("/v1/spaces/{space}/runner");
+    assert_eq!(s.get(ALICE, "/v1/runners").await.1["attach_if_empty"], true);
+    assert_eq!(s.get(ALICE, &path).await.1["runner"], Value::Null);
+    assert_eq!(
+        s.attach_if_empty(BOB, &space, &org).await.0,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        s.attach_if_empty(CAROL, &space, &org).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s.attach_if_empty(ALICE, &space, &bobs).await.0,
+        StatusCode::NOT_FOUND
+    );
+
+    let (left, right) = tokio::join!(
+        s.attach_if_empty(ALICE, &space, &local),
+        s.attach_if_empty(ALICE, &space, &org)
+    );
+    let winner = match (left.0, right.0) {
+        (StatusCode::OK, StatusCode::CONFLICT) => &local,
+        (StatusCode::CONFLICT, StatusCode::OK) => &org,
+        _ => panic!("expected exactly one attachment"),
+    };
+    assert_eq!(s.get(ALICE, &path).await.1["runner"]["id"], *winner);
+    assert_eq!(
+        s.attach_if_empty(ALICE, &space, winner).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(s.get(ALICE, &path).await.1["runner"]["id"], *winner);
+    let replacement = if *winner == local { &org } else { &local };
+    assert_eq!(s.attach(ALICE, &space, replacement).await.0, StatusCode::OK);
+    assert_eq!(s.get(ALICE, &path).await.1["runner"]["id"], *replacement);
+
+    let dedicated_space = s.space(ALICE, "Dedicated").await;
+    let dedicated = format!("/v1/spaces/{dedicated_space}/runner");
+    assert_eq!(s.get(ALICE, &dedicated).await.1["runner"], Value::Null);
+    // Dedicated pairing can also win after a successful empty read.
+    let (status, _) = s.dedicated_token(ALICE, &dedicated_space).await;
+    assert!(status.is_success());
+    assert_eq!(
+        s.attach_if_empty(ALICE, &dedicated_space, &local).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        s.get(ALICE, &dedicated).await.1["runner"]["kind"],
+        "dedicated"
+    );
 }
 
 fn ids(body: &Value) -> Vec<String> {
@@ -321,7 +617,7 @@ async fn personal_runners_are_private_to_their_owner() {
         .await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
-        body["runner"],
+        without_update_fields(&body["runner"]),
         json!({"id": mine, "name": "alice laptop", "visibility": "personal", "kind": "registered"})
     );
     assert_eq!(
@@ -384,7 +680,7 @@ async fn organization_runners_are_managed_by_admins_and_attachable_by_space_owne
     let (org, _) = s.register(CAROL, "build farm", "organization").await;
     let (_, body) = s.get(ALICE, "/v1/runners").await;
     assert_eq!(
-        body["runners"],
+        without_update_fields(&body["runners"]),
         json!([{"id": org, "name": "build farm", "visibility": "organization", "can_manage": false}])
     );
     assert_eq!(
@@ -551,7 +847,7 @@ async fn detach_and_reassign_cancel_in_flight_jobs() {
         StatusCode::NOT_FOUND
     );
     let (_, body) = s.get(ALICE, &format!("/v1/spaces/{a}/runner")).await;
-    assert_eq!(body, json!({"runner": null}));
+    assert_eq!(body, json!({"runner": null, "guarded_token_changes": true}));
     assert_eq!(s.demo(ALICE, &a).await, StatusCode::CONFLICT);
     // Detaching again is a no-op.
     assert_eq!(
@@ -613,7 +909,7 @@ async fn rotation_and_deletion_revoke_the_token() {
         StatusCode::UNAUTHORIZED
     );
     let (_, body) = s.get(ALICE, &format!("/v1/spaces/{a}/runner")).await;
-    assert_eq!(body, json!({"runner": null}));
+    assert_eq!(body, json!({"runner": null, "guarded_token_changes": true}));
     let (_, body) = s.get(ALICE, "/v1/runners").await;
     assert!(ids(&body).is_empty());
     assert_eq!(
@@ -702,4 +998,23 @@ async fn attachments_survive_a_restart() {
     s.demo(ALICE, &a).await;
     let job = s.claim(&token, Some("2")).await;
     assert_eq!(job["space_id"], a.as_str());
+}
+
+/// A runner view without the display-only `presence` and `update` objects
+/// (covered in tests/updates.rs), which must be present on every view.
+fn without_update_fields(v: &Value) -> Value {
+    match v {
+        Value::Array(items) => Value::Array(items.iter().map(without_update_fields).collect()),
+        Value::Object(map) => {
+            assert!(
+                map["presence"].is_object() && map["update"].is_object(),
+                "{v}"
+            );
+            let mut map = map.clone();
+            map.remove("presence");
+            map.remove("update");
+            Value::Object(map)
+        }
+        other => other.clone(),
+    }
 }

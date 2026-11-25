@@ -1,0 +1,14 @@
+f422bf6c97f41edbc57eb56180c5555b899fa407d24fc2b46bd2b4380b8007c9  IMAGES.txt
+20b5e7aff09280ab68abf68f9c98c9bd2c6bd50e48542236da785d966c60d854  Metro-0.4.0-linux-x64.tar.gz
+8ec8bc4de2ebbd9880d6cd3cbf64bc4e88401d868512e466b2531f1c25b95e1a  Metro-0.4.0-linux-x64.tar.gz.sha256
+f6691cfef9698b541da86d50d475a199bdecb334cac6f28d460a4af90d197188  Metro-0.4.0-windows-x64.unsigned-preview.msi
+3da10c1664dd425498875ce592ebd16d17554afda493ebab178077967fe2346e  Metro-0.4.0-windows-x64.unsigned-preview.msi.sha256
+92919e7ffaa356f6cedc305550aaab4fe0c3d569407c2d2afea3550e894d1f5c  Metro-0.4.0-windows-x64.zip
+c633a573fae29fe14c5c99a7f8df2f4385977d9b5fdf8c8847eefb00143176a8  Metro-0.4.0-windows-x64.zip.sha256
+0b854daa06511982f6ce846b8b669a05954623dc7897960cff37ac14ca0f5ae1  Metro-runner-0.4.0-linux-x64.tar.gz
+1a49b3aa2c914ef133f51197a5f293e30da657a064995b78e370b95cf3a6dce1  Metro-runner-0.4.0-linux-x64.tar.gz.sha256
+cb8f20d182a91d9f0f6e1dfa87aa29a9be840389e8e04f162e980f818eccc06b  install-metro-linux.sh
+e5fd7921bfcb8272aff36e338c945355c5d940073f90090d4519f49760c3ad8f  install-metro-runner-linux.sh
+e1bb5362e034d10b0f2ffd7a22bd9f4957382b92488d258ab7b2f6b31989d6ca  install-metro-windows.ps1
+4b4dea074c582eaeda8dbf13a6cf1b6f4c751b1886aee1264b34bcda9efadc57  metro-runner-container.ps1
+480f96a4d364404a7ee0fcd7ab03eb8166734f5d5ed65abc09635047eaf387d1  metro-runner-container.sh

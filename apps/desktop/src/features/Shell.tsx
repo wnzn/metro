@@ -1,9 +1,10 @@
-import { cleanup, keymap } from "nsh";
-import { mainPlace, openSettings, view } from "../store";
+import { cleanup, effect, keymap, untracked } from "nsh";
+import { mainPlace, me, openSettings, spaces } from "../store";
+import { refreshPages } from "../pagesState";
 import { CenteredToolbar, Column, compactWidth, modalOpen, navigationPanel, PanelToggle, Surface } from "../ui";
 import { ChatView } from "./ChatView";
 import { LibraryHome } from "./library/LibraryView";
-import { ManageSpace } from "./ManageSpace";
+import { PagesView } from "./pages/PagesView";
 import { ScheduledTasksView } from "./ScheduledTasksView";
 import { SearchView } from "./SearchView";
 import { SettingsModal } from "./SettingsView";
@@ -17,7 +18,7 @@ import { TopSearch } from "./TopSearch";
  * on a narrow window), then the main panel: one header row (the sidebar's
  * toggle, a room's breadcrumb and actions, the search box, which mod+k
  * focuses), under it the Chat, Library, Search, Scheduled
- * tasks, or a Space's room or its management. Settings opens as a modal over
+ * tasks, or a Space's room. Settings opens as a modal over
  * all of it and leaves the main panel mounted, so closing it returns to the
  * same place, draft and scroll.
  */
@@ -29,8 +30,18 @@ export function Shell() {
   } catch {
     /* a platform that keeps this keystroke: the sidebar's Settings still opens it */
   }
+  let lastPagesScope = "";
+  effect(() => {
+    const scope = JSON.stringify([me(), mainPlace() === "pages", ...spaces().map(s => s.id).sort()]);
+    if (scope !== lastPagesScope) {
+      lastPagesScope = scope;
+      if (me()) untracked(() => void refreshPages());
+    }
+  });
   // A Space's room puts its breadcrumb and actions in the same header row.
-  const inRoom = () => mainPlace() === "space" && view() !== "manage";
+  const inRoom = () => mainPlace() === "space";
+  // Construct one Pages route owner. The owner mounts just the active slot.
+  const pagesPane = <PagesView />;
   return (
     <Surface variant="app" testID="workspace">
       <Sidebar mode={navigationPanel.open() ? "full" : compactWidth() ? "hidden" : "rail"} />
@@ -55,13 +66,12 @@ export function Shell() {
         <If when={mainPlace() === "search"}>
           <SearchView />
         </If>
+        {pagesPane}
         <If when={mainPlace() === "schedules"}>
           <ScheduledTasksView />
         </If>
         <If when={mainPlace() === "space"}>
-          <If when={view() === "manage"} else={<SpaceView />}>
-            <ManageSpace />
-          </If>
+          <SpaceView />
         </If>
       </Column>
       <SettingsModal />

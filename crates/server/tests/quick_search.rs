@@ -138,7 +138,11 @@ impl App {
 
     async fn chat(&self, who: &str, text: &str) {
         let (s, v) = self
-            .post(who, "/v1/chat/messages", json!({"text": text}))
+            .post(
+                who,
+                "/v1/chat/messages",
+                json!({"text": text, "save_note": true}),
+            )
             .await;
         assert!(s.is_success(), "{s} {v}");
     }

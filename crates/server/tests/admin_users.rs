@@ -17,6 +17,114 @@ use serde_json::{Value, json};
 const JM: &str = "jm-dev-token-0000000000000001";
 const BOB: &str = "bob-dev-token-000000000000002";
 
+#[tokio::test]
+async fn organization_settings_are_bearer_admin_only_and_persist() {
+    use reqwest::Method;
+
+    const SETTINGS: &str = "/v1/admin/settings";
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("settings.sqlite");
+    let s = Server::dev(Db::open(&path).unwrap()).await;
+    let default = json!({"pages_per_space": 50, "versions_per_page": 200});
+    assert_eq!(s.get(JM, SETTINGS).await, (StatusCode::OK, default.clone()));
+
+    for method in [Method::GET, Method::PATCH] {
+        let (status, headers, _) = s.send(method.clone(), None, SETTINGS, None).await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED);
+        assert_eq!(headers["www-authenticate"], "Bearer");
+        let (status, _, _) = s.send(method, Some(BOB), SETTINGS, None).await;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+    }
+    for body in [
+        json!({"pages_per_space": 0}),
+        json!({"pages_per_space": 501}),
+        json!({"versions_per_page": 1}),
+        json!({"versions_per_page": 1001, "pages_per_space": 500}),
+    ] {
+        let (status, _) = s.call(Method::PATCH, JM, SETTINGS, Some(body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+    for body in [
+        json!({"pages_per_space": null}),
+        json!({"pages_per_space": 2.5}),
+        json!({"versions_per_page": "200"}),
+        json!({"unrecognized": 100}),
+    ] {
+        let (status, _) = s.call(Method::PATCH, JM, SETTINGS, Some(body)).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    }
+    assert_eq!(s.get(JM, SETTINGS).await, (StatusCode::OK, default.clone()));
+    assert_eq!(
+        s.call(
+            Method::PATCH,
+            JM,
+            SETTINGS,
+            Some(json!({"pages_per_space": 500})),
+        )
+        .await,
+        (
+            StatusCode::OK,
+            json!({"pages_per_space": 500, "versions_per_page": 200})
+        )
+    );
+    let changed = json!({"pages_per_space": 500, "versions_per_page": 2});
+    assert_eq!(
+        s.call(
+            Method::PATCH,
+            JM,
+            SETTINGS,
+            Some(json!({"versions_per_page": 2}))
+        )
+        .await,
+        (StatusCode::OK, changed.clone())
+    );
+    let page_body = json!({
+        "scope": "personal",
+        "source": "export default <Page title=\"Existing page\" />"
+    });
+    let (status, existing_page) = s.post(BOB, "/v1/pages", page_body.clone()).await;
+    assert_eq!(status, StatusCode::CREATED);
+    let changed = json!({"pages_per_space": 1, "versions_per_page": 2});
+    assert_eq!(
+        s.call(
+            Method::PATCH,
+            JM,
+            SETTINGS,
+            Some(json!({"pages_per_space": 1})),
+        )
+        .await,
+        (StatusCode::OK, changed.clone())
+    );
+    // An independently reopened DB must see the same values, with no
+    // on-disk defaults replacing them on initialization.
+    let reopened = Server::dev(Db::open(&path).unwrap()).await;
+    assert_eq!(reopened.get(JM, SETTINGS).await, (StatusCode::OK, changed));
+    let existing_path = format!("/v1/pages/{}", existing_page["id"].as_str().unwrap());
+    assert_eq!(reopened.get(BOB, &existing_path).await.0, StatusCode::OK);
+    assert_eq!(
+        reopened.get(JM, &existing_path).await.0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        reopened.post(BOB, "/v1/pages", page_body.clone()).await.0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(
+        reopened.post(JM, "/v1/pages", page_body).await.0,
+        StatusCode::CREATED
+    );
+
+    // Settings are also available to an OIDC subject listed in org admins;
+    // they do not depend on the managed-user (dev only) admin API.
+    let oidc = Server::start_with(
+        config(&["jm"]),
+        Db::open_in_memory().unwrap(),
+        Arc::new(OidcAuth),
+    )
+    .await;
+    assert_eq!(oidc.get(JM, SETTINGS).await, (StatusCode::OK, default));
+}
+
 fn config(admins: &[&str]) -> Config {
     Config {
         bind: "127.0.0.1:0".parse().unwrap(),

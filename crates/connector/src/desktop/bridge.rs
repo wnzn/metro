@@ -243,6 +243,7 @@ fn router(ctx: Arc<Ctx>) -> Router {
         .route("/v1/status", get(status))
         .route("/v1/monitoring/events", get(monitoring_events))
         .route("/v1/session", post(session_open).delete(session_close))
+        .route("/v1/session/intent", post(intent_open).delete(intent_close))
         .route("/v1/connections/{id}/pair", post(pair))
         .route("/v1/connections/{id}/rotate", post(rotate))
         .route(
@@ -258,7 +259,25 @@ fn router(ctx: Arc<Ctx>) -> Router {
         .route("/v1/connections/{id}/models", put(models))
         .route("/v1/connections/{id}/endpoint", put(endpoint))
         .route("/v1/connections/{id}/forget", post(forget))
+        .route("/v1/web-search", get(web_state).put(web_update))
+        .route(
+            "/v1/web-search/providers/{id}/key",
+            put(web_key_set).delete(web_key_delete),
+        )
+        .route("/v1/web-search/keys/reset", post(web_reset_keys))
+        .route("/v1/web-search/providers/{id}/test", post(web_test))
+        .route(
+            "/v1/web-search/providers/{id}/clear-cooldown",
+            post(web_clear_cooldown),
+        )
         .route("/v1/local-workspace/open", post(local_open))
+        .route("/v1/update", get(update_state))
+        .route("/v1/update/check", post(update_check))
+        .route("/v1/update/settings", put(update_settings))
+        .route("/v1/update/download", post(update_download))
+        .route("/v1/update/apply", post(update_apply))
+        .route("/v1/update/cancel", post(update_cancel))
+        .route("/v1/update/started", post(update_started))
         .route("/v1/local-tools", any(tools))
         .route("/v1/local-tools/{*rest}", any(tools))
         .fallback(|| async { err(404, "not_found", "No such bridge endpoint").into_response() })
@@ -308,6 +327,8 @@ async fn monitoring_events(State(ctx): State<Arc<Ctx>>) -> Response {
 struct SessionBody {
     server_url: String,
     session_token: String,
+    #[serde(default)]
+    intent: Option<String>,
 }
 
 async fn session_open(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
@@ -316,8 +337,41 @@ async fn session_open(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
         Err(e) => return e.into_response(),
     };
     let token = Secret::new(std::mem::take(&mut parsed.session_token));
-    match ctx.desktop.open_session(&parsed.server_url, token).await {
+    match ctx
+        .desktop
+        .open_session(&parsed.server_url, token, parsed.intent.as_deref())
+        .await
+    {
         Ok(v) => ok(v),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IntentBody {
+    intent: String,
+}
+
+async fn intent_open(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    if let Err(e) = body::<Empty>(&b) {
+        return e.into_response();
+    }
+    match random_token() {
+        Ok(id) => {
+            ctx.desktop.intents.reserve(id.expose().to_owned());
+            ok(json!({"intent": id.expose()}))
+        }
+        Err(_) => err(500, "local_error", "Cannot prepare device sign-in").into_response(),
+    }
+}
+
+async fn intent_close(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    match body::<IntentBody>(&b) {
+        Ok(req) => {
+            ctx.desktop.intents.cancel(&req.intent);
+            StatusCode::NO_CONTENT.into_response()
+        }
         Err(e) => e.into_response(),
     }
 }
@@ -409,6 +463,98 @@ async fn login_cancel(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Re
     reply(ctx.desktop.cancel_sign_in(&id).await)
 }
 
+// ---------------------------------------------------------------- web search
+
+async fn web_state(State(ctx): State<Arc<Ctx>>) -> Response {
+    reply(ctx.desktop.web_state().await)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebProvider {
+    id: String,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebUpdate {
+    #[serde(default)]
+    enabled: Option<bool>,
+    #[serde(default)]
+    notice_acknowledged: Option<bool>,
+    /// The whole list, in try order.
+    #[serde(default)]
+    providers: Option<Vec<WebProvider>>,
+}
+
+async fn web_update(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    match body::<WebUpdate>(&b) {
+        Ok(u) => reply(
+            ctx.desktop
+                .web_update(
+                    u.enabled,
+                    u.notice_acknowledged,
+                    u.providers
+                        .map(|l| l.into_iter().map(|p| (p.id, p.enabled)).collect()),
+                )
+                .await,
+        ),
+        Err(e) => e.into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebKey {
+    api_key: String,
+}
+
+async fn web_key_set(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>, b: Bytes) -> Response {
+    match body::<WebKey>(&b) {
+        Ok(mut k) => {
+            let key = Secret::new(std::mem::take(&mut k.api_key));
+            reply(ctx.desktop.web_set_key(&id, key).await)
+        }
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn web_reset_keys(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    match body::<Empty>(&b) {
+        Ok(_) => reply(ctx.desktop.web_reset_keys().await),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn web_key_delete(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Response {
+    reply(ctx.desktop.web_delete_key(&id).await)
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebTestBody {
+    session_generation: u64,
+}
+
+async fn web_test(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>, b: Bytes) -> Response {
+    match body::<WebTestBody>(&b) {
+        Ok(test) => reply(ctx.desktop.web_test(&id, test.session_generation).await),
+        Err(e) => e.into_response(),
+    }
+}
+
+async fn web_clear_cooldown(
+    State(ctx): State<Arc<Ctx>>,
+    Path(id): Path<String>,
+    b: Bytes,
+) -> Response {
+    match body::<Empty>(&b) {
+        Ok(_) => reply(ctx.desktop.web_clear_cooldown(&id).await),
+        Err(e) => e.into_response(),
+    }
+}
+
 async fn credentials_delete(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> Response {
     reply(ctx.desktop.delete_credentials(&id).await)
 }
@@ -487,4 +633,140 @@ async fn tools(State(ctx): State<Arc<Ctx>>, req: Request<Body>) -> Response {
     let (status, v) = ctx.desktop.tools_request(m, &path, &bytes).await;
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, axum::Json(v)).into_response()
+}
+
+// ---- updates (see crate::desktop::update) ----
+//
+// A `would_interrupt` refusal of apply is answered from the same state the
+// UI reads: `GET /v1/update` carries `busy` (serving connections, local
+// workspace).
+
+fn updater(ctx: &Ctx) -> Option<&Arc<crate::desktop::update::Updater>> {
+    ctx.desktop.updater()
+}
+
+fn unavailable() -> Response {
+    err(
+        503,
+        "update_unavailable",
+        "Updates are handled by the first Metro window",
+    )
+    .into_response()
+}
+
+fn refusal(r: crate::desktop::update::Refusal) -> Response {
+    err(r.status, r.code, &r.message).into_response()
+}
+
+fn update_view(ctx: &Ctx, u: &crate::desktop::update::Updater) -> Response {
+    ok(u.state(ctx.desktop.update_busy()))
+}
+
+async fn update_state(State(ctx): State<Arc<Ctx>>) -> Response {
+    match updater(&ctx) {
+        Some(u) => update_view(&ctx, u),
+        None => unavailable(),
+    }
+}
+
+async fn update_check(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    if let Err(e) = body::<Empty>(&b) {
+        return error_response(&e);
+    }
+    let u = match updater(&ctx) {
+        Some(u) => u.clone(),
+        None => return unavailable(),
+    };
+    match u.check(true).await {
+        Ok(()) => update_view(&ctx, &u),
+        Err(r) => refusal(r),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateSettings {
+    auto_check: bool,
+}
+
+async fn update_settings(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    let s: UpdateSettings = match body(&b) {
+        Ok(s) => s,
+        Err(e) => return error_response(&e),
+    };
+    match updater(&ctx) {
+        Some(u) => match u.set_auto_check(s.auto_check) {
+            Ok(()) => update_view(&ctx, u),
+            Err(r) => refusal(r),
+        },
+        None => unavailable(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateVersion {
+    version: String,
+}
+
+async fn update_download(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    let v: UpdateVersion = match body(&b) {
+        Ok(v) => v,
+        Err(e) => return error_response(&e),
+    };
+    match updater(&ctx) {
+        Some(u) => match u.start_download(&v.version) {
+            Ok(()) => update_view(&ctx, u),
+            Err(r) => refusal(r),
+        },
+        None => unavailable(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateApply {
+    version: String,
+    #[serde(default)]
+    confirm_interrupt: bool,
+}
+
+async fn update_apply(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    let a: UpdateApply = match body(&b) {
+        Ok(a) => a,
+        Err(e) => return error_response(&e),
+    };
+    match updater(&ctx) {
+        Some(u) => {
+            let busy = ctx.desktop.update_busy();
+            match u.request_apply(&a.version, a.confirm_interrupt, busy) {
+                Ok(()) => update_view(&ctx, u),
+                Err(r) => refusal(r),
+            }
+        }
+        None => unavailable(),
+    }
+}
+
+async fn update_cancel(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    if let Err(e) = body::<Empty>(&b) {
+        return error_response(&e);
+    }
+    match updater(&ctx) {
+        Some(u) => match u.cancel() {
+            Ok(()) => update_view(&ctx, u),
+            Err(r) => refusal(r),
+        },
+        None => unavailable(),
+    }
+}
+
+async fn update_started(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    if let Err(e) = body::<Empty>(&b) {
+        return error_response(&e);
+    }
+    match updater(&ctx) {
+        Some(u) => ok(json!({"trial": u.started()})),
+        None => unavailable(),
+    }
 }

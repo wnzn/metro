@@ -28,7 +28,7 @@ use super::metro_api::{ApiError, MetroApi};
 use super::monitoring::{EventKind, Events};
 use super::store::{self, Binding};
 use crate::metro::MetroClient;
-use crate::netpolicy::validate_base_url;
+use crate::netpolicy::{validate_base_url, validate_server_url};
 use crate::openai_oauth::{self, Endpoints, LoginOptions};
 use crate::profile::{
     DEFAULT_REQUEST_TIMEOUT_SECS, Kind, Profile, ProfileConfig, validate_models,
@@ -72,6 +72,8 @@ mod tests {
             server_url: server.into(),
             account_id: account.into(),
             token: Secret::new("private-token-canary"),
+            epoch: 1,
+            lease: Default::default(),
         });
         let profile = store::profile_for(&root, server, account, connection).unwrap();
         profile
@@ -236,6 +238,10 @@ struct Session {
     server_url: String,
     account_id: String,
     token: Secret,
+    /// Increases with every new binding (sign-in, account switch), never
+    /// with a token refresh of the same binding.
+    epoch: u64,
+    lease: super::session_intent::Lease,
 }
 
 #[derive(Default)]
@@ -247,6 +253,8 @@ struct State {
     /// started before then is aborted, never kept or acted on.
     session_gen: u64,
     next_attempt: u64,
+    /// The last session epoch handed out.
+    session_epoch: u64,
 }
 
 impl State {
@@ -284,6 +292,11 @@ pub struct DesktopConfig {
     /// Opens a sign-in URL in the person's browser.
     pub open_browser: Opener,
     pub oauth_endpoints: Endpoints,
+    /// The update check and in-app update (primary instance only).
+    pub updater: Option<Arc<crate::desktop::update::Updater>>,
+    /// Web search vendor URLs; `None`: the compiled-in vendors (with the
+    /// loopback-only test overrides from the environment).
+    pub web_endpoints: Option<crate::web::Endpoints>,
 }
 
 impl DesktopConfig {
@@ -297,6 +310,8 @@ impl DesktopConfig {
             prepare_wait: PREPARE_WAIT,
             open_browser: Arc::new(open_system_browser),
             oauth_endpoints: Endpoints::openai(),
+            updater: None,
+            web_endpoints: None,
         }
     }
 }
@@ -312,6 +327,7 @@ pub struct Desktop {
     pub(super) events: Events,
     /// Serializes changes (session, pairing, credentials); status never waits on it.
     ops: tokio::sync::Mutex<()>,
+    pub(super) intents: super::session_intent::Intents,
     state: Arc<Mutex<State>>,
     /// Watches a hosted session: stops the tools the moment the local
     /// server no longer runs with the bound URL and bearer.
@@ -320,6 +336,8 @@ pub struct Desktop {
     /// tokens): a session to one of them is only allowed while that server
     /// runs there now with that bearer.
     local_urls: Mutex<std::collections::HashSet<String>>,
+    /// This computer as the signed-in person's web search device.
+    web: super::web::WebSearch,
 }
 
 fn lock(s: &Mutex<State>) -> std::sync::MutexGuard<'_, State> {
@@ -345,10 +363,18 @@ struct Bound {
 
 impl Desktop {
     pub fn new(cfg: DesktopConfig) -> Arc<Self> {
+        let events = Events::new(&cfg.root);
+        let mut web =
+            super::web::WebSearch::new(&cfg.root, cfg.primary, cfg.poll_interval, events.clone());
+        if let Some(e) = cfg.web_endpoints.clone() {
+            web = web.with_endpoints(e);
+        }
         Arc::new(Desktop {
-            events: Events::new(&cfg.root),
+            events,
+            web,
             cfg,
             ops: tokio::sync::Mutex::new(()),
+            intents: Default::default(),
             state: Arc::new(Mutex::new(State::default())),
             monitor: Mutex::new(None),
             local_urls: Mutex::new(Default::default()),
@@ -357,7 +383,7 @@ impl Desktop {
 
     fn session(&self) -> R<(String, String, Secret)> {
         let st = lock(&self.state);
-        match &st.session {
+        match st.session.as_ref().filter(|s| s.lease.live()) {
             Some(s) => Ok((s.server_url.clone(), s.account_id.clone(), s.token.clone())),
             None => Err(err(409, "no_session", "Sign in to a Metro server first")),
         }
@@ -505,12 +531,35 @@ impl Desktop {
 
     // ---------------------------------------------------------------- status
 
+    /// The updater, when this is the primary instance.
+    pub fn updater(&self) -> Option<&Arc<crate::desktop::update::Updater>> {
+        self.cfg.updater.as_ref()
+    }
+
+    /// What a restart for an update would interrupt.
+    pub fn update_busy(&self) -> crate::desktop::update::Busy {
+        let serving_connections = lock(&self.state)
+            .live
+            .values()
+            .filter(|l| matches!(l.worker, WorkerState::Online | WorkerState::Starting))
+            .count();
+        let local_workspace = self
+            .cfg
+            .local
+            .as_ref()
+            .is_some_and(|h| matches!(h.state(), LocalState::Running | LocalState::Starting));
+        crate::desktop::update::Busy {
+            serving_connections,
+            local_workspace,
+        }
+    }
+
     pub async fn status(&self) -> Value {
         let (session, list) = {
             let st = lock(&self.state);
-            match &st.session {
+            match st.session.as_ref().filter(|s| s.lease.live()) {
                 Some(s) => (
-                    json!({"server_url": s.server_url, "account_id": s.account_id}),
+                    json!({"server_url": s.server_url, "account_id": s.account_id, "generation": s.epoch}),
                     Some((s.server_url.clone(), s.account_id.clone())),
                 ),
                 None => (Value::Null, None),
@@ -622,6 +671,13 @@ impl Desktop {
     // ---------------------------------------------------------------- workers
 
     fn spawn_worker(&self, p: Profile, cfg: ProfileConfig, token: Secret) {
+        let lease = {
+            let st = lock(&self.state);
+            let Some(session) = st.session.as_ref().filter(|s| s.lease.live()) else {
+                return;
+            };
+            session.lease.clone()
+        };
         let name = p.name.clone();
         let (tx, rx) = watch::channel(false);
         let epoch = {
@@ -669,13 +725,15 @@ impl Desktop {
                         config: &cfg,
                     };
                     let diagnostics = events.clone();
-                    run_with_failure_observer(
+                    let live = || lease.live();
+                    let run = run_with_failure_observer(
                         &client,
                         &provider,
                         &opts,
                         Arc::new(move |failure| diagnostics.record_chatgpt(failure)),
-                    )
-                    .await
+                        &live,
+                    );
+                    lease.race(run).await.unwrap_or(Stop::Done)
                 }
                 Err(_) => Stop::Fatal("cannot start the HTTP client".into()),
             };
@@ -796,8 +854,8 @@ impl Desktop {
         self: &Arc<Self>,
         server_url: &str,
         session_token: Secret,
+        intent: Option<&str>,
     ) -> R<Value> {
-        let _g = self.ops.lock().await;
         if !self.cfg.primary {
             return Err(err(
                 409,
@@ -805,7 +863,14 @@ impl Desktop {
                 "Another Metro window already serves this device's connections",
             ));
         }
-        let server = validate_base_url(server_url, "server_url")
+        let lease = match intent {
+            Some(id) => self.intents.claim(id)?,
+            None => super::session_intent::Lease::default(),
+        };
+        let _g = lease.race(self.ops.lock()).await?;
+        // The app asked the person before using plain HTTP to a host that is
+        // neither loopback nor Tailscale (apps/desktop/src/plainHttp.ts).
+        let server = validate_server_url(server_url, "server_url")
             .map_err(|e| err(422, "invalid", e.to_string()))?;
         let t = session_token.expose();
         if t.is_empty() || t.len() > 8192 || t.chars().any(|c| c.is_whitespace() || c.is_control())
@@ -814,31 +879,49 @@ impl Desktop {
         }
         self.check_not_stale_local(&server, &session_token)?;
         let api = MetroApi::new(&server, session_token.clone()).map_err(api_err)?;
-        let account = api.me().await.map_err(api_err)?;
+        let account = lease.race(api.me()).await?.map_err(api_err)?;
         let same = {
             let st = lock(&self.state);
-            st.session
-                .as_ref()
-                .is_some_and(|s| s.server_url == server && s.account_id == account)
+            intent.is_none()
+                && st.session.as_ref().is_some_and(|s| {
+                    s.lease.is_legacy() && s.server_url == server && s.account_id == account
+                })
         };
         self.stop_monitor();
         if !same {
+            self.web.session_ended().await;
             self.stop_all().await;
             if let Some(t) = &self.cfg.tools {
                 t.stop_all().await;
             }
         }
-        lock(&self.state).session = Some(Session {
-            server_url: server.clone(),
-            account_id: account.clone(),
-            token: session_token,
-        });
+        let session_token_copy = session_token.clone();
+        lease.check()?;
+        let epoch = {
+            let mut st = lock(&self.state);
+            let epoch = match (&st.session, same) {
+                (Some(s), true) => s.epoch,
+                _ => {
+                    st.session_epoch += 1;
+                    st.session_epoch
+                }
+            };
+            st.session = Some(Session {
+                server_url: server.clone(),
+                account_id: account.clone(),
+                token: session_token,
+                epoch,
+                lease: lease.clone(),
+            });
+            epoch
+        };
         if !same {
             let bound = store::bound_profiles(&self.cfg.root, &server, &account);
             if !bound.is_empty() {
-                match api.connections().await {
+                match lease.race(api.connections()).await? {
                     Ok(conns) => {
                         for (p, b) in bound {
+                            lease.check()?;
                             if conns
                                 .iter()
                                 .any(|(id, pid)| *id == b.connection_id && pid == b.kind.as_str())
@@ -867,18 +950,35 @@ impl Desktop {
                 }
             }
         }
+        lease.check()?;
         if let (Some(t), Some(ctx)) = (&self.cfg.tools, self.session_ctx()) {
             t.session_bound(&ctx).await;
         }
+        lease.check()?;
+        if !same {
+            // Web search is on by default; failures show in its Settings.
+            self.web
+                .session_bound_with_lease(
+                    &server,
+                    &account,
+                    &session_token_copy,
+                    epoch,
+                    lease.clone(),
+                )
+                .await;
+        }
+        lease.check()?;
         self.start_monitor();
         drop(_g);
         Ok(self.status().await)
     }
 
     pub async fn close_session(&self) -> Value {
+        self.intents.cancel_all();
         {
             let _g = self.ops.lock().await;
             self.stop_monitor();
+            self.web.session_ended().await;
             self.stop_all().await;
             if let Some(t) = &self.cfg.tools {
                 t.stop_all().await;
@@ -890,9 +990,15 @@ impl Desktop {
 
     /// App exit: stop everything, forget the session, stop the local workspace.
     pub async fn shutdown(&self) {
+        let _ = self.shutdown_confirmed().await;
+    }
+
+    pub async fn shutdown_confirmed(&self) -> bool {
         self.close_session().await;
         if let Some(h) = &self.cfg.local {
-            h.shutdown().await;
+            h.shutdown_confirmed().await
+        } else {
+            true
         }
     }
 
@@ -1508,6 +1614,93 @@ impl Desktop {
     }
 
     // ---------------------------------------------------------------- local workspace
+
+    // ---------------------------------------------------------------- web search
+
+    /// The bound session with its epoch, read together.
+    fn session_epoch(&self) -> R<(String, String, Secret, u64)> {
+        let st = lock(&self.state);
+        match st.session.as_ref().filter(|s| s.lease.live()) {
+            Some(s) => Ok((
+                s.server_url.clone(),
+                s.account_id.clone(),
+                s.token.clone(),
+                s.epoch,
+            )),
+            None => Err(err(409, "no_session", "Sign in to a Metro server first")),
+        }
+    }
+
+    /// `GET /v1/web-search`.
+    pub async fn web_state(&self) -> R<Value> {
+        let (server, account, _) = self.session()?;
+        self.web.state(&server, &account).await
+    }
+
+    /// `PUT /v1/web-search`.
+    pub async fn web_update(
+        &self,
+        enabled: Option<bool>,
+        notice_acknowledged: Option<bool>,
+        providers: Option<Vec<(String, bool)>>,
+    ) -> R<Value> {
+        let (server, account, token, epoch) = self.session_epoch()?;
+        if !self.cfg.primary && enabled.is_some() {
+            return Err(err(
+                409,
+                "other_instance",
+                "Another Metro window already serves this computer's web search",
+            ));
+        }
+        self.web
+            .update(
+                &server,
+                &account,
+                epoch,
+                &token,
+                enabled,
+                notice_acknowledged,
+                providers,
+            )
+            .await
+    }
+
+    /// `PUT /v1/web-search/providers/{id}/key`.
+    pub async fn web_set_key(&self, id: &str, key: Secret) -> R<Value> {
+        let (server, account, _, epoch) = self.session_epoch()?;
+        self.web.set_key(&server, &account, epoch, id, key).await
+    }
+
+    /// `DELETE /v1/web-search/providers/{id}/key`.
+    pub async fn web_delete_key(&self, id: &str) -> R<Value> {
+        let (server, account, _, epoch) = self.session_epoch()?;
+        self.web.delete_key(&server, &account, epoch, id).await
+    }
+
+    /// `POST /v1/web-search/keys/reset`.
+    pub async fn web_reset_keys(&self) -> R<Value> {
+        let (server, account, _, epoch) = self.session_epoch()?;
+        self.web.reset_keys(&server, &account, epoch).await
+    }
+
+    /// `POST /v1/web-search/providers/{id}/test`.
+    pub async fn web_test(&self, id: &str, expected_generation: u64) -> R<Value> {
+        let (server, account, _, epoch) = self.session_epoch()?;
+        // A delayed loopback request must not adopt the replacement session.
+        // This check uses the same snapshot as the account and server.
+        if epoch != expected_generation {
+            return Err(err(409, "no_session", "The web search session changed"));
+        }
+        self.web.test(&server, &account, epoch, id).await
+    }
+
+    /// `POST /v1/web-search/providers/{id}/clear-cooldown`.
+    pub async fn web_clear_cooldown(&self, id: &str) -> R<Value> {
+        let (server, account, token, epoch) = self.session_epoch()?;
+        self.web
+            .clear_cooldown(&server, &account, epoch, &token, id)
+            .await
+    }
 
     pub async fn open_local(&self) -> R<(String, Secret)> {
         let Some(h) = &self.cfg.local else {

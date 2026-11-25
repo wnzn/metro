@@ -1,0 +1,14 @@
+{
+  "name": "Metro proxy probe",
+  "id": "dev.metro.proxyprobe",
+  "version": "0.0.1",
+  "build": 1,
+  "nsh": ">=0.6, <0.7",
+  "window": { "title": "Proxy probe", "defaultSize": { "width": 640, "height": 400 } },
+  "capabilities": {
+    "network": { "hosts": ["*"] },
+    "process": { "env": ["PROBE_URLS"] },
+    "statusBar": true,
+    "application": true
+  }
+}

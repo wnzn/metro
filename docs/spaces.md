@@ -88,6 +88,11 @@ The live dev service's profile read endpoints were also checked.
   everyone's per-Space preferences, its agents and its monitoring events.
   Its registered runner is detached, and its dedicated runner token is
   revoked, so queued and claimed jobs fail. Its running agent runs stop.
+  In the source, not released, the same transaction also permanently
+  removes the Space's published Pages, their version history,
+  recently deleted Pages, and Space Page drafts, including drafts that
+  had not yet created a page. [Recently deleted](pages.md#deleting-pages-and-spaces)
+  cannot recover them after Space deletion. This is not a 0.4.0 Pages feature.
 - A Space holds at most 100 members and 200 rooms, threads included.
 
 | Request | Who | Result |
@@ -171,7 +176,9 @@ your own, or one shared with this Space or the organization. It's checked
 when you save and again on every run. The order a run's model is chosen in
 is in [settings.md](settings.md#which-model-a-run-uses).
 
-**In the desktop app** (released in 0.4.0), a Space's
+The [unified Space settings](next-source.md#space-settings) and
+[guarded runner changes](next-source.md#guarded-runner-changes) are in
+the source, not released. **In the published 0.4.0 app**, a Space's
 settings window has four pages: **General** (name and description; **Leave
 Space…** for members, **Delete Space…** with the typed name for the owner),
 **Members and runner** (a link to the owner's member and runner
@@ -185,6 +192,12 @@ Space's agents and members: **↑**/**↓** move, **Tab** or **Return**
 inserts, **Esc** closes the list.
 
 ## Messages and addressing
+
+In the source, not released: [desktop mentions](next-source.md#mentions-in-rooms-and-threads),
+[recipient-safe Dispatch and exact-destination Follow up](next-source.md#recipient-safe-dispatch-and-exact-destination-follow-up),
+[private sender notices](next-source.md#private-sender-notices), and the
+[Space send protocol](next-source.md#space-send-protocol-client-developers).
+The following describes 0.4.0.
 
 | You write | Addressed to | Which agent runs |
 | --- | --- | --- |
@@ -309,6 +322,9 @@ A room's agent can delegate work to **child threads** with the tools
 
 ## Personal Chat
 
+The behaviour below is for 0.4.0. [Direct Send and explicit Save note](next-source.md#personal-chat)
+are in the source, not released.
+
 - Every user has a private Chat with the agent. Only that user can see it, and
   it works with zero Spaces.
 - `GET /v1/chat/events?after=<id>` and `POST /v1/chat/messages`
@@ -331,8 +347,9 @@ A room's agent can delegate work to **child threads** with the tools
   tools, and it can't read Space transcripts. Chat never uses a runner, not
   even your personal registered one, and Chat messages are never forwarded
   into a Space.
-- The cross-Space controls in Chat are for you, not the agent: you can list,
-  open, follow up on and stop runs (see [Runs](#runs)). In the desktop app,
+- The cross-Space controls in Chat are for you, not the agent. **Agent runs**
+  lists only Space runs, including threads; you can open, follow up on or
+  stop runs where permitted (see [Runs](#runs)). In the 0.4.0 desktop app,
   **New task** beside Chat's agent runs sends a task right away to the agent
   of a Space and a room or thread you pick explicitly. It shows the
   recipient (*To: agent in Acme › #lobby*) before **Send to agent**, and
@@ -396,6 +413,9 @@ sharing logs. A read names exactly one scope; nothing combines them.
   README](../apps/desktop/README.md#troubleshooting)).
 
 ## Runner pairing
+
+These are the published 0.4.0 routes and behavior. For the source-only
+desktop and revision-checked API, see [Guarded runner changes](next-source.md#guarded-runner-changes).
 
 A Space uses **at most one runner**, and only its owner chooses it. There are
 two kinds, described fully in [runners.md](runners.md):

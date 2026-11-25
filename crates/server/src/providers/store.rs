@@ -3,12 +3,12 @@
 //! row there. The only owner-independent reads are [`find`] and the share
 //! queries, which the access rules in [`super::sharing`] gate.
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::catalog::Capability;
 
 /// A stored connection. `sealed_key` is the encrypted key, never plaintext.
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct Row {
     pub id: String,
     pub user_id: String,
@@ -23,9 +23,11 @@ pub struct Row {
     /// Fixed when the connection is created; rows from before capabilities
     /// existed are `chat`.
     pub capability: Capability,
-    /// Bumped on model changes for search indexes, and on chat credential
-    /// changes so an older authorization or model listing can't be reused.
+    /// Bumped on model or endpoint changes for search indexes, and on chat
+    /// credential changes so an older authorization or listing can't be reused.
     pub config_rev: i64,
+    /// Owner-only compare token, independent of the index fingerprint.
+    pub edit_rev: i64,
 }
 
 impl std::fmt::Debug for Row {
@@ -83,11 +85,25 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
             "ALTER TABLE provider_connections ADD COLUMN config_rev INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
+    if !has("edit_rev")? {
+        conn.execute_batch(
+            "ALTER TABLE provider_connections ADD COLUMN edit_rev INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
     conn.execute_batch(
-        // One default per owner and capability. The old one-per-owner index
-        // is equivalent while every row is `chat`; it is replaced, no row
-        // changes.
-        "DROP INDEX IF EXISTS provider_connections_one_default;
+        // Keep the compare token in step with every row mutation, including
+        // implicit default changes and writes from older clients.
+        "CREATE TRIGGER IF NOT EXISTS provider_connection_edit_rev
+         AFTER UPDATE OF name, provider_id, base_url, model, is_default, sealed_key, capability, config_rev
+         ON provider_connections
+         WHEN OLD.name IS NOT NEW.name OR OLD.provider_id IS NOT NEW.provider_id
+           OR OLD.base_url IS NOT NEW.base_url OR OLD.model IS NOT NEW.model
+           OR OLD.is_default IS NOT NEW.is_default OR OLD.sealed_key IS NOT NEW.sealed_key
+           OR OLD.capability IS NOT NEW.capability OR OLD.config_rev IS NOT NEW.config_rev
+         BEGIN
+             UPDATE provider_connections SET edit_rev = OLD.edit_rev + 1 WHERE id = NEW.id;
+         END;
+         DROP INDEX IF EXISTS provider_connections_one_default;
          CREATE UNIQUE INDEX IF NOT EXISTS provider_connections_one_default_per_capability
              ON provider_connections (user_id, capability) WHERE is_default = 1;
          CREATE TABLE IF NOT EXISTS provider_shares (
@@ -116,7 +132,7 @@ fn now() -> i64 {
 }
 
 const COLUMNS: &str = "id, user_id, name, provider_id, base_url, model, is_default, sealed_key, \
-                       capability, config_rev";
+                       capability, config_rev, edit_rev";
 
 fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
     let capability: String = r.get(8)?;
@@ -137,6 +153,7 @@ fn read(r: &rusqlite::Row<'_>) -> rusqlite::Result<Row> {
             )
         })?,
         config_rev: r.get(9)?,
+        edit_rev: r.get(10)?,
     })
 }
 
@@ -236,59 +253,178 @@ pub fn insert(conn: &mut Connection, row: &Row, max: usize) -> rusqlite::Result<
 
 /// Write `row` back (matched by owner and id), clearing the owner's other
 /// default of the same capability when `row.is_default`. A model change or
-/// a chat credential change bumps `config_rev`. The capability and base URL
-/// never change. `None` when the row no longer exists, otherwise the stored
+/// a chat credential change bumps `config_rev`. This does not write the
+/// capability or base URL. `None` when the row no longer exists, otherwise the stored
 /// `config_rev`.
+///
+/// `row` is written whole, so callers must have read it under the same
+/// database lock (as [`super::models`] does). A change prepared from an
+/// earlier read goes through [`patch`] instead.
 pub fn update(conn: &mut Connection, row: &Row) -> rusqlite::Result<Option<i64>> {
-    let tx = conn.transaction()?;
-    let old_model: Option<String> = tx
-        .query_row(
-            "SELECT model FROM provider_connections WHERE user_id = ?1 AND id = ?2",
-            params![row.user_id, row.id],
-            |r| r.get(0),
-        )
-        .optional()?;
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(old) = get(&tx, &row.user_id, &row.id)? else {
+        return Ok(None);
+    };
+    let rev = write(&tx, &old, row, false)?;
+    tx.commit()?;
+    Ok(Some(rev))
+}
+
+/// The fields one change sets; `None` leaves a field as it is now.
+#[derive(Default)]
+pub struct Patch {
+    pub name: Option<String>,
+    pub model: Option<String>,
+    pub is_default: Option<bool>,
+    /// `Some(None)` removes the key.
+    pub sealed_key: Option<Option<Vec<u8>>>,
+    /// An endpoint the caller has already tested.
+    pub base_url: Option<String>,
+    /// A precondition: the endpoint the caller named, unchanged. The patch
+    /// is saved only while the committed endpoint is still this one, so a
+    /// key or model meant for it never lands on another endpoint.
+    pub base_url_is: Option<String>,
+    pub edit_rev_is: Option<i64>,
+}
+
+impl std::fmt::Debug for Patch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Patch")
+            .field("name", &self.name)
+            .field("model", &self.model)
+            .field("is_default", &self.is_default)
+            .field("sets_key", &self.sealed_key.as_ref().map(Option::is_some))
+            .field("base_url", &self.base_url)
+            .field("base_url_is", &self.base_url_is)
+            .finish()
+    }
+}
+
+/// What [`patch`] did.
+#[derive(Debug)]
+pub enum Patched {
+    /// The stored row after the change.
+    Saved(Row),
+    /// No such connection for that owner.
+    Missing,
+    /// The connection no longer matches the expected snapshot.
+    Changed,
+    /// The change would leave a default connection without a model.
+    DefaultNeedsModel,
+}
+
+/// Apply only the fields `patch` sets to the connection as it is now, in one
+/// immediate transaction: a field the caller didn't set keeps whatever was
+/// committed last, never the caller's earlier read of it.
+///
+/// With `expected`, the change is saved only while the whole row still
+/// equals that snapshot (compare-and-set). A new `base_url` needs it: the
+/// endpoint was tested with the snapshot's key and model.
+pub fn patch(
+    conn: &mut Connection,
+    user_id: &str,
+    id: &str,
+    patch: &Patch,
+    expected: Option<&Row>,
+) -> rusqlite::Result<Patched> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let Some(old) = get(&tx, user_id, id)? else {
+        return Ok(Patched::Missing);
+    };
+    if expected.is_some_and(|expected| expected != &old)
+        || patch.edit_rev_is.is_some_and(|rev| rev != old.edit_rev)
+        || (patch.base_url.is_some() && expected.is_none())
+        || patch
+            .base_url_is
+            .as_ref()
+            .is_some_and(|url| old.base_url.as_ref() != Some(url))
+    {
+        return Ok(Patched::Changed);
+    }
+    let mut row = old.clone();
+    if let Some(name) = &patch.name {
+        row.name = name.clone();
+    }
+    if let Some(model) = &patch.model {
+        row.model = model.clone();
+    }
+    if let Some(flag) = patch.is_default {
+        row.is_default = flag;
+    }
+    if let Some(key) = &patch.sealed_key {
+        row.sealed_key = key.clone();
+    }
+    if let Some(url) = &patch.base_url {
+        row.base_url = Some(url.clone());
+    }
+    if row.is_default && row.model.is_empty() {
+        return Ok(Patched::DefaultNeedsModel);
+    }
+    let endpoint_changed = old.base_url != row.base_url;
+    write(&tx, &old, &row, endpoint_changed)?;
+    let saved = get(&tx, user_id, id)?;
+    tx.commit()?;
+    Ok(saved.map_or(Patched::Missing, Patched::Saved))
+}
+
+/// Write `row` over `old` inside `tx`; the new `config_rev`.
+fn write(
+    tx: &Transaction<'_>,
+    old: &Row,
+    row: &Row,
+    endpoint_changed: bool,
+) -> rusqlite::Result<i64> {
     if row.is_default {
         tx.execute(
             "UPDATE provider_connections SET is_default = 0
              WHERE user_id = ?1 AND capability = ?3 AND is_default = 1 AND id <> ?2",
-            params![row.user_id, row.id, row.capability.as_str()],
+            params![row.user_id, row.id, old.capability.as_str()],
         )?;
     }
-    let rev: Option<i64> = tx
-        .query_row(
-            "UPDATE provider_connections
-             SET name = ?3, is_default = ?5, sealed_key = ?6, updated_at = ?7,
-                  config_rev = config_rev + (model <> ?4
-                      OR (capability = 'chat' AND sealed_key IS NOT ?6)),
-                  model = ?4
-             WHERE user_id = ?1 AND id = ?2
-             RETURNING config_rev",
-            params![
-                row.user_id,
-                row.id,
-                row.name,
-                row.model,
-                row.is_default,
-                row.sealed_key,
-                now()
-            ],
-            |r| r.get(0),
-        )
-        .optional()?;
-    if rev.is_some() {
-        super::models::ensure_enabled(&tx, &row.id, &row.model)?;
-    }
+    let rev: i64 = tx.query_row(
+        "UPDATE provider_connections
+         SET name = ?3, is_default = ?5, sealed_key = ?6, updated_at = ?7,
+              config_rev = config_rev + (model <> ?4
+                  OR (capability = 'chat' AND sealed_key IS NOT ?6)
+                  OR ?8),
+              model = ?4, base_url = ?9
+         WHERE user_id = ?1 AND id = ?2
+         RETURNING config_rev",
+        params![
+            row.user_id,
+            row.id,
+            row.name,
+            row.model,
+            row.is_default,
+            row.sealed_key,
+            now(),
+            endpoint_changed,
+            if endpoint_changed {
+                &row.base_url
+            } else {
+                &old.base_url
+            },
+        ],
+        |r| r.get(0),
+    )?;
+    super::models::ensure_enabled(tx, &row.id, &row.model)?;
     // A media connection that now computes something else: everyone's
     // library vectors built with it are stale, in this same transaction.
     // A rename, default flag or key rotation leaves them valid.
-    if rev.is_some()
-        && old_model.as_deref().is_some_and(|m| m != row.model)
-        && media(&row.provider_id)
+    if (old.model != row.model || endpoint_changed)
+        && let Some(entry) = super::catalog::find(&old.provider_id).filter(|e| e.media_inputs)
     {
-        crate::library_search::hooks::connection_changed(&tx, &row.id)?;
+        // An explicit override equal to the dialect's default is not a
+        // different destination. Do not advance consent for that case.
+        let default = entry.default_base_url.as_deref();
+        if endpoint_changed
+            && old.base_url.as_deref().or(default) != row.base_url.as_deref().or(default)
+        {
+            crate::library_search::hooks::connection_endpoint_changed(tx, &row.id)?;
+        } else {
+            crate::library_search::hooks::connection_changed(tx, &row.id)?;
+        }
     }
-    tx.commit()?;
     Ok(rev)
 }
 
@@ -474,35 +610,47 @@ pub fn is_member(conn: &Connection, space_id: &str, user_id: &str) -> rusqlite::
 /// Space both `caller` and the owner belong to now. `space`: only shares
 /// with that Space (plus organization shares); `None` with `any_space`
 /// false: organization shares only; `None` with `any_space`: any Space.
+/// A Space share includes one matching Space for authorization under this
+/// same DB lock. That witness is never part of the public response.
 pub fn shared_with(
     conn: &Connection,
     caller: &str,
     space: Option<&str>,
     any_space: bool,
-) -> rusqlite::Result<Vec<(Row, Visibility)>> {
+) -> rusqlite::Result<Vec<(Row, Visibility, Option<String>)>> {
     let columns = COLUMNS
         .split(", ")
         .map(|c| format!("c.{c}"))
         .collect::<Vec<_>>()
         .join(", ");
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {columns}, s.visibility FROM provider_connections c
+        "WITH granted_spaces AS (
+             SELECT ss.connection_id, MIN(ss.space_id) AS space_id
+             FROM provider_share_spaces ss
+             JOIN provider_connections pc ON pc.id = ss.connection_id
+             JOIN space_members me ON me.space_id = ss.space_id AND me.user_id = ?1
+             JOIN space_members owner ON owner.space_id = ss.space_id AND owner.user_id = pc.user_id
+             WHERE (?2 IS NOT NULL OR ?3) AND (?2 IS NULL OR ss.space_id = ?2)
+             GROUP BY ss.connection_id
+         )
+         SELECT {columns}, s.visibility AS grant_visibility,
+             CASE WHEN s.visibility = 'spaces' THEN g.space_id END AS granted_space_id
+         FROM provider_connections c
          JOIN provider_shares s ON s.connection_id = c.id
+         LEFT JOIN granted_spaces g ON g.connection_id = c.id
          WHERE c.user_id <> ?1 AND c.model <> '' AND (
              s.visibility = 'organization'
-             OR (s.visibility = 'spaces' AND (?2 IS NOT NULL OR ?3) AND EXISTS (
-                 SELECT 1 FROM provider_share_spaces ss
-                 JOIN space_members me ON me.space_id = ss.space_id AND me.user_id = ?1
-                 JOIN space_members owner ON owner.space_id = ss.space_id
-                      AND owner.user_id = c.user_id
-                 WHERE ss.connection_id = c.id AND (?2 IS NULL OR ss.space_id = ?2)))
-         )
+             OR (s.visibility = 'spaces' AND g.space_id IS NOT NULL))
          ORDER BY c.created_at, c.rowid"
     ))?;
     stmt.query_map(params![caller, space, any_space], |r| {
         let row = read(r)?;
-        let v: String = r.get(10)?;
-        Ok((row, Visibility::parse(&v).unwrap_or(Visibility::Personal)))
+        let v: String = r.get("grant_visibility")?;
+        Ok((
+            row,
+            Visibility::parse(&v).unwrap_or(Visibility::Personal),
+            r.get("granted_space_id")?,
+        ))
     })?
     .collect()
 }

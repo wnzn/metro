@@ -328,7 +328,7 @@ async fn chat_uses_the_chosen_connection_or_the_default_never_another() {
         ),
         // A choice on a message the agent will not answer is not ignored.
         (
-            json!({"text": "just a note", "provider_connection_id": alice_override}),
+            json!({"text": "just a note", "provider_connection_id": alice_override, "invoke_agent": false}),
             StatusCode::BAD_REQUEST,
         ),
         (

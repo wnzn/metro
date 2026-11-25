@@ -6,6 +6,7 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { discoveryWorld } from "./test/fixtures";
+import { launched } from "../../../test/launched";
 
 type W = ReturnType<typeof discoveryWorld>;
 
@@ -16,6 +17,7 @@ const NOW = Date.UTC(2026, 10, 23, 12, 0); // Mon, Nov 23, 2026 · 12:00 UTC
 
 async function signIn(w: W, zone = "UTC", now?: number): Promise<App> {
   const app = await open("./test/Harness.tsx", {
+    modules: launched(),
     network: w.network as any, platform: "linux", width: 1280, height: 900, localeSettings: { timeZone: zone },
     clock: now === undefined ? null : { time: now },
   });

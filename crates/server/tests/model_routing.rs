@@ -19,11 +19,14 @@ use axum::routing::post;
 use metro_model_protocol::Capability;
 use metro_server::auth::{AuthFailure, AuthFuture, HumanAuth, UserIdentity};
 use metro_server::db::Db;
+use metro_server::device_relay::DeviceError;
+use metro_server::model_routing::MODEL_UNAVAILABLE_IN_ROOM;
 use metro_server::model_routing::{BoxFuture, Routing, RoutingBackend, submit_scheduled};
-use metro_server::providers::{SelectedModel, UseError};
+use metro_server::providers::{ProviderError, SelectedModel, UseError};
 use metro_server::{AppState, Config, Limits, ModelConfig, router};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 
 struct FakeAuth;
 
@@ -75,6 +78,20 @@ struct FakeConn {
 /// (user, space, connection, state, questions) of one System One call.
 type Call = (String, Option<String>, String, Value, Value);
 
+struct HeldDecision {
+    question: &'static str,
+    arrived: Notify,
+    release: Notify,
+}
+
+impl HeldDecision {
+    async fn wait(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.arrived.notified())
+            .await
+            .expect("the held decision was not requested");
+    }
+}
+
 #[derive(Default)]
 struct Fake {
     conns: Mutex<HashMap<String, FakeConn>>,
@@ -82,9 +99,23 @@ struct Fake {
     calls: Mutex<Vec<Call>>,
     base_url: Mutex<String>,
     members: Mutex<Vec<(String, String)>>,
+    /// Connections whose (device) endpoint is offline: an upstream-side
+    /// failure that has nothing to do with access.
+    offline: Mutex<Vec<String>>,
+    hold: Mutex<Option<Arc<HeldDecision>>>,
 }
 
 impl Fake {
+    fn hold(&self, question: &'static str) -> Arc<HeldDecision> {
+        let hold = Arc::new(HeldDecision {
+            question,
+            arrived: Notify::new(),
+            release: Notify::new(),
+        });
+        *self.hold.lock().unwrap() = Some(hold.clone());
+        hold
+    }
+
     fn add(&self, n: char, capability: Capability, grants: Vec<Grant>, model: &str) {
         self.conns.lock().unwrap().insert(
             id(n),
@@ -212,9 +243,30 @@ impl RoutingBackend for Backend {
             match conn {
                 Some(c)
                     if c.capability == Capability::SystemOne && self.0.usable(user, space, &c) => {}
-                _ => anyhow::bail!("not found"),
+                _ => return Err(ProviderError::Use(UseError::NotFound).into()),
             }
             let message = state_payload["message"].as_str().unwrap_or_default();
+            let held = self.0.hold.lock().unwrap().clone();
+            if let Some(held) = held.filter(|held| questions.get(held.question).is_some()) {
+                held.arrived.notify_one();
+                held.release.notified().await;
+            }
+            if message.contains("[timeout]") {
+                return std::future::pending().await;
+            }
+            if message.contains("[busy]") {
+                return Err(ProviderError::Busy.into());
+            }
+            // A device classifier's failures, as the relay reports them.
+            if message.contains("[device-bad]") {
+                return Err(ProviderError::Device(DeviceError::BadResponse(
+                    "missing answers".into(),
+                ))
+                .into());
+            }
+            if message.contains("[device-revoked]") {
+                return Err(ProviderError::Device(DeviceError::AccessRevoked).into());
+            }
             Fake::answer(message, &questions).map_err(anyhow::Error::msg)
         })
     }
@@ -253,6 +305,9 @@ impl RoutingBackend for Backend {
             if conn.capability != Capability::Chat {
                 return Err(UseError::NotFound);
             }
+            if self.0.offline.lock().unwrap().iter().any(|o| o == id) {
+                return Err(UseError::DeviceOffline);
+            }
             let base_url = self.0.base_url.lock().unwrap().clone();
             Ok(SelectedModel {
                 connection_id: id.to_owned(),
@@ -264,6 +319,8 @@ impl RoutingBackend for Backend {
                     api_key: String::new(),
                 }),
                 max_tokens: None,
+                built_from: None,
+                effective_device: None,
             })
         })
     }
@@ -311,6 +368,10 @@ struct H {
 
 impl H {
     async fn start() -> Self {
+        Self::start_with(Db::open_in_memory().unwrap()).await
+    }
+
+    async fn start_with(db: Db) -> Self {
         let models = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let base_url = endpoint(models.clone(), bodies.clone()).await;
@@ -328,9 +389,7 @@ impl H {
             },
             org_admins: Vec::new(),
         };
-        let mut state = AppState::new(config, Db::open_in_memory().unwrap(), Arc::new(FakeAuth))
-            .await
-            .unwrap();
+        let mut state = AppState::new(config, db, Arc::new(FakeAuth)).await.unwrap();
         let fake = Arc::new(Fake::default());
         *fake.base_url.lock().unwrap() = base_url;
         fake.add(
@@ -406,6 +465,26 @@ impl H {
 
     async fn post(&self, who: &str, path: &str, body: Value) -> (StatusCode, Value) {
         self.req(reqwest::Method::POST, who, path, Some(body)).await
+    }
+
+    async fn upload_for_race(&self, sid: &str) -> String {
+        let response = self
+            .http
+            .post(format!(
+                "{}/v1/library/assets?scope=space&space_id={sid}&name=notes.txt",
+                self.base
+            ))
+            .bearer_auth("alice")
+            .header("content-type", "text/plain")
+            .body("An existing upload, not part of the post transaction.")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response.json::<Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     async fn put_routing(&self, who: &str, body: Value) -> (StatusCode, Value) {
@@ -726,16 +805,6 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
         .await;
     assert_eq!(h.fake.calls(), before);
 
-    // Personal Chat too, with the same opt-in.
-    let e = h
-        .say("alice", None, json!({"text": "[yes] summarize my day"}))
-        .await;
-    assert_eq!(e["mentions"][0]["addressed_by"], "classifier");
-    let a = h
-        .answer_after("alice", None, e["id"].as_i64().unwrap())
-        .await;
-    assert_eq!(a["kind"], "agent", "{a}");
-    assert_eq!(h.fake.last_call().1, None);
     // A forged classifier mark is refused by the mention wire.
     let (s, _) = h
         .post(
@@ -745,6 +814,283 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
         )
         .await;
     assert_ne!(s, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn chat_is_direct_with_or_without_the_legacy_flag_but_notes_stay_quiet() {
+    let h = H::start().await;
+    for infer in [false, true] {
+        let (status, prefs) = h
+            .put_routing("alice", json!({"infer_addressing": infer}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{prefs}");
+        assert_eq!(prefs["infer_addressing"], infer);
+        let sent = h
+            .say("alice", None, json!({"text": "@bob [err] a Chat prompt"}))
+            .await;
+        assert_eq!(sent["audience"], "agent");
+        assert_eq!(sent["mentions"], json!([{"kind": "agent"}]));
+        assert_eq!(sent["addressing_note"], Value::Null);
+        assert_eq!(sent["routing_note"], Value::Null);
+        let id = sent["id"].as_i64().unwrap();
+        assert_eq!(h.answer_after("alice", None, id).await["kind"], "agent");
+        assert_eq!(
+            h.route_after("alice", None, id).await["addressed_by"],
+            "explicit"
+        );
+    }
+
+    // A configured classifier still sees neither sends nor notes.
+    assert_eq!(
+        h.put_routing("alice", routing_on(true, false)).await.0,
+        StatusCode::OK
+    );
+    for body in [
+        json!({"text": "[err] a direct send"}),
+        json!({"text": "hello", "invoke_agent": true}),
+        json!({"text": "@agent hello", "invoke_agent": false}),
+    ] {
+        let sent = h.say("alice", None, body).await;
+        assert_eq!(sent["mentions"], json!([{"kind": "agent"}]));
+        assert_eq!(sent["addressing_note"], Value::Null);
+        assert_eq!(
+            h.answer_after("alice", None, sent["id"].as_i64().unwrap())
+                .await["kind"],
+            "agent"
+        );
+    }
+    let calls = h.model_calls().len();
+    let note = h
+        .say(
+            "alice",
+            None,
+            json!({"text": "[yes] remember this", "invoke_agent": false}),
+        )
+        .await;
+    assert_eq!(note["mentions"], json!([]));
+    assert_eq!(note["audience"], "room");
+    assert_eq!(note["addressing_note"], Value::Null);
+    h.quiet_after("alice", None, note["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(h.fake.calls(), 0);
+    assert_eq!(h.model_calls().len(), calls);
+    assert!(h.events("bob", None).await.is_empty());
+}
+
+#[tokio::test]
+async fn explicit_chat_notes_do_not_resolve_mentions_or_route_with_both_opt_ins_set() {
+    let h = H::start().await;
+    assert_eq!(
+        h.put_routing("alice", routing_on(true, true)).await.0,
+        StatusCode::OK
+    );
+    for text in [
+        "@agent review this code",
+        "Note\u{0085}@agent review this code",
+    ] {
+        let note = h
+            .say("alice", None, json!({"text": text, "save_note": true}))
+            .await;
+        assert_eq!(note["text"], text);
+        assert_eq!(note["mentions"], json!([]));
+        assert_eq!(note["audience"], "room");
+        assert_eq!(note["addressing_note"], Value::Null);
+        assert_eq!(note["routing_note"], Value::Null);
+        h.quiet_after("alice", None, note["id"].as_i64().unwrap())
+            .await;
+    }
+
+    // A note cannot ask for a model, even if the text looks like a request.
+    let (status, error) = h
+        .post(
+            "alice",
+            "/v1/chat/messages",
+            json!({"text": "@agent hi", "save_note": true, "provider_connection_id": id(BOBS)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["error"], "a note cannot select a model");
+    assert_eq!(h.events("alice", None).await.len(), 2);
+    assert!(h.events("bob", None).await.is_empty());
+    assert_eq!(h.fake.calls(), 0);
+    assert!(h.model_calls().is_empty());
+
+    let sid = h.space("Space compatibility").await;
+    let (status, _) = h
+        .post(
+            "alice",
+            &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+            json!({"text": "@agent hi", "save_note": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(h.events("alice", Some(&sid)).await.is_empty());
+}
+
+#[tokio::test]
+async fn failed_classification_is_returned_only_on_the_senders_post() {
+    let h = H::start().await;
+    let sid = h.space("private classifier notes").await;
+    assert_eq!(
+        h.put_routing("alice", routing_on(true, false)).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        h.put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    for (text, reason) in [
+        ("[err] service failed", Some("unreachable")),
+        ("[bad] malformed", Some("invalid_answer")),
+        ("[timeout] delayed", Some("timeout")),
+        ("[device-bad] malformed", Some("invalid_answer")),
+        ("[device-revoked] share gone", Some("not_allowed")),
+        ("[maybe] not sure", None),
+        ("Lunch?", None),
+    ] {
+        let expected = match reason {
+            Some(reason) => json!({"kind": "classification_failed", "reason": reason}),
+            None => Value::Null,
+        };
+        let room = h.say("alice", Some(&sid), json!({"text": text})).await;
+        assert_eq!(room.get("addressing_note"), Some(&expected));
+        for who in ["alice", "bob"] {
+            let events = h.events(who, Some(&sid)).await;
+            let stored = events.last().unwrap();
+            assert_eq!(stored["id"], room["id"]);
+            assert_eq!(stored["kind"], "message");
+            assert_eq!(stored["text"], text);
+            assert!(stored.get("addressing_note").is_none());
+        }
+    }
+    // No reason reached anyone's transcript, in any form.
+    for who in ["alice", "bob"] {
+        let transcript = serde_json::to_string(&h.events(who, Some(&sid)).await).unwrap();
+        for leak in [
+            "addressing_note",
+            "invalid_answer",
+            "not_allowed",
+            "malformed",
+            "not usable here",
+        ] {
+            let typed = transcript.matches(leak).count();
+            // The message texts themselves are the only allowed mentions.
+            let said = ["[bad] malformed", "[device-bad] malformed"]
+                .iter()
+                .filter(|t| t.contains(leak))
+                .count();
+            assert_eq!(typed, said, "{who}: {leak}");
+        }
+    }
+
+    // An opted-in Space loses the classifier with routing settings reset,
+    // and can also lose access to a classifier configured just before a
+    // concurrent share revocation/deletion.
+    h.fake
+        .conns
+        .lock()
+        .unwrap()
+        .remove(&id(CLASSIFIER))
+        .unwrap();
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "lost access"}))
+        .await;
+    assert_eq!(e["addressing_note"]["reason"], "not_allowed");
+    assert_eq!(
+        h.put_routing(
+            "alice",
+            json!({"infer_addressing": false, "classifier_id": null})
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let e = h
+        .say("alice", Some(&sid), json!({"text": "no classifier"}))
+        .await;
+    assert_eq!(e["addressing_note"]["reason"], "no_classifier");
+    let bobs_events = h.events("bob", Some(&sid)).await;
+    assert!(
+        bobs_events
+            .iter()
+            .all(|e| e["kind"] == "message" && e.get("addressing_note").is_none())
+    );
+}
+
+#[tokio::test]
+async fn routing_failures_in_a_room_do_not_reveal_the_senders_access() {
+    let h = H::start().await;
+    let sid = h.space("private routing failures").await;
+    let (s, v) = h.put_routing("alice", routing_on(false, true)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    h.agent(
+        &sid,
+        json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+    )
+    .await;
+
+    // The routing Choice fails upstream...
+    let upstream = h
+        .say("alice", Some(&sid), json!({"text": "@coder [err] code"}))
+        .await;
+    assert_eq!(upstream["routing_note"]["kind"], "routing_failed");
+    assert_eq!(upstream["routing_note"]["reason"], "unreachable");
+    assert!(
+        upstream["routing_note"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(": the System One call failed.")
+    );
+    assert_eq!(upstream["addressing_note"], Value::Null);
+    let upstream_seen = h
+        .answer_after("bob", Some(&sid), upstream["id"].as_i64().unwrap())
+        .await;
+
+    // ...and then alice loses access to her classifier.
+    h.fake
+        .conns
+        .lock()
+        .unwrap()
+        .get_mut(&id(CLASSIFIER))
+        .unwrap()
+        .grants
+        .clear();
+    let calls = h.model_calls().len();
+    let revoked = h
+        .say("alice", Some(&sid), json!({"text": "@coder review code"}))
+        .await;
+    assert_eq!(revoked["routing_note"]["kind"], "routing_failed");
+    assert_eq!(revoked["routing_note"]["reason"], "not_allowed");
+    // The sender alone learns what to fix.
+    assert!(
+        revoked["routing_note"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(": the System One connection is not usable here.")
+    );
+    let revoked_seen = h
+        .answer_after("bob", Some(&sid), revoked["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(h.model_calls().len(), calls, "no model ran");
+
+    // Bob sees the same room error for both.
+    for seen in [&upstream_seen, &revoked_seen] {
+        assert_eq!(seen["kind"], "error", "{seen}");
+        assert!(
+            seen["text"]
+                .as_str()
+                .unwrap()
+                .contains(": the System One call failed."),
+            "{seen}"
+        );
+    }
+    assert_eq!(upstream_seen["text"], revoked_seen["text"]);
+    let transcript = serde_json::to_string(&h.events("bob", Some(&sid)).await).unwrap();
+    for leak in ["routing_note", "not_allowed", "not usable here"] {
+        assert!(!transcript.contains(leak), "{leak}");
+    }
 }
 
 #[tokio::test]
@@ -836,7 +1182,7 @@ async fn use_cases_route_explicit_turns_and_explicit_models_win() {
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // Addressing first (a lone Noul), then, only after a yes, the lone Choice.
+    // Direct Chat skips addressing and asks one Choice for model routing.
     let (s, _) = h.put_routing("alice", routing_on(true, true)).await;
     assert_eq!(s, StatusCode::OK);
     let before = h.fake.calls();
@@ -852,12 +1198,23 @@ async fn use_cases_route_explicit_turns_and_explicit_models_win() {
         .iter()
         .map(|c| c.4.as_object().unwrap().keys().cloned().collect())
         .collect();
+    assert_eq!(asked, vec![vec!["use_case".to_owned()]]);
+    let route = h
+        .route_after("alice", None, e["id"].as_i64().unwrap())
+        .await;
     assert_eq!(
-        asked,
-        vec![vec!["directed".to_owned()], vec!["use_case".to_owned()]]
+        (route["source"].as_str(), route["addressed_by"].as_str()),
+        (Some("case"), Some("explicit"))
     );
 
-    // A rejected, uncertain or failed addressing Noul never leads to a Choice.
+    // A rejected, uncertain or failed addressing Choice in a Space never
+    // leads to model routing.
+    assert_eq!(
+        h.put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+            .await
+            .0,
+        StatusCode::OK
+    );
     for text in [
         "lunch, code later",
         "[maybe] code?",
@@ -865,20 +1222,14 @@ async fn use_cases_route_explicit_turns_and_explicit_models_win() {
         "[bad] code",
     ] {
         let before = h.fake.calls();
-        let e = h.say("alice", None, json!({"text": text})).await;
-        h.quiet_after("alice", None, e["id"].as_i64().unwrap())
+        let e = h.say("alice", Some(&sid), json!({"text": text})).await;
+        h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
             .await;
         let calls = h.fake.calls.lock().unwrap()[before..].to_vec();
         assert_eq!(calls.len(), 1, "{text}");
+        assert_eq!(calls[0].4["agent"]["type"], "choice", "{text}");
         assert!(calls[0].4.get("use_case").is_none(), "{text}: no Choice");
     }
-    let route = h
-        .route_after("alice", None, e["id"].as_i64().unwrap())
-        .await;
-    assert_eq!(
-        (route["source"].as_str(), route["addressed_by"].as_str()),
-        (Some("case"), Some("classifier"))
-    );
 }
 
 /// `text` fails visibly because routing could not decide, before any
@@ -980,7 +1331,19 @@ async fn weak_unknown_and_failed_routes_use_the_default_or_fail_clearly() {
         .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
     assert_eq!(a["kind"], "error", "{a}");
-    let text = a["text"].as_str().unwrap();
+    assert_eq!(a["text"], MODEL_UNAVAILABLE_IN_ROOM, "{a}");
+    // The full reason is the sender's alone, on their POST response.
+    let note = &e["routing_note"];
+    assert_eq!(
+        (
+            note["kind"].as_str(),
+            note["source"].as_str(),
+            note["reason"].as_str()
+        ),
+        (Some("model_unavailable"), Some("case"), Some("not_allowed")),
+        "{note}"
+    );
+    let text = note["message"].as_str().unwrap();
     assert!(
         text.contains("\"Coding\"") && text.contains("No other model was used"),
         "{text}"
@@ -1043,7 +1406,6 @@ async fn shared_connections_stay_in_their_space_and_settings_are_validated() {
         json!({"default_chat_id": id(CLASSIFIER)}),
         json!({"classifier_id": id(CODE), "infer_addressing": true}),
         json!({"embedding_id": id(CODE)}),
-        json!({"infer_addressing": true}),
         json!({"enabled": true, "cases": routing_on(false, true)["cases"]}),
         json!({"min_directedness": 0.2}),
         json!({"min_route_probability": 1.5}),
@@ -1550,10 +1912,34 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
         .await;
     assert_eq!(started["agent"]["handle"], "agent");
     assert!(started["pick"].as_str().unwrap().contains("unsure"));
-    // A failed or malformed decision runs nothing for @agent, visibly.
-    for text in ["@agent [err] x", "@agent [ghost] x"] {
+    // A failed or malformed decision runs nothing for @agent, visibly. The
+    // room reads one category; only the sender learns which failure.
+    let mut seen_by_bob = Vec::new();
+    for (text, private) in [
+        ("@agent [err] x", "unreachable"),
+        ("@agent [busy] x", "unreachable"),
+        ("@agent [ghost] x", "invalid_answer"),
+        ("@agent [bad] x", "invalid_answer"),
+        ("@agent [timeout] x", "timeout"),
+    ] {
+        let reason = "the System One call failed";
         let calls = h.model_calls().len();
         let e = h.say("alice", Some(&sid), json!({"text": text})).await;
+        // Not an unaddressed classification: its own kind, for the sender.
+        let note = &e["addressing_note"];
+        assert_eq!(note["kind"], "generic_agent_unavailable", "{text}: {note}");
+        assert_eq!(note["reason"], private, "{text}");
+        let message = note["message"].as_str().unwrap();
+        assert!(message.contains("No agent ran for @agent"), "{message}");
+        assert!(
+            !message.contains("affects only"),
+            "nothing else named: {message}"
+        );
+        seen_by_bob.push(
+            h.answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
+                .await["text"]
+                .clone(),
+        );
         let a = h
             .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
             .await;
@@ -1564,9 +1950,51 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
                 .unwrap()
                 .contains("could not choose an agent")
         );
+        assert!(
+            a["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!(": {reason}."))
+        );
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(h.model_calls().len(), calls, "{text}");
+        assert!(
+            h.events("bob", Some(&sid))
+                .await
+                .iter()
+                .all(|e| e.get("addressing_note").is_none())
+        );
     }
+    assert!(
+        seen_by_bob.iter().all(|t| t == &seen_by_bob[0]),
+        "{seen_by_bob:?}"
+    );
+    // `@agent @coder` with a failed decision: @coder still runs, the room
+    // shows the same generic error, and the sender's note says @coder ran.
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "@agent @coder [err] both"}),
+        )
+        .await;
+    let note = &e["addressing_note"];
+    assert_eq!(note["kind"], "generic_agent_unavailable", "{note}");
+    assert_eq!(note["reason"], "unreachable");
+    // True whether or not @coder's run then starts: it claims no outcome.
+    let message = note["message"].as_str().unwrap();
+    assert!(message.contains("This affects only @agent"), "{note}");
+    assert!(!message.contains("answer"), "{note}");
+    let started = h
+        .started_after("alice", &sid, e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(started["agent"]["handle"], "coder", "{started}");
+    let room = h
+        .answers_after("bob", &sid, e["id"].as_i64().unwrap(), 2)
+        .await;
+    let errors: Vec<&Value> = room.iter().filter(|x| x["kind"] == "error").collect();
+    assert_eq!(errors.len(), 1, "{room:?}");
+    assert_eq!(errors[0]["text"], seen_by_bob[0]);
     // A specific handle skips classification.
     let before = h.fake.calls();
     let e = h
@@ -1627,6 +2055,600 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
         )
         .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Losing the classifier must not tell other members about the sender's
+    // connection or share. Bob sees the same room error as an upstream failure.
+    h.fake
+        .conns
+        .lock()
+        .unwrap()
+        .remove(&id(CLASSIFIER))
+        .unwrap();
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "@agent access changed"}),
+        )
+        .await;
+    assert_eq!(e["addressing_note"]["kind"], "generic_agent_unavailable");
+    assert_eq!(e["addressing_note"]["reason"], "not_allowed");
+    let err = h
+        .answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(err["kind"], "error");
+    // Revocation reads exactly like an upstream failure, a timeout or a
+    // malformed answer.
+    assert_eq!(err["text"], seen_by_bob[0]);
+    assert!(
+        err["text"]
+            .as_str()
+            .unwrap()
+            .contains(": the System One call failed.")
+    );
+}
+
+#[tokio::test]
+async fn recipient_race_aborts_both_room_and_attachment_writes_without_public_classification() {
+    for with_attachment in [false, true] {
+        for recipient in ["member", "named", "classified"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("metro.sqlite");
+            let h = H::start_with(Db::open(&db_path).unwrap()).await;
+            let sid = h.space("Commit recipient race").await;
+            let agent = h
+                .agent(
+                    &sid,
+                    json!({"name":"Private Candidate","handle":"candidate","description":"Scripted"}),
+                )
+                .await;
+            assert_eq!(
+                h.put_routing("alice", routing_on(false, true)).await.0,
+                StatusCode::OK
+            );
+            assert_eq!(
+                h.put_prefs("alice", &sid, json!({"classify_unaddressed":true}))
+                    .await
+                    .0,
+                StatusCode::OK,
+            );
+            // The mixed cases wait on generic-agent classification. The
+            // legacy unaddressed case acquires a classifier pick that isn't
+            // in the original request.
+            let mut body = match recipient {
+                "member" => json!({"text":"@bob @agent [yes] review", "infer_text_mentions":false,
+                                  "mentions":[{"kind":"user","id":"bob"},{"kind":"agent"}]}),
+                "named" => {
+                    json!({"text":"@candidate @agent [yes] review", "infer_text_mentions":false,
+                                 "mentions":[{"kind":"agent","agent_id":agent},{"kind":"agent"}]})
+                }
+                _ => json!({"text":"[pick2] review"}),
+            };
+            let asset = if with_attachment {
+                let asset = h.upload_for_race(&sid).await;
+                body["asset_ids"] = json!([asset]);
+                Some(asset)
+            } else {
+                None
+            };
+            let held = h.fake.hold("agent");
+            let path = format!("/v1/spaces/{sid}/rooms/lobby/messages");
+            let revoke = async {
+                held.wait().await;
+                let (suffix, body) = if recipient == "member" {
+                    ("members".to_owned(), Some(json!({"user_id":"bob"})))
+                } else {
+                    (format!("agents/{agent}"), None)
+                };
+                let (s, v) = h
+                    .req(
+                        reqwest::Method::DELETE,
+                        "alice",
+                        &format!("/v1/spaces/{sid}/{suffix}"),
+                        body,
+                    )
+                    .await;
+                assert_eq!(s, StatusCode::OK, "{suffix}: {v}");
+                held.release.notify_one();
+            };
+            let ((status, error), ()) = tokio::join!(h.post("alice", &path, body), revoke);
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error, json!({"error":"unknown recipient"}));
+            assert!(h.events("alice", Some(&sid)).await.is_empty());
+            assert!(h.state.runs.list().is_empty());
+            assert!(h.model_calls().is_empty());
+            assert_eq!(h.fake.calls(), 1);
+            if let Some(asset) = asset {
+                let links: i64 = rusqlite::Connection::open(&db_path)
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM message_attachments", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(links, 0);
+                // The upload happened separately and remains visible.
+                let content = h
+                    .http
+                    .get(format!("{}/v1/library/assets/{asset}/content", h.base))
+                    .bearer_auth("alice")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(content.status(), StatusCode::OK);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn recipient_race_after_message_commit_refuses_deleted_agent_at_run_acceptance() {
+    let h = H::start().await;
+    let sid = h.space("Run acceptance race").await;
+    let agent = h
+        .agent(
+            &sid,
+            json!({"name":"Deleted Target","handle":"gone","description":"Scripted"}),
+        )
+        .await;
+    assert_eq!(
+        h.put_routing("alice", routing_on(false, true)).await.0,
+        StatusCode::OK
+    );
+    let held = h.fake.hold("use_case");
+    let path = format!("/v1/spaces/{sid}/rooms/lobby/messages");
+    let body = json!({"text":"please review the code","invoke_agent":true,"agent_id":agent,"infer_text_mentions":false});
+    let revoke = async {
+        held.wait().await;
+        let events = h.events("bob", Some(&sid)).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "only the committed message precedes the routing decision"
+        );
+        assert_eq!(events[0]["mentions"][0]["agent_id"], agent);
+        let (s, v) = h
+            .req(
+                reqwest::Method::DELETE,
+                "alice",
+                &format!("/v1/spaces/{sid}/agents/{agent}"),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        held.release.notify_one();
+    };
+    let ((status, posted), ()) = tokio::join!(h.post("alice", &path, body), revoke);
+    assert_eq!(status, StatusCode::ACCEPTED, "{posted}");
+    assert_eq!(posted["spans"], json!([]));
+    let events = h.events("bob", Some(&sid)).await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1]["kind"], "error");
+    assert_eq!(
+        events[1]["text"],
+        "The requested agent is no longer available in this Space. No agent ran."
+    );
+    assert!(h.state.runs.list().is_empty());
+    assert!(h.model_calls().is_empty());
+    assert_eq!(h.fake.calls(), 1);
+}
+
+#[tokio::test]
+async fn held_routing_uses_the_selected_agents_current_allowlist_at_acceptance() {
+    let h = H::start().await;
+    let sid = h.space("Run configuration race").await;
+    h.state
+        .db
+        .set_runner_token(&sid, &[1; 32])
+        .unwrap()
+        .unwrap();
+    let agent = h
+        .agent(
+            &sid,
+            json!({"name":"Original","handle":"runner","description":"Scripted",
+                   "instructions":"Old instruction.", "tools":["workspace.list","workspace.read"]}),
+        )
+        .await;
+    assert_eq!(
+        h.put_routing("alice", routing_on(false, true)).await.0,
+        StatusCode::OK
+    );
+    let held = h.fake.hold("use_case");
+    let path = format!("/v1/spaces/{sid}/rooms/lobby/messages");
+    let body = json!({"text":"please review the code","invoke_agent":true,"agent_id":agent,"infer_text_mentions":false});
+    let update = async {
+        held.wait().await;
+        assert!(h.bodies.lock().unwrap().is_empty());
+        let (status, edited) = h
+            .req(
+                reqwest::Method::PATCH,
+                "alice",
+                &format!("/v1/spaces/{sid}/agents/{agent}"),
+                Some(json!({"name":"Current","instructions":"Current instruction.","tools":["workspace.read"]})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        assert_eq!(edited["tools"], json!(["workspace.read"]));
+        held.release.notify_one();
+    };
+    let ((status, posted), ()) = tokio::join!(h.post("alice", &path, body), update);
+    assert_eq!(status, StatusCode::ACCEPTED, "{posted}");
+    let id = posted["id"].as_i64().unwrap();
+    let answer = h.answer_after("alice", Some(&sid), id).await;
+    assert_eq!(answer["kind"], "agent", "{answer}");
+    assert_eq!(answer["activity"]["agent"]["id"], agent);
+    assert_eq!(answer["activity"]["agent"]["name"], "Current");
+    let bodies = h.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let tools = bodies[0]["tools"].to_string();
+    assert!(tools.contains("workspace_read"), "{tools}");
+    assert!(!tools.contains("workspace_list"), "{tools}");
+    let messages = bodies[0]["messages"].to_string();
+    assert!(messages.contains("Current instruction."));
+    assert!(!messages.contains("Old instruction."));
+}
+
+#[tokio::test]
+async fn authoritative_posts_return_canonical_text_and_spans_without_inference() {
+    let h = H::start().await;
+    let sid = h.space("Exact dispatch text").await;
+    let thread = h
+        .state
+        .db
+        .create_room(&sid, "follow-up", Some("lobby"), 10, 10)
+        .unwrap();
+    let leading = "\u{2003}  ";
+    let canonical = "🌿 @bob, résumé\ncheck the task";
+    let raw = format!("{leading}{canonical}  \t");
+    let path = format!("/v1/spaces/{sid}/rooms/{}", thread.id);
+    let (status, posted) = h
+        .post(
+            "alice",
+            &format!("{path}/messages"),
+            json!({"text":raw,"invoke_agent":true,"infer_text_mentions":false}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{posted}");
+    assert_eq!(posted["text"], canonical);
+    assert_eq!(posted["mentions"], json!([{"kind":"agent"}]));
+    assert_eq!(posted["spans"], json!([]));
+    let (status, polled) = h
+        .req(reqwest::Method::GET, "bob", &format!("{path}/events"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{polled}");
+    assert_eq!(polled["events"][0]["text"], canonical);
+    assert_eq!(polled["events"][0]["mentions"], posted["mentions"]);
+    assert_eq!(polled["events"][0]["spans"], posted["spans"]);
+    assert!(
+        h.events("bob", Some(&sid))
+            .await
+            .iter()
+            .all(|event| event["kind"] != "message"),
+        "thread activity may appear in the lobby, but the message must not"
+    );
+    let legacy = h.say("alice", Some(&sid), json!({"text":raw})).await;
+    assert_eq!(legacy["text"], canonical);
+    assert_eq!(legacy["mentions"], json!([{"kind":"user","id":"bob"}]));
+    assert!(legacy.get("spans").is_none());
+
+    let start = canonical.find('@').unwrap();
+    let submitted = start + leading.len();
+    let span = json!({"start":submitted,"end":submitted+4,"index":0});
+    let bound = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text":raw,"infer_text_mentions":false,"mentions":[{"kind":"user","id":"bob"}],"spans":[span]}),
+        )
+        .await;
+    let rebased = json!([{"start":start,"end":start+4,"index":0}]);
+    assert_eq!(bound["text"], canonical);
+    assert_eq!(bound["spans"], rebased);
+    let polled = h.events("bob", Some(&sid)).await;
+    let echo = polled
+        .iter()
+        .find(|event| event["id"] == bound["id"])
+        .unwrap();
+    assert_eq!(echo["text"], canonical);
+    assert_eq!(echo["mentions"], bound["mentions"]);
+    assert_eq!(echo["spans"], rebased);
+}
+
+#[tokio::test]
+async fn authoritative_mentions_leave_stale_text_unaddressed() {
+    let h = H::start().await;
+    let sid = h.space("stale mention directory").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let cases = [
+        ("@coder", json!({"kind": "agent", "agent_id": coder})),
+        ("@agent", json!({"kind": "agent"})),
+        ("@bob", json!({"kind": "user", "id": "bob"})),
+    ];
+    for (text, _) in &cases {
+        // The server knows these handles, but the client didn't resolve them.
+        // Omitting both mentions and spans must not turn on the legacy scan.
+        let e = h
+            .say(
+                "alice",
+                Some(&sid),
+                json!({"text": text, "infer_text_mentions": false}),
+            )
+            .await;
+        assert_eq!(e["text"], *text);
+        assert_eq!(e["mentions"], json!([]));
+        assert_eq!(e["audience"], "room");
+        assert_eq!(e["spans"], json!([]));
+        let stored = h.events("bob", Some(&sid)).await;
+        let polled = stored.iter().find(|row| row["id"] == e["id"]).unwrap();
+        assert_eq!(polled["spans"], json!([]));
+        h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+            .await;
+    }
+    assert_eq!(h.fake.calls(), 0);
+    assert!(h.model_calls().is_empty());
+
+    for (text, recipient) in cases {
+        let e = h.say("alice", Some(&sid), json!({"text": text})).await;
+        assert_eq!(e["mentions"], json!([recipient]));
+        assert!(e.get("spans").is_none());
+        if recipient["kind"] == "agent" {
+            let id = e["id"].as_i64().unwrap();
+            let started = h.started_after("alice", &sid, id).await;
+            assert_eq!(started["agent"]["handle"], &text[1..]);
+            assert_eq!(
+                h.answer_after("alice", Some(&sid), id).await["kind"],
+                "agent"
+            );
+        }
+    }
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "@bob", "infer_text_mentions": true}),
+        )
+        .await;
+    assert_eq!(e["mentions"], json!([{"kind": "user", "id": "bob"}]));
+}
+
+#[tokio::test]
+async fn authoritative_mentions_preserve_space_classification_and_use_case_routing() {
+    let h = H::start().await;
+    let sid = h.space("authoritative routing").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let (s, v) = h.put_routing("alice", routing_on(false, true)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = h
+        .put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let text = "@agent @coder [pick2] review this code";
+    let bob = json!({"kind": "user", "id": "bob"});
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": text, "infer_text_mentions": false, "mentions": [bob]}),
+        )
+        .await;
+    assert_eq!(e["audience"], "users");
+    assert_eq!(e["mentions"], json!([bob]));
+    h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(h.fake.calls(), 0);
+    assert!(h.model_calls().is_empty());
+
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": text, "infer_text_mentions": false}),
+        )
+        .await;
+    assert_eq!(
+        e["mentions"],
+        json!([{"kind": "agent", "agent_id": coder, "addressed_by": "classifier"}])
+    );
+    assert_eq!(e["spans"], json!([]));
+    let id = e["id"].as_i64().unwrap();
+    let started = h.started_after("alice", &sid, id).await;
+    assert_eq!(started["agent"]["id"], coder.as_str());
+    assert_eq!(started["route"]["addressed_by"], "classifier");
+    assert_eq!(started["route"]["case_key"], "code");
+    assert_eq!(h.fake.calls(), 2);
+    let calls = h.fake.calls.lock().unwrap().clone();
+    assert!(calls[0].4["agent"]["criteria"].get("no_agent").is_some());
+    assert_eq!(calls[1].4["use_case"]["type"], "choice");
+    assert_eq!(
+        h.answer_after("alice", Some(&sid), id).await["text"],
+        "answered by code-model"
+    );
+
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({
+                "text": text, "infer_text_mentions": false, "invoke_agent": true, "agent_id": coder
+            }),
+        )
+        .await;
+    assert_eq!(e["mentions"], json!([{"kind": "agent", "agent_id": coder}]));
+    assert_eq!(e["spans"], json!([]));
+    let id = e["id"].as_i64().unwrap();
+    let started = h.started_after("alice", &sid, id).await;
+    assert_eq!(started["agent"]["id"], coder.as_str());
+    assert_eq!(started["route"]["addressed_by"], "explicit");
+    assert_eq!(started["route"]["case_key"], "code");
+    assert_eq!(
+        h.fake.calls(),
+        3,
+        "named Ask agent only calls use-case routing"
+    );
+    assert_eq!(h.fake.last_call().4["use_case"]["type"], "choice");
+    assert_eq!(
+        h.answer_after("alice", Some(&sid), id).await["text"],
+        "answered by code-model"
+    );
+}
+
+#[tokio::test]
+async fn mention_spans_keep_generic_and_named_recipients_distinct_from_run_targets() {
+    let h = H::start().await;
+    let sid = h.space("span routing").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let (s, v) = h.put_routing("alice", routing_on(false, false)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = h
+        .put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    let user = json!({"kind": "user", "id": "bob"});
+    let generic = json!({"kind": "agent"});
+    let named = json!({"kind": "agent", "agent_id": coder});
+    let before = h.fake.calls();
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({
+                "text": "@Bob @agent [pick2] go, cc @alice",
+                "infer_text_mentions": false,
+                "mentions": [user, user, generic],
+                "spans": [{"start": 0, "end": 4, "index": 1}, {"start": 5, "end": 11, "index": 2}]
+            }),
+        )
+        .await;
+    let generic_id = e["id"].as_i64().unwrap();
+    let started = h.started_after("alice", &sid, generic_id).await;
+    assert_eq!(started["agent"]["id"], coder.as_str());
+    assert_eq!(started["pick"], "Picked by classifier: Coder");
+    assert_eq!(h.fake.calls(), before + 1);
+    assert_eq!(e["mentions"], json!([user, generic]));
+    assert_eq!(
+        e["spans"],
+        json!([{"start": 0, "end": 4, "index": 0}, {"start": 5, "end": 11, "index": 1}])
+    );
+    let polled = h
+        .events("bob", Some(&sid))
+        .await
+        .into_iter()
+        .find(|m| m["id"] == generic_id)
+        .unwrap();
+    assert_eq!(polled["mentions"], e["mentions"]);
+    assert_eq!(polled["spans"], e["spans"]);
+    h.answer_after("alice", Some(&sid), generic_id).await;
+
+    // A colliding token in a span refers to the selected named agent,
+    // never the user with that id; an unspanned @bob still adds the user.
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({
+                "text": "@bob [pick2] go, cc @bob",
+                "mentions": [named],
+                "spans": [{"start": 0, "end": 4, "index": 0}]
+            }),
+        )
+        .await;
+    let message = e["id"].as_i64().unwrap();
+    let started = h.started_after("alice", &sid, message).await;
+    assert_eq!(started["agent"]["id"], coder.as_str());
+    assert_eq!(e["mentions"], json!([named, user]));
+    h.answer_after("alice", Some(&sid), message).await;
+    assert_eq!(h.fake.calls(), before + 1);
+
+    let legacy = h.say("bob", Some(&sid), json!({"text": "cc @alice"})).await;
+    assert_eq!(legacy["mentions"], json!([{"kind": "user", "id": "alice"}]));
+    assert!(legacy.get("spans").is_none());
+}
+
+#[tokio::test]
+async fn mention_span_labels_cannot_change_adjacent_legacy_routing() {
+    let h = H::start().await;
+    let sid = h.space("span code ranges").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let (s, v) = h.put_routing("alice", routing_on(false, false)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = h
+        .put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let bob = json!({"kind": "user", "id": "bob"});
+    let before = h.fake.calls();
+
+    // A malformed range cannot hide a separate token or leave a message
+    // behind. Force generic addressing so a late check would call System One.
+    for label in [
+        "@Support @agent",
+        "@Support (@alice)",
+        "@Support\u{00a0}@agent",
+    ] {
+        let (s, v) = h
+            .post(
+                "alice",
+                &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+                json!({
+                    "text": format!("{label} [pick2]"),
+                    "invoke_agent": true,
+                    "mentions": [bob],
+                    "spans": [{"start": 0, "end": label.len(), "index": 0}]
+                }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], "invalid mention span");
+    }
+    assert_eq!(h.fake.calls(), before);
+    assert!(h.model_calls().is_empty());
+    assert!(h.events("alice", Some(&sid)).await.is_empty());
+
+    for (n, label) in ["@DevOps", "@Dev`Ops", "@Support@Home"]
+        .into_iter()
+        .enumerate()
+    {
+        let prefix = "👋 ";
+        let text = format!("{prefix}{label} @agent [pick2] and `echo @alice literally`");
+        let span = json!({"start": prefix.len(), "end": prefix.len() + label.len(), "index": 0});
+        let e = h
+            .say(
+                "alice",
+                Some(&sid),
+                json!({"text": text, "mentions": [bob], "spans": [span]}),
+            )
+            .await;
+        assert_eq!(e["text"], text);
+        assert_eq!(e["spans"], json!([span]));
+        assert_eq!(e["mentions"], json!([bob, {"kind": "agent"}]));
+        let id = e["id"].as_i64().unwrap();
+        let started = h.started_after("alice", &sid, id).await;
+        assert_eq!(started["agent"]["id"], coder.as_str());
+        assert_eq!(h.fake.calls(), before + n + 1);
+        assert_eq!(
+            h.answer_after("alice", Some(&sid), id).await["kind"],
+            "agent"
+        );
+    }
 }
 
 #[tokio::test]
@@ -1716,14 +2738,134 @@ async fn per_space_and_per_agent_models_come_before_the_personal_default() {
         .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
     assert_eq!(a["kind"], "error", "{a}");
+    assert_eq!(a["text"], MODEL_UNAVAILABLE_IN_ROOM, "{a}");
+    let note = &e["routing_note"];
+    assert_eq!(
+        (note["kind"].as_str(), note["source"].as_str()),
+        (Some("model_unavailable"), Some("space_default")),
+        "{note}"
+    );
     assert!(
-        a["text"]
+        note["message"]
             .as_str()
             .unwrap()
             .contains("default model for this Space"),
-        "{a}"
+        "{note}"
     );
     assert_eq!(h.model_calls().len(), calls);
+}
+
+#[tokio::test]
+async fn a_lost_model_connection_reads_like_any_failure_to_other_members() {
+    let h = H::start().await;
+    let sid = h.space("private model failures").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let (s, v) = h
+        .put_prefs(
+            "alice",
+            &sid,
+            json!({"default_model": {"provider_connection_id": id(CODE)},
+                   "agent_models": {coder.clone(): {"provider_connection_id": id(WRITING)}}}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+
+    // Alice's Space default fails for a reason unrelated to access...
+    h.fake.offline.lock().unwrap().push(id(CODE));
+    let calls = h.model_calls().len();
+    let offline = h
+        .say("alice", Some(&sid), json!({"text": "@agent a"}))
+        .await;
+    // ...and her model for @coder loses its share.
+    h.fake
+        .conns
+        .lock()
+        .unwrap()
+        .get_mut(&id(WRITING))
+        .unwrap()
+        .grants
+        .clear();
+    let revoked = h
+        .say("alice", Some(&sid), json!({"text": "@coder b"}))
+        .await;
+
+    let mut seen = Vec::new();
+    for e in [&offline, &revoked] {
+        let a = h
+            .answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
+            .await;
+        assert_eq!(a["kind"], "error", "{a}");
+        seen.push(a["text"].clone());
+    }
+    assert_eq!(seen[0], seen[1], "bob can't tell them apart");
+    assert_eq!(seen[0], MODEL_UNAVAILABLE_IN_ROOM);
+    assert_eq!(
+        h.model_calls().len(),
+        calls,
+        "no model ran, nothing fell back"
+    );
+    let transcript = serde_json::to_string(&h.events("bob", Some(&sid)).await).unwrap();
+    for leak in [
+        "routing_note",
+        "not_allowed",
+        "offline",
+        "default model for this",
+        "can't be used here",
+    ] {
+        assert!(!transcript.contains(leak), "{leak}");
+    }
+    assert_eq!(
+        h.events("alice", Some(&sid)).await.len(),
+        h.events("bob", Some(&sid)).await.len()
+    );
+
+    // Alice still gets an actionable reason for each, privately.
+    let note = &offline["routing_note"];
+    assert_eq!(
+        (
+            note["kind"].as_str(),
+            note["source"].as_str(),
+            note["reason"].as_str()
+        ),
+        (
+            Some("model_unavailable"),
+            Some("space_default"),
+            Some("offline")
+        ),
+        "{note}"
+    );
+    assert!(
+        note["message"]
+            .as_str()
+            .unwrap()
+            .contains("default model for this Space")
+    );
+    let note = &revoked["routing_note"];
+    assert_eq!(
+        (
+            note["kind"].as_str(),
+            note["source"].as_str(),
+            note["reason"].as_str()
+        ),
+        (
+            Some("model_unavailable"),
+            Some("agent_default"),
+            Some("not_allowed")
+        ),
+        "{note}"
+    );
+    assert!(
+        note["message"]
+            .as_str()
+            .unwrap()
+            .contains("default model for this agent in this Space")
+    );
+    assert!(offline.get("addressing_note").is_some_and(Value::is_null));
 }
 
 #[tokio::test]

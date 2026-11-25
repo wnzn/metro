@@ -265,6 +265,14 @@ impl Server {
         body["connections"].as_array().unwrap().clone()
     }
 
+    async fn connection(&self, token: &str, id: &Value) -> Value {
+        self.connections(token)
+            .await
+            .into_iter()
+            .find(|row| &row["id"] == id)
+            .unwrap()
+    }
+
     async fn chat_and_wait(&self, token: &str, text: &str) -> Value {
         let (status, body) = self
             .post(
@@ -620,6 +628,288 @@ async fn listing_failures_are_clear_and_redirects_are_not_followed() {
     let seen = redirect.seen();
     assert_eq!(seen.len(), 1, "the redirect was followed: {seen:?}");
     assert_eq!(seen[0].path, "/v1/models");
+}
+
+#[tokio::test]
+async fn changing_endpoint_tests_before_saving_and_keeps_connection_settings() {
+    let old = Fixture::start(&["retired", "keep"], Listing::Ok, "old").await;
+    let new = Fixture::start(&["keep", "new"], Listing::Ok, "new").await;
+    let missing = Fixture::start(&[], Listing::Missing, "missing").await;
+    let redirect = Fixture::start(&[], Listing::Redirect, "redirect").await;
+    let s = Server::start(
+        None,
+        Db::open_in_memory().unwrap(),
+        Some(master(1)),
+        [&old, &new, &missing, &redirect]
+            .map(|fixture| fixture.base_url.clone())
+            .into(),
+    )
+    .await;
+    let key = "endpoint-test-key";
+    let c = s
+        .connect(
+            ALICE,
+            json!({
+                "name": "Connection", "provider_id": "custom", "base_url": old.base_url,
+                "model": "keep", "api_key": key, "fetch_models": true,
+            }),
+        )
+        .await;
+    let path = format!("/v1/providers/{}", c["id"].as_str().unwrap());
+    let share = format!("{path}/sharing");
+    let (status, initial_share) = s
+        .send(
+            reqwest::Method::PUT,
+            ALICE,
+            &share,
+            Some(json!({"visibility": "organization"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{initial_share}");
+    let (status, available) = s.get(BOB, "/v1/models/available").await;
+    assert_eq!(status, StatusCode::OK, "{available}");
+    let shared = available["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["connection_id"] == c["id"])
+        .unwrap();
+    assert!(shared.get("endpoint_revision").is_none());
+
+    let (status, body) = s.patch(BOB, &path, json!({"base_url": new.base_url})).await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_eq!(body["code"], "endpoint_missing");
+    for (rejected, code) in [
+        (Value::Null, "endpoint_rejected"),
+        (
+            json!(format!("{}/not-allowlisted", new.base_url)),
+            "endpoint_not_approved",
+        ),
+        (
+            json!(format!("{}?not-allowed", new.base_url)),
+            "endpoint_rejected",
+        ),
+    ] {
+        let (status, body) = s.patch(ALICE, &path, json!({"base_url": rejected})).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(body["code"], code);
+    }
+    let device = s
+        .connect(
+            ALICE,
+            json!({
+                "name": "Device", "provider_id": "device-openai-compatible", "model": "local",
+            }),
+        )
+        .await;
+    let device_path = format!("/v1/providers/{}", device["id"].as_str().unwrap());
+    assert_eq!(
+        s.patch(ALICE, &device_path, json!({"base_url": new.base_url}))
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert!(
+        new.seen().is_empty(),
+        "refused changes must not test an endpoint"
+    );
+
+    for fixture in [&missing, &redirect] {
+        let (status, response) = s.patch(ALICE, &path, json!({
+            "base_url": fixture.base_url, "api_key": "failed-probe-key", "name": "not saved",
+        })).await;
+        assert_eq!(status, StatusCode::BAD_GATEWAY, "{response}");
+        assert_eq!(response["code"], "endpoint_probe_failed");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("model listing test")
+        );
+        assert_no_secret(&response, "failed-probe-key");
+        assert_eq!(s.connection(ALICE, &c["id"]).await, c);
+        let calls = fixture.seen();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].path, "/v1/models");
+    }
+
+    let (status, changed) = s
+        .patch(
+            ALICE,
+            &path,
+            json!({
+                "base_url": format!("{}/", new.base_url),
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{changed}");
+    assert_no_secret(&changed, key);
+    assert_eq!(changed["base_url"], new.base_url);
+    for field in ["id", "models", "model", "is_default", "has_key"] {
+        assert_eq!(changed[field], c[field], "{field}");
+    }
+    assert_eq!(s.get(ALICE, &share).await, (StatusCode::OK, initial_share));
+    let calls = new.seen();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].method, "GET");
+    assert_eq!(calls[0].path, "/v1/models");
+    assert!(
+        calls[0]
+            .authorization
+            .as_deref()
+            .is_some_and(|v| v == format!("Bearer {key}"))
+    );
+
+    let (status, refresh) = s.post(ALICE, &format!("{path}/models"), json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{refresh}");
+    assert_eq!(refresh["added"], 1);
+    assert_eq!(refresh["unavailable"], 1);
+    assert_eq!(refresh["connection"]["model"], "keep");
+}
+
+#[tokio::test]
+async fn changing_a_system_one_endpoint_tests_its_typed_model_listing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let old = format!("{origin}/original/v1");
+    let new = format!("{origin}/candidate/v1");
+    let seen = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/candidate/v1/models",
+        get({
+            let seen = seen.clone();
+            move || async move {
+                seen.fetch_add(1, Ordering::Relaxed);
+                Json(json!({"models": [{"name": "jev-test"}]}))
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let s = Server::start(
+        None,
+        Db::open_in_memory().unwrap(),
+        None,
+        vec![old.clone(), new.clone()],
+    )
+    .await;
+    let c = s
+        .connect(
+            ALICE,
+            json!({
+                "name": "System One", "provider_id": "custom-systemone",
+                "base_url": old, "model": "jev-test",
+            }),
+        )
+        .await;
+    let path = format!("/v1/providers/{}", c["id"].as_str().unwrap());
+    let (status, updated) = s.patch(ALICE, &path, json!({"base_url": new})).await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["base_url"], new);
+    assert_eq!(updated["model"], "jev-test");
+    assert_eq!(updated["is_default"], c["is_default"]);
+    assert_eq!(s.connection(ALICE, &c["id"]).await, updated);
+    assert_eq!(seen.load(Ordering::Relaxed), 1);
+
+    // The normalized URL is already saved, so sending it again is a
+    // regular PATCH, not an additional probe.
+    let (status, renamed) = s
+        .patch(
+            ALICE,
+            &path,
+            json!({
+                "base_url": format!("{new}/"), "name": "Renamed",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed["name"], "Renamed");
+    assert_eq!(seen.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn endpoint_probe_cannot_overwrite_a_concurrent_edit() {
+    let old = Fixture::start(&["keep"], Listing::Ok, "old").await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let new = format!("http://{}/v1", listener.local_addr().unwrap());
+    let arrived = Arc::new(tokio::sync::Notify::new());
+    let reply = Arc::new(tokio::sync::Notify::new());
+    let app = axum::Router::new().route(
+        "/v1/models",
+        get({
+            let (arrived, reply) = (arrived.clone(), reply.clone());
+            move || {
+                let (arrived, reply) = (arrived.clone(), reply.clone());
+                async move {
+                    arrived.notify_one();
+                    reply.notified().await;
+                    Json(json!({"data": [{"id": "keep"}]}))
+                }
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let s = Server::start(
+        None,
+        Db::open_in_memory().unwrap(),
+        None,
+        vec![old.base_url.clone(), new.clone()],
+    )
+    .await;
+    let c = s.connect(ALICE, json!({
+        "name": "Connection", "provider_id": "custom", "base_url": old.base_url, "model": "keep",
+    })).await;
+    let path = format!("/v1/providers/{}", c["id"].as_str().unwrap());
+    let stale_body = json!({"base_url": new, "expected_endpoint_revision": c["endpoint_revision"]});
+    let patch = s.patch(ALICE, &path, stale_body.clone());
+    let concurrent = async {
+        tokio::time::timeout(Duration::from_secs(5), arrived.notified())
+            .await
+            .unwrap();
+        assert_eq!(s.connection(ALICE, &c["id"]).await, c);
+        assert_eq!(
+            s.patch(ALICE, &path, json!({"name": "Name changed"}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        reply.notify_one();
+    };
+    let ((status, body), ()) = tokio::join!(patch, concurrent);
+    assert_eq!(status, StatusCode::CONFLICT, "{body}");
+    assert_eq!(body["code"], "endpoint_conflict");
+    let saved = s.connection(ALICE, &c["id"]).await;
+    assert_eq!(saved["name"], "Name changed");
+    assert_eq!(saved["base_url"], old.base_url);
+    assert_ne!(saved["endpoint_revision"], c["endpoint_revision"]);
+    // Like a request still at the gateway: Metro first reads the row only
+    // after the concurrent edit. It must not start another probe.
+    let (status, refused) =
+        tokio::time::timeout(Duration::from_secs(2), s.patch(ALICE, &path, stale_body))
+            .await
+            .expect("stale client token must fail before the held upstream");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(refused["code"], "endpoint_conflict");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), arrived.notified())
+            .await
+            .is_err()
+    );
+    // Only a new, explicit PATCH can make the change after reviewing the row.
+    reply.notify_one();
+    let (status, retried) = s
+        .patch(
+            ALICE,
+            &path,
+            json!({
+                "base_url": new, "expected_endpoint_revision": saved["endpoint_revision"],
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{retried}");
+    assert_eq!(retried["base_url"], new);
+    assert_eq!(retried["name"], "Name changed");
 }
 
 #[tokio::test]
@@ -1204,4 +1494,373 @@ async fn an_explicitly_chosen_connection_must_be_the_senders_own() {
         "a refused choice fell back to the environment model"
     );
     assert_eq!(bob_model.chats()[0].body["model"], "second-model");
+}
+
+/// A chat endpoint that lists one model and answers a run's first request
+/// with a tool call, held until the test opens its gate.
+struct GatedModel {
+    base_url: String,
+    requests: Arc<Mutex<Vec<Value>>>,
+    gate: Arc<tokio::sync::RwLock<()>>,
+}
+
+impl GatedModel {
+    async fn start() -> Self {
+        let requests: Arc<Mutex<Vec<Value>>> = Arc::default();
+        let gate = Arc::new(tokio::sync::RwLock::new(()));
+        let (seen, held) = (requests.clone(), gate.clone());
+        let app = axum::Router::new()
+            .route(
+                "/v1/models",
+                axum::routing::get(|| async {
+                    Json(json!({"object": "list", "data": [
+                        {"id": "am", "object": "model", "created": 0, "owned_by": "x"}]}))
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(move |Json(body): Json<Value>| {
+                    let (seen, held) = (seen.clone(), held.clone());
+                    async move {
+                        seen.lock().unwrap().push(body.clone());
+                        let replied = body["messages"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .any(|m| m["role"] == "tool");
+                        let message = if replied {
+                            json!({"role": "assistant", "content": "done"})
+                        } else {
+                            let _open = held.read().await;
+                            json!({"role": "assistant", "content": null, "tool_calls": [{
+                                "id": "call_1", "type": "function",
+                                "function": {"name": body["tools"][0]["function"]["name"],
+                                             "arguments": "{}"}}]})
+                        };
+                        let finish = if replied { "stop" } else { "tool_calls" };
+                        Json(json!({
+                            "id": "c", "object": "chat.completion", "created": 0, "model": "am",
+                            "choices": [{"index": 0, "message": message, "finish_reason": finish}],
+                            "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                        }))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        Self {
+            base_url,
+            requests,
+            gate,
+        }
+    }
+
+    fn chat_requests(&self) -> usize {
+        self.requests.lock().unwrap().len()
+    }
+}
+
+#[tokio::test]
+async fn a_run_stops_at_its_next_request_after_its_endpoint_changes() {
+    let (a, b) = (GatedModel::start().await, GatedModel::start().await);
+    let s = Server::start(
+        None,
+        Db::open_in_memory().unwrap(),
+        Some(master(5)),
+        vec![a.base_url.clone(), b.base_url.clone()],
+    )
+    .await;
+    let c = s
+        .connect(
+            ALICE,
+            json!({"name": "a", "provider_id": "custom", "base_url": a.base_url,
+                   "api_key": "sk-alice-rotating", "model": "am"}),
+        )
+        .await;
+    let held = a.gate.write().await;
+    let (status, body) = s
+        .post(
+            ALICE,
+            "/v1/chat/messages",
+            json!({"text": "two turns", "invoke_agent": true}),
+        )
+        .await;
+    assert!(status.is_success(), "{body}");
+    wait_until(|| a.chat_requests() == 1).await;
+    // Between the run's two model requests, the owner moves the connection.
+    let (status, moved) = s
+        .patch(
+            ALICE,
+            &format!("/v1/providers/{}", c["id"].as_str().unwrap()),
+            json!({"base_url": b.base_url}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{moved}");
+    drop(held);
+    let mut answer = Value::Null;
+    for _ in 0..400 {
+        let (_, events) = s.get(ALICE, "/v1/chat/events").await;
+        if let Some(e) = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| ["agent", "error"].contains(&e["kind"].as_str().unwrap_or("")))
+        {
+            answer = e.clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert_eq!(answer["kind"], "error", "{answer}");
+    assert!(
+        answer["text"]
+            .as_str()
+            .unwrap()
+            .contains("changed or was replaced during this run"),
+        "{answer}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        a.chat_requests(),
+        1,
+        "the retired endpoint got no second request"
+    );
+    assert_eq!(
+        b.chat_requests(),
+        0,
+        "the run never switched endpoints mid-run"
+    );
+}
+
+/// Text only a provider's own error carries.
+const SENTINEL: &str = "SENTINEL-provider-body-51c0de";
+
+/// A chat endpoint that always fails with a body carrying [`SENTINEL`] and
+/// the credential it was sent, as some providers echo it.
+async fn failing_endpoint() -> String {
+    let app = axum::Router::new().route(
+        "/v1/chat/completions",
+        post(|headers: HeaderMap| async move {
+            let echoed = headers
+                .get("authorization")
+                .map(|v| v.to_str().unwrap().to_owned())
+                .unwrap_or_default();
+            (
+                AxumStatus::UNAUTHORIZED,
+                Json(json!({"error": {"message": format!("{SENTINEL}: bad key {echoed}")}})),
+            )
+                .into_response()
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base_url = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    base_url
+}
+
+/// Everything Metro logs, in this test binary.
+#[derive(Clone, Default)]
+struct Captured(Arc<Mutex<Vec<u8>>>);
+
+/// The process-wide capture of Metro's logs, installed once. A process-wide
+/// subscriber (not a thread's) sees every callsite whichever thread first
+/// reached it; only one test per binary reads it, for its own sentinel.
+fn captured_logs() -> Captured {
+    static CAPTURED: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
+    CAPTURED
+        .get_or_init(|| {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_env_filter(tracing_subscriber::EnvFilter::new("metro_server=trace"))
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+            captured
+        })
+        .clone()
+}
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn provider_error_text_reaches_no_run_detail_chat_or_log() {
+    let captured = captured_logs();
+
+    let failing = failing_endpoint().await;
+    let operator_key = "sk-operator-secret-key-42";
+    let own_key = "sk-alice-own-secret-key-42";
+    let s = Server::start(
+        Some(ModelConfig {
+            base_url: failing.clone(),
+            model: "env-model".into(),
+            api_key: operator_key.into(),
+        }),
+        Db::open_in_memory().unwrap(),
+        Some(master(5)),
+        vec![failing.clone()],
+    )
+    .await;
+    // Alice uses her own connection; Bob, who has none, the operator's model.
+    s.connect(
+        ALICE,
+        json!({"name": "own", "provider_id": "custom", "base_url": failing,
+               "api_key": own_key, "model": "own-model"}),
+    )
+    .await;
+    let (status, space) = s.post(ALICE, "/v1/spaces", json!({"name": "logs"})).await;
+    assert_eq!(status, StatusCode::CREATED, "{space}");
+    let sid = space["id"].as_str().unwrap().to_owned();
+    let (status, _) = s
+        .post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/members"),
+            json!({"user_id": "bob"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+
+    let leaks = [SENTINEL, operator_key, own_key, failing.as_str()];
+    for token in [ALICE, BOB] {
+        // Personal Chat: the persisted error.
+        let error = s.chat_and_wait(token, &format!("{token} asks")).await;
+        assert_eq!(error["kind"], "error", "{error}");
+        let text = error["text"].as_str().unwrap();
+        assert!(text.contains("HTTP 401"), "{text}");
+        for leak in leaks {
+            assert!(!text.contains(leak), "{token} chat: {text}");
+        }
+        // A Space run: the initiator's private failure.
+        let (status, sent) = s
+            .post(
+                token,
+                &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+                json!({"text": format!("@agent {token} in space")}),
+            )
+            .await;
+        assert!(status.is_success(), "{sent}");
+        let mut failure = Value::Null;
+        for _ in 0..400 {
+            let (_, runs) = s.get(token, "/v1/runs").await;
+            if let Some(run) =
+                runs["runs"].as_array().unwrap().iter().find(|r| {
+                    r["actor"] == token.trim_end_matches("-token") && r["status"] == "failed"
+                })
+            {
+                failure = run["failure"].clone();
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert_eq!(failure["reason"], "model_error", "{failure}");
+        let message = failure["message"].as_str().unwrap();
+        assert!(
+            message.contains("rejected the connection's credentials"),
+            "{message}"
+        );
+        for leak in leaks {
+            assert!(!message.contains(leak), "{token} run: {message}");
+        }
+    }
+
+    let logs = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logs.contains("agent run failed"),
+        "the failures were logged"
+    );
+    assert!(logs.contains("auth_rejected"), "{logs}");
+    for leak in leaks {
+        assert!(!logs.contains(leak), "a log line carries {leak}:\n{logs}");
+    }
+}
+
+#[tokio::test]
+async fn the_operator_model_follows_no_redirect() {
+    // Where a redirect would lead: it records every request it gets.
+    let reached: Arc<Mutex<usize>> = Arc::default();
+    let counter = reached.clone();
+    let dest = axum::Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            *counter.lock().unwrap() += 1;
+            AxumStatus::OK
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let elsewhere = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, dest).await.unwrap() });
+    // The operator's endpoint answers every request with a 307, which would
+    // resend the body to `elsewhere`.
+    let target = format!("{elsewhere}/v1/chat/completions");
+    let redirecting = axum::Router::new().fallback(move || {
+        let target = target.clone();
+        async move {
+            (
+                AxumStatus::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, target)],
+            )
+                .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let operator = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, redirecting).await.unwrap() });
+
+    let s = Server::start(
+        Some(ModelConfig {
+            base_url: operator,
+            model: "env-model".into(),
+            api_key: "sk-operator-redirect".into(),
+        }),
+        Db::open_in_memory().unwrap(),
+        Some(master(5)),
+        vec![],
+    )
+    .await;
+    // Personal Chat, and a Space run: neither has a saved connection.
+    let answer = s.chat_and_wait(BOB, "redirect me").await;
+    assert_eq!(answer["kind"], "error", "{answer}");
+    let (status, space) = s
+        .post(ALICE, "/v1/spaces", json!({"name": "redirects"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{space}");
+    let sid = space["id"].as_str().unwrap().to_owned();
+    let (status, sent) = s
+        .post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+            json!({"text": "@agent redirect me too"}),
+        )
+        .await;
+    assert!(status.is_success(), "{sent}");
+    let mut failed = false;
+    for _ in 0..400 {
+        if s.state
+            .runs
+            .list()
+            .iter()
+            .any(|r| r.space_id == sid && r.status.is_terminal())
+        {
+            failed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(failed, "the Space run ended");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        *reached.lock().unwrap(),
+        0,
+        "a redirect destination got a request"
+    );
 }

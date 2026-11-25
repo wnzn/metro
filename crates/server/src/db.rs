@@ -92,6 +92,10 @@ pub struct Event {
     /// `[{"kind":"agent"}]`, `[{"kind":"user","id":"bob"}]`, ... Empty for
     /// everything but messages.
     pub mentions: serde_json::Value,
+    /// Display ranges indexing `mentions`. Empty is authoritative; absent
+    /// leaves the spelling of mentions in older events unspecified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub spans: Option<Vec<crate::mentions::MentionSpan>>,
     /// `room`, `agent`, `users` or `mixed`; `room` for non-messages.
     pub audience: String,
     /// The agent turn or Demo run that wrote this event, when the server
@@ -162,6 +166,14 @@ pub struct Activity {
     /// e.g. `Picked by classifier: Coder` or `Addressed: @coder`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick: Option<String>,
+    /// On a `page_draft` event only: public card metadata, never the draft body.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub page_draft: Option<crate::pages::store::DraftCard>,
+    /// Only on a web tool's `tool_call` / `tool_result` / `error` events:
+    /// which tool, the provider that answered and every attempt
+    /// ([`crate::web_tools`]). Never a query result or page text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<crate::web_tools::ToolNote>,
 }
 
 /// A Space agent as shown on its events: enough to draw its name and
@@ -191,6 +203,8 @@ impl Activity {
             route: None,
             agent: None,
             pick: None,
+            page_draft: None,
+            tool: None,
         }
     }
 
@@ -217,6 +231,8 @@ impl Activity {
             route: None,
             agent: None,
             pick: None,
+            page_draft: None,
+            tool: None,
         }
     }
 
@@ -227,6 +243,18 @@ impl Activity {
             phase: Some(phase.to_owned()),
             route: None,
             pick: None,
+            tool: None,
+            ..self.clone()
+        }
+    }
+
+    /// This activity with a web tool's note.
+    pub fn with_tool(&self, tool: crate::web_tools::ToolNote) -> Self {
+        Self {
+            phase: None,
+            route: None,
+            pick: None,
+            tool: Some(tool),
             ..self.clone()
         }
     }
@@ -236,6 +264,12 @@ impl Activity {
         self.route = Some(route);
         self
     }
+}
+
+/// The server-written `thread` event a parent run posts in its room when it
+/// creates thread `id` named `name`.
+pub fn thread_started_text(name: &str, id: &str) -> String {
+    format!("Started thread \"{name}\" ({id}).")
 }
 
 /// Activity sources and lifecycle phases.
@@ -256,6 +290,7 @@ pub struct Addressed {
     /// A JSON array of mentions.
     pub mentions: serde_json::Value,
     pub audience: String,
+    pub spans: Option<Vec<crate::mentions::MentionSpan>>,
 }
 
 impl Addressed {
@@ -264,6 +299,7 @@ impl Addressed {
         Self {
             mentions: serde_json::Value::Array(Vec::new()),
             audience: "room".to_owned(),
+            spans: None,
         }
     }
 }
@@ -278,6 +314,8 @@ pub mod kind {
     pub const TOOL_CALL: &str = "tool_call";
     /// The runner's answer to a tool call.
     pub const TOOL_RESULT: &str = "tool_result";
+    /// A Space agent left a page draft for the person who started the run.
+    pub const PAGE_DRAFT: &str = "page_draft";
     /// A person started Demo.
     pub const DEMO: &str = "demo";
     /// A failure or notice from the server.
@@ -401,6 +439,7 @@ impl Db {
                  owner_id          TEXT NOT NULL,
                  runner_token_hash BLOB UNIQUE,
                  runner_generation INTEGER NOT NULL DEFAULT 0,
+                 runner_drop_before INTEGER NOT NULL DEFAULT 0,
                  created_at        INTEGER NOT NULL
              );
              CREATE INDEX IF NOT EXISTS spaces_owner ON spaces (owner_id);
@@ -455,10 +494,13 @@ impl Db {
         add_space_description(&conn)?;
         reactions::init(&conn)?;
         crate::runners::init(&conn)?;
+        add_runner_queue_floor(&conn)?;
         crate::admin_users::init(&conn)?;
+        crate::admin_settings::init(&conn)?;
         crate::profiles::init(&conn)?;
         crate::providers::init(&conn)?;
         crate::device_relay::init(&conn)?;
+        crate::web_devices::init(&conn)?;
         crate::model_routing::init(&conn)?;
         crate::search::init(&conn)?;
         crate::schedules::init(&conn)?;
@@ -471,6 +513,8 @@ impl Db {
         // After spaces, members and model routing settings exist.
         crate::space_agents::init(&conn)?;
         crate::space_prefs::init(&conn)?;
+        // After spaces (Space pages reference them).
+        crate::pages::init(&conn)?;
         let version: Option<String> = conn
             .query_row(
                 "SELECT value FROM metro_meta WHERE key = 'schema_version'",
@@ -698,6 +742,8 @@ impl Db {
                 crate::library_search::hooks::member_removed(&tx, space_id, user_id)?;
                 // Their per-Space preferences go with their membership.
                 crate::space_prefs::member_removed(&tx, space_id, user_id)?;
+                // Their page preferences, confirmations and drafts there too.
+                crate::pages::hooks::member_removed(&tx, space_id, user_id)?;
                 RemoveMember::Removed
             }
         };
@@ -723,7 +769,9 @@ impl Db {
             return Ok(None);
         }
         let generation: i64 = tx.query_row(
-            "UPDATE spaces SET runner_token_hash = ?2, runner_generation = runner_generation + 1
+            "UPDATE spaces SET runner_token_hash = ?2,
+                 runner_drop_before = CASE WHEN runner_token_hash IS NULL THEN runner_generation + 1 ELSE runner_drop_before END,
+                 runner_generation = runner_generation + 1
              WHERE id = ?1 RETURNING runner_generation",
             params![space_id, hash],
             |r| r.get(0),
@@ -747,7 +795,8 @@ impl Db {
             return Ok(None);
         }
         let generation: i64 = tx.query_row(
-            "UPDATE spaces SET runner_token_hash = NULL, runner_generation = runner_generation + 1
+            "UPDATE spaces SET runner_token_hash = NULL, runner_drop_before = runner_generation + 1,
+                 runner_generation = runner_generation + 1
              WHERE id = ?1 RETURNING runner_generation",
             [space_id],
             |r| r.get(0),
@@ -788,15 +837,51 @@ impl Db {
     /// serve the Space changes: dedicated token issued, rotated or revoked;
     /// registered runner attached, detached, reassigned, rotated or deleted.
     pub fn space_runner_generation(&self, space_id: &str) -> anyhow::Result<Option<u64>> {
-        let conn = self.lock();
-        Ok(conn
-            .query_row(
-                "SELECT runner_generation FROM spaces WHERE id = ?1",
-                [space_id],
-                |r| r.get::<_, i64>(0),
-            )
-            .optional()?
-            .map(|g| g as u64))
+        Ok(read_runner_queue_version(&self.lock(), space_id)?.map(|v| v.generation))
+    }
+
+    /// Bind a new job to the current committed assignment and insert it
+    /// before another connection can change that assignment.
+    pub(crate) fn with_runner_queue_version<T>(
+        &self,
+        space_id: &str,
+        action: impl FnOnce(crate::jobs::RunnerVersion) -> T,
+    ) -> anyhow::Result<Option<T>> {
+        let mut conn = self.lock();
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Ok(read_runner_queue_version(&tx, space_id)?.map(action))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn runner_queue_version(
+        &self,
+        space_id: &str,
+    ) -> anyhow::Result<Option<crate::jobs::RunnerVersion>> {
+        Ok(read_runner_queue_version(&self.lock(), space_id)?)
+    }
+
+    /// Revalidate an authenticated runner's exact generations just before
+    /// accessing in-memory jobs. The transaction keeps assignment
+    /// writes out until this synchronous queue action is finished.
+    pub(crate) fn with_runner_queue_access<T>(
+        &self,
+        authenticated: &[(String, u64)],
+        action: impl FnOnce(&[(String, crate::jobs::RunnerVersion)]) -> T,
+    ) -> anyhow::Result<T> {
+        let mut conn = self.lock();
+        if authenticated.is_empty() {
+            return Ok(action(&[]));
+        }
+        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let mut verified = Vec::with_capacity(authenticated.len());
+        for (sid, generation) in authenticated {
+            if let Some(version) = read_runner_queue_version(&tx, sid)?
+                && version.generation == *generation
+            {
+                verified.push((sid.clone(), version));
+            }
+        }
+        Ok(action(&verified))
     }
 
     // ---- Rooms and events ----
@@ -884,6 +969,40 @@ impl Db {
         })
     }
 
+    /// The parent-room events from before `thread` (a child room named
+    /// `name`) was created: those before the server-written `Started
+    /// thread` marker the parent run left there, newest `limit`. Empty when
+    /// there is no such marker, so nothing later (or forged) counts.
+    pub fn events_before_thread(
+        &self,
+        space_id: &str,
+        parent_room_id: &str,
+        thread_id: &str,
+        name: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        let marker: Option<i64> = {
+            let conn = self.lock();
+            conn.query_row(
+                "SELECT id FROM space_events
+                 WHERE space_id = ?1 AND room_id = ?2 AND kind = 'thread' AND actor_id IS NULL
+                   AND text = ?3
+                 ORDER BY id LIMIT 1",
+                params![
+                    space_id,
+                    parent_room_id,
+                    thread_started_text(name, thread_id)
+                ],
+                |r| r.get(0),
+            )
+            .optional()?
+        };
+        match marker {
+            Some(id) => self.events_before(space_id, parent_room_id, id, limit),
+            None => Ok(Vec::new()),
+        }
+    }
+
     /// The most recent event of `kinds` in a room, if any.
     pub fn last_event_of(
         &self,
@@ -928,6 +1047,23 @@ impl Db {
         activity: Option<&Activity>,
     ) -> anyhow::Result<Event> {
         let conn = self.lock();
+        Self::append_event_in(
+            &conn, space_id, room_id, kind, author, text, addressed, activity,
+        )
+    }
+
+    /// Append an event inside the caller's transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn append_event_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        addressed: &Addressed,
+        activity: Option<&Activity>,
+    ) -> anyhow::Result<Event> {
         let at = now_ms();
         conn.execute(
             "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
@@ -942,7 +1078,7 @@ impl Db {
                 addressed.mentions.to_string(),
                 addressed.audience,
                 at,
-                activity_json(activity)?,
+                event_metadata_json(activity, addressed.spans.as_deref())?,
             ],
         )?;
         Ok(new_event(
@@ -954,6 +1090,56 @@ impl Db {
             activity,
             at,
         ))
+    }
+
+    pub(crate) fn room_member_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+        user_id: &str,
+    ) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)
+                AND EXISTS (SELECT 1 FROM space_rooms WHERE space_id = ?1 AND id = ?3)",
+            params![space_id, user_id, room_id],
+            |r| r.get(0),
+        )
+    }
+
+    pub(crate) fn space_agent_exists_in(
+        conn: &Connection,
+        space_id: &str,
+        agent_id: &str,
+    ) -> rusqlite::Result<bool> {
+        conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM space_agents WHERE space_id = ?1 AND id = ?2)",
+            params![space_id, agent_id],
+            |r| r.get(0),
+        )
+    }
+
+    /// Recheck the concrete recipients in the transaction that writes a room message.
+    pub(crate) fn recipients_current_in(
+        conn: &Connection,
+        space_id: &str,
+        recipients: &[crate::mentions::Mention],
+    ) -> rusqlite::Result<bool> {
+        use crate::mentions::Mention;
+        for m in recipients {
+            let exists: bool = match m {
+                Mention::Agent => continue,
+                Mention::AgentId { agent_id } => Self::space_agent_exists_in(conn, space_id, agent_id)?,
+                Mention::User { id } => conn.query_row(
+                    "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)",
+                    params![space_id, id],
+                    |r| r.get(0),
+                )?,
+            };
+            if !exists {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     /// Append a message written by `author` (a person) to `room_id` of
@@ -974,34 +1160,13 @@ impl Db {
         };
         let conn = self.lock();
         let tx = conn.unchecked_transaction()?;
-        let allowed: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)
-                AND EXISTS (SELECT 1 FROM space_rooms WHERE space_id = ?1 AND id = ?3)",
-            params![space_id, user_id, room_id],
-            |r| r.get(0),
-        )?;
-        if !allowed {
+        if !Self::room_member_in(&tx, space_id, room_id, user_id)? {
             return Ok(None);
         }
-        let at = now_ms();
-        tx.execute(
-            "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
-            params![
-                space_id,
-                room_id,
-                kind,
-                author.name,
-                author.id,
-                text,
-                addressed.mentions.to_string(),
-                addressed.audience,
-                at,
-            ],
-        )?;
-        let id = tx.last_insert_rowid();
+        let event =
+            Self::append_event_in(&tx, space_id, room_id, kind, author, text, addressed, None)?;
         tx.commit()?;
-        Ok(Some(new_event(id, kind, author, text, addressed, None, at)))
+        Ok(Some(event))
     }
 
     /// Events of a room with an id above `after`, oldest first.
@@ -1032,7 +1197,8 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
-             WHERE space_id = ?1 AND room_id = ?2 AND id < ?3 AND kind NOT IN ('activity', 'reasoning_summary')
+             WHERE space_id = ?1 AND room_id = ?2 AND id < ?3
+               AND kind NOT IN ('activity', 'reasoning_summary', 'page_draft')
              ORDER BY id DESC LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![space_id, room_id, before, limit as i64], row_event)?;
@@ -1182,19 +1348,33 @@ fn row_space(r: &rusqlite::Row<'_>) -> rusqlite::Result<SpaceView> {
 
 fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let mentions: String = r.get(5)?;
+    let metadata: Option<String> = r.get(7)?;
+    let kind: String = r.get(1)?;
+    let spans = if kind == kind::MESSAGE {
+        metadata.as_deref().and_then(|raw| {
+            // Unknown/malformed spans must not turn into legacy text inference.
+            match serde_json::from_str::<serde_json::Value>(raw) {
+                Ok(serde_json::Value::Object(mut m)) => m
+                    .remove("spans")
+                    .map(|v| serde_json::from_value(v).unwrap_or_default()),
+                _ => Some(Vec::new()),
+            }
+        })
+    } else {
+        None
+    };
     Ok(Event {
         id: r.get(0)?,
-        kind: r.get(1)?,
+        kind,
         actor: r.get(2)?,
         actor_id: r.get(3)?,
         text: r.get(4)?,
         mentions: serde_json::from_str(&mentions)
             .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+        spans,
         audience: r.get(6)?,
         // Unreadable metadata is dropped, never guessed.
-        activity: r
-            .get::<_, Option<String>>(7)?
-            .and_then(|a| serde_json::from_str(&a).ok()),
+        activity: metadata.and_then(|a| serde_json::from_str(&a).ok()),
         created_at: r.get::<_, Option<i64>>(8)?.and_then(event_time),
         attachments: Vec::new(),
     })
@@ -1202,6 +1382,25 @@ fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
 
 fn activity_json(activity: Option<&Activity>) -> anyhow::Result<Option<String>> {
     Ok(activity.map(serde_json::to_string).transpose()?)
+}
+
+/// Space event metadata shares the existing JSON column. Keep the old
+/// activity keys and the mentions array unchanged, including for older
+/// readers. A span-only object has no activity id, so it is not a run event.
+fn event_metadata_json(
+    activity: Option<&Activity>,
+    spans: Option<&[crate::mentions::MentionSpan]>,
+) -> anyhow::Result<Option<String>> {
+    let Some(spans) = spans else {
+        return activity_json(activity);
+    };
+    #[derive(Serialize)]
+    struct Metadata<'a> {
+        #[serde(flatten)]
+        activity: Option<&'a Activity>,
+        spans: &'a [crate::mentions::MentionSpan],
+    }
+    Ok(Some(serde_json::to_string(&Metadata { activity, spans })?))
 }
 
 /// Additive: older databases gain a `description` column on `spaces`;
@@ -1216,6 +1415,37 @@ fn add_space_description(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE spaces ADD COLUMN description TEXT NOT NULL DEFAULT ''")?;
     }
     Ok(())
+}
+
+fn add_runner_queue_floor(conn: &Connection) -> rusqlite::Result<()> {
+    let has = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('spaces') WHERE name = 'runner_drop_before')",
+        [], |r| r.get::<_, bool>(0),
+    )?;
+    if !has {
+        // Jobs are process-local, so there is no old queue to migrate.
+        conn.execute_batch(
+            "ALTER TABLE spaces ADD COLUMN runner_drop_before INTEGER NOT NULL DEFAULT 0",
+        )?;
+    }
+    Ok(())
+}
+
+fn read_runner_queue_version(
+    conn: &Connection,
+    sid: &str,
+) -> rusqlite::Result<Option<crate::jobs::RunnerVersion>> {
+    conn.query_row(
+        "SELECT runner_generation, runner_drop_before FROM spaces WHERE id = ?1",
+        [sid],
+        |r| {
+            Ok(crate::jobs::RunnerVersion {
+                generation: r.get::<_, i64>(0)? as u64,
+                drop_before: r.get::<_, i64>(1)? as u64,
+            })
+        },
+    )
+    .optional()
 }
 
 /// Additive: older databases gain a nullable `activity` column; their
@@ -1237,69 +1467,217 @@ fn add_activity_columns(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Runs live only in this process, so at startup no turn is active. Every
-/// turn whose last lifecycle event is still `started` gets an
-/// `interrupted` event, so it never looks live forever. One server per
-/// database file is assumed (as for the in-memory run registry).
-fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
-    let now = now_ms();
-    // (scope ids, activity JSON, actor, actor id) of each orphaned start.
-    type Orphan = (Vec<String>, String, String, Option<String>);
-    let orphans = |sql: &str| -> rusqlite::Result<Vec<Orphan>> {
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                vec![r.get::<_, String>(0)?, r.get::<_, String>(1)?],
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-            ))
-        })?;
-        rows.collect()
+/// One event table's turn scope, for [`interrupt_orphaned_activity`].
+struct ActivityScope {
+    table: &'static str,
+    /// The columns that, with the turn id, identify one turn's events.
+    scope: &'static str,
+    /// The `metro_meta` key of this table's reconciled high-water mark.
+    mark_key: &'static str,
+    insert: &'static str,
+}
+
+const ACTIVITY_SCOPES: [ActivityScope; 2] = [
+    ActivityScope {
+        table: "space_events",
+        scope: "space_id, room_id",
+        mark_key: "activity_reconciled_through:space_events",
+        insert: "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, created_at, activity)
+                 VALUES (?1, ?2, 'activity', ?3, ?4, '', ?5, ?6)",
+    },
+    ActivityScope {
+        table: "personal_events",
+        scope: "user_id",
+        mark_key: "activity_reconciled_through:personal_events",
+        insert: "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, created_at, activity)
+                 VALUES (?1, 'activity', ?3, ?4, '', ?5, ?6)",
+    },
+];
+
+/// (scope ids, activity JSON, actor, actor id) of one orphaned start. The
+/// activity is `None` when it isn't text (a JSONB blob, never written by this
+/// server), so it can't be read back.
+type OrphanedStart = ([String; 2], Option<String>, String, Option<String>);
+
+/// The query behind [`orphaned_starts`]: the started event of each turn in
+/// `s.table` whose latest lifecycle event is that start, oldest first. With
+/// `bounded`, only turns with an `activity` event above `?1` (the
+/// high-water mark); without it, every row, whatever its id.
+///
+/// A turn is the scope columns plus `json_extract(activity, '$.id')`, the
+/// same comparison as before this pass was set-based. `activity` that
+/// isn't JSON5 text (canonical JSON included) or strictly valid JSONB
+/// belongs to no turn (this server never writes it), and so does one
+/// without an id; neither ends a turn nor is interrupted, and neither can
+/// make startup fail.
+fn orphaned_starts_sql(s: &ActivityScope, bounded: bool) -> String {
+    let scope_cols = if s.table == "space_events" {
+        "e.space_id, e.room_id"
+    } else {
+        "e.user_id, ''"
     };
+    // json_valid flags (SQLite 3.45+; the bundled one is newer): 0x02 JSON5
+    // text, 0x08 strictly valid JSONB. Text that fails it would make
+    // json_extract raise "malformed JSON"; the strict JSONB check, unlike the
+    // superficial one (0x04), also keeps corrupt blobs out. The CASE keeps
+    // json_extract from seeing a row that fails it, and only rows that pass
+    // reach the GROUP BY and the outer json_extract.
+    format!(
+        "SELECT {scope_cols}, e.activity, e.actor, e.actor_id
+         FROM (SELECT MAX(id) AS last FROM {t}
+               WHERE kind = 'activity' {bound}
+                 AND CASE WHEN json_valid(activity, 10) THEN json_extract(activity, '$.id') END IS NOT NULL
+               GROUP BY {scope}, json_extract(activity, '$.id')) m
+         JOIN {t} e ON e.id = m.last
+         WHERE json_extract(e.activity, '$.phase') = 'started'
+         ORDER BY e.id",
+        t = s.table,
+        scope = s.scope,
+        bound = if bounded { "AND id > ?1" } else { "" },
+    )
+}
+
+/// The rows of [`orphaned_starts_sql`]: above `after`, or all of them.
+fn orphaned_starts(
+    conn: &Connection,
+    s: &ActivityScope,
+    after: Option<i64>,
+) -> rusqlite::Result<Vec<OrphanedStart>> {
+    let mut stmt = conn.prepare(&orphaned_starts_sql(s, after.is_some()))?;
+    let params: Vec<i64> = after.into_iter().collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
+        Ok((
+            [r.get::<_, String>(0)?, r.get::<_, String>(1)?],
+            match r.get_ref(2)? {
+                rusqlite::types::ValueRef::Text(t) => {
+                    std::str::from_utf8(t).ok().map(str::to_owned)
+                }
+                _ => None,
+            },
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// Runs live only in this process, so at startup no turn is active. Every
+/// turn whose last lifecycle event is still `started` gets exactly one
+/// `interrupted` event in the same scope, by the same actor, so it never
+/// looks live forever. One server per database file is assumed (as for the
+/// in-memory run registry).
+///
+/// The pass is set-based (one grouped scan, not a lookup per started
+/// event), and bounded by a per-table high-water mark: once a pass commits,
+/// every turn whose events all lie at or below the table's AUTOINCREMENT
+/// sequence is closed (or its start can't be read back as an [`Activity`],
+/// which every later pass would skip again), and no new event can get an id
+/// at or below it (the server never inserts an explicit id). So
+/// the next start only needs turns with an `activity` event above the mark:
+/// for such a turn every one of its events above the mark is scanned, and
+/// the newest of them is its newest overall. Mark and sequence are
+/// untrusted metadata: a mark that isn't the text of a positive integer,
+/// or is above the sequence (it was reset), and a sequence that isn't an
+/// integer, all mean a full scan with no lower bound on ids. A mark is
+/// written only from an integer sequence; while the sequence isn't one, the
+/// mark is removed. Failing to read either is still an error. Everything,
+/// the mark included, is written in one transaction, so a crash at any
+/// point leaves either nothing or all of it.
+///
+/// Maintenance that resets a table's event ids or its `sqlite_sequence`
+/// row, or restores event rows into it, must delete that table's
+/// `activity_reconciled_through:<table>` key in the same transaction.
+/// Deleting events (as deleting a Space does) and `VACUUM` keep the
+/// sequence, so they need nothing.
+///
+/// Known limit: a start that can't be read back as an [`Activity`] is
+/// skipped (and counted in one warning), and once it is below the mark no
+/// later start looks at it again. That only matters if a future build reads
+/// activity more permissively; such a build must change the mark keys
+/// (`activity_reconciled_through:*`) so its first start scans everything.
+fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let now = now_ms();
     let interrupted = |activity: &str| -> Option<String> {
         let a: Activity = serde_json::from_str(activity).ok()?;
         serde_json::to_string(&a.at(activity::INTERRUPTED)).ok()
     };
-    // The latest lifecycle event of each turn, where that one is `started`.
-    const LATEST_STARTED: &str = "e.kind = 'activity'
-          AND json_extract(e.activity, '$.phase') = 'started'
-          AND NOT EXISTS (SELECT 1 FROM {t} l WHERE l.kind = 'activity' AND l.id > e.id {scope}
-                          AND json_extract(l.activity, '$.id') = json_extract(e.activity, '$.id'))";
-    let space_sql = format!(
-        "SELECT e.space_id, e.room_id, e.activity, e.actor, e.actor_id FROM space_events e WHERE {}",
-        LATEST_STARTED.replace("{t}", "space_events").replace(
-            "{scope}",
-            "AND l.space_id = e.space_id AND l.room_id = e.room_id"
-        )
-    );
-    for (ids, activity, actor, actor_id) in orphans(&space_sql)? {
-        let Some(json) = interrupted(&activity) else {
-            continue;
+    let mut unreadable = 0_usize;
+    for s in &ACTIVITY_SCOPES {
+        let seq = reconciled_sequence(&tx, s)?;
+        let mark = reconciled_mark(&tx, s)?;
+        // The mark bounds the scan only when both can be trusted.
+        let after = match (mark, seq) {
+            (Some(m), Some(seq)) if 0 < m && m <= seq => Some(m),
+            _ => None,
         };
-        conn.execute(
-            "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, created_at, activity)
-             VALUES (?1, ?2, 'activity', ?3, ?4, ?5, ?6, ?7)",
-            params![ids[0], ids[1], actor, actor_id, "", now, json],
-        )?;
+        let orphans = orphaned_starts(&tx, s, after)?;
+        let mut stmt = tx.prepare(s.insert)?;
+        for (ids, activity, actor, actor_id) in orphans {
+            let Some(json) = activity.as_deref().and_then(interrupted) else {
+                unreadable += 1;
+                continue;
+            };
+            stmt.execute(params![ids[0], ids[1], actor, actor_id, now, json])?;
+        }
+        drop(stmt);
+        match reconciled_sequence(&tx, s)? {
+            Some(through) if Some(through) == mark => {}
+            Some(through) => {
+                tx.execute(
+                    "INSERT INTO metro_meta (key, value) VALUES (?1, ?2)
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    params![s.mark_key, through.to_string()],
+                )?;
+            }
+            None => {
+                tx.execute("DELETE FROM metro_meta WHERE key = ?1", [s.mark_key])?;
+            }
+        }
     }
-    let personal_sql = format!(
-        "SELECT e.user_id, '', e.activity, e.actor, e.actor_id FROM personal_events e WHERE {}",
-        LATEST_STARTED
-            .replace("{t}", "personal_events")
-            .replace("{scope}", "AND l.user_id = e.user_id")
-    );
-    for (ids, activity, actor, actor_id) in orphans(&personal_sql)? {
-        let Some(json) = interrupted(&activity) else {
-            continue;
-        };
-        conn.execute(
-            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, created_at, activity)
-             VALUES (?1, 'activity', ?2, ?3, ?4, ?5, ?6)",
-            params![ids[0], actor, actor_id, "", now, json],
-        )?;
+    tx.commit()?;
+    if unreadable > 0 {
+        tracing::warn!(
+            count = unreadable,
+            "left turns open at startup whose started event can't be read as activity"
+        );
     }
     Ok(())
+}
+
+/// `s.table`'s AUTOINCREMENT sequence, if it can be trusted: an integer
+/// (no row yet is 0). Any other stored value is `None`; a failed read is an
+/// error.
+fn reconciled_sequence(tx: &Transaction<'_>, s: &ActivityScope) -> rusqlite::Result<Option<i64>> {
+    let mut stmt = tx.prepare("SELECT seq FROM sqlite_sequence WHERE name = ?1")?;
+    let mut rows = stmt.query([s.table])?;
+    let Some(row) = rows.next()? else {
+        return Ok(Some(0));
+    };
+    let seq = match row.get_ref(0)? {
+        rusqlite::types::ValueRef::Integer(n) => Some(n),
+        _ => None,
+    };
+    // Two rows for one table is not a sequence SQLite wrote.
+    Ok(if rows.next()?.is_some() { None } else { seq })
+}
+
+/// `s.table`'s high-water mark, if it can be read: the text of an integer
+/// of at least 0 (`0` bounds nothing). Anything else (absent, not text,
+/// not UTF-8, not such a number) is `None`; a failed read is an error.
+fn reconciled_mark(tx: &Transaction<'_>, s: &ActivityScope) -> rusqlite::Result<Option<i64>> {
+    let mut stmt = tx.prepare("SELECT value FROM metro_meta WHERE key = ?1")?;
+    let mut rows = stmt.query([s.mark_key])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(match row.get_ref(0)? {
+        rusqlite::types::ValueRef::Text(t) => std::str::from_utf8(t)
+            .ok()
+            .and_then(|t| t.parse::<i64>().ok())
+            .filter(|&m| m >= 0),
+        _ => None,
+    })
 }
 
 pub(crate) fn new_event(
@@ -1318,6 +1696,7 @@ pub(crate) fn new_event(
         actor_id: author.id.clone(),
         text: text.to_owned(),
         mentions: addressed.mentions.clone(),
+        spans: addressed.spans.clone(),
         audience: addressed.audience.clone(),
         activity: activity.cloned(),
         created_at: event_time(created_at_ms),
@@ -1341,8 +1720,56 @@ pub(crate) fn now_ms() -> i64 {
 }
 
 #[cfg(test)]
+#[path = "db_activity_tests.rs"]
+mod activity_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_threads_parent_history_ends_at_its_creation_marker() {
+        let db = Db::open_in_memory().unwrap();
+        let s = db.create_space("alice", "a", 10).unwrap();
+        let alice = Author {
+            id: Some("alice".into()),
+            name: "Alice".into(),
+        };
+        let agent = Author::server(actor::AGENT);
+        let room = Addressed::room();
+        let msg = |author: &Author, k: &str, text: &str| {
+            db.append_event(&s.id, LOBBY_ID, k, author, text, &room)
+                .unwrap()
+        };
+        msg(&alice, kind::MESSAGE, "before https://a.example/");
+        // A person can't forge the marker.
+        msg(
+            &alice,
+            kind::MESSAGE,
+            &thread_started_text("research", "t1"),
+        );
+        let thread = db
+            .create_room(&s.id, "research", Some(LOBBY_ID), 10, 10)
+            .unwrap();
+        assert!(
+            db.events_before_thread(&s.id, LOBBY_ID, &thread.id, "research", 50)
+                .unwrap()
+                .is_empty(),
+            "no server marker yet: nothing counts"
+        );
+        msg(
+            &agent,
+            kind::THREAD,
+            &thread_started_text("research", &thread.id),
+        );
+        msg(&alice, kind::MESSAGE, "after https://b.example/");
+        let got = db
+            .events_before_thread(&s.id, LOBBY_ID, &thread.id, "research", 50)
+            .unwrap();
+        let texts: Vec<&str> = got.iter().map(|e| e.text.as_str()).collect();
+        assert!(texts.contains(&"before https://a.example/"), "{texts:?}");
+        assert!(!texts.iter().any(|t| t.contains("b.example")), "{texts:?}");
+    }
 
     #[test]
     fn refuses_populated_legacy_database_and_accepts_empty_one() {

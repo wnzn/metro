@@ -15,13 +15,11 @@
 // to the toolbar's button. Explicit recipients are always shown; an audience
 // phrase is left out only where a typed @agent already says the same.
 //
-// The composer is one raised box: recipients, the growing field, and a bar
-// with the tools, "Ask agent"
-// (explicitly asks the agent) and the plain send at the bottom right. Send
-// never asks the agent by itself; who a message reaches is the store's and
-// the server's rule (explicit recipients decide).
+// In personal Chat, Send asks the agent and Save note does not. In a Space,
+// the composer has separate Ask agent and Send actions; explicit recipients
+// still decide who a Space message reaches.
 
-import { Clipboard, announce, cleanup, computed, effect, localeSettings, signal, untracked } from "nsh";
+import { Clipboard, announce, cleanup, computed, localeSettings, signal } from "nsh";
 import type { CaretEvent, InputRef, JSX, ViewRef } from "nsh";
 import {
   activeEvents,
@@ -33,13 +31,12 @@ import {
   draft,
   isReactable,
   me,
-  members,
-  mentions,
   notice,
   mainPlace,
   REACTION_EMOJI,
   reactionPending,
   retryNow,
+  saveChatNote,
   send,
   sending,
   setDraft,
@@ -47,8 +44,7 @@ import {
   toggleReaction,
 } from "../store";
 import type { RoomEvent } from "../store";
-import { choiceForTurn, ComposerModelControls, knownNoSystemOne } from "./composerModels";
-import { composerAddress } from "./composerAddress";
+import { choiceForTurn, ComposerModelControls } from "./composerModels";
 import type { AttachedFile, EventAgent } from "../api/client";
 import { agentById } from "./space/agents";
 import { SpaceAgentAvatar } from "./space/SpaceAgentAvatar";
@@ -95,6 +91,7 @@ import { ActivityGroupRow, FailureBody, FoldableText } from "./activity/Activity
 import { failureText } from "./activity/failure";
 import { disclosureKey, disclosureScope } from "./activity/disclosure";
 import { DEFAULT_AGENT_NAME, groupTranscript } from "./activity/group";
+import { PageDraftCard } from "./pages/PageDraftCard";
 import { clockFor } from "./chatTime";
 import type { Stamp } from "./chatTime";
 import { PersonAvatar } from "./profile/PersonAvatar";
@@ -107,6 +104,10 @@ import { destinationCue, openMessageFile, pickAttachments, pickNote, picking } f
 import { unstage } from "./attachments/attachmentDraft";
 import { formatSize } from "./library/libraryState";
 import { mediaKindOf } from "../api/library";
+import { MentionedBody, localMentionIdentity, sentMentionLabel } from "./mentions/MentionedBody";
+import { verifiedAgents } from "./mentions/roster";
+import { copyMentionText, leadingMentionsCoverRecipients, sentMentions } from "./mentions/sent";
+import { SenderNotice } from "./senderNotices/SenderNotice";
 
 /** The active place's transcript, with each agent turn folded into one group. */
 const transcriptItems = computed(() => groupTranscript(activeEvents()));
@@ -119,11 +120,11 @@ const rows = computed(() => transcriptRows(transcriptItems(), activeEvents(), cl
 let composerInput: InputRef | null = null;
 
 /** Puts the keyboard focus in the composer, the caret after its text. */
-export function focusComposer() {
+export function focusComposer(caret = draft().length) {
   const input = composerInput;
   if (!input) return;
   input.focus();
-  input.setSelection(draft().length);
+  input.setSelection(caret);
 }
 
 /** Replaces the draft with `text` and focuses it; never sends. */
@@ -213,7 +214,14 @@ function TranscriptRowView(props: { row: () => TranscriptRow }) {
     <If
       when={as("day")}
       else={
-        <If when={as("group")} else={<MessageRow row={() => row() as Of<"event">} />}>
+        <If when={as("group")} else={
+          <If when={mainPlace() === "space" && as("event")?.event.kind === "page_draft" ? as("event") : null}
+            else={<MessageRow row={() => row() as Of<"event">} />}>
+            {entry => <MessageFrame gutter={<StampGutter stamp={entry().stamp} id={entry().event.id} />} continued>
+              <PageDraftCard event={entry().event} />
+            </MessageFrame>}
+          </If>
+        }>
           {(g) => (
             <MessageFrame gutter={<StampGutter stamp={g().stamp} id={g().key} />} continued>
               <ActivityGroupRow
@@ -263,13 +271,21 @@ function authorOf(e: RoomEvent, myId: string | null): Author {
   return { kind: "server", name: e.actor.trim() || "system", tone: toneForEvent(e.kind, e.actor), label: kindLabel(e.kind) };
 }
 
-/** "@you", "@<their display name>" or "@<id>" when no profile is known; agent mentions as eventKinds says. */
-function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null): string {
-  if (m.kind === "agent" && m.agentId) {
-    const a = agentById(activeSpace()?.id, m.agentId);
-    if (m.addressedBy === "classifier") return `${a?.name ?? "agent"} · detected by System One`;
-    if (m.addressedBy === "schedule") return `${a?.name ?? "agent"} · scheduled prompt`;
-    return a ? `@${a.handle}` : "@agent";
+function recipientAgent(id: string | undefined) {
+  const sid = activeSpace()?.id;
+  return mainPlace() === "space" ? (sid ? verifiedAgents(sid)?.find(a => a.id === id) : undefined) : agentById(sid, id);
+}
+
+function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null, lastKnown?: string): string {
+  if (m.kind === "agent" && !m.addressedBy && mainPlace() === "chat") return "to the agent";
+  if (m.kind === "agent" && m.addressedBy && (m.agentId || mainPlace() === "space")) {
+    const a = recipientAgent(m.agentId);
+    return `${a?.name ?? "agent"} · ${m.addressedBy === "classifier" ? "detected by System One" : "scheduled prompt"}`;
+  }
+  if (mainPlace() === "space") {
+    const sid = activeSpace()?.id;
+    const fallback = lastKnown ?? (m.kind === "user" ? "Person unavailable" : m.agentId ? "Agent unavailable" : "@agent");
+    return sid ? sentMentionLabel(sid, m, fallback) : fallback;
   }
   if (m.kind === "user" && m.id !== myId) {
     const name = profileName(m.id);
@@ -279,19 +295,29 @@ function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: stri
 }
 
 /** What a screen reader hears for a recipient: the display name and the stable id behind it. */
-function recipientDescription(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null): string {
+function recipientDescription(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null, lastKnown?: string): string {
   if (m.kind === "agent" && m.agentId) {
-    const a = agentById(activeSpace()?.id, m.agentId);
+    const a = recipientAgent(m.agentId);
     return `Addressed to ${a ? `${a.name} (@${a.handle})` : "an agent"}${m.addressedBy ? ` (${recipientText(m, myId)})` : ""}`;
   }
   if (m.kind === "agent") return `Addressed to the agent${m.addressedBy ? ` (${mentionText(m, myId)})` : ""}`;
   if (m.id === myId) return "Addressed to you";
+  const sid = activeSpace()?.id;
+  if (mainPlace() === "space") {
+    const identity = sid && localMentionIdentity(sid, m);
+    if (!identity) return lastKnown ? `Addressed to ${lastKnown}, unavailable` : "Addressed to an unavailable person";
+    return identity.name !== m.id ? `Addressed to ${identity.name} (@${m.id})` : `Addressed to @${m.id}`;
+  }
   const name = profileName(m.id);
   return name && name !== m.id ? `Addressed to ${name} (@${m.id})` : `Addressed to @${m.id}`;
 }
 
 function MessageRow(props: { row: () => Of<"event"> }) {
   const event = () => props.row().event;
+  const spaceId = () => mainPlace() === "space" ? activeSpace()?.id : undefined;
+  const pieces = computed(() => spaceId() ? sentMentions(event()) : []);
+  const storedSpelling = (m: NonNullable<RoomEvent["mentions"]>[number]) =>
+    pieces().find(piece => piece.mention === m)?.literal;
   const tone = () => toneForEvent(event().kind, event().actor);
   const author = () => authorOf(event(), me());
   const forMe = () => mentionsMe(event().mentions, me());
@@ -300,10 +326,13 @@ function MessageRow(props: { row: () => Of<"event"> }) {
   const continued = () => props.row().continued;
   /**
    * A follow-up's recipients: in a slim line level with the time in the
-   * gutter, and left out when the text already starts by naming them all.
+   * gutter. In a Space only actual leading bindings can stand in for it.
    */
+  const leadingRecipients = () => spaceId()
+    ? leadingMentionsCoverRecipients(event(), pieces())
+    : textNamesRecipients(event().text, event().mentions);
   const followUpRecipients = () =>
-    continued() && hasRecipients() && !(textNamesRecipients(event().text, event().mentions) && !audience().agentBadge && !audience().peopleNote);
+    continued() && hasRecipients() && !(leadingRecipients() && !audience().agentBadge && !audience().peopleNote);
   /** A failure says one plain sentence; the technical text folds under Details. */
   const failure = () => (isFailureKind(event().kind) ? failureText(event().text) : null);
   const person = () => {
@@ -329,7 +358,9 @@ function MessageRow(props: { row: () => Of<"event"> }) {
     reactButton?.focus();
   };
   const copy = () => {
-    void Clipboard.writeText(event().text).then(
+    const sid = spaceId();
+    const text = sid ? copyMentionText(event().text, pieces(), piece => sentMentionLabel(sid, piece.mention, piece.literal)) : event().text;
+    void Clipboard.writeText(text).then(
       () => {
         copied.set(true);
         announce("Message copied");
@@ -434,8 +465,8 @@ function MessageRow(props: { row: () => Of<"event"> }) {
                 tone={m().kind === "agent" ? "agent" : "neutral"}
                 slim={continued()}
                 self={m().kind === "user" && (m() as { id: string }).id === me()}
-                label={recipientText(m(), me())}
-                accessibilityLabel={recipientDescription(m(), me())}
+                label={recipientText(m(), me(), storedSpelling(m()))}
+                accessibilityLabel={recipientDescription(m(), me(), storedSpelling(m()))}
               />
             )}
           </Each>
@@ -445,7 +476,10 @@ function MessageRow(props: { row: () => Of<"event"> }) {
         when={failure()}
         else={
           <If when={event().text.trim().length > 0}>
-            <FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />
+            <If when={pieces().length > 0 ? spaceId() : undefined}
+              else={<FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />}>
+              {(sid) => <MentionedBody event={event()} sid={sid()} pieces={pieces()} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />}
+            </If>
           </If>
         }
       >
@@ -475,6 +509,7 @@ function MessageRow(props: { row: () => Of<"event"> }) {
       <If when={reactable()}>
         <Reactions eventId={event().id} />
       </If>
+      <SenderNotice event={event} focusComposer={focusComposer} />
     </MessageFrame>
   );
 }
@@ -661,6 +696,7 @@ export function Composer(props: {
   onSubmitIntercept?: () => boolean;
   /** The caret moved in the field (its box in the window anchors mention suggestions). */
   onCaretMove?: (e: CaretEvent) => void;
+  onSelectionChange?: (selection: { start: number; end: number }) => void;
   /** The field took or lost the keyboard focus. */
   onFocusChange?: (focused: boolean) => void;
   /** The agent Ask agent asks (a Space with several agents); none: the default (or the classifier's pick). */
@@ -675,34 +711,22 @@ export function Composer(props: {
   const hasFiles = () => stagedFor(composerScope()).length > 0;
   const ready = () => !props.disabled && status().phase !== "signedOut" && !sending();
   const canSend = () => ready() && (draft().trim().length > 0 || hasFiles());
-  // Asking the agent needs a typed question: files alone are saved, not sent to it.
+  // A Space Ask needs a typed question; Chat Send can start a turn with files alone.
   const canAsk = () => ready() && draft().trim().length > 0;
   const personal = () => mainPlace() === "chat";
-  const addressed = computed(() => composerAddress(draft(), personal() ? [] : (members() ?? []).map(m => m.userId)));
-  const toAgent = () => addressed().agent || (!personal() && mentions().some(m => m.kind === "agent"));
-  // Decide once when a new draft starts (including a suggestion). A catalog
-  // that finishes loading while somebody writes must never promote their Send.
-  const askDraft = signal(false);
-  let started = false;
-  effect(() => {
-    const filled = personal() && !!draft().trim();
-    if (filled !== started) {
-      started = filled;
-      askDraft.set(filled && untracked(knownNoSystemOne));
-    }
-  });
-  const primaryAsk = () => personal() && askDraft() && !!draft().trim() && (!addressed().people || toAgent());
   const post = (ask: boolean) => {
-    if (!(ask ? canAsk() : canSend())) return;
-    if (draft().trim() && (ask || toAgent())) {
+    if (!(ask && !personal() ? canAsk() : canSend())) return;
+    if (!personal()) {
+      void send(ask, choiceForTurn, ask ? props.askAgentId : undefined);
+    } else if (ask) {
       const { error, choice } = choiceForTurn();
       if (error) { actionError.set(error); return; }
-      void send(ask, choice, ask ? props.askAgentId : undefined);
+      void send(ask, choice);
     } else void send(false);
   };
   const submit = () => {
     if (props.onSubmitIntercept?.()) return;
-    post(primaryAsk());
+    post(personal());
   };
   return (
     <Column padX={4} padY={3} gap={2}>
@@ -719,6 +743,7 @@ export function Composer(props: {
           onSubmit={submit}
           onFocusChange={(f) => props.onFocusChange?.(f)}
           onCaretMove={props.onCaretMove}
+          onSelectionChange={props.onSelectionChange}
           placeholder={props.placeholder}
           disabled={props.disabled}
         />
@@ -739,30 +764,48 @@ export function Composer(props: {
             </>
           }
           trailing={
-            <>
-              <AskAgentButton
-                testID="ask-agent"
-                primary={primaryAsk()}
-                label={`${props.askLabel ?? "Ask agent"}${primaryAsk() ? " ↵" : ""}`}
-                picture={props.askPicture}
-                chooser={props.askChooser}
-                busyLabel="Asking…"
-                accessibilityLabel={`Send and ask the agent to answer. ${primaryAsk() ? "Return asks the agent. " : ""}${props.agentHint}${hasFiles() ? " Attached files are saved to the Library, not sent to the agent." : ""}`}
-                tooltip={primaryAsk() ? "Ask agent (Return)" : props.agentHint}
-                busy={sending() === "agent"}
-                disabled={!canAsk()}
-                onPress={() => post(true)}
+            <If when={personal()} else={
+              <>
+                <AskAgentButton
+                  testID="ask-agent"
+                  label={props.askLabel ?? "Ask agent"}
+                  picture={props.askPicture}
+                  chooser={props.askChooser}
+                  busyLabel="Asking…"
+                  accessibilityLabel={`Send and ask the agent to answer. ${props.agentHint}${hasFiles() ? " Attached files are saved to the Library, not sent to the agent." : ""}`}
+                  tooltip={props.agentHint}
+                  busy={sending() === "agent"}
+                  disabled={!canAsk()}
+                  onPress={() => post(true)}
+                />
+                <SendButton
+                  testID="send"
+                  accessibilityLabel={hasFiles() ? "Send with files" : "Send"}
+                  tooltip="Send (Return)"
+                  busy={sending() === "message"}
+                  disabled={!canSend()}
+                  onPress={() => post(false)}
+                />
+              </>
+            }>
+              <SendButton
+                testID="save-note"
+                note
+                accessibilityLabel="Save note without asking the agent"
+                tooltip="Save note without asking the agent"
+                busy={sending() === "message"}
+                disabled={!canSend()}
+                onPress={() => void saveChatNote()}
               />
               <SendButton
                 testID="send"
-                note={primaryAsk() && !toAgent()}
-                accessibilityLabel={primaryAsk() && !toAgent() ? "Save note without asking the agent" : hasFiles() ? "Send with files" : "Send"}
-                tooltip={primaryAsk() ? (toAgent() ? "Send to mentioned recipients" : "Save note without asking the agent") : "Send (Return)"}
-                busy={sending() === "message"}
+                accessibilityLabel={hasFiles() ? "Send to your agent. The agent cannot read attached files." : "Send to your agent"}
+                tooltip="Send to your agent (Return)"
+                busy={sending() === "agent"}
                 disabled={!canSend()}
-                onPress={() => post(false)}
+                onPress={() => post(true)}
               />
-            </>
+            </If>
           }
         />
       </ComposerBox>

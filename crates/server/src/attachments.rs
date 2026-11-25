@@ -117,6 +117,8 @@ pub enum Append {
     Posted(Box<Event>),
     /// The sender is not a member of the Space now, or the room is gone.
     NoRoom,
+    /// At least one concrete recipient is no longer valid in this Space.
+    NoRecipient,
     /// A file is missing, deleted, or not one this place may attach.
     NoAsset,
 }
@@ -130,6 +132,7 @@ pub fn append_message(
     text: &str,
     addressed: &Addressed,
     asset_ids: &[String],
+    recipients: &[crate::mentions::Mention],
 ) -> anyhow::Result<Append> {
     let Some(sender) = author.id.as_deref() else {
         return Ok(Append::NoRoom);
@@ -137,18 +140,15 @@ pub fn append_message(
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     if let Place::Space { space_id, room_id } = place {
-        let allowed: bool = tx.query_row(
-            "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)
-                AND EXISTS (SELECT 1 FROM space_rooms WHERE space_id = ?1 AND id = ?3)",
-            params![space_id, sender, room_id],
-            |r| r.get(0),
-        )?;
-        if !allowed {
+        if !Db::room_member_in(&tx, space_id, room_id, sender)? {
             return Ok(Append::NoRoom);
+        }
+        if !Db::recipients_current_in(&tx, space_id, recipients)? {
+            return Ok(Append::NoRecipient);
         }
     }
     let mut attachments = Vec::with_capacity(asset_ids.len());
-    {
+    if !asset_ids.is_empty() {
         // The sender's own upload, of exactly this place: personal for the
         // Chat, this Space for a room (membership was checked above). With bytes.
         let mut stmt = tx.prepare_cached(
@@ -171,48 +171,52 @@ pub fn append_message(
             }
         }
     }
-    let at = crate::db::now_ms();
-    match place {
-        Place::Personal { user_id } => tx.execute(
-            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
-            params![
-                user_id,
+    let mut event = match place {
+        Place::Personal { user_id } => {
+            let at = crate::db::now_ms();
+            tx.execute(
+                "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, \
+                 mentions, audience, created_at, activity) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+                params![
+                    user_id,
+                    kind::MESSAGE,
+                    author.name,
+                    author.id,
+                    text,
+                    addressed.mentions.to_string(),
+                    addressed.audience,
+                    at,
+                ],
+            )?;
+            crate::db::new_event(
+                tx.last_insert_rowid(),
                 kind::MESSAGE,
-                author.name,
-                author.id,
+                author,
                 text,
-                addressed.mentions.to_string(),
-                addressed.audience,
+                addressed,
+                None,
                 at,
-            ],
-        )?,
-        Place::Space { space_id, room_id } => tx.execute(
-            "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
-            params![
-                space_id,
-                room_id,
-                kind::MESSAGE,
-                author.name,
-                author.id,
-                text,
-                addressed.mentions.to_string(),
-                addressed.audience,
-                at,
-            ],
+            )
+        }
+        Place::Space { space_id, room_id } => Db::append_event_in(
+            &tx,
+            space_id,
+            room_id,
+            kind::MESSAGE,
+            author,
+            text,
+            addressed,
+            None,
         )?,
     };
-    let event_id = tx.last_insert_rowid();
     for (position, a) in attachments.iter().enumerate() {
         tx.execute(
             "INSERT INTO message_attachments (scope, event_id, position, asset_id) VALUES (?1, ?2, ?3, ?4)",
-            params![place.scope(), event_id, position as i64, a.asset_id],
+            params![place.scope(), event.id, position as i64, a.asset_id],
         )?;
     }
     tx.commit()?;
-    let mut event =
-        crate::db::new_event(event_id, kind::MESSAGE, author, text, addressed, None, at);
     event.attachments = attachments.into_iter().map(Attachment::File).collect();
     Ok(Append::Posted(Box::new(event)))
 }

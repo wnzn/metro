@@ -6,9 +6,10 @@ import type { App } from "nsh/test";
 import { BASE, fakeServer, header, TOKENS, world } from "./test/fakeServer";
 import { serverPlace } from "./src/features/Sidebar";
 import { spaceWorld } from "./src/features/space/test/fixtures";
+import { launched } from "./test/launched";
 
 async function openApp(f: ReturnType<typeof fakeServer>, storage: Record<string, string> = {}) {
-  return open("./App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
+  return open("./App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
 }
 
 async function signIn(app: App, user: string, url = BASE) {
@@ -37,12 +38,16 @@ async function askAgent(app: App) {
   await app.press("id:ask-agent");
 }
 
-test("refuses to send a token over plain HTTP to a remote host", async () => {
+test("asks before sending a token over plain HTTP to a remote host, and sends nothing until confirmed", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "alice", "http://192.168.1.20:8787");
-  await app.waitFor("id:connect-error");
-  expect(text(app)).toContain("Refusing to send your access token over plain HTTP");
+  await app.waitFor("id:plain-http-consent");
+  expect(text(app)).toContain("This connection isn't encrypted.");
+  expect(app.shows("id:account-menu")).toBe(false);
+  expect(app.requests()).toHaveLength(0);
+  await app.press("id:plain-http-consent:cancel");
+  await app.waitFor("id:connect");
   expect(app.requests()).toHaveLength(0);
 });
 
@@ -107,12 +112,13 @@ test("@mentions: pick a member, send, prune and clear on room change", async () 
   await app.waitFor("id:mention-chip:bob");
   expect(app.value("id:composer")).toBe("can you look @bob ");
   await app.press("id:send");
-  await app.waitFor("text:can you look @bob");
+  await app.waitUntil(() => f.posts().some(p => p.path.endsWith("/messages")));
   const sent = f.posts().find((p) => p.path.endsWith("/messages"))!;
-  expect(sent.body).toEqual({ text: "can you look @bob", invoke_agent: false, mentions: [{ kind: "user", id: "bob" }] });
+  expect(sent.body).toEqual({ text: "can you look @bob ", invoke_agent: false, infer_text_mentions: false,
+    mentions: [{ kind: "user", id: "bob" }], spans: [{ start: 13, end: 17, index: 0 }] });
   expect(f.state.events.get("acme/lobby")!.some((e) => e.actor === "agent")).toBe(false); // a person only
   // The header names the recipient itself: a pill for bob, no agent badge, no "to people" note.
-  const toBob = f.state.events.get("acme/lobby")!.find((e) => e.text === "can you look @bob")!;
+  const toBob = f.state.events.get("acme/lobby")!.find((e) => e.text.trim() === "can you look @bob")!;
   await app.waitFor(`id:recipient:${toBob.id}:bob`);
   expect(app.shows("text:@bob")).toBe(true);
   expect(app.shows("label:Addressed to @bob")).toBe(true);
@@ -124,7 +130,7 @@ test("@mentions: pick a member, send, prune and clear on room change", async () 
   // Ask agent with no mention: invoke_agent on the wire, and one "to the agent" badge.
   await app.type("id:composer", "summarise the lobby");
   await askAgent(app);
-  expect(f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!.body).toEqual({ text: "summarise the lobby", invoke_agent: true });
+  expect(f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!.body).toEqual({ text: "summarise the lobby", invoke_agent: true, infer_text_mentions: false });
   const asked = f.state.events.get("acme/lobby")!.find((e) => e.text === "summarise the lobby")!;
   await app.waitFor(`id:recipient:${asked.id}:ask-agent`);
   expect(app.count(`id:recipient:${asked.id}:ask-agent`)).toBe(1);
@@ -158,7 +164,7 @@ test("mixed @bob @agent is addressed to both and starts the agent with no extra 
   await app.waitFor("id:mention-chip:agent");
   await app.waitFor("id:mention-chip:bob");
   await app.press("id:send");
-  await app.waitFor("text:please both look @bob @agent");
+  await app.waitUntil(() => f.posts().some(p => p.path.endsWith("/messages")));
   const sent = f.posts().filter((p) => p.path.endsWith("/messages")).at(-1)!;
   const body = sent.body as { text: string; invoke_agent: boolean; mentions: { kind: string; id?: string }[] };
   // On the wire: both recipients, each once; the agent is addressed explicitly.
@@ -166,7 +172,7 @@ test("mixed @bob @agent is addressed to both and starts the agent with no extra 
   expect(body.mentions.filter((m) => m.kind === "agent")).toHaveLength(1);
   expect(body.mentions).toHaveLength(2);
   expect(body.invoke_agent === true || body.mentions.some((m) => m.kind === "agent")).toBe(true);
-  expect(body.text).toBe("please both look @bob @agent");
+  expect(body.text).toBe("please both look @bob @agent ");
   // In the transcript: exactly one agent badge (the @agent pill, no second
   // Ask agent badge) and one pill for bob; no verbose audience sentence.
   const ev = f.state.events.get("acme/lobby")!.find((e) => e.actor === "alice" && e.text.startsWith("please both look"))!;
@@ -183,15 +189,14 @@ test("mixed @bob @agent is addressed to both and starts the agent with no extra 
   expect(f.posts().some((p) => p.path === "/v1/systemone")).toBe(false);
 });
 
-test("a message that mentions me is highlighted as @you", async () => {
+test("a message that mentions me shows my current label and announces it as addressed to me", async () => {
   const f = world();
   const ev = f.post("acme/lobby", { kind: "message", actor: "bob", text: "@alice please review", mentions: [{ kind: "user", id: "alice" }, { kind: "agent" }], audience: "mixed" });
   const app = await openApp(f);
   await signIn(app, "alice");
   await openAcme(app);
   await app.waitFor(`id:recipient:${ev.id}:alice`);
-  // My pill reads @you, and says so to a screen reader; the agent has its one pill.
-  expect(app.shows("text:@you")).toBe(true);
+  expect(app.shows(`id:recipient:${ev.id}:alice >> text:@alice`)).toBe(true);
   expect(app.shows("label:Addressed to you")).toBe(true);
   expect(app.count(`id:recipient:${ev.id}:agent`)).toBe(1);
   expect(app.shows(`id:recipient:${ev.id}:ask-agent`)).toBe(false);
@@ -254,7 +259,7 @@ test("reactions: add and remove mine, fold the agent's acknowledgement, no extra
 test("Test runner lives with the runner controls, needs this Space's runner and shows its tool output collapsed", async () => {
   const w = spaceWorld();
   const f = w.f;
-  const app = await open("./App.tsx", { network: w.network as any, platform: "linux", width: 1200, height: 800 });
+  const app = await open("./App.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1200, height: 800 });
   await signIn(app, "alice");
   await openAcme(app);
   expect(app.shows("text:Runner attached")).toBe(true);
@@ -262,8 +267,9 @@ test("Test runner lives with the runner controls, needs this Space's runner and 
   expect(app.shows("id:run-demo")).toBe(false);
   expect(app.shows("id:test-runner")).toBe(false);
   await app.press("id:space-settings-open");
-  await app.press("id:space-settings-tab:members");
-  expect(app.shows("text:Lists the workspace on this Space's runner; no model is used. The listing is posted in the room you have open.")).toBe(true);
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:test-runner-row");
+  expect(app.shows("text:Lists the workspace on this Space's runner; no model is used. The listing is posted in # lobby.")).toBe(true);
   await app.press("id:test-runner");
   await app.waitFor("text:Requested. The listing appears in # lobby as Runner activity.");
   expect(f.posts().at(-1)).toMatchObject({ path: "/v1/spaces/acme/rooms/lobby/demo", body: {} });
@@ -273,25 +279,28 @@ test("Test runner lives with the runner controls, needs this Space's runner and 
   expect(app.shows("text:/thinking/")).toBe(false);
   expect(app.shows("text:README.md\nsrc/")).toBe(false); // collapsed until opened
 
-  // Manage offers it beside the runner's status, only while a runner is attached.
+  // The old Manage shortcut opens Members; Runner houses the one test control.
   await app.press("id:manage-space");
+  await app.waitFor("id:space-members");
+  expect(app.shows("id:test-runner")).toBe(false);
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:runner-card >> id:test-runner");
-  await app.press("id:close-manage");
+  await app.press("id:space-settings-close");
 
   // A Space without a runner, which alice doesn't own: its status, nothing to test, no management.
   await app.press("id:space:side");
   await app.waitFor("text:No runner");
   await app.press("id:space-settings-open");
-  await app.press("id:space-settings-tab:members");
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:space-runner-status");
   expect(app.shows("id:space-runner-status >> text:No runner")).toBe(true);
   expect(app.shows("id:test-runner")).toBe(false);
-  expect(app.shows("id:open-manage")).toBe(false);
+  expect(app.shows("id:space-runner-advanced:toggle")).toBe(false);
 });
 
 test("owners manage members and see a runner token once; members can't manage", async () => {
-  const f = world();
-  const app = await openApp(f);
+  const w = spaceWorld();
+  const app = await open("./App.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1200, height: 800 });
   await signIn(app, "alice");
   await openAcme(app);
   await app.press("id:manage-space");
@@ -300,26 +309,37 @@ test("owners manage members and see a runner token once; members can't manage", 
   await app.press("id:add-member");
   await app.waitFor("id:member:carol");
   await app.press("id:remove-member:carol");
+  await app.press("id:remove-member:carol:confirm");
   await app.waitFor("id:member:carol", { state: "gone" });
 
   // Acme has a dedicated (legacy) token: the owner can still rotate it.
+  await app.press("id:space-settings-tab:runner");
+  await app.press("id:space-runner-advanced:toggle");
   await app.waitFor("id:dedicated-runner");
   await app.press("id:issue-runner-token");
+  await app.press("id:issue-runner-token:confirm");
   await app.waitFor("id:runner-token-value");
   expect(text(app)).not.toContain("secret-runner-token-"); // masked until asked
   await app.press("id:copy-runner-token");
   expect(app.clipboard()).toContain("secret-runner-token-");
   await app.press("id:reveal-toggle");
   expect(text(app)).toContain("secret-runner-token-");
-  await app.press("id:close-manage"); // leaving the view forgets it
+  await app.press("id:space-settings-close"); // leaving the dialog forgets it
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:runner-card");
+  expect(app.shows("id:token-reveal")).toBe(false);
   expect(text(app)).not.toContain("secret-runner-token-");
   expect(JSON.stringify(app.storage())).not.toContain("secret-runner-token-");
 
+  await app.press("id:space-settings-close");
   await app.press("id:space:side"); // Bob owns Side; Alice is a member
   await app.waitFor("text:side lobby only");
   expect(app.shows("id:manage-space")).toBe(false);
+  await app.press("id:space-settings-open");
+  await app.press("id:space-settings-tab:members");
+  await app.waitFor("id:member:bob");
+  expect(app.shows("id:add-member")).toBe(false);
 });
 
 test("losing membership purges the Space and returns to the Chat", async () => {
@@ -341,7 +361,7 @@ test("Chat: personal messages, runs, follow-up to an explicit Space and room, st
   await signIn(app, "alice");
   await app.waitFor("id:chat-view");
   await app.type("id:composer", "what's running?");
-  await askAgent(app);
+  await app.press("id:send");
   await app.waitFor("text:(agent) re: what's running?");
   expect(f.posts().find((p) => p.path === "/v1/chat/messages")?.body).toMatchObject({ text: "what's running?", invoke_agent: true });
 
@@ -462,7 +482,8 @@ test("Settings work without any Space; a personal runner's token is shown once, 
   await signIn(app, "carol");
   await app.waitFor("id:onboarding");
   await openSettings(app, "runners");
-  await app.waitFor("text:No runners yet");
+  await app.waitFor("text:No other personal runners");
+  await app.press("id:runner-add-toggle");
   // Not an org admin: organization runners can't be chosen.
   expect(app.enabled("id:runner-visibility:organization")).toBe(false);
 
@@ -507,6 +528,7 @@ test("org admins add organization runners; others see them but can't manage them
   const app = await openApp(f);
   await signIn(app, "alice");
   await openSettings(app, "runners");
+  await app.press("id:runner-add-toggle");
   await app.type("id:runner-name", "Shared CI");
   await app.press("id:runner-visibility:organization");
   await app.press("id:add-runner");
@@ -519,14 +541,15 @@ test("org admins add organization runners; others see them but can't manage them
   await app.waitFor(`id:rotate-runner:${org.id}`);
   await app.press(`id:rotate-runner:${org.id}`);
   await app.waitFor("text:/Spaces you belong to that use it: Side project/");
-  await app.press("id:confirm-rotate-runner");
+  await app.press(`id:rotate-runner:${org.id}:confirm`);
   await app.waitFor("text:/New token for/");
   expect(text(app)).not.toContain(org.token);
   await app.press("id:hide-runner-token");
 
   await app.press(`id:delete-runner:${org.id}`);
-  await app.waitFor("text:/Deleting revokes its token/");
-  await app.press("id:confirm-delete-runner");
+  await app.waitFor("text:/Deleting .* revokes its token/");
+  await app.waitUntil(() => app.enabled(`id:delete-runner:${org.id}:confirm`));
+  await app.press(`id:delete-runner:${org.id}:confirm`);
   await app.waitFor("text:/It no longer serves any Space/");
   expect(f.state.runners.has(org.id)).toBe(false);
   expect(f.state.attached.has("side")).toBe(false);
@@ -539,7 +562,7 @@ test("org admins add organization runners; others see them but can't manage them
   await bob.waitFor("text:Org builder");
   expect(bob.shows(`id:rotate-runner:${other.id}`)).toBe(false);
   expect(bob.shows(`id:delete-runner:${other.id}`)).toBe(false);
-  expect(bob.shows("text:Organization · managed by org admins. You can attach it to Spaces you own.")).toBe(true);
+  expect(bob.shows("text:Any Space owner can attach these. Organization admins manage them.")).toBe(true);
 });
 
 test("a Space owner attaches and detaches a runner from the same list; attached is not online", async () => {
@@ -552,23 +575,26 @@ test("a Space owner attaches and detaches a runner from the same list; attached 
   await app.press("id:space:side");
   await app.waitFor("text:side lobby only");
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:attach-runner-list");
+  await app.waitFor(`id:space-runner-attach:${mine.id}`);
   expect(app.shows(`id:attachable:${org.id}`)).toBe(true);
   expect(app.shows(`id:attachable:${mine.id}`)).toBe(true);
   expect(app.shows("text:Alice private")).toBe(false);
 
-  await app.press(`id:attach-runner:${mine.id}`);
+  await app.press(`id:space-runner-attach:${mine.id}`);
   await app.waitFor("id:attached-runner");
-  expect(f.posts().at(-1)).toMatchObject({ method: "PUT", path: "/v1/spaces/side/runner", body: { runner_id: mine.id } });
+  expect(f.posts().at(-1)).toMatchObject({ method: "POST", path: "/v1/spaces/side/runner/attach-if-empty", body: { runner_id: mine.id } });
   // Attached only routes this Space's jobs; it never claims the runner is up.
-  expect(text(app)).toMatch(/Attached or paired means [^|]*(it doesn't mean the runner is online|not that it[’']s online)/);
+  expect(text(app)).toContain("The assignment doesn't mean it's online.");
   expect(app.shows("id:runner-card >> text:Online")).toBe(false);
   expect(text(app)).not.toContain(mine.token);
 
-  await app.press("id:detach-runner");
-  await app.press("id:confirm-detach");
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
   await app.waitFor("id:attach-runner-list");
   expect(f.state.attached.has("side")).toBe(false);
+  expect(f.posts().at(-1)).toMatchObject({ method: "POST", path: "/v1/spaces/side/runner/detach-if-current" });
   await app.press("id:open-runner-settings");
   await app.waitFor("id:runners-settings");
 });
@@ -870,21 +896,30 @@ test("Settings opens as a modal over a room and closes back to the same room and
   expect(app.shows("text:hello from bob in acme")).toBe(true);
 });
 
-test("Settings opened from a Space's management returns to it; a runner token shown in Settings is gone after closing", async () => {
+test("Settings opened from a Space's Runner page returns to its room and draft, and forgets the runner token", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "bob");
   await app.press("id:space:side");
   await app.waitFor("text:side lobby only");
+  await app.type("id:composer", "Half-written Side draft");
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:attach-runner-list");
   await app.press("id:open-runner-settings");
   await app.waitFor("id:runners-settings");
+  await app.press("id:runner-add-toggle");
   await app.type("id:runner-name", "Bob laptop");
   await app.press("id:add-runner");
   await app.waitFor("id:token-reveal");
   await app.press("id:settings-close");
-  await app.waitFor("id:attach-runner-list"); // still managing Side
+  await app.waitFor("id:settings-dialog", { state: "gone" });
+  expect(app.shows("text:side lobby only")).toBe(true);
+  expect(app.value("id:composer")).toBe("Half-written Side draft");
+  await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:attach-runner-list");
+  await app.press("id:space-settings-close");
   await app.press("id:nav-settings");
   await app.waitFor("id:runners-settings");
   expect(app.shows("id:token-reveal")).toBe(false);
@@ -1004,16 +1039,29 @@ test("with the operator's model, no onboarding card shows: Chat already works", 
 test("a late settings answer never lands after sign-out or in the next user's session", async () => {
   const f = world();
   f.addRunner("Alice private", "personal", "alice");
-  f.state.delays.set("/v1/runners", 600);
-  const app = await openApp(f);
+  const delay = 2000;
+  const held = f.answerLate("/v1/runners", TOKENS.alice!, delay);
+  const rosterReads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/runners").map((p) => p.user);
+  const app = await open("./App.tsx", {
+    modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800, clock: {},
+  });
   await signIn(app, "alice");
-  await app.press("id:nav-settings");
+  await openSettings(app, "runners");
+  await app.waitUntil(() => held.arrived() === 1, { timeout: 500 });
+  expect(app.shows("id:runner-list >> text:Loading runners…")).toBe(true);
   await app.press("id:settings-close");
   await signOut(app); // while GET /v1/runners is still on its way
-  f.state.delays.delete("/v1/runners");
+  await app.waitFor("id:connect");
   await signIn(app, "bob");
   await openSettings(app, "runners");
-  await app.waitFor("text:No runners yet");
-  await app.wait(800);
+  const noPersonal = "id:runner-list >> text:No other personal runners";
+  const noOrganization = "id:organization-runner-list >> text:No organization runners";
+  await app.waitFor(noPersonal, { timeout: 500 });
+  expect(app.shows(noOrganization)).toBe(true);
+  expect(rosterReads()).toEqual(["alice", "bob"]);
+  expect(app.shows("text:Alice private")).toBe(false);
+  await app.clock!.runFor(delay); // Alice's held response now comes due during Bob's session.
+  expect(app.shows(noPersonal)).toBe(true);
+  expect(app.shows(noOrganization)).toBe(true);
   expect(app.shows("text:Alice private")).toBe(false);
 });

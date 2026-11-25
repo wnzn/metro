@@ -10,11 +10,12 @@ import { BASE, TOKENS, world } from "../../test/fakeServer";
 import { headerAudience, textNamesRecipients } from "./transcriptRows";
 import theme from "../../theme/theme.json";
 import { APPEARANCE_KEY } from "../ui";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof world>;
 
 async function inAcme(f: F, storage: Record<string, string> = {}) {
-  const app = await open("../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
+  const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);
@@ -108,7 +109,8 @@ test("@ suggestions: Return picks the highlighted one and sends nothing", async 
   await app.waitFor("id:mention-chip:agent");
   await app.submit("id:composer");
   await app.waitUntil(() => messages(f).length === before + 1);
-  expect(messages(f).at(-1)!.body).toEqual({ text: "ping @bob @agent", invoke_agent: false, mentions: [{ kind: "user", id: "bob" }, { kind: "agent" }] });
+  expect(messages(f).at(-1)!.body).toEqual({ text: "ping @bob @agent ", invoke_agent: false, infer_text_mentions: false,
+    mentions: [{ kind: "user", id: "bob" }, { kind: "agent" }], spans: [{ start: 5, end: 9, index: 0 }, { start: 10, end: 16, index: 1 }] });
 });
 
 test("@ then Down then Return picks the second suggestion with the caret still in the field; nothing is sent", async () => {
@@ -175,7 +177,7 @@ test("the agent has a glyph, not initials; a message to me has the rail and expl
   await app.waitFor("text:on it");
   expect(app.shows(`id:avatar:${reply.id}`)).toBe(true);
   expect(app.shows(`id:avatar:${reply.id} >> text:/^[A-Z]{1,2}$/`)).toBe(false);
-  expect(app.shows(`id:recipient:${toMe.id}:alice >> text:@you`)).toBe(true);
+  expect(app.shows(`id:recipient:${toMe.id}:alice >> text:@alice`)).toBe(true);
   expect(app.shows("label:Addressed to you")).toBe(true);
 });
 
@@ -278,6 +280,32 @@ test("follow-ups: no lone recipient line when the text names them; 'you' is plai
   await app.waitFor(`id:failure:${err.id}:text`);
   expect(app.shows(`id:you:${mine.id} >> text:you`) || app.shows(`id:you:${mine.id}`)).toBe(true);
   expect(app.viewStyle(`id:you:${mine.id}`)?.backgroundColor).toBeUndefined(); // muted words, no pill
+});
+
+test("Space follow-ups hide To only for leading bindings to the actual stored recipients", async () => {
+  const f = world();
+  const say = (text: string, mentions: unknown[] = [], metadata: Record<string, unknown> = {}) =>
+    f.post("acme/lobby", { kind: "message", actor: "alice", actor_id: "alice", text,
+      created_at: "2026-11-22T01:01:00.000Z", mentions, ...metadata } as any);
+  const bob = { kind: "user", id: "bob" };
+  const other = { kind: "user", id: "carol" };
+  say("first from alice");
+  const empty = say("@bob is just text", [bob], { spans: [] });
+  const malformed = say("@bob is just text too", [bob], { spans: [{ start: 0, end: 4, index: 9 }] });
+  const real = say("@Robert Smith please look", [bob], { spans: [{ start: 0, end: 13, index: 0 }] });
+  const wrong = say("@bob and @carol", [bob, other], { spans: [{ start: 0, end: 4, index: 1 }] });
+  const later = say("@bob words @Robert", [bob], { spans: [{ start: 11, end: 18, index: 0 }] });
+  const legacy = say("@bob legacy spelling", [bob]);
+  const noStoredHandle = say("@coder is just text", [{ kind: "agent", agent_id: "ag-coder" }]);
+  const storedHandle = say("@old-coder legacy spelling", [{ kind: "agent", agent_id: "ag-coder", handle: "old-coder" }]);
+  const app = await inAcme(f);
+  await app.waitFor(`id:event:${storedHandle.id}`);
+  for (const e of [empty, malformed, wrong, later]) {
+    expect(app.shows(`id:recipient:${e.id}:bob`)).toBe(true);
+    expect(app.shows(`id:author:${e.id}`)).toBe(false);
+  }
+  expect(app.shows(`id:recipient:${noStoredHandle.id}:agent:ag-coder`)).toBe(true);
+  for (const e of [real, legacy, storedHandle]) expect(app.shows(`id:header:${e.id}`)).toBe(false);
 });
 
 test("@ suggestions: Tab inserts the highlighted one like Return; Return sends only once the list is closed", async () => {

@@ -6,7 +6,8 @@
 //!   transaction: rooms, threads, events, reactions, attachments links,
 //!   library files and everyone's index rows of them, search vectors,
 //!   schedules, connection share grants to it, per-Space preferences,
-//!   agents, monitoring entries; its registered runner is detached and its
+//!   agents, pages (with their versions, drafts and preferences),
+//!   monitoring entries; its registered runner is detached and its
 //!   dedicated runner token revoked (the runner generation is bumped, so
 //!   queued and claimed jobs fail). Its runs are stopped.
 //! - `POST /v1/spaces/{sid}/leave` (members other than the owner): like
@@ -143,7 +144,8 @@ impl Db {
             return Ok(Deleted::NameMismatch);
         }
         let generation: i64 = tx.query_row(
-            "UPDATE spaces SET runner_token_hash = NULL, runner_generation = runner_generation + 1
+            "UPDATE spaces SET runner_token_hash = NULL, runner_generation = runner_generation + 1,
+                 runner_drop_before = runner_generation + 1
              WHERE id = ?1 RETURNING runner_generation",
             [space_id],
             |r| r.get(0),
@@ -166,6 +168,7 @@ impl Db {
             [sid],
         )?;
         tx.execute("DELETE FROM space_member_prefs WHERE space_id = ?1", [sid])?;
+        crate::pages::hooks::space_deleted(&tx, sid)?;
         tx.execute("DELETE FROM space_agents WHERE space_id = ?1", [sid])?;
         tx.execute("DELETE FROM space_runners WHERE space_id = ?1", [sid])?;
         tx.execute(
@@ -209,7 +212,7 @@ async fn delete_space(
                 .list()
                 .iter()
                 .filter(|r| r.space_id == space.id)
-                .filter(|r| state.runs.stop(&r.id))
+                .filter(|r| state.runs.stop(&r.id).is_some())
                 .count();
             if let Err(e) = state.device.shares_changed(&state.db, None).await {
                 tracing::warn!(error = %format!("{e:#}"), "rechecking borrowed device jobs");

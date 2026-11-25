@@ -5,8 +5,10 @@
 //
 // What is kept, and where:
 // - The list itself is not secret: a name and a canonical server address
-//   (parseServerUrl: https://, or http:// on loopback only, with an optional
-//   base path), stored as `metro.savedServers`. No token, ever.
+//   (parseServerUrl: https:// or http://, with an optional base path), stored
+//   as `metro.savedServers`. No token, ever. A plain-HTTP address that is
+//   neither loopback nor Tailscale also records that the person confirmed
+//   using it unencrypted (`plainHttp: true`, see plainHttp.ts).
 // - Only when the user asks ("Keep me signed in until Metro quits", off by
 //   default), a saved server's access token is kept in this run's memory, so
 //   switching back needs no second paste. It is used only for the exact
@@ -28,6 +30,7 @@
 import { batch, computed, signal, Storage, untracked } from "nsh";
 import { ApiError } from "./api/client";
 import { parseServerUrl } from "./api/serverUrl";
+import { acceptPlainHttp, forgetPlainHttp, plainHttpAccepted } from "./plainHttp";
 import { hasPendingAttachments } from "./features/attachments/attachmentDraft";
 import { commitLocalWorkspace, onLocalWorkspace, prepareLocalWorkspace } from "./localWorkspace";
 import { clearForgottenDefault } from "./startupWorkspace";
@@ -147,10 +150,11 @@ async function readSavedServers(): Promise<void> {
     if (Array.isArray(list)) {
       for (const v of list) {
         if (!v || typeof v !== "object") continue;
-        const { id, name, baseUrl } = v as Record<string, unknown>;
+        const { id, name, baseUrl, plainHttp } = v as Record<string, unknown>;
         if (typeof id !== "string" || !id || id === "local" || out.some((s) => s.id === id) || typeof baseUrl !== "string") continue;
         const parsed = parseServerUrl(baseUrl);
         if (!parsed.ok || parsed.baseUrl !== baseUrl || out.some((s) => s.baseUrl === baseUrl)) continue;
+        if (parsed.needsConsent && plainHttp === true) acceptPlainHttp(baseUrl);
         out.push({ id, name: cleanName(typeof name === "string" ? name : "", baseUrl), baseUrl });
       }
     }
@@ -164,8 +168,13 @@ async function persist(list: SavedServer[]): Promise<void> {
   await loadSavedServers();
   savedServers.set(list);
   try {
-    // Only id, name and address: never a token.
-    await Storage.setItem(SAVED_SERVERS_KEY, JSON.stringify(list.map(({ id, name, baseUrl }) => ({ id, name, baseUrl }))));
+    // Only id, name, address and the plain-HTTP confirmation: never a token.
+    const records = list.map(({ id, name, baseUrl }) => {
+      const parsed = parseServerUrl(baseUrl);
+      const confirmed = parsed.ok && parsed.needsConsent && untracked(() => plainHttpAccepted(baseUrl));
+      return confirmed ? { id, name, baseUrl, plainHttp: true } : { id, name, baseUrl };
+    });
+    await Storage.setItem(SAVED_SERVERS_KEY, JSON.stringify(records));
   } catch {
     /* storage unavailable: kept for this run only */
   }
@@ -212,9 +221,21 @@ export function serverCandidate(urlInput: string, name: string): SavedServer | n
 export async function saveCurrentServer(name: string, opts: { keep?: boolean; keepName?: boolean } = {}): Promise<SavedServer | null> {
   const url = connectedTo();
   if (!url || onLocalWorkspace()) return null;
+  const sameSession = sessionGuard();
   const entry = await saveServer(url, name, { keepName: opts.keepName });
-  if (entry && opts.keep) keepCurrentSignedIn();
+  if (entry && opts.keep && sameSession()) keepCurrentSignedIn();
   return entry;
+}
+
+/**
+ * The person confirmed using this address over plain HTTP. Kept for this run,
+ * and in the saved record when the address is (or later gets) saved.
+ */
+export async function confirmPlainHttp(baseUrl: string): Promise<void> {
+  acceptPlainHttp(baseUrl);
+  await loadSavedServers();
+  const list = untracked(savedServers);
+  if (list.some((s) => s.baseUrl === baseUrl)) await persist(list);
 }
 
 export async function renameServer(id: string, name: string): Promise<void> {
@@ -230,6 +251,7 @@ export async function forgetServer(id: string): Promise<void> {
   const s = list.find((x) => x.id === id);
   if (!s) return;
   dropToken(s.baseUrl);
+  forgetPlainHttp(s.baseUrl);
   await persist(list.filter((x) => x.id !== id));
   await clearForgottenDefault(id);
 }

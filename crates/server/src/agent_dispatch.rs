@@ -25,7 +25,8 @@ use crate::AppState;
 use crate::db::{Addressed, Author, Event, Room, actor, kind};
 use crate::mentions::Mention;
 use crate::model_routing::{
-    self as routing, AddressedBy, Addressing, Decision, Route, RoutingSettings,
+    self as routing, AddressedBy, Addressing, AddressingNote, Decision, DecisionFailure, Route,
+    RoutingSettings,
 };
 use crate::space_agents::SpaceAgent;
 use crate::space_prefs::SpacePrefs;
@@ -44,6 +45,8 @@ pub struct Plan {
     pub targets: Vec<Target>,
     /// Shown in the room after the message, e.g. a failed agent decision.
     pub errors: Vec<String>,
+    /// Only returned to the sender; this never becomes a room event.
+    pub addressing_note: Option<AddressingNote>,
     /// Set when the classifier addressed an unaddressed message: the
     /// mentions to store instead of the empty ones.
     pub classified: Option<Addressed>,
@@ -91,12 +94,15 @@ pub async fn plan(
         // Attachments alone are ordinary conversation: never classified.
         Addressing::Unaddressed if text.is_empty() => {}
         Addressing::Unaddressed => {
-            if !classifies(prefs, settings) {
+            if !prefs.classify_unaddressed {
                 return plan;
             }
             let answer =
                 routing::pick_agent(state, user, space, settings, text, &options(agents), true)
                     .await;
+            if let Decision::Failed(why) = answer {
+                plan.addressing_note = Some(why.into());
+            }
             if let Decision::Answered(a) = answer
                 && let Some(i) = a.index
                 && a.directed >= settings.min_directedness
@@ -106,6 +112,7 @@ pub async fn plan(
                     mentions: json!([{"kind": "agent", "addressed_by": "classifier",
                                       "agent_id": agent.id}]),
                     audience: "agent".to_owned(),
+                    spans: None,
                 });
                 plan.targets.push(Target {
                     pick: format!("Picked by classifier: {}", agent.name),
@@ -115,6 +122,7 @@ pub async fn plan(
             }
         }
         Addressing::Agent => {
+            let mut generic_failed = None;
             for m in resolved {
                 match m {
                     Mention::AgentId { agent_id } => {
@@ -134,11 +142,29 @@ pub async fn plan(
                             .await
                         {
                             Ok(t) => push(&mut plan.targets, t),
-                            Err(e) => plan.errors.push(e),
+                            Err(why) => {
+                                // The room reads one category; the sender
+                                // alone gets the reason (below).
+                                generic_failed.get_or_insert(why);
+                                let why = why.shared();
+                                plan.errors.push(format!(
+                                    "Your classifier could not choose an agent for this message: \
+                                     {why}. No agent ran for @agent; mention an agent by its \
+                                     handle, or check your System One connection in Settings."
+                                ));
+                            }
                         }
                     }
                     Mention::User { .. } => {}
                 }
+            }
+            if let Some(why) = generic_failed {
+                plan.addressing_note = Some(AddressingNote::generic_agent_unavailable(
+                    why,
+                    resolved
+                        .iter()
+                        .any(|m| matches!(m, Mention::AgentId { .. })),
+                ));
             }
         }
     }
@@ -156,7 +182,7 @@ async fn generic(
     prefs: &SpacePrefs,
     agents: &[SpaceAgent],
     default: &SpaceAgent,
-) -> Result<Target, String> {
+) -> Result<Target, DecisionFailure> {
     let default_target = |pick: String| Target {
         agent: default.clone(),
         pick,
@@ -178,12 +204,18 @@ async fn generic(
             ))),
             None => Ok(default_target("Default agent".to_owned())),
         },
-        Decision::Failed(why) => Err(format!(
-            "Your classifier could not choose an agent for this message: {why}. No agent ran \
-             for @agent; mention an agent by its handle, or check your System One connection \
-             in Settings."
-        )),
+        Decision::Failed(why) => Err(why),
     }
+}
+
+/// What [`start_runs`] did.
+#[derive(Debug, Default)]
+pub struct Started {
+    /// Why runs could not start, in full, for the person who asked (a
+    /// scheduled prompt's creator); the room got the shown text.
+    pub failures: Vec<String>,
+    /// The first sender-only note, for their POST response only.
+    pub note: Option<AddressingNote>,
 }
 
 /// Start one run per target answering `event` (already stored) in `room`.
@@ -200,9 +232,9 @@ pub async fn start_runs(
     chosen: Option<Route>,
     settings: &RoutingSettings,
     prefs: &SpacePrefs,
-) -> Vec<String> {
+) -> Started {
     let user = author.id.clone().unwrap_or_default();
-    let mut failures = Vec::new();
+    let mut started = Started::default();
     for t in targets {
         let route = match &chosen {
             Some(route) => route.clone(),
@@ -220,7 +252,7 @@ pub async fn start_runs(
                 .await
             }
         };
-        if let Err(reason) = crate::agent::start_room_run(
+        if let Err(refusal) = crate::agent::start_room_run(
             state,
             space,
             room,
@@ -238,11 +270,14 @@ pub async fn start_runs(
                     &room.id,
                     kind::ERROR,
                     &Author::server(actor::SYSTEM),
-                    &reason,
+                    &refusal.shown,
                 )
                 .await;
-            failures.push(reason);
+            started.failures.push(refusal.private().to_owned());
+            if started.note.is_none() {
+                started.note = refusal.note;
+            }
         }
     }
-    failures
+    started
 }

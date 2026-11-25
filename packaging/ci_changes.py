@@ -6,6 +6,7 @@ github.event.before..github.sha). It prints one answer per segment, and
 "true" means run:
 
 - rust:       the `rust` job (Cargo build, clippy, tests, end-to-end scripts).
+- updates:    the isolated updater fixture build and test within `rust`.
 - desktop:    the `desktop` job (nsh check and nsh test in apps/desktop).
 - containers: the `containers` job (images, Compose files, media service).
 - packaging:  the `packaging` job (packaging, release and signing unit tests).
@@ -33,7 +34,7 @@ import subprocess
 import sys
 
 
-SEGMENTS = ("rust", "desktop", "containers", "packaging", "previews")
+SEGMENTS = ("rust", "updates", "desktop", "containers", "packaging", "previews")
 ALL = frozenset(SEGMENTS)
 NONE = frozenset()
 SHA = re.compile(r"[a-f0-9]{40}")
@@ -51,6 +52,8 @@ RULES = tuple((re.compile(pattern.encode()), frozenset(segments)) for pattern, s
     (r"Cargo\.toml|apps/desktop/nsh\.json", ALL),
     # Known, and read by no ci.yml job.
     (r"docs/.+\.(?:md|png|jpe?g|gif|svg|webp)|[^/]+\.md|ops/.+\.md|apps/desktop/.+\.md", NONE),
+    # This exact release-notes companion is prose, not a packaging input.
+    (r"packaging/README\.md", NONE),
     (r"apps/desktop/dev/.+|ops/.+|\.gitignore|\.env\.example", NONE),
     # Rust workspace and everything its tests and end-to-end scripts read.
     # crates/ is also the Docker build context and a release build input.
@@ -58,17 +61,23 @@ RULES = tuple((re.compile(pattern.encode()), frozenset(segments)) for pattern, s
     (r"\.cargo/.+", {"rust", "previews"}),
     (r"tests/e2e/.+", {"rust", "containers"}),  # containers runs library_reference.py
     (r"tests/.+|examples/.+", {"rust"}),
+    # The updater fixture builds server and runner with their local runtime
+    # dependencies, imports smoke.py and exercises the actual Linux installer.
+    (r"crates/(?:server|runner|release|auth|model-protocol|url-policy)/.+"
+     r"|Cargo\.lock|rust-toolchain(?:\.toml)?|\.cargo/.+"
+     r"|tests/e2e/(?:updates|smoke)\.py|packaging/install-metro-runner-linux\.sh", {"rust", "updates"}),
     # crates/desktop/build.rs embeds the icon; package.py and the signing tests read the assets.
     (r"apps/desktop/assets/.+", {"rust", "desktop", "packaging", "previews"}),
     # package.py and the packaging tests read the icon modules, icons and font.
     (r"apps/desktop/src/ui/.+", {"packaging"}),
     (DESKTOP_SOURCE, {"desktop", "previews"}),
+    (r"packaging/nsh_ci_tests\.py", {"desktop"}),
     # The container images, the media service and the Compose files.
     (r"Dockerfile|\.dockerignore|services/.+", {"containers", "previews"}),
     # test_image_release.py reads compose.yaml and compose.prebuilt.yaml.
     (r"compose(?:\.[a-z0-9-]+)?\.yaml", {"containers", "packaging"}),
     # The packaging tests read every workflow; release.yml and its calls build the previews.
-    (r"packaging/.+|\.github/.+", {"packaging", "previews"}),
+    (r"packaging/(?!README\.md\Z).+|\.github/.+", {"packaging", "previews"}),
     (r"packaging/metro-runner-container\.(?:sh|ps1)", {"containers"}),
 ))
 

@@ -103,6 +103,8 @@ impl RoutingBackend for Backend {
                     api_key: String::new(),
                 }),
                 max_tokens: None,
+                built_from: None,
+                effective_device: None,
             })
         })
     }
@@ -278,8 +280,8 @@ impl H {
         (s, v["events"].as_array().cloned().unwrap_or_default())
     }
 
-    /// Opt alice in to classification of unaddressed messages.
-    async fn classify_for_alice(&self) {
+    /// Set the old Chat inference flag to prove it has no effect.
+    async fn legacy_chat_inference(&self) {
         let (s, v) = self
             .req(
                 Method::PUT,
@@ -335,9 +337,337 @@ fn by_id(events: &[Value], id: &Value) -> Value {
 }
 
 #[tokio::test]
-async fn attachment_only_chat_message_is_delivered_without_any_agent_work() {
+async fn mention_spans_round_trip_in_rooms_threads_and_attachment_events() {
     let h = H::start().await;
-    h.classify_for_alice().await;
+    h.legacy_chat_inference().await;
+    let sid = h.space("Acme", &["bob", "carol"]).await;
+    let (s, v) = h
+        .req(
+            Method::POST,
+            "alice",
+            &format!("/v1/spaces/{sid}/agents"),
+            Some(json!({"name": "Review", "handle": "review", "description": "An agent."})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{v}");
+    let (s, v) = h
+        .req(
+            Method::PUT,
+            "alice",
+            &format!("/v1/spaces/{sid}/prefs"),
+            Some(json!({"classify_unaddressed": true})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let thread = h
+        .state
+        .db
+        .create_room(&sid, "side", Some("lobby"), 10, 10)
+        .unwrap();
+    let asset = h
+        .upload(
+            "alice",
+            &format!("scope=space&space_id={sid}"),
+            "notes.txt",
+            "notes",
+        )
+        .await;
+
+    let text =
+        "👩‍💻 (@alice Moréno), @review and @Support@Home, @alice Moréno; @carol, then `@agent`.";
+    let leading = "\u{2003}\r\n";
+    let raw = format!("{leading}{text}\t ");
+    let mut occurrences: Vec<_> = text
+        .match_indices("@alice Moréno")
+        .chain(text.match_indices("@Support@Home"))
+        .chain(text.match_indices("@review"))
+        .collect();
+    let spans: Vec<_> = occurrences
+        .iter()
+        .map(|(i, label)| {
+            let start = i + leading.len();
+            json!({"start": start, "end": start + label.len(), "index": 1})
+        })
+        .collect();
+    occurrences.sort_unstable_by_key(|(i, _)| *i);
+    let expected: Vec<_> = occurrences
+        .iter()
+        .map(|(i, label)| json!({"start": i, "end": i + label.len(), "index": 0}))
+        .collect();
+    let bob = json!({"kind": "user", "id": "bob"});
+    let body = json!({"text": raw, "mentions": [bob, bob], "spans": spans});
+    for (room, file) in [("lobby", None), (thread.id.as_str(), Some(&asset))] {
+        let mut body = body.clone();
+        if let Some(file) = file {
+            body["asset_ids"] = json!([file]);
+            body["infer_text_mentions"] = json!(false);
+        }
+        let (status, event) = h.room("alice", &sid, room, body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{event}");
+        assert_eq!(event["text"], text);
+        assert_eq!(event["spans"], json!(expected));
+        // No second recipient from the span's first word, the colliding
+        // agent handle, or code. The unspanned @carol only works in legacy mode.
+        let recipients = if file.is_some() {
+            json!([bob])
+        } else {
+            json!([bob, {"kind": "user", "id": "carol"}])
+        };
+        assert_eq!(event["mentions"], recipients);
+        assert_eq!(event["audience"], "users");
+        assert!(event.get("activity").is_none());
+        if let Some(file) = file {
+            assert_eq!(ids(&event), vec![file.clone()]);
+        }
+        let (_, events) = h.room_events("bob", &sid, room).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let polled = &events[0];
+        for field in ["id", "text", "mentions", "spans", "audience", "attachments"] {
+            assert_eq!(polled[field], event[field], "{field}");
+        }
+        let reloaded = Db::open(&h.db_path)
+            .unwrap()
+            .events_after(&sid, room, 0, 10)
+            .unwrap();
+        assert_eq!(reloaded.len(), 1);
+        assert_eq!(
+            serde_json::to_value(&reloaded[0]).unwrap()["spans"],
+            json!(expected)
+        );
+        assert_eq!(reloaded[0].text, text);
+    }
+    assert_eq!(h.link_rows(), (1, 1));
+    assert_eq!(h.system_one_calls(), 0);
+    assert!(h.model_bodies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn authoritative_empty_spans_survive_post_poll_and_reopen_with_attachments() {
+    let h = H::start().await;
+    let sid = h.space("Acme", &["bob"]).await;
+    let thread = h
+        .state
+        .db
+        .create_room(&sid, "side", Some("lobby"), 10, 10)
+        .unwrap();
+    let asset = h
+        .upload(
+            "alice",
+            &format!("scope=space&space_id={sid}"),
+            "s.txt",
+            "s",
+        )
+        .await;
+    let bob = json!({"kind": "user", "id": "bob"});
+    for (room, file) in [("lobby", None), (thread.id.as_str(), Some(&asset))] {
+        let mut body = json!({
+            "text": " @bob is literal ", "infer_text_mentions": false, "mentions": [bob],
+        });
+        if let Some(file) = file {
+            body["asset_ids"] = json!([file]);
+        }
+        let (status, event) = h.room("alice", &sid, room, body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{event}");
+        assert_eq!(event["text"], "@bob is literal");
+        assert_eq!(event["mentions"], json!([bob]));
+        assert_eq!(event["spans"], json!([]));
+        assert!(event.get("activity").is_none());
+        let (_, events) = h.room_events("bob", &sid, room).await;
+        assert_eq!(events[0]["text"], event["text"]);
+        assert_eq!(events[0]["spans"], json!([]));
+        assert_eq!(events[0]["attachments"], event["attachments"]);
+        let stored = Db::open(&h.db_path)
+            .unwrap()
+            .events_after(&sid, room, 0, 10)
+            .unwrap();
+        assert_eq!(stored[0].spans, Some(vec![]));
+        assert!(stored[0].activity.is_none());
+        let (status, legacy) = h
+            .room("alice", &sid, room, json!({"text": "@bob legacy"}))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{legacy}");
+        assert!(legacy.get("spans").is_none());
+        let (_, events) = h.room_events("bob", &sid, room).await;
+        assert!(events[1].get("spans").is_none());
+    }
+}
+
+#[tokio::test]
+async fn invalid_mention_spans_and_recipients_never_post_or_dispatch() {
+    let h = H::start().await;
+    h.legacy_chat_inference().await;
+    let sid = h.space("Acme", &["bob"]).await;
+    let other = h.space("Other", &["carol"]).await;
+    let (s, prefs) = h
+        .req(
+            Method::PUT,
+            "alice",
+            &format!("/v1/spaces/{sid}/prefs"),
+            Some(json!({"classify_unaddressed": true})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{prefs}");
+    let other_agent = h.state.db.space_agents(&other).unwrap()[0].id.clone();
+    let bob = json!({"kind": "user", "id": "bob"});
+    let range = json!({"start": 0, "end": 4, "index": 0});
+    for recipient in [
+        json!({"kind": "user", "id": "Bob"}),
+        json!({"kind": "user", "id": "carol"}),
+        json!({"kind": "agent", "agent_id": other_agent}),
+    ] {
+        let (s, v) = h
+            .room(
+                "alice",
+                &sid,
+                "lobby",
+                json!({
+                    "text": "@bob @agent", "infer_text_mentions": false,
+                    "mentions": [recipient], "spans": [range]
+                }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], "unknown recipient");
+    }
+    for spans in [
+        json!([range, range]),
+        json!([{"start": 0, "end": 2, "index": 0}]),
+        json!([{"start": 0, "end": 4, "index": 1}]),
+        json!(vec![range.clone(); 65]),
+    ] {
+        let (s, v) = h
+            .room(
+                "alice",
+                &sid,
+                "lobby",
+                json!({
+                    "text": "@bob @agent", "infer_text_mentions": false, "invoke_agent": true,
+                    "mentions": [bob], "spans": spans
+                }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    }
+    for (key, value) in [
+        ("infer_text_mentions", Value::Null),
+        ("infer_text_mentions", json!("false")),
+        ("infer_text_mentions", json!(0)),
+        ("unknown_field", json!(false)),
+    ] {
+        let mut body = json!({"text": "@agent", "invoke_agent": true});
+        body[key] = value;
+        let (s, v) = h.room("alice", &sid, "lobby", body).await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    }
+    for (invoke, agent_id, error) in [
+        (false, other_agent.as_str(), "agent_id needs invoke_agent"),
+        (true, other_agent.as_str(), "unknown recipient"),
+    ] {
+        let (s, v) = h
+            .room(
+                "alice",
+                &sid,
+                "lobby",
+                json!({
+                    "text": "@agent", "infer_text_mentions": false,
+                    "invoke_agent": invoke, "agent_id": agent_id
+                }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], error);
+    }
+    let asset = h
+        .upload(
+            "alice",
+            &format!("scope=space&space_id={sid}"),
+            "s.txt",
+            "s",
+        )
+        .await;
+    for spans in [
+        Value::Null,
+        json!([[0, 4, 0]]),
+        json!([{"start": 0, "end": 4, "index": 0, "id": "bob"}]),
+    ] {
+        let (s, v) = h
+            .room(
+                "alice",
+                &sid,
+                "lobby",
+                json!({"text": "@bob @agent", "mentions": [bob], "spans": spans, "asset_ids": [asset]}),
+            )
+            .await;
+        assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+    }
+    let (s, v) = h
+        .room(
+            "alice",
+            &sid,
+            "lobby",
+            json!({"text":" \n", "mentions": [bob], "spans": [range], "asset_ids": [asset]}),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    let thread = h
+        .state
+        .db
+        .create_room(&sid, "side", Some("lobby"), 10, 10)
+        .unwrap();
+    for (sender, space) in [("carol", &sid), ("alice", &other)] {
+        let (s, _) = h
+            .room(
+                sender,
+                space,
+                &thread.id,
+                json!({
+                    "text": "@bob", "infer_text_mentions": false, "mentions": [bob], "spans": [range]
+                }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+    let (s, v) = h
+        .req(
+            Method::DELETE,
+            "alice",
+            &format!("/v1/spaces/{sid}/members"),
+            Some(json!({"user_id": "bob"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = h
+        .room(
+            "alice",
+            &sid,
+            &thread.id,
+            json!({
+                "text": "@bob", "infer_text_mentions": false, "mentions": [bob], "spans": [range]
+            }),
+        )
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["error"], "unknown recipient");
+    for save_note in [false, true] {
+        for (key, value) in [("spans", json!([])), ("infer_text_mentions", json!(false))] {
+            let mut body = json!({"text": "@agent", "save_note": save_note});
+            body[key] = value;
+            let (s, v) = h.chat("alice", body).await;
+            assert_eq!(s, StatusCode::UNPROCESSABLE_ENTITY, "{v}");
+        }
+    }
+    assert!(h.chat_events("alice").await.is_empty());
+    assert!(h.room_events("alice", &sid, "lobby").await.1.is_empty());
+    assert!(h.room_events("alice", &sid, &thread.id).await.1.is_empty());
+    assert_eq!(h.link_rows(), (0, 0));
+    assert_eq!(h.system_one_calls(), 0);
+    assert!(h.model_bodies.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn attachment_only_chat_send_starts_the_agent_without_exposing_the_files() {
+    let h = H::start().await;
+    h.legacy_chat_inference().await;
     let a = h
         .upload("alice", "scope=personal", "notes.txt", "hello")
         .await;
@@ -346,11 +676,16 @@ async fn attachment_only_chat_message_is_delivered_without_any_agent_work() {
         .await;
 
     let (s, e) = h
-        .chat("alice", json!({"text": "  ", "asset_ids": [b, a]}))
+        .chat(
+            "alice",
+            json!({"text": "  ", "asset_ids": [b, a], "provider_connection_id": CHAT}),
+        )
         .await;
     assert_eq!(s, StatusCode::ACCEPTED, "{e}");
     assert_eq!(e["text"], "");
-    assert_eq!(e["audience"], "room");
+    assert_eq!(e["audience"], "agent");
+    assert_eq!(e["mentions"], json!([{"kind": "agent"}]));
+    assert_eq!(e["addressing_note"], Value::Null);
     // Authoritative metadata, in the order sent; no paths, urls or uploader.
     assert_eq!(ids(&e), vec![b.clone(), a.clone()]);
     assert_eq!(
@@ -359,19 +694,49 @@ async fn attachment_only_chat_message_is_delivered_without_any_agent_work() {
                "kind": "text", "size_bytes": 5})
     );
 
-    // Poll and reload return the same.
-    let events = h.chat_events("alice").await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["attachments"], e["attachments"]);
-
-    // Ordinary conversation: no System One, no model, no agent events.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Poll and reload return the same attachments, with a direct model reply.
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let events = h.chat_events("alice").await;
+            if events.iter().any(|e| e["activity"]["phase"] == "completed") {
+                break events;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("attachment-only turn to complete");
+    assert_eq!(by_id(&events, &e["id"])["attachments"], e["attachments"]);
+    assert!(events.iter().any(|e| e["text"] == "answered"));
+    let started = events
+        .iter()
+        .find(|e| e["activity"]["phase"] == "started")
+        .unwrap();
+    assert_eq!(started["activity"]["route"]["addressed_by"], "explicit");
+    assert_eq!(started["activity"]["route"]["source"], "override");
+    assert!(started["activity"].get("pick").is_none());
     assert_eq!(h.system_one_calls(), 0);
-    assert!(h.model_bodies.lock().unwrap().is_empty());
-    assert_eq!(h.chat_events("alice").await.len(), 1);
+    {
+        let bodies = h.model_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("You cannot access those files"));
+        for private in [&a, &b, "notes.txt", "plan.txt", "hello"] {
+            assert!(!bodies[0].contains(private), "leaked {private}");
+        }
+    }
+    assert!(h.chat_events("bob").await.is_empty());
 
-    // The same in a room, with alice's own upload to the Space.
+    // File-only Space sends remain ordinary conversation even with the opt-in.
     let sid = h.space("Acme", &[]).await;
+    let (status, prefs) = h
+        .req(
+            Method::PUT,
+            "alice",
+            &format!("/v1/spaces/{sid}/prefs"),
+            Some(json!({"classify_unaddressed": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{prefs}");
     let f = h
         .upload(
             "alice",
@@ -394,12 +759,22 @@ async fn attachment_only_chat_message_is_delivered_without_any_agent_work() {
     assert_eq!(h.system_one_calls(), 0);
     assert_eq!(h.room_events("alice", &sid, "lobby").await.1.len(), 1);
 
-    // Text with attachments keeps the opt-in classification as before.
-    let (s, _) = h
-        .chat("alice", json!({"text": "what is this?", "asset_ids": [a]}))
+    // The older explicit Save note action can still save files on their own.
+    let (s, note) = h
+        .chat(
+            "alice",
+            json!({"text": "", "asset_ids": [a], "invoke_agent": false}),
+        )
         .await;
     assert_eq!(s, StatusCode::ACCEPTED);
-    assert_eq!(h.system_one_calls(), 1);
+    assert_eq!(note["audience"], "room");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.chat_events("alice").await.last().unwrap()["id"],
+        note["id"]
+    );
+    assert_eq!(h.system_one_calls(), 0);
+    assert_eq!(h.model_bodies.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -418,7 +793,7 @@ async fn ask_agent_needs_a_question_and_bad_id_lists_post_nothing() {
 
     let refused = [
         (
-            json!({"text": "", "asset_ids": [a], "invoke_agent": true}),
+            json!({"text": "", "invoke_agent": true}),
             StatusCode::BAD_REQUEST,
         ),
         (
@@ -442,7 +817,7 @@ async fn ask_agent_needs_a_question_and_bad_id_lists_post_nothing() {
             StatusCode::NOT_FOUND,
         ),
         (
-            json!({"text": "", "asset_ids": [a], "provider_connection_id": CHAT}),
+            json!({"text": "", "asset_ids": [a], "provider_connection_id": CHAT, "invoke_agent": false}),
             StatusCode::BAD_REQUEST,
         ),
     ];
@@ -512,7 +887,7 @@ async fn scopes_never_cross_personal_space_or_another_space() {
         )
         .await;
 
-    h.classify_for_alice().await;
+    h.legacy_chat_inference().await;
     // Personal Chat: only the sender's own personal files.
     for id in [&bobs, &acme_file, &other_file] {
         let (s, v) = h
@@ -722,7 +1097,10 @@ async fn deleting_a_file_keeps_the_message_and_drops_only_its_link() {
     let a = h.upload("alice", "scope=personal", "a.txt", "a").await;
     let b = h.upload("alice", "scope=personal", "b.txt", "b").await;
     let (_, e) = h
-        .chat("alice", json!({"text": "two files", "asset_ids": [a, b]}))
+        .chat(
+            "alice",
+            json!({"text": "two files", "asset_ids": [a, b], "invoke_agent": false}),
+        )
         .await;
     assert_eq!(h.link_rows(), (2, 2));
 
@@ -752,7 +1130,12 @@ async fn deleting_a_file_keeps_the_message_and_drops_only_its_link() {
     assert_eq!(h.chat_events("alice").await.len(), 1);
 
     // An attachment-only message whose file is gone stays in the transcript.
-    let (_, only) = h.chat("alice", json!({"text": "", "asset_ids": [b]})).await;
+    let (_, only) = h
+        .chat(
+            "alice",
+            json!({"text": "", "asset_ids": [b], "invoke_agent": false}),
+        )
+        .await;
     let (s, _) = h
         .req(
             Method::DELETE,

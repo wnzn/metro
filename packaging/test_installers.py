@@ -6,11 +6,13 @@ by recording fakes on PATH, so nothing on the host is installed, started or
 changed. Real engines are exercised only by the CI jobs.
 """
 
+import fcntl
 import hashlib
 import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import stat
 import subprocess
@@ -32,15 +34,32 @@ CONTAINER_PS1 = HERE / "metro-runner-container.ps1"
 TRUE = shutil.which("true")
 # Validation only: none of these is ever connected to.
 BAD_LOOPBACK = (
-    "http://127.0.0.1.evil.example:80", "http://127.0.0.2:8787", "http://127.1:8787", "http://localhost",
+    "http://127.0.0.2:8787", "http://127.1:8787", "http://localhost",
     "http://localhost:", "http://localhost:0", "http://localhost:65536", "http://localhost:99999",
-    "http://localhost:80x", "http://localhost:+80", "http://localhost:8787:1", "http://localhostx:80",
+    "http://localhost:80x", "http://localhost:+80", "http://localhost:8787:1",
     "http://LOCALHOST:80", "http://[::1]", "http://[::1]80", "http://[::1:80", "http://[::1]]:80",
     "http://[0:0:0:0:0:0:0:1]:80", "http://u@localhost:80", "http://localhost@evil.example:80",
     "http://0.0.0.0:80", "http://127.0.0.1 :80",
 )
 GOOD_LOOPBACK = ("http://127.0.0.1:41234", "http://localhost:1", "http://[::1]:65535",
                  "http://localhost:41234/base")
+# Plain http beyond loopback is allowed: Tailscale silently, anything else with a warning.
+TAILSCALE_HTTP = ("http://100.64.0.1", "http://100.127.255.255:8787", "http://[fd7a:115c:a1e0::1]:8787",
+                  "http://metro.tail1234.ts.net", "http://Metro.Tail1234.TS.NET:8787/base",
+                  "http://office.metro.ts.net.:8787")
+OTHER_HTTP = ("http://metro.example", "http://10.0.0.5:8787", "http://192.168.1.10:8787/base",
+              "http://100.128.0.1", "http://100.63.255.255:80", "http://[fe80::1]:8787", "http://ts.net",
+              # Real DNS labels, not prefix tests: these are ordinary names.
+              "http://localhost-office.example:8787", "http://localhostx:80", "http://127.0.0.1.evil.example:80")
+BAD_HTTP = ("http://1.2.3.999", "http://.metro.example", "http://a..b", "http://-x:80", "http://[::]:80",
+            "http://[fd7a::1", "http://metro.example:0", "http://metro.example:65536", "http://metro.example:",
+            "http://[fd7a:115c:a1e0:::]:8787", "http://[fd7a:115c:a1e0::1::2]",
+            # Numeric spellings resolvers read differently (octal, hex, shorthand).
+            "http://100.077.0.1", "http://100.00077.0.1:8787", "http://0x64.64.0.1", "http://100.64.1",
+            "http://1681915905:8787",
+            # Strict authorities and DNS characters.
+            "http://[::1]:99]:8787", "http://[::1]x:8787", "http://*.ts.net:8787", "http://box..:8787")
+VECTORS = HERE.parent / "crates/url-policy/testdata/host_vectors.json"
 HOST_MUTATORS = {"docker", "podman", "sudo", "doas", "pkexec", "su", "systemctl", "apt", "apt-get", "dpkg",
                  "pacman", "dnf", "yum", "rpm", "zypper", "flatpak", "snap"}
 
@@ -146,6 +165,45 @@ esac
     def calls(self):
         return self.log.read_text().splitlines()
 
+    def reciprocal_published_lock(self, modern, archive, marker):
+        # The fixture is the actual published script, not a lock mock.
+        name = modern.name
+        published = HERE / "test-fixtures" / name.replace(".sh", "-0.4.0.sh")
+        sums = (HERE.parent / "crates/release/tests/fixtures/v0.4.0/SHA256SUMS").read_text()
+        assert f"{sha(published.read_bytes())}  {name}" in sums.splitlines()
+        self.run(published, "install", "--archive", archive, check=True)
+        assert marker.read_text() != "metro-update-lock-v2\n"
+        tar = shlex.quote(str(self.tools / "tar"))
+        probe = self.root / "lock-probe"
+        hook = self.bin / "tar"
+        for holder, contender in [(published, modern), (modern, published)]:
+            nested = shlex.join(["/bin/sh", str(contender), "update", "--archive", str(archive)])
+            write_exec(hook, f"""#!/bin/sh
+if [ -z "${{METRO_LOCK_PROBING:-}}" ]; then
+    METRO_LOCK_PROBING=1 {nested} >{shlex.quote(str(probe))} 2>&1
+fi
+exec {tar} "$@"
+""")
+            self.run(holder, "update", "--archive", archive, check=True)
+            assert "another install" in probe.read_text(), probe.read_text()
+            assert not (marker.parent / ".lock").exists()
+        hook.unlink()
+        self.run(modern, "update", "--archive", archive, "--migrate-update-lock", check=True)
+        assert marker.read_text() == "metro-update-lock-v2\n"
+        self.run(published, "update", "--archive", archive, check=True)
+        assert marker.read_text() != "metro-update-lock-v2\n"
+        lock = marker.parent / ".lock"
+        lock.mkdir()
+        owner = lock / "owner.metro-lock-v2"
+        invalid = "metro-lock-v2:.looks-valid\nforeign bytes"
+        owner.write_text(invalid)
+        result = self.run(modern, "update", "--archive", archive)
+        assert result.returncode and "another install" in result.stderr, result.stderr
+        assert owner.read_text() == invalid
+        owner.write_text("metro-lock-v2:.interrupted\n")
+        self.run(modern, "update", "--archive", archive, check=True)
+        assert not lock.exists()
+
 
 class DesktopInstallerTests(unittest.TestCase):
     def setUp(self):
@@ -182,7 +240,7 @@ class DesktopInstallerTests(unittest.TestCase):
         b = self.archive("0.3.1")
         self.box.run(DESKTOP, "update", "--archive", b, "--no-local-runner", check=True)
         self.assertEqual(os.readlink(current), "versions/0.3.1")
-        self.assertEqual(sorted(p.name for p in (self.app_root / "versions").iterdir()), ["0.3.1"])
+        self.assertEqual(sorted(p.name for p in (self.app_root / "versions").iterdir()), ["0.3.0", "0.3.1"])
         self.assertFalse(marker.exists())
         self.box.run(DESKTOP, "update", "--archive", b, check=True)  # keeps "off"
         self.assertFalse(marker.exists())
@@ -198,6 +256,116 @@ class DesktopInstallerTests(unittest.TestCase):
         self.assertFalse(entry.exists())
         self.assertEqual((self.data / "desktop.json").read_text(), "keep")
         self.assertEqual(self.box.calls(), [])  # no package manager, sudo or systemctl
+
+    def test_in_app_updates_are_never_clobbered(self):
+        self.box.run(DESKTOP, "install", "--archive", self.archive(), check=True)
+        journal = self.app_root / ".update.json"
+        b = self.archive("0.3.1")
+        for phase in ("trial", "committing"):
+            journal.write_text(json.dumps({"version": 1, "id": "ab12" * 4, "from": "0.3.0", "to": "0.3.2", "phase": phase, "started_at": 0},
+                                          separators=(",", ":")))
+            for args in (("update", "--archive", b), ("uninstall",)):
+                r = self.box.run(DESKTOP, *args)
+                self.assertNotEqual(r.returncode, 0, (phase, args))
+                self.assertIn("in the middle of updating itself to 0.3.2", r.stderr, (phase, args))
+            self.assertEqual(os.readlink(self.app_root / "current"), "versions/0.3.0")
+            self.assertTrue(journal.exists())
+        journal.write_text('{"phase":"exploded"}')
+        self.assertIn("unknown in-app update state", self.box.run(DESKTOP, "update", "--archive", b).stderr)
+        self.assertEqual(journal.read_text(), '{"phase":"exploded"}')
+        # The app holding the lock while it stages.
+        journal.unlink()
+        fd = os.open(self.app_root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for args in (("update", "--archive", b), ("uninstall",)):
+                self.assertIn("another install is running", self.box.run(DESKTOP, *args).stderr)
+        finally:
+            os.close(fd)
+        # Legacy .lock is respected but never reaped.
+        lock = self.app_root / ".lock"
+        lock.mkdir()
+        (lock / "owner").write_text('{"by":"metro-desktop","pid":1,"started_at":1}')
+        r = self.box.run(DESKTOP, "update", "--archive", b)
+        self.assertIn("preparing an in-app update right now", r.stderr)
+        self.assertTrue(lock.is_dir(), "the app's lock is left alone")
+        self.assertIn("preparing an in-app update right now", self.box.run(DESKTOP, "uninstall").stderr)
+        (lock / "owner").unlink()
+        self.assertIn("another install is running", self.box.run(DESKTOP, "update", "--archive", b).stderr)
+        shutil.rmtree(lock)
+        # A staged (not started) in-app update is superseded and its journal removed.
+        (self.app_root / "versions/0.3.2").mkdir()
+        journal.write_text('{"version":1,"id":"ab12ab12ab12ab12","from":"0.3.0","to":"0.3.2","phase":"staged","started_at":0}')
+        self.box.run(DESKTOP, "update", "--archive", b, check=True)
+        self.assertEqual(os.readlink(self.app_root / "current"), "versions/0.3.1")
+        self.assertFalse(journal.exists())
+        self.assertFalse((self.app_root / "versions/0.3.2").exists())
+
+    def test_manual_installer_leaves_backup_cleanup_to_the_journal_owner(self):
+        self.box.run(DESKTOP, "install", "--archive", self.archive(), check=True)
+        journal = self.app_root / ".update.json"
+        b = self.archive("0.3.1")
+        record = {"version": 2, "id": "ab12" * 4, "from": "0.3.0", "to": "0.3.2", "started_at": 0}
+        for extra in ({"phase": "backing_up"},
+                      {"phase": "failed", "backup_manifest": "a" * 64, "outcome": "rolled_back"}):
+            text = json.dumps(record | extra)
+            journal.write_text(text)
+            for args in (("update", "--archive", b), ("uninstall",)):
+                result = self.box.run(DESKTOP, *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("start it once", result.stderr)
+            self.assertEqual(journal.read_text(), text)
+
+    def test_malformed_journal_has_read_only_diagnostics_and_preserves_workspace(self):
+        self.box.run(DESKTOP, "install", "--archive", self.archive(), check=True)
+        journal = self.app_root / ".update.json"
+        journal.write_bytes(b"{")
+        current = self.app_root / "current"
+        backup = self.data / "update/db-snapshot-0123456789abcdef/metro.sqlite3"
+        live = self.data / "local/db/metro.sqlite3"
+        gate = self.data / "desktop-update.json"
+        for path, content in [(backup, b"backup"), (live, b"live"), (gate, b"private gate")]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        archive = self.archive("0.3.1")
+        for args in (("status",), ("update", "--archive", archive), ("uninstall",)):
+            result = self.box.run(DESKTOP, *args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("[update_journal_unknown]", result.stderr)
+            self.assertIn("read-only diagnosis", result.stderr)
+            self.assertIn("https://github.com/wnzn/metro/issues", result.stderr)
+            self.assertNotIn("private gate", result.stdout + result.stderr)
+            self.assertEqual(journal.read_bytes(), b"{")
+            self.assertEqual(os.readlink(current), "versions/0.3.0")
+            self.assertEqual(backup.read_bytes(), b"backup")
+            self.assertEqual(live.read_bytes(), b"live")
+            self.assertEqual(gate.read_bytes(), b"private gate")
+        # A matching stage can be reported without giving the installer
+        # authority to retire the workspace's separate gate.
+        valid = b'{"version":1,"id":"0123456789abcdef","from":"0.3.0","to":"0.3.2","phase":"staged","started_at":0}'
+        journal.write_bytes(valid)
+        status = self.box.run(DESKTOP, "status", check=True)
+        self.assertIn("Update journal phase: staged (read-only diagnosis", status.stdout)
+        self.assertIn("[update_recovery_required]", self.box.run(DESKTOP, "update", "--archive", archive).stderr)
+        self.assertEqual(journal.read_bytes(), valid)
+        self.assertEqual(os.readlink(current), "versions/0.3.0")
+        self.assertEqual(gate.read_bytes(), b"private gate")
+        self.assertEqual(backup.read_bytes(), b"backup")
+        # A gate without its journal is not a reason to select a version or
+        # run the installer to reconstruct a missing record.
+        journal.unlink()  # simulate lost journal in this disposable fixture
+        for args in (("status",), ("update", "--archive", archive), ("uninstall",)):
+            result = self.box.run(DESKTOP, *args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("[update_journal_unknown]", result.stderr)
+            self.assertIn("update journal is missing", result.stderr)
+            self.assertEqual(os.readlink(current), "versions/0.3.0")
+            self.assertEqual(backup.read_bytes(), b"backup")
+            self.assertEqual(live.read_bytes(), b"live")
+            self.assertEqual(gate.read_bytes(), b"private gate")
+
+    def test_published_desktop_installer_and_the_current_installer_exclude_each_other(self):
+        self.box.reciprocal_published_lock(DESKTOP, self.archive(), self.app_root / ".metro-desktop-install")
 
     def test_update_requires_install_and_old_archives_without_menu_script(self):
         # Like the early 0.2.0 candidates: no menu script, no local_runner capability.
@@ -263,6 +431,16 @@ class DesktopInstallerTests(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertTrue((self.app_root / "someone-elses-file").exists())
 
+    def test_refuses_foreign_install_directory_with_newline_entry(self):
+        self.app_root.mkdir(mode=0o700, parents=True)
+        foreign = self.app_root / "\n"
+        foreign.write_text("keep")
+        result = self.box.run(DESKTOP, "install", "--archive", self.archive())
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not created by this installer", result.stderr)
+        self.assertEqual(list(self.app_root.iterdir()), [foreign])
+        self.assertEqual(foreign.read_text(), "keep")
+
     def test_missing_runtime_explains_then_install_deps_runs_fixed_list(self):
         a = self.archive()
         self.box.missing.write_text("libwebkitgtk-6.0.so.4\nlibgtk-4.so.1\n")
@@ -315,7 +493,12 @@ FAKE_RUNNER = """#!/bin/sh
 printf 'url=%s ws=%s token_sha=%s insecure=%s file=%s\\n' "$METRO_SERVER_URL" "$METRO_WORKSPACE" \
   "$(printf %s "$METRO_RUNNER_TOKEN" | sha256sum | cut -c1-16)" "${METRO_ALLOW_INSECURE_HTTP:-unset}" \
   "${METRO_RUNNER_TOKEN_FILE:-unset}"
+printf 'NO_PROXY=%s no_proxy=%s HTTP_PROXY=%s\\n' "${NO_PROXY:-unset}" "${no_proxy:-unset}" "${HTTP_PROXY:-unset}"
 """
+
+
+# The runner script as published in Metro 0.4.0 (before METRO_RUNNER_SELF_UPDATE).
+OLD_RUNNER_SCRIPT = HERE / "test-fixtures/install-metro-runner-linux-0.4.0.sh"
 
 
 class RunnerInstallerTests(unittest.TestCase):
@@ -341,6 +524,19 @@ class RunnerInstallerTests(unittest.TestCase):
         return self.box.run(RUNNER, "configure", "--server-url", url, "--workspace", kw.get("ws", self.ws),
                             "--token-file", kw.get("token", self.token))
 
+    def test_published_runner_installer_and_the_current_installer_exclude_each_other(self):
+        self.box.reciprocal_published_lock(RUNNER, self.archive, self.install_root / ".metro-runner-install")
+
+    def test_refuses_foreign_install_directory_with_newline_entry(self):
+        self.install_root.mkdir(mode=0o700, parents=True)
+        foreign = self.install_root / ".lock\n.lock"
+        foreign.write_text("keep")
+        result = self.box.run(RUNNER, "install", "--archive", self.archive)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not created by this installer", result.stderr)
+        self.assertEqual(list(self.install_root.iterdir()), [foreign])
+        self.assertEqual(foreign.read_text(), "keep")
+
     def test_full_lifecycle_never_exposes_the_token(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
         self.assertEqual(os.readlink(self.install_root / "current"), "versions/0.3.0")
@@ -355,6 +551,32 @@ class RunnerInstallerTests(unittest.TestCase):
         expected = sha(b"metro_rt_v2_secret-value")[:16]
         self.assertIn(f"url=https://metro.example ws={self.ws} token_sha={expected} insecure=unset file=unset", r.stdout)
         self.assertNotIn("secret-value", r.stdout + r.stderr)
+        # Plain http to a LAN host: a warning at configure time, and the old
+        # opt-in passed so runners up to 0.4.0 accept it too.
+        r = self.configure("http://192.168.1.10:8787")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stderr.count("isn't encrypted"), 1, r.stderr)
+        self.assertIn("192.168.1.10", r.stderr)
+        self.assertNotIn("secret-value", r.stdout + r.stderr)
+        proxy_env = {"METRO_RUNNER_TOKEN": "x", "HTTP_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "corp.example"}
+        r = self.box.run(RUNNER, "run", check=True, env=proxy_env)
+        self.assertIn("url=http://192.168.1.10:8787 ", r.stdout)
+        self.assertIn("insecure=1 ", r.stdout)
+        # An ordinary host keeps the person's proxy settings untouched.
+        self.assertIn("NO_PROXY=corp.example no_proxy=unset HTTP_PROXY=http://proxy.invalid:3128", r.stdout)
+        # A Tailscale or loopback server is always reached without the proxy,
+        # also by runners up to 0.4.0: NO_PROXY gains exactly its host.
+        for url, entries in (("http://100.101.102.103:8787", "100.101.102.103"),
+                             ("http://[fd7a:115c:a1e0::1]:8787", "[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1"),
+                             ("http://office.metro.ts.net.:8787", "office.metro.ts.net."),
+                             ("http://127.0.0.1:41234", "127.0.0.1")):
+            self.assertEqual(self.configure(url).returncode, 0, url)
+            r = self.box.run(RUNNER, "run", check=True, env=proxy_env)
+            self.assertIn(f"NO_PROXY=corp.example,{entries} no_proxy=corp.example,{entries} "
+                          "HTTP_PROXY=http://proxy.invalid:3128", r.stdout, url)
+        r = self.box.run(RUNNER, "run", check=True, env={"METRO_RUNNER_TOKEN": "x"})
+        self.assertIn("NO_PROXY=127.0.0.1 no_proxy=127.0.0.1 ", r.stdout)
+        self.assertEqual(self.configure("https://metro.example").returncode, 0)
 
         out = self.box.run(RUNNER, "install-service", check=True).stdout
         self.assertIn("not started", out)
@@ -403,14 +625,36 @@ class RunnerInstallerTests(unittest.TestCase):
         self.assertEqual(marker.read_text(), "keep")
         self.assertEqual(self.box.calls(), [])
 
+    def test_manual_runner_install_respects_a_live_update_lock_and_journal(self):
+        self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
+        fd = os.open(self.install_root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIn("another install is running", self.box.run(RUNNER, "update", "--archive", self.archive).stderr)
+            self.assertIn("another install is running", self.box.run(RUNNER, "uninstall").stderr)
+            self.assertIn("another install is running", self.configure().stderr)
+        finally:
+            os.close(fd)
+        journal = self.install_root / ".update-pending.json"
+        journal.write_text("malformed; leave for recovery")
+        self.assertIn("finish recovery", self.box.run(RUNNER, "uninstall").stderr)
+        self.assertEqual(journal.read_text(), "malformed; leave for recovery")
+        self.assertEqual(os.readlink(self.install_root / "current"), "versions/0.3.0")
+
     def test_configuration_is_validated(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
-        for url in ("http://metro.example", "http://10.0.0.5:8787", "ftp://x", "https://u:p@metro.example",
-                    "https://metro.example/?q", "https://", "https://:443", *BAD_LOOPBACK):
+        for url in ("ftp://x", "https://u:p@metro.example", "http://u:p@metro.example",
+                    "https://metro.example/?q", "https://", "https://:443", *BAD_LOOPBACK, *BAD_HTTP):
             r = self.configure(url)
             self.assertNotEqual(r.returncode, 0, url)
-        for url in GOOD_LOOPBACK:
-            self.assertEqual(self.configure(url).returncode, 0, url)
+        for url in GOOD_LOOPBACK + TAILSCALE_HTTP + ("https://metro.example",):
+            r = self.configure(url)
+            self.assertEqual(r.returncode, 0, url + r.stderr)
+            self.assertNotIn("isn't encrypted", r.stderr, url)
+        for url in OTHER_HTTP:
+            r = self.configure(url)
+            self.assertEqual(r.returncode, 0, url + r.stderr)
+            self.assertEqual(r.stderr.count("isn't encrypted"), 1, url)
         self.token.chmod(0o644)
         self.assertIn("mode 600", self.configure().stderr)
         self.token.chmod(0o600)
@@ -423,6 +667,68 @@ class RunnerInstallerTests(unittest.TestCase):
             f.write("METRO_RUNNER_TOKEN=inline\n")
         r = self.box.run(RUNNER, "run")
         self.assertIn("unsupported setting METRO_RUNNER_TOKEN", r.stderr)
+
+    def test_self_update_choice(self):
+        self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
+        # A new configuration: on, with a line saying so.
+        r = self.configure()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="1"', self.config.read_text())
+        self.assertIn("Self-update is on", r.stdout)
+        self.assertIn("self-update: on", self.box.run(RUNNER, "status", check=True).stdout)
+        # Explicit off, then reconfiguring keeps it off.
+        args = ["configure", "--server-url", "https://metro.example", "--workspace", self.ws, "--token-file", self.token]
+        self.assertEqual(self.box.run(RUNNER, *args, "--self-update", "off").returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="0"', self.config.read_text())
+        self.assertEqual(self.configure().returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="0"', self.config.read_text())
+        self.assertIn("self-update: off", self.box.run(RUNNER, "status", check=True).stdout)
+        # A configuration from before this option stays off.
+        self.config.write_text(self.config.read_text().replace('METRO_RUNNER_SELF_UPDATE="0"\n', ""))
+        self.assertEqual(self.configure().returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="0"', self.config.read_text())
+        # Explicit on, and the run passes it to the runner.
+        self.assertEqual(self.box.run(RUNNER, *args, "--self-update", "on").returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="1"', self.config.read_text())
+        self.assertEqual(self.box.run(RUNNER, "run").returncode, 0)
+        self.assertIn("--self-update must be on or off", self.box.run(RUNNER, *args, "--self-update", "yes").stderr)
+
+    def test_configure_upgrades_an_old_installed_script_copy(self):
+        # The script as shipped before METRO_RUNNER_SELF_UPDATE existed (0.4.0).
+        old = self.root / "old" / "install-metro-runner-linux.sh"
+        old.parent.mkdir()
+        old.write_bytes(OLD_RUNNER_SCRIPT.read_bytes())
+        old.chmod(0o755)
+        self.assertNotIn(b"METRO_RUNNER_SELF_UPDATE", old.read_bytes())
+        self.box.run(old, "install", "--archive", self.archive, check=True)
+        installed = self.install_root / "install-metro-runner-linux.sh"
+        self.assertEqual(installed.read_bytes(), old.read_bytes())
+        # Configuring with the new script writes the new key and replaces the old copy...
+        r = self.configure()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="1"', self.config.read_text())
+        self.assertEqual(installed.read_bytes(), RUNNER.read_bytes())
+        self.assertIn("Updated the installed copy", r.stdout)
+        # ...so the installed copy (what the unit runs) accepts the settings.
+        r = self.box.run(installed, "run")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        # A copy with both capabilities is left alone.
+        self.assertNotIn("Updated the installed copy", self.configure().stdout)
+
+    def test_configure_refreshes_an_update_aware_script_without_http_support(self):
+        self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
+        installed = self.install_root / RUNNER.name
+        write_exec(installed, "#!/bin/sh\n# METRO_RUNNER_SELF_UPDATE\nexit 1\n")
+        marker = self.install_root / ".metro-runner-install"
+        before = marker.read_bytes()
+        result = self.configure("http://100.101.102.103:8787")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(installed.read_bytes(), RUNNER.read_bytes())
+        self.assertEqual(marker.read_bytes(), before)
+        run = self.box.run(installed, "run", check=True, env={"NO_PROXY": "corp.example"})
+        self.assertIn("insecure=1 ", run.stdout)
+        self.assertIn("NO_PROXY=corp.example,100.101.102.103 ", run.stdout)
+        self.assertFalse((self.install_root / ".lock").exists())
 
     def test_refuses_desktop_archive_and_bad_checksum(self):
         desk = build_archive(self.root, "Metro-runner-0.3.2-linux-x64", runner_files(FAKE_RUNNER),
@@ -484,7 +790,8 @@ class ContainerScriptTests(unittest.TestCase):
         calls = self.docker_calls()
         self.assertIn("docker pull ghcr.io/wnzn/metro-runner:v0.3.0", calls)
         self.assertIn("docker volume create metro-runner-workspace", calls)
-        self.assertTrue(any(c.startswith("docker run --rm") and "test -r /run/secrets/metro_runner_token" in c
+        self.assertTrue(any(c.startswith("docker run --rm") and 'test -r "$1" && test -s "$1" metro-probe '
+                            "/run/secrets/metro_runner_token" in c
                             for c in calls))
         self.box.run(CONTAINER, "start", check=True)
         run = next(c for c in self.docker_calls() if c.startswith("docker run -d"))
@@ -506,17 +813,56 @@ class ContainerScriptTests(unittest.TestCase):
         self.assertFalse(any("volume rm" in c for c in self.docker_calls()))
         self.assertTrue(self.token.exists())
 
-    def test_loopback_uses_host_network_and_http_elsewhere_is_refused(self):
+    def test_plain_http_elsewhere_warns_and_uses_the_default_network(self):
         r = self.box.run(CONTAINER, "setup", "--server-url", "http://192.168.1.10:8787", "--token-file", self.token,
-                         "--version", "0.3.0")
-        self.assertIn("unencrypted", r.stderr)
-        self.assertEqual(self.docker_calls(), [])
+                         "--version", "0.3.0", check=True)
+        self.assertEqual(r.stderr.count("isn't encrypted"), 1, r.stderr)
+        self.assertIn("192.168.1.10", r.stderr)
+        self.assertNotIn("secret-value", r.stdout + r.stderr)
+        self.assertIn("NETWORK=default", self.config.read_text())
+        self.box.run(CONTAINER, "start", check=True)
+        run = next(c for c in self.docker_calls() if c.startswith("docker run -d"))
+        self.assertNotIn("--network=host", run)
+        self.assertIn("METRO_SERVER_URL=http://192.168.1.10:8787", run)
+        self.assertIn("--env METRO_ALLOW_INSECURE_HTTP=1", run)  # for runner images up to 0.4.0
+        # An ordinary host keeps the engine's proxy settings.
+        self.assertNotIn("--env NO_PROXY", run)
+        self.assertNotIn("--env METRO_DIRECT_NO_PROXY", run)
+        # Checking the URL never touches the script's own settings.
+        self.assertIn("--name metro-runner ", run)
+        self.assertIn("NAME=metro-runner\n", self.config.read_text())
+        self.assertFalse(any("/dev/tcp/" in c for c in self.docker_calls()))
+        self.box.run(CONTAINER, "remove", check=True)
+
+        for url in TAILSCALE_HTTP:
+            r = self.box.run(CONTAINER, "setup", "--server-url", url, "--token-file", self.token, "--image", "m:ci",
+                             check=True)
+            self.assertNotIn("isn't encrypted", r.stderr, url)
+            self.assertIn("NETWORK=default", self.config.read_text())
+        # A Tailscale server is reached without any proxy the engine injects.
+        self.box.run(CONTAINER, "setup", "--server-url", "http://[fd7a:115c:a1e0::1]:8787", "--token-file", self.token,
+                     "--image", "m:ci", check=True)
+        self.box.run(CONTAINER, "start", check=True)
+        run = [c for c in self.docker_calls() if c.startswith("docker run -d")][-1]
+        entries = "[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1"
+        self.assertIn(f"--env METRO_DIRECT_NO_PROXY={entries} ", run)
+        self.assertNotIn("--env NO_PROXY", run)  # the container's own exclusions are kept (entry script)
+        self.box.run(CONTAINER, "remove", check=True)
+        for url in BAD_HTTP:
+            r = self.box.run(CONTAINER, "setup", "--server-url", url, "--token-file", self.token, "--image", "m:ci")
+            self.assertNotEqual(r.returncode, 0, url)
+
+    def test_loopback_uses_host_network(self):
         self.box.run(CONTAINER, "setup", "--server-url", "http://127.0.0.1:41234", "--token-file", self.token,
                      "--image", "metro-runner:ci", check=True)
-        self.assertTrue(any("--network=host" in c and "/dev/tcp/127.0.0.1/41234" in c for c in self.docker_calls()))
+        # The probe is fixed text; the host and port reach it as arguments.
+        self.assertTrue(any("--network=host" in c and 'exec 3<>"/dev/tcp/$1/$2" metro-probe 127.0.0.1 41234' in c
+                            for c in self.docker_calls()))
         self.box.run(CONTAINER, "start", check=True)
         run = next(c for c in self.docker_calls() if c.startswith("docker run -d"))
         self.assertIn("--network=host", run)
+        self.assertNotIn("METRO_ALLOW_INSECURE_HTTP", run)
+        self.assertIn("--env METRO_DIRECT_NO_PROXY=127.0.0.1 ", run)
 
     def test_loopback_urls_are_exact_literals_with_a_port(self):
         for url in BAD_LOOPBACK:
@@ -527,7 +873,7 @@ class ContainerScriptTests(unittest.TestCase):
             self.box.run(CONTAINER, "setup", "--server-url", url, "--token-file", self.token, "--image", "m:ci",
                          check=True)
             self.assertIn("NETWORK=host", self.config.read_text())
-        self.assertTrue(any("/dev/tcp/::1/65535" in c for c in self.docker_calls()))
+        self.assertTrue(any('"/dev/tcp/$1/$2" metro-probe ::1 65535' in c for c in self.docker_calls()))
 
     def test_token_file_checks_and_foreign_container(self):
         self.token.chmod(0o640)
@@ -547,6 +893,127 @@ class ContainerScriptTests(unittest.TestCase):
         r = self.box.run(CONTAINER, "setup", "--server-url", "https://m.example", "--token-file", self.token,
                          "--version", "0.3.0")
         self.assertIn("Docker or Podman is required", r.stderr)
+
+
+def url_rule_block(script, comment):
+    """The installer's own URL rule, between its url-rule markers."""
+    text = script.read_text()
+    begin, end = text.index(f"{comment} url-rule:begin"), text.index(f"{comment} url-rule:end")
+    return text[begin:end]
+
+
+def vector_cases():
+    """(url, expected) for every shared host vector: loopback, tailscale, other or refused."""
+    hosts = json.loads(VECTORS.read_text())["hosts"]
+    assert len(hosts) > 40
+    return [(f"http://{v['host']}:8787", v.get("installer", v["class"])) for v in hosts]
+
+
+class UrlRuleVectorTests(unittest.TestCase):
+    """The installers classify every shared host vector like metro-url-policy,
+    the desktop app and the admin panel (crates/url-policy/testdata/host_vectors.json)."""
+
+    def check(self, got_lines, cases):
+        self.assertEqual(len(got_lines), len(cases), got_lines)
+        wrong = [f"{u}: {g}, expected {e}" for (u, e), g in zip(cases, got_lines) if g != e]
+        self.assertEqual(wrong, [])
+
+    def test_shell_scripts(self):
+        """Under every POSIX-ish shell present (sh, dash, bash), from a directory
+        holding a file, so a stray pathname expansion would show (*.ts.net)."""
+        cases = vector_cases()
+        shells = [sh for sh in ("sh", "dash", "bash") if shutil.which(sh)]
+        self.assertIn("sh", shells)
+        for script in (RUNNER, CONTAINER):
+            for sh in shells:
+                with self.subTest(script=script.name, shell=sh), tempfile.TemporaryDirectory() as d, \
+                        tempfile.TemporaryDirectory() as cwd:
+                    (Path(cwd) / "sample").write_text("")
+                    harness = Path(d) / "rule.sh"
+                    harness.write_text("PROG=t\n" + url_rule_block(script, "#") +
+                                       'for u in "$@"; do if http_class "$u"; then echo "$url_class"; '
+                                       'else echo refused; fi; done\n')
+                    r = subprocess.run([sh, harness, *[u for u, _ in cases]], text=True, capture_output=True,
+                                       check=True, cwd=cwd)
+                    self.check(r.stdout.splitlines(), cases)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
+    def test_powershell_script(self):
+        cases = vector_cases()
+        with tempfile.TemporaryDirectory() as d:
+            harness = Path(d) / "rule.ps1"
+            harness.write_text("$Prog = 't'\nfunction Fail([string] $Message) { throw $Message }\n" +
+                               url_rule_block(CONTAINER_PS1, "#") +
+                               "foreach ($u in $args) { try { Test-Url $u } catch { 'refused' } }\n")
+            r = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", harness,
+                                *[u for u, _ in cases]], text=True, capture_output=True, timeout=120, check=True)
+            self.check(r.stdout.splitlines(), cases)
+
+    @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
+    def test_powershell_direct_args(self):
+        with tempfile.TemporaryDirectory() as d:
+            harness = Path(d) / "direct.ps1"
+            harness.write_text("$Prog = 't'\nfunction Fail([string] $Message) { throw $Message }\n" +
+                               url_rule_block(CONTAINER_PS1, "#") +
+                               "foreach ($u in $args) { (Get-DirectArgs ([pscustomobject]@{ ServerUrl = $u })) -join ' ' }\n")
+            urls = ["http://100.101.102.103:8787", "http://[fd7a:115c:a1e0::1]:8787", "http://127.0.0.1:41234",
+                    "http://192.168.1.10:8787", "https://metro.example"]
+            r = subprocess.run(["pwsh", "-NoLogo", "-NoProfile", "-NonInteractive", "-File", harness, *urls],
+                               text=True, capture_output=True, timeout=120, check=True)
+            self.assertEqual(r.stdout.splitlines(), [
+                "--env METRO_DIRECT_NO_PROXY=100.101.102.103",
+                "--env METRO_DIRECT_NO_PROXY=[fd7a:115c:a1e0::1],fd7a:115c:a1e0::1",
+                "--env METRO_DIRECT_NO_PROXY=127.0.0.1",
+                "", "",
+            ])
+
+
+def runner_entry(script):
+    """The container entry text of metro-runner-container.sh / .ps1."""
+    text = script.read_text()
+    if script.suffix == ".ps1":
+        return text.split("$RunnerEntry = '", 1)[1].split("'\n", 1)[0]
+    return text.split("RUNNER_ENTRY='", 1)[1].split("'\n", 1)[0]
+
+
+class ContainerEntryTests(unittest.TestCase):
+    """The runner container's fixed entry script, run here with sh."""
+
+    def run_entry(self, env, *, script=CONTAINER, shell="sh"):
+        self.assertEqual(runner_entry(CONTAINER), runner_entry(CONTAINER_PS1),
+                         "the .sh and .ps1 entries must be the same text")
+        entry = runner_entry(script)
+        with tempfile.TemporaryDirectory() as d:
+            token = Path(d) / "token"
+            token.touch(mode=0o600)
+            token.write_text("metro_rt_v2_secret-value\n")
+            # Only the secret's path and the final exec are swapped for the test.
+            local = entry.replace("/run/secrets/metro_runner_token", str(token)).replace(
+                "exec /usr/local/bin/metro-runner", 'printf "NO_PROXY=%s|no_proxy=%s|direct=%s\\n" '
+                '"${NO_PROXY-unset}" "${no_proxy-unset}" "${METRO_DIRECT_NO_PROXY-unset}"')
+            return subprocess.run([shell, "-c", local], text=True, capture_output=True, check=True,
+                                  env={"PATH": os.environ["PATH"], **env}).stdout.strip()
+
+    def test_metro_host_is_appended_and_engine_exclusions_survive(self):
+        self.assertEqual(self.run_entry({"NO_PROXY": "corp.internal,.svc", "METRO_DIRECT_NO_PROXY": "100.101.102.103"}),
+                         "NO_PROXY=corp.internal,.svc,100.101.102.103|no_proxy=corp.internal,.svc,100.101.102.103|direct=unset")
+        # Docker may inject only the lowercase form.
+        self.assertEqual(self.run_entry({"no_proxy": "corp.internal", "METRO_DIRECT_NO_PROXY": "[fd7a::1],fd7a::1"}),
+                         "NO_PROXY=corp.internal,[fd7a::1],fd7a::1|no_proxy=corp.internal,[fd7a::1],fd7a::1|direct=unset")
+        self.assertEqual(self.run_entry({"METRO_DIRECT_NO_PROXY": "127.0.0.1"}),
+                         "NO_PROXY=127.0.0.1|no_proxy=127.0.0.1|direct=unset")
+        # An ordinary destination: the engine's settings stay exactly as they were.
+        self.assertEqual(self.run_entry({"NO_PROXY": "corp.internal"}),
+                         "NO_PROXY=corp.internal|no_proxy=unset|direct=unset")
+
+    def test_empty_uppercase_exclusions_do_not_inherit_lowercase_exclusions(self):
+        for script in (CONTAINER, CONTAINER_PS1):
+            for shell in ("sh", "dash", "bash"):
+                if shutil.which(shell):
+                    with self.subTest(script=script.name, shell=shell):
+                        got = self.run_entry({"NO_PROXY": "", "no_proxy": "corp.internal",
+                                              "METRO_DIRECT_NO_PROXY": "127.0.0.1"}, script=script, shell=shell)
+                        self.assertEqual(got, "NO_PROXY=127.0.0.1|no_proxy=127.0.0.1|direct=unset")
 
 
 class MacosInstallerTests(unittest.TestCase):
@@ -667,6 +1134,27 @@ class MacosInstallerTests(unittest.TestCase):
             self.assertIn("for macOS", r.stderr)
 
 
+class WindowsInAppUpdateGuardTests(unittest.TestCase):
+    """Static checks (pwsh isn't needed): install and uninstall check the
+    journal under the installer lock before changing anything."""
+
+    def test_guard_runs_before_any_change(self):
+        text = WINDOWS.read_text()
+        install = text[text.index("function Install-Metro {"):text.index("function Uninstall-Metro {")]
+        uninstall = text[text.index("function Uninstall-Metro {"):]
+        self.assertLess(install.index("$lock = Enter-InstallLock"), install.index("Assert-NoInAppUpdate"))
+        self.assertLess(install.index("Assert-NoInAppUpdate"), install.index("Set-Content"))
+        self.assertLess(uninstall.index("$lock = Enter-InstallLock"), uninstall.index("Assert-NoInAppUpdate"))
+        self.assertLess(uninstall.index("Assert-NoInAppUpdate"), uninstall.index("Remove-Item"))
+        self.assertIn("$lock.Dispose()", uninstall)
+        guard = text[text.index("function Assert-NoInAppUpdate"):text.index("function Get-LockBusyMessage")]
+        self.assertIn("@('trial', 'committing', 'rolling_back')", guard)
+        self.assertIn("$handle.Lock(0, 1)", text)
+        self.assertIn('"by":"metro-desktop"', text)
+        self.assertLess(install.index("Remove-Item -LiteralPath (Join-Path $Root '.update.json')"),
+                        install.index("Keep a copy of this script"))
+
+
 @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")
 class PowerShellTests(unittest.TestCase):
     def pwsh(self, *args, env=None):
@@ -679,18 +1167,100 @@ class PowerShellTests(unittest.TestCase):
                                       f"'{script}', [ref]$null, [ref]$e) | Out-Null; if ($e) {{ $e; exit 1 }}")
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_windows_update_replaces_existing_pointer_without_backup(self):
+        # Run the installer's actual pointer write without the Windows-only
+        # prerequisite, shortcut and registry operations.
+        text = WINDOWS.read_text()
+        start = text.index("$current = Join-Path $Root 'current.txt'")
+        end = text.index("if ($stagedVersion", start)
+        with tempfile.TemporaryDirectory(prefix="metro pointer ") as d:
+            root = Path(d) / "install"
+            stage = root / "stage"
+            stage.mkdir(parents=True)
+            current = root / "current.txt"
+            current.write_bytes(b"0.4.0")
+            harness = Path(d) / "pointer.ps1"
+            harness.write_text("param($Root, $stage, $version)\n$ErrorActionPreference = 'Stop'\n"
+                               + text[start:end])
+            r = self.pwsh("-File", harness, root, stage, "0.5.0")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(current.read_bytes(), b"0.5.0")
+            self.assertEqual(set(root.rglob("*")), {current, stage})
+
+    def test_published_windows_installer_and_current_installer_exclude_each_other(self):
+        published = HERE / "test-fixtures/install-metro-windows-0.4.0.ps1"
+        sums = (HERE.parent / "crates/release/tests/fixtures/v0.4.0/SHA256SUMS").read_text()
+        self.assertIn(f"{sha(published.read_bytes())}  {WINDOWS.name}", sums.splitlines())
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "install"
+            dest.mkdir()
+            (dest / ".metro-desktop-install").write_text("managed\n")
+            archive = Path(d) / "Metro-0.4.0-windows-x64.zip"
+            archive.write_bytes(b"not extracted")
+            harness = Path(d) / "hold.ps1"
+            # Run the unmodified Install-Metro body and its lock functions
+            # from each script; intercept prerequisite probes and stop at
+            # extraction, before any Windows-only install operations.
+            harness.write_text(r"""
+param($Installer, $Root, $Archive, $Contender)
+$ErrorActionPreference = 'Stop'
+$Action = 'Install'
+$Mark = '.metro-desktop-install'
+$Sha256 = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
+$Quiet = $true
+$UserData = Join-Path $Root 'unused'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$tokens, [ref]$errors)
+if ($errors) { throw 'could not parse installer' }
+$excluded = 'Test-Prerequisites', 'Get-MsiManagedMetro', 'Expand-Verified'
+foreach ($def in $ast.EndBlock.Statements) {
+    if ($def -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $def.Name -notin $excluded) {
+        . ([scriptblock]::Create($def.Extent.Text))
+    }
+}
+function Test-Prerequisites {}
+function Get-MsiManagedMetro {}
+function Expand-Verified {
+    if (-not $Contender) { throw 'contender got past the lock' }
+    $child = Join-Path $PSHOME 'pwsh'
+    $probe = & $child -NoProfile -NonInteractive -File $PSCommandPath $Contender $Root $Archive
+    if ($LASTEXITCODE -ne 0 -or $probe -notmatch 'another install is running') { throw "lock not honored: $probe" }
+    throw 'fixture stopped after verifying exclusion'
+}
+try {
+    Install-Metro
+    throw 'unexpected install result'
+} catch {
+    $message = $_.Exception.Message
+    if ($message -match 'another install is running|fixture stopped after verifying exclusion') {
+        Write-Output $message
+        exit 0
+    }
+    throw
+}
+""")
+            for holder, contender in ((published, WINDOWS), (WINDOWS, published)):
+                with self.subTest(holder=holder.name):
+                    result = self.pwsh("-File", harness, holder, dest, archive, contender)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("fixture stopped after verifying exclusion", result.stdout)
+                    self.assertFalse((dest / ".lock").exists())
+
     def test_container_url_validation(self):
         missing = "/nonexistent/metro-token"  # a valid URL gets as far as the token file
-        for url in BAD_LOOPBACK + ("http://metro.example:80", "https://", "https://u@metro.example"):
+        for url in BAD_LOOPBACK + BAD_HTTP + ("https://", "https://u@metro.example", "http://u@metro.example"):
             r = self.pwsh("-File", CONTAINER_PS1, "-Action", "Setup", "-ServerUrl", url, "-TokenFile", missing,
                           "-Version", "0.3.0")
             self.assertNotEqual(r.returncode, 0, url)
             self.assertNotIn("Cannot find path", r.stderr, url)
-        for url in GOOD_LOOPBACK + ("https://metro.example", "https://metro.example:8443/base"):
+        for url in GOOD_LOOPBACK + TAILSCALE_HTTP + OTHER_HTTP + ("https://metro.example", "https://metro.example:8443/base"):
             r = self.pwsh("-File", CONTAINER_PS1, "-Action", "Setup", "-ServerUrl", url, "-TokenFile", missing,
                           "-Version", "0.3.0")
             self.assertNotEqual(r.returncode, 0, url)
             self.assertIn("Cannot find path", r.stderr, url)
+            # Only plain http beyond loopback and Tailscale warns.
+            self.assertEqual("isn't encrypted" in (r.stdout + r.stderr), url in OTHER_HTTP, url)
 
     def test_windows_installer_verifies_archives(self):
         with tempfile.TemporaryDirectory() as d:

@@ -84,9 +84,13 @@ jobs:
         with:
           persist-credentials: false
       - name: Build metro-runner in the bookworm toolchain image
+        env:
+          # Official releases only: such a build checks for and offers updates
+          # (metro-release). Previews and PR package smoke stay source builds.
+          METRO_RELEASE_CHANNEL: ${{ inputs.release && 'release' || '' }}
         run: |
           set -eu
-          docker build --target build -t metro-build:release .
+          docker build --target build --build-arg METRO_RELEASE_CHANNEL="$METRO_RELEASE_CHANNEL" -t metro-build:release .
           cid="$(docker create metro-build:release)"
           trap 'docker rm "$cid" >/dev/null' EXIT
           mkdir -p "$RUNNER_TEMP/runner-bin"
@@ -150,8 +154,14 @@ jobs:
           # Throwaway credential, never printed and never accepted by any server.
           head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n' > "$home/runner token"
           chmod 600 "$home/runner token"
-          if sh "$i" configure --server-url http://192.0.2.1:8787 --workspace "$home/work space" --token-file "$home/runner token"; then
-            echo "plain http to a non-loopback host was accepted" >&2; exit 1
+          sh "$i" configure --server-url http://192.0.2.1:8787 --workspace "$home/work space" --token-file "$home/runner token" \
+            >"$home/configure.stdout" 2>"$home/configure.stderr"
+          grep -Fq "warning: plain HTTP to 192.0.2.1 isn't encrypted" "$home/configure.stderr" \
+            || { echo "missing unencrypted HTTP warning on stderr" >&2; exit 1; }
+          if grep -aFq -f "$home/runner token" "$home/configure.stdout" "$home/configure.stderr"; then
+            echo "HTTP configure printed the runner token" >&2; exit 1
+          else
+            test "$?" -eq 1
           fi
           sh "$i" configure --server-url https://metro.invalid --workspace "$home/work space" --token-file "$home/runner token"
           sh "$i" doctor
@@ -294,6 +304,9 @@ jobs:
           cargo test --locked --release --target x86_64-pc-windows-msvc -p metro-connector --lib openai_oauth::store::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Build metro-desktop, metro-server and metro-tui (native, locked)
+        env:
+          # Official releases only (see runner-linux).
+          METRO_RELEASE_CHANNEL: ${{ inputs.release && 'release' || '' }}
         run: |
           cargo build --locked --release --target x86_64-pc-windows-msvc --bin metro-desktop --bin metro-server --bin metro-tui
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -674,6 +687,9 @@ jobs:
           python3 -I -c 'import sys; assert sys.version_info >= (3, 11), sys.version'
           readelf --version | head -1
       - name: Build metro-desktop, metro-server and metro-tui (locked)
+        env:
+          # Official releases only (see runner-linux).
+          METRO_RELEASE_CHANNEL: ${{ inputs.release && 'release' || '' }}
         run: |
           set -eu
           cargo build --locked --release --target x86_64-unknown-linux-gnu --bin metro-desktop --bin metro-server --bin metro-tui

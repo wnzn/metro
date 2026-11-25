@@ -7,6 +7,7 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, fakeServer, header, TOKENS, world } from "../../test/fakeServer";
 import { BRIDGE, BRIDGE_DEVICE_SECRET, BRIDGE_TOKEN, bridgeEnv, fakeBridge, LOCAL_MODELS } from "./test/fakeBridge";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof fakeServer>;
 type B = ReturnType<typeof fakeBridge>;
@@ -15,7 +16,7 @@ const VENDOR_KEY = "sk-vendor-fixture-not-real-123456";
 
 async function openPackaged(f: F, b: B | null, env: object | null = bridgeEnv(), platform: "linux" | "windows" = "linux") {
   const network = { ...(f.network as any), ...(b ? (b.network as any) : {}) };
-  return open("../../App.tsx", { network, platform, width: 1280, height: 900, ...(env ? { modules: env as any } : {}) });
+  return open("../../App.tsx", { network, platform, width: 1280, height: 900, modules: (env ? env : launched()) as any });
 }
 
 async function signIn(app: App, user: string) {
@@ -63,10 +64,10 @@ test("packaged: sign-in binds the bridge with the session; it's the only place t
   const f = world();
   const b = fakeBridge(f);
   const app = await openPackaged(f, b);
-  // Before any sign-in, the app only asks the helper about itself.
-  await app.waitUntil(() => b.calls("/v1/status", "GET").length >= 1);
+  // Before sign-in, only the helper and updater status reads are allowed.
+  await app.waitUntil(() => b.calls("/v1/status", "GET").length >= 1 && b.calls("/v1/update", "GET").length >= 1);
   await app.wait(300);
-  expect(b.state.log.every((l) => l.method === "GET" && l.path === "/v1/status")).toBe(true);
+  expect(b.state.log.every((l) => l.method === "GET" && (l.path === "/v1/status" || l.path === "/v1/update"))).toBe(true);
   await signIn(app, "bob");
   await app.waitUntil(() => b.calls("/v1/session", "POST").length === 1);
   const bind = b.calls("/v1/session", "POST")[0]!;

@@ -5,7 +5,6 @@ import {
   activeSpaceId,
   connectedTo,
   createRoom,
-  createSpace,
   creatingRoom,
   creatingSpace,
   isActiveRun,
@@ -24,13 +23,17 @@ import {
   view,
 } from "../store";
 import type { Room } from "../store";
-import { AccountMenu, Action, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailBrand, RailButton, ResizeHandle, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
+import { goPages, pages, pagesRoute } from "../pagesState";
+import { dismissRunnerOffer, runnerOfferCount, watchInstalledRunner } from "../runnersState";
+import { AccountMenu, Action, Banner, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailBrand, RailButton, ResizeHandle, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
 import type { AccountMenuItem, Tone } from "../ui";
 import { loadSavedServers, signOut } from "../savedWorkspaces";
+import { settingsPageDot } from "./SettingsView";
 import { WorkspaceDialogs, workspaceItems, WorkspaceNotice } from "./WorkspaceSwitcher";
 import { PersonAvatar } from "./profile/PersonAvatar";
 import { profileName } from "./profile/profileState";
 import { openSpaceSettings } from "./space/spaceSettingsState";
+import { CreateSpaceForm } from "./CreateSpaceForm";
 
 /**
  * The app's navigation: Chat, Library, Scheduled tasks, the Spaces and their
@@ -44,6 +47,7 @@ import { openSpaceSettings } from "./space/spaceSettingsState";
  * Space name is still there when it opens again.
  */
 export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
+  watchInstalledRunner();
   return (
     <>
       <Surface variant="sidebar" testID="sidebar" hidden={props.mode !== "full"} width={navigationPanel.width()}>
@@ -62,12 +66,15 @@ export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
             onPress={openChat}
           />
           <NavItem testID="nav-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
+          <NavItem testID="nav-pages" label="Pages" icon="file" selected={mainPlace() === "pages" && pagesRoute().kind === "home" && !pagesRoute().spaceId} onPress={() => goPages()} />
+          <PinnedPages />
           <NavItem testID="nav-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
-          <SpacesSection />
+          <SpacesSection visible={props.mode === "full"} />
         </ScrollArea>
 
         <Column padX={2} padY={2} gap={1}>
-          <NavItem testID="nav-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
+          <NavItem testID="nav-settings" label="Settings" icon="settings" dot={settingsPageDot("about")}
+            selected={settingsOpen()} onPress={() => openSettings()} />
         </Column>
         <AccountFooter />
       </Surface>
@@ -93,6 +100,7 @@ function SidebarRail() {
       </RailBrand>
       <RailButton testID="rail-chat" label={runs() ? `Chat, ${runs()} running` : "Chat"} icon="chat" selected={mainPlace() === "chat"} onPress={openChat} />
       <RailButton testID="rail-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
+      <RailButton testID="rail-pages" label="Pages" icon="file" selected={mainPlace() === "pages"} onPress={() => goPages()} />
       <RailButton testID="rail-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
       <ScrollArea gap={1} align="center" padY={2}>
         <Each of={spaces()} key={(space) => space.id}>
@@ -104,7 +112,10 @@ function SidebarRail() {
               seed={space().id}
               selected={space().id === activeSpaceId() && mainPlace() === "space"}
               onPress={() => void selectSpace(space().id)}
-              menu={[{ id: `rail-space-settings:${space().id}`, label: "Space settings", onPress: () => openSpaceSettings(space().id) }]}
+              menu={[
+                { id: `rail-space-settings:${space().id}`, label: "Space settings", onPress: () => openSpaceSettings(space().id) },
+                { id: `rail-space-pages:${space().id}`, label: "Pages", onPress: () => goPages({ kind: "home", spaceId: space().id }) },
+              ]}
             />
           )}
         </Each>
@@ -118,7 +129,8 @@ function SidebarRail() {
           }}
         />
       </ScrollArea>
-      <RailButton testID="rail-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
+      <RailButton testID="rail-settings" label="Settings" icon="settings" dot={settingsPageDot("about")} dotTestID="settings-update-dot"
+        selected={settingsOpen()} onPress={() => openSettings()} />
       <AccountFooter compact />
     </Surface>
   );
@@ -137,15 +149,11 @@ const activeRunCount = () => runs().filter(isActiveRun).length;
 /** An agent run is going on in this Space (from the runs the app already loaded). */
 const spaceRunning = (sid: string) => runs().some((r) => r.spaceId === sid && isActiveRun(r));
 
-function SpacesSection() {
+function SpacesSection(props: { visible: boolean }) {
   const adding = addingSpace;
   const name = signal("");
-  const submit = async () => {
-    if (await createSpace(name())) {
-      name.set("");
-      adding.set(false);
-    }
-  };
+  const spaceExpanded = (sid: string) => (mainPlace() === "space" && activeSpaceId() === sid)
+    || (mainPlace() === "pages" && pagesRoute().spaceId === sid);
   return (
     <Column gap={1} padY={2}>
       {/* The same 12-point inset as the rows' icons; + shows on hover and focus. */}
@@ -160,10 +168,23 @@ function SpacesSection() {
           onPress: () => adding.set(!adding()),
         }}
       />
+      <If when={!creatingSpace() && runnerOfferCount()}>
+        {(count) => (
+          <Banner testID="runner-offer" tone="neutral" variant="inline" title="Use this computer's runner?"
+            message={`${count()} of your Spaces ${count() === 1 ? "has" : "have"} no runner. Attaching lets their agents list and read files in a folder on this computer.`}>
+            <Row gap={1} wrap>
+              <Action compact testID="runner-offer-choose" label="Choose Spaces…" variant="ghost"
+                onPress={() => { if (!creatingSpace() && runnerOfferCount()) openSettings("runners"); }} />
+              <Action compact testID="runner-offer-dismiss" label="Not now" variant="ghost"
+                onPress={() => { if (!creatingSpace() && runnerOfferCount()) dismissRunnerOffer(); }} />
+            </Row>
+          </Banner>
+        )}
+      </If>
       <If when={adding()}>
         <Column padX={2} padY={1} gap={2}>
-          <Field testID="new-space-name" accessibilityLabel="New Space name" value={name()} onChange={name.set} placeholder="Space name" autoFocus maxLength={80} onSubmit={() => void submit()} />
-          <Action testID="create-space" label="Create Space" busyLabel="Creating…" busy={creatingSpace()} variant="primary" onPress={() => void submit()} />
+          <CreateSpaceForm name={name} setName={name.set} visible={props.visible}
+            onCreated={() => { name.set(""); adding.set(false); }} />
         </Column>
       </If>
       <Each of={spaces()} key={(space) => space.id}>
@@ -173,7 +194,7 @@ function SpacesSection() {
               testID={`space:${space().id}`}
               label={space().name}
               tile={{ initial: spaceInitial(space().name), seed: space().id }}
-              expanded={space().id === activeSpaceId() && mainPlace() === "space"}
+              expanded={spaceExpanded(space().id)}
               dot={spaceRunning(space().id) ? "the agent is working here" : undefined}
               tooltip={space().role === "owner" ? `${space().name} · you own this Space` : undefined}
               emphasis={space().id === activeSpaceId()}
@@ -186,11 +207,24 @@ function SpacesSection() {
                   { id: `space-settings:${space().id}`, label: "Space settings", onPress: () => openSpaceSettings(space().id) },
                   { id: `space-agents:${space().id}`, label: "Agents", onPress: () => openSpaceSettings(space().id, "agents") },
                   { id: `space-prefs:${space().id}`, label: "Your preferences", onPress: () => openSpaceSettings(space().id, "preferences") },
+                  { id: `space-menu-pages:${space().id}`, label: "Pages", onPress: () => goPages({ kind: "home", spaceId: space().id }) },
                 ],
               }}
             />
-            <If when={space().id === activeSpaceId() && mainPlace() === "space"}>
-              <RoomTree />
+            <If when={spaceExpanded(space().id)}>
+              <If when={space().id === activeSpaceId()}><RoomTree /></If>
+              <NavGroup>
+                <NavItem testID={`space-pages:${space().id}`} label="Pages" icon="file" depth={1}
+                  selected={mainPlace() === "pages" && pagesRoute().kind === "home" && pagesRoute().spaceId === space().id}
+                  onPress={() => goPages({ kind: "home", spaceId: space().id })} />
+                <If when={mainPlace() === "pages" && pagesRoute().spaceId === space().id}>
+                  <Each of={pages().filter(page => page.space_id === space().id)} key={page => page.id}>
+                    {page => <NavItem testID={`space-page:${page().id}`} label={[page().icon, page().title].filter(Boolean).join(" ")}
+                      icon="file" depth={2} selected={selectedPage(page().id)}
+                      onPress={() => goPages({ kind: "page", id: page().id, spaceId: space().id })} />}
+                  </Each>
+                </If>
+              </NavGroup>
             </If>
           </Column>
         )}
@@ -204,6 +238,31 @@ function SpacesSection() {
       </If>
     </Column>
   );
+}
+
+function selectedPage(id: string) {
+  const route = pagesRoute();
+  return mainPlace() === "pages" && route.kind === "page" && route.id === id;
+}
+
+function PinnedPages() {
+  const pinned = () => {
+    const names = new Map(spaces().map(s => [s.id, s.name]));
+    return pages().filter(p => p.pinned).sort((a, b) =>
+      Number(!!a.space_id) - Number(!!b.space_id)
+      || (names.get(a.space_id ?? "") ?? "").localeCompare(names.get(b.space_id ?? "") ?? "")
+      || (a.position ?? Number.MAX_SAFE_INTEGER) - (b.position ?? Number.MAX_SAFE_INTEGER)
+      || a.title.localeCompare(b.title));
+  };
+  return <If when={pinned().length}>
+    <NavGroup testID="pinned-pages">
+      <Each of={pinned()} key={p => p.id}>{p =>
+        <NavItem depth={1} icon="file" label={[p().icon, p().title].filter(Boolean).join(" ")}
+          testID={`pinned-page:${p().id}`} selected={selectedPage(p().id)}
+          onPress={() => goPages({ kind: "page", id: p().id, spaceId: p().space_id ?? undefined })} />
+      }</Each>
+    </NavGroup>
+  </If>;
 }
 
 type TreeRow = { room: Room; depth: number };
@@ -327,6 +386,7 @@ function AccountFooter(props: { compact?: boolean }) {
   // out ends this session and forgets its server's token in memory.
   const items = (): readonly AccountMenuItem[] => [
     ...workspaceItems(),
+    ...(settingsPageDot("about") ? [{ id: "account-update", label: "Update available", onPress: () => openSettings("about") }] : []),
     { id: "copy-server-url", label: "Copy server URL", icon: "copy", onPress: () => copy(connectedTo(), "Server URL copied") },
     { id: "copy-id", label: "Copy ID", icon: "copy", onPress: () => copy(me(), "ID copied") },
     { id: "disconnect", label: "Sign out", icon: "logout", destructive: true, onPress: () => signOut() },

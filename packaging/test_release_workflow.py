@@ -6,6 +6,7 @@ workflow (validated before any `if:`), the input contracts of each call, who
 sees which secret, and the order in which release jobs run.
 """
 
+from copy import deepcopy
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,10 @@ MAIN_IF = """github.event_name == 'push' && github.repository == 'wnzn/metro' &&
 GATES = ("rust", "desktop", "containers", "workflows", "packaging")
 RELEASE_IF = "needs.release-policy.outputs.release == 'true' && " + " && ".join(
     f"needs.{gate}.result == 'success'" for gate in GATES)
+E2E_RELEASE_MARKERS = ("e2e-test-release", "metro-release/e2e", "--all-features",
+                       "METRO_TEST_RELEASE_", "METRO_TEST_CRASH_VERSION",
+                       "metro-update-e2e-target")
+E2E_RELEASE_WORKFLOW_MARKERS = E2E_RELEASE_MARKERS + ("tests/e2e/updates.py",)
 
 
 def load(name):
@@ -91,6 +96,25 @@ def matches_conjunction(expression, context):
         return value(left) == value(right)
 
     return all(matches(term) for term in expression.split("&&"))
+
+
+class E2eTestHooksNeverShipTests(unittest.TestCase):
+    """metro-server/metro-runner `e2e-test-release` (tests/e2e/updates.py) loads
+    a loopback release source and the test verifier. No build path that makes
+    shipped binaries may enable it (metro-release also refuses to compile it
+    with METRO_RELEASE_CHANNEL=release)."""
+
+    def test_no_release_build_enables_the_e2e_feature(self):
+        paths = sorted(WF.glob("*.yml")) + [ROOT / "Dockerfile", ROOT / "packaging/Dockerfile.build"]
+        paths += sorted((ROOT / "packaging").glob("*.py")) + sorted((ROOT / "packaging").glob("*.sh"))
+        for path in paths:
+            # ci.yml has one step-level exception, checked on the parsed workflow below.
+            if path in (WF / "ci.yml", Path(__file__).resolve()) or not path.is_file():
+                continue
+            text = path.read_text(encoding="utf-8")
+            markers = E2E_RELEASE_WORKFLOW_MARKERS if path.parent == WF else E2E_RELEASE_MARKERS
+            for needle in markers:
+                self.assertNotIn(needle, text, f"{path.name} mentions {needle}")
 
 
 @unittest.skipIf(yaml is None and not os.environ.get("CI"), "PyYAML is not installed (CI installs python3-yaml)")
@@ -320,6 +344,45 @@ class ReleaseWorkflowTests(unittest.TestCase):
         # The only secrets any workflow reads are none at all (signing uses OIDC and the workflow token).
         for path in sorted(WF.glob("*.yml")):
             self.assertEqual(re.findall(r"secrets\.([A-Z0-9_]+)", path.read_text()), [], path.name)
+
+    def test_only_official_release_builds_are_stamped_for_updates(self):
+        """METRO_RELEASE_CHANNEL=release (update checks) only on official releases.
+
+        release.yml stamps its three binary builds from inputs.release, which
+        ci.yml sets only on the release job; the PR package smoke calls it
+        with release: false. release-images.yml stamps from inputs.push.
+        Nothing else in the workflows sets the variable."""
+        expr = "${{ inputs.release && 'release' || '' }}"
+        builds = {
+            "runner-linux": "Build metro-runner in the bookworm toolchain image",
+            "desktop-windows": "Build metro-desktop, metro-server and metro-tui (native, locked)",
+            "desktop-linux": "Build metro-desktop, metro-server and metro-tui (locked)",
+        }
+        for job, step_name in builds.items():
+            steps = self.release["jobs"][job]["steps"]
+            stamped = [st for st in steps if "METRO_RELEASE_CHANNEL" in str(st)]
+            self.assertEqual([st.get("name") for st in stamped], [step_name], job)
+            self.assertEqual(stamped[0]["env"]["METRO_RELEASE_CHANNEL"], expr, job)
+        runner = next(st for st in self.release["jobs"]["runner-linux"]["steps"] if st.get("name") == builds["runner-linux"])
+        self.assertIn('--build-arg METRO_RELEASE_CHANNEL="$METRO_RELEASE_CHANNEL"', runner["run"])
+        self.assertNotIn("METRO_RELEASE_CHANNEL", str(self.release.get("env")))
+        for name, job in self.release["jobs"].items():
+            self.assertNotIn("METRO_RELEASE_CHANNEL", str(job.get("env")), name)
+            if name not in builds:
+                self.assertNotIn("METRO_RELEASE_CHANNEL", str(job), name)
+        # Previews and PR smoke are release: false; only the release job is true.
+        callers = {name: job for name, job in self.ci["jobs"].items() if job.get("uses") == "./.github/workflows/release.yml"}
+        for name, job in callers.items():
+            self.assertEqual(job["with"]["release"] is True, name == "release", name)
+        self.assertNotIn("METRO_RELEASE_CHANNEL", (WF / "ci.yml").read_text())
+        # Images: from inputs.push only, server and runner, never the media image.
+        images = load("release-images.yml")
+        step = next(st for st in images["jobs"]["build"]["steps"] if "RELEASE_CHANNEL" in str(st))
+        self.assertEqual(step["env"]["RELEASE_CHANNEL"], "${{ inputs.push && 'release' || '' }}")
+        self.assertIn('--release-channel "$RELEASE_CHANNEL"', step["run"])
+        self.assertNotIn("RELEASE_CHANNEL", str(images["jobs"]["media"]))
+        # The Dockerfile defaults to a source build.
+        self.assertIn("ARG METRO_RELEASE_CHANNEL=\n", (ROOT / "Dockerfile").read_text())
 
     def test_linux_desktop_job_has_only_blocking_steps(self):
         # The best-effort Xvfb launch could never fail CI, so it and its screenshot are gone.
@@ -553,6 +616,44 @@ class ReleaseWorkflowTests(unittest.TestCase):
         self.assertLessEqual(pty[0]["timeout-minutes"], 10)
         self.assertIn("python3 -B crates/tui/tests/pty_qa.py --bin-dir target/debug", pty[0]["run"])
         self.assertIn("timeout --kill-after=", pty[0]["run"])
+
+    def test_ci_pages_and_web_search_use_the_normal_build_once(self):
+        jobs = self.ci["jobs"]
+        rust = jobs["rust"]["steps"]
+        build, = [i for i, s in enumerate(rust) if str(s.get("run", "")).startswith("cargo build --locked --bin ")]
+        for fixture, timeout in (("pages.py", 60), ("agent_pages.py", 90), ("web_search.py", 90)):
+            path = f"tests/e2e/{fixture}"
+            with self.subTest(fixture=fixture):
+                (job, index, step), = [(name, i, step) for name, job in jobs.items()
+                                       for i, step in enumerate(job.get("steps", []))
+                                       if path in str(step.get("run", ""))]
+                self.assertEqual(job, "rust")
+                self.assertGreater(index, build)
+                self.assertEqual(step["run"], f"python3 {path} --bin-dir target/debug --timeout {timeout}")
+                self.assertEqual(set(step), {"name", "run"})  # no independent skip, override, or allowed failure
+
+    def test_ci_updater_fixture_is_blocking_and_confined_to_one_step(self):
+        ci = deepcopy(self.ci)
+        rust = ci["jobs"]["rust"]
+        # Last step, still subject to implicit success() and part of the required rust check.
+        fixture = rust["steps"].pop()
+        self.assertEqual(fixture, {
+            "name": "Build and run the isolated updater fixture",
+            "if": "${{ needs.workflows.outputs.updates != 'false' || needs.release-policy.outputs.release == 'true' }}",
+            "timeout-minutes": 15,
+            "run": (
+                'set -eu\n'
+                'target="$RUNNER_TEMP/metro-update-e2e-target"\n'
+                'CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \\\n'
+                '  cargo build --locked -p metro-server -p metro-runner --target-dir "$target" \\\n'
+                '    --features metro-server/e2e-test-release,metro-runner/e2e-test-release\n'
+                'python3 tests/e2e/updates.py --bin-dir "$target/debug" --timeout 120\n'
+            ),
+        })
+        self.assertNotIn("continue-on-error", rust)
+        self.assertEqual(uploads(rust), [])
+        for needle in E2E_RELEASE_WORKFLOW_MARKERS:
+            self.assertNotIn(needle, yaml.safe_dump(ci))
 
     def test_signer_and_image_contracts_line_up(self):
         signer = (WF / "sign-release-assets.yml").read_text()

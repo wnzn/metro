@@ -4,8 +4,11 @@
 // Opening reads; Reconnect and Show folder act only when pressed.
 
 import { Clipboard, effect, signal, untracked } from "nsh";
-import { connectedTo, me } from "../../store";
-import { Action, ActionBar, Badge, Banner, Column, Label, Row, SettingRow, SettingsGroup } from "../../ui";
+import type { JSX } from "nsh";
+import { runnerBusy, runners } from "../../settings";
+import { attachMany, eligibleSpaces, installedFolderRefreshExhausted, installedRunnerChoice, retryInstalledFolderRefresh, runnerAttachBusy, runnerSessionKey } from "../../runnersState";
+import { sessionGuard, spaces } from "../../store";
+import { Action, Badge, Banner, Checkbox, Column, ConfirmInline, Label, Row, SettingRow, SettingsGroup } from "../../ui";
 import type { Tone } from "../../ui";
 import {
   folders,
@@ -13,7 +16,8 @@ import {
   installedError,
   installedNotice,
   installedRunner,
-  loadInstalledRunner,
+  checkingInstalledScope,
+  ownedInstalledRunner,
   reconnectInstalledRunner,
   runnerSpaces,
   showRunnerFolder,
@@ -44,7 +48,7 @@ export function installedRunnerBadge(r: InstalledRunner): { tone: Tone; label: s
 }
 
 export function reconnectImpact(r: InstalledRunner): string {
-  const fresh = "A new runner isn't attached to any Space: attach it in each Space's Manage view.";
+  const fresh = "A new runner isn't attached to any Space. You can choose where to attach it afterward.";
   if (r.runner) {
     return `Reconnecting issues a new token for “${r.runner.name}” if it's still one of your personal runners; its old token stops working at once, wherever else it was used, and the Spaces it's attached to stay attached. If it no longer exists, Metro creates a new personal runner instead. ${fresh}`;
   }
@@ -54,32 +58,27 @@ export function reconnectImpact(r: InstalledRunner): string {
   return `Reconnecting creates a new personal runner for this computer. ${fresh}`;
 }
 
-/**
- * Call once at the top of the Settings › Runners page (not inside a branch
- * that re-renders): reads the status on open and on any server or account
- * switch. Only reads.
- */
-export function watchInstalledRunner() {
-  effect(() => {
-    connectedTo();
-    me();
-    untracked(() => void loadInstalledRunner());
-  });
-}
-
-export function InstalledRunnerSection() {
+export function InstalledRunnerSection(props: { management?: JSX.Element; picks: AttachSelection }) {
   return (
-    <If when={installedRunner()}>
-      {(r) => <Section r={r()} />}
-    </If>
+    <>
+      <If when={installedRunner()}>
+        {(r) => <Section r={r()} management={props.management} picks={props.picks} />}
+      </If>
+      <If when={installedFolderRefreshExhausted()}>
+        <Banner variant="inline" tone="warning" testID="installed-runner-folders-unavailable"
+          title="Couldn’t refresh this computer’s runner folders"
+          message="Automatic checks stopped. If the runner isn’t registered, use Reconnect if available, then retry."
+          action={<Action testID="installed-runner-folders-retry" label="Retry" onPress={retryInstalledFolderRefresh} />} />
+      </If>
+    </>
   );
 }
 
-function Section(props: { r: InstalledRunner }) {
-  const confirm = signal(false);
+function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: AttachSelection }) {
   const copied = signal<string | null>(null);
   const r = () => props.r;
   const badge = () => installedRunnerBadge(r());
+  const version = () => runners()?.find((item) => item.id === ownedInstalledRunner()?.id)?.presence?.version;
   return (
     <SettingsGroup
       title="This computer's runner"
@@ -88,7 +87,7 @@ function Section(props: { r: InstalledRunner }) {
     >
       <SettingRow
         label={r().runner?.name ?? (r().unconfirmedName ? `Not confirmed (asked for “${r().unconfirmedName}”)` : "Not registered yet")}
-        description={`Read-only: ${r().tools.join(", ") || "workspace.list, workspace.read"}. It never changes files, runs commands or MCP servers.`}
+        description={`${version() ? `v${version()}` : "Version unknown until it connects"}. Updates with Metro. Read-only: ${r().tools.join(", ") || "workspace.list, workspace.read"}. It never changes files, runs commands or MCP servers.`}
       >
         <Badge testID="installed-runner-state" tone={badge().tone} label={badge().label} />
       </SettingRow>
@@ -101,9 +100,11 @@ function Section(props: { r: InstalledRunner }) {
           </Column>
         )}
       </If>
+      <AttachPicks picks={props.picks} />
       <SettingRow
-        label="Attach it to a Space"
-        description="Metro doesn't attach it for you. In a Space you own, open Manage and choose it under Runner. Each Space gets its own folder on this computer."
+        label="Folders on this computer"
+        description={runnerSpaces().length ? "Each Space gets its own folder on this computer."
+          : installedFolderRefreshExhausted() ? "Couldn’t verify attached Spaces." : "Attached Spaces will appear here."}
         stacked
       >
         <If when={runnerSpaces().length > 0}>
@@ -123,7 +124,7 @@ function Section(props: { r: InstalledRunner }) {
                           label="Show folder"
                           busyLabel="Opening…"
                           busy={installedBusy() === `folder:${s().id}`}
-                          disabled={!!installedBusy()}
+                          disabled={!!installedBusy() || runnerAttachBusy() || !!runnerBusy()}
                           variant="ghost"
                           onPress={() => void showRunnerFolder(s().id)}
                         />
@@ -171,32 +172,86 @@ function Section(props: { r: InstalledRunner }) {
       </If>
       <If when={r().canReconnect}>
         <Column padX={4} padY={3} gap={2}>
-          <If
-            when={confirm()}
-            else={
-              <Row justify="end">
-                <Action testID="installed-runner-reconnect" label="Reconnect…" disabled={!!installedBusy()} onPress={() => confirm.set(true)} />
-              </Row>
-            }
-          >
-            <Banner variant="inline" tone="warning" testID="installed-runner-impact" message={reconnectImpact(r())} />
-            <ActionBar>
-              <Action testID="installed-runner-cancel" label="Cancel" variant="ghost" onPress={() => confirm.set(false)} />
-              <Action
-                testID="installed-runner-confirm-reconnect"
-                label="Reconnect"
-                busyLabel="Reconnecting…"
-                busy={installedBusy() === "reconnect"}
-                variant="danger"
-                onPress={() => {
-                  confirm.set(false);
-                  void reconnectInstalledRunner();
-                }}
-              />
-            </ActionBar>
-          </If>
+          <ConfirmInline testID="installed-runner-reconnect" triggerLabel="Reconnect…" confirmLabel="Reconnect"
+            message={reconnectImpact(r())} scopeKey={JSON.stringify([runnerSessionKey(), r().runner?.id, r().state])}
+            disabled={!!installedBusy() || runnerAttachBusy() || !!runnerBusy()} busy={installedBusy() === "reconnect"} busyLabel="Reconnecting…"
+            onConfirm={() => void reconnectInstalledRunner()} />
         </Column>
       </If>
+      {props.management}
     </SettingsGroup>
+  );
+}
+
+const attachBusy = () => runnerAttachBusy() || !!installedBusy() || !!runnerBusy();
+
+export function createAttachSelection(listVisible: () => boolean) {
+  const checked = signal<ReadonlySet<string>>(new Set());
+  let initial = true;
+  let previousRunnerId: string | undefined;
+  let sameSession = sessionGuard();
+  effect(() => {
+    runnerSessionKey();
+    const local = installedRunner();
+    const runnerId = local?.runner?.id;
+    const choice = installedRunnerChoice();
+    const visible = eligibleSpaces();
+    const changed = !sameSession() || (previousRunnerId !== undefined && previousRunnerId !== runnerId);
+    sameSession = sessionGuard();
+    previousRunnerId = runnerId;
+
+    if (changed || (local && !runnerId)) {
+      // A different or newly registered runner must not inherit defaults.
+      initial = false;
+      checked.set(new Set());
+    } else if (initial && choice && listVisible()) {
+      // Only default the first verified list shown to the user, even if empty.
+      initial = false;
+      checked.set(new Set(visible.map((s) => s.id)));
+    } else {
+      // Losing eligibility revokes the pick; a returning row needs a new pick.
+      const before = untracked(checked);
+      const kept = visible.filter((s) => before.has(s.id));
+      if (kept.length !== before.size) checked.set(new Set(kept.map((s) => s.id)));
+    }
+  });
+  return {
+    checked,
+    setChecked: (id: string, on: boolean) => {
+      if (attachBusy() || !eligibleSpaces().some((s) => s.id === id)) return;
+      const next = new Set(checked());
+      if (on) next.add(id);
+      else next.delete(id);
+      checked.set(next);
+    },
+  };
+}
+
+type AttachSelection = ReturnType<typeof createAttachSelection>;
+
+function AttachPicks(props: { picks: AttachSelection }) {
+  const selected = () => eligibleSpaces().filter((s) => props.picks.checked().has(s.id)).map((s) => s.id);
+  const state = () => {
+    if (!installedFolderRefreshExhausted() && checkingInstalledScope() && !installedRunnerChoice()) return "Checking this computer's runner…";
+    if (ownedInstalledRunner()?.attachIfEmpty === false) return "This server doesn't support attaching only to Spaces without a runner.";
+    if (!installedRunnerChoice()) return "This computer's runner isn't available to attach for this account.";
+    if (eligibleSpaces().length === 0) return spaces().some((s) => s.role === "owner" && s.runnerPaired === null)
+      ? "Some runner assignments haven’t been confirmed yet." : "Every Space you own has a runner.";
+    return "Agents in the Spaces you choose can list and read files in their own folders on this computer.";
+  };
+  return (
+    <SettingRow label="Spaces without a runner" description={state()} stacked testID="runner-attach-list">
+      <If when={eligibleSpaces().length > 0}>
+        <Column gap={2}>
+          <Each of={eligibleSpaces()} key={(s) => s.id}>
+            {(s) => <Checkbox testID={`runner-attach-pick:${s().id}`} label={s().name} checked={props.picks.checked().has(s().id)}
+              disabled={attachBusy()} onChange={(checked) => props.picks.setChecked(s().id, checked)} />}
+          </Each>
+          <Action testID="runner-attach-many" label={`Attach to ${selected().length} ${selected().length === 1 ? "Space" : "Spaces"}`}
+            variant="primary" busy={runnerAttachBusy()} busyLabel="Attaching…" disabled={attachBusy() || !selected().length}
+            onPress={() => { if (!attachBusy()) void attachMany(selected()); }} />
+        </Column>
+      </If>
+    </SettingRow>
   );
 }

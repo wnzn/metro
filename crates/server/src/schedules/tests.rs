@@ -759,3 +759,206 @@ async fn move_to_personal_chat_clears_room() {
     assert_eq!(task.target, None);
     assert_eq!(task.view()["room_id"], serde_json::Value::Null);
 }
+
+#[tokio::test]
+async fn run_now_at_the_due_instant_never_swallows_the_occurrence() {
+    let st = state().await;
+    let fake = Fake::new(Mode::Ok);
+    let now = t(NOW);
+    let task = create(&st, "alice", body(once("2026-11-22T10:00:06+08:00")), now).unwrap();
+    let due = task.next_run_at.unwrap();
+    // "Run now" at exactly the instant the occurrence is due.
+    let (claim, _) = claim_now(&st.db, "alice", &task.id, None, due).unwrap();
+    finish(
+        &st.db,
+        &claim,
+        status::DISPATCHING,
+        status::DISPATCHED,
+        "ok",
+        due,
+    )
+    .unwrap();
+    // The scheduled occurrence is still claimed and dispatched, once.
+    let r = tick(&st, due, &fake).await;
+    assert_eq!(r.dispatched, 1, "{r:?}");
+    assert_eq!(
+        tick(&st, due + Duration::seconds(1), &fake).await,
+        TickReport::default()
+    );
+    assert_eq!(fake.calls().len(), 1);
+    let h = runs(&st, "alice", &task.id);
+    assert_eq!(h.len(), 2, "{h:?}");
+    assert!(h.iter().all(|r| r.due_at == "2026-11-22T02:00:06Z"));
+    assert_eq!(h.iter().filter(|r| r.run_now).count(), 1);
+    assert_eq!(h.iter().filter(|r| !r.run_now).count(), 1);
+    // Two run-nows in the same millisecond get distinct rows too.
+    let (a, _) = claim_now(&st.db, "alice", &task.id, None, due).unwrap();
+    let (b, _) = claim_now(&st.db, "alice", &task.id, None, due).unwrap();
+    assert_ne!(a.run_id, b.run_id);
+}
+
+#[tokio::test]
+async fn the_summary_follows_the_latest_occurrence_by_run_id() {
+    let st = state().await;
+    let now = t(NOW);
+    let task = create(&st, "alice", body(once("2026-11-22T10:00:06+08:00")), now).unwrap();
+    let due = task.next_run_at.unwrap();
+    // The scheduled occurrence and a run now share the same time.
+    let (scheduled, _) = claim_due(&st.db, due, 10).unwrap();
+    let scheduled = scheduled.into_iter().next().unwrap();
+    let (manual, _) = claim_now(&st.db, "alice", &task.id, None, due).unwrap();
+    finish(
+        &st.db,
+        &manual,
+        status::DISPATCHING,
+        status::DISPATCHED,
+        "ok",
+        due,
+    )
+    .unwrap();
+    // The older occurrence finishing later doesn't overwrite the summary.
+    finish(
+        &st.db,
+        &scheduled,
+        status::DISPATCHING,
+        status::ERROR,
+        "boom",
+        due,
+    )
+    .unwrap();
+    assert_eq!(
+        get(&st, &task.id).last_status.as_deref(),
+        Some(status::DISPATCHED)
+    );
+    // A transition that didn't happen changes nothing either.
+    finish(&st.db, &manual, status::UNKNOWN, status::ERROR, "late", due).unwrap();
+    assert_eq!(
+        get(&st, &task.id).last_status.as_deref(),
+        Some(status::DISPATCHED)
+    );
+}
+
+#[tokio::test]
+async fn run_now_dispatches_exactly_the_claimed_snapshot() {
+    let st = state().await;
+    let fake = Fake::new(Mode::Ok);
+    let now = t(NOW);
+    let task = create(&st, "alice", body(cron("0 3 * * *", "UTC")), now).unwrap();
+    // A stale revision is refused and records nothing.
+    let err = run_now_with(
+        &st,
+        "alice",
+        &task.id,
+        Some(task.revision + 1),
+        fake.clone(),
+        StdDuration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ScheduleError::Conflict(_)), "{err:?}");
+    assert!(runs(&st, "alice", &task.id).is_empty());
+    assert!(fake.calls().is_empty());
+    // Claimed, then edited: the claimed prompt is what's sent.
+    let (claim, snapshot) =
+        claim_now(&st.db, "alice", &task.id, Some(task.revision), Utc::now()).unwrap();
+    let edit = PatchBody {
+        prompt: Some("Edited after the claim".into()),
+        ..Default::default()
+    };
+    update_task(&st.db, "alice", &task.id, edit, now, 8_000).unwrap();
+    let run = dispatch_claimed(
+        &st,
+        claim,
+        snapshot,
+        fake.as_ref(),
+        StdDuration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.status, status::DISPATCHED);
+    assert!(run.run_now);
+    assert_eq!(fake.calls()[0].2, "Summarize yesterday");
+    // A required Space the task doesn't target is refused.
+    let mut conn = st.db.lock();
+    let tx = conn.transaction().unwrap();
+    let err = claim_now_in(&tx, "alice", &task.id, None, Some("s-other"), Utc::now()).unwrap_err();
+    assert!(matches!(err, ScheduleError::Conflict(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn run_now_is_recorded_even_if_its_caller_goes_away() {
+    let st = state().await;
+    let fake = Fake::new(Mode::Hang);
+    let task = create(&st, "alice", body(cron("0 3 * * *", "UTC")), t(NOW)).unwrap();
+    let (s2, f2, id) = (st.clone(), fake.clone(), task.id.clone());
+    // The caller (an HTTP handler, say) is dropped while the prompt is out.
+    let caller = tokio::spawn(async move {
+        let _ = run_now_with(&s2, "alice", &id, None, f2, StdDuration::from_secs(30)).await;
+    });
+    for _ in 0..200 {
+        if !fake.calls().is_empty() {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    assert_eq!(fake.calls().len(), 1);
+    caller.abort();
+    let _ = caller.await;
+    fake.release.notify_one();
+    for _ in 0..200 {
+        let h = runs(&st, "alice", &task.id);
+        if h[0].status != status::DISPATCHING {
+            assert_eq!(h[0].status, status::DISPATCHED, "{h:?}");
+            return;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    panic!(
+        "the occurrence was left dispatching: {:?}",
+        runs(&st, "alice", &task.id)
+    );
+}
+
+/// Hold the database lock on another thread until the returned sender is
+/// dropped or used.
+fn hold_lock(db: &Db) -> std::sync::mpsc::Sender<()> {
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let (locked, is_locked) = std::sync::mpsc::channel::<()>();
+    let db = db.clone();
+    std::thread::spawn(move || {
+        let _guard = db.lock();
+        locked.send(()).unwrap();
+        let _ = wait.recv();
+    });
+    is_locked.recv().unwrap();
+    release
+}
+
+#[tokio::test]
+async fn run_now_cancelled_while_its_claim_is_pending_is_still_dispatched() {
+    let st = state().await;
+    let fake = Fake::new(Mode::Ok);
+    let task = create(&st, "alice", body(cron("0 3 * * *", "UTC")), t(NOW)).unwrap();
+    let release = hold_lock(&st.db);
+    let (s2, f2, id) = (st.clone(), fake.clone(), task.id.clone());
+    let caller = tokio::spawn(async move {
+        let _ = run_now_with(&s2, "alice", &id, None, f2, StdDuration::from_secs(30)).await;
+    });
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+    caller.abort();
+    let _ = caller.await;
+    drop(release);
+    for _ in 0..300 {
+        let h = runs(&st, "alice", &task.id);
+        if h.first().is_some_and(|r| r.status != status::DISPATCHING) {
+            assert_eq!(h[0].status, status::DISPATCHED, "{h:?}");
+            assert_eq!(fake.calls().len(), 1);
+            return;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    panic!(
+        "the claimed occurrence was never dispatched: {:?}",
+        runs(&st, "alice", &task.id)
+    );
+}

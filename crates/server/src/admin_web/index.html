@@ -41,14 +41,24 @@
   <section id="unsafe" class="card notice notice-danger" hidden aria-labelledby="unsafe-title">
     <h1 id="unsafe-title">Sign-in is turned off on this page</h1>
     <p id="unsafe-reason"></p>
-    <p><strong>Do not paste an admin token into this page.</strong> Open the panel over a protected connection instead:</p>
+    <p><strong>Do not paste an admin token into this page.</strong> Open the panel directly from your Metro server instead:</p>
     <ul class="steps">
       <li><strong>HTTPS:</strong> put Metro behind a TLS proxy and open <code>https://&lt;your-host&gt;/admin</code>.</li>
+      <li><strong>Tailscale:</strong> open <code>http://&lt;your-host&gt;.&lt;tailnet&gt;.ts.net/admin</code> or the server's <code>100.x.y.z</code> address.</li>
       <li><strong>SSH tunnel:</strong> from your computer run
         <code class="block" id="unsafe-ssh"></code>
         then open <a id="unsafe-local" href="http://localhost:8080/admin" rel="noreferrer">http://localhost:8080/admin</a>.</li>
       <li><strong>On the server itself:</strong> open <code id="unsafe-loopback">http://127.0.0.1/admin</code>.</li>
     </ul>
+  </section>
+
+  <!-- Plain HTTP to a host that is neither loopback nor Tailscale: asked once per server, before the token field appears. -->
+  <section id="plain-http" class="card notice notice-warning" hidden aria-labelledby="plain-http-title">
+    <h1 id="plain-http-title">This connection isn't encrypted</h1>
+    <div id="plain-http-status" class="alert alert-danger" role="alert" hidden></div>
+    <p id="plain-http-reason"></p>
+    <p>HTTPS or an SSH tunnel to the server keeps the token private on any network.</p>
+    <button type="button" id="plain-http-accept" class="btn btn-primary">Sign in anyway</button>
   </section>
 
   <section id="signin" class="card signin" hidden aria-labelledby="signin-title">
@@ -60,6 +70,8 @@
       <label for="token" class="label">Admin access token</label>
       <input id="token" class="input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required aria-describedby="token-hint">
       <p id="token-hint" class="hint">Sent only to this server, in an Authorization header.</p>
+      <p id="plain-http-note" class="hint" hidden>This connection isn't encrypted.
+        <button type="button" id="plain-http-forget" class="btn-link">Forget this choice</button></p>
       <button type="submit" id="signin-submit" class="btn btn-primary">Sign in</button>
     </form>
   </section>
@@ -71,6 +83,12 @@
   </section>
 
   <div id="panel" hidden>
+    <section id="update-notice" class="card notice notice-warning" hidden role="status" aria-labelledby="update-title">
+      <h2 id="update-title">A newer Metro release is available</h2>
+      <p>This server runs <strong id="update-current"></strong>. Metro <strong id="update-latest"></strong> is published and its signature was verified. Update the server yourself; Metro never updates it.</p>
+      <p>Server image: <code id="update-image"></code></p>
+      <p><a id="update-link" href="https://github.com/wnzn/metro/releases" rel="noreferrer">Release notes</a></p>
+    </section>
     <div id="secret" class="card secret" hidden role="region" aria-labelledby="secret-title">
       <h2 id="secret-title">Token for <span id="secret-for"></span></h2>
       <p>Copy it now and hand it over privately. <strong>It's shown only once.</strong> Metro stores only a hash, so you can't see this token again.</p>
@@ -117,6 +135,31 @@
           <tbody id="users-body"></tbody>
         </table>
       </div>
+    </section>
+
+    <section class="card" aria-labelledby="page-limits-title">
+      <h2 id="page-limits-title">Page limits</h2>
+      <p class="muted">These limits apply across this workspace. Lowering them won't delete anything when you save.</p>
+      <div id="page-limits-error" class="alert alert-danger" role="alert" hidden></div>
+      <p id="page-limits-status" class="hint" role="status"></p>
+      <button type="button" id="page-limits-retry" class="btn btn-secondary" hidden>Retry loading Page limits</button>
+      <form id="page-limits-form" method="post" novalidate hidden>
+        <div class="page-limits-fields">
+          <div class="field">
+            <label for="pages-per-space" class="label">Live pages per Space</label>
+            <input id="pages-per-space" class="input" type="number" min="1" max="500" step="1" required
+                   aria-describedby="pages-per-space-hint" aria-errormessage="page-limits-error">
+            <p id="pages-per-space-hint" class="hint">1–500. The same limit applies to each person's private pages. At or above the limit, no new pages can be created or recovered from Trash.</p>
+          </div>
+          <div class="field">
+            <label for="versions-per-page" class="label">Recent versions per page</label>
+            <input id="versions-per-page" class="input" type="number" min="2" max="1000" step="1" required
+                   aria-describedby="versions-per-page-hint" aria-errormessage="page-limits-error">
+            <p id="versions-per-page-hint" class="hint">2–1,000. When a new version is saved, Metro keeps this many recent versions plus the first version.</p>
+          </div>
+        </div>
+        <button type="submit" id="page-limits-save" class="btn btn-primary">Save Page limits</button>
+      </form>
     </section>
   </div>
 

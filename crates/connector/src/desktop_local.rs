@@ -72,6 +72,16 @@ const START_TIMEOUT: Duration = Duration::from_secs(45);
 /// How long a graceful stop may take before the server is killed.
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(50);
+const READY_FAST_POLL: Duration = Duration::from_millis(5);
+const READY_FAST_POLLS: usize = 8;
+
+fn ready_delay(attempt: usize) -> Duration {
+    if attempt < READY_FAST_POLLS {
+        READY_FAST_POLL
+    } else {
+        POLL
+    }
+}
 
 /// Variables the local server inherits; everything else is dropped, so a
 /// developer's `METRO_*`, OIDC or model settings never reach it.
@@ -121,6 +131,8 @@ struct Shared {
     current: Mutex<Option<Current>>,
     /// The port this launcher owns, from the first open until shutdown.
     lease: Mutex<Option<Lease>>,
+    #[cfg(target_os = "linux")]
+    instance: Option<Arc<crate::desktop::store::InstanceLock>>,
 }
 
 /// The listening socket every server start serves, and the data root's lock.
@@ -172,8 +184,18 @@ impl LocalServer {
                 closing: AtomicBool::new(false),
                 current: Mutex::new(None),
                 lease: Mutex::new(None),
+                #[cfg(target_os = "linux")]
+                instance: None,
             }),
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn with_instance(mut self, instance: Arc<crate::desktop::store::InstanceLock>) -> Self {
+        Arc::get_mut(&mut self.shared)
+            .expect("new local server")
+            .instance = Some(instance);
+        self
     }
 
     /// The running local server's URL, `None` unless it runs. In-process
@@ -247,19 +269,34 @@ impl LocalServer {
         }
     }
 
-    async fn shutdown_inner(&self) {
+    async fn shutdown_inner(&self) -> bool {
         self.shared.closing.store(true, Ordering::SeqCst);
         let mut slot = self.shared.running.lock().await;
         self.shared.set_current(None);
-        if let Some(running) = slot.take() {
+        if let Some(running) = slot.as_ref() {
             let child = running.child.clone();
-            drop(running); // token wiped, lock released after the stop below
-            let _ = tokio::task::spawn_blocking(move || child.stop(STOP_GRACE)).await;
+            let stopped = tokio::task::spawn_blocking(move || {
+                child.stop(STOP_GRACE);
+                child
+                    .child
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .try_wait()
+                    .is_ok_and(|s| s.is_some())
+            })
+            .await
+            .unwrap_or(false);
+            if !stopped {
+                self.shared.set_state(LocalState::Failed);
+                return false;
+            }
+            drop(slot.take());
         }
         // The app is closing: nothing calls the local address any more.
         drop(lock(&self.shared.lease).take());
         self.shared.set_state(LocalState::Stopped);
         self.shared.closing.store(false, Ordering::SeqCst);
+        true
     }
 
     async fn start(&self) -> Result<Running, SafeError> {
@@ -300,6 +337,8 @@ impl LocalServer {
             .env("METRO_PROVIDER_KEY_FILE", &dirs.master_key)
             .env("METRO_READY_FILE", &ready_path)
             .env("METRO_EXIT_ON_STDIN_EOF", "1")
+            // The app checks for updates itself; its private server never does.
+            .env("METRO_UPDATE_CHECK", "off")
             .stdin(Stdio::piped())
             .stdout(Stdio::from(
                 log.try_clone()
@@ -307,6 +346,20 @@ impl LocalServer {
             ))
             .stderr(Stdio::from(log));
         platform::configure(&mut cmd, socket);
+        #[cfg(target_os = "linux")]
+        {
+            let lease = lock(&self.shared.lease);
+            let writer = &lease
+                .as_ref()
+                .ok_or_else(|| SafeError::new("The local workspace lease was lost."))?
+                ._lock;
+            crate::desktop::store::inherit_lock(writer, &mut cmd)
+                .and_then(|()| match &self.shared.instance {
+                    Some(instance) => instance.inherit_in(&mut cmd),
+                    None => Ok(()),
+                })
+                .map_err(|e| fs_error("hand over its locks", e.into()))?;
+        }
 
         let child =
             ChildProc::spawn(cmd, move |c| platform::hand_over(c, socket)).map_err(|e| {
@@ -393,6 +446,9 @@ impl LocalServer {
         leased: SocketAddrV4,
     ) -> Result<SocketAddrV4, SafeError> {
         let deadline = Instant::now() + START_TIMEOUT;
+        // Most bundled children are ready within the first 50 ms. Check
+        // more often in that window without keeping the fast cadence on slow starts.
+        let mut attempt = 0;
         loop {
             if self.shared.closing.load(Ordering::SeqCst) {
                 return Err(SafeError::new(
@@ -427,7 +483,8 @@ impl LocalServer {
                     log_error(log)
                 )));
             }
-            tokio::time::sleep(POLL).await;
+            tokio::time::sleep(ready_delay(attempt)).await;
+            attempt += 1;
         }
     }
 }
@@ -444,6 +501,12 @@ impl LocalWorkspaceHost for LocalServer {
     }
 
     fn shutdown(&self) -> BoxFut<'_, ()> {
+        Box::pin(async {
+            let _ = self.shutdown_inner().await;
+        })
+    }
+
+    fn shutdown_confirmed(&self) -> BoxFut<'_, bool> {
         Box::pin(self.shutdown_inner())
     }
 
@@ -553,7 +616,9 @@ impl ChildProc {
         std::thread::Builder::new()
             .name("metro-local-server".into())
             .spawn(move || {
-                let proc = match cmd.spawn() {
+                let spawned = cmd.spawn();
+                drop(cmd);
+                let proc = match spawned {
                     Ok(mut child) => {
                         if let Err(e) = hand_over(&mut child) {
                             let _ = child.kill();
@@ -699,6 +764,15 @@ fn take_lock(path: &Path) -> Result<fs::File, SafeError> {
         )),
         Err(fs::TryLockError::Error(e)) => Err(fs_error("lock its folder", e.into())),
     }
+}
+
+/// Taken by the updater while inspecting or replacing SQLite files. The
+/// same lease is inherited by Linux bundled servers, even if their launcher
+/// dies before the server has stopped or been reaped.
+pub(crate) fn update_writer_exclusion(desktop_root: &Path) -> std::io::Result<fs::File> {
+    let local = desktop_root.join("local");
+    ensure_private_dir(&local).map_err(std::io::Error::other)?;
+    take_lock(&local.join("local.lock")).map_err(std::io::Error::other)
 }
 
 fn load_state(path: &Path) -> Result<SavedState, SafeError> {
@@ -1142,6 +1216,16 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_polls_fast_for_eight_attempts_then_slow_down() {
+        for attempt in 0..8 {
+            assert_eq!(ready_delay(attempt), Duration::from_millis(5));
+        }
+        for attempt in [8, 9, usize::MAX] {
+            assert_eq!(ready_delay(attempt), Duration::from_millis(50));
+        }
+    }
 
     #[test]
     fn log_summary_takes_the_error_report() {

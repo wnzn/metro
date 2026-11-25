@@ -6,11 +6,13 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { BOB_PNG, profileWorld } from "./test/fixtures";
+import { launched } from "../../../test/launched";
 
 type W = ReturnType<typeof profileWorld>;
 
 async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice"): Promise<App> {
   const app = await open("./test/Harness.tsx", {
+    modules: launched(),
     network: w.network as any,
     platform: "linux",
     width: 1280,
@@ -147,6 +149,7 @@ test("Settings › Profile edits the name and bio, and sets, changes and removes
   await app.waitFor("id:profile-name");
   expect(app.value("id:profile-name")).toBe("Alice Moreno");
   expect(app.value("id:profile-bio")).toBe("Runs the Acme rollout.");
+  expect(app.shows("text:Your account on 127.0.0.1:8787")).toBe(true);
   expect(app.shows("id:profile-id")).toBe(true);
   // The stable id copies with one press; Save stays in the fixed footer.
   await app.press("id:profile-id-copy");
@@ -155,6 +158,11 @@ test("Settings › Profile edits the name and bio, and sets, changes and removes
   expect(app.shows("id:profile-settings:footer >> id:profile-save")).toBe(true);
   expect(app.enabled("id:profile-save")).toBe(false); // nothing changed yet
   expect(app.shows("id:profile-picture-remove")).toBe(false); // no picture: initials
+  await app.type("id:profile-bio", " Temporary.");
+  await app.waitFor("id:profile-unsaved");
+  await app.press("id:profile-revert");
+  expect(app.value("id:profile-bio")).toBe("Runs the Acme rollout.");
+  expect(calls(w, "/v1/me/profile", "PATCH")).toHaveLength(0);
 
   // Name and bio.
   await app.clear("id:profile-name");
@@ -236,7 +244,7 @@ test("a server without profiles: the page says so, the transcript still works", 
     const inner = network[key]!;
     network[key] = (req: any) => (new URL(req.url).pathname.includes("profile") ? { status: 404, body: { error: "not found" } } : inner(req));
   }
-  const app = await open("./test/Harness.tsx", { network: network as any, platform: "linux", width: 1280, height: 900, localeSettings: { timeZone: "UTC" } });
+  const app = await open("./test/Harness.tsx", { modules: launched(), network: network as any, platform: "linux", width: 1280, height: 900, localeSettings: { timeZone: "UTC" } });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS.alice!);

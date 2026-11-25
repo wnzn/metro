@@ -3,9 +3,10 @@
 // in theme/theme.json. To swap the design system, replace this module while
 // keeping its exports' props.
 
-import { effect, keymap, List, Scroll, signal, Text, View } from "nsh";
-import type { JSX, ListRef } from "nsh";
-import { Button, Collapsible, ContextMenu, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
+import { cleanup, effect, keymap, List, Scroll, signal, Text, untracked, View } from "nsh";
+import type { InputRef, JSX, ListRef, ViewRef } from "nsh";
+import { Button, Checkbox as BaseCheckbox, Collapsible, ContextMenu, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
+import type { ButtonProps } from "nsh/base";
 import { Icon, SpaceTile } from "./chrome";
 import type { IconColor, IconName } from "./chrome";
 import {
@@ -55,10 +56,11 @@ type StackProps = Children &
 const alignClass = { start: "items-start", center: "items-center", end: "items-end", stretch: "items-stretch" };
 const justifyClass = { start: "justify-start", center: "justify-center", end: "justify-end", between: "justify-between" };
 
-function stackClass(props: StackProps, direction: "row" | "col") {
+// Pass layout overrides separately: spreading NSH props evaluates their lazy children.
+function stackClass(props: StackProps, direction: "row" | "col", grow = props.grow) {
   return cx(
     direction === "row" ? "flex-row" : "flex-col",
-    props.grow && "flex-1 min-w-0 min-h-0",
+    grow && "flex-1 min-w-0 min-h-0",
     props.wrap && "flex-wrap",
     props.align && alignClass[props.align],
     props.justify && justifyClass[props.justify],
@@ -69,9 +71,9 @@ function stackClass(props: StackProps, direction: "row" | "col") {
   );
 }
 
-export function Row(props: StackProps) {
+export function Row(props: StackProps & { stacked?: boolean }) {
   return (
-    <View class={stackClass(props, "row")} selectable={props.selectable} testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
+    <View class={stackClass(props, props.stacked ? "col" : "row")} selectable={props.selectable} testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
       {props.children}
     </View>
   );
@@ -132,14 +134,23 @@ const surfaceClass: Record<SurfaceVariant, string> = {
   popover: "bg-popover border border-border rounded-(--radius-lg) shadow-lg",
 };
 
-export function Surface(props: StackProps & { variant: SurfaceVariant; hidden?: boolean; /** A side panel's width the user chose (points), over the variant's own. */ width?: number }) {
+export function Surface(props: StackProps & {
+  variant: SurfaceVariant; hidden?: boolean;
+  /** A side panel's width the user chose (points), over the variant's own. */
+  width?: number;
+  /** Called after a nonempty layout; may fire again on resize. */
+  onLaidOut?: () => void;
+}) {
   return (
     <View
-      class={cx(surfaceClass[props.variant], stackClass({ ...props, grow: false }, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col"), props.grow && "flex-1 min-h-0", props.hidden && "hidden", props.width !== undefined && "shrink-0")}
+      class={cx(surfaceClass[props.variant], stackClass(props, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col", false), props.grow && "flex-1 min-h-0", props.hidden && "hidden", props.width !== undefined && "shrink-0")}
       style={props.width !== undefined ? { width: props.width } : undefined}
       accessibilityElementsHidden={props.hidden}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
+      onLayout={props.onLaidOut ? ({ bounds }) => {
+        if (bounds.size.width > 0 && bounds.size.height > 0) props.onLaidOut?.();
+      } : undefined}
     >
       {props.children}
     </View>
@@ -246,6 +257,39 @@ export function Label(
 /** The keyboard focus ring every interactive primitive shares. */
 const focusRing = focusRingClass;
 
+/** Only the focused control takes Escape, through the keymap before modal dismissal. */
+function focusedEscape(handler: () => (() => void) | undefined) {
+  const focused = signal(false);
+  effect(() => {
+    if (!focused() || !handler()) return;
+    return keymap.bind("escape", () => handler()?.(), { when: "always", forFocus: true });
+  });
+  return { onFocus: () => focused.set(true), onBlur: () => focused.set(false) };
+}
+
+// NSH's base Button does not expose focus events. Keep its host for ordinary
+// Actions; only controls with a focus-scoped Escape need the View host.
+function EscapeActionButton(props: ButtonProps & { onEscape?: () => void }) {
+  const escape = focusedEscape(() => props.onEscape);
+  return (
+    <View
+      class={props.class}
+      ref={props.ref}
+      role="button"
+      focusable={!props.disabled}
+      disabled={props.disabled}
+      accessibilityState={{ disabled: !!props.disabled }}
+      accessibilityLabel={props.accessibilityLabel ?? undefined}
+      testID={props.testID}
+      onPress={() => props.onPress?.()}
+      onFocus={escape.onFocus}
+      onBlur={escape.onBlur}
+    >
+      {props.children}
+    </View>
+  );
+}
+
 /**
  * - `primary`: the one main action of a view.
  * - `secondary`: an outlined everyday action.
@@ -306,13 +350,20 @@ export function Action(
     edgeAligned?: boolean;
     /** An icon of the app's family before the label (secondary, ghost and destructive only). */
     icon?: IconName;
+    /** For focus handoffs to this action, such as returning from an inline confirmation. */
+    viewRef?: (node: ViewRef) => void;
+    /** Consume Escape while this action is focused (e.g. inside an inline confirmation). */
+    onEscape?: () => void;
   },
 ) {
   const variant = () => props.variant ?? "secondary";
   const iconColor = () => actionIconColor[variant()];
   const quiet = () => variant() === "ghost" || variant() === "destructive";
+  const Control = props.onEscape ? EscapeActionButton : Button;
   return (
-    <Button
+    <Control
+      ref={props.viewRef}
+      onEscape={props.onEscape}
       class={cx(
         "group flex-row items-center justify-center",
         props.compact ? cx(controlHeightClass.compact, "rounded-(--radius-sm) gap-(--space-1) px-(--space-2)") : cx(controlHeightClass.default, "rounded-(--radius-md) gap-(--space-2) px-(--space-3)"),
@@ -337,7 +388,7 @@ export function Action(
       <Text class={cx(props.compact ? textClass.xs : textClass.sm, "font-medium", actionTextClass[variant()], disabledTextClass)}>
         {props.busy ? props.busyLabel ?? props.label : props.label}
       </Text>
-    </Button>
+    </Control>
   );
 }
 
@@ -640,6 +691,10 @@ export function Field(
     multiline?: boolean;
     disabled?: boolean;
     autoFocus?: boolean;
+    /** For handing focus to the field when opening inline content. */
+    inputRef?: (node: InputRef) => void;
+    /** Keep the text exactly as typed (names and confirmation phrases). */
+    verbatim?: boolean;
     grow?: boolean;
     /** Return submits (Shift+Return adds a line in multiline fields). */
     onSubmit?: () => void;
@@ -657,6 +712,7 @@ export function Field(
   });
   return (
     <Input
+      ref={props.inputRef}
       onFocus={() => focused.set(true)}
       onBlur={() => focused.set(false)}
       class={cx(
@@ -678,8 +734,8 @@ export function Field(
       disabled={props.disabled}
       autoFocus={props.autoFocus}
       maxLength={props.maxLength}
-      autoCapitalize={props.masked ? "none" : undefined}
-      autoCorrect={props.masked ? false : undefined}
+      autoCapitalize={props.masked || props.verbatim ? "none" : undefined}
+      autoCorrect={props.masked || props.verbatim ? false : undefined}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.placeholder}
     />
@@ -707,17 +763,17 @@ export function FormRow(props: { label: string; hint?: string; children?: JSX.El
  * A quiet status pill. `soft` (the default) is tinted by its tone; `outline`
  * is quieter still, for metadata beside a name (a scope, a capability).
  */
-export function Badge(props: { tone: Tone; label: string; testID?: string; variant?: "soft" | "outline" }) {
+export function Badge(props: { tone: Tone | "info"; label: string; testID?: string; variant?: "soft" | "outline" }) {
   const outline = () => props.variant === "outline";
   return (
     <View
       class={cx(
         "flex-row items-center self-center rounded-full px-[8px] py-px",
-        outline() ? "border border-border" : toneSurfaceClass[props.tone],
+        outline() ? "border border-border" : props.tone === "info" ? "bg-accent" : toneSurfaceClass[props.tone],
       )}
       testID={props.testID}
     >
-      <Text class={cx(textClass.xs, "font-medium", outline() ? "text-muted-foreground" : toneTextClass[props.tone])} style={{ numberOfLines: 1 }}>
+      <Text class={cx(textClass.xs, "font-medium", outline() ? "text-muted-foreground" : props.tone === "info" ? "text-accent-foreground" : toneTextClass[props.tone])} style={{ numberOfLines: 1 }}>
         {props.label}
       </Text>
     </View>
@@ -778,6 +834,222 @@ export function Banner(
       </If>
       <If when={props.action}>
         <View class="shrink-0 flex-row items-center gap-(--space-2)">{props.action}</View>
+      </If>
+    </View>
+  );
+}
+
+type ConfirmTrigger =
+  | { triggerLabel: string; open?: boolean; onOpenChange?: (open: boolean) => void; returnFocus?: () => ViewRef | null | undefined }
+  | { triggerLabel?: never; open: boolean; onOpenChange: (open: boolean) => void; returnFocus: () => ViewRef | null | undefined };
+
+/** An inline result that can receive keyboard focus after its action goes away. */
+export function StatusSummary(props: Testable & { focusable: boolean; viewRef: (node: ViewRef) => void; children?: JSX.Element }) {
+  return (
+    <View ref={props.viewRef} role={props.focusable ? "summary" : undefined} focusable={props.focusable}
+      class={focusRing} accessibilityLabel={props.accessibilityLabel} testID={props.testID}>
+      {props.children}
+    </View>
+  );
+}
+
+/**
+ * A confirmation scoped to one row. `testID` names the trigger; the panel,
+ * warning, input, Cancel, final action and busy status use `:panel`, `:warning`,
+ * `:input`, `:cancel`, `:confirm` and `:busy`. For a menu trigger or a saving
+ * state, control `open` and `onOpenChange`. For an external trigger, omit
+ * `triggerLabel` and pass `returnFocus`, which captures the opener when
+ * `open` turns true. A busy status takes focus in place of the final action.
+ * Use the persistent menu button as the opener for a menu item that unmounts.
+ * Clear controlled `open` when changing targets, and set it again only on
+ * a new user request. Scope invalidation does not write to the parent's state.
+ */
+export function ConfirmInline(props: Testable & ConfirmTrigger & {
+  confirmLabel: string;
+  title?: string;
+  message: string;
+  /** The exact (case- and space-sensitive) text needed to enable the action. */
+  typeToConfirm?: string;
+  /** A changed target closes the panel. A controlled reopen needs `open` to go false, then true. */
+  scopeKey?: string;
+  onConfirm: () => void;
+  /** Non-destructive actions (such as starting an update) use `primary`. */
+  variant?: "destructive" | "primary";
+  disabled?: boolean;
+  busy?: boolean;
+  busyLabel?: string;
+  /** Idle close in the same scope: use this when the opener has become unavailable. */
+  returnFocusOnClose?: () => ViewRef | null | undefined;
+  /** Controlled close after confirming: fall back to the opener if this returns no result control. */
+  returnFocusAfterBusy?: () => ViewRef | null | undefined;
+}) {
+  const localOpen = signal(false);
+  const session = signal<{ key?: string; opener?: ViewRef | null } | null>(null);
+  const typed = signal("");
+  const open = () => {
+    const active = session();
+    return !!active && (props.open ?? localOpen()) && active.key === props.scopeKey;
+  };
+  const ready = () => !props.disabled && !props.busy && (props.typeToConfirm === undefined || typed() === props.typeToConfirm);
+  const id = (part: string) => props.testID ? `${props.testID}:${part}` : undefined;
+  let trigger: ViewRef | undefined;
+  let cancelControl: ViewRef | undefined;
+  let busyFocus: ReturnType<typeof session> = null;
+  let submitted: ReturnType<typeof session> = null;
+  let focusedWhileBusy: ReturnType<typeof session> = null;
+  let mounted = true;
+  cleanup(() => { mounted = false; });
+  let wasRequested = false;
+  const changeOpen = (next: boolean) => {
+    if (props.open === undefined) localOpen.set(next);
+    props.onOpenChange?.(next);
+  };
+  const restore = (active: NonNullable<ReturnType<typeof session>>) => {
+    const opener = active.opener ?? trigger;
+    const afterSubmit = submitted === active;
+    const choose = afterSubmit ? props.returnFocusAfterBusy : props.returnFocusOnClose;
+    if (!choose) {
+      opener?.focus();
+      return;
+    }
+    // Don't pull focus back from a different control the person moved to.
+    if (props.busy || (focusedWhileBusy === active && busyFocus !== active)) return;
+    const next = choose() ?? opener;
+    if (!next) return;
+    void next.measure().then((layout) => {
+      if (layout && mounted && session() === null && props.scopeKey === active.key) next.focus();
+    });
+  };
+  // A true prop is a request to open only on its rising edge. Retargeting
+  // invalidates the session even if the parent keeps requesting it, or the
+  // original target comes back before the parent clears its request.
+  effect(() => {
+    const requested = props.open ?? localOpen();
+    const key = props.scopeKey;
+    const opening = requested && !wasRequested;
+    wasRequested = requested;
+    const active = untracked(session);
+    if (opening) {
+      session.set({ key, opener: untracked(() => props.returnFocus?.() ?? trigger) });
+    } else if (active && active.key !== key) {
+      session.set(null);
+      if (props.open === undefined) localOpen.set(false);
+    } else if (active && !requested) {
+      session.set(null);
+      untracked(() => restore(active));
+    }
+  });
+  effect(() => {
+    session();
+    props.typeToConfirm;
+    typed.set("");
+  });
+  const close = () => {
+    const active = session();
+    session.set(null);
+    changeOpen(false);
+    if (active) restore(active);
+  };
+  const cancel = () => {
+    if (!open() || props.busy) return;
+    close();
+  };
+  const confirm = () => {
+    if (!open() || !ready()) return;
+    typed.set("");
+    if (props.open === undefined) close();
+    else submitted = session();
+    props.onConfirm();
+  };
+  const variant = () => props.variant ?? "destructive";
+  const unavailable = () => !!(props.disabled || props.busy);
+  const focusInPanel = (node: ViewRef, busy: boolean) => {
+    const active = session();
+    // The menu may still be releasing focus during the mount. Focus the
+    // new control after layout, and never if that open session has ended.
+    void node.measure().then((layout) => {
+      if (layout && active === session() && open() && !!props.busy === busy) node.focus();
+    });
+  };
+  effect(() => {
+    if (props.busy) return;
+    // If the caller leaves the panel open after work settles (e.g. retry),
+    // return busy focus to Cancel, not to the action that just ran.
+    if (busyFocus && busyFocus === untracked(session) && cancelControl) focusInPanel(cancelControl, false);
+    busyFocus = null;
+  });
+  const busyLabel = () => props.busyLabel ?? props.confirmLabel;
+  const triggerEscape = focusedEscape(() => open() ? cancel : undefined);
+  const busyEscape = focusedEscape(() => props.busy && open() ? cancel : undefined);
+  return (
+    <View class="min-w-0 flex-col">
+      <If when={props.triggerLabel}>
+        <View
+          ref={(node) => (trigger = node)}
+          class={cx("group self-start flex-row items-center justify-center rounded-(--radius-md) px-(--space-3)", controlHeightClass.default,
+            focusRing, transitionClass, actionClass[variant() === "destructive" ? "destructive" : "secondary"], actionDisabledClass)}
+          role="button"
+          focusable={!unavailable()}
+          disabled={unavailable()}
+          accessibilityState={{ expanded: open(), disabled: unavailable() }}
+          accessibilityLabel={props.accessibilityLabel ?? props.triggerLabel}
+          testID={props.testID}
+          onFocus={triggerEscape.onFocus}
+          onBlur={triggerEscape.onBlur}
+          onPress={() => {
+            if (unavailable()) return;
+            if (open()) cancel();
+            else changeOpen(true);
+          }}
+        >
+          <Text class={cx(textClass.sm, "font-medium", actionTextClass[variant() === "destructive" ? "destructive" : "secondary"], disabledTextClass)}>
+            {props.triggerLabel}
+          </Text>
+        </View>
+      </If>
+      <If when={open()}>
+        <View class={cx("min-w-0 flex-col gap-(--space-2)", props.triggerLabel && "mt-(--space-2)")} testID={id("panel")}>
+          <Banner tone="warning" variant="inline" title={props.title} message={props.message} testID={id("warning")} />
+          <If when={props.typeToConfirm !== undefined}>
+            <FormRow label={`Type “${props.typeToConfirm}” to confirm`}>
+              <Field
+                value={typed()}
+                onChange={typed.set}
+                accessibilityLabel={`Type “${props.typeToConfirm}” to confirm`}
+                testID={id("input")}
+                disabled={unavailable()}
+                inputRef={(node) => {
+                  if (!unavailable()) focusInPanel(node, false);
+                }}
+                onCancel={cancel}
+                // Return neither confirms nor takes the focus out of the field.
+                onSubmit={() => {}}
+                keepFocusOnSubmit
+                verbatim
+              />
+            </FormRow>
+          </If>
+          <ActionBar>
+            <Action label="Cancel" variant="ghost" testID={id("cancel")} onPress={cancel} onEscape={cancel} disabled={props.busy}
+              viewRef={(node) => {
+                cancelControl = node;
+                if (!props.busy && (props.typeToConfirm === undefined || props.disabled)) focusInPanel(node, false);
+              }} />
+            <If when={props.busy} else={
+              <Action label={props.confirmLabel} variant={variant() === "destructive" ? "danger" : "primary"} testID={id("confirm")}
+                onPress={confirm} onEscape={cancel} disabled={!ready()} />
+            }>
+              <View class={cx("flex-row items-center rounded-(--radius-md) bg-muted px-(--space-3)", controlHeightClass.default, focusRing)}
+                ref={(node) => focusInPanel(node, true)}
+                role="summary" focusable captureKeys={["enter", "space"]}
+                accessibilityLabel={busyLabel()} accessibilityState={{ busy: true }} testID={id("busy")}
+                 onFocus={() => { focusedWhileBusy = busyFocus = session(); busyEscape.onFocus(); }}
+                onBlur={() => { if (props.busy) busyFocus = null; busyEscape.onBlur(); }}>
+                <Text class={cx(textClass.sm, "font-medium text-muted-foreground")} accessibilityElementsHidden>{busyLabel()}</Text>
+              </View>
+            </If>
+          </ActionBar>
+        </View>
       </If>
     </View>
   );
@@ -945,7 +1217,7 @@ export function PageLayout(props: StackProps & { footer?: JSX.Element; wide?: bo
   return (
     <View class="flex-1 min-h-0 flex-col">
       <Scroll class="flex-1 min-h-0" testID={props.testID}>
-        <View class={cx(stackClass({ ...props, grow: false }, "col"), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>
+        <View class={cx(stackClass(props, "col", false), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>
       </Scroll>
       <If when={props.footer}>
         <View class="border-t border-border bg-background px-(--space-8) max-md:px-(--space-4) py-(--space-3)" testID={props.testID ? `${props.testID}:footer` : undefined}>
@@ -1080,6 +1352,36 @@ export function Toggle(
   );
 }
 
+/** A selectable option in a form, with one target for the box, label and optional hint. */
+export function Checkbox(props: Testable & {
+  label: string;
+  hint?: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  const label = () => props.accessibilityLabel ?? props.label;
+  return (
+    <BaseCheckbox
+      class={cx("self-start max-w-full flex-row items-start gap-(--space-2) rounded-(--radius-sm) py-(--space-1)", controlHeightClass.compact, focusRing, disabledClass)}
+      indicatorClass={cx("size-[18px] shrink-0 items-center justify-center rounded-[4px] border bg-background checked:bg-primary checked:border-primary", controlEdgeClass)}
+      indicator={<If when={props.checked}><Icon name="check" color="on-primary" size={14} /></If>}
+      checked={props.checked}
+      disabled={props.disabled}
+      onChange={({ checked }) => props.onChange(checked)}
+      testID={props.testID}
+      accessibilityLabel={props.hint ? `${label()}. ${props.hint}` : label()}
+    >
+      <View class="shrink min-w-0 flex-col" accessibilityElementsHidden>
+        <Text class={cx(textClass.sm, "font-medium text-foreground")}>{props.label}</Text>
+        <If when={props.hint}>
+          <Text class={cx(textClass.xs, "text-muted-foreground")}>{props.hint}</Text>
+        </If>
+      </View>
+    </BaseCheckbox>
+  );
+}
+
 export type PickerItem = {
   value: string;
   label: string;
@@ -1168,8 +1470,33 @@ export function Picker(
   );
 }
 
+export type PageScope =
+  | { kind: "account"; host: string }
+  | { kind: "computer" }
+  | { kind: "space"; personal?: boolean }
+  | { kind: "organization" };
+
+/** Whose settings these are, in fixed wording shared across pages. */
+export function ScopeLine(props: Testable & { scope: PageScope }) {
+  const text = () => {
+    switch (props.scope.kind) {
+      case "account": return `Your account on ${props.scope.host}`;
+      case "computer": return "This computer only";
+      case "space": return props.scope.personal ? "This Space · only you see these" : "This Space · only the owner changes it";
+      case "organization": return "Organization · org admins manage it";
+    }
+  };
+  const icons = { account: "person", computer: "device", space: "hash", organization: "server" } as const;
+  return (
+    <View class="min-w-0 flex-row items-start gap-(--space-1)" testID={props.testID}>
+      <View class="shrink-0 pt-[2px]"><Icon name={icons[props.scope.kind]} color="muted" size={12} /></View>
+      <Label variant="caption" color="muted" accessibilityLabel={props.accessibilityLabel}>{text()}</Label>
+    </View>
+  );
+}
+
 /** The title block at the top of a page (Settings, a Space's management). */
-export function PageHeader(props: Testable & { title: string; subtitle?: string; children?: JSX.Element }) {
+export function PageHeader(props: Testable & { title: string; subtitle?: string; scope?: PageScope; children?: JSX.Element }) {
   return (
     <View class="flex-row items-start gap-(--space-4) pb-(--space-2)" testID={props.testID}>
       <View class="flex-1 min-w-0 flex-col gap-(--space-1)">
@@ -1179,6 +1506,9 @@ export function PageHeader(props: Testable & { title: string; subtitle?: string;
         <If when={props.subtitle}>
           <Text class={cx(textClass.sm, "text-muted-foreground")}>{props.subtitle}</Text>
         </If>
+        <If when={props.scope}>
+          {(scope) => <ScopeLine scope={scope()} testID={props.testID ? `${props.testID}:scope` : undefined} />}
+        </If>
       </View>
       {props.children}
     </View>
@@ -1187,15 +1517,29 @@ export function PageHeader(props: Testable & { title: string; subtitle?: string;
 
 /**
  * A titled group of SettingRows on one card. The rows draw the lines between
- * them; the card clips the first one's.
+ * them; the card clips the first one's. `focusTitle` is for navigation to a group.
  */
-export function SettingsGroup(props: Testable & { title?: string; description?: string; children?: JSX.Element }) {
+export function SettingsGroup(props: Testable & { title?: string; description?: string; focusTitle?: boolean; children?: JSX.Element }) {
+  const titleRef = signal<ViewRef | undefined>(undefined);
+  effect(() => {
+    if (!props.focusTitle) return;
+    const node = titleRef();
+    if (!node) return;
+    let live = true;
+    void node.measure().then((layout) => {
+      if (!live || !layout || layout.bounds.size.height <= 0) return;
+      node.reveal({ vertical: "start", animated: false });
+      node.focus();
+    });
+    return () => { live = false; };
+  });
   return (
     <View class="flex-col gap-(--space-2)" testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
       <If when={props.title || props.description}>
         <View class="flex-col gap-px px-(--space-1)">
           <If when={props.title}>
-            <Text class={cx(textClass.sm, "font-semibold text-foreground")} role="header">
+            <Text class={cx(textClass.sm, "font-semibold text-foreground")} role="header"
+              ref={props.focusTitle ? titleRef.set : undefined} focusable={props.focusTitle}>
               {props.title}
             </Text>
           </If>

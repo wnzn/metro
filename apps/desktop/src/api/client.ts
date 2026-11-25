@@ -5,9 +5,18 @@
 import { discoveryApi } from "./discovery";
 import { libraryApi } from "./library";
 import { monitoringApi } from "./monitoring";
+import { pagesApi } from "./pages";
+import type { PageDraftEvent } from "./pages";
 import { profileApi } from "./profile";
+import { serverUpdateApi } from "./serverUpdate";
 import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
+import { parseWebTool, webSearchPrefsApi } from "./webSearch";
+import type { WebToolNote } from "./webSearch";
+import type { MentionSend, WireMentionSpan } from "../features/mentions/draft";
+import { readMentionSpans } from "../features/mentions/sent";
+import { canonicalAddressing, canonicalEventTime, canonicalStableId, readPostedNotes } from "../features/senderNotices/response";
+import type { PostedSenderNotes } from "../features/senderNotices/response";
 
 /** `parentRoomId`: set on a thread an agent delegated from that room. */
 export type Room = { id: string; name: string; parentRoomId?: string };
@@ -15,13 +24,19 @@ export type Room = { id: string; name: string; parentRoomId?: string };
  * Who a message addresses: the Space's agent, or a member by their stable
  * user id. An agent mention with `agentId` names one of the Space's agents
  * (`@handle`); without it, it is the generic `@agent` (the Space's default
- * agent, or the sender's classifier pick). `handle` is only the draft's text
- * for it (`@coder`), never sent. On received events only, an agent mention may say it wasn't typed:
+ * agent, or the sender's classifier pick). An agent mention may say it wasn't typed:
  * `classifier` (the sender's opt-in System One judgement started the agent
  * from an unaddressed message) or `schedule` (the creator's scheduled
  * prompt). The server sets it; the app never sends it.
  */
-export type Mention = { kind: "agent"; agentId?: string; handle?: string; addressedBy?: "classifier" | "schedule" } | { kind: "user"; id: string };
+export type Mention = {
+  kind: "agent";
+  agentId?: string;
+  addressedBy?: "classifier" | "schedule";
+  /** If an old event stored its own spelling; never filled from the live roster. */
+  legacyHandle?: string;
+} | { kind: "user"; id: string };
+export type SpaceMessageBody = Extract<MentionSend, { ok: true }>["body"];
 /** For messages: who it was addressed to ("room" = nobody in particular). */
 export type Audience = "room" | "agent" | "users" | "mixed";
 /** Where a turn's activity comes from: an agent run, or the deterministic Demo (no model). */
@@ -43,6 +58,10 @@ export type EventActivity = {
   agent?: EventAgent;
   /** Only on a Space turn's `started` marker: how its agent was chosen ("Picked by classifier: Coder"). */
   pick?: string;
+  /** The small room-visible proposal card, not the draft itself. */
+  page_draft?: PageDraftEvent;
+  /** Public, bounded web tool metadata. Never includes credentials or raw vendor errors. */
+  tool?: WebToolNote;
 };
 /** A Space agent as a run's events show it: enough for its name and avatar. */
 export type EventAgent = { id: string; handle: string; name: string; avatar_version?: string; color: string };
@@ -71,6 +90,8 @@ export type RoomEvent = {
   actor: string;
   text: string;
   mentions?: Mention[];
+  /** Bytes in the stored text; [] forbids fallback, undefined is legacy. */
+  spans?: WireMentionSpan[];
   audience?: Audience;
   activity?: EventActivity;
   /** A person's stable id; absent for the agent, runner and system. */
@@ -92,27 +113,41 @@ export type EventAttachment = AttachedFile | { removed: true };
 /** Most files one message may carry (the server's limit too). */
 export const MAX_MESSAGE_ATTACHMENTS = 10;
 export type SpaceRole = "owner" | "member";
-/** `runnerPaired`: a runner token is issued for the space. It says nothing about the runner being online. */
-export type Space = { id: string; name: string; role: SpaceRole; runnerPaired: boolean };
+/** `runnerPaired` says nothing about liveness; null is local, awaiting exact post-write proof. */
+export type Space = { id: string; name: string; role: SpaceRole; runnerPaired: boolean | null };
 export type Member = { userId: string; role: SpaceRole };
 /** An agent run in a Space the user belongs to (GET /v1/runs, newest first). */
 export type Run = { id: string; spaceId: string; roomId: string; status: string; actor: string; task: string };
 
 /** Who is signed in. `isOrgAdmin`: may create and manage organization runners. */
-export type Me = { id: string; isOrgAdmin: boolean };
+export type Me = { id: string; canonicalId: string | null; isOrgAdmin: boolean };
 
 /** A registered runner the user can see (GET /v1/runners). */
 export type RunnerVisibility = "personal" | "organization";
-export type RegisteredRunner = { id: string; name: string; visibility: RunnerVisibility; canManage: boolean };
+export type RunnerPresence = {
+  seenAt: number | null; online: boolean; version: string | null;
+  install: "managed" | "unmanaged" | "container" | "desktop" | null; selfUpdate: boolean;
+};
+export type RunnerPending = { target: string; requestedAt: number };
+export type RunnerUpdate = {
+  latest: string | null; available: boolean; action: "none" | "self_update" | "container" | "with_app" | "install_script";
+  containerImage: string | null; pending: RunnerPending | null;
+  lastResult: { target: string; state: "updated" | "failed"; code: string | null; at: number } | null;
+};
+export type RegisteredRunner = {
+  id: string; name: string; visibility: RunnerVisibility; canManage: boolean;
+  presence?: RunnerPresence; update?: RunnerUpdate;
+};
 
 /**
  * Who serves a Space (GET /v1/spaces/{sid}/runner): a registered runner, the
  * Space's own dedicated (legacy) token, or nobody. Attached says nothing
  * about the runner being online.
  */
-export type SpaceRunner =
+export type SpaceRunner = (
   | { kind: "registered"; id: string; name: string; visibility: RunnerVisibility }
-  | { kind: "dedicated"; name: string };
+  | { kind: "dedicated"; name: string }
+) & { assignmentRevision?: string };
 
 /** Where a provider's inference runs: in the user's own metro-connector, or from the server. */
 export type ProviderExecution = "device" | "server";
@@ -158,6 +193,7 @@ export type ProviderConnection = {
   name: string;
   providerId: string;
   baseUrl: string | null;
+  endpointRevision?: string;
   model: string | null;
   isDefault: boolean;
   hasKey: boolean;
@@ -290,7 +326,7 @@ export type ModelRouting = {
 };
 
 /** The transport other API modules (src/api/discovery.ts) build on. */
-export type RequestFn = (method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) => Promise<unknown>;
+export type RequestFn = (method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown, signal?: AbortSignal, deadlineMs?: number) => Promise<unknown>;
 
 /** A device connection's metro-connector (GET /v1/providers/{id}/device-token). */
 export type DeviceStatus = { paired: boolean; online: boolean; lastSeenSecs: number | null };
@@ -321,7 +357,7 @@ export type ApiErrorKind =
 export class ApiError extends Error {
   readonly kind: ApiErrorKind;
   readonly status: number | null;
-  constructor(kind: ApiErrorKind, message: string, status: number | null = null) {
+  constructor(kind: ApiErrorKind, message: string, status: number | null = null, readonly details?: unknown) {
     super(message);
     this.name = "ApiError";
     this.kind = kind;
@@ -334,6 +370,25 @@ export class ApiError extends Error {
       this.kind === "timeout" ||
       (this.kind === "http" && this.status !== null && (this.status >= 500 || this.status === 429))
     );
+  }
+}
+
+const ENDPOINT_REFUSAL_STATUSES = {
+  endpoint_not_approved: [400],
+  endpoint_probe_busy: [503],
+  endpoint_probe_failed: [502, 504],
+  endpoint_conflict: [409],
+  endpoint_missing: [404],
+  endpoint_rejected: [400, 403, 404, 409, 422, 500, 503],
+} as const;
+export const revisionToken = (value: unknown): string | null =>
+  typeof value === "string" && /^(0|[1-9][0-9]{0,18})$/.test(value) ? value : null;
+type EndpointRefusal = keyof typeof ENDPOINT_REFUSAL_STATUSES;
+
+/** A Metro endpoint PATCH response that expressly refuses the write. */
+export class EndpointPatchError extends ApiError {
+  constructor(status: number, readonly code: EndpointRefusal, readonly reason: string) {
+    super(status === 404 ? "not_found" : "http", `Endpoint change refused (HTTP ${status}): ${reason}`, status);
   }
 }
 
@@ -351,50 +406,57 @@ export type Client = ReturnType<typeof createClient>;
 export function createClient(options: ClientOptions) {
   const timeoutMs = options.timeoutMs ?? 10_000;
 
-  async function request(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown): Promise<unknown> {
+  const request: RequestFn = async (method, path, body, signal, deadlineMs = timeoutMs) => {
     const url = options.baseUrl + path;
     const timeout = new AbortController();
-    const timer = setTimeout(() => timeout.abort(), timeoutMs);
+    const timer = setTimeout(() => timeout.abort(), deadlineMs);
     const onOuterAbort = () => timeout.abort();
     options.signal?.addEventListener("abort", onOuterAbort);
+    signal?.addEventListener("abort", onOuterAbort);
+    const cancelled = () => options.signal?.aborted || signal?.aborted;
+    const checkCancelled = () => { if (cancelled()) throw new ApiError("aborted", "Cancelled"); };
     const headers: Record<string, string> = {
       Accept: "application/json",
       Authorization: `Bearer ${options.token()}`,
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
 
-    let response: Response;
     try {
-      if (options.signal?.aborted) throw new ApiError("aborted", "Cancelled");
-      response = await fetch(url, {
+      checkCancelled();
+      const response = await fetch(url, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: timeout.signal,
         redirect: "error", // never forward the bearer token to another location
       });
+      checkCancelled();
+      const errorDetails = path.startsWith("/v1/pages") ? "pages"
+        : method === "PATCH" && /^\/v1\/providers\/[^/]+$/.test(path) && isObject(body) && "base_url" in body ? "endpoint"
+        : /^\/v1\/library\/(?:settings|index|search)\/selection$/.test(path) ? "library" : undefined;
+      await checkStatus(response, method, path, errorDetails);
+      const text = await response.text();
+      checkCancelled();
+      if (!text.trim()) return null;
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new ApiError("protocol", `${method} ${path} answered with something that is not JSON.`, response.status);
+      }
     } catch (error) {
+      checkCancelled();
       if (error instanceof ApiError) throw error;
-      if (options.signal?.aborted) throw new ApiError("aborted", "Cancelled");
       if (timeout.signal.aborted) {
-        throw new ApiError("timeout", `${options.baseUrl} did not answer ${method} ${path} within ${Math.round(timeoutMs / 1000)}s.`);
+        throw new ApiError("timeout", `${options.baseUrl} did not answer ${method} ${path} within ${Math.round(deadlineMs / 1000)}s.`);
       }
       const detail = String((error as Error)?.message ?? error).replace(/^Network request failed:\s*/i, "");
       throw new ApiError("network", `Cannot reach ${options.baseUrl} (${detail}). Is the server running?`);
     } finally {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onOuterAbort);
+      signal?.removeEventListener("abort", onOuterAbort);
     }
-
-    await checkStatus(response, method, path);
-    const text = await response.text();
-    if (!text.trim()) return null;
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new ApiError("protocol", `${method} ${path} answered with something that is not JSON.`, response.status);
-    }
-  }
+  };
 
   /**
    * Raw bytes both ways (library uploads and file content): the same
@@ -469,18 +531,42 @@ export function createClient(options: ClientOptions) {
     };
   }
 
+  async function listRunnerInventory() {
+    const data = await request("GET", "/v1/runners");
+    if (!isObject(data) || !Array.isArray(data.runners)) {
+      throw new ApiError("protocol", "GET /v1/runners did not return { runners: [...] }.");
+    }
+    return { runners: data.runners.filter(isRegisteredRunner).map(toRegisteredRunner), attachIfEmpty: data.attach_if_empty === true };
+  }
+
+  const isAssignmentRevision = (value: unknown): value is string =>
+    typeof value === "string" && /^(0|[1-9][0-9]{0,18})$/.test(value);
+
+  async function getSpaceRunnerAssignment(spaceId: string) {
+    const data = await request("GET", `${sp(spaceId)}/runner`);
+    if (!isObject(data) || !("runner" in data)) throw new ApiError("protocol", "GET …/runner did not return { runner }.");
+    const runner = toSpaceRunner(data.runner);
+    return {
+      runner: runner && isAssignmentRevision(data.assignment_revision) ? { ...runner, assignmentRevision: data.assignment_revision } : runner,
+      guardedTokenChanges: data.guarded_token_changes === true,
+    };
+  }
+
   return {
     baseUrl: options.baseUrl,
     // Search and scheduled prompts (src/api/discovery.ts), on the same transport.
     ...discoveryApi(request),
     // Documents & media (src/api/library.ts): JSON on `request`, bytes on `binary`.
     ...libraryApi(request, binary),
+    ...pagesApi(request),
     // Profiles (src/api/profile.ts): JSON on `request`, pictures on `binary`.
     ...profileApi(request, binary),
     // A Space's settings, agents and the person's own preferences there (src/api/spaces.ts).
     ...spacesApi(request, binary),
     // Monitoring events (src/api/monitoring.ts): one Space, My Chat or the instance; never an aggregate.
     ...monitoringApi(request),
+    ...webSearchPrefsApi(request),
+    ...serverUpdateApi(request),
 
     async me(): Promise<Me> {
       const data = await request("GET", "/v1/me");
@@ -488,17 +574,13 @@ export function createClient(options: ClientOptions) {
         throw new ApiError("protocol", "GET /v1/me did not return { id }.");
       }
       // An older server has no organization: nobody is its admin.
-      return { id: String(data.id), isOrgAdmin: data.is_org_admin === true };
+      return { id: String(data.id), canonicalId: canonicalStableId(data.id) ? data.id : null, isOrgAdmin: data.is_org_admin === true };
     },
 
     // ---- registered runners (personal or organization), reusable across Spaces
 
-    async listRunners(): Promise<RegisteredRunner[]> {
-      const data = await request("GET", "/v1/runners");
-      const runners = isObject(data) ? data.runners : undefined;
-      if (!Array.isArray(runners)) throw new ApiError("protocol", "GET /v1/runners did not return { runners: [...] }.");
-      return runners.filter(isRegisteredRunner).map(toRegisteredRunner);
-    },
+    listRunnerInventory,
+    async listRunners(): Promise<RegisteredRunner[]> { return (await listRunnerInventory()).runners; },
 
     /** Registers a runner. The token is shown once; the caller must not keep it longer than it is shown. */
     async createRunner(name: string, visibility: RunnerVisibility): Promise<{ runner: RegisteredRunner; token: string }> {
@@ -520,20 +602,35 @@ export function createClient(options: ClientOptions) {
       await request("DELETE", `/v1/runners/${encodeURIComponent(runnerId)}`);
     },
 
-    async getSpaceRunner(spaceId: string): Promise<SpaceRunner | null> {
-      const data = await request("GET", `${sp(spaceId)}/runner`);
-      if (!isObject(data) || !("runner" in data)) throw new ApiError("protocol", "GET …/runner did not return { runner }.");
-      return toSpaceRunner(data.runner);
-    },
+    getSpaceRunnerAssignment,
+    async getSpaceRunner(spaceId: string): Promise<SpaceRunner | null> { return (await getSpaceRunnerAssignment(spaceId)).runner; },
 
     async attachRunner(spaceId: string, runnerId: string): Promise<SpaceRunner | null> {
       const data = await request("PUT", `${sp(spaceId)}/runner`, { runner_id: runnerId });
       return isObject(data) && "runner" in data ? toSpaceRunner(data.runner) : null;
     },
 
-    /** Detaches the Space's registered runner (or revokes its dedicated token). */
-    async detachRunner(spaceId: string): Promise<void> {
-      await request("DELETE", `${sp(spaceId)}/runner`);
+    /** No fallback to PUT: on an older server this must fail without changing anything. */
+    async attachRunnerIfEmpty(spaceId: string, runnerId: string) {
+      const data = await request("POST", `${sp(spaceId)}/runner/attach-if-empty`, { runner_id: runnerId });
+      const attached = isObject(data) && "runner" in data ? toSpaceRunner(data.runner) : null;
+      if (attached?.kind !== "registered" || attached.id !== runnerId ||
+          !isObject(data) || !isAssignmentRevision(data.assignment_revision)) {
+        throw new ApiError("protocol", "The server did not confirm the exact runner assignment.");
+      }
+      return { ...attached, assignmentRevision: data.assignment_revision };
+    },
+
+    async requestRunnerUpdate(runnerId: string, version: string): Promise<RunnerPending> {
+      const data = await request("POST", `/v1/runners/${encodeURIComponent(runnerId)}/update`, { version });
+      const pending = isObject(data) ? toRunnerPending(data.pending) : null;
+      if (!pending || pending.target !== version) throw new ApiError("protocol", "The server did not confirm the update request.");
+      return pending;
+    },
+
+    /** Removes only the assignment the owner confirmed. Never falls back to DELETE. */
+    async detachRunnerIfCurrent(spaceId: string, revision: string): Promise<void> {
+      await request("POST", `${sp(spaceId)}/runner/detach-if-current`, { assignment_revision: revision });
     },
 
     // ---- personal model connections
@@ -546,11 +643,19 @@ export function createClient(options: ClientOptions) {
       return { providers: providers.filter(isCatalogProvider).map(toCatalogProvider), allowedBaseUrls: allowed };
     },
 
-    async listProviders(): Promise<ProviderConnection[]> {
+    async listProviders(confirmEndpointOf?: string): Promise<ProviderConnection[]> {
       const data = await request("GET", "/v1/providers");
       const list = isObject(data) ? data.connections : undefined;
       if (!Array.isArray(list)) throw new ApiError("protocol", "GET /v1/providers did not return { connections: [...] }.");
-      return list.filter(isConnection).map(toConnection);
+      const connections = list.filter(isConnection);
+      if (confirmEndpointOf !== undefined) {
+        const matches = connections.filter((row) => String(row.id) === confirmEndpointOf);
+        const url = matches[0]?.base_url; // absent or null is valid for a provider's built-in URL
+        if (list.length !== connections.length || matches.length > 1 || (url != null && (typeof url !== "string" || !url))) {
+          throw new ApiError("protocol", "GET /v1/providers did not confirm the connection's endpoint.");
+        }
+      }
+      return connections.map(toConnection);
     },
 
     async createProvider(body: NewProviderConnection): Promise<ProviderConnection> {
@@ -581,8 +686,8 @@ export function createClient(options: ClientOptions) {
     },
 
     /** Lists the provider's models again and merges them into the connection's list. */
-    async refreshConnectionModels(id: string): Promise<ModelRefresh> {
-      const data = await request("POST", `/v1/providers/${encodeURIComponent(id)}/model-list/refresh`, {});
+    async refreshConnectionModels(id: string, afterEndpointChange = false): Promise<ModelRefresh> {
+      const data = await request("POST", `/v1/providers/${encodeURIComponent(id)}/model-list/refresh`, {}, undefined, afterEndpointChange ? 25_000 : undefined);
       const models = isObject(data) ? data.models : undefined;
       if (!isObject(data) || !Array.isArray(models)) throw new ApiError("protocol", "POST …/model-list/refresh did not return { models: [...] }.");
       return {
@@ -595,6 +700,17 @@ export function createClient(options: ClientOptions) {
 
     async updateProvider(id: string, patch: ProviderPatch): Promise<void> {
       await request("PATCH", `/v1/providers/${encodeURIComponent(id)}`, patch);
+    },
+
+    /** The server tests and commits in one operation (its endpoint probe can take up to 20s). */
+    async updateProviderEndpoint(id: string, baseUrl: string, revision: string): Promise<ProviderConnection> {
+      const path = `/v1/providers/${encodeURIComponent(id)}`;
+      const data = await request("PATCH", path, { base_url: baseUrl, expected_endpoint_revision: revision }, undefined, 25_000);
+      const savedRevision = isObject(data) ? revisionToken(data.endpoint_revision) : null;
+      if (!isConnection(data) || String(data.id) !== id || data.base_url !== baseUrl || !savedRevision || savedRevision === revision) {
+        throw new ApiError("protocol", "The server did not confirm the requested endpoint.");
+      }
+      return toConnection(data);
     },
 
     async deleteProvider(id: string): Promise<void> {
@@ -699,17 +815,15 @@ export function createClient(options: ClientOptions) {
       await request("DELETE", `${sp(spaceId)}/members`, { user_id: userId });
     },
 
-    /** Issues (or rotates) the space's runner token. The caller must not keep it longer than it is shown. */
-    async issueRunnerToken(spaceId: string): Promise<string> {
-      const data = await request("POST", `${sp(spaceId)}/runner-token`, {});
-      if (!isObject(data) || typeof data.token !== "string" || !data.token) {
-        throw new ApiError("protocol", "POST …/runner-token did not return { token }.");
+    /** Guarded only: issue to an empty Space or rotate the dedicated revision shown. */
+    async changeDedicatedToken(spaceId: string, change: { kind: "issue" } | { kind: "rotate"; revision: string }) {
+      const route = change.kind === "issue" ? "issue-if-empty" : "rotate-if-current";
+      const data = await request("POST", `${sp(spaceId)}/runner-token/${route}`,
+        change.kind === "issue" ? {} : { assignment_revision: change.revision });
+      if (!isObject(data) || !isToken(data.token) || !isAssignmentRevision(data.assignment_revision)) {
+        throw new ApiError("protocol", "The server did not confirm the dedicated token change.");
       }
-      return data.token;
-    },
-
-    async revokeRunnerToken(spaceId: string): Promise<void> {
-      await request("DELETE", `${sp(spaceId)}/runner-token`);
+      return { token: data.token, revision: data.assignment_revision };
     },
 
     async listRooms(spaceId: string): Promise<Room[]> {
@@ -733,25 +847,29 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    /** `agentId` (with `invokeAgent`): Ask agent asks that agent of the Space instead of the default (or the classifier's pick). */
+    /** A modern Space send. No fallback: legacy text inference could change who is notified or starts work. */
     async sendMessage(
       spaceId: string,
       roomId: string,
-      text: string,
-      invokeAgent: boolean,
-      mentions?: Mention[],
+      addressing: SpaceMessageBody,
       assetIds?: readonly string[],
       choice?: TurnModelChoice,
-      agentId?: string,
-    ): Promise<void> {
-      const body: Record<string, unknown> = { text, invoke_agent: invokeAgent, ...turnModelBody(choice) };
-      if (invokeAgent && agentId) body.agent_id = agentId;
-      // Only what a person can type: never `addressed_by`, which only the server sets.
-      if (mentions && mentions.length > 0)
-        body.mentions = mentions.map((m) => (m.kind === "agent" ? (m.agentId ? { kind: "agent", agent_id: m.agentId } : { kind: "agent" }) : { kind: "user", id: m.id }));
+    ): Promise<PostedSenderNotes | null> {
+      const body: Record<string, unknown> = { invoke_agent: false, ...addressing, infer_text_mentions: false, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
-      await request("POST", `${room(spaceId, roomId)}/messages`, body);
+      try {
+        const data = await request("POST", `${room(spaceId, roomId)}/messages`, body);
+        return readPostedNotes(data, { ...addressing, kind: "space" });
+      } catch (error) {
+        if (error instanceof ApiError && error.status === 422) {
+          throw new ApiError("http", "Update Metro Server to send Space messages with safe addressing. Your draft was kept and was not sent.", 422);
+        }
+        if (error instanceof ApiError && (error.kind === "network" || error.kind === "timeout" || error.kind === "protocol" || (error.status ?? 0) >= 500)) {
+          throw new ApiError(error.kind, "Could not confirm whether the message was sent. Your draft was kept. Check the conversation before sending again.", error.status);
+        }
+        throw error;
+      }
     },
 
     async runDemo(spaceId: string, roomId: string): Promise<void> {
@@ -766,11 +884,27 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendChatMessage(text: string, invokeAgent: boolean, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<void> {
-      const body: Record<string, unknown> = { text, invoke_agent: invokeAgent, ...turnModelBody(choice) };
+    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<PostedSenderNotes | null> {
+      // Text sends also ask the agent on servers that require the legacy flag.
+      const body: Record<string, unknown> = { text, invoke_agent: true, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
-      await request("POST", "/v1/chat/messages", body);
+      const data = await request("POST", "/v1/chat/messages", body);
+      return readPostedNotes(data, { kind: "chat", text });
+    },
+
+    async saveChatNote(text: string, assetIds?: readonly string[]): Promise<void> {
+      const ids = assetIdsBody(assetIds);
+      try {
+        await request("POST", "/v1/chat/messages", { text, save_note: true, ...(ids ? { asset_ids: ids } : {}) });
+      } catch (error) {
+        // Older servers reject the unknown field while decoding the request.
+        // Never fall back to invoke_agent: false: a mention could still start work.
+        if (error instanceof ApiError && error.status === 422) {
+          throw new ApiError("http", "Update Metro Server to use Save note. Your draft was kept and was not sent to the agent.", 422);
+        }
+        throw error;
+      }
     },
 
     async listRuns(): Promise<Run[]> {
@@ -828,8 +962,47 @@ function isRegisteredRunner(v: unknown): v is { id: string | number; name: strin
   return isObject(v) && isId(v.id) && typeof v.name === "string" && isVisibility(v.visibility);
 }
 
-function toRegisteredRunner(v: { id: string | number; name: string; visibility: RunnerVisibility; can_manage?: unknown }): RegisteredRunner {
-  return { id: String(v.id), name: v.name, visibility: v.visibility, canManage: v.can_manage === true };
+function toRegisteredRunner(v: { id: string | number; name: string; visibility: RunnerVisibility; can_manage?: unknown; presence?: unknown; update?: unknown }): RegisteredRunner {
+  const presence = isObject(v.presence) ? v.presence : undefined;
+  const update = isObject(v.update) ? v.update : undefined;
+  const install = presence?.install;
+  const action = update?.action;
+  const last = update?.last_result;
+  const target = isObject(last) ? runnerVersion(last.target) : null;
+  const at = isObject(last) ? runnerTimestamp(last.at) : null;
+  return {
+    id: String(v.id), name: v.name, visibility: v.visibility, canManage: v.can_manage === true,
+    presence: presence && {
+      seenAt: runnerTimestamp(presence.seen_at), online: presence.online === true, version: runnerVersion(presence.version),
+      install: install === "managed" || install === "unmanaged" || install === "container" || install === "desktop" ? install : null,
+      selfUpdate: presence.self_update === true,
+    },
+    update: update && {
+      latest: runnerVersion(update.latest), available: update.available === true,
+      action: action === "self_update" || action === "container" || action === "with_app" || action === "install_script" ? action : "none",
+      containerImage: typeof update.container_image === "string" && update.container_image.length <= 160 ? update.container_image : null,
+      pending: toRunnerPending(update.pending),
+      lastResult: target && at !== null && isObject(last) && (last.state === "updated" || last.state === "failed")
+        ? { target, at, state: last.state, code: typeof last.code === "string" && /^[a-z_]{1,40}$/.test(last.code) ? last.code : null }
+        : null,
+    },
+  };
+}
+
+function runnerVersion(v: unknown): string | null {
+  return typeof v === "string" && v === v.trim() && /^(0|[1-9]\d{0,9})(\.(0|[1-9]\d{0,9})){2}$/.test(v)
+    && v.split(".").every((part) => Number(part) <= 0xffffffff) ? v : null;
+}
+
+function runnerTimestamp(v: unknown): number | null {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : null;
+}
+
+function toRunnerPending(v: unknown): RunnerPending | null {
+  if (!isObject(v)) return null;
+  const target = runnerVersion(v.target);
+  const requestedAt = runnerTimestamp(v.requested_at);
+  return target && requestedAt !== null ? { target, requestedAt } : null;
 }
 
 /** null: nobody serves the Space. Unknown shapes are a protocol error, never "no runner". */
@@ -1035,6 +1208,7 @@ function toConnection(v: Record<string, unknown> & { id: string | number; name: 
     name: v.name,
     providerId: v.provider_id,
     baseUrl: typeof v.base_url === "string" && v.base_url ? v.base_url : null,
+    endpointRevision: revisionToken(v.endpoint_revision) ?? undefined,
     model: typeof v.model === "string" && v.model ? v.model : null,
     isDefault: v.is_default === true,
     hasKey: v.has_key === true,
@@ -1066,31 +1240,63 @@ function isRun(v: unknown): v is { id: string | number; space_id: string | numbe
   );
 }
 
+// Leave legacy rendering alone. Private receipt corroboration additionally
+// requires canonical raw identity, time, and addressing, before coercion.
+const canonicalMessageRows = new WeakSet<RoomEvent>();
+export const isCanonicalMessageRow = (event: RoomEvent) => canonicalMessageRows.has(event);
+
 function toEvent(v: RoomEvent): RoomEvent {
   const raw = v as unknown as Record<string, unknown>;
   const event: RoomEvent = { id: v.id, kind: v.kind, actor: v.actor, text: v.text };
+  const indexes = new Map<number, number>();
   if (Array.isArray(raw.mentions)) {
     const mentions: Mention[] = [];
-    for (const m of raw.mentions) {
+    for (const [index, m] of raw.mentions.entries()) {
+      let mention: Mention | undefined;
       if (isObject(m) && m.kind === "agent") {
-        const mention: Mention = { kind: "agent" };
-        if (typeof m.agent_id === "string" && m.agent_id.trim()) mention.agentId = m.agent_id.trim();
+        if (m.agent_id != null && (typeof m.agent_id !== "string" || !m.agent_id.trim())) continue;
+        mention = { kind: "agent" };
+        if (typeof m.agent_id === "string") mention.agentId = m.agent_id;
+        if (mention.agentId && typeof m.handle === "string" && /^[a-z0-9_-]{1,32}$/i.test(m.handle)) {
+          mention.legacyHandle = m.handle;
+        }
         if (m.addressed_by === "classifier" || m.addressed_by === "schedule") mention.addressedBy = m.addressed_by;
+      } else if (isObject(m) && m.kind === "user" && isId(m.id)) mention = { kind: "user", id: String(m.id) };
+      if (mention) {
+        if (mention.kind !== "agent" || !mention.addressedBy) indexes.set(index, mentions.length);
         mentions.push(mention);
       }
-      else if (isObject(m) && m.kind === "user" && isId(m.id)) mentions.push({ kind: "user", id: String(m.id) });
     }
     if (mentions.length) event.mentions = mentions;
   }
+  if ("spans" in raw) event.spans = readMentionSpans(raw.spans, event.text, indexes);
   if (raw.audience === "room" || raw.audience === "agent" || raw.audience === "users" || raw.audience === "mixed") event.audience = raw.audience;
   const activity = toActivity(raw.activity);
-  if (activity) event.activity = activity;
+  if (activity) {
+    if (event.kind === "page_draft" && event.actor === "agent" && activity.source === "agent" && isObject(raw.activity)) {
+      const draft = toPageDraftCard(raw.activity.page_draft);
+      if (draft) activity.page_draft = draft;
+    }
+    event.activity = activity;
+  }
   if (isId(raw.actor_id) && String(raw.actor_id).trim()) event.actorId = String(raw.actor_id);
   const createdAt = toCreatedAt(raw.created_at);
   if (createdAt) event.createdAt = createdAt;
+  if (event.kind === "message" && canonicalStableId(raw.actor_id) && canonicalEventTime(raw.created_at) &&
+    canonicalAddressing(raw.audience, raw.mentions)) canonicalMessageRows.add(event);
   const attachments = toAttachments(raw.attachments);
   if (attachments.length) event.attachments = attachments;
   return event;
+}
+
+function toPageDraftCard(v: unknown): PageDraftEvent | undefined {
+  if (!isObject(v) || typeof v.draft_id !== "string" || !/^pgd_[A-Za-z0-9_-]{1,96}$/.test(v.draft_id)
+    || typeof v.author_id !== "string" || !v.author_id || typeof v.title !== "string" || typeof v.summary !== "string"
+    || (v.kind !== "new" && v.kind !== "edit")) return undefined;
+  const expires_at = toCreatedAt(v.expires_at);
+  const page_id = typeof v.page_id === "string" && /^pg_[A-Za-z0-9_-]{1,96}$/.test(v.page_id) ? v.page_id : null;
+  if (!expires_at || (v.kind === "edit" && !page_id) || (v.kind === "new" && v.page_id !== null)) return undefined;
+  return { draft_id: v.draft_id, title: v.title.slice(0, 120), summary: v.summary.slice(0, 240), kind: v.kind, page_id, author_id: v.author_id, expires_at };
 }
 
 /** `asset_ids` for a message body: distinct, at most MAX_MESSAGE_ATTACHMENTS; undefined when there are none. */
@@ -1165,6 +1371,8 @@ export function toActivity(v: unknown): EventActivity | undefined {
   if (agent) activity.agent = agent;
   const pick = shortText(v.pick, 200);
   if (pick) activity.pick = pick;
+  const tool = parseWebTool(v.tool);
+  if (tool && v.source === "agent") activity.tool = tool;
   return activity;
 }
 
@@ -1209,16 +1417,60 @@ function isEvent(v: unknown): v is RoomEvent {
   );
 }
 
-/** Maps a non-2xx response to its ApiError (the body read only for a short server message). */
-async function checkStatus(response: Response, method: string, path: string): Promise<void> {
+/** Only a recognised Metro JSON error, with its expected status, can settle a refused PATCH. */
+function endpointRefusal(data: unknown, status: number): EndpointPatchError | null {
+  if (!isObject(data) || typeof data.error !== "string" || !data.error.trim()) return null;
+  const reason = data.error.slice(0, 200);
+  if (Object.prototype.hasOwnProperty.call(data, "code")) {
+    if (typeof data.code !== "string" || !Object.prototype.hasOwnProperty.call(ENDPOINT_REFUSAL_STATUSES, data.code)) return null;
+    const code = data.code as EndpointRefusal;
+    const statuses: readonly number[] = ENDPOINT_REFUSAL_STATUSES[code];
+    return statuses.includes(status) ? new EndpointPatchError(status, code, reason) : null;
+  }
+  // Older Metro servers used these two specific reasons in the same JSON
+  // envelope. A generic gateway response or any plain text isn't evidence.
+  if (status === 400 && reason === "base_url must be exactly one of this server's allowed_base_urls") {
+    return new EndpointPatchError(status, "endpoint_not_approved", reason);
+  }
+  const legacyProbe = /^the new endpoint failed its (?:model listing test(?:: .+)?|(?:chat completion(?: \(response too large\))?|System One (?:Noul|request setup)|embeddings(?: request setup)?) test(?: \(timed out\))?)$/;
+  if ((status === 502 || status === 504) && legacyProbe.test(reason)) {
+    return new EndpointPatchError(status, "endpoint_probe_failed", reason);
+  }
+  return null;
+}
+
+/** Maps a non-2xx response to its ApiError. */
+async function checkStatus(response: Response, method: string, path: string, errorDetails?: "pages" | "endpoint" | "library"): Promise<void> {
   if (response.status === 401) {
     throw new ApiError("auth", "The server rejected the access token (HTTP 401). Check the token and connect again.", 401);
+  }
+  if (errorDetails === "endpoint" && !response.ok) {
+    const data: unknown = await response.json().catch(() => undefined);
+    throw endpointRefusal(data, response.status) ??
+      new ApiError("http", `${method} ${path} failed with HTTP ${response.status}`, response.status);
+  }
+  if (errorDetails === "library" && !response.ok) {
+    const data: unknown = await response.json().catch(() => undefined);
+    const reason = isObject(data) && typeof data.error === "string" ? data.error.trim().slice(0, 200) : "";
+    const status = response.status;
+    const code = reason && isObject(data) ? data.code : null;
+    const verified = (code === "library_selection_changed" && status === 409)
+      || (code === "library_selection_refused" && method === "PUT" && [400, 404, 409, 422].includes(status));
+    throw new ApiError(status === 404 ? "not_found" : "http",
+      `${method} ${path} failed with HTTP ${status}${reason ? `: ${reason}` : ""}`, status, verified ? { code } : undefined);
   }
   if (response.status === 403) {
     const detail = await safeSnippet(response);
     throw new ApiError("forbidden", `You don't have access to that (HTTP 403)${detail ? `: ${detail}` : ""}.`, 403);
   }
   if (!response.ok) {
+    // Pages needs structured error bodies (diagnostics, conflicts and
+    // action challenges). Do not turn any of those fields into error text.
+    if (errorDetails === "pages" && [409, 422, 428].includes(response.status)) {
+      const details: unknown = await response.json().catch(() => undefined);
+      const error = isObject(details) && typeof details.error === "string" ? details.error.slice(0, 200) : "";
+      throw new ApiError("http", error || `${method} ${path} failed with HTTP ${response.status}`, response.status, details);
+    }
     const detail = await safeSnippet(response);
     throw new ApiError(
       response.status === 404 ? "not_found" : "http",

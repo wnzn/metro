@@ -1,26 +1,10 @@
 //! Personal model routing: which of a person's usable chat connections
-//! answers a turn, and (separately) whether an unaddressed message of theirs
-//! is asking the agent at all.
+//! answers a turn. Use-case routing is a personal opt-in, persisted per
+//! user (`GET|PUT /v1/model-routing`), and off by default.
 //!
-//! Both are personal opt-ins, persisted per user (`GET|PUT /v1/model-routing`),
-//! and both are off by default, which keeps the old behaviour exactly:
-//! only `@agent` or Ask agent starts agent work, and the person's default
-//! chat connection answers.
-//!
-//! A message falls into exactly one case, decided by its explicit
-//! recipients ([`Addressing`]):
-//!
-//! - **People only** (`@bob`): never starts agent work and is never sent to
-//!   System One.
-//! - **To the agent** (`@agent`, Ask agent, mixed `@bob @agent`): starts
-//!   agent work with no "was this for the agent?" question.
-//! - **Unaddressed**: ordinary conversation, unless the *sender* turned on
-//!   `infer_addressing`. Then that one new message (never room history) is
-//!   sent to the sender's System One connection with a Noul; only an answer
-//!   at or above `min_directedness` starts the agent, as the sender. No
-//!   answer, an uncertain one, a malformed one or an error starts nothing.
-//!   The stored message is marked `addressed_by: "classifier"`, which no
-//!   client can send.
+//! A send in personal Chat is direct. Space addressing is handled separately
+//! by [`crate::agent_dispatch`], which uses this module for agent Choice
+//! questions. Space addressing never applies to personal Chat.
 //!
 //! **Use-case routing** (`enabled`) runs on any turn that starts agent work
 //! for the person, unless they picked a model explicitly for that turn. It
@@ -36,9 +20,8 @@
 //! nothing falls back to another model.
 //!
 //! Every System One request carries exactly one question, because some
-//! endpoints accept no more. A message therefore costs at most two calls:
-//! the addressing Noul first (unaddressed and opted in only), then the
-//! Choice, only after a clear yes or on an explicit agent turn.
+//! endpoints accept no more. A personal Chat send asks at most one Choice,
+//! for use-case routing. A Space can ask an agent Choice before model routing.
 //!
 //! The route that was actually used is recorded on the turn's `started`
 //! activity marker ([`RouteNote`]): where the model came from, the case, the
@@ -83,7 +66,6 @@ const DECISION_TIMEOUT: Duration = Duration::from_secs(10);
 /// System One calls in flight at once, across the server.
 const MAX_DECISIONS: usize = 8;
 
-const Q_DIRECTED: &str = "directed";
 const Q_USE_CASE: &str = "use_case";
 const Q_AGENT: &str = "agent";
 /// The agent Choice's reserved "nobody" option. Agent options are keyed
@@ -100,7 +82,8 @@ pub struct RoutingSettings {
     /// Use-case routing on turns that start agent work for this person.
     #[serde(default)]
     pub enabled: bool,
-    /// Let System One judge this person's own unaddressed messages.
+    /// Legacy field kept for wire/storage compatibility and the one-time
+    /// Space preferences migration. Not used for dispatch or validation.
     #[serde(default)]
     pub infer_addressing: bool,
     /// The person's System One connection, used for both decisions.
@@ -113,6 +96,7 @@ pub struct RoutingSettings {
     /// the person's default chat connection.
     #[serde(default)]
     pub default_chat_id: Option<String>,
+    /// Confidence floor for unaddressed messages in opted-in Spaces.
     #[serde(default = "default_min_directedness")]
     pub min_directedness: f64,
     #[serde(default = "default_min_route_probability")]
@@ -158,10 +142,6 @@ pub struct RouteCase {
 impl RoutingSettings {
     fn wants_case_routing(&self) -> bool {
         self.enabled && !self.cases.is_empty() && self.classifier_id.is_some()
-    }
-
-    fn wants_inference(&self) -> bool {
-        self.infer_addressing && self.classifier_id.is_some()
     }
 
     /// Shape checks that need no database.
@@ -211,13 +191,9 @@ impl RoutingSettings {
                 ));
             }
         }
-        if (self.enabled && !self.cases.is_empty() || self.infer_addressing)
-            && self.classifier_id.is_none()
-        {
+        if self.enabled && !self.cases.is_empty() && self.classifier_id.is_none() {
             return Err(
-                "classifier_id must name a System One connection for use-case routing or \
-                 addressing inference"
-                    .to_owned(),
+                "classifier_id must name a System One connection for use-case routing".to_owned(),
             );
         }
         Ok(())
@@ -426,7 +402,7 @@ impl RoutingBackend for ProviderBackend {
         Box::pin(async move {
             crate::providers::decide(state, user, space, id, state_payload, questions)
                 .await
-                .map_err(|e| anyhow::anyhow!("{e}"))
+                .map_err(anyhow::Error::new)
         })
     }
 
@@ -621,6 +597,10 @@ pub struct Route {
     /// the turn fails with this text before any model is called. Never a
     /// silent switch to another model.
     pub blocked: Option<String>,
+    /// Why the turn can't run, in full, for the sender's own POST response
+    /// only: in a Space room, `blocked` reads the same for a lost grant as
+    /// for an upstream failure.
+    pub sender_note: Option<AddressingNote>,
 }
 
 impl Route {
@@ -630,6 +610,7 @@ impl Route {
             connection_id: None,
             turn_selection: None,
             blocked: None,
+            sender_note: None,
             note: RouteNote {
                 source: RouteSource::Default,
                 addressed_by,
@@ -650,6 +631,7 @@ impl Route {
             connection_id: Some(connection_id.to_owned()),
             turn_selection: None,
             blocked: None,
+            sender_note: None,
             note: RouteNote {
                 source: RouteSource::Override,
                 addressed_by,
@@ -676,11 +658,32 @@ impl Route {
             connection_id: parent.connection_id.clone(),
             turn_selection: parent.turn_selection.clone(),
             blocked: None,
+            sender_note: None,
             note,
         }
     }
 
-    /// Why a turn on this route could not get its model.
+    /// Why a turn on this route could not get its model, as it is shown:
+    /// `space` is the Space whose members read it (`None`: the person's own
+    /// Chat, which shows the full reason). In a Space room a lost share or
+    /// connection reads exactly like any other failure, and the full reason
+    /// goes to the sender alone, as the note.
+    pub fn refused(&self, space: Option<&str>, error: &UseError) -> Refusal {
+        let message = self.unavailable(error);
+        match space {
+            None => Refusal::shown(message),
+            Some(_) => Refusal {
+                shown: MODEL_UNAVAILABLE_IN_ROOM.to_owned(),
+                note: Some(AddressingNote::ModelUnavailable {
+                    source: self.note.source,
+                    reason: use_reason(error),
+                    message,
+                }),
+            },
+        }
+    }
+
+    /// Why a turn on this route could not get its model, in full.
     pub fn unavailable(&self, error: &UseError) -> String {
         match (&self.note.source, error) {
             (RouteSource::Override, UseError::NotFound) => {
@@ -713,6 +716,70 @@ impl Route {
     }
 }
 
+/// What other members of a Space room read when a turn couldn't get the
+/// sender's model, whatever the reason: a revoked share, a deleted or
+/// misconfigured connection, a busy or offline device.
+pub const MODEL_UNAVAILABLE_IN_ROOM: &str =
+    "This run couldn't use the sender's model, so no agent answered. No other model was used.";
+
+/// A turn that could not start: `shown` is posted where the turn was
+/// asked for; `note` is the full reason for the sender's POST response.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Refusal {
+    pub shown: String,
+    pub note: Option<AddressingNote>,
+}
+
+impl Refusal {
+    pub fn shown(text: impl Into<String>) -> Self {
+        Self {
+            shown: text.into(),
+            note: None,
+        }
+    }
+
+    /// The text for the person who asked: the note's full message if any.
+    pub fn private(&self) -> &str {
+        match &self.note {
+            Some(
+                AddressingNote::RoutingFailed { message, .. }
+                | AddressingNote::ModelUnavailable { message, .. },
+            ) => message,
+            _ => &self.shown,
+        }
+    }
+}
+
+impl From<String> for Refusal {
+    fn from(text: String) -> Self {
+        Self::shown(text)
+    }
+}
+
+/// A coarse, stable code for why a connection can't be used.
+pub(crate) fn use_reason(error: &UseError) -> &'static str {
+    match error {
+        UseError::NotFound
+        | UseError::Revoked
+        | UseError::PresetNeedsOwnConnection(_)
+        | UseError::WrongCapability { .. }
+        | UseError::TurnModelNotAllowed
+        | UseError::TurnEffortNotAllowed => "not_allowed",
+        // The connection behind an explicit model changed: not a lost grant.
+        UseError::TurnChanged => "connection_changed",
+        UseError::Busy => "busy",
+        UseError::DeviceOffline => "offline",
+        UseError::NoModel
+        | UseError::NoMasterKey
+        | UseError::KeyUnreadable
+        | UseError::KeyMissing
+        | UseError::EndpointNotApproved
+        | UseError::Unsupported
+        | UseError::MediaUnsupported => "misconfigured",
+        UseError::Internal => "internal",
+    }
+}
+
 /// The Choice's reserved "none of these" option. Case keys may not use it
 /// ([`RoutingSettings::check_shape`]), so it can never select a connection.
 pub const NO_MATCH_KEY: &str = "no_match";
@@ -721,8 +788,157 @@ pub const NO_MATCH_KEY: &str = "no_match";
 #[derive(Clone, Debug, PartialEq)]
 pub enum Decision<T> {
     Answered(T),
-    /// No answer: no connection, busy, timed out, failed or malformed.
-    Failed(&'static str),
+    Failed(DecisionFailure),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionFailure {
+    Unreachable,
+    Timeout,
+    InvalidAnswer,
+    NoClassifier,
+    NotAllowed,
+    Busy,
+    InvalidQuestion,
+}
+
+impl std::fmt::Display for DecisionFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::Unreachable => "the System One call failed",
+            Self::Timeout => "System One took too long",
+            Self::InvalidAnswer => "System One's answer was malformed",
+            Self::NoClassifier => "no System One connection is set",
+            Self::NotAllowed => "the System One connection is not usable here",
+            Self::Busy => "System One is busy",
+            Self::InvalidQuestion => "the routing question is invalid",
+        })
+    }
+}
+
+impl DecisionFailure {
+    /// The failure as other members of a Space room may see it: one public
+    /// category for every failure of this stage. A lost grant, a missing
+    /// connection, a full queue, a timeout and a malformed answer all read
+    /// alike, so the room never learns about the sender's access; the
+    /// sender's own note carries the distinction.
+    pub fn shared(self) -> Self {
+        Self::Unreachable
+    }
+
+    fn upstream(error: &anyhow::Error) -> Self {
+        use crate::device_relay::DeviceError;
+        use crate::providers::ProviderError;
+        match error.downcast_ref::<ProviderError>() {
+            Some(ProviderError::Use(UseError::Busy) | ProviderError::Busy) => Self::Busy,
+            // A device classifier: a lost share and a malformed answer mean
+            // what they mean for a server connection.
+            Some(ProviderError::Device(DeviceError::AccessRevoked | DeviceError::NotFound)) => {
+                Self::NotAllowed
+            }
+            Some(ProviderError::Device(DeviceError::BadResponse(_))) => Self::InvalidAnswer,
+            Some(ProviderError::Use(UseError::DeviceOffline | UseError::Internal)) => {
+                Self::Unreachable
+            }
+            Some(ProviderError::Use(_)) => Self::NotAllowed,
+            Some(error) if error.status() == axum::http::StatusCode::GATEWAY_TIMEOUT => {
+                Self::Timeout
+            }
+            // Only locally generated protocol errors reach this branch, never an
+            // upstream error body. The shared client currently returns fixed text.
+            Some(ProviderError::Endpoint(text))
+                if text
+                    .starts_with("the model endpoint returned an invalid System One response")
+                    || text == "the model endpoint's response is not JSON"
+                    || text == "the model endpoint's response is too large" =>
+            {
+                Self::InvalidAnswer
+            }
+            _ => Self::Unreachable,
+        }
+    }
+}
+
+/// Extra metadata on the sender's POST response only; never on an Event
+/// and never stored.
+///
+/// `addressing_note` carries `classification_failed` (an unaddressed
+/// message's classification failed; nothing ran) or
+/// `generic_agent_unavailable` (no agent could be chosen for `@agent`;
+/// agents the message named by handle still ran). `routing_note` carries
+/// the other two, for a turn the message started in a Space room whose
+/// room error is generic: `routing_failed` (use-case routing could not
+/// decide) and `model_unavailable` (the turn's model connection can't be
+/// used). All but `classification_failed` have a stable `reason` code and
+/// the full, actionable `message`.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum AddressingNote {
+    ClassificationFailed {
+        reason: &'static str,
+    },
+    /// `reason` as for `classification_failed`.
+    GenericAgentUnavailable {
+        reason: &'static str,
+        message: String,
+    },
+    /// `reason` as for `classification_failed`.
+    RoutingFailed {
+        reason: &'static str,
+        message: String,
+    },
+    /// `reason`: `not_allowed`, `busy`, `offline`, `misconfigured` or
+    /// `internal`; `source` says which of the sender's choices it was.
+    ModelUnavailable {
+        source: RouteSource,
+        reason: &'static str,
+        message: String,
+    },
+}
+
+impl AddressingNote {
+    /// `@agent` could not be resolved. `named` when the message also named
+    /// agents by handle: they were asked on their own (whether their runs
+    /// start is reported separately), so the note claims nothing about them.
+    pub fn generic_agent_unavailable(why: DecisionFailure, named: bool) -> Self {
+        let others = if named {
+            " This affects only @agent; the agents you mentioned by handle were asked on their \
+             own."
+        } else {
+            ""
+        };
+        Self::GenericAgentUnavailable {
+            reason: why.reason(),
+            message: format!(
+                "Your classifier could not choose an agent for @agent: {why}. No agent ran for \
+                 @agent; mention an agent by its handle, or check your System One connection \
+                 in Settings.{others}"
+            ),
+        }
+    }
+}
+
+impl From<DecisionFailure> for AddressingNote {
+    fn from(reason: DecisionFailure) -> Self {
+        Self::ClassificationFailed {
+            reason: reason.reason(),
+        }
+    }
+}
+
+impl DecisionFailure {
+    /// The stable reason code of a sender-only note.
+    fn reason(self) -> &'static str {
+        match self {
+            DecisionFailure::Unreachable
+            | DecisionFailure::Busy
+            | DecisionFailure::InvalidQuestion => "unreachable",
+            DecisionFailure::Timeout => "timeout",
+            DecisionFailure::InvalidAnswer => "invalid_answer",
+            DecisionFailure::NoClassifier => "no_classifier",
+            DecisionFailure::NotAllowed => "not_allowed",
+        }
+    }
 }
 
 /// The use-case Choice's answer: the option and its probability.
@@ -731,17 +947,6 @@ pub struct CaseAnswer {
     /// One of the person's case keys, or [`NO_MATCH_KEY`].
     pub key: String,
     pub probability: f64,
-}
-
-fn directed_question() -> Question {
-    Question::noul_with(
-        "Is `message` addressed to the AI assistant, asking it to answer something or do \
-         something?",
-        "The sender asks the assistant a question, asks it for help, or tells it to do \
-         something",
-        "Conversation with other people, a status update, a reaction or a remark that is not \
-         a request to the assistant",
-    )
 }
 
 fn case_question(settings: &RoutingSettings) -> Question {
@@ -778,12 +983,12 @@ async fn ask_one(
     question: Question,
 ) -> Decision<protocol::Answer> {
     let Some(classifier) = settings.classifier_id.as_deref() else {
-        return Decision::Failed("no System One connection is set");
+        return Decision::Failed(DecisionFailure::NoClassifier);
     };
     let mut asked = Questions::new();
     asked.insert(id.to_owned(), question);
     if protocol::validate_questions(&asked).is_err() {
-        return Decision::Failed("the routing question is invalid");
+        return Decision::Failed(DecisionFailure::InvalidQuestion);
     }
     let message: String = text.chars().take(MAX_CLASSIFIED_CHARS).collect();
     let payload = json!({
@@ -791,7 +996,7 @@ async fn ask_one(
         "where": if space.is_some() { "a shared room" } else { "the sender's private chat with the assistant" },
     });
     let Ok(_slot) = state.routing.decisions.clone().try_acquire_owned() else {
-        return Decision::Failed("System One is busy");
+        return Decision::Failed(DecisionFailure::Busy);
     };
     let call = state.routing.backend.system_one(
         state,
@@ -804,48 +1009,22 @@ async fn ask_one(
     let response = match tokio::time::timeout(DECISION_TIMEOUT, call).await {
         Ok(Ok(response)) => response,
         Ok(Err(e)) => {
-            tracing::warn!(error = %format!("{e:#}"), "System One call failed");
-            return Decision::Failed("the System One call failed");
+            let failure = DecisionFailure::upstream(&e);
+            tracing::warn!(%failure, "System One call failed");
+            return Decision::Failed(failure);
         }
-        Err(_) => return Decision::Failed("System One took too long"),
+        Err(_) => return Decision::Failed(DecisionFailure::Timeout),
     };
     let answers: Answers = match protocol::parse_answers(&asked, &response) {
         Ok(a) => a,
-        Err(e) => {
-            tracing::warn!(error = %e, "System One answer rejected");
-            return Decision::Failed("System One's answer was malformed");
+        Err(_) => {
+            tracing::warn!("System One answer rejected");
+            return Decision::Failed(DecisionFailure::InvalidAnswer);
         }
     };
     match answers.into_values().next() {
         Some(answer) => Decision::Answered(answer),
-        None => Decision::Failed("System One's answer was malformed"),
-    }
-}
-
-/// The addressing Noul alone: how likely `text` is a request to the agent.
-pub async fn directedness(
-    state: &AppState,
-    user: &str,
-    space: Option<&str>,
-    settings: &RoutingSettings,
-    text: &str,
-) -> Decision<f64> {
-    match ask_one(
-        state,
-        user,
-        space,
-        settings,
-        text,
-        Q_DIRECTED,
-        directed_question(),
-    )
-    .await
-    {
-        Decision::Answered(a) => match a.as_noul() {
-            Some(p) => Decision::Answered(p),
-            None => Decision::Failed("System One's answer was malformed"),
-        },
-        Decision::Failed(why) => Decision::Failed(why),
+        None => Decision::Failed(DecisionFailure::InvalidAnswer),
     }
 }
 
@@ -873,7 +1052,7 @@ pub async fn use_case(
                 key: key.to_owned(),
                 probability: p.unwrap_or(0.0),
             }),
-            None => Decision::Failed("System One's answer was malformed"),
+            None => Decision::Failed(DecisionFailure::InvalidAnswer),
         },
         Decision::Failed(why) => Decision::Failed(why),
     }
@@ -957,7 +1136,7 @@ pub async fn pick_agent(
         ..
     } = &answer
     else {
-        return Decision::Failed("System One's answer was malformed");
+        return Decision::Failed(DecisionFailure::InvalidAnswer);
     };
     let probability = probabilities.get(choice).copied().unwrap_or(0.0);
     let index = if with_none && choice == NO_AGENT_KEY {
@@ -966,7 +1145,7 @@ pub async fn pick_agent(
         match (0..agents.len()).find(|i| agent_key(*i) == *choice) {
             Some(i) => Some(i),
             // An option that was never offered.
-            None => return Decision::Failed("System One's answer was malformed"),
+            None => return Decision::Failed(DecisionFailure::InvalidAnswer),
         }
     };
     let directed = match (with_none, probabilities.get(NO_AGENT_KEY)) {
@@ -981,28 +1160,9 @@ pub async fn pick_agent(
     })
 }
 
-/// Whether an unaddressed message of `user` starts agent work: only when
-/// they opted in and the addressing Noul clearly says yes. One System One
-/// call; the use case is asked separately, and only after a yes.
-pub async fn infer_addressed(
-    state: &AppState,
-    user: &str,
-    space: Option<&str>,
-    settings: &RoutingSettings,
-    text: &str,
-) -> bool {
-    settings.wants_inference()
-        && matches!(
-            directedness(state, user, space, settings, text).await,
-            Decision::Answered(p) if p >= settings.min_directedness
-        )
-}
-
 /// The route of a turn `user` starts. `chosen` (an explicit model for this
 /// turn) wins and asks System One nothing; then use-case routing, if they
-/// turned it on (one Choice call); then their default. So a message costs
-/// at most two System One calls: the addressing Noul (unaddressed, opted
-/// in) and, only after a yes or for an explicit agent turn, this Choice.
+/// turned it on (one Choice call); then their default.
 pub async fn route_turn(
     state: &AppState,
     user: &str,
@@ -1021,6 +1181,7 @@ pub async fn route_turn(
                 connection_id: Some(id.clone()),
                 turn_selection: None,
                 blocked: None,
+                sender_note: None,
                 note: RouteNote {
                     source: RouteSource::RoutingDefault,
                     connection_id: Some(id.clone()),
@@ -1045,11 +1206,21 @@ pub async fn route_turn(
         // connection could not answer, so nothing answers in its place.
         Decision::Failed(why) => {
             let mut route = Route::default_for(addressed_by);
-            route.blocked = Some(format!(
-                "Your model routing could not choose a model for this message: {why}. No \
-                 model was used; check your System One connection in Settings."
-            ));
-            route.note.reason = format!("routing failed: {why}");
+            let text = |why: DecisionFailure| {
+                format!(
+                    "Your model routing could not choose a model for this message: {why}. No \
+                     model was used; check your System One connection in Settings."
+                )
+            };
+            // In a Space room every member reads this; the detail is
+            // returned to the sender alone.
+            let shown = if space.is_some() { why.shared() } else { why };
+            route.blocked = Some(text(shown));
+            route.note.reason = format!("routing failed: {shown}");
+            route.sender_note = Some(AddressingNote::RoutingFailed {
+                reason: why.reason(),
+                message: text(why),
+            });
             return route;
         }
     };
@@ -1072,6 +1243,7 @@ pub async fn route_turn(
         connection_id: Some(case.connection_id.clone()),
         turn_selection: None,
         blocked: None,
+        sender_note: None,
         note: RouteNote {
             source: RouteSource::Case,
             addressed_by,
@@ -1089,19 +1261,12 @@ pub async fn route_turn(
     }
 }
 
-/// The mentions of a message the classifier addressed to the agent.
-pub fn classifier_addressed() -> Addressed {
-    Addressed {
-        mentions: json!([{"kind": "agent", "addressed_by": "classifier"}]),
-        audience: "agent".to_owned(),
-    }
-}
-
 /// The mentions of a scheduled prompt.
 pub fn schedule_addressed() -> Addressed {
     Addressed {
         mentions: json!([{"kind": "agent", "addressed_by": "schedule"}]),
         audience: "agent".to_owned(),
+        spans: None,
     }
 }
 
@@ -1203,11 +1368,11 @@ pub async fn submit_scheduled(
                 pick: "Scheduled prompt: default agent".to_owned(),
                 addressed_by: AddressedBy::Schedule,
             }];
-            let failures = crate::agent_dispatch::start_runs(
+            let started = crate::agent_dispatch::start_runs(
                 state, space_id, &room, &author, &event, targets, None, &settings, &prefs,
             )
             .await;
-            if let Some(reason) = failures.into_iter().next() {
+            if let Some(reason) = started.failures.into_iter().next() {
                 anyhow::bail!(reason);
             }
             Ok(())
@@ -1270,7 +1435,7 @@ mod tests {
         s.enabled = false;
         assert!(s.check_shape().is_ok(), "off routing may keep cases");
         s.infer_addressing = true;
-        assert!(s.check_shape().is_err(), "inference needs a classifier");
+        assert!(s.check_shape().is_ok(), "the legacy flag is ignored");
     }
 
     #[test]

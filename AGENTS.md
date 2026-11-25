@@ -10,14 +10,17 @@ whatever model `METRO_MODEL` names.
 
 | Role | Owner |
 | --- | --- |
-| Project manager and orchestrator: decides architecture, scope and trade-offs; assigns and directs subagents; accepts results only once they are verified | **Astra 6.2** |
-| Writing (README, AGENTS.md, docs/), frontend (`apps/desktop`), complex code | **Opus 5.5**, only through OpenChamber subagents; **Astra 6.2** may directly edit and test `apps/desktop` for UX Round 2 only. |
-| Mid-level code (assigned to either, at Astra's discretion) | **Sol 6.2** or **Sonnet 5.5**, both through OpenChamber subagents |
+| Orchestrator: decides scope, architecture and trade-offs; assigns and directs subagents; accepts results only once they're verified. Assigns the work in the other rows to subagents and doesn't do it itself | Any model; no specific model is required |
+| UI/UX decisions: what to build, and how it should look and behave | **Opus 5.5** |
+| UI/UX implementation (`apps/desktop`, including `theme/` and `src/ui/`) | By complexity: **Opus 5.5** for complex work, **Sonnet 5.5** for medium, **Sol 6.2** for the most routine tasks |
+| Complex code in any layer (for example security-sensitive or tricky Rust) | **Opus 5.5** |
+| General tasks (routine code, tests, fixtures, chores) | **Sol 6.2** |
+| Writing (README, AGENTS.md, docs/) | **Opus 5.5** |
+| Reviews | **Opus 5.5** first, then **Astra 6.2**. Work is accepted only after both reviews pass |
 
-Opus 5.5 never edits directly in the root session, and nobody calls the
-Claude CLI directly. Opus contributes only as an OpenChamber subagent. These
-are build assignments only. They don't affect which model Metro calls at
-runtime.
+Every role works through OpenChamber subagents running the named model.
+Nobody calls the Claude CLI directly. These are build assignments only. They
+don't affect which model Metro calls at runtime.
 
 ## Layout
 
@@ -33,6 +36,9 @@ runtime.
 
 ## Rules
 
+The rules below describe the current source. For behaviour added after
+0.4.0, see [In the source, not released](docs/next-source.md).
+
 - Stay inside the files you were assigned. Don't edit another lane's files;
   report what needs to change instead.
 - Never commit secrets. Generate tokens locally, and keep `.env` out of git.
@@ -44,7 +50,9 @@ runtime.
 - Deleting a Space is permanent, owner-only and needs the Space's exact name
   typed as confirmation. It removes everything of the Space in one
   transaction (see [docs/spaces.md](docs/spaces.md#spaces-and-members)),
-  revokes its dedicated token, detaches its runner and stops its runs. Any
+  including published Pages, their versions, recently deleted Pages and
+  drafts. There is no Trash recovery for a deleted Space. It revokes its
+  dedicated token, detaches its runner and stops its runs. Any
   member except the owner can leave. Leaving is the same as being removed,
   including the purge of that person's index rows and preferences for the
   Space. The owner can't leave.
@@ -79,6 +87,26 @@ runtime.
   second Space, and no job goes to a runner its Space didn't explicitly
   choose. Don't add a server-wide runner token, a fallback Space or runner, or
   any implicit cross-Space assignment.
+- The desktop may offer its own eligible personal runner when creating a
+  Space or for owner-selected existing Spaces. Submitting the checked
+  Create Space choice or pressing Attach is the explicit action. These
+  paths must use an atomic attach-if-empty check, never replace or detach
+  assignments (including dedicated tokens or offline runners), and never
+  fall back to a replacing route. Reconnect rotates the existing
+  registration's token without changing attachments; a new one starts
+  unattached.
+- **Space settings** combines General, Members, Runner, Agents and Your
+  preferences. Members can read and change their own preferences;
+  preserve owner-only management and the old Manage entry to Members.
+  Runner attachment and dedicated token issue require an empty slot.
+  Detach, revoke and rotate require the reviewed
+  assignment revision; never retry unguarded. Don't show a dedicated
+  token from an unconfirmed or superseded assignment. Rotation
+  invalidates claimed work under the old credential and can preserve
+  waiting work for the same runner; removing or replacing an assignment
+  drops old work rather than transferring it. **Test runner** posts its
+  listing as Runner activity in the open Space room, not privately in
+  Settings, and never calls a model.
 - A registered runner never runs check or MCP commands as unsandboxed host
   processes, because they could read sibling Spaces' roots. By default it
   offers only list and read. Check and MCP need `METRO_SANDBOX=docker`, which
@@ -105,7 +133,11 @@ runtime.
   - **Server-stored API profiles** are optional. Their keys are write-only
     through the API, encrypted at rest with the operator's master key, and
     never logged or returned. Custom base URLs must match an entry in
-    `METRO_PROVIDER_ALLOWED_BASE_URLS` exactly.
+    `METRO_PROVIDER_ALLOWED_BASE_URLS` exactly. Only the owner can change
+    a supported endpoint. Testing sends the configured key, if any, to
+    the approved candidate before the save. A rejected save cannot undo
+    that disclosure. Don't overwrite a concurrent change or expose the
+    endpoint to borrowers.
 - The providers shown to users are only those the build implements.
   Server-side adapters come from the compiled Rig catalog. Don't claim a
   provider, a vendor sign-in flow or plan limits that nobody has verified, and
@@ -140,8 +172,8 @@ runtime.
   each person then signs in with their own account. A preset must never
   switch quietly to the borrower's paid API profile. Accounts are never
   shared.
-- **Explicit recipients always decide who a message is addressed to.** A
-  message falls into exactly one of these cases:
+- **In Spaces, explicit recipients always decide who a message is
+  addressed to.** A Space message falls into exactly one of these cases:
   - **People only** (`@bob`, with no agent and not sent with Ask agent).
     It never starts agent work, and it's never sent to System One for an
     addressing or routing decision.
@@ -161,19 +193,43 @@ runtime.
 
   The same routing below still applies to choose each run's answering
   model. The agent's history shows each message's author and recipients.
+- The desktop sends verified Space mentions as stable IDs and validated
+  text ranges. Never silently retarget an ambiguous, changed or stale
+  mention; keep the original draft when send is refused. Dispatch from
+  Chat is an explicit generic request to the verified room or thread,
+  with no implicit recipients from its text. Follow up checks the exact
+  destination and doesn't silently change it. Generic `@agent` isn't an
+  identity card. Don't fall back to legacy text inference on a server
+  refusal.
 - **Opt-in classification** decides only which agent, if any, an outgoing
   message is for. A person turns it on for their own messages **per
   Space**, only while they have a System One connection usable in that
-  Space; personal Chat keeps its own per-person setting. In a Space it's one
-  typed System One Choice over the Space's agents plus "No agent" for an
-  unaddressed message (without "No agent" for the generic `@agent`). The
+  Space. It's one typed System One Choice over the Space's agents plus
+  "No agent" for an unaddressed message (without "No agent" for the
+  generic `@agent`). The
   options are keyed internally, so model text never becomes an agent id.
   For an unaddressed message, "No agent", low confidence or a failure
-  starts nothing (for `@agent`, see above). The run's
+  starts nothing (for `@agent`, see above). A failed decision on
+  unaddressed text returns an unstored `addressing_note` to the sender
+  only; don't turn it into a room event. The run's
   activity shows the decision ("Picked by classifier: X"). A message it
   starts runs as that person. It's never used on people-only messages,
   messages to a named agent or other people's messages. With it off, which
   is the default, unaddressed text is ordinary conversation.
+- Sender-only notice details are POST metadata, never a polled event,
+  search result or model history. Either or both fields may be present.
+  Bind them to the originating authenticated sender, destination and
+  matching transcript row. Don't replay them after dismissal, session
+  reset or access loss, or expose private model details in a shared
+  room. Direct Personal Chat failures
+  in this server appear in the private Chat, not as addressing notices.
+- **Personal Chat is direct.** Send starts the Chat agent, including for
+  attachment-only messages. No addressing classifier or marker is needed.
+  **Save note** stores the message without starting a run and overrides
+  text mentions and the legacy `invoke_agent` flag. `infer_addressing`
+  remains accepted for compatibility and the existing one-time Space
+  migration, but doesn't control Chat dispatch. Use-case routing remains
+  separate and can choose the answering connection.
 - **Use-case routing** is a separate opt-in, and it decides only which of a
   person's usable chat connections answers. It can run on any run that
   starts for that person: a named agent, `@agent`, Ask agent, or one
@@ -228,6 +284,44 @@ runtime.
   and no fallback is used. A scheduled prompt counts as the creator
   explicitly asking the agent (in a Space, its default agent, never
   classified).
+- **Web search and fetch** run on the initiator's most recently seen
+  online web device on that server, never on the server itself, a runner
+  or a borrowed connection's device. The computer's
+  switch is on by default with a notice. A Space owner enables each tool
+  in its agent allowlist; personal Chat has a separate per-account opt-in
+  for both, off by default. Provider choices and keys stay on the
+  computer; keys go only to their provider, never to Metro. The server
+  relays job arguments and bounded results. A contacted provider sees
+  applicable network and auth data and may receive the query or URLs;
+  session setup can fail first. A rejected saved key never silently
+  falls back to keyless for that provider. Activity keeps accepted
+  queries, keywords and non-default result limits, or normalized URLs
+  and focus, plus bounded summaries and attempt outcomes. Snippets and
+  page text are relayed as current-run tool output, not stored or
+  replayed as tool history; replies may quote them. Metro doesn't
+  control vendor or model retention. If no paired device is online at
+  call time, report the tool failure. A scheduled prompt may answer
+  without web data if its model is usable.
+- **Fetch checks provenance, not DNS.** Require an HTTP(S) URL from a
+  person's message available to the run or a structured search result
+  in that run. Reject URL userinfo, blocked IP literals and recognized
+  local hostnames. Metro doesn't check target DNS or control provider
+  redirects; don't describe these checks as proof a URL is public.
+  Warn against submitting private or credential-bearing links.
+- **Pages** are validated Page TSX, not executable user code. Reads are
+  as the viewer; Space pages see only their own Space, and personal
+  pages have no admin bypass. Actions run as the clicker. Personal-page
+  runs are page-only with no web tools and cannot target Chat or a Space;
+  Space actions are limited to that Space's top-level rooms. Consent
+  from one button covers the entire page version, not just that button.
+  Each click still checks the current version, access and destination;
+  schedules also check the reviewed task revision as applicable.
+  Space Page tools are opt-in per agent, run
+  as the initiator, and return only room-safe data. Proposal cards are
+  visible in the room; the draft is private to the initiator and applies
+  only after they act with current edit rights. The organization limits
+  are live through the token-authenticated `/v1/admin/settings` API used
+  by `/admin`; they don't grant access to page data.
 - Reactions never start agent work and never imply that work is complete.
 - A `reasoning_summary` event carries only the reasoning summary text a
   provider returned (bounded), never encrypted, raw or redacted reasoning
@@ -235,12 +329,18 @@ runtime.
   and never indexed.
 - Threads stay one level deep and bounded, inherit their Space's members
   and runner, and keep the agent and connection of the run that created
-  them. The personal Chat agent's only tool is the scoped
-  `react_to_message` acknowledgment. It has no runner, workspace or thread
-  tools, and can't read Space transcripts. Cross-Space run controls are for
-  the human, and they check membership.
+  them. The personal Chat agent gets the scoped `react_to_message`
+  acknowledgment and, only with the account opt-in, the web tools above.
+  It has no runner, workspace or thread tools, and can't read Space
+  transcripts. Cross-Space run controls are for the human, and they check
+  membership.
 - The database is pinned to one identity namespace. Never assign legacy or
   foreign history to anyone.
+- Desktop startup can show the Shell after verifying identity and
+  membership, before the remembered room finishes loading. Don't show
+  an old transcript before verification or let late startup work
+  override a newer navigation, session or authoritative access change.
+  Only reuse in-flight model reads for the same session and scope.
 - *Demo* must stay deterministic and must never call a model.
 - Sandboxing is opt-in, and `docker` mode fails closed. Check and MCP commands
   are operator-defined JSON argv and are never run through a shell.
@@ -252,7 +352,7 @@ runtime.
     loopback fixtures and scripted models.
   - The classification and routing opt-ins are off by default. With them
     off, the default behaviour above is the only behaviour.
-  - The current final local result is the Metro 0.2.0 local release,
+  - A historical final local result is the Metro 0.2.0 local release,
     prepublication (`docs/acceptance.md`): 570 Rust tests, all seven e2e
     scripts, 6 packaging tests, and desktop `nsh test` 159/159. The
     Documents & media gate (497 Rust tests, the 83 hardened media-service
@@ -264,7 +364,7 @@ runtime.
     (`docs/acceptance.md`). Metro 0.3.2 (`v0.3.2` on `d943797`, CI run
     45418420759) was the release before it. Native Windows by a person,
     real vendor accounts and real sign-ins are still unverified.
-  - The latest gate (4175475, several agents per Space, per-connection
+  - The 0.4.0 staged gate (4175475, several agents per Space, per-connection
     model lists, the desktop redesign) ran on local builds of source that
     is now released in 0.4.0: 686 Rust tests, eight e2e scripts (not
     `library_reference.py`) and desktop `nsh test` 400/400, with no
@@ -299,11 +399,29 @@ runtime.
   read-only local tools (`workspace.list`/`workspace.read`) never stand in
   for an operator's separately installed runner. It and the other features
   checked in the 0.2.0 Linux candidate are described as verified in that
-  local candidate, never as released. Anything still unchecked (native
-  Windows, real vendor accounts and sign-ins) is labelled as such. A
-  deployment's own address (such as a dev LAN host) is never a documented
-  default. Over plain HTTP on a LAN, the admin page is a landing
-  page only; tokens go over loopback, an SSH port forward or HTTPS.
+  local candidate, never as released. Keep unattended native Windows CI
+  checks separate from earlier Wine attempts and the still-unverified
+  native GUI by a person. Real vendor accounts and sign-ins remain
+  unverified. A deployment's own address (such as a dev LAN host) is
+  never a documented default.
+- **Metro server transport** in the current source: prefer HTTPS or SSH
+  forwarding. The desktop and `/admin` require informed consent before
+  sending a token over ordinary plain HTTP; runner and CLI clients warn
+  rather than prompt. Direct loopback and recognized Tailscale hosts can
+  skip the question. The desktop also asks when the route to one of those
+  hosts is proxied or unknown; don't silently exempt tailnet hosts from a
+  user's desktop proxy. Runner and connector server clients reach loopback
+  and Tailscale directly; the admin panel can't detect browser proxies.
+  This doesn't relax provider URL rules or change the published 0.4.0
+  instructions.
+- **Updates** require a verified published release and an explicit
+  install action. Source and preview builds don't offer updates. Only
+  eligible managed Linux desktop installs update in-app; portable and
+  Windows copies are manual, and servers and Docker runners get notices
+  only. Standalone runner self-update verifies independently; the server
+  sends a version, never a URL or code. If recovery is uncertain, keep
+  journals, locks and database copies intact; document the verified
+  installer's read-only diagnostic, never an improvised repair.
 - The docs must not claim features that aren't implemented, or results that
   nobody recorded. When code and docs disagree, fix the docs. Record each
   verification run in `docs/acceptance.md`.

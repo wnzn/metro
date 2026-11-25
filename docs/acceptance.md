@@ -103,6 +103,353 @@ anyone outside the release workflow; macOS (not built); real vendor
 accounts and sign-ins; pretrained `google/embeddinggemma-2` ranking.
 Windows files carry no Authenticode signature.
 
+## Source only: documentation cut at d82c07f
+
+The [source preview](next-source.md) was checked against merged source
+`d82c07fed0e4232a45154066ec8430eb2f11ae70`. The documentation pass
+checked local Markdown links and anchors and ran `git diff --check`.
+It did not run builds, runtime tests, live services, or release checks.
+The updater results below belong to the earlier cuts named there;
+they are not acceptance for this source.
+
+The first docs review was checked against that same cutoff and the local
+`v0.4.0` tag at `1a743e59d4ec6c1da85d09d92c99457561f64e55`. The tagged
+source lists six Settings sections, including Monitoring. Its workflows
+distinguish unattended `windows-2025` MSI and connector fixture checks
+from the earlier Wine GUI smoke tests. Neither is a GUI verification
+by a person on native Windows. No runtime checks were rerun.
+
+The second docs review checked the web-tool contract at the same cutoff:
+accepted arguments and event summaries, current-run model output, URL
+provenance and host checks, and the hosted MCP initialization sequence.
+This was local source inspection, not a live provider or retention test.
+
+**Runtime copy findings at this earlier cut (no code change in that pass):**
+
+- Web Search and About & updates → Privacy use singular provider
+  wording and refer to “this computer.” Explain that any contacted
+  provider may receive the arguments after setup, the server relays
+  the job and bounded results, and the serving device may be another
+  online device of the same account. Distinguish stored activity from
+  current-run tool output and avoid promising public-only destinations
+  or provider retention limits. Align Model choices' privacy summary,
+  and don't promise that adding a free key raises a vendor's limits.
+- Model connections' **Test and save** explains when the endpoint
+  changes, but not that the test sends the configured key to the
+  candidate even if the save fails. Disclose that before the test.
+- The Page confirmation shows the clicked action and says the choice
+  is remembered for that page version. Say explicitly that it also
+  covers other buttons in the version.
+
+The entries below distinguish the later UX integration from this
+historical review.
+
+## Source only: interim gate and startup evidence
+
+- **Interim desktop gate, `141a89ff131f8c1f99fdfcdb0d234f5d81a6ae12`.**
+  The archived full offline `nsh test` log and JUnit receipt agree:
+  **678/678 passed**, with no failures, errors or skips. This gate covers
+  the integration at that commit, not the later feature cut or a final
+  combined release matrix.
+- **Startup fixture replay.** The same `startup-metrics.test.tsx`
+  fixture (SHA-256
+  `3c2a299abbf676e2d962e51793dfd65c40ad83d5fbb8f303f034e0ec3fb51c2e`)
+  passed all four cases on each Git archive: standalone startup
+  `f51117cf87f7c869a6ed46901e6d0a0607f79462` and startup with the
+  conversation lanes merged at `5fcd434bc97ec6237a83a783c355c4e6a456a029`.
+  The replay ran `nsh test .nsh/startup-metrics.test.tsx --verbose`
+  with headless NSH 0.6.1 (`2f51d86`) in an isolated network namespace.
+  The fixture sampled virtual time every 10 ms through 700 ms for the
+  remembered-room cases and 950 ms for the empty-Chat cases. Its zero
+  sample followed the fixture's **Connect** press or, for the local
+  case, the NSH harness's app-open call. Request counts are arrivals
+  at the mock Metro server within those windows; bridge status reads
+  are counted separately.
+
+  | Fixture | Shell / first room text, virtual ms (both archives) | Server arrivals at `f51117c` | Server arrivals at `5fcd434` |
+  | --- | --- | ---: | ---: |
+  | Saved remote room | 70 / 360 | 10 | 12 |
+  | Local remembered room | 150 / 450 | 10 | 12 |
+  | Empty Chat, no operator model | — | 9 | 9 |
+  | Empty Chat, operator model | — | 8 | 8 |
+
+  Each room fixture logged one separate bridge status read. These
+  are controlled fixture observations, not native launch or live
+  network timings, and not measurements of `cf5fd97` or `2cb1beb`.
+- **Pre-UX docs cutoff, `2cb1bebf55f06a168161404c1496fd9f20442a93`.**
+  The source preview was advanced after checking the
+  merged Space settings, guarded runner and token routes, mentions and
+  Dispatch, sender notices, startup, and Space deletion code. The
+  docs lane verified the local 0.4.0 tag and kept the published release
+  record unchanged. It ran local Markdown/link and diff checks only.
+
+The full UX review at `2cb1beb` identified the issues addressed by the
+later UX integration below. The admin browser fixture in that review did
+not yield a usable result; the backend gate's mocked Chromium result is
+a separate run.
+
+**Pre-UX desktop check at `2cb1beb`: 862/863 passed.** The offline full
+NSH run and an isolated rerun both failed the same stale selector in
+[`Activity.test.tsx`](../apps/desktop/src/features/activity/Activity.test.tsx):
+it expected the whole `@agent` question in one text node, but the
+renderer split the mention from the message text. This is not a
+passing desktop gate.
+
+## Source only: reviewed UX integration at b444379
+
+The [source preview](next-source.md) now describes
+`b44437956e73f2eaa6e8a4d62102352139fa67d2`. This local integration
+includes the reviewed startup HTTP consent, runner selection and Space
+deletion warning, exact **Follow up** confirmation and verification,
+Page version approval, and Web Activity wording. It also updates the
+stale Activity selector for text split across mention spans.
+
+- **Scoped desktop evidence:** The startup fix author checked the
+  startup consent fixture offline in GTK/Xvfb at **720×480** and
+  **1280×800** on `4f37cdeb9845297c607ac149b4467a34913f8eb3`.
+  Scoped offline headless NSH checks and reviews covered the desktop
+  changes on their respective lanes. These are not a full desktop
+  run on `b444379`, a screen-reader check, or native Windows verification.
+- **Backend continuity:** The backend, workflows and backend test
+  files are unchanged from `2cb1beb`; `crates/` still has tree
+  `7242f3cb5a77486e51b43c3cad864499737572bb`. The bounded backend
+  result below remains attributed to `2cb1beb`; it was not rerun
+  for this docs update.
+
+## Source only: final local acceptance at b444379
+
+- **Full desktop gate:** The immutable source archive of
+  `b44437956e73f2eaa6e8a4d62102352139fa67d2` passed **894/894 unique
+  tests across 67 files**, with no failures, errors, skips or duplicates.
+  The console log and JUnit receipt agree, including the Activity test
+  that was the sole failure at `2cb1beb`. From `apps/desktop`, the run
+  used `TZ=Asia/Manila nsh test . --junit ../../full.junit.xml` with
+  headless NSH 0.6.1 (`2f51d86`); JUnit recorded **685.440 s**. This
+  offline headless gate is separate from the scoped GTK/Xvfb startup
+  consent evidence above.
+- **Backend and supporting checks:** The [bounded backend gate](#source-only-bounded-backend-gate-at-2cb1beb)
+  remains attributed to `2cb1bebf55f06a168161404c1496fd9f20442a93`.
+  The backend, packaging, workflows and backend e2e sources are
+  unchanged at `b444379`; `crates/` still has tree
+  `7242f3cb5a77486e51b43c3cad864499737572bb`. Rust, loopback e2e and
+  isolated updater, packaging and signing fixtures, mocked Chromium,
+  and workflow tooling results were not rerun or reattributed.
+
+This closes local desktop acceptance alongside the bounded backend
+result, not release sign-off. Its exclusions still apply, including
+Docker, hosted CI, live services and distribution, native Windows
+and macOS, separate TUI and media-reference checks, and screen-reader
+verification. No push, deployment, or publication is implied.
+
+## Source only: bounded backend gate at 2cb1beb
+
+The verified local backend gate ran on
+`2cb1bebf55f06a168161404c1496fd9f20442a93`, Git tree
+`8a84fc0e36ccd285d45c496be8fc3ee528740fbf`, with `crates/` tree
+`7242f3cb5a77486e51b43c3cad864499737572bb`. It used Rust, Cargo and
+Clippy 1.98.1 in an isolated loopback-only network namespace without
+deployment credentials. This is not the earlier **678/678** desktop
+gate at `141a89f`, a new desktop result, or release sign-off.
+
+- **Rust:** One locked, offline test run across `metro-server`,
+  `metro-connector`, `metro-runner`, `metro-auth`, `metro-url-policy`,
+  `metro-release` and `metro-model-protocol` passed **1,092 unique
+  cases** including doctests, with **0 failed, 3 ignored and 6
+  Docker-dependent tests excluded**. The normal server, runner and
+  connector built offline. `cargo fmt --all -- --check` and strict
+  `cargo clippy --locked --offline --all-targets … -- -D warnings`
+  passed for the recorded scope (Clippy: those seven packages).
+- **Loopback e2e:** The normal binaries passed all 11 scripts:
+  `smoke`, `settings`, `attachments`, `pages`, `device_connector`,
+  `threads`, `intelligence`, `agent_pages`, `web_search`, `library`
+  and `schedules`. These are the scripts in [`tests/e2e`](../tests/e2e).
+  The audited normal binaries had neither the test-release feature
+  nor the fixture verifier markers. The gate then freshly built
+  server and runner executables in a separate target with
+  `metro-server/e2e-test-release,metro-runner/e2e-test-release` and ran
+  [`updates.py`](../tests/e2e/updates.py) only against those binaries.
+  It passed owner-only update, in-place upgrade, refusal to claim
+  work during unsafe journal or rollback states, and rollback of a
+  crash-loop version after three restarts. This did not contact the
+  live release service or demonstrate live signed distribution.
+- **Packaging and tooling:** The Python suites in
+  [`packaging`](../packaging), [`release-signatures`](../packaging/release-signatures)
+  and [`windows-signing`](../packaging/windows-signing) passed **316**
+  tests with **11 skipped**, using PowerShell on Linux where needed.
+  ShellCheck, actionlint, the full-SHA action pin check and the
+  example workspace check passed. The
+  [`admin.browser-test.mjs`](../crates/server/src/admin_web/admin.browser-test.mjs)
+  mocked Chromium admin API suite passed **30** checks, separate from
+  the inconclusive browser attempt in the UX review.
+
+**Not verified by this gate:** Docker sandbox execution or container
+images; native Windows or macOS installs and signing; hosted CI or an
+actual release run; live auth, providers, signing or updates; live
+hourly recurrence; the media-reference e2e; or the separate desktop,
+TUI and UI matrices.
+
+## Source only: updater lane and reviewed integration (2026-11-25, local)
+
+Local merge on `lane/updates-backend` of approved updater
+`8ee22c9a67530ccef1a9be0761bfbb821518eb0f` and reviewed integration
+`02a0cb73c78347c07d7da1e213307bf6505a9bef`. No integration branch update,
+push, deployment, or release.
+
+- `cargo build --locked --workspace` and formatting passed with normal
+  features. The normal binaries passed `smoke`, `pages`, `agent_pages`,
+  `web_search`, `settings`, `device_connector`, `intelligence`, and
+  `library` end to end.
+- Locked tests for release, URL policy, model protocol, connector,
+  desktop, runner, server, and TUI: 1,034 passed, 3 ignored. Strict
+  workspace Clippy (`--all-targets -- -D warnings`) passed.
+- `tests/e2e/updates.py` passed against separately built fixture server
+  and runner binaries. A build combining the `e2e` verifier feature with
+  `METRO_RELEASE_CHANNEL=release` was refused at compile time as intended.
+- The installer suite passed 41/41 (PowerShell ran on Linux). It covered
+  the published installer locks and the case where an installed runner
+  script knows self-update but predates the HTTP and proxy handling.
+- The admin browser suite passed 27/27 in
+  `mcr.microsoft.com/playwright:v1.58.2-noble`. The unmodified integration
+  tip reproduced a second-tab consent test failure. The merged test
+  enables Page events and waits for the correct origin and consent UI;
+  this did not change the panel's credential or consent behavior.
+
+The connector and launcher passed an offline locked
+`x86_64-pc-windows-gnu` check with pre-existing connector warnings.
+Windows updates remain manual-only. Native Windows MSI and helper death,
+live TUF refresh, and a published-to-published update were not tested.
+The legacy installer and shared-workspace recovery limits below still apply.
+
+## Source only: shared-workspace updater re-review (2026-11-25, local)
+
+Verified on `lane/updates-backend` at `d57420e`, after `b451766`. This is
+unreleased source; nothing was pushed, merged, or deployed.
+
+- The Linux watchdog keeps the original `instance.lock` through the
+  trial handoff and rollback. The trial launcher verifies the handoff
+  against its parent and the workspace journal. The bundled server
+  inherits both the instance lock and the local workspace lease.
+  A portable launcher was refused before opening a workspace on the
+  same data root. In a separate fixture the bundled server outlived the
+  trial launcher: an independent holder of the old lock protocol could
+  not become primary, and the watchdog preserved the database, backup,
+  and journals instead of restoring over the live writer.
+- The desktop's durable floor survived both expiry of its cached
+  verification lease and absence of the cached status. A lower signed
+  release was not offered; the pending stage was retained until it
+  could be revalidated. The admin notice used the runner's shared-floor
+  decision: a below-floor release remained history with no update link
+  or image instructions.
+- 71 focused locked Rust tests passed; one child-process helper was
+  ignored as a standalone test and invoked by its parent test. These
+  suites included the published Linux installer lock regressions.
+  Formatting, strict Clippy, and the admin browser suite (22/22) passed.
+  `tests/e2e/updates.py` passed with separate test-release binaries. A
+  damaged or unprotected runner journal was left unchanged and the
+  runner exited with status 75 before sending a claim.
+
+**Manual recovery and legacy limits.** If a trial loses its watchdog and
+continuous exclusion cannot be proved, Metro does not restore on restart.
+The `desktop-update.json` gate and backup are kept. Stop Metro and its
+bundled server, keep both database copies, and resolve the installation
+and data together before resuming. Old launchers honor `instance.lock`
+while it is held but do not read the durable gate after the lock is
+released; do not run them against a workspace pending manual recovery.
+A server already orphaned by an older launcher did not inherit the new
+guards; older launchers and servers must be stopped before updating.
+Earlier installer migration restrictions still apply.
+
+Windows remains manual-only. The connector and launcher checked for
+`x86_64-pc-windows-gnu`, with pre-existing connector warnings. Native
+Windows MSI and helper-death tests remain deferred. No live update or
+TUF refresh was run.
+
+## Source only: updater re-review (2026-11-25, local)
+
+Verified locally on `lane/updates-backend` at `92979ca`, after `916f8da`.
+None of this is in Metro 0.4.0. Nothing was deployed, pushed, or merged.
+
+**Migration and recovery limits.** Linux desktop in-app updates and Linux
+runner self-update require an explicit migration. With the app or runner
+stopped and no installer running, use the installer and verified prebuilt
+archive for the build that includes these changes:
+`update --archive FILE --migrate-update-lock`. Retire old installer copies
+before restarting. The new lock excludes 0.4.0 operations that take `.lock`;
+published runner `configure` and `uninstall` and Windows script `Uninstall`
+bypass it. The migration does not make those old commands safe to run
+concurrently.
+
+Windows script and MSI updates are manual-only. The launcher won't start an
+MSI helper. If an old journal leaves completion uncertain, Metro stops
+before opening the workspace and preserves both the journal and the backup.
+Confirm the Windows Installer transaction has ended and resolve the
+installation and data manually before restarting. A dead helper PID is
+not proof. Unowned backups from older Metro builds are not consumed.
+
+**Local checks.**
+
+- Locked all-features tests for `metro-release`, `metro-runner`,
+  `metro-connector`, `metro-server` and `metro-desktop`: 740 passed,
+  2 ignored. Formatting and strict Clippy on those crates passed.
+  Regressions cover interruptions before and after backup publication and
+  during cleanup, a modified staged menu script, legacy MSI journals,
+  cached TUF expiry, and a shared release floor raised by another checker.
+  The desktop and runner update locks were also exercised in both
+  directions against the published Linux scripts.
+- `tests/e2e/updates.py` passed with separate test-release binaries. When
+  rollback was due and the previous executable was unavailable, the runner
+  saved rollback intent, exited with status 75, and sent no claim. The same
+  test exercised the in-place update and the rollback after three restarts.
+- Packaging, release-signature and Windows-signing suites: 286 passed,
+  11 skipped. Published installer fixtures matched the signed 0.4.0
+  `SHA256SUMS` entries. The Linux installers ran in throwaway homes. The
+  Windows fixture exercised the published and current lock paths in
+  PowerShell on Linux, stopping before extraction; it was not an MSI run.
+- The admin browser suite passed 22/22 in
+  `mcr.microsoft.com/playwright:v1.58.2-noble`. The release, connector and
+  desktop crates checked for `x86_64-pc-windows-gnu`, with pre-existing
+  connector warnings. This was cross-compilation only.
+
+Native Windows MSI transactions, helper death and shortcuts, live TUF
+refresh, and updates between published Metro releases were not tested.
+
+## Source only: updater review 2 (2026-11-25, local)
+
+Tested on `lane/updates-backend` at `3de67c1`. This work was not part of
+Metro 0.4.0 and was not published or merged.
+
+- The locked Rust workspace suite ran with `METRO_SERVER_BIN` pointed at
+  the local server binary: 803 passed, 2 ignored. Formatting and workspace
+  Clippy (`--all-targets --all-features -- -D warnings`) passed.
+- Locked all-features tests for `metro-release`, `metro-server`,
+  `metro-runner`, `metro-connector`, and `metro-desktop`: 730 passed,
+  2 ignored. This run omitted debug symbols to fit on disk.
+- The eight plain end-to-end scripts passed against builds without
+  test-release hooks: `smoke`, `threads`, `device_connector`, `settings`,
+  `schedules`, `intelligence`, `attachments`, and `library`.
+- `tests/e2e/updates.py` passed with separate test-release fixture
+  binaries. It verified the update notice and owner-only request, updated
+  the runner from 1.0.0 to 1.0.1 without restarting the process, then
+  rolled a crashing 1.0.2 back after three restarts and reported
+  `start_failed`.
+- A build check with the `e2e` feature and `METRO_RELEASE_CHANNEL=release`
+  was rejected by the compile-time guard as expected.
+- The packaging, release-signature, and Windows-signing suites ran with
+  PyYAML 6.0.4: 282 passed, 11 skipped. The PowerShell fixtures ran on Linux;
+  they are not native Windows install or signing tests.
+  Both Linux installers failed the new live-lock regressions when the same
+  tests were run against the scripts from `b04dd43`.
+- The admin browser suite passed 22/22 in
+  `mcr.microsoft.com/playwright:v1.58.2-noble`. `actionlint` 1.7.12 passed.
+- `metro-release`, `metro-connector`, and `metro-desktop` checked for
+  `x86_64-pc-windows-gnu` in `metro-package-builder:windows-gnu`. This was
+  a cross-check only. Native Windows MSI execution, shortcuts, and helper
+  handoff were not exercised.
+
+The trust tests replay CDN-captured signed TUF metadata locally and verify
+real Metro 0.4.0 Sigstore fixtures offline. They do not demonstrate a live
+TUF refresh or an update from one published Metro release to another.
+
 ## Staged: Spaces with several agents, per-connection model lists and the desktop redesign at 4175475 (2026-11-25, project manager, local)
 
 A **gate on unreleased source**, run on Linux and reported by the project
@@ -2291,6 +2638,10 @@ server connection and sign-in weren't tested.
 **Not shown:** launching, rendering, input or sign-in on native Windows.
 
 ## Not demonstrated
+
+This is the historical gap list from the local QA cut, not the release
+status. See the [0.4.0 release record](#published-metro-040-2026-11-25-github-release-v040)
+for subsequent publication and native CI evidence.
 
 - Deployment behind a real OIDC provider (Ory Hydra, Authelia or authentik).
   Auth is covered by `crates/auth`'s tests against a local stand-in provider.

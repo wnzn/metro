@@ -6,12 +6,13 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../../test/fakeServer";
+import { launched } from "../../../test/launched";
 
 type F = ReturnType<typeof world>;
 type Act = { id: string; name: string; source: "agent" | "demo"; phase?: string };
 
 async function signedIntoAcme(f: F, user: "alice" | "bob" = "alice", options: { reducedMotion?: boolean } = {}) {
-  const app = await open("../../../App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, ...options });
+  const app = await open("../../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800, ...options });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
@@ -64,7 +65,19 @@ test("a live turn is one line with its current step that settles into the summar
   expect(shown(app, `id:activity-toggle:event:${result.id}`)).toBe(false);
   expect(shown(app, "text:/README\\.md/")).toBe(false);
   // The question and the final answer stay visible, with their reactions.
-  expect(shown(app, "text:@agent what is in the workspace?")).toBe(true);
+  const question = `id:event:${ask.id}`;
+  expect(shown(app, `${question} >> id:mention-token:${ask.id}:0 >> text:@agent`)).toBe(true);
+  // The native line wraps individual words. Each exact token occurs only in
+  // this row, so the screen-order slice below can't match a different row.
+  for (const word of ["what", "is", "in", "the", "workspace\\?"]) {
+    const token = `text:/^${word}\\s*$/`;
+    expect(app.count(`${question} >> ${token}`)).toBe(1);
+    expect(app.count(token)).toBe(1);
+  }
+  const words = app.texts();
+  const start = words.indexOf("what ");
+  expect(start).toBeGreaterThan(-1);
+  expect(words.slice(start, start + 5)).toEqual(["what ", "is ", "in ", "the ", "workspace?"]);
   expect(shown(app, `id:recipient:${ask.id}:agent`)).toBe(true);
   expect(shown(app, `id:react:${reply.id}`)).toBe(true);
   expect(shown(app, `id:react:${result.id}`)).toBe(false);
@@ -177,11 +190,12 @@ test("failed, cancelled and interrupted turns say so while collapsed; errors sta
 test("Demo is Runner activity, not thinking, and never the person's name", async () => {
   const f = world();
   const app = await signedIntoAcme(f);
-  // Test runner, beside the runner's status on Manage.
+  // Test runner, beside the runner's status in Space settings.
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
   await app.press("id:test-runner");
   await app.waitFor("text:/^Requested\\./");
-  await app.press("id:close-manage");
+  await app.press("id:space-settings-close");
   await app.waitFor("text:/^Runner (activity|is working…)$/");
   expect(shown(app, "text:/thinking/")).toBe(false);
   expect(shown(app, "text:Demo: workspace.list on the Space's runner")).toBe(true); // the request stays top-level

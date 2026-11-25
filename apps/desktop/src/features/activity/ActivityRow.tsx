@@ -17,7 +17,10 @@
 
 import { Clipboard, announce, signal } from "nsh";
 import type { JSX } from "nsh";
-import { isActiveRun, runBusy, runs, stopRun } from "../../store";
+import { isActiveRun, me, runBusy, runs, stopRun } from "../../store";
+import { webSearchSettingsAction } from "../../webSearch";
+import { WEB_PROVIDERS } from "../../api/webSearch";
+import type { WebToolNote } from "../../api/webSearch";
 import { Action, Badge, Column, Label, Row } from "../../ui";
 import { AgentMark, CodeOutput, DisclosureToggle, SummaryParts, ThinkingIndicator, TimelineEntry } from "../../ui/activity";
 import { stepPhase } from "./classify";
@@ -26,6 +29,10 @@ import { failureText } from "./failure";
 import type { ActivityGroup, Step, TimelineItem } from "./group";
 import { groupAccessibleLabel, liveTitle, groupOutcomeText, routeText, summaryParts, timeline } from "./group";
 import { FOLD_LINES, outputView } from "./output";
+import { webAttemptRows, webFailureText } from "./web";
+
+/** Old events without the server's durable attribution never get a shortcut. */
+const ownWebFailure = (note: WebToolNote) => !!note.starterId && note.starterId === me();
 
 export function ActivityGroupRow(props: {
   group: ActivityGroup;
@@ -66,6 +73,7 @@ export function ActivityGroupRow(props: {
   };
   const label = () => groupAccessibleLabel(g(), name());
   const mark = () => (g().source === "agent" ? <AgentMark picture={props.agentAvatar} /> : undefined);
+  const webFailure = () => g().steps.find((s) => s.activity.web?.note.failure)?.activity.web;
   return (
     <Column gap={2} padY={1} testID={`activity:${id()}`}>
       <Row align="center" gap={2}>
@@ -116,6 +124,11 @@ export function ActivityGroupRow(props: {
           )}
         </If>
       </Row>
+      <If when={expanded() ? null : webFailure()}>
+        {(f) => <Label variant="caption" color="danger" testID={`activity-web-failure:${id()}`}>
+          {webFailureText(f().note, ownWebFailure(f().note), f().offlineOwner)}
+        </Label>}
+      </If>
       <If when={hasDetails() && expanded()}>
         <Column gap={0} selectable testID={`activity-details:${id()}`}>
           <If when={g().pick}>
@@ -166,6 +179,7 @@ function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type:
       last={props.last}
       testID={`activity-step:${first().eventId}`}
     >
+      <If when={first().activity.web} else={<>
       <Row align="center" gap={2} wrap>
         <Label variant="strong">{props.item.name}</Label>
         <If when={props.item.args}>
@@ -193,7 +207,56 @@ function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type:
       <If when={!props.item.call && props.item.result && props.item.result.activity.details.length > 0 ? props.item.result : null}>
         {(r) => <StepOutput text={r().activity.details} stateKey={stateKey(r())} testID={`activity-output:${r().eventId}`} />}
       </If>
+      </>}>
+        <WebToolView item={props.item} groupKey={props.groupKey} />
+      </If>
     </TimelineEntry>
+  );
+}
+
+function WebToolView(props: { item: Extract<TimelineItem, { type: "tool" }>; groupKey: string }) {
+  const call = () => props.item.call;
+  const result = () => props.item.result;
+  const web = () => (result() ?? call())!.activity.web!;
+  const provider = () => web().note.provider;
+  const args = () => call()?.activity.details ?? "";
+  const own = () => ownWebFailure(web().note);
+  const foldKey = () => disclosureKey(disclosureScope(), props.groupKey, `web-args:${call()?.eventId}`);
+  return (
+    <Column gap={1}>
+      <Label variant="strong">{props.item.name}{provider() ? ` · ${WEB_PROVIDERS[provider()!]}` : ""}</Label>
+      <If when={args()}>
+        <Row>
+          <DisclosureToggle label={web().note.name === "web_search" ? "Query details" : "Page addresses"}
+            testID={`activity-web-args:${call()?.eventId}`} expanded={isOpen(foldKey())} onPress={() => toggle(foldKey())} />
+        </Row>
+        <If when={isOpen(foldKey())}>
+          <Label variant="body" testID={`activity-web-query:${call()?.eventId}`}>{args()}</Label>
+        </If>
+      </If>
+      <If when={result() && !web().note.failure && result()?.activity.details}>
+        {(count) => <Label variant="caption" testID={`activity-web-count:${result()?.eventId}`}>{count()}</Label>}
+      </If>
+      <Each of={webAttemptRows(web().note)} key={(a) => a.index}>
+        {(a) => <Label variant="caption" testID={a().switched ? "activity-websearch-rotated" : `activity-web-attempt:${a().index}`}>
+          {a().text}
+        </Label>}
+      </Each>
+      <If when={result() && web().note.failure}>
+        <Label variant="caption" color="danger" testID={`activity-web-failure:${result()?.eventId}`}>
+          {webFailureText(web().note, own(), web().offlineOwner)}
+        </Label>
+        <If when={own() && web().note.failure === "exhausted" &&
+          web().note.attempts.some((a) => a.mode === "keyless" && (a.outcome === "limited" || a.outcome === "out_of_credits"))}>
+          <Label variant="caption" color="muted">Check the provider’s terms before configuring an API key in Web search settings.</Label>
+        </If>
+        <If when={own() && (web().note.failure === "exhausted" || web().note.failure === "no_device")}>
+          <If when={webSearchSettingsAction()}>
+            {(action) => <Row><Action label="Open Web search" variant="ghost" testID="activity-open-websearch" onPress={() => { if (own()) action().open(); }} /></Row>}
+          </If>
+        </If>
+      </If>
+    </Column>
   );
 }
 
