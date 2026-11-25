@@ -721,6 +721,112 @@ for (const edit of [false, true]) {
   });
 }
 
+test("accepted files retire by key after a Space is revoked and rejoined, without touching newer staging or drafts", async () => {
+  const w = fixture();
+  const text = "accepted before losing access";
+  w.reply(text, { addressing_note: pickup }, 9_000);
+  const app = await launch(w);
+  const pick = async (name: string) => {
+    app.onPick(() => [{ name, type: "text/plain", data: new Uint8Array([65]) }]);
+    await app.press("id:attach");
+    await app.waitFor(`id:staged:${name}`);
+  };
+  await space(app);
+  await app.type("id:composer", "unrelated Acme draft");
+  await pick("unrelated.txt");
+  await space(app, "side");
+  await pick("accepted.txt");
+  // Let the next ordinary /spaces refresh happen after revocation,
+  // but before the accepted POST reply's ten-second timeout.
+  await app.clock!.runFor(5_000);
+  await send(app, text);
+  await app.waitUntil(() => w.sent.has(text));
+  const id = w.sent.get(text)!.id;
+  const members = w.f.state.spaces.get("side")!.members;
+  members.delete("alice");
+  await app.waitFor("id:space:side", { state: "gone", timeout: 3_000 });
+  members.add("alice");
+  await app.waitFor("id:space:side", { timeout: 6_000 });
+  await space(app, "side");
+  await app.waitFor(`id:event:${id}`);
+  await app.waitFor("id:staged:accepted.txt");
+  await pick("later.txt");
+  await app.type("id:composer", "a newer Side draft");
+  await app.waitFor("id:staged:accepted.txt", { state: "gone", timeout: 6_000 });
+  expect(app.shows("id:staged:later.txt")).toBe(true);
+  expect(app.value("id:composer")).toBe("a newer Side draft");
+  expect(app.shows(note(id))).toBe(false);
+  expect(w.uploads).toEqual(["accepted.txt"]);
+  expect(w.messages().map(p => p.body.asset_ids)).toEqual([["asset-accepted.txt"]]);
+  await space(app);
+  expect(app.shows("id:staged:unrelated.txt")).toBe(true);
+  expect(app.value("id:composer")).toBe("unrelated Acme draft");
+});
+
+test("a late accepted Space POST never retires a replacement account's draft or staging", async () => {
+  const w = fixture();
+  w.reply("Alice's accepted send", { addressing_note: pickup }, 8_000);
+  const app = await launch(w);
+  await space(app, "side");
+  app.onPick(() => [{ name: "same-name.txt", type: "text/plain", data: new Uint8Array([65]) }]);
+  await app.press("id:attach");
+  await app.waitFor("id:staged:same-name.txt");
+  await send(app, "Alice's accepted send");
+  await app.waitUntil(() => w.sent.has("Alice's accepted send"));
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+  await app.waitFor("id:connect-screen");
+  await signIn(app, "bob");
+  await space(app, "side");
+  await app.type("id:composer", "Bob's draft");
+  app.onPick(() => [{ name: "same-name.txt", type: "text/plain", data: new Uint8Array([66]) }]);
+  await app.press("id:attach");
+  await app.waitFor("id:staged:same-name.txt");
+  await app.clock!.runFor(8_200);
+  expect(app.value("id:composer")).toBe("Bob's draft");
+  expect(app.shows("id:staged:same-name.txt")).toBe(true);
+  expect(w.messages()).toHaveLength(1);
+  expect(w.uploads).toEqual(["same-name.txt"]);
+});
+
+test("a held positive Space list cannot resurrect a Space after newer denial, but a fresh list can", async () => {
+  const w = fixture();
+  w.deny("request denied after snapshot", 404, 300);
+  const base = w.network[get]!;
+  let armed = false;
+  let held = false;
+  w.network[get] = req => {
+    if (armed && !held && new URL(req.url).pathname === "/v1/spaces") {
+      held = true;
+      // Capture the actual membership before changing it, then hold the reply.
+      return { ...(base(req) as object), delay: 6_000 };
+    }
+    return base(req);
+  };
+  const app = await launch(w);
+  await space(app);
+  await space(app, "side"); // dispatch can target the already-cached room
+  await app.press("id:nav-chat");
+  armed = true;
+  await app.waitUntil(() => held, { timeout: 12_000 });
+  await dispatch(app, "request denied after snapshot");
+  await app.waitUntil(() => w.denied.has("request denied after snapshot"));
+  const members = w.f.state.spaces.get("side")!.members;
+  members.delete("alice");
+  await app.waitFor("id:space:side", { state: "gone", timeout: 2_000 });
+  await space(app);
+  await app.type("id:composer", "newer Acme draft");
+  await app.clock!.runFor(6_200);
+  expect(app.shows("id:space:side")).toBe(false);
+  expect(app.value("id:composer")).toBe("newer Acme draft");
+  expect(app.shows("text:hello from bob in acme")).toBe(true);
+  members.add("alice");
+  await app.clock!.runFor(12_000);
+  await app.waitFor("id:space:side");
+  expect(app.value("id:composer")).toBe("newer Acme draft");
+  await space(app, "side");
+});
+
 for (const save of [false, true]) {
   test(`an accepted Chat ${save ? "Save note" : "Send"} cleans up without overriding a newer poll denial`, async () => {
     const w = fixture();

@@ -207,6 +207,9 @@ const spaceEpoch = new Map<string, number>();
 // success proves both the room and its Space; a sibling proves only the Space.
 let accessSequence = 0;
 const verifiedAccess = new Map<string, number>();
+// Keep Space denials past purgeSpace: an older positive list may still be
+// in flight. A newer authoritative list can grant access again.
+const deniedSpaceAccess = new Map<string, number>();
 const accessProbes = new Map<string, { request: number }>();
 let chatAvailabilityRequest = 0;
 let chatProbeAfter = 0;
@@ -218,6 +221,12 @@ function verifyAccess(key: string, request: number) {
 function verifyRoomAccess(sid: string, rid: string, request: number) {
   verifyAccess(scopeKey(sid, ""), request);
   verifyAccess(scopeKey(sid, rid), request);
+}
+const deniedAtOrAfter = (sid: string, request: number) => (deniedSpaceAccess.get(sid) ?? 0) >= request;
+function recordSpaceDenial(sid: string, request: number) {
+  if (deniedAtOrAfter(sid, request) || newerAccess(scopeKey(sid, ""), request)) return false;
+  deniedSpaceAccess.set(sid, request);
+  return true;
 }
 
 // A successful but older POST may retire its draft, not undo a newer denial.
@@ -596,8 +605,10 @@ export async function createSpace(nameInput: string): Promise<boolean> {
     actionError.set(null);
   });
   try {
+    const request = nextAccessRequest();
     const space = await c.createSpace(name);
     if (!ok()) return false;
+    verifyAccess(scopeKey(space.id, ""), request);
     spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
     await enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
     kick();
@@ -621,6 +632,7 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
   navigationGeneration++;
   const currentSession = guard();
   const ok = guard(spaceId);
+  let request: number | undefined;
   batch(() => {
     clearTransient();
     view.set("room");
@@ -634,7 +646,7 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
   });
   try {
     if (!roomsBySpace()[spaceId]) {
-      const request = nextAccessRequest();
+      request = nextAccessRequest();
       const list = await c.listRooms(spaceId);
       if (!ok()) return;
       verifyAccess(scopeKey(spaceId, ""), request);
@@ -652,8 +664,13 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
       return;
     }
     const name = spaces().find((s) => s.id === spaceId)?.name ?? spaceId;
-    if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) purgeSpace(spaceId, true);
-    else purgeSpace(spaceId, false); // keep it listed; just don't keep half-loaded state
+    if (isAccessDenial(error)) {
+      if (request === undefined || !recordSpaceDenial(spaceId, request)) {
+        if (activeSpaceId() === spaceId && !activeRoomId()) activeRoomId.set(pickRoom(spaceId, roomsOf(spaceId)));
+        return;
+      }
+      purgeSpace(spaceId, true);
+    } else purgeSpace(spaceId, false); // keep it listed; just don't keep half-loaded state
     const back = previous.spaceId && spaces().some((s) => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
     batch(() => {
       activeSpaceId.set(back);
@@ -674,7 +691,13 @@ async function ensureRooms(spaceId: string): Promise<readonly Room[]> {
   if (!c) return EMPTY_ROOMS;
   const ok = guard(spaceId);
   const request = nextAccessRequest();
-  const list = await c.listRooms(spaceId);
+  let list: Room[];
+  try {
+    list = await c.listRooms(spaceId);
+  } catch (error) {
+    if (ok() && isAccessDenial(error)) dropLostSpace(spaceId, request, true);
+    throw error;
+  }
   if (!ok()) return EMPTY_ROOMS;
   verifyAccess(scopeKey(spaceId, ""), request);
   for (const r of list) verifyRoomAccess(spaceId, r.id, request);
@@ -1094,10 +1117,12 @@ async function sendDraft(intent: DraftSend): Promise<void> {
       origin = captureSendOrigin(c, to);
       origin.acknowledge(await c.sendMessage(sid!, rid!, body, ids, selected.choice));
     }
-    // The POST did succeed even if a concurrent denial made its private
-    // notice unusable. Retire only its own unchanged draft and file keys.
-    if (!origin.canRetireDraft()) return;
+    // Accepted files are identified by immutable staging keys, not by the
+    // current room epoch. Never leave them staged for a duplicate send after
+    // rejoin, and never touch a replacement account's staging.
+    if (!sameSession()) return;
     if (keys.length) attachments?.sent(scope, keys, to);
+    if (!origin.canRetireDraft()) return;
     if (activeScope() === scope && (chat ? draft() === submittedText : mentionDraft() === submittedDraft)) {
       // unless the user typed something new meanwhile
       batch(() => {
@@ -1664,6 +1689,7 @@ function endSession() {
   noticeEpochs.clear();
   pendingSenderNotices.clear();
   verifiedAccess.clear();
+  deniedSpaceAccess.clear();
   accessProbes.clear();
   chatAvailabilityRequest = 0;
   chatProbeAfter = 0;
@@ -1779,7 +1805,8 @@ async function handleLoopError(error: unknown): Promise<number | null> {
   return retryInMs;
 }
 
-function dropLostSpace(spaceId: string, show: boolean) {
+function dropLostSpace(spaceId: string, request: number, show: boolean) {
+  if (!recordSpaceDenial(spaceId, request)) return;
   const name = spaces().find(s => s.id === spaceId)?.name;
   batch(() => {
     purgeSpace(spaceId, true);
@@ -1814,7 +1841,7 @@ async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind:
     if (!current() || !visible) return;
     if (visible.some(s => s.id === spaceId)) verifyAccess(spaceScope, spaceRequest);
     else if (!newerAccess(spaceScope, spaceRequest)) {
-      dropLostSpace(spaceId, show);
+      dropLostSpace(spaceId, spaceRequest, show);
       return;
     }
     // The room read is a new observation. Access verified while the Space
@@ -1826,7 +1853,7 @@ async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind:
       if (list.some(r => r.id === roomId)) verifyRoomAccess(spaceId, roomId, roomRequest);
       else if (!newerAccess(scope, roomRequest)) dropLostRoom(spaceId, roomId, show);
     } catch (error) {
-      if (current() && isAccessDenial(error) && !newerAccess(spaceScope, roomRequest)) dropLostSpace(spaceId, show);
+      if (current() && isAccessDenial(error)) dropLostSpace(spaceId, roomRequest, show);
     }
   } finally {
     if (accessProbes.get(scope) === probe) accessProbes.delete(scope);
@@ -1883,6 +1910,40 @@ export function spaceRenamed(spaceId: string, name: string) {
   spaces.set(spaces().map((s) => (s.id === spaceId ? { ...s, name } : s)));
 }
 
+/** Merge a same-session membership snapshot with newer scoped evidence.
+ * Startup publishing a snapshot into an existing session must use the
+ * same request order; only a genuinely new session starts with no evidence. */
+function applySpaceList(list: readonly Space[], request: number) {
+  const previous = new Map(spaces().map(s => [s.id, s]));
+  const listed = new Set(list.map(s => s.id));
+  const next: Space[] = [];
+  batch(() => {
+    for (const s of list) {
+      if (deniedAtOrAfter(s.id, request)) continue;
+      const current = previous.get(s.id);
+      const key = scopeKey(s.id, "");
+      // A snapshot older than newer verified access doesn't replace its
+      // current listing (including role), even when both include the Space.
+      if (current && newerAccess(key, request)) next.push(current);
+      else {
+        verifyAccess(key, request);
+        next.push(s);
+      }
+    }
+    for (const [sid, s] of previous) {
+      if (listed.has(sid)) continue;
+      if (newerAccess(scopeKey(sid, ""), request)) next.push(s);
+      else dropLostSpace(sid, request, true);
+    }
+    // Even after eviction, a newer omission is evidence the Space is
+    // still gone, not a chance for an intermediate positive reply to win.
+    for (const sid of deniedSpaceAccess.keys()) {
+      if (!listed.has(sid)) recordSpaceDenial(sid, request);
+    }
+    spaces.set(next);
+  });
+}
+
 /** Reloads the Space list and the active Space's rooms. */
 async function refreshLists(force = false) {
   const c = client;
@@ -1893,13 +1954,7 @@ async function refreshLists(force = false) {
   const list = await c.listSpaces();
   if (!ok()) return;
   lastListsRefresh = Date.now();
-  const known = new Set(list.map((s) => s.id));
-  for (const s of list) verifyAccess(scopeKey(s.id, ""), request);
-  const previous = spaces();
-  const missing = previous.filter(s => !known.has(s.id));
-  const stillVerified = missing.filter(s => newerAccess(scopeKey(s.id, ""), request));
-  for (const s of missing) if (!newerAccess(scopeKey(s.id, ""), request)) dropLostSpace(s.id, true);
-  spaces.set([...list, ...stillVerified]);
+  applySpaceList(list, request);
   const active = activeSpaceId();
   if (active) {
     const okSpace = guard(active);
@@ -1910,7 +1965,7 @@ async function refreshLists(force = false) {
     } catch (error) {
       if (!okSpace()) return;
       if (isAccessDenial(error)) {
-        if (!newerAccess(scopeKey(active, ""), roomRequest)) dropLostSpace(active, true);
+        dropLostSpace(active, roomRequest, true);
         return;
       }
       throw error;
