@@ -12,7 +12,7 @@
 //   runner; never by name) and a Space's folder (which creates it on this
 //   computer) are POSTs, sent only from an explicit press. Adopting a chosen
 //   runner (`{runner_id}`) isn't offered here.
-// - Metro never attaches it: the Space owner does that in Manage Space. The
+// - Metro never attaches it without an explicit owner action. The
 //   folder is offered only for Spaces this user owns whose runner, by stable
 //   id, is this one.
 // - Separate from the per-Space dedicated "Local tools" switch.
@@ -21,7 +21,7 @@
 
 import { signal } from "nsh";
 import { BridgeError, scrub } from "../../device/bridge";
-import { apiClient, connectedTo, me, sessionGuard, spaces } from "../../store";
+import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, spaces } from "../../store";
 import { localRunnerCall } from "../localtools/localTools";
 
 export type InstalledRunnerState =
@@ -81,14 +81,24 @@ export function parseFolder(v: unknown, sid: string): RunnerFolder {
 
 /** The status, or null (hidden: no launcher, not requested, not the own server, unknown). */
 export const installedRunner = signal<InstalledRunner | null>(null);
+/** A bridge id verified against the current account's personal runners. */
+export const ownedInstalledRunner = signal<{ id: string; attachIfEmpty: boolean } | null>(null);
+export const checkingInstalledScope = signal(false);
+/** A provisioned (or temporarily unreachable) launcher worth watching for the offer. */
+export const installedRunnerStatusWatchable = signal(false);
+/** This session has had a supported local runner status, even if its bridge context is now missing. */
+export const installedRunnerSeen = signal(false);
 /** Owned Spaces whose runner is this one, by stable id. */
 export const runnerSpaces = signal<{ id: string; name: string }[]>([]);
+/** Serial of the last complete folder read for the current verified runner, if any. */
+export const installedFolderSnapshot = signal<number | null>(null);
 export const installedBusy = signal<null | "reconnect" | `folder:${string}`>(null);
 export const installedError = signal<string | null>(null);
 export const installedNotice = signal<string | null>(null);
 export const folders = signal<Record<string, RunnerFolder>>({});
 
 let gen = 0;
+let attachedSeq = 0;
 const sessionKey = () => `${connectedTo() ?? ""}\n${me() ?? ""}`;
 
 /** Still the same session and the latest request. */
@@ -99,13 +109,29 @@ function stillValid(): () => boolean {
   return () => mine === gen && key === sessionKey() && ok();
 }
 
-function reset() {
-  installedRunner.set(null);
+function clearAttached() {
   runnerSpaces.set([]);
   folders.set({});
+  installedFolderSnapshot.set(null);
+}
+
+function reset() {
+  installedRunner.set(null);
+  ownedInstalledRunner.set(null);
+  checkingInstalledScope.set(false);
+  clearAttached();
   installedError.set(null);
   installedNotice.set(null);
 }
+
+onSessionEnd(() => {
+  gen++;
+  inflight = null;
+  installedRunnerStatusWatchable.set(false);
+  installedRunnerSeen.set(false);
+  installedBusy.set(null);
+  reset();
+});
 
 function message(error: unknown, what: string): string {
   return error instanceof BridgeError ? error.message : `${what} didn't work.`;
@@ -114,45 +140,117 @@ function message(error: unknown, what: string): string {
 /** Which Spaces this user owns use this runner, by stable id (read-only GETs). */
 async function loadAttached(runnerId: string, valid: () => boolean): Promise<void> {
   const c = apiClient();
-  if (!c) return;
+  if (!c || !valid() || installedRunner()?.runner?.id !== runnerId || ownedInstalledRunner()?.id !== runnerId) return;
+  const seq = ++attachedSeq;
   const owned = spaces().filter((s) => s.role === "owner" && SPACE_ID_RE.test(s.id));
   const checks = await Promise.allSettled(owned.map(async (s) => ({ s, r: await c.getSpaceRunner(s.id) })));
-  if (!valid() || installedRunner()?.runner?.id !== runnerId) return;
+  if (!valid() || seq !== attachedSeq || installedRunner()?.runner?.id !== runnerId || ownedInstalledRunner()?.id !== runnerId) return;
   const list: { id: string; name: string }[] = [];
   for (const res of checks) {
     if (res.status === "fulfilled" && res.value.r?.kind === "registered" && res.value.r.id === runnerId) list.push({ id: res.value.s.id, name: res.value.s.name });
   }
   runnerSpaces.set(list);
+  if (checks.every((res) => res.status === "fulfilled")) installedFolderSnapshot.set(seq);
 }
 
-// One read per session at a time: the page may mount more than once as it opens.
-let inflight: { key: string; done: Promise<void> } | null = null;
+/** Don't allow an older folder-list read to undo a just-confirmed attachment. */
+export function recordAttachedFolder(space: { id: string; name: string }) {
+  attachedSeq++;
+  if (!runnerSpaces().some((s) => s.id === space.id)) runnerSpaces.set([...runnerSpaces(), space]);
+}
 
-/** Opening the page: read the status only. Never throws; unknown hides. */
-export function loadInstalledRunner(): Promise<void> {
+/** The owner deleted this registration. An older bridge read can't revive its controls. */
+export function refreshAfterInstalledRunnerDeletion(id: string) {
+  if (ownedInstalledRunner()?.id !== id) return;
+  gen++;
+  inflight = null;
+  ownedInstalledRunner.set(null);
+  clearAttached();
+  void loadInstalledRunner();
+}
+
+type FolderRead = { runnerId: string | undefined; wanted: () => boolean };
+type InstalledRead = { key: string; valid: () => boolean; folders: FolderRead[]; done: Promise<void> };
+// One bridge read per session at a time. Folder demand can join a status-only read.
+let inflight: InstalledRead | null = null;
+
+/** Read status and optionally folders. A caller can withdraw its folder demand before the fetch. */
+export function loadInstalledRunner(readFolders = true, wanted = () => true): Promise<void> {
   const key = sessionKey();
-  if (inflight && inflight.key === key) return inflight.done;
-  const done = readStatus().finally(() => {
-    if (inflight?.done === done) inflight = null;
-  });
-  inflight = { key, done };
-  return done;
+  if (installedBusy()) return Promise.resolve();
+  const demand = readFolders ? { runnerId: installedRunner()?.runner?.id, wanted } : null;
+  if (inflight?.key === key && inflight.valid()) {
+    if (demand) inflight.folders.push(demand);
+    return inflight.done;
+  }
+  const read: InstalledRead = { key, valid: stillValid(), folders: demand ? [demand] : [], done: Promise.resolve() };
+  inflight = read;
+  read.done = readStatus(read);
+  return read.done;
 }
 
-async function readStatus(): Promise<void> {
-  const call = localRunnerCall();
-  const valid = stillValid();
-  reset();
-  if (!call || !apiClient()) return;
-  let next: InstalledRunner | null;
+async function readStatus(read: InstalledRead): Promise<void> {
+  const { valid } = read;
   try {
-    next = parseInstalledRunner(await call("GET", "/v1/local-tools/runner"));
-  } catch {
-    next = null;
+    const { runner: next, watchable } = await readBridgeStatus();
+    if (!valid()) return;
+    if (next) installedRunnerSeen.set(true);
+    installedRunnerStatusWatchable.set(watchable);
+    if (!next || next.runner?.id !== installedRunner()?.runner?.id) reset();
+    installedRunner.set(next);
+    const id = next?.runner?.id;
+    if (!id) return;
+    const wantsFolders = () => valid() && read.folders.some((d) => (d.runnerId === undefined || d.runnerId === id) && d.wanted());
+    if (ownedInstalledRunner()?.id !== id || wantsFolders()) await loadInstalledScope(id, valid);
+    if (wantsFolders()) await loadAttached(id, wantsFolders);
+  } finally {
+    // Clear before resolving, so no caller can join after the last decision.
+    if (inflight === read) inflight = null;
   }
-  if (!valid()) return;
-  installedRunner.set(next);
-  if (next?.runner) await loadAttached(next.runner.id, valid);
+}
+
+/** Read the bridge again at the point of an explicit action, without changing the UI. */
+export async function readInstalledRunner(): Promise<InstalledRunner | null> {
+  return (await readBridgeStatus()).runner;
+}
+
+async function readBridgeStatus(): Promise<{ runner: InstalledRunner | null; watchable: boolean }> {
+  const call = localRunnerCall();
+  if (!call || !apiClient() || !me()) return { runner: null, watchable: false };
+  try {
+    const body = await call("GET", "/v1/local-tools/runner");
+    const runner = parseInstalledRunner(body);
+    // A definitive "not installed / not this workspace" doesn't need another
+    // read. An empty or incomprehensible answer may be transient.
+    const unavailable = isObj(body) && (body.requested === false || body.available === false);
+    return { runner, watchable: !unavailable };
+  } catch (error) {
+    const unsupported = error instanceof BridgeError && [404, 405].includes(error.status ?? 0);
+    return { runner: null, watchable: !unsupported };
+  }
+}
+
+async function loadInstalledScope(runnerId: string, valid: () => boolean) {
+  const c = apiClient();
+  if (!c) return;
+  checkingInstalledScope.set(true);
+  try {
+    const list = await c.listRunnerInventory();
+    if (!valid()) return;
+    if (list.runners.some((r) => r.id === runnerId && r.visibility === "personal" && r.canManage)) {
+      ownedInstalledRunner.set({ id: runnerId, attachIfEmpty: list.attachIfEmpty });
+    } else {
+      ownedInstalledRunner.set(null);
+      clearAttached();
+    }
+  } catch {
+    if (valid()) {
+      ownedInstalledRunner.set(null);
+      clearAttached();
+    }
+  } finally {
+    if (valid()) checkingInstalledScope.set(false);
+  }
 }
 
 /** The person pressed Reconnect and confirmed. */
@@ -166,15 +264,19 @@ export async function reconnectInstalledRunner(): Promise<void> {
   try {
     const next = parseInstalledRunner(await call("POST", "/v1/local-tools/runner/reconnect"));
     if (!valid()) return;
+    clearAttached();
     installedRunner.set(next);
-    folders.set({});
-    installedNotice.set("Reconnected. Attach it to a Space in that Space's Manage view if it isn't attached already.");
-    if (next?.runner) await loadAttached(next.runner.id, valid);
-    else runnerSpaces.set([]);
+    installedNotice.set("Reconnected. Choose Spaces without a runner below to attach it.");
+    if (next?.runner) {
+      await loadInstalledScope(next.runner.id, valid);
+      await loadAttached(next.runner.id, valid);
+    } else {
+      ownedInstalledRunner.set(null);
+    }
   } catch (error) {
     if (valid()) installedError.set(message(error, "Reconnecting this computer's runner"));
   } finally {
-    installedBusy.set(null);
+    if (valid()) installedBusy.set(null);
   }
 }
 
@@ -198,6 +300,6 @@ export async function showRunnerFolder(sid: string): Promise<void> {
   } catch (error) {
     if (valid()) installedError.set(message(error, "Opening the Space's folder"));
   } finally {
-    installedBusy.set(null);
+    if (valid()) installedBusy.set(null);
   }
 }

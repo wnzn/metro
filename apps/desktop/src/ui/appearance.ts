@@ -38,12 +38,14 @@ export const appearancePreference = () => preference();
 export const resolvedAppearance = () => colorScheme();
 
 /** Shows `value` at once and remembers it on this device. */
-export function setAppearancePreference(value: AppearancePreference) {
-  if (!isAppearancePreference(value)) return;
+let writes = Promise.resolve(true);
+export function setAppearancePreference(value: AppearancePreference): Promise<boolean> {
+  if (!isAppearancePreference(value)) return Promise.resolve(false);
   chosenThisSession = true;
   preference.set(value);
   setColorScheme(value);
-  Storage.setItem(APPEARANCE_KEY, value).catch(() => {});
+  writes = writes.then(() => Storage.setItem(APPEARANCE_KEY, value)).then(() => true, () => false);
+  return writes;
 }
 
 /**

@@ -193,7 +193,8 @@ test("a global lookup that found only files opens More in Documents & media, wit
   expect(app.shows(`id:quick-asset:${doc.id} >> text:.md`)).toBe(true);
   await app.press("id:quick-more");
   await app.waitFor("id:search-view");
-  await app.waitUntil(() => w.l.log.some((l) => l.path === "/v1/library/search"));
+  await app.waitFor("id:library-search-no-model");
+  expect(libSearches(w)).toEqual([]); // no acknowledged selection was displayed in the global box
   expect(app.value("id:top-search")).toBe("budget");
   expect(semantic(w)).toEqual([]); // not message search
 });
@@ -363,7 +364,8 @@ test("Down walks a full list of eight to More, which is last", async () => {
   for (let i = 0; i < 9; i++) await app.keyboard.press("down");
   await app.keyboard.press("enter"); // the ninth row: More results
   await app.waitFor("id:search-view");
-  await app.waitUntil(() => w.l.log.some((l) => l.path === "/v1/library/search")); // only files: Documents & media
+  await app.waitFor("id:library-search-no-model"); // only files: Documents & media
+  expect(libSearches(w)).toEqual([]);
 });
 
 test("a Chat message and a Space message with the same event id are two rows; the global box says files and messages", async () => {
@@ -392,7 +394,7 @@ test("a Chat message and a Space message with the same event id are two rows; th
   expect(app.shows("label:Search your documents and media; Return searches")).toBe(true);
 });
 
-const libSearches = (w: QW) => w.l.log.filter((l) => l.path === "/v1/library/search" && l.method === "POST").map((l) => JSON.parse(l.body!));
+const libSearches = (w: QW) => w.l.log.filter((l) => l.path === "/v1/library/search/selection" && l.method === "POST").map((l) => JSON.parse(l.body!));
 
 test("the Library page looks where its picker shows, and More and Return search there", async () => {
   const w = quickWorld();
@@ -412,7 +414,7 @@ test("the Library page looks where its picker shows, and More and Return search 
   await app.press("id:quick-more");
   await app.waitFor("id:search-view");
   await app.waitUntil(() => libSearches(w).length === 1);
-  expect(libSearches(w)[0]).toEqual({ query: "plan", scope: "personal", limit: 10 });
+  expect(libSearches(w)[0]).toEqual({ query: "plan", scope: "personal", limit: 10, selection_revision: "0" });
 
   // A Space: the quick lookup and an unselected Return stay in it.
   await app.press("id:nav-library");
@@ -428,7 +430,7 @@ test("the Library page looks where its picker shows, and More and Return search 
   await app.submit("id:top-search");
   await app.waitFor("id:search-view");
   await app.waitUntil(() => libSearches(w).length === 2);
-  expect(libSearches(w)[1]).toEqual({ query: "plan", scope: "space", space_id: "acme", limit: 10 });
+  expect(libSearches(w)[1]).toEqual({ query: "plan", scope: "space", space_id: "acme", limit: 10, selection_revision: "0" });
 });
 
 test("More from the general bar searches everything in its corpus, keeping the query, never an old Space or type filter", async () => {
@@ -454,7 +456,7 @@ test("More from the general bar searches everything in its corpus, keeping the q
   await app.press("id:quick-more");
   await app.waitFor("id:search-view");
   await app.waitUntil(() => libSearches(w).length === 1);
-  expect(libSearches(w)[0]).toEqual({ query: "budget", scope: "all", limit: 10 });
+  expect(libSearches(w)[0]).toEqual({ query: "budget", scope: "all", limit: 10, selection_revision: "0" });
   expect(app.value("id:top-search")).toBe("budget");
 
   // Files and messages: the box's own mode (back to Conversations), everything.

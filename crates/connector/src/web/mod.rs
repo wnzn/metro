@@ -217,6 +217,8 @@ pub enum GateStop {
     ProviderOff,
     CredentialChanged,
     KeysUnreadable,
+    BindingEnded,
+    ConsentRevoked,
 }
 
 /// A provider failure (with an optional cooldown hint in seconds), or a
@@ -712,6 +714,10 @@ pub const TURNED_OFF: &str = "web search is turned off on this computer";
 pub const SETTINGS_UNREADABLE: &str = "the web search settings on this computer can't be read";
 pub const KEYS_UNREADABLE: &str =
     "the saved web search keys on this computer can't be read; reset them in Settings → Web Search";
+pub(crate) const BINDING_ENDED: &str = "the web search session ended";
+const PROVIDER_TURNED_OFF: &str = "this web search provider is turned off";
+const TEST_CREDENTIAL_CHANGED: &str = "the web search credential changed during the test";
+const TEST_CONSENT_REVOKED: &str = "web search consent changed during the test";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Consent {
@@ -720,6 +726,24 @@ enum Consent {
     ProviderOff,
     /// The master switch is off, or the settings can't be read.
     Off,
+}
+
+fn consent_for(s: &settings::Settings, p: ProviderId) -> Consent {
+    if !s.enabled {
+        Consent::Off
+    } else if !s.providers.iter().any(|x| x.id == p && x.enabled) {
+        Consent::ProviderOff
+    } else {
+        Consent::Yes
+    }
+}
+
+fn require_test_consent(s: &settings::Settings, p: ProviderId) -> Result<(), &'static str> {
+    match consent_for(s, p) {
+        Consent::Yes => Ok(()),
+        Consent::ProviderOff => Err(PROVIDER_TURNED_OFF),
+        Consent::Off => Err(TURNED_OFF),
+    }
 }
 
 /// Per-attempt timeouts, always within the job's own deadline.
@@ -759,6 +783,42 @@ pub struct Engine {
     /// Serializes read-modify-write of the settings file.
     write: tokio::sync::Mutex<()>,
     clock: Clock,
+}
+
+/// A provider test's outcome, not yet saved. The desktop must authorize
+/// publication again under its binding lock after the network phase ends.
+pub(crate) struct ProviderTest {
+    provider: ProviderId,
+    consent_revision: settings::ConsentRevision,
+    credential: keys::TestCredential,
+    outcome: Outcome,
+    updates: settings::Updates,
+}
+
+impl ProviderTest {
+    /// Record under the binding lock and both on-disk mutation locks. Lock
+    /// order is binding → keys → settings; no network work happens here.
+    pub(crate) fn record<G>(
+        self,
+        dir: &Path,
+        publication: impl FnOnce() -> Result<G>,
+    ) -> Result<Outcome> {
+        let store = keys::KeyStore::new(dir);
+        store.locked(|| {
+            settings::apply_test(dir, self.provider, &self.updates, |s, revision| {
+                require_test_consent(s, self.provider).map_err(SafeError::new)?;
+                if revision != self.consent_revision {
+                    return Err(SafeError::new(TEST_CONSENT_REVOKED).into());
+                }
+                let (_, current) = store.test_credential(self.provider)?;
+                if current != self.credential {
+                    return Err(SafeError::new(TEST_CREDENTIAL_CHANGED).into());
+                }
+                publication()
+            })
+        })?;
+        Ok(self.outcome)
+    }
 }
 
 impl Engine {
@@ -905,7 +965,7 @@ impl Engine {
                     // Right before contacting this provider: still on, this
                     // provider still allowed, and its credential as it is
                     // now (another process may have changed it).
-                    match self.consent(Some(p)) {
+                    match self.consent(p) {
                         Consent::Yes => {}
                         Consent::ProviderOff => break,
                         Consent::Off => break 'rotation Err(TURNED_OFF),
@@ -920,25 +980,32 @@ impl Engine {
                         Mode::Keyless
                     };
                     let now = self.now();
-                    let mut push = |outcome: Outcome, until: Option<u64>| {
+                    let mut push = |outcome: Outcome,
+                                    until: Option<u64>,
+                                    contacted: Option<bool>| {
                         let mut a = json!({"provider": p.as_str(), "mode": mode.as_str(), "outcome": outcome.as_str()});
                         if let Some(u) = until {
                             a["until"] = json!(rfc3339(u));
                         }
+                        if let Some(contacted) = contacted {
+                            a["contacted"] = json!(contacted);
+                        }
                         attempts.push(a);
                     };
                     if key.is_none() && !p.keyless() {
-                        push(Outcome::SkippedNoKey, None);
+                        push(Outcome::SkippedNoKey, None, None);
                         break;
                     }
                     if let Some(k) = &key
                         && snapshot.key_rejected(p, &keys::fingerprint(k))
                     {
-                        push(Outcome::KeyRejected, None);
+                        // Keep the v1 outcome for older servers. The optional
+                        // flag tells newer clients no request used this key.
+                        push(Outcome::KeyRejected, None, Some(false));
                         break;
                     }
                     if let Some(until) = snapshot.cooldown_until(p, mode, now) {
-                        push(Outcome::SkippedCooldown, Some(until));
+                        push(Outcome::SkippedCooldown, Some(until), None);
                         break;
                     }
                     let left = deadline.saturating_duration_since(Instant::now());
@@ -950,7 +1017,7 @@ impl Engine {
                     let used = key.as_ref().map(keys::fingerprint);
                     let started = AtomicBool::new(false);
                     let gate = || {
-                        self.check_outbound(p, Some(p), used.as_deref())?;
+                        self.check_outbound(p, used.as_deref())?;
                         started.store(true, Ordering::Relaxed);
                         Ok(())
                     };
@@ -979,7 +1046,7 @@ impl Engine {
                     });
                     match result {
                         Ok(a) => {
-                            push(Outcome::Ok, None);
+                            push(Outcome::Ok, None, None);
                             updates.last.push((p, Outcome::Ok, now));
                             log(job_id, op, Some(p), Some(mode), "ok");
                             answer = Some((p, mode, a));
@@ -994,13 +1061,19 @@ impl Engine {
                             log(job_id, op, None, None, "saved keys unreadable; stopped");
                             break 'rotation Err(KEYS_UNREADABLE);
                         }
+                        Err(Failure::Stopped(GateStop::BindingEnded)) => {
+                            break 'rotation Err(BINDING_ENDED);
+                        }
+                        Err(Failure::Stopped(GateStop::ConsentRevoked)) => {
+                            break 'rotation Err(TEST_CONSENT_REVOKED);
+                        }
                         Err(Failure::Stopped(GateStop::CredentialChanged)) => {
                             // The mode belongs to the interrupted attempt, not
                             // its replacement. If the gate blocked its first
                             // request, no credential mode was used.
                             if started.load(Ordering::Relaxed) {
                                 let outcome = Outcome::CredentialChanged;
-                                push(outcome, None);
+                                push(outcome, None, None);
                                 log(job_id, op, Some(p), Some(mode), outcome.as_str());
                             }
                             if restarts == 0 {
@@ -1016,7 +1089,11 @@ impl Engine {
                                 if let Some(k) = &key {
                                     updates.rejected.push((p, keys::fingerprint(k)));
                                 }
-                                push(Outcome::KeyRejected, None);
+                                push(
+                                    Outcome::KeyRejected,
+                                    None,
+                                    started.load(Ordering::Relaxed).then_some(true),
+                                );
                                 break;
                             }
                             let secs = cooldown
@@ -1026,7 +1103,7 @@ impl Engine {
                             if let Some(u) = until {
                                 updates.cooldowns.push((p, mode, u, outcome));
                             }
-                            push(outcome, until);
+                            push(outcome, until, None);
                             break;
                         }
                     }
@@ -1077,13 +1154,8 @@ impl Engine {
     /// Keep the reason observed at the gate: re-reading after an adapter
     /// stops could miss a transient refusal or mistake corruption for a key
     /// change.
-    fn check_outbound(
-        &self,
-        p: ProviderId,
-        provider_consent: Option<ProviderId>,
-        used: Option<&str>,
-    ) -> Result<(), GateStop> {
-        match self.consent(provider_consent) {
+    fn check_outbound(&self, p: ProviderId, used: Option<&str>) -> Result<(), GateStop> {
+        match self.consent(p) {
             Consent::Yes => {}
             Consent::ProviderOff => return Err(GateStop::ProviderOff),
             Consent::Off => return Err(GateStop::TurnedOff),
@@ -1097,42 +1169,80 @@ impl Engine {
 
     /// Consent now, from the files as they are (any process may have
     /// changed them): the master switch, and `p`'s own switch.
-    fn consent(&self, p: Option<ProviderId>) -> Consent {
+    fn consent(&self, p: ProviderId) -> Consent {
         match settings::load(&self.dir) {
-            Ok(s) if !s.enabled => Consent::Off,
+            Ok(s) => consent_for(&s, p),
             Err(_) => Consent::Off,
-            Ok(s) => match p {
-                Some(p) if !s.providers.iter().any(|x| x.id == p && x.enabled) => {
-                    Consent::ProviderOff
-                }
-                _ => Consent::Yes,
-            },
         }
     }
 
-    /// One user-initiated test of `p` with a fixed query, ignoring (and not
-    /// setting) cooldowns. Returns the outcome word, or the fixed reason
-    /// nothing was sent (web search off, unreadable settings or keys).
-    pub async fn test_provider(&self, p: ProviderId) -> Result<Outcome, &'static str> {
-        match settings::load(&self.dir) {
-            Ok(s) if s.enabled => {}
-            Ok(_) => return Err(TURNED_OFF),
-            Err(_) => return Err(SETTINGS_UNREADABLE),
+    /// Run one explicit test without publishing any resulting state.
+    pub(crate) async fn probe_provider(
+        &self,
+        p: ProviderId,
+        admission: &(dyn Fn() -> Result<(), GateStop> + Sync),
+    ) -> Result<ProviderTest, &'static str> {
+        fn stopped(why: GateStop) -> &'static str {
+            match why {
+                GateStop::TurnedOff => TURNED_OFF,
+                GateStop::KeysUnreadable => KEYS_UNREADABLE,
+                GateStop::CredentialChanged => TEST_CREDENTIAL_CHANGED,
+                GateStop::ProviderOff => PROVIDER_TURNED_OFF,
+                GateStop::BindingEnded => BINDING_ENDED,
+                GateStop::ConsentRevoked => TEST_CONSENT_REVOKED,
+            }
         }
-        let key = self.current_key(p)?;
+        admission().map_err(stopped)?;
+        let (prefs, consent_revision) =
+            settings::test_snapshot(&self.dir, p).map_err(|_| SETTINGS_UNREADABLE)?;
+        require_test_consent(&prefs, p)?;
+        let store = keys::KeyStore::new(&self.dir);
+        let snapshot = || store.locked(|| store.test_credential(p));
+        let (key, credential) = snapshot().map_err(|_| KEYS_UNREADABLE)?;
         let key = key.as_ref();
         if key.is_none() && !p.keyless() {
-            return Ok(Outcome::SkippedNoKey);
+            return Ok(ProviderTest {
+                provider: p,
+                consent_revision,
+                credential,
+                outcome: Outcome::SkippedNoKey,
+                updates: settings::Updates::default(),
+            });
         }
         let mode = if key.is_some() {
             Mode::Key
         } else {
             Mode::Keyless
         };
-        // An explicit test of one provider: the master switch, and the same
-        // credential as when the test began.
-        let used = key.map(keys::fingerprint);
-        let gate = || self.check_outbound(p, None, used.as_deref());
+        // Every outbound send checks the master switch and the exact
+        // credential, then checks the captured binding as close to send as
+        // possible. In particular, MCP may send several messages in one poll.
+        let gate = || {
+            // Check one coherent key and preference snapshot, in the same
+            // lock order as publication. Both locks end before any send.
+            store
+                .locked(|| {
+                    let (_, current) = store.test_credential(p)?;
+                    let check = || {
+                        let (prefs, revision) = settings::test_snapshot(&self.dir, p)
+                            .map_err(|_| GateStop::TurnedOff)?;
+                        match consent_for(&prefs, p) {
+                            Consent::Yes => {}
+                            Consent::ProviderOff => return Err(GateStop::ProviderOff),
+                            Consent::Off => return Err(GateStop::TurnedOff),
+                        }
+                        if current != credential {
+                            return Err(GateStop::CredentialChanged);
+                        }
+                        if revision != consent_revision {
+                            return Err(GateStop::ConsentRevoked);
+                        }
+                        admission()
+                    };
+                    Ok(check())
+                })
+                .map_err(|_| GateStop::KeysUnreadable)?
+        };
         let op = Op::Search(SearchReq {
             query: "Metro web search test".into(),
             keywords: Vec::new(),
@@ -1150,12 +1260,7 @@ impl Engine {
         let outcome = match tokio::time::timeout(SEARCH_ATTEMPT, self.call(p, &op, &call)).await {
             Ok(Ok(_)) => Outcome::Ok,
             Ok(Err(Failure::Provider { outcome, .. })) => outcome,
-            Ok(Err(Failure::Stopped(why))) => match why {
-                GateStop::TurnedOff => return Err(TURNED_OFF),
-                GateStop::KeysUnreadable => return Err(KEYS_UNREADABLE),
-                GateStop::CredentialChanged => Outcome::CredentialChanged,
-                GateStop::ProviderOff => Outcome::SkippedDisabled,
-            },
+            Ok(Err(Failure::Stopped(why))) => return Err(stopped(why)),
             Err(_) => Outcome::Timeout,
         };
         let mut updates = settings::Updates::default();
@@ -1166,11 +1271,23 @@ impl Engine {
             updates.rejected.push((p, keys::fingerprint(k)));
         }
         if outcome == Outcome::Ok {
-            updates.cleared.push(p);
+            updates.cleared.push((p, mode));
         }
-        let _g = self.write.lock().await;
-        let _ = settings::apply(&self.dir, &updates);
-        Ok(outcome)
+        Ok(ProviderTest {
+            provider: p,
+            consent_revision,
+            credential,
+            outcome,
+            updates,
+        })
+    }
+
+    #[cfg(test)]
+    async fn test_provider(&self, p: ProviderId) -> Result<Outcome, &'static str> {
+        let result = self.probe_provider(p, &|| Ok(())).await?;
+        result
+            .record(&self.dir, || Ok(()))
+            .map_err(|_| "the provider test result was not applied")
     }
 
     /// Serialize a settings change made elsewhere (the bridge) with jobs.

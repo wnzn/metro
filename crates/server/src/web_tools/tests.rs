@@ -264,7 +264,7 @@ fn summaries_name_the_provider_and_every_attempt_never_page_text() {
     );
     assert!(
         s.contains(
-            "Tried: Tavily (your key) key rejected → Parallel (your key) credential changed → Parallel (free) ok"
+            "Tried: Tavily (your key) key rejected (contact not recorded) → Parallel (your key) credential changed → Parallel (free) ok"
         ),
         "{s}"
     );
@@ -275,18 +275,49 @@ fn summaries_name_the_provider_and_every_attempt_never_page_text() {
 }
 
 #[test]
+fn attempt_contact_marker_is_additive_and_old_rejections_stay_ambiguous() {
+    let a = normalize(
+        Operation::WebSearch,
+        &json!({"v": 1, "provider": "tavily", "mode": "keyless", "attempts": [
+            {"provider": "exa", "mode": "key", "outcome": "key_rejected", "contacted": true},
+            {"provider": "parallel", "mode": "key", "outcome": "key_rejected", "contacted": false},
+            {"provider": "firecrawl", "mode": "key", "outcome": "key_rejected"},
+            {"provider": "tinyfish", "mode": "key", "outcome": "key_rejected", "contacted": "not a boolean"},
+            {"provider": "tavily", "mode": "keyless", "outcome": "ok", "contacted": false}
+        ], "results": []}),
+    ).unwrap();
+    let wire = json!(a.attempts);
+    assert_eq!(wire[0]["contacted"], true);
+    assert_eq!(wire[1]["contacted"], false);
+    assert!(
+        wire.as_array().unwrap()[2..]
+            .iter()
+            .all(|v| v.get("contacted").is_none())
+    );
+    // Persisted old events deserialize without manufacturing a contact.
+    let old = serde_json::from_value::<Attempt>(wire[2].clone()).unwrap();
+    assert_eq!(old.contacted, None);
+    let summary = summary(Operation::WebSearch, &a);
+    assert!(summary.contains("Exa (your key) provider rejected the key"));
+    assert!(summary.contains("Parallel (your key) skipped (saved key was already rejected)"));
+    assert!(summary.contains("Firecrawl (your key) key rejected (contact not recorded)"));
+}
+
+#[test]
 fn exhausted_text_lists_each_reason() {
     let attempts = vec![
         Attempt {
             provider: "tinyfish".into(),
             mode: "key".into(),
             outcome: "skipped_no_key".into(),
+            contacted: None,
             until: None,
         },
         Attempt {
             provider: "firecrawl".into(),
             mode: "keyless".into(),
             outcome: "out_of_credits".into(),
+            contacted: None,
             until: None,
         },
     ];
