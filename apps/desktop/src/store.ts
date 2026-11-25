@@ -984,32 +984,44 @@ export async function followUp(run: Run): Promise<void> {
 }
 
 export async function setDispatchSpace(spaceId: string, roomId?: string): Promise<void> {
-  if (!spaces().some((s) => s.id === spaceId)) return;
+  const c = client;
+  if (!c || !spaces().some((s) => s.id === spaceId)) return;
+  const ok = guard(spaceId);
+  const pending = { spaceId, roomId: null };
   dispatchError.set(null);
   dispatchNotice.set(null);
-  dispatchTarget.set({ spaceId, roomId: roomId ?? null });
+  dispatchTarget.set(pending);
   try {
-    const list = await ensureRooms(spaceId);
-    const current = dispatchTarget();
-    if (current?.spaceId !== spaceId) return;
-    const chosen = roomId && list.some((r) => r.id === roomId) ? roomId : pickRoom(spaceId, list);
-    dispatchTarget.set({ spaceId, roomId: chosen });
+    // Follow up at the exact requested room or thread. A cached list can
+    // miss a new thread or still contain one that no longer exists.
+    const list = roomId === undefined ? await ensureRooms(spaceId) : await c.listRooms(spaceId);
+    if (!ok() || dispatchTarget() !== pending) return;
+    if (roomId === undefined) {
+      dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
+    } else {
+      roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+      if (list.some(r => r.id === roomId)) dispatchTarget.set({ spaceId, roomId });
+      else dispatchError.set("That room or thread is no longer available. Choose another destination.");
+    }
   } catch (error) {
-    if (dispatchTarget()?.spaceId === spaceId) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+    if (ok() && dispatchTarget() === pending) dispatchError.set(describe(error, "Could not load that Space's rooms"));
   }
 }
 
 export function setDispatchRoom(roomId: string) {
   const t = dispatchTarget();
-  if (t) dispatchTarget.set({ spaceId: t.spaceId, roomId });
+  if (t && roomsBySpace()[t.spaceId]?.some(r => r.id === roomId)) {
+    dispatchTarget.set({ spaceId: t.spaceId, roomId });
+    dispatchError.set(null);
+  }
 }
 
 /** Sends the dispatch draft to the chosen Space and room and asks that Space's agent. */
 export async function sendDispatch(): Promise<void> {
-  const text = dispatchDraft().trim();
+  const text = dispatchDraft();
   const target = dispatchTarget();
   const c = client;
-  if (!text || !target?.roomId || !c || dispatching()) return;
+  if (!text.trim() || !target?.roomId || !c || dispatching()) return;
   const space = spaces().find((s) => s.id === target.spaceId);
   const room = roomsBySpace()[target.spaceId]?.find((r) => r.id === target.roomId);
   if (!space || !room) {
@@ -1027,7 +1039,7 @@ export async function sendDispatch(): Promise<void> {
     // mention composer. Its text cannot add recipients implicitly.
     await c.sendMessage(target.spaceId, target.roomId, { text, invoke_agent: true });
     if (!ok()) return;
-    if (dispatchDraft().trim() === text) dispatchDraft.set("");
+    if (dispatchDraft() === text) dispatchDraft.set("");
     dispatchNotice.set(`Sent to the agent in ${space.name} › #${room.name}.`);
     lastRunsRefresh = 0;
     kick();
