@@ -51,10 +51,12 @@ test("Chat Return sends directly with the picked model, even with @text; Save no
   await app.submit("id:composer");
   await app.waitUntil(() => posts().length === 1);
   expect(posts()[0]!.body).toEqual({ text: "Please review", invoke_agent: true, ...chosen });
-  await app.type("id:composer", "remember tomorrow");
+  await app.type("id:composer", "@agent remember tomorrow");
+  expect(app.enabled("id:save-note")).toBe(true);
   await app.press("text:Save note");
   await app.waitUntil(() => posts().length === 2);
-  expect(posts()[1]!.body).toEqual({ text: "remember tomorrow", invoke_agent: false });
+  expect(posts()[1]!.body).toEqual({ text: "@agent remember tomorrow", save_note: true });
+  expect(f.state.events.get("chat:alice")!.at(-1)).toMatchObject({ kind: "message", audience: "room" });
   await app.type("id:composer", "@bob please review");
   await app.submit("id:composer");
   await app.waitUntil(() => posts().length === 3);
@@ -96,14 +98,43 @@ test("with System One available, Send still asks directly; a stale pin blocks Se
   await app.press("id:composer-model");
   await app.waitFor("id:composer-model-options");
   await app.press("text:Done");
-  await app.type("id:composer", "keep my draft");
+  // Rust treats NEL as whitespace, so legacy false + this text would ask.
+  const text = "keep this\u0085@agent as literal text";
+  expect(composerAddress(text).agent).toBe(false);
+  await app.type("id:composer", text);
   await app.press("id:send");
   await app.waitFor("id:action-error");
   expect(posts()).toHaveLength(1);
-  expect(app.value("id:composer")).toBe("keep my draft");
+  expect(app.value("id:composer")).toBe(text);
   await app.press("id:save-note");
   await app.waitUntil(() => posts().length === 2);
-  expect(posts()[1]!.body).toEqual({ text: "keep my draft", invoke_agent: false });
+  expect(posts()[1]!.body).toEqual({ text, save_note: true });
+  expect(f.state.events.get("chat:alice")!.at(-1)).toMatchObject({ kind: "message", audience: "room" });
+});
+
+test("an older server rejects Save note without any retry, keeping the draft", async () => {
+  const { f, posts } = setup();
+  const key = `POST ${BASE}/v1/*`;
+  const post = f.network[key]!;
+  const attempts: unknown[] = [];
+  f.network[key] = req => {
+    if (new URL(req.url).pathname === "/v1/chat/messages") {
+      const body = JSON.parse(req.body!);
+      attempts.push(body);
+      if ("save_note" in body) return { status: 422, body: { error: "unknown field `save_note`" } };
+    }
+    return post(req);
+  };
+  const app = await chat(f);
+  const text = "keep this\u0085@agent as literal text";
+  await app.type("id:composer", text);
+  await app.press("id:save-note");
+  await app.waitFor("text:/Update Metro Server to use Save note/");
+  expect(app.value("id:composer")).toBe(text);
+  expect(app.enabled("id:save-note")).toBe(true);
+  expect(attempts).toEqual([{ text, save_note: true }]);
+  expect(posts()).toHaveLength(0);
+  expect(f.state.events.get("chat:alice") ?? []).toEqual([]);
 });
 
 test("a file-only Chat send starts a turn using the pinned model", async () => {

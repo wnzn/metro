@@ -974,6 +974,9 @@ pub struct ChatMessage {
     /// false saves a note unless the message expressly mentions `@agent`.
     #[serde(default = "chat_invokes_agent")]
     invoke_agent: bool,
+    /// Explicit Save note: takes precedence over the legacy flag and text.
+    #[serde(default)]
+    save_note: bool,
     /// Answer with this one of the sender's own model connections instead of
     /// their default. Never falls back to the default or the server model.
     #[serde(default)]
@@ -989,6 +992,18 @@ fn chat_invokes_agent() -> bool {
     true
 }
 
+impl ChatMessage {
+    fn recipients(&self, text: &str) -> ApiResult<Vec<Mention>> {
+        if self.save_note {
+            Ok(Vec::new())
+        } else if self.invoke_agent {
+            Ok(vec![Mention::Agent])
+        } else {
+            mentions::resolve(text, &[], false, &[]).map_err(ApiError::bad_request)
+        }
+    }
+}
+
 pub async fn chat_message(
     State(state): State<AppState>,
     who: Human,
@@ -996,24 +1011,28 @@ pub async fn chat_message(
 ) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
     let Json(body) = body?;
     let text = check_message(&state, &who.id, None, &body.text, &body.asset_ids).await?;
-    // A normal Chat send is already addressed to the agent. Only the legacy
-    // note path needs the textual mention rule, and Chat has no other members.
-    let resolved = if body.invoke_agent {
-        vec![Mention::Agent]
-    } else {
-        mentions::resolve(&text, &[], false, &[]).map_err(ApiError::bad_request)?
-    };
+    let resolved = body.recipients(&text)?;
     let addressing = Addressing::of(&resolved);
-    let chosen = check_choice(
-        &state,
-        &who,
-        None,
-        body.provider_connection_id,
-        body.model_id,
-        body.reasoning_effort,
-        addressing,
-    )
-    .await?;
+    let chosen = if body.save_note {
+        if body.provider_connection_id.is_some()
+            || body.model_id.is_some()
+            || body.reasoning_effort.is_some()
+        {
+            return Err(ApiError::bad_request("a note cannot select a model"));
+        }
+        None
+    } else {
+        check_choice(
+            &state,
+            &who,
+            None,
+            body.provider_connection_id,
+            body.model_id,
+            body.reasoning_effort,
+            addressing,
+        )
+        .await?
+    };
     let settings = if addressing == Addressing::Agent && chosen.is_none() {
         Some(
             routing::preferences(&state, &who.id)
@@ -1076,6 +1095,24 @@ pub async fn chat_message(
             routing_note: None,
         }),
     ))
+}
+
+#[cfg(test)]
+#[test]
+fn explicit_chat_note_never_resolves_legacy_mentions() {
+    // Rust recognizes U+0085 as whitespace; JavaScript's \s doesn't.
+    for text in ["@agent ping", "line\u{0085}@agent ping"] {
+        let legacy: ChatMessage =
+            serde_json::from_value(json!({"text": text, "invoke_agent": false})).unwrap();
+        assert_eq!(legacy.recipients(text).unwrap(), [Mention::Agent]);
+        for invoke_agent in [false, true] {
+            let note: ChatMessage = serde_json::from_value(
+                json!({"text": text, "invoke_agent": invoke_agent, "save_note": true}),
+            )
+            .unwrap();
+            assert!(note.recipients(text).unwrap().is_empty());
+        }
+    }
 }
 
 // ---- Runs ----

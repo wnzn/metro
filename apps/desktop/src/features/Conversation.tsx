@@ -38,6 +38,7 @@ import {
   REACTION_EMOJI,
   reactionPending,
   retryNow,
+  saveChatNote,
   send,
   sending,
   setDraft,
@@ -677,11 +678,12 @@ export function Composer(props: {
   // A Space Ask needs a typed question; Chat Send can start a turn with files alone.
   const canAsk = () => ready() && draft().trim().length > 0;
   const personal = () => mainPlace() === "chat";
-  const addressed = computed(() => composerAddress(draft(), personal() ? [] : (members() ?? []).map(m => m.userId)));
-  const toAgent = () => addressed().agent || (!personal() && mentions().some(m => m.kind === "agent"));
+  const toSpaceAgent = () => !personal() && (
+    composerAddress(draft(), (members() ?? []).map(m => m.userId)).agent || mentions().some(m => m.kind === "agent")
+  );
   const post = (ask: boolean) => {
     if (!(ask && !personal() ? canAsk() : canSend())) return;
-    if (ask || (draft().trim() && toAgent())) {
+    if (ask || (draft().trim() && toSpaceAgent())) {
       const { error, choice } = choiceForTurn();
       if (error) { actionError.set(error); return; }
       void send(ask, choice, ask ? props.askAgentId : undefined);
@@ -750,18 +752,15 @@ export function Composer(props: {
                 />
               </>
             }>
-              {/* A legacy note with an explicit @agent mention would ask the agent. */}
-              <If when={!toAgent()}>
-                <SendButton
-                  testID="save-note"
-                  note
-                  accessibilityLabel="Save note without asking the agent"
-                  tooltip="Save note without asking the agent"
-                  busy={sending() === "message"}
-                  disabled={!canSend()}
-                  onPress={() => post(false)}
-                />
-              </If>
+              <SendButton
+                testID="save-note"
+                note
+                accessibilityLabel="Save note without asking the agent"
+                tooltip="Save note without asking the agent"
+                busy={sending() === "message"}
+                disabled={!canSend()}
+                onPress={() => void saveChatNote()}
+              />
               <SendButton
                 testID="send"
                 accessibilityLabel={hasFiles() ? "Send to your agent. The agent cannot read attached files." : "Send to your agent"}

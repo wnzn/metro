@@ -426,8 +426,9 @@ export function fakeServer() {
         return ok({ events: state.events.get(key)!.filter((e) => state.ignoreCursor || e.id > after) });
       }
       if (path === "/v1/chat/messages") {
-        post(key, { kind: "message", actor: user, text: body.text });
-        if (body.invoke_agent !== false) post(key, { kind: "agent", actor: "agent", text: `(agent) re: ${body.text}` });
+        const asks = body.save_note !== true && body.invoke_agent !== false;
+        post(key, { kind: "message", actor: user, text: body.text, audience: asks ? "agent" : "room" });
+        if (asks) post(key, { kind: "agent", actor: "agent", text: `(agent) re: ${body.text}` });
         return ok({}, 202);
       }
       if ((r = m(/^\/v1\/chat\/events\/(\d+)\/reactions$/))) {

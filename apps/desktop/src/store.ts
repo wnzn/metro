@@ -746,7 +746,22 @@ export const ASK_NEEDS_TEXT = "Type a question to ask the agent. Attached files 
  * message may be files only, unless it asks an agent in a Space.
  */
 export async function send(invokeAgent: boolean, choice?: TurnModelChoice, agentId?: string): Promise<void> {
+  await sendDraft({ kind: "message", invokeAgent, choice, agentId });
+}
+
+export async function saveChatNote(): Promise<void> {
+  await sendDraft({ kind: "chat-note" });
+}
+
+type DraftSend =
+  | { kind: "message"; invokeAgent: boolean; choice?: TurnModelChoice; agentId?: string }
+  | { kind: "chat-note" };
+
+async function sendDraft(intent: DraftSend): Promise<void> {
   const chat = basePlace() === "chat";
+  const saveNote = intent.kind === "chat-note";
+  if (saveNote && !chat) return;
+  const { invokeAgent, choice, agentId } = saveNote ? { invokeAgent: false } : intent;
   const text = draft().trim();
   const sid = activeSpaceId();
   const rid = activeRoomId();
@@ -791,7 +806,8 @@ export async function send(invokeAgent: boolean, choice?: TurnModelChoice, agent
       ids = up.ids;
       keys = up.keys;
     }
-    if (chat) await c.sendChatMessage(text, invokeAgent, ids, choice);
+    if (saveNote) await c.saveChatNote(text, ids);
+    else if (chat) await c.sendChatMessage(text, ids, choice);
     else await c.sendMessage(sid!, rid!, text, invokeAgent, sentMentions, ids, choice, invokeAgent ? agentId : undefined);
     if (!ok()) return;
     if (keys.length) attachments?.sent(scope, keys, to);
@@ -813,9 +829,9 @@ export async function send(invokeAgent: boolean, choice?: TurnModelChoice, agent
     kick();
   } catch (error) {
     if (!here()) return;
-    handleActionError(error, invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", chat ? undefined : sid!);
+    handleActionError(error, saveNote ? "Could not save the note" : invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", chat ? undefined : sid!);
     const shown = actionError();
-    if (files && shown) actionError.set(`${shown} Its files are already in the Library; Send again won't upload them twice.`);
+    if (files && shown) actionError.set(`${shown} Its files are already in the Library; ${saveNote ? "Save note" : "Send"} again won't upload them twice.`);
   } finally {
     if (sameSession()) sending.set(null);
   }

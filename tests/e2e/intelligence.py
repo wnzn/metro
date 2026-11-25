@@ -527,9 +527,23 @@ def exercise_chat(run, classifier, default, routed):
     require(route["addressed_by"] == "explicit" and route.get("case_key") == "causal_review",
             "Chat did not preserve its direct attribution and separate use-case routing")
     assert_questions(run.systemone, before[0], ROUTED, (("use_case", "choice"),))
+    for text in ("@agent is a literal note", "separator\u0085@agent is also a literal note"):
+        before = run.post_counts()
+        note = run.call("alice", "POST", f"{CHAT}/messages", body={"text": text, "save_note": True},
+                        expect=(202,), read_json=True)
+        require(note["text"] == text and note["mentions"] == [] and note["audience"] == "room"
+                and note.get("addressing_note") is None and note.get("routing_note") is None,
+                "Save note parsed a recipient or routed the text")
+        run.expect_no_run("alice", CHAT, note["id"], before, "explicit personal note")
+
+    # U+0085 is a boundary in the server's legacy parser, unlike JS's \s.
+    # Leave that contract in place only for clients still using the old flag.
     before = run.post_counts()
-    event = run.post("alice", CHAT, "Remember this without asking.", invoke_agent=False)
-    run.expect_no_run("alice", CHAT, event, before, "explicit personal note")
+    text = "legacy separator\u0085@agent please review"
+    event = run.post("alice", CHAT, text, invoke_agent=False)
+    route = run.expect_reply("alice", CHAT, event, run.routed, text)
+    require(route["addressed_by"] == "explicit", "legacy @agent did not start a turn")
+    assert_questions(run.systemone, before[0], text, (("use_case", "choice"),))
 
 
 def exercise_space_routing(run, space, default, routed):

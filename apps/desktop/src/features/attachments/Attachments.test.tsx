@@ -95,6 +95,22 @@ test("Chat: a file-only message goes to my personal Library; the file opens in t
   expect(read.url).not.toContain(TOKENS.alice!);
 });
 
+test("Chat: Save note with files posts only note intent, even with a literal @agent", async () => {
+  const w = attachmentWorld();
+  const app = await signIn(w);
+  await app.waitFor("id:chat-view");
+  app.onPick(() => [NOTE]);
+  await app.press("id:attach");
+  await app.waitFor("id:staged:notes.txt");
+  await app.type("id:composer", "@agent is literal");
+  await app.press("id:save-note");
+  await app.waitFor("id:attachments", { state: "gone" });
+  expect(posts(w).at(-1)!.body).toEqual({
+    text: "@agent is literal", save_note: true, asset_ids: [w.l.assets[0]!.id],
+  });
+  expect(w.f.state.events.get("chat:alice")).toMatchObject([{ kind: "message", audience: "room" }]);
+});
+
 test("Ask agent with files sends the typed question; the files are saved, the model gets text", async () => {
   const w = attachmentWorld();
   const app = await inAcme(w);

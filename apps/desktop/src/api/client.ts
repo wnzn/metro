@@ -766,11 +766,26 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendChatMessage(text: string, invokeAgent: boolean, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<void> {
-      const body: Record<string, unknown> = { text, invoke_agent: invokeAgent, ...turnModelBody(choice) };
+    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<void> {
+      // Text sends also ask the agent on servers that require the legacy flag.
+      const body: Record<string, unknown> = { text, invoke_agent: true, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
       await request("POST", "/v1/chat/messages", body);
+    },
+
+    async saveChatNote(text: string, assetIds?: readonly string[]): Promise<void> {
+      const ids = assetIdsBody(assetIds);
+      try {
+        await request("POST", "/v1/chat/messages", { text, save_note: true, ...(ids ? { asset_ids: ids } : {}) });
+      } catch (error) {
+        // Older servers reject the unknown field while decoding the request.
+        // Never fall back to invoke_agent: false: a mention could still start work.
+        if (error instanceof ApiError && error.status === 422) {
+          throw new ApiError("http", "Update Metro Server to use Save note. Your draft was kept and was not sent to the agent.", 422);
+        }
+        throw error;
+      }
     },
 
     async listRuns(): Promise<Run[]> {

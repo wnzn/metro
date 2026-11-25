@@ -825,6 +825,56 @@ async fn chat_is_direct_with_or_without_the_legacy_flag_but_notes_stay_quiet() {
 }
 
 #[tokio::test]
+async fn explicit_chat_notes_do_not_resolve_mentions_or_route_with_both_opt_ins_set() {
+    let h = H::start().await;
+    assert_eq!(
+        h.put_routing("alice", routing_on(true, true)).await.0,
+        StatusCode::OK
+    );
+    for text in [
+        "@agent review this code",
+        "Note\u{0085}@agent review this code",
+    ] {
+        let note = h
+            .say("alice", None, json!({"text": text, "save_note": true}))
+            .await;
+        assert_eq!(note["text"], text);
+        assert_eq!(note["mentions"], json!([]));
+        assert_eq!(note["audience"], "room");
+        assert_eq!(note["addressing_note"], Value::Null);
+        assert_eq!(note["routing_note"], Value::Null);
+        h.quiet_after("alice", None, note["id"].as_i64().unwrap())
+            .await;
+    }
+
+    // A note cannot ask for a model, even if the text looks like a request.
+    let (status, error) = h
+        .post(
+            "alice",
+            "/v1/chat/messages",
+            json!({"text": "@agent hi", "save_note": true, "provider_connection_id": id(BOBS)}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(error["error"], "a note cannot select a model");
+    assert_eq!(h.events("alice", None).await.len(), 2);
+    assert!(h.events("bob", None).await.is_empty());
+    assert_eq!(h.fake.calls(), 0);
+    assert!(h.model_calls().is_empty());
+
+    let sid = h.space("Space compatibility").await;
+    let (status, _) = h
+        .post(
+            "alice",
+            &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+            json!({"text": "@agent hi", "save_note": true}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+    assert!(h.events("alice", Some(&sid)).await.is_empty());
+}
+
+#[tokio::test]
 async fn failed_classification_is_returned_only_on_the_senders_post() {
     let h = H::start().await;
     let sid = h.space("private classifier notes").await;

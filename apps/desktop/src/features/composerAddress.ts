@@ -1,6 +1,5 @@
 // Mirror the server's text boundaries in crates/server/src/mentions.rs.
-// Personal Chat has no member list: a handle that looks like a person's is
-// enough to keep Return from explicitly asking on their behalf.
+// Used for selecting a model in a Space, never for deciding if a Chat draft is a note.
 export function composerAddress(text: string, memberIds: readonly string[] = []) {
   if (!text.includes("@")) return { agent: false, people: false };
   const fenced: [number, number][] = [];

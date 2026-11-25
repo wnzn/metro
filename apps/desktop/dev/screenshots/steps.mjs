@@ -158,7 +158,7 @@ const scenarios = {
     `await app.press("id:nav-chat")`,
     `await app.waitFor("id:runs-aside", { timeout: 10000 })`,
     `await app.type("id:composer", "I'll follow the workspace audit from the runs panel. Please acknowledge.")`,
-    `await app.press("id:ask-agent")`,
+    `await app.press("id:send")`,
     `await app.waitFor("text:👀", { timeout: 20000 })`,
     `await app.waitFor("text:Acme › #workspace-audit", { timeout: 20000 })`,
     `await app.wait(800)`,

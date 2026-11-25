@@ -59,7 +59,7 @@ export function attachmentWorld() {
     const key = sid === null ? `chat:${user}` : `${sid}/${decodeURIComponent(room![2]!)}`;
     if (!f.state.events.has(key)) f.state.events.set(key, []);
     f.state.log.push({ user, method: "POST", path, body });
-    const asks = chat ? body.invoke_agent !== false : body.invoke_agent === true;
+    const asks = chat ? body.save_note !== true && body.invoke_agent !== false : body.invoke_agent === true;
     f.post(key, { kind: "message", actor: user, actor_id: user, text: body.text ?? "", attachments: files, audience: asks ? "agent" : "room" } as any);
     if (asks) f.post(key, { kind: "agent", actor: "agent", text: `(agent) re: ${body.text}` });
     return { status: 202, body: {} };

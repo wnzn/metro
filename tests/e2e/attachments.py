@@ -161,11 +161,12 @@ def journey(server_binary, timeout):
         s.call("alice", "POST", f"{CHAT}/messages", expect=(400,),
                body={"text": "", "invoke_agent": True}, label="Chat send with no text or files")
         note = s.call("alice", "POST", f"{CHAT}/messages", read_json=True, expect=(202,),
-                      body={"text": "", "asset_ids": [mine], "invoke_agent": False},
+                      body={"text": "", "asset_ids": [mine], "save_note": True},
                       label="attachment-only Save note")
         time.sleep(0.5)
         require(s.events("alice", CHAT)[-1]["id"] == note["id"]
-                and note["audience"] == "room" and model.total() == 1,
+                and note["audience"] == "room" and note["mentions"] == []
+                and [a["asset_id"] for a in attached(note)] == [mine] and model.total() == 1,
                 "Save note or the room send started other work")
 
         # 2. Another member reads the event and opens the file.
