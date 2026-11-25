@@ -31,15 +31,18 @@ pub struct Settings {
 }
 
 pub(crate) fn init(conn: &Connection) -> anyhow::Result<()> {
-    conn.execute_batch(&format!(
+    conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS admin_settings (
             singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-            pages_per_space INTEGER NOT NULL CHECK (pages_per_space BETWEEN {} AND {}),
-            versions_per_page INTEGER NOT NULL CHECK (versions_per_page BETWEEN {} AND {})
-        );
-        INSERT OR IGNORE INTO admin_settings VALUES (1, {}, {});",
-        PAGES.0, PAGES.1, VERSIONS.0, VERSIONS.1, PAGES.2, VERSIONS.2
-    ))?;
+            pages_per_space INTEGER NOT NULL,
+            versions_per_page INTEGER NOT NULL
+        ) STRICT;",
+    )?;
+    conn.execute(
+        "INSERT OR IGNORE INTO admin_settings (singleton, pages_per_space, versions_per_page)
+         VALUES (1, ?1, ?2)",
+        params![PAGES.2, VERSIONS.2],
+    )?;
     Ok(())
 }
 
@@ -123,4 +126,35 @@ pub(crate) fn router() -> Router<AppState> {
         "/v1/admin/settings",
         get(get_settings).patch(patch_settings),
     )
+}
+
+#[cfg(test)]
+#[test]
+fn storage_checks_types_and_leaves_product_bounds_to_the_api() {
+    let conn = Connection::open_in_memory().unwrap();
+    init(&conn).unwrap();
+    for invalid in ["NULL", "'not a number'", "2.5"] {
+        assert!(
+            conn.execute(
+                &format!("UPDATE admin_settings SET pages_per_space = {invalid}"),
+                [],
+            )
+            .is_err()
+        );
+    }
+    let future_pages = PAGES.1 + 1;
+    let future_versions = VERSIONS.1 + 1;
+    conn.execute(
+        "UPDATE admin_settings SET pages_per_space = ?1, versions_per_page = ?2",
+        params![future_pages, future_versions],
+    )
+    .unwrap();
+    init(&conn).unwrap();
+    assert_eq!(
+        read(&conn).unwrap(),
+        Settings {
+            pages_per_space: future_pages,
+            versions_per_page: future_versions
+        }
+    );
 }
