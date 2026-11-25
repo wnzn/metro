@@ -304,11 +304,12 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
     startOnline(prepared.baseUrl, candidate.token);
     const initial = candidate.list.find((s) => s.id === candidate.remembered);
     if (initial) {
-      // Show the shell now, but start its first tick after room selection.
-      // A tick before the room list arrives has no transcript to poll.
+      // Show the shell now; kick the first tick after enterSpace settles,
+      // bounded by listRooms' client timeout.
       const current = guard();
       void enterSpace(initial.id, { place: "chat", spaceId: null }).then(() => {
-        // Navigation away may already have started the loop for another view.
+        // A running tick reads the active room after any refreshLists await.
+        // Navigation away may also have scheduled a tick for another view.
         if (current() && !ticking && (basePlace() === "space" || timer === undefined)) kick();
       });
     } else {

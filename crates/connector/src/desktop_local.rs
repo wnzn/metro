@@ -75,6 +75,14 @@ const POLL: Duration = Duration::from_millis(50);
 const READY_FAST_POLL: Duration = Duration::from_millis(5);
 const READY_FAST_POLLS: usize = 8;
 
+fn ready_delay(attempt: usize) -> Duration {
+    if attempt < READY_FAST_POLLS {
+        READY_FAST_POLL
+    } else {
+        POLL
+    }
+}
+
 /// Variables the local server inherits; everything else is dropped, so a
 /// developer's `METRO_*`, OIDC or model settings never reach it.
 const INHERITED_ENV: &[&str] = &[
@@ -397,7 +405,7 @@ impl LocalServer {
         let deadline = Instant::now() + START_TIMEOUT;
         // Most bundled children are ready within the first 50 ms. Check
         // more often in that window without keeping the fast cadence on slow starts.
-        let mut fast_polls = READY_FAST_POLLS;
+        let mut attempt = 0;
         loop {
             if self.shared.closing.load(Ordering::SeqCst) {
                 return Err(SafeError::new(
@@ -432,13 +440,8 @@ impl LocalServer {
                     log_error(log)
                 )));
             }
-            let delay = if fast_polls > 0 {
-                fast_polls -= 1;
-                READY_FAST_POLL
-            } else {
-                POLL
-            };
-            tokio::time::sleep(delay).await;
+            tokio::time::sleep(ready_delay(attempt)).await;
+            attempt += 1;
         }
     }
 }
@@ -1153,6 +1156,16 @@ mod platform {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn readiness_polls_fast_for_eight_attempts_then_slow_down() {
+        for attempt in 0..8 {
+            assert_eq!(ready_delay(attempt), Duration::from_millis(5));
+        }
+        for attempt in [8, 9, usize::MAX] {
+            assert_eq!(ready_delay(attempt), Duration::from_millis(50));
+        }
+    }
 
     #[test]
     fn log_summary_takes_the_error_report() {
