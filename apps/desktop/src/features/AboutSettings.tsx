@@ -2,8 +2,8 @@ import { appInfo, cleanup, Clipboard, effect, openUrl, platform, signal } from "
 import type { ViewRef } from "nsh";
 import type { ServerUpdate } from "../api/serverUpdate";
 import { apiClient, connectedTo, me, orgAdmin, sessionGuard, status } from "../store";
-import { desktopUpdates as updates, METRO_LICENSES, METRO_RELEASES, METRO_SOURCE, needsManualRecovery, newerVersion, officialReleaseUrl, outcomeKey, stableVersion } from "../updates";
-import type { UpdateOffer, UpdateState } from "../updates";
+import { desktopUpdates, METRO_LICENSES, METRO_RELEASES, METRO_SOURCE, needsManualRecovery, newerVersion, officialReleaseUrl, outcomeKey, stableVersion } from "../updates";
+import type { DesktopUpdates, UpdateOffer, UpdateState } from "../updates";
 import { Action, ActionBar, Badge, Banner, Column, compactWidth, ConfirmInline, Disclosure, Label, PageHeader,
   PageLayout, ProgressLine, SettingRow, SettingsGroup, Toggle } from "../ui";
 
@@ -142,7 +142,8 @@ function Privacy() {
   </SettingsGroup>;
 }
 
-function UpdateOutcome() {
+function UpdateOutcome(props: { updates: DesktopUpdates }) {
+  const updates = props.updates;
   return <Each of={updates.outcome() ? [updates.outcome()!] : []} key={outcomeKey}>{last => {
     const copied = signal("");
     const label = () => ({ updated: "Update installed", install_failed: "Update not installed",
@@ -188,7 +189,8 @@ function ReleaseNotes(props: { release: NonNullable<UpdateState["latest"]> }) {
   </Disclosure>;
 }
 
-function RestartUpdate(props: { target: UpdateOffer }) {
+function RestartUpdate(props: { target: UpdateOffer; updates: DesktopUpdates }) {
+  const updates = props.updates;
   const confirmation = signal<string | null>(null);
   const deferred = signal(false);
   let restartButton: ViewRef | undefined;
@@ -227,7 +229,8 @@ function RestartUpdate(props: { target: UpdateOffer }) {
   </Column>;
 }
 
-function PublishedUpdates() {
+function PublishedUpdates(props: { updates: DesktopUpdates }) {
+  const updates = props.updates;
   const s = () => updates.state()!;
   const offer = updates.offer;
   const phase = () => s().phase;
@@ -283,7 +286,7 @@ function PublishedUpdates() {
       </If>
       <Each of={ready() ? [ready()!] : []} key={target => target.identity}>{target => <Column gap={2} align="start">
         <Badge tone="success" label="Ready" />
-        <RestartUpdate target={target()} />
+        <RestartUpdate target={target()} updates={updates} />
       </Column>}</Each>
       <If when={!checking() && phase() === "failed"}><Badge tone="danger" label="Failed" /></If>
       <If when={phase() === "idle" && !checking() && !error() && !ready()}>
@@ -333,7 +336,8 @@ function PublishedUpdates() {
   </>;
 }
 
-function UpdatePanel() {
+function UpdatePanel(props: { updates: DesktopUpdates }) {
+  const updates = props.updates;
   const problem = updates.readProblem;
   const s = updates.state;
   return <SettingsGroup title="Updates">
@@ -360,15 +364,16 @@ function UpdatePanel() {
             : s()?.current.channel === "preview" ? "Preview builds don't check for or install updates."
             : "Metro can't check for or install updates on this platform."} />
       }>
-        <UpdateOutcome />
-        <PublishedUpdates />
+        <UpdateOutcome updates={updates} />
+        <PublishedUpdates updates={updates} />
       </If>
     </If>
   </SettingsGroup>;
 }
 
 /** Settings page `about`; navigation and entry-point indicators belong to the Settings shell. */
-export function AboutSettings() {
+export function AboutSettings(props: { updates?: DesktopUpdates } = {}) {
+  const updates = props.updates ?? desktopUpdates;
   cleanup(updates.watch());
   const server = serverInfo();
   const ui = appInfo();
@@ -396,7 +401,7 @@ export function AboutSettings() {
         <Label variant="caption" color="muted">Packaged copies include their license notices in the licenses folder.</Label>
       </SettingRow>
     </SettingsGroup>
-    <UpdatePanel />
+    <UpdatePanel updates={updates} />
     <If when={server()}>{data => <ServerNotice data={data()} />}</If>
     <Privacy />
   </PageLayout>;

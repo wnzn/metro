@@ -334,6 +334,40 @@ test("a refused download does not hide an independent newer offer returned by th
   expect(f.count("apply")).toBe(0);
 });
 
+test("a busy refusal reads fresh status before an old poll returns, and that poll cannot retire a newer read", async () => {
+  const f = scenario({ ...available(), phase: "ready", stage_revision: "1".repeat(64) });
+  const app = await open("../../test/AboutHarness.tsx", { modules: bridgeEnv(), network: f.network as any,
+    clock: {}, width: 1000, height: 840, platform: "linux" });
+  await app.press("id:h-about");
+  await app.waitFor("id:update-restart");
+
+  const initialReads = f.count("read");
+  f.update({ phase: "idle" });
+  f.readDelay = 2_500;
+  await app.press("id:h-poll-updater");
+  await app.waitUntil(() => f.count("read") === initialReads + 1, { timeout: 400 });
+  f.readDelay = 0;
+  f.update({ phase: "ready", busy: { serving_connections: 2, local_workspace: true } });
+  await app.press("id:update-restart");
+  await app.waitFor("text:/2 device connections and the local workspace/", { timeout: 400 });
+  expect(app.shows("id:update-interrupt:confirm")).toBe(true);
+  expect(f.count("read")).toBe(initialReads + 2);
+
+  // A third read remains pending when the old idle snapshot is delivered.
+  f.readDelay = 4_200;
+  await app.press("id:h-poll-updater");
+  await app.waitUntil(() => f.count("read") === initialReads + 3, { timeout: 400 });
+  await app.clock!.runFor(2_600);
+  expect(app.shows("id:update-interrupt:confirm")).toBe(true);
+  await app.press("id:h-poll-updater");
+  expect(f.count("read")).toBe(initialReads + 3);
+  await app.press("id:update-interrupt:confirm");
+  await app.waitFor("text:/Metro is restarting/");
+  expect(f.calls.filter(c => c.step === "apply").map(c => c.body)).toEqual([
+    { version: NEXT, confirm_interrupt: false }, { version: NEXT, confirm_interrupt: true },
+  ]);
+});
+
 test("a ready refusal blocks the same stage on refresh, not a distinct stage", async () => {
   const f = scenario({ ...available(), phase: "ready", stage_revision: "1".repeat(64) });
   f.apply = () => err(409, "not_ready");
@@ -398,6 +432,41 @@ test("a dismissed outcome stays dismissed on relaunch, but a new attempt with th
   f.update({ last_update: { ...last, at: lastAt + 1 } });
   await next.waitFor("id:update-outcome");
   expect(next.storage()[OUTCOME_DISMISSAL_KEY]).toBe(dismissed);
+});
+
+test("a held dismissal read hides only the outcome until storage says whether it was dismissed", async () => {
+  const last = { from: CURRENT, to: NEXT, at: lastAt, outcome: "rolled_back" };
+  const dismissed = `${CURRENT}/${NEXT}/${lastAt}/rolled_back`;
+  const f = scenario({ ...available(), latest: latest(AFTER), last_update: last });
+  const app = await open("../../test/AboutDismissalHarness.tsx", { modules: bridgeEnv(), network: f.network as any,
+    storage: { [OUTCOME_DISMISSAL_KEY]: dismissed }, width: 1000, height: 840, platform: "linux" });
+  await app.waitFor("id:h-storage-held");
+  await app.waitFor(`text:Update to ${AFTER}…`);
+  expect(app.shows("id:about-privacy")).toBe(true);
+  expect(app.shows("id:update-check")).toBe(true);
+  expect(app.shows("id:update-outcome")).toBe(false);
+  await app.press("id:h-finish-storage");
+  await app.waitFor("id:h-storage-settled");
+  expect(app.shows("id:update-outcome")).toBe(false);
+
+  f.update({ last_update: { ...last, at: lastAt + 1 } });
+  await app.press("id:h-poll-updater");
+  await app.waitFor("id:update-outcome");
+  expect(app.storage()[OUTCOME_DISMISSAL_KEY]).toBe(dismissed);
+});
+
+test("an unreadable dismissal record releases the outcome notice without affecting About", async () => {
+  const f = scenario({ ...available(), latest: latest(AFTER),
+    last_update: { from: CURRENT, to: NEXT, at: lastAt, outcome: "rolled_back" } });
+  const app = await open("../../test/AboutDismissalHarness.tsx", { modules: bridgeEnv(), network: f.network as any,
+    width: 1000, height: 840, platform: "linux" });
+  await app.waitFor("id:h-storage-held");
+  await app.waitFor("id:update-start");
+  expect(app.shows("id:update-outcome")).toBe(false);
+  await app.press("id:h-fail-storage");
+  await app.waitFor("id:update-outcome");
+  expect(app.shows("id:update-start")).toBe(true);
+  expect(text(app)).not.toContain("Fixture storage unavailable");
 });
 
 test("a slow initial dismissal read cannot undo a newer dismissal", async () => {

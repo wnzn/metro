@@ -181,15 +181,17 @@ function validOutcomeKey(key: string) {
  * dismissal wins over an outstanding read, and writes keep click order. */
 export function createOutcomeDismissal(storage: Pick<typeof Storage, "getItem" | "setItem">) {
   const current = signal("");
+  const ready = signal(false);
   let restored: Promise<void> | undefined;
   let edited = false;
   let writes = Promise.resolve();
   return {
     current,
+    ready,
     restore() {
-      return restored ??= storage.getItem(DISMISSED_OUTCOME).then(key => {
+      return restored ??= Promise.resolve().then(() => storage.getItem(DISMISSED_OUTCOME)).then(key => {
         if (!edited && key && validOutcomeKey(key)) current.set(key);
-      }).catch(() => {});
+      }).catch(() => { /* If storage is unavailable, show the notice. */ }).finally(() => ready.set(true));
     },
     dismiss(key: string) {
       if (!validOutcomeKey(key)) return Promise.resolve();
@@ -205,7 +207,7 @@ type Command = "check" | "settings" | "download" | "cancel" | "restart";
 const activeTransfer = (s: UpdateState | null) => s?.phase === "downloading" || s?.phase === "verifying" || s?.phase === "staging";
 const canCancel = (s: UpdateState | null) => s?.phase === "downloading" || s?.phase === "verifying";
 
-function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
+export function createDesktopUpdates(endpoint: BridgeEndpoint | null, storage: Pick<typeof Storage, "getItem" | "setItem"> = Storage) {
   const bridge = endpoint && updateBridge(endpoint);
   const state = signal<UpdateState | null>(null);
   const readProblem = signal<string | null>(bridge ? null : "no_launcher");
@@ -214,12 +216,13 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
   const cancelling = signal(false);
   const notice = signal<string | null>(null);
   const refusedOffers = signal<ReadonlySet<string>>(new Set());
-  const dismissal = createOutcomeDismissal(Storage);
+  const dismissal = createOutcomeDismissal(storage);
   const offer = () => {
     const candidate = !readProblem() ? verifiedOffer(state()) : undefined;
     return candidate && !refusedOffers().has(candidate.identity) ? candidate : undefined;
   };
   const outcome = () => {
+    if (!dismissal.ready()) return;
     const last = state()?.lastUpdate;
     return last && outcomeKey(last) !== dismissal.current() ? last : undefined;
   };
@@ -266,17 +269,20 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
   function refresh(): Promise<void> {
     if (!bridge) return Promise.resolve();
     if (readInFlight) return readInFlight;
+    clearTimeout(timer);
     const observed = revision;
-    readInFlight = bridge.read().then(s => {
-      if (observed === revision) publish(s);
+    const read: Promise<void> = bridge.read().then(s => {
+      if (readInFlight === read && observed === revision) publish(s);
     }, (e: UpdateBridgeError) => {
-      if (observed !== revision) return;
+      if (readInFlight !== read || observed !== revision) return;
       if (state()?.phase !== "applying") readProblem.set(e.status === 404 ? "old_launcher" : e.code);
     }).finally(() => {
+      if (readInFlight !== read) return; // A detached poll cannot retire its replacement.
       readInFlight = undefined;
       schedule();
     });
-    return readInFlight;
+    readInFlight = read;
+    return read;
   }
 
   async function run(command: Command, act: () => Promise<UpdateState>, actedOn?: UpdateOffer): Promise<string | null> {
@@ -303,7 +309,9 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
       if (refusal !== "would_interrupt") problem.set({ command, code: refusal, refusedIdentity });
       // An apply can lose its reply during shutdown; never retry it for the
       // user. A refusal may also be racing with a newer release or busy work.
-      await readInFlight;
+      // Detach the obsolete GET (bounded by its bridge deadline) and get the
+      // updated offer or busy state now rather than waiting for that poll.
+      readInFlight = undefined;
       const read = refresh();
       if (refusal === "would_interrupt") await read;
     } finally {
@@ -355,6 +363,7 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
   };
 }
 
+export type DesktopUpdates = ReturnType<typeof createDesktopUpdates>;
 const env = readBridgeEnv();
 export const desktopUpdates = createDesktopUpdates(env.present ? env.endpoint : null);
 /** Quiet navigation affordance: no error, popup, or notifications. */

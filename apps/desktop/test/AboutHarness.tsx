@@ -15,6 +15,7 @@ function Harness() {
       <ActionBar>
         <Action label="Toggle About" testID="h-about" onPress={() => show.set(!show())} />
         <Action label="Render app surface" testID="h-render" onPress={() => rendered.set(true)} />
+        <Action label="Poll updater" testID="h-poll-updater" onPress={() => void desktopUpdates.refresh()} />
         <Action label="Alice" testID="h-alice" onPress={() => void connect(BASE, TOKENS.alice)} />
         <Action label="Bob" testID="h-bob" onPress={() => void connect(BASE, TOKENS.bob)} />
         <Action label="Other server" testID="h-other-server" onPress={() => void connect(OTHER, TOKENS.alice)} />
