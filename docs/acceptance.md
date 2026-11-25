@@ -151,16 +151,31 @@ review items.
   **678/678 passed**, with no failures, errors or skips. This gate covers
   the integration at that commit, not the later feature cut or a final
   combined release matrix.
-- **Startup fixtures, `cf5fd97ff2f0a1ebe2d7fe1d73d78ddcdecfd379`.**
-  With the conversation lanes merged into this startup snapshot, each
-  steady remembered-room fixture made **12 server requests**,
-  not the 10 observed on the standalone startup lane. The empty-Chat
-  fixtures made 9 without an operator model and 8 with one. Independent
-  review checked focused regressions and request assertions. The
-  handoff reported Shell and first-room-text milestones in isolated
-  offline NSH fixtures, not native or live timings. Aggregate timing
-  figures are omitted pending a traceable measurement receipt. This
-  startup evidence isn't a measurement of `2cb1beb`.
+- **Startup fixture replay.** The same `startup-metrics.test.tsx`
+  fixture (SHA-256
+  `3c2a299abbf676e2d962e51793dfd65c40ad83d5fbb8f303f034e0ec3fb51c2e`)
+  passed all four cases on each Git archive: standalone startup
+  `f51117cf87f7c869a6ed46901e6d0a0607f79462` and startup with the
+  conversation lanes merged at `5fcd434bc97ec6237a83a783c355c4e6a456a029`.
+  The replay ran `nsh test .nsh/startup-metrics.test.tsx --verbose`
+  with headless NSH 0.6.1 (`2f51d86`) in an isolated network namespace.
+  The fixture sampled virtual time every 10 ms through 700 ms for the
+  remembered-room cases and 950 ms for the empty-Chat cases. Its zero
+  sample followed the fixture's **Connect** press or, for the local
+  case, the NSH harness's app-open call. Request counts are arrivals
+  at the mock Metro server within those windows; bridge status reads
+  are counted separately.
+
+  | Fixture | Shell / first room text, virtual ms (both archives) | Server arrivals at `f51117c` | Server arrivals at `5fcd434` |
+  | --- | --- | ---: | ---: |
+  | Saved remote room | 70 / 360 | 10 | 12 |
+  | Local remembered room | 150 / 450 | 10 | 12 |
+  | Empty Chat, no operator model | — | 9 | 9 |
+  | Empty Chat, operator model | — | 8 | 8 |
+
+  Each room fixture logged one separate bridge status read. These
+  are controlled fixture observations, not native launch or live
+  network timings, and not measurements of `cf5fd97` or `2cb1beb`.
 - **Docs cutoff, `2cb1bebf55f06a168161404c1496fd9f20442a93`.**
   The [source preview](next-source.md) was advanced after checking the
   merged Space settings, guarded runner and token routes, mentions and
