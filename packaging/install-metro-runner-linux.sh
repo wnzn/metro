@@ -90,14 +90,15 @@ compat_retire() {
 
 compat_take() {
     compat_owner=$root/.lock/owner.metro-lock-v2
-    if [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; then
-        [ ! -L "$root/.lock" ] && [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
+    if { [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; } &&
+        ! { [ ! -L "$root/.lock" ] && [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
             [ "$(ls -A -- "$root/.lock")" = owner.metro-lock-v2 ] &&
             [ "$(stat -c '%s' -- "$compat_owner")" -le 128 ] &&
             [ "$(wc -l <"$compat_owner")" -eq 1 ] &&
             [ "$(LC_ALL=C grep -ac '^' "$compat_owner")" -eq 1 ] &&
             LC_ALL=C grep -aExq 'metro-lock-v2:[A-Za-z0-9._-]+' "$compat_owner" &&
-            compat_retire || die "another install holds the legacy lock at $root/.lock"
+            compat_retire; }; then
+        die "another install holds the legacy lock at $root/.lock"
     fi
     compat_new=$(mktemp -d -- "$root/.lock-new.XXXXXX")
     compat_token=metro-lock-v2:${compat_new##*/}
@@ -127,7 +128,7 @@ no_pending_update() {
 
 action=${1:-}
 [ $# -gt 0 ] && shift
-archive='' sha='' checksum_file='' server_url='' workspace='' token_file='' purge=0 self_update= migrate=0
+archive='' sha='' checksum_file='' server_url='' workspace='' token_file='' purge=0 self_update='' migrate=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --archive) [ $# -ge 2 ] || die "--archive needs a file"; archive=$2; shift 2 ;;
@@ -553,12 +554,19 @@ install_runner() {
         die "unexpected version in archive name: $version"
     problems=$(host_problems)
     [ -z "$problems" ] || die "this host cannot run the native runner: $problems"
+    # Only the new install root is private; parent directories use the umask.
+    # shellcheck disable=SC2174
     mkdir -p -m 700 -- "$root"
     lock_install
     no_pending_update
     [ "$action" != update ] || [ -L "$root/current" ] || die "the runner is not installed in $root; use install"
-    if [ -n "$(ls -A -- "$root" | grep -vxF .lock || :)" ] && [ ! -f "$root/$MARK" ]; then
-        die "$root exists but was not created by this installer; refusing to change it"
+    if [ ! -f "$root/$MARK" ]; then
+        for root_entry in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+            [ "$root_entry" != "$root/.lock" ] || continue
+            if [ -e "$root_entry" ] || [ -L "$root_entry" ]; then
+                die "$root exists but was not created by this installer; refusing to change it"
+            fi
+        done
     fi
     stage=
     old=
