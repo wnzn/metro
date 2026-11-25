@@ -193,6 +193,7 @@ sys.exit({status!r})
         self.assertEqual(self.ci["permissions"], {"contents": "read"})
         self.assertNotIn("permissions", self.desktop)
         self.assertNotIn("secrets", self.desktop)
+        self.assertEqual(self.desktop["timeout-minutes"], 45)
         self.assertEqual(self.desktop["needs"], ["workflows", "release-policy"])
         self.assertIs(self.selector, self.workflow_gate["steps"][0])
         self.assertEqual(self.selector["env"], {"GH_TOKEN": "${{ github.token }}"})
@@ -226,8 +227,11 @@ sys.exit({status!r})
         self.assertEqual(install["if"], "runner.environment == 'github-hosted'")
         self.assertIn("curl", install["run"])
         self.assertEqual(commands, [
-            {"run": command, "working-directory": "apps/desktop"}
-            for command in ("nsh check", "nsh test")
+            {"run": "nsh check", "working-directory": "apps/desktop"},
+            {"name": "NSH headless tests (all files, isolated workers)",
+             "env": {"METRO_NSH_WORKERS": "2"},
+             "run": "python3 -B ../../packaging/nsh_ci_tests.py",
+             "working-directory": "apps/desktop"},
         ])
         # The release build is package-smoke's `ui` job, not this one.
         self.assertNotIn("nsh build", yaml.safe_dump(self.desktop))

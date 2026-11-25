@@ -94,6 +94,7 @@ jobs:
       && (needs.workflows.outputs.desktop != 'false' || needs.release-policy.outputs.release == 'true') }}
     # Choose a queue, not a fallback if the selected runner is offline.
     runs-on: ${{ needs.workflows.outputs.desktop_runner == 'metro-ci-linux-x64' && needs.release-policy.outputs.release != 'true' && 'metro-ci-linux-x64' || 'ubuntu-24.04' }}
+    timeout-minutes: 45
     env:
       NSH_VERSION: v0.6.1
       NSH_ARCHIVE_SHA256: 9a7ac692f1c229df476be8ff83a3c5912d271453b644e313f02cb19d18696070
@@ -140,7 +141,10 @@ jobs:
       - run: nsh check
         working-directory: apps/desktop
       # The release build is package-smoke's `ui` job (when the `previews` segment runs).
-      - run: nsh test
+      - name: NSH headless tests (all files, isolated workers)
+        env:
+          METRO_NSH_WORKERS: '2'
+        run: python3 -B ../../packaging/nsh_ci_tests.py
         working-directory: apps/desktop
 
   containers:
