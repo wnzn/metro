@@ -204,28 +204,40 @@ test("cancelling a replacement or clear sends no PUT and preserves the person's 
 test("a failed refresh never leaves a cached media model draft saveable", async () => {
   const w = libraryWorld();
   const own = w.addMediaConnection("alice", "embeddinggemma-2", "Use this model");
-  const app = await signIn(w);
-  await app.press("id:nav-settings");
-  await app.press("id:nav-settings:routing");
+  const app = await open("./test/ModelHarness.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1280, height: 900 });
+  await connect(app, "alice");
+  await app.waitFor("id:library-view");
   await app.waitFor("id:library-model-picker");
   await app.press("id:library-model-picker");
   await app.press(`id:library-model-picker:${own}`);
   expect(app.enabled("id:library-model-save")).toBe(true);
+  // Opening the real Library pane reloads the selection and its guard
+  // revision while the harness keeps the editor (and its draft) mounted.
+  await app.press("id:harness-toggle-library");
+  await app.waitFor("id:library-view", { state: "gone" });
+  const reads = lib(w, LEGACY_SELECTION).length;
   w.l.settingsReadStatus = 503;
-  // Crossing the layout breakpoint remounts the editor and reloads its
-  // choices without leaving the page or discarding the unsaved draft.
-  await app.setViewport(760, 900);
-  await app.waitFor("id:library-model-error");
+  await app.press("id:harness-toggle-library");
+  await app.waitFor("id:library-model-error >> text:/GET \\/v1\\/library\\/settings failed with HTTP 503/");
+  expect(lib(w, LEGACY_SELECTION).slice(reads).map((r) => r.user)).toEqual(["alice"]);
+  expect(app.shows("id:library-model >> text:Unsaved media model")).toBe(true);
   expect(app.shows("id:library-model-save")).toBe(true);
   expect(app.enabled("id:library-model-save")).toBe(false);
   expect(app.shows("id:library-model-picker")).toBe(false);
   expect(lib(w, GUARDED_SELECTION, "PUT")).toHaveLength(0);
+  expect(lib(w, LEGACY_SELECTION, "PUT")).toHaveLength(0);
   w.l.settingsReadStatus = 200;
   await app.press("id:library-model-error >> label:Try again");
   await app.waitUntil(() => app.enabled("id:library-model-save"));
+  expect(lib(w, LEGACY_SELECTION).slice(reads).map((r) => r.user)).toEqual(["alice", "alice"]);
+  expect(lib(w, GUARDED_SELECTION, "PUT")).toHaveLength(0);
   await app.press("id:library-model-save");
   await app.waitFor("id:library-model-notice");
   expect(w.l.settings.get("alice")).toBe(own);
+  expect(lib(w, GUARDED_SELECTION, "PUT").map((r) => JSON.parse(r.body!))).toEqual([
+    { embedding_id: own, expected_embedding_id: null, expected_selection_revision: "0" },
+  ]);
+  expect(lib(w, LEGACY_SELECTION, "PUT")).toHaveLength(0);
 });
 
 async function openModelChoices(app: App) {

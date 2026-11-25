@@ -56,10 +56,11 @@ type StackProps = Children &
 const alignClass = { start: "items-start", center: "items-center", end: "items-end", stretch: "items-stretch" };
 const justifyClass = { start: "justify-start", center: "justify-center", end: "justify-end", between: "justify-between" };
 
-function stackClass(props: StackProps, direction: "row" | "col") {
+// Pass layout overrides separately: spreading NSH props evaluates their lazy children.
+function stackClass(props: StackProps, direction: "row" | "col", grow = props.grow) {
   return cx(
     direction === "row" ? "flex-row" : "flex-col",
-    props.grow && "flex-1 min-w-0 min-h-0",
+    grow && "flex-1 min-w-0 min-h-0",
     props.wrap && "flex-wrap",
     props.align && alignClass[props.align],
     props.justify && justifyClass[props.justify],
@@ -70,9 +71,9 @@ function stackClass(props: StackProps, direction: "row" | "col") {
   );
 }
 
-export function Row(props: StackProps) {
+export function Row(props: StackProps & { stacked?: boolean }) {
   return (
-    <View class={stackClass(props, "row")} selectable={props.selectable} testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
+    <View class={stackClass(props, props.stacked ? "col" : "row")} selectable={props.selectable} testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
       {props.children}
     </View>
   );
@@ -142,7 +143,7 @@ export function Surface(props: StackProps & {
 }) {
   return (
     <View
-      class={cx(surfaceClass[props.variant], stackClass({ ...props, grow: false }, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col"), props.grow && "flex-1 min-h-0", props.hidden && "hidden", props.width !== undefined && "shrink-0")}
+      class={cx(surfaceClass[props.variant], stackClass(props, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col", false), props.grow && "flex-1 min-h-0", props.hidden && "hidden", props.width !== undefined && "shrink-0")}
       style={props.width !== undefined ? { width: props.width } : undefined}
       accessibilityElementsHidden={props.hidden}
       testID={props.testID}
@@ -1216,7 +1217,7 @@ export function PageLayout(props: StackProps & { footer?: JSX.Element; wide?: bo
   return (
     <View class="flex-1 min-h-0 flex-col">
       <Scroll class="flex-1 min-h-0" testID={props.testID}>
-        <View class={cx(stackClass({ ...props, grow: false }, "col"), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>
+        <View class={cx(stackClass(props, "col", false), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>
       </Scroll>
       <If when={props.footer}>
         <View class="border-t border-border bg-background px-(--space-8) max-md:px-(--space-4) py-(--space-3)" testID={props.testID ? `${props.testID}:footer` : undefined}>
@@ -1516,15 +1517,29 @@ export function PageHeader(props: Testable & { title: string; subtitle?: string;
 
 /**
  * A titled group of SettingRows on one card. The rows draw the lines between
- * them; the card clips the first one's.
+ * them; the card clips the first one's. `focusTitle` is for navigation to a group.
  */
-export function SettingsGroup(props: Testable & { title?: string; description?: string; children?: JSX.Element }) {
+export function SettingsGroup(props: Testable & { title?: string; description?: string; focusTitle?: boolean; children?: JSX.Element }) {
+  const titleRef = signal<ViewRef | undefined>(undefined);
+  effect(() => {
+    if (!props.focusTitle) return;
+    const node = titleRef();
+    if (!node) return;
+    let live = true;
+    void node.measure().then((layout) => {
+      if (!live || !layout || layout.bounds.size.height <= 0) return;
+      node.reveal({ vertical: "start", animated: false });
+      node.focus();
+    });
+    return () => { live = false; };
+  });
   return (
     <View class="flex-col gap-(--space-2)" testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
       <If when={props.title || props.description}>
         <View class="flex-col gap-px px-(--space-1)">
           <If when={props.title}>
-            <Text class={cx(textClass.sm, "font-semibold text-foreground")} role="header">
+            <Text class={cx(textClass.sm, "font-semibold text-foreground")} role="header"
+              ref={props.focusTitle ? titleRef.set : undefined} focusable={props.focusTitle}>
               {props.title}
             </Text>
           </If>
