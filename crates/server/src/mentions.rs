@@ -34,7 +34,9 @@ const AGENT_HANDLE: &str = "agent";
 ///
 /// A span starts at a standalone `@` and ends at a token boundary (as for
 /// legacy handles). The nonempty label may contain spaces between words,
-/// but no extra `@`, control characters, line breaks or edge whitespace.
+/// but no control characters, line breaks or edge whitespace. An `@` is
+/// allowed within the label (e.g. `@Support@Home`), not at either edge of
+/// the label or after a character that would let it start a separate token.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct MentionSpan {
     pub start: usize,
@@ -104,11 +106,7 @@ impl ValidatedSpans {
                 .get(span.start..span.end)
                 .and_then(|s| s.strip_prefix('@'))
                 .ok_or(INVALID)?;
-            if label.is_empty()
-                || label.trim() != label
-                || label
-                    .chars()
-                    .any(|c| matches!(c, '@' | '\u{2028}' | '\u{2029}') || c.is_control())
+            if !valid_span_label(label)
                 || !opens_token(raw_text[..span.start].chars().next_back())
                 || !closes_token(&raw_text[span.end..])
             {
@@ -381,6 +379,21 @@ fn opens_token(prev: Option<char>) -> bool {
     }
 }
 
+fn valid_span_label(label: &str) -> bool {
+    if label.is_empty() || label.trim() != label || label.ends_with('@') {
+        return false;
+    }
+    let mut prev = None;
+    for c in label.chars() {
+        if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') || (c == '@' && opens_token(prev))
+        {
+            return false;
+        }
+        prev = Some(c);
+    }
+    true
+}
+
 /// True if `rest` (the text right after a matched handle) ends the token.
 fn closes_token(rest: &str) -> bool {
     let trimmed = rest.trim_start_matches(|c: char| {
@@ -393,7 +406,19 @@ fn closes_token(rest: &str) -> bool {
 }
 
 /// Byte ranges of `text` that are code (fenced blocks and inline spans).
-fn code_ranges(text: &str) -> Vec<(usize, usize)> {
+fn code_ranges(text: &str, spans: &[MentionSpan]) -> Vec<(usize, usize)> {
+    // Typed labels are opaque to Markdown. Replace only their bytes in
+    // this private view, preserving offsets, line breaks and every marker
+    // outside the spans. Non-whitespace also keeps a label after a fence
+    // marker from looking like an empty closing line.
+    let masked = (!spans.is_empty()).then(|| {
+        let mut bytes = text.as_bytes().to_vec();
+        for span in spans {
+            bytes[span.start..span.end].fill(b'x');
+        }
+        String::from_utf8(bytes).expect("validated spans align with UTF-8 boundaries")
+    });
+    let text = masked.as_deref().unwrap_or(text);
     let mut ranges = Vec::new();
     let bytes = text.as_bytes();
 
@@ -475,7 +500,7 @@ fn scan_text(
     agents: &[(&str, &str)],
     spans: &[MentionSpan],
 ) -> Vec<Mention> {
-    let code = code_ranges(text);
+    let code = code_ranges(text, spans);
     let in_code = |i: usize| code.iter().any(|&(s, e)| i >= s && i < e);
     let mut spans = spans.iter().peekable();
     let mut found = Vec::new();
@@ -620,7 +645,6 @@ mod tests {
             ("x @", vec![span(2, 3)]),    // bare @
             ("@ x", vec![span(0, 3)]),    // space immediately after @
             ("@x\nY", vec![span(0, 4)]),  // across lines
-            ("@x@y", vec![span(0, 4)]),   // embedded @
             ("a@x", vec![span(1, 3)]),    // email-like
             (r"\@x", vec![span(1, 3)]),   // escaped
             ("@agent", vec![span(0, 3)]), // partial token
@@ -634,6 +658,89 @@ mod tests {
         let many = |n| (0..n).map(|i| span(i * 3, i * 3 + 2)).collect();
         assert!(ValidatedSpans::new(&"@x ".repeat(MAX_SPANS), 1, many(MAX_SPANS)).is_ok());
         assert!(ValidatedSpans::new(&"@x ".repeat(MAX_SPANS + 1), 1, many(MAX_SPANS + 1)).is_err());
+    }
+
+    #[test]
+    fn mention_span_label_may_contain_at_signs_but_not_another_token() {
+        let full = |text: &str| {
+            ValidatedSpans::new(
+                text,
+                1,
+                vec![MentionSpan {
+                    start: 0,
+                    end: text.len(),
+                    index: 0,
+                }],
+            )
+        };
+        for label in ["@Support@Home", "@支援@自宅", "@Ops@Home@Work"] {
+            assert!(full(label).is_ok(), "{label}");
+        }
+        for separate in [
+            "@@agent",
+            "@Support@",
+            "@Support @agent",
+            "@Support\u{00a0}@alice",
+            "@Support (@agent)",
+            "@Support:@alice",
+        ] {
+            assert!(full(separate).is_err(), "{separate}");
+        }
+    }
+
+    #[test]
+    fn mention_span_label_is_opaque_to_code_ranges_but_real_code_still_counts() {
+        for label in ["@DevOps", "@Dev`Ops", "@Dév`Ops"] {
+            let text = format!("👋 {label} @agent and `echo @alice literally` @carol-ops");
+            let start = "👋 ".len();
+            let span = MentionSpan {
+                start,
+                end: start + label.len(),
+                index: 0,
+            };
+            let spans = ValidatedSpans::new(&text, 1, vec![span]).unwrap();
+            let (recipients, spans) =
+                resolve_with_spans(&text, &[user("bob")], false, None, &ids(TEAM), &[], spans)
+                    .unwrap();
+            assert_eq!(
+                recipients,
+                [user("bob"), Mention::Agent, user("carol-ops")],
+                "{text}"
+            );
+            assert_eq!(spans, [span]);
+        }
+
+        // A span does not count as whitespace after a real fence marker:
+        // the second line is not a closer, and @alice stays inside code.
+        let prefix = "```\n``` ";
+        let label = "@Dev```Ops";
+        let text = format!("{prefix}{label}\n@alice\n```\n@agent");
+        let span = MentionSpan {
+            start: prefix.len(),
+            end: prefix.len() + label.len(),
+            index: 0,
+        };
+        let spans = ValidatedSpans::new(&text, 1, vec![span]).unwrap();
+        let (recipients, _) =
+            resolve_with_spans(&text, &[user("bob")], false, None, &ids(TEAM), &[], spans).unwrap();
+        assert_eq!(recipients, [user("bob"), Mention::Agent]);
+
+        // The same backticks still have their legacy meaning when not
+        // covered by a typed span.
+        assert_eq!(
+            text_only(
+                "👋 @Dev`Ops @agent and `echo @alice literally` @carol-ops",
+                TEAM,
+            ),
+            [user("alice"), user("carol-ops")]
+        );
+        assert_eq!(
+            text_only(
+                "👋 @DevOps @agent and `echo @alice literally` @carol-ops",
+                TEAM,
+            ),
+            [Mention::Agent, user("carol-ops")]
+        );
     }
 
     #[test]

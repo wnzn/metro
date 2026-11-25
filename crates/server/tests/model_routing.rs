@@ -2113,6 +2113,79 @@ async fn mention_spans_keep_generic_and_named_recipients_distinct_from_run_targe
 }
 
 #[tokio::test]
+async fn mention_span_labels_cannot_change_adjacent_legacy_routing() {
+    let h = H::start().await;
+    let sid = h.space("span code ranges").await;
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let (s, v) = h.put_routing("alice", routing_on(false, false)).await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = h
+        .put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let bob = json!({"kind": "user", "id": "bob"});
+    let before = h.fake.calls();
+
+    // A malformed range cannot hide a separate token or leave a message
+    // behind. Force generic addressing so a late check would call System One.
+    for label in [
+        "@Support @agent",
+        "@Support (@alice)",
+        "@Support\u{00a0}@agent",
+    ] {
+        let (s, v) = h
+            .post(
+                "alice",
+                &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+                json!({
+                    "text": format!("{label} [pick2]"),
+                    "invoke_agent": true,
+                    "mentions": [bob],
+                    "spans": [{"start": 0, "end": label.len(), "index": 0}]
+                }),
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+        assert_eq!(v["error"], "invalid mention span");
+    }
+    assert_eq!(h.fake.calls(), before);
+    assert!(h.model_calls().is_empty());
+    assert!(h.events("alice", Some(&sid)).await.is_empty());
+
+    for (n, label) in ["@DevOps", "@Dev`Ops", "@Support@Home"]
+        .into_iter()
+        .enumerate()
+    {
+        let prefix = "👋 ";
+        let text = format!("{prefix}{label} @agent [pick2] and `echo @alice literally`");
+        let span = json!({"start": prefix.len(), "end": prefix.len() + label.len(), "index": 0});
+        let e = h
+            .say(
+                "alice",
+                Some(&sid),
+                json!({"text": text, "mentions": [bob], "spans": [span]}),
+            )
+            .await;
+        assert_eq!(e["text"], text);
+        assert_eq!(e["spans"], json!([span]));
+        assert_eq!(e["mentions"], json!([bob, {"kind": "agent"}]));
+        let id = e["id"].as_i64().unwrap();
+        let started = h.started_after("alice", &sid, id).await;
+        assert_eq!(started["agent"]["id"], coder.as_str());
+        assert_eq!(h.fake.calls(), before + n + 1);
+        assert_eq!(
+            h.answer_after("alice", Some(&sid), id).await["kind"],
+            "agent"
+        );
+    }
+}
+
+#[tokio::test]
 async fn per_space_and_per_agent_models_come_before_the_personal_default() {
     let h = H::start().await;
     let sid = h.space("models").await;

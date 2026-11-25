@@ -373,11 +373,13 @@ async fn mention_spans_round_trip_in_rooms_threads_and_attachment_events() {
         )
         .await;
 
-    let text = "👩‍💻 (@alice Moréno), @review and @alice Moréno; @carol, then `@agent`.";
+    let text =
+        "👩‍💻 (@alice Moréno), @review and @Support@Home, @alice Moréno; @carol, then `@agent`.";
     let leading = "\u{2003}\r\n";
     let raw = format!("{leading}{text}\t ");
     let mut occurrences: Vec<_> = text
         .match_indices("@alice Moréno")
+        .chain(text.match_indices("@Support@Home"))
         .chain(text.match_indices("@review"))
         .collect();
     let spans: Vec<_> = occurrences
