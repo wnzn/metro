@@ -209,7 +209,7 @@ type ProfileRow = (
     Option<String>,
 );
 
-fn profile_in(conn: &Connection, id: &str) -> anyhow::Result<Profile> {
+pub(crate) fn profile_in(conn: &Connection, id: &str) -> anyhow::Result<Profile> {
     let row: Option<ProfileRow> = conn
         .query_row(
             "SELECT display_name, default_name, bio, avatar_version FROM profiles WHERE user_id = ?1",

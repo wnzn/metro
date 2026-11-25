@@ -32,6 +32,7 @@ pub mod runners;
 pub mod schedules;
 pub mod search;
 pub mod space_agents;
+mod space_context;
 pub mod space_prefs;
 pub mod spaces;
 pub mod tools;
