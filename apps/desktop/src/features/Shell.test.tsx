@@ -250,7 +250,7 @@ test("the connection is a dot on the account's server line; words only when not 
   expect(app.shows("id:active-server >> id:connection-state")).toBe(true);
   expect(app.shows("label:Connection: Online")).toBe(true);
   expect(app.shows("text:Online")).toBe(false);
-  expect(app.shows("label:/^alice, connected to 127\\.0\\.0\\.1:8787\\. Connection: Online\\. Account menu$/")).toBe(true);
+  expect(app.shows("label:/^alice, Connection: Online, connected to 127\\.0\\.0\\.1:8787\\. Account menu$/")).toBe(true);
 });
 
 test("a room's breadcrumb and actions share the one header row with the search box", async () => {

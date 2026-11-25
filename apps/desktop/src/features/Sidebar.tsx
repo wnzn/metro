@@ -332,12 +332,15 @@ function AccountFooter(props: { compact?: boolean }) {
     { id: "disconnect", label: "Sign out", icon: "logout", destructive: true, onPress: () => signOut() },
   ];
   const where = () => (server().local ? "on this device" : `connected to ${server().title}`);
+  // The accessible name ends with "<where>. Account menu": screen readers and
+  // the native packaged-app checks (UI Automation, release.yml) rely on it, so
+  // the connection goes before the place, never after it.
   return (
     <Column padX={props.compact ? 0 : 2} padY={2} gap={1} testID={props.compact ? "rail-account" : "active-server"}>
       <AccountMenu
         testID={props.compact ? "rail-account-menu" : "account-menu"}
         compact={props.compact}
-        accessibilityLabel={`${name()}, ${where()}. ${connection().label}. Account menu`}
+        accessibilityLabel={`${name()}, ${connection().label}, ${where()}. Account menu`}
         avatar={<PersonAvatar userId={me()} name={name()} size={props.compact ? "md" : "sm"} />}
         name={name()}
         detail={server().title}

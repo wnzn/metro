@@ -270,6 +270,18 @@ test("On this computer straight from a signed-in menu, and back to a saved serve
   expect(onlyTokenFor(app, BASE, "alice")).toBeGreaterThan(0);
 });
 
+test("the local workspace's account menu and Chat composer keep the names the native packaged check reads", async () => {
+  // release.yml (desktop-windows) finds AutomationId account-menu, requires its
+  // name to end with ", on this device. Account menu", and an enabled composer.
+  const app = await launch(servers(), { bridge: launcher() });
+  await app.waitFor("id:space:solo");
+  await app.press("id:nav-chat");
+  await app.waitFor("id:composer");
+  expect(app.shows("id:account-menu")).toBe(true);
+  expect(app.shows("label:/^carol, Connection: Online, on this device\\. Account menu$/")).toBe(true);
+  expect(app.enabled("id:composer")).toBe(true);
+});
+
 test("when this computer's workspace can't open, the current session stays", async () => {
   const s = servers();
   const app = await launch(s, { bridge: launcher({ refuse: true }) });
