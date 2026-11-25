@@ -97,6 +97,79 @@ test("a failed endpoint test leaves the old URL and doesn't refresh models; the 
   expect(custom.base_url).toBe(NEW);
 });
 
+test("Metro's full probe queue refuses the write without testing and permits direct retry", async () => {
+  const { f, custom } = fixture();
+  f.state.endpointRefusals.set(NEW, { status: 503, code: "endpoint_probe_busy", error: "Please try again later." });
+  const app = await signIn(f, "alice");
+  await edit(app, custom.id);
+  await app.press(`id:endpoint-section:${custom.id} >> label:${NEW}`);
+  await app.press(`id:endpoint-save:${custom.id}`);
+  await app.waitFor("id:endpoint-feedback >> text:/No change was saved/");
+  expect(app.shows("id:endpoint-feedback >> label:Reload connection")).toBe(false);
+  expect(custom.base_url).toBe(OLD);
+  expect(f.state.endpointProbes).toHaveLength(0);
+  expect(patches(f, custom.id)).toHaveLength(1);
+
+  f.state.endpointRefusals.delete(NEW);
+  await app.press("id:endpoint-feedback >> label:Try again");
+  await app.waitFor("id:endpoint-feedback >> text:/Endpoint changed/");
+  expect(f.state.endpointProbes).toEqual([NEW]);
+  expect(patches(f, custom.id)).toHaveLength(2);
+  expect(custom.base_url).toBe(NEW);
+});
+
+for (const [label, refusal] of [
+  ["an uncoded 503", { status: 503, error: "too many endpoint tests are running; try again shortly" }],
+  ["a malformed legacy probe response", { status: 502, error: "the new endpoint failed its " }],
+] as const) {
+  test(`${label} is not proof the endpoint write was refused`, async () => {
+    const { f, custom } = fixture();
+    f.state.endpointRefusals.set(NEW, refusal);
+    const app = await signIn(f, "alice");
+    await edit(app, custom.id);
+    await app.press(`id:endpoint-section:${custom.id} >> label:${NEW}`);
+    await app.press(`id:endpoint-save:${custom.id}`);
+    await app.waitFor("id:endpoint-feedback >> label:Reload connection");
+    expect(app.shows("id:endpoint-feedback >> label:Try again")).toBe(false);
+    await app.press("id:endpoint-feedback >> label:Reload connection");
+    await app.waitFor("id:endpoint-feedback >> text:/first test may still be running/");
+    expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(false);
+    expect(patches(f, custom.id)).toHaveLength(1);
+  });
+}
+
+for (const live of [OLD, NEW]) {
+  test(`a concurrent edit requires reload and a fresh choice even when the current URL is ${live === OLD ? "unchanged" : "the one proposed"}`, async () => {
+    const { f, custom } = fixture();
+    f.state.endpointConcurrentEdits.set(NEW, { name: "Another editor renamed it", baseUrl: live });
+    const app = await signIn(f, "alice");
+    await edit(app, custom.id);
+    await app.press(`id:endpoint-section:${custom.id} >> label:${NEW}`);
+    await app.press(`id:endpoint-save:${custom.id}`);
+    await app.waitFor("id:endpoint-feedback >> text:/Your change was not saved/");
+    expect(app.shows("id:endpoint-feedback >> label:Try again")).toBe(false);
+    expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(false);
+    expect(app.shows("text:Another editor renamed it")).toBe(false);
+    const failedBeforeReload = f.state.log.filter((r) => r.method === "GET" && r.path === "/v1/providers").length;
+    await app.press("id:endpoint-feedback >> label:Reload connection");
+    await app.waitFor("id:endpoint-feedback >> text:/Connection reloaded.*Review the current endpoint/");
+    expect(f.state.log.filter((r) => r.method === "GET" && r.path === "/v1/providers")).toHaveLength(failedBeforeReload + 1);
+    await app.waitFor(`id:endpoint-current:${custom.id} >> text:${live}`);
+    expect(app.shows("text:Another editor renamed it")).toBe(true);
+    expect(app.shows(`id:endpoint-input:${custom.id}`)).toBe(false);
+    expect(patches(f, custom.id)).toHaveLength(1);
+
+    await app.press(`id:endpoint-change:${custom.id}`);
+    expect(app.value(`id:endpoint-input:${custom.id}`)).toBe(live);
+    expect(app.enabled(`id:endpoint-save:${custom.id}`)).toBe(false);
+    const next = live === NEW ? OLD : NEW;
+    await app.press(`id:endpoint-section:${custom.id} >> label:${next}`);
+    await app.press(`id:endpoint-save:${custom.id}`);
+    await app.waitFor("id:endpoint-feedback >> text:/Endpoint changed/");
+    expect(patches(f, custom.id).map((p) => p.body.base_url)).toEqual([NEW, next]);
+  });
+}
+
 test("an endpoint that doesn't list models saves without claiming a refresh", async () => {
   const { f } = fixture();
   const embeddings = f.addConnection("alice", "custom-embeddings", "Embeddings", "embed-fixture");

@@ -225,9 +225,13 @@ function endpointCheckFeedback(id: string): EndpointFeedback | null {
       id, tone: "warning", detail: check.detail,
       message: check.phase === "reload-failed"
         ? "The reload didn't confirm the current endpoint. Try reloading again."
-        : check.phase === "not-settled"
-          ? "The server hasn't reported the proposed endpoint. The first test may still be running. Reload again; Metro won't send another change while this one is unresolved."
-        : "Metro couldn't confirm the endpoint change. Reload the connection before changing it again.",
+        : check.refusal === "conflict"
+          ? "The connection changed while you were saving. Your change was not saved. Reload the connection and review it before making a new change."
+          : check.refusal === "missing"
+            ? "The connection was not available to edit. Your change was not saved. Reload the connection."
+            : check.phase === "not-settled"
+              ? "The server hasn't reported the proposed endpoint. The first test may still be running. Reload again; Metro won't send another change while this one is unresolved."
+              : "Metro couldn't confirm the endpoint change. Reload the connection before changing it again.",
       action: { label: "Reload connection", run: () => void reloadEndpoint(id), busy: () => providerBusy() === `endpoint-reload:${id}` },
     };
     case "saved": {
@@ -236,6 +240,8 @@ function endpointCheckFeedback(id: string): EndpointFeedback | null {
         ? "The server confirmed the new endpoint was saved. Use Refresh models to update the list."
         : "The server confirmed the new endpoint was saved." };
     }
+    case "review":
+      return { id, tone: "warning", message: "Connection reloaded. Your previous change was not saved. Review the current endpoint before making a new change." };
   }
 }
 
@@ -612,7 +618,10 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
     if (outcome.kind === "not-approved") {
       error.set(ENDPOINT_NOT_APPROVED);
     } else if (outcome.kind === "refused") {
-      props.feedback({ id, tone: "danger", message: outcome.message, detail: outcome.detail, action: { label: "Try again", run: () => void submit() } });
+      props.feedback({
+        id, tone: "danger", message: outcome.message, detail: outcome.detail,
+        action: outcome.retry ? { label: "Try again", run: () => void submit() } : undefined,
+      });
     } else if (outcome.kind === "changed") {
       editing.set(false);
       const listing = outcome.listing;
@@ -631,7 +640,10 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
   };
   effect(() => {
     const result = endpointChecks()[id];
-    if (result?.phase === "saved") editing.set(false);
+    if (result?.phase === "saved" || result?.phase === "review") {
+      value.set("");
+      editing.set(false);
+    }
   });
   return (
     <SettingsGroup title="Endpoint" description="Only endpoints the operator approved. Metro tests the new one before it switches." testID={`endpoint-section:${id}`}>

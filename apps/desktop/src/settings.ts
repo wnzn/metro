@@ -19,7 +19,7 @@
 //   form that holds it clears it as soon as it is sent.
 
 import { batch, computed, effect, signal, untracked } from "nsh";
-import { ApiError } from "./api/client";
+import { ApiError, EndpointPatchError } from "./api/client";
 import { serverHost } from "./api/serverUrl";
 import type { PageScope } from "./ui";
 import type {
@@ -756,11 +756,15 @@ export async function updateConnection(id: string, patch: ProviderPatch, done?: 
 
 type EndpointResult =
   | { kind: "ignored" | "not-approved" | "unconfirmed" }
-  | { kind: "refused"; message: string; detail?: string }
+  | { kind: "refused"; message: string; retry: boolean; detail?: string }
   | { kind: "changed"; listing?: ModelListing };
 
-type EndpointCheck = { from: string | null; to: string; detail?: string; phase: "unknown" | "reload-failed" | "saved" | "not-settled" };
-/** A lost acknowledgement stays unresolved if the editor closes or remounts. */
+type EndpointCheck = {
+  from: string | null; to: string; detail?: string;
+  refusal?: "conflict" | "missing";
+  phase: "unknown" | "reload-failed" | "saved" | "not-settled" | "review";
+};
+/** A check survives editor closes/remounts. Only positive refusal evidence allows review instead of waiting for a possible commit. */
 export const endpointChecks = signal<Partial<Record<string, EndpointCheck>>>({});
 
 export function endpointNeedsReload(id: string): boolean {
@@ -798,10 +802,17 @@ export async function reloadEndpoint(id: string): Promise<void> {
     batch(() => {
       if (connection?.baseUrl !== check.from) invalidateEndpointListing(id);
       const checks = { ...endpointChecks() };
-      if (!connection) delete checks[id];
-      // A GET is a snapshot, not proof the original PATCH has stopped.
-      // Only seeing the requested endpoint settles this attempt.
-      else checks[id] = { ...check, phase: connection.baseUrl === check.to ? "saved" : "not-settled" };
+      if (!connection) {
+        delete checks[id];
+        connectionsError.set("This connection is no longer available to edit.");
+      } else if (check.refusal) {
+        // A definite refusal never saved the draft, even if someone else
+        // has since chosen the same URL. Always ask for fresh review.
+        checks[id] = { ...check, phase: "review" };
+      } else {
+        // A GET is a snapshot, not proof an uncertain PATCH has stopped.
+        checks[id] = { ...check, phase: connection.baseUrl === check.to ? "saved" : "not-settled" };
+      }
       endpointChecks.set(checks);
     });
   } finally {
@@ -845,18 +856,34 @@ export async function updateEndpoint(id: string, url: string): Promise<EndpointR
     }
     const status = error instanceof ApiError ? error.status : null;
     const detail = status ? `PATCH endpoint: HTTP ${status}` : undefined;
-    if (status === 400 && /allowed_base_urls/i.test(serverReason(error) ?? "")) {
-      void loadCatalog();
-      return { kind: "not-approved" };
-    }
-    if ((status === 502 || status === 504) && /^the new endpoint failed/i.test(serverReason(error) ?? "")) {
-      const reason = status === 504 ? "the test timed out" : "the connection test failed";
-      return { kind: "refused", message: `The new endpoint didn't answer (${reason}). The connection still uses the old one.`, detail };
+    let refusal: EndpointCheck["refusal"];
+    if (error instanceof EndpointPatchError) {
+      switch (error.code) {
+        case "endpoint_not_approved":
+          void loadCatalog();
+          return { kind: "not-approved" };
+        case "endpoint_probe_busy":
+          return { kind: "refused", message: "The server has too many endpoint tests running. No change was saved. Try again shortly.", retry: true, detail };
+        case "endpoint_probe_failed": {
+          const reason = status === 504 ? "the test timed out" : "the connection test failed";
+          return { kind: "refused", message: `The new endpoint didn't answer (${reason}). The connection still uses the old one.`, retry: true, detail };
+        }
+        case "endpoint_rejected":
+          return { kind: "refused", message: `Metro didn't save the endpoint change: ${error.reason}`, retry: false, detail };
+        case "endpoint_conflict":
+          refusal = "conflict";
+          break;
+        case "endpoint_missing":
+          refusal = "missing";
+          break;
+      }
     }
     batch(() => {
       // An old refresh's result can't later overwrite the reloaded endpoint.
       invalidateEndpointListing(id);
-      endpointChecks.set({ ...endpointChecks(), [id]: { phase: "unknown", from: current.baseUrl, to: url, detail: detail ?? "Endpoint response was not confirmed" } });
+      endpointChecks.set({
+        ...endpointChecks(), [id]: { phase: "unknown", refusal, from: current.baseUrl, to: url, detail: detail ?? "Endpoint response was not confirmed" },
+      });
     });
     return { kind: "unconfirmed" };
   } finally {

@@ -71,7 +71,9 @@ export function fakeServer() {
     connections: new Map<string, Conn>(),
     allowedBaseUrls: [...CATALOG.allowed_base_urls],
     /** Scripted endpoint test failures, before PATCH commits; never a live provider request. */
-    endpointRefusals: new Map<string, { status: number; error: string }>(),
+    endpointRefusals: new Map<string, { status: number; error: string; code?: string }>(),
+    /** A different writer commits while Metro's endpoint test is running. */
+    endpointConcurrentEdits: new Map<string, { name: string; baseUrl: string }>(),
     endpointProbes: [] as string[],
     /** Break only the response to a committed endpoint PATCH. */
     endpointAck: new Map<string, "lost" | "malformed">(),
@@ -129,7 +131,7 @@ export function fakeServer() {
     return Object.keys(TOKENS).find((u) => auth === `Bearer ${TOKENS[u]}`);
   };
   const ok = (body: unknown, status = 200) => ({ status, body });
-  const err = (status: number, error: string) => ({ status, body: { error } });
+  const err = (status: number, error: string, code?: string) => ({ status, body: { error, ...(code ? { code } : {}) } });
   const spaceJson = (s: Space, user: string) => ({ id: s.id, name: s.name, role: s.owner === user ? "owner" : "member", runner_paired: !!s.runnerToken || state.attached.has(s.id) });
   const admin = (user: string) => ORG_ADMINS.includes(user);
   const visibleRunner = (r: Runner | undefined, user: string) => !!r && (r.visibility === "organization" || r.owner === user);
@@ -409,10 +411,12 @@ export function fakeServer() {
       if (!r[2] && req.method === "PATCH") {
         if (body.base_url !== undefined) {
           const provider = CATALOG.providers.find((p) => p.id === c.provider_id);
-          if (device || !provider?.allow_custom_url) return err(400, "not a custom server connection");
+          if (device || !provider?.allow_custom_url) return err(400, "not a custom server connection", "endpoint_rejected");
           const url = body.base_url;
-          if (!state.allowedBaseUrls.includes(url)) return err(400, "base_url must be exactly one of this server's allowed_base_urls");
+          if (!state.allowedBaseUrls.includes(url)) return err(400, "base_url must be exactly one of this server's allowed_base_urls", "endpoint_not_approved");
           if (url !== c.base_url) {
+            const refusal = state.endpointRefusals.get(url);
+            if (refusal?.code === "endpoint_probe_busy") return err(refusal.status, refusal.error, refusal.code);
             state.endpointProbes.push(url);
             if (state.heldEndpointProbes.delete(url)) {
               const previous = c.base_url;
@@ -422,8 +426,14 @@ export function fakeServer() {
               });
               return err(504, "Gateway Timeout");
             }
-            const refusal = state.endpointRefusals.get(url);
-            if (refusal) return err(refusal.status, refusal.error);
+            if (refusal) return err(refusal.status, refusal.error, refusal.code);
+            const concurrent = state.endpointConcurrentEdits.get(url);
+            if (concurrent) {
+              state.endpointConcurrentEdits.delete(url);
+              c.name = concurrent.name;
+              c.base_url = concurrent.baseUrl;
+              return err(409, "the connection changed while this change was being saved; reload it and try again", "endpoint_conflict");
+            }
             c.base_url = url;
             const ack = state.endpointAck.get(url);
             state.endpointAck.delete(url);
