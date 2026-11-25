@@ -84,6 +84,7 @@ import type { AskAgentChoice } from "../ui";
 import type { SpaceAgent } from "../api/spaces";
 import { RESERVED_HANDLE } from "../api/spaces";
 import { Composer, ConnectionBanner, fillDraft, focusComposer, messageAuthorName, replyExcerpt, Transcript } from "./Conversation";
+import { isCommandDraft } from "./commands/registry";
 import { NewSpaceRunnerFeedback } from "./CreateSpaceForm";
 import type { DraftIdea } from "./Conversation";
 import type { RoomEvent } from "../store";
@@ -330,14 +331,16 @@ function RoomComposer(props: { thread?: boolean }) {
   const optionRefs = new Map<string, ViewRef>();
   /** The composer's field has the keyboard focus. */
   const fieldFocused = signal(false);
+  const commandDraft = () => isCommandDraft(draft());
   let atButton: ViewRef | null = null;
   const preview = computed(previewMentionDraft);
-  const matches = computed(() => previewMentionMatches(preview()));
+  const matches = computed(() => commandDraft() ? [] : previewMentionMatches(preview()));
   const ambiguous = () => matches().find(d => d.kind === "ambiguous");
   const currentDirectory = () => ambiguous()?.preflight ? verifiedConfirmationDirectory()
     : activeSpaceId() ? spaceMentionDirectory(activeSpaceId()!) : null;
   const unresolved = () => matches().find(d => d.kind === "unresolved");
-  const chips = computed(() => mentions().filter(a => !matches().some(m => m.kind === "ambiguous" && m.start === a.start)));
+  const chips = computed(() => commandDraft() ? [] :
+    mentions().filter(a => !matches().some(m => m.kind === "ambiguous" && m.start === a.start)));
   const replyAgent = () => {
     const target = replyTarget();
     if (!target || target.event.kind !== "agent" || target.muted) return null;
@@ -376,7 +379,8 @@ function RoomComposer(props: { thread?: boolean }) {
     return index < 0 && !ambiguous() ? 0 : index;
   };
   const typing = () => !!partial() && fieldFocused() && (options().length > 0 || !currentDirectory() && !query());
-  const open = () => inSpaceComposer() && (explicit() || dismissedAt() !== draft() && (typing() || !!ambiguous() && fieldFocused()));
+  const open = () => inSpaceComposer() && !commandDraft() &&
+    (explicit() || dismissedAt() !== draft() && (typing() || !!ambiguous() && fieldFocused()));
 
   // The same roster feeds sent chips even if the picker was never opened.
   const visitKey = computed(() => spaceSettingsFor() ? null : mentionVisitKey());
@@ -533,7 +537,7 @@ function RoomComposer(props: { thread?: boolean }) {
           accessibilityLabel="Mention the agent or a member"
           tooltip="Mention someone (@)"
           active={open()}
-          disabled={!activeRoom()}
+          disabled={!activeRoom() || commandDraft()}
           ref={(node) => (atButton = node)}
           onPress={toggle}
         />
@@ -545,7 +549,7 @@ function RoomComposer(props: { thread?: boolean }) {
               <Label variant="caption" color="muted" lines={2} testID="composer-reply-quote">
                 {messageAuthorName(target().event)} · {replyExcerpt(target().event)}
               </Label>
-              <If when={replyAgent()}>
+              <If when={commandDraft() ? null : replyAgent()}>
                 {agent => <RecipientBar><RecipientChip testID="reply-agent-chip" agent
                   label={`Replying to ${agent().name}`} accessibilityLabel={`Don't ask ${agent().name} to reply`}
                   onRemove={() => { muteReplyAgent(); focusComposer(); }} /></RecipientBar>}

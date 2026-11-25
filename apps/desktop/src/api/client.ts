@@ -111,6 +111,7 @@ export type RoomEvent = {
   via?: "metro";
   forwarded?: { authorName: string; authorKind: "person" | "agent"; sentAt?: string; sameSpace?: { roomId: string; eventId: number } };
   replies?: { roomId: string; count: number; lastAt?: string; participantIds: string[] };
+  compaction?: { events: number; trigger: "auto" | "manual"; byName: string; focus?: string };
 };
 export type ReplyAddress = { eventId: number; askAgent: boolean; agentId?: string };
 /**
@@ -132,7 +133,10 @@ export type Member = { userId: string; role: SpaceRole };
 export type Run = {
   id: string; spaceId: string; roomId: string; status: string; actor: string; task: string;
   kind?: "room"; agentId?: string; triggerEventId?: number; startedAt?: string;
+  compactionFailure?: string;
 };
+
+export type CompactionPrefs = { auto: boolean; at_percent: number };
 
 /** Who is signed in. `isOrgAdmin`: may create and manage organization runners. */
 export type Me = { id: string; canonicalId: string | null; isOrgAdmin: boolean };
@@ -245,6 +249,7 @@ export type ConnectionModel = {
   isDefault: boolean;
   thinking: ModelThinking | null;
   reasoningEfforts: string[];
+  contextTokens?: number | null;
 };
 
 /** A connection's model list as the server answers a change to it. */
@@ -253,8 +258,8 @@ export type ConnectionModelList = { connectionId: string; defaultModel: string |
 /** What a refresh of a connection's model list did. */
 export type ModelRefresh = { models: string[]; added: number; unavailable: number; connection: ProviderConnection | null };
 
-export type NewConnectionModel = { model_id: string; display_name?: string; thinking?: ModelThinking };
-export type ConnectionModelPatch = { model_id: string; display_name?: string | null; enabled?: boolean; thinking?: ModelThinking | null; position?: number; default?: true };
+export type NewConnectionModel = { model_id: string; display_name?: string; thinking?: ModelThinking; context_tokens?: number };
+export type ConnectionModelPatch = { model_id: string; display_name?: string | null; enabled?: boolean; thinking?: ModelThinking | null; position?: number; default?: true; context_tokens?: number | null };
 
 /** A chat model in the grouped picker (GET /v1/models/available `chat_providers`). */
 export type PickerModel = { id: string; displayName: string; reasoningEfforts: string[]; isDefault: boolean; available: boolean };
@@ -448,6 +453,7 @@ export function createClient(options: ClientOptions) {
       checkCancelled();
       const errorDetails = path.startsWith("/v1/pages") ? "pages"
         : path === "/v1/forward" ? "forward"
+        : method === "POST" && path.endsWith("/compact") ? "compact"
         : method === "PATCH" && /^\/v1\/providers\/[^/]+$/.test(path) && isObject(body) && "base_url" in body ? "endpoint"
         : /^\/v1\/library\/(?:settings|index|search)\/selection$/.test(path) ? "library" : undefined;
       await checkStatus(response, method, path, errorDetails);
@@ -909,6 +915,22 @@ export function createClient(options: ClientOptions) {
     },
 
     /** The user's personal Chat, outside every Space. */
+    async compact(scope: { kind: "chat" } | { kind: "room"; spaceId: string; roomId: string }, focus: string): Promise<RoomEvent> {
+      const path = scope.kind === "chat" ? "/v1/chat/compact" : `${room(scope.spaceId, scope.roomId)}/compact`;
+      const event = decodeEvent(await request("POST", path, focus ? { focus } : {}, undefined, 610_000));
+      if (!event?.compaction) throw new ApiError("protocol", "The server did not return a summary.");
+      return event;
+    },
+
+    async compactionPrefs(prefs?: CompactionPrefs): Promise<CompactionPrefs> {
+      const data = await request(prefs ? "PUT" : "GET", "/v1/compaction", prefs);
+      if (!isObject(data) || typeof data.auto !== "boolean" || typeof data.at_percent !== "number" ||
+        !Number.isInteger(data.at_percent) || data.at_percent < 40 || data.at_percent > 90) {
+        throw new ApiError("protocol", "The server did not return summary preferences.");
+      }
+      return { auto: data.auto, at_percent: data.at_percent };
+    },
+
     async listChatEvents(after: number): Promise<RoomEvent[]> {
       const data = await request("GET", `/v1/chat/events?after=${encodeURIComponent(String(after))}`);
       const events = isObject(data) ? data.events : undefined;
@@ -1157,6 +1179,8 @@ function toConnectionModels(value: unknown): ConnectionModel[] {
       isDefault: m.is_default === true,
       thinking: toThinking(m.thinking),
       reasoningEfforts: efforts(m.reasoning_efforts),
+      contextTokens: typeof m.context_tokens === "number" && Number.isInteger(m.context_tokens) &&
+        m.context_tokens >= 1024 && m.context_tokens <= 10_000_000 ? m.context_tokens : null,
     });
   }
   return out;
@@ -1269,7 +1293,7 @@ function toRoom(v: WireRoom): Room {
 }
 
 type WireRun = { id: string | number; space_id: string | number; room_id: string | number; status: string; actor: string; task: string;
-  kind?: unknown; agent_id?: unknown; trigger_event_id?: unknown; started_at?: unknown };
+  kind?: unknown; agent_id?: unknown; trigger_event_id?: unknown; started_at?: unknown; compaction_failure?: unknown };
 function isRun(v: unknown): v is WireRun {
   return (
     isObject(v) &&
@@ -1284,6 +1308,8 @@ function isRun(v: unknown): v is WireRun {
 
 function toRun(r: WireRun): Run {
   const startedAt = toCreatedAt(r.started_at);
+  const reason = isObject(r.compaction_failure) && typeof r.compaction_failure.message === "string"
+    ? r.compaction_failure.message.trim().slice(0, 1200) : "";
   return {
     id: String(r.id), spaceId: String(r.space_id), roomId: String(r.room_id),
     status: r.status, actor: r.actor, task: r.task,
@@ -1291,6 +1317,7 @@ function toRun(r: WireRun): Run {
     ...(typeof r.agent_id === "string" && r.agent_id ? { agentId: r.agent_id } : {}),
     ...(isEventId(r.trigger_event_id) ? { triggerEventId: r.trigger_event_id } : {}),
     ...(startedAt ? { startedAt } : {}),
+    ...(reason ? { compactionFailure: reason } : {}),
   };
 }
 
@@ -1305,6 +1332,13 @@ export const decodeEvent = (value: unknown): RoomEvent | null => isEvent(value) 
 function toEvent(v: RoomEvent): RoomEvent {
   const raw = v as unknown as Record<string, unknown>;
   const event: RoomEvent = { id: v.id, kind: v.kind, actor: v.actor, text: v.text };
+  const summary = raw.compaction;
+  if (event.kind === "compaction" && event.actor === "system" && isObject(summary) &&
+    isEventId(summary.events) && (summary.trigger === "auto" || summary.trigger === "manual") &&
+    typeof summary.by_name === "string" && summary.by_name.trim()) {
+    event.compaction = { events: summary.events, trigger: summary.trigger, byName: summary.by_name,
+      ...(typeof summary.focus === "string" && summary.focus ? { focus: summary.focus } : {}) };
+  }
   const indexes = new Map<number, number>();
   if (Array.isArray(raw.mentions)) {
     const mentions: Mention[] = [];
@@ -1524,9 +1558,16 @@ function endpointRefusal(data: unknown, status: number): EndpointPatchError | nu
 }
 
 /** Maps a non-2xx response to its ApiError. */
-async function checkStatus(response: Response, method: string, path: string, errorDetails?: "pages" | "endpoint" | "library" | "forward"): Promise<void> {
+async function checkStatus(response: Response, method: string, path: string, errorDetails?: "pages" | "endpoint" | "library" | "forward" | "compact"): Promise<void> {
   if (response.status === 401) {
     throw new ApiError("auth", "The server rejected the access token (HTTP 401). Check the token and connect again.", 401);
+  }
+  if (errorDetails === "compact" && (response.status === 409 || response.status === 502)) {
+    const data: unknown = await response.json().catch(() => undefined);
+    const code = isObject(data) ? data.code : undefined;
+    const reason = response.status === 502 && code === "summary_failed" &&
+      isObject(data) && typeof data.error === "string" ? data.error.trim().slice(0, 400) : "";
+    throw new ApiError("http", reason || "The server could not summarize this conversation.", response.status, code);
   }
   if (errorDetails === "forward" && response.status === 404) {
     const body: unknown = await response.json().catch(() => undefined);

@@ -699,6 +699,8 @@ export function Field(
     masked?: boolean;
     multiline?: boolean;
     disabled?: boolean;
+    /** A validation message the caller also shows near the field. */
+    error?: string | null;
     autoFocus?: boolean;
     /** For handing focus to the field when opening inline content. */
     inputRef?: (node: InputRef) => void;
@@ -730,6 +732,7 @@ export function Field(
         textClass.md,
         controlHeightClass.default,
         disabledClass,
+        props.error && "border-destructive focus:border-destructive focus:ring-destructive",
         props.multiline && "min-h-[72px] max-h-[160px]",
         props.grow && "flex-1",
       )}
@@ -747,6 +750,8 @@ export function Field(
       autoCorrect={props.masked || props.verbatim ? false : undefined}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.placeholder}
+      accessibilityState={props.error ? { invalid: true } : undefined}
+      accessibilityDescription={props.error ?? undefined}
     />
   );
 }
@@ -1088,6 +1093,7 @@ export function Disclosure(
     /** Content at the header's end (a badge). Keep it non-interactive. */
     trailing?: JSX.Element;
     disabled?: boolean;
+    centered?: boolean;
     children?: JSX.Element;
   },
 ) {
@@ -1105,6 +1111,7 @@ export function Disclosure(
           focusRing,
           transitionClass,
           disabledClass,
+          props.centered && "self-center max-w-full",
         )}
         role="button"
         focusable={!props.disabled}
@@ -1115,7 +1122,7 @@ export function Disclosure(
         testID={props.testID ? `${props.testID}:toggle` : undefined}
       >
         <Icon name={props.open ? "chevron-down" : "chevron-right"} color="muted" size={14} />
-        <Text class={cx(textClass.sm, "font-semibold text-foreground")} style={{ numberOfLines: 1 }}>
+        <Text class={cx(textClass.sm, "font-semibold text-foreground", props.centered && "shrink min-w-0")} style={{ numberOfLines: props.centered ? 2 : 1 }}>
           {props.title}
         </Text>
         <If when={props.summary}>
@@ -1123,7 +1130,7 @@ export function Disclosure(
             {props.summary}
           </Text>
         </If>
-        <View class="flex-1" />
+        <If when={!props.centered || !!props.trailing}><View class="flex-1" /></If>
         {props.trailing}
       </View>
     </Collapsible>

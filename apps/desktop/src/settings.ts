@@ -653,6 +653,7 @@ export function addConnectionModel(id: string, model: NewConnectionModel): Promi
   const body: NewConnectionModel = { model_id: model.model_id.trim() };
   if (model.display_name?.trim()) body.display_name = model.display_name.trim();
   if (model.thinking && model.thinking.efforts.length > 0 && model.thinking.wire !== "none") body.thinking = model.thinking;
+  if (model.context_tokens !== undefined) body.context_tokens = model.context_tokens;
   if (!body.model_id) {
     connectionsError.set("Enter the model ID your provider documents.");
     return Promise.resolve(false);

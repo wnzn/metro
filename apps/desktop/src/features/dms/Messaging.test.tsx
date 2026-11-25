@@ -133,6 +133,18 @@ test("directory debounces, paginates by cursor, suppresses stale matches, and Re
   expect(app.shows("id:directory-notice")).toBe(false);
 });
 
+test("a leading slash is ordinary text in a DM", async () => {
+  const { app, calls, incoming } = await fixture();
+  incoming("Hello");
+  await app.waitFor("id:dm:dm-one");
+  await app.press("id:dm:dm-one");
+  await app.type("id:dm-composer", "/compact");
+  expect(app.shows("id:command-suggestions")).toBe(false);
+  await app.submit("id:dm-composer");
+  await app.waitUntil(() => calls.some(c => c.path === `${dmPath}/messages` && c.body.text === "/compact"));
+  expect(calls.some(c => c.path.endsWith("/compact"))).toBe(false);
+});
+
 test("DM unread, keyboard reply, markdown send, reactions, hide, reappearance and access loss", async () => {
   const { app, calls, incoming, denyDm } = await fixture();
   const old = incoming("A private **message**");
