@@ -502,7 +502,6 @@ pub async fn update(
     let previous = row.clone();
     let entry = catalog::find(&row.provider_id)
         .ok_or_else(|| conflict("this connection's provider is no longer supported"))?;
-    let changing_endpoint = body.base_url.is_some();
     if let Some(url) = body.base_url {
         if entry.is_device() {
             return Err(device_has_no_key());
@@ -543,27 +542,46 @@ pub async fn update(
             "a default connection needs a model; choose one first",
         ));
     }
-    if changing_endpoint {
-        test_endpoint(&state, entry, &row).await?;
-    }
-    let saved = {
-        let row = row.clone();
-        state
-            .db
-            .call(move |db| Ok(store::update_if_current(&mut db.lock(), &row, &previous)?))
-            .await
-            .map_err(ApiError::internal)?
+    let changing_endpoint = row.base_url != previous.base_url;
+    let saved = save_update(&state, entry, row, previous).await?;
+    let Some(row) = saved else {
+        if changing_endpoint {
+            load(&state, &who, &id).await?;
+            return Err(conflict(
+                "the connection changed while testing the endpoint; try again",
+            ));
+        }
+        return Err(not_found());
     };
-    let Some(rev) = saved else {
-        load(&state, &who, &id).await?;
-        return Err(conflict(if changing_endpoint {
-            "the connection changed while testing the endpoint; try again"
-        } else {
-            "the connection changed while saving; try again"
-        }));
-    };
-    row.config_rev = rev;
     Ok(Json(view_of(&state, row).await?))
+}
+
+async fn save_update(
+    state: &AppState,
+    entry: &Entry,
+    row: Row,
+    previous: Row,
+) -> ApiResult<Option<Row>> {
+    let changing_endpoint = row.base_url != previous.base_url;
+    if changing_endpoint {
+        test_endpoint(state, entry, &row).await?;
+    }
+    state
+        .db
+        .call(move |db| {
+            let mut conn = db.lock();
+            let revision = if changing_endpoint {
+                store::update_if_current(&mut conn, &row, &previous)?
+            } else {
+                store::update(&mut conn, &row)?
+            };
+            if revision.is_none() {
+                return Ok(None);
+            }
+            Ok(store::get(&conn, &row.user_id, &row.id)?)
+        })
+        .await
+        .map_err(ApiError::internal)
 }
 
 /// Test only the candidate config. Never include upstream response bodies,
@@ -576,14 +594,15 @@ async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<
             }
             _ => list_server_models(state, entry, row).await.map(|_| ()),
         };
-        return result.map_err(|e| {
-            ApiError::new(
-                StatusCode::BAD_GATEWAY,
+        return result.map_err(|e| match e.status() {
+            StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => ApiError::new(
+                e.status(),
                 format!(
                     "the new endpoint failed its model listing test: {}",
                     e.message()
                 ),
-            )
+            ),
+            _ => e,
         });
     }
     if row.model.is_empty() {
@@ -592,7 +611,7 @@ async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<
         ));
     }
     let Ok(_permit) = state.providers.inner.listings.try_acquire() else {
-        return Err(conflict(
+        return Err(ApiError::unavailable(
             "too many endpoint tests are running; try again shortly",
         ));
     };
@@ -664,13 +683,16 @@ async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<
 
 #[cfg(test)]
 #[tokio::test]
-async fn providers_without_listing_get_only_a_minimal_capability_probe() {
+async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
     use std::sync::Arc;
 
     use axum::{Router, routing::post};
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let base = format!("{origin}/v1");
+    let failing = format!("{origin}/failed/v1");
+    let original = format!("{origin}/original/v1");
     let app = Router::new()
             .route(
                 "/v1/systemone",
@@ -704,7 +726,8 @@ async fn providers_without_listing_get_only_a_minimal_capability_probe() {
                         "choices": [{"index": 0, "finish_reason": "stop", "message": {"role": "assistant", "content": "OK"}}],
                     }))
                 }),
-            );
+            )
+            .fallback(|| async { StatusCode::BAD_GATEWAY });
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
     let auth = metro_auth::Authenticator::from_lookup(|key| {
         Ok((key == metro_auth::env::DEV_USERS).then(|| r#"{"user":"fixture-dev-token"}"#.into()))
@@ -725,29 +748,87 @@ async fn providers_without_listing_get_only_a_minimal_capability_probe() {
     )
     .await
     .unwrap();
-    state.providers = super::ProviderService::new(None, vec![base.clone()]).unwrap();
-    for id in [
-        catalog::CUSTOM_SYSTEMONE,
-        catalog::CUSTOM_EMBEDDINGS,
-        catalog::CUSTOM,
+    state.providers =
+        super::ProviderService::new(None, vec![base.clone(), original.clone(), failing.clone()])
+            .unwrap();
+    for (id, operation) in [
+        (catalog::CUSTOM_SYSTEMONE, "System One Noul"),
+        (catalog::CUSTOM_EMBEDDINGS, "embeddings"),
+        (catalog::CUSTOM, "chat completion"),
     ] {
         let mut entry = catalog::find(id).unwrap().clone();
-        // Exercise the fallback even for adapters that advertise listing
-        // in today's catalog. The fixture deliberately offers no /models.
-        entry.lists_models = false;
-        let row = Row {
+        let previous = Row {
             id: new_connection_id(),
             user_id: "user".into(),
             name: "fixture".into(),
             provider_id: id.into(),
-            base_url: Some(base.clone()),
+            base_url: Some(original.clone()),
             model: "probe-model".into(),
             is_default: false,
             sealed_key: None,
             capability: entry.capability,
             config_rev: 0,
         };
-        test_endpoint(&state, &entry, &row).await.unwrap();
+        assert!(store::insert(&mut state.db.lock(), &previous, 20).unwrap());
+
+        let mut row = previous.clone();
+        row.base_url = Some(failing.clone());
+        let permit = state
+            .providers
+            .inner
+            .listings
+            .try_acquire_many(super::MAX_LISTINGS as u32)
+            .unwrap();
+        for lists_models in [true, false] {
+            entry.lists_models = lists_models;
+            let err = save_update(&state, &entry, row.clone(), previous.clone())
+                .await
+                .unwrap_err();
+            assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
+            assert!(!err.message().contains("failed its model listing test"));
+        }
+        drop(permit);
+
+        // Listing errors local to Metro must keep their status and message.
+        entry.lists_models = true;
+        row.sealed_key = Some(vec![0]);
+        let err = save_update(&state, &entry, row.clone(), previous.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::CONFLICT);
+        assert_eq!(err.message(), UseError::NoMasterKey.to_string());
+        row.sealed_key = None;
+
+        // Exercise the minimal wire even when today's catalog lists models.
+        entry.lists_models = false;
+        let err = save_update(&state, &entry, row.clone(), previous.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(err.status(), StatusCode::BAD_GATEWAY);
+        assert!(
+            err.message()
+                .contains(&format!("failed its {operation} test"))
+        );
+        let saved = store::get(&state.db.lock(), &previous.user_id, &previous.id).unwrap();
+        assert_eq!(saved.as_ref(), Some(&previous));
+
+        row.base_url = Some(base.clone());
+        let saved = save_update(&state, &entry, row, previous.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.base_url.as_deref(), Some(base.as_str()));
+
+        // A regular PATCH from a stale snapshot still wins without a second
+        // probe, and must not write the old endpoint back.
+        let mut rename = previous.clone();
+        rename.name = "Renamed".into();
+        let saved = save_update(&state, &entry, rename, previous)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(saved.name, "Renamed");
+        assert_eq!(saved.base_url.as_deref(), Some(base.as_str()));
     }
 }
 

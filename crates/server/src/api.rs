@@ -64,6 +64,9 @@ impl ApiError {
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
+    pub(crate) fn status(&self) -> StatusCode {
+        self.status
+    }
     pub fn internal(e: anyhow::Error) -> Self {
         tracing::error!(error = %format!("{e:#}"), "internal error");
         Self::new(StatusCode::INTERNAL_SERVER_ERROR, "internal error")

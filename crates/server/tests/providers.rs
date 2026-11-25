@@ -754,6 +754,67 @@ async fn changing_endpoint_tests_before_saving_and_keeps_connection_settings() {
 }
 
 #[tokio::test]
+async fn changing_a_system_one_endpoint_tests_its_typed_model_listing() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let old = format!("{origin}/original/v1");
+    let new = format!("{origin}/candidate/v1");
+    let seen = Arc::new(AtomicUsize::new(0));
+    let app = axum::Router::new().route(
+        "/candidate/v1/models",
+        get({
+            let seen = seen.clone();
+            move || async move {
+                seen.fetch_add(1, Ordering::Relaxed);
+                Json(json!({"models": [{"name": "jev-test"}]}))
+            }
+        }),
+    );
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let s = Server::start(
+        None,
+        Db::open_in_memory().unwrap(),
+        None,
+        vec![old.clone(), new.clone()],
+    )
+    .await;
+    let c = s
+        .connect(
+            ALICE,
+            json!({
+                "name": "System One", "provider_id": "custom-systemone",
+                "base_url": old, "model": "jev-test",
+            }),
+        )
+        .await;
+    let path = format!("/v1/providers/{}", c["id"].as_str().unwrap());
+    let (status, updated) = s.patch(ALICE, &path, json!({"base_url": new})).await;
+    assert_eq!(status, StatusCode::OK, "{updated}");
+    assert_eq!(updated["base_url"], new);
+    assert_eq!(updated["model"], "jev-test");
+    assert_eq!(updated["is_default"], c["is_default"]);
+    assert_eq!(s.connection(ALICE, &c["id"]).await, updated);
+    assert_eq!(seen.load(Ordering::Relaxed), 1);
+
+    // The normalized URL is already saved, so sending it again is a
+    // regular PATCH, not an additional probe.
+    let (status, renamed) = s
+        .patch(
+            ALICE,
+            &path,
+            json!({
+                "base_url": format!("{new}/"), "name": "Renamed",
+            }),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(renamed["name"], "Renamed");
+    assert_eq!(seen.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
 async fn endpoint_probe_cannot_overwrite_a_concurrent_edit() {
     let old = Fixture::start(&["keep"], Listing::Ok, "old").await;
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
