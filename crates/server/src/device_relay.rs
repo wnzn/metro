@@ -127,12 +127,22 @@ pub fn is_device_provider(provider: &str) -> bool {
     DEVICE_PROVIDERS.contains(&provider)
 }
 
+/// A person's *web device* (`crate::web_devices`): their desktop app or
+/// `metro-connector` running web searches with their own providers and keys.
+/// Not a model provider (never in [`DEVICE_PROVIDERS`], never shared or
+/// borrowed); it serves `web_search` and `web_fetch` only.
+pub const DEVICE_WEB: &str = "device-web";
+
 /// Whether a device connection of `provider` serves `operation`.
 pub fn serves(provider: &str, operation: Operation) -> bool {
+    if provider == DEVICE_WEB {
+        return matches!(operation, Operation::WebSearch | Operation::WebFetch);
+    }
     if !is_device_provider(provider) {
         return false;
     }
     match operation {
+        Operation::WebSearch | Operation::WebFetch => false,
         Operation::Models => true,
         Operation::Complete => !matches!(
             provider,
@@ -173,6 +183,12 @@ pub enum Operation {
     /// `device-embeddinggemma-2`.
     #[serde(rename = "media_embed")]
     MediaEmbed,
+    /// One web search on a person's own web device (`device-web` only).
+    #[serde(rename = "web_search")]
+    WebSearch,
+    /// Reading web pages on a person's own web device (`device-web` only).
+    #[serde(rename = "web_fetch")]
+    WebFetch,
 }
 
 /// Who asks for a relayed call, and where. Kept with the job so a borrowed
@@ -494,6 +510,26 @@ fn credential_by_hash(
     .optional()
 }
 
+/// The connection `id`: a web device (`wd_…`, from `crate::web_devices`),
+/// else whatever the providers' directory knows.
+fn lookup(
+    directory: &dyn ConnectionDirectory,
+    conn: &Connection,
+    id: &str,
+) -> anyhow::Result<Option<DeviceConnection>> {
+    if crate::web_devices::is_web_device_id(id) {
+        return crate::web_devices::device_connection(conn, id);
+    }
+    Ok(directory
+        .device_connection(conn, id)?
+        .filter(|c| c.provider != DEVICE_WEB))
+}
+
+/// Whether `provider` may hold a device token.
+fn takes_device_token(provider: &str) -> bool {
+    is_device_provider(provider) || provider == DEVICE_WEB
+}
+
 /// The connection, when it exists, belongs to `owner` and is a device one.
 fn owned_device_connection(
     directory: &dyn ConnectionDirectory,
@@ -501,9 +537,7 @@ fn owned_device_connection(
     owner: &str,
     connection: &str,
 ) -> anyhow::Result<Option<DeviceConnection>> {
-    Ok(directory
-        .device_connection(conn, connection)?
-        .filter(|c| c.id == connection && c.owner_id == owner))
+    Ok(lookup(directory, conn, connection)?.filter(|c| c.id == connection && c.owner_id == owner))
 }
 
 // ---------------------------------------------------------------------------
@@ -573,6 +607,8 @@ struct Job {
     borrowed: Option<Caller>,
     /// Taken when claimed, so the payload lives no longer than needed.
     request: Option<Value>,
+    /// How long the device may take once it claimed the job.
+    run_timeout: Duration,
     /// What this job holds of `max_pending_media_bytes` (0 for text work),
     /// charged to `caller` and `connection` too.
     media_bytes: usize,
@@ -944,6 +980,7 @@ impl DeviceRelay {
             size,
             true,
             Some((expected, grant)),
+            None,
         )
         .await
     }
@@ -1030,6 +1067,7 @@ impl DeviceRelay {
                 size,
                 true,
                 None,
+                None,
             )
             .await?;
         metro_model_protocol::check_media_response(
@@ -1097,6 +1135,36 @@ impl DeviceRelay {
             size,
             allow_borrow,
             None,
+            None,
+        )
+        .await
+    }
+
+    /// One web job (`web_search` / `web_fetch`) on `owner`'s own web device
+    /// `connection`, never borrowed, with its own `run_timeout`.
+    pub async fn dispatch_web(
+        &self,
+        db: &Db,
+        owner: &str,
+        connection: &str,
+        operation: Operation,
+        request: Value,
+        run_timeout: Duration,
+    ) -> Result<Value, DeviceError> {
+        if !matches!(operation, Operation::WebSearch | Operation::WebFetch) {
+            return Err(DeviceError::NotFound);
+        }
+        let size = metro_model_protocol::json_len(&request);
+        self.dispatch_sized(
+            db,
+            &Caller::personal(owner),
+            connection,
+            operation,
+            request,
+            size,
+            false,
+            None,
+            Some(run_timeout),
         )
         .await
     }
@@ -1113,6 +1181,7 @@ impl DeviceRelay {
         size: usize,
         allow_borrow: bool,
         selection: Option<(ExpectedDevice, crate::providers::guard::DeviceClaimGrant)>,
+        run_timeout: Option<Duration>,
     ) -> Result<Value, DeviceError> {
         let media = operation == Operation::MediaEmbed;
         let cap = if media {
@@ -1128,15 +1197,17 @@ impl DeviceRelay {
         let (generation, owner, borrowed) = db
             .call(move |db| {
                 let conn = db.lock();
-                let Some(dc) = directory
-                    .device_connection(&conn, &c)?
+                let Some(dc) = lookup(&*directory, &conn, &c)?
                     .filter(|d| d.id == c && serves(&d.provider, operation))
                 else {
                     return Ok(Err(DeviceError::NotFound));
                 };
                 let borrowed = dc.owner_id != who.user;
+                // A web device is never borrowed: searches run only on the
+                // asking person's own machine.
                 if borrowed
                     && (!allow_borrow
+                        || dc.provider == DEVICE_WEB
                         || dc.provider == SUBSCRIPTION_PROVIDER
                         || !directory.shared_use_allowed(
                             &conn,
@@ -1203,6 +1274,7 @@ impl DeviceRelay {
                     owner: owner.clone(),
                     borrowed: borrowed.then(|| caller.clone()),
                     request: Some(request),
+                    run_timeout: run_timeout.unwrap_or(self.limits.run_timeout),
                     media_bytes,
                     caller: caller.user.clone(),
                     state: JobState::Queued,
@@ -1228,7 +1300,8 @@ impl DeviceRelay {
                     let next = match inner.jobs.get(&id).map(|j| &j.state) {
                         Some(JobState::Queued | JobState::Checking) => Err(DeviceError::NotClaimed),
                         Some(JobState::Claimed { at }) => {
-                            let end = *at + self.limits.run_timeout;
+                            let run = inner.jobs.get(&id).map_or(self.limits.run_timeout, |j| j.run_timeout);
+                            let end = *at + run;
                             if end <= Instant::now() { Err(DeviceError::TimedOut) } else { Ok(end) }
                         }
                         // Finished meanwhile: the result is in the channel.
@@ -1272,12 +1345,13 @@ impl DeviceRelay {
         let (who, c, o) = (caller.clone(), connection.to_owned(), owner.to_owned());
         db.call(move |db| {
             let conn = db.lock();
-            let Some(dc) = directory.device_connection(&conn, &c)? else {
+            let Some(dc) = lookup(&*directory, &conn, &c)? else {
                 return Ok(false);
             };
             if dc.id != c
                 || dc.owner_id != o
                 || dc.owner_id == who.user
+                || dc.provider == DEVICE_WEB
                 || dc.provider == SUBSCRIPTION_PROVIDER
                 || !serves(&dc.provider, operation)
             {
@@ -1527,9 +1601,9 @@ impl DeviceRelay {
         let generation = db
             .call(move |db| {
                 let conn = db.lock();
-                match directory.device_connection(&conn, &c)? {
+                match lookup(&*directory, &conn, &c)? {
                     Some(dc) if dc.id == c && dc.owner_id == o => {
-                        if !is_device_provider(&dc.provider) {
+                        if !takes_device_token(&dc.provider) {
                             return Ok(Err(IssueError::NotDevice));
                         }
                     }
@@ -1609,11 +1683,11 @@ impl DeviceRelay {
             let Some((connection, owner, generation)) = credential_by_hash(&conn, &hash)? else {
                 return Ok(None);
             };
-            match directory.device_connection(&conn, &connection)? {
+            match lookup(&*directory, &conn, &connection)? {
                 Some(dc)
                     if dc.id == connection
                         && dc.owner_id == owner
-                        && is_device_provider(&dc.provider) =>
+                        && takes_device_token(&dc.provider) =>
                 {
                     Ok(Some(Device {
                         connection,
@@ -1904,6 +1978,18 @@ fn empty_object(body: &Bytes) -> Result<(), ApiError> {
     }
 }
 
+/// Web devices have their own routes (`/v1/web-devices`); the provider
+/// routes don't know them.
+fn not_web_device(id: &str) -> Result<(), ApiError> {
+    if crate::web_devices::is_web_device_id(id) {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "no such provider connection",
+        ));
+    }
+    Ok(())
+}
+
 /// `POST /v1/providers/{id}/device-token`: issue or rotate. Owner only.
 pub async fn issue_device_token(
     State(state): State<AppState>,
@@ -1912,6 +1998,7 @@ pub async fn issue_device_token(
     body: Bytes,
 ) -> Result<Response, ApiError> {
     empty_object(&body)?;
+    not_web_device(&id)?;
     let token = state.device.issue_token(&state.db, &human.id, &id).await?;
     tracing::info!(connection = %id, "device token issued");
     Ok((StatusCode::CREATED, Json(json!({ "token": token }))).into_response())
@@ -1923,6 +2010,7 @@ pub async fn revoke_device_token(
     human: Human,
     Path(id): Path<String>,
 ) -> Result<StatusCode, ApiError> {
+    not_web_device(&id)?;
     state.device.revoke_token(&state.db, &human.id, &id).await?;
     tracing::info!(connection = %id, "device token revoked");
     Ok(StatusCode::NO_CONTENT)
@@ -1934,6 +2022,7 @@ pub async fn device_token_status(
     human: Human,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
+    not_web_device(&id)?;
     let paired = state
         .device
         .paired(&state.db, &human.id, &id)
@@ -2076,6 +2165,13 @@ fn validate_response(operation: Operation, response: &Value) -> Result<(), Strin
             (Some(Value::Array(_)), Some(Value::Bool(_))) => Ok(()),
             _ => Err("expected a media embeddings response with data and partial".into()),
         },
+        // Normalized in full by `crate::web_tools`; here only the envelope.
+        Operation::WebSearch | Operation::WebFetch => {
+            match (response.get("v"), response.get("attempts")) {
+                (Some(v), Some(Value::Array(_))) if v == 1 => Ok(()),
+                _ => Err("expected a web response {\"v\":1,\"attempts\":[..]}".into()),
+            }
+        }
     }
 }
 

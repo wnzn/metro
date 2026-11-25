@@ -31,6 +31,8 @@ pub mod space_agents;
 pub mod space_prefs;
 pub mod spaces;
 pub mod tools;
+pub mod web_devices;
+pub mod web_tools;
 
 use std::sync::Arc;
 
@@ -249,6 +251,8 @@ pub fn router(state: AppState) -> Router {
         // Personal device connector routes (`/v1/device/*` and
         // `POST /v1/providers/{id}/device-token`), with full paths.
         .merge(crate::device_relay::router())
+        // A person's own web search computers and their personal Chat opt-in.
+        .merge(crate::web_devices::router())
         // `GET|PUT /v1/model-routing`, personal routing settings.
         .merge(crate::model_routing::router())
         // Personal semantic search and scheduled prompts, with full paths.

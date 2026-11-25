@@ -162,6 +162,11 @@ pub struct Activity {
     /// e.g. `Picked by classifier: Coder` or `Addressed: @coder`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pick: Option<String>,
+    /// Only on a web tool's `tool_call` / `tool_result` / `error` events:
+    /// which tool, the provider that answered and every attempt
+    /// ([`crate::web_tools`]). Never a query result or page text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<crate::web_tools::ToolNote>,
 }
 
 /// A Space agent as shown on its events: enough to draw its name and
@@ -191,6 +196,7 @@ impl Activity {
             route: None,
             agent: None,
             pick: None,
+            tool: None,
         }
     }
 
@@ -217,6 +223,7 @@ impl Activity {
             route: None,
             agent: None,
             pick: None,
+            tool: None,
         }
     }
 
@@ -227,6 +234,18 @@ impl Activity {
             phase: Some(phase.to_owned()),
             route: None,
             pick: None,
+            tool: None,
+            ..self.clone()
+        }
+    }
+
+    /// This activity with a web tool's note.
+    pub fn with_tool(&self, tool: crate::web_tools::ToolNote) -> Self {
+        Self {
+            phase: None,
+            route: None,
+            pick: None,
+            tool: Some(tool),
             ..self.clone()
         }
     }
@@ -459,6 +478,7 @@ impl Db {
         crate::profiles::init(&conn)?;
         crate::providers::init(&conn)?;
         crate::device_relay::init(&conn)?;
+        crate::web_devices::init(&conn)?;
         crate::model_routing::init(&conn)?;
         crate::search::init(&conn)?;
         crate::schedules::init(&conn)?;
