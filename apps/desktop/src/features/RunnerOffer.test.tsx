@@ -121,12 +121,18 @@ async function startSidebar(app: App, name: string, hasChoice = true) {
   await app.type("id:new-space-name", name);
 }
 
+async function openRunnerSettings(app: App) {
+  await app.press("id:nav-settings");
+  await app.press("id:nav-settings:runners");
+  await app.waitFor("id:runners-settings");
+}
+
 // U5 won't start a new folder demand during a batch. Begin the Settings
 // snapshot first, and hold just its status reply until the interesting race.
 async function openWithHeldFolderStatus(app: App, t: ReturnType<typeof fixture>, delay: number) {
   const before = t.status.reads;
   t.status.delay = delay;
-  await app.press("id:nav-settings");
+  await openRunnerSettings(app);
   await app.waitUntil(() => t.status.reads > before);
   t.status.delay = 0;
 }
@@ -210,7 +216,7 @@ test("a held Reconnect hides both Create checkboxes without silently dropping a 
       await app.waitFor(checkbox);
       await app.type(field, label);
     } else await startSidebar(app, label);
-    await app.press("id:nav-settings");
+    await openRunnerSettings(app);
     await app.press("id:installed-runner-reconnect");
     await app.press("id:installed-runner-reconnect:confirm");
     await app.waitUntil(() => t.status.reconnects === 1);
@@ -243,7 +249,7 @@ test("Reconnect during post-create verification reports the missing attach in th
   const late = f.answerLate("/v1/runners", TOKENS.alice!, 800);
   await app.press("id:create-space");
   await app.waitUntil(() => late.arrived() > 0);
-  await app.press("id:nav-settings");
+  await openRunnerSettings(app);
   await app.press("id:installed-runner-reconnect");
   await app.press("id:installed-runner-reconnect:confirm");
   await app.waitUntil(() => t.status.reconnects === 1);
@@ -377,7 +383,7 @@ test("a held successful attach reply cannot resurrect a runner after a newer Man
     ["POST", `/v1/spaces/${id}/runner/attach-if-empty`],
     ["DELETE", `/v1/spaces/${id}/runner`],
   ]);
-  await app.press("id:nav-settings");
+  await openRunnerSettings(app);
   await app.waitFor(`id:runner-attach-pick:${id}`); // The paired flag is false.
   expect(app.shows(`id:installed-runner-space:${id}`)).toBe(false);
 });
@@ -426,7 +432,7 @@ test("an older folder snapshot preserves newer presence or absence for A and sti
     t.gate.attach = 900;
     const app = await launch(t, { manual: true });
     await signIn(app);
-    await app.press("id:nav-settings");
+    await openRunnerSettings(app);
     await app.waitFor("id:installed-runner-space:solo");
     expect(app.shows("id:installed-runner-space:keep")).toBe(true);
     expect(app.shows("id:installed-runner-space:added")).toBe(false);
@@ -543,7 +549,7 @@ test("batch consent doesn't survive a local attach and detach while the first it
     const t = fixture(f, r.id);
     const app = await launch(t, { manual: true });
     await signIn(app);
-    await app.press("id:nav-settings");
+    await openRunnerSettings(app);
     await app.waitFor("id:runner-attach-pick:second");
     await app.waitUntil(() => f.state.log.some((p) => p.method === "GET" && p.path === "/v1/spaces/second/runner"));
     const preflight = { sid: "second", delay: 800, parked: false };
@@ -564,7 +570,7 @@ test("batch consent doesn't survive a local attach and detach while the first it
     expect(f.state.attached.has("second")).toBe(false);
 
     await app.clock!.runFor(800);
-    await app.press("id:nav-settings");
+    await openRunnerSettings(app);
     await app.waitFor("id:runner-attach-result");
     expect(words(app)).toContain("Attached to 1 of 2 Spaces. Second: A newer runner action changed this Space");
     expect(app.shows("id:installed-runner-space:first")).toBe(true);
@@ -588,7 +594,7 @@ test("a newer local Manage detach wins over a held bulk success, including count
   t.gate.attach = 800;
   const app = await launch(t, { manual: true });
   await signIn(app);
-  await app.press("id:nav-settings");
+  await openRunnerSettings(app);
   await app.waitFor("id:runner-attach-pick:solo");
   await app.press("id:runner-attach-many");
   await app.waitUntil(() => f.state.attached.get("solo") === r.id);
@@ -602,7 +608,7 @@ test("a newer local Manage detach wins over a held bulk success, including count
   await app.clock!.runFor(800);
   expect(app.shows("id:attached-runner")).toBe(false);
   expect(app.shows("id:test-runner-row")).toBe(false);
-  await app.press("id:nav-settings");
+  await openRunnerSettings(app);
   await app.waitFor("id:runner-attach-result");
   expect(words(app)).toContain("Attached to 0 of 1 Space. Solo: A newer runner action superseded this attachment check.");
   expect(app.shows("id:runner-attach-pick:solo")).toBe(true);
@@ -637,7 +643,7 @@ test("a current Manage detach fences a pre-commit folder read without losing B o
   const preCommit = { sid: "alpha", delay: 800, parked: false };
   t.gate.runnerRead = preCommit;
   f.state.attached.set("beta", r.id);
-  await app.press("id:nav-settings");
+  await openRunnerSettings(app);
   await app.waitUntil(() => preCommit.parked);
   expect(app.shows("id:installed-runner-space:alpha")).toBe(true);
   const afterAck = { sid: "alpha", delay: 1600, parked: false };
@@ -658,7 +664,7 @@ test("a current Manage detach fences a pre-commit folder read without losing B o
   // A newer observation really can win: another client attaches A again
   // after the ack, while the first post-ack read is still in flight.
   f.state.attached.set("alpha", r.id);
-  await app.press("id:nav-settings");
+  await openRunnerSettings(app);
   await app.waitFor("id:installed-runner-space:alpha");
   await app.clock!.runFor(1200);
   expect(app.shows("id:installed-runner-space:alpha")).toBe(true);
@@ -692,7 +698,7 @@ test("a Manage detach ack superseded by a verified bulk attach doesn't publish o
 
   // Make a sibling folder mark completion of this Settings snapshot.
   f.state.attached.set("marker", r.id);
-  await app.press("id:nav-settings");
+  await openRunnerSettings(app);
   await app.waitFor("id:installed-runner-space:marker");
   await app.waitFor("id:runner-attach-pick:solo");
   await app.press("id:runner-attach-many");
