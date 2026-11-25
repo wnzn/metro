@@ -58,9 +58,10 @@ export function beginSpaceRunnerObservation(sid: string, exactEndpoint = true) {
   const access = beginRunnerAccessRead(sid, exactEndpoint);
   const stamp = access.request;
   const isCurrent = () => access.valid() && isSpaceRunnerStampCurrent(sid, stamp);
+  const finish = (verified = false) => access.finish(verified && isCurrent());
   return {
     isCurrent,
-    finish: access.finish,
+    finish,
     hasNewer: () => !access.valid() || hasNewerSpaceRunnerStamp(sid, stamp),
     denyAccess() {
       if (!isCurrent()) {
@@ -72,7 +73,7 @@ export function beginSpaceRunnerObservation(sid: string, exactEndpoint = true) {
       return true;
     },
     publish(runner: SpaceRunner | null, allowFolderAdd = true, exact = true) {
-      access.finish(exact);
+      finish(exact);
       if (!isCurrent()) return false;
       recordSpaceRunnerStamp(sid, stamp);
       batch(() => {

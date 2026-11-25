@@ -706,45 +706,54 @@ test("an older positive Space list cannot restore a forced removal, but a newer 
   await app.waitFor("id:space-settings-open");
 });
 
-for (const pending of [false, true]) test(
-  `a newer exact assignment read protects an existing Space from an older omission${pending ? " while the exact read is pending" : ""}`,
-  async () => {
-  const f = world();
-  const r = f.addRunner("This PC", "personal", "alice");
-  f.addSpace("solo", "Solo", "alice");
-  f.state.attached.set("solo", r.id);
-  const get = f.network[`GET ${BASE}/v1/*`]!;
-  let armed = false;
-  let parked = false;
-  f.network[`GET ${BASE}/v1/*`] = (req) => {
-    const response = get(req);
-    if (!armed || parked || new URL(req.url).pathname !== "/v1/spaces") return response;
-    parked = true;
-    const reply = response as { status: number; body: { spaces: { id: string }[] } };
-    return { ...reply, body: { ...reply.body, spaces: reply.body.spaces.filter((s) => s.id !== "solo") }, delay: 2400 };
-  };
-  const t = fixture(f, r.id);
-  const app = await launch(t, { manual: true });
-  await signIn(app);
-  await app.waitFor("id:space:solo");
-  armed = true;
-  await app.clock!.runFor(11_000);
-  await app.waitUntil(() => parked);
-  await app.press("id:space:solo");
-  const exact = { sid: "solo", delay: 3600, parked: false };
-  if (pending) t.gate.runnerRead = exact;
-  await openSpaceRunner(app);
-  if (pending) await app.waitUntil(() => exact.parked);
-  else await app.waitFor("id:attached-runner");
-  await app.clock!.runFor(2400);
-  expect(app.shows("id:space:solo")).toBe(true);
-  if (pending) {
-    expect(app.shows("id:attached-runner")).toBe(false);
-    await app.clock!.runFor(1200);
-    await app.waitFor("id:attached-runner");
-  }
-  expect(app.shows("id:attached-runner")).toBe(true);
-});
+for (const mode of ["completed", "pending", "denied"] as const) {
+  test(`an older membership omission respects a ${mode} exact assignment read`, async () => {
+    const w = spaceWorld();
+    const f = w.f;
+    const r = f.addRunner("This PC", "personal", "alice");
+    f.addSpace("solo", "Solo", "alice");
+    f.state.attached.set("solo", r.id);
+    const get = w.network[`GET ${BASE}/v1/*`]!;
+    let armed = false;
+    let parked = false;
+    f.network[`GET ${BASE}/v1/*`] = (req) => {
+      const response = get(req);
+      if (!armed || parked || new URL(req.url).pathname !== "/v1/spaces") return response;
+      parked = true;
+      const reply = response as { status: number; body: { spaces: { id: string }[] } };
+      return { ...reply, body: { ...reply.body, spaces: reply.body.spaces.filter((s) => s.id !== "solo") }, delay: 2400 };
+    };
+    const t = fixture(f, r.id);
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    await app.waitFor("id:space:solo");
+    armed = true;
+    await app.clock!.runFor(11_000);
+    await app.waitUntil(() => parked);
+    // Don't enter the Space: a room snapshot would independently prove access.
+    const exact = { sid: "solo", delay: 3600, parked: false, errorStatus: mode === "denied" ? 403 : undefined };
+    if (mode !== "completed") t.gate.runnerRead = exact;
+    await app.press("id:space-menu:solo");
+    await app.press("id:space-settings:solo");
+    await app.waitFor("id:space-settings-dialog");
+    await app.press("id:space-settings-tab:runner");
+    if (mode === "completed") await app.waitFor("id:attached-runner");
+    else await app.waitUntil(() => exact.parked);
+    await app.clock!.runFor(2400);
+    expect(app.shows("id:space:solo")).toBe(true);
+    if (mode !== "completed") {
+      expect(app.shows("id:attached-runner")).toBe(false);
+      await app.clock!.runFor(1500);
+      if (mode === "denied") {
+        await app.waitFor("id:space:solo", { state: "gone" });
+        expect(app.shows("id:attached-runner")).toBe(false);
+        return;
+      }
+      await app.waitFor("id:attached-runner");
+    }
+    expect(app.shows("id:attached-runner")).toBe(true);
+  });
+}
 
 test("the follow-up read also detects a newer assignment made outside this app", async () => {
   const f = world();

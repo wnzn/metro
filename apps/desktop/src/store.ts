@@ -372,14 +372,21 @@ export function beginRunnerAccessRead(sid: string, exactEndpoint: boolean) {
   const valid = () => scope() && !newerSpaceDenial(sid, request);
   const settle = exactEndpoint ? trackScopedAccessRead(scopeKey(sid, ""), request) : () => {};
   const key = runnerAccessKey(sid);
+  let settled = false;
   return {
     request,
     valid,
     finish(verified = false) {
+      // Batch publication can come later than the response, after a newer
+      // denial has already withdrawn its proof. Never replay that proof.
+      if (settled) return;
+      settled = true;
       if (exactEndpoint && verified && valid()) verifyAccess(key, request);
       settle();
     },
     withdraw() {
+      if (settled) return;
+      settled = true;
       if (valid() && !newerAccess(key, request)) verifiedAccess.delete(key);
       settle();
     },
