@@ -306,8 +306,19 @@ impl Db {
         &self,
         hash: &[u8],
     ) -> anyhow::Result<Option<(String, Bumped)>> {
-        let conn = self.lock();
-        let Some(id) = conn
+        self.registered_runner_snapshot(hash, || {})
+    }
+
+    fn registered_runner_snapshot(
+        &self,
+        hash: &[u8],
+        after_identity: impl FnOnce(),
+    ) -> anyhow::Result<Option<(String, Bumped)>> {
+        let mut conn = self.lock();
+        // The process-local mutex doesn't fence writes on other connections.
+        // Pin both reads to one SQLite snapshot, including for idle runners.
+        let tx = conn.transaction()?;
+        let Some(id) = tx
             .query_row(
                 "SELECT id FROM runners WHERE token_hash = ?1",
                 [hash],
@@ -317,7 +328,8 @@ impl Db {
         else {
             return Ok(None);
         };
-        let mut stmt = conn.prepare_cached(
+        after_identity();
+        let mut stmt = tx.prepare_cached(
             "SELECT s.id, s.runner_generation FROM space_runners a JOIN spaces s ON s.id = a.space_id
              WHERE a.runner_id = ?1 ORDER BY s.id",
         )?;
@@ -1146,6 +1158,85 @@ mod tests {
         assert!(db.detach_runner(&s).unwrap().is_some());
         assert!(db.runner_by_token_hash(b"legacy").unwrap().is_none());
         assert_eq!(db.detach_runner(&s).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn registered_auth_keeps_old_generation_when_rotation_splits_the_reads() {
+        use crate::jobs::{CompleteError, JobError, JobOutcome, JobQueue};
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("metro.db");
+        let reader = Db::open(&path).unwrap();
+        let writer = Db::open(&path).unwrap();
+        let sid = reader.create_space("alice", "Space", 4).unwrap().id;
+        let runner = reader
+            .create_runner("alice", "runner", Visibility::Personal, b"old", 5)
+            .unwrap();
+        let Attach::Attached(_, rev) = reader.attach_runner(&sid, &runner.id, "alice").unwrap()
+        else {
+            panic!("runner was not attached");
+        };
+        let queue = JobQueue::new(4, Duration::from_secs(5), Duration::from_secs(5));
+        let claimer = format!("runner:{}", runner.id);
+        let submit = |n| {
+            reader
+                .with_runner_queue_version(&sid, |v| queue.enqueue_at(&sid, v, "t", json!(n)))
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        };
+        let first = submit(1);
+        let second = submit(2);
+        let job = reader
+            .with_runner_queue_access(&[(sid.clone(), rev)], |s| queue.claim_at(&claimer, s))
+            .unwrap()
+            .unwrap();
+        let (id, split) = reader
+            .registered_runner_snapshot(b"old", || {
+                assert_eq!(
+                    writer.rotate_runner_token(&runner.id, b"new").unwrap(),
+                    Some(vec![(sid.clone(), rev + 1)])
+                );
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(id, runner.id);
+        assert_eq!(split, vec![(sid.clone(), rev)]);
+        let result = || JobOutcome {
+            ok: true,
+            output: "done".into(),
+        };
+        // Use the same admission transaction as both HTTP handlers. Do
+        // not let a rotation handler update the in-memory queue first.
+        reader
+            .with_runner_queue_access(&split, |s| {
+                assert!(queue.claim_at(&claimer, s).is_none());
+                assert_eq!(
+                    queue.complete_at(&claimer, s, &job.id, result()),
+                    Err(CompleteError::Unknown)
+                );
+            })
+            .unwrap();
+        assert!(
+            reader
+                .registered_runner_by_token_hash(b"old")
+                .unwrap()
+                .is_none()
+        );
+        let (_, live) = reader
+            .registered_runner_by_token_hash(b"new")
+            .unwrap()
+            .unwrap();
+        reader
+            .with_runner_queue_access(&live, |s| {
+                let job = queue.claim_at(&claimer, s).unwrap();
+                assert_eq!(job.arguments, json!(2));
+                queue.complete_at(&claimer, s, &job.id, result()).unwrap();
+            })
+            .unwrap();
+        assert_eq!(first.await, Err(JobError::CredentialChanged));
+        assert_eq!(second.await, Ok(result()));
     }
 
     #[test]
