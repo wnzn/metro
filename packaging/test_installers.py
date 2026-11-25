@@ -1167,6 +1167,26 @@ class PowerShellTests(unittest.TestCase):
                                       f"'{script}', [ref]$null, [ref]$e) | Out-Null; if ($e) {{ $e; exit 1 }}")
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_windows_update_replaces_existing_pointer_without_backup(self):
+        # Run the installer's actual pointer write without the Windows-only
+        # prerequisite, shortcut and registry operations.
+        text = WINDOWS.read_text()
+        start = text.index("$current = Join-Path $Root 'current.txt'")
+        end = text.index("if ($stagedVersion", start)
+        with tempfile.TemporaryDirectory(prefix="metro pointer ") as d:
+            root = Path(d) / "install"
+            stage = root / "stage"
+            stage.mkdir(parents=True)
+            current = root / "current.txt"
+            current.write_bytes(b"0.4.0")
+            harness = Path(d) / "pointer.ps1"
+            harness.write_text("param($Root, $stage, $version)\n$ErrorActionPreference = 'Stop'\n"
+                               + text[start:end])
+            r = self.pwsh("-File", harness, root, stage, "0.5.0")
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual(current.read_bytes(), b"0.5.0")
+            self.assertEqual(set(root.rglob("*")), {current, stage})
+
     def test_published_windows_installer_and_current_installer_exclude_each_other(self):
         published = HERE / "test-fixtures/install-metro-windows-0.4.0.ps1"
         sums = (HERE.parent / "crates/release/tests/fixtures/v0.4.0/SHA256SUMS").read_text()
