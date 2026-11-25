@@ -23,13 +23,14 @@
 //!   would leak to it, so private hosts are refused here and on the device.
 
 use std::collections::HashSet;
-use std::net::{Ipv4Addr, Ipv6Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rig_core::tool::{DynamicTool, ToolExecutionError, ToolOutput};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+
+use metro_model_protocol::web_privacy;
 
 use crate::AppState;
 use crate::db::{Activity, Addressed, Author, Event, actor, kind};
@@ -250,51 +251,6 @@ pub fn fetch_arguments(args: &Value) -> Result<(Vec<String>, Option<String>), St
     Ok((urls, focus))
 }
 
-fn private_v4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || ip.is_documentation()
-        // CGNAT, including Tailscale addresses.
-        || (o[0] == 100 && (64..=127).contains(&o[1]))
-        || o[0] == 0
-}
-
-fn private_v6(ip: Ipv6Addr) -> bool {
-    let s = ip.segments();
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return private_v4(v4);
-    }
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        // Unique local (fc00::/7), link-local (fe80::/10), documentation.
-        || (s[0] & 0xfe00) == 0xfc00
-        || (s[0] & 0xffc0) == 0xfe80
-        || (s[0] == 0x2001 && s[1] == 0x0db8)
-}
-
-fn private_name(host: &str) -> bool {
-    let host = host.trim_end_matches('.');
-    !host.contains('.')
-        || host == "localhost"
-        || [
-            ".localhost",
-            ".local",
-            ".internal",
-            ".lan",
-            ".home.arpa",
-            ".intranet",
-            ".corp",
-        ]
-        .iter()
-        .any(|s| host.ends_with(s))
-}
-
 /// Check a URL a model wants fetched (or a device returned): `http`/`https`,
 /// at most 2048 bytes, no user info, a public host (never an IP literal in a
 /// private range, `localhost`, `*.local`, `*.internal` or a one-label name).
@@ -313,9 +269,9 @@ pub fn check_url(raw: &str) -> Result<String, String> {
     }
     let private = match url.host() {
         None => true,
-        Some(url::Host::Ipv4(ip)) => private_v4(ip),
-        Some(url::Host::Ipv6(ip)) => private_v6(ip),
-        Some(url::Host::Domain(d)) => private_name(&d.to_ascii_lowercase()),
+        Some(url::Host::Ipv4(ip)) => web_privacy::private_ipv4(ip),
+        Some(url::Host::Ipv6(ip)) => web_privacy::private_ipv6(ip),
+        Some(url::Host::Domain(d)) => web_privacy::private_name(&d.to_ascii_lowercase()),
     };
     if private {
         return Err(
@@ -1088,10 +1044,23 @@ impl WebContext {
         self.initiator.id.as_deref().unwrap_or_default()
     }
 
-    fn whose(&self) -> String {
+    /// "your" in personal Chat; in a room, the person's current display
+    /// name (never their identity-provider id, which is what a scheduled
+    /// prompt's author carries).
+    async fn whose(&self) -> String {
         match self.scope {
             WebScope::Personal => "your".to_owned(),
-            WebScope::Room { .. } => format!("{}'s", self.initiator.name),
+            WebScope::Room { .. } => {
+                let user = self.user().to_owned();
+                let name = self
+                    .state
+                    .db
+                    .call(move |db| db.profile(&user))
+                    .await
+                    .map(|p| p.display_name)
+                    .unwrap_or_else(|_| self.initiator.name.clone());
+                format!("{name}'s")
+            }
         }
     }
 
@@ -1247,7 +1216,7 @@ impl WebContext {
             ToolNote::named(tool),
         )
         .await;
-        let whose = self.whose();
+        let whose = self.whose().await;
         let fail = |text: String, note: ToolNote| async move {
             self.append(kind::ERROR, Author::server(actor::SYSTEM), &text, note)
                 .await;

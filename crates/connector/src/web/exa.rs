@@ -84,43 +84,65 @@ async fn call(
 }
 
 /// Results parsed from Exa's `Title:` / `URL:` / `Published:` lines, best
-/// effort (the text itself still goes to Metro).
+/// effort (the text itself still goes to Metro). Only the header of a hit
+/// sets its fields: the first `URL:` line counts, and once `Highlights:` or
+/// `Text:` starts the page excerpt, `URL:` and `Published:` lines there are
+/// page text, so a page can't choose the URL Metro records for its hit.
 pub(crate) fn parse_results(text: &str) -> Vec<Hit> {
+    struct Cur {
+        hit: Hit,
+        in_body: bool,
+    }
     let mut out: Vec<Hit> = Vec::new();
-    let mut cur: Option<Hit> = None;
+    let mut cur: Option<Cur> = None;
+    let flush = |cur: Option<Cur>, out: &mut Vec<Hit>| {
+        if let Some(c) = cur.filter(|c| !c.hit.url.is_empty()) {
+            out.push(c.hit);
+        }
+    };
     for line in text.lines() {
         let line = line.trim();
         if let Some(t) = line.strip_prefix("Title:") {
-            if let Some(h) = cur.take().filter(|h| !h.url.is_empty()) {
-                out.push(h);
-            }
-            cur = Some(Hit {
-                title: t.trim().to_owned(),
-                ..Hit::default()
+            flush(cur.take(), &mut out);
+            cur = Some(Cur {
+                hit: Hit {
+                    title: t.trim().to_owned(),
+                    ..Hit::default()
+                },
+                in_body: false,
             });
-        } else if let Some(u) = line.strip_prefix("URL:") {
-            cur.get_or_insert_with(Hit::default).url = u.trim().to_owned();
-        } else if let Some(p) = line.strip_prefix("Published:") {
-            let p = p.trim();
-            if !p.is_empty() && p != "N/A" {
-                cur.get_or_insert_with(Hit::default).published = Some(p.to_owned());
+            continue;
+        }
+        let Some(c) = cur.as_mut() else {
+            continue;
+        };
+        if line.starts_with("Highlights:") || line.starts_with("Text:") {
+            c.in_body = true;
+            continue;
+        }
+        if !c.in_body {
+            if let Some(u) = line.strip_prefix("URL:") {
+                if c.hit.url.is_empty() {
+                    c.hit.url = u.trim().to_owned();
+                }
+                continue;
             }
-        } else if let Some(h) = cur.as_mut()
-            && !h.url.is_empty()
-            && h.snippet.len() < 500
-            && !line.is_empty()
-            && !line.starts_with("Highlights:")
-            && !line.starts_with("Text:")
-        {
-            if !h.snippet.is_empty() {
-                h.snippet.push(' ');
+            if let Some(p) = line.strip_prefix("Published:") {
+                let p = p.trim();
+                if c.hit.published.is_none() && !p.is_empty() && p != "N/A" {
+                    c.hit.published = Some(p.to_owned());
+                }
+                continue;
             }
-            h.snippet.push_str(line);
+        }
+        if !c.hit.url.is_empty() && c.hit.snippet.len() < 500 && !line.is_empty() {
+            if !c.hit.snippet.is_empty() {
+                c.hit.snippet.push(' ');
+            }
+            c.hit.snippet.push_str(line);
         }
     }
-    if let Some(h) = cur.filter(|h| !h.url.is_empty()) {
-        out.push(h);
-    }
+    flush(cur, &mut out);
     out
 }
 

@@ -468,17 +468,22 @@ fn store_credential(
 /// one to drop.
 fn delete_credential(conn: &Connection, connection: &str) -> anyhow::Result<Option<u64>> {
     let tx = conn.unchecked_transaction()?;
-    let n = tx.execute(
+    let generation = delete_credential_in(&tx, connection)?;
+    tx.commit()?;
+    Ok(generation)
+}
+
+/// [`delete_credential`] inside a transaction the caller holds.
+fn delete_credential_in(conn: &Connection, connection: &str) -> anyhow::Result<Option<u64>> {
+    let n = conn.execute(
         "DELETE FROM device_credentials WHERE connection_id = ?1",
         params![connection],
     )?;
-    let generation = if n > 0 {
-        Some(bump_generation(&tx, connection)?)
+    Ok(if n > 0 {
+        Some(bump_generation(conn, connection)?)
     } else {
         None
-    };
-    tx.commit()?;
-    Ok(generation)
+    })
 }
 
 /// `(owner, generation)` of the connection's current token.
@@ -1640,6 +1645,33 @@ impl DeviceRelay {
         .map_err(IssueError::Internal)??;
         self.lock().flush(connection);
         Ok(())
+    }
+
+    /// Remove `owner`'s web device `id`: its token and its row go in one
+    /// transaction, then its pending jobs fail (`CredentialChanged`).
+    /// `Ok(false)` when it isn't theirs.
+    pub async fn remove_web_device(&self, db: &Db, owner: &str, id: &str) -> anyhow::Result<bool> {
+        let (o, i) = (owner.to_owned(), id.to_owned());
+        let removed = db
+            .call(move |db| {
+                let conn = db.lock();
+                let tx = conn.unchecked_transaction()?;
+                let n = tx.execute(
+                    "DELETE FROM web_devices WHERE id = ?1 AND owner_id = ?2",
+                    params![i, o],
+                )?;
+                if n == 0 {
+                    return Ok(false);
+                }
+                delete_credential_in(&tx, &i)?;
+                tx.commit()?;
+                Ok(true)
+            })
+            .await?;
+        if removed {
+            self.lock().flush(id);
+        }
+        Ok(removed)
     }
 
     /// Whether `owner`'s `connection` has a device token; `None` when the

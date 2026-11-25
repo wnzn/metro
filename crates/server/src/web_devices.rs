@@ -327,17 +327,16 @@ async fn remove(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     own(&state, &who, &id).await?;
-    // Revoking first fails the device's pending jobs (`CredentialChanged`).
-    state.device.revoke_token(&state.db, &who.id, &id).await?;
-    let (owner, i) = (who.id.clone(), id.clone());
-    db(&state, move |db| {
-        db.lock().execute(
-            "DELETE FROM web_devices WHERE id = ?1 AND owner_id = ?2",
-            params![i, owner],
-        )?;
-        Ok(())
-    })
-    .await?;
+    // The token and the row go together; pending jobs then fail
+    // (`CredentialChanged`).
+    let removed = state
+        .device
+        .remove_web_device(&state.db, &who.id, &id)
+        .await
+        .map_err(ApiError::internal)?;
+    if !removed {
+        return Err(ApiError::not_found(NO_DEVICE));
+    }
     tracing::info!(device = %id, "web device removed");
     Ok(StatusCode::NO_CONTENT)
 }
@@ -389,6 +388,76 @@ mod tests {
             assert!(!serves(DEVICE_WEB, op));
         }
         assert!(!DEVICE_PROVIDERS.contains(&DEVICE_WEB));
+    }
+
+    #[tokio::test]
+    async fn removal_drops_token_and_row_together_and_fails_pending_jobs() {
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let id = new_id();
+        let i = id.clone();
+        db.call(move |db| {
+            db.lock().execute(
+                "INSERT INTO web_devices (id, owner_id, label, created_at) VALUES (?1, 'alice', 'l', 0)",
+                [&i],
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+        let relay = crate::device_relay::DeviceRelay::new(
+            Default::default(),
+            std::sync::Arc::new(crate::providers::DeviceDirectory),
+        );
+        relay.issue_token(&db, "alice", &id).await.unwrap();
+        let device = crate::device_relay::Device {
+            connection: id.clone(),
+            owner: "alice".into(),
+            generation: 1,
+        };
+        assert!(relay.claim(&device).is_none(), "online, nothing queued");
+        let pending = {
+            let (relay, db, id) = (relay.clone(), db.clone(), id.clone());
+            tokio::spawn(async move {
+                relay
+                    .dispatch_web(
+                        &db,
+                        "alice",
+                        &id,
+                        Operation::WebSearch,
+                        json!({"v": 1}),
+                        std::time::Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Not the owner: nothing changes.
+        assert!(!relay.remove_web_device(&db, "bob", &id).await.unwrap());
+        assert!(relay.remove_web_device(&db, "alice", &id).await.unwrap());
+        assert_eq!(
+            pending.await.unwrap().unwrap_err(),
+            crate::device_relay::DeviceError::CredentialChanged
+        );
+        let i = id.clone();
+        let (rows, creds): (i64, i64) = db
+            .call(move |db| {
+                let conn = db.lock();
+                Ok((
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM web_devices WHERE id = ?1",
+                        [&i],
+                        |r| r.get(0),
+                    )?,
+                    conn.query_row(
+                        "SELECT COUNT(*) FROM device_credentials WHERE connection_id = ?1",
+                        [&i],
+                        |r| r.get(0),
+                    )?,
+                ))
+            })
+            .await
+            .unwrap();
+        assert_eq!((rows, creds), (0, 0));
     }
 
     #[test]

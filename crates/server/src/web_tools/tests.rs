@@ -295,3 +295,14 @@ fn exhausted_text_lists_each_reason() {
     assert!(t.contains("Adding a free key"));
     assert!(exhausted_text(WEB_FETCH, "your", &[]).contains("No provider is turned on"));
 }
+
+#[test]
+fn private_hosts_match_the_shared_table_the_device_uses() {
+    use metro_model_protocol::web_privacy::{PRIVATE_URL_SAMPLES, PUBLIC_URL_SAMPLES};
+    for u in PRIVATE_URL_SAMPLES {
+        assert!(check_url(u).is_err(), "{u}");
+    }
+    for u in PUBLIC_URL_SAMPLES {
+        assert!(check_url(u).is_ok(), "{u}");
+    }
+}

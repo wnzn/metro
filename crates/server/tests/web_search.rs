@@ -984,11 +984,107 @@ async fn a_thread_searches_on_its_parent_runs_initiators_computer() {
 }
 
 #[tokio::test]
+async fn a_thread_may_fetch_what_a_person_wrote_in_the_parent_room_not_its_task_text() {
+    let s = Server::start().await;
+    let sid = s.space(BOB, &["alice"]).await;
+    s.agent_tools(BOB, &sid, json!(["threads", "web_search", "web_fetch"]))
+        .await;
+    let (_, model) = s.chat_device(ALICE).await;
+    let (_, alice_web) = s.web_device(ALICE, "laptop").await;
+    s.idle(&alice_web).await;
+    let room = format!("/v1/spaces/{sid}/rooms/lobby");
+    s.post(
+        ALICE,
+        &format!("{room}/messages"),
+        json!({"text": "background: https://parent.example/doc"}),
+    )
+    .await;
+    s.post(
+        ALICE,
+        &format!("{room}/messages"),
+        json!({"text": "@agent research in a thread"}),
+    )
+    .await;
+    let job = s.model_job(&model).await;
+    s.reply_tool(
+        &model,
+        &job,
+        "thread_create",
+        json!({"name": "research", "task": "read https://parent.example/doc and https://task-only.example/x"}),
+    )
+    .await;
+    let mut step = 0;
+    let mut parent_done = false;
+    while step < 3 || !parent_done {
+        let job = s.model_job(&model).await;
+        if !system_prompt(&job).contains("You are working in a thread") {
+            s.reply_text(&model, &job, "parent done").await;
+            parent_done = true;
+            continue;
+        }
+        match step {
+            0 => {
+                s.reply_tool(
+                    &model,
+                    &job,
+                    "web_fetch",
+                    json!({"urls": ["https://parent.example/doc"]}),
+                )
+                .await;
+                let wj = s.job(&alice_web, &json!({})).await;
+                assert_eq!(wj["request"]["urls"], json!(["https://parent.example/doc"]));
+                let page = json!({"ok": true, "response": {
+                    "v": 1, "provider": "tavily", "mode": "keyless",
+                    "attempts": [{"provider": "tavily", "mode": "keyless", "outcome": "ok"}],
+                    "pages": [{"url": "https://parent.example/doc", "text": "doc text"}]
+                }});
+                assert_eq!(
+                    s.answer(&alice_web, &wj, page).await,
+                    StatusCode::NO_CONTENT
+                );
+            }
+            1 => {
+                assert!(last_tool_message(&job).contains("doc text"));
+                // Only in the agent-written task: refused, no device job.
+                s.reply_tool(
+                    &model,
+                    &job,
+                    "web_fetch",
+                    json!({"urls": ["https://task-only.example/x"]}),
+                )
+                .await;
+            }
+            _ => {
+                assert!(
+                    last_tool_message(&job)
+                        .contains("didn't come from a person or a search result"),
+                    "{}",
+                    last_tool_message(&job)
+                );
+                s.idle(&alice_web).await;
+                s.reply_text(&model, &job, "child done").await;
+            }
+        }
+        step += 1;
+    }
+    s.idle(&alice_web).await;
+}
+
+#[tokio::test]
 async fn a_scheduled_prompt_searches_on_the_creators_computer_or_answers_without() {
     let s = Server::start().await;
     let sid = s.space(BOB, &["alice"]).await;
     s.agent_tools(BOB, &sid, json!(["web_search"])).await;
     let (_, model) = s.chat_device(ALICE).await;
+    let (status, me) = s
+        .send(
+            Method::PATCH,
+            ALICE,
+            "/v1/me/profile",
+            Some(json!({"display_name": "Alice Moreno"})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{me}");
     let _offline = s.web_device(ALICE, "laptop").await;
     let (_, bob_web) = s.web_device(BOB, "desktop").await;
     s.idle(&bob_web).await;
@@ -1019,7 +1115,12 @@ async fn a_scheduled_prompt_searches_on_the_creators_computer_or_answers_without
     s.reply_tool(&model, &job, "web_search", json!({"query": "scheduled"}))
         .await;
     let job = s.model_job(&model).await;
-    assert!(last_tool_message(&job).contains("Metro isn't running on alice's computer"));
+    // The creator's display name, not their identity-provider id.
+    let told = last_tool_message(&job);
+    assert!(
+        told.contains("Metro isn't running on Alice Moreno's computer"),
+        "{told}"
+    );
     s.idle(&bob_web).await;
     s.reply_text(&model, &job, "No web data today.").await;
     tick.await.unwrap();

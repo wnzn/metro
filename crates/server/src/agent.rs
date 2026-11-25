@@ -625,20 +625,28 @@ async fn execute_room_run(
 ) {
     let limits = state.config.limits.clone();
     let loaded = {
-        let (space, room_id, before, n, parent) = (
+        // A thread's task came from its parent room: URLs people wrote
+        // there before the thread was created may be fetched by the thread
+        // too. Read only when this run may fetch.
+        let parent = room
+            .parent_room_id
+            .clone()
+            .filter(|_| agent.allows(crate::web_tools::WEB_FETCH));
+        let (space, room_id, before, n, thread_id, thread_name) = (
             space_id.to_owned(),
             room.id.clone(),
             trigger.id,
             limits.agent_history,
-            room.parent_room_id.clone(),
+            room.id.clone(),
+            room.name.clone(),
         );
         state
             .db
             .call(move |db| {
-                // A thread's task came from its parent room: URLs people
-                // wrote there may be fetched by the thread too.
                 let parent_events = match &parent {
-                    Some(parent) => db.events_before(&space, parent, i64::MAX, n)?,
+                    Some(parent) => {
+                        db.events_before_thread(&space, parent, &thread_id, &thread_name, n)?
+                    }
                     None => Vec::new(),
                 };
                 Ok((
@@ -1079,7 +1087,7 @@ impl Threads {
                         &self.parent_room_id,
                         kind::THREAD,
                         &Author::server(actor::AGENT),
-                        &format!("Started thread \"{}\" ({}).", child.name, child.id),
+                        &crate::db::thread_started_text(&child.name, &child.id),
                         Some(&self.turn),
                     )
                     .await;

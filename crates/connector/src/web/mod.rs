@@ -41,12 +41,13 @@ mod tinyfish;
 #[cfg(test)]
 mod tests;
 
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
+use metro_model_protocol::web_privacy;
 use serde_json::{Map, Value, json};
 
 use crate::netpolicy::{url_is_loopback, validate_base_url};
@@ -344,32 +345,6 @@ pub fn parse_job(operation: &str, request: &Value) -> Result<Op, SafeError> {
     }
 }
 
-fn private_v4(ip: Ipv4Addr) -> bool {
-    let o = ip.octets();
-    ip.is_loopback()
-        || ip.is_private()
-        || ip.is_link_local()
-        || ip.is_unspecified()
-        || ip.is_broadcast()
-        || ip.is_multicast()
-        || ip.is_documentation()
-        || (o[0] == 100 && (64..=127).contains(&o[1]))
-        || o[0] == 0
-}
-
-fn private_v6(ip: Ipv6Addr) -> bool {
-    if let Some(v4) = ip.to_ipv4_mapped() {
-        return private_v4(v4);
-    }
-    let s = ip.segments();
-    ip.is_loopback()
-        || ip.is_unspecified()
-        || ip.is_multicast()
-        || (s[0] & 0xfe00) == 0xfc00
-        || (s[0] & 0xffc0) == 0xfe80
-        || (s[0] == 0x2001 && s[1] == 0x0db8)
-}
-
 /// A public `http(s)` URL (no user info, no private or local host),
 /// normalized with its fragment dropped. The same rule as Metro's server:
 /// a private name or address would leak to a third-party provider.
@@ -387,25 +362,9 @@ pub fn public_url(raw: &str) -> Result<String> {
     }
     let private = match url.host() {
         None => true,
-        Some(url::Host::Ipv4(ip)) => private_v4(ip),
-        Some(url::Host::Ipv6(ip)) => private_v6(ip),
-        Some(url::Host::Domain(d)) => {
-            let d = d.to_ascii_lowercase();
-            let d = d.trim_end_matches('.');
-            !d.contains('.')
-                || d == "localhost"
-                || [
-                    ".localhost",
-                    ".local",
-                    ".internal",
-                    ".lan",
-                    ".home.arpa",
-                    ".intranet",
-                    ".corp",
-                ]
-                .iter()
-                .any(|s| d.ends_with(s))
-        }
+        Some(url::Host::Ipv4(ip)) => web_privacy::private_ipv4(ip),
+        Some(url::Host::Ipv6(ip)) => web_privacy::private_ipv6(ip),
+        Some(url::Host::Domain(d)) => web_privacy::private_name(&d.to_ascii_lowercase()),
     };
     if private {
         bail!("private URL");
