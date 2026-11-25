@@ -264,7 +264,9 @@
   async function loadUpdateNotice(s) {
     try {
       const u = await api("GET", "/v1/server/update");
-      if (session !== s || !u || u.available !== true || !u.latest) return;
+      if (session !== s) return;
+      el.updateNotice.hidden = true;
+      if (!u || u.available !== true || u.latest?.historical !== false) return;
       const version = String(u.latest.version || "");
       if (!/^[0-9]+\.[0-9]+\.[0-9]+$/.test(version)) return;
       el.updateCurrent.textContent = String(u.current || "");

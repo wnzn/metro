@@ -839,6 +839,11 @@ async fn historical_notice_cannot_authorize_or_dispatch_after_another_checker_ra
     assert_eq!(body["code"], "not_latest");
     let (_, body) = s.get(ALICE, "/v1/runners").await;
     assert_eq!(body["runners"][0]["update"]["available"], false);
+    let (_, body) = s.get(ALICE, "/v1/server/update").await;
+    assert_eq!(body["available"], false);
+    assert_eq!(body["latest"]["version"], "9.1.0");
+    assert_eq!(body["latest"]["historical"], true);
+    assert!(body["latest"]["images"].is_null() && body["latest"]["release_url"].is_null());
 }
 
 /// A persisted floor: after a restart, an older verified release served as

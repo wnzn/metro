@@ -255,6 +255,15 @@ impl Updates {
         self.lock().latest.clone()
     }
 
+    fn notice(&self) -> (Option<Latest>, bool) {
+        self.with_floor(|inner, _| {
+            let latest = inner.latest.clone();
+            let authorized = inner.authorizes(latest.as_ref().map(|l| l.version));
+            Ok((latest, authorized))
+        })
+        .unwrap_or_else(|_| (self.latest(), false))
+    }
+
     /// For tests and the checker: set the verified latest release.
     pub fn set_latest(&self, latest: Latest) {
         let _ = self.with_floor(|inner, _| {
@@ -499,14 +508,7 @@ pub fn runner_fields(state: &AppState, key: &str) -> (serde_json::Value, serde_j
     let p = state.updates.presence(key);
     let pending = state.updates.pending(key, now);
     let last = state.updates.lock().last_result.get(key).cloned();
-    let (latest, authorized) = state
-        .updates
-        .with_floor(|inner, _| {
-            let latest = inner.latest.clone();
-            let authorized = inner.authorizes(latest.as_ref().map(|l| l.version));
-            Ok((latest, authorized))
-        })
-        .unwrap_or_else(|_| (state.updates.latest(), false));
+    let (latest, authorized) = state.updates.notice();
     let presence = json!({
         "seen_at": p.as_ref().map(|p| p.seen_at),
         "online": p.as_ref().is_some_and(|p| now - p.seen_at < ONLINE_WINDOW_MS),
@@ -563,10 +565,11 @@ pub async fn server_update(
     }
     let current = env!("CARGO_PKG_VERSION");
     let channel = channel();
-    let latest = state.updates.latest();
+    let (latest, authorized) = state.updates.notice();
     let status = state.updates.lock().status.clone();
     let running = Version::parse(current);
-    let available = matches!((&latest, running), (Some(l), Some(r)) if channel == Channel::Release && l.version > r);
+    let available = authorized
+        && matches!((&latest, running), (Some(l), Some(r)) if channel == Channel::Release && l.version > r);
     Ok(Json(json!({
         "current": current,
         "channel": channel.as_str(),
@@ -580,8 +583,9 @@ pub async fn server_update(
             "version": l.version.to_string(),
             "commit": l.commit,
             "signed_at": l.signed_at,
-            "release_url": metro_release::release_url(&l.version),
-            "images": {"server": l.images.server, "runner": l.images.runner},
+            "historical": !authorized,
+            "release_url": authorized.then(|| metro_release::release_url(&l.version)),
+            "images": authorized.then(|| json!({"server": l.images.server, "runner": l.images.runner})),
         })),
     })))
 }

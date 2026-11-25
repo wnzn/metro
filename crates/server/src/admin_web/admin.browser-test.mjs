@@ -338,11 +338,14 @@ await test("the server update notice shows only a verified newer release", async
   mock.serverUpdate = { current: "0.5.0", available: false, latest: { version: "0.5.0", images: {} } };
   await signedInFresh();
   assert(!(await evaluate(vis("update-notice"))), "notice shown when up to date");
-  mock.serverUpdate = { current: "0.5.0", available: true, latest: { version: "0.5.1\"><img src=x onerror=window.__xss=1>", images: {} } };
+  mock.serverUpdate = { current: "0.5.0", available: true, latest: { historical: false, version: "0.5.1\"><img src=x onerror=window.__xss=1>", images: {} } };
   await signedInFresh();
   assert(!(await evaluate(vis("update-notice"))), "notice shown for a malformed version");
   const image = "ghcr.io/wnzn/metro-server:v0.5.1@sha256:" + "a".repeat(64);
-  mock.serverUpdate = { current: "0.5.0", available: true, latest: { version: "0.5.1", images: { server: image } } };
+  mock.serverUpdate = { current: "0.5.0", available: true, latest: { historical: true, version: "0.5.1", images: { server: image } } };
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "historical notice was actionable");
+  mock.serverUpdate.latest.historical = false;
   await signedInFresh();
   await waitFor(vis("update-notice"));
   assert((await text("update-latest")) === "0.5.1", "latest");
