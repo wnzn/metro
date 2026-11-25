@@ -325,7 +325,7 @@ export function PageView(props: { route: ViewRoute }) {
         <Label variant="meta">Last edited by {profileName(choice().edited_by) ?? choice().edited_by} · {cell(choice().edited_at, "datetime").label}</Label>
         <Label variant="strong">{destination(choice())}</Label>
         <Column selectable><Label>{choice().action.prompt}</Label></Column>
-        <Label variant="caption" color="muted">Metro remembers this confirmation for this page version.</Label>
+        <Label>This approval covers every agent and schedule button on this page version. Only this action runs now. The other buttons still need a click, but won’t ask for page approval again.</Label>
         <ActionBar><Action label="Cancel" testID="page-action-cancel" variant="ghost" onPress={() => confirm.set(null)} />
           <Action label="Run now" testID="page-action-run" variant="primary" busy={busy()} onPress={() => void run(choice().block_key, choice().action.kind, choice())} /></ActionBar>
       </PageLayout>

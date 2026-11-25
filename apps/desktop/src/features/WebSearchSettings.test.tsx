@@ -178,10 +178,10 @@ function fixture() {
   return { network, calls, chatWrites, replies, alice, bob, other, lifecycle, intentEvents, worker: () => workerGeneration };
 }
 
-async function start(w: ReturnType<typeof fixture>, bridge = true) {
+async function start(w: ReturnType<typeof fixture>, bridge = true, size = { width: 1280, height: 1000 }) {
   const app = await open("./WebSearchSettings.fixture.tsx", {
     modules: (bridge ? bridgeEnv() : launched()) as any, network: w.network as any,
-    width: 1280, height: 1000, platform: "linux", clock: {}, reducedMotion: true,
+    ...size, platform: "linux", clock: {}, reducedMotion: true,
   });
   await app.press("id:fixture-alice");
   await app.waitFor("id:websearch-settings");
@@ -199,8 +199,8 @@ test("the complete provider list reorders with accessible controls and status; a
   await app.waitFor("id:websearch-up:exa");
   expect(app.enabled("id:websearch-up:exa")).toBe(false);
   expect(app.enabled("id:websearch-down:tinyfish")).toBe(false);
-  expect(text(app)).toContain("Needs a free key");
-  expect(text(app)).toContain("Free (no key)");
+  expect(text(app)).toContain("Key required");
+  expect(text(app)).toContain("No key");
   await app.press("id:websearch-enabled:exa");
   await app.waitFor("text:Exa is off.");
   await app.press("label:Move Exa down");
@@ -215,6 +215,27 @@ test("the complete provider list reorders with accessible controls and status; a
   w.alice.providers.forEach((row) => { row.enabled = false; });
   await app.press("id:websearch-refresh");
   await app.waitFor("id:websearch-all-off");
+  expect(text(app)).toContain("All providers are off on this computer.");
+});
+
+test("Web search describes device selection and privacy with no disclosure required at minimum size", async () => {
+  const w = fixture();
+  w.alice.device.worker = "offline";
+  const app = await start(w, true, { width: 720, height: 480 });
+  await app.waitFor("id:websearch-worker >> text:Offline");
+  expect(text(app)).toContain("This switch and these provider settings apply only to this computer.");
+  expect(text(app)).toContain("For runs you start, Metro selects your most recently seen online web device on this server for each permitted search or page read.");
+  expect(text(app)).toContain("If none of your web devices is online");
+  expect(text(app)).toContain("After setup, it may receive your query or page URLs.");
+  expect(text(app)).toContain("Web keys are stored on the device and never uploaded to the Metro server.");
+  expect(text(app)).toContain("The Metro server relays requests and limited results.");
+  expect(text(app)).toContain("Activity records accepted queries, URLs and options, plus summaries and provider outcomes.");
+  expect(text(app)).toContain("Metro doesn't keep or replay that text as tool history");
+  expect(text(app)).toContain("Don't give agents private links or URLs that contain credentials.");
+  await app.press("id:websearch-learn:toggle");
+  await app.waitFor("text:/doesn't check where DNS or provider redirects lead/");
+  await app.press("label:Open About & updates › Privacy");
+  expect(text(app)).toContain("Privacy opened");
 });
 
 test("master notice and Chat consent are separate, with no optimistic or cross-server write", async () => {
@@ -223,8 +244,6 @@ test("master notice and Chat consent are separate, with no optimistic or cross-s
   await app.waitFor("id:websearch-notice");
   await app.waitFor("id:websearch-chat-opt-in");
   expect(text(app)).toContain("third-party providers");
-  expect(text(app)).toContain("Exact queries from Space runs");
-  expect(text(app)).toContain("may charge that account");
   await app.press("id:websearch-ack");
   await app.waitFor("id:websearch-notice", { state: "gone" });
   await app.press("id:websearch-master");
@@ -249,6 +268,8 @@ test("keys are masked, wiped on Escape and close, key errors are safe, and remov
   const app = await start(w);
   await app.waitFor("id:websearch-provider:exa");
   await item(app, "edit");
+  expect(text(app)).toContain("A key goes only to its provider, which may charge your account.");
+  expect(text(app)).not.toContain("higher limits");
   await app.type("id:websearch-key:exa", SYNTHETIC);
   expect(text(app)).not.toContain(SYNTHETIC);
   expect(JSON.stringify(app.storage())).not.toContain(SYNTHETIC);
@@ -280,7 +301,7 @@ test("keys are masked, wiped on Escape and close, key errors are safe, and remov
   expect(w.calls.filter((r) => r.path.endsWith("/key")).map((r) => r.keyAccepted && r.binding === `${BASE} alice`)).toEqual([true, true]);
   expect(text(app)).not.toContain(REFLECTED);
   await item(app, "remove");
-  await app.waitFor("text:/Searches use its free mode again/");
+  await app.waitFor("text:/this provider will run without a key/");
   await app.press("id:websearch-remove-confirm:exa:cancel");
   expect(w.alice.providers[0]?.key_saved).toBe(true);
   await item(app, "remove");

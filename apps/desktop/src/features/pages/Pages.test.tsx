@@ -13,9 +13,9 @@ async function signIn(app: App, user: string) {
   await app.press("id:connect");
   await app.waitFor("id:nav-pages");
 }
-async function start(f: Fixture, user = "alice", readProbe = false) {
+async function start(f: Fixture, user = "alice", readProbe = false, size = { width: 1280, height: 900 }) {
   const app = await open(readProbe ? "../../../PagesReadProbe.fixture.tsx" : "../../../App.tsx", {
-    modules: launched(), network: f.network as any, platform: "linux", width: 1280, height: 900, clock: {},
+    modules: launched(), network: f.network as any, platform: "linux", ...size, clock: {},
   });
   await signIn(app, user);
   return app;
@@ -187,20 +187,22 @@ test("Recently deleted shows the empty state when only other scopes have rows", 
 
 test("Schedule consent sends the exact displayed version and revision, never retries a stale click", async () => {
   const f = pagesFixture();
-  const app = await start(f);
+  const app = await start(f, "alice", false, { width: 720, height: 480 });
   await jump(app);
   await app.press("id:page-action:run");
   await app.waitFor("id:page-action-confirm");
   expect(text(app)).toContain("Send the exact release summary");
   expect(text(app)).toContain("Release reminder");
   expect(text(app)).toContain("Acme › Renamed room");
+  expect(app.shows("id:page-action-confirm >> text:/covers every agent and schedule button on this page version/")).toBe(true);
+  expect(app.shows("id:page-action-confirm >> text:/Only this action runs now. The other buttons still need a click/")).toBe(true);
   expect(f.state.started).toBe(0);
-  await app.press("id:page-action-cancel");
+  await app.press("id:page-action-confirm >> label:Cancel");
   await app.waitFor("id:page-action-confirm", { state: "gone" });
   await app.press("id:page-action:run");
   await app.waitFor("id:page-action-confirm");
   f.state.revision = 4;
-  await app.press("id:page-action-run");
+  await app.press("id:page-action-confirm >> label:Run now");
   await app.waitFor("text:/changed.*no action ran/");
   expect(f.state.started).toBe(0);
   expect(f.calls(`/${TEAM}/actions`, "POST").map(r => r.body)).toEqual([
@@ -220,6 +222,11 @@ test("Schedule consent sends the exact displayed version and revision, never ret
     { version: 1, block_key: "run", schedule_revision: 4 },
     { version: 1, block_key: "run", schedule_revision: 5, confirm: true },
   ]);
+  await app.waitUntil(() => app.enabled("id:page-action:ask"));
+  await app.press("id:page-action:ask");
+  await app.waitUntil(() => f.state.started === 2);
+  expect(app.shows("id:page-action-confirm")).toBe(false);
+  expect(f.calls(`/${TEAM}/actions`, "POST").at(-1)?.body).toEqual({ version: 1, block_key: "ask" });
 });
 
 test("Personal page action stays on the page; a missing room link never falls back", async () => {

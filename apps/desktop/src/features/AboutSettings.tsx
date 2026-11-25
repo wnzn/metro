@@ -6,6 +6,7 @@ import { desktopUpdates, JOURNAL_UNCERTAIN, METRO_LICENSES, METRO_RELEASES, METR
 import type { DesktopUpdates, UpdateOffer, UpdateState } from "../updates";
 import { Action, ActionBar, Badge, Banner, Column, compactWidth, ConfirmInline, Disclosure, Label, PageHeader,
   PageLayout, ProgressLine, SettingRow, SettingsGroup, Toggle } from "../ui";
+import { webActivityDisclosure, webDeviceSelection, webModelDisclosure, webProviderDisclosure } from "./webSearchPrivacy";
 
 const buildName = { release: "Published release", preview: "Preview build", source: "Source build" } as const;
 const installName = {
@@ -131,8 +132,10 @@ function Privacy(props: { focusTitle?: boolean }) {
   return <SettingsGroup title="Privacy" testID="about-privacy" focusTitle={props.focusTitle}>
     <SettingRow label="Update checks"
       description="Metro contacts github.com and its release asset hosts (release-assets.githubusercontent.com or objects.githubusercontent.com). A newer release can also make a request to api.github.com for notes. If verification data is out of date, Metro can refresh it at tuf-repo-cdn.sigstore.dev. These requests don't send your account, device ID or usage data. If you're offline, the check can't confirm the latest release." />
-    <SettingRow label="Web search"
-      description="Your queries and the pages agents read go to the web provider from this computer's address. Metro stores your web-search keys on this computer and sends a key only to its provider when needed." />
+    <SettingRow label="Web search" description={webDeviceSelection} />
+    <SettingRow label="Web providers" description={webProviderDisclosure} />
+    <SettingRow label="Web activity" description={webActivityDisclosure} />
+    <SettingRow label="Web results" description={webModelDisclosure} />
     <SettingRow label="Model connections"
       description="What you send goes to the connection that answers. A shared connection's owner can see those requests and may pay for them." />
     <SettingRow label="Your Metro server"

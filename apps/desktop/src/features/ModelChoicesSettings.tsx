@@ -519,7 +519,8 @@ function DataFlow(props: { draft: RoutingDraft }) {
         testID="dataflow-never"
       />
       <If when={settingsExtensionAvailable("websearch")}>
-        <SettingRow label="Web search" description="When Metro searches the web, it sends queries to the providers enabled on this computer.">
+        <SettingRow label="Web search" stacked testID="dataflow-websearch"
+          description="For runs you start, Metro relays each permitted web request through your most recently seen online web device on this server, not the model's device. Contacted providers may receive queries or page URLs. Metro keeps activity; the model may see limited web results for that run.">
           <Action label="Open Web search" variant="ghost" onPress={() => openSettings("websearch")} />
         </SettingRow>
       </If>
