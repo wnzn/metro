@@ -97,7 +97,7 @@ fn tampered_signature_is_refused() {
     b["messageSignature"]["signature"] = flip_b64(&sig, 5).into();
     assert!(matches!(
         refused(MANIFEST, &bytes(&b)),
-        ErrorCode::NotVerified | ErrorCode::TrustRootStale
+        ErrorCode::NotVerified
     ));
 }
 
@@ -111,10 +111,7 @@ fn tampered_certificate_is_refused() {
             .to_string();
         b["verificationMaterial"]["certificate"]["rawBytes"] = flip_b64(&cert, at).into();
         let code = refused(MANIFEST, &bytes(&b));
-        assert!(
-            matches!(code, ErrorCode::NotVerified | ErrorCode::TrustRootStale),
-            "{at}: {code:?}"
-        );
+        assert!(code == ErrorCode::NotVerified, "{at}: {code:?}");
     }
 }
 
@@ -125,22 +122,22 @@ fn tampered_tlog_is_refused() {
     let other =
         json(RUNNER_BUNDLE)["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"].clone();
     b["verificationMaterial"]["tlogEntries"][0]["canonicalizedBody"] = other;
-    assert!(verify_manifest(&verifier(), MANIFEST, &bytes(&b)).is_err());
+    assert_eq!(refused(MANIFEST, &bytes(&b)), ErrorCode::NotVerified);
     // A truncated inclusion proof.
     let mut b = json(BUNDLE);
     b["verificationMaterial"]["tlogEntries"][0]["inclusionProof"]["hashes"]
         .as_array_mut()
         .unwrap()
         .pop();
-    assert!(verify_manifest(&verifier(), MANIFEST, &bytes(&b)).is_err());
+    assert_eq!(refused(MANIFEST, &bytes(&b)), ErrorCode::NotVerified);
     // A moved integrated time (covered by the SET).
     let mut b = json(BUNDLE);
     b["verificationMaterial"]["tlogEntries"][0]["integratedTime"] = "1795589873".into();
-    assert!(verify_manifest(&verifier(), MANIFEST, &bytes(&b)).is_err());
+    assert_eq!(refused(MANIFEST, &bytes(&b)), ErrorCode::NotVerified);
     // No tlog entry at all.
     let mut b = json(BUNDLE);
     b["verificationMaterial"]["tlogEntries"] = Value::Array(vec![]);
-    assert!(verify_manifest(&verifier(), MANIFEST, &bytes(&b)).is_err());
+    assert_eq!(refused(MANIFEST, &bytes(&b)), ErrorCode::NotVerified);
 }
 
 #[test]
@@ -186,4 +183,33 @@ fn other_trust_roots_are_refused() {
 fn test_bundles_are_refused_by_the_real_verifier() {
     let fake = metro_release::testing::test_bundle(MANIFEST, COMMIT, 1);
     assert!(verify_manifest(&verifier(), MANIFEST, &fake).is_err());
+}
+
+#[test]
+fn tampered_timestamps_are_not_stale() {
+    let mut b = json(BUNDLE);
+    let ts = b["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"][0]["signedTimestamp"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    b["verificationMaterial"]["timestampVerificationData"]["rfc3161Timestamps"][0]["signedTimestamp"] =
+        flip_b64(&ts, 20).into();
+    assert_eq!(refused(MANIFEST, &bytes(&b)), ErrorCode::NotVerified);
+}
+
+#[test]
+fn missing_trust_material_is_stale() {
+    let root: Value = serde_json::from_str(VENDORED_TRUSTED_ROOT).unwrap();
+    let mut no_ca = root.clone();
+    no_ca["certificateAuthorities"] = Value::Array(vec![]);
+    let mut no_log = root.clone();
+    no_log["tlogs"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|t| t["baseUrl"] != "https://rekor.sigstore.dev");
+    for (label, r) in [("no CA", no_ca), ("no log", no_log)] {
+        let v = SigstoreVerifier::from_trusted_root_json(&r.to_string()).unwrap();
+        let e = verify_manifest(&v, MANIFEST, BUNDLE).unwrap_err();
+        assert_eq!(e.code, ErrorCode::TrustRootStale, "{label}: {e}");
+    }
 }

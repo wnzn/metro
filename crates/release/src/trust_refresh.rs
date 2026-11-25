@@ -108,10 +108,25 @@ impl TrustCache {
         Ok(())
     }
 
-    /// The trusted root a previous refresh verified, if any.
+    /// The trusted root a previous refresh verified, if any. It is checked
+    /// again against the length and SHA-256 the cached (TUF-verified)
+    /// `targets.json` pins for it; anything else is ignored.
     pub fn cached_verifier(&self) -> Option<SigstoreVerifier> {
         let raw = std::fs::read(self.dir.join(TARGET)).ok()?;
         if raw.len() as u64 > MAX_TRUSTED_ROOT {
+            return None;
+        }
+        let targets: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(self.dir.join("tuf").join("targets.json")).ok()?)
+                .ok()?;
+        let pinned = &targets["signed"]["targets"][TARGET];
+        let length_ok = pinned["length"].as_u64() == Some(raw.len() as u64);
+        let hash_ok =
+            pinned["hashes"]["sha256"].as_str() == Some(crate::hex(&crate::sha256(&raw)).as_str());
+        if !(length_ok && hash_ok) {
+            eprintln!(
+                "metro: the cached Sigstore trusted root doesn't match its TUF metadata; ignored"
+            );
             return None;
         }
         SigstoreVerifier::from_trusted_root_json(std::str::from_utf8(&raw).ok()?).ok()

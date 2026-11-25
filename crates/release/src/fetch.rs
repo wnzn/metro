@@ -427,11 +427,27 @@ mod nonblocking {
     }
 
     impl AsyncFetcher {
+        /// For small requests: `timeout` bounds each whole request.
         pub fn new(source: Source, timeout: Duration) -> Result<AsyncFetcher, Error> {
+            Self::build(source, timeout, timeout)
+        }
+
+        /// For large downloads on slow links: fails when no byte arrives for
+        /// `idle`, and only past the generous `overall` cap otherwise.
+        pub fn for_downloads(
+            source: Source,
+            idle: Duration,
+            overall: Duration,
+        ) -> Result<AsyncFetcher, Error> {
+            Self::build(source, idle, overall)
+        }
+
+        fn build(source: Source, idle: Duration, overall: Duration) -> Result<AsyncFetcher, Error> {
             let client = reqwest::Client::builder()
                 .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(15).min(timeout))
-                .timeout(timeout)
+                .connect_timeout(Duration::from_secs(15).min(idle))
+                .read_timeout(idle)
+                .timeout(overall)
                 .user_agent(USER_AGENT)
                 .referer(false)
                 .build()

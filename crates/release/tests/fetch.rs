@@ -265,3 +265,71 @@ fn blocking_fetch_release_by_version() {
     r.check_digest(&name, &digest).unwrap();
     assert!(part.ends_with(format!("{name}.part")));
 }
+
+/// Serves a 10-chunk body, `gap` apart, with Content-Length.
+fn slow_server(gap: std::time::Duration) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut h = String::new();
+                if reader.read_line(&mut h).unwrap_or(0) == 0 || h == "\r\n" {
+                    break;
+                }
+            }
+            let _ = stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\n");
+            for _ in 0..10 {
+                let _ = stream.write_all(b"x");
+                let _ = stream.flush();
+                std::thread::sleep(gap);
+            }
+        }
+    });
+    base
+}
+
+#[test]
+fn downloads_time_out_on_idle_reads_not_on_total_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let url = |base: &str| format!("{base}/wnzn/metro/releases/download/v1.0.0/x");
+    let fetch = |f: AsyncFetcher, base: String| {
+        let dest = dir.path().join("x");
+        rt().block_on(async move {
+            f.download(&url(&base), &dest, 1000, &|_, _| {})
+                .await
+                .map(|_| ())
+        })
+    };
+    // Steady but slow (about 2.5 s in total): fine with a 1 s idle limit...
+    let base = slow_server(Duration::from_millis(250));
+    let f = AsyncFetcher::for_downloads(
+        Source::loopback_fixture(&base).unwrap(),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    fetch(f, base).expect("steady download");
+    // ...where a 1 s total timeout would have failed it.
+    let base = slow_server(Duration::from_millis(250));
+    let f = AsyncFetcher::new(
+        Source::loopback_fixture(&base).unwrap(),
+        Duration::from_secs(1),
+    )
+    .unwrap();
+    assert!(fetch(f, base).is_err());
+    // A stalled download fails after the idle limit.
+    let base = slow_server(Duration::from_secs(3));
+    let f = AsyncFetcher::for_downloads(
+        Source::loopback_fixture(&base).unwrap(),
+        Duration::from_secs(1),
+        Duration::from_secs(60),
+    )
+    .unwrap();
+    let started = std::time::Instant::now();
+    assert_eq!(fetch(f, base).unwrap_err().code, ErrorCode::Offline);
+    assert!(started.elapsed() < Duration::from_secs(10));
+}

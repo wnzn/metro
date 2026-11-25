@@ -436,3 +436,23 @@ fn synthetic_threshold_rotation_and_rollback() {
             .is_ok()
     );
 }
+
+#[test]
+fn the_cached_root_is_checked_against_its_tuf_metadata() {
+    let repo = serve(real_files());
+    let dir = tempfile::tempdir().unwrap();
+    let c = cache(&repo, dir.path(), VENDORED_TUF_ROOT);
+    rt().block_on(c.refresh(now())).unwrap();
+    assert!(c.cached_verifier().is_some());
+    // A changed cached root is ignored.
+    let path = dir.path().join("trusted_root.json");
+    let good = std::fs::read(&path).unwrap();
+    let mut bad = good.clone();
+    bad[200] ^= 1;
+    std::fs::write(&path, &bad).unwrap();
+    assert!(c.cached_verifier().is_none());
+    // So is one without its TUF metadata.
+    std::fs::write(&path, &good).unwrap();
+    std::fs::remove_file(dir.path().join("tuf/targets.json")).unwrap();
+    assert!(c.cached_verifier().is_none());
+}

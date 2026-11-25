@@ -76,21 +76,31 @@ impl ReleaseVerifier for SigstoreVerifier {
     }
 }
 
-/// Unknown keys or logs, or authorities outside their validity window: a
-/// newer trusted root may fix it (Sigstore key rotation).
+/// `trust_root_stale` only when the failure says Metro's trust material lacks
+/// something a newer trusted root could supply (Sigstore key rotation): an
+/// unknown log or log key, no CA or TSA valid then, or a chain to an issuer
+/// the root doesn't know. Anything else (a tampered signature, certificate,
+/// log entry or timestamp) is `not_verified`. The texts are those of the
+/// pinned sigstore-verify/webpki; tests/sigstore_real.rs and
+/// tests/tuf_refresh.rs guard them.
+pub(crate) fn is_stale(error: &sigstore_verify::Error) -> bool {
+    use sigstore_verify::{CertificateError, Error as E, TimestampError, TransparencyLogError};
+    let text = error.to_string();
+    match error {
+        E::TransparencyLog(TransparencyLogError::UnknownLog { .. }) => true,
+        E::TransparencyLog(_) => text.contains("No log key valid"),
+        E::Certificate(CertificateError::NoValidAuthority { .. }) => true,
+        E::Certificate(CertificateError::ChainInvalid(_)) => text.contains("UnknownIssuer"),
+        E::Timestamp(TimestampError::OutsideAuthorityValidity { .. }) => true,
+        E::Timestamp(TimestampError::Invalid(_)) => {
+            text.contains("no timestamp authorities configured") || text.contains("UnknownIssuer")
+        }
+        _ => false,
+    }
+}
+
 fn classify(error: sigstore_verify::Error) -> Error {
-    use sigstore_verify::{CertificateError, Error as E, TransparencyLogError};
-    let stale = matches!(
-        &error,
-        E::TransparencyLog(TransparencyLogError::UnknownLog { .. })
-            | E::Certificate(CertificateError::NoValidAuthority { .. })
-            | E::Certificate(CertificateError::ChainInvalid(_))
-    ) || matches!(&error, E::Timestamp(_))
-        // sigstore-verify (pinned) reports a log key the trusted root lacks
-        // as an invalid inclusion promise / checkpoint with this text;
-        // tests/tuf_refresh.rs guards it.
-        || matches!(&error, E::TransparencyLog(_)) && error.to_string().contains("No log key valid");
-    let code = if stale {
+    let code = if is_stale(&error) {
         ErrorCode::TrustRootStale
     } else {
         ErrorCode::NotVerified
