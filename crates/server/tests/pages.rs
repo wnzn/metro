@@ -115,6 +115,17 @@ struct Server {
 
 impl Server {
     async fn start(model: Option<ModelConfig>) -> Self {
+        Self::start_with(
+            model,
+            Limits {
+                agent_timeout: Duration::from_secs(30),
+                ..Limits::default()
+            },
+        )
+        .await
+    }
+
+    async fn start_with(model: Option<ModelConfig>, limits: Limits) -> Self {
         let user = |id: &str, name: &str| UserIdentity {
             id: id.to_owned(),
             actor: name.to_owned(),
@@ -129,10 +140,7 @@ impl Server {
             bind: "127.0.0.1:0".parse().unwrap(),
             db_path: ":memory:".into(),
             model,
-            limits: Limits {
-                agent_timeout: Duration::from_secs(30),
-                ..Limits::default()
-            },
+            limits,
             // An org admin gets no view of anyone's pages.
             org_admins: vec!["carol".to_owned()],
         };
@@ -1128,4 +1136,240 @@ async fn generations_per_person_are_bounded() {
         )
         .await;
     assert_eq!(st, StatusCode::ACCEPTED);
+}
+
+// ---- Review fixes ----
+
+#[tokio::test]
+async fn validate_survives_a_15k_coalesce_chain() {
+    let s = Server::start(None).await;
+    let chain = vec!["r"; 15_000].join("??");
+    let src = format!(
+        "export default <Page title=\"x\"><Data name=\"r\" source=\"runs\"/><Show key=\"s\" when={{{chain}}}><Divider/></Show></Page>"
+    );
+    let (st, v) = s
+        .post(
+            ALICE,
+            "/v1/pages/validate",
+            json!({"scope": "personal", "source": src}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["ok"], false);
+    assert!(
+        v["diagnostics"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("at most 8 values")
+    );
+    // The server is still up.
+    let (st, _) = s.get(ALICE, "/v1/pages").await;
+    assert_eq!(st, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn renames_and_restores_dont_count_as_reviewing_buttons() {
+    let m = model(|_, _| "ok".to_owned()).await;
+    let s = Server::start(Some(m.config.clone())).await;
+    let sid = s.space(ALICE, "Team", &["bob"]).await;
+    let p = s
+        .create_page(BOB, space_scope(&sid), &ask_page("Ask"))
+        .await;
+    let pid = p["id"].as_str().unwrap().to_owned();
+    let act = |v: i64| json!({"version": v, "block_key": "ask"});
+    // Bob changes the prompt (v2); Alice, the Space owner, renames (v3).
+    let (st, _) = s
+        .post(BOB, &format!("/v1/pages/{pid}/versions"),
+              json!({"base_version": 1, "source": ask_page("Ask").replace("Status please", "Delete the backups")}))
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, v) = s
+        .patch(
+            ALICE,
+            &format!("/v1/pages/{pid}"),
+            json!({"title": "Renamed"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK, "{v}");
+    assert_eq!(v["version"]["kind"], "rename");
+    assert_eq!(v["version"]["author_id"], "alice");
+    // Alice is the head's author but never reviewed Bob's button.
+    let (_, d) = s
+        .post(ALICE, &format!("/v1/pages/{pid}/data"), json!({}))
+        .await;
+    assert_eq!(d["actions"]["ask"]["confirm"], true);
+    let (st, v) = s
+        .post(ALICE, &format!("/v1/pages/{pid}/actions"), act(3))
+        .await;
+    assert_eq!(st, StatusCode::PRECONDITION_REQUIRED, "{v}");
+    assert_eq!(v["confirmation"]["action"]["prompt"], "Delete the backups");
+    // A restore of Bob's version by Alice doesn't count either.
+    let (st, v) = s
+        .post(
+            ALICE,
+            &format!("/v1/pages/{pid}/versions/2/restore"),
+            json!({"base_version": 3}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED, "{v}");
+    let (st, _) = s
+        .post(ALICE, &format!("/v1/pages/{pid}/actions"), act(4))
+        .await;
+    assert_eq!(st, StatusCode::PRECONDITION_REQUIRED);
+    // Saving the source herself with that exact button does.
+    let (_, head) = s.get(ALICE, &format!("/v1/pages/{pid}")).await;
+    let (st, _) = s
+        .post(ALICE, &format!("/v1/pages/{pid}/versions"),
+              json!({"base_version": 4, "source": head["source"].as_str().unwrap().replace("Renamed", "Mine")}))
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    let (st, v) = s
+        .post(ALICE, &format!("/v1/pages/{pid}/actions"), act(5))
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    // Bob authored that action in v2, so he isn't asked on Alice's v5.
+    let (st, v) = s
+        .post(BOB, &format!("/v1/pages/{pid}/actions"), act(5))
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+}
+
+#[tokio::test]
+async fn deleting_a_generating_draft_keeps_its_slot() {
+    let m = model(|_, _| HANG.to_owned()).await;
+    let s = Server::start(Some(m.config.clone())).await;
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let (st, d) = s
+            .post(
+                ALICE,
+                "/v1/pages/drafts",
+                json!({"scope": "personal", "prompt": "x"}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::ACCEPTED);
+        ids.push(d["id"].as_str().unwrap().to_owned());
+    }
+    let (st, _) = s
+        .delete(ALICE, &format!("/v1/pages/drafts/{}", ids[0]))
+        .await;
+    assert_eq!(st, StatusCode::NO_CONTENT);
+    let (st, _) = s.get(ALICE, &format!("/v1/pages/drafts/{}", ids[0])).await;
+    assert_eq!(st, StatusCode::NOT_FOUND);
+    // Its job still runs, so the slot is still taken.
+    let (st, _) = s
+        .post(
+            ALICE,
+            "/v1/pages/drafts",
+            json!({"scope": "personal", "prompt": "x"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::TOO_MANY_REQUESTS);
+}
+
+#[tokio::test]
+async fn page_generation_never_takes_agent_run_slots() {
+    let m = model(|req, _| {
+        if is_builder(req) {
+            HANG.to_owned()
+        } else {
+            "Agent here.".to_owned()
+        }
+    })
+    .await;
+    let s = Server::start_with(
+        Some(m.config.clone()),
+        Limits {
+            agent_timeout: Duration::from_secs(30),
+            max_agent_runs: 1,
+            ..Limits::default()
+        },
+    )
+    .await;
+    let sid = s.space(ALICE, "Team", &["bob", "carol", "dave"]).await;
+    for token in [ALICE, BOB, CAROL, DAVE] {
+        for _ in 0..2 {
+            let (st, _) = s
+                .post(
+                    token,
+                    "/v1/pages/drafts",
+                    json!({"scope": "personal", "prompt": "x"}),
+                )
+                .await;
+            assert_eq!(st, StatusCode::ACCEPTED);
+        }
+    }
+    // Let the builder turns start and hold whatever they hold.
+    for _ in 0..200 {
+        if m.requests.lock().unwrap().len() >= 4 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let (st, v) = s
+        .post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+            json!({"text": "@agent hi"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    for _ in 0..400 {
+        let (_, e) = s
+            .get(ALICE, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
+            .await;
+        let events = e["events"].as_array().unwrap().clone();
+        if events
+            .iter()
+            .any(|e| e["kind"] == "agent" && e["text"] == "Agent here.")
+        {
+            return;
+        }
+        assert!(
+            !events.iter().any(|e| e["kind"] == "error"),
+            "the agent run was refused: {events:#?}"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("the agent never answered");
+}
+
+#[tokio::test]
+async fn a_personal_page_title_never_reaches_a_space_room() {
+    let m = model(|_, _| "done".to_owned()).await;
+    let s = Server::start(Some(m.config.clone())).await;
+    let sid = s.space(ALICE, "Team", &["bob"]).await;
+    let src = format!(
+        r#"export default <Page title="Alice private plans"><Button key="ask" label="Ask" action="runAgent" space="{sid}" room="lobby" agent="agent" prompt="Hello"/></Page>"#
+    );
+    let p = s.create_page(ALICE, personal(), &src).await;
+    let pid = p["id"].as_str().unwrap();
+    let (st, v) = s
+        .post(
+            ALICE,
+            &format!("/v1/pages/{pid}/actions"),
+            json!({"version": 1, "block_key": "ask"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    let mut seen = false;
+    for _ in 0..400 {
+        let (_, e) = s
+            .get(BOB, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
+            .await;
+        let text = e.to_string();
+        assert!(!text.contains("Alice private plans"), "{text}");
+        if e["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|e| e["kind"] == "agent")
+        {
+            assert!(text.contains("(from a page)"), "{text}");
+            seen = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(seen);
 }

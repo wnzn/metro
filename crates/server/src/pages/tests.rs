@@ -1124,7 +1124,7 @@ mod store_tests {
         // A save based on an old head never overwrites.
         assert_eq!(
             store::add_version(&db, &p.id, 3, &version("alice", "stale"), &limits).unwrap(),
-            Err(store::Conflict { head: 6 })
+            Err(store::SaveError::Conflict { head: 6 })
         );
         let kept: Vec<i64> = store::versions(&db, &p.id)
             .unwrap()
@@ -1165,6 +1165,7 @@ mod store_tests {
                 prompt: "x",
             },
         )
+        .unwrap()
         .unwrap();
         db.remove_member(&sid, "bob").unwrap();
         assert!(!store::prefs(&db, "bob", &p.id).unwrap().pinned);
@@ -1172,7 +1173,7 @@ mod store_tests {
         let drafts: i64 = db
             .lock()
             .query_row(
-                "SELECT COUNT(*) FROM page_drafts",
+                "SELECT COUNT(*) FROM page_drafts WHERE status <> 'discarded'",
                 [],
                 |r| r.get(0),
             )
@@ -1199,6 +1200,53 @@ mod store_tests {
             .unwrap();
         assert_eq!(versions, 0);
         assert!(store::get(&db, &personal.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn saves_recheck_membership_and_edit_rights_in_the_transaction() {
+        let (db, sid) = db_with_space();
+        let limits = PageLimits::default();
+        // Carol isn't a member: no Space page for her.
+        assert_eq!(
+            store::create(&db, Some(&sid), &version("carol", "x"), &limits).unwrap(),
+            Err(CreateError::NotAllowed)
+        );
+        let p = store::create(&db, Some(&sid), &version("bob", "Bob's"), &limits)
+            .unwrap()
+            .unwrap();
+        // Alice (owner) may; Dave-like members without rights may not.
+        db.add_member(&sid, "dave", 10).unwrap();
+        assert_eq!(
+            store::add_version(&db, &p.id, 1, &version("dave", "x"), &limits).unwrap(),
+            Err(store::SaveError::NotAllowed)
+        );
+        store::set_meta(&db, &p.id, None, Some(true)).unwrap();
+        assert_eq!(
+            store::add_version(&db, &p.id, 1, &version("dave", "x"), &limits).unwrap(),
+            Ok(2)
+        );
+        // Removed between the API's check and the write: refused.
+        db.remove_member(&sid, "bob").unwrap();
+        assert_eq!(
+            store::add_version(&db, &p.id, 2, &version("bob", "y"), &limits).unwrap(),
+            Err(store::SaveError::NotAllowed)
+        );
+        assert_eq!(
+            store::create(&db, Some(&sid), &version("bob", "z"), &limits).unwrap(),
+            Err(CreateError::NotAllowed)
+        );
+        // Personal pages: only their owner.
+        let mine = store::create(&db, None, &version("alice", "Mine"), &limits)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store::add_version(&db, &mine.id, 1, &version("bob", "x"), &limits).unwrap(),
+            Err(store::SaveError::NotAllowed)
+        );
+        assert_eq!(
+            store::add_version(&db, &p.id, 2, &version("alice", "owner"), &limits).unwrap(),
+            Ok(3)
+        );
     }
 
     #[test]

@@ -39,8 +39,6 @@ pub struct Context {
     pub page_id: Option<String>,
     /// The Space of a Space page; `None` for a personal page.
     pub space_id: Option<String>,
-    /// The author of the version being viewed (for confirmations).
-    pub version_author: Option<String>,
     pub version: Option<i64>,
     /// A draft: its buttons don't run.
     pub draft: bool,
@@ -501,8 +499,7 @@ fn capability(db: &Db, ctx: &Context, block: &super::spec::Block, viewer: &str) 
         let (Some(page), Some(version)) = (&ctx.page_id, ctx.version) else {
             return false;
         };
-        ctx.version_author.as_deref() != Some(viewer)
-            && !store::confirmed(db, viewer, page, version).unwrap_or(false)
+        store::needs_confirmation(db, page, version, viewer, a).unwrap_or(true)
     };
     let result: Result<Json, Fail> = (|| match a.kind.as_str() {
         action::RUN_AGENT => {

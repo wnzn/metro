@@ -27,6 +27,8 @@ use crate::model_routing::{self as routing, AddressedBy, Route};
 
 /// The Page TSX reference given to the model.
 pub const REFERENCE: &str = include_str!("prompt.md");
+/// Page builder model turns running at once, server-wide.
+pub const MAX_PAGE_BUILDS: usize = 4;
 /// Retries after the first attempt when the page doesn't compile.
 pub const MAX_RETRIES: usize = 2;
 /// Longest request, in characters.

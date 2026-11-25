@@ -50,7 +50,7 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
              version    INTEGER NOT NULL,
              author_id  TEXT NOT NULL,
              kind       TEXT NOT NULL
-                        CHECK (kind IN ('create', 'prompt', 'manual', 'restore', 'template')),
+                        CHECK (kind IN ('create', 'prompt', 'manual', 'restore', 'template', 'rename')),
              prompt     TEXT,
              model_ref  TEXT,
              restored_from INTEGER,
@@ -68,7 +68,7 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
              base_version INTEGER,
              block_key    TEXT,
              prompt       TEXT NOT NULL,
-             status       TEXT NOT NULL CHECK (status IN ('generating', 'ready', 'failed')),
+             status       TEXT NOT NULL CHECK (status IN ('generating', 'ready', 'failed', 'discarded')),
              source       TEXT,
              spec         TEXT,
              diagnostics  TEXT,
@@ -228,6 +228,17 @@ pub struct NewVersion {
 pub enum CreateError {
     /// The Space (or person) already has the most pages allowed.
     TooMany(usize),
+    /// The author isn't a member of the Space (any more).
+    NotAllowed,
+}
+
+fn member_role(conn: &Connection, space: &str, user: &str) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT role FROM space_members WHERE space_id = ?1 AND user_id = ?2",
+        params![space, user],
+        |r| r.get(0),
+    )
+    .optional()
 }
 
 pub fn new_page_id() -> String {
@@ -244,6 +255,12 @@ pub fn create(
 ) -> anyhow::Result<Result<PageRow, CreateError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // The author's membership, checked again in the write transaction.
+    if let Some(sid) = space
+        && member_role(&tx, sid, &version.author_id)?.is_none()
+    {
+        return Ok(Err(CreateError::NotAllowed));
+    }
     let count: i64 = match space {
         Some(sid) => tx.query_row(
             "SELECT COUNT(*) FROM pages WHERE space_id = ?1 AND deleted_at IS NULL",
@@ -310,10 +327,14 @@ fn insert_version(
     Ok(())
 }
 
-/// Saving a version found a different head than the one it was based on.
+/// Why a version wasn't saved.
 #[derive(Debug, PartialEq, Eq)]
-pub struct Conflict {
-    pub head: i64,
+pub enum SaveError {
+    /// The head isn't the version the save was based on.
+    Conflict { head: i64 },
+    /// The author may not edit the page now (checked in the write
+    /// transaction: membership, creator or Space owner, or Members can edit).
+    NotAllowed,
 }
 
 /// Append version `base + 1` if the head is still `base` (optimistic
@@ -324,21 +345,27 @@ pub fn add_version(
     base: i64,
     version: &NewVersion,
     limits: &PageLimits,
-) -> anyhow::Result<Result<i64, Conflict>> {
+) -> anyhow::Result<Result<i64, SaveError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let head: Option<i64> = tx
-        .query_row(
-            "SELECT head_version FROM pages WHERE id = ?1 AND deleted_at IS NULL",
-            [page],
-            |r| r.get(0),
-        )
-        .optional()?;
-    let Some(head) = head else {
+    let Some(row) = get_in(&tx, page)?.filter(|p| p.deleted_at.is_none()) else {
         return Err(anyhow::anyhow!("the page is gone"));
     };
+    let author = version.author_id.as_str();
+    let allowed = match (&row.space_id, &row.owner_id) {
+        (Some(sid), _) => match member_role(&tx, sid, author)? {
+            None => false,
+            Some(role) => role == "owner" || row.creator_id == author || row.members_edit,
+        },
+        (None, Some(owner)) => owner == author,
+        (None, None) => false,
+    };
+    if !allowed {
+        return Ok(Err(SaveError::NotAllowed));
+    }
+    let head = row.head_version;
     if head != base {
-        return Ok(Err(Conflict { head }));
+        return Ok(Err(SaveError::Conflict { head }));
     }
     let n = head + 1;
     let now = now_ms();
@@ -582,6 +609,48 @@ pub fn confirm(db: &Db, user: &str, page: &str, version: i64) -> anyhow::Result<
         params![user, page, version, now_ms()],
     )?;
     Ok(())
+}
+
+/// Version kinds in which the author wrote (or chose) the page's buttons:
+/// a rename or a restore doesn't count as reviewing them.
+const AUTHORED_KINDS: &str = "'create', 'manual', 'prompt', 'template'";
+
+/// Whether `user` must confirm running `action` from version `version` of
+/// `page`: not when they already confirmed this version, and not when this
+/// exact action appears in a version they authored by saving source,
+/// applying a draft or creating the page.
+pub fn needs_confirmation(
+    db: &Db,
+    page: &str,
+    version: i64,
+    user: &str,
+    action: &super::spec::Action,
+) -> anyhow::Result<bool> {
+    if confirmed(db, user, page, version)? {
+        return Ok(false);
+    }
+    let specs: Vec<String> = {
+        let conn = db.lock();
+        let mut stmt = conn.prepare_cached(&format!(
+            "SELECT spec FROM page_versions WHERE page_id = ?1 AND author_id = ?2
+               AND kind IN ({AUTHORED_KINDS})"
+        ))?;
+        let rows = stmt.query_map(params![page, user], |r| r.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
+    for spec in specs {
+        let Ok(spec) = serde_json::from_str::<super::spec::PageSpec>(&spec) else {
+            continue;
+        };
+        if spec
+            .all_blocks()
+            .iter()
+            .any(|b| b.action.as_ref() == Some(action))
+        {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 // ---- Run origins ----
@@ -872,7 +941,8 @@ pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Option<DraftRow
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let busy: i64 = tx.query_row(
-        "SELECT COUNT(*) FROM page_drafts WHERE author_id = ?1 AND status = 'generating'",
+        "SELECT COUNT(*) FROM page_drafts WHERE author_id = ?1
+             AND status IN ('generating', 'discarded')",
         [d.author_id],
         |r| r.get(0),
     )?;
@@ -904,7 +974,8 @@ pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Option<DraftRow
         ],
     )?;
     tx.execute(
-        "DELETE FROM page_drafts WHERE author_id = ?1 AND id NOT IN
+        "DELETE FROM page_drafts WHERE author_id = ?1
+             AND status NOT IN ('generating', 'discarded') AND id NOT IN
              (SELECT id FROM page_drafts WHERE author_id = ?1 ORDER BY created_at DESC, id
               LIMIT ?2)",
         params![d.author_id, MAX_DRAFTS_PER_PERSON as i64],
@@ -922,7 +993,9 @@ pub fn draft(db: &Db, id: &str) -> anyhow::Result<Option<DraftRow>> {
     let conn = db.lock();
     Ok(conn
         .query_row(
-            &format!("SELECT {DRAFT_COLUMNS} FROM page_drafts WHERE id = ?1"),
+            &format!(
+                "SELECT {DRAFT_COLUMNS} FROM page_drafts WHERE id = ?1 AND status <> 'discarded'"
+            ),
             [id],
             row_draft,
         )
@@ -945,7 +1018,7 @@ pub fn finish_draft(
     let conn = db.lock();
     conn.execute(
         "UPDATE page_drafts SET status = ?2, source = ?3, spec = ?4, diagnostics = ?5, error = ?6, \
-         model_ref = ?7, attempts = ?8 WHERE id = ?1",
+         model_ref = ?7, attempts = ?8 WHERE id = ?1 AND status = 'generating'",
         params![
             id,
             status,
@@ -956,6 +1029,28 @@ pub fn finish_draft(
             model_ref,
             attempts
         ],
+    )?;
+    // A draft discarded while it was generating goes once its job is done;
+    // until then it kept its generation slot.
+    conn.execute(
+        "DELETE FROM page_drafts WHERE id = ?1 AND status = 'discarded'",
+        [id],
+    )?;
+    Ok(())
+}
+
+/// Discard a draft for its author: a finished one goes now; one still
+/// generating is hidden and keeps counting against the author's
+/// generations until its job finishes.
+pub fn discard_draft(db: &Db, id: &str) -> anyhow::Result<()> {
+    let conn = db.lock();
+    conn.execute(
+        "UPDATE page_drafts SET status = 'discarded' WHERE id = ?1 AND status = 'generating'",
+        [id],
+    )?;
+    conn.execute(
+        "DELETE FROM page_drafts WHERE id = ?1 AND status IN ('ready', 'failed')",
+        [id],
     )?;
     Ok(())
 }
@@ -1001,9 +1096,18 @@ pub mod hooks {
                  AND page_id IN (SELECT id FROM pages WHERE space_id = ?1)",
             params![space, user],
         )?;
+        // Drafts still generating are discarded, not deleted: they keep
+        // their generation slot until their job finishes.
+        let theirs = "author_id = ?2 AND (space_id = ?1
+                 OR page_id IN (SELECT id FROM pages WHERE space_id = ?1))";
         tx.execute(
-            "DELETE FROM page_drafts WHERE author_id = ?2 AND (space_id = ?1
-                 OR page_id IN (SELECT id FROM pages WHERE space_id = ?1))",
+            &format!(
+                "UPDATE page_drafts SET status = 'discarded' WHERE {theirs} AND status = 'generating'"
+            ),
+            params![space, user],
+        )?;
+        tx.execute(
+            &format!("DELETE FROM page_drafts WHERE {theirs} AND status IN ('ready', 'failed')"),
             params![space, user],
         )?;
         Ok(())

@@ -215,6 +215,15 @@ fn too_many(e: CreateError) -> ApiError {
             StatusCode::CONFLICT,
             format!("this Space (or person) already has {n} pages, the most this server allows"),
         ),
+        CreateError::NotAllowed => ApiError::not_found("no such Space"),
+    }
+}
+
+/// A refused save: 409 with the head, or 403.
+fn save_refused(e: store::SaveError) -> Response {
+    match e {
+        store::SaveError::Conflict { head } => conflict_head(head),
+        store::SaveError::NotAllowed => forbidden("you can't edit this page").into_response(),
     }
 }
 
@@ -518,15 +527,16 @@ async fn patch_page(
         if compiled.spec.is_none() {
             return Ok(invalid(&compiled));
         }
-        let version = new_version(&who, "manual", &compiled)?;
+        // A rename: it doesn't count as reviewing the page's buttons.
+        let version = new_version(&who, "rename", &compiled)?;
         let limits = limits::current(&state).await;
         let pid = page.id.clone();
-        if let Err(c) = db(&state, move |db| {
+        if let Err(e) = db(&state, move |db| {
             store::add_version(db, &pid, base, &version, &limits)
         })
         .await?
         {
-            return Ok(conflict_head(c.head));
+            return Ok(save_refused(e));
         }
     }
     let (pid, icon, members) = (page.id.clone(), body.icon, body.members_edit);
@@ -643,7 +653,7 @@ async fn save(
             )
                 .into_response())
         }
-        Err(c) => Ok(conflict_head(c.head)),
+        Err(e) => Ok(save_refused(e)),
     }
 }
 
@@ -755,7 +765,6 @@ async fn page_data(
     let ctx = data::Context {
         page_id: Some(page.id.clone()),
         space_id: page.space_id.clone(),
-        version_author: Some(head.author_id.clone()),
         version: Some(head.version),
         draft: false,
     };
@@ -1067,7 +1076,7 @@ async fn delete_draft(
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
     let d = own_draft(&state, &who, &id).await?;
-    db(&state, move |db| store::delete_draft(db, &d.id)).await?;
+    db(&state, move |db| store::discard_draft(db, &d.id)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1193,7 +1202,6 @@ async fn draft_data(
     let ctx = data::Context {
         page_id: d.page_id.clone(),
         space_id: d.space_id.clone(),
-        version_author: None,
         version: None,
         draft: true,
     };

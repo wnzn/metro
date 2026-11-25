@@ -74,6 +74,8 @@ pub struct AppState {
     pub managed: crate::admin_users::Managed,
     /// Avatar re-encodes running at once (see [`crate::profiles`]).
     pub avatar_encodes: Arc<Semaphore>,
+    /// Page builder model turns at once, apart from agent runs.
+    pub page_builds: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -104,6 +106,7 @@ impl AppState {
             .await?;
         let state = Self {
             avatar_encodes: Arc::new(Semaphore::new(crate::profiles::MAX_AVATAR_ENCODES)),
+            page_builds: Arc::new(Semaphore::new(crate::pages::generate::MAX_PAGE_BUILDS)),
             managed,
             library,
             providers,

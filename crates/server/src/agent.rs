@@ -434,8 +434,9 @@ pub async fn page_builder_turn(
     prompt: String,
 ) -> Result<(String, crate::model_routing::RouteNote), String> {
     let model = route_model(state, user_id, space, &mut route).await?;
-    let Ok(_permit) = state.agent_runs.clone().try_acquire_owned() else {
-        return Err("The agent is busy with other requests; try again shortly.".to_owned());
+    // Its own small pool: page building never takes agent-run slots.
+    let Ok(_permit) = state.page_builds.clone().try_acquire_owned() else {
+        return Err("Metro is building other pages right now; try again shortly.".to_owned());
     };
     let agent = model.builder().preamble(preamble).build();
     let history = history

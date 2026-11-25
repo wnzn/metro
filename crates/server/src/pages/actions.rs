@@ -107,10 +107,13 @@ pub async fn run(
         None
     };
 
-    if head.author_id != who.id {
-        let (uid, pid, v) = (who.id.clone(), page.id.clone(), head.version);
-        let done = db(state, move |db| store::confirmed(db, &uid, &pid, v)).await?;
-        if !done {
+    {
+        let (uid, pid, v, act) = (who.id.clone(), page.id.clone(), head.version, a.clone());
+        let ask = db(state, move |db| {
+            store::needs_confirmation(db, &pid, v, &uid, &act)
+        })
+        .await?;
+        if ask {
             if !confirm {
                 let what = match &schedule {
                     Some(task) => json!({
@@ -220,10 +223,17 @@ async fn run_in_room(
         AddressedBy::Explicit,
     )
     .await;
-    let pick = format!(
-        "Addressed: @{} (from the page \"{}\")",
-        agent.handle, page.title
-    );
+    // A personal page's title is private: only a Space page's own title is
+    // shown in its Space's activity.
+    let pick = match &page.space_id {
+        Some(own) if own == sid => {
+            format!(
+                "Addressed: @{} (from the page \"{}\")",
+                agent.handle, page.title
+            )
+        }
+        _ => format!("Addressed: @{} (from a page)", agent.handle),
+    };
     match crate::agent::start_room_run(
         state,
         sid,
