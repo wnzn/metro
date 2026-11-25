@@ -1,4 +1,4 @@
-// Settings › Model providers: the user's personal model connections. The
+// Settings › Model connections: the user's personal model connections. The
 // providers offered come from the server (GET /v1/provider-catalog), never
 // from a list in this app. Device connections (preferred) run in the user's
 // own metro-connector, so this form never asks for their vendor key or
@@ -10,10 +10,9 @@
 //   group per capability (Chat, System One, Embeddings), each a list of
 //   compact rows: the provider's mark, the name with a "Default" tag, one
 //   status line with a coloured dot, and a ⋯ menu. A problem shows as one
-//   plain sentence under its row with at most one fix. Then the Documents &
-//   media model (./library owns it).
-// - Details: a sub-view (← Model providers) per connection, opened from its
-//   row or ⋯ › Details: Models, Device, Key, Sharing and Danger zone, and
+//   plain sentence under its row with at most one fix.
+// - Details: a sub-view (← Model connections) per connection, opened from its
+//   row or ⋯ › Details: Models, Device or Endpoint, Key, Sharing and Danger zone, and
 //   technical text only under a closed Technical details.
 // - Add connection opens one picker that lists every provider's ways to
 //   connect at once, searchable and filterable by capability. Choosing a row
@@ -26,7 +25,7 @@
 // row, and in Sharing (the owner of the device or endpoint sees the requests
 // and may pay for them). Feedback shows in the page's fixed footer.
 
-import { signal } from "nsh";
+import { cleanup, signal } from "nsh";
 import {
   closeSharing,
   isSubscription,
@@ -62,6 +61,7 @@ import {
   fetchModels,
   isAllowedBaseUrl,
   isDeviceConnection,
+  loadProviders,
   modelListings,
   patchConnectionModel,
   providerBusy,
@@ -71,11 +71,13 @@ import {
   removeConnectionModel,
   revealed,
   rotateDeviceToken,
+  settingsAccountScope,
   unpairDevice,
   updateConnection,
+  updateEndpoint,
 } from "../settings";
 import type { Capability, CatalogProvider, ConnectionModel, ModelThinking, NewConnectionModel, ProviderConnection } from "../settings";
-import { onSessionEnd, onTransientClear, spaces } from "../store";
+import { onSessionEnd, onTransientClear, sessionGuard, spaces } from "../store";
 import {
   Action,
   ActionBar,
@@ -95,12 +97,12 @@ import {
   SegmentedControl,
   SettingRow,
   SettingsGroup,
+  ScopeLine,
   Toggle,
 } from "../ui";
 import type { Tone } from "../ui";
 import { BackLink, ConnectionHeading, ConnectionItem, EditableName, MethodRow, ModelItem, MoreMenu, PickerPanel, ProblemNote, VendorHeading } from "../ui/providers";
 import type { MoreMenuItem } from "../ui/providers";
-import { MediaModelSettings } from "./library/LibraryView";
 import { ModelOnboarding, needsChatModel } from "./ModelOnboarding";
 import { CAPABILITY_TONE, describePath, methodDetail, pickerGroups, vendorOf, wayLabel } from "./providerGroups";
 import type { VendorGroup } from "./providerGroups";
@@ -144,7 +146,7 @@ const closeAdding = () => adding.set({ step: "closed" });
 /**
  * Starts adding a connection from elsewhere (the onboarding card): a catalog
  * id opens that way's form; "chat" opens the picker on chat ways. The caller
- * opens Settings › Model providers.
+ * opens Settings › Model connections.
  */
 export function startAdding(way: string | "chat") {
   detailsOf.set(null);
@@ -159,13 +161,15 @@ const openDetails = (id: string) => {
 
 export function ProvidersSettings() {
   const device = () => revealed()?.kind === "device";
-  const hasMessages = () => !device() && !!(catalogError() || connectionsError() || providerNotice());
+  const endpointFeedback = signal<EndpointFeedback | null>(null);
+  const currentFeedback = () => endpointFeedback()?.id === detailsOf() ? endpointFeedback() : null;
+  const hasMessages = () => !device() && !!(catalogError() || connectionsError() || providerNotice() || currentFeedback());
   const open = () => {
     const id = detailsOf();
     return id ? connections()?.find((c) => c.id === id) ?? null : null;
   };
   return (
-    <PageLayout testID="providers-settings" pad={compactWidth() ? 4 : 6} gap={6} footer={hasMessages() ? <Messages /> : undefined}>
+    <PageLayout testID="providers-settings" pad={compactWidth() ? 4 : 6} gap={6} footer={hasMessages() ? <Messages endpoint={currentFeedback()} /> : undefined}>
       <If
         when={device()}
         else={
@@ -173,7 +177,7 @@ export function ProvidersSettings() {
             when={open()}
             else={
               <Column gap={6}>
-                <PageHeader title="Model providers">
+                <PageHeader title="Model connections" subtitle="Add and manage the connections Metro can use for your work." scope={settingsAccountScope()}>
                   <Action testID="provider-picker" label="Add connection" icon="plus" variant="primary" accessibilityLabel="Add a model connection" onPress={() => openPicker()} />
                 </PageHeader>
                 <AddConnection />
@@ -181,14 +185,12 @@ export function ProvidersSettings() {
                   <ModelOnboarding />
                 </If>
                 <ConnectionList />
-                {/* Documents & media's own form and Save (./library). Mounting it only loads the choice: nothing is indexed or sent. */}
-                <MediaModelSettings />
               </Column>
             }
           >
             {(c) => (
               <Each of={[c().id]} key={(x) => x}>
-                {() => <ConnectionDetails connection={c()} />}
+                {() => <ConnectionDetails connection={c()} endpointFeedback={currentFeedback()} setEndpointFeedback={endpointFeedback.set} />}
               </Each>
             )}
           </If>
@@ -200,16 +202,24 @@ export function ProvidersSettings() {
   );
 }
 
+type EndpointFeedback = { id: string; message: string; tone: "success" | "warning" | "danger"; detail?: string; retry?: () => void };
+
 /** Errors and what the last change did, in the page's fixed footer. Technical text only on request. */
-function Messages() {
+function Messages(props: { endpoint: EndpointFeedback | null }) {
   const technical = signal(false);
   return (
     <Column gap={2}>
-      <If when={catalogError()}>{(message) => <Banner variant="inline" tone="danger" testID="catalog-error" message={message()} />}</If>
+      <If when={props.endpoint}>
+        {(result) => <Banner variant="inline" tone={result().tone} testID="endpoint-feedback" message={result().message}
+          action={result().retry ? <Action label="Try again" onPress={() => result().retry?.()} /> : undefined} />}
+      </If>
+      <If when={catalogError()}>{(message) => <Banner variant="inline" tone="danger" testID="catalog-error" message={message()}
+        action={<Action label="Try again" onPress={() => void loadProviders()} />} />}</If>
       <If when={connectionsError()}>
         {(message) => (
           <Column gap={1}>
-            <Banner variant="inline" tone="danger" testID="providers-error" message={message()} />
+            <Banner variant="inline" tone="danger" testID="providers-error" message={message()}
+              action={!connections() ? <Action label="Try again" onPress={() => void loadProviders()} /> : undefined} />
             <If when={connectionsErrorDetail()}>
               {(detail) => (
                 <Disclosure testID="providers-error-technical" title="Technical details" open={technical()} onToggle={technical.set}>
@@ -388,7 +398,11 @@ function capabilityGroups(list: readonly ProviderConnection[]): { capability: Ca
 function ConnectionList() {
   return (
     <Column gap={3} testID="connection-list">
-      <If when={connections()} else={<SettingsGroup><SettingRow label="Loading your connections…" /></SettingsGroup>}>
+      <If when={connections()} else={
+        <If when={!connectionsError()}>
+          <SettingsGroup><SettingRow label="Loading your connections…" /></SettingsGroup>
+        </If>
+      }>
         {(list) => (
           <Column gap={6}>
             <If when={list().length === 0 && !needsChatModel()}>
@@ -398,21 +412,11 @@ function ConnectionList() {
             </If>
             <Each of={capabilityGroups(list())} key={(g) => g.capability}>
               {(g) => (
-                <Column gap={2} testID={`connection-group:${g().capability}`}>
-                  <Column gap={1} padX={1}>
-                    <Label variant="strong" heading>
-                      {CAPABILITY_LABEL[g().capability]}
-                    </Label>
-                    <Label variant="caption" color="muted">
-                      {GROUP_PURPOSE[g().capability]}
-                    </Label>
-                  </Column>
-                  <SettingsGroup>
-                    <Each of={g().items} key={(c) => c.id}>
-                      {(c) => <ConnectionRow connection={c()} />}
-                    </Each>
-                  </SettingsGroup>
-                </Column>
+                <SettingsGroup title={CAPABILITY_LABEL[g().capability]} description={GROUP_PURPOSE[g().capability]} testID={`connection-group:${g().capability}`}>
+                  <Each of={g().items} key={(c) => c.id}>
+                    {(c) => <ConnectionRow connection={c()} />}
+                  </Each>
+                </SettingsGroup>
               )}
             </Each>
           </Column>
@@ -451,7 +455,11 @@ function ConnectionRow(props: { connection: ProviderConnection }) {
 
 // ------------------------------------------------------------------ details
 
-function ConnectionDetails(props: { connection: ProviderConnection }) {
+function ConnectionDetails(props: {
+  connection: ProviderConnection;
+  endpointFeedback: EndpointFeedback | null;
+  setEndpointFeedback: (value: EndpointFeedback | null) => void;
+}) {
   const c = () => props.connection;
   const device = () => isDeviceConnection(c());
   const provider = () => providerById(c().providerId);
@@ -460,6 +468,7 @@ function ConnectionDetails(props: { connection: ProviderConnection }) {
     if (sharingOpen() === c().id) closeSharing();
     providerConfirmDelete.set(null);
     deviceConfirmUnpair.set(null);
+    props.setEndpointFeedback(null);
     detailsOf.set(null);
   };
   const how = () => {
@@ -475,20 +484,20 @@ function ConnectionDetails(props: { connection: ProviderConnection }) {
   return (
     <Column gap={6} testID={`connection-details:${c().id}`}>
       <Column gap={3}>
-        <BackLink testID="connection-back" label="Model providers" onPress={back} />
+        <BackLink testID="connection-back" label="Model connections" onPress={back} />
         <ConnectionHeading testID={`connection-heading:${c().id}`} mark={markOf(c())} name={c().name} isDefault={c().isDefault} status={connectionStatus(c())}>
           <MoreMenu testID={`connection-menu:${c().id}`} accessibilityLabel={`More for ${c().name}`} items={menuItems(c(), true)} />
         </ConnectionHeading>
         <Label variant="caption" color="muted">
           {`${how()} · ${CAPABILITY_LABEL[connectionCapability(c())]}`}
         </Label>
+        <If when={settingsAccountScope()}>{(scope) => <ScopeLine scope={scope()} />}</If>
         <If when={connectionProblem(c())}>
           {(p) => (
-            <Banner
-              variant="inline"
+            <ProblemNote
               tone={p().tone}
               testID={`connection-problem:${c().id}`}
-              message={p().text}
+              text={p().text}
               action={p().fix ? <Action compact testID={`connection-fix:${c().id}`} label={p().fix!.label} onPress={p().fix!.run} /> : undefined}
             />
           )}
@@ -498,6 +507,9 @@ function ConnectionDetails(props: { connection: ProviderConnection }) {
       <ModelsSection connection={c()} />
       <If when={device()}>
         <DeviceSection connection={c()} />
+      </If>
+      <If when={!device() && provider()?.allowCustomUrl}>
+        <EndpointSection connection={c()} feedback={props.setEndpointFeedback} />
       </If>
       <If when={!device() && (provider()?.requiresKey || c().hasKey)}>
         <KeySection connection={c()} />
@@ -509,14 +521,114 @@ function ConnectionDetails(props: { connection: ProviderConnection }) {
         <FactList
           facts={[
             { label: "Provider", value: c().providerId },
-            ...(c().baseUrl ? [{ label: "Endpoint", value: c().baseUrl! }] : []),
+            ...(!provider()?.allowCustomUrl && c().baseUrl ? [{ label: "Endpoint", value: c().baseUrl! }] : []),
             { label: "Connection ID", value: c().id },
             ...(listingDetail() ? [{ label: "Last model listing", value: listingDetail()! }] : []),
             ...(connectionsErrorDetail() ? [{ label: "Last error", value: connectionsErrorDetail()! }] : []),
+            ...(props.endpointFeedback?.detail ? [{ label: "Last endpoint change", value: props.endpointFeedback.detail }] : []),
           ]}
         />
       </Disclosure>
     </Column>
+  );
+}
+
+const ENDPOINT_NOT_APPROVED = "That endpoint isn't on the server's approved list. Pick an approved URL exactly, or ask the operator to add it.";
+
+function EndpointSection(props: { connection: ProviderConnection; feedback: (value: EndpointFeedback | null) => void }) {
+  const c = () => props.connection;
+  const id = c().id;
+  const approved = () => catalog()?.allowedBaseUrls ?? [];
+  const current = () => c().baseUrl ?? providerById(c().providerId)?.defaultBaseUrl ?? null;
+  const canChange = () => !catalogError() && approved().some((url) => url !== current());
+  const busy = () => providerBusy() === `endpoint:${id}` || providerBusy() === `endpoint-refresh:${id}`;
+  const editing = signal(false);
+  const value = signal("");
+  const error = signal<string | null>(null);
+  let mounted = true;
+  cleanup(() => { mounted = false; });
+  const change = () => {
+    value.set(current() ?? "");
+    error.set(null);
+    props.feedback(null);
+    editing.set(true);
+  };
+  const edit = (url: string) => {
+    value.set(url);
+    error.set(null);
+    props.feedback(null);
+  };
+  const submit = async () => {
+    if (!mounted || !editing() || providerBusy()) return;
+    const url = value();
+    props.feedback(null);
+    error.set(null);
+    if (!isAllowedBaseUrl(url)) {
+      error.set(ENDPOINT_NOT_APPROVED);
+      return;
+    }
+    const outcome = await updateEndpoint(id, url);
+    if (!mounted) return;
+    if (outcome.kind === "not-approved") {
+      error.set(ENDPOINT_NOT_APPROVED);
+    } else if (outcome.kind === "failed") {
+      props.feedback({ id, tone: "danger", message: outcome.message, detail: outcome.detail, retry: () => void submit() });
+    } else if (outcome.kind === "changed") {
+      editing.set(false);
+      const listing = outcome.listing;
+      const refreshed = listing?.state === "ok";
+      const refreshFailed = listing?.state === "error";
+      props.feedback({
+        id,
+        tone: refreshFailed ? "warning" : "success",
+        message: refreshed
+          ? `Endpoint changed. Models listed again: ${refreshText(listing)}`
+          : refreshFailed
+            ? "Endpoint changed. Metro couldn't refresh the model list; use Refresh models to try again."
+            : "Endpoint changed.",
+      });
+    }
+  };
+  return (
+    <SettingsGroup title="Endpoint" description="Only endpoints the operator approved. Metro tests the new one before it switches." testID={`endpoint-section:${id}`}>
+      <SettingRow label="Current URL" stacked>
+        <Row align="center" gap={3} wrap>
+          <Column selectable grow testID={`endpoint-current:${id}`}>
+            <Label variant="mono">{current() ?? "No endpoint set"}</Label>
+          </Column>
+          <If when={!editing()}>
+            <Action label="Change…" testID={`endpoint-change:${id}`} disabled={!canChange() || !!providerBusy()} onPress={change} />
+          </If>
+        </Row>
+        <If when={!editing() && !canChange() && !catalogError()}>
+          <Label variant="caption" color="muted">No other approved endpoints. Ask your server operator to add one.</Label>
+        </If>
+      </SettingRow>
+      <If when={editing()}>
+        <If when={(c().visibility ?? shareOf(id)) === "spaces" || (c().visibility ?? shareOf(id)) === "organization"}>
+          <Banner variant="inline" tone="warning" testID={`endpoint-shared:${id}`} message="People you share this with will send their requests to the new endpoint." />
+        </If>
+        <SettingRow label="New URL" stacked>
+          <Column gap={2}>
+            <Row gap={2} wrap>
+              <Each of={approved()} key={(url) => url}>
+                {(url) => <Chip label={url()} selected={value() === url()} disabled={!!providerBusy()} onPress={() => edit(url())} />}
+              </Each>
+            </Row>
+            <Field testID={`endpoint-input:${id}`} accessibilityLabel="Approved endpoint URL" value={value()} onChange={edit} disabled={!!providerBusy()} />
+            <If when={error()}>
+              {(message) => <ProblemNote tone="danger" testID={`endpoint-error:${id}`} text={message()} />}
+            </If>
+            <ActionBar>
+              <Action label="Cancel" variant="ghost" disabled={busy()} onPress={() => { editing.set(false); props.feedback(null); }} />
+              <Action label="Test and save" variant="primary" testID={`endpoint-save:${id}`} busy={busy()}
+                busyLabel={providerBusy() === `endpoint-refresh:${id}` ? "Refreshing models…" : "Testing and saving…"}
+                disabled={!value() || value() === current() || catalogError() !== null || (!!providerBusy() && !busy())} onPress={() => void submit()} />
+            </ActionBar>
+          </Column>
+        </SettingRow>
+      </If>
+    </SettingsGroup>
   );
 }
 
@@ -555,6 +667,7 @@ function ModelsSection(props: { connection: ProviderConnection }) {
             label="Refresh models"
             busyLabel="Listing…"
             busy={listing()?.state === "loading"}
+            disabled={!!providerBusy()}
             compact
             onPress={() => void fetchModels(c().id)}
           />
@@ -1039,8 +1152,10 @@ function DangerZone(props: { connection: ProviderConnection }) {
               busy={busy() === `delete:${c().id}`}
               variant="danger"
               onPress={() => {
-                void deleteConnection(c().id).then(() => {
-                  if (!connections()?.some((x) => x.id === c().id)) detailsOf.set(null);
+                const id = c().id;
+                const currentSession = sessionGuard();
+                void deleteConnection(id).then(() => {
+                  if (currentSession() && detailsOf() === id && !connections()?.some((x) => x.id === id)) detailsOf.set(null);
                 });
               }}
             />

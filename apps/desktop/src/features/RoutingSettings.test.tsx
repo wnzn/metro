@@ -198,9 +198,36 @@ test("a model whose share was revoked is flagged and can't be saved", async () =
   const app = await signIn(f, "alice");
   await settings(app, "routing");
   await app.waitFor("id:case-missing:0");
+  expect(app.shows("id:routing-unsaved")).toBe(false);
+  expect(app.enabled("id:routing-save")).toBe(false);
+  await app.clear("id:routing-min-route");
+  await app.type("id:routing-min-route", "80");
   await app.press("id:routing-save");
   await app.waitFor("text:The model for “Heavy jobs” isn't available to you any more. Choose another one.");
   expect(puts(f, "/v1/model-routing")).toHaveLength(0);
+});
+
+test("a revoked fallback stays unavailable until the person explicitly clears and saves it", async () => {
+  const { f, s1, chat, shared } = routingWorld();
+  f.state.routing.set("alice", {
+    enabled: true, infer_addressing: false, classifier_id: s1.id, embedding_id: null,
+    default_chat_id: shared.id, min_directedness: 0.85, min_route_probability: 0.65,
+    cases: [{ key: "review", label: "Review", description: "", connection_id: chat.id }],
+  });
+  shared.share = { visibility: "personal", space_ids: [] };
+  const app = await signIn(f, "alice");
+  await settings(app, "routing");
+  await app.waitFor("id:routing-default-chat-missing");
+  expect(app.shows("id:routing-default-chat >> text:Unavailable selection")).toBe(true);
+  expect(app.shows("id:routing-default-chat >> text:Your default chat connection")).toBe(false);
+  expect(app.enabled("id:routing-save")).toBe(false);
+  expect(f.state.routing.get("alice")?.default_chat_id).toBe(shared.id);
+  await app.press("id:routing-default-chat-clear");
+  await app.waitFor("text:Your default chat connection");
+  expect(puts(f, "/v1/model-routing")).toHaveLength(0);
+  await app.press("id:routing-save");
+  await app.waitFor("id:routing-notice");
+  expect(puts(f, "/v1/model-routing").at(-1)?.body).toMatchObject({ default_chat_id: null, enabled: true });
 });
 
 test("a server without model routing says so", async () => {

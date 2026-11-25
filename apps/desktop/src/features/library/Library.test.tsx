@@ -91,10 +91,11 @@ test("Library is its own page listing only what I can access; Search's file mode
   expect(app.shows("id:library-model-status")).toBe(false);
   expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
 
-  // A first Index with no media model leads straight to the choice in Settings › Model providers: nothing is sent.
+  // A first Index with no media model leads straight to the choice in Settings › Model choices: nothing is sent.
   await app.press(`id:library-actions:${s.mine.id}`);
   await app.waitFor("text:Choose a media model to index");
   await app.press(`id:library-index:${s.mine.id}`);
+  await app.waitFor("id:routing-settings >> text:Model choices");
   await app.waitFor("id:library-model");
   await app.waitFor("id:library-model-asked");
   expect(app.shows("id:library-model-picker")).toBe(true);
@@ -133,6 +134,26 @@ test("Library is its own page listing only what I can access; Search's file mode
   // From there, the Library is one press away.
   await app.press("id:search-open-library");
   await app.waitFor("id:library-view");
+});
+
+test("a revoked Documents & media model is shown as unavailable until explicitly cleared and saved", async () => {
+  const w = libraryWorld();
+  w.addMediaConnection("alice", "device-embeddinggemma-2", "Another media model");
+  const revoked = w.addMediaConnection("bob", "embeddinggemma-2", "Previously shared");
+  w.l.settings.set("alice", revoked);
+  const app = await signIn(w);
+  await app.press("id:nav-settings");
+  await app.press("id:nav-settings:routing");
+  await app.waitFor("id:library-model-missing");
+  expect(app.shows("text:The saved selection is unavailable; no other model takes its place.")).toBe(true);
+  expect(lib(w, "/v1/library/settings", "PUT")).toHaveLength(0);
+  await app.press("id:library-model-clear");
+  expect(w.l.settings.get("alice")).toBe(revoked);
+  await app.press("id:library-model-save");
+  await app.waitFor("id:library-model-notice");
+  const writes = lib(w, "/v1/library/settings", "PUT");
+  expect(writes).toHaveLength(1);
+  expect(writes[0]!.body).toBe(JSON.stringify({ embedding_id: null }));
 });
 
 test("uploads come from the system picker as raw bytes, to the chosen Space, within the server's limit; nothing goes to a model", async () => {

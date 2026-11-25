@@ -69,7 +69,15 @@ export type Place = "chat" | "space" | "settings" | "search" | "library" | "page
 /** Where the main panel is under any modal: never Settings. */
 export type MainPlace = Exclude<Place, "settings">;
 /** The pages of Settings. Reachable with or without any Space. */
-export type SettingsSection = "profile" | "runners" | "providers" | "routing" | "monitoring" | "appearance";
+export type SettingsExtension = "websearch" | "about";
+export type SettingsSection = "profile" | "runners" | "connections" | "models" | "monitoring" | "appearance" | SettingsExtension;
+type SettingsAlias = "providers" | "routing";
+const settingsExtensions = signal<readonly SettingsExtension[]>([]);
+export const settingsExtensionAvailable = (section: SettingsExtension) => settingsExtensions().includes(section);
+/** Called by the Settings shell when a real extension page is installed. */
+export function enableSettingsExtension(section: SettingsExtension) {
+  if (!settingsExtensionAvailable(section)) settingsExtensions.set([...settingsExtensions(), section]);
+}
 
 // ------------------------------------------------------------------ state
 
@@ -101,7 +109,7 @@ export const settingsOpen = signal(false);
 export const place = computed<Place>(() => (settingsOpen() ? "settings" : basePlace()));
 /** The main panel's place, under the Settings modal too. */
 export const mainPlace = computed<MainPlace>(() => basePlace());
-export const settingsSection = signal<SettingsSection>("runners");
+export const settingsSection = signal<SettingsSection>("profile");
 export const spaces = signal<Space[]>([]);
 export const activeSpaceId = signal<string | null>(null);
 export const activeSpace = computed(() => spaces().find((s) => s.id === activeSpaceId()) ?? null);
@@ -495,11 +503,13 @@ export async function openLocation(target: Location): Promise<boolean> {
  * (place, Space, room, view, drafts, scroll) is kept for closeSettings; only
  * what is shown once (tokens, confirmations) is dropped, as on any move.
  */
-export function openSettings(section: SettingsSection = settingsSection()) {
-  if (settingsOpen() && settingsSection() === section) return;
+export function openSettings(section: SettingsSection | SettingsAlias = settingsSection()) {
+  const page = section === "providers" ? "connections" : section === "routing" ? "models" : section;
+  if ((page === "about" || page === "websearch") && !settingsExtensionAvailable(page)) return;
+  if (settingsOpen() && settingsSection() === page) return;
   batch(() => {
     clearTransient();
-    settingsSection.set(section);
+    settingsSection.set(page);
     settingsOpen.set(true);
   });
 }
@@ -1340,7 +1350,7 @@ function endSession() {
     manageError.set(null);
     memberBusy.set(null);
     orgAdmin.set(false);
-    settingsSection.set("runners");
+    settingsSection.set("profile");
     for (const fn of sessionEnders) fn();
   });
 }

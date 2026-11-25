@@ -294,7 +294,7 @@ export type ModelRouting = {
 };
 
 /** The transport other API modules (src/api/discovery.ts) build on. */
-export type RequestFn = (method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown, signal?: AbortSignal) => Promise<unknown>;
+export type RequestFn = (method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown, signal?: AbortSignal, deadlineMs?: number) => Promise<unknown>;
 
 /** A device connection's metro-connector (GET /v1/providers/{id}/device-token). */
 export type DeviceStatus = { paired: boolean; online: boolean; lastSeenSecs: number | null };
@@ -355,10 +355,10 @@ export type Client = ReturnType<typeof createClient>;
 export function createClient(options: ClientOptions) {
   const timeoutMs = options.timeoutMs ?? 10_000;
 
-  const request: RequestFn = async (method, path, body, signal) => {
+  const request: RequestFn = async (method, path, body, signal, deadlineMs = timeoutMs) => {
     const url = options.baseUrl + path;
     const timeout = new AbortController();
-    const timer = setTimeout(() => timeout.abort(), timeoutMs);
+    const timer = setTimeout(() => timeout.abort(), deadlineMs);
     const onOuterAbort = () => timeout.abort();
     options.signal?.addEventListener("abort", onOuterAbort);
     signal?.addEventListener("abort", onOuterAbort);
@@ -393,7 +393,7 @@ export function createClient(options: ClientOptions) {
       checkCancelled();
       if (error instanceof ApiError) throw error;
       if (timeout.signal.aborted) {
-        throw new ApiError("timeout", `${options.baseUrl} did not answer ${method} ${path} within ${Math.round(timeoutMs / 1000)}s.`);
+        throw new ApiError("timeout", `${options.baseUrl} did not answer ${method} ${path} within ${Math.round(deadlineMs / 1000)}s.`);
       }
       const detail = String((error as Error)?.message ?? error).replace(/^Network request failed:\s*/i, "");
       throw new ApiError("network", `Cannot reach ${options.baseUrl} (${detail}). Is the server running?`);
@@ -590,8 +590,8 @@ export function createClient(options: ClientOptions) {
     },
 
     /** Lists the provider's models again and merges them into the connection's list. */
-    async refreshConnectionModels(id: string): Promise<ModelRefresh> {
-      const data = await request("POST", `/v1/providers/${encodeURIComponent(id)}/model-list/refresh`, {});
+    async refreshConnectionModels(id: string, afterEndpointChange = false): Promise<ModelRefresh> {
+      const data = await request("POST", `/v1/providers/${encodeURIComponent(id)}/model-list/refresh`, {}, undefined, afterEndpointChange ? 25_000 : undefined);
       const models = isObject(data) ? data.models : undefined;
       if (!isObject(data) || !Array.isArray(models)) throw new ApiError("protocol", "POST …/model-list/refresh did not return { models: [...] }.");
       return {
@@ -604,6 +604,16 @@ export function createClient(options: ClientOptions) {
 
     async updateProvider(id: string, patch: ProviderPatch): Promise<void> {
       await request("PATCH", `/v1/providers/${encodeURIComponent(id)}`, patch);
+    },
+
+    /** The server tests and commits in one operation (its endpoint probe can take up to 20s). */
+    async updateProviderEndpoint(id: string, baseUrl: string): Promise<ProviderConnection> {
+      const path = `/v1/providers/${encodeURIComponent(id)}`;
+      const data = await request("PATCH", path, { base_url: baseUrl }, undefined, 25_000);
+      if (!isConnection(data) || String(data.id) !== id || data.base_url !== baseUrl) {
+        throw new ApiError("protocol", "The server did not confirm the requested endpoint.");
+      }
+      return toConnection(data);
     },
 
     async deleteProvider(id: string): Promise<void> {

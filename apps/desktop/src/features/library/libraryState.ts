@@ -23,7 +23,7 @@ import type { AvailableModel } from "../../api/client";
 import { ACCEPTED, acceptedOf, MAX_UPLOAD_BYTES, mediaKindOf } from "../../api/library";
 import type { AssetKind, LibraryApi, LibraryAsset, LibraryHit, LibraryRanking, LibraryScope, Locator, MediaKind, UploadTarget } from "../../api/library";
 import { ensurePrivateDir } from "./privateDir";
-import { apiClient, describe, disconnect, isAborted, mainPlace, me, onSessionEnd, sessionGuard, spaces } from "../../store";
+import { apiClient, describe, disconnect, isAborted, mainPlace, me, onSessionEnd, onTransientClear, place, sessionGuard, settingsSection, spaces } from "../../store";
 
 export type { LibraryAsset, LibraryHit, LibraryRanking, LibraryScope, Locator, MediaKind, UploadTarget };
 
@@ -71,11 +71,27 @@ export const savedModelId = signal<string | null>(null);
 export const suggestedModelId = signal<string | null>(null);
 export const modelDraft = signal<string | null>(null);
 export const modelsLoaded = signal(false);
+export const modelsLoading = signal(false);
 export const modelError = signal<string | null>(null);
+export const modelNotice = signal<string | null>(null);
+export const modelsUnsupported = signal(false);
 export const savingModel = signal(false);
+let mediaModelsSeq = 0;
+let mediaVisit = 0;
 
 export const savedModel = computed(() => mediaModels().find((m) => m.connectionId === savedModelId()) ?? null);
 export const draftModel = computed(() => mediaModels().find((m) => m.connectionId === modelDraft()) ?? null);
+
+export function revertMediaModel() {
+  modelDraft.set(savedModelId());
+  modelNotice.set(null);
+}
+
+onTransientClear(() => {
+  if (place() !== "settings" || settingsSection() !== "models") return;
+  mediaVisit++;
+  revertMediaModel();
+});
 
 // ------------------------------------------------------------------ search
 
@@ -293,61 +309,75 @@ export async function loadAssets(more: boolean): Promise<void> {
 }
 
 export async function loadModels(): Promise<void> {
+  const api = library();
+  const c = apiClient();
+  if (!api || !c || savingModel()) return;
   const ok = sessionGuard();
-  modelError.set(null);
+  const seq = ++mediaModelsSeq;
+  const live = () => ok() && seq === mediaModelsSeq;
+  batch(() => {
+    modelError.set(null);
+    modelsLoading.set(true);
+    modelsUnsupported.set(false);
+  });
   try {
-    const api = library();
-    const c = apiClient();
-    if (!api || !c) return;
     const [models, settings] = await Promise.all([c.availableModels(), api.librarySettings()]);
-    if (!ok()) return;
+    if (!live()) return;
+    const edited = modelDraft() !== savedModelId();
     batch(() => {
       // Only adapters that embed media themselves: a text-only embeddings connection never stands in.
-      mediaModels.set(models.filter((m) => m.capability === "embeddings" && m.mediaInputs === true && m.ready !== false));
+      mediaModels.set(models.filter((m) => m.capability === "embeddings" && m.mediaInputs === true && !!m.model && m.ready !== false));
       savedModelId.set(settings.embeddingId);
       suggestedModelId.set(settings.suggestedId);
-      modelDraft.set(settings.embeddingId);
+      if (!edited) modelDraft.set(settings.embeddingId);
       modelsLoaded.set(true);
     });
   } catch (error) {
-    if (!ok()) return;
+    if (!live()) return;
     if (statusOf(error) === 404) {
-      modelError.set("This server has no Documents & media search (GET /v1/library/settings answered 404).");
+      modelsUnsupported.set(true);
+      modelsLoaded.set(false);
       return;
     }
     const message = failure(error, "Couldn't load media models");
     if (message) modelError.set(message);
+  } finally {
+    if (live()) modelsLoading.set(false);
   }
 }
 
-export async function saveModel(): Promise<void> {
+export async function saveModel(): Promise<boolean> {
+  const api = library();
   const id = modelDraft();
-  if (id !== null && !mediaModels().some((m) => m.connectionId === id)) return;
+  if (!api || !modelsLoaded() || modelsLoading() || savingModel() || id === savedModelId() || (id !== null && !draftModel())) return false;
   const ok = sessionGuard();
+  const visit = mediaVisit;
   batch(() => {
     savingModel.set(true);
     modelError.set(null);
+    modelNotice.set(null);
   });
   try {
-    const api = library();
-    if (!api) return;
     const saved = await api.putLibrarySettings(id);
-    if (!ok()) return;
+    if (!ok()) return false;
     batch(() => {
       savedModelId.set(saved.embeddingId);
       modelDraft.set(saved.embeddingId);
       if (saved.suggestedId) suggestedModelId.set(saved.suggestedId);
+      if (visit === mediaVisit) modelNotice.set(saved.embeddingId ? "Media model saved." : "Media model cleared. Indexing and file search are off.");
     });
+    return visit === mediaVisit;
   } catch (error) {
-    if (!ok()) return;
+    if (!ok()) return false;
     const detail = serverDetail(error);
     const status = statusOf(error);
     if (status === 422 || status === 409 || status === 400) {
-      modelError.set(`That connection can't be used for Documents & media${detail ? `: ${detail}` : ""}.`);
-      return;
+      if (visit === mediaVisit) modelError.set(`That connection can't be used for Documents & media${detail ? `: ${detail}` : ""}.`);
+      return false;
     }
     const message = failure(error, "Couldn't save the media model");
-    if (message) modelError.set(message);
+    if (message && visit === mediaVisit) modelError.set(message);
+    return false;
   } finally {
     if (ok()) savingModel.set(false);
   }
@@ -1020,6 +1050,8 @@ effect(() => {
 
 onSessionEnd(() => {
   seq++;
+  mediaModelsSeq++;
+  mediaVisit++;
   stopThumbnails();
   closeViewer();
   dropThumbnails();
@@ -1047,7 +1079,10 @@ onSessionEnd(() => {
     suggestedModelId.set(null);
     modelDraft.set(null);
     modelsLoaded.set(false);
+    modelsLoading.set(false);
+    modelsUnsupported.set(false);
     modelError.set(null);
+    modelNotice.set(null);
     savingModel.set(false);
     libQuery.set("");
     libScope.set({ kind: "all" });

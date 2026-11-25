@@ -20,6 +20,8 @@
 
 import { batch, computed, effect, signal, untracked } from "nsh";
 import { ApiError } from "./api/client";
+import { serverHost } from "./api/serverUrl";
+import type { PageScope } from "./ui";
 import type {
   Capability,
   CatalogProvider,
@@ -41,6 +43,7 @@ import {
   activeSpace,
   activeSpaceId,
   apiClient,
+  connectedTo,
   describe,
   disconnect,
   handleManageError,
@@ -59,6 +62,11 @@ import {
 import { forgetQuietly, localConnections, localStep, onLocalPairingChanged, packaged, refreshHelper } from "./device/state";
 
 export type { Capability, CatalogProvider, ConnectionModel, DeviceStatus, ModelThinking, NewConnectionModel, ProviderConnection, RegisteredRunner, RunnerVisibility, SpaceRunner };
+
+export function settingsAccountScope(): PageScope | undefined {
+  const server = connectedTo();
+  return server ? { kind: "account", host: serverHost(server) } : undefined;
+}
 
 // ------------------------------------------------------------------ the one-time reveal
 
@@ -575,7 +583,7 @@ export async function createConnection(body: NewProviderConnection, opts: { fetc
  * is dropped). For a device connection this is also its connection test: it
  * answers only while its metro-connector is online.
  */
-export async function fetchModels(id: string): Promise<void> {
+export async function fetchModels(id: string, afterEndpointChange = false): Promise<void> {
   const c = apiClient();
   if (!c) return;
   const seq = (modelsSeq.get(id) ?? 0) + 1;
@@ -585,7 +593,7 @@ export async function fetchModels(id: string): Promise<void> {
   const known = connections()?.find((x) => x.id === id);
   if (known && isDeviceConnection(known)) void loadDeviceStatus(id);
   try {
-    const result = await c.refreshConnectionModels(id);
+    const result = await c.refreshConnectionModels(id, afterEndpointChange);
     if (!ok() || modelsSeq.get(id) !== seq) return;
     batch(() => {
       modelListings.set({ ...modelListings(), [id]: { state: "ok", models: result.models, added: result.added, unavailable: result.unavailable } });
@@ -740,6 +748,72 @@ export async function updateConnection(id: string, patch: ProviderPatch, done?: 
   }
 }
 
+type EndpointResult =
+  | { kind: "ignored" | "not-approved" }
+  | { kind: "failed"; message: string; detail?: string }
+  | { kind: "changed"; listing?: ModelListing };
+
+/** Keep the committed endpoint in state until the server confirms a successful test and save. */
+export async function updateEndpoint(id: string, url: string): Promise<EndpointResult> {
+  const c = apiClient();
+  const current = connections()?.find((x) => x.id === id);
+  const provider = current && providerById(current.providerId);
+  if (!c || !current || !provider?.allowCustomUrl || isDeviceConnection(current) || providerBusy() || url === current.baseUrl) {
+    return { kind: "ignored" };
+  }
+  if (catalogError() || !isAllowedBaseUrl(url)) return { kind: "not-approved" };
+  const ok = sessionGuard();
+  batch(() => {
+    providerBusy.set(`endpoint:${id}`);
+    clearProviderError();
+    providerNotice.set(null);
+  });
+  try {
+    const changed = await c.updateProviderEndpoint(id, url);
+    if (!ok()) return { kind: "ignored" };
+    // Don't show a listing from the old endpoint, even if it finishes after the PATCH.
+    modelsSeq.set(id, (modelsSeq.get(id) ?? 0) + 1);
+    batch(() => {
+      replaceConnection(changed);
+      const listings = { ...modelListings() };
+      delete listings[id];
+      modelListings.set(listings);
+      providerBusy.set(`endpoint-refresh:${id}`);
+    });
+    if (provider.listsModels) await fetchModels(id, true);
+    if (!ok()) return { kind: "ignored" };
+    return { kind: "changed", listing: modelListings()[id] };
+  } catch (error) {
+    if (!ok() || isAborted(error)) return { kind: "ignored" };
+    if (error instanceof ApiError && error.kind === "auth") {
+      disconnect(error.message);
+      return { kind: "ignored" };
+    }
+    const status = error instanceof ApiError ? error.status : null;
+    const detail = status ? `PATCH endpoint: HTTP ${status}` : undefined;
+    if (status === 400 && /allowed_base_urls/i.test(serverReason(error) ?? "")) {
+      void loadCatalog();
+      return { kind: "not-approved" };
+    }
+    if ((status === 502 || status === 504) && /^the new endpoint failed/i.test(serverReason(error) ?? "")) {
+      const reason = status === 504 ? "the test timed out" : "the connection test failed";
+      return { kind: "failed", message: `The new endpoint didn't answer (${reason}). The connection still uses the old one.`, detail };
+    }
+    void loadConnections();
+    return {
+      kind: "failed",
+      message: status === 404 || status === 403
+        ? "This connection is no longer available to edit."
+        : status === 400 || status === 409 || status === 503
+          ? serverReason(error) ?? "The server refused the endpoint change. Check the connection and try again."
+          : "Metro couldn't confirm the endpoint change. Reload the connection before trying again.",
+      detail,
+    };
+  } finally {
+    if (ok()) providerBusy.set(null);
+  }
+}
+
 export async function deleteConnection(id: string): Promise<void> {
   const c = apiClient();
   if (!c || providerBusy()) return;
@@ -882,12 +956,12 @@ export async function rotateDeviceToken(id: string): Promise<void> {
   }
 }
 
-const onProvidersPage = () => place() === "settings" && settingsSection() === "providers";
+const onProvidersPage = () => place() === "settings" && settingsSection() === "connections";
 
 /** Whether `url` may be used as a custom base URL: exactly one of the server's allowed URLs. */
 export function isAllowedBaseUrl(url: string): boolean {
   const allowed = catalog()?.allowedBaseUrls ?? [];
-  return allowed.includes(url.trim());
+  return allowed.includes(url);
 }
 
 // ------------------------------------------------------------------ errors and lifecycle
@@ -960,7 +1034,7 @@ effect(() => {
   const here = place() === "settings" ? settingsSection() : null;
   untracked(() => {
     if (here === "runners") void loadRunners();
-    else if (here === "providers") {
+    else if (here === "connections") {
       void loadProviders();
       void refreshHelper();
     }

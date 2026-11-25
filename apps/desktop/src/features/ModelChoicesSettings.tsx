@@ -1,4 +1,4 @@
-// Settings › Model routing: which of the user's usable models answers which
+// Settings › Model choices: which of the user's usable models answers which
 // kind of request (use-case routing), confidence for Space classification,
 // and the embeddings model
 // search uses. Every picker offers only models of the right capability that
@@ -9,14 +9,18 @@ import {
   addCase,
   available,
   availableError,
+  availableLoading,
   draft,
   editCase,
   editRouting,
   findAvailable,
+  loadAvailable,
+  loadRouting,
   MAX_CASES,
   MAX_DESCRIPTION,
   MAX_LABEL,
   MIN_DIRECTEDNESS_FLOOR,
+  modelChoiceUsable,
   modelsFor,
   parseProbability,
   removeCase,
@@ -31,12 +35,13 @@ import {
 } from "../routing";
 import type { JSX } from "nsh";
 import type { AvailableModel, DraftCase, RoutingDraft } from "../routing";
-import { providerById } from "../settings";
+import { providerById, settingsAccountScope } from "../settings";
 import type { Capability } from "../settings";
-import { openSettings } from "../store";
-import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field, Label, LearnMore, ModelPicker, PageHeader, PageLayout, PercentField, Row, SettingRow, SettingsGroup, Toggle } from "../ui";
+import { openSettings, settingsExtensionAvailable } from "../store";
+import { Action, ActionBar, Badge, Banner, Column, compactWidth, FactList, Field, Label, LearnMore, ModelPicker, PageHeader, PageLayout, PercentField, ProblemNote, Row, SettingRow, SettingsGroup, Toggle } from "../ui";
 import type { Fact, ModelOption } from "../ui";
 import { vendorOf } from "./providerGroups";
+import { MediaModelSettings, MediaModelFeedback, MediaModelSaveBar } from "./library/LibraryView";
 
 const NONE = "";
 
@@ -74,7 +79,9 @@ function percentsValid(d: RoutingDraft): boolean {
   return percentError(percentText(d.minRouteProbability), 0) === null && percentError(percentText(d.minDirectedness), FLOOR_PERCENT) === null;
 }
 
-export function RoutingSettings() {
+const catalogReady = () => !!available() && !availableLoading() && !availableError();
+
+export function ModelChoicesSettings() {
   return (
     <PageLayout
       testID="routing-settings"
@@ -83,25 +90,31 @@ export function RoutingSettings() {
       footer={
         <Column gap={2}>
           <Messages />
+          <MediaModelFeedback />
+          <MediaModelSaveBar separate />
           <If when={!routingUnsupported() && draft()}>
             <SaveBar />
           </If>
         </Column>
       }
     >
-      <PageHeader title="Model routing" />
-      <If when={!routingUnsupported()} else={<Unsupported />}>
-        <If when={draft()} else={<Label variant="caption" color="muted">{routingError() ? "" : "Loading your model routing…"}</Label>}>
+      <PageHeader title="Model choices" subtitle="Choose how Metro routes requests, searches messages and indexes files." scope={settingsAccountScope()} />
+      <If when={!routingUnsupported()}>
+        <If when={draft()} else={<If when={!routingError()}><SettingsGroup><SettingRow label="Loading your model choices…" /></SettingsGroup></If>}>
           {(d) => (
             <Column gap={6}>
+              <If when={availableLoading()}><SettingsGroup><SettingRow label="Loading the models you can use…" /></SettingsGroup></If>
               <ClassifierGroup draft={d()} />
               <RoutingGroup draft={d()} />
               <AddressingGroup draft={d()} />
               <SearchGroup draft={d()} />
-              <DataFlow draft={d()} />
             </Column>
           )}
         </If>
+      </If>
+      <MediaModelSettings separate canReveal={!availableLoading() && !!(draft() || routingUnsupported() || routingError())} />
+      <If when={routingUnsupported() ? null : draft()}>
+        {(d) => <DataFlow draft={d()} />}
       </If>
     </PageLayout>
   );
@@ -122,8 +135,11 @@ function Unsupported() {
 function Messages() {
   return (
     <Column gap={2}>
-      <If when={availableError()}>{(message) => <Banner variant="inline" tone="danger" testID="available-error" message={message()} />}</If>
-      <If when={routingError()}>{(message) => <Banner variant="inline" tone="danger" testID="routing-error" message={message()} />}</If>
+      <If when={availableError()}>{(message) => <Banner variant="inline" tone="danger" testID="available-error" message={message()}
+        action={<Action label="Try again" onPress={() => void loadAvailable()} />} />}</If>
+      <If when={routingUnsupported()}><Unsupported /></If>
+      <If when={routingError()}>{(message) => <Banner variant="inline" tone="danger" testID="routing-error" message={message()}
+        action={!draft() ? <Action label="Try again" onPress={() => void loadRouting()} /> : undefined} />}</If>
       <If when={routingNotice()}>{(message) => <Banner variant="inline" tone="success" testID="routing-notice" message={message()} />}</If>
     </Column>
   );
@@ -149,7 +165,9 @@ function modelDetail(m: AvailableModel): string {
       ? `Preset from ${m.ownerId ?? "someone"} · runs on your own sign-in`
       : `Shared by ${m.ownerId ?? "someone"}, who can see these requests`;
   const model = defaultModelOf(m);
-  const notReady = !m.model ? " · Add a model to it first" : m.ready === false ? " · Sign in with your own account first" : "";
+  const notReady = !m.model ? " · Add a model to it first"
+    : m.ready === false && m.runsOn === "your_own_sign_in" ? " · Sign in with your own account first"
+    : modelChoiceUsable(m, m.capability) ? "" : " · Not available now";
   return [model, whose].filter(Boolean).join(" · ") + notReady;
 }
 
@@ -168,21 +186,16 @@ function optionsFor(capability: Capability, none?: string): ModelOption[] {
       detail: modelDetail(m),
       title: [m.name, defaultModelOf(m), m.model, v.name, m.owned ? "yours" : m.ownerId].filter(Boolean).join(" · "),
       provider: v,
-      disabled: !m.model || m.ready === false,
+      disabled: !modelChoiceUsable(m, capability),
     };
   });
   return none ? [{ value: NONE, model: none, title: none }, ...options] : options;
 }
 
-/** A model saved earlier that is no longer available (deleted, or its share revoked). */
-function Missing(props: { id: string | null; testID: string }) {
-  return (
-    <If when={props.id && available() && !findAvailable(props.id)}>
-      <Label variant="caption" color="warning" testID={props.testID}>
-        The model saved here isn't available to you any more (deleted, or no longer shared with you). Choose another one.
-      </Label>
-    </If>
-  );
+function unavailable(id: string | null, capability: Capability): boolean {
+  if (!id || !catalogReady()) return false;
+  const model = findAvailable(id);
+  return !model || !modelChoiceUsable(model, capability);
 }
 
 function RoutingModelPicker(props: {
@@ -193,7 +206,10 @@ function RoutingModelPicker(props: {
   onChange: (id: string | null) => void;
   none?: string;
   placeholder?: string;
+  missingTestID?: string;
 }) {
+  const missing = () => unavailable(props.value, props.capability);
+  const pinned = () => props.value !== null;
   return (
     <Column gap={1}>
       <ModelPicker
@@ -201,23 +217,32 @@ function RoutingModelPicker(props: {
         rememberAs="routing"
         accessibilityLabel={props.label}
         options={optionsFor(props.capability, props.none)}
-        value={props.value && findAvailable(props.value) ? props.value : props.none ? NONE : null}
+        value={pinned() ? (missing() ? null : props.value) : props.none ? NONE : null}
         onChange={(v) => props.onChange(v ? v : null)}
-        placeholder={props.placeholder ?? props.none ?? "Choose a model"}
+        placeholder={pinned() ? (missing() ? "Unavailable selection" : "Checking saved selection…") : props.placeholder ?? props.none ?? "Choose a model"}
+        attention={missing()}
+        disabled={!catalogReady() || routingSaving()}
       />
-      <Missing id={props.value} testID={`${props.testID}-missing`} />
+      <If when={missing()}>
+        <ProblemNote tone="warning" testID={props.missingTestID ?? `${props.testID}-missing`}
+          text={props.none
+            ? "This selection is unavailable. Metro won't replace it automatically; pick another model or clear the selection and save."
+            : "This selection is unavailable. Metro won't replace it automatically; choose another model or remove this use case."}
+          action={props.none ? <Action label="Clear selection" testID={`${props.testID}-clear`} variant="ghost" disabled={routingSaving()} onPress={() => props.onChange(null)} /> : undefined}
+        />
+      </If>
     </Column>
   );
 }
 
 function NoneOf(props: { capability: Capability; what: string; testID: string }) {
   return (
-    <If when={available() && modelsFor(props.capability).length === 0}>
+    <If when={catalogReady() && modelsFor(props.capability).length === 0}>
       <Row gap={2} align="center" wrap testID={props.testID}>
         <Label variant="caption" color="muted">
-          {`You have no ${props.what} connection, and none is shared with you. Add one in Model providers.`}
+          {`You have no ${props.what} connection, and none is shared with you.`}
         </Label>
-        <Action label="Open Model providers" variant="ghost" onPress={() => openSettings("providers")} />
+        <Action label="Open Model connections" variant="ghost" onPress={() => openSettings("connections")} />
       </Row>
     </If>
   );
@@ -237,14 +262,14 @@ function SectionMore(props: { testID: string; children?: JSX.Element }) {
 function ClassifierGroup(props: { draft: RoutingDraft }) {
   return (
     <SettingsGroup
-      title="System One classifier"
+      title="System One"
       description="Used by routing, Space classification and search. A chat model never stands in for it."
       testID="routing-classifier-group"
     >
       <SectionMore testID="classifier-learn-more">
         <FactList facts={[{ label: "Answers", value: "Typed questions: Noul, choice and score." }, { label: "Used by", value: "Use-case routing, Space classification when enabled, and search, which reranks with it." }]} />
       </SectionMore>
-      <SettingRow label="Classifier" stacked>
+      <SettingRow label="System One connection" stacked>
         <RoutingModelPicker
           testID="routing-classifier"
           label="System One classifier"
@@ -270,7 +295,7 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
       <SectionMore testID="routing-learn-more">
         <FactList
           facts={[
-            { label: "Starts on", value: "@agent, Ask agent, or a start the opt-in below allowed." },
+            { label: "Starts on", value: "Messages in personal Chat, and requests that start an agent in a Space." },
             { label: "Override", value: "A model you pick for one turn overrides it." },
             { label: "When off", value: "Your default chat connection answers." },
             { label: "Use cases", value: "System One reads each name and description to tell them apart." },
@@ -278,7 +303,7 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
         />
       </SectionMore>
       <SettingRow label="Route by use case" description="Off by default. When on, each agent request you start is sent to System One to pick a model.">
-        <Toggle testID="routing-enabled" label="Route by use case" checked={d().enabled} onChange={(on) => editRouting({ enabled: on })} />
+        <Toggle testID="routing-enabled" label="Route by use case" checked={d().enabled} disabled={routingSaving()} onChange={(on) => editRouting({ enabled: on })} />
       </SettingRow>
       <SettingRow label="Minimum confidence" description="0 to 100%. Below it, the fallback model answers." stacked>
         <PercentField
@@ -287,6 +312,7 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
           value={percentText(d().minRouteProbability)}
           onChange={(v) => editRouting({ minRouteProbability: fromPercent(v) })}
           error={percentError(percentText(d().minRouteProbability), 0)}
+          disabled={routingSaving()}
           placeholder="65"
         />
       </SettingRow>
@@ -308,7 +334,7 @@ function RoutingGroup(props: { draft: RoutingDraft }) {
       </If>
       <NoneOf capability="chat" what="chat" testID="routing-no-chat" />
       <Row padX={4} padY={3} gap={2} align="center">
-        <Action testID="routing-add-case" label="+ Use case" accessibilityLabel="Add a use case" disabled={d().cases.length >= MAX_CASES} onPress={addCase} />
+        <Action testID="routing-add-case" label="Add use case" disabled={d().cases.length >= MAX_CASES || routingSaving()} onPress={addCase} />
         <Label variant="caption" color="muted">
           {`${d().cases.length} of ${MAX_CASES}`}
         </Label>
@@ -321,9 +347,9 @@ function CaseRow(props: { item: DraftCase; index: number }) {
   const c = () => props.item;
   const n = () => props.index;
   return (
-    <SettingRow label={c().label.trim() || `Use case ${n() + 1}`} stacked testID={`case:${n()}`}>
+    <SettingRow label={c().label.trim() || `Use case ${n() + 1}`} description={`Name: up to ${MAX_LABEL} characters; description: up to ${MAX_DESCRIPTION}.`} stacked testID={`case:${n()}`}>
       <Column gap={2}>
-        <Field testID={`case-label:${n()}`} accessibilityLabel={`Name of use case ${n() + 1}`} value={c().label} onChange={(v) => editCase(c().uid, { label: v })} placeholder="Name, such as Code review" maxLength={MAX_LABEL} />
+        <Field testID={`case-label:${n()}`} accessibilityLabel={`Name of use case ${n() + 1}`} value={c().label} onChange={(v) => editCase(c().uid, { label: v })} placeholder="Name, such as Code review" maxLength={MAX_LABEL} disabled={routingSaving()} />
         <Field
           testID={`case-description:${n()}`}
           accessibilityLabel={`Description of use case ${n() + 1}`}
@@ -332,25 +358,25 @@ function CaseRow(props: { item: DraftCase; index: number }) {
           placeholder="What kind of request it is, in a sentence or two"
           multiline
           maxLength={MAX_DESCRIPTION}
+          disabled={routingSaving()}
         />
         <Row gap={2} align="center" wrap>
           <Label variant="caption" color="muted">
             Answered by
           </Label>
           <Column grow>
-            <ModelPicker
+            <RoutingModelPicker
               testID={`case-model:${n()}`}
-              rememberAs="routing"
-              accessibilityLabel={`Model that answers use case ${n() + 1}`}
-              options={optionsFor("chat")}
-              value={c().connectionId && findAvailable(c().connectionId) ? c().connectionId : null}
-              onChange={(v) => editCase(c().uid, { connectionId: v || null })}
+              label={`Model that answers use case ${n() + 1}`}
+              capability="chat"
+              value={c().connectionId}
+              onChange={(v) => editCase(c().uid, { connectionId: v })}
               placeholder="Choose a chat model"
+              missingTestID={`case-missing:${n()}`}
             />
           </Column>
-          <Action testID={`case-remove:${n()}`} label="Remove" accessibilityLabel={`Remove use case ${n() + 1}`} variant="destructive" edgeAligned onPress={() => removeCase(c().uid)} />
+          <Action testID={`case-remove:${n()}`} label="Remove" accessibilityLabel={`Remove use case ${n() + 1}`} variant="destructive" edgeAligned disabled={routingSaving()} onPress={() => removeCase(c().uid)} />
         </Row>
-        <Missing id={c().connectionId} testID={`case-missing:${n()}`} />
       </Column>
     </SettingRow>
   );
@@ -371,6 +397,7 @@ function AddressingGroup(props: { draft: RoutingDraft }) {
           value={percentText(d().minDirectedness)}
           onChange={(v) => editRouting({ minDirectedness: fromPercent(v) })}
           error={percentError(percentText(d().minDirectedness), FLOOR_PERCENT)}
+          disabled={routingSaving()}
           placeholder="85"
         />
       </SettingRow>
@@ -443,10 +470,15 @@ function FlowRow(props: { label: string; on: boolean; off: string; facts: Fact[]
 
 function DataFlow(props: { draft: RoutingDraft }) {
   const d = () => props.draft;
-  const classifier = () => findAvailable(d().classifierId);
-  const embedding = () => findAvailable(d().embeddingId);
+  const flow = (id: string | null, cap: Capability, label?: string): Fact[] => {
+    if (!id) return endpointFacts(null, label);
+    if (!catalogReady()) return [{ label: label ?? "To", value: "Availability not confirmed" }];
+    const model = findAvailable(id);
+    if (!model || !modelChoiceUsable(model, cap)) return [{ label: label ?? "To", value: "The selected model is unavailable; no other model takes its place" }];
+    return endpointFacts(model, label);
+  };
   return (
-    <SettingsGroup title="Where your text goes" description="Nothing is sent until you save." testID="routing-dataflow">
+    <SettingsGroup title="Where your text goes" description="Draft changes take effect only after you save." testID="routing-dataflow">
       <FlowRow
         label="Use-case routing"
         on={d().enabled}
@@ -455,7 +487,7 @@ function DataFlow(props: { draft: RoutingDraft }) {
         facts={[
           { label: "When", value: "Agent work starts for you" },
           { label: "Sends", value: "That message's text, and your use-case names and descriptions" },
-          ...endpointFacts(classifier()),
+          ...flow(d().classifierId, "system_one"),
           { label: "Then", value: "The model it picks answers as usual" },
         ]}
       />
@@ -471,17 +503,22 @@ function DataFlow(props: { draft: RoutingDraft }) {
         testID="dataflow-search"
         facts={[
           { label: "Sends", value: "Your queries, and the text of messages you can read: your Chat, and the rooms and threads of Spaces you're in now, other members' messages there included" },
-          ...endpointFacts(embedding()),
+          ...flow(d().embeddingId, "embeddings"),
           ...(d().classifierId
-            ? [{ label: "Reranks", value: "Each query and its top results (at most 10) also go to the classifier" }, ...endpointFacts(classifier(), "Classifier")]
+            ? [{ label: "Reranks", value: "Each query and its top results (at most 10) also go to the classifier" }, ...flow(d().classifierId, "system_one", "Classifier")]
             : [{ label: "Reranks", value: "No: results keep their embedding order" }]),
         ]}
       />
       <SettingRow
         label="Never sent"
-        description="Messages that mention only people, and other members' messages for routing or classification. Your settings cover only what you write."
+        description="Messages that mention only people, and other members' messages for routing or classification. Search can include messages you can read."
         testID="dataflow-never"
       />
+      <If when={settingsExtensionAvailable("websearch")}>
+        <SettingRow label="Web search" description="When Metro searches the web, it sends queries to the providers enabled on this computer.">
+          <Action label="Open Web search" variant="ghost" onPress={() => openSettings("websearch")} />
+        </SettingRow>
+      </If>
     </SettingsGroup>
   );
 }
@@ -498,9 +535,7 @@ function SaveBar() {
           when={invalid()}
           else={
             <If when={routingDirty()}>
-              <Label variant="caption" color="muted" testID="routing-unsaved">
-                Unsaved changes. Nothing is sent until you save.
-              </Label>
+              <Label variant="caption" color="muted" testID="routing-unsaved">Unsaved model choices</Label>
             </If>
           }
         >
@@ -513,10 +548,10 @@ function SaveBar() {
         <Action testID="routing-revert" label="Revert" variant="ghost" disabled={!routing() || !routingDirty() || routingSaving()} onPress={revertRouting} />
         <Action
           testID="routing-save"
-          label="Save routing"
+          label="Save routing & search"
           busyLabel="Saving…"
           busy={routingSaving()}
-          disabled={!routingDirty() || invalid()}
+          disabled={!routingDirty() || invalid() || !catalogReady()}
           variant="primary"
           onPress={() => void saveRouting()}
         />

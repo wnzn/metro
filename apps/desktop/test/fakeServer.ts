@@ -69,6 +69,10 @@ export function fakeServer() {
     runners: new Map<string, Runner>(),
     attached: new Map<string, string>(), // space id -> runner id
     connections: new Map<string, Conn>(),
+    allowedBaseUrls: [...CATALOG.allowed_base_urls],
+    /** Scripted endpoint test failures, before PATCH commits; never a live provider request. */
+    endpointRefusals: new Map<string, { status: number; error: string }>(),
+    endpointProbes: [] as string[],
     /** Device connection ids whose metro-connector is online. */
     online: new Set<string>(),
     /** Model routing per user (missing: the defaults, all off). */
@@ -243,7 +247,7 @@ export function fakeServer() {
         return ok(undefined, 204);
       }
     }
-    if (path === "/v1/provider-catalog" && req.method === "GET") return ok(CATALOG);
+    if (path === "/v1/provider-catalog" && req.method === "GET") return ok({ ...CATALOG, allowed_base_urls: state.allowedBaseUrls });
     if (path === "/v1/providers" && req.method === "GET") {
       return ok({ connections: [...state.connections.values()].filter((c) => c.owner === user).map(connJson) });
     }
@@ -388,6 +392,19 @@ export function fakeServer() {
         }
       }
       if (!r[2] && req.method === "PATCH") {
+        if (body.base_url !== undefined) {
+          const provider = CATALOG.providers.find((p) => p.id === c.provider_id);
+          if (device || !provider?.allow_custom_url) return err(400, "not a custom server connection");
+          const url = body.base_url;
+          if (!state.allowedBaseUrls.includes(url)) return err(400, "base_url must be exactly one of this server's allowed_base_urls");
+          if (url !== c.base_url) {
+            state.endpointProbes.push(url);
+            const refusal = state.endpointRefusals.get(url);
+            if (refusal) return err(refusal.status, refusal.error);
+            c.base_url = url;
+          }
+          return ok(connJson(c));
+        }
         if (body.name !== undefined) c.name = body.name;
         if (body.model !== undefined) {
           c.model = body.model;
