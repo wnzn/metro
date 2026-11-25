@@ -112,6 +112,13 @@ fn server_message(v: &Value, fallback: &str) -> String {
     crate::secret::clean_line(m, 200)
 }
 
+/// The ETag stored by older launchers too; the decimal part is not a secret.
+pub(super) fn pairing_revision(etag: &str) -> Option<&str> {
+    let raw = etag.strip_prefix("\"rtg-")?.strip_suffix('"')?;
+    let value: u64 = raw.parse().ok()?;
+    (value <= i64::MAX as u64 && value.to_string() == raw).then_some(raw)
+}
+
 impl Hosted {
     pub fn new(base: &str) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
@@ -281,30 +288,32 @@ impl Hosted {
             .map(str::to_owned))
     }
 
-    /// `POST /v1/spaces/{sid}/runner-token` with `If-None-Match: *`: a new
-    /// dedicated token and its ETag, only if the Space has no runner.
+    /// Use a separate route so an older server cannot ignore the guard.
     pub async fn issue_guarded(
         &self,
         session: &Secret,
         sid: &str,
     ) -> Result<(Secret, String), CallError> {
-        let (s, h, mut v) = self
+        let (s, _, mut v) = self
             .send(
                 reqwest::Method::POST,
-                &format!("/v1/spaces/{sid}/runner-token"),
+                &format!("/v1/spaces/{sid}/runner-token/issue-if-empty"),
                 session,
-                &[("If-None-Match", "*")],
+                &[],
                 Some(&json!({})),
                 MAX_BODY,
             )
             .await?;
+        if s == 409 {
+            return Err(CallError::Precondition("the Space's runner changed".into()));
+        }
         if s != 200 {
             return Err(Self::classify(s, &v));
         }
-        let etag = h
-            .get(reqwest::header::ETAG)
-            .and_then(|e| e.to_str().ok())
-            .map(str::to_owned);
+        let etag = v
+            .get("assignment_revision")
+            .and_then(Value::as_str)
+            .map(|revision| format!("\"rtg-{revision}\""));
         let token = match v.get_mut("token") {
             Some(Value::String(t)) => {
                 let out = Secret::new(t.as_str());
@@ -324,8 +333,7 @@ impl Hosted {
                 "the local Metro server sent an unexpected token".into(),
             ));
         }
-        let Some(etag) = etag.filter(|e| e.len() <= 64 && e.starts_with('"') && e.ends_with('"'))
-        else {
+        let Some(etag) = etag.filter(|e| pairing_revision(e).is_some()) else {
             return Err(CallError::Other(
                 "the local Metro server doesn't support guarded pairing".into(),
             ));
@@ -333,25 +341,31 @@ impl Hosted {
         Ok((token, etag))
     }
 
-    /// `DELETE /v1/spaces/{sid}/runner-token` with `If-Match: <etag>`.
+    /// Revoke only a dedicated revision; never fall back to a legacy route.
     pub async fn revoke_guarded(
         &self,
         session: &Secret,
         sid: &str,
         etag: &str,
     ) -> Result<(), CallError> {
+        let revision = pairing_revision(etag).ok_or_else(|| {
+            CallError::Other("This local pairing has no supported revision.".into())
+        })?;
         let (s, _, v) = self
             .send(
-                reqwest::Method::DELETE,
-                &format!("/v1/spaces/{sid}/runner-token"),
+                reqwest::Method::POST,
+                &format!("/v1/spaces/{sid}/runner-token/revoke-if-current"),
                 session,
-                &[("If-Match", etag)],
-                None,
+                &[],
+                Some(&json!({"assignment_revision": revision})),
                 MAX_BODY,
             )
             .await?;
-        if s == 204 || s == 200 {
+        if s == 204 {
             return Ok(());
+        }
+        if s == 409 {
+            return Err(CallError::Precondition("the Space's runner changed".into()));
         }
         Err(Self::classify(s, &v))
     }

@@ -27,7 +27,11 @@ export type LocalToolsSpace = {
   detail: string | null;
   /** This Space's private folder on this computer: the only place the tools read. */
   folder: string;
+  /** Nonsecret revision of the exact local record; older launchers lack it. */
+  pairingRevision?: string;
 };
+
+export type LocalToolsDisableTarget = { spaceId: string; accountId: string; revision: string };
 
 export type LocalToolsStatus = { available: boolean; reason: string | null; spaces: LocalToolsSpace[] };
 
@@ -42,7 +46,9 @@ export function parseSpace(v: unknown): LocalToolsSpace {
   const state = v.state === "on" || v.state === "revoked" ? v.state : "off";
   const worker = WORKERS.includes(String(v.worker)) ? (v.worker as LocalToolsWorker) : "stopped";
   const detail = str(v.detail);
-  return { spaceId: v.space_id, enabled: v.enabled === true, state, worker, detail: detail === null ? null : scrub(detail), folder: v.folder };
+  const revision = v.pairing_revision;
+  return { spaceId: v.space_id, enabled: v.enabled === true, state, worker, detail: detail === null ? null : scrub(detail), folder: v.folder,
+    pairingRevision: typeof revision === "string" && /^(0|[1-9][0-9]{0,18})$/.test(revision) ? revision : undefined };
 }
 
 export function parseStatus(v: unknown): LocalToolsStatus {
@@ -64,7 +70,7 @@ type Client = {
   call(method: "GET" | "POST", path: string, body?: unknown): Promise<unknown>;
   status(): Promise<LocalToolsStatus>;
   enable(spaceId: string): Promise<LocalToolsSpace>;
-  disable(spaceId: string): Promise<LocalToolsSpace>;
+  disable(target: LocalToolsDisableTarget): Promise<LocalToolsSpace>;
 };
 
 function createClient(endpoint: BridgeEndpoint): Client {
@@ -108,7 +114,10 @@ function createClient(endpoint: BridgeEndpoint): Client {
     call,
     status: async () => parseStatus(await call("GET", "/v1/local-tools")),
     enable: async (sid) => parseSpace(await call("POST", `${seg(sid)}/enable`, {})),
-    disable: async (sid) => parseSpace(await call("POST", `${seg(sid)}/disable`, {})),
+    // Do not send a confirmation to an older unguarded handler.
+    disable: async (target) => parseSpace(await call("POST", `${seg(target.spaceId)}/disable-if-current`, {
+      account_id: target.accountId, pairing_revision: target.revision,
+    })),
   };
 }
 
@@ -135,6 +144,7 @@ export const localTools = signal<LocalToolsStatus | null>(null);
 export const localToolsBusy = signal<null | "enable" | "disable">(null);
 export const localToolsError = signal<string | null>(null);
 export const localToolsNotice = signal<string | null>(null);
+let statusSeq = 0;
 
 /** The entry for one Space, or null when local tools are off for it. */
 export function localToolsFor(spaceId: string | undefined): LocalToolsSpace | null {
@@ -158,12 +168,13 @@ function merge(entry: LocalToolsSpace) {
 export async function loadLocalTools(stillOpen: () => boolean): Promise<void> {
   if (!client) return;
   const session = sessionGuard();
+  const seq = ++statusSeq;
   try {
     const next = await client.status();
-    if (session() && stillOpen()) localTools.set(next);
+    if (seq === statusSeq && session() && stillOpen()) localTools.set(next);
   } catch {
     // Unknown means hidden: the card never guesses.
-    if (session() && stillOpen()) localTools.set(null);
+    if (seq === statusSeq && session() && stillOpen()) localTools.set(null);
   }
 }
 
@@ -171,6 +182,7 @@ export async function enableLocalTools(spaceId: string, stillOpen: () => boolean
   if (!client || localToolsBusy()) return;
   const live = sessionGuard(spaceId);
   const session = sessionGuard();
+  statusSeq++;
   localToolsBusy.set("enable");
   localToolsError.set(null);
   localToolsNotice.set(null);
@@ -183,28 +195,42 @@ export async function enableLocalTools(spaceId: string, stillOpen: () => boolean
   } catch (error) {
     if (live() && stillOpen()) localToolsError.set(message(error, "Turning on local tools"));
   } finally {
-    if (session()) localToolsBusy.set(null);
+    if (session()) {
+      statusSeq++;
+      localToolsBusy.set(null);
+    }
   }
 }
 
-export async function disableLocalTools(spaceId: string, stillOpen: () => boolean): Promise<void> {
+export async function disableLocalTools(target: LocalToolsDisableTarget, stillOpen: () => boolean): Promise<void> {
   if (!client || localToolsBusy()) return;
-  const live = sessionGuard(spaceId);
+  const live = sessionGuard(target.spaceId);
   const session = sessionGuard();
+  statusSeq++;
+  let refresh = false;
   localToolsBusy.set("disable");
   localToolsError.set(null);
   localToolsNotice.set(null);
   try {
-    const entry = await client.disable(spaceId);
+    const entry = await client.disable(target);
     if (live()) {
       merge(entry);
       if (stillOpen()) localToolsNotice.set(entry.detail ?? "Local tools are off. The files in the folder stay on this computer.");
     }
   } catch (error) {
     if (live() && stillOpen()) localToolsError.set(message(error, "Turning off local tools"));
+    refresh = error instanceof BridgeError && error.code === "pairing_changed";
+    if (refresh && live() && stillOpen()) {
+      const previous = localTools();
+      if (previous) localTools.set({ ...previous, spaces: previous.spaces.filter((s) => s.spaceId !== target.spaceId) });
+    }
   } finally {
-    if (session()) localToolsBusy.set(null);
+    if (session()) {
+      statusSeq++;
+      localToolsBusy.set(null);
+    }
   }
+  if (refresh && live() && stillOpen()) await loadLocalTools(stillOpen);
 }
 
 /** While a worker says `starting`: re-read at most this often, this many times. */
@@ -228,6 +254,7 @@ export function followStarting(spaceId: string, stillValid: () => boolean): () =
   const tick = async () => {
     timer = undefined;
     if (!client || !live() || left-- <= 0) return;
+    const seq = ++statusSeq;
     let next: LocalToolsStatus;
     try {
       next = await client.status();
@@ -235,8 +262,8 @@ export function followStarting(spaceId: string, stillValid: () => boolean): () =
       return; // unknown: stop; the next visit reads again
     }
     if (!live()) return;
-    localTools.set(next);
-    const e = next.spaces.find((s) => s.spaceId === spaceId);
+    if (seq === statusSeq) localTools.set(next);
+    const e = localToolsFor(spaceId);
     if (e && e.state === "on" && e.worker === "starting") timer = setTimeout(() => void tick(), STARTING_POLL_MS);
   };
   timer = setTimeout(() => void tick(), STARTING_POLL_MS);

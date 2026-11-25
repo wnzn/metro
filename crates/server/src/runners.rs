@@ -504,6 +504,7 @@ impl Db {
         space_id: &str,
         actor: &str,
         revision: i64,
+        dedicated_only: bool,
     ) -> anyhow::Result<GuardedAssignment> {
         let mut conn = self.lock();
         // Acquire the write reservation before checking live ownership or
@@ -516,6 +517,17 @@ impl Db {
                 return Ok(GuardedAssignment::Changed);
             }
             Some((true, _)) => {}
+        }
+        if dedicated_only {
+            let dedicated = tx.query_row(
+                "SELECT runner_token_hash IS NOT NULL AND NOT EXISTS
+                    (SELECT 1 FROM space_runners WHERE space_id = ?1) FROM spaces WHERE id = ?1",
+                [space_id],
+                |row| row.get::<_, bool>(0),
+            )?;
+            if !dedicated {
+                return Ok(GuardedAssignment::Changed);
+            }
         }
         let Some(generation) = Self::remove_assignment(&tx, space_id)? else {
             return Ok(GuardedAssignment::Changed);
@@ -914,12 +926,32 @@ pub async fn post_detach_space_runner_if_current(
     Path(sid): Path<String>,
     body: JsonBody<AssignmentRevisionBody>,
 ) -> ApiResult<StatusCode> {
-    let space = owner_of(&state, &sid, &who).await?;
+    remove_current_runner_assignment(&state, &who, &sid, body, false).await
+}
+
+pub async fn post_revoke_dedicated_token_if_current(
+    State(state): State<AppState>,
+    who: Human,
+    Path(sid): Path<String>,
+    body: JsonBody<AssignmentRevisionBody>,
+) -> ApiResult<StatusCode> {
+    remove_current_runner_assignment(&state, &who, &sid, body, true).await
+}
+
+async fn remove_current_runner_assignment(
+    state: &AppState,
+    who: &Human,
+    sid: &str,
+    body: JsonBody<AssignmentRevisionBody>,
+    dedicated_only: bool,
+) -> ApiResult<StatusCode> {
+    let space = owner_of(state, sid, who).await?;
     let Json(body) = body?;
     let revision = assignment_revision(&body.assignment_revision)?;
     let space_id = space.id.clone();
-    let generation = api::db(&state, move |db| {
-        db.detach_runner_if_current(&space_id, &who.id, revision)
+    let actor = who.id.clone();
+    let generation = api::db(state, move |db| {
+        db.detach_runner_if_current(&space_id, &actor, revision, dedicated_only)
     })
     .await?
     .generation()?;
@@ -998,12 +1030,32 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            db.detach_runner_if_current(&sid, "alice", revision)
+            db.detach_runner_if_current(&sid, "alice", revision, true)
                 .unwrap(),
             GuardedAssignment::NotOwner
         );
         assert_eq!(
             db.set_dedicated_token_guarded(&sid, "alice", Some(revision), b"fixture-new-hash")
+                .unwrap(),
+            GuardedAssignment::NotOwner
+        );
+        assert_eq!(
+            db.clear_runner_token_if_generation(&sid, generation, "alice")
+                .unwrap(),
+            None
+        );
+        let empty = db.create_space("alice", "Empty", 4).unwrap().id;
+        db.lock().execute(
+            "UPDATE space_members SET role = 'member' WHERE space_id = ?1 AND user_id = 'alice'",
+            [&empty],
+        ).unwrap();
+        assert_eq!(
+            db.set_runner_token_if_unpaired(&empty, b"fixture-new-hash", "alice")
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            db.set_dedicated_token_guarded(&empty, "alice", None, b"fixture-new-hash")
                 .unwrap(),
             GuardedAssignment::NotOwner
         );
@@ -1014,7 +1066,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            db.detach_runner_if_current(&sid, "alice", revision)
+            db.detach_runner_if_current(&sid, "alice", revision, true)
                 .unwrap(),
             GuardedAssignment::NotMember
         );

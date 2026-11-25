@@ -12,12 +12,12 @@
 //!   account) gets no tools: there is no fallback and no global token.
 //! - Explicit, per Space, owner only. The Space owner turns it on for one
 //!   Space. The real server checks ownership; this module only asks it.
-//!   Pairing uses the guarded route (`POST /v1/spaces/{sid}/runner-token`
-//!   with `If-None-Match: *`), which the server applies atomically only
+//!   Pairing uses `POST /v1/spaces/{sid}/runner-token/issue-if-empty`,
+//!   which the server applies atomically only
 //!   while the Space has no runner at all, so an existing dedicated token or
 //!   attached registered runner is never replaced. Turning it off uses
-//!   `DELETE` with `If-Match: <ETag of our pairing>`, so it can't revoke a
-//!   token someone issued after us.
+//!   the confirmed local pairing revision and the server's dedicated-only
+//!   `revoke-if-current` route, so it can't revoke a newer token.
 //! - A dedicated token per Space (shown to nobody, kept mode 600 under the
 //!   desktop root). A token the server refuses (401) marks the pairing
 //!   revoked and is never re-issued automatically.
@@ -34,7 +34,7 @@
 //!
 //! ```text
 //! let tools = DesktopTools::new(desktop_root.join("local-tools"));
-//! // GET /v1/local-tools, POST /v1/local-tools/spaces/{sid}/enable|disable:
+//! // GET /v1/local-tools, POST /v1/local-tools/spaces/{sid}/enable|disable-if-current:
 //! let (status, json) = tools.handle(method, path, body, hosted_session_or_none).await;
 //! tools.resume(hosted).await;   // after POST /v1/session bound the local server
 //! tools.stop_all().await;       // DELETE /v1/session, switch, shutdown
@@ -192,6 +192,14 @@ fn fs_error(what: &str) -> ToolsError {
     )
 }
 
+fn pairing_changed() -> ToolsError {
+    ToolsError::new(
+        409,
+        "pairing_changed",
+        "This local pairing or account changed. Review the current pairing before turning it off.",
+    )
+}
+
 struct Inner {
     root: Option<Arc<File>>,
     /// (server URL, account id) the workers belong to.
@@ -297,11 +305,35 @@ impl DesktopTools {
         else {
             return Err(ToolsError::new(404, "not_found", "unknown path"));
         };
-        if action != "enable" && action != "disable" {
+        if !matches!(action, "enable" | "disable" | "disable-if-current") {
             return Err(ToolsError::new(404, "not_found", "unknown path"));
         }
         if method != "POST" {
             return Err(ToolsError::new(405, "method_not_allowed", "use POST"));
+        }
+        if !store::valid_space_id(sid) {
+            return Err(ToolsError::new(404, "not_found", "no such Space"));
+        }
+        if action == "disable-if-current" {
+            #[derive(serde::Deserialize)]
+            #[serde(deny_unknown_fields)]
+            struct Confirmation {
+                account_id: String,
+                pairing_revision: String,
+            }
+            let confirmation: Confirmation = serde_json::from_slice(body).map_err(|_| {
+                ToolsError::new(
+                    422,
+                    "invalid",
+                    "a pairing revision and account are required",
+                )
+            })?;
+            let Some(h) = hosted.filter(|h| h.account_id == confirmation.account_id) else {
+                return Err(pairing_changed());
+            };
+            return self
+                .disable(&h, sid, Some(&confirmation.pairing_revision))
+                .await;
         }
         if !body.iter().all(u8::is_ascii_whitespace)
             && serde_json::from_slice::<serde_json::Map<String, Value>>(body)
@@ -309,9 +341,6 @@ impl DesktopTools {
                 .unwrap_or(true)
         {
             return Err(ToolsError::new(422, "invalid", "the body must be {}"));
-        }
-        if !store::valid_space_id(sid) {
-            return Err(ToolsError::new(404, "not_found", "no such Space"));
         }
         let Some(hosted) = hosted else {
             // Not our own server: make sure nothing keeps running.
@@ -321,7 +350,7 @@ impl DesktopTools {
         if action == "enable" {
             self.enable(&hosted, sid).await
         } else {
-            self.disable(&hosted, sid).await
+            self.disable(&hosted, sid, None).await
         }
     }
 
@@ -352,6 +381,7 @@ impl DesktopTools {
             "worker": worker,
             "detail": detail,
             "folder": folder.to_string_lossy(),
+            "pairing_revision": p.and_then(|p| hosted::pairing_revision(&p.etag)),
             "tools": ["workspace.list", "workspace.read"],
         })
     }
@@ -584,20 +614,38 @@ impl DesktopTools {
         Ok(self.entry(&inner, &h.account_id, sid, Some(&pairing)))
     }
 
-    async fn disable(&self, h: &HostedSession, sid: &str) -> Result<Value, ToolsError> {
+    async fn disable(
+        &self,
+        h: &HostedSession,
+        sid: &str,
+        expected: Option<&str>,
+    ) -> Result<Value, ToolsError> {
         let mut inner = self.inner.lock().await;
-        Self::rebind(&mut inner, Some(h)).await;
-        let root = self.root(&mut inner)?;
-        if let Some(w) = inner.workers.remove(sid) {
-            w.stop().await;
+        if expected.is_some() {
+            // Do not rebind or stop anybody else's workers for a stale UI.
+            if inner.bound.as_ref() != Some(&(h.server_url.clone(), h.account_id.clone())) {
+                return Err(pairing_changed());
+            }
+        } else {
+            Self::rebind(&mut inner, Some(h)).await;
         }
+        let root = self.root(&mut inner)?;
         let existing = {
             let _g = self.store_lock.lock();
             store::load(&root, &h.account_id, sid).map_err(|_| fs_error("read its settings"))?
         };
         let Some(p) = existing else {
+            if expected.is_some() {
+                return Err(pairing_changed());
+            }
             return Ok(self.entry(&inner, &h.account_id, sid, None));
         };
+        if let Some(revision) = expected
+            && (hosted::pairing_revision(&p.etag) != Some(revision)
+                || inner.workers.get(sid).is_some_and(|w| w.etag != p.etag))
+        {
+            return Err(pairing_changed());
+        }
         let mut detail: Option<&str> = None;
         if p.state == PairingState::Active {
             let api = Hosted::new(&h.server_url).map_err(|_| fs_error("start"))?;
@@ -610,18 +658,32 @@ impl DesktopTools {
                          server; this computer stopped serving it.",
                     );
                 }
-                Err(CallError::NotFound(_)) | Err(CallError::Forbidden(_)) => {
+                Err(e @ CallError::NotFound(_)) => {
+                    // A missing route on an older server is not loss of
+                    // ownership. Keep the pairing and worker in that case.
+                    if api.role(&h.token, sid).await.map_err(from_call)?.as_deref() == Some("owner")
+                    {
+                        return Err(from_call(e));
+                    }
+                    detail = Some(
+                        "You no longer own this Space, so nothing was revoked on the server; \
+                         this computer stopped serving it.",
+                    );
+                }
+                Err(CallError::Forbidden(_)) => {
                     detail = Some(
                         "You no longer own this Space, so nothing was revoked on the server; \
                          this computer stopped serving it.",
                     );
                 }
                 Err(e) => {
-                    // Keep the pairing so turning off can be retried; the
-                    // worker stays stopped until then.
+                    // No confirmed server change: keep both pairing and worker.
                     return Err(from_call(e));
                 }
             }
+        }
+        if let Some(w) = inner.workers.remove(sid) {
+            w.stop().await;
         }
         {
             let _g = self.store_lock.lock();

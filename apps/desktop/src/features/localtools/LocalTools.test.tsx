@@ -18,7 +18,7 @@ const LOCAL_RUNNER_SECRET = "metro_rt_local_fixture_secret";
 const FOLDER = "/home/me/.config/metro-desktop/local-tools/accounts/a1/spaces/solo/workspace";
 
 /** The fake bridge plus local tools. `available`: is this session the computer's own workspace? */
-function bridgeWithTools(f: F, available = true, opts: { startingReads?: number } = {}) {
+function bridgeWithTools(f: F, available = true, opts: { startingReads?: number; legacy?: boolean } = {}) {
   /** After enable, this many status reads still report the worker as starting. */
   let starting = 0;
   const b = fakeBridge(f);
@@ -37,7 +37,7 @@ function bridgeWithTools(f: F, available = true, opts: { startingReads?: number 
         ? { status: 200, body: { available: true, reason: null, spaces: [...tools.values()] } }
         : { status: 200, body: { available: false, reason: "Local tools work only in this computer's own Metro workspace.", spaces: [] } };
     }
-    const m = /^\/v1\/local-tools\/spaces\/([^/]+)\/(enable|disable)$/.exec(path);
+    const m = /^\/v1\/local-tools\/spaces\/([^/]+)\/(enable|disable|disable-if-current)$/.exec(path);
     if (!m || req.method !== "POST") return { status: 404, body: { error: { code: "not_found", message: "unknown path" } } };
     const space = f.state.spaces.get(m[1]!)!;
     if (!available) return { status: 409, body: { error: { code: "not_local", message: "not local" } } };
@@ -49,9 +49,14 @@ function bridgeWithTools(f: F, available = true, opts: { startingReads?: number 
       space.runnerToken = LOCAL_RUNNER_SECRET;
       const startingFor = opts.startingReads;
       if (startingFor !== undefined) starting = startingFor;
-      const e = { space_id: space.id, enabled: true, state: "on", worker: startingFor === undefined ? "online" : "starting", detail: null, folder: FOLDER, tools: ["workspace.list", "workspace.read"] };
+      const e = { space_id: space.id, enabled: true, state: "on", worker: startingFor === undefined ? "online" : "starting", detail: null, folder: FOLDER, tools: ["workspace.list", "workspace.read"],
+        ...(opts.legacy ? {} : { pairing_revision: "7" }) };
       tools.set(space.id, e);
       return { status: 200, body: e };
+    }
+    if (m[2] === "disable-if-current" && opts.legacy) return { status: 404, body: { error: { code: "not_found", message: "unknown path" } } };
+    if (m[2] === "disable-if-current" && (body?.account_id !== "alice" || body?.pairing_revision !== tools.get(space.id)?.pairing_revision)) {
+      return { status: 409, body: { error: { code: "pairing_changed", message: "Review the current pairing." } } };
     }
     if (tools.has(space.id)) space.runnerToken = null;
     tools.delete(space.id);
@@ -117,12 +122,52 @@ test("owner turns local tools on and off for a Space without a runner; no token 
   await app.waitFor("id:local-tools-on", { state: "gone" });
   await app.waitFor("id:attach-runner-list");
   expect(f.state.spaces.get("solo")!.runnerToken).toBe(null);
+  expect(t.log.filter((l) => l.method === "POST").at(-1)).toMatchObject({
+    path: "/v1/local-tools/spaces/solo/disable-if-current", body: { account_id: "alice", pairing_revision: "7" },
+  });
 
   // The bridge bearer goes only to the bridge; the pairing token never shows.
   for (const r of app.requests()) if (!r.url.startsWith(BRIDGE)) expect(JSON.stringify(r)).not.toContain(BRIDGE_TOKEN);
   expect(text(app)).not.toContain(LOCAL_RUNNER_SECRET);
   expect(JSON.stringify(app.storage())).not.toContain(LOCAL_RUNNER_SECRET);
   expect(JSON.stringify(app.storage())).not.toContain(BRIDGE_TOKEN);
+});
+
+test("a stale Turn off confirmation never stops the replacement; the next review uses its revision", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const t = bridgeWithTools(f);
+  const app = await openWith(f, t);
+  await signIn(app, "alice");
+  await manage(app, "solo");
+  await app.press("id:local-tools-enable");
+  await app.press("id:local-tools-disable");
+  t.tools.set("solo", { ...t.tools.get("solo"), pairing_revision: "8", detail: "Replacement pairing" });
+  await app.press("id:local-tools-confirm-disable");
+  await app.waitFor("id:local-tools-error");
+  await app.waitFor("text:Replacement pairing");
+  expect(app.shows("id:local-tools-confirm-disable")).toBe(false);
+  expect(f.state.spaces.get("solo")!.runnerToken === LOCAL_RUNNER_SECRET).toBe(true);
+  await app.press("id:local-tools-disable");
+  await app.press("id:local-tools-confirm-disable");
+  await app.waitFor("id:local-tools-on", { state: "gone" });
+  expect(t.log.filter((l) => l.method === "POST" && l.path.includes("/disable")).map((l) => [l.path, l.body])).toEqual([
+    ["/v1/local-tools/spaces/solo/disable-if-current", { account_id: "alice", pairing_revision: "7" }],
+    ["/v1/local-tools/spaces/solo/disable-if-current", { account_id: "alice", pairing_revision: "8" }],
+  ]);
+});
+
+test("an old bridge cannot receive an unguarded Turn off request", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const t = bridgeWithTools(f, true, { legacy: true });
+  const app = await openWith(f, t);
+  await signIn(app, "alice");
+  await manage(app, "solo");
+  await app.press("id:local-tools-enable");
+  await app.waitFor("id:local-tools-disable-unavailable");
+  expect(app.shows("id:local-tools-disable")).toBe(false);
+  expect(t.log.filter((l) => l.method === "POST").map((l) => l.path)).toEqual(["/v1/local-tools/spaces/solo/enable"]);
 });
 
 test("a Space that already has a runner is never offered a replacement", async () => {

@@ -17,7 +17,7 @@ import {
   localToolsBusy,
   localToolsFor,
 } from "./localTools";
-import type { LocalToolsSpace } from "./localTools";
+import type { LocalToolsDisableTarget, LocalToolsSpace } from "./localTools";
 
 export function localToolsBadge(e: LocalToolsSpace | null): { tone: Tone; label: string } {
   if (!e) return { tone: "neutral", label: "Off" };
@@ -35,7 +35,7 @@ export function localToolsBadge(e: LocalToolsSpace | null): { tone: Tone; label:
 }
 
 export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRunner | null | undefined; disabled: boolean; refreshRunner: (spaceId: string, stillLatest: () => boolean) => Promise<void> }) {
-  const confirm = signal(false);
+  const confirm = signal<(LocalToolsDisableTarget & { server: string }) | null>(null);
   const copied = signal(false);
   const sid = () => props.spaceId ?? undefined;
   const entry = () => localToolsFor(sid());
@@ -47,13 +47,27 @@ export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRun
     if (id) untracked(() => void loadLocalTools(() => open && sid() === id));
   });
   const blocked = () => props.disabled || !!localToolsBusy();
-  const change = async (enable: boolean) => {
+  const target = () => {
+    const spaceId = sid();
+    const accountId = me();
+    const server = connectedTo();
+    const revision = entry()?.pairingRevision;
+    return spaceId && accountId && server && revision ? { spaceId, accountId, server, revision } : null;
+  };
+  const scopeKey = (t: ReturnType<typeof target>) => t && JSON.stringify([t.server, t.accountId, t.spaceId, t.revision]);
+  const asking = () => !!confirm() && scopeKey(confirm()) === scopeKey(target());
+  effect(() => {
+    if (confirm() && !asking()) confirm.set(null);
+  });
+  const change = async (removal?: NonNullable<ReturnType<typeof confirm>>) => {
     const id = sid();
-    if (!open || !id || blocked() || (enable && props.runner !== null)) return;
-    const stillOpen = () => open && sid() === id;
+    if (!open || !id || blocked() || (removal ? scopeKey(removal) !== scopeKey(target()) : props.runner !== null)) return;
+    const account = me();
+    const server = connectedTo();
+    const stillOpen = () => open && sid() === id && me() === account && connectedTo() === server;
     const latest = beginSpaceRunnerWrite(id);
-    if (enable) await enableLocalTools(id, stillOpen);
-    else await disableLocalTools(id, stillOpen);
+    if (removal) await disableLocalTools(removal, stillOpen);
+    else await enableLocalTools(id, stillOpen);
     if (latest()) await props.refreshRunner(id, latest);
   };
   // While this Space's worker is starting, follow it here (bounded), so the
@@ -63,7 +77,7 @@ export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRun
     const id = sid();
     const e = entry();
     if (!id || !e || e.state !== "on" || e.worker !== "starting") return null;
-    return `${connectedTo() ?? ""}\n${me() ?? ""}\n${id}`;
+    return `${connectedTo() ?? ""}\n${me() ?? ""}\n${id}\n${e.pairingRevision ?? ""}`;
   });
   effect(() => {
     const key = startingKey();
@@ -126,15 +140,17 @@ export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRun
                     busyLabel="Pairing…"
                     busy={localToolsBusy() === "enable"}
                     disabled={blocked()}
-                    onPress={() => void change(true)}
+                    onPress={() => void change()}
                   />
                 </If>
                 <Spacer />
                 <If
-                  when={confirm()}
-                  else={<Action variant="destructive" testID="local-tools-disable" label="Turn off…" disabled={blocked()} onPress={() => confirm.set(true)} />}
+                  when={asking()}
+                  else={<If when={target()} else={<Label variant="caption" color="muted" testID="local-tools-disable-unavailable">Update Metro to safely turn off this pairing.</Label>}>
+                    <Action variant="destructive" testID="local-tools-disable" label="Turn off…" disabled={blocked()} onPress={() => confirm.set(target())} />
+                  </If>}
                 >
-                  <Action label="Cancel" variant="ghost" onPress={() => confirm.set(false)} />
+                  <Action label="Cancel" variant="ghost" onPress={() => confirm.set(null)} />
                   <Action
                     testID="local-tools-confirm-disable"
                     label="Turn off: this computer stops serving this Space"
@@ -143,8 +159,9 @@ export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRun
                     disabled={blocked()}
                     variant="danger"
                     onPress={() => {
-                      confirm.set(false);
-                      void change(false);
+                      const captured = confirm();
+                      confirm.set(null);
+                      if (captured) void change(captured);
                     }}
                   />
                 </If>
@@ -169,7 +186,7 @@ export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRun
                 busy={localToolsBusy() === "enable"}
                 disabled={blocked() || props.runner === undefined}
                 variant="secondary"
-                onPress={() => void change(true)}
+                onPress={() => void change()}
               />
             </SettingRow>
           </If>

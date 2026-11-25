@@ -281,6 +281,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/spaces/{sid}/runner-token/rotate-if-current",
             post(runners::post_rotate_dedicated_token_if_current),
         )
+        .route(
+            "/v1/spaces/{sid}/runner-token/revoke-if-current",
+            post(runners::post_revoke_dedicated_token_if_current),
+        )
         // Provider routes carry their full paths and authenticate people
         // themselves; they share the human body limit.
         .merge(crate::providers::router())

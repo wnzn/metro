@@ -426,6 +426,62 @@ async fn old_disable_cannot_revoke_a_replacement() {
 }
 
 #[tokio::test]
+async fn stale_local_confirmation_neither_stops_nor_revokes_the_new_pairing() {
+    let s = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-tools");
+    let tools = DesktopTools::new(root.clone());
+    let alice = s.hosted(ALICE, "alice");
+    let sid = s.space(ALICE, "replace-local").await;
+    let (st, first) = enable(&tools, &alice, &sid).await;
+    assert_eq!(st, 200);
+    assert_eq!(
+        s.send(
+            reqwest::Method::DELETE,
+            ALICE,
+            &format!("/v1/spaces/{sid}/runner-token"),
+            &[],
+            None
+        )
+        .await
+        .0,
+        StatusCode::NO_CONTENT
+    );
+    wait_worker(&tools, &alice, &sid, "revoked").await;
+    let (st, second) = enable(&tools, &alice, &sid).await;
+    assert_eq!(st, 200);
+    assert_ne!(first["pairing_revision"], second["pairing_revision"]);
+    let token = token_of(&root, "alice", &sid);
+    let path = format!("/v1/local-tools/spaces/{sid}/disable-if-current");
+    for (account, revision) in [
+        ("alice", &first["pairing_revision"]),
+        ("bob", &second["pairing_revision"]),
+    ] {
+        let body =
+            serde_json::to_vec(&json!({"account_id": account, "pairing_revision": revision}))
+                .unwrap();
+        let (st, v) = tools
+            .handle("POST", &path, &body, Some(alice.clone()))
+            .await;
+        assert_eq!(st, 409);
+        assert_eq!(v["error"]["code"], "pairing_changed");
+    }
+    assert_eq!(
+        wait_worker(&tools, &alice, &sid, "online").await["pairing_revision"],
+        second["pairing_revision"]
+    );
+    assert_eq!(s.claim(&token).await, StatusCode::NO_CONTENT);
+    let body = serde_json::to_vec(
+        &json!({"account_id": "alice", "pairing_revision": second["pairing_revision"]}),
+    )
+    .unwrap();
+    let (st, v) = tools.handle("POST", &path, &body, Some(alice)).await;
+    assert_eq!(st, 200);
+    assert_eq!(v["state"], "off");
+    assert_eq!(s.claim(&token).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn guarded_routes_are_atomic_preconditions() {
     let s = Server::start().await;
     let a = s.space(ALICE, "guarded").await;
