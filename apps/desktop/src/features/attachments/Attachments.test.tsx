@@ -148,7 +148,7 @@ for (const noteOnly of [true, false]) {
     expect(posts(w)[0]!.body).toEqual({
       text: "@agent with two files",
       ...(noteOnly ? { save_note: true } : { invoke_agent: true }),
-      asset_ids: [savedId, w.l.assets[1]!.id],
+      asset_ids: [savedId, w.l.assets.find(a => a.name === PLAN.name)!.id],
     });
     expect(w.f.state.events.get("chat:alice")?.map(e => e.kind))
       .toEqual(noteOnly ? ["message"] : ["message", "agent"]);
