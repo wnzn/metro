@@ -79,6 +79,7 @@ pub(crate) struct DeviceClaimGrant {
     config_rev: i64,
     /// Typed calls always use the saved model, even for their owner.
     require_saved_model: bool,
+    library_selection: Option<(String, i64)>,
 }
 
 impl DeviceClaimGrant {
@@ -87,6 +88,7 @@ impl DeviceClaimGrant {
         space: Option<&str>,
         chosen: &str,
         row: &super::store::Row,
+        library_selection: Option<(String, i64)>,
     ) -> Self {
         Self {
             caller: caller.to_owned(),
@@ -96,10 +98,16 @@ impl DeviceClaimGrant {
             model: row.model.clone(),
             config_rev: row.config_rev,
             require_saved_model: true,
+            library_selection,
         }
     }
 
     pub(crate) fn allowed(&self, conn: &rusqlite::Connection) -> anyhow::Result<bool> {
+        if let Some((id, revision)) = &self.library_selection
+            && !crate::library_search::selection_is(conn, &self.caller, id, *revision)?
+        {
+            return Ok(false);
+        }
         if let Some(space) = &self.space
             && !super::store::is_member(conn, space, &self.caller)?
         {
@@ -404,6 +412,7 @@ impl Transport<Chat> for GuardedDeviceTransport {
                                 model: check.selection.model_id.clone(),
                                 config_rev: check.selection.config_rev,
                                 require_saved_model: false,
+                                library_selection: None,
                             },
                         )
                         .await

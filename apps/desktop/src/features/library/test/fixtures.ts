@@ -36,6 +36,11 @@ export function libraryWorld() {
     settingsReadStatus: 200,
     advertisesSelectionPrecondition: true,
     guardedSelectionRoute: true,
+    guardedOperations: true,
+    selectionRevisions: new Map<string, number>(),
+    heldSelectionSave: null as null | (() => void),
+    loseSelectionAck: false,
+    modelCalls: [] as { model: string; operation: "index" | "search"; data: string }[],
     selectionConflicts: 0,
     index: new Map<string, Set<string>>(),
     /** Server-configured file limit (bytes). */
@@ -59,7 +64,16 @@ export function libraryWorld() {
     return Object.keys(TOKENS).find((u) => auth === `Bearer ${TOKENS[u]}`);
   };
   const ok = (body: unknown, status = 200) => ({ status, body });
-  const err = (status: number, error: string) => ({ status, body: { error } });
+  const err = (status: number, error: string, code?: string) => ({ status, body: { error, ...(code ? { code } : {}) } });
+  const selectionRev = (user: string) => String(l.selectionRevisions.get(user) ?? 0);
+  const setSelection = (user: string, id: string | null) => {
+    if ((l.settings.get(user) ?? null) !== id) {
+      l.index.delete(user);
+      l.selectionRevisions.set(user, (l.selectionRevisions.get(user) ?? 0) + 1);
+    }
+    l.settings.set(user, id);
+  };
+  const changed = () => err(409, "the saved media model changed; reload it before saving", "library_selection_changed");
   const member = (user: string, sid: string) => !!f.state.spaces.get(sid)?.members.has(user);
   const visible = (user: string, a: FakeAsset) => (a.space_id === null ? a.uploader_id === user : member(user, a.space_id));
   const view = ({ bytes: _b, ...a }: FakeAsset) => a;
@@ -152,7 +166,7 @@ export function libraryWorld() {
     if (path === "/v1/library/settings" || path === "/v1/library/settings/selection") {
       const guarded = path.endsWith("/selection");
       const selection = () => ({ embedding_id: l.settings.get(user) ?? null,
-        ...(l.advertisesSelectionPrecondition ? { selection_precondition: true } : {}) });
+        ...(l.advertisesSelectionPrecondition ? { selection_precondition: true, selection_revision: selectionRev(user) } : {}) });
       if (guarded && !l.guardedSelectionRoute) return err(404, "not found");
       if (!guarded && req.method === "GET") return l.settingsReadStatus === 200
         ? ok(selection())
@@ -160,37 +174,50 @@ export function libraryWorld() {
       if (req.method === "PUT") {
         const draft = body();
         const nullableId = (id: unknown) => id === null || (typeof id === "string" && !!id);
-        if (guarded && (!draft || Object.keys(draft).length !== 2 || !nullableId(draft.embedding_id) || !nullableId(draft.expected_embedding_id))) {
+        if (guarded && (!draft || Object.keys(draft).length !== 3 || !nullableId(draft.embedding_id) || !nullableId(draft.expected_embedding_id))) {
           return err(422, "both selection fields are required");
         }
-        const id = draft?.embedding_id ?? null;
-        const c = id ? f.state.connections.get(id) : undefined;
-        if (id && (!c || (c.owner !== user && c.share.visibility !== "organization"))) return err(409, "that connection cannot be used");
-        if (id && !String(c?.provider_id).includes("embeddinggemma-2")) return err(422, "that connection cannot embed documents, images, audio or video");
-        const previous = l.settings.get(user) ?? null;
-        if (guarded && draft.expected_embedding_id !== previous) {
-          l.selectionConflicts++;
-          return err(409, "the saved media model changed; reload it before saving");
+        const write = () => {
+          const id = draft?.embedding_id ?? null;
+          const c = id ? f.state.connections.get(id) : undefined;
+          if (id && (!c || (c.owner !== user && c.share.visibility !== "organization"))) return err(409, "that connection cannot be used", "library_selection_refused");
+          if (id && !String(c?.provider_id).includes("embeddinggemma-2")) return err(422, "that connection cannot embed documents, images, audio or video", "library_selection_refused");
+          const previous = l.settings.get(user) ?? null;
+          if (guarded && (draft.expected_embedding_id !== previous || draft.expected_selection_revision !== selectionRev(user))) {
+            l.selectionConflicts++;
+            return changed();
+          }
+          setSelection(user, id);
+          return ok(selection());
+        };
+        if (l.loseSelectionAck) {
+          l.loseSelectionAck = false;
+          l.heldSelectionSave = () => { l.heldSelectionSave = null; write(); };
+          return err(504, "Gateway Timeout");
         }
-        // The legacy fixture intentionally ignores unknown fields. A guarded
-        // app must never try that endpoint, even against a permissive server.
-        if (id !== previous) l.index.delete(user);
-        l.settings.set(user, id);
-        return ok(selection());
+        return write();
       }
     }
-    if (path === "/v1/library/index" && req.method === "POST") {
-      if (!l.settings.get(user)) return err(409, "choose a media embedding model in Settings to search your files");
+    if ((path === "/v1/library/index" || path === "/v1/library/index/selection") && req.method === "POST") {
+      if (path.endsWith("/selection") && !l.guardedOperations) return err(404, "not found");
+      if (path.endsWith("/selection") && body()?.selection_revision !== selectionRev(user)) return changed();
+      const model = l.settings.get(user);
+      if (!model) return err(409, "choose a media embedding model in Settings to search your files");
       const id = body()?.asset_id;
       const a = l.assets.find((x) => x.id === id);
       if (!a || !visible(user, a)) return err(404, "asset not found");
+      l.modelCalls.push({ model, operation: "index", data: a.bytes });
       l.index.set(user, new Set([...(l.index.get(user) ?? []), a.id]));
       return ok({ indexed_segments: 3, partial: false, items: [{ asset_id: a.id, status: "indexed", indexed_segments: 3, partial: false }] });
     }
-    if (path === "/v1/library/search" && req.method === "POST") {
+    if ((path === "/v1/library/search" || path === "/v1/library/search/selection") && req.method === "POST") {
       const b = body();
+      if (path.endsWith("/selection") && !l.guardedOperations) return err(404, "not found");
       if (b.scope === "space" && !member(user, b.space_id)) return err(404, "space not found");
-      if (!l.settings.get(user)) return err(409, "choose a media embedding model in Settings to search your files");
+      if (path.endsWith("/selection") && b.selection_revision !== selectionRev(user)) return changed();
+      const model = l.settings.get(user);
+      if (!model) return err(409, "choose a media embedding model in Settings to search your files");
+      l.modelCalls.push({ model, operation: "search", data: b.query });
       const results = l.hits
         .map((hit) => ({ hit, a: l.assets.find((x) => x.id === hit.asset_id) }))
         .filter(({ a }) => !!a && visible(user, a) && (b.scope === "all" || (b.scope === "personal" ? a.space_id === null : a.space_id === b.space_id)))
@@ -235,5 +262,5 @@ export function libraryWorld() {
   };
   /** Delay subsequent content replies on NSH's clock without blocking other routes. */
   const delayContent = (ms: number) => { contentDelay = ms; };
-  return { f, l, network, addAsset, addMediaConnection, holdContent, delayContent };
+  return { f, l, network, addAsset, addMediaConnection, setSelection, holdContent, delayContent };
 }

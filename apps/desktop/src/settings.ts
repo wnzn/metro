@@ -821,7 +821,7 @@ export async function reloadEndpoint(id: string): Promise<void> {
 }
 
 /** Keep the committed endpoint in state until the server confirms a successful test and save. */
-export async function updateEndpoint(id: string, url: string): Promise<EndpointResult> {
+export async function updateEndpoint(id: string, url: string, revision: string): Promise<EndpointResult> {
   const c = apiClient();
   const current = connections()?.find((x) => x.id === id);
   const provider = current && providerById(current.providerId);
@@ -837,7 +837,7 @@ export async function updateEndpoint(id: string, url: string): Promise<EndpointR
     providerNotice.set(null);
   });
   try {
-    const changed = await c.updateProviderEndpoint(id, url);
+    const changed = await c.updateProviderEndpoint(id, url, revision);
     if (!ok()) return { kind: "ignored" };
     // Don't show a listing from the old endpoint, even if it finishes after the PATCH.
     batch(() => {

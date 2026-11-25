@@ -112,7 +112,7 @@ test("each file shows what it holds, or says why not; reads are authenticated, r
   }
   expect(w.l.log.some((r) => r.url.includes(TOKENS.alice!))).toBe(false);
   // Previews never index or search anything.
-  expect(w.l.log.some((r) => r.path === "/v1/library/index" || r.path === "/v1/library/search")).toBe(false);
+  expect(w.l.log.some((r) => /^\/v1\/library\/(index|search)(\/selection)?$/.test(r.path))).toBe(false);
 });
 
 test("reads are held to two in flight; hiding the rows aborts them, queued ones are never read, and a late answer draws nothing", async () => {

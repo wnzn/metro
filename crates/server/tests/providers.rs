@@ -666,6 +666,15 @@ async fn changing_endpoint_tests_before_saving_and_keeps_connection_settings() {
         )
         .await;
     assert_eq!(status, StatusCode::OK, "{initial_share}");
+    let (status, available) = s.get(BOB, "/v1/models/available").await;
+    assert_eq!(status, StatusCode::OK, "{available}");
+    let shared = available["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["connection_id"] == c["id"])
+        .unwrap();
+    assert!(shared.get("endpoint_revision").is_none());
 
     let (status, body) = s.patch(BOB, &path, json!({"base_url": new.base_url})).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
@@ -852,7 +861,8 @@ async fn endpoint_probe_cannot_overwrite_a_concurrent_edit() {
         "name": "Connection", "provider_id": "custom", "base_url": old.base_url, "model": "keep",
     })).await;
     let path = format!("/v1/providers/{}", c["id"].as_str().unwrap());
-    let patch = s.patch(ALICE, &path, json!({"base_url": new}));
+    let stale_body = json!({"base_url": new, "expected_endpoint_revision": c["endpoint_revision"]});
+    let patch = s.patch(ALICE, &path, stale_body.clone());
     let concurrent = async {
         tokio::time::timeout(Duration::from_secs(5), arrived.notified())
             .await
@@ -872,9 +882,31 @@ async fn endpoint_probe_cannot_overwrite_a_concurrent_edit() {
     let saved = s.connection(ALICE, &c["id"]).await;
     assert_eq!(saved["name"], "Name changed");
     assert_eq!(saved["base_url"], old.base_url);
+    assert_ne!(saved["endpoint_revision"], c["endpoint_revision"]);
+    // Like a request still at the gateway: Metro first reads the row only
+    // after the concurrent edit. It must not start another probe.
+    let (status, refused) =
+        tokio::time::timeout(Duration::from_secs(2), s.patch(ALICE, &path, stale_body))
+            .await
+            .expect("stale client token must fail before the held upstream");
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(refused["code"], "endpoint_conflict");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), arrived.notified())
+            .await
+            .is_err()
+    );
     // Only a new, explicit PATCH can make the change after reviewing the row.
     reply.notify_one();
-    let (status, retried) = s.patch(ALICE, &path, json!({"base_url": new})).await;
+    let (status, retried) = s
+        .patch(
+            ALICE,
+            &path,
+            json!({
+                "base_url": new, "expected_endpoint_revision": saved["endpoint_revision"],
+            }),
+        )
+        .await;
     assert_eq!(status, StatusCode::OK, "{retried}");
     assert_eq!(retried["base_url"], new);
     assert_eq!(retried["name"], "Name changed");

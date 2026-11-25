@@ -79,6 +79,10 @@ export function fakeServer() {
     endpointAck: new Map<string, "lost" | "malformed">(),
     /** Proxy 504 while the server is still probing, released by the test. */
     heldEndpointProbes: new Set<string>(),
+    heldEndpointRequests: new Set<string>(),
+    forwardEndpointRequests: new Map<string, () => { status?: number; body?: unknown }>(),
+    endpointRevisions: new Map<string, number>(),
+    exposesEndpointRevision: true,
     finishEndpointProbes: new Map<string, () => void>(),
     providersReadStatus: 200,
     /** Scenario opts into modern flat chat inventory; other callers exercise the older shape. */
@@ -144,7 +148,12 @@ export function fakeServer() {
       enabled: m.enabled, available: m.available, source: m.source, position: m.position, is_default: m.model_id === c.model,
       thinking: m.thinking, reasoning_efforts: m.thinking?.efforts ?? [],
     }));
-  const connJson = (c: Conn) => ({ id: c.id, name: c.name, provider_id: c.provider_id, base_url: c.base_url, model: c.model, is_default: c.is_default, has_key: !!c.key, capability: c.capability, visibility: c.share.visibility, custom_thinking: customThinking(c), models: modelViews(c) });
+  const endpointRev = (c: Conn) => state.endpointRevisions.get(c.id) ?? 0;
+  const bumpEndpointRev = (c: Conn) => state.endpointRevisions.set(c.id, endpointRev(c) + 1);
+  const connJson = (c: Conn) => ({ id: c.id, name: c.name, provider_id: c.provider_id, base_url: c.base_url,
+    ...(state.exposesEndpointRevision && !c.provider_id.startsWith("device-") && CATALOG.providers.find((p) => p.id === c.provider_id)?.allow_custom_url
+      ? { endpoint_revision: String(endpointRev(c)) } : {}),
+    model: c.model, is_default: c.is_default, has_key: !!c.key, capability: c.capability, visibility: c.share.visibility, custom_thinking: customThinking(c), models: modelViews(c) });
   const listView = (c: Conn) => ({ connection_id: c.id, default_model: c.model, custom_thinking: customThinking(c), models: modelViews(c) });
   /** The connection's model is always an enabled entry of its list; with none, the first enabled one becomes it. */
   const settle = (c: Conn) => {
@@ -413,16 +422,21 @@ export function fakeServer() {
           const provider = CATALOG.providers.find((p) => p.id === c.provider_id);
           if (device || !provider?.allow_custom_url) return err(400, "not a custom server connection", "endpoint_rejected");
           const url = body.base_url;
+          const conflict = () => err(409, "the connection changed while this change was being saved; reload it and try again", "endpoint_conflict");
+          const revision = endpointRev(c);
+          if (body.expected_endpoint_revision !== undefined && body.expected_endpoint_revision !== String(revision)) return conflict();
           if (!state.allowedBaseUrls.includes(url)) return err(400, "base_url must be exactly one of this server's allowed_base_urls", "endpoint_not_approved");
           if (url !== c.base_url) {
             const refusal = state.endpointRefusals.get(url);
             if (refusal?.code === "endpoint_probe_busy") return err(refusal.status, refusal.error, refusal.code);
             state.endpointProbes.push(url);
             if (state.heldEndpointProbes.delete(url)) {
-              const previous = c.base_url;
               state.finishEndpointProbes.set(url, () => {
                 state.finishEndpointProbes.delete(url);
-                if (state.connections.get(c.id) === c && c.base_url === previous) c.base_url = url;
+                if (state.connections.get(c.id) === c && endpointRev(c) === revision) {
+                  c.base_url = url;
+                  bumpEndpointRev(c);
+                }
               });
               return err(504, "Gateway Timeout");
             }
@@ -432,9 +446,11 @@ export function fakeServer() {
               state.endpointConcurrentEdits.delete(url);
               c.name = concurrent.name;
               c.base_url = concurrent.baseUrl;
-              return err(409, "the connection changed while this change was being saved; reload it and try again", "endpoint_conflict");
+              bumpEndpointRev(c);
+              return conflict();
             }
             c.base_url = url;
+            bumpEndpointRev(c);
             const ack = state.endpointAck.get(url);
             state.endpointAck.delete(url);
             if (ack === "lost") return { error: "fixture lost the response" };
@@ -449,6 +465,7 @@ export function fakeServer() {
         }
         if (body.api_key !== undefined) c.key = body.api_key || null;
         if (body.is_default) for (const x of state.connections.values()) if (x.owner === user && x.capability === c.capability) x.is_default = x.id === c.id;
+        bumpEndpointRev(c);
         return ok({ connection: connJson(c) });
       }
       if (!r[2] && req.method === "DELETE") {
@@ -593,6 +610,16 @@ export function fakeServer() {
   for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"]) {
     network[`${method} ${BASE}/v1/*`] = (req: Req) => {
       const u = new URL(req.url);
+      if (method === "PATCH" && /^\/v1\/providers\/[^/]+$/.test(u.pathname) && req.body) {
+        const url = JSON.parse(req.body).base_url;
+        if (state.heldEndpointRequests.delete(url)) {
+          state.forwardEndpointRequests.set(url, () => {
+            state.forwardEndpointRequests.delete(url);
+            return handle(req) as { status?: number; body?: unknown };
+          });
+          return err(504, "Gateway Timeout");
+        }
+      }
       const token = (header(req, "authorization") ?? "").replace(/^Bearer /, "");
       const late = slow.get(`${u.pathname}${u.search} ${token}`) ?? slow.get(`${u.pathname} ${token}`);
       if (late) {

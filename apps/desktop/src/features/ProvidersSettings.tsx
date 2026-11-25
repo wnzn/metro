@@ -582,18 +582,21 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
   const id = c().id;
   const approved = () => catalog()?.allowedBaseUrls ?? [];
   const current = () => c().baseUrl ?? providerById(c().providerId)?.defaultBaseUrl ?? null;
-  const canChange = () => !catalogError() && approved().some((url) => url !== current());
+  const canChange = () => !!c().endpointRevision && !catalogError() && approved().some((url) => url !== current());
   const check = () => endpointNeedsReload(id);
   const busy = () => providerBusy() === `endpoint:${id}` || providerBusy() === `endpoint-refresh:${id}`;
   const editing = signal(check());
   const value = signal(endpointChecks()[id]?.to ?? "");
+  const revision = signal<string | null>(null);
   const error = signal<string | null>(null);
   let mounted = true;
   cleanup(() => { mounted = false; });
   const change = () => {
-    if (check()) return;
+    const displayed = c().endpointRevision;
+    if (check() || !displayed) return;
     dismissEndpointCheck(id);
     value.set(current() ?? "");
+    revision.set(displayed);
     error.set(null);
     props.feedback(null);
     editing.set(true);
@@ -605,7 +608,8 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
     props.feedback(null);
   };
   const submit = async () => {
-    if (!mounted || !editing() || providerBusy() || check()) return;
+    const expected = revision();
+    if (!mounted || !editing() || !expected || providerBusy() || check()) return;
     const url = value();
     props.feedback(null);
     error.set(null);
@@ -613,7 +617,7 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
       error.set(ENDPOINT_NOT_APPROVED);
       return;
     }
-    const outcome = await updateEndpoint(id, url);
+    const outcome = await updateEndpoint(id, url, expected);
     if (!mounted) return;
     if (outcome.kind === "not-approved") {
       error.set(ENDPOINT_NOT_APPROVED);
@@ -657,7 +661,9 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
           </If>
         </Row>
         <If when={!editing() && !canChange() && !catalogError()}>
-          <Label variant="caption" color="muted">No other approved endpoints. Ask your server operator to add one.</Label>
+          <Label variant="caption" color="muted">{c().endpointRevision
+            ? "No other approved endpoints. Ask your server operator to add one."
+            : "This server doesn't support guarded endpoint changes."}</Label>
         </If>
       </SettingRow>
       <If when={editing()}>
@@ -679,7 +685,7 @@ function EndpointSection(props: { connection: ProviderConnection; feedback: (val
               <Action label="Cancel" variant="ghost" disabled={busy() || check()} onPress={() => { dismissEndpointCheck(id); editing.set(false); props.feedback(null); }} />
               <Action label="Test and save" variant="primary" testID={`endpoint-save:${id}`} busy={busy()}
                 busyLabel={providerBusy() === `endpoint-refresh:${id}` ? "Refreshing models…" : "Testing and saving…"}
-                disabled={!value() || value() === current() || !!check() || catalogError() !== null || (!!providerBusy() && !busy())} onPress={() => void submit()} />
+                disabled={!revision() || !value() || value() === current() || !!check() || catalogError() !== null || (!!providerBusy() && !busy())} onPress={() => void submit()} />
             </ActionBar>
           </Column>
         </SettingRow>

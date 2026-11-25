@@ -27,6 +27,7 @@ pub struct Engine<'a> {
     library: &'a dyn Library,
     models: &'a dyn MediaModels,
     routing: Routing,
+    selection: Option<SelectionBinding>,
 }
 
 #[derive(Default)]
@@ -103,7 +104,45 @@ impl<'a> Engine<'a> {
             library,
             models,
             routing,
+            selection: None,
         }
+    }
+
+    pub(super) fn bind_selection(mut self, selection: SelectionBinding) -> Self {
+        self.selection = Some(selection);
+        self
+    }
+
+    fn revision(&self) -> Option<i64> {
+        self.selection.as_ref().map(|s| s.revision)
+    }
+
+    async fn check_selection(&self) -> Result<(), LibrarySearchError> {
+        if let Some(revision) = self.revision() {
+            let (user, id) = (self.user.to_owned(), self.embedding()?.to_owned());
+            let same = self
+                .db
+                .call(move |db| Ok(selection_is(&db.lock(), &user, &id, revision)?))
+                .await?;
+            if !same {
+                return Err(LibrarySearchError::SelectionChanged);
+            }
+        }
+        Ok(())
+    }
+
+    async fn check_fingerprint(&self, fingerprint: &str) -> Result<(), LibrarySearchError> {
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|s| s.fingerprint.as_deref() != Some(fingerprint))
+        {
+            self.check_selection().await?;
+            return Err(LibrarySearchError::Unusable(
+                "the media embedding connection changed during this operation; try again".into(),
+            ));
+        }
+        Ok(())
     }
 
     fn embedding(&self) -> Result<&str, LibrarySearchError> {
@@ -166,6 +205,7 @@ impl<'a> Engine<'a> {
         snapshot: i64,
     ) -> Result<usize, LibrarySearchError> {
         let (user, key, conn) = (self.user.to_owned(), source.key(), conn.to_owned());
+        let revision = self.revision();
         Ok(self
             .db
             .call(move |db| {
@@ -173,7 +213,7 @@ impl<'a> Engine<'a> {
                     &mut db.lock(),
                     &user,
                     &key,
-                    &conn,
+                    (&conn, revision),
                     snapshot,
                 )?)
             })
@@ -256,11 +296,13 @@ impl<'a> Engine<'a> {
         self.purge_revoked().await?;
         let mut items = Vec::with_capacity(ids.len());
         for id in ids {
+            self.check_selection().await?;
             match self.index_one(id).await {
                 Ok(item) => items.push(item),
                 Err(e) if !bulk => return Err(e),
                 Err(
                     e @ (LibrarySearchError::NoMediaModel
+                    | LibrarySearchError::SelectionChanged
                     | LibrarySearchError::Busy
                     | LibrarySearchError::Full
                     | LibrarySearchError::Internal(_)),
@@ -324,6 +366,7 @@ impl<'a> Engine<'a> {
             Ok(fp) => fp,
             Err(e) => return Err(self.unusable(e, &source, conn, snapshot).await),
         };
+        self.check_fingerprint(&fingerprint).await?;
         // What the connection resolves to now; the store transaction
         // requires the same.
         let grant = self.models.grant();
@@ -372,11 +415,17 @@ impl<'a> Engine<'a> {
 
         // Right before the bytes leave: still readable, still the same file.
         self.still_same(&read).await?;
+        self.check_selection().await?;
         let input = protocol::asset_request(&read.name, &read.mime_type, &bytes);
         drop(bytes);
         let result = tokio::time::timeout(
             INDEX_TIMEOUT,
-            self.models.embed(dest.as_deref(), conn, input),
+            self.models.embed(
+                dest.as_deref(),
+                conn,
+                input,
+                self.revision().map(|rev| (rev, fingerprint.as_str())),
+            ),
         )
         .await;
 
@@ -389,6 +438,7 @@ impl<'a> Engine<'a> {
             }
             return Err(e);
         }
+        self.check_selection().await?;
         let answer = match result {
             Ok(Ok(a)) => a,
             Ok(Err(e)) if e.kind == MediaFailure::Upstream => {
@@ -408,8 +458,14 @@ impl<'a> Engine<'a> {
         // for this destination.
         match self.models.fingerprint(dest.as_deref(), conn).await {
             Ok(fp) if fp == fingerprint => {}
-            Ok(_) => return Err(switched()),
-            Err(e) => return Err(self.unusable(e, &source, conn, snapshot).await),
+            Ok(_) => {
+                self.check_selection().await?;
+                return Err(switched());
+            }
+            Err(e) => {
+                self.check_selection().await?;
+                return Err(self.unusable(e, &source, conn, snapshot).await);
+            }
         }
         // The store transaction revalidates the setting, the file and the
         // grant once more, atomically with the write.
@@ -422,6 +478,7 @@ impl<'a> Engine<'a> {
         );
         let n = parsed.segments.len();
         let partial = parsed.partial;
+        let selection_revision = self.revision();
         let outcome = self
             .db
             .call(move |db| {
@@ -429,6 +486,7 @@ impl<'a> Engine<'a> {
                     &mut db.lock(),
                     &user,
                     &NewAsset {
+                        selection_revision,
                         asset_id: &id,
                         source: &key,
                         space_id: sid.as_deref(),
@@ -461,6 +519,7 @@ impl<'a> Engine<'a> {
                 "the file changed while it was indexed; index it again".into(),
             )),
             StoreOutcome::Switched => Err(switched()),
+            StoreOutcome::SelectionChanged => Err(LibrarySearchError::SelectionChanged),
             StoreOutcome::Full => Err(LibrarySearchError::Full),
         }
     }
@@ -490,8 +549,12 @@ impl<'a> Engine<'a> {
             .map_err(|_| MediaError::transient("no media embedding model"))?;
         let answer = tokio::time::timeout(
             QUERY_TIMEOUT,
-            self.models
-                .embed(source.destination(), conn, protocol::query_request(query)),
+            self.models.embed(
+                source.destination(),
+                conn,
+                protocol::query_request(query),
+                self.revision().map(|rev| (rev, fingerprint)),
+            ),
         )
         .await
         .map_err(|_| MediaError::transient("the media embedding model timed out"))??;
@@ -518,6 +581,7 @@ impl<'a> Engine<'a> {
         snapshot: i64,
     ) -> Result<usize, LibrarySearchError> {
         let conn = self.embedding()?.to_owned();
+        let revision = self.revision();
         let (user, key, fp) = (self.user.to_owned(), source.key(), fingerprint.to_owned());
         Ok(self
             .db
@@ -526,7 +590,7 @@ impl<'a> Engine<'a> {
                     &mut db.lock(),
                     &user,
                     &key,
-                    &conn,
+                    (&conn, revision),
                     &fp,
                     dims,
                     snapshot,
@@ -696,10 +760,20 @@ impl<'a> Engine<'a> {
             );
             let state = rerank_state(query, &text);
             let models = self.models;
+            let selection = self
+                .revision()
+                .zip(self.routing.embedding.as_deref())
+                .map(|(rev, id)| (id, rev));
             calls.push(Box::pin(async move {
                 let out = tokio::time::timeout(
                     DECIDE_TIMEOUT,
-                    models.decide(dest.as_deref(), classifier, state, rerank_questions()),
+                    models.decide(
+                        dest.as_deref(),
+                        classifier,
+                        state,
+                        rerank_questions(),
+                        selection,
+                    ),
                 )
                 .await;
                 (i, out)
@@ -751,6 +825,7 @@ impl<'a> Engine<'a> {
         let (mut served, mut searchable, mut stale, mut skipped_spaces, mut removed) =
             (0, 0, 0, 0, 0);
         for source in sources {
+            self.check_selection().await?;
             // Nothing is sent anywhere for a library with no indexed files.
             if self.indexed_count(source).await? == 0 {
                 continue;
@@ -778,6 +853,7 @@ impl<'a> Engine<'a> {
                     continue;
                 }
             };
+            self.check_fingerprint(&fp).await?;
             stale += self.purge_stale(source, &fp, None, snapshot).await?;
             if self.indexed_count(source).await? == 0 {
                 continue;
@@ -814,6 +890,7 @@ impl<'a> Engine<'a> {
                 merged.push(c.cosine, key, c);
             }
         }
+        self.check_selection().await?;
         if served == 0 && !report.failed.is_empty() {
             self.check_failed_search_scope(sources).await?;
             return Err(LibrarySearchError::Upstream(format!(
@@ -911,6 +988,7 @@ impl<'a> Engine<'a> {
             }
         }
 
+        self.check_selection().await?;
         let n_ranked = found.iter().filter(|f| f.classifier.is_some()).count();
         let ranking = if n_ranked == 0 {
             Ranking::Embeddings
@@ -966,8 +1044,8 @@ pub async fn settings_view(
     prior: Option<String>,
 ) -> Result<SettingsView, LibrarySearchError> {
     let u = user.to_owned();
-    let embedding_id = db
-        .call(move |db| Ok(store::embedding_id(&db.lock(), &u)?))
+    let (embedding_id, revision) = db
+        .call(move |db| Ok(store::selection(&db.lock(), &u)?))
         .await?;
     let suggested_id = match (&embedding_id, prior) {
         (None, Some(p)) => match models.media_capable(None, &p).await {
@@ -979,6 +1057,7 @@ pub async fn settings_view(
     Ok(SettingsView {
         embedding_id,
         selection_precondition: true,
+        selection_revision: revision.to_string(),
         suggested_id,
     })
 }
@@ -991,7 +1070,7 @@ pub async fn save_settings(
     models: &dyn MediaModels,
     user: &str,
     embedding_id: Option<String>,
-    expected: Option<Option<String>>,
+    expected: Option<(Option<String>, Option<i64>)>,
 ) -> Result<SettingsView, LibrarySearchError> {
     if let Some(id) = &embedding_id {
         if !crate::auth::valid_id(id) {
@@ -1007,22 +1086,31 @@ pub async fn save_settings(
         }
     }
     let (u, id) = (user.to_owned(), embedding_id.clone());
+    let grant = models.grant();
     let outcome = db
         .call(move |db| {
-            Ok(store::set_embedding_id(
+            Ok(store::save_selection(
                 &mut db.lock(),
                 &u,
                 id.as_deref(),
-                expected.as_ref().map(Option::as_deref),
+                expected.as_ref().map(|(id, _)| id.as_deref()),
+                expected.as_ref().and_then(|(_, rev)| *rev),
+                &grant,
             )?)
         })
         .await?;
-    if outcome == store::SelectionWrite::Stale {
-        return Err(LibrarySearchError::SelectionChanged);
-    }
+    let revision = match outcome {
+        store::SelectionWrite::Saved(revision) => revision,
+        store::SelectionWrite::Stale => return Err(LibrarySearchError::SelectionChanged),
+        store::SelectionWrite::Unusable(e) if e.kind == MediaFailure::Internal => {
+            return Err(LibrarySearchError::Internal(e.message));
+        }
+        store::SelectionWrite::Unusable(e) => return Err(LibrarySearchError::Unusable(e.message)),
+    };
     Ok(SettingsView {
         embedding_id,
         selection_precondition: true,
+        selection_revision: revision.to_string(),
         suggested_id: None,
     })
 }
