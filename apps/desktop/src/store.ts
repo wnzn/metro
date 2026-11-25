@@ -271,11 +271,15 @@ function credentials(urlInput: string, tokenInput: string) {
   return { baseUrl: parsed.baseUrl, token };
 }
 
+function verifyConnection(c: Client, baseUrl: string) {
+  return Promise.all([c.me(), c.listSpaces(), rememberedSpace(baseUrl)]);
+}
+
 /** Probe a candidate without touching the live session, including on failure. */
 export async function prepareConnection(baseUrl: string, token: string, signal: AbortSignal): Promise<PreparedConnection> {
   const target = credentials(baseUrl, token);
   const c = createClient({ baseUrl: target.baseUrl, token: () => target.token, signal });
-  const [who, list, remembered] = await Promise.all([c.me(), c.listSpaces(), rememberedSpace(target.baseUrl)]);
+  const [who, list, remembered] = await verifyConnection(c, target.baseUrl);
   if (signal.aborted) throw new ApiError("aborted", "Cancelled");
   const prepared = Object.freeze({ baseUrl: target.baseUrl });
   candidates.set(prepared, { token: target.token, who, list, remembered, signal });
@@ -290,42 +294,24 @@ function beginSession(baseUrl: string, token: string) {
   return { sess, c: client };
 }
 
-function publishIdentity(baseUrl: string, who: Me, list: Space[], remember?: boolean) {
-  batch(() => {
+/** Publish the verified identity, membership and destination together. */
+function publishSession(baseUrl: string, token: string, who: Me, list: Space[], remembered: string | null, remember?: boolean) {
+  return batch(() => {
     me.set(who.id);
     orgAdmin.set(who.isOrgAdmin);
     spaces.set(list);
     connectedTo.set(baseUrl);
-  });
-  if (remember !== false) Storage.setItem(SERVER_URL_KEY, baseUrl).catch(() => {});
-}
+    if (remember !== false) Storage.setItem(SERVER_URL_KEY, baseUrl).catch(() => {});
 
-function startOnline(baseUrl: string, token: string) {
-  lastListsRefresh = Date.now();
-  failures = 0;
-  status.set({ phase: "online" });
-  for (const fn of sessionStarters) fn({ baseUrl, token });
-}
-
-/** Consume a verified candidate synchronously. Subsequent requests have their own session lifetime. */
-export function adoptConnection(prepared: PreparedConnection, opts: { remember?: boolean } = {}): void {
-  const candidate = candidates.get(prepared);
-  if (!candidate) throw new Error("Connection was not prepared or was already adopted.");
-  candidates.delete(prepared);
-  if (candidate.signal.aborted) throw new ApiError("aborted", "Cancelled");
-  batch(() => {
-    beginSession(prepared.baseUrl, candidate.token);
-    connectError.set(null);
-    publishIdentity(prepared.baseUrl, candidate.who, candidate.list, opts.remember);
-    startOnline(prepared.baseUrl, candidate.token);
-    const initial = candidate.list.find((s) => s.id === candidate.remembered);
+    const initial = list.find((s) => s.id === remembered);
+    let hydration: Promise<void> | undefined;
     if (initial) {
-      // Show the shell now; kick the first tick after enterSpace settles,
-      // bounded by listRooms' client timeout.
+      // Set the Space before exposing the Shell. Chat must not mount while
+      // we wait for the selected Space's rooms.
       const current = guard();
       const entering = enterSpace(initial.id, { place: "chat", spaceId: null });
       const navigation = navigationGeneration; // enterSpace starts navigation before its first await
-      void entering.then(() => {
+      hydration = entering.then(() => {
         // A running tick reads the active room after any refreshLists await.
         if (!current() || ticking) return;
         const stillTarget = navigation === navigationGeneration &&
@@ -337,6 +323,24 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
     } else {
       kick();
     }
+    lastListsRefresh = Date.now();
+    failures = 0;
+    status.set({ phase: "online" });
+    for (const fn of sessionStarters) fn({ baseUrl, token });
+    return hydration;
+  });
+}
+
+/** Consume a verified candidate synchronously. Subsequent requests have their own session lifetime. */
+export function adoptConnection(prepared: PreparedConnection, opts: { remember?: boolean } = {}): void {
+  const candidate = candidates.get(prepared);
+  if (!candidate) throw new Error("Connection was not prepared or was already adopted.");
+  candidates.delete(prepared);
+  if (candidate.signal.aborted) throw new ApiError("aborted", "Cancelled");
+  batch(() => {
+    beginSession(prepared.baseUrl, candidate.token);
+    connectError.set(null);
+    void publishSession(prepared.baseUrl, candidate.token, candidate.who, candidate.list, candidate.remembered, opts.remember);
   });
 }
 
@@ -344,13 +348,13 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
  * `remember: false` (the desktop-hosted local workspace): don't save this URL
  * as the server to offer next time, so the remote choice stays as it was.
  */
-export async function connect(urlInput: string, tokenInput: string, opts: { remember?: boolean } = {}): Promise<void> {
+export async function connect(urlInput: string, tokenInput: string, opts: { remember?: boolean } = {}): Promise<boolean> {
   let target: ReturnType<typeof credentials>;
   try {
     target = credentials(urlInput, tokenInput);
   } catch (error) {
     connectError.set((error as Error).message);
-    return;
+    return false;
   }
   const { baseUrl, token } = target;
   const { sess, c } = beginSession(baseUrl, token);
@@ -360,21 +364,18 @@ export async function connect(urlInput: string, tokenInput: string, opts: { reme
   });
 
   try {
-    const [who, list] = await Promise.all([c.me(), c.listSpaces()]);
-    if (sess !== session) return;
-    publishIdentity(baseUrl, who, list, opts.remember);
-    const remembered = await rememberedSpace(baseUrl);
-    if (sess !== session) return;
-    // A returning user lands in their last Space; everyone else in their Chat.
-    const initial = list.find((s) => s.id === remembered) ?? null;
-    if (initial) await enterSpace(initial.id, { place: "chat", spaceId: null });
-    if (sess !== session) return;
-    startOnline(baseUrl, token);
-    kick();
+    const [who, list, remembered] = await verifyConnection(c, baseUrl);
+    if (sess !== session) return false;
+    // The Shell can mount immediately, but don't offer to keep the token if
+    // room hydration lost the session or the person switched in the meantime.
+    await publishSession(baseUrl, token, who, list, remembered, opts.remember);
+    return sess === session;
   } catch (error) {
-    if (sess !== session) return;
-    endSession();
-    connectError.set(describe(error, "Could not connect"));
+    if (sess === session) {
+      endSession();
+      connectError.set(describe(error, "Could not connect"));
+    }
+    return false;
   }
 }
 
@@ -583,7 +584,7 @@ export async function createSpace(nameInput: string): Promise<boolean> {
 async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId: string | null }): Promise<void> {
   const c = client;
   if (!c) return;
-  navigationGeneration++;
+  const navigation = ++navigationGeneration;
   const currentSession = guard();
   const ok = guard(spaceId);
   batch(() => {
@@ -614,6 +615,7 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
       return;
     }
     const name = spaces().find((s) => s.id === spaceId)?.name ?? spaceId;
+    if (navigation !== navigationGeneration) return; // a newer navigation owns the main panel
     if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) purgeSpace(spaceId, true);
     else purgeSpace(spaceId, false); // keep it listed; just don't keep half-loaded state
     const back = previous.spaceId && spaces().some((s) => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;

@@ -58,9 +58,10 @@ function servers() {
   return { a, b, local };
 }
 
-async function launch(s: ReturnType<typeof servers>, opts: { storage?: Record<string, string>; bridge?: ReturnType<typeof launcher> } = {}): Promise<App> {
+async function launch(s: ReturnType<typeof servers>, opts: { storage?: Record<string, string>; bridge?: ReturnType<typeof launcher>; manualClock?: boolean } = {}): Promise<App> {
   const network = { ...(s.a.network as any), ...at(REMOTE, s.b), ...at(LOCAL, s.local), ...(opts.bridge ? opts.bridge.network : {}) };
-  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 820, storage: opts.storage ?? {}, modules: (opts.bridge ? env : launched()) as any });
+  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 820,
+    storage: opts.storage ?? {}, modules: (opts.bridge ? env : launched()) as any, ...(opts.manualClock ? { clock: {} } : {}) });
 }
 
 async function signIn(app: App, user: string, url = BASE, opts: { keep?: boolean } = {}) {
@@ -299,6 +300,91 @@ const choices = JSON.stringify([
   { id: "srv-a", name: "Work", baseUrl: BASE },
   { id: "srv-b", name: "Team B", baseUrl: REMOTE },
 ]);
+
+const rememberedRemote = {
+  "metro.savedServers": choices,
+  "metro.startupServer": "srv-b",
+  "metro.lastSpace": JSON.stringify({ server: REMOTE, space: "beta" }),
+};
+const betaRooms = "/v1/spaces/beta/rooms";
+const betaEvents = `${betaRooms}/lobby/events`;
+const remotePaths = (s: ReturnType<typeof servers>) => s.b.state.log.map(r => r.path);
+
+async function submitSavedStartup(app: App) {
+  await app.waitFor("text:Sign in to Team B");
+  await app.type("id:access-token", TOKENS.bob!);
+  await app.press("id:connect");
+}
+
+test("saved remote verifies before showing the scoped Shell and room hydration never boots Chat", async () => {
+  const s = servers(), bridge = launcher();
+  const who = s.b.answerLate("/v1/me", TOKENS.bob!, 40);
+  const spaces = s.b.answerLate("/v1/spaces", TOKENS.bob!, 70);
+  const rooms = s.b.answerLate(betaRooms, TOKENS.bob!, 300);
+  // A nonempty first page intentionally causes one catch-up request.
+  const message = s.b.post("beta/lobby", { kind: "message", actor: "bob", text: "First remote room message" });
+  s.b.answerLate("/v1/models/available?space_id=beta", TOKENS.bob!, 900);
+  const app = await launch(s, { bridge, storage: rememberedRemote, manualClock: true });
+  await app.waitFor("text:Sign in to Team B");
+  expect(remotePaths(s)).toEqual([]);
+  await submitSavedStartup(app);
+  await app.waitUntil(() => who.arrived() === 1 && spaces.arrived() === 1, { timeout: 25 });
+  expect(app.shows("id:workspace")).toBe(false);
+  expect(rooms.arrived()).toBe(0);
+  await app.waitFor("id:rooms-loading", { timeout: 150 });
+  expect(app.shows("id:space:beta")).toBe(true);
+  expect(app.shows("id:chat-view")).toBe(false);
+  expect(app.shows("id:composer")).toBe(false);
+  expect(rooms.arrived()).toBe(1);
+  expect(remotePaths(s).some(p => p.includes("/events") || p.startsWith("/v1/models/available"))).toBe(false);
+  await app.waitFor("text:First remote room message", { timeout: 340 });
+  await app.waitUntil(() => remotePaths(s).includes(`${betaEvents}?after=${message.id}`), { timeout: 100 });
+  const paths = remotePaths(s);
+  for (const path of ["/v1/me", "/v1/spaces", betaRooms]) expect(paths.filter(p => p === path)).toHaveLength(1);
+  expect(paths.filter(p => p.includes("/events?"))).toEqual([`${betaEvents}?after=0`, `${betaEvents}?after=${message.id}`]);
+  expect(paths.some(p => p.startsWith("/v1/chat/") || p === "/v1/runs" || p === "/v1/models/available" || p === "/v1/providers")).toBe(false);
+  expect(bridge.opens()).toBe(0);
+});
+
+test("a 401 during remote room hydration clears the Shell without committing a new saved connection", async () => {
+  const s = servers();
+  const get = s.b.network[`GET ${BASE}/v1/*`]!;
+  s.b.network[`GET ${BASE}/v1/*`] = (req) => new URL(req.url).pathname === betaRooms
+    ? { status: 401, body: { error: "invalid token" }, delay: 300 }
+    : get(req);
+  const app = await launch(s, { manualClock: true, storage: { "metro.lastSpace": rememberedRemote["metro.lastSpace"] } });
+  await app.clear("id:server-url");
+  await app.type("id:server-url", REMOTE);
+  await app.type("id:access-token", TOKENS.bob!);
+  await app.press("id:keep-signed-in");
+  await app.press("id:connect");
+  await app.waitFor("id:rooms-loading", { timeout: 120 });
+  await app.waitFor("id:connect-error", { timeout: 350 });
+  expect(app.shows("id:workspace")).toBe(false);
+  expect(app.shows("id:space:beta")).toBe(false);
+  expect(app.value("id:access-token")).toBe("");
+  expect(saved(app)).toEqual([]);
+  expect(remotePaths(s).some(p => p.includes("/events"))).toBe(false);
+});
+
+test("signing out during remote hydration aborts the old room and never saves its token", async () => {
+  const s = servers();
+  const rooms = s.b.answerLate(betaRooms, TOKENS.bob!, 500);
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true });
+  await app.waitFor("text:Sign in to Team B");
+  await app.press("id:keep-signed-in");
+  await submitSavedStartup(app);
+  await app.waitFor("id:rooms-loading", { timeout: 100 });
+  expect(rooms.arrived()).toBe(1);
+  await menuSwitch(app, "disconnect");
+  await app.waitFor("id:connect-screen", { timeout: 100 });
+  await app.clock!.runFor(550);
+  expect(app.shows("id:workspace")).toBe(false);
+  expect(remotePaths(s).some(p => p.includes("/events"))).toBe(false);
+  await app.press("id:saved-server:srv-b");
+  expect(app.value("id:access-token")).toBe("");
+  expect(remotePaths(s).filter(p => p === "/v1/me")).toHaveLength(1);
+});
 
 async function pickStartup(app: App, id: string) {
   await menuSwitch(app, "startup-server");

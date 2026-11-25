@@ -4,7 +4,7 @@ import { pendingPlainHttp } from "../plainHttp";
 import { addressLabel, cancelSwitch, confirmPlainHttp, defaultName, hasToken, saveCurrentServer, savedError, savedServers, switchTo } from "../savedWorkspaces";
 import type { SavedServer } from "../savedWorkspaces";
 import { chooseManually, startupOpening, startupPrompt } from "../startupWorkspace";
-import { connect, connectedTo, connectError, serverUrlInput, status } from "../store";
+import { connect, connectError, serverUrlInput, status } from "../store";
 import { PlainHttpConsent, SERVER_URL_HINT } from "./PlainHttpConsent";
 import { Action, Banner, Column, Divider, Field, FormRow, Label, MetroMark, Row, SavedServerChoice, Surface, Toggle } from "../ui";
 
@@ -58,9 +58,9 @@ export function ConnectScreen() {
     }
     const saving = !!target() || save();
     const keeping = saving && keep();
-    void connect(url, value).then(() => {
+    void connect(url, value).then((current) => {
       if (connectError()) token.set(""); // don't keep a token that failed
-      else if (connectedTo() && (status().phase === "online" || status().phase === "retrying")) {
+      else if (current) {
         // An already-saved address keeps its name; the token is kept only when asked.
         if (saving) void saveCurrentServer(defaultName(url), { keep: keeping, keepName: true });
       }

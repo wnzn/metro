@@ -37,6 +37,7 @@ import {
   selectRoom,
   setDraft,
   status,
+  switchingSpace,
 } from "../store";
 import type { Mention } from "../store";
 import {
@@ -45,6 +46,7 @@ import {
   AskAgentChooser,
   AuthorGlyph,
   Badge,
+  Column,
   InlineLink,
   Label,
   PopoverNote,
@@ -90,8 +92,16 @@ export function SpaceView() {
   return (
     <Surface variant="panel" grow testID="space-view">
       <ConnectionBanner />
-      <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
-      <RoomComposer />
+      <If when={switchingSpace() && !activeRoom()} else={
+        <>
+          <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
+          <RoomComposer />
+        </>
+      }>
+        <Column grow align="center" justify="center" pad={6} testID="rooms-loading">
+          <Label color="muted">Loading rooms…</Label>
+        </Column>
+      </If>
     </Surface>
   );
 }
