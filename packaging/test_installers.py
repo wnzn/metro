@@ -175,6 +175,17 @@ exec {tar} "$@"
         assert marker.read_text() == "metro-update-lock-v2\n"
         self.run(published, "update", "--archive", archive, check=True)
         assert marker.read_text() != "metro-update-lock-v2\n"
+        lock = marker.parent / ".lock"
+        lock.mkdir()
+        owner = lock / "owner.metro-lock-v2"
+        invalid = "metro-lock-v2:.looks-valid\nforeign bytes"
+        owner.write_text(invalid)
+        result = self.run(modern, "update", "--archive", archive)
+        assert result.returncode and "another install" in result.stderr, result.stderr
+        assert owner.read_text() == invalid
+        owner.write_text("metro-lock-v2:.interrupted\n")
+        self.run(modern, "update", "--archive", archive, check=True)
+        assert not lock.exists()
 
 
 class DesktopInstallerTests(unittest.TestCase):

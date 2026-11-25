@@ -92,7 +92,8 @@ compat_take() {
             [ "$(ls -A -- "$root/.lock")" = owner.metro-lock-v2 ] &&
             [ "$(stat -c '%s' -- "$compat_owner")" -le 128 ] &&
             [ "$(wc -l <"$compat_owner")" -eq 1 ] &&
-            grep -Eq '^metro-lock-v2:[A-Za-z0-9._-]+$' "$compat_owner" &&
+            [ "$(LC_ALL=C grep -ac '^' "$compat_owner")" -eq 1 ] &&
+            LC_ALL=C grep -aExq 'metro-lock-v2:[A-Za-z0-9._-]+' "$compat_owner" &&
             compat_retire || die "another install holds the legacy lock at $root/.lock"
     fi
     compat_new=$(mktemp -d -- "$root/.lock-new.XXXXXX")
