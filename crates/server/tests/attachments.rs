@@ -280,8 +280,8 @@ impl H {
         (s, v["events"].as_array().cloned().unwrap_or_default())
     }
 
-    /// Opt alice in to classification of unaddressed messages.
-    async fn classify_for_alice(&self) {
+    /// Set the old Chat inference flag to prove it has no effect.
+    async fn legacy_chat_inference(&self) {
         let (s, v) = self
             .req(
                 Method::PUT,
@@ -337,9 +337,9 @@ fn by_id(events: &[Value], id: &Value) -> Value {
 }
 
 #[tokio::test]
-async fn attachment_only_chat_message_is_delivered_without_any_agent_work() {
+async fn attachment_only_chat_send_starts_the_agent_without_exposing_the_files() {
     let h = H::start().await;
-    h.classify_for_alice().await;
+    h.legacy_chat_inference().await;
     let a = h
         .upload("alice", "scope=personal", "notes.txt", "hello")
         .await;
@@ -348,11 +348,16 @@ async fn attachment_only_chat_message_is_delivered_without_any_agent_work() {
         .await;
 
     let (s, e) = h
-        .chat("alice", json!({"text": "  ", "asset_ids": [b, a]}))
+        .chat(
+            "alice",
+            json!({"text": "  ", "asset_ids": [b, a], "provider_connection_id": CHAT}),
+        )
         .await;
     assert_eq!(s, StatusCode::ACCEPTED, "{e}");
     assert_eq!(e["text"], "");
-    assert_eq!(e["audience"], "room");
+    assert_eq!(e["audience"], "agent");
+    assert_eq!(e["mentions"], json!([{"kind": "agent"}]));
+    assert_eq!(e["addressing_note"], Value::Null);
     // Authoritative metadata, in the order sent; no paths, urls or uploader.
     assert_eq!(ids(&e), vec![b.clone(), a.clone()]);
     assert_eq!(
@@ -361,19 +366,49 @@ async fn attachment_only_chat_message_is_delivered_without_any_agent_work() {
                "kind": "text", "size_bytes": 5})
     );
 
-    // Poll and reload return the same.
-    let events = h.chat_events("alice").await;
-    assert_eq!(events.len(), 1);
-    assert_eq!(events[0]["attachments"], e["attachments"]);
-
-    // Ordinary conversation: no System One, no model, no agent events.
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    // Poll and reload return the same attachments, with a direct model reply.
+    let events = tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let events = h.chat_events("alice").await;
+            if events.iter().any(|e| e["activity"]["phase"] == "completed") {
+                break events;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("attachment-only turn to complete");
+    assert_eq!(by_id(&events, &e["id"])["attachments"], e["attachments"]);
+    assert!(events.iter().any(|e| e["text"] == "answered"));
+    let started = events
+        .iter()
+        .find(|e| e["activity"]["phase"] == "started")
+        .unwrap();
+    assert_eq!(started["activity"]["route"]["addressed_by"], "explicit");
+    assert_eq!(started["activity"]["route"]["source"], "override");
+    assert!(started["activity"].get("pick").is_none());
     assert_eq!(h.system_one_calls(), 0);
-    assert!(h.model_bodies.lock().unwrap().is_empty());
-    assert_eq!(h.chat_events("alice").await.len(), 1);
+    {
+        let bodies = h.model_bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert!(bodies[0].contains("You cannot access those files"));
+        for private in [&a, &b, "notes.txt", "plan.txt", "hello"] {
+            assert!(!bodies[0].contains(private), "leaked {private}");
+        }
+    }
+    assert!(h.chat_events("bob").await.is_empty());
 
-    // The same in a room, with alice's own upload to the Space.
+    // File-only Space sends remain ordinary conversation even with the opt-in.
     let sid = h.space("Acme", &[]).await;
+    let (status, prefs) = h
+        .req(
+            Method::PUT,
+            "alice",
+            &format!("/v1/spaces/{sid}/prefs"),
+            Some(json!({"classify_unaddressed": true})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{prefs}");
     let f = h
         .upload(
             "alice",
@@ -396,12 +431,22 @@ async fn attachment_only_chat_message_is_delivered_without_any_agent_work() {
     assert_eq!(h.system_one_calls(), 0);
     assert_eq!(h.room_events("alice", &sid, "lobby").await.1.len(), 1);
 
-    // Text with attachments keeps the opt-in classification as before.
-    let (s, _) = h
-        .chat("alice", json!({"text": "what is this?", "asset_ids": [a]}))
+    // The older explicit Save note action can still save files on their own.
+    let (s, note) = h
+        .chat(
+            "alice",
+            json!({"text": "", "asset_ids": [a], "invoke_agent": false}),
+        )
         .await;
     assert_eq!(s, StatusCode::ACCEPTED);
-    assert_eq!(h.system_one_calls(), 1);
+    assert_eq!(note["audience"], "room");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.chat_events("alice").await.last().unwrap()["id"],
+        note["id"]
+    );
+    assert_eq!(h.system_one_calls(), 0);
+    assert_eq!(h.model_bodies.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]
@@ -420,7 +465,7 @@ async fn ask_agent_needs_a_question_and_bad_id_lists_post_nothing() {
 
     let refused = [
         (
-            json!({"text": "", "asset_ids": [a], "invoke_agent": true}),
+            json!({"text": "", "invoke_agent": true}),
             StatusCode::BAD_REQUEST,
         ),
         (
@@ -444,7 +489,7 @@ async fn ask_agent_needs_a_question_and_bad_id_lists_post_nothing() {
             StatusCode::NOT_FOUND,
         ),
         (
-            json!({"text": "", "asset_ids": [a], "provider_connection_id": CHAT}),
+            json!({"text": "", "asset_ids": [a], "provider_connection_id": CHAT, "invoke_agent": false}),
             StatusCode::BAD_REQUEST,
         ),
     ];
@@ -514,7 +559,7 @@ async fn scopes_never_cross_personal_space_or_another_space() {
         )
         .await;
 
-    h.classify_for_alice().await;
+    h.legacy_chat_inference().await;
     // Personal Chat: only the sender's own personal files.
     for id in [&bobs, &acme_file, &other_file] {
         let (s, v) = h
@@ -724,7 +769,10 @@ async fn deleting_a_file_keeps_the_message_and_drops_only_its_link() {
     let a = h.upload("alice", "scope=personal", "a.txt", "a").await;
     let b = h.upload("alice", "scope=personal", "b.txt", "b").await;
     let (_, e) = h
-        .chat("alice", json!({"text": "two files", "asset_ids": [a, b]}))
+        .chat(
+            "alice",
+            json!({"text": "two files", "asset_ids": [a, b], "invoke_agent": false}),
+        )
         .await;
     assert_eq!(h.link_rows(), (2, 2));
 
@@ -754,7 +802,12 @@ async fn deleting_a_file_keeps_the_message_and_drops_only_its_link() {
     assert_eq!(h.chat_events("alice").await.len(), 1);
 
     // An attachment-only message whose file is gone stays in the transcript.
-    let (_, only) = h.chat("alice", json!({"text": "", "asset_ids": [b]})).await;
+    let (_, only) = h
+        .chat(
+            "alice",
+            json!({"text": "", "asset_ids": [b], "invoke_agent": false}),
+        )
+        .await;
     let (s, _) = h
         .req(
             Method::DELETE,

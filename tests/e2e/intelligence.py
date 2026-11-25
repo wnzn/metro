@@ -502,7 +502,16 @@ def exercise_routing(run, space, classifier, default, routed):
     room = room_path(space)
     current = run.call("alice", "GET", ROUTING, read_json=True)
     require(current["enabled"] is False and current["infer_addressing"] is False,
-            "classifier and routing were not opt-in")
+            "routing or the legacy settings default changed")
+    before = run.post_counts()
+    direct = "This is a direct personal Chat send."
+    sent = run.call("alice", "POST", f"{CHAT}/messages", body={"text": direct},
+                    expect=(202,), read_json=True)
+    route = run.expect_reply("alice", CHAT, sent["id"], run.default, direct)
+    require(sent["mentions"] == [{"kind": "agent"}] and sent.get("addressing_note") is None
+            and route["addressed_by"] == "explicit" and len(run.systemone.posts()) == before[0],
+            "Chat did not send directly without System One")
+
     before = run.post_counts()
     event = run.post("alice", room, "Please analyze the causal chain. ROUTING_OPT_OUT")
     run.expect_no_run("alice", room, event, before, "unaddressed while opted out")
@@ -526,6 +535,16 @@ def exercise_routing(run, space, classifier, default, routed):
     def change_counts(counts, vendor):
         index = run.vendors.index(vendor)
         return counts[:index] + (counts[index] + 1,) + counts[index + 1:]
+
+    before = run.post_counts()
+    event = run.post("alice", CHAT, ROUTED)
+    route = run.expect_reply("alice", CHAT, event, run.routed, ROUTED)
+    require(route["addressed_by"] == "explicit" and route.get("case_key") == "causal_review",
+            "Chat did not preserve its direct attribution and separate use-case routing")
+    assert_questions(run.systemone, before[0], ROUTED, use_case)
+    before = run.post_counts()
+    event = run.post("alice", CHAT, "Remember this without asking.", invoke_agent=False)
+    run.expect_no_run("alice", CHAT, event, before, "explicit personal note")
 
     before = run.post_counts()
     event = run.post("alice", room, HUMAN)
@@ -612,8 +631,8 @@ def exercise_search(run, shared_space, stranger_space):
     room = room_path(shared_space)
     lexical = run.post("alice", room, LEXICAL)
     semantic = run.post("alice", room, SEMANTIC)
-    chat = run.post("bob", CHAT, CHAT_HIT)
-    run.post("alice", CHAT, PRIVATE)
+    chat = run.post("bob", CHAT, CHAT_HIT, invoke_agent=False)
+    run.post("alice", CHAT, PRIVATE, invoke_agent=False)
     run.post("carol", room_path(stranger_space), STRANGER)
 
     before = run.post_counts()
@@ -723,7 +742,8 @@ def intelligence(server, connector, timeout):
         exercise_subscription_preset(run)
         exercise_routing(run, space, classifier, default, routed)
         run.finish()
-    print("PASS: capability discovery, borrowed endpoint, directedness and routing, device embeddings, semantic rerank and privacy.")
+    print("PASS: capability discovery, borrowed endpoint, direct Chat and Space classification, "
+          "use-case routing, device embeddings, semantic rerank and privacy.")
 
 
 if __name__ == "__main__":

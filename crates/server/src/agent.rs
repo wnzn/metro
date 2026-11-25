@@ -1840,6 +1840,12 @@ async fn execute_personal_run(
     } else {
         PERSONAL_PREAMBLE
     });
+    if lane == PersonalLane::Chat && trigger.text.is_empty() && !trigger.attachments.is_empty() {
+        builder = builder.append_preamble(
+            "The latest message contains only attachments. You cannot access those files. \
+             Ask what the user needs and invite them to paste the relevant text.",
+        );
+    }
     if web {
         let paired = crate::web_devices::has_device(&state, &user_id).await;
         if matches!(paired, Ok(true)) {

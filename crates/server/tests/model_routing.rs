@@ -752,16 +752,6 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
         .await;
     assert_eq!(h.fake.calls(), before);
 
-    // Personal Chat too, with the same opt-in.
-    let e = h
-        .say("alice", None, json!({"text": "[yes] summarize my day"}))
-        .await;
-    assert_eq!(e["mentions"][0]["addressed_by"], "classifier");
-    let a = h
-        .answer_after("alice", None, e["id"].as_i64().unwrap())
-        .await;
-    assert_eq!(a["kind"], "agent", "{a}");
-    assert_eq!(h.fake.last_call().1, None);
     // A forged classifier mark is refused by the mention wire.
     let (s, _) = h
         .post(
@@ -771,6 +761,67 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
         )
         .await;
     assert_ne!(s, StatusCode::ACCEPTED);
+}
+
+#[tokio::test]
+async fn chat_is_direct_with_or_without_the_legacy_flag_but_notes_stay_quiet() {
+    let h = H::start().await;
+    for infer in [false, true] {
+        let (status, prefs) = h
+            .put_routing("alice", json!({"infer_addressing": infer}))
+            .await;
+        assert_eq!(status, StatusCode::OK, "{prefs}");
+        assert_eq!(prefs["infer_addressing"], infer);
+        let sent = h
+            .say("alice", None, json!({"text": "@bob [err] a Chat prompt"}))
+            .await;
+        assert_eq!(sent["audience"], "agent");
+        assert_eq!(sent["mentions"], json!([{"kind": "agent"}]));
+        assert_eq!(sent["addressing_note"], Value::Null);
+        assert_eq!(sent["routing_note"], Value::Null);
+        let id = sent["id"].as_i64().unwrap();
+        assert_eq!(h.answer_after("alice", None, id).await["kind"], "agent");
+        assert_eq!(
+            h.route_after("alice", None, id).await["addressed_by"],
+            "explicit"
+        );
+    }
+
+    // A configured classifier still sees neither sends nor notes.
+    assert_eq!(
+        h.put_routing("alice", routing_on(true, false)).await.0,
+        StatusCode::OK
+    );
+    for body in [
+        json!({"text": "[err] a direct send"}),
+        json!({"text": "hello", "invoke_agent": true}),
+        json!({"text": "@agent hello", "invoke_agent": false}),
+    ] {
+        let sent = h.say("alice", None, body).await;
+        assert_eq!(sent["mentions"], json!([{"kind": "agent"}]));
+        assert_eq!(sent["addressing_note"], Value::Null);
+        assert_eq!(
+            h.answer_after("alice", None, sent["id"].as_i64().unwrap())
+                .await["kind"],
+            "agent"
+        );
+    }
+    let calls = h.model_calls().len();
+    let note = h
+        .say(
+            "alice",
+            None,
+            json!({"text": "[yes] remember this", "invoke_agent": false}),
+        )
+        .await;
+    assert_eq!(note["mentions"], json!([]));
+    assert_eq!(note["audience"], "room");
+    assert_eq!(note["addressing_note"], Value::Null);
+    h.quiet_after("alice", None, note["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(h.fake.calls(), 0);
+    assert_eq!(h.model_calls().len(), calls);
+    assert!(h.events("bob", None).await.is_empty());
 }
 
 #[tokio::test]
@@ -800,33 +851,20 @@ async fn failed_classification_is_returned_only_on_the_senders_post() {
             Some(reason) => json!({"kind": "classification_failed", "reason": reason}),
             None => Value::Null,
         };
-        let (room, chat) = tokio::join!(
-            h.say("alice", Some(&sid), json!({"text": text})),
-            h.say("alice", None, json!({"text": text})),
-        );
-        for post in [&room, &chat] {
-            assert_eq!(post.get("addressing_note"), Some(&expected));
-        }
-        for (who, space, post) in [
-            ("alice", Some(sid.as_str()), &room),
-            ("bob", Some(sid.as_str()), &room),
-            ("alice", None, &chat),
-        ] {
-            let events = h.events(who, space).await;
+        let room = h.say("alice", Some(&sid), json!({"text": text})).await;
+        assert_eq!(room.get("addressing_note"), Some(&expected));
+        for who in ["alice", "bob"] {
+            let events = h.events(who, Some(&sid)).await;
             let stored = events.last().unwrap();
-            assert_eq!(stored["id"], post["id"]);
+            assert_eq!(stored["id"], room["id"]);
             assert_eq!(stored["kind"], "message");
             assert_eq!(stored["text"], text);
             assert!(stored.get("addressing_note").is_none());
         }
     }
     // No reason reached anyone's transcript, in any form.
-    for (who, space) in [
-        ("alice", Some(sid.as_str())),
-        ("bob", Some(sid.as_str())),
-        ("alice", None),
-    ] {
-        let transcript = serde_json::to_string(&h.events(who, space).await).unwrap();
+    for who in ["alice", "bob"] {
+        let transcript = serde_json::to_string(&h.events(who, Some(&sid)).await).unwrap();
         for leak in [
             "addressing_note",
             "invalid_answer",
@@ -1041,7 +1079,7 @@ async fn use_cases_route_explicit_turns_and_explicit_models_win() {
         .await;
     assert_eq!(s, StatusCode::BAD_REQUEST);
 
-    // Addressing first (a lone Noul), then, only after a yes, the lone Choice.
+    // Direct Chat skips addressing and asks one Choice for model routing.
     let (s, _) = h.put_routing("alice", routing_on(true, true)).await;
     assert_eq!(s, StatusCode::OK);
     let before = h.fake.calls();
@@ -1057,12 +1095,23 @@ async fn use_cases_route_explicit_turns_and_explicit_models_win() {
         .iter()
         .map(|c| c.4.as_object().unwrap().keys().cloned().collect())
         .collect();
+    assert_eq!(asked, vec![vec!["use_case".to_owned()]]);
+    let route = h
+        .route_after("alice", None, e["id"].as_i64().unwrap())
+        .await;
     assert_eq!(
-        asked,
-        vec![vec!["directed".to_owned()], vec!["use_case".to_owned()]]
+        (route["source"].as_str(), route["addressed_by"].as_str()),
+        (Some("case"), Some("explicit"))
     );
 
-    // A rejected, uncertain or failed addressing Noul never leads to a Choice.
+    // A rejected, uncertain or failed addressing Choice in a Space never
+    // leads to model routing.
+    assert_eq!(
+        h.put_prefs("alice", &sid, json!({"classify_unaddressed": true}))
+            .await
+            .0,
+        StatusCode::OK
+    );
     for text in [
         "lunch, code later",
         "[maybe] code?",
@@ -1070,20 +1119,14 @@ async fn use_cases_route_explicit_turns_and_explicit_models_win() {
         "[bad] code",
     ] {
         let before = h.fake.calls();
-        let e = h.say("alice", None, json!({"text": text})).await;
-        h.quiet_after("alice", None, e["id"].as_i64().unwrap())
+        let e = h.say("alice", Some(&sid), json!({"text": text})).await;
+        h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
             .await;
         let calls = h.fake.calls.lock().unwrap()[before..].to_vec();
         assert_eq!(calls.len(), 1, "{text}");
+        assert_eq!(calls[0].4["agent"]["type"], "choice", "{text}");
         assert!(calls[0].4.get("use_case").is_none(), "{text}: no Choice");
     }
-    let route = h
-        .route_after("alice", None, e["id"].as_i64().unwrap())
-        .await;
-    assert_eq!(
-        (route["source"].as_str(), route["addressed_by"].as_str()),
-        (Some("case"), Some("classifier"))
-    );
 }
 
 /// `text` fails visibly because routing could not decide, before any
@@ -1260,7 +1303,6 @@ async fn shared_connections_stay_in_their_space_and_settings_are_validated() {
         json!({"default_chat_id": id(CLASSIFIER)}),
         json!({"classifier_id": id(CODE), "infer_addressing": true}),
         json!({"embedding_id": id(CODE)}),
-        json!({"infer_addressing": true}),
         json!({"enabled": true, "cases": routing_on(false, true)["cases"]}),
         json!({"min_directedness": 0.2}),
         json!({"min_route_probability": 1.5}),

@@ -1,26 +1,10 @@
 //! Personal model routing: which of a person's usable chat connections
-//! answers a turn, and (separately) whether an unaddressed message of theirs
-//! is asking the agent at all.
+//! answers a turn. Use-case routing is a personal opt-in, persisted per
+//! user (`GET|PUT /v1/model-routing`), and off by default.
 //!
-//! Both are personal opt-ins, persisted per user (`GET|PUT /v1/model-routing`),
-//! and both are off by default, which keeps the old behaviour exactly:
-//! only `@agent` or Ask agent starts agent work, and the person's default
-//! chat connection answers.
-//!
-//! A message falls into exactly one case, decided by its explicit
-//! recipients ([`Addressing`]):
-//!
-//! - **People only** (`@bob`): never starts agent work and is never sent to
-//!   System One.
-//! - **To the agent** (`@agent`, Ask agent, mixed `@bob @agent`): starts
-//!   agent work with no "was this for the agent?" question.
-//! - **Unaddressed**: ordinary conversation, unless the *sender* turned on
-//!   `infer_addressing`. Then that one new message (never room history) is
-//!   sent to the sender's System One connection with a Noul; only an answer
-//!   at or above `min_directedness` starts the agent, as the sender. No
-//!   answer, an uncertain one, a malformed one or an error starts nothing.
-//!   The stored message is marked `addressed_by: "classifier"`, which no
-//!   client can send.
+//! A send in personal Chat is direct. Space addressing is handled separately
+//! by [`crate::agent_dispatch`], which uses this module for agent Choice
+//! questions. Space addressing never applies to personal Chat.
 //!
 //! **Use-case routing** (`enabled`) runs on any turn that starts agent work
 //! for the person, unless they picked a model explicitly for that turn. It
@@ -36,9 +20,8 @@
 //! nothing falls back to another model.
 //!
 //! Every System One request carries exactly one question, because some
-//! endpoints accept no more. A message therefore costs at most two calls:
-//! the addressing Noul first (unaddressed and opted in only), then the
-//! Choice, only after a clear yes or on an explicit agent turn.
+//! endpoints accept no more. A personal Chat send asks at most one Choice,
+//! for use-case routing. A Space can ask an agent Choice before model routing.
 //!
 //! The route that was actually used is recorded on the turn's `started`
 //! activity marker ([`RouteNote`]): where the model came from, the case, the
@@ -83,7 +66,6 @@ const DECISION_TIMEOUT: Duration = Duration::from_secs(10);
 /// System One calls in flight at once, across the server.
 const MAX_DECISIONS: usize = 8;
 
-const Q_DIRECTED: &str = "directed";
 const Q_USE_CASE: &str = "use_case";
 const Q_AGENT: &str = "agent";
 /// The agent Choice's reserved "nobody" option. Agent options are keyed
@@ -100,7 +82,8 @@ pub struct RoutingSettings {
     /// Use-case routing on turns that start agent work for this person.
     #[serde(default)]
     pub enabled: bool,
-    /// Let System One judge this person's own unaddressed messages.
+    /// Legacy field kept for wire/storage compatibility and the one-time
+    /// Space preferences migration. Not used for dispatch or validation.
     #[serde(default)]
     pub infer_addressing: bool,
     /// The person's System One connection, used for both decisions.
@@ -113,6 +96,7 @@ pub struct RoutingSettings {
     /// the person's default chat connection.
     #[serde(default)]
     pub default_chat_id: Option<String>,
+    /// Confidence floor for unaddressed messages in opted-in Spaces.
     #[serde(default = "default_min_directedness")]
     pub min_directedness: f64,
     #[serde(default = "default_min_route_probability")]
@@ -207,13 +191,9 @@ impl RoutingSettings {
                 ));
             }
         }
-        if (self.enabled && !self.cases.is_empty() || self.infer_addressing)
-            && self.classifier_id.is_none()
-        {
+        if self.enabled && !self.cases.is_empty() && self.classifier_id.is_none() {
             return Err(
-                "classifier_id must name a System One connection for use-case routing or \
-                 addressing inference"
-                    .to_owned(),
+                "classifier_id must name a System One connection for use-case routing".to_owned(),
             );
         }
         Ok(())
@@ -969,17 +949,6 @@ pub struct CaseAnswer {
     pub probability: f64,
 }
 
-fn directed_question() -> Question {
-    Question::noul_with(
-        "Is `message` addressed to the AI assistant, asking it to answer something or do \
-         something?",
-        "The sender asks the assistant a question, asks it for help, or tells it to do \
-         something",
-        "Conversation with other people, a status update, a reaction or a remark that is not \
-         a request to the assistant",
-    )
-}
-
 fn case_question(settings: &RoutingSettings) -> Question {
     let mut criteria: BTreeMap<String, Value> = settings
         .cases
@@ -1056,33 +1025,6 @@ async fn ask_one(
     match answers.into_values().next() {
         Some(answer) => Decision::Answered(answer),
         None => Decision::Failed(DecisionFailure::InvalidAnswer),
-    }
-}
-
-/// The addressing Noul alone: how likely `text` is a request to the agent.
-pub async fn directedness(
-    state: &AppState,
-    user: &str,
-    space: Option<&str>,
-    settings: &RoutingSettings,
-    text: &str,
-) -> Decision<f64> {
-    match ask_one(
-        state,
-        user,
-        space,
-        settings,
-        text,
-        Q_DIRECTED,
-        directed_question(),
-    )
-    .await
-    {
-        Decision::Answered(a) => match a.as_noul() {
-            Some(p) => Decision::Answered(p),
-            None => Decision::Failed(DecisionFailure::InvalidAnswer),
-        },
-        Decision::Failed(why) => Decision::Failed(why),
     }
 }
 
@@ -1218,30 +1160,9 @@ pub async fn pick_agent(
     })
 }
 
-/// Whether an unaddressed message of `user` starts agent work: only when
-/// they opted in and the addressing Noul clearly says yes. One System One
-/// call; the use case is asked separately, and only after a yes.
-pub async fn infer_addressed(
-    state: &AppState,
-    user: &str,
-    space: Option<&str>,
-    settings: &RoutingSettings,
-    text: &str,
-) -> Result<bool, DecisionFailure> {
-    if !settings.infer_addressing {
-        return Ok(false);
-    }
-    match directedness(state, user, space, settings, text).await {
-        Decision::Answered(p) => Ok(p >= settings.min_directedness),
-        Decision::Failed(why) => Err(why),
-    }
-}
-
 /// The route of a turn `user` starts. `chosen` (an explicit model for this
 /// turn) wins and asks System One nothing; then use-case routing, if they
-/// turned it on (one Choice call); then their default. So a message costs
-/// at most two System One calls: the addressing Noul (unaddressed, opted
-/// in) and, only after a yes or for an explicit agent turn, this Choice.
+/// turned it on (one Choice call); then their default.
 pub async fn route_turn(
     state: &AppState,
     user: &str,
@@ -1337,14 +1258,6 @@ pub async fn route_turn(
                 case.label, answer.probability
             ),
         },
-    }
-}
-
-/// The mentions of a message the classifier addressed to the agent.
-pub fn classifier_addressed() -> Addressed {
-    Addressed {
-        mentions: json!([{"kind": "agent", "addressed_by": "classifier"}]),
-        audience: "agent".to_owned(),
     }
 }
 
@@ -1521,7 +1434,7 @@ mod tests {
         s.enabled = false;
         assert!(s.check_shape().is_ok(), "off routing may keep cases");
         s.infer_addressing = true;
-        assert!(s.check_shape().is_err(), "inference needs a classifier");
+        assert!(s.check_shape().is_ok(), "the legacy flag is ignored");
     }
 
     #[test]

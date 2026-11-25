@@ -629,58 +629,6 @@ async fn check_choice(
     }
 }
 
-/// How a new message of `who` is addressed and whether it starts a turn:
-/// people-only messages never do and never reach System One; explicit
-/// agent messages always do; unaddressed ones only when the sender opted
-/// in and System One clearly says the message is for the agent.
-async fn dispatch_of(
-    state: &AppState,
-    who: &Human,
-    space: Option<&str>,
-    text: &str,
-    resolved: &[Mention],
-    addressing: Addressing,
-) -> ApiResult<PersonalDispatch> {
-    let settings = || async {
-        routing::preferences(state, &who.id)
-            .await
-            .map_err(ApiError::internal)
-    };
-    let (addressed, turn, note) = match addressing {
-        // Attachments alone are ordinary conversation: never classified.
-        Addressing::Unaddressed if text.is_empty() => (addressed(resolved), None, None),
-        Addressing::PeopleOnly => (addressed(resolved), None, None),
-        Addressing::Agent => (
-            addressed(resolved),
-            Some((AddressedBy::Explicit, settings().await?)),
-            None,
-        ),
-        Addressing::Unaddressed => {
-            let settings = settings().await?;
-            match routing::infer_addressed(state, &who.id, space, &settings, text).await {
-                Ok(true) => (
-                    routing::classifier_addressed(),
-                    Some((AddressedBy::Classifier, settings)),
-                    None,
-                ),
-                Ok(false) => (addressed(resolved), None, None),
-                Err(why) => (addressed(resolved), None, Some(why.into())),
-            }
-        }
-    };
-    Ok(PersonalDispatch {
-        addressed,
-        turn,
-        note,
-    })
-}
-
-struct PersonalDispatch {
-    addressed: Addressed,
-    turn: Option<(AddressedBy, RoutingSettings)>,
-    note: Option<AddressingNote>,
-}
-
 #[derive(Serialize)]
 pub struct PostedMessage {
     #[serde(flatten)]
@@ -1022,7 +970,9 @@ pub async fn chat_events(
 #[serde(deny_unknown_fields)]
 pub struct ChatMessage {
     text: String,
-    #[serde(default)]
+    /// Omission is a normal direct send. Keep accepting the legacy flag:
+    /// false saves a note unless the message expressly mentions `@agent`.
+    #[serde(default = "chat_invokes_agent")]
     invoke_agent: bool,
     /// Answer with this one of the sender's own model connections instead of
     /// their default. Never falls back to the default or the server model.
@@ -1035,6 +985,10 @@ pub struct ChatMessage {
     asset_ids: Vec<String>,
 }
 
+fn chat_invokes_agent() -> bool {
+    true
+}
+
 pub async fn chat_message(
     State(state): State<AppState>,
     who: Human,
@@ -1042,11 +996,14 @@ pub async fn chat_message(
 ) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
     let Json(body) = body?;
     let text = check_message(&state, &who.id, None, &body.text, &body.asset_ids).await?;
-    // Personal Chat has no other members: only `@agent` or the flag resolve.
-    let resolved =
-        mentions::resolve(&text, &[], body.invoke_agent, &[]).map_err(ApiError::bad_request)?;
+    // A normal Chat send is already addressed to the agent. Only the legacy
+    // note path needs the textual mention rule, and Chat has no other members.
+    let resolved = if body.invoke_agent {
+        vec![Mention::Agent]
+    } else {
+        mentions::resolve(&text, &[], false, &[]).map_err(ApiError::bad_request)?
+    };
     let addressing = Addressing::of(&resolved);
-    agent_needs_text(&text, addressing)?;
     let chosen = check_choice(
         &state,
         &who,
@@ -1057,11 +1014,16 @@ pub async fn chat_message(
         addressing,
     )
     .await?;
-    let PersonalDispatch {
-        addressed,
-        turn,
-        note,
-    } = dispatch_of(&state, &who, None, &text, &resolved, addressing).await?;
+    let settings = if addressing == Addressing::Agent && chosen.is_none() {
+        Some(
+            routing::preferences(&state, &who.id)
+                .await
+                .map_err(ApiError::internal)?,
+        )
+    } else {
+        None
+    };
+    let addressed = addressed(&resolved);
     let (uid, author, stored) = (who.id.clone(), who.author(), text.clone());
     let event = if body.asset_ids.is_empty() {
         db(&state, move |db| {
@@ -1080,28 +1042,37 @@ pub async fn chat_message(
             Append::NoRoom | Append::NoAsset => return Err(no_attachment()),
         }
     };
-    if let Some((addressed_by, settings)) = turn {
-        // With a choice: only that connection. Otherwise routing, if the
-        // sender turned it on, or their default; a connection that cannot
-        // be used fails the reply.
-        let route = match chosen {
-            Some(route) => route,
-            None => {
-                routing::route_turn(&state, &who.id, None, &settings, &text, addressed_by, None)
-                    .await
-            }
-        };
-        let (state, uid, event) = (state.clone(), who.id.clone(), event.clone());
+    // With a choice: only that connection. Otherwise routing, if the sender
+    // turned it on, or their default; a connection that cannot be used fails
+    // the reply. Notes have neither a choice nor routing settings.
+    let route = if let Some(settings) = settings {
+        Some(
+            routing::route_turn(
+                &state,
+                &who.id,
+                None,
+                &settings,
+                &text,
+                AddressedBy::Explicit,
+                None,
+            )
+            .await,
+        )
+    } else {
+        chosen
+    };
+    if let Some(route) = route {
+        let event = event.clone();
         tokio::spawn(async move {
             // A turn that cannot start says why in the Chat.
-            let _ = start_personal_run(&state, &uid, &event, route).await;
+            let _ = start_personal_run(&state, &who.id, &event, route).await;
         });
     }
     Ok((
         StatusCode::ACCEPTED,
         Json(PostedMessage {
             event,
-            addressing_note: note,
+            addressing_note: None,
             routing_note: None,
         }),
     ))

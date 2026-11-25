@@ -891,12 +891,8 @@ async fn personal_chat_gets_web_tools_only_after_the_persons_opt_in() {
         json!({"personal_chat": false})
     );
 
-    s.post(
-        ALICE,
-        "/v1/chat/messages",
-        json!({"text": "hello", "invoke_agent": true}),
-    )
-    .await;
+    s.post(ALICE, "/v1/chat/messages", json!({"text": "hello"}))
+        .await;
     let job = s.model_job(&model).await;
     assert!(!tool_names(&job).iter().any(|n| n.starts_with("web_")));
     assert!(system_prompt(&job).contains("You have no tools"));
@@ -924,7 +920,7 @@ async fn personal_chat_gets_web_tools_only_after_the_persons_opt_in() {
     s.post(
         ALICE,
         "/v1/chat/messages",
-        json!({"text": "search the web", "invoke_agent": true}),
+        json!({"text": "search the web"}),
     )
     .await;
     let job = s.model_job(&model).await;
@@ -970,12 +966,8 @@ async fn personal_chat_gets_web_tools_only_after_the_persons_opt_in() {
         Some(json!({"personal_chat": false})),
     )
     .await;
-    s.post(
-        ALICE,
-        "/v1/chat/messages",
-        json!({"text": "again", "invoke_agent": true}),
-    )
-    .await;
+    s.post(ALICE, "/v1/chat/messages", json!({"text": "again"}))
+        .await;
     let job = s.model_job(&model).await;
     assert!(!tool_names(&job).iter().any(|n| n.starts_with("web_")));
     s.reply_text(&model, &job, "bye").await;

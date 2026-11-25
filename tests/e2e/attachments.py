@@ -3,12 +3,11 @@
 
 Run with: python3 tests/e2e/attachments.py [--bin-dir DIR] [--timeout SECONDS]
 
-Needs only the real `metro-server` binary, with dev-token users and a
-temporary on-disk SQLite database. No model is configured and none is
-called. One journey:
+Needs only the real `metro-server` binary, with dev-token users, a
+temporary on-disk SQLite database and a scripted loopback model.
 
-1. Alice attaches her personal file in her personal Chat with no text, and
-   her Space file in a shared room. Neither starts any agent work.
+1. Alice's attachment-only Chat send starts a direct agent turn. Saving
+   a note in Chat and sending the Space file in a room do not start one.
 2. Bob, a member, reads the room event and opens the attached file.
 3. The server restarts on the same database; the event and file are still
    there, with the same metadata.
@@ -33,6 +32,7 @@ from functools import partial
 from pathlib import Path
 from urllib.parse import quote
 
+from schedules import ModelStub, serve_stub
 from smoke import (
     HOST, SPACES, clean_env, create_space, main, remaining, request, require, server_port,
     start_child, stop_child, temp_state, terminate, wait_for_server,
@@ -43,16 +43,12 @@ CHAT = "/v1/chat"
 FIELDS = {"asset_id", "name", "mime_type", "kind", "size_bytes"}
 
 
-class NoModel:
-    """No model fixture: nothing may fail on its side."""
-    error = None
-
-
 class Server:
-    def __init__(self, stack, binary, directory, tokens, deadline):
+    def __init__(self, stack, binary, directory, tokens, deadline, model):
         self.stack, self.binary, self.directory = stack, binary, Path(directory)
         self.tokens, self.deadline = tokens, deadline
         self.env = clean_env(directory)
+        self.model = model
         self.child = None
         self.start()
 
@@ -63,8 +59,11 @@ class Server:
                                      "METRO_BIND": f"{HOST}:{self.port}",
                                      "METRO_DB": str(self.directory / "metro.sqlite"),
                                      "METRO_DEV_USERS": json.dumps(self.tokens),
+                                     "METRO_MODEL_BASE_URL": self.model.base_url,
+                                     "METRO_MODEL": self.model.model,
+                                     "METRO_MODEL_API_KEY": self.model.api_key,
                                  })
-        wait_for_server(self.port, [self.child], NoModel, self.deadline)
+        wait_for_server(self.port, [self.child], self.model, self.deadline)
 
     def restart(self):
         stop_child(self.child[0])
@@ -116,7 +115,8 @@ def find(events, eid):
 def journey(server_binary, timeout):
     tokens = {user: secrets.token_hex(24) for user in ("alice", "bob")}
     with temp_state() as directory, ExitStack() as stack:
-        s = Server(stack, server_binary, directory, tokens, time.monotonic() + timeout)
+        model = serve_stub(stack, ModelStub("attachments", "attachments-fixture", secrets.token_hex(24)))
+        s = Server(stack, server_binary, directory, tokens, time.monotonic() + timeout, model)
         sid = create_space(s.call, "alice", "Attachments e2e")
         space = f"{SPACES}/{quote(sid, safe='')}"
         room = f"{space}/rooms/lobby"
@@ -132,6 +132,20 @@ def journey(server_binary, timeout):
                       body={"text": "", "asset_ids": [mine]}, label="attachment-only Chat send")
         require([a["asset_id"] for a in attached(chat)] == [mine] and chat["text"] == "",
                 "Chat send did not echo its attachment")
+        require(chat["mentions"] == [{"kind": "agent"}] and chat["audience"] == "agent"
+                and chat.get("addressing_note") is None, "attachment-only send was not direct")
+        while True:
+            events = s.events("alice", CHAT)
+            require(model.error is None and not any(e["kind"] == "error" for e in events),
+                    "attachment-only Chat turn failed")
+            if any(e.get("activity", {}).get("phase") == "completed" for e in events):
+                break
+            time.sleep(min(0.05, remaining(s.deadline)))
+        started = [e["activity"] for e in events if e.get("activity", {}).get("phase") == "started"]
+        require(len(started) == 1 and started[0]["route"]["addressed_by"] == "explicit"
+                and "pick" not in started[0] and any(e["text"] == "ACK none" for e in events),
+                "attachment-only Chat turn lacked a directly attributed reply")
+        require(s.events("bob", CHAT) == [], "another user's Chat received the turn")
         msg = s.call("alice", "POST", f"{room}/messages", read_json=True, expect=(202,),
                      body={"text": "see the plan", "asset_ids": [shared]}, label="room send")
         meta = attached(msg)
@@ -145,10 +159,14 @@ def journey(server_binary, timeout):
         s.call("bob", "POST", f"{room}/messages", expect=(404,),
                body={"text": "x", "asset_ids": [shared]}, label="bob attaches alice's file")
         s.call("alice", "POST", f"{CHAT}/messages", expect=(400,),
-               body={"text": "", "asset_ids": [mine], "invoke_agent": True},
-               label="Ask agent with no question")
+               body={"text": "", "invoke_agent": True}, label="Chat send with no text or files")
+        note = s.call("alice", "POST", f"{CHAT}/messages", read_json=True, expect=(202,),
+                      body={"text": "", "asset_ids": [mine], "invoke_agent": False},
+                      label="attachment-only Save note")
         time.sleep(0.5)
-        require(len(s.events("alice", CHAT)) == 1, "attachment-only Chat send started other work")
+        require(s.events("alice", CHAT)[-1]["id"] == note["id"]
+                and note["audience"] == "room" and model.total() == 1,
+                "Save note or the room send started other work")
 
         # 2. Another member reads the event and opens the file.
         require(attached(find(s.events("bob", room), msg["id"])) == meta,
@@ -187,7 +205,7 @@ def journey(server_binary, timeout):
                body={"text": "again", "asset_ids": [shared]}, label="attach a deleted file")
         require(s.child[0].poll() is None, "the server exited")
     print("PASS: attachments delivered in Chat and a room, read by a member, kept across a "
-          "restart, denied after removal, and tombstoned on delete; no agent work.")
+          "restart, denied after removal, and tombstoned on delete; only Chat Send started a turn.")
 
 
 if __name__ == "__main__":

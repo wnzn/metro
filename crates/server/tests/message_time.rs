@@ -497,7 +497,7 @@ async fn personal_chat_and_scheduled_turns_carry_their_times() {
         .post(
             ALICE,
             "/v1/chat/messages",
-            json!({"text": "remember the dentist"}),
+            json!({"text": "remember the dentist", "invoke_agent": false}),
         )
         .await;
     let (_, ask) = s
@@ -690,7 +690,7 @@ async fn a_device_connection_sees_the_same_times() {
         .post(
             ALICE,
             "/v1/chat/messages",
-            json!({"text": "plan for friday"}),
+            json!({"text": "plan for friday", "invoke_agent": false}),
         )
         .await;
     let from = ms_floor(Utc::now());
