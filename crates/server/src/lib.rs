@@ -11,6 +11,7 @@ pub mod agent_dispatch;
 pub mod api;
 pub mod attachments;
 pub mod auth;
+pub mod compaction;
 pub mod config;
 pub mod db;
 pub mod device_relay;
@@ -96,6 +97,8 @@ pub struct AppState {
     /// Chat turns waiting on a delegated Space run at once (half the agent
     /// slots), so waiting turns can't starve the runs they wait for.
     pub meta_waits: Arc<Semaphore>,
+    /// Compaction locks, the auto rate limit and failure notes (memory only).
+    pub compaction: Arc<crate::compaction::Compaction>,
 }
 
 impl AppState {
@@ -140,6 +143,7 @@ impl AppState {
             directory_limit: directory::RateLimit::default(),
             page_builds: Arc::new(Semaphore::new(crate::pages::generate::MAX_PAGE_BUILDS)),
             chat_runs: Arc::default(),
+            compaction: Arc::default(),
             meta_waits: Arc::new(Semaphore::new((limits.max_agent_runs / 2).max(1))),
             managed,
             library,
@@ -344,6 +348,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::pages::router())
         // Metro in Chat: Spaces access and stopping a Chat turn.
         .merge(crate::meta::router())
+        // Conversation compaction: the auto setting and `/compact`.
+        .merge(crate::compaction::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;
