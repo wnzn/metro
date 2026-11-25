@@ -11,6 +11,7 @@
 //! - [`tools`]: tool trait, registry and the built-in adapters.
 //! - [`spaces`]: per-Space roots under the base for reusable credentials.
 //! - [`runner`]: the claim/execute/report loop with backoff.
+//! - [`update`]: version reporting and the opt-in self-update.
 
 pub mod client;
 pub mod config;
@@ -20,6 +21,7 @@ pub mod mcp;
 pub mod runner;
 pub mod spaces;
 pub mod tools;
+pub mod update;
 pub mod util;
 
 use std::sync::atomic::{AtomicBool, Ordering};

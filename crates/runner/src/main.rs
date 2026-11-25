@@ -8,6 +8,43 @@ use metro_runner::confine::Workspace;
 use metro_runner::runner::Runner;
 use metro_runner::spaces::SpaceRoots;
 use metro_runner::tools::{Registry, SubprocessPolicy};
+use metro_runner::update::{self, InstallKind, SelfUpdate, StartAction, Updater};
+
+/// Version reporting, and the self-updater when this host opted in and this
+/// is a managed install of a published release build.
+fn self_update(install: InstallKind, cfg: &Config) -> SelfUpdate {
+    let channel = metro_release::Channel::current();
+    let updater = match (&install, metro_release::Version::this_build()) {
+        (InstallKind::Managed { root }, Some(own))
+            if cfg.self_update && channel == metro_release::Channel::Release =>
+        {
+            match metro_release::sigstore::SigstoreVerifier::vendored() {
+                Ok(verifier) => Some(Updater {
+                    root: root.clone(),
+                    own,
+                    fetcher: metro_release::fetch::BlockingFetcher::new(
+                        metro_release::fetch::Source::github(),
+                        std::time::Duration::from_secs(300),
+                    ),
+                    verifier: Box::new(verifier),
+                }),
+                Err(e) => {
+                    eprintln!("metro-runner: warning: self-update unavailable: {e}");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+    let updates = SelfUpdate::new(install, channel, cfg.self_update, updater);
+    eprintln!(
+        "metro-runner: install={} channel={} self-update={}",
+        updates.install.as_str(),
+        channel.as_str(),
+        if updates.enabled { "on" } else { "off" }
+    );
+    updates
+}
 
 extern "C" fn on_signal(_: libc::c_int) {
     if metro_runner::SHUTDOWN.swap(true, Ordering::SeqCst) {
@@ -76,6 +113,39 @@ fn warn_nested_docker(cfg: &Config) {
 }
 
 fn main() -> ExitCode {
+    let check_start = match std::env::args_os().nth(1) {
+        None => false,
+        Some(a) if a == "--check-start" && std::env::args_os().count() == 2 => true,
+        Some(_) => {
+            eprintln!(
+                "metro-runner: usage: metro-runner [--check-start] (configured by environment)"
+            );
+            return ExitCode::from(2);
+        }
+    };
+    // A managed runner counts its starts first, before anything that could
+    // fail, so a crash-looping new version is rolled back (see `update`).
+    let install = update::detect_current();
+    if !check_start
+        && let InstallKind::Managed { root } = &install
+        && let Some(own) = metro_release::Version::this_build()
+    {
+        match update::on_start(root, &own) {
+            Ok(StartAction::Continue) => {}
+            Ok(StartAction::RollBack(switch)) => {
+                eprintln!(
+                    "metro-runner: {own} failed to start {} times after an update; going back to the previous version",
+                    update::MAX_STARTS
+                );
+                let e = switch.exec();
+                eprintln!("metro-runner: could not start the previous version: {e}");
+            }
+            Err(e) => eprintln!(
+                "metro-runner: warning: update bookkeeping failed: {}",
+                e.kind()
+            ),
+        }
+    }
     let cfg = match Config::from_env() {
         Ok(c) => c,
         Err(e) => {
@@ -109,6 +179,14 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    if check_start {
+        // Config, workspace and docker preflight passed; no server contact.
+        eprintln!(
+            "metro-runner {}: start check passed",
+            env!("CARGO_PKG_VERSION")
+        );
+        return ExitCode::SUCCESS;
+    }
     install_signal_handlers();
 
     let sandbox = match &cfg.sandbox {
@@ -151,6 +229,7 @@ fn main() -> ExitCode {
         eprintln!("metro-runner: warning: workspace.check/workspace.mcp {why}");
     }
 
+    let updates = self_update(install, &cfg);
     let client = ServerClient::new(&cfg);
     let poll = cfg.poll_interval;
     let cfg = Arc::new(cfg);
@@ -158,6 +237,7 @@ fn main() -> ExitCode {
         Opened::Dedicated(ws) => Runner::new(client, Registry::standard(cfg, Arc::new(ws)), poll),
         Opened::Reusable(roots) => Runner::per_space(client, cfg, Arc::new(roots), poll),
     };
+    runner = runner.with_updates(updates);
     runner.run();
     ExitCode::SUCCESS
 }

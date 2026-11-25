@@ -64,6 +64,10 @@ pub mod env {
     pub const SANDBOX_USER: &str = "METRO_SANDBOX_USER";
     pub const SANDBOX_TMPFS_SIZE: &str = "METRO_SANDBOX_TMPFS_SIZE";
     pub const DOCKER_BIN: &str = "METRO_DOCKER_BIN";
+    /// `1`: this host lets a managed (script-installed) runner update
+    /// itself when its manager asks in Metro. Written by
+    /// `install-metro-runner-linux.sh configure --self-update on|off`.
+    pub const SELF_UPDATE: &str = "METRO_RUNNER_SELF_UPDATE";
 }
 
 #[derive(Debug)]
@@ -133,6 +137,9 @@ pub struct Config {
     pub mcp_argv: Option<Vec<String>>,
     pub mcp_timeout: Duration,
     pub sandbox: Sandbox,
+    /// `METRO_RUNNER_SELF_UPDATE`: the host's opt-in to self-update. Only
+    /// effective for a managed install of a release build (see `update`).
+    pub self_update: bool,
 }
 
 impl Config {
@@ -288,6 +295,7 @@ impl Config {
             mcp_argv,
             mcp_timeout,
             sandbox,
+            self_update: parse_bool(get(env::SELF_UPDATE).as_deref(), env::SELF_UPDATE)?,
         })
     }
 }

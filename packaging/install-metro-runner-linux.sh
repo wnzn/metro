@@ -20,7 +20,7 @@ usage() {
 Usage:
   install-metro-runner-linux.sh install   --archive FILE [--sha256 HEX | --checksum-file FILE]
   install-metro-runner-linux.sh update    --archive FILE [--sha256 HEX | --checksum-file FILE]
-  install-metro-runner-linux.sh configure --server-url URL --workspace DIR --token-file FILE
+  install-metro-runner-linux.sh configure --server-url URL --workspace DIR --token-file FILE [--self-update on|off]
   install-metro-runner-linux.sh run         (runs the runner in the foreground)
   install-metro-runner-linux.sh install-service   (writes a systemd --user unit; does not start it)
   install-metro-runner-linux.sh doctor
@@ -34,6 +34,12 @@ Space's files in spaces/<space-id>/ inside it. It is never deleted.
 --token-file is a regular file owned by you with mode 600 holding the runner
 token from Metro. Only its path is stored; the token is read when the runner
 starts.
+--self-update on lets the runner update itself when the runner's manager
+clicks Update in Metro: it downloads the release from GitHub and checks its
+Sigstore signature and checksums itself before switching. The Metro server
+only says which version; it never sends a download link or code. New
+configurations default to on; reconfiguring keeps the earlier choice (off
+when there was none).
 
 Uninstall keeps your configuration (unless --purge-config), the workspace and
 the token file.
@@ -57,7 +63,7 @@ unit_file=$config_home/systemd/user/$UNIT
 
 action=${1:-}
 [ $# -gt 0 ] && shift
-archive='' sha='' checksum_file='' server_url='' workspace='' token_file='' purge=0
+archive='' sha='' checksum_file='' server_url='' workspace='' token_file='' purge=0 self_update=
 while [ $# -gt 0 ]; do
     case "$1" in
         --archive) [ $# -ge 2 ] || die "--archive needs a file"; archive=$2; shift 2 ;;
@@ -67,6 +73,10 @@ while [ $# -gt 0 ]; do
         --workspace) [ $# -ge 2 ] || die "--workspace needs a directory"; workspace=$2; shift 2 ;;
         --token-file) [ $# -ge 2 ] || die "--token-file needs a file"; token_file=$2; shift 2 ;;
         --purge-config) purge=1; shift ;;
+        --self-update)
+            [ $# -ge 2 ] || die "--self-update needs on or off"
+            case "$2" in on|off) self_update=$2 ;; *) die "--self-update must be on or off" ;; esac
+            shift 2 ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; die "unknown option: $1" ;;
     esac
@@ -208,7 +218,7 @@ check_plain_value() { # values go into env and unit files unquoted-safe
 }
 
 # Reads runner.env: KEY="value" lines for a fixed set of keys, no shell eval.
-ALLOWED_KEYS='METRO_SERVER_URL METRO_WORKSPACE METRO_RUNNER_TOKEN_FILE METRO_POLL_INTERVAL_MS METRO_HTTP_TIMEOUT_SECS METRO_CHECK_ARGV METRO_CHECK_TIMEOUT_SECS METRO_MCP_ARGV METRO_MCP_TIMEOUT_SECS METRO_SANDBOX METRO_SANDBOX_IMAGE METRO_SANDBOX_MEMORY METRO_SANDBOX_CPUS METRO_SANDBOX_PIDS METRO_SANDBOX_USER METRO_SANDBOX_TMPFS_SIZE METRO_DOCKER_BIN'
+ALLOWED_KEYS='METRO_SERVER_URL METRO_WORKSPACE METRO_RUNNER_TOKEN_FILE METRO_POLL_INTERVAL_MS METRO_HTTP_TIMEOUT_SECS METRO_CHECK_ARGV METRO_CHECK_TIMEOUT_SECS METRO_MCP_ARGV METRO_MCP_TIMEOUT_SECS METRO_SANDBOX METRO_SANDBOX_IMAGE METRO_SANDBOX_MEMORY METRO_SANDBOX_CPUS METRO_SANDBOX_PIDS METRO_SANDBOX_USER METRO_SANDBOX_TMPFS_SIZE METRO_DOCKER_BIN METRO_RUNNER_SELF_UPDATE'
 
 load_config() {
     [ -f "$config" ] || die "not configured: run '$PROG configure --server-url URL --workspace DIR --token-file FILE'"
@@ -241,6 +251,19 @@ configure() {
     fi
     [ "$(stat -c '%u' -- "$workspace")" = "$(id -u)" ] || die "workspace must be owned by you: $workspace"
     check_token_file "$token_file"
+    # Self-update: explicit choice; else keep the earlier one; else on for a
+    # new configuration and off for one made before this option existed.
+    if [ -z "$self_update" ]; then
+        if [ -f "$config" ]; then
+            case "$(grep -E '^METRO_RUNNER_SELF_UPDATE=' -- "$config" 2>/dev/null | tail -n1)" in
+                *'"1"'|*=1) self_update=on ;;
+                *) self_update=off ;;
+            esac
+        else
+            self_update=on
+        fi
+    fi
+    case "$self_update" in on) self_update_value=1 ;; *) self_update_value=0 ;; esac
     mkdir -p -- "$config_dir"
     chmod 700 -- "$config_dir"
     tmp=$(mktemp -- "$config_dir/.runner.env.XXXXXX")
@@ -250,12 +273,18 @@ configure() {
         printf 'METRO_SERVER_URL="%s"\n' "$server_url"
         printf 'METRO_WORKSPACE="%s"\n' "$workspace"
         printf 'METRO_RUNNER_TOKEN_FILE="%s"\n' "$token_file"
+        printf 'METRO_RUNNER_SELF_UPDATE="%s"\n' "$self_update_value"
     } >"$tmp"
     chmod 600 -- "$tmp"
     mv -f -- "$tmp" "$config"
     trap - EXIT
     say "Saved $config"
     say "The runner keeps each attached Space's files in $workspace/spaces/<space-id>/."
+    if [ "$self_update" = on ]; then
+        say "Self-update is on: when you click Update for this runner in Metro, it downloads that release from GitHub, verifies its signature itself and restarts. Turn it off with: $PROG configure ... --self-update off"
+    else
+        say "Self-update is off: update this runner with '$PROG update --archive ...'."
+    fi
     case "$server_url" in http://*) say "Note: the loopback port must stay the same; a server that picks a new port each start needs reconfiguring." ;; esac
 }
 
@@ -423,7 +452,10 @@ case "$action" in
     doctor) doctor ;;
     status)
         if [ -L "$root/current" ]; then say "installed: $(readlink -- "$root/current") in $root"; else say "not installed in $root"; fi
-        if [ -f "$config" ]; then say "settings: $config"; else say "not configured"; fi ;;
+        if [ -f "$config" ]; then say "settings: $config"; else say "not configured"; fi
+        if [ -f "$config" ] && grep -qE '^METRO_RUNNER_SELF_UPDATE="?1"?$' -- "$config"; then say "self-update: on"; else say "self-update: off"; fi
+        if [ -f "$root/.update-pending.json" ]; then say "update in progress: $(cat -- "$root/.update-pending.json")"; fi
+        if [ -f "$root/.update-failed.json" ]; then say "last self-update failed: $(cat -- "$root/.update-failed.json")"; fi ;;
     uninstall) uninstall_runner ;;
     -h|--help|help) usage ;;
     '') usage >&2; exit 2 ;;

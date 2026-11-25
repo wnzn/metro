@@ -130,6 +130,7 @@ pub enum CheckOutcome {
     Newer(crate::release::VerifiedRelease),
 }
 
+#[cfg(feature = "async")]
 fn unverified_version(manifest: &[u8]) -> Result<Version, Error> {
     crate::manifest::parse(manifest).map(|m| m.version)
 }

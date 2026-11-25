@@ -16,10 +16,13 @@ name = "metro_runner"
 path = "src/lib.rs"
 
 [dependencies]
+# Self-update: verifies a release itself (Sigstore + SHA256SUMS + RELEASE.json).
+metro-release = { path = "../release", features = ["blocking"] }
 libc = "0.2.180"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
 
 [dev-dependencies]
+metro-release = { path = "../release", features = ["blocking", "testing"] }
 tempfile = "3.27.0"

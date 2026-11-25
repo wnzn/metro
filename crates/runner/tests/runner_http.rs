@@ -35,9 +35,41 @@ fn idle_on_204_with_bearer_auth() {
     let reqs = srv.requests();
     assert_eq!(reqs[0].method, "POST");
     assert_eq!(reqs[0].path, "/v1/runner/claim");
-    assert_eq!(reqs[0].body, "{}");
+    // The claim body reports this runner's version and install kind only.
+    let body: serde_json::Value = serde_json::from_str(&reqs[0].body).unwrap();
+    assert_eq!(body["runner"]["version"], env!("CARGO_PKG_VERSION"));
+    assert_eq!(body["runner"]["install"], "unmanaged");
+    assert_eq!(body["runner"]["self_update"], false);
+    assert_eq!(body.as_object().unwrap().len(), 1);
+    assert!(!reqs[0].body.contains("test-token"));
     assert_eq!(reqs[0].headers["authorization"], "Bearer test-token");
     assert_eq!(reqs[0].headers["content-type"], "application/json");
+}
+
+#[test]
+fn update_header_is_read_and_strictly_parsed() {
+    let ws = tempfile::tempdir().unwrap();
+    for (value, expected) in [
+        ("0.5.1", Some("0.5.1")),
+        ("v0.5.1", None),
+        ("0.5.1-rc.1", None),
+        ("https://evil.example/runner", None),
+    ] {
+        let v = value.to_string();
+        let srv = MockServer::start(move |_, _| {
+            let mut r = Resp::new(204, "");
+            r.headers.push(("X-Metro-Runner-Update".into(), v.clone()));
+            r
+        });
+        let mut r = runner_for(&srv.url, ws.path(), &[]);
+        assert_eq!(r.step(), Step::Idle);
+        assert_eq!(r.update_request.as_deref(), expected, "{value}");
+        // An unmanaged runner ignores it (no request is made).
+        if let Some(v) = r.update_request.take() {
+            r.updates.on_request(&v);
+        }
+        assert_eq!(srv.requests().len(), 1);
+    }
 }
 
 #[test]

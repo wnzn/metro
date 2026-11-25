@@ -424,6 +424,31 @@ class RunnerInstallerTests(unittest.TestCase):
         r = self.box.run(RUNNER, "run")
         self.assertIn("unsupported setting METRO_RUNNER_TOKEN", r.stderr)
 
+    def test_self_update_choice(self):
+        self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
+        # A new configuration: on, with a line saying so.
+        r = self.configure()
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="1"', self.config.read_text())
+        self.assertIn("Self-update is on", r.stdout)
+        self.assertIn("self-update: on", self.box.run(RUNNER, "status", check=True).stdout)
+        # Explicit off, then reconfiguring keeps it off.
+        args = ["configure", "--server-url", "https://metro.example", "--workspace", self.ws, "--token-file", self.token]
+        self.assertEqual(self.box.run(RUNNER, *args, "--self-update", "off").returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="0"', self.config.read_text())
+        self.assertEqual(self.configure().returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="0"', self.config.read_text())
+        self.assertIn("self-update: off", self.box.run(RUNNER, "status", check=True).stdout)
+        # A configuration from before this option stays off.
+        self.config.write_text(self.config.read_text().replace('METRO_RUNNER_SELF_UPDATE="0"\n', ""))
+        self.assertEqual(self.configure().returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="0"', self.config.read_text())
+        # Explicit on, and the run passes it to the runner.
+        self.assertEqual(self.box.run(RUNNER, *args, "--self-update", "on").returncode, 0)
+        self.assertIn('METRO_RUNNER_SELF_UPDATE="1"', self.config.read_text())
+        self.assertEqual(self.box.run(RUNNER, "run").returncode, 0)
+        self.assertIn("--self-update must be on or off", self.box.run(RUNNER, *args, "--self-update", "yes").stderr)
+
     def test_refuses_desktop_archive_and_bad_checksum(self):
         desk = build_archive(self.root, "Metro-runner-0.3.2-linux-x64", runner_files(FAKE_RUNNER),
                              "desktop", "linux-x64", "0.3.2")
