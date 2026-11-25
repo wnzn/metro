@@ -321,10 +321,32 @@ async fn cancelled(mut cancel: watch::Receiver<bool>) {
 
 enum Outcome {
     Completed(String),
-    /// The text shown in the room, and the allowlisted monitoring code.
-    Failed(String, Code),
+    /// The full text, the allowlisted monitoring code, and whether the model
+    /// or its connection failed (see [`model_failure`]).
+    Failed(String, Code, bool),
     Cancelled,
 }
+
+/// Whether a run failed because of its model or the connection serving it:
+/// a provider error, a transport error, or a refused request (a revoked
+/// share, a lost membership, a device's withdrawn access), as Rig reports
+/// them, typed or relayed. Their text can name the initiator's endpoint,
+/// provider, account or access, so a Space room never shows it. A tool's own
+/// failure and the run's limits are not about the connection.
+fn model_failure(e: &PromptError) -> bool {
+    match e {
+        PromptError::Provider(_) => true,
+        PromptError::Report(report) => !matches!(report.kind, rig_core::ErrorKind::Tool(_)),
+        _ => false,
+    }
+}
+
+/// What a Space room shows when a run's model failed or stopped being
+/// available, whatever the cause: other members can't tell a revoked share
+/// from an upstream failure. The initiator gets the reason privately
+/// ([`crate::orchestration::RunFailure`]).
+pub const MODEL_STOPPED_IN_ROOM: &str =
+    "The agent stopped: the sender's model failed or is no longer available to this run.";
 
 /// The monitoring code of a failed run, from the error's type and
 /// classification only; its text is never recorded.
@@ -408,11 +430,13 @@ async fn drive(
                 Outcome::Failed(
                     truncate(&format!("The agent failed: {e}"), 2_000),
                     failure_code(&e),
+                    model_failure(&e),
                 )
             }
             Err(_) => Outcome::Failed(
                 "The agent took too long and was stopped.".to_owned(),
                 Code::AgentTimedOut,
+                false,
             ),
         },
         () = cancel => Outcome::Cancelled,
@@ -607,6 +631,81 @@ pub async fn start_room_run(
     Ok(info)
 }
 
+/// The text of a model failure for the person whose run it was. On a
+/// connection someone shared with them, the provider's own text can name
+/// the owner's endpoint, account or key, which a borrower must never see:
+/// they get the failure's fixed category instead.
+async fn model_error_text(
+    state: &AppState,
+    user_id: &str,
+    route: &Route,
+    text: String,
+    code: Code,
+) -> String {
+    let Some(id) = route.note.connection_id.clone() else {
+        // The person's own default, or the operator's model.
+        return text;
+    };
+    let user = user_id.to_owned();
+    let owned = state
+        .db
+        .call(move |db| Ok(crate::providers::store::get(&db.lock(), &user, &id)?.is_some()))
+        .await
+        .unwrap_or(false);
+    if owned {
+        text
+    } else {
+        format!(
+            "The agent failed: {} The model connection is shared with you, so its provider's \
+             details aren't shown.",
+            code.summary()
+        )
+    }
+}
+
+/// Why `initiator`'s run in `space_id` on `route` failed, for them alone:
+/// rechecked as a new turn would be (membership, then the route's
+/// connection), so a lost grant says what to fix; otherwise the model's own
+/// error, `text`.
+async fn private_failure(
+    state: &AppState,
+    space_id: &str,
+    initiator: &Author,
+    route: &Route,
+    text: String,
+) -> crate::orchestration::RunFailure {
+    use crate::model_routing::AddressingNote;
+    use crate::orchestration::RunFailure;
+    if ensure_member(state, space_id, initiator).await.is_err() {
+        return RunFailure {
+            reason: "not_member".to_owned(),
+            message: "The agent stopped: you are no longer a member of this Space.".to_owned(),
+        };
+    }
+    let user_id = initiator.id.clone().unwrap_or_default();
+    let mut recheck = route.clone();
+    match route_model(state, &user_id, Some(space_id), &mut recheck).await {
+        Err(Refusal {
+            note:
+                Some(AddressingNote::ModelUnavailable {
+                    reason, message, ..
+                }),
+            ..
+        }) => RunFailure {
+            reason: reason.to_owned(),
+            message: format!("The agent stopped. {message}"),
+        },
+        Err(refusal) => RunFailure {
+            reason: "not_allowed".to_owned(),
+            message: format!("The agent stopped. {}", refusal.private()),
+        },
+        Ok(_) => RunFailure {
+            reason: "model_error".to_owned(),
+            message: text,
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn execute_room_run(
     state: &AppState,
@@ -646,6 +745,7 @@ async fn execute_room_run(
             Outcome::Failed(
                 "The agent could not read the room history.".to_owned(),
                 Code::AgentHistoryUnavailable,
+                false,
             )
         }
         Ok((earlier, paired)) => {
@@ -737,10 +837,21 @@ async fn execute_room_run(
             ),
             Reply::ReactionOnly => (RunStatus::Completed, None),
         },
-        Outcome::Failed(text, code) => {
+        Outcome::Failed(text, code, false) => {
             // Space-scoped, owner-readable; the room keeps the full text.
             state.monitor_space(space_id, code).await;
             (RunStatus::Failed, Some((kind::ERROR, text)))
+        }
+        Outcome::Failed(text, code, true) => {
+            state.monitor_space(space_id, code).await;
+            let user_id = initiator.id.clone().unwrap_or_default();
+            let text = model_error_text(state, &user_id, route, text, code).await;
+            let failure = private_failure(state, space_id, initiator, route, text).await;
+            state.runs.set_failure(run_id, failure);
+            (
+                RunStatus::Failed,
+                Some((kind::ERROR, MODEL_STOPPED_IN_ROOM.to_owned())),
+            )
         }
         Outcome::Cancelled => (
             RunStatus::Cancelled,
@@ -1353,8 +1464,12 @@ async fn execute_personal_run(
             activity::COMPLETED
         }
         // Only the person whose Chat this is can read it, and only the code.
-        Outcome::Failed(text, code) => {
+        Outcome::Failed(text, code, model) => {
             state.monitor_personal(&user_id, code).await;
+            let text = match model {
+                true => model_error_text(&state, &user_id, &route, text, code).await,
+                false => text,
+            };
             tagged(kind::ERROR, text).await;
             activity::FAILED
         }

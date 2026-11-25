@@ -104,6 +104,23 @@ struct Entry {
     info: RunInfo,
     /// Present while the run is `Running`; taken when it ends.
     cancel: Option<watch::Sender<bool>>,
+    /// Why the run failed, in full, for its initiator only. Never in
+    /// [`RunInfo`], so listing or serializing runs can't expose it.
+    failure: Option<RunFailure>,
+}
+
+/// The full reason a run failed, kept in memory with the run (never
+/// stored) and shown only to the person who started it
+/// (`GET /v1/runs`, `GET /v1/runs/{id}`). In a Space room the run posted
+/// a generic error instead.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct RunFailure {
+    /// `model_error` (the model or its provider failed), or why the
+    /// initiator's model is no longer usable by them: `not_member`,
+    /// `not_allowed`, `busy`, `offline`, `misconfigured` or `internal`.
+    pub reason: String,
+    /// What happened, for the initiator.
+    pub message: String,
 }
 
 #[derive(Default)]
@@ -243,6 +260,7 @@ impl RunRegistry {
         inner.entries.push_back(Entry {
             info: info.clone(),
             cancel: Some(tx),
+            failure: None,
         });
         Ok((info, rx))
     }
@@ -264,6 +282,24 @@ impl RunRegistry {
         entry.info.status = status;
         entry.cancel = None;
         inner.evict(self.max_history);
+    }
+
+    /// Keep the initiator-only reason a run failed (see [`RunFailure`]).
+    /// Unknown ids are ignored.
+    pub fn set_failure(&self, id: &str, failure: RunFailure) {
+        if let Some(entry) = self.lock().find(id) {
+            entry.failure = Some(failure);
+        }
+    }
+
+    /// The initiator-only failure of run `id`. The caller must have checked
+    /// that the requester is the run's `actor`.
+    pub fn failure(&self, id: &str) -> Option<RunFailure> {
+        self.lock()
+            .entries
+            .iter()
+            .find(|e| e.info.id == id)
+            .and_then(|e| e.failure.clone())
     }
 
     /// Every run held, newest first. Unfiltered: see the module docs.

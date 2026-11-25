@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use axum::Json;
 use axum::http::HeaderMap;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use base64::Engine;
 use metro_server::auth::{AuthFailure, AuthFuture, HumanAuth, UserIdentity};
@@ -82,7 +83,7 @@ impl Fixture {
     async fn start() -> Self {
         let seen = Arc::new(Mutex::new(Vec::<Seen>::new()));
         let gate = Arc::new(tokio::sync::RwLock::new(()));
-        let (g1, g2) = (gate.clone(), gate.clone());
+        let (g1, g2, g3) = (gate.clone(), gate.clone(), gate.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let record = |seen: &Arc<Mutex<Vec<Seen>>>, path: &str, h: &HeaderMap, body: Value| {
@@ -154,9 +155,44 @@ impl Fixture {
             .route(
                 "/v1/chat/completions",
                 post(move |h: HeaderMap, Json(body): Json<Value>| {
-                    let seen = s4.clone();
+                    let (seen, gate) = (s4.clone(), g3.clone());
                     async move {
                         record(&seen, "/v1/chat/completions", &h, body.clone());
+                        let messages = body["messages"].as_array().cloned().unwrap_or_default();
+                        let asked = messages
+                            .iter()
+                            .rev()
+                            .find(|m| m["role"] == "user")
+                            .map(|m| m["content"].to_string())
+                            .unwrap_or_default();
+                        let replied = messages.iter().any(|m| m["role"] == "tool");
+                        // A two-request run: a tool call first (held at the
+                        // gate), so a share can end between the requests.
+                        if asked.contains("[tool]") && !replied {
+                            let _open = gate.read().await;
+                            let tool = body["tools"][0]["function"]["name"].clone();
+                            return Json(json!({
+                                "id": "chatcmpl-1", "object": "chat.completion", "created": 0,
+                                "model": body["model"],
+                                "choices": [{"index": 0, "finish_reason": "tool_calls",
+                                             "message": {"role": "assistant", "content": null,
+                                                         "tool_calls": [{"id": "call_1", "type": "function",
+                                                             "function": {"name": tool, "arguments": "{}"}}]}}],
+                                "usage": {"prompt_tokens": 1, "completion_tokens": 1,
+                                          "total_tokens": 2}
+                            }))
+                            .into_response();
+                        }
+                        // An upstream failure whose text names the owner's
+                        // account and endpoint.
+                        if asked.contains("[fail]") && !asked.contains("[tool]") {
+                            return (
+                                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                                Json(json!({"error": {"message":
+                                    "quota exceeded for org-alice-billing"}})),
+                            )
+                                .into_response();
+                        }
                         Json(json!({
                             "id": "chatcmpl-1", "object": "chat.completion", "created": 0,
                             "model": body["model"],
@@ -165,6 +201,7 @@ impl Fixture {
                             "usage": {"prompt_tokens": 1, "completion_tokens": 1,
                                       "total_tokens": 2}
                         }))
+                        .into_response()
                     }
                 }),
             );
@@ -1364,4 +1401,226 @@ async fn borrowed_server_typed_answers_are_withheld_after_a_revoke_mid_call() {
 
     // The owner's own calls are unaffected by any of this.
     s.decide("alice", None, &s1).await.unwrap();
+}
+
+/// The first error event after event `after` in `sid`'s lobby, as `token`
+/// reads it.
+async fn error_after(s: &Server, token: &str, sid: &str, after: i64) -> Value {
+    for _ in 0..400 {
+        let (_, events) = s
+            .get(token, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
+            .await;
+        if let Some(e) = events["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"].as_i64().unwrap() > after && e["kind"] == "error")
+        {
+            return e.clone();
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    panic!("no error after {after}");
+}
+
+/// The run of `token`'s view of `GET /v1/runs` whose task contains `task`.
+async fn run_for(s: &Server, token: &str, task: &str) -> Value {
+    let (status, runs) = s.get(token, "/v1/runs").await;
+    assert_eq!(status, StatusCode::OK, "{runs}");
+    runs["runs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["task"].as_str().unwrap().contains(task))
+        .cloned()
+        .unwrap_or_else(|| panic!("no run for {task}: {runs}"))
+}
+
+#[tokio::test]
+async fn a_share_revoked_mid_run_reads_like_an_upstream_failure_to_the_room() {
+    let s = Server::start().await;
+    let id = s.connect(ALICE, "custom", "alice-model", true).await;
+    let sid = s.space(ALICE, "mid-run", &["bob", "carol"]).await;
+    let (status, body) = s
+        .share(
+            ALICE,
+            &id,
+            json!({"visibility": "spaces", "space_ids": [sid]}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    // Bob answers with Alice's shared connection in this Space.
+    let (status, body) = s
+        .put(
+            BOB,
+            &format!("/v1/spaces/{sid}/prefs"),
+            json!({"default_model": {"provider_connection_id": id}}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let lobby = format!("/v1/spaces/{sid}/rooms/lobby/messages");
+
+    // An upstream failure.
+    let (status, failed) = s
+        .post(BOB, &lobby, json!({"text": "@agent [fail] first"}))
+        .await;
+    assert!(status.is_success(), "{failed}");
+    let upstream = error_after(&s, CAROL, &sid, failed["id"].as_i64().unwrap()).await;
+
+    // The share ends between the run's two model requests.
+    let held = s.fixture.gate.write().await;
+    let (status, asked) = s
+        .post(BOB, &lobby, json!({"text": "@agent [tool] second"}))
+        .await;
+    assert!(status.is_success(), "{asked}");
+    for _ in 0..400 {
+        if s.fixture
+            .seen("/v1/chat/completions")
+            .iter()
+            .any(|c| c.body.to_string().contains("[tool] second"))
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    let (status, _) = s.share(ALICE, &id, json!({"visibility": "personal"})).await;
+    assert_eq!(status, StatusCode::OK);
+    drop(held);
+    let revoked = error_after(&s, CAROL, &sid, asked["id"].as_i64().unwrap()).await;
+    let requests = s
+        .fixture
+        .seen("/v1/chat/completions")
+        .iter()
+        .filter(|c| c.body.to_string().contains("[tool] second"))
+        .count();
+    assert_eq!(requests, 1, "the request after the revoke was never sent");
+
+    // Carol (and Alice, the Space owner) can't tell the two apart.
+    assert_eq!(upstream["text"], revoked["text"]);
+    assert_eq!(
+        upstream["text"],
+        "The agent stopped: the sender's model failed or is no longer available to this run."
+    );
+    for token in [CAROL, ALICE] {
+        let (_, events) = s
+            .get(token, &format!("/v1/spaces/{sid}/rooms/lobby/events"))
+            .await;
+        let transcript = events.to_string();
+        for leak in [
+            "has ended",
+            "org-alice-billing",
+            "The agent failed",
+            "500",
+            s.fixture.base_url.as_str(),
+            "not_allowed",
+            "model_error",
+        ] {
+            assert!(!transcript.contains(leak), "{token}: {leak}");
+        }
+        // Their run views carry no reason.
+        for task in ["[fail] first", "[tool] second"] {
+            let run = run_for(&s, token, task).await;
+            assert_eq!(run["status"], "failed", "{run}");
+            assert!(run.get("failure").is_none(), "{token}: {run}");
+            let (status, one) = s
+                .get(token, &format!("/v1/runs/{}", run["id"].as_str().unwrap()))
+                .await;
+            assert_eq!(status, StatusCode::OK);
+            assert!(one.get("failure").is_none(), "{token}: {one}");
+        }
+    }
+
+    // Bob, who started both runs, learns each reason privately.
+    // The provider's own text is the owner's: a borrower gets its category.
+    let run = run_for(&s, BOB, "[fail] first").await;
+    assert_eq!(run["failure"]["reason"], "model_error", "{run}");
+    let message = run["failure"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("server error") && message.contains("shared with you"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("org-alice-billing") && !message.contains(&s.fixture.base_url),
+        "{message}"
+    );
+    let run = run_for(&s, BOB, "[tool] second").await;
+    assert_eq!(run["failure"]["reason"], "not_allowed", "{run}");
+    let message = run["failure"]["message"].as_str().unwrap();
+    assert!(message.starts_with("The agent stopped."), "{message}");
+    assert!(
+        message.contains("default model for this Space"),
+        "{message}"
+    );
+    let (status, one) = s
+        .get(BOB, &format!("/v1/runs/{}", run["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(one["failure"], run["failure"]);
+    assert!(!message.contains(ALICE_KEY));
+
+    // Someone outside the Space can't see the run at all.
+    s.remove_member(ALICE, &sid, "carol").await;
+    let (status, _) = s
+        .get(CAROL, &format!("/v1/runs/{}", run["id"].as_str().unwrap()))
+        .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn a_borrowers_chat_never_shows_the_owners_provider_text() {
+    let s = Server::start().await;
+    let id = s.connect(ALICE, "custom", "alice-model", true).await;
+    let (status, _) = s
+        .share(ALICE, &id, json!({"visibility": "organization"}))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = s
+        .put(
+            CAROL,
+            "/v1/model-routing",
+            json!({"enabled": true, "default_chat_id": id}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let ask = |token: &'static str| {
+        let s = &s;
+        async move {
+            let (status, sent) = s
+                .post(
+                    token,
+                    "/v1/chat/messages",
+                    json!({"text": "@agent [fail] hi"}),
+                )
+                .await;
+            assert!(status.is_success(), "{sent}");
+            for _ in 0..400 {
+                let (_, events) = s.get(token, "/v1/chat/events").await;
+                if let Some(e) = events["events"].as_array().unwrap().iter().find(|e| {
+                    e["id"].as_i64().unwrap() > sent["id"].as_i64().unwrap() && e["kind"] == "error"
+                }) {
+                    return e["text"].as_str().unwrap().to_owned();
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+            panic!("no error");
+        }
+    };
+    let carol = ask(CAROL).await;
+    assert!(
+        carol.contains("server error") && carol.contains("shared with you"),
+        "{carol}"
+    );
+    assert!(!carol.contains("org-alice-billing"), "{carol}");
+    assert!(!carol.contains(&s.fixture.base_url), "{carol}");
+    // The owner's own Chat keeps the provider's text.
+    let (status, body) = s
+        .put(
+            ALICE,
+            "/v1/model-routing",
+            json!({"enabled": true, "default_chat_id": id}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let alice = ask(ALICE).await;
+    assert!(alice.contains("org-alice-billing"), "{alice}");
 }

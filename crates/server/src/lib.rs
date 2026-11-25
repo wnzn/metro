@@ -231,6 +231,7 @@ pub fn router(state: AppState) -> Router {
             put(api::put_chat_reaction).delete(api::delete_chat_reaction),
         )
         .route("/v1/runs", get(api::list_runs))
+        .route("/v1/runs/{id}", get(api::get_run))
         .route("/v1/runs/{id}/stop", post(api::stop_run))
         .route(
             "/v1/runners",
