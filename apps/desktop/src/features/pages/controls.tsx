@@ -1,7 +1,7 @@
-import { cleanup, effect, signal, untracked } from "nsh";
+import { cleanup, signal } from "nsh";
 import type { TurnModelChoice } from "../../api/client";
 import type { Draft, PageDiagnostic } from "../../api/pages";
-import { hasSpace, goPages, refreshPages } from "../../pagesState";
+import { hasSpace, goPages, refreshPages, watchPageScope } from "../../pagesState";
 import { apiClient, sessionGuard, spaces } from "../../store";
 import { Action, Banner, Column, Field, Label, Row } from "../../ui";
 import { ComposerModelTrigger, ModelOptionPicker, ThinkingChoice } from "../../ui/composerModelTrigger";
@@ -40,47 +40,77 @@ export function Diagnostics(props: { items: PageDiagnostic[] }) {
 
 /** Same model options, provider grouping and thinking controls as the chat
  * composer, but with a separate per-form catalog and an explicit page scope. */
-function PageModel(props: { spaceId: string | null; choice: (result: { choice?: TurnModelChoice; error?: string }) => void }) {
+function createPageModel(scopeId: () => string | null) {
   const catalog = createComposerCatalog();
   const open = signal(false);
-  const current = () => catalog.current(props.spaceId);
-  const selected = () => catalog.selected(current());
-  const load = () => {
-    const client = apiClient(), scope = props.spaceId;
+  // Explicit intent lives outside the fetchable catalogue. A refresh, failed
+  // request, or lost share can remove options but can't choose Default.
+  const intent = signal<{ scope: string | null; choice: TurnModelChoice } | null>(null);
+  const pin = () => intent()?.scope === scopeId() ? intent()?.choice : undefined;
+  const current = () => catalog.current(scopeId());
+  const selected = () => {
+    const choice = pin();
+    return choice && current()?.targets.find(t => t.choice.connectionId === choice.connectionId && (t.choice.modelId ?? t.modelId) === choice.modelId);
+  };
+  let alive = true;
+  const load = async () => {
+    const client = apiClient(), scope = scopeId();
     if (!client || !hasSpace(scope)) return;
     const guard = sessionGuard(scope ?? undefined);
-    void catalog.load(scope, () => guard() && props.spaceId === scope && hasSpace(scope),
+    await catalog.load(scope, () => alive && guard() && scopeId() === scope && hasSpace(scope),
       () => client.availableCatalog(scope).then(result => result.models),
       () => client.providerCatalog().then(result => result.providers.map(({ id, name }) => ({ id, name }))));
   };
-  effect(() => {
-    const id = props.spaceId;
-    const visible = hasSpace(id);
-    untracked(() => { catalog.clear(); open.set(false); if (visible) props.choice({}); });
+  watchPageScope(scopeId, (_, visible, switched) => {
+    catalog.clear();
+    if (switched) { intent.set(null); open.set(false); }
+    if (visible && (open() || pin())) void load();
   });
-  effect(() => { const choice = catalog.choice(props.spaceId); untracked(() => props.choice(choice)); });
-  cleanup(catalog.clear);
+  cleanup(() => { alive = false; catalog.clear(); });
+  const error = () => {
+    if (!hasSpace(scopeId())) return "You no longer have access to this Space. Choose a different scope.";
+    const choice = pin(), target = selected();
+    if (!choice) return "";
+    if (current()?.phase === "loading") return "Checking your selected model…";
+    if (!target || (choice.reasoningEffort && !target.levels.includes(choice.reasoningEffort)))
+      return "The selected model or thinking level is unavailable. Open Model to choose again or explicitly select Default.";
+    return "";
+  };
+  const pick = (key: string, level?: string) => {
+    if (!key) { intent.set(null); return; }
+    const target = current()?.targets.find(t => t.key === key);
+    if (target && (!level || target.levels.includes(level))) {
+      intent.set({ scope: scopeId(), choice: { ...target.choice, modelId: target.choice.modelId ?? target.modelId, reasoningEffort: level } });
+    }
+  };
+  return { open, current, selected, pin, pick, error, load, alive: () => alive };
+}
+
+function PageModel(props: { model: ReturnType<typeof createPageModel>; disabled?: boolean }) {
+  const { open, current, selected, pin, pick, load } = props.model;
   return <Column gap={2}>
-    <Row><ComposerModelTrigger model={selected()?.model ?? (current()?.pin ? "Check selection" : null)}
-      thinking={current()?.pin?.reasoningEffort ?? "Provider default"} mark={selected()?.provider.mark ?? null}
+    <Row><ComposerModelTrigger model={selected()?.model ?? (pin() ? "Check selection" : null)}
+      thinking={pin()?.reasoningEffort ?? "Provider default"} mark={selected()?.provider.mark ?? null}
       accessibilityLabel="Model for building this page" onPress={() => {
+        if (props.disabled) return;
         open.set(!open());
-        if (open()) load();
+        if (open()) void load();
       }} /></Row>
     <If when={open()}>
       <If when={current()?.phase === "ready"} else={<Row gap={2} align="center">
         <Label variant="caption">{current()?.phase === "failed" ? "Could not load available models." : "Loading available models…"}</Label>
-        <If when={current()?.phase === "failed"}><Action compact label="Try again" onPress={load} /></If>
+        <If when={current()?.phase === "failed"}><Action compact label="Try again" onPress={() => void load()} /></If>
+        <If when={current()?.phase === "failed" && pin()}><Action compact label="Use Default model" disabled={props.disabled} onPress={() => pick("")} /></If>
       </Row>}>
-        <ModelOptionPicker testID="page-model-options" value={selected()?.key ?? (current()?.pin ? null : "")}
+        <ModelOptionPicker testID="page-model-options" value={selected()?.key ?? (pin() ? null : "")}
           options={[{ value: "", model: "Default model", title: "Default model", detail: "Your normal routing" },
             ...(current()?.targets ?? []).map(t => ({ value: t.key, model: t.model, modelId: t.modelId, provider: t.provider,
               detail: [t.connection, t.detail].filter(Boolean).join(" · "), title: t.label, thinking: t.levels.join(" · ") }))]}
-          onChange={key => { const s = current(); if (s) catalog.select(s, key || null); }} />
+          onChange={key => { if (!props.disabled) pick(key ?? ""); }} />
         <If when={selected()?.levels.length}>
-          <ThinkingChoice testID="page-model-thinking" value={current()?.pin?.reasoningEffort ?? ""}
+          <ThinkingChoice testID="page-model-thinking" value={pin()?.reasoningEffort ?? ""}
             options={[{ value: "", label: "Provider default" }, ...(selected()?.levels ?? []).map(level => ({ value: level, label: level }))]}
-            onChange={level => { const s = current(), key = selected()?.key; if (s && key) catalog.select(s, key, level || undefined); }} />
+            onChange={level => { const key = selected()?.key; if (key && !props.disabled) pick(key, level || undefined); }} />
         </If>
       </If>
     </If>
@@ -92,16 +122,27 @@ export function DraftPrompt(props: {
   onSubmit: (prompt: string, choice?: TurnModelChoice) => void;
 }) {
   const prompt = signal(props.initial ?? "");
-  const model = signal<{ choice?: TurnModelChoice; error?: string }>({});
-  const submit = () => {
-    if (!props.busy && prompt().trim() && !model().error && hasSpace(props.spaceId)) props.onSubmit(prompt().trim(), model().choice);
+  const checking = signal(false);
+  const model = createPageModel(() => props.spaceId);
+  const submit = async () => {
+    const text = prompt().trim(), choice = model.pin(), sid = props.spaceId;
+    if (props.busy || checking() || !text || model.error()) return;
+    if (!choice) { props.onSubmit(text); return; }
+    const grant = sessionGuard(sid ?? undefined);
+    checking.set(true);
+    try {
+      // A share, device or model list can change while this sheet stays open.
+      // Verify the explicit choice again; the server then checks at use time.
+      await model.load();
+      if (model.alive() && grant() && props.spaceId === sid && model.pin() === choice && !model.error()) props.onSubmit(text, choice);
+    } finally { if (model.alive()) checking.set(false); }
   };
   return <Column gap={2}>
     <Field testID="page-prompt" accessibilityLabel={props.label ?? "Describe the page you want"} multiline value={prompt()}
-      placeholder={props.label ?? "Describe the page you want"} onChange={prompt.set} maxLength={4000} disabled={props.busy} />
-    <PageModel spaceId={props.spaceId} choice={model.set} />
-    <If when={model().error}>{message => <Label color="warning">{message()}</Label>}</If>
+      placeholder={props.label ?? "Describe the page you want"} onChange={prompt.set} maxLength={4000} disabled={props.busy || checking()} />
+    <PageModel model={model} disabled={props.busy || checking()} />
+    <If when={model.error()}>{message => <Label color="warning">{message()}</Label>}</If>
     <Row justify="end"><Action testID="page-generate" label="Generate draft" busyLabel="Starting…" variant="primary"
-      disabled={!prompt().trim() || !!model().error || !hasSpace(props.spaceId)} busy={props.busy} onPress={submit} /></Row>
+      disabled={!prompt().trim() || !!model.error()} busy={props.busy || checking()} onPress={() => void submit()} /></Row>
   </Column>;
 }

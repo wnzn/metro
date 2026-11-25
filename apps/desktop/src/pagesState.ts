@@ -1,4 +1,4 @@
-import { batch, computed, signal } from "nsh";
+import { batch, computed, effect, signal, untracked } from "nsh";
 import type { PageMeta } from "./api/pages";
 import { ApiError, apiClient, describe, disconnect, isAborted, mainPlace, onSessionEnd, openPlace, sessionGuard, spaces } from "./store";
 
@@ -21,6 +21,27 @@ let listRequest = 0;
 
 export function hasSpace(id?: string | null) {
   return !id || spaces().some(s => s.id === id);
+}
+
+export function spaceGrants() {
+  return new Map(spaces().map(s => [s.id, sessionGuard(s.id)]));
+}
+
+export function sameSpaceGrants(previous: ReturnType<typeof spaceGrants>, current: ReturnType<typeof spaceGrants>) {
+  return previous.size === current.size && [...previous].every(([id, valid]) => current.has(id) && valid());
+}
+
+/** The Space list gets fresh objects even when membership didn't change.
+ * Forms react to their selected Space and grant, not to list identity. */
+export function watchPageScope(scope: () => string | null, changed: (id: string | null, visible: boolean, switchScope: boolean) => void) {
+  let previous: { id: string | null; visible: boolean; grant: () => boolean } | undefined;
+  effect(() => {
+    const id = scope(), visible = hasSpace(id);
+    const switchScope = previous?.id !== id;
+    if (previous && !switchScope && visible === previous.visible && previous.grant()) return;
+    previous = { id, visible, grant: sessionGuard(id ?? undefined) };
+    untracked(() => changed(id, visible, switchScope));
+  });
 }
 
 export function scopeVisible(page: { scope: string; space_id: string | null }) {
@@ -62,7 +83,7 @@ export async function refreshPages() {
   const valid = () => currentSession() && index === listRequest;
   // Do not accept entries from a Space the user joined again while this
   // response was in flight; its epoch no longer matches.
-  const grants = new Map(spaces().map(s => [s.id, sessionGuard(s.id)]));
+  const grants = spaceGrants();
   pagesLoading.set(true);
   pagesError.set("");
   try {
