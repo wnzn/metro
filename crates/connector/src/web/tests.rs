@@ -39,6 +39,8 @@ struct Reply {
     body: Vec<u8>,
     /// Wait this long before answering.
     delay_ms: u64,
+    /// Hold the answer until the test releases it.
+    hold: Option<Arc<tokio::sync::Notify>>,
 }
 
 fn reply(status: u16, body: Value) -> Reply {
@@ -47,6 +49,7 @@ fn reply(status: u16, body: Value) -> Reply {
         headers: vec![("content-type", "application/json".into())],
         body: body.to_string().into_bytes(),
         delay_ms: 0,
+        hold: None,
     }
 }
 
@@ -72,7 +75,10 @@ impl Fixture {
             move |method: Method, uri: Uri, headers: HeaderMap, body: Bytes| {
                 let f = state.clone();
                 async move {
-                    let (resp, delay) = f.handle(method, uri, headers, body);
+                    let (resp, delay, hold) = f.handle(method, uri, headers, body);
+                    if let Some(h) = hold {
+                        h.notified().await;
+                    }
                     tokio::time::sleep(Duration::from_millis(delay)).await;
                     resp
                 }
@@ -84,7 +90,13 @@ impl Fixture {
         (f, base)
     }
 
-    fn handle(&self, method: Method, uri: Uri, headers: HeaderMap, body: Bytes) -> (Response, u64) {
+    fn handle(
+        &self,
+        method: Method,
+        uri: Uri,
+        headers: HeaderMap,
+        body: Bytes,
+    ) -> (Response, u64, Option<Arc<tokio::sync::Notify>>) {
         let body = String::from_utf8_lossy(&body).to_string();
         let path = uri.path().to_owned();
         let rpc = serde_json::from_str::<Value>(&body)
@@ -127,6 +139,7 @@ impl Fixture {
                 headers: vec![],
                 body: vec![],
                 delay_ms: 0,
+                hold: None,
             },
             _ => reply(500, json!({"error": "unscripted"})),
         };
@@ -142,7 +155,7 @@ impl Fixture {
         for (k, v) in r.headers {
             resp.headers_mut().insert(k, v.parse().unwrap());
         }
-        (resp, r.delay_ms)
+        (resp, r.delay_ms, r.hold)
     }
 
     fn push(&self, key: &str, r: Reply) {
@@ -163,6 +176,25 @@ impl Fixture {
             .into_iter()
             .filter(|s| s.path.starts_with(prefix))
             .collect()
+    }
+}
+
+/// Hold `r` until the returned handle is notified.
+fn hold(r: &mut Reply) -> Arc<tokio::sync::Notify> {
+    let n = Arc::new(tokio::sync::Notify::new());
+    r.hold = Some(n.clone());
+    n
+}
+
+/// Wait until the fixture has seen `n` requests under `prefix`.
+async fn wait_seen(f: &Fixture, prefix: &str, n: usize) {
+    let t = Instant::now();
+    while f.seen_at(prefix).len() < n {
+        assert!(
+            t.elapsed() < Duration::from_secs(20),
+            "no request at {prefix}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
 }
 
@@ -592,6 +624,7 @@ fn mcp_sse(text: &str) -> Reply {
         body: format!("event: message\ndata: {note}\n\nevent: message\ndata: {res}\n\n")
             .into_bytes(),
         delay_ms: 0,
+        hold: None,
     }
 }
 
@@ -842,6 +875,7 @@ async fn caps_redirects_and_deadlines() {
             headers: vec![("content-type", "application/json".into())],
             body: vec![b' '; 3 * 1024 * 1024],
             delay_ms: 0,
+            hold: None,
         },
     );
     // A redirect is never followed.
@@ -1333,7 +1367,7 @@ async fn mcp_replies_must_answer_the_request_id_and_overlapping_calls_get_their_
 async fn turning_off_during_a_job_holds_for_the_next_one_across_processes() {
     let s = Setup::new(&[ProviderId::Tavily]).await;
     let mut slow = tavily_ok();
-    slow.delay_ms = 400;
+    let release = hold(&mut slow);
     s.fixture.push("/tavily/search", slow);
     // "Process A": the worker, with a job in flight.
     let worker = Arc::new(s.engine());
@@ -1349,7 +1383,7 @@ async fn turning_off_during_a_job_holds_for_the_next_one_across_processes() {
             .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_seen(&s.fixture, "/tavily", 1).await;
     assert_eq!(
         s.fixture.seen_at("/tavily").len(),
         1,
@@ -1366,6 +1400,7 @@ async fn turning_off_during_a_job_holds_for_the_next_one_across_processes() {
     .await
     .unwrap()
     .unwrap();
+    release.notify_one();
     // The in-flight job finishes and records its outcome...
     assert_eq!(job.await.unwrap()["ok"], true);
     assert_eq!(s.settings().last["tavily"].outcome, "ok");
@@ -1541,7 +1576,7 @@ async fn turning_off_mid_job_stops_before_the_next_provider_and_the_next_url() {
     // provider receives nothing.
     let s = Setup::new(&[ProviderId::Tavily, ProviderId::Firecrawl]).await;
     let mut slow = with(reply(429, json!({})), "retry-after", "1");
-    slow.delay_ms = 400;
+    let release = hold(&mut slow);
     s.fixture.push("/tavily/search", slow);
     let e = Arc::new(s.engine());
     let job = {
@@ -1556,12 +1591,13 @@ async fn turning_off_mid_job_stops_before_the_next_provider_and_the_next_url() {
             .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(150)).await;
+    wait_seen(&s.fixture, "/tavily", 1).await;
     settings::update_prefs(&s.dir, true, |st| {
         st.enabled = false;
         Ok(())
     })
     .unwrap();
+    release.notify_one();
     assert_eq!(
         job.await.unwrap(),
         json!({"ok": false, "error": TURNED_OFF})
@@ -1574,7 +1610,7 @@ async fn turning_off_mid_job_stops_before_the_next_provider_and_the_next_url() {
     // Only the next provider turned off: it is skipped, the job goes on.
     let s = Setup::new(&[ProviderId::Tavily, ProviderId::Firecrawl, ProviderId::Exa]).await;
     let mut slow = reply(429, json!({}));
-    slow.delay_ms = 300;
+    let release = hold(&mut slow);
     s.fixture.push("/tavily/search", slow);
     s.fixture.push("/exa#tools/call", mcp_result(EXA_TEXT));
     let e = Arc::new(s.engine());
@@ -1582,7 +1618,7 @@ async fn turning_off_mid_job_stops_before_the_next_provider_and_the_next_url() {
         let e = e.clone();
         tokio::spawn(async move { e.rotate("j", &search("q"), deadline()).await })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_seen(&s.fixture, "/tavily", 1).await;
     settings::update_prefs(&s.dir, false, |st| {
         let list: Vec<(ProviderId, bool)> = st
             .providers
@@ -1592,6 +1628,7 @@ async fn turning_off_mid_job_stops_before_the_next_provider_and_the_next_url() {
         st.set_providers(&list).map_err(anyhow::Error::msg)
     })
     .unwrap();
+    release.notify_one();
     let v = job.await.unwrap();
     assert_eq!(v["provider"], "exa");
     assert!(s.fixture.seen_at("/firecrawl").is_empty());
@@ -1602,7 +1639,7 @@ async fn turning_off_mid_job_stops_before_the_next_provider_and_the_next_url() {
         200,
         json!({"data": {"markdown": "a", "metadata": {"statusCode": 200}}}),
     );
-    page.delay_ms = 300;
+    let release = hold(&mut page);
     s.fixture.push("/firecrawl/scrape", page);
     s.fixture.push(
         "/firecrawl/scrape",
@@ -1624,12 +1661,13 @@ async fn turning_off_mid_job_stops_before_the_next_provider_and_the_next_url() {
             .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_seen(&s.fixture, "/firecrawl/scrape", 1).await;
     settings::update_prefs(&s.dir, true, |st| {
         st.enabled = false;
         Ok(())
     })
     .unwrap();
+    release.notify_one();
     assert_eq!(
         job.await.unwrap(),
         json!({"ok": false, "error": TURNED_OFF})
@@ -1646,7 +1684,7 @@ async fn turning_off_mid_job_stops_before_the_next_provider_and_the_next_url() {
         200,
         json!({"jsonrpc": "2.0", "id": 2, "result": {"protocolVersion": "2025-11-25", "capabilities": {}}}),
     );
-    init.delay_ms = 300;
+    let release = hold(&mut init);
     s.fixture.push("/exa#initialize", init);
     let e = Arc::new(s.engine());
     let job = {
@@ -1661,12 +1699,13 @@ async fn turning_off_mid_job_stops_before_the_next_provider_and_the_next_url() {
             .await
         })
     };
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    wait_seen(&s.fixture, "/exa", 1).await;
     settings::update_prefs(&s.dir, true, |st| {
         st.enabled = false;
         Ok(())
     })
     .unwrap();
+    release.notify_one();
     assert_eq!(
         job.await.unwrap(),
         json!({"ok": false, "error": TURNED_OFF})
