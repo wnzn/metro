@@ -1126,6 +1126,17 @@ pub async fn list_runs(
     Ok(Json(json!({"runs": runs})))
 }
 
+/// A failed membership check on a run's Space, as the run's API answers
+/// it: not being a member reads like an unknown run (404); anything else
+/// (an internal error) keeps its own status.
+fn run_not_found(e: ApiError, not_found: impl FnOnce() -> ApiError) -> ApiError {
+    if e.status() == StatusCode::NOT_FOUND {
+        not_found()
+    } else {
+        e
+    }
+}
+
 /// One run, for a member of its Space: 404 for anyone else.
 pub async fn get_run(
     State(state): State<AppState>,
@@ -1136,7 +1147,7 @@ pub async fn get_run(
     let (run, failure) = state.runs.get_with_failure(&id).ok_or_else(not_found)?;
     member_of(&state, &run.space_id, &who)
         .await
-        .map_err(|_| not_found())?;
+        .map_err(|e| run_not_found(e, not_found))?;
     Ok(Json(run_view(&who, run, failure)?))
 }
 
@@ -1168,7 +1179,7 @@ pub async fn stop_run(
     let run = state.runs.get(&id).ok_or_else(not_found)?;
     let space = member_of(&state, &run.space_id, &who)
         .await
-        .map_err(|_| not_found())?;
+        .map_err(|e| run_not_found(e, not_found))?;
     if run.actor != who.id && space.role != Role::Owner {
         return Err(ApiError::forbidden(
             "only the person who started a run, or the Space owner, can stop it",
@@ -1240,4 +1251,17 @@ pub async fn runner_result(
         Err(CompleteError::NotClaimed) => Err(ApiError::conflict("job has not been claimed")),
         Err(CompleteError::Unknown) => Err(ApiError::not_found("no such job")),
     }
+}
+
+#[cfg(test)]
+#[test]
+fn only_a_failed_membership_reads_as_an_unknown_run() {
+    let unknown = || ApiError::not_found("no such run");
+    let outsider = run_not_found(ApiError::not_found(NO_SPACE), unknown);
+    assert_eq!(
+        (outsider.status(), outsider.message()),
+        (StatusCode::NOT_FOUND, "no such run")
+    );
+    let broken = run_not_found(ApiError::internal(anyhow::anyhow!("disk")), unknown);
+    assert_eq!(broken.status(), StatusCode::INTERNAL_SERVER_ERROR);
 }
