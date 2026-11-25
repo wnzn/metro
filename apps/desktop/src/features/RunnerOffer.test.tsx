@@ -19,7 +19,13 @@ const space = (f: Server, name: string) => [...f.state.spaces.values()].find((s)
 const words = (app: App) => app.texts().join(" | ");
 
 function fixture(f: Server, runnerId: string | null, state = "online") {
-  const status = { runnerId, state, available: true, reads: 0, failReads: 0, delay: 0 };
+  const status = { runnerId, state, available: true, reads: 0, failReads: 0, delay: 0, reconnects: 0 };
+  const gate = { create: 0, attach: 0, badConfirmation: false, reconnect: 0 };
+  const runnerStatus = () => ({
+    requested: true, available: status.available, state: status.state,
+    runner: status.runnerId && { id: status.runnerId, name: "This PC" },
+    tools: ["workspace.list", "workspace.read"], can_reconnect: status.state === "revoked",
+  });
   const b = fakeBridge(f);
   const network = { ...f.network, ...b.network } as Record<string, (req: Request) => unknown>;
   const bridgeGet = network[`GET ${BRIDGE}/v1/*`]!;
@@ -28,17 +34,17 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
     if (header(req, "authorization") !== `Bearer ${BRIDGE_TOKEN}`) return { status: 401 };
     status.reads++;
     if (status.reads <= status.failReads) return { status: 503, body: {} };
-    return {
-      status: 200, delay: status.delay,
-      body: {
-        requested: true, available: status.available, state: status.state,
-        runner: status.runnerId && { id: status.runnerId, name: "This PC" },
-        tools: ["workspace.list", "workspace.read"], can_reconnect: status.state === "revoked",
-      },
-    };
+    return { status: 200, delay: status.delay, body: runnerStatus() };
+  };
+  const bridgePost = network[`POST ${BRIDGE}/v1/*`]!;
+  network[`POST ${BRIDGE}/v1/*`] = (req) => {
+    if (new URL(req.url).pathname !== "/v1/local-tools/runner/reconnect") return bridgePost(req);
+    if (header(req, "authorization") !== `Bearer ${BRIDGE_TOKEN}`) return { status: 401 };
+    status.reconnects++;
+    status.state = "online";
+    return { status: 200, delay: gate.reconnect, body: runnerStatus() };
   };
   // The server applies the write before these gates hold or spoil the reply.
-  const gate = { create: 0, attach: 0, badConfirmation: false };
   const serverPost = network[`POST ${BASE}/v1/*`]!;
   network[`POST ${BASE}/v1/*`] = (req) => {
     const reply = serverPost(req);
@@ -152,6 +158,69 @@ test("a revoked runner needs a reconnect, not just a wait for it to come back", 
   expect(words(app)).toContain("Its token is no longer accepted. Reconnect it in Settings › Runners. Jobs may time out");
 });
 
+test("a held Reconnect hides both Create checkboxes without silently dropping a previously checked choice", async () => {
+  for (const onboarding of [false, true]) {
+    const f = onboarding ? fakeServer() : world();
+    const r = f.addRunner("This PC", "personal", "alice");
+    const t = fixture(f, r.id, "revoked");
+    t.gate.reconnect = 1000;
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    const label = "Create during reconnect";
+    const checkbox = onboarding ? "id:onboarding-space-use-runner" : choice;
+    const field = onboarding ? "id:onboarding-space-name" : "id:new-space-name";
+    if (onboarding) {
+      await app.waitFor(checkbox);
+      await app.type(field, label);
+    } else await startSidebar(app, label);
+    await app.press("id:nav-settings");
+    await app.press("id:installed-runner-reconnect");
+    await app.press("id:installed-runner-reconnect:confirm");
+    await app.waitUntil(() => t.status.reconnects === 1);
+    await app.press("id:settings-close");
+    await app.waitFor(onboarding ? "id:onboarding-space-runner-unavailable" : "id:new-space-runner-unavailable");
+    expect(app.shows(checkbox)).toBe(false);
+    expect(creates(f)).toEqual([]);
+
+    await app.submit(field);
+    await app.waitFor(failure);
+    expect(words(app)).toContain(`Created ${label}. Metro didn't attach this computer's runner.`);
+    expect(words(app)).toContain("wasn't available when you submitted");
+    expect(app.shows("id:new-space-open-runner")).toBe(true);
+    await app.clock!.runFor(1000);
+    expect(creates(f)).toHaveLength(1);
+    expect(runnerWrites(f)).toEqual([]);
+    expect(f.state.attached.has(space(f, label).id)).toBe(false);
+    expect(app.shows(success)).toBe(false);
+  }
+});
+
+test("Reconnect during post-create verification reports the missing attach in the same Space", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  const t = fixture(f, r.id, "revoked");
+  t.gate.reconnect = 1200;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await startSidebar(app, "Before reconnect");
+  const late = f.answerLate("/v1/runners", TOKENS.alice!, 800);
+  await app.press("id:create-space");
+  await app.waitUntil(() => late.arrived() > 0);
+  await app.press("id:nav-settings");
+  await app.press("id:installed-runner-reconnect");
+  await app.press("id:installed-runner-reconnect:confirm");
+  await app.waitUntil(() => t.status.reconnects === 1);
+  await app.press("id:settings-close");
+  await app.clock!.runFor(800);
+  await app.waitFor(failure);
+  expect(words(app)).toContain("Created Before reconnect. Metro didn't attach this computer's runner.");
+  expect(words(app)).toContain("no longer available for this account");
+  expect(app.shows("id:new-space-open-runner")).toBe(true);
+  await app.clock!.runFor(400);
+  expect(creates(f)).toHaveLength(1);
+  expect(runnerWrites(f)).toEqual([]);
+});
+
 test("unknown, foreign and legacy choices never render or send a runner attachment", async () => {
   for (const mode of ["not installed", "wrong account", "organization", "old server"]) {
     const f = world();
@@ -165,6 +234,7 @@ test("unknown, foreign and legacy choices never render or send a runner attachme
     if (mode !== "not installed") await app.waitUntil(() => f.state.log.some((p) => p.path === "/v1/runners"));
     await startSidebar(app, mode, false);
     expect(app.shows(choice)).toBe(false);
+    expect(app.shows("id:new-space-runner-unavailable")).toBe(false);
     expect(app.shows(offer)).toBe(false);
     await app.press("id:create-space");
     await app.waitUntil(() => !app.shows("id:new-space-name"));
@@ -301,6 +371,79 @@ test("the follow-up read also detects a newer assignment made outside this app",
   expect(words(app)).toContain(other.name);
 });
 
+test("bulk attach doesn't count a held success after an external detach or reassignment", async () => {
+  for (const replaced of [false, true]) {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    const r = f.addRunner("This PC", "personal", "alice");
+    const other = f.addRunner("Other computer", "personal", "alice");
+    const t = fixture(f, r.id);
+    t.gate.attach = 800;
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    await app.press("id:nav-settings");
+    await app.waitFor("id:runner-attach-pick:solo");
+    await app.press("id:runner-attach-many");
+    await app.waitUntil(() => f.state.attached.get("solo") === r.id);
+    if (replaced) f.state.attached.set("solo", other.id);
+    else f.state.attached.delete("solo");
+
+    await app.clock!.runFor(800);
+    await app.waitFor("id:runner-attach-result");
+    expect(words(app)).toContain("Attached to 0 of 1 Space. Solo: The runner assignment changed.");
+    expect(words(app)).toContain("Check this Space before retrying.");
+    expect(f.state.attached.get("solo")).toBe(replaced ? other.id : undefined);
+    expect(app.shows("id:runner-attach-pick:solo")).toBe(!replaced); // Authoritative paired flag.
+    expect(app.shows("id:installed-runner-space:solo")).toBe(false);
+    expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+    expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["POST", "/v1/spaces/solo/runner/attach-if-empty"]]);
+
+    if (replaced) {
+      // Check the cache before opening Manage can get its own fresh reply.
+      f.answerLate("/v1/spaces/solo/runner", TOKENS.alice!, 1200);
+      await app.press("id:settings-close");
+      await app.press("id:space:solo");
+      await app.press("id:manage-space");
+      await app.waitFor("id:attached-runner");
+      expect(words(app)).toContain(other.name);
+    }
+  }
+});
+
+test("a newer local Manage detach wins over a held bulk success, including count and folders", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const r = f.addRunner("This PC", "personal", "alice");
+  const t = fixture(f, r.id);
+  t.gate.attach = 800;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.press("id:nav-settings");
+  await app.waitFor("id:runner-attach-pick:solo");
+  await app.press("id:runner-attach-many");
+  await app.waitUntil(() => f.state.attached.get("solo") === r.id);
+  await app.press("id:settings-close");
+  await app.press("id:space:solo");
+  await app.press("id:manage-space");
+  await app.waitFor("id:attached-runner");
+  await app.press("id:detach-runner");
+  await app.press("id:confirm-detach");
+  await app.waitFor(`id:attach-runner:${r.id}`);
+  await app.clock!.runFor(800);
+  expect(app.shows("id:attached-runner")).toBe(false);
+  expect(app.shows("id:test-runner-row")).toBe(false);
+  await app.press("id:nav-settings");
+  await app.waitFor("id:runner-attach-result");
+  expect(words(app)).toContain("Attached to 0 of 1 Space. Solo: A newer runner action superseded this attachment check.");
+  expect(app.shows("id:runner-attach-pick:solo")).toBe(true);
+  expect(app.shows("id:installed-runner-space:solo")).toBe(false);
+  expect(f.state.attached.has("solo")).toBe(false);
+  expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+  expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([
+    ["POST", "/v1/spaces/solo/runner/attach-if-empty"], ["DELETE", "/v1/spaces/solo/runner"],
+  ]);
+});
+
 test("changing and restoring consent while the create response is held never posts an attach or duplicate create", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");
@@ -316,7 +459,7 @@ test("changing and restoring consent while the create response is held never pos
   await app.press(choice);
   await app.clock!.runFor(600);
   await app.waitFor(failure);
-  expect(words(app)).toContain("The Create Space choice changed");
+  expect(words(app)).toContain("The Create Space choice or context changed");
   expect(creates(f)).toHaveLength(1);
   expect(runnerWrites(f)).toEqual([]);
   expect(space(f, "One only")).toBeTruthy();

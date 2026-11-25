@@ -535,7 +535,10 @@ export async function selectSpace(spaceId: string): Promise<void> {
 
 type CreateSpaceOptions = {
   formIsCurrent: () => boolean;
-  attachRunner: (space: Space, fromOriginalForm: boolean, stillInCreatedSpace: () => boolean) => Promise<void>;
+  attachRunner: (space: Space, scope: {
+    mayAttach: () => boolean;
+    mayShowOutcome: () => boolean;
+  }) => Promise<void>;
 };
 
 // Also catches a modal opened and closed while creating or checking the runner.
@@ -569,9 +572,15 @@ export async function createSpace(nameInput: string, options?: CreateSpaceOption
     spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
     await enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
     kick();
-    const stillInCreatedSpace = () => spaceOK() && createSpaceContext === expectedContext &&
-      basePlace() === "space" && activeSpaceId() === space.id;
-    if (options && stillInCreatedSpace()) await options.attachRunner(space, fromOriginalForm, stillInCreatedSpace);
+    // Returning to the same Space can show a missing attachment, but cannot
+    // revive consent invalidated by a move or dialog.
+    const mayShowOutcome = () => spaceOK() && basePlace() === "space" && view() === "room" && activeSpaceId() === space.id;
+    if (options && mayShowOutcome()) {
+      await options.attachRunner(space, {
+        mayAttach: () => fromOriginalForm && createSpaceContext === expectedContext && mayShowOutcome(),
+        mayShowOutcome,
+      });
+    }
     return true;
   } catch (error) {
     // A follow-up failure must not turn a confirmed creation into a retry.
