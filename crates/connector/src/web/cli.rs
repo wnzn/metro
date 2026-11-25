@@ -418,7 +418,13 @@ mod tests {
 
     #[test]
     fn secrets_are_refused_on_argv() {
-        for bad in ["--key", "--api-key=x", "--token", "--session-token", "--device-token"] {
+        for bad in [
+            "--key",
+            "--api-key=x",
+            "--token",
+            "--session-token",
+            "--device-token",
+        ] {
             assert!(parse(&s(&[bad, "v"])).is_err(), "{bad}");
         }
         let a = parse(&s(&["tavily", "--from-file", "-", "--profile=p"])).unwrap();

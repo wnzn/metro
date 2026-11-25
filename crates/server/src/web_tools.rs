@@ -993,9 +993,14 @@ fn device_error_text(tool: &str, whose: &str, e: &DeviceError) -> (String, &'sta
         "Web search"
     };
     match e {
-        DeviceError::Offline | DeviceError::NotPaired | DeviceError::NotFound => (
+        DeviceError::Offline => (
             unavailable_text(tool, whose, Unavailable::Offline),
             "offline",
+        ),
+        // Removed or unpaired between choosing it and queueing the job.
+        DeviceError::NotPaired | DeviceError::NotFound => (
+            unavailable_text(tool, whose, Unavailable::NoDevice),
+            "no_device",
         ),
         DeviceError::QueueFull => (
             format!(
