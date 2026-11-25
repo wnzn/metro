@@ -852,6 +852,85 @@ async fn device_access_db_failures_withhold_payloads_and_answers_as_internal_err
 }
 
 #[tokio::test]
+async fn web_permission_db_failure_withholds_both_payload_and_answer() {
+    for after_claim in [false, true] {
+        let db = Db::open_in_memory().unwrap();
+        let id = format!("wd_{}", uuid::Uuid::new_v4().simple());
+        {
+            let conn = db.lock();
+            conn.execute(
+                "INSERT INTO web_devices (id, owner_id, label, created_at) VALUES (?1, 'alice', 'test', 0)",
+                [&id],
+            ).unwrap();
+            conn.execute(
+                "INSERT INTO web_search_prefs (user_id, personal_chat, updated_at) VALUES ('alice', 1, 0)",
+                [],
+            ).unwrap();
+        }
+        let relay = DeviceRelay::new(
+            Default::default(),
+            Arc::new(crate::providers::DeviceDirectory),
+        );
+        relay.issue_token(&db, "alice", &id).await.unwrap();
+        let device = Device {
+            connection: id.clone(),
+            owner: "alice".to_owned(),
+            generation: 1,
+        };
+        assert!(relay.claim_checked(&db, &device).await.is_none());
+        let waiter = {
+            let (db, relay, id) = (db.clone(), relay.clone(), id.clone());
+            tokio::spawn(async move {
+                relay
+                    .dispatch_web(
+                        &db,
+                        &crate::web_tools::WebGrant::personal_chat("alice"),
+                        &id,
+                        Operation::WebSearch,
+                        json!({"v": 1, "query": "fixture"}),
+                        Duration::from_secs(5),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                if relay
+                    .lock()
+                    .jobs
+                    .values()
+                    .any(|j| j.connection == id && matches!(j.state, JobState::Queued))
+                {
+                    break;
+                }
+                assert!(!waiter.is_finished());
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("web work was queued");
+        let claimed = if after_claim {
+            Some(relay.claim_checked(&db, &device).await.unwrap())
+        } else {
+            None
+        };
+        db.lock()
+            .execute("DROP TABLE web_search_prefs", [])
+            .unwrap();
+        if let Some(job) = claimed {
+            relay
+                .complete_job(&device, &job.id, Ok(json!({"v": 1, "attempts": []})))
+                .unwrap();
+        } else {
+            assert!(relay.claim_checked(&db, &device).await.is_none());
+        }
+        let err = waiter.await.unwrap().unwrap_err();
+        assert_eq!(err, DeviceError::Internal);
+        assert_eq!(err.to_string(), "internal error in the device relay");
+    }
+}
+
+#[tokio::test]
 async fn genuine_device_grant_revocations_still_return_forbidden() {
     use crate::providers::{ProviderError, store};
 

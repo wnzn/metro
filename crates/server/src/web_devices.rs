@@ -138,46 +138,53 @@ pub enum Unavailable {
     Offline,
 }
 
-/// Whether `user` has at least one web device (online or not).
-pub async fn has_device(state: &AppState, user: &str) -> bool {
+async fn device_ids(
+    db: &crate::db::Db,
+    user: &str,
+) -> Result<Vec<String>, crate::device_relay::DeviceError> {
     let u = user.to_owned();
-    state
-        .db
-        .call(move |db| Ok(!devices_of(&db.lock(), &u)?.is_empty()))
-        .await
-        .unwrap_or_else(|e| {
-            tracing::error!(error = %format!("{e:#}"), "reading web devices");
-            false
-        })
+    db.call(move |db| {
+        Ok(devices_of(&db.lock(), &u)?
+            .into_iter()
+            .map(|(id, _, _)| id)
+            .collect())
+    })
+    .await
+    .map_err(|e| {
+        tracing::error!(%e, "reading web devices");
+        crate::device_relay::DeviceError::Internal
+    })
+}
+
+/// Whether `user` has at least one web device (online or not).
+pub(crate) async fn has_device(
+    state: &AppState,
+    user: &str,
+) -> Result<bool, crate::device_relay::DeviceError> {
+    Ok(!device_ids(&state.db, user).await?.is_empty())
 }
 
 /// The web device of `user` that should take a search now: among their own
 /// devices that polled recently, the most recently seen. Never another
 /// person's device, the server or a runner.
-pub async fn pick_device(state: &AppState, user: &str) -> Result<String, Unavailable> {
-    let u = user.to_owned();
-    let ids: Vec<String> = state
-        .db
-        .call(move |db| Ok(devices_of(&db.lock(), &u)?))
-        .await
-        .map_err(|e| {
-            tracing::error!(error = %format!("{e:#}"), "reading web devices");
-            Unavailable::NoDevice
-        })?
-        .into_iter()
-        .map(|(id, _, _)| id)
-        .collect();
+pub(crate) async fn pick_device(
+    db: &crate::db::Db,
+    relay: &crate::device_relay::DeviceRelay,
+    user: &str,
+) -> Result<String, crate::device_relay::DeviceError> {
+    use crate::device_relay::DeviceError;
+    let ids = device_ids(db, user).await?;
     if ids.is_empty() {
-        return Err(Unavailable::NoDevice);
+        return Err(DeviceError::NotFound);
     }
     ids.into_iter()
         .filter_map(|id| {
-            let s = state.device.status(&id);
+            let s = relay.status(&id);
             s.online.then(|| (s.last_seen_secs.unwrap_or(u64::MAX), id))
         })
         .min_by_key(|(secs, _)| *secs)
         .map(|(_, id)| id)
-        .ok_or(Unavailable::Offline)
+        .ok_or(DeviceError::Offline)
 }
 
 // ---------------------------------------------------------------------------
@@ -370,6 +377,25 @@ mod tests {
     use super::*;
     use crate::device_relay::{DEVICE_PROVIDERS, Operation, serves};
 
+    #[tokio::test]
+    async fn device_selection_distinguishes_a_database_fault_from_no_device() {
+        use crate::device_relay::{DeviceError, DeviceRelay};
+        let db = crate::db::Db::open_in_memory().unwrap();
+        let relay = DeviceRelay::new(
+            Default::default(),
+            std::sync::Arc::new(crate::providers::DeviceDirectory),
+        );
+        assert_eq!(
+            pick_device(&db, &relay, "alice").await.unwrap_err(),
+            DeviceError::NotFound
+        );
+        db.lock().execute("DROP TABLE web_devices", []).unwrap();
+        assert_eq!(
+            pick_device(&db, &relay, "alice").await.unwrap_err(),
+            DeviceError::Internal
+        );
+    }
+
     #[test]
     fn web_devices_serve_only_web_operations_and_nothing_else_serves_them() {
         for op in [Operation::WebSearch, Operation::WebFetch] {
@@ -400,6 +426,7 @@ mod tests {
                 "INSERT INTO web_devices (id, owner_id, label, created_at) VALUES (?1, 'alice', 'l', 0)",
                 [&i],
             )?;
+            set_personal_chat(&db.lock(), "alice", true)?;
             Ok(())
         })
         .await
@@ -421,7 +448,7 @@ mod tests {
                 relay
                     .dispatch_web(
                         &db,
-                        &crate::device_relay::Caller::personal("alice"),
+                        &crate::web_tools::WebGrant::personal_chat("alice"),
                         &id,
                         Operation::WebSearch,
                         json!({"v": 1}),
@@ -477,6 +504,7 @@ mod tests {
                 "INSERT INTO web_devices (id, owner_id, label, created_at) VALUES (?1, 'alice', 'l', 0)",
                 [&i],
             )?;
+            set_personal_chat(&db.lock(), "alice", true)?;
             Ok(())
         })
         .await
@@ -500,7 +528,7 @@ mod tests {
                 relay
                     .dispatch_web(
                         &db,
-                        &crate::device_relay::Caller::personal("alice"),
+                        &crate::web_tools::WebGrant::personal_chat("alice"),
                         &id,
                         Operation::WebSearch,
                         json!({"v": 1}),
@@ -513,7 +541,10 @@ mod tests {
         // The revocation of generation 1 is published only now.
         relay.retire(&id, 1);
         assert_eq!(relay.known_generation(&id), 2);
-        let job = relay.claim(&device).expect("the newer job survived");
+        let job = relay
+            .claim_checked(&db, &device)
+            .await
+            .expect("the newer job survived");
         assert_eq!(job.operation, Operation::WebSearch);
         relay
             .complete_job(&device, &job.id, Ok(json!({"v": 1, "attempts": []})))
@@ -588,7 +619,7 @@ mod tests {
         let err = relay
             .dispatch_web(
                 &db,
-                &crate::device_relay::Caller::personal("bob"),
+                &crate::web_tools::WebGrant::personal_chat("bob"),
                 &id,
                 Operation::WebSearch,
                 json!({"v": 1}),
@@ -601,7 +632,7 @@ mod tests {
         let err = relay
             .dispatch_web(
                 &db,
-                &crate::device_relay::Caller::personal("alice"),
+                &crate::web_tools::WebGrant::personal_chat("alice"),
                 &id,
                 Operation::WebSearch,
                 json!({"v": 1}),

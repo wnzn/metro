@@ -991,7 +991,8 @@ async fn execute_room_run(
             );
             if search || fetch {
                 let user = initiator.id.clone().unwrap_or_default();
-                if crate::web_devices::has_device(state, &user).await {
+                let paired = crate::web_devices::has_device(state, &user).await;
+                if matches!(paired, Ok(true)) {
                     let provenance = crate::web_tools::Provenance::from_messages(
                         parent_events
                             .iter()
@@ -1013,7 +1014,8 @@ async fn execute_room_run(
                         .append_preamble(crate::web_tools::WEB_PREAMBLE)
                         .dynamic_tools(crate::web_tools::tools(&ctx, search, fetch));
                 } else {
-                    builder = builder.append_preamble(crate::web_tools::NO_WEB_DEVICE_PREAMBLE);
+                    builder = builder
+                        .append_preamble(crate::web_tools::device_unavailable_preamble(paired));
                 }
             }
             if is_thread {
@@ -1719,7 +1721,7 @@ async fn execute_personal_run(
     };
     // Web tools only for a person who turned them on for their own Chat,
     // always on their own computer.
-    let web = {
+    let web = lane == PersonalLane::Chat && {
         let user = user_id.clone();
         state
             .db
@@ -1741,10 +1743,11 @@ async fn execute_personal_run(
         PERSONAL_PREAMBLE
     });
     if web {
-        if crate::web_devices::has_device(&state, &user_id).await {
+        let paired = crate::web_devices::has_device(&state, &user_id).await;
+        if matches!(paired, Ok(true)) {
             let ctx = crate::web_tools::WebContext {
                 state: state.clone(),
-                scope: crate::web_tools::WebScope::Personal,
+                scope: crate::web_tools::WebScope::PersonalChat,
                 initiator: Author {
                     id: Some(user_id.clone()),
                     name: String::new(),
@@ -1759,7 +1762,8 @@ async fn execute_personal_run(
                 .append_preamble(crate::web_tools::WEB_PREAMBLE)
                 .dynamic_tools(crate::web_tools::tools(&ctx, true, true));
         } else {
-            builder = builder.append_preamble(crate::web_tools::NO_WEB_DEVICE_PREAMBLE);
+            builder =
+                builder.append_preamble(crate::web_tools::device_unavailable_preamble(paired));
         }
     }
     let mut reacted = Arc::new(AtomicBool::new(false));

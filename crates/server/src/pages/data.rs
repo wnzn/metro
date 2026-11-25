@@ -242,6 +242,7 @@ fn agent_answer(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json
         // like a completed run that ended without one.
         let marker = latest(&[kind::ACTIVITY])?;
         let room = t.room.as_deref();
+        // The store excludes tool errors: those do not end the run.
         if let Some(e) = latest(&[kind::AGENT, kind::ERROR, kind::STATUS])? {
             return Ok(answer_json(db, &e, room));
         }
