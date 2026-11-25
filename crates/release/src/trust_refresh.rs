@@ -83,6 +83,49 @@ pub struct TrustCache {
     tuf_root: Vec<u8>,
 }
 
+/// Trust material plus the time established when replaying the signed chain.
+/// Only a successful replay can construct one.
+#[derive(Debug)]
+pub struct FreshVerifier {
+    verifier: SigstoreVerifier,
+    verified_at: jiff::Timestamp,
+    loaded_at: std::time::Instant,
+    age_when_loaded: u64,
+}
+
+impl FreshVerifier {
+    fn fresh_at(&self, now: jiff::Timestamp) -> bool {
+        now >= self.verified_at
+            && now.as_second().saturating_sub(self.verified_at.as_second()) < CACHE_MAX_AGE_SECS
+            && self
+                .age_when_loaded
+                .saturating_add(self.loaded_at.elapsed().as_secs())
+                < CACHE_MAX_AGE_SECS as u64
+    }
+
+    #[doc(hidden)]
+    pub fn verify_at(
+        &self,
+        artifact: Signed<'_>,
+        bundle_json: &[u8],
+        now: jiff::Timestamp,
+    ) -> Result<SignedFacts, Error> {
+        if !self.fresh_at(now) {
+            return Err(Error::new(
+                ErrorCode::TrustRootStale,
+                "cached Sigstore trust expired",
+            ));
+        }
+        self.verifier.verify(artifact, bundle_json)
+    }
+}
+
+impl ReleaseVerifier for FreshVerifier {
+    fn verify(&self, artifact: Signed<'_>, bundle_json: &[u8]) -> Result<SignedFacts, Error> {
+        self.verify_at(artifact, bundle_json, jiff::Timestamp::now())
+    }
+}
+
 impl TrustCache {
     /// Production: Sigstore's CDN, anchored at the vendored TUF root.
     pub fn new(dir: &Path) -> TrustCache {
@@ -115,7 +158,7 @@ impl TrustCache {
     /// past and at most [`CACHE_MAX_AGE_SECS`] old. The cache folder and files
     /// must be private (owned by this user, not writable by others, no
     /// links). Anything else: the cache is ignored.
-    pub fn cached_verifier(&self, now: jiff::Timestamp) -> Option<SigstoreVerifier> {
+    pub fn cached_verifier(&self, now: jiff::Timestamp) -> Option<FreshVerifier> {
         match self.replay(now) {
             Ok(v) => Some(v),
             Err(why) => {
@@ -127,10 +170,11 @@ impl TrustCache {
         }
     }
 
-    fn replay(&self, now: jiff::Timestamp) -> io::Result<SigstoreVerifier> {
+    fn replay(&self, now: jiff::Timestamp) -> io::Result<FreshVerifier> {
+        let loaded_at = std::time::Instant::now();
         let dir = self.private_dir(false)?;
         let at = parse_time(&dir.read("verified_at", 32)?)?;
-        if at > now.as_second() || now.as_second().saturating_sub(at) > CACHE_MAX_AGE_SECS {
+        if at > now.as_second() || now.as_second().saturating_sub(at) >= CACHE_MAX_AGE_SECS {
             return Err(invalid(
                 "the cached verification is from the future or too old",
             ));
@@ -175,7 +219,13 @@ impl TrustCache {
             ));
         }
         let text = std::str::from_utf8(&raw).map_err(io::Error::other)?;
-        SigstoreVerifier::from_trusted_root_json(text).map_err(io::Error::other)
+        let verifier = SigstoreVerifier::from_trusted_root_json(text).map_err(io::Error::other)?;
+        Ok(FreshVerifier {
+            verifier,
+            verified_at: at,
+            loaded_at,
+            age_when_loaded: now.as_second().saturating_sub(at.as_second()) as u64,
+        })
     }
 
     fn last_attempt(dir: &CacheDir) -> io::Result<Option<i64>> {
@@ -214,7 +264,7 @@ impl TrustCache {
 
     /// Run the TUF refresh and return a verifier over the new trusted root
     /// (callers reserve first, see [`TrustCache::reserve`]).
-    pub async fn refresh(&self, now: jiff::Timestamp) -> Result<SigstoreVerifier, Error> {
+    pub async fn refresh(&self, now: jiff::Timestamp) -> Result<FreshVerifier, Error> {
         let io =
             |e: std::io::Error| Error::new(ErrorCode::Io, format!("trust cache: {}", e.kind()));
         let dir = self.private_dir(true).map_err(io)?;
@@ -544,34 +594,53 @@ impl sigstore_tuf::cache::MetadataStore for CacheStore {
 /// too old (`trust_root_stale`). Same pinned signer policy either way.
 pub struct LayeredVerifier {
     vendored: SigstoreVerifier,
-    refreshed: Mutex<Option<SigstoreVerifier>>,
+    refreshed: Mutex<Option<FreshVerifier>>,
 }
 
 impl LayeredVerifier {
-    pub fn new(vendored: SigstoreVerifier, refreshed: Option<SigstoreVerifier>) -> LayeredVerifier {
+    pub fn new(vendored: SigstoreVerifier, refreshed: Option<FreshVerifier>) -> LayeredVerifier {
         LayeredVerifier {
             vendored,
             refreshed: Mutex::new(refreshed),
         }
     }
 
-    pub fn set_refreshed(&self, v: SigstoreVerifier) {
+    pub fn set_refreshed(&self, v: FreshVerifier) {
         *self.refreshed.lock().unwrap_or_else(|p| p.into_inner()) = Some(v);
+    }
+
+    #[doc(hidden)]
+    pub fn verify_at(
+        &self,
+        artifact: Signed<'_>,
+        bundle_json: &[u8],
+        now: jiff::Timestamp,
+    ) -> Result<SignedFacts, Error> {
+        self.verify_with_clock(artifact, bundle_json, || now)
+    }
+
+    fn verify_with_clock(
+        &self,
+        artifact: Signed<'_>,
+        bundle_json: &[u8],
+        clock: impl FnOnce() -> jiff::Timestamp,
+    ) -> Result<SignedFacts, Error> {
+        match self.vendored.verify(artifact, bundle_json) {
+            Err(e) if e.code == ErrorCode::TrustRootStale => {
+                let refreshed = self.refreshed.lock().unwrap_or_else(|p| p.into_inner());
+                match refreshed.as_ref() {
+                    Some(r) => r.verify_at(artifact, bundle_json, clock()),
+                    _ => Err(e),
+                }
+            }
+            other => other,
+        }
     }
 }
 
 impl ReleaseVerifier for LayeredVerifier {
     fn verify(&self, artifact: Signed<'_>, bundle_json: &[u8]) -> Result<SignedFacts, Error> {
-        match self.vendored.verify(artifact, bundle_json) {
-            Err(e) if e.code == ErrorCode::TrustRootStale => {
-                let refreshed = self.refreshed.lock().unwrap_or_else(|p| p.into_inner());
-                match refreshed.as_ref() {
-                    Some(r) => r.verify(artifact, bundle_json),
-                    None => Err(e),
-                }
-            }
-            other => other,
-        }
+        self.verify_with_clock(artifact, bundle_json, jiff::Timestamp::now)
     }
 }
 
@@ -598,7 +667,11 @@ impl TrustRefresh {
     /// After a `trust_root_stale` failure: refresh if due. `true` when a
     /// new root is in place and the caller should retry once.
     pub async fn refresh_if_due(&self) -> bool {
-        let now = jiff::Timestamp::now();
+        self.refresh_if_due_at(jiff::Timestamp::now()).await
+    }
+
+    #[doc(hidden)]
+    pub async fn refresh_if_due_at(&self, now: jiff::Timestamp) -> bool {
         if !matches!(self.cache.reserve(now), Ok(true)) {
             return false;
         }

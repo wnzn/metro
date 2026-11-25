@@ -116,7 +116,7 @@ fn real_sigstore_metadata_refreshes_and_verifies_the_release() {
     assert!(c.reserve(now()).unwrap(), "the first refresh is reserved");
     let v = rt().block_on(c.refresh(now())).expect("refresh");
     // The refreshed root verifies the published 0.4.0 release.
-    let facts = v.verify(Signed::Bytes(MANIFEST), BUNDLE).unwrap();
+    let facts = v.verify_at(Signed::Bytes(MANIFEST), BUNDLE, now()).unwrap();
     assert_eq!(facts.commit, "1a743e59d4ec6c1da85d09d92c99457561f64e55");
     assert_eq!(
         hex(&sha256(
@@ -305,12 +305,53 @@ fn layered_verifier_uses_the_refreshed_root_only_when_the_vendored_one_is_stale(
             .code,
         ErrorCode::TrustRootStale
     );
-    layered.set_refreshed(SigstoreVerifier::vendored().unwrap());
-    assert!(layered.verify(Signed::Bytes(MANIFEST), BUNDLE).is_ok());
+    let repo = serve(real_files());
+    let dir = tempfile::tempdir().unwrap();
+    let c = cache(&repo, dir.path(), VENDORED_TUF_ROOT);
+    rt().block_on(c.refresh(now())).unwrap();
+    layered.set_refreshed(c.cached_verifier(now()).unwrap());
+    assert!(
+        layered
+            .verify_at(Signed::Bytes(MANIFEST), BUNDLE, now())
+            .is_ok()
+    );
+    let expires = now()
+        .checked_add(jiff::SignedDuration::from_secs(
+            metro_release::trust_refresh::CACHE_MAX_AGE_SECS,
+        ))
+        .unwrap();
+    assert_eq!(
+        layered
+            .verify_at(Signed::Bytes(MANIFEST), BUNDLE, expires)
+            .unwrap_err()
+            .code,
+        ErrorCode::TrustRootStale,
+        "a running verifier may not keep using expired cached trust"
+    );
+    let refresh = metro_release::trust_refresh::TrustRefresh {
+        cache: c,
+        verifier: Arc::new(layered),
+    };
+    let before = repo.log.lock().unwrap().len();
+    // The recorded upstream metadata is now stale too, so the first
+    // refresh reaches the fixture but fails. Failure still spends the slot.
+    assert!(!rt().block_on(refresh.refresh_if_due_at(expires)));
+    let after = repo.log.lock().unwrap().len();
+    assert!(after > before);
+    assert!(!rt().block_on(refresh.refresh_if_due_at(expires)));
+    assert!(
+        repo.log.lock().unwrap().len() == after,
+        "the expiry retry must not contact the repository again this week"
+    );
     // Never a different signer: a tampered manifest still fails with either root.
     let mut m = MANIFEST.to_vec();
     m[0] ^= 1;
-    assert!(layered.verify(Signed::Bytes(&m), BUNDLE).is_err());
+    assert!(
+        refresh
+            .verifier
+            .verify_at(Signed::Bytes(&m), BUNDLE, now())
+            .is_err()
+    );
 }
 
 // ---- synthetic repository (threshold, rotation, rollback) ----
