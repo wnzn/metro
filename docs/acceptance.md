@@ -103,6 +103,43 @@ anyone outside the release workflow; macOS (not built); real vendor
 accounts and sign-ins; pretrained `google/embeddinggemma-2` ranking.
 Windows files carry no Authenticode signature.
 
+## Source only: updater review 2 (2026-11-25, local)
+
+Tested on `lane/updates-backend` at `3de67c1`. This work was not part of
+Metro 0.4.0 and was not published or merged.
+
+- The locked Rust workspace suite ran with `METRO_SERVER_BIN` pointed at
+  the local server binary: 803 passed, 2 ignored. Formatting and workspace
+  Clippy (`--all-targets --all-features -- -D warnings`) passed.
+- Locked all-features tests for `metro-release`, `metro-server`,
+  `metro-runner`, `metro-connector`, and `metro-desktop`: 730 passed,
+  2 ignored. This run omitted debug symbols to fit on disk.
+- The eight plain end-to-end scripts passed against builds without
+  test-release hooks: `smoke`, `threads`, `device_connector`, `settings`,
+  `schedules`, `intelligence`, `attachments`, and `library`.
+- `tests/e2e/updates.py` passed with separate test-release fixture
+  binaries. It verified the update notice and owner-only request, updated
+  the runner from 1.0.0 to 1.0.1 without restarting the process, then
+  rolled a crashing 1.0.2 back after three restarts and reported
+  `start_failed`.
+- A build check with the `e2e` feature and `METRO_RELEASE_CHANNEL=release`
+  was rejected by the compile-time guard as expected.
+- The packaging, release-signature, and Windows-signing suites ran with
+  PyYAML 6.0.4: 282 passed, 11 skipped. The PowerShell fixtures ran on Linux;
+  they are not native Windows install or signing tests.
+  Both Linux installers failed the new live-lock regressions when the same
+  tests were run against the scripts from `b04dd43`.
+- The admin browser suite passed 22/22 in
+  `mcr.microsoft.com/playwright:v1.58.2-noble`. `actionlint` 1.7.12 passed.
+- `metro-release`, `metro-connector`, and `metro-desktop` checked for
+  `x86_64-pc-windows-gnu` in `metro-package-builder:windows-gnu`. This was
+  a cross-check only. Native Windows MSI execution, shortcuts, and helper
+  handoff were not exercised.
+
+The trust tests replay CDN-captured signed TUF metadata locally and verify
+real Metro 0.4.0 Sigstore fixtures offline. They do not demonstrate a live
+TUF refresh or an update from one published Metro release to another.
+
 ## Staged: Spaces with several agents, per-connection model lists and the desktop redesign at 4175475 (2026-11-25, project manager, local)
 
 A **gate on unreleased source**, run on Linux and reported by the project
