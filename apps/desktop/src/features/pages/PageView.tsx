@@ -1,9 +1,9 @@
 import { cleanup, effect, lifecycle, openUrl, signal, untracked } from "nsh";
 import type { ActionKind, Confirmation, Page, PageData, PageDiagnostic } from "../../api/pages";
 import { isPageStatus, pageFailure } from "../../api/pages";
-import { goPages, hasSpace, pageGuard, pagesProblem, refreshPages, scopeVisible } from "../../pagesState";
+import { goPages, hasSpace, pageGuard, pagesProblem, refreshPages, sameSpaceGrants, scopeVisible, spaceGrants } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
-import { apiClient, me, openChat, openExactRoom, openPlace, sessionGuard, spaces } from "../../store";
+import { apiClient, me, openChat, openExactRoom, openPlace, sessionGuard } from "../../store";
 import { Action, ActionBar, ActionsMenu, Badge, Banner, Column, Label, Modal, modalOpen, PageHeader, PageLayout, Row } from "../../ui";
 import { httpsLink } from "../../ui/pageBlocks";
 import { prefillPageTask } from "../discovery/scheduleState";
@@ -14,7 +14,7 @@ import { Diagnostics, DraftPrompt, PagesError, scopeName, showDraft } from "./co
 import { PageRenderer } from "./PageRenderer";
 import { PageHistory, PageSettings, SourceEditor } from "./PageTools";
 import { capabilityOf, cell, own, str } from "./renderPlan";
-import { intervalFor, visiblePolling } from "./refresh";
+import { intervalFor, pageReadLane, visiblePolling } from "./refresh";
 import { answerSchedule } from "./scheduleAnswer";
 
 type ViewRoute = Extract<PagesRoute, { kind: "page" }>;
@@ -31,21 +31,22 @@ export function PageView(props: { route: ViewRoute }) {
   const editing = signal(false), select = signal(false), block = signal<string | undefined>(undefined);
   const client = apiClient(), route = props.route;
   const guard = pageGuard(route);
-  let alive = true, ticket = 0;
+  const reads = pageReadLane<boolean>();
+  let alive = true;
   let scopeGuard = sessionGuard(route.spaceId);
   cleanup(() => { alive = false; });
   const valid = () => alive && guard() && scopeGuard() && hasSpace(page()?.space_id);
   const live = () => valid() && lifecycle() === "active";
   const visible = () => live() && !modalOpen();
-  const grants = () => new Map(spaces().map(s => [s.id, sessionGuard(s.id)]));
+  const cancelRead = () => { reads.cancel(); refreshing.set(false); };
   const lost = () => {
-    ++ticket;
+    cancelRead();
     page.set(null); data.set(null); confirm.set(null); external.set(null); schedule.set(undefined); sheet.set(null);
     refreshing.set(false); loading.set(false);
     error.set("This page is no longer available to you.");
     void refreshPages();
   };
-  function accept(next: Page, before: ReturnType<typeof grants>) {
+  function accept(next: Page, before: ReturnType<typeof spaceGrants>) {
     const previous = page();
     if (next.id !== route.id || !scopeVisible(next) || next.deleted_at
       || (route.spaceId && next.space_id !== route.spaceId)
@@ -60,54 +61,59 @@ export function PageView(props: { route: ViewRoute }) {
     }
     return true;
   }
-  async function refresh(loadHead = false) {
-    if (!client || !visible()) return;
-    const index = ++ticket, before = grants();
-    const allowed = () => valid() && index === ticket && [...before.values()].every(ok => ok());
-    refreshing.set(true);
-    error.set("");
-    try {
-      if (loadHead || !page()) {
-        const head = await client.getPage(route.id);
-        if (!allowed() || !accept(head, before)) return;
-      }
-      if (!visible()) return;
-      let answer = await client.pageData(route.id);
+  function refresh(loadHead = false, replace = false): Promise<void> {
+    if (!client || !visible()) return Promise.resolve();
+    const needsHead = loadHead || !page();
+    const before = spaceGrants();
+    return reads.run(needsHead, async (signal, current) => {
+      const allowed = () => current() && visible() && [...before.values()].every(ok => ok());
       if (!allowed()) return;
-      if (answer.version !== page()?.head_version) {
-        data.set(null); confirm.set(null);
-        if (!visible()) return;
-        const head = await client.getPage(route.id);
-        if (!allowed() || !accept(head, before) || !visible()) return;
-        answer = await client.pageData(route.id);
+      refreshing.set(true);
+      error.set("");
+      try {
+        if (needsHead) {
+          const head = await client.getPage(route.id, signal);
+          if (!allowed() || !accept(head, before)) return;
+        }
+        if (!allowed()) return;
+        let answer = await client.pageData(route.id, signal);
+        if (!allowed()) return;
+        if (answer.version !== page()?.head_version) {
+          data.set(null); confirm.set(null);
+          const head = await client.getPage(route.id, signal);
+          if (!allowed() || !accept(head, before) || !allowed()) return;
+          answer = await client.pageData(route.id, signal);
+        }
+        if (!allowed()) return;
+        if (answer.version !== page()?.head_version) {
+          error.set("The page changed while it was loading. Refresh to see the latest version.");
+          data.set(null);
+          return;
+        }
+        data.set(answer);
+      } catch (e) {
+        if (!allowed()) return;
+        if (isPageStatus(e, 404) || isPageStatus(e, 403)) lost();
+        else { data.set(null); confirm.set(null); error.set(pagesProblem(e)); }
+      } finally {
+        if (allowed()) { loading.set(false); refreshing.set(false); }
       }
-      if (!allowed()) return;
-      if (answer.version !== page()?.head_version) {
-        error.set("The page changed while it was loading. Refresh to see the latest version.");
-        data.set(null);
-        return;
-      }
-      data.set(answer);
-    } catch (e) {
-      if (!allowed()) return;
-      if (isPageStatus(e, 404) || isPageStatus(e, 403)) lost();
-      else { data.set(null); confirm.set(null); error.set(pagesProblem(e)); }
-    } finally {
-      if (valid() && index === ticket) { loading.set(false); refreshing.set(false); }
-    }
+    }, existingHead => !replace && (!needsHead || existingHead));
   }
   // A personal page can reference other Spaces. Clear its data and consent
   // as soon as the list of accessible Spaces changes.
-  let membership: string | undefined, wasVisible = false, recheck = true;
+  let membership: ReturnType<typeof spaceGrants> | undefined, wasVisible = false;
   effect(() => {
-    const now = JSON.stringify(spaces().map(s => s.id).sort());
+    const now = spaceGrants();
     const shown = visible();
-    const changed = membership !== undefined && now !== membership;
+    const changed = membership !== undefined && !sameSpaceGrants(membership, now);
+    const justShown = shown && !wasVisible;
     membership = now;
+    wasVisible = shown;
     untracked(() => {
-      if (changed) { ++ticket; data.set(null); confirm.set(null); external.set(null); schedule.set(undefined); refreshing.set(false); recheck = true; }
-      if (shown && (!wasVisible || recheck)) { recheck = false; void refresh(true); }
-      wasVisible = shown;
+      if (!shown || changed) cancelRead();
+      if (changed) { data.set(null); confirm.set(null); external.set(null); schedule.set(undefined); }
+      if (shown && (justShown || changed)) void refresh(true);
     });
   });
   visiblePolling(() => visible() && !!page(), () => intervalFor(page()?.spec?.refresh), () => {
@@ -115,9 +121,9 @@ export function PageView(props: { route: ViewRoute }) {
   });
 
   const saved = (next: Page) => {
-    if (!valid() || !accept(next, grants())) return;
+    if (!valid() || !accept(next, spaceGrants())) return;
     sheet.set(null); notice.set("Page saved.");
-    void refresh();
+    void refresh(false, true);
     void refreshPages();
   };
   const toolProps = (head: Page): PageToolProps => ({ page: head, stillHere: valid, close: () => sheet.set(null), saved, lost });
@@ -160,7 +166,7 @@ export function PageView(props: { route: ViewRoute }) {
       } else notice.set("Scheduled task started.");
       // Preserve an action failure while refreshing its answer.
       const failure = error();
-      await refresh();
+      await refresh(false, true);
       if (valid() && failure && !error()) error.set(failure);
     } catch (e) {
       if (!valid()) return;
@@ -170,7 +176,7 @@ export function PageView(props: { route: ViewRoute }) {
         if (check && live() && page() === head && data() === displayed) confirm.set(check);
         else error.set("Metro could not verify what this action would do. Refresh the page and try again.");
       } else if (isPageStatus(e, 409)) {
-        await refresh(true);
+        await refresh(true, true);
         if (valid() && page()) error.set("The page or scheduled task changed. Review it and click again; no action ran.");
       } else {
         const problem = pagesProblem(e);
@@ -182,7 +188,7 @@ export function PageView(props: { route: ViewRoute }) {
   async function file(id: string) {
     const head = page();
     if (!client || !head || !live() || busy()) return;
-    const before = grants();
+    const before = spaceGrants();
     try {
       const asset = await client.getAsset(id);
       if (!live() || page() !== head || asset.id !== id || (head.space_id && head.space_id !== asset.spaceId)

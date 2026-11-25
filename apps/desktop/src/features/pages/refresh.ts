@@ -1,4 +1,30 @@
-import { effect, lifecycle, untracked } from "nsh";
+import { cleanup, effect, lifecycle, untracked } from "nsh";
+
+/** Only for reads (including POST /data). Cancelling a read releases its
+ * slot immediately, even if the transport later delivers its old result. */
+export function pageReadLane<Key>() {
+  type Read = { key: Key; controller: AbortController; done: Promise<void> };
+  let active: Read | undefined;
+  const cancel = () => {
+    const previous = active;
+    active = undefined;
+    previous?.controller.abort();
+  };
+  cleanup(cancel);
+  function run(key: Key, work: (signal: AbortSignal, current: () => boolean) => Promise<void>, reuse: (existing: Key) => boolean = k => k === key) {
+    if (active && reuse(active.key)) return active.done;
+    cancel();
+    const controller = new AbortController();
+    const read: Read = { key, controller, done: Promise.resolve() };
+    const current = () => active === read && !controller.signal.aborted;
+    active = read;
+    read.done = Promise.resolve().then(() => {
+      if (current()) return work(controller.signal, current);
+    }).finally(() => { if (current()) active = undefined; });
+    return read.done;
+  }
+  return { run, cancel };
+}
 
 export function intervalFor(value: unknown): number {
   switch (value) {

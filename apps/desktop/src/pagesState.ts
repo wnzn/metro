@@ -8,6 +8,8 @@ export type PagesRoute =
   | { kind: "draft"; id: string; spaceId?: string; returnPage?: string; returnRoom?: string };
 
 const route = signal<PagesRoute>({ kind: "home" });
+/** A primitive key for NSH's keyed view, not a new object on each evaluation. */
+export const pagesRouteMount = signal(0);
 const entries = signal<{ page: PageMeta; valid?: () => boolean }[]>([]);
 type DraftRoute = Extract<PagesRoute, { kind: "draft" }>;
 const draftLinks = signal<{ route: DraftRoute; valid: () => boolean }[]>([]);
@@ -54,6 +56,7 @@ export function goPages(next: PagesRoute = { kind: "home" }) {
   batch(() => {
     if (next.kind === "draft") draftLinks.set([{ route: { ...next }, valid: sessionGuard(next.spaceId) }, ...draftLinks().filter(entry => entry.route.id !== next.id && entry.valid())].slice(0, 20));
     route.set(next);
+    pagesRouteMount.set(pagesRouteMount() + 1);
     openPlace("pages");
   });
 }
@@ -107,4 +110,5 @@ onSessionEnd(() => {
   pagesError.set("");
   pagesLoading.set(false);
   route.set({ kind: "home" });
+  pagesRouteMount.set(pagesRouteMount() + 1);
 });

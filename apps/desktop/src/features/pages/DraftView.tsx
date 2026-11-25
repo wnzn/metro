@@ -2,14 +2,14 @@ import { cleanup, effect, lifecycle, signal, untracked } from "nsh";
 import type { TurnModelChoice } from "../../api/client";
 import type { Draft, Page, PageDiagnostic, PageValues } from "../../api/pages";
 import { isPageStatus, pageFailure, targetOf } from "../../api/pages";
-import { forgetPageDraft, goPages, pageGuard, pagesProblem, scopeVisible } from "../../pagesState";
+import { forgetPageDraft, goPages, pageGuard, pagesProblem, sameSpaceGrants, scopeVisible, spaceGrants } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
-import { apiClient, openExactRoom, sessionGuard, spaces } from "../../store";
+import { apiClient, openExactRoom, sessionGuard } from "../../store";
 import { Action, ActionBar, Badge, Banner, Column, Label, modalOpen, PageHeader, Row, ScrollArea, SegmentedControl } from "../../ui";
 import { PageCode, PageDiff } from "../../ui/pageBlocks";
 import { Diagnostics, DraftPrompt, PagesError, scopeName, showDraft, showPage } from "./controls";
 import { PageRenderer } from "./PageRenderer";
-import { visiblePolling } from "./refresh";
+import { pageReadLane, visiblePolling } from "./refresh";
 
 type DraftRoute = Extract<PagesRoute, { kind: "draft" }>;
 type Tab = "preview" | "changes" | "source";
@@ -23,59 +23,99 @@ export function DraftView(props: { route: DraftRoute }) {
   const tab = signal<Tab>("preview"), error = signal("");
   const outside = signal<string[]>([]), confirmOutside = signal(false), retry = signal(false), discard = signal(false);
   const busy = signal(false), loading = signal(true), previewing = signal(false), unavailable = signal(false);
-  let alive = true, checking = false, grant = sessionGuard(route.spaceId);
-  let dataSeq = 0;
+  const conflict = signal<{ pageId: string; version: number } | null>(null), readingHead = signal(false), headError = signal("");
+  const draftReads = pageReadLane<string>(), previewReads = pageReadLane<Draft>(), headReads = pageReadLane<string>();
+  let alive = true, grant = sessionGuard(route.spaceId);
   cleanup(() => { alive = false; });
   const valid = () => alive && guard() && grant() && (!draft() || scopeVisible(draft()!));
   const visible = () => valid() && !modalOpen() && lifecycle() === "active";
   const available = () => valid() && !unavailable();
 
   function missing() {
+    draftReads.cancel(); previewReads.cancel(); headReads.cancel();
     forgetPageDraft(route.id);
     unavailable.set(true);
     error.set("This draft is no longer available. It may have been applied, discarded, expired, or you may no longer have access.");
+    loading.set(false); previewing.set(false); readingHead.set(false);
     data.set(null); draft.set(null); currentHead.set(null); diagnostics.set([]); outside.set([]);
   }
   function problem(e: unknown) {
     if (isPageStatus(e, 404) || isPageStatus(e, 403)) missing();
     else { error.set(pagesProblem(e)); diagnostics.set(pageFailure(e).diagnostics ?? []); }
   }
-  async function load() {
-    if (!client || !available() || checking) return;
-    checking = true;
-    const grants = new Map(spaces().map(s => [s.id, sessionGuard(s.id)]));
-    try {
-      const next = await client.getPageDraft(route.id);
-      if (!available()) return;
-      if (next.id !== route.id || next.space_id !== (route.spaceId ?? null) || (route.returnPage && next.page_id !== route.returnPage)
-        || (next.space_id && !grants.get(next.space_id)?.()) || !scopeVisible(next)) { missing(); return; }
-      grant = sessionGuard(next.space_id ?? undefined);
-      draft.set(next);
-      diagnostics.set(next.diagnostics);
-      outside.set(next.outside_selection);
-      error.set(next.error ?? "");
-    } catch (e) { if (available()) problem(e); }
-    finally { checking = false; if (valid()) loading.set(false); }
+  function load() {
+    if (!client || !visible() || !available()) return;
+    const grants = spaceGrants();
+    return draftReads.run(route.id, async (signal, current) => {
+      const allowed = () => current() && visible() && available();
+      try {
+        if (!allowed()) return;
+        const next = await client.getPageDraft(route.id, signal);
+        if (!allowed()) return;
+        if (next.id !== route.id || next.space_id !== (route.spaceId ?? null) || (route.returnPage && next.page_id !== route.returnPage)
+          || (next.space_id && !grants.get(next.space_id)?.()) || !scopeVisible(next)) { missing(); return; }
+        grant = sessionGuard(next.space_id ?? undefined);
+        draft.set(next);
+        diagnostics.set(next.diagnostics);
+        outside.set(next.outside_selection);
+        error.set(next.error ?? "");
+      } catch (e) { if (allowed()) problem(e); }
+      finally { if (allowed()) loading.set(false); }
+    });
   }
-  visiblePolling(() => visible() && available() && (!draft() || draft()?.status === "generating"), () => 1_500, () => void load(), true);
-  async function preview() {
-    if (!client || !available() || draft()?.status !== "ready" || !draft()?.spec) return;
-    const index = ++dataSeq, grants = spaces().map(s => sessionGuard(s.id));
-    const allowed = () => available() && index === dataSeq && grants.every(ok => ok());
-    previewing.set(true);
-    try {
-      const values = await client.pageDraftData(route.id);
-      if (allowed()) data.set(values);
-    } catch (e) { if (allowed()) problem(e); }
-    finally { if (available() && index === dataSeq) previewing.set(false); }
+  const generating = () => !draft() || draft()?.status === "generating";
+  visiblePolling(() => visible() && available() && generating(), () => 1_500, () => void load());
+  function preview(review: Draft) {
+    if (!client || !visible() || !available()) return;
+    const grants = spaceGrants();
+    return previewReads.run(review, async (signal, current) => {
+      const allowed = () => current() && visible() && available() && tab() === "preview" && draft() === review && [...grants.values()].every(ok => ok());
+      if (!allowed()) return;
+      previewing.set(true);
+      try {
+        const values = await client.pageDraftData(route.id, signal);
+        if (allowed()) data.set(values);
+      } catch (e) { if (allowed()) problem(e); }
+      finally { if (allowed()) previewing.set(false); }
+    });
   }
+  function loadConflictHead() {
+    const target = conflict();
+    if (!client || !target || !available() || !visible() || tab() !== "changes" || currentHead()) return;
+    return headReads.run(target.pageId, async (signal, current) => {
+      const allowed = () => current() && visible() && available() && tab() === "changes" && conflict() === target;
+      if (!allowed()) return;
+      readingHead.set(true); headError.set("");
+      try {
+        const head = await client.getPage(target.pageId, signal);
+        if (!allowed()) return;
+        if (!scopeVisible(head) || head.id !== target.pageId || head.space_id !== draft()?.space_id) { missing(); return; }
+        if (head.head_version < target.version) { headError.set("Metro did not return the current version. Try again."); return; }
+        currentHead.set(head);
+      } catch (e) {
+        if (!allowed()) return;
+        if (isPageStatus(e, 404) || isPageStatus(e, 403)) missing();
+        else headError.set(pagesProblem(e));
+      } finally { if (allowed()) readingHead.set(false); }
+    });
+  }
+  let oldGrants: ReturnType<typeof spaceGrants> | undefined, oldPreview: Draft | null = null, wasVisible = false;
   effect(() => {
-    const usePreview = visible() && tab() === "preview" && draft()?.status === "ready" && !!draft()?.spec;
-    // Personal drafts may read any Space the author currently belongs to.
-    const scope = JSON.stringify(spaces().map(s => s.id).sort());
-    if (usePreview) untracked(() => { data.set(null); void preview(); });
-    else untracked(() => { ++dataSeq; data.set(null); previewing.set(false); });
-    void scope;
+    const grants = spaceGrants(), shown = visible() && available(), review = draft();
+    const toPreview = shown && tab() === "preview" && review?.status === "ready" && review.spec ? review : null;
+    const toCompare = shown && tab() === "changes" && !!conflict();
+    const changed = !!oldGrants && !sameSpaceGrants(oldGrants, grants);
+    const show = shown && !wasVisible;
+    const previewChanged = oldPreview !== toPreview || changed;
+    oldGrants = grants; wasVisible = shown; oldPreview = toPreview;
+    untracked(() => {
+      if (!shown || changed) draftReads.cancel();
+      if ((show || changed) && shown && generating()) void load();
+      if (previewChanged || !shown) { previewReads.cancel(); data.set(null); previewing.set(false); }
+      if (toPreview && previewChanged) void preview(toPreview);
+      if (!toCompare || changed) { headReads.cancel(); readingHead.set(false); }
+      if (toCompare) void loadConflictHead();
+    });
   });
 
   function back() {
@@ -105,14 +145,8 @@ export function DraftView(props: { route: DraftRoute }) {
       if (isPageStatus(e, 409) && Number.isSafeInteger(detail.head_version) && review.page_id) {
         stale.set(true);
         error.set("This draft is based on an older version. Nothing was changed. Compare with the current source or edit the prompt and generate a new draft.");
+        conflict.set({ pageId: review.page_id, version: detail.head_version! });
         tab.set("changes");
-        try {
-          const head = await client.getPage(review.page_id);
-          if (available() && scopeVisible(head) && head.id === review.page_id && head.space_id === review.space_id) currentHead.set(head);
-        } catch (headError) {
-          if (available() && (isPageStatus(headError, 404) || isPageStatus(headError, 403))) missing();
-          else if (available() && headError instanceof Error) error.set(`The page changed. Could not load the current version. ${pagesProblem(headError)}`);
-        }
       } else if (isPageStatus(e, 409) && Array.isArray(detail.outside_selection) && detail.outside_selection.length) {
         outside.set(detail.outside_selection);
         confirmOutside.set(true);
@@ -192,7 +226,12 @@ export function DraftView(props: { route: DraftRoute }) {
           <If when={!currentHead() && review().base_version !== null && review().base_source === null}>
             <Label variant="caption" color="warning">The original version is no longer in history. Its source cannot be compared.</Label>
           </If>
-          <PageDiff before={currentHead()?.source ?? review().base_source ?? ""} after={review().source ?? ""} />
+          <If when={!stale() || currentHead()} else={<Column gap={2}>
+            <If when={readingHead()}><Label color="muted">Loading current source…</Label></If>
+            <PagesError message={headError()} onRetry={() => void loadConflictHead()} />
+          </Column>}>
+            <PageDiff before={currentHead()?.source ?? review().base_source ?? ""} after={review().source ?? ""} />
+          </If>
         </If>
         <If when={tab() === "source"}><PageCode value={review().source ?? ""} readOnly /></If>
         <If when={outside().length}>

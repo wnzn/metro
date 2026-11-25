@@ -85,8 +85,8 @@ export function pagesApi(request: RequestFn) {
   const draft = (id: string) => `${root}/drafts/${segment(id, "draft")}`;
   // The transport parses JSON; the renderer separately treats the tree, data
   // paths and action capabilities as untrusted values.
-  async function json<T>(method: Parameters<RequestFn>[0], path: string, body?: unknown): Promise<T> {
-    const value = await request(method, path, body);
+  async function json<T>(method: Parameters<RequestFn>[0], path: string, body?: unknown, signal?: AbortSignal): Promise<T> {
+    const value = await request(method, path, body, signal);
     if (!value || typeof value !== "object" || Array.isArray(value)) {
       throw new ApiError("protocol", "Metro did not return a Pages response.");
     }
@@ -100,10 +100,10 @@ export function pagesApi(request: RequestFn) {
   return {
     listPages: (deleted = false) => list<"pages", PageMeta>("pages", root + (deleted ? "?deleted=true" : "")),
     pageTemplates: () => list<"templates", Template>("templates", `${root}/templates`),
-    getPage: (id: string) => json<Page>("GET", page(id)),
+    getPage: (id: string, signal?: AbortSignal) => json<Page>("GET", page(id), undefined, signal),
     createPage: (body: PageTarget & ({ template: string; room?: string; agent?: string } | { source: string })) =>
       json<Page>("POST", root, body),
-    validatePage: (target: PageTarget, source: string) => json<Validation>("POST", `${root}/validate`, { ...target, source }),
+    validatePage: (target: PageTarget, source: string, signal?: AbortSignal) => json<Validation>("POST", `${root}/validate`, { ...target, source }, signal),
     patchPage: (id: string, body: { title?: string; base_version?: number; icon?: string | null; members_edit?: boolean }) =>
       json<Page>("PATCH", page(id), body),
     deletePage: async (id: string) => { await request("DELETE", page(id)); },
@@ -113,7 +113,7 @@ export function pagesApi(request: RequestFn) {
     savePage: (id: string, base_version: number, source: string) => json<Page>("POST", `${page(id)}/versions`, { base_version, source }),
     restorePageVersion: (id: string, version: number, base_version: number) =>
       json<Page>("POST", `${page(id)}/versions/${version}/restore`, { base_version }),
-    pageData: (id: string) => json<PageData>("POST", `${page(id)}/data`, {}),
+    pageData: (id: string, signal?: AbortSignal) => json<PageData>("POST", `${page(id)}/data`, {}, signal),
     pageAction: (id: string, click: PageClick) => json<ClickResult>("POST", `${page(id)}/actions`, click),
     pinPage: (id: string, pinned: boolean, position?: number) =>
       json<Pick<PageMeta, "pinned" | "position">>("PUT", `${page(id)}/prefs`, { pinned, position }),
@@ -122,9 +122,9 @@ export function pagesApi(request: RequestFn) {
         ...target, prompt, provider_connection_id: choice?.connectionId,
         model_id: choice?.modelId, reasoning_effort: choice?.reasoningEffort,
       }),
-    getPageDraft: (id: string) => json<Draft>("GET", draft(id)),
+    getPageDraft: (id: string, signal?: AbortSignal) => json<Draft>("GET", draft(id), undefined, signal),
     discardPageDraft: async (id: string) => { await request("DELETE", draft(id)); },
     applyPageDraft: (id: string, confirm_outside = false) => json<Page>("POST", `${draft(id)}/apply`, { confirm_outside }),
-    pageDraftData: (id: string) => json<PageValues>("POST", `${draft(id)}/data`, {}),
+    pageDraftData: (id: string, signal?: AbortSignal) => json<PageValues>("POST", `${draft(id)}/data`, {}, signal),
   };
 }

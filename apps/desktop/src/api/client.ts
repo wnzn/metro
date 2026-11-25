@@ -294,7 +294,7 @@ export type ModelRouting = {
 };
 
 /** The transport other API modules (src/api/discovery.ts) build on. */
-export type RequestFn = (method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown) => Promise<unknown>;
+export type RequestFn = (method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown, signal?: AbortSignal) => Promise<unknown>;
 
 /** A device connection's metro-connector (GET /v1/providers/{id}/device-token). */
 export type DeviceStatus = { paired: boolean; online: boolean; lastSeenSecs: number | null };
@@ -355,31 +355,43 @@ export type Client = ReturnType<typeof createClient>;
 export function createClient(options: ClientOptions) {
   const timeoutMs = options.timeoutMs ?? 10_000;
 
-  async function request(method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown): Promise<unknown> {
+  const request: RequestFn = async (method, path, body, signal) => {
     const url = options.baseUrl + path;
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(), timeoutMs);
     const onOuterAbort = () => timeout.abort();
     options.signal?.addEventListener("abort", onOuterAbort);
+    signal?.addEventListener("abort", onOuterAbort);
+    const cancelled = () => options.signal?.aborted || signal?.aborted;
+    const checkCancelled = () => { if (cancelled()) throw new ApiError("aborted", "Cancelled"); };
     const headers: Record<string, string> = {
       Accept: "application/json",
       Authorization: `Bearer ${options.token()}`,
     };
     if (body !== undefined) headers["Content-Type"] = "application/json";
 
-    let response: Response;
     try {
-      if (options.signal?.aborted) throw new ApiError("aborted", "Cancelled");
-      response = await fetch(url, {
+      checkCancelled();
+      const response = await fetch(url, {
         method,
         headers,
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: timeout.signal,
         redirect: "error", // never forward the bearer token to another location
       });
+      checkCancelled();
+      await checkStatus(response, method, path, path.startsWith("/v1/pages"));
+      const text = await response.text();
+      checkCancelled();
+      if (!text.trim()) return null;
+      try {
+        return JSON.parse(text);
+      } catch {
+        throw new ApiError("protocol", `${method} ${path} answered with something that is not JSON.`, response.status);
+      }
     } catch (error) {
+      checkCancelled();
       if (error instanceof ApiError) throw error;
-      if (options.signal?.aborted) throw new ApiError("aborted", "Cancelled");
       if (timeout.signal.aborted) {
         throw new ApiError("timeout", `${options.baseUrl} did not answer ${method} ${path} within ${Math.round(timeoutMs / 1000)}s.`);
       }
@@ -388,17 +400,9 @@ export function createClient(options: ClientOptions) {
     } finally {
       clearTimeout(timer);
       options.signal?.removeEventListener("abort", onOuterAbort);
+      signal?.removeEventListener("abort", onOuterAbort);
     }
-
-    await checkStatus(response, method, path, path.startsWith("/v1/pages"));
-    const text = await response.text();
-    if (!text.trim()) return null;
-    try {
-      return JSON.parse(text);
-    } catch {
-      throw new ApiError("protocol", `${method} ${path} answered with something that is not JSON.`, response.status);
-    }
-  }
+  };
 
   /**
    * Raw bytes both ways (library uploads and file content): the same
