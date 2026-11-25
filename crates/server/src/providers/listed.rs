@@ -152,6 +152,7 @@ mod tests {
             sealed_key: None,
             capability: Capability::Chat,
             config_rev: 0,
+            edit_rev: 0,
         }
     }
 

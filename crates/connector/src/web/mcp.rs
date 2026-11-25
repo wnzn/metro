@@ -100,7 +100,6 @@ async fn post(
     body: &Value,
     want: Option<u64>,
 ) -> Result<Reply, McpError> {
-    (t.gate)().map_err(McpError::Stopped)?;
     let mut rb = t
         .http
         .post(t.url)
@@ -115,6 +114,7 @@ async fn post(
             rb = rb.header(SESSION_HEADER, id);
         }
     }
+    (t.gate)().map_err(McpError::Stopped)?;
     let mut resp = rb
         .send()
         .await

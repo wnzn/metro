@@ -27,9 +27,9 @@ import {
 } from "../../api/spaces";
 import type { AgentPatch, ModelSelection, SpaceAgent, SpaceDetails, SpacePrefs, SpacePrefsView } from "../../api/spaces";
 import { apiClient, closeSettings, describe, disconnect, isAborted, me, onManageOpen, onSessionEnd, onTransientClear, rememberMembers, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
-import { beginSpaceRunnerRead, beginSpaceRunnerWrite, dismissReveal, rememberSpaceRunner, revealDedicatedToken, revealed, spaceRunners } from "../../settings";
+import { beginSpaceRunnerWrite, dismissReveal, revealDedicatedToken, revealed, spaceRunners } from "../../settings";
+import { beginSpaceRunnerObservation } from "../../spaceRunnerObservations";
 import { dismissRunnerOffer, installedRunnerChoice, snapshotInstalledRunner } from "../../runnersState";
-import { recordAttachedFolder } from "../installedRunner/installedRunner";
 import { clearLocalToolsMessages, localToolsBusy } from "../localtools/localTools";
 import { noteClassifierPrefs } from "./askAgent";
 import { adoptAgent, agentList, dropAgent, ensureSpaceAgents, forgetSpaceAgents, invalidateSpaceAgents, isOptInTool, showPicture, spaceAgents } from "./agents";
@@ -365,13 +365,13 @@ async function readRunner(api: Client, sid: string): Promise<RunnerSnapshot> {
 }
 
 async function refreshAssignment(api: Client, sid: string, current: () => boolean, show: () => boolean) {
-  const latestRead = beginSpaceRunnerRead(sid);
-  const valid = () => latestRead() && current();
+  const observation = beginSpaceRunnerObservation(sid);
+  const valid = () => observation.isCurrent() && current();
   try {
     const next = await readRunner(api, sid);
     if (!valid()) return undefined;
     batch(() => {
-      rememberSpaceRunner(sid, next.runner);
+      observation.publish(next.runner);
       if (show()) {
         runnerSource.set({ sid, legacy: next.legacy, guardedTokenChanges: next.guardedTokenChanges });
         runnerError.set(null);
@@ -530,7 +530,6 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       const space = spaces().find((s) => s.id === sid && s.role === "owner");
       if (space) {
         dismissRunnerOffer();
-        recordAttachedFolder(space);
       }
     }
     if (!live() || !writeCurrent()) return;

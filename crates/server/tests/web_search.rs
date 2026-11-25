@@ -42,6 +42,10 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_with_run_history(None).await
+    }
+
+    async fn start_with_run_history(max_history: Option<usize>) -> Self {
         let user = |id: &str| UserIdentity {
             id: id.to_owned(),
             actor: id.to_owned(),
@@ -58,9 +62,15 @@ impl Server {
             limits: Limits::default(),
             org_admins: Vec::new(),
         };
-        let state = AppState::new(config, Db::open_in_memory().unwrap(), Arc::new(auth))
+        let mut state = AppState::new(config, Db::open_in_memory().unwrap(), Arc::new(auth))
             .await
             .unwrap();
+        if let Some(max_history) = max_history {
+            state.runs = Arc::new(metro_server::orchestration::RunRegistry::with_limits(
+                10,
+                max_history,
+            ));
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let app = router(state.clone());
@@ -679,7 +689,7 @@ async fn searches_run_on_the_senders_computer_never_the_owners() {
 
 #[tokio::test]
 async fn offline_computer_fails_at_once_and_the_run_answers_without_web_data() {
-    let s = Server::start().await;
+    let s = Server::start_with_run_history(Some(0)).await;
     let sid = s.space(BOB, &["alice"]).await;
     s.agent_tools(BOB, &sid, json!(["web_search"])).await;
     let (_, model) = s.chat_device(ALICE).await;
@@ -734,6 +744,32 @@ async fn offline_computer_fails_at_once_and_the_run_answers_without_web_data() {
             .contains("never run on the server or someone else's computer")
     );
     assert_eq!(error["activity"]["tool"]["failure"], "offline");
+    assert_eq!(error["activity"]["tool"]["starter_id"], "alice");
+    let run = error["activity"]["id"].as_str().unwrap();
+    assert_eq!(
+        s.get(ALICE, &format!("/v1/runs/{run}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    // The other Space member reads the same server-stamped id without help
+    // from the in-memory run registry. Outsiders cannot read the event.
+    let path = format!("{room}/events");
+    let bob_view = s.events(BOB, &path).await;
+    assert!(
+        bob_view.iter().any(|event| event["id"] == error["id"]
+            && event["activity"]["tool"]["starter_id"] == "alice")
+    );
+    assert_eq!(s.get(CAROL, &path).await.0, StatusCode::NOT_FOUND);
+    // A member can send message text, not a forged activity envelope.
+    assert_eq!(
+        s.post(
+            BOB,
+            &format!("{room}/messages"),
+            json!({"text": "fixture", "activity": {"tool": {"starter_id": "bob"}}}),
+        )
+        .await
+        .0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
 }
 
 #[tokio::test]

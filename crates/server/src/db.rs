@@ -92,6 +92,9 @@ pub struct Event {
     /// `[{"kind":"agent"}]`, `[{"kind":"user","id":"bob"}]`, ... Empty for
     /// everything but messages.
     pub mentions: serde_json::Value,
+    /// Display ranges in this event's `text`, indexed into its `mentions`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub spans: Vec<crate::mentions::MentionSpan>,
     /// `room`, `agent`, `users` or `mixed`; `room` for non-messages.
     pub audience: String,
     /// The agent turn or Demo run that wrote this event, when the server
@@ -286,6 +289,7 @@ pub struct Addressed {
     /// A JSON array of mentions.
     pub mentions: serde_json::Value,
     pub audience: String,
+    pub spans: Vec<crate::mentions::MentionSpan>,
 }
 
 impl Addressed {
@@ -294,6 +298,7 @@ impl Addressed {
         Self {
             mentions: serde_json::Value::Array(Vec::new()),
             audience: "room".to_owned(),
+            spans: Vec::new(),
         }
     }
 }
@@ -1072,7 +1077,7 @@ impl Db {
                 addressed.mentions.to_string(),
                 addressed.audience,
                 at,
-                activity_json(activity)?,
+                event_metadata_json(activity, &addressed.spans)?,
             ],
         )?;
         Ok(new_event(
@@ -1113,25 +1118,10 @@ impl Db {
         if !allowed {
             return Ok(None);
         }
-        let at = now_ms();
-        tx.execute(
-            "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, mentions, audience, created_at, activity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
-            params![
-                space_id,
-                room_id,
-                kind,
-                author.name,
-                author.id,
-                text,
-                addressed.mentions.to_string(),
-                addressed.audience,
-                at,
-            ],
-        )?;
-        let id = tx.last_insert_rowid();
+        let event =
+            Self::append_event_in(&tx, space_id, room_id, kind, author, text, addressed, None)?;
         tx.commit()?;
-        Ok(Some(new_event(id, kind, author, text, addressed, None, at)))
+        Ok(Some(event))
     }
 
     /// Events of a room with an id above `after`, oldest first.
@@ -1313,19 +1303,33 @@ fn row_space(r: &rusqlite::Row<'_>) -> rusqlite::Result<SpaceView> {
 
 fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let mentions: String = r.get(5)?;
+    let metadata: Option<String> = r.get(7)?;
+    let kind: String = r.get(1)?;
+    #[derive(Deserialize)]
+    struct Spans {
+        spans: Vec<crate::mentions::MentionSpan>,
+    }
+    let spans = if kind == kind::MESSAGE {
+        metadata
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<Spans>(s).ok())
+            .map(|m| m.spans)
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    };
     Ok(Event {
         id: r.get(0)?,
-        kind: r.get(1)?,
+        kind,
         actor: r.get(2)?,
         actor_id: r.get(3)?,
         text: r.get(4)?,
         mentions: serde_json::from_str(&mentions)
             .unwrap_or_else(|_| serde_json::Value::Array(Vec::new())),
+        spans,
         audience: r.get(6)?,
         // Unreadable metadata is dropped, never guessed.
-        activity: r
-            .get::<_, Option<String>>(7)?
-            .and_then(|a| serde_json::from_str(&a).ok()),
+        activity: metadata.and_then(|a| serde_json::from_str(&a).ok()),
         created_at: r.get::<_, Option<i64>>(8)?.and_then(event_time),
         attachments: Vec::new(),
     })
@@ -1333,6 +1337,25 @@ fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
 
 fn activity_json(activity: Option<&Activity>) -> anyhow::Result<Option<String>> {
     Ok(activity.map(serde_json::to_string).transpose()?)
+}
+
+/// Space event metadata shares the existing JSON column. Keep the old
+/// activity keys and the mentions array unchanged, including for older
+/// readers. A span-only object has no activity id, so it is not a run event.
+fn event_metadata_json(
+    activity: Option<&Activity>,
+    spans: &[crate::mentions::MentionSpan],
+) -> anyhow::Result<Option<String>> {
+    if spans.is_empty() {
+        return activity_json(activity);
+    }
+    #[derive(Serialize)]
+    struct Metadata<'a> {
+        #[serde(flatten)]
+        activity: Option<&'a Activity>,
+        spans: &'a [crate::mentions::MentionSpan],
+    }
+    Ok(Some(serde_json::to_string(&Metadata { activity, spans })?))
 }
 
 /// Additive: older databases gain a `description` column on `spaces`;
@@ -1628,6 +1651,7 @@ pub(crate) fn new_event(
         actor_id: author.id.clone(),
         text: text.to_owned(),
         mentions: addressed.mentions.clone(),
+        spans: addressed.spans.clone(),
         audience: addressed.audience.clone(),
         activity: activity.cloned(),
         created_at: event_time(created_at_ms),

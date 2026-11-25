@@ -82,6 +82,26 @@ pub struct LastUpdate {
     pub at: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub detail: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_code: Option<InstallFailure>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum InstallFailure {
+    InstallerBusy,
+    StageVerificationFailed,
+    BackupFailed,
+}
+
+impl LastUpdate {
+    fn blocks(&self, own: Version, target: Version) -> bool {
+        self.outcome == "install_failed"
+            // Old launchers did not distinguish verification from other failures.
+            && matches!(self.failure_code, None | Some(InstallFailure::StageVerificationFailed))
+            && Version::parse(&self.from) == Some(own)
+            && Version::parse(&self.to) == Some(target)
+    }
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -211,6 +231,9 @@ pub fn message_for(code: &str) -> &'static str {
         "installer_busy" => {
             "Another Metro install or update is running. Try again when it has finished."
         }
+        install::JOURNAL_UNCERTAIN => {
+            "Metro couldn't verify the update journal. Keep the installation and workspace data unchanged and contact the Metro maintainers."
+        }
         "missing_libraries" => "This version needs system libraries that aren't installed.",
         "not_latest" => "That version isn't the latest verified release anymore. Check again.",
         _ => "The update couldn't be completed. Nothing was changed.",
@@ -314,12 +337,20 @@ fn save_floor(dir: &Path, version: Version) -> std::io::Result<()> {
 
 fn offered(status: &Status, own: Version, target: Version) -> bool {
     target > own
+        && !blocked_stage(status, own, target)
         && status.highest_seen.as_deref().and_then(Version::parse) == Some(target)
         && status
             .latest
             .as_ref()
             .is_some_and(|l| Version::parse(&l.version) == Some(target))
         && status.evidence.is_some()
+}
+
+fn blocked_stage(status: &Status, own: Version, target: Version) -> bool {
+    status
+        .last_update
+        .as_ref()
+        .is_some_and(|last| last.blocks(own, target))
 }
 
 fn supports_managed_update(kind: &InstallKind) -> bool {
@@ -529,6 +560,10 @@ impl Updater {
     fn authorizes(&self, inner: &Inner, version: Version) -> bool {
         !inner.floor_unreadable
             && !inner.status_error
+            && !inner
+                .failure
+                .as_ref()
+                .is_some_and(|f| f.code == install::JOURNAL_UNCERTAIN)
             && offered(&inner.status, self.cfg.own, version)
             && inner.status.evidence.as_ref().is_some_and(|e| {
                 e.verify(self.cfg.verifier.as_ref())
@@ -536,11 +571,23 @@ impl Updater {
             })
     }
 
-    /// Record how the last update ended (the launcher, after a rollback).
-    pub fn record_outcome(&self, outcome: LastUpdate) {
+    /// Record a pre-trial failure. In particular, a check of release metadata
+    /// cannot make a failed stage safe; leave its files/journal untouched.
+    pub fn record_install_failure(&self, target: Version, reason: InstallFailure) -> bool {
         let mut inner = self.lock();
-        inner.status.last_update = Some(outcome);
+        inner.status.last_update = Some(LastUpdate {
+            from: self.cfg.own.to_string(),
+            to: target.to_string(),
+            outcome: "install_failed".into(),
+            at: now_ms(),
+            detail: None,
+            failure_code: Some(reason),
+        });
+        if reason == InstallFailure::StageVerificationFailed {
+            inner.phase = Phase::Idle;
+        }
         self.save_status(&mut inner);
+        !inner.status_error
     }
 
     /// The `UpdateState` the UI reads (`GET /v1/update`).
@@ -592,6 +639,12 @@ impl Updater {
         }
         if let Some(l) = &inner.status.latest {
             v["latest"] = serde_json::to_value(l).unwrap_or(Value::Null);
+        }
+        if inner.phase == Phase::Ready
+            && let Some((_, id)) = &inner.staged
+        {
+            // An opaque comparison value, not the journal identifier or a path.
+            v["stage_revision"] = metro_release::hex(&metro_release::sha256(id.as_bytes())).into();
         }
         if let Some((done, total)) = inner.progress {
             v["progress"] = json!({"done": done, "total": total});
@@ -831,6 +884,24 @@ impl Updater {
         let Some(target) = Version::parse(version) else {
             return Err(refuse(400, "bad_request", "version must be X.Y.Z"));
         };
+        if inner
+            .failure
+            .as_ref()
+            .is_some_and(|f| f.code == install::JOURNAL_UNCERTAIN)
+        {
+            return Err(refuse(
+                409,
+                install::JOURNAL_UNCERTAIN,
+                message_for(install::JOURNAL_UNCERTAIN),
+            ));
+        }
+        if blocked_stage(&inner.status, self.cfg.own, target) {
+            return Err(refuse(
+                409,
+                "stage_verification_failed",
+                "The staged update could not be verified. Use the official installer.",
+            ));
+        }
         if !self.authorizes(&inner, target) {
             return Err(refuse(409, "not_latest", message_for("not_latest")));
         }
@@ -1110,6 +1181,18 @@ impl Updater {
                 "the update is no longer staged and offered",
             )
         };
+        lock.check(install::lock_root(&self.cfg.kind, &self.cfg.dir))?;
+        let path = install::journal_path(&self.cfg.kind, &self.cfg.dir).ok_or_else(invalid)?;
+        let j = install::load_journal(&path)
+            .map_err(|_| install::journal_uncertain())?
+            .filter(|j| {
+                j.phase == "staged"
+                    && j.id == req.journal_id
+                    && j.from == self.cfg.own.to_string()
+                    && j.to == req.version.to_string()
+            })
+            .ok_or_else(install::journal_uncertain)?;
+        install::check_staged_current(&self.cfg.kind, &j)?;
         if !self.can_update_in_app() {
             return Err(invalid());
         }
@@ -1130,15 +1213,6 @@ impl Updater {
                 .manifest
                 .clone()
         };
-        let path = install::journal_path(&self.cfg.kind, &self.cfg.dir).ok_or_else(invalid)?;
-        let j = install::load_journal(&path)?
-            .filter(|j| {
-                j.phase == "staged"
-                    && j.id == req.journal_id
-                    && j.from == self.cfg.own.to_string()
-                    && j.to == req.version.to_string()
-            })
-            .ok_or_else(invalid)?;
         let file = install::verify_staged(
             &self.cfg.kind,
             &self.cfg.dir,

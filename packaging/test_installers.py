@@ -316,6 +316,54 @@ class DesktopInstallerTests(unittest.TestCase):
                 self.assertIn("start it once", result.stderr)
             self.assertEqual(journal.read_text(), text)
 
+    def test_malformed_journal_has_read_only_diagnostics_and_preserves_workspace(self):
+        self.box.run(DESKTOP, "install", "--archive", self.archive(), check=True)
+        journal = self.app_root / ".update.json"
+        journal.write_bytes(b"{")
+        current = self.app_root / "current"
+        backup = self.data / "update/db-snapshot-0123456789abcdef/metro.sqlite3"
+        live = self.data / "local/db/metro.sqlite3"
+        gate = self.data / "desktop-update.json"
+        for path, content in [(backup, b"backup"), (live, b"live"), (gate, b"private gate")]:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(content)
+        archive = self.archive("0.3.1")
+        for args in (("status",), ("update", "--archive", archive), ("uninstall",)):
+            result = self.box.run(DESKTOP, *args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("[update_journal_unknown]", result.stderr)
+            self.assertIn("read-only diagnosis", result.stderr)
+            self.assertIn("https://github.com/wnzn/metro/issues", result.stderr)
+            self.assertNotIn("private gate", result.stdout + result.stderr)
+            self.assertEqual(journal.read_bytes(), b"{")
+            self.assertEqual(os.readlink(current), "versions/0.3.0")
+            self.assertEqual(backup.read_bytes(), b"backup")
+            self.assertEqual(live.read_bytes(), b"live")
+            self.assertEqual(gate.read_bytes(), b"private gate")
+        # A matching stage can be reported without giving the installer
+        # authority to retire the workspace's separate gate.
+        valid = b'{"version":1,"id":"0123456789abcdef","from":"0.3.0","to":"0.3.2","phase":"staged","started_at":0}'
+        journal.write_bytes(valid)
+        status = self.box.run(DESKTOP, "status", check=True)
+        self.assertIn("Update journal phase: staged (read-only diagnosis", status.stdout)
+        self.assertIn("[update_recovery_required]", self.box.run(DESKTOP, "update", "--archive", archive).stderr)
+        self.assertEqual(journal.read_bytes(), valid)
+        self.assertEqual(os.readlink(current), "versions/0.3.0")
+        self.assertEqual(gate.read_bytes(), b"private gate")
+        self.assertEqual(backup.read_bytes(), b"backup")
+        # A gate without its journal is not a reason to select a version or
+        # run the installer to reconstruct a missing record.
+        journal.unlink()  # simulate lost journal in this disposable fixture
+        for args in (("status",), ("update", "--archive", archive), ("uninstall",)):
+            result = self.box.run(DESKTOP, *args)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("[update_journal_unknown]", result.stderr)
+            self.assertIn("update journal is missing", result.stderr)
+            self.assertEqual(os.readlink(current), "versions/0.3.0")
+            self.assertEqual(backup.read_bytes(), b"backup")
+            self.assertEqual(live.read_bytes(), b"live")
+            self.assertEqual(gate.read_bytes(), b"private gate")
+
     def test_published_desktop_installer_and_the_current_installer_exclude_each_other(self):
         self.box.reciprocal_published_lock(DESKTOP, self.archive(), self.app_root / ".metro-desktop-install")
 
@@ -382,6 +430,16 @@ class DesktopInstallerTests(unittest.TestCase):
         r = self.box.run(DESKTOP, "uninstall")
         self.assertNotEqual(r.returncode, 0)
         self.assertTrue((self.app_root / "someone-elses-file").exists())
+
+    def test_refuses_foreign_install_directory_with_newline_entry(self):
+        self.app_root.mkdir(mode=0o700, parents=True)
+        foreign = self.app_root / "\n"
+        foreign.write_text("keep")
+        result = self.box.run(DESKTOP, "install", "--archive", self.archive())
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not created by this installer", result.stderr)
+        self.assertEqual(list(self.app_root.iterdir()), [foreign])
+        self.assertEqual(foreign.read_text(), "keep")
 
     def test_missing_runtime_explains_then_install_deps_runs_fixed_list(self):
         a = self.archive()
@@ -468,6 +526,16 @@ class RunnerInstallerTests(unittest.TestCase):
 
     def test_published_runner_installer_and_the_current_installer_exclude_each_other(self):
         self.box.reciprocal_published_lock(RUNNER, self.archive, self.install_root / ".metro-runner-install")
+
+    def test_refuses_foreign_install_directory_with_newline_entry(self):
+        self.install_root.mkdir(mode=0o700, parents=True)
+        foreign = self.install_root / ".lock\n.lock"
+        foreign.write_text("keep")
+        result = self.box.run(RUNNER, "install", "--archive", self.archive)
+        self.assertNotEqual(result.returncode, 0, result.stdout)
+        self.assertIn("not created by this installer", result.stderr)
+        self.assertEqual(list(self.install_root.iterdir()), [foreign])
+        self.assertEqual(foreign.read_text(), "keep")
 
     def test_full_lifecycle_never_exposes_the_token(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)

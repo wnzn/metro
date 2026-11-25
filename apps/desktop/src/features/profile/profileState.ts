@@ -187,6 +187,16 @@ export function profileDirty(): boolean {
   return !!p && (nameDraft().trim() !== p.displayName || bioDraft().trim() !== p.bio.trim());
 }
 
+export function revertProfile() {
+  const p = myProfile();
+  if (!p || savingProfile()) return;
+  batch(() => {
+    nameDraft.set(p.displayName);
+    bioDraft.set(p.bio);
+    profileNotice.set(null);
+  });
+}
+
 function adoptMine(p: Profile, keepDrafts = false) {
   batch(() => {
     myProfile.set(p);
@@ -206,7 +216,7 @@ function adoptMine(p: Profile, keepDrafts = false) {
 export async function loadMyProfile(): Promise<void> {
   const api = apiClient();
   const id = me();
-  if (!api || !id || myProfileLoading()) return;
+  if (!api || !id || myProfileLoading() || savingProfile() || pictureBusy()) return;
   const gen = generation;
   const ok = sessionGuard();
   const live = () => ok() && gen === generation;
@@ -241,7 +251,7 @@ export function profileProblem(): string | null {
 export async function saveProfile(): Promise<void> {
   const api = apiClient();
   const p = myProfile();
-  if (!api || !p || savingProfile() || profileProblem()) return;
+  if (!api || !p || savingProfile() || myProfileLoading() || pictureBusy() || profileProblem()) return;
   const gen = generation;
   const ok = sessionGuard();
   const live = () => ok() && gen === generation;

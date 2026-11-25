@@ -8,26 +8,48 @@
 // Each page owns its scroll area and loads its data when opened
 // (src/settings.ts, src/routing.ts).
 
-import { closeSettings, openSettings, settingsOpen, settingsSection } from "../store";
-import type { SettingsSection } from "../store";
-import { Column, compactWidth, IconButton, Label, Modal, ModalNav, ModalTab, ModalTabRow, PanelToggle, RailButton, Row, settingsPanel, Spacer, Surface } from "../ui";
+import type { JSX } from "nsh";
+import { closeSettings, enableSettingsExtension, openSettings, settingsExtensionAvailable, settingsOpen, settingsSection } from "../store";
+import type { SettingsExtension, SettingsSection } from "../store";
+import { Column, compactWidth, Divider, IconButton, Label, Modal, ModalNav, ModalNavSection, ModalTab, ModalTabRow, PanelToggle, RailButton, Row, settingsPanel, Spacer, Surface } from "../ui";
 import type { IconName } from "../ui";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { ConnectionBanner } from "./Conversation";
 import { MonitoringSettings } from "./MonitoringSettings";
 import { ProfileSettings } from "./profile/ProfileSettings";
 import { ProvidersSettings } from "./ProvidersSettings";
-import { RoutingSettings } from "./RoutingSettings";
+import { ModelChoicesSettings } from "./ModelChoicesSettings";
 import { RunnersSettings } from "./RunnersSettings";
 
-export const SETTINGS_PAGES: readonly { section: SettingsSection; label: string; icon: IconName }[] = [
-  { section: "profile", label: "Profile", icon: "person" },
-  { section: "runners", label: "Runners", icon: "runner" },
-  { section: "providers", label: "Model providers", icon: "providers" },
-  { section: "routing", label: "Model routing", icon: "routing" },
-  { section: "monitoring", label: "Monitoring", icon: "clock" },
-  { section: "appearance", label: "Appearance", icon: "appearance" },
+type Page = { section: SettingsSection; label: string; icon: IconName; hook?: string };
+type ExtensionPage = { Page: () => JSX.Element; dot?: () => string | undefined };
+const extensions: Partial<Record<SettingsExtension, ExtensionPage>> = {};
+/** Register once at startup, when the implementation is present. No stub tabs or deep links. */
+export function registerSettingsPage(section: SettingsExtension, page: ExtensionPage) {
+  extensions[section] = page;
+  enableSettingsExtension(section);
+}
+
+const GROUPS: readonly { id: string; label: string; pages: readonly Page[] }[] = [
+  { id: "you", label: "You", pages: [
+    { section: "profile", label: "Profile", icon: "person" },
+    { section: "connections", label: "Model connections", icon: "providers", hook: "providers" },
+    { section: "models", label: "Model choices", icon: "routing", hook: "routing" },
+    { section: "runners", label: "Runners", icon: "runner" },
+  ] },
+  { id: "computer", label: "This computer", pages: [
+    { section: "websearch", label: "Web search", icon: "search" },
+    { section: "appearance", label: "Appearance", icon: "appearance" },
+  ] },
+  { id: "metro", label: "Metro", pages: [
+    { section: "monitoring", label: "Monitoring", icon: "clock" },
+    { section: "about", label: "About & updates", icon: "metro" },
+  ] },
 ];
+const isExtension = (section: SettingsSection): section is SettingsExtension => section === "websearch" || section === "about";
+const visible = (pages: readonly Page[]) => pages.filter((p) => !isExtension(p.section) || settingsExtensionAvailable(p.section));
+export const settingsPageDot = (section: SettingsSection) => isExtension(section) ? extensions[section]?.dot?.() : undefined;
+const tabHook = (page: Page) => page.hook ?? page.section; // keep existing automation hooks
 
 /** The Settings modal. Mounted once by the Shell; shown while Settings is open. */
 export function SettingsModal() {
@@ -35,73 +57,73 @@ export function SettingsModal() {
     <Modal open={settingsOpen()} title="Settings" onClose={closeSettings} testID="settings-dialog">
       {/* Unmounted while closed: a typed key or a half-filled form never outlives the modal. */}
       <If when={settingsOpen()}>
-        <If when={compactWidth()} else={<WideSettings />}>
-          <CompactSettings />
-        </If>
+        <SettingsContent />
       </If>
     </Modal>
   );
 }
 
-function WideSettings() {
+function SettingsContent() {
+  const compact = compactWidth;
   return (
-    <Row grow testID="settings">
-      {/* Collapsed, the sections stay as a rail of their icons. */}
-      <If
-        when={settingsPanel.open()}
-        else={
-          <Surface variant="rail" testID="settings-rail" accessibilityLabel="Settings sections">
-            <Each of={SETTINGS_PAGES} key={(p) => p.section}>
-              {(p) => (
-                <RailButton
-                  testID={`rail-settings:${p().section}`}
-                  label={p().label}
-                  icon={p().icon}
-                  selected={settingsSection() === p().section}
-                  onPress={() => openSettings(p().section)}
-                />
-              )}
-            </Each>
-          </Surface>
-        }
-      >
-        <ModalNav testID="settings-nav" accessibilityLabel="Settings sections">
-          <Row padX={3} padY={2}>
-            <Label variant="heading" heading>Settings</Label>
-          </Row>
-          <Tabs compact={false} />
-        </ModalNav>
-      </If>
+    <Row grow stacked={compact()} testID="settings">
+      <If when={!compact()}><WideSections /></If>
       <Column grow>
-        <Row align="center" padX={3} padY={2}>
+        <Row align="center" padX={compact() ? 4 : 3} padY={2} gap={compact() ? 2 : undefined}>
+          <If when={compact()}><Label variant="heading" heading>Settings</Label></If>
           <SectionsToggle />
           <Spacer />
           <CloseButton />
         </Row>
+        <If when={compact() && settingsPanel.open()}>
+          <ModalTabRow testID="settings-nav">
+            <Tabs compact />
+          </ModalTabRow>
+        </If>
+        {/* Switching widths replaces the navigation, not the open page or its reads. */}
         <SettingsPage />
       </Column>
     </Row>
   );
 }
 
-function CompactSettings() {
+function WideSections() {
+  // Collapsed, the sections stay as a rail of their icons.
   return (
-    <Column grow testID="settings">
-      <Row align="center" padX={4} padY={2} gap={2}>
-        <Label variant="heading" heading>
-          Settings
-        </Label>
-        <SectionsToggle />
-        <Spacer />
-        <CloseButton />
-      </Row>
-      <If when={settingsPanel.open()}>
-        <ModalTabRow testID="settings-nav">
-          <Tabs compact />
-        </ModalTabRow>
-      </If>
-      <SettingsPage />
-    </Column>
+    <If
+      when={settingsPanel.open()}
+      else={
+        <Surface variant="rail" testID="settings-rail" accessibilityLabel="Settings sections">
+          <Each of={GROUPS} key={(g) => g.id}>
+            {(g, i) => (
+              <>
+                <If when={i() > 0}><Divider /></If>
+                <Each of={visible(g().pages)} key={(p) => p.section}>
+                  {(p) => (
+                    <RailButton
+                      testID={`rail-settings:${tabHook(p())}`}
+                      label={p().label}
+                      icon={p().icon}
+                      dot={settingsPageDot(p().section)}
+                      dotTestID={`rail-settings:${tabHook(p())}:dot`}
+                      selected={settingsSection() === p().section}
+                      onPress={() => openSettings(p().section)}
+                    />
+                  )}
+                </Each>
+              </>
+            )}
+          </Each>
+        </Surface>
+      }
+    >
+      <ModalNav testID="settings-nav" accessibilityLabel="Settings sections">
+        <Row padX={3} padY={2}>
+          <Label variant="heading" heading>Settings</Label>
+        </Row>
+        <Tabs compact={false} />
+      </ModalNav>
+    </If>
   );
 }
 
@@ -112,16 +134,24 @@ function SectionsToggle() {
 
 function Tabs(props: { compact: boolean }) {
   return (
-    <Each of={SETTINGS_PAGES} key={(p) => p.section}>
-      {(p) => (
-        <ModalTab
-          testID={`nav-settings:${p().section}`}
-          label={p().label}
-          icon={p().icon}
-          compact={props.compact}
-          selected={settingsSection() === p().section}
-          onPress={() => openSettings(p().section)}
-        />
+    <Each of={GROUPS} key={(g) => g.id}>
+      {(g, i) => (
+        <>
+          <ModalNavSection testID={`settings-group:${g().id}`} label={g().label} compact={props.compact} divided={i() > 0} />
+          <Each of={visible(g().pages)} key={(p) => p.section}>
+            {(p) => (
+              <ModalTab
+                testID={`nav-settings:${tabHook(p())}`}
+                label={p().label}
+                icon={p().icon}
+                dot={settingsPageDot(p().section)}
+                compact={props.compact}
+                selected={settingsSection() === p().section}
+                onPress={() => openSettings(p().section)}
+              />
+            )}
+          </Each>
+        </>
       )}
     </Each>
   );
@@ -132,6 +162,7 @@ function CloseButton() {
 }
 
 function SettingsPage() {
+  const extension = (section: SettingsExtension) => settingsExtensionAvailable(section) ? extensions[section] : undefined;
   return (
     <Surface variant="panel" grow testID="settings-page">
       <ConnectionBanner />
@@ -142,11 +173,11 @@ function SettingsPage() {
       <If when={settingsSection() === "runners"}>
         <RunnersSettings />
       </If>
-      <If when={settingsSection() === "providers"}>
+      <If when={settingsSection() === "connections"}>
         <ProvidersSettings />
       </If>
-      <If when={settingsSection() === "routing"}>
-        <RoutingSettings />
+      <If when={settingsSection() === "models"}>
+        <ModelChoicesSettings />
       </If>
       <If when={settingsSection() === "monitoring"}>
         <MonitoringSettings />
@@ -154,6 +185,17 @@ function SettingsPage() {
       <If when={settingsSection() === "appearance"}>
         <AppearanceSettings />
       </If>
+      <If when={settingsSection() === "websearch" ? extension("websearch") : undefined}>
+        {(page) => <Extension page={page()} />}
+      </If>
+      <If when={settingsSection() === "about" ? extension("about") : undefined}>
+        {(page) => <Extension page={page()} />}
+      </If>
     </Surface>
   );
+}
+
+function Extension(props: { page: ExtensionPage }) {
+  const Page = props.page.Page;
+  return <Page />;
 }

@@ -64,9 +64,21 @@ fn report(opts: &RunOptions, s: RunState) {
 
 /// Serve web jobs until stopped.
 pub async fn run(client: &MetroClient, engine: &Engine, opts: &RunOptions) -> Stop {
+    run_guarded(client, engine, opts, &|| true).await
+}
+
+pub(crate) async fn run_guarded(
+    client: &MetroClient,
+    engine: &Engine,
+    opts: &RunOptions,
+    live: &(dyn Fn() -> bool + Sync),
+) -> Stop {
     let mut backoff = Duration::from_secs(1);
     let mut offline = false;
     loop {
+        if !live() {
+            return Stop::Done;
+        }
         let claim_sent = Instant::now();
         let stop_rx = opts.stop.clone();
         let claim = tokio::select! {

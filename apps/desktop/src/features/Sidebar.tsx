@@ -28,6 +28,7 @@ import { dismissRunnerOffer, runnerOfferCount, watchInstalledRunner } from "../r
 import { AccountMenu, Action, Banner, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailBrand, RailButton, ResizeHandle, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
 import type { AccountMenuItem, Tone } from "../ui";
 import { loadSavedServers, signOut } from "../savedWorkspaces";
+import { settingsPageDot } from "./SettingsView";
 import { WorkspaceDialogs, workspaceItems, WorkspaceNotice } from "./WorkspaceSwitcher";
 import { PersonAvatar } from "./profile/PersonAvatar";
 import { profileName } from "./profile/profileState";
@@ -72,7 +73,8 @@ export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
         </ScrollArea>
 
         <Column padX={2} padY={2} gap={1}>
-          <NavItem testID="nav-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
+          <NavItem testID="nav-settings" label="Settings" icon="settings" dot={settingsPageDot("about")}
+            selected={settingsOpen()} onPress={() => openSettings()} />
         </Column>
         <AccountFooter />
       </Surface>
@@ -127,7 +129,8 @@ function SidebarRail() {
           }}
         />
       </ScrollArea>
-      <RailButton testID="rail-settings" label="Settings" icon="settings" selected={settingsOpen()} onPress={() => openSettings()} />
+      <RailButton testID="rail-settings" label="Settings" icon="settings" dot={settingsPageDot("about")} dotTestID="settings-update-dot"
+        selected={settingsOpen()} onPress={() => openSettings()} />
       <AccountFooter compact />
     </Surface>
   );
@@ -383,6 +386,7 @@ function AccountFooter(props: { compact?: boolean }) {
   // out ends this session and forgets its server's token in memory.
   const items = (): readonly AccountMenuItem[] => [
     ...workspaceItems(),
+    ...(settingsPageDot("about") ? [{ id: "account-update", label: "Update available", onPress: () => openSettings("about") }] : []),
     { id: "copy-server-url", label: "Copy server URL", icon: "copy", onPress: () => copy(connectedTo(), "Server URL copied") },
     { id: "copy-id", label: "Copy ID", icon: "copy", onPress: () => copy(me(), "ID copied") },
     { id: "disconnect", label: "Sign out", icon: "logout", destructive: true, onPress: () => signOut() },

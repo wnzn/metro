@@ -267,18 +267,19 @@ async fn sleep_or_shutdown(d: Duration, opts: &RunOptions) -> bool {
 }
 
 pub async fn run(client: &MetroClient, provider: &Provider<'_>, opts: &RunOptions) -> Stop {
-    run_inner(client, provider, opts, None).await
+    run_inner(client, provider, opts, None, &|| true).await
 }
 
 /// [`run`], handing each failed ChatGPT catalog or inference job's local
 /// diagnostic to `on_failure` (see [`handle_job_observed`]).
-pub async fn run_with_failure_observer(
+pub(crate) async fn run_with_failure_observer(
     client: &MetroClient,
     provider: &Provider<'_>,
     opts: &RunOptions,
     on_failure: FailureObserver,
+    live: &(dyn Fn() -> bool + Sync),
 ) -> Stop {
-    run_inner(client, provider, opts, Some(&on_failure)).await
+    run_inner(client, provider, opts, Some(&on_failure), live).await
 }
 
 async fn run_inner(
@@ -286,12 +287,16 @@ async fn run_inner(
     provider: &Provider<'_>,
     opts: &RunOptions,
     on_failure: Option<&FailureObserver>,
+    live: &(dyn Fn() -> bool + Sync),
 ) -> Stop {
     let approved_models = (provider.config.kind.capability() == crate::profile::Capability::Chat)
         .then_some(provider.config.models.as_slice());
     let mut backoff = Duration::from_secs(1);
     let mut offline = false;
     loop {
+        if !live() {
+            return Stop::Done;
+        }
         // Metro starts a job's clock when it hands the job out, which is
         // after this moment: timing from here is conservative.
         let claim_sent = Instant::now();

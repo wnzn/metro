@@ -1266,6 +1266,7 @@ pub fn schedule_addressed() -> Addressed {
     Addressed {
         mentions: json!([{"kind": "agent", "addressed_by": "schedule"}]),
         audience: "agent".to_owned(),
+        spans: Vec::new(),
     }
 }
 

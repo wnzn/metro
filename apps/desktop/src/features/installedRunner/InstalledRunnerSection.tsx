@@ -6,7 +6,7 @@
 import { Clipboard, signal } from "nsh";
 import type { JSX } from "nsh";
 import { runnerBusy, runners } from "../../settings";
-import { attachMany, eligibleSpaces, installedRunnerChoice, runnerAttachBusy, runnerSessionKey } from "../../runnersState";
+import { attachMany, eligibleSpaces, installedFolderRefreshExhausted, installedRunnerChoice, retryInstalledFolderRefresh, runnerAttachBusy, runnerSessionKey } from "../../runnersState";
 import { Action, Badge, Banner, Checkbox, Column, ConfirmInline, Label, Row, SettingRow, SettingsGroup } from "../../ui";
 import type { Tone } from "../../ui";
 import {
@@ -59,9 +59,17 @@ export function reconnectImpact(r: InstalledRunner): string {
 
 export function InstalledRunnerSection(props: { management?: JSX.Element } = {}) {
   return (
-    <If when={installedRunner()}>
-      {(r) => <Section r={r()} management={props.management} />}
-    </If>
+    <>
+      <If when={installedRunner()}>
+        {(r) => <Section r={r()} management={props.management} />}
+      </If>
+      <If when={installedFolderRefreshExhausted()}>
+        <Banner variant="inline" tone="warning" testID="installed-runner-folders-unavailable"
+          title="Couldn’t refresh this computer’s runner folders"
+          message="Automatic checks stopped. If the runner isn’t registered, use Reconnect if available, then retry."
+          action={<Action testID="installed-runner-folders-retry" label="Retry" onPress={retryInstalledFolderRefresh} />} />
+      </If>
+    </>
   );
 }
 
@@ -94,7 +102,8 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element }) {
       <AttachPicks />
       <SettingRow
         label="Folders on this computer"
-        description={runnerSpaces().length ? "Each Space gets its own folder on this computer." : "Attached Spaces will appear here."}
+        description={runnerSpaces().length ? "Each Space gets its own folder on this computer."
+          : installedFolderRefreshExhausted() ? "Couldn’t verify attached Spaces." : "Attached Spaces will appear here."}
         stacked
       >
         <If when={runnerSpaces().length > 0}>
@@ -178,7 +187,7 @@ function AttachPicks() {
   const selected = () => eligibleSpaces().filter((s) => !unticked()[s.id]).map((s) => s.id);
   const busy = () => runnerAttachBusy() || !!installedBusy() || !!runnerBusy();
   const state = () => {
-    if (checkingInstalledScope() && !installedRunnerChoice()) return "Checking this computer's runner…";
+    if (!installedFolderRefreshExhausted() && checkingInstalledScope() && !installedRunnerChoice()) return "Checking this computer's runner…";
     if (ownedInstalledRunner()?.attachIfEmpty === false) return "This server doesn't support attaching only to Spaces without a runner.";
     if (!installedRunnerChoice()) return "This computer's runner isn't available to attach for this account.";
     if (eligibleSpaces().length === 0) return "Every Space you own has a runner.";

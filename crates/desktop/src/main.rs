@@ -277,11 +277,12 @@ async fn next_apply(
 async fn launch(
     events: Option<&Events>,
     trial: Option<String>,
+    dir: &Path,
+    root: &Path,
 ) -> Result<Launched, (EventKind, String)> {
     let start_failed = |msg| (EventKind::LauncherStartFailed, msg);
-    let dir = install_dir().map_err(start_failed)?;
     #[cfg(target_os = "macos")]
-    let ui = macos::ui_executable(&dir).map_err(start_failed)?;
+    let ui = macos::ui_executable(dir).map_err(start_failed)?;
     #[cfg(not(target_os = "macos"))]
     let ui = component(&dir.join("ui").join(UI_NAME)).ok_or_else(|| {
         start_failed(format!(
@@ -291,30 +292,28 @@ async fn launch(
     })?;
     let server = component(&dir.join(SERVER_NAME));
 
-    let root = store::desktop_root()
-        .map_err(|e| start_failed(format!("cannot find a place for Metro's data: {e}")))?;
-    store::prepare_private_dir(&root)
+    store::prepare_private_dir(root)
         .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?;
-    update::gate_msi_at_start(&root).map_err(start_failed)?;
+    update::gate_msi_at_start(root).map_err(start_failed)?;
     let lock = if let Some(id) = &trial {
-        Some(update::trial_lock(id, &dir, &root).ok_or_else(|| {
+        Some(update::trial_lock(id, dir, root).ok_or_else(|| {
             start_failed("this trial did not inherit the active workspace lock".into())
         })?)
     } else {
-        store::try_lock_instance(&root)
+        store::try_lock_instance(root)
             .map_err(|e| start_failed(format!("cannot prepare Metro's data folder: {e}")))?
     }
     .map(Arc::new);
     let primary = lock.is_some();
-    update::gate_msi_at_start(&root).map_err(start_failed)?;
+    update::gate_msi_at_start(root).map_err(start_failed)?;
     if trial.is_none() {
-        update::recover_at_start(&dir, &root, lock.as_deref()).map_err(start_failed)?;
+        update::recover_at_start(dir, root, lock.as_deref()).map_err(start_failed)?;
     }
 
     // Updates: primary instance only. Startup above reconciles safe
     // cleanup or blocks if a prior trial lost its watchdog.
     let updater: Option<Arc<Updater>> = if primary {
-        UpdaterConfig::for_app(&root, &dir, trial.clone()).map(Updater::new)
+        UpdaterConfig::for_app(root, dir, trial.clone()).map(Updater::new)
     } else {
         None
     };
@@ -346,8 +345,8 @@ async fn launch(
         }
         _ => None,
     };
-    let mut cfg = DesktopConfig::new(root.clone(), primary, local);
-    cfg.tools = tools_hook(&root, primary);
+    let mut cfg = DesktopConfig::new(root.to_path_buf(), primary, local);
+    cfg.tools = tools_hook(root, primary);
     cfg.updater = updater.clone();
     let desktop = Desktop::new(cfg);
     let bridge = bridge::start(desktop.clone()).await.map_err(|e| {
@@ -360,7 +359,7 @@ async fn launch(
     let mut cmd = tokio::process::Command::new(&ui);
     // The guardian starts `ui` itself and passes this environment on.
     #[cfg(target_os = "macos")]
-    let mut cmd = match macos::guardian_command(&dir) {
+    let mut cmd = match macos::guardian_command(dir) {
         Ok(cmd) => cmd,
         Err(e) => {
             bridge.stop().await;
@@ -471,7 +470,7 @@ async fn launch(
             return Err((EventKind::LauncherStartFailed, "the update was not started because the local workspace did not stop. Close Metro and try again.".into()));
         }
         return Ok(
-            match update::apply(&u, req, &root, lock.expect("primary updater")).await {
+            match update::apply(&u, req, root, lock.expect("primary updater")).await {
                 update::After::Exit(code) => Launched::Exit(code),
                 update::After::Relaunch => Launched::Relaunch,
             },
@@ -527,7 +526,22 @@ fn main() -> ExitCode {
     unsafe {
         metro_connector::http::exempt_loopback_from_proxy();
     }
-    let events = store::desktop_root().ok().map(|root| Events::new(&root));
+    let paths = || -> Result<_, String> {
+        let dir = install_dir()?;
+        let root = store::desktop_root()
+            .map_err(|e| format!("cannot find a place for Metro's data: {e}"))?;
+        update::preflight_at_start(&dir, &root, matches!(mode, update::Mode::Trial(_)))?;
+        Ok((dir, root))
+    };
+    let (dir, root) = match paths() {
+        Ok(paths) => paths,
+        Err(msg) => {
+            // Refuse without even creating a monitoring record or lock file.
+            fatal(&format!("Metro can't start: {msg}"));
+            return ExitCode::from(1);
+        }
+    };
+    let events = Events::new(&root);
     let rt = match tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
@@ -535,9 +549,7 @@ fn main() -> ExitCode {
     {
         Ok(rt) => rt,
         Err(e) => {
-            if let Some(events) = &events {
-                events.record(EventKind::LauncherStartFailed);
-            }
+            events.record(EventKind::LauncherStartFailed);
             fatal(&format!("Metro can't start: {e}"));
             return ExitCode::from(1);
         }
@@ -547,13 +559,16 @@ fn main() -> ExitCode {
         _ => None,
     };
     let code = loop {
-        match rt.block_on(launch(events.as_ref(), trial.take())) {
+        match rt.block_on(launch(Some(&events), trial.take(), &dir, &root)) {
             Ok(Launched::Exit(code)) => break code,
-            Ok(Launched::Relaunch) => continue,
-            Err((kind, msg)) => {
-                if let Some(events) = &events {
-                    events.record(kind);
+            Ok(Launched::Relaunch) => {
+                if let Err(msg) = update::preflight_at_start(&dir, &root, false) {
+                    fatal(&format!("Metro can't start: {msg}"));
+                    break 1;
                 }
+            }
+            Err((kind, msg)) => {
+                events.record(kind);
                 fatal(&format!("Metro can't start: {msg}"));
                 break 1;
             }

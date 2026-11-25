@@ -64,10 +64,10 @@ test("packaged: sign-in binds the bridge with the session; it's the only place t
   const f = world();
   const b = fakeBridge(f);
   const app = await openPackaged(f, b);
-  // Before any sign-in, the app only asks the helper about itself.
-  await app.waitUntil(() => b.calls("/v1/status", "GET").length >= 1);
+  // Before sign-in, only the helper and updater status reads are allowed.
+  await app.waitUntil(() => b.calls("/v1/status", "GET").length >= 1 && b.calls("/v1/update", "GET").length >= 1);
   await app.wait(300);
-  expect(b.state.log.every((l) => l.method === "GET" && l.path === "/v1/status")).toBe(true);
+  expect(b.state.log.every((l) => l.method === "GET" && (l.path === "/v1/status" || l.path === "/v1/update"))).toBe(true);
   await signIn(app, "bob");
   await app.waitUntil(() => b.calls("/v1/session", "POST").length === 1);
   const bind = b.calls("/v1/session", "POST")[0]!;

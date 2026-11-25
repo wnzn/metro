@@ -992,6 +992,7 @@ struct TypedUse {
     space: Option<String>,
     chosen: String,
     device_generation: Option<u64>,
+    library_selection: Option<(String, i64)>,
     _global: tokio::sync::OwnedSemaphorePermit,
     _borrowed: Option<tokio::sync::OwnedSemaphorePermit>,
 }
@@ -1068,6 +1069,7 @@ async fn typed_use(
         space: space.map(str::to_owned),
         chosen,
         device_generation,
+        library_selection: None,
         _global: global,
         _borrowed: borrowed,
     })
@@ -1087,10 +1089,16 @@ async fn still_current(state: &AppState, u: &TypedUse) -> Result<(), ProviderErr
     let prepared = u.row.clone();
     let providers = state.providers.clone();
     let entry = u.entry;
+    let selection = u.library_selection.clone();
     state
         .db
         .call(move |db| {
             let conn = db.lock();
+            if let Some((id, revision)) = selection
+                && !crate::library_search::selection_is(&conn, &caller, &id, revision)?
+            {
+                return Ok(Err(UseError::TurnChanged));
+            }
             if let Some(sid) = &space
                 && !store::is_member(&conn, sid, &caller)?
             {
@@ -1147,7 +1155,13 @@ fn typed_target(state: &AppState, u: &TypedUse) -> Result<TypedTarget, ProviderE
         }
         Adapter::Device => Ok(TypedTarget::Device(crate::device_relay::DispatchBinding {
             generation: u.device_generation.ok_or(DeviceError::NotPaired)?,
-            grant: guard::DeviceClaimGrant::typed(&u.caller, u.space.as_deref(), &u.chosen, &u.row),
+            grant: guard::DeviceClaimGrant::typed(
+                &u.caller,
+                u.space.as_deref(),
+                &u.chosen,
+                &u.row,
+                u.library_selection.clone(),
+            ),
             advertised: None,
         })),
         Adapter::Registered(_) | Adapter::Custom => Err(UseError::Unsupported.into()),
@@ -1181,6 +1195,19 @@ pub async fn decide(
 ) -> Result<serde_json::Value, ProviderError> {
     let u = typed_use(state, caller, space, id, Capability::SystemOne).await?;
     decide_with(state, u, state_payload, questions).await
+}
+
+pub(crate) async fn library_decide(
+    state: &AppState,
+    caller: &str,
+    space: Option<&str>,
+    id: &str,
+    (payload, questions): (serde_json::Value, serde_json::Value),
+    selection: Option<(&str, i64)>,
+) -> Result<serde_json::Value, ProviderError> {
+    let mut u = typed_use(state, caller, space, id, Capability::SystemOne).await?;
+    u.library_selection = selection.map(|(id, rev)| (id.to_owned(), rev));
+    decide_with(state, u, payload, questions).await
 }
 
 /// [`decide`] for a call already prepared by [`typed_use`].
@@ -1281,9 +1308,26 @@ pub async fn media_embed(
     connection_id: &str,
     input: serde_json::Value,
 ) -> Result<serde_json::Value, ProviderError> {
-    let u = typed_use(state, caller, space, connection_id, Capability::Embeddings).await?;
+    media_embed_bound(state, caller, space, connection_id, input, None).await
+}
+
+pub(crate) async fn media_embed_bound(
+    state: &AppState,
+    caller: &str,
+    space: Option<&str>,
+    connection_id: &str,
+    input: serde_json::Value,
+    binding: Option<(i64, &str)>,
+) -> Result<serde_json::Value, ProviderError> {
+    let mut u = typed_use(state, caller, space, connection_id, Capability::Embeddings).await?;
     if !u.entry.media_inputs {
         return Err(UseError::MediaUnsupported.into());
+    }
+    if let Some((revision, fingerprint)) = binding {
+        if fingerprint_of(&state.providers, &u.chosen, &u.row)? != fingerprint {
+            return Err(UseError::TurnChanged.into());
+        }
+        u.library_selection = Some((connection_id.to_owned(), revision));
     }
     // The slot is taken before the payload is checked or sent.
     let _media = state.providers.media_slot(caller, &u.row.id)?;
@@ -1403,28 +1447,34 @@ pub async fn model_fingerprint(
     space: Option<&str>,
     id: &str,
 ) -> Result<String, ProviderError> {
-    use sha2::{Digest, Sha256};
     let a = resolve(state, caller, space, id).await?;
-    let entry = catalog::find(&a.row.provider_id).ok_or(UseError::Unsupported)?;
-    if a.row.model.is_empty() {
+    fingerprint_of(&state.providers, &a.chosen, &a.row)
+}
+
+pub(crate) fn fingerprint_of(
+    providers: &ProviderService,
+    chosen: &str,
+    row: &Row,
+) -> Result<String, ProviderError> {
+    use sha2::{Digest, Sha256};
+    let entry = catalog::find(&row.provider_id).ok_or(UseError::Unsupported)?;
+    if row.model.is_empty() {
         return Err(UseError::NoModel.into());
     }
     let endpoint = match entry.execution {
         Execution::Device => "device".to_owned(),
-        Execution::Server => state
-            .providers
-            .effective_base_url(entry, a.row.base_url.as_deref())?,
+        Execution::Server => providers.effective_base_url(entry, row.base_url.as_deref())?,
     };
     let mut h = Sha256::new();
     h.update(b"metro.model-fingerprint.v1");
     for part in [
-        a.chosen.as_str(),
-        a.row.id.as_str(),
-        a.row.provider_id.as_str(),
-        a.row.capability.as_str(),
-        a.row.model.as_str(),
+        chosen,
+        row.id.as_str(),
+        row.provider_id.as_str(),
+        row.capability.as_str(),
+        row.model.as_str(),
         endpoint.as_str(),
-        &a.row.config_rev.to_string(),
+        &row.config_rev.to_string(),
     ] {
         h.update((part.len() as u64).to_be_bytes());
         h.update(part.as_bytes());

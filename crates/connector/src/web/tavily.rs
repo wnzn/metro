@@ -38,10 +38,9 @@ fn failure(c: &Call<'_>, status: u16, headers: &reqwest::header::HeaderMap) -> F
 }
 
 async fn send(c: &Call<'_>, url: String, body: Value) -> Result<Value, Failure> {
-    let resp = request(c, url, body)
-        .send()
-        .await
-        .map_err(|e| transport(&e))?;
+    let rb = request(c, url, body);
+    (c.gate)().map_err(Failure::Stopped)?;
+    let resp = rb.send().await.map_err(|e| transport(&e))?;
     let status = resp.status().as_u16();
     if !(200..300).contains(&status) {
         return Err(failure(c, status, resp.headers()));

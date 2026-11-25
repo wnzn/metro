@@ -38,6 +38,21 @@ use crate::device_relay::DeviceError;
 type ApiResult<T> = Result<T, ApiError>;
 
 const NO_CONNECTION: &str = "no such model connection";
+// Codes mean the endpoint PATCH did not commit, not just that it errored.
+const ENDPOINT_REJECTED: &str = "endpoint_rejected";
+const ENDPOINT_NOT_APPROVED: &str = "endpoint_not_approved";
+const ENDPOINT_PROBE_BUSY: &str = "endpoint_probe_busy";
+const ENDPOINT_PROBE_FAILED: &str = "endpoint_probe_failed";
+const ENDPOINT_CONFLICT: &str = "endpoint_conflict";
+const ENDPOINT_MISSING: &str = "endpoint_missing";
+
+fn endpoint_code(endpoint: bool, error: ApiError, code: &'static str) -> ApiError {
+    if endpoint {
+        error.with_code(code)
+    } else {
+        error
+    }
+}
 
 fn bad_request(message: impl Into<String>) -> ApiError {
     ApiError::new(StatusCode::BAD_REQUEST, message)
@@ -57,6 +72,9 @@ pub struct ConnectionView {
     pub provider_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Only in the owner's view. An old server rejects this PATCH field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint_revision: Option<String>,
     /// Empty until a model is chosen.
     pub model: String,
     pub is_default: bool,
@@ -83,6 +101,9 @@ impl From<&Row> for ConnectionView {
             name: row.name.clone(),
             provider_id: row.provider_id.clone(),
             base_url: row.base_url.clone(),
+            endpoint_revision: catalog::find(&row.provider_id)
+                .filter(|e| !e.is_device())
+                .map(|_| row.edit_rev.to_string()),
             model: row.model.clone(),
             is_default: row.is_default,
             has_key: row.sealed_key.is_some(),
@@ -317,7 +338,7 @@ pub async fn create(
         (None, None)
     } else {
         let base_url = match body.base_url.as_deref() {
-            Some(url) => Some(approved_base_url(&state, url)?),
+            Some(url) => Some(approved_base_url(&state, url, false)?),
             None if entry.default_base_url.is_some() => None,
             None => {
                 return Err(bad_request(
@@ -355,6 +376,7 @@ pub async fn create(
         sealed_key,
         capability: entry.capability,
         config_rev: 0,
+        edit_rev: 0,
     };
     let explicit = body.is_default;
     let saved = state
@@ -470,12 +492,14 @@ where
     Option::<T>::deserialize(d).map(Some)
 }
 
-fn approved_base_url(state: &AppState, url: &str) -> ApiResult<String> {
+fn approved_base_url(state: &AppState, url: &str, endpoint_patch: bool) -> ApiResult<String> {
     let url =
         normalize_base_url(url).map_err(|e| bad_request(format!("base_url is invalid: {e}")))?;
     if !state.providers.allowed_base_urls().contains(&url) {
-        return Err(bad_request(
-            "base_url must be exactly one of this server's allowed_base_urls",
+        return Err(endpoint_code(
+            endpoint_patch,
+            bad_request("base_url must be exactly one of this server's allowed_base_urls"),
+            ENDPOINT_NOT_APPROVED,
         ));
     }
     Ok(url)
@@ -498,6 +522,13 @@ pub struct UpdateBody {
     /// Absent: unchanged. An explicit null cannot reset the endpoint.
     #[serde(default, deserialize_with = "explicit_null")]
     base_url: Option<Option<String>>,
+    #[serde(default, deserialize_with = "explicit_null")]
+    expected_endpoint_revision: Option<Option<String>>,
+}
+
+fn endpoint_conflict() -> ApiError {
+    conflict("the connection changed while this change was being saved; reload it and try again")
+        .with_code(ENDPOINT_CONFLICT)
 }
 
 pub async fn update(
@@ -506,21 +537,66 @@ pub async fn update(
     Path(id): Path<String>,
     body: Result<Json<UpdateBody>, JsonRejection>,
 ) -> ApiResult<Json<ConnectionView>> {
-    let previous = load(&state, &who, &id).await?;
+    let endpoint = body
+        .as_ref()
+        .is_ok_and(|Json(body)| body.base_url.is_some());
+    let missing = |error: ApiError| {
+        endpoint_code(
+            endpoint && error.status() == StatusCode::NOT_FOUND,
+            error,
+            ENDPOINT_MISSING,
+        )
+    };
+    let previous = load(&state, &who, &id).await.map_err(missing)?;
     let Json(body) = body?;
-    let entry = catalog::find(&previous.provider_id)
-        .ok_or_else(|| conflict("this connection's provider is no longer supported"))?;
-    let patch = patch_of(&state, entry, &previous, body)?;
+    let expected = match body.expected_endpoint_revision.as_ref() {
+        None => None, // Legacy endpoint edits retain their existing preflight and CAS.
+        Some(Some(rev)) if endpoint => Some(
+            rev.parse::<i64>()
+                .ok()
+                .filter(|n| *n >= 0 && n.to_string() == *rev)
+                .ok_or_else(|| {
+                    bad_request("invalid expected_endpoint_revision").with_code(ENDPOINT_REJECTED)
+                })?,
+        ),
+        Some(_) => {
+            return Err(endpoint_code(
+                endpoint,
+                bad_request("expected_endpoint_revision requires a non-null revision and base_url"),
+                ENDPOINT_REJECTED,
+            ));
+        }
+    };
+    if expected.is_some_and(|rev| rev != previous.edit_rev) {
+        return Err(endpoint_conflict());
+    }
+    let entry = catalog::find(&previous.provider_id).ok_or_else(|| {
+        endpoint_code(
+            endpoint,
+            conflict("this connection's provider is no longer supported"),
+            ENDPOINT_REJECTED,
+        )
+    })?;
+    let mut patch = patch_of(&state, entry, &previous, body)
+        .map_err(|e| endpoint_code(endpoint, e, ENDPOINT_REJECTED))?;
+    patch.edit_rev_is = expected;
     match save_update(&state, entry, patch, previous).await? {
         store::Patched::Saved(row) => Ok(Json(view_of(&state, row).await?)),
-        store::Patched::Missing => Err(not_found()),
-        store::Patched::DefaultNeedsModel => Err(default_needs_model()),
+        store::Patched::Missing => Err(missing(not_found())),
+        store::Patched::DefaultNeedsModel => Err(endpoint_code(
+            endpoint,
+            default_needs_model(),
+            ENDPOINT_REJECTED,
+        )),
         store::Patched::Changed => {
-            load(&state, &who, &id).await?;
-            Err(conflict(
-                "the connection changed while this change was being saved; reload it and try \
-                 again",
-            ))
+            load(&state, &who, &id).await.map_err(missing)?;
+            Err(if endpoint {
+                endpoint_conflict()
+            } else {
+                conflict(
+                    "the connection changed while this change was being saved; reload it and try again",
+                )
+            })
         }
     }
 }
@@ -538,7 +614,7 @@ fn patch_of(
             return Err(device_has_no_key());
         }
         let url = url.ok_or_else(|| bad_request("base_url must be an approved URL, not null"))?;
-        let url = approved_base_url(state, &url)?;
+        let url = approved_base_url(state, &url, true)?;
         if previous.base_url.as_deref() == Some(url.as_str()) {
             // Named but unchanged: still a precondition of the write.
             patch.base_url_is = Some(url);
@@ -612,7 +688,7 @@ async fn save_update(
     let expected = if patch.base_url.is_some() {
         let candidate = patched(&previous, &patch);
         if candidate.is_default && candidate.model.is_empty() {
-            return Err(default_needs_model());
+            return Err(default_needs_model().with_code(ENDPOINT_REJECTED));
         }
         test_endpoint(state, entry, &candidate).await?;
         Some(previous.clone())
@@ -637,7 +713,9 @@ async fn save_update(
 /// Test only the candidate config. Never include upstream response bodies,
 /// request data, or arbitrary provider error text in logs or the API response.
 async fn test_endpoint(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<()> {
-    probe(state, entry, row, LIST_TIMEOUT).await
+    probe(state, entry, row, LIST_TIMEOUT)
+        .await
+        .map_err(|e| e.with_code(ENDPOINT_REJECTED))
 }
 
 /// [`test_endpoint`] with every upstream call bounded by `deadline`.
@@ -645,13 +723,19 @@ async fn probe(state: &AppState, entry: &Entry, row: &Row, deadline: Duration) -
     if entry.lists_models {
         let result = match entry.adapter {
             Adapter::SystemOne | Adapter::Embeddings => {
-                list_typed_models_within(state, entry, row, deadline)
+                list_typed_models_within(state, entry, row, deadline, ListingPurpose::EndpointProbe)
                     .await
                     .map(|_| ())
             }
-            _ => list_server_models_within(state, entry, row, deadline)
-                .await
-                .map(|_| ()),
+            _ => list_server_models_within(
+                state,
+                entry,
+                row,
+                deadline,
+                ListingPurpose::EndpointProbe,
+            )
+            .await
+            .map(|_| ()),
         };
         return result.map_err(|e| match e.status() {
             StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => ApiError::new(
@@ -660,7 +744,8 @@ async fn probe(state: &AppState, entry: &Entry, row: &Row, deadline: Duration) -
                     "the new endpoint failed its model listing test: {}",
                     e.message()
                 ),
-            ),
+            )
+            .with_code(ENDPOINT_PROBE_FAILED),
             _ => e,
         });
     }
@@ -669,11 +754,7 @@ async fn probe(state: &AppState, entry: &Entry, row: &Row, deadline: Duration) -
             "choose a model before testing an endpoint that does not list models",
         ));
     }
-    let Ok(_permit) = state.providers.inner.listings.try_acquire() else {
-        return Err(ApiError::unavailable(
-            "too many endpoint tests are running; try again shortly",
-        ));
-    };
+    let _permit = listing_permit(state, ListingPurpose::EndpointProbe)?;
     // A spent deadline is a gateway timeout; any other upstream failure is
     // a bad gateway.
     let failed = |what: &str| {
@@ -681,12 +762,14 @@ async fn probe(state: &AppState, entry: &Entry, row: &Row, deadline: Duration) -
             StatusCode::BAD_GATEWAY,
             format!("the new endpoint failed its {what} test"),
         )
+        .with_code(ENDPOINT_PROBE_FAILED)
     };
     let timed_out = |what: &str| {
         ApiError::new(
             StatusCode::GATEWAY_TIMEOUT,
             format!("the new endpoint failed its {what} test (timed out)"),
         )
+        .with_code(ENDPOINT_PROBE_FAILED)
     };
     let typed_failed = |what: &str, e: ProviderError| match e.status() {
         StatusCode::GATEWAY_TIMEOUT => timed_out(what),
@@ -795,6 +878,7 @@ pub(crate) fn probe_row(state: &AppState, provider: &str, base_url: &str) -> Row
         sealed_key: None,
         capability: catalog::find(provider).unwrap().capability,
         config_rev: 0,
+        edit_rev: 0,
     };
     assert!(store::insert(&mut state.db.lock(), &row, 20).unwrap());
     row
@@ -987,6 +1071,7 @@ async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
             sealed_key: None,
             capability: entry.capability,
             config_rev: 0,
+            edit_rev: 0,
         };
         assert!(store::insert(&mut state.db.lock(), &previous, 20).unwrap());
 
@@ -1002,11 +1087,25 @@ async fn endpoint_changes_probe_capabilities_and_keep_the_old_url_on_failure() {
             .unwrap();
         for lists_models in [true, false] {
             entry.lists_models = lists_models;
-            let err = save_update(&state, &entry, to(&failing), previous.clone())
+            let err = save_update(&state, &entry, to(&base), previous.clone())
                 .await
                 .unwrap_err();
             assert_eq!(err.status(), StatusCode::SERVICE_UNAVAILABLE);
-            assert!(!err.message().contains("failed its model listing test"));
+            let response = err.into_response();
+            let bytes = axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                json!({
+                    "error": "too many endpoint tests are running; try again shortly",
+                    "code": "endpoint_probe_busy",
+                })
+            );
+            assert_eq!(
+                store::get(&state.db.lock(), &previous.user_id, &previous.id).unwrap(),
+                Some(previous.clone())
+            );
         }
         drop(permit);
 
@@ -1206,12 +1305,37 @@ fn device_error(e: DeviceError) -> ApiError {
     ApiError::new(status, e.to_string())
 }
 
+enum ListingPurpose {
+    Refresh,
+    EndpointProbe,
+}
+
+fn listing_permit(
+    state: &AppState,
+    purpose: ListingPurpose,
+) -> ApiResult<tokio::sync::SemaphorePermit<'_>> {
+    state
+        .providers
+        .inner
+        .listings
+        .try_acquire()
+        .map_err(|_| match purpose {
+            ListingPurpose::Refresh => {
+                ApiError::unavailable("too many model listings are running; try again shortly")
+            }
+            ListingPurpose::EndpointProbe => {
+                ApiError::unavailable("too many endpoint tests are running; try again shortly")
+                    .with_code(ENDPOINT_PROBE_BUSY)
+            }
+        })
+}
+
 async fn list_server_models(
     state: &AppState,
     entry: &Entry,
     row: &Row,
 ) -> ApiResult<Vec<(String, Option<String>)>> {
-    list_server_models_within(state, entry, row, LIST_TIMEOUT).await
+    list_server_models_within(state, entry, row, LIST_TIMEOUT, ListingPurpose::Refresh).await
 }
 
 async fn list_server_models_within(
@@ -1219,6 +1343,7 @@ async fn list_server_models_within(
     entry: &Entry,
     row: &Row,
     deadline: Duration,
+    purpose: ListingPurpose,
 ) -> ApiResult<Vec<(String, Option<String>)>> {
     if !entry.lists_models {
         return Err(ApiError::new(
@@ -1230,11 +1355,7 @@ async fn list_server_models_within(
         .providers
         .server_config(entry, row)
         .map_err(use_error)?;
-    let Ok(_permit) = state.providers.inner.listings.try_acquire() else {
-        return Err(ApiError::unavailable(
-            "too many model listings are running; try again shortly",
-        ));
-    };
+    let _permit = listing_permit(state, purpose)?;
     // Every page together reads at most this many bytes.
     let http = BudgetedHttp::client(state.providers.http(), LISTING_MAX_RESPONSE_BYTES);
     match tokio::time::timeout(deadline, list_upstream(config, http)).await {
@@ -1274,7 +1395,7 @@ async fn list_server_models_within(
 /// A System One (`{models: [{name}]}`) or embeddings (`{data: [{id}]}`)
 /// listing, with the connection's own endpoint and key, no redirects.
 async fn list_typed_models(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<Vec<String>> {
-    list_typed_models_within(state, entry, row, LIST_TIMEOUT).await
+    list_typed_models_within(state, entry, row, LIST_TIMEOUT, ListingPurpose::Refresh).await
 }
 
 async fn list_typed_models_within(
@@ -1282,16 +1403,13 @@ async fn list_typed_models_within(
     entry: &Entry,
     row: &Row,
     deadline: Duration,
+    purpose: ListingPurpose,
 ) -> ApiResult<Vec<String>> {
     let (base, key) = state
         .providers
         .typed_endpoint(entry, row)
         .map_err(use_error)?;
-    let Ok(_permit) = state.providers.inner.listings.try_acquire() else {
-        return Err(ApiError::unavailable(
-            "too many model listings are running; try again shortly",
-        ));
-    };
+    let _permit = listing_permit(state, purpose)?;
     let listed = tokio::time::timeout(
         deadline,
         super::typed::list_models(&base, key.as_deref(), entry.capability),

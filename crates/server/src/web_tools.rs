@@ -397,6 +397,10 @@ pub struct Attempt {
     pub mode: String,
     /// One of [`OUTCOMES`].
     pub outcome: String,
+    /// Optional for `key_rejected`: false for a cached skip, true for a
+    /// provider response. Older connectors and history don't say which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contacted: Option<bool>,
     /// RFC 3339 UTC, for a cooldown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<String>,
@@ -419,6 +423,11 @@ pub struct ToolNote {
     /// `failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// Stable run starter, stamped by Metro on failure events only. Room
+    /// members already see this id in run metadata; persist it here so the
+    /// starter can be identified after that in-memory registry is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starter_id: Option<String>,
 }
 
 impl ToolNote {
@@ -429,6 +438,7 @@ impl ToolNote {
             mode: None,
             attempts: Vec::new(),
             failure: None,
+            starter_id: None,
         }
     }
 
@@ -579,6 +589,10 @@ pub fn normalize(operation: Operation, response: &Value) -> Result<WebAnswer, St
             provider: provider.to_owned(),
             mode,
             outcome: outcome.to_owned(),
+            contacted: a
+                .get("contacted")
+                .and_then(Value::as_bool)
+                .filter(|_| outcome == "key_rejected"),
             until: check_until(a.get("until"))?,
         });
     }
@@ -734,7 +748,11 @@ fn outcome_label(a: &Attempt) -> String {
         "ok" => "ok",
         "limited" => "rate-limited",
         "out_of_credits" => "out of credits or over its plan limit",
-        "key_rejected" => "key rejected",
+        "key_rejected" => match a.contacted {
+            Some(false) => "skipped (saved key was already rejected)",
+            Some(true) => "provider rejected the key",
+            None => "key rejected (contact not recorded)",
+        },
         "blocked" => "blocked from this network",
         "unavailable" => "unavailable",
         "timeout" => "timed out",
@@ -1135,9 +1153,12 @@ impl WebContext {
         }
     }
 
-    async fn append(&self, kind: &'static str, author: Author, text: &str, note: ToolNote) {
+    async fn append(&self, kind: &'static str, author: Author, text: &str, mut note: ToolNote) {
         let max = self.state.config.limits.max_event_text;
         let text = truncate(text, max);
+        if kind == kind::ERROR {
+            note.starter_id = self.initiator.id.clone();
+        }
         let activity = self.turn.with_tool(note);
         match &self.scope {
             WebScope::Room { space_id, room_id } => {
@@ -1323,6 +1344,7 @@ impl WebContext {
             mode: answer.mode.clone(),
             attempts: answer.attempts.clone(),
             failure: None,
+            starter_id: None,
         };
         if answer.provider.is_none() {
             let text = exhausted_text(tool, &whose, &answer.attempts);

@@ -69,7 +69,15 @@ export type Place = "chat" | "space" | "settings" | "search" | "library" | "page
 /** Where the main panel is under any modal: never Settings. */
 export type MainPlace = Exclude<Place, "settings">;
 /** The pages of Settings. Reachable with or without any Space. */
-export type SettingsSection = "profile" | "runners" | "providers" | "routing" | "monitoring" | "appearance";
+export type SettingsExtension = "websearch" | "about";
+export type SettingsSection = "profile" | "runners" | "connections" | "models" | "monitoring" | "appearance" | SettingsExtension;
+type SettingsAlias = "providers" | "routing";
+const settingsExtensions = signal<readonly SettingsExtension[]>([]);
+export const settingsExtensionAvailable = (section: SettingsExtension) => settingsExtensions().includes(section);
+/** Called by the Settings shell when a real extension page is installed. */
+export function enableSettingsExtension(section: SettingsExtension) {
+  if (!settingsExtensionAvailable(section)) settingsExtensions.set([...settingsExtensions(), section]);
+}
 
 // ------------------------------------------------------------------ state
 
@@ -101,7 +109,8 @@ export const settingsOpen = signal(false);
 export const place = computed<Place>(() => (settingsOpen() ? "settings" : basePlace()));
 /** The main panel's place, under the Settings modal too. */
 export const mainPlace = computed<MainPlace>(() => basePlace());
-export const settingsSection = signal<SettingsSection>("runners");
+export const settingsSection = signal<SettingsSection>("profile");
+export const settingsAnchor = signal<"privacy" | null>(null);
 export const spaces = signal<Space[]>([]);
 export const activeSpaceId = signal<string | null>(null);
 export const activeSpace = computed(() => spaces().find((s) => s.id === activeSpaceId()) ?? null);
@@ -496,11 +505,15 @@ export async function openLocation(target: Location): Promise<boolean> {
  * (place, Space, room, view, drafts, scroll) is kept for closeSettings; only
  * what is shown once (tokens, confirmations) is dropped, as on any move.
  */
-export function openSettings(section: SettingsSection = settingsSection()) {
-  if (settingsOpen() && settingsSection() === section) return;
+export function openSettings(section: SettingsSection | SettingsAlias | "about-privacy" = settingsSection()) {
+  const page = section === "providers" ? "connections" : section === "routing" ? "models"
+    : section === "about-privacy" ? "about" : section;
+  if ((page === "about" || page === "websearch") && !settingsExtensionAvailable(page)) return;
   batch(() => {
+    settingsAnchor.set(section === "about-privacy" ? "privacy" : null);
+    if (settingsOpen() && settingsSection() === page) return;
     clearTransient();
-    settingsSection.set(section);
+    settingsSection.set(page);
     settingsOpen.set(true);
   });
 }
@@ -511,6 +524,7 @@ export function closeSettings() {
   batch(() => {
     clearTransient();
     settingsOpen.set(false);
+    settingsAnchor.set(null);
   });
 }
 
@@ -536,7 +550,10 @@ export async function selectSpace(spaceId: string): Promise<void> {
 
 type CreateSpaceOptions = {
   formIsCurrent: () => boolean;
-  attachRunner: (space: Space, fromOriginalForm: boolean, stillInCreatedSpace: () => boolean) => Promise<void>;
+  attachRunner: (space: Space, scope: {
+    mayAttach: () => boolean;
+    mayShowOutcome: () => boolean;
+  }) => Promise<void>;
 };
 
 // Also catches a modal opened and closed while creating or checking the runner.
@@ -570,9 +587,15 @@ export async function createSpace(nameInput: string, options?: CreateSpaceOption
     spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
     await enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
     kick();
-    const stillInCreatedSpace = () => spaceOK() && createSpaceContext === expectedContext &&
-      basePlace() === "space" && activeSpaceId() === space.id;
-    if (options && stillInCreatedSpace()) await options.attachRunner(space, fromOriginalForm, stillInCreatedSpace);
+    // Returning to the same Space can show a missing attachment, but cannot
+    // revive consent invalidated by a move or dialog.
+    const mayShowOutcome = () => spaceOK() && basePlace() === "space" && view() === "room" && activeSpaceId() === space.id;
+    if (options && mayShowOutcome()) {
+      await options.attachRunner(space, {
+        mayAttach: () => fromOriginalForm && createSpaceContext === expectedContext && mayShowOutcome(),
+        mayShowOutcome,
+      });
+    }
     return true;
   } catch (error) {
     // A follow-up failure must not turn a confirmed creation into a retry.
@@ -1286,7 +1309,8 @@ function endSession() {
     membersError.set(null);
     mentions.set([]);
     orgAdmin.set(false);
-    settingsSection.set("runners");
+    settingsSection.set("profile");
+    settingsAnchor.set(null);
     for (const fn of sessionEnders) fn();
   });
 }

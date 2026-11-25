@@ -1038,17 +1038,29 @@ test("with the operator's model, no onboarding card shows: Chat already works", 
 test("a late settings answer never lands after sign-out or in the next user's session", async () => {
   const f = world();
   f.addRunner("Alice private", "personal", "alice");
-  f.state.delays.set("/v1/runners", 600);
-  const app = await openApp(f);
+  const delay = 2000;
+  const held = f.answerLate("/v1/runners", TOKENS.alice!, delay);
+  const rosterReads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/runners").map((p) => p.user);
+  const app = await open("./App.tsx", {
+    modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800, clock: {},
+  });
   await signIn(app, "alice");
-  await app.press("id:nav-settings");
+  await openSettings(app, "runners");
+  await app.waitUntil(() => held.arrived() === 1, { timeout: 500 });
+  expect(app.shows("id:runner-list >> text:Loading runners…")).toBe(true);
   await app.press("id:settings-close");
   await signOut(app); // while GET /v1/runners is still on its way
-  f.state.delays.delete("/v1/runners");
+  await app.waitFor("id:connect");
   await signIn(app, "bob");
   await openSettings(app, "runners");
-  await app.waitFor("text:No other personal runners");
-  await app.waitFor("text:No organization runners");
-  await app.wait(800);
+  const noPersonal = "id:runner-list >> text:No other personal runners";
+  const noOrganization = "id:organization-runner-list >> text:No organization runners";
+  await app.waitFor(noPersonal, { timeout: 500 });
+  expect(app.shows(noOrganization)).toBe(true);
+  expect(rosterReads()).toEqual(["alice", "bob"]);
+  expect(app.shows("text:Alice private")).toBe(false);
+  await app.clock!.runFor(delay); // Alice's held response now comes due during Bob's session.
+  expect(app.shows(noPersonal)).toBe(true);
+  expect(app.shows(noOrganization)).toBe(true);
   expect(app.shows("text:Alice private")).toBe(false);
 });

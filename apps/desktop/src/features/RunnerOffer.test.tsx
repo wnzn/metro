@@ -19,7 +19,18 @@ const space = (f: Server, name: string) => [...f.state.spaces.values()].find((s)
 const words = (app: App) => app.texts().join(" | ");
 
 function fixture(f: Server, runnerId: string | null, state = "online") {
-  const status = { runnerId, state, available: true, reads: 0, failReads: 0, delay: 0 };
+  const status = { runnerId, state, available: true, reads: 0, failReads: 0, delay: 0, reconnects: 0 };
+  const gate = {
+    create: 0, attach: 0, badConfirmation: false, reconnect: 0,
+    attachSpace: null as string | null,
+    runnerRead: null as { sid: string; delay: number; parked: boolean } | null,
+    detach: null as { sid: string; beforeCommit: boolean; delay: number; commit: (() => void) | null } | null,
+  };
+  const runnerStatus = () => ({
+    requested: true, available: status.available, state: status.state,
+    runner: status.runnerId && { id: status.runnerId, name: "This PC" },
+    tools: ["workspace.list", "workspace.read"], can_reconnect: status.state === "revoked",
+  });
   const b = fakeBridge(f);
   const network = { ...f.network, ...b.network } as Record<string, (req: Request) => unknown>;
   const bridgeGet = network[`GET ${BRIDGE}/v1/*`]!;
@@ -28,25 +39,46 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
     if (header(req, "authorization") !== `Bearer ${BRIDGE_TOKEN}`) return { status: 401 };
     status.reads++;
     if (status.reads <= status.failReads) return { status: 503, body: {} };
-    return {
-      status: 200, delay: status.delay,
-      body: {
-        requested: true, available: status.available, state: status.state,
-        runner: status.runnerId && { id: status.runnerId, name: "This PC" },
-        tools: ["workspace.list", "workspace.read"], can_reconnect: status.state === "revoked",
-      },
-    };
+    return { status: 200, delay: status.delay, body: runnerStatus() };
   };
-  // The server applies the write before these gates hold or spoil the reply.
-  const gate = { create: 0, attach: 0, badConfirmation: false };
+  const bridgePost = network[`POST ${BRIDGE}/v1/*`]!;
+  network[`POST ${BRIDGE}/v1/*`] = (req) => {
+    if (new URL(req.url).pathname !== "/v1/local-tools/runner/reconnect") return bridgePost(req);
+    if (header(req, "authorization") !== `Bearer ${BRIDGE_TOKEN}`) return { status: 401 };
+    status.reconnects++;
+    status.state = "online";
+    return { status: 200, delay: gate.reconnect, body: runnerStatus() };
+  };
+  // The server handles the request before these gates hold or spoil its reply.
+  const serverGet = network[`GET ${BASE}/v1/*`]!;
+  network[`GET ${BASE}/v1/*`] = (req) => {
+    const reply = serverGet(req);
+    const read = gate.runnerRead;
+    if (read && !read.parked && new URL(req.url).pathname === `/v1/spaces/${read.sid}/runner`) {
+      read.parked = true;
+      return { ...(reply as object), delay: read.delay };
+    }
+    return reply;
+  };
   const serverPost = network[`POST ${BASE}/v1/*`]!;
   network[`POST ${BASE}/v1/*`] = (req) => {
-    const reply = serverPost(req);
     const path = new URL(req.url).pathname;
+    const detach = gate.detach;
+    if (detach && !detach.commit && path === `/v1/spaces/${detach.sid}/runner/detach-if-current`) {
+      if (detach.beforeCommit) {
+        detach.commit = () => { serverPost(req); };
+        return { status: 204, delay: detach.delay };
+      }
+      detach.commit = () => {};
+      return { ...(serverPost(req) as object), delay: detach.delay };
+    }
+    const reply = serverPost(req);
     if (path === "/v1/spaces" && gate.create) return { ...(reply as object), delay: gate.create };
     if (path.endsWith("/runner/attach-if-empty")) {
       if (gate.badConfirmation) return { status: 200, body: {} };
-      if (gate.attach) return { ...(reply as object), delay: gate.attach };
+      if (gate.attach && (!gate.attachSpace || path === `/v1/spaces/${gate.attachSpace}/runner/attach-if-empty`)) {
+        return { ...(reply as object), delay: gate.attach };
+      }
     }
     return reply;
   };
@@ -86,6 +118,27 @@ async function startSidebar(app: App, name: string, hasChoice = true) {
   if (hasChoice) await app.waitFor(choice);
   await app.clear("id:new-space-name");
   await app.type("id:new-space-name", name);
+}
+
+async function openRunnerSettings(app: App) {
+  await app.press("id:nav-settings");
+  await app.press("id:nav-settings:runners");
+  await app.waitFor("id:runners-settings");
+}
+
+async function openSpaceRunner(app: App) {
+  await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
+}
+
+// U5 won't start a new folder demand during a batch. Begin the Settings
+// snapshot first, and hold just its status reply until the interesting race.
+async function openWithHeldFolderStatus(app: App, t: ReturnType<typeof fixture>, delay: number) {
+  const before = t.status.reads;
+  t.status.delay = delay;
+  await openRunnerSettings(app);
+  await app.waitUntil(() => t.status.reads > before);
+  t.status.delay = 0;
 }
 
 test("sidebar requires submit consent, supports keyboard, and starts each new form checked", async () => {
@@ -152,6 +205,69 @@ test("a revoked runner needs a reconnect, not just a wait for it to come back", 
   expect(words(app)).toContain("Its token is no longer accepted. Reconnect it in Settings › Runners. Jobs may time out");
 });
 
+test("a held Reconnect hides both Create checkboxes without silently dropping a previously checked choice", async () => {
+  for (const onboarding of [false, true]) {
+    const f = onboarding ? fakeServer() : world();
+    const r = f.addRunner("This PC", "personal", "alice");
+    const t = fixture(f, r.id, "revoked");
+    t.gate.reconnect = 1000;
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    const label = "Create during reconnect";
+    const checkbox = onboarding ? "id:onboarding-space-use-runner" : choice;
+    const field = onboarding ? "id:onboarding-space-name" : "id:new-space-name";
+    if (onboarding) {
+      await app.waitFor(checkbox);
+      await app.type(field, label);
+    } else await startSidebar(app, label);
+    await openRunnerSettings(app);
+    await app.press("id:installed-runner-reconnect");
+    await app.press("id:installed-runner-reconnect:confirm");
+    await app.waitUntil(() => t.status.reconnects === 1);
+    await app.press("id:settings-close");
+    await app.waitFor(onboarding ? "id:onboarding-space-runner-unavailable" : "id:new-space-runner-unavailable");
+    expect(app.shows(checkbox)).toBe(false);
+    expect(creates(f)).toEqual([]);
+
+    await app.submit(field);
+    await app.waitFor(failure);
+    expect(words(app)).toContain(`Created ${label}. Metro didn't attach this computer's runner.`);
+    expect(words(app)).toContain("wasn't available when you submitted");
+    expect(app.shows("id:new-space-open-runner")).toBe(true);
+    await app.clock!.runFor(1000);
+    expect(creates(f)).toHaveLength(1);
+    expect(runnerWrites(f)).toEqual([]);
+    expect(f.state.attached.has(space(f, label).id)).toBe(false);
+    expect(app.shows(success)).toBe(false);
+  }
+});
+
+test("Reconnect during post-create verification reports the missing attach in the same Space", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  const t = fixture(f, r.id, "revoked");
+  t.gate.reconnect = 1200;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await startSidebar(app, "Before reconnect");
+  const late = f.answerLate("/v1/runners", TOKENS.alice!, 800);
+  await app.press("id:create-space");
+  await app.waitUntil(() => late.arrived() > 0);
+  await openRunnerSettings(app);
+  await app.press("id:installed-runner-reconnect");
+  await app.press("id:installed-runner-reconnect:confirm");
+  await app.waitUntil(() => t.status.reconnects === 1);
+  await app.press("id:settings-close");
+  await app.clock!.runFor(800);
+  await app.waitFor(failure);
+  expect(words(app)).toContain("Created Before reconnect. Metro didn't attach this computer's runner.");
+  expect(words(app)).toContain("no longer available for this account");
+  expect(app.shows("id:new-space-open-runner")).toBe(true);
+  await app.clock!.runFor(400);
+  expect(creates(f)).toHaveLength(1);
+  expect(runnerWrites(f)).toEqual([]);
+});
+
 test("unknown, foreign and legacy choices never render or send a runner attachment", async () => {
   for (const mode of ["not installed", "wrong account", "organization", "old server"]) {
     const f = world();
@@ -165,6 +281,7 @@ test("unknown, foreign and legacy choices never render or send a runner attachme
     if (mode !== "not installed") await app.waitUntil(() => f.state.log.some((p) => p.path === "/v1/runners"));
     await startSidebar(app, mode, false);
     expect(app.shows(choice)).toBe(false);
+    expect(app.shows("id:new-space-runner-unavailable")).toBe(false);
     expect(app.shows(offer)).toBe(false);
     await app.press("id:create-space");
     await app.waitUntil(() => !app.shows("id:new-space-name"));
@@ -296,7 +413,7 @@ test("a held successful attach reply cannot resurrect a runner after a newer Spa
     ["POST", `/v1/spaces/${id}/runner/detach-if-current`],
   ]);
   await app.press("id:space-settings-close");
-  await app.press("id:nav-settings");
+  await openRunnerSettings(app);
   await app.waitFor(`id:runner-attach-pick:${id}`); // The paired flag is false.
   expect(app.shows(`id:installed-runner-space:${id}`)).toBe(false);
 });
@@ -347,8 +464,7 @@ test("a verified Space settings attach dismisses the offer and records its folde
   expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
 
   t.status.delay = 2_000; // Don't let the Runners view's own refresh populate the folder.
-  await app.press("id:nav-settings");
-  await app.waitFor("id:runners-settings");
+  await openRunnerSettings(app);
   expect(app.shows("id:installed-runner-space:manual")).toBe(false);
   await app.clock!.runFor(800);
   await app.waitUntil(() => app.storage()[runnerOfferStorageKey(BASE, "alice")] === "dismissed");
@@ -397,8 +513,7 @@ test("a member-readable or unversioned assignment cannot dismiss the offer or re
     await app.waitUntil(() => f.state.attached.get("manual") === r.id);
     await app.press("id:space-settings-close");
     t.status.delay = 2_000;
-    await app.press("id:nav-settings");
-    await app.waitFor("id:runners-settings");
+    await openRunnerSettings(app);
     await app.clock!.runFor(800);
     await app.waitUntil(() => receivedAssignment);
     await app.waitFor("id:runner-state >> text:Runner attached");
@@ -443,8 +558,7 @@ test("detach and reattach of the same runner supersedes a held Space settings re
   expect(runnerWrites(f)).toHaveLength(3);
   await app.press("id:space-settings-close");
   t.status.delay = 2_000;
-  await app.press("id:nav-settings");
-  await app.waitFor("id:runners-settings");
+  await openRunnerSettings(app);
   expect(app.shows("id:installed-runner-space:manual")).toBe(false);
 });
 
@@ -458,14 +572,12 @@ test("a superseded Space settings attach neither dismisses the offer nor records
   await signIn(app);
   await app.waitFor(offer);
   await app.press("id:space:manual");
-  await app.press("id:manage-space");
-  await app.press("id:space-settings-tab:runner");
+  await openSpaceRunner(app);
   await app.press(`id:space-runner-attach:${r.id}`);
   await app.waitUntil(() => f.state.attached.get("manual") === r.id);
   await app.press("id:space-settings-close");
 
-  await app.press("id:manage-space");
-  await app.press("id:space-settings-tab:runner");
+  await openSpaceRunner(app);
   await app.press("id:space-runner-detach");
   await app.press("id:space-runner-detach:confirm");
   await app.waitFor("id:space-runner-status >> text:No runner");
@@ -477,12 +589,357 @@ test("a superseded Space settings attach neither dismisses the offer nor records
     "/v1/spaces/manual/runner/attach-if-empty", "/v1/spaces/manual/runner/detach-if-current",
   ]);
 
-  t.status.delay = 1_000; // Check the cache before a new folder refresh can replace it.
-  await app.press("id:nav-settings");
-  await app.waitFor("id:runners-settings");
+  t.status.delay = 1_000;
+  await openRunnerSettings(app);
   expect(app.shows("id:installed-runner-space:manual")).toBe(false);
   await app.clock!.runFor(1_000);
   await app.waitFor("id:runner-attach-pick:manual");
+});
+
+test("an older folder snapshot preserves newer presence or absence for A and still adds and removes fresh B rows", async () => {
+  for (const final of ["detached", "reassigned", "attached"]) {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    f.addSpace("keep", "Keep folder", "alice");
+    f.addSpace("added", "New folder", "alice");
+    f.addSpace("removed", "Old folder", "alice");
+    const r = f.addRunner("This PC", "personal", "alice");
+    const other = f.addRunner("Other computer", "personal", "alice");
+    const attaches = final === "attached";
+    const expectedRunner = attaches ? r.id : final === "reassigned" ? other.id : undefined;
+    f.state.attached.set("solo", r.id);
+    f.state.attached.set("keep", r.id);
+    f.state.attached.set("removed", r.id);
+    const t = fixture(f, r.id);
+    t.gate.attach = 900;
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    await openRunnerSettings(app);
+    await app.waitFor("id:installed-runner-space:solo");
+    expect(app.shows("id:installed-runner-space:keep")).toBe(true);
+    expect(app.shows("id:installed-runner-space:added")).toBe(false);
+    expect(app.shows("id:installed-runner-space:removed")).toBe(true);
+    // The normal Space list can see an external detach before the installed
+    // runner's next full folder snapshot has replaced its cached row.
+    f.state.attached.delete("solo");
+    await app.clock!.runFor(11_000);
+    await app.waitFor("id:runner-attach-pick:solo");
+    expect(app.shows("id:installed-runner-space:solo")).toBe(true);
+    await app.press("id:settings-close");
+    await openWithHeldFolderStatus(app, t, 300);
+    await app.press("id:runner-attach-pick:added"); // Not part of this batch.
+    await app.press("id:runner-attach-many");
+    await app.waitUntil(() => f.state.attached.get("solo") === r.id);
+
+    const folderRead = { sid: "solo", delay: 1000, parked: false };
+    t.gate.runnerRead = folderRead;
+    f.state.attached.set("added", r.id);
+    f.state.attached.delete("removed");
+    if (attaches) f.state.attached.delete("solo"); // The held snapshot sees absence.
+    await app.clock!.runFor(300);
+    await app.waitUntil(() => folderRead.parked);
+    expect(app.shows("id:installed-runner-space:solo")).toBe(true);
+
+    if (expectedRunner) f.state.attached.set("solo", expectedRunner);
+    else f.state.attached.delete("solo");
+
+    await app.clock!.runFor(600);
+    await app.waitFor("id:runner-attach-result");
+    if (attaches) expect(words(app)).toContain("Attached to 1 Space.");
+    else {
+      expect(words(app)).toContain("Attached to 0 of 1 Space. Solo: The runner assignment changed.");
+      expect(words(app)).toContain("Check this Space before retrying.");
+    }
+    expect(f.state.attached.get("solo")).toBe(expectedRunner);
+    expect(app.shows("id:runner-attach-pick:solo")).toBe(final === "detached"); // Authoritative paired flag.
+    expect(app.shows("id:installed-runner-space:solo")).toBe(attaches);
+    await app.clock!.runFor(400); // Merge the other rows without rolling back A.
+    expect(app.shows("id:installed-runner-space:solo")).toBe(attaches);
+    expect(app.shows("id:installed-runner-space:keep")).toBe(true);
+    expect(app.shows("id:installed-runner-space:added")).toBe(true);
+    expect(app.shows("id:installed-runner-space:removed")).toBe(false);
+    expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(attaches ? "dismissed" : undefined);
+    expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["POST", "/v1/spaces/solo/runner/attach-if-empty"]]);
+
+    if (final === "reassigned") {
+      // The Space badge must still reflect the newer assignment while its
+      // Runner page waits for its own read before enabling any actions.
+      f.answerLate("/v1/spaces/solo/runner", TOKENS.alice!, 1200);
+      await app.press("id:settings-close");
+      await app.press("id:space:solo");
+      await openSpaceRunner(app);
+      await app.waitFor("id:runner-state >> text:Runner attached");
+      expect(app.shows("id:attached-runner")).toBe(false);
+      await app.clock!.runFor(1200);
+      await app.waitFor("id:attached-runner");
+      expect(words(app)).toContain(other.name);
+    }
+  }
+});
+
+test("a newer folder observation for A wins over a delayed reconciliation without confirming the old batch", async () => {
+  for (const oldMatch of [false, true]) {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    f.addSpace("marker", "Snapshot marker", "alice");
+    const r = f.addRunner("This PC", "personal", "alice");
+    const other = f.addRunner("Other computer", "personal", "alice");
+    f.state.attached.set("marker", other.id);
+    const t = fixture(f, r.id);
+    t.gate.attach = 500;
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    await app.waitFor(offer);
+    await openWithHeldFolderStatus(app, t, 800);
+    await app.waitFor("id:runner-attach-pick:solo");
+    await app.press("id:runner-attach-many");
+    await app.waitUntil(() => f.state.attached.get("solo") === r.id);
+    if (!oldMatch) f.state.attached.delete("solo");
+    const reconciliation = { sid: "solo", delay: 1000, parked: false };
+    t.gate.runnerRead = reconciliation;
+    await app.clock!.runFor(500);
+    await app.waitUntil(() => reconciliation.parked);
+
+    if (oldMatch) f.state.attached.delete("solo");
+    else f.state.attached.set("solo", r.id);
+    f.state.attached.set("marker", r.id);
+    await app.clock!.runFor(300);
+    await app.waitFor("id:installed-runner-space:marker"); // The newer snapshot has merged.
+    await app.waitFor(oldMatch ? "id:runner-attach-pick:solo" : "id:installed-runner-space:solo");
+
+    await app.clock!.runFor(700);
+    await app.waitFor("id:runner-attach-result");
+    expect(words(app)).toContain("Attached to 0 of 1 Space. Solo: The attachment wasn't confirmed.");
+    expect(app.shows("id:installed-runner-space:solo")).toBe(!oldMatch);
+    expect(app.shows("id:runner-attach-pick:solo")).toBe(oldMatch);
+    expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+    expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["POST", "/v1/spaces/solo/runner/attach-if-empty"]]);
+
+    // The badge uses the shared pairing state; the new page still waits for
+    // its own read before showing a guarded action.
+    f.answerLate("/v1/spaces/solo/runner", TOKENS.alice!, 1200);
+    await app.press("id:settings-close");
+    await app.press("id:space:solo");
+    await openSpaceRunner(app);
+    await app.waitFor(oldMatch ? "id:runner-state >> text:No runner" : "id:runner-state >> text:Runner attached");
+    await app.clock!.runFor(1200);
+    await app.waitFor(oldMatch ? `id:space-runner-attach:${r.id}` : "id:attached-runner");
+    expect(app.shows("id:attached-runner")).toBe(!oldMatch);
+  }
+});
+
+test("batch consent doesn't survive a local attach and detach while the first item or second preflight is held", async () => {
+  for (const holdFirst of [true, false]) {
+    const f = world();
+    f.addSpace("first", "First", "alice");
+    f.addSpace("second", "Second", "alice");
+    const r = f.addRunner("This PC", "personal", "alice");
+    const other = f.addRunner("Other computer", "personal", "alice");
+    const t = fixture(f, r.id);
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    await openRunnerSettings(app);
+    await app.waitFor("id:runner-attach-pick:second");
+    await app.waitUntil(() => f.state.log.some((p) => p.method === "GET" && p.path === "/v1/spaces/second/runner"));
+    const preflight = { sid: "second", delay: 800, parked: false };
+    if (holdFirst) {
+      t.gate.attach = 800;
+      t.gate.attachSpace = "first";
+    }
+    else t.gate.runnerRead = preflight;
+    await app.press("id:runner-attach-many");
+    await app.waitUntil(() => f.state.attached.get("first") === r.id && (holdFirst || preflight.parked));
+    await app.press("id:settings-close");
+    await app.press("id:space:second");
+    await openSpaceRunner(app);
+    await app.waitFor(`id:space-runner-attach:${other.id}`);
+    await app.press(`id:space-runner-attach:${other.id}`);
+    await app.waitFor("id:attached-runner");
+    expect(f.state.attached.get("second")).toBe(other.id);
+    await app.press("id:space-runner-detach");
+    await app.press("id:space-runner-detach:confirm");
+    await app.waitFor(`id:space-runner-attach:${other.id}`);
+    expect(f.state.attached.has("second")).toBe(false);
+
+    await app.clock!.runFor(800);
+    await app.press("id:space-settings-close");
+    await openRunnerSettings(app);
+    await app.waitFor("id:runner-attach-result");
+    expect(words(app)).toContain("Attached to 1 of 2 Spaces. Second: A newer runner action changed this Space");
+    expect(app.shows("id:installed-runner-space:first")).toBe(true);
+    expect(app.shows("id:installed-runner-space:second")).toBe(false);
+    expect(app.shows("id:runner-attach-pick:second")).toBe(true);
+    expect(f.state.attached.has("second")).toBe(false);
+    await app.waitUntil(() => app.storage()[runnerOfferStorageKey(BASE, "alice")] === "dismissed");
+    expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([
+      ["POST", "/v1/spaces/first/runner/attach-if-empty"],
+      ["POST", "/v1/spaces/second/runner/attach-if-empty"], // Only the explicit Space settings action.
+      ["POST", "/v1/spaces/second/runner/detach-if-current"],
+    ]);
+  }
+});
+
+test("a newer local Manage detach wins over a held bulk success, including count and folders", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const r = f.addRunner("This PC", "personal", "alice");
+  const t = fixture(f, r.id);
+  t.gate.attach = 800;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await openRunnerSettings(app);
+  await app.waitFor("id:runner-attach-pick:solo");
+  await app.press("id:runner-attach-many");
+  await app.waitUntil(() => f.state.attached.get("solo") === r.id);
+  await app.press("id:settings-close");
+  await app.press("id:space:solo");
+  await openSpaceRunner(app);
+  await app.waitFor("id:attached-runner");
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitFor(`id:space-runner-attach:${r.id}`);
+  await app.clock!.runFor(800);
+  expect(app.shows("id:attached-runner")).toBe(false);
+  expect(app.shows("id:test-runner-row")).toBe(false);
+  await app.press("id:space-settings-close");
+  await openRunnerSettings(app);
+  await app.waitFor("id:runner-attach-result");
+  expect(words(app)).toContain("Attached to 0 of 1 Space. Solo: A newer runner action superseded this attachment check.");
+  expect(app.shows("id:runner-attach-pick:solo")).toBe(true);
+  expect(app.shows("id:installed-runner-space:solo")).toBe(false);
+  expect(f.state.attached.has("solo")).toBe(false);
+  expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
+  expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([
+    ["POST", "/v1/spaces/solo/runner/attach-if-empty"], ["POST", "/v1/spaces/solo/runner/detach-if-current"],
+  ]);
+});
+
+test("a current Manage detach fences a pre-commit folder read without losing B or a newer post-ack observation", async () => {
+  const f = world();
+  f.addSpace("alpha", "Alpha", "alice");
+  f.addSpace("beta", "Beta", "alice");
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.state.attached.set("alpha", r.id);
+  const t = fixture(f, r.id);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.waitFor(offer);
+  await app.press("id:space:alpha");
+  await openSpaceRunner(app);
+  await app.waitFor("id:attached-runner");
+  const detach = { sid: "alpha", beforeCommit: true, delay: 400, commit: null as (() => void) | null };
+  t.gate.detach = detach;
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitUntil(() => detach.commit !== null);
+  expect(f.state.attached.get("alpha")).toBe(r.id); // The guarded detach hasn't committed.
+
+  const preCommit = { sid: "alpha", delay: 800, parked: false };
+  t.gate.runnerRead = preCommit;
+  f.state.attached.set("beta", r.id);
+  await app.press("id:space-settings-close");
+  await openRunnerSettings(app);
+  await app.waitUntil(() => preCommit.parked);
+  expect(app.shows("id:installed-runner-space:alpha")).toBe(true);
+  const afterAck = { sid: "alpha", delay: 1600, parked: false };
+  t.gate.runnerRead = afterAck;
+  detach.commit!();
+  await app.clock!.runFor(400);
+  await app.waitUntil(() => afterAck.parked); // Fresh exact-Space read after the ack.
+  expect(f.state.attached.has("alpha")).toBe(false);
+
+  await app.clock!.runFor(400); // The pre-commit snapshot returns before the fresh read.
+  await app.waitFor("id:installed-runner-space:beta");
+  expect(app.shows("id:installed-runner-space:alpha")).toBe(false);
+  // A historical ack cannot make the Space attachable before a fresh read.
+  expect(app.shows("id:runner-attach-pick:alpha")).toBe(false);
+  await app.press("id:settings-close");
+  expect(app.shows("id:attached-runner")).toBe(false);
+  expect(app.shows("id:test-runner-row")).toBe(false);
+
+  // A newer observation really can win: another client attaches A again
+  // after the ack, while the first post-ack read is still in flight.
+  f.state.attached.set("alpha", r.id);
+  await openRunnerSettings(app);
+  await app.waitFor("id:installed-runner-space:alpha");
+  await app.clock!.runFor(1200);
+  expect(app.shows("id:installed-runner-space:alpha")).toBe(true);
+  expect(app.shows("id:installed-runner-space:beta")).toBe(true);
+  expect(app.shows("id:runner-attach-pick:alpha")).toBe(false);
+  await app.press("id:settings-close");
+  await app.waitFor("id:runner-state >> text:Runner attached");
+  expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["POST", "/v1/spaces/alpha/runner/detach-if-current"]]);
+});
+
+test("a Manage detach ack superseded by a verified bulk attach doesn't publish or re-read", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  f.addSpace("marker", "Snapshot marker", "alice");
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.state.attached.set("solo", r.id);
+  const t = fixture(f, r.id);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.waitFor(offer);
+  await app.press("id:space:solo");
+  await openSpaceRunner(app);
+  await app.waitFor("id:attached-runner");
+  const detach = { sid: "solo", beforeCommit: false, delay: 800, commit: null as (() => void) | null };
+  t.gate.detach = detach;
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitUntil(() => detach.commit !== null);
+  expect(f.state.attached.has("solo")).toBe(false);
+
+  // Make a sibling folder mark completion of this Settings snapshot.
+  f.state.attached.set("marker", r.id);
+  await app.press("id:space-settings-close");
+  await openRunnerSettings(app);
+  await app.waitFor("id:installed-runner-space:marker");
+  await app.waitFor("id:runner-attach-pick:solo");
+  await app.press("id:runner-attach-many");
+  await app.waitFor("id:runner-attach-result");
+  expect(words(app)).toContain("Attached to 1 Space.");
+  expect(app.shows("id:installed-runner-space:solo")).toBe(true);
+  const reads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/spaces/solo/runner").length;
+  const before = reads();
+
+  await app.clock!.runFor(800);
+  expect(app.shows("id:installed-runner-space:solo")).toBe(true);
+  expect(reads()).toBe(before);
+  await app.press("id:settings-close");
+  await app.waitFor("id:runner-state >> text:Runner attached");
+  expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([
+    ["POST", "/v1/spaces/solo/runner/detach-if-current"], ["POST", "/v1/spaces/solo/runner/attach-if-empty"],
+  ]);
+});
+
+test("a Manage detach acknowledgement after an account change doesn't re-read the old Space", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.state.attached.set("solo", r.id);
+  const t = fixture(f, r.id);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.press("id:space:solo");
+  await openSpaceRunner(app);
+  await app.waitFor("id:attached-runner");
+  const detach = { sid: "solo", beforeCommit: false, delay: 800, commit: null as (() => void) | null };
+  t.gate.detach = detach;
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitUntil(() => detach.commit !== null);
+  expect(f.state.attached.has("solo")).toBe(false);
+  const reads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/spaces/solo/runner").length;
+  const before = reads();
+  await app.press("id:space-settings-close");
+  await signOut(app);
+  await signIn(app, "bob");
+  await app.clock!.runFor(800);
+  expect(reads()).toBe(before);
+  expect(app.shows("id:space:solo")).toBe(false);
+  expect(words(app)).not.toContain("Runner detached.");
 });
 
 test("changing and restoring consent while the create response is held never posts an attach or duplicate create", async () => {
@@ -500,7 +957,7 @@ test("changing and restoring consent while the create response is held never pos
   await app.press(choice);
   await app.clock!.runFor(600);
   await app.waitFor(failure);
-  expect(words(app)).toContain("The Create Space choice changed");
+  expect(words(app)).toContain("The Create Space choice or context changed");
   expect(creates(f)).toHaveLength(1);
   expect(runnerWrites(f)).toEqual([]);
   expect(space(f, "One only")).toBeTruthy();
@@ -688,8 +1145,7 @@ test("Settings reopen joins held Sidebar liveness and refreshes folders after an
     const before = t.status.reads;
     await app.clock!.runFor(5000);
     expect(t.status.reads).toBe(before + 1);
-    await app.press("id:nav-settings");
-    await app.waitFor("id:runners-settings");
+    await openRunnerSettings(app);
     expect(t.status.reads).toBe(before + 1); // Settings joins; no second bridge request.
     await app.clock!.runFor(800);
   };

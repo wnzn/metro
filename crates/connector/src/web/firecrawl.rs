@@ -54,14 +54,13 @@ async fn failure(c: &Call<'_>, resp: reqwest::Response) -> Option<Failure> {
 }
 
 pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<Answer, Failure> {
-    let resp = request(
+    let rb = request(
         c,
         format!("{base}/search"),
         json!({"query": r.query, "limit": r.max_results}),
-    )
-    .send()
-    .await
-    .map_err(|e| transport(&e))?;
+    );
+    (c.gate)().map_err(Failure::Stopped)?;
+    let resp = rb.send().await.map_err(|e| transport(&e))?;
     if !resp.status().is_success() {
         return Err(failure(c, resp)
             .await
@@ -94,14 +93,13 @@ pub(crate) async fn fetch(c: &Call<'_>, base: &str, r: &FetchReq) -> Result<Answ
     let mut out = Answer::default();
     for url in &r.urls {
         // Each URL is its own request; preserve why the gate stopped it.
-        (c.gate)().map_err(Failure::Stopped)?;
-        let resp = request(
+        let rb = request(
             c,
             format!("{base}/scrape"),
             json!({"url": url, "formats": ["markdown"], "onlyMainContent": true, "timeout": 45000}),
-        )
-        .send()
-        .await;
+        );
+        (c.gate)().map_err(Failure::Stopped)?;
+        let resp = rb.send().await;
         let resp = match resp {
             Ok(r) => r,
             Err(e) if out.pages.is_empty() && out.failed_urls.is_empty() => {

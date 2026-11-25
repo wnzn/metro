@@ -38,22 +38,53 @@ use crate::auth::Human;
 /// The caller's media embedding connection and System One connection.
 /// The media connection is the library setting only, never the message
 /// search connection.
-pub async fn routing(state: &AppState, who: &Human) -> Result<Routing, LibrarySearchError> {
+pub(super) async fn routing(
+    state: &AppState,
+    who: &Human,
+    expected: Option<i64>,
+) -> Result<(Routing, SelectionBinding), LibrarySearchError> {
     let user = who.id.clone();
-    let embedding = state
+    let providers = state.providers.clone();
+    let (embedding, revision, fingerprint) = state
         .db
-        .call(move |db| Ok(super::store::embedding_id(&db.lock(), &user)?))
+        .call(move |db| {
+            let mut conn = db.lock();
+            let read = conn.transaction()?;
+            let (embedding, revision) = super::store::selection(&read, &user)?;
+            // Capture the selected connection's destination in the very same
+            // snapshot. Media shares always use this row (no presets).
+            // Scope and share authorization are still checked per source,
+            // not inferred from this fingerprint.
+            let fingerprint = match embedding.as_deref() {
+                Some(id) if expected.is_none_or(|r| r == revision) => {
+                    crate::providers::store::find(&read, id)?
+                        .and_then(|row| crate::providers::fingerprint_of(&providers, id, &row).ok())
+                }
+                _ => None,
+            };
+            read.commit()?;
+            Ok((embedding, revision, fingerprint))
+        })
         .await?;
+    if expected.is_some_and(|expected| revision != expected) {
+        return Err(LibrarySearchError::SelectionChanged);
+    }
     let prefs = crate::model_routing::preferences(state, &who.id)
         .await
         .map_err(|e| LibrarySearchError::Internal(format!("reading model routing: {e:#}")))?;
     if embedding.is_none() {
         return Err(LibrarySearchError::NoMediaModel);
     }
-    Ok(Routing {
-        embedding,
-        classifier: prefs.classifier_id,
-    })
+    Ok((
+        Routing {
+            embedding,
+            classifier: prefs.classifier_id,
+        },
+        SelectionBinding {
+            revision,
+            fingerprint,
+        },
+    ))
 }
 
 pub fn seams<'a>(state: &'a AppState, who: &'a Human) -> (DbLibrary, ProviderModels<'a>) {
@@ -157,14 +188,19 @@ fn use_error(e: crate::providers::UseError) -> MediaError {
 /// `caller`, keyed by every fact a stored vector depends on (chosen and
 /// running connection, provider, capability, model, config revision,
 /// endpoint, and how the caller reaches it).
-fn grant_check(caller: String) -> GrantCheck {
+pub(super) fn grant_check(caller: String) -> GrantCheck {
     std::sync::Arc::new(move |conn, space, id| {
         let a =
             crate::providers::sharing::authorize(conn, &caller, space, id).map_err(use_error)?;
         let media = a.row.capability == crate::providers::Capability::Embeddings
-            && crate::providers::catalog::find(&a.row.provider_id).is_some_and(|e| e.media_inputs);
+            && crate::providers::catalog::find(&a.row.provider_id).is_some_and(|e| {
+                e.media_inputs && e.capability == crate::providers::Capability::Embeddings
+            });
         if !media {
             return Err(use_error(crate::providers::UseError::MediaUnsupported));
+        }
+        if a.row.model.is_empty() {
+            return Err(use_error(crate::providers::UseError::NoModel));
         }
         Ok(format!(
             "{:?}",
@@ -235,11 +271,19 @@ impl MediaModels for ProviderModels<'_> {
         dest: Option<&'a str>,
         connection: &'a str,
         input: Value,
+        binding: Option<(i64, &'a str)>,
     ) -> ModelFuture<'a, Value> {
         Box::pin(async move {
-            crate::providers::media_embed(self.state, self.caller, dest, connection, input)
-                .await
-                .map_err(provider_error)
+            crate::providers::media_embed_bound(
+                self.state,
+                self.caller,
+                dest,
+                connection,
+                input,
+                binding,
+            )
+            .await
+            .map_err(provider_error)
         })
     }
 
@@ -249,11 +293,19 @@ impl MediaModels for ProviderModels<'_> {
         connection: &'a str,
         state: Value,
         questions: Value,
+        selection: Option<(&'a str, i64)>,
     ) -> ModelFuture<'a, Value> {
         Box::pin(async move {
-            crate::providers::decide(self.state, self.caller, dest, connection, state, questions)
-                .await
-                .map_err(provider_error)
+            crate::providers::library_decide(
+                self.state,
+                self.caller,
+                dest,
+                connection,
+                (state, questions),
+                selection,
+            )
+            .await
+            .map_err(provider_error)
         })
     }
 
@@ -286,7 +338,31 @@ pub async fn put_settings(
     let Json(body) = body?;
     let (_, models) = seams(&state, &who);
     Ok(Json(
-        engine::save_settings(&state.db, &models, &who.id, body).await?,
+        engine::save_settings(&state.db, &models, &who.id, body.embedding_id, None).await?,
+    ))
+}
+
+/// `PUT /v1/library/settings/selection`: guarded write, never routed to the legacy PUT.
+pub async fn put_selection(
+    State(state): State<AppState>,
+    who: Human,
+    body: Result<Json<CheckedSettings>, JsonRejection>,
+) -> Result<Json<SettingsView>, ApiError> {
+    let Json(body) = body?;
+    let (_, models) = seams(&state, &who);
+    Ok(Json(
+        engine::save_settings(
+            &state.db,
+            &models,
+            &who.id,
+            body.embedding_id,
+            Some((
+                body.expected_embedding_id,
+                request_revision(body.expected_selection_revision.as_deref(), false)?,
+            )),
+        )
+        .await
+        .map_err(selection_save_error)?,
     ))
 }
 

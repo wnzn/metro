@@ -350,10 +350,12 @@ async fn tavily_keyless_and_keyed_headers_and_errors() {
     let v = s.engine().rotate("j3", &search("rust"), deadline()).await;
     assert_eq!(v["provider"], Value::Null);
     assert_eq!(outcomes(&v), vec![o("tavily", "key", "key_rejected")]);
+    assert_eq!(v["attempts"][0]["contacted"], true);
     assert_eq!(s.fixture.seen().len(), n + 1);
     // ... and stays skipped until the key changes.
     let v = s.engine().rotate("j4", &search("rust"), deadline()).await;
     assert_eq!(outcomes(&v), vec![o("tavily", "key", "key_rejected")]);
+    assert_eq!(v["attempts"][0]["contacted"], false);
     assert_eq!(
         s.fixture.seen().len(),
         n + 1,
@@ -370,6 +372,39 @@ async fn tavily_keyless_and_keyed_headers_and_errors() {
     s.fixture.push("/tavily/search", tavily_ok());
     let v = s.engine().rotate("j6", &search("rust"), deadline()).await;
     assert_eq!(v["mode"], "keyless");
+}
+
+#[tokio::test]
+async fn rotation_marks_a_cached_rejection_without_contacting_that_provider() {
+    let s = Setup::new(&[ProviderId::Exa, ProviderId::Parallel, ProviderId::Tavily]).await;
+    s.key(ProviderId::Parallel, CANARY);
+    settings::apply(
+        &s.dir,
+        &settings::Updates {
+            rejected: vec![(
+                ProviderId::Parallel,
+                keys::fingerprint(&Secret::new(CANARY)),
+            )],
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    s.fixture.push("/exa#initialize", reply(429, json!({})));
+    s.fixture.push("/tavily/search", tavily_ok());
+    let v = s
+        .engine()
+        .rotate("cached", &search("fixture"), deadline())
+        .await;
+    assert_eq!(
+        outcomes(&v),
+        [
+            o("exa", "keyless", "limited"),
+            o("parallel", "key", "key_rejected"),
+            o("tavily", "keyless", "ok"),
+        ]
+    );
+    assert_eq!(v["attempts"][1]["contacted"], false);
+    assert!(s.fixture.seen_at("/parallel").is_empty());
 }
 
 #[tokio::test]

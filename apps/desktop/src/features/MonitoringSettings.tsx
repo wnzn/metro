@@ -6,6 +6,7 @@
 // from. Sources are never mixed into one list (src/monitoring.ts).
 
 import { connectedTo, me } from "../store";
+import { settingsAccountScope } from "../settings";
 import {
   loadMonitoring,
   MAX_MONITORING_EVENTS,
@@ -15,8 +16,8 @@ import {
   selectMonitoringSource,
 } from "../monitoring";
 import type { MonitoringEvent, MonitoringSource } from "../monitoring";
-import { Action, Badge, Banner, Column, compactWidth, Divider, FactList, Label, PageHeader, PageLayout, Picker, Row, SettingsGroup } from "../ui";
-import type { Fact, PickerItem } from "../ui";
+import { Action, Badge, Banner, Column, compactWidth, Divider, FactList, Label, PageHeader, PageLayout, Picker, Row, SettingRow, SettingsGroup } from "../ui";
+import type { Fact, PageScope, PickerItem } from "../ui";
 
 const GROUP: Record<MonitoringSource["kind"], string> = {
   device: "This computer",
@@ -64,29 +65,34 @@ export function formatEventTime(ms: number): string {
 }
 
 export function MonitoringSettings() {
+  const hasFeedback = () => monitoringResult()?.phase === "error" || monitoringResult()?.phase === "unsupported";
+  const scope = (): PageScope | undefined => {
+    switch (monitoringSource()?.kind) {
+      case "device": return { kind: "computer" };
+      case "me": return settingsAccountScope();
+      case "space": return { kind: "space" };
+      case "instance": return { kind: "organization" };
+    }
+  };
   return (
-    <PageLayout testID="monitoring-settings" pad={compactWidth() ? 4 : 6} gap={6}>
-      <PageHeader title="Monitoring" subtitle="Recent events from one source at a time. Sources are never combined." />
+    <PageLayout testID="monitoring-settings" pad={compactWidth() ? 4 : 6} gap={6} footer={hasFeedback() ? <MonitoringFeedback /> : undefined}>
+      <PageHeader title="Monitoring" subtitle="See recent events from one source at a time." scope={scope()} />
       <If when={monitoringSource()} else={<NoSources />}>
         {(s) => (
           <Column gap={4}>
-            <Row gap={2} align="center" wrap>
-              <Picker
-                testID="monitoring-source"
-                accessibilityLabel="Monitoring source"
-                items={sourceItems(monitoringSources())}
-                value={s().key}
-                onChange={(v) => v && selectMonitoringSource(v)}
-              />
-              <Action
-                testID="monitoring-refresh"
-                label="Refresh"
-                busyLabel="Loading…"
-                busy={monitoringResult()?.phase === "loading"}
-                onPress={() => void loadMonitoring()}
-              />
-            </Row>
-            <FactList testID="monitoring-source-facts" facts={facts(s())} />
+            <SettingsGroup title="Source">
+              <SettingRow label="Event source" stacked>
+                <Row gap={2} align="center" wrap>
+                  <Picker testID="monitoring-source" accessibilityLabel="Monitoring source" items={sourceItems(monitoringSources())}
+                    value={s().key} onChange={(v) => v && selectMonitoringSource(v)} />
+                  <Action testID="monitoring-refresh" label="Refresh" busyLabel="Loading…" busy={monitoringResult()?.phase === "loading"}
+                    onPress={() => void loadMonitoring()} />
+                </Row>
+              </SettingRow>
+              <SettingRow label="Scope" stacked>
+                <FactList testID="monitoring-source-facts" facts={facts(s())} />
+              </SettingRow>
+            </SettingsGroup>
             <Result />
           </Column>
         )}
@@ -97,12 +103,24 @@ export function MonitoringSettings() {
 
 function NoSources() {
   return (
-    <Banner
-      variant="inline"
-      tone="system"
-      testID="monitoring-none"
-      message="Nothing to monitor here. Sign in to see your own Chat's events, the events of Spaces you own, of this computer when Metro's desktop helper runs it, and of the server if you're an organization admin."
-    />
+    <SettingsGroup title="Events" testID="monitoring-none">
+      <SettingRow label="No monitoring sources" description="Connect to a server or start the Metro desktop helper to see events." />
+    </SettingsGroup>
+  );
+}
+
+function MonitoringFeedback() {
+  const result = monitoringResult;
+  return (
+    <>
+      <If when={result()?.phase === "unsupported"}>
+        <Banner variant="inline" tone="warning" testID="monitoring-unsupported" message={result()?.message ?? ""} />
+      </If>
+      <If when={result()?.phase === "error"}>
+        <Banner variant="inline" tone="danger" testID="monitoring-error" message={result()?.message ?? ""}
+          action={<Action label="Try again" testID="monitoring-retry" onPress={() => void loadMonitoring()} />} />
+      </If>
+    </>
   );
 }
 
@@ -111,12 +129,6 @@ function Result() {
     <If when={monitoringResult()} else={<Label variant="caption" color="muted">Loading events…</Label>}>
       {(r) => (
         <Column gap={3}>
-          <If when={r().phase === "unsupported"}>
-            <Banner variant="inline" tone="warning" testID="monitoring-unsupported" message={r().message ?? ""} />
-          </If>
-          <If when={r().phase === "error"}>
-            <Banner variant="inline" tone="danger" testID="monitoring-error" message={r().message ?? ""} />
-          </If>
           <If when={r().phase === "loading" && r().events.length === 0}>
             <Label variant="caption" color="muted" testID="monitoring-loading">
               Loading events…
@@ -124,7 +136,7 @@ function Result() {
           </If>
           <If when={r().phase === "ready" && r().events.length === 0}>
             <Label variant="caption" color="muted" testID="monitoring-empty">
-              No recent events.
+              No events yet.
             </Label>
           </If>
           <If when={r().truncated}>
@@ -138,7 +150,7 @@ function Result() {
             </Label>
           </If>
           <If when={r().events.length > 0}>
-            <SettingsGroup testID="monitoring-events">
+            <SettingsGroup title="Events" testID="monitoring-events">
               <Each of={r().events.map((e, i) => ({ e, i }))} key={(x) => `${x.i}:${x.e.timestamp}:${x.e.code}`}>
                 {(x) => (
                   <Column>
