@@ -34,18 +34,29 @@ function previousQuote(text: string, before: number, opaque: readonly MentionRan
   return null;
 }
 
+function startsEmailToken(text: string, start: number): boolean {
+  if (start === 0 || sharedOpen.test(text[start - 1])) return true;
+  if (text[start - 1] !== ">") return false;
+  // A no-space `>` is an email boundary only at a Markdown line prefix.
+  // Do not admit a prose closing angle bracket or widen wire mention spans.
+  let prefix = start - 1;
+  while (prefix > 0 && /[> \t]/.test(text[prefix - 1])) prefix--;
+  return (prefix === 0 || /[\r\n]/.test(text[prefix - 1]))
+    && /^ {0,3}>(?:(?: {0,4}|\t {0,3})>)*$/.test(text.slice(prefix, start));
+}
+
 function openingUnderscores(text: string, quote: number): number {
   // Underscore emphasis can wrap mail, but is not wire mention punctuation:
   // underscores are legal in handles and the server treats them as part of one.
   let start = quote;
   while (start > 0 && text[start - 1] === "_") start--;
-  return (start === 0 || sharedOpen.test(text[start - 1])) ? quote - start : 0;
+  return start < quote && startsEmailToken(text, start) ? quote - start : 0;
 }
 
 function startsQuotedToken(text: string, start: number): boolean {
   // Narrower than a mention boundary: the quote in `hello!"`, for example,
   // closes prose rather than starting a new local-part token.
-  return start === 0 || sharedOpen.test(text[start - 1]) || openingUnderscores(text, start) > 0;
+  return startsEmailToken(text, start) || openingUnderscores(text, start) > 0;
 }
 
 function endsDelimitedToken(text: string, end: number): boolean {

@@ -398,6 +398,62 @@ test("wrapped and emphasized quoted email never contributes an agent recipient o
   }
 });
 
+test("quoted mail can start directly after a Markdown blockquote marker", () => {
+  const directory = {
+    ...roster, agents: [...roster.agents, { id: "ag-underscore", handle: "agent_", name: "Underscore" }],
+  };
+  for (const text of ['>"local"@agent', '>_"local"@agent_']) {
+    expect(scanMentionDraft(draft(text), directory, { finalize: true })).toEqual([]);
+    expect(send(text, directory)).toEqual({ ok: true, body: { text } });
+    const start = text.indexOf("@");
+    expect(pickMention(draft(text), { start, end: text.length, literal: text.slice(start) }, generic, directory)).toBe(null);
+  }
+});
+
+test("nested blockquote prefixes preserve wrapped addresses, adjacent addresses, and UTF-8 spans", () => {
+  const directory = {
+    ...roster, agents: [...roster.agents,
+      { id: "ag-underscore", handle: "agent_", name: "Underscore" },
+      { id: "ag-double-underscore", handle: "agent__", name: "Double Underscore" },
+    ],
+  };
+  for (const prefix of [">", ">>", "> >", "  > >>", ">\t>", "🌿 Earlier\r\n   >   >"]) {
+    for (const [left, right] of [["", ""], ["_", "_"], ["__", "__"], ["*", "*"], ["(*", "*)"], ["<", ">"]]) {
+      for (const suffix of ["", ',"second"@coder', ';_" second"@agent_']) {
+        const text = `${prefix}${left}"local"@agent${right}${suffix}\n🌿 Say "@Alice Moreno"`;
+        const mention = "@Alice Moreno";
+        const start = new TextEncoder().encode(text.slice(0, text.indexOf(mention))).length;
+        expect(send(text, directory)).toEqual({
+          ok: true, body: { text, mentions: [alice], spans: [{ start, end: start + mention.length, index: 0 }] },
+        });
+      }
+    }
+  }
+});
+
+test("an angle bracket outside a blockquote prefix does not change mention or chooser boundaries", () => {
+  for (const text of [
+    'See <tag>" "@Alice Moreno"',
+    'See <tag>_" "@Alice Moreno"',
+    '> See <tag>" "@Alice Moreno"',
+    '    >" "@Alice Moreno"',
+    '\\>" "@Alice Moreno"',
+    '>"@Alice Moreno"',
+  ]) expect(body(send(text)).mentions).toEqual([alice]);
+
+  const source = draft('>"@Alice Moreno"');
+  const [match] = scanMentionDraft(source, roster);
+  const chosen = pickMention(source, match, alice, roster)!;
+  expect(chosen.anchors[0]?.picked).toBe(true);
+  expect(body(prepareMentionSend(chosen, roster)).mentions).toEqual([alice]);
+  const text = ">@agent";
+  const selection = { start: 1, end: text.length, literal: "@agent" };
+  expect(send(text)).toEqual({ ok: true, body: { text } });
+  expect(pickMention(draft(text), selection, generic, roster)).toBe(null);
+  expect(prepareMentionSend({ text, anchors: [{ ...selection, mention: generic, picked: true }] }, roster))
+    .toEqual({ ok: false, reason: "invalid-anchor" });
+});
+
 test("an email-like invalid host stays in the chooser even after its agent changes handle", () => {
   const initial = {
     ...roster, agents: roster.agents.map(a => a.id === coder.agentId ? { ...a, handle: "_coder" } : a),
