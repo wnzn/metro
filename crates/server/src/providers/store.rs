@@ -263,6 +263,10 @@ pub struct Patch {
     pub sealed_key: Option<Option<Vec<u8>>>,
     /// An endpoint the caller has already tested.
     pub base_url: Option<String>,
+    /// A precondition: the endpoint the caller named, unchanged. The patch
+    /// is saved only while the committed endpoint is still this one, so a
+    /// key or model meant for it never lands on another endpoint.
+    pub base_url_is: Option<String>,
 }
 
 impl std::fmt::Debug for Patch {
@@ -273,6 +277,7 @@ impl std::fmt::Debug for Patch {
             .field("is_default", &self.is_default)
             .field("sets_key", &self.sealed_key.as_ref().map(Option::is_some))
             .field("base_url", &self.base_url)
+            .field("base_url_is", &self.base_url_is)
             .finish()
     }
 }
@@ -310,6 +315,10 @@ pub fn patch(
     };
     if expected.is_some_and(|expected| expected != &old)
         || (patch.base_url.is_some() && expected.is_none())
+        || patch
+            .base_url_is
+            .as_ref()
+            .is_some_and(|url| old.base_url.as_ref() != Some(url))
     {
         return Ok(Patched::Changed);
     }

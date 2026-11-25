@@ -510,14 +510,39 @@ pub async fn update(
     let Json(body) = body?;
     let entry = catalog::find(&previous.provider_id)
         .ok_or_else(|| conflict("this connection's provider is no longer supported"))?;
+    let patch = patch_of(&state, entry, &previous, body)?;
+    match save_update(&state, entry, patch, previous).await? {
+        store::Patched::Saved(row) => Ok(Json(view_of(&state, row).await?)),
+        store::Patched::Missing => Err(not_found()),
+        store::Patched::DefaultNeedsModel => Err(default_needs_model()),
+        store::Patched::Changed => {
+            load(&state, &who, &id).await?;
+            Err(conflict(
+                "the connection changed while this change was being saved; reload it and try \
+                 again",
+            ))
+        }
+    }
+}
+
+/// The checked change `body` asks for on `previous`.
+fn patch_of(
+    state: &AppState,
+    entry: &Entry,
+    previous: &Row,
+    body: UpdateBody,
+) -> ApiResult<store::Patch> {
     let mut patch = store::Patch::default();
     if let Some(url) = body.base_url {
         if entry.is_device() {
             return Err(device_has_no_key());
         }
         let url = url.ok_or_else(|| bad_request("base_url must be an approved URL, not null"))?;
-        let url = approved_base_url(&state, &url)?;
-        if previous.base_url.as_deref() != Some(url.as_str()) {
+        let url = approved_base_url(state, &url)?;
+        if previous.base_url.as_deref() == Some(url.as_str()) {
+            // Named but unchanged: still a precondition of the write.
+            patch.base_url_is = Some(url);
+        } else {
             patch.base_url = Some(url);
         }
     }
@@ -547,17 +572,7 @@ pub async fn update(
         }
     }
     patch.is_default = body.is_default;
-    match save_update(&state, entry, patch, previous).await? {
-        store::Patched::Saved(row) => Ok(Json(view_of(&state, row).await?)),
-        store::Patched::Missing => Err(not_found()),
-        store::Patched::DefaultNeedsModel => Err(default_needs_model()),
-        store::Patched::Changed => {
-            load(&state, &who, &id).await?;
-            Err(conflict(
-                "the connection changed while testing the endpoint; try again",
-            ))
-        }
-    }
+    Ok(patch)
 }
 
 fn default_needs_model() -> ApiError {
@@ -1339,4 +1354,95 @@ fn error_kind(e: &RigProviderError) -> &'static str {
         RigProviderError::InvalidAuthentication(_) => "invalid_authentication",
         _ => "other",
     }
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_named_unchanged_endpoint_is_a_precondition_in_both_commit_orders() {
+    use base64::Engine;
+
+    let (a, b) = (
+        "https://a.example.invalid/v1".to_owned(),
+        "https://b.example.invalid/v1".to_owned(),
+    );
+    let mut state = probe_state(vec![a.clone(), b.clone()]).await;
+    let master = super::secret::MasterKey::parse(
+        &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
+    )
+    .unwrap();
+    state.providers =
+        super::ProviderService::new(Some(master), vec![a.clone(), b.clone()]).unwrap();
+    let entry = catalog::find(catalog::CUSTOM).unwrap();
+    // The new key, sent together with the endpoint it is meant for.
+    let body = || -> UpdateBody {
+        serde_json::from_value(json!({"base_url": a, "api_key": "sk-new-key-for-a"})).unwrap()
+    };
+    let switch_to_b = |_: &Row| store::Patch {
+        base_url: Some(b.clone()),
+        ..store::Patch::default()
+    };
+
+    // Order 1: a switch to B commits between the PATCH's read and write.
+    let snapshot = probe_row(&state, catalog::CUSTOM, &a);
+    let patch = patch_of(&state, entry, &snapshot, body()).unwrap();
+    assert_eq!(patch.base_url, None);
+    assert_eq!(patch.base_url_is.as_deref(), Some(a.as_str()));
+    let store::Patched::Saved(switched) = store::patch(
+        &mut state.db.lock(),
+        &snapshot.user_id,
+        &snapshot.id,
+        &switch_to_b(&snapshot),
+        Some(&snapshot),
+    )
+    .unwrap() else {
+        panic!("switch not saved");
+    };
+    let saved = save_update(&state, entry, patch, snapshot.clone())
+        .await
+        .unwrap();
+    assert!(matches!(saved, store::Patched::Changed), "{saved:?}");
+    let now = store::get(&state.db.lock(), &snapshot.user_id, &snapshot.id).unwrap();
+    assert_eq!(now.as_ref(), Some(&switched), "nothing was written");
+    assert_eq!(
+        now.unwrap().sealed_key,
+        None,
+        "the key for A never reached B"
+    );
+
+    // Order 2: the PATCH commits first; the switch, prepared from the older
+    // snapshot, is then refused.
+    let snapshot = probe_row(&state, catalog::CUSTOM, &a);
+    let patch = patch_of(&state, entry, &snapshot, body()).unwrap();
+    let store::Patched::Saved(keyed) = save_update(&state, entry, patch, snapshot.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("key not saved");
+    };
+    assert_eq!(keyed.base_url.as_deref(), Some(a.as_str()));
+    assert!(keyed.sealed_key.is_some());
+    let late = store::patch(
+        &mut state.db.lock(),
+        &snapshot.user_id,
+        &snapshot.id,
+        &switch_to_b(&snapshot),
+        Some(&snapshot),
+    )
+    .unwrap();
+    assert!(matches!(late, store::Patched::Changed), "{late:?}");
+    let now = store::get(&state.db.lock(), &snapshot.user_id, &snapshot.id).unwrap();
+    assert_eq!(now.as_ref(), Some(&keyed));
+
+    // Omitting the endpoint merges into whatever is committed.
+    let omitted: UpdateBody = serde_json::from_value(json!({"name": "Renamed"})).unwrap();
+    let patch = patch_of(&state, entry, &snapshot, omitted).unwrap();
+    assert_eq!(patch.base_url_is, None);
+    let store::Patched::Saved(renamed) = save_update(&state, entry, patch, snapshot.clone())
+        .await
+        .unwrap()
+    else {
+        panic!("rename not saved");
+    };
+    assert_eq!(renamed.name, "Renamed");
+    assert_eq!(renamed.sealed_key, keyed.sealed_key);
 }
