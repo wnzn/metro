@@ -28,6 +28,25 @@ test("A wide table owns its labelled horizontal scroll", async () => {
   await app.waitFor("text:Column 10");
 });
 
+test("Table plans align only numeric columns, leaving mixed text and statuses readable", () => {
+  const spec = { format: 1, data: [{ name: "records" }], blocks: [
+    { type: "Table", key: "table", props: { rows: bind("records") }, children: [
+      { type: "Column", props: { field: lit("name") } },
+      { type: "Column", props: { field: lit("size"), format: lit("bytes") } },
+      { type: "Column", props: { field: lit("count") } },
+      { type: "Column", props: { field: lit("mixed") } },
+      { type: "Column", props: { field: lit("status"), format: lit("status") } },
+    ] },
+  ] };
+  const data = { ...sampleData, data: { records: { ok: true as const, value: [
+    { name: "One", size: 2048, count: 4, mixed: 3, status: "running" },
+    { name: "Two", mixed: "unknown", status: "completed" },
+  ] } } };
+  const table = planPage(spec, data, false).blocks[0];
+  expect(table?.numericColumns).toEqual([false, true, true, false, false]);
+  expect(table?.rows?.[0]?.[1]?.label).toBe("2 KiB");
+});
+
 test("Page Markdown uses underlined, high-contrast link ink", async () => {
   const app = await open("./test/pages.fixture.tsx", { width: 1100, height: 850, platform: "linux" });
   await app.setColorScheme("dark");

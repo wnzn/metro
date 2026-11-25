@@ -6,9 +6,9 @@ import { isPageStatus, pageFailure, targetOf } from "../../api/pages";
 import { forgetPageDraft, goPages, pageDraftModel, pageDraftUnavailable, pageGuard, pagesProblem, rememberPageDraftModel, sameSpaceGrants, scopeVisible, spaceGrants } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
 import { apiClient, openExactRoom, sessionGuard } from "../../store";
-import { Action, ActionBar, Badge, Banner, Column, Label, modalOpen, PageHeader, Row, ScrollArea, SegmentedControl } from "../../ui";
+import { Action, ActionBar, Banner, Column, Label, modalOpen, PageHeader, PageLayout, Row, SegmentedControl } from "../../ui";
 import { PageCode, PageDiff } from "../../ui/pageBlocks";
-import { Diagnostics, DraftPrompt, PagesError, scopeName, showDraft, showPage } from "./controls";
+import { Diagnostics, DraftPrompt, PagesError, scopeAudience, showDraft, showPage } from "./controls";
 import { PageRenderer } from "./PageRenderer";
 import { pageReadLane, visiblePolling } from "./refresh";
 
@@ -221,7 +221,10 @@ export function DraftView(props: { route: DraftRoute }) {
       if (available()) { error.set(pagesProblem(e)); diagnostics.set(pageFailure(e).diagnostics ?? []); }
     } finally { if (valid()) busy.set(false); }
   }
-  const changed = () => new Set([...(draft()?.changes?.added ?? []), ...(draft()?.changes?.changed ?? [])]);
+  const highlights = () => new Map([
+    ...(draft()?.changes?.added ?? []).map(key => [key, "Added"] as const),
+    ...(draft()?.changes?.changed ?? []).map(key => [key, "Changed"] as const),
+  ]);
   const readable = () => available() && applyAccess() !== "checking";
   const title = () => (readable() && draft()?.spec?.title) || "Page draft";
   const changeSummary = () => {
@@ -230,16 +233,38 @@ export function DraftView(props: { route: DraftRoute }) {
     return [`${c.added.length} added`, `${c.changed.length} changed`, `${c.removed.length} removed`,
       c.data.length ? `${c.data.length} data sources changed` : "", c.page ? "Page layout or settings changed" : ""].filter(Boolean).join(" · ");
   };
-  return <Column grow pad={6} gap={6} testID="page-draft-view">
+  const versionBefore = () => currentHead() ? `Current version ${currentHead()!.head_version}`
+    : draft()?.base_version ? `Published version ${draft()?.base_version}` : "Empty page";
+  const footer = (review: Draft) => <If when={discard()} else={
+    <Column gap={1}>
+      <If when={confirmOutside()}><Label variant="caption">These changes also affect blocks outside your selection.</Label></If>
+      <ActionBar justify="between">
+        <Action compact label="Discard…" testID="page-discard" variant="destructive" disabled={busy() || confirmOutside()} onPress={() => discard.set(true)} />
+        <If when={confirmOutside()} else={
+          <Action testID="page-apply" label={review.page_id ? "Apply changes" : "Publish page"} variant="primary"
+            disabled={applyAccess() !== "allowed" || stale() || review.status !== "ready"} busy={busy()} onPress={() => void apply()} />
+        }>
+          <ActionBar><Action label="Cancel" variant="ghost" onPress={() => confirmOutside.set(false)} />
+            <Action testID="page-apply-outside" label="Apply all changes" variant="primary" disabled={stale()} onPress={() => void apply(true)} /></ActionBar>
+        </If>
+      </ActionBar>
+    </Column>
+  }>
+    <Column gap={2}>
+      <Label variant="caption">Discard this draft? The published page won’t change.</Label>
+      <ActionBar><Action label="Cancel" variant="ghost" disabled={busy()} onPress={() => discard.set(false)} />
+        <Action testID="page-discard-now" label="Discard draft" variant="danger" busy={busy()} onPress={() => void remove()} /></ActionBar>
+    </Column>
+  </If>;
+  return <PageLayout inset={6} gap={4} testID="page-draft-view" footer={readable() && draft() ? footer(draft()!) : undefined}>
     <Column gap={2}>
       <Row gap={2} wrap>
         <Action compact testID="page-draft-back" label={route.returnRoom ? "‹ Back to room" : route.returnPage ? "‹ Back to page" : "‹ Back to pages"}
           variant="ghost" disabled={busy()} onPress={back} />
         <If when={route.returnRoom || route.returnPage}><Action compact variant="ghost" label="All pages" onPress={() => goPages()} /></If>
       </Row>
-      <PageHeader title={title()} subtitle="Review the draft before it changes a page." focusTitle testID="page-draft-heading">
-        <Badge label={scopeName(route.spaceId)} tone="system" />
-      </PageHeader>
+      <PageHeader title={title()} eyebrow="Draft · not published" subtitle={readable() && draft()
+        ? `After publishing: ${scopeAudience(route.spaceId)}` : undefined} focusTitle testID="page-draft-heading" />
     </Column>
     <PagesError message={error()} />
     <If when={loading()}><Label color="muted">Loading draft…</Label></If>
@@ -258,22 +283,43 @@ export function DraftView(props: { route: DraftRoute }) {
             viewRef={node => { retryControl = node; }} onPress={() => { if (retry()) closeRetry(); else retry.set(true); }} /> : undefined} />
       </If>
       <If when={review().status !== "generating"}>
+        <Row gap={2} align="center" wrap>
+          <If when={changeSummary()}><Label variant="strong" testID="page-draft-summary">{changeSummary()}</Label></If>
+          <Label variant="meta">{tab() === "changes" && currentHead() ? `Comparing draft with current version ${currentHead()!.head_version}`
+            : review().base_version ? `Based on version ${review().base_version}` : "New page"}</Label>
+        </Row>
+        <If when={outside().length}>
+          <Banner tone="warning" variant="inline" title="Changes outside the selected block"
+            message={`${outside().length} ${outside().length === 1 ? "block is" : "blocks are"} affected outside your selection. Review the Changes tab before applying.`} />
+        </If>
         <Row gap={2} wrap align="center">
           <SegmentedControl testID="page-draft-tab" accessibilityLabel="Draft review tab" value={tab()} onChange={tab.set}
             options={[{ value: "preview", label: "Preview" }, { value: "changes", label: "Changes" }, { value: "source", label: "Source" }]} />
-          <Label variant="meta">{review().base_version ? `Based on version ${review().base_version}` : "New page"}</Label>
+          <If when={review().status === "ready"}>
+            <Action compact testID="page-draft-retry" label={retry() ? "Close prompt" : "Edit prompt and retry"} variant="ghost" disabled={busy() || applyAccess() === "denied"}
+              viewRef={node => { retryControl = node; }} onPress={() => { if (retry()) closeRetry(); else retry.set(true); }} />
+          </If>
         </Row>
+        <If when={retry() && applyAccess() === "allowed"}>
+          <Column gap={2}>
+            <Label variant="strong">{review().block_key ? "Retry the edit to the selected block" : "Edit prompt and retry"}</Label>
+            <DraftPrompt spaceId={review().space_id} initial={review().prompt} initialModel={pageDraftModel(review().id)}
+              label="Revise the prompt" busy={busy()} focus onCancel={closeRetry} onSubmit={(prompt, choice) => void regenerate(prompt, choice)} />
+          </Column>
+        </If>
         <If when={tab() === "preview"}>
-          <ScrollArea gap={2}>
+          <Column gap={2}>
             <PagesError message={previewError()} retryLabel="Retry preview" onRetry={() => void preview(review())} />
             <If when={review().spec} else={<Label color="muted">No preview is available. Review the diagnostics or edit the prompt and retry.</Label>}>
-              {spec => <PageRenderer spec={spec()} data={data()} pending={previewing()} changed={changed()} readOnly />}
+              {spec => <PageRenderer spec={spec()} data={data()} pending={previewing()} highlights={highlights()} readOnly />}
             </If>
             <Diagnostics items={diagnostics()} />
-          </ScrollArea>
+          </Column>
         </If>
         <If when={tab() === "changes"}>
-          <Label variant="caption" color="muted">{currentHead() ? `Comparing draft with current version ${currentHead()!.head_version}` : changeSummary()}</Label>
+          <If when={outside().length}>
+            <Label variant="meta">Block keys outside your selection: {outside().slice(0, 12).join(", ")}</Label>
+          </If>
           <If when={!currentHead() && review().base_version !== null && review().base_source === null}>
             <Label variant="caption" color="warning">The original version is no longer in history. Its source cannot be compared.</Label>
           </If>
@@ -282,39 +328,11 @@ export function DraftView(props: { route: DraftRoute }) {
             <PagesError message={headError()} onRetry={() => void loadConflictHead()} />
           </Column>}>
             <PageDiff before={currentHead()?.source ?? review().base_source ?? ""} after={review().source ?? ""}
-              accessibilityLabel={`${currentHead() ? `Current version ${currentHead()!.head_version}` : review().base_version ? `Published version ${review().base_version}` : "Empty page"} to draft source`} />
+              beforeLabel={versionBefore()} afterLabel="Draft source" accessibilityLabel={`${versionBefore()} to draft source`} />
           </If>
         </If>
         <If when={tab() === "source"}><PageCode value={review().source ?? ""} readOnly /></If>
-        <If when={outside().length}>
-          <Banner tone="warning" variant="inline" title="Changes outside the selected block"
-            message={outside().slice(0, 12).join(", ")} />
-        </If>
-        <If when={confirmOutside()}>
-          <ActionBar><Action label="Cancel" variant="ghost" onPress={() => confirmOutside.set(false)} />
-            <Action testID="page-apply-outside" label="Apply all changes" variant="primary" disabled={stale()} onPress={() => void apply(true)} /></ActionBar>
-        </If>
-        <If when={retry() && applyAccess() === "allowed"}>
-          <ScrollArea gap={2}>
-            <Label variant="strong">{review().block_key ? `Retry edit to block ${review().block_key}` : "Edit prompt and retry"}</Label>
-            <DraftPrompt spaceId={review().space_id} initial={review().prompt} initialModel={pageDraftModel(review().id)}
-              label="Revise the prompt" busy={busy()} focus onCancel={closeRetry} onSubmit={(prompt, choice) => void regenerate(prompt, choice)} />
-          </ScrollArea>
-        </If>
       </If>
-      <If when={discard()}>
-        <Banner tone="warning" variant="inline" message="Discard this draft? The published page won’t change." />
-        <ActionBar><Action label="Cancel" variant="ghost" onPress={() => discard.set(false)} />
-          <Action testID="page-discard-now" label="Discard draft" variant="danger" busy={busy()} onPress={() => void remove()} /></ActionBar>
-      </If>
-      <ActionBar>
-        <Action label="Discard…" testID="page-discard" variant="destructive" disabled={busy() || discard()} onPress={() => discard.set(true)} />
-        <If when={review().status === "ready"}>
-          <Action testID="page-draft-retry" label={retry() ? "Close prompt" : "Edit prompt and retry"} variant="ghost" disabled={busy() || applyAccess() === "denied"}
-            viewRef={node => { retryControl = node; }} onPress={() => { if (retry()) closeRetry(); else retry.set(true); }} />
-        </If>
-        <Action testID="page-apply" label="Apply" variant="primary" disabled={applyAccess() !== "allowed" || stale() || review().status !== "ready" || confirmOutside() || discard()} busy={busy()} onPress={() => void apply()} />
-      </ActionBar>
     </>}</If>
-  </Column>;
+  </PageLayout>;
 }

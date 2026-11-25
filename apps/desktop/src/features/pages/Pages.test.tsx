@@ -61,6 +61,47 @@ test("Page sheet content and footer share the same responsive gutter", async () 
   expect(app.shows("text:Section gap: 16")).toBe(true);
 });
 
+test("Empty Pages shows what templates do and opens either start mode at a compact viewport", async () => {
+  const f = pagesFixture();
+  f.entries.clear();
+  const app = await start(f, "alice", false, { width: 720, height: 480 });
+  await app.press("id:nav-pages");
+  await app.waitFor("id:pages-empty >> text:Recent library files");
+  expect(app.shows("id:pages-empty >> text:Watch a Space")).toBe(true);
+  await app.press("id:pages-start-template");
+  await app.waitFor("id:page-template");
+  expect(app.shows("id:new-page-form:footer >> id:create-page-template")).toBe(true);
+  await app.press("id:new-page-form:footer >> label:Cancel");
+  await app.press("id:pages-start-prompt");
+  await app.waitFor("id:page-prompt");
+  expect(app.shows("id:new-page-form:footer >> id:page-generate")).toBe(true);
+  expect(app.enabled("id:page-generate")).toBe(false);
+  await app.keyboard.press("escape");
+  await app.waitFor("id:new-page-sheet", { state: "gone" });
+  expect(f.calls("", "POST")).toHaveLength(0);
+  expect(f.calls("/drafts", "POST")).toHaveLength(0);
+});
+
+test("Named page rows open in their scope and unpinned page and draft keep Pages selected", async () => {
+  const f = pagesFixture();
+  f.entries.set(PERSONAL, { ...f.entries.get(PERSONAL)!, pinned: false });
+  const app = await start(f);
+  await app.press("id:nav-pages");
+  await app.waitFor("text:Members of Acme");
+  expect(app.shows("text:Only you")).toBe(true);
+  const active = app.viewStyle("id:nav-pages")?.backgroundColor;
+  expect(active).toBeTruthy();
+  await app.press("id:open-page:pg_personal >> text:Alice’s dashboard");
+  await app.waitFor("id:page-renderer");
+  expect(app.viewStyle("id:nav-pages")?.backgroundColor).toBe(active);
+  await app.press("id:page-edit");
+  await app.type("id:page-prompt", "Change this page");
+  await app.press("id:page-generate");
+  await app.waitFor("id:page-draft-summary");
+  expect(app.viewStyle("id:nav-pages")?.backgroundColor).toBe(active);
+  expect(app.shows("id:page-draft-view:footer >> text:Apply changes")).toBe(true);
+});
+
 test("Pages navigation, scoped list, pins and Space template creation", async () => {
   const f = pagesFixture();
   const app = await start(f);
@@ -691,12 +732,17 @@ test("Prompt creation polls a private draft, previews disabled actions and appli
   await app.waitFor("id:page-draft-generating");
   expect(text(app)).toContain("Pages → Drafts");
   await app.waitFor("text:Proposed dashboard");
+  expect(app.shows("text:Draft · not published")).toBe(true);
+  expect(text(app)).toContain("1 added · 1 changed · 1 removed");
+  expect(app.shows("id:page-draft-view:footer >> text:Publish page")).toBe(true);
   await app.waitFor("id:page-action:ask");
   await expect(app.press("id:page-action:ask")).rejects.toMatchObject({ code: "ERR_NSH_TEST_DISABLED" });
   expect(f.calls("/drafts", "POST")[0]?.body).toEqual({ scope: "personal", prompt: "Build a release dashboard" });
   expect(f.state.started).toBe(0);
   await app.press("id:page-draft-tab:changes");
   await app.waitFor("id:page-source-diff");
+  expect(app.shows("text:Before: Empty page")).toBe(true);
+  expect(app.shows("text:After: Draft source")).toBe(true);
   await app.press("id:page-draft-tab:source");
   await app.waitFor("id:page-code");
   await app.press("id:page-apply");
@@ -714,7 +760,10 @@ test("Selected-block edit requires review of outside changes; stale conflict re-
   await app.press("id:page-select-block");
   await app.press("id:page-edit-block:stat");
   await app.waitFor("text:Editing stat: Active runs");
-  await app.type("id:page-prompt", "Retitle the metric");
+  expect(app.shows("label:Describe what to change in stat: Active runs")).toBe(true);
+  await app.keyboard.press("shift+r");
+  expect(app.value("id:page-prompt")).toBe("R");
+  await app.type("id:page-prompt", "etitle the metric");
   await app.press("id:page-generate");
   await app.waitFor("text:Changes outside the selected block");
   expect(f.calls("/drafts", "POST")[0]?.body).toEqual({ page_id: TEAM, block_key: "stat", prompt: "Retitle the metric" });

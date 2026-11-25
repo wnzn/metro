@@ -5,14 +5,14 @@ import { isPageStatus, pageFailure } from "../../api/pages";
 import { goPages, hasSpace, pageGuard, pagesProblem, refreshPages, sameSpaceGrants, scopeVisible, spaceGrants } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
 import { apiClient, me, openChat, openExactRoom, openPlace, sessionGuard } from "../../store";
-import { Action, ActionBar, ActionsMenu, Badge, Banner, Column, compactWidth, Label, Modal, modalOpen, PageHeader, PageLayout, Row } from "../../ui";
-import { httpsLink } from "../../ui/pageBlocks";
+import { Action, ActionBar, ActionsMenu, Banner, Column, compactWidth, Label, Modal, modalOpen, PageHeader, PageLayout, Row } from "../../ui";
+import { httpsLink, PageEditPanel } from "../../ui/pageBlocks";
 import { pageTaskPrefillIssue, prefillPageTask } from "../discovery/scheduleState";
 import { openAsset } from "../library/libraryState";
 import { profileName } from "../profile/profileState";
 import { actionBody, checkedConfirmation } from "./actions";
 import { answerState, linkedAnswerNames, terminalAnswer } from "./answerWatch";
-import { Diagnostics, DraftPrompt, PagesError, scopeName, showDraft } from "./controls";
+import { Diagnostics, DraftPrompt, PagesError, scopeAudience, scopeName, showDraft } from "./controls";
 import { PageRenderer } from "./PageRenderer";
 import { PageHistory, PageSettings, SourceEditor } from "./PageTools";
 import { capabilityOf, cell, MAX_DEPTH, otherApprovalButtons, own, str } from "./renderPlan";
@@ -345,7 +345,7 @@ export function PageView(props: { route: ViewRoute }) {
     editing.set(true);
   }
   const shownPage = () => valid() ? page() : null;
-  return <PageLayout wide inset={6} gap={6} testID="page-view">
+  return <PageLayout inset={6} gap={4} testID="page-view">
     <Column gap={2}>
       <Row gap={2} wrap>
         <Action compact label={unavailableSpace() ? "‹ All pages" : "‹ Pages"} testID="page-back" variant="ghost" onPress={() => {
@@ -358,8 +358,26 @@ export function PageView(props: { route: ViewRoute }) {
       <If when={actionNotice()}>{message => <Label testID="page-action-status">{message()}</Label>}</If>
       <If when={notice()}>{message => <Banner tone="success" variant="inline" message={message()} />}</If>
       <If when={loading() && !page()}><Label color="muted">Loading page…</Label></If>
-      <If when={shownPage()}>{head =>
-        <PageHeader title={[head().icon, head().title].filter(Boolean).join(" ")} subtitle={`Version ${head().head_version} · Edited by ${profileName(head().version.author_id) ?? head().version.author_id}`}>
+    </Column>
+    <If when={shownPage()}>{head => <>
+      <Column gap={2}>
+        <PageHeader title={[head().icon, head().title].filter(Boolean).join(" ")} subtitle={scopeAudience(head().space_id)} />
+        <Label variant="meta">{`Version ${head().head_version} · Edited by ${profileName(head().version.author_id) ?? head().version.author_id} · ${
+          refreshing() ? "Refreshing data…" : data() ? `Data updated ${cell(data()?.resolved_at, "relative").label.toLowerCase()}` : "Data not loaded"}`}</Label>
+        <Row gap={2} align="center" wrap>
+          <If when={head().can_edit || editing()}>
+            <Action compact label={editing() ? "Close edit prompt" : "Edit with prompt"} testID="page-edit" disabled={busy()}
+              viewRef={node => { editControl = node; }} onPress={() => {
+                if (!editing()) openPrompt();
+                else closePrompt();
+              }} />
+          </If>
+          <If when={head().can_edit}>
+            <Action compact label={select() ? "Stop selecting" : "Select a block"} testID="page-select-block" variant="ghost" onPress={() => {
+              select.set(!select()); if (select()) openPrompt();
+            }} />
+          </If>
+          <Action compact label="Refresh data" testID="page-refresh" variant="ghost" disabled={refreshing() || busy()} onPress={() => void refresh(true)} />
           <ActionsMenu testID="page-menu" label="Page options" disabled={busy()} items={[
             { id: "page-pin", label: head().pinned ? "Unpin" : "Pin", onPress: () => {
               const current = head();
@@ -375,27 +393,28 @@ export function PageView(props: { route: ViewRoute }) {
             ...(head().can_edit || head().can_manage ? [{ id: "page-settings", label: "Page settings", onPress: () => sheet.set("settings") }] : []),
             ...(head().can_delete ? [{ id: "page-delete", label: "Delete…", destructive: true, onPress: () => sheet.set("delete") }] : []),
           ]} />
-        </PageHeader>
-      }</If>
-    </Column>
-    <If when={shownPage()}>{head => <>
-      <Row gap={2} align="center" wrap>
-        <Badge tone="system" label={scopeName(head().space_id)} />
-        <Label variant="meta">{refreshing() ? "Refreshing…" : data() ? `Updated ${cell(data()?.resolved_at, "relative").label.toLowerCase()}` : "Data not loaded"}</Label>
-        <Action compact label="Refresh data" testID="page-refresh" disabled={refreshing() || busy()} onPress={() => void refresh(true)} />
-        <If when={head().can_edit || editing()}>
-          <Action compact label={editing() ? "Close edit prompt" : "Edit with prompt"} testID="page-edit" disabled={busy()}
-            viewRef={node => { editControl = node; }} onPress={() => {
-            if (!editing()) openPrompt();
-            else closePrompt();
-          }} />
-        </If>
-        <If when={head().can_edit}>
-          <Action compact label={select() ? "Stop selecting" : "Select a block"} testID="page-select-block" variant="ghost" onPress={() => {
-            select.set(!select()); if (select()) openPrompt();
-          }} />
-        </If>
-      </Row>
+        </Row>
+      </Column>
+      <If when={editing()}>
+        <PageEditPanel testID="page-edit-prompt">
+          <Row gap={2} align="center" wrap>
+            <Label heading variant="strong">{block() ? `Editing ${blockName()}` : "Edit page with a prompt"}</Label>
+            <If when={block() && !reselect()}><Action compact label="Edit whole page" variant="ghost" onPress={() => {
+              editTicket++; block.set(undefined); promptField?.focus();
+            }} /></If>
+          </Row>
+          <If when={select() && !block()}><Label variant="meta">Choose an Edit block… button below to target part of the page.</Label></If>
+          <If when={editVersion() !== head().head_version}>
+            <Banner tone="warning" variant="inline" title="New version published" message={reselect()
+              ? "Your prompt is still here. The selected block is gone. Select a block to continue."
+              : `Your prompt is still here. The next draft will use version ${head().head_version}.`} />
+          </If>
+          <If when={!head().can_edit}><Label color="warning">You can no longer edit this page. You can still copy your prompt.</Label></If>
+          <DraftPrompt spaceId={head().space_id} label={block() ? `Describe what to change in ${blockName()}` : "Describe what to change"} busy={busy()} blocked={reselect() || !head().can_edit}
+            compact focus inputRef={node => { promptField = node; }} onCancel={closePrompt} prepareSubmit={prepareGenerate} />
+          <Diagnostics items={diagnostics()} />
+        </PageEditPanel>
+      </If>
       <PageRenderer spec={head().spec} data={data()?.version === head().head_version ? data() : null} pending={refreshing()} busy={busy()} onAction={(key, kind) => void run(key, kind)}
         waitingForAgent={!!waiting()}
         onLink={url => { if (live()) external.set(httpsLink(url)); }} onFile={id => void file(id)}
@@ -405,27 +424,11 @@ export function PageView(props: { route: ViewRoute }) {
         }}
         onSchedule={key => void prepareSchedule(key)}
         onEdit={head().can_edit && select() ? (key, label) => {
-          editTicket++; block.set(key); blockName.set(label); reselect.set(false); openPrompt(); promptField?.focus();
+          if (busy()) return;
+          editTicket++; block.set(key); blockName.set(label); reselect.set(false); openPrompt();
+          promptField?.reveal({ vertical: "center", animated: false });
+          promptField?.focus();
         } : undefined} />
-      <If when={editing()}>
-        <Column gap={2} testID="page-edit-prompt">
-          <Row gap={2} align="center" wrap>
-            <Label heading variant="strong">{block() ? `Editing ${blockName()}` : "Edit page with a prompt"}</Label>
-            <If when={block() && !reselect()}><Action compact label="Edit whole page" variant="ghost" onPress={() => {
-              editTicket++; block.set(undefined); promptField?.focus();
-            }} /></If>
-          </Row>
-          <If when={editVersion() !== head().head_version}>
-            <Banner tone="warning" variant="inline" title="New version published" message={reselect()
-              ? "Your prompt is still here. The selected block is gone. Select a block to continue."
-              : `Your prompt is still here. The next draft will use version ${head().head_version}.`} />
-          </If>
-          <If when={!head().can_edit}><Label color="warning">You can no longer edit this page. You can still copy your prompt.</Label></If>
-          <DraftPrompt spaceId={head().space_id} label="Describe what to change" busy={busy()} blocked={reselect() || !head().can_edit}
-            focus inputRef={node => { promptField = node; }} onCancel={closePrompt} prepareSubmit={prepareGenerate} />
-          <Diagnostics items={diagnostics()} />
-        </Column>
-      </If>
       <If when={sheet() === "source"}><SourceEditor {...toolProps(head())} /></If>
       <If when={sheet() === "history"}><PageHistory {...toolProps(head())} /></If>
       <If when={sheet() === "settings"}><PageSettings {...toolProps(head())} /></If>

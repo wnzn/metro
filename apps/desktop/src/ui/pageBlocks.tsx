@@ -2,17 +2,22 @@ import { Action, Badge, Column, Label, Row } from "./primitives";
 import { DiffView, Editor, Progress, TextView } from "nsh/base";
 import type { EditorDiagnostic, TextViewDocument } from "nsh/base";
 import { Bar, Line, Plot, PlotAxis } from "nsh/base/plot";
-import { effect, keymap, Scroll, signal, View } from "nsh";
+import { effect, keymap, Scroll, signal, Text, View } from "nsh";
 import type { JSX, ScrollRef } from "nsh";
-import { cx, toneSolidClass } from "./tokens";
+import { cx, textClass, toneSolidClass } from "./tokens";
 import type { Tone } from "./tokens";
 import { httpsLink } from "./pageMarkdown";
 export { httpsLink } from "./pageMarkdown";
 
-export function PageBlockFrame(props: { children?: JSX.Element; blockKey?: string; blockLabel?: string; changed?: boolean; onEdit?: () => void }) {
+export function PageEditPanel(props: { testID?: string; children?: JSX.Element }) {
+  return <View class="flex-col gap-(--space-2) rounded-(--radius-md) bg-muted p-(--space-3)" testID={props.testID}>{props.children}</View>;
+}
+
+export function PageBlockFrame(props: { children?: JSX.Element; blockKey?: string; blockLabel?: string; highlight?: "Added" | "Changed"; onEdit?: () => void }) {
   return (
-    <View class={cx("group min-w-0 flex-col gap-1", props.changed && "border border-ring rounded-(--radius-sm) p-2")}
+    <View class={cx("group min-w-0 flex-col gap-(--space-1)", props.highlight && "rounded-(--radius-sm) bg-accent/50 p-(--space-2)")}
       testID={props.blockKey ? `page-block:${props.blockKey}` : undefined}>
+      <If when={props.highlight}><Label variant="meta" color="accent">{props.highlight}</Label></If>
       {props.children}
       <If when={props.onEdit}>
         <Row justify="end">
@@ -41,18 +46,21 @@ export function PageProgress(props: { percent: number; tone: Tone; label: string
 
 export function PageChart(props: { points: { label: string; value: number }[]; kind: "line" | "bar"; label: string }) {
   return <Column gap={1}>
-    <Label variant="strong">{props.label}</Label>
-    <Plot class="h-[180px] text-tone-system-foreground" data={props.points} y="value" xScale={{ type: props.kind === "bar" ? "band" : "point" }}
-      accessibilityLabel={props.label} accessibilityValue={{ text: props.points.map(p => `${p.label}: ${p.value}`).join(", ") }}>
-      <PlotAxis placement="left" />
-      <PlotAxis placement="bottom" format={(_, i) => props.points[i]?.label ?? ""} />
-      <If when={props.kind === "bar"} else={<Line />}><Bar /></If>
-    </Plot>
+    <Label heading variant="heading">{props.label}</Label>
+    <View class="pl-(--space-8) pb-(--space-6)">
+      <Plot class="h-[160px] text-foreground" data={props.points} y="value"
+        xScale={props.kind === "bar" ? { type: "band", maxBandWidth: 48, paddingInner: 0.24, paddingOuter: 0.12 } : { type: "point" }}
+        accessibilityLabel={props.label} accessibilityValue={{ text: props.points.map(p => `${p.label}: ${p.value}`).join(", ") }}>
+        <PlotAxis placement="left" ticks={4} labelClass={cx(textClass.xs, "text-muted-foreground tabular-nums")} lineClass="w-px bg-border" />
+        <PlotAxis placement="bottom" ticks={6} format={i => props.points[i]?.label ?? ""} labelClass={cx(textClass.xs, "text-muted-foreground")} lineClass="h-px bg-border" />
+        <If when={props.kind === "bar"} else={<Line class="stroke-ring" />}><Bar class="fill-ring" /></If>
+      </Plot>
+    </View>
   </Column>;
 }
 
 type TableCell = { label: string; tone?: Tone };
-export function PageTable(props: { label?: string; headings: string[]; rows: TableCell[][] }) {
+export function PageTable(props: { label?: string; headings: string[]; rows: TableCell[][]; numericColumns?: boolean[] }) {
   const columnWidth = 112;
   const viewportWidth = signal(0);
   const focused = signal(false);
@@ -74,14 +82,20 @@ export function PageTable(props: { label?: string; headings: string[]; rows: Tab
     testID="page-table-scroll" onLayout={e => viewportWidth.set(e.bounds.size.width)}
     ref={node => { scroll = node; }} onFocus={() => focused.set(true)} onBlur={() => focused.set(false)}
     onScroll={e => { offset = e.offset.x; }}>
-    <View role="table" class="flex-col gap-1" style={{ width: width() }} testID="page-table">
-      <View role="row" class="flex-row gap-2 border-b border-border px-2 py-1">
-        <Each of={props.headings}>{title => <View role="columnheader" class="flex-1 min-w-0"><Label variant="strong" lines={2}>{title()}</Label></View>}</Each>
+    <View role="table" class="flex-col" style={{ width: width() }} testID="page-table">
+      <View role="row" class="flex-row items-center gap-(--space-3) border-b border-border px-(--space-2) py-(--space-2)">
+        <Each of={props.headings}>{(title, i) => <View role="columnheader" class="flex-1 min-w-0">
+          <Text class={cx(textClass.sm, "font-semibold text-muted-foreground", props.numericColumns?.[i()] && "text-right")}
+            style={{ numberOfLines: 2 }}>{title()}</Text>
+        </View>}</Each>
       </View>
-      <Each of={props.rows}>{(row, index) =>
-        <View role="row" class={cx("flex-row gap-2 px-2 py-1", index() % 2 === 0 && "bg-muted")}>
-          <Each of={row()}>{value => <View role="cell" class="flex-1 min-w-0">
-            <If when={value().tone} else={<Label lines={3}>{value().label}</Label>}>{t => <Row><Badge tone={t()} label={value().label} /></Row>}</If>
+      <Each of={props.rows}>{row =>
+        <View role="row" class="flex-row items-center gap-(--space-3) border-b border-border px-(--space-2) py-(--space-2)">
+          <Each of={row()}>{(value, i) => <View role="cell" class="flex-1 min-w-0">
+            <If when={value().tone} else={
+              <Text class={cx(textClass.sm, "text-foreground", props.numericColumns?.[i()] && "text-right tabular-nums")}
+                style={{ numberOfLines: 3 }}>{value().label}</Text>
+            }>{t => <Row><Badge tone={t()} label={value().label} /></Row>}</If>
           </View>}</Each>
         </View>
       }</Each>
@@ -102,8 +116,14 @@ export function PageCode(props: { value: string; readOnly?: boolean; onChange?: 
     onChange={props.onChange ? e => props.onChange?.(e.value) : undefined} diagnostics={props.diagnostics} scrollBeyondLastLine={false} />;
 }
 
-export function PageDiff(props: { before: string; after: string; accessibilityLabel?: string }) {
-  return <View class="min-h-[260px] flex-1" role="region" accessibilityLabel={props.accessibilityLabel ?? "Source changes"}>
+export function PageDiff(props: { before: string; after: string; beforeLabel?: string; afterLabel?: string; accessibilityLabel?: string }) {
+  return <View class="min-h-[260px] flex-1 flex-col gap-(--space-2)" role="region" accessibilityLabel={props.accessibilityLabel ?? "Source changes"}>
+    <If when={props.beforeLabel && props.afterLabel}>
+      <Row gap={3} wrap>
+        <Label variant="meta">Before: {props.beforeLabel}</Label>
+        <Label variant="meta">After: {props.afterLabel}</Label>
+      </Row>
+    </If>
     <DiffView class="min-h-[260px] flex-1 rounded-(--radius-sm) border border-border bg-background"
       testID="page-source-diff" language="tsx" layout="unified" oldValue={props.before} newValue={props.after} />
   </View>;
