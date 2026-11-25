@@ -265,6 +265,72 @@ test("deleting a registration reconciles its confirmed Space without guessing em
   await app.waitFor("id:runner-state >> text:No runner");
 });
 
+test("Delete cannot submit while impact is held or failed and can retry with proof", async () => {
+  const f = world();
+  const r = f.addRunner("Remote runner", "personal", "alice");
+  f.addSpace("solo", "Solo", "alice");
+  f.state.attached.set("solo", r.id);
+  const t = fixture(f, null);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await openRunnerSettings(app);
+  const held = { sid: "solo", delay: 800, parked: false };
+  t.gate.runnerRead = held;
+  t.gate.runnerReadError = "solo";
+  const confirm = `id:delete-runner:${r.id}:confirm`;
+  await app.press(`id:delete-runner:${r.id}`);
+  await app.waitUntil(() => held.parked);
+  expect(app.enabled(confirm)).toBe(false);
+  await app.press(confirm).catch(() => {});
+  expect(runnerWrites(f)).toEqual([]);
+
+  await app.clock!.runFor(800);
+  await app.waitFor(`id:delete-runner:${r.id}:retry-impact`);
+  expect(app.enabled(confirm)).toBe(false);
+  expect(words(app)).not.toContain("None of your Spaces use it.");
+  t.gate.runnerReadError = null;
+  await app.press(`id:delete-runner:${r.id}:retry-impact`);
+  await app.waitUntil(() => app.enabled(confirm));
+  await app.waitFor("text:/Spaces you belong to that use it: Solo/");
+  await app.press(confirm);
+  await app.waitUntil(() => !f.state.runners.has(r.id));
+  expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["DELETE", `/v1/runners/${r.id}`]]);
+});
+
+test("a held Delete impact cannot authorize a different registration or a reopened panel", async () => {
+  const f = world();
+  const a = f.addRunner("Runner A", "personal", "alice");
+  const b = f.addRunner("Runner B", "personal", "alice");
+  f.addSpace("solo", "Solo", "alice");
+  f.state.attached.set("solo", a.id);
+  const t = fixture(f, null);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await openRunnerSettings(app);
+  const aHeld = { sid: "solo", delay: 500, parked: false };
+  t.gate.runnerRead = aHeld;
+  await app.press(`id:delete-runner:${a.id}`);
+  await app.waitUntil(() => aHeld.parked);
+  await app.press("id:settings-close");
+  await openRunnerSettings(app);
+  const bHeld = { sid: "solo", delay: 1000, parked: false };
+  t.gate.runnerRead = bHeld;
+  await app.press(`id:delete-runner:${b.id}`);
+  await app.waitUntil(() => bHeld.parked);
+  const confirm = `id:delete-runner:${b.id}:confirm`;
+  await app.clock!.runFor(500);
+  expect(app.shows(`id:delete-runner:${a.id}:panel`)).toBe(false);
+  expect(app.enabled(confirm)).toBe(false);
+  expect(words(app)).not.toContain("Spaces you belong to that use it: Solo");
+  expect(runnerWrites(f)).toEqual([]);
+  await app.clock!.runFor(500);
+  await app.waitUntil(() => app.enabled(confirm));
+  await app.waitFor("text:/None of your Spaces use it/");
+  await app.press(confirm);
+  await app.waitUntil(() => !f.state.runners.has(b.id));
+  expect(f.state.attached.get("solo")).toBe(a.id);
+});
+
 test("sidebar requires submit consent, supports keyboard, and starts each new form checked", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");

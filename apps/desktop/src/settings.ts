@@ -113,9 +113,13 @@ export const runnersError = signal<string | null>(null);
 export const runnerBusy = signal<string | null>(null);
 export const runnerNotice = signal<string | null>(null);
 /** A rotate or delete waiting for confirmation, with what it affects. */
-export const runnerConfirm = signal<{ action: "rotate" | "delete"; runnerId: string } | null>(null);
+export const runnerConfirm = signal<{ action: "rotate" | "delete"; runnerId: string; scope: string } | null>(null);
 /** Spaces the user can see that a runner serves (for the confirmation). null: still looking. */
-export const runnerImpact = signal<{ runnerId: string; spaces: string[] | null; partial: boolean } | null>(null);
+export const runnerImpact = signal<{ runnerId: string; scope: string; spaces: string[] | null; partial: boolean; failed: boolean } | null>(null);
+let deleteImpactProof: {
+  affected: { sid: string; assignment: SpaceRunner }[];
+  current: () => boolean;
+} | null = null;
 let runnersSeq = 0;
 let impactSeq = 0;
 
@@ -192,14 +196,22 @@ export async function createRunner(nameInput: string, visibility: RunnerVisibili
 }
 
 /** Asks to rotate or delete: shows the confirmation and looks up which visible Spaces it serves. */
-export async function confirmRunnerAction(action: "rotate" | "delete", runnerId: string): Promise<void> {
+export async function confirmRunnerAction(action: "rotate" | "delete", runnerId: string, panelScope: () => string): Promise<void> {
   const c = apiClient();
-  if (!c) return;
+  const canManage = () => runners()?.some((r) => r.id === runnerId && r.canManage) === true;
+  if (!c || !onRunnersPage() || !canManage() || runnerBusy()) return;
   const seq = ++impactSeq;
   const ok = sessionGuard();
+  const scope = panelScope();
+  const intent = { action, runnerId, scope };
+  const opened = () => ok() && seq === impactSeq && runnerConfirm() === intent &&
+    onRunnersPage() && panelScope() === scope && canManage();
+  const membership = () => JSON.stringify(spaces().map((s) => [s.id, s.role]).sort());
+  const membershipAtRead = membership();
+  deleteImpactProof = null;
   batch(() => {
-    runnerConfirm.set({ action, runnerId });
-    runnerImpact.set({ runnerId, spaces: null, partial: false });
+    runnerConfirm.set(intent);
+    runnerImpact.set({ runnerId, scope, spaces: null, partial: false, failed: false });
     runnersError.set(null);
   });
   // Only Spaces this user belongs to can be checked; others may use an organization runner too.
@@ -207,25 +219,39 @@ export async function confirmRunnerAction(action: "rotate" | "delete", runnerId:
     const observation = beginSpaceRunnerObservation(s.id);
     return { space: s, observation, runner: await c.getSpaceRunner(s.id) };
   }));
-  if (!ok() || seq !== impactSeq) return;
+  if (!opened()) return;
+  const complete = () => membership() === membershipAtRead &&
+    checks.every((check) => check.status === "fulfilled" && !check.value.observation.hasNewer());
+  if (action === "delete" && !complete()) {
+    runnerImpact.set({ runnerId, scope, spaces: [], partial: true, failed: true });
+    return;
+  }
   const using: string[] = [];
+  const affected: { sid: string; assignment: SpaceRunner }[] = [];
   let partial = false;
   for (const check of checks) {
     if (check.status === "rejected") partial = true;
     else if (check.value.runner?.kind === "registered" && check.value.runner.id === runnerId) {
       const { space, runner, observation } = check.value;
       using.push(space.name);
-      // Remember exact affected Spaces for a possible deletion, even when
-      // this isn't the installed runner and there was no folder refresh.
-      observation.publish(runner, false);
+      if (observation.publish(runner, false)) affected.push({ sid: space.id, assignment: runner });
     }
   }
   const runner = runners()?.find((r) => r.id === runnerId);
-  runnerImpact.set({ runnerId, spaces: using, partial: partial || runner?.visibility === "organization" });
+  if (action === "delete") deleteImpactProof = { affected, current: () => opened() && complete() };
+  runnerImpact.set({ runnerId, scope, spaces: using, partial: partial || runner?.visibility === "organization", failed: partial });
+}
+
+export function runnerDeleteReady(runnerId: string, scope: string) {
+  const intent = runnerConfirm();
+  const impact = runnerImpact();
+  return intent?.action === "delete" && intent.runnerId === runnerId && intent.scope === scope &&
+    impact?.runnerId === runnerId && impact.scope === scope && deleteImpactProof?.current() === true;
 }
 
 export function cancelRunnerAction() {
   impactSeq++;
+  deleteImpactProof = null;
   batch(() => {
     runnerConfirm.set(null);
     runnerImpact.set(null);
@@ -257,20 +283,18 @@ export async function rotateRunner(runnerId: string): Promise<void> {
   }
 }
 
-export async function deleteRunner(runnerId: string): Promise<void> {
+export async function deleteRunner(runnerId: string, scope: string): Promise<void> {
   const c = apiClient();
-  if (!c || runnerBusy()) return;
+  if (!c || runnerBusy() || !runnerDeleteReady(runnerId, scope) || !deleteImpactProof) return;
   const runner = runners()?.find((r) => r.id === runnerId);
   const ok = sessionGuard();
+  const affected = deleteImpactProof.affected.map(({ sid, assignment }) => ({ sid, assignment, dispatched: beginSpaceRunnerWrite(sid) }));
   batch(() => {
     runnerBusy.set(`delete:${runnerId}`);
     runnersError.set(null);
     runnerNotice.set(null);
   });
   cancelRunnerAction();
-  const affected = Object.entries(spaceRunners()).flatMap(([sid, assignment]) =>
-    assignment?.kind === "registered" && assignment.id === runnerId && spaces().some((s) => s.id === sid)
-      ? [{ sid, assignment, dispatched: beginSpaceRunnerWrite(sid) }] : []);
   try {
     await c.deleteRunner(runnerId);
     if (!ok()) return;
@@ -1019,9 +1043,7 @@ function settingsError(error: unknown, target: { set(v: string | null): void }, 
 // Anything shown once goes away whenever the user moves (place, Space, room, view, section).
 onTransientClear(() => {
   dismissReveal();
-  impactSeq++;
-  runnerConfirm.set(null);
-  runnerImpact.set(null);
+  cancelRunnerAction();
   providerConfirmDelete.set(null);
   deviceConfirmUnpair.set(null);
 });
@@ -1048,7 +1070,7 @@ onLocalPairingChanged((id) => {
 
 onSessionEnd(() => {
   runnersSeq++;
-  impactSeq++;
+  cancelRunnerAction();
   spaceRunnerWrites.clear();
   catalogSeq++;
   connectionsSeq++;
@@ -1059,8 +1081,6 @@ onSessionEnd(() => {
   runnersError.set(null);
   runnerBusy.set(null);
   runnerNotice.set(null);
-  runnerConfirm.set(null);
-  runnerImpact.set(null);
   catalog.set(null);
   catalogError.set(null);
   connections.set(null);

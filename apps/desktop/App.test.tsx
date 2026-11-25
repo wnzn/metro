@@ -548,6 +548,7 @@ test("org admins add organization runners; others see them but can't manage them
 
   await app.press(`id:delete-runner:${org.id}`);
   await app.waitFor("text:/Deleting .* revokes its token/");
+  await app.waitUntil(() => app.enabled(`id:delete-runner:${org.id}:confirm`));
   await app.press(`id:delete-runner:${org.id}:confirm`);
   await app.waitFor("text:/It no longer serves any Space/");
   expect(f.state.runners.has(org.id)).toBe(false);

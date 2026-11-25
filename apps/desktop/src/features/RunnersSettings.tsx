@@ -15,6 +15,7 @@ import {
   rotateRunner,
   runnerBusy,
   runnerConfirm,
+  runnerDeleteReady,
   runnerImpact,
   runnerNotice,
   runners,
@@ -192,13 +193,21 @@ function RunnerRow(props: { runner: RegisteredRunner }) {
 
 function RunnerManagement(props: { runner: RegisteredRunner; installed?: boolean }) {
   const r = () => props.runner;
-  const confirming = () => (runnerConfirm()?.runnerId === r().id ? runnerConfirm()!.action : null);
   const canRotate = () => !props.installed || !installedRunner()?.canReconnect;
   const busy = () => !!runnerBusy() || !!runnerUpdateBusy() || (props.installed && (!!installedBusy() || runnerAttachBusy()));
   // Moving between installed and standalone controls invalidates the old panel.
   const scope = () => JSON.stringify([registrationScope(r()), !!props.installed]);
+  const confirming = () => {
+    const intent = runnerConfirm();
+    return intent?.runnerId === r().id && intent.scope === scope() ? intent.action : null;
+  };
+  const deleteReady = () => runnerDeleteReady(r().id, scope());
+  const retryImpact = () => {
+    const impact = runnerImpact();
+    return confirming() === "delete" && impact?.scope === scope() && impact.spaces !== null && !deleteReady();
+  };
   const changeConfirmation = (action: "rotate" | "delete", open: boolean) => {
-    if (open) void confirmRunnerAction(action, r().id);
+    if (open) void confirmRunnerAction(action, r().id, scope);
     else if (confirming() === action) cancelRunnerAction();
   };
   effect(() => {
@@ -207,8 +216,9 @@ function RunnerManagement(props: { runner: RegisteredRunner; installed?: boolean
   cleanup(() => { if (confirming()) cancelRunnerAction(); });
   const remove = async () => {
     const id = r().id;
+    if (!deleteReady()) return;
     const valid = sessionGuard();
-    await deleteRunner(id);
+    await deleteRunner(id, scope());
     if (valid() && props.installed && !runners()?.some((runner) => runner.id === id)) {
       refreshAfterInstalledRunnerDeletion(id);
     }
@@ -217,16 +227,21 @@ function RunnerManagement(props: { runner: RegisteredRunner; installed?: boolean
     <Column gap={2}>
       <If when={canRotate()}>
         <ConfirmInline testID={`rotate-runner:${r().id}`} triggerLabel="Rotate token…" confirmLabel="Rotate token"
-          message={impactText("rotate", r(), props.installed)} scopeKey={scope()}
+          message={impactText("rotate", r(), scope(), props.installed)} scopeKey={scope()}
           open={confirming() === "rotate"} onOpenChange={(open) => changeConfirmation("rotate", open)}
           busyLabel="Rotating…" busy={runnerBusy() === `rotate:${r().id}`} disabled={busy()}
           onConfirm={() => void rotateRunner(r().id)} />
       </If>
       <ConfirmInline testID={`delete-runner:${r().id}`} triggerLabel="Delete…" confirmLabel="Delete runner"
-        message={impactText("delete", r())} scopeKey={scope()}
+        message={impactText("delete", r(), scope())} scopeKey={scope()}
         open={confirming() === "delete"} onOpenChange={(open) => changeConfirmation("delete", open)}
-        busyLabel="Deleting…" busy={runnerBusy() === `delete:${r().id}`} disabled={busy()}
+        busyLabel="Deleting…" busy={runnerBusy() === `delete:${r().id}`}
+        disabled={busy() || (confirming() === "delete" && !deleteReady())}
         onConfirm={() => void remove()} />
+      <If when={retryImpact()}>
+        <Action testID={`delete-runner:${r().id}:retry-impact`} label="Retry impact check" variant="ghost"
+          disabled={busy()} onPress={() => { if (retryImpact()) void confirmRunnerAction("delete", r().id, scope); }} />
+      </If>
     </Column>
   );
 }
@@ -375,11 +390,14 @@ function updateFailure(code: string | null): string {
   }
 }
 
-function impactText(action: "rotate" | "delete", r: RegisteredRunner, installed = false): string {
+function impactText(action: "rotate" | "delete", r: RegisteredRunner, scope: string, installed = false): string {
   const impact = runnerImpact();
-  const known = impact?.runnerId === r.id ? impact : null;
+  const known = impact?.runnerId === r.id && impact.scope === scope ? impact : null;
   let where: string;
   if (!known || known.spaces === null) where = "Checking which of your Spaces use it…";
+  else if (known.failed || (action === "delete" && !runnerDeleteReady(r.id, scope))) where = action === "delete"
+    ? "Metro couldn’t verify which of your Spaces use it. Retry the check before deleting."
+    : "Metro couldn’t verify which of your Spaces use it.";
   else if (known.spaces.length === 0) where = known.partial ? "None of the Spaces you belong to use it, but other Spaces in the organization may." : "None of your Spaces use it.";
   else where = `Spaces you belong to that use it: ${known.spaces.join(", ")}.${known.partial ? " Other Spaces in the organization may use it too." : ""}`;
   return action === "rotate"
