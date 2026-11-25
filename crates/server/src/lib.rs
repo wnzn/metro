@@ -22,6 +22,7 @@ pub mod library;
 pub mod library_search;
 pub mod mentions;
 pub mod messages;
+pub mod meta;
 pub mod model_routing;
 pub mod monitoring;
 pub mod orchestration;
@@ -30,6 +31,7 @@ pub mod profiles;
 pub mod providers;
 pub mod quick_search;
 pub mod replies;
+pub mod run_retry;
 pub mod runner_pairing;
 pub mod runners;
 pub mod schedules;
@@ -89,6 +91,11 @@ pub struct AppState {
     pub updates: crate::updates::Updates,
     /// Page builder model turns at once, apart from agent runs.
     pub page_builds: Arc<Semaphore>,
+    /// Running personal Chat turns, so their owner can stop them.
+    pub chat_runs: Arc<crate::meta::ChatTurns>,
+    /// Chat turns waiting on a delegated Space run at once (half the agent
+    /// slots), so waiting turns can't starve the runs they wait for.
+    pub meta_waits: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -132,6 +139,8 @@ impl AppState {
             avatar_encodes: Arc::new(Semaphore::new(crate::profiles::MAX_AVATAR_ENCODES)),
             directory_limit: directory::RateLimit::default(),
             page_builds: Arc::new(Semaphore::new(crate::pages::generate::MAX_PAGE_BUILDS)),
+            chat_runs: Arc::default(),
+            meta_waits: Arc::new(Semaphore::new((limits.max_agent_runs / 2).max(1))),
             managed,
             library,
             providers,
@@ -266,6 +275,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs", get(api::list_runs))
         .route("/v1/runs/{id}", get(api::get_run))
         .route("/v1/runs/{id}/stop", post(api::stop_run))
+        .route("/v1/runs/{id}/retry", post(run_retry::retry_run))
         .route(
             "/v1/runners",
             get(runners::list_runners).post(runners::create_runner),
@@ -332,6 +342,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::updates::router())
         // Pages; routes that carry page source set their own limit.
         .merge(crate::pages::router())
+        // Metro in Chat: Spaces access and stopping a Chat turn.
+        .merge(crate::meta::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;

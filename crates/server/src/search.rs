@@ -322,6 +322,26 @@ fn permits() -> Arc<Semaphore> {
         .clone()
 }
 
+/// Semantic search of `sources` as `who`, for Metro in Chat
+/// ([`crate::meta`]): the same engine, permits, bounds and access checks
+/// as `POST /v1/search`.
+pub(crate) async fn search_as(
+    state: &AppState,
+    who: &Human,
+    query: &str,
+    sources: &[Source],
+    limit: usize,
+) -> Result<SearchResponse, SearchError> {
+    let _permit = permits()
+        .try_acquire_owned()
+        .map_err(|_| SearchError::Busy)?;
+    let routing = upstream::routing(state, who).await?;
+    let models = upstream::ProviderModels::new(state, who);
+    Engine::new(&state.db, &who.id, &models, routing)
+        .search(query, sources, 0, limit)
+        .await
+}
+
 async fn search(
     State(state): State<AppState>,
     who: Human,

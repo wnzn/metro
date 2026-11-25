@@ -7,7 +7,8 @@
 //! be used fails the run; it never falls back. Thread runs a run delegates
 //! use the same person and the same connection. Space rooms get their Space runner's tools when one is paired,
 //! and top-level rooms get thread tools to delegate to child rooms.
-//! Personal Chat gets only the reaction tool.
+//! Personal Chat gets the reaction tool, Metro's Space tools when the person
+//! allows them ([`crate::meta`]) and web tools when they turned those on.
 //!
 //! Every Space run is registered in the [`RunRegistry`], so it can be listed
 //! and stopped. Stopping drops the model loop and any pending tool job
@@ -128,15 +129,11 @@ example acknowledging a thank-you; never react to every message, and never use â
 unless you have evidence it is. When a reaction alone fully answers the message, react and then reply with \
 exactly METRO_REACTION_ONLY and nothing else; otherwise give a normal answer.";
 
+/// A personal page's own conversation. Personal Chat uses
+/// [`crate::meta::chat_preamble`].
 const PERSONAL_PREAMBLE: &str = "You are the Metro agent in the user's private personal Chat. Only this user \
 sees this conversation. You have no tools and no access to the user's Spaces from here. Answer concisely in \
 plain text.";
-
-/// [`PERSONAL_PREAMBLE`] for a person who turned on web tools in their own
-/// Chat.
-const PERSONAL_WEB_PREAMBLE: &str = "You are the Metro agent in the user's private personal Chat. Only this \
-user sees this conversation. You have no access to the user's Spaces from here; the user turned on web search \
-for this Chat, so you may search the web and read web pages for them. Answer concisely in plain text.";
 
 /// The operator's model on `http`, which must follow no redirect: a
 /// redirect would resend the conversation to another URL.
@@ -919,12 +916,13 @@ pub async fn start_room_run(
         Agent,
         Registry(String),
     }
-    let (sid, rid, aid, task, runs) = (
+    let (sid, rid, aid, task, runs, trigger_id) = (
         space_id.to_owned(),
         room.id.clone(),
         agent.id.clone(),
         truncate(&trigger.text, 200),
         state.runs.clone(),
+        trigger.id,
     );
     // Read the selected agent's current configuration while registering the
     // run. Routing/model selection may have awaited since it was selected.
@@ -941,7 +939,11 @@ pub async fn start_room_run(
             };
             // The stable user id authorizes stops. Create the guard here
             // too in case the caller goes away before receiving the result.
-            let (info, cancel) = match runs.start(&sid, &rid, &user_id, &task) {
+            let origin = crate::orchestration::RunOrigin {
+                agent_id: Some(agent.id.clone()),
+                trigger_event_id: Some(trigger_id),
+            };
+            let (info, cancel) = match runs.start_for(&sid, &rid, &user_id, &task, origin) {
                 Ok(started) => started,
                 Err(error) => return Ok(Err(AcceptanceError::Registry(error))),
             };
@@ -1894,6 +1896,14 @@ async fn execute_personal_run(
 ) {
     let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
+    // A Chat turn can be stopped by its owner (`POST /v1/chat/turns/{id}/stop`).
+    let (cancel, _registered) = match lane {
+        PersonalLane::Chat => {
+            let (cancel, guard) = state.chat_runs.register(&turn.id, &user_id);
+            (Some(cancel), Some(guard))
+        }
+        PersonalLane::Page { .. } => (None, None),
+    };
     let agent_author = Author::server(actor::AGENT);
     let append_as = |kind: &'static str, text: String, activity: Option<Activity>| {
         let (state, user_id, author, lane) = (
@@ -1949,29 +1959,39 @@ async fn execute_personal_run(
             return;
         }
     };
-    // Web tools only for a person who turned them on for their own Chat,
-    // always on their own computer.
-    let web = lane == PersonalLane::Chat && {
+    // In Chat only: web tools for a person who turned them on, always on
+    // their own computer; Space tools while "Use my Spaces in Chat" is on
+    // and its notice was shown (each call checks again).
+    let (web, spaces) = if lane == PersonalLane::Chat {
         let user = user_id.clone();
         state
             .db
             .call(move |db| {
-                Ok(crate::web_devices::personal_chat_enabled(
-                    &db.lock(),
-                    &user,
-                )?)
+                let conn = db.lock();
+                Ok((
+                    crate::web_devices::personal_chat_enabled(&conn, &user)?,
+                    crate::meta::active(&conn, &user)?,
+                ))
             })
             .await
             .unwrap_or_else(|e| {
-                tracing::error!(error = %format!("{e:#}"), "reading web search prefs");
-                false
+                tracing::error!(error = %format!("{e:#}"), "reading Chat tool prefs");
+                (false, false)
             })
-    };
-    let mut builder = model.builder().preamble(PREAMBLE).append_preamble(if web {
-        PERSONAL_WEB_PREAMBLE
     } else {
-        PERSONAL_PREAMBLE
-    });
+        (false, false)
+    };
+    let mut builder = model
+        .builder()
+        .preamble(PREAMBLE)
+        .append_preamble(&match lane {
+            PersonalLane::Chat => crate::meta::chat_preamble(spaces, web),
+            PersonalLane::Page { .. } => PERSONAL_PREAMBLE.to_owned(),
+        });
+    if spaces {
+        let ctx = crate::meta::Ctx::new(&state, &user_id, &turn, &trigger, &earlier);
+        builder = builder.dynamic_tools(crate::meta::tools(&ctx));
+    }
     if lane == PersonalLane::Chat && trigger.text.is_empty() && !trigger.attachments.is_empty() {
         builder = builder.append_preamble(
             "The latest message contains only attachments. You cannot access those files. \
@@ -2033,7 +2053,7 @@ async fn execute_personal_run(
         builder.build(),
         prompt,
         history(&earlier, &key),
-        None,
+        cancel,
         route.note.connection_id.as_deref(),
         false,
     )

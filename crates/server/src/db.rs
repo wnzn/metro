@@ -278,6 +278,15 @@ pub struct Activity {
     /// ([`crate::web_tools`]). Never a query result or page text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<crate::web_tools::ToolNote>,
+    /// Only on a Metro-in-Chat tool's `tool_call` / `tool_result` / `error`
+    /// events in personal Chat ([`crate::meta`]): which tool, the Space
+    /// names it touched and a count. Never content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub meta: Option<crate::meta::MetaNote>,
+    /// Only on a personal Chat `space_post` event: where Metro posted the
+    /// person's message ([`crate::meta`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space_post: Option<crate::meta::SpacePost>,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -318,6 +327,8 @@ impl Activity {
             pick: None,
             page_draft: None,
             tool: None,
+            meta: None,
+            space_post: None,
         }
     }
 
@@ -347,6 +358,8 @@ impl Activity {
             pick: None,
             page_draft: None,
             tool: None,
+            meta: None,
+            space_post: None,
         }
     }
 
@@ -359,6 +372,8 @@ impl Activity {
             route: None,
             pick: None,
             tool: None,
+            meta: None,
+            space_post: None,
             ..self.clone()
         }
     }
@@ -370,6 +385,21 @@ impl Activity {
             route: None,
             pick: None,
             tool: Some(tool),
+            meta: None,
+            space_post: None,
+            ..self.clone()
+        }
+    }
+
+    /// This activity with a Metro-in-Chat tool's note.
+    pub fn with_meta(&self, note: crate::meta::MetaNote) -> Self {
+        Self {
+            phase: None,
+            route: None,
+            pick: None,
+            tool: None,
+            meta: Some(note),
+            space_post: None,
             ..self.clone()
         }
     }
@@ -446,6 +476,10 @@ pub mod kind {
     /// run, as the provider returned it (bounded). Tagged with the run's
     /// activity; never a message, never model history, never indexed.
     pub const REASONING_SUMMARY: &str = "reasoning_summary";
+    /// Personal Chat only: Metro posted the person's message into a Space
+    /// (`activity.space_post`). The text is exactly what was sent. Never
+    /// model history, never indexed, never in any Space.
+    pub const SPACE_POST: &str = "space_post";
 }
 
 /// Actors the server writes for non-human events.
@@ -630,6 +664,8 @@ impl Db {
         // After spaces, members and model routing settings exist.
         crate::space_agents::init(&conn)?;
         crate::space_prefs::init(&conn)?;
+        // After spaces (exclusions reference them).
+        crate::meta::prefs::init(&conn)?;
         // After spaces (Space pages reference them).
         crate::pages::init(&conn)?;
         let version: Option<String> = conn
@@ -755,7 +791,11 @@ impl Db {
 
     /// The Spaces `user_id` belongs to.
     pub fn list_spaces(&self, user_id: &str) -> anyhow::Result<Vec<SpaceView>> {
-        let conn = self.lock();
+        Ok(Self::spaces_in(&self.lock(), user_id)?)
+    }
+
+    /// [`Db::list_spaces`] on the caller's connection or transaction.
+    pub(crate) fn spaces_in(conn: &Connection, user_id: &str) -> rusqlite::Result<Vec<SpaceView>> {
         let mut stmt = conn.prepare_cached(
             "SELECT s.id, s.name, m.role,
                     (s.runner_token_hash IS NOT NULL
@@ -765,25 +805,32 @@ impl Db {
              WHERE m.user_id = ?1 ORDER BY s.created_at, s.rowid",
         )?;
         let rows = stmt.query_map([user_id], row_space)?;
-        Ok(rows.collect::<Result<_, _>>()?)
+        rows.collect()
     }
 
     /// `space_id` as `user_id` sees it, or `None` when they are not a member
     /// (or it does not exist; the two are deliberately indistinguishable).
     pub fn membership(&self, space_id: &str, user_id: &str) -> anyhow::Result<Option<SpaceView>> {
-        let conn = self.lock();
-        Ok(conn
-            .query_row(
-                "SELECT s.id, s.name, m.role,
+        Ok(Self::membership_in(&self.lock(), space_id, user_id)?)
+    }
+
+    /// [`Db::membership`] on the caller's connection or transaction.
+    pub(crate) fn membership_in(
+        conn: &Connection,
+        space_id: &str,
+        user_id: &str,
+    ) -> rusqlite::Result<Option<SpaceView>> {
+        conn.query_row(
+            "SELECT s.id, s.name, m.role,
                     (s.runner_token_hash IS NOT NULL
                      OR EXISTS (SELECT 1 FROM space_runners a WHERE a.space_id = s.id))
                  , s.description
                  FROM space_members m JOIN spaces s ON s.id = m.space_id
                  WHERE m.space_id = ?1 AND m.user_id = ?2",
-                params![space_id, user_id],
-                row_space,
-            )
-            .optional()?)
+            params![space_id, user_id],
+            row_space,
+        )
+        .optional()
     }
 
     pub fn list_members(&self, space_id: &str) -> anyhow::Result<Vec<Member>> {
@@ -859,6 +906,8 @@ impl Db {
                 crate::library_search::hooks::member_removed(&tx, space_id, user_id)?;
                 // Their per-Space preferences go with their membership.
                 crate::space_prefs::member_removed(&tx, space_id, user_id)?;
+                // Their Metro-in-Chat exclusion of it too.
+                crate::meta::prefs::member_removed(&tx, space_id, user_id)?;
                 // Their page preferences, confirmations and drafts there too.
                 crate::pages::hooks::member_removed(&tx, space_id, user_id)?;
                 RemoveMember::Removed

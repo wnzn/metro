@@ -168,6 +168,7 @@ impl Db {
             [sid],
         )?;
         tx.execute("DELETE FROM space_member_prefs WHERE space_id = ?1", [sid])?;
+        crate::meta::prefs::space_deleted(&tx, sid)?;
         crate::pages::hooks::space_deleted(&tx, sid)?;
         tx.execute("DELETE FROM space_agents WHERE space_id = ?1", [sid])?;
         tx.execute("DELETE FROM space_runners WHERE space_id = ?1", [sid])?;
