@@ -160,7 +160,9 @@ pub async fn plan(
             if let Some(why) = generic_failed {
                 plan.addressing_note = Some(AddressingNote::generic_agent_unavailable(
                     why,
-                    !plan.targets.is_empty(),
+                    resolved
+                        .iter()
+                        .any(|m| matches!(m, Mention::AgentId { .. })),
                 ));
             }
         }

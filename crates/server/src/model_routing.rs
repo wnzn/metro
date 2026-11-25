@@ -917,11 +917,13 @@ pub enum AddressingNote {
 }
 
 impl AddressingNote {
-    /// `@agent` could not be resolved: `others_ran` when agents the message
-    /// named by handle still run.
-    pub fn generic_agent_unavailable(why: DecisionFailure, others_ran: bool) -> Self {
-        let others = if others_ran {
-            " The agents you mentioned by handle still answer."
+    /// `@agent` could not be resolved. `named` when the message also named
+    /// agents by handle: they were asked on their own (whether their runs
+    /// start is reported separately), so the note claims nothing about them.
+    pub fn generic_agent_unavailable(why: DecisionFailure, named: bool) -> Self {
+        let others = if named {
+            " This affects only @agent; the agents you mentioned by handle were asked on their \
+             own."
         } else {
             ""
         };

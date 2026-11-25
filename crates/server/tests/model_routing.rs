@@ -1786,8 +1786,8 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
         let message = note["message"].as_str().unwrap();
         assert!(message.contains("No agent ran for @agent"), "{message}");
         assert!(
-            !message.contains("still answer"),
-            "nothing else ran: {message}"
+            !message.contains("affects only"),
+            "nothing else named: {message}"
         );
         seen_by_bob.push(
             h.answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
@@ -1835,10 +1835,10 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
     let note = &e["addressing_note"];
     assert_eq!(note["kind"], "generic_agent_unavailable", "{note}");
     assert_eq!(note["reason"], "unreachable");
-    assert!(
-        note["message"].as_str().unwrap().contains("still answer"),
-        "{note}"
-    );
+    // True whether or not @coder's run then starts: it claims no outcome.
+    let message = note["message"].as_str().unwrap();
+    assert!(message.contains("This affects only @agent"), "{note}");
+    assert!(!message.contains("answer"), "{note}");
     let started = h
         .started_after("alice", &sid, e["id"].as_i64().unwrap())
         .await;
