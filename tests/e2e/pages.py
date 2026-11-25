@@ -242,11 +242,15 @@ def pages(binary, timeout):
 
         # Space Daily brief follows the room and its selected agent, not a
         # page-button origin. Exercise a real schedule dispatch on loopback.
+        _, room = api.ok(alice, "POST", f"/v1/spaces/{quote(sid)}/rooms", {"name": "Briefing"}, (201,))
         _, brief_page = api.ok(
-            alice, "POST", "/v1/pages", scope | {"template": "daily-brief"}, (201,))
+            alice, "POST", "/v1/pages", scope | {"template": "daily-brief", "room": room["name"]}, (201,))
         target = brief_page["spec"]["data"][0]["params"]
-        require("block" not in target and bool(target.get("room_id")) and bool(target.get("agent_id")),
+        require("block" not in target and target.get("room_id") == room["id"] and bool(target.get("agent_id")),
                 "Space Daily brief isn't bound to a room and an agent")
+        brief_data = f"/v1/pages/{brief_page['id']}/data"
+        _, empty_brief = api.ok(bob, "POST", brief_data, {}, (200,))
+        require(empty_brief["data"]["brief"].get("value") is None, "the Lobby answer leaked into the Briefing block")
         _, task = api.ok(alice, "POST", "/v1/schedules", {
             "name": "Scheduled fixture brief",
             "prompt": SCHEDULE_PROMPT,
@@ -270,12 +274,32 @@ def pages(binary, timeout):
         require(run["run"]["status"] == "dispatched", "scheduled page action did not dispatch")
 
         def scheduled_brief():
-            _, data = api.ok(bob, "POST", f"/v1/pages/{brief_page['id']}/data", {}, (200,))
+            _, data = api.ok(bob, "POST", brief_data, {}, (200,))
             answer = data["data"]["brief"].get("value")
             return answer if answer and answer.get("text") == SCHEDULE_ANSWER else None
 
         answer = poll(deadline, "a scheduled reply on the Space Daily brief", scheduled_brief, watch)
         require(answer.get("room") == target["room"], "Daily brief didn't read its scheduled room")
+
+        # A newer reply in the right room, but from a different agent, doesn't
+        # replace the selected agent's brief.
+        _, helper = api.ok(alice, "POST", f"/v1/spaces/{quote(sid)}/agents", {
+            "name": "Briefing helper", "handle": "briefing-helper", "description": "Loopback fixture",
+        }, (201,))
+        _, helper_page = api.ok(alice, "POST", "/v1/pages", scope | {
+            "source": 'export default <Page title="Helper"><Button key="ask" label="Ask" action="runAgent" '
+                      'room="Briefing" agent="briefing-helper" prompt="Send a different reply"/></Page>',
+        }, (201,))
+        api.ok(alice, "POST", f"/v1/pages/{helper_page['id']}/actions", {"version": 1, "block_key": "ask"}, (202,))
+
+        def helper_replied():
+            path = f"/v1/spaces/{quote(sid)}/rooms/{quote(room['id'])}/events"
+            _, data = api.ok(bob, "GET", path, expect=(200,))
+            return next((e for e in data["events"] if e["kind"] == "agent"
+                         and (e.get("activity") or {}).get("agent", {}).get("id") == helper["id"]), None)
+
+        poll(deadline, "the other agent's newer reply", helper_replied, watch)
+        require(scheduled_brief() is not None, "another agent's newer reply replaced the scheduled brief")
 
         # Personal Daily brief stays private and linked to its own button.
         _, mine = api.ok(alice, "POST", "/v1/pages", {"scope": "personal", "template": "daily-brief"}, (201,))
