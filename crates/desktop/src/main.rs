@@ -133,37 +133,6 @@ fn ui_no_proxy(base: &str) -> String {
     parts.join(",")
 }
 
-#[cfg(test)]
-mod no_proxy_tests {
-    use super::ui_no_proxy;
-    use metro_url_policy::ureq_no_proxy_matches;
-
-    #[test]
-    fn keeps_the_persons_entries_and_sends_loopback_and_tailscale_direct() {
-        let v = ui_no_proxy("corp.example,127.0.0.1,localhost,::1");
-        assert!(
-            v.starts_with("corp.example,127.0.0.1,localhost,::1,"),
-            "{v}"
-        );
-        for direct in [
-            "127.0.0.1",
-            "[::1]",
-            "100.101.102.103",
-            "[fd7a:115c:a1e0::1]",
-            "box.tail1234.ts.net",
-            "box.tail1234.ts.net.",
-            "corp.example",
-        ] {
-            assert!(ureq_no_proxy_matches(&v, direct), "{direct}");
-        }
-        for proxied in ["192.168.1.5", "metro.example.com", "100.128.0.1"] {
-            assert!(!ureq_no_proxy_matches(&v, proxied), "{proxied}");
-        }
-        assert_eq!(v.matches("localhost").count(), 1, "no duplicates");
-        assert_eq!(ui_no_proxy("*"), "*");
-    }
-}
-
 #[cfg(windows)]
 mod job {
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -499,4 +468,35 @@ fn main() -> ExitCode {
     // Don't wait for stuck provider calls; everything was told to stop.
     rt.shutdown_timeout(Duration::from_secs(2));
     ExitCode::from(code)
+}
+
+#[cfg(test)]
+mod no_proxy_tests {
+    use super::ui_no_proxy;
+    use metro_url_policy::ureq_no_proxy_matches;
+
+    #[test]
+    fn keeps_the_persons_entries_and_sends_loopback_and_tailscale_direct() {
+        let v = ui_no_proxy("corp.example,127.0.0.1,localhost,::1");
+        assert!(
+            v.starts_with("corp.example,127.0.0.1,localhost,::1,"),
+            "{v}"
+        );
+        for direct in [
+            "127.0.0.1",
+            "[::1]",
+            "100.101.102.103",
+            "[fd7a:115c:a1e0::1]",
+            "box.tail1234.ts.net",
+            "box.tail1234.ts.net.",
+            "corp.example",
+        ] {
+            assert!(ureq_no_proxy_matches(&v, direct), "{direct}");
+        }
+        for proxied in ["192.168.1.5", "metro.example.com", "100.128.0.1"] {
+            assert!(!ureq_no_proxy_matches(&v, proxied), "{proxied}");
+        }
+        assert_eq!(v.matches("localhost").count(), 1, "no duplicates");
+        assert_eq!(ui_no_proxy("*"), "*");
+    }
 }
