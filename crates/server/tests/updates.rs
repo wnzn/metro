@@ -776,11 +776,34 @@ async fn the_release_floor_survives_restarts_and_never_hides_an_offer() {
     // In the same process, the newer offer stays and the anomaly is reported.
     check(&a, &fixture_github("9.1.0", None)).await;
     assert_eq!(a.updates.latest().unwrap().version.to_string(), "9.2.0");
-    // A malformed floor file is ignored, never trusted.
+    // A malformed floor must not reset the floor and allow an older offer.
     std::fs::write(&floor, "not a version").unwrap();
     let mut c = s.state.clone();
     c.updates = metro_server::updates::Updates::new(true).with_floor_file(floor.clone());
     assert_eq!(c.updates.floor(), None);
+    check(&c, &fixture_github("9.1.0", None)).await;
+    assert!(c.updates.latest().is_none());
+    assert_eq!(std::fs::read_to_string(&floor).unwrap(), "not a version");
+}
+
+#[tokio::test]
+async fn an_incomplete_newer_release_still_establishes_the_floor() {
+    let s = Server::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let floor = dir.path().join("metro.release-floor");
+    let mut state = s.state.clone();
+    state.updates = metro_server::updates::Updates::new(true).with_floor_file(floor.clone());
+    for (version, bad_commit) in [("9.2.0", Some("f".repeat(40))), ("9.1.0", None)] {
+        let base = fixture_github(version, bad_commit.as_deref());
+        let fetcher = AsyncFetcher::new(
+            Source::loopback_fixture(&base).unwrap(),
+            Duration::from_secs(10),
+        )
+        .unwrap();
+        metro_server::updates::check_once(&state, &fetcher, &TestVerifier).await;
+        assert!(state.updates.latest().is_none());
+        assert_eq!(std::fs::read_to_string(&floor).unwrap(), "9.2.0");
+    }
 }
 
 #[tokio::test]

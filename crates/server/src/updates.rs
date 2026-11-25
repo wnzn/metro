@@ -136,6 +136,7 @@ pub struct CheckStatus {
 #[derive(Default)]
 struct Inner {
     floor: Option<Version>,
+    floor_unreadable: bool,
     latest: Option<Latest>,
     status: CheckStatus,
     presence: HashMap<String, Presence>,
@@ -168,16 +169,19 @@ impl Updates {
         }
     }
 
-    /// Persist the version floor in `path` (a malformed file is ignored:
-    /// stored state is untrusted, and the floor only ever rises).
+    /// Persist the version floor in `path`. An unreadable floor blocks
+    /// publication rather than silently starting over at zero.
     pub fn with_floor_file(mut self, path: std::path::PathBuf) -> Updates {
-        let floor = std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|t| Version::parse(t.trim()));
-        if path.exists() && floor.is_none() {
-            tracing::warn!("the stored release floor is malformed; ignored");
+        {
+            let mut inner = self.lock();
+            match read_floor(&path) {
+                Ok(floor) => inner.floor = floor,
+                Err(error) => {
+                    tracing::warn!(%error, "could not read the stored release floor; checks blocked");
+                    inner.floor_unreadable = true;
+                }
+            }
         }
-        self.lock().floor = floor;
         self.floor_file = Some(path);
         self
     }
@@ -191,22 +195,33 @@ impl Updates {
         }
     }
 
-    fn raise_floor(&self, v: Version) {
-        let changed = {
-            let mut inner = self.lock();
-            if inner.floor.is_some_and(|f| f >= v) {
-                false
-            } else {
-                inner.floor = Some(v);
-                true
-            }
+    /// Returns false for a backwards check, without changing any offer.
+    fn raise_floor(&self, v: Version) -> Result<bool, metro_release::Error> {
+        let error = || {
+            metro_release::Error::new(
+                metro_release::ErrorCode::Io,
+                "could not read or persist the release floor",
+            )
         };
-        if changed
-            && let Some(path) = &self.floor_file
-            && let Err(e) = metro_release::write_atomic(path, v.to_string().as_bytes())
-        {
-            tracing::error!(error = %e.kind(), "could not store the release floor");
+        let mut inner = self.lock();
+        if inner.floor_unreadable {
+            return Err(error());
         }
+        if inner
+            .floor
+            .into_iter()
+            .chain(inner.latest.as_ref().map(|l| l.version))
+            .any(|f| f > v)
+        {
+            return Ok(false);
+        }
+        if inner.floor != Some(v) {
+            if let Some(path) = &self.floor_file {
+                metro_release::write_atomic(path, v.to_string().as_bytes()).map_err(|_| error())?;
+            }
+            inner.floor = Some(v);
+        }
+        Ok(true)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -247,6 +262,32 @@ impl Updates {
         }
         inner.pending.get(key).cloned()
     }
+}
+
+fn read_floor(path: &std::path::Path) -> std::io::Result<Option<Version>> {
+    use std::io::{self, Read};
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = match options.open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let invalid = || io::Error::new(io::ErrorKind::InvalidData, "invalid release floor");
+    if !file.metadata()?.is_file() {
+        return Err(invalid());
+    }
+    let mut value = String::new();
+    file.take(65).read_to_string(&mut value)?;
+    if value.len() > 64 {
+        return Err(invalid());
+    }
+    Version::parse(value.trim()).map(Some).ok_or_else(invalid)
 }
 
 /// The presence key of a runner credential (a dedicated runner is its Space).
@@ -636,6 +677,11 @@ pub async fn check_once(state: &AppState, fetcher: &AsyncFetcher, verifier: &dyn
                 ));
             }
         };
+        // The signed manifest establishes the floor, even if an optional
+        // image manifest cannot be fetched. Only a complete check can offer it.
+        if !state.updates.raise_floor(release.version)? {
+            return Ok((release.version, None));
+        }
         let raw = fetcher
             .get(
                 &fetcher.source.asset_url(&release.version, "IMAGES.txt")?,
@@ -650,48 +696,59 @@ pub async fn check_once(state: &AppState, fetcher: &AsyncFetcher, verifier: &dyn
                 "IMAGES.txt names another commit than the signed release",
             ));
         }
-        Ok(Latest {
-            version: release.version,
-            commit: release.commit,
-            signed_at: release.signed_at,
-            images,
-        })
+        Ok((
+            release.version,
+            Some(Latest {
+                version: release.version,
+                commit: release.commit,
+                signed_at: release.signed_at,
+                images,
+            }),
+        ))
     }
     .await;
     let now = now_ms();
     match outcome {
-        Ok(latest) if state.updates.floor().is_some_and(|f| latest.version < f) => {
-            // Never hides the newer verified release; reported separately.
-            tracing::warn!(seen = %latest.version, "an older release was served as latest; ignored");
-            state.updates.lock().status = CheckStatus {
-                checked_at: Some(now),
-                result: "ok",
-                error: None,
-                anomaly: Some("older_release_served"),
+        Ok((version, candidate)) => {
+            let notify = {
+                let mut inner = state.updates.lock();
+                let latest = candidate.filter(|l| {
+                    inner.floor.is_none_or(|f| l.version >= f)
+                        && inner
+                            .latest
+                            .as_ref()
+                            .is_none_or(|old| l.version >= old.version)
+                });
+                let mut anomaly = None;
+                let notify = if let Some(latest) = latest {
+                    let changed = inner.latest.as_ref().map(|l| l.version) != Some(version);
+                    inner.latest = Some(latest);
+                    changed
+                        && Version::parse(env!("CARGO_PKG_VERSION")).is_some_and(|r| version > r)
+                } else {
+                    tracing::warn!(seen = %version, "an older release was served as latest; ignored");
+                    anomaly = Some("older_release_served");
+                    false
+                };
+                inner.status = CheckStatus {
+                    checked_at: Some(now),
+                    result: "ok",
+                    error: None,
+                    anomaly,
+                };
+                notify
             };
-        }
-        Ok(latest) => {
-            let running = Version::parse(env!("CARGO_PKG_VERSION"));
-            let before = state.updates.latest().map(|l| l.version);
-            if running.is_some_and(|r| latest.version > r) && before != Some(latest.version) {
+            if notify {
                 tracing::warn!(
                     "Metro {} is available; this server runs {} ({})",
-                    latest.version,
+                    version,
                     env!("CARGO_PKG_VERSION"),
-                    metro_release::release_url(&latest.version)
+                    metro_release::release_url(&version)
                 );
                 state
                     .monitor(Scope::Instance, Code::ServerUpdateAvailable)
                     .await;
             }
-            state.updates.raise_floor(latest.version);
-            state.updates.set_latest(latest);
-            state.updates.lock().status = CheckStatus {
-                checked_at: Some(now),
-                result: "ok",
-                error: None,
-                anomaly: None,
-            };
         }
         Err(e) => {
             tracing::info!(
