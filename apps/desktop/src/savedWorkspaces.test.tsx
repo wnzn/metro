@@ -602,6 +602,112 @@ async function startMembershipProbe(s: ReturnType<typeof servers>, app: App, del
   await app.waitUntil(() => request.arrived() === 1, { timeout: 100 });
 }
 
+async function launchInEmptyBeta(s: ReturnType<typeof servers>) {
+  s.b.state.rooms.set("beta", []);
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true, probe: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:rooms-empty", { timeout: 150 });
+  return app;
+}
+
+const createdName = "Startup proof";
+function createdSpace(s: ReturnType<typeof servers>) {
+  return [...s.b.state.spaces.values()].find(space => space.name === createdName);
+}
+
+async function submitCreate(s: ReturnType<typeof servers>, app: App) {
+  await app.press("id:new-space-toggle");
+  await app.type("id:new-space-name", createdName);
+  await app.press("id:create-space");
+  await app.waitUntil(() => !!createdSpace(s), { timeout: 120 });
+  return createdSpace(s)!;
+}
+
+function holdCreateResponse(s: ReturnType<typeof servers>) {
+  const post = s.b.network[`POST ${BASE}/v1/*`]!;
+  s.b.network[`POST ${BASE}/v1/*`] = req => new URL(req.url).pathname === "/v1/spaces"
+    ? { ...(post(req) as object), delay: 750 }
+    : post(req);
+}
+
+test("successful Create outvotes a pre-create membership omission even if its first room read fails", async () => {
+  const s = servers();
+  const get = s.b.network[`GET ${BASE}/v1/*`]!;
+  let failRooms = true;
+  s.b.network[`GET ${BASE}/v1/*`] = req => failRooms && new URL(req.url).pathname === `/v1/spaces/${createdSpace(s)?.id}/rooms`
+    ? { status: 503, body: { error: "Try again later" }, delay: 40 }
+    : get(req);
+  const app = await launchInEmptyBeta(s);
+  await startMembershipProbe(s, app, 650);
+  s.b.answerLate("/v1/spaces", TOKENS.bob!, 0); // only hold the captured GET, not the later POST
+  const space = await submitCreate(s, app);
+  const roomsPath = `/v1/spaces/${space.id}/rooms`;
+  await app.waitFor("id:rooms-error", { timeout: 150 });
+  expect(app.texts().join(" ")).toContain(`Couldn't open ${createdName}:`);
+  expect(app.shows(`id:space:${space.id}`)).toBe(true);
+  await app.clock!.runFor(700);
+  expect(app.shows(`id:space:${space.id}`)).toBe(true);
+  expect(app.shows("id:rooms-empty")).toBe(true); // still in the original Beta
+  expect(firstRoomPages(s)).toEqual([]);
+  expect(chatStarted(s)).toBe(false);
+
+  failRooms = false;
+  await app.press(`id:space:${space.id}`);
+  await app.waitUntil(() => firstRoomPages(s).length === 1, { timeout: 160 });
+  expect(firstRoomPages(s)).toEqual([`${roomsPath}/lobby/events?after=0`]);
+  expect(app.requests().filter(r => r.url === REMOTE + roomsPath)).toHaveLength(2);
+});
+
+test("a delayed Create acknowledgement cannot restore a Space already lost to a newer exact denial", async () => {
+  const s = servers();
+  holdCreateResponse(s);
+  const app = await launchInEmptyBeta(s);
+  const space = await submitCreate(s, app);
+  await startMembershipProbe(s, app, 40); // discover the new Space before the POST response
+  await app.waitFor(`id:space:${space.id}`, { timeout: 130 });
+  space.members.delete("bob");
+  await app.press(`id:space:${space.id}`);
+  await app.waitFor(`id:space:${space.id}`, { state: "gone", timeout: 140 });
+  await app.clock!.runFor(800);
+  expect(app.shows(`id:space:${space.id}`)).toBe(false);
+  expect(app.shows("id:rooms-empty")).toBe(true);
+  expect(app.requests().filter(r => r.url === `${REMOTE}/v1/spaces/${space.id}/rooms`)).toHaveLength(1);
+  expect(firstRoomPages(s)).toEqual([]);
+  expect(chatStarted(s)).toBe(false);
+});
+
+test("a delayed Create acknowledgement lists the Space without overriding a move to Library", async () => {
+  const s = servers();
+  holdCreateResponse(s);
+  const app = await launchInEmptyBeta(s);
+  const space = await submitCreate(s, app);
+  await app.press("id:nav-library");
+  await app.waitFor("id:library-view", { timeout: 120 });
+  await app.waitFor(`id:space:${space.id}`, { timeout: 850 });
+  expect(app.shows("id:library-view")).toBe(true);
+  expect(remotePaths(s)).not.toContain(`/v1/spaces/${space.id}/rooms`);
+  expect(firstRoomPages(s)).toEqual([]);
+  expect(remotePaths(s).some(p => p.startsWith("/v1/chat/") || p === "/v1/runs")).toBe(false);
+});
+
+test("a delayed Create from a signed-out account doesn't enter or publish in the next session", async () => {
+  const s = servers();
+  holdCreateResponse(s);
+  const app = await launchInEmptyBeta(s);
+  const space = await submitCreate(s, app);
+  await menuSwitch(app, "disconnect");
+  await app.waitFor("id:saved-server:srv-b", { timeout: 120 });
+  await app.press("id:saved-server:srv-b");
+  await app.type("id:access-token", TOKENS.alice!);
+  await app.press("id:connect");
+  await app.waitFor("id:chat-view", { timeout: 150 });
+  await app.clock!.runFor(800);
+  expect(app.shows("id:chat-view")).toBe(true);
+  expect(app.shows(`id:space:${space.id}`)).toBe(false);
+  expect(remotePaths(s)).not.toContain(`/v1/spaces/${space.id}/rooms`);
+  expect(firstRoomPages(s)).toEqual([]);
+});
+
 test("a newer complete list can omit a Space that an older list discovered midflight", async () => {
   const s = servers();
   const app = await launchWithoutBeta(s);

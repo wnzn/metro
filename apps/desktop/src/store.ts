@@ -638,6 +638,18 @@ export async function selectSpace(spaceId: string): Promise<void> {
   if (current() && navigation === navigationGeneration) kick();
 }
 
+/** Publish an acknowledged Create without replacing newer access evidence. */
+function publishCreatedSpace(space: Space, request: number): boolean {
+  if (newerSpaceDenial(space.id, request)) return false;
+  const key = scopeKey(space.id, "");
+  const listed = spaces();
+  if (newerAccess(key, request)) return listed.some(s => s.id === space.id);
+  // The POST proves access even if the first room read is inconclusive.
+  verifyAccess(key, request);
+  spaces.set([...listed.filter(s => s.id !== space.id), space]);
+  return true;
+}
+
 export async function createSpace(nameInput: string): Promise<boolean> {
   const name = nameInput.trim();
   const c = client;
@@ -647,19 +659,25 @@ export async function createSpace(nameInput: string): Promise<boolean> {
     return false;
   }
   const ok = guard();
+  const origin = navigationGeneration;
+  const originPlace = place(), originView = view();
+  const stillHere = () => origin === navigationGeneration && originPlace === place() && originView === view();
   batch(() => {
     creatingSpace.set(true);
     actionError.set(null);
   });
   try {
+    const request = nextAccessRequest();
     const space = await c.createSpace(name);
     if (!ok()) return false;
-    spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
-    await enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
-    kick();
+    if (!publishCreatedSpace(space, request) || !stillHere()) return true; // created; don't reopen or retry it
+    const entering = enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
+    const navigation = navigationGeneration;
+    await entering;
+    if (ok() && navigation === navigationGeneration) kick();
     return true;
   } catch (error) {
-    if (ok()) handleActionError(error, "Could not create the Space");
+    if (ok() && stillHere()) handleActionError(error, "Could not create the Space");
     return false;
   } finally {
     if (ok()) creatingSpace.set(false);
