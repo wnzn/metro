@@ -234,6 +234,53 @@ test("a Members page refreshes live and closes when the viewer loses access", as
   expect(app.shows("text:side lobby only")).toBe(true);
 });
 
+for (const mode of ["closed", "superseded", "replacement account"] as const) {
+  test(`a held hosted Members 401 is handled after ${mode}`, async () => {
+    const w = spaceWorld();
+    w.f.addSpace("bob-only", "Bob only", "bob");
+    const get = `GET ${BASE}/v1/*`;
+    const respond = w.network[get]!;
+    let armed = false;
+    let parked = false;
+    w.network[get] = (req) => {
+      if (armed && !parked && new URL(req.url).pathname === "/v1/spaces/acme/members") {
+        parked = true;
+        return { status: 401, body: {}, delay: 3_000 };
+      }
+      return respond(req);
+    };
+    const app = await signIn(w, "alice", true);
+    await openSettingsFor(app);
+    armed = true;
+    await app.press("id:space-settings-tab:members");
+    await app.waitUntil(() => parked);
+    if (mode === "superseded") {
+      await app.press("id:space-settings-tab:general");
+      await app.press("id:space-settings-tab:members");
+      await app.waitFor("id:member:bob");
+    } else {
+      await app.press("id:space-settings-close");
+    }
+
+    if (mode === "replacement account") {
+      await app.press("id:account-menu");
+      await app.press("id:disconnect");
+      await app.waitFor("id:connect");
+      await app.type("id:access-token", TOKENS.bob!);
+      await app.press("id:connect");
+      await app.waitFor("id:space:bob-only");
+    }
+    await app.clock!.runFor(3_100);
+    if (mode === "replacement account") {
+      expect(app.shows("id:space:bob-only")).toBe(true);
+      expect(app.shows("id:connect")).toBe(false);
+    } else {
+      await app.waitFor("id:connect");
+      expect(app.shows("id:space:acme")).toBe(false);
+    }
+  });
+}
+
 test("attach and confirmed detach affect only the Space being configured", async () => {
   const w = spaceWorld();
   w.f.addSpace("empty", "Empty", "alice");

@@ -51,6 +51,7 @@ import {
   onTransientClear,
   orgAdmin,
   place,
+  readHostedAccess,
   sessionGuard,
   settingsSection,
   spaces,
@@ -219,7 +220,7 @@ export async function confirmRunnerAction(action: "rotate" | "delete", runnerId:
   const checks = await Promise.allSettled(spaces().map(async (s) => {
     const observation = beginSpaceRunnerObservation(s.id);
     try {
-      const runner = await c.getSpaceRunner(s.id);
+      const runner = await readHostedAccess(c, () => c.getSpaceRunner(s.id));
       observation.finish(opened());
       return { space: s, observation, runner };
     } catch (error) {
@@ -376,7 +377,7 @@ async function reconcileSpaceRunner(
   if (!c || !currentScope()) return undefined;
   const observation = beginSpaceRunnerObservation(sid);
   try {
-    const current = await c.getSpaceRunner(sid);
+    const current = await readHostedAccess(c, () => c.getSpaceRunner(sid));
     if (!currentScope() || !observation.publish(current, allowFolderAdd(current))) return undefined;
     return current;
   } catch (error) {

@@ -3,7 +3,7 @@ import { cleanup, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError } from "./api/client";
 import type { Client, RegisteredRunner, Space, SpaceRunner } from "./api/client";
 import { acknowledgeSpaceRunnerWrite, beginSpaceRunnerWrite, loadRunners, reconcileOwnedSpaceRunner, recordRunnerUpdateAccepted, runnerBusy, runners, snapshotSpaceRunnerWrite, spaceRunners } from "./settings";
-import { apiClient, connectedTo, me, onSessionEnd, place, sessionGuard, settingsSection, spaces } from "./store";
+import { apiClient, connectedTo, me, onSessionEnd, place, readHostedAccess, sessionGuard, settingsSection, spaces } from "./store";
 import { helper } from "./device/state";
 import { installedBusy, installedFolderSnapshot, installedRunner, installedRunnerSeen, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner } from "./features/installedRunner/installedRunner";
 import type { InstalledRunnerState } from "./features/installedRunner/installedRunner";
@@ -356,7 +356,7 @@ export async function attachMany(spaceIds: readonly string[]) {
       }
       const spaceOK = sessionGuard(s.id);
       try {
-        const current = await c.getSpaceRunner(s.id);
+        const current = await readHostedAccess(c, () => c.getSpaceRunner(s.id));
         if (!valid()) return;
         if (!spaceOK() || !ownsSpace(s.id)) {
           failures.push(`${s.name}: You no longer own this Space.`);

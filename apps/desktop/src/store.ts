@@ -387,7 +387,7 @@ export function beginRunnerAccessRead(sid: string, exactEndpoint: boolean) {
     withdraw() {
       if (settled) return;
       settled = true;
-      if (valid() && !newerAccess(key, request)) verifiedAccess.delete(key);
+      if (exactEndpoint && valid() && !newerAccess(key, request)) verifiedAccess.delete(key);
       settle();
     },
   };
@@ -439,6 +439,20 @@ export function onManageOpen(fn: (spaceId: string, section: "members" | "runner"
 export function apiClient(): Client | null {
   return client;
 }
+
+/** A hosted access read can invalidate its session even if its view or result is stale. */
+export async function readHostedAccess<T>(c: Client, read: () => Promise<T>): Promise<T> {
+  const current = guard();
+  try {
+    return await read();
+  } catch (error) {
+    if (current() && client === c && error instanceof ApiError && error.kind === "auth" && error.status === 401) {
+      disconnect(error.message);
+    }
+    throw error;
+  }
+}
+
 /** A guard for async work started now: still the same session (and Space, when given). */
 export function sessionGuard(spaceId?: string) {
   return guard(spaceId);
@@ -1811,7 +1825,7 @@ export function loadMembersForMentions(fresh = false): Promise<void> {
   if (existing && !fresh) return existing;
   const ok = guard(sid);
   const version = nextMemberVersion(sid);
-  const work = c.listMembers(sid).then(list => {
+  const work = readHostedAccess(c, () => c.listMembers(sid)).then(list => {
     if (ok() && currentMentionVisit(visit)) {
       batch(() => {
         if (adoptMembers(sid, version, list) && !visit.verified) mentionVisit.set({ ...visit, verified: true });
@@ -1820,8 +1834,7 @@ export function loadMembersForMentions(fresh = false): Promise<void> {
   }, error => {
     if (!ok() || !currentMentionVisit(visit) || isAborted(error)) return;
     if (!markMembersUnverified(sid, version, error)) return;
-    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
-    else if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) void lostAccess(sid, null);
+    if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) void lostAccess(sid, null);
   }).finally(() => {
     if (memberRequests.get(sid) === work) memberRequests.delete(sid);
   });
@@ -1995,7 +2008,7 @@ async function verifySpaceRecipients(
   const checkMembers = checkAliases || uploaded || people.length > 0;
   const version = checkMembers ? nextMemberVersion(sid) : 0;
   const visit = mentionVisitGuard(sid);
-  const roster = checkMembers ? c.listMembers(sid).then(list => {
+  const roster = checkMembers ? readHostedAccess(c, () => c.listMembers(sid)).then(list => {
     if (mayPost()) adoptMembers(sid, version, list);
     return { list, evidence: memberEvidence()[sid]?.roster };
   }, error => {

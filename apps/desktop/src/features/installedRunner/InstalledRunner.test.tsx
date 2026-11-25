@@ -196,6 +196,104 @@ for (const denial of [403, 404]) {
   });
 }
 
+for (const status of [403, 404, 401] as const) {
+  test(`a local Show folder ${status} does not contradict newer hosted assignment proof`, async () => {
+    const f = world();
+    const mine = f.addRunner("This PC", "personal", "alice");
+    f.addSpace("target", "Target", "alice");
+    f.addSpace("sibling", "Sibling", "alice");
+    f.state.attached.set("target", mine.id);
+    f.state.attached.set("sibling", mine.id);
+    const route = `GET ${BASE}/v1/*`;
+    const respond = f.network[route]!;
+    let armed = false;
+    let omitted = false;
+    f.network[route] = (req) => {
+      const reply = respond(req);
+      if (!armed || omitted || new URL(req.url).pathname !== "/v1/spaces") return reply;
+      omitted = true;
+      const list = reply as { status: number; body: { spaces: { id: string }[] } };
+      return { ...list, body: { spaces: list.body.spaces.filter(s => s.id !== "target") }, delay: 5_000 };
+    };
+    const t = bridgeWithRunner(f, mine.id, mine.name);
+    const post = `POST ${BRIDGE}/v1/*`;
+    const bridge = t.network[post]!;
+    t.network[post] = req => new URL(req.url).pathname === "/v1/local-tools/runner/spaces/target/folder"
+      ? { status, body: { error: { code: status === 403 ? "not_owner" : status === 404 ? "not_found" : "unauthorized", message: "Local folder refused." } } }
+      : bridge(req);
+    const app = await openWith(f, t, true);
+    await signIn(app, "alice");
+    await app.waitFor("id:space:target");
+    armed = true;
+    await app.clock!.runFor(11_000);
+    await app.waitUntil(() => omitted);
+
+    // Don't enter Target: the fresh folder scan, not a room read, proves its
+    // hosted access after the omitted list's dispatch.
+    await openRunners(app);
+    await app.waitFor("id:installed-runner-folder:target");
+    await app.press("id:installed-runner-folder:sibling");
+    await app.waitFor("id:installed-runner-path:sibling");
+    await app.press("id:installed-runner-folder:target");
+    await app.waitFor("id:installed-runner-error");
+    expect(app.shows("id:installed-runner-space:target")).toBe(status === 401);
+    expect(app.shows("id:installed-runner-path:target")).toBe(false);
+    expect(app.shows("id:installed-runner-path:sibling")).toBe(true);
+    expect(app.shows("id:connect")).toBe(false);
+
+    await app.clock!.runFor(5_000);
+    expect(app.shows("id:space:target")).toBe(true);
+    await app.press("id:settings-close");
+    await app.press("id:space:target");
+    await app.waitFor("id:runner-state >> text:Runner attached");
+  });
+}
+
+for (const replaced of [false, true]) {
+  test(`a hosted folder scan 401 settles before its held sibling${replaced ? " without signing out a replacement" : " after close"}`, async () => {
+    const f = world();
+    const mine = f.addRunner("This PC", "personal", "alice");
+    f.addSpace("target", "Target", "alice");
+    f.addSpace("sibling", "Sibling", "alice");
+    f.addSpace("bob-only", "Bob only", "bob");
+    const route = `GET ${BASE}/v1/*`;
+    const respond = f.network[route]!;
+    let denied = false;
+    let sibling = false;
+    f.network[route] = req => {
+      const path = new URL(req.url).pathname;
+      if (path === "/v1/spaces/target/runner") {
+        denied = true;
+        return { status: 401, body: {}, delay: 3_000 };
+      }
+      const reply = respond(req);
+      if (path !== "/v1/spaces/sibling/runner") return reply;
+      sibling = true;
+      return { ...(reply as object), delay: 9_000 };
+    };
+    const t = bridgeWithRunner(f, mine.id, mine.name);
+    const app = await openWith(f, t, true);
+    await signInToRunners(app, "alice");
+    await app.waitUntil(() => denied && sibling);
+    await app.press("id:settings-close");
+    if (replaced) {
+      await app.press("id:account-menu");
+      await app.press("id:disconnect");
+      await app.waitFor("id:connect");
+      await signIn(app, "bob");
+      await app.waitFor("id:space:bob-only");
+    }
+    await app.clock!.runFor(3_100);
+    if (replaced) {
+      expect(app.shows("id:space:bob-only")).toBe(true);
+      expect(app.shows("id:connect")).toBe(false);
+    } else {
+      expect(app.shows("id:connect")).toBe(true);
+      expect(app.shows("id:space:sibling")).toBe(false);
+    }
+  });
+}
+
 test("shows the installer's runner, read-only tools and how to attach; opening only reads", async () => {
   const f = world();
   f.addSpace("solo", "Solo", "alice");

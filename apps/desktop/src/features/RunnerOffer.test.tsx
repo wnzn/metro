@@ -299,6 +299,34 @@ test("Delete cannot submit while impact is held or failed and can retry with pro
   expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["DELETE", `/v1/runners/${r.id}`]]);
 });
 
+test("a held Delete impact 401 signs out after dismissal without waiting for its sibling", async () => {
+  const f = world();
+  const r = f.addRunner("Remote runner", "personal", "alice");
+  f.addSpace("solo", "Solo", "alice");
+  f.state.attached.set("solo", r.id);
+  const route = `GET ${BASE}/v1/*`;
+  const respond = f.network[route]!;
+  let sibling = false;
+  f.network[route] = req => {
+    const reply = respond(req);
+    if (new URL(req.url).pathname !== "/v1/spaces/acme/runner") return reply;
+    sibling = true;
+    return { ...(reply as object), delay: 9_000 };
+  };
+  const t = fixture(f, null);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await openRunnerSettings(app);
+  const held = { sid: "solo", delay: 3_000, parked: false, errorStatus: 401 };
+  t.gate.runnerRead = held;
+  await app.press(`id:delete-runner:${r.id}`);
+  await app.waitUntil(() => held.parked && sibling);
+  await app.press("id:settings-close");
+  await app.clock!.runFor(3_100);
+  expect(app.shows("id:connect")).toBe(true);
+  expect(runnerWrites(f)).toEqual([]);
+});
+
 test("a held assignment write immediately disables Delete and exposes a fresh impact retry", async () => {
   const f = world();
   const installed = f.addRunner("This PC", "personal", "alice");
@@ -754,6 +782,28 @@ for (const mode of ["completed", "pending", "denied"] as const) {
     expect(app.shows("id:attached-runner")).toBe(true);
   });
 }
+
+test("a held hosted assignment 401 signs out after a newer exact read and close", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("solo", "Solo", "alice");
+  f.state.attached.set("solo", r.id);
+  const t = fixture(f, r.id);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.press("id:space:solo");
+  const held = { sid: "solo", delay: 3_000, parked: false, errorStatus: 401 };
+  t.gate.runnerRead = held;
+  await openSpaceRunner(app);
+  await app.waitUntil(() => held.parked);
+  await app.press("id:space-settings-tab:members");
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:attached-runner");
+  await app.press("id:space-settings-close");
+  await app.clock!.runFor(3_100);
+  await app.waitFor("id:connect");
+  expect(app.shows("id:space:solo")).toBe(false);
+});
 
 test("the follow-up read also detects a newer assignment made outside this app", async () => {
   const f = world();

@@ -22,7 +22,7 @@
 import { batch, signal } from "nsh";
 import { BridgeError, scrub } from "../../device/bridge";
 import { beginSpaceRunnerObservation, isSpaceRunnerAccessDenied, onSpaceRunnerObserved } from "../../spaceRunnerObservations";
-import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, spaces } from "../../store";
+import { apiClient, connectedTo, me, onSessionEnd, readHostedAccess, sessionGuard, spaces } from "../../store";
 import { localRunnerCall } from "../localtools/localTools";
 
 export type InstalledRunnerState =
@@ -153,7 +153,7 @@ async function loadAttached(runnerId: string, scanWanted: () => boolean): Promis
   const checks = await Promise.all(owned.map(async ({ id }) => {
     const observation = beginSpaceRunnerObservation(id);
     try {
-      const runner = await c.getSpaceRunner(id);
+      const runner = await readHostedAccess(c, () => c.getSpaceRunner(id));
       observation.finish(sameRunner());
       return { id, observation, ok: true as const, runner };
     } catch (error) {
@@ -336,7 +336,7 @@ export async function showRunnerFolder(sid: string): Promise<void> {
   if (!row) return;
   const valid = stillValid();
   const stillRow = () => valid() && runnerSpaces().includes(row);
-  const observation = beginSpaceRunnerObservation(sid, false); // Local bridge, not hosted access evidence.
+  const observation = beginSpaceRunnerObservation(sid, { dropLocalFolder: () => removeFolder(sid) });
   installedBusy.set(`folder:${sid}`);
   installedError.set(null);
   installedNotice.set(null);

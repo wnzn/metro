@@ -26,7 +26,7 @@ import {
   MAX_SPACE_DESCRIPTION,
 } from "../../api/spaces";
 import type { AgentPatch, ModelSelection, SpaceAgent, SpaceDetails, SpacePrefs, SpacePrefsView } from "../../api/spaces";
-import { apiClient, beginMemberRosterRead, closeSettings, describe, disconnect, isAborted, me, onManageOpen, onSessionEnd, onTransientClear, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
+import { apiClient, beginMemberRosterRead, closeSettings, describe, disconnect, isAborted, me, onManageOpen, onSessionEnd, onTransientClear, readHostedAccess, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
 import { acknowledgeSpaceRunnerWrite, beginSpaceRunnerWrite, dismissReveal, revealDedicatedToken, revealed, spaceRunners } from "../../settings";
 import { beginSpaceRunnerObservation, isSpaceRunnerAccessDenied } from "../../spaceRunnerObservations";
 import { spaceRunnerExactPending } from "../../spaceRunnerOrder";
@@ -300,7 +300,7 @@ export async function loadMembers(): Promise<void> {
   const live = () => page() && seq === memberRead;
   const read = beginMemberRosterRead(sid);
   try {
-    const list = await api.listMembers(sid);
+    const list = await readHostedAccess(api, () => api.listMembers(sid));
     if (!live() || !read.publish(list)) return;
     batch(() => {
       roster.set(list);
@@ -308,12 +308,6 @@ export async function loadMembers(): Promise<void> {
     });
   } catch (error) {
     if (!live() || isAborted(error)) return;
-    // Auth failure ends the current session, but an older roster failure
-    // must not close the page or supersede a newer accepted roster.
-    if (error instanceof ApiError && error.kind === "auth") {
-      lost(error, sid);
-      return;
-    }
     if (read.fail(error) && !lost(error, sid)) rosterError.set(reason(error, "Couldn't load members"));
   }
 }
@@ -381,7 +375,7 @@ async function refreshAssignment(
   const observation = beginSpaceRunnerObservation(sid);
   const valid = () => observation.isCurrent() && current();
   try {
-    const next = await readRunner(api, sid, !!options?.exact);
+    const next = await readHostedAccess(api, () => readRunner(api, sid, !!options?.exact));
     if (!valid()) return undefined;
     batch(() => {
       observation.publish(next.runner, options?.allowFolderAdd?.(next.runner) === true, !next.legacy);
