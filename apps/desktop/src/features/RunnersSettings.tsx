@@ -25,7 +25,7 @@ import type { RegisteredRunner, RunnerVisibility } from "../settings";
 import { Action, Badge, Banner, Column, compactWidth, ConfirmInline, Disclosure, FactList, Field, Label, LearnMore, PageHeader, PageLayout, ProblemNote, Row, SegmentedControl, SettingRow, SettingsGroup, StatusSummary } from "../ui";
 import { pinnedRunnerImage, requestRunnerUpdate, runnerAttachBusy, runnerAttachFeedback, runnerSessionKey, runnerUpdateBusy, runnerUpdateErrors, runnerUpdateTarget, selfUpdateTarget, watchInstalledRunner } from "../runnersState";
 import { TokenReveal } from "./TokenReveal";
-import { InstalledRunnerSection } from "./installedRunner/InstalledRunnerSection";
+import { createAttachSelection, InstalledRunnerSection } from "./installedRunner/InstalledRunnerSection";
 import { installedBusy, installedRunner, ownedInstalledRunner, refreshAfterInstalledRunnerDeletion } from "./installedRunner/installedRunner";
 import { relativeTime } from "./discovery/time";
 import { RELEASES_URL } from "./setupTemplates";
@@ -34,6 +34,8 @@ export function RunnersSettings() {
   watchInstalledRunner(true);
   const adding = signal(false);
   const token = () => revealed()?.kind === "runner";
+  // Keep the review and its live checks for the whole Runners visit.
+  const picks = createAttachSelection(() => !token());
   const hasMessages = () => !token() && !!(runnersError() || runnerNotice() || runnerAttachFeedback());
   const installedRegistration = () => runners()?.find((r) => r.visibility === "personal" && r.canManage && r.id === ownedInstalledRunner()?.id);
   effect(() => {
@@ -61,7 +63,7 @@ export function RunnersSettings() {
               </LearnMore>
             </Column>
             <If when={adding()}><AddRunner onAdded={() => adding.set(false)} /></If>
-            <InstalledRunnerSection management={
+            <InstalledRunnerSection picks={picks} management={
               <If when={installedRegistration()}>
                 {(runner) => <Column padX={4} gap={2}><RunnerManagement runner={runner()} installed /></Column>}
               </If>

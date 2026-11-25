@@ -3,11 +3,11 @@
 // Shown only when the launcher's bridge says so (see installedRunner.ts).
 // Opening reads; Reconnect and Show folder act only when pressed.
 
-import { Clipboard, signal } from "nsh";
+import { Clipboard, effect, signal, untracked } from "nsh";
 import type { JSX } from "nsh";
 import { runnerBusy, runners } from "../../settings";
 import { attachMany, eligibleSpaces, installedFolderRefreshExhausted, installedRunnerChoice, retryInstalledFolderRefresh, runnerAttachBusy, runnerSessionKey } from "../../runnersState";
-import { spaces } from "../../store";
+import { sessionGuard, spaces } from "../../store";
 import { Action, Badge, Banner, Checkbox, Column, ConfirmInline, Label, Row, SettingRow, SettingsGroup } from "../../ui";
 import type { Tone } from "../../ui";
 import {
@@ -58,11 +58,11 @@ export function reconnectImpact(r: InstalledRunner): string {
   return `Reconnecting creates a new personal runner for this computer. ${fresh}`;
 }
 
-export function InstalledRunnerSection(props: { management?: JSX.Element } = {}) {
+export function InstalledRunnerSection(props: { management?: JSX.Element; picks: AttachSelection }) {
   return (
     <>
       <If when={installedRunner()}>
-        {(r) => <Section r={r()} management={props.management} />}
+        {(r) => <Section r={r()} management={props.management} picks={props.picks} />}
       </If>
       <If when={installedFolderRefreshExhausted()}>
         <Banner variant="inline" tone="warning" testID="installed-runner-folders-unavailable"
@@ -74,7 +74,7 @@ export function InstalledRunnerSection(props: { management?: JSX.Element } = {})
   );
 }
 
-function Section(props: { r: InstalledRunner; management?: JSX.Element }) {
+function Section(props: { r: InstalledRunner; management?: JSX.Element; picks: AttachSelection }) {
   const copied = signal<string | null>(null);
   const r = () => props.r;
   const badge = () => installedRunnerBadge(r());
@@ -100,7 +100,7 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element }) {
           </Column>
         )}
       </If>
-      <AttachPicks />
+      <AttachPicks picks={props.picks} />
       <SettingRow
         label="Folders on this computer"
         description={runnerSpaces().length ? "Each Space gets its own folder on this computer."
@@ -183,10 +183,54 @@ function Section(props: { r: InstalledRunner; management?: JSX.Element }) {
   );
 }
 
-function AttachPicks() {
-  const unticked = signal<Record<string, boolean>>({});
-  const selected = () => eligibleSpaces().filter((s) => !unticked()[s.id]).map((s) => s.id);
-  const busy = () => runnerAttachBusy() || !!installedBusy() || !!runnerBusy();
+const attachBusy = () => runnerAttachBusy() || !!installedBusy() || !!runnerBusy();
+
+export function createAttachSelection(listVisible: () => boolean) {
+  const checked = signal<ReadonlySet<string>>(new Set());
+  let initial = true;
+  let previousRunnerId: string | undefined;
+  let sameSession = sessionGuard();
+  effect(() => {
+    runnerSessionKey();
+    const local = installedRunner();
+    const runnerId = local?.runner?.id;
+    const choice = installedRunnerChoice();
+    const visible = eligibleSpaces();
+    const changed = !sameSession() || (previousRunnerId !== undefined && previousRunnerId !== runnerId);
+    sameSession = sessionGuard();
+    previousRunnerId = runnerId;
+
+    if (changed || (local && !runnerId)) {
+      // A different or newly registered runner must not inherit defaults.
+      initial = false;
+      checked.set(new Set());
+    } else if (initial && choice && listVisible()) {
+      // Only default the first verified list shown to the user, even if empty.
+      initial = false;
+      checked.set(new Set(visible.map((s) => s.id)));
+    } else {
+      // Losing eligibility revokes the pick; a returning row needs a new pick.
+      const before = untracked(checked);
+      const kept = visible.filter((s) => before.has(s.id));
+      if (kept.length !== before.size) checked.set(new Set(kept.map((s) => s.id)));
+    }
+  });
+  return {
+    checked,
+    setChecked: (id: string, on: boolean) => {
+      if (attachBusy() || !eligibleSpaces().some((s) => s.id === id)) return;
+      const next = new Set(checked());
+      if (on) next.add(id);
+      else next.delete(id);
+      checked.set(next);
+    },
+  };
+}
+
+type AttachSelection = ReturnType<typeof createAttachSelection>;
+
+function AttachPicks(props: { picks: AttachSelection }) {
+  const selected = () => eligibleSpaces().filter((s) => props.picks.checked().has(s.id)).map((s) => s.id);
   const state = () => {
     if (!installedFolderRefreshExhausted() && checkingInstalledScope() && !installedRunnerChoice()) return "Checking this computer's runner…";
     if (ownedInstalledRunner()?.attachIfEmpty === false) return "This server doesn't support attaching only to Spaces without a runner.";
@@ -200,12 +244,12 @@ function AttachPicks() {
       <If when={eligibleSpaces().length > 0}>
         <Column gap={2}>
           <Each of={eligibleSpaces()} key={(s) => s.id}>
-            {(s) => <Checkbox testID={`runner-attach-pick:${s().id}`} label={s().name} checked={!unticked()[s().id]}
-              disabled={busy()} onChange={(checked) => unticked.set({ ...unticked(), [s().id]: !checked })} />}
+            {(s) => <Checkbox testID={`runner-attach-pick:${s().id}`} label={s().name} checked={props.picks.checked().has(s().id)}
+              disabled={attachBusy()} onChange={(checked) => props.picks.setChecked(s().id, checked)} />}
           </Each>
           <Action testID="runner-attach-many" label={`Attach to ${selected().length} ${selected().length === 1 ? "Space" : "Spaces"}`}
-            variant="primary" busy={runnerAttachBusy()} busyLabel="Attaching…" disabled={busy() || !selected().length}
-            onPress={() => void attachMany(selected())} />
+            variant="primary" busy={runnerAttachBusy()} busyLabel="Attaching…" disabled={attachBusy() || !selected().length}
+            onPress={() => { if (!attachBusy()) void attachMany(selected()); }} />
         </Column>
       </If>
     </SettingRow>
