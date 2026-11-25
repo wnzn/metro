@@ -4,7 +4,7 @@ import {
 import type { RoomEvent, SenderNotice as Notice } from "../../store";
 import { Action, Banner, Column, IconButton, Label, Row } from "../../ui";
 import { openSpaceSettings } from "../space/spaceSettingsState";
-import { addressingText } from "./response";
+import { addressingText, routingText } from "./response";
 
 // Fixed in-app destinations only. Do not use anything from the note's text
 // as a link or reopen the Space that happened to be behind another view.
@@ -57,7 +57,10 @@ function NoticeCard(props: { notice: Notice; focusComposer: (caret: number) => v
         <If when={props.notice.routing}>
           {(note) => (
             <Column gap={1} testID={`routing-note:${id()}`}>
-              <Label variant="caption">{note().message}</Label>
+              <If when={props.notice.destination.kind === "room"}>
+                <Label variant="strong">One agent turn couldn’t start</Label>
+              </If>
+              <Label variant="caption">{routingText(note(), props.notice.destination.kind === "room")}</Label>
               <Row>
                 <Action compact variant="ghost" label="Settings" accessibilityLabel="Open settings for this model choice"
                   testID={`routing-note-settings:${id()}`} onPress={() => settingsFor(props.notice, "routing")} />

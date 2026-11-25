@@ -13,7 +13,7 @@ import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
 import type { MentionSend, WireMentionSpan } from "../features/mentions/draft";
 import { readMentionSpans } from "../features/mentions/sent";
-import { readPostedNotes } from "../features/senderNotices/response";
+import { canonicalEventTime, readPostedNotes } from "../features/senderNotices/response";
 import type { PostedSenderNotes } from "../features/senderNotices/response";
 
 /** `parentRoomId`: set on a thread an agent delegated from that room. */
@@ -763,7 +763,7 @@ export function createClient(options: ClientOptions) {
       if (ids) body.asset_ids = ids;
       try {
         const data = await request("POST", `${room(spaceId, roomId)}/messages`, body);
-        return readPostedNotes(data, addressing.text, true, toCreatedAt);
+        return readPostedNotes(data, { ...addressing, kind: "space" });
       } catch (error) {
         if (error instanceof ApiError && error.status === 422) {
           throw new ApiError("http", "Update Metro Server to send Space messages with safe addressing. Your draft was kept and was not sent.", 422);
@@ -793,7 +793,7 @@ export function createClient(options: ClientOptions) {
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
       const data = await request("POST", "/v1/chat/messages", body);
-      return readPostedNotes(data, text, false, toCreatedAt);
+      return readPostedNotes(data, { kind: "chat", text });
     },
 
     async saveChatNote(text: string, assetIds?: readonly string[]): Promise<void> {
@@ -1103,6 +1103,11 @@ function isRun(v: unknown): v is { id: string | number; space_id: string | numbe
   );
 }
 
+// Keep the stricter POST-corroboration contract separate from permissive
+// legacy display times, without adding receipt fields to transcript events.
+const canonicalMessageTimes = new WeakSet<RoomEvent>();
+export const hasCanonicalMessageTime = (event: RoomEvent) => canonicalMessageTimes.has(event);
+
 function toEvent(v: RoomEvent): RoomEvent {
   const raw = v as unknown as Record<string, unknown>;
   const event: RoomEvent = { id: v.id, kind: v.kind, actor: v.actor, text: v.text };
@@ -1137,6 +1142,7 @@ function toEvent(v: RoomEvent): RoomEvent {
   if (isId(raw.actor_id) && String(raw.actor_id).trim()) event.actorId = String(raw.actor_id);
   const createdAt = toCreatedAt(raw.created_at);
   if (createdAt) event.createdAt = createdAt;
+  if (event.kind === "message" && canonicalEventTime(raw.created_at)) canonicalMessageTimes.add(event);
   const attachments = toAttachments(raw.attachments);
   if (attachments.length) event.attachments = attachments;
   return event;

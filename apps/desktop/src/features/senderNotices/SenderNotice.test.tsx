@@ -19,7 +19,7 @@ const unavailable = {
   kind: "model_unavailable",
   source: "space_default",
   reason: "connection_changed",
-  message: "Your Space default model can't be used here. Choose another in Your preferences.",
+  message: "Your Space default model can't be used here. No other model was used.",
 };
 const time = "2026-11-25T00:00:00.000Z";
 const post = `POST ${BASE}/v1/*`;
@@ -32,22 +32,31 @@ function fixture() {
   type Reply = { status: number; delay?: number; body: Record<string, unknown> };
   const sent = new Map<string, Event>();
   const replies = new Map<string, (event: Event, key: string) => Reply>();
+  const denials = new Map<string, Reply>();
+  const denied = new Set<string>();
   const reply = (text: string, fields: Record<string, unknown>, delay = 0) =>
     replies.set(text, (ev) => ({ status: 202, body: { ...ev, ...fields }, delay }));
+  const deny = (text: string, status: 403 | 404, delay: number) =>
+    denials.set(text, { status, delay, body: { error: "held send denial" } });
   w.network[post] = req => {
     const path = new URL(req.url).pathname;
     const body = req.body && JSON.parse(req.body);
+    if (path.endsWith("/messages") && denials.has(body?.text)) {
+      denied.add(body.text);
+      return denials.get(body.text);
+    }
     const answer = respond(req) as Reply;
     if (!path.endsWith("/messages") || answer.status !== 202) return answer;
     const call = w.f.posts().at(-1)!;
     const key = path.startsWith("/v1/chat/") ? `chat:${call.user}` :
       path.replace("/v1/spaces/", "").replace("/rooms/", "/").replace("/messages", "");
     const event = w.f.state.events.get(key)!.findLast(e => e.kind === "message" && e.text === body.text)!;
-    Object.assign(event, { actor: "Same display name", actor_id: call.user, text: event.text.trim(), created_at: time });
+    const text = event.text.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
+    Object.assign(event, { actor: "Same display name", actor_id: call.user, text, created_at: time });
     sent.set(body.text, event);
     return replies.get(body.text)?.(event, key) ?? answer;
   };
-  return { ...w, reply, replies, sent, messages: () => w.f.posts().filter(p => p.path.endsWith("/messages")) };
+  return { ...w, reply, replies, deny, denied, sent, messages: () => w.f.posts().filter(p => p.path.endsWith("/messages")) };
 }
 
 async function signIn(app: App, account = "alice") {
@@ -75,6 +84,15 @@ async function space(app: App, id = "acme") {
 async function send(app: App, text: string, button = "send") {
   await app.type("id:composer", text);
   await app.press(`id:${button}`);
+}
+
+async function dispatch(app: App, text: string, sid = "side") {
+  if (!app.shows("id:dispatch-text")) await app.press("id:dispatch-new");
+  await app.press(`id:dispatch-space:${sid}`);
+  await app.clear("id:dispatch-text");
+  await app.type("id:dispatch-text", text);
+  await app.waitUntil(() => app.enabled("id:dispatch-send"));
+  await app.press("id:dispatch-send");
 }
 
 test("classification note is under its message; Settings opens Space preferences and Ask agent only prepares or focuses", async () => {
@@ -136,7 +154,8 @@ test("both notices can coexist; generic failure does not claim named agents did 
   });
   expect(app.shows("text:/No agent ran for @agent.*asked on their own/")).toBe(true);
   expect(app.texts().join(" ")).not.toContain("Nothing was started");
-  expect(app.shows("id:routing-note:" + id)).toBe(true);
+  expect(app.shows(`id:routing-note:${id} >> text:One agent turn couldn’t start`)).toBe(true);
+  expect(app.shows("text:/No other model was used for this turn\\./")).toBe(true);
   expect(app.shows(`id:addressing-note-ask:${id}`)).toBe(false);
   const error = w.f.state.events.get("acme/lobby")!.at(-1)!;
   await app.waitFor(`id:failure:${error.id}`);
@@ -183,6 +202,7 @@ test("replayed response ids, foreign authors, wrong variants and injected transc
   w.reply("foreign author", { actor_id: "bob", routing_note: routing });
   w.reply("wrong place", { text: "different message", routing_note: routing });
   w.reply("invalid shapes", { addressing_note: routing, routing_note: { ...unavailable, message: { text: "not plain text" } } });
+  w.reply("conflicting codes", { addressing_note: pickup, routing_note: routing });
   w.reply("overlong or unknown", {
     addressing_note: { ...generic, message: "!".repeat(1_201) }, routing_note: { ...unavailable, source: "unknown" },
   });
@@ -191,12 +211,66 @@ test("replayed response ids, foreign authors, wrong variants and injected transc
   await space(app);
   await app.waitFor(`id:event:${old.id}`);
   expect(app.shows(note(old.id))).toBe(false);
-  for (const text of [old.text, "foreign author", "wrong place", "invalid shapes", "overlong or unknown", "denied"]) {
+  for (const text of [old.text, "foreign author", "wrong place", "invalid shapes", "conflicting codes", "overlong or unknown", "denied"]) {
     await send(app, text);
     await app.waitUntil(() => w.sent.has(text));
     await app.waitFor(`id:event:${w.sent.get(text)!.id}`);
     expect(app.shows(note(w.sent.get(text)!.id))).toBe(false);
     expect(app.shows(note(old.id))).toBe(false);
+  }
+});
+
+test("receipt waits for the poll, rejects a text mismatch, and honors Rust's exact trim without changing U11's body", async () => {
+  const w = fixture();
+  const app = await launch(w);
+  await space(app);
+  w.f.answerLate("/v1/spaces/acme/rooms/lobby/events", TOKENS.alice!, 2_000);
+  const exact = "\u0085 🌿 canonical, including BOM\uFEFF\u0085";
+  w.reply(exact, { addressing_note: pickup });
+  w.replies.set("sent body", (ev) => {
+    const response = { ...ev, addressing_note: pickup };
+    ev.text = "different polled body";
+    return { status: 202, body: response };
+  });
+  await send(app, "sent body");
+  await app.waitUntil(() => w.sent.has("sent body") && app.value("id:composer") === "");
+  const wrong = w.sent.get("sent body")!.id;
+  expect(app.shows(note(wrong))).toBe(false);
+  await send(app, exact);
+  await app.waitUntil(() => w.sent.has(exact));
+  const good = w.sent.get(exact)!.id;
+  expect(w.messages().at(-1)!.body.text).toBe(exact);
+  expect(app.shows(note(good))).toBe(false);
+  await app.waitFor(`id:event:${wrong} >> text:different polled body`);
+  await app.waitFor(note(good));
+  expect(w.sent.get(exact)!.text).toBe("🌿 canonical, including BOM\uFEFF");
+  expect(app.shows(note(wrong))).toBe(false);
+});
+
+test("missing, noncanonical or different timestamps never corroborate even when the polled row came first", async () => {
+  const w = fixture();
+  const app = await launch(w);
+  await space(app);
+  const bad = "2026-02-30T00:00:00.000Z";
+  const inputs = [
+    { text: "missing both", post: undefined, row: undefined },
+    { text: "invalid both", post: bad, row: bad },
+    { text: "invalid poll only", post: "2026-03-02T00:00:00.000Z", row: bad },
+    { text: "not UTC canonical", post: time, row: "2026-11-25T08:00:00.000+08:00" },
+    { text: "different instants", post: "2026-11-25T00:00:01.000Z", row: time },
+  ];
+  for (const { text, post, row } of inputs) {
+    w.replies.set(text, (ev) => {
+      Object.assign(ev, { created_at: row });
+      return { status: 202, delay: 3_000, body: { ...ev, created_at: post, addressing_note: pickup } };
+    });
+    await send(app, text);
+    await app.waitUntil(() => w.sent.has(text));
+    const id = w.sent.get(text)!.id;
+    await app.waitFor(`id:event:${id}`);
+    expect(app.shows(note(id))).toBe(false);
+    await app.clock!.runFor(3_000);
+    expect(app.shows(note(id))).toBe(false);
   }
 });
 
@@ -245,7 +319,7 @@ test("detected revocation scrubs existing and delayed notes even after the same 
   await app.waitUntil(() => w.sent.has("already visible"));
   const existing = w.sent.get("already visible")!.id;
   await app.waitFor(note(existing));
-  await send(app, "arrives after access returns");
+  await send(app, "arrives after access returns", "ask-agent");
   await app.waitUntil(() => w.sent.has("arrives after access returns"));
   const delayed = w.sent.get("arrives after access returns")!.id;
   w.f.state.spaces.get("side")!.members.delete("alice");
@@ -275,7 +349,7 @@ test("losing a thread scrubs its notice without touching the Space lobby's", asy
   await app.waitFor(note(lobbyId));
   await app.press("id:room:t1");
   await app.waitFor("id:open-parent");
-  await send(app, "thread note");
+  await send(app, "thread note", "ask-agent");
   await app.waitUntil(() => w.sent.has("thread note"));
   const threadId = w.sent.get("thread note")!.id;
   await app.waitFor(note(threadId));
@@ -299,7 +373,7 @@ test("late response and existing sender-only text do not survive sign-out or swi
   w.reply("pending response", { addressing_note: pickup }, 8_000);
   const app = await launch(w);
   await space(app);
-  await send(app, "already read");
+  await send(app, "already read", "ask-agent");
   await app.waitUntil(() => w.sent.has("already read"));
   const existing = w.sent.get("already read")!.id;
   await app.waitFor(note(existing));
@@ -345,4 +419,132 @@ test("a successful workspace switch scrubs the old session before a late POST re
   await app.waitFor(`id:event:${id}`);
   await app.clock!.runFor(9_000);
   expect(app.shows(note(id))).toBe(false);
+});
+
+test("a held dispatch denial rechecks only its source after navigation and invalidates a concurrent receipt", async () => {
+  const w = fixture();
+  w.reply("old Side note", { addressing_note: pickup });
+  w.reply("unrelated Acme note", { addressing_note: pickup });
+  w.reply("concurrent Side send", { addressing_note: pickup }, 6_000);
+  w.deny("held Side task", 403, 3_000);
+  const app = await launch(w);
+  await space(app);
+  await send(app, "unrelated Acme note");
+  await app.waitUntil(() => w.sent.has("unrelated Acme note"));
+  const acme = w.sent.get("unrelated Acme note")!.id;
+  await app.waitFor(note(acme));
+  await space(app, "side");
+  await send(app, "old Side note");
+  await app.waitUntil(() => w.sent.has("old Side note"));
+  const old = w.sent.get("old Side note")!.id;
+  await app.waitFor(note(old));
+  await app.press("id:nav-chat");
+  await dispatch(app, "held Side task");
+  await app.waitUntil(() => w.denied.has("held Side task"));
+  await space(app, "side");
+  await send(app, "concurrent Side send");
+  await app.waitUntil(() => w.sent.has("concurrent Side send"));
+  const concurrent = w.sent.get("concurrent Side send")!.id;
+  await space(app);
+  await app.type("id:composer", "current Acme draft");
+  w.f.state.spaces.get("side")!.members.delete("alice");
+  await app.waitFor("id:space:side", { state: "gone", timeout: 5_000 });
+  expect(app.shows(note(acme))).toBe(true);
+  expect(app.value("id:composer")).toBe("current Acme draft");
+  expect(app.shows("id:action-error")).toBe(false);
+  expect(app.texts().join(" ")).not.toContain("held send denial");
+
+  w.f.state.spaces.get("side")!.members.add("alice");
+  await app.clock!.runFor(12_000);
+  await space(app, "side");
+  await app.waitFor(`id:event:${concurrent}`);
+  expect(app.shows(note(old))).toBe(false);
+  expect(app.shows(note(concurrent))).toBe(false);
+  await app.press("id:nav-chat");
+  expect(app.shows("id:dispatch-error")).toBe(false);
+});
+
+test("a held composer 404 is applied to its thread even when another room of the same Space is open", async () => {
+  const w = fixture();
+  w.f.addRoom("acme", { id: "t1", name: "Follow-up", parent_room_id: "lobby" });
+  w.reply("lobby notice", { addressing_note: pickup });
+  w.reply("thread notice", { addressing_note: pickup });
+  w.deny("held thread send", 404, 3_000);
+  const app = await launch(w);
+  await space(app);
+  await send(app, "lobby notice");
+  await app.waitUntil(() => w.sent.has("lobby notice"));
+  const lobby = w.sent.get("lobby notice")!.id;
+  await app.waitFor(note(lobby));
+  await app.press("id:room:t1");
+  await send(app, "thread notice");
+  await app.waitUntil(() => w.sent.has("thread notice"));
+  const thread = w.sent.get("thread notice")!.id;
+  await app.waitFor(note(thread));
+  await send(app, "held thread send");
+  await app.waitUntil(() => w.denied.has("held thread send"));
+  await app.press("id:room:lobby");
+  await app.type("id:composer", "a new lobby draft");
+  await app.clock!.runFor(4_000);
+  expect(app.shows(note(lobby))).toBe(true);
+  expect(app.value("id:composer")).toBe("a new lobby draft");
+  expect(app.shows("id:action-error")).toBe(false);
+  await app.press("id:room:t1");
+  await app.waitFor(`id:event:${thread}`);
+  expect(app.shows(note(thread))).toBe(false);
+  expect(app.value("id:composer")).toBe("held thread send"); // a denied POST keeps its draft
+});
+
+test("a delayed room send denial scrubs only its room; an older denial cannot erase a newer receipt", async () => {
+  const w = fixture();
+  w.reply("original Side note", { addressing_note: pickup });
+  w.reply("replacement Side note", { routing_note: routing });
+  w.deny("stale room denial", 404, 8_000);
+  w.deny("first resolved denial", 403, 1_000);
+  const app = await launch(w);
+  await space(app, "side");
+  await send(app, "original Side note");
+  await app.waitUntil(() => w.sent.has("original Side note"));
+  const old = w.sent.get("original Side note")!.id;
+  await app.waitFor(note(old));
+  await send(app, "stale room denial");
+  await app.waitUntil(() => w.denied.has("stale room denial"));
+  await app.press("id:nav-chat");
+  await dispatch(app, "first resolved denial");
+  await app.waitFor("id:dispatch-error");
+  // The target is still a member's visible room. A POST denial could have
+  // been for a model or file, so recheck and keep its public transcript.
+  expect(w.f.state.log.some(req => req.path === "/v1/spaces/side/rooms")).toBe(true);
+  await dispatch(app, "replacement Side note");
+  await app.waitUntil(() => w.sent.has("replacement Side note"));
+  const fresh = w.sent.get("replacement Side note")!.id;
+  await space(app, "side");
+  await app.waitFor(note(fresh));
+  expect(app.shows(`id:event:${old}`)).toBe(true);
+  expect(app.shows(note(old))).toBe(false);
+  await app.clock!.runFor(8_000);
+  expect(app.shows(note(fresh))).toBe(true);
+  expect(app.shows("id:action-error")).toBe(false);
+});
+
+test("a delayed composer denial for a former account cannot clear the replacement account's receipt", async () => {
+  const w = fixture();
+  w.deny("Alice's held denial", 404, 8_000);
+  w.reply("Bob's note", { addressing_note: pickup });
+  const app = await launch(w);
+  await space(app, "side");
+  await send(app, "Alice's held denial");
+  await app.waitUntil(() => w.denied.has("Alice's held denial"));
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+  await app.waitFor("id:connect-screen");
+  await signIn(app, "bob");
+  await space(app, "side");
+  await send(app, "Bob's note");
+  await app.waitUntil(() => w.sent.has("Bob's note"));
+  const id = w.sent.get("Bob's note")!.id;
+  await app.waitFor(note(id));
+  await app.clock!.runFor(8_000);
+  expect(app.shows(note(id))).toBe(true);
+  expect(app.shows("id:action-error")).toBe(false);
 });

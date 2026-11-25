@@ -34,7 +34,7 @@
 //   here with onTransientClear / onSessionEnd).
 
 import { batch, computed, effect, signal, Storage, untracked } from "nsh";
-import { ApiError, createClient, parseReaction } from "./api/client";
+import { ApiError, createClient, hasCanonicalMessageTime, parseReaction } from "./api/client";
 import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl, serverHost } from "./api/serverUrl";
@@ -43,7 +43,7 @@ import {
   captureTypedMentions, editMentionDraft, mentionIdentityKey, pickMention, prepareMentionSend, scanMentionDraft, updateMentionDraft,
 } from "./features/mentions/draft";
 import type { MentionDirectory, MentionDraft, MentionRecipient, MentionSelection, MentionSend } from "./features/mentions/draft";
-import type { PostedSenderNotes } from "./features/senderNotices/response";
+import type { PostedSenderNotes, SenderNoticeDetails } from "./features/senderNotices/response";
 
 export type { Member, Mention, Room, RoomEvent, Run, Space };
 
@@ -664,6 +664,7 @@ function purgeSpace(spaceId: string, unlist: boolean) {
   for (const key of [...inflight.keys()]) if (key.startsWith(prefix)) inflight.delete(key);
   for (const key of [...pollAgain]) if (key.startsWith(prefix)) pollAgain.delete(key);
   for (const key of noticeEpochs.keys()) if (key.startsWith(prefix)) noticeEpochs.delete(key);
+  for (const key of pendingSenderNotices.keys()) if (key.startsWith(prefix)) pendingSenderNotices.delete(key);
   lastRoomBySpace.delete(spaceId);
   const strip = <T,>(record: Record<string, T>) => {
     const next: Record<string, T> = {};
@@ -770,8 +771,14 @@ export type SendDestination = { kind: "chat" } | { kind: "room"; spaceId: string
 
 // Only the initiating POST writes here. Not an event cache: it is never
 // merged into a transcript, persisted, or used for model/search history.
-export type SenderNotice = PostedSenderNotes & { destination: SendDestination };
-const senderNotices = signal<Record<string, ReadonlyMap<number, SenderNotice | null>>>({});
+export type SenderNotice = SenderNoticeDetails & { destination: SendDestination };
+type ConfirmedSenderNotice = { note: SenderNotice; row: RoomEvent };
+type PendingSenderNotice = PostedSenderNotes & { destination: SendDestination };
+const senderNotices = signal<Record<string, ReadonlyMap<number, ConfirmedSenderNotice | null>>>({});
+const pendingSenderNotices = new Map<string, Map<number, PendingSenderNotice>>();
+// Only uncorroborated receipts hold a copy of the text (at most 16k code
+// units each). Bound those across the entire session, including idle rooms.
+const MAX_PENDING_SENDER_NOTICES = 32;
 const noticeEpochs = new Map<string, number>();
 const noticeEpoch = (scope: string) => noticeEpochs.get(scope) ?? 0;
 const destinationScope = (to: SendDestination) => to.kind === "chat" ? CHAT : scopeKey(to.spaceId, to.roomId);
@@ -782,52 +789,95 @@ function noticeDestinationVisible(to: SendDestination) {
 }
 
 function forgetSenderNotices(scope: string) {
-  noticeEpochs.set(scope, noticeEpoch(scope) + 1);
+  const epoch = noticeEpoch(scope) + 1;
+  noticeEpochs.set(scope, epoch);
+  pendingSenderNotices.delete(scope);
   const { [scope]: removed, ...rest } = senderNotices();
   if (removed) senderNotices.set(rest);
+  return epoch;
 }
 
-/** Capture the sender, permission epoch and latest known id just before POST. */
-function acceptSenderNotice(to: SendDestination) {
+/** The POST belongs to this principal and destination even after navigation. */
+function captureSendOrigin(c: Client, to: SendDestination) {
   const scope = destinationScope(to);
   const sender = me();
-  const ok = guard(to.kind === "room" ? to.spaceId : undefined);
+  const valid = guard(to.kind === "room" ? to.spaceId : undefined);
+  const sameAccount = () => !!sender && me() === sender && client === c && valid();
   const epoch = noticeEpoch(scope);
   const after = cursors.get(scope) ?? 0;
   const wasVisible = noticeDestinationVisible(to);
-  return (posted: PostedSenderNotes | null): boolean => {
-    if (!posted || !sender || posted.senderId !== sender || me() !== sender || posted.eventId <= after ||
-      !wasVisible || !ok() || noticeEpoch(scope) !== epoch || !noticeDestinationVisible(to)) return false;
-    const notes = new Map(senderNotices()[scope]);
-    if (notes.has(posted.eventId)) return false; // includes dismissed notices
-    notes.set(posted.eventId, { ...posted, destination: to });
-    senderNotices.set({ ...senderNotices(), [scope]: notes });
-    return true;
+  const current = () => sameAccount() && noticeEpoch(scope) === epoch;
+  return {
+    current,
+    accept(posted: PostedSenderNotes | null): boolean {
+      if (!posted || posted.senderId !== sender || posted.eventId <= after ||
+        !wasVisible || !current() || !noticeDestinationVisible(to)) return false;
+      const notes = senderNotices()[scope];
+      const pending = pendingSenderNotices.get(scope);
+      if (notes?.has(posted.eventId) || pending?.has(posted.eventId)) return false;
+      const receipt = { ...posted, destination: to };
+      if (posted.eventId <= (cursors.get(scope) ?? 0)) {
+        const confirmed = corroborateSenderNotice(receipt, eventsByScope()[scope] ?? EMPTY_EVENTS);
+        if (!confirmed) return false;
+        senderNotices.set({ ...senderNotices(), [scope]: new Map(notes).set(posted.eventId, confirmed) });
+      } else {
+        let count = 0;
+        for (const entries of pendingSenderNotices.values()) count += entries.size;
+        if (count >= MAX_PENDING_SENDER_NOTICES) return false;
+        pendingSenderNotices.set(scope, (pending ?? new Map()).set(posted.eventId, receipt));
+      }
+      return true;
+    },
+    deny() {
+      if (!current()) return;
+      const next = forgetSenderNotices(scope);
+      if (to.kind === "room") void recheckSendAccess(c, to, () => sameAccount() && noticeEpoch(scope) === next);
+    },
   };
 }
 
-/** A receipt augments only the matching human message in its original place. */
-function matchesSenderNotice(event: RoomEvent, note: SenderNotice) {
-  return event.kind === "message" && event.id === note.eventId &&
-    event.actorId === note.senderId && event.createdAt === note.createdAt;
+function corroborateSenderNotice(receipt: PendingSenderNotice, rows: readonly RoomEvent[]): ConfirmedSenderNotice | null {
+  const { text, ...note } = receipt;
+  const row = rows.find(e => e.id === note.eventId);
+  return row && row.kind === "message" && row.actorId === note.senderId && hasCanonicalMessageTime(row) &&
+    row.createdAt === note.createdAt && row.text === text ? { note, row } : null;
+}
+
+/** Resolve POST evidence once, when polling reaches the id. Polls create no receipts. */
+function reconcileSenderNotices(scope: string, through: number, rows: readonly RoomEvent[]) {
+  const saved = senderNotices()[scope];
+  const pending = pendingSenderNotices.get(scope);
+  let next: Map<number, ConfirmedSenderNotice | null> | undefined;
+  if (saved && rows.length) {
+    for (const id of saved.keys()) if (id < rows[0]!.id) (next ??= new Map(saved)).delete(id);
+  }
+  if (pending) {
+    for (const [id, receipt] of pending) {
+      if (id > through) continue;
+      pending.delete(id);
+      const confirmed = corroborateSenderNotice(receipt, rows);
+      if (confirmed) (next ??= new Map(saved)).set(id, confirmed);
+    }
+    if (!pending.size) pendingSenderNotices.delete(scope);
+  }
+  if (next) senderNotices.set({ ...senderNotices(), [scope]: next });
 }
 
 export function activeSenderNotice(event: RoomEvent): SenderNotice | null {
   if (event.kind !== "message" || !event.actorId || event.actorId !== me()) return null;
   if (basePlace() !== "chat" && (basePlace() !== "space" || view() !== "room" || switchingSpace())) return null;
-  const note = senderNotices()[activeScope()]?.get(event.id);
-  if (!note || !matchesSenderNotice(event, note) ||
-    !noticeDestinationVisible(note.destination) || !activeEvents().includes(event)) return null;
-  return note;
+  const entry = senderNotices()[activeScope()]?.get(event.id);
+  if (entry?.row !== event || !noticeDestinationVisible(entry.note.destination) || !activeEvents().includes(event)) return null;
+  return entry.note;
 }
 
 /** A delayed UI callback must not act on a notice from a place already left. */
 export function senderNoticeIsCurrent(note: SenderNotice) {
   const scope = destinationScope(note.destination);
+  const entry = senderNotices()[scope]?.get(note.eventId);
   return me() === note.senderId && !settingsOpen() && scope === activeScope() &&
     (note.destination.kind === "chat" ? basePlace() === "chat" : inSpaceComposer()) &&
-    noticeDestinationVisible(note.destination) && senderNotices()[scope]?.get(note.eventId) === note &&
-    !!eventsByScope()[scope]?.some(e => matchesSenderNotice(e, note));
+    noticeDestinationVisible(note.destination) && entry?.note === note && !!eventsByScope()[scope]?.includes(entry.row);
 }
 
 export function dismissSenderNotice(note: SenderNotice) {
@@ -917,7 +967,8 @@ async function sendDraft(intent: DraftSend): Promise<void> {
   const ok = chat ? sameSession : guard(sid!);
   const navigation = navigationGeneration;
   // Feedback only where it happened: never in a place the user moved to.
-  const here = () => ok() && activeScope() === scope;
+  const here = () => ok() && navigation === navigationGeneration && activeScope() === scope &&
+    (chat ? basePlace() === "chat" : inSpaceComposer());
   let address: SpaceMessageBody | null = null;
   let submittedDraft: MentionDraft | undefined;
   if (!chat) {
@@ -956,7 +1007,8 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     actionError.set(null);
     notice.set(null);
   });
-  const mayPost = () => here() && navigation === navigationGeneration && inSpaceComposer() && mentionDraft() === submittedDraft;
+  const mayPost = () => here() && mentionDraft() === submittedDraft;
+  let origin: ReturnType<typeof captureSendOrigin> | undefined;
   try {
     let ids: string[] = [];
     let keys: string[] = [];
@@ -970,10 +1022,10 @@ async function sendDraft(intent: DraftSend): Promise<void> {
       ids = up.ids;
       keys = up.keys;
     }
-    if (saveNote) await c.saveChatNote(text, ids);
-    else if (chat) {
-      const accept = acceptSenderNotice(to);
-      accept(await c.sendChatMessage(text, ids, selected.choice));
+    if (chat) {
+      origin = captureSendOrigin(c, to);
+      if (saveNote) await c.saveChatNote(text, ids);
+      else origin.accept(await c.sendChatMessage(text, ids, selected.choice));
     } else {
       if (!mayPost()) {
         if (here()) actionError.set("The draft or destination changed. Nothing was sent; review the draft and send again.");
@@ -987,10 +1039,10 @@ async function sendDraft(intent: DraftSend): Promise<void> {
         return;
       }
       if (!mayPost()) return;
-      const accept = acceptSenderNotice(to);
-      accept(await c.sendMessage(sid!, rid!, body, ids, selected.choice));
+      origin = captureSendOrigin(c, to);
+      origin.accept(await c.sendMessage(sid!, rid!, body, ids, selected.choice));
     }
-    if (!ok()) return;
+    if (!ok() || !origin.current()) return;
     if (keys.length) attachments?.sent(scope, keys, to);
     if (activeScope() === scope && (chat ? draft().trim() === text : mentionDraft() === submittedDraft)) {
       // unless the user typed something new meanwhile
@@ -1009,11 +1061,14 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     }
     kick();
   } catch (error) {
-    if (!here()) {
-      if (!chat && ok() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") {
+      disconnect(error.message);
       return;
     }
-    handleActionError(error, saveNote ? "Could not save the note" : invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", chat ? undefined : sid!);
+    if (origin && !origin.current()) return;
+    if (origin && isAccessDenial(error)) origin.deny();
+    if (!here()) return;
+    handleActionError(error, saveNote ? "Could not save the note" : invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", origin || chat ? undefined : sid!);
     const shown = actionError();
     if (files && shown) actionError.set(chat
       ? `${shown} Its files are already in the Library; ${retryAction} again won't upload them twice.`
@@ -1084,7 +1139,10 @@ export async function sendDispatch(): Promise<void> {
     dispatchError.set("Choose a Space and room you belong to first.");
     return;
   }
-  const ok = guard(target.spaceId);
+  const sameSession = guard();
+  const navigation = navigationGeneration;
+  const here = () => basePlace() === "chat" && navigation === navigationGeneration && dispatchTarget() === target;
+  const origin = captureSendOrigin(c, { kind: "room", spaceId: target.spaceId, roomId: target.roomId });
   batch(() => {
     dispatching.set(true);
     dispatchError.set(null);
@@ -1093,23 +1151,21 @@ export async function sendDispatch(): Promise<void> {
   try {
     // Dispatch is an explicit request to the chosen Space's agent, not a
     // mention composer. Its text cannot add recipients implicitly.
-    const accept = acceptSenderNotice({ kind: "room", spaceId: target.spaceId, roomId: target.roomId });
-    const hadNotice = accept(await c.sendMessage(target.spaceId, target.roomId, { text, invoke_agent: true }));
-    if (!ok()) return;
-    if (dispatchDraft().trim() === text) dispatchDraft.set("");
-    dispatchNotice.set(hadNotice ? `Posted in ${space.name} › #${room.name}. See the note under your message.` :
+    const hadNotice = origin.accept(await c.sendMessage(target.spaceId, target.roomId, { text, invoke_agent: true }));
+    if (!origin.current()) return;
+    if (dispatchTarget() === target && dispatchDraft().trim() === text) dispatchDraft.set("");
+    if (here()) dispatchNotice.set(hadNotice ? `Posted in ${space.name} › #${room.name}.` :
       `Sent to the agent in ${space.name} › #${room.name}.`);
     lastRunsRefresh = 0;
     kick();
   } catch (error) {
-    if (!ok()) return;
-    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
-    else {
-      dispatchError.set(describe(error, "Could not send the task"));
-      if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) void lostAccess(target.spaceId, null);
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else if (origin.current()) {
+      if (isAccessDenial(error)) origin.deny();
+      if (here() && !isAborted(error)) dispatchError.set(describe(error, "Could not send the task"));
     }
   } finally {
-    if (ok()) dispatching.set(false);
+    if (sameSession()) dispatching.set(false);
   }
 }
 
@@ -1553,6 +1609,7 @@ function endSession() {
   lastRoomBySpace.clear();
   spaceEpoch.clear();
   noticeEpochs.clear();
+  pendingSenderNotices.clear();
   memberRequests.clear();
   memberVersions.clear();
   batch(() => {
@@ -1669,6 +1726,56 @@ async function handleLoopError(error: unknown): Promise<number | null> {
   return retryInMs;
 }
 
+/** A message POST can also deny a model or attachment. Hide this room's
+ * private notices immediately, but drop public state only on a scoped read
+ * that confirms access is gone. Never refresh the room the user moved to. */
+async function recheckSendAccess(c: Client, to: Extract<SendDestination, { kind: "room" }>, current: () => boolean) {
+  const { spaceId, roomId } = to;
+  const forgetSpace = () => {
+    batch(() => {
+      purgeSpace(spaceId, true);
+      if (activeSpaceId() !== spaceId) return;
+      activeSpaceId.set(null);
+      activeRoomId.set(null);
+      view.set("room");
+      if (basePlace() === "space") {
+        actionError.set(null);
+        notice.set(null);
+        basePlace.set("chat");
+      }
+    });
+  };
+  const visible = await c.listSpaces().catch(() => null);
+  if (!current() || !visible) return;
+  if (!visible.some(s => s.id === spaceId)) {
+    forgetSpace();
+    return;
+  }
+  try {
+    const list = await c.listRooms(spaceId);
+    if (current() && !list.some(r => r.id === roomId)) dropLostRoom(spaceId, roomId, false);
+  } catch (error) {
+    // listRooms is Space-scoped, and can't deny a particular file or model.
+    if (current() && isAccessDenial(error)) forgetSpace();
+  }
+}
+
+function dropLostRoom(spaceId: string, roomId: string, show: boolean) {
+  const key = scopeKey(spaceId, roomId);
+  cursors.delete(key);
+  batch(() => {
+    forgetSenderNotices(key);
+    roomsBySpace.set({ ...roomsBySpace(), [spaceId]: roomsOf(spaceId).filter(r => r.id !== roomId) });
+    const { [key]: _e, ...events } = eventsByScope();
+    eventsByScope.set(events);
+    if (activeSpaceId() === spaceId && activeRoomId() === roomId) {
+      activeRoomId.set(pickRoom(spaceId, roomsOf(spaceId)));
+      if (show && basePlace() === "space") notice.set("That room is no longer available.");
+      else if (basePlace() === "space") actionError.set(null);
+    }
+  });
+}
+
 /**
  * A Space endpoint said 403/404. Reload the Space list to tell "removed from
  * the Space" (purge it, move on) from "this room is gone" (drop the room).
@@ -1687,18 +1794,7 @@ async function lostAccess(spaceId: string | null, roomId: string | null) {
   if (!currentSession()) return;
   if (spaces().some((s) => s.id === spaceId)) {
     if (!roomId || !sameSpace()) return;
-    const key = scopeKey(spaceId, roomId);
-    cursors.delete(key);
-    batch(() => {
-      forgetSenderNotices(key);
-      roomsBySpace.set({ ...roomsBySpace(), [spaceId]: (roomsBySpace()[spaceId] ?? EMPTY_ROOMS).filter((r) => r.id !== roomId) });
-      const { [key]: _e, ...events } = eventsByScope();
-      eventsByScope.set(events);
-      if (activeSpaceId() === spaceId && activeRoomId() === roomId) {
-        activeRoomId.set(pickRoom(spaceId, roomsBySpace()[spaceId] ?? EMPTY_ROOMS));
-        notice.set("That room is no longer available.");
-      }
-    });
+    dropLostRoom(spaceId, roomId, true);
   } else if (before) {
     notice.set(`You no longer have access to ${before.name}.`);
   }
@@ -1783,9 +1879,12 @@ async function refreshLists(force = false) {
 }
 
 async function pollRoom(spaceId: string, roomId: string): Promise<void> {
-  const ok = guard(spaceId);
+  const scope = scopeKey(spaceId, roomId);
+  const sameSpace = guard(spaceId);
+  const epoch = noticeEpoch(scope);
+  const ok = () => sameSpace() && noticeEpoch(scope) === epoch;
   try {
-    await poll(scopeKey(spaceId, roomId), ok, (c, after) => c.listEvents(spaceId, roomId, after));
+    await poll(scope, ok, (c, after) => c.listEvents(spaceId, roomId, after));
   } catch (error) {
     if (!ok()) return;
     if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) {
@@ -1795,7 +1894,9 @@ async function pollRoom(spaceId: string, roomId: string): Promise<void> {
 }
 
 async function pollChat(): Promise<void> {
-  const ok = guard();
+  const sameSession = guard();
+  const epoch = noticeEpoch(CHAT);
+  const ok = () => sameSession() && noticeEpoch(CHAT) === epoch;
   try {
     await poll(CHAT, ok, (c, after) => c.listChatEvents(after));
   } catch (error) {
@@ -1879,20 +1980,24 @@ function merge(key: string, events: RoomEvent[]): number {
   batch(() => {
     if (!loadedScopes()[key]) loadedScopes.set({ ...loadedScopes(), [key]: true });
     if (fresh.length === 0) return;
-    cursors.set(key, fresh[fresh.length - 1].id);
+    const through = fresh[fresh.length - 1].id;
+    cursors.set(key, through);
     if (reactions) reactionsByScope.set({ ...reactionsByScope(), [key]: reactions });
-    if (shown.length === 0) return;
     const current = eventsByScope()[key] ?? EMPTY_EVENTS;
-    const next = current.concat(shown);
-    eventsByScope.set({
-      ...eventsByScope(),
-      [key]: next.length > MAX_EVENTS_PER_ROOM ? next.slice(next.length - MAX_EVENTS_PER_ROOM) : next,
-    });
+    let rows = current;
+    if (shown.length) {
+      rows = current.concat(shown).slice(-MAX_EVENTS_PER_ROOM);
+      eventsByScope.set({ ...eventsByScope(), [key]: rows });
+    }
+    reconcileSenderNotices(key, through, rows);
   });
   return fresh.length;
 }
 
 // ------------------------------------------------------------------ errors
+
+const isAccessDenial = (error: unknown) => error instanceof ApiError &&
+  (error.kind === "forbidden" || error.kind === "not_found");
 
 function handleActionError(error: unknown, what: string, spaceId?: string) {
   if (isAborted(error)) return;
