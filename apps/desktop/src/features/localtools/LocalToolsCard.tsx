@@ -44,7 +44,7 @@ export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRun
   cleanup(() => { open = false; });
   effect(() => {
     const id = sid();
-    if (id) untracked(() => void loadLocalTools(() => open && sid() === id));
+    if (id) untracked(() => void loadLocalTools(id, () => open && sid() === id));
   });
   const blocked = () => props.disabled || !!localToolsBusy();
   const target = () => {

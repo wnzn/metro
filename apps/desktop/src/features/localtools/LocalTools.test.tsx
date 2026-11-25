@@ -21,6 +21,7 @@ const FOLDER = "/home/me/.config/metro-desktop/local-tools/accounts/a1/spaces/so
 function bridgeWithTools(f: F, available = true, opts: { startingReads?: number; legacy?: boolean } = {}) {
   /** After enable, this many status reads still report the worker as starting. */
   let starting = 0;
+  const delay = { disable: 0 };
   const b = fakeBridge(f);
   const tools = new Map<string, any>();
   const log: { method: string; path: string; body: any; auth: string | undefined }[] = [];
@@ -60,14 +61,14 @@ function bridgeWithTools(f: F, available = true, opts: { startingReads?: number;
     }
     if (tools.has(space.id)) space.runnerToken = null;
     tools.delete(space.id);
-    return { status: 200, body: { space_id: space.id, enabled: false, state: "off", worker: "stopped", detail: null, folder: FOLDER } };
+    return { status: 200, delay: delay.disable, body: { space_id: space.id, enabled: false, state: "off", worker: "stopped", detail: null, folder: FOLDER } };
   };
   const network: Record<string, (req: Req) => unknown> = {};
   for (const method of ["GET", "POST", "PUT", "DELETE"]) {
     const inner = (b.network as any)[`${method} ${BRIDGE}/v1/*`];
     network[`${method} ${BRIDGE}/v1/*`] = (req: Req) => (new URL(req.url).pathname.startsWith("/v1/local-tools") ? handleTools(req) : inner(req));
   }
-  return { b, tools, log, network, finishStartingAfter: (reads: number) => { starting = reads; } };
+  return { b, tools, log, network, delay, finishStartingAfter: (reads: number) => { starting = reads; } };
 }
 
 async function openWith(f: F, t: ReturnType<typeof bridgeWithTools> | null, manual = false) {
@@ -156,6 +157,40 @@ test("a stale Turn off confirmation never stops the replacement; the next review
     ["/v1/local-tools/spaces/solo/disable-if-current", { account_id: "alice", pairing_revision: "8" }],
   ]);
 });
+
+for (const reopen of [true, false]) {
+  test(`a held Off reply cannot hide its replacement ${reopen ? "after reopening Settings" : "on the same page"}`, async () => {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    const t = bridgeWithTools(f);
+    const app = await openWith(f, t, true);
+    await signIn(app, "alice");
+    await manage(app, "solo");
+    await app.press("id:local-tools-enable");
+    await app.waitFor("id:local-tools-disable");
+    const original = t.tools.get("solo");
+    t.delay.disable = 2_000;
+    await app.press("id:local-tools-disable");
+    await app.press("id:local-tools-confirm-disable");
+    await app.waitUntil(() => !t.tools.has("solo"));
+    t.tools.set("solo", { ...original, pairing_revision: "8", detail: "Replacement pairing" });
+    f.state.spaces.get("solo")!.runnerToken = LOCAL_RUNNER_SECRET;
+    if (reopen) {
+      await app.press("id:space-settings-close");
+      await manage(app, "solo");
+      await app.waitFor("text:Replacement pairing");
+    }
+    t.delay.disable = 0;
+    await app.clock!.runFor(2_000);
+    await app.waitFor("text:Replacement pairing");
+    expect(app.shows("text:Local tools are off. The files in the folder stay on this computer.")).toBe(false);
+    await app.press("id:local-tools-disable");
+    await app.press("id:local-tools-confirm-disable");
+    await app.waitFor("id:local-tools-on", { state: "gone" });
+    expect(t.log.filter((l) => l.path.endsWith("/disable-if-current")).map((l) => l.body.pairing_revision))
+      .toEqual(["7", "8"]);
+  });
+}
 
 test("an old bridge cannot receive an unguarded Turn off request", async () => {
   const f = world();
