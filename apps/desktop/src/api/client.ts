@@ -15,6 +15,8 @@ import { parseWebTool, webSearchPrefsApi } from "./webSearch";
 import type { WebToolNote } from "./webSearch";
 import type { MentionSend, WireMentionSpan } from "../features/mentions/draft";
 import { readMentionSpans } from "../features/mentions/sent";
+import { canonicalAddressing, canonicalEventTime, canonicalStableId, readPostedNotes } from "../features/senderNotices/response";
+import type { PostedSenderNotes } from "../features/senderNotices/response";
 
 /** `parentRoomId`: set on a thread an agent delegated from that room. */
 export type Room = { id: string; name: string; parentRoomId?: string };
@@ -118,7 +120,7 @@ export type Member = { userId: string; role: SpaceRole };
 export type Run = { id: string; spaceId: string; roomId: string; status: string; actor: string; task: string };
 
 /** Who is signed in. `isOrgAdmin`: may create and manage organization runners. */
-export type Me = { id: string; isOrgAdmin: boolean };
+export type Me = { id: string; canonicalId: string | null; isOrgAdmin: boolean };
 
 /** A registered runner the user can see (GET /v1/runners). */
 export type RunnerVisibility = "personal" | "organization";
@@ -558,7 +560,7 @@ export function createClient(options: ClientOptions) {
         throw new ApiError("protocol", "GET /v1/me did not return { id }.");
       }
       // An older server has no organization: nobody is its admin.
-      return { id: String(data.id), isOrgAdmin: data.is_org_admin === true };
+      return { id: String(data.id), canonicalId: canonicalStableId(data.id) ? data.id : null, isOrgAdmin: data.is_org_admin === true };
     },
 
     // ---- registered runners (personal or organization), reusable across Spaces
@@ -842,12 +844,13 @@ export function createClient(options: ClientOptions) {
       addressing: SpaceMessageBody,
       assetIds?: readonly string[],
       choice?: TurnModelChoice,
-    ): Promise<void> {
+    ): Promise<PostedSenderNotes | null> {
       const body: Record<string, unknown> = { invoke_agent: false, ...addressing, infer_text_mentions: false, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
       try {
-        await request("POST", `${room(spaceId, roomId)}/messages`, body);
+        const data = await request("POST", `${room(spaceId, roomId)}/messages`, body);
+        return readPostedNotes(data, { ...addressing, kind: "space" });
       } catch (error) {
         if (error instanceof ApiError && error.status === 422) {
           throw new ApiError("http", "Update Metro Server to send Space messages with safe addressing. Your draft was kept and was not sent.", 422);
@@ -871,12 +874,13 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<void> {
+    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<PostedSenderNotes | null> {
       // Text sends also ask the agent on servers that require the legacy flag.
       const body: Record<string, unknown> = { text, invoke_agent: true, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
-      await request("POST", "/v1/chat/messages", body);
+      const data = await request("POST", "/v1/chat/messages", body);
+      return readPostedNotes(data, { kind: "chat", text });
     },
 
     async saveChatNote(text: string, assetIds?: readonly string[]): Promise<void> {
@@ -1226,6 +1230,11 @@ function isRun(v: unknown): v is { id: string | number; space_id: string | numbe
   );
 }
 
+// Leave legacy rendering alone. Private receipt corroboration additionally
+// requires canonical raw identity, time, and addressing, before coercion.
+const canonicalMessageRows = new WeakSet<RoomEvent>();
+export const isCanonicalMessageRow = (event: RoomEvent) => canonicalMessageRows.has(event);
+
 function toEvent(v: RoomEvent): RoomEvent {
   const raw = v as unknown as Record<string, unknown>;
   const event: RoomEvent = { id: v.id, kind: v.kind, actor: v.actor, text: v.text };
@@ -1263,6 +1272,8 @@ function toEvent(v: RoomEvent): RoomEvent {
   if (isId(raw.actor_id) && String(raw.actor_id).trim()) event.actorId = String(raw.actor_id);
   const createdAt = toCreatedAt(raw.created_at);
   if (createdAt) event.createdAt = createdAt;
+  if (event.kind === "message" && canonicalStableId(raw.actor_id) && canonicalEventTime(raw.created_at) &&
+    canonicalAddressing(raw.audience, raw.mentions)) canonicalMessageRows.add(event);
   const attachments = toAttachments(raw.attachments);
   if (attachments.length) event.attachments = attachments;
   return event;

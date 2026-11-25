@@ -34,7 +34,7 @@
 //   here with onTransientClear / onSessionEnd).
 
 import { batch, computed, effect, signal, Storage, untracked } from "nsh";
-import { ApiError, createClient, parseReaction } from "./api/client";
+import { ApiError, createClient, isCanonicalMessageRow, parseReaction } from "./api/client";
 import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl, serverHost } from "./api/serverUrl";
@@ -44,6 +44,8 @@ import {
 } from "./features/mentions/draft";
 import type { MentionDirectory, MentionDraft, MentionRecipient, MentionSelection, MentionSend } from "./features/mentions/draft";
 import { confirmChangedAutomaticMentions } from "./features/mentions/preflight";
+import type { PostedSenderNotes, SenderNoticeDetails } from "./features/senderNotices/response";
+import { renderedRecipientsKey } from "./features/senderNotices/response";
 
 export type { Member, Mention, Room, RoomEvent, Run, Space };
 
@@ -144,7 +146,7 @@ export const activeReactions = computed(() => reactionsByScope()[activeScope()] 
 export const reactionPending = signal<string | null>(null);
 
 export const view = signal<View>("room");
-/** Set when the server has no personal Chat for this user (403/404); polling it stops. */
+/** Why personal Chat is unavailable, until a newer check can read or post to it. */
 export const chatUnavailable = signal<string | null>(null);
 
 // Runs and dispatch (meta controls in the Chat)
@@ -223,6 +225,7 @@ export const memberBusy = signal<string | null>(null);
 // ------------------------------------------------------------------ session internals
 
 let client: Client | null = null;
+let noticeSenderId: string | null = null; // canonical raw /me id, not a legacy coercion
 let abort: AbortController | null = null;
 let session = 0;
 let navigationGeneration = 0;
@@ -239,8 +242,7 @@ const pollAgain = new Set<string>();
 const lastRoomBySpace = new Map<string, string>();
 const spaceEpoch = new Map<string, number>();
 
-// Request order, not response order. Keep these three primitives on the
-// same clock as the room-level access checks when those are integrated.
+// Order Space membership, room access and Chat availability by request start.
 let accessSequence = 0;
 const verifiedAccess = new Map<string, number>();
 const nextAccessRequest = () => ++accessSequence;
@@ -252,6 +254,11 @@ const pendingSpaceReads = new Map<string, Map<number, Promise<void>>>();
 // A complete list observes every Space, including ids unknown at dispatch.
 const pendingMembershipReads = new Map<number, Promise<void>>();
 const spaceDenials = new Map<string, number>();
+// Keep tombstones after cache eviction and rejoin to fence older replies.
+const deniedRoomAccess = new Map<string, number>();
+const accessProbes = new Map<string, { request: number }>();
+let chatAvailabilityRequest = 0;
+let chatProbeAfter = 0;
 const roomListRequests = new Map<string, number>();
 // A newer complete snapshot also supersedes older discoveries of unknown ids.
 let lastMembershipRequest = 0;
@@ -273,6 +280,23 @@ function currentSpaceEvidence(sid: string, request: number) {
   return !newerAccess(scopeKey(sid, ""), request) && !newerSpaceDenial(sid, request);
 }
 
+const roomDeniedAtOrAfter = (key: string, request: number) => (deniedRoomAccess.get(key) ?? 0) >= request;
+
+function verifyRoomAccess(sid: string, rid: string, request: number) {
+  if (newerSpaceDenial(sid, request)) return;
+  verifyAccess(scopeKey(sid, ""), request);
+  const key = scopeKey(sid, rid);
+  if (!roomDeniedAtOrAfter(key, request)) verifyAccess(key, request);
+}
+
+function keepNewerRooms(sid: string, list: readonly Room[], request: number, keepActiveOtherThan?: string): Room[] {
+  const listed = new Set(list.map(r => r.id));
+  return [...list, ...roomsOf(sid).filter(r => !listed.has(r.id) &&
+    (newerAccess(scopeKey(sid, r.id), request) ||
+      (keepActiveOtherThan !== undefined && r.id !== keepActiveOtherThan &&
+        activeSpaceId() === sid && activeRoomId() === r.id)))];
+}
+
 /** All membership and room-list reads are evidence for the exact Space. */
 function beginSpaceRead(sid: string, request = nextAccessRequest()) {
   const key = scopeKey(sid, "");
@@ -287,19 +311,24 @@ function beginSpaceRead(sid: string, request = nextAccessRequest()) {
   }
   return {
     valid,
+    request,
     finish,
-    finishRooms() {
+    finishRooms(list: readonly Room[]) {
       finish(true);
-      if (!valid() || newerSpaceDenial(sid, request) || (roomListRequests.get(sid) ?? 0) > request) return false;
+      if (!valid() || newerSpaceDenial(sid, request) || (roomListRequests.get(sid) ?? 0) > request) return;
       roomListRequests.set(sid, request);
-      return true;
+      return list.filter(room => {
+        if (roomDeniedAtOrAfter(scopeKey(sid, room.id), request)) return false;
+        verifyRoomAccess(sid, room.id, request);
+        return true;
+      });
     },
-    publishRooms(list: readonly Room[]) {
-      roomsBySpace.set({ ...roomsBySpace(), [sid]: list });
+    publishRooms(list: readonly Room[], keepActiveOtherThan?: string) {
+      roomsBySpace.set({ ...roomsBySpace(), [sid]: keepNewerRooms(sid, list, request, keepActiveOtherThan) });
     },
     async deny(apply: () => void) {
       finish();
-      if (!valid() || !currentSpaceEvidence(sid, request)) return false;
+      if (!valid() || !currentSpaceEvidence(sid, request) || spaceDenials.get(sid) === request) return false;
       spaceDenials.set(sid, request);
       while (valid() && !newerAccess(key, request) && spaceDenials.get(sid) === request) {
         const newer = [...(pendingSpaceReads.get(sid) ?? []), ...pendingMembershipReads].find(([id]) => id > request);
@@ -315,8 +344,15 @@ function beginSpaceRead(sid: string, request = nextAccessRequest()) {
   };
 }
 
-function isSpaceDenial(error: unknown) {
-  return error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found");
+// A successful but older POST may retire its draft, not undo a newer denial.
+function observeChatAvailability(request: number, problem: string | null) {
+  if (request < chatAvailabilityRequest) return;
+  chatAvailabilityRequest = request;
+  chatProbeAfter = problem ? Date.now() + LISTS_REFRESH_MS : 0;
+  batch(() => {
+    if (problem) forgetSenderNotices(CHAT);
+    chatUnavailable.set(problem);
+  });
 }
 
 // Other state modules (src/settings.ts) hook into the session's lifecycle
@@ -430,6 +466,7 @@ function beginSession(baseUrl: string, token: string) {
 
 /** Publish the verified identity, membership and destination together. */
 function publishSession(baseUrl: string, token: string, who: Me, list: Space[], remembered: string | null, remember?: boolean) {
+  noticeSenderId = who.canonicalId;
   return batch(() => {
     me.set(who.id);
     orgAdmin.set(who.isOrgAdmin);
@@ -567,15 +604,16 @@ export async function openExactRoom(spaceId: string, roomId: string, stillHere: 
   if (!c || switchingSpace() || !roomId || !spaces().some(s => s.id === spaceId)) return false;
   const generation = navigationGeneration;
   const read = beginSpaceRead(spaceId);
-  let list: Room[];
+  let result: Room[];
   try {
-    list = await c.listRooms(spaceId);
+    result = await c.listRooms(spaceId);
   } catch (error) {
-    if (isSpaceDenial(error)) void read.deny(() => dropLostSpace(spaceId));
+    if (isAccessDenial(error)) void read.deny(() => dropLostSpace(spaceId));
     else read.finish();
     throw error;
   }
-  if (!read.finishRooms() || switchingSpace() || generation !== navigationGeneration || !stillHere() || !list.some(r => r.id === roomId)) return false;
+  const list = read.finishRooms(result);
+  if (switchingSpace() || generation !== navigationGeneration || !stillHere() || !list?.some(r => r.id === roomId)) return false;
   navigationGeneration++;
   lastRoomBySpace.set(spaceId, roomId);
   batch(() => {
@@ -751,7 +789,7 @@ export async function createSpace(nameInput: string, options?: CreateSpaceOption
       // The newer list may have been taken before the POST committed, or
       // after the Space disappeared. Only a fresh read can distinguish them.
       // A failed check doesn't undo the accepted POST or make it safe to retry.
-      const checked = await refreshMembership(c, captureForm).catch(error => {
+      const checked = await refreshMembership(c, { beforePublish: captureForm }).catch(error => {
         if (ok() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
         return undefined;
       });
@@ -821,11 +859,10 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
   });
   try {
     if (read) {
-      const list = await c.listRooms(spaceId);
-      const publish = read.finishRooms();
+      const list = read.finishRooms(await c.listRooms(spaceId));
       if (!ok() || navigation !== navigationGeneration) return;
       batch(() => {
-        if (publish) read.publishRooms(list);
+        if (list) read.publishRooms(list);
         if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, roomsBySpace()[spaceId] ?? EMPTY_ROOMS));
       });
     }
@@ -853,7 +890,7 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
         actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
       });
     };
-    if (read && isSpaceDenial(error)) {
+    if (read && isAccessDenial(error)) {
       if (await read.deny(() => failed(true))) return;
     } else {
       read?.finish();
@@ -882,11 +919,11 @@ async function ensureRooms(spaceId: string): Promise<readonly Room[]> {
   if (!c) return EMPTY_ROOMS;
   const read = beginSpaceRead(spaceId);
   try {
-    const list = await c.listRooms(spaceId);
-    if (read.finishRooms()) read.publishRooms(list);
+    const list = read.finishRooms(await c.listRooms(spaceId));
+    if (list) read.publishRooms(list);
     return read.valid() ? roomsBySpace()[spaceId] ?? EMPTY_ROOMS : EMPTY_ROOMS;
   } catch (error) {
-    if (read.valid() && isSpaceDenial(error)) {
+    if (read.valid() && isAccessDenial(error)) {
       const dropped = await read.deny(() => dropLostSpace(spaceId));
       if (!dropped && read.valid() && roomsBySpace()[spaceId]) return roomsBySpace()[spaceId]!;
     } else {
@@ -918,6 +955,12 @@ function purgeSpace(spaceId: string, unlist: boolean) {
   for (const key of [...cursors.keys()]) if (key.startsWith(prefix)) cursors.delete(key);
   for (const key of [...inflight.keys()]) if (key.startsWith(prefix)) inflight.delete(key);
   for (const key of [...pollAgain]) if (key.startsWith(prefix)) pollAgain.delete(key);
+  for (const key of noticeEpochs.keys()) if (key.startsWith(prefix)) noticeEpochs.delete(key);
+  for (const key of verifiedAccess.keys()) if (key.startsWith(prefix)) verifiedAccess.delete(key);
+  for (const key of accessProbes.keys()) if (key.startsWith(prefix)) accessProbes.delete(key);
+  for (const [key, receipt] of pendingSenderNotices) {
+    if (receipt.destination.kind === "room" && receipt.destination.spaceId === spaceId) pendingSenderNotices.delete(key);
+  }
   lastRoomBySpace.delete(spaceId);
   const strip = <T,>(record: Record<string, T>) => {
     const next: Record<string, T> = {};
@@ -931,6 +974,7 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     eventsByScope.set(strip(eventsByScope()));
     loadedScopes.set(strip(loadedScopes()));
     reactionsByScope.set(strip(reactionsByScope()));
+    senderNotices.set(strip(senderNotices()));
     if (unlist) spaces.set(spaces().filter((s) => s.id !== spaceId));
     if (dispatchTarget()?.spaceId === spaceId) dispatchTarget.set(null);
     const { [spaceId]: _members, ...restMembers } = membersBySpace();
@@ -956,6 +1000,7 @@ function dropLostSpace(spaceId: string, show = true) {
     activeRoomId.set(null);
     if (basePlace() === "space") {
       view.set("room");
+      actionError.set(null);
       notice.set(show && name ? `You no longer have access to ${name}.` : null);
       basePlace.set("chat");
       if (!ticking) kick();
@@ -1012,8 +1057,11 @@ export async function createRoom(nameInput: string): Promise<boolean> {
     actionError.set(null);
   });
   try {
+    const request = nextAccessRequest();
     const room = await c.createRoom(sid, name);
     if (!ok()) return false;
+    if (roomDeniedAtOrAfter(scopeKey(sid, room.id), request)) return true;
+    verifyRoomAccess(sid, room.id, request);
     const list = roomsBySpace()[sid] ?? EMPTY_ROOMS;
     batch(() => {
       if (!list.some((r) => r.id === room.id)) roomsBySpace.set({ ...roomsBySpace(), [sid]: [...list, room] });
@@ -1037,6 +1085,141 @@ export async function createRoom(nameInput: string): Promise<boolean> {
  * library) or a Space's room or thread (files to that Space's library).
  */
 export type SendDestination = { kind: "chat" } | { kind: "room"; spaceId: string; roomId: string };
+
+// Only the initiating POST writes here. Not an event cache: it is never
+// merged into a transcript, persisted, or used for model/search history.
+export type SenderNotice = SenderNoticeDetails & { destination: SendDestination };
+type ConfirmedSenderNotice = { note: SenderNotice; row: RoomEvent };
+type PendingSenderNotice = PostedSenderNotes & { destination: SendDestination };
+const senderNotices = signal<Record<string, ReadonlyMap<number, ConfirmedSenderNotice | null>>>({});
+const pendingSenderNotices = new Map<string, PendingSenderNotice>();
+// FIFO across the session: only uncorroborated receipts hold a copy of the
+// text (at most 16k code units each), and an idle room can't block a new one.
+const MAX_PENDING_SENDER_NOTICES = 32;
+const noticeEpochs = new Map<string, number>();
+const noticeEpoch = (scope: string) => noticeEpochs.get(scope) ?? 0;
+const destinationScope = (to: SendDestination) => to.kind === "chat" ? CHAT : scopeKey(to.spaceId, to.roomId);
+const pendingKey = (scope: string, id: number) => JSON.stringify([scope, id]);
+
+function noticeDestinationVisible(to: SendDestination) {
+  return to.kind === "chat" ? !chatUnavailable() :
+    spaces().some(s => s.id === to.spaceId) && !!roomsBySpace()[to.spaceId]?.some(r => r.id === to.roomId);
+}
+
+function forgetSenderNotices(scope: string) {
+  noticeEpochs.set(scope, noticeEpoch(scope) + 1);
+  for (const [key, receipt] of pendingSenderNotices) {
+    if (destinationScope(receipt.destination) === scope) pendingSenderNotices.delete(key);
+  }
+  const { [scope]: removed, ...rest } = senderNotices();
+  if (removed) senderNotices.set(rest);
+}
+
+/** The POST belongs to this principal and destination even after navigation. */
+function captureSendOrigin(c: Client, to: SendDestination) {
+  const scope = destinationScope(to);
+  const sender = me();
+  const privateSender = noticeSenderId;
+  const valid = guard(to.kind === "room" ? to.spaceId : undefined);
+  const sameAccount = () => !!sender && me() === sender && client === c && valid();
+  const canRetireDraft = () => sameAccount() && (to.kind === "chat" || noticeDestinationVisible(to));
+  const request = nextAccessRequest();
+  const epoch = noticeEpoch(scope);
+  const after = cursors.get(scope) ?? 0;
+  const wasVisible = noticeDestinationVisible(to);
+  const current = () => sameAccount() && noticeEpoch(scope) === epoch;
+  return {
+    current,
+    canRetireDraft,
+    acknowledge(posted: PostedSenderNotes | null): boolean {
+      if (!sameAccount()) return false;
+      if (to.kind === "room" && noticeDestinationVisible(to)) verifyRoomAccess(to.spaceId, to.roomId, request);
+      else if (to.kind === "chat") {
+        verifyAccess(CHAT, request);
+        observeChatAvailability(request, null);
+      }
+      if (!posted || posted.senderId !== privateSender || posted.eventId <= after ||
+        !wasVisible || !current() || !noticeDestinationVisible(to)) return false;
+      const notes = senderNotices()[scope];
+      const key = pendingKey(scope, posted.eventId);
+      if (notes?.has(posted.eventId) || pendingSenderNotices.has(key)) return false;
+      const receipt = { ...posted, destination: to };
+      if (posted.eventId <= (cursors.get(scope) ?? 0)) {
+        const confirmed = corroborateSenderNotice(receipt, eventsByScope()[scope] ?? EMPTY_EVENTS);
+        if (!confirmed) return false;
+        senderNotices.set({ ...senderNotices(), [scope]: new Map(notes).set(posted.eventId, confirmed) });
+      } else {
+        if (pendingSenderNotices.size >= MAX_PENDING_SENDER_NOTICES) {
+          pendingSenderNotices.delete(pendingSenderNotices.keys().next().value!);
+        }
+        pendingSenderNotices.set(key, receipt);
+      }
+      return true;
+    },
+    deny() {
+      if (!current() || newerAccess(scope, request)) return;
+      forgetSenderNotices(scope);
+      if (to.kind === "room") void recheckRoomAccess(c, to, sameAccount, false);
+    },
+  };
+}
+
+function corroborateSenderNotice(receipt: PendingSenderNotice, rows: readonly RoomEvent[]): ConfirmedSenderNotice | null {
+  const { text, recipientsKey, ...note } = receipt;
+  const row = rows.find(e => e.id === note.eventId);
+  return row && row.actorId === note.senderId && isCanonicalMessageRow(row) &&
+    row.createdAt === note.createdAt && row.text === text &&
+    renderedRecipientsKey(row.mentions) === recipientsKey ? { note, row } : null;
+}
+
+/** Resolve POST evidence once, when polling reaches the id. Polls create no receipts. */
+function reconcileSenderNotices(scope: string, through: number, rows: readonly RoomEvent[]) {
+  const saved = senderNotices()[scope];
+  let next: Map<number, ConfirmedSenderNotice | null> | undefined;
+  if (saved && rows.length) {
+    for (const id of saved.keys()) if (id < rows[0]!.id) (next ??= new Map(saved)).delete(id);
+  }
+  for (const [key, receipt] of pendingSenderNotices) {
+    if (receipt.eventId > through || destinationScope(receipt.destination) !== scope) continue;
+    pendingSenderNotices.delete(key);
+    const confirmed = corroborateSenderNotice(receipt, rows);
+    if (confirmed) (next ??= new Map(saved)).set(receipt.eventId, confirmed);
+  }
+  if (next) senderNotices.set({ ...senderNotices(), [scope]: next });
+}
+
+export function activeSenderNotice(event: RoomEvent): SenderNotice | null {
+  if (event.kind !== "message" || !event.actorId || event.actorId !== me()) return null;
+  if (basePlace() !== "chat" && (basePlace() !== "space" || view() !== "room" || switchingSpace())) return null;
+  const entry = senderNotices()[activeScope()]?.get(event.id);
+  if (entry?.row !== event || !noticeDestinationVisible(entry.note.destination) || !activeEvents().includes(event)) return null;
+  return entry.note;
+}
+
+/** A delayed UI callback must not act on a notice from a place already left. */
+export function senderNoticeIsCurrent(note: SenderNotice) {
+  const scope = destinationScope(note.destination);
+  const entry = senderNotices()[scope]?.get(note.eventId);
+  return me() === note.senderId && !settingsOpen() && scope === activeScope() &&
+    (note.destination.kind === "chat" ? basePlace() === "chat" : inSpaceComposer()) &&
+    noticeDestinationVisible(note.destination) && entry?.note === note && !!eventsByScope()[scope]?.includes(entry.row);
+}
+
+export function dismissSenderNotice(note: SenderNotice) {
+  if (!senderNoticeIsCurrent(note)) return;
+  const scope = destinationScope(note.destination);
+  const notes = new Map(senderNotices()[scope]);
+  notes.set(note.eventId, null);
+  senderNotices.set({ ...senderNotices(), [scope]: notes });
+}
+
+/** Prepare a bound generic mention only in an empty Space draft. */
+export function prepareSenderNoticeDraft(note: SenderNotice): number | null {
+  if (note.addressing?.kind !== "classification_failed" || note.destination.kind !== "room" ||
+    !senderNoticeIsCurrent(note) || sending()) return null;
+  if (draft() || attachments?.pending(activeScope())) return draft().length; // focus the existing draft
+  return addMention({ kind: "agent" });
+}
 
 /**
  * Files staged in the composer, uploaded on submission. Registered by
@@ -1089,7 +1272,8 @@ async function sendDraft(intent: DraftSend): Promise<void> {
   if (saveNote && !chat) return;
   const retryAction = saveNote ? "Save note" : "Send";
   const { invokeAgent, choice: pickModel, agentId } = saveNote ? { invokeAgent: false } : intent;
-  const text = draft().trim();
+  const submittedText = draft();
+  const text = submittedText.trim();
   const sid = activeSpaceId();
   const rid = activeRoomId();
   const c = client;
@@ -1109,7 +1293,8 @@ async function sendDraft(intent: DraftSend): Promise<void> {
   const ok = chat ? sameSession : guard(sid!);
   const navigation = navigationGeneration;
   // Feedback only where it happened: never in a place the user moved to.
-  const here = () => ok() && activeScope() === scope;
+  const here = () => ok() && navigation === navigationGeneration && activeScope() === scope &&
+    (chat ? basePlace() === "chat" : inSpaceComposer());
   let address: SpaceMessageBody | null = null;
   let submittedDraft: MentionDraft | undefined;
   if (!chat) {
@@ -1148,7 +1333,8 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     actionError.set(null);
     notice.set(null);
   });
-  const mayPost = () => here() && navigation === navigationGeneration && inSpaceComposer() && mentionDraft() === submittedDraft;
+  const mayPost = () => here() && mentionDraft() === submittedDraft;
+  let origin: ReturnType<typeof captureSendOrigin> | undefined;
   try {
     let ids: string[] = [];
     let keys: string[] = [];
@@ -1162,9 +1348,13 @@ async function sendDraft(intent: DraftSend): Promise<void> {
       ids = up.ids;
       keys = up.keys;
     }
-    if (saveNote) await c.saveChatNote(text, ids);
-    else if (chat) await c.sendChatMessage(text, ids, selected.choice);
-    else {
+    if (chat) {
+      origin = captureSendOrigin(c, to);
+      if (saveNote) {
+        await c.saveChatNote(text, ids);
+        origin.acknowledge(null);
+      } else origin.acknowledge(await c.sendChatMessage(text, ids, selected.choice));
+    } else {
       if (!mayPost()) {
         if (here()) actionError.set("The draft or destination changed. Nothing was sent; review the draft and send again.");
         return;
@@ -1187,32 +1377,37 @@ async function sendDraft(intent: DraftSend): Promise<void> {
           : "The draft or destination changed. Nothing was sent; review the draft and send again.");
         return;
       }
-      await c.sendMessage(sid!, rid!, body, ids, selected.choice);
+      origin = captureSendOrigin(c, to);
+      origin.acknowledge(await c.sendMessage(sid!, rid!, body, ids, selected.choice));
     }
-    if (!ok()) return;
+    // Accepted files are identified by immutable staging keys, not by the
+    // current room epoch. Never leave them staged for a duplicate send after
+    // rejoin, and never touch a replacement account's staging.
+    if (!sameSession()) return;
     if (keys.length) attachments?.sent(scope, keys, to);
-    if (activeScope() === scope && (chat ? draft().trim() === text : mentionDraft() === submittedDraft)) {
+    if (!origin.canRetireDraft()) return;
+    if (activeScope() === scope && (chat ? draft() === submittedText : mentionDraft() === submittedDraft)) {
       // unless the user typed something new meanwhile
       batch(() => {
         if (chat) draft.set("");
         else writeMentionDraft(EMPTY_MENTION_DRAFT, null);
       });
-    } else if (chat ? stashedDrafts()[scope]?.text.trim() === text : stashedDrafts()[scope]?.mention === submittedDraft) {
+    } else if (chat ? stashedDrafts()[scope]?.text === submittedText : stashedDrafts()[scope]?.mention === submittedDraft) {
       // Sent from a place the user has since left: its stashed draft is gone too.
       const { [scope]: _sent, ...rest } = stashedDrafts();
       stashedDrafts.set(rest);
     }
-    if (chat) {
-      if (chatUnavailable()) chatUnavailable.set(null);
-      lastRunsRefresh = 0;
-    }
+    if (chat) lastRunsRefresh = 0;
     kick();
   } catch (error) {
-    if (!here()) {
-      if (!chat && ok() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") {
+      disconnect(error.message);
       return;
     }
-    handleActionError(error, saveNote ? "Could not save the note" : invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", chat ? undefined : sid!);
+    if (origin && !origin.current()) return;
+    if (origin && isAccessDenial(error)) origin.deny();
+    if (!here()) return;
+    handleActionError(error, saveNote ? "Could not save the note" : invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", origin || chat ? undefined : sid!);
     const shown = actionError();
     if (files && shown) actionError.set(chat
       ? `${shown} Its files are already in the Library; ${retryAction} again won't upload them twice.`
@@ -1254,33 +1449,52 @@ export async function setDispatchSpace(spaceId: string, roomId?: string): Promis
   const c = client;
   if (!c || !spaces().some((s) => s.id === spaceId)) return;
   const ok = guard(spaceId);
+  const navigation = navigationGeneration;
   const pending = { spaceId, roomId: null };
-  const current = () => ok() && dispatchTarget() === pending;
+  const here = () => basePlace() === "chat" && navigation === navigationGeneration && dispatchTarget() === pending;
+  const sameSession = guard();
   dispatchError.set(null);
   dispatchNotice.set(null);
   dispatchTarget.set(pending);
-  // Follow-ups need exact fresh evidence even if we already know the lobby.
   const read = roomId === undefined ? undefined : beginSpaceRead(spaceId);
+  const unverified = "Couldn't verify that destination. Follow up again or choose another room.";
   try {
-    const list = read ? await c.listRooms(spaceId) : await ensureRooms(spaceId);
-    const publish = read?.finishRooms() ?? true;
-    if (!current()) return;
-    if (!read) {
-      dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
-    } else if (publish) {
-      read.publishRooms(list);
-      if (roomId !== undefined && list.some(r => r.id === roomId)) {
-        dispatchTarget.set({ spaceId, roomId });
-        return;
-      }
-      dispatchError.set("That room or thread is no longer available. Choose another destination.");
-    } else {
-      dispatchError.set("Couldn't verify that room or thread. Choose a destination again.");
+    if (!read || roomId === undefined) {
+      const list = await ensureRooms(spaceId);
+      if (ok() && here()) dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
+      return;
     }
+    // Verify the exact destination from this read, never from a cached fallback.
+    const list = read.finishRooms(await c.listRooms(spaceId));
+    if (!ok()) return;
+    const key = scopeKey(spaceId, roomId);
+    const found = list?.some(r => r.id === roomId);
+    const stale = !list || (!found && (roomDeniedAtOrAfter(key, read.request) || newerAccess(key, read.request)));
+    batch(() => {
+      if (list && !stale) {
+        // An unrelated active room is left for its own poll to confirm.
+        read.publishRooms(list, roomId);
+        if (!found) dropLostRoom(spaceId, roomId, read.request, false);
+      }
+      if (found && here()) dispatchTarget.set({ spaceId, roomId });
+      else if (!found && here()) dispatchError.set(stale ? unverified
+        : "That room or thread is no longer available. Choose another destination.");
+    });
   } catch (error) {
-    if (read && isSpaceDenial(error)) await read.deny(() => dropLostSpace(spaceId));
-    else read?.finish();
-    if (current()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") {
+      read?.finish();
+      disconnect(error.message);
+    } else if (read && isAccessDenial(error)) {
+      const applied = await read.deny(() => batch(() => {
+        const show = here();
+        dropLostSpace(spaceId, false);
+        if (show) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+      }));
+      if (!applied && ok() && here()) dispatchError.set(unverified);
+    } else {
+      read?.finish();
+      if (ok() && here()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+    }
   }
 }
 
@@ -1304,7 +1518,10 @@ export async function sendDispatch(): Promise<void> {
     dispatchError.set("Choose a Space and room you belong to first.");
     return;
   }
-  const ok = guard(target.spaceId);
+  const sameSession = guard();
+  const navigation = navigationGeneration;
+  const here = () => basePlace() === "chat" && navigation === navigationGeneration && dispatchTarget() === target;
+  const origin = captureSendOrigin(c, { kind: "room", spaceId: target.spaceId, roomId: target.roomId });
   batch(() => {
     dispatching.set(true);
     dispatchError.set(null);
@@ -1313,21 +1530,21 @@ export async function sendDispatch(): Promise<void> {
   try {
     // Dispatch is an explicit request to the chosen Space's agent, not a
     // mention composer. Its text cannot add recipients implicitly.
-    await c.sendMessage(target.spaceId, target.roomId, { text, invoke_agent: true });
-    if (!ok()) return;
-    if (dispatchDraft() === text) dispatchDraft.set("");
-    dispatchNotice.set(`Sent to the agent in ${space.name} › #${room.name}.`);
+    const hadNotice = origin.acknowledge(await c.sendMessage(target.spaceId, target.roomId, { text, invoke_agent: true }));
+    if (!origin.canRetireDraft()) return;
+    if (dispatchTarget() === target && dispatchDraft() === text) dispatchDraft.set("");
+    if (here()) dispatchNotice.set(hadNotice ? `Posted in ${space.name} › #${room.name}.` :
+      `Sent to the agent in ${space.name} › #${room.name}.`);
     lastRunsRefresh = 0;
     kick();
   } catch (error) {
-    if (!ok()) return;
-    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
-    else {
-      dispatchError.set(describe(error, "Could not send the task"));
-      if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) void lostAccess(target.spaceId, null);
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else if (origin.current()) {
+      if (isAccessDenial(error)) origin.deny();
+      if (here() && !isAborted(error)) dispatchError.set(describe(error, "Could not send the task"));
     }
   } finally {
-    if (ok()) dispatching.set(false);
+    if (sameSession()) dispatching.set(false);
   }
 }
 
@@ -1901,6 +2118,7 @@ function endSession() {
   abort?.abort();
   abort = null;
   client = null;
+  noticeSenderId = null;
   if (timer !== undefined) clearTimeout(timer);
   timer = undefined;
   ticking = false;
@@ -1920,6 +2138,12 @@ function endSession() {
   roomListRequests.clear();
   verifiedAccess.clear();
   lastMembershipRequest = 0;
+  noticeEpochs.clear();
+  pendingSenderNotices.clear();
+  deniedRoomAccess.clear();
+  accessProbes.clear();
+  chatAvailabilityRequest = 0;
+  chatProbeAfter = 0;
   memberRequests.clear();
   memberVersions.clear();
   batch(() => {
@@ -1945,6 +2169,7 @@ function endSession() {
     roomsBySpace.set({});
     activeRoomId.set(null);
     eventsByScope.set({});
+    senderNotices.set({});
     loadedScopes.set({});
     reactionsByScope.set({});
     reactionPending.set(null);
@@ -2000,7 +2225,7 @@ async function tick(sess: number) {
     if (Date.now() - lastListsRefresh >= LISTS_REFRESH_MS) await refreshLists();
     if (sess !== session) return;
     if (basePlace() === "chat") {
-      if (!chatUnavailable()) await pollChat();
+      if (Date.now() >= chatProbeAfter) await pollChat();
       if (sess === session && Date.now() - lastRunsRefresh >= RUNS_REFRESH_MS) await refreshRuns();
     } else if (basePlace() === "space") {
       const sid = activeSpaceId();
@@ -2029,14 +2254,84 @@ async function handleLoopError(error: unknown): Promise<number | null> {
     disconnect(error.message);
     return null;
   }
-  if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found") && basePlace() === "space") {
-    await lostAccess(activeSpaceId(), activeRoomId());
-    return 0;
-  }
   failures++;
   const retryInMs = Math.min(MAX_BACKOFF_MS, 1000 * 2 ** (failures - 1));
   status.set({ phase: "retrying", attempt: failures, retryInMs, message: describe(error, "Connection problem") });
   return retryInMs;
+}
+
+/** A POST or poll denial invalidates the originating room's notes now.
+ * Only a scoped, still-current access check may drop its public state. */
+async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind: "room" }>, valid: () => boolean, show: boolean) {
+  const { spaceId, roomId } = to;
+  const scope = scopeKey(spaceId, roomId);
+  const spaceScope = scopeKey(spaceId, "");
+  const inProgress = accessProbes.get(scope);
+  // A stream of denials must not keep replacing its own slow probe. A
+  // denial after fresh positive evidence, however, needs a fresh check.
+  if (inProgress && !newerAccess(scope, inProgress.request) && !newerAccess(spaceScope, inProgress.request)) return;
+  const sameSession = guard();
+  const probe = { request: 0 };
+  accessProbes.set(scope, probe);
+  const current = () => valid() && accessProbes.get(scope) === probe;
+  try {
+    const spaceRequest = await refreshMembership(c, {
+      started: request => { probe.request = request; },
+      showLoss: sid => sid !== spaceId || show,
+      keepPollCadence: true,
+    });
+    if (!current() || spaceRequest === undefined || !spaces().some(s => s.id === spaceId) ||
+      (spaceDenials.get(spaceId) ?? 0) >= (verifiedAccess.get(spaceScope) ?? 0)) return;
+    // The room read is a new observation. Access verified while the Space
+    // list was in flight does not outrank a denial on this later leg.
+    const read = beginSpaceRead(spaceId);
+    const roomRequest = probe.request = read.request;
+    try {
+      const list = await c.listRooms(spaceId);
+      read.finish(current());
+      if (!current() || newerSpaceDenial(spaceId, roomRequest)) return;
+      if (list.some(r => r.id === roomId)) verifyRoomAccess(spaceId, roomId, roomRequest);
+      else dropLostRoom(spaceId, roomId, roomRequest, show);
+    } catch (error) {
+      if (current() && isAccessDenial(error)) await read.deny(() => dropLostSpace(spaceId, show));
+      else {
+        read.finish();
+        throw error;
+      }
+    }
+  } catch (error) {
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+  } finally {
+    if (accessProbes.get(scope) === probe) accessProbes.delete(scope);
+  }
+}
+
+function recordRoomDenial(key: string, request: number) {
+  if (roomDeniedAtOrAfter(key, request) || newerAccess(key, request)) return false;
+  deniedRoomAccess.set(key, request);
+  return true;
+}
+
+function dropLostRoom(spaceId: string, roomId: string, request: number, show: boolean) {
+  const key = scopeKey(spaceId, roomId);
+  if (!recordRoomDenial(key, request)) return;
+  cursors.delete(key);
+  if (lastRoomBySpace.get(spaceId) === roomId) lastRoomBySpace.delete(spaceId);
+  batch(() => {
+    forgetSenderNotices(key);
+    roomsBySpace.set({ ...roomsBySpace(), [spaceId]: roomsOf(spaceId).filter(r => r.id !== roomId) });
+    const target = dispatchTarget();
+    if (target?.spaceId === spaceId && target.roomId === roomId) {
+      dispatchTarget.set({ spaceId, roomId: null });
+    }
+    const { [key]: _e, ...events } = eventsByScope();
+    eventsByScope.set(events);
+    if (activeSpaceId() === spaceId && activeRoomId() === roomId) {
+      activeRoomId.set(pickRoom(spaceId, roomsOf(spaceId)));
+      if (show && basePlace() === "space") notice.set("That room is no longer available.");
+      else if (basePlace() === "space") actionError.set(null);
+    }
+  });
 }
 
 /**
@@ -2044,28 +2339,17 @@ async function handleLoopError(error: unknown): Promise<number | null> {
  * the Space" (purge it, move on) from "this room is gone" (drop the room).
  */
 async function lostAccess(spaceId: string | null, roomId: string | null) {
-  if (!spaceId) return;
-  const before = spaces().find((s) => s.id === spaceId);
+  const c = client;
+  if (!spaceId || !c) return;
+  if (roomId) {
+    forgetSenderNotices(scopeKey(spaceId, roomId));
+    await recheckRoomAccess(c, { kind: "room", spaceId, roomId }, guard(spaceId), true);
+    return;
+  }
   try {
     await refreshLists(true);
   } catch {
     /* the next tick deals with it */
-  }
-  if (spaces().some((s) => s.id === spaceId)) {
-    if (!roomId) return;
-    const key = scopeKey(spaceId, roomId);
-    cursors.delete(key);
-    batch(() => {
-      roomsBySpace.set({ ...roomsBySpace(), [spaceId]: (roomsBySpace()[spaceId] ?? EMPTY_ROOMS).filter((r) => r.id !== roomId) });
-      const { [key]: _e, ...events } = eventsByScope();
-      eventsByScope.set(events);
-      if (activeSpaceId() === spaceId && activeRoomId() === roomId) {
-        activeRoomId.set(pickRoom(spaceId, roomsBySpace()[spaceId] ?? EMPTY_ROOMS));
-        notice.set("That room is no longer available.");
-      }
-    });
-  } else if (before) {
-    notice.set(`You no longer have access to ${before.name}.`);
   }
 }
 
@@ -2074,8 +2358,9 @@ async function lostAccess(spaceId: string | null, roomId: string | null) {
  * list, which forgets it and leaves it if it was open, then say what happened.
  */
 export async function spaceGone(spaceId: string, message: string): Promise<void> {
+  const current = guard();
   await lostAccess(spaceId, null);
-  if (!spaces().some((s) => s.id === spaceId)) notice.set(message);
+  if (current() && !spaces().some((s) => s.id === spaceId)) notice.set(message);
 }
 
 /** A Space's name changed (src/features/space): show it everywhere at once. */
@@ -2084,16 +2369,24 @@ export function spaceRenamed(spaceId: string, name: string) {
 }
 
 /** Apply just the ordered membership snapshot, with no room or event reads. */
-async function refreshMembership(c: Client, beforePublish?: () => void): Promise<number | undefined> {
+async function refreshMembership(c: Client, options?: {
+  beforePublish?: () => void;
+  started?: (request: number) => void;
+  showLoss?: (spaceId: string) => boolean;
+  keepPollCadence?: boolean;
+}): Promise<number | undefined> {
   const ok = guard();
   const request = nextAccessRequest();
   const settle = trackAccessRead(pendingMembershipReads, request);
   try {
+    options?.started?.(request);
     const list = await c.listSpaces();
     if (!ok() || request <= lastMembershipRequest) return;
-    beforePublish?.();
+    options?.beforePublish?.();
     lastMembershipRequest = request;
-    lastListsRefresh = Date.now();
+    // A denial-triggered probe is ordered like every snapshot, but must not
+    // postpone the regular scan (including rediscovery after a rejoin).
+    if (!options?.keepPollCadence) lastListsRefresh = Date.now();
     const listed = new Set(list.map(s => s.id));
     batch(() => {
       const accepted = list.filter(s => {
@@ -2103,8 +2396,11 @@ async function refreshMembership(c: Client, beforePublish?: () => void): Promise
       });
       // Include ids published by an earlier list while this one was in
       // flight. Scope evidence still outranks an older complete snapshot.
-      for (const { id } of spaces()) {
-        if (!listed.has(id)) void beginSpaceRead(id, request).deny(() => dropLostSpace(id));
+      const known = new Set([...spaces().map(s => s.id), ...spaceDenials.keys()]);
+      for (const id of known) {
+        if (!listed.has(id)) void beginSpaceRead(id, request).deny(() => {
+          if (spaces().some(s => s.id === id)) dropLostSpace(id, options?.showLoss?.(id));
+        });
       }
       const updated = new Set(accepted.map(s => s.id));
       spaces.set([...accepted, ...spaces().filter(s => !updated.has(s.id))]);
@@ -2130,7 +2426,7 @@ async function refreshLists(force = false) {
     try {
       rooms = await c.listRooms(active);
     } catch (error) {
-      if (isSpaceDenial(error)) {
+      if (isAccessDenial(error)) {
         void read.deny(() => dropLostSpace(active));
         return;
       }
@@ -2138,14 +2434,25 @@ async function refreshLists(force = false) {
       if (!read.valid()) return;
       throw error;
     }
-    if (!read.finishRooms()) return;
+    const snapshotIds = new Set(rooms.map(r => r.id));
+    const list = read.finishRooms(rooms);
+    if (!list) return;
+    const roomRequest = read.request;
     const previous = roomsBySpace()[active] ?? EMPTY_ROOMS;
     const current = activeRoomId();
     batch(() => {
-      // Keep a room we just created even if the list is a moment behind; the
-      // events poll will say 404 if it really is gone.
-      const local = current ? previous.find((r) => r.id === current && !rooms.some((x) => x.id === r.id)) : undefined;
-      read.publishRooms(local ? [...rooms, local] : rooms);
+      // Newer room access, including a successful create, wins over an
+      // older omission. An authoritative loss must also clear Dispatch.
+      read.publishRooms(list);
+      for (const r of previous) {
+        if (!snapshotIds.has(r.id)) dropLostRoom(active, r.id, roomRequest, true);
+      }
+      // An absent room can have an intermediate positive read still in
+      // flight. Advance existing tombstones even when no row is cached.
+      const prefix = scopeKey(active, "");
+      for (const key of deniedRoomAccess.keys()) {
+        if (key.startsWith(prefix) && !snapshotIds.has(key.slice(prefix.length))) recordRoomDenial(key, roomRequest);
+      }
       if (activeSpaceId() === active && (!current || !roomsBySpace()[active].some((r) => r.id === current))) {
         activeRoomId.set(pickRoom(active, roomsBySpace()[active]));
       }
@@ -2153,16 +2460,49 @@ async function refreshLists(force = false) {
   }
 }
 
-function pollRoom(spaceId: string, roomId: string): Promise<void> {
-  return poll(scopeKey(spaceId, roomId), guard(spaceId), (c, after) => c.listEvents(spaceId, roomId, after));
+async function pollRoom(spaceId: string, roomId: string): Promise<void> {
+  const scope = scopeKey(spaceId, roomId);
+  const sameSpace = guard(spaceId);
+  const epoch = noticeEpoch(scope);
+  const ok = () => sameSpace() && noticeEpoch(scope) === epoch;
+  let request = 0;
+  try {
+    await poll(scope, ok, async (c, after) => {
+      request = nextAccessRequest();
+      const events = await c.listEvents(spaceId, roomId, after);
+      if (ok()) verifyRoomAccess(spaceId, roomId, request);
+      return events;
+    });
+  } catch (error) {
+    if (!ok()) return;
+    if (isAccessDenial(error)) {
+      // Do not park the polling loop behind the recheck; fresh room access
+      // must be able to supersede a slow denial.
+      if (request && !newerAccess(scope, request)) void lostAccess(spaceId, roomId);
+    } else throw error;
+  }
 }
 
 async function pollChat(): Promise<void> {
+  const sameSession = guard();
+  const epoch = noticeEpoch(CHAT);
+  const ok = () => sameSession() && noticeEpoch(CHAT) === epoch;
+  let request = 0;
   try {
-    await poll(CHAT, guard(), (c, after) => c.listChatEvents(after));
+    await poll(CHAT, ok, async (c, after) => {
+      request = nextAccessRequest();
+      const events = await c.listChatEvents(after);
+      if (ok()) {
+        verifyAccess(CHAT, request);
+        observeChatAvailability(request, null);
+      }
+      return events;
+    });
   } catch (error) {
+    if (!ok()) return;
     if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found" || error.kind === "protocol")) {
-      chatUnavailable.set(`Your Chat isn't available on this server: ${error.message}`);
+      if (!request || newerAccess(CHAT, request)) return;
+      observeChatAvailability(request, `Your Chat isn't available on this server: ${error.message}`);
       return;
     }
     throw error;
@@ -2237,20 +2577,24 @@ function merge(key: string, events: RoomEvent[]): number {
   batch(() => {
     if (!loadedScopes()[key]) loadedScopes.set({ ...loadedScopes(), [key]: true });
     if (fresh.length === 0) return;
-    cursors.set(key, fresh[fresh.length - 1].id);
+    const through = fresh[fresh.length - 1].id;
+    cursors.set(key, through);
     if (reactions) reactionsByScope.set({ ...reactionsByScope(), [key]: reactions });
-    if (shown.length === 0) return;
     const current = eventsByScope()[key] ?? EMPTY_EVENTS;
-    const next = current.concat(shown);
-    eventsByScope.set({
-      ...eventsByScope(),
-      [key]: next.length > MAX_EVENTS_PER_ROOM ? next.slice(next.length - MAX_EVENTS_PER_ROOM) : next,
-    });
+    let rows = current;
+    if (shown.length) {
+      rows = current.concat(shown).slice(-MAX_EVENTS_PER_ROOM);
+      eventsByScope.set({ ...eventsByScope(), [key]: rows });
+    }
+    reconcileSenderNotices(key, through, rows);
   });
   return fresh.length;
 }
 
 // ------------------------------------------------------------------ errors
+
+const isAccessDenial = (error: unknown) => error instanceof ApiError &&
+  (error.kind === "forbidden" || error.kind === "not_found");
 
 function handleActionError(error: unknown, what: string, spaceId?: string) {
   if (isAborted(error)) return;

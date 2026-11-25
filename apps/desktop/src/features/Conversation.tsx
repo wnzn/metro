@@ -107,6 +107,7 @@ import { mediaKindOf } from "../api/library";
 import { MentionedBody, localMentionIdentity, sentMentionLabel } from "./mentions/MentionedBody";
 import { verifiedAgents } from "./mentions/roster";
 import { copyMentionText, leadingMentionsCoverRecipients, sentMentions } from "./mentions/sent";
+import { SenderNotice } from "./senderNotices/SenderNotice";
 
 /** The active place's transcript, with each agent turn folded into one group. */
 const transcriptItems = computed(() => groupTranscript(activeEvents()));
@@ -508,6 +509,7 @@ function MessageRow(props: { row: () => Of<"event"> }) {
       <If when={reactable()}>
         <Reactions eventId={event().id} />
       </If>
+      <SenderNotice event={event} focusComposer={focusComposer} />
     </MessageFrame>
   );
 }
