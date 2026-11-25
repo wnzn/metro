@@ -7,10 +7,11 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
 ## Install (users)
 
 Download the build for your system from
-[Releases](https://github.com/wnzn/metro/releases). **No release has been
-published yet.** The files built and verified locally so far were the
-0.2.0 candidate
-([evidence](../../docs/acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)), but there are no files to download yet. You never need NSH, a
+[Releases](https://github.com/wnzn/metro/releases). The latest is
+[Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2)
+([what was checked](../../docs/acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
+Everything this README describes on `main` at `d943797` is in 0.3.2; the
+local checks it cites ran on local builds, not on the release files. You never need NSH, a
 checkout or a terminal to use the app; the build commands further down are
 for contributors.
 
@@ -18,24 +19,26 @@ for contributors.
   archive and start `Metro` at its top level. Keep `metro-server` and the
   `ui` folder next to it. Needs glibc ≥ 2.39, GTK ≥ 4.14, WebKitGTK 6.0 and
   the GStreamer base plugins ([runtime requirements](#runtime-requirements)).
-  In the current source after 0.2.0, the archive also holds an optional
+  Since 0.3.2, the archive also holds an optional
   `install-desktop` script: `./install-desktop --install` (no `sudo`) adds
   Metro and its icon to your applications menu, and `./install-desktop
   --uninstall` removes them without touching your Metro data. Run it again
   if you move the folder. A local test archive of that source passed this
-  check; it isn't released.
+  check, and the 0.3.2 Linux archive contains `install-desktop`.
 - **Windows x64:** `Metro-<version>-windows-x64.zip`, a portable ZIP. See
   [Windows portable package](#windows-portable-package).
 
-Check each download against the `.sha256` file published beside it. No
-version has been published yet.
+Check each download against the `.sha256` file published beside it, or
+against the release's Sigstore-signed `SHA256SUMS`
+([check a download](../../docs/install.md#check-a-download)).
 
 Per-user installer scripts for Linux and Windows, which check the
 download, add a menu entry and optionally install Linux libraries, are
 described in [docs/install.md](../../docs/install.md). The Linux installer
 passed in a local test cut on Debian 13 and CachyOS
-([acceptance](../../docs/acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)). None is published or
-signed, and the Windows one hasn't been run in a recorded test. There's no
+([acceptance](../../docs/acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)). They're published
+with 0.3.2 and listed in its signed `SHA256SUMS`; the scripts themselves
+aren't code-signed, and the Windows one hasn't been run in a recorded test. There's no
 Mac build or download for now: CI doesn't build macOS. The macOS installer
 script stays in the repository, untested, for when Mac builds return.
 
@@ -48,9 +51,8 @@ In 0.2.0, the first screen, **Connect to Metro**, offers two choices:
 - **Or connect to a server:** the URL and token your admin gave you
   ([README](../../README.md#get-started)).
 
-In the current source after 0.2.0 (checked natively in a Linux test
-archive, [acceptance](../../docs/acceptance.md#staged-startup-server-attachments-and-device-sign-in-at-ba07516-2026-11-23-project-manager-local);
-not released):
+Since 0.3.2 (checked natively in a Linux test
+archive, [acceptance](../../docs/acceptance.md#staged-startup-server-attachments-and-device-sign-in-at-ba07516-2026-11-23-project-manager-local)):
 
 - Metro opens your private workspace **On this computer** at launch by
   default.
@@ -161,7 +163,7 @@ They never stand in for each other.
 `fb7cb06`, Settings screen at `57409bb`; checked in the native GTK app on
 Debian 13 in the local
 [57409bb setup cut](../../docs/acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local), with
-scripted models; not released, and not checked on Windows or macOS).
+scripted models; released in 0.3.2, not checked on Windows or macOS).
 Installing and recovery are in [docs/install.md](../../docs/install.md#the-desktops-own-runner).
 
 - It's created only if the desktop installer left its `enable-local-runner`
@@ -269,7 +271,7 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
     set one up. **Fetch models from …** asks your own server-stored
     connection for its list.
   - Since `93d7968` (checked in the native GTK app on Debian 13 in the
-    local 57409bb setup cut; not released), the searchable list is grouped by provider, under its name and
+    local 57409bb setup cut; released in 0.3.2), the searchable list is grouped by provider, under its name and
     bundled mark (OpenAI, Anthropic and Gemini first, custom endpoints
     last). Each row shows the model, the connection's name and the levels
     the server advertised for it. Thinking levels are inline choices, and
@@ -361,14 +363,14 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
 
 Chat, Search, Library and Scheduled tasks are your own pages, outside every
 Space, and work with or without any Space. The entries above describe the
-current source after 0.2.0, which isn't released. Quick results were
+source after 0.2.0, released in 0.3.2. Quick results were
 checked natively at `95a3d2b` ([acceptance](../../docs/acceptance.md#staged-quick-search-as-you-type-2026-11-23-project-manager-local)). Before they
 were added, native runs checked the full search's Return behaviour with its
 scope and type filters, folded zero-similarity results, the Library
 page, the media model in Settings, scheduled-task cards with the History
 menu, the routing badge's percentage, the account row, and Chat's **New
 task** form were checked in a native Linux GTK run, in dark and light themes,
-of the unreleased source after 0.2.0. Below 1100 points, Chat's runs open
+of the source after 0.2.0 (before 0.3.2). Below 1100 points, Chat's runs open
 in an **Agent runs** dialog from a **Runs** button. At 860 points, a native
 recheck of source `13c80b4` showed that **Escape** and **Close** each
 returned the typed draft unchanged. At 1200 the runs stay inline. The
@@ -544,9 +546,12 @@ contributors only, in
 
 ## Windows portable package
 
-The release file will be `Metro-<version>-windows-x64.zip`, a portable build
-with no installer. The package recorded so far was built locally as
-`Metro-windows-x64.zip`. It isn't published yet, and release ZIPs ship without an Authenticode signature for now ([install.md](../../docs/install.md#desktop-on-windows)). It hasn't been started on native Windows. The 0.2.0 candidate has only been started under Wine. Its
+The release file is `Metro-<version>-windows-x64.zip` (for 0.3.2,
+`Metro-0.3.2-windows-x64.zip`), a portable build with no installer.
+Release ZIPs ship without an Authenticode signature for now
+([install.md](../../docs/install.md#desktop-on-windows)). Nobody has
+started the app from it on native Windows; the 0.2.0 candidate has only
+been started under Wine. Its
 checks are in [acceptance](../../docs/acceptance.md#verified-windows-x64-portable-package-built-on-linux-2026-11-22-packaging-local).
 
 1. Check the ZIP against its `.sha256` file, for example with

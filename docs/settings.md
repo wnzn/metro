@@ -11,11 +11,11 @@ sections in this order (as verified in the 0.2.0 Linux candidate):
 | **Model routing** | Opt-in use-case routing and classification; see [system-one.md](system-one.md#how-a-message-reaches-the-agent) |
 | **Appearance** | Color scheme, [below](#appearance) |
 
-In the current source after 0.2.0, which isn't released, **Settings** is still a
+Since 0.3.2, **Settings** is still a
 sidebar entry with these sections. **Model providers** also holds
 **Documents & media**, where you choose the media model that indexes and
 searches your files ([library.md](library.md#in-the-desktop-app)). That
-choice was checked in a native Linux GTK run, in dark and light themes, of the unreleased source after 0.2.0. Your account is in the sidebar's account row.
+choice was checked in a native Linux GTK run, in dark and light themes, of the source after 0.2.0 (before 0.3.2; not of the release files). Your account is in the sidebar's account row.
 Its menu offers **Copy server URL**, **Copy ID** and **Sign out**. The
 account row was checked in the same native GTK review, and its menu items
 are covered by automated tests.
@@ -82,8 +82,8 @@ default.
     nothing is posted.
   - If the chosen connection can't be used, that reply fails. It doesn't fall
     back to your default or to `METRO_MODEL`.
-- **Per-turn model and thinking level, in Chat and Spaces** (current source
-  after 0.2.0, not released; verified in a local test cut,
+- **Per-turn model and thinking level, in Chat and Spaces** (since 0.3.2;
+  verified in a local test cut,
   [acceptance](acceptance.md#staged-composer-models-and-ask-from-personal-chat-at-28ba4e2-2026-11-23-project-manager-local)).
   A message to the agent, in your Chat or in a Space room, can also carry
   `model_id` and `reasoning_effort` with `provider_connection_id`, on

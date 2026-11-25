@@ -200,8 +200,13 @@ runtime.
     Documents & media gate (497 Rust tests, the 83 hardened media-service
     tests, `nsh test` 106/106) and the earlier 403-test gate are historical
     milestones.
-  - Don't claim a real commercial provider, production auth, a published
-    release, pretrained `google/embeddinggemma-2` ranking quality, or
+  - **Metro 0.3.2 is published**: GitHub release `v0.3.2` (2026-11-24),
+    tag on `d943797`, made by CI run 45418420759, with Sigstore-signed
+    `SHA256SUMS`, unsigned Windows files and GHCR images signed by the release workflow
+    (`docs/acceptance.md`). Native Windows by a person, real vendor
+    accounts and real sign-ins are still unverified.
+  - Don't claim a real commercial provider, production auth, a release
+    other than the recorded ones, pretrained `google/embeddinggemma-2` ranking quality, or
     native audio and video playback, seeking or the native file picker for
     library uploads, until a run is recorded.
 - **User and operator docs use prebuilt files only:** the desktop app
@@ -209,12 +214,22 @@ runtime.
   binary from https://github.com/wnzn/metro. They never ask anyone to
   compile, `cargo install`, build an image locally, or run a terminal
   sidecar next to the desktop app. Source builds live only in
-  [docs/development.md](docs/development.md). Until a release is published,
-  docs give the verified target names (`ghcr.io/wnzn/metro-server`,
-  `ghcr.io/wnzn/metro-runner`, `Metro-<version>-windows-x64.zip`,
-  `Metro-<version>-linux-x64.tar.gz`,
-  `Metro-runner-<version>-linux-x64.tar.gz`, each with `.sha256`) and say
-  they aren't published yet. The desktop app's **Use locally**
+  [docs/development.md](docs/development.md). Docs point to the published
+  release by the names and URLs recorded in `docs/acceptance.md`: the
+  current one is **Metro 0.3.2**
+  (https://github.com/wnzn/metro/releases/tag/v0.3.2, tag `v0.3.2` on
+  `d943797`), with `Metro-0.3.2-linux-x64.tar.gz`,
+  `Metro-0.3.2-windows-x64.zip`,
+  `Metro-0.3.2-windows-x64.unsigned-preview.msi`,
+  `Metro-runner-0.3.2-linux-x64.tar.gz` (each with `.sha256`), the
+  installer scripts, `SHA256SUMS` with its Sigstore bundle, `IMAGES.txt`,
+  and the images `ghcr.io/wnzn/metro-server:v0.3.2`,
+  `ghcr.io/wnzn/metro-runner:v0.3.2` and
+  `ghcr.io/wnzn/metro-embeddinggemma2:v0.3.2` (pinned by digest). Windows
+  files are **unsigned** (no Authenticode). Docs never present source
+  that came after a release's commit as part of that release; label it
+  "in the source, not released". A newer release is named in docs only
+  once its publication is recorded in `docs/acceptance.md`. The desktop app's **Use locally**
   runs a bundled local server with no token, and its owner-only, per-Space,
   read-only local tools (`workspace.list`/`workspace.read`) never stand in
   for an operator's separately installed runner. It and the other features

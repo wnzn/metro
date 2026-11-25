@@ -71,16 +71,19 @@ connects with the server's URL and their own token. Details:
 Send tokens only over loopback, an SSH port forward or HTTPS. The desktop
 app refuses plain `http://` to any other host.
 
-> **No release is published yet.** The verified target names are
-> `Metro-<version>-windows-x64.zip`, `Metro-<version>-linux-x64.tar.gz` and
-> `Metro-runner-<version>-linux-x64.tar.gz` (each with a `.sha256`), and
-> the images `ghcr.io/wnzn/metro-server` and `ghcr.io/wnzn/metro-runner`.
-> There's no macOS build for now, and Windows hasn't been tested natively.
-> Windows release files will ship **unsigned** (no Authenticode signature)
-> until a code-signing certificate is set up, so expect SmartScreen
+> **Latest release: [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2)**
+> (2026-11-24). Downloads: `Metro-0.3.2-linux-x64.tar.gz`,
+> `Metro-0.3.2-windows-x64.zip`, `Metro-0.3.2-windows-x64.unsigned-preview.msi`
+> and `Metro-runner-0.3.2-linux-x64.tar.gz` (each with a `.sha256`), the
+> installer scripts, and `SHA256SUMS` with its Sigstore bundle. Images,
+> listed by digest in the release's `IMAGES.txt`:
+> `ghcr.io/wnzn/metro-server:v0.3.2` and `ghcr.io/wnzn/metro-runner:v0.3.2`
+> (`linux/amd64`, `linux/arm64`). There's no macOS build for now. Windows
+> files are **unsigned** (no Authenticode signature), so expect SmartScreen
 > warnings and check them against the Sigstore-signed `SHA256SUMS`
-> ([docs/install.md](docs/install.md#desktop-on-windows)).
-> What's verified so far: [docs/acceptance.md](docs/acceptance.md).
+> ([docs/install.md](docs/install.md#check-a-download)). The desktop app
+> hasn't been tried by a person on native Windows. What's verified so far:
+> [docs/acceptance.md](docs/acceptance.md).
 
 ## Repository layout
 

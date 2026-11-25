@@ -1,9 +1,10 @@
 # Terminal client (`metro-tui`)
 
-> **Status: no release yet.** `metro-tui` has been in the source since
-> `142bc85`. CI now builds it into every desktop download, including the
-> unsigned [test builds](install.md#test-builds-from-github-actions), but no
-> public release containing it exists yet. The
+> **Status: released in [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2).**
+> `metro-tui` has been in the source since `142bc85`. CI builds it into
+> every desktop download, including the unsigned
+> [test builds](install.md#test-builds-from-github-actions); the 0.3.2 Linux
+> and Windows archives contain it. The
 > [57409bb setup cut](acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)
 > doesn't include it. Its test runs the real Linux binary in a
 > pseudo-terminal against a real Metro server with a scripted model
@@ -17,8 +18,7 @@ GTK, the desktop app or a display, and it never reads Metro's database.
 
 ## Where it is
 
-It's inside each desktop download. A release will have it in the same
-places; no release exists yet.
+It's inside each desktop download, including the 0.3.2 release archives.
 
 | Download | Where `metro-tui` is |
 | --- | --- |

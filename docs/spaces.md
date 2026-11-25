@@ -114,7 +114,7 @@ author and recipients, so it can tell a question for Bob from one for itself.
   `mentions` is a list of up to 32 recipients, each `{"kind":"agent"}` or
   `{"kind":"user","id":"<member id>"}`. The desktop picker sends these, which
   also works for opaque OIDC ids that nobody would type.
-  In the current source after 0.2.0 (not released), a message to the agent
+  Since 0.3.2, a message to the agent
   may also carry `provider_connection_id`, `model_id` and
   `reasoning_effort` to choose the model and thinking level for that turn,
   and `asset_ids` to attach Library files. See
@@ -197,7 +197,7 @@ A room's agent can delegate work to **child threads** with the tools
   Chat message is a note to yourself and never calls a model. In the current
   source after 0.2.0, `model_id` and `reasoning_effort` may go with
   `provider_connection_id` on a message to the agent.
-- In the desktop app (current source after 0.2.0, not released), when a
+- In the desktop app (since 0.3.2), when a
   chat model is ready for your Chat and you haven't set up System One,
   **Ask agent ↵** is the primary action for a typed message and **Return**
   asks the agent. **Save note** keeps the text without asking. Files sent

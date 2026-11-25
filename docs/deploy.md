@@ -5,23 +5,23 @@ source is for contributors: [development.md](development.md).
 
 ## Release files and images
 
-> **Not published yet.** The repository is
-> <https://github.com/wnzn/metro>. Releases will appear on its
-> [Releases page](https://github.com/wnzn/metro/releases), published
-> automatically when a version bump is merged into the protected `main`
-> branch ([CI and publishing](#ci-and-publishing)). No public release, file or image
-> exists yet. The names below are what the next release publishes; the files
-> built and verified locally so far were the 0.2.0 candidate
-> ([acceptance](acceptance.md#final-metro-020-local-release-prepublication-2026-11-23-project-manager-local)).
-> Each release file comes with a `.sha256` file beside it. The full release
-> file list, including the MSI, is in
-> [install.md](install.md#official-releases).
+> **Latest release: [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2)**,
+> published 2026-11-24 from commit `d943797` of
+> <https://github.com/wnzn/metro>. Releases are published automatically
+> when a version bump is merged into the protected `main` branch
+> ([CI and publishing](#ci-and-publishing)). Each release file comes with a
+> `.sha256` file beside it. The full release file list, including the MSI,
+> is in [install.md](install.md#official-releases); what was checked is in
+> [acceptance](acceptance.md#published-metro-032-2026-11-24-github-release-v032).
+> The image digests are in the release's
+> [`IMAGES.txt`](https://github.com/wnzn/metro/releases/download/v0.3.2/IMAGES.txt).
 
-| Part | Where | Release-target name |
+| Part | Where | Name in 0.3.2 |
 | --- | --- | --- |
-| Server image | GitHub Container Registry | `ghcr.io/wnzn/metro-server:<tag>` |
-| Runner image | GitHub Container Registry | `ghcr.io/wnzn/metro-runner:<tag>` |
-| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases) | `Metro-0.3.2-windows-x64.zip` (+ `.sha256`), **unsigned** |
+| Server image | GitHub Container Registry | `ghcr.io/wnzn/metro-server:v0.3.2` (`linux/amd64`, `linux/arm64`) |
+| Runner image | GitHub Container Registry | `ghcr.io/wnzn/metro-runner:v0.3.2` (`linux/amd64`, `linux/arm64`) |
+| Media embedding image (optional) | GitHub Container Registry | `ghcr.io/wnzn/metro-embeddinggemma2:v0.3.2` (`linux/amd64`, no weights) |
+| Desktop, Windows x64 | [Releases](https://github.com/wnzn/metro/releases/tag/v0.3.2) | `Metro-0.3.2-windows-x64.zip` and `Metro-0.3.2-windows-x64.unsigned-preview.msi` (+ `.sha256`), **unsigned** |
 | Desktop, Linux x64 | Releases | `Metro-0.3.2-linux-x64.tar.gz` (+ `.sha256`) |
 | Runner, Linux x64 binary | Releases | `Metro-runner-0.3.2-linux-x64.tar.gz` (+ `.sha256`) |
 
@@ -172,7 +172,7 @@ specific to your deployment; Metro's only built-in address is loopback.
 - People choose their own models in **Settings → Model providers**. To let
   them save API keys on the server, or to set a fallback model, see
   [settings.md](settings.md#operator-settings).
-- In the current source after 0.2.0 (not released), org admins listed in
+- Since 0.3.2, org admins listed in
   `METRO_ORG_ADMINS` can read the server's own monitoring events with
   `GET /v1/monitoring/events`, and each Space's owner reads that Space's
   with `?space_id=SID`. Each person reads their own personal Chat events
@@ -243,7 +243,11 @@ they always compile from scratch.
 A tag push starts nothing, and there's no manual trigger. What has been
 verified so far is in [acceptance.md](acceptance.md).
 
-### Releases from `main` on a version bump (in the source; never run with real credentials)
+### Releases from `main` on a version bump
+
+This process published Metro 0.3.2 from `d943797` in CI run
+[45418420759](https://github.com/wnzn/metro/actions/runs/45418420759)
+([acceptance](acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
 
 `packaging/release_policy.py` decides. A release runs only for a
 **protected, non-deleted, non-forced push to `refs/heads/main`** of
@@ -317,7 +321,7 @@ Image and file signatures are bound to `refs/heads/main` and to the exact
 commit. A rerun after a failure resumes, and a rerun after success changes
 nothing. A prerelease version is never marked latest.
 
-Before the first release, a maintainer sets up:
+A release needs this setup, which was in place for 0.3.2:
 
 - **The `main` branch,** the repository's default branch, protected against
   deletion and force pushes. Changes, including version bumps, arrive
