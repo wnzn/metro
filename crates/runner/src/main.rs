@@ -163,10 +163,12 @@ fn main() -> ExitCode {
                 eprintln!("metro-runner: could not start the previous version: {e}");
                 return ExitCode::from(75);
             }
-            Err(e) => eprintln!(
-                "metro-runner: warning: update bookkeeping failed: {}",
-                e.kind()
-            ),
+            Err(e) => {
+                eprintln!(
+                    "metro-runner: update recovery could not proceed: {e}; exiting before claiming work"
+                );
+                return ExitCode::from(75);
+            }
         }
         // e2e test builds only: a version that "fails to start" after its
         // start was counted (tests/e2e/updates.py).

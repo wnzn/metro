@@ -225,8 +225,10 @@ def updates(server, runner, timeout):
         (root / "versions" / OLD).mkdir(parents=True)
         for path in (root, root / "versions", root / "versions" / OLD):
             path.chmod(0o700)
-        shutil.copy2(runner, root / "versions" / OLD / "metro-runner")
-        (root / ".metro-runner-install").write_text("managed\n")
+        installed_runner = root / "versions" / OLD / "metro-runner"
+        shutil.copy2(runner, installed_runner)
+        installed_runner.chmod(0o755)
+        (root / ".metro-runner-install").write_text("metro-update-lock-v2\n")
         shutil.copy2(ROOT / "packaging/install-metro-runner-linux.sh", root / "install-metro-runner-linux.sh")
         os.symlink(f"versions/{OLD}", root / "current")
         workspace = state / "workspace"
@@ -240,15 +242,30 @@ def updates(server, runner, timeout):
             "METRO_TEST_RELEASE_BASE": base,
             "METRO_TEST_CRASH_VERSION": BAD,
         }
-        supervisor = Supervisor(root, runner_env)
-        supervisor.thread.start()
-        stack.callback(supervisor.stop)
-
         def runner_view():
             for r in call(alice, "GET", RUNNERS, read_json=True)["runners"]:
                 if r["id"] == rid:
                     return r
             raise RuntimeError("runner disappeared")
+
+        # A real runner with rollback due and a missing previous executable
+        # must persist intent and exit before sending even its first claim.
+        pending = root / ".update-pending.json"
+        pending.write_text(json.dumps({"version": 1, "from": "0.9.0", "to": OLD,
+                                       "attempts": 3, "rolling_back": False}))
+        pending.chmod(0o600)
+        failed = subprocess.run([root / "current" / "metro-runner"], env=runner_env,
+                                capture_output=True, text=True, timeout=remaining(deadline))
+        require(failed.returncode == 75 and "exiting before claiming work" in failed.stderr,
+                f"runner did not exit on rollback preparation failure: {failed.returncode}")
+        require(json.loads(pending.read_text())["rolling_back"], "rollback intent wasn't saved")
+        require(runner_view()["presence"]["seen_at"] is None, "the failed runner sent a claim")
+        require(os.readlink(root / "current") == f"versions/{OLD}", "failed rollback moved current")
+        pending.unlink()
+
+        supervisor = Supervisor(root, runner_env)
+        supervisor.thread.start()
+        stack.callback(supervisor.stop)
 
         r = wait_until(deadline, "the runner's presence", lambda: (v := runner_view())["presence"]["version"] and v)
         require(r["presence"]["version"] == OLD and r["presence"]["install"] == "managed"
@@ -300,7 +317,8 @@ def updates(server, runner, timeout):
         require(not (root / ".update-pending.json").exists(), "a pending update was left behind")
         for child, label in children:
             require(child.poll() is None, f"{label} exited")
-    print(f"PASS: verified check and notice; owner-only request; runner self-updated {OLD} → {GOOD} in place; "
+    print(f"PASS: verified check and notice; owner-only request; failed rollback preparation sent no claim; "
+          f"runner self-updated {OLD} → {GOOD} in place; "
           f"crashing {BAD} rolled back after {restarts} restarts and reported start_failed.")
 
 

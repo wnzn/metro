@@ -113,7 +113,11 @@ fn managed_root() -> Root {
     )
     .unwrap();
     set_exec(&path.join("versions").join(OLD).join("metro-runner"));
-    fs::write(path.join(update::MARKER), b"").unwrap();
+    fs::write(
+        path.join(update::MARKER),
+        metro_release::installer_lock::MIGRATION,
+    )
+    .unwrap();
     fs::write(
         path.join(update::SCRIPT),
         b"#!/bin/sh\n# old installer script\n",
@@ -224,7 +228,7 @@ fn happy_path_stages_verifies_and_execs_the_new_version() {
         unsafe { libc::_exit(99) };
     }
     // Drop the parent's reference; only the exec'ing child holds the lock.
-    drop(switch);
+    switch.handoff_to_fork();
     let mut status = 0;
     unsafe { libc::waitpid(pid, &mut status, 0) };
     assert!(
@@ -350,6 +354,64 @@ fn failed_rollback_exec_keeps_retry_intent_and_the_previous_copy() {
         update::on_start(&root.path, &version).unwrap(),
         update::StartAction::RollBack(_)
     ));
+}
+
+#[test]
+fn rollback_preparation_failure_does_not_allow_the_trial_to_confirm() {
+    let root = managed_root();
+    let old = root.path.join("versions").join(OLD).join(update::BINARY);
+    let keep = old.with_extension("temporarily-unavailable");
+    fs::rename(&old, &keep).unwrap();
+    let new = root.path.join("versions").join(NEW);
+    fs::create_dir(&new).unwrap();
+    fs::set_permissions(&new, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(new.join(update::BINARY), stub(0)).unwrap();
+    set_exec(&new.join(update::BINARY));
+    update::point_current(&root.path, &Path::new("versions").join(NEW)).unwrap();
+    let journal = root.path.join(update::PENDING);
+    let pending = PendingFile {
+        version: 1,
+        from: OLD.into(),
+        to: NEW.into(),
+        attempts: update::MAX_STARTS,
+        rolling_back: false,
+    };
+    fs::write(&journal, serde_json::to_vec(&pending).unwrap()).unwrap();
+    fs::set_permissions(&journal, fs::Permissions::from_mode(0o600)).unwrap();
+    let version = Version::parse(NEW).unwrap();
+    assert!(update::on_start(&root.path, &version).is_err());
+    let after: PendingFile = serde_json::from_slice(&fs::read(&journal).unwrap()).unwrap();
+    assert!(after.rolling_back);
+    assert!(!update::confirm_started(&root.path, &version));
+    assert!(journal.is_file());
+    fs::rename(keep, old).unwrap();
+    assert!(matches!(
+        update::on_start(&root.path, &version).unwrap(),
+        update::StartAction::RollBack(_)
+    ));
+}
+
+#[test]
+fn a_published_layout_needs_the_supported_migration_before_self_update() {
+    let root = managed_root();
+    fs::write(
+        root.path.join(update::MARKER),
+        b"Metro runner per-user install\n",
+    )
+    .unwrap();
+    let rel = release(runner_archive(NEW, "runner", &stub(0)));
+    let f = serve(rel.files, NEW);
+    let kind = InstallKind::Managed {
+        root: root.path.clone(),
+    };
+    let u = SelfUpdate::new(kind, Channel::Release, true, Some(updater(&root.path, &f)));
+    assert!(!u.enabled);
+    assert_eq!(
+        updater(&root.path, &f).prepare(NEW).err().unwrap().code,
+        "manual_migration_required"
+    );
+    assert_eq!(f.hits.load(Ordering::SeqCst), 0);
+    assert!(!root.path.join(update::LOCK).exists());
 }
 
 #[test]

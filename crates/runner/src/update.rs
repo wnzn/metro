@@ -321,6 +321,7 @@ pub fn point_current(root: &Path, rel: &Path) -> io::Result<()> {
 
 pub struct Lock {
     path: PathBuf,
+    legacy: Option<metro_release::installer_lock::LegacyLock>,
     dir: fs::File,
 }
 
@@ -348,12 +349,9 @@ impl Lock {
             Err(std::fs::TryLockError::WouldBlock) => return Err(busy()),
             Err(std::fs::TryLockError::Error(e)) => return Err(io(e)),
         }
-        match fs::symlink_metadata(root.join(LOCK)) {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-            _ => return Err(busy()), // an older installer owns this lock; never remove it
-        }
-        let lock = Self {
+        let mut lock = Self {
             path: root.to_path_buf(),
+            legacy: None,
             dir,
         };
         if !lock.owns_path(root) {
@@ -362,11 +360,21 @@ impl Lock {
                 "the install directory changed",
             ));
         }
+        lock.legacy = Some(
+            metro_release::installer_lock::LegacyLock::take(root).map_err(|e| {
+                if e.kind() == io::ErrorKind::WouldBlock {
+                    busy()
+                } else {
+                    io(e)
+                }
+            })?,
+        );
         Ok(lock)
     }
 
     fn owns_path(&self, root: &Path) -> bool {
         self.path == root
+            && self.legacy.as_ref().is_none_or(|lock| lock.owned())
             && self
                 .dir
                 .metadata()
@@ -514,13 +522,23 @@ impl Switch {
 
     /// Write pending intent, durably move `current`, and execute the checked
     /// descriptor. If exec fails, the lock is still held during recovery.
-    pub fn exec(self) -> io::Error {
+    pub fn exec(mut self) -> io::Error {
         let error = self.execute();
         // Successful exec closed this descriptor via CLOEXEC. On error the
         // switch is over; unlock this exact file description even if an
         // unrelated concurrent fork briefly inherited a reference to it.
+        drop(self.lock.legacy.take());
         let _ = self.lock.dir.unlock();
         error
+    }
+
+    /// In a forked test, drop the parent's descriptor without touching the
+    /// compatibility lock that the child still owns.
+    #[doc(hidden)]
+    pub fn handoff_to_fork(mut self) {
+        if let Some(legacy) = self.lock.legacy.take() {
+            legacy.leave();
+        }
     }
 
     fn execute(&self) -> io::Error {
@@ -710,13 +728,15 @@ pub fn on_start(root: &Path, own: &Version) -> io::Result<StartAction> {
             return Ok(StartAction::Continue);
         }
     };
-    if !managed_current(root, own) {
-        return Ok(StartAction::Continue);
-    }
-    let own = own.to_string();
-    if pending.to == own {
+    let own_name = own.to_string();
+    if pending.to == own_name && read_current(root) == Some(*own) {
         pending.attempts = pending.attempts.saturating_add(1).min(MAX_STARTS + 1);
         if pending.attempts <= MAX_STARTS && !pending.rolling_back {
+            if !managed_current(root, own) {
+                return Err(io::Error::other(
+                    "the pending runner installation cannot be verified",
+                ));
+            }
             write_atomic(
                 &root.join(PENDING),
                 &serde_json::to_vec(&pending).expect("json"),
@@ -724,13 +744,20 @@ pub fn on_start(root: &Path, own: &Version) -> io::Result<StartAction> {
             )?;
             return Ok(StartAction::Continue);
         }
-        let old = open_version_exe(root, &pending.from)?;
         pending.rolling_back = true;
         write_atomic(
             &root.join(PENDING),
             &serde_json::to_vec(&pending).expect("json"),
             0o600,
         )?;
+        // Journal the decision before checking whether the old executable
+        // is usable. A failed preparation must never confirm this version.
+        if !managed_current(root, own) {
+            return Err(io::Error::other(
+                "the pending runner installation cannot be verified",
+            ));
+        }
+        let old = open_version_exe(root, &pending.from)?;
         let failed = Report::failed(&pending.to, "start_failed");
         write_atomic(
             &root.join(FAILED),
@@ -747,7 +774,8 @@ pub fn on_start(root: &Path, own: &Version) -> io::Result<StartAction> {
         )?;
         return Ok(StartAction::RollBack(Box::new(switch)));
     }
-    if pending.from == own
+    if pending.from == own_name
+        && managed_current(root, own)
         && (pending.rolling_back || pending.attempts == 0)
         && open_version_exe(root, &pending.to).is_ok()
     {
@@ -779,6 +807,7 @@ pub fn confirm_started(root: &Path, own: &Version) -> bool {
     };
     let pending = match read_pending(root) {
         Ok(Some(p)) if p.to == own.to_string() && !p.rolling_back && p.attempts <= MAX_STARTS => p,
+        Ok(Some(p)) if p.to == own.to_string() => return false,
         _ => return true,
     };
     if !managed_current(root, own) || open_version_exe(root, &pending.from).is_err() {
@@ -840,6 +869,12 @@ impl Updater {
             ));
         }
         let lock = Lock::take(&self.root)?;
+        if !metro_release::installer_lock::migrated(&self.root, MARKER) {
+            return Err(UpdateError::new(
+                "manual_migration_required",
+                "use the current manual installer with --migrate-update-lock before enabling self-update",
+            ));
+        }
         if !managed_current(&self.root, &self.own) {
             return Err(UpdateError::new(
                 "install_changed",
@@ -1075,7 +1110,7 @@ impl SelfUpdate {
     ) -> SelfUpdate {
         let enabled = host_opt_in
             && channel == Channel::Release
-            && matches!(install, InstallKind::Managed { .. })
+            && matches!(&install, InstallKind::Managed { root } if metro_release::installer_lock::migrated(root, MARKER))
             && updater.is_some();
         let report = match &install {
             InstallKind::Managed { root } => failed_report(root),
@@ -1120,6 +1155,8 @@ impl SelfUpdate {
             };
         } else if let (Some(r), InstallKind::Managed { root }) = (&self.report, &self.install)
             && r.state == "failed"
+            && let Ok(_lock) = Lock::take(root)
+            && self.own.is_some_and(|own| managed_current(root, &own))
         {
             // Reported once already; the server has it.
             let _ = fs::remove_file(root.join(FAILED));
