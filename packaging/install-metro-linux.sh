@@ -221,21 +221,81 @@ run_privileged_install() { # $1 = package manager command (fixed list)
 
 # ---------------------------------------------------------------- in-app updates
 # The Metro app updates itself too: it journals each step in
-# $root/.update.json and holds $root/.lock with an owner file while it
-# stages. This script never interrupts a running in-app update.
+# $root/.update.json and locks the installation directory while it mutates it.
 JOURNAL=.update.json
 
-journal_field() { # $1 = key: the app writes compact JSON ("key":"value")
-    sed -n "s/.*\"$1\":\"\([A-Za-z0-9._-]*\)\".*/\1/p" "$root/$JOURNAL" | head -n 1
-}
-
 refuse_during_in_app_update() {
-    [ -f "$root/$JOURNAL" ] || return 0
-    phase=$(journal_field phase)
+    staged_version=
+    [ -e "$root/$JOURNAL" ] || [ -L "$root/$JOURNAL" ] || return 0
+    [ -f "$root/$JOURNAL" ] && [ ! -L "$root/$JOURNAL" ] ||
+        die "$root/$JOURNAL has an unknown in-app update state"
+    command -v python3 >/dev/null 2>&1 ||
+        die "python3 is needed to read the update journal safely; start Metro to finish the update and retry"
+    current=$(readlink -- "$root/current" || :)
+    fields=$(python3 - "$root/$JOURNAL" "$current" <<'PY'
+import json, re, sys
+
+def fields(items):
+    result = {}
+    for k, v in items:
+        if k in result:
+            raise ValueError()
+        result[k] = v
+    return result
+
+def version(s):
+    if not isinstance(s, str) or not re.fullmatch(r'(?:0|[1-9][0-9]{0,9})\.(?:0|[1-9][0-9]{0,9})\.(?:0|[1-9][0-9]{0,9})', s):
+        raise ValueError()
+    values = tuple(map(int, s.split('.')))
+    if max(values) > 2**32 - 1:
+        raise ValueError()
+    return values
+
+try:
+    with open(sys.argv[1], 'rb') as f:
+        raw = f.read(65537)
+    if len(raw) > 65536:
+        raise ValueError()
+    j = json.loads(raw, object_pairs_hook=fields)
+    if not isinstance(j, dict) or j.keys() - {'version', 'id', 'from', 'to', 'phase', 'outcome', 'detail', 'local_db_snapshot', 'watchdog_pid', 'reported', 'started_at'}:
+        raise ValueError()
+    if type(j['version']) is not int or j['version'] != 1 or not re.fullmatch('[0-9a-f]{16}', j['id']):
+        raise ValueError()
+    if version(j['from']) >= version(j['to']) or type(j['started_at']) is not int:
+        raise ValueError()
+    if any(type(j[k]) is not bool for k in ('local_db_snapshot', 'reported') if k in j):
+        raise ValueError()
+    if j.get('detail') is not None and not isinstance(j['detail'], str):
+        raise ValueError()
+    pid = j.get('watchdog_pid')
+    if pid is not None and (type(pid) is not int or not 0 < pid < 2**32):
+        raise ValueError()
+    phase = j['phase']
+    outcome = j.get('outcome')
+    if phase == 'staged' and (j.get('local_db_snapshot') or pid is not None):
+        raise ValueError()
+    if phase == 'committed' and outcome == 'updated':
+        expected = {j['to']}
+    elif phase == 'failed' and outcome in ('rolled_back', 'not_confirmed', 'install_failed'):
+        expected = {j['from']}
+    elif phase in ('staged', 'trial', 'committing', 'rolling_back') and outcome is None:
+        expected = {j['from'], j['to']} if phase in ('committing', 'rolling_back') else {j['from']}
+    else:
+        raise ValueError()
+    if sys.argv[2] not in {'versions/' + v for v in expected}:
+        raise ValueError()
+    print(phase + ' ' + j['to'])
+except (ValueError, KeyError, TypeError, OSError, RecursionError):
+    sys.exit(1)
+PY
+    ) || die "$root/$JOURNAL has an unknown in-app update state; start Metro once, then run this again"
+    phase=${fields% *}
+    target=${fields#* }
     case "$phase" in
-        staged|committed|failed) ;; # finished or only prepared: this install supersedes it
-        trial|committing)
-            die "Metro is in the middle of updating itself to $(journal_field to). Let it finish, or close Metro and start it once to complete or undo the update, then run this again" ;;
+        staged) staged_version=$target ;;
+        committed|failed) ;;
+        trial|committing|rolling_back)
+            die "Metro is in the middle of updating itself to $target. Let it finish, or close Metro and start it once to complete or undo the update, then run this again" ;;
         *) die "$root/$JOURNAL has an unknown in-app update state; start Metro once, then run this again" ;;
     esac
 }
@@ -247,16 +307,41 @@ lock_busy() { # why $root/.lock exists
     die "another install is running (or a previous one crashed: remove $root/.lock and retry)"
 }
 
+lock_install_root() {
+    [ -d "$root" ] && [ ! -L "$root" ] || die "install directory is not a plain directory"
+    if [ -n "$(ls -A -- "$root" 2>/dev/null)" ] && { [ ! -f "$root/$MARK" ] || [ -L "$root/$MARK" ]; }; then
+        die "$root was not created by this installer; refusing to change it"
+    fi
+    [ "$(stat -c '%u' -- "$root")" = "$(id -u)" ] || die "install directory is not owned by you"
+    mode=$(stat -c '%a' -- "$root")
+    [ "$((0$mode & 022))" -eq 0 ] || die "install directory is writable by others"
+    exec 9<"$root"
+    flock -n -x 9 || die "another install is running (Metro may be preparing an in-app update right now)"
+    owns_install_root || die "the install directory changed"
+    if [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; then lock_busy; fi
+}
+
+owns_install_root() { [ ! -L "$root" ] && [ "$root" -ef /proc/self/fd/9 ]; }
+
 # ---------------------------------------------------------------- install
 lock() {
-    mkdir -p -- "$root"
+    mkdir -p -m 700 -- "$root"
+    lock_install_root
     if [ -e "$root/current" ] || [ -n "$(ls -A -- "$root" 2>/dev/null)" ]; then
-        [ -f "$root/$MARK" ] || die "$root exists but was not created by this installer; refusing to change it"
+        [ -f "$root/$MARK" ] && [ ! -L "$root/$MARK" ] ||
+            die "$root exists but was not created by this installer; refusing to change it"
     fi
     refuse_during_in_app_update
-    mkdir -- "$root/.lock" 2>/dev/null || lock_busy
     # On failure before anything was installed, leave no trace behind.
-    trap 'rm -rf -- "$root/.lock" ${stage:+"$stage"}; [ -L "$root/current" ] || { rm -f -- "$root/$MARK"; rmdir -- "$root" 2>/dev/null; }' EXIT
+    trap 'if owns_install_root; then
+        if [ -n "$old" ] && [ ! -e "$root/versions/$version" ] && [ -e "$old/$version" ]; then
+            mv -- "$old/$version" "$root/versions/$version"
+        fi
+        [ -z "$stage" ] || rm -rf -- "$stage"
+        if [ ! -L "$root/current" ] && [ -z "$old" ]; then
+            rm -f -- "$root/$MARK"; rmdir -- "$root" 2>/dev/null || :
+        fi
+    fi' EXIT
     trap 'exit 130' INT TERM
     printf 'Metro desktop per-user install (managed by %s). Your data is in %s.\n' "$PROG" "$user_data" >"$root/$MARK"
 }
@@ -272,13 +357,20 @@ install_app() {
     esac
     printf '%s' "$version" | grep -Eq '^v?[0-9]+\.[0-9]+\.[0-9]+([-+][A-Za-z0-9][A-Za-z0-9.-]{0,40})?$' ||
         die "unexpected version in archive name: $version"
-    if [ "$action" = update ] && [ ! -L "$root/current" ]; then
-        die "Metro is not installed in $root; use install"
-    fi
-    verify_archive_checksum "$archive"
     stage=
+    old=
     lock
+    [ "$action" != update ] || [ -L "$root/current" ] || die "Metro is not installed in $root; use install"
     stage=$(mktemp -d -- "$root/.stage.XXXXXX")
+    cp -- "$archive" "$stage/$name"
+    if [ -z "$sha" ] && [ -z "$checksum_file" ]; then
+        if [ -f "$archive.sha256" ]; then checksum_file=$archive.sha256
+        elif [ -f "${archive%/*}/SHA256SUMS" ]; then checksum_file=${archive%/*}/SHA256SUMS
+        else die "no checksum for $name: pass --sha256 HEX or --checksum-file FILE"
+        fi
+    fi
+    archive=$stage/$name
+    verify_archive_checksum "$archive"
     extract_verified "$archive" "$stage" "$top"
     app=$stage/$top
     if [ "$(json_field "$app/RELEASE.json" kind)" != desktop ] ||
@@ -312,8 +404,9 @@ install_app() {
         chmod 644 -- "$app/enable-local-runner"
     fi
 
+    owns_install_root || die "the install directory changed"
+    [ ! -L "$root/versions" ] || die "versions directory is a symlink"
     mkdir -p -- "$root/versions"
-    old=
     if [ -e "$root/versions/$version" ]; then
         old=$(mktemp -d -- "$root/.old.XXXXXX")
         mv -- "$root/versions/$version" "$old/"
@@ -322,11 +415,10 @@ install_app() {
     ln -sfn -- "versions/$version" "$root/.current.new"
     mv -fT -- "$root/.current.new" "$root/current"
     [ -z "$old" ] || rm -rf -- "$old"
-    for other in "$root"/versions/* "$root"/.old.*; do
-        [ -e "$other" ] || continue
-        [ "$other" = "$root/versions/$version" ] || rm -rf -- "$other"
-    done
-    # A staged or finished in-app update is superseded (its files are gone).
+    if [ -n "$staged_version" ] && [ "$staged_version" != "$version" ]; then
+        rm -rf -- "$root/versions/$staged_version"
+    fi
+    # Supersede the validated stage without discarding the previous working install.
     rm -f -- "$root/$JOURNAL"
 
     if [ "$menu" = 1 ]; then
@@ -352,10 +444,9 @@ install_app() {
 
 uninstall_app() {
     [ -d "$root" ] || { say "Metro is not installed in $root."; return 0; }
-    [ -f "$root/$MARK" ] || die "$root was not created by this installer; refusing to remove it"
-    stage=
+    lock_install_root
+    [ -f "$root/$MARK" ] && [ ! -L "$root/$MARK" ] || die "$root was not created by this installer; refusing to remove it"
     refuse_during_in_app_update
-    mkdir -- "$root/.lock" 2>/dev/null || lock_busy
     if [ -x "$root/current/install-desktop" ]; then
         "$root/current/install-desktop" --uninstall >/dev/null || say "warning: could not remove the applications-menu entry"
     fi

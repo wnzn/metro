@@ -183,19 +183,57 @@ function Get-ShortcutTarget([string] $Path) {
 }
 
 # The Metro app updates itself too: it journals each step in
-# $Root\.update.json and holds $Root\.lock with an owner file while it
-# stages. This script never interrupts a running in-app update.
+# $Root\.update.json and takes the same kernel lock as this installer.
 function Assert-NoInAppUpdate {
     $journal = Join-Path $Root '.update.json'
-    if (-not (Test-Path -LiteralPath $journal -PathType Leaf)) { return }
-    $j = $null
-    try { $j = Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json } catch { $j = $null }
-    if ($null -eq $j -or -not ($j.phase -in @('staged', 'trial', 'committing', 'committed', 'failed'))) {
+    $item = Get-Item -LiteralPath $journal -Force -ErrorAction SilentlyContinue
+    if (-not $item) { return }
+    try {
+        if ($item.PSIsContainer -or $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint) -or $item.Length -gt 65536) { throw 'unsafe journal' }
+        $raw = Get-Content -LiteralPath $journal -Raw
+        $tokens = @([regex]::Matches($raw, '"(?:\\.|[^"\\])*"|[{},:\[\]]') | ForEach-Object { $_.Value })
+        $known = @('version', 'id', 'from', 'to', 'phase', 'outcome', 'detail', 'local_db_snapshot', 'watchdog_pid', 'reported', 'started_at')
+        $found = @()
+        for ($i = 0; $i -lt ($tokens.Count - 1); $i++) {
+            if ($tokens[$i + 1] -eq ':') {
+                $key = $tokens[$i].Trim('"')
+                if ($key -cnotin $known -or $key -cin $found) { throw 'invalid or repeated field' }
+                $found += $key
+            }
+        }
+        $j = $raw | ConvertFrom-Json
+        if (($j.version -isnot [long] -and $j.version -isnot [int]) -or $j.version -ne 1 -or
+            $j.id -cnotmatch '^[0-9a-f]{16}$' -or
+            ($j.started_at -isnot [long] -and $j.started_at -isnot [int])) { throw 'bad journal header' }
+        function Get-JournalVersion([string] $Value) {
+            if ($Value -notmatch '^(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})\.(0|[1-9][0-9]{0,9})$') { throw 'bad journal version' }
+            return (([uint32]$Matches[1], [uint32]$Matches[2], [uint32]$Matches[3]) | ForEach-Object { '{0:D10}' -f $_ }) -join '.'
+        }
+        if ((Get-JournalVersion $j.from) -cge (Get-JournalVersion $j.to)) { throw 'downwards transition' }
+        $outcome = if ('outcome' -cin $found) { $j.outcome }
+        $pidValue = if ('watchdog_pid' -cin $found) { $j.watchdog_pid }
+        foreach ($field in @('reported', 'local_db_snapshot')) {
+            if ($field -cin $found -and $j.$field -isnot [bool]) { throw 'bad flag' }
+        }
+        if ($null -ne $pidValue -and (($pidValue -isnot [long] -and $pidValue -isnot [int]) -or $pidValue -le 0 -or $pidValue -ge 4294967296)) { throw 'bad pid' }
+        if ($j.phase -ceq 'staged' -and ($null -ne $pidValue -or ('local_db_snapshot' -cin $found -and $j.local_db_snapshot))) { throw 'staged trial' }
+        $current = Get-Current
+        $valid = switch -CaseSensitive ($j.phase) {
+            'staged' { $null -eq $outcome -and $current -ceq $j.from }
+            'trial' { $null -eq $outcome -and $current -ceq $j.from }
+            { $_ -cin @('committing', 'rolling_back') } { $null -eq $outcome -and $current -cin @($j.from, $j.to) }
+            'committed' { $outcome -ceq 'updated' -and $current -ceq $j.to }
+            'failed' { $outcome -cin @('rolled_back', 'not_confirmed', 'install_failed') -and $current -ceq $j.from }
+            default { $false }
+        }
+        if (-not $valid) { throw 'foreign journal' }
+    } catch {
         Fail "$journal has an unknown in-app update state; start Metro once, then run this again"
     }
-    if ($j.phase -in @('trial', 'committing')) {
+    if ($j.phase -cin @('trial', 'committing', 'rolling_back')) {
         Fail "Metro is in the middle of updating itself to $($j.to). Let it finish, or close Metro and start it once to complete or undo the update, then run this again"
     }
+    if ($j.phase -ceq 'staged') { return $j.to }
 }
 
 function Get-LockBusyMessage([string] $Lock) {
@@ -204,6 +242,34 @@ function Get-LockBusyMessage([string] $Lock) {
         return "Metro is preparing an in-app update right now (it holds $Lock). Wait for it to finish, then run this again"
     }
     return "another install is running (or a previous one crashed: remove $Lock and retry)"
+}
+
+function Get-InstallLockPath {
+    $rootPath = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/')
+    return Join-Path (Split-Path -Parent $rootPath) ('.' + (Split-Path -Leaf $rootPath) + '.install.lock')
+}
+
+function Enter-InstallLock {
+    $item = Get-Item -LiteralPath $Root -Force
+    if (-not $item.PSIsContainer -or $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
+        Fail 'the install directory is not a plain directory'
+    }
+    $legacy = Join-Path $Root '.lock'
+    if (Test-Path -LiteralPath $legacy) { Fail (Get-LockBusyMessage $legacy) }
+    $path = Get-InstallLockPath
+    $entry = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    if ($entry -and ($entry.PSIsContainer -or $entry.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint))) { Fail 'the install lock is not a plain file' }
+    $handle = $null
+    try {
+        # Rust's File::try_lock also locks byte zero. Omitting FileShare.Delete
+        # keeps this kernel lock on the same file until the last holder exits.
+        $handle = [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
+        $handle.Lock(0, 1)
+        return $handle
+    } catch {
+        if ($handle) { $handle.Dispose() }
+        Fail 'another install is running; wait for it to finish'
+    }
 }
 
 function Install-Metro {
@@ -226,26 +292,27 @@ function Install-Metro {
             Fail ("Metro is already installed by the Metro Windows Installer package (MSI) $($msi -join ' '). " +
                   'Update or remove it with that package (Settings > Apps > Installed apps); this script does not install a second copy or change it.')
         }
-        if ($Action -eq 'Update' -and -not (Get-Current)) { Fail "Metro is not installed in $Root; use -Action Install" }
     }
     $expected = Get-ExpectedSum $archivePath
-    $actual = Get-Sha256 $archivePath
-    if ($actual -ne $expected) { Fail "checksum mismatch for $name (expected $expected, got $actual). Download it again; do not install it." }
-    Say "Checksum OK: $name"
 
     New-Item -ItemType Directory -Force -Path $Root | Out-Null
-    if ((Get-ChildItem -LiteralPath $Root -Force | Measure-Object).Count -gt 0 -and -not (Test-Path -LiteralPath (Join-Path $Root $Mark))) {
-        Fail "$Root exists but was not created by this installer; refusing to change it"
-    }
-    Assert-NoInAppUpdate
-    $lock = Join-Path $Root '.lock'
-    try { New-Item -ItemType Directory -Path $lock -ErrorAction Stop | Out-Null }
-    catch { Fail (Get-LockBusyMessage $lock) }
+    $lock = Enter-InstallLock
     $stage = Join-Path $Root ('.stage.' + [Guid]::NewGuid().ToString('N'))
+    $target = $null
+    $old = $null
     try {
-        Set-Content -LiteralPath (Join-Path $Root $Mark) -Value "Metro desktop per-user install (managed by $Prog). Your data is in $UserData." -Encoding UTF8
+        if ((Get-ChildItem -LiteralPath $Root -Force | Measure-Object).Count -gt 0 -and -not (Test-Path -LiteralPath (Join-Path $Root $Mark))) {
+            Fail "$Root exists but was not created by this installer; refusing to change it"
+        }
+        if ($Action -eq 'Update' -and -not (Get-Current)) { Fail "Metro is not installed in $Root; use -Action Install" }
+        $stagedVersion = Assert-NoInAppUpdate
         New-Item -ItemType Directory -Path $stage | Out-Null
-        $result = Expand-Verified $archivePath $stage $top
+        $privateArchive = Join-Path $stage $name
+        Copy-Item -LiteralPath $archivePath -Destination $privateArchive
+        $actual = Get-Sha256 $privateArchive
+        if ($actual -ne $expected) { Fail "checksum mismatch for $name (expected $expected, got $actual). Download it again; do not install it." }
+        Say "Checksum OK: $name"
+        $result = Expand-Verified $privateArchive $stage $top
         $m = $result.Manifest
         if ($m.kind -ne 'desktop' -or $m.target -ne 'windows-x64' -or $m.version -ne $version) {
             Fail "RELEASE.json does not describe a Metro $version windows-x64 desktop package"
@@ -255,6 +322,12 @@ function Install-Metro {
         }
         if ($Action -eq 'Verify') { Say "Archive verified: $name"; return }
         if (Test-Running) { Fail 'Metro is running from this install; close it first' }
+        $marker = Join-Path $Root $Mark
+        $markEntry = Get-Item -LiteralPath $marker -Force -ErrorAction SilentlyContinue
+        if ($markEntry -and ($markEntry.PSIsContainer -or $markEntry.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint))) { Fail 'invalid install marker' }
+        if (-not $markEntry) {
+            Set-Content -LiteralPath $marker -Value "Metro desktop per-user install (managed by $Prog). Your data is in $UserData." -Encoding UTF8
+        }
 
         $previous = Get-Current
         $enable = $true
@@ -265,18 +338,26 @@ function Install-Metro {
 
         $versions = Join-Path $Root 'versions'
         New-Item -ItemType Directory -Force -Path $versions | Out-Null
+        if ((Get-Item -LiteralPath $versions -Force).Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { Fail 'invalid versions directory' }
         $target = Join-Path $versions $version
-        $old = $null
         if (Test-Path -LiteralPath $target) {
             $old = Join-Path $Root ('.old.' + [Guid]::NewGuid().ToString('N'))
             Move-Item -LiteralPath $target -Destination $old
         }
         Move-Item -LiteralPath $result.Dir -Destination $target
-        $tmp = Join-Path $Root 'current.txt.new'
-        Set-Content -LiteralPath $tmp -Value $version -Encoding ASCII
-        Move-Item -LiteralPath $tmp -Destination (Join-Path $Root 'current.txt') -Force
-        foreach ($d in Get-ChildItem -LiteralPath $versions -Directory) {
-            if ($d.Name -ne $version) { Remove-Item -LiteralPath $d.FullName -Recurse -Force }
+        $current = Join-Path $Root 'current.txt'
+        $tmp = Join-Path $stage 'current.txt.new'
+        $ptr = [IO.File]::Open($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try {
+            $bytes = [Text.Encoding]::ASCII.GetBytes($version)
+            $ptr.Write($bytes, 0, $bytes.Length)
+            $ptr.Flush($true)
+        } finally { $ptr.Dispose() }
+        if (Test-Path -LiteralPath $current) { [IO.File]::Replace($tmp, $current, $null) }
+        else { [IO.File]::Move($tmp, $current) }
+        if ($stagedVersion -and $stagedVersion -ne $version) {
+            $superseded = Join-Path $versions $stagedVersion
+            if (Test-Path -LiteralPath $superseded) { Remove-Item -LiteralPath $superseded -Recurse -Force }
         }
         if ($old) { Remove-Item -LiteralPath $old -Recurse -Force }
         # A staged or finished in-app update is superseded (its files are gone).
@@ -323,35 +404,32 @@ function Install-Metro {
         }
         Say "Your Metro data stays in $UserData."
     } finally {
+        if ($old -and $target -and (Test-Path -LiteralPath $old) -and -not (Test-Path -LiteralPath $target)) {
+            Move-Item -LiteralPath $old -Destination $target -ErrorAction SilentlyContinue
+        }
         if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
-        Remove-Item -LiteralPath $lock -Force -ErrorAction SilentlyContinue
-        if ($Action -eq 'Verify') { Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue }
+        $lock.Dispose()
+        if ($Action -eq 'Verify') {
+            Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
+            Remove-Item -LiteralPath (Get-InstallLockPath) -Force -ErrorAction SilentlyContinue
+        }
     }
 }
 
 function Uninstall-Metro {
     if (-not $OnWindows) { Fail 'this installer is for Windows' }
-    if (Test-Path -LiteralPath $Root) {
+    if (-not (Test-Path -LiteralPath $Root)) { Say "Metro is not installed in $Root."; return }
+    $lock = Enter-InstallLock
+    try {
         if (-not (Test-Path -LiteralPath (Join-Path $Root $Mark))) { Fail "$Root was not created by this installer; refusing to remove it" }
         if (Test-Running) { Fail 'Metro is running; close it first' }
-        Assert-NoInAppUpdate
-        $lock = Join-Path $Root '.lock'
-        if (Test-Path -LiteralPath $lock) { Fail (Get-LockBusyMessage $lock) }
-    }
-    $lnk = Get-ShortcutPath
-    # Only this script's own shortcut; another installer's (such as the MSI's) stays.
-    if (Test-OwnShortcut (Get-ShortcutTarget $lnk) $Root) { Remove-Item -LiteralPath $lnk -Force }
-    if (Test-Path -LiteralPath $UninstallKey) { Remove-Item -LiteralPath $UninstallKey -Recurse -Force }
-    if (Test-Path -LiteralPath $Root) {
-        # The uninstall entry may run the copy of this script inside $Root.
-        Get-ChildItem -LiteralPath $Root -Force | Where-Object { $_.Name -ne 'install-metro-windows.ps1' } |
-            Remove-Item -Recurse -Force
-        $self = Join-Path $Root 'install-metro-windows.ps1'
-        if ($PSCommandPath -and (Test-Path -LiteralPath $self) -and ((Resolve-Path -LiteralPath $PSCommandPath).ProviderPath -eq $self)) {
-            # Delete the running script and its folder after this process exits.
-            Start-Process -WindowStyle Hidden -FilePath "$env:ComSpec" -ArgumentList "/d /c ping -n 3 127.0.0.1 >nul & rd /s /q `"$Root`""
-        } else { Remove-Item -LiteralPath $Root -Recurse -Force }
-    }
+        $null = Assert-NoInAppUpdate
+        $lnk = Get-ShortcutPath
+        # Only this script's own shortcut; another installer's (such as the MSI's) stays.
+        if (Test-OwnShortcut (Get-ShortcutTarget $lnk) $Root) { Remove-Item -LiteralPath $lnk -Force }
+        Remove-Item -LiteralPath $Root -Recurse -Force
+        if (Test-Path -LiteralPath $UninstallKey) { Remove-Item -LiteralPath $UninstallKey -Recurse -Force }
+    } finally { $lock.Dispose() }
     Say "Metro was removed. Your Metro data was kept in $UserData (delete that folder yourself to remove it)."
 }
 

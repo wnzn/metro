@@ -6,6 +6,7 @@ by recording fakes on PATH, so nothing on the host is installed, started or
 changed. Real engines are exercised only by the CI jobs.
 """
 
+import fcntl
 import hashlib
 import io
 import json
@@ -182,7 +183,7 @@ class DesktopInstallerTests(unittest.TestCase):
         b = self.archive("0.3.1")
         self.box.run(DESKTOP, "update", "--archive", b, "--no-local-runner", check=True)
         self.assertEqual(os.readlink(current), "versions/0.3.1")
-        self.assertEqual(sorted(p.name for p in (self.app_root / "versions").iterdir()), ["0.3.1"])
+        self.assertEqual(sorted(p.name for p in (self.app_root / "versions").iterdir()), ["0.3.0", "0.3.1"])
         self.assertFalse(marker.exists())
         self.box.run(DESKTOP, "update", "--archive", b, check=True)  # keeps "off"
         self.assertFalse(marker.exists())
@@ -204,7 +205,7 @@ class DesktopInstallerTests(unittest.TestCase):
         journal = self.app_root / ".update.json"
         b = self.archive("0.3.1")
         for phase in ("trial", "committing"):
-            journal.write_text(json.dumps({"version": 1, "id": "ab12", "from": "0.3.0", "to": "0.3.2", "phase": phase},
+            journal.write_text(json.dumps({"version": 1, "id": "ab12" * 4, "from": "0.3.0", "to": "0.3.2", "phase": phase, "started_at": 0},
                                           separators=(",", ":")))
             for args in (("update", "--archive", b), ("uninstall",)):
                 r = self.box.run(DESKTOP, *args)
@@ -214,8 +215,17 @@ class DesktopInstallerTests(unittest.TestCase):
             self.assertTrue(journal.exists())
         journal.write_text('{"phase":"exploded"}')
         self.assertIn("unknown in-app update state", self.box.run(DESKTOP, "update", "--archive", b).stderr)
+        self.assertEqual(journal.read_text(), '{"phase":"exploded"}')
         # The app holding the lock while it stages.
         journal.unlink()
+        fd = os.open(self.app_root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            for args in (("update", "--archive", b), ("uninstall",)):
+                self.assertIn("another install is running", self.box.run(DESKTOP, *args).stderr)
+        finally:
+            os.close(fd)
+        # Legacy .lock is respected but never reaped.
         lock = self.app_root / ".lock"
         lock.mkdir()
         (lock / "owner").write_text('{"by":"metro-desktop","pid":1,"started_at":1}')
@@ -228,7 +238,7 @@ class DesktopInstallerTests(unittest.TestCase):
         shutil.rmtree(lock)
         # A staged (not started) in-app update is superseded and its journal removed.
         (self.app_root / "versions/0.3.2").mkdir()
-        journal.write_text('{"version":1,"id":"ab12","from":"0.3.0","to":"0.3.2","phase":"staged"}')
+        journal.write_text('{"version":1,"id":"ab12ab12ab12ab12","from":"0.3.0","to":"0.3.2","phase":"staged","started_at":0}')
         self.box.run(DESKTOP, "update", "--archive", b, check=True)
         self.assertEqual(os.readlink(self.app_root / "current"), "versions/0.3.1")
         self.assertFalse(journal.exists())
@@ -441,6 +451,22 @@ class RunnerInstallerTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.token.stat().st_mode), 0o600)
         self.assertEqual(marker.read_text(), "keep")
         self.assertEqual(self.box.calls(), [])
+
+    def test_manual_runner_install_respects_a_live_update_lock_and_journal(self):
+        self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
+        fd = os.open(self.install_root, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            self.assertIn("another install is running", self.box.run(RUNNER, "update", "--archive", self.archive).stderr)
+            self.assertIn("another install is running", self.box.run(RUNNER, "uninstall").stderr)
+            self.assertIn("another install is running", self.configure().stderr)
+        finally:
+            os.close(fd)
+        journal = self.install_root / ".update-pending.json"
+        journal.write_text("malformed; leave for recovery")
+        self.assertIn("finish recovery", self.box.run(RUNNER, "uninstall").stderr)
+        self.assertEqual(journal.read_text(), "malformed; leave for recovery")
+        self.assertEqual(os.readlink(self.install_root / "current"), "versions/0.3.0")
 
     def test_configuration_is_validated(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
@@ -755,18 +781,20 @@ class MacosInstallerTests(unittest.TestCase):
 
 class WindowsInAppUpdateGuardTests(unittest.TestCase):
     """Static checks (pwsh isn't needed): install and uninstall check the
-    journal and the app's lock owner before changing anything."""
+    journal under the installer lock before changing anything."""
 
     def test_guard_runs_before_any_change(self):
         text = WINDOWS.read_text()
         install = text[text.index("function Install-Metro {"):text.index("function Uninstall-Metro {")]
         uninstall = text[text.index("function Uninstall-Metro {"):]
-        self.assertLess(install.index("Assert-NoInAppUpdate"), install.index("New-Item -ItemType Directory -Path $lock"))
-        self.assertIn("Fail (Get-LockBusyMessage $lock)", install)
+        self.assertLess(install.index("$lock = Enter-InstallLock"), install.index("Assert-NoInAppUpdate"))
+        self.assertLess(install.index("Assert-NoInAppUpdate"), install.index("Set-Content"))
+        self.assertLess(uninstall.index("$lock = Enter-InstallLock"), uninstall.index("Assert-NoInAppUpdate"))
         self.assertLess(uninstall.index("Assert-NoInAppUpdate"), uninstall.index("Remove-Item"))
-        self.assertIn("Get-LockBusyMessage $lock", uninstall)
+        self.assertIn("$lock.Dispose()", uninstall)
         guard = text[text.index("function Assert-NoInAppUpdate"):text.index("function Get-LockBusyMessage")]
-        self.assertIn("@('trial', 'committing')", guard)
+        self.assertIn("@('trial', 'committing', 'rolling_back')", guard)
+        self.assertIn("$handle.Lock(0, 1)", text)
         self.assertIn('"by":"metro-desktop"', text)
         self.assertLess(install.index("Remove-Item -LiteralPath (Join-Path $Root '.update.json')"),
                         install.index("Keep a copy of this script"))
