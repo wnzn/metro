@@ -52,7 +52,7 @@ import {
   status,
   toggleReaction,
 } from "../store";
-import type { RoomEvent } from "../store";
+import type { Reactions as ReactionMap, RoomEvent } from "../store";
 import { choiceForTurn, ComposerModelControls } from "./composerModels";
 import type { AttachedFile, EventAgent } from "../api/client";
 import { agentById } from "./space/agents";
@@ -124,7 +124,13 @@ import { ReplySummary } from "./replies/ReplySummary";
 /** The user's zone and hour cycle; follows the system's settings as they change. */
 const clock = computed(() => clockFor(localeSettings()));
 type ReplyControl = (event: RoomEvent, opener?: ViewRef) => void;
-type TranscriptActions = { roomId?: string; onReply?: ReplyControl; replyAnchor?: RoomEvent | null; readOnly?: boolean };
+type DirectTranscript = {
+  id: string; events: () => readonly RoomEvent[]; loaded: () => boolean;
+  reactions: () => ReactionMap; pending: () => string | null; react: (eventId: number, emoji: string) => void;
+};
+type TranscriptActions = {
+  roomId?: string; direct?: DirectTranscript; onReply?: ReplyControl; replyAnchor?: RoomEvent | null; readOnly?: boolean;
+};
 
 export const messageAuthorName = (event: RoomEvent) => authorOf(event, me()).name;
 export const replyExcerpt = (event: RoomEvent) => event.text.trim().replace(/\s+/g, " ").slice(0, 180) || "Message";
@@ -180,10 +186,10 @@ export type DraftIdea = { id: string; label: string; apply: () => void };
 
 export function Transcript(props: TranscriptActions & { emptyText: string; emptyTitle?: string; ideas?: DraftIdea[]; testID?: string }) {
   const chat = () => mainPlace() === "chat";
-  const events = () => props.roomId ? eventsInRoom(props.roomId) : activeEvents();
+  const events = () => props.direct?.events() ?? (props.roomId ? eventsInRoom(props.roomId) : activeEvents());
   const rows = computed(() => transcriptRows(groupTranscript(events()), events(), clock()));
   const ideas = () => props.ideas ?? [];
-  const glyph = (): ChatGlyphName => (chat() ? "chat" : "hash");
+  const glyph = (): ChatGlyphName => (chat() || props.direct ? "chat" : "hash");
   let feed: import("nsh").ListRef | undefined;
   let reached: ReturnType<typeof focusTarget> = null;
   effect(() => {
@@ -204,7 +210,7 @@ export function Transcript(props: TranscriptActions & { emptyText: string; empty
       keyOf={(row) => row.key}
       empty={
         <If
-          when={props.roomId ? roomEventsLoaded(props.roomId) : activeLoaded()}
+          when={props.direct?.loaded() ?? (props.roomId ? roomEventsLoaded(props.roomId) : activeLoaded())}
           else={
             <Column grow align="center" justify="center" pad={6}>
               <Label color="muted">Loading…</Label>
@@ -390,7 +396,9 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
   const copyable = () => !props.actions.readOnly && event().text.trim().length > 0;
   const replyable = () => !!props.actions.onReply && (event().kind === "message" || event().kind === "agent" || event().kind === "thread");
   const forwardable = () => !props.actions.readOnly && (event().kind === "message" || event().kind === "agent");
-  const nearby = () => roomId() ? eventsInRoom(roomId()!) : activeEvents();
+  const direct = () => props.actions.direct;
+  const nearby = () => direct()?.events() ?? (roomId() ? eventsInRoom(roomId()!) : activeEvents());
+  const bodyScope = () => direct() ? `${disclosureScope()}\u0001dm:${direct()!.id}` : disclosureScope();
   const quoted = () => event().replyTo ? nearby().find(e => e.id === event().replyTo) ??
     (props.actions.replyAnchor?.id === event().replyTo ? props.actions.replyAnchor : null) : null;
   const forwarded = () => event().forwarded;
@@ -402,13 +410,17 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
   let reactButton: ViewRef | null = null;
   let replyButton: ViewRef | undefined;
   let forwardButton: ViewRef | undefined;
+  let frame: ViewRef | undefined;
   const reply = () => { if (!openingReply()) props.actions.onReply?.(event(), replyButton); };
-  const forward = () => {
+  const forward = (opener?: ViewRef) => {
     const sid = spaceId(), rid = roomId(), id = event().id;
-    if (sid && rid) openForward({ kind: "space", space_id: sid, room_id: rid, event_id: id }, event(), forwardButton,
+    const dm = direct();
+    if (dm) openForward({ kind: "dm", dm_id: dm.id, event_id: id }, event(), opener,
+      () => direct()?.id === dm.id && dm.events().some(e => e.id === id));
+    else if (sid && rid) openForward({ kind: "space", space_id: sid, room_id: rid, event_id: id }, event(), opener,
       () => spaceId() === sid && eventsInRoom(rid).some(e => e.id === id) &&
         (!rooms().some(r => r.id === rid && r.anchorEventId !== undefined) || replyPane()?.roomId === rid));
-    else if (mainPlace() === "chat") openForward({ kind: "chat", event_id: event().id }, event(), forwardButton);
+    else if (mainPlace() === "chat") openForward({ kind: "chat", event_id: event().id }, event(), opener);
   };
   const closePalette = () => {
     palette.set(false);
@@ -429,7 +441,8 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
   return (
     <MessageFrame
       testID={`${props.actions.readOnly ? "anchor" : "event"}:${event().id}`}
-      shortcuts={{ ...(replyable() ? { r: reply } : {}), ...(forwardable() ? { f: forward } : {}) }}
+      viewRef={node => { frame = node; }}
+      shortcuts={{ ...(replyable() ? { r: reply } : {}), ...(forwardable() ? { f: () => forward(frame) } : {}) }}
       highlight={forMe()}
       continued={continued()}
       selectable
@@ -453,7 +466,7 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
             </If>
             <If when={forwardable()}>
               <ToolbarIconButton testID={`forward:${event().id}`} icon="forward" tooltip="Forward" accessibilityLabel="Forward this message"
-                ref={node => { forwardButton = node; }} onPress={forward} />
+                ref={node => { forwardButton = node; }} onPress={() => forward(forwardButton)} />
             </If>
             <If when={copyable()}>
               <ToolbarIconButton
@@ -466,7 +479,7 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
             </If>
           </MessageToolbar>
           <If when={palette()}>
-            <ReactionPopover eventId={event().id} roomId={roomId()} anchor={reactButton} onClose={closePalette} />
+            <ReactionPopover eventId={event().id} roomId={roomId()} direct={direct()} anchor={reactButton} onClose={closePalette} />
           </If>
         </If>
       }
@@ -562,7 +575,7 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
           <If when={event().text.trim().length > 0}>
             <If when={event().kind === "message" || event().kind === "agent"}
               else={<FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />}>
-              <MentionedBody event={event()} sid={spaceId()} pieces={pieces()} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />
+              <MentionedBody event={event()} sid={spaceId()} pieces={pieces()} stateKey={disclosureKey(bodyScope(), event().id, "all")} />
             </If>
           </If>
         }
@@ -591,13 +604,13 @@ function MessageRow(props: { row: () => Of<"event">; actions: TranscriptActions 
         )}
       </If>
       <If when={reactable()}>
-        <Reactions eventId={event().id} roomId={roomId()} />
+        <Reactions eventId={event().id} roomId={roomId()} direct={direct()} />
       </If>
       <If when={replies()}>
         {r => <ReplySummary eventId={event().id} summary={r()} last={stampOf(r().lastAt, clock())?.short}
           onOpen={opener => { if (!openingReply()) props.actions.onReply?.(event(), opener); }} />}
       </If>
-      <If when={!props.actions.readOnly}><SenderNotice event={event} focusComposer={focusComposer} /></If>
+      <If when={!props.actions.readOnly && !direct()}><SenderNotice event={event} focusComposer={focusComposer} /></If>
     </MessageFrame>
   );
 }
@@ -624,12 +637,18 @@ function openFile(f: AttachedFile) {
  * the first emoji; Left and Right move, Return or Space picks, Escape or a
  * press outside closes and gives the focus back to the button.
  */
-function ReactionPopover(props: { eventId: number; roomId?: string; anchor: ViewRef | null; onClose: () => void }) {
-  const byEmoji = () => (props.roomId ? reactionsInRoom(props.roomId) : activeReactions())[props.eventId] ?? {};
+type ReactionTarget = { eventId: number; roomId?: string; direct?: DirectTranscript };
+const reactionsFor = (target: ReactionTarget) =>
+  (target.direct?.reactions() ?? (target.roomId ? reactionsInRoom(target.roomId) : activeReactions()))[target.eventId] ?? {};
+const reactTo = (target: ReactionTarget, emoji: string) =>
+  target.direct ? target.direct.react(target.eventId, emoji) : void toggleReaction(target.eventId, emoji, target.roomId);
+
+function ReactionPopover(props: ReactionTarget & { anchor: ViewRef | null; onClose: () => void }) {
+  const byEmoji = () => reactionsFor(props);
   const mine = (emoji: string) => (byEmoji()[emoji] ?? []).includes(`user:${me()}`);
   const pick = (emoji: string) => {
     props.onClose();
-    void toggleReaction(props.eventId, emoji, props.roomId);
+    reactTo(props, emoji);
   };
   return (
     <AnchoredPopover
@@ -662,10 +681,10 @@ function ReactionPopover(props: { eventId: number; roomId?: string; anchor: View
 }
 
 /** The reactions so far; nothing when there are none. */
-function Reactions(props: { eventId: number; roomId?: string }) {
-  const byEmoji = () => (props.roomId ? reactionsInRoom(props.roomId) : activeReactions())[props.eventId] ?? {};
+function Reactions(props: ReactionTarget) {
+  const byEmoji = () => reactionsFor(props);
   const emojis = () => Object.keys(byEmoji()).filter((e) => (byEmoji()[e]?.length ?? 0) > 0);
-  const pending = (emoji: string) => reactionPending() === `${props.eventId}|${emoji}`;
+  const pending = (emoji: string) => (props.direct ? props.direct.pending() : reactionPending()) === `${props.eventId}|${emoji}`;
   return (
     <If when={emojis().length > 0}>
       <Row gap={1} wrap align="center" testID={`reactions:${props.eventId}`}>
@@ -681,7 +700,7 @@ function Reactions(props: { eventId: number; roomId?: string }) {
                 agent={summary().agent}
                 busy={pending(emoji())}
                 accessibilityLabel={`${emoji()} ${summary().description}. ${summary().mine ? "Remove yours" : "Add yours"}`}
-                onPress={() => void toggleReaction(props.eventId, emoji(), props.roomId)}
+                onPress={() => reactTo(props, emoji())}
               />
             );
           }}

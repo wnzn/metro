@@ -13,6 +13,11 @@ import { Sidebar } from "./Sidebar";
 import { RoomHeaderActions, RoomHeaderTitle, SpaceView } from "./SpaceView";
 import { TopSearch } from "./TopSearch";
 import { ForwardEntry } from "./forward/ForwardEntry";
+import { DmHeader, DmView } from "./dms/DmView";
+import { dmDraftPending, watchDmFocus } from "./dms/state";
+import { registerUnsentCheck } from "../savedWorkspaces";
+
+registerUnsentCheck(dmDraftPending);
 
 /**
  * The signed-in app: the sidebar (or its icon rail while collapsed; nothing
@@ -24,6 +29,7 @@ import { ForwardEntry } from "./forward/ForwardEntry";
  * same place, draft and scroll.
  */
 export function Shell() {
+  watchDmFocus();
   try {
     // Removed with the Shell: signing out and in again never stacks it.
     cleanup(keymap.bind("mod+,", () => openSettings()));
@@ -53,7 +59,7 @@ export function Shell() {
             <PanelToggle side="left" name="workspace navigation" expanded={navigationPanel.open()}
               shortcut="B" testID="toggle-navigation" onPress={navigationPanel.toggle} />
           }
-          title={inRoom() ? <RoomHeaderTitle /> : undefined}
+          title={inRoom() ? <RoomHeaderTitle /> : mainPlace() === "dm" && !compactWidth() ? <DmHeader /> : undefined}
           trailing={inRoom() ? <RoomHeaderActions /> : undefined}
         >
           <TopSearch />
@@ -73,6 +79,9 @@ export function Shell() {
         </If>
         <If when={mainPlace() === "space"}>
           <SpaceView />
+        </If>
+        <If when={mainPlace() === "dm"}>
+          <DmView />
         </If>
       </Column>
       <SettingsModal />
