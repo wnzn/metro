@@ -65,7 +65,13 @@ test("a live turn is one line with its current step that settles into the summar
   expect(shown(app, `id:activity-toggle:event:${result.id}`)).toBe(false);
   expect(shown(app, "text:/README\\.md/")).toBe(false);
   // The question and the final answer stay visible, with their reactions.
-  expect(shown(app, "text:@agent what is in the workspace?")).toBe(true);
+  const question = `id:event:${ask.id}`;
+  expect(shown(app, `${question} >> id:mention-token:${ask.id}:0 >> text:@agent`)).toBe(true);
+  // The native mention line wraps individual words, not a single body node.
+  for (const word of ["what", "is", "in", "the", "workspace\\?"]) {
+    expect(shown(app, `${question} >> text:/^${word}\\s*$/`)).toBe(true);
+  }
+  expect(app.texts().join("")).toContain("@agent what is in the workspace?");
   expect(shown(app, `id:recipient:${ask.id}:agent`)).toBe(true);
   expect(shown(app, `id:react:${reply.id}`)).toBe(true);
   expect(shown(app, `id:react:${result.id}`)).toBe(false);
