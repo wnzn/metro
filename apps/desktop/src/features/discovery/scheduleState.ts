@@ -108,6 +108,21 @@ export function openNewTask() {
   });
 }
 
+/** Pages may prefill the normal form for a verified top-level Space room.
+ * This only opens a draft; the person still reviews and saves the task. */
+export function prefillPageTask(spaceId: string, roomId: string, prompt: string): boolean {
+  if (formOpen() || atTaskLimit() || !spaces().some(s => s.id === spaceId)) return false;
+  batch(() => {
+    resetForm();
+    formDestination.set({ kind: "room", spaceId, roomId });
+    formPrompt.set(prompt);
+    formOpen.set({ mode: "new" });
+    scheduleNotice.set(null);
+  });
+  void loadDestinationRooms(spaceId);
+  return true;
+}
+
 export function openEditTask(task: ScheduledTask) {
   batch(() => {
     resetForm();

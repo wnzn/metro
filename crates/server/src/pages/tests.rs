@@ -2170,6 +2170,143 @@ mod store_tests {
     }
 
     #[test]
+    fn confirmation_describes_live_destinations_and_the_claimed_schedule_revision() {
+        use serde_json::json;
+
+        let (db, sid) = db_with_space();
+        let agent = db.default_space_agent(&sid).unwrap().unwrap();
+        let task = crate::schedules::create_task(
+            &db,
+            "alice",
+            crate::schedules::CreateBody {
+                name: "Nightly".into(),
+                prompt: "Old task prompt".into(),
+                space_id: Some(sid.clone()),
+                room_id: Some("lobby".into()),
+                schedule: crate::schedules::ScheduleIn {
+                    kind: "cron".into(),
+                    at: None,
+                    expression: Some("0 3 * * *".into()),
+                    timezone: Some("UTC".into()),
+                },
+                enabled: true,
+            },
+            chrono::Utc::now(),
+            8_000,
+        )
+        .unwrap();
+        let source = format!(
+            r#"export default <Page title="P">
+                <Button key="ask" label="Ask" action="runAgent" agent="agent" room="lobby" prompt="Go"/>
+                <Button key="run" label="Run" action="runSchedule" schedule="{}"/>
+            </Page>"#,
+            task.id
+        );
+        let page = store::create(
+            &db,
+            Some(&sid),
+            &compiled(&db, "bob", Some(&sid), &source),
+            &PageLimits::default(),
+        )
+        .unwrap()
+        .unwrap();
+        {
+            let conn = db.lock();
+            conn.execute(
+                "UPDATE space_agents SET name = 'Fresh name', handle = 'fresh' WHERE id = ?1",
+                [&agent.id],
+            )
+            .unwrap();
+            conn.execute(
+                "UPDATE space_rooms SET name = 'Fresh room' WHERE space_id = ?1 AND id = 'lobby'",
+                [&sid],
+            )
+            .unwrap();
+        }
+        let author = crate::db::Author {
+            id: Some("alice".into()),
+            name: "Alice".into(),
+        };
+        let mut req = store::ActionRequest {
+            page: &page.id,
+            user: "alice",
+            author: &author,
+            version: 1,
+            block_key: "ask",
+            confirm: false,
+            schedule_revision: None,
+            chat_turn: "chat_x",
+            max_prompt_chars: 8_000,
+        };
+        let Err(store::ActionError::NeedsConfirmation(agent_challenge)) =
+            store::claim_action(&db, &req).unwrap()
+        else {
+            panic!("expected agent challenge");
+        };
+        let action = &agent_challenge["action"];
+        assert_eq!(action["agent"], "fresh");
+        assert_eq!(action["agent_name"], "Fresh name");
+        assert_eq!(action["agent_id"], agent.id);
+        assert_eq!(action["room"], "Fresh room");
+        assert_eq!(action["room_id"], "lobby");
+        assert_eq!(action["space_id"], sid);
+
+        req.block_key = "run";
+        let Err(store::ActionError::NeedsConfirmation(schedule_challenge)) =
+            store::claim_action(&db, &req).unwrap()
+        else {
+            panic!("expected schedule challenge");
+        };
+        let action = &schedule_challenge["action"];
+        assert_eq!(action["room"], "Fresh room");
+        assert_eq!(action["room_id"], "lobby");
+        assert_eq!(action["schedule_revision"], json!(task.revision));
+        assert_eq!(action["prompt"], "Old task prompt");
+        let new_room = db
+            .create_room(&sid, "New task room", None, 100, 100)
+            .unwrap();
+        db.lock()
+            .execute(
+                "UPDATE schedules SET revision = revision + 1, prompt = 'New task prompt',
+                 room_id = ?2 WHERE id = ?1",
+                [&task.id, &new_room.id],
+            )
+            .unwrap();
+        req.confirm = true;
+        req.schedule_revision = Some(task.revision);
+        assert!(matches!(
+            store::claim_action(&db, &req).unwrap(),
+            Err(store::ActionError::ScheduleChanged { revision }) if revision == task.revision + 1
+        ));
+        for table in ["page_confirmations", "schedule_runs"] {
+            let count: i64 = db
+                .lock()
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(count, 0, "{table}");
+        }
+        req.confirm = false;
+        let Err(store::ActionError::NeedsConfirmation(new_challenge)) =
+            store::claim_action(&db, &req).unwrap()
+        else {
+            panic!("expected a fresh schedule challenge");
+        };
+        assert_eq!(new_challenge["action"]["prompt"], "New task prompt");
+        assert_eq!(new_challenge["action"]["room"], "New task room");
+        assert_eq!(new_challenge["action"]["room_id"], new_room.id);
+        req.confirm = true;
+        req.schedule_revision = new_challenge["action"]["schedule_revision"].as_i64();
+        let Ok(store::Claimed::Schedule { task: claimed, .. }) =
+            store::claim_action(&db, &req).unwrap()
+        else {
+            panic!("expected a schedule claim");
+        };
+        assert_eq!(claimed.revision, task.revision + 1);
+        assert_eq!(claimed.prompt, "New task prompt");
+        assert_eq!(claimed.target, Some((sid, new_room.id)));
+    }
+
+    #[test]
     fn schedules_in_threads_never_run_from_a_page() {
         let (db, sid) = db_with_space();
         let thread = db

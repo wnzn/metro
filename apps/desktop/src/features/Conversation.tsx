@@ -94,6 +94,7 @@ import { ActivityGroupRow, FailureBody, FoldableText } from "./activity/Activity
 import { failureText } from "./activity/failure";
 import { disclosureKey, disclosureScope } from "./activity/disclosure";
 import { DEFAULT_AGENT_NAME, groupTranscript } from "./activity/group";
+import { PageDraftCard } from "./pages/PageDraftCard";
 import { clockFor } from "./chatTime";
 import type { Stamp } from "./chatTime";
 import { PersonAvatar } from "./profile/PersonAvatar";
@@ -212,7 +213,14 @@ function TranscriptRowView(props: { row: () => TranscriptRow }) {
     <If
       when={as("day")}
       else={
-        <If when={as("group")} else={<MessageRow row={() => row() as Of<"event">} />}>
+        <If when={as("group")} else={
+          <If when={mainPlace() === "space" && as("event")?.event.kind === "page_draft" ? as("event") : null}
+            else={<MessageRow row={() => row() as Of<"event">} />}>
+            {entry => <MessageFrame gutter={<StampGutter stamp={entry().stamp} id={entry().event.id} />} continued>
+              <PageDraftCard event={entry().event} />
+            </MessageFrame>}
+          </If>
+        }>
           {(g) => (
             <MessageFrame gutter={<StampGutter stamp={g().stamp} id={g().key} />} continued>
               <ActivityGroupRow

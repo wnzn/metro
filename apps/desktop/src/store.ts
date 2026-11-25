@@ -65,7 +65,7 @@ export type View = "room" | "manage";
  * outside every Space), or Settings, which opens as a modal over whichever of
  * those is underneath.
  */
-export type Place = "chat" | "space" | "settings" | "search" | "library" | "schedules";
+export type Place = "chat" | "space" | "settings" | "search" | "library" | "pages" | "schedules";
 /** Where the main panel is under any modal: never Settings. */
 export type MainPlace = Exclude<Place, "settings">;
 /** The pages of Settings. Reachable with or without any Space. */
@@ -397,7 +397,7 @@ export function openChat() {
 }
 
 /** Opens Search, Library or Scheduled tasks: the user's own pages, outside every Space. */
-export function openPlace(where: "search" | "library" | "schedules") {
+export function openPlace(where: "search" | "library" | "pages" | "schedules") {
   if (basePlace() === where && !settingsOpen()) return;
   navigationGeneration++;
   batch(() => {
@@ -408,6 +408,33 @@ export function openPlace(where: "search" | "library" | "schedules") {
     actionError.set(null);
     notice.set(null);
   });
+}
+
+/** Pages links must land on the exact room or stay where they are. Validate
+ * with a fresh membership-checked list before changing navigation. */
+export async function openExactRoom(spaceId: string, roomId: string, stillHere: () => boolean): Promise<boolean> {
+  const c = client;
+  if (!c || switchingSpace() || !roomId || !spaces().some(s => s.id === spaceId)) return false;
+  const valid = guard(spaceId);
+  const generation = navigationGeneration;
+  const list = await c.listRooms(spaceId);
+  if (!valid() || switchingSpace() || generation !== navigationGeneration || !stillHere() || !list.some(r => r.id === roomId)) return false;
+  navigationGeneration++;
+  lastRoomBySpace.set(spaceId, roomId);
+  batch(() => {
+    clearTransient();
+    roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+    activeSpaceId.set(spaceId);
+    activeRoomId.set(roomId);
+    view.set("room");
+    settingsOpen.set(false);
+    basePlace.set("space");
+    actionError.set(null);
+    notice.set(null);
+  });
+  rememberSpace(spaceId);
+  kick();
+  return true;
 }
 
 /**

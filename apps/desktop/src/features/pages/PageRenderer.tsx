@@ -1,0 +1,163 @@
+import { computed, signal } from "nsh";
+import type { ActionKind, PageValues, PageSpec } from "../../api/pages";
+import { Action, Badge, Column, Disclosure, Divider, Label, Row, Surface } from "../../ui";
+import type { Tone } from "../../ui";
+import { PageBlockFrame, PageChart, PageGrid, PageGridCell, PageMarkdown, PageProgress, PageTable } from "../../ui/pageBlocks";
+import { capabilityOf, number, planPage, str } from "./renderPlan";
+import type { PlanBlock } from "./renderPlan";
+
+type Interactions = {
+  data: PageValues | null;
+  readOnly?: boolean;
+  busy?: boolean;
+  changed?: ReadonlySet<string>;
+  onAction?: (key: string, kind: ActionKind) => void;
+  onEdit?: (key: string) => void;
+  onLink?: (url: string) => void;
+  onFile?: (id: string) => void;
+  onSchedule?: (block: string) => void;
+  canSchedule?: (block: string) => boolean;
+};
+
+const toneOf = (v: unknown): Tone => v === "info" ? "system"
+  : v === "success" || v === "warning" || v === "danger" ? v : "neutral";
+
+export function PageRenderer(props: Interactions & { spec: PageSpec; pending?: boolean }) {
+  const plan = computed(() => planPage(props.spec, props.data, !!props.pending));
+  return <Column gap={3} testID="page-renderer">
+    <If when={!plan().supported}><Label color="warning">This page format is not supported by this version of Metro.</Label></If>
+    <If when={plan().richText.limited}>
+      <Label color="warning" testID="page-rich-text-limit">Some rich text was shortened because this page reached its display limit.</Label>
+    </If>
+    <Each of={plan().blocks} key={b => b.instance}>
+      {block => <Block node={block()} interactions={props} />}
+    </Each>
+    <If when={plan().truncated}><Label color="warning" testID="page-render-limit">This page reached Metro’s display limit.</Label></If>
+  </Column>;
+}
+
+function Block(props: { node: PlanBlock; interactions: Interactions }) {
+  const key = () => props.node.key;
+  return <If when={props.node.type !== "Show" || props.node.issue || props.node.children.length || (!!key() && props.interactions.onEdit)}>
+    <PageBlockFrame blockKey={key()} changed={!!key() && props.interactions.changed?.has(key()!)}
+      onEdit={key() && props.interactions.onEdit ? () => props.interactions.onEdit?.(key()!) : undefined}>
+      <If when={props.node.issue !== undefined} else={<BlockBody node={props.node} interactions={props.interactions} />}>
+        <Label variant="caption" color="muted" testID="page-source-state">{props.node.issue}</Label>
+      </If>
+    </PageBlockFrame>
+  </If>;
+}
+
+function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
+  const n = () => props.node;
+  const p = () => n().p;
+  const label = () => str(p().label);
+  const empty = (fallback = "No data yet.") => str(p().empty) || fallback;
+  const tone = () => toneOf(p().tone);
+  const children = () => <Each of={n().children} key={b => b.instance}>
+    {child => <Block node={child()} interactions={props.interactions} />}
+  </Each>;
+  switch (n().type) {
+    case "Section": return <Section node={props.node}>{children()}</Section>;
+    case "Row": return <Row wrap gap={3} align="start">{children()}</Row>;
+    case "Grid": {
+      const columns = () => Math.floor(Math.max(1, Math.min(4, number(p().columns) ?? 2)));
+      return <PageGrid><Each of={n().children} key={b => b.instance}>{child =>
+        <PageGridCell columns={columns()}><Block node={child()} interactions={props.interactions} /></PageGridCell>
+      }</Each></PageGrid>;
+    }
+    case "Divider": return <Divider />;
+    case "Heading": return <Label heading variant={p().level === 1 ? "title" : p().level === 3 ? "strong" : "heading"}>{n().text}</Label>;
+    case "Text": return <Label color={p().muted === true ? "muted" : tone() === "neutral" ? "default" : tone()}>{n().text}</Label>;
+    case "Empty": return <Label variant="caption" color="muted">{n().text || empty()}</Label>;
+    case "Markdown": return <If when={n().document}>{document =>
+      <PageMarkdown document={document()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />
+    }</If>;
+    case "Badge": return <Row><Badge tone={tone()} label={n().text} /></Row>;
+    case "Stat": return <Surface variant="card" pad={3} gap={1}>
+      <Label variant="caption" color="muted">{label()}</Label>
+      <Label variant="display" color={n().stat?.tone ?? (tone() === "neutral" ? "default" : tone())}>{n().stat?.label}</Label>
+      <If when={p().hint}><Label variant="caption" color="muted">{str(p().hint)}</Label></If>
+    </Surface>;
+    case "Progress": {
+      const value = () => number(p().value);
+      const max = () => number(p().max) ?? 100;
+      return <If when={value() !== undefined && max() > 0} else={<Label color="muted">{empty()}</Label>}>
+        <PageProgress percent={Math.max(0, Math.min(100, value()! / max() * 100))} label={label() || "Progress"} tone={tone()} />
+      </If>;
+    }
+    case "Chart": return <If when={n().points?.length} else={<Label color="muted">{empty()}</Label>}>
+      <PageChart points={n().points ?? []} label={label() || "Chart"} kind={p().kind === "bar" ? "bar" : "line"} />
+    </If>;
+    case "Table": return <If when={n().rows?.length} else={<Label color="muted">{empty()}</Label>}>
+      <PageTable headings={n().headings ?? []} rows={n().rows ?? []} />
+    </If>;
+    case "List": return <If when={n().children.length} else={<Label color="muted">{empty()}</Label>}>
+      <Column gap={1}>{children()}</Column>
+    </If>;
+    case "Each": case "Show": return <Column gap={2}>{children()}</Column>;
+    case "AgentAnswer": {
+      const answer = () => n().answer;
+      return <Column gap={2}>
+        <If when={answer()} else={<Label color="muted">{empty("No answer yet.")}</Label>}>{item => <>
+          <Row gap={2} align="center" wrap>
+            <Badge tone={item().status.tone ?? "agent"} label={item().status.label} />
+            <Label variant="meta">{item().metadata}</Label>
+          </Row>
+          <If when={n().document}>
+            {document => <PageMarkdown document={document()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />}
+          </If>
+          <If when={item().error}>{t => <Label color="warning">{t()}</Label>}</If>
+        </>}</If>
+        <If when={!props.interactions.readOnly && props.interactions.onSchedule && n().key && props.interactions.canSchedule?.(n().key!) ? n().key : undefined}>
+          {key => <Row><Action compact variant="ghost" label="Keep this answer fresh…" testID={`page-schedule:${key()}`} onPress={() => props.interactions.onSchedule?.(key())} /></Row>}
+        </If>
+      </Column>;
+    }
+    case "RunList": case "MessageFeed": case "ScheduleCard": case "FileList":
+      return <If when={n().entries?.length} else={<Label color="muted">{empty()}</Label>}>
+        <Column gap={2}>
+          <Each of={n().entries ?? []}>{(item, index) => {
+            const status = () => item().status;
+            return <Surface variant="card" pad={2} gap={1}>
+              <Row gap={2} wrap align="center">
+                <Label variant="strong">{item().title || "Untitled"}</Label>
+                <If when={status().label && status().label !== "—"}><Badge tone={status().tone ?? "neutral"} label={status().label} /></If>
+              </Row>
+              <If when={n().type === "MessageFeed"} else={
+                <Label variant="meta">{item().metadata}</Label>
+              }>
+                <If when={n().messages?.[index()]}>{document =>
+                  <PageMarkdown document={document()} onLink={props.interactions.readOnly ? undefined : props.interactions.onLink} />
+                }</If>
+              </If>
+              <If when={!props.interactions.readOnly && props.interactions.onFile ? item().fileId : undefined}>{id =>
+                <Row><Action compact variant="ghost" label="Open file" onPress={() => props.interactions.onFile?.(id())} /></Row>
+              }</If>
+            </Surface>;
+          }}</Each>
+        </Column>
+      </If>;
+    case "Button": case "Link": {
+      const capability = () => n().key ? capabilityOf(props.interactions.data, n().key!) : undefined;
+      const disabled = () => props.interactions.readOnly || !props.interactions.onAction || !n().action || capability()?.enabled !== true;
+      const reason = () => props.interactions.readOnly ? "Preview only" : n().disabledReason || "Action unavailable";
+      return <Column gap={1} align="start">
+        <Action testID={`page-action:${n().key}`} label={label() || "Action"} variant={n().type === "Link" ? "ghost" : tone() === "danger" ? "destructive" : tone() === "system" ? "primary" : "secondary"}
+          disabled={disabled() || props.interactions.busy}
+          onPress={() => { if (!disabled() && !props.interactions.busy && n().key && n().action) props.interactions.onAction?.(n().key!, n().action!); }} />
+        <If when={disabled()}><Label variant="caption" color="muted">{reason()}</Label></If>
+      </Column>;
+    }
+    default: return null;
+  }
+}
+
+function Section(props: { node: PlanBlock; children?: import("nsh").JSX.Element }) {
+  const open = signal(props.node.p.collapsed !== true);
+  return <Surface variant="card" pad={3}>
+    <Disclosure title={str(props.node.p.title) || "Section"} open={open()} onToggle={open.set}>
+      <Column gap={3}>{props.children}</Column>
+    </Disclosure>
+  </Surface>;
+}
