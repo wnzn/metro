@@ -89,18 +89,6 @@ pub fn template(id: &str) -> Option<&'static Template> {
     TEMPLATES.iter().find(|t| t.id == id)
 }
 
-/// A JSX attribute string for `value`: double quotes, single quotes, or
-/// `None` when it contains both.
-fn attr(value: &str) -> Option<String> {
-    if !value.contains('"') {
-        Some(format!("\"{value}\""))
-    } else if !value.contains('\'') {
-        Some(format!("'{value}'"))
-    } else {
-        None
-    }
-}
-
 /// `template`'s source for a page in `space` (with its `room` and `agent`
 /// handle), or for a personal page (personal Chat).
 pub fn instantiate(t: &Template, space: Option<(&str, &str, &str)>) -> String {
@@ -111,8 +99,8 @@ pub fn instantiate(t: &Template, space: Option<(&str, &str, &str)>) -> String {
         .map(|l| format!("{l}\n"))
         .collect();
     let (target, room_only) = match space {
-        Some((room_id, room_name, agent)) => {
-            let room = attr(room_name).unwrap_or_else(|| format!("\"{room_id}\""));
+        Some((_room_id, room_name, agent)) => {
+            let room = tsx::jsx_attr_string(room_name);
             (
                 format!("room={room} agent=\"{agent}\""),
                 format!("room={room}"),
@@ -153,42 +141,70 @@ pub fn instantiate(t: &Template, space: Option<(&str, &str, &str)>) -> String {
 /// What the author may reference, as structured data: names only, never
 /// message content. It goes to the model as data in the user turn, marked
 /// untrusted (names are written by people), never in the system message.
-fn catalogue(db: &crate::db::Db, user: &str, space: Option<&str>) -> anyhow::Result<Json> {
-    let spaces: Vec<crate::db::SpaceView> = match space {
-        Some(sid) => db.membership(sid, user)?.into_iter().collect(),
-        None => db.list_spaces(user)?,
+///
+/// Read as one snapshot under the database lock, so every row comes from a
+/// Space the author is a member of at that moment. Returns the catalogue
+/// and the ids of the Spaces it names: the generation must stop if the
+/// author leaves any of them before a later model call.
+fn catalogue(
+    db: &crate::db::Db,
+    user: &str,
+    space: Option<&str>,
+) -> anyhow::Result<(Json, Vec<String>)> {
+    let conn = db.lock();
+    let spaces: Vec<(String, String)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT s.id, s.name FROM space_members m JOIN spaces s ON s.id = m.space_id
+             WHERE m.user_id = ?1 AND (?2 IS NULL OR s.id = ?2)
+             ORDER BY s.created_at, s.rowid LIMIT ?3",
+        )?;
+        stmt.query_map(rusqlite::params![user, space, MAX_LISTED as i64], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })?
+        .collect::<Result<_, _>>()?
     };
     let mut listed = Vec::new();
-    for s in spaces.iter().take(MAX_LISTED) {
-        let rooms: Vec<Json> = db
-            .list_rooms(&s.id)?
-            .iter()
-            .take(MAX_LISTED)
-            .map(|r| json!({"name": r.name, "thread": r.parent_room_id.is_some()}))
-            .collect();
-        let agents: Vec<Json> = db
-            .space_agents(&s.id)?
+    for (sid, name) in &spaces {
+        let rooms: Vec<Json> = {
+            let mut stmt = conn.prepare_cached(
+                "SELECT name, parent_room_id IS NOT NULL FROM space_rooms WHERE space_id = ?1
+                 ORDER BY created_at, rowid LIMIT ?2",
+            )?;
+            stmt.query_map(rusqlite::params![sid, MAX_LISTED as i64], |r| {
+                Ok(json!({"name": r.get::<_, String>(0)?, "thread": r.get::<_, bool>(1)?}))
+            })?
+            .collect::<Result<_, _>>()?
+        };
+        let agents: Vec<Json> = crate::space_agents::list_in(&conn, sid)?
             .iter()
             .take(MAX_LISTED)
             .map(|a| json!({"handle": a.handle, "default": a.is_default, "description": a.description}))
             .collect();
-        listed.push(json!({"id": s.id, "name": s.name, "rooms": rooms, "agents": agents}));
+        listed.push(json!({"id": sid, "name": name, "rooms": rooms, "agents": agents}));
     }
+    // Personal pages can't run schedules: only a Space page lists them.
     let tasks: Vec<Json> = match space {
-        // Personal pages can't run schedules.
         None => Vec::new(),
-        Some(sid) => crate::schedules::list_tasks(db, user)?
-            .iter()
-            .filter(|t| t.target.as_ref().is_some_and(|(s, _)| s == sid))
-            .take(MAX_LISTED)
-            .map(|t| json!({"id": t.id, "name": t.name}))
-            .collect(),
+        Some(sid) => {
+            let mut stmt = conn.prepare_cached(
+                "SELECT id, name FROM schedules WHERE owner_id = ?1 AND space_id = ?2
+                 ORDER BY created_at, id LIMIT ?3",
+            )?;
+            stmt.query_map(rusqlite::params![user, sid, MAX_LISTED as i64], |r| {
+                Ok(json!({"id": r.get::<_, String>(0)?, "name": r.get::<_, String>(1)?}))
+            })?
+            .collect::<Result<_, _>>()?
+        }
     };
-    Ok(json!({
-        "page": if space.is_some() { "space" } else { "personal" },
-        "spaces": listed,
-        "schedules": tasks,
-    }))
+    let ids = spaces.into_iter().map(|(id, _)| id).collect();
+    Ok((
+        json!({
+            "page": if space.is_some() { "space" } else { "personal" },
+            "spaces": listed,
+            "schedules": tasks,
+        }),
+        ids,
+    ))
 }
 
 /// The catalogue as the first part of the user turn: labelled as data.
@@ -553,8 +569,8 @@ enum Outcome {
 }
 
 /// What a draft says when its author lost access while it was generating.
-pub const REVOKED: &str =
-    "Stopped: you can no longer edit this page here (or the draft was discarded).";
+pub const REVOKED: &str = "Stopped: your access changed while the page was being built (or the \
+     draft was discarded); try again.";
 
 /// Longest model reply used, in bytes: more than any valid page needs. Longer
 /// replies are cut before extraction, retry history and storage.
@@ -591,11 +607,14 @@ async fn compile_as(
         .await
 }
 
-async fn still_wanted(state: &AppState, job: &Job) -> bool {
-    let (id, user) = (job.draft_id.clone(), job.user.clone());
+/// Whether the job may still call a model: the draft is still wanted
+/// ([`store::draft_live`]) and the author is still a member of every Space
+/// whose names the request carries.
+async fn still_wanted(state: &AppState, job: &Job, spaces: &[String]) -> bool {
+    let (id, user, spaces) = (job.draft_id.clone(), job.user.clone(), spaces.to_vec());
     state
         .db
-        .call(move |db| store::draft_live(db, &id, &user))
+        .call(move |db| store::draft_live(db, &id, &user, &spaces))
         .await
         .unwrap_or(false)
 }
@@ -603,7 +622,7 @@ async fn still_wanted(state: &AppState, job: &Job) -> bool {
 async fn generate(state: &AppState, job: &Job) -> Outcome {
     // Routing may itself call a model (System One): only under the
     // reservation, and only while the draft is still wanted.
-    if !still_wanted(state, job).await {
+    if !still_wanted(state, job, &[]).await {
         return Outcome::Error {
             error: REVOKED.to_owned(),
             attempts: 0,
@@ -628,7 +647,7 @@ async fn generate(state: &AppState, job: &Job) -> Outcome {
         }
     };
     let (db_user, db_space) = (job.user.clone(), job.space.clone());
-    let context = match state
+    let (context, catalogued) = match state
         .db
         .call(move |db| catalogue(db, &db_user, db_space.as_deref()))
         .await
@@ -674,7 +693,9 @@ async fn generate(state: &AppState, job: &Job) -> Outcome {
         let attempts = attempt as i64 + 1;
         // Rechecked right before every model call: still generating, still
         // theirs, still a member, still an editor of the page.
-        if !still_wanted(state, job).await {
+        // The request (and its history) names these Spaces: stop rather
+        // than send their names once the author has left one of them.
+        if !still_wanted(state, job, &catalogued).await {
             return Outcome::Error {
                 error: REVOKED.to_owned(),
                 attempts: attempts - 1,

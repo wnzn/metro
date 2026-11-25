@@ -175,7 +175,9 @@ async fn full_view(
     page: &PageRow,
     rights: &Rights,
 ) -> ApiResult<Json_> {
-    let head = head_of(state, page).await?;
+    let head = versions_of(state, who, &page.id, vec![page.head_version])
+        .await?
+        .remove(0);
     let (uid, pid) = (who.id.clone(), page.id.clone());
     let prefs = db(state, move |db| store::prefs(db, &uid, &pid)).await?;
     let mut v = meta(page, rights, &prefs);
@@ -483,13 +485,8 @@ fn retitle(source: &str, title: &str) -> Result<String, &'static str> {
     let a = root.attr("title").ok_or("the page has no title")?;
     // `title="…"`, `title='…'` and `title={"…"}` alike: the whole attribute
     // is replaced.
-    let quoted = if !title.contains('"') {
-        format!("\"{title}\"")
-    } else if !title.contains('\'') {
-        format!("'{title}'")
-    } else {
-        return Err("a title can't contain both \" and '");
-    };
+    // Canonical: any title round-trips through the parser.
+    let quoted = tsx::jsx_attr_string(title);
     Ok(format!(
         "{}title={quoted}{}",
         &source[..a.at],
@@ -622,20 +619,40 @@ async fn list_versions(
     who: Human,
     Path(pid): Path<String>,
 ) -> ApiResult<Json<Json_>> {
-    let (page, _) = load_live(&state, &who, &pid).await?;
-    let id = page.id.clone();
-    let versions = db(&state, move |db| store::version_list(db, &id)).await?;
+    if !compile::valid_page_id(&pid) {
+        return Err(ApiError::not_found(NO_PAGE));
+    }
+    let uid = who.id.clone();
+    let (head, versions) = db(&state, move |db| store::version_list_for(db, &pid, &uid))
+        .await?
+        .map_err(|_| ApiError::not_found(NO_PAGE))?;
     let list: Vec<Json_> = versions.iter().map(list_meta).collect();
-    Ok(Json(
-        json!({"head_version": page.head_version, "versions": list}),
-    ))
+    Ok(Json(json!({"head_version": head, "versions": list})))
 }
 
-async fn version_n(state: &AppState, page: &PageRow, n: i64) -> ApiResult<VersionRow> {
-    let id = page.id.clone();
-    db(state, move |db| store::version(db, &id, n))
-        .await?
-        .ok_or_else(|| ApiError::not_found("no such version"))
+/// Versions `ns` of page `pid` (`0` = the head) for `who`, read under the
+/// same lock as their grant check: a removal can't land in between.
+async fn versions_of(
+    state: &AppState,
+    who: &Human,
+    pid: &str,
+    ns: Vec<i64>,
+) -> ApiResult<Vec<VersionRow>> {
+    let (id, uid) = (pid.to_owned(), who.id.clone());
+    match db(state, move |db| store::versions_for(db, &id, &uid, &ns)).await? {
+        Ok(found) => found
+            .into_iter()
+            .map(|v| v.ok_or_else(|| ApiError::not_found("no such version")))
+            .collect(),
+        Err(_) => Err(ApiError::not_found(NO_PAGE)),
+    }
+}
+
+async fn version_n(state: &AppState, who: &Human, page: &PageRow, n: i64) -> ApiResult<VersionRow> {
+    if n < 1 {
+        return Err(ApiError::not_found("no such version"));
+    }
+    Ok(versions_of(state, who, &page.id, vec![n]).await?.remove(0))
 }
 
 async fn get_version(
@@ -643,8 +660,10 @@ async fn get_version(
     who: Human,
     Path((pid, n)): Path<(String, i64)>,
 ) -> ApiResult<Json<Json_>> {
-    let (page, _) = load_live(&state, &who, &pid).await?;
-    let v = version_n(&state, &page, n).await?;
+    if !compile::valid_page_id(&pid) || n < 1 {
+        return Err(ApiError::not_found(NO_PAGE));
+    }
+    let v = versions_of(&state, &who, &pid, vec![n]).await?.remove(0);
     let mut out = version_meta(&v);
     out["source"] = json!(v.source);
     out["spec"] = serde_json::from_str(&v.spec).unwrap_or(Json_::Null);
@@ -724,7 +743,7 @@ async fn restore_version(
         return Err(forbidden("you can't edit this page"));
     }
     let Json(body) = body?;
-    let old = version_n(&state, &page, n).await?;
+    let old = version_n(&state, &who, &page, n).await?;
     if body.base_version != page.head_version {
         return Ok(conflict_head(page.head_version));
     }
@@ -753,9 +772,12 @@ async fn diff(
     query: Result<Query<DiffQuery>, QueryRejection>,
 ) -> ApiResult<Json<Json_>> {
     let Query(q) = query?;
-    let (page, _) = load_live(&state, &who, &pid).await?;
-    let a = version_n(&state, &page, q.from).await?;
-    let b = version_n(&state, &page, q.to.unwrap_or(page.head_version)).await?;
+    if !compile::valid_page_id(&pid) || q.from < 1 || q.to.is_some_and(|t| t < 1) {
+        return Err(ApiError::not_found(NO_PAGE));
+    }
+    // Both versions and the grant in one read.
+    let mut found = versions_of(&state, &who, &pid, vec![q.from, q.to.unwrap_or(0)]).await?;
+    let (a, b) = (found.remove(0), found.remove(0));
     let (sa, sb) = (spec_of(&a)?, spec_of(&b)?);
     Ok(Json(json!({
         "from": {"version": a.version, "source": a.source},
@@ -1106,9 +1128,12 @@ async fn delete_draft(
     who: Human,
     Path(id): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let d = own_draft(&state, &who, &id).await?;
-    db(&state, move |db| store::discard_draft(db, &d.id)).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let uid = who.id.clone();
+    if db(&state, move |db| store::discard_draft(db, &id, &uid)).await? {
+        Ok(StatusCode::NO_CONTENT)
+    } else {
+        Err(ApiError::not_found(NO_DRAFT))
+    }
 }
 
 #[derive(Deserialize, Default)]

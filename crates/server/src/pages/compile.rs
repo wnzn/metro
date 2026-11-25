@@ -496,15 +496,11 @@ pub fn markdown_problem(md: &str) -> Option<&'static str> {
             return Some("raw HTML and <…> autolinks aren't allowed in <Markdown>");
         }
     }
-    // Reference definitions (`[x]: …`, up to three spaces in) and full or
-    // collapsed reference links (`[x][y]`, `[x][]`).
-    for line in lower.lines() {
-        let l = line.trim_start_matches(' ');
-        if line.len() - l.len() <= 3 && l.starts_with('[') && l.contains("]:") {
-            return Some(NO_REFS);
-        }
-    }
-    if lower.contains("][") {
+    // Reference definitions, wherever they are (inside block quotes, list
+    // items or after lazy continuation lines; labels may span lines), and
+    // full or collapsed reference links. Without definitions a shortcut
+    // reference (`[x]`) can never become a link.
+    if lower.contains("]:") || lower.contains("][") {
         return Some(NO_REFS);
     }
     // Inline links.
@@ -619,6 +615,13 @@ struct Compiler<'a> {
     multiplier: usize,
     /// Blocks and table cells rendered with full data.
     rendered: usize,
+}
+
+impl Compiler<'_> {
+    /// Add `n` rendered blocks or cells, saturating just past the budget.
+    fn cost(&mut self, n: usize) {
+        self.rendered = self.rendered.saturating_add(n).min(spec::MAX_RENDERED + 1);
+    }
 }
 
 fn static_str(list: &'static [&'static str], s: &str) -> Option<&'static str> {
@@ -1424,9 +1427,10 @@ impl<'a> Compiler<'a> {
             }
         }
         // Repetition: counted at its worst case, and never nested.
-        self.rendered += self.multiplier;
+        self.cost(self.multiplier);
         let repeats = matches!(e.name.as_str(), "List" | "Each" | "Table");
-        if repeats && self.multiplier > 1 {
+        let nested = repeats && self.multiplier > 1;
+        if nested {
             self.push(
                 e.at,
                 k,
@@ -1459,7 +1463,13 @@ impl<'a> Compiler<'a> {
         let scope = inner.as_ref().unwrap_or(scope);
         let saved = self.multiplier;
         if matches!(e.name.as_str(), "List" | "Each") {
-            self.multiplier = saved.saturating_mul(spec::MAX_ITEMS);
+            // A rejected nested repeater isn't multiplied again: the page
+            // already fails, and its cost stays bounded.
+            if !nested {
+                self.multiplier = saved
+                    .saturating_mul(spec::MAX_ITEMS)
+                    .min(spec::MAX_RENDERED + 1);
+            }
         }
         match d.kids {
             Kids::None => {
@@ -1609,7 +1619,13 @@ impl<'a> Compiler<'a> {
                     format!("a <Table> has at most {} columns", spec::MAX_COLUMNS),
                 );
             }
-            self.rendered += self.multiplier * spec::MAX_ITEMS * columns;
+            if !nested {
+                self.cost(
+                    self.multiplier
+                        .saturating_mul(spec::MAX_ITEMS)
+                        .saturating_mul(columns),
+                );
+            }
         }
         if matches!(e.name.as_str(), "Button" | "Link") {
             self.actions += 1;

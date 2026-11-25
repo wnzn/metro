@@ -213,7 +213,7 @@ fn agent_answer(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json
         } else {
             None
         };
-        let Some(run) = store::latest_run(db, page, block, only)? else {
+        let Some(run) = store::latest_run(db, viewer, page, block, only)? else {
             return Ok(Json::Null);
         };
         let reply = match (&run.space_id, &run.room_id) {
@@ -464,9 +464,8 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
     if let (Some(sid), Some(room)) = (allowed.first(), t.room_id.as_deref()) {
         room_ok(db, sid, Some(room))?;
     }
-    let mut rooms: HashMap<(String, String), String> = HashMap::new();
-    let mut items = Vec::new();
-    let mut active_by: HashMap<String, usize> = HashMap::new();
+    // Filter in registry order, newest first; limit only afterwards.
+    let mut matching = Vec::new();
     for r in all.iter().rev() {
         if !allowed.contains(&r.space_id) {
             continue;
@@ -476,7 +475,7 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
         }
         // Newest first: the last of a run's (at most a few) lifecycle
         // markers is its `started` one; any marker carries the agent.
-        let started = store::room_events(
+        let markers = store::room_events(
             db,
             viewer,
             &r.space_id,
@@ -486,8 +485,8 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
             None,
             8,
         )?;
-        let marker = started.last();
-        let agent = marker
+        let agent = markers
+            .last()
             .and_then(|e| e.activity.as_ref())
             .and_then(|a| a.agent.clone());
         if let Some(want) = &t.agent_id
@@ -495,12 +494,21 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
         {
             continue;
         }
-        if r.status == RunStatus::Running {
-            *active_by.entry(r.space_id.clone()).or_default() += 1;
-        }
-        if items.len() >= limit_of(t) {
-            continue;
-        }
+        matching.push((r, agent, markers.last().map(at)));
+    }
+    // Membership again after the read: a Space the viewer left meanwhile
+    // contributes nothing, to the list or the count.
+    let still: std::collections::HashSet<String> =
+        db.list_spaces(viewer)?.into_iter().map(|s| s.id).collect();
+    matching.retain(|(r, ..)| still.contains(&r.space_id));
+    // Active runs are counted over every match, not just the listed ones.
+    let active = matching
+        .iter()
+        .filter(|(r, ..)| r.status == RunStatus::Running)
+        .count();
+    let mut rooms: HashMap<(String, String), String> = HashMap::new();
+    let mut items = Vec::new();
+    for (r, agent, started) in matching.into_iter().take(limit_of(t)) {
         let key = (r.space_id.clone(), r.room_id.clone());
         if !rooms.contains_key(&key) {
             let name = db
@@ -517,24 +525,12 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
             "room": rooms.get(&key),
             "room_id": r.room_id,
             "space_id": r.space_id,
-            "started": started.last().map(at),
+            "started": started,
             "sender": display(db, Some(&r.actor), &r.actor),
             "sender_id": r.actor,
             "task": r.task,
         }));
     }
-    // Membership again after the read: a Space the viewer left meanwhile
-    // contributes nothing.
-    let still: std::collections::HashSet<String> =
-        db.list_spaces(viewer)?.into_iter().map(|s| s.id).collect();
-    items.retain(|i| i["space_id"].as_str().is_some_and(|s| still.contains(s)));
-    let active: usize = active_by
-        .iter()
-        .filter(|(s, _)| still.contains(*s))
-        .map(|(_, n)| n)
-        .sum();
-    // Newest first by start time; runs without a known start last.
-    items.sort_by(|a, b| b["started"].as_str().cmp(&a["started"].as_str()));
     Ok(json!({"active": active, "items": items}))
 }
 
@@ -580,34 +576,20 @@ fn capability(
         }
     };
     let result: Result<Json, Fail> = (|| match a.kind.as_str() {
-        action::RUN_AGENT => {
-            let Some(sid) = space_of(db, ctx, &a.target, viewer)? else {
-                return Ok(json!({"enabled": a.target.chat, "confirm": confirm()}));
+        // The same destination policy the click claim applies.
+        action::RUN_AGENT | action::RUN_SCHEDULE => {
+            let dest = {
+                let conn = db.lock();
+                store::destination_in(&conn, ctx.space_id.as_deref(), a, viewer)
+                    .map_err(anyhow::Error::from)?
             };
-            let room = a.target.room_id.as_deref().ok_or(Fail::NoAccess)?;
-            if db.get_room(&sid, room)?.is_none() {
-                return Ok(no("This button's room no longer exists."));
-            }
-            let agent = a.target.agent_id.as_deref().unwrap_or_default();
-            if db.space_agent(&sid, agent)?.is_none() {
-                return Ok(no("This button's agent no longer exists."));
-            }
-            Ok(json!({"enabled": true, "confirm": confirm()}))
-        }
-        action::RUN_SCHEDULE => {
-            let id = a.schedule_id.clone().unwrap_or_default();
-            let task = crate::schedules::list_tasks(db, viewer)?
-                .into_iter()
-                .find(|t| t.id == id);
-            let Some(task) = task else {
-                return Ok(no("Only the schedule's owner can run it."));
-            };
-            if let Some(sid) = &ctx.space_id
-                && task.target.as_ref().is_none_or(|(s, _)| s != sid)
-            {
-                return Ok(no("This schedule doesn't run in this Space."));
-            }
-            Ok(json!({"enabled": true, "confirm": confirm()}))
+            Ok(match dest {
+                Err(e) => no(e.reason()),
+                Ok(store::Destination::Schedule(t)) => {
+                    json!({"enabled": true, "confirm": confirm(), "schedule_revision": t.revision})
+                }
+                Ok(_) => json!({"enabled": true, "confirm": confirm()}),
+            })
         }
         action::OPEN_ROOM => match space_of(db, ctx, &a.target, viewer)? {
             Some(sid) => {

@@ -947,6 +947,51 @@ fn moves_and_sibling_swaps_count_outside_the_selection() {
 }
 
 #[test]
+fn a_huge_invalid_subtree_is_costed_without_overflow() {
+    // Repeaters nested as deep as the parser allows around a table with
+    // hundreds of columns: worst-case cost far past usize. Rejected with
+    // diagnostics, and the costing never overflows (debug build).
+    let mut body = String::from(r#"<Data name="r" source="runs"/>"#);
+    for i in 0..9 {
+        body.push_str(&format!(r#"<Each key="e{i}" items={{r.items}} as="x{i}">"#));
+    }
+    let cols: String = (0..500)
+        .map(|c| format!(r#"<Column field="c{c}" label="C"/>"#))
+        .collect();
+    body.push_str(&format!(
+        r#"<Table key="t" rows={{r.items}}>{cols}</Table>"#
+    ));
+    body.push_str(&"</Each>".repeat(9));
+    let c = space_page(&page(&body));
+    assert!(c.spec.is_none());
+    assert!(
+        c.diagnostics
+            .iter()
+            .any(|d| d.message.contains("can't be nested")),
+        "{:#?}",
+        c.diagnostics
+    );
+}
+
+#[test]
+fn reference_definitions_are_refused_in_any_container() {
+    for md in [
+        "> [x]: https://a.example\n>\n> [x]",
+        "- [x]: https://a.example\n- [x]",
+        "1. [x]: https://a.example",
+        "[multi\nline]: https://a.example",
+        "para\n[x]:\n  https://a.example",
+        "* > [x]: javascript:alert(1)",
+    ] {
+        let body = format!(
+            "<Markdown key=\"m\">{{{}}}</Markdown>",
+            serde_json::to_string(md).unwrap()
+        );
+        rejects(&space_page(&page(&body)), "reference-style");
+    }
+}
+
+#[test]
 fn diagnostics_point_at_the_right_place() {
     let src = "export default (\n  <Page title=\"x\">\n    <Stat key=\"s\" label=\"x\" value={go()} />\n  </Page>\n);";
     let c = space_page(src);
@@ -1512,7 +1557,7 @@ mod store_tests {
             let b = store::create_draft(&db, &draft("alice", WINDOW))
                 .unwrap()
                 .unwrap();
-            store::discard_draft(&db, &b.id).unwrap();
+            assert!(store::discard_draft(&db, &b.id, "alice").unwrap());
             // Both still hold a slot: the third is refused.
             assert!(
                 store::create_draft(&db, &draft("alice", WINDOW))
@@ -1829,7 +1874,7 @@ mod store_tests {
         );
         // A discarded draft can't be applied.
         let d3 = new_draft(&db);
-        store::discard_draft(&db, &d3).unwrap();
+        assert!(store::discard_draft(&db, &d3, "bob").unwrap());
         assert_eq!(
             store::apply_draft(&db, &d3, "bob", &version("bob", "x"), &limits).unwrap(),
             Err(store::ApplyError::Gone)
@@ -2071,6 +2116,327 @@ mod store_tests {
             "{:#?}",
             c.diagnostics
         );
+    }
+
+    #[test]
+    fn version_and_run_reads_carry_the_viewers_grant() {
+        let (db, sid) = db_with_space();
+        let limits = PageLimits::default();
+        let p = store::create(&db, Some(&sid), &version("alice", "v1"), &limits)
+            .unwrap()
+            .unwrap();
+        db.lock()
+            .execute(
+                "INSERT INTO page_runs (page_id, version, block_key, user_id, trigger_id, run_id, \
+                 error, created_at) VALUES (?1, 1, 'ask', 'alice', 1, '', 'no model', 0)",
+                [&p.id],
+            )
+            .unwrap();
+        assert!(store::version_list_for(&db, &p.id, "bob").unwrap().is_ok());
+        assert!(
+            store::latest_run(&db, "bob", &p.id, "ask", None)
+                .unwrap()
+                .is_some()
+        );
+        // Bob is removed; then Alice writes version 2.
+        db.remove_member(&sid, "bob").unwrap();
+        store::add_version(&db, &p.id, 1, &version("alice", "v2 secret"), &limits)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store::version_list_for(&db, &p.id, "bob").unwrap(),
+            Err(store::Denied::Gone)
+        );
+        for ns in [vec![1], vec![2], vec![0], vec![1, 2]] {
+            assert_eq!(
+                store::versions_for(&db, &p.id, "bob", &ns).unwrap(),
+                Err(store::Denied::Gone)
+            );
+        }
+        assert!(
+            store::latest_run(&db, "bob", &p.id, "ask", None)
+                .unwrap()
+                .is_none()
+        );
+        // Alice still reads everything.
+        let (head, list) = store::version_list_for(&db, &p.id, "alice")
+            .unwrap()
+            .unwrap();
+        assert_eq!((head, list.len()), (2, 2));
+        let found = store::versions_for(&db, &p.id, "alice", &[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(found[0].as_ref().unwrap().version, 2);
+    }
+
+    #[test]
+    fn schedules_in_threads_never_run_from_a_page() {
+        let (db, sid) = db_with_space();
+        let thread = db
+            .create_room(&sid, "nightly-thread", Some("lobby"), 100, 100)
+            .unwrap();
+        let body = crate::schedules::CreateBody {
+            name: "N".into(),
+            prompt: "p".into(),
+            space_id: Some(sid.clone()),
+            room_id: Some(thread.id.clone()),
+            schedule: crate::schedules::ScheduleIn {
+                kind: "cron".into(),
+                at: None,
+                expression: Some("0 3 * * *".into()),
+                timezone: Some("UTC".into()),
+            },
+            enabled: true,
+        };
+        let task =
+            crate::schedules::create_task(&db, "alice", body, chrono::Utc::now(), 8_000).unwrap();
+        let src = format!(
+            r#"export default <Page title="P"><Button key="run" label="x" action="runSchedule" schedule="{}"/></Page>"#,
+            task.id
+        );
+        let limits = PageLimits::default();
+        let p = store::create(
+            &db,
+            Some(&sid),
+            &compiled(&db, "alice", Some(&sid), &src),
+            &limits,
+        )
+        .unwrap()
+        .unwrap();
+        let spec: super::super::spec::PageSpec =
+            serde_json::from_str(&store::version(&db, &p.id, 1).unwrap().unwrap().spec).unwrap();
+        let a = spec.block("run").unwrap().action.clone().unwrap();
+        // A legacy personal page with a Space-room button: disabled, with why.
+        let mut legacy = a.clone();
+        legacy.kind = "runAgent".into();
+        legacy.target.space_id = Some(sid.clone());
+        let Err(e) = store::destination_in(&db.lock(), None, &legacy, "alice").unwrap() else {
+            panic!("a personal page's Space button was allowed");
+        };
+        assert!(
+            e.reason().contains("only start private runs"),
+            "{}",
+            e.reason()
+        );
+        let dest = store::destination_in(&db.lock(), Some(&sid), &a, "alice").unwrap();
+        let Err(e) = dest else {
+            panic!("a thread schedule was allowed")
+        };
+        assert!(e.reason().contains("thread"), "{}", e.reason());
+        let author = crate::db::Author {
+            id: Some("alice".into()),
+            name: "Alice".into(),
+        };
+        let req = store::ActionRequest {
+            page: &p.id,
+            user: "alice",
+            author: &author,
+            version: 1,
+            block_key: "run",
+            confirm: true,
+            schedule_revision: Some(task.revision),
+            chat_turn: "chat_x",
+            max_prompt_chars: 8_000,
+        };
+        assert!(matches!(
+            store::claim_action(&db, &req).unwrap(),
+            Err(store::ActionError::Forbidden(_))
+        ));
+        let runs: i64 = db
+            .lock()
+            .query_row("SELECT COUNT(*) FROM schedule_runs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(runs, 0);
+    }
+
+    #[test]
+    fn discard_claims_only_the_authors_live_draft() {
+        let db = Db::open_in_memory().unwrap();
+        let d = store::create_draft(&db, &draft("alice", WINDOW))
+            .unwrap()
+            .unwrap();
+        assert!(
+            !store::discard_draft(&db, &d.id, "bob").unwrap(),
+            "not Bob's"
+        );
+        assert!(store::draft(&db, &d.id).unwrap().is_some());
+        db.lock()
+            .execute(
+                "UPDATE page_drafts SET expires_at = 0 WHERE id = ?1",
+                [&d.id],
+            )
+            .unwrap();
+        assert!(
+            !store::discard_draft(&db, &d.id, "alice").unwrap(),
+            "expired"
+        );
+        assert!(!store::discard_draft(&db, "pgd_nope", "alice").unwrap());
+        let d = store::create_draft(&db, &draft("alice", WINDOW))
+            .unwrap()
+            .unwrap();
+        assert!(store::discard_draft(&db, &d.id, "alice").unwrap());
+        assert!(
+            !store::discard_draft(&db, &d.id, "alice").unwrap(),
+            "already discarded"
+        );
+    }
+
+    #[test]
+    fn tables_from_the_earlier_lane_schema_are_upgraded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("old.sqlite");
+        let page_id = {
+            let db = Db::open(&path).unwrap();
+            let space = db.create_space("alice", "Team", 10).unwrap();
+            let p = store::create(
+                &db,
+                Some(&space.id),
+                &version("alice", "Old"),
+                &PageLimits::default(),
+            )
+            .unwrap()
+            .unwrap();
+            // Recreate the three tables exactly as the lane's first build did.
+            db.lock()
+                .execute_batch(&format!(
+                    "PRAGMA foreign_keys = OFF;
+                     DROP TABLE page_versions; DROP TABLE page_drafts; DROP TABLE page_runs;
+                     CREATE TABLE page_versions (
+                         page_id TEXT NOT NULL REFERENCES pages (id) ON DELETE CASCADE,
+                         version INTEGER NOT NULL, author_id TEXT NOT NULL,
+                         kind TEXT NOT NULL CHECK (kind IN ('create', 'prompt', 'manual', 'restore', 'template')),
+                         prompt TEXT, model_ref TEXT, restored_from INTEGER,
+                         source TEXT NOT NULL, spec TEXT NOT NULL, created_at INTEGER NOT NULL,
+                         PRIMARY KEY (page_id, version));
+                     INSERT INTO page_versions VALUES ('{0}', 1, 'alice', 'create', NULL, NULL, NULL, 's', '{{}}', 0);
+                     CREATE TABLE page_drafts (
+                         id TEXT PRIMARY KEY NOT NULL, page_id TEXT REFERENCES pages (id) ON DELETE CASCADE,
+                         scope TEXT NOT NULL CHECK (scope IN ('personal', 'space')),
+                         space_id TEXT REFERENCES spaces (id) ON DELETE CASCADE, author_id TEXT NOT NULL,
+                         base_version INTEGER, block_key TEXT, prompt TEXT NOT NULL,
+                         status TEXT NOT NULL CHECK (status IN ('generating', 'ready', 'failed')),
+                         source TEXT, spec TEXT, diagnostics TEXT, error TEXT, model_ref TEXT,
+                         attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
+                         expires_at INTEGER NOT NULL);
+                     INSERT INTO page_drafts (id, scope, author_id, prompt, status, created_at, expires_at)
+                         VALUES ('pgd_old', 'personal', 'alice', 'p', 'ready', 0, 9999999999999);
+                     CREATE TABLE page_runs (
+                         id INTEGER PRIMARY KEY AUTOINCREMENT,
+                         page_id TEXT NOT NULL REFERENCES pages (id) ON DELETE CASCADE,
+                         version INTEGER NOT NULL, block_key TEXT NOT NULL, user_id TEXT NOT NULL,
+                         space_id TEXT, room_id TEXT, trigger_id INTEGER NOT NULL,
+                         run_id TEXT NOT NULL, created_at INTEGER NOT NULL);
+                     PRAGMA foreign_keys = ON;",
+                    p.id
+                ))
+                .unwrap();
+            p.id
+        };
+        // Opened by this build: upgraded in place, rows kept, twice over.
+        for _ in 0..2 {
+            let db = Db::open(&path).unwrap();
+            assert_eq!(
+                store::version_list_for(&db, &page_id, "alice")
+                    .unwrap()
+                    .unwrap()
+                    .1
+                    .len(),
+                1
+            );
+            assert!(store::draft(&db, "pgd_old").unwrap().is_some());
+        }
+        let db = Db::open(&path).unwrap();
+        store::add_version(
+            &db,
+            &page_id,
+            1,
+            &NewVersion {
+                kind: "rename",
+                ..version("alice", "R")
+            },
+            &PageLimits::default(),
+        )
+        .unwrap()
+        .unwrap();
+        let d = store::create_draft(&db, &draft("alice", WINDOW))
+            .unwrap()
+            .unwrap();
+        assert!(store::discard_draft(&db, &d.id, "alice").unwrap());
+        db.lock()
+            .execute(
+                "INSERT INTO page_runs (page_id, version, block_key, user_id, trigger_id, run_id, error, created_at)
+                 VALUES (?1, 1, 'b', 'alice', 1, 'x', 'e', 0)",
+                [&page_id],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_restart_marks_orphaned_page_runs_interrupted() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.sqlite");
+        let page_id = {
+            let db = Db::open(&path).unwrap();
+            let p = store::create(&db, None, &version("alice", "Mine"), &PageLimits::default())
+                .unwrap()
+                .unwrap();
+            let insert = |run: &str| {
+                db.lock()
+                    .execute(
+                        "INSERT INTO page_runs (page_id, version, block_key, user_id, trigger_id, \
+                         run_id, created_at) VALUES (?1, 1, ?2, 'alice', 1, ?3, 0)",
+                        rusqlite::params![p.id, run, run],
+                    )
+                    .unwrap();
+            };
+            insert(""); // claimed, never got a run id
+            insert("chat_never"); // page-only, never started
+            insert("chat_started"); // page-only, started, never ended
+            let started = crate::db::Activity::agent("chat_started", "Metro").at("started");
+            store::append_page_event(
+                &db,
+                &p.id,
+                "alice",
+                "activity",
+                &crate::db::Author::server("agent"),
+                "",
+                Some(&started),
+            )
+            .unwrap();
+            p.id
+        };
+        let db = Db::open(&path).unwrap();
+        let errors: Vec<(String, Option<String>)> = {
+            let conn = db.lock();
+            let mut stmt = conn
+                .prepare("SELECT run_id, error FROM page_runs ORDER BY id")
+                .unwrap();
+            stmt.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+                .unwrap()
+                .map(Result::unwrap)
+                .collect()
+        };
+        assert_eq!(errors[0].1.as_deref(), Some(store::RUN_INTERRUPTED));
+        assert_eq!(errors[1].1.as_deref(), Some(store::RUN_INTERRUPTED));
+        assert_eq!(
+            errors[2].1, None,
+            "a started run is ended by its marker instead"
+        );
+        let last =
+            store::last_page_event(&db, &page_id, "alice", &["activity"], Some("chat_started"))
+                .unwrap()
+                .unwrap();
+        assert_eq!(last.activity.unwrap().phase.as_deref(), Some("interrupted"));
+        // Nothing is replayed: no new triggers.
+        let triggers: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM page_events WHERE kind = 'message'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(triggers, 0);
     }
 
     #[test]

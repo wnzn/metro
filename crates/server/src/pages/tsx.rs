@@ -1119,6 +1119,24 @@ pub fn invalid_char_in(s: &str) -> Option<char> {
     None
 }
 
+/// `value` as a JSX attribute string that parses back to exactly `value`:
+/// double-quoted, with `&`, `"`, `<` and `>` written as entities.
+pub fn jsx_attr_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for c in value.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '"' => out.push_str("&quot;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// JSX whitespace rules: lines are trimmed, whitespace-only lines that
 /// contain a line break are dropped, and the rest are joined with spaces.
 fn jsx_text(raw: &str) -> String {

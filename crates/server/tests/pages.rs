@@ -1797,3 +1797,82 @@ async fn renaming_works_for_title_in_braces() {
         "{v}"
     );
 }
+
+// ---- Round 3 ----
+
+#[tokio::test]
+async fn a_personal_draft_stops_when_a_catalogued_space_is_left() {
+    let (arrived, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let m = gated_model(arrived.clone(), release.clone(), |_, _| INVALID.to_owned()).await;
+    let s = Server::start(Some(m.config.clone())).await;
+    // Alice is in Bob's Space, so her personal draft's catalogue names it.
+    let sid = s.space(BOB, "Bob's secret space", &["alice"]).await;
+    let (st, d) = s
+        .post(
+            ALICE,
+            "/v1/pages/drafts",
+            json!({"scope": "personal", "prompt": "x"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+    let id = d["id"].as_str().unwrap().to_owned();
+    arrived.notified().await;
+    assert!(last_user_text(&m.requests.lock().unwrap()[0]).contains("Bob's secret space"));
+    // Removed between the first answer and the repair.
+    let (st, _) = s
+        .send(
+            Method::DELETE,
+            BOB,
+            &format!("/v1/spaces/{sid}/members"),
+            Some(json!({"user_id": "alice"})),
+        )
+        .await;
+    assert_eq!(st, StatusCode::OK);
+    release.notify_one();
+    let d = s.draft_done(ALICE, &id).await;
+    assert_eq!(d["status"], "failed", "{d}");
+    assert!(d["error"].as_str().unwrap().starts_with("Stopped"), "{d}");
+    assert_eq!(
+        m.requests.lock().unwrap().len(),
+        1,
+        "the Space's names were sent again"
+    );
+}
+
+#[tokio::test]
+async fn any_title_round_trips_through_a_rename() {
+    let s = Server::start(None).await;
+    let p = s
+        .create_page(
+            ALICE,
+            personal(),
+            "export default <Page title=\"x\"><Divider/></Page>",
+        )
+        .await;
+    let pid = p["id"].as_str().unwrap();
+    for title in [
+        r#"Tom & "Jerry's" <b>"#,
+        "a &amp; b &quot; &#65;",
+        r#"both " and ' quotes"#,
+        "{braces} and /* not a comment */",
+    ] {
+        let (st, v) = s
+            .patch(ALICE, &format!("/v1/pages/{pid}"), json!({"title": title}))
+            .await;
+        assert_eq!(st, StatusCode::OK, "{title}: {v}");
+        assert_eq!(v["title"], title);
+        assert_eq!(v["spec"]["title"], title);
+        // The stored source compiles back to the same title.
+        let (_, check) = s
+            .post(
+                ALICE,
+                "/v1/pages/validate",
+                json!({"scope": "personal", "source": v["source"]}),
+            )
+            .await;
+        assert_eq!(check["spec"]["title"], title);
+    }
+}

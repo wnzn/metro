@@ -79,6 +79,40 @@ pub async fn run(
         Ok(c) => c,
         Err(e) => return refused(e, max),
     };
+    // From here the work is accepted: it's owned by its own task, so a
+    // client that hangs up (and drops this handler) can't strand it, and
+    // every failure is recorded on the run's origin.
+    let (st, person, pid) = (state.clone(), who.clone(), page_id.to_owned());
+    match tokio::spawn(async move { dispatch(&st, &person, &pid, claimed, turn).await }).await {
+        Ok(response) => response,
+        Err(e) => Err(ApiError::internal(anyhow::anyhow!(
+            "dispatching a page action: {e}"
+        ))),
+    }
+}
+
+/// Record why a claimed run didn't start.
+async fn failed(state: &AppState, page_run: i64, why: &str) {
+    let why = why.to_owned();
+    if let Err(e) = state
+        .db
+        .call(move |db| store::set_run(db, page_run, None, Some(&why)))
+        .await
+    {
+        tracing::error!(error = %format!("{e:#}"), "recording a page run failure");
+    }
+}
+
+const NO_SETTINGS: &str = "Your model settings couldn't be read; the run didn't start.";
+
+/// Start the claimed work and record how it went.
+async fn dispatch(
+    state: &AppState,
+    who: &Human,
+    page_id: &str,
+    claimed: Claimed,
+    turn: Activity,
+) -> ApiResult<Response> {
     match claimed {
         Claimed::Schedule { claim, task } => {
             let run = crate::schedules::dispatch_claimed_for(state, claim, task).await?;
@@ -95,12 +129,20 @@ pub async fn run(
             page_run,
             page_title,
         } => {
-            let settings = routing::preferences(state, &who.id)
-                .await
-                .map_err(ApiError::internal)?;
-            let prefs = crate::space_prefs::load(state, &space_id, &who.id)
-                .await
-                .map_err(ApiError::internal)?;
+            let settings = match routing::preferences(state, &who.id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    failed(state, page_run, NO_SETTINGS).await;
+                    return Err(ApiError::internal(e));
+                }
+            };
+            let prefs = match crate::space_prefs::load(state, &space_id, &who.id).await {
+                Ok(p) => p,
+                Err(e) => {
+                    failed(state, page_run, NO_SETTINGS).await;
+                    return Err(ApiError::internal(e));
+                }
+            };
             let route = crate::space_prefs::route_for(
                 state,
                 &who.id,
@@ -132,10 +174,13 @@ pub async fn run(
             {
                 Ok(info) => {
                     let rid = info.id.clone();
-                    db(state, move |db| {
-                        store::set_run(db, page_run, Some(&rid), None)
-                    })
-                    .await?;
+                    if let Err(e) = state
+                        .db
+                        .call(move |db| store::set_run(db, page_run, Some(&rid), None))
+                        .await
+                    {
+                        tracing::error!(error = %format!("{e:#}"), "recording a page run");
+                    }
                     Ok(reply(
                         StatusCode::ACCEPTED,
                         json!({"kind": action::RUN_AGENT, "started": true, "run_id": info.id,
@@ -152,11 +197,7 @@ pub async fn run(
                             &reason,
                         )
                         .await;
-                    let why = reason.clone();
-                    db(state, move |db| {
-                        store::set_run(db, page_run, None, Some(&why))
-                    })
-                    .await?;
+                    failed(state, page_run, &reason).await;
                     Ok(reply(
                         StatusCode::ACCEPTED,
                         json!({"kind": action::RUN_AGENT, "started": false, "error": reason,
@@ -166,9 +207,13 @@ pub async fn run(
             }
         }
         Claimed::Chat { event, page_run } => {
-            let settings = routing::preferences(state, &who.id)
-                .await
-                .map_err(ApiError::internal)?;
+            let settings = match routing::preferences(state, &who.id).await {
+                Ok(s) => s,
+                Err(e) => {
+                    failed(state, page_run, NO_SETTINGS).await;
+                    return Err(ApiError::internal(e));
+                }
+            };
             let route = routing::route_turn(
                 state,
                 &who.id,
@@ -189,11 +234,7 @@ pub async fn run(
             )
             .await;
             if let Err(e) = &started {
-                let why = e.clone();
-                db(state, move |db| {
-                    store::set_run(db, page_run, None, Some(&why))
-                })
-                .await?;
+                failed(state, page_run, e).await;
             }
             Ok(reply(
                 StatusCode::ACCEPTED,
