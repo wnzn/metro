@@ -16,6 +16,8 @@ pub const MAX_SOURCE_BYTES: usize = 64 * 1024;
 pub const MAX_DEPTH: usize = 12;
 /// Deepest expression nesting (`!!x`, parentheses).
 const MAX_EXPR_DEPTH: usize = 8;
+/// Most properties on one element.
+pub const MAX_ATTRS: usize = 24;
 /// Most operands of one `a ?? b ?? …` chain.
 pub const MAX_COALESCE: usize = 8;
 /// Most nodes (literals, reads, operators) in one `{…}` expression. With
@@ -99,6 +101,8 @@ pub struct Attr {
     pub value: AttrValue,
     /// Byte range of a quoted string value, quotes excluded.
     pub span: Option<(usize, usize)>,
+    /// Byte offset just after the whole attribute (its value included).
+    pub end: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -431,6 +435,7 @@ impl<'a> Parser<'a> {
             );
         }
         let mut attrs: Vec<Attr> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         loop {
             self.skip_trivia()?;
             match self.peek() {
@@ -459,8 +464,14 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
             let attr = self.attr()?;
-            if attrs.iter().any(|a| a.name == attr.name) {
+            if !seen.insert(attr.name.clone()) {
                 return self.err(attr.at, format!("`{}` is set twice", attr.name));
+            }
+            if attrs.len() >= MAX_ATTRS {
+                return self.err(
+                    attr.at,
+                    format!("an element has at most {MAX_ATTRS} properties"),
+                );
             }
             attrs.push(attr);
         }
@@ -493,6 +504,7 @@ impl<'a> Parser<'a> {
                 at,
                 value: AttrValue::Bare,
                 span: None,
+                end: self.i,
             });
         }
         self.i += 1;
@@ -512,6 +524,7 @@ impl<'a> Parser<'a> {
                     at,
                     value: AttrValue::Str(value),
                     span: Some((start, start + len)),
+                    end: self.i,
                 })
             }
             Some(b'{') => {
@@ -529,6 +542,7 @@ impl<'a> Parser<'a> {
                     at,
                     value: AttrValue::Expr(expr),
                     span: None,
+                    end: self.i,
                 })
             }
             Some(b'<') => self.err(
@@ -1139,7 +1153,9 @@ fn decode_entities(s: &str) -> String {
     while let Some(p) = rest.find('&') {
         out.push_str(&rest[..p]);
         rest = &rest[p..];
-        let end = rest.find(';').filter(|e| *e <= 10);
+        // Only the next few bytes can end an entity: never a scan to the end.
+        let window = &rest.as_bytes()[..rest.len().min(12)];
+        let end = window.iter().position(|b| *b == b';').filter(|e| *e <= 10);
         let decoded = end.and_then(|e| {
             let name = &rest[1..e];
             let ch = match name {

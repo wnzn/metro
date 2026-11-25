@@ -145,6 +145,18 @@ fn meta(page: &PageRow, rights: &Rights, prefs: &store::Prefs) -> Json_ {
     })
 }
 
+fn list_meta(v: &store::VersionMeta) -> Json_ {
+    json!({
+        "version": v.version,
+        "author_id": v.author_id,
+        "kind": v.kind,
+        "prompt": v.prompt,
+        "model": v.model_ref,
+        "restored_from": v.restored_from,
+        "created_at": rfc3339_utc(v.created_at),
+    })
+}
+
 fn version_meta(v: &VersionRow) -> Json_ {
     json!({
         "version": v.version,
@@ -223,7 +235,12 @@ fn too_many(e: CreateError) -> ApiError {
 fn save_refused(e: store::SaveError) -> Response {
     match e {
         store::SaveError::Conflict { head } => conflict_head(head),
-        store::SaveError::NotAllowed => forbidden("you can't edit this page").into_response(),
+        store::SaveError::Denied(store::Denied::Gone) => {
+            ApiError::not_found(NO_PAGE).into_response()
+        }
+        store::SaveError::Denied(store::Denied::Forbidden) => {
+            forbidden("you can't edit this page").into_response()
+        }
     }
 }
 
@@ -464,7 +481,8 @@ struct PatchBody {
 fn retitle(source: &str, title: &str) -> Result<String, &'static str> {
     let root = tsx::parse(source).map_err(|_| "the current source doesn't parse")?;
     let a = root.attr("title").ok_or("the page has no title")?;
-    let (_, end) = a.span.ok_or("the page's title isn't a plain string")?;
+    // `title="…"`, `title='…'` and `title={"…"}` alike: the whole attribute
+    // is replaced.
     let quoted = if !title.contains('"') {
         format!("\"{title}\"")
     } else if !title.contains('\'') {
@@ -475,7 +493,7 @@ fn retitle(source: &str, title: &str) -> Result<String, &'static str> {
     Ok(format!(
         "{}title={quoted}{}",
         &source[..a.at],
-        &source[end + 1..]
+        &source[a.end..]
     ))
 }
 
@@ -485,23 +503,8 @@ async fn patch_page(
     Path(pid): Path<String>,
     body: JsonBody<PatchBody>,
 ) -> ApiResult<Response> {
-    let (page, rights) = load_live(&state, &who, &pid).await?;
+    let (page, _) = load_live(&state, &who, &pid).await?;
     let Json(body) = body?;
-    if body.members_edit.is_some() {
-        if page.space_id.is_none() {
-            return Err(ApiError::bad_request(
-                "members_edit is only for Space pages",
-            ));
-        }
-        if !rights.can_manage {
-            return Err(forbidden(
-                "only the page's creator or the Space owner can change who edits it",
-            ));
-        }
-    }
-    if (body.icon.is_some() || body.title.is_some()) && !rights.can_edit {
-        return Err(forbidden("you can't edit this page"));
-    }
     if let Some(Some(icon)) = &body.icon
         && (icon.chars().count() > 16 || tsx::invalid_char_in(icon).is_some())
     {
@@ -510,6 +513,7 @@ async fn patch_page(
              text-direction characters",
         ));
     }
+    let mut rename = None;
     if let Some(title) = &body.title {
         let title = title.trim();
         if title.is_empty() || title.chars().count() > compile::MAX_TITLE_CHARS {
@@ -529,22 +533,39 @@ async fn patch_page(
             return Ok(invalid(&compiled));
         }
         // A rename: it doesn't count as reviewing the page's buttons.
-        let version = new_version(&who, "rename", &compiled)?;
-        let limits = limits::current(&state).await;
-        let pid = page.id.clone();
-        if let Err(e) = db(&state, move |db| {
-            store::add_version(db, &pid, base, &version, &limits)
-        })
-        .await?
-        {
-            return Ok(save_refused(e));
+        rename = Some((base, new_version(&who, "rename", &compiled)?));
+    }
+    // Everything at once: rights, liveness and the head are checked in the
+    // same transaction as the writes, and nothing is written unless all may be.
+    let ops = store::PatchOps {
+        rename,
+        icon: body.icon,
+        members_edit: body.members_edit,
+    };
+    let limits = limits::current(&state).await;
+    let (pid, uid) = (page.id.clone(), who.id.clone());
+    match db(&state, move |db| {
+        store::patch(db, &pid, &uid, &ops, &limits)
+    })
+    .await?
+    {
+        Ok(()) => {}
+        Err(store::PatchError::Denied(store::Denied::Gone)) => {
+            return Err(ApiError::not_found(NO_PAGE));
+        }
+        Err(store::PatchError::Denied(store::Denied::Forbidden)) => {
+            return Err(forbidden(
+                "you can't change this: editing needs edit rights, and who edits needs the \
+                 page's creator or the Space owner",
+            ));
+        }
+        Err(store::PatchError::Conflict { head }) => return Ok(conflict_head(head)),
+        Err(store::PatchError::NotSpacePage) => {
+            return Err(ApiError::bad_request(
+                "members_edit is only for Space pages",
+            ));
         }
     }
-    let (pid, icon, members) = (page.id.clone(), body.icon, body.members_edit);
-    db(&state, move |db| {
-        store::set_meta(db, &pid, icon.as_ref().map(|i| i.as_deref()), members)
-    })
-    .await?;
     let (page, rights) = load_live(&state, &who, &page.id).await?;
     Ok(Json(full_view(&state, &who, &page, &rights).await?).into_response())
 }
@@ -554,15 +575,17 @@ async fn delete_page(
     who: Human,
     Path(pid): Path<String>,
 ) -> ApiResult<StatusCode> {
-    let (page, rights) = load_live(&state, &who, &pid).await?;
-    if !rights.can_delete {
-        return Err(forbidden(
-            "only the page's creator or the Space owner can delete it",
-        ));
+    if !compile::valid_page_id(&pid) {
+        return Err(ApiError::not_found(NO_PAGE));
     }
-    let (pid, uid) = (page.id.clone(), who.id.clone());
-    db(&state, move |db| store::soft_delete(db, &pid, &uid)).await?;
-    Ok(StatusCode::NO_CONTENT)
+    let uid = who.id.clone();
+    match db(&state, move |db| store::soft_delete(db, &pid, &uid)).await? {
+        Ok(()) => Ok(StatusCode::NO_CONTENT),
+        Err(store::Denied::Gone) => Err(ApiError::not_found(NO_PAGE)),
+        Err(store::Denied::Forbidden) => Err(forbidden(
+            "only the page's creator or the Space owner can delete it",
+        )),
+    }
 }
 
 async fn undelete(
@@ -572,19 +595,23 @@ async fn undelete(
     body: axum::body::Bytes,
 ) -> ApiResult<Json<Json_>> {
     crate::api::empty_object(&body)?;
-    let (page, _) = load(&state, &who, &pid).await?;
-    if page.deleted_at.is_none() {
-        return Err(ApiError::new(
-            StatusCode::CONFLICT,
-            "the page isn't deleted",
-        ));
+    if !compile::valid_page_id(&pid) {
+        return Err(ApiError::not_found(NO_PAGE));
     }
     let limits: PageLimits = limits::current(&state).await;
-    let id = page.id.clone();
-    db(&state, move |db| store::undelete(db, &id, &limits))
-        .await?
-        .map_err(too_many)?;
-    let (page, rights) = load_live(&state, &who, &page.id).await?;
+    let (id, uid) = (pid.clone(), who.id.clone());
+    match db(&state, move |db| store::undelete(db, &id, &uid, &limits)).await? {
+        Ok(()) => {}
+        Err(store::UndeleteError::Denied(_)) => return Err(ApiError::not_found(NO_PAGE)),
+        Err(store::UndeleteError::NotDeleted) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "the page isn't deleted",
+            ));
+        }
+        Err(store::UndeleteError::TooMany(n)) => return Err(too_many(CreateError::TooMany(n))),
+    }
+    let (page, rights) = load_live(&state, &who, &pid).await?;
     Ok(Json(full_view(&state, &who, &page, &rights).await?))
 }
 
@@ -597,8 +624,8 @@ async fn list_versions(
 ) -> ApiResult<Json<Json_>> {
     let (page, _) = load_live(&state, &who, &pid).await?;
     let id = page.id.clone();
-    let versions = db(&state, move |db| store::versions(db, &id)).await?;
-    let list: Vec<Json_> = versions.iter().map(version_meta).collect();
+    let versions = db(&state, move |db| store::version_list(db, &id)).await?;
+    let list: Vec<Json_> = versions.iter().map(list_meta).collect();
     Ok(Json(
         json!({"head_version": page.head_version, "versions": list}),
     ))
@@ -783,6 +810,9 @@ struct ActionBody {
     block_key: String,
     #[serde(default)]
     confirm: bool,
+    /// For a schedule button: the task revision the confirmation showed.
+    #[serde(default)]
+    schedule_revision: Option<i64>,
 }
 
 async fn run_action(
@@ -791,23 +821,17 @@ async fn run_action(
     Path(pid): Path<String>,
     body: JsonBody<ActionBody>,
 ) -> ApiResult<Response> {
-    let (page, _) = load_live(&state, &who, &pid).await?;
-    let Json(body) = body?;
-    if body.version != page.head_version {
-        return Ok(conflict_head(page.head_version));
+    if !compile::valid_page_id(&pid) {
+        return Err(ApiError::not_found(NO_PAGE));
     }
-    let head = head_of(&state, &page).await?;
-    let spec = spec_of(&head)?;
-    actions::run(
-        &state,
-        &who,
-        &page,
-        &head,
-        &spec,
-        &body.block_key,
-        body.confirm,
-    )
-    .await
+    let Json(body) = body?;
+    let click = actions::Click {
+        version: body.version,
+        block_key: body.block_key,
+        confirm: body.confirm,
+        schedule_revision: body.schedule_revision,
+    };
+    actions::run(&state, &who, &pid, click).await
 }
 
 #[derive(Deserialize)]
@@ -824,14 +848,18 @@ async fn put_prefs(
     Path(pid): Path<String>,
     body: JsonBody<PrefsBody>,
 ) -> ApiResult<Json<Json_>> {
-    let (page, _) = load_live(&state, &who, &pid).await?;
+    if !compile::valid_page_id(&pid) {
+        return Err(ApiError::not_found(NO_PAGE));
+    }
     let Json(body) = body?;
     let p = store::Prefs {
         pinned: body.pinned,
         position: body.position,
     };
-    let (uid, id, saved) = (who.id.clone(), page.id.clone(), p.clone());
-    db(&state, move |db| store::put_prefs(db, &uid, &id, &saved)).await?;
+    let (uid, saved) = (who.id.clone(), p.clone());
+    db(&state, move |db| store::put_prefs(db, &uid, &pid, &saved))
+        .await?
+        .map_err(|_| ApiError::not_found(NO_PAGE))?;
     Ok(Json(json!({"pinned": p.pinned, "position": p.position})))
 }
 
@@ -928,27 +956,15 @@ async fn create_draft(
             generate::MAX_PROMPT_CHARS
         )));
     }
-    let (page, space, base) = match &body.page_id {
+    let (page_id, space) = match &body.page_id {
         Some(pid) => {
             if body.scope.is_some() || body.space_id.is_some() {
                 return Err(ApiError::bad_request(
                     "an edit takes page_id, not scope or space_id",
                 ));
             }
-            let (page, rights) = load_live(&state, &who, pid).await?;
-            if !rights.can_edit {
-                return Err(forbidden("you can't edit this page"));
-            }
-            let head = head_of(&state, &page).await?;
-            if let Some(k) = &body.block_key
-                && spec_of(&head)?.block(k).is_none()
-            {
-                return Err(ApiError::bad_request(
-                    "block_key isn't a block of this page",
-                ));
-            }
-            let space = page.space_id.clone();
-            (Some(page), space, Some(head))
+            let (page, _) = load_live(&state, &who, pid).await?;
+            (Some(page.id), page.space_id)
         }
         None => {
             if body.block_key.is_some() {
@@ -957,13 +973,11 @@ async fn create_draft(
             let scope = body
                 .scope
                 .ok_or_else(|| ApiError::bad_request("give page_id, or scope for a new page"))?;
-            (
-                None,
-                scope_space(&state, &who, scope, body.space_id).await?,
-                None,
-            )
+            (None, scope_space(&state, &who, scope, body.space_id).await?)
         }
     };
+    // An explicit model choice is checked (no model is called) before the
+    // slot is taken.
     let chosen = chosen_route(
         &state,
         &who,
@@ -973,26 +987,25 @@ async fn create_draft(
         body.reasoning_effort,
     )
     .await?;
-    let route = generate::route_for(&state, &who.id, space.as_deref(), &prompt, chosen)
-        .await
-        .map_err(ApiError::internal)?;
-    let (uid, pid, sid, bv, bk, pr) = (
+    // Reserve the generation slot, with the page, edit rights and
+    // membership checked in the same transaction. Any model-backed routing
+    // (use-case routing may ask System One) happens only after this, in the
+    // job, under the reservation.
+    let (uid, pid, sid, bk, pr) = (
         who.id.clone(),
-        page.as_ref().map(|p| p.id.clone()),
+        page_id.clone(),
         space.clone(),
-        base.as_ref().map(|b| b.version),
         body.block_key.clone(),
         prompt.clone(),
     );
     let window = generate::busy_window_ms(&state.config.limits);
-    let draft = db(&state, move |db| {
+    let draft = match db(&state, move |db| {
         store::create_draft(
             db,
             &store::NewDraft {
                 page_id: pid.as_deref(),
                 space_id: sid.as_deref(),
                 author_id: &uid,
-                base_version: bv,
                 block_key: bk.as_deref(),
                 prompt: &pr,
                 busy_window_ms: window,
@@ -1000,12 +1013,27 @@ async fn create_draft(
         )
     })
     .await?
-    .ok_or_else(|| {
-        ApiError::new(
-            StatusCode::TOO_MANY_REQUESTS,
-            "you already have pages being generated; wait for them to finish",
-        )
-    })?;
+    {
+        Ok(d) => d,
+        Err(store::DraftError::Busy) => {
+            return Err(ApiError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                "you already have pages being generated; wait for them to finish",
+            ));
+        }
+        Err(store::DraftError::NoBlock) => {
+            return Err(ApiError::bad_request(
+                "block_key isn't a block of this page",
+            ));
+        }
+        Err(store::DraftError::Denied(store::Denied::Gone)) => {
+            return Err(ApiError::not_found(NO_PAGE));
+        }
+        Err(store::DraftError::Denied(store::Denied::Forbidden)) => {
+            return Err(forbidden("you can't edit this page"));
+        }
+    };
+    let base = draft_base(&state, &draft).await?;
     let job = generate::Job {
         draft_id: draft.id.clone(),
         user: who.id.clone(),
@@ -1013,7 +1041,7 @@ async fn create_draft(
         prompt,
         base_source: base.as_ref().map(|b| b.source.clone()),
         block_key: body.block_key,
-        route,
+        chosen,
     };
     tokio::spawn(generate::run(state.clone(), job));
     Ok((
@@ -1104,7 +1132,7 @@ async fn apply_draft(
             .map_err(|e| ApiError::bad_request(format!("bad body: {e}")))?
     };
     let d = own_draft(&state, &who, &id).await?;
-    let page = draft_access(&state, &who, &d).await?;
+    draft_access(&state, &who, &d).await?;
     if d.status != "ready" {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -1114,8 +1142,25 @@ async fn apply_draft(
     let source = d.source.clone().unwrap_or_default();
     // Checked again as the person applying it, with their access now.
     let compiled = compile_as(&state, &who, d.space_id.clone(), source).await?;
-    if compiled.spec.is_none() {
+    let Some(new) = compiled.spec.as_ref() else {
         return Ok(invalid(&compiled));
+    };
+    if let Some(k) = &d.block_key
+        && let Some(old) = draft_base(&state, &d).await?
+    {
+        let old = spec_of(&old)?;
+        let c = generate::changes(Some(&old), new);
+        let outside = generate::outside_selection(&old, new, k, &c);
+        if !outside.is_empty() && !body.confirm_outside {
+            return Ok((
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": "this draft also changes blocks outside the selected one; apply with confirm_outside to keep them",
+                    "outside_selection": outside,
+                })),
+            )
+                .into_response());
+        }
     }
     let mut version = new_version(
         &who,
@@ -1128,59 +1173,39 @@ async fn apply_draft(
     )?;
     version.prompt = Some(d.prompt.chars().take(4_000).collect());
     version.model_ref = d.model_ref.clone();
-    let response = match page {
-        None => {
-            let limits = limits::current(&state).await;
-            let space = d.space_id.clone();
-            let created = db(&state, move |db| {
-                store::create(db, space.as_deref(), &version, &limits)
-            })
-            .await?
-            .map_err(too_many)?;
-            let rights = Rights {
-                can_edit: true,
-                can_delete: true,
-                can_manage: true,
-            };
-            (
-                StatusCode::CREATED,
-                Json(full_view(&state, &who, &created, &rights).await?),
-            )
-                .into_response()
+    // One transaction: the draft is still ready and theirs, the page is
+    // created or the version saved with every check, then the draft is
+    // consumed. Any refusal leaves the draft as it was.
+    let limits = limits::current(&state).await;
+    let (did, uid) = (d.id.clone(), who.id.clone());
+    let page_id = match db(&state, move |db| {
+        store::apply_draft(db, &did, &uid, &version, &limits)
+    })
+    .await?
+    {
+        Ok(page_id) => page_id,
+        Err(store::ApplyError::Gone) => return Err(ApiError::not_found(NO_DRAFT)),
+        Err(store::ApplyError::NotReady) => {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                "the draft isn't ready to apply",
+            ));
         }
-        Some((page, rights)) => {
-            if !rights.can_edit {
-                return Err(forbidden("you can't edit this page"));
-            }
-            let base = d.base_version.unwrap_or(page.head_version);
-            if base != page.head_version {
-                return Ok(conflict_head(page.head_version));
-            }
-            if let Some(k) = &d.block_key {
-                let old = draft_base(&state, &d).await?;
-                let new = compiled.spec.as_ref();
-                if let (Some(old), Some(new)) = (old, new) {
-                    let old = spec_of(&old)?;
-                    let c = generate::changes(Some(&old), new);
-                    let outside = generate::outside_selection(&old, new, k, &c);
-                    if !outside.is_empty() && !body.confirm_outside {
-                        return Ok((
-                            StatusCode::CONFLICT,
-                            Json(json!({
-                                "error": "this draft also changes blocks outside the selected one; apply with confirm_outside to keep them",
-                                "outside_selection": outside,
-                            })),
-                        )
-                            .into_response());
-                    }
-                }
-            }
-            save(&state, &who, &page, base, version).await?
+        Err(store::ApplyError::Denied(store::Denied::Gone)) => {
+            return Err(ApiError::not_found(NO_PAGE));
         }
+        Err(store::ApplyError::Denied(store::Denied::Forbidden)) => {
+            return Err(forbidden("you can't edit this page"));
+        }
+        Err(store::ApplyError::Conflict { head }) => return Ok(conflict_head(head)),
+        Err(store::ApplyError::TooMany(n)) => return Err(too_many(CreateError::TooMany(n))),
     };
-    let did = d.id.clone();
-    db(&state, move |db| store::delete_draft(db, &did)).await?;
-    Ok(response)
+    let (page, rights) = load_live(&state, &who, &page_id).await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(full_view(&state, &who, &page, &rights).await?),
+    )
+        .into_response())
 }
 
 async fn draft_data(

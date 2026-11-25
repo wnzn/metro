@@ -45,6 +45,11 @@ pub const ACTIONS: &[&str] = &[
     spec::action::REFRESH,
 ];
 
+/// Why a personal page's button can't point at a Space.
+pub const PERSONAL_ONLY: &str = "a personal page's buttons only start private runs shown on the \
+     page: use action=\"runAgent\" room=\"chat\" (without space or agent); Space rooms can't be \
+     a personal page's destination";
+
 /// The personal Chat, as a room name on personal pages.
 pub const CHAT_ROOM: &str = "chat";
 
@@ -56,8 +61,9 @@ pub trait Resolver {
     /// A Space a personal page names, by id: its name, if the saver is a
     /// member now.
     fn space(&mut self, id: &str) -> Result<String, String>;
-    /// A room or thread of `space`, by name (or id): its id and name.
-    fn room(&mut self, space: &str, name: &str) -> Result<(String, String), String>;
+    /// A room or thread of `space`, by name (or id): its id, its name, and
+    /// whether it's a thread.
+    fn room(&mut self, space: &str, name: &str) -> Result<(String, String, bool), String>;
     /// An agent of `space`, by handle: its id and handle.
     fn agent(&mut self, space: &str, handle: &str) -> Result<(String, String), String>;
 }
@@ -461,47 +467,67 @@ const PROP_HINTS: &[(&str, &str)] = &[
     ("html", "raw HTML isn't allowed; use <Markdown> or <Text>"),
 ];
 
-/// Why `md` can't be a page's `<Markdown>`, if it can't: images (a page
-/// never loads anything remote), raw HTML, or a link that isn't `https:`.
+/// Why `md` can't be a page's `<Markdown>`, if it can't. Links are
+/// checked structurally: every inline link `[text](destination "title")`
+/// is parsed (balanced parentheses, `<…>` destinations, backslash escapes)
+/// and its destination must be a plain `https://` URL. Images, raw HTML,
+/// `<…>` autolinks, reference-style links and definitions, and bare
+/// non-https schemes are refused outright, so nothing the renderer's
+/// Markdown parser could turn into a link escapes the check.
 pub fn markdown_problem(md: &str) -> Option<&'static str> {
     const NO_IMAGES: &str =
         "<Markdown> can't show images (![…](…)); pages never load remote content";
-    const HTTPS_ONLY: &str = "links in <Markdown> must be https:// links";
+    const HTTPS_ONLY: &str = "links in <Markdown> must be plain https:// links";
+    const NO_REFS: &str =
+        "reference-style links aren't supported in <Markdown>; write [text](https://…)";
     if md.contains("![") {
         return Some(NO_IMAGES);
     }
     let lower = md.to_ascii_lowercase();
     let b = lower.as_bytes();
     for (i, c) in b.iter().enumerate() {
+        // `](<destination>)` is a link destination, checked below.
+        let destination = i >= 2 && &b[i - 2..i] == b"](";
         if *c == b'<'
+            && !destination
             && b.get(i + 1)
                 .is_some_and(|n| n.is_ascii_alphabetic() || matches!(n, b'/' | b'!' | b'?'))
         {
             return Some("raw HTML and <…> autolinks aren't allowed in <Markdown>");
         }
     }
-    // Inline links and images: `](target`.
-    let mut rest = lower.as_str();
-    while let Some(p) = rest.find("](") {
-        let target = rest[p + 2..].trim_start().trim_start_matches('<');
-        if !target.starts_with("https://") {
-            return Some(HTTPS_ONLY);
-        }
-        rest = &rest[p + 2..];
-    }
-    // Reference definitions: `[label]: target`.
+    // Reference definitions (`[x]: …`, up to three spaces in) and full or
+    // collapsed reference links (`[x][y]`, `[x][]`).
     for line in lower.lines() {
-        let l = line.trim_start();
-        if l.starts_with('[')
-            && let Some(p) = l.find("]:")
-        {
-            let target = l[p + 2..].trim_start().trim_start_matches('<');
-            if !target.starts_with("https://") {
-                return Some(HTTPS_ONLY);
-            }
+        let l = line.trim_start_matches(' ');
+        if line.len() - l.len() <= 3 && l.starts_with('[') && l.contains("]:") {
+            return Some(NO_REFS);
         }
     }
-    // Bare autolinked schemes other than https.
+    if lower.contains("][") {
+        return Some(NO_REFS);
+    }
+    // Inline links.
+    let mut i = 0;
+    while let Some(p) = lower[i..].find("](") {
+        let start = i + p + 2;
+        match link_end(b, start) {
+            Some((dest, end)) => {
+                let ok = dest.starts_with(b"https://")
+                    && dest.len() > 8
+                    && dest.iter().all(|c| {
+                        c.is_ascii_graphic()
+                            && !matches!(c, b'\\' | b'&' | b'<' | b'>' | b'"' | b'\'')
+                    });
+                if !ok {
+                    return Some(HTTPS_ONLY);
+                }
+                i = end;
+            }
+            None => return Some(HTTPS_ONLY),
+        }
+    }
+    // Bare schemes a renderer might autolink.
     for scheme in [
         "http://",
         "javascript:",
@@ -517,6 +543,48 @@ pub fn markdown_problem(md: &str) -> Option<&'static str> {
         }
     }
     None
+}
+
+/// Parse an inline link's `destination "title")` starting at `at` (just
+/// after `](`): the destination bytes and the offset after `)`, or `None`
+/// when it isn't a well-formed link this checker understands.
+fn link_end(b: &[u8], mut at: usize) -> Option<(&[u8], usize)> {
+    while b.get(at).is_some_and(|c| *c == b' ') {
+        at += 1;
+    }
+    let (dest, mut at) = if b.get(at) == Some(&b'<') {
+        let end = at + 1 + b[at + 1..].iter().position(|c| *c == b'>')?;
+        (&b[at + 1..end], end + 1)
+    } else {
+        let start = at;
+        let mut depth = 0usize;
+        while let Some(&c) = b.get(at) {
+            match c {
+                b'\\' => return None,
+                b'(' => depth += 1,
+                b')' if depth == 0 => break,
+                b')' => depth -= 1,
+                c if c.is_ascii_whitespace() => break,
+                _ => {}
+            }
+            at += 1;
+        }
+        (&b[start..at], at)
+    };
+    while b.get(at).is_some_and(|c| *c == b' ') {
+        at += 1;
+    }
+    // An optional title in "…", '…' or (…).
+    if let Some(&q) = b.get(at)
+        && matches!(q, b'"' | b'\'' | b'(')
+    {
+        let close = if q == b'(' { b')' } else { q };
+        at = at + 1 + b[at + 1..].iter().position(|c| *c == close)? + 1;
+        while b.get(at).is_some_and(|c| *c == b' ') {
+            at += 1;
+        }
+    }
+    (b.get(at) == Some(&b')')).then_some((dest, at + 1))
 }
 
 // ---- Compiler ----
@@ -546,6 +614,11 @@ struct Compiler<'a> {
     data: Vec<(String, &'static str)>,
     blocks: usize,
     actions: usize,
+    /// How many times blocks here repeat with full data (1, or
+    /// [`spec::MAX_ITEMS`] inside a `<List>`/`<Each>`).
+    multiplier: usize,
+    /// Blocks and table cells rendered with full data.
+    rendered: usize,
 }
 
 fn static_str(list: &'static [&'static str], s: &str) -> Option<&'static str> {
@@ -744,6 +817,17 @@ impl<'a> Compiler<'a> {
                     "values directly inside <Page> aren't allowed; put them in <Text> or <Stat>",
                 ),
             }
+        }
+        if self.rendered > spec::MAX_RENDERED {
+            self.push(
+                root.at,
+                None,
+                format!(
+                    "with full data this page would draw more than {} blocks; put fewer blocks \
+                     inside <List> and <Each>",
+                    spec::MAX_RENDERED
+                ),
+            );
         }
         if self.blocks > MAX_BLOCKS {
             self.push(
@@ -1221,9 +1305,10 @@ impl<'a> Compiler<'a> {
                 t.room = Some(CHAT_ROOM.to_owned());
             }
             (Some(sid), Some(r)) => match self.resolver.room(sid, &r) {
-                Ok((id, name)) => {
+                Ok((id, name, thread)) => {
                     t.room_id = Some(id);
                     t.room = Some(name);
+                    t.thread = thread;
                 }
                 Err(why) => {
                     self.push(e.at, key, why);
@@ -1338,6 +1423,16 @@ impl<'a> Compiler<'a> {
                 );
             }
         }
+        // Repetition: counted at its worst case, and never nested.
+        self.rendered += self.multiplier;
+        let repeats = matches!(e.name.as_str(), "List" | "Each" | "Table");
+        if repeats && self.multiplier > 1 {
+            self.push(
+                e.at,
+                k,
+                "repeating blocks can't be nested: no <List>, <Each> or <Table> inside a <List> or <Each>",
+            );
+        }
         // Children.
         let mut inner = None;
         if matches!(e.name.as_str(), "List" | "Each")
@@ -1362,6 +1457,10 @@ impl<'a> Compiler<'a> {
             inner = Some(Scope { names });
         }
         let scope = inner.as_ref().unwrap_or(scope);
+        let saved = self.multiplier;
+        if matches!(e.name.as_str(), "List" | "Each") {
+            self.multiplier = saved.saturating_mul(spec::MAX_ITEMS);
+        }
         match d.kids {
             Kids::None => {
                 if let Some(c) = e.children.first() {
@@ -1500,6 +1599,18 @@ impl<'a> Compiler<'a> {
                 }
             }
         }
+        self.multiplier = saved;
+        if e.name == "Table" {
+            let columns = block.children.len();
+            if columns > spec::MAX_COLUMNS {
+                self.push(
+                    e.at,
+                    k,
+                    format!("a <Table> has at most {} columns", spec::MAX_COLUMNS),
+                );
+            }
+            self.rendered += self.multiplier * spec::MAX_ITEMS * columns;
+        }
         if matches!(e.name.as_str(), "Button" | "Link") {
             self.actions += 1;
             let before = self.diags.len();
@@ -1572,6 +1683,20 @@ impl<'a> Compiler<'a> {
                     return None;
                 }
                 let target = self.target(e, key, false)?;
+                // Personal pages are strictly page-only: their buttons start
+                // private runs whose output appears only on the page.
+                if self.resolver.page_space().is_none() && !target.chat {
+                    self.push(e.at, key, PERSONAL_ONLY);
+                    return None;
+                }
+                if target.thread {
+                    self.push(
+                        e.at,
+                        key,
+                        "a button can't send work to a thread; name one of the Space's top-level rooms",
+                    );
+                    return None;
+                }
                 if !target.chat && target.agent_id.is_none() {
                     self.push(
                         e.at,
@@ -1582,6 +1707,15 @@ impl<'a> Compiler<'a> {
                 }
                 action.target = target;
                 action.prompt = Some(prompt);
+            }
+            spec::action::RUN_SCHEDULE if self.resolver.page_space().is_none() => {
+                self.push(
+                    e.at,
+                    key,
+                    "a personal page can't run schedules: a scheduled task writes to your Chat or a \
+                     Space room, and a personal page's buttons only start private runs shown on the page",
+                );
+                return None;
             }
             spec::action::RUN_SCHEDULE => match s("schedule") {
                 Some(id) if valid_schedule_id(&id) => action.schedule_id = Some(id),
@@ -1635,6 +1769,8 @@ pub fn compile(src: &str, resolver: &mut dyn Resolver) -> Compiled {
         data: Vec::new(),
         blocks: 0,
         actions: 0,
+        multiplier: 1,
+        rendered: 0,
     };
     c.collect_keys(&root);
     let spec = c.page(&root);
@@ -1695,6 +1831,19 @@ pub fn compile(src: &str, resolver: &mut dyn Resolver) -> Compiled {
         for (at, text) in inserts {
             source.insert_str(at, &text);
         }
+    }
+    // The stored source, generated keys included, obeys the same limit.
+    let mut diagnostics = diagnostics;
+    if diagnostics.is_empty() && source.len() > tsx::MAX_SOURCE_BYTES {
+        diagnostics.push(Diagnostic {
+            line: 1,
+            column: 1,
+            message: format!(
+                "with its keys added the page is over {} KB; write keys yourself or shorten it",
+                tsx::MAX_SOURCE_BYTES / 1024
+            ),
+            key: None,
+        });
     }
     Compiled {
         source,

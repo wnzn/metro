@@ -158,6 +158,7 @@ fn messages(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json, Fa
             room_ok(db, &sid, Some(room))?;
             store::room_events(
                 db,
+                viewer,
                 &sid,
                 room,
                 kinds,
@@ -223,6 +224,7 @@ fn agent_answer(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json
                 }
                 store::room_events(
                     db,
+                    viewer,
                     sid,
                     rid,
                     &[kind::AGENT, kind::ERROR, kind::STATUS],
@@ -242,13 +244,57 @@ fn agent_answer(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json
             )?,
         };
         let room = t.room.as_deref();
-        return Ok(match reply {
-            Some(e) => answer_json(db, &e, room),
-            None => json!({
-                "status": "running",
-                "at": rfc3339_utc(run.created_at),
-                "room": room,
-            }),
+        if let Some(e) = reply {
+            return Ok(answer_json(db, &e, room));
+        }
+        // No answer: the run couldn't start, hasn't started yet, or ended
+        // without a reply (its last lifecycle marker says how).
+        if let Some(error) = &run.error {
+            return Ok(json!({"status": "failed", "error": text(error),
+                             "at": rfc3339_utc(run.created_at), "room": room}));
+        }
+        if run.run_id.is_empty() {
+            return Ok(
+                json!({"status": "starting", "at": rfc3339_utc(run.created_at), "room": room}),
+            );
+        }
+        let marker = match (&run.space_id, &run.room_id) {
+            (Some(sid), Some(rid)) => store::room_events(
+                db,
+                viewer,
+                sid,
+                rid,
+                &[kind::ACTIVITY],
+                Some(&run.run_id),
+                None,
+                1,
+            )?
+            .into_iter()
+            .next(),
+            _ => store::last_page_event(db, page, viewer, &[kind::ACTIVITY], Some(&run.run_id))?,
+        };
+        let phase = marker
+            .as_ref()
+            .and_then(|e| e.activity.as_ref())
+            .and_then(|a| a.phase.clone());
+        let at = marker
+            .as_ref()
+            .map(at)
+            .unwrap_or(json!(rfc3339_utc(run.created_at)));
+        return Ok(match phase.as_deref() {
+            Some(crate::db::activity::COMPLETED) => {
+                json!({"status": "done", "text": null, "at": at, "room": room})
+            }
+            Some(crate::db::activity::FAILED) => {
+                json!({"status": "failed", "at": at, "room": room})
+            }
+            Some(crate::db::activity::CANCELLED) => {
+                json!({"status": "cancelled", "at": at, "room": room})
+            }
+            Some(crate::db::activity::INTERRUPTED) => {
+                json!({"status": "interrupted", "at": at, "room": room})
+            }
+            _ => json!({"status": "running", "at": at, "room": room}),
         });
     }
     let latest = match &space {
@@ -256,6 +302,7 @@ fn agent_answer(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json
             let room = t.room_id.as_deref().ok_or(Fail::NoAccess)?;
             store::room_events(
                 db,
+                viewer,
                 sid,
                 room,
                 &[kind::AGENT],
@@ -376,8 +423,18 @@ fn agents(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json, Fail
     let Some(sid) = space_of(db, ctx, t, viewer)? else {
         return Err(Fail::NoAccess);
     };
-    let items: Vec<Json> = db
-        .space_agents(&sid)?
+    // Membership and the read under one lock: nothing changes in between.
+    let list = {
+        let conn = db.lock();
+        if super::access::member_role(&conn, &sid, viewer)
+            .map_err(anyhow::Error::from)?
+            .is_none()
+        {
+            return Err(Fail::NoAccess);
+        }
+        crate::space_agents::list_in(&conn, &sid).map_err(anyhow::Error::from)?
+    };
+    let items: Vec<Json> = list
         .iter()
         .map(|a| {
             json!({
@@ -409,7 +466,7 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
     }
     let mut rooms: HashMap<(String, String), String> = HashMap::new();
     let mut items = Vec::new();
-    let mut active = 0;
+    let mut active_by: HashMap<String, usize> = HashMap::new();
     for r in all.iter().rev() {
         if !allowed.contains(&r.space_id) {
             continue;
@@ -421,6 +478,7 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
         // markers is its `started` one; any marker carries the agent.
         let started = store::room_events(
             db,
+            viewer,
             &r.space_id,
             &r.room_id,
             &[kind::ACTIVITY],
@@ -438,7 +496,7 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
             continue;
         }
         if r.status == RunStatus::Running {
-            active += 1;
+            *active_by.entry(r.space_id.clone()).or_default() += 1;
         }
         if items.len() >= limit_of(t) {
             continue;
@@ -465,6 +523,18 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
             "task": r.task,
         }));
     }
+    // Membership again after the read: a Space the viewer left meanwhile
+    // contributes nothing.
+    let still: std::collections::HashSet<String> =
+        db.list_spaces(viewer)?.into_iter().map(|s| s.id).collect();
+    items.retain(|i| i["space_id"].as_str().is_some_and(|s| still.contains(s)));
+    let active: usize = active_by
+        .iter()
+        .filter(|(s, _)| still.contains(*s))
+        .map(|(_, n)| n)
+        .sum();
+    // Newest first by start time; runs without a known start last.
+    items.sort_by(|a, b| b["started"].as_str().cmp(&a["started"].as_str()));
     Ok(json!({"active": active, "items": items}))
 }
 
@@ -600,7 +670,7 @@ pub async fn resolve(
             }
             // What the viewer vouched for, once per request.
             let vouched = match (&ctx.page_id, ctx.version) {
-                (Some(page), Some(version)) if !ctx.draft => {
+                (Some(page), Some(version)) if !ctx.draft && !spec.server_actions().is_empty() => {
                     match store::vouched(db, page, version, &viewer) {
                         Ok(v) => Some(v),
                         Err(e) => {

@@ -9,8 +9,10 @@
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
+use super::access::{Rights, member_role, rights_in};
 use super::limits::PageLimits;
-use crate::db::{Activity, Author, Db, Event, event_time, now_ms};
+use super::spec::{Action, PageSpec};
+use crate::db::{Activity, Author, Db, Event, Room, event_time, now_ms};
 
 /// How long a soft-deleted page can be restored.
 pub const DELETED_RETENTION_MS: i64 = 30 * 24 * 60 * 60 * 1000;
@@ -103,8 +105,18 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
              room_id    TEXT,
              trigger_id INTEGER NOT NULL,
              run_id     TEXT NOT NULL,
+             error      TEXT,
              created_at INTEGER NOT NULL
          );
+         CREATE TABLE IF NOT EXISTS page_action_authors (
+             page_id     TEXT NOT NULL REFERENCES pages (id) ON DELETE CASCADE,
+             version     INTEGER NOT NULL,
+             user_id     TEXT NOT NULL,
+             action_hash TEXT NOT NULL,
+             PRIMARY KEY (page_id, version, user_id, action_hash)
+         );
+         CREATE INDEX IF NOT EXISTS page_action_authors_user
+             ON page_action_authors (page_id, user_id, action_hash);
          CREATE INDEX IF NOT EXISTS page_runs_block ON page_runs (page_id, block_key, id);
          CREATE TABLE IF NOT EXISTS page_events (
              id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -242,55 +254,91 @@ pub struct NewVersion {
     pub title: String,
 }
 
+/// Why a request may not touch a page: 404 (gone, deleted, or not visible
+/// to them) or 403 (visible, but not this operation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Denied {
+    Gone,
+    Forbidden,
+}
+
+/// The right an operation needs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Need {
+    View,
+    Edit,
+    Delete,
+    Manage,
+}
+
+/// The live page `id` and `user`'s rights on it, read on `conn` (inside
+/// the caller's transaction), or why not.
+pub fn load_in(
+    conn: &Connection,
+    id: &str,
+    user: &str,
+    need: Need,
+) -> rusqlite::Result<Result<(PageRow, Rights), Denied>> {
+    let Some(page) = get_in(conn, id)?.filter(|p| p.deleted_at.is_none()) else {
+        return Ok(Err(Denied::Gone));
+    };
+    let Some(rights) = rights_in(conn, &page, user)? else {
+        return Ok(Err(Denied::Gone));
+    };
+    let allowed = match need {
+        Need::View => true,
+        Need::Edit => rights.can_edit,
+        Need::Delete => rights.can_delete,
+        Need::Manage => rights.can_manage,
+    };
+    if !allowed {
+        return Ok(Err(Denied::Forbidden));
+    }
+    Ok(Ok((page, rights)))
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub enum CreateError {
     /// The Space (or person) already has the most pages allowed.
     TooMany(usize),
-    /// The author isn't a member of the Space (any more).
+    /// The author isn't a member of the Space (any more): 404.
     NotAllowed,
-}
-
-fn member_role(conn: &Connection, space: &str, user: &str) -> rusqlite::Result<Option<String>> {
-    conn.query_row(
-        "SELECT role FROM space_members WHERE space_id = ?1 AND user_id = ?2",
-        params![space, user],
-        |r| r.get(0),
-    )
-    .optional()
 }
 
 pub fn new_page_id() -> String {
     format!("pg_{}", uuid::Uuid::new_v4().simple())
 }
 
-/// Create a page with version 1. `space` set: a Space page; otherwise a
-/// personal page of `version.author_id`.
-pub fn create(
-    db: &Db,
+fn live_count(conn: &Connection, space: Option<&str>, owner: &str) -> rusqlite::Result<i64> {
+    match space {
+        Some(sid) => conn.query_row(
+            "SELECT COUNT(*) FROM pages WHERE space_id = ?1 AND deleted_at IS NULL",
+            [sid],
+            |r| r.get(0),
+        ),
+        None => conn.query_row(
+            "SELECT COUNT(*) FROM pages WHERE owner_id = ?1 AND deleted_at IS NULL",
+            [owner],
+            |r| r.get(0),
+        ),
+    }
+}
+
+/// Create a page with version 1 on `conn` (inside the caller's
+/// transaction). `space` set: a Space page; otherwise a personal page of
+/// `version.author_id`.
+fn create_in(
+    conn: &Connection,
     space: Option<&str>,
     version: &NewVersion,
     limits: &PageLimits,
 ) -> anyhow::Result<Result<PageRow, CreateError>> {
-    let mut conn = db.lock();
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    // The author's membership, checked again in the write transaction.
     if let Some(sid) = space
-        && member_role(&tx, sid, &version.author_id)?.is_none()
+        && member_role(conn, sid, &version.author_id)?.is_none()
     {
         return Ok(Err(CreateError::NotAllowed));
     }
-    let count: i64 = match space {
-        Some(sid) => tx.query_row(
-            "SELECT COUNT(*) FROM pages WHERE space_id = ?1 AND deleted_at IS NULL",
-            [sid],
-            |r| r.get(0),
-        )?,
-        None => tx.query_row(
-            "SELECT COUNT(*) FROM pages WHERE owner_id = ?1 AND deleted_at IS NULL",
-            [&version.author_id],
-            |r| r.get(0),
-        )?,
-    };
+    let count = live_count(conn, space, &version.author_id)?;
     if usize::try_from(count).unwrap_or(usize::MAX) >= limits.pages_per_space {
         return Ok(Err(CreateError::TooMany(limits.pages_per_space)));
     }
@@ -300,7 +348,7 @@ pub fn create(
         Some(_) => ("space", None),
         None => ("personal", Some(version.author_id.as_str())),
     };
-    tx.execute(
+    conn.execute(
         "INSERT INTO pages (id, scope, owner_id, space_id, creator_id, title, head_version, \
          created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
         params![
@@ -313,10 +361,25 @@ pub fn create(
             now
         ],
     )?;
-    insert_version(&tx, &id, 1, version, now)?;
-    let page = get_in(&tx, &id)?.ok_or_else(|| anyhow::anyhow!("reading the new page"))?;
-    tx.commit()?;
+    insert_version(conn, &id, 1, version, now)?;
+    let page = get_in(conn, &id)?.ok_or_else(|| anyhow::anyhow!("reading the new page"))?;
     Ok(Ok(page))
+}
+
+/// [`create_in`] in its own transaction.
+pub fn create(
+    db: &Db,
+    space: Option<&str>,
+    version: &NewVersion,
+    limits: &PageLimits,
+) -> anyhow::Result<Result<PageRow, CreateError>> {
+    let mut conn = db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let out = create_in(&tx, space, version, limits)?;
+    if out.is_ok() {
+        tx.commit()?;
+    }
+    Ok(out)
 }
 
 fn insert_version(
@@ -325,7 +388,7 @@ fn insert_version(
     n: i64,
     v: &NewVersion,
     now: i64,
-) -> rusqlite::Result<()> {
+) -> anyhow::Result<()> {
     conn.execute(
         "INSERT INTO page_versions (page_id, version, author_id, kind, prompt, model_ref, \
          restored_from, source, spec, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
@@ -342,6 +405,68 @@ fn insert_version(
             now
         ],
     )?;
+    credit(conn, page, n, v)?;
+    Ok(())
+}
+
+/// A stable digest of one action, for provenance.
+pub fn action_hash(a: &Action) -> String {
+    use sha2::Digest;
+    let json = serde_json::to_vec(a).unwrap_or_default();
+    sha2::Sha256::digest(&json)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+fn spec_actions(spec: &PageSpec) -> Vec<(Option<String>, Action)> {
+    spec.all_blocks()
+        .into_iter()
+        .filter_map(|b| b.action.clone().map(|a| (b.key.clone(), a)))
+        .collect()
+}
+
+/// Record which actions version `n` credits to its author, as compact
+/// digests read once per request:
+/// - `create`, `manual` (a source save) and `template`: every action;
+/// - `prompt` (an applied AI draft): only actions it added or changed
+///   relative to version `n - 1`, its base (none if that was pruned);
+/// - `rename` and `restore`: none.
+fn credit(conn: &Connection, page: &str, n: i64, v: &NewVersion) -> anyhow::Result<()> {
+    let Ok(spec) = serde_json::from_str::<PageSpec>(&v.spec) else {
+        return Ok(());
+    };
+    let actions: Vec<Action> = match v.kind {
+        "create" | "manual" | "template" => {
+            spec_actions(&spec).into_iter().map(|(_, a)| a).collect()
+        }
+        "prompt" => {
+            let base: Option<String> = conn
+                .query_row(
+                    "SELECT spec FROM page_versions WHERE page_id = ?1 AND version = ?2",
+                    params![page, n - 1],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let Some(base) = base.and_then(|s| serde_json::from_str::<PageSpec>(&s).ok()) else {
+                return Ok(());
+            };
+            let before = spec_actions(&base);
+            spec_actions(&spec)
+                .into_iter()
+                .filter(|(k, a)| !before.iter().any(|(bk, b)| bk == k && b == a))
+                .map(|(_, a)| a)
+                .collect()
+        }
+        _ => Vec::new(),
+    };
+    for a in actions {
+        conn.execute(
+            "INSERT OR IGNORE INTO page_action_authors (page_id, version, user_id, action_hash)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![page, n, v.author_id, action_hash(&a)],
+        )?;
+    }
     Ok(())
 }
 
@@ -350,13 +475,40 @@ fn insert_version(
 pub enum SaveError {
     /// The head isn't the version the save was based on.
     Conflict { head: i64 },
-    /// The author may not edit the page now (checked in the write
-    /// transaction: membership, creator or Space owner, or Members can edit).
-    NotAllowed,
+    /// Gone (404) or not an editor now (403), checked in the transaction.
+    Denied(Denied),
 }
 
-/// Append version `base + 1` if the head is still `base` (optimistic
-/// concurrency: never a silent overwrite), then prune old versions.
+/// Append version `base + 1` on `conn` if `version.author_id` may edit the
+/// live page now and its head is still `base` (optimistic concurrency:
+/// never a silent overwrite), then prune old versions.
+fn add_version_in(
+    conn: &Connection,
+    page: &str,
+    base: i64,
+    version: &NewVersion,
+    limits: &PageLimits,
+) -> anyhow::Result<Result<i64, SaveError>> {
+    let row = match load_in(conn, page, &version.author_id, Need::Edit)? {
+        Ok((row, _)) => row,
+        Err(d) => return Ok(Err(SaveError::Denied(d))),
+    };
+    let head = row.head_version;
+    if head != base {
+        return Ok(Err(SaveError::Conflict { head }));
+    }
+    let n = head + 1;
+    let now = now_ms();
+    insert_version(conn, page, n, version, now)?;
+    conn.execute(
+        "UPDATE pages SET head_version = ?2, title = ?3, updated_at = ?4 WHERE id = ?1",
+        params![page, n, version.title, now],
+    )?;
+    prune_versions(conn, page, n, limits.versions_per_page)?;
+    Ok(Ok(n))
+}
+
+/// [`add_version_in`] in its own transaction.
 pub fn add_version(
     db: &Db,
     page: &str,
@@ -366,48 +518,23 @@ pub fn add_version(
 ) -> anyhow::Result<Result<i64, SaveError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let Some(row) = get_in(&tx, page)?.filter(|p| p.deleted_at.is_none()) else {
-        return Err(anyhow::anyhow!("the page is gone"));
-    };
-    let author = version.author_id.as_str();
-    let allowed = match (&row.space_id, &row.owner_id) {
-        (Some(sid), _) => match member_role(&tx, sid, author)? {
-            None => false,
-            Some(role) => role == "owner" || row.creator_id == author || row.members_edit,
-        },
-        (None, Some(owner)) => owner == author,
-        (None, None) => false,
-    };
-    if !allowed {
-        return Ok(Err(SaveError::NotAllowed));
+    let out = add_version_in(&tx, page, base, version, limits)?;
+    if out.is_ok() {
+        tx.commit()?;
     }
-    let head = row.head_version;
-    if head != base {
-        return Ok(Err(SaveError::Conflict { head }));
-    }
-    let n = head + 1;
-    let now = now_ms();
-    insert_version(&tx, page, n, version, now)?;
-    tx.execute(
-        "UPDATE pages SET head_version = ?2, title = ?3, updated_at = ?4 WHERE id = ?1",
-        params![page, n, version.title, now],
-    )?;
-    prune_versions(&tx, page, n, limits.versions_per_page)?;
-    tx.commit()?;
-    Ok(Ok(n))
+    Ok(out)
 }
 
-/// Keep version 1 and the newest `keep` versions.
+/// Keep version 1 and the newest `keep` versions (and their provenance
+/// and confirmations).
 fn prune_versions(conn: &Connection, page: &str, head: i64, keep: usize) -> rusqlite::Result<()> {
     let oldest_kept = head - keep as i64 + 1;
-    conn.execute(
-        "DELETE FROM page_versions WHERE page_id = ?1 AND version <> 1 AND version < ?2",
-        params![page, oldest_kept],
-    )?;
-    conn.execute(
-        "DELETE FROM page_confirmations WHERE page_id = ?1 AND version <> 1 AND version < ?2",
-        params![page, oldest_kept],
-    )?;
+    for table in ["page_versions", "page_confirmations", "page_action_authors"] {
+        conn.execute(
+            &format!("DELETE FROM {table} WHERE page_id = ?1 AND version <> 1 AND version < ?2"),
+            params![page, oldest_kept],
+        )?;
+    }
     Ok(())
 }
 
@@ -428,13 +555,13 @@ pub fn get(db: &Db, id: &str) -> anyhow::Result<Option<PageRow>> {
 /// Pages `user` can see now: their personal pages and the pages of Spaces
 /// they're a member of now. With `deleted`, only the soft-deleted ones
 /// they could restore (their own, ones they created, or any in a Space
-/// they own) instead.
+/// they own) within the restore window instead.
 pub fn list_for(db: &Db, user: &str, deleted: bool) -> anyhow::Result<Vec<PageRow>> {
     let conn = db.lock();
     let sql = if deleted {
         format!(
-            "SELECT {PAGE_COLUMNS} FROM pages p WHERE p.deleted_at IS NOT NULL AND (
-                 p.owner_id = ?1
+            "SELECT {PAGE_COLUMNS} FROM pages p WHERE p.deleted_at IS NOT NULL AND p.deleted_at >= ?2
+               AND (p.owner_id = ?1
                  OR (p.space_id IS NOT NULL AND EXISTS (SELECT 1 FROM space_members m
                      WHERE m.space_id = p.space_id AND m.user_id = ?1
                        AND (m.role = 'owner' OR p.creator_id = ?1))))
@@ -442,7 +569,7 @@ pub fn list_for(db: &Db, user: &str, deleted: bool) -> anyhow::Result<Vec<PageRo
         )
     } else {
         format!(
-            "SELECT {PAGE_COLUMNS} FROM pages p WHERE p.deleted_at IS NULL AND (
+            "SELECT {PAGE_COLUMNS} FROM pages p WHERE p.deleted_at IS NULL AND ?2 = ?2 AND (
                  p.owner_id = ?1
                  OR (p.space_id IS NOT NULL AND EXISTS (SELECT 1 FROM space_members m
                      WHERE m.space_id = p.space_id AND m.user_id = ?1)))
@@ -450,109 +577,192 @@ pub fn list_for(db: &Db, user: &str, deleted: bool) -> anyhow::Result<Vec<PageRo
         )
     };
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map([user], row_page)?;
+    let rows = stmt.query_map(params![user, now_ms() - DELETED_RETENTION_MS], row_page)?;
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-pub fn versions(db: &Db, page: &str) -> anyhow::Result<Vec<VersionRow>> {
+/// One version's metadata (no source or spec).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct VersionMeta {
+    pub version: i64,
+    pub author_id: String,
+    pub kind: String,
+    pub prompt: Option<String>,
+    pub model_ref: Option<String>,
+    pub restored_from: Option<i64>,
+    pub created_at: i64,
+}
+
+/// The history list: metadata only, newest first.
+pub fn version_list(db: &Db, page: &str) -> anyhow::Result<Vec<VersionMeta>> {
     let conn = db.lock();
-    let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {VERSION_COLUMNS} FROM page_versions WHERE page_id = ?1 ORDER BY version DESC"
-    ))?;
-    let rows = stmt.query_map([page], row_version)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT version, author_id, kind, prompt, model_ref, restored_from, created_at
+         FROM page_versions WHERE page_id = ?1 ORDER BY version DESC",
+    )?;
+    let rows = stmt.query_map([page], |r| {
+        Ok(VersionMeta {
+            version: r.get(0)?,
+            author_id: r.get(1)?,
+            kind: r.get(2)?,
+            prompt: r.get(3)?,
+            model_ref: r.get(4)?,
+            restored_from: r.get(5)?,
+            created_at: r.get(6)?,
+        })
+    })?;
     Ok(rows.collect::<Result<_, _>>()?)
+}
+
+fn version_in(conn: &Connection, page: &str, n: i64) -> rusqlite::Result<Option<VersionRow>> {
+    conn.query_row(
+        &format!("SELECT {VERSION_COLUMNS} FROM page_versions WHERE page_id = ?1 AND version = ?2"),
+        params![page, n],
+        row_version,
+    )
+    .optional()
 }
 
 pub fn version(db: &Db, page: &str, n: i64) -> anyhow::Result<Option<VersionRow>> {
-    let conn = db.lock();
-    Ok(conn
-        .query_row(
-            &format!(
-                "SELECT {VERSION_COLUMNS} FROM page_versions WHERE page_id = ?1 AND version = ?2"
-            ),
-            params![page, n],
-            row_version,
-        )
-        .optional()?)
+    Ok(version_in(&db.lock(), page, n)?)
 }
 
-pub fn set_meta(
+/// A combined edit of a page's settings, applied all or nothing.
+#[derive(Debug, Default)]
+pub struct PatchOps {
+    /// A rename: the new version and the head it's based on.
+    pub rename: Option<(i64, NewVersion)>,
+    pub icon: Option<Option<String>>,
+    pub members_edit: Option<bool>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum PatchError {
+    Denied(Denied),
+    Conflict {
+        head: i64,
+    },
+    /// `members_edit` on a personal page.
+    NotSpacePage,
+}
+
+/// Apply `ops` for `user` in one transaction: every right is checked on
+/// the live page there, and nothing is written unless everything may be.
+pub fn patch(
     db: &Db,
     page: &str,
-    icon: Option<Option<&str>>,
-    members_edit: Option<bool>,
-) -> anyhow::Result<()> {
-    let conn = db.lock();
-    if let Some(icon) = icon {
-        conn.execute(
+    user: &str,
+    ops: &PatchOps,
+    limits: &PageLimits,
+) -> anyhow::Result<Result<(), PatchError>> {
+    let mut conn = db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (row, rights) = match load_in(&tx, page, user, Need::View)? {
+        Ok(v) => v,
+        Err(d) => return Ok(Err(PatchError::Denied(d))),
+    };
+    if ops.members_edit.is_some() {
+        if row.space_id.is_none() {
+            return Ok(Err(PatchError::NotSpacePage));
+        }
+        if !rights.can_manage {
+            return Ok(Err(PatchError::Denied(Denied::Forbidden)));
+        }
+    }
+    if (ops.icon.is_some() || ops.rename.is_some()) && !rights.can_edit {
+        return Ok(Err(PatchError::Denied(Denied::Forbidden)));
+    }
+    if let Some((base, version)) = &ops.rename {
+        match add_version_in(&tx, page, *base, version, limits)? {
+            Ok(_) => {}
+            Err(SaveError::Conflict { head }) => return Ok(Err(PatchError::Conflict { head })),
+            Err(SaveError::Denied(d)) => return Ok(Err(PatchError::Denied(d))),
+        }
+    }
+    let now = now_ms();
+    if let Some(icon) = &ops.icon {
+        tx.execute(
             "UPDATE pages SET icon = ?2, updated_at = ?3 WHERE id = ?1",
-            params![page, icon, now_ms()],
+            params![page, icon, now],
         )?;
     }
-    if let Some(m) = members_edit {
-        conn.execute(
+    if let Some(m) = ops.members_edit {
+        tx.execute(
             "UPDATE pages SET members_edit = ?2, updated_at = ?3 WHERE id = ?1",
-            params![page, m as i64, now_ms()],
+            params![page, m as i64, now],
         )?;
     }
-    Ok(())
+    tx.commit()?;
+    Ok(Ok(()))
 }
 
-pub fn soft_delete(db: &Db, page: &str, by: &str) -> anyhow::Result<bool> {
-    let conn = db.lock();
-    Ok(conn.execute(
+/// Soft-delete the live page for `user`, if they may delete it now.
+pub fn soft_delete(db: &Db, page: &str, user: &str) -> anyhow::Result<Result<(), Denied>> {
+    let mut conn = db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Err(d) = load_in(&tx, page, user, Need::Delete)? {
+        return Ok(Err(d));
+    }
+    tx.execute(
         "UPDATE pages SET deleted_at = ?2, deleted_by = ?3 WHERE id = ?1 AND deleted_at IS NULL",
-        params![page, now_ms(), by],
-    )? == 1)
+        params![page, now_ms(), user],
+    )?;
+    tx.commit()?;
+    Ok(Ok(()))
 }
 
-/// Undelete, if the Space (or person) still has room for it.
+#[derive(Debug, PartialEq, Eq)]
+pub enum UndeleteError {
+    Denied(Denied),
+    NotDeleted,
+    TooMany(usize),
+}
+
+/// Undelete for `user`, if they may restore it now, it's within the restore
+/// window, and the Space (or person) still has room for it.
 pub fn undelete(
     db: &Db,
     page: &str,
+    user: &str,
     limits: &PageLimits,
-) -> anyhow::Result<Result<bool, CreateError>> {
+) -> anyhow::Result<Result<(), UndeleteError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let Some(row) = get_in(&tx, page)? else {
-        return Ok(Ok(false));
+        return Ok(Err(UndeleteError::Denied(Denied::Gone)));
     };
-    if row.deleted_at.is_none() {
-        return Ok(Ok(false));
+    // Beyond the window, or without the right: as if it didn't exist.
+    if rights_in(&tx, &row, user)?.is_none_or(|r| !r.can_delete) {
+        return Ok(Err(UndeleteError::Denied(Denied::Gone)));
     }
-    let count: i64 = match (&row.space_id, &row.owner_id) {
-        (Some(sid), _) => tx.query_row(
-            "SELECT COUNT(*) FROM pages WHERE space_id = ?1 AND deleted_at IS NULL",
-            [sid],
-            |r| r.get(0),
-        )?,
-        (None, Some(owner)) => tx.query_row(
-            "SELECT COUNT(*) FROM pages WHERE owner_id = ?1 AND deleted_at IS NULL",
-            [owner],
-            |r| r.get(0),
-        )?,
-        _ => 0,
-    };
+    if row.deleted_at.is_none() {
+        return Ok(Err(UndeleteError::NotDeleted));
+    }
+    let owner = row.owner_id.clone().unwrap_or_default();
+    let count = live_count(&tx, row.space_id.as_deref(), &owner)?;
     if usize::try_from(count).unwrap_or(usize::MAX) >= limits.pages_per_space {
-        return Ok(Err(CreateError::TooMany(limits.pages_per_space)));
+        return Ok(Err(UndeleteError::TooMany(limits.pages_per_space)));
     }
     tx.execute(
         "UPDATE pages SET deleted_at = NULL, deleted_by = NULL, updated_at = ?2 WHERE id = ?1",
         params![page, now_ms()],
     )?;
     tx.commit()?;
-    Ok(Ok(true))
+    Ok(Ok(()))
 }
 
 /// Purge pages deleted more than [`DELETED_RETENTION_MS`] ago and expired
-/// drafts, as of `now`.
+/// drafts that no job is working on, as of `now`.
 pub fn purge_expired(db: &Db, now: i64) -> anyhow::Result<usize> {
     let conn = db.lock();
     let pages = conn.execute(
         "DELETE FROM pages WHERE deleted_at IS NOT NULL AND deleted_at < ?1",
         [now - DELETED_RETENTION_MS],
     )?;
-    conn.execute("DELETE FROM page_drafts WHERE expires_at < ?1", [now])?;
+    conn.execute(
+        "DELETE FROM page_drafts WHERE expires_at < ?1 AND status IN ('ready', 'failed')",
+        [now],
+    )?;
     Ok(pages)
 }
 
@@ -597,121 +807,406 @@ pub fn all_prefs(db: &Db, user: &str) -> anyhow::Result<std::collections::HashMa
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
-pub fn put_prefs(db: &Db, user: &str, page: &str, p: &Prefs) -> anyhow::Result<()> {
-    let conn = db.lock();
-    conn.execute(
+/// Save `user`'s preferences for a page they can see now.
+pub fn put_prefs(db: &Db, user: &str, page: &str, p: &Prefs) -> anyhow::Result<Result<(), Denied>> {
+    let mut conn = db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if let Err(d) = load_in(&tx, page, user, Need::View)? {
+        return Ok(Err(d));
+    }
+    tx.execute(
         "INSERT INTO page_prefs (user_id, page_id, pinned, position) VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (user_id, page_id) DO UPDATE SET pinned = ?3, position = ?4",
         params![user, page, p.pinned as i64, p.position],
     )?;
-    Ok(())
+    tx.commit()?;
+    Ok(Ok(()))
 }
 
-// ---- Confirmations ----
+// ---- Confirmations and provenance ----
 
-pub fn confirmed(db: &Db, user: &str, page: &str, version: i64) -> anyhow::Result<bool> {
-    let conn = db.lock();
-    Ok(conn.query_row(
+fn confirmed_in(conn: &Connection, user: &str, page: &str, version: i64) -> rusqlite::Result<bool> {
+    conn.query_row(
         "SELECT EXISTS (SELECT 1 FROM page_confirmations
              WHERE user_id = ?1 AND page_id = ?2 AND version = ?3)",
         params![user, page, version],
         |r| r.get(0),
-    )?)
+    )
 }
 
-pub fn confirm(db: &Db, user: &str, page: &str, version: i64) -> anyhow::Result<()> {
-    let conn = db.lock();
-    conn.execute(
-        "INSERT OR IGNORE INTO page_confirmations (user_id, page_id, version, created_at)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![user, page, version, now_ms()],
-    )?;
-    Ok(())
+pub fn confirmed(db: &Db, user: &str, page: &str, version: i64) -> anyhow::Result<bool> {
+    Ok(confirmed_in(&db.lock(), user, page, version)?)
 }
 
 /// What `user` already vouched for on one page version: whether they
-/// confirmed that version, and the actions they authored. Computed once
-/// per request and asked per button.
+/// confirmed that version, and the digests of actions credited to them
+/// ([`credit`]). Read once per request and asked per button.
 #[derive(Debug, Default)]
 pub struct Vouched {
     confirmed: bool,
-    authored: Vec<super::spec::Action>,
+    authored: std::collections::HashSet<String>,
 }
 
 impl Vouched {
     /// Whether running `action` needs the confirmation sheet.
-    pub fn needs_confirmation(&self, action: &super::spec::Action) -> bool {
-        !self.confirmed && !self.authored.iter().any(|a| a == action)
+    pub fn needs_confirmation(&self, action: &Action) -> bool {
+        !self.confirmed && !self.authored.contains(&action_hash(action))
     }
 }
 
-/// `(key, action)` of every block with an action.
-fn actions_of(spec: &super::spec::PageSpec) -> Vec<(Option<String>, super::spec::Action)> {
-    spec.all_blocks()
-        .into_iter()
-        .filter_map(|b| b.action.clone().map(|a| (b.key.clone(), a)))
-        .collect()
-}
-
-/// What `user` vouched for on version `version` of `page`.
-///
-/// Authored actions come from versions the user wrote:
-/// - `create`, `manual` (a source save) and `template`: every action in it;
-/// - `prompt` (an AI draft they applied): only the actions that version
-///   added or changed relative to the version it was based on, since
-///   applying a draft that didn't touch a button isn't reviewing it. If the
-///   base was pruned, none.
-///
-/// Renames and restores never count.
-pub fn vouched(db: &Db, page: &str, version: i64, user: &str) -> anyhow::Result<Vouched> {
-    let confirmed = confirmed(db, user, page, version)?;
-    if confirmed {
+fn vouched_in(
+    conn: &Connection,
+    page: &str,
+    version: i64,
+    user: &str,
+) -> rusqlite::Result<Vouched> {
+    if confirmed_in(conn, user, page, version)? {
         return Ok(Vouched {
-            confirmed,
-            authored: Vec::new(),
+            confirmed: true,
+            authored: Default::default(),
         });
     }
-    let rows: Vec<(i64, String, String, String)> = {
-        let conn = db.lock();
-        let mut stmt = conn.prepare_cached(
-            "SELECT version, author_id, kind, spec FROM page_versions WHERE page_id = ?1
-             ORDER BY version",
-        )?;
-        let rows = stmt.query_map([page], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
-        rows.collect::<Result<_, _>>()?
-    };
-    let parse = |s: &str| serde_json::from_str::<super::spec::PageSpec>(s).ok();
-    let mut authored = Vec::new();
-    for (n, author, kind, spec) in &rows {
-        if author != user {
-            continue;
-        }
-        let Some(spec) = parse(spec) else { continue };
-        match kind.as_str() {
-            "create" | "manual" | "template" => {
-                authored.extend(actions_of(&spec).into_iter().map(|(_, a)| a));
-            }
-            "prompt" => {
-                let base = rows
-                    .iter()
-                    .find(|(m, ..)| *m == n - 1)
-                    .and_then(|(.., s)| parse(s));
-                let Some(base) = base else { continue };
-                let before = actions_of(&base);
-                for (key, a) in actions_of(&spec) {
-                    let unchanged = before.iter().any(|(k, b)| *k == key && *b == a);
-                    if !unchanged {
-                        authored.push(a);
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT DISTINCT action_hash FROM page_action_authors WHERE page_id = ?1 AND user_id = ?2",
+    )?;
+    let authored = stmt
+        .query_map(params![page, user], |r| r.get(0))?
+        .collect::<Result<_, _>>()?;
     Ok(Vouched {
-        confirmed,
+        confirmed: false,
         authored,
     })
+}
+
+pub fn vouched(db: &Db, page: &str, version: i64, user: &str) -> anyhow::Result<Vouched> {
+    Ok(vouched_in(&db.lock(), page, version, user)?)
+}
+
+// ---- Claiming a button ----
+
+/// A click on a page button that runs something.
+pub struct ActionRequest<'a> {
+    pub page: &'a str,
+    pub user: &'a str,
+    pub author: &'a Author,
+    pub version: i64,
+    pub block_key: &'a str,
+    pub confirm: bool,
+    /// The schedule revision the confirmation sheet showed.
+    pub schedule_revision: Option<i64>,
+    /// The id the page-only Chat turn will run as.
+    pub chat_turn: &'a str,
+    /// The server's message limit: a longer prompt is refused.
+    pub max_prompt_chars: usize,
+}
+
+/// A claimed click: its trigger (if any) is already stored, as is its run
+/// origin and the person's consent. Dispatch exactly this. (One short-lived
+/// value per click, so the variants' size difference doesn't matter.)
+#[allow(clippy::large_enum_variant)]
+pub enum Claimed {
+    Room {
+        event: Event,
+        space_id: String,
+        room: Room,
+        agent: crate::space_agents::SpaceAgent,
+        page_run: i64,
+        page_title: String,
+    },
+    Chat {
+        event: Event,
+        page_run: i64,
+    },
+    Schedule {
+        claim: crate::schedules::Claim,
+        task: crate::schedules::Task,
+    },
+}
+
+#[derive(Debug)]
+pub enum ActionError {
+    Denied(Denied),
+    Conflict {
+        head: i64,
+    },
+    NoButton,
+    /// Opening rooms or pages and refreshing happen in the app.
+    Navigation,
+    /// A personal page's button that isn't a page-only run.
+    PersonalOnly,
+    Forbidden(&'static str),
+    /// The destination room or agent is gone.
+    Gone(&'static str),
+    Thread,
+    /// Confirm first; the payload describes exactly what would run.
+    NeedsConfirmation(serde_json::Value),
+    /// The schedule changed since the revision that was confirmed.
+    ScheduleChanged {
+        revision: i64,
+    },
+    Schedule(crate::schedules::ScheduleError),
+    /// The button's prompt is longer than a message may be.
+    TooLong,
+}
+
+/// Check and claim one click in a single transaction: the page is live and
+/// visible to the clicker, the version is still the head, the button exists
+/// and may run from this page, its destination is valid now, the clicker
+/// vouched for it (or confirms now, which is recorded), and then its
+/// trigger and run origin (or the schedule occurrence) are written. A
+/// click on a superseded version writes nothing.
+pub fn claim_action(
+    db: &Db,
+    req: &ActionRequest<'_>,
+) -> anyhow::Result<Result<Claimed, ActionError>> {
+    use super::spec::action as kinds;
+    use crate::db::kind;
+    let mut conn = db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (page, _) = match load_in(&tx, req.page, req.user, Need::View)? {
+        Ok(v) => v,
+        Err(d) => return Ok(Err(ActionError::Denied(d))),
+    };
+    if page.head_version != req.version {
+        return Ok(Err(ActionError::Conflict {
+            head: page.head_version,
+        }));
+    }
+    let head = version_in(&tx, &page.id, req.version)?
+        .ok_or_else(|| anyhow::anyhow!("a page without its head version"))?;
+    let spec: PageSpec = serde_json::from_str(&head.spec)?;
+    let Some(a) = spec.block(req.block_key).and_then(|b| b.action.clone()) else {
+        return Ok(Err(ActionError::NoButton));
+    };
+    if a.kind != kinds::RUN_AGENT && a.kind != kinds::RUN_SCHEDULE {
+        return Ok(Err(ActionError::Navigation));
+    }
+    if a.prompt
+        .as_ref()
+        .is_some_and(|p| p.chars().count() > req.max_prompt_chars)
+    {
+        return Ok(Err(ActionError::TooLong));
+    }
+    // Personal pages are strictly page-only.
+    let page_space = page.space_id.clone();
+    match &page_space {
+        None if a.kind != kinds::RUN_AGENT || !a.target.chat || a.target.space_id.is_some() => {
+            return Ok(Err(ActionError::PersonalOnly));
+        }
+        Some(_) if a.target.chat || a.target.space_id.is_some() => {
+            return Ok(Err(ActionError::Forbidden("this button can't run")));
+        }
+        _ => {}
+    }
+    // The destination, live.
+    let mut room_agent = None;
+    let mut task = None;
+    if let (Some(sid), true) = (&page_space, a.kind == kinds::RUN_AGENT) {
+        let rid = a.target.room_id.clone().unwrap_or_default();
+        let room: Option<Room> = tx
+            .query_row(
+                "SELECT id, name, parent_room_id FROM space_rooms WHERE space_id = ?1 AND id = ?2",
+                params![sid, rid],
+                |r| {
+                    Ok(Room {
+                        id: r.get(0)?,
+                        name: r.get(1)?,
+                        parent_room_id: r.get(2)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(room) = room else {
+            return Ok(Err(ActionError::Gone(
+                "this button's room no longer exists",
+            )));
+        };
+        if room.parent_room_id.is_some() {
+            return Ok(Err(ActionError::Thread));
+        }
+        let agent_id = a.target.agent_id.clone().unwrap_or_default();
+        let Some(agent) = crate::space_agents::get_in(&tx, sid, &agent_id)? else {
+            return Ok(Err(ActionError::Gone(
+                "this button's agent no longer exists",
+            )));
+        };
+        room_agent = Some((sid.clone(), room, agent));
+    }
+    if a.kind == kinds::RUN_SCHEDULE {
+        let id = a.schedule_id.clone().unwrap_or_default();
+        let found = crate::schedules::get_task_in(&tx, &id)?.filter(|t| t.owner_id == req.user);
+        let Some(t) = found else {
+            return Ok(Err(ActionError::Forbidden(
+                "only the schedule's owner can run it",
+            )));
+        };
+        if t.target.as_ref().map(|(s, _)| s) != page_space.as_ref() {
+            return Ok(Err(ActionError::Forbidden(
+                "this schedule doesn't run in this page's Space",
+            )));
+        }
+        task = Some(t);
+    }
+    // Consent.
+    let vouched = vouched_in(&tx, &page.id, req.version, req.user)?;
+    if vouched.needs_confirmation(&a) {
+        if !req.confirm {
+            let what = match &task {
+                Some(t) => serde_json::json!({
+                    "kind": kinds::RUN_SCHEDULE,
+                    "schedule_id": t.id,
+                    "schedule": t.name,
+                    "schedule_revision": t.revision,
+                    "prompt": t.prompt,
+                }),
+                None => serde_json::json!({
+                    "kind": kinds::RUN_AGENT,
+                    "prompt": a.prompt,
+                    "agent": a.target.agent,
+                    "agent_id": a.target.agent_id,
+                    "room": a.target.room,
+                    "room_id": a.target.room_id,
+                    "space_id": page_space,
+                    "chat": a.target.chat,
+                }),
+            };
+            return Ok(Err(ActionError::NeedsConfirmation(serde_json::json!({
+                "page_id": page.id,
+                "version": head.version,
+                "block_key": req.block_key,
+                "edited_by": head.author_id,
+                "edited_at": crate::db::rfc3339_utc(head.created_at),
+                "runs_as": req.user,
+                "action": what,
+            }))));
+        }
+        // A schedule confirmation is bound to the revision it showed.
+        if let Some(t) = &task
+            && req.schedule_revision != Some(t.revision)
+        {
+            return Ok(Err(ActionError::ScheduleChanged {
+                revision: t.revision,
+            }));
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO page_confirmations (user_id, page_id, version, created_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![req.user, page.id, req.version, now_ms()],
+        )?;
+    }
+    if let (Some(t), Some(r)) = (&task, req.schedule_revision)
+        && t.revision != r
+    {
+        return Ok(Err(ActionError::ScheduleChanged {
+            revision: t.revision,
+        }));
+    }
+    let now = now_ms();
+    let claimed = if let Some(t) = task {
+        match crate::schedules::claim_now_in(
+            &tx,
+            req.user,
+            &t.id,
+            Some(t.revision),
+            page_space.as_deref(),
+            chrono::Utc::now(),
+        ) {
+            Ok((claim, task)) => Claimed::Schedule { claim, task },
+            Err(e) => return Ok(Err(ActionError::Schedule(e))),
+        }
+    } else {
+        let text = a.prompt.clone().unwrap_or_default();
+        match room_agent {
+            Some((sid, room, agent)) => {
+                let addressed = crate::db::Addressed {
+                    mentions: serde_json::json!([{"kind": "agent", "agent_id": agent.id}]),
+                    audience: "agent".to_owned(),
+                };
+                tx.execute(
+                    "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, \
+                     mentions, audience, created_at, activity) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                    params![
+                        sid,
+                        room.id,
+                        kind::MESSAGE,
+                        req.author.name,
+                        req.author.id,
+                        text,
+                        addressed.mentions.to_string(),
+                        addressed.audience,
+                        now
+                    ],
+                )?;
+                let eid = tx.last_insert_rowid();
+                let event = crate::db::new_event(
+                    eid,
+                    kind::MESSAGE,
+                    req.author,
+                    &text,
+                    &addressed,
+                    None,
+                    now,
+                );
+                let page_run = insert_run(
+                    &tx,
+                    &page.id,
+                    req.version,
+                    req.block_key,
+                    req.user,
+                    Some((&sid, &room.id)),
+                    eid,
+                    "",
+                )?;
+                Claimed::Room {
+                    event,
+                    space_id: sid,
+                    room,
+                    agent,
+                    page_run,
+                    page_title: page.title.clone(),
+                }
+            }
+            None => {
+                tx.execute(
+                    "INSERT INTO page_events (page_id, user_id, kind, actor, actor_id, text, \
+                     activity, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7)",
+                    params![
+                        page.id,
+                        req.user,
+                        kind::MESSAGE,
+                        req.author.name,
+                        req.author.id,
+                        text,
+                        now
+                    ],
+                )?;
+                let eid = tx.last_insert_rowid();
+                let event = crate::db::new_event(
+                    eid,
+                    kind::MESSAGE,
+                    req.author,
+                    &text,
+                    &crate::agent::agent_addressed(),
+                    None,
+                    now,
+                );
+                let page_run = insert_run(
+                    &tx,
+                    &page.id,
+                    req.version,
+                    req.block_key,
+                    req.user,
+                    None,
+                    eid,
+                    req.chat_turn,
+                )?;
+                Claimed::Chat { event, page_run }
+            }
+        }
+    };
+    tx.commit()?;
+    Ok(Ok(claimed))
 }
 
 // ---- Run origins ----
@@ -723,13 +1218,16 @@ pub struct PageRun {
     pub space_id: Option<String>,
     pub room_id: Option<String>,
     pub trigger_id: i64,
+    /// Empty until the run started; then its activity id.
     pub run_id: String,
+    /// Why the run couldn't start.
+    pub error: Option<String>,
     pub created_at: i64,
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn record_run(
-    db: &Db,
+fn insert_run(
+    conn: &Connection,
     page: &str,
     version: i64,
     block: &str,
@@ -737,8 +1235,7 @@ pub fn record_run(
     target: Option<(&str, &str)>,
     trigger_id: i64,
     run_id: &str,
-) -> anyhow::Result<()> {
-    let conn = db.lock();
+) -> rusqlite::Result<i64> {
     conn.execute(
         "INSERT INTO page_runs (page_id, version, block_key, user_id, space_id, room_id, \
          trigger_id, run_id, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -754,12 +1251,27 @@ pub fn record_run(
             now_ms()
         ],
     )?;
+    let id = conn.last_insert_rowid();
     // Bounded: the newest 200 per block are enough to find answers.
     conn.execute(
         "DELETE FROM page_runs WHERE page_id = ?1 AND block_key = ?2 AND id NOT IN
              (SELECT id FROM page_runs WHERE page_id = ?1 AND block_key = ?2
               ORDER BY id DESC LIMIT 200)",
         params![page, block],
+    )?;
+    Ok(id)
+}
+
+/// Record how a claimed run went: its run id, or why it couldn't start.
+pub fn set_run(
+    db: &Db,
+    page_run: i64,
+    run_id: Option<&str>,
+    error: Option<&str>,
+) -> anyhow::Result<()> {
+    db.lock().execute(
+        "UPDATE page_runs SET run_id = COALESCE(?2, run_id), error = ?3 WHERE id = ?1",
+        params![page_run, run_id, error],
     )?;
     Ok(())
 }
@@ -774,7 +1286,7 @@ pub fn latest_run(
     let conn = db.lock();
     Ok(conn
         .query_row(
-            "SELECT version, user_id, space_id, room_id, trigger_id, run_id, created_at
+            "SELECT version, user_id, space_id, room_id, trigger_id, run_id, error, created_at
              FROM page_runs WHERE page_id = ?1 AND block_key = ?2
                AND (?3 IS NULL OR user_id = ?3)
              ORDER BY id DESC LIMIT 1",
@@ -787,7 +1299,8 @@ pub fn latest_run(
                     room_id: r.get(3)?,
                     trigger_id: r.get(4)?,
                     run_id: r.get(5)?,
-                    created_at: r.get(6)?,
+                    error: r.get(6)?,
+                    created_at: r.get(7)?,
                 })
             },
         )
@@ -896,10 +1409,12 @@ pub fn last_page_event(
 }
 
 /// Newest room events of `kinds` (optionally of one activity id or one
-/// agent id), newest first.
+/// agent id), newest first, read only while `viewer` is a member of the
+/// Space: the membership check is in the same statement as the rows.
 #[allow(clippy::too_many_arguments)]
 pub fn room_events(
     db: &Db,
+    viewer: &str,
     space: &str,
     room: &str,
     kinds: &[&str],
@@ -914,10 +1429,20 @@ pub fn room_events(
          WHERE space_id = ?1 AND room_id = ?2 AND kind IN (SELECT value FROM json_each(?3))
            AND (?4 IS NULL OR json_extract(activity, '$.id') = ?4)
            AND (?5 IS NULL OR json_extract(activity, '$.agent.id') = ?5)
+           AND EXISTS (SELECT 1 FROM space_members m
+                       WHERE m.space_id = ?1 AND m.user_id = ?7)
          ORDER BY id DESC LIMIT ?6",
     )?;
     let rows = stmt.query_map(
-        params![space, room, kinds, activity_id, agent_id, limit as i64],
+        params![
+            space,
+            room,
+            kinds,
+            activity_id,
+            agent_id,
+            limit as i64,
+            viewer
+        ],
         row_page_event,
     )?;
     Ok(rows.collect::<Result<_, _>>()?)
@@ -991,7 +1516,6 @@ pub struct NewDraft<'a> {
     pub page_id: Option<&'a str>,
     pub space_id: Option<&'a str>,
     pub author_id: &'a str,
-    pub base_version: Option<i64>,
     pub block_key: Option<&'a str>,
     pub prompt: &'a str,
     /// A draft older than this no longer holds a generation slot even if
@@ -1000,11 +1524,46 @@ pub struct NewDraft<'a> {
     pub busy_window_ms: i64,
 }
 
-/// Create a draft in `generating`; `None` when its author already has
-/// [`MAX_GENERATING_PER_PERSON`] drafts generating.
-pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Option<DraftRow>> {
+#[derive(Debug, PartialEq, Eq)]
+pub enum DraftError {
+    Denied(Denied),
+    /// The author already has [`MAX_GENERATING_PER_PERSON`] generating.
+    Busy,
+    /// `block_key` isn't a block of the page's head.
+    NoBlock,
+}
+
+/// Create a draft in `generating`, reserving one of its author's
+/// generation slots. In the same transaction: an edit draft needs the live
+/// page and edit rights now (its base is the head now); a new Space page's
+/// draft needs membership now.
+pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Result<DraftRow, DraftError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let base = match d.page_id {
+        Some(pid) => {
+            let (page, _) = match load_in(&tx, pid, d.author_id, Need::Edit)? {
+                Ok(v) => v,
+                Err(e) => return Ok(Err(DraftError::Denied(e))),
+            };
+            if let Some(k) = d.block_key {
+                let head = version_in(&tx, pid, page.head_version)?
+                    .and_then(|v| serde_json::from_str::<PageSpec>(&v.spec).ok());
+                if head.is_none_or(|s| s.block(k).is_none()) {
+                    return Ok(Err(DraftError::NoBlock));
+                }
+            }
+            Some(page.head_version)
+        }
+        None => {
+            if let Some(sid) = d.space_id
+                && member_role(&tx, sid, d.author_id)?.is_none()
+            {
+                return Ok(Err(DraftError::Denied(Denied::Gone)));
+            }
+            None
+        }
+    };
     let busy: i64 = tx.query_row(
         "SELECT COUNT(*) FROM page_drafts WHERE author_id = ?1
              AND status IN ('generating', 'discarded') AND created_at > ?2",
@@ -1012,7 +1571,7 @@ pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Option<DraftRow
         |r| r.get(0),
     )?;
     if busy >= MAX_GENERATING_PER_PERSON {
-        return Ok(None);
+        return Ok(Err(DraftError::Busy));
     }
     let id = format!("pgd_{}", uuid::Uuid::new_v4().simple());
     let now = now_ms();
@@ -1031,7 +1590,7 @@ pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Option<DraftRow
             scope,
             d.space_id,
             d.author_id,
-            d.base_version,
+            base,
             d.block_key,
             d.prompt,
             now,
@@ -1051,20 +1610,114 @@ pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Option<DraftRow
         row_draft,
     )?;
     tx.commit()?;
-    Ok(Some(row))
+    Ok(Ok(row))
 }
 
+/// A draft, unless it was discarded or has expired.
 pub fn draft(db: &Db, id: &str) -> anyhow::Result<Option<DraftRow>> {
     let conn = db.lock();
     Ok(conn
         .query_row(
             &format!(
-                "SELECT {DRAFT_COLUMNS} FROM page_drafts WHERE id = ?1 AND status <> 'discarded'"
+                "SELECT {DRAFT_COLUMNS} FROM page_drafts
+                 WHERE id = ?1 AND status <> 'discarded' AND expires_at > ?2"
             ),
-            [id],
+            params![id, now_ms()],
             row_draft,
         )
         .optional()?)
+}
+
+/// Whether draft `id`'s job may still call a model for `user`, decided in
+/// one read: the draft is still generating (not discarded, failed or
+/// expired) and theirs, they're still a member of its Space, and for an
+/// edit the page is live and they may still edit it.
+pub fn draft_live(db: &Db, id: &str, user: &str) -> anyhow::Result<bool> {
+    let conn = db.lock();
+    let row: Option<(Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT page_id, space_id FROM page_drafts
+             WHERE id = ?1 AND author_id = ?2 AND status = 'generating' AND expires_at > ?3",
+            params![id, user, now_ms()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .optional()?;
+    let Some((page, space)) = row else {
+        return Ok(false);
+    };
+    if let Some(sid) = &space
+        && member_role(&conn, sid, user)?.is_none()
+    {
+        return Ok(false);
+    }
+    if let Some(pid) = &page
+        && load_in(&conn, pid, user, Need::Edit)?.is_err()
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum ApplyError {
+    /// Gone, someone else's, discarded or expired: 404.
+    Gone,
+    NotReady,
+    Denied(Denied),
+    Conflict {
+        head: i64,
+    },
+    TooMany(usize),
+}
+
+/// Apply draft `id` for its author `user` in one transaction: the draft is
+/// still ready, then the page is created or the version saved (with every
+/// check those do), then the draft is consumed. On any refusal nothing
+/// changes and the draft stays; a concurrent apply or discard can't both
+/// succeed. Returns the page id.
+pub fn apply_draft(
+    db: &Db,
+    id: &str,
+    user: &str,
+    version: &NewVersion,
+    limits: &PageLimits,
+) -> anyhow::Result<Result<String, ApplyError>> {
+    let mut conn = db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let d = tx
+        .query_row(
+            &format!(
+                "SELECT {DRAFT_COLUMNS} FROM page_drafts
+                 WHERE id = ?1 AND author_id = ?2 AND status <> 'discarded' AND expires_at > ?3"
+            ),
+            params![id, user, now_ms()],
+            row_draft,
+        )
+        .optional()?;
+    let Some(d) = d else {
+        return Ok(Err(ApplyError::Gone));
+    };
+    if d.status != "ready" {
+        return Ok(Err(ApplyError::NotReady));
+    }
+    let page_id = match &d.page_id {
+        Some(pid) => {
+            let base = d.base_version.unwrap_or(-1);
+            match add_version_in(&tx, pid, base, version, limits)? {
+                Ok(_) => pid.clone(),
+                Err(SaveError::Conflict { head }) => return Ok(Err(ApplyError::Conflict { head })),
+                Err(SaveError::Denied(e)) => return Ok(Err(ApplyError::Denied(e))),
+            }
+        }
+        None => match create_in(&tx, d.space_id.as_deref(), version, limits)? {
+            Ok(page) => page.id,
+            Err(CreateError::TooMany(n)) => return Ok(Err(ApplyError::TooMany(n))),
+            Err(CreateError::NotAllowed) => return Ok(Err(ApplyError::Denied(Denied::Gone))),
+        },
+    };
+    tx.execute("DELETE FROM page_drafts WHERE id = ?1", [id])?;
+    tx.commit()?;
+    Ok(Ok(page_id))
 }
 
 /// Record a generation attempt's result (`ready` or `failed`).

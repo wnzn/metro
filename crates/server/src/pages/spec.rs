@@ -17,6 +17,17 @@ use serde::{Deserialize, Serialize};
 
 pub const FORMAT: u32 = 1;
 
+/// Most items any data list holds (the largest `limit` a source allows),
+/// and so the most times a `<List>`/`<Each>` repeats its blocks or a
+/// `<Table>` has rows.
+pub const MAX_ITEMS: usize = 50;
+/// The most blocks and table cells a page can render with full data:
+/// the compiler refuses pages above it (repetition can't nest), and the
+/// renderer must stop drawing past it too.
+pub const MAX_RENDERED: usize = 5_000;
+/// Most columns in one `<Table>`.
+pub const MAX_COLUMNS: usize = 12;
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PageSpec {
     pub format: u32,
@@ -55,6 +66,9 @@ pub struct Target {
     pub room_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub room: Option<String>,
+    /// The room is a thread (never a button's destination).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub thread: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

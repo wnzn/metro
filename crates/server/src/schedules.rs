@@ -606,6 +606,11 @@ fn row_task(r: &rusqlite::Row<'_>) -> rusqlite::Result<Task> {
     })
 }
 
+/// Task `id`, read on the caller's connection (or transaction).
+pub(crate) fn get_task_in(conn: &Connection, id: &str) -> rusqlite::Result<Option<Task>> {
+    get_task(conn, id)
+}
+
 fn get_task(conn: &Connection, id: &str) -> rusqlite::Result<Option<Task>> {
     conn.query_row(
         &format!("SELECT {TASK_COLUMNS} FROM schedules WHERE id = ?1"),
@@ -1014,18 +1019,23 @@ fn finish(
     now: DateTime<Utc>,
 ) -> anyhow::Result<()> {
     let detail: String = detail.chars().take(MAX_DETAIL_CHARS).collect();
-    let conn = db.lock();
-    conn.execute(
+    let mut conn = db.lock();
+    let tx = conn.transaction()?;
+    let changed = tx.execute(
         "UPDATE schedule_runs SET status = ?2, detail = ?3, finished_at = ?4 \
          WHERE id = ?1 AND status = ?5",
         params![claim.run_id, state, detail, ms(now), from],
     )?;
-    // Only the latest occurrence sets the task's summary.
-    conn.execute(
-        "UPDATE schedules SET last_status = ?2, last_detail = ?3 \
-         WHERE id = ?1 AND last_run_at = ?4",
-        params![claim.task_id, state, detail, ms(claim.due_at)],
-    )?;
+    // Only a transition that happened, of the task's latest occurrence (by
+    // run id: two occurrences can share a time), sets the task's summary.
+    if changed == 1 {
+        tx.execute(
+            "UPDATE schedules SET last_status = ?2, last_detail = ?3 \
+             WHERE id = ?1 AND (SELECT MAX(id) FROM schedule_runs WHERE task_id = ?1) = ?4",
+            params![claim.task_id, state, detail, claim.run_id],
+        )?;
+    }
+    tx.commit()?;
     Ok(())
 }
 
@@ -1118,8 +1128,12 @@ async fn fire(
     match tokio::time::timeout(timeout, &mut handle).await {
         Ok(joined) => Ok(submitted(joined)),
         Err(_) => {
-            // Not cancelled: the submission keeps running and its result
-            // replaces `unknown` when it returns.
+            // `unknown` is committed before the late completion is handed
+            // off, so a late result always lands on top of it.
+            let (db, c) = (state.db.clone(), claim.clone());
+            let (st, detail) = describe(&Outcome::Unknown, timeout);
+            db.call(move |db| finish(db, &c, status::DISPATCHING, st, &detail, Utc::now()))
+                .await?;
             let (db, claim) = (state.db.clone(), claim.clone());
             tokio::spawn(async move {
                 let (st, detail) = describe(&submitted(handle.await), timeout);
@@ -1277,39 +1291,118 @@ pub(crate) async fn process_claims(
 /// `schedule_runs` row like any occurrence (unique on its due time), and
 /// the task's last-run summary. Its schedule (`next_run_at`) is unchanged,
 /// and a paused task stays paused.
-fn claim_now(db: &Db, owner: &str, id: &str, now: DateTime<Utc>) -> Result<Claim, ScheduleError> {
-    let mut conn = db.lock();
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let task = get_owned(&tx, owner, id)?;
+/// Whether `owner` may send work to `target` now, read on `conn`.
+fn access_in(
+    conn: &Connection,
+    owner: &str,
+    target: &Option<(String, String)>,
+) -> rusqlite::Result<Access> {
+    let Some((sid, rid)) = target else {
+        return Ok(Access::Ok);
+    };
+    let member: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM space_members WHERE space_id = ?1 AND user_id = ?2)",
+        params![sid, owner],
+        |r| r.get(0),
+    )?;
+    if !member {
+        return Ok(Access::NoSpace);
+    }
+    let room: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM space_rooms WHERE space_id = ?1 AND id = ?2)",
+        params![sid, rid],
+        |r| r.get(0),
+    )?;
+    Ok(if room { Access::Ok } else { Access::NoRoom })
+}
+
+/// Claim a "run now" occurrence of `owner`'s task `id` at `now`, on the
+/// caller's transaction, and return it with the exact task snapshot to
+/// dispatch. Refused (with nothing written) unless the task is theirs,
+/// still at `expected_revision` when given, targets `required_space` when
+/// given, and its Space and room are still theirs. The occurrence is a
+/// `schedule_runs` row like any other (in its own namespace, see below);
+/// the task's schedule is unchanged.
+pub(crate) fn claim_now_in(
+    conn: &Connection,
+    owner: &str,
+    id: &str,
+    expected_revision: Option<i64>,
+    required_space: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<(Claim, Task), ScheduleError> {
+    let task = get_owned(conn, owner, id)?;
+    if expected_revision.is_some_and(|r| r != task.revision) {
+        return Err(ScheduleError::Conflict(
+            "the task changed since it was shown; review it and try again".to_owned(),
+        ));
+    }
+    if let Some(sid) = required_space
+        && task.target.as_ref().is_none_or(|(s, _)| s != sid)
+    {
+        return Err(ScheduleError::Conflict(
+            "this task doesn't run in this Space".to_owned(),
+        ));
+    }
+    match access_in(conn, owner, &task.target)? {
+        Access::Ok => {}
+        Access::NoSpace => {
+            return Err(ScheduleError::Conflict(
+                "you're no longer a member of this task's Space; it can't run".to_owned(),
+            ));
+        }
+        Access::NoRoom => {
+            return Err(ScheduleError::Conflict(
+                "this task's room no longer exists; it can't run".to_owned(),
+            ));
+        }
+    }
     // Run-now rows live in their own namespace: `due_at` is the negated
     // time, and a scheduled occurrence's `due_at` is never negative, so a
     // run now can never take the unique (task, due_at) slot of a real
     // occurrence (which `claim_due` inserts with INSERT OR IGNORE).
     let mut key = -ms(now).max(1);
     let run_id = loop {
-        let inserted = tx.execute(
+        let inserted = conn.execute(
             "INSERT OR IGNORE INTO schedule_runs \
              (task_id, owner_id, due_at, status, claimed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![task.id, task.owner_id, key, status::DISPATCHING, ms(now)],
         )?;
         if inserted == 1 {
-            break tx.last_insert_rowid();
+            break conn.last_insert_rowid();
         }
         key -= 1;
     };
     let due = ms(now);
-    tx.execute(
+    conn.execute(
         "UPDATE schedules SET last_status = ?2, last_run_at = ?3, last_detail = NULL WHERE id = ?1",
         params![task.id, status::DISPATCHING, due],
     )?;
-    prune(&tx, &task.id)?;
+    prune(conn, &task.id)?;
+    Ok((
+        Claim {
+            run_id,
+            task_id: task.id.clone(),
+            revision: task.revision,
+            due_at: from_ms(due),
+        },
+        task,
+    ))
+}
+
+/// [`claim_now_in`] in its own transaction.
+fn claim_now(
+    db: &Db,
+    owner: &str,
+    id: &str,
+    expected_revision: Option<i64>,
+    now: DateTime<Utc>,
+) -> Result<(Claim, Task), ScheduleError> {
+    let mut conn = db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let out = claim_now_in(&tx, owner, id, expected_revision, None, now)?;
     tx.commit()?;
-    Ok(Claim {
-        run_id,
-        task_id: task.id,
-        revision: task.revision,
-        due_at: from_ms(due),
-    })
+    Ok(out)
 }
 
 fn run_view(db: &Db, run_id: i64) -> anyhow::Result<Option<RunView>> {
@@ -1343,37 +1436,28 @@ pub async fn run_now_with(
     state: &AppState,
     owner: &str,
     id: &str,
+    expected_revision: Option<i64>,
     submit: &dyn Submitter,
     timeout: StdDuration,
 ) -> Result<RunView, ScheduleError> {
     let (o, i) = (owner.to_owned(), id.to_owned());
-    let task = state
+    let (claim, task) = state
         .db
-        .call(move |db| Ok(get_owned(&db.lock(), &o, &i)))
+        .call(move |db| Ok(claim_now(db, &o, &i, expected_revision, Utc::now())))
         .await??;
-    let (o, target) = (owner.to_owned(), task.target.clone());
-    match state
-        .db
-        .call(move |db| target_access(db, &o, &target))
-        .await?
-    {
-        Access::Ok => {}
-        Access::NoSpace => {
-            return Err(ScheduleError::Conflict(
-                "you're no longer a member of this task's Space; it can't run".to_owned(),
-            ));
-        }
-        Access::NoRoom => {
-            return Err(ScheduleError::Conflict(
-                "this task's room no longer exists; it can't run".to_owned(),
-            ));
-        }
-    }
-    let (o, i) = (owner.to_owned(), id.to_owned());
-    let claim = state
-        .db
-        .call(move |db| Ok(claim_now(db, &o, &i, Utc::now())))
-        .await??;
+    dispatch_claimed(state, claim, task, submit, timeout).await
+}
+
+/// Submit exactly the claimed snapshot `task` for `claim` and record the
+/// outcome. A submission still running at `timeout` is committed as
+/// `unknown` first; its late result then replaces that.
+pub(crate) async fn dispatch_claimed(
+    state: &AppState,
+    claim: Claim,
+    task: Task,
+    submit: &dyn Submitter,
+    timeout: StdDuration,
+) -> Result<RunView, ScheduleError> {
     let mut handle = tokio::spawn(submit.submit(
         state.clone(),
         task.owner_id.clone(),
@@ -1383,11 +1467,19 @@ pub async fn run_now_with(
     let outcome = match tokio::time::timeout(timeout, &mut handle).await {
         Ok(joined) => submitted(joined),
         Err(_) => {
-            let (db, claim) = (state.db.clone(), claim.clone());
+            let (st, detail) = describe(&Outcome::Unknown, timeout);
+            let detail = format!("Run now: {detail}");
+            let c = claim.clone();
+            state
+                .db
+                .call(move |db| finish(db, &c, status::DISPATCHING, st, &detail, Utc::now()))
+                .await?;
+            let (db, late) = (state.db.clone(), claim.clone());
             tokio::spawn(async move {
                 let (st, detail) = describe(&submitted(handle.await), timeout);
+                let detail = format!("Run now: {detail}");
                 let result = db
-                    .call(move |db| finish(db, &claim, status::UNKNOWN, st, &detail, Utc::now()))
+                    .call(move |db| finish(db, &late, status::UNKNOWN, st, &detail, Utc::now()))
                     .await;
                 if let Err(e) = result {
                     tracing::error!(error = %format!("{e:#}"), "recording a late run-now result");
@@ -1402,6 +1494,7 @@ pub async fn run_now_with(
     state
         .db
         .call(move |db| {
+            // A no-op when `unknown` was already committed above.
             finish(db, &claim, status::DISPATCHING, st, &detail, Utc::now())?;
             run_view(db, claim_id)
         })
@@ -1414,8 +1507,26 @@ pub async fn run_now_for(
     state: &AppState,
     owner: &str,
     id: &str,
+    expected_revision: Option<i64>,
 ) -> Result<RunView, ScheduleError> {
-    run_now_with(state, owner, id, &Routing, SUBMIT_TIMEOUT).await
+    run_now_with(
+        state,
+        owner,
+        id,
+        expected_revision,
+        &Routing,
+        SUBMIT_TIMEOUT,
+    )
+    .await
+}
+
+/// [`dispatch_claimed`] through the interactive routing.
+pub(crate) async fn dispatch_claimed_for(
+    state: &AppState,
+    claim: Claim,
+    task: Task,
+) -> Result<RunView, ScheduleError> {
+    dispatch_claimed(state, claim, task, &Routing, SUBMIT_TIMEOUT).await
 }
 
 /// The earliest pending firing of any enabled task.
@@ -1591,7 +1702,20 @@ async fn run_now(
     Path(id): Path<String>,
     body: axum::body::Bytes,
 ) -> ApiResult<Json<serde_json::Value>> {
-    crate::api::empty_object(&body)?;
-    let run = run_now_for(&state, &who.id, &id).await?;
+    /// Optionally, the revision the person saw: a task edited since then
+    /// isn't run (409).
+    #[derive(Deserialize, Default)]
+    #[serde(deny_unknown_fields)]
+    struct RunBody {
+        #[serde(default)]
+        revision: Option<i64>,
+    }
+    let body: RunBody = if body.iter().all(u8::is_ascii_whitespace) {
+        RunBody::default()
+    } else {
+        serde_json::from_slice(&body)
+            .map_err(|_| ApiError::bad_request("body must be {} or {\"revision\": n}"))?
+    };
+    let run = run_now_for(&state, &who.id, &id, body.revision).await?;
     Ok(Json(json!({"run": run})))
 }

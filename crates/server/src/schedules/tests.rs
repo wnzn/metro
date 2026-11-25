@@ -768,7 +768,7 @@ async fn run_now_at_the_due_instant_never_swallows_the_occurrence() {
     let task = create(&st, "alice", body(once("2026-11-22T10:00:06+08:00")), now).unwrap();
     let due = task.next_run_at.unwrap();
     // "Run now" at exactly the instant the occurrence is due.
-    let claim = claim_now(&st.db, "alice", &task.id, due).unwrap();
+    let (claim, _) = claim_now(&st.db, "alice", &task.id, None, due).unwrap();
     finish(
         &st.db,
         &claim,
@@ -792,7 +792,95 @@ async fn run_now_at_the_due_instant_never_swallows_the_occurrence() {
     assert_eq!(h.iter().filter(|r| r.run_now).count(), 1);
     assert_eq!(h.iter().filter(|r| !r.run_now).count(), 1);
     // Two run-nows in the same millisecond get distinct rows too.
-    let a = claim_now(&st.db, "alice", &task.id, due).unwrap();
-    let b = claim_now(&st.db, "alice", &task.id, due).unwrap();
+    let (a, _) = claim_now(&st.db, "alice", &task.id, None, due).unwrap();
+    let (b, _) = claim_now(&st.db, "alice", &task.id, None, due).unwrap();
     assert_ne!(a.run_id, b.run_id);
+}
+
+#[tokio::test]
+async fn the_summary_follows_the_latest_occurrence_by_run_id() {
+    let st = state().await;
+    let now = t(NOW);
+    let task = create(&st, "alice", body(once("2026-11-22T10:00:06+08:00")), now).unwrap();
+    let due = task.next_run_at.unwrap();
+    // The scheduled occurrence and a run now share the same time.
+    let (scheduled, _) = claim_due(&st.db, due, 10).unwrap();
+    let scheduled = scheduled.into_iter().next().unwrap();
+    let (manual, _) = claim_now(&st.db, "alice", &task.id, None, due).unwrap();
+    finish(
+        &st.db,
+        &manual,
+        status::DISPATCHING,
+        status::DISPATCHED,
+        "ok",
+        due,
+    )
+    .unwrap();
+    // The older occurrence finishing later doesn't overwrite the summary.
+    finish(
+        &st.db,
+        &scheduled,
+        status::DISPATCHING,
+        status::ERROR,
+        "boom",
+        due,
+    )
+    .unwrap();
+    assert_eq!(
+        get(&st, &task.id).last_status.as_deref(),
+        Some(status::DISPATCHED)
+    );
+    // A transition that didn't happen changes nothing either.
+    finish(&st.db, &manual, status::UNKNOWN, status::ERROR, "late", due).unwrap();
+    assert_eq!(
+        get(&st, &task.id).last_status.as_deref(),
+        Some(status::DISPATCHED)
+    );
+}
+
+#[tokio::test]
+async fn run_now_dispatches_exactly_the_claimed_snapshot() {
+    let st = state().await;
+    let fake = Fake::new(Mode::Ok);
+    let now = t(NOW);
+    let task = create(&st, "alice", body(cron("0 3 * * *", "UTC")), now).unwrap();
+    // A stale revision is refused and records nothing.
+    let err = run_now_with(
+        &st,
+        "alice",
+        &task.id,
+        Some(task.revision + 1),
+        fake.as_ref(),
+        StdDuration::from_secs(5),
+    )
+    .await
+    .unwrap_err();
+    assert!(matches!(err, ScheduleError::Conflict(_)), "{err:?}");
+    assert!(runs(&st, "alice", &task.id).is_empty());
+    assert!(fake.calls().is_empty());
+    // Claimed, then edited: the claimed prompt is what's sent.
+    let (claim, snapshot) =
+        claim_now(&st.db, "alice", &task.id, Some(task.revision), Utc::now()).unwrap();
+    let edit = PatchBody {
+        prompt: Some("Edited after the claim".into()),
+        ..Default::default()
+    };
+    update_task(&st.db, "alice", &task.id, edit, now, 8_000).unwrap();
+    let run = dispatch_claimed(
+        &st,
+        claim,
+        snapshot,
+        fake.as_ref(),
+        StdDuration::from_secs(5),
+    )
+    .await
+    .unwrap();
+    assert_eq!(run.status, status::DISPATCHED);
+    assert!(run.run_now);
+    assert_eq!(fake.calls()[0].2, "Summarize yesterday");
+    // A required Space the task doesn't target is refused.
+    let mut conn = st.db.lock();
+    let tx = conn.transaction().unwrap();
+    let err = claim_now_in(&tx, "alice", &task.id, None, Some("s-other"), Utc::now()).unwrap_err();
+    assert!(matches!(err, ScheduleError::Conflict(_)), "{err:?}");
 }
