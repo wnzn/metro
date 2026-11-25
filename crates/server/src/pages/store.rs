@@ -119,7 +119,25 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
          );
          CREATE INDEX IF NOT EXISTS page_events_page ON page_events (page_id, user_id, id);",
     )
-    .context("creating page tables")
+    .context("creating page tables")?;
+    recover_drafts(conn).context("recovering page drafts")?;
+    Ok(())
+}
+
+/// What the restart message says on a draft whose generation was cut off.
+pub const INTERRUPTED: &str = "Interrupted by a server restart; try again.";
+
+/// At startup no generation job is running: drafts still `generating`
+/// were cut off by the restart (they fail, so their author sees why), and
+/// `discarded` ones were only waiting for their job (they go). Either way
+/// their generation slots are free again.
+pub fn recover_drafts(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute(
+        "UPDATE page_drafts SET status = 'failed', error = ?1 WHERE status = 'generating'",
+        [INTERRUPTED],
+    )?;
+    conn.execute("DELETE FROM page_drafts WHERE status = 'discarded'", [])?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -611,46 +629,89 @@ pub fn confirm(db: &Db, user: &str, page: &str, version: i64) -> anyhow::Result<
     Ok(())
 }
 
-/// Version kinds in which the author wrote (or chose) the page's buttons:
-/// a rename or a restore doesn't count as reviewing them.
-const AUTHORED_KINDS: &str = "'create', 'manual', 'prompt', 'template'";
+/// What `user` already vouched for on one page version: whether they
+/// confirmed that version, and the actions they authored. Computed once
+/// per request and asked per button.
+#[derive(Debug, Default)]
+pub struct Vouched {
+    confirmed: bool,
+    authored: Vec<super::spec::Action>,
+}
 
-/// Whether `user` must confirm running `action` from version `version` of
-/// `page`: not when they already confirmed this version, and not when this
-/// exact action appears in a version they authored by saving source,
-/// applying a draft or creating the page.
-pub fn needs_confirmation(
-    db: &Db,
-    page: &str,
-    version: i64,
-    user: &str,
-    action: &super::spec::Action,
-) -> anyhow::Result<bool> {
-    if confirmed(db, user, page, version)? {
-        return Ok(false);
+impl Vouched {
+    /// Whether running `action` needs the confirmation sheet.
+    pub fn needs_confirmation(&self, action: &super::spec::Action) -> bool {
+        !self.confirmed && !self.authored.iter().any(|a| a == action)
     }
-    let specs: Vec<String> = {
+}
+
+/// `(key, action)` of every block with an action.
+fn actions_of(spec: &super::spec::PageSpec) -> Vec<(Option<String>, super::spec::Action)> {
+    spec.all_blocks()
+        .into_iter()
+        .filter_map(|b| b.action.clone().map(|a| (b.key.clone(), a)))
+        .collect()
+}
+
+/// What `user` vouched for on version `version` of `page`.
+///
+/// Authored actions come from versions the user wrote:
+/// - `create`, `manual` (a source save) and `template`: every action in it;
+/// - `prompt` (an AI draft they applied): only the actions that version
+///   added or changed relative to the version it was based on, since
+///   applying a draft that didn't touch a button isn't reviewing it. If the
+///   base was pruned, none.
+///
+/// Renames and restores never count.
+pub fn vouched(db: &Db, page: &str, version: i64, user: &str) -> anyhow::Result<Vouched> {
+    let confirmed = confirmed(db, user, page, version)?;
+    if confirmed {
+        return Ok(Vouched {
+            confirmed,
+            authored: Vec::new(),
+        });
+    }
+    let rows: Vec<(i64, String, String, String)> = {
         let conn = db.lock();
-        let mut stmt = conn.prepare_cached(&format!(
-            "SELECT spec FROM page_versions WHERE page_id = ?1 AND author_id = ?2
-               AND kind IN ({AUTHORED_KINDS})"
-        ))?;
-        let rows = stmt.query_map(params![page, user], |r| r.get(0))?;
+        let mut stmt = conn.prepare_cached(
+            "SELECT version, author_id, kind, spec FROM page_versions WHERE page_id = ?1
+             ORDER BY version",
+        )?;
+        let rows = stmt.query_map([page], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))?;
         rows.collect::<Result<_, _>>()?
     };
-    for spec in specs {
-        let Ok(spec) = serde_json::from_str::<super::spec::PageSpec>(&spec) else {
+    let parse = |s: &str| serde_json::from_str::<super::spec::PageSpec>(s).ok();
+    let mut authored = Vec::new();
+    for (n, author, kind, spec) in &rows {
+        if author != user {
             continue;
-        };
-        if spec
-            .all_blocks()
-            .iter()
-            .any(|b| b.action.as_ref() == Some(action))
-        {
-            return Ok(false);
+        }
+        let Some(spec) = parse(spec) else { continue };
+        match kind.as_str() {
+            "create" | "manual" | "template" => {
+                authored.extend(actions_of(&spec).into_iter().map(|(_, a)| a));
+            }
+            "prompt" => {
+                let base = rows
+                    .iter()
+                    .find(|(m, ..)| *m == n - 1)
+                    .and_then(|(.., s)| parse(s));
+                let Some(base) = base else { continue };
+                let before = actions_of(&base);
+                for (key, a) in actions_of(&spec) {
+                    let unchanged = before.iter().any(|(k, b)| *k == key && *b == a);
+                    if !unchanged {
+                        authored.push(a);
+                    }
+                }
+            }
+            _ => {}
         }
     }
-    Ok(true)
+    Ok(Vouched {
+        confirmed,
+        authored,
+    })
 }
 
 // ---- Run origins ----
@@ -933,6 +994,10 @@ pub struct NewDraft<'a> {
     pub base_version: Option<i64>,
     pub block_key: Option<&'a str>,
     pub prompt: &'a str,
+    /// A draft older than this no longer holds a generation slot even if
+    /// it still says it's generating: no job runs that long (defence in
+    /// depth on top of the startup recovery and the job's drop guard).
+    pub busy_window_ms: i64,
 }
 
 /// Create a draft in `generating`; `None` when its author already has
@@ -942,8 +1007,8 @@ pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Option<DraftRow
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let busy: i64 = tx.query_row(
         "SELECT COUNT(*) FROM page_drafts WHERE author_id = ?1
-             AND status IN ('generating', 'discarded')",
-        [d.author_id],
+             AND status IN ('generating', 'discarded') AND created_at > ?2",
+        params![d.author_id, now_ms() - d.busy_window_ms],
         |r| r.get(0),
     )?;
     if busy >= MAX_GENERATING_PER_PERSON {

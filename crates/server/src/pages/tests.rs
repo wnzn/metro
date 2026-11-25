@@ -1043,6 +1043,54 @@ fn reserved_names_and_chart_fields_are_checked() {
     )));
 }
 
+#[test]
+fn invisible_characters_and_comments_are_checked() {
+    for bad in [
+        '\u{061C}', '\u{200B}', '\u{200C}', '\u{2060}', '\u{2063}', '\u{FEFF}', '\u{00AD}',
+        '\u{180E}',
+    ] {
+        let body = format!("<Text key=\"t\">a{bad}b</Text>");
+        rejects(&space_page(&page(&body)), "isn't allowed in a page");
+    }
+    // Comments are stored and shown, so they follow the same rules.
+    for comment in [
+        "// hidden \u{202E}evil\n",
+        "/* hidden \u{202E}evil */",
+        "/* a\u{7}b */",
+    ] {
+        let src = format!("{comment}export default <Page title=\"x\"><Divider/></Page>");
+        rejects(&space_page(&src), "isn't allowed in a page");
+        let body = format!("{{{comment}}}");
+        let body = body.replace("//", "/*").replace('\n', " */");
+        rejects(
+            &space_page(&page(&format!("<Section key=\"s\">{body}</Section>"))),
+            "isn't allowed",
+        );
+    }
+    // CRLF sources and ordinary comments are fine.
+    ok(&space_page(
+        "// a comment\r\nexport default <Page title=\"x\">{/* note\r\n more */}<Divider/></Page>",
+    ));
+    // The zero-width joiner only inside emoji sequences.
+    for good in ["👩\u{200D}💻", "❤\u{FE0F}\u{200D}🔥", "👋🏽"] {
+        ok(&space_page(&page(&format!(
+            "<Badge key=\"b\">{good} ok</Badge>"
+        ))));
+        assert_eq!(super::tsx::invalid_char_in(good), None);
+    }
+    for bad in ["a\u{200D}b", "\u{200D}👩", "👩\u{200D}", "👩\u{200D}a"] {
+        assert_eq!(
+            super::tsx::invalid_char_in(bad),
+            Some('\u{200D}'),
+            "{bad:?}"
+        );
+        rejects(
+            &space_page(&page(&format!("<Badge key=\"b\">{bad}</Badge>"))),
+            "isn't allowed in a page",
+        );
+    }
+}
+
 mod store_tests {
     use super::super::limits::PageLimits;
     use super::super::store::{self, CreateError, NewVersion};
@@ -1164,6 +1212,7 @@ mod store_tests {
                 base_version: Some(1),
                 block_key: None,
                 prompt: "x",
+                busy_window_ms: 60_000,
             },
         )
         .unwrap()
@@ -1248,6 +1297,142 @@ mod store_tests {
             store::add_version(&db, &p.id, 2, &version("alice", "owner"), &limits).unwrap(),
             Ok(3)
         );
+    }
+
+    fn draft<'a>(author: &'a str, window: i64) -> store::NewDraft<'a> {
+        store::NewDraft {
+            page_id: None,
+            space_id: None,
+            author_id: author,
+            base_version: None,
+            block_key: None,
+            prompt: "x",
+            busy_window_ms: window,
+        }
+    }
+
+    const WINDOW: i64 = 60_000;
+
+    #[test]
+    fn a_restart_frees_generation_slots() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pages.sqlite");
+        let (kept, discarded) = {
+            let db = Db::open(&path).unwrap();
+            let a = store::create_draft(&db, &draft("alice", WINDOW))
+                .unwrap()
+                .unwrap();
+            let b = store::create_draft(&db, &draft("alice", WINDOW))
+                .unwrap()
+                .unwrap();
+            store::discard_draft(&db, &b.id).unwrap();
+            // Both still hold a slot: the third is refused.
+            assert!(
+                store::create_draft(&db, &draft("alice", WINDOW))
+                    .unwrap()
+                    .is_none()
+            );
+            (a.id, b.id)
+        };
+        // The server stopped with both jobs cut off.
+        let db = Db::open(&path).unwrap();
+        let a = store::draft(&db, &kept).unwrap().unwrap();
+        assert_eq!(a.status, "failed");
+        assert_eq!(a.error.as_deref(), Some(store::INTERRUPTED));
+        let gone: i64 = db
+            .lock()
+            .query_row(
+                "SELECT COUNT(*) FROM page_drafts WHERE id = ?1",
+                [&discarded],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(gone, 0);
+        for _ in 0..2 {
+            assert!(
+                store::create_draft(&db, &draft("alice", WINDOW))
+                    .unwrap()
+                    .is_some()
+            );
+        }
+    }
+
+    #[test]
+    fn a_draft_older_than_any_job_holds_no_slot() {
+        let db = Db::open_in_memory().unwrap();
+        for _ in 0..2 {
+            store::create_draft(&db, &draft("alice", WINDOW))
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            store::create_draft(&db, &draft("alice", WINDOW))
+                .unwrap()
+                .is_none()
+        );
+        db.lock()
+            .execute(
+                "UPDATE page_drafts SET created_at = created_at - ?1",
+                [WINDOW + 1],
+            )
+            .unwrap();
+        assert!(
+            store::create_draft(&db, &draft("alice", WINDOW))
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_panicking_job_still_releases_its_slot() {
+        let db = Db::open_in_memory().unwrap();
+        let d = store::create_draft(&db, &draft("alice", WINDOW))
+            .unwrap()
+            .unwrap();
+        store::create_draft(&db, &draft("alice", WINDOW))
+            .unwrap()
+            .unwrap();
+        assert!(
+            store::create_draft(&db, &draft("alice", WINDOW))
+                .unwrap()
+                .is_none()
+        );
+        let job = super::super::generate::guarded(db.clone(), d.id.clone(), async {
+            panic!("the page builder blew up");
+        });
+        assert!(tokio::spawn(job).await.is_err(), "the job panicked");
+        let after = store::draft(&db, &d.id).unwrap().unwrap();
+        assert_eq!(after.status, "failed");
+        assert_eq!(
+            after.error.as_deref(),
+            Some(super::super::generate::STOPPED)
+        );
+        assert!(
+            store::create_draft(&db, &draft("alice", WINDOW))
+                .unwrap()
+                .is_some()
+        );
+        // A job that finishes normally keeps its own result.
+        let d = store::create_draft(&db, &draft("bob", WINDOW))
+            .unwrap()
+            .unwrap();
+        let (db2, id) = (db.clone(), d.id.clone());
+        super::super::generate::guarded(db.clone(), d.id.clone(), async move {
+            store::finish_draft(
+                &db2,
+                &id,
+                "ready",
+                Some("s"),
+                Some("{}"),
+                None,
+                None,
+                None,
+                1,
+            )
+            .unwrap();
+        })
+        .await;
+        assert_eq!(store::draft(&db, &d.id).unwrap().unwrap().status, "ready");
     }
 
     #[test]

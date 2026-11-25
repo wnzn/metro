@@ -110,7 +110,7 @@ pub async fn run(
     {
         let (uid, pid, v, act) = (who.id.clone(), page.id.clone(), head.version, a.clone());
         let ask = db(state, move |db| {
-            store::needs_confirmation(db, &pid, v, &uid, &act)
+            Ok(store::vouched(db, &pid, v, &uid)?.needs_confirmation(&act))
         })
         .await?;
         if ask {

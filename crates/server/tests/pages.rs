@@ -1373,3 +1373,120 @@ async fn a_personal_page_title_never_reaches_a_space_room() {
     }
     assert!(seen);
 }
+
+// ---- Re-review fixes ----
+
+fn note_page(note: &str, prompt: &str) -> String {
+    format!(
+        r#"export default (
+  <Page title="Notes">
+    <Text key="note">{note}</Text>
+    <Button key="ask" label="Ask" action="runAgent" agent="agent" room="lobby" prompt="{prompt}" />
+  </Page>
+);"#
+    )
+}
+
+#[tokio::test]
+async fn applying_a_draft_vouches_only_for_the_buttons_it_changed() {
+    let m = model(|req, _| {
+        if !is_builder(req) {
+            return "ok".to_owned();
+        }
+        let last = last_user_text(req);
+        if last.contains("TOUCH-BUTTON") {
+            format!("```tsx\n{}\n```", note_page("new", "Alice's prompt"))
+        } else {
+            format!("```tsx\n{}\n```", note_page("new", "Bob's prompt"))
+        }
+    })
+    .await;
+    let s = Server::start(Some(m.config.clone())).await;
+    let sid = s.space(ALICE, "Team", &["bob"]).await;
+    let p = s
+        .create_page(BOB, space_scope(&sid), &note_page("old", "Bob's prompt"))
+        .await;
+    let pid = p["id"].as_str().unwrap().to_owned();
+    let apply = |prompt: &'static str| {
+        let (s, pid) = (&s, pid.clone());
+        async move {
+            let (st, d) = s
+                .post(
+                    ALICE,
+                    "/v1/pages/drafts",
+                    json!({"page_id": pid, "prompt": prompt}),
+                )
+                .await;
+            assert_eq!(st, StatusCode::ACCEPTED, "{d}");
+            let d = s.draft_done(ALICE, d["id"].as_str().unwrap()).await;
+            assert_eq!(d["status"], "ready", "{d}");
+            let (st, v) = s
+                .post(
+                    ALICE,
+                    &format!("/v1/pages/drafts/{}/apply", d["id"].as_str().unwrap()),
+                    json!({}),
+                )
+                .await;
+            assert_eq!(st, StatusCode::CREATED, "{v}");
+            assert_eq!(v["version"]["kind"], "prompt");
+            v["head_version"].as_i64().unwrap()
+        }
+    };
+    // Alice applies an AI draft that only changes the text: Bob's button
+    // is still Bob's, and Alice must confirm it.
+    let v2 = apply("TOUCH-TEXT").await;
+    let act = |v: i64| json!({"version": v, "block_key": "ask"});
+    let (_, d) = s
+        .post(ALICE, &format!("/v1/pages/{pid}/data"), json!({}))
+        .await;
+    assert_eq!(d["actions"]["ask"]["confirm"], true);
+    let (st, v) = s
+        .post(ALICE, &format!("/v1/pages/{pid}/actions"), act(v2))
+        .await;
+    assert_eq!(st, StatusCode::PRECONDITION_REQUIRED, "{v}");
+    assert_eq!(v["confirmation"]["action"]["prompt"], "Bob's prompt");
+    // A draft that changes the button: that action is Alice's now.
+    let v3 = apply("TOUCH-BUTTON").await;
+    let (st, v) = s
+        .post(ALICE, &format!("/v1/pages/{pid}/actions"), act(v3))
+        .await;
+    assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+    let (st, v) = s
+        .post(BOB, &format!("/v1/pages/{pid}/actions"), act(v3))
+        .await;
+    assert_eq!(st, StatusCode::PRECONDITION_REQUIRED, "{v}");
+    assert_eq!(v["confirmation"]["action"]["prompt"], "Alice's prompt");
+}
+
+#[tokio::test]
+async fn icons_refuse_direction_and_invisible_characters() {
+    let s = Server::start(None).await;
+    let p = s
+        .create_page(
+            ALICE,
+            personal(),
+            "export default <Page title=\"Mine\"><Divider/></Page>",
+        )
+        .await;
+    let pid = p["id"].as_str().unwrap();
+    for bad in [
+        "\u{202E}x",
+        "a\u{200B}",
+        "\u{2066}",
+        "\u{FEFF}",
+        "a\u{200D}b",
+        "\u{7}",
+    ] {
+        let (st, v) = s
+            .patch(ALICE, &format!("/v1/pages/{pid}"), json!({"icon": bad}))
+            .await;
+        assert_eq!(st, StatusCode::BAD_REQUEST, "{bad:?}: {v}");
+    }
+    for good in ["📊", "👩\u{200D}💻"] {
+        let (st, v) = s
+            .patch(ALICE, &format!("/v1/pages/{pid}"), json!({"icon": good}))
+            .await;
+        assert_eq!(st, StatusCode::OK, "{v}");
+        assert_eq!(v["icon"], good);
+    }
+}

@@ -503,10 +503,11 @@ async fn patch_page(
         return Err(forbidden("you can't edit this page"));
     }
     if let Some(Some(icon)) = &body.icon
-        && (icon.chars().count() > 16 || icon.chars().any(char::is_control))
+        && (icon.chars().count() > 16 || tsx::invalid_char_in(icon).is_some())
     {
         return Err(ApiError::bad_request(
-            "icon is at most 16 printable characters",
+            "icon is at most 16 printable characters, without control, invisible or \
+             text-direction characters",
         ));
     }
     if let Some(title) = &body.title {
@@ -983,6 +984,7 @@ async fn create_draft(
         body.block_key.clone(),
         prompt.clone(),
     );
+    let window = generate::busy_window_ms(&state.config.limits);
     let draft = db(&state, move |db| {
         store::create_draft(
             db,
@@ -993,6 +995,7 @@ async fn create_draft(
                 base_version: bv,
                 block_key: bk.as_deref(),
                 prompt: &pr,
+                busy_window_ms: window,
             },
         )
     })

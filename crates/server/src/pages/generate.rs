@@ -375,7 +375,66 @@ fn model_ref(note: &crate::model_routing::RouteNote) -> Option<String> {
 }
 
 /// Generate the draft of `job` and record the result.
+/// How long a generation can possibly take: every attempt at the agent
+/// timeout, plus a margin. A draft generating for longer than this is no
+/// longer counted against its author.
+pub fn busy_window_ms(limits: &crate::Limits) -> i64 {
+    let attempts = (MAX_RETRIES + 1) as u128;
+    let ms = limits.agent_timeout.as_millis() * attempts + 60_000;
+    i64::try_from(ms).unwrap_or(i64::MAX)
+}
+
+/// Fails its draft when dropped while still armed: a job that panics (or
+/// whose task is dropped) still releases its generation slot and tells its
+/// author why.
+struct Guard {
+    db: crate::db::Db,
+    id: String,
+    armed: bool,
+}
+
+/// What a draft says when its job ended without a result.
+pub const STOPPED: &str = "The page builder stopped unexpectedly; try again.";
+
+impl Drop for Guard {
+    fn drop(&mut self) {
+        if self.armed
+            && let Err(e) = store::finish_draft(
+                &self.db,
+                &self.id,
+                "failed",
+                None,
+                None,
+                None,
+                Some(STOPPED),
+                None,
+                0,
+            )
+        {
+            tracing::error!(error = %format!("{e:#}"), "failing an abandoned page draft");
+        }
+    }
+}
+
+/// Run `job` (which records its own result) for draft `id`; if it never
+/// finishes normally, the draft fails and its slot is freed.
+pub async fn guarded(db: crate::db::Db, id: String, job: impl std::future::Future<Output = ()>) {
+    let mut guard = Guard {
+        db,
+        id,
+        armed: true,
+    };
+    job.await;
+    guard.armed = false;
+}
+
+/// Generate the draft of `job` and record the result.
 pub async fn run(state: AppState, job: Job) {
+    let (db, id) = (state.db.clone(), job.draft_id.clone());
+    guarded(db, id, run_inner(state, job)).await;
+}
+
+async fn run_inner(state: AppState, job: Job) {
     let result = generate(&state, &job).await;
     let id = job.draft_id.clone();
     let write = state

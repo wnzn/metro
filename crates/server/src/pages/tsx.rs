@@ -281,17 +281,25 @@ impl<'a> Parser<'a> {
             match self.peek() {
                 Some(c) if c.is_ascii_whitespace() => self.i += 1,
                 Some(b'/') if self.peek_at(1) == Some(b'/') => {
+                    let start = self.i;
                     while let Some(c) = self.peek() {
                         if c == b'\n' {
                             break;
                         }
                         self.i += 1;
                     }
+                    // Comments are stored and shown too: same rules as text.
+                    let body = self.src[start..self.i].trim_end_matches('\r');
+                    self.check_chars(start, body)?;
                 }
                 Some(b'/') if self.peek_at(1) == Some(b'*') => {
                     let start = self.i;
                     match self.src[self.i + 2..].find("*/") {
-                        Some(end) => self.i += 2 + end + 2,
+                        Some(end) => {
+                            let body = self.src[start + 2..start + 2 + end].replace("\r\n", "\n");
+                            self.check_chars(start, &body)?;
+                            self.i += 2 + end + 2;
+                        }
                         None => return self.err(start, "unterminated /* comment"),
                     }
                 }
@@ -941,11 +949,12 @@ impl<'a> Parser<'a> {
     /// invisible direction overrides in a string's decoded value, however
     /// they were written (raw, `\u…` escape or `&#…;` entity).
     fn check_chars(&self, at: usize, s: &str) -> PResult<()> {
-        match s.chars().find(|c| forbidden_char(*c)) {
+        match invalid_char_in(s) {
             Some(c) => self.err(
                 at,
                 format!(
-                    "the character U+{:04X} isn't allowed in a page (control or text-direction character)",
+                    "the character U+{:04X} isn't allowed in a page (control, invisible or \
+                     text-direction character)",
                     c as u32
                 ),
             ),
@@ -1046,12 +1055,54 @@ impl<'a> Parser<'a> {
 
 /// C0/C1 controls except `\n` and `\t`, bidi embeddings, overrides and
 /// isolates (U+202A–U+202E, U+2066–U+2069) and the LRM/RLM marks.
+///
+/// Also invisible and zero-width characters that can hide or disguise text:
+/// U+00AD soft hyphen, U+061C Arabic letter mark, U+180E Mongolian vowel
+/// separator, U+200B–U+200D zero-width space/non-joiner/joiner, U+2060–U+2064
+/// word joiner and invisible operators, U+FEFF zero-width no-break space.
+/// The zero-width joiner is the one exception, decided in
+/// [`invalid_char_in`]: it's allowed only inside an emoji sequence.
 pub fn forbidden_char(c: char) -> bool {
     (c.is_control() && c != '\n' && c != '\t')
         || ('\u{202A}'..='\u{202E}').contains(&c)
         || ('\u{2066}'..='\u{2069}').contains(&c)
-        || c == '\u{200E}'
-        || c == '\u{200F}'
+        || ('\u{200B}'..='\u{200F}').contains(&c)
+        || ('\u{2060}'..='\u{2064}').contains(&c)
+        || matches!(c, '\u{00AD}' | '\u{061C}' | '\u{180E}' | '\u{FEFF}')
+}
+
+/// A pictographic character that can appear in a ZWJ emoji sequence.
+fn emoji(c: char) -> bool {
+    matches!(c as u32,
+        0x1F000..=0x1FAFF | 0x2190..=0x21FF | 0x2300..=0x23FF | 0x2600..=0x27BF
+        | 0x2B00..=0x2BFF)
+}
+
+/// The first character of `s` a page may not contain, if any. A zero-width
+/// joiner (U+200D) is allowed only between two emoji (optionally after a
+/// U+FE0F variation selector or a skin-tone modifier), as in 👩‍💻 or ❤️‍🔥,
+/// so emoji in labels and icons keep working while a joiner can't hide
+/// inside words.
+pub fn invalid_char_in(s: &str) -> Option<char> {
+    let chars: Vec<char> = s.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        if c == '\u{200D}' {
+            let mut p = i;
+            while p > 0 && matches!(chars[p - 1], '\u{FE0F}') {
+                p -= 1;
+            }
+            let before = p > 0 && emoji(chars[p - 1]);
+            let after = chars.get(i + 1).is_some_and(|n| emoji(*n));
+            if before && after {
+                continue;
+            }
+            return Some(c);
+        }
+        if forbidden_char(c) {
+            return Some(c);
+        }
+    }
+    None
 }
 
 /// JSX whitespace rules: lines are trimmed, whitespace-only lines that

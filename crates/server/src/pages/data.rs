@@ -486,7 +486,13 @@ fn source(db: &Db, ctx: &Context, d: &DataDecl, viewer: &str, all_runs: &[RunInf
 }
 
 /// What a button would do for `viewer` now.
-fn capability(db: &Db, ctx: &Context, block: &super::spec::Block, viewer: &str) -> Json {
+fn capability(
+    db: &Db,
+    ctx: &Context,
+    block: &super::spec::Block,
+    viewer: &str,
+    vouched: Option<&store::Vouched>,
+) -> Json {
     let Some(a) = &block.action else {
         return json!({"enabled": false});
     };
@@ -495,11 +501,13 @@ fn capability(db: &Db, ctx: &Context, block: &super::spec::Block, viewer: &str) 
     if ctx.draft && runs_server {
         return no("Apply the draft to use its buttons.");
     }
+    // No page version (a draft): nothing runs, nothing to confirm. A
+    // failed lookup asks.
     let confirm = || -> bool {
-        let (Some(page), Some(version)) = (&ctx.page_id, ctx.version) else {
-            return false;
-        };
-        store::needs_confirmation(db, page, version, viewer, a).unwrap_or(true)
+        match (&ctx.page_id, ctx.version) {
+            (Some(_), Some(_)) => vouched.is_none_or(|v| v.needs_confirmation(a)),
+            _ => false,
+        }
     };
     let result: Result<Json, Fail> = (|| match a.kind.as_str() {
         action::RUN_AGENT => {
@@ -590,12 +598,28 @@ pub async fn resolve(
                 }
                 data.insert(d.name.clone(), source(db, &ctx, d, &viewer, &all_runs));
             }
+            // What the viewer vouched for, once per request.
+            let vouched = match (&ctx.page_id, ctx.version) {
+                (Some(page), Some(version)) if !ctx.draft => {
+                    match store::vouched(db, page, version, &viewer) {
+                        Ok(v) => Some(v),
+                        Err(e) => {
+                            tracing::error!(error = %format!("{e:#}"), "reading confirmations");
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
             let mut actions = serde_json::Map::new();
             for b in spec.all_blocks() {
                 if b.action.is_some()
                     && let Some(k) = &b.key
                 {
-                    actions.insert(k.clone(), capability(db, &ctx, b, &viewer));
+                    actions.insert(
+                        k.clone(),
+                        capability(db, &ctx, b, &viewer, vouched.as_ref()),
+                    );
                 }
             }
             Ok(json!({
