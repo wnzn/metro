@@ -170,6 +170,7 @@ export const memberBusy = signal<string | null>(null);
 let client: Client | null = null;
 let abort: AbortController | null = null;
 let session = 0;
+let navigationGeneration = 0;
 let timer: number | undefined;
 let ticking = false;
 let tickAgain = false;
@@ -295,7 +296,6 @@ function startOnline(baseUrl: string, token: string) {
   failures = 0;
   status.set({ phase: "online" });
   for (const fn of sessionStarters) fn({ baseUrl, token });
-  kick();
 }
 
 /** Consume a verified candidate synchronously. Subsequent requests have their own session lifetime. */
@@ -309,8 +309,24 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
     connectError.set(null);
     publishIdentity(prepared.baseUrl, candidate.who, candidate.list, opts.remember);
     startOnline(prepared.baseUrl, candidate.token);
-    if (candidate.list.some((s) => s.id === candidate.remembered)) {
-      void enterSpace(candidate.remembered!, { place: "chat", spaceId: null });
+    const initial = candidate.list.find((s) => s.id === candidate.remembered);
+    if (initial) {
+      // Show the shell now; kick the first tick after enterSpace settles,
+      // bounded by listRooms' client timeout.
+      const current = guard();
+      const entering = enterSpace(initial.id, { place: "chat", spaceId: null });
+      const navigation = navigationGeneration; // enterSpace starts navigation before its first await
+      void entering.then(() => {
+        // A running tick reads the active room after any refreshLists await.
+        if (!current() || ticking) return;
+        const stillTarget = navigation === navigationGeneration &&
+          basePlace() === "space" && activeSpaceId() === initial.id && activeRoomId() !== null && view() === "room";
+        // Don't wake a later navigation, even if it returned to this Space.
+        // Still start the loop if none is scheduled (e.g. after falling back to Chat).
+        if (stillTarget || timer === undefined) kick();
+      });
+    } else {
+      kick();
     }
   });
 }
@@ -345,6 +361,7 @@ export async function connect(urlInput: string, tokenInput: string, opts: { reme
     if (initial) await enterSpace(initial.id, { place: "chat", spaceId: null });
     if (sess !== session) return;
     startOnline(baseUrl, token);
+    kick();
   } catch (error) {
     if (sess !== session) return;
     endSession();
@@ -366,6 +383,7 @@ export function retryNow() {
 
 export function openChat() {
   if (basePlace() === "chat" && !settingsOpen()) return;
+  navigationGeneration++;
   batch(() => {
     clearTransient();
     view.set("room");
@@ -381,6 +399,7 @@ export function openChat() {
 /** Opens Search, Library or Scheduled tasks: the user's own pages, outside every Space. */
 export function openPlace(where: "search" | "library" | "schedules") {
   if (basePlace() === where && !settingsOpen()) return;
+  navigationGeneration++;
   batch(() => {
     clearTransient();
     view.set("room");
@@ -471,6 +490,7 @@ export async function selectSpace(spaceId: string): Promise<void> {
   if (switchingSpace()) return;
   if (spaceId === activeSpaceId() && roomsBySpace()[spaceId]) {
     if (basePlace() === "space" && !settingsOpen()) return;
+    navigationGeneration++;
     batch(() => {
       clearTransient();
       view.set("room");
@@ -522,6 +542,7 @@ export async function createSpace(nameInput: string): Promise<boolean> {
 async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId: string | null }): Promise<void> {
   const c = client;
   if (!c) return;
+  navigationGeneration++;
   const currentSession = guard();
   const ok = guard(spaceId);
   batch(() => {
@@ -638,6 +659,7 @@ function rememberSpace(spaceId: string) {
 export function selectRoom(roomId: string) {
   const sid = activeSpaceId();
   if (!sid || (roomId === activeRoomId() && view() === "room" && basePlace() === "space" && !settingsOpen())) return;
+  navigationGeneration++;
   lastRoomBySpace.set(sid, roomId);
   batch(() => {
     clearTransient();

@@ -537,13 +537,14 @@ export function fakeServer() {
   const network: Record<string, (req: Req) => unknown> = {};
   for (const method of ["GET", "POST", "PUT", "PATCH", "DELETE"]) {
     network[`${method} ${BASE}/v1/*`] = (req: Req) => {
-      const late = slow.get(`${new URL(req.url).pathname} ${(header(req, "authorization") ?? "").replace(/^Bearer /, "")}`);
+      const u = new URL(req.url);
+      const token = (header(req, "authorization") ?? "").replace(/^Bearer /, "");
+      const late = slow.get(`${u.pathname}${u.search} ${token}`) ?? slow.get(`${u.pathname} ${token}`);
       if (late) {
         late.arrived++;
         return { ...(handle(req) as object), delay: late.ms };
       }
       const answer = handle(req);
-      const u = new URL(req.url);
       const delay = state.delays.get(u.pathname + u.search) ?? state.delays.get(u.pathname);
       return delay ? new Promise((resolve) => setTimeout(() => resolve(answer), delay)) : answer;
     };
