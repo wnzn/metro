@@ -346,6 +346,7 @@ test("saved remote verifies before showing the scoped Shell and room hydration n
   expect(app.shows("id:chat-view")).toBe(false);
   expect(app.shows("id:composer")).toBe(false);
   expect(app.shows("text:No room selected")).toBe(false);
+  expect(app.shows("text:Loading rooms…")).toBe(true);
   expect(rooms.arrived()).toBe(1);
   expect(remotePaths(s).some(p => p.includes("/events") || p.startsWith("/v1/models/available"))).toBe(false);
   await app.waitFor("text:First remote room message", { timeout: 340 });
@@ -478,24 +479,112 @@ test("a held denial can't remove a rejoined Space while its newer room entry is 
   expect(chatStarted(s)).toBe(false);
 });
 
-test("a newer scoped dispatch room read supersedes a denied startup entry without opening its transcript", async () => {
+for (const dispatchFirst of [true, false]) {
+  for (const confirmed of [true, false]) {
+    test(`startup denial ${dispatchFirst ? "after" : "before"} a newer ${confirmed ? "verified" : "inconclusive"} Dispatch room read`, async () => {
+      const s = servers();
+      const beta = holdBetaDenial(s, 404);
+      const delay = dispatchFirst ? 40 : 900;
+      if (confirmed) {
+        s.b.answerLate(betaRooms, TOKENS.bob!, delay);
+      } else {
+        const get = s.b.network[`GET ${BASE}/v1/*`]!;
+        let calls = 0;
+        s.b.network[`GET ${BASE}/v1/*`] = req => new URL(req.url).pathname === betaRooms && ++calls === 2
+          ? { status: 503, body: { error: "Try again later" }, delay }
+          : get(req);
+      }
+      const app = await launch(s, { storage: rememberedRemote, manualClock: true });
+      await submitSavedStartup(app);
+      await app.waitFor("id:rooms-loading", { timeout: 100 });
+      await app.press("id:nav-chat"); // deliberate Chat; only Dispatch reads Beta again
+      await app.press("id:dispatch-new");
+      beta.rejoin();
+      await app.press("id:dispatch-space:beta");
+      if (dispatchFirst) await app.waitFor(confirmed ? "id:dispatch-room:lobby" : "id:dispatch-error", { timeout: 150 });
+      else {
+        await app.clock!.runFor(700);
+        expect(app.shows("id:space:beta")).toBe(true); // an older denial can't invalidate a pending check
+        expect(app.shows("id:dispatch-room:lobby")).toBe(false);
+      }
+      await app.clock!.runFor(350 + (dispatchFirst ? 350 : 0));
+      expect(app.shows("id:space:beta")).toBe(confirmed);
+      expect(app.shows("id:dispatch-room:lobby")).toBe(confirmed);
+      expect(firstRoomPages(s)).toEqual([]);
+      expect(app.requests().filter(r => r.url === REMOTE + betaRooms)).toHaveLength(2);
+      await app.press("id:space:acme");
+      await app.waitFor("text:hello from bob in acme", { timeout: 180 });
+      expect(firstRoomPages(s)).toEqual([firstAcme]);
+    });
+  }
+}
+
+for (const betaFirst of [true, false]) {
+  test(`membership sync still runs in Library when ${betaFirst ? "A" : "B"}'s superseded entry replies first`, async () => {
+    const s = servers();
+    const beta = s.b.answerLate(betaRooms, TOKENS.bob!, betaFirst ? 700 : 950);
+    const acme = s.b.answerLate(acmeRooms, TOKENS.bob!, betaFirst ? 950 : 700);
+    const app = await launch(s, { storage: rememberedRemote, manualClock: true });
+    await submitSavedStartup(app);
+    await app.waitFor("id:rooms-loading", { timeout: 100 });
+    await app.press("id:space:acme");
+    await app.waitUntil(() => acme.arrived() === 1, { timeout: 100 });
+    await app.press("id:nav-library");
+    await app.waitFor("id:library-view", { timeout: 100 });
+    s.b.state.spaces.get("beta")!.members.delete("bob");
+    await app.clock!.runFor(11_500);
+    expect(app.shows("id:space:beta")).toBe(false);
+    expect(app.shows("id:space:acme")).toBe(true);
+    expect(app.shows("id:library-view")).toBe(true);
+    expect(remotePaths(s).filter(p => p === "/v1/spaces")).toHaveLength(2);
+    expect(beta.arrived()).toBe(1);
+    expect(acme.arrived()).toBe(1);
+    expect(firstRoomPages(s)).toEqual([]);
+    // Library loads its own model capabilities; there must be no Chat UI or poll.
+    expect(app.shows("id:chat-view")).toBe(false);
+    expect(remotePaths(s).some(p => p.startsWith("/v1/chat/") || p === "/v1/runs")).toBe(false);
+  });
+}
+
+test("a held membership omission can't erase a newer pending Dispatch read after rejoin", async () => {
   const s = servers();
-  const beta = holdBetaDenial(s, 404);
+  const app = await launch(s, { storage: { ...rememberedRemote, "metro.lastSpace": "" }, manualClock: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:chat-empty", { timeout: 100 });
+  const omitted = s.b.answerLate("/v1/spaces", TOKENS.bob!, 500);
+  const members = s.b.state.spaces.get("beta")!.members;
+  members.delete("bob");
+  await app.waitUntil(() => omitted.arrived() === 1, { timeout: 11_500 });
+  members.add("bob");
+  const rooms = s.b.answerLate(betaRooms, TOKENS.bob!, 800);
+  await app.press("id:dispatch-new");
+  await app.press("id:dispatch-space:beta");
+  await app.waitUntil(() => rooms.arrived() === 1, { timeout: 100 });
+  await app.clock!.runFor(550);
+  expect(app.shows("id:space:beta")).toBe(true);
+  expect(app.shows("id:dispatch-room:lobby")).toBe(false);
+  await app.waitFor("id:dispatch-room:lobby", { timeout: 350 });
+  expect(app.shows("id:space:beta")).toBe(true);
+  expect(firstRoomPages(s)).toEqual([]);
+});
+
+test("a newer Dispatch refusal wins over an older successful room snapshot", async () => {
+  const s = servers();
+  const held = s.b.answerLate(betaRooms, TOKENS.bob!, 700);
   const app = await launch(s, { storage: rememberedRemote, manualClock: true });
   await submitSavedStartup(app);
   await app.waitFor("id:rooms-loading", { timeout: 100 });
-  await app.press("id:nav-chat"); // deliberate Chat; the task form reads Beta's room list
+  expect(held.arrived()).toBe(1);
+  s.b.state.spaces.get("beta")!.members.delete("bob");
+  s.b.answerLate(betaRooms, TOKENS.bob!, 30);
+  await app.press("id:nav-chat");
   await app.press("id:dispatch-new");
-  beta.rejoin();
   await app.press("id:dispatch-space:beta");
-  await app.waitFor("id:dispatch-room:lobby", { timeout: 150 });
-  await app.press("id:space:acme");
-  await app.waitFor("text:hello from bob in acme", { timeout: 180 });
-  await app.clock!.runFor(700);
-  expect(app.shows("id:space:beta")).toBe(true);
-  expect(app.shows("text:hello from bob in acme")).toBe(true);
-  expect(firstRoomPages(s)).toEqual([firstAcme]);
-  expect(app.requests().filter(r => r.url === REMOTE + betaRooms)).toHaveLength(2);
+  await app.waitFor("id:space:beta", { state: "gone", timeout: 150 });
+  await app.clock!.runFor(750);
+  expect(app.shows("id:space:beta")).toBe(false);
+  expect(app.shows("id:dispatch-room:lobby")).toBe(false);
+  expect(firstRoomPages(s)).toEqual([]);
 });
 
 test("a room-list failure stays visible when returning to a settled empty Space", async () => {

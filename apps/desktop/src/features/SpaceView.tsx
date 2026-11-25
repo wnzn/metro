@@ -48,6 +48,7 @@ import {
   AskAgentChooser,
   AuthorGlyph,
   Badge,
+  Banner,
   Column,
   InlineLink,
   Label,
@@ -93,6 +94,12 @@ const roomsPending = () => switchingSpace() && !roomsLoaded();
 export function SpaceView() {
   // Its header (breadcrumb, runner, Manage, Space settings) is the Shell's one
   // header row: RoomHeaderTitle and RoomHeaderActions below.
+  let announcedFor: string | null = null;
+  effect(() => {
+    const pending = roomsPending() ? activeSpace() : null;
+    if (pending && pending.id !== announcedFor) announce(`Loading rooms in ${pending.name}.`);
+    announcedFor = pending?.id ?? null;
+  });
   return (
     <Surface variant="panel" grow testID="space-view">
       <ConnectionBanner />
@@ -100,7 +107,7 @@ export function SpaceView() {
         <If when={roomsPending()} else={
           <Column grow align="center" justify="center" pad={6} gap={2}>
             <If when={actionError()}>
-              {error => <Label color="danger" testID="rooms-error">{error()}</Label>}
+              {error => <Banner tone="danger" variant="inline" testID="rooms-error" message={error()} />}
             </If>
             <If when={roomsLoaded() && rooms().length === 0} else={<Label color="muted">Select a room in the sidebar.</Label>}>
               <Label color="muted" testID="rooms-empty">No rooms in this Space yet.</Label>
@@ -108,7 +115,7 @@ export function SpaceView() {
           </Column>
         }>
           <Column grow align="center" justify="center" pad={6} testID="rooms-loading">
-            <Label color="muted">Loading rooms…</Label>
+            <Label color="muted">Rooms will appear here when they’re ready.</Label>
           </Column>
         </If>
       }>
@@ -137,7 +144,7 @@ export function RoomHeaderTitle() {
         ›
       </Label>
       <Label variant="heading" lines={1} testID="room-title" heading tooltip={parent() ? undefined : ROOM_DESCRIPTION}>
-        {activeRoom() ? `# ${activeRoom()!.name}` : roomsPending() ? "Rooms" : "No room selected"}
+        {activeRoom() ? `# ${activeRoom()!.name}` : roomsPending() ? "Loading rooms…" : "No room selected"}
       </Label>
       <If when={parent()}>
         {(p) => (

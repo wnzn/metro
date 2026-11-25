@@ -183,7 +183,6 @@ let abort: AbortController | null = null;
 let session = 0;
 let navigationGeneration = 0;
 let roomEntryNavigation: number | undefined;
-const pendingRoomEntries = new Map<string, number>();
 let timer: number | undefined;
 let ticking = false;
 let tickAgain = false;
@@ -195,6 +194,69 @@ const inflight = new Map<string, Promise<void>>();
 const pollAgain = new Set<string>();
 const lastRoomBySpace = new Map<string, string>();
 const spaceEpoch = new Map<string, number>();
+
+// Request order, not response order. Keep these three primitives on the
+// same clock as the room-level access checks when those are integrated.
+let accessSequence = 0;
+const verifiedAccess = new Map<string, number>();
+const nextAccessRequest = () => ++accessSequence;
+const newerAccess = (key: string, request: number) => (verifiedAccess.get(key) ?? 0) > request;
+function verifyAccess(key: string, request: number) {
+  if (!newerAccess(key, request)) verifiedAccess.set(key, request);
+}
+const pendingSpaceReads = new Map<string, Map<number, Promise<void>>>();
+const spaceDenials = new Map<string, number>();
+const roomListRequests = new Map<string, number>();
+let lastMembershipRequest = 0;
+
+/** All membership and room-list reads are evidence for the exact Space. */
+function beginSpaceRead(sid: string, request = nextAccessRequest()) {
+  const key = scopeKey(sid, "");
+  const valid = guard(sid);
+  let pending = pendingSpaceReads.get(sid);
+  if (!pending) pendingSpaceReads.set(sid, pending = new Map());
+  const reads = pending;
+  let resolve!: () => void;
+  reads.set(request, new Promise<void>(done => { resolve = done; }));
+  function finish(verified = false) {
+    if (verified && valid()) verifyAccess(key, request);
+    reads.delete(request);
+    if (!reads.size && pendingSpaceReads.get(sid) === reads) pendingSpaceReads.delete(sid);
+    resolve();
+  }
+  return {
+    valid,
+    finish,
+    finishRooms() {
+      finish(true);
+      if (!valid() || (spaceDenials.get(sid) ?? 0) > request || (roomListRequests.get(sid) ?? 0) > request) return false;
+      roomListRequests.set(sid, request);
+      return true;
+    },
+    publishRooms(list: readonly Room[]) {
+      roomsBySpace.set({ ...roomsBySpace(), [sid]: list });
+    },
+    async deny(apply: () => void) {
+      finish();
+      if (!valid() || newerAccess(key, request) || (spaceDenials.get(sid) ?? 0) > request) return false;
+      spaceDenials.set(sid, request);
+      while (valid() && !newerAccess(key, request) && spaceDenials.get(sid) === request) {
+        const newer = [...(pendingSpaceReads.get(sid) ?? [])].find(([id]) => id > request);
+        if (!newer) {
+          apply(); // stamp/epoch and cache change together, without an intervening await
+          return true;
+        }
+        // A newer attempt isn't a grant. If inconclusive, this refusal still stands.
+        await newer[1];
+      }
+      return false;
+    },
+  };
+}
+
+function isSpaceDenial(error: unknown) {
+  return error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found");
+}
 
 // Other state modules (src/settings.ts) hook into the session's lifecycle
 // here instead of this module importing them.
@@ -323,20 +385,15 @@ function publishSession(baseUrl: string, token: string, who: Me, list: Space[], 
       const entering = enterSpace(initial.id, { place: "chat", spaceId: null });
       const navigation = navigationGeneration; // enterSpace starts navigation before its first await
       hydration = entering.then(() => {
-        // A running tick reads the active room after any refreshLists await.
-        if (!current() || ticking) return;
-        const stillTarget = navigation === navigationGeneration &&
-          basePlace() === "space" && activeSpaceId() === initial.id && activeRoomId() !== null && view() === "room";
-        // Don't wake a later navigation, even if it returned to this Space.
-        // Still start the loop if none is scheduled (e.g. after falling back to Chat).
-        if (stillTarget || (timer === undefined && !switchingSpace())) kick();
+        // A running tick reads the active destination after any refreshLists await.
+        if (current() && !ticking && navigation === navigationGeneration) kick();
       });
-    } else {
-      kick();
     }
     lastListsRefresh = Date.now();
     failures = 0;
     status.set({ phase: "online" });
+    // Membership sync belongs to the session, not to a room entry or transcript.
+    kick();
     for (const fn of sessionStarters) fn({ baseUrl, token });
     return hydration;
   });
@@ -436,15 +493,22 @@ export function openPlace(where: "search" | "library" | "pages" | "schedules") {
 export async function openExactRoom(spaceId: string, roomId: string, stillHere: () => boolean): Promise<boolean> {
   const c = client;
   if (!c || switchingSpace() || !roomId || !spaces().some(s => s.id === spaceId)) return false;
-  const valid = guard(spaceId);
   const generation = navigationGeneration;
-  const list = await c.listRooms(spaceId);
-  if (!valid() || switchingSpace() || generation !== navigationGeneration || !stillHere() || !list.some(r => r.id === roomId)) return false;
+  const read = beginSpaceRead(spaceId);
+  let list: Room[];
+  try {
+    list = await c.listRooms(spaceId);
+  } catch (error) {
+    if (isSpaceDenial(error)) void read.deny(() => dropLostSpace(spaceId));
+    else read.finish();
+    throw error;
+  }
+  if (!read.finishRooms() || switchingSpace() || generation !== navigationGeneration || !stillHere() || !list.some(r => r.id === roomId)) return false;
   navigationGeneration++;
   lastRoomBySpace.set(spaceId, roomId);
   batch(() => {
     clearTransient();
-    roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+    read.publishRooms(list);
     activeSpaceId.set(spaceId);
     activeRoomId.set(roomId);
     view.set("room");
@@ -595,11 +659,9 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
   if (!c) return;
   const navigation = ++navigationGeneration;
   roomEntryNavigation = navigation;
-  pendingRoomEntries.set(spaceId, navigation);
   const currentSession = guard();
   const ok = guard(spaceId);
-  const listedSpace = () => spaces().find(s => s.id === spaceId);
-  const membership = listedSpace();
+  const read = !roomsBySpace()[spaceId] ? beginSpaceRead(spaceId) : undefined;
   batch(() => {
     clearTransient();
     view.set("room");
@@ -612,62 +674,56 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
     switchingSpace.set(true);
   });
   try {
-    if (!roomsBySpace()[spaceId]) {
+    if (read) {
       const list = await c.listRooms(spaceId);
+      const publish = read.finishRooms();
       if (!ok() || navigation !== navigationGeneration) return;
-      // A room list from another verified read may already have landed.
-      const fresh = roomsBySpace()[spaceId];
       batch(() => {
-        if (!fresh) roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
-        if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, fresh ?? list));
+        if (publish) read.publishRooms(list);
+        if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, roomsBySpace()[spaceId] ?? EMPTY_ROOMS));
       });
     }
     if (activeSpaceId() === spaceId) rememberSpace(spaceId);
   } catch (error) {
-    if (!ok() || isAborted(error)) return;
+    if (!ok() || isAborted(error)) { read?.finish(); return; }
     if (error instanceof ApiError && error.kind === "auth") {
+      read?.finish();
       disconnect(error.message);
       return;
     }
-    if (pendingRoomEntries.get(spaceId) !== navigation) return;
-    const denied = error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found");
-    const verifiedRooms = roomsBySpace()[spaceId];
-    // Only this Space's evidence can supersede its refusal: a newer entry,
-    // a committed room read (including []), or a refreshed membership.
-    const sameEvidence = !verifiedRooms && membership !== undefined && listedSpace() === membership;
-    if (navigation !== navigationGeneration) {
-      if (denied && sameEvidence) {
-        batch(() => {
-          purgeSpace(spaceId, true);
-          if (activeSpaceId() === spaceId) {
-            activeSpaceId.set(null);
-            activeRoomId.set(null);
-          }
-        });
+    const failed = (unlist: boolean) => {
+      if (navigation !== navigationGeneration) {
+        if (unlist) dropLostSpace(spaceId);
+        return;
       }
-      return;
+      const name = spaces().find(s => s.id === spaceId)?.name ?? spaceId;
+      const back = previous.spaceId && previous.spaceId !== spaceId &&
+        spaces().some(s => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
+      batch(() => {
+        if (unlist) purgeSpace(spaceId, true);
+        activeSpaceId.set(back);
+        activeRoomId.set(back ? pickRoom(back, roomsBySpace()[back] ?? EMPTY_ROOMS) : null);
+        basePlace.set(back && previous.place === "space" ? "space" : "chat");
+        actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
+      });
+    };
+    if (read && isSpaceDenial(error)) {
+      if (await read.deny(() => failed(true))) return;
+    } else {
+      read?.finish();
     }
+    if (!ok() || navigation !== navigationGeneration) return;
+    const verifiedRooms = roomsBySpace()[spaceId];
     if (verifiedRooms) {
       activeRoomId.set(pickRoom(spaceId, verifiedRooms));
       rememberSpace(spaceId);
       return;
     }
-    const name = listedSpace()?.name ?? spaceId;
-    if (sameEvidence) purgeSpace(spaceId, denied);
-    const back = previous.spaceId && spaces().some((s) => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
-    batch(() => {
-      activeSpaceId.set(back);
-      activeRoomId.set(back ? pickRoom(back, roomsBySpace()[back] ?? EMPTY_ROOMS) : null);
-      basePlace.set(back && previous.place === "space" ? "space" : "chat");
-      actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
-    });
+    failed(false);
   } finally {
-    if (currentSession()) {
-      if (pendingRoomEntries.get(spaceId) === navigation) pendingRoomEntries.delete(spaceId);
-      if (roomEntryNavigation === navigation) {
-        roomEntryNavigation = undefined;
-        switchingSpace.set(false);
-      }
+    if (currentSession() && roomEntryNavigation === navigation) {
+      roomEntryNavigation = undefined;
+      switchingSpace.set(false);
     }
   }
 }
@@ -678,11 +734,20 @@ async function ensureRooms(spaceId: string): Promise<readonly Room[]> {
   if (cached) return cached;
   const c = client;
   if (!c) return EMPTY_ROOMS;
-  const ok = guard(spaceId);
-  const list = await c.listRooms(spaceId);
-  if (!ok()) return EMPTY_ROOMS;
-  roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
-  return list;
+  const read = beginSpaceRead(spaceId);
+  try {
+    const list = await c.listRooms(spaceId);
+    if (read.finishRooms()) read.publishRooms(list);
+    return read.valid() ? roomsBySpace()[spaceId] ?? EMPTY_ROOMS : EMPTY_ROOMS;
+  } catch (error) {
+    if (read.valid() && isSpaceDenial(error)) {
+      const dropped = await read.deny(() => dropLostSpace(spaceId));
+      if (!dropped && read.valid() && roomsBySpace()[spaceId]) return roomsBySpace()[spaceId]!;
+    } else {
+      read.finish();
+    }
+    throw error;
+  }
 }
 
 function pickRoom(spaceId: string, list: readonly Room[]): string | null {
@@ -699,6 +764,9 @@ function pickRoom(spaceId: string, list: readonly Room[]): string | null {
 /** Forgets everything cached for a Space; `unlist` also removes it from the list. */
 function purgeSpace(spaceId: string, unlist: boolean) {
   spaceEpoch.set(spaceId, epochOf(spaceId) + 1);
+  pendingSpaceReads.delete(spaceId);
+  spaceDenials.delete(spaceId);
+  roomListRequests.delete(spaceId);
   const prefix = scopeKey(spaceId, "");
   for (const key of [...cursors.keys()]) if (key.startsWith(prefix)) cursors.delete(key);
   for (const key of [...inflight.keys()]) if (key.startsWith(prefix)) inflight.delete(key);
@@ -721,6 +789,23 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     const { [spaceId]: _members, ...restMembers } = membersBySpace();
     membersBySpace.set(restMembers);
     if (activeSpaceId() === spaceId) clearTransient();
+  });
+}
+
+/** Remove only the scope of a verified refusal, not the user's newer destination. */
+function dropLostSpace(spaceId: string, show = true) {
+  const name = spaces().find(s => s.id === spaceId)?.name;
+  batch(() => {
+    purgeSpace(spaceId, true);
+    if (activeSpaceId() !== spaceId) return;
+    activeSpaceId.set(null);
+    activeRoomId.set(null);
+    if (basePlace() === "space") {
+      view.set("room");
+      notice.set(show && name ? `You no longer have access to ${name}.` : null);
+      basePlace.set("chat");
+      if (!ticking) kick();
+    }
   });
 }
 
@@ -1358,7 +1443,11 @@ function endSession() {
   lastRoomBySpace.clear();
   spaceEpoch.clear();
   roomEntryNavigation = undefined;
-  pendingRoomEntries.clear();
+  pendingSpaceReads.clear();
+  spaceDenials.clear();
+  roomListRequests.clear();
+  verifiedAccess.clear();
+  lastMembershipRequest = 0;
   batch(() => {
     status.set({ phase: "signedOut" });
     connectedTo.set(null);
@@ -1522,38 +1611,62 @@ async function refreshLists(force = false) {
   if (!c) return;
   if (!force && Date.now() - lastListsRefresh < LISTS_REFRESH_MS) return;
   const ok = guard();
-  const list = await c.listSpaces();
-  if (!ok()) return;
-  lastListsRefresh = Date.now();
-  const known = new Set(list.map((s) => s.id));
-  const lost = spaces().filter((s) => !known.has(s.id));
-  for (const space of lost) purgeSpace(space.id, true);
-  spaces.set(list);
-  const active = activeSpaceId();
-  if (active && !known.has(active)) {
-    const lostSpace = lost.find((s) => s.id === active);
-    const wasHere = basePlace() === "space";
-    batch(() => {
-      activeSpaceId.set(null);
-      activeRoomId.set(null);
-      view.set("room");
-      if (lostSpace) notice.set(`You no longer have access to ${lostSpace.name}.`);
-    });
-    // Never fall back to another Space silently: go to the Chat, which says what happened.
-    if (wasHere) basePlace.set("chat");
+  const request = nextAccessRequest();
+  const reads = new Map(spaces().map(s => [s.id, beginSpaceRead(s.id, request)]));
+  let list: Space[];
+  try {
+    list = await c.listSpaces();
+  } catch (error) {
+    for (const read of reads.values()) read.finish();
+    throw error;
+  }
+  if (!ok()) {
+    for (const read of reads.values()) read.finish();
     return;
   }
+  lastListsRefresh = Date.now();
+  const listed = new Set(list.map(s => s.id));
+  batch(() => {
+    const accepted = list.filter(s => {
+      const read = reads.get(s.id);
+      const key = scopeKey(s.id, "");
+      const current = read?.valid() ?? (request > lastMembershipRequest);
+      read?.finish(true);
+      if (!current || newerAccess(key, request) || (spaceDenials.get(s.id) ?? 0) > request) return false;
+      verifyAccess(key, request);
+      return true;
+    });
+    lastMembershipRequest = Math.max(lastMembershipRequest, request);
+    for (const [sid, read] of reads) {
+      // Don't wait in the list loop for a different scope's newer read.
+      if (!listed.has(sid)) void read.deny(() => dropLostSpace(sid));
+    }
+    const updated = new Set(accepted.map(s => s.id));
+    spaces.set([...accepted, ...spaces().filter(s => !updated.has(s.id))]);
+  });
+  const active = basePlace() === "space" && !switchingSpace() ? activeSpaceId() : null;
   if (active) {
-    const okSpace = guard(active);
-    const rooms = await c.listRooms(active);
-    if (!okSpace()) return;
+    const read = beginSpaceRead(active);
+    let rooms: Room[];
+    try {
+      rooms = await c.listRooms(active);
+    } catch (error) {
+      if (isSpaceDenial(error)) {
+        void read.deny(() => dropLostSpace(active));
+        return;
+      }
+      read.finish();
+      if (!read.valid()) return;
+      throw error;
+    }
+    if (!read.finishRooms()) return;
     const previous = roomsBySpace()[active] ?? EMPTY_ROOMS;
     const current = activeRoomId();
     batch(() => {
       // Keep a room we just created even if the list is a moment behind; the
       // events poll will say 404 if it really is gone.
       const local = current ? previous.find((r) => r.id === current && !rooms.some((x) => x.id === r.id)) : undefined;
-      roomsBySpace.set({ ...roomsBySpace(), [active]: local ? [...rooms, local] : rooms });
+      read.publishRooms(local ? [...rooms, local] : rooms);
       if (activeSpaceId() === active && (!current || !roomsBySpace()[active].some((r) => r.id === current))) {
         activeRoomId.set(pickRoom(active, roomsBySpace()[active]));
       }
