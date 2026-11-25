@@ -124,7 +124,8 @@ function Computer(props: { model: WebSearchSettingsModel; state: LocalWebSearch 
         <SettingRow label="Enable web search on this computer"
           description="Lets permitted agents use this computer. This does not turn on web search in personal Chat.">
           <Toggle testID="websearch-master" label="Enable web search on this computer"
-            checked={s().enabled} disabled={blocked() || (s().serverUnsupported && !s().enabled)}
+            checked={s().enabled} disabled={m.busy() || !!s().settingsError ||
+              (!s().enabled && (s().endpointsError || s().serverUnsupported))}
             onChange={(enabled) => { dismiss(); void m.update({ enabled }, `Web search is ${enabled ? "on" : "off"} on this computer.`); }} />
         </SettingRow>
         <If when={!s().noticeAcknowledged}>
@@ -145,7 +146,7 @@ function Computer(props: { model: WebSearchSettingsModel; state: LocalWebSearch 
           <ProblemNote text="Your saved web search settings can't be read. Web search is off. Resetting restores the default provider order while leaving web search off."
             testID="websearch-settings-error"
             action={<Action label="Turn off and reset settings" testID="websearch-reset-settings"
-              disabled={m.busy() || s().endpointsError} onPress={() => { dismiss(); void m.update({ enabled: false }, "Settings reset. Web search is off on this computer."); }} />} />
+              disabled={m.busy()} onPress={() => { dismiss(); void m.update({ enabled: false }, "Settings reset. Web search is off on this computer."); }} />} />
         </If>
         <If when={s().settingsError === "pauses"}>
           <ProblemNote text="Saved provider pauses can't be read, so web search is paused. Turn it off without repairing them, or choose “Try again now” on any provider to reset them."

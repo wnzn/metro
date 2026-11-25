@@ -217,6 +217,7 @@ pub enum GateStop {
     ProviderOff,
     CredentialChanged,
     KeysUnreadable,
+    BindingEnded,
 }
 
 /// A provider failure (with an optional cooldown hint in seconds), or a
@@ -712,6 +713,7 @@ pub const TURNED_OFF: &str = "web search is turned off on this computer";
 pub const SETTINGS_UNREADABLE: &str = "the web search settings on this computer can't be read";
 pub const KEYS_UNREADABLE: &str =
     "the saved web search keys on this computer can't be read; reset them in Settings → Web Search";
+pub(crate) const BINDING_ENDED: &str = "the web search session ended";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Consent {
@@ -759,6 +761,21 @@ pub struct Engine {
     /// Serializes read-modify-write of the settings file.
     write: tokio::sync::Mutex<()>,
     clock: Clock,
+}
+
+/// A provider test's outcome, not yet saved. The desktop must authorize
+/// publication again under its binding lock after the network phase ends.
+pub(crate) struct ProviderTest {
+    outcome: Outcome,
+    updates: settings::Updates,
+}
+
+impl ProviderTest {
+    pub(crate) fn record(self, dir: &Path) -> Outcome {
+        // `settings::apply` holds the profile's interprocess file lock.
+        let _ = settings::apply(dir, &self.updates);
+        self.outcome
+    }
 }
 
 impl Engine {
@@ -920,25 +937,32 @@ impl Engine {
                         Mode::Keyless
                     };
                     let now = self.now();
-                    let mut push = |outcome: Outcome, until: Option<u64>| {
+                    let mut push = |outcome: Outcome,
+                                    until: Option<u64>,
+                                    contacted: Option<bool>| {
                         let mut a = json!({"provider": p.as_str(), "mode": mode.as_str(), "outcome": outcome.as_str()});
                         if let Some(u) = until {
                             a["until"] = json!(rfc3339(u));
                         }
+                        if let Some(contacted) = contacted {
+                            a["contacted"] = json!(contacted);
+                        }
                         attempts.push(a);
                     };
                     if key.is_none() && !p.keyless() {
-                        push(Outcome::SkippedNoKey, None);
+                        push(Outcome::SkippedNoKey, None, None);
                         break;
                     }
                     if let Some(k) = &key
                         && snapshot.key_rejected(p, &keys::fingerprint(k))
                     {
-                        push(Outcome::KeyRejected, None);
+                        // Keep the v1 outcome for older servers. The optional
+                        // flag tells newer clients no request used this key.
+                        push(Outcome::KeyRejected, None, Some(false));
                         break;
                     }
                     if let Some(until) = snapshot.cooldown_until(p, mode, now) {
-                        push(Outcome::SkippedCooldown, Some(until));
+                        push(Outcome::SkippedCooldown, Some(until), None);
                         break;
                     }
                     let left = deadline.saturating_duration_since(Instant::now());
@@ -979,7 +1003,7 @@ impl Engine {
                     });
                     match result {
                         Ok(a) => {
-                            push(Outcome::Ok, None);
+                            push(Outcome::Ok, None, None);
                             updates.last.push((p, Outcome::Ok, now));
                             log(job_id, op, Some(p), Some(mode), "ok");
                             answer = Some((p, mode, a));
@@ -994,13 +1018,16 @@ impl Engine {
                             log(job_id, op, None, None, "saved keys unreadable; stopped");
                             break 'rotation Err(KEYS_UNREADABLE);
                         }
+                        Err(Failure::Stopped(GateStop::BindingEnded)) => {
+                            break 'rotation Err(BINDING_ENDED);
+                        }
                         Err(Failure::Stopped(GateStop::CredentialChanged)) => {
                             // The mode belongs to the interrupted attempt, not
                             // its replacement. If the gate blocked its first
                             // request, no credential mode was used.
                             if started.load(Ordering::Relaxed) {
                                 let outcome = Outcome::CredentialChanged;
-                                push(outcome, None);
+                                push(outcome, None, None);
                                 log(job_id, op, Some(p), Some(mode), outcome.as_str());
                             }
                             if restarts == 0 {
@@ -1016,7 +1043,11 @@ impl Engine {
                                 if let Some(k) = &key {
                                     updates.rejected.push((p, keys::fingerprint(k)));
                                 }
-                                push(Outcome::KeyRejected, None);
+                                push(
+                                    Outcome::KeyRejected,
+                                    None,
+                                    started.load(Ordering::Relaxed).then_some(true),
+                                );
                                 break;
                             }
                             let secs = cooldown
@@ -1026,7 +1057,7 @@ impl Engine {
                             if let Some(u) = until {
                                 updates.cooldowns.push((p, mode, u, outcome));
                             }
-                            push(outcome, until);
+                            push(outcome, until, None);
                             break;
                         }
                     }
@@ -1110,10 +1141,15 @@ impl Engine {
         }
     }
 
-    /// One user-initiated test of `p` with a fixed query, ignoring (and not
-    /// setting) cooldowns. Returns the outcome word, or the fixed reason
-    /// nothing was sent (web search off, unreadable settings or keys).
-    pub async fn test_provider(&self, p: ProviderId) -> Result<Outcome, &'static str> {
+    /// Run one explicit test without publishing any resulting state.
+    pub(crate) async fn probe_provider(
+        &self,
+        p: ProviderId,
+        binding_live: &(dyn Fn() -> bool + Sync),
+    ) -> Result<ProviderTest, &'static str> {
+        if !binding_live() {
+            return Err(BINDING_ENDED);
+        }
         match settings::load(&self.dir) {
             Ok(s) if s.enabled => {}
             Ok(_) => return Err(TURNED_OFF),
@@ -1122,17 +1158,24 @@ impl Engine {
         let key = self.current_key(p)?;
         let key = key.as_ref();
         if key.is_none() && !p.keyless() {
-            return Ok(Outcome::SkippedNoKey);
+            return Ok(ProviderTest {
+                outcome: Outcome::SkippedNoKey,
+                updates: settings::Updates::default(),
+            });
         }
         let mode = if key.is_some() {
             Mode::Key
         } else {
             Mode::Keyless
         };
-        // An explicit test of one provider: the master switch, and the same
-        // credential as when the test began.
+        // Every outbound send checks the master switch and the exact
+        // credential, then checks the captured binding as close to send as
+        // possible. In particular, MCP may send several messages in one poll.
         let used = key.map(keys::fingerprint);
-        let gate = || self.check_outbound(p, None, used.as_deref());
+        let gate = || {
+            self.check_outbound(p, None, used.as_deref())?;
+            binding_live().then_some(()).ok_or(GateStop::BindingEnded)
+        };
         let op = Op::Search(SearchReq {
             query: "Metro web search test".into(),
             keywords: Vec::new(),
@@ -1155,6 +1198,7 @@ impl Engine {
                 GateStop::KeysUnreadable => return Err(KEYS_UNREADABLE),
                 GateStop::CredentialChanged => Outcome::CredentialChanged,
                 GateStop::ProviderOff => Outcome::SkippedDisabled,
+                GateStop::BindingEnded => return Err(BINDING_ENDED),
             },
             Err(_) => Outcome::Timeout,
         };
@@ -1168,9 +1212,13 @@ impl Engine {
         if outcome == Outcome::Ok {
             updates.cleared.push(p);
         }
-        let _g = self.write.lock().await;
-        let _ = settings::apply(&self.dir, &updates);
-        Ok(outcome)
+        Ok(ProviderTest { outcome, updates })
+    }
+
+    #[cfg(test)]
+    async fn test_provider(&self, p: ProviderId) -> Result<Outcome, &'static str> {
+        let result = self.probe_provider(p, &|| true).await?;
+        Ok(result.record(&self.dir))
     }
 
     /// Serialize a settings change made elsewhere (the bridge) with jobs.

@@ -20,7 +20,7 @@ function device() {
   return {
     enabled: true, notice_acknowledged: false, providers: rows(),
     device: { paired: true, worker: "online", detail: null as string | null },
-    keys_error: null as string | null, settings_error: null as string | null, endpoints_error: null,
+    keys_error: null as string | null, settings_error: null as string | null, endpoints_error: null as string | null,
   };
 }
 
@@ -305,6 +305,7 @@ test("unreadable preferences, pauses and keys have different explicit recovery a
   await app.press("id:websearch-reset-keys:confirm");
   await app.waitFor("id:websearch-keys-error", { state: "gone" });
   w.alice.settings_error = "Saved provider pauses on this computer can't be read, so web search is paused.";
+  w.alice.endpoints_error = REFLECTED;
   w.alice.enabled = true;
   await app.press("id:websearch-refresh");
   await app.waitFor("id:websearch-pauses-error");
@@ -316,6 +317,8 @@ test("unreadable preferences, pauses and keys have different explicit recovery a
   expect(w.alice.settings_error).not.toBe(null);
   expect(w.calls.filter((r) => r.method === "PUT").at(-1)?.prefsBody).toEqual({ enabled: false });
   expect(w.calls.some((r) => r.path.endsWith("/clear-cooldown"))).toBe(false);
+  w.alice.endpoints_error = null;
+  await app.press("id:websearch-refresh");
   await item(app, "clear");
   await app.waitFor("id:websearch-pauses-error", { state: "gone" });
   expect(w.alice.enabled).toBe(false);

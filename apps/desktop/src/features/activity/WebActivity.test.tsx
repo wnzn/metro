@@ -120,3 +120,37 @@ test("web attempt presentation distinguishes provider failures, skips and repeat
   expect(bad.failure).toBe("failed");
   expect(bad.attempts).toEqual([]);
 });
+
+test("activity shows cached key rejection as a skip and points rotation at the next known contact", async () => {
+  const f = world();
+  event(f, "run_cached", "tool_call", 'web_search "weather"', { name: "web_search" });
+  event(f, "run_cached", "tool_result", "web_search via Tavily (free): 1 result", {
+    name: "web_search", provider: "tavily", mode: "keyless", attempts: [
+      attempt("firecrawl", "key", "credential_changed"),
+      attempt("firecrawl", "keyless", "credential_changed"),
+      attempt("exa", "keyless", "limited"),
+      { ...attempt("parallel", "key", "key_rejected"), contacted: false },
+      attempt("tavily", "keyless", "ok"),
+    ],
+  });
+  const app = await room(f, "bob");
+  await app.press("id:activity-toggle:agent:run_cached");
+  await app.waitFor("id:activity-websearch-rotated");
+  expect(app.texts().filter((s) => s.includes("credential changed"))).toEqual([
+    "Firecrawl (your key): credential changed.", "Firecrawl (free): credential changed.",
+  ]);
+  expect(app.shows("text:Exa (free) reached its rate limit. Switched to Tavily.")).toBe(true);
+  expect(app.shows("text:Parallel (your key): skipped (saved key was already rejected).")).toBe(true);
+});
+
+test("legacy key rejections don't assert an immediate switch or known provider contact", () => {
+  const rejection = attempt("parallel", "key", "key_rejected");
+  const rows = (contacted?: boolean) => webAttemptRows(parseWebTool({ name: "web_search", attempts: [
+    attempt("exa", "keyless", "limited"), { ...rejection, contacted }, attempt("tavily", "keyless", "ok"),
+  ] })!);
+  expect(rows()[0]!.switched).toBe(false);
+  expect(rows()[1]!.text).toBe("Parallel (your key): key rejected (contact not recorded).");
+  expect(rows(true)[0]!.text).toContain("Switched to Parallel.");
+  expect(rows(true)[1]!.text).toBe("Parallel (your key): rejected the key.");
+  expect(rows(false)[0]!.text).toContain("Switched to Tavily.");
+});

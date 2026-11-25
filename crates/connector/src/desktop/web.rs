@@ -523,35 +523,38 @@ impl WebSearch {
             ),
             None => None,
         };
-        let was_on = settings::load(&p.dir).is_ok_and(|s| s.enabled);
-        let engine = self.engine(&p)?;
-        let changed = engine
-            .edit(|dir| {
-                // Only turning web search off may start over from an
-                // unreadable file.
-                settings::update_prefs(dir, enabled == Some(false), |s| {
-                    if let Some(list) = &list {
-                        s.set_providers(list)
-                            .map_err(|m| anyhow::anyhow!(SafeError::new(m)))?;
-                    }
-                    if let Some(a) = notice_acknowledged {
-                        s.notice_acknowledged = a;
-                    }
-                    if let Some(e) = enabled {
-                        s.enabled = e;
-                    }
-                    Ok(s.enabled != was_on)
-                })
+        let turn_off = enabled == Some(false);
+        let was_on = !turn_off && settings::load(&p.dir).is_ok_and(|s| s.enabled);
+        let save = |dir: &Path| {
+            settings::update_prefs(dir, turn_off, |s| {
+                if let Some(list) = &list {
+                    s.set_providers(list)
+                        .map_err(|m| anyhow::anyhow!(SafeError::new(m)))?;
+                }
+                if let Some(a) = notice_acknowledged {
+                    s.notice_acknowledged = a;
+                }
+                if let Some(e) = enabled {
+                    s.enabled = e;
+                }
+                Ok(s.enabled != was_on)
             })
-            .await
-            .map_err(|e| {
-                let b = local(e, "The settings can't be saved");
-                err(422, "invalid", b.message)
-            });
+        };
+        let changed = if turn_off {
+            // Disabling must never need an engine, working endpoints, or a
+            // readable pauses file. The preferences transaction locks on disk.
+            save(&p.dir)
+        } else {
+            self.engine(&p)?.edit(save).await
+        }
+        .map_err(|e| {
+            let b = local(e, "The settings can't be saved");
+            err(422, "invalid", b.message)
+        });
         // An explicit "off" always stops this computer and removes it from
         // Metro, whatever the file said before and even if saving failed;
         // both steps are idempotent.
-        if enabled == Some(false) {
+        if turn_off {
             self.stop().await;
             if let Some(problem) = self.unpair(&p, server, account, session).await {
                 let mut l = lock(&self.live);
@@ -618,24 +621,46 @@ impl WebSearch {
         // Capture cancellation under the lifecycle lock, but don't hold it
         // across the vendor call. A replacement binding drops this sender,
         // including sign-out followed by sign-in to the very same account.
-        let mut ended = {
-            let g = self.bound_ops(server, account, epoch).await?;
-            g.as_ref()
-                .expect("bound_ops checked the session")
-                .ended
-                .subscribe()
-        };
+        let mut ended = self.test_lease(server, account, epoch).await?;
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
-        let outcome = tokio::select! {
+        let lease = ended.clone();
+        let bound = || lease.has_changed().is_ok();
+        let result = tokio::select! {
             biased;
-            _ = ended.changed() => return Err(err(409, "no_session", "The web search session ended")),
-            outcome = engine.test_provider(pid) => outcome,
+            _ = ended.changed() => return Err(err(409, "no_session", web::BINDING_ENDED)),
+            result = engine.probe_provider(pid, &bound) => result,
         };
+        self.commit_test(server, account, epoch, &p, pid, result)
+            .await
+    }
+
+    async fn test_lease(&self, server: &str, account: &str, epoch: u64) -> R<watch::Receiver<()>> {
+        let g = self.bound_ops(server, account, epoch).await?;
+        Ok(g.as_ref()
+            .expect("bound_ops checked the session")
+            .ended
+            .subscribe())
+    }
+
+    async fn commit_test(
+        &self,
+        server: &str,
+        account: &str,
+        epoch: u64,
+        p: &Profile,
+        pid: ProviderId,
+        result: Result<web::ProviderTest, &'static str>,
+    ) -> R<Value> {
+        // No vendor I/O under this lock. Hold it over the result's file
+        // transaction as well as the response so a stale test cannot save
+        // status or clear cooldowns in a replacement binding.
         let _g = self.bound_ops(server, account, epoch).await?;
-        let outcome = outcome.map_err(|why| err(409, "not_sent", why))?;
-        let mut row = self.row(&p, pid)?;
+        let outcome = result
+            .map_err(|why| err(409, "not_sent", why))?
+            .record(&p.dir);
+        let mut row = self.row(p, pid)?;
         row["test"] = json!({"outcome": outcome.as_str()});
         Ok(row)
     }
@@ -685,3 +710,7 @@ impl WebSearch {
         Ok(self.provider_row(&s, &k, pid, web::time_now()))
     }
 }
+
+#[cfg(test)]
+#[path = "web_tests.rs"]
+mod tests;

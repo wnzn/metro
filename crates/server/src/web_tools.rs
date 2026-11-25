@@ -397,6 +397,10 @@ pub struct Attempt {
     pub mode: String,
     /// One of [`OUTCOMES`].
     pub outcome: String,
+    /// Optional for `key_rejected`: false for a cached skip, true for a
+    /// provider response. Older connectors and history don't say which.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contacted: Option<bool>,
     /// RFC 3339 UTC, for a cooldown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub until: Option<String>,
@@ -585,6 +589,10 @@ pub fn normalize(operation: Operation, response: &Value) -> Result<WebAnswer, St
             provider: provider.to_owned(),
             mode,
             outcome: outcome.to_owned(),
+            contacted: a
+                .get("contacted")
+                .and_then(Value::as_bool)
+                .filter(|_| outcome == "key_rejected"),
             until: check_until(a.get("until"))?,
         });
     }
@@ -740,7 +748,11 @@ fn outcome_label(a: &Attempt) -> String {
         "ok" => "ok",
         "limited" => "rate-limited",
         "out_of_credits" => "out of credits or over its plan limit",
-        "key_rejected" => "key rejected",
+        "key_rejected" => match a.contacted {
+            Some(false) => "skipped (saved key was already rejected)",
+            Some(true) => "provider rejected the key",
+            None => "key rejected (contact not recorded)",
+        },
         "blocked" => "blocked from this network",
         "unavailable" => "unavailable",
         "timeout" => "timed out",

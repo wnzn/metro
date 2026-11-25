@@ -15,9 +15,14 @@ export function webAttemptRows(note: WebToolNote) {
     const until = a.until && (limit || a.outcome === "blocked" || a.outcome === "skipped_cooldown")
       ? ` · retry after ${a.until.slice(0, 10)} ${a.until.slice(11, 16)} UTC` : "";
     // A skipped candidate is still a row, but no request went to it.
-    const next = visible.slice(i + 1).find(({ attempt }) => !attempt.outcome.startsWith("skipped_"))?.attempt;
-    const switched = limit && !!next && next.provider !== a.provider;
-    const text = limit ? `${name} ${WEB_OUTCOMES[a.outcome]}` : `${name}: ${WEB_OUTCOMES[a.outcome]}`;
+    const next = visible.slice(i + 1).find(({ attempt }) => !attempt.outcome.startsWith("skipped_") && attempt.contacted !== false)?.attempt;
+    // Old key_rejected rows cannot tell us whether this candidate was tried.
+    // Don't claim the immediate destination past that ambiguity, either.
+    const switched = limit && !!next && next.provider !== a.provider &&
+      (next.outcome !== "key_rejected" || next.contacted === true);
+    const outcome = a.outcome !== "key_rejected" || a.contacted === true ? WEB_OUTCOMES[a.outcome] :
+      a.contacted === false ? "skipped (saved key was already rejected)" : "key rejected (contact not recorded)";
+    const text = limit ? `${name} ${outcome}` : `${name}: ${outcome}`;
     return { index, switched, text: `${text}${until}.${switched ? ` Switched to ${WEB_PROVIDERS[next.provider]}.` : ""}` };
   });
 }

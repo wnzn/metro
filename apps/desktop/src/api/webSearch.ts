@@ -37,7 +37,7 @@ export function webTime(v: unknown): string | null {
 const failures = ["no_device", "offline", "exhausted", "busy", "timed_out", "revoked", "refused", "bad_response", "not_allowed", "invalid", "failed"] as const;
 type Failure = typeof failures[number];
 export type WebTool = "web_search" | "web_fetch";
-type Attempt = { provider: WebProvider; mode: WebMode; outcome: WebOutcome; until: string | null };
+type Attempt = { provider: WebProvider; mode: WebMode; outcome: WebOutcome; until: string | null; contacted: boolean | null };
 export type WebToolNote = {
   name: WebTool;
   provider: WebProvider | null;
@@ -51,7 +51,8 @@ export function parseWebTool(v: unknown): WebToolNote | undefined {
   if (!isWebRecord(v) || (v.name !== "web_search" && v.name !== "web_fetch")) return undefined;
   const attempts = (Array.isArray(v.attempts) ? v.attempts.slice(0, 10) : []).flatMap((a): Attempt[] =>
     isWebRecord(a) && isWebProvider(a.provider) && isWebMode(a.mode) && isWebOutcome(a.outcome)
-      ? [{ provider: a.provider, mode: a.mode, outcome: a.outcome, until: webTime(a.until) }]
+      ? [{ provider: a.provider, mode: a.mode, outcome: a.outcome, until: webTime(a.until),
+          contacted: a.outcome === "key_rejected" && typeof a.contacted === "boolean" ? a.contacted : null }]
       : [],
   );
   return {
