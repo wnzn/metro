@@ -3,14 +3,115 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Published: Metro 0.4.0 (2026-11-25, GitHub release v0.4.0)
+
+**What was published.** The GitHub release
+[Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0), tag
+`v0.4.0`, public (not a draft, not a prerelease, marked latest), published
+2026-11-25T06:58:45Z by `github-actions[bot]`. The tag points at commit
+`1a743e59d4ec6c1da85d09d92c99457561f64e55` (the merge of pull request #15,
+the 0.4.0 bump on `main`). It was made by the push-to-`main` CI run
+[45560122825](https://github.com/wnzn/metro/actions/runs/45560122825)
+(conclusion `success`). `release-policy` decided `release=true`,
+`state=new`, `version=0.4.0`, `prerelease=false`,
+`windows_signing=unsigned`. The jobs `release / *`,
+`release / windows-distribution / seed` and `/ preview`,
+`publish / authorize`, `/ tag`, `/ assets`, `/ images / guard`,
+`/ images / build` (amd64, arm64), `/ images / media`,
+`/ images / publish`, `/ images / sign`, `/ sign / authorize`, `/ sign / sign`
+and `/ publish` all passed; `publish / windows-sign` was skipped (Windows
+unsigned). The pull request's own CI (run 45558661121) passed before the
+merge.
+
+It contains everything on `main` up to `1a743e5`, including the source of
+the [staged gate at 4175475](#staged-spaces-with-several-agents-per-connection-model-lists-and-the-desktop-redesign-at-4175475-2026-11-25-project-manager-local)
+(several agents per Space, per-connection model lists, the desktop
+redesign) and the providers settings redesign (pull request #13). That
+gate ran on local builds, not on these release files.
+
+**Assets** (18):
+
+| File | Signature |
+| --- | --- |
+| `Metro-0.4.0-linux-x64.tar.gz` + `.sha256` | `Metro-0.4.0-linux-x64.tar.gz.sigstore.json` |
+| `Metro-0.4.0-windows-x64.zip` + `.sha256` | none (no Authenticode) |
+| `Metro-0.4.0-windows-x64.unsigned-preview.msi` + `.sha256` | none (no Authenticode) |
+| `Metro-runner-0.4.0-linux-x64.tar.gz` + `.sha256` | `Metro-runner-0.4.0-linux-x64.tar.gz.sigstore.json` |
+| `install-metro-linux.sh`, `install-metro-runner-linux.sh`, `install-metro-windows.ps1`, `metro-runner-container.sh`, `metro-runner-container.ps1` | none of their own; listed in `SHA256SUMS` |
+| `IMAGES.txt` | listed in `SHA256SUMS` |
+| `SHA256SUMS` | `SHA256SUMS.sigstore.json` |
+
+**Images** (public on GHCR, from `IMAGES.txt`; no `latest` tag):
+
+| Reference | Index digest | Platforms |
+| --- | --- | --- |
+| `ghcr.io/wnzn/metro-server:v0.4.0` | `sha256:2bc9dd1b1ed45a91235299793200ceb517b0e927e920e8963fa303611ec0802c` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-runner:v0.4.0` | `sha256:a3f12f00eea1bea5061eaa370da49108b756465f88fe9eea0f50c6681772d0b6` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/wnzn/metro-embeddinggemma2:v0.4.0` | `sha256:a0c322d7135c08442b09065b28b4efb82b1959999b6f7f7c61592113a1494853` | `linux/amd64` (no weights) |
+
+**How it was checked** (2026-11-25, release lane, from a Debian 13 host; no
+downloaded file was executed):
+
+```sh
+gh release view v0.4.0 --repo wnzn/metro \
+  --json tagName,publishedAt,assets,targetCommitish,isDraft,isPrerelease   # 18 assets, isDraft false, isPrerelease false
+gh release list --repo wnzn/metro                                          # "Metro 0.4.0  Latest  v0.4.0", then "Metro 0.3.2  v0.3.2"
+gh api repos/wnzn/metro/git/ref/tags/v0.4.0                                # commit 1a743e59…
+git ls-remote --tags origin                                                # v0.3.1 a033e85, v0.3.2 d943797, v0.4.0 1a743e5
+gh run view 45560122825 --repo wnzn/metro --json jobs                      # the jobs above, all success
+# Anonymous GHCR pull token, then HEAD on /v2/wnzn/<image>/manifests/v0.4.0:
+#   HTTP 200 for all three images; docker-content-digest equals IMAGES.txt;
+#   the index lists the platforms above
+gh release download v0.4.0 --repo wnzn/metro …   # all 18 assets into a fresh, empty ~/.cache dir
+sha256sum -c SHA256SUMS                                                    # all 14 entries OK
+sha256sum -c <each>.sha256                                                 # the 4 archives (with the MSI): OK
+```
+
+- The `SHA256SUMS.sigstore.json` bundle (Sigstore bundle v0.3, one Rekor
+  entry, log index 4095390086) signs a SHA-256 digest equal to
+  `SHA256SUMS`'s (`51deb6a7…b5da`). Its Fulcio certificate names
+  `https://github.com/wnzn/metro/.github/workflows/sign-release-assets.yml@refs/heads/main`,
+  issuer `https://token.actions.githubusercontent.com`, ref
+  `refs/heads/main`, commit `1a743e59…`, the calling workflow
+  `ci.yml@refs/heads/main` and run 45560122825 attempt 1. That was read
+  from the certificate with `openssl x509`; **`cosign verify-blob` wasn't
+  run** here (cosign isn't installed), so the signature itself and the
+  Rekor inclusion weren't checked by this run.
+- The image signatures weren't checked with `cosign verify` here either.
+  `IMAGES.txt` states the release workflow verified them against
+  `release-images.yml@refs/heads/main` and commit `1a743e59…`, and the
+  run's `publish / images / sign` job passed.
+- Listing the archives (no extraction run): the Linux archive holds
+  `Metro`, `metro-server`, `metro-tui`, `ui/Metro`, `install-desktop`,
+  `START.txt` and `RELEASE.json`; the Windows ZIP holds `Metro.exe`,
+  `metro-server.exe`, `metro-tui.exe`, `ui/Metro.exe`, `START.txt` and
+  `RELEASE.json`; the runner archive holds `metro-runner`, `run-runner`,
+  `START.txt`, `RELEASE.json` and its licence notices.
+
+**Windows in the release run.** `release / windows-distribution / preview`
+ran on a GitHub Windows runner and passed every step: it assembled and
+verified the preview, installed the unsigned MSI into a chosen folder,
+checked the payload, ran the server and uninstalled it, checked that the
+legacy script refuses to install next to the MSI, and ran the MSI lane's
+native tests (fixtures, upgrade, repair, downgrade, uninstall). All
+unattended.
+
+**Not verified:** the desktop app or the MSI wizard on screen on native
+Windows, by a person; any start of the released binaries or images (not
+run here); `cosign` verification of the file or image signatures by
+anyone outside the release workflow; macOS (not built); real vendor
+accounts and sign-ins; pretrained `google/embeddinggemma-2` ranking.
+Windows files carry no Authenticode signature.
+
 ## Staged: Spaces with several agents, per-connection model lists and the desktop redesign at 4175475 (2026-11-25, project manager, local)
 
 A **gate on unreleased source**, run on Linux and reported by the project
 manager. It isn't a release, and nothing was built for distribution or
 published. Its source came after the published
 [Metro 0.3.2](#published-metro-032-2026-11-24-github-release-v032) release
-(tag on `d943797`): it's in the source since 0.3.2, not released, and isn't in
-0.3.0, 0.3.1 or 0.3.2. Packaging tests weren't rerun.
+(tag on `d943797`). It isn't in 0.3.0, 0.3.1 or 0.3.2; it was later
+released in [Metro 0.4.0](#published-metro-040-2026-11-25-github-release-v040).
+Packaging tests weren't rerun.
 
 **Source.** Commits `4d72b28` through `4175475`:
 

@@ -18,8 +18,7 @@ searches your files ([library.md](library.md#in-the-desktop-app)). That
 choice was checked in a native Linux GTK run, in dark and light themes, of the source after 0.2.0 (before 0.3.2; not of the release files). Your account is in the sidebar's account row.
 Its menu offers **Copy server URL**, **Copy ID** and **Sign out**. The
 account row was checked in the same native GTK review, and its menu items
-are covered by automated tests. Since then (in the source for 0.4.0, not yet
-recorded as published; covered by automated tests only), the account card also shows the connection to the
+are covered by automated tests. Since then (released in 0.4.0; covered by automated tests only), the account card also shows the connection to the
 server (*Connecting*, *Reconnecting*, or online), and collapsing the
 sidebar leaves an icon rail with the same places: Chat, Library, Scheduled
 tasks, one tile per Space, New Space and Settings. In a very narrow window
@@ -67,7 +66,7 @@ before it can be the default.
   run delegates to. It never falls back to another member's connection. A
   shared connection is used only when someone picks it
   ([sharing](#sharing-a-connection)).
-- **The order** (in the source for 0.4.0, not yet recorded as published). A run in a
+- **The order** (released in 0.4.0). A run in a
   Space uses the first of these that is set:
   1. the model the sender chose for that turn (the composer's **Model**);
   2. the sender's model for that agent in this Space;
@@ -406,13 +405,13 @@ connector says so. Then disconnect Metro in ChatGPT's settings.
 
 **Models and requests.**
 
-- Listing models asks OpenAI for your account's models. In the
-  source for 0.4.0 (not yet recorded as published), the device also reports the catalog's display names
+- Listing models asks OpenAI for your account's models. Since
+  0.4.0, the device also reports the catalog's display names
   (short, printable names only), which the model list shows.
 - Requests go to the Responses API with `store: false`, and only a completed
   response counts as success. Tool calls come back to Metro, and the
   connector runs no tools itself.
-- In the source for 0.4.0 (not yet recorded as published), a successful (`200`) answer is read
+- Since 0.4.0, a successful (`200`) answer is read
   as an event stream, as a whole JSON Responses object, or, without a
   recognized `content-type`, by checking which of the two it is. Output
   items and message parts it doesn't know are skipped. An answer it still
@@ -475,7 +474,7 @@ setup ([commands](development.md#metro-connector-developer-cli)).
 
 Your own OpenAI-compatible endpoint, such as a local inference server or a
 gateway. Use it with your own key, or `--no-api-key`. The base URL is set
-on your machine only. In the source for 0.4.0 (not yet recorded as published), a thinking level
+on your machine only. Since 0.4.0, a thinking level
 you set up for one of its models ([model lists](#each-connections-model-list))
 is forwarded unchanged as `reasoning_effort` or `reasoning: {"effort"}`
 (1–32 characters of `a-z`, `0-9`, `_`, `-`). Sign in with ChatGPT accepts
@@ -556,7 +555,7 @@ never see or manage it.
 
 ## Each connection's model list
 
-(In the source for 0.4.0, not yet recorded as published.) Each chat connection keeps its
+(Released in 0.4.0.) Each chat connection keeps its
 own list of the models that may be picked on it. The connection's `model`
 is its default model and is always one of its enabled models.
 
@@ -678,7 +677,7 @@ isn't secret and never leaves the device.
   - A routed turn's group can show its route, for example *detected by
     System One* and the use case. It never shows connection ids, prompts or
     credentials ([screenshot](screenshots/route-attribution.png)).
-  - In the source for 0.4.0 (not yet recorded as published), the group is named
+  - Since 0.4.0, the group is named
     after the Space agent working the turn, can show how that agent was
     chosen (for example *Picked by classifier: Coder*), and shows the
     provider's reasoning summaries (`reasoning_summary` events) as

@@ -8,9 +8,9 @@ and Win32 on Windows. No npm or Node is needed to build or run it.
 
 Download the build for your system from
 [Releases](https://github.com/wnzn/metro/releases). The latest is
-[Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2)
-([what was checked](../../docs/acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
-Everything this README describes on `main` at `d943797` is in 0.3.2; the
+[Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0)
+([what was checked](../../docs/acceptance.md#published-metro-040-2026-11-25-github-release-v040)).
+Everything this README describes on `main` at `1a743e5` is in 0.4.0; the
 local checks it cites ran on local builds, not on the release files. You never need NSH, a
 checkout or a terminal to use the app; the build commands further down are
 for contributors.
@@ -24,7 +24,7 @@ for contributors.
   Metro and its icon to your applications menu, and `./install-desktop
   --uninstall` removes them without touching your Metro data. Run it again
   if you move the folder. A local test archive of that source passed this
-  check, and the 0.3.2 Linux archive contains `install-desktop`.
+  check, and the 0.3.2 and 0.4.0 Linux archives contain `install-desktop`.
 - **Windows x64:** `Metro-<version>-windows-x64.zip`, a portable ZIP. See
   [Windows portable package](#windows-portable-package).
 
@@ -37,7 +37,7 @@ download, add a menu entry and optionally install Linux libraries, are
 described in [docs/install.md](../../docs/install.md). The Linux installer
 passed in a local test cut on Debian 13 and CachyOS
 ([acceptance](../../docs/acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local)). They're published
-with 0.3.2 and listed in its signed `SHA256SUMS`; the scripts themselves
+with each release since 0.3.2 (0.4.0 included) and listed in its signed `SHA256SUMS`; the scripts themselves
 aren't code-signed, and the Windows one hasn't been run in a recorded test. There's no
 Mac build or download for now: CI doesn't build macOS. The macOS installer
 script stays in the repository, untested, for when Mac builds return.
@@ -292,8 +292,7 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   session. Switching workspaces asks first if any place still has one.
 - **Mentions:** type `@` or press **@** to mention `@agent`, one of the
   Space's named agents by its `@handle`, or a Space member by their stable
-  user ID. In the source for 0.4.0 (covered by automated tests;
-  not yet recorded as published), the list shows each agent with its picture (or its initial
+  user ID. Released in 0.4.0 (covered by automated tests), the list shows each agent with its picture (or its initial
   on its colour) and each person with theirs. `@agent` is the generic agent:
   the Space's default agent, or your classifier's pick if you turned
   classification on in that Space. A named agent is sent by its id. Keys
@@ -305,8 +304,8 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   Mentioning a person never starts agent work. Only an agent mention or
   **Ask agent** does. Messages show their audience and recipients, and
   `@you` is highlighted.
-- **Ask agent in a Space with several agents** (in the source for 0.4.0;
-  covered by automated tests; not yet recorded as published): **Ask agent** gets a small
+- **Ask agent in a Space with several agents** (released in 0.4.0;
+  covered by automated tests): **Ask agent** gets a small
   chevron that chooses which agent it asks. The Space's default agent is
   preselected and the button names the chosen one (**Ask Coder**). **Let the
   classifier choose** is offered only when you have a System One connection
@@ -329,8 +328,8 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   collapsed **Runner activity** group, and since no model is called it never
   says "thinking".
 - **Agent activity:** each agent turn shows as **one** collapsed group, not a
-  row per tool. In the source for 0.4.0 (covered by automated
-  tests; not yet recorded as published), a Space turn shows its agent's name and picture (or
+  row per tool. Released in 0.4.0 (covered by automated
+  tests), a Space turn shows its agent's name and picture (or
   initial), and its reply in the transcript does too, instead of the generic
   agent mark. The collapsed line also says how the agent was chosen when
   that adds something, such as **Picked by classifier: Coder**; the opened
@@ -400,8 +399,7 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   collapses it to a rail of icons: Chat, Library, Scheduled tasks, each Space
   as its initial tile, Settings and your picture. Each name is the icon's
   tooltip and accessible name.
-- **Resizable panels** (in the source for 0.4.0; covered by automated tests; not yet
-  recorded as published): drag the thin handle on the inner edge of the sidebar
+- **Resizable panels** (released in 0.4.0; covered by automated tests): drag the thin handle on the inner edge of the sidebar
   (200–400 points), of Chat's agent runs (260–520) or of the Settings and
   Space settings sections (180–320, one width for both). Double-click the
   handle to restore the default width (headless tests can't double-click,
@@ -411,8 +409,8 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   and widest, and <kbd>Return</kbd> restores the default. Dragging the
   sidebar well below its narrowest width collapses it to the icon rail. Each
   width is remembered on this device, like the collapsed state.
-- **Space settings** (in the source for 0.4.0; covered by automated
-  tests; not yet recorded as published): every member opens a Space's settings from the cog
+- **Space settings** (released in 0.4.0; covered by automated
+  tests): every member opens a Space's settings from the cog
   in the room's header, from the **⋯** that shows when hovering the Space in
   the sidebar (**Space settings**, **Agents**, **Your preferences**), or with
   a secondary click on its tile in the icon rail. **General** renames and
@@ -597,7 +595,7 @@ contributors only, in
   - Those details stay on this computer. The Metro server only gets the
     fixed, coarser error text, such as asking you to sign in again on the
     device.
-  - In the source for 0.4.0, not yet recorded as published (covered by
+  - Released in 0.4.0 (covered by
     automated tests; no real-account run), a successful ChatGPT answer Metro still can't read
     is recorded as `chatgpt_unusable_response`, with only the class of its
     media type (`event_stream`, `json`, `other` or `missing`), never the
@@ -620,8 +618,8 @@ contributors only, in
 
 ## Windows portable package
 
-The release file is `Metro-<version>-windows-x64.zip` (for 0.3.2,
-`Metro-0.3.2-windows-x64.zip`), a portable build with no installer.
+The release file is `Metro-<version>-windows-x64.zip` (for 0.4.0,
+`Metro-0.4.0-windows-x64.zip`), a portable build with no installer.
 Release ZIPs ship without an Authenticode signature for now
 ([install.md](../../docs/install.md#desktop-on-windows)). Nobody has
 started the app from it on native Windows; the 0.2.0 candidate has only

@@ -6,10 +6,10 @@ for one person, without compiling anything. Each one is a standalone file
 that's also published as a release asset next to the archives, and each is
 listed in `SHA256SUMS` (except `install-metro-macos.sh` while there are no
 Mac builds). The latest published release is
-[Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2); its
-scripts are the 0.3.2 copies, so a change here after `d943797` isn't in
+[Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0); its
+scripts are the 0.4.0 copies, so a change here after `1a743e5` isn't in
 it until the next release
-([acceptance](../docs/acceptance.md#published-metro-032-2026-11-24-github-release-v032)).
+([acceptance](../docs/acceptance.md#published-metro-040-2026-11-25-github-release-v040)).
 
 Every installer checks the archive's SHA-256 before it extracts anything.
 It takes `--sha256 HEX`, `--checksum-file` (a `.sha256` sidecar or
@@ -147,8 +147,9 @@ For reference, this is how that code works:
 ## Release signing (protected `main` only)
 
 The pipeline below is implemented and covered by local contract tests. It
-published Metro 0.3.2 from `d943797` in CI run 45418420759, with Windows
-unsigned: the signatures in that release are the Sigstore bundles for
+published Metro 0.3.2 from `d943797` in CI run 45418420759 and Metro 0.4.0
+from `1a743e5` in CI run 45560122825, both with Windows unsigned: the
+signatures in each release are the Sigstore bundles for
 `SHA256SUMS` and the two Linux archives, and the GHCR image signatures.
 Windows Authenticode signing has never run.
 Who may release, which version, and when: `release_policy.py` and

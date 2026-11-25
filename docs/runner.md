@@ -134,10 +134,10 @@ runner image or the Linux runner binary. Either needs Linux ≥ 5.6
 (`openat2`). The remote runner must reach the server over `https://`, so
 expose the server through a TLS reverse proxy (see [deploy.md](deploy.md)).
 
-> **Published in [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2):**
-> the image `ghcr.io/wnzn/metro-runner:v0.3.2` (`linux/amd64`,
+> **Published in [Metro 0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0):**
+> the image `ghcr.io/wnzn/metro-runner:v0.4.0` (`linux/amd64`,
 > `linux/arm64`; pin the digest from the release's `IMAGES.txt`) and the
-> binary archive `Metro-runner-0.3.2-linux-x64.tar.gz` with its `.sha256`
+> binary archive `Metro-runner-0.4.0-linux-x64.tar.gz` with its `.sha256`
 > ([deploy.md](deploy.md#release-files-and-images)). Building them yourself
 > is contributor tooling ([development.md](development.md#images-and-binaries)).
 
