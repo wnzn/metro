@@ -1321,6 +1321,8 @@ test("a Manage detach ack superseded by a verified bulk attach doesn't publish o
   await openRunnerSettings(app);
   await app.waitFor("id:installed-runner-space:marker");
   await app.waitFor("id:runner-attach-pick:solo");
+  expect(app.enabled("id:runner-attach-many")).toBe(false);
+  await app.press("id:runner-attach-pick:solo"); // The snapshot found Solo eligible after the initial review.
   await app.press("id:runner-attach-many");
   await app.waitFor("id:runner-attach-result");
   expect(words(app)).toContain("Attached to 1 Space.");

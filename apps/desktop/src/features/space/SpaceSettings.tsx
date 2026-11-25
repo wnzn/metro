@@ -354,7 +354,7 @@ function DangerZone() {
       >
         <SettingRow
           label="Delete this Space"
-          description="Permanently removes its rooms and threads, messages, library files and scheduled prompts, and detaches its runner. This can't be undone."
+          description="Permanently deletes its rooms, threads, messages, library files, scheduled prompts and Space Pages, including page history and drafts. It detaches its runner. You can’t recover this Space from Trash."
           stacked={dangerOpen() === "delete"}
         >
           <If

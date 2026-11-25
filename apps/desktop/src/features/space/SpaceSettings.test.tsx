@@ -118,9 +118,13 @@ test("deleting needs the exact name typed, says what goes, and forgets the Space
   expect(words).toContain("rooms");
   expect(words).toContain("library files");
   expect(words).toContain("scheduled prompts");
+  expect(words).toContain("Space Pages, including page history and drafts");
   expect(words).toContain("detaches its runner");
+  expect(words).toContain("You can’t recover this Space from Trash.");
+  expect(app.enabled("id:delete-confirm")).toBe(false);
   await app.type("id:delete-space-name", "acme");
   expect(app.enabled("id:delete-confirm")).toBe(false);
+  expect(calls(w, "DELETE", "/v1/spaces/acme")).toEqual([]);
   await app.clear("id:delete-space-name");
   await app.type("id:delete-space-name", "Acme");
   await app.press("id:delete-confirm");

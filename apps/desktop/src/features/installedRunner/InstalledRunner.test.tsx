@@ -677,6 +677,116 @@ test("bulk attach starts checked, respects picks, and loses safely to both kinds
   expect(app.shows("id:runner-attach-pick:d")).toBe(true); // dismissal does not remove the permanent action
 });
 
+test("the offer reviews its first bulk list; late, detached and returning Spaces need a fresh pick", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  const other = f.addRunner("Other PC", "personal", "alice");
+  for (const id of ["reviewed", "returning", "detached"]) f.addSpace(id, id, "alice");
+  f.state.attached.set("detached", other.id);
+  const returning = f.state.spaces.get("returning")!;
+  const app = await openWith(f, bridgeWithRunner(f, mine.id, mine.name), true);
+  await signIn(app, "alice");
+  await app.waitFor("id:runner-offer");
+  await app.press("id:runner-offer-choose");
+  await app.waitFor("id:runner-attach-many >> text:Attach to 2 Spaces");
+  const writes = () => f.posts().filter((p) => p.path.includes("/runner"));
+  const dismissal = runnerOfferStorageKey(BASE, "alice");
+  expect(writes()).toEqual([]);
+  expect(app.storage()[dismissal]).toBe(undefined);
+
+  // Changes from another client while Settings remains open.
+  returning.members.delete("alice");
+  f.state.attached.delete("detached");
+  f.addSpace("late", "Late", "alice");
+  await app.clock!.runFor(11_000);
+  await app.waitFor("id:runner-attach-pick:detached");
+  await app.waitFor("id:runner-attach-pick:late");
+  await app.waitFor("id:runner-attach-pick:returning", { state: "gone" });
+  returning.members.add("alice");
+  await app.clock!.runFor(11_000);
+  await app.waitFor("id:runner-attach-pick:returning");
+  await app.waitFor("id:runner-attach-many >> text:Attach to 1 Space");
+  await app.press("id:runner-attach-many");
+  await app.waitFor("id:runner-attach-result >> text:Attached to 1 Space.");
+  expect(writes().map((p) => p.path)).toEqual(["/v1/spaces/reviewed/runner/attach-if-empty"]);
+  for (const id of ["returning", "detached", "late"]) expect(f.state.attached.has(id)).toBe(false);
+  expect(app.enabled("id:runner-attach-many")).toBe(false);
+  await app.waitUntil(() => app.storage()[dismissal] === "dismissed");
+
+  await app.press("id:runner-attach-pick:detached");
+  expect(writes()).toHaveLength(1); // Changing the selection isn't an attach.
+  await app.press("id:runner-attach-many");
+  await app.waitUntil(() => f.state.attached.get("detached") === mine.id);
+  await app.waitFor("id:runner-attach-result >> text:Attached to 1 Space.");
+  expect(writes().map((p) => p.path)).toEqual([
+    "/v1/spaces/reviewed/runner/attach-if-empty", "/v1/spaces/detached/runner/attach-if-empty",
+  ]);
+  await app.press("id:settings-close");
+  expect(app.shows("id:runner-offer")).toBe(false); // Eligible rows remain, but the offer was dismissed.
+});
+
+test("an empty first verified bulk list does not preselect the first later arrival", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  const app = await openWith(f, bridgeWithRunner(f, mine.id, mine.name), true);
+  await signInToRunners(app, "alice");
+  await app.waitFor("text:Every Space you own has a runner.");
+  f.addSpace("late", "Late", "alice");
+  await app.clock!.runFor(11_000);
+  await app.waitFor("id:runner-attach-pick:late");
+  expect(app.enabled("id:runner-attach-many")).toBe(false);
+  expect(f.posts().filter((p) => p.path.includes("/runner"))).toEqual([]);
+});
+
+for (const change of ["new", "moved", "replaced"] as const) {
+  test(`a ${change} installed runner starts unchecked in open Settings`, async () => {
+    const f = world();
+    for (const id of ["first", "second"]) f.addSpace(id, id, "alice");
+    const original = change === "new" ? null : f.addRunner("This PC", "personal", "alice");
+    const reconnect = change !== "moved";
+    const t = bridgeWithRunner(f, original?.id ?? null, "This PC", {
+      state: change === "new" ? "interrupted" : reconnect ? "revoked" : "online", canReconnect: reconnect,
+    });
+    const app = await openWith(f, t, true);
+    await signInToRunners(app, "alice");
+    if (original) {
+      await app.waitFor("id:runner-attach-many >> text:Attach to 2 Spaces");
+      await app.press("id:runner-attach-pick:second");
+      await app.waitFor("id:runner-attach-many >> text:Attach to 1 Space");
+    } else {
+      await app.waitFor("id:installed-runner-reconnect");
+      expect(app.shows("id:runner-attach-pick:first")).toBe(false);
+    }
+    if (change === "moved") {
+      // A live status update for the same id is not a new runner.
+      t.st.state = "offline";
+      await app.clock!.runFor(5100);
+      await app.waitFor("id:installed-runner-state >> text:Can't reach the local server");
+      expect(app.shows("id:runner-attach-many >> text:Attach to 1 Space")).toBe(true);
+      t.st.state = "online";
+    }
+    const next = f.addRunner("This PC", "personal", "alice");
+    t.st.runnerId = next.id;
+    if (reconnect) {
+      await app.press("id:installed-runner-reconnect");
+      await app.press("id:installed-runner-reconnect:confirm");
+    } else {
+      await app.clock!.runFor(5100);
+    }
+    await app.waitFor("id:runner-attach-many >> text:Attach to 0 Spaces");
+    expect(app.enabled("id:runner-attach-many")).toBe(false);
+    const writes = () => f.posts().filter((p) => p.path.includes("/runner"));
+    expect(writes()).toEqual([]);
+    await app.press("id:runner-attach-pick:second");
+    expect(writes()).toEqual([]);
+    await app.press("id:runner-attach-many");
+    await app.waitFor("id:runner-attach-result >> text:Attached to 1 Space.");
+    expect(writes()).toEqual([{
+      user: "alice", method: "POST", path: "/v1/spaces/second/runner/attach-if-empty", body: { runner_id: next.id },
+    }]);
+  });
+}
+
 test("legacy server or a launcher runner from another scope can't use bulk attach", async () => {
   for (const mode of ["legacy", "organization", "other account"]) {
     const f = world();
