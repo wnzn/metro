@@ -30,7 +30,17 @@ export type ServerUrlResult =
   | { ok: false; error: string };
 
 function bareHost(hostname: string): string {
-  return hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
+  const host = hostname.toLowerCase();
+  return host.startsWith("[") && host.endsWith("]") ? host.slice(1, -1) : host;
+}
+
+const LABEL = /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/;
+
+/** `<label>[.<label>...].ts.net` (lowercase input). */
+function isTsNetName(name: string): boolean {
+  if (!name.endsWith(".ts.net")) return false;
+  const labels = name.slice(0, -".ts.net".length);
+  return labels !== "" && labels.split(".").every((l) => LABEL.test(l));
 }
 
 function ipv4(host: string): number[] | null {
@@ -89,12 +99,16 @@ function classifyV4(o: number[]): HostClass {
 /**
  * Loopback, Tailscale or other. Takes a URL hostname (IPv6 with or without
  * brackets). Anything that doesn't parse as one of the known forms is "other".
+ * The host is taken exactly as given: a trailing dot (`100.64.0.1.`,
+ * `localhost.`) makes it a name for the resolver, so "other"; only a
+ * MagicDNS name may end in a dot. Matches the metro-url-policy crate, checked
+ * by the shared vectors in crates/url-policy/testdata/host_vectors.json.
  */
 export function classifyHost(hostname: string): HostClass {
   const host = bareHost(hostname);
   if (!host) return "other";
-  if (host === "localhost" || host.endsWith(".localhost")) return "loopback";
-  if (host.endsWith(".ts.net") && host.length > ".ts.net".length && !host.startsWith(".")) return "tailscale";
+  if (host === "localhost") return "loopback";
+  if (isTsNetName(host.endsWith(".") ? host.slice(0, -1) : host)) return "tailscale";
   const v4 = ipv4(host);
   if (v4) return classifyV4(v4);
   const v6 = ipv6(host);

@@ -1,4 +1,5 @@
 import { expect, test } from "nsh/test";
+import vectors from "../../../../crates/url-policy/testdata/host_vectors.json";
 import { classifyHost, isLoopbackHost, parseServerUrl, plainHttpWarning } from "./serverUrl";
 
 test("plain http works for every host; only hosts outside loopback and Tailscale need consent", () => {
@@ -59,6 +60,11 @@ test("classifies Tailscale ranges and names exactly", () => {
   expect(classifyHost("::ffff:6464:6464")).toBe("tailscale");
   expect(classifyHost("Host.Tailnet-Name.TS.NET")).toBe("tailscale");
   expect(classifyHost("host.tailnet.ts.net.")).toBe("tailscale");
+  expect(classifyHost("a.ts.net")).toBe("tailscale");
+  expect(classifyHost("a..ts.net")).toBe("other");
+  expect(classifyHost("100.64.0.1.")).toBe("other");
+  expect(classifyHost("localhost.")).toBe("other");
+  expect(classifyHost("foo.localhost")).toBe("other");
   expect(classifyHost("ts.net")).toBe("other");
   expect(classifyHost(".ts.net")).toBe("other");
   expect(classifyHost("evilts.net")).toBe("other");
@@ -73,4 +79,24 @@ test("the warning names the host and the risk, plainly", () => {
   expect(plainHttpWarning("http://192.168.1.5:8787/metro")).toBe(
     "This connection isn't encrypted. Anyone on the network between you and 192.168.1.5:8787 could read your sign-in token. Use it on networks you trust, such as Tailscale or a VPN.",
   );
+});
+
+test("matches the shared host vectors (crates/url-policy/testdata/host_vectors.json)", () => {
+  const hosts = (vectors as { hosts: { host: string; class: string }[] }).hosts;
+  expect(hosts.length > 40).toBe(true);
+  for (const v of hosts) {
+    const got = classifyHost(v.host);
+    if (got !== v.class) throw new Error(`${JSON.stringify(v.host)}: ${got}, expected ${v.class}`);
+  }
+});
+
+test("a URL is classified by the host the app will connect to", () => {
+  // WHATWG URL parsing turns 100.64.0.1. into the IP literal, so the
+  // request goes straight to that address; localhost. stays a name.
+  const ts = parseServerUrl("http://100.64.0.1.:8787");
+  expect(ts.ok && ts.baseUrl === "http://100.64.0.1:8787" && ts.network === "tailscale").toBe(true);
+  const name = parseServerUrl("http://localhost.:8787");
+  expect(name.ok && name.network === "other" && name.needsConsent).toBe(true);
+  const sub = parseServerUrl("http://foo.localhost:8787");
+  expect(sub.ok && sub.needsConsent).toBe(true);
 });
