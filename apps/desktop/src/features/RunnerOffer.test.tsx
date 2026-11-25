@@ -23,6 +23,7 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
   const gate = {
     create: 0, attach: 0, badConfirmation: false, reconnect: 0,
     runnerRead: null as { sid: string; delay: number; parked: boolean } | null,
+    detach: null as { sid: string; beforeCommit: boolean; delay: number; commit: (() => void) | null } | null,
   };
   const runnerStatus = () => ({
     requested: true, available: status.available, state: status.state,
@@ -68,6 +69,19 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
       if (gate.attach) return { ...(reply as object), delay: gate.attach };
     }
     return reply;
+  };
+  const serverDelete = network[`DELETE ${BASE}/v1/*`]!;
+  network[`DELETE ${BASE}/v1/*`] = (req) => {
+    const detach = gate.detach;
+    if (!detach || detach.commit || new URL(req.url).pathname !== `/v1/spaces/${detach.sid}/runner`) {
+      return serverDelete(req);
+    }
+    if (detach.beforeCommit) {
+      detach.commit = () => { serverDelete(req); };
+      return { status: 204, delay: detach.delay };
+    }
+    detach.commit = () => {};
+    return { ...(serverDelete(req) as object), delay: detach.delay };
   };
   return { status, gate, network };
 }
@@ -600,6 +614,132 @@ test("a newer local Manage detach wins over a held bulk success, including count
   ]);
 });
 
+test("a current Manage detach fences a pre-commit folder read without losing B or a newer post-ack observation", async () => {
+  const f = world();
+  f.addSpace("alpha", "Alpha", "alice");
+  f.addSpace("beta", "Beta", "alice");
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.state.attached.set("alpha", r.id);
+  const t = fixture(f, r.id);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.waitFor(offer);
+  await app.press("id:space:alpha");
+  await app.press("id:manage-space");
+  await app.waitFor("id:attached-runner");
+  const detach = { sid: "alpha", beforeCommit: true, delay: 400, commit: null as (() => void) | null };
+  t.gate.detach = detach;
+  await app.press("id:detach-runner");
+  await app.press("id:confirm-detach");
+  await app.waitUntil(() => detach.commit !== null);
+  expect(f.state.attached.get("alpha")).toBe(r.id); // The DELETE hasn't committed.
+
+  const preCommit = { sid: "alpha", delay: 800, parked: false };
+  t.gate.runnerRead = preCommit;
+  f.state.attached.set("beta", r.id);
+  await app.press("id:nav-settings");
+  await app.waitUntil(() => preCommit.parked);
+  expect(app.shows("id:installed-runner-space:alpha")).toBe(true);
+  const afterAck = { sid: "alpha", delay: 1600, parked: false };
+  t.gate.runnerRead = afterAck;
+  detach.commit!();
+  await app.clock!.runFor(400);
+  await app.waitUntil(() => afterAck.parked); // Fresh exact-Space read after the ack.
+  expect(f.state.attached.has("alpha")).toBe(false);
+
+  await app.clock!.runFor(400); // The pre-commit snapshot returns before the fresh read.
+  await app.waitFor("id:installed-runner-space:beta");
+  expect(app.shows("id:installed-runner-space:alpha")).toBe(false);
+  expect(app.shows("id:runner-attach-pick:alpha")).toBe(true);
+  await app.press("id:settings-close");
+  expect(app.shows("id:attached-runner")).toBe(false);
+  expect(app.shows("id:test-runner-row")).toBe(false);
+
+  // A newer observation really can win: another client attaches A again
+  // after the ack, while the first post-ack read is still in flight.
+  f.state.attached.set("alpha", r.id);
+  await app.press("id:nav-settings");
+  await app.waitFor("id:installed-runner-space:alpha");
+  await app.clock!.runFor(1200);
+  expect(app.shows("id:installed-runner-space:alpha")).toBe(true);
+  expect(app.shows("id:installed-runner-space:beta")).toBe(true);
+  expect(app.shows("id:runner-attach-pick:alpha")).toBe(false);
+  await app.press("id:settings-close");
+  expect(app.shows("id:attached-runner")).toBe(true);
+  expect(app.shows("id:test-runner-row")).toBe(true);
+  expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["DELETE", "/v1/spaces/alpha/runner"]]);
+});
+
+test("a Manage detach ack superseded by a verified bulk attach doesn't publish or re-read", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  f.addSpace("marker", "Snapshot marker", "alice");
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.state.attached.set("solo", r.id);
+  const t = fixture(f, r.id);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.waitFor(offer);
+  await app.press("id:space:solo");
+  await app.press("id:manage-space");
+  await app.waitFor("id:attached-runner");
+  const detach = { sid: "solo", beforeCommit: false, delay: 800, commit: null as (() => void) | null };
+  t.gate.detach = detach;
+  await app.press("id:detach-runner");
+  await app.press("id:confirm-detach");
+  await app.waitUntil(() => detach.commit !== null);
+  expect(f.state.attached.has("solo")).toBe(false);
+
+  // Make a sibling folder mark completion of this Settings snapshot.
+  f.state.attached.set("marker", r.id);
+  await app.press("id:nav-settings");
+  await app.waitFor("id:installed-runner-space:marker");
+  await app.waitFor("id:runner-attach-pick:solo");
+  await app.press("id:runner-attach-many");
+  await app.waitFor("id:runner-attach-result");
+  expect(words(app)).toContain("Attached to 1 Space.");
+  expect(app.shows("id:installed-runner-space:solo")).toBe(true);
+  const reads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/spaces/solo/runner").length;
+  const before = reads();
+
+  await app.clock!.runFor(800);
+  expect(app.shows("id:installed-runner-space:solo")).toBe(true);
+  expect(reads()).toBe(before);
+  await app.press("id:settings-close");
+  expect(app.shows("id:attached-runner")).toBe(true);
+  expect(app.shows("id:test-runner-row")).toBe(true);
+  expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([
+    ["DELETE", "/v1/spaces/solo/runner"], ["POST", "/v1/spaces/solo/runner/attach-if-empty"],
+  ]);
+});
+
+test("a Manage detach acknowledgement after an account change doesn't re-read the old Space", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.state.attached.set("solo", r.id);
+  const t = fixture(f, r.id);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.press("id:space:solo");
+  await app.press("id:manage-space");
+  await app.waitFor("id:attached-runner");
+  const detach = { sid: "solo", beforeCommit: false, delay: 800, commit: null as (() => void) | null };
+  t.gate.detach = detach;
+  await app.press("id:detach-runner");
+  await app.press("id:confirm-detach");
+  await app.waitUntil(() => detach.commit !== null);
+  expect(f.state.attached.has("solo")).toBe(false);
+  const reads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/spaces/solo/runner").length;
+  const before = reads();
+  await signOut(app);
+  await signIn(app, "bob");
+  await app.clock!.runFor(800);
+  expect(reads()).toBe(before);
+  expect(app.shows("id:space:solo")).toBe(false);
+  expect(words(app)).not.toContain("Runner detached.");
+});
+
 test("changing and restoring consent while the create response is held never posts an attach or duplicate create", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");
@@ -798,8 +938,11 @@ test("Settings reopen joins held Sidebar liveness and refreshes folders after ma
   await app.press("id:space:manual");
   await app.press("id:manage-space");
   await app.waitFor(`id:attach-runner:${r.id}`);
+  const folderReads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/spaces/manual/runner").length;
+  const beforeAttach = folderReads();
   await app.press(`id:attach-runner:${r.id}`);
   await app.waitFor("id:attached-runner");
+  await app.waitUntil(() => folderReads() > beforeAttach);
   t.status.delay = 800;
   const reopenDuringLiveness = async () => {
     const before = t.status.reads;
@@ -813,10 +956,11 @@ test("Settings reopen joins held Sidebar liveness and refreshes folders after ma
   await reopenDuringLiveness();
   await app.waitFor("id:installed-runner-space:manual");
   await app.press("id:settings-close");
+  const beforeDetach = folderReads();
   await app.press("id:detach-runner");
   await app.press("id:confirm-detach");
   await app.waitFor(`id:attach-runner:${r.id}`);
-  const folderReads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/spaces/manual/runner").length;
+  await app.waitUntil(() => folderReads() > beforeDetach);
   const before = folderReads();
   await reopenDuringLiveness();
   await app.waitUntil(() => folderReads() > before);
