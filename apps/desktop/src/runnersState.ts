@@ -2,7 +2,7 @@
 import { cleanup, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError } from "./api/client";
 import type { Client, RegisteredRunner, Space, SpaceRunner } from "./api/client";
-import { beginSpaceRunnerWrite, loadRunners, reconcileOwnedSpaceRunner, recordRunnerUpdateAccepted, runnerBusy, runners, snapshotSpaceRunnerWrite, spaceRunners } from "./settings";
+import { acknowledgeSpaceRunnerWrite, beginSpaceRunnerWrite, loadRunners, reconcileOwnedSpaceRunner, recordRunnerUpdateAccepted, runnerBusy, runners, snapshotSpaceRunnerWrite, spaceRunners } from "./settings";
 import { apiClient, connectedTo, me, onSessionEnd, place, sessionGuard, settingsSection, spaces } from "./store";
 import { helper } from "./device/state";
 import { installedBusy, installedFolderSnapshot, installedRunner, installedRunnerSeen, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner } from "./features/installedRunner/installedRunner";
@@ -238,9 +238,10 @@ async function attachAndReconcile(
 ): Promise<AttachProblem | { kind: "attached"; stillVerified: () => boolean }> {
   // The server repeats ownership and emptiness checks atomically. Never fall
   // back to the replacing route, including if the server lacks this endpoint.
-  const latest = beginSpaceRunnerWrite(sid, expectedWrite);
+  let latest = beginSpaceRunnerWrite(sid, expectedWrite);
   if (!latest) return changedSinceSelection;
-  const stillScoped = () => latest() && ownsSpace(sid) && choice.isCurrent();
+  const sameWrite = () => !!latest?.() && ownsSpace(sid);
+  const stillScoped = () => sameWrite() && choice.isCurrent();
   let accepted = false;
   try {
     const receipt = await c.attachRunnerIfEmpty(sid, choice.id);
@@ -248,8 +249,10 @@ async function attachAndReconcile(
       r?.kind === "registered" && r.id === choice.id && r.visibility === "personal" &&
       r.assignmentRevision === receipt.assignmentRevision;
     accepted = true;
-    if (!latest()) return newerRunnerAction;
-    const current = await reconcileOwnedSpaceRunner(sid, stillScoped, matches);
+    const afterAck = acknowledgeSpaceRunnerWrite(sid, sameWrite, null);
+    if (!afterAck) return newerRunnerAction;
+    latest = afterAck;
+    const current = await reconcileOwnedSpaceRunner(sid, sameWrite, (r) => stillScoped() && matches(r));
     if (!latest()) return newerRunnerAction;
     if (current === undefined) return { kind: "unconfirmed" };
     if (!matches(current)) return { kind: "superseded", reason: "The runner assignment changed." };

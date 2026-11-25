@@ -174,12 +174,12 @@ export async function loadLocalTools(spaceId: string, stillOpen: () => boolean):
   }
 }
 
-export async function enableLocalTools(spaceId: string, stillOpen: () => boolean): Promise<void> {
-  if (client) await changeLocalTools("enable", spaceId, stillOpen, () => client!.enable(spaceId));
+export async function enableLocalTools(spaceId: string, stillOpen: () => boolean, onAck: () => void): Promise<void> {
+  if (client) await changeLocalTools("enable", spaceId, stillOpen, () => client!.enable(spaceId), onAck);
 }
 
-export async function disableLocalTools(target: LocalToolsDisableTarget, stillOpen: () => boolean): Promise<void> {
-  if (client) await changeLocalTools("disable", target.spaceId, stillOpen, () => client!.disable(target));
+export async function disableLocalTools(target: LocalToolsDisableTarget, stillOpen: () => boolean, onAck: () => void): Promise<void> {
+  if (client) await changeLocalTools("disable", target.spaceId, stillOpen, () => client!.disable(target), onAck);
 }
 
 async function changeLocalTools(
@@ -187,6 +187,7 @@ async function changeLocalTools(
   spaceId: string,
   stillOpen: () => boolean,
   write: () => Promise<LocalToolsSpace>,
+  onAck: () => void,
 ) {
   if (!stillOpen() || localToolsBusy()) return;
   const live = sessionGuard(spaceId);
@@ -198,11 +199,13 @@ async function changeLocalTools(
   localToolsNotice.set(null);
   try {
     const receipt = await write();
+    if (!live() || receipt.spaceId !== spaceId) return;
+    if (receipt.state === (action === "enable" ? "on" : "off")) onAck();
     // An acknowledgement can be delayed across replacement or page reopen.
-    // Reconcile only on the originating page; never publish receipt state.
+    // Only the originating page can publish bridge-status feedback.
     if (!onPage()) return;
     const current = await loadLocalTools(spaceId, onPage);
-    if (!onPage() || !current?.available || localTools() !== current || receipt.spaceId !== spaceId) return;
+    if (!onPage() || !current?.available || localTools() !== current) return;
     const entry = current.spaces.find((s) => s.spaceId === spaceId);
     if (action === "enable" && entry?.state === "on" && entry.pairingRevision === receipt.pairingRevision) {
       localToolsNotice.set("Local tools are on for this Space.");

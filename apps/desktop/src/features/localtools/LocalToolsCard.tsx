@@ -5,7 +5,7 @@
 import { Clipboard, cleanup, computed, effect, signal, untracked } from "nsh";
 import { connectedTo, me } from "../../store";
 import type { SpaceRunner } from "../../api/client";
-import { beginSpaceRunnerWrite } from "../../settings";
+import { acknowledgeSpaceRunnerWrite, beginSpaceRunnerWrite } from "../../settings";
 import { Action, Badge, Column, Label, Row, SettingRow, SettingsGroup, Spacer } from "../../ui";
 import type { Tone } from "../../ui";
 import {
@@ -65,10 +65,16 @@ export function LocalToolsCard(props: { spaceId: string | null; runner: SpaceRun
     const account = me();
     const server = connectedTo();
     const stillOpen = () => open && sid() === id && me() === account && connectedTo() === server;
-    const latest = beginSpaceRunnerWrite(id);
-    if (removal) await disableLocalTools(removal, stillOpen);
-    else await enableLocalTools(id, stillOpen);
-    if (latest()) await props.refreshRunner(id, latest);
+    const dispatched = beginSpaceRunnerWrite(id);
+    const previous: SpaceRunner | null = removal
+      ? { kind: "dedicated", name: "Dedicated Space runner", assignmentRevision: removal.revision } : null;
+    const onAck = () => {
+      const latest = acknowledgeSpaceRunnerWrite(id, dispatched, previous);
+      if (latest) void props.refreshRunner(id, latest);
+    };
+    if (removal) await disableLocalTools(removal, stillOpen, onAck);
+    else await enableLocalTools(id, stillOpen, onAck);
+    if (stillOpen() && dispatched()) await props.refreshRunner(id, dispatched);
   };
   // While this Space's worker is starting, follow it here (bounded), so the
   // owner sees "On" without leaving the page. Keyed by Space, owner and

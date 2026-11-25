@@ -11,7 +11,7 @@ import { TEST_RUNNER_DESCRIPTION, TEST_RUNNER_LABEL, TestRunnerAction } from "./
 import {
   changeMember, changeRunner, closeSpaceSettings, dedicatedRevealIsCurrent, isSettingsOwner, loadMembers, loadRunner, loadRunnerInventory,
   memberBusy, memberNotice, preferredSpaceRunner, roster, rosterError, runnerAdvanced, runnerBusy, runnerError,
-  runnerInventory, runnerInventoryError, runnerNotice, runnerSnapshot, setRunnerAdvanced, spaceSettingsFor,
+  reconcileLocalToolsRunner, runnerInventory, runnerInventoryError, runnerNotice, runnerSnapshot, setRunnerAdvanced, spaceSettingsFor,
 } from "./spaceSettingsState";
 
 const scope = { kind: "space" } as const;
@@ -289,7 +289,7 @@ function DedicatedAndLocalTools() {
         </If>
       </SettingsGroup>
       <LocalToolsCard spaceId={spaceSettingsFor()} runner={runner()} disabled={!!runnerBusy()}
-        refreshRunner={async (sid, latest) => { if (spaceSettingsFor() === sid) await loadRunner(latest); }} />
+        refreshRunner={reconcileLocalToolsRunner} />
     </Column>
   );
 }

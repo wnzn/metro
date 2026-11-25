@@ -23,6 +23,7 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
   const gate = {
     create: 0, attach: 0, badConfirmation: false, reconnect: 0,
     attachSpace: null as string | null,
+    uncommittedAttach: null as { delay: number; commit: (() => void) | null } | null,
     runnerReadError: null as string | null,
     runnerRead: null as { sid: string; delay: number; parked: boolean } | null,
     detach: null as { sid: string; beforeCommit: boolean; delay: number; commit: (() => void) | null } | null,
@@ -75,6 +76,14 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
       }
       detach.commit = () => {};
       return { ...(serverPost(req) as object), delay: detach.delay };
+    }
+    const uncommitted = gate.uncommittedAttach;
+    if (uncommitted && !uncommitted.commit && path.endsWith("/runner/attach-if-empty")) {
+      // This fixture gives a newly created, never-paired Space its first
+      // revision. Verify the promised receipt against the actual fake write.
+      const body = { runner: { id: runnerId, name: "This PC", visibility: "personal", kind: "registered" }, assignment_revision: "1" };
+      uncommitted.commit = () => { expect(serverPost(req)).toMatchObject({ status: 200, body }); };
+      return { status: 200, body, delay: uncommitted.delay };
     }
     const reply = serverPost(req);
     if (path === "/v1/spaces" && gate.create) return { ...(reply as object), delay: gate.create };
@@ -185,6 +194,76 @@ for (const exactFails of [false, true]) {
     }
   });
 }
+
+for (const mode of ["Create", "bulk"] as const) {
+test(`a ${mode} acknowledgement fences a pre-commit folder read${mode === "Create" ? " after leaving the form" : ""}`, async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  if (mode === "bulk") f.addSpace("solo", "Solo", "alice");
+  f.addSpace("sibling", "Sibling", "alice");
+  f.state.attached.set("sibling", r.id);
+  const t = fixture(f, r.id);
+  const attach = { delay: 800, commit: null as (() => void) | null };
+  t.gate.uncommittedAttach = attach;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  if (mode === "Create") {
+    await startSidebar(app, "Held Create attach");
+    await app.press("id:create-space");
+  } else {
+    await openWithHeldFolderStatus(app, t, 300);
+    await app.waitFor("id:runner-attach-pick:solo");
+    await app.press("id:runner-attach-many");
+  }
+  await app.waitUntil(() => attach.commit !== null);
+  const sid = mode === "Create" ? space(f, "Held Create attach").id : "solo";
+  expect(f.state.attached.has(sid)).toBe(false);
+
+  const preCommit = { sid, delay: mode === "Create" ? 1600 : 1300, parked: false };
+  t.gate.runnerRead = preCommit;
+  if (mode === "Create") await openRunnerSettings(app);
+  else await app.clock!.runFor(300);
+  await app.waitUntil(() => preCommit.parked);
+  expect(app.shows(`id:runner-attach-pick:${sid}`)).toBe(true);
+  const exact = { sid, delay: 1600, parked: false };
+  t.gate.runnerRead = exact;
+  attach.commit!();
+  await app.clock!.runFor(mode === "Create" ? 800 : 500);
+  await app.waitUntil(() => exact.parked);
+  expect(app.shows(`id:runner-attach-pick:${sid}`)).toBe(false);
+  await app.clock!.runFor(800);
+  await app.waitFor("id:installed-runner-space:sibling");
+  expect(app.shows(`id:runner-attach-pick:${sid}`)).toBe(false);
+  expect(app.shows(`id:installed-runner-space:${sid}`)).toBe(false);
+  await app.clock!.runFor(800);
+  await app.waitFor(`id:installed-runner-space:${sid}`);
+  expect(app.shows("id:installed-runner-space:sibling")).toBe(true);
+  expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["POST", `/v1/spaces/${sid}/runner/attach-if-empty`]]);
+});
+}
+
+test("deleting a registration reconciles its confirmed Space without guessing empty", async () => {
+  const f = world();
+  const r = f.addRunner("Remote runner", "personal", "alice");
+  f.addSpace("solo", "Solo", "alice");
+  f.state.attached.set("solo", r.id);
+  const t = fixture(f, null);
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.press("id:space:solo");
+  await app.waitFor("id:runner-state >> text:Runner attached");
+  await openRunnerSettings(app);
+  await app.press(`id:delete-runner:${r.id}`);
+  await app.waitFor("text:/Spaces you belong to that use it: Solo/");
+  const held = { sid: "solo", delay: 600, parked: false };
+  t.gate.runnerRead = held;
+  await app.press(`id:delete-runner:${r.id}:confirm`);
+  await app.waitUntil(() => held.parked);
+  await app.waitFor("id:runner-state >> text:Runner not confirmed");
+  await app.press("id:settings-close");
+  await app.clock!.runFor(600);
+  await app.waitFor("id:runner-state >> text:No runner");
+});
 
 test("sidebar requires submit consent, supports keyboard, and starts each new form checked", async () => {
   const f = world();

@@ -21,7 +21,7 @@ const FOLDER = "/home/me/.config/metro-desktop/local-tools/accounts/a1/spaces/so
 function bridgeWithTools(f: F, available = true, opts: { startingReads?: number; legacy?: boolean } = {}) {
   /** After enable, this many status reads still report the worker as starting. */
   let starting = 0;
-  const delay = { disable: 0 };
+  const delay = { enable: 0, disable: 0 };
   const b = fakeBridge(f);
   const tools = new Map<string, any>();
   const log: { method: string; path: string; body: any; auth: string | undefined }[] = [];
@@ -53,7 +53,7 @@ function bridgeWithTools(f: F, available = true, opts: { startingReads?: number;
       const e = { space_id: space.id, enabled: true, state: "on", worker: startingFor === undefined ? "online" : "starting", detail: null, folder: FOLDER, tools: ["workspace.list", "workspace.read"],
         ...(opts.legacy ? {} : { pairing_revision: "7" }) };
       tools.set(space.id, e);
-      return { status: 200, body: e };
+      return { status: 200, delay: delay.enable, body: e };
     }
     if (m[2] === "disable-if-current" && opts.legacy) return { status: 404, body: { error: { code: "not_found", message: "unknown path" } } };
     if (m[2] === "disable-if-current" && (body?.account_id !== "alice" || body?.pairing_revision !== tools.get(space.id)?.pairing_revision)) {
@@ -156,6 +156,26 @@ test("a stale Turn off confirmation never stops the replacement; the next review
     ["/v1/local-tools/spaces/solo/disable-if-current", { account_id: "alice", pairing_revision: "7" }],
     ["/v1/local-tools/spaces/solo/disable-if-current", { account_id: "alice", pairing_revision: "8" }],
   ]);
+});
+
+test("a successful local pairing reconciles its Space after closing Advanced", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const t = bridgeWithTools(f);
+  t.delay.enable = 800;
+  const app = await openWith(f, t, true);
+  await signIn(app, "alice");
+  await manage(app, "solo");
+  await app.press("id:local-tools-enable");
+  await app.waitUntil(() => t.tools.has("solo"));
+  await app.press("id:space-settings-close");
+  const exact = f.answerLate("/v1/spaces/solo/runner", TOKENS.alice!, 600);
+  await app.clock!.runFor(800);
+  await app.waitUntil(() => exact.arrived() === 1);
+  await app.waitFor("id:runner-state >> text:Runner not confirmed");
+  await app.clock!.runFor(600);
+  await app.waitFor("id:runner-state >> text:Runner attached");
+  expect(app.shows("id:local-tools-card")).toBe(false);
 });
 
 for (const reopen of [true, false]) {

@@ -27,8 +27,8 @@ import {
 } from "../../api/spaces";
 import type { AgentPatch, ModelSelection, SpaceAgent, SpaceDetails, SpacePrefs, SpacePrefsView } from "../../api/spaces";
 import { apiClient, closeSettings, describe, disconnect, isAborted, me, onManageOpen, onSessionEnd, onTransientClear, rememberMembers, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
-import { beginSpaceRunnerWrite, dismissReveal, revealDedicatedToken, revealed, spaceRunners } from "../../settings";
-import { beginSpaceRunnerObservation, forgetDisprovedSpaceRunner } from "../../spaceRunnerObservations";
+import { acknowledgeSpaceRunnerWrite, beginSpaceRunnerWrite, dismissReveal, revealDedicatedToken, revealed, spaceRunners } from "../../settings";
+import { beginSpaceRunnerObservation } from "../../spaceRunnerObservations";
 import { spaceRunnerExactPending } from "../../spaceRunnerOrder";
 import { dismissRunnerOffer, installedRunnerChoice, snapshotInstalledRunner } from "../../runnersState";
 import { clearLocalToolsMessages, localToolsBusy } from "../localtools/localTools";
@@ -352,11 +352,11 @@ export async function changeMember(action: "add" | "remove", input: string): Pro
 const dedicatedRunner = { kind: "dedicated", name: "Dedicated Space runner" } as const;
 const canAttach = (r: RegisteredRunner) => r.visibility === "organization" || r.canManage;
 
-async function readRunner(api: Client, sid: string): Promise<RunnerSnapshot> {
+async function readRunner(api: Client, sid: string, exact: boolean): Promise<RunnerSnapshot> {
   try {
     return { ...await api.getSpaceRunnerAssignment(sid), legacy: false };
   } catch (error) {
-    if (!(error instanceof ApiError) || error.kind !== "not_found") throw error;
+    if (exact || !(error instanceof ApiError) || error.kind !== "not_found") throw error;
     // Older servers lack GET …/runner. Prove access before showing any
     // fallback from the Space record; a revoked membership also returns 404.
     const space = (await api.listSpaces()).find((s) => s.id === sid);
@@ -368,15 +368,15 @@ async function readRunner(api: Client, sid: string): Promise<RunnerSnapshot> {
 
 async function refreshAssignment(
   api: Client, sid: string, current: () => boolean, show: () => boolean,
-  allowFolderAdd?: (runner: SpaceRunner | null) => boolean,
+  options?: { exact: true; allowFolderAdd?: (runner: SpaceRunner | null) => boolean },
 ) {
   const observation = beginSpaceRunnerObservation(sid);
   const valid = () => observation.isCurrent() && current();
   try {
-    const next = await readRunner(api, sid);
+    const next = await readRunner(api, sid, !!options?.exact);
     if (!valid()) return undefined;
     batch(() => {
-      observation.publish(next.runner, allowFolderAdd?.(next.runner) === true);
+      observation.publish(next.runner, options?.allowFolderAdd?.(next.runner) === true);
       if (show()) {
         runnerSource.set({ sid, legacy: next.legacy, guardedTokenChanges: next.guardedTokenChanges });
         runnerError.set(null);
@@ -386,6 +386,22 @@ async function refreshAssignment(
   } catch (error) {
     if (valid()) throw error;
     return undefined;
+  }
+}
+
+/** A bridge write belongs to this Space even if its Advanced card closed. */
+export async function reconcileLocalToolsRunner(sid: string, latest: () => boolean) {
+  const api = apiClient();
+  const page = guardPage(sid, "runner");
+  const current = () => latest() && spaces().some((s) => s.id === sid && s.role === "owner");
+  if (!api || !current()) return;
+  try {
+    await refreshAssignment(api, sid, current, page, { exact: true });
+  } catch {
+    if (current() && page()) {
+      runnerSource.set(null);
+      runnerError.set("Couldn't check which runner serves this Space.");
+    }
   }
 }
 
@@ -510,16 +526,16 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
     if (!writeCurrent()) return;
     // U10's ack fence expires pre-commit observations and mid-write consent
     // for this Space only. Keep newer assignment evidence if it already won.
-    const afterAck = beginSpaceRunnerWrite(sid, writeCurrent);
+    const afterAck = acknowledgeSpaceRunnerWrite(sid, writeCurrent, before.runner);
     if (!afterAck) return;
     pendingWrite = afterAck;
-    forgetDisprovedSpaceRunner(sid, before.runner);
     // A delayed write reply describes history, not the current assignment.
     // Use the shared exact-Space guards even when the originating page closed.
     const attachConfirmed = (r: SpaceRunner | null) => action.kind === "attach" &&
       r?.kind === "registered" && r.id === action.id && r.assignmentRevision === attachedRevision;
-    const actual = await refreshAssignment(api, sid, writeCurrent, live,
-      (r) => attachConfirmed(r) && !!installed?.isCurrent());
+    const actual = await refreshAssignment(api, sid, writeCurrent, live, {
+      exact: true, allowFolderAdd: (r) => attachConfirmed(r) && !!installed?.isCurrent(),
+    });
     if (!actual) {
       if (receipt && writeCurrent() && stillConsented()) reject(tokenUnconfirmed);
       return;

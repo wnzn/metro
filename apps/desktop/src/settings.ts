@@ -55,7 +55,7 @@ import {
   spaces,
 } from "./store";
 import { forgetQuietly, localConnections, localStep, onLocalPairingChanged, packaged, refreshHelper } from "./device/state";
-import { beginSpaceRunnerObservation, invalidateSpaceRunnerObservations, spaceRunners } from "./spaceRunnerObservations";
+import { beginSpaceRunnerObservation, forgetDisprovedSpaceRunner, invalidateSpaceRunnerObservations, spaceRunners } from "./spaceRunnerObservations";
 export { spaceRunners } from "./spaceRunnerObservations";
 
 export type { Capability, CatalogProvider, ConnectionModel, DeviceStatus, ModelThinking, NewConnectionModel, ProviderConnection, RegisteredRunner, RunnerVisibility, SpaceRunner };
@@ -203,13 +203,22 @@ export async function confirmRunnerAction(action: "rotate" | "delete", runnerId:
     runnersError.set(null);
   });
   // Only Spaces this user belongs to can be checked; others may use an organization runner too.
-  const checks = await Promise.allSettled(spaces().map(async (s) => ({ space: s, runner: await c.getSpaceRunner(s.id) })));
+  const checks = await Promise.allSettled(spaces().map(async (s) => {
+    const observation = beginSpaceRunnerObservation(s.id);
+    return { space: s, observation, runner: await c.getSpaceRunner(s.id) };
+  }));
   if (!ok() || seq !== impactSeq) return;
   const using: string[] = [];
   let partial = false;
   for (const check of checks) {
     if (check.status === "rejected") partial = true;
-    else if (check.value.runner?.kind === "registered" && check.value.runner.id === runnerId) using.push(check.value.space.name);
+    else if (check.value.runner?.kind === "registered" && check.value.runner.id === runnerId) {
+      const { space, runner, observation } = check.value;
+      using.push(space.name);
+      // Remember exact affected Spaces for a possible deletion, even when
+      // this isn't the installed runner and there was no folder refresh.
+      observation.publish(runner, false);
+    }
   }
   const runner = runners()?.find((r) => r.id === runnerId);
   runnerImpact.set({ runnerId, spaces: using, partial: partial || runner?.visibility === "organization" });
@@ -259,6 +268,9 @@ export async function deleteRunner(runnerId: string): Promise<void> {
     runnerNotice.set(null);
   });
   cancelRunnerAction();
+  const affected = Object.entries(spaceRunners()).flatMap(([sid, assignment]) =>
+    assignment?.kind === "registered" && assignment.id === runnerId && spaces().some((s) => s.id === sid)
+      ? [{ sid, assignment, dispatched: beginSpaceRunnerWrite(sid) }] : []);
   try {
     await c.deleteRunner(runnerId);
     if (!ok()) return;
@@ -268,14 +280,11 @@ export async function deleteRunner(runnerId: string): Promise<void> {
       const shown = revealed();
       if (shown?.kind === "runner" && shown.runnerId === runnerId) dismissReveal();
       runnerNotice.set(`Runner “${runner?.name ?? runnerId}” was deleted. It no longer serves any Space.`);
-      // Spaces it served now have no runner; the next Space list refresh confirms it.
-      const cached = spaceRunners();
-      for (const [sid, r] of Object.entries(cached)) {
-        if (r?.kind !== "registered" || r.id !== runnerId) continue;
-        invalidateSpaceRunnerRequests(sid);
-        beginSpaceRunnerObservation(sid).publish(null);
-      }
     });
+    for (const { sid, assignment, dispatched } of affected) {
+      const latest = acknowledgeSpaceRunnerWrite(sid, dispatched, assignment);
+      if (latest) void reconcileSpaceRunner(sid, latest, () => false).catch(() => {});
+    }
     void loadRunners();
   } catch (error) {
     if (ok()) settingsError(error, runnersError, "Could not delete the runner", () => void loadRunners());
@@ -288,21 +297,7 @@ const onRunnersPage = () => place() === "settings" && settingsSection() === "run
 
 // ------------------------------------------------------------------ Space runner assignments
 
-const spaceRunnerWrites = new Map<string, object>();
-
-function runnerRequest(markers: Map<string, object>, sid: string) {
-  const mark = {};
-  markers.set(sid, mark);
-  const ok = sessionGuard(sid);
-  return () => ok() && markers.get(sid) === mark;
-}
-
-function invalidateSpaceRunnerRequests(sid: string) {
-  invalidateSpaceRunnerObservations(sid);
-  // Keep a new marker even after the action settles: becoming empty again
-  // must not restore consent captured before the action.
-  spaceRunnerWrites.set(sid, {});
-}
+const spaceRunnerWrites = new Map<string, { before: SpaceRunner | null | undefined }>();
 
 /** Capture consent to write to this Space as it was at submission. */
 export function snapshotSpaceRunnerWrite(sid: string) {
@@ -317,19 +312,37 @@ export function beginSpaceRunnerWrite(sid: string, expected: (() => boolean) | u
 export function beginSpaceRunnerWrite(sid: string, expected?: () => boolean) {
   if (expected && !expected()) return null;
   invalidateSpaceRunnerObservations(sid);
-  return runnerRequest(spaceRunnerWrites, sid);
+  const mark = { before: spaceRunners()[sid] };
+  spaceRunnerWrites.set(sid, mark);
+  const ok = sessionGuard(sid);
+  return () => ok() && spaceRunnerWrites.get(sid) === mark;
+}
+
+/** Fence pre-commit reads and mid-write consent without replaying the ack. */
+export function acknowledgeSpaceRunnerWrite(sid: string, dispatched: () => boolean, previous: SpaceRunner | null) {
+  const before = spaceRunnerWrites.get(sid)?.before;
+  const latest = beginSpaceRunnerWrite(sid, dispatched);
+  if (latest) forgetDisprovedSpaceRunner(sid, previous, before);
+  return latest;
 }
 
 /** The POST's reply is historical by the time it arrives. Read the actual assignment. */
 export async function reconcileOwnedSpaceRunner(
   sid: string, stillLatest: () => boolean, matchesReceipt: (runner: SpaceRunner | null) => boolean,
 ) {
-  const c = apiClient();
   const owns = () => spaces().some((s) => s.id === sid && s.role === "owner");
-  if (!c || !stillLatest() || !owns()) return undefined;
+  return reconcileSpaceRunner(sid, () => stillLatest() && owns(), matchesReceipt);
+}
+
+async function reconcileSpaceRunner(
+  sid: string, stillLatest: () => boolean, allowFolderAdd: (runner: SpaceRunner | null) => boolean,
+) {
+  const c = apiClient();
+  const currentScope = () => stillLatest() && spaces().some((s) => s.id === sid);
+  if (!c || !currentScope()) return undefined;
   const observation = beginSpaceRunnerObservation(sid);
   const current = await c.getSpaceRunner(sid);
-  if (!stillLatest() || !owns() || !observation.publish(current, matchesReceipt(current))) return undefined;
+  if (!currentScope() || !observation.publish(current, allowFolderAdd(current))) return undefined;
   return current;
 }
 

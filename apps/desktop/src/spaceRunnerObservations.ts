@@ -18,10 +18,11 @@ export function invalidateSpaceRunnerObservations(sid: string) {
 }
 
 /** A guarded ack disproves the pre-write assignment, not the current one. */
-export function forgetDisprovedSpaceRunner(sid: string, previous: SpaceRunner | null) {
+export function forgetDisprovedSpaceRunner(sid: string, previous: SpaceRunner | null, atDispatch: SpaceRunner | null | undefined) {
   const all = spaceRunners();
   const current = all[sid];
-  if (current !== undefined && current !== previous && !(current && previous?.assignmentRevision &&
+  if (current !== undefined && current !== previous && !(previous === null && current === atDispatch) &&
+      !(current && previous?.assignmentRevision &&
       current.kind === previous.kind && current.assignmentRevision === previous.assignmentRevision)) return;
   const next = { ...all };
   delete next[sid];
