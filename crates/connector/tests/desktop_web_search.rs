@@ -355,3 +355,65 @@ async fn web_search_is_on_by_default_serves_jobs_and_keeps_keys_local() {
     desktop.shutdown().await;
     ui.bridge.stop().await;
 }
+
+/// A settings change that captured the session before a sign-out must not
+/// register the computer or start workers once the session has ended.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_enable_that_lands_after_sign_out_starts_nothing() {
+    use metro_connector::desktop::monitoring::Events;
+    use metro_connector::desktop::web::WebSearch;
+    use metro_connector::web::settings;
+
+    let (base, s) = fake().await;
+    let t = tempfile::tempdir().unwrap();
+    let root = t.path().join("desktop");
+    let web = Arc::new(
+        WebSearch::new(&root, true, Duration::from_millis(30), Events::new(&root))
+            .with_endpoints(endpoints(&base)),
+    );
+    let session = metro_connector::Secret::new("tok-alice");
+    // Off on this computer, so binding starts nothing.
+    let p =
+        metro_connector::desktop::store::profile_for(&root, &base, "alice", "web-search").unwrap();
+    p.ensure().unwrap();
+    let st = settings::Settings {
+        enabled: false,
+        ..Default::default()
+    };
+    settings::save(&p.dir, &st).unwrap();
+    web.session_bound(&base, "alice", &session).await;
+    assert!(s.lock().unwrap().created.is_empty());
+
+    // The UI's enable captured (server, account, token) and is paused while
+    // the person signs out; then it runs.
+    web.session_ended().await;
+    let r = web
+        .update(&base, "alice", &session, Some(true), None, None)
+        .await;
+    assert_eq!(r.unwrap_err().code, "no_session");
+    for (id, k) in [("tavily", "set"), ("tavily", "test")] {
+        let r = match k {
+            "set" => {
+                web.set_key(&base, "alice", id, metro_connector::Secret::new(CANARY))
+                    .await
+            }
+            _ => web.test(&base, "alice", id).await,
+        };
+        assert_eq!(r.unwrap_err().code, "no_session");
+    }
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    let (created, claims) = {
+        let f = s.lock().unwrap();
+        (f.created.len(), f.claims)
+    };
+    assert_eq!(created, 0, "registered after sign-out");
+    assert_eq!(claims, 0, "a worker ran after sign-out");
+    // Another account bound now: the stale change is still refused.
+    web.session_bound(&base, "bob", &metro_connector::Secret::new("tok-bob"))
+        .await;
+    let r = web
+        .update(&base, "alice", &session, Some(true), None, None)
+        .await;
+    assert_eq!(r.unwrap_err().code, "no_session");
+    web.session_ended().await;
+}

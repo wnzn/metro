@@ -72,7 +72,11 @@ pub struct WebSearch {
     endpoints: Result<Endpoints, String>,
     events: Events,
     live: Arc<Mutex<Live>>,
-    ops: tokio::sync::Mutex<()>,
+    /// The lifecycle lock: binding, ending, and every change. Holds the
+    /// (server, account) of the bound session, `None` after sign-out, so a
+    /// change that captured an older session before waiting here is refused
+    /// instead of pairing or starting workers for nobody.
+    ops: tokio::sync::Mutex<Option<(String, String)>>,
 }
 
 fn lock(m: &Mutex<Live>) -> std::sync::MutexGuard<'_, Live> {
@@ -126,7 +130,7 @@ impl WebSearch {
             endpoints: Endpoints::from_env().map_err(|e| clean_line(&e.to_string(), 200)),
             events,
             live: Arc::new(Mutex::new(Live::default())),
-            ops: tokio::sync::Mutex::new(()),
+            ops: tokio::sync::Mutex::new(None),
         }
     }
 
@@ -364,15 +368,30 @@ impl WebSearch {
         Ok(())
     }
 
+    /// The lifecycle lock, if `(server, account)` is still the bound session.
+    async fn bound_ops(
+        &self,
+        server: &str,
+        account: &str,
+    ) -> R<tokio::sync::MutexGuard<'_, Option<(String, String)>>> {
+        let g = self.ops.lock().await;
+        match &*g {
+            Some((s, a)) if s == server && a == account => Ok(g),
+            _ => Err(err(409, "no_session", "Sign in to a Metro server first")),
+        }
+    }
+
     /// A session was bound: serve web search for it, unless it's off here.
     pub async fn session_bound(&self, server: &str, account: &str, session: &Secret) {
-        let _g = self.ops.lock().await;
+        let mut g = self.ops.lock().await;
+        *g = Some((server.to_owned(), account.to_owned()));
         let _ = self.start_locked(server, account, session).await;
     }
 
     /// Sign-out, account switch or exit.
     pub async fn session_ended(&self) {
-        let _g = self.ops.lock().await;
+        let mut g = self.ops.lock().await;
+        *g = None;
         self.stop().await;
     }
 
@@ -465,7 +484,7 @@ impl WebSearch {
         notice_acknowledged: Option<bool>,
         providers: Option<Vec<(String, bool)>>,
     ) -> R<Value> {
-        let _g = self.ops.lock().await;
+        let _g = self.bound_ops(server, account).await?;
         let p = self.profile(server, account)?;
         let list = match providers {
             Some(list) => Some(
@@ -516,6 +535,7 @@ impl WebSearch {
 
     /// `PUT /v1/web-search/providers/{id}/key`: saved on this computer only.
     pub async fn set_key(&self, server: &str, account: &str, id: &str, key: Secret) -> R<Value> {
+        let _g = self.bound_ops(server, account).await?;
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         keys::validate_key(&key).map_err(|e| err(422, "invalid", e.as_str()))?;
@@ -529,6 +549,7 @@ impl WebSearch {
 
     /// `DELETE /v1/web-search/providers/{id}/key`: back to the free mode.
     pub async fn delete_key(&self, server: &str, account: &str, id: &str) -> R<Value> {
+        let _g = self.bound_ops(server, account).await?;
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
@@ -541,6 +562,8 @@ impl WebSearch {
 
     /// `POST /v1/web-search/providers/{id}/test`: one fixed query, now.
     pub async fn test(&self, server: &str, account: &str, id: &str) -> R<Value> {
+        // Checked, not held: a vendor call mustn't delay a sign-out.
+        drop(self.bound_ops(server, account).await?);
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
@@ -552,6 +575,7 @@ impl WebSearch {
 
     /// `POST /v1/web-search/providers/{id}/clear-cooldown` ("Try again now").
     pub async fn clear_cooldown(&self, server: &str, account: &str, id: &str) -> R<Value> {
+        let _g = self.bound_ops(server, account).await?;
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
