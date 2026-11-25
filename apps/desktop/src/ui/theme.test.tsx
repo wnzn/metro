@@ -439,9 +439,9 @@ test("Settings primitives: externally opened confirmation focuses Cancel, restor
   expect(bg(app, "id:fx-external:confirm")).toBe(rgba(dark.primary));
   await app.keyboard.press("tab");
   await app.keyboard.press("enter");
-  await app.waitFor("id:fx-external:confirm >> text:Downloading…");
+  await app.waitFor("id:fx-external:busy >> text:Downloading…");
   expect(app.shows("label:Downloading…")).toBe(true);
-  expect(app.enabled("id:fx-external:confirm")).toBe(false);
+  expect(app.shows("id:fx-external:confirm")).toBe(false);
   expect(app.enabled("id:fx-external:cancel")).toBe(false);
   await app.press("id:fx-reset-open"); // The caller closes after its action completes.
   expect(app.shows("id:fx-external:panel")).toBe(false);
@@ -461,6 +461,32 @@ test("Settings primitives: a no-text confirmation opened from a menu focuses Can
   await app.press("id:fx-external-menu-item");
   await app.keyboard.press("escape");
   expect(app.shows("id:fx-external:panel")).toBe(false);
+  expect(app.shows("id:fx-modal")).toBe(true);
+});
+
+test("Settings primitives: Escape during keyboard-started work keeps the modal open without restarting or dismissing the action", async () => {
+  const app = await open("./settings.fixture.tsx", { platform: "linux", width: 720, height: 900, reducedMotion: true, clock: {} });
+  await app.press("id:fx-auto-settle");
+  await app.press("id:fx-external-open");
+  await app.keyboard.press("tab"); // Cancel → Confirm
+  await app.keyboard.press("enter");
+  expect(app.shows("id:fx-external:busy >> text:Downloading…")).toBe(true);
+  await app.keyboard.press("escape");
+  expect(app.shows("id:fx-modal")).toBe(true);
+  expect(app.shows("id:fx-external:panel")).toBe(true);
+  expect(app.enabled("id:fx-external:cancel")).toBe(false);
+  expect(app.shows("id:fx-external:confirm")).toBe(false);
+  await app.keyboard.press("enter");
+  await app.keyboard.press("space");
+  expect(app.shows("text:Actions started: 1")).toBe(true);
+  await app.clock!.runFor(1000); // Settle without moving focus by clicking another control.
+  expect(app.shows("id:fx-external:panel")).toBe(true);
+  expect(app.shows("id:fx-external:busy")).toBe(false);
+  await app.keyboard.press("enter"); // Focus settles on Cancel, not on the destructive action or somewhere else.
+  expect(app.shows("id:fx-external:panel")).toBe(false);
+  expect(app.shows("text:Actions started: 1")).toBe(true);
+  await app.keyboard.press("enter"); // Cancel restores the original opener.
+  expect(app.shows("id:fx-external:panel")).toBe(true);
   expect(app.shows("id:fx-modal")).toBe(true);
 });
 
@@ -536,15 +562,17 @@ test("Settings primitives: the whole checkbox toggles with keyboard or pointer, 
   expect(app.shows("text:Runner selected: true")).toBe(true);
 });
 
-test("Settings primitives: tagged and passive list rows keep their trailing actions separate", async () => {
+test("Settings primitives: the same nonblank tags are visible and spoken, even with a custom button name", async () => {
   const app = await openSettingsFixture(720, 900);
   await app.waitFor("label:Test provider, default, Update 0.5.0, Online");
   expect(app.shows("id:fx-row:default")).toBe(true);
   expect(bg(app, "id:fx-update-tag")).toBe(rgba(dark.accent));
+  expect(app.shows("id:fx-update-tag >> text:Update 0.5.0")).toBe(true);
+  expect(app.shows("id:fx-blank-tag")).toBe(false);
   expect(app.shows("id:fx-problem")).toBe(true);
   expect(app.shows("id:fx-passive:open")).toBe(false);
   expect(app.shows("id:fx-passive >> label:Passive provider name")).toBe(true);
-  expect(app.shows("id:fx-passive >> label:Organization runner")).toBe(true);
+  expect(app.shows("id:fx-passive-tag >> text:Organization")).toBe(true);
   expect(app.shows("id:fx-passive >> text:Off")).toBe(true);
   await app.press("id:fx-row-action");
   await app.waitFor("text:Last row action: trailing");

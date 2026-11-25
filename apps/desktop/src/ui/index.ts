@@ -15,5 +15,5 @@ export * from "./agentAvatar";
 export type { Space, Tone } from "./tokens";
 export * from "./settings";
 export { ConnectionItem, MoreMenu, ProblemNote } from "./providers";
-export type { MoreMenuItem } from "./providers";
+export type { ConnectionTag, MoreMenuItem } from "./providers";
 export * from "./modelPicker";

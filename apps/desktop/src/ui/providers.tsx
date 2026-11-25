@@ -104,49 +104,60 @@ export function DefaultsLine(props: { entries: readonly DefaultEntry[]; testID?:
 
 // ------------------------------------------------------------------ saved connections
 
-type ConnectionItemTags =
-  | { onPress?: () => void; tags?: undefined; tagsLabel?: never }
-  | { onPress?: undefined; tags: JSX.Element; tagsLabel?: never }
-  | { onPress: () => void; tags: JSX.Element; tagsLabel: string };
+export type ConnectionTag = {
+  label: string;
+  tone?: Tone | "info";
+  variant?: "soft" | "outline";
+  testID?: string;
+};
 
 /**
  * A compact list row: a provider mark (or custom `leading`), name with tags,
  * and a status line. Supply `onPress` for a row that opens details; otherwise
- * only the trailing controls are interactive. Non-interactive `tags` beside
- * the name are read on their own in passive rows; pressable rows need a
- * `tagsLabel` to include them in the button name, even with a custom label.
+ * only the trailing controls are interactive. `tags` describe badges beside
+ * the name: each label does double duty as visible and spoken text. Empty
+ * labels are skipped. In a pressable row the labels join the button name;
+ * in a passive row they are read independently.
  * `children` go under the row.
  */
-export function ConnectionItem(props: ConnectionItemTags & {
+export function ConnectionItem(props: {
   mark?: Mark;
   leading?: JSX.Element;
   name: string;
   isDefault?: boolean;
+  tags?: readonly ConnectionTag[];
   status: { tone: Tone; text: string };
+  onPress?: () => void;
   trailing?: JSX.Element;
   children?: JSX.Element;
   testID?: string;
   accessibilityLabel?: string;
 }) {
   const identityClass = "flex-1 min-w-0 flex-row items-center gap-(--space-3) px-(--space-2) py-(--space-2)";
-  const buttonLabel = () => (props.accessibilityLabel !== undefined
-    ? [props.accessibilityLabel, props.tagsLabel]
-    : [props.name, props.isDefault ? "default" : undefined, props.tagsLabel, props.status.text]).filter(Boolean).join(", ");
+  const tags = () => (props.tags ?? []).map((tag) => ({ ...tag, label: tag.label.trim() })).filter((tag) => tag.label);
+  const buttonLabel = () => {
+    const labels = tags().map((tag) => tag.label);
+    return (props.accessibilityLabel !== undefined
+      ? [props.accessibilityLabel, ...labels]
+      : [props.name, props.isDefault ? "default" : undefined, ...labels, props.status.text]).filter(Boolean).join(", ");
+  };
   const identity = (
     <>
       <If when={props.leading} else={<If when={props.mark}>{(mark) => <BrandMark mark={mark()} size="md" />}</If>}>
         <View class="shrink-0" accessibilityElementsHidden>{props.leading}</View>
       </If>
       <View class="flex-1 min-w-0 flex-col gap-px">
-        <View class={cx("flex-row items-center gap-(--space-2)", !!props.tags && "flex-wrap gap-y-px")}>
-          <Text class={cx(textClass.sm, "font-medium text-foreground", !!props.tags && "shrink min-w-0")} style={{ numberOfLines: 1 }}
+        <View class={cx("flex-row items-center gap-(--space-2)", tags().length > 0 && "flex-wrap gap-y-px")}>
+          <Text class={cx(textClass.sm, "font-medium text-foreground", tags().length > 0 && "shrink min-w-0")} style={{ numberOfLines: 1 }}
             accessibilityLabel={props.onPress ? undefined : props.accessibilityLabel}>
             {props.name}
           </Text>
           <If when={props.isDefault}>
             <Badge tone="neutral" variant="outline" label="Default" testID={props.testID ? `${props.testID}:default` : undefined} />
           </If>
-          {props.tags}
+          <Each of={tags()} key="index">
+            {(tag) => <Badge label={tag().label} tone={tag().tone ?? "neutral"} variant={tag().variant} testID={tag().testID} />}
+          </Each>
         </View>
         <StatusLine tone={props.status.tone} text={props.status.text} testID={props.testID ? `${props.testID}:status` : undefined} />
       </View>

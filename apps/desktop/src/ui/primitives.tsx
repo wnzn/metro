@@ -797,10 +797,11 @@ type ConfirmTrigger =
 
 /**
  * A confirmation scoped to one row. `testID` names the trigger; the panel,
- * warning, input, Cancel and final action use `:panel`, `:warning`, `:input`,
- * `:cancel` and `:confirm`. For a menu trigger or a saving state, control
- * `open` and `onOpenChange`. For an external trigger, omit `triggerLabel`
- * and pass `returnFocus`, which captures the opener when `open` turns true.
+ * warning, input, Cancel, final action and busy status use `:panel`, `:warning`,
+ * `:input`, `:cancel`, `:confirm` and `:busy`. For a menu trigger or a saving
+ * state, control `open` and `onOpenChange`. For an external trigger, omit
+ * `triggerLabel` and pass `returnFocus`, which captures the opener when
+ * `open` turns true. A busy status takes focus in place of the final action.
  * Use the persistent menu button as the opener for a menu item that unmounts.
  * Clear controlled `open` when changing targets, and set it again only on
  * a new user request. Scope invalidation does not write to the parent's state.
@@ -830,6 +831,8 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
   const ready = () => !props.disabled && !props.busy && (props.typeToConfirm === undefined || typed() === props.typeToConfirm);
   const id = (part: string) => props.testID ? `${props.testID}:${part}` : undefined;
   let trigger: ViewRef | undefined;
+  let cancelControl: ViewRef | undefined;
+  let busyFocus: ReturnType<typeof session> = null;
   let wasRequested = false;
   const changeOpen = (next: boolean) => {
     if (props.open === undefined) localOpen.set(next);
@@ -878,14 +881,22 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
   };
   const variant = () => props.variant ?? "destructive";
   const unavailable = () => !!(props.disabled || props.busy);
-  const focusOnOpen = (node: ViewRef) => {
+  const focusInPanel = (node: ViewRef, busy: boolean) => {
     const active = session();
     // The menu may still be releasing focus during the mount. Focus the
     // new control after layout, and never if that open session has ended.
     void node.measure().then((layout) => {
-      if (layout && active === session() && open() && !props.busy) node.focus();
+      if (layout && active === session() && open() && !!props.busy === busy) node.focus();
     });
   };
+  effect(() => {
+    if (props.busy) return;
+    // If the caller leaves the panel open after work settles (e.g. retry),
+    // return busy focus to Cancel, not to the action that just ran.
+    if (busyFocus && busyFocus === untracked(session) && cancelControl) focusInPanel(cancelControl, false);
+    busyFocus = null;
+  });
+  const busyLabel = () => props.busyLabel ?? props.confirmLabel;
   return (
     <View
       class="min-w-0 flex-col"
@@ -928,7 +939,7 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
                 testID={id("input")}
                 disabled={unavailable()}
                 inputRef={(node) => {
-                  if (!unavailable()) focusOnOpen(node);
+                  if (!unavailable()) focusInPanel(node, false);
                 }}
                 onCancel={cancel}
                 verbatim
@@ -938,11 +949,22 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
           <ActionBar>
             <Action label="Cancel" variant="ghost" testID={id("cancel")} onPress={cancel} disabled={props.busy}
               viewRef={(node) => {
-                if (!props.busy && (props.typeToConfirm === undefined || props.disabled)) focusOnOpen(node);
+                cancelControl = node;
+                if (!props.busy && (props.typeToConfirm === undefined || props.disabled)) focusInPanel(node, false);
               }} />
-            <Action label={props.confirmLabel} variant={variant() === "destructive" ? "danger" : "primary"} testID={id("confirm")}
-              onPress={confirm} disabled={!ready()} busy={props.busy} busyLabel={props.busyLabel}
-              accessibilityLabel={props.busy ? props.busyLabel : undefined} />
+            <If when={props.busy} else={
+              <Action label={props.confirmLabel} variant={variant() === "destructive" ? "danger" : "primary"} testID={id("confirm")}
+                onPress={confirm} disabled={!ready()} />
+            }>
+              <View class={cx("flex-row items-center rounded-(--radius-md) bg-muted px-(--space-3)", controlHeightClass.default, focusRing)}
+                ref={(node) => focusInPanel(node, true)}
+                role="summary" focusable captureKeys={["enter", "space"]}
+                accessibilityLabel={busyLabel()} accessibilityState={{ busy: true }} testID={id("busy")}
+                onFocus={() => { busyFocus = session(); }}
+                onBlur={() => { if (props.busy) busyFocus = null; }}>
+                <Text class={cx(textClass.sm, "font-medium text-muted-foreground")} accessibilityElementsHidden>{busyLabel()}</Text>
+              </View>
+            </If>
           </ActionBar>
         </View>
       </If>

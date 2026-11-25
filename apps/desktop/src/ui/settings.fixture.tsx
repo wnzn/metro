@@ -2,7 +2,7 @@
 import { mount, signal, View } from "nsh";
 import type { ViewRef } from "nsh";
 import {
-  Action, Badge, Checkbox, ConfirmInline, ConnectionItem, Field, Label, Modal, ModalNav, ModalNavSection,
+  Action, Checkbox, ConfirmInline, ConnectionItem, Field, Label, Modal, ModalNav, ModalNavSection,
   ModalTab, ModalTabRow, MoreMenu, PageHeader, ProblemNote, ProgressLine, RailButton, RailDivider, ReorderButtons, Row,
   ScrollArea, Surface, compactWidth,
 } from "./index";
@@ -16,10 +16,10 @@ const scopes: PageScope[] = [
   { kind: "organization" },
 ];
 
-// Checked by nsh check: a custom name doesn't excuse missing tag text.
-function invalidPressableTags() {
-  // @ts-expect-error tagged button needs tagsLabel
-  return <ConnectionItem name="Missing tag text" accessibilityLabel="Open details" status={{ tone: "neutral", text: "Off" }} onPress={() => {}} tags={<Badge tone="info" label="Update" />} />;
+// Checked by nsh check: callers can't override derived tag text with an empty string.
+function invalidTagOverride() {
+  // @ts-expect-error spoken tags come from the descriptions, not tagsLabel
+  return <ConnectionItem name="Provider" status={{ tone: "neutral", text: "Off" }} onPress={() => {}} tags={[{ label: "Update" }]} tagsLabel="  " />;
 }
 
 function Fixture() {
@@ -40,6 +40,8 @@ function Fixture() {
   let menuOpener: ViewRef | undefined;
   let opener: ViewRef | undefined;
   const busy = signal(false);
+  const starts = signal(0);
+  const autoSettle = signal(false);
   const position = signal(0);
   const rowAction = signal("none");
   const customName = signal(false);
@@ -77,24 +79,33 @@ function Fixture() {
           items={[{ id: "fx-external-menu-item", label: "Update…", onPress: () => { opener = menuOpener; open.set(true); } }]} />
         <Action label="Require text" testID="fx-external-typed" onPress={() => typedExternal.set(true)} />
         <Action label="Use destructive confirmation" testID="fx-danger-external" onPress={() => destructive.set(true)} />
-        <Action label="Reset parent open" testID="fx-reset-open" onPress={() => open.set(false)} />
+        <Action label="Reset parent open" testID="fx-reset-open" onPress={() => { open.set(false); busy.set(false); }} />
+        <Action label="Settle automatically" testID="fx-auto-settle" onPress={() => autoSettle.set(true)} />
       </Row>
       <Label>{`Parent open: ${open()}`}</Label>
+      <Label>{`Actions started: ${starts()}`}</Label>
       <ConfirmInline open={open()} onOpenChange={open.set} returnFocus={() => opener} scopeKey={target()} typeToConfirm={typedExternal() ? "Exact Name" : undefined}
         variant={destructive() ? "destructive" : "primary"} confirmLabel="Download and verify" message="The app will restart."
-        onConfirm={() => busy.set(true)} busy={busy()} busyLabel="Downloading…" testID="fx-external" />
+        onConfirm={() => {
+          starts.set(starts() + 1);
+          busy.set(true);
+          if (autoSettle()) setTimeout(() => busy.set(false), 1000);
+        }} busy={busy()} busyLabel="Downloading…" testID="fx-external" />
       <ConfirmInline triggerLabel="Remove…" confirmLabel="Remove runner" message="This disconnects the runner." scopeKey={target()}
         onConfirm={() => localConfirmed.set(target())} testID="fx-local" />
       <Label>{`Removed runner: ${localConfirmed()}`}</Label>
       <ConnectionItem name="Test provider" mark={{ letters: "TP", tone: "neutral" }} isDefault status={{ tone: "success", text: "Online" }}
-        tags={<Badge tone="info" label="Update 0.5.0" testID="fx-update-tag" />} tagsLabel="Update 0.5.0"
+        tags={[
+          { label: " Update 0.5.0 ", tone: "info", testID: "fx-update-tag" },
+          { label: "   ", testID: "fx-blank-tag" },
+        ]}
         accessibilityLabel={customName() ? "Open provider details" : undefined}
         onPress={() => rowAction.set("open")} trailing={<Action label="Details" testID="fx-row-action" onPress={() => rowAction.set("trailing")} />}
         testID="fx-row">
         <ProblemNote text="A problem below the tagged row." testID="fx-problem" />
       </ConnectionItem>
       <ConnectionItem name="Passive provider" leading={<Label>PP</Label>} status={{ tone: "neutral", text: "Off" }} testID="fx-passive"
-        tags={<Label accessibilityLabel="Organization runner">Organization</Label>} accessibilityLabel="Passive provider name">
+        tags={[{ label: "Organization", variant: "outline", testID: "fx-passive-tag" }]} accessibilityLabel="Passive provider name">
         <Label>{`Last row action: ${rowAction()}`}</Label>
       </ConnectionItem>
       <Action label="Use custom name" testID="fx-custom-name" onPress={() => customName.set(true)} />
