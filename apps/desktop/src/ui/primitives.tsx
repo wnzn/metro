@@ -1502,11 +1502,30 @@ export function ScopeLine(props: Testable & { scope: PageScope }) {
 }
 
 /** The title block at the top of a page (Settings, a Space's management). */
-export function PageHeader(props: Testable & { title: string; subtitle?: string; scope?: PageScope; children?: JSX.Element }) {
+function useHeadingFocus(wanted: () => boolean | undefined) {
+  const ref = signal<ViewRef | undefined>(undefined);
+  effect(() => {
+    if (!wanted()) return;
+    const node = ref();
+    if (!node) return;
+    let live = true;
+    void node.measure().then(layout => {
+      if (!live || !layout || layout.bounds.size.height <= 0) return;
+      node.reveal({ vertical: "start", animated: false });
+      node.focus();
+    });
+    return () => { live = false; };
+  });
+  return ref.set;
+}
+
+export function PageHeader(props: Testable & { title: string; subtitle?: string; scope?: PageScope; focusTitle?: boolean; children?: JSX.Element }) {
+  const titleRef = useHeadingFocus(() => props.focusTitle);
   return (
     <View class="flex-row items-start gap-(--space-4) pb-(--space-2)" testID={props.testID}>
       <View class="flex-1 min-w-0 flex-col gap-(--space-1)">
-        <Text class={cx(textClass["2xl"], "font-semibold tracking-tight text-foreground")} role="header">
+        <Text class={cx(textClass["2xl"], "font-semibold tracking-tight text-foreground")} role="header"
+          ref={props.focusTitle ? titleRef : undefined} focusable={props.focusTitle}>
           {props.title}
         </Text>
         <If when={props.subtitle}>
@@ -1526,26 +1545,14 @@ export function PageHeader(props: Testable & { title: string; subtitle?: string;
  * them; the card clips the first one's. `focusTitle` is for navigation to a group.
  */
 export function SettingsGroup(props: Testable & { title?: string; description?: string; focusTitle?: boolean; children?: JSX.Element }) {
-  const titleRef = signal<ViewRef | undefined>(undefined);
-  effect(() => {
-    if (!props.focusTitle) return;
-    const node = titleRef();
-    if (!node) return;
-    let live = true;
-    void node.measure().then((layout) => {
-      if (!live || !layout || layout.bounds.size.height <= 0) return;
-      node.reveal({ vertical: "start", animated: false });
-      node.focus();
-    });
-    return () => { live = false; };
-  });
+  const titleRef = useHeadingFocus(() => props.focusTitle);
   return (
     <View class="flex-col gap-(--space-2)" testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
       <If when={props.title || props.description}>
         <View class="flex-col gap-px px-(--space-1)">
           <If when={props.title}>
             <Text class={cx(textClass.sm, "font-semibold text-foreground")} role="header"
-              ref={props.focusTitle ? titleRef.set : undefined} focusable={props.focusTitle}>
+              ref={props.focusTitle ? titleRef : undefined} focusable={props.focusTitle}>
               {props.title}
             </Text>
           </If>
