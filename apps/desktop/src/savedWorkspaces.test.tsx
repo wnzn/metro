@@ -615,10 +615,14 @@ function createdSpace(s: ReturnType<typeof servers>) {
   return [...s.b.state.spaces.values()].find(space => space.name === createdName);
 }
 
-async function submitCreate(s: ReturnType<typeof servers>, app: App) {
+async function startCreate(app: App) {
   await app.press("id:new-space-toggle");
   await app.type("id:new-space-name", createdName);
   await app.press("id:create-space");
+}
+
+async function submitCreate(s: ReturnType<typeof servers>, app: App) {
+  await startCreate(app);
   await app.waitUntil(() => !!createdSpace(s), { timeout: 120 });
   return createdSpace(s)!;
 }
@@ -628,6 +632,22 @@ function holdCreateResponse(s: ReturnType<typeof servers>) {
   s.b.network[`POST ${BASE}/v1/*`] = req => new URL(req.url).pathname === "/v1/spaces"
     ? { ...(post(req) as object), delay: 750 }
     : post(req);
+}
+
+function holdCreateCommit(s: ReturnType<typeof servers>) {
+  const post = s.b.network[`POST ${BASE}/v1/*`]!;
+  let commit: (() => void) | undefined;
+  s.b.network[`POST ${BASE}/v1/*`] = req => {
+    const response = post(req);
+    if (new URL(req.url).pathname !== "/v1/spaces") return response;
+    // Stage the fake's created row outside the visible membership map until
+    // the test commits it, then let the delayed acknowledgement arrive.
+    const space = createdSpace(s)!;
+    s.b.state.spaces.delete(space.id);
+    commit = () => { s.b.state.spaces.set(space.id, space); };
+    return { ...(response as object), delay: 750 };
+  };
+  return { arrived: () => !!commit, release: () => commit!() };
 }
 
 test("successful Create outvotes a pre-create membership omission even if its first room read fails", async () => {
@@ -650,12 +670,100 @@ test("successful Create outvotes a pre-create membership omission even if its fi
   expect(app.shows("id:rooms-empty")).toBe(true); // still in the original Beta
   expect(firstRoomPages(s)).toEqual([]);
   expect(chatStarted(s)).toBe(false);
+  expect(remotePaths(s).filter(p => p === "/v1/spaces")).toHaveLength(3); // two GETs, one POST
 
   failRooms = false;
   await app.press(`id:space:${space.id}`);
   await app.waitUntil(() => firstRoomPages(s).length === 1, { timeout: 160 });
   expect(firstRoomPages(s)).toEqual([`${roomsPath}/lobby/events?after=0`]);
   expect(app.requests().filter(r => r.url === REMOTE + roomsPath)).toHaveLength(2);
+});
+
+for (const move of [false, true]) {
+  test(move ? "moving to Library during Create revalidation wins even when the Space is verified"
+    : "a newer membership snapshot taken before Create commits is rechecked before the Space appears", async () => {
+    const s = servers();
+    const create = holdCreateCommit(s);
+    const app = await launchInEmptyBeta(s);
+    await startCreate(app);
+    await app.waitUntil(create.arrived, { timeout: 120 });
+    await startMembershipProbe(s, app, 35);
+    await app.clock!.runFor(65);
+    expect(createdSpace(s)).toBeUndefined(); // the newer snapshot settled before the server committed
+
+    create.release();
+    const verification = s.b.answerLate("/v1/spaces", TOKENS.bob!, 180);
+    await app.waitUntil(() => verification.arrived() === 1, { timeout: 850 });
+    const space = createdSpace(s)!;
+    expect(app.shows(`id:space:${space.id}`)).toBe(false);
+    expect(firstRoomPages(s)).toEqual([]);
+    if (move) await app.press("id:nav-library");
+    await app.waitFor(`id:space:${space.id}`, { timeout: 250 });
+    const roomsPath = `/v1/spaces/${space.id}/rooms`;
+    if (move) {
+      expect(app.shows("id:library-view")).toBe(true);
+      expect(remotePaths(s)).not.toContain(roomsPath);
+      expect(firstRoomPages(s)).toEqual([]);
+      expect(remotePaths(s).some(p => p.startsWith("/v1/chat/") || p === "/v1/runs")).toBe(false);
+    } else {
+      await app.waitUntil(() => firstRoomPages(s).length === 1, { timeout: 150 });
+      expect(firstRoomPages(s)).toEqual([`${roomsPath}/lobby/events?after=0`]);
+      expect(app.requests().filter(r => r.url === REMOTE + roomsPath)).toHaveLength(1);
+      expect(chatStarted(s)).toBe(false);
+    }
+  });
+}
+
+test("Create cannot resurrect a Space deleted before acknowledgement while the user is in Library", async () => {
+  const s = servers();
+  holdCreateResponse(s);
+  const app = await launchInEmptyBeta(s);
+  const space = await submitCreate(s, app);
+  await app.press("id:nav-library");
+  await app.waitFor("id:library-view", { timeout: 120 });
+  s.b.state.spaces.delete(space.id); // another client deletes the Space after the POST committed
+  await startMembershipProbe(s, app, 35);
+  await app.clock!.runFor(65);
+
+  const verification = s.b.answerLate("/v1/spaces", TOKENS.bob!, 180);
+  await app.waitUntil(() => verification.arrived() === 1, { timeout: 850 });
+  expect(app.shows(`id:space:${space.id}`)).toBe(false);
+  await app.waitFor("id:new-space-name", { state: "gone", timeout: 250 });
+  expect(app.shows(`id:space:${space.id}`)).toBe(false);
+  expect(app.shows("id:library-view")).toBe(true);
+  expect(remotePaths(s)).not.toContain(`/v1/spaces/${space.id}/rooms`);
+  expect(firstRoomPages(s)).toEqual([]);
+  expect(remotePaths(s).some(p => p.startsWith("/v1/chat/") || p === "/v1/runs")).toBe(false);
+  expect(s.b.posts().filter(r => r.path === "/v1/spaces")).toHaveLength(1);
+});
+
+test("an inconclusive overlap check neither publishes the Space nor retries the accepted Create", async () => {
+  const s = servers();
+  const create = holdCreateCommit(s);
+  const get = s.b.network[`GET ${BASE}/v1/*`]!;
+  let checks = 0;
+  let fail = false;
+  s.b.network[`GET ${BASE}/v1/*`] = req => {
+    if (!fail || new URL(req.url).pathname !== "/v1/spaces") return get(req);
+    checks++;
+    return { status: 503, body: { error: "Try again later" }, delay: 80 };
+  };
+  const app = await launchInEmptyBeta(s);
+  await startCreate(app);
+  await app.waitUntil(create.arrived, { timeout: 120 });
+  await startMembershipProbe(s, app, 35);
+  await app.clock!.runFor(65);
+  fail = true;
+  create.release();
+  await app.waitFor("id:new-space-name", { state: "gone", timeout: 950 });
+  const space = createdSpace(s)!;
+  expect(checks).toBe(1);
+  expect(app.shows(`id:space:${space.id}`)).toBe(false);
+  expect(app.shows("id:rooms-empty")).toBe(true);
+  expect(app.shows("id:rooms-error")).toBe(false);
+  expect(remotePaths(s)).not.toContain(`/v1/spaces/${space.id}/rooms`);
+  expect(firstRoomPages(s)).toEqual([]);
+  expect(s.b.posts().filter(r => r.path === "/v1/spaces")).toHaveLength(1);
 });
 
 test("a delayed Create acknowledgement cannot restore a Space already lost to a newer exact denial", async () => {

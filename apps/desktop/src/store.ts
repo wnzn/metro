@@ -670,7 +670,18 @@ export async function createSpace(nameInput: string): Promise<boolean> {
     const request = nextAccessRequest();
     const space = await c.createSpace(name);
     if (!ok()) return false;
-    if (!publishCreatedSpace(space, request) || !stillHere()) return true; // created; don't reopen or retry it
+    if (newerSpaceDenial(space.id, request)) return true;
+    if (lastMembershipRequest > request && !spaces().some(s => s.id === space.id)) {
+      // The newer list may have been taken before the POST committed, or
+      // after the Space disappeared. Only a fresh read can distinguish them.
+      // A failed check doesn't undo the accepted POST or make it safe to retry.
+      const checked = await refreshMembership(c).catch(() => undefined);
+      if (!ok()) return false;
+      const verified = verifiedAccess.get(scopeKey(space.id, "")) ?? 0;
+      if (checked === undefined || verified < checked || newerSpaceDenial(space.id, verified) ||
+        !spaces().some(s => s.id === space.id)) return true;
+    } else if (!publishCreatedSpace(space, request)) return true;
+    if (!stillHere()) return true; // the sidebar may update, but don't override navigation
     const entering = enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
     const navigation = navigationGeneration;
     await entering;
@@ -1644,11 +1655,8 @@ export function spaceRenamed(spaceId: string, name: string) {
   spaces.set(spaces().map((s) => (s.id === spaceId ? { ...s, name } : s)));
 }
 
-/** Reloads the Space list and the active Space's rooms. */
-async function refreshLists(force = false) {
-  const c = client;
-  if (!c) return;
-  if (!force && Date.now() - lastListsRefresh < LISTS_REFRESH_MS) return;
+/** Apply just the ordered membership snapshot, with no room or event reads. */
+async function refreshMembership(c: Client): Promise<number | undefined> {
   const ok = guard();
   const request = nextAccessRequest();
   const settle = trackAccessRead(pendingMembershipReads, request);
@@ -1672,9 +1680,20 @@ async function refreshLists(force = false) {
       const updated = new Set(accepted.map(s => s.id));
       spaces.set([...accepted, ...spaces().filter(s => !updated.has(s.id))]);
     });
+    return request;
   } finally {
     settle();
   }
+}
+
+/** Reloads the Space list and the active Space's rooms. */
+async function refreshLists(force = false) {
+  const c = client;
+  if (!c) return;
+  if (!force && Date.now() - lastListsRefresh < LISTS_REFRESH_MS) return;
+  const ok = guard();
+  const request = await refreshMembership(c);
+  if (!ok() || request !== lastMembershipRequest) return;
   const active = basePlace() === "space" && !switchingSpace() ? activeSpaceId() : null;
   if (active) {
     const read = beginSpaceRead(active);
