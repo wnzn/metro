@@ -27,6 +27,7 @@ pub mod profiles;
 pub mod providers;
 pub mod quick_search;
 pub mod replies;
+pub mod run_retry;
 pub mod runner_pairing;
 pub mod runners;
 pub mod schedules;
@@ -259,6 +260,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs", get(api::list_runs))
         .route("/v1/runs/{id}", get(api::get_run))
         .route("/v1/runs/{id}/stop", post(api::stop_run))
+        .route("/v1/runs/{id}/retry", post(run_retry::retry_run))
         .route(
             "/v1/runners",
             get(runners::list_runners).post(runners::create_runner),

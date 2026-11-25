@@ -890,12 +890,13 @@ pub async fn start_room_run(
         Agent,
         Registry(String),
     }
-    let (sid, rid, aid, task, runs) = (
+    let (sid, rid, aid, task, runs, trigger_id) = (
         space_id.to_owned(),
         room.id.clone(),
         agent.id.clone(),
         truncate(&trigger.text, 200),
         state.runs.clone(),
+        trigger.id,
     );
     // Read the selected agent's current configuration while registering the
     // run. Routing/model selection may have awaited since it was selected.
@@ -912,7 +913,11 @@ pub async fn start_room_run(
             };
             // The stable user id authorizes stops. Create the guard here
             // too in case the caller goes away before receiving the result.
-            let (info, cancel) = match runs.start(&sid, &rid, &user_id, &task) {
+            let origin = crate::orchestration::RunOrigin {
+                agent_id: Some(agent.id.clone()),
+                trigger_event_id: Some(trigger_id),
+            };
+            let (info, cancel) = match runs.start_for(&sid, &rid, &user_id, &task, origin) {
                 Ok(started) => started,
                 Err(error) => return Ok(Err(AcceptanceError::Registry(error))),
             };
