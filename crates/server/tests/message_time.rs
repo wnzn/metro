@@ -379,7 +379,11 @@ async fn events_carry_the_server_recorded_time_and_clients_cannot_set_it() {
 
     // Personal Chat events carry it too.
     let (status, mine) = s
-        .post(ALICE, "/v1/chat/messages", json!({"text": "note to self"}))
+        .post(
+            ALICE,
+            "/v1/chat/messages",
+            json!({"text": "note to self", "save_note": true}),
+        )
         .await;
     assert!(status.is_success(), "{mine}");
     let listed = s.events(ALICE, "/v1/chat/events").await;
