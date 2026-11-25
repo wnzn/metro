@@ -22,6 +22,7 @@ async function signIn(w: W, user: "alice" | "bob" = "alice"): Promise<App> {
 }
 
 const text = (app: App) => app.texts().join(" | ");
+const GUARDED_SELECTION = "/v1/library/settings/selection";
 const lib = (w: W, path: string, method = "GET") => w.l.log.filter((r) => r.path === path && r.method === method);
 /** Anything that would send a file or a query to a model. */
 const modelWork = (w: W) => lib(w, "/v1/library/index", "POST").length + lib(w, "/v1/library/search", "POST").length;
@@ -68,13 +69,14 @@ test("Model choices offers personal media models and discloses data flow; saving
   await app.press("text:/Bob's EG2 server/");
   await app.waitFor("id:library-model-dataflow");
   expect(text(app)).toContain("Shared by bob: it runs on bob's endpoint, so whoever runs that endpoint can see the files and queries sent, and bob may pay for it.");
-  expect(lib(w, "/v1/library/settings", "PUT").length).toBe(0); // nothing saved until Save
+  expect(lib(w, GUARDED_SELECTION, "PUT").length).toBe(0); // nothing saved until Save
 
   await app.press("id:library-model-picker");
   await app.press("text:My EG2 · google/embeddinggemma-2"); // the option, not the connection's row
   await app.press("id:library-model-save");
-  await app.waitUntil(() => lib(w, "/v1/library/settings", "PUT").length === 1);
-  expect(lib(w, "/v1/library/settings", "PUT")[0]!.body).toBe(JSON.stringify({ embedding_id: own }));
+  await app.waitUntil(() => lib(w, GUARDED_SELECTION, "PUT").length === 1);
+  expect(lib(w, GUARDED_SELECTION, "PUT")[0]!.body).toBe(JSON.stringify({ embedding_id: own, expected_embedding_id: null }));
+  expect(lib(w, "/v1/library/settings", "PUT")).toHaveLength(0);
   expect(modelWork(w)).toBe(0);
 
   // Back to the same Library page; still nothing sent to the model until Index.

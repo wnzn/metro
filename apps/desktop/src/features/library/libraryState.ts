@@ -73,7 +73,9 @@ export const modelDraft = signal<string | null>(null);
 export const modelsLoaded = signal(false);
 export const modelsLoading = signal(false);
 export const modelError = signal<string | null>(null);
+export const modelConflict = signal<string | null>(null);
 export const modelNotice = signal<string | null>(null);
+export const mediaSelectionPrecondition = signal(false);
 export const modelsUnsupported = signal(false);
 export const savingModel = signal(false);
 let mediaModelsSeq = 0;
@@ -83,9 +85,16 @@ let mediaIndexRevision = 0;
 export const savedModel = computed(() => mediaModels().find((m) => m.connectionId === savedModelId()) ?? null);
 export const draftModel = computed(() => mediaModels().find((m) => m.connectionId === modelDraft()) ?? null);
 
+export function editMediaModel(id: string | null) {
+  batch(() => {
+    modelDraft.set(id);
+    modelNotice.set(null);
+    modelConflict.set(null);
+  });
+}
+
 export function revertMediaModel() {
-  modelDraft.set(savedModelId());
-  modelNotice.set(null);
+  editMediaModel(savedModelId());
 }
 
 onTransientClear(() => {
@@ -326,19 +335,22 @@ export async function loadModels(): Promise<void> {
     // The server still checks the concrete scope of every index or search.
     const [models, settings] = await Promise.all([c.availableModels(null), api.librarySettings()]);
     if (!live()) return;
-    const edited = modelDraft() !== savedModelId();
+    const previous = savedModelId();
+    const edited = modelDraft() !== previous;
     batch(() => {
       // Only adapters that embed media themselves: a text-only embeddings connection never stands in.
       mediaModels.set(models.filter((m) => m.capability === "embeddings" && m.mediaInputs === true && !!m.model && m.ready !== false));
-      savedModelId.set(settings.embeddingId);
+      adoptMediaSelection(settings.embeddingId);
+      mediaSelectionPrecondition.set(settings.selectionPrecondition);
       suggestedModelId.set(settings.suggestedId);
-      if (!edited) modelDraft.set(settings.embeddingId);
+      if (!edited || previous !== settings.embeddingId) modelDraft.set(settings.embeddingId);
       modelsLoaded.set(true);
     });
   } catch (error) {
     if (!live()) return;
     batch(() => {
       modelsLoaded.set(false);
+      mediaSelectionPrecondition.set(false);
       mediaModels.set([]);
       suggestedModelId.set(null);
     });
@@ -353,32 +365,38 @@ export async function loadModels(): Promise<void> {
   }
 }
 
+function adoptMediaSelection(id: string | null) {
+  if (savedModelId() !== null && id !== savedModelId()) {
+    mediaIndexRevision++;
+    indexStates.set({});
+    libAnswer.set(null);
+    libSearchError.set(null);
+    libSearching.set(false);
+    lessRelevantOpen.set(false);
+  }
+  savedModelId.set(id);
+}
+
 export async function saveModel(confirmed?: { previous: string; next: string | null }): Promise<boolean> {
   const api = library();
   const id = modelDraft();
   const previous = savedModelId();
-  if (!api || !modelsLoaded() || modelsLoading() || savingModel() || id === previous || (id !== null && !draftModel())) return false;
+  if (!api || !mediaSelectionPrecondition() || !modelsLoaded() || modelsLoading() || savingModel() || id === previous || (id !== null && !draftModel())) return false;
   if (previous !== null && (confirmed?.previous !== previous || confirmed.next !== id)) return false;
   const ok = sessionGuard();
   const visit = mediaVisit;
+  let reload = false;
   batch(() => {
     savingModel.set(true);
     modelError.set(null);
+    modelConflict.set(null);
     modelNotice.set(null);
   });
   try {
-    const saved = await api.putLibrarySettings(id);
+    const saved = await api.putLibrarySettings(id, previous);
     if (!ok()) return false;
     batch(() => {
-      if (previous !== null && saved.embeddingId !== previous) {
-        mediaIndexRevision++;
-        indexStates.set({});
-        libAnswer.set(null);
-        libSearchError.set(null);
-        libSearching.set(false);
-        lessRelevantOpen.set(false);
-      }
-      savedModelId.set(saved.embeddingId);
+      adoptMediaSelection(saved.embeddingId);
       modelDraft.set(saved.embeddingId);
       if (saved.suggestedId) suggestedModelId.set(saved.suggestedId);
       if (visit === mediaVisit) modelNotice.set(saved.embeddingId ? "Media model saved." : "Media model cleared. Indexing and file search are off.");
@@ -388,7 +406,27 @@ export async function saveModel(confirmed?: { previous: string; next: string | n
     if (!ok()) return false;
     const detail = serverDetail(error);
     const status = statusOf(error);
-    if (status === 422 || status === 409 || status === 400) {
+    if (status === 409) {
+      reload = true;
+      batch(() => {
+        modelsLoaded.set(false);
+        mediaSelectionPrecondition.set(false);
+        modelDraft.set(savedModelId());
+        if (visit === mediaVisit) {
+          modelConflict.set(detail === "the saved media model changed; reload it before saving"
+            ? "The saved media model changed elsewhere. Your draft was discarded. Review the current selection and choose again."
+            : "The server refused the media model change. Your draft was discarded. Review the current selection and choose again.");
+        }
+      });
+      return false;
+    }
+    if (status === 404 || status === 405) {
+      // A server downgrade or mixed deployment may lack the guarded route.
+      mediaSelectionPrecondition.set(false);
+      modelDraft.set(savedModelId());
+      return false;
+    }
+    if (status === 422 || status === 400) {
       if (visit === mediaVisit) modelError.set(`That connection can't be used for Documents & media${detail ? `: ${detail}` : ""}.`);
       return false;
     }
@@ -396,7 +434,10 @@ export async function saveModel(confirmed?: { previous: string; next: string | n
     if (message && visit === mediaVisit) modelError.set(message);
     return false;
   } finally {
-    if (ok()) savingModel.set(false);
+    if (ok()) {
+      savingModel.set(false);
+      if (reload) await loadModels();
+    }
   }
 }
 
@@ -1102,7 +1143,9 @@ onSessionEnd(() => {
     modelsLoaded.set(false);
     modelsLoading.set(false);
     modelsUnsupported.set(false);
+    mediaSelectionPrecondition.set(false);
     modelError.set(null);
+    modelConflict.set(null);
     modelNotice.set(null);
     savingModel.set(false);
     libQuery.set("");

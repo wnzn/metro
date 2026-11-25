@@ -64,6 +64,7 @@ import {
   confirmingDelete,
   deleting,
   draftModel,
+  editMediaModel,
   fileKindOf,
   fileNotice,
   formatSize,
@@ -84,6 +85,8 @@ import {
   locatorText,
   maxFileBytes,
   mediaModels,
+  mediaSelectionPrecondition,
+  modelConflict,
   modelDraft,
   modelError,
   modelNotice,
@@ -423,6 +426,7 @@ export function MediaModelSettings(props: { separate?: boolean; canReveal?: bool
     ...mediaModels().map((m) => ({ value: m.connectionId, label: `${m.name}${m.model ? ` · ${m.model}` : ""}${m.owned ? "" : ` · shared by ${m.ownerId ?? "someone"}`}` })),
   ];
   const missing = () => modelsLoaded() && !modelsLoading() && modelDraft() !== null && !draftModel();
+  const editable = () => modelsLoaded() && !modelsLoading() && mediaSelectionPrecondition();
   const suggestion = () => {
     const id = suggestedModelId();
     return id && id !== savedModelId() ? mediaModels().find((m) => m.connectionId === id) ?? null : null;
@@ -456,23 +460,26 @@ export function MediaModelSettings(props: { separate?: boolean; canReveal?: bool
         stacked
       >
         <Column gap={2}>
-          <If when={modelsLoaded() && !modelsLoading()}>
+          <If when={editable()}>
             <Picker testID="library-model-picker" accessibilityLabel="Media model" items={items()}
               value={missing() ? null : modelDraft() ?? "none"} placeholder="Unavailable selection"
               disabled={savingModel()} onChange={(v) => {
-                if (!modelsLoaded() || modelsLoading() || savingModel()) return;
-                modelDraft.set(v === "none" ? null : v);
-                modelNotice.set(null);
+                if (!editable() || savingModel()) return;
+                editMediaModel(v === "none" ? null : v);
               }} />
           </If>
-          <If when={missing()}>
+          <If when={modelsLoaded() && !modelsLoading() && !mediaSelectionPrecondition()}>
+            <ProblemNote tone="warning" testID="library-model-guard-unsupported"
+              text="Update Metro Server to change the media model safely. This app won't send an unguarded change." />
+          </If>
+          <If when={editable() && missing()}>
             <ProblemNote tone="warning" testID="library-model-missing"
               text="Choose another media model or clear this selection and save. Metro won't replace it automatically."
-              action={<Action label="Clear selection" testID="library-model-clear" variant="ghost" disabled={savingModel()} onPress={() => modelDraft.set(null)} />} />
+              action={<Action label="Clear selection" testID="library-model-clear" variant="ghost" disabled={savingModel()} onPress={() => editMediaModel(null)} />} />
           </If>
-          <If when={suggestion()}>
+          <If when={editable() ? suggestion() : null}>
             {(s) => <Action testID="library-model-suggested" label={`Use ${s().name}`} variant="ghost"
-              disabled={savingModel() || modelsLoading()} onPress={() => modelDraft.set(s().connectionId)} />}
+              disabled={savingModel()} onPress={() => editMediaModel(s().connectionId)} />}
           </If>
         </Column>
       </SettingRow>
@@ -505,6 +512,9 @@ export function MediaModelFeedback() {
         {(e) => <Banner variant="inline" tone="danger" testID="library-model-error" message={e()}
           action={<Action label="Try again" onPress={() => void loadModels()} />} />}
       </If>
+      <If when={modelConflict()}>
+        {(message) => <Banner variant="inline" tone="warning" testID="library-model-conflict" message={message()} />}
+      </If>
       <If when={modelNotice()}>
         {(n) => <Banner variant="inline" tone="success" testID="library-model-notice" message={n()} />}
       </If>
@@ -514,7 +524,7 @@ export function MediaModelFeedback() {
 
 export function MediaModelSaveBar(props: { separate?: boolean }) {
   const dirty = () => modelDraft() !== savedModelId();
-  const disabled = () => !dirty() || !modelsLoaded() || modelsLoading() || (modelDraft() !== null && !draftModel());
+  const disabled = () => !dirty() || !mediaSelectionPrecondition() || !modelsLoaded() || modelsLoading() || (modelDraft() !== null && !draftModel());
   const save = (confirmed?: { previous: string; next: string | null }) => {
     void saveModel(confirmed).then((saved) => {
       if (saved && savedModelId()) mediaModelAsked.set(false);
@@ -539,7 +549,7 @@ export function MediaModelSaveBar(props: { separate?: boolean }) {
               triggerLabel={modelDraft() === null ? "Clear media model…" : "Change media model…"}
               confirmLabel={modelDraft() === null ? "Clear model and index" : "Change model and clear index"}
               message="This removes your Documents & media index, not your files or anyone else's index. Index your files again to search them with a new model."
-              scopeKey={JSON.stringify([previous(), modelDraft(), modelsLoaded(), modelsLoading()])}
+              scopeKey={JSON.stringify([previous(), modelDraft(), modelsLoaded(), modelsLoading(), mediaSelectionPrecondition()])}
               busy={savingModel()} busyLabel="Saving…" disabled={disabled()}
               onConfirm={() => save({ previous: previous(), next: modelDraft() })} />
           )}

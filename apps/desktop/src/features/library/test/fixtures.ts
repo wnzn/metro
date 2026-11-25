@@ -34,6 +34,9 @@ export function libraryWorld() {
     ranking: "mixed" as "classifier" | "embeddings" | "mixed",
     settings: new Map<string, string | null>(),
     settingsReadStatus: 200,
+    advertisesSelectionPrecondition: true,
+    guardedSelectionRoute: true,
+    selectionConflicts: 0,
     index: new Map<string, Set<string>>(),
     /** Server-configured file limit (bytes). */
     maxFileBytes: 8 * 1024 * 1024,
@@ -146,19 +149,34 @@ export function libraryWorld() {
         return { status: 204, body: "" };
       }
     }
-    if (path === "/v1/library/settings") {
-      if (req.method === "GET") return l.settingsReadStatus === 200
-        ? ok({ embedding_id: l.settings.get(user) ?? null })
+    if (path === "/v1/library/settings" || path === "/v1/library/settings/selection") {
+      const guarded = path.endsWith("/selection");
+      const selection = () => ({ embedding_id: l.settings.get(user) ?? null,
+        ...(l.advertisesSelectionPrecondition ? { selection_precondition: true } : {}) });
+      if (guarded && !l.guardedSelectionRoute) return err(404, "not found");
+      if (!guarded && req.method === "GET") return l.settingsReadStatus === 200
+        ? ok(selection())
         : err(l.settingsReadStatus, "could not load library settings");
       if (req.method === "PUT") {
-        const id = body()?.embedding_id ?? null;
-        const c = id ? (f.state.connections.get(id) as any) : null;
-        if (id && (!c || !(c.owner === user || c.share.visibility === "organization" ||
-          (c.share.visibility === "spaces" && c.share.space_ids.some((sid: string) => member(user, sid) && member(c.owner, sid)))))) return err(409, "that connection cannot be used");
-        if (id && !String(c.provider_id).includes("embeddinggemma-2")) return err(422, "that connection cannot embed documents, images, audio or video");
-        if (id !== (l.settings.get(user) ?? null)) l.index.delete(user);
+        const draft = body();
+        const nullableId = (id: unknown) => id === null || (typeof id === "string" && !!id);
+        if (guarded && (!draft || Object.keys(draft).length !== 2 || !nullableId(draft.embedding_id) || !nullableId(draft.expected_embedding_id))) {
+          return err(422, "both selection fields are required");
+        }
+        const id = draft?.embedding_id ?? null;
+        const c = id ? f.state.connections.get(id) : undefined;
+        if (id && (!c || (c.owner !== user && c.share.visibility !== "organization"))) return err(409, "that connection cannot be used");
+        if (id && !String(c?.provider_id).includes("embeddinggemma-2")) return err(422, "that connection cannot embed documents, images, audio or video");
+        const previous = l.settings.get(user) ?? null;
+        if (guarded && draft.expected_embedding_id !== previous) {
+          l.selectionConflicts++;
+          return err(409, "the saved media model changed; reload it before saving");
+        }
+        // The legacy fixture intentionally ignores unknown fields. A guarded
+        // app must never try that endpoint, even against a permissive server.
+        if (id !== previous) l.index.delete(user);
         l.settings.set(user, id);
-        return ok({ embedding_id: id });
+        return ok(selection());
       }
     }
     if (path === "/v1/library/index" && req.method === "POST") {
