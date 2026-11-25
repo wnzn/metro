@@ -918,3 +918,47 @@ async fn run_now_is_recorded_even_if_its_caller_goes_away() {
         runs(&st, "alice", &task.id)
     );
 }
+
+/// Hold the database lock on another thread until the returned sender is
+/// dropped or used.
+fn hold_lock(db: &Db) -> std::sync::mpsc::Sender<()> {
+    let (release, wait) = std::sync::mpsc::channel::<()>();
+    let (locked, is_locked) = std::sync::mpsc::channel::<()>();
+    let db = db.clone();
+    std::thread::spawn(move || {
+        let _guard = db.lock();
+        locked.send(()).unwrap();
+        let _ = wait.recv();
+    });
+    is_locked.recv().unwrap();
+    release
+}
+
+#[tokio::test]
+async fn run_now_cancelled_while_its_claim_is_pending_is_still_dispatched() {
+    let st = state().await;
+    let fake = Fake::new(Mode::Ok);
+    let task = create(&st, "alice", body(cron("0 3 * * *", "UTC")), t(NOW)).unwrap();
+    let release = hold_lock(&st.db);
+    let (s2, f2, id) = (st.clone(), fake.clone(), task.id.clone());
+    let caller = tokio::spawn(async move {
+        let _ = run_now_with(&s2, "alice", &id, None, f2, StdDuration::from_secs(30)).await;
+    });
+    tokio::time::sleep(StdDuration::from_millis(100)).await;
+    caller.abort();
+    let _ = caller.await;
+    drop(release);
+    for _ in 0..300 {
+        let h = runs(&st, "alice", &task.id);
+        if h.first().is_some_and(|r| r.status != status::DISPATCHING) {
+            assert_eq!(h[0].status, status::DISPATCHED, "{h:?}");
+            assert_eq!(fake.calls().len(), 1);
+            return;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    panic!(
+        "the claimed occurrence was never dispatched: {:?}",
+        runs(&st, "alice", &task.id)
+    );
+}

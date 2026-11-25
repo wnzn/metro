@@ -1440,17 +1440,28 @@ pub async fn run_now_with(
     submit: std::sync::Arc<dyn Submitter>,
     timeout: StdDuration,
 ) -> Result<RunView, ScheduleError> {
-    let (o, i) = (owner.to_owned(), id.to_owned());
-    let (claim, task) = state
-        .db
-        .call(move |db| Ok(claim_now(db, &o, &i, expected_revision, Utc::now())))
-        .await??;
-    // The claimed occurrence is owned by its own task: the caller (an HTTP
-    // handler) going away never leaves it `dispatching` unrecorded.
-    let st = state.clone();
-    tokio::spawn(async move { dispatch_claimed(&st, claim, task, submit.as_ref(), timeout).await })
-        .await
-        .map_err(|e| ScheduleError::Internal(anyhow::anyhow!("dispatching a run now: {e}")))?
+    // One independent task owns the claim, the dispatch and the recording:
+    // the caller (an HTTP handler) going away at any point never leaves a
+    // claimed occurrence `dispatching` unrecorded.
+    let (st, o, i) = (state.clone(), owner.to_owned(), id.to_owned());
+    tokio::spawn(async move {
+        let db_owner = (o.clone(), i.clone());
+        let (claim, task) = st
+            .db
+            .call(move |db| {
+                Ok(claim_now(
+                    db,
+                    &db_owner.0,
+                    &db_owner.1,
+                    expected_revision,
+                    Utc::now(),
+                ))
+            })
+            .await??;
+        dispatch_claimed(&st, claim, task, submit.as_ref(), timeout).await
+    })
+    .await
+    .map_err(|e| ScheduleError::Internal(anyhow::anyhow!("running a run now: {e}")))?
 }
 
 /// Submit exactly the claimed snapshot `task` for `claim` and record the
