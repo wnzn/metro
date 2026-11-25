@@ -262,14 +262,23 @@ The rules below describe the current source. For behaviour added after
   in its agent allowlist; personal Chat has a separate per-account opt-in
   for both, off by default. Provider choices and keys stay on the
   computer; keys go only to their provider, never to Metro. The server
-  relays job arguments and bounded results. Each contacted provider
-  receives a request, even if it fails; a rejected saved key never
-  silently falls back to keyless for that provider. Room readers can see
-  exact accepted queries and URLs, provider attempts and summaries,
-  not raw tool output. Fetch only public URLs a person wrote in the
-  conversation or a search earlier in the same run returned. If no
-  paired device is online at call time, report the tool failure.
-  A scheduled prompt may answer without web data if its model is usable.
+  relays job arguments and bounded results. A contacted provider sees
+  applicable network and auth data and may receive the query or URLs;
+  session setup can fail first. A rejected saved key never silently
+  falls back to keyless for that provider. Activity keeps accepted
+  queries, keywords and non-default result limits, or normalized URLs
+  and focus, plus bounded summaries and attempt outcomes. Snippets and
+  page text are relayed as current-run tool output, not stored or
+  replayed as tool history; replies may quote them. Metro doesn't
+  control vendor or model retention. If no paired device is online at
+  call time, report the tool failure. A scheduled prompt may answer
+  without web data if its model is usable.
+- **Fetch checks provenance, not DNS.** Require an HTTP(S) URL from a
+  person's message available to the run or a structured search result
+  in that run. Reject URL userinfo, blocked IP literals and recognized
+  local hostnames. Metro doesn't check target DNS or control provider
+  redirects; don't describe these checks as proof a URL is public.
+  Warn against submitting private or credential-bearing links.
 - **Pages** are validated Page TSX, not executable user code. Reads are
   as the viewer; Space pages see only their own Space, and personal
   pages have no admin bypass. Actions run as the clicker. Personal-page

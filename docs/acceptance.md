@@ -119,14 +119,21 @@ distinguish unattended `windows-2025` MSI and connector fixture checks
 from the earlier Wine GUI smoke tests. Neither is a GUI verification
 by a person on native Windows. No runtime checks were rerun.
 
+The second docs review checked the web-tool contract at the same cutoff:
+accepted arguments and event summaries, current-run model output, URL
+provenance and host checks, and the hosted MCP initialization sequence.
+This was local source inspection, not a live provider or retention test.
+
 **Runtime copy follow-ups for UX (no code change in this pass):**
 
 - Web Search and About & updates → Privacy use singular provider
-  wording and refer to “this computer.” Explain that each contacted
-  provider sees its request, the server relays the job and bounded
-  results, and the serving device may be another online device of the
-  same account. Align Model choices' privacy summary, and don't promise
-  that adding a free key raises a vendor's limits.
+  wording and refer to “this computer.” Explain that any contacted
+  provider may receive the arguments after setup, the server relays
+  the job and bounded results, and the serving device may be another
+  online device of the same account. Distinguish stored activity from
+  current-run tool output and avoid promising public-only destinations
+  or provider retention limits. Align Model choices' privacy summary,
+  and don't promise that adding a free key raises a vendor's limits.
 - Model connections' **Test and save** explains when the endpoint
   changes, but not that the test sends the configured key to the
   candidate even if the save fails. Disclose that before the test.
