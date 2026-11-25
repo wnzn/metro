@@ -155,6 +155,17 @@ pub mod hooks {
         super::store::forget_connection(conn, connection_id, None).map(drop)
     }
 
+    /// A media connection moved to a different endpoint. In the provider's
+    /// write transaction, invalidate action consent for every user who
+    /// selected it (including borrowers) and purge vectors built with it.
+    pub fn connection_endpoint_changed(
+        tx: &rusqlite::Transaction<'_>,
+        connection_id: &str,
+    ) -> rusqlite::Result<()> {
+        super::store::invalidate_destination(tx, connection_id)?;
+        connection_changed(tx, connection_id)
+    }
+
     /// For the provider owner: a share of `connection_id` (owned by
     /// `owner_id`) was revoked or narrowed. Drops every index other people
     /// built with it. It may drop more than strictly needed (someone who
@@ -177,6 +188,12 @@ pub(crate) fn selection_is(
 ) -> rusqlite::Result<bool> {
     let (current, actual) = store::selection(conn, user)?;
     Ok(actual == revision && current.as_deref() == Some(id))
+}
+
+/// Captured in one SQLite snapshot; the fingerprint never crosses the API.
+struct SelectionBinding {
+    revision: i64,
+    fingerprint: Option<String>,
 }
 
 // ---- Seams ----
@@ -753,10 +770,10 @@ async fn index_with(
     let _permit = permits()
         .try_acquire_owned()
         .map_err(|_| LibrarySearchError::Busy)?;
-    let (routing, revision) = upstream::routing(&state, &who, expected).await?;
+    let (routing, selection) = upstream::routing(&state, &who, expected).await?;
     let (library, models) = upstream::seams(&state, &who);
     let engine =
-        Engine::new(&state.db, &who.id, &library, &models, routing).bind_selection(revision);
+        Engine::new(&state.db, &who.id, &library, &models, routing).bind_selection(selection);
     Ok(Json(engine.index(&ids, bulk).await?))
 }
 
@@ -792,10 +809,10 @@ async fn search_with(
     let _permit = permits()
         .try_acquire_owned()
         .map_err(|_| LibrarySearchError::Busy)?;
-    let (routing, revision) = upstream::routing(&state, &who, expected).await?;
+    let (routing, selection) = upstream::routing(&state, &who, expected).await?;
     let (library, models) = upstream::seams(&state, &who);
     let engine =
-        Engine::new(&state.db, &who.id, &library, &models, routing).bind_selection(revision);
+        Engine::new(&state.db, &who.id, &library, &models, routing).bind_selection(selection);
     Ok(Json(
         engine
             .search(&query, &sources, left_out, limit, body.kind)

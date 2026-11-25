@@ -27,8 +27,7 @@ pub struct Engine<'a> {
     library: &'a dyn Library,
     models: &'a dyn MediaModels,
     routing: Routing,
-    selection_revision: Option<i64>,
-    embedding_fingerprint: OnceLock<String>,
+    selection: Option<SelectionBinding>,
 }
 
 #[derive(Default)]
@@ -105,18 +104,21 @@ impl<'a> Engine<'a> {
             library,
             models,
             routing,
-            selection_revision: None,
-            embedding_fingerprint: OnceLock::new(),
+            selection: None,
         }
     }
 
-    pub fn bind_selection(mut self, revision: i64) -> Self {
-        self.selection_revision = Some(revision);
+    pub(super) fn bind_selection(mut self, selection: SelectionBinding) -> Self {
+        self.selection = Some(selection);
         self
     }
 
+    fn revision(&self) -> Option<i64> {
+        self.selection.as_ref().map(|s| s.revision)
+    }
+
     async fn check_selection(&self) -> Result<(), LibrarySearchError> {
-        if let Some(revision) = self.selection_revision {
+        if let Some(revision) = self.revision() {
             let (user, id) = (self.user.to_owned(), self.embedding()?.to_owned());
             let same = self
                 .db
@@ -129,13 +131,13 @@ impl<'a> Engine<'a> {
         Ok(())
     }
 
-    fn pin_fingerprint(&self, fingerprint: &str) -> Result<(), LibrarySearchError> {
-        if self.selection_revision.is_some()
-            && self
-                .embedding_fingerprint
-                .get_or_init(|| fingerprint.to_owned())
-                != fingerprint
+    async fn check_fingerprint(&self, fingerprint: &str) -> Result<(), LibrarySearchError> {
+        if self
+            .selection
+            .as_ref()
+            .is_some_and(|s| s.fingerprint.as_deref() != Some(fingerprint))
         {
+            self.check_selection().await?;
             return Err(LibrarySearchError::Unusable(
                 "the media embedding connection changed during this operation; try again".into(),
             ));
@@ -203,7 +205,7 @@ impl<'a> Engine<'a> {
         snapshot: i64,
     ) -> Result<usize, LibrarySearchError> {
         let (user, key, conn) = (self.user.to_owned(), source.key(), conn.to_owned());
-        let revision = self.selection_revision;
+        let revision = self.revision();
         Ok(self
             .db
             .call(move |db| {
@@ -364,7 +366,7 @@ impl<'a> Engine<'a> {
             Ok(fp) => fp,
             Err(e) => return Err(self.unusable(e, &source, conn, snapshot).await),
         };
-        self.pin_fingerprint(&fingerprint)?;
+        self.check_fingerprint(&fingerprint).await?;
         // What the connection resolves to now; the store transaction
         // requires the same.
         let grant = self.models.grant();
@@ -422,8 +424,7 @@ impl<'a> Engine<'a> {
                 dest.as_deref(),
                 conn,
                 input,
-                self.selection_revision
-                    .map(|rev| (rev, fingerprint.as_str())),
+                self.revision().map(|rev| (rev, fingerprint.as_str())),
             ),
         )
         .await;
@@ -457,8 +458,14 @@ impl<'a> Engine<'a> {
         // for this destination.
         match self.models.fingerprint(dest.as_deref(), conn).await {
             Ok(fp) if fp == fingerprint => {}
-            Ok(_) => return Err(switched()),
-            Err(e) => return Err(self.unusable(e, &source, conn, snapshot).await),
+            Ok(_) => {
+                self.check_selection().await?;
+                return Err(switched());
+            }
+            Err(e) => {
+                self.check_selection().await?;
+                return Err(self.unusable(e, &source, conn, snapshot).await);
+            }
         }
         // The store transaction revalidates the setting, the file and the
         // grant once more, atomically with the write.
@@ -471,7 +478,7 @@ impl<'a> Engine<'a> {
         );
         let n = parsed.segments.len();
         let partial = parsed.partial;
-        let selection_revision = self.selection_revision;
+        let selection_revision = self.revision();
         let outcome = self
             .db
             .call(move |db| {
@@ -546,7 +553,7 @@ impl<'a> Engine<'a> {
                 source.destination(),
                 conn,
                 protocol::query_request(query),
-                self.selection_revision.map(|rev| (rev, fingerprint)),
+                self.revision().map(|rev| (rev, fingerprint)),
             ),
         )
         .await
@@ -574,7 +581,7 @@ impl<'a> Engine<'a> {
         snapshot: i64,
     ) -> Result<usize, LibrarySearchError> {
         let conn = self.embedding()?.to_owned();
-        let revision = self.selection_revision;
+        let revision = self.revision();
         let (user, key, fp) = (self.user.to_owned(), source.key(), fingerprint.to_owned());
         Ok(self
             .db
@@ -754,7 +761,7 @@ impl<'a> Engine<'a> {
             let state = rerank_state(query, &text);
             let models = self.models;
             let selection = self
-                .selection_revision
+                .revision()
                 .zip(self.routing.embedding.as_deref())
                 .map(|(rev, id)| (id, rev));
             calls.push(Box::pin(async move {
@@ -846,7 +853,7 @@ impl<'a> Engine<'a> {
                     continue;
                 }
             };
-            self.pin_fingerprint(&fp)?;
+            self.check_fingerprint(&fp).await?;
             stale += self.purge_stale(source, &fp, None, snapshot).await?;
             if self.indexed_count(source).await? == 0 {
                 continue;

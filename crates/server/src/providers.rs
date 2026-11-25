@@ -1324,7 +1324,7 @@ pub(crate) async fn media_embed_bound(
         return Err(UseError::MediaUnsupported.into());
     }
     if let Some((revision, fingerprint)) = binding {
-        if fingerprint_of(state, &u.chosen, &u.row)? != fingerprint {
+        if fingerprint_of(&state.providers, &u.chosen, &u.row)? != fingerprint {
             return Err(UseError::TurnChanged.into());
         }
         u.library_selection = Some((connection_id.to_owned(), revision));
@@ -1448,10 +1448,14 @@ pub async fn model_fingerprint(
     id: &str,
 ) -> Result<String, ProviderError> {
     let a = resolve(state, caller, space, id).await?;
-    fingerprint_of(state, &a.chosen, &a.row)
+    fingerprint_of(&state.providers, &a.chosen, &a.row)
 }
 
-fn fingerprint_of(state: &AppState, chosen: &str, row: &Row) -> Result<String, ProviderError> {
+pub(crate) fn fingerprint_of(
+    providers: &ProviderService,
+    chosen: &str,
+    row: &Row,
+) -> Result<String, ProviderError> {
     use sha2::{Digest, Sha256};
     let entry = catalog::find(&row.provider_id).ok_or(UseError::Unsupported)?;
     if row.model.is_empty() {
@@ -1459,9 +1463,7 @@ fn fingerprint_of(state: &AppState, chosen: &str, row: &Row) -> Result<String, P
     }
     let endpoint = match entry.execution {
         Execution::Device => "device".to_owned(),
-        Execution::Server => state
-            .providers
-            .effective_base_url(entry, row.base_url.as_deref())?,
+        Execution::Server => providers.effective_base_url(entry, row.base_url.as_deref())?,
     };
     let mut h = Sha256::new();
     h.update(b"metro.model-fingerprint.v1");

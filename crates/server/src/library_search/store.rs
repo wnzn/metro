@@ -115,7 +115,10 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
             "ALTER TABLE library_search_settings ADD COLUMN selection_rev INTEGER NOT NULL DEFAULT 0;",
         )?;
     }
-    Ok(())
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS library_search_settings_by_embedding
+         ON library_search_settings (embedding_id);",
+    )
 }
 
 /// The write clock now; see the module docs.
@@ -161,6 +164,20 @@ pub fn selection(conn: &Connection, user: &str) -> rusqlite::Result<(Option<Stri
         )
         .optional()?
         .unwrap_or_default())
+}
+
+/// Only selections pointing to the connection whose destination moved.
+/// The caller holds the endpoint update and index purge transaction.
+pub fn invalidate_destination(
+    tx: &rusqlite::Transaction<'_>,
+    connection_id: &str,
+) -> rusqlite::Result<()> {
+    tx.execute(
+        "UPDATE library_search_settings SET selection_rev = selection_rev + 1
+         WHERE embedding_id = ?1",
+        [connection_id],
+    )?;
+    Ok(())
 }
 
 #[cfg(test)]

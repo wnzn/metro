@@ -38,15 +38,33 @@ use crate::auth::Human;
 /// The caller's media embedding connection and System One connection.
 /// The media connection is the library setting only, never the message
 /// search connection.
-pub async fn routing(
+pub(super) async fn routing(
     state: &AppState,
     who: &Human,
     expected: Option<i64>,
-) -> Result<(Routing, i64), LibrarySearchError> {
+) -> Result<(Routing, SelectionBinding), LibrarySearchError> {
     let user = who.id.clone();
-    let (embedding, revision) = state
+    let providers = state.providers.clone();
+    let (embedding, revision, fingerprint) = state
         .db
-        .call(move |db| Ok(super::store::selection(&db.lock(), &user)?))
+        .call(move |db| {
+            let mut conn = db.lock();
+            let read = conn.transaction()?;
+            let (embedding, revision) = super::store::selection(&read, &user)?;
+            // Capture the selected connection's destination in the very same
+            // snapshot. Media shares always use this row (no presets).
+            // Scope and share authorization are still checked per source,
+            // not inferred from this fingerprint.
+            let fingerprint = match embedding.as_deref() {
+                Some(id) if expected.is_none_or(|r| r == revision) => {
+                    crate::providers::store::find(&read, id)?
+                        .and_then(|row| crate::providers::fingerprint_of(&providers, id, &row).ok())
+                }
+                _ => None,
+            };
+            read.commit()?;
+            Ok((embedding, revision, fingerprint))
+        })
         .await?;
     if expected.is_some_and(|expected| revision != expected) {
         return Err(LibrarySearchError::SelectionChanged);
@@ -62,7 +80,10 @@ pub async fn routing(
             embedding,
             classifier: prefs.classifier_id,
         },
-        revision,
+        SelectionBinding {
+            revision,
+            fingerprint,
+        },
     ))
 }
 

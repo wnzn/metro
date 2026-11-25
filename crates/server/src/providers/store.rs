@@ -3,7 +3,7 @@
 //! row there. The only owner-independent reads are [`find`] and the share
 //! queries, which the access rules in [`super::sharing`] gate.
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 
 use super::catalog::Capability;
 
@@ -368,7 +368,12 @@ pub fn patch(
 }
 
 /// Write `row` over `old` inside `tx`; the new `config_rev`.
-fn write(tx: &Connection, old: &Row, row: &Row, endpoint_changed: bool) -> rusqlite::Result<i64> {
+fn write(
+    tx: &Transaction<'_>,
+    old: &Row,
+    row: &Row,
+    endpoint_changed: bool,
+) -> rusqlite::Result<i64> {
     if row.is_default {
         tx.execute(
             "UPDATE provider_connections SET is_default = 0
@@ -406,8 +411,19 @@ fn write(tx: &Connection, old: &Row, row: &Row, endpoint_changed: bool) -> rusql
     // A media connection that now computes something else: everyone's
     // library vectors built with it are stale, in this same transaction.
     // A rename, default flag or key rotation leaves them valid.
-    if (old.model != row.model || endpoint_changed) && media(&old.provider_id) {
-        crate::library_search::hooks::connection_changed(tx, &row.id)?;
+    if (old.model != row.model || endpoint_changed)
+        && let Some(entry) = super::catalog::find(&old.provider_id).filter(|e| e.media_inputs)
+    {
+        // An explicit override equal to the dialect's default is not a
+        // different destination. Do not advance consent for that case.
+        let default = entry.default_base_url.as_deref();
+        if endpoint_changed
+            && old.base_url.as_deref().or(default) != row.base_url.as_deref().or(default)
+        {
+            crate::library_search::hooks::connection_endpoint_changed(tx, &row.id)?;
+        } else {
+            crate::library_search::hooks::connection_changed(tx, &row.id)?;
+        }
     }
     Ok(rev)
 }
