@@ -171,7 +171,7 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
 }
 
 /// `GET|POST /v1/schedules`, `PATCH|DELETE /v1/schedules/{id}`,
-/// `GET /v1/schedules/{id}/history`.
+/// `GET /v1/schedules/{id}/history`, `POST /v1/schedules/{id}/run`.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/v1/schedules", get(list).post(create))
@@ -180,6 +180,7 @@ pub fn router() -> Router<AppState> {
             axum::routing::patch(update).delete(remove),
         )
         .route("/v1/schedules/{id}/history", get(history))
+        .route("/v1/schedules/{id}/run", axum::routing::post(run_now))
 }
 
 // ---- Model ----
@@ -1265,6 +1266,147 @@ pub(crate) async fn process_claims(
     }
 }
 
+// ---- Run now ----
+
+/// Claim a "run now" occurrence of `owner`'s task `id` at `now`: a
+/// `schedule_runs` row like any occurrence (unique on its due time), and
+/// the task's last-run summary. Its schedule (`next_run_at`) is unchanged,
+/// and a paused task stays paused.
+fn claim_now(db: &Db, owner: &str, id: &str, now: DateTime<Utc>) -> Result<Claim, ScheduleError> {
+    let mut conn = db.lock();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let task = get_owned(&tx, owner, id)?;
+    let mut due = ms(now);
+    let run_id = loop {
+        let inserted = tx.execute(
+            "INSERT OR IGNORE INTO schedule_runs \
+             (task_id, owner_id, due_at, status, claimed_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![task.id, task.owner_id, due, status::DISPATCHING, ms(now)],
+        )?;
+        if inserted == 1 {
+            break tx.last_insert_rowid();
+        }
+        due += 1;
+    };
+    tx.execute(
+        "UPDATE schedules SET last_status = ?2, last_run_at = ?3, last_detail = NULL WHERE id = ?1",
+        params![task.id, status::DISPATCHING, due],
+    )?;
+    prune(&tx, &task.id)?;
+    tx.commit()?;
+    Ok(Claim {
+        run_id,
+        task_id: task.id,
+        revision: task.revision,
+        due_at: from_ms(due),
+    })
+}
+
+fn run_view(db: &Db, run_id: i64) -> anyhow::Result<Option<RunView>> {
+    let conn = db.lock();
+    Ok(conn
+        .query_row(
+            "SELECT id, due_at, status, detail, claimed_at, finished_at FROM schedule_runs \
+             WHERE id = ?1",
+            [run_id],
+            |r| {
+                Ok(RunView {
+                    id: r.get(0)?,
+                    due_at: rfc3339(from_ms(r.get(1)?)),
+                    status: r.get(2)?,
+                    detail: r.get(3)?,
+                    claimed_at: rfc3339(from_ms(r.get(4)?)),
+                    finished_at: r.get::<_, Option<i64>>(5)?.map(|v| rfc3339(from_ms(v))),
+                })
+            },
+        )
+        .optional()?)
+}
+
+/// "Run now": submit `owner`'s task `id` once, immediately, through the
+/// same submission path as a scheduled occurrence, and record it in its
+/// history. Only the task's owner can; another person's task and a missing
+/// one both answer 404. Access to the task's Space and room is rechecked
+/// first: without it nothing is recorded or sent (409).
+pub async fn run_now_with(
+    state: &AppState,
+    owner: &str,
+    id: &str,
+    submit: &dyn Submitter,
+    timeout: StdDuration,
+) -> Result<RunView, ScheduleError> {
+    let (o, i) = (owner.to_owned(), id.to_owned());
+    let task = state
+        .db
+        .call(move |db| Ok(get_owned(&db.lock(), &o, &i)))
+        .await??;
+    let (o, target) = (owner.to_owned(), task.target.clone());
+    match state
+        .db
+        .call(move |db| target_access(db, &o, &target))
+        .await?
+    {
+        Access::Ok => {}
+        Access::NoSpace => {
+            return Err(ScheduleError::Conflict(
+                "you're no longer a member of this task's Space; it can't run".to_owned(),
+            ));
+        }
+        Access::NoRoom => {
+            return Err(ScheduleError::Conflict(
+                "this task's room no longer exists; it can't run".to_owned(),
+            ));
+        }
+    }
+    let (o, i) = (owner.to_owned(), id.to_owned());
+    let claim = state
+        .db
+        .call(move |db| Ok(claim_now(db, &o, &i, Utc::now())))
+        .await??;
+    let mut handle = tokio::spawn(submit.submit(
+        state.clone(),
+        task.owner_id.clone(),
+        task.target.clone(),
+        task.prompt.clone(),
+    ));
+    let outcome = match tokio::time::timeout(timeout, &mut handle).await {
+        Ok(joined) => submitted(joined),
+        Err(_) => {
+            let (db, claim) = (state.db.clone(), claim.clone());
+            tokio::spawn(async move {
+                let (st, detail) = describe(&submitted(handle.await), timeout);
+                let result = db
+                    .call(move |db| finish(db, &claim, status::UNKNOWN, st, &detail, Utc::now()))
+                    .await;
+                if let Err(e) = result {
+                    tracing::error!(error = %format!("{e:#}"), "recording a late run-now result");
+                }
+            });
+            Outcome::Unknown
+        }
+    };
+    let (st, detail) = describe(&outcome, timeout);
+    let detail = format!("Run now: {detail}");
+    let claim_id = claim.run_id;
+    state
+        .db
+        .call(move |db| {
+            finish(db, &claim, status::DISPATCHING, st, &detail, Utc::now())?;
+            run_view(db, claim_id)
+        })
+        .await?
+        .ok_or_else(|| ScheduleError::NotFound(NO_TASK))
+}
+
+/// [`run_now_with`] through the interactive routing.
+pub async fn run_now_for(
+    state: &AppState,
+    owner: &str,
+    id: &str,
+) -> Result<RunView, ScheduleError> {
+    run_now_with(state, owner, id, &Routing, SUBMIT_TIMEOUT).await
+}
+
 /// The earliest pending firing of any enabled task.
 pub fn earliest_due(db: &Db) -> anyhow::Result<Option<DateTime<Utc>>> {
     let conn = db.lock();
@@ -1430,4 +1572,15 @@ async fn history(
         .await
         .map_err(ApiError::internal)??;
     Ok(Json(json!({"runs": runs})))
+}
+
+async fn run_now(
+    State(state): State<AppState>,
+    who: Human,
+    Path(id): Path<String>,
+    body: axum::body::Bytes,
+) -> ApiResult<Json<serde_json::Value>> {
+    crate::api::empty_object(&body)?;
+    let run = run_now_for(&state, &who.id, &id).await?;
+    Ok(Json(json!({"run": run})))
 }
