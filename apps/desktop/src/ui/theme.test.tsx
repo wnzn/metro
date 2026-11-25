@@ -464,30 +464,73 @@ test("Settings primitives: a no-text confirmation opened from a menu focuses Can
   expect(app.shows("id:fx-modal")).toBe(true);
 });
 
-test("Settings primitives: Escape during keyboard-started work keeps the modal open without restarting or dismissing the action", async () => {
-  const app = await open("./settings.fixture.tsx", { platform: "linux", width: 720, height: 900, reducedMotion: true, clock: {} });
-  await app.press("id:fx-auto-settle");
+for (const platform of ["linux", "windows"] as const) {
+  test(`Settings primitives: ${platform} idle Escape cancels the confirmation before closing Settings`, async () => {
+    const app = await open("./settings.fixture.tsx", { platform, width: 720, height: 900, reducedMotion: true });
+    await app.press("id:fx-external-open");
+    await app.keyboard.press("enter"); // Verify Cancel was initially focused.
+    expect(app.shows("id:fx-external:panel")).toBe(false);
+    await app.keyboard.press("enter"); // Cancel restored the opener.
+    expect(app.shows("id:fx-external:panel")).toBe(true);
+    await app.keyboard.press("escape"); // On Cancel.
+    expect(app.shows("id:fx-external:panel")).toBe(false);
+    expect(app.shows("id:fx-modal")).toBe(true);
+    await app.keyboard.press("enter"); // Escape also restored the opener.
+    expect(app.shows("id:fx-external:panel")).toBe(true);
+    await app.keyboard.press("tab"); // Cancel → Confirm
+    await app.keyboard.press("escape");
+    expect(app.shows("id:fx-external:panel")).toBe(false);
+    expect(app.shows("id:fx-modal")).toBe(true);
+    await app.keyboard.press("escape"); // With no confirmation active, the modal closes normally.
+    expect(app.shows("id:fx-modal")).toBe(false);
+  });
+
+  test(`Settings primitives: ${platform} busy Escape stays inside the keyboard-started confirmation`, async () => {
+    const app = await open("./settings.fixture.tsx", { platform, width: 720, height: 900, reducedMotion: true, clock: {} });
+    await app.press("id:fx-auto-settle");
+    await app.press("id:fx-external-open");
+    await app.keyboard.press("tab"); // Cancel → Confirm
+    await app.keyboard.press("enter");
+    expect(app.shows("id:fx-external:busy >> text:Downloading…")).toBe(true);
+    await app.keyboard.press("escape"); // The focused status consumes Escape.
+    expect(app.shows("id:fx-modal")).toBe(true);
+    expect(app.shows("id:fx-external:panel")).toBe(true);
+    expect(app.shows("id:fx-external:busy")).toBe(true);
+    expect(app.enabled("id:fx-external:cancel")).toBe(false);
+    expect(app.shows("id:fx-external:confirm")).toBe(false);
+    await app.keyboard.press("enter");
+    await app.keyboard.press("space");
+    expect(app.shows("text:Actions started: 1")).toBe(true);
+    await app.clock!.runFor(1000); // Let work settle without moving focus.
+    expect(app.shows("id:fx-external:panel")).toBe(true);
+    expect(app.shows("id:fx-external:busy")).toBe(false);
+    await app.keyboard.press("enter"); // Focus settled on Cancel, not Confirm.
+    expect(app.shows("id:fx-external:panel")).toBe(false);
+    expect(app.shows("text:Actions started: 1")).toBe(true);
+    await app.keyboard.press("enter"); // Cancel restored the original opener.
+    expect(app.shows("id:fx-external:panel")).toBe(true);
+    expect(app.shows("id:fx-modal")).toBe(true);
+  });
+}
+
+test("Settings primitives: windows typed confirmation keeps exact matching and restores focus after Escape", async () => {
+  const app = await open("./settings.fixture.tsx", { platform: "windows", width: 720, height: 900, reducedMotion: true });
+  await app.press("id:fx-external-typed");
   await app.press("id:fx-external-open");
-  await app.keyboard.press("tab"); // Cancel → Confirm
+  await app.keyboard.press("x");
+  expect(app.value("id:fx-external:input")).toBe("x");
+  expect(app.enabled("id:fx-external:confirm")).toBe(false);
+  await app.clear("id:fx-external:input");
+  await app.type("id:fx-external:input", "Exact Name");
+  expect(app.enabled("id:fx-external:confirm")).toBe(true);
   await app.keyboard.press("enter");
-  expect(app.shows("id:fx-external:busy >> text:Downloading…")).toBe(true);
-  await app.keyboard.press("escape");
-  expect(app.shows("id:fx-modal")).toBe(true);
-  expect(app.shows("id:fx-external:panel")).toBe(true);
-  expect(app.enabled("id:fx-external:cancel")).toBe(false);
-  expect(app.shows("id:fx-external:confirm")).toBe(false);
-  await app.keyboard.press("enter");
-  await app.keyboard.press("space");
-  expect(app.shows("text:Actions started: 1")).toBe(true);
-  await app.clock!.runFor(1000); // Settle without moving focus by clicking another control.
   expect(app.shows("id:fx-external:panel")).toBe(true);
   expect(app.shows("id:fx-external:busy")).toBe(false);
-  await app.keyboard.press("enter"); // Focus settles on Cancel, not on the destructive action or somewhere else.
+  await app.keyboard.press("escape");
   expect(app.shows("id:fx-external:panel")).toBe(false);
-  expect(app.shows("text:Actions started: 1")).toBe(true);
-  await app.keyboard.press("enter"); // Cancel restores the original opener.
-  expect(app.shows("id:fx-external:panel")).toBe(true);
   expect(app.shows("id:fx-modal")).toBe(true);
+  await app.keyboard.press("enter");
+  expect(app.value("id:fx-external:input")).toBe("");
 });
 
 test("Settings primitives: a menu-opener handoff preserves focus and Escape in a typed confirmation", async () => {

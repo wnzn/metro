@@ -6,6 +6,7 @@
 import { effect, keymap, List, Scroll, signal, Text, untracked, View } from "nsh";
 import type { InputRef, JSX, ListRef, ViewRef } from "nsh";
 import { Button, Checkbox as BaseCheckbox, Collapsible, ContextMenu, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
+import type { ButtonProps } from "nsh/base";
 import { Icon, SpaceTile } from "./chrome";
 import type { IconColor, IconName } from "./chrome";
 import {
@@ -246,6 +247,39 @@ export function Label(
 /** The keyboard focus ring every interactive primitive shares. */
 const focusRing = focusRingClass;
 
+/** Only the focused control takes Escape, through the keymap before modal dismissal. */
+function focusedEscape(handler: () => (() => void) | undefined) {
+  const focused = signal(false);
+  effect(() => {
+    if (!focused() || !handler()) return;
+    return keymap.bind("escape", () => handler()?.(), { when: "always", forFocus: true });
+  });
+  return { onFocus: () => focused.set(true), onBlur: () => focused.set(false) };
+}
+
+// NSH's base Button does not expose focus events. Keep its host for ordinary
+// Actions; only controls with a focus-scoped Escape need the View host.
+function EscapeActionButton(props: ButtonProps & { onEscape?: () => void }) {
+  const escape = focusedEscape(() => props.onEscape);
+  return (
+    <View
+      class={props.class}
+      ref={props.ref}
+      role="button"
+      focusable={!props.disabled}
+      disabled={props.disabled}
+      accessibilityState={{ disabled: !!props.disabled }}
+      accessibilityLabel={props.accessibilityLabel ?? undefined}
+      testID={props.testID}
+      onPress={() => props.onPress?.()}
+      onFocus={escape.onFocus}
+      onBlur={escape.onBlur}
+    >
+      {props.children}
+    </View>
+  );
+}
+
 /**
  * - `primary`: the one main action of a view.
  * - `secondary`: an outlined everyday action.
@@ -308,14 +342,18 @@ export function Action(
     icon?: IconName;
     /** For focus handoffs to this action, such as returning from an inline confirmation. */
     viewRef?: (node: ViewRef) => void;
+    /** Consume Escape while this action is focused (e.g. inside an inline confirmation). */
+    onEscape?: () => void;
   },
 ) {
   const variant = () => props.variant ?? "secondary";
   const iconColor = () => actionIconColor[variant()];
   const quiet = () => variant() === "ghost" || variant() === "destructive";
+  const Control = props.onEscape ? EscapeActionButton : Button;
   return (
-    <Button
+    <Control
       ref={props.viewRef}
+      onEscape={props.onEscape}
       class={cx(
         "group flex-row items-center justify-center",
         props.compact ? cx(controlHeightClass.compact, "rounded-(--radius-sm) gap-(--space-1) px-(--space-2)") : cx(controlHeightClass.default, "rounded-(--radius-md) gap-(--space-2) px-(--space-3)"),
@@ -340,7 +378,7 @@ export function Action(
       <Text class={cx(props.compact ? textClass.xs : textClass.sm, "font-medium", actionTextClass[variant()], disabledTextClass)}>
         {props.busy ? props.busyLabel ?? props.label : props.label}
       </Text>
-    </Button>
+    </Control>
   );
 }
 
@@ -897,14 +935,10 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
     busyFocus = null;
   });
   const busyLabel = () => props.busyLabel ?? props.confirmLabel;
+  const triggerEscape = focusedEscape(() => open() ? cancel : undefined);
+  const busyEscape = focusedEscape(() => props.busy && open() ? cancel : undefined);
   return (
-    <View
-      class="min-w-0 flex-col"
-      captureKeys={open() ? ["escape"] : undefined}
-      onKeyDown={(e) => {
-        if (e.key === "Escape" && e.defaultPrevented) cancel();
-      }}
-    >
+    <View class="min-w-0 flex-col">
       <If when={props.triggerLabel}>
         <View
           ref={(node) => (trigger = node)}
@@ -916,6 +950,8 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
           accessibilityState={{ expanded: open(), disabled: unavailable() }}
           accessibilityLabel={props.accessibilityLabel ?? props.triggerLabel}
           testID={props.testID}
+          onFocus={triggerEscape.onFocus}
+          onBlur={triggerEscape.onBlur}
           onPress={() => {
             if (unavailable()) return;
             if (open()) cancel();
@@ -942,26 +978,29 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
                   if (!unavailable()) focusInPanel(node, false);
                 }}
                 onCancel={cancel}
+                // Return neither confirms nor takes the focus out of the field.
+                onSubmit={() => {}}
+                keepFocusOnSubmit
                 verbatim
               />
             </FormRow>
           </If>
           <ActionBar>
-            <Action label="Cancel" variant="ghost" testID={id("cancel")} onPress={cancel} disabled={props.busy}
+            <Action label="Cancel" variant="ghost" testID={id("cancel")} onPress={cancel} onEscape={cancel} disabled={props.busy}
               viewRef={(node) => {
                 cancelControl = node;
                 if (!props.busy && (props.typeToConfirm === undefined || props.disabled)) focusInPanel(node, false);
               }} />
             <If when={props.busy} else={
               <Action label={props.confirmLabel} variant={variant() === "destructive" ? "danger" : "primary"} testID={id("confirm")}
-                onPress={confirm} disabled={!ready()} />
+                onPress={confirm} onEscape={cancel} disabled={!ready()} />
             }>
               <View class={cx("flex-row items-center rounded-(--radius-md) bg-muted px-(--space-3)", controlHeightClass.default, focusRing)}
                 ref={(node) => focusInPanel(node, true)}
                 role="summary" focusable captureKeys={["enter", "space"]}
                 accessibilityLabel={busyLabel()} accessibilityState={{ busy: true }} testID={id("busy")}
-                onFocus={() => { busyFocus = session(); }}
-                onBlur={() => { if (props.busy) busyFocus = null; }}>
+                onFocus={() => { busyFocus = session(); busyEscape.onFocus(); }}
+                onBlur={() => { if (props.busy) busyFocus = null; busyEscape.onBlur(); }}>
                 <Text class={cx(textClass.sm, "font-medium text-muted-foreground")} accessibilityElementsHidden>{busyLabel()}</Text>
               </View>
             </If>
