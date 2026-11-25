@@ -5,7 +5,7 @@
 // library), and message events carry `attachments` metadata. Failure knobs let
 // tests fail one post or one upload deterministically.
 
-import { BASE, header, TOKENS } from "../../../../test/fakeServer";
+import { BASE, header, spaceMessageText, TOKENS } from "../../../../test/fakeServer";
 import { libraryWorld } from "../../library/test/fixtures";
 
 type Req = { method: string; url: string; headers: unknown; body?: string | null };
@@ -59,10 +59,14 @@ export function attachmentWorld() {
     const key = sid === null ? `chat:${user}` : `${sid}/${decodeURIComponent(room![2]!)}`;
     if (!f.state.events.has(key)) f.state.events.set(key, []);
     f.state.log.push({ user, method: "POST", path, body });
-    const asks = chat ? body.save_note !== true && body.invoke_agent !== false : body.invoke_agent === true;
-    f.post(key, { kind: "message", actor: user, actor_id: user, text: body.text ?? "", attachments: files, audience: asks ? "agent" : "room" } as any);
+    const mentions: { kind: string }[] = body.mentions ?? [];
+    const asks = chat ? body.save_note !== true && body.invoke_agent !== false : body.invoke_agent === true || mentions.some(m => m.kind === "agent");
+    const people = !chat && mentions.some(m => m.kind === "user");
+    const audience = asks ? (people ? "mixed" : "agent") : people ? "users" : "room";
+    const fields = chat ? { text: body.text ?? "" } : { ...spaceMessageText(body), mentions };
+    const event = f.post(key, { kind: "message", actor: user, actor_id: user, ...fields, attachments: files, audience } as any);
     if (asks) f.post(key, { kind: "agent", actor: "agent", text: `(agent) re: ${body.text}` });
-    return { status: 202, body: {} };
+    return { status: 202, body: chat ? {} : { ...event, addressing_note: null, routing_note: null } };
   };
 
   const network: Record<string, (req: Req) => unknown> = {};

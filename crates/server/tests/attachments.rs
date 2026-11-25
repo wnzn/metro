@@ -442,6 +442,57 @@ async fn mention_spans_round_trip_in_rooms_threads_and_attachment_events() {
 }
 
 #[tokio::test]
+async fn authoritative_empty_spans_survive_post_poll_and_reopen_with_attachments() {
+    let h = H::start().await;
+    let sid = h.space("Acme", &["bob"]).await;
+    let thread = h
+        .state
+        .db
+        .create_room(&sid, "side", Some("lobby"), 10, 10)
+        .unwrap();
+    let asset = h
+        .upload(
+            "alice",
+            &format!("scope=space&space_id={sid}"),
+            "s.txt",
+            "s",
+        )
+        .await;
+    let bob = json!({"kind": "user", "id": "bob"});
+    for (room, file) in [("lobby", None), (thread.id.as_str(), Some(&asset))] {
+        let mut body = json!({
+            "text": " @bob is literal ", "infer_text_mentions": false, "mentions": [bob],
+        });
+        if let Some(file) = file {
+            body["asset_ids"] = json!([file]);
+        }
+        let (status, event) = h.room("alice", &sid, room, body).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{event}");
+        assert_eq!(event["text"], "@bob is literal");
+        assert_eq!(event["mentions"], json!([bob]));
+        assert_eq!(event["spans"], json!([]));
+        assert!(event.get("activity").is_none());
+        let (_, events) = h.room_events("bob", &sid, room).await;
+        assert_eq!(events[0]["text"], event["text"]);
+        assert_eq!(events[0]["spans"], json!([]));
+        assert_eq!(events[0]["attachments"], event["attachments"]);
+        let stored = Db::open(&h.db_path)
+            .unwrap()
+            .events_after(&sid, room, 0, 10)
+            .unwrap();
+        assert_eq!(stored[0].spans, Some(vec![]));
+        assert!(stored[0].activity.is_none());
+        let (status, legacy) = h
+            .room("alice", &sid, room, json!({"text": "@bob legacy"}))
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{legacy}");
+        assert!(legacy.get("spans").is_none());
+        let (_, events) = h.room_events("bob", &sid, room).await;
+        assert!(events[1].get("spans").is_none());
+    }
+}
+
+#[tokio::test]
 async fn invalid_mention_spans_and_recipients_never_post_or_dispatch() {
     let h = H::start().await;
     h.legacy_chat_inference().await;

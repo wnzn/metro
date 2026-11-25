@@ -20,7 +20,7 @@ type BoundMention = MentionSelection & { readonly mention: MentionRecipient };
 /** Only deliberate picks set `picked`; absent (including older drafts) means automatic. */
 export type MentionAnchor = BoundMention & { readonly picked?: true };
 type MentionDecision =
-  | (MentionSelection & { kind: "ambiguous"; choices: readonly MentionRecipient[] })
+  | (MentionSelection & { kind: "ambiguous"; choices: readonly MentionRecipient[]; preflight?: true })
   | (MentionSelection & { kind: "unresolved" });
 export type MentionDraft = {
   readonly text: string;

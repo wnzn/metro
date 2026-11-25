@@ -274,7 +274,7 @@ pub fn agent_addressed() -> Addressed {
     Addressed {
         mentions: json!([{"kind": "agent"}]),
         audience: "agent".to_owned(),
-        spans: Vec::new(),
+        spans: None,
     }
 }
 
@@ -840,8 +840,8 @@ impl AgentHook for ReasoningSummaries {
 /// Start an agent run in `room` of `space_id` answering `trigger` (already
 /// stored), on behalf of `initiator`. Returns the registered run, or why it
 /// could not start. The run itself proceeds in the background.
-/// `agent` is the Space agent working the run; `pick` says how it was
-/// chosen and is shown on the `started` marker.
+/// `agent` identifies the selected Space agent; its configuration is read
+/// again at acceptance. `pick` records how it was chosen.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_room_run(
     state: &AppState,
@@ -885,17 +885,62 @@ pub async fn start_room_run(
             "The agent is busy with other requests; try again shortly.",
         ));
     };
-    let task = truncate(&trigger.text, 200);
-    // The registry's `actor` is the initiator's stable id: it authorizes stops.
-    let (info, cancel) = match state.runs.start(space_id, &room.id, &user_id, &task) {
+    enum AcceptanceError {
+        Room,
+        Agent,
+        Registry(String),
+    }
+    let (sid, rid, aid, task, runs) = (
+        space_id.to_owned(),
+        room.id.clone(),
+        agent.id.clone(),
+        truncate(&trigger.text, 200),
+        state.runs.clone(),
+    );
+    // Read the selected agent's current configuration while registering the
+    // run. Routing/model selection may have awaited since it was selected.
+    let accepted = state
+        .db
+        .call(move |db| {
+            let mut conn = db.lock();
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            if !crate::db::Db::room_member_in(&tx, &sid, &rid, &user_id)? {
+                return Ok(Err(AcceptanceError::Room));
+            }
+            let Some(agent) = crate::space_agents::get_in(&tx, &sid, &aid)? else {
+                return Ok(Err(AcceptanceError::Agent));
+            };
+            // The stable user id authorizes stops. Create the guard here
+            // too in case the caller goes away before receiving the result.
+            let (info, cancel) = match runs.start(&sid, &rid, &user_id, &task) {
+                Ok(started) => started,
+                Err(error) => return Ok(Err(AcceptanceError::Registry(error))),
+            };
+            let registration = crate::orchestration::Registration::new(runs, info.id.clone());
+            Ok(Ok((info, cancel, registration, agent)))
+        })
+        .await
+        .map_err(|error| {
+            tracing::warn!(%error, "could not check Space run acceptance");
+            Refusal::shown("Could not verify this Space's run. No agent ran.")
+        })?;
+    let (info, cancel, registration, agent) = match accepted {
         Ok(started) => started,
-        Err(e) => {
+        Err(AcceptanceError::Room) => {
+            return Err(Refusal::shown(
+                "This room is no longer available to the sender. No agent ran.",
+            ));
+        }
+        Err(AcceptanceError::Agent) => {
+            return Err(Refusal::shown(
+                "The requested agent is no longer available in this Space. No agent ran.",
+            ));
+        }
+        Err(AcceptanceError::Registry(e)) => {
             state.monitor_space(space_id, Code::AgentBusy).await;
             return Err(e.into());
         }
     };
-    // Ends the run if this start is abandoned before the worker owns it.
-    let registration = crate::orchestration::Registration::new(state.runs.clone(), info.id.clone());
     // The turn is shown as the agent that works it: a thread's agent by the
     // thread's name, otherwise the Space agent's name; never the person who
     // asked. Every event carries the agent's identity.
@@ -920,14 +965,13 @@ pub async fn start_room_run(
         )
         .await;
 
-    let (state, space_id, room, initiator, trigger, run_id, agent) = (
+    let (state, space_id, room, initiator, trigger, run_id) = (
         state.clone(),
         space_id.to_owned(),
         room.clone(),
         initiator.clone(),
         trigger.clone(),
         info.id.clone(),
-        agent.clone(),
     );
     tokio::spawn(async move {
         let _permit = permit;
@@ -1974,7 +2018,7 @@ mod tests {
             actor_id: Some("alice".to_owned()),
             text: text.to_owned(),
             mentions: json!([{"kind": "agent"}]),
-            spans: Vec::new(),
+            spans: None,
             audience: "agent".to_owned(),
             activity: None,
             created_at,

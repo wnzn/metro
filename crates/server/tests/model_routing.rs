@@ -26,6 +26,7 @@ use metro_server::providers::{ProviderError, SelectedModel, UseError};
 use metro_server::{AppState, Config, Limits, ModelConfig, router};
 use reqwest::StatusCode;
 use serde_json::{Value, json};
+use tokio::sync::Notify;
 
 struct FakeAuth;
 
@@ -77,6 +78,20 @@ struct FakeConn {
 /// (user, space, connection, state, questions) of one System One call.
 type Call = (String, Option<String>, String, Value, Value);
 
+struct HeldDecision {
+    question: &'static str,
+    arrived: Notify,
+    release: Notify,
+}
+
+impl HeldDecision {
+    async fn wait(&self) {
+        tokio::time::timeout(Duration::from_secs(5), self.arrived.notified())
+            .await
+            .expect("the held decision was not requested");
+    }
+}
+
 #[derive(Default)]
 struct Fake {
     conns: Mutex<HashMap<String, FakeConn>>,
@@ -87,9 +102,20 @@ struct Fake {
     /// Connections whose (device) endpoint is offline: an upstream-side
     /// failure that has nothing to do with access.
     offline: Mutex<Vec<String>>,
+    hold: Mutex<Option<Arc<HeldDecision>>>,
 }
 
 impl Fake {
+    fn hold(&self, question: &'static str) -> Arc<HeldDecision> {
+        let hold = Arc::new(HeldDecision {
+            question,
+            arrived: Notify::new(),
+            release: Notify::new(),
+        });
+        *self.hold.lock().unwrap() = Some(hold.clone());
+        hold
+    }
+
     fn add(&self, n: char, capability: Capability, grants: Vec<Grant>, model: &str) {
         self.conns.lock().unwrap().insert(
             id(n),
@@ -220,6 +246,11 @@ impl RoutingBackend for Backend {
                 _ => return Err(ProviderError::Use(UseError::NotFound).into()),
             }
             let message = state_payload["message"].as_str().unwrap_or_default();
+            let held = self.0.hold.lock().unwrap().clone();
+            if let Some(held) = held.filter(|held| questions.get(held.question).is_some()) {
+                held.arrived.notify_one();
+                held.release.notified().await;
+            }
             if message.contains("[timeout]") {
                 return std::future::pending().await;
             }
@@ -337,6 +368,10 @@ struct H {
 
 impl H {
     async fn start() -> Self {
+        Self::start_with(Db::open_in_memory().unwrap()).await
+    }
+
+    async fn start_with(db: Db) -> Self {
         let models = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
         let base_url = endpoint(models.clone(), bodies.clone()).await;
@@ -354,9 +389,7 @@ impl H {
             },
             org_admins: Vec::new(),
         };
-        let mut state = AppState::new(config, Db::open_in_memory().unwrap(), Arc::new(FakeAuth))
-            .await
-            .unwrap();
+        let mut state = AppState::new(config, db, Arc::new(FakeAuth)).await.unwrap();
         let fake = Arc::new(Fake::default());
         *fake.base_url.lock().unwrap() = base_url;
         fake.add(
@@ -432,6 +465,26 @@ impl H {
 
     async fn post(&self, who: &str, path: &str, body: Value) -> (StatusCode, Value) {
         self.req(reqwest::Method::POST, who, path, Some(body)).await
+    }
+
+    async fn upload_for_race(&self, sid: &str) -> String {
+        let response = self
+            .http
+            .post(format!(
+                "{}/v1/library/assets?scope=space&space_id={sid}&name=notes.txt",
+                self.base
+            ))
+            .bearer_auth("alice")
+            .header("content-type", "text/plain")
+            .body("An existing upload, not part of the post transaction.")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        response.json::<Value>().await.unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
     }
 
     async fn put_routing(&self, who: &str, body: Value) -> (StatusCode, Value) {
@@ -2036,6 +2089,269 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
 }
 
 #[tokio::test]
+async fn recipient_race_aborts_both_room_and_attachment_writes_without_public_classification() {
+    for with_attachment in [false, true] {
+        for recipient in ["member", "named", "classified"] {
+            let dir = tempfile::tempdir().unwrap();
+            let db_path = dir.path().join("metro.sqlite");
+            let h = H::start_with(Db::open(&db_path).unwrap()).await;
+            let sid = h.space("Commit recipient race").await;
+            let agent = h
+                .agent(
+                    &sid,
+                    json!({"name":"Private Candidate","handle":"candidate","description":"Scripted"}),
+                )
+                .await;
+            assert_eq!(
+                h.put_routing("alice", routing_on(false, true)).await.0,
+                StatusCode::OK
+            );
+            assert_eq!(
+                h.put_prefs("alice", &sid, json!({"classify_unaddressed":true}))
+                    .await
+                    .0,
+                StatusCode::OK,
+            );
+            // The mixed cases wait on generic-agent classification. The
+            // legacy unaddressed case acquires a classifier pick that isn't
+            // in the original request.
+            let mut body = match recipient {
+                "member" => json!({"text":"@bob @agent [yes] review", "infer_text_mentions":false,
+                                  "mentions":[{"kind":"user","id":"bob"},{"kind":"agent"}]}),
+                "named" => {
+                    json!({"text":"@candidate @agent [yes] review", "infer_text_mentions":false,
+                                 "mentions":[{"kind":"agent","agent_id":agent},{"kind":"agent"}]})
+                }
+                _ => json!({"text":"[pick2] review"}),
+            };
+            let asset = if with_attachment {
+                let asset = h.upload_for_race(&sid).await;
+                body["asset_ids"] = json!([asset]);
+                Some(asset)
+            } else {
+                None
+            };
+            let held = h.fake.hold("agent");
+            let path = format!("/v1/spaces/{sid}/rooms/lobby/messages");
+            let revoke = async {
+                held.wait().await;
+                let (suffix, body) = if recipient == "member" {
+                    ("members".to_owned(), Some(json!({"user_id":"bob"})))
+                } else {
+                    (format!("agents/{agent}"), None)
+                };
+                let (s, v) = h
+                    .req(
+                        reqwest::Method::DELETE,
+                        "alice",
+                        &format!("/v1/spaces/{sid}/{suffix}"),
+                        body,
+                    )
+                    .await;
+                assert_eq!(s, StatusCode::OK, "{suffix}: {v}");
+                held.release.notify_one();
+            };
+            let ((status, error), ()) = tokio::join!(h.post("alice", &path, body), revoke);
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert_eq!(error, json!({"error":"unknown recipient"}));
+            assert!(h.events("alice", Some(&sid)).await.is_empty());
+            assert!(h.state.runs.list().is_empty());
+            assert!(h.model_calls().is_empty());
+            assert_eq!(h.fake.calls(), 1);
+            if let Some(asset) = asset {
+                let links: i64 = rusqlite::Connection::open(&db_path)
+                    .unwrap()
+                    .query_row("SELECT COUNT(*) FROM message_attachments", [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(links, 0);
+                // The upload happened separately and remains visible.
+                let content = h
+                    .http
+                    .get(format!("{}/v1/library/assets/{asset}/content", h.base))
+                    .bearer_auth("alice")
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(content.status(), StatusCode::OK);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn recipient_race_after_message_commit_refuses_deleted_agent_at_run_acceptance() {
+    let h = H::start().await;
+    let sid = h.space("Run acceptance race").await;
+    let agent = h
+        .agent(
+            &sid,
+            json!({"name":"Deleted Target","handle":"gone","description":"Scripted"}),
+        )
+        .await;
+    assert_eq!(
+        h.put_routing("alice", routing_on(false, true)).await.0,
+        StatusCode::OK
+    );
+    let held = h.fake.hold("use_case");
+    let path = format!("/v1/spaces/{sid}/rooms/lobby/messages");
+    let body = json!({"text":"please review the code","invoke_agent":true,"agent_id":agent,"infer_text_mentions":false});
+    let revoke = async {
+        held.wait().await;
+        let events = h.events("bob", Some(&sid)).await;
+        assert_eq!(
+            events.len(),
+            1,
+            "only the committed message precedes the routing decision"
+        );
+        assert_eq!(events[0]["mentions"][0]["agent_id"], agent);
+        let (s, v) = h
+            .req(
+                reqwest::Method::DELETE,
+                "alice",
+                &format!("/v1/spaces/{sid}/agents/{agent}"),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        held.release.notify_one();
+    };
+    let ((status, posted), ()) = tokio::join!(h.post("alice", &path, body), revoke);
+    assert_eq!(status, StatusCode::ACCEPTED, "{posted}");
+    assert_eq!(posted["spans"], json!([]));
+    let events = h.events("bob", Some(&sid)).await;
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[1]["kind"], "error");
+    assert_eq!(
+        events[1]["text"],
+        "The requested agent is no longer available in this Space. No agent ran."
+    );
+    assert!(h.state.runs.list().is_empty());
+    assert!(h.model_calls().is_empty());
+    assert_eq!(h.fake.calls(), 1);
+}
+
+#[tokio::test]
+async fn held_routing_uses_the_selected_agents_current_allowlist_at_acceptance() {
+    let h = H::start().await;
+    let sid = h.space("Run configuration race").await;
+    h.state
+        .db
+        .set_runner_token(&sid, &[1; 32])
+        .unwrap()
+        .unwrap();
+    let agent = h
+        .agent(
+            &sid,
+            json!({"name":"Original","handle":"runner","description":"Scripted",
+                   "instructions":"Old instruction.", "tools":["workspace.list","workspace.read"]}),
+        )
+        .await;
+    assert_eq!(
+        h.put_routing("alice", routing_on(false, true)).await.0,
+        StatusCode::OK
+    );
+    let held = h.fake.hold("use_case");
+    let path = format!("/v1/spaces/{sid}/rooms/lobby/messages");
+    let body = json!({"text":"please review the code","invoke_agent":true,"agent_id":agent,"infer_text_mentions":false});
+    let update = async {
+        held.wait().await;
+        assert!(h.bodies.lock().unwrap().is_empty());
+        let (status, edited) = h
+            .req(
+                reqwest::Method::PATCH,
+                "alice",
+                &format!("/v1/spaces/{sid}/agents/{agent}"),
+                Some(json!({"name":"Current","instructions":"Current instruction.","tools":["workspace.read"]})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        assert_eq!(edited["tools"], json!(["workspace.read"]));
+        held.release.notify_one();
+    };
+    let ((status, posted), ()) = tokio::join!(h.post("alice", &path, body), update);
+    assert_eq!(status, StatusCode::ACCEPTED, "{posted}");
+    let id = posted["id"].as_i64().unwrap();
+    let answer = h.answer_after("alice", Some(&sid), id).await;
+    assert_eq!(answer["kind"], "agent", "{answer}");
+    assert_eq!(answer["activity"]["agent"]["id"], agent);
+    assert_eq!(answer["activity"]["agent"]["name"], "Current");
+    let bodies = h.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let tools = bodies[0]["tools"].to_string();
+    assert!(tools.contains("workspace_read"), "{tools}");
+    assert!(!tools.contains("workspace_list"), "{tools}");
+    let messages = bodies[0]["messages"].to_string();
+    assert!(messages.contains("Current instruction."));
+    assert!(!messages.contains("Old instruction."));
+}
+
+#[tokio::test]
+async fn authoritative_posts_return_canonical_text_and_spans_without_inference() {
+    let h = H::start().await;
+    let sid = h.space("Exact dispatch text").await;
+    let thread = h
+        .state
+        .db
+        .create_room(&sid, "follow-up", Some("lobby"), 10, 10)
+        .unwrap();
+    let leading = "\u{2003}  ";
+    let canonical = "🌿 @bob, résumé\ncheck the task";
+    let raw = format!("{leading}{canonical}  \t");
+    let path = format!("/v1/spaces/{sid}/rooms/{}", thread.id);
+    let (status, posted) = h
+        .post(
+            "alice",
+            &format!("{path}/messages"),
+            json!({"text":raw,"invoke_agent":true,"infer_text_mentions":false}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::ACCEPTED, "{posted}");
+    assert_eq!(posted["text"], canonical);
+    assert_eq!(posted["mentions"], json!([{"kind":"agent"}]));
+    assert_eq!(posted["spans"], json!([]));
+    let (status, polled) = h
+        .req(reqwest::Method::GET, "bob", &format!("{path}/events"), None)
+        .await;
+    assert_eq!(status, StatusCode::OK, "{polled}");
+    assert_eq!(polled["events"][0]["text"], canonical);
+    assert_eq!(polled["events"][0]["mentions"], posted["mentions"]);
+    assert_eq!(polled["events"][0]["spans"], posted["spans"]);
+    assert!(
+        h.events("bob", Some(&sid))
+            .await
+            .iter()
+            .all(|event| event["kind"] != "message"),
+        "thread activity may appear in the lobby, but the message must not"
+    );
+    let legacy = h.say("alice", Some(&sid), json!({"text":raw})).await;
+    assert_eq!(legacy["text"], canonical);
+    assert_eq!(legacy["mentions"], json!([{"kind":"user","id":"bob"}]));
+    assert!(legacy.get("spans").is_none());
+
+    let start = canonical.find('@').unwrap();
+    let submitted = start + leading.len();
+    let span = json!({"start":submitted,"end":submitted+4,"index":0});
+    let bound = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text":raw,"infer_text_mentions":false,"mentions":[{"kind":"user","id":"bob"}],"spans":[span]}),
+        )
+        .await;
+    let rebased = json!([{"start":start,"end":start+4,"index":0}]);
+    assert_eq!(bound["text"], canonical);
+    assert_eq!(bound["spans"], rebased);
+    let polled = h.events("bob", Some(&sid)).await;
+    let echo = polled
+        .iter()
+        .find(|event| event["id"] == bound["id"])
+        .unwrap();
+    assert_eq!(echo["text"], canonical);
+    assert_eq!(echo["mentions"], bound["mentions"]);
+    assert_eq!(echo["spans"], rebased);
+}
+
+#[tokio::test]
 async fn authoritative_mentions_leave_stale_text_unaddressed() {
     let h = H::start().await;
     let sid = h.space("stale mention directory").await;
@@ -2063,7 +2379,10 @@ async fn authoritative_mentions_leave_stale_text_unaddressed() {
         assert_eq!(e["text"], *text);
         assert_eq!(e["mentions"], json!([]));
         assert_eq!(e["audience"], "room");
-        assert!(e.get("spans").is_none());
+        assert_eq!(e["spans"], json!([]));
+        let stored = h.events("bob", Some(&sid)).await;
+        let polled = stored.iter().find(|row| row["id"] == e["id"]).unwrap();
+        assert_eq!(polled["spans"], json!([]));
         h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
             .await;
     }
@@ -2073,6 +2392,7 @@ async fn authoritative_mentions_leave_stale_text_unaddressed() {
     for (text, recipient) in cases {
         let e = h.say("alice", Some(&sid), json!({"text": text})).await;
         assert_eq!(e["mentions"], json!([recipient]));
+        assert!(e.get("spans").is_none());
         if recipient["kind"] == "agent" {
             let id = e["id"].as_i64().unwrap();
             let started = h.started_after("alice", &sid, id).await;
@@ -2137,6 +2457,7 @@ async fn authoritative_mentions_preserve_space_classification_and_use_case_routi
         e["mentions"],
         json!([{"kind": "agent", "agent_id": coder, "addressed_by": "classifier"}])
     );
+    assert_eq!(e["spans"], json!([]));
     let id = e["id"].as_i64().unwrap();
     let started = h.started_after("alice", &sid, id).await;
     assert_eq!(started["agent"]["id"], coder.as_str());
@@ -2161,6 +2482,7 @@ async fn authoritative_mentions_preserve_space_classification_and_use_case_routi
         )
         .await;
     assert_eq!(e["mentions"], json!([{"kind": "agent", "agent_id": coder}]));
+    assert_eq!(e["spans"], json!([]));
     let id = e["id"].as_i64().unwrap();
     let started = h.started_after("alice", &sid, id).await;
     assert_eq!(started["agent"]["id"], coder.as_str());
