@@ -1237,69 +1237,159 @@ fn add_activity_columns(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Runs live only in this process, so at startup no turn is active. Every
-/// turn whose last lifecycle event is still `started` gets an
-/// `interrupted` event, so it never looks live forever. One server per
-/// database file is assumed (as for the in-memory run registry).
-fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
-    let now = now_ms();
-    // (scope ids, activity JSON, actor, actor id) of each orphaned start.
-    type Orphan = (Vec<String>, String, String, Option<String>);
-    let orphans = |sql: &str| -> rusqlite::Result<Vec<Orphan>> {
-        let mut stmt = conn.prepare(sql)?;
-        let rows = stmt.query_map([], |r| {
-            Ok((
-                vec![r.get::<_, String>(0)?, r.get::<_, String>(1)?],
-                r.get::<_, String>(2)?,
-                r.get::<_, String>(3)?,
-                r.get::<_, Option<String>>(4)?,
-            ))
-        })?;
-        rows.collect()
+/// One event table's turn scope, for [`interrupt_orphaned_activity`].
+struct ActivityScope {
+    table: &'static str,
+    /// The columns that, with the turn id, identify one turn's events.
+    scope: &'static str,
+    /// The `metro_meta` key of this table's reconciled high-water mark.
+    mark_key: &'static str,
+    insert: &'static str,
+}
+
+const ACTIVITY_SCOPES: [ActivityScope; 2] = [
+    ActivityScope {
+        table: "space_events",
+        scope: "space_id, room_id",
+        mark_key: "activity_reconciled_through:space_events",
+        insert: "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, created_at, activity)
+                 VALUES (?1, ?2, 'activity', ?3, ?4, '', ?5, ?6)",
+    },
+    ActivityScope {
+        table: "personal_events",
+        scope: "user_id",
+        mark_key: "activity_reconciled_through:personal_events",
+        insert: "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, created_at, activity)
+                 VALUES (?1, 'activity', ?3, ?4, '', ?5, ?6)",
+    },
+];
+
+/// (scope ids, activity JSON, actor, actor id) of one orphaned start. The
+/// activity is `None` when it isn't text (a JSONB blob, never written by this
+/// server), so it can't be read back.
+type OrphanedStart = ([String; 2], Option<String>, String, Option<String>);
+
+/// The started event of each turn in `s.table` whose latest lifecycle
+/// event is that start, among turns with an `activity` event above `after`,
+/// oldest first.
+///
+/// A turn is the scope columns plus `json_extract(activity, '$.id')`, the
+/// same comparison as before this pass was set-based. `activity` that
+/// SQLite can't read as JSON belongs to no turn (it was never written by
+/// this server), and so does one without an id; neither ends a turn nor is
+/// interrupted, and neither can make startup fail.
+fn orphaned_starts(
+    conn: &Connection,
+    s: &ActivityScope,
+    after: i64,
+) -> rusqlite::Result<Vec<OrphanedStart>> {
+    let scope_cols = if s.table == "space_events" {
+        "e.space_id, e.room_id"
+    } else {
+        "e.user_id, ''"
     };
+    // 6 = JSON5 text (which includes canonical JSON) or a JSONB blob: what
+    // json_extract reads. The guard comes first, so json_extract never sees
+    // anything it would reject.
+    let sql = format!(
+        "SELECT {scope_cols}, e.activity, e.actor, e.actor_id
+         FROM (SELECT MAX(id) AS last FROM {t}
+               WHERE kind = 'activity' AND id > ?1
+                 AND CASE WHEN json_valid(activity, 6) THEN json_extract(activity, '$.id') END IS NOT NULL
+               GROUP BY {scope}, json_extract(activity, '$.id')) m
+         JOIN {t} e ON e.id = m.last
+         WHERE json_extract(e.activity, '$.phase') = 'started'
+         ORDER BY e.id",
+        t = s.table,
+        scope = s.scope,
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([after], |r| {
+        Ok((
+            [r.get::<_, String>(0)?, r.get::<_, String>(1)?],
+            match r.get_ref(2)? {
+                rusqlite::types::ValueRef::Text(t) => {
+                    std::str::from_utf8(t).ok().map(str::to_owned)
+                }
+                _ => None,
+            },
+            r.get::<_, String>(3)?,
+            r.get::<_, Option<String>>(4)?,
+        ))
+    })?;
+    rows.collect()
+}
+
+/// Runs live only in this process, so at startup no turn is active. Every
+/// turn whose last lifecycle event is still `started` gets exactly one
+/// `interrupted` event in the same scope, by the same actor, so it never
+/// looks live forever. One server per database file is assumed (as for the
+/// in-memory run registry).
+///
+/// The pass is set-based (one grouped scan, not a lookup per started
+/// event), and bounded by a per-table high-water mark: once a pass commits,
+/// every turn whose events all lie at or below the table's AUTOINCREMENT
+/// sequence is closed (or its start can't be read back as an [`Activity`],
+/// which every later pass would skip again), and no new event can get an id
+/// at or below it (the server never inserts an explicit id). So
+/// the next start only needs turns with an `activity` event above the mark:
+/// for such a turn every one of its events above the mark is scanned, and
+/// the newest of them is its newest overall. A mark that isn't a number, or
+/// that is above the sequence (it was reset), is ignored and the whole
+/// table is scanned again. Everything, the mark included, is written in one
+/// transaction, so a crash at any point leaves either nothing or all of it.
+fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let now = now_ms();
     let interrupted = |activity: &str| -> Option<String> {
         let a: Activity = serde_json::from_str(activity).ok()?;
         serde_json::to_string(&a.at(activity::INTERRUPTED)).ok()
     };
-    // The latest lifecycle event of each turn, where that one is `started`.
-    const LATEST_STARTED: &str = "e.kind = 'activity'
-          AND json_extract(e.activity, '$.phase') = 'started'
-          AND NOT EXISTS (SELECT 1 FROM {t} l WHERE l.kind = 'activity' AND l.id > e.id {scope}
-                          AND json_extract(l.activity, '$.id') = json_extract(e.activity, '$.id'))";
-    let space_sql = format!(
-        "SELECT e.space_id, e.room_id, e.activity, e.actor, e.actor_id FROM space_events e WHERE {}",
-        LATEST_STARTED.replace("{t}", "space_events").replace(
-            "{scope}",
-            "AND l.space_id = e.space_id AND l.room_id = e.room_id"
-        )
-    );
-    for (ids, activity, actor, actor_id) in orphans(&space_sql)? {
-        let Some(json) = interrupted(&activity) else {
-            continue;
+    for s in &ACTIVITY_SCOPES {
+        let sequence = |tx: &Transaction<'_>| -> rusqlite::Result<i64> {
+            Ok(tx
+                .query_row(
+                    "SELECT seq FROM sqlite_sequence WHERE name = ?1",
+                    [s.table],
+                    |r| r.get::<_, Option<i64>>(0),
+                )
+                .optional()?
+                .flatten()
+                .unwrap_or(0))
         };
-        conn.execute(
-            "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, created_at, activity)
-             VALUES (?1, ?2, 'activity', ?3, ?4, ?5, ?6, ?7)",
-            params![ids[0], ids[1], actor, actor_id, "", now, json],
-        )?;
+        let seq = sequence(&tx)?;
+        let mark: Option<String> = tx
+            .query_row(
+                "SELECT value FROM metro_meta WHERE key = ?1",
+                [s.mark_key],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let after = mark
+            .as_deref()
+            .and_then(|m| m.parse::<i64>().ok())
+            .filter(|&m| (0..=seq).contains(&m))
+            // Every row, even one inserted by hand with an id below 1.
+            .unwrap_or(i64::MIN);
+        let orphans = orphaned_starts(&tx, s, after)?;
+        let mut stmt = tx.prepare(s.insert)?;
+        for (ids, activity, actor, actor_id) in orphans {
+            let Some(json) = activity.as_deref().and_then(interrupted) else {
+                continue;
+            };
+            stmt.execute(params![ids[0], ids[1], actor, actor_id, now, json])?;
+        }
+        drop(stmt);
+        let through = sequence(&tx)?.to_string();
+        if mark.as_deref() != Some(through.as_str()) {
+            tx.execute(
+                "INSERT INTO metro_meta (key, value) VALUES (?1, ?2)
+                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                params![s.mark_key, through],
+            )?;
+        }
     }
-    let personal_sql = format!(
-        "SELECT e.user_id, '', e.activity, e.actor, e.actor_id FROM personal_events e WHERE {}",
-        LATEST_STARTED
-            .replace("{t}", "personal_events")
-            .replace("{scope}", "AND l.user_id = e.user_id")
-    );
-    for (ids, activity, actor, actor_id) in orphans(&personal_sql)? {
-        let Some(json) = interrupted(&activity) else {
-            continue;
-        };
-        conn.execute(
-            "INSERT INTO personal_events (user_id, kind, actor, actor_id, text, created_at, activity)
-             VALUES (?1, 'activity', ?2, ?3, ?4, ?5, ?6)",
-            params![ids[0], actor, actor_id, "", now, json],
-        )?;
-    }
-    Ok(())
+    tx.commit()
 }
 
 pub(crate) fn new_event(
@@ -1339,6 +1429,10 @@ pub(crate) fn now_ms() -> i64 {
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
 }
+
+#[cfg(test)]
+#[path = "db_activity_tests.rs"]
+mod activity_tests;
 
 #[cfg(test)]
 mod tests {
