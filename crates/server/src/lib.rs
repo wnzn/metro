@@ -20,6 +20,7 @@ pub mod mentions;
 pub mod model_routing;
 pub mod monitoring;
 pub mod orchestration;
+pub mod pages;
 pub mod profiles;
 pub mod providers;
 pub mod quick_search;
