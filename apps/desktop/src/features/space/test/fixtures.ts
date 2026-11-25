@@ -34,6 +34,8 @@ export function spaceWorld() {
     prefs: new Map<string, Prefs>(),
     /** Users with a usable System One connection (the classifier). */
     classifier: new Set<string>(),
+    toolCatalog: [...TOOLS],
+    defaultTools: [...TOOLS] as string[] | undefined,
     log: [] as { user: string; method: string; path: string; body: any }[],
   };
   const agent = (sid: string, a: Partial<FakeAgent> & { name: string; handle: string }): FakeAgent => {
@@ -111,7 +113,7 @@ export function spaceWorld() {
     const list = s.agents.get(sid) ?? [];
     const taken = (handle: string, except?: string) => list.some((a) => a.handle === handle && a.id !== except) || space.members.has(handle);
     if (!aid) {
-      if (req.method === "GET") return ok({ agents: list.map(agentJson), tools: TOOLS });
+      if (req.method === "GET") return ok({ agents: list.map(agentJson), tools: s.toolCatalog, default_tools: s.defaultTools });
       if (req.method === "POST") {
         if (!owner) return err(403, "only the owner can do that");
         if (!/^[a-z0-9_-]{1,32}$/.test(body.handle ?? "")) return err(400, "handle must be 1..=32 of a-z, 0-9, _ and -");

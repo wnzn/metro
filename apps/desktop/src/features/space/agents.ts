@@ -23,6 +23,8 @@ export type AgentList = {
   agents: readonly SpaceAgent[];
   /** Every tool an agent's allowlist may name (the server's catalogue). */
   tools: readonly string[];
+  /** Selected initially only when creating a new agent. */
+  defaultTools: readonly string[];
   error: string | null;
 };
 
@@ -83,22 +85,22 @@ async function loadAgents(spaceId: string): Promise<void> {
   const ok = sessionGuard();
   const live = () => ok() && gen === generation;
   const current = untracked(lists)[spaceId];
-  if (!current) setList(spaceId, { status: "loading", agents: EMPTY, tools: [], error: null });
+  if (!current) setList(spaceId, { status: "loading", agents: EMPTY, tools: [], defaultTools: [], error: null });
   try {
-    const { agents, tools } = await api.spaceAgents(spaceId);
+    const { agents, tools, defaultTools } = await api.spaceAgents(spaceId);
     if (!live()) return;
     checkedAt.set(spaceId, Date.now());
-    setList(spaceId, { status: "ready", agents, tools, error: null });
+    setList(spaceId, { status: "ready", agents, tools, defaultTools, error: null });
   } catch (error) {
     if (!live() || isAborted(error)) return;
     if (error instanceof ApiError && error.kind === "auth") return disconnect(error.message);
     if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) {
       forgetSpaceAgents(spaceId);
-      setList(spaceId, { status: "hidden", agents: EMPTY, tools: [], error: null });
+      setList(spaceId, { status: "hidden", agents: EMPTY, tools: [], defaultTools: [], error: null });
       return;
     }
     const before = untracked(lists)[spaceId];
-    setList(spaceId, { status: before?.status === "ready" ? "ready" : "error", agents: before?.agents ?? EMPTY, tools: before?.tools ?? [], error: describe(error, "Couldn't load this Space's agents") });
+    setList(spaceId, { status: before?.status === "ready" ? "ready" : "error", agents: before?.agents ?? EMPTY, tools: before?.tools ?? [], defaultTools: before?.defaultTools ?? [], error: describe(error, "Couldn't load this Space's agents") });
   }
 }
 

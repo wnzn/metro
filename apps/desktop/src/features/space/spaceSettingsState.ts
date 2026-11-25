@@ -335,7 +335,7 @@ function draftOf(a: SpaceAgent): AgentDraft {
   return { name: a.name, handle: a.handle, handleTouched: true, description: a.description, instructions: a.instructions, tools: [...a.tools], color: a.color };
 }
 
-/** Opens the editor for a new agent: every tool allowed, the next unused colour. */
+/** Opens the editor for a new agent with server defaults and the next unused colour. */
 export function startNewAgent() {
   const sid = spaceSettingsFor();
   if (!sid) return;
@@ -343,7 +343,7 @@ export function startNewAgent() {
   const color = AGENT_COLORS.find((c) => !used.has(c)) ?? AGENT_COLORS[0];
   batch(() => {
     editing.set({ mode: "new" });
-    agentDraft.set({ name: "", handle: "", handleTouched: false, description: "", instructions: "", tools: [...(agentList(sid)?.tools ?? [])], color });
+    agentDraft.set({ name: "", handle: "", handleTouched: false, description: "", instructions: "", tools: [...(agentList(sid)?.defaultTools ?? [])], color });
     pendingPicture.set(null);
     agentError.set(null);
     spaceNotice.set(null);
