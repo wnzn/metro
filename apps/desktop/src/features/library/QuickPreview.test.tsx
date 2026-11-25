@@ -8,31 +8,22 @@
 // is read and drawn, not that a native player shows a video frame.
 
 import { expect, open, test } from "nsh/test";
-import type { App } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { libraryWorld } from "./test/fixtures";
 
 type W = ReturnType<typeof libraryWorld>;
 
-/** Signs in. The Connect press is returned, not awaited: the driver's press waits for in-flight reads, which a test may hold. */
-async function signIn(w: W, user = "alice"): Promise<{ app: App; connecting: Promise<void> }> {
-  const app = await open("./test/QuickHarness.tsx", { network: w.network as any, platform: "linux", width: 1100, height: 900 });
+const REPLY_DELAY = 5_000; // app time, below the client's request timeout
+const BEFORE_REPLY = { timeout: 500 };
+
+async function signIn(w: W, user = "alice") {
+  const app = await open("./test/QuickHarness.tsx", { network: w.network as any, platform: "linux", width: 1100, height: 900, clock: {} });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
-  const connecting = app.press("id:connect");
-  await poll(() => app.shows("id:h-toggle"));
-  return { app, connecting };
-}
-
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
-
-async function poll(cond: () => boolean, ms = 20_000) {
-  const end = Date.now() + ms;
-  while (!cond()) {
-    if (Date.now() > end) throw new Error("condition not reached: " + cond.toString());
-    await new Promise((r) => setTimeout(r, 10));
-  }
+  await app.press("id:connect");
+  await app.waitFor("id:h-toggle", BEFORE_REPLY);
+  return app;
 }
 
 /** A mono 16-bit, 4096 Hz WAV of `frames` samples, each 0x7F00 (loud) or 0 (silent); every byte is under 0x80. */
@@ -74,7 +65,7 @@ function seed(w: W) {
 test("each file shows what it holds, or says why not; reads are authenticated, ranged for text and WAV, and skipped for PDF, MP3 and oversized files", async () => {
   const w = libraryWorld();
   const s = seed(w);
-  const { app } = await signIn(w);
+  const app = await signIn(w);
   await app.waitFor(`id:quick-preview-text:${s.notes.id}`);
   await app.waitFor(`id:quick-preview-wave:${s.half.id}`);
   await app.waitFor(`id:quick-preview-wave:${s.quiet.id}`);
@@ -124,22 +115,19 @@ test("each file shows what it holds, or says why not; reads are authenticated, r
 });
 
 test("reads are held to two in flight; hiding the rows aborts them, queued ones are never read, and a late answer draws nothing", async () => {
-  // The test network answers its handlers one at a time, so "two at once" is
-  // checked as: with every read held, hiding the rows leaves at most the two
-  // already started ever reaching the server.
+  // NSH serves JS route handlers serially. Return a delayed response instead
+  // of parking the handler itself, so both requests can reach the fake server.
   const w = libraryWorld();
   const s = seed(w);
-  const release = w.holdContent();
-  const { app, connecting } = await signIn(w);
-  await poll(() => w.l.contentParked >= 1);
-  await sleep(300); // not app.wait: the driver's waits wait for the held reads too
+  w.delayContent(REPLY_DELAY);
+  const app = await signIn(w);
+  await app.waitUntil(() => reads(w).length >= 2, BEFORE_REPLY);
   expect(app.shows(`id:quick-preview-loading:${s.notes.id}`)).toBe(true);
 
-  const toggling = app.press("id:h-toggle"); // every row unmounts while reads are held
-  await poll(() => !app.shows("id:h-row:row-0"));
-  release();
-  await Promise.all([toggling, connecting]);
-  await app.wait(300);
+  await app.press("id:h-toggle"); // every row unmounts while reads are held
+  await app.waitFor("id:h-row:row-0", { ...BEFORE_REPLY, state: "gone" });
+  w.delayContent(0);
+  await app.clock!.runFor(REPLY_DELAY);
   expect(reads(w).length).toBeLessThanOrEqual(2); // nothing queued was read after the rows went
   expect(reads(w, s.notes.id)).toHaveLength(0);
   expect(app.shows(`id:quick-preview-text:${s.notes.id}`)).toBe(false);
@@ -154,7 +142,7 @@ test("reads are held to two in flight; hiding the rows aborts them, queued ones 
 test("two rows of one file share one read; pointing a row at another file releases the old one", async () => {
   const w = libraryWorld();
   const s = seed(w);
-  const { app } = await signIn(w);
+  const app = await signIn(w);
   const first = s.acme.id; // the list's first file (added last)
   await app.waitFor(`id:quick-preview-image:${first}`);
   await app.press("id:h-dup");
@@ -178,7 +166,7 @@ test("two rows of one file share one read; pointing a row at another file releas
 test("losing a Space drops its previews at once; sign-out drops everything and a late read never reaches the next person", async () => {
   const w = libraryWorld();
   const s = seed(w);
-  const { app } = await signIn(w);
+  const app = await signIn(w);
   await app.waitFor(`id:quick-preview-image:${s.acme.id}`);
   w.f.state.spaces.get("acme")!.members.delete("alice");
   await app.waitFor(`id:quick-preview-none:${s.acme.id}`, { timeout: 15_000 });
@@ -188,18 +176,17 @@ test("losing a Space drops its previews at once; sign-out drops everything and a
 
   // Hide, then park reads, show again and sign out while they're parked.
   await app.press("id:h-toggle");
-  const release = w.holdContent();
-  const showing = app.press("id:h-toggle");
-  await poll(() => w.l.contentParked >= 1);
-  const signingOut = app.press("id:h-signout");
-  await poll(() => app.shows("id:connect"));
-  release();
-  await Promise.all([showing, signingOut]);
+  const before = reads(w).length;
+  w.delayContent(REPLY_DELAY);
+  await app.press("id:h-toggle");
+  await app.waitUntil(() => reads(w).length > before, BEFORE_REPLY);
+  await app.press("id:h-signout");
+  await app.waitFor("id:connect", BEFORE_REPLY);
+  w.delayContent(0);
   await app.type("id:access-token", TOKENS.bob!);
   await app.press("id:connect");
-  await app.waitFor("id:h-toggle");
-  await app.waitUntil(() => w.l.contentParked === 0);
-  await app.wait(300);
+  await app.waitFor("id:h-toggle", BEFORE_REPLY);
+  await app.clock!.runFor(REPLY_DELAY);
   const text = app.texts().join(" | ");
   expect(text).not.toContain("Rollback plan");
   expect(text).not.toContain("notes.md");
@@ -209,7 +196,7 @@ test("losing a Space drops its previews at once; sign-out drops everything and a
 test("past the row budget a preview says so instead of reading", async () => {
   const w = libraryWorld();
   const ids = Array.from({ length: 14 }, (_, i) => w.addAsset("alice", null, `n${String(i).padStart(2, "0")}.txt`, `note ${i}`).id);
-  const { app } = await signIn(w);
+  const app = await signIn(w);
   await app.waitUntil(() => ids.filter((id) => app.shows(`id:quick-preview-text:${id}`)).length === 12);
   await app.wait(200);
   // The two past the budget show their type's glyph, with the reason in its accessible name.

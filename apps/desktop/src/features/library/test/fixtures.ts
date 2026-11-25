@@ -26,6 +26,7 @@ const EXT: Record<string, { kind: string; mimes: string[] }> = {
 export function libraryWorld() {
   const f = world();
   let next = 1;
+  let contentDelay = 0;
   const uuid = () => `00000000-0000-4000-8000-${String(next++).padStart(12, "0")}`;
   const l = {
     assets: [] as FakeAsset[],
@@ -127,7 +128,7 @@ export function libraryWorld() {
             })()
           : { status: 200, headers: { "content-type": a.mime_type, "cache-control": "no-store" }, body: a.bytes };
         const gate = l.contentGate;
-        if (!gate) return answer;
+        if (!gate) return { ...answer, delay: contentDelay };
         l.contentParked++;
         return gate.promise.then(() => {
           l.contentParked--;
@@ -206,5 +207,7 @@ export function libraryWorld() {
       open();
     };
   };
-  return { f, l, network, addAsset, addMediaConnection, holdContent };
+  /** Delay subsequent content replies on NSH's clock without blocking other routes. */
+  const delayContent = (ms: number) => { contentDelay = ms; };
+  return { f, l, network, addAsset, addMediaConnection, holdContent, delayContent };
 }
