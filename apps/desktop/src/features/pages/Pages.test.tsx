@@ -2,7 +2,7 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { launched } from "../../../test/launched";
-import { DRAFT, pagesFixture, PERSONAL, TEAM } from "./test/fixtureServer";
+import { briefSpec, DRAFT, pagesFixture, PERSONAL, TEAM } from "./test/fixtureServer";
 import { stamp } from "./test/sample";
 
 type Fixture = ReturnType<typeof pagesFixture>;
@@ -193,6 +193,7 @@ test("Schedule consent sends the exact displayed version and revision, never ret
   await app.waitFor("id:page-action-confirm");
   expect(text(app)).toContain("Send the exact release summary");
   expect(text(app)).toContain("Release reminder");
+  expect(text(app)).toContain("Acme › Renamed room");
   expect(f.state.started).toBe(0);
   await app.press("id:page-action-cancel");
   await app.waitFor("id:page-action-confirm", { state: "gone" });
@@ -207,12 +208,18 @@ test("Schedule consent sends the exact displayed version and revision, never ret
     { version: 1, block_key: "run", schedule_revision: 3 },
     { version: 1, block_key: "run", schedule_revision: 3, confirm: true },
   ]);
+  f.state.revision = 5;
+  f.state.liveRoom = "Updated destination";
   await app.press("id:page-action:run");
   await app.waitFor("id:page-action-confirm");
+  expect(text(app)).toContain("Acme › Updated destination");
   await app.press("id:page-action-run");
   await app.waitFor("text:Scheduled task started.");
   expect(f.state.started).toBe(1);
-  expect(f.calls(`/${TEAM}/actions`, "POST").slice(-1)[0]?.body).toEqual({ version: 1, block_key: "run", schedule_revision: 4, confirm: true });
+  expect(f.calls(`/${TEAM}/actions`, "POST").slice(-2).map(r => r.body)).toEqual([
+    { version: 1, block_key: "run", schedule_revision: 4 },
+    { version: 1, block_key: "run", schedule_revision: 5, confirm: true },
+  ]);
 });
 
 test("Personal page action stays on the page; a missing room link never falls back", async () => {
@@ -239,6 +246,7 @@ test("A page republished while its confirmation is open does not run the superse
   await jump(app);
   await app.press("id:page-action:ask");
   await app.waitFor("id:page-action-confirm");
+  expect(text(app)).toContain("Renamed agent (@renamed_agent) in Acme › Renamed room");
   const previous = f.entries.get(TEAM)!;
   f.entries.set(TEAM, { ...previous, head_version: 2, version: { ...previous.version, version: 2 } });
   await app.press("id:page-action-run");
@@ -248,6 +256,127 @@ test("A page republished while its confirmation is open does not run the superse
   ]);
   expect(f.state.started).toBe(0);
   expect(text(app)).toContain("Version 2");
+});
+
+test("A linked Space page loses access after a verified membership change; Back opens All pages", async () => {
+  const f = pagesFixture();
+  f.state.linkedPage = TEAM;
+  const app = await start(f);
+  await jump(app, PERSONAL);
+  await app.press("id:page-action:other");
+  await app.waitFor("text:Team dashboard");
+  await app.waitFor("id:page-action:ask");
+  await app.waitUntil(() => f.calls(`/${TEAM}/data`, "POST").length > 0);
+  f.f.state.spaces.get("acme")!.members.delete("alice");
+  await refreshMembership(app, f);
+  await app.waitFor("text:This Space is no longer available.");
+  expect(app.shows("id:page-renderer")).toBe(false);
+  await app.press("id:page-back");
+  await app.waitFor("id:pages-home");
+  await app.waitFor(`id:open-page:${PERSONAL}`);
+  expect(app.shows(`id:open-page:${TEAM}`)).toBe(false);
+});
+
+for (const clear of [true, false]) {
+  test(`Delayed model validation never submits an edit after ${clear ? "clearing" : "changing"} its block`, async () => {
+    const f = pagesFixture();
+    const conn = f.f.addConnection("alice", "openai", "Fixture connection", "gpt-fixture-1");
+    const app = await start(f);
+    await jump(app);
+    await app.press("id:page-select-block");
+    await app.press("id:page-edit-block:stat");
+    await app.type("id:page-prompt", "Revise the selected block");
+    await app.press("id:composer-model");
+    await app.press("id:page-model-options");
+    await app.press("text:gpt-fixture-1");
+    const validations = () => f.log.filter(r => r.path === "/v1/models/available").length;
+    const before = validations();
+    f.state.modelDelay = 5000;
+    await app.press("id:page-generate");
+    await app.waitUntil(() => validations() > before);
+    await app.press(clear ? "text:Edit whole page" : "id:page-edit-block:intro");
+    await app.clock!.fastForward(5100);
+    await app.waitFor("text:/The edit target changed/");
+    expect(f.calls("/drafts", "POST")).toHaveLength(0);
+    if (clear) await app.press("id:page-edit-block:intro");
+    f.state.modelDelay = 0;
+    await app.press("id:page-generate");
+    await app.waitFor("id:page-draft-view");
+    expect(f.calls("/drafts", "POST").map(r => r.body)).toEqual([{ page_id: TEAM, block_key: "intro",
+      prompt: "Revise the selected block", provider_connection_id: conn.id, model_id: "gpt-fixture-1" }]);
+  });
+}
+
+for (const loss of ["edit", "read", "membership"] as const) {
+  test(`Apply denied: ${loss === "edit" ? "retain preview, diff and Discard for a still-member editor" : `hide draft after ${loss} loss`}`, async () => {
+    const f = pagesFixture();
+    f.f.state.spaces.get("acme")!.members.add("bob");
+    f.entries.set(TEAM, { ...f.entries.get(TEAM)!, members_edit: true });
+    const app = await start(f, "bob");
+    await jump(app);
+    await app.press("id:page-edit");
+    await app.type("id:page-prompt", "Update the overview");
+    await app.press("id:page-generate");
+    await app.waitFor("id:page-renderer");
+    await app.waitFor("text:Proposed dashboard");
+    await app.press("id:page-draft-tab:changes");
+    await app.waitFor("id:page-source-diff");
+    f.entries.set(TEAM, { ...f.entries.get(TEAM)!, members_edit: false });
+    f.state.denyDraftRead = loss === "read";
+    if (loss === "membership") await app.clock!.fastForward(9_200);
+    f.state.draftDelay = 5000;
+    const before = f.calls("/drafts/pgd_1").length;
+    await app.press("id:page-apply");
+    await app.waitUntil(() => f.calls("/drafts/pgd_1").length > before);
+    await app.waitFor("text:/Checking whether you can still review/");
+    expect(app.shows("id:page-source-diff")).toBe(false);
+    if (loss === "membership") {
+      f.f.state.spaces.get("acme")!.members.delete("bob");
+      await refreshMembership(app, f, 2200);
+      await app.waitFor("id:page-draft-view", { state: "gone" });
+    }
+    await app.clock!.fastForward(5100);
+    if (loss !== "edit") {
+      if (loss === "read") await app.waitFor("text:/This draft is no longer available/");
+      expect(app.shows("text:Proposed dashboard")).toBe(false);
+      expect(app.shows("id:page-source-diff")).toBe(false);
+      expect(app.shows("id:page-apply")).toBe(false);
+    } else {
+      await app.waitFor("text:/no longer have permission to apply/");
+      await app.waitFor("id:page-source-diff");
+      await expect(app.press("id:page-apply")).rejects.toMatchObject({ code: "ERR_NSH_TEST_DISABLED" });
+      await app.press("id:page-draft-tab:preview");
+      await app.waitFor("id:page-renderer");
+      await app.press("id:page-discard");
+      await app.press("id:page-discard-now");
+      await app.waitFor("id:page-view");
+      expect(f.calls("/drafts/pgd_1", "DELETE")).toHaveLength(1);
+    }
+    expect(f.calls("/drafts/pgd_1/apply", "POST")).toHaveLength(1);
+    expect(f.state.applied).toBe(0);
+  });
+}
+
+test("Scheduled refresh is offered only for a room-and-agent Space brief, not a block-linked answer", async () => {
+  const f = pagesFixture();
+  f.replaceTeam(briefSpec(false));
+  f.entries.set(PERSONAL, { ...f.entries.get(PERSONAL)!, spec: briefSpec(true) });
+  const app = await start(f);
+  await jump(app, PERSONAL);
+  expect(app.shows("id:page-schedule:answer")).toBe(false);
+  await jump(app);
+  await app.waitFor("text:Everything looks good.");
+  await app.press("id:page-schedule:answer");
+  await app.waitFor("id:page-open-schedule-form");
+  expect(text(app)).toContain("including scheduled answers");
+  await app.press("id:page-open-schedule-form");
+  await app.waitFor("id:schedule-prompt");
+  expect(app.value("id:schedule-prompt")).toBe("Summarize today");
+  expect(text(app)).toContain("To: the agent in Acme · #lobby");
+  expect(f.f.posts().filter(r => r.path === "/v1/schedules")).toHaveLength(0);
+  f.replaceTeam(briefSpec(false, true));
+  await jump(app);
+  expect(app.shows("id:page-schedule:answer")).toBe(false);
 });
 
 test("Prompt creation polls a private draft, previews disabled actions and applies once", async () => {

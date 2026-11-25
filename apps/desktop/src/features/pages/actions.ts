@@ -15,6 +15,7 @@ export function checkedConfirmation(value: unknown, page: Page, key: string, kin
   if (own(action, "kind") !== kind || typeof prompt !== "string" || !prompt.trim()) return null;
   if (kind === "runSchedule") {
     if (!page.space_id || typeof own(action, "schedule") !== "string" || typeof own(action, "schedule_id") !== "string"
+      || own(action, "space_id") !== page.space_id || typeof own(action, "room_id") !== "string" || typeof own(action, "room") !== "string"
       || !revision(own(action, "schedule_revision"))) return null;
   } else if (kind === "runAgent") {
     if (page.scope === "personal") {

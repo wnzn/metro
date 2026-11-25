@@ -24,7 +24,7 @@ export type Expr =
   | { k: "cmp"; op: "eq" | "ne" | "lt" | "gt" | "le" | "ge"; a: Expr; b: unknown };
 export type PageBlock = {
   type: string; key?: string; props?: Record<string, Expr>; content?: Expr[]; children?: PageBlock[];
-  action?: { kind: ActionKind };
+  action?: { kind: ActionKind; prompt?: string; agent_id?: string; room_id?: string; space_id?: string; chat?: boolean; thread?: boolean };
 };
 export type Definition = { source: string; spec: PageSpec };
 export type Page = PageMeta & Definition & { version: VersionMeta };
@@ -53,8 +53,8 @@ export type PageData = PageValues & { version: number };
 export type Confirmation = {
   page_id: string; version: number; block_key: string; edited_by: string; edited_at: string; runs_as: string;
   action:
-    | { kind: "runAgent"; prompt: string; agent: string | null; agent_id: string | null; room: string | null; room_id: string | null; space_id: string | null; chat: boolean }
-    | { kind: "runSchedule"; prompt: string; schedule: string; schedule_id: string; schedule_revision: number };
+    | { kind: "runAgent"; prompt: string; agent: string | null; agent_id: string | null; agent_name?: string; room: string | null; room_id: string | null; space_id: string | null; chat: boolean }
+    | { kind: "runSchedule"; prompt: string; schedule: string; schedule_id: string; schedule_revision: number; space_id: string; room_id: string; room: string };
 };
 export type PageClick = { version: number; block_key: string; confirm?: true; schedule_revision?: number };
 type ClickResult = { kind: "runAgent"; started: boolean; error?: string } | { kind: "runSchedule"; run: { status: string; detail: string | null } };

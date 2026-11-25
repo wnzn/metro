@@ -23,6 +23,8 @@ export function DraftView(props: { route: DraftRoute }) {
   const tab = signal<Tab>("preview"), error = signal("");
   const outside = signal<string[]>([]), confirmOutside = signal(false), retry = signal(false), discard = signal(false);
   const busy = signal(false), loading = signal(true), previewing = signal(false), unavailable = signal(false);
+  const applyAccess = signal<"allowed" | "checking" | "denied">("allowed");
+  const checkError = signal("");
   const conflict = signal<{ pageId: string; version: number } | null>(null), readingHead = signal(false), headError = signal("");
   const draftReads = pageReadLane<string>(), previewReads = pageReadLane<Draft>(), headReads = pageReadLane<string>();
   let alive = true, grant = sessionGuard(route.spaceId);
@@ -35,6 +37,8 @@ export function DraftView(props: { route: DraftRoute }) {
     draftReads.cancel(); previewReads.cancel(); headReads.cancel();
     forgetPageDraft(route.id);
     unavailable.set(true);
+    checkError.set("");
+    applyAccess.set("denied");
     error.set("This draft is no longer available. It may have been applied, discarded, expired, or you may no longer have access.");
     loading.set(false); previewing.set(false); readingHead.set(false);
     data.set(null); draft.set(null); currentHead.set(null); diagnostics.set([]); outside.set([]);
@@ -43,10 +47,10 @@ export function DraftView(props: { route: DraftRoute }) {
     if (isPageStatus(e, 404) || isPageStatus(e, 403)) missing();
     else { error.set(pagesProblem(e)); diagnostics.set(pageFailure(e).diagnostics ?? []); }
   }
-  function load() {
+  function load(recheck = false) {
     if (!client || !visible() || !available()) return;
     const grants = spaceGrants();
-    return draftReads.run(route.id, async (signal, current) => {
+    return draftReads.run(recheck ? "recheck" : "draft", async (signal, current) => {
       const allowed = () => current() && visible() && available();
       try {
         if (!allowed()) return;
@@ -59,12 +63,19 @@ export function DraftView(props: { route: DraftRoute }) {
         diagnostics.set(next.diagnostics);
         outside.set(next.outside_selection);
         error.set(next.error ?? "");
-      } catch (e) { if (allowed()) problem(e); }
+        if (recheck) applyAccess.set("denied");
+      } catch (e) {
+        if (allowed()) {
+          if (recheck && (isPageStatus(e, 403) || isPageStatus(e, 404))) missing();
+          else if (recheck) checkError.set(pagesProblem(e));
+          else problem(e);
+        }
+      }
       finally { if (allowed()) loading.set(false); }
     });
   }
   const generating = () => !draft() || draft()?.status === "generating";
-  visiblePolling(() => visible() && available() && generating(), () => 1_500, () => void load());
+  visiblePolling(() => visible() && available() && generating() && applyAccess() !== "checking", () => 1_500, () => void load());
   function preview(review: Draft) {
     if (!client || !visible() || !available()) return;
     const grants = spaceGrants();
@@ -102,15 +113,17 @@ export function DraftView(props: { route: DraftRoute }) {
   let oldGrants: ReturnType<typeof spaceGrants> | undefined, oldPreview: Draft | null = null, wasVisible = false;
   effect(() => {
     const grants = spaceGrants(), shown = visible() && available(), review = draft();
-    const toPreview = shown && tab() === "preview" && review?.status === "ready" && review.spec ? review : null;
-    const toCompare = shown && tab() === "changes" && !!conflict();
+    const checkingAccess = applyAccess() === "checking";
+    const toPreview = shown && !checkingAccess && tab() === "preview" && review?.status === "ready" && review.spec ? review : null;
+    const toCompare = shown && !checkingAccess && tab() === "changes" && !!conflict();
     const changed = !!oldGrants && !sameSpaceGrants(oldGrants, grants);
     const show = shown && !wasVisible;
     const previewChanged = oldPreview !== toPreview || changed;
     oldGrants = grants; wasVisible = shown; oldPreview = toPreview;
     untracked(() => {
       if (!shown || changed) draftReads.cancel();
-      if ((show || changed) && shown && generating()) void load();
+      if (shown && checkingAccess) void load(true);
+      else if ((show || changed) && shown && generating()) void load();
       if (previewChanged || !shown) { previewReads.cancel(); data.set(null); previewing.set(false); }
       if (toPreview && previewChanged) void preview(toPreview);
       if (!toCompare || changed) { headReads.cancel(); readingHead.set(false); }
@@ -129,7 +142,7 @@ export function DraftView(props: { route: DraftRoute }) {
   }
   async function apply(confirmed = false) {
     const review = draft();
-    if (!client || !visible() || !available() || review?.status !== "ready" || stale() || busy()) return;
+    if (!client || !visible() || !available() || review?.status !== "ready" || stale() || busy() || applyAccess() !== "allowed") return;
     if (outside().length && !confirmed) { confirmOutside.set(true); return; }
     if (confirmed && !confirmOutside()) return;
     busy.set(true); error.set(""); confirmOutside.set(false);
@@ -142,7 +155,11 @@ export function DraftView(props: { route: DraftRoute }) {
     } catch (e) {
       if (!available()) return;
       const detail = pageFailure(e);
-      if (isPageStatus(e, 409) && Number.isSafeInteger(detail.head_version) && review.page_id) {
+      if (isPageStatus(e, 403) && review.page_id) {
+        // Loss of edit rights isn't loss of the private draft. Only show it
+        // again after the author-only read verifies live view access.
+        applyAccess.set("checking");
+      } else if (isPageStatus(e, 409) && Number.isSafeInteger(detail.head_version) && review.page_id) {
         stale.set(true);
         error.set("This draft is based on an older version. Nothing was changed. Compare with the current source or edit the prompt and generate a new draft.");
         conflict.set({ pageId: review.page_id, version: detail.head_version! });
@@ -169,7 +186,7 @@ export function DraftView(props: { route: DraftRoute }) {
   }
   async function regenerate(prompt: string, choice?: TurnModelChoice) {
     const review = draft();
-    if (!client || !review || !available() || !visible() || busy()) return;
+    if (!client || !review || !available() || !visible() || busy() || applyAccess() !== "allowed") return;
     busy.set(true); error.set("");
     try {
       const next = await client.createPageDraft(review.page_id ? { page_id: review.page_id, block_key: review.block_key ?? undefined } : targetOf(review), prompt, choice);
@@ -187,7 +204,8 @@ export function DraftView(props: { route: DraftRoute }) {
     } finally { if (valid()) busy.set(false); }
   }
   const changed = () => new Set([...(draft()?.changes?.added ?? []), ...(draft()?.changes?.changed ?? [])]);
-  const title = () => draft()?.spec?.title || "Page draft";
+  const readable = () => available() && applyAccess() !== "checking";
+  const title = () => (readable() && draft()?.spec?.title) || "Page draft";
   const changeSummary = () => {
     const c = draft()?.changes;
     if (!c) return "";
@@ -205,7 +223,14 @@ export function DraftView(props: { route: DraftRoute }) {
     </PageHeader>
     <PagesError message={error()} />
     <If when={loading()}><Label color="muted">Loading draft…</Label></If>
-    <If when={available() ? draft() : null}>{review => <>
+    <If when={applyAccess() === "checking"}>
+      <If when={!checkError()}><Label color="muted">Checking whether you can still review this draft…</Label></If>
+      <PagesError message={checkError()} onRetry={() => { checkError.set(""); void load(true); }} />
+    </If>
+    <If when={readable() ? draft() : null}>{review => <>
+      <If when={applyAccess() === "denied"}>
+        <Banner tone="warning" variant="inline" message="You can still review or discard this draft, but you no longer have permission to apply it." />
+      </If>
       <If when={review().status === "generating"}><Label testID="page-draft-generating">Building your draft… You can leave this view while it runs.</Label></If>
       <If when={review().status !== "generating"}>
         <Row gap={2} wrap align="center">
@@ -242,7 +267,7 @@ export function DraftView(props: { route: DraftRoute }) {
           <ActionBar><Action label="Cancel" variant="ghost" onPress={() => confirmOutside.set(false)} />
             <Action testID="page-apply-outside" label="Apply all changes" variant="primary" disabled={stale()} onPress={() => void apply(true)} /></ActionBar>
         </If>
-        <If when={retry()}>
+        <If when={retry() && applyAccess() === "allowed"}>
           <ScrollArea gap={2}>
             <Label variant="strong">{review().block_key ? `Retry edit to block ${review().block_key}` : "Edit prompt and retry"}</Label>
             <DraftPrompt spaceId={review().space_id} initial={review().prompt} label="Revise the prompt" busy={busy()} onSubmit={(prompt, choice) => void regenerate(prompt, choice)} />
@@ -257,9 +282,9 @@ export function DraftView(props: { route: DraftRoute }) {
       <ActionBar>
         <Action label="Discard…" testID="page-discard" variant="destructive" disabled={busy() || discard()} onPress={() => discard.set(true)} />
         <If when={review().status !== "generating"}>
-          <Action testID="page-draft-retry" label={retry() ? "Close prompt" : "Edit prompt and retry"} variant="ghost" disabled={busy()} onPress={() => retry.set(!retry())} />
+          <Action testID="page-draft-retry" label={retry() ? "Close prompt" : "Edit prompt and retry"} variant="ghost" disabled={busy() || applyAccess() === "denied"} onPress={() => retry.set(!retry())} />
         </If>
-        <Action testID="page-apply" label="Apply" variant="primary" disabled={stale() || review().status !== "ready" || confirmOutside() || discard()} busy={busy()} onPress={() => void apply()} />
+        <Action testID="page-apply" label="Apply" variant="primary" disabled={applyAccess() !== "allowed" || stale() || review().status !== "ready" || confirmOutside() || discard()} busy={busy()} onPress={() => void apply()} />
       </ActionBar>
     </>}</If>
   </Column>;

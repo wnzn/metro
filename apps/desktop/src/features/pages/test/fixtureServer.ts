@@ -1,6 +1,6 @@
 import { BASE, header, TOKENS, world } from "../../../../test/fakeServer";
 import type { Draft, Page, PageData, PageDraftEvent, PageMeta, PageSpec } from "../../../api/pages";
-import { sample, sampleData, stamp } from "./sample";
+import { bind, lit, sample, sampleData, stamp } from "./sample";
 
 export const TEAM = "pg_team", PERSONAL = "pg_personal", DRAFT = "pgd_fixture";
 type Req = { method: string; url: string; headers: unknown; body?: string | null };
@@ -8,6 +8,16 @@ const ok = (body: unknown, status = 200) => ({ status, body });
 const fail = (status: number, error: string, details = {}) => ok({ error, ...details }, status);
 const path = "/v1/pages";
 export const sourceOf = (title: string) => `export default (<Page title="${title}"><Text key="body">Fixture</Text></Page>);`;
+export function briefSpec(personal: boolean, blockLinked = personal): PageSpec {
+  const target = personal ? { chat: true } : { room: "lobby", room_id: "lobby", agent: "agent", agent_id: "sa_fixture" };
+  return { format: 1, title: "Daily brief", refresh: "15m", data: [
+    { name: "answer", source: "agentAnswer", params: { ...target, ...(blockLinked ? { block: "ask" } : {}) } },
+  ], blocks: [
+    { type: "AgentAnswer", key: "answer", props: { from: bind("answer") } },
+    { type: "Button", key: "ask", props: { label: lit("Write today’s brief") },
+      action: { kind: "runAgent", ...target, prompt: "Summarize today" } },
+  ] };
+}
 const pageOf = (id: string, title: string, author: string, sid: string | null, spec = sample): Page => ({
   id, scope: sid ? "space" : "personal", space_id: sid, creator_id: author, title, icon: null, members_edit: false,
   head_version: 1, created_at: stamp, updated_at: stamp, deleted_at: null, pinned: id !== TEAM, position: null,
@@ -28,7 +38,8 @@ export function pagesFixture() {
   const log: { user: string; method: string; path: string; body: any }[] = [];
   let nextId = 1;
   const state = { revision: 3, delayPage: "", delay: 0, dataDelay: 0, draftDelay: 0, previewDelay: 0,
-    actionDelay: 0, createDelay: 0, restoreDelay: 0, answer: "",
+    actionDelay: 0, createDelay: 0, restoreDelay: 0, modelDelay: 0, answer: "", linkedPage: PERSONAL,
+    denyDraftRead: false, liveRoom: "Renamed room", liveAgent: "renamed_agent", liveAgentName: "Renamed agent",
     stale: false, staleSource: false, outside: false, generating: 0, started: 0, applied: 0 };
   const visible = (p: PageMeta, user: string) => p.scope === "personal" ? p.creator_id === user : !!p.space_id && f.state.spaces.get(p.space_id)?.members.has(user);
   const caps = (p: Page, user: string): Page => {
@@ -63,11 +74,23 @@ export function pagesFixture() {
       data: state.answer || (p.id === PERSONAL && state.started) ? { ...sampleData.data, answer: { ok: true, value: {
         text: state.answer || "Private page-only answer", status: "done",
       } } } : sampleData.data,
-      actions: { ...sampleData.actions, ask: { enabled: true, confirm }, run: p.scope === "personal" ? { enabled: false, reason: "Space only" } : { enabled: true, confirm, schedule_revision: state.revision } } };
+      actions: { ...sampleData.actions, other: { enabled: true, page_id: state.linkedPage }, ask: { enabled: true, confirm }, run: p.scope === "personal" ? { enabled: false, reason: "Space only" } : { enabled: true, confirm, schedule_revision: state.revision } } };
   }
   function handle(req: Req) {
     const url = new URL(req.url), pathname = url.pathname;
-    if (!pathname.startsWith(path)) return f.network[`${req.method} ${BASE}/v1/*`]!(req);
+    if (!pathname.startsWith(path)) {
+      const response = f.network[`${req.method} ${BASE}/v1/*`]!(req);
+      if (pathname === "/v1/models/available") {
+        log.push({ user: "", method: req.method, path: pathname, body: null });
+        return typeof response === "object" && response !== null ? { ...response, delay: state.modelDelay } : response;
+      }
+      if (pathname === "/v1/spaces/acme/agents" && req.method === "GET") {
+        return ok({ agents: [{ id: "sa_fixture", space_id: "acme", handle: "agent", name: "Agent",
+          description: "Fixture", is_default: true, instructions: "", tools: [] }] });
+      }
+      if (pathname === "/v1/schedules" && req.method === "GET") return ok({ tasks: [] });
+      return response;
+    }
     const token = header(req, "authorization") ?? "";
     const user = Object.keys(TOKENS).find(u => `Bearer ${TOKENS[u]}` === token);
     if (!user) return fail(401, "unauthenticated");
@@ -98,12 +121,14 @@ export function pagesFixture() {
       if (!found || found.owner !== user || (found.draft.space_id && !f.state.spaces.get(found.draft.space_id)?.members.has(user))) return fail(404, "no such draft");
       const d = found.draft, base = d.page_id ? entries.get(d.page_id) : undefined;
       if (method === "DELETE") { privateDrafts.delete(op!); return { status: 204 }; }
+      if (detail !== "apply" && state.denyDraftRead) return { ...fail(404, "no such draft"), delay: state.draftDelay };
       if (detail === "data") {
         const { version: _version, ...fixture } = sampleData;
         return { ...ok({ ...fixture, data: state.answer ? { ...fixture.data, answer: { ok: true, value: { text: state.answer, status: "done" } } } : fixture.data }),
           delay: state.previewDelay };
       }
       if (detail === "apply") {
+        if (base && !caps(base, user).can_edit) return fail(403, "no edit rights");
         if (d.outside_selection.length && !body.confirm_outside) return fail(409, "outside selection", { outside_selection: d.outside_selection });
         if (state.stale && base) {
           const changed = save(base.id, { source: sourceOf("New head from another editor") }, "manual", "bob");
@@ -163,9 +188,11 @@ export function pagesFixture() {
       const schedule = body.block_key === "run";
       if (!confirmations.has(key) && !body.confirm) return fail(428, "confirmation required", {
         confirmation: { page_id: id, version: page.head_version, block_key: body.block_key, edited_at: stamp, edited_by: page.version.author_id, runs_as: user,
-          action: schedule ? { kind: "runSchedule", schedule: "Release reminder", schedule_id: "sch_fixture", schedule_revision: state.revision, prompt: "Send the exact release summary" }
-            : { kind: "runAgent", prompt: "Write a private brief", agent: page.space_id ? "releases" : null,
-              agent_id: page.space_id ? "sa_releases" : null, room: page.space_id ? "Lobby" : null, room_id: page.space_id ? "lobby" : null, space_id: page.space_id, chat: !page.space_id },
+          action: schedule ? { kind: "runSchedule", schedule: "Release reminder", schedule_id: "sch_fixture", schedule_revision: state.revision,
+            prompt: "Send the exact release summary", space_id: page.space_id, room_id: "lobby", room: state.liveRoom }
+            : { kind: "runAgent", prompt: "Write a private brief", agent: page.space_id ? state.liveAgent : null,
+              agent_name: page.space_id ? state.liveAgentName : undefined, agent_id: page.space_id ? "sa_releases" : null,
+              room: page.space_id ? state.liveRoom : null, room_id: page.space_id ? "lobby" : null, space_id: page.space_id, chat: !page.space_id },
         },
       });
       if (schedule && body.schedule_revision !== state.revision) return fail(409, "schedule changed", { schedule_revision: state.revision });

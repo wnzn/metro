@@ -26,7 +26,7 @@ function Route(props: { route: PagesRoute; allowed: boolean }) {
   if (!props.allowed) return <PageLayout gap={3}>
     <PageHeader title="Pages" />
     <Label>This Space is no longer available.</Label>
-    <Action label="All pages" onPress={() => goPages()} />
+    <Action testID="page-back" label="All pages" onPress={() => goPages()} />
   </PageLayout>;
   const route = props.route;
   switch (route.kind) {

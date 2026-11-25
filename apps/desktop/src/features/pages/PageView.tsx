@@ -30,30 +30,36 @@ export function PageView(props: { route: ViewRoute }) {
   const schedule = signal<ReturnType<typeof answerSchedule>>(undefined);
   const editing = signal(false), select = signal(false), block = signal<string | undefined>(undefined);
   const client = apiClient(), route = props.route;
+  const unavailableSpace = signal(false);
+  const verifiedSpace = signal<string | null>(route.spaceId ?? null);
   const guard = pageGuard(route);
   const reads = pageReadLane<boolean>();
   let alive = true;
   let scopeGuard = sessionGuard(route.spaceId);
   cleanup(() => { alive = false; });
-  const valid = () => alive && guard() && scopeGuard() && hasSpace(page()?.space_id);
+  const valid = () => alive && guard() && !unavailableSpace() && scopeGuard() && hasSpace(verifiedSpace());
   const live = () => valid() && lifecycle() === "active";
   const visible = () => live() && !modalOpen();
   const cancelRead = () => { reads.cancel(); refreshing.set(false); };
-  const lost = () => {
+  const lost = (space = false) => {
+    if (space) unavailableSpace.set(true);
     cancelRead();
     page.set(null); data.set(null); confirm.set(null); external.set(null); schedule.set(undefined); sheet.set(null);
     refreshing.set(false); loading.set(false);
-    error.set("This page is no longer available to you.");
+    notice.set("");
+    editing.set(false); select.set(false); block.set(undefined); diagnostics.set([]);
+    error.set(space ? "This Space is no longer available." : "This page is no longer available to you.");
     void refreshPages();
   };
   function accept(next: Page, before: ReturnType<typeof spaceGrants>) {
     const previous = page();
     if (next.id !== route.id || !scopeVisible(next) || next.deleted_at
       || (route.spaceId && next.space_id !== route.spaceId)
-      || (previous && next.space_id !== previous.space_id)
+      || (verifiedSpace() && next.space_id !== verifiedSpace())
       || (next.space_id && !before.get(next.space_id)?.())) { lost(); return false; }
     const changed = previous && previous.head_version !== next.head_version;
     scopeGuard = sessionGuard(next.space_id ?? undefined);
+    verifiedSpace.set(next.space_id);
     page.set(next);
     if (changed) {
       confirm.set(null); external.set(null); schedule.set(undefined); data.set(null);
@@ -105,12 +111,15 @@ export function PageView(props: { route: ViewRoute }) {
   let membership: ReturnType<typeof spaceGrants> | undefined, wasVisible = false;
   effect(() => {
     const now = spaceGrants();
+    const sid = verifiedSpace();
+    const spaceLost = !unavailableSpace() && !!sid && (!now.has(sid) || !scopeGuard());
     const shown = visible();
     const changed = membership !== undefined && !sameSpaceGrants(membership, now);
     const justShown = shown && !wasVisible;
     membership = now;
     wasVisible = shown;
     untracked(() => {
+      if (spaceLost) { lost(true); return; }
       if (!shown || changed) cancelRead();
       if (changed) { data.set(null); confirm.set(null); external.set(null); schedule.set(undefined); }
       if (shown && (justShown || changed)) void refresh(true);
@@ -126,7 +135,7 @@ export function PageView(props: { route: ViewRoute }) {
     void refresh(false, true);
     void refreshPages();
   };
-  const toolProps = (head: Page): PageToolProps => ({ page: head, stillHere: valid, close: () => sheet.set(null), saved, lost });
+  const toolProps = (head: Page): PageToolProps => ({ page: head, stillHere: valid, close: () => sheet.set(null), saved, lost: () => lost() });
   async function run(key: string, kind: ActionKind, consent?: Confirmation) {
     const head = page(), c = client, displayed = data();
     if (!head || !c || !live() || busy() || displayed?.version !== head.head_version) return;
@@ -225,21 +234,31 @@ export function PageView(props: { route: ViewRoute }) {
     } catch (e) { if (valid()) error.set(pagesProblem(e)); }
     finally { if (valid()) { busy.set(false); sheet.set(null); } }
   }
-  async function generate(prompt: string, choice?: import("../../api/client").TurnModelChoice) {
+  function prepareGenerate() {
     const head = page();
-    if (!client || !head?.can_edit || !live() || busy()) return;
-    busy.set(true); error.set(""); diagnostics.set([]);
-    try {
-      const draft = await client.createPageDraft({ page_id: head.id, block_key: block() }, prompt, choice);
-      if (valid() && scopeVisible(draft) && draft.page_id === head.id && draft.space_id === head.space_id) showDraft(draft);
-    } catch (e) { if (valid()) { error.set(pagesProblem(e)); diagnostics.set(pageFailure(e).diagnostics ?? []); } }
-    finally { if (valid()) busy.set(false); }
+    const selected = block();
+    return async (prompt: string, choice?: import("../../api/client").TurnModelChoice) => {
+      if (!client || !head?.can_edit || !live() || busy() || !editing()) return;
+      if (selected !== block() || page()?.head_version !== head.head_version || !page()?.can_edit) {
+        error.set("The edit target changed. Review the selection and generate again.");
+        return;
+      }
+      busy.set(true); error.set(""); diagnostics.set([]);
+      try {
+        const draft = await client.createPageDraft({ page_id: head.id, block_key: selected }, prompt, choice);
+        if (valid() && scopeVisible(draft) && draft.page_id === head.id && draft.space_id === head.space_id) showDraft(draft);
+      } catch (e) { if (valid()) { error.set(pagesProblem(e)); diagnostics.set(pageFailure(e).diagnostics ?? []); } }
+      finally { if (valid()) busy.set(false); }
+    };
   }
   return <PageLayout wide gap={3} testID="page-view">
     <Row gap={2} wrap>
-      <Action compact label="‹ Pages" testID="page-back" variant="ghost" onPress={() => goPages({ kind: "home", spaceId: page()?.space_id ?? route.spaceId })} />
+      <Action compact label={unavailableSpace() ? "‹ All pages" : "‹ Pages"} testID="page-back" variant="ghost" onPress={() => {
+        const sid = verifiedSpace() ?? undefined;
+        goPages({ kind: "home", spaceId: !unavailableSpace() && hasSpace(sid) ? sid : undefined });
+      }} />
     </Row>
-    <PagesError message={error()} onRetry={() => void refresh(true)} />
+    <PagesError message={error()} onRetry={unavailableSpace() ? undefined : () => void refresh(true)} />
     <If when={notice()}>{message => <Banner tone="success" variant="inline" message={message()} />}</If>
     <If when={loading() && !page()}><Label color="muted">Loading page…</Label></If>
     <If when={valid() ? page() : null}>{head => <>
@@ -283,7 +302,7 @@ export function PageView(props: { route: ViewRoute }) {
             <Label variant="strong">{block() ? `Editing block: ${block()}` : "Edit page with a prompt"}</Label>
             <If when={block()}><Action compact label="Edit whole page" variant="ghost" onPress={() => block.set(undefined)} /></If>
           </Row>
-          <DraftPrompt spaceId={head().space_id} label="Describe what to change" busy={busy()} onSubmit={(prompt, choice) => void generate(prompt, choice)} />
+          <DraftPrompt spaceId={head().space_id} label="Describe what to change" busy={busy()} prepareSubmit={prepareGenerate} />
           <Diagnostics items={diagnostics()} />
         </Column>
       </If>
@@ -314,8 +333,7 @@ export function PageView(props: { route: ViewRoute }) {
     <If when={schedule()}>{task => <Modal open size="compact" title="Set up scheduled refresh" onClose={() => schedule.set(undefined)}>
       <Column pad={4} gap={3}>
         <Label heading variant="title">Set up a scheduled prompt?</Label>
-        <Label>The scheduled task runs as you and posts to this Space room. It won’t run until you save the task.</Label>
-        <If when={task().linked}><Label color="warning">This block shows only runs from its page button. To show scheduled answers here, remove the data source’s block link in the Page TSX.</Label></If>
+        <Label>The task runs as you. This block shows the latest answer from the selected room and agent, including scheduled answers. Nothing is scheduled until you save the task.</Label>
         <ActionBar><Action label="Cancel" variant="ghost" onPress={() => schedule.set(undefined)} />
           <Action label="Open task form" variant="primary" testID="page-open-schedule-form" onPress={() => {
             const chosen = task(), sid = page()?.space_id;
@@ -345,7 +363,9 @@ export function PageView(props: { route: ViewRoute }) {
 
 function destination(confirmation: Confirmation) {
   const action = confirmation.action;
-  if (action.kind === "runSchedule") return action.schedule;
+  if (action.kind === "runSchedule") return `${action.schedule} · Space default agent in ${scopeName(action.space_id)} › ${action.room}`;
   if (action.chat) return "Your private page agent · answer stays on this page";
-  return `${action.agent ? `@${action.agent}` : "Agent"} in ${scopeName(action.space_id)} › ${action.room ?? "Room"}`;
+  const handle = action.agent ? `@${action.agent}` : "Agent";
+  const name = str(action.agent_name);
+  return `${name ? `${name} (${handle})` : handle} in ${scopeName(action.space_id)} › ${action.room ?? "Room"}`;
 }

@@ -117,24 +117,26 @@ function PageModel(props: { model: ReturnType<typeof createPageModel>; disabled?
   </Column>;
 }
 
+type DraftSend = (prompt: string, choice?: TurnModelChoice) => void;
 export function DraftPrompt(props: {
   spaceId: string | null; initial?: string; label?: string; busy?: boolean;
-  onSubmit: (prompt: string, choice?: TurnModelChoice) => void;
-}) {
+} & ({ onSubmit: DraftSend; prepareSubmit?: never } | { prepareSubmit: () => DraftSend; onSubmit?: never })) {
   const prompt = signal(props.initial ?? "");
   const checking = signal(false);
   const model = createPageModel(() => props.spaceId);
   const submit = async () => {
     const text = prompt().trim(), choice = model.pin(), sid = props.spaceId;
     if (props.busy || checking() || !text || model.error()) return;
-    if (!choice) { props.onSubmit(text); return; }
+    const send = props.prepareSubmit?.() ?? props.onSubmit;
+    if (!send) return;
+    if (!choice) { send(text); return; }
     const grant = sessionGuard(sid ?? undefined);
     checking.set(true);
     try {
       // A share, device or model list can change while this sheet stays open.
       // Verify the explicit choice again; the server then checks at use time.
       await model.load();
-      if (model.alive() && grant() && props.spaceId === sid && model.pin() === choice && !model.error()) props.onSubmit(text, choice);
+      if (model.alive() && grant() && props.spaceId === sid && model.pin() === choice && !model.error()) send(text, choice);
     } finally { if (model.alive()) checking.set(false); }
   };
   return <Column gap={2}>
