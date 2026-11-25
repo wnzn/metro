@@ -1561,21 +1561,11 @@ export function followUp(run: Run) {
   const sameVisit = () => ok() && basePlace() === "chat" && navigation === navigationGeneration;
   const latest = () => sameVisit() && intent === dispatchIntent;
   if (original?.spaceId === spaceId && original.roomId === roomId) {
-    // Keep the selected recipient visible but don't send while checking it.
-    // An inconclusive response can't make the cached room sendable again.
-    const key = scopeKey(spaceId, roomId);
-    const check: DispatchRoomCheck = { phase: "checking" };
-    const current = () => latest() && dispatchTarget() === original;
-    setDispatchRoomCheck(key, check);
-    void verifyDispatchRoom(c, spaceId, roomId, current).then(verified => {
-      if (dispatchRoomChecks().get(key) === check) setDispatchRoomCheck(key, verified && current() ? undefined : { phase: "retry" });
-    });
+    // Check in place without replacing the selected target's identity.
+    void verifyDispatchRoom(c, spaceId, roomId, () => latest() && dispatchTarget() === original);
     return;
   }
-  const selectExactRoom = () => {
-    setDispatchRoomCheck(scopeKey(spaceId, roomId));
-    dispatchTarget.set({ spaceId, roomId });
-  };
+  const selectExactRoom = () => dispatchTarget.set({ spaceId, roomId });
   if (!text) {
     const pending = { spaceId, roomId: null };
     dispatchTarget.set(pending);
@@ -1627,21 +1617,27 @@ export async function setDispatchSpace(spaceId: string): Promise<void> {
 }
 
 async function verifyDispatchRoom(c: Client, spaceId: string, roomId: string, here: () => boolean, select?: () => void): Promise<boolean> {
-  const ok = guard(spaceId);
   const sameSession = guard();
+  const read = beginSpaceRead(spaceId);
+  const key = scopeKey(spaceId, roomId);
+  const check: DispatchRoomCheck = { phase: "checking" };
+  const latestCheck = () => read.valid() && dispatchRoomChecks().get(key) === check;
+  setDispatchRoomCheck(key, check);
   dispatchError.set(null);
   dispatchNotice.set(null);
-  const read = beginSpaceRead(spaceId);
   const unverified = "Couldn't verify that destination. Follow up again or choose another room.";
   try {
     // Verify the exact destination from this read, never from a cached fallback.
     const list = read.finishRooms(await c.listRooms(spaceId));
-    if (!ok()) return false;
-    const key = scopeKey(spaceId, roomId);
+    if (!read.valid()) return false;
     const found = list?.some(r => r.id === roomId) === true;
     const stale = !list || (!found && (roomDeniedAtOrAfter(key, read.request) || newerAccess(key, read.request)));
-    const show = here();
+    const show = latestCheck() && here();
     batch(() => {
+      // A current exact access observation can settle the room's guard even
+      // if the panel closed or the user picked another target. That evidence
+      // is separate from permission to apply the original UI intent.
+      if (found && latestCheck()) setDispatchRoomCheck(key);
       if (list && !stale) {
         // Still settle access evidence and exact denials for superseded reads,
         // but don't repaint a newer Dispatch choice with their positive data.
@@ -1659,16 +1655,18 @@ async function verifyDispatchRoom(c: Client, spaceId: string, roomId: string, he
       disconnect(error.message);
     } else if (isAccessDenial(error)) {
       const applied = await read.deny(() => batch(() => {
-        const show = here();
+        const show = latestCheck() && here();
         dropLostSpace(spaceId, false);
         if (show) dispatchError.set(describe(error, "Could not load that Space's rooms"));
       }));
-      if (!applied && ok() && here()) dispatchError.set(unverified);
+      if (!applied && latestCheck() && here()) dispatchError.set(unverified);
     } else {
       read.finish();
-      if (ok() && here()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+      if (latestCheck() && here()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
     }
     return false;
+  } finally {
+    if (latestCheck()) setDispatchRoomCheck(key, { phase: "retry" });
   }
 }
 
@@ -2440,7 +2438,6 @@ async function dropLostRoom(spaceId: string, roomId: string, request: number, sh
     if (target?.spaceId === spaceId && target.roomId === roomId) {
       dispatchTarget.set({ spaceId, roomId: null });
     }
-    setDispatchRoomCheck(key);
     const { [key]: _e, ...events } = eventsByScope();
     eventsByScope.set(events);
     if (activeSpaceId() === spaceId && activeRoomId() === roomId) {

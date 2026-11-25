@@ -390,6 +390,158 @@ for (const recovery of ["retry", "different Space"] as const) {
   });
 }
 
+for (const flow of ["empty draft", "confirmed move"] as const) {
+  test(`${flow} Follow up blocks a cached reselect while held and after failure, until fresh exact proof`, async () => {
+    const f = world();
+    lobbyRuns(f);
+    f.addRoom("side", { id: "review", name: "Review" });
+    f.addRoom("side", { id: "scratch", name: "Scratch" });
+    f.state.runs.push({ id: "review", space_id: "side", room_id: "review", status: "completed", actor: "alice", task: "Prior review" });
+    const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
+    let next: "fail" | "verify" | undefined;
+    f.network[get] = req => {
+      const result = base(req);
+      if (!req.url.endsWith("/side/rooms") || !next) return result;
+      const reply = next;
+      next = undefined;
+      return reply === "fail" ? { status: 503, body: { error: "temporarily unavailable" }, delay: 2_000 }
+        : { ...(result as object), delay: 2_000 };
+    };
+    const app = await inChat(f, 1200, "alice", true);
+    await app.waitFor("label:Open Side project › #Review");
+    const draft = "\u2003  🌿 @bob, résumé\nKeep this exact draft  \t";
+    if (flow === "confirmed move") {
+      await app.press("id:run-follow:run-acme");
+      await app.waitFor("text:To: agent in Acme › #lobby");
+      await app.paste("id:dispatch-text", { text: draft });
+    }
+
+    next = "fail";
+    await app.press("id:run-follow:review");
+    if (flow === "confirmed move") await app.press("id:dispatch-move-draft");
+    else await app.paste("id:dispatch-text", { text: draft });
+    await app.waitUntil(() => next === undefined);
+    await app.press("id:dispatch-space:side");
+    await app.press("id:dispatch-room:review");
+    expect(app.shows("text:To: agent in Side project › #Review")).toBe(true);
+    expect(app.shows("text:Checking the selected destination…")).toBe(true);
+    expect(app.enabled("id:dispatch-send")).toBe(false);
+
+    // Deliberately choosing a different room in the same Space is allowed;
+    // returning to the implicated cached room must still be blocked.
+    await app.press("id:dispatch-room:scratch");
+    expect(app.shows("text:To: agent in Side project › #Scratch")).toBe(true);
+    expect(app.enabled("id:dispatch-send")).toBe(true);
+    await app.press("id:dispatch-room:review");
+    await app.press("id:dispatch-close");
+    await app.press("id:dispatch-new");
+    expect(app.enabled("id:dispatch-send")).toBe(false);
+    await app.clock!.runFor(2_100);
+    await app.waitFor("id:dispatch-retry-destination");
+    expect(app.shows("id:dispatch-verifying")).toBe(false);
+    expect(app.shows("text:To: agent in Side project › #Review")).toBe(true);
+    await expect(app.press("id:dispatch-send")).rejects.toMatchObject({ code: "ERR_NSH_TEST_DISABLED" });
+    expect(app.value("id:dispatch-text")).toBe(draft);
+    expect(sentAnything(f)).toBe(false);
+
+    await app.press("id:dispatch-room:scratch");
+    next = "verify";
+    await app.press("id:run-follow:review");
+    await app.press("id:dispatch-move-draft");
+    await app.waitUntil(() => next === undefined);
+    await app.press("id:dispatch-room:review"); // Retires the move intent, not its exact room check.
+    expect(app.shows("text:Checking the selected destination…")).toBe(true);
+    expect(app.enabled("id:dispatch-send")).toBe(false);
+    await app.clock!.runFor(2_100);
+    await app.waitUntil(() => app.enabled("id:dispatch-send"));
+    expect(app.shows("id:dispatch-retry-destination")).toBe(false);
+    expect(app.value("id:dispatch-text")).toBe(draft);
+    expect(sentAnything(f)).toBe(false);
+    await app.press("id:dispatch-send");
+    await app.waitFor("id:dispatch-notice");
+    expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
+      { path: "/v1/spaces/side/rooms/review/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+    ]);
+  });
+}
+
+test("an older positive Follow up can't release a newer check for the same cached room", async () => {
+  const f = world();
+  lobbyRuns(f);
+  const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
+  let next: "older success" | "newer failure" | undefined;
+  f.network[get] = req => {
+    const result = base(req);
+    if (!req.url.endsWith("/side/rooms") || !next) return result;
+    const reply = next;
+    next = undefined;
+    return reply === "older success" ? { ...(result as object), delay: 1_000 }
+      : { status: 503, body: { error: "temporarily unavailable" }, delay: 2_000 };
+  };
+  const app = await inChat(f, 1200, "alice", true);
+  await app.waitFor("label:Open Side project › #lobby");
+  next = "older success";
+  await app.press("id:run-follow:run-side");
+  await app.waitUntil(() => next === undefined);
+  await app.type("id:dispatch-text", "This draft needs current proof");
+  await app.press("id:dispatch-room:lobby");
+  next = "newer failure";
+  await app.press("id:run-follow:run-side");
+  await app.waitUntil(() => next === undefined);
+  await app.clock!.runFor(1_100);
+  expect(app.shows("text:Checking the selected destination…")).toBe(true);
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+  await app.clock!.runFor(1_000);
+  await app.waitFor("id:dispatch-retry-destination");
+  expect(app.shows("text:To: agent in Side project › #lobby")).toBe(true);
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+  expect(sentAnything(f)).toBe(false);
+});
+
+test("a failed name lookup stays blocked when a different room's exact check fills the cache", async () => {
+  const f = world();
+  lobbyRuns(f);
+  f.state.runs.push({ id: "review", space_id: "side", room_id: "review", status: "completed", actor: "alice", task: "Prior review" });
+  const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
+  let failLookup = false;
+  f.network[get] = req => {
+    if (failLookup && req.url.endsWith("/side/rooms")) {
+      failLookup = false;
+      return { status: 503, body: { error: "temporarily unavailable" } };
+    }
+    return base(req);
+  };
+  const app = await inChat(f, 1200, "alice", true);
+  await app.waitFor("label:Open Side project › #lobby");
+  await app.press("id:run-follow:run-acme");
+  await app.waitFor("text:To: agent in Acme › #lobby");
+  const draft = "🌿 @bob, résumé\nUse the chosen room  \t";
+  await app.paste("id:dispatch-text", { text: draft });
+  f.addRoom("side", { id: "review", name: "Review", parent_room_id: "lobby" });
+  failLookup = true;
+  await app.press("id:run-follow:review");
+  await app.waitFor("id:dispatch-error");
+  expect(app.shows("id:dispatch-move-confirm")).toBe(false);
+  expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+
+  await app.press("id:run-follow:run-side");
+  await app.press("id:dispatch-move-draft");
+  await app.waitFor("text:To: agent in Side project › #lobby");
+  await app.press("id:dispatch-room:review");
+  expect(app.shows("text:To: agent in Side project › #Review")).toBe(true);
+  expect(app.shows("id:dispatch-retry-destination")).toBe(true);
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+  await app.press("id:dispatch-room:lobby");
+  expect(app.enabled("id:dispatch-send")).toBe(true);
+  expect(app.value("id:dispatch-text")).toBe(draft);
+  expect(sentAnything(f)).toBe(false);
+  await app.press("id:dispatch-send");
+  await app.waitFor("id:dispatch-notice");
+  expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
+    { path: "/v1/spaces/side/rooms/lobby/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+  ]);
+});
+
 test("Follow up resolves an uncached thread in a cached Space before asking and checks it again on consent", async () => {
   const f = world();
   lobbyRuns(f);
