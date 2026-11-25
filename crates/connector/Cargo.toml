@@ -21,6 +21,8 @@ path = "src/lib.rs"
 anyhow = "1.0.100"
 # System One and embeddings clients, shared with metro-server.
 metro-model-protocol = { path = "../model-protocol" }
+# The desktop updater: release verification and the anonymous release check.
+metro-release = { path = "../release", features = ["async"] }
 # openai_oauth: PKCE and state encoding.
 base64 = "0.22"
 # openai_oauth: ID-token parsing. Same single crypto backend as metro-auth;
@@ -57,9 +59,10 @@ libc = "0.2.180"
 # openai_oauth: DPAPI (current user) for its credential store.
 # opener: ShellExecuteW (with COM) to open the sign-in start link.
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Networking_WinSock", "Win32_System_Com", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Security_Cryptography", "Win32_Networking_WinSock", "Win32_System_Com", "Win32_System_Registry", "Win32_System_JobObjects", "Win32_System_Threading", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging"] }
 
 [dev-dependencies]
+metro-release = { path = "../release", features = ["async", "testing"] }
 aws-lc-rs = "1"
 axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"] }
 jsonwebtoken = { version = "12", default-features = false, features = ["aws_lc_rs", "use_pem"] }

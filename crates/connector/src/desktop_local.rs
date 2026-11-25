@@ -300,6 +300,8 @@ impl LocalServer {
             .env("METRO_PROVIDER_KEY_FILE", &dirs.master_key)
             .env("METRO_READY_FILE", &ready_path)
             .env("METRO_EXIT_ON_STDIN_EOF", "1")
+            // The app checks for updates itself; its private server never does.
+            .env("METRO_UPDATE_CHECK", "off")
             .stdin(Stdio::piped())
             .stdout(Stdio::from(
                 log.try_clone()

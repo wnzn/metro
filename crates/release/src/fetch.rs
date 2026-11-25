@@ -545,6 +545,34 @@ mod nonblocking {
             Ok(CheckOutcome::Newer(release))
         }
 
+        /// Fetch and verify the `SHA256SUMS` of exactly `version`.
+        pub async fn fetch_release(
+            &self,
+            verifier: &dyn crate::ReleaseVerifier,
+            version: &Version,
+        ) -> Result<crate::VerifiedRelease, Error> {
+            let manifest = self
+                .get(
+                    &self.source.asset_url(version, "SHA256SUMS")?,
+                    crate::MAX_MANIFEST,
+                )
+                .await?;
+            let bundle = self
+                .get(
+                    &self.source.asset_url(version, "SHA256SUMS.sigstore.json")?,
+                    crate::MAX_BUNDLE,
+                )
+                .await?;
+            let release = crate::release::verify_manifest(verifier, &manifest, &bundle)?;
+            if release.version != *version {
+                return Err(Error::new(
+                    ErrorCode::Inconsistent,
+                    "signed release is for another version",
+                ));
+            }
+            Ok(release)
+        }
+
         /// GitHub's release notes for `version` (`None` when unavailable,
         /// including when rate limited: the UI links the release page).
         pub async fn notes(&self, version: &Version) -> Option<Notes> {

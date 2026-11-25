@@ -259,6 +259,13 @@ fn router(ctx: Arc<Ctx>) -> Router {
         .route("/v1/connections/{id}/endpoint", put(endpoint))
         .route("/v1/connections/{id}/forget", post(forget))
         .route("/v1/local-workspace/open", post(local_open))
+        .route("/v1/update", get(update_state))
+        .route("/v1/update/check", post(update_check))
+        .route("/v1/update/settings", put(update_settings))
+        .route("/v1/update/download", post(update_download))
+        .route("/v1/update/apply", post(update_apply))
+        .route("/v1/update/cancel", post(update_cancel))
+        .route("/v1/update/started", post(update_started))
         .route("/v1/local-tools", any(tools))
         .route("/v1/local-tools/{*rest}", any(tools))
         .fallback(|| async { err(404, "not_found", "No such bridge endpoint").into_response() })
@@ -487,4 +494,140 @@ async fn tools(State(ctx): State<Arc<Ctx>>, req: Request<Body>) -> Response {
     let (status, v) = ctx.desktop.tools_request(m, &path, &bytes).await;
     let status = StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
     (status, axum::Json(v)).into_response()
+}
+
+// ---- updates (see crate::desktop::update) ----
+//
+// A `would_interrupt` refusal of apply is answered from the same state the
+// UI reads: `GET /v1/update` carries `busy` (serving connections, local
+// workspace).
+
+fn updater(ctx: &Ctx) -> Option<&Arc<crate::desktop::update::Updater>> {
+    ctx.desktop.updater()
+}
+
+fn unavailable() -> Response {
+    err(
+        503,
+        "update_unavailable",
+        "Updates are handled by the first Metro window",
+    )
+    .into_response()
+}
+
+fn refusal(r: crate::desktop::update::Refusal) -> Response {
+    err(r.status, r.code, &r.message).into_response()
+}
+
+fn update_view(ctx: &Ctx, u: &crate::desktop::update::Updater) -> Response {
+    ok(u.state(ctx.desktop.update_busy()))
+}
+
+async fn update_state(State(ctx): State<Arc<Ctx>>) -> Response {
+    match updater(&ctx) {
+        Some(u) => update_view(&ctx, u),
+        None => unavailable(),
+    }
+}
+
+async fn update_check(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    if let Err(e) = body::<Empty>(&b) {
+        return error_response(&e);
+    }
+    let u = match updater(&ctx) {
+        Some(u) => u.clone(),
+        None => return unavailable(),
+    };
+    match u.check(true).await {
+        Ok(()) => update_view(&ctx, &u),
+        Err(r) => refusal(r),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateSettings {
+    auto_check: bool,
+}
+
+async fn update_settings(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    let s: UpdateSettings = match body(&b) {
+        Ok(s) => s,
+        Err(e) => return error_response(&e),
+    };
+    match updater(&ctx) {
+        Some(u) => {
+            u.set_auto_check(s.auto_check);
+            update_view(&ctx, u)
+        }
+        None => unavailable(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateVersion {
+    version: String,
+}
+
+async fn update_download(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    let v: UpdateVersion = match body(&b) {
+        Ok(v) => v,
+        Err(e) => return error_response(&e),
+    };
+    match updater(&ctx) {
+        Some(u) => match u.start_download(&v.version) {
+            Ok(()) => update_view(&ctx, u),
+            Err(r) => refusal(r),
+        },
+        None => unavailable(),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpdateApply {
+    version: String,
+    #[serde(default)]
+    confirm_interrupt: bool,
+}
+
+async fn update_apply(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    let a: UpdateApply = match body(&b) {
+        Ok(a) => a,
+        Err(e) => return error_response(&e),
+    };
+    match updater(&ctx) {
+        Some(u) => {
+            let busy = ctx.desktop.update_busy();
+            match u.request_apply(&a.version, a.confirm_interrupt, busy) {
+                Ok(()) => update_view(&ctx, u),
+                Err(r) => refusal(r),
+            }
+        }
+        None => unavailable(),
+    }
+}
+
+async fn update_cancel(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    if let Err(e) = body::<Empty>(&b) {
+        return error_response(&e);
+    }
+    match updater(&ctx) {
+        Some(u) => match u.cancel() {
+            Ok(()) => update_view(&ctx, u),
+            Err(r) => refusal(r),
+        },
+        None => unavailable(),
+    }
+}
+
+async fn update_started(State(ctx): State<Arc<Ctx>>, b: Bytes) -> Response {
+    if let Err(e) = body::<Empty>(&b) {
+        return error_response(&e);
+    }
+    match updater(&ctx) {
+        Some(u) => ok(json!({"trial": u.started()})),
+        None => unavailable(),
+    }
 }

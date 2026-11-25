@@ -1711,6 +1711,7 @@ dependencies = [
  "jsonwebtoken",
  "libc",
  "metro-model-protocol",
+ "metro-release",
  "rand 0.9.5",
  "reqwest",
  "rpassword",
@@ -1731,6 +1732,7 @@ version = "0.4.0"
 dependencies = [
  "libc",
  "metro-connector",
+ "metro-release",
  "serde_json",
  "tokio",
  "windows-sys 0.61.2",

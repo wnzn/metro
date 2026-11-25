@@ -284,6 +284,8 @@ pub struct DesktopConfig {
     /// Opens a sign-in URL in the person's browser.
     pub open_browser: Opener,
     pub oauth_endpoints: Endpoints,
+    /// The update check and in-app update (primary instance only).
+    pub updater: Option<Arc<crate::desktop::update::Updater>>,
 }
 
 impl DesktopConfig {
@@ -297,6 +299,7 @@ impl DesktopConfig {
             prepare_wait: PREPARE_WAIT,
             open_browser: Arc::new(open_system_browser),
             oauth_endpoints: Endpoints::openai(),
+            updater: None,
         }
     }
 }
@@ -504,6 +507,29 @@ impl Desktop {
     }
 
     // ---------------------------------------------------------------- status
+
+    /// The updater, when this is the primary instance.
+    pub fn updater(&self) -> Option<&Arc<crate::desktop::update::Updater>> {
+        self.cfg.updater.as_ref()
+    }
+
+    /// What a restart for an update would interrupt.
+    pub fn update_busy(&self) -> crate::desktop::update::Busy {
+        let serving_connections = lock(&self.state)
+            .live
+            .values()
+            .filter(|l| matches!(l.worker, WorkerState::Online | WorkerState::Starting))
+            .count();
+        let local_workspace = self
+            .cfg
+            .local
+            .as_ref()
+            .is_some_and(|h| matches!(h.state(), LocalState::Running | LocalState::Starting));
+        crate::desktop::update::Busy {
+            serving_connections,
+            local_workspace,
+        }
+    }
 
     pub async fn status(&self) -> Value {
         let (session, list) = {
