@@ -850,7 +850,7 @@ async fn run_now_dispatches_exactly_the_claimed_snapshot() {
         "alice",
         &task.id,
         Some(task.revision + 1),
-        fake.as_ref(),
+        fake.clone(),
         StdDuration::from_secs(5),
     )
     .await
@@ -883,4 +883,38 @@ async fn run_now_dispatches_exactly_the_claimed_snapshot() {
     let tx = conn.transaction().unwrap();
     let err = claim_now_in(&tx, "alice", &task.id, None, Some("s-other"), Utc::now()).unwrap_err();
     assert!(matches!(err, ScheduleError::Conflict(_)), "{err:?}");
+}
+
+#[tokio::test]
+async fn run_now_is_recorded_even_if_its_caller_goes_away() {
+    let st = state().await;
+    let fake = Fake::new(Mode::Hang);
+    let task = create(&st, "alice", body(cron("0 3 * * *", "UTC")), t(NOW)).unwrap();
+    let (s2, f2, id) = (st.clone(), fake.clone(), task.id.clone());
+    // The caller (an HTTP handler, say) is dropped while the prompt is out.
+    let caller = tokio::spawn(async move {
+        let _ = run_now_with(&s2, "alice", &id, None, f2, StdDuration::from_secs(30)).await;
+    });
+    for _ in 0..200 {
+        if !fake.calls().is_empty() {
+            break;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    assert_eq!(fake.calls().len(), 1);
+    caller.abort();
+    let _ = caller.await;
+    fake.release.notify_one();
+    for _ in 0..200 {
+        let h = runs(&st, "alice", &task.id);
+        if h[0].status != status::DISPATCHING {
+            assert_eq!(h[0].status, status::DISPATCHED, "{h:?}");
+            return;
+        }
+        tokio::time::sleep(StdDuration::from_millis(10)).await;
+    }
+    panic!(
+        "the occurrence was left dispatching: {:?}",
+        runs(&st, "alice", &task.id)
+    );
 }

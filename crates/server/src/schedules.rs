@@ -1437,7 +1437,7 @@ pub async fn run_now_with(
     owner: &str,
     id: &str,
     expected_revision: Option<i64>,
-    submit: &dyn Submitter,
+    submit: std::sync::Arc<dyn Submitter>,
     timeout: StdDuration,
 ) -> Result<RunView, ScheduleError> {
     let (o, i) = (owner.to_owned(), id.to_owned());
@@ -1445,7 +1445,12 @@ pub async fn run_now_with(
         .db
         .call(move |db| Ok(claim_now(db, &o, &i, expected_revision, Utc::now())))
         .await??;
-    dispatch_claimed(state, claim, task, submit, timeout).await
+    // The claimed occurrence is owned by its own task: the caller (an HTTP
+    // handler) going away never leaves it `dispatching` unrecorded.
+    let st = state.clone();
+    tokio::spawn(async move { dispatch_claimed(&st, claim, task, submit.as_ref(), timeout).await })
+        .await
+        .map_err(|e| ScheduleError::Internal(anyhow::anyhow!("dispatching a run now: {e}")))?
 }
 
 /// Submit exactly the claimed snapshot `task` for `claim` and record the
@@ -1514,7 +1519,7 @@ pub async fn run_now_for(
         owner,
         id,
         expected_revision,
-        &Routing,
+        std::sync::Arc::new(Routing),
         SUBMIT_TIMEOUT,
     )
     .await
