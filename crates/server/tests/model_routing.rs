@@ -218,6 +218,9 @@ impl RoutingBackend for Backend {
             if message.contains("[timeout]") {
                 return std::future::pending().await;
             }
+            if message.contains("[busy]") {
+                return Err(ProviderError::Busy.into());
+            }
             Fake::answer(message, &questions).map_err(anyhow::Error::msg)
         })
     }
@@ -1635,15 +1638,13 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
     assert!(started["pick"].as_str().unwrap().contains("unsure"));
     // A failed or malformed decision runs nothing for @agent, visibly.
     for (text, reason) in [
-        ("@agent [err] x", "unreachable"),
-        ("@agent [ghost] x", "invalid_answer"),
+        ("@agent [err] x", "the System One call failed"),
+        ("@agent [busy] x", "the System One call failed"),
+        ("@agent [ghost] x", "System One's answer was malformed"),
     ] {
         let calls = h.model_calls().len();
         let e = h.say("alice", Some(&sid), json!({"text": text})).await;
-        assert_eq!(
-            e["addressing_note"],
-            json!({"kind": "classification_failed", "reason": reason})
-        );
+        assert_eq!(e.get("addressing_note"), Some(&Value::Null));
         let a = h
             .answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
             .await;
@@ -1653,6 +1654,12 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
                 .as_str()
                 .unwrap()
                 .contains("could not choose an agent")
+        );
+        assert!(
+            a["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!(": {reason}."))
         );
         tokio::time::sleep(Duration::from_millis(200)).await;
         assert_eq!(h.model_calls().len(), calls, "{text}");
@@ -1723,6 +1730,33 @@ async fn the_classifier_picks_among_agents_only_for_the_sender_who_opted_in() {
         )
         .await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+
+    // Losing the classifier must not tell other members about the sender's
+    // connection or share. Bob sees the same room error as an upstream failure.
+    h.fake
+        .conns
+        .lock()
+        .unwrap()
+        .remove(&id(CLASSIFIER))
+        .unwrap();
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "@agent access changed"}),
+        )
+        .await;
+    assert_eq!(e.get("addressing_note"), Some(&Value::Null));
+    let err = h
+        .answer_after("bob", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
+    assert_eq!(err["kind"], "error");
+    assert!(
+        err["text"]
+            .as_str()
+            .unwrap()
+            .contains(": the System One call failed.")
+    );
 }
 
 #[tokio::test]

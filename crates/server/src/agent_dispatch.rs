@@ -141,9 +141,14 @@ pub async fn plan(
                         {
                             Ok(t) => push(&mut plan.targets, t),
                             Err(why) => {
-                                plan.addressing_note = Some(why.into());
-                                // Generic @agent was explicitly addressed; keep
-                                // the existing visible error for this case.
+                                // Keep the existing room error without revealing
+                                // changes to the sender's access or connection.
+                                let why = match why {
+                                    DecisionFailure::NotAllowed | DecisionFailure::Busy => {
+                                        DecisionFailure::Unreachable
+                                    }
+                                    other => other,
+                                };
                                 plan.errors.push(format!(
                                     "Your classifier could not choose an agent for this message: \
                                      {why}. No agent ran for @agent; mention an agent by its \
