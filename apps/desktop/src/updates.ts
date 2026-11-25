@@ -236,6 +236,7 @@ export function createDesktopUpdates(endpoint: BridgeEndpoint | null, storage: P
   let healthSent = false;
   let readInFlight: Promise<void> | undefined;
   let revision = 0;
+  let acceptedReads = 0;
   let viewers = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -272,7 +273,10 @@ export function createDesktopUpdates(endpoint: BridgeEndpoint | null, storage: P
     clearTimeout(timer);
     const observed = revision;
     const read: Promise<void> = bridge.read().then(s => {
-      if (readInFlight === read && observed === revision) publish(s);
+      if (readInFlight === read && observed === revision) {
+        ++acceptedReads;
+        publish(s);
+      }
     }, (e: UpdateBridgeError) => {
       if (readInFlight !== read || observed !== revision) return;
       if (state()?.phase !== "applying") readProblem.set(e.status === 404 ? "old_launcher" : e.code);
@@ -286,17 +290,26 @@ export function createDesktopUpdates(endpoint: BridgeEndpoint | null, storage: P
   }
 
   async function run(command: Command, act: () => Promise<UpdateState>, actedOn?: UpdateOffer): Promise<string | null> {
+    const before = acceptedReads;
     ++revision;
     pending.set(command);
     problem.set(null);
     notice.set(null);
-    if (command === "cancel") cancelling.set(true);
     schedule();
     let refusal = null;
     try {
       const s = await act();
       ++revision; // No in-flight GET may overwrite a newer action response.
-      publish(s);
+      if (command === "cancel") cancelling.set(true);
+      if (acceptedReads === before) {
+        publish(s);
+      } else {
+        // The command was accepted, but its whole snapshot may predate the
+        // status we've shown. Keep that state and read after the acceptance
+        // to learn the command's effect, without repeating the intent.
+        readInFlight = undefined;
+        await refresh();
+      }
     } catch (e) {
       ++revision;
       refusal = e instanceof UpdateBridgeError ? e.code : "unavailable";

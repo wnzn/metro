@@ -35,6 +35,7 @@ function scenario(overrides: Record<string, unknown> = {}) {
   const fixture = {
     f, calls, readDelay: 0, readError: null as null | { status: number; body: unknown },
     check: null as null | ((body: any) => unknown),
+    settingsDelay: 0,
     download: null as null | ((body: any) => unknown),
     apply: null as null | ((body: any) => unknown),
     update(patch: Record<string, unknown>) { view = { ...view, ...patch }; },
@@ -52,7 +53,7 @@ function scenario(overrides: Record<string, unknown> = {}) {
       case "read": return { ...(fixture.readError ?? ok(view)), delay: fixture.readDelay };
       case "started": return ok({ trial: true });
       case "check": return fixture.check?.(body) ?? ok(view);
-      case "settings": fixture.update({ auto_check: body.auto_check }); return ok(view);
+      case "settings": fixture.update({ auto_check: body.auto_check }); return { ...ok(view), delay: fixture.settingsDelay };
       case "download":
         if (fixture.download) return fixture.download(body);
         fixture.update({ phase: "downloading", progress: { done: 0, total: 0 } });
@@ -366,6 +367,40 @@ test("a busy refusal reads fresh status before an old poll returns, and that pol
   expect(f.calls.filter(c => c.step === "apply").map(c => c.body)).toEqual([
     { version: NEXT, confirm_interrupt: false }, { version: NEXT, confirm_interrupt: true },
   ]);
+});
+
+test("a late successful settings reply cannot rewind an offer already updated by GET", async () => {
+  const f = scenario(available());
+  const app = await open("../../test/AboutHarness.tsx", { modules: bridgeEnv(), network: f.network as any,
+    clock: {}, width: 1000, height: 840, platform: "linux" });
+  await app.press("id:h-about");
+  await app.waitFor("id:update-start");
+  f.settingsDelay = 2_500;
+  await app.press("id:update-auto");
+  await app.waitUntil(() => f.count("settings") === 1, { timeout: 400 });
+  const reads = f.count("read");
+
+  f.update({ latest: latest(AFTER), last_checked_at: lastAt + 1 });
+  await app.press("id:h-poll-updater");
+  await app.waitFor(`text:Update to ${AFTER}…`, { timeout: 400 });
+  expect(f.count("read")).toBe(reads + 1);
+  // Keep the post-acknowledgement GET pending long enough to catch a stale
+  // command snapshot that would otherwise flash the old offer again.
+  f.readDelay = 600;
+  await app.clock!.runFor(2_500);
+  expect(app.shows(`text:Update to ${AFTER}…`)).toBe(true);
+  expect(app.shows(`text:Update to ${NEXT}…`)).toBe(false);
+  expect(app.shows("id:update-action-error")).toBe(false);
+  expect(f.count("read")).toBe(reads + 2);
+  expect(f.calls.filter(c => c.step === "settings").map(c => c.body)).toEqual([{ auto_check: false }]);
+  await app.clock!.runFor(600);
+
+  f.settingsDelay = 0;
+  await app.press("id:update-auto");
+  await app.waitUntil(() => f.count("settings") === 2, { timeout: 400 });
+  expect(f.calls.filter(c => c.step === "settings").map(c => c.body)).toEqual([{ auto_check: false }, { auto_check: true }]);
+  expect(f.count("download")).toBe(0);
+  expect(f.count("apply")).toBe(0);
 });
 
 test("a ready refusal blocks the same stage on refresh, not a distinct stage", async () => {
