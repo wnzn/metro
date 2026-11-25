@@ -61,6 +61,8 @@ import {
   view,
 } from "./store";
 import { forgetQuietly, localConnections, localStep, onLocalPairingChanged, packaged, refreshHelper } from "./device/state";
+import { beginSpaceRunnerObservation, invalidateSpaceRunnerObservations, spaceRunners } from "./spaceRunnerObservations";
+export { spaceRunners } from "./spaceRunnerObservations";
 
 export type { Capability, CatalogProvider, ConnectionModel, DeviceStatus, ModelThinking, NewConnectionModel, ProviderConnection, RegisteredRunner, RunnerVisibility, SpaceRunner };
 
@@ -269,10 +271,11 @@ export async function deleteRunner(runnerId: string): Promise<void> {
       runnerNotice.set(`Runner “${runner?.name ?? runnerId}” was deleted. It no longer serves any Space.`);
       // Spaces it served now have no runner; the next Space list refresh confirms it.
       const cached = spaceRunners();
-      const next: Record<string, SpaceRunner | null> = {};
-      for (const [sid, r] of Object.entries(cached)) next[sid] = r?.kind === "registered" && r.id === runnerId ? null : r;
-      spaceRunners.set(next);
-      for (const [sid, r] of Object.entries(cached)) if (r?.kind === "registered" && r.id === runnerId) setRunnerPaired(sid, false);
+      for (const [sid, r] of Object.entries(cached)) {
+        if (r?.kind !== "registered" || r.id !== runnerId) continue;
+        invalidateSpaceRunnerRequests(sid);
+        beginSpaceRunnerObservation(sid).publish(null);
+      }
     });
     void loadRunners();
   } catch (error) {
@@ -286,8 +289,6 @@ const onRunnersPage = () => place() === "settings" && settingsSection() === "run
 
 // ------------------------------------------------------------------ a Space's runner (owner's Manage view)
 
-/** Who serves each Space, as last loaded. Missing: not loaded yet. */
-export const spaceRunners = signal<Record<string, SpaceRunner | null>>({});
 export const activeSpaceRunner = computed(() => {
   const sid = activeSpaceId();
   if (!sid) return undefined;
@@ -299,22 +300,63 @@ export const registeredRunnersSupported = signal(true);
 /** What is in flight in the Manage view: "attach:<id>", "detach", "issue", "revoke". */
 export const spaceRunnerBusy = signal<string | null>(null);
 export const spaceRunnerNotice = signal<string | null>(null);
-let spaceRunnerSeq = 0;
+const spaceRunnerWrites = new Map<string, object>();
 
-export async function loadSpaceRunner(spaceId: string): Promise<void> {
+function runnerRequest(markers: Map<string, object>, sid: string) {
+  const mark = {};
+  markers.set(sid, mark);
+  const ok = sessionGuard(sid);
+  return () => ok() && markers.get(sid) === mark;
+}
+
+function invalidateSpaceRunnerRequests(sid: string) {
+  invalidateSpaceRunnerObservations(sid);
+  // Keep a new marker even after the action settles: becoming empty again
+  // must not restore consent captured before the action.
+  spaceRunnerWrites.set(sid, {});
+}
+
+/** Capture consent to write to this Space as it was at submission. */
+export function snapshotSpaceRunnerWrite(sid: string) {
+  const mark = spaceRunnerWrites.get(sid);
+  const ok = sessionGuard(sid);
+  return () => ok() && spaceRunnerWrites.get(sid) === mark;
+}
+
+/** Compare and mark an exact-Space write before the caller dispatches it in the same turn. */
+export function beginSpaceRunnerWrite(sid: string, expected?: () => boolean) {
+  if (expected && !expected()) return null;
+  invalidateSpaceRunnerObservations(sid);
+  return runnerRequest(spaceRunnerWrites, sid);
+}
+
+/** The POST's reply is historical by the time it arrives. Read the actual assignment. */
+export async function reconcileOwnedSpaceRunner(sid: string, stillLatest: () => boolean) {
   const c = apiClient();
-  if (!c) return;
-  const seq = ++spaceRunnerSeq;
-  const ok = sessionGuard(spaceId);
+  const owns = () => spaces().some((s) => s.id === sid && s.role === "owner");
+  if (!c || !stillLatest() || !owns()) return undefined;
+  const observation = beginSpaceRunnerObservation(sid);
+  const current = await c.getSpaceRunner(sid);
+  if (!stillLatest() || !owns() || !observation.publish(current)) return undefined;
+  return current;
+}
+
+export function loadSpaceRunner(spaceId: string): Promise<void> {
+  return readSpaceRunner(spaceId, () => true);
+}
+
+async function readSpaceRunner(spaceId: string, stillLatest: () => boolean): Promise<void> {
+  const c = apiClient();
+  if (!c || !stillLatest()) return;
+  const observation = beginSpaceRunnerObservation(spaceId);
   try {
     const runner = await c.getSpaceRunner(spaceId);
-    if (!ok() || seq !== spaceRunnerSeq) return;
+    if (!stillLatest()) return;
     batch(() => {
-      registeredRunnersSupported.set(true);
-      spaceRunners.set({ ...spaceRunners(), [spaceId]: runner });
+      if (observation.publish(runner)) registeredRunnersSupported.set(true);
     });
   } catch (error) {
-    if (!ok() || seq !== spaceRunnerSeq || isAborted(error)) return;
+    if (!stillLatest() || !observation.isCurrent() || isAborted(error)) return;
     // 404 for a Space we're still in: this server predates registered runners.
     if (error instanceof ApiError && error.kind === "not_found" && spaces().some((s) => s.id === spaceId)) {
       const legacy = spaces().find((s) => s.id === spaceId)?.runnerPaired;
@@ -324,8 +366,28 @@ export async function loadSpaceRunner(spaceId: string): Promise<void> {
       });
       return;
     }
-    handleManageError(error, "Could not load this Space's runner", spaceId);
+    if (activeSpaceId() === spaceId) handleManageError(error, "Could not load this Space's runner", spaceId);
   }
+}
+
+/** Fence the exact Space before publishing an ack or reading its current assignment. */
+function finishManageRunnerWrite(
+  sid: string, dispatched: () => boolean, runner: SpaceRunner | null | undefined,
+) {
+  // A read sent after dispatch but before this ack can still describe the
+  // pre-commit assignment. Fence it and expire consent captured mid-write.
+  const afterAck = beginSpaceRunnerWrite(sid, dispatched);
+  if (!afterAck) return false;
+  batch(() => {
+    if (runner !== undefined) beginSpaceRunnerObservation(sid).publish(runner);
+    else {
+      // An older server can accept an attach without returning a registration.
+      spaceRunners.set({ ...spaceRunners(), [sid]: null });
+      setRunnerPaired(sid, true);
+    }
+    void readSpaceRunner(sid, afterAck);
+  });
+  return true;
 }
 
 /** Attaches a registered runner to the active Space (owner only). Replaces nothing: detach first. */
@@ -333,7 +395,9 @@ export async function attachRunner(runnerId: string): Promise<void> {
   const sid = activeSpaceId();
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
-  const ok = sessionGuard(sid);
+  const ok = sessionGuard();
+  const dispatched = beginSpaceRunnerWrite(sid);
+  if (!dispatched) return;
   batch(() => {
     spaceRunnerBusy.set(`attach:${runnerId}`);
     spaceRunnerNotice.set(null);
@@ -341,18 +405,14 @@ export async function attachRunner(runnerId: string): Promise<void> {
   });
   try {
     const attached = await c.attachRunner(sid, runnerId);
-    if (!ok()) return;
-    spaceRunnerSeq++;
     const runner = runners()?.find((r) => r.id === runnerId);
-    const value: SpaceRunner | null = attached ?? (runner ? { kind: "registered", id: runner.id, name: runner.name, visibility: runner.visibility } : null);
+    const value: SpaceRunner | undefined = attached ?? (runner ? { kind: "registered", id: runner.id, name: runner.name, visibility: runner.visibility } : undefined);
     batch(() => {
-      spaceRunners.set({ ...spaceRunners(), [sid]: value });
-      setRunnerPaired(sid, true);
-      spaceRunnerNotice.set(`Attached “${value?.kind === "registered" ? value.name : runnerId}”. Jobs from this Space go to it from now on, in its own folder for this Space.`);
+      if (!finishManageRunnerWrite(sid, dispatched, value)) return;
+      spaceRunnerNotice.set(`Attached “${value?.name ?? runnerId}”. Jobs from this Space go to it from now on, in its own folder for this Space.`);
     });
-    if (!attached) void loadSpaceRunner(sid);
   } catch (error) {
-    if (ok()) handleManageError(error, "Could not attach the runner", sid);
+    if (dispatched()) handleManageError(error, "Could not attach the runner", sid);
   } finally {
     if (ok()) spaceRunnerBusy.set(null);
   }
@@ -363,22 +423,22 @@ export async function detachRunner(): Promise<void> {
   const sid = activeSpaceId();
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
-  const ok = sessionGuard(sid);
+  const ok = sessionGuard();
+  const dispatched = beginSpaceRunnerWrite(sid);
+  if (!dispatched) return;
   batch(() => {
     spaceRunnerBusy.set("detach");
     spaceRunnerNotice.set(null);
   });
   try {
     await c.detachRunner(sid);
-    if (!ok()) return;
-    spaceRunnerSeq++;
     batch(() => {
-      spaceRunners.set({ ...spaceRunners(), [sid]: null });
-      setRunnerPaired(sid, false);
-      spaceRunnerNotice.set("Runner detached. It no longer gets jobs from this Space; its other Spaces are unchanged.");
+      if (finishManageRunnerWrite(sid, dispatched, null)) {
+        spaceRunnerNotice.set("Runner detached. It no longer gets jobs from this Space; its other Spaces are unchanged.");
+      }
     });
   } catch (error) {
-    if (ok()) handleManageError(error, "Could not detach the runner", sid);
+    if (dispatched()) handleManageError(error, "Could not detach the runner", sid);
   } finally {
     if (ok()) spaceRunnerBusy.set(null);
   }
@@ -389,7 +449,9 @@ export async function issueDedicatedToken(): Promise<void> {
   const sid = activeSpaceId();
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
-  const ok = sessionGuard(sid);
+  const ok = sessionGuard();
+  const dispatched = beginSpaceRunnerWrite(sid);
+  if (!dispatched) return;
   batch(() => {
     spaceRunnerBusy.set("issue");
     spaceRunnerNotice.set(null);
@@ -397,18 +459,13 @@ export async function issueDedicatedToken(): Promise<void> {
   });
   try {
     const token = await c.issueRunnerToken(sid);
-    if (!ok()) return;
-    spaceRunnerSeq++;
-    batch(() => {
-      spaceRunners.set({ ...spaceRunners(), [sid]: { kind: "dedicated", name: "Dedicated Space runner" } });
-      setRunnerPaired(sid, true);
-    });
+    if (!finishManageRunnerWrite(sid, dispatched, { kind: "dedicated", name: "Dedicated Space runner" })) return;
     // Show it only if the owner is still looking at this Space's management view.
     if (activeSpaceId() === sid && view() === "manage" && place() === "space") {
       reveal({ kind: "dedicated", spaceId: sid, spaceName: activeSpace()?.name ?? sid, token });
     }
   } catch (error) {
-    if (ok()) handleManageError(error, "Could not issue a runner token", sid);
+    if (dispatched()) handleManageError(error, "Could not issue a runner token", sid);
   } finally {
     if (ok()) spaceRunnerBusy.set(null);
   }
@@ -418,7 +475,9 @@ export async function revokeDedicatedToken(): Promise<void> {
   const sid = activeSpaceId();
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
-  const ok = sessionGuard(sid);
+  const ok = sessionGuard();
+  const dispatched = beginSpaceRunnerWrite(sid);
+  if (!dispatched) return;
   batch(() => {
     spaceRunnerBusy.set("revoke");
     spaceRunnerNotice.set(null);
@@ -426,15 +485,13 @@ export async function revokeDedicatedToken(): Promise<void> {
   });
   try {
     await c.revokeRunnerToken(sid);
-    if (!ok()) return;
-    spaceRunnerSeq++;
     batch(() => {
-      spaceRunners.set({ ...spaceRunners(), [sid]: null });
-      setRunnerPaired(sid, false);
-      spaceRunnerNotice.set("Runner token revoked. The runner can no longer serve this Space.");
+      if (finishManageRunnerWrite(sid, dispatched, null)) {
+        spaceRunnerNotice.set("Runner token revoked. The runner can no longer serve this Space.");
+      }
     });
   } catch (error) {
-    if (ok()) handleManageError(error, "Could not revoke the runner token", sid);
+    if (dispatched()) handleManageError(error, "Could not revoke the runner token", sid);
   } finally {
     if (ok()) spaceRunnerBusy.set(null);
   }
@@ -1152,7 +1209,7 @@ onManageOpen((spaceId) => {
 onSessionEnd(() => {
   runnersSeq++;
   impactSeq++;
-  spaceRunnerSeq++;
+  spaceRunnerWrites.clear();
   catalogSeq++;
   connectionsSeq++;
   modelsSeq.clear();
@@ -1164,7 +1221,6 @@ onSessionEnd(() => {
   runnerNotice.set(null);
   runnerConfirm.set(null);
   runnerImpact.set(null);
-  spaceRunners.set({});
   registeredRunnersSupported.set(true);
   spaceRunnerBusy.set(null);
   spaceRunnerNotice.set(null);

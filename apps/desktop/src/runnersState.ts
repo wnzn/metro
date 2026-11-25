@@ -1,11 +1,12 @@
 // Shared by Settings › Runners and the entry points that offer this computer's runner.
 import { cleanup, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError } from "./api/client";
-import type { RegisteredRunner, Space } from "./api/client";
-import { loadRunners, recordRunnerUpdateAccepted, runnerBusy, runners, spaceRunners } from "./settings";
-import { apiClient, connectedTo, me, onSessionEnd, place, sessionGuard, setRunnerPaired, settingsSection, spaces } from "./store";
+import type { Client, RegisteredRunner, Space, SpaceRunner } from "./api/client";
+import { beginSpaceRunnerWrite, loadRunners, reconcileOwnedSpaceRunner, recordRunnerUpdateAccepted, runnerBusy, runners, snapshotSpaceRunnerWrite, spaceRunners } from "./settings";
+import { apiClient, connectedTo, me, onSessionEnd, place, sessionGuard, settingsSection, spaces } from "./store";
 import { helper } from "./device/state";
-import { installedBusy, installedFolderSnapshot, installedRunner, installedRunnerSeen, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner, recordAttachedFolder } from "./features/installedRunner/installedRunner";
+import { installedBusy, installedFolderSnapshot, installedRunner, installedRunnerSeen, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner } from "./features/installedRunner/installedRunner";
+import type { InstalledRunnerState } from "./features/installedRunner/installedRunner";
 
 export const runnerSessionKey = () => JSON.stringify([connectedTo(), me()]);
 export const runnerOfferStorageKey = (server: string, userId: string) =>
@@ -25,11 +26,40 @@ const attachFeedback = signal<{ message: string; incomplete: boolean } | null>(n
 export const runnerAttachFeedback = () => attachFeedback();
 export const runnerAttachBusy = signal(false);
 
+const bridgeSessionMatches = computed(() => {
+  const h = helper();
+  return h.phase === "ready" && !!h.status.session && h.status.session.accountId === me() &&
+    h.status.session.serverUrl.replace(/\/+$/, "") === connectedTo();
+});
+
 export const installedRunnerChoice = computed(() => {
+  // Reconnect can rebind even the same registration. Rendering and submitting
+  // use the same eligibility and both must wait for the action to settle.
+  if (installedBusy() === "reconnect") return null;
   const runner = installedRunner()?.runner;
   const owned = ownedInstalledRunner();
-  return runner && runner.id === owned?.id && owned.attachIfEmpty ? runner : null;
+  return bridgeSessionMatches() && runner && runner.id === owned?.id && owned.attachIfEmpty ? runner : null;
 });
+
+const installedChoiceId = computed(() => installedRunnerChoice()?.id ?? null);
+let installedChoiceEpoch = 0;
+effect(() => {
+  installedChoiceId();
+  installedChoiceEpoch++;
+});
+
+/** Capture the exact choice at submission; a lost or different choice cannot regain consent. */
+export function snapshotInstalledRunner(displayedId: string) {
+  if (installedChoiceId() !== displayedId) return null;
+  const epoch = installedChoiceEpoch;
+  const key = runnerSessionKey();
+  const sessionOK = sessionGuard();
+  return {
+    id: displayedId,
+    isCurrent: () => sessionOK() && runnerSessionKey() === key &&
+      installedChoiceEpoch === epoch && installedChoiceId() === displayedId,
+  };
+}
 
 const isEmptyOwned = (s: Space) => s.role === "owner" && s.runnerPaired === false;
 
@@ -82,9 +112,9 @@ const needsFolderRead = (interest: FolderInterest | null) => {
   return snapshot === null || snapshot === interest.baseline;
 };
 const wantsFolderRead = (interest: FolderInterest | null) =>
-  !!interest && !interest.expired() && needsFolderRead(interest) && helper().phase !== "checking";
+  !!interest && !interest.expired() && needsFolderRead(interest) && bridgeSessionMatches();
 const canCheckFolders = () => installedRunnerStatusWatchable() || installedRunnerSeen();
-const folderReadReady = computed(() => helper().phase !== "checking" && !runnerAttachBusy() && !installedBusy());
+const folderReadReady = computed(() => bridgeSessionMatches() && !runnerAttachBusy() && !installedBusy());
 
 export const installedFolderRefreshExhausted = computed(() => {
   const interest = folderInterest();
@@ -130,14 +160,14 @@ effect(() => {
 });
 
 effect(() => {
-  if (!watching() || !offerKey() || helper().phase === "checking") return;
+  if (!watching() || !offerKey() || !bridgeSessionMatches()) return;
   // Initial read is independent of the offer, so Create can still use the
   // verified runner after dismissal or when there are no existing Spaces.
   untracked(() => void loadInstalledRunner(false));
 });
 
 const shouldWatchOffer = computed(() => {
-  if (!watching() || helper().phase === "checking" || !installedRunnerStatusWatchable() ||
+  if (!watching() || !bridgeSessionMatches() || !installedRunnerStatusWatchable() ||
       runnerAttachBusy() || installedBusy() || ownedInstalledRunner()?.attachIfEmpty === false) return false;
   const key = offerKey();
   const state = offer();
@@ -188,17 +218,105 @@ function actionError(error: unknown, fallback: string) {
   return fallback;
 }
 
+type InstalledChoice = NonNullable<ReturnType<typeof snapshotInstalledRunner>>;
+type AttachProblem =
+  | { kind: "not-attached" | "superseded"; reason: string }
+  | { kind: "unconfirmed" };
+type CreatedSpaceAttachment = AttachProblem | { kind: "attached"; state: InstalledRunnerState };
+
+const notAttached = (reason: string) => ({ kind: "not-attached" as const, reason });
+const newerRunnerAction = {
+  kind: "superseded" as const, reason: "A newer runner action superseded this attachment check.",
+};
+const changedSinceSelection = notAttached("A newer runner action changed this Space after it was selected. Select it again to attach.");
+
+const ownsSpace = (sid: string) => spaces().some((s) => s.id === sid && s.role === "owner");
+
+/** Never publish from the write receipt alone: another action may have won since it was sent. */
+async function attachAndReconcile(
+  c: Client, sid: string, choice: InstalledChoice, conflict: string, expectedWrite?: () => boolean,
+): Promise<AttachProblem | { kind: "attached"; stillVerified: () => boolean }> {
+  // The server repeats ownership and emptiness checks atomically. Never fall
+  // back to the replacing route, including if the server lacks this endpoint.
+  const latest = beginSpaceRunnerWrite(sid, expectedWrite);
+  if (!latest) return changedSinceSelection;
+  const stillScoped = () => latest() && ownsSpace(sid) && choice.isCurrent();
+  const matches = (r: SpaceRunner | null | undefined) =>
+    r?.kind === "registered" && r.id === choice.id && r.visibility === "personal";
+  let accepted = false;
+  try {
+    await c.attachRunnerIfEmpty(sid, choice.id);
+    accepted = true;
+    if (!latest()) return newerRunnerAction;
+    const current = await reconcileOwnedSpaceRunner(sid, stillScoped);
+    if (!latest()) return newerRunnerAction;
+    if (current === undefined) return { kind: "unconfirmed" };
+    if (!matches(current)) return { kind: "superseded", reason: "The runner assignment changed." };
+    return { kind: "attached", stillVerified: () => stillScoped() && matches(spaceRunners()[sid]) };
+  } catch (error) {
+    if (!latest()) return newerRunnerAction;
+    if (!accepted && error instanceof ApiError && error.kind !== "protocol") {
+      if (error.status === 409) return notAttached(conflict);
+      if (error.status === 404 || error.status === 405) {
+        return notAttached("The safe attachment route or runner is no longer available on this server.");
+      }
+      if (error.status === 401 || error.status === 403) return notAttached("The server refused permission to attach the runner.");
+      if (error.status === 400 || error.status === 422) return notAttached("The server rejected the attachment request.");
+    }
+    return { kind: "unconfirmed" };
+  }
+}
+
+/** Called only after Create Space succeeds, with the id returned by that creation. */
+export async function attachCreatedSpaceRunner(
+  space: Space,
+  choice: InstalledChoice,
+  stillConsented: () => boolean,
+): Promise<CreatedSpaceAttachment> {
+  const c = apiClient();
+  const sid = space.id;
+  const spaceOK = sessionGuard(sid);
+  const consentChanged = notAttached("The Create Space choice or context changed before attachment.");
+  const runnerChanged = notAttached("This computer's runner is no longer available for this account.");
+  const notOwner = notAttached("You no longer own this Space.");
+  const alreadyPaired = notAttached("This Space already has a runner.");
+  const unsupported = notAttached("This server doesn't support safe attachment to empty Spaces.");
+  if (!c) return consentChanged;
+  if (!choice.isCurrent()) return runnerChanged;
+  if (!stillConsented()) return consentChanged;
+  if (!spaceOK() || space.role !== "owner" || !ownsSpace(sid)) return notOwner;
+  const checks = await Promise.all([readInstalledRunner(), c.listRunnerInventory(), c.listSpaces()]).catch(() => null);
+  if (!choice.isCurrent()) return runnerChanged;
+  if (!stillConsented()) return consentChanged;
+  if (!spaceOK() || !ownsSpace(sid)) return notOwner;
+  if (!checks) return notAttached("Metro couldn't verify the runner and the new Space.");
+  const [local, inventory, liveSpaces] = checks;
+  if (!inventory.attachIfEmpty) return unsupported;
+  if (local?.runner?.id !== choice.id ||
+      !inventory.runners.some((r) => r.id === choice.id && r.visibility === "personal" && r.canManage)) return runnerChanged;
+  const live = liveSpaces.find((s) => s.id === sid);
+  if (live?.role !== "owner") return notOwner;
+  if (live.runnerPaired !== false) return alreadyPaired;
+  const outcome = await attachAndReconcile(c, sid, choice, alreadyPaired.reason);
+  if (outcome.kind !== "attached") return outcome;
+  if (!outcome.stillVerified()) return { kind: "unconfirmed" };
+  dismissRunnerOffer();
+  return { kind: "attached", state: local.state };
+}
+
 /** Uses the same non-replacing route for every selected Space, one at a time. */
 export async function attachMany(spaceIds: readonly string[]) {
   const c = apiClient();
   const runner = installedRunnerChoice();
+  const choice = runner && snapshotInstalledRunner(runner.id);
   const selected = new Set(spaceIds);
-  const picks = eligibleSpaces().filter((s) => selected.has(s.id));
-  if (!c || !runner || !picks.length || runnerAttachBusy() || installedBusy()) return;
+  const picks = eligibleSpaces().filter((s) => selected.has(s.id))
+    .map((s) => ({ id: s.id, name: s.name, expectedWrite: snapshotSpaceRunnerWrite(s.id) }));
+  if (!c || !choice || !picks.length || runnerAttachBusy() || installedBusy()) return;
   const sessionOK = sessionGuard();
   const key = runnerSessionKey();
   const valid = () => sessionOK() && key === runnerSessionKey();
-  const matches = () => installedRunnerChoice()?.id === runner.id;
+  const { id, isCurrent: matches } = choice;
   runnerAttachBusy.set(true);
   attachFeedback.set(null);
   const failures: string[] = [];
@@ -207,12 +325,12 @@ export async function attachMany(spaceIds: readonly string[]) {
     const [local, inventory, liveSpaces] = await Promise.all([readInstalledRunner(), c.listRunnerInventory(), c.listSpaces()]);
     if (!valid()) return;
     if (!inventory.attachIfEmpty) {
-      ownedInstalledRunner.set({ id: runner.id, attachIfEmpty: false });
+      if (matches()) ownedInstalledRunner.set({ id, attachIfEmpty: false });
       attachFeedback.set({ message: "This server doesn't support attaching only to Spaces without a runner.", incomplete: true });
       return;
     }
-    if (!matches() || local?.runner?.id !== runner.id ||
-        !inventory.runners.some((r) => r.id === runner.id && r.visibility === "personal" && r.canManage)) {
+    if (!matches() || local?.runner?.id !== id ||
+        !inventory.runners.some((r) => r.id === id && r.visibility === "personal" && r.canManage)) {
       attachFeedback.set({ message: "This computer's runner is no longer available for this account. No Spaces were changed.", incomplete: true });
       return;
     }
@@ -228,16 +346,19 @@ export async function attachMany(spaceIds: readonly string[]) {
         failures.push(`${pick.name}: You no longer own this Space.`);
         continue;
       }
+      if (!pick.expectedWrite()) {
+        failures.push(`${pick.name}: ${changedSinceSelection.reason}`);
+        continue;
+      }
       const spaceOK = sessionGuard(s.id);
       try {
         const current = await c.getSpaceRunner(s.id);
         if (!valid()) return;
-        if (!spaceOK() || !spaces().some((space) => space.id === s.id && space.role === "owner")) {
+        if (!spaceOK() || !ownsSpace(s.id)) {
           failures.push(`${s.name}: You no longer own this Space.`);
           continue;
         }
         if (s.runnerPaired || current !== null) {
-          setRunnerPaired(s.id, true);
           failures.push(`${s.name}: Already has a runner.`);
           continue;
         }
@@ -245,22 +366,20 @@ export async function attachMany(spaceIds: readonly string[]) {
           failures.push(`${s.name}: This computer's runner changed.`);
           continue;
         }
-        const result = await c.attachRunnerIfEmpty(s.id, runner.id);
+        const result = await attachAndReconcile(c, s.id, choice, "Already has a runner.", pick.expectedWrite);
         if (!valid()) return;
-        attached++;
-        dismissRunnerOffer();
-        if (!spaceOK() || !spaces().some((space) => space.id === s.id && space.role === "owner")) continue;
-        setRunnerPaired(s.id, true);
-        spaceRunners.set({ ...spaceRunners(), [s.id]: result });
-        if (matches()) recordAttachedFolder({ id: s.id, name: s.name });
+        if (result.kind === "attached" && result.stillVerified()) {
+          attached++;
+          dismissRunnerOffer();
+        } else {
+          const detail = result.kind === "not-attached" ? result.reason
+            : result.kind === "superseded" ? `${result.reason} Check this Space before retrying.`
+            : "The attachment wasn't confirmed. Check this Space before retrying.";
+          failures.push(`${s.name}: ${detail}`);
+        }
       } catch (error) {
         if (!valid()) return;
-        if (error instanceof ApiError && error.status === 409) {
-          if (spaceOK()) setRunnerPaired(s.id, true);
-          failures.push(`${s.name}: Already has a runner.`);
-        } else {
-          failures.push(`${s.name}: ${actionError(error, "The attach was not confirmed.")}`);
-        }
+        failures.push(`${s.name}: ${actionError(error, "Metro couldn't check whether this Space already has a runner.")}`);
       }
     }
     if (!valid()) return;

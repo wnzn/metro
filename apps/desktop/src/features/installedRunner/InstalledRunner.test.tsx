@@ -17,7 +17,7 @@ type Req = { method: string; url: string; headers: Record<string, string>; body?
 
 const ROOT = "/home/me/.config/metro-desktop/local-tools/runner/0123456789abcdef/spaces";
 
-type Opts = { requested?: boolean; available?: boolean; state?: string; canReconnect?: boolean; legacy?: boolean; laterAvailable?: boolean; unconfirmedName?: string };
+type Opts = { requested?: boolean; available?: boolean; state?: string; canReconnect?: boolean; legacy?: boolean; unavailableFor?: string; unconfirmedName?: string };
 
 /** The fake bridge plus the personal runner routes. */
 function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opts = {}) {
@@ -44,8 +44,9 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
     if (header(req as any, "authorization") !== `Bearer ${BRIDGE_TOKEN}`) return { status: 401, body: { error: { code: "unauthorized", message: "Unauthorized." } } };
     if (opts.legacy && path.startsWith("/v1/local-tools/runner")) return { status: 404, body: { error: { code: "not_found", message: "unknown path" } } };
     if (path === "/v1/local-tools/runner" && req.method === "GET") {
-      const reads = t.log.filter((l) => l.path === path && l.method === "GET").length;
-      if (reads > 1 && opts.laterAvailable === false) return { status: 200, body: { ...status(), available: false, runner: null, state: "unavailable" } };
+      if (opts.unavailableFor && b.state.session?.account_id === opts.unavailableFor) {
+        return { status: 200, body: { ...status(), available: false, runner: null, state: "unavailable" } };
+      }
       const body = st.status === 200 ? status() : { error: { code: "unavailable", message: "try again" } };
       return { status: st.status, body, ...(st.delay ? { delay: st.delay } : {}) };
     }
@@ -75,15 +76,23 @@ async function openWith(f: F, t: ReturnType<typeof bridgeWithRunner> | null, man
   return open("../../../App.tsx", { network, platform: "linux", width: 1280, height: 900, modules: (t ? bridgeEnv() : launched()) as any, ...(manualClock ? { clock: {} } : {}) });
 }
 
-async function signInToRunners(app: App, user: string) {
+async function signIn(app: App, user: string) {
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
   await app.press("id:connect");
   await app.waitFor("id:nav-chat");
+}
+
+async function openRunners(app: App) {
   if (!app.shows("id:nav-settings:runners")) await app.press("id:nav-settings");
   await app.press("id:nav-settings:runners");
   await app.waitFor("id:runners-settings");
+}
+
+async function signInToRunners(app: App, user: string) {
+  await signIn(app, user);
+  await openRunners(app);
 }
 
 const text = (app: App) => app.texts().join(" | ");
@@ -226,25 +235,34 @@ test("hidden on a remote server, when not requested, with an older launcher, and
   expect(plain.requests().some((r) => r.url.includes("/v1/local-tools"))).toBe(false);
 });
 
-test("switching account re-reads once; the previous account's runner doesn't carry over", async () => {
+test("each account binds one Sidebar read; Settings refreshes without carrying the previous runner over", async () => {
   const f = world();
   f.addSpace("solo", "Solo", "alice", ["bob"]);
   const mine = f.addRunner("This PC", "personal", "alice");
   f.state.attached.set("solo", mine.id);
   // Alice's session is this computer's own server; Bob's answer says "not here".
-  const t = bridgeWithRunner(f, mine.id, "This PC", { laterAvailable: false });
-  const app = await openWith(f, t);
-  await signInToRunners(app, "alice");
+  const t = bridgeWithRunner(f, mine.id, "This PC", { unavailableFor: "bob" });
+  const reads = () => t.log.filter((l) => l.path === "/v1/local-tools/runner").length;
+  const app = await openWith(f, t, true);
+  await signIn(app, "alice");
+  await app.press("id:new-space-toggle");
+  await app.waitFor("id:new-space-use-runner");
+  expect(reads()).toBe(1);
+  await openRunners(app);
   await app.waitFor("id:installed-runner-space:solo");
-  // The page mounts more than once as it opens: still a single read.
-  expect(t.log.filter((l) => l.path === "/v1/local-tools/runner").length).toBe(1);
+  expect(reads()).toBe(2);
   await app.press("id:settings-close");
   await app.press("id:account-menu");
   await app.press("id:disconnect");
   await app.waitFor("id:connect");
-  await signInToRunners(app, "bob");
-  await app.waitUntil(() => t.log.filter((l) => l.path === "/v1/local-tools/runner").length === 2);
-  await sleep(300);
+  await signIn(app, "bob");
+  await app.waitUntil(() => reads() === 3);
+  await app.clock!.runFor(5000);
+  expect(reads()).toBe(3);
+  await openRunners(app);
+  await app.waitUntil(() => reads() === 4);
+  await app.clock!.runFor(1);
+  expect(app.shows("id:new-space-use-runner")).toBe(false);
   expect(app.shows("id:installed-runner")).toBe(false);
   expect(app.shows("id:installed-runner-space:solo")).toBe(false);
   expect(posts(t)).toEqual([]);
