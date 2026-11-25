@@ -21,6 +21,7 @@
 import { batch, computed, effect, signal, untracked } from "nsh";
 import { ApiError, EndpointPatchError } from "./api/client";
 import { serverHost } from "./api/serverUrl";
+import { readStartupProviderCatalog } from "./startupModelRequests";
 import type { PageScope } from "./ui";
 import type {
   Capability,
@@ -501,7 +502,7 @@ async function loadCatalog(): Promise<void> {
   const seq = ++catalogSeq;
   const ok = sessionGuard();
   try {
-    const value = await c.providerCatalog();
+    const value = await readStartupProviderCatalog(c);
     if (!ok() || seq !== catalogSeq) return;
     batch(() => {
       catalog.set(value);

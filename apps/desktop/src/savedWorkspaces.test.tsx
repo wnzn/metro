@@ -327,7 +327,7 @@ test("saved remote verifies before showing the scoped Shell and room hydration n
   const rooms = s.b.answerLate(betaRooms, TOKENS.bob!, 300);
   // A nonempty first page intentionally causes one catch-up request.
   const message = s.b.post("beta/lobby", { kind: "message", actor: "bob", text: "First remote room message" });
-  s.b.answerLate("/v1/models/available?space_id=beta", TOKENS.bob!, 900);
+  const models = s.b.answerLate("/v1/models/available?space_id=beta", TOKENS.bob!, 900);
   const app = await launch(s, { bridge, storage: rememberedRemote, manualClock: true });
   await app.waitFor("text:Sign in to Team B");
   expect(remotePaths(s)).toEqual([]);
@@ -345,6 +345,7 @@ test("saved remote verifies before showing the scoped Shell and room hydration n
   await app.waitUntil(() => remotePaths(s).includes(`${betaEvents}?after=${message.id}`), { timeout: 100 });
   const paths = remotePaths(s);
   for (const path of ["/v1/me", "/v1/spaces", betaRooms]) expect(paths.filter(p => p === path)).toHaveLength(1);
+  expect(models.arrived()).toBe(1);
   expect(paths.filter(p => p.includes("/events?"))).toEqual([`${betaEvents}?after=0`, `${betaEvents}?after=${message.id}`]);
   expect(paths.some(p => p.startsWith("/v1/chat/") || p === "/v1/runs" || p === "/v1/models/available" || p === "/v1/providers")).toBe(false);
   expect(bridge.opens()).toBe(0);

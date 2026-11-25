@@ -123,6 +123,7 @@ test("a slow remembered room starts one initial transcript request before the no
   local.addSpace("solo", "Solo", "carol");
   const message = local.post("solo/lobby", { kind: "message", actor: "carol", text: "First local message" });
   const rooms = local.answerLate(localRooms, LOCAL_TOKEN, 80);
+  const models = local.answerLate("/v1/models/available?space_id=solo", LOCAL_TOKEN, 900);
   local.answerLate(lobbyEvents, LOCAL_TOKEN, 300);
   const app = await launch(world(), local, fakeLauncher(), lastLocalSpace, true);
   await app.waitFor("id:workspace", { timeout: 50 });
@@ -137,6 +138,8 @@ test("a slow remembered room starts one initial transcript request before the no
   await app.waitUntil(() => roomEventPaths(local).length >= 2, { timeout: 150 });
   // The intentional catch-up page advances the cursor, never re-fetching page one.
   expect(roomEventPaths(local)).toEqual([`${lobbyEvents}?after=0`, `${lobbyEvents}?after=${message.id}`]);
+  expect(models.arrived()).toBe(1);
+  expect(local.state.log.some(r => r.path.startsWith("/v1/chat/") || r.path === "/v1/models/available")).toBe(false);
 });
 
 test("a remembered Space with no rooms makes no transcript request", async () => {
