@@ -13,6 +13,8 @@ import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
 import type { MentionSend, WireMentionSpan } from "../features/mentions/draft";
 import { readMentionSpans } from "../features/mentions/sent";
+import { readPostedNotes } from "../features/senderNotices/response";
+import type { PostedSenderNotes } from "../features/senderNotices/response";
 
 /** `parentRoomId`: set on a thread an agent delegated from that room. */
 export type Room = { id: string; name: string; parentRoomId?: string };
@@ -755,12 +757,13 @@ export function createClient(options: ClientOptions) {
       addressing: SpaceMessageBody,
       assetIds?: readonly string[],
       choice?: TurnModelChoice,
-    ): Promise<void> {
+    ): Promise<PostedSenderNotes | null> {
       const body: Record<string, unknown> = { invoke_agent: false, ...addressing, infer_text_mentions: false, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
       try {
-        await request("POST", `${room(spaceId, roomId)}/messages`, body);
+        const data = await request("POST", `${room(spaceId, roomId)}/messages`, body);
+        return readPostedNotes(data, addressing.text, true, toCreatedAt);
       } catch (error) {
         if (error instanceof ApiError && error.status === 422) {
           throw new ApiError("http", "Update Metro Server to send Space messages with safe addressing. Your draft was kept and was not sent.", 422);
@@ -784,12 +787,13 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<void> {
+    async sendChatMessage(text: string, assetIds?: readonly string[], choice?: TurnModelChoice): Promise<PostedSenderNotes | null> {
       // Text sends also ask the agent on servers that require the legacy flag.
       const body: Record<string, unknown> = { text, invoke_agent: true, ...turnModelBody(choice) };
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
-      await request("POST", "/v1/chat/messages", body);
+      const data = await request("POST", "/v1/chat/messages", body);
+      return readPostedNotes(data, text, false, toCreatedAt);
     },
 
     async saveChatNote(text: string, assetIds?: readonly string[]): Promise<void> {
