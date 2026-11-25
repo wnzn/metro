@@ -289,7 +289,9 @@ export async function attachCreatedSpaceRunner(
   if (!choice.isCurrent()) return runnerChanged;
   if (!stillConsented()) return consentChanged;
   if (!spaceOK() || space.role !== "owner" || !ownsSpace(sid)) return notOwner;
-  const checks = await Promise.all([readInstalledRunner(), c.listRunnerInventory(), c.listSpaces()]).catch(() => null);
+  const checks = await Promise.all([
+    readInstalledRunner(), readHostedAccess(c, () => c.listRunnerInventory()), c.listSpaces(),
+  ]).catch(() => null);
   if (!choice.isCurrent()) return runnerChanged;
   if (!stillConsented()) return consentChanged;
   if (!spaceOK() || !ownsSpace(sid)) return notOwner;
@@ -326,7 +328,9 @@ export async function attachMany(spaceIds: readonly string[]) {
   const failures: string[] = [];
   let attached = 0;
   try {
-    const [local, inventory, liveSpaces] = await Promise.all([readInstalledRunner(), c.listRunnerInventory(), c.listSpaces()]);
+    const [local, inventory, liveSpaces] = await Promise.all([
+      readInstalledRunner(), readHostedAccess(c, () => c.listRunnerInventory()), c.listSpaces(),
+    ]);
     if (!valid()) return;
     if (!inventory.attachIfEmpty) {
       if (matches()) ownedInstalledRunner.set({ id, attachIfEmpty: false });

@@ -53,10 +53,9 @@ function hideSpaceRunner(sid: string, stamp: number) {
   });
 }
 
-/** Take a ticket at dispatch. A newer accepted answer wins, not one merely in flight. */
-export function beginSpaceRunnerObservation(sid: string, source: "hosted" | { dropLocalFolder: () => void } = "hosted") {
-  const exactEndpoint = source === "hosted";
-  const access = beginRunnerAccessRead(sid, exactEndpoint);
+/** Hosted assignment reads only. A newer accepted answer wins, not one merely in flight. */
+export function beginSpaceRunnerObservation(sid: string) {
+  const access = beginRunnerAccessRead(sid);
   const stamp = access.request;
   const isCurrent = () => access.valid() && isSpaceRunnerStampCurrent(sid, stamp);
   const finish = (verified = false) => access.finish(verified && isCurrent());
@@ -69,18 +68,11 @@ export function beginSpaceRunnerObservation(sid: string, source: "hosted" | { dr
         access.finish();
         return false;
       }
-      if (source === "hosted") {
-        access.withdraw();
-        hideSpaceRunner(sid, stamp);
-      } else {
-        // The bridge can refuse the local folder without contradicting the
-        // hosted assignment or the same-Space access it proved.
-        source.dropLocalFolder();
-      }
+      access.withdraw();
+      hideSpaceRunner(sid, stamp);
       return true;
     },
     publish(runner: SpaceRunner | null, allowFolderAdd = true, exact = true) {
-      if (!exactEndpoint) return false;
       finish(exact);
       if (!isCurrent()) return false;
       recordSpaceRunnerStamp(sid, stamp);

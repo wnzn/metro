@@ -283,7 +283,7 @@ async function loadInstalledScope(runnerId: string, valid: () => boolean) {
   if (!c) return;
   checkingInstalledScope.set(true);
   try {
-    const list = await c.listRunnerInventory();
+    const list = await readHostedAccess(c, () => c.listRunnerInventory());
     if (!valid()) return;
     if (list.runners.some((r) => r.id === runnerId && r.visibility === "personal" && r.canManage)) {
       ownedInstalledRunner.set({ id: runnerId, attachIfEmpty: list.attachIfEmpty });
@@ -336,7 +336,6 @@ export async function showRunnerFolder(sid: string): Promise<void> {
   if (!row) return;
   const valid = stillValid();
   const stillRow = () => valid() && runnerSpaces().includes(row);
-  const observation = beginSpaceRunnerObservation(sid, { dropLocalFolder: () => removeFolder(sid) });
   installedBusy.set(`folder:${sid}`);
   installedError.set(null);
   installedNotice.set(null);
@@ -350,8 +349,10 @@ export async function showRunnerFolder(sid: string): Promise<void> {
     folders.set({ ...folders(), [sid]: f });
   } catch (error) {
     if (stillRow()) {
+      // The local refusal belongs to this row and session, not to a hosted
+      // assignment stamp. A newer list alone doesn't replace the folder row.
       if (error instanceof BridgeError && ((error.status === 403 && error.code === "not_owner") ||
-          (error.status === 404 && error.code === "not_found"))) observation.denyAccess();
+          (error.status === 404 && error.code === "not_found"))) batch(() => removeFolder(sid));
       installedError.set(message(error, "Opening the Space's folder"));
     }
   } finally {

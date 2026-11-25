@@ -364,13 +364,12 @@ function beginSpaceRead(sid: string, request = nextAccessRequest()) {
   };
 }
 
-/** Share the Space's access order and pending reads, without treating an
- * unavailable runner endpoint (or a local bridge denial) as loss of membership. */
-export function beginRunnerAccessRead(sid: string, exactEndpoint: boolean) {
+/** Track a hosted assignment read without treating an unavailable runner endpoint as loss of membership. */
+export function beginRunnerAccessRead(sid: string) {
   const request = nextAccessRequest();
   const scope = guard(sid);
   const valid = () => scope() && !newerSpaceDenial(sid, request);
-  const settle = exactEndpoint ? trackScopedAccessRead(scopeKey(sid, ""), request) : () => {};
+  const settle = trackScopedAccessRead(scopeKey(sid, ""), request);
   const key = runnerAccessKey(sid);
   let settled = false;
   return {
@@ -381,13 +380,13 @@ export function beginRunnerAccessRead(sid: string, exactEndpoint: boolean) {
       // denial has already withdrawn its proof. Never replay that proof.
       if (settled) return;
       settled = true;
-      if (exactEndpoint && verified && valid()) verifyAccess(key, request);
+      if (verified && valid()) verifyAccess(key, request);
       settle();
     },
     withdraw() {
       if (settled) return;
       settled = true;
-      if (exactEndpoint && valid() && !newerAccess(key, request)) verifiedAccess.delete(key);
+      if (valid() && !newerAccess(key, request)) verifiedAccess.delete(key);
       settle();
     },
   };

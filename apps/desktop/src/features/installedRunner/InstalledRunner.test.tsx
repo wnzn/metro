@@ -249,6 +249,145 @@ for (const status of [403, 404, 401] as const) {
   });
 }
 
+for (const status of [403, 404] as const) {
+  test(`a positive hosted Space list does not mask a held local folder ${status} for the same row`, async () => {
+    const f = world();
+    const mine = f.addRunner("This PC", "personal", "alice");
+    f.addSpace("target", "Target", "alice");
+    f.addSpace("sibling", "Sibling", "alice");
+    f.state.attached.set("target", mine.id);
+    f.state.attached.set("sibling", mine.id);
+    const t = bridgeWithRunner(f, mine.id, mine.name);
+    const post = `POST ${BRIDGE}/v1/*`;
+    const bridge = t.network[post]!;
+    let parked = false;
+    t.network[post] = req => {
+      if (new URL(req.url).pathname !== "/v1/local-tools/runner/spaces/target/folder") return bridge(req);
+      parked = true;
+      return { status, delay: 5_000, body: { error: {
+        code: status === 403 ? "not_owner" : "not_found", message: "Local folder refused.",
+      } } };
+    };
+    const app = await openWith(f, t, true);
+    await signInToRunners(app, "alice");
+    await app.waitFor("id:installed-runner-folder:target");
+    await app.press("id:installed-runner-folder:sibling");
+    await app.waitFor("id:installed-runner-path:sibling");
+    await app.clock!.runFor(8_000); // The complete Space list refresh is due at 10s.
+    await app.press("id:installed-runner-folder:target");
+    await app.waitUntil(() => parked);
+    f.state.spaces.get("target")!.name = "Target from the newer list";
+    await app.clock!.runFor(3_500);
+    expect(app.shows("id:space:target >> text:Target from the newer list")).toBe(true);
+    expect(app.shows("id:installed-runner-space:target")).toBe(true);
+    expect(app.shows("id:installed-runner-error")).toBe(false);
+
+    await app.clock!.runFor(1_600);
+    await app.waitFor("id:installed-runner-error");
+    expect(app.shows("id:installed-runner-space:target")).toBe(false);
+    expect(app.shows("id:installed-runner-path:target")).toBe(false);
+    expect(app.shows("id:installed-runner-path:sibling")).toBe(true);
+    expect(app.shows("id:space:target")).toBe(true);
+    await app.press("id:settings-close");
+    await app.press("id:space:target");
+    await app.waitFor("id:runner-state >> text:Runner attached");
+  });
+}
+
+test("a held local folder refusal cannot remove the row from a confirmed detach and reattach", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("target", "Target", "alice");
+  f.state.attached.set("target", mine.id);
+  const t = bridgeWithRunner(f, mine.id, mine.name);
+  const post = `POST ${BRIDGE}/v1/*`;
+  const bridge = t.network[post]!;
+  let parked = false;
+  t.network[post] = req => {
+    if (parked || new URL(req.url).pathname !== "/v1/local-tools/runner/spaces/target/folder") return bridge(req);
+    parked = true;
+    return { status: 404, delay: 6_000, body: { error: { code: "not_found", message: "Old folder refused." } } };
+  };
+  const app = await openWith(f, t, true);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:installed-runner-folder:target");
+  await app.press("id:installed-runner-folder:target");
+  await app.waitUntil(() => parked);
+  await app.press("id:settings-close");
+  await app.press("id:space:target");
+  await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:attached-runner");
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitFor(`id:space-runner-attach:${mine.id}`);
+  expect(f.state.attached.has("target")).toBe(false);
+  await app.press(`id:space-runner-attach:${mine.id}`);
+  await app.waitFor("text:/Attached .+\\. This Space now sends its runner jobs there/");
+  await app.press("id:space-settings-close");
+  await openRunners(app);
+  await app.waitFor("id:installed-runner-folder:target");
+  expect(app.enabled("id:installed-runner-folder:target")).toBe(false); // Old Show folder is still pending.
+
+  await app.clock!.runFor(6_100);
+  expect(app.shows("id:installed-runner-error")).toBe(false);
+  expect(app.enabled("id:installed-runner-folder:target")).toBe(true);
+  await app.press("id:installed-runner-folder:target");
+  await app.waitFor("id:installed-runner-path:target");
+});
+
+for (const mode of ["current", "replacement", "bridge"] as const) {
+  test(`a held ${mode === "bridge" ? "local bridge status" : "hosted installed-runner inventory"} 401 after Settings close: ${mode}`, async () => {
+    const f = world();
+    const mine = f.addRunner("This PC", "personal", "alice");
+    f.addSpace("bob-only", "Bob only", "bob");
+    const route = `GET ${BASE}/v1/*`;
+    const respond = f.network[route]!;
+    let armed = false;
+    let parked = false;
+    f.network[route] = req => {
+      if (armed && !parked && new URL(req.url).pathname === "/v1/runners" &&
+          header(req, "authorization") === `Bearer ${TOKENS.alice}`) {
+        parked = true;
+        return { status: 401, delay: 3_000, body: {} };
+      }
+      return respond(req);
+    };
+    const t = bridgeWithRunner(f, mine.id, mine.name, { unavailableFor: "bob" });
+    const app = await openWith(f, t, true);
+    await signIn(app, "alice");
+    await app.press("id:new-space-toggle");
+    await app.waitFor("id:new-space-use-runner"); // Initial Sidebar scope check succeeded.
+    await app.press("id:new-space-toggle");
+    const bridgeReads = () => t.log.filter(r => r.method === "GET" && r.path === "/v1/local-tools/runner").length;
+    const before = bridgeReads();
+    t.st.delay = 1_000;
+    if (mode === "bridge") t.st.status = 401;
+    await openRunners(app);
+    await app.waitUntil(() => bridgeReads() > before);
+    // Let the general Runners roster load while bridge status is still held;
+    // only its subsequent installed-runner scope check should receive 401.
+    await app.waitFor(`id:delete-runner:${mine.id}`);
+    if (mode !== "bridge") {
+      armed = true;
+      await app.clock!.runFor(1_100);
+      await app.waitUntil(() => parked);
+    }
+    await app.press("id:settings-close");
+    if (mode === "replacement") {
+      await app.press("id:account-menu");
+      await app.press("id:disconnect");
+      await app.waitFor("id:connect");
+      await signIn(app, "bob");
+      await app.waitFor("id:space:bob-only");
+    }
+    await app.clock!.runFor(3_100);
+    expect(app.shows("id:connect")).toBe(mode === "current");
+    if (mode === "replacement") expect(app.shows("id:space:bob-only")).toBe(true);
+    if (mode === "bridge") expect(app.shows("id:nav-chat")).toBe(true);
+  });
+}
+
 for (const replaced of [false, true]) {
   test(`a hosted folder scan 401 settles before its held sibling${replaced ? " without signing out a replacement" : " after close"}`, async () => {
     const f = world();
