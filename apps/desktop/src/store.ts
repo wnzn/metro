@@ -1046,6 +1046,7 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     senderNotices.set(strip(senderNotices()));
     if (unlist) spaces.set(spaces().filter((s) => s.id !== spaceId));
     if (dispatchTarget()?.spaceId === spaceId) dispatchTarget.set(null);
+    clearDispatchRoomChecks(prefix);
     const { [spaceId]: _members, ...restMembers } = membersBySpace();
     membersBySpace.set(restMembers);
     const { [spaceId]: _error, ...restErrors } = memberFailures();
@@ -1509,67 +1510,170 @@ export async function openRun(run: Run): Promise<void> {
   else notice.set("That room or thread isn't visible to you (yet).");
 }
 
-/** Targets the dispatch composer at a run's room, for a follow-up. */
-export async function followUp(run: Run): Promise<void> {
-  await setDispatchSpace(run.spaceId, run.roomId);
+// This epoch records user intent, not cache/permission cleanup of the selected target.
+let dispatchIntent = 0;
+let dispatchDraftRevision = 0;
+type DispatchRoomCheck = { phase: "checking" | "retry" };
+// Leave failures on the exact room: selecting away and back is not a recheck.
+const dispatchRoomChecks = signal(new Map<string, DispatchRoomCheck>());
+
+export function dispatchRoomCheck() {
+  const target = dispatchTarget();
+  return target?.roomId ? dispatchRoomChecks().get(scopeKey(target.spaceId, target.roomId))?.phase : undefined;
 }
 
-export async function setDispatchSpace(spaceId: string, roomId?: string): Promise<void> {
+function setDispatchRoomCheck(key: string, check?: DispatchRoomCheck) {
+  const checks = dispatchRoomChecks();
+  if (!check && !checks.has(key)) return;
+  const next = new Map(checks);
+  if (check) next.set(key, check);
+  else next.delete(key);
+  dispatchRoomChecks.set(next);
+}
+
+function clearDispatchRoomChecks(prefix: string) {
+  const checks = dispatchRoomChecks();
+  const next = new Map([...checks].filter(([key]) => !key.startsWith(prefix)));
+  if (next.size !== checks.size) dispatchRoomChecks.set(next);
+}
+
+export function setDispatchDraft(text: string) {
+  if (text === dispatchDraft()) return;
+  dispatchDraftRevision++;
+  dispatchDraft.set(text);
+}
+
+/** A draft with a different destination needs an explicit, one-use move decision. */
+export function followUp(run: Run) {
+  const { spaceId, roomId } = run;
+  const intent = ++dispatchIntent;
+  const original = dispatchTarget();
+  const text = dispatchDraft();
+  const revision = dispatchDraftRevision;
   const c = client;
-  if (!c || !spaces().some((s) => s.id === spaceId)) return;
+  if (!c) return;
+  if (!spaces().some(s => s.id === spaceId)) {
+    dispatchError.set("That run's Space is no longer available.");
+    return;
+  }
   const ok = guard(spaceId);
   const navigation = navigationGeneration;
-  const pending = { spaceId, roomId: null };
-  const here = () => basePlace() === "chat" && navigation === navigationGeneration && dispatchTarget() === pending;
+  const sameVisit = () => ok() && basePlace() === "chat" && navigation === navigationGeneration;
+  const latest = () => sameVisit() && intent === dispatchIntent;
+  if (original?.spaceId === spaceId && original.roomId === roomId) {
+    // Check in place without replacing the selected target's identity.
+    void verifyDispatchRoom(c, spaceId, roomId, () => latest() && dispatchTarget() === original);
+    return;
+  }
+  const selectExactRoom = () => dispatchTarget.set({ spaceId, roomId });
+  if (!text) {
+    const pending = { spaceId, roomId: null };
+    dispatchTarget.set(pending);
+    void verifyDispatchRoom(c, spaceId, roomId, () => latest() && dispatchTarget() === pending, selectExactRoom);
+    return;
+  }
+  // Once confirmed, a revocation can clear the old recipient without changing
+  // the user's move. A subsequent explicit selection still advances the epoch.
+  const moveCurrent = () => latest() && dispatchDraft() === text &&
+    dispatchDraftRevision === revision && spaces().some(s => s.id === spaceId);
+  const current = () => moveCurrent() && dispatchTarget() === original;
+  let used = false;
+  return {
+    current,
+    moveCurrent,
+    lookup(stillHere: () => boolean) {
+      return current() && stillHere() && verifyDispatchRoom(c, spaceId, roomId, () => current() && stillHere());
+    },
+    async move(stillHere: () => boolean) {
+      if (used || !current() || !stillHere() || dispatching()) return;
+      used = true;
+      await verifyDispatchRoom(c, spaceId, roomId, () => moveCurrent() && stillHere(), selectExactRoom);
+    },
+  };
+}
+
+export async function setDispatchSpace(spaceId: string): Promise<void> {
+  if (!client || !spaces().some((s) => s.id === spaceId)) return;
+  // Re-clicking the selected Space is not permission to fall back from an
+  // unverified exact room to its lobby. The room choices are already visible.
+  if (dispatchTarget()?.spaceId === spaceId && dispatchRoomCheck()) return;
+  const intent = ++dispatchIntent;
+  const ok = guard(spaceId);
   const sameSession = guard();
+  const navigation = navigationGeneration;
+  const pending = { spaceId, roomId: null };
+  const here = () => basePlace() === "chat" && navigation === navigationGeneration &&
+    intent === dispatchIntent && dispatchTarget() === pending;
   dispatchError.set(null);
   dispatchNotice.set(null);
   dispatchTarget.set(pending);
-  const read = roomId === undefined ? undefined : beginSpaceRead(spaceId);
+  try {
+    const list = await ensureRooms(spaceId);
+    if (ok() && here()) dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
+  } catch (error) {
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else if (ok() && here()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+  }
+}
+
+async function verifyDispatchRoom(c: Client, spaceId: string, roomId: string, here: () => boolean, select?: () => void): Promise<boolean> {
+  const sameSession = guard();
+  const read = beginSpaceRead(spaceId);
+  const key = scopeKey(spaceId, roomId);
+  const check: DispatchRoomCheck = { phase: "checking" };
+  const latestCheck = () => read.valid() && dispatchRoomChecks().get(key) === check;
+  setDispatchRoomCheck(key, check);
+  dispatchError.set(null);
+  dispatchNotice.set(null);
   const unverified = "Couldn't verify that destination. Follow up again or choose another room.";
   try {
-    if (!read || roomId === undefined) {
-      const list = await ensureRooms(spaceId);
-      if (ok() && here()) dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
-      return;
-    }
     // Verify the exact destination from this read, never from a cached fallback.
     const list = read.finishRooms(await c.listRooms(spaceId));
-    if (!ok()) return;
-    const key = scopeKey(spaceId, roomId);
-    const found = list?.some(r => r.id === roomId);
+    if (!read.valid()) return false;
+    const found = list?.some(r => r.id === roomId) === true;
     const stale = !list || (!found && (roomDeniedAtOrAfter(key, read.request) || newerAccess(key, read.request)));
+    const show = latestCheck() && here();
     batch(() => {
+      // A current exact access observation can settle the room's guard even
+      // if the panel closed or the user picked another target. That evidence
+      // is separate from permission to apply the original UI intent.
+      if (found && latestCheck()) setDispatchRoomCheck(key);
       if (list && !stale) {
-        // An unrelated active room is left for its own poll to confirm.
-        read.publishRooms(list, roomId);
+        // Still settle access evidence and exact denials for superseded reads,
+        // but don't repaint a newer Dispatch choice with their positive data.
+        if (show) read.publishRooms(list, roomId);
         if (!found) void dropLostRoom(spaceId, roomId, read.request, false);
       }
-      if (found && here()) dispatchTarget.set({ spaceId, roomId });
-      else if (!found && here()) dispatchError.set(stale ? unverified
+      if (found && show) select?.();
+      else if (!found && show) dispatchError.set(stale ? unverified
         : "That room or thread is no longer available. Choose another destination.");
     });
+    return found && show;
   } catch (error) {
     if (sameSession() && error instanceof ApiError && error.kind === "auth") {
-      read?.finish();
+      read.finish();
       disconnect(error.message);
-    } else if (read && isAccessDenial(error)) {
+    } else if (isAccessDenial(error)) {
       const applied = await read.deny(() => batch(() => {
-        const show = here();
+        const show = latestCheck() && here();
         dropLostSpace(spaceId, false);
         if (show) dispatchError.set(describe(error, "Could not load that Space's rooms"));
       }));
-      if (!applied && ok() && here()) dispatchError.set(unverified);
+      if (!applied && latestCheck() && here()) dispatchError.set(unverified);
     } else {
-      read?.finish();
-      if (ok() && here()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+      read.finish();
+      if (latestCheck() && here()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
     }
+    return false;
+  } finally {
+    if (latestCheck()) setDispatchRoomCheck(key, { phase: "retry" });
   }
 }
 
 export function setDispatchRoom(roomId: string) {
   const t = dispatchTarget();
   if (t && roomsBySpace()[t.spaceId]?.some(r => r.id === roomId)) {
+    dispatchIntent++;
     dispatchTarget.set({ spaceId: t.spaceId, roomId });
     dispatchError.set(null);
   }
@@ -1580,7 +1684,7 @@ export async function sendDispatch(): Promise<void> {
   const text = dispatchDraft();
   const target = dispatchTarget();
   const c = client;
-  if (!text.trim() || !target?.roomId || !c || dispatching()) return;
+  if (!text.trim() || !target?.roomId || !c || dispatching() || dispatchRoomCheck()) return;
   const space = spaces().find((s) => s.id === target.spaceId);
   const room = roomsBySpace()[target.spaceId]?.find((r) => r.id === target.roomId);
   if (!space || !room) {
@@ -1591,6 +1695,7 @@ export async function sendDispatch(): Promise<void> {
   const navigation = navigationGeneration;
   const here = () => basePlace() === "chat" && navigation === navigationGeneration && dispatchTarget() === target;
   const origin = captureSendOrigin(c, { kind: "room", spaceId: target.spaceId, roomId: target.roomId });
+  dispatchIntent++;
   batch(() => {
     dispatching.set(true);
     dispatchError.set(null);
@@ -1645,9 +1750,9 @@ export function isActiveRun(run: Run) {
 }
 
 /** Display names for a run's scope, from what is cached. */
-export function runScope(run: Run): { space: string; room: string } {
-  const space = spaces().find((s) => s.id === run.spaceId)?.name ?? run.spaceId;
-  const room = roomsBySpace()[run.spaceId]?.find((r) => r.id === run.roomId)?.name ?? run.roomId;
+export function runScope(run: Run) {
+  const space = spaces().find((s) => s.id === run.spaceId)?.name;
+  const room = space && roomsOf(run.spaceId).find((r) => r.id === run.roomId)?.name;
   return { space, room };
 }
 
@@ -2159,6 +2264,7 @@ function endSession() {
     runsError.set(null);
     runBusy.set(null);
     dispatchTarget.set(null);
+    dispatchRoomChecks.set(new Map());
     dispatchDraft.set("");
     dispatching.set(false);
     dispatchError.set(null);

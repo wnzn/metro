@@ -2,7 +2,7 @@ import { expect, open, test } from "nsh/test";
 import { BASE, TOKENS, world } from "../../../test/fakeServer";
 import { launched } from "../../../test/launched";
 import { parseWebTool } from "../../api/webSearch";
-import { webAttemptRows } from "./web";
+import { webAttemptRows, webFailureText } from "./web";
 
 type F = ReturnType<typeof world>;
 const secret = "fixture-only-refusal-value";
@@ -47,8 +47,10 @@ test("web activity folds the accepted query and shows rotation, the interrupted 
   await app.press(`id:activity-web-args:${call.id}`);
   expect(app.texts().join(" ")).toContain('"weather over Cebu" keywords: "forecast" max_results: 2');
   const text = app.texts().join(" | ");
-  expect(text).toContain("Exa (free) reached its rate limit · retry after 2027-01-02 14:20 UTC. Switched to Firecrawl.");
-  expect(text.indexOf("Firecrawl (your key): credential changed.")).toBeLessThan(text.indexOf("Firecrawl (free): worked."));
+  expect(text).toContain("Exa (no key) reached its rate limit · retry after 2027-01-02 14:20 UTC. Switched to Firecrawl.");
+  expect(text).toContain("Firecrawl (saved key): credential changed.");
+  expect(text).toContain("Firecrawl (no key): worked.");
+  expect(text.indexOf("Firecrawl (saved key): credential changed.")).toBeLessThan(text.indexOf("Firecrawl (no key): worked."));
   expect(app.shows("id:activity-websearch-rotated")).toBe(true);
   expect(app.shows("id:activity-web-attempt:1")).toBe(false);
   expect(app.shows("id:activity-web-attempt:2")).toBe(true);
@@ -64,10 +66,12 @@ test("after run eviction only the server-attributed starter is offered Settings;
     attempts: [attempt("exa", "keyless", "out_of_credits"), attempt("tavily", "key", "key_rejected")] });
   const refuse = event(f, "run_refuse", "error", `web_fetch refused: ${secret}`, { name: "web_fetch", failure: "not_allowed" });
   const other = await room(f, "bob");
-  await other.waitFor("text:/every provider was at its limit or unavailable/");
+  await other.waitFor("text:No provider returned a usable result.");
   await other.press("id:activity-toggle:agent:run_exhausted");
   await other.waitFor(`id:activity-web-failure:${e.id}`);
+  expect(other.shows("id:activity-details:agent:run_exhausted >> text:No provider returned a usable result.")).toBe(true);
   expect(other.shows("id:activity-open-websearch")).toBe(false);
+  expect(other.texts().join(" ")).not.toContain("before configuring an API key");
   await other.press("id:activity-toggle:agent:run_refuse");
   await other.waitFor(`id:activity-web-failure:${refuse.id}`);
   expect(other.texts().join(" ")).not.toContain(secret);
@@ -76,8 +80,17 @@ test("after run eviction only the server-attributed starter is offered Settings;
   const own = await room(f, "alice");
   await own.press("id:activity-toggle:agent:run_exhausted");
   await own.waitFor("id:activity-open-websearch");
+  expect(own.texts().join(" ")).toContain("Check the provider’s terms before configuring an API key");
+  expect(own.texts().join(" ")).not.toContain("higher limits");
   await own.press("id:activity-open-websearch");
   await own.waitFor("text:Opened Web search settings");
+});
+
+test("exhaustion doesn't imply contact when the attempt list is empty or only contains skips", () => {
+  for (const attempts of [[], [attempt("exa", "keyless", "skipped_disabled"), attempt("tinyfish", "key", "skipped_no_key")]]) {
+    const note = parseWebTool({ name: "web_search", failure: "exhausted", attempts })!;
+    expect(webFailureText(note, false)).toBe("No provider returned a usable result.");
+  }
 });
 
 test("offline names the starter to other members but says your for the same stable account", async () => {
@@ -111,9 +124,9 @@ test("web attempt presentation distinguishes provider failures, skips and repeat
     attempt("tinyfish", "keyless", "skipped_no_key"),
   ] })!;
   expect(webAttemptRows(note).map((row) => row.text)).toEqual([
-    "Exa (your key): credential changed.", "Exa (free): credential changed.",
-    "Parallel (free): blocked requests from this network.", "Firecrawl (your key): paused after an earlier attempt.",
-    "Tavily (free): timed out.", "TinyFish: needs a free key.",
+    "Exa (saved key): credential changed.", "Exa (no key): credential changed.",
+    "Parallel (no key): blocked requests from this network.", "Firecrawl (saved key): paused after an earlier attempt.",
+    "Tavily (no key): timed out.", "TinyFish: requires an API key.",
   ]);
   const bad = parseWebTool({ name: "web_fetch", provider: secret, failure: secret, attempts: [attempt("exa", secret, "ok")] })!;
   expect(bad.provider).toBe(null);
@@ -137,10 +150,10 @@ test("activity shows cached key rejection as a skip and points rotation at the n
   await app.press("id:activity-toggle:agent:run_cached");
   await app.waitFor("id:activity-websearch-rotated");
   expect(app.texts().filter((s) => s.includes("credential changed"))).toEqual([
-    "Firecrawl (your key): credential changed.", "Firecrawl (free): credential changed.",
+    "Firecrawl (saved key): credential changed.", "Firecrawl (no key): credential changed.",
   ]);
-  expect(app.shows("text:Exa (free) reached its rate limit. Switched to Tavily.")).toBe(true);
-  expect(app.shows("text:Parallel (your key): skipped (saved key was already rejected).")).toBe(true);
+  expect(app.shows("text:Exa (no key) reached its rate limit. Switched to Tavily.")).toBe(true);
+  expect(app.shows("text:Parallel (saved key): skipped (saved key was already rejected).")).toBe(true);
 });
 
 test("legacy key rejections don't assert an immediate switch or known provider contact", () => {
@@ -149,8 +162,8 @@ test("legacy key rejections don't assert an immediate switch or known provider c
     attempt("exa", "keyless", "limited"), { ...rejection, contacted }, attempt("tavily", "keyless", "ok"),
   ] })!);
   expect(rows()[0]!.switched).toBe(false);
-  expect(rows()[1]!.text).toBe("Parallel (your key): key rejected (contact not recorded).");
+  expect(rows()[1]!.text).toBe("Parallel (saved key): key rejected (contact not recorded).");
   expect(rows(true)[0]!.text).toContain("Switched to Parallel.");
-  expect(rows(true)[1]!.text).toBe("Parallel (your key): rejected the key.");
+  expect(rows(true)[1]!.text).toBe("Parallel (saved key): rejected the key.");
   expect(rows(false)[0]!.text).toContain("Switched to Tavily.");
 });

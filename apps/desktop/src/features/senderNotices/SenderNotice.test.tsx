@@ -771,6 +771,7 @@ test("a held positive Follow up cannot resurrect a thread after a newer authorit
 
   // An actual newer read can rejoin the thread, but never revive its old notice.
   await app.press("id:run-follow:follow-run");
+  await app.press("id:dispatch-move-draft");
   await app.waitFor("text:To: agent in Side project › #Follow-up");
   w.reply(text, { addressing_note: generic });
   await app.press("id:dispatch-send");

@@ -248,7 +248,7 @@ function WebToolView(props: { item: Extract<TimelineItem, { type: "tool" }>; gro
         </Label>
         <If when={own() && web().note.failure === "exhausted" &&
           web().note.attempts.some((a) => a.mode === "keyless" && (a.outcome === "limited" || a.outcome === "out_of_credits"))}>
-          <Label variant="caption" color="muted">Adding a key may give you higher limits.</Label>
+          <Label variant="caption" color="muted">Check the provider’s terms before configuring an API key in Web search settings.</Label>
         </If>
         <If when={own() && (web().note.failure === "exhausted" || web().note.failure === "no_device")}>
           <If when={webSearchSettingsAction()}>

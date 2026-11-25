@@ -18,7 +18,7 @@ export const WEB_OUTCOMES = {
   timeout: "timed out",
   bad_response: "sent an unusable answer",
   skipped_cooldown: "paused after an earlier attempt",
-  skipped_no_key: "needs a free key",
+  skipped_no_key: "requires an API key",
   skipped_disabled: "off",
   credential_changed: "credential changed",
 } as const;

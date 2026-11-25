@@ -282,3 +282,24 @@ export function planPage(spec: unknown, data: PageValues | null, pending: boolea
   const blocks = supported ? walk(own(spec, "blocks"), "", 2) : [];
   return { blocks, supported, truncated: truncated || textLimited, count: initial - left, plainText: { bytes: textBytes, limited: textLimited }, richText: rich.usage() };
 }
+
+/** Only labels the viewer can already resolve on this page, never action inputs. */
+export function otherApprovalButtons(spec: unknown, data: PageValues, clicked: string) {
+  const labels: { key: string; label: string }[] = [];
+  const seen = new Set([clicked]);
+  let more = 0;
+  function walk(blocks: readonly PlanBlock[]) {
+    for (const b of blocks) {
+      if (b.issue) continue;
+      if (b.type === "Button" && (b.action === "runAgent" || b.action === "runSchedule") &&
+        b.key && !seen.has(b.key) && capabilityOf(data, b.key)?.enabled === true) {
+        seen.add(b.key);
+        if (labels.length < 4) labels.push({ key: b.key, label: str(b.p.label) || "Action" });
+        else more++;
+      }
+      walk(b.children);
+    }
+  }
+  walk(planPage(spec, data, false).blocks);
+  return { labels, more };
+}
