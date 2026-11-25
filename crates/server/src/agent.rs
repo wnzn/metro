@@ -840,8 +840,8 @@ impl AgentHook for ReasoningSummaries {
 /// Start an agent run in `room` of `space_id` answering `trigger` (already
 /// stored), on behalf of `initiator`. Returns the registered run, or why it
 /// could not start. The run itself proceeds in the background.
-/// `agent` is the Space agent working the run; `pick` says how it was
-/// chosen and is shown on the `started` marker.
+/// `agent` identifies the selected Space agent; its configuration is read
+/// again at acceptance. `pick` records how it was chosen.
 #[allow(clippy::too_many_arguments)]
 pub async fn start_room_run(
     state: &AppState,
@@ -897,9 +897,8 @@ pub async fn start_room_run(
         truncate(&trigger.text, 200),
         state.runs.clone(),
     );
-    // Serialize the last existence check with other writers through the
-    // instant the run is registered. Routing/model selection may have
-    // awaited since the message was committed. Never substitute an agent.
+    // Read the selected agent's current configuration while registering the
+    // run. Routing/model selection may have awaited since it was selected.
     let accepted = state
         .db
         .call(move |db| {
@@ -908,9 +907,9 @@ pub async fn start_room_run(
             if !crate::db::Db::room_member_in(&tx, &sid, &rid, &user_id)? {
                 return Ok(Err(AcceptanceError::Room));
             }
-            if !crate::db::Db::space_agent_exists_in(&tx, &sid, &aid)? {
+            let Some(agent) = crate::space_agents::get_in(&tx, &sid, &aid)? else {
                 return Ok(Err(AcceptanceError::Agent));
-            }
+            };
             // The stable user id authorizes stops. Create the guard here
             // too in case the caller goes away before receiving the result.
             let (info, cancel) = match runs.start(&sid, &rid, &user_id, &task) {
@@ -918,14 +917,14 @@ pub async fn start_room_run(
                 Err(error) => return Ok(Err(AcceptanceError::Registry(error))),
             };
             let registration = crate::orchestration::Registration::new(runs, info.id.clone());
-            Ok(Ok((info, cancel, registration)))
+            Ok(Ok((info, cancel, registration, agent)))
         })
         .await
         .map_err(|error| {
             tracing::warn!(%error, "could not check Space run acceptance");
             Refusal::shown("Could not verify this Space's run. No agent ran.")
         })?;
-    let (info, cancel, registration) = match accepted {
+    let (info, cancel, registration, agent) = match accepted {
         Ok(started) => started,
         Err(AcceptanceError::Room) => {
             return Err(Refusal::shown(
@@ -966,14 +965,13 @@ pub async fn start_room_run(
         )
         .await;
 
-    let (state, space_id, room, initiator, trigger, run_id, agent) = (
+    let (state, space_id, room, initiator, trigger, run_id) = (
         state.clone(),
         space_id.to_owned(),
         room.clone(),
         initiator.clone(),
         trigger.clone(),
         info.id.clone(),
-        agent.clone(),
     );
     tokio::spawn(async move {
         let _permit = permit;

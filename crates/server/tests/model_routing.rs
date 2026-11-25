@@ -2231,6 +2231,61 @@ async fn recipient_race_after_message_commit_refuses_deleted_agent_at_run_accept
 }
 
 #[tokio::test]
+async fn held_routing_uses_the_selected_agents_current_allowlist_at_acceptance() {
+    let h = H::start().await;
+    let sid = h.space("Run configuration race").await;
+    h.state
+        .db
+        .set_runner_token(&sid, &[1; 32])
+        .unwrap()
+        .unwrap();
+    let agent = h
+        .agent(
+            &sid,
+            json!({"name":"Original","handle":"runner","description":"Scripted",
+                   "instructions":"Old instruction.", "tools":["workspace.list","workspace.read"]}),
+        )
+        .await;
+    assert_eq!(
+        h.put_routing("alice", routing_on(false, true)).await.0,
+        StatusCode::OK
+    );
+    let held = h.fake.hold("use_case");
+    let path = format!("/v1/spaces/{sid}/rooms/lobby/messages");
+    let body = json!({"text":"please review the code","invoke_agent":true,"agent_id":agent,"infer_text_mentions":false});
+    let update = async {
+        held.wait().await;
+        assert!(h.bodies.lock().unwrap().is_empty());
+        let (status, edited) = h
+            .req(
+                reqwest::Method::PATCH,
+                "alice",
+                &format!("/v1/spaces/{sid}/agents/{agent}"),
+                Some(json!({"name":"Current","instructions":"Current instruction.","tools":["workspace.read"]})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{edited}");
+        assert_eq!(edited["tools"], json!(["workspace.read"]));
+        held.release.notify_one();
+    };
+    let ((status, posted), ()) = tokio::join!(h.post("alice", &path, body), update);
+    assert_eq!(status, StatusCode::ACCEPTED, "{posted}");
+    let id = posted["id"].as_i64().unwrap();
+    let answer = h.answer_after("alice", Some(&sid), id).await;
+    assert_eq!(answer["kind"], "agent", "{answer}");
+    assert_eq!(answer["activity"]["agent"]["id"], agent);
+    assert_eq!(answer["activity"]["agent"]["name"], "Current");
+    let bodies = h.bodies.lock().unwrap();
+    assert_eq!(bodies.len(), 1);
+    let tools = bodies[0]["tools"].to_string();
+    assert!(tools.contains("workspace_read"), "{tools}");
+    assert!(!tools.contains("workspace_list"), "{tools}");
+    let messages = bodies[0]["messages"].to_string();
+    assert!(messages.contains("Current instruction."));
+    assert!(!messages.contains("Old instruction."));
+}
+
+#[tokio::test]
 async fn authoritative_posts_return_canonical_text_and_spans_without_inference() {
     let h = H::start().await;
     let sid = h.space("Exact dispatch text").await;
