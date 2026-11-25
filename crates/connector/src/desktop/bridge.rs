@@ -495,9 +495,15 @@ async fn web_key_delete(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>) -> 
     reply(ctx.desktop.web_delete_key(&id).await)
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WebTestBody {
+    session_generation: u64,
+}
+
 async fn web_test(State(ctx): State<Arc<Ctx>>, Path(id): Path<String>, b: Bytes) -> Response {
-    match body::<Empty>(&b) {
-        Ok(_) => reply(ctx.desktop.web_test(&id).await),
+    match body::<WebTestBody>(&b) {
+        Ok(test) => reply(ctx.desktop.web_test(&id, test.session_generation).await),
         Err(e) => e.into_response(),
     }
 }

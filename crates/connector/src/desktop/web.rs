@@ -58,6 +58,14 @@ struct Live {
     engine: Option<Arc<Engine>>,
 }
 
+struct BoundSession {
+    server: String,
+    account: String,
+    epoch: u64,
+    // No value is sent; dropping the sender cancels in-flight provider tests.
+    ended: watch::Sender<()>,
+}
+
 pub struct WebSearch {
     root: PathBuf,
     primary: bool,
@@ -69,7 +77,7 @@ pub struct WebSearch {
     /// (server, account) of the bound session, `None` after sign-out, so a
     /// change that captured an older session before waiting here is refused
     /// instead of pairing or starting workers for nobody.
-    ops: tokio::sync::Mutex<Option<(String, String, u64)>>,
+    ops: tokio::sync::Mutex<Option<BoundSession>>,
 }
 
 fn lock(m: &Mutex<Live>) -> std::sync::MutexGuard<'_, Live> {
@@ -367,18 +375,26 @@ impl WebSearch {
         server: &str,
         account: &str,
         epoch: u64,
-    ) -> R<tokio::sync::MutexGuard<'_, Option<(String, String, u64)>>> {
+    ) -> R<tokio::sync::MutexGuard<'_, Option<BoundSession>>> {
         let g = self.ops.lock().await;
-        match &*g {
-            Some((s, a, e)) if s == server && a == account && *e == epoch => Ok(g),
-            _ => Err(err(409, "no_session", "Sign in to a Metro server first")),
+        if g.as_ref()
+            .is_some_and(|s| s.server == server && s.account == account && s.epoch == epoch)
+        {
+            Ok(g)
+        } else {
+            Err(err(409, "no_session", "Sign in to a Metro server first"))
         }
     }
 
     /// A session was bound: serve web search for it, unless it's off here.
     pub async fn session_bound(&self, server: &str, account: &str, session: &Secret, epoch: u64) {
         let mut g = self.ops.lock().await;
-        *g = Some((server.to_owned(), account.to_owned(), epoch));
+        *g = Some(BoundSession {
+            server: server.to_owned(),
+            account: account.to_owned(),
+            epoch,
+            ended: watch::channel(()).0,
+        });
         let _ = self.start_locked(server, account, session).await;
     }
 
@@ -599,15 +615,26 @@ impl WebSearch {
 
     /// `POST /v1/web-search/providers/{id}/test`: one fixed query, now.
     pub async fn test(&self, server: &str, account: &str, epoch: u64, id: &str) -> R<Value> {
-        // Checked, not held: a vendor call mustn't delay a sign-out.
-        drop(self.bound_ops(server, account, epoch).await?);
+        // Capture cancellation under the lifecycle lock, but don't hold it
+        // across the vendor call. A replacement binding drops this sender,
+        // including sign-out followed by sign-in to the very same account.
+        let mut ended = {
+            let g = self.bound_ops(server, account, epoch).await?;
+            g.as_ref()
+                .expect("bound_ops checked the session")
+                .ended
+                .subscribe()
+        };
         let pid = provider(id)?;
         let p = self.profile(server, account)?;
         let engine = self.engine(&p)?;
-        let outcome = engine
-            .test_provider(pid)
-            .await
-            .map_err(|why| err(409, "not_sent", why))?;
+        let outcome = tokio::select! {
+            biased;
+            _ = ended.changed() => return Err(err(409, "no_session", "The web search session ended")),
+            outcome = engine.test_provider(pid) => outcome,
+        };
+        let _g = self.bound_ops(server, account, epoch).await?;
+        let outcome = outcome.map_err(|why| err(409, "not_sent", why))?;
         let mut row = self.row(&p, pid)?;
         row["test"] = json!({"outcome": outcome.as_str()});
         Ok(row)

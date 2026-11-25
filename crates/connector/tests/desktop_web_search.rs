@@ -29,6 +29,8 @@ struct Fake {
     claims: u32,
     /// Every request body Metro received.
     bodies: Vec<String>,
+    tests: u32,
+    hold_test: Option<Arc<tokio::sync::Notify>>,
 }
 
 type Shared = Arc<Mutex<Fake>>;
@@ -103,10 +105,21 @@ async fn result(State(s): State<Shared>, Path(_id): Path<String>, body: String) 
 }
 
 async fn tavily(State(s): State<Shared>, h: HeaderMap, body: String) -> Response {
-    let mut f = s.lock().unwrap();
-    let keyed = h.get("authorization").is_some();
-    f.bodies.push(format!("tavily keyed={keyed}"));
-    let _ = body;
+    let test = serde_json::from_str::<Value>(&body).unwrap()["query"] == "Metro web search test";
+    let hold = {
+        let mut f = s.lock().unwrap();
+        f.bodies
+            .push(format!("tavily keyed={}", h.get("authorization").is_some()));
+        if test {
+            f.tests += 1;
+            f.hold_test.clone()
+        } else {
+            None
+        }
+    };
+    if let Some(hold) = hold {
+        hold.notified().await;
+    }
     axum::Json(json!({"results": [{"title": "T", "url": "https://t.example/", "content": "c"}]}))
         .into_response()
 }
@@ -188,7 +201,7 @@ async fn web_search_is_on_by_default_serves_jobs_and_keeps_keys_local() {
     // Before sign-in: no session.
     assert_eq!(ui.call("GET", "/v1/web-search", None).await.0, 409);
 
-    let (status, _) = ui
+    let (status, bound) = ui
         .call(
             "POST",
             "/v1/session",
@@ -221,6 +234,7 @@ async fn web_search_is_on_by_default_serves_jobs_and_keeps_keys_local() {
         vec!["tavily", "exa", "parallel", "firecrawl", "tinyfish"]
     );
     let tinyfish = &state["providers"][4];
+    assert_eq!(tinyfish["enabled"], true);
     assert_eq!(tinyfish["keyless"], false);
     assert_eq!(tinyfish["key_saved"], false);
 
@@ -313,7 +327,7 @@ async fn web_search_is_on_by_default_serves_jobs_and_keeps_keys_local() {
         .call(
             "POST",
             "/v1/web-search/providers/tinyfish/test",
-            Some(json!({})),
+            Some(json!({"session_generation": bound["session"]["generation"]})),
         )
         .await;
     assert_eq!(row["test"]["outcome"], "skipped_no_key");
@@ -354,6 +368,82 @@ async fn web_search_is_on_by_default_serves_jobs_and_keeps_keys_local() {
     assert!(s.lock().unwrap().bodies.iter().all(|b| !b.contains(CANARY)));
     desktop.shutdown().await;
     ui.bridge.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provider_test_cancels_on_sign_out_and_a_delayed_test_cannot_adopt_the_new_binding() {
+    let (base, s) = fake().await;
+    let release = Arc::new(tokio::sync::Notify::new());
+    s.lock().unwrap().hold_test = Some(release.clone());
+    let t = tempfile::tempdir().unwrap();
+    let mut cfg = DesktopConfig::new(t.path().join("desktop"), true, None);
+    cfg.poll_interval = Duration::from_millis(30);
+    cfg.web_endpoints = Some(endpoints(&base));
+    let desktop = Desktop::new(cfg);
+    let ui = Arc::new(Ui {
+        http: reqwest::Client::builder().no_proxy().build().unwrap(),
+        bridge: bridge::start(desktop.clone()).await.unwrap(),
+    });
+    let credentials = json!({"server_url": base, "session_token": "tok-alice"});
+    let (status, first) = ui
+        .call("POST", "/v1/session", Some(credentials.clone()))
+        .await;
+    assert_eq!(status, 200);
+    let route = "/v1/web-search/providers/tavily/test";
+    let old = json!({"session_generation": first["session"]["generation"]});
+    let running = {
+        let ui = ui.clone();
+        let old = old.clone();
+        tokio::spawn(async move { ui.call("POST", route, Some(old)).await })
+    };
+    wait_for("held vendor request", || s.lock().unwrap().tests == 1).await;
+    let (status, signed_out) = tokio::time::timeout(
+        Duration::from_secs(2),
+        ui.call("DELETE", "/v1/session", None),
+    )
+    .await
+    .expect("sign-out didn't wait for the vendor");
+    assert_eq!(status, 200);
+    assert!(signed_out["session"].is_null());
+    let (status, cancelled) = tokio::time::timeout(Duration::from_secs(2), running)
+        .await
+        .expect("old test cancelled without releasing the vendor")
+        .unwrap();
+    assert_eq!(status, 409);
+    assert_eq!(cancelled["error"]["code"], "no_session");
+
+    // The same person signs back in before a different old request even
+    // reaches the loopback handler. Matching account/server alone is not enough.
+    let (status, second) = ui.call("POST", "/v1/session", Some(credentials)).await;
+    assert_eq!(status, 200);
+    assert_ne!(
+        first["session"]["generation"],
+        second["session"]["generation"]
+    );
+    let (status, stale) = ui.call("POST", route, Some(old)).await;
+    assert_eq!(status, 409);
+    assert_eq!(stale["error"]["code"], "no_session");
+    assert_eq!(ui.call("POST", route, Some(json!({}))).await.0, 400);
+    assert_eq!(s.lock().unwrap().tests, 1);
+    let (_, view) = ui.call("GET", "/v1/web-search", None).await;
+    assert!(
+        view["providers"][0]["last"].is_null(),
+        "cancelled test wasn't saved"
+    );
+    s.lock().unwrap().hold_test = None;
+    release.notify_one();
+    let (status, current) = ui
+        .call(
+            "POST",
+            route,
+            Some(json!({"session_generation": second["session"]["generation"]})),
+        )
+        .await;
+    assert_eq!(status, 200);
+    assert_eq!(current["test"]["outcome"], "ok");
+    assert_eq!(s.lock().unwrap().tests, 2);
+    desktop.shutdown().await;
+    Arc::try_unwrap(ui).ok().unwrap().bridge.stop().await;
 }
 
 /// A settings change that captured the session before a sign-out must not

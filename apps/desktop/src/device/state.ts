@@ -18,7 +18,8 @@
 // its kind and the session (store.ts `sessionGuard`) is unchanged.
 
 import { batch, cleanup, computed, effect, signal, untracked } from "nsh";
-import { connectedTo, onSessionEnd, onSessionStart, place, sessionGuard, settingsSection } from "../store";
+import { connectedTo, me, onSessionEnd, onSessionStart, place, sessionGuard, settingsSection } from "../store";
+import type { WebProvider } from "../api/webSearch";
 import { BridgeError, createBridge, isEndpointKind } from "./bridge";
 import type { Bridge, BridgeStatus, CredentialsBody, LocalConnection } from "./bridge";
 import { readBridgeEnv } from "./env";
@@ -98,6 +99,10 @@ export const helperKinds = computed(() => {
 // lands before the next bind is sent.
 let chain: Promise<unknown> = Promise.resolve();
 let bound = false;
+/** Includes a dispatched POST whose response is still pending or failed. */
+let bindDispatched = false;
+/** A failed DELETE cannot be treated as proof that the previous binding ended. */
+let releasePending = false;
 let statusSeq = 0;
 
 function serial<T>(job: () => Promise<T>): Promise<T> {
@@ -106,19 +111,31 @@ function serial<T>(job: () => Promise<T>): Promise<T> {
   return next;
 }
 
-/** Web routes use the helper's current binding, not an account in the request.
- * Keep them ordered with bind/unbind, and reject queued work after a change. */
+export function webSearchBinding(server: string, account: string) {
+  const h = helper();
+  const s = h.phase === "ready" ? h.status.session : null;
+  return s && s.accountId === account && s.serverUrl.replace(/\/+$/, "") === server.replace(/\/+$/, "") ? s : null;
+}
+
+/** Settings reads and local changes use the helper's current binding.
+ * Keep them ordered with bind/unbind and reject queued work after a change. */
 export function withWebSearchBridge<T>(server: string, account: string, job: (b: Bridge) => Promise<T>): Promise<T> {
   const current = sessionGuard();
   return serial(() => {
-    const h = helper();
-    const bound = h.phase === "ready" ? h.status.session : null;
-    if (!current() || !bridge || !bound || bound.accountId !== account ||
-        bound.serverUrl.replace(/\/+$/, "") !== server.replace(/\/+$/, "")) {
+    if (!current() || !bridge || !webSearchBinding(server, account)) {
       throw new BridgeError("no_session", "This window isn't serving the selected account and server.");
     }
     return job(bridge);
   });
+}
+
+/** A slow vendor test never holds the binding queue. Its required generation
+ * is compared at the helper before it can read any credentials or send data. */
+export async function testWebSearchOnCurrentBinding(server: string, account: string, id: WebProvider) {
+  const binding = webSearchBinding(server, account);
+  if (!bridge || !binding) throw new BridgeError("no_session", "The web search session changed.");
+  if (binding.generation === undefined) throw new BridgeError("unsupported", "Update Metro to test providers.");
+  return bridge.testWebSearchProvider(id, binding.generation);
 }
 
 function message(error: unknown, what: string): string {
@@ -147,7 +164,8 @@ function applyStatus(status: BridgeStatus) {
     return;
   }
   // Only ever show what belongs to this server's session.
-  if (!status.session || !server || status.session.serverUrl.replace(/\/+$/, "") !== server.replace(/\/+$/, "")) {
+  if (!status.session || !server || status.session.accountId !== me() ||
+      status.session.serverUrl.replace(/\/+$/, "") !== server.replace(/\/+$/, "")) {
     helper.set({ phase: "unbound", status, message: "Metro's device helper isn't signed in to this server yet." });
     return;
   }
@@ -227,10 +245,18 @@ effect(() => {
 function resetLocal() {
   statusSeq++;
   bound = false;
+  bindDispatched = false;
   pairBusy.set(null);
   pairError.set(null);
   pairNotice.set(null);
   availableModels.set({});
+}
+
+async function releasePreviousBinding(b: Bridge) {
+  if (!releasePending) return;
+  const status = await b.unbindSession();
+  if (status.session) throw new BridgeError("protocol", "Metro's device helper did not end the previous sign-in.");
+  releasePending = false;
 }
 
 onSessionStart(({ baseUrl, token }) => {
@@ -240,6 +266,16 @@ onSessionStart(({ baseUrl, token }) => {
   helper.set({ phase: "checking" });
   void serial(async () => {
     if (!ok()) return;
+    try {
+      // Retry a failed cleanup on the person's next sign-in. Never overwrite
+      // an uncertain old binding, even when the account and server match.
+      await releasePreviousBinding(b);
+    } catch {
+      if (ok()) helper.set({ phase: "unbound", status: null, message: "Metro couldn't confirm that the previous device sign-in ended. Reopen Metro and sign in again." });
+      return;
+    }
+    if (!ok()) return;
+    bindDispatched = true;
     try {
       const status = await b.bindSession(baseUrl, token);
       if (!ok()) return;
@@ -264,17 +300,12 @@ onSessionStart(({ baseUrl, token }) => {
 
 onSessionEnd(() => {
   const b = bridge;
-  const wasBound = bound;
+  releasePending ||= bindDispatched;
   resetLocal();
   if (!b) return;
   helper.set(SIGNED_OUT);
-  if (!wasBound) return;
-  void serial(async () => {
-    try {
-      await b.unbindSession();
-    } catch {
-      /* the launcher also stops workers when the UI exits */
-    }
+  if (releasePending) void serial(() => releasePreviousBinding(b)).catch(() => {
+    // Retain the obligation; the launcher also stops workers on app exit.
   });
 });
 

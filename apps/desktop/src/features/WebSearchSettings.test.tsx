@@ -3,7 +3,6 @@ import type { App } from "nsh/test";
 import { BASE, header, world } from "../../test/fakeServer";
 import { launched } from "../../test/launched";
 import { BRIDGE, BRIDGE_TOKEN, bridgeEnv, fakeBridge } from "../device/test/fakeBridge";
-import { WEB_PROVIDERS } from "../api/webSearch";
 import { parseLocalWebSearch } from "../device/webSearch";
 
 const OTHER = BASE.replace("8787", "8788");
@@ -12,7 +11,8 @@ const SYNTHETIC = "fixture-only-value-not-a-real-key";
 const REFLECTED = "fixture-only-private-diagnostic";
 type Req = { method: string; url: string; headers: Record<string, string>; body?: string | null };
 type Row = ReturnType<typeof rows>[number];
-const rows = () => Object.keys(WEB_PROVIDERS).map((id) => ({
+const defaults = ["tavily", "exa", "parallel", "firecrawl", "tinyfish"];
+const rows = () => defaults.map((id) => ({
   id, enabled: true, keyless: id !== "tinyfish", key_saved: false, key_status: null as string | null,
   cooldown: null as null | { until: string; mode: string; outcome: string },
 }));
@@ -28,16 +28,22 @@ function fixture() {
   const f = world();
   const b = fakeBridge(f);
   const alice = device();
+  // Alice has explicitly moved Exa to the top, not the connector default.
+  alice.providers = [alice.providers[1]!, alice.providers[0]!, ...alice.providers.slice(2)];
   const bob = device();
   bob.enabled = false;
   bob.device.worker = "stopped";
   const other = device();
   other.providers.reverse();
   const states = new Map([[`${BASE} alice`, alice], [`${BASE} bob`, bob], [`${OTHER} alice`, other]]);
-  const calls: { method: string; path: string; binding: string; providers?: string[]; keyAccepted?: boolean }[] = [];
+  const calls: { method: string; path: string; binding: string; providers?: string[]; keyAccepted?: boolean; generation?: number; prefsBody?: unknown }[] = [];
+  const lifecycle: { method: string; previous: number | null; next: number | null }[] = [];
+  let generation = 0;
+  let workerGeneration: number | null = null;
   const chatWrites: { host: string; enabled: boolean }[] = [];
   const prefs = new Map<string, boolean>();
-  const replies = { unsupported: false, oldServer: false, testRefused: false, rejectKey: false, refusePrefs: false, refuseOrder: false, writeDelay: 0 };
+  const replies = { unsupported: false, oldServer: false, testRefused: false, rejectKey: false, refusePrefs: false,
+    refuseOrder: false, writeDelay: 0, testDelay: 0, bindDelay: 0, unbindDelay: 0, failBind: false, failUnbind: false, noGeneration: false };
   const ok = (body: unknown, delay = 0) => ({ status: 200, body, delay });
   const err = (status: number, code: string) => ({ status, body: { error: { code, message: REFLECTED } } });
   function web(req: Req) {
@@ -51,8 +57,10 @@ function fixture() {
     calls.push(record);
     if (replies.unsupported) return { status: 404, body: "" };
     if (path === PATH) {
-      if (req.method === "GET") return ok(state);
+      const view = () => state.settings_error ? { ...state, enabled: false, providers: rows() } : state;
+      if (req.method === "GET") return ok(view());
       const body = JSON.parse(req.body!);
+      record.prefsBody = body;
       if (body.providers) {
         record.providers = body.providers.map((r: Row) => r.id);
         if (replies.refuseOrder) return err(422, "invalid");
@@ -67,7 +75,7 @@ function fixture() {
         }
       }
       if (body.notice_acknowledged) state.notice_acknowledged = true;
-      return ok(state, replies.writeDelay);
+      return ok(view(), replies.writeDelay);
     }
     if (path === `${PATH}/keys/reset`) {
       state.keys_error = null;
@@ -87,11 +95,14 @@ function fixture() {
       row.key_status = row.key_saved ? "ok" : null;
       return ok({ ...row, api_key: REFLECTED }, replies.writeDelay);
     }
-    if (action === "test") return replies.testRefused ? err(409, "not_sent") : ok({ ...row, test: { outcome: "ok" } });
+    if (action === "test") {
+      record.generation = JSON.parse(req.body!).session_generation;
+      if (record.generation !== generation) return err(409, "no_session");
+      return replies.testRefused ? err(409, "not_sent") : ok({ ...row, test: { outcome: "ok" } }, replies.testDelay);
+    }
     if (action === "clear-cooldown") {
       if (state.settings_error?.startsWith("Saved provider pauses")) {
         state.settings_error = null;
-        state.enabled = true;
       }
       row.cooldown = null;
       row.key_status = row.key_saved ? "ok" : null;
@@ -101,8 +112,27 @@ function fixture() {
   }
   const network = { ...f.network, ...b.network };
   for (const method of ["GET", "PUT", "POST", "DELETE"]) {
-    network[`${method} ${BRIDGE}/v1/*`] = (req: Req) => new URL(req.url).pathname.startsWith(PATH)
-      ? web(req) : b.network[`${method} ${BRIDGE}/v1/*`]!(req);
+    network[`${method} ${BRIDGE}/v1/*`] = (req: Req) => {
+      const path = new URL(req.url).pathname;
+      if (path.startsWith(PATH)) return web(req);
+      if (path === "/v1/session" && method === "POST" && replies.failBind) return { error: "fixture offline" };
+      if (path === "/v1/session" && method === "DELETE" && replies.failUnbind) return { error: "fixture offline" };
+      const answer = b.network[`${method} ${BRIDGE}/v1/*`]!(req) as {
+        status: number; body: { session?: { generation?: number } | null };
+      };
+      const previous = workerGeneration;
+      if (path === "/v1/session" && answer.status === 200) {
+        if (method === "POST") workerGeneration = ++generation;
+        if (method === "DELETE") workerGeneration = null;
+        lifecycle.push({ method, previous, next: workerGeneration });
+      }
+      const session = answer.body.session;
+      return {
+        ...answer,
+        body: session && !replies.noGeneration ? { ...answer.body, session: { ...session, generation } } : answer.body,
+        delay: path !== "/v1/session" ? 0 : method === "POST" ? replies.bindDelay : replies.unbindDelay,
+      };
+    };
     for (const host of [BASE, OTHER]) {
       network[`${method} ${host}/v1/*`] = (req: Req) => {
         if (new URL(req.url).pathname !== `${PATH}/prefs`) return f.network[`${method} ${BASE}/v1/*`]!({ ...req, url: req.url.replace(host, BASE) });
@@ -118,7 +148,7 @@ function fixture() {
       };
     }
   }
-  return { network, calls, chatWrites, replies, alice, bob, other, b };
+  return { network, calls, chatWrites, replies, alice, bob, other, lifecycle, worker: () => workerGeneration };
 }
 
 async function start(w: ReturnType<typeof fixture>, bridge = true) {
@@ -148,7 +178,7 @@ test("the complete provider list reorders with accessible controls and status; a
   await app.waitFor("text:Exa is off.");
   await app.press("label:Move Exa down");
   await app.waitFor("text:Exa moved to position 2 of 5.");
-  expect(w.calls.filter((c) => c.method === "PUT").at(-1)?.providers).toEqual(["parallel", "exa", "tavily", "firecrawl", "tinyfish"]);
+  expect(w.calls.filter((c) => c.method === "PUT").at(-1)?.providers).toEqual(defaults);
   expect(w.alice.providers.find((p) => p.id === "exa")?.enabled).toBe(false);
   w.replies.refuseOrder = true;
   await app.press("id:websearch-up:exa");
@@ -275,13 +305,22 @@ test("unreadable preferences, pauses and keys have different explicit recovery a
   await app.press("id:websearch-reset-keys:confirm");
   await app.waitFor("id:websearch-keys-error", { state: "gone" });
   w.alice.settings_error = "Saved provider pauses on this computer can't be read, so web search is paused.";
+  w.alice.enabled = true;
   await app.press("id:websearch-refresh");
   await app.waitFor("id:websearch-pauses-error");
   expect(app.shows("id:websearch-reset-settings")).toBe(false);
+  await app.press("id:websearch-turn-off-paused");
+  await app.waitFor("text:Web search is off on this computer.");
+  expect(w.alice.enabled).toBe(false);
+  expect(w.alice.device.worker).toBe("stopped");
+  expect(w.alice.settings_error).not.toBe(null);
+  expect(w.calls.filter((r) => r.method === "PUT").at(-1)?.prefsBody).toEqual({ enabled: false });
+  expect(w.calls.some((r) => r.path.endsWith("/clear-cooldown"))).toBe(false);
   await item(app, "clear");
   await app.waitFor("id:websearch-pauses-error", { state: "gone" });
+  expect(w.alice.enabled).toBe(false);
   expect(text(app)).not.toContain(REFLECTED);
-  expect(w.calls.filter((r) => r.method !== "GET").map((r) => r.path)).toEqual([PATH, `${PATH}/keys/reset`, `${PATH}/providers/exa/clear-cooldown`]);
+  expect(w.calls.filter((r) => r.method !== "GET").map((r) => r.path)).toEqual([PATH, `${PATH}/keys/reset`, PATH, `${PATH}/providers/exa/clear-cooldown`]);
 });
 
 test("explicit provider tests and cooldown clear use separate routes and never show refusal details", async () => {
@@ -339,6 +378,100 @@ test("a helper bound to the wrong account is never read or written", async () =>
   await app.waitFor("id:websearch-chat-opt-in");
   expect(w.calls).toEqual([]);
   expect(app.shows("id:websearch-master")).toBe(false);
+});
+
+test("sign-out cleans a dispatched bind even when its response has not arrived", async () => {
+  const w = fixture();
+  w.replies.bindDelay = 3000;
+  const app = await start(w);
+  await app.waitUntil(() => w.worker() === 1, { timeout: 500 });
+  expect(app.shows("id:websearch-loading")).toBe(true);
+  await app.press("id:fixture-signout");
+  expect(w.lifecycle.map((action) => action.method)).toEqual(["POST"]);
+  await app.waitUntil(() => w.lifecycle.length === 2);
+  expect(w.lifecycle[1]).toEqual({ method: "DELETE", previous: 1, next: null });
+  expect(w.worker()).toBe(null);
+  expect(w.calls).toEqual([]);
+});
+
+test("replacement sign-in to the same account waits for held bind and cleanup, with no old worker", async () => {
+  const w = fixture();
+  w.replies.bindDelay = 2500;
+  w.replies.unbindDelay = 3000;
+  const app = await start(w);
+  await app.waitUntil(() => w.worker() === 1, { timeout: 500 });
+  w.replies.bindDelay = 0; // Only the first POST is held.
+  await app.press("id:fixture-alice");
+  expect(w.lifecycle.map((action) => action.method)).toEqual(["POST"]);
+  await app.waitUntil(() => w.lifecycle.length === 2, { timeout: 4000 });
+  expect(w.worker()).toBe(null);
+  await app.clock!.runFor(1000);
+  expect(w.lifecycle.map((action) => action.method)).toEqual(["POST", "DELETE"]);
+  expect(w.calls).toEqual([]);
+  await app.waitFor("id:websearch-provider:exa");
+  expect(w.lifecycle).toEqual([
+    { method: "POST", previous: null, next: 1 },
+    { method: "DELETE", previous: 1, next: null },
+    { method: "POST", previous: null, next: 2 },
+  ]);
+});
+
+test("a failed cleanup must be confirmed before a replacement session can bind", async () => {
+  const w = fixture();
+  const app = await start(w);
+  await app.waitFor("id:websearch-provider:exa");
+  w.replies.failUnbind = true;
+  await app.press("id:fixture-alice");
+  await app.waitFor("text:/isn't serving this account on this server/");
+  expect(w.lifecycle.map((action) => action.method)).toEqual(["POST"]);
+  w.replies.failUnbind = false;
+  await app.press("id:fixture-alice");
+  await app.waitFor("id:websearch-provider:exa");
+  expect(w.lifecycle.map((action) => action.method)).toEqual(["POST", "DELETE", "POST"]);
+  expect(w.worker()).toBe(2);
+});
+
+test("a held provider-test reply neither blocks switching nor publishes to the new account", async () => {
+  const w = fixture();
+  const app = await start(w);
+  await app.waitFor("id:websearch-provider:exa");
+  w.replies.testDelay = 5000;
+  await item(app, "test");
+  await app.waitUntil(() => w.calls.some((r) => r.path.endsWith("/test")), { timeout: 500 });
+  expect(w.calls.at(-1)?.generation).toBe(1);
+  await app.press("id:fixture-bob");
+  await app.waitUntil(() => w.worker() === 2, { timeout: 1000 });
+  await app.waitFor("id:websearch-provider:exa", { timeout: 1000 });
+  expect(w.lifecycle.map((action) => action.method)).toEqual(["POST", "DELETE", "POST"]);
+  expect(w.calls.at(-1)?.binding).toBe(`${BASE} bob`);
+  const observed = w.calls.length;
+  await app.clock!.runFor(5000);
+  expect(w.calls.length).toBe(observed);
+  expect(text(app)).not.toContain("Exa test:");
+  expect(app.shows("id:websearch-status")).toBe(false);
+});
+
+test("initial bind failure tells you to sign in again rather than offering a no-op Refresh", async () => {
+  const w = fixture();
+  w.replies.failBind = true;
+  const app = await start(w);
+  await app.waitFor("text:/sign out and sign in again/");
+  expect(app.shows("id:websearch-refresh")).toBe(false);
+  expect(w.calls).toEqual([]);
+  w.replies.failBind = false;
+  await app.press("id:fixture-signout");
+  await app.press("id:fixture-alice");
+  await app.waitFor("id:websearch-provider:exa");
+});
+
+test("an older bridge without a generation can't dispatch provider tests", async () => {
+  const w = fixture();
+  w.replies.noGeneration = true;
+  const app = await start(w);
+  await app.waitFor("text:Update Metro to test providers.");
+  await app.press("id:websearch-menu:exa");
+  expect(app.enabled("id:websearch-test:exa")).toBe(false);
+  expect(w.calls.some((r) => r.path.endsWith("/test"))).toBe(false);
 });
 
 test("bridge parser drops diagnostics and credentials, and rejects an incomplete order", () => {

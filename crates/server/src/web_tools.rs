@@ -419,6 +419,11 @@ pub struct ToolNote {
     /// `failed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure: Option<String>,
+    /// Stable run starter, stamped by Metro on failure events only. Room
+    /// members already see this id in run metadata; persist it here so the
+    /// starter can be identified after that in-memory registry is gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub starter_id: Option<String>,
 }
 
 impl ToolNote {
@@ -429,6 +434,7 @@ impl ToolNote {
             mode: None,
             attempts: Vec::new(),
             failure: None,
+            starter_id: None,
         }
     }
 
@@ -1135,9 +1141,12 @@ impl WebContext {
         }
     }
 
-    async fn append(&self, kind: &'static str, author: Author, text: &str, note: ToolNote) {
+    async fn append(&self, kind: &'static str, author: Author, text: &str, mut note: ToolNote) {
         let max = self.state.config.limits.max_event_text;
         let text = truncate(text, max);
+        if kind == kind::ERROR {
+            note.starter_id = self.initiator.id.clone();
+        }
         let activity = self.turn.with_tool(note);
         match &self.scope {
             WebScope::Room { space_id, room_id } => {
@@ -1323,6 +1332,7 @@ impl WebContext {
             mode: answer.mode.clone(),
             attempts: answer.attempts.clone(),
             failure: None,
+            starter_id: None,
         };
         if answer.provider.is_none() {
             let text = exhausted_text(tool, &whose, &answer.attempts);

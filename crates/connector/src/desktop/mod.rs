@@ -6,7 +6,7 @@
 //!
 //! | Method + path | Body | Answer |
 //! |---|---|---|
-//! | `GET /v1/status` | | bridge, version, instance, kinds, session, local, connections |
+//! | `GET /v1/status` | | bridge, version, instance, kinds, session (including generation), local, connections |
 //! | `GET /v1/monitoring/events` | | `{events: [...]}`; recent device-only operational errors |
 //! | `POST /v1/session` | `{server_url, session_token}` | status; verifies `GET /v1/me`, starts confirmed workers |
 //! | `DELETE /v1/session` | | status; stops every worker and sign-in |
@@ -23,7 +23,7 @@
 //! | `PUT /v1/web-search/providers/{id}/key` | `{api_key}` | provider row (`key_saved`, never the key) |
 //! | `DELETE /v1/web-search/providers/{id}/key` | | provider row (back to free mode) |
 //! | `POST /v1/web-search/keys/reset` | `{}` | the web search state; every saved key deleted |
-//! | `POST /v1/web-search/providers/{id}/test` | `{}` | provider row with `test.outcome` |
+//! | `POST /v1/web-search/providers/{id}/test` | `{session_generation}` | provider row with `test.outcome`; cancelled if that binding ends |
 //! | `POST /v1/web-search/providers/{id}/clear-cooldown` | `{}` | provider row |
 //! | `POST /v1/local-workspace/open` | `{}` | `{server_url, token}` |
 //! | `GET/POST /v1/local-tools…` | | the desktop tools lane |

@@ -32,6 +32,8 @@ test("web activity folds the accepted query and shows rotation, the interrupted 
     attempts: [
       attempt("exa", "keyless", "limited", "2027-01-02T14:20:00Z"),
       attempt("parallel", "keyless", "skipped_disabled"),
+      attempt("tinyfish", "keyless", "skipped_no_key"),
+      attempt("tavily", "keyless", "skipped_cooldown"),
       attempt("firecrawl", "key", "credential_changed"),
       attempt("firecrawl", "keyless", "ok"),
     ],
@@ -51,12 +53,14 @@ test("web activity folds the accepted query and shows rotation, the interrupted 
   expect(app.shows("id:activity-web-attempt:1")).toBe(false);
   expect(app.shows("id:activity-web-attempt:2")).toBe(true);
   expect(app.shows("id:activity-web-attempt:3")).toBe(true);
+  expect(app.shows("id:activity-web-attempt:4")).toBe(true);
+  expect(app.shows("id:activity-web-attempt:5")).toBe(true);
 });
 
-test("refusals and failures do not expose wire details; settings is only offered to the proven starter", async () => {
+test("after run eviction only the server-attributed starter is offered Settings; refusals stay private", async () => {
   const f = world();
-  f.state.runs.push({ id: "run_exhausted", actor: "alice", status: "completed", space_id: "acme", room_id: "lobby", task: "Find weather" });
-  const e = event(f, "run_exhausted", "error", secret, { name: "web_search", failure: "exhausted",
+  // Only transcript records survive; the in-memory registry is empty.
+  const e = event(f, "run_exhausted", "error", secret, { name: "web_search", failure: "exhausted", starter_id: "alice",
     attempts: [attempt("exa", "keyless", "out_of_credits"), attempt("tavily", "key", "key_rejected")] });
   const refuse = event(f, "run_refuse", "error", `web_fetch refused: ${secret}`, { name: "web_fetch", failure: "not_allowed" });
   const other = await room(f, "bob");
@@ -78,14 +82,23 @@ test("refusals and failures do not expose wire details; settings is only offered
 
 test("offline names the starter to other members but says your for the same stable account", async () => {
   const f = world();
-  f.state.runs.push({ id: "run_offline", actor: "alice", status: "completed", space_id: "acme", room_id: "lobby", task: "Find weather" });
   event(f, "run_offline", "error", "Web search couldn't run: Metro isn't running on Alice Example's computer, so it can't search for them. Searches never run on the server or someone else's computer.",
-    { name: "web_search", failure: "offline" });
+    { name: "web_search", failure: "offline", starter_id: "alice" });
   const nonStarter = await room(f, "bob");
   await nonStarter.waitFor("text:/Alice Example's Metro app, which is offline/");
   const app = await room(f, "alice");
   await app.waitFor("text:/your Metro app, which is offline/");
   expect(app.shows("text:/Nothing was sent/")).toBe(true);
+});
+
+test("history without server attribution gets no starter action", async () => {
+  const f = world();
+  f.state.runs.push({ id: "run_legacy", actor: "alice", status: "completed", space_id: "acme", room_id: "lobby", task: "Find weather" });
+  const error = event(f, "run_legacy", "error", "alice", { name: "web_search", failure: "exhausted" });
+  const app = await room(f, "alice");
+  await app.press("id:activity-toggle:agent:run_legacy");
+  await app.waitFor(`id:activity-web-failure:${error.id}`);
+  expect(app.shows("id:activity-open-websearch")).toBe(false);
 });
 
 test("web attempt presentation distinguishes provider failures, skips and repeat interruptions", () => {

@@ -59,7 +59,7 @@ export type BridgeStatus = {
   /** `secondary`: another Metro window of this user already serves device connections. */
   instance: "primary" | "secondary";
   kinds: string[];
-  session: { serverUrl: string; accountId: string } | null;
+  session: { serverUrl: string; accountId: string; generation?: number } | null;
   connections: LocalConnection[];
   /** The desktop-hosted solo workspace, when the bridge reports it. */
   local: LocalState | null;
@@ -144,7 +144,9 @@ export function parseConnection(v: unknown): LocalConnection {
 export function parseStatus(v: unknown): BridgeStatus {
   if (!isObj(v) || v.bridge !== 1) throw new BridgeError("protocol", "Metro's device helper speaks a version this app doesn't know.");
   const session = isObj(v.session) && typeof v.session.server_url === "string" && typeof v.session.account_id === "string"
-    ? { serverUrl: v.session.server_url, accountId: v.session.account_id }
+    ? { serverUrl: v.session.server_url, accountId: v.session.account_id,
+        ...(typeof v.session.generation === "number" && Number.isSafeInteger(v.session.generation) && v.session.generation > 0
+          ? { generation: v.session.generation } : {}) }
     : null;
   const local = str(v.local);
   return {
@@ -191,7 +193,7 @@ export type Bridge = {
   setWebSearchKey(id: WebProvider, key: string): Promise<WebProviderRow>;
   removeWebSearchKey(id: WebProvider): Promise<WebProviderRow>;
   resetWebSearchKeys(): Promise<LocalWebSearch>;
-  testWebSearchProvider(id: WebProvider): Promise<WebProviderRow>;
+  testWebSearchProvider(id: WebProvider, generation: number): Promise<WebProviderRow>;
   clearWebSearchCooldown(id: WebProvider): Promise<WebProviderRow>;
 };
 
@@ -292,7 +294,7 @@ export function createBridge(endpoint: BridgeEndpoint): Bridge {
     setWebSearchKey: (id, key) => webProvider(id, "PUT", "key", { api_key: key }),
     removeWebSearchKey: (id) => webProvider(id, "DELETE", "key"),
     resetWebSearchKeys: () => webState(webCall("POST", "/keys/reset", {})),
-    testWebSearchProvider: (id) => webProvider(id, "POST", "test", {}),
+    testWebSearchProvider: (id, generation) => webProvider(id, "POST", "test", { session_generation: generation }),
     clearWebSearchCooldown: (id) => webProvider(id, "POST", "clear-cooldown", {}),
   };
 }

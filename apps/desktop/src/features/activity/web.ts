@@ -14,9 +14,9 @@ export function webAttemptRows(note: WebToolNote) {
     const limit = a.outcome === "limited" || a.outcome === "out_of_credits";
     const until = a.until && (limit || a.outcome === "blocked" || a.outcome === "skipped_cooldown")
       ? ` · retry after ${a.until.slice(0, 10)} ${a.until.slice(11, 16)} UTC` : "";
-    const next = visible[i + 1]?.attempt;
-    const switched = limit && !!next && next.provider !== a.provider &&
-      next.outcome !== "skipped_no_key" && next.outcome !== "skipped_cooldown";
+    // A skipped candidate is still a row, but no request went to it.
+    const next = visible.slice(i + 1).find(({ attempt }) => !attempt.outcome.startsWith("skipped_"))?.attempt;
+    const switched = limit && !!next && next.provider !== a.provider;
     const text = limit ? `${name} ${WEB_OUTCOMES[a.outcome]}` : `${name}: ${WEB_OUTCOMES[a.outcome]}`;
     return { index, switched, text: `${text}${until}.${switched ? ` Switched to ${WEB_PROVIDERS[next.provider]}.` : ""}` };
   });

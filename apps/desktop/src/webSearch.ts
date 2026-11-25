@@ -6,7 +6,7 @@ import { WEB_OUTCOMES, WEB_PROVIDERS } from "./api/webSearch";
 import type { WebProvider } from "./api/webSearch";
 import { BridgeError } from "./device/bridge";
 import type { Bridge } from "./device/bridge";
-import { helper, refreshHelper, withWebSearchBridge } from "./device/state";
+import { helper, testWebSearchOnCurrentBinding, webSearchBinding, withWebSearchBridge } from "./device/state";
 import type { LocalWebSearch, WebProviderRow, WebUpdate } from "./device/webSearch";
 import { apiClient, connectedTo, me, sessionGuard } from "./store";
 
@@ -62,8 +62,7 @@ export function createWebSearchSettings(server: string, account: string) {
       case "secondary": return "secondary";
       case "unbound": return "unbound";
       case "unreachable": return "offline";
-      case "ready": return h.status.session?.accountId === account &&
-        h.status.session.serverUrl.replace(/\/+$/, "") === server.replace(/\/+$/, "") ? "ready" : "unbound";
+      case "ready": return webSearchBinding(server, account) ? "ready" : "unbound";
     }
   });
   const local = signal<LocalWebSearch | null>(null);
@@ -71,6 +70,8 @@ export function createWebSearchSettings(server: string, account: string) {
   const phase = computed<LocalPhase>(() => binding() === "ready" ? loaded() : binding());
   const localBusy = signal(false);
   const busy = computed(() => localBusy() || phase() === "loading");
+  const canRefresh = computed(() => binding() === "ready");
+  const canTest = computed(() => webSearchBinding(server, account)?.generation !== undefined);
   const localMessage = signal<Message | null>(null);
   const chat = signal<Chat>({ phase: "loading" });
   const chatBusy = signal(false);
@@ -127,25 +128,30 @@ export function createWebSearchSettings(server: string, account: string) {
     cleanup(() => { stopped = true; if (timer !== undefined) clearTimeout(timer); });
   });
 
+  type LocalAnswer = LocalWebSearch | WebProviderRow;
   async function changeLocal(
-    job: (b: Bridge) => Promise<LocalWebSearch | WebProviderRow>,
-    success: (answer: LocalWebSearch | WebProviderRow) => Message,
+    job: () => Promise<LocalAnswer>,
+    success: (answer: LocalAnswer) => Message,
     fallback: string,
+    refreshAfterRow = true,
   ) {
     if (!current() || phase() !== "ready" || busy()) return;
     localBusy.set(true);
     localMessage.set(null);
     try {
-      const answer = await withWebSearchBridge(server, account, (b) => {
-        if (!current()) throw new BridgeError("no_session", "The web search settings page was closed.");
-        return job(b);
-      });
+      const answer = await job();
       if (!current() || binding() !== "ready") return;
       if ("providers" in answer) local.set(answer);
-      else {
+      else if (refreshAfterRow) {
         // Cooldown clearing can restart the worker or repair the whole state
         // file. Read the full view instead of pretending only one row changed.
         if (!await readLocal() || !current()) return;
+      } else {
+        // Test only changes its provider's row. Don't queue a read-back
+        // that could make account switching wait for the test.
+        const view = local();
+        if (!view) return;
+        local.set({ ...view, providers: view.providers.map((p) => p.id === answer.id ? answer : p) });
       }
       const msg = success(answer);
       say(msg.text, msg.tone);
@@ -153,22 +159,25 @@ export function createWebSearchSettings(server: string, account: string) {
       if (!current() || binding() !== "ready") return;
       // Some writes can succeed before the worker fails to start. Read back;
       // never retry the write, send a key again, or restore optimistic values.
-      await readLocal();
+      if (refreshAfterRow) await readLocal();
       if (current() && binding() === "ready") say(localProblem(error, fallback), "danger");
     } finally {
       if (current()) localBusy.set(false);
     }
   }
 
+  function mutateLocal(job: (b: Bridge) => Promise<LocalAnswer>, success: (answer: LocalAnswer) => Message, fallback: string) {
+    return changeLocal(() => withWebSearchBridge(server, account, (b) => {
+      if (!current()) throw new BridgeError("no_session", "The web search settings page was closed.");
+      return job(b);
+    }), success, fallback);
+  }
+
   async function refresh() {
-    if (!current() || busy()) return;
+    if (!current() || busy() || !canRefresh()) return;
     localMessage.set(null);
-    if (binding() === "ready") {
-      localBusy.set(true);
-      try { await readLocal(); } finally { if (current()) localBusy.set(false); }
-    } else {
-      await refreshHelper(); // this does not bind or move to another server
-    }
+    localBusy.set(true);
+    try { await readLocal(); } finally { if (current()) localBusy.set(false); }
   }
 
   async function readChat() {
@@ -208,19 +217,19 @@ export function createWebSearchSettings(server: string, account: string) {
 
   const ok = (text: string): Message => ({ tone: "success", text });
   return {
-    phase, local, busy, localMessage, chat, chatBusy, chatError, refresh, readChat, setChat,
-    update: (data: WebUpdate, text: string) => changeLocal((b) => b.updateWebSearch(data), () => ok(text), "Metro couldn't confirm the web search change. Check the current settings before trying again."),
-    saveKey: (id: WebProvider, key: string) => changeLocal((b) => b.setWebSearchKey(id, key),
+    phase, local, busy, canRefresh, canTest, localMessage, chat, chatBusy, chatError, refresh, readChat, setChat,
+    update: (data: WebUpdate, text: string) => mutateLocal((b) => b.updateWebSearch(data), () => ok(text), "Metro couldn't confirm the web search change. Check the current settings before trying again."),
+    saveKey: (id: WebProvider, key: string) => mutateLocal((b) => b.setWebSearchKey(id, key),
       () => ok(`Saved your ${WEB_PROVIDERS[id]} key on this computer.`), `Couldn't save the ${WEB_PROVIDERS[id]} key. Check it and enter it again.`),
-    removeKey: (id: WebProvider) => changeLocal((b) => b.removeWebSearchKey(id),
+    removeKey: (id: WebProvider) => mutateLocal((b) => b.removeWebSearchKey(id),
       () => ok(`Removed your ${WEB_PROVIDERS[id]} key.`), `Couldn't remove the ${WEB_PROVIDERS[id]} key.`),
-    resetKeys: () => changeLocal((b) => b.resetWebSearchKeys(), () => ok("Saved web search keys removed."), "Couldn't reset the saved keys."),
-    clear: (id: WebProvider) => changeLocal((b) => b.clearWebSearchCooldown(id),
+    resetKeys: () => mutateLocal((b) => b.resetWebSearchKeys(), () => ok("Saved web search keys removed."), "Couldn't reset the saved keys."),
+    clear: (id: WebProvider) => mutateLocal((b) => b.clearWebSearchCooldown(id),
       () => ok(`${WEB_PROVIDERS[id]} is no longer paused or marked as having a rejected key.`), "Couldn't clear the saved provider pause."),
-    test: (id: WebProvider) => changeLocal((b) => b.testWebSearchProvider(id), (row) => {
+    test: (id: WebProvider) => changeLocal(() => testWebSearchOnCurrentBinding(server, account, id), (row) => {
       const result = "test" in row ? row.test : null;
       return { tone: result === "ok" ? "success" : "warning", text: `${WEB_PROVIDERS[id]} test: ${result ? WEB_OUTCOMES[result] : "no result"}.` };
-    }, `Couldn't test ${WEB_PROVIDERS[id]}.`),
+    }, `Couldn't test ${WEB_PROVIDERS[id]}.`, false),
   };
 }
 

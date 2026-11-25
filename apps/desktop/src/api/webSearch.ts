@@ -44,6 +44,7 @@ export type WebToolNote = {
   mode: WebMode | null;
   attempts: Attempt[];
   failure: Failure | null;
+  starterId: string | null;
 };
 
 export function parseWebTool(v: unknown): WebToolNote | undefined {
@@ -60,6 +61,7 @@ export function parseWebTool(v: unknown): WebToolNote | undefined {
     attempts,
     // Unknown failure codes must never make the raw refusal text visible.
     failure: v.failure == null ? null : failures.find((f) => f === v.failure) ?? "failed",
+    starterId: typeof v.starter_id === "string" && v.starter_id.trim() ? v.starter_id : null,
   };
 }
 

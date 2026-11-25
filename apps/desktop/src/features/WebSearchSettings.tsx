@@ -47,8 +47,9 @@ function WebSearchAccount(props: Props & { server: string; account: string }) {
   const unavailable = () => ({
     unavailable: "Web search runs in the Metro desktop app. Open Metro on this computer to use it.",
     secondary: "Another Metro window serves web search on this computer. Open Web search in that window.",
-    unbound: "Metro's helper isn't serving this account on this server. Sign in again to reconnect it.",
-    offline: "Metro's helper on this computer isn't answering. Refresh or reopen the desktop app.",
+    unbound: "Metro's helper isn't serving this account on this server. Reopen Metro or sign out and sign in again to reconnect it.",
+    offline: model.canRefresh() ? "Metro's helper on this computer isn't answering. Refresh or reopen the desktop app."
+      : "Metro's helper on this computer isn't answering. Reopen the desktop app or sign out and sign in again to reconnect it.",
     error: "Metro's helper didn't return usable web search settings. Refresh to try again.",
     unsupported: "", ready: "", loading: "",
   })[model.phase()];
@@ -73,7 +74,7 @@ function WebSearchAccount(props: Props & { server: string; account: string }) {
         <ProblemNote text="Update Metro to use web search." testID="websearch-unsupported"
           action={props.onOpenAbout ? <Action label="Open About & updates" onPress={props.onOpenAbout} /> : undefined} />
       </If>
-      <If when={["ready", "offline", "error"].includes(model.phase())}>
+      <If when={model.canRefresh() && ["ready", "offline", "error"].includes(model.phase())}>
         <Row><Action label="Refresh web search" testID="websearch-refresh" disabled={model.busy()} onPress={() => void model.refresh()} /></Row>
       </If>
       <If when={local()}>{(state) => <Computer model={model} state={state()} />}</If>
@@ -147,7 +148,10 @@ function Computer(props: { model: WebSearchSettingsModel; state: LocalWebSearch 
               disabled={m.busy() || s().endpointsError} onPress={() => { dismiss(); void m.update({ enabled: false }, "Settings reset. Web search is off on this computer."); }} />} />
         </If>
         <If when={s().settingsError === "pauses"}>
-          <ProblemNote text="Saved provider pauses can't be read, so web search is paused. Choose “Try again now” on any provider to reset them." testID="websearch-pauses-error" />
+          <ProblemNote text="Saved provider pauses can't be read, so web search is paused. Turn it off without repairing them, or choose “Try again now” on any provider to reset them."
+            testID="websearch-pauses-error"
+            action={<Action label="Turn off web search" testID="websearch-turn-off-paused" disabled={m.busy()}
+              onPress={() => { dismiss(); void m.update({ enabled: false }, "Web search is off on this computer."); }} />} />
         </If>
         <If when={s().settingsError === "unknown"}>
           <ProblemNote text="The helper can't read the local web search settings. Refresh to check again." testID="websearch-settings-error" />
@@ -174,7 +178,9 @@ function Computer(props: { model: WebSearchSettingsModel; state: LocalWebSearch 
         <If when={!s().settingsError && !s().keysError && s().providers.some((p) => p.enabled) && s().providers.every((p) => !p.enabled || (!p.keyless && !p.keySaved))}>
           <ProblemNote tone="warning" testID="websearch-no-eligible" text="No enabled provider can search without a key. Add a key or turn on a keyless provider." />
         </If>
-        <Label variant="caption">Testing sends the fixed query “Metro web search test” to the selected provider, using its current mode. It can use provider credits.</Label>
+        <If when={m.canTest()} else={<Label variant="caption">Update Metro to test providers.</Label>}>
+          <Label variant="caption">Testing sends the fixed query “Metro web search test” to the selected provider, using its current mode. It can use provider credits.</Label>
+        </If>
       </SettingsGroup>
     </>
   );
@@ -218,7 +224,7 @@ function ProviderRow(props: {
               { id: `websearch-edit:${id}`, label: p().keySaved ? "Replace key…" : "Add key…",
                 disabled: props.blocked || props.state.keysError, onPress: () => props.setEdit(true) },
               { id: `websearch-test:${id}`, label: "Test provider",
-                disabled: props.blocked || !props.state.enabled || !p().enabled || props.state.keysError || (!p().keyless && !p().keySaved),
+                disabled: !m.canTest() || props.blocked || !props.state.enabled || !p().enabled || props.state.keysError || (!p().keyless && !p().keySaved),
                 onPress: () => void m.test(id) },
               { id: `websearch-clear:${id}`, label: "Try again now",
                 disabled: m.busy() || props.state.endpointsError || !p().cooldown && !p().keyRejected && props.state.settingsError !== "pauses",

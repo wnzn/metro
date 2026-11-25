@@ -555,7 +555,7 @@ impl Desktop {
             let st = lock(&self.state);
             match &st.session {
                 Some(s) => (
-                    json!({"server_url": s.server_url, "account_id": s.account_id}),
+                    json!({"server_url": s.server_url, "account_id": s.account_id, "generation": s.epoch}),
                     Some((s.server_url.clone(), s.account_id.clone())),
                 ),
                 None => (Value::Null, None),
@@ -870,8 +870,8 @@ impl Desktop {
         };
         self.stop_monitor();
         if !same {
-            self.stop_all().await;
             self.web.session_ended().await;
+            self.stop_all().await;
             if let Some(t) = &self.cfg.tools {
                 t.stop_all().await;
             }
@@ -946,8 +946,8 @@ impl Desktop {
         {
             let _g = self.ops.lock().await;
             self.stop_monitor();
-            self.stop_all().await;
             self.web.session_ended().await;
+            self.stop_all().await;
             if let Some(t) = &self.cfg.tools {
                 t.stop_all().await;
             }
@@ -1652,8 +1652,13 @@ impl Desktop {
     }
 
     /// `POST /v1/web-search/providers/{id}/test`.
-    pub async fn web_test(&self, id: &str) -> R<Value> {
+    pub async fn web_test(&self, id: &str, expected_generation: u64) -> R<Value> {
         let (server, account, _, epoch) = self.session_epoch()?;
+        // A delayed loopback request must not adopt the replacement session.
+        // This check uses the same snapshot as the account and server.
+        if epoch != expected_generation {
+            return Err(err(409, "no_session", "The web search session changed"));
+        }
         self.web.test(&server, &account, epoch, id).await
     }
 

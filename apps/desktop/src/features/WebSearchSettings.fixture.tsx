@@ -1,6 +1,6 @@
 import { mount, signal } from "nsh";
 import { BASE, TOKENS } from "../../test/fakeServer";
-import { connect, status } from "../store";
+import { connect, disconnect, status } from "../store";
 import { Action, Column, Label, Row } from "../ui";
 import { WebSearchSettings } from "./WebSearchSettings";
 
@@ -14,6 +14,7 @@ function Fixture() {
         <Action label="Alice" testID="fixture-alice" onPress={() => use(BASE, "alice")} />
         <Action label="Bob" testID="fixture-bob" onPress={() => use(BASE, "bob")} />
         <Action label="Other workspace" testID="fixture-other" onPress={() => use(BASE.replace("8787", "8788"), "alice")} />
+        <Action label="Sign out" testID="fixture-signout" onPress={() => disconnect()} />
         <Action label="Toggle page" testID="fixture-toggle" onPress={() => show.set(!show())} />
       </Row>
       <Label testID="fixture-link">{link()}</Label>

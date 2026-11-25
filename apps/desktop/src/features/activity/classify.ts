@@ -61,11 +61,11 @@ export function stepPhase(a: Activity): "called" | "complete" | "failed" | "thin
 }
 
 /** The event's activity, or null when it should stay visible as it is. */
-export function activityOf(event: { kind: string; text: string; activity?: { tool?: WebToolNote } }): Activity | null {
+export function activityOf(event: { kind: string; text: string; actorId?: string; activity?: { tool?: WebToolNote } }): Activity | null {
   const k = norm(event.kind);
   const text = event.text ?? "";
   const note = event.activity?.tool;
-  if (note) {
+  if (note && !event.actorId && (k === "error" || k === "tool_call" || k === "tool_result")) {
     const web = { note: k === "error" && !note.failure ? { ...note, failure: "failed" as const } : note,
       offlineOwner: note.failure === "offline" ? webOfflineOwner(text) : null };
     const summary = webToolLabel(note.name);
