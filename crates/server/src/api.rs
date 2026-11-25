@@ -162,13 +162,14 @@ pub(crate) fn check_name(state: &AppState, name: &str) -> ApiResult<String> {
 }
 
 fn check_text(state: &AppState, text: &str) -> ApiResult<String> {
+    let text = text.trim().to_owned();
     let max = state.config.limits.max_message_chars;
-    if text.trim().is_empty() || text.chars().count() > max {
+    if text.is_empty() || text.chars().count() > max {
         return Err(ApiError::bad_request(format!(
             "text must be 1..={max} characters"
         )));
     }
-    Ok(text.to_owned())
+    Ok(text)
 }
 
 /// A message's text and attachments checked together: the text may be
@@ -670,25 +671,13 @@ pub async fn post_message(
     let Json(body) = body?;
     let space = member_of(&state, &sid, &who).await?;
     let room = room_of(&state, &space, &rid).await?;
-    // Legacy clients retain their original trim-and-infer contract.
-    // Authoritative sends (including Chat Dispatch) keep the submitted text.
-    let (stored_text, spans) = if body.infer_text_mentions {
-        (
-            body.text.trim(),
-            ValidatedSpans::new(&body.text, body.mentions.len(), body.spans),
-        )
-    } else {
-        (
-            body.text.as_str(),
-            ValidatedSpans::for_message(&body.text, body.mentions.len(), body.spans, false),
-        )
-    };
-    let spans = spans.map_err(ApiError::bad_request)?;
+    let spans = ValidatedSpans::new(&body.text, body.mentions.len(), body.spans)
+        .map_err(ApiError::bad_request)?;
     let text = check_message(
         &state,
         &who.id,
         Some(&space.id),
-        stored_text,
+        &body.text,
         &body.asset_ids,
     )
     .await?;
@@ -1048,7 +1037,7 @@ pub async fn chat_message(
     body: JsonBody<ChatMessage>,
 ) -> ApiResult<(StatusCode, Json<PostedMessage>)> {
     let Json(body) = body?;
-    let text = check_message(&state, &who.id, None, body.text.trim(), &body.asset_ids).await?;
+    let text = check_message(&state, &who.id, None, &body.text, &body.asset_ids).await?;
     let resolved = body.recipients(&text)?;
     let addressing = Addressing::of(&resolved);
     let chosen = if body.save_note {

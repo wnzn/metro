@@ -390,6 +390,10 @@ async fn mention_spans_round_trip_in_rooms_threads_and_attachment_events() {
         })
         .collect();
     occurrences.sort_unstable_by_key(|(i, _)| *i);
+    let expected: Vec<_> = occurrences
+        .iter()
+        .map(|(i, label)| json!({"start": i, "end": i + label.len(), "index": 0}))
+        .collect();
     let bob = json!({"kind": "user", "id": "bob"});
     let body = json!({"text": raw, "mentions": [bob, bob], "spans": spans});
     for (room, file) in [("lobby", None), (thread.id.as_str(), Some(&asset))] {
@@ -398,18 +402,9 @@ async fn mention_spans_round_trip_in_rooms_threads_and_attachment_events() {
             body["asset_ids"] = json!([file]);
             body["infer_text_mentions"] = json!(false);
         }
-        let (stored, offset) = if file.is_some() {
-            (raw.as_str(), leading.len())
-        } else {
-            (text, 0)
-        };
-        let expected: Vec<_> = occurrences
-            .iter()
-            .map(|(i, label)| json!({"start": i + offset, "end": i + offset + label.len(), "index": 0}))
-            .collect();
         let (status, event) = h.room("alice", &sid, room, body).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{event}");
-        assert_eq!(event["text"], stored);
+        assert_eq!(event["text"], text);
         assert_eq!(event["spans"], json!(expected));
         // No second recipient from the span's first word, the colliding
         // agent handle, or code. The unspanned @carol only works in legacy mode.
@@ -439,7 +434,7 @@ async fn mention_spans_round_trip_in_rooms_threads_and_attachment_events() {
             serde_json::to_value(&reloaded[0]).unwrap()["spans"],
             json!(expected)
         );
-        assert_eq!(reloaded[0].text, stored);
+        assert_eq!(reloaded[0].text, text);
     }
     assert_eq!(h.link_rows(), (1, 1));
     assert_eq!(h.system_one_calls(), 0);
@@ -473,7 +468,7 @@ async fn authoritative_empty_spans_survive_post_poll_and_reopen_with_attachments
         }
         let (status, event) = h.room("alice", &sid, room, body).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{event}");
-        assert_eq!(event["text"], " @bob is literal ");
+        assert_eq!(event["text"], "@bob is literal");
         assert_eq!(event["mentions"], json!([bob]));
         assert_eq!(event["spans"], json!([]));
         assert!(event.get("activity").is_none());

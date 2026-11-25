@@ -115,7 +115,7 @@ test("Dispatch sends exact Unicode and whitespace to the explicit thread, never 
   await app.waitFor("id:run-follow:held");
   await app.press("id:run-follow:held");
   await app.waitFor("text:To: agent in Acme › #Thread");
-  const text = "  🌿 @agent, résumé\ncheck the task  ";
+  const text = "\u2003  🌿 @bob, résumé\ncheck the task  \t";
   await app.paste("id:dispatch-text", { text });
   const posts = () => app.requests().filter(r => r.method === "POST" && r.url.endsWith("/messages"));
   const body = { text, invoke_agent: true, infer_text_mentions: false };
