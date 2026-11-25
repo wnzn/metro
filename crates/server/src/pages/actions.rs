@@ -69,10 +69,16 @@ pub async fn run(
             ));
         }
     };
-    if a.kind == action::RUN_AGENT
-        && let Some(sid) = &target_space
-    {
-        crate::api::member_of(state, sid, who).await?;
+    if a.kind == action::RUN_AGENT {
+        if let Some(sid) = &target_space {
+            crate::api::member_of(state, sid, who).await?;
+        }
+        let max = state.config.limits.max_message_chars;
+        if a.prompt.as_deref().unwrap_or_default().chars().count() > max {
+            return Err(ApiError::bad_request(format!(
+                "this button's prompt is longer than this server's {max}-character message limit"
+            )));
+        }
     }
     let schedule = if a.kind == action::RUN_SCHEDULE {
         let (uid, id) = (who.id.clone(), a.schedule_id.clone().unwrap_or_default());
