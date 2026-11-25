@@ -1,6 +1,6 @@
 import { expect, test } from "nsh/test";
 import {
-  editMentionDraft, MAX_MENTION_RECIPIENTS, MAX_MENTION_SPANS, pickMention,
+  captureTypedMentions, editMentionDraft, MAX_MENTION_RECIPIENTS, MAX_MENTION_SPANS, mentionIdentityKey, pickMention,
   prepareMentionSend, scanMentionDraft, updateMentionDraft,
 } from "./draft";
 import type { MentionDirectory, MentionDraft, MentionRecipient, MentionSend } from "./draft";
@@ -62,10 +62,10 @@ test("same full label across handle, member id and display name asks in priority
 
 test("duplicate aliases for one stable identity do not create ambiguity; user and agent namespaces are distinct", () => {
   const directory: MentionDirectory = {
-    members: [{ id: "coder", displayName: "CODER" }, { id: "coder", displayName: "Coder" }],
+    members: [{ id: "coder", displayName: "MEMBER CODER" }, { id: "coder", displayName: "Member Coder" }],
     agents: [{ id: "coder", handle: "robot", name: "Robot" }, { id: "coder", handle: "robot", name: "Robot" }],
   };
-  const out = body(send("@coder @Robot @CODER", directory));
+  const out = body(send("@Member Coder @Robot @MEMBER CODER", directory));
   expect(out.mentions).toEqual([{ kind: "user", id: "coder" }, { kind: "agent", agent_id: "coder" }]);
   expect(out.spans?.map(s => s.index)).toEqual([0, 1, 0]);
 });
@@ -90,13 +90,109 @@ test("bare @agent is reserved in typed text; the original agent can still be add
 test("await a typed boundary without prematurely anchoring a short alias; preflight checks EOF", () => {
   const directory = { ...roster, members: [...roster.members, { id: otherAlice.id, displayName: "Alice Moreno" }] };
   expect(scanMentionDraft(draft("@Alice"), directory)).toEqual([]);
-  expect(scanMentionDraft(draft("@Alice "), directory)[0]?.kind).toBe("resolved");
+  expect(scanMentionDraft(draft("@Alice "), directory)).toEqual([]);
   expect(scanMentionDraft(draft("@Alice Moreno"), directory)).toEqual([]);
   expect(scanMentionDraft(draft("@Alice Moreno"), directory, { finalize: true })[0]?.kind).toBe("ambiguous");
   expect(scanMentionDraft(draft("@Alice Moreno!"), directory)[0]?.kind).toBe("ambiguous");
   const atSend = send("@Alice Moreno", directory);
   expect(atSend.ok ? null : atSend.reason).toBe("ambiguous");
   expect(body(send("@Alice Moreno")).mentions).toEqual([alice]);
+});
+
+test("capture keeps a short alias provisional through single- and multiword typing", () => {
+  let typed = draft("");
+  for (const text of ["@Alice", "@Alice ", "@Alice M", "@Alice Moreno"]) {
+    typed = captureTypedMentions(updateMentionDraft(typed, text), roster);
+    expect(typed.anchors).toEqual([]);
+    expect(typed.decisions).toBe(undefined);
+  }
+  typed = captureTypedMentions(updateMentionDraft(typed, "@Alice Moreno "), roster);
+  expect(typed.anchors.map(a => a.mention)).toEqual([alice]);
+  const middle = captureTypedMentions(draft("@Alice M existing tail"), roster, { caret: "@Alice M".length });
+  expect(middle.anchors).toEqual([]);
+  const short = captureTypedMentions(draft("@Alice "), roster, { finalize: true });
+  expect(short.anchors[0]?.mention).toEqual({ kind: "agent", agentId: "ag-3" });
+  expect(captureTypedMentions(draft("@bo."), roster).anchors).toEqual([]);
+});
+
+test("a completed typed person cannot silently retarget to an agent after rename or revocation", () => {
+  const ada = { kind: "user", id: "oidc|ada" } as const;
+  const first: MentionDirectory = { members: [{ id: ada.id, displayName: "Ada" }], agents: [] };
+  const next: MentionDirectory = {
+    members: [{ id: ada.id, displayName: "Ada Lovelace" }],
+    agents: [{ id: "ag-replacement", name: "Agent", handle: "ada" }],
+  };
+  const revoked = { ...next, members: [] };
+  const typed = captureTypedMentions(draft("@Ada "), first);
+  expect(typed.anchors).toEqual([{ start: 0, end: 4, literal: "@Ada", mention: ada }]);
+  const prefixed = captureTypedMentions(updateMentionDraft(typed, `👋 ${typed.text}`), next);
+  const moved = captureTypedMentions(updateMentionDraft(prefixed, `${prefixed.text}next`), next);
+  expect(body(prepareMentionSend(moved, next)).mentions).toEqual([ada]);
+  expect(scanMentionDraft(moved, revoked)[0]).toEqual({
+    kind: "resolved", start: 3, end: 7, literal: "@Ada", mention: ada,
+  });
+  expect(prepareMentionSend(moved, revoked)).toEqual({ ok: false, reason: "stale-recipient" });
+  // The value-only API cannot prove survival through a broad, two-sided
+  // change, but still must not reinterpret the same spelling as the agent.
+  const broad = captureTypedMentions(updateMentionDraft(typed, moved.text), next);
+  const broadSend = prepareMentionSend(broad, next);
+  expect(broadSend.ok ? null : broadSend.reason).toBe("ambiguous");
+  // Actually replacing the occurrence (as opposed to refreshing its data)
+  // can resolve the same visible spelling to a newly chosen identity.
+  const retyped = editMentionDraft(moved, { start: 3, end: 7, replacement: "@Ada" })!;
+  expect(body(prepareMentionSend(captureTypedMentions(retyped, revoked), revoked)).mentions)
+    .toEqual([{ kind: "agent", agent_id: "ag-replacement" }]);
+});
+
+test("completed ambiguity and plain decisions do not change when roster candidates change", () => {
+  const directory = {
+    members: [{ id: "person-a", displayName: "Review" }, { id: "person-b", displayName: "Review" }],
+    agents: [],
+  };
+  const refresh = {
+    members: [],
+    agents: [{ id: "ag-new", handle: "review", name: "Latest" }, { id: "ag-other", handle: "spare", name: "Spare" }],
+  };
+  const ambiguous = captureTypedMentions(draft("@Review "), directory);
+  const blocked = prepareMentionSend(ambiguous, refresh);
+  expect(blocked.ok ? null : blocked.reason).toBe("ambiguous");
+  const plain = captureTypedMentions(draft("@Spare "), directory);
+  const moved = captureTypedMentions(updateMentionDraft(plain, `hello ${plain.text}`), refresh);
+  expect(scanMentionDraft(moved, refresh)).toEqual([
+    { kind: "unresolved", start: 6, end: 12, literal: "@Spare" },
+  ]);
+  expect(prepareMentionSend(moved, refresh)).toEqual({ ok: true, body: { text: "hello @Spare " } });
+});
+
+test("chooser order and focus keys are stable across directory reordering", () => {
+  const directory = {
+    members: [{ id: "member-z", displayName: "Review" }, { id: "member-a", displayName: "Review" }],
+    agents: [{ id: "ag-z", name: "Review", handle: "review" }, { id: "ag-a", name: "Review", handle: "helper" }],
+  };
+  const source = draft("@Review ");
+  const choices = (d: MentionDirectory) => {
+    const match = scanMentionDraft(source, d)[0];
+    return match.kind === "ambiguous" ? match.choices.map(mentionIdentityKey) : [];
+  };
+  const expected = ["agent:ag-z", "agent:ag-a", "user:member-a", "user:member-z"];
+  expect(choices(directory)).toEqual(expected);
+  expect(choices({ members: [...directory.members].reverse(), agents: [...directory.agents].reverse() })).toEqual(expected);
+});
+
+test("leading underscore and hyphen handles and raw agent IDs resolve only through the directory", () => {
+  const first = { id: "ag-1234567890abcdef", name: "Builder", handle: "_coder" };
+  const second = { id: "ag-fedcba0987654321", name: "Tester", handle: "-helper" };
+  const directory = { members: [], agents: [first, second] };
+  const out = body(send(`@_CoDeR @-helper @${first.id} @${second.id}`, directory));
+  expect(out.mentions).toEqual([
+    { kind: "agent", agent_id: first.id }, { kind: "agent", agent_id: second.id },
+  ]);
+  expect(out.spans?.map(s => s.index)).toEqual([0, 1, 0, 1]);
+  expect(send(`@${first.id}`, { members: [], agents: [] })).toEqual({ ok: true, body: { text: `@${first.id}` } });
+  expect(pickMention(draft("@?"), { start: 0, end: 2, literal: "@?" }, { kind: "agent", agentId: first.id },
+    { members: [], agents: [] })).toBe(null);
+  const collision = send(`@${first.id}`, { ...directory, members: [{ id: first.id }] });
+  expect(collision.ok ? null : collision.reason).toBe("ambiguous");
 });
 
 test("an ambiguous full name becomes a stable anchor when a suggestion is tapped", () => {
@@ -135,6 +231,19 @@ test("unresolved and lookalike text stays unchanged and has no addressing metada
   expect(scanMentionDraft(draft("@Alise"), roster, { finalize: true })[0]?.kind).toBe("unresolved");
   expect(send("@Alise")).toEqual({ ok: true, body: { text: "@Alise" } });
   expect(send(" \t\n ")).toEqual({ ok: true, body: { text: " \t\n " } });
+});
+
+test("authoritative draft keeps quoted addresses plain while normal quoted mentions still work", () => {
+  const mail = `Write to <"local part"@agent> or "with \\"quote\\""@coder or 'local'@agent or "local @coder team"@example.net.`;
+  expect(scanMentionDraft(draft(mail), roster)).toEqual([]);
+  expect(send(mail)).toEqual({ ok: true, body: { text: mail } });
+  const text = `Say "hello!" "@coder" or '@agent' but not \\@agent.`;
+  expect(scanMentionDraft(draft(text), roster).map(m => m.literal)).toEqual(["@coder", "@agent"]);
+  expect(body(send(text)).mentions).toEqual([{ kind: "agent", agent_id: coder.agentId }, generic]);
+  const agent = captureTypedMentions(draft("@agent "), roster);
+  const email = editMentionDraft(agent, { start: 0, end: 0, replacement: `"local"` })!;
+  expect(email.anchors).toEqual([]);
+  expect(prepareMentionSend(email, roster)).toEqual({ ok: true, body: { text: `"local"@agent ` } });
 });
 
 test("pasted inline and fenced code is ignored, including open fences and a fence exposed by server trim", () => {
@@ -185,6 +294,22 @@ test("an explicit label cannot swallow a standalone @ token", () => {
     text, anchors: [{ start: 0, end: text.length, literal: text, mention: support }],
   }, directory)).toEqual({ ok: false, reason: "invalid-anchor" });
   expect(body(send(text, directory)).mentions).toEqual([support, generic]);
+});
+
+test("B-G rejects edge @ labels; explicit picks fall back to a valid ID or handle", () => {
+  const directory = {
+    members: [{ id: "member", displayName: "@Support" }, { id: "other", displayName: "Support@" }],
+    agents: [{ id: coder.agentId, handle: "_coder", name: "@Coder" }],
+  };
+  const source = draft("@s");
+  expect(pick(source, 0, 2, { kind: "user", id: "member" }, directory).text).toBe("@member ");
+  expect(pick(source, 0, 2, { kind: "user", id: "other" }, directory).text).toBe("@other ");
+  expect(pick(source, 0, 2, coder, directory).text).toBe("@_coder ");
+  for (const text of ["@@Support", "@Support@"]) {
+    expect(prepareMentionSend({
+      text, anchors: [{ start: 0, end: text.length, literal: text, mention: { kind: "user", id: "member" } }],
+    }, directory)).toEqual({ ok: false, reason: "invalid-anchor" });
+  }
 });
 
 test("UTF-8 byte ranges use exact untrimmed text through multiline and multibyte paste", () => {
@@ -276,6 +401,25 @@ test("exact span and recipient caps pass; overflow blocks instead of dropping a 
   expect(body(send(full, directory)).mentions?.length).toBe(MAX_MENTION_RECIPIENTS);
   expect(send(`${full} @${members[members.length - 1].id}`, directory))
     .toEqual({ ok: false, reason: "too-many-recipients" });
+});
+
+test("Ask Agent counts against the total recipient cap unless that identity is already addressed", () => {
+  const members = Array.from({ length: MAX_MENTION_RECIPIENTS }, (_, i) => ({ id: `p${i}` }));
+  const directory = { ...roster, members };
+  const full = members.map(m => `@${m.id}`).join(" ");
+  const oneShort = full.slice(0, full.lastIndexOf(" "));
+  expect(prepareMentionSend(draft(full), directory, { askAgent: {} }))
+    .toEqual({ ok: false, reason: "too-many-recipients" });
+  expect(prepareMentionSend(draft(full), directory, { askAgent: { agentId: coder.agentId } }))
+    .toEqual({ ok: false, reason: "too-many-recipients" });
+  const named = body(prepareMentionSend(draft(`${oneShort} @coder`), directory, { askAgent: { agentId: coder.agentId } }));
+  expect([named.mentions?.length, named.invoke_agent, named.agent_id]).toEqual([MAX_MENTION_RECIPIENTS, true, coder.agentId]);
+  const duplicate = body(prepareMentionSend(draft(`${oneShort} @agent`), directory, { askAgent: {} }));
+  expect([duplicate.mentions?.length, duplicate.invoke_agent, duplicate.agent_id]).toEqual([MAX_MENTION_RECIPIENTS, true, undefined]);
+  expect(body(prepareMentionSend(draft("plain"), directory, { askAgent: {} })))
+    .toEqual({ text: "plain", invoke_agent: true });
+  expect(prepareMentionSend(draft("plain"), directory, { askAgent: { agentId: "missing" } }))
+    .toEqual({ ok: false, reason: "stale-recipient" });
 });
 
 test("display-name limit counts Unicode scalars, not code units or wire bytes", () => {
