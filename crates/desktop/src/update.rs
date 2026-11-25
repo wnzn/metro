@@ -182,6 +182,38 @@ pub fn gate_msi_at_start(desktop_root: &Path) -> Result<(), String> {
     })
 }
 
+fn managed_root(install_dir: &Path) -> Option<&Path> {
+    install_dir
+        .parent()
+        .and_then(Path::parent)
+        .filter(|root| root.join(install::MARKER).is_file())
+}
+
+/// Read-only early rejection, including before monitoring or instance-lock
+/// creation. A pass is not authorization: startup rechecks under its locks.
+pub fn preflight_at_start(
+    install_dir: &Path,
+    desktop_root: &Path,
+    trial: bool,
+) -> Result<(), String> {
+    gate_msi_at_start(desktop_root)?;
+    let gate = RootGate::read(desktop_root).map_err(|_| uncertain_journal())?;
+    if let Some(root) = managed_root(install_dir) {
+        let journal = install::inspect_recovery_journal(root).map_err(|_| uncertain_journal())?;
+        if let Some(gate) = gate {
+            if !journal.is_some_and(|j| gate.matches(root, &j.id)) {
+                return Err(uncertain_journal());
+            }
+            if !trial && !install::script_state(root, env!("CARGO_PKG_VERSION")) {
+                return Err(uncertain_journal());
+            }
+        }
+    } else if gate.is_some() {
+        return Err(blocked_recovery());
+    }
+    Ok(())
+}
+
 pub fn recover_at_start(
     install_dir: &Path,
     desktop_root: &Path,
@@ -195,11 +227,7 @@ pub fn recover_at_start(
             Ok(())
         };
     };
-    let root = install_dir
-        .parent()
-        .and_then(Path::parent)
-        .filter(|root| root.join(install::MARKER).is_file());
-    let Some(root) = root else {
+    let Some(root) = managed_root(install_dir) else {
         return if gate.is_some() {
             Err(blocked_recovery())
         } else {
@@ -209,14 +237,9 @@ pub fn recover_at_start(
     let Some(own) = metro_release::Version::parse(env!("CARGO_PKG_VERSION")) else {
         return Err(blocked_recovery());
     };
-    let recover = || match install::recover(root, desktop_root, &desktop_root.join("update"), &own)
-    {
-        install::Recovery::Nothing => Ok(()),
-        install::Recovery::Blocked => Err(blocked_recovery()),
-        install::Recovery::JournalUncertain => Err(uncertain_journal()),
-    };
-    if let Some(gate) = &gate {
-        let j = install::load_journal(&root.join(install::JOURNAL))
+    let update_dir = desktop_root.join("update");
+    let recovery = if let Some(gate) = &gate {
+        let j = install::inspect_recovery_journal(root)
             .map_err(|_| uncertain_journal())?
             .filter(|j| gate.matches(root, &j.id))
             .ok_or_else(uncertain_journal)?;
@@ -229,10 +252,15 @@ pub fn recover_at_start(
         ) {
             return Err(blocked_recovery());
         }
-        recover()?;
-        return RootGate::retire(desktop_root, root, &j.id, lock).map_err(|_| blocked_recovery());
+        install::recover_with_gate(root, desktop_root, &update_dir, &own, &j, lock)
+    } else {
+        install::recover(root, desktop_root, &update_dir, &own)
+    };
+    match recovery {
+        install::Recovery::Nothing => Ok(()),
+        install::Recovery::Blocked => Err(blocked_recovery()),
+        install::Recovery::JournalUncertain => Err(uncertain_journal()),
     }
-    recover()
 }
 
 pub fn trial_lock(id: &str, install_dir: &Path, desktop_root: &Path) -> Option<InstanceLock> {

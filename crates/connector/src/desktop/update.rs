@@ -1181,9 +1181,6 @@ impl Updater {
                 "the update is no longer staged and offered",
             )
         };
-        if !self.can_update_in_app() {
-            return Err(invalid());
-        }
         lock.check(install::lock_root(&self.cfg.kind, &self.cfg.dir))?;
         let path = install::journal_path(&self.cfg.kind, &self.cfg.dir).ok_or_else(invalid)?;
         let j = install::load_journal(&path)
@@ -1195,6 +1192,10 @@ impl Updater {
                     && j.to == req.version.to_string()
             })
             .ok_or_else(install::journal_uncertain)?;
+        install::check_staged_current(&self.cfg.kind, &j)?;
+        if !self.can_update_in_app() {
+            return Err(invalid());
+        }
         let manifest = {
             let inner = self.lock();
             if inner.phase != Phase::Applying
