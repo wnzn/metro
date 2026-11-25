@@ -78,7 +78,7 @@ export type Place = "chat" | "space" | "settings" | "search" | "library" | "page
 export type MainPlace = Exclude<Place, "settings">;
 /** The pages of Settings. Reachable with or without any Space. */
 export type SettingsExtension = "websearch" | "about";
-export type SettingsSection = "profile" | "runners" | "connections" | "models" | "monitoring" | "appearance" | SettingsExtension;
+export type SettingsSection = "profile" | "runners" | "connections" | "models" | "metro-chat" | "monitoring" | "appearance" | SettingsExtension;
 type SettingsAlias = "providers" | "routing";
 const settingsExtensions = signal<readonly SettingsExtension[]>([]);
 export const settingsExtensionAvailable = (section: SettingsExtension) => settingsExtensions().includes(section);
@@ -152,6 +152,7 @@ const activeScope = computed(() => {
   return sid && rid ? scopeKey(sid, rid) : "";
 });
 export const activeEvents = computed(() => eventsByScope()[activeScope()] ?? EMPTY_EVENTS);
+export const chatEvents = computed(() => eventsByScope()[CHAT] ?? EMPTY_EVENTS);
 export const activeLoaded = computed(() => !!loadedScopes()[activeScope()]);
 const reactionsByScope = signal<Record<string, Reactions>>({});
 export const activeReactions = computed(() => reactionsByScope()[activeScope()] ?? EMPTY_REACTIONS);
@@ -197,6 +198,7 @@ export const runs = signal<Run[]>([]);
 export const runsLoaded = signal(false);
 export const runsError = signal<string | null>(null);
 export const runBusy = signal<string | null>(null);
+export const runRetryBusy = signal<string | null>(null);
 /** Where a task from the Chat goes: an explicit Space and room, never implied. */
 export const dispatchTarget = signal<{ spaceId: string; roomId: string | null } | null>(null);
 export const dispatchDraft = signal("");
@@ -708,9 +710,9 @@ export function openPlace(where: "search" | "library" | "pages" | "schedules" | 
   });
 }
 
-/** Pages links must land on the exact room or stay where they are. Validate
+/** Deep links must land on the exact room or stay where they are. Validate
  * with a fresh membership-checked list before changing navigation. */
-export async function openExactRoom(spaceId: string, roomId: string, stillHere: () => boolean): Promise<boolean> {
+export async function openExactRoom(spaceId: string, roomId: string, stillHere: () => boolean, eventId?: number): Promise<boolean> {
   const c = client;
   if (!c || switchingSpace() || !roomId || !spaces().some(s => s.id === spaceId)) return false;
   const generation = navigationGeneration;
@@ -738,6 +740,7 @@ export async function openExactRoom(spaceId: string, roomId: string, stillHere: 
     basePlace.set("space");
     actionError.set(null);
     notice.set(null);
+    if (eventId !== undefined) focusTarget.set({ scope: scopeKey(spaceId, roomId), eventId });
   });
   rememberSpace(spaceId);
   kick();
@@ -1873,6 +1876,41 @@ export async function stopRun(run: Run): Promise<void> {
   }
 }
 
+export function canRetryRun(run: Run) {
+  return run.kind === "room" && run.actor === me() && !!run.triggerEventId && !!run.agentId &&
+    (run.status === "failed" || run.status === "cancelled") && spaces().some(s => s.id === run.spaceId);
+}
+
+export async function retryRun(run: Run): Promise<boolean> {
+  const c = client;
+  if (!c || runRetryBusy() || !canRetryRun(run) || !runs().includes(run)) return false;
+  const current = guard();
+  const grant = guard(run.spaceId);
+  const visible = () => grant() && spaces().some(s => s.id === run.spaceId);
+  batch(() => {
+    runRetryBusy.set(run.id);
+    runsError.set(null);
+  });
+  try {
+    await readHostedAccess(c, () => c.retryRun(run.id));
+    if (!current()) return false;
+    lastRunsRefresh = 0;
+    kick();
+    return visible();
+  } catch (error) {
+    if (visible() && !isAborted(error)) runsError.set(describe(error, "Could not retry the run"));
+    if (current() && isAccessDenial(error)) refreshChatEvents(true);
+    return false;
+  } finally {
+    if (current()) runRetryBusy.set(null);
+  }
+}
+
+export function refreshChatEvents(membershipChanged = false) {
+  if (membershipChanged) lastListsRefresh = 0;
+  if (client) kick();
+}
+
 /** Whether a run is still going (so Stop makes sense). */
 export function isActiveRun(run: Run) {
   return /^(queued|pending|running|active|in_progress|started|waiting)$/i.test(run.status);
@@ -2404,6 +2442,7 @@ function endSession() {
     runsLoaded.set(false);
     runsError.set(null);
     runBusy.set(null);
+    runRetryBusy.set(null);
     dispatchTarget.set(null);
     dispatchRoomChecks.set(new Map());
     dispatchDraft.set("");

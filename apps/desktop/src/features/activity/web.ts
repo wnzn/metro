@@ -1,6 +1,16 @@
 import { WEB_OUTCOMES, WEB_PROVIDERS } from "../../api/webSearch";
 import type { WebTool, WebToolNote } from "../../api/webSearch";
 
+const META_LABELS: Record<string, string> = {
+  spaces_list: "List your Spaces", space_read: "Read a Space", spaces_catch_up: "Catch up in your Spaces",
+  spaces_search: "Search your Spaces", waiting_on_me: "Find follow-ups", space_send: "Send a Space message",
+  runs_list: "Check runs", run_cancel: "Stop a run", run_retry: "Retry a run",
+  schedules_list: "List scheduled prompts", schedule_create: "Schedule a prompt",
+  schedule_set_enabled: "Change a scheduled prompt", pages_find: "Find Pages",
+  page_propose: "Propose a page draft", settings_explain: "Explain settings",
+};
+export const metaToolLabel = (tool: string) => META_LABELS[tool] ?? "Metro tool";
+
 export const webToolLabel = (name: WebTool) => name === "web_search" ? "Web search" : "Read web pages";
 export const webRefusal = (note: WebToolNote) => note.failure === "not_allowed" || note.failure === "invalid";
 
