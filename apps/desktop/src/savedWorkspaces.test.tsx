@@ -241,7 +241,7 @@ test("after a restart the saved list is there and no token is: the first screen 
 
 test("a saved list with a bad address is read without it", async () => {
   const s = servers();
-  const list = JSON.stringify([{ id: "x", name: "Plain", baseUrl: "http://example.org" }, { id: "y", name: "Ok", baseUrl: REMOTE }, "junk"]);
+  const list = JSON.stringify([{ id: "x", name: "Bad", baseUrl: "ftp://example.org" }, { id: "y", name: "Ok", baseUrl: REMOTE }, "junk"]);
   const app = await launch(s, { storage: { "metro.savedServers": list } });
   await app.waitFor("id:saved-server:y");
   expect(app.shows("id:saved-server:x")).toBe(false);

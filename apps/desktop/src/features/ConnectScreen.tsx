@@ -1,9 +1,11 @@
 import { signal } from "nsh";
 import { localAvailability, localError, localOpening, openLocalWorkspace } from "../localWorkspace";
-import { addressLabel, cancelSwitch, defaultName, hasToken, saveCurrentServer, savedError, savedServers, switchTo } from "../savedWorkspaces";
+import { pendingPlainHttp } from "../plainHttp";
+import { addressLabel, cancelSwitch, confirmPlainHttp, defaultName, hasToken, saveCurrentServer, savedError, savedServers, switchTo } from "../savedWorkspaces";
 import type { SavedServer } from "../savedWorkspaces";
 import { chooseManually, startupOpening, startupPrompt } from "../startupWorkspace";
 import { connect, connectedTo, connectError, serverUrlInput, status } from "../store";
+import { PlainHttpConsent, SERVER_URL_HINT } from "./PlainHttpConsent";
 import { Action, Banner, Column, Divider, Field, FormRow, Label, MetroMark, Row, SavedServerChoice, Surface, Toggle } from "../ui";
 
 /**
@@ -31,12 +33,15 @@ export function ConnectScreen() {
   /** Keep the token in memory until Metro quits, for switching back without pasting it again. Off unless asked. */
   const keep = signal(false);
   const connecting = () => status().phase === "connecting";
+  /** A plain-HTTP address waiting for the person's one-time confirmation. */
+  const consent = signal<string | null>(null);
   let intent = 0;
   const manual = () => {
     ++intent;
     cancelSwitch();
     chooseManually();
     savedError.set(null);
+    consent.set(null);
   };
   const submit = () => {
     if (connecting()) return;
@@ -44,6 +49,13 @@ export function ConnectScreen() {
     manual();
     const value = token();
     const url = (target()?.baseUrl ?? serverUrlInput()).trim();
+    const unconfirmed = pendingPlainHttp(url);
+    if (unconfirmed) {
+      // Asked before the token goes anywhere; nothing is sent until confirmed.
+      connectError.set(null);
+      consent.set(unconfirmed);
+      return;
+    }
     const saving = !!target() || save();
     const keeping = saving && keep();
     void connect(url, value).then(() => {
@@ -157,7 +169,7 @@ export function ConnectScreen() {
 
           <If when={showForm()}>
             <Column gap={4} testID="server-form-fields">
-              <FormRow label="Server URL" hint={target() ? undefined : "Use HTTPS, or HTTP on this computer."}>
+              <FormRow label="Server URL" hint={target() ? undefined : SERVER_URL_HINT}>
                 <Field
                   testID="server-url"
                   accessibilityLabel="Server URL"
@@ -203,17 +215,35 @@ export function ConnectScreen() {
                 )}
               </If>
 
-              <Row justify="end">
-                <If when={target()}><Action testID="choose-other-server" label="Choose another server" variant="ghost" onPress={other} disabled={connecting()} /></If>
-                <Action
-                  testID="connect"
-                  label="Connect"
-                  busyLabel="Connecting…"
-                  busy={connecting()}
-                  variant={offerLocal() ? "secondary" : "primary"}
-                  onPress={submit}
-                />
-              </Row>
+              <If when={consent()}>
+                {(url) => (
+                  <PlainHttpConsent
+                    testID="plain-http-consent"
+                    baseUrl={url()}
+                    onCancel={() => consent.set(null)}
+                    onAccept={() => {
+                      const confirmed = url();
+                      consent.set(null);
+                      void confirmPlainHttp(confirmed);
+                      submit();
+                    }}
+                  />
+                )}
+              </If>
+
+              <If when={!consent()}>
+                <Row justify="end">
+                  <If when={target()}><Action testID="choose-other-server" label="Choose another server" variant="ghost" onPress={other} disabled={connecting()} /></If>
+                  <Action
+                    testID="connect"
+                    label="Connect"
+                    busyLabel="Connecting…"
+                    busy={connecting()}
+                    variant={offerLocal() ? "secondary" : "primary"}
+                    onPress={submit}
+                  />
+                </Row>
+              </If>
             </Column>
           </If>
         </Surface>

@@ -37,7 +37,8 @@ import { batch, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError, createClient, parseReaction } from "./api/client";
 import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, TurnModelChoice } from "./api/client";
 export { ApiError };
-import { DEFAULT_SERVER_URL, parseServerUrl } from "./api/serverUrl";
+import { DEFAULT_SERVER_URL, parseServerUrl, serverHost } from "./api/serverUrl";
+import { plainHttpAccepted } from "./plainHttp";
 
 export type { Member, Mention, Room, RoomEvent, Run, Space };
 
@@ -249,6 +250,11 @@ const candidates = new WeakMap<PreparedConnection, {
 function credentials(urlInput: string, tokenInput: string) {
   const parsed = parseServerUrl(urlInput);
   if (!parsed.ok) throw new Error(parsed.error);
+  // Plain HTTP to a host that is neither loopback nor Tailscale: only once the
+  // person confirmed it for this exact address (the screens ask first).
+  if (parsed.needsConsent && !untracked(() => plainHttpAccepted(parsed.baseUrl))) {
+    throw new Error(`Confirm the unencrypted connection to ${serverHost(parsed.baseUrl)} first.`);
+  }
   const token = tokenInput.trim();
   if (!token) throw new ApiError("auth", "Enter your access token (a dev token or a JWT from your identity provider).");
   if (/\s/.test(token)) throw new ApiError("auth", "The access token contains spaces or line breaks; paste only the token itself.");
