@@ -260,7 +260,7 @@ pub struct SpaceMemberHttp {
 }
 
 impl SpaceMemberHttp {
-    async fn admit(&self) -> http_client::Result<()> {
+    async fn admit(&self) -> Result<(), UseError> {
         let (space, user) = (self.space.clone(), self.user.clone());
         let member = self
             .db
@@ -273,7 +273,7 @@ impl SpaceMemberHttp {
         if member {
             Ok(())
         } else {
-            Err(refused(UseError::Revoked))
+            Err(UseError::Revoked)
         }
     }
 }
@@ -285,7 +285,7 @@ impl HttpClientExt for SpaceMemberHttp {
     ) -> impl Future<Output = http_client::Result<Response<LazyBody>>> + Send + 'static {
         let this = self.clone();
         async move {
-            this.admit().await?;
+            this.admit().await.map_err(refused)?;
             HttpClientExt::send(&this.inner, req).await
         }
     }
@@ -296,7 +296,7 @@ impl HttpClientExt for SpaceMemberHttp {
     ) -> impl Future<Output = http_client::Result<Response<LazyBody>>> + Send + 'static {
         let this = self.clone();
         async move {
-            this.admit().await?;
+            this.admit().await.map_err(refused)?;
             HttpClientExt::send_multipart(&this.inner, req).await
         }
     }
@@ -307,7 +307,7 @@ impl HttpClientExt for SpaceMemberHttp {
     ) -> impl Future<Output = http_client::Result<http_client::StreamingResponse>> + Send {
         let this = self.clone();
         async move {
-            this.admit().await?;
+            this.admit().await.map_err(refused)?;
             HttpClientExt::send_streaming(&this.inner, req).await
         }
     }

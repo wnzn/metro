@@ -1615,9 +1615,29 @@ async fn failing_endpoint() -> String {
     base_url
 }
 
-/// Everything Metro logs while it is alive, on this thread.
+/// Everything Metro logs, in this test binary.
 #[derive(Clone, Default)]
 struct Captured(Arc<Mutex<Vec<u8>>>);
+
+/// The process-wide capture of Metro's logs, installed once. A process-wide
+/// subscriber (not a thread's) sees every callsite whichever thread first
+/// reached it; only one test per binary reads it, for its own sentinel.
+fn captured_logs() -> Captured {
+    static CAPTURED: std::sync::OnceLock<Captured> = std::sync::OnceLock::new();
+    CAPTURED
+        .get_or_init(|| {
+            let captured = Captured::default();
+            let writer = captured.clone();
+            let subscriber = tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_env_filter(tracing_subscriber::EnvFilter::new("metro_server=trace"))
+                .with_writer(move || writer.clone())
+                .finish();
+            tracing::subscriber::set_global_default(subscriber).unwrap();
+            captured
+        })
+        .clone()
+}
 
 impl std::io::Write for Captured {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -1631,15 +1651,7 @@ impl std::io::Write for Captured {
 
 #[tokio::test]
 async fn provider_error_text_reaches_no_run_detail_chat_or_log() {
-    let captured = Captured::default();
-    let writer = captured.clone();
-    let subscriber = tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_env_filter(tracing_subscriber::EnvFilter::new("metro_server=trace"))
-        .with_writer(move || writer.clone())
-        .finish();
-    // A current-thread runtime: every task, the server's included, logs here.
-    let _logs = tracing::subscriber::set_default(subscriber);
+    let captured = captured_logs();
 
     let failing = failing_endpoint().await;
     let operator_key = "sk-operator-secret-key-42";
