@@ -391,6 +391,15 @@ fn no_redirect_client() -> anyhow::Result<DynHttpClient> {
     Ok(DynHttpClient::new(rig_reqwest::ReqwestClient::from(client)))
 }
 
+/// One process-wide no-redirect client, for models built without an
+/// [`AppState`] at hand.
+pub(crate) fn no_redirect_shared() -> DynHttpClient {
+    static SHARED: std::sync::OnceLock<DynHttpClient> = std::sync::OnceLock::new();
+    SHARED
+        .get_or_init(|| no_redirect_client().expect("the provider HTTP client builds"))
+        .clone()
+}
+
 /// Parse `METRO_PROVIDER_ALLOWED_BASE_URLS`: a JSON array of absolute
 /// `http`/`https` URLs without credentials, query or fragment. Each is kept
 /// as written minus trailing slashes, and matched exactly.

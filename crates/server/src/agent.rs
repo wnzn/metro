@@ -112,10 +112,15 @@ const PERSONAL_PREAMBLE: &str = "You are the Metro agent in the user's private p
 sees this conversation. You have no tools and no access to the user's Spaces from here. Answer concisely in \
 plain text.";
 
-fn model(config: &ModelConfig) -> rig_core::Model<rig_core::providers::openai::wire::Chat> {
+/// The operator's model on `http`, which must follow no redirect: a
+/// redirect would resend the conversation to another URL.
+fn model(
+    config: &ModelConfig,
+    http: rig_core::http_client::DynHttpClient,
+) -> rig_core::Model<rig_core::providers::openai::wire::Chat> {
     OpenAIConfig::with_key(&METRO_DIALECT, config.api_key.clone())
         .with_base_url(config.base_url.clone())
-        .client()
+        .connect(http)
         .chat(config.model.clone())
 }
 
@@ -128,22 +133,19 @@ fn space_model(
     space: &str,
 ) -> DynModel<Completion> {
     let http = crate::providers::guard::SpaceMemberHttp {
-        inner: rig_reqwest::shared(),
+        // Metro's no-redirect client, as every model request uses.
+        inner: state.providers.http(),
         db: state.db.clone(),
         space: space.to_owned(),
         user: user.to_owned(),
     };
-    OpenAIConfig::with_key(&METRO_DIALECT, config.api_key.clone())
-        .with_base_url(config.base_url.clone())
-        .connect(http)
-        .chat(config.model.clone())
-        .into()
+    model(config, rig_core::http_client::DynHttpClient::new(http)).into()
 }
 
 /// A plain OpenAI-compatible chat model, as the environment model is built;
 /// for embedders and test backends that hand routing a model.
 pub fn openai_compatible_model(config: &ModelConfig) -> DynModel<Completion> {
-    model(config).into()
+    model(config, crate::providers::no_redirect_shared()).into()
 }
 
 const NO_MODEL: &str = "Ask agent is unavailable: you have no default model connection, and \
@@ -243,7 +245,7 @@ async fn route_model(
                     Ok(RunModel {
                         model: match space {
                             Some(sid) => space_model(state, config, user_id, sid),
-                            None => model(config).into(),
+                            None => model(config, state.providers.http()).into(),
                         },
                         max_tokens: None,
                         params: None,

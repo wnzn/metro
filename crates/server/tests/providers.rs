@@ -1739,3 +1739,84 @@ async fn provider_error_text_reaches_no_run_detail_chat_or_log() {
         assert!(!logs.contains(leak), "a log line carries {leak}:\n{logs}");
     }
 }
+
+#[tokio::test]
+async fn the_operator_model_follows_no_redirect() {
+    // Where a redirect would lead: it records every request it gets.
+    let reached: Arc<Mutex<usize>> = Arc::default();
+    let counter = reached.clone();
+    let dest = axum::Router::new().fallback(move || {
+        let counter = counter.clone();
+        async move {
+            *counter.lock().unwrap() += 1;
+            AxumStatus::OK
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let elsewhere = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, dest).await.unwrap() });
+    // The operator's endpoint answers every request with a 307, which would
+    // resend the body to `elsewhere`.
+    let target = format!("{elsewhere}/v1/chat/completions");
+    let redirecting = axum::Router::new().fallback(move || {
+        let target = target.clone();
+        async move {
+            (
+                AxumStatus::TEMPORARY_REDIRECT,
+                [(axum::http::header::LOCATION, target)],
+            )
+                .into_response()
+        }
+    });
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let operator = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, redirecting).await.unwrap() });
+
+    let s = Server::start(
+        Some(ModelConfig {
+            base_url: operator,
+            model: "env-model".into(),
+            api_key: "sk-operator-redirect".into(),
+        }),
+        Db::open_in_memory().unwrap(),
+        Some(master(5)),
+        vec![],
+    )
+    .await;
+    // Personal Chat, and a Space run: neither has a saved connection.
+    let answer = s.chat_and_wait(BOB, "redirect me").await;
+    assert_eq!(answer["kind"], "error", "{answer}");
+    let (status, space) = s
+        .post(ALICE, "/v1/spaces", json!({"name": "redirects"}))
+        .await;
+    assert_eq!(status, StatusCode::CREATED, "{space}");
+    let sid = space["id"].as_str().unwrap().to_owned();
+    let (status, sent) = s
+        .post(
+            ALICE,
+            &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+            json!({"text": "@agent redirect me too"}),
+        )
+        .await;
+    assert!(status.is_success(), "{sent}");
+    let mut failed = false;
+    for _ in 0..400 {
+        if s.state
+            .runs
+            .list()
+            .iter()
+            .any(|r| r.space_id == sid && r.status.is_terminal())
+        {
+            failed = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(failed, "the Space run ended");
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        *reached.lock().unwrap(),
+        0,
+        "a redirect destination got a request"
+    );
+}
