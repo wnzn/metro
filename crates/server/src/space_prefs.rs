@@ -143,7 +143,11 @@ pub fn agent_deleted(conn: &Connection, space_id: &str, agent_id: &str) -> rusql
     Ok(())
 }
 
-fn load_in(conn: &Connection, space_id: &str, user_id: &str) -> rusqlite::Result<SpacePrefs> {
+pub(crate) fn load_in(
+    conn: &Connection,
+    space_id: &str,
+    user_id: &str,
+) -> rusqlite::Result<SpacePrefs> {
     let row: Option<(bool, Option<String>, String, bool)> = conn
         .query_row(
             "SELECT classify_unaddressed, default_model, agent_models, routing
