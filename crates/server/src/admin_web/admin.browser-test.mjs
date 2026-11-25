@@ -353,6 +353,10 @@ await test("the server update notice shows only a verified newer release", async
   await click("#sign-out");
   assert(!(await evaluate(vis("update-notice"))), "notice kept after sign-out");
   mock.serverUpdate = null;
+  // Leave the page as "admin signs in" did: signed in, users listed, no
+  // notice (the following tests run in that session).
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown without an update");
 });
 
 await test("every button has an accessible name; inputs have labels", async () => {
