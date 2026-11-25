@@ -808,11 +808,15 @@ fn grouped_history_reconciles_in_linear_time() {
     {
         // The plan is one grouped scan of the activity index, no lookup per start.
         let c = Connection::open(&path).unwrap();
-        for s in &ACTIVITY_SCOPES {
-            let plan: Vec<String> = c
-                .prepare(&format!("EXPLAIN QUERY PLAN {}", orphaned_starts_sql(s)))
-                .unwrap()
-                .query_map([0], |r| r.get::<_, String>(3))
+        for (s, bounded) in ACTIVITY_SCOPES.iter().flat_map(|s| [(s, true), (s, false)]) {
+            let sql = orphaned_starts_sql(s, bounded);
+            assert_eq!(sql.contains("id > ?1"), bounded);
+            let mut stmt = c.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
+            let params: Vec<i64> = if bounded { vec![0] } else { vec![] };
+            let plan: Vec<String> = stmt
+                .query_map(rusqlite::params_from_iter(params), |r| {
+                    r.get::<_, String>(3)
+                })
                 .unwrap()
                 .collect::<rusqlite::Result<_>>()
                 .unwrap();
@@ -880,4 +884,162 @@ fn grouped_history_benchmark() {
             "{n} grouped turns per scope: full pass {full:?}, next start {bounded:?}, old query {reference}"
         );
     }
+}
+
+/// A start below the mark (moved there by hand), found only by a full pass.
+fn hide_start(c: &Connection, turn: &str) {
+    let id = room_row(
+        c,
+        SID,
+        "room2",
+        kind::ACTIVITY,
+        ("agent", None),
+        Some(&act(turn, "started")),
+    );
+    c.execute(
+        "UPDATE space_events SET id = (SELECT MIN(id) FROM space_events) - 1 WHERE id = ?1",
+        [id],
+    )
+    .unwrap();
+}
+
+fn interrupted_turns(c: &Connection) -> Vec<String> {
+    rows(c, "space_events")
+        .into_iter()
+        .filter_map(|r| serde_json::from_str::<Activity>(r.activity.as_deref()?).ok())
+        .filter(|a| a.phase.as_deref() == Some("interrupted"))
+        .map(|a| a.id)
+        .collect()
+}
+
+const SPACE_MARK: &str = "activity_reconciled_through:space_events";
+
+/// A mark stored as a blob or as text that isn't UTF-8 is untrusted: the
+/// start is not refused, the whole table is scanned, and a good mark is
+/// written in its place.
+#[test]
+fn a_mark_that_is_not_text_means_a_full_pass() {
+    for (i, bad) in ["x'ff'", "CAST(x'ff' AS TEXT)", "x'3132'", "1.5"]
+        .into_iter()
+        .enumerate()
+    {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh(dir.path());
+        let c = Connection::open(&path).unwrap();
+        room_row(
+            &c,
+            SID,
+            LOBBY_ID,
+            kind::MESSAGE,
+            ("Alice", Some("alice")),
+            None,
+        );
+        drop(Db::open(&path).unwrap());
+        let turn = format!("run_hidden{i}");
+        hide_start(&c, &turn);
+        c.execute(
+            &format!("UPDATE metro_meta SET value = {bad} WHERE key = ?1"),
+            [SPACE_MARK],
+        )
+        .unwrap();
+        drop(Db::open(&path).unwrap());
+        assert_eq!(interrupted_turns(&c), [turn], "mark {bad}");
+        assert_eq!(
+            mark(&c, "space_events"),
+            Some(seq(&c, "space_events").to_string())
+        );
+    }
+}
+
+/// A sequence that isn't an integer can't vouch for a mark: full passes,
+/// and no mark is kept until the sequence is an integer again.
+#[test]
+fn a_sequence_that_is_not_an_integer_means_a_full_pass_and_no_mark() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fresh(dir.path());
+    let c = Connection::open(&path).unwrap();
+    for _ in 0..3 {
+        room_row(
+            &c,
+            SID,
+            LOBBY_ID,
+            kind::MESSAGE,
+            ("Alice", Some("alice")),
+            None,
+        );
+    }
+    drop(Db::open(&path).unwrap());
+    assert_eq!(mark(&c, "space_events").as_deref(), Some("3"));
+    hide_start(&c, "run_hidden");
+    // A closed turn on top, so the sequence is above the mark as usual.
+    room_row(
+        &c,
+        SID,
+        LOBBY_ID,
+        kind::ACTIVITY,
+        ("agent", None),
+        Some(&act("run_done", "started")),
+    );
+    room_row(
+        &c,
+        SID,
+        LOBBY_ID,
+        kind::ACTIVITY,
+        ("agent", None),
+        Some(&act("run_done", "completed")),
+    );
+    c.execute(
+        "UPDATE sqlite_sequence SET seq = CAST(seq AS TEXT) WHERE name = 'space_events'",
+        [],
+    )
+    .unwrap();
+    let seq_type = |c: &Connection| -> String {
+        c.query_row(
+            "SELECT typeof(seq) FROM sqlite_sequence WHERE name = 'space_events'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(seq_type(&c), "text");
+    // The pass writes an interruption, and with it SQLite stores the
+    // sequence as an integer again: a full scan found the hidden start, so
+    // a mark is written.
+    drop(Db::open(&path).unwrap());
+    assert_eq!(interrupted_turns(&c), ["run_hidden"]);
+    assert_eq!(seq_type(&c), "integer");
+    assert_eq!(
+        mark(&c, "space_events"),
+        Some(seq(&c, "space_events").to_string())
+    );
+    // Nothing to write: the sequence stays text, and no mark is kept.
+    c.execute(
+        "UPDATE sqlite_sequence SET seq = CAST(seq AS TEXT) WHERE name = 'space_events'",
+        [],
+    )
+    .unwrap();
+    for _ in 0..2 {
+        drop(Db::open(&path).unwrap());
+        assert_eq!(seq_type(&c), "text");
+        assert_eq!(mark(&c, "space_events"), None);
+        assert_eq!(interrupted_turns(&c), ["run_hidden"]);
+    }
+}
+
+/// A full pass has no lower bound: even a start at the smallest id counts.
+#[test]
+fn a_full_pass_sees_every_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = fresh(dir.path());
+    let c = Connection::open(&path).unwrap();
+    c.execute(
+        "INSERT INTO space_events (id, space_id, room_id, kind, actor, text, created_at, activity)
+         VALUES (?1, ?2, 'lobby', 'activity', 'agent', '', 1, ?3)",
+        params![i64::MIN, SID, act("run_min", "started")],
+    )
+    .unwrap();
+    c.execute("DELETE FROM metro_meta WHERE key = ?1", [SPACE_MARK])
+        .unwrap();
+    drop(Db::open(&path).unwrap());
+    assert_eq!(interrupted_turns(&c), ["run_min"]);
 }

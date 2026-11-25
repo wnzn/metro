@@ -1269,10 +1269,10 @@ const ACTIVITY_SCOPES: [ActivityScope; 2] = [
 /// server), so it can't be read back.
 type OrphanedStart = ([String; 2], Option<String>, String, Option<String>);
 
-/// The query behind [`orphaned_starts`], with `?1` the high-water mark:
-/// the started event of each turn in `s.table` whose latest lifecycle event
-/// is that start, among turns with an `activity` event above the mark,
-/// oldest first.
+/// The query behind [`orphaned_starts`]: the started event of each turn in
+/// `s.table` whose latest lifecycle event is that start, oldest first. With
+/// `bounded`, only turns with an `activity` event above `?1` (the
+/// high-water mark); without it, every row, whatever its id.
 ///
 /// A turn is the scope columns plus `json_extract(activity, '$.id')`, the
 /// same comparison as before this pass was set-based. `activity` that
@@ -1280,7 +1280,7 @@ type OrphanedStart = ([String; 2], Option<String>, String, Option<String>);
 /// belongs to no turn (this server never writes it), and so does one
 /// without an id; neither ends a turn nor is interrupted, and neither can
 /// make startup fail.
-fn orphaned_starts_sql(s: &ActivityScope) -> String {
+fn orphaned_starts_sql(s: &ActivityScope, bounded: bool) -> String {
     let scope_cols = if s.table == "space_events" {
         "e.space_id, e.room_id"
     } else {
@@ -1295,7 +1295,7 @@ fn orphaned_starts_sql(s: &ActivityScope) -> String {
     format!(
         "SELECT {scope_cols}, e.activity, e.actor, e.actor_id
          FROM (SELECT MAX(id) AS last FROM {t}
-               WHERE kind = 'activity' AND id > ?1
+               WHERE kind = 'activity' {bound}
                  AND CASE WHEN json_valid(activity, 10) THEN json_extract(activity, '$.id') END IS NOT NULL
                GROUP BY {scope}, json_extract(activity, '$.id')) m
          JOIN {t} e ON e.id = m.last
@@ -1303,17 +1303,19 @@ fn orphaned_starts_sql(s: &ActivityScope) -> String {
          ORDER BY e.id",
         t = s.table,
         scope = s.scope,
+        bound = if bounded { "AND id > ?1" } else { "" },
     )
 }
 
-/// The rows of [`orphaned_starts_sql`] above `after`.
+/// The rows of [`orphaned_starts_sql`]: above `after`, or all of them.
 fn orphaned_starts(
     conn: &Connection,
     s: &ActivityScope,
-    after: i64,
+    after: Option<i64>,
 ) -> rusqlite::Result<Vec<OrphanedStart>> {
-    let mut stmt = conn.prepare(&orphaned_starts_sql(s))?;
-    let rows = stmt.query_map([after], |r| {
+    let mut stmt = conn.prepare(&orphaned_starts_sql(s, after.is_some()))?;
+    let params: Vec<i64> = after.into_iter().collect();
+    let rows = stmt.query_map(rusqlite::params_from_iter(params), |r| {
         Ok((
             [r.get::<_, String>(0)?, r.get::<_, String>(1)?],
             match r.get_ref(2)? {
@@ -1343,10 +1345,20 @@ fn orphaned_starts(
 /// at or below it (the server never inserts an explicit id). So
 /// the next start only needs turns with an `activity` event above the mark:
 /// for such a turn every one of its events above the mark is scanned, and
-/// the newest of them is its newest overall. A mark that isn't a number, or
-/// that is above the sequence (it was reset), is ignored and the whole
-/// table is scanned again. Everything, the mark included, is written in one
-/// transaction, so a crash at any point leaves either nothing or all of it.
+/// the newest of them is its newest overall. Mark and sequence are
+/// untrusted metadata: a mark that isn't the text of a positive integer,
+/// or is above the sequence (it was reset), and a sequence that isn't an
+/// integer, all mean a full scan with no lower bound on ids. A mark is
+/// written only from an integer sequence; while the sequence isn't one, the
+/// mark is removed. Failing to read either is still an error. Everything,
+/// the mark included, is written in one transaction, so a crash at any
+/// point leaves either nothing or all of it.
+///
+/// Maintenance that resets a table's event ids or its `sqlite_sequence`
+/// row, or restores event rows into it, must delete that table's
+/// `activity_reconciled_through:<table>` key in the same transaction.
+/// Deleting events (as deleting a Space does) and `VACUUM` keep the
+/// sequence, so they need nothing.
 ///
 /// Known limit: a start that can't be read back as an [`Activity`] is
 /// skipped (and counted in one warning), and once it is below the mark no
@@ -1362,31 +1374,13 @@ fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
     };
     let mut unreadable = 0_usize;
     for s in &ACTIVITY_SCOPES {
-        let sequence = |tx: &Transaction<'_>| -> rusqlite::Result<i64> {
-            Ok(tx
-                .query_row(
-                    "SELECT seq FROM sqlite_sequence WHERE name = ?1",
-                    [s.table],
-                    |r| r.get::<_, Option<i64>>(0),
-                )
-                .optional()?
-                .flatten()
-                .unwrap_or(0))
+        let seq = reconciled_sequence(&tx, s)?;
+        let mark = reconciled_mark(&tx, s)?;
+        // The mark bounds the scan only when both can be trusted.
+        let after = match (mark, seq) {
+            (Some(m), Some(seq)) if 0 < m && m <= seq => Some(m),
+            _ => None,
         };
-        let seq = sequence(&tx)?;
-        let mark: Option<String> = tx
-            .query_row(
-                "SELECT value FROM metro_meta WHERE key = ?1",
-                [s.mark_key],
-                |r| r.get(0),
-            )
-            .optional()?;
-        let after = mark
-            .as_deref()
-            .and_then(|m| m.parse::<i64>().ok())
-            .filter(|&m| (0..=seq).contains(&m))
-            // Every row, even one inserted by hand with an id below 1.
-            .unwrap_or(i64::MIN);
         let orphans = orphaned_starts(&tx, s, after)?;
         let mut stmt = tx.prepare(s.insert)?;
         for (ids, activity, actor, actor_id) in orphans {
@@ -1397,13 +1391,18 @@ fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
             stmt.execute(params![ids[0], ids[1], actor, actor_id, now, json])?;
         }
         drop(stmt);
-        let through = sequence(&tx)?.to_string();
-        if mark.as_deref() != Some(through.as_str()) {
-            tx.execute(
-                "INSERT INTO metro_meta (key, value) VALUES (?1, ?2)
-                 ON CONFLICT (key) DO UPDATE SET value = excluded.value",
-                params![s.mark_key, through],
-            )?;
+        match reconciled_sequence(&tx, s)? {
+            Some(through) if Some(through) == mark => {}
+            Some(through) => {
+                tx.execute(
+                    "INSERT INTO metro_meta (key, value) VALUES (?1, ?2)
+                     ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                    params![s.mark_key, through.to_string()],
+                )?;
+            }
+            None => {
+                tx.execute("DELETE FROM metro_meta WHERE key = ?1", [s.mark_key])?;
+            }
         }
     }
     tx.commit()?;
@@ -1414,6 +1413,41 @@ fn interrupt_orphaned_activity(conn: &Connection) -> rusqlite::Result<()> {
         );
     }
     Ok(())
+}
+
+/// `s.table`'s AUTOINCREMENT sequence, if it can be trusted: an integer
+/// (no row yet is 0). Any other stored value is `None`; a failed read is an
+/// error.
+fn reconciled_sequence(tx: &Transaction<'_>, s: &ActivityScope) -> rusqlite::Result<Option<i64>> {
+    let mut stmt = tx.prepare("SELECT seq FROM sqlite_sequence WHERE name = ?1")?;
+    let mut rows = stmt.query([s.table])?;
+    let Some(row) = rows.next()? else {
+        return Ok(Some(0));
+    };
+    let seq = match row.get_ref(0)? {
+        rusqlite::types::ValueRef::Integer(n) => Some(n),
+        _ => None,
+    };
+    // Two rows for one table is not a sequence SQLite wrote.
+    Ok(if rows.next()?.is_some() { None } else { seq })
+}
+
+/// `s.table`'s high-water mark, if it can be read: the text of an integer
+/// of at least 0 (`0` bounds nothing). Anything else (absent, not text,
+/// not UTF-8, not such a number) is `None`; a failed read is an error.
+fn reconciled_mark(tx: &Transaction<'_>, s: &ActivityScope) -> rusqlite::Result<Option<i64>> {
+    let mut stmt = tx.prepare("SELECT value FROM metro_meta WHERE key = ?1")?;
+    let mut rows = stmt.query([s.mark_key])?;
+    let Some(row) = rows.next()? else {
+        return Ok(None);
+    };
+    Ok(match row.get_ref(0)? {
+        rusqlite::types::ValueRef::Text(t) => std::str::from_utf8(t)
+            .ok()
+            .and_then(|t| t.parse::<i64>().ok())
+            .filter(|&m| m >= 0),
+        _ => None,
+    })
 }
 
 pub(crate) fn new_event(
