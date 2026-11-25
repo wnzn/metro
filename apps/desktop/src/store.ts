@@ -250,7 +250,7 @@ const newerAccess = (key: string, request: number) => (verifiedAccess.get(key) ?
 function verifyAccess(key: string, request: number) {
   if (!newerAccess(key, request)) verifiedAccess.set(key, request);
 }
-const pendingSpaceReads = new Map<string, Map<number, Promise<void>>>();
+const pendingAccessReads = new Map<string, Map<number, Promise<void>>>();
 // A complete list observes every Space, including ids unknown at dispatch.
 const pendingMembershipReads = new Map<number, Promise<void>>();
 const spaceDenials = new Map<string, number>();
@@ -272,6 +272,22 @@ function trackAccessRead(reads: Map<number, Promise<void>>, request: number) {
   };
 }
 
+function trackScopedAccessRead(key: string, request: number) {
+  const reads = pendingAccessReads.get(key) ?? new Map<number, Promise<void>>();
+  pendingAccessReads.set(key, reads);
+  const settle = trackAccessRead(reads, request);
+  return () => {
+    settle();
+    if (!reads.size && pendingAccessReads.get(key) === reads) pendingAccessReads.delete(key);
+  };
+}
+
+function newerPendingRead(key: string, request: number) {
+  for (const [id, done] of pendingAccessReads.get(key) ?? []) {
+    if (id > request) return done;
+  }
+}
+
 function newerSpaceDenial(sid: string, request: number) {
   return (spaceDenials.get(sid) ?? 0) > request;
 }
@@ -291,23 +307,22 @@ function verifyRoomAccess(sid: string, rid: string, request: number) {
 
 function keepNewerRooms(sid: string, list: readonly Room[], request: number, keepActiveOtherThan?: string): Room[] {
   const listed = new Set(list.map(r => r.id));
-  return [...list, ...roomsOf(sid).filter(r => !listed.has(r.id) &&
-    (newerAccess(scopeKey(sid, r.id), request) ||
+  return [...list, ...roomsOf(sid).filter(r => {
+    const key = scopeKey(sid, r.id);
+    return !listed.has(r.id) && (newerAccess(key, request) || newerPendingRead(key, request) ||
       (keepActiveOtherThan !== undefined && r.id !== keepActiveOtherThan &&
-        activeSpaceId() === sid && activeRoomId() === r.id)))];
+        activeSpaceId() === sid && activeRoomId() === r.id));
+  })];
 }
 
-/** All membership and room-list reads are evidence for the exact Space. */
+/** Room lists and transcripts are also evidence for their Space. */
 function beginSpaceRead(sid: string, request = nextAccessRequest()) {
   const key = scopeKey(sid, "");
   const valid = guard(sid);
-  const reads = pendingSpaceReads.get(sid) ?? new Map<number, Promise<void>>();
-  pendingSpaceReads.set(sid, reads);
-  const settle = trackAccessRead(reads, request);
+  const settle = trackScopedAccessRead(key, request);
   function finish(verified = false) {
     if (verified && valid() && !newerSpaceDenial(sid, request)) verifyAccess(key, request);
     settle();
-    if (!reads.size && pendingSpaceReads.get(sid) === reads) pendingSpaceReads.delete(sid);
   }
   return {
     valid,
@@ -331,13 +346,14 @@ function beginSpaceRead(sid: string, request = nextAccessRequest()) {
       if (!valid() || !currentSpaceEvidence(sid, request) || spaceDenials.get(sid) === request) return false;
       spaceDenials.set(sid, request);
       while (valid() && !newerAccess(key, request) && spaceDenials.get(sid) === request) {
-        const newer = [...(pendingSpaceReads.get(sid) ?? []), ...pendingMembershipReads].find(([id]) => id > request);
+        const newer = newerPendingRead(key, request) ??
+          [...pendingMembershipReads].find(([id]) => id > request)?.[1];
         if (!newer) {
           apply(); // stamp/epoch and cache change together, without an intervening await
           return true;
         }
         // A newer attempt isn't a grant. If inconclusive, this refusal still stands.
-        await newer[1];
+        await newer;
       }
       return false;
     },
@@ -947,11 +963,11 @@ function pickRoom(spaceId: string, list: readonly Room[]): string | null {
 /** Forgets everything cached for a Space; `unlist` also removes it from the list. */
 function purgeSpace(spaceId: string, unlist: boolean) {
   spaceEpoch.set(spaceId, epochOf(spaceId) + 1);
-  pendingSpaceReads.delete(spaceId);
   // Keep denial evidence for the session. A complete list may still be on
   // the wire from before the denial, even if this id was unknown to it.
   roomListRequests.delete(spaceId);
   const prefix = scopeKey(spaceId, "");
+  for (const key of pendingAccessReads.keys()) if (key.startsWith(prefix)) pendingAccessReads.delete(key);
   for (const key of [...cursors.keys()]) if (key.startsWith(prefix)) cursors.delete(key);
   for (const key of [...inflight.keys()]) if (key.startsWith(prefix)) inflight.delete(key);
   for (const key of [...pollAgain]) if (key.startsWith(prefix)) pollAgain.delete(key);
@@ -1474,7 +1490,7 @@ export async function setDispatchSpace(spaceId: string, roomId?: string): Promis
       if (list && !stale) {
         // An unrelated active room is left for its own poll to confirm.
         read.publishRooms(list, roomId);
-        if (!found) dropLostRoom(spaceId, roomId, read.request, false);
+        if (!found) void dropLostRoom(spaceId, roomId, read.request, false);
       }
       if (found && here()) dispatchTarget.set({ spaceId, roomId });
       else if (!found && here()) dispatchError.set(stale ? unverified
@@ -2132,7 +2148,7 @@ function endSession() {
   lastRoomBySpace.clear();
   spaceEpoch.clear();
   roomEntryNavigation = undefined;
-  pendingSpaceReads.clear();
+  pendingAccessReads.clear();
   pendingMembershipReads.clear();
   spaceDenials.clear();
   roomListRequests.clear();
@@ -2280,8 +2296,12 @@ async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind:
       showLoss: sid => sid !== spaceId || show,
       keepPollCadence: true,
     });
-    if (!current() || spaceRequest === undefined || !spaces().some(s => s.id === spaceId) ||
+    if (!current() || !spaces().some(s => s.id === spaceId) ||
       (spaceDenials.get(spaceId) ?? 0) >= (verifiedAccess.get(spaceScope) ?? 0)) return;
+    // A newer membership snapshot can settle the Space leg, not the room leg.
+    // Only newer evidence for this exact room makes the latter redundant.
+    if (spaceRequest === undefined && (!newerAccess(spaceScope, probe.request) ||
+      newerAccess(scope, probe.request) || roomDeniedAtOrAfter(scope, probe.request))) return;
     // The room read is a new observation. Access verified while the Space
     // list was in flight does not outrank a denial on this later leg.
     const read = beginSpaceRead(spaceId);
@@ -2291,7 +2311,7 @@ async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind:
       read.finish(current());
       if (!current() || newerSpaceDenial(spaceId, roomRequest)) return;
       if (list.some(r => r.id === roomId)) verifyRoomAccess(spaceId, roomId, roomRequest);
-      else dropLostRoom(spaceId, roomId, roomRequest, show);
+      else void dropLostRoom(spaceId, roomId, roomRequest, show);
     } catch (error) {
       if (current() && isAccessDenial(error)) await read.deny(() => dropLostSpace(spaceId, show));
       else {
@@ -2312,9 +2332,16 @@ function recordRoomDenial(key: string, request: number) {
   return true;
 }
 
-function dropLostRoom(spaceId: string, roomId: string, request: number, show: boolean) {
+async function dropLostRoom(spaceId: string, roomId: string, request: number, show: boolean) {
   const key = scopeKey(spaceId, roomId);
   if (!recordRoomDenial(key, request)) return;
+  const valid = guard(spaceId);
+  // Record the fence now, but don't evict a room with a newer transcript on
+  // the wire. An empty successful transcript proves access too.
+  for (let pending = newerPendingRead(key, request); pending; pending = newerPendingRead(key, request)) {
+    await pending;
+    if (!valid() || newerAccess(key, request) || deniedRoomAccess.get(key) !== request) return;
+  }
   cursors.delete(key);
   if (lastRoomBySpace.get(spaceId) === roomId) lastRoomBySpace.delete(spaceId);
   batch(() => {
@@ -2445,7 +2472,7 @@ async function refreshLists(force = false) {
       // older omission. An authoritative loss must also clear Dispatch.
       read.publishRooms(list);
       for (const r of previous) {
-        if (!snapshotIds.has(r.id)) dropLostRoom(active, r.id, roomRequest, true);
+        if (!snapshotIds.has(r.id)) void dropLostRoom(active, r.id, roomRequest, true);
       }
       // An absent room can have an intermediate positive read still in
       // flight. Advance existing tombstones even when no row is cached.
@@ -2468,10 +2495,19 @@ async function pollRoom(spaceId: string, roomId: string): Promise<void> {
   let request = 0;
   try {
     await poll(scope, ok, async (c, after) => {
-      request = nextAccessRequest();
-      const events = await c.listEvents(spaceId, roomId, after);
-      if (ok()) verifyRoomAccess(spaceId, roomId, request);
-      return events;
+      const read = beginSpaceRead(spaceId);
+      request = read.request;
+      const settleRoom = trackScopedAccessRead(scope, request);
+      try {
+        const events = await c.listEvents(spaceId, roomId, after);
+        if (!read.valid() || newerSpaceDenial(spaceId, request)) return null;
+        // A notice epoch change fences rendering, not the server's access evidence.
+        verifyRoomAccess(spaceId, roomId, request);
+        return ok() && !roomDeniedAtOrAfter(scope, request) ? events : null;
+      } finally {
+        settleRoom();
+        read.finish();
+      }
     });
   } catch (error) {
     if (!ok()) return;
@@ -2510,7 +2546,7 @@ async function pollChat(): Promise<void> {
 }
 
 /** Fetches events after the scope's cursor; one request per scope at a time. */
-function poll(key: string, ok: () => boolean, fetch: (c: Client, after: number) => Promise<RoomEvent[]>): Promise<void> {
+function poll(key: string, ok: () => boolean, fetch: (c: Client, after: number) => Promise<RoomEvent[] | null>): Promise<void> {
   const running = inflight.get(key);
   if (running) {
     pollAgain.add(key);
@@ -2524,7 +2560,7 @@ function poll(key: string, ok: () => boolean, fetch: (c: Client, after: number) 
       if (!c || !ok()) return;
       const firstLoad = !loadedScopes()[key];
       const events = await fetch(c, cursors.get(key) ?? 0);
-      if (!ok()) return;
+      if (!events || !ok()) return;
       const added = merge(key, events);
       pages++;
       // Catch up a long history in a few quick pages on first load; otherwise

@@ -321,6 +321,8 @@ const firstBeta = `${betaEvents}?after=0`;
 const firstRoomPages = (s: ReturnType<typeof servers>) => remotePaths(s).filter(p => p.includes("/rooms/") && p.endsWith("/events?after=0"));
 const chatStarted = (s: ReturnType<typeof servers>) => remotePaths(s)
   .some(p => p.startsWith("/v1/chat/") || p === "/v1/runs" || p === "/v1/models/available" || p === "/v1/providers");
+const chatPolled = (s: ReturnType<typeof servers>) => remotePaths(s)
+  .some(p => p.startsWith("/v1/chat/") || p === "/v1/runs");
 
 async function submitSavedStartup(app: App) {
   await app.waitFor("text:Sign in to Team B");
@@ -603,6 +605,134 @@ async function startMembershipProbe(s: ReturnType<typeof servers>, app: App, del
   await app.press("id:probe-refresh");
   await app.waitUntil(() => request.arrived() === 1, { timeout: 100 });
 }
+
+for (const scenario of ["chat", "library", "newer original-room proof"] as const) {
+  const covered = scenario === "newer original-room proof";
+  const destination = scenario === "chat" ? "chat" : "library";
+  test(`an obsolete denial probe ${
+    covered ? "does not repeat a check when the original room has newer access evidence" : `in ${destination} still checks the original missing room`
+  }`, async () => {
+    const s = servers();
+    const thread = { id: "probe-thread", name: "Probe thread", parent_room_id: "lobby" };
+    s.b.addRoom("beta", thread);
+    s.b.post("beta/lobby", { kind: "message", actor: "bob", text: "Beta lobby stays" });
+    const post = s.b.network[`POST ${BASE}/v1/*`]!;
+    s.b.network[`POST ${BASE}/v1/*`] = req => new URL(req.url).pathname === `${betaRooms}/${thread.id}/messages`
+      ? { status: 404, body: { error: "Original room no longer visible" } }
+      : post(req);
+    const app = await launch(s, { storage: rememberedRemote, manualClock: true, probe: true });
+    await submitSavedStartup(app);
+    await app.waitFor("text:Beta lobby stays");
+    await app.press(`id:room:${thread.id}`);
+    const held = s.b.answerLate("/v1/spaces", TOKENS.bob!, 650);
+    await app.type("id:composer", "Denied in the original thread");
+    await app.press("id:send");
+    await app.waitUntil(() => held.arrived() === 1, { timeout: 150 });
+    await app.press("id:space:acme");
+    await app.waitFor("text:hello from bob in acme", { timeout: 150 });
+    await app.press(`id:nav-${destination}`);
+    await app.waitFor(`id:${destination}-view`);
+    if (destination === "chat") await app.type("id:composer", "Keep the personal draft");
+    if (!covered) s.b.state.rooms.set("beta", s.b.state.rooms.get("beta")!.filter(r => r.id !== thread.id));
+    s.b.addSpace("fresh", "New membership snapshot", "bob");
+    await startMembershipProbe(s, app, 0);
+    await app.waitFor("id:space:fresh", { timeout: 150 });
+    const roomReads = () => remotePaths(s).filter(path => path === betaRooms).length;
+    expect(roomReads()).toBe(1);
+    if (covered) {
+      s.b.post(`beta/${thread.id}`, { kind: "message", actor: "bob", text: "The original room is still visible" });
+      await app.press("id:space:beta");
+      await app.waitFor("text:The original room is still visible", { timeout: 150 });
+      await app.press("id:nav-library");
+      await app.clock!.runFor(670);
+      expect(roomReads()).toBe(1);
+    } else {
+      await app.waitUntil(() => roomReads() === 2, { timeout: 700 });
+    }
+    expect(app.shows(`id:${destination}-view`)).toBe(true);
+    expect(app.shows("id:action-error")).toBe(false);
+    if (destination === "chat") expect(app.value("id:composer")).toBe("Keep the personal draft");
+    else expect(chatPolled(s)).toBe(false);
+    expect(remotePaths(s).filter(path => path === acmeRooms)).toHaveLength(1);
+    if (covered) return;
+    await app.press("id:space:beta");
+    await app.waitFor("text:Beta lobby stays");
+    expect(app.shows(`id:room:${thread.id}`)).toBe(false);
+    expect(roomReads()).toBe(2); // returning used the corrected cache, not a fresh list
+  });
+}
+
+for (const outcome of ["transcript first", "omission first with empty transcript", "timeout", "session abort"] as const) {
+  test(`held membership omission respects a pending rejoined transcript: ${outcome}`, async () => {
+    const s = servers();
+    const app = await launch(s, { storage: rememberedRemote, manualClock: true, probe: true });
+    await submitSavedStartup(app);
+    await app.waitUntil(() => firstRoomPages(s).includes(firstBeta), { timeout: 150 });
+    await app.press("id:nav-library");
+    await app.waitFor("id:library-view");
+    const members = s.b.state.spaces.get("beta")!.members;
+    members.delete("bob");
+    await startMembershipProbe(s, app, 500);
+    members.add("bob");
+    const cutoff = outcome === "timeout";
+    const first = outcome === "transcript first";
+    if (first) s.b.post("beta/lobby", { kind: "message", actor: "bob", text: "After rejoining Beta" });
+    const events = s.b.answerLate(betaEvents, TOKENS.bob!, cutoff ? 20_000 : first ? 80 : 800);
+    await app.press("id:space:beta"); // use the cached room list; only its transcript proves the rejoin
+    await app.waitUntil(() => events.arrived() === 1, { timeout: 100 });
+    if (first) await app.waitFor("text:After rejoining Beta", { timeout: 150 });
+    else await app.press("id:nav-library");
+    await app.clock!.runFor(560);
+    expect(app.shows("id:space:beta")).toBe(true);
+    expect(events.arrived()).toBe(1);
+    if (cutoff) {
+      // Keep the next periodic snapshot from re-granting this test Space.
+      members.delete("bob");
+      await app.waitFor("id:space:beta", { state: "gone", timeout: 10_000 });
+      expect(app.shows("id:library-view")).toBe(true);
+    } else if (outcome === "session abort") {
+      await menuSwitch(app, "disconnect");
+      await app.waitFor("id:connect-screen");
+      members.add("alice");
+      await app.press(`id:saved-server:${idOf(app, REMOTE)}`);
+      await signIn(app, "alice", REMOTE);
+      await app.clock!.runFor(350);
+      expect(app.shows("id:space:beta")).toBe(true);
+    } else {
+      await app.clock!.runFor(350);
+      expect(app.shows("id:space:beta")).toBe(true);
+      if (first) expect(app.shows("text:After rejoining Beta")).toBe(true);
+      else expect(app.shows("id:library-view")).toBe(true);
+    }
+    expect(remotePaths(s).filter(p => p === betaRooms)).toHaveLength(first || outcome === "session abort" ? 2 : 1);
+    expect(chatPolled(s)).toBe(false);
+  });
+}
+
+test("an older room-list omission waits for the exact pending transcript, not a sibling", async () => {
+  const s = servers();
+  s.b.addRoom("beta", { id: "stale-sibling", name: "Stale sibling" });
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true, probe: true });
+  await submitSavedStartup(app);
+  await app.waitUntil(() => firstRoomPages(s).includes(firstBeta), { timeout: 150 });
+  const original = s.b.state.rooms.get("beta")!;
+  s.b.state.rooms.set("beta", []);
+  const list = s.b.answerLate(betaRooms, TOKENS.bob!, 500);
+  await app.press("id:probe-refresh");
+  await app.waitUntil(() => list.arrived() === 1, { timeout: 100 });
+  s.b.state.rooms.set("beta", original.filter(r => r.id !== "stale-sibling"));
+  const events = s.b.answerLate(betaEvents, TOKENS.bob!, 800);
+  await app.press("id:nav-library");
+  await app.press("id:space:beta");
+  await app.waitUntil(() => events.arrived() === 1, { timeout: 100 });
+  await app.clock!.runFor(550);
+  expect(app.shows("id:room:lobby")).toBe(true);
+  expect(app.shows("id:room:stale-sibling")).toBe(false);
+  await app.clock!.runFor(350);
+  expect(app.shows("id:room:lobby")).toBe(true);
+  expect(app.shows("id:room:stale-sibling")).toBe(false);
+  expect(chatPolled(s)).toBe(false);
+});
 
 async function launchInEmptyBeta(s: ReturnType<typeof servers>) {
   s.b.state.rooms.set("beta", []);
