@@ -78,6 +78,7 @@ const server = createServer(async (req, res) => {
   if (!who) { res.setHeader("www-authenticate", "Bearer"); return send(res, 401, { error: "invalid token" }); }
   if (p === "/v1/me") return send(res, 200, { id: who === "admin" ? "jm" : "pat", actor: who === "admin" ? "JM" : "Pat", is_org_admin: who === "admin" });
   if (who !== "admin") return send(res, 403, { error: "only an organization admin can manage users" });
+  if (p === "/v1/server/update") return mock.serverUpdate ? send(res, 200, mock.serverUpdate) : send(res, 404, { error: "not found" });
   let body = "";
   for await (const c of req) body += c;
   if (p === "/v1/admin/users" && req.method === "GET") {
@@ -321,6 +322,37 @@ await test("admin signs in; names render as text", async () => {
   }
   assert(await evaluate("document.getElementById('token').value") === "", "token left in the field");
   assert(!(await evaluate("location.href")).includes("metro_"), "token in URL");
+});
+
+await test("the server update notice shows only a verified newer release", async () => {
+  const signedInFresh = async () => {
+    await goto(base + "/admin");
+    await signIn(ADMIN);
+    await waitFor(vis("panel") + " && document.querySelectorAll('#users-body tr').length > 0");
+    await delay(150);
+  };
+  mock.serverUpdate = null;
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown on a 404");
+  assert(await evaluate(vis("panel")), "a 404 ended the session");
+  mock.serverUpdate = { current: "0.5.0", available: false, latest: { version: "0.5.0", images: {} } };
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown when up to date");
+  mock.serverUpdate = { current: "0.5.0", available: true, latest: { version: "0.5.1\"><img src=x onerror=window.__xss=1>", images: {} } };
+  await signedInFresh();
+  assert(!(await evaluate(vis("update-notice"))), "notice shown for a malformed version");
+  const image = "ghcr.io/wnzn/metro-server:v0.5.1@sha256:" + "a".repeat(64);
+  mock.serverUpdate = { current: "0.5.0", available: true, latest: { version: "0.5.1", images: { server: image } } };
+  await signedInFresh();
+  await waitFor(vis("update-notice"));
+  assert((await text("update-latest")) === "0.5.1", "latest");
+  assert((await text("update-current")) === "0.5.0", "current");
+  assert((await text("update-image")) === image, "image");
+  assert(await evaluate("document.getElementById('update-link').href") === "https://github.com/wnzn/metro/releases/tag/v0.5.1", "link");
+  assert(await evaluate("window.__xss") === undefined, "script ran");
+  await click("#sign-out");
+  assert(!(await evaluate(vis("update-notice"))), "notice kept after sign-out");
+  mock.serverUpdate = null;
 });
 
 await test("every button has an accessible name; inputs have labels", async () => {

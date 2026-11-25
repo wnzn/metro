@@ -415,31 +415,47 @@ impl Db {
 // ---- HTTP ----
 
 fn view(runner: &RegisteredRunner, who: &Human, state: &AppState) -> serde_json::Value {
+    let (presence, update) = crate::updates::runner_fields(state, &format!("runner:{}", runner.id));
     json!({
         "id": runner.id,
         "name": runner.name,
         "visibility": runner.visibility,
         "can_manage": runner.manageable_by(&who.id, state.config.is_org_admin(&who.id)),
+        "presence": presence,
+        "update": update,
     })
 }
 
 /// How a Space's runner is shown to its members. A dedicated token has no
-/// registered runner behind it, so it has no id.
-fn space_view(runner: &SpaceRunner) -> serde_json::Value {
+/// registered runner behind it, so it has no id. `presence` and `update`
+/// are display data (see [`crate::updates`]).
+fn space_view(state: &AppState, space_id: &str, runner: &SpaceRunner) -> serde_json::Value {
     match runner {
         SpaceRunner::None => serde_json::Value::Null,
-        SpaceRunner::Dedicated => json!({
-            "id": null,
-            "name": "Dedicated Space runner",
-            "visibility": "dedicated",
-            "kind": "dedicated",
-        }),
-        SpaceRunner::Registered(r) => json!({
-            "id": r.id,
-            "name": r.name,
-            "visibility": r.visibility,
-            "kind": "registered",
-        }),
+        SpaceRunner::Dedicated => {
+            let (presence, update) =
+                crate::updates::runner_fields(state, &format!("space:{space_id}"));
+            json!({
+                "id": null,
+                "name": "Dedicated Space runner",
+                "visibility": "dedicated",
+                "kind": "dedicated",
+                "presence": presence,
+                "update": update,
+            })
+        }
+        SpaceRunner::Registered(r) => {
+            let (presence, update) =
+                crate::updates::runner_fields(state, &format!("runner:{}", r.id));
+            json!({
+                "id": r.id,
+                "name": r.name,
+                "visibility": r.visibility,
+                "kind": "registered",
+                "presence": presence,
+                "update": update,
+            })
+        }
     }
 }
 
@@ -458,7 +474,11 @@ async fn visible_runner(state: &AppState, id: &str, who: &Human) -> ApiResult<Re
 }
 
 /// Like [`visible_runner`], and 403 unless `who` may manage it.
-async fn managed_runner(state: &AppState, id: &str, who: &Human) -> ApiResult<RegisteredRunner> {
+pub(crate) async fn managed_runner(
+    state: &AppState,
+    id: &str,
+    who: &Human,
+) -> ApiResult<RegisteredRunner> {
     let runner = visible_runner(state, id, who).await?;
     if !runner.manageable_by(&who.id, state.config.is_org_admin(&who.id)) {
         return Err(ApiError::new(
@@ -577,8 +597,11 @@ pub async fn get_space_runner(
     Path(sid): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let space = member_of(&state, &sid, &who).await?;
-    let runner = api::db(&state, move |db| db.space_runner(&space.id)).await?;
-    Ok(Json(json!({"runner": space_view(&runner)})))
+    let space_id = space.id.clone();
+    let runner = api::db(&state, move |db| db.space_runner(&space_id)).await?;
+    Ok(Json(
+        json!({"runner": space_view(&state, &space.id, &runner)}),
+    ))
 }
 
 #[derive(Deserialize)]
@@ -607,14 +630,14 @@ pub async fn put_space_runner(
              (DELETE /v1/spaces/{sid}/runner-token or DELETE /v1/spaces/{sid}/runner)",
         )),
         Attach::Unchanged(runner) => Ok(Json(
-            json!({"runner": space_view(&SpaceRunner::Registered(runner))}),
+            json!({"runner": space_view(&state, &space.id, &SpaceRunner::Registered(runner))}),
         )),
         Attach::Attached(runner, generation) => {
             // Whatever was queued or claimed for the previous runner fails.
             state.jobs.revoke(&space.id, generation);
             tracing::info!(space = %space.id, runner = %runner.id, generation, "runner attached");
             Ok(Json(
-                json!({"runner": space_view(&SpaceRunner::Registered(runner))}),
+                json!({"runner": space_view(&state, &space.id, &SpaceRunner::Registered(runner))}),
             ))
         }
     }

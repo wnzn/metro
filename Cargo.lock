@@ -1797,6 +1797,7 @@ dependencies = [
  "metro-auth",
  "metro-connector",
  "metro-model-protocol",
+ "metro-release",
  "reqwest",
  "rig-agent",
  "rig-core",

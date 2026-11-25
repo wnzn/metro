@@ -31,6 +31,7 @@ pub mod space_agents;
 pub mod space_prefs;
 pub mod spaces;
 pub mod tools;
+pub mod updates;
 
 use std::sync::Arc;
 
@@ -73,6 +74,8 @@ pub struct AppState {
     pub managed: crate::admin_users::Managed,
     /// Avatar re-encodes running at once (see [`crate::profiles`]).
     pub avatar_encodes: Arc<Semaphore>,
+    /// Release check, runner presence and runner update requests (memory only).
+    pub updates: crate::updates::Updates,
 }
 
 impl AppState {
@@ -102,6 +105,7 @@ impl AppState {
         db.call(move |db| crate::monitoring::prune(db, retention))
             .await?;
         let state = Self {
+            updates: crate::updates::Updates::new(crate::updates::check_enabled_from_env()),
             avatar_encodes: Arc::new(Semaphore::new(crate::profiles::MAX_AVATAR_ENCODES)),
             managed,
             library,
@@ -269,6 +273,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::spaces::router())
         .merge(crate::space_agents::router())
         .merge(crate::space_prefs::router())
+        // Release check notice and runner update requests.
+        .merge(crate::updates::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;
