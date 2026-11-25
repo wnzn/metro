@@ -6,6 +6,7 @@ import { discoveryApi } from "./discovery";
 import { libraryApi } from "./library";
 import { monitoringApi } from "./monitoring";
 import { pagesApi } from "./pages";
+import type { PageDraftEvent } from "./pages";
 import { profileApi } from "./profile";
 import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
@@ -44,6 +45,8 @@ export type EventActivity = {
   agent?: EventAgent;
   /** Only on a Space turn's `started` marker: how its agent was chosen ("Picked by classifier: Coder"). */
   pick?: string;
+  /** The small room-visible proposal card, not the draft itself. */
+  page_draft?: PageDraftEvent;
 };
 /** A Space agent as a run's events show it: enough for its name and avatar. */
 export type EventAgent = { id: string; handle: string; name: string; avatar_version?: string; color: string };
@@ -1086,13 +1089,29 @@ function toEvent(v: RoomEvent): RoomEvent {
   }
   if (raw.audience === "room" || raw.audience === "agent" || raw.audience === "users" || raw.audience === "mixed") event.audience = raw.audience;
   const activity = toActivity(raw.activity);
-  if (activity) event.activity = activity;
+  if (activity) {
+    if (event.kind === "page_draft" && event.actor === "agent" && activity.source === "agent" && isObject(raw.activity)) {
+      const draft = toPageDraftCard(raw.activity.page_draft);
+      if (draft) activity.page_draft = draft;
+    }
+    event.activity = activity;
+  }
   if (isId(raw.actor_id) && String(raw.actor_id).trim()) event.actorId = String(raw.actor_id);
   const createdAt = toCreatedAt(raw.created_at);
   if (createdAt) event.createdAt = createdAt;
   const attachments = toAttachments(raw.attachments);
   if (attachments.length) event.attachments = attachments;
   return event;
+}
+
+function toPageDraftCard(v: unknown): PageDraftEvent | undefined {
+  if (!isObject(v) || typeof v.draft_id !== "string" || !/^pgd_[A-Za-z0-9_-]{1,96}$/.test(v.draft_id)
+    || typeof v.author_id !== "string" || !v.author_id || typeof v.title !== "string" || typeof v.summary !== "string"
+    || (v.kind !== "new" && v.kind !== "edit")) return undefined;
+  const expires_at = toCreatedAt(v.expires_at);
+  const page_id = typeof v.page_id === "string" && /^pg_[A-Za-z0-9_-]{1,96}$/.test(v.page_id) ? v.page_id : null;
+  if (!expires_at || (v.kind === "edit" && !page_id) || (v.kind === "new" && v.page_id !== null)) return undefined;
+  return { draft_id: v.draft_id, title: v.title.slice(0, 120), summary: v.summary.slice(0, 240), kind: v.kind, page_id, author_id: v.author_id, expires_at };
 }
 
 /** `asset_ids` for a message body: distinct, at most MAX_MESSAGE_ATTACHMENTS; undefined when there are none. */

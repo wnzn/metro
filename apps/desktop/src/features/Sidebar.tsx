@@ -24,6 +24,7 @@ import {
   view,
 } from "../store";
 import type { Room } from "../store";
+import { goPages, pages, pagesRoute } from "../pagesState";
 import { AccountMenu, Action, Column, Field, Label, MetroMark, NavGroup, NavItem, navigationPanel, RailBrand, RailButton, ResizeHandle, Row, ScrollArea, SectionHeader, SidebarBrand, Surface } from "../ui";
 import type { AccountMenuItem, Tone } from "../ui";
 import { loadSavedServers, signOut } from "../savedWorkspaces";
@@ -62,6 +63,8 @@ export function Sidebar(props: { mode: "full" | "rail" | "hidden" }) {
             onPress={openChat}
           />
           <NavItem testID="nav-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
+          <NavItem testID="nav-pages" label="Pages" icon="file" selected={mainPlace() === "pages" && pagesRoute().kind === "home" && !pagesRoute().spaceId} onPress={() => goPages()} />
+          <PinnedPages />
           <NavItem testID="nav-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
           <SpacesSection />
         </ScrollArea>
@@ -93,6 +96,7 @@ function SidebarRail() {
       </RailBrand>
       <RailButton testID="rail-chat" label={runs() ? `Chat, ${runs()} running` : "Chat"} icon="chat" selected={mainPlace() === "chat"} onPress={openChat} />
       <RailButton testID="rail-library" label="Library" icon="library" selected={mainPlace() === "library"} onPress={() => openPlace("library")} />
+      <RailButton testID="rail-pages" label="Pages" icon="file" selected={mainPlace() === "pages"} onPress={() => goPages()} />
       <RailButton testID="rail-schedules" label="Scheduled tasks" icon="clock" selected={mainPlace() === "schedules"} onPress={() => openPlace("schedules")} />
       <ScrollArea gap={1} align="center" padY={2}>
         <Each of={spaces()} key={(space) => space.id}>
@@ -146,6 +150,8 @@ function SpacesSection() {
       adding.set(false);
     }
   };
+  const spaceExpanded = (sid: string) => (mainPlace() === "space" && activeSpaceId() === sid)
+    || (mainPlace() === "pages" && pagesRoute().spaceId === sid);
   return (
     <Column gap={1} padY={2}>
       {/* The same 12-point inset as the rows' icons; + shows on hover and focus. */}
@@ -173,7 +179,7 @@ function SpacesSection() {
               testID={`space:${space().id}`}
               label={space().name}
               tile={{ initial: spaceInitial(space().name), seed: space().id }}
-              expanded={space().id === activeSpaceId() && mainPlace() === "space"}
+              expanded={spaceExpanded(space().id)}
               dot={spaceRunning(space().id) ? "the agent is working here" : undefined}
               tooltip={space().role === "owner" ? `${space().name} · you own this Space` : undefined}
               emphasis={space().id === activeSpaceId()}
@@ -189,8 +195,13 @@ function SpacesSection() {
                 ],
               }}
             />
-            <If when={space().id === activeSpaceId() && mainPlace() === "space"}>
-              <RoomTree />
+            <If when={spaceExpanded(space().id)}>
+              <If when={space().id === activeSpaceId()}><RoomTree /></If>
+              <NavGroup>
+                <NavItem testID={`space-pages:${space().id}`} label="Pages" icon="file" depth={1}
+                  selected={mainPlace() === "pages" && pagesRoute().spaceId === space().id}
+                  onPress={() => goPages({ kind: "home", spaceId: space().id })} />
+              </NavGroup>
             </If>
           </Column>
         )}
@@ -204,6 +215,30 @@ function SpacesSection() {
       </If>
     </Column>
   );
+}
+
+function PinnedPages() {
+  const selected = (id: string) => {
+    const route = pagesRoute();
+    return mainPlace() === "pages" && route.kind === "page" && route.id === id;
+  };
+  const pinned = () => {
+    const names = new Map(spaces().map(s => [s.id, s.name]));
+    return pages().filter(p => p.pinned).sort((a, b) =>
+      Number(!!a.space_id) - Number(!!b.space_id)
+      || (names.get(a.space_id ?? "") ?? "").localeCompare(names.get(b.space_id ?? "") ?? "")
+      || (a.position ?? Number.MAX_SAFE_INTEGER) - (b.position ?? Number.MAX_SAFE_INTEGER)
+      || a.title.localeCompare(b.title));
+  };
+  return <If when={pinned().length}>
+    <NavGroup testID="pinned-pages">
+      <Each of={pinned()} key={p => p.id}>{p =>
+        <NavItem depth={1} icon="file" label={[p().icon, p().title].filter(Boolean).join(" ")}
+          testID={`pinned-page:${p().id}`} selected={selected(p().id)}
+          onPress={() => goPages({ kind: "page", id: p().id, spaceId: p().space_id ?? undefined })} />
+      }</Each>
+    </NavGroup>
+  </If>;
 }
 
 type TreeRow = { room: Room; depth: number };
