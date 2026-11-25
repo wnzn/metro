@@ -37,9 +37,8 @@ export function SourceEditor(props: PageToolProps) {
   const review = signal<"diff" | "source">("source");
   const discard = signal(false);
   function close() {
-    if (busy()) return;
-    if (discard()) discard.set(false);
-    else if (source() !== target().source) discard.set(true);
+    if (!valid() || busy() || discard()) return;
+    if (source() !== target().source) discard.set(true);
     else props.close();
   }
   const headReads = pageReadLane<number>();
@@ -125,7 +124,7 @@ export function SourceEditor(props: PageToolProps) {
     const start = { line: d.line - 1, column: d.column - 1 };
     return [{ range: { start, end: { ...start, column: start.column + 1 } }, message: d.message, severity: "error" }];
   });
-  return <Modal open testID="page-source-sheet" title="Edit page source" onClose={close}>
+  return <Modal open guardDismiss={busy() || source() !== target().source} testID="page-source-sheet" title="Edit page source" onClose={close}>
     <Column grow pad={compactWidth() ? 4 : 6} gap={4}>
       <PageHeader title="Edit page source" subtitle={`Page TSX · based on version ${target().head_version} · checked by Metro, never run as code.`} />
       <If when={conflict() !== null}>

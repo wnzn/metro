@@ -148,7 +148,7 @@ export function DraftPrompt(props: {
   return <Column gap={2}>
     <Field testID="page-prompt" accessibilityLabel={props.label ?? "Describe the page you want"} multiline value={prompt()}
       placeholder={props.label ?? "Describe the page you want"} onChange={prompt.set} maxLength={4000} disabled={props.busy || checking()}
-      autoFocus={props.focus} inputRef={props.inputRef} onCancel={props.onCancel} />
+      autoFocus={props.focus} inputRef={node => props.inputRef?.(node)} onCancel={props.onCancel} />
     <PageModel model={model} disabled={props.busy || checking()} />
     <If when={model.error()}>{message => <Label color="warning">{message()}</Label>}</If>
     <Label variant="caption" color="muted">Only you can review this draft until you apply it.</Label>

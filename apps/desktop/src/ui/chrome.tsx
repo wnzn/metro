@@ -540,11 +540,15 @@ export const modalOpen = () => openModals() > 0;
 
 /**
  * A large modal over the app, in its own native layer: it takes the keyboard
- * focus and gives it back as it closes; Escape, the backdrop and `onClose`'s
- * callers close it. Sized to the window, never past it: a compact window
+ * focus and gives it back as it closes. Escape and the backdrop normally
+ * dismiss it; a guarded modal lets the caller decide. A compact window
  * gets a narrower margin. With reduced motion it appears without a fade.
  */
-export function Modal(props: Testable & { open: boolean; title: string; onClose: () => void; children?: JSX.Element; size?: "large" | "compact" }) {
+export function Modal(props: Testable & {
+  open: boolean; title: string; onClose: () => void; children?: JSX.Element; size?: "large" | "compact";
+  /** Report a dismissal attempt without closing natively, e.g. to review unsaved edits. */
+  guardDismiss?: boolean;
+}) {
   effect(() => {
     if (!props.open) return;
     openModals.set(untracked(openModals) + 1);
@@ -564,8 +568,12 @@ export function Modal(props: Testable & { open: boolean; title: string; onClose:
       accessibilityLabel={props.title}
       testID={props.testID}
       backdropTestID={props.testID ? `${props.testID}-backdrop` : undefined}
+      closeOnEscape={props.guardDismiss ? false : undefined}
+      closeOnBackdropPress={props.guardDismiss ? false : undefined}
+      closeOnSwipe={props.guardDismiss ? false : undefined}
+      onCancel={props.guardDismiss ? () => props.onClose() : undefined}
       onOpenChange={(e) => {
-        if (!e.open) props.onClose();
+        if (!e.open && !props.guardDismiss) props.onClose();
       }}
       backdropClass="bg-black/55"
       class="m-auto flex-col overflow-hidden rounded-(--radius-xl) border border-border bg-background shadow-lg"
