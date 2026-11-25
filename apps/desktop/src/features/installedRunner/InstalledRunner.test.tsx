@@ -24,17 +24,17 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
   const b = fakeBridge(f);
   const log: { method: string; path: string; body: string | null | undefined }[] = [];
   const t = { log };
-  const st = { state: opts.state ?? "online", canReconnect: opts.canReconnect ?? false, runnerId, delay: 0 };
+  const st = { state: opts.state ?? "online", canReconnect: opts.canReconnect ?? false, runnerId, delay: 0, status: 200, available: opts.available ?? true };
   const status = () => ({
     requested: opts.requested ?? true,
     marker: opts.requested === false ? "absent" : "accepted",
     marker_detail: null,
-    available: opts.available ?? true,
-    state: opts.available === false ? "unavailable" : st.state,
+    available: st.available,
+    state: !st.available ? "unavailable" : st.state,
     detail: st.state === "revoked" ? "This computer's runner is no longer accepted by the local Metro server." : null,
-    runner: opts.available === false || !st.runnerId ? null : { id: st.runnerId, name },
+    runner: !st.available || !st.runnerId ? null : { id: st.runnerId, name },
     ...(opts.unconfirmedName && !st.runnerId ? { unconfirmed_name: opts.unconfirmedName } : {}),
-    spaces_folder: opts.available === false ? null : ROOT,
+    spaces_folder: !st.available ? null : ROOT,
     tools: ["workspace.list", "workspace.read"],
     can_reconnect: st.canReconnect,
   });
@@ -46,7 +46,8 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
     if (path === "/v1/local-tools/runner" && req.method === "GET") {
       const reads = t.log.filter((l) => l.path === path && l.method === "GET").length;
       if (reads > 1 && opts.laterAvailable === false) return { status: 200, body: { ...status(), available: false, runner: null, state: "unavailable" } };
-      return { status: 200, body: status(), ...(st.delay ? { delay: st.delay } : {}) };
+      const body = st.status === 200 ? status() : { error: { code: "unavailable", message: "try again" } };
+      return { status: st.status, body, ...(st.delay ? { delay: st.delay } : {}) };
     }
     if (path === "/v1/local-tools/runner/reconnect" && req.method === "POST") {
       st.state = "online";
@@ -368,7 +369,8 @@ test("persistent concurrent consumers see late online and subsequent offline; di
   expect(reads()).toBe(1); // Both watchers use the initial read.
   expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
   await app.clock!.runFor(36_000); // Longer than the old six-try window.
-  expect(reads()).toBe(8);
+  expect(reads()).toBeGreaterThanOrEqual(7);
+  expect(reads()).toBeLessThanOrEqual(8); // At most one poll per five seconds.
   expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
 
   t.st.state = "online";
@@ -470,6 +472,73 @@ test("Settings upgrades a held Sidebar poll to one folder fetch for the still-mo
       expect(folders()).toBe(0);
     }
     expect(reads()).toBe(2);
+    t.st.delay = 0;
+    await app.clock!.runFor(5300);
+    if (change === "different runner") {
+      await app.waitFor(`text:Create choice: ${replacement.id}`);
+      await app.waitFor("id:installed-runner-folder:solo");
+    }
+    expect(folders()).toBe(change === "unmounted" ? 0 : 1);
+    expect(posts(t)).toEqual([]);
+  }
+});
+
+test("mounted Settings retries a failed or empty joined read after offer dismissal, then stops after one folder refresh", async () => {
+  for (const failure of ["error", "no runner", "temporarily unavailable", "unmounted"]) {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    const mine = f.addRunner("This PC", "personal", "alice");
+    const t = bridgeWithRunner(f, mine.id, mine.name);
+    const reads = () => t.log.filter((l) => l.method === "GET" && l.path === "/v1/local-tools/runner").length;
+    const folderReads = () => f.state.log.filter((l) => l.method === "GET" && l.path === "/v1/spaces/solo/runner").length;
+    const app = await open("./runnerWatch.fixture.tsx", {
+      network: { ...f.network, ...t.network } as any, modules: bridgeEnv() as any, platform: "linux", width: 1280, height: 900, clock: {},
+    });
+    await app.press("id:fixture-connect");
+    await app.waitFor("id:dismiss-fixture-offer");
+    expect(reads()).toBe(1);
+    f.state.attached.set("solo", mine.id);
+    t.st.delay = 1800;
+    if (failure === "temporarily unavailable") t.st.available = false;
+    else if (failure === "error" || failure === "unmounted") t.st.status = 503;
+    else {
+      t.st.runnerId = null;
+      t.st.state = "starting";
+    }
+    await app.clock!.runFor(5100);
+    await app.press("id:toggle-runner-settings");
+    await app.waitFor("id:runners-settings");
+    await app.press("id:dismiss-fixture-offer");
+    await app.clock!.runFor(6400);
+    expect(reads()).toBe(2); // The failed read didn't trigger an eager retry.
+    expect(folderReads()).toBe(0);
+    expect(app.shows("id:installed-runner-folder:solo")).toBe(false);
+
+    t.st.delay = 0;
+    if (failure === "unmounted") {
+      await app.press("id:toggle-runner-settings");
+      t.st.status = 200;
+      await app.clock!.runFor(15_000);
+      expect(reads()).toBe(2);
+      expect(folderReads()).toBe(0);
+      continue;
+    }
+    await app.clock!.runFor(600);
+    expect(reads()).toBe(3); // One shared retry, despite two mounted folder consumers.
+    expect(folderReads()).toBe(0);
+
+    t.st.status = 200;
+    t.st.available = true;
+    t.st.runnerId = mine.id;
+    t.st.state = "online";
+    await app.clock!.runFor(5000);
+    await app.waitFor("id:installed-runner-folder:solo");
+    expect(reads()).toBe(4);
+    expect(folderReads()).toBe(1);
+    await app.clock!.runFor(15_000);
+    expect(reads()).toBe(4);
+    expect(folderReads()).toBe(1);
+    expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
     expect(posts(t)).toEqual([]);
   }
 });

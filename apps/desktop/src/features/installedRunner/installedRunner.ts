@@ -86,8 +86,12 @@ export const ownedInstalledRunner = signal<{ id: string; attachIfEmpty: boolean 
 export const checkingInstalledScope = signal(false);
 /** A provisioned (or temporarily unreachable) launcher worth watching for the offer. */
 export const installedRunnerStatusWatchable = signal(false);
+/** This session has had a supported local runner status, even if its bridge context is now missing. */
+export const installedRunnerSeen = signal(false);
 /** Owned Spaces whose runner is this one, by stable id. */
 export const runnerSpaces = signal<{ id: string; name: string }[]>([]);
+/** Serial of the last complete folder read for the current verified runner, if any. */
+export const installedFolderSnapshot = signal<number | null>(null);
 export const installedBusy = signal<null | "reconnect" | `folder:${string}`>(null);
 export const installedError = signal<string | null>(null);
 export const installedNotice = signal<string | null>(null);
@@ -105,12 +109,17 @@ function stillValid(): () => boolean {
   return () => mine === gen && key === sessionKey() && ok();
 }
 
+function clearAttached() {
+  runnerSpaces.set([]);
+  folders.set({});
+  installedFolderSnapshot.set(null);
+}
+
 function reset() {
   installedRunner.set(null);
   ownedInstalledRunner.set(null);
   checkingInstalledScope.set(false);
-  runnerSpaces.set([]);
-  folders.set({});
+  clearAttached();
   installedError.set(null);
   installedNotice.set(null);
 }
@@ -119,6 +128,7 @@ onSessionEnd(() => {
   gen++;
   inflight = null;
   installedRunnerStatusWatchable.set(false);
+  installedRunnerSeen.set(false);
   installedBusy.set(null);
   reset();
 });
@@ -140,6 +150,7 @@ async function loadAttached(runnerId: string, valid: () => boolean): Promise<voi
     if (res.status === "fulfilled" && res.value.r?.kind === "registered" && res.value.r.id === runnerId) list.push({ id: res.value.s.id, name: res.value.s.name });
   }
   runnerSpaces.set(list);
+  if (checks.every((res) => res.status === "fulfilled")) installedFolderSnapshot.set(seq);
 }
 
 /** Don't allow an older folder-list read to undo a just-confirmed attachment. */
@@ -154,8 +165,7 @@ export function refreshAfterInstalledRunnerDeletion(id: string) {
   gen++;
   inflight = null;
   ownedInstalledRunner.set(null);
-  runnerSpaces.set([]);
-  folders.set({});
+  clearAttached();
   void loadInstalledRunner();
 }
 
@@ -184,6 +194,7 @@ async function readStatus(read: InstalledRead): Promise<void> {
   try {
     const { runner: next, watchable } = await readBridgeStatus();
     if (!valid()) return;
+    if (next) installedRunnerSeen.set(true);
     installedRunnerStatusWatchable.set(watchable);
     if (!next || next.runner?.id !== installedRunner()?.runner?.id) reset();
     installedRunner.set(next);
@@ -207,9 +218,12 @@ async function readBridgeStatus(): Promise<{ runner: InstalledRunner | null; wat
   const call = localRunnerCall();
   if (!call || !apiClient() || !me()) return { runner: null, watchable: false };
   try {
-    const runner = parseInstalledRunner(await call("GET", "/v1/local-tools/runner"));
-    // An answered "not installed / not this workspace" isn't a transient failure.
-    return { runner, watchable: runner !== null };
+    const body = await call("GET", "/v1/local-tools/runner");
+    const runner = parseInstalledRunner(body);
+    // A definitive "not installed / not this workspace" doesn't need another
+    // read. An empty or incomprehensible answer may be transient.
+    const unavailable = isObj(body) && (body.requested === false || body.available === false);
+    return { runner, watchable: !unavailable };
   } catch (error) {
     const unsupported = error instanceof BridgeError && [404, 405].includes(error.status ?? 0);
     return { runner: null, watchable: !unsupported };
@@ -227,12 +241,12 @@ async function loadInstalledScope(runnerId: string, valid: () => boolean) {
       ownedInstalledRunner.set({ id: runnerId, attachIfEmpty: list.attachIfEmpty });
     } else {
       ownedInstalledRunner.set(null);
-      runnerSpaces.set([]);
+      clearAttached();
     }
   } catch {
     if (valid()) {
       ownedInstalledRunner.set(null);
-      runnerSpaces.set([]);
+      clearAttached();
     }
   } finally {
     if (valid()) checkingInstalledScope.set(false);
@@ -250,15 +264,14 @@ export async function reconnectInstalledRunner(): Promise<void> {
   try {
     const next = parseInstalledRunner(await call("POST", "/v1/local-tools/runner/reconnect"));
     if (!valid()) return;
+    clearAttached();
     installedRunner.set(next);
-    folders.set({});
     installedNotice.set("Reconnected. Choose Spaces without a runner below to attach it.");
     if (next?.runner) {
       await loadInstalledScope(next.runner.id, valid);
       await loadAttached(next.runner.id, valid);
     } else {
       ownedInstalledRunner.set(null);
-      runnerSpaces.set([]);
     }
   } catch (error) {
     if (valid()) installedError.set(message(error, "Reconnecting this computer's runner"));

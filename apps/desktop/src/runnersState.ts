@@ -5,7 +5,7 @@ import type { RegisteredRunner, Space } from "./api/client";
 import { loadRunners, runnerBusy, runners, spaceRunners } from "./settings";
 import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, setRunnerPaired, spaces } from "./store";
 import { helper } from "./device/state";
-import { installedBusy, installedRunner, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner, recordAttachedFolder } from "./features/installedRunner/installedRunner";
+import { installedBusy, installedFolderSnapshot, installedRunner, installedRunnerSeen, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner, recordAttachedFolder } from "./features/installedRunner/installedRunner";
 
 export const runnerSessionKey = () => JSON.stringify([connectedTo(), me()]);
 export const runnerOfferStorageKey = (server: string, userId: string) =>
@@ -16,7 +16,9 @@ const dismissedThisLaunch = new Set<string>();
 const offerFresh = signal(false);
 const watchers = signal(0);
 const watching = computed(() => watchers() > 0);
-const OFFER_REFRESH_MS = 5000;
+const folderWatchers = signal(0);
+const watchingFolders = computed(() => folderWatchers() > 0);
+const RUNNER_REFRESH_MS = 5000;
 const OFFER_REFRESH_GRACE_MS = 2000;
 const attachFeedback = signal<{ message: string; incomplete: boolean } | null>(null);
 export const runnerAttachFeedback = () => attachFeedback();
@@ -65,16 +67,30 @@ export function dismissRunnerOffer() {
 export function watchInstalledRunner(refreshFoldersOnOpen = false) {
   watchers.set(untracked(watchers) + 1);
   cleanup(() => watchers.set(untracked(watchers) - 1));
-  if (refreshFoldersOnOpen) effect(() => {
-    if (!offerKey() || helper().phase === "checking") return;
-    const valid = sessionGuard();
-    let wanted = true;
-    cleanup(() => { wanted = false; });
-    // A mounted Settings page needs folders, even when joining a Sidebar
-    // status read. Closing the page withdraws just this folder demand.
-    untracked(() => void loadInstalledRunner(true, () => wanted && valid()));
-  });
+  if (!refreshFoldersOnOpen) return;
+  folderWatchers.set(untracked(folderWatchers) + 1);
+  cleanup(() => folderWatchers.set(untracked(folderWatchers) - 1));
 }
+
+type FolderInterest = { baseline: number | null; valid: () => boolean };
+const folderInterest = signal<FolderInterest | null>(null);
+const wantsFolderRead = (interest: FolderInterest | null) => {
+  if (!interest || folderInterest() !== interest || !interest.valid()) return false;
+  const snapshot = installedFolderSnapshot();
+  return snapshot === null || snapshot === interest.baseline;
+};
+
+effect(() => {
+  if (!watchingFolders() || !offerKey() || helper().phase === "checking") return;
+  const interest = { baseline: untracked(installedFolderSnapshot), valid: sessionGuard() };
+  folderInterest.set(interest);
+  cleanup(() => folderInterest.set(null));
+  // Try on open, joining any Sidebar read already in flight. If this attempt
+  // can't verify the candidate, the mounted demand survives for a later read.
+  untracked(() => {
+    if (!runnerAttachBusy()) void loadInstalledRunner(true, () => wantsFolderRead(interest));
+  });
+});
 
 effect(() => {
   if (watching() && offerKey()) untracked(() => void loadOfferDismissal());
@@ -95,28 +111,34 @@ const shouldWatchOffer = computed(() => {
   return !!key && state?.key === key && !state.dismissed && spaces().some(isEmptyOwned);
 });
 
+const shouldRefreshRunner = computed(() => shouldWatchOffer() ||
+  ((installedRunnerStatusWatchable() || installedRunnerSeen()) && !runnerAttachBusy() &&
+    !installedBusy() && wantsFolderRead(folderInterest())));
+
 effect(() => {
-  if (!shouldWatchOffer()) {
-    offerFresh.set(false);
-    return;
-  }
+  if (!shouldWatchOffer()) offerFresh.set(false);
+});
+
+effect(() => {
+  if (!shouldRefreshRunner()) return;
   const valid = sessionGuard();
   let stopped = false;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let expiry: ReturnType<typeof setTimeout> | undefined;
   const tick = async () => {
-    if (stopped || !valid() || !shouldWatchOffer()) return;
+    if (stopped || !valid() || !shouldRefreshRunner()) return;
     // A hung bridge (with a longer transport timeout) must not leave an
     // online offer on screen. Keep the last verified Create choice separate.
-    expiry = setTimeout(() => offerFresh.set(false), OFFER_REFRESH_GRACE_MS);
-    // Same runner: only ask the bridge for liveness. Don't reload every
-    // Space's folders while Sidebar is sitting open.
-    await loadInstalledRunner(false);
+    if (shouldWatchOffer()) expiry = setTimeout(() => offerFresh.set(false), OFFER_REFRESH_GRACE_MS);
+    const interest = folderInterest();
+    // Share one cadence. Once Settings has a complete snapshot, Sidebar
+    // checks liveness only until the registration changes or is invalidated.
+    await loadInstalledRunner(wantsFolderRead(interest), () => wantsFolderRead(interest));
     if (expiry !== undefined) clearTimeout(expiry);
     expiry = undefined;
-    if (stopped || !valid() || !shouldWatchOffer()) return;
-    offerFresh.set(true);
-    timer = setTimeout(() => void tick(), OFFER_REFRESH_MS);
+    if (stopped || !valid() || !shouldRefreshRunner()) return;
+    if (shouldWatchOffer()) offerFresh.set(true);
+    timer = setTimeout(() => void tick(), RUNNER_REFRESH_MS);
   };
   cleanup(() => {
     stopped = true;
