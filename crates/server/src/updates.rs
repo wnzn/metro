@@ -197,40 +197,54 @@ impl Updates {
 
     /// Returns false for a backwards check, without changing any offer.
     fn raise_floor(&self, v: Version) -> Result<bool, metro_release::Error> {
-        let error = || {
-            metro_release::Error::new(
-                metro_release::ErrorCode::Io,
-                "could not read or persist the release floor",
-            )
-        };
-        let mut inner = self.lock();
-        if inner.floor_unreadable {
-            return Err(error());
-        }
-        let _disk_lock = if let Some(path) = &self.floor_file {
-            let file = lock_floor_file(path).map_err(|_| error())?;
-            if let Some(saved) = read_floor(path).map_err(|_| error())? {
-                inner.floor = Some(inner.floor.map_or(saved, |floor| floor.max(saved)));
+        self.with_floor(|inner, saved| {
+            if inner.floor.is_some_and(|floor| floor > v) {
+                return Ok(false);
             }
-            Some(file)
-        } else {
-            None
-        };
-        if inner
-            .floor
-            .into_iter()
-            .chain(inner.latest.as_ref().map(|l| l.version))
-            .any(|f| f > v)
-        {
-            return Ok(false);
-        }
-        if inner.floor != Some(v) {
-            if let Some(path) = &self.floor_file {
-                metro_release::write_atomic(path, v.to_string().as_bytes()).map_err(|_| error())?;
+            if let Some(path) = &self.floor_file
+                && saved != Some(v)
+            {
+                metro_release::write_atomic(path, v.to_string().as_bytes())?;
             }
             inner.floor = Some(v);
+            Ok(true)
+        })
+        .map_err(|_| {
+            metro_release::Error::new(
+                metro_release::ErrorCode::Io,
+                "could not persist the release floor",
+            )
+        })
+    }
+
+    /// All authorization and publication use the same lock order: local
+    /// state, then the shared floor lock, held through the decision.
+    fn with_floor<T>(
+        &self,
+        f: impl FnOnce(&mut Inner, Option<Version>) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let mut inner = self.lock();
+        if inner.floor_unreadable {
+            return Err(std::io::ErrorKind::InvalidData.into());
         }
-        Ok(true)
+        let _disk_lock = self
+            .floor_file
+            .as_deref()
+            .map(lock_floor_file)
+            .transpose()?;
+        let saved = self
+            .floor_file
+            .as_deref()
+            .map(read_floor)
+            .transpose()?
+            .flatten();
+        inner.floor = inner
+            .floor
+            .into_iter()
+            .chain(saved)
+            .chain(inner.latest.as_ref().map(|l| l.version))
+            .max();
+        f(&mut inner, saved)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Inner> {
@@ -243,17 +257,12 @@ impl Updates {
 
     /// For tests and the checker: set the verified latest release.
     pub fn set_latest(&self, latest: Latest) {
-        let mut inner = self.lock();
-        // Never go backwards: a replayed older manifest can't hide a newer one.
-        if inner
-            .latest
-            .as_ref()
-            .is_some_and(|l| l.version > latest.version)
-        {
-            tracing::warn!(seen = %latest.version, "an older release was served as latest; ignored");
-            return;
-        }
-        inner.latest = Some(latest);
+        let _ = self.with_floor(|inner, _| {
+            if inner.floor.is_none_or(|floor| latest.version >= floor) {
+                inner.latest = Some(latest);
+            }
+            Ok(())
+        });
     }
 
     pub fn presence(&self, key: &str) -> Option<Presence> {
@@ -261,15 +270,29 @@ impl Updates {
     }
 
     fn pending(&self, key: &str, now: i64) -> Option<Pending> {
-        let mut inner = self.lock();
-        if inner
-            .pending
-            .get(key)
-            .is_some_and(|p| now - p.requested_at > PENDING_TTL_MS)
-        {
-            inner.pending.remove(key);
-        }
-        inner.pending.get(key).cloned()
+        self.with_floor(|inner, _| {
+            if inner.pending.get(key).is_some_and(|p| {
+                now - p.requested_at > PENDING_TTL_MS
+                    || !inner.authorizes(Version::parse(&p.target))
+            }) {
+                inner.pending.remove(key);
+            }
+            Ok(inner.pending.get(key).cloned())
+        })
+        .ok()
+        .flatten()
+    }
+}
+
+impl Inner {
+    fn authorizes(&self, target: Option<Version>) -> bool {
+        target.is_some_and(|v| {
+            self.floor.is_none_or(|floor| v >= floor)
+                && self
+                    .latest
+                    .as_ref()
+                    .is_some_and(|release| release.version == v)
+        })
     }
 }
 
@@ -476,7 +499,14 @@ pub fn runner_fields(state: &AppState, key: &str) -> (serde_json::Value, serde_j
     let p = state.updates.presence(key);
     let pending = state.updates.pending(key, now);
     let last = state.updates.lock().last_result.get(key).cloned();
-    let latest = state.updates.latest();
+    let (latest, authorized) = state
+        .updates
+        .with_floor(|inner, _| {
+            let latest = inner.latest.clone();
+            let authorized = inner.authorizes(latest.as_ref().map(|l| l.version));
+            Ok((latest, authorized))
+        })
+        .unwrap_or_else(|_| (state.updates.latest(), false));
     let presence = json!({
         "seen_at": p.as_ref().map(|p| p.seen_at),
         "online": p.as_ref().is_some_and(|p| now - p.seen_at < ONLINE_WINDOW_MS),
@@ -488,7 +518,7 @@ pub fn runner_fields(state: &AppState, key: &str) -> (serde_json::Value, serde_j
         .as_ref()
         .and_then(|p| p.version.as_deref())
         .and_then(Version::parse);
-    let available = matches!((&latest, running), (Some(l), Some(r)) if l.version > r);
+    let available = authorized && matches!((&latest, running), (Some(l), Some(r)) if l.version > r);
     let action = match p.as_ref() {
         _ if !available => "none",
         Some(p) if p.self_update => "self_update",
@@ -576,58 +606,65 @@ async fn request_update(state: &AppState, key: &str, version: &str, scope: Scope
     let Some(target) = Version::parse(version) else {
         return ApiError::bad_request("version must be X.Y.Z").into_response();
     };
-    let Some(latest) = state.updates.latest() else {
-        return refuse(
+    let result = state
+        .updates
+        .with_floor(|inner, _| {
+            let p = inner.presence.get(key).cloned();
+            let pending = inner
+                .pending
+                .get(key)
+                .filter(|p| {
+                    now - p.requested_at <= PENDING_TTL_MS
+                        && inner.authorizes(Version::parse(&p.target))
+                })
+                .cloned();
+            let running = p
+                .as_ref()
+                .and_then(|p| p.version.as_deref())
+                .and_then(Version::parse);
+            Ok(if inner.latest.is_none() {
+                Err((
+                    "no_verified_release",
+                    "this server hasn't verified a newer release",
+                ))
+            } else if !inner.authorizes(Some(target)) {
+                Err((
+                    "not_latest",
+                    "only the latest verified release can be requested",
+                ))
+            } else if !p
+                .as_ref()
+                .is_some_and(|p| now - p.seen_at < ONLINE_WINDOW_MS)
+            {
+                Err((
+                    "runner_offline",
+                    "the runner hasn't been seen in the last 2 minutes",
+                ))
+            } else if !p.as_ref().is_some_and(|p| p.self_update) {
+                Err((
+                    "self_update_off",
+                    "this runner doesn't update itself; update it on its host",
+                ))
+            } else if !running.is_some_and(|r| target > r) {
+                Err((
+                    "not_newer",
+                    "the runner already runs this version or a newer one",
+                ))
+            } else if pending.is_some() {
+                Err(("already_pending", "an update was already requested"))
+            } else {
+                let pending = Pending {
+                    target: target.to_string(),
+                    requested_at: now,
+                };
+                inner.pending.insert(key.to_owned(), pending.clone());
+                Ok((pending, running))
+            })
+        })
+        .unwrap_or(Err((
             "no_verified_release",
-            "this server hasn't verified a newer release",
-        );
-    };
-    let result = {
-        let mut inner = state.updates.lock();
-        let p = inner.presence.get(key).cloned();
-        let pending = inner
-            .pending
-            .get(key)
-            .filter(|p| now - p.requested_at <= PENDING_TTL_MS)
-            .cloned();
-        let running = p
-            .as_ref()
-            .and_then(|p| p.version.as_deref())
-            .and_then(Version::parse);
-        if target != latest.version {
-            Err((
-                "not_latest",
-                "only the latest verified release can be requested",
-            ))
-        } else if !p
-            .as_ref()
-            .is_some_and(|p| now - p.seen_at < ONLINE_WINDOW_MS)
-        {
-            Err((
-                "runner_offline",
-                "the runner hasn't been seen in the last 2 minutes",
-            ))
-        } else if !p.as_ref().is_some_and(|p| p.self_update) {
-            Err((
-                "self_update_off",
-                "this runner doesn't update itself; update it on its host",
-            ))
-        } else if !running.is_some_and(|r| target > r) {
-            Err((
-                "not_newer",
-                "the runner already runs this version or a newer one",
-            ))
-        } else if pending.is_some() {
-            Err(("already_pending", "an update was already requested"))
-        } else {
-            let pending = Pending {
-                target: target.to_string(),
-                requested_at: now,
-            };
-            inner.pending.insert(key.to_owned(), pending.clone());
-            Ok((pending, running))
-        }
-    };
+            "the shared release floor could not be checked",
+        )));
     match result {
         Err((code, message)) => refuse(code, message),
         Ok((pending, running)) => {
@@ -740,8 +777,7 @@ pub async fn check_once(state: &AppState, fetcher: &AsyncFetcher, verifier: &dyn
     let now = now_ms();
     match outcome {
         Ok((version, candidate)) => {
-            let notify = {
-                let mut inner = state.updates.lock();
+            let notify = state.updates.with_floor(|inner, _| {
                 let latest = candidate.filter(|l| {
                     inner.floor.is_none_or(|f| l.version >= f)
                         && inner
@@ -766,8 +802,13 @@ pub async fn check_once(state: &AppState, fetcher: &AsyncFetcher, verifier: &dyn
                     error: None,
                     anomaly,
                 };
-                notify
-            };
+                Ok(notify)
+            }).unwrap_or_else(|_| {
+                state.updates.lock().status = CheckStatus {
+                    checked_at: Some(now), result: "error", error: Some("io"), anomaly: None,
+                };
+                false
+            });
             if notify {
                 tracing::warn!(
                     "Metro {} is available; this server runs {} ({})",

@@ -43,6 +43,10 @@ struct Server {
 
 impl Server {
     async fn start() -> Server {
+        Self::start_with_floor(None).await
+    }
+
+    async fn start_with_floor(floor: Option<std::path::PathBuf>) -> Server {
         let user = |id: &str| UserIdentity {
             id: id.into(),
             actor: id.into(),
@@ -59,9 +63,12 @@ impl Server {
             limits: Limits::default(),
             org_admins: vec!["alice".into()],
         };
-        let state = AppState::new(config, Db::open_in_memory().unwrap(), Arc::new(auth))
+        let mut state = AppState::new(config, Db::open_in_memory().unwrap(), Arc::new(auth))
             .await
             .unwrap();
+        if let Some(floor) = floor {
+            state.updates = metro_server::updates::Updates::new(true).with_floor_file(floor);
+        }
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
         let app = router(state.clone());
@@ -701,6 +708,14 @@ async fn check_off_makes_no_outbound_request() {
 
 /// Serve a fixture release (optionally with its IMAGES.txt commit changed).
 fn fixture_github(version: &str, images_commit: Option<&str>) -> String {
+    fixture_github_on_images(version, images_commit, || {})
+}
+
+fn fixture_github_on_images(
+    version: &str,
+    images_commit: Option<&str>,
+    before_images: impl FnOnce() + Send + 'static,
+) -> String {
     use std::io::{BufRead, BufReader, Write};
     let mut overrides = BTreeMap::new();
     if let Some(c) = images_commit {
@@ -713,6 +728,7 @@ fn fixture_github(version: &str, images_commit: Option<&str>) -> String {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     std::thread::spawn(move || {
+        let mut before_images = Some(before_images);
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let mut reader = BufReader::new(stream.try_clone().unwrap());
@@ -732,6 +748,11 @@ fn fixture_github(version: &str, images_commit: Option<&str>) -> String {
                 .next()
                 .unwrap_or("")
                 .to_string();
+            if name == "IMAGES.txt"
+                && let Some(before_images) = before_images.take()
+            {
+                before_images();
+            }
             let body = files.get(&name).cloned().unwrap_or_default();
             let _ = write!(
                 stream,
@@ -742,6 +763,82 @@ fn fixture_github(version: &str, images_commit: Option<&str>) -> String {
         }
     });
     base
+}
+
+#[tokio::test]
+async fn publication_rechecks_the_shared_floor_after_fetching_images() {
+    let dir = tempfile::tempdir().unwrap();
+    let floor = dir.path().join("floor");
+    let low = Server::start_with_floor(Some(floor.clone())).await;
+    let high = Server::start_with_floor(Some(floor.clone())).await;
+    let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    let first = fixture_github_on_images("9.1.0", None, move || {
+        reached_tx.send(()).unwrap();
+        resume_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+    });
+    let low_state = low.state.clone();
+    let check = tokio::spawn(async move {
+        let f = AsyncFetcher::new(
+            Source::loopback_fixture(&first).unwrap(),
+            Duration::from_secs(15),
+        )
+        .unwrap();
+        metro_server::updates::check_once(&low_state, &f, &TestVerifier).await;
+    });
+    tokio::time::timeout(Duration::from_secs(10), reached_rx)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&floor).unwrap(), "9.1.0");
+    let latest = fixture_github("9.2.0", Some(&"f".repeat(40)));
+    let f = AsyncFetcher::new(
+        Source::loopback_fixture(&latest).unwrap(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    metro_server::updates::check_once(&high.state, &f, &TestVerifier).await;
+    assert_eq!(std::fs::read_to_string(&floor).unwrap(), "9.2.0");
+    resume_tx.send(()).unwrap();
+    check.await.unwrap();
+    assert!(
+        low.state.updates.latest().is_none(),
+        "9.1.0 must not publish after the other process saw 9.2.0"
+    );
+}
+
+#[tokio::test]
+async fn historical_notice_cannot_authorize_or_dispatch_after_another_checker_raises_the_floor() {
+    let dir = tempfile::tempdir().unwrap();
+    let floor = dir.path().join("floor");
+    let s = Server::start_with_floor(Some(floor.clone())).await;
+    let other = Server::start_with_floor(Some(floor)).await;
+    let (rid, token) = s.runner(ALICE, "personal").await;
+    s.claim(&token, &presence("9.0.0", "managed", true)).await;
+    s.set_latest("9.1.0");
+    let path = format!("/v1/runners/{rid}/update");
+    assert_eq!(
+        s.post(ALICE, &path, json!({"version":"9.1.0"})).await.0,
+        StatusCode::ACCEPTED
+    );
+    let latest = fixture_github("9.2.0", Some(&"f".repeat(40)));
+    let f = AsyncFetcher::new(
+        Source::loopback_fixture(&latest).unwrap(),
+        Duration::from_secs(10),
+    )
+    .unwrap();
+    metro_server::updates::check_once(&other.state, &f, &TestVerifier).await;
+    assert_eq!(
+        s.state.updates.latest().unwrap().version,
+        Version::parse("9.1.0").unwrap()
+    );
+    let (_, headers, _) = s.claim(&token, &presence("9.0.0", "managed", true)).await;
+    assert!(!headers.contains("x-metro-runner-update:"), "{headers}");
+    let (status, body) = s.post(ALICE, &path, json!({"version":"9.1.0"})).await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["code"], "not_latest");
+    let (_, body) = s.get(ALICE, "/v1/runners").await;
+    assert_eq!(body["runners"][0]["update"]["available"], false);
 }
 
 /// A persisted floor: after a restart, an older verified release served as
