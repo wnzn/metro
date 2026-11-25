@@ -39,6 +39,20 @@ export function desktopBridge(): Bridge | null {
   return bridge;
 }
 
+let pendingStartupStatus: { value: Promise<BridgeStatus>; current: () => boolean } | undefined;
+
+/** Share the overlapping launch probes, not session-bound worker status reads. */
+export function startupBridgeStatus(): Promise<BridgeStatus> | undefined {
+  if (!bridge) return;
+  if (pendingStartupStatus?.current()) return pendingStartupStatus.value;
+  const current = sessionGuard();
+  const value = bridge.status().finally(() => {
+    if (pendingStartupStatus?.value === value) pendingStartupStatus = undefined;
+  });
+  pendingStartupStatus = { value, current };
+  return value;
+}
+
 /**
  * What the helper says about itself, read at startup (before any sign-in) and
  * with every status: its version, whether this window is the primary one, and
@@ -50,9 +64,10 @@ const noteInfo = (s: BridgeStatus) => helperInfo.set({ version: s.version, insta
 
 /** Re-reads helperInfo (e.g. for the local workspace's state). Never throws. */
 export async function refreshHelperInfo(): Promise<void> {
-  if (!bridge) return;
+  const pending = startupBridgeStatus();
+  if (!pending) return;
   try {
-    noteInfo(await bridge.status());
+    noteInfo(await pending);
   } catch {
     helperInfo.set(null);
   }

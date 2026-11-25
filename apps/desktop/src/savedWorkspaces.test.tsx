@@ -29,7 +29,7 @@ function at(origin: string, server: F) {
 }
 
 /** A launcher that hosts the local workspace (carol's, on its own server) or refuses to. */
-function launcher(opts: { refuse?: boolean } = {}) {
+function launcher(opts: { refuse?: boolean; statusDelay?: number } = {}) {
   const log: string[] = [];
   const ok = (body: unknown) => ({ status: 200, headers: { "cache-control": "no-store" }, body });
   const status = () => ({ bridge: 1, version: "test", instance: "primary", kinds: [], session: null, connections: [], local: "stopped" });
@@ -37,7 +37,8 @@ function launcher(opts: { refuse?: boolean } = {}) {
     const path = new URL(req.url).pathname;
     log.push(`${req.method} ${path}`);
     if (header(req as any, "authorization") !== `Bearer ${BRIDGE_TOKEN}`) return { status: 401, body: { error: { code: "unauthorized", message: "Unauthorized." } } };
-    if (path === "/v1/status" || path === "/v1/session") return ok(status());
+    if (path === "/v1/status") return { ...ok(status()), delay: opts.statusDelay ?? 0 };
+    if (path === "/v1/session") return ok(status());
     if (path === "/v1/local-workspace/open") {
       if (opts.refuse) return { status: 503, body: { error: { code: "local_failed", message: "The local server didn't start." } } };
       return ok({ server_url: LOCAL, token: TOKENS.carol });
@@ -46,7 +47,10 @@ function launcher(opts: { refuse?: boolean } = {}) {
   };
   const network: Record<string, (req: Req) => unknown> = {};
   for (const m of ["GET", "POST", "PUT", "DELETE"]) network[`${m} ${BRIDGE}/v1/*`] = handle;
-  return { network, opens: () => log.filter((l) => l === "POST /v1/local-workspace/open").length };
+  return {
+    network, opens: () => log.filter((l) => l === "POST /v1/local-workspace/open").length,
+    statuses: () => log.filter((l) => l === "GET /v1/status").length,
+  };
 }
 
 function servers() {
@@ -384,6 +388,28 @@ test("signing out during remote hydration aborts the old room and never saves it
   await app.press("id:saved-server:srv-b");
   expect(app.value("id:access-token")).toBe("");
   expect(remotePaths(s).filter(p => p === "/v1/me")).toHaveLength(1);
+});
+
+test("manual sign-in wins before the shared startup status resolves", async () => {
+  const s = servers(), bridge = launcher({ statusDelay: 400 });
+  const app = await launch(s, { bridge, manualClock: true, storage: {
+    "metro.savedServers": choices, "metro.serverUrl": REMOTE,
+  } });
+  await app.press("id:startup-choose-manually");
+  await app.waitFor("id:server-url");
+  await app.clear("id:server-url");
+  await app.type("id:server-url", BASE);
+  expect(s.a.state.log).toHaveLength(0);
+  expect(s.b.state.log).toHaveLength(0);
+  await app.type("id:access-token", TOKENS.alice!);
+  await app.press("id:connect");
+  await app.waitFor("id:space:acme", { timeout: 120 });
+  await app.clock!.runFor(450);
+  expect(bridge.statuses()).toBe(1);
+  expect(bridge.opens()).toBe(0);
+  expect(remotePaths(s)).toEqual([]);
+  expect(s.local.state.log).toHaveLength(0);
+  expect(app.shows("id:space:acme")).toBe(true);
 });
 
 async function pickStartup(app: App, id: string) {
