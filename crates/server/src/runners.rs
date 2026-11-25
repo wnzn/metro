@@ -120,10 +120,14 @@ pub enum SpaceRunner {
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Attach {
+    /// The Space is no longer owned by the caller.
+    NoOwnedSpace,
     /// No runner with that id that the caller may attach.
     NoSuchRunner,
     /// The Space has a dedicated token; revoke it first.
     DedicatedPresent,
+    /// The empty-only precondition failed: a registered runner is attached.
+    RegisteredPresent,
     /// Already attached; nothing changed.
     Unchanged(RegisteredRunner),
     /// Attached (replacing any other registered runner); the Space's new generation.
@@ -337,8 +341,45 @@ impl Db {
         runner_id: &str,
         actor: &str,
     ) -> anyhow::Result<Attach> {
+        self.attach_runner_inner(space_id, runner_id, actor, false)
+    }
+
+    /// Attach only while the Space is still owned and has neither kind of runner.
+    pub fn attach_runner_if_empty(
+        &self,
+        space_id: &str,
+        runner_id: &str,
+        actor: &str,
+    ) -> anyhow::Result<Attach> {
+        self.attach_runner_inner(space_id, runner_id, actor, true)
+    }
+
+    fn attach_runner_inner(
+        &self,
+        space_id: &str,
+        runner_id: &str,
+        actor: &str,
+        empty_only: bool,
+    ) -> anyhow::Result<Attach> {
         let mut conn = self.lock();
-        let tx = conn.transaction()?;
+        // Reserve the write before observing either runner assignment, even
+        // if a different SQLite connection is pairing the same Space.
+        let tx = if empty_only {
+            conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?
+        } else {
+            conn.transaction()?
+        };
+        if empty_only {
+            let owned: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM space_members
+                 WHERE space_id = ?1 AND user_id = ?2 AND role = 'owner')",
+                params![space_id, actor],
+                |r| r.get(0),
+            )?;
+            if !owned {
+                return Ok(Attach::NoOwnedSpace);
+            }
+        }
         let runner = tx
             .query_row(
                 &format!("SELECT {RUNNER_COLUMNS} FROM runners WHERE id = ?1"),
@@ -364,6 +405,9 @@ impl Db {
                 |r| r.get(0),
             )
             .optional()?;
+        if empty_only && current.is_some() {
+            return Ok(Attach::RegisteredPresent);
+        }
         if current.as_deref() == Some(runner_id) {
             return Ok(Attach::Unchanged(runner));
         }
@@ -496,7 +540,7 @@ pub async fn list_runners(
     let uid = who.id.clone();
     let runners = api::db(&state, move |db| db.list_runners(&uid)).await?;
     let runners: Vec<_> = runners.iter().map(|r| view(r, &who, &state)).collect();
-    Ok(Json(json!({"runners": runners})))
+    Ok(Json(json!({"runners": runners, "attach_if_empty": true})))
 }
 
 #[derive(Deserialize)]
@@ -616,14 +660,48 @@ pub async fn put_space_runner(
     Path(sid): Path<String>,
     body: JsonBody<AttachBody>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    attach_space_runner(state, who, sid, body, false).await
+}
+
+/// A separate route: a client must never accidentally invoke the replacement
+/// API when talking to a server that doesn't support empty-only attachment.
+pub async fn post_space_runner_if_empty(
+    State(state): State<AppState>,
+    who: Human,
+    Path(sid): Path<String>,
+    body: JsonBody<AttachBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    attach_space_runner(state, who, sid, body, true).await
+}
+
+async fn attach_space_runner(
+    state: AppState,
+    who: Human,
+    sid: String,
+    body: JsonBody<AttachBody>,
+    empty_only: bool,
+) -> ApiResult<Json<serde_json::Value>> {
     let space = owner_of(&state, &sid, &who).await?;
     let Json(body) = body?;
     if crate::config::validate_id(&body.runner_id).is_err() {
         return Err(ApiError::new(StatusCode::NOT_FOUND, NO_RUNNER));
     }
     let (space_id, rid, uid) = (space.id.clone(), body.runner_id, who.id.clone());
-    match api::db(&state, move |db| db.attach_runner(&space_id, &rid, &uid)).await? {
+    match api::db(&state, move |db| {
+        if empty_only {
+            db.attach_runner_if_empty(&space_id, &rid, &uid)
+        } else {
+            db.attach_runner(&space_id, &rid, &uid)
+        }
+    })
+    .await?
+    {
+        Attach::NoOwnedSpace => Err(ApiError::not_found("no such Space")),
         Attach::NoSuchRunner => Err(ApiError::new(StatusCode::NOT_FOUND, NO_RUNNER)),
+        Attach::RegisteredPresent => Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "this Space already has a registered runner; nothing was changed",
+        )),
         Attach::DedicatedPresent => Err(ApiError::new(
             StatusCode::CONFLICT,
             "this Space has a dedicated runner token; revoke it first \

@@ -257,6 +257,22 @@ async fn actions_per_install_kind() {
 }
 
 #[tokio::test]
+async fn source_runner_shows_version_without_a_release_offer() {
+    let s = Server::start().await;
+    s.set_latest("0.5.1");
+    let (id, token) = s.runner(ALICE, "personal").await;
+    let body = json!({"runner": {"version":"0.5.0", "channel":"source", "install":"container", "self_update":true}});
+    s.claim(&token, &body.to_string()).await;
+    let (_, list) = s.get(ALICE, "/v1/runners").await;
+    let r = &list["runners"][0];
+    assert_eq!(r["id"], id);
+    assert_eq!(r["presence"]["version"], "0.5.0");
+    assert_eq!(r["update"]["available"], false);
+    assert_eq!(r["update"]["action"], "none");
+    assert!(r["update"]["container_image"].is_null());
+}
+
+#[tokio::test]
 async fn registered_update_authorization_and_header() {
     let s = Server::start().await;
     s.set_latest("0.5.1");
