@@ -23,6 +23,7 @@ const unavailable = {
 };
 const time = "2026-11-25T00:00:00.000Z";
 const post = `POST ${BASE}/v1/*`;
+const get = `GET ${BASE}/v1/*`;
 const note = (id: number) => `id:addressing-note:${id}`;
 
 function fixture() {
@@ -34,12 +35,19 @@ function fixture() {
   const replies = new Map<string, (event: Event, key: string) => Reply>();
   const denials = new Map<string, Reply>();
   const denied = new Set<string>();
+  const uploads: string[] = [];
   const reply = (text: string, fields: Record<string, unknown>, delay = 0) =>
     replies.set(text, (ev) => ({ status: 202, body: { ...ev, ...fields }, delay }));
   const deny = (text: string, status: 403 | 404, delay: number) =>
     denials.set(text, { status, delay, body: { error: "held send denial" } });
   w.network[post] = req => {
-    const path = new URL(req.url).pathname;
+    const url = new URL(req.url);
+    const path = url.pathname;
+    if (path === "/v1/library/assets") {
+      const name = url.searchParams.get("name") ?? "";
+      uploads.push(name);
+      return { status: 201, body: { id: `asset-${name}`, name, kind: "text", size_bytes: 1, space_id: "side" } };
+    }
     const body = req.body && JSON.parse(req.body);
     if (path.endsWith("/messages") && denials.has(body?.text)) {
       denied.add(body.text);
@@ -52,11 +60,15 @@ function fixture() {
       path.replace("/v1/spaces/", "").replace("/rooms/", "/").replace("/messages", "");
     const event = w.f.state.events.get(key)!.findLast(e => e.kind === "message" && e.text === body.text)!;
     const text = event.text.replace(/^\p{White_Space}+|\p{White_Space}+$/gu, "");
-    Object.assign(event, { actor: "Same display name", actor_id: call.user, text, created_at: time });
+    const mentions = [...(body.mentions ?? [])];
+    if (body.invoke_agent && !mentions.some(m => m.kind === "agent" && m.agent_id === body.agent_id)) {
+      mentions.push(body.agent_id ? { kind: "agent", agent_id: body.agent_id } : { kind: "agent" });
+    }
+    Object.assign(event, { actor: "Same display name", actor_id: call.user, text, mentions, created_at: time });
     sent.set(body.text, event);
     return replies.get(body.text)?.(event, key) ?? answer;
   };
-  return { ...w, reply, replies, deny, denied, sent, messages: () => w.f.posts().filter(p => p.path.endsWith("/messages")) };
+  return { ...w, reply, replies, deny, denied, uploads, sent, messages: () => w.f.posts().filter(p => p.path.endsWith("/messages")) };
 }
 
 async function signIn(app: App, account = "alice") {
@@ -547,4 +559,196 @@ test("a delayed composer denial for a former account cannot clear the replacemen
   await app.clock!.runFor(8_000);
   expect(app.shows(note(id))).toBe(true);
   expect(app.shows("id:action-error")).toBe(false);
+});
+
+for (const probe of ["post-room", "post-space", "poll-space"] as const) {
+  test(`${probe}: a held negative recheck cannot purge newer verified access and its corroborated notice`, async () => {
+    const w = fixture();
+    const oldText = `old ${probe}`;
+    const newText = `new ${probe}`;
+    w.reply(oldText, { addressing_note: pickup });
+    w.reply(newText, { addressing_note: pickup });
+    const base = w.network[get]!;
+    let armed = false;
+    let rechecking = false;
+    let deniedPoll = false;
+    const spaces = w.f.state.spaces.get("side")!;
+    w.network[get] = req => {
+      if (!armed) return base(req);
+      const path = new URL(req.url).pathname;
+      if (probe === "poll-space" && !deniedPoll && path === "/v1/spaces/side/rooms/lobby/events") {
+        deniedPoll = true;
+        spaces.members.delete("alice");
+        return { status: 404, body: { error: "room not visible" } };
+      }
+      const spaceCheck = path === "/v1/spaces" && probe !== "post-room" && (deniedPoll || w.denied.has("held task"));
+      const roomCheck = path === "/v1/spaces/side/rooms" && probe === "post-room" && w.denied.has("held task");
+      if (!rechecking && (spaceCheck || roomCheck)) {
+        rechecking = true;
+        if (spaceCheck) {
+          spaces.members.delete("alice");
+          return { ...(base(req) as object), delay: 6_000 };
+        }
+        return { status: 200, body: { rooms: [] }, delay: 6_000 };
+      }
+      return base(req);
+    };
+    const app = await launch(w);
+    await space(app, "side");
+    await send(app, oldText);
+    await app.waitUntil(() => w.sent.has(oldText));
+    const old = w.sent.get(oldText)!.id;
+    await app.waitFor(note(old));
+    armed = true;
+    if (probe !== "poll-space") {
+      w.deny("held task", 403, 300);
+      await app.press("id:nav-chat");
+      await dispatch(app, "held task");
+    }
+    await app.waitUntil(() => rechecking);
+    spaces.members.add("alice");
+    if (probe !== "poll-space") await space(app, "side");
+    expect(app.shows(note(old))).toBe(false);
+    await send(app, newText);
+    await app.waitUntil(() => w.sent.has(newText));
+    const id = w.sent.get(newText)!.id;
+    await app.waitFor(note(id));
+    await app.clock!.runFor(6_200);
+    expect(app.shows("id:space:side")).toBe(true);
+    expect(app.shows(note(id))).toBe(true);
+    expect(app.shows(note(old))).toBe(false);
+    expect(app.shows("id:action-error")).toBe(false);
+  });
+}
+
+for (const edit of [false, true]) {
+  test(`accepted composer send retires only its draft and files after a concurrent denial (edited: ${edit})`, async () => {
+    const w = fixture();
+    w.deny("dispatch denial", 403, 2_000);
+    w.reply("accepted with a file", { addressing_note: pickup }, 4_500);
+    const app = await launch(w);
+    await dispatch(app, "dispatch denial");
+    await app.waitUntil(() => w.denied.has("dispatch denial"));
+    await space(app, "side");
+    app.onPick(() => [{ name: "posted.txt", type: "text/plain", data: new Uint8Array([65]) }]);
+    await app.press("id:attach");
+    await app.waitFor("id:staged:posted.txt");
+    await send(app, "accepted with a file");
+    await app.waitUntil(() => w.sent.has("accepted with a file"));
+    const id = w.sent.get("accepted with a file")!.id;
+    expect(app.shows("id:staged:posted.txt")).toBe(true);
+    if (edit) {
+      await app.clear("id:composer");
+      await app.type("id:composer", "a later edit");
+      app.onPick(() => [{ name: "later.txt", type: "text/plain", data: new Uint8Array([66]) }]);
+      await app.press("id:attach");
+      await app.waitFor("id:staged:later.txt");
+    }
+    await app.clock!.runFor(5_000);
+    await app.waitFor(`id:event:${id}`);
+    expect(app.shows(note(id))).toBe(false);
+    expect(app.value("id:composer")).toBe(edit ? "a later edit" : "");
+    expect(app.shows("id:staged:posted.txt")).toBe(false);
+    expect(app.shows("id:staged:later.txt")).toBe(edit);
+    expect(w.uploads).toEqual(["posted.txt"]);
+    expect(w.messages().map(p => p.body.asset_ids)).toEqual([["asset-posted.txt"]]);
+  });
+}
+
+test("a classified routing receipt needs matching canonical recipients in the echo and the rendered row", async () => {
+  const w = fixture();
+  const coder = w.agent("acme", { handle: "coder", name: "Coder" });
+  const pick = { kind: "agent", agent_id: coder.id, addressed_by: "classifier" };
+  const cases = [
+    { text: "valid classifier pick", echo: [pick], row: [pick], show: true },
+    { text: "different recipient", echo: [pick], row: [{ ...pick, agent_id: "ag-other" }] },
+    { text: "lost classifier", echo: [pick], row: [{ kind: "agent", agent_id: coder.id }] },
+    { text: "unknown attribution", echo: [pick], row: [{ ...pick, addressed_by: "other" }] },
+    { text: "noncanonical recipient", echo: [{ ...pick, agent_id: ` ${coder.id}` }], row: [{ ...pick, agent_id: ` ${coder.id}` }] },
+    { text: "unaddressed row", echo: [pick], row: [], audience: "room" },
+    { text: "contradictory audience", echo: [pick], row: [pick], audience: "room" },
+    { text: "duplicate recipient", echo: [pick], row: [pick, pick] },
+  ];
+  const app = await launch(w);
+  await space(app);
+  for (const input of cases) {
+    w.replies.set(input.text, ev => {
+      Object.assign(ev, { mentions: input.row, audience: input.audience ?? "agent" });
+      return { status: 202, body: { ...ev, mentions: input.echo, audience: "agent", routing_note: routing } };
+    });
+    await send(app, input.text);
+    await app.waitUntil(() => w.sent.has(input.text) && app.value("id:composer") === "");
+    const id = w.sent.get(input.text)!.id;
+    await app.waitFor(`id:event:${id}`);
+    expect(app.shows(note(id))).toBe(input.show ?? false);
+  }
+  // Even a matching echo and poll cannot override the POST's explicit
+  // generic recipient with a different agent.
+  w.replies.set("explicit generic ask", ev => {
+    Object.assign(ev, { mentions: [{ kind: "agent", agent_id: coder.id }] });
+    return { status: 202, body: { ...ev, routing_note: routing } };
+  });
+  await send(app, "explicit generic ask", "ask-agent");
+  await app.waitUntil(() => w.sent.has("explicit generic ask") && app.value("id:composer") === "");
+  const id = w.sent.get("explicit generic ask")!.id;
+  await app.waitFor(`id:event:${id}`);
+  expect(app.shows(note(id))).toBe(false);
+});
+
+for (const account of ["123", 123] as const) {
+  test(`legacy numeric display IDs still render "you" without granting private identity (${typeof account})`, async () => {
+    const w = fixture();
+    const base = w.network[get]!;
+    w.network[get] = req => new URL(req.url).pathname === "/v1/me"
+      ? { status: 200, body: { id: account } } : base(req);
+    const app = await launch(w);
+    await space(app);
+    for (const rawActor of ["123", 123] as const) {
+      const text = `raw actor ${typeof rawActor}`;
+      w.replies.set(text, ev => {
+        Object.assign(ev, { actor_id: rawActor, created_at: typeof rawActor === "number" ? "2026-11-26T00:00:00.000Z" : time });
+        return { status: 202, body: { ...ev, actor_id: "123", addressing_note: pickup } };
+      });
+      await send(app, text);
+      await app.waitUntil(() => w.sent.has(text) && app.value("id:composer") === "");
+      const id = w.sent.get(text)!.id;
+      await app.waitFor(`id:you:${id}`);
+      expect(app.shows(note(id))).toBe(typeof account === "string" && typeof rawActor === "string");
+    }
+  });
+}
+
+test("oldest uncorroborated receipts are evicted across rooms without starving a new receipt", async () => {
+  const w = fixture();
+  const base = w.network[get]!;
+  const release = new Set<number>();
+  w.network[get] = req => {
+    const url = new URL(req.url);
+    if (url.pathname !== "/v1/spaces/acme/rooms/lobby/events") return base(req);
+    const after = Number(url.searchParams.get("after"));
+    const events = w.f.state.events.get("acme/lobby")!;
+    return { status: 200, body: { events: events.filter((e, i) => e.id > after && (i === 0 || release.has(e.id))) } };
+  };
+  const app = await launch(w);
+  await space(app);
+  for (let i = 0; i < 32; i++) {
+    const text = `idle receipt ${i}`;
+    w.reply(text, { addressing_note: pickup });
+    await send(app, text);
+    await app.waitUntil(() => w.sent.has(text) && app.value("id:composer") === "");
+  }
+  const oldest = w.sent.get("idle receipt 0")!.id;
+  const retained = w.sent.get("idle receipt 31")!.id;
+  expect(app.shows(note(oldest))).toBe(false);
+  await space(app, "side");
+  w.reply("new room receipt", { addressing_note: pickup });
+  await send(app, "new room receipt");
+  await app.waitUntil(() => w.sent.has("new room receipt"));
+  await app.waitFor(note(w.sent.get("new room receipt")!.id));
+  release.add(oldest);
+  release.add(retained);
+  await space(app);
+  await app.waitFor(`id:event:${oldest}`);
+  await app.waitFor(note(retained));
+  expect(app.shows(note(oldest))).toBe(false);
 });

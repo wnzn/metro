@@ -13,7 +13,7 @@ import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
 import type { MentionSend, WireMentionSpan } from "../features/mentions/draft";
 import { readMentionSpans } from "../features/mentions/sent";
-import { canonicalEventTime, readPostedNotes } from "../features/senderNotices/response";
+import { canonicalAddressing, canonicalEventTime, canonicalStableId, readPostedNotes } from "../features/senderNotices/response";
 import type { PostedSenderNotes } from "../features/senderNotices/response";
 
 /** `parentRoomId`: set on a thread an agent delegated from that room. */
@@ -110,7 +110,7 @@ export type Member = { userId: string; role: SpaceRole };
 export type Run = { id: string; spaceId: string; roomId: string; status: string; actor: string; task: string };
 
 /** Who is signed in. `isOrgAdmin`: may create and manage organization runners. */
-export type Me = { id: string; isOrgAdmin: boolean };
+export type Me = { id: string; canonicalId: string | null; isOrgAdmin: boolean };
 
 /** A registered runner the user can see (GET /v1/runners). */
 export type RunnerVisibility = "personal" | "organization";
@@ -505,7 +505,7 @@ export function createClient(options: ClientOptions) {
         throw new ApiError("protocol", "GET /v1/me did not return { id }.");
       }
       // An older server has no organization: nobody is its admin.
-      return { id: String(data.id), isOrgAdmin: data.is_org_admin === true };
+      return { id: String(data.id), canonicalId: canonicalStableId(data.id) ? data.id : null, isOrgAdmin: data.is_org_admin === true };
     },
 
     // ---- registered runners (personal or organization), reusable across Spaces
@@ -1103,10 +1103,10 @@ function isRun(v: unknown): v is { id: string | number; space_id: string | numbe
   );
 }
 
-// Keep the stricter POST-corroboration contract separate from permissive
-// legacy display times, without adding receipt fields to transcript events.
-const canonicalMessageTimes = new WeakSet<RoomEvent>();
-export const hasCanonicalMessageTime = (event: RoomEvent) => canonicalMessageTimes.has(event);
+// Leave legacy rendering alone. Private receipt corroboration additionally
+// requires canonical raw identity, time, and addressing, before coercion.
+const canonicalMessageRows = new WeakSet<RoomEvent>();
+export const isCanonicalMessageRow = (event: RoomEvent) => canonicalMessageRows.has(event);
 
 function toEvent(v: RoomEvent): RoomEvent {
   const raw = v as unknown as Record<string, unknown>;
@@ -1142,7 +1142,8 @@ function toEvent(v: RoomEvent): RoomEvent {
   if (isId(raw.actor_id) && String(raw.actor_id).trim()) event.actorId = String(raw.actor_id);
   const createdAt = toCreatedAt(raw.created_at);
   if (createdAt) event.createdAt = createdAt;
-  if (event.kind === "message" && canonicalEventTime(raw.created_at)) canonicalMessageTimes.add(event);
+  if (event.kind === "message" && canonicalStableId(raw.actor_id) && canonicalEventTime(raw.created_at) &&
+    canonicalAddressing(raw.audience, raw.mentions)) canonicalMessageRows.add(event);
   const attachments = toAttachments(raw.attachments);
   if (attachments.length) event.attachments = attachments;
   return event;

@@ -18,8 +18,8 @@ export type SenderNoticeDetails = {
   addressing: AddressingNote | null;
   routing: RoutingNote | null;
 };
-/** Exact text is held only while waiting for the poll to corroborate a POST. */
-export type PostedSenderNotes = SenderNoticeDetails & { text: string };
+/** Echo evidence is held only while waiting for the poll to corroborate a POST. */
+export type PostedSenderNotes = SenderNoticeDetails & { text: string; recipientsKey: string };
 
 type SendIntent =
   | { kind: "chat"; text: string }
@@ -40,6 +40,61 @@ const isRecord = (v: unknown): v is Record<string, unknown> =>
   !!v && typeof v === "object" && !Array.isArray(v);
 const isOneOf = <T extends string>(values: readonly T[], value: unknown): value is T =>
   typeof value === "string" && (values as readonly string[]).includes(value);
+
+/** Never derive private identity by coercing the legacy display value. */
+export function canonicalStableId(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 256 && value === value.trim() &&
+    !/[\u0000-\u001f\u007f-\u009f\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/.test(value);
+}
+
+type Recipient = readonly ["user", string] | readonly ["agent", string | null, "classifier" | "schedule" | null];
+const identityOf = (r: Recipient) => JSON.stringify([r[0], r[1]]);
+const recipientsKey = (recipients: readonly Recipient[]) => JSON.stringify(recipients);
+
+/** Validate the complete modern wire address, without using legacy renderer normalization. */
+export function canonicalAddressing(audience: unknown, raw: unknown): Recipient[] | null {
+  if (!Array.isArray(raw) || raw.length > 32) return null;
+  const recipients: Recipient[] = [];
+  const seen = new Set<string>();
+  for (const m of raw) {
+    if (!isRecord(m)) return null;
+    let r: Recipient;
+    if (m.kind === "user" && canonicalStableId(m.id) && !("agent_id" in m) && !("addressed_by" in m)) {
+      r = ["user", m.id];
+    } else if (m.kind === "agent" && !("id" in m)) {
+      const id = "agent_id" in m ? m.agent_id : null;
+      const by = "addressed_by" in m ? m.addressed_by : null;
+      if (("agent_id" in m && !canonicalStableId(id)) ||
+        ("addressed_by" in m && (!(by === "classifier" || by === "schedule") || !canonicalStableId(id)))) return null;
+      r = ["agent", id as string | null, by as "classifier" | "schedule" | null];
+    } else return null;
+    const identity = identityOf(r);
+    if (seen.has(identity)) return null;
+    seen.add(identity);
+    recipients.push(r);
+  }
+  const people = recipients.some(r => r[0] === "user");
+  const agents = recipients.some(r => r[0] === "agent");
+  return audience === (agents ? (people ? "mixed" : "agent") : (people ? "users" : "room")) ? recipients : null;
+}
+
+type RenderedRecipient = { kind: "user"; id: string } |
+  { kind: "agent"; agentId?: string; addressedBy?: "classifier" | "schedule" };
+
+/** Only called for a row whose original wire fields passed canonicalAddressing. */
+export function renderedRecipientsKey(mentions: readonly RenderedRecipient[] = []): string {
+  return recipientsKey(mentions.map(m => m.kind === "user" ? ["user", m.id] :
+    ["agent", m.agentId ?? null, m.addressedBy ?? null]));
+}
+
+function submittedRecipients(sent: SendIntent): Recipient[] {
+  if (sent.kind === "chat") return [["agent", null, null]];
+  const unique = new Map<string, Recipient>();
+  const add = (r: Recipient) => unique.set(identityOf(r), r);
+  for (const r of sent.mentions ?? []) add(r.kind === "user" ? ["user", r.id] : ["agent", r.agent_id ?? null, null]);
+  if (sent.invoke_agent) add(["agent", sent.agent_id ?? null, null]);
+  return [...unique.values()];
+}
 
 // Plain text only; do not interpret links, markup, or control/directional characters.
 function readMessage(value: unknown) {
@@ -100,28 +155,29 @@ export function readPostedNotes(data: unknown, sent: SendIntent): PostedSenderNo
   // Mirror Rust str::trim (Unicode White_Space) for correlation only; never
   // change the POST body, whose mention spans index the original UTF-8 text.
   if (kind !== "message" || typeof id !== "number" || !Number.isSafeInteger(id) || id <= 0 ||
-    typeof actor !== "string" || typeof actor_id !== "string" || !actor_id.trim() || !createdAt ||
+    typeof actor !== "string" || !canonicalStableId(actor_id) || !createdAt ||
     typeof text !== "string" || text.length > 16_000 || text !== canonicalSentText(sent.text)) return null;
   const addressing = sent.kind === "space" ? addressingNote(data.addressing_note) : null;
   const routing = routingNote(data.routing_note);
-  if (data.routing_note != null && !routing) return null;
+  if ((!addressing && !routing) || (data.routing_note != null && !routing)) return null;
+  const echoed = canonicalAddressing(data.audience, data.mentions);
+  if (!echoed) return null;
+  const expected = submittedRecipients(sent);
+  const key = recipientsKey(echoed);
+  const explicitMatch = recipientsKey(expected) === key;
   if (sent.kind === "space") {
     if (data.addressing_note != null && !addressing) return null;
-    const recipients = sent.mentions ?? [];
-    const unaddressed = !sent.invoke_agent && !recipients.length;
-    const generic = (sent.invoke_agent && !sent.agent_id) || recipients.some(m => m.kind === "agent" && !m.agent_id);
-    const named = (sent.invoke_agent && !!sent.agent_id) || recipients.some(m => m.kind === "agent" && !!m.agent_id);
+    const unaddressed = expected.length === 0;
+    const generic = expected.some(m => m[0] === "agent" && m[1] === null);
+    const named = expected.some(m => m[0] === "agent" && m[1] !== null);
     if (addressing?.kind === "classification_failed" &&
-      (!unaddressed || !text || routing || (Array.isArray(data.mentions) && data.mentions.length > 0))) return null;
+      (!unaddressed || !text || routing || !explicitMatch)) return null;
     if (addressing?.kind === "generic_agent_unavailable" && (!generic || (routing && !named))) return null;
-    if (routing && !generic && !named) {
-      // An unaddressed message can reach routing only if classification
-      // succeeded, in which case the stored event names the classifier's pick.
-      if (!unaddressed || !text || !Array.isArray(data.mentions) || data.mentions.length !== 1) return null;
-      const [pick] = data.mentions;
-      if (!isRecord(pick) || pick.kind !== "agent" || pick.addressed_by !== "classifier" ||
-        typeof pick.agent_id !== "string" || !pick.agent_id.trim()) return null;
-    }
-  }
-  return addressing || routing ? { eventId: id, senderId: actor_id, createdAt, text, addressing, routing } : null;
+    // Classification is the only valid rewrite of explicit no-recipient
+    // addressing. It must name a single agent picked by the classifier.
+    const classified = unaddressed && !!text && echoed.length === 1 && echoed[0]?.[0] === "agent" && echoed[0][2] === "classifier";
+    if (!explicitMatch && !(routing && !addressing && classified)) return null;
+    if (routing && !generic && !named && !classified) return null;
+  } else if (!explicitMatch) return null;
+  return { eventId: id, senderId: actor_id, createdAt, text, recipientsKey: key, addressing, routing };
 }
