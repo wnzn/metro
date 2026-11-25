@@ -73,7 +73,7 @@ export type View = "room";
  * outside every Space), or Settings, which opens as a modal over whichever of
  * those is underneath.
  */
-export type Place = "chat" | "space" | "settings" | "search" | "library" | "pages" | "schedules";
+export type Place = "chat" | "space" | "settings" | "search" | "library" | "pages" | "schedules" | "dm";
 /** Where the main panel is under any modal: never Settings. */
 export type MainPlace = Exclude<Place, "settings">;
 /** The pages of Settings. Reachable with or without any Space. */
@@ -146,6 +146,7 @@ const replySelections = signal<Record<string, { event: RoomEvent; muted: boolean
 const composerRoomId = () => replyPane()?.roomId ?? activeRoomId();
 const activeScope = computed(() => {
   if (basePlace() === "chat") return CHAT;
+  if (basePlace() === "dm") return "";
   const sid = activeSpaceId();
   const rid = composerRoomId();
   return sid && rid ? scopeKey(sid, rid) : "";
@@ -446,12 +447,12 @@ function observeChatAvailability(request: number, problem: string | null) {
 
 // Other state modules (src/settings.ts) hook into the session's lifecycle
 // here instead of this module importing them.
-const transientClearers: (() => void)[] = [];
+const transientClearers: ((keepReply: boolean) => void)[] = [];
 const sessionEnders: (() => void)[] = [];
 const spacePurgers: ((spaceId: string) => void)[] = [];
 const manageOpeners: ((spaceId: string, section: "members" | "runner") => void)[] = [];
-/** Called whenever the place, Space, room or view changes: drop anything shown once. */
-export function onTransientClear(fn: () => void) {
+/** Drop transient UI on navigation. An overlay may keep the conversation underneath. */
+export function onTransientClear(fn: (keepReply: boolean) => void) {
   transientClearers.push(fn);
 }
 /** Called when the session ends (disconnect, 401): drop everything of the session. */
@@ -687,9 +688,12 @@ export function openChat() {
 }
 
 /** Open a destination outside a Space. Explicit sub-route moves also supersede old navigation intents. */
-export function openPlace(where: "search" | "library" | "pages" | "schedules", { subrouteChanged = false } = {}) {
+export function openPlace(where: "search" | "library" | "pages" | "schedules" | "dm", { subrouteChanged = false } = {}) {
   if (basePlace() === where && !settingsOpen()) {
-    if (subrouteChanged) navigationGeneration++;
+    if (subrouteChanged) {
+      navigationGeneration++;
+      if (where === "dm") clearTransient();
+    }
     return;
   }
   navigationGeneration++;
@@ -2321,7 +2325,7 @@ function clearTransient(keepReply = false) {
     openingReply.set(false);
   }
   focusTarget.set(null);
-  for (const fn of transientClearers) fn();
+  for (const fn of transientClearers) fn(keepReply);
 }
 
 // Drafts are per place: each room or thread, and the personal Chat, keeps its
@@ -2468,6 +2472,8 @@ async function tick(sess: number) {
     if (basePlace() === "chat") {
       if (Date.now() >= chatProbeAfter) await pollChat();
       if (sess === session && Date.now() - lastRunsRefresh >= RUNS_REFRESH_MS) await refreshRuns();
+    } else if (basePlace() === "dm") {
+      await dmPoll?.();
     } else if (basePlace() === "space") {
       const sid = activeSpaceId();
       const rid = activeRoomId();
@@ -2513,6 +2519,10 @@ async function tick(sess: number) {
     }
   }
 }
+
+let dmPoll: (() => Promise<void>) | undefined;
+export function registerDmPoll(poll: () => Promise<void>) { dmPoll = poll; }
+export function requestDmPoll() { kick(); }
 
 /** Returns the delay before the next tick, or null when the session ended. */
 async function handleLoopError(error: unknown): Promise<number | null> {

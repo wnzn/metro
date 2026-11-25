@@ -142,7 +142,7 @@ test("an access denial closes the narrow thread immediately; resizing chooses th
   expect(sends.length).toBe(0);
 });
 
-test("legacy messages still render and Forward opens only the stub; modern attribution and no-reply activity are visible", async () => {
+test("legacy messages still render and cancelling Forward sends nothing; modern attribution and no-reply activity are visible", async () => {
   const { app, f } = await fixture();
   const old = f.state.events.get("acme/lobby")![0]!;
   expect(app.shows(`id:via-metro:${old.id}`)).toBe(false);
@@ -175,7 +175,7 @@ test("focused message rows support R for reply and F for forward", async () => {
   await app.waitFor("id:forward-dialog");
   await app.keyboard.press("escape");
   await app.waitFor("id:forward-dialog", { state: "gone" });
-  await focusRow();
+  await app.wait(50); // Focus returns after the dialog leaves the host's focus stack.
   await app.keyboard.press("r");
   await app.waitFor(`id:anchor:${anchor.id}`);
 });

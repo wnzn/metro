@@ -416,10 +416,13 @@ export function NavItem(
     label: string;
     selected: boolean;
     onPress: () => void;
+    disabled?: boolean;
     /** A short glyph before the label ("#", "›"). Ignored when `icon` or `tile` is set. */
     prefix?: string;
     /** An icon of the app's family before the label, in place of `prefix`. */
     icon?: IconName;
+    /** A small avatar in place of an icon or tile. */
+    avatar?: JSX.Element;
     /** A rounded letter tile before the label (a Space), its color fixed by `seed`. */
     tile?: { initial: string; seed: string };
     /** A chevron at the end: the row opens a group (a Space's rooms). */
@@ -438,7 +441,7 @@ export function NavItem(
      * shows on hover and keyboard focus (always on touch screens), and the
      * same items on a secondary click of the row.
      */
-    menu?: { items: readonly ActionsMenuItem[]; accessibilityLabel: string; testID?: string };
+    menu?: { items: readonly ActionsMenuItem[]; accessibilityLabel: string; testID?: string; ref?: (node: ViewRef) => void };
   },
 ) {
   const row = (
@@ -449,10 +452,12 @@ export function NavItem(
         props.menu ? "pr-[40px]" : "pr-(--space-3)",
         focusRing,
         transitionClass,
+        disabledClass,
         indentClass[Math.min(props.depth ?? 0, indentClass.length - 1)],
         props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-hover active:bg-sidebar-hover",
       )}
       selected={props.selected}
+      disabled={props.disabled}
       onPress={props.onPress}
       testID={props.testID}
       accessibilityLabel={(props.accessibilityLabel ?? props.label) + (props.dot ? `, ${props.dot}` : "")}
@@ -462,7 +467,7 @@ export function NavItem(
         <View class="absolute left-0 top-[9px] bottom-[9px] w-[3px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
       </If>
       <View class="w-[20px] shrink-0 items-center justify-center" accessibilityElementsHidden>
-        <If
+        <If when={props.avatar} else={<If
           when={props.tile}
           else={
             <If
@@ -478,7 +483,7 @@ export function NavItem(
           }
         >
           {(t) => <SpaceTile initial={t().initial} seed={t().seed} />}
-        </If>
+        </If>}>{props.avatar}</If>
       </View>
       <Text
         class={cx(
@@ -539,6 +544,7 @@ export function NavItem(
                     transitionClass,
                   )}
                   testID={menu().testID}
+                  ref={menu().ref}
                   accessibilityLabel={menu().accessibilityLabel}
                   tooltip={<Text class={tooltipClass}>More</Text>}
                 >
@@ -577,7 +583,7 @@ export function NavGroup(props: Testable & { children?: JSX.Element }) {
 export function SectionHeader(
   props: Testable & {
     label: string;
-    action?: { icon: IconName; label: string; tooltip?: string; onPress: () => void; testID?: string; shown?: boolean };
+    action?: { icon: IconName; label: string; tooltip?: string; onPress: () => void; testID?: string; shown?: boolean; ref?: (node: ViewRef) => void };
   },
 ) {
   return (
@@ -596,6 +602,7 @@ export function SectionHeader(
             )}
             onPress={a().onPress}
             testID={a().testID}
+            ref={a().ref}
             accessibilityLabel={a().label}
             tooltip={<Text class={tooltipClass}>{a().tooltip ?? a().label}</Text>}
           >

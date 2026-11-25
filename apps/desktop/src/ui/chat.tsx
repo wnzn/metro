@@ -178,6 +178,7 @@ export function MessageFrame(
     continued?: boolean;
     selectable?: boolean;
     shortcuts?: Record<string, () => void>;
+    viewRef?: (node: ViewRef) => void;
     children?: JSX.Element;
   },
 ) {
@@ -195,6 +196,7 @@ export function MessageFrame(
         hasShortcuts() && focusRingClass,
       )}
       testID={props.testID}
+      ref={props.viewRef}
       accessibilityLabel={props.accessibilityLabel}
       focusable={hasShortcuts()}
       onFocus={() => focused.set(true)}

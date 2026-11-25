@@ -1,13 +1,10 @@
 import { signal } from "nsh";
 import type { ViewRef } from "nsh";
-import { mainPlace, onTransientClear, sessionGuard } from "../../store";
+import { mainPlace, onTransientClear, startupReadGuard } from "../../store";
 import type { RoomEvent } from "../../store";
+import type { ForwardSource } from "../../api/dms";
 
 /** Exact source for POST /v1/forward, plus the local preview. Never send preview data to the server. */
-export type ForwardSource =
-  | { kind: "space"; space_id: string; room_id: string; event_id: number }
-  | { kind: "chat"; event_id: number }
-  | { kind: "dm"; dm_id: string; event_id: number };
 export const forwardSelection = signal<{
   source: ForwardSource; event: RoomEvent; current: () => boolean; opener?: ViewRef;
 } | null>(null);
@@ -15,14 +12,18 @@ export const forwardSelection = signal<{
 export function openForward(source: ForwardSource, event: RoomEvent, opener?: ViewRef, sourceVisible = () => true) {
   if ((event.kind !== "message" && event.kind !== "agent") || event.id !== source.event_id) return;
   const route = mainPlace();
-  const valid = sessionGuard(source.kind === "space" ? source.space_id : undefined);
+  const valid = startupReadGuard(source.kind === "space" ? source.space_id : undefined);
   forwardSelection.set({ source, event, opener, current: () => valid() && mainPlace() === route && sourceVisible() });
 }
 
 export function closeForward() {
   const selection = forwardSelection();
+  if (!selection) return;
   forwardSelection.set(null);
-  if (selection?.current()) queueMicrotask(() => selection.opener?.focus());
+  // Wait for the host to take the modal off the focus stack.
+  requestAnimationFrame(() => {
+    if (selection.current() && !forwardSelection()) selection.opener?.focus();
+  });
 }
 
 onTransientClear(() => forwardSelection.set(null));

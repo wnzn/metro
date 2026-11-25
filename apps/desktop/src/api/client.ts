@@ -3,6 +3,8 @@
 // decide between retrying, stopping, and what to tell the user.
 
 import { discoveryApi } from "./discovery";
+import { directoryApi } from "./directory";
+import { dmsApi } from "./dms";
 import { libraryApi } from "./library";
 import { monitoringApi } from "./monitoring";
 import { pagesApi } from "./pages";
@@ -438,6 +440,7 @@ export function createClient(options: ClientOptions) {
       });
       checkCancelled();
       const errorDetails = path.startsWith("/v1/pages") ? "pages"
+        : path === "/v1/forward" ? "forward"
         : method === "PATCH" && /^\/v1\/providers\/[^/]+$/.test(path) && isObject(body) && "base_url" in body ? "endpoint"
         : /^\/v1\/library\/(?:settings|index|search)\/selection$/.test(path) ? "library" : undefined;
       await checkStatus(response, method, path, errorDetails);
@@ -560,6 +563,8 @@ export function createClient(options: ClientOptions) {
 
   return {
     baseUrl: options.baseUrl,
+    ...directoryApi(request),
+    ...dmsApi(request),
     // Search and scheduled prompts (src/api/discovery.ts), on the same transport.
     ...discoveryApi(request),
     // Documents & media (src/api/library.ts): JSON on `request`, bytes on `binary`.
@@ -832,8 +837,8 @@ export function createClient(options: ClientOptions) {
       return { token: data.token, revision: data.assignment_revision };
     },
 
-    async listRooms(spaceId: string): Promise<Room[]> {
-      const data = await request("GET", `${sp(spaceId)}/rooms`);
+    async listRooms(spaceId: string, topLevelOnly = false, signal?: AbortSignal): Promise<Room[]> {
+      const data = await request("GET", `${sp(spaceId)}/rooms${topLevelOnly ? "?top_level_only=true" : ""}`, undefined, signal);
       const rooms = isObject(data) ? data.rooms : undefined;
       if (!Array.isArray(rooms)) throw new ApiError("protocol", "GET …/rooms did not return { rooms: [...] }.");
       return rooms.filter(isRoom).map(toRoom);
@@ -1490,9 +1495,15 @@ function endpointRefusal(data: unknown, status: number): EndpointPatchError | nu
 }
 
 /** Maps a non-2xx response to its ApiError. */
-async function checkStatus(response: Response, method: string, path: string, errorDetails?: "pages" | "endpoint" | "library"): Promise<void> {
+async function checkStatus(response: Response, method: string, path: string, errorDetails?: "pages" | "endpoint" | "library" | "forward"): Promise<void> {
   if (response.status === 401) {
     throw new ApiError("auth", "The server rejected the access token (HTTP 401). Check the token and connect again.", 401);
+  }
+  if (errorDetails === "forward" && response.status === 404) {
+    const body: unknown = await response.json().catch(() => undefined);
+    const code = isObject(body) ? body.code : undefined;
+    throw new ApiError("not_found", "Forwarding is unavailable.", 404,
+      code === "forward_source_not_found" || code === "forward_destination_not_found" ? { code } : undefined);
   }
   if (errorDetails === "endpoint" && !response.ok) {
     const data: unknown = await response.json().catch(() => undefined);
