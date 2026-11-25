@@ -85,6 +85,7 @@ test("Pages navigation, scoped list, pins and Space template creation", async ()
   await app.press("id:new-page-templates");
   await app.press("id:page-template");
   await app.press("id:page-template:files");
+  expect(app.shows("id:page-template-room")).toBe(false);
   await app.press("id:create-page-template");
   await app.waitFor("text:Recent files");
   expect(f.calls("", "POST").map(r => r.body)).toEqual([{ scope: "space", space_id: "acme", template: "files" }]);
@@ -97,13 +98,66 @@ test("Routine Space sync preserves the template and explicit room picked in a sh
   await app.press("id:nav-pages");
   await app.press("id:new-page");
   await chooseTeamScope(app);
-  await pickFilesTemplate(app);
+  await app.press("id:new-page-templates");
+  await app.press("id:page-template");
+  await app.press("id:page-template:release-watch");
   await app.press("id:page-template-room");
+  expect(app.shows("text:First room")).toBe(false);
   await app.press("text:Releases");
   await refreshMembership(app, f);
   await app.press("id:create-page-template");
-  await app.waitFor("text:Recent files");
-  expect(f.calls("", "POST")[0]?.body).toEqual({ scope: "space", space_id: "acme", template: "files", room: "Releases" });
+  await app.waitFor("text:Fixture page");
+  expect(f.calls("", "POST")[0]?.body).toEqual({ scope: "space", space_id: "acme", template: "release-watch", room: "Releases", room_id: "releases" });
+});
+
+test("Pages home can resume and discard a draft after restarting", async () => {
+  const f = pagesFixture();
+  const first = await start(f);
+  await first.press("id:nav-pages");
+  await first.press("id:new-page");
+  await first.type("id:page-prompt", "Private restart fixture");
+  await first.press("id:page-generate");
+  await first.waitFor("id:page-draft-view");
+  const id = "pgd_1";
+  const previous = f.calls(`/drafts/${id}`).length;
+
+  // A fresh NSH app has no route or in-memory handles from the first app.
+  const restarted = await start(f);
+  await restarted.press("id:nav-pages");
+  await restarted.waitFor(`id:continue-page-draft:${id}`);
+  expect(restarted.shows("text:New page · Personal")).toBe(true);
+  expect(text(restarted)).not.toContain("Private restart fixture");
+  expect(f.calls(`/drafts/${id}`)).toHaveLength(previous);
+  await restarted.press(`id:continue-page-draft:${id}`);
+  await restarted.waitFor("id:page-draft-view");
+  await restarted.waitFor("id:page-apply");
+  expect(f.calls(`/drafts/${id}`).length).toBeGreaterThan(previous);
+  await restarted.press("id:nav-pages");
+  await restarted.waitFor(`id:discard-listed-draft:${id}`);
+  await restarted.press(`id:discard-listed-draft:${id}`);
+  await restarted.press("id:discard-listed-draft-confirm");
+  await restarted.waitFor(`id:continue-page-draft:${id}`, { state: "gone" });
+  expect(f.calls(`/drafts/${id}`, "DELETE")).toHaveLength(1);
+  await restarted.press("id:pages-reload");
+  await restarted.waitUntil(() => f.calls("/drafts").length >= 3);
+  expect(restarted.shows(`id:continue-page-draft:${id}`)).toBe(false);
+});
+
+test("Pages home lists a Space edit draft only for its author while they have access", async () => {
+  const f = pagesFixture();
+  f.propose("alice");
+  const alice = await start(f);
+  await alice.press("id:nav-pages");
+  await alice.waitFor(`id:continue-page-draft:${DRAFT}`);
+  expect(alice.shows("text:Team dashboard · Acme")).toBe(true);
+  const bob = await start(f, "bob");
+  await bob.press("id:nav-pages");
+  await bob.waitFor(`id:open-page:${TEAM}`);
+  await bob.waitUntil(() => f.calls("/drafts").some(r => r.user === "bob"));
+  expect(bob.shows(`id:continue-page-draft:${DRAFT}`)).toBe(false);
+  f.f.state.spaces.get("acme")!.members.delete("alice");
+  await refreshMembership(alice, f);
+  await alice.waitFor(`id:continue-page-draft:${DRAFT}`, { state: "gone" });
 });
 
 async function spaceModelForm(f: Fixture) {
