@@ -106,6 +106,21 @@ function serial<T>(job: () => Promise<T>): Promise<T> {
   return next;
 }
 
+/** Web routes use the helper's current binding, not an account in the request.
+ * Keep them ordered with bind/unbind, and reject queued work after a change. */
+export function withWebSearchBridge<T>(server: string, account: string, job: (b: Bridge) => Promise<T>): Promise<T> {
+  const current = sessionGuard();
+  return serial(() => {
+    const h = helper();
+    const bound = h.phase === "ready" ? h.status.session : null;
+    if (!current() || !bridge || !bound || bound.accountId !== account ||
+        bound.serverUrl.replace(/\/+$/, "") !== server.replace(/\/+$/, "")) {
+      throw new BridgeError("no_session", "This window isn't serving the selected account and server.");
+    }
+    return job(bridge);
+  });
+}
+
 function message(error: unknown, what: string): string {
   if (error instanceof BridgeError) return error.message;
   return what;

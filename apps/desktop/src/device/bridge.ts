@@ -11,6 +11,9 @@
 import { parseMonitoringEvents } from "../api/monitoring";
 import type { MonitoringList } from "../api/monitoring";
 import type { BridgeEndpoint } from "./env";
+import type { WebProvider } from "../api/webSearch";
+import { parseLocalWebSearch, parseWebProvider } from "./webSearch";
+import type { LocalWebSearch, WebProviderRow, WebUpdate } from "./webSearch";
 
 export type DeviceKind =
   | "device-openai-oauth"
@@ -183,6 +186,13 @@ export type Bridge = {
    * first. An older helper answers 404: callers show that as unsupported.
    */
   monitoringEvents(): Promise<MonitoringList>;
+  webSearch(): Promise<LocalWebSearch>;
+  updateWebSearch(update: WebUpdate): Promise<LocalWebSearch>;
+  setWebSearchKey(id: WebProvider, key: string): Promise<WebProviderRow>;
+  removeWebSearchKey(id: WebProvider): Promise<WebProviderRow>;
+  resetWebSearchKeys(): Promise<LocalWebSearch>;
+  testWebSearchProvider(id: WebProvider): Promise<WebProviderRow>;
+  clearWebSearchCooldown(id: WebProvider): Promise<WebProviderRow>;
 };
 
 type Method = "GET" | "POST" | "PUT" | "DELETE";
@@ -191,7 +201,7 @@ type Method = "GET" | "POST" | "PUT" | "DELETE";
 const DEADLINE_MS = 30_000;
 
 export function createBridge(endpoint: BridgeEndpoint): Bridge {
-  async function call(method: Method, path: string, body?: unknown, deadline = DEADLINE_MS): Promise<unknown> {
+  async function call(method: Method, path: string, body?: unknown, deadline = DEADLINE_MS, fixedErrors = false): Promise<unknown> {
     let response: Response;
     try {
       response = await fetch(endpoint.url + path, {
@@ -224,7 +234,7 @@ export function createBridge(endpoint: BridgeEndpoint): Bridge {
     if (!response.ok) {
       const e = isObj(data) && isObj(data.error) ? data.error : null;
       const code = (e && str(e.code)) || (response.status === 401 ? "unauthorized" : "protocol");
-      const message = (e && str(e.message)) || `Metro's device helper refused the request (HTTP ${response.status}).`;
+      const message = (!fixedErrors && e && str(e.message)) || `Metro's device helper refused the request (HTTP ${response.status}).`;
       throw new BridgeError(code, scrub(message), response.status);
     }
     return data;
@@ -232,6 +242,18 @@ export function createBridge(endpoint: BridgeEndpoint): Bridge {
 
   const seg = (id: string) => `/v1/connections/${encodeURIComponent(id)}`;
   const conn = async (p: Promise<unknown>) => parseConnection(await p);
+  const webPath = "/v1/web-search";
+  const webCall = (method: Method, path = "", body?: unknown) => call(method, webPath + path, body, DEADLINE_MS, true);
+  const webState = async (p: Promise<unknown>) => {
+    const state = parseLocalWebSearch(await p);
+    if (!state) throw new BridgeError("protocol", "Metro's helper sent unreadable web search settings.");
+    return state;
+  };
+  const webProvider = async (id: WebProvider, method: Method, action: string, body?: unknown) => {
+    const row = parseWebProvider(await webCall(method, `/providers/${encodeURIComponent(id)}/${action}`, body));
+    if (row?.id !== id || (action === "test" && !row.test)) throw new BridgeError("protocol", "Metro's helper sent an unreadable web search provider.");
+    return row;
+  };
 
   return {
     status: async () => parseStatus(await call("GET", "/v1/status", undefined, 10_000)),
@@ -265,5 +287,12 @@ export function createBridge(endpoint: BridgeEndpoint): Bridge {
       if (!list) throw new BridgeError("protocol", "Metro's device helper sent monitoring events this app doesn't understand.");
       return list;
     },
+    webSearch: () => webState(webCall("GET")),
+    updateWebSearch: (update) => webState(webCall("PUT", "", update)),
+    setWebSearchKey: (id, key) => webProvider(id, "PUT", "key", { api_key: key }),
+    removeWebSearchKey: (id) => webProvider(id, "DELETE", "key"),
+    resetWebSearchKeys: () => webState(webCall("POST", "/keys/reset", {})),
+    testWebSearchProvider: (id) => webProvider(id, "POST", "test", {}),
+    clearWebSearchCooldown: (id) => webProvider(id, "POST", "clear-cooldown", {}),
   };
 }

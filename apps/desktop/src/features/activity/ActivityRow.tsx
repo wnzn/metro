@@ -17,7 +17,9 @@
 
 import { Clipboard, announce, signal } from "nsh";
 import type { JSX } from "nsh";
-import { isActiveRun, runBusy, runs, stopRun } from "../../store";
+import { isActiveRun, mainPlace, me, runBusy, runs, stopRun } from "../../store";
+import { webSearchSettingsAction } from "../../webSearch";
+import { WEB_PROVIDERS } from "../../api/webSearch";
 import { Action, Badge, Column, Label, Row } from "../../ui";
 import { AgentMark, CodeOutput, DisclosureToggle, SummaryParts, ThinkingIndicator, TimelineEntry } from "../../ui/activity";
 import { stepPhase } from "./classify";
@@ -26,6 +28,7 @@ import { failureText } from "./failure";
 import type { ActivityGroup, Step, TimelineItem } from "./group";
 import { groupAccessibleLabel, liveTitle, groupOutcomeText, routeText, summaryParts, timeline } from "./group";
 import { FOLD_LINES, outputView } from "./output";
+import { webAttemptRows, webFailureText } from "./web";
 
 export function ActivityGroupRow(props: {
   group: ActivityGroup;
@@ -66,6 +69,15 @@ export function ActivityGroupRow(props: {
   };
   const label = () => groupAccessibleLabel(g(), name());
   const mark = () => (g().source === "agent" ? <AgentMark picture={props.agentAvatar} /> : undefined);
+  // Personal Chat is private; in Spaces only the run registry identifies
+  // the starter. Never guess from display names or nearby messages.
+  const own = () => {
+    const user = me();
+    const activityId = g().activityId;
+    return !!user && !!activityId && (mainPlace() === "chat" && activityId.startsWith("chat_") ||
+      runs().some((run) => run.id === activityId && run.actor === user));
+  };
+  const webFailure = () => g().steps.find((s) => s.activity.web?.note.failure)?.activity.web;
   return (
     <Column gap={2} padY={1} testID={`activity:${id()}`}>
       <Row align="center" gap={2}>
@@ -116,6 +128,11 @@ export function ActivityGroupRow(props: {
           )}
         </If>
       </Row>
+      <If when={expanded() ? null : webFailure()}>
+        {(f) => <Label variant="caption" color="danger" testID={`activity-web-failure:${id()}`}>
+          {webFailureText(f().note, own(), f().offlineOwner)}
+        </Label>}
+      </If>
       <If when={hasDetails() && expanded()}>
         <Column gap={0} selectable testID={`activity-details:${id()}`}>
           <If when={g().pick}>
@@ -137,7 +154,7 @@ export function ActivityGroupRow(props: {
             )}
           </If>
           <Each of={timeline(g())} key={(item) => item.key}>
-            {(item, index) => <TimelineView groupKey={id()} item={item()} last={index() === timeline(g()).length - 1} />}
+            {(item, index) => <TimelineView groupKey={id()} item={item()} own={own()} last={index() === timeline(g()).length - 1} />}
           </Each>
         </Column>
       </If>
@@ -145,17 +162,17 @@ export function ActivityGroupRow(props: {
   );
 }
 
-function TimelineView(props: { groupKey: string; item: TimelineItem; last: boolean }) {
+function TimelineView(props: { groupKey: string; item: TimelineItem; last: boolean; own: boolean }) {
   const as = <T extends TimelineItem["type"]>(type: T) => (props.item.type === type ? (props.item as Extract<TimelineItem, { type: T }>) : null);
   return (
     <If when={as("tool")} else={<If when={as("thought")} else={<NoteView groupKey={props.groupKey} step={(props.item as Extract<TimelineItem, { type: "note" }>).step} last={props.last} />}>{(t) => <ThoughtView groupKey={props.groupKey} step={t().step} last={props.last} />}</If>}>
-      {(t) => <ToolView groupKey={props.groupKey} item={t()} last={props.last} />}
+      {(t) => <ToolView groupKey={props.groupKey} item={t()} last={props.last} own={props.own} />}
     </If>
   );
 }
 
 /** A tool call: its name and short arguments, then its output (or failure) in a bounded code view. */
-function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type: "tool" }>; last: boolean }) {
+function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type: "tool" }>; last: boolean; own: boolean }) {
   const first = () => (props.item.call ?? props.item.result)!;
   const phase = () => (props.item.failed ? "failed" : props.item.result ? "complete" : "called");
   const stateKey = (s: Step) => disclosureKey(disclosureScope(), props.groupKey, `all:${s.eventId}`);
@@ -166,6 +183,7 @@ function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type:
       last={props.last}
       testID={`activity-step:${first().eventId}`}
     >
+      <If when={first().activity.web} else={<>
       <Row align="center" gap={2} wrap>
         <Label variant="strong">{props.item.name}</Label>
         <If when={props.item.args}>
@@ -193,7 +211,55 @@ function ToolView(props: { groupKey: string; item: Extract<TimelineItem, { type:
       <If when={!props.item.call && props.item.result && props.item.result.activity.details.length > 0 ? props.item.result : null}>
         {(r) => <StepOutput text={r().activity.details} stateKey={stateKey(r())} testID={`activity-output:${r().eventId}`} />}
       </If>
+      </>}>
+        <WebToolView item={props.item} own={props.own} groupKey={props.groupKey} />
+      </If>
     </TimelineEntry>
+  );
+}
+
+function WebToolView(props: { item: Extract<TimelineItem, { type: "tool" }>; groupKey: string; own: boolean }) {
+  const call = () => props.item.call;
+  const result = () => props.item.result;
+  const web = () => (result() ?? call())!.activity.web!;
+  const provider = () => web().note.provider;
+  const args = () => call()?.activity.details ?? "";
+  const foldKey = () => disclosureKey(disclosureScope(), props.groupKey, `web-args:${call()?.eventId}`);
+  return (
+    <Column gap={1}>
+      <Label variant="strong">{props.item.name}{provider() ? ` · ${WEB_PROVIDERS[provider()!]}` : ""}</Label>
+      <If when={args()}>
+        <Row>
+          <DisclosureToggle label={web().note.name === "web_search" ? "Query details" : "Page addresses"}
+            testID={`activity-web-args:${call()?.eventId}`} expanded={isOpen(foldKey())} onPress={() => toggle(foldKey())} />
+        </Row>
+        <If when={isOpen(foldKey())}>
+          <Label variant="body" testID={`activity-web-query:${call()?.eventId}`}>{args()}</Label>
+        </If>
+      </If>
+      <If when={result() && !web().note.failure && result()?.activity.details}>
+        {(count) => <Label variant="caption" testID={`activity-web-count:${result()?.eventId}`}>{count()}</Label>}
+      </If>
+      <Each of={webAttemptRows(web().note)} key={(a) => a.index}>
+        {(a) => <Label variant="caption" testID={a().switched ? "activity-websearch-rotated" : `activity-web-attempt:${a().index}`}>
+          {a().text}
+        </Label>}
+      </Each>
+      <If when={result() && web().note.failure}>
+        <Label variant="caption" color="danger" testID={`activity-web-failure:${result()?.eventId}`}>
+          {webFailureText(web().note, props.own, web().offlineOwner)}
+        </Label>
+        <If when={props.own && web().note.failure === "exhausted" &&
+          web().note.attempts.some((a) => a.mode === "keyless" && (a.outcome === "limited" || a.outcome === "out_of_credits"))}>
+          <Label variant="caption" color="muted">Adding a key may give you higher limits.</Label>
+        </If>
+        <If when={props.own && (web().note.failure === "exhausted" || web().note.failure === "no_device")}>
+          <If when={webSearchSettingsAction()}>
+            {(action) => <Row><Action label="Open Web search" variant="ghost" testID="activity-open-websearch" onPress={() => { if (props.own) action().open(); }} /></Row>}
+          </If>
+        </If>
+      </If>
+    </Column>
   );
 }
 

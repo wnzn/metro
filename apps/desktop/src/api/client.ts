@@ -10,6 +10,8 @@ import type { PageDraftEvent } from "./pages";
 import { profileApi } from "./profile";
 import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
+import { parseWebTool, webSearchPrefsApi } from "./webSearch";
+import type { WebToolNote } from "./webSearch";
 
 /** `parentRoomId`: set on a thread an agent delegated from that room. */
 export type Room = { id: string; name: string; parentRoomId?: string };
@@ -47,6 +49,8 @@ export type EventActivity = {
   pick?: string;
   /** The small room-visible proposal card, not the draft itself. */
   page_draft?: PageDraftEvent;
+  /** Public, bounded web tool metadata. Never includes credentials or raw vendor errors. */
+  tool?: WebToolNote;
 };
 /** A Space agent as a run's events show it: enough for its name and avatar. */
 export type EventAgent = { id: string; handle: string; name: string; avatar_version?: string; color: string };
@@ -490,6 +494,7 @@ export function createClient(options: ClientOptions) {
     ...spacesApi(request, binary),
     // Monitoring events (src/api/monitoring.ts): one Space, My Chat or the instance; never an aggregate.
     ...monitoringApi(request),
+    ...webSearchPrefsApi(request),
 
     async me(): Promise<Me> {
       const data = await request("GET", "/v1/me");
@@ -1205,6 +1210,8 @@ export function toActivity(v: unknown): EventActivity | undefined {
   if (agent) activity.agent = agent;
   const pick = shortText(v.pick, 200);
   if (pick) activity.pick = pick;
+  const tool = parseWebTool(v.tool);
+  if (tool && v.source === "agent") activity.tool = tool;
   return activity;
 }
 
