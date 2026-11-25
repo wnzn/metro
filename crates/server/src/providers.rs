@@ -982,7 +982,6 @@ struct TypedUse {
     caller: String,
     space: Option<String>,
     chosen: String,
-    access: Access,
     _global: tokio::sync::OwnedSemaphorePermit,
     _borrowed: Option<tokio::sync::OwnedSemaphorePermit>,
 }
@@ -1038,32 +1037,41 @@ async fn typed_use(
         caller: caller.to_owned(),
         space: space.map(str::to_owned),
         chosen,
-        access,
         _global: global,
         _borrowed: borrowed,
     })
 }
-/// Before a borrowed typed answer is returned: the grant must still hold,
-/// and the connection must still be the one that was called (same row,
-/// provider, model, revision and approved endpoint). Otherwise the answer
-/// is withheld as [`UseError::Revoked`]. Read in its own short database
-/// call after the request finished; nothing is locked while the request
-/// runs. The payload already sent cannot be unsent: this only keeps the
-/// result from someone who lost access meanwhile. Own connections pass.
-async fn recheck_typed(state: &AppState, u: &TypedUse) -> Result<(), ProviderError> {
-    // Whatever the connection, a Space's answer only while still a member.
-    if still_member(state, u).await.is_err() {
-        return Err(UseError::Revoked.into());
-    }
-    if u.access == Access::Own {
-        return Ok(());
-    }
-    let now = match resolve(state, &u.caller, u.space.as_deref(), &u.chosen).await {
-        Ok(now) => now,
-        Err(UseError::NotFound) => return Err(UseError::Revoked.into()),
-        Err(e) => return Err(e.into()),
-    };
+/// Whether the typed call `u` prepared may still go ahead as prepared:
+/// the caller is still a member of its Space (when it has one), still has
+/// the grant they were admitted on, and the connection is still the same
+/// one (row, provider, model, revision, capability and approved endpoint).
+/// Checked together, in one database call, immediately before the request
+/// is sent and again before its answer is returned, whatever the access
+/// (own, Space share, organization share). Lost access is
+/// [`UseError::Revoked`]; a changed connection is [`UseError::TurnChanged`]
+/// and is never silently retargeted; internal errors propagate.
+async fn still_current(state: &AppState, u: &TypedUse) -> Result<(), ProviderError> {
+    let (caller, space, chosen) = (u.caller.clone(), u.space.clone(), u.chosen.clone());
+    let now = state
+        .db
+        .call(move |db| {
+            let conn = db.lock();
+            if let Some(sid) = &space
+                && !store::is_member(&conn, sid, &caller)?
+            {
+                return Ok(Err(UseError::Revoked));
+            }
+            Ok(
+                match sharing::authorize(&conn, &caller, space.as_deref(), &chosen) {
+                    Err(UseError::NotFound) => Err(UseError::Revoked),
+                    other => other,
+                },
+            )
+        })
+        .await
+        .map_err(read_error)??;
     let same = now.row.id == u.row.id
+        && now.row.user_id == u.row.user_id
         && now.row.provider_id == u.row.provider_id
         && now.row.model == u.row.model
         && now.row.config_rev == u.row.config_rev
@@ -1079,27 +1087,7 @@ async fn recheck_typed(state: &AppState, u: &TypedUse) -> Result<(), ProviderErr
     if same {
         Ok(())
     } else {
-        Err(UseError::Revoked.into())
-    }
-}
-
-/// For a typed call in a Space: the caller must be a member right now,
-/// whatever connection runs it (their own, a Space share or an organization
-/// share), or nothing of the Space is sent. Personal calls pass.
-async fn still_member(state: &AppState, u: &TypedUse) -> Result<(), ProviderError> {
-    let Some(space) = u.space.clone() else {
-        return Ok(());
-    };
-    let caller = u.caller.clone();
-    let member = state
-        .db
-        .call(move |db| Ok(store::is_member(&db.lock(), &space, &caller)?))
-        .await
-        .map_err(read_error)?;
-    if member {
-        Ok(())
-    } else {
-        Err(UseError::NotFound.into())
+        Err(UseError::TurnChanged.into())
     }
 }
 
@@ -1146,8 +1134,20 @@ pub async fn decide(
     questions: serde_json::Value,
 ) -> Result<serde_json::Value, ProviderError> {
     let u = typed_use(state, caller, space, id, Capability::SystemOne).await?;
+    decide_with(state, u, state_payload, questions).await
+}
+
+/// [`decide`] for a call already prepared by [`typed_use`].
+async fn decide_with(
+    state: &AppState,
+    u: TypedUse,
+    state_payload: serde_json::Value,
+    questions: serde_json::Value,
+) -> Result<serde_json::Value, ProviderError> {
+    let (caller, space) = (u.caller.clone(), u.space.clone());
+    let (caller, space) = (caller.as_str(), space.as_deref());
     let request = typed::decision_request(&u.row.model, state_payload, questions)?;
-    still_member(state, &u).await?;
+    still_current(state, &u).await?;
     let answer = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => typed::decide(&base, key.as_deref(), request).await,
         TypedTarget::Device => state
@@ -1157,7 +1157,7 @@ pub async fn decide(
             .map_err(ProviderError::from),
     }
     .inspect_err(|e| log_typed_failure(&u, e))?;
-    recheck_typed(state, &u).await?;
+    still_current(state, &u).await?;
     Ok(answer)
 }
 
@@ -1172,7 +1172,7 @@ pub async fn embed(
 ) -> Result<Vec<Vec<f32>>, ProviderError> {
     let u = typed_use(state, caller, space, id, Capability::Embeddings).await?;
     let request = typed::embedding_request(&u.row.model, &inputs)?;
-    still_member(state, &u).await?;
+    still_current(state, &u).await?;
     let vectors = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => typed::embed(&base, key.as_deref(), request).await,
         TypedTarget::Device => state
@@ -1188,7 +1188,7 @@ pub async fn embed(
             "the model endpoint returned an invalid embeddings response".into(),
         ));
     }
-    recheck_typed(state, &u).await?;
+    still_current(state, &u).await?;
     Ok(vectors)
 }
 
@@ -1230,7 +1230,7 @@ pub async fn media_embed(
     // The slot is taken before the payload is checked or sent.
     let _media = state.providers.media_slot(caller, &u.row.id)?;
     let request = typed::media_request(&u.row.model, input)?;
-    still_member(state, &u).await?;
+    still_current(state, &u).await?;
     let answer = match typed_target(state, &u)? {
         TypedTarget::Server { base, key } => {
             typed::media_embed(&base, key.as_deref(), request).await
@@ -1242,7 +1242,7 @@ pub async fn media_embed(
             .map_err(ProviderError::from),
     }
     .inspect_err(|e| log_typed_failure(&u, e))?;
-    recheck_typed(state, &u).await?;
+    still_current(state, &u).await?;
     Ok(answer)
 }
 
@@ -1441,4 +1441,149 @@ pub fn device_connection(
                 provider,
             },
         ))
+}
+
+/// A System One endpoint that answers every decision and counts them.
+#[cfg(test)]
+async fn counting_systemone() -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use axum::routing::post;
+    let count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = count.clone();
+    let app = axum::Router::new().route(
+        "/v1/systemone",
+        post(move |axum::Json(req): axum::Json<serde_json::Value>| {
+            let seen = seen.clone();
+            async move {
+                seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let answers: serde_json::Map<String, serde_json::Value> = req["questions"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(|k| (k.clone(), serde_json::json!({"type": "noul", "noul": 0.9})))
+                    .collect();
+                axum::Json(serde_json::json!({"model": "probe-model", "answers": answers}))
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    (base, count)
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_typed_call_goes_out_only_as_it_was_prepared() {
+    use std::sync::atomic::Ordering::SeqCst;
+
+    let ((a, to_a), (b, to_b)) = (counting_systemone().await, counting_systemone().await);
+    let state = api::probe_state(vec![a.clone(), b.clone()]).await;
+    let sid = state.db.create_space("user", "typed", 10).unwrap().id;
+    state.db.add_member(&sid, "bob", 100).unwrap();
+    let ask = |state: &AppState, u: TypedUse| {
+        let state = state.clone();
+        async move {
+            decide_with(
+                &state,
+                u,
+                serde_json::json!({"value": true}),
+                serde_json::json!({"check": {"type": "noul", "instructions": "Is value true?"}}),
+            )
+            .await
+        }
+    };
+
+    // The endpoint is rotated between preparation and dispatch.
+    let row = api::probe_row(&state, catalog::CUSTOM_SYSTEMONE, &a);
+    let u = typed_use(&state, "user", Some(&sid), &row.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    let rotate = store::Patch {
+        base_url: Some(b.clone()),
+        ..store::Patch::default()
+    };
+    assert!(matches!(
+        store::patch(&mut state.db.lock(), "user", &row.id, &rotate, Some(&row)).unwrap(),
+        store::Patched::Saved(_)
+    ));
+    let r = ask(&state, u).await;
+    assert_eq!(r, Err(ProviderError::Use(UseError::TurnChanged)));
+    assert_eq!(
+        (to_a.load(SeqCst), to_b.load(SeqCst)),
+        (0, 0),
+        "nothing was sent"
+    );
+
+    // A Space share is revoked between preparation and dispatch.
+    let shared = api::probe_row(&state, catalog::CUSTOM_SYSTEMONE, &a);
+    let to_space = store::Share {
+        visibility: store::Visibility::Spaces,
+        space_ids: vec![sid.clone()],
+    };
+    assert!(store::set_share(&mut state.db.lock(), "user", &shared.id, &to_space).unwrap());
+    let u = typed_use(&state, "bob", Some(&sid), &shared.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    let personal = store::Share {
+        visibility: store::Visibility::Personal,
+        space_ids: vec![],
+    };
+    assert!(store::set_share(&mut state.db.lock(), "user", &shared.id, &personal).unwrap());
+    let r = ask(&state, u).await;
+    assert_eq!(r, Err(ProviderError::Use(UseError::Revoked)));
+    assert_eq!(to_a.load(SeqCst), 0, "the old endpoint got nothing");
+
+    // Unchanged, the prepared call goes out.
+    let u = typed_use(
+        &state,
+        "user",
+        Some(&sid),
+        &shared.id,
+        Capability::SystemOne,
+    )
+    .await
+    .unwrap();
+    assert!(ask(&state, u).await.is_ok());
+    assert_eq!(to_a.load(SeqCst), 1);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn a_lost_membership_is_revoked_and_internal_errors_propagate() {
+    let (a, _) = counting_systemone().await;
+    let state = api::probe_state(vec![a.clone()]).await;
+    let sid = state.db.create_space("owner", "typed", 10).unwrap().id;
+    state.db.add_member(&sid, "user", 100).unwrap();
+    let row = api::probe_row(&state, catalog::CUSTOM_SYSTEMONE, &a);
+    let question = || {
+        (
+            serde_json::json!({"value": true}),
+            serde_json::json!({"check": {"type": "noul", "instructions": "Is value true?"}}),
+        )
+    };
+    // Admitted, then removed from the Space before dispatch.
+    let u = typed_use(&state, "user", Some(&sid), &row.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    state.db.remove_member(&sid, "user").unwrap();
+    let (p, q) = question();
+    assert_eq!(
+        decide_with(&state, u, p, q).await,
+        Err(ProviderError::Use(UseError::Revoked))
+    );
+    // A database failure is reported as one, never as lost access.
+    state.db.add_member(&sid, "user", 100).unwrap();
+    let u = typed_use(&state, "user", Some(&sid), &row.id, Capability::SystemOne)
+        .await
+        .unwrap();
+    state
+        .db
+        .lock()
+        .execute_batch("ALTER TABLE space_members RENAME TO space_members_gone")
+        .unwrap();
+    let (p, q) = question();
+    assert_eq!(
+        decide_with(&state, u, p, q).await,
+        Err(ProviderError::Use(UseError::Internal))
+    );
 }

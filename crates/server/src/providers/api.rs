@@ -755,7 +755,7 @@ async fn probe(state: &AppState, entry: &Entry, row: &Row, deadline: Duration) -
 
 /// A state with no master key whose providers may use `allowed`.
 #[cfg(test)]
-async fn probe_state(allowed: Vec<String>) -> AppState {
+pub(crate) async fn probe_state(allowed: Vec<String>) -> AppState {
     use std::sync::Arc;
 
     let auth = metro_auth::Authenticator::from_lookup(|key| {
@@ -783,7 +783,7 @@ async fn probe_state(allowed: Vec<String>) -> AppState {
 
 /// A saved connection of `provider` at `base_url` with model `probe-model`.
 #[cfg(test)]
-fn probe_row(state: &AppState, provider: &str, base_url: &str) -> Row {
+pub(crate) fn probe_row(state: &AppState, provider: &str, base_url: &str) -> Row {
     let row = Row {
         id: new_connection_id(),
         user_id: "user".into(),
