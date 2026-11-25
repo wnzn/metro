@@ -103,6 +103,55 @@ anyone outside the release workflow; macOS (not built); real vendor
 accounts and sign-ins; pretrained `google/embeddinggemma-2` ranking.
 Windows files carry no Authenticode signature.
 
+## Source only: updater re-review (2026-11-25, local)
+
+Verified locally on `lane/updates-backend` at `92979ca`, after `916f8da`.
+None of this is in Metro 0.4.0. Nothing was deployed, pushed, or merged.
+
+**Migration and recovery limits.** Linux desktop in-app updates and Linux
+runner self-update require an explicit migration. With the app or runner
+stopped and no installer running, use the installer and verified prebuilt
+archive for the build that includes these changes:
+`update --archive FILE --migrate-update-lock`. Retire old installer copies
+before restarting. The new lock excludes 0.4.0 operations that take `.lock`;
+published runner `configure` and `uninstall` and Windows script `Uninstall`
+bypass it. The migration does not make those old commands safe to run
+concurrently.
+
+Windows script and MSI updates are manual-only. The launcher won't start an
+MSI helper. If an old journal leaves completion uncertain, Metro stops
+before opening the workspace and preserves both the journal and the backup.
+Confirm the Windows Installer transaction has ended and resolve the
+installation and data manually before restarting. A dead helper PID is
+not proof. Unowned backups from older Metro builds are not consumed.
+
+**Local checks.**
+
+- Locked all-features tests for `metro-release`, `metro-runner`,
+  `metro-connector`, `metro-server` and `metro-desktop`: 740 passed,
+  2 ignored. Formatting and strict Clippy on those crates passed.
+  Regressions cover interruptions before and after backup publication and
+  during cleanup, a modified staged menu script, legacy MSI journals,
+  cached TUF expiry, and a shared release floor raised by another checker.
+  The desktop and runner update locks were also exercised in both
+  directions against the published Linux scripts.
+- `tests/e2e/updates.py` passed with separate test-release binaries. When
+  rollback was due and the previous executable was unavailable, the runner
+  saved rollback intent, exited with status 75, and sent no claim. The same
+  test exercised the in-place update and the rollback after three restarts.
+- Packaging, release-signature and Windows-signing suites: 286 passed,
+  11 skipped. Published installer fixtures matched the signed 0.4.0
+  `SHA256SUMS` entries. The Linux installers ran in throwaway homes. The
+  Windows fixture exercised the published and current lock paths in
+  PowerShell on Linux, stopping before extraction; it was not an MSI run.
+- The admin browser suite passed 22/22 in
+  `mcr.microsoft.com/playwright:v1.58.2-noble`. The release, connector and
+  desktop crates checked for `x86_64-pc-windows-gnu`, with pre-existing
+  connector warnings. This was cross-compilation only.
+
+Native Windows MSI transactions, helper death and shortcuts, live TUF
+refresh, and updates between published Metro releases were not tested.
+
 ## Source only: updater review 2 (2026-11-25, local)
 
 Tested on `lane/updates-backend` at `3de67c1`. This work was not part of
