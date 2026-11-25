@@ -4,7 +4,8 @@
 // Opening reads; Reconnect and Show folder act only when pressed.
 
 import { Clipboard, signal } from "nsh";
-import { runners } from "../../settings";
+import type { JSX } from "nsh";
+import { runnerBusy, runners } from "../../settings";
 import { attachMany, eligibleSpaces, installedRunnerChoice, runnerAttachBusy, runnerSessionKey } from "../../runnersState";
 import { Action, Badge, Banner, Checkbox, Column, ConfirmInline, Label, Row, SettingRow, SettingsGroup } from "../../ui";
 import type { Tone } from "../../ui";
@@ -56,15 +57,15 @@ export function reconnectImpact(r: InstalledRunner): string {
   return `Reconnecting creates a new personal runner for this computer. ${fresh}`;
 }
 
-export function InstalledRunnerSection() {
+export function InstalledRunnerSection(props: { management?: JSX.Element } = {}) {
   return (
     <If when={installedRunner()}>
-      {(r) => <Section r={r()} />}
+      {(r) => <Section r={r()} management={props.management} />}
     </If>
   );
 }
 
-function Section(props: { r: InstalledRunner }) {
+function Section(props: { r: InstalledRunner; management?: JSX.Element }) {
   const copied = signal<string | null>(null);
   const r = () => props.r;
   const badge = () => installedRunnerBadge(r());
@@ -113,7 +114,7 @@ function Section(props: { r: InstalledRunner }) {
                           label="Show folder"
                           busyLabel="Opening…"
                           busy={installedBusy() === `folder:${s().id}`}
-                          disabled={!!installedBusy() || runnerAttachBusy()}
+                          disabled={!!installedBusy() || runnerAttachBusy() || !!runnerBusy()}
                           variant="ghost"
                           onPress={() => void showRunnerFolder(s().id)}
                         />
@@ -163,10 +164,11 @@ function Section(props: { r: InstalledRunner }) {
         <Column padX={4} padY={3} gap={2}>
           <ConfirmInline testID="installed-runner-reconnect" triggerLabel="Reconnect…" confirmLabel="Reconnect"
             message={reconnectImpact(r())} scopeKey={JSON.stringify([runnerSessionKey(), r().runner?.id, r().state])}
-            disabled={!!installedBusy() || runnerAttachBusy()} busy={installedBusy() === "reconnect"} busyLabel="Reconnecting…"
+            disabled={!!installedBusy() || runnerAttachBusy() || !!runnerBusy()} busy={installedBusy() === "reconnect"} busyLabel="Reconnecting…"
             onConfirm={() => void reconnectInstalledRunner()} />
         </Column>
       </If>
+      {props.management}
     </SettingsGroup>
   );
 }
@@ -174,7 +176,7 @@ function Section(props: { r: InstalledRunner }) {
 function AttachPicks() {
   const unticked = signal<Record<string, boolean>>({});
   const selected = () => eligibleSpaces().filter((s) => !unticked()[s.id]).map((s) => s.id);
-  const busy = () => runnerAttachBusy() || !!installedBusy();
+  const busy = () => runnerAttachBusy() || !!installedBusy() || !!runnerBusy();
   const state = () => {
     if (checkingInstalledScope() && !installedRunnerChoice()) return "Checking this computer's runner…";
     if (ownedInstalledRunner()?.attachIfEmpty === false) return "This server doesn't support attaching only to Spaces without a runner.";

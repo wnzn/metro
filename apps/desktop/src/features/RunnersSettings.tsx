@@ -3,8 +3,9 @@
 // delete the runners this user manages. Attaching happens per Space, in the
 // Space owner's Manage view, from the same list.
 
-import { cleanup, Clipboard, effect, openUrl, signal } from "nsh";
-import { orgAdmin } from "../store";
+import { batch, cleanup, Clipboard, effect, openUrl, signal } from "nsh";
+import type { ViewRef } from "nsh";
+import { orgAdmin, sessionGuard } from "../store";
 import {
   cancelRunnerAction,
   confirmRunnerAction,
@@ -21,19 +22,20 @@ import {
   runnersError,
 } from "../settings";
 import type { RegisteredRunner, RunnerVisibility } from "../settings";
-import { Action, Badge, Banner, Column, compactWidth, ConfirmInline, Disclosure, FactList, Field, Label, LearnMore, PageHeader, PageLayout, ProblemNote, Row, SegmentedControl, SettingRow, SettingsGroup } from "../ui";
-import { pinnedRunnerImage, requestRunnerUpdate, runnerAttachFeedback, runnerSessionKey, runnerUpdateBusy, runnerUpdateErrors, runnerUpdateTarget, selfUpdateTarget, watchInstalledRunner } from "../runnersState";
+import { Action, Badge, Banner, Column, compactWidth, ConfirmInline, Disclosure, FactList, Field, Label, LearnMore, PageHeader, PageLayout, ProblemNote, Row, SegmentedControl, SettingRow, SettingsGroup, StatusSummary } from "../ui";
+import { pinnedRunnerImage, requestRunnerUpdate, runnerAttachBusy, runnerAttachFeedback, runnerSessionKey, runnerUpdateBusy, runnerUpdateErrors, runnerUpdateTarget, selfUpdateTarget, watchInstalledRunner } from "../runnersState";
 import { TokenReveal } from "./TokenReveal";
 import { InstalledRunnerSection } from "./installedRunner/InstalledRunnerSection";
-import { ownedInstalledRunner } from "./installedRunner/installedRunner";
+import { installedBusy, installedRunner, ownedInstalledRunner, refreshAfterInstalledRunnerDeletion } from "./installedRunner/installedRunner";
 import { relativeTime } from "./discovery/time";
 import { RELEASES_URL } from "./setupTemplates";
 
 export function RunnersSettings() {
-  watchInstalledRunner();
+  watchInstalledRunner(true);
   const adding = signal(false);
   const token = () => revealed()?.kind === "runner";
   const hasMessages = () => !token() && !!(runnersError() || runnerNotice() || runnerAttachFeedback());
+  const installedRegistration = () => runners()?.find((r) => r.visibility === "personal" && r.canManage && r.id === ownedInstalledRunner()?.id);
   effect(() => {
     runnerSessionKey();
     adding.set(false);
@@ -66,7 +68,11 @@ export function RunnersSettings() {
               </LearnMore>
             </Column>
             <If when={adding()}><AddRunner onAdded={() => adding.set(false)} /></If>
-            <InstalledRunnerSection />
+            <InstalledRunnerSection management={
+              <If when={installedRegistration()}>
+                {(runner) => <Column padX={4} gap={2}><RunnerManagement runner={runner()} installed /></Column>}
+              </If>
+            } />
             <RunnerList visibility="personal" />
             <RunnerList visibility="organization" />
           </Column>
@@ -162,24 +168,17 @@ function RunnerList(props: { visibility: RunnerVisibility }) {
 }
 
 export function runnerStatus(r: RegisteredRunner, now = Date.now()): string {
-  const pending = r.update?.pending;
-  if (pending) return `Update to ${pending.target} requested`;
   const p = r.presence;
   const version = p?.version ? `v${p.version}` : p?.seenAt != null ? "Version not reported" : "Version unknown until it connects";
   if (p?.online) return `${version} · Online`;
   return p?.seenAt != null ? `${version} · Last seen ${relativeTime(Math.min(p.seenAt, now), now)}` : version;
 }
 
+const registrationScope = (r: RegisteredRunner) => JSON.stringify([runnerSessionKey(), r.id, r.visibility, r.canManage]);
+
 function RunnerRow(props: { runner: RegisteredRunner }) {
   const r = () => props.runner;
-  const confirming = () => (runnerConfirm()?.runnerId === r().id ? runnerConfirm()!.action : null);
   const target = () => runnerUpdateTarget(r());
-  const busy = () => !!runnerBusy() || !!runnerUpdateBusy();
-  const scope = () => JSON.stringify([runnerSessionKey(), r().id, r().visibility, r().canManage]);
-  const changeConfirmation = (action: "rotate" | "delete", open: boolean) => {
-    if (open) void confirmRunnerAction(action, r().id);
-    else if (confirming() === action) cancelRunnerAction();
-  };
   return (
     <Column testID={`runner:${r().id}`}>
       <SettingRow label={r().name} description={runnerStatus(r())}>
@@ -192,37 +191,50 @@ function RunnerRow(props: { runner: RegisteredRunner }) {
         </Row>
       </SettingRow>
       <Column padX={4} gap={2}>
-        <RunnerUpdateControls runner={r()} scope={scope()} />
-        <If when={r().canManage}>
-          <Column gap={2}>
-            <ConfirmInline
-              testID={`rotate-runner:${r().id}`}
-              triggerLabel="Rotate token…"
-              confirmLabel="Rotate token"
-              message={impactText("rotate", r())}
-              scopeKey={scope()}
-              open={confirming() === "rotate"}
-              onOpenChange={(open) => changeConfirmation("rotate", open)}
-              busyLabel="Rotating…"
-              busy={runnerBusy() === `rotate:${r().id}`}
-              disabled={busy()}
-              onConfirm={() => void rotateRunner(r().id)}
-            />
-            <ConfirmInline
-              testID={`delete-runner:${r().id}`}
-              triggerLabel="Delete…"
-              confirmLabel="Delete runner"
-              message={impactText("delete", r())}
-              scopeKey={scope()}
-              open={confirming() === "delete"}
-              onOpenChange={(open) => changeConfirmation("delete", open)}
-              busyLabel="Deleting…"
-              busy={runnerBusy() === `delete:${r().id}`}
-              disabled={busy()}
-              onConfirm={() => void deleteRunner(r().id)} />
-          </Column>
-        </If>
+        <RunnerUpdateControls runner={r()} scope={registrationScope(r())} />
+        <If when={r().canManage}><RunnerManagement runner={r()} /></If>
       </Column>
+    </Column>
+  );
+}
+
+function RunnerManagement(props: { runner: RegisteredRunner; installed?: boolean }) {
+  const r = () => props.runner;
+  const confirming = () => (runnerConfirm()?.runnerId === r().id ? runnerConfirm()!.action : null);
+  const canRotate = () => !props.installed || !installedRunner()?.canReconnect;
+  const busy = () => !!runnerBusy() || !!runnerUpdateBusy() || (props.installed && (!!installedBusy() || runnerAttachBusy()));
+  // Moving between installed and standalone controls invalidates the old panel.
+  const scope = () => JSON.stringify([registrationScope(r()), !!props.installed]);
+  const changeConfirmation = (action: "rotate" | "delete", open: boolean) => {
+    if (open) void confirmRunnerAction(action, r().id);
+    else if (confirming() === action) cancelRunnerAction();
+  };
+  effect(() => {
+    if (!canRotate() && confirming() === "rotate") cancelRunnerAction();
+  });
+  cleanup(() => { if (confirming()) cancelRunnerAction(); });
+  const remove = async () => {
+    const id = r().id;
+    const valid = sessionGuard();
+    await deleteRunner(id);
+    if (valid() && props.installed && !runners()?.some((runner) => runner.id === id)) {
+      refreshAfterInstalledRunnerDeletion(id);
+    }
+  };
+  return (
+    <Column gap={2}>
+      <If when={canRotate()}>
+        <ConfirmInline testID={`rotate-runner:${r().id}`} triggerLabel="Rotate token…" confirmLabel="Rotate token"
+          message={impactText("rotate", r(), props.installed)} scopeKey={scope()}
+          open={confirming() === "rotate"} onOpenChange={(open) => changeConfirmation("rotate", open)}
+          busyLabel="Rotating…" busy={runnerBusy() === `rotate:${r().id}`} disabled={busy()}
+          onConfirm={() => void rotateRunner(r().id)} />
+      </If>
+      <ConfirmInline testID={`delete-runner:${r().id}`} triggerLabel="Delete…" confirmLabel="Delete runner"
+        message={impactText("delete", r())} scopeKey={scope()}
+        open={confirming() === "delete"} onOpenChange={(open) => changeConfirmation("delete", open)}
+        busyLabel="Deleting…" busy={runnerBusy() === `delete:${r().id}`} disabled={busy()}
+        onConfirm={() => void remove()} />
     </Column>
   );
 }
@@ -236,6 +248,51 @@ function RunnerUpdateControls(props: { runner: RegisteredRunner; scope: string }
   const failure = () => u()?.lastResult?.state === "failed" && u()?.lastResult?.target === target() && !u()?.pending ? u()?.lastResult : null;
   const error = () => runnerUpdateErrors()[r().id];
   const eligible = () => selfUpdateTarget(r());
+  const intent = signal<{ target: string; scope: string } | null>(null);
+  const confirmOpen = signal(false);
+  const submitting = signal(false);
+  const pending = () => u()?.pending;
+  const pendingText = () => { const p = pending(); return p ? `Update to ${p.target} requested` : null; };
+  const resultText = () => pendingText() ?? error();
+  let result: ViewRef | undefined;
+  let mounted = true;
+  cleanup(() => { mounted = false; });
+  // Keep the captured target, not the live offer, wired to the mounted
+  // panel. Eligibility is rechecked before sending and never retargets it.
+  const confirmationKey = () => JSON.stringify([runnerSessionKey(), r().id, intent()]);
+  const changeConfirmation = (open: boolean) => {
+    if (!open) {
+      confirmOpen.set(false);
+      return;
+    }
+    const target = eligible();
+    if (!target || runnerUpdateBusy() || runnerBusy()) return;
+    batch(() => {
+      intent.set({ target, scope: props.scope });
+      confirmOpen.set(true);
+    });
+  };
+  const confirm = async () => {
+    const request = intent();
+    if (!request || !confirmOpen() || submitting() || runnerUpdateBusy() || runnerBusy()
+        || request.scope !== props.scope || request.target !== eligible()) return;
+    const valid = sessionGuard();
+    submitting.set(true);
+    try {
+      await requestRunnerUpdate(r().id, request.target);
+    } finally {
+      if (mounted && valid() && request === intent()) {
+        batch(() => {
+          confirmOpen.set(false);
+          submitting.set(false);
+        });
+      }
+    }
+  };
+  effect(() => {
+    const request = intent();
+    if (confirmOpen() && !submitting() && (request?.scope !== props.scope || request?.target !== eligible())) confirmOpen.set(false);
+  });
   effect(() => {
     props.scope;
     target();
@@ -256,7 +313,7 @@ function RunnerUpdateControls(props: { runner: RegisteredRunner; scope: string }
             {(image) => (
               <Column gap={2}>
                 <Label variant="mono">{`docker pull ${image()}`}</Label>
-                <Label variant="caption" color="muted">Pull the new image, then restart the container with it. Metro can't reach Docker from here.</Label>
+                <Label variant="caption" color="muted">Pull the pinned image, then recreate the runner container with that image. Keep its existing configuration and volume mounts. Restarting the old container won't change its image. Metro can't reach Docker from here.</Label>
                 <Action testID={`runner-copy-image:${r().id}`} label={copied() === image() ? "Copied" : "Copy image"} onPress={() => {
                   Clipboard.writeText(image());
                   copied.set(image());
@@ -280,18 +337,23 @@ function RunnerUpdateControls(props: { runner: RegisteredRunner; scope: string }
       <If when={target() && r().canManage && u()?.action === "self_update" && !r().presence?.online && !u()?.pending}>
         <Label variant="caption" color="muted">Bring this runner online to request an update.</Label>
       </If>
-      <If when={error()}>{(text) => <ProblemNote testID={`runner-update-error:${r().id}`} text={`${r().name}: ${text()}`} />}</If>
+      <StatusSummary viewRef={(node) => { result = node; }} focusable={!eligible() && !!resultText() && !submitting()}
+        accessibilityLabel={!eligible() && resultText() ? `${r().name}: ${resultText()}` : undefined} testID={`runner-update-result:${r().id}`}>
+        <If when={pendingText()}>{(text) => <Label variant="caption" color="muted">{text()}</Label>}</If>
+        <If when={error()}>{(text) => <ProblemNote testID={`runner-update-error:${r().id}`} text={`${r().name}: ${text()}`} />}</If>
+      </StatusSummary>
       <If when={failure()}>
         {(last) => <ProblemNote testID={`runner-update-failed:${r().id}`}
           text={`Update to ${last().target} failed on ${r().name}: ${updateFailure(last().code)}${r().presence?.version ? ` Last reported version: v${r().presence?.version}.` : ""}`} />}
       </If>
-      <If when={eligible()}>
-        {(version) => <ConfirmInline testID={`runner-update:${r().id}`} triggerLabel={failure() || error() ? "Try again…" : "Update…"}
-          confirmLabel="Update runner" variant="primary" scopeKey={JSON.stringify([props.scope, version()])}
-          disabled={!!runnerBusy() || !!runnerUpdateBusy()} busy={runnerUpdateBusy() === r().id} busyLabel="Requesting…"
-          message={`${r().name} downloads ${version()} from GitHub, verifies the signature itself and restarts. Jobs pause for a moment.`}
-          onConfirm={() => void requestRunnerUpdate(r().id, version())} />}
-      </If>
+      <ConfirmInline testID={`runner-update:${r().id}`}
+        triggerLabel={eligible() || confirmOpen() ? (failure() || error() ? "Try again…" : "Update…") : ""}
+        confirmLabel="Update runner" variant="primary" scopeKey={confirmationKey()}
+        open={confirmOpen()} onOpenChange={changeConfirmation}
+        disabled={!eligible() || !!runnerBusy() || !!runnerUpdateBusy()} busy={submitting()} busyLabel="Requesting…"
+        message={`${r().name} downloads ${intent()?.target} from GitHub, verifies the signature itself and restarts. Jobs pause for a moment.`}
+        returnFocusAfterBusy={() => !eligible() && resultText() ? result : undefined}
+        onConfirm={() => void confirm()} />
     </Column>
   );
 }
@@ -307,7 +369,7 @@ function updateFailure(code: string | null): string {
   }
 }
 
-function impactText(action: "rotate" | "delete", r: RegisteredRunner): string {
+function impactText(action: "rotate" | "delete", r: RegisteredRunner, installed = false): string {
   const impact = runnerImpact();
   const known = impact?.runnerId === r.id ? impact : null;
   let where: string;
@@ -315,6 +377,8 @@ function impactText(action: "rotate" | "delete", r: RegisteredRunner): string {
   else if (known.spaces.length === 0) where = known.partial ? "None of the Spaces you belong to use it, but other Spaces in the organization may." : "None of your Spaces use it.";
   else where = `Spaces you belong to that use it: ${known.spaces.join(", ")}.${known.partial ? " Other Spaces in the organization may use it too." : ""}`;
   return action === "rotate"
-    ? `Rotating the token for “${r.name}” stops the current token at once, in every Space this runner serves. Put the new token in its runner.env and restart it. ${where}`
+    ? `Rotating the token for “${r.name}” stops the current token at once, in every Space this runner serves. ${installed
+      ? "This computer's runner will disconnect. Reopen Runners to check its status and use Reconnect when it becomes available."
+      : "Put the new token in its runner.env and restart it."} ${where}`
     : `Deleting “${r.name}” revokes its token and detaches it from every Space it serves; those Spaces have no runner until their owners attach another. ${where}`;
 }

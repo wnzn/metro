@@ -24,7 +24,7 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
   const b = fakeBridge(f);
   const log: { method: string; path: string; body: string | null | undefined }[] = [];
   const t = { log };
-  const st = { state: opts.state ?? "online", canReconnect: opts.canReconnect ?? false, runnerId };
+  const st = { state: opts.state ?? "online", canReconnect: opts.canReconnect ?? false, runnerId, delay: 0 };
   const status = () => ({
     requested: opts.requested ?? true,
     marker: opts.requested === false ? "absent" : "accepted",
@@ -46,7 +46,7 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
     if (path === "/v1/local-tools/runner" && req.method === "GET") {
       const reads = t.log.filter((l) => l.path === path && l.method === "GET").length;
       if (reads > 1 && opts.laterAvailable === false) return { status: 200, body: { ...status(), available: false, runner: null, state: "unavailable" } };
-      return { status: 200, body: status() };
+      return { status: 200, body: status(), ...(st.delay ? { delay: st.delay } : {}) };
     }
     if (path === "/v1/local-tools/runner/reconnect" && req.method === "POST") {
       st.state = "online";
@@ -137,6 +137,7 @@ test("reconnect is offered only when allowed, explains itself, and posts only af
   const app = await openWith(f, t);
   await signInToRunners(app, "alice");
   await app.waitFor("id:installed-runner-reconnect");
+  expect(app.shows(`id:rotate-runner:${mine.id}`)).toBe(false); // Reconnect already rotates the token.
   expect(text(app)).toContain("Token no longer accepted");
   await app.press("id:installed-runner-reconnect");
   await app.waitFor("id:installed-runner-reconnect:warning");
@@ -153,6 +154,42 @@ test("reconnect is offered only when allowed, explains itself, and posts only af
   expect(posts(t).map((l) => [l.path, l.body])).toEqual([["/v1/local-tools/runner/reconnect", "{}"]]);
   expect(text(app)).toContain("Online");
   expect(app.shows("id:installed-runner-reconnect")).toBe(false);
+});
+
+test("the healthy installed runner has exactly one scoped Rotate and Delete path", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.state.attached.set("solo", mine.id);
+  const t = bridgeWithRunner(f, mine.id, mine.name);
+  const app = await openWith(f, t);
+  await signInToRunners(app, "alice");
+  await app.waitFor("id:installed-runner-folder:solo");
+  const rotate = `id:rotate-runner:${mine.id}`;
+  const remove = `id:delete-runner:${mine.id}`;
+  expect(app.shows("id:installed-runner-reconnect")).toBe(false);
+  expect(app.shows(`id:installed-runner >> ${rotate}`)).toBe(true);
+  expect(app.shows(`id:installed-runner >> ${remove}`)).toBe(true);
+  expect(app.shows(`id:runner-list >> ${rotate}`)).toBe(false);
+  expect(app.shows(`id:runner-list >> ${remove}`)).toBe(false);
+  await app.press(rotate);
+  await app.waitFor(`text:/This computer's runner will disconnect/`);
+  await app.waitFor("text:/Spaces you belong to that use it: Solo/");
+  expect(f.posts().filter((p) => p.path.startsWith("/v1/runners/"))).toEqual([]);
+  await app.press(`${rotate}:confirm`);
+  await app.waitFor("id:token-reveal");
+  await app.press("id:hide-runner-token");
+  await app.waitFor("id:installed-runner-folder:solo");
+  await app.press(remove);
+  await app.waitFor(`${remove}:warning`);
+  await app.press(`${remove}:confirm`);
+  await app.waitFor("id:runners-notice");
+  expect(app.shows("id:installed-runner-folder:solo")).toBe(false);
+  expect(f.state.attached.has("solo")).toBe(false);
+  expect(f.posts().filter((p) => p.path.startsWith("/v1/runners/")).map((p) => [p.method, p.path])).toEqual([
+    ["POST", `/v1/runners/${mine.id}/token`], ["DELETE", `/v1/runners/${mine.id}`],
+  ]);
+  expect(posts(t)).toEqual([]);
 });
 
 test("an interrupted setup with no known id: reconnect creates a new runner and warns of an unused one", async () => {
@@ -316,6 +353,86 @@ test("an account change during the live check cannot run the old batch or set it
   expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
 });
 
+test("persistent concurrent consumers see late online and subsequent offline; dismissal stops refresh without clearing Create", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const mine = f.addRunner("This PC", "personal", "alice");
+  const t = bridgeWithRunner(f, mine.id, mine.name, { state: "offline" });
+  const reads = () => t.log.filter((l) => l.method === "GET" && l.path === "/v1/local-tools/runner").length;
+  const launch = (storage?: Record<string, string>) => open("./runnerWatch.fixture.tsx", {
+    network: { ...f.network, ...t.network } as any, modules: bridgeEnv() as any, platform: "linux", clock: {}, storage,
+  });
+  const app = await launch();
+  await app.press("id:fixture-connect");
+  await app.waitFor(`text:Create choice: ${mine.id}`);
+  expect(reads()).toBe(1); // Both watchers use the initial read.
+  expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
+  await app.clock!.runFor(36_000); // Longer than the old six-try window.
+  expect(reads()).toBe(8);
+  expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
+
+  t.st.state = "online";
+  await app.clock!.runFor(5100);
+  expect(app.shows("text:Offer appearances: 1")).toBe(true);
+  expect(app.shows("id:dismiss-fixture-offer")).toBe(true);
+  t.st.state = "offline";
+  await app.clock!.runFor(5100);
+  expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
+  expect(app.shows(`text:Create choice: ${mine.id}`)).toBe(true);
+  t.st.state = "online";
+  await app.clock!.runFor(5100);
+  expect(app.shows("text:Offer appearances: 2")).toBe(true);
+
+  t.st.delay = 1500;
+  const before = reads();
+  await app.clock!.runFor(5000);
+  expect(reads()).toBe(before + 1); // A read is now held in flight.
+  await app.press("id:dismiss-fixture-offer");
+  await app.clock!.runFor(20_000);
+  expect(app.shows("text:Offer appearances: 2")).toBe(true);
+  expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
+  expect(app.shows(`text:Create choice: ${mine.id}`)).toBe(true);
+  expect(reads()).toBe(before + 1);
+  const storage = app.storage();
+  expect(storage[runnerOfferStorageKey(BASE, "alice")]).toBe("dismissed");
+
+  t.st.delay = 0;
+  const reopened = await launch(storage);
+  await reopened.press("id:fixture-connect");
+  await reopened.waitFor(`text:Create choice: ${mine.id}`);
+  await reopened.clock!.runFor(15_000);
+  expect(reopened.shows("text:Offer appearances: 0")).toBe(true);
+  expect(reads()).toBe(before + 2); // Initialization is allowed; polling isn't.
+});
+
+test("a stalled bridge expires the online offer; unmount stops reads and remount validates before showing", async () => {
+  const f = world();
+  f.addSpace("solo", "Solo", "alice");
+  const mine = f.addRunner("This PC", "personal", "alice");
+  const t = bridgeWithRunner(f, mine.id, mine.name);
+  const app = await open("./runnerWatch.fixture.tsx", {
+    network: { ...f.network, ...t.network } as any, modules: bridgeEnv() as any, platform: "linux", clock: {},
+  });
+  await app.press("id:fixture-connect");
+  await app.waitFor("id:dismiss-fixture-offer");
+  t.st.delay = 9000;
+  t.st.state = "offline";
+  await app.clock!.runFor(7200);
+  expect(app.shows("id:dismiss-fixture-offer")).toBe(false); // Not waiting out the transport timeout.
+  expect(app.shows(`text:Create choice: ${mine.id}`)).toBe(true);
+  const before = t.log.length;
+  await app.press("id:toggle-watchers");
+  await app.clock!.runFor(15_000);
+  expect(t.log.length).toBe(before);
+  expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
+  expect(app.shows(`text:Create choice: ${mine.id}`)).toBe(true);
+  t.st.delay = 0;
+  await app.press("id:toggle-watchers");
+  await app.clock!.runFor(1);
+  expect(app.shows("text:Offer appearances: 1")).toBe(true);
+  expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
+});
+
 const fixtureRelease = (install: string, action: string, extra = {}) => ({
   presence: { version: "0.4.0", online: true, seen_at: Date.now(), install, self_update: install === "managed" },
   update: { latest: "0.5.0", available: true, action, pending: null, last_result: null, ...extra },
@@ -393,6 +510,52 @@ test("an update offer changed while confirming never requests a different target
   expect(text(app)).toContain("Build box downloads 0.6.0 from GitHub");
 });
 
+test("a held keyboard update keeps its scoped busy panel and restores focus to retry or result", async () => {
+  const f = world();
+  const mine = f.addRunner("Build box", "personal", "alice");
+  const path = `/v1/runners/${mine.id}/update`;
+  const updates = () => f.posts().filter((p) => p.path === path);
+  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update"));
+  f.state.rejectRunnerUpdate.add(mine.id);
+  f.answerLate(path, TOKENS.alice!, 1400);
+  const app = await openWith(f, null, true);
+  await signInToRunners(app, "alice");
+  const id = `id:runner-update:${mine.id}`;
+  const start = async () => {
+    await app.waitFor(`${id}:panel`);
+    await app.keyboard.press("tab"); // Cancel → Confirm
+    await app.keyboard.press("enter");
+    await app.waitFor(`${id}:busy >> text:Requesting…`);
+  };
+  await app.press(id);
+  await start();
+  expect(app.shows(`${id}:confirm`)).toBe(false);
+  expect(app.enabled(`${id}:cancel`)).toBe(false);
+  await app.keyboard.press("escape");
+  await app.keyboard.press("enter");
+  await app.keyboard.press("space");
+  expect(app.shows("id:runners-settings")).toBe(true);
+  expect(app.shows(`${id}:busy`)).toBe(true);
+  expect(updates()).toHaveLength(1);
+  await app.clock!.runFor(1500);
+  await app.waitFor(`id:runner-update-error:${mine.id}`);
+  expect(app.shows(`${id}:panel`)).toBe(false);
+  expect(updates()).toHaveLength(1);
+
+  f.state.rejectRunnerUpdate.delete(mine.id);
+  await app.keyboard.press("enter"); // Focus returned to the retry trigger.
+  await start();
+  expect(updates()).toHaveLength(2);
+  await app.clock!.runFor(1500);
+  await app.waitFor(`id:runner-update-result:${mine.id} >> text:Update to 0.5.0 requested`);
+  expect(app.shows(`${id}:panel`)).toBe(false);
+  expect(app.shows(id)).toBe(false);
+  await app.keyboard.press("tab"); // Result summary → next control (Rotate token).
+  await app.keyboard.press("enter");
+  await app.waitFor(`id:rotate-runner:${mine.id}:panel`);
+  expect(updates()).toHaveLength(2);
+});
+
 test("Docker guidance only exposes official version-matched pinned images; embedded, unsupported and non-admin rows can't update", async () => {
   const f = world();
   const embedded = f.addRunner("Laptop", "personal", "bob");
@@ -421,6 +584,7 @@ test("Docker guidance only exposes official version-matched pinned images; embed
   expect(app.shows(`id:runner-update-release:${manual.id}`)).toBe(true);
   for (const r of [docker, wrong, embedded, old, org, offline, manual]) expect(app.shows(`id:runner-update:${r.id}`)).toBe(false);
   await app.press(`id:runner-update-docker:${docker.id}:toggle`);
+  expect(text(app)).toContain("recreate the runner container with that image. Keep its existing configuration and volume mounts.");
   await app.press(`id:runner-copy-image:${docker.id}`);
   expect(app.clipboard()).toBe(image);
   await app.press(`id:runner-update-docker:${wrong.id}:toggle`);

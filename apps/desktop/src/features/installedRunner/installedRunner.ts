@@ -84,6 +84,8 @@ export const installedRunner = signal<InstalledRunner | null>(null);
 /** A bridge id verified against the current account's personal runners. */
 export const ownedInstalledRunner = signal<{ id: string; attachIfEmpty: boolean } | null>(null);
 export const checkingInstalledScope = signal(false);
+/** A provisioned (or temporarily unreachable) launcher worth watching for the offer. */
+export const installedRunnerStatusWatchable = signal(false);
 /** Owned Spaces whose runner is this one, by stable id. */
 export const runnerSpaces = signal<{ id: string; name: string }[]>([]);
 export const installedBusy = signal<null | "reconnect" | `folder:${string}`>(null);
@@ -116,6 +118,7 @@ function reset() {
 onSessionEnd(() => {
   gen++;
   inflight = null;
+  installedRunnerStatusWatchable.set(false);
   installedBusy.set(null);
   reset();
 });
@@ -145,38 +148,59 @@ export function recordAttachedFolder(space: { id: string; name: string }) {
   if (!runnerSpaces().some((s) => s.id === space.id)) runnerSpaces.set([...runnerSpaces(), space]);
 }
 
+/** The owner deleted this registration. An older bridge read can't revive its controls. */
+export function refreshAfterInstalledRunnerDeletion(id: string) {
+  if (ownedInstalledRunner()?.id !== id) return;
+  gen++;
+  inflight = null;
+  ownedInstalledRunner.set(null);
+  runnerSpaces.set([]);
+  folders.set({});
+  void loadInstalledRunner();
+}
+
 // One read per session at a time: the page may mount more than once as it opens.
 let inflight: { key: string; done: Promise<void> } | null = null;
 
 /** Opening the page: read the status only. Never throws; unknown hides. */
-export function loadInstalledRunner(): Promise<void> {
+export function loadInstalledRunner(readFolders = true): Promise<void> {
   const key = sessionKey();
   if (inflight && inflight.key === key) return inflight.done;
   if (installedBusy()) return Promise.resolve();
-  const done = readStatus().finally(() => {
+  const done = readStatus(readFolders).finally(() => {
     if (inflight?.done === done) inflight = null;
   });
   inflight = { key, done };
   return done;
 }
 
-async function readStatus(): Promise<void> {
+async function readStatus(readFolders: boolean): Promise<void> {
   const valid = stillValid();
-  const next = await readInstalledRunner();
+  const { runner: next, watchable } = await readBridgeStatus();
   if (!valid()) return;
+  installedRunnerStatusWatchable.set(watchable);
   if (!next || next.runner?.id !== installedRunner()?.runner?.id) reset();
   installedRunner.set(next);
-  if (next?.runner) await loadInstalledScope(next.runner.id, valid);
+  if (next?.runner && (readFolders || ownedInstalledRunner()?.id !== next.runner.id)) {
+    await loadInstalledScope(next.runner.id, valid);
+  }
 }
 
 /** Read the bridge again at the point of an explicit action, without changing the UI. */
 export async function readInstalledRunner(): Promise<InstalledRunner | null> {
+  return (await readBridgeStatus()).runner;
+}
+
+async function readBridgeStatus(): Promise<{ runner: InstalledRunner | null; watchable: boolean }> {
   const call = localRunnerCall();
-  if (!call || !apiClient() || !me()) return null;
+  if (!call || !apiClient() || !me()) return { runner: null, watchable: false };
   try {
-    return parseInstalledRunner(await call("GET", "/v1/local-tools/runner"));
-  } catch {
-    return null;
+    const runner = parseInstalledRunner(await call("GET", "/v1/local-tools/runner"));
+    // An answered "not installed / not this workspace" isn't a transient failure.
+    return { runner, watchable: runner !== null };
+  } catch (error) {
+    const unsupported = error instanceof BridgeError && [404, 405].includes(error.status ?? 0);
+    return { runner: null, watchable: !unsupported };
   }
 }
 

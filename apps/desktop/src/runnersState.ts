@@ -5,7 +5,7 @@ import type { RegisteredRunner, Space } from "./api/client";
 import { loadRunners, runnerBusy, runners, spaceRunners } from "./settings";
 import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, setRunnerPaired, spaces } from "./store";
 import { helper } from "./device/state";
-import { installedBusy, installedRunner, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner, recordAttachedFolder } from "./features/installedRunner/installedRunner";
+import { installedBusy, installedRunner, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner, recordAttachedFolder } from "./features/installedRunner/installedRunner";
 
 export const runnerSessionKey = () => JSON.stringify([connectedTo(), me()]);
 export const runnerOfferStorageKey = (server: string, userId: string) =>
@@ -13,6 +13,11 @@ export const runnerOfferStorageKey = (server: string, userId: string) =>
 
 const offer = signal<{ key: string; dismissed: boolean } | null>(null);
 const dismissedThisLaunch = new Set<string>();
+const offerFresh = signal(false);
+const watchers = signal(0);
+const watching = computed(() => watchers() > 0);
+const OFFER_REFRESH_MS = 5000;
+const OFFER_REFRESH_GRACE_MS = 2000;
 const attachFeedback = signal<{ message: string; incomplete: boolean } | null>(null);
 export const runnerAttachFeedback = () => attachFeedback();
 export const runnerAttachBusy = signal(false);
@@ -34,7 +39,8 @@ const offerKey = () => {
 
 export const runnerOfferCount = computed(() => {
   const state = offer();
-  return state && state.key === offerKey() && !state.dismissed && installedRunner()?.state === "online" ? eligibleSpaces().length : 0;
+  return offerFresh() && state && state.key === offerKey() && !state.dismissed && installedRunner()?.state === "online"
+    ? eligibleSpaces().length : 0;
 });
 
 async function loadOfferDismissal() {
@@ -55,38 +61,69 @@ export function dismissRunnerOffer() {
   void Storage.setItem(key, "dismissed").catch(() => {});
 }
 
-/** Read-only on mount and session switch. U10 can also mount it from Sidebar. */
-export function watchInstalledRunner() {
-  effect(() => {
-    connectedTo();
-    me();
-    const phase = helper().phase;
-    untracked(() => {
-      if (!offerKey()) return;
-      void loadOfferDismissal();
-      // The launcher only reports its installed runner after its session
-      // has been bound. Sidebar can mount before that asynchronous handshake.
-      if (phase === "checking") return;
-      const valid = sessionGuard();
-      let stopped = false;
-      let timer: ReturnType<typeof setTimeout> | undefined;
-      const read = async (remaining: number) => {
-        if (stopped || !valid()) return;
-        if (!runnerAttachBusy()) await loadInstalledRunner();
-        const state = installedRunner()?.state;
-        if (!stopped && valid() && remaining > 0 &&
-            (state === "starting" || state === "offline" || state === "idle")) {
-          timer = setTimeout(() => void read(remaining - 1), 5000);
-        }
-      };
-      cleanup(() => {
-        stopped = true;
-        if (timer !== undefined) clearTimeout(timer);
-      });
-      void read(6);
-    });
+/** One shared read-only watch, regardless of how many consumers are mounted. */
+export function watchInstalledRunner(refreshFoldersOnOpen = false) {
+  untracked(() => {
+    const count = watchers();
+    watchers.set(count + 1);
+    // Settings can open after Sidebar has been showing the same session for
+    // a while. It needs a fresh folder list, not another periodic watcher.
+    if (refreshFoldersOnOpen && count && offerKey() && helper().phase !== "checking" && !runnerAttachBusy()) {
+      void loadInstalledRunner();
+    }
   });
+  cleanup(() => watchers.set(untracked(watchers) - 1));
 }
+
+effect(() => {
+  if (watching() && offerKey()) untracked(() => void loadOfferDismissal());
+});
+
+effect(() => {
+  if (!watching() || !offerKey() || helper().phase === "checking") return;
+  // Initial read is independent of the offer, so Create can still use the
+  // verified runner after dismissal or when there are no existing Spaces.
+  untracked(() => void loadInstalledRunner());
+});
+
+const shouldWatchOffer = computed(() => {
+  if (!watching() || helper().phase === "checking" || !installedRunnerStatusWatchable() ||
+      runnerAttachBusy() || installedBusy() || ownedInstalledRunner()?.attachIfEmpty === false) return false;
+  const key = offerKey();
+  const state = offer();
+  return !!key && state?.key === key && !state.dismissed && spaces().some(isEmptyOwned);
+});
+
+effect(() => {
+  if (!shouldWatchOffer()) {
+    offerFresh.set(false);
+    return;
+  }
+  const valid = sessionGuard();
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  let expiry: ReturnType<typeof setTimeout> | undefined;
+  const tick = async () => {
+    if (stopped || !valid() || !shouldWatchOffer()) return;
+    // A hung bridge (with a longer transport timeout) must not leave an
+    // online offer on screen. Keep the last verified Create choice separate.
+    expiry = setTimeout(() => offerFresh.set(false), OFFER_REFRESH_GRACE_MS);
+    // Same runner: only ask the bridge for liveness. Don't reload every
+    // Space's folders while Sidebar is sitting open.
+    await loadInstalledRunner(false);
+    if (expiry !== undefined) clearTimeout(expiry);
+    expiry = undefined;
+    if (stopped || !valid() || !shouldWatchOffer()) return;
+    offerFresh.set(true);
+    timer = setTimeout(() => void tick(), OFFER_REFRESH_MS);
+  };
+  cleanup(() => {
+    stopped = true;
+    if (timer !== undefined) clearTimeout(timer);
+    if (expiry !== undefined) clearTimeout(expiry);
+  });
+  untracked(() => void tick());
+});
 
 function actionError(error: unknown, fallback: string) {
   if (!(error instanceof ApiError)) return fallback;
@@ -226,6 +263,8 @@ export async function requestRunnerUpdate(id: string, target: string) {
     if (!valid()) return;
     const live = list.find((r) => r.id === id);
     if (!live || selfUpdateTarget(live) !== target || installedRunner()?.runner?.id === id) {
+      await loadRunners();
+      if (!valid()) return;
       runnerUpdateErrors.set({ ...runnerUpdateErrors(), [id]: "This runner is no longer eligible for that update. Nothing was requested." });
       return;
     }
@@ -237,17 +276,17 @@ export async function requestRunnerUpdate(id: string, target: string) {
     const message = actionError(error, error instanceof ApiError && error.status === 409
       ? "The server refused this update. Availability or runner status may have changed."
       : "The server did not confirm this update request.");
+    await loadRunners();
+    if (!valid()) return;
     runnerUpdateErrors.set({ ...runnerUpdateErrors(), [id]: message });
   } finally {
-    if (valid()) {
-      runnerUpdateBusy.set(null);
-      void loadRunners();
-    }
+    if (valid()) runnerUpdateBusy.set(null);
   }
 }
 
 onSessionEnd(() => {
   offer.set(null);
+  offerFresh.set(false);
   attachFeedback.set(null);
   runnerAttachBusy.set(false);
   runnerUpdateBusy.set(null);

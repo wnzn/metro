@@ -3,7 +3,7 @@
 // in theme/theme.json. To swap the design system, replace this module while
 // keeping its exports' props.
 
-import { effect, keymap, List, Scroll, signal, Text, untracked, View } from "nsh";
+import { cleanup, effect, keymap, List, Scroll, signal, Text, untracked, View } from "nsh";
 import type { InputRef, JSX, ListRef, ViewRef } from "nsh";
 import { Button, Checkbox as BaseCheckbox, Collapsible, ContextMenu, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
 import type { ButtonProps } from "nsh/base";
@@ -833,6 +833,16 @@ type ConfirmTrigger =
   | { triggerLabel: string; open?: boolean; onOpenChange?: (open: boolean) => void; returnFocus?: () => ViewRef | null | undefined }
   | { triggerLabel?: never; open: boolean; onOpenChange: (open: boolean) => void; returnFocus: () => ViewRef | null | undefined };
 
+/** An inline result that can receive keyboard focus after its action goes away. */
+export function StatusSummary(props: Testable & { focusable: boolean; viewRef: (node: ViewRef) => void; children?: JSX.Element }) {
+  return (
+    <View ref={props.viewRef} role={props.focusable ? "summary" : undefined} focusable={props.focusable}
+      class={focusRing} accessibilityLabel={props.accessibilityLabel} testID={props.testID}>
+      {props.children}
+    </View>
+  );
+}
+
 /**
  * A confirmation scoped to one row. `testID` names the trigger; the panel,
  * warning, input, Cancel, final action and busy status use `:panel`, `:warning`,
@@ -858,6 +868,8 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
   disabled?: boolean;
   busy?: boolean;
   busyLabel?: string;
+  /** Controlled close after confirming: fall back to the opener if this returns no result control. */
+  returnFocusAfterBusy?: () => ViewRef | null | undefined;
 }) {
   const localOpen = signal(false);
   const session = signal<{ key?: string; opener?: ViewRef | null } | null>(null);
@@ -871,12 +883,29 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
   let trigger: ViewRef | undefined;
   let cancelControl: ViewRef | undefined;
   let busyFocus: ReturnType<typeof session> = null;
+  let submitted: ReturnType<typeof session> = null;
+  let focusedWhileBusy: ReturnType<typeof session> = null;
+  let mounted = true;
+  cleanup(() => { mounted = false; });
   let wasRequested = false;
   const changeOpen = (next: boolean) => {
     if (props.open === undefined) localOpen.set(next);
     props.onOpenChange?.(next);
   };
-  const restore = (active: { opener?: ViewRef | null }) => (active.opener ?? trigger)?.focus();
+  const restore = (active: NonNullable<ReturnType<typeof session>>) => {
+    const opener = active.opener ?? trigger;
+    if (!props.returnFocusAfterBusy || submitted !== active) {
+      opener?.focus();
+      return;
+    }
+    // Don't pull focus back from a different control the person moved to.
+    if (props.busy || (focusedWhileBusy === active && busyFocus !== active)) return;
+    const next = props.returnFocusAfterBusy() ?? opener;
+    if (!next) return;
+    void next.measure().then((layout) => {
+      if (layout && mounted && session() === null && props.scopeKey === active.key) next.focus();
+    });
+  };
   // A true prop is a request to open only on its rising edge. Retargeting
   // invalidates the session even if the parent keeps requesting it, or the
   // original target comes back before the parent clears its request.
@@ -915,6 +944,7 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
     if (!open() || !ready()) return;
     typed.set("");
     if (props.open === undefined) close();
+    else submitted = session();
     props.onConfirm();
   };
   const variant = () => props.variant ?? "destructive";
@@ -999,7 +1029,7 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
                 ref={(node) => focusInPanel(node, true)}
                 role="summary" focusable captureKeys={["enter", "space"]}
                 accessibilityLabel={busyLabel()} accessibilityState={{ busy: true }} testID={id("busy")}
-                onFocus={() => { busyFocus = session(); busyEscape.onFocus(); }}
+                 onFocus={() => { focusedWhileBusy = busyFocus = session(); busyEscape.onFocus(); }}
                 onBlur={() => { if (props.busy) busyFocus = null; busyEscape.onBlur(); }}>
                 <Text class={cx(textClass.sm, "font-medium text-muted-foreground")} accessibilityElementsHidden>{busyLabel()}</Text>
               </View>
