@@ -855,6 +855,116 @@ fn rows(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
 }
 
 #[tokio::test]
+async fn library_model_compare_and_save_preserves_the_index_on_stale_writes() {
+    let s = Server::start_on_file().await;
+    let create = |name: &'static str| {
+        let s = &s;
+        async move {
+            s.create(
+                ALICE,
+                json!({"name": name, "provider_id": "embeddinggemma-2", "base_url": s.fixture.base_url}),
+            )
+            .await["id"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        }
+    };
+    let (a, b) = (create("A").await, create("B").await);
+    let path = "/v1/library/settings";
+    let guarded_path = "/v1/library/settings/selection";
+    let read = || s.send(reqwest::Method::GET, ALICE, path, None);
+    let put = |body| s.send(reqwest::Method::PUT, ALICE, guarded_path, Some(body));
+    let (status, initial) = read().await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(initial["selection_precondition"], true);
+    assert_eq!(initial["embedding_id"], Value::Null);
+
+    // A's view still has no model; a legacy window can save B as before.
+    let (status, saved) = s
+        .send(
+            reqwest::Method::PUT,
+            ALICE,
+            path,
+            Some(json!({"embedding_id": b})),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(saved["embedding_id"], b);
+    seed_index(&s, "alice", "alice-index", &b);
+    seed_index(&s, "bob", "bob-index", &b);
+    let intact = (rows(&[("alice", "alice-index"), ("bob", "bob-index")]), 2);
+
+    for body in [
+        json!({"embedding_id": a, "expected_embedding_id": null}),
+        json!({"embedding_id": null, "expected_embedding_id": a}),
+        json!({"embedding_id": b, "expected_embedding_id": a}),
+    ] {
+        let (status, error) = put(body).await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            error["error"],
+            "the saved media model changed; reload it before saving"
+        );
+        assert_eq!(read().await.1["embedding_id"], b);
+        assert_eq!(index_rows(&s), intact);
+    }
+    for body in [
+        json!({"embedding_id": null}),
+        json!({"expected_embedding_id": b}),
+        json!({"embedding_id": null, "expected_embedding_id": 1}),
+        json!({"embedding_id": null, "expected_embedding_id": b, "unknown": true}),
+    ] {
+        assert_eq!(put(body).await.0, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(index_rows(&s), intact);
+    }
+    assert_eq!(
+        put(json!({"embedding_id": b, "expected_embedding_id": b}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    assert_eq!(index_rows(&s), intact);
+
+    let shared = s.space(ALICE, "Shared", &["bob"]).await;
+    s.share(
+        ALICE,
+        &a,
+        json!({"visibility": "spaces", "space_ids": [shared]}),
+    )
+    .await;
+    assert_eq!(
+        s.send(
+            reqwest::Method::PUT,
+            BOB,
+            guarded_path,
+            Some(json!({"embedding_id": a, "expected_embedding_id": null})),
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    assert_eq!(index_rows(&s), intact);
+
+    let (status, replaced) = put(json!({"embedding_id": a, "expected_embedding_id": b})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(replaced["embedding_id"], a);
+    let others = (rows(&[("bob", "bob-index")]), 1);
+    assert_eq!(index_rows(&s), others);
+    seed_index(&s, "alice", "alice-index", &a);
+    let (status, cleared) = put(json!({"embedding_id": null, "expected_embedding_id": a})).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(cleared["embedding_id"], Value::Null);
+    assert_eq!(index_rows(&s), others);
+    assert_eq!(
+        put(json!({"embedding_id": b, "expected_embedding_id": null}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+}
+
+#[tokio::test]
 async fn definitive_provider_changes_purge_library_vectors() {
     let s = Server::start_on_file().await;
     let f = &s.fixture;

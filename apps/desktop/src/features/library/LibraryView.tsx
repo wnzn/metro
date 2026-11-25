@@ -8,16 +8,17 @@
 //   The query is typed only in the search box at the top; Return there is the
 //   only thing that sends it anywhere.
 // - `MediaModelSettings`: the media model choice and where files and queries
-//   go, mounted by Settings › Model providers.
+//   go, mounted by Settings › Model choices.
 //
 // Message search (Search's Conversations mode) is a separate corpus.
 
 import { signal, untracked } from "nsh";
-import { me, openPlace, openSettings, spaces } from "../../store";
+import { me, onSessionEnd, openPlace, openSettings, spaces } from "../../store";
 import { ACCEPTED } from "../../api/library";
 import type { AvailableModel } from "../../api/client";
 import {
   Action,
+  ActionBar,
   ActionsMenu,
   Badge,
   Banner,
@@ -25,6 +26,7 @@ import {
   Column,
   Disclosure,
   CompactAudioPlayer,
+  ConfirmInline,
   FileIcon,
   FileList,
   FileRow,
@@ -34,6 +36,7 @@ import {
   MediaPlayer,
   PageHeader,
   Picker,
+  ProblemNote,
   Row,
   RowDetail,
   ResultCard,
@@ -61,6 +64,7 @@ import {
   confirmingDelete,
   deleting,
   draftModel,
+  editMediaModel,
   fileKindOf,
   fileNotice,
   formatSize,
@@ -81,9 +85,14 @@ import {
   locatorText,
   maxFileBytes,
   mediaModels,
+  mediaSelectionPrecondition,
+  modelConflict,
   modelDraft,
   modelError,
+  modelNotice,
   modelsLoaded,
+  modelsLoading,
+  modelsUnsupported,
   nextCursor,
   openAsset,
   openLabel,
@@ -91,6 +100,7 @@ import {
   openLibraryHit,
   openLibrarySearch,
   relevantHits,
+  revertMediaModel,
   playerError,
   playerFailed,
   playerPosition,
@@ -224,16 +234,24 @@ function UploadOutcomes() {
 
 /**
  * Asked from a file's Index while no media model is saved: Settings › Model
- * providers opens with the media model choice scrolled into view.
+ * choices opens with the media model choice scrolled into view.
  */
 const mediaModelAsked = signal(false);
 /** Scroll the media model choice into view once, when Settings opens on it. */
 const revealMediaModel = signal(false);
+onSessionEnd(() => {
+  mediaModelAsked.set(false);
+  revealMediaModel.set(false);
+});
 
 function chooseMediaModel() {
   mediaModelAsked.set(true);
+  openMediaChoices();
+}
+
+function openMediaChoices() {
   revealMediaModel.set(true);
-  openSettings("providers");
+  openSettings("models");
 }
 
 /** Where Index sends a file, said before any Index (only once a media model is chosen; without one, Index leads to choosing it). */
@@ -398,22 +416,23 @@ const RERANK_NOTE = "With a System One connection, search also sends short extra
 
 /**
  * The media model Documents & media indexes and searches with, and where
- * files and queries go. Settings › Model providers mounts it. Nothing is
+ * files and queries go. Settings › Model choices mounts it. Nothing is
  * used until the person saves a choice.
  */
-export function MediaModelSettings() {
+export function MediaModelSettings(props: { separate?: boolean; canReveal?: boolean }) {
   untracked(() => void loadModels());
   const items = (): PickerItem[] => [
-    { value: "none", label: "None" },
+    { value: "none", label: "None", detail: "Indexing and file search are off." },
     ...mediaModels().map((m) => ({ value: m.connectionId, label: `${m.name}${m.model ? ` · ${m.model}` : ""}${m.owned ? "" : ` · shared by ${m.ownerId ?? "someone"}`}` })),
   ];
-  const dirty = () => modelDraft() !== savedModelId();
+  const missing = () => modelsLoaded() && !modelsLoading() && modelDraft() !== null && !draftModel();
+  const editable = () => modelsLoaded() && !modelsLoading() && mediaSelectionPrecondition();
   const suggestion = () => {
     const id = suggestedModelId();
     return id && id !== savedModelId() ? mediaModels().find((m) => m.connectionId === id) ?? null : null;
   };
   return (
-    <RevealAnchor active={revealMediaModel()} onShown={() => revealMediaModel.set(false)} testID="library-model-anchor">
+    <RevealAnchor active={revealMediaModel() && props.canReveal !== false} onShown={() => revealMediaModel.set(false)} testID="library-model-anchor">
     <SettingsGroup
       title="Documents & media"
       description="Indexing and file search use only the media connection chosen here. A text-only embeddings connection can't stand in."
@@ -429,16 +448,42 @@ export function MediaModelSettings() {
       <SettingRow
         label="Index and search with"
         description={
-          modelsLoaded() && mediaModels().length === 0
-            ? "You have no media embeddings connection yet. Add EmbeddingGemma 2 (google/embeddinggemma-2) as a connection, or ask someone to share theirs."
+          modelsLoading() ? "Loading media models…" : modelsUnsupported() ? "This server doesn't offer indexing and file search."
+            : !modelsLoaded() ? "The server hasn't confirmed the saved model."
             : savedModel()
-              ? `Saved: ${savedModel()!.name}.`
-              : "Nothing is chosen, so nothing can be indexed or searched."
+            ? `Saved: ${savedModel()!.name}.`
+              : savedModelId() ? "The saved selection is unavailable in personal scope; no other model takes its place."
+              : mediaModels().length === 0
+                ? "No media models yet. Add EmbeddingGemma 2 in Model connections, or ask for an organization share."
+                : "Nothing is chosen, so nothing can be indexed or searched."
         }
+        stacked
       >
-        <Picker testID="library-model-picker" accessibilityLabel="Media model" items={items()} value={modelDraft() ?? "none"} onChange={(v) => modelDraft.set(v === "none" ? null : v)} />
+        <Column gap={2}>
+          <If when={editable()}>
+            <Picker testID="library-model-picker" accessibilityLabel="Media model" items={items()}
+              value={missing() ? null : modelDraft() ?? "none"} placeholder="Unavailable selection"
+              disabled={savingModel()} onChange={(v) => {
+                if (!editable() || savingModel()) return;
+                editMediaModel(v === "none" ? null : v);
+              }} />
+          </If>
+          <If when={modelsLoaded() && !modelsLoading() && !mediaSelectionPrecondition()}>
+            <ProblemNote tone="warning" testID="library-model-guard-unsupported"
+              text="Update Metro Server to change the media model safely. This app won't send an unguarded change." />
+          </If>
+          <If when={editable() && missing()}>
+            <ProblemNote tone="warning" testID="library-model-missing"
+              text="Choose another media model or clear this selection and save. Metro won't replace it automatically."
+              action={<Action label="Clear selection" testID="library-model-clear" variant="ghost" disabled={savingModel()} onPress={() => editMediaModel(null)} />} />
+          </If>
+          <If when={editable() ? suggestion() : null}>
+            {(s) => <Action testID="library-model-suggested" label={`Use ${s().name}`} variant="ghost"
+              disabled={savingModel()} onPress={() => editMediaModel(s().connectionId)} />}
+          </If>
+        </Column>
       </SettingRow>
-      <If when={draftModel()}>
+      <If when={modelsLoaded() && !modelsLoading() ? draftModel() : null}>
         {(m) => (
           <Column padX={4} padY={3} gap={1} testID="library-model-dataflow">
             <Label variant="strong">Where your files go</Label>
@@ -451,35 +496,66 @@ export function MediaModelSettings() {
           </Column>
         )}
       </If>
-      <If when={modelError()}>
-        {(e) => (
-          <Column padX={4} padY={2}>
-            <Label variant="caption" color="danger" testID="library-model-error">
-              {e()}
-            </Label>
-          </Column>
-        )}
+      <If when={!props.separate}>
+        <MediaModelFeedback />
+        <MediaModelSaveBar />
       </If>
-      <Row padX={4} padY={3} gap={2} justify="end">
-        <If when={suggestion()}>
-          {(s) => <Action testID="library-model-suggested" label={`Use ${s().name}`} variant="ghost" onPress={() => modelDraft.set(s().connectionId)} />}
-        </If>
-        <Action
-          testID="library-model-save"
-          label="Save"
-          busyLabel="Saving…"
-          busy={savingModel()}
-          disabled={!dirty()}
-          variant="primary"
-          onPress={() =>
-            void saveModel().then(() => {
-              if (savedModelId()) mediaModelAsked.set(false);
-            })
-          }
-        />
-      </Row>
     </SettingsGroup>
     </RevealAnchor>
+  );
+}
+
+export function MediaModelFeedback() {
+  return (
+    <>
+      <If when={modelError()}>
+        {(e) => <Banner variant="inline" tone="danger" testID="library-model-error" message={e()}
+          action={<Action label="Try again" onPress={() => void loadModels()} />} />}
+      </If>
+      <If when={modelConflict()}>
+        {(message) => <Banner variant="inline" tone="warning" testID="library-model-conflict" message={message()} />}
+      </If>
+      <If when={modelNotice()}>
+        {(n) => <Banner variant="inline" tone="success" testID="library-model-notice" message={n()} />}
+      </If>
+    </>
+  );
+}
+
+export function MediaModelSaveBar(props: { separate?: boolean }) {
+  const dirty = () => modelDraft() !== savedModelId();
+  const disabled = () => !dirty() || !mediaSelectionPrecondition() || !modelsLoaded() || modelsLoading() || (modelDraft() !== null && !draftModel());
+  const save = (confirmed?: { previous: string; next: string | null }) => {
+    void saveModel(confirmed).then((saved) => {
+      if (saved && savedModelId()) mediaModelAsked.set(false);
+    });
+  };
+  return (
+    <If when={!props.separate || dirty() || savingModel()}>
+      <Column gap={2}>
+        <ActionBar justify="between">
+          <Column grow>
+            <If when={dirty()}><Label variant="caption" color="muted">Unsaved media model</Label></If>
+          </Column>
+          <Action testID="library-model-revert" label="Revert" disabled={!dirty() || savingModel()} variant="ghost" onPress={revertMediaModel} />
+          <If when={!savedModelId()}>
+            <Action testID="library-model-save" label={props.separate ? "Save media model" : "Save"} busyLabel="Saving…"
+              busy={savingModel()} disabled={disabled()} variant="primary" onPress={() => save()} />
+          </If>
+        </ActionBar>
+        <If when={savedModelId()}>
+          {(previous) => (
+            <ConfirmInline testID="library-model-save"
+              triggerLabel={modelDraft() === null ? "Clear media model…" : "Change media model…"}
+              confirmLabel={modelDraft() === null ? "Clear model and index" : "Change model and clear index"}
+              message="This removes your Documents & media index, not your files or anyone else's index. Index your files again to search them with a new model."
+              scopeKey={JSON.stringify([previous(), modelDraft(), modelsLoaded(), modelsLoading(), mediaSelectionPrecondition()])}
+              busy={savingModel()} busyLabel="Saving…" disabled={disabled()}
+              onConfirm={() => save({ previous: previous(), next: modelDraft() })} />
+          )}
+        </If>
+      </Column>
+    </If>
   );
 }
 
@@ -553,10 +629,10 @@ function LibraryFilters() {
             <Banner tone="warning" testID="library-search-no-model">
               <Column grow>
                 <Label variant="caption" color="warning">
-                  Choose a media model in Settings › Model providers to search your files. Nothing is sent anywhere until you do and search.
+                  Choose a media model in Settings › Model choices to search your files. Nothing is sent anywhere until you do and search.
                 </Label>
               </Column>
-              <Action testID="library-open-model-settings" label="Choose a media model" variant="ghost" onPress={() => openSettings("providers")} />
+              <Action testID="library-open-model-settings" label="Choose a media model" variant="ghost" onPress={openMediaChoices} />
             </Banner>
           </If>
         }
@@ -574,7 +650,7 @@ function LibraryFilters() {
               <Label color="danger">{e().message}</Label>
             </Column>
             <If when={e().needsModel}>
-              <Action testID="library-search-open-providers" label="Open Model providers" onPress={() => openSettings("providers")} />
+              <Action testID="library-search-open-providers" label="Open Model choices" variant="ghost" onPress={openMediaChoices} />
             </If>
           </Banner>
         )}

@@ -217,7 +217,7 @@ const startingIds = computed(() => {
   return h.phase === "ready" ? h.status.connections.filter((c) => c.worker === "starting").map((c) => c.connectionId).sort().join(",") : "";
 });
 /** Model providers is on screen (its list, a row or the setup page): the only view that shows these states. */
-const providersVisible = computed(() => place() === "settings" && settingsSection() === "providers");
+const providersVisible = computed(() => place() === "settings" && settingsSection() === "connections");
 
 // While a worker is starting and Model providers is open, re-read the bridge's
 // GET /v1/status (no vendor or model call) until it settles: one request at a

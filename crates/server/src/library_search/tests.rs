@@ -910,7 +910,7 @@ impl World {
     fn engine<'a>(&'a self, user: &'a str, classifier: bool) -> Engine<'a> {
         let mut c = self.db.lock();
         if store::embedding_id(&c, user).unwrap().is_none() {
-            store::set_embedding_id(&mut c, user, Some("media")).unwrap();
+            store::set_embedding_id(&mut c, user, Some("media"), None).unwrap();
         }
         drop(c);
         Engine::new(
@@ -1801,6 +1801,7 @@ async fn settings_never_switch_silently() {
         v,
         SettingsView {
             embedding_id: None,
+            selection_precondition: true,
             suggested_id: None
         }
     );
@@ -1811,24 +1812,23 @@ async fn settings_never_switch_silently() {
         v,
         SettingsView {
             embedding_id: None,
+            selection_precondition: true,
             suggested_id: Some("media".into())
         }
     );
     // Saving: text-only and unknown connections are refused.
-    let put = |id: Option<&str>| Settings {
-        embedding_id: id.map(str::to_owned),
-    };
+    let put = |id: Option<&str>| id.map(str::to_owned);
     assert_eq!(
-        engine::save_settings(&w.db, &w.fx, "alice", put(Some("text-only")))
+        engine::save_settings(&w.db, &w.fx, "alice", put(Some("text-only")), None)
             .await
             .unwrap_err(),
         LibrarySearchError::NotMediaCapable
     );
     assert!(matches!(
-        engine::save_settings(&w.db, &w.fx, "alice", put(Some("ghost"))).await,
+        engine::save_settings(&w.db, &w.fx, "alice", put(Some("ghost")), None).await,
         Err(LibrarySearchError::Unusable(_))
     ));
-    engine::save_settings(&w.db, &w.fx, "alice", put(Some("media")))
+    engine::save_settings(&w.db, &w.fx, "alice", put(Some("media")), None)
         .await
         .unwrap();
     let v = engine::settings_view(&w.db, &w.fx, "alice", Some("media".into()))
@@ -1838,6 +1838,7 @@ async fn settings_never_switch_silently() {
         v,
         SettingsView {
             embedding_id: Some("media".into()),
+            selection_precondition: true,
             suggested_id: None
         }
     );
@@ -1852,11 +1853,11 @@ async fn settings_never_switch_silently() {
     );
     w.index("alice", "a").await.unwrap();
     assert_eq!(w.segments("alice"), 3);
-    engine::save_settings(&w.db, &w.fx, "alice", put(Some("media")))
+    engine::save_settings(&w.db, &w.fx, "alice", put(Some("media")), None)
         .await
         .unwrap();
     assert_eq!(w.segments("alice"), 3, "same connection keeps it");
-    engine::save_settings(&w.db, &w.fx, "alice", put(None))
+    engine::save_settings(&w.db, &w.fx, "alice", put(None), None)
         .await
         .unwrap();
     assert_eq!(w.segments("alice"), 0);
@@ -2399,7 +2400,7 @@ async fn settings_switched_while_the_old_model_runs_stores_nothing() {
     );
     w.engine("alice", false); // the setting names `media`
     hold(&w, |db| {
-        store::set_embedding_id(&mut db.lock(), "alice", Some("media2")).unwrap();
+        store::set_embedding_id(&mut db.lock(), "alice", Some("media2"), None).unwrap();
     });
     match w.index("alice", "a").await {
         Err(LibrarySearchError::Unusable(m)) => assert!(m.contains("nothing was stored")),
@@ -2492,7 +2493,7 @@ fn the_store_transaction_revalidates_everything() {
     let sid = w.space("alice", &["bob"]);
     w.upload("s", "alice", Some(&sid), "s.txt", "text/plain", "x".into());
     let sha = hex(b"x");
-    store::set_embedding_id(&mut w.db.lock(), "bob", Some("media")).unwrap();
+    store::set_embedding_id(&mut w.db.lock(), "bob", Some("media"), None).unwrap();
     let seg = protocol::Segment {
         seq: 0,
         vector: vec![1.0],

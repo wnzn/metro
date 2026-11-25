@@ -575,35 +575,47 @@ pub fn is_member(conn: &Connection, space_id: &str, user_id: &str) -> rusqlite::
 /// Space both `caller` and the owner belong to now. `space`: only shares
 /// with that Space (plus organization shares); `None` with `any_space`
 /// false: organization shares only; `None` with `any_space`: any Space.
+/// A Space share includes one matching Space for authorization under this
+/// same DB lock. That witness is never part of the public response.
 pub fn shared_with(
     conn: &Connection,
     caller: &str,
     space: Option<&str>,
     any_space: bool,
-) -> rusqlite::Result<Vec<(Row, Visibility)>> {
+) -> rusqlite::Result<Vec<(Row, Visibility, Option<String>)>> {
     let columns = COLUMNS
         .split(", ")
         .map(|c| format!("c.{c}"))
         .collect::<Vec<_>>()
         .join(", ");
     let mut stmt = conn.prepare_cached(&format!(
-        "SELECT {columns}, s.visibility FROM provider_connections c
+        "WITH granted_spaces AS (
+             SELECT ss.connection_id, MIN(ss.space_id) AS space_id
+             FROM provider_share_spaces ss
+             JOIN provider_connections pc ON pc.id = ss.connection_id
+             JOIN space_members me ON me.space_id = ss.space_id AND me.user_id = ?1
+             JOIN space_members owner ON owner.space_id = ss.space_id AND owner.user_id = pc.user_id
+             WHERE (?2 IS NOT NULL OR ?3) AND (?2 IS NULL OR ss.space_id = ?2)
+             GROUP BY ss.connection_id
+         )
+         SELECT {columns}, s.visibility,
+             CASE WHEN s.visibility = 'spaces' THEN g.space_id END
+         FROM provider_connections c
          JOIN provider_shares s ON s.connection_id = c.id
+         LEFT JOIN granted_spaces g ON g.connection_id = c.id
          WHERE c.user_id <> ?1 AND c.model <> '' AND (
              s.visibility = 'organization'
-             OR (s.visibility = 'spaces' AND (?2 IS NOT NULL OR ?3) AND EXISTS (
-                 SELECT 1 FROM provider_share_spaces ss
-                 JOIN space_members me ON me.space_id = ss.space_id AND me.user_id = ?1
-                 JOIN space_members owner ON owner.space_id = ss.space_id
-                      AND owner.user_id = c.user_id
-                 WHERE ss.connection_id = c.id AND (?2 IS NULL OR ss.space_id = ?2)))
-         )
+             OR (s.visibility = 'spaces' AND g.space_id IS NOT NULL))
          ORDER BY c.created_at, c.rowid"
     ))?;
     stmt.query_map(params![caller, space, any_space], |r| {
         let row = read(r)?;
         let v: String = r.get(10)?;
-        Ok((row, Visibility::parse(&v).unwrap_or(Visibility::Personal)))
+        Ok((
+            row,
+            Visibility::parse(&v).unwrap_or(Visibility::Personal),
+            r.get(11)?,
+        ))
     })?
     .collect()
 }

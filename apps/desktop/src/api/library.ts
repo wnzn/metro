@@ -93,7 +93,7 @@ export type IndexItem = { assetId: string; status: "indexed" | "not_found" | "un
 export type IndexResult = { indexedSegments: number; partial: boolean; items: IndexItem[]; notice: string | null };
 
 /** The person's media embedding choice. `suggestedId`: their message-search connection, when the server confirmed it media-capable; never used until saved. */
-export type LibrarySettings = { embeddingId: string | null; suggestedId: string | null };
+export type LibrarySettings = { embeddingId: string | null; suggestedId: string | null; selectionPrecondition: boolean };
 
 /** A file's bytes, read through an authenticated request. */
 export type AssetContent = { bytes: Uint8Array; contentType: string };
@@ -172,14 +172,23 @@ export function libraryApi(request: RequestFn, binary: BinaryFn) {
 
     async librarySettings(): Promise<LibrarySettings> {
       const data = await request("GET", "/v1/library/settings");
-      if (!isObject(data) || !("embedding_id" in data)) throw new ApiError("protocol", "GET /v1/library/settings did not return { embedding_id }.");
-      return { embeddingId: optionalId(data.embedding_id), suggestedId: optionalId(data.suggested_id) };
+      if (!isObject(data) || (data.embedding_id !== null && !optionalId(data.embedding_id))) {
+        throw new ApiError("protocol", "GET /v1/library/settings did not return a valid selection.");
+      }
+      return {
+        embeddingId: optionalId(data.embedding_id),
+        suggestedId: optionalId(data.suggested_id),
+        selectionPrecondition: data.selection_precondition === true,
+      };
     },
 
-    async putLibrarySettings(embeddingId: string | null): Promise<LibrarySettings> {
-      const data = await request("PUT", "/v1/library/settings", { embedding_id: embeddingId });
-      if (!isObject(data)) return { embeddingId, suggestedId: null };
-      return { embeddingId: "embedding_id" in data ? optionalId(data.embedding_id) : embeddingId, suggestedId: optionalId(data.suggested_id) };
+    async putLibrarySettings(embeddingId: string | null, expected: string | null): Promise<LibrarySettings> {
+      // The legacy route has no precondition. Never use it, even as a retry.
+      const data = await request("PUT", "/v1/library/settings/selection", { embedding_id: embeddingId, expected_embedding_id: expected });
+      if (!isObject(data) || data.selection_precondition !== true || data.embedding_id !== embeddingId) {
+        throw new ApiError("protocol", "The server did not confirm the media model selection.");
+      }
+      return { embeddingId, suggestedId: optionalId(data.suggested_id), selectionPrecondition: true };
     },
 
     /** Sends this one file to the chosen media model. */

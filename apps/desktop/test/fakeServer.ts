@@ -69,6 +69,20 @@ export function fakeServer() {
     runners: new Map<string, Runner>(),
     attached: new Map<string, string>(), // space id -> runner id
     connections: new Map<string, Conn>(),
+    allowedBaseUrls: [...CATALOG.allowed_base_urls],
+    /** Scripted endpoint test failures, before PATCH commits; never a live provider request. */
+    endpointRefusals: new Map<string, { status: number; error: string; code?: string }>(),
+    /** A different writer commits while Metro's endpoint test is running. */
+    endpointConcurrentEdits: new Map<string, { name: string; baseUrl: string }>(),
+    endpointProbes: [] as string[],
+    /** Break only the response to a committed endpoint PATCH. */
+    endpointAck: new Map<string, "lost" | "malformed">(),
+    /** Proxy 504 while the server is still probing, released by the test. */
+    heldEndpointProbes: new Set<string>(),
+    finishEndpointProbes: new Map<string, () => void>(),
+    providersReadStatus: 200,
+    /** Scenario opts into modern flat chat inventory; other callers exercise the older shape. */
+    chatInventory: false,
     /** Device connection ids whose metro-connector is online. */
     online: new Set<string>(),
     /** Model routing per user (missing: the defaults, all off). */
@@ -117,7 +131,7 @@ export function fakeServer() {
     return Object.keys(TOKENS).find((u) => auth === `Bearer ${TOKENS[u]}`);
   };
   const ok = (body: unknown, status = 200) => ({ status, body });
-  const err = (status: number, error: string) => ({ status, body: { error } });
+  const err = (status: number, error: string, code?: string) => ({ status, body: { error, ...(code ? { code } : {}) } });
   const spaceJson = (s: Space, user: string) => ({ id: s.id, name: s.name, role: s.owner === user ? "owner" : "member", runner_paired: !!s.runnerToken || state.attached.has(s.id) });
   const admin = (user: string) => ORG_ADMINS.includes(user);
   const visibleRunner = (r: Runner | undefined, user: string) => !!r && (r.visibility === "organization" || r.owner === user);
@@ -243,8 +257,9 @@ export function fakeServer() {
         return ok(undefined, 204);
       }
     }
-    if (path === "/v1/provider-catalog" && req.method === "GET") return ok(CATALOG);
+    if (path === "/v1/provider-catalog" && req.method === "GET") return ok({ ...CATALOG, allowed_base_urls: state.allowedBaseUrls });
     if (path === "/v1/providers" && req.method === "GET") {
+      if (state.providersReadStatus !== 200) return err(state.providersReadStatus, "could not load connections");
       return ok({ connections: [...state.connections.values()].filter((c) => c.owner === user).map(connJson) });
     }
     if (path === "/v1/providers" && req.method === "POST") {
@@ -283,6 +298,12 @@ export function fakeServer() {
             owner_id: c.owner, execution,
             runs_on: owned ? "your_connection" : preset ? "your_own_sign_in" : "owner_connection",
             billing: owned || preset ? "you" : "owner",
+            ...(state.chatInventory && c.capability === "chat" ? {
+              chat_models: modelViews(c).filter((m) => m.enabled).map((m) => ({
+                id: m.model_id, display_name: m.display_name, reasoning_efforts: m.reasoning_efforts,
+                is_default: m.is_default, available: m.available,
+              })),
+            } : {}),
             ...(preset ? { ready: [...state.connections.values()].some((x) => x.owner === user && x.provider_id === "device-openai-oauth" && !!x.model) } : {}),
             is_default: owned && c.is_default,
           };
@@ -388,6 +409,39 @@ export function fakeServer() {
         }
       }
       if (!r[2] && req.method === "PATCH") {
+        if (body.base_url !== undefined) {
+          const provider = CATALOG.providers.find((p) => p.id === c.provider_id);
+          if (device || !provider?.allow_custom_url) return err(400, "not a custom server connection", "endpoint_rejected");
+          const url = body.base_url;
+          if (!state.allowedBaseUrls.includes(url)) return err(400, "base_url must be exactly one of this server's allowed_base_urls", "endpoint_not_approved");
+          if (url !== c.base_url) {
+            const refusal = state.endpointRefusals.get(url);
+            if (refusal?.code === "endpoint_probe_busy") return err(refusal.status, refusal.error, refusal.code);
+            state.endpointProbes.push(url);
+            if (state.heldEndpointProbes.delete(url)) {
+              const previous = c.base_url;
+              state.finishEndpointProbes.set(url, () => {
+                state.finishEndpointProbes.delete(url);
+                if (state.connections.get(c.id) === c && c.base_url === previous) c.base_url = url;
+              });
+              return err(504, "Gateway Timeout");
+            }
+            if (refusal) return err(refusal.status, refusal.error, refusal.code);
+            const concurrent = state.endpointConcurrentEdits.get(url);
+            if (concurrent) {
+              state.endpointConcurrentEdits.delete(url);
+              c.name = concurrent.name;
+              c.base_url = concurrent.baseUrl;
+              return err(409, "the connection changed while this change was being saved; reload it and try again", "endpoint_conflict");
+            }
+            c.base_url = url;
+            const ack = state.endpointAck.get(url);
+            state.endpointAck.delete(url);
+            if (ack === "lost") return { error: "fixture lost the response" };
+            if (ack === "malformed") return ok({ unexpected: true });
+          }
+          return ok(connJson(c));
+        }
         if (body.name !== undefined) c.name = body.name;
         if (body.model !== undefined) {
           c.model = body.model;

@@ -4,7 +4,7 @@
 // shared ActionsMenu (./primitives).
 // Feature code passes only semantic props; every class decision lives here.
 
-import { Image, Text, View, effect, token, untracked } from "nsh";
+import { Image, Text, View, effect, reduceMotion, signal, token, untracked } from "nsh";
 import type { JSX, ViewRef } from "nsh";
 import { Button, Menu, MenuItem } from "nsh/base";
 import fileAudioIcon from "./icons/file-audio.svg";
@@ -220,15 +220,20 @@ export function UploadMenu(
 /** Content that scrolls itself into view when `active` turns true (a "take me there" from another page), then calls `onShown`. */
 export function RevealAnchor(props: { active: boolean; onShown?: () => void; children?: JSX.Element; testID?: string }) {
   let node: ViewRef | undefined;
+  const laidOut = signal(false);
   effect(() => {
-    if (!props.active) return;
-    untracked(() => {
-      node?.reveal({ vertical: "start" });
+    if (!props.active || !laidOut() || !node) return;
+    const target = node;
+    let live = true;
+    void target.measure().then((m) => {
+      if (!live || !m || m.bounds.size.height === 0) return;
+      target.reveal({ vertical: "start", animated: !untracked(reduceMotion) });
       props.onShown?.();
     });
+    return () => { live = false; };
   });
   return (
-    <View ref={(n: ViewRef) => (node = n)} class="flex-col" testID={props.testID}>
+    <View ref={(n: ViewRef) => (node = n)} onLayout={({ bounds }) => laidOut.set(bounds.size.height > 0)} class="flex-col" testID={props.testID}>
       {props.children}
     </View>
   );

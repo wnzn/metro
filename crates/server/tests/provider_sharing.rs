@@ -630,6 +630,103 @@ async fn space_shares_need_the_caller_and_the_owner_in_that_space_now() {
 }
 
 #[tokio::test]
+async fn union_chat_inventory_uses_a_current_space_grant_without_widening_access() {
+    let s = Server::start().await;
+    let model = "space-only-chat-test-model";
+    let id = s.connect(ALICE, "custom", model, true).await;
+    let shared = s.space(ALICE, "Shared", &["bob"]).await;
+    let owner_only = s.space(ALICE, "Owner only", &[]).await;
+    let unrelated = s.space(BOB, "Unrelated", &[]).await;
+    assert_eq!(
+        s.share(
+            ALICE,
+            &id,
+            json!({"visibility": "spaces", "space_ids": [shared, owner_only]}),
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    for query in ["?scope=any".to_owned(), format!("?space_id={shared}")] {
+        let (status, body) = s.get(BOB, &format!("/v1/models/available{query}")).await;
+        assert_eq!(status, StatusCode::OK);
+        let row = body["models"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|m| m["connection_id"] == id)
+            .unwrap();
+        let inventory = &row["chat_models"];
+        assert_eq!(inventory[0]["id"], model);
+        assert_eq!(inventory[0]["available"], true);
+        assert!(body["chat_providers"].as_array().unwrap().iter().any(|g| {
+            g["connections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|c| c["connection_id"] == id && c["models"] == *inventory)
+        }));
+        let public = body.to_string();
+        for private in [
+            shared.as_str(),
+            owner_only.as_str(),
+            s.fixture.base_url.as_str(),
+            ALICE_KEY,
+        ] {
+            assert!(!public.contains(private));
+        }
+    }
+    for (token, query) in [
+        (BOB, "".to_owned()),
+        (BOB, format!("?space_id={unrelated}")),
+        (CAROL, "?scope=any".to_owned()),
+    ] {
+        let (status, body) = s.get(token, &format!("/v1/models/available{query}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert!(!body.to_string().contains(&id));
+        assert!(!body.to_string().contains(model));
+    }
+    assert!(
+        providers::connection_model_for(&s.state, "bob", Some(&shared), &id)
+            .await
+            .is_ok()
+    );
+    assert!(matches!(
+        providers::connection_model_for(&s.state, "bob", None, &id).await,
+        Err(UseError::NotFound)
+    ));
+
+    // Membership loss and share revocation both remove the picker metadata.
+    s.remove_member(ALICE, &shared, "bob").await;
+    let (_, body) = s.get(BOB, "/v1/models/available?scope=any").await;
+    assert!(!body.to_string().contains(&id));
+    assert!(!body.to_string().contains(model));
+    assert_eq!(
+        s.post(
+            ALICE,
+            &format!("/v1/spaces/{shared}/members"),
+            json!({"user_id": "bob"}),
+        )
+        .await
+        .0,
+        StatusCode::CREATED
+    );
+    let (_, any) = s.available(BOB, "?scope=any").await;
+    assert!(ids(&any).contains(&id.as_str()));
+    assert_eq!(
+        s.share(ALICE, &id, json!({"visibility": "personal"}))
+            .await
+            .0,
+        StatusCode::OK
+    );
+    for query in ["?scope=any".to_owned(), format!("?space_id={shared}")] {
+        let (_, body) = s.get(BOB, &format!("/v1/models/available{query}")).await;
+        assert!(!body.to_string().contains(&id));
+        assert!(!body.to_string().contains(model));
+    }
+}
+
+#[tokio::test]
 async fn capabilities_are_fixed_and_each_has_its_own_default() {
     let s = Server::start().await;
     let (_, catalog) = s.get(ALICE, "/v1/provider-catalog").await;

@@ -50,10 +50,12 @@ async function menu(app: App, connectionId: string, item: string) {
 /** Alice's own chat, System One and embeddings connections, Bob's chat connection shared with Acme, and one he keeps private. */
 function routingWorld() {
   const f = world();
+  f.state.chatInventory = true;
   const chat = f.addConnection("alice", "openai", "Alice OpenAI", "gpt-fixture-2");
   const s1 = f.addConnection("alice", "systemone", "Alice System One", "jev-latest");
   const emb = f.addConnection("alice", "custom-embeddings", "Home embeddings", "nomic-embed-text");
   const shared = f.addConnection("bob", "device-openai-compatible", "Bob GPU", "qwen-fixture", { visibility: "spaces", space_ids: ["acme"] });
+  shared.models[0]!.display_name = "Bob's Qwen";
   const hidden = f.addConnection("bob", "openai", "Bob private", "gpt-fixture-1");
   return { f, chat, s1, emb, shared, hidden };
 }
@@ -68,15 +70,17 @@ test("Model routing is off by default and says nothing is sent", async () => {
   expect(app.value("id:routing-min-directed")).toBe("85");
   expect(text(app)).toContain("Off: nothing is sent to pick a model.");
   expect(text(app)).toContain("Personal Chat sends directly to your agent.");
+  expect(app.shows("id:dataflow-chat-send >> text:/Send starts your Chat agent directly/")).toBe(true);
+  expect(app.shows("id:dataflow-chat-note >> text:/without starting an agent or routing a request/")).toBe(true);
   expect(text(app)).toContain("Messages that mention only people, and other members' messages for routing or classification.");
   expect(app.enabled("id:routing-save")).toBe(false); // nothing changed
   // Section headers are one sentence; the rest is under Learn more, closed until asked.
   // The routing opt-in explains what it sends beside its toggle.
-  expect(app.shows("text:Off by default. When on, each agent request you start is sent to System One to pick a model.")).toBe(true);
+  expect(app.shows("text:Send eligible agent requests to System One to pick an answering model. Off by default.")).toBe(true);
   expect(app.shows("id:routing-infer")).toBe(false);
-  expect(app.shows("text:A model you pick for one turn overrides it.")).toBe(false);
+  expect(app.shows("text:/A model you pick for one turn overrides it/")).toBe(false);
   await app.press("id:routing-learn-more:toggle");
-  await app.waitFor("text:A model you pick for one turn overrides it.");
+  await app.waitFor("text:/A model you pick for one turn overrides it/");
   expect(app.shows("id:dataflow-addressing >> text:/This never applies to personal Chat/")).toBe(true);
   await app.press("id:classifier-learn-more:toggle");
   await app.waitFor("text:Typed questions: Noul, choice and score.");
@@ -113,7 +117,8 @@ test("pickers offer only models of their capability that I can use, mine and sha
   await app.press("id:case-model:0");
   await app.waitFor(`id:case-model:0:${shared.id}`);
   // A shared one says whose it is and that they see the requests.
-  expect(app.shows(`id:case-model:0:${shared.id} >> text:qwen-fixture · Shared by bob, who can see these requests`)).toBe(true);
+  expect(app.shows(`id:case-model:0:${shared.id} >> text:Bob's Qwen · Shared by bob, who can see these requests · Shared Spaces only, not personal Chat`)).toBe(true);
+  expect(f.state.log.some((r) => r.path === "/v1/models/available?scope=any" && r.user === "alice")).toBe(true);
   expect(app.shows(`id:case-model:0:${hidden.id}`)).toBe(false);
   expect(app.shows(`id:case-model:0:${s1.id}`)).toBe(false); // not offered: not a chat model
   await app.press(`id:case-model:0:${shared.id}`);
@@ -198,9 +203,36 @@ test("a model whose share was revoked is flagged and can't be saved", async () =
   const app = await signIn(f, "alice");
   await settings(app, "routing");
   await app.waitFor("id:case-missing:0");
+  expect(app.shows("id:routing-unsaved")).toBe(false);
+  expect(app.enabled("id:routing-save")).toBe(false);
+  await app.clear("id:routing-min-route");
+  await app.type("id:routing-min-route", "80");
   await app.press("id:routing-save");
   await app.waitFor("text:The model for “Heavy jobs” isn't available to you any more. Choose another one.");
   expect(puts(f, "/v1/model-routing")).toHaveLength(0);
+});
+
+test("a revoked fallback stays unavailable until the person explicitly clears and saves it", async () => {
+  const { f, s1, chat, shared } = routingWorld();
+  f.state.routing.set("alice", {
+    enabled: true, infer_addressing: false, classifier_id: s1.id, embedding_id: null,
+    default_chat_id: shared.id, min_directedness: 0.85, min_route_probability: 0.65,
+    cases: [{ key: "review", label: "Review", description: "", connection_id: chat.id }],
+  });
+  shared.share = { visibility: "personal", space_ids: [] };
+  const app = await signIn(f, "alice");
+  await settings(app, "routing");
+  await app.waitFor("id:routing-default-chat-missing");
+  expect(app.shows("id:routing-default-chat >> text:Unavailable selection")).toBe(true);
+  expect(app.shows("id:routing-default-chat >> text:Your default chat connection")).toBe(false);
+  expect(app.enabled("id:routing-save")).toBe(false);
+  expect(f.state.routing.get("alice")?.default_chat_id).toBe(shared.id);
+  await app.press("id:routing-default-chat-clear");
+  await app.waitFor("text:Your default chat connection");
+  expect(puts(f, "/v1/model-routing")).toHaveLength(0);
+  await app.press("id:routing-save");
+  await app.waitFor("id:routing-notice");
+  expect(puts(f, "/v1/model-routing").at(-1)?.body).toMatchObject({ default_chat_id: null, enabled: true });
 });
 
 test("a server without model routing says so", async () => {
@@ -318,7 +350,7 @@ test("the owner shares a connection with chosen Spaces, others can use it withou
   await app.press("id:routing-add-case");
   await app.press("id:case-model:0");
   await app.waitFor(`id:case-model:0:${chat.id}`);
-  expect(app.shows(`id:case-model:0:${chat.id} >> text:gpt-fixture-2 · Shared by alice, who can see these requests`)).toBe(true);
+  expect(app.shows(`id:case-model:0:${chat.id} >> text:gpt-fixture-2 · Shared by alice, who can see these requests · Shared Spaces only, not personal Chat`)).toBe(true);
   expect(text(app)).not.toContain("sk-fixture-not-real");
   await signOut(app);
   await signIn(f, "carol", app);
@@ -393,7 +425,7 @@ test("in the narrowest window routing consent, Save and the runner controls stay
   await settings(app, "routing");
   await app.waitFor("id:routing-enabled");
   // Consent sits beside the routing toggle, not behind hover or a disclosure.
-  expect(app.shows("text:Off by default. When on, each agent request you start is sent to System One to pick a model.")).toBe(true);
+  expect(app.shows("text:Send eligible agent requests to System One to pick an answering model. Off by default.")).toBe(true);
   await app.press("id:routing-enabled");
   expect(app.shows("id:routing-save")).toBe(true); // the fixed footer
   expect(app.enabled("id:routing-save")).toBe(true);

@@ -978,20 +978,22 @@ pub async fn settings_view(
     };
     Ok(SettingsView {
         embedding_id,
+        selection_precondition: true,
         suggested_id,
     })
 }
 
-/// `PUT /v1/library/settings`. A connection is saved only when it is
+/// A connection is saved only when it is
 /// usable by the person and media-capable; changing it discards their
 /// library index.
 pub async fn save_settings(
     db: &Db,
     models: &dyn MediaModels,
     user: &str,
-    settings: Settings,
+    embedding_id: Option<String>,
+    expected: Option<Option<String>>,
 ) -> Result<SettingsView, LibrarySearchError> {
-    if let Some(id) = &settings.embedding_id {
+    if let Some(id) = &embedding_id {
         if !crate::auth::valid_id(id) {
             return Err(LibrarySearchError::NotFound("connection"));
         }
@@ -1004,11 +1006,23 @@ pub async fn save_settings(
             Err(e) => return Err(LibrarySearchError::Unusable(e.message)),
         }
     }
-    let (u, id) = (user.to_owned(), settings.embedding_id.clone());
-    db.call(move |db| Ok(store::set_embedding_id(&mut db.lock(), &u, id.as_deref())?))
+    let (u, id) = (user.to_owned(), embedding_id.clone());
+    let outcome = db
+        .call(move |db| {
+            Ok(store::set_embedding_id(
+                &mut db.lock(),
+                &u,
+                id.as_deref(),
+                expected.as_ref().map(Option::as_deref),
+            )?)
+        })
         .await?;
+    if outcome == store::SelectionWrite::Stale {
+        return Err(LibrarySearchError::SelectionChanged);
+    }
     Ok(SettingsView {
-        embedding_id: settings.embedding_id,
+        embedding_id,
+        selection_precondition: true,
         suggested_id: None,
     })
 }
