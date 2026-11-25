@@ -254,6 +254,9 @@ pub struct Activity {
     /// Only on `activity` lifecycle events: one of the [`activity`] phases.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub phase: Option<String>,
+    /// Only on a completed Space run's activity event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<RunOutcome>,
     /// Only on an agent turn's `started` event: which model answered and
     /// why ([`crate::model_routing`]). No prompts, no credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -275,6 +278,14 @@ pub struct Activity {
     /// ([`crate::web_tools`]). Never a query result or page text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool: Option<crate::web_tools::ToolNote>,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RunOutcome {
+    NoReply,
+    Reaction,
+    Reply,
 }
 
 /// A Space agent as shown on its events: enough to draw its name and
@@ -301,6 +312,7 @@ impl Activity {
             name: name.into(),
             source: activity::AGENT.to_owned(),
             phase: None,
+            outcome: None,
             route: None,
             agent: None,
             pick: None,
@@ -329,6 +341,7 @@ impl Activity {
             name: Self::DEMO_NAME.to_owned(),
             source: activity::DEMO.to_owned(),
             phase: None,
+            outcome: None,
             route: None,
             agent: None,
             pick: None,
@@ -342,6 +355,7 @@ impl Activity {
     pub fn at(&self, phase: &str) -> Self {
         Self {
             phase: Some(phase.to_owned()),
+            outcome: None,
             route: None,
             pick: None,
             tool: None,
@@ -600,6 +614,7 @@ impl Db {
         crate::admin_users::init(&conn)?;
         crate::admin_settings::init(&conn)?;
         crate::profiles::init(&conn)?;
+        crate::dms::init(&conn)?;
         crate::providers::init(&conn)?;
         crate::device_relay::init(&conn)?;
         crate::web_devices::init(&conn)?;
@@ -922,7 +937,10 @@ impl Db {
     /// Whether `space_id` has a runner: a dedicated token or an attached
     /// registered runner.
     pub fn runner_paired(&self, space_id: &str) -> anyhow::Result<bool> {
-        let conn = self.lock();
+        Self::runner_paired_in(&self.lock(), space_id)
+    }
+
+    pub(crate) fn runner_paired_in(conn: &Connection, space_id: &str) -> anyhow::Result<bool> {
         Ok(conn
             .query_row(
                 "SELECT runner_token_hash IS NOT NULL
@@ -989,9 +1007,22 @@ impl Db {
     // ---- Rooms and events ----
 
     pub fn list_rooms(&self, space_id: &str) -> anyhow::Result<Vec<Room>> {
+        self.list_rooms_filtered(space_id, false)
+    }
+
+    pub(crate) fn list_rooms_filtered(
+        &self,
+        space_id: &str,
+        top_level_only: bool,
+    ) -> anyhow::Result<Vec<Room>> {
+        let filter = if top_level_only {
+            " AND parent_room_id IS NULL"
+        } else {
+            ""
+        };
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(&format!(
-            "SELECT {ROOM_COLUMNS} FROM space_rooms WHERE space_id = ?1 ORDER BY created_at, rowid"
+            "SELECT {ROOM_COLUMNS} FROM space_rooms WHERE space_id = ?1{filter} ORDER BY created_at, rowid"
         ))?;
         let rows = stmt.query_map([space_id], row_room)?;
         Ok(rows.collect::<Result<_, _>>()?)
@@ -1096,9 +1127,26 @@ impl Db {
         name: &str,
         limit: usize,
     ) -> anyhow::Result<Vec<Event>> {
-        let marker: Option<i64> = {
-            let conn = self.lock();
-            conn.query_row(
+        Self::events_before_thread_in(
+            &self.lock(),
+            space_id,
+            parent_room_id,
+            thread_id,
+            name,
+            limit,
+        )
+    }
+
+    pub(crate) fn events_before_thread_in(
+        conn: &Connection,
+        space_id: &str,
+        parent_room_id: &str,
+        thread_id: &str,
+        name: &str,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        let marker: Option<i64> = conn
+            .query_row(
                 "SELECT id FROM space_events
                  WHERE space_id = ?1 AND room_id = ?2 AND kind = 'thread' AND actor_id IS NULL
                    AND text = ?3
@@ -1110,10 +1158,9 @@ impl Db {
                 ],
                 |r| r.get(0),
             )
-            .optional()?
-        };
+            .optional()?;
         match marker {
-            Some(id) => self.events_before(space_id, parent_room_id, id, limit),
+            Some(id) => Self::events_before_in(conn, space_id, parent_room_id, id, limit),
             None => Ok(Vec::new()),
         }
     }
@@ -1362,7 +1409,16 @@ impl Db {
         before: i64,
         limit: usize,
     ) -> anyhow::Result<Vec<Event>> {
-        let conn = self.lock();
+        Self::events_before_in(&self.lock(), space_id, room_id, before, limit)
+    }
+
+    pub(crate) fn events_before_in(
+        conn: &Connection,
+        space_id: &str,
+        room_id: &str,
+        before: i64,
+        limit: usize,
+    ) -> anyhow::Result<Vec<Event>> {
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
              WHERE space_id = ?1 AND room_id = ?2 AND id < ?3

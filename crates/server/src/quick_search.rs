@@ -274,7 +274,7 @@ fn chat_messages(
     Ok(rows.collect::<Result<Vec<_>, _>>()?)
 }
 
-/// The rooms and threads `user` may read now, in `space` or in every Space
+/// The rooms and agent-created threads `user` may read now, in `space` or in every Space
 /// they belong to: the [`MAX_ROOMS`] most recently active, deterministic.
 fn readable_rooms(
     conn: &Connection,
@@ -285,6 +285,7 @@ fn readable_rooms(
         "SELECT r.space_id, r.id FROM space_members m
          JOIN space_rooms r ON r.space_id = m.space_id
          WHERE m.user_id = :user AND (:space IS NULL OR m.space_id = :space)
+           AND r.anchor_event_id IS NULL
          ORDER BY (SELECT MAX(e.id) FROM space_events e
                    WHERE e.space_id = r.space_id AND e.room_id = r.id) DESC,
                   r.space_id, r.id

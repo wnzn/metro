@@ -486,13 +486,24 @@ pub(crate) fn empty_object(body: &[u8]) -> ApiResult<()> {
 
 // ---- Rooms and events ----
 
+#[derive(Deserialize)]
+pub struct RoomsQuery {
+    #[serde(default)]
+    top_level_only: bool,
+}
+
 pub async fn list_rooms(
     State(state): State<AppState>,
     who: Human,
     Path(sid): Path<String>,
+    query: Result<Query<RoomsQuery>, QueryRejection>,
 ) -> ApiResult<Json<serde_json::Value>> {
+    let Query(query) = query?;
     let space = member_of(&state, &sid, &who).await?;
-    let rooms = db(&state, move |db| db.list_rooms(&space.id)).await?;
+    let rooms = db(&state, move |db| {
+        db.list_rooms_filtered(&space.id, query.top_level_only)
+    })
+    .await?;
     Ok(Json(json!({"rooms": rooms})))
 }
 

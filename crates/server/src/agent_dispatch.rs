@@ -10,10 +10,10 @@
 //!   low-confidence answer keeps the default agent; a failed decision runs
 //!   no agent for `@agent` and says why. Several agents start one run each.
 //! - **Unaddressed**: nothing, unless the sender opted in here. Then one
-//!   System One Choice over every agent plus "No agent": a clear pick
-//!   (the probability that the message is for some agent at least the
-//!   sender's `min_directedness`) starts that agent; "No agent", an unsure,
-//!   malformed or failed answer starts nothing.
+//!   System One Choice over every agent plus "No agent": if the probability
+//!   of any agent clears the sender's floor, run the chosen agent (or the
+//!   strongest agent option if it chose "No agent"). Low directedness and
+//!   malformed or failed answers start nothing.
 //! - **Replies to an agent** (`reply_to` an agent's reply in a thread, see
 //!   [`crate::replies`]): that agent is an explicit recipient, with any of
 //!   the above, and nothing is classified. If it was deleted, it isn't
@@ -85,6 +85,7 @@ pub async fn plan(
     state: &AppState,
     user: &str,
     space: &str,
+    room: &str,
     text: &str,
     resolved: &[Mention],
     addressing: Addressing,
@@ -105,15 +106,22 @@ pub async fn plan(
             if !prefs.classify_unaddressed {
                 return plan;
             }
-            let answer =
-                routing::pick_agent(state, user, space, settings, text, &options(agents), true)
-                    .await;
+            let answer = routing::pick_agent(
+                state,
+                user,
+                space,
+                settings,
+                text,
+                &options(agents),
+                Some(room),
+            )
+            .await;
             if let Decision::Failed(why) = answer {
                 plan.addressing_note = Some(why.into());
             }
             if let Decision::Answered(a) = answer
                 && let Some(i) = a.index
-                && a.directed >= settings.min_directedness
+                && a.meets_directedness(settings.min_directedness)
             {
                 let agent = agents[i].clone();
                 plan.classified = Some(Addressed {
@@ -210,7 +218,7 @@ async fn generic(
     if !classifies(prefs, settings) || agents.len() < 2 {
         return Ok(default_target("Default agent".to_owned()));
     }
-    match routing::pick_agent(state, user, space, settings, text, &options(agents), false).await {
+    match routing::pick_agent(state, user, space, settings, text, &options(agents), None).await {
         Decision::Answered(a) => match a.index {
             Some(i) if a.probability >= settings.min_route_probability => Ok(Target {
                 agent: agents[i].clone(),

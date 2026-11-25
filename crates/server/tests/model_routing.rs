@@ -171,12 +171,14 @@ impl Fake {
         }
         if let Some(q) = asked.get("agent") {
             let has_none = q["criteria"].get("no_agent").is_some();
-            let (choice, p) = if message.contains("[pick2]") {
+            let (choice, p) = if message.contains("[lean]") {
+                ("no_agent", 0.65)
+            } else if message.contains("[pick2]") {
                 ("agent_2", 0.9)
             } else if message.contains("[yes]") {
                 ("agent_1", 0.95)
             } else if message.contains("[maybe]") {
-                ("agent_1", 0.6)
+                ("agent_1", 0.3)
             } else if message.contains("[unsure]") {
                 ("agent_2", 0.4)
             } else if message.contains("[ghost]") {
@@ -188,6 +190,10 @@ impl Fake {
             };
             let mut probabilities = serde_json::Map::new();
             probabilities.insert(choice.into(), json!(p));
+            if message.contains("[lean]") {
+                probabilities.insert("agent_1".into(), json!(0.1));
+                probabilities.insert("agent_2".into(), json!(0.25));
+            }
             if has_none && choice != "no_agent" {
                 probabilities.insert("no_agent".into(), json!(1.0 - p));
             }
@@ -667,7 +673,7 @@ async fn defaults_are_off_and_keep_the_old_behaviour() {
     assert_eq!(
         v,
         json!({"enabled": false, "infer_addressing": false, "classifier_id": null,
-               "embedding_id": null, "default_chat_id": null, "min_directedness": 0.85,
+               "embedding_id": null, "default_chat_id": null, "min_directedness": 0.35,
                "min_route_probability": 0.65, "cases": []})
     );
     let sid = h.space("defaults").await;
@@ -717,6 +723,13 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
     h.quiet_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
     assert_eq!(h.fake.calls(), 0);
+    for text in [
+        "context one".to_owned(),
+        "文".repeat(401),
+        "context three".to_owned(),
+    ] {
+        h.say("bob", Some(&sid), json!({"text": text})).await;
+    }
     let (s, v) = h
         .req(
             reqwest::Method::PUT,
@@ -753,7 +766,7 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
         .route_after("alice", Some(&sid), e["id"].as_i64().unwrap())
         .await;
     assert_eq!(route["addressed_by"], "classifier");
-    // Only the new message went to System One: no history, no ids.
+    // The message and up to three earlier messages, with no metadata IDs.
     let (user, space, conn, payload, questions) = h.fake.last_call();
     assert_eq!(
         (user.as_str(), space.as_deref()),
@@ -761,13 +774,32 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
     );
     assert_eq!(conn, id(CLASSIFIER));
     assert_eq!(payload["message"], "[yes] what does this error mean?");
-    assert_eq!(payload.as_object().unwrap().len(), 2, "{payload}");
+    assert_eq!(
+        payload,
+        json!({
+            "message": "[yes] what does this error mean?",
+            "where": "a shared room",
+            "space": {"name": "infer", "description": ""},
+            "room": "lobby",
+            "previous": [
+                {"speaker_kind": "person", "speaker": "bob", "text": "context one"},
+                {"speaker_kind": "person", "speaker": "bob", "text": "文".repeat(400)},
+                {"speaker_kind": "person", "speaker": "bob", "text": "context three"}
+            ]
+        })
+    );
     // One Choice over the agents plus "No agent".
     assert_eq!(questions["agent"]["type"], "choice");
     let options = questions["agent"]["criteria"].as_object().unwrap();
     assert_eq!(options.len(), 2);
     assert_eq!(options["agent_1"]["label"], "Metro");
     assert!(options.contains_key("no_agent"));
+    assert!(
+        questions["agent"]["instructions"]
+            .as_str()
+            .unwrap()
+            .contains("When unsure, pick an agent.")
+    );
     assert!(questions.get("use_case").is_none(), "routing is off");
 
     // Uncertain, malformed and failed answers start nothing.
@@ -814,6 +846,32 @@ async fn addressing_inference_is_opt_in_thresholded_and_abstains() {
         )
         .await;
     assert_ne!(s, StatusCode::ACCEPTED);
+
+    let coder = h
+        .agent(
+            &sid,
+            json!({"name": "Coder", "handle": "coder", "description": "Writes code."}),
+        )
+        .await;
+    let e = h
+        .say(
+            "alice",
+            Some(&sid),
+            json!({"text": "[lean] could we simplify it?"}),
+        )
+        .await;
+    assert_eq!(e["audience"], "agent");
+    assert_eq!(e["mentions"][0]["agent_id"], coder);
+    assert_eq!(
+        h.started_after("alice", &sid, e["id"].as_i64().unwrap())
+            .await["pick"],
+        "Picked by classifier: Coder"
+    );
+    let (_, _, _, payload, _) = h.fake.last_call();
+    assert_eq!(payload["previous"][2]["speaker_kind"], "agent");
+    assert_eq!(payload["previous"][2]["speaker"], "Metro");
+    h.answer_after("alice", Some(&sid), e["id"].as_i64().unwrap())
+        .await;
 }
 
 #[tokio::test]
@@ -1407,7 +1465,7 @@ async fn shared_connections_stay_in_their_space_and_settings_are_validated() {
         json!({"classifier_id": id(CODE), "infer_addressing": true}),
         json!({"embedding_id": id(CODE)}),
         json!({"enabled": true, "cases": routing_on(false, true)["cases"]}),
-        json!({"min_directedness": 0.2}),
+        json!({"min_directedness": 0.19}),
         json!({"min_route_probability": 1.5}),
         json!({"min_route_probability": "high"}),
         json!({"surprise": true}),
@@ -1424,11 +1482,12 @@ async fn shared_connections_stay_in_their_space_and_settings_are_validated() {
     let (s, v) = h
         .put_routing(
             "alice",
-            json!({"embedding_id": id(EMBED), "default_chat_id": id(CODE)}),
+            json!({"embedding_id": id(EMBED), "default_chat_id": id(CODE), "min_directedness": 0.2}),
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["embedding_id"], id(EMBED));
+    assert_eq!(v["min_directedness"], 0.2);
     let prefs = metro_server::model_routing::preferences(&h.state, "alice")
         .await
         .unwrap();

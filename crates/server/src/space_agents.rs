@@ -170,28 +170,41 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
             .collect::<rusqlite::Result<_>>()?
     };
     for sid in missing {
-        insert_default(conn, &sid)?;
+        insert_default(conn, &sid, "The Space's built-in agent.", "")?;
     }
     Ok(())
 }
 
 /// The default agent of a new Space, in its creating transaction.
 pub fn seed_default(tx: &Transaction<'_>, space_id: &str) -> rusqlite::Result<()> {
-    insert_default(tx, space_id)
+    insert_default(
+        tx,
+        space_id,
+        "Helps everyone in this Space with questions and tasks.",
+        "You are this Space's general helper. Use the Space context to understand who is here and what the Space \
+         is for. Prefer answers the whole room can use. If another agent in the roster is clearly better suited, \
+         say which one (by @handle) instead of guessing. Ask one short question when a request is ambiguous.",
+    )
 }
 
-fn insert_default(conn: &Connection, space_id: &str) -> rusqlite::Result<()> {
+fn insert_default(
+    conn: &Connection,
+    space_id: &str,
+    description: &str,
+    instructions: &str,
+) -> rusqlite::Result<()> {
     let now = now_ms();
     conn.execute(
         "INSERT INTO space_agents (id, space_id, name, handle, description, instructions, tools,
                                    is_default, color, created_at, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, '', ?6, 1, ?7, ?8, ?8)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8, ?9, ?9)",
         params![
             new_id(),
             space_id,
             Activity::AGENT_NAME,
             DEFAULT_HANDLE,
-            "The Space's built-in agent.",
+            description,
+            instructions,
             serde_json::to_string(&default_tools()).unwrap_or_else(|_| "[]".to_owned()),
             COLORS[0],
             now,
