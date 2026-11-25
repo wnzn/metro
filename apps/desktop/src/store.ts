@@ -35,10 +35,14 @@
 
 import { batch, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError, createClient, parseReaction } from "./api/client";
-import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, TurnModelChoice } from "./api/client";
+import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, SpaceMessageBody, TurnModelChoice } from "./api/client";
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl, serverHost } from "./api/serverUrl";
 import { plainHttpAccepted } from "./plainHttp";
+import {
+  captureTypedMentions, editMentionDraft, mentionIdentityKey, pickMention, prepareMentionSend, scanMentionDraft, updateMentionDraft,
+} from "./features/mentions/draft";
+import type { MentionDirectory, MentionDraft, MentionRecipient, MentionSelection, MentionSend } from "./features/mentions/draft";
 
 export type { Member, Mention, Room, RoomEvent, Run, Space };
 
@@ -155,11 +159,24 @@ export const notice = signal<string | null>(null);
 // Members per Space (any member may list them; owners manage them)
 const membersBySpace = signal<Record<string, Member[]>>({});
 export const members = computed(() => membersBySpace()[activeSpaceId() ?? ""] ?? null);
-export const membersError = signal<string | null>(null);
+const memberFailures = signal<Record<string, string | null>>({});
+export const membersError = computed(() => memberFailures()[activeSpaceId() ?? ""] ?? null);
+const memberRequests = new Map<string, Promise<void>>();
+const memberVersions = new Map<string, number>();
 
-// Mentions picked in the room composer. Only for the active room; cleared when
-// the room or Space changes, and pruned when their text leaves the draft.
-export const mentions = signal<Mention[]>([]);
+const EMPTY_DIRECTORY: MentionDirectory = { members: [], agents: [] };
+const EMPTY_MENTION_DRAFT: MentionDraft = { text: "", anchors: [] };
+export const mentionDraft = signal<MentionDraft>(EMPTY_MENTION_DRAFT);
+const editDirectory = signal<MentionDirectory | null>(null);
+export const mentions = computed(() =>
+  [...new Map(mentionDraft().anchors.map(a => [mentionIdentityKey(a.mention), a])).values()]);
+
+// The composer supplies the locally verified names and handles; the store
+// independently verifies stable recipients before the POST.
+let directoryForMentions: (sid: string) => MentionDirectory | null = () => null;
+export function registerMentionDirectory(get: (sid: string) => MentionDirectory | null) {
+  directoryForMentions = get;
+}
 
 // Space management (owners)
 export const manageError = signal<string | null>(null);
@@ -662,7 +679,14 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     if (dispatchTarget()?.spaceId === spaceId) dispatchTarget.set(null);
     const { [spaceId]: _members, ...restMembers } = membersBySpace();
     membersBySpace.set(restMembers);
-    if (activeSpaceId() === spaceId) clearTransient();
+    const { [spaceId]: _error, ...restErrors } = memberFailures();
+    memberFailures.set(restErrors);
+    memberRequests.delete(spaceId);
+    memberVersions.delete(spaceId);
+    if (activeSpaceId() === spaceId) {
+      if (activeScope().startsWith(prefix)) writeMentionDraft(EMPTY_MENTION_DRAFT, null);
+      clearTransient();
+    }
   });
 }
 
@@ -766,13 +790,15 @@ export function composerScope(): string {
 /** Asking the agent needs a typed question: files alone are saved to the Library, not sent to a model. */
 export const ASK_NEEDS_TEXT = "Type a question to ask the agent. Attached files are saved to the Library; they aren't sent to the agent.";
 
+type ModelChoice = () => { choice?: TurnModelChoice; error?: string | null };
+
 /**
  * Posts the draft (and any staged files) to the active place; `invokeAgent`
  * asks the agent to answer. Files are uploaded to the destination's library
  * first; if one fails nothing is posted and the draft and files stay. A
  * message may be files only, unless it asks an agent in a Space.
  */
-export async function send(invokeAgent: boolean, choice?: TurnModelChoice, agentId?: string): Promise<void> {
+export async function send(invokeAgent: boolean, choice?: TurnModelChoice | ModelChoice, agentId?: string): Promise<void> {
   await sendDraft({ kind: "message", invokeAgent, choice, agentId });
 }
 
@@ -781,7 +807,7 @@ export async function saveChatNote(): Promise<void> {
 }
 
 type DraftSend =
-  | { kind: "message"; invokeAgent: boolean; choice?: TurnModelChoice; agentId?: string }
+  | { kind: "message"; invokeAgent: boolean; choice?: TurnModelChoice | ModelChoice; agentId?: string }
   | { kind: "chat-note" };
 
 async function sendDraft(intent: DraftSend): Promise<void> {
@@ -789,13 +815,13 @@ async function sendDraft(intent: DraftSend): Promise<void> {
   const saveNote = intent.kind === "chat-note";
   if (saveNote && !chat) return;
   const retryAction = saveNote ? "Save note" : "Send";
-  const { invokeAgent, choice, agentId } = saveNote ? { invokeAgent: false } : intent;
+  const { invokeAgent, choice: pickModel, agentId } = saveNote ? { invokeAgent: false } : intent;
   const text = draft().trim();
   const sid = activeSpaceId();
   const rid = activeRoomId();
   const c = client;
   const scope = activeScope();
-  if (!c || sending() || !scope || (!chat && (!sid || !rid))) return;
+  if (!c || sending() || !scope || (!chat && (!sid || !rid || !inSpaceComposer()))) return;
   const files = !!attachments?.pending(scope);
   if (!text && !files) return;
   if (!chat && invokeAgent && !text) {
@@ -808,19 +834,48 @@ async function sendDraft(intent: DraftSend): Promise<void> {
   const to: SendDestination = chat ? { kind: "chat" } : { kind: "room", spaceId: sid!, roomId: rid! };
   const sameSession = guard();
   const ok = chat ? sameSession : guard(sid!);
+  const navigation = navigationGeneration;
   // Feedback only where it happened: never in a place the user moved to.
   const here = () => ok() && activeScope() === scope;
+  let address: SpaceMessageBody | null = null;
+  let submittedDraft: MentionDraft | undefined;
+  if (!chat) {
+    const askAgent = invokeAgent ? { agentId } : undefined;
+    const directory = editDirectory();
+    submittedDraft = captureForDirectory(mentionDraft(), directory, { finalize: true });
+    writeMentionDraft(submittedDraft, directory);
+    // Finalization has already decided all typed occurrences. Validate
+    // preserved ids against a fresh roster after any uploads, not aliases.
+    const bound = submittedDraft.anchors.map(a => a.mention);
+    const people = new Set((directory?.members ?? []).map(m => m.id));
+    const named = new Set((directory?.agents ?? []).map(a => a.id));
+    for (const recipient of bound) {
+      if (recipient.kind === "user") people.add(recipient.id);
+      else if (recipient.agentId) named.add(recipient.agentId);
+    }
+    if (askAgent?.agentId) named.add(askAgent.agentId);
+    const result = prepareMentionSend(submittedDraft, {
+      members: [...people].map(id => ({ id })),
+      agents: [...named].map(id => ({ id, handle: "", name: "" })),
+    }, { askAgent });
+    if (!result.ok) {
+      setMentionSendError(result);
+      return;
+    }
+    address = result.body;
+  }
+  const willAsk = invokeAgent || address?.mentions?.some(m => m.kind === "agent");
+  const selected = typeof pickModel === "function" ? (willAsk ? pickModel() : {}) : { choice: pickModel };
+  if (selected.error) {
+    actionError.set(selected.error);
+    return;
+  }
   batch(() => {
     sending.set(invokeAgent ? "agent" : "message");
     actionError.set(null);
     notice.set(null);
   });
-  const sentMentions = chat
-    ? []
-    : mentions().filter((m) => {
-        const literal = mentionLiteral(m);
-        return !literal || text.includes(literal);
-      });
+  const mayPost = () => here() && navigation === navigationGeneration && inSpaceComposer() && mentionDraft() === submittedDraft;
   try {
     let ids: string[] = [];
     let keys: string[] = [];
@@ -835,17 +890,31 @@ async function sendDraft(intent: DraftSend): Promise<void> {
       keys = up.keys;
     }
     if (saveNote) await c.saveChatNote(text, ids);
-    else if (chat) await c.sendChatMessage(text, ids, choice);
-    else await c.sendMessage(sid!, rid!, text, invokeAgent, sentMentions, ids, choice, invokeAgent ? agentId : undefined);
+    else if (chat) await c.sendChatMessage(text, ids, selected.choice);
+    else {
+      if (!mayPost()) {
+        if (here()) actionError.set("The draft or destination changed. Nothing was sent; review the draft and send again.");
+        return;
+      }
+      const body = address!;
+      if (!await verifySpaceRecipients(c, sid!, body, files, mayPost)) {
+        if (here()) actionError.set(mayPost()
+          ? "A recipient is no longer in this Space. Remove their mention or choose someone else. Nothing was sent."
+          : "The draft or destination changed. Nothing was sent; review the draft and send again.");
+        return;
+      }
+      if (!mayPost()) return;
+      await c.sendMessage(sid!, rid!, body, ids, selected.choice);
+    }
     if (!ok()) return;
     if (keys.length) attachments?.sent(scope, keys, to);
-    if (activeScope() === scope && draft().trim() === text) {
+    if (activeScope() === scope && (chat ? draft().trim() === text : mentionDraft() === submittedDraft)) {
       // unless the user typed something new meanwhile
       batch(() => {
-        draft.set("");
-        if (!chat) mentions.set([]);
+        if (chat) draft.set("");
+        else writeMentionDraft(EMPTY_MENTION_DRAFT, null);
       });
-    } else if (stashedDrafts()[scope]?.text.trim() === text) {
+    } else if (chat ? stashedDrafts()[scope]?.text.trim() === text : stashedDrafts()[scope]?.mention === submittedDraft) {
       // Sent from a place the user has since left: its stashed draft is gone too.
       const { [scope]: _sent, ...rest } = stashedDrafts();
       stashedDrafts.set(rest);
@@ -856,10 +925,15 @@ async function sendDraft(intent: DraftSend): Promise<void> {
     }
     kick();
   } catch (error) {
-    if (!here()) return;
+    if (!here()) {
+      if (!chat && ok() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+      return;
+    }
     handleActionError(error, saveNote ? "Could not save the note" : invokeAgent ? (chat ? "Could not ask your agent" : "Could not ask the agent") : "Could not send the message", chat ? undefined : sid!);
     const shown = actionError();
-    if (files && shown) actionError.set(`${shown} Its files are already in the Library; ${retryAction} again won't upload them twice.`);
+    if (files && shown) actionError.set(chat
+      ? `${shown} Its files are already in the Library; ${retryAction} again won't upload them twice.`
+      : `${shown} The uploaded files remain in the Library.`);
   } finally {
     if (sameSession()) sending.set(null);
   }
@@ -933,7 +1007,9 @@ export async function sendDispatch(): Promise<void> {
     dispatchNotice.set(null);
   });
   try {
-    await c.sendMessage(target.spaceId, target.roomId, text, true);
+    // Dispatch is an explicit request to the chosen Space's agent, not a
+    // mention composer. Its text cannot add recipients implicitly.
+    await c.sendMessage(target.spaceId, target.roomId, { text, invoke_agent: true });
     if (!ok()) return;
     if (dispatchDraft().trim() === text) dispatchDraft.set("");
     dispatchNotice.set(`Sent to the agent in ${space.name} › #${room.name}.`);
@@ -1107,93 +1183,184 @@ export async function reloadMembers(): Promise<void> {
   const c = client;
   if (!sid || !c) return;
   const ok = guard(sid);
+  const version = nextMemberVersion(sid);
   try {
     const list = await c.listMembers(sid);
-    if (ok()) membersBySpace.set({ ...membersBySpace(), [sid]: list });
+    if (ok()) adoptMembers(sid, version, list);
   } catch (error) {
-    if (ok()) handleManageError(error, "Could not load members", sid);
+    if (ok()) {
+      markMembersUnverified(sid, version, error);
+      handleManageError(error, "Could not load members", sid);
+    }
   }
 }
 
 /** Loads the active Space's members for the mention picker (any member may). */
-export async function loadMembersForMentions(): Promise<void> {
+export function loadMembersForMentions(): Promise<void> {
   const sid = activeSpaceId();
   const c = client;
-  if (!sid || !c) return;
+  if (!sid || !c) return Promise.resolve();
+  const existing = memberRequests.get(sid);
+  if (existing) return existing;
   const ok = guard(sid);
-  membersError.set(null);
-  try {
-    const list = await c.listMembers(sid);
-    if (ok()) membersBySpace.set({ ...membersBySpace(), [sid]: list });
-  } catch (error) {
+  const version = nextMemberVersion(sid);
+  const work = c.listMembers(sid).then(list => {
+    if (ok()) adoptMembers(sid, version, list);
+  }, error => {
     if (!ok() || isAborted(error)) return;
+    markMembersUnverified(sid, version, error);
     if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
-    else if (activeSpaceId() === sid) membersError.set(describe(error, "Could not load members"));
-  }
+    else if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) void lostAccess(sid, null);
+  }).finally(() => {
+    if (memberRequests.get(sid) === work) memberRequests.delete(sid);
+  });
+  memberRequests.set(sid, work);
+  return work;
 }
 
 // ------------------------------------------------------------------ mentions
 
-export function mentionLiteral(m: Mention): string | null {
-  // A named agent by its @handle; the generic @agent (the default agent, or the classifier's pick) otherwise.
-  if (m.kind === "agent") return m.agentId ? (m.handle && /^[a-z0-9_-]+$/.test(m.handle) ? `@${m.handle}` : null) : "@agent";
-  return /^\S+$/.test(m.id) ? `@${m.id}` : null; // ids with spaces go only in the explicit list
+function nextMemberVersion(sid: string) {
+  const version = (memberVersions.get(sid) ?? 0) + 1;
+  memberVersions.set(sid, version);
+  return version;
 }
 
-export function sameMention(a: Mention, b: Mention) {
-  if (a.kind === "agent" && b.kind === "agent") return (a.agentId ?? null) === (b.agentId ?? null);
-  return a.kind === "user" && b.kind === "user" && a.id === b.id;
-}
-
-function escapeRegExp(text: string) {
-  return text.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
-function literalIn(text: string, literal: string) {
-  return new RegExp(`(^|\\s)${escapeRegExp(literal)}(?=$|[\\s.,;:!?)])`).test(text);
-}
-
-/** The "@partial" being typed at the end of the draft, if any. */
-export function mentionQuery(text: string): string | null {
-  const m = /(^|\s)@([^\s@]*)$/.exec(text);
-  return m ? m[2] : null;
-}
-
-/** Adds a mention: its literal replaces a trailing "@partial" or is appended. */
-export function addMention(m: Mention) {
-  if (basePlace() !== "space") return;
-  const literal = mentionLiteral(m);
+function adoptMembers(sid: string, version: number, list: Member[]) {
+  if (memberVersions.get(sid) !== version) return;
   batch(() => {
-    if (!mentions().some((x) => sameMention(x, m))) mentions.set([...mentions(), m]);
-    if (!literal) return;
-    const text = draft();
-    if (mentionQuery(text) !== null) draft.set(text.replace(/@[^\s@]*$/, `${literal} `));
-    else if (!literalIn(text, literal)) draft.set(`${text}${text && !/\s$/.test(text) ? " " : ""}${literal} `);
+    membersBySpace.set({ ...membersBySpace(), [sid]: list });
+    if (memberFailures()[sid]) memberFailures.set({ ...memberFailures(), [sid]: null });
   });
 }
 
-/** Removes a mention chip and its text from the draft. */
-export function removeMention(m: Mention) {
-  const literal = mentionLiteral(m);
+function markMembersUnverified(sid: string, version: number, error: unknown) {
+  if (memberVersions.get(sid) === version) {
+    memberFailures.set({ ...memberFailures(), [sid]: describe(error, "Could not verify members") });
+  }
+}
+
+/** The visible, permission-scoped room/thread, never the Space left beneath another view. */
+export function inSpaceComposer() {
+  return basePlace() === "space" && !settingsOpen() && view() === "room" && !!activeSpace() && !!activeRoom() && !switchingSpace();
+}
+
+function captureForDirectory(value: MentionDraft, directory: MentionDirectory | null, options?: { finalize?: boolean; caret?: number }): MentionDraft {
+  const captured = captureTypedMentions(value, directory ?? EMPTY_DIRECTORY, options);
+  if (directory || captured === value) return captured;
+  // Without a verified directory even the reserved generic token could be
+  // a prefix of a longer label. Only an explicit pick may bind it now.
+  const asPlain = ({ start, end, literal }: MentionSelection) => ({ start, end, literal, kind: "unresolved" as const });
+  const decisions = [
+    ...(captured.decisions ?? []).map(d => d.kind === "ambiguous" && !value.decisions?.includes(d) ? asPlain(d) : d),
+    ...captured.anchors.filter(a => !value.anchors.includes(a)).map(asPlain),
+  ];
+  return { text: captured.text, anchors: value.anchors, decisions };
+}
+
+function writeMentionDraft(value: MentionDraft, directory: MentionDirectory | null) {
   batch(() => {
-    mentions.set(mentions().filter((x) => !sameMention(x, m)));
-    if (literal) {
-      const re = new RegExp(`(^|\\s)${escapeRegExp(literal)}(?=$|[\\s.,;:!?)])`, "g");
-      draft.set(draft().replace(re, "$1").replace(/[ \t]{2,}/g, " ").trimStart());
+    mentionDraft.set(value);
+    editDirectory.set(directory);
+    draft.set(value.text);
+  });
+}
+
+/** Use the same snapshot for preview and finalization; never capture on roster refresh. */
+export function previewMentionDraft() {
+  return captureForDirectory(mentionDraft(), editDirectory(), { finalize: true });
+}
+
+export function previewMentionMatches(value: MentionDraft) {
+  return scanMentionDraft(value, editDirectory() ?? EMPTY_DIRECTORY, { finalize: true });
+}
+
+/** Picking can only use current data and the exact literal the chooser showed. */
+export function addMention(mention: MentionRecipient, selection?: MentionSelection): number | null {
+  const sid = activeSpaceId();
+  if (!sid || !inSpaceComposer()) return null;
+  const value = mentionDraft();
+  const directory = directoryForMentions(sid);
+  const end = value.text.length;
+  const range = selection ?? { start: end, end, literal: "" };
+  const picked = pickMention(value, range, mention, directory ?? EMPTY_DIRECTORY);
+  if (!picked) return null;
+  writeMentionDraft(picked, editDirectory());
+  const caret = range.end + picked.text.length - value.text.length;
+  return picked.text[caret] === " " ? caret + 1 : caret;
+}
+
+/** Remove only the exact tracked occurrences of this recipient. */
+export function removeMention(mention: MentionRecipient) {
+  if (!inSpaceComposer()) return;
+  const key = mentionIdentityKey(mention);
+  let value = mentionDraft();
+  for (const a of [...value.anchors].reverse()) {
+    if (mentionIdentityKey(a.mention) === key) {
+      const end = a.end + (value.text[a.end] === " " ? 1 : 0);
+      value = editMentionDraft(value, { start: a.start, end, replacement: "" }) ?? value;
     }
+  }
+  writeMentionDraft(value, editDirectory());
+}
+
+export function setDraft(text: string) {
+  const sid = activeSpaceId();
+  if (basePlace() !== "space" || !sid) {
+    draft.set(text);
+    return;
+  }
+  const before = mentionDraft();
+  if (before.text === text) return;
+  // NSH gives us a value snapshot, not a native edit range. The helper
+  // conservatively preserves only anchors outside ambiguous edit ranges.
+  let caret = text.length;
+  for (let i = before.text.length; caret > 0 && i > 0 && before.text[i - 1] === text[caret - 1]; i--) caret--;
+  const directory = directoryForMentions(sid);
+  writeMentionDraft(captureForDirectory(updateMentionDraft(before, text), directory, { caret }), directory);
+}
+
+function setMentionSendError(result: Extract<MentionSend, { ok: false }>) {
+  const message = {
+    ambiguous: "Pick who you mean before sending.",
+    "invalid-text": "The draft contains invalid text. Edit it and try again.",
+    "invalid-anchor": "A mention changed. Edit it or choose its recipient again.",
+    "stale-recipient": "A recipient could not be verified. Remove their mention or choose someone else.",
+    "too-many-spans": "A message can contain up to 64 mentions. Remove some before sending.",
+    "too-many-recipients": "A message can address up to 32 recipients. Remove some before sending.",
+  }[result.reason];
+  batch(() => {
+    actionError.set(message);
+    notice.set(null);
   });
 }
 
-/** Sets the draft and drops mention chips whose text the user deleted. */
-export function setDraft(text: string) {
-  batch(() => {
-    draft.set(text);
-    const kept = mentions().filter((m) => {
-      const literal = mentionLiteral(m);
-      return !literal || literalIn(text, literal);
-    });
-    if (kept.length !== mentions().length) mentions.set(kept);
-  });
+async function verifySpaceRecipients(
+  c: Client, sid: string, body: SpaceMessageBody, uploaded: boolean, mayPost: () => boolean,
+): Promise<boolean> {
+  const people = body.mentions?.flatMap(m => m.kind === "user" ? [m.id] : []) ?? [];
+  const agents = body.mentions?.flatMap(m => m.kind === "agent" && m.agent_id ? [m.agent_id] : []) ?? [];
+  if (body.agent_id) agents.push(body.agent_id);
+  const checkMembers = uploaded || people.length > 0;
+  const version = checkMembers ? nextMemberVersion(sid) : 0;
+  const ok = guard(sid);
+  const roster = checkMembers ? c.listMembers(sid).then(list => {
+    if (ok()) adoptMembers(sid, version, list);
+    return list;
+  }, error => {
+    if (ok() && !isAborted(error)) markMembersUnverified(sid, version, error);
+    throw error;
+  }) : null;
+  const [members, currentAgents] = await Promise.all([roster, agents.length ? c.spaceAgents(sid) : null]);
+  if (!mayPost()) return false;
+  if (checkMembers) {
+    // If a newer refresh won, don't let the older result restore a revoked
+    // identity. Require both snapshots to agree on the identities used.
+    const ids = [me(), ...people];
+    if (membersError() || ids.some(id => !members?.some(m => m.userId === id)
+      || !membersBySpace()[sid]?.some(m => m.userId === id))) return false;
+  }
+  return agents.every(id => currentAgents?.agents.some(a => a.spaceId === sid && a.id === id));
 }
 
 export async function addMember(userIdInput: string): Promise<boolean> {
@@ -1254,9 +1421,9 @@ function clearTransient() {
 }
 
 // Drafts are per place: each room or thread, and the personal Chat, keeps its
-// own text and mention chips. `draft` and `mentions` are the active place's;
+// own text and range bindings. `draft` and `mentionDraft` are the active place's;
 // switching stashes them under the place left and restores the new one's.
-const stashedDrafts = signal<Record<string, { text: string; mentions: Mention[] }>>({});
+const stashedDrafts = signal<Record<string, { text: string; mention: MentionDraft; directory: MentionDirectory | null }>>({});
 /** Some place other than the active one has a draft not sent yet. */
 export const stashedDraftPending = computed(() => Object.values(stashedDrafts()).some((d) => d.text.trim().length > 0));
 let mentionScope = "";
@@ -1267,15 +1434,15 @@ effect(() => {
     const left = mentionScope;
     mentionScope = scope;
     const stash = { ...stashedDrafts() };
-    if (left && (draft() || mentions().length)) stash[left] = { text: draft(), mentions: mentions() };
+    if (left && draft()) stash[left] = { text: draft(), mention: mentionDraft(), directory: editDirectory() };
     else delete stash[left];
     const back = stash[scope];
     delete stash[scope];
     batch(() => {
       stashedDrafts.set(stash);
       draft.set(back?.text ?? "");
-      mentions.set(back?.mentions ?? []);
-      if (membersError()) membersError.set(null);
+      mentionDraft.set(back?.mention ?? EMPTY_MENTION_DRAFT);
+      editDirectory.set(back?.directory ?? null);
     });
   });
 });
@@ -1299,6 +1466,8 @@ function endSession() {
   pollAgain.clear();
   lastRoomBySpace.clear();
   spaceEpoch.clear();
+  memberRequests.clear();
+  memberVersions.clear();
   batch(() => {
     status.set({ phase: "signedOut" });
     connectedTo.set(null);
@@ -1335,8 +1504,9 @@ function endSession() {
     actionError.set(null);
     notice.set(null);
     membersBySpace.set({});
-    membersError.set(null);
-    mentions.set([]);
+    memberFailures.set({});
+    mentionDraft.set(EMPTY_MENTION_DRAFT);
+    editDirectory.set(null);
     manageError.set(null);
     memberBusy.set(null);
     orgAdmin.set(false);

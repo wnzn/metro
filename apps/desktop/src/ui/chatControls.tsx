@@ -381,6 +381,7 @@ export function ComposerField(
     disabled?: boolean;
     onFocusChange?: (focused: boolean) => void;
     onCaretMove?: (e: CaretEvent) => void;
+    onSelectionChange?: (selection: { start: number; end: number }) => void;
     ref?: (node: InputRef) => void;
   },
 ) {
@@ -401,6 +402,7 @@ export function ComposerField(
       onFocus={() => props.onFocusChange?.(true)}
       onBlur={() => props.onFocusChange?.(false)}
       onCaretMove={props.onCaretMove}
+      onSelectionChange={props.onSelectionChange}
       onContentSizeChange={({ size }) => height.set(Math.max(FIELD_MIN, Math.min(FIELD_MAX, Math.ceil(size.height))))}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.placeholder}

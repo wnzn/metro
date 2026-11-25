@@ -109,7 +109,8 @@ test("@ suggestions: Return picks the highlighted one and sends nothing", async 
   await app.waitFor("id:mention-chip:agent");
   await app.submit("id:composer");
   await app.waitUntil(() => messages(f).length === before + 1);
-  expect(messages(f).at(-1)!.body).toEqual({ text: "ping @bob @agent", invoke_agent: false, mentions: [{ kind: "user", id: "bob" }, { kind: "agent" }] });
+  expect(messages(f).at(-1)!.body).toEqual({ text: "ping @bob @agent ", invoke_agent: false, infer_text_mentions: false,
+    mentions: [{ kind: "user", id: "bob" }, { kind: "agent" }], spans: [{ start: 5, end: 9, index: 0 }, { start: 10, end: 16, index: 1 }] });
 });
 
 test("@ then Down then Return picks the second suggestion with the caret still in the field; nothing is sent", async () => {
@@ -176,7 +177,7 @@ test("the agent has a glyph, not initials; a message to me has the rail and expl
   await app.waitFor("text:on it");
   expect(app.shows(`id:avatar:${reply.id}`)).toBe(true);
   expect(app.shows(`id:avatar:${reply.id} >> text:/^[A-Z]{1,2}$/`)).toBe(false);
-  expect(app.shows(`id:recipient:${toMe.id}:alice >> text:@you`)).toBe(true);
+  expect(app.shows(`id:recipient:${toMe.id}:alice >> text:@alice`)).toBe(true);
   expect(app.shows("label:Addressed to you")).toBe(true);
 });
 

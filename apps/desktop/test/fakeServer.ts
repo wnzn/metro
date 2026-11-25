@@ -441,6 +441,9 @@ export function fakeServer() {
       if (!space || !space.members.has(user)) return err(404, "no such space"); // outsiders get 404
       const rest = r[2] ?? "";
       const owner = space.owner === user;
+      if (rest === "/agents" && req.method === "GET") {
+        return ok({ agents: [{ id: `ag-default-${space.id}`, space_id: space.id, name: "Metro", handle: "agent", is_default: true }], tools: [] });
+      }
       if (rest === "/members") {
         if (req.method === "GET") return ok({ members: [...space.members].map((u) => ({ user_id: u, role: u === space.owner ? "owner" : "member" })) });
         if (!owner) return err(403, "only the owner manages members");

@@ -31,8 +31,6 @@ import {
   draft,
   isReactable,
   me,
-  members,
-  mentions,
   notice,
   mainPlace,
   REACTION_EMOJI,
@@ -47,7 +45,6 @@ import {
 } from "../store";
 import type { RoomEvent } from "../store";
 import { choiceForTurn, ComposerModelControls } from "./composerModels";
-import { composerAddress } from "./composerAddress";
 import type { AttachedFile, EventAgent } from "../api/client";
 import { agentById } from "./space/agents";
 import { SpaceAgentAvatar } from "./space/SpaceAgentAvatar";
@@ -107,6 +104,9 @@ import { destinationCue, openMessageFile, pickAttachments, pickNote, picking } f
 import { unstage } from "./attachments/attachmentDraft";
 import { formatSize } from "./library/libraryState";
 import { mediaKindOf } from "../api/library";
+import { MentionedBody, localMentionIdentity, sentMentionLabel } from "./mentions/MentionedBody";
+import { verifiedAgents } from "./mentions/roster";
+import { copyMentionText, sentMentions } from "./mentions/sent";
 
 /** The active place's transcript, with each agent turn folded into one group. */
 const transcriptItems = computed(() => groupTranscript(activeEvents()));
@@ -119,11 +119,11 @@ const rows = computed(() => transcriptRows(transcriptItems(), activeEvents(), cl
 let composerInput: InputRef | null = null;
 
 /** Puts the keyboard focus in the composer, the caret after its text. */
-export function focusComposer() {
+export function focusComposer(caret = draft().length) {
   const input = composerInput;
   if (!input) return;
   input.focus();
-  input.setSelection(draft().length);
+  input.setSelection(caret);
 }
 
 /** Replaces the draft with `text` and focuses it; never sends. */
@@ -270,14 +270,16 @@ function authorOf(e: RoomEvent, myId: string | null): Author {
   return { kind: "server", name: e.actor.trim() || "system", tone: toneForEvent(e.kind, e.actor), label: kindLabel(e.kind) };
 }
 
-/** "@you", "@<their display name>" or "@<id>" when no profile is known; agent mentions as eventKinds says. */
-function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null): string {
+function recipientText(m: NonNullable<RoomEvent["mentions"]>[number], myId: string | null, lastKnown?: string): string {
   if (m.kind === "agent" && !m.addressedBy && mainPlace() === "chat") return "to the agent";
-  if (m.kind === "agent" && m.agentId) {
+  if (m.kind === "agent" && m.addressedBy && (m.agentId || mainPlace() === "space")) {
     const a = agentById(activeSpace()?.id, m.agentId);
-    if (m.addressedBy === "classifier") return `${a?.name ?? "agent"} · detected by System One`;
-    if (m.addressedBy === "schedule") return `${a?.name ?? "agent"} · scheduled prompt`;
-    return a ? `@${a.handle}` : "@agent";
+    return `${a?.name ?? "agent"} · ${m.addressedBy === "classifier" ? "detected by System One" : "scheduled prompt"}`;
+  }
+  if (mainPlace() === "space") {
+    const sid = activeSpace()?.id;
+    const fallback = lastKnown ?? (m.kind === "user" ? `@${m.id}` : m.agentId ? "Agent unavailable" : "@agent");
+    return sid ? sentMentionLabel(sid, m, fallback) : fallback;
   }
   if (m.kind === "user" && m.id !== myId) {
     const name = profileName(m.id);
@@ -294,12 +296,22 @@ function recipientDescription(m: NonNullable<RoomEvent["mentions"]>[number], myI
   }
   if (m.kind === "agent") return `Addressed to the agent${m.addressedBy ? ` (${mentionText(m, myId)})` : ""}`;
   if (m.id === myId) return "Addressed to you";
-  const name = profileName(m.id);
+  const sid = activeSpace()?.id;
+  const name = mainPlace() === "space" ? sid && localMentionIdentity(sid, m)?.name : profileName(m.id);
   return name && name !== m.id ? `Addressed to ${name} (@${m.id})` : `Addressed to @${m.id}`;
 }
 
 function MessageRow(props: { row: () => Of<"event"> }) {
   const event = () => props.row().event;
+  const spaceId = () => mainPlace() === "space" ? activeSpace()?.id : undefined;
+  const pieces = computed(() => {
+    const sid = spaceId();
+    if (!sid) return [];
+    const agents = verifiedAgents(sid);
+    return sentMentions(event(), id => agents?.find(a => a.id === id)?.handle);
+  });
+  const recipientLabel = (m: NonNullable<RoomEvent["mentions"]>[number]) =>
+    recipientText(m, me(), pieces().find(piece => piece.mention === m)?.literal);
   const tone = () => toneForEvent(event().kind, event().actor);
   const author = () => authorOf(event(), me());
   const forMe = () => mentionsMe(event().mentions, me());
@@ -337,7 +349,9 @@ function MessageRow(props: { row: () => Of<"event"> }) {
     reactButton?.focus();
   };
   const copy = () => {
-    void Clipboard.writeText(event().text).then(
+    const sid = spaceId();
+    const text = sid ? copyMentionText(event().text, pieces(), piece => sentMentionLabel(sid, piece.mention, piece.literal)) : event().text;
+    void Clipboard.writeText(text).then(
       () => {
         copied.set(true);
         announce("Message copied");
@@ -442,7 +456,7 @@ function MessageRow(props: { row: () => Of<"event"> }) {
                 tone={m().kind === "agent" ? "agent" : "neutral"}
                 slim={continued()}
                 self={m().kind === "user" && (m() as { id: string }).id === me()}
-                label={recipientText(m(), me())}
+                label={recipientLabel(m())}
                 accessibilityLabel={recipientDescription(m(), me())}
               />
             )}
@@ -453,7 +467,10 @@ function MessageRow(props: { row: () => Of<"event"> }) {
         when={failure()}
         else={
           <If when={event().text.trim().length > 0}>
-            <FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />
+            <If when={pieces().length > 0 ? spaceId() : undefined}
+              else={<FoldableText text={event().text} mono={tone() === "runner"} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />}>
+              {(sid) => <MentionedBody event={event()} sid={sid()} pieces={pieces()} stateKey={disclosureKey(disclosureScope(), event().id, "all")} />}
+            </If>
           </If>
         }
       >
@@ -669,6 +686,7 @@ export function Composer(props: {
   onSubmitIntercept?: () => boolean;
   /** The caret moved in the field (its box in the window anchors mention suggestions). */
   onCaretMove?: (e: CaretEvent) => void;
+  onSelectionChange?: (selection: { start: number; end: number }) => void;
   /** The field took or lost the keyboard focus. */
   onFocusChange?: (focused: boolean) => void;
   /** The agent Ask agent asks (a Space with several agents); none: the default (or the classifier's pick). */
@@ -686,15 +704,14 @@ export function Composer(props: {
   // A Space Ask needs a typed question; Chat Send can start a turn with files alone.
   const canAsk = () => ready() && draft().trim().length > 0;
   const personal = () => mainPlace() === "chat";
-  const toSpaceAgent = () => !personal() && (
-    composerAddress(draft(), (members() ?? []).map(m => m.userId)).agent || mentions().some(m => m.kind === "agent")
-  );
   const post = (ask: boolean) => {
     if (!(ask && !personal() ? canAsk() : canSend())) return;
-    if (ask || (draft().trim() && toSpaceAgent())) {
+    if (!personal()) {
+      void send(ask, choiceForTurn, ask ? props.askAgentId : undefined);
+    } else if (ask) {
       const { error, choice } = choiceForTurn();
       if (error) { actionError.set(error); return; }
-      void send(ask, choice, ask ? props.askAgentId : undefined);
+      void send(ask, choice);
     } else void send(false);
   };
   const submit = () => {
@@ -716,6 +733,7 @@ export function Composer(props: {
           onSubmit={submit}
           onFocusChange={(f) => props.onFocusChange?.(f)}
           onCaretMove={props.onCaretMove}
+          onSelectionChange={props.onSelectionChange}
           placeholder={props.placeholder}
           disabled={props.disabled}
         />
