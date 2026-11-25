@@ -263,7 +263,7 @@ runtime.
     `SHA256SUMS`, unsigned Windows files and GHCR images signed by the release workflow
     (`docs/acceptance.md`). Native Windows by a person, real vendor
     accounts and real sign-ins are still unverified.
-  - The latest gate on source since 0.3.2, not released (4175475, several
+  - The latest gate on the source for 0.4.0, not yet recorded as published (4175475, several
     agents per Space, per-connection model lists, the desktop redesign) is
     staged, not a release: 686 Rust tests, eight e2e scripts (not
     `library_reference.py`) and desktop `nsh test` 400/400, with no

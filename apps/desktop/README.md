@@ -239,7 +239,7 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   agent** ("To: agent in Acme › #lobby"). Follow up opens the same form, and
   Close folds it while keeping your draft. This is separate from
   **Scheduled tasks › New task**, which creates a schedule.
-- **Asking in Chat** (current source after 0.2.0; checked natively in a
+- **Asking in Chat** (released in 0.3.2; checked natively in a
   Linux test archive, [acceptance](../../docs/acceptance.md#staged-composer-models-and-ask-from-personal-chat-at-28ba4e2-2026-11-23-project-manager-local)):
   - When a chat model is ready for your Chat and you haven't set up System
     One, a typed message shows **Ask agent ↵** as the primary action, and
@@ -253,7 +253,7 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
     ordinary text as a note, and **Ask agent** (or `@agent`) asks. The
     choice is made when you start typing, so a list that finishes loading
     while you write never changes what Return does.
-- **Model for agent turns** (current source after 0.2.0): the **Model**
+- **Model for agent turns** (released in 0.3.2): the **Model**
   button in the composer picks the model, and where supported the
   **Thinking level**, for agent turns you start in that place: your Chat,
   or a Space. **Default** keeps your normal routing or default connection.
@@ -292,8 +292,8 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   session. Switching workspaces asks first if any place still has one.
 - **Mentions:** type `@` or press **@** to mention `@agent`, one of the
   Space's named agents by its `@handle`, or a Space member by their stable
-  user ID. In the source since 0.3.2 (covered by automated tests;
-  not released), the list shows each agent with its picture (or its initial
+  user ID. In the source for 0.4.0 (covered by automated tests;
+  not yet recorded as published), the list shows each agent with its picture (or its initial
   on its colour) and each person with theirs. `@agent` is the generic agent:
   the Space's default agent, or your classifier's pick if you turned
   classification on in that Space. A named agent is sent by its id. Keys
@@ -305,8 +305,8 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   Mentioning a person never starts agent work. Only an agent mention or
   **Ask agent** does. Messages show their audience and recipients, and
   `@you` is highlighted.
-- **Ask agent in a Space with several agents** (source since 0.3.2;
-  covered by automated tests; not released): **Ask agent** gets a small
+- **Ask agent in a Space with several agents** (in the source for 0.4.0;
+  covered by automated tests; not yet recorded as published): **Ask agent** gets a small
   chevron that chooses which agent it asks. The Space's default agent is
   preselected and the button names the chosen one (**Ask Coder**). **Let the
   classifier choose** is offered only when you have a System One connection
@@ -329,8 +329,8 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   collapsed **Runner activity** group, and since no model is called it never
   says "thinking".
 - **Agent activity:** each agent turn shows as **one** collapsed group, not a
-  row per tool. In the source since 0.3.2 (covered by automated
-  tests; not released), a Space turn shows its agent's name and picture (or
+  row per tool. In the source for 0.4.0 (covered by automated
+  tests; not yet recorded as published), a Space turn shows its agent's name and picture (or
   initial), and its reply in the transcript does too, instead of the generic
   agent mark. The collapsed line also says how the agent was chosen when
   that adds something, such as **Picked by classifier: Coder**; the opened
@@ -400,8 +400,8 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   collapses it to a rail of icons: Chat, Library, Scheduled tasks, each Space
   as its initial tile, Settings and your picture. Each name is the icon's
   tooltip and accessible name.
-- **Resizable panels** (source since 0.3.2; covered by automated tests; not
-  released): drag the thin handle on the inner edge of the sidebar
+- **Resizable panels** (in the source for 0.4.0; covered by automated tests; not yet
+  recorded as published): drag the thin handle on the inner edge of the sidebar
   (200–400 points), of Chat's agent runs (260–520) or of the Settings and
   Space settings sections (180–320, one width for both). Double-click the
   handle to restore the default width (headless tests can't double-click,
@@ -411,8 +411,8 @@ Installing and recovery are in [docs/install.md](../../docs/install.md#the-deskt
   and widest, and <kbd>Return</kbd> restores the default. Dragging the
   sidebar well below its narrowest width collapses it to the icon rail. Each
   width is remembered on this device, like the collapsed state.
-- **Space settings** (source since 0.3.2; covered by automated
-  tests; not released): every member opens a Space's settings from the cog
+- **Space settings** (in the source for 0.4.0; covered by automated
+  tests; not yet recorded as published): every member opens a Space's settings from the cog
   in the room's header, from the **⋯** that shows when hovering the Space in
   the sidebar (**Space settings**, **Agents**, **Your preferences**), or with
   a secondary click on its tile in the icon rail. **General** renames and
@@ -497,7 +497,7 @@ by automated tests. Windows and macOS weren't checked.
     name) renames it in place, <kbd>Return</kbd> saves and <kbd>Esc</kbd>
     cancels. A Sign in with ChatGPT connection shares only a bring-your-own
     preset: each person signs in with their own account.
-    In the current source after 0.2.0, this page also holds **Documents &
+    Released in 0.3.2, this page also holds **Documents &
     media**: **Index and search with** picks your media model (only
     media-capable connections), and **Where your files go** says what Index
     and search send, and to whom.
@@ -578,7 +578,7 @@ contributors only, in
   address, or to its Compose service name on the same Docker network
   ([runners.md](../../docs/runners.md#3-choose-a-server-url-the-container-can-reach)).
   Local tools in **Use locally** need no runner.
-- **Metro's own errors on this computer** (current source after 0.2.0:
+- **Metro's own errors on this computer** (released in 0.3.2:
   `322dc9b`, with Sign in with ChatGPT details from `9144e1c` and
   `38749f3`; covered by automated tests. In the local 57409bb setup cut its
   view opened natively on Debian 13, but no failure was injected into it;
@@ -597,8 +597,8 @@ contributors only, in
   - Those details stay on this computer. The Metro server only gets the
     fixed, coarser error text, such as asking you to sign in again on the
     device.
-  - In the current source after 0.2.0 (covered by automated tests; no
-    real-account run), a successful ChatGPT answer Metro still can't read
+  - In the source for 0.4.0, not yet recorded as published (covered by
+    automated tests; no real-account run), a successful ChatGPT answer Metro still can't read
     is recorded as `chatgpt_unusable_response`, with only the class of its
     media type (`event_stream`, `json`, `other` or `missing`), never the
     body. Try again; if it keeps failing, update Metro.
@@ -608,8 +608,8 @@ contributors only, in
     Windows). The app reads it through the launcher's local service, which
     refuses requests without the app's own credential.
   - Since `5f4463e` (checked in the native GTK app on Debian 13 in the
-    local 57409bb setup cut, except an injected device-local failure; not
-    released), **Settings → Monitoring** shows one source at a time, never combined:
+    local 57409bb setup cut, except an injected device-local failure;
+    released in 0.3.2), **Settings → Monitoring** shows one source at a time, never combined:
     **This computer** (this list), **Your account on this server** (your
     personal Chat's events, only you), **Spaces you own** (one Space), and
     **Organization** for org admins. A server or helper too old to support

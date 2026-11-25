@@ -171,7 +171,7 @@ your own, or one shared with this Space or the organization. It's checked
 when you save and again on every run. The order a run's model is chosen in
 is in [settings.md](settings.md#which-model-a-run-uses).
 
-**In the desktop app** (source since 0.3.2, not released), a Space's
+**In the desktop app** (in the source for 0.4.0, not yet recorded as published), a Space's
 settings window has four pages: **General** (name and description; **Leave
 Space…** for members, **Delete Space…** with the typed name for the owner),
 **Members and runner** (a link to the owner's member and runner
@@ -318,8 +318,7 @@ A room's agent can delegate work to **child threads** with the tools
   someone else's connection, or one that doesn't exist, gets `404`. See
   [settings.md](settings.md#which-model-a-run-uses). Chat has no other
   members, so only `@agent` or `invoke_agent` addresses anyone. Any other
-  Chat message is a note to yourself and never calls a model. In the current
-  source after 0.2.0, `model_id` and `reasoning_effort` may go with
+  Chat message is a note to yourself and never calls a model. Since 0.3.2, `model_id` and `reasoning_effort` may go with
   `provider_connection_id` on a message to the agent.
 - In the desktop app (since 0.3.2), when a
   chat model is ready for your Chat and you haven't set up System One,
@@ -359,11 +358,11 @@ A room's agent can delegate work to **child threads** with the tools
 
 ## Monitoring events
 
-**Status.** In the current source after 0.2.0 (`797eac1`, with the personal
+**Status.** Released in 0.3.2 (`797eac1`, with the personal
 scope added in `c5e2753`), covered by the server's automated tests
 (`crates/server/tests/monitoring.rs`), and checked through the desktop's
 **Settings → Monitoring** in the native GTK app on Debian 13 in the local
-[57409bb setup cut](acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local). It isn't released.
+[57409bb setup cut](acceptance.md#staged-installers-and-setup-at-57409bb-2026-11-23-project-manager-local).
 
 The server keeps a short log of things that went wrong, so a Space's owner,
 a person, or an operator can see that something failed without anyone

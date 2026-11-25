@@ -38,7 +38,7 @@ own files.
 - **Native desktop app** with reactions, profiles, and dark and light themes.
 
 Several agents per Space, `@handle` addressing, per-Space classification and
-per-connection model lists are in the source since 0.3.2, not released.
+per-connection model lists are in the source for 0.4.0, not yet recorded as published.
 
 Opt-in extras:
 
