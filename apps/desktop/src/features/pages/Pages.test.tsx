@@ -3,7 +3,7 @@ import type { App } from "nsh/test";
 import { BASE, TOKENS } from "../../../test/fakeServer";
 import { launched } from "../../../test/launched";
 import { briefSpec, DRAFT, pagesFixture, PERSONAL, TEAM } from "./test/fixtureServer";
-import { stamp } from "./test/sample";
+import { bind, lit, sample, stamp } from "./test/sample";
 
 type Fixture = ReturnType<typeof pagesFixture>;
 async function signIn(app: App, user: string) {
@@ -203,7 +203,7 @@ test("Schedule consent sends the exact displayed version and revision, never ret
   await app.press("id:page-action:run");
   await app.waitFor("id:page-action-confirm");
   f.state.revision = 4;
-  await app.press("id:page-action-confirm >> label:Run now");
+  await app.press("id:page-action-confirm >> label:Approve version and run");
   await app.waitFor("text:/changed.*no action ran/");
   expect(f.state.started).toBe(0);
   expect(f.calls(`/${TEAM}/actions`, "POST").map(r => r.body)).toEqual([
@@ -229,6 +229,51 @@ test("Schedule consent sends the exact displayed version and revision, never ret
   expect(app.shows("id:page-action-confirm")).toBe(false);
   expect(f.calls(`/${TEAM}/actions`, "POST").at(-1)?.body).toEqual({ version: 1, block_key: "ask" });
 });
+
+for (const size of [{ width: 720, height: 480 }, { width: 1280, height: 900 }]) {
+  test(`Version approval shows a read-only list of other available actions at ${size.width}px`, async () => {
+    const f = pagesFixture();
+    f.replaceTeam({ ...sample, blocks: [
+      ...sample.blocks!.map(b =>
+        b.key === "ask" ? { ...b, action: { kind: "runAgent" as const, prompt: "other-button-private-input" } }
+        : b.key === "room" ? { type: "Button", key: "room", props: { label: bind("private", "secret") },
+          action: { kind: "runAgent" as const, prompt: "unresolved-button-private-input" } } : b),
+      { type: "Button", key: "denied-schedule", props: { label: lit("Restricted schedule") },
+        action: { kind: "runSchedule", prompt: "restricted-schedule-private-input" } },
+    ] });
+    const app = await start(f, "alice", false, size);
+    await jump(app);
+    await app.waitUntil(() => app.enabled("id:page-action:run"));
+    const dialog = "id:page-action-confirm";
+    const covered = `${dialog} >> id:page-action-covered`;
+    const calls = () => f.calls(`/${TEAM}/actions`, "POST").map(r => r.body);
+    const dataReads = f.calls(`/${TEAM}/data`, "POST").length;
+    await app.press("id:page-action:run");
+    await app.waitFor(dialog);
+    expect(app.shows(`${dialog} >> text:Approve version 1 and run the scheduled task?`)).toBe(true);
+    expect(app.shows(`${covered} >> text:/Ask for a brief/`)).toBe(true);
+    expect(app.shows(`${covered} >> id:page-action:ask`)).toBe(false);
+    expect(app.shows(`${covered} >> text:/Run schedule|Restricted schedule|Refresh this page|Open another page|• Action/`)).toBe(false);
+    expect(text(app)).not.toMatch(/other-button-private-input|restricted-schedule-private-input|unresolved-button-private-input/);
+    expect(f.state.started).toBe(0);
+    expect(calls()).toEqual([{ version: 1, block_key: "run", schedule_revision: 3 }]);
+    expect(f.calls(`/${TEAM}/data`, "POST")).toHaveLength(dataReads);
+
+    await app.press(`${dialog} >> id:page-action-review:footer >> label:Approve version and run`);
+    await app.waitFor("text:Scheduled task started.");
+    expect(f.state.started).toBe(1);
+    expect(app.shows(dialog)).toBe(false);
+    expect(calls()).toEqual([
+      { version: 1, block_key: "run", schedule_revision: 3 },
+      { version: 1, block_key: "run", schedule_revision: 3, confirm: true },
+    ]);
+    await app.waitUntil(() => app.enabled("id:page-action:ask"));
+    await app.press("id:page-action:ask");
+    await app.waitUntil(() => f.state.started === 2);
+    expect(app.shows(dialog)).toBe(false);
+    expect(calls().at(-1)).toEqual({ version: 1, block_key: "ask" });
+  });
+}
 
 test("Personal page action stays on the page; a missing room link never falls back", async () => {
   const f = pagesFixture();

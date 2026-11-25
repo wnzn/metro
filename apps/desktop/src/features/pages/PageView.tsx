@@ -1,4 +1,4 @@
-import { cleanup, effect, lifecycle, openUrl, signal, untracked } from "nsh";
+import { cleanup, computed, effect, lifecycle, openUrl, signal, untracked } from "nsh";
 import type { ActionKind, Confirmation, Page, PageData, PageDiagnostic } from "../../api/pages";
 import { isPageStatus, pageFailure } from "../../api/pages";
 import { goPages, hasSpace, pageGuard, pagesProblem, refreshPages, sameSpaceGrants, scopeVisible, spaceGrants } from "../../pagesState";
@@ -13,7 +13,7 @@ import { actionBody, checkedConfirmation } from "./actions";
 import { Diagnostics, DraftPrompt, PagesError, scopeName, showDraft } from "./controls";
 import { PageRenderer } from "./PageRenderer";
 import { PageHistory, PageSettings, SourceEditor } from "./PageTools";
-import { capabilityOf, cell, own, str } from "./renderPlan";
+import { capabilityOf, cell, otherApprovalButtons, str } from "./renderPlan";
 import { intervalFor, pageReadLane, visiblePolling } from "./refresh";
 import { answerSchedule } from "./scheduleAnswer";
 
@@ -28,6 +28,11 @@ export function PageView(props: { route: ViewRoute }) {
   const diagnostics = signal<PageDiagnostic[]>([]);
   const sheet = signal<Sheet>(null), confirm = signal<Confirmation | null>(null), external = signal<string | null>(null);
   const schedule = signal<ReturnType<typeof answerSchedule>>(undefined);
+  const covered = computed(() => {
+    const choice = confirm(), head = page(), displayed = data();
+    if (!choice || !head || !displayed || head.head_version !== choice.version || displayed.version !== choice.version) return;
+    return otherApprovalButtons(head.spec, displayed, choice.block_key);
+  });
   const editing = signal(false), select = signal(false), block = signal<string | undefined>(undefined);
   const client = apiClient(), route = props.route;
   const unavailableSpace = signal(false);
@@ -318,16 +323,26 @@ export function PageView(props: { route: ViewRoute }) {
         </Column>
       </Modal></If>
     </>}</If>
-    <If when={confirm()}>{choice => <Modal open title="Confirm page action" testID="page-action-confirm" onClose={() => confirm.set(null)}>
-      <PageLayout gap={3}>
-        <PageHeader title={choice().action.kind === "runAgent" ? "Run agent?" : "Run scheduled task now?"} />
+    <If when={confirm()}>{choice => <Modal open title="Approve page version" testID="page-action-confirm" onClose={() => confirm.set(null)}>
+      <PageLayout gap={3} pad={4} testID="page-action-review" footer={
+        <ActionBar><Action label="Cancel" testID="page-action-cancel" variant="ghost" onPress={() => confirm.set(null)} />
+          <Action label="Approve version and run" testID="page-action-run" variant="primary" busy={busy()} onPress={() => void run(choice().block_key, choice().action.kind, choice())} /></ActionBar>
+      }>
+        <PageHeader title={`Approve version ${choice().version} and ${choice().action.kind === "runAgent" ? "run the agent?" : "run the scheduled task?"}`} />
         <Label>Runs as you, with your model settings.</Label>
         <Label variant="meta">Last edited by {profileName(choice().edited_by) ?? choice().edited_by} · {cell(choice().edited_at, "datetime").label}</Label>
         <Label variant="strong">{destination(choice())}</Label>
         <Column selectable><Label>{choice().action.prompt}</Label></Column>
         <Label>This approval covers every agent and schedule button on this page version. Only this action runs now. The other buttons still need a click, but won’t ask for page approval again. Permission and schedule checks still apply.</Label>
-        <ActionBar><Action label="Cancel" testID="page-action-cancel" variant="ghost" onPress={() => confirm.set(null)} />
-          <Action label="Run now" testID="page-action-run" variant="primary" busy={busy()} onPress={() => void run(choice().block_key, choice().action.kind, choice())} /></ActionBar>
+        <If when={covered()?.labels.length ? covered() : undefined}>{buttons =>
+          <Column gap={1} testID="page-action-covered">
+            <Label variant="strong">Other available buttons this approval covers</Label>
+            <Each of={buttons().labels} key={button => button.key}>
+              {button => <Label lines={2} variant="caption">• {button().label}</Label>}
+            </Each>
+            <If when={buttons().more > 0}><Label variant="caption">{`And ${buttons().more} more`}</Label></If>
+          </Column>
+        }</If>
       </PageLayout>
     </Modal>}</If>
     <If when={schedule()}>{task => <Modal open size="compact" title="Set up scheduled refresh" onClose={() => schedule.set(undefined)}>

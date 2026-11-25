@@ -8,7 +8,7 @@ export function webAttemptRows(note: WebToolNote) {
   const visible = note.attempts.map((attempt, index) => ({ attempt, index })).filter(({ attempt }) => attempt.outcome !== "skipped_disabled");
   return visible.map(({ attempt: a, index }, i) => {
     const provider = WEB_PROVIDERS[a.provider];
-    const name = a.outcome === "skipped_no_key" ? provider : `${provider} (${a.mode === "key" ? "your key" : "free"})`;
+    const name = a.outcome === "skipped_no_key" ? provider : `${provider} (${a.mode === "key" ? "saved key" : "no key"})`;
     // The connector normalizes several vendor codes (and MCP error bodies)
     // to the same outcome. Don't invent an exact HTTP status here.
     const limit = a.outcome === "limited" || a.outcome === "out_of_credits";
@@ -52,6 +52,7 @@ export function webFailureText(note: WebToolNote, own: boolean, offlineOwner?: s
 
 /** The server's public result summary, not result titles, page text or diagnostics. */
 export function webResultCount(text: string): string {
+  // The stored wire copy predates the neutral attempt labels above.
   const m = /^(?:web_search|web_fetch) via (?:Exa|Parallel|Tavily|Firecrawl|TinyFish) \((?:free|your key)\): (\d{1,2} (?:results?|pages?)(?: \(as text\))?|results as text)(?:, (\d{1,2}) failed)?(?=$|\n| \()/.exec(text);
   if (!m) return "";
   return `${m[1]}${m[2] ? ` · ${m[2]} failed` : ""}`;

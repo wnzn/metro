@@ -9,8 +9,8 @@ import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof world>;
 
-async function inChat(f: F, width = 1200, user: "alice" | "carol" = "alice") {
-  const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width, height: 800 });
+async function inChat(f: F, width = 1200, user: "alice" | "carol" = "alice", useClock = false) {
+  const app = await open("../../App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width, height: 800, clock: useClock ? {} : undefined });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
@@ -99,6 +99,123 @@ test("Follow up opens the folded form, aimed at the run's room", async () => {
   await app.press("id:run-follow:run1");
   await app.waitFor("id:dispatch");
   await app.waitFor("text:To: agent in Acme › #lobby");
+});
+
+function lobbyRuns(f: F) {
+  for (const space_id of ["acme", "side"]) {
+    f.state.runs.push({ id: `run-${space_id}`, space_id, room_id: "lobby", status: "completed", actor: "alice", task: "Earlier task" });
+  }
+}
+
+for (const width of [1200, 780]) {
+  test(`Follow up across identical lobby names asks explicitly and restores keyboard focus at ${width}px`, async () => {
+    const f = world();
+    lobbyRuns(f);
+    const app = await inChat(f, width);
+    if (width === 780) await app.press("id:runs-toggle");
+    await app.waitFor("id:run:run-acme");
+    expect(app.shows("id:run:run-acme >> label:Open Acme › #lobby")).toBe(true);
+    expect(app.shows("id:run:run-side >> label:Open Side project › #lobby")).toBe(true);
+    await app.press("label:Follow up in Acme › #lobby");
+    await app.waitFor("text:To: agent in Acme › #lobby");
+    const draft = "\u2003🌿 @bob\nDraft  \t";
+    await app.paste("id:dispatch-text", { text: draft });
+    await app.press("id:dispatch-close");
+    const sideReads = () => app.requests().filter(r => r.method === "GET" && r.url.endsWith("/side/rooms")).length;
+    const before = sideReads();
+    await app.press("label:Follow up in Side project › #lobby");
+    await app.waitFor("id:dispatch-move-confirm");
+    expect(app.shows("id:dispatch-move-confirm >> text:/Follow up in Side project › #lobby instead/")).toBe(true);
+    expect(app.shows("id:dispatch-move-confirm >> text:To: agent in Acme › #lobby")).toBe(true);
+    expect(sideReads()).toBe(before); // Previewing the choice doesn't probe or move.
+    await app.keyboard.press("enter"); // The initial focus is Keep draft, not Move.
+    await app.waitFor("id:dispatch-move-confirm", { state: "gone" });
+    expect(app.value("id:dispatch-text")).toBe(draft);
+    expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+    expect(sideReads()).toBe(before);
+
+    await app.keyboard.press("enter"); // Focus returned to the correct Follow up card.
+    await app.waitFor("id:dispatch-move-confirm");
+    await app.keyboard.press("escape");
+    await app.waitFor("id:dispatch-move-confirm", { state: "gone" });
+    expect(app.shows("id:dispatch")).toBe(true); // Escape didn't close Agent runs.
+    await app.keyboard.press("enter");
+    await app.waitFor("id:dispatch-move-confirm");
+    await app.keyboard.press("tab");
+    await app.keyboard.press("enter");
+    await app.waitFor("text:To: agent in Side project › #lobby");
+    expect(sideReads()).toBe(before + 1);
+    expect(app.value("id:dispatch-text")).toBe(draft);
+    expect(sentAnything(f)).toBe(false);
+    await app.press("id:dispatch-send");
+    await app.waitFor("id:dispatch-notice");
+    expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
+      { path: "/v1/spaces/side/rooms/lobby/messages", body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+    ]);
+  });
+}
+
+test("a held confirmed Follow up can't move a draft edited away and back; an omitted room doesn't replace its target", async () => {
+  const f = world();
+  lobbyRuns(f);
+  const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
+  let scenario: "hold" | "omit" | undefined;
+  let held = false;
+  f.network[get] = req => {
+    const result = base(req);
+    if (!req.url.endsWith("/side/rooms")) return result;
+    if (scenario === "hold") {
+      held = true;
+      return { ...(result as object), delay: 3_000 };
+    }
+    if (scenario === "omit") return { status: 200, body: { rooms: [] } };
+    return result;
+  };
+  const app = await inChat(f, 1200, "alice", true);
+  await app.waitFor("id:run-follow:run-acme");
+  await app.press("id:run-follow:run-acme");
+  await app.waitFor("text:To: agent in Acme › #lobby");
+  const draft = "same words, new intent";
+  await app.paste("id:dispatch-text", { text: draft });
+  scenario = "hold";
+  await app.press("id:run-follow:run-side");
+  await app.press("id:dispatch-move-draft");
+  await app.waitUntil(() => held);
+  expect(app.shows("id:dispatch-verifying")).toBe(true);
+  expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+  expect(app.enabled("id:dispatch-send")).toBe(false);
+  await app.clear("id:dispatch-text");
+  await app.paste("id:dispatch-text", { text: draft });
+  await app.clock!.runFor(3_100);
+  expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+  expect(app.value("id:dispatch-text")).toBe(draft);
+  expect(app.shows("id:dispatch-verifying")).toBe(false);
+
+  scenario = "omit";
+  await app.press("id:run-follow:run-side");
+  await app.press("id:dispatch-move-draft");
+  await app.waitFor("text:/That room or thread is no longer available/");
+  expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+  expect(app.value("id:dispatch-text")).toBe(draft);
+  expect(sentAnything(f)).toBe(false);
+});
+
+test("Follow up discards an unsubmitted move choice if its Space access is lost", async () => {
+  const f = world();
+  lobbyRuns(f);
+  const app = await inChat(f, 1200, "alice", true);
+  await app.press("id:run-follow:run-acme");
+  await app.waitFor("text:To: agent in Acme › #lobby");
+  await app.type("id:dispatch-text", "Keep this in Acme");
+  await app.press("id:run-follow:run-side");
+  await app.waitFor("id:dispatch-move-confirm");
+  f.state.spaces.get("side")!.members.delete("alice");
+  await app.clock!.runFor(12_000);
+  await app.waitFor("id:dispatch-move-confirm", { state: "gone" });
+  expect(app.shows("id:run-follow:run-side")).toBe(false);
+  expect(app.shows("text:To: agent in Acme › #lobby")).toBe(true);
+  expect(app.value("id:dispatch-text")).toBe("Keep this in Acme");
+  expect(sentAnything(f)).toBe(false);
 });
 
 test("Dispatch sends exact Unicode and whitespace to the explicit thread, never replays 422 or uncertain sends", async () => {

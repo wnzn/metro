@@ -9,6 +9,7 @@
 // presses Follow up), and it scrolls with the runs, so it never covers them.
 
 import { cleanup, effect, keymap, signal } from "nsh";
+import type { ViewRef } from "nsh";
 import {
   activeEvents,
   activeLoaded,
@@ -30,6 +31,7 @@ import {
   runsError,
   runsLoaded,
   sendDispatch,
+  setDispatchDraft,
   setDispatchRoom,
   setDispatchSpace,
   setDraft,
@@ -37,7 +39,7 @@ import {
   stopRun,
 } from "../store";
 import type { Run } from "../store";
-import { Action, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, PanelToggle, ResizeHandle, Row, runsPanel, ScrollArea, Spacer, Surface } from "../ui";
+import { Action, ActionBar, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, PanelToggle, ResizeHandle, Row, runsPanel, ScrollArea, Spacer, Surface } from "../ui";
 import { EmptyState, sidePanelFits, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
 import { Composer, ConnectionBanner, Transcript } from "./Conversation";
@@ -104,11 +106,11 @@ export function ChatView() {
       <If when={sidePanelFits() && runsPanel.open()}>
         <ResizeHandle panel={runsPanel} edge="start" name="agent runs" testID="resize-runs" />
         <Surface variant="aside" testID="runs-aside" width={runsPanel.width()}>
-          <RunsPanel />
+        <RunsPanel visible={runsPanel.open() && sidePanelFits()} />
         </Surface>
       </If>
       <Modal testID="runs-dialog" title="Agent runs" open={runsDialogOpen() && !sidePanelFits()} onClose={() => runsDialogOpen.set(false)}>
-        <RunsPanel onClose={() => runsDialogOpen.set(false)} />
+        <RunsPanel visible={runsDialogOpen() && !sidePanelFits()} onClose={() => runsDialogOpen.set(false)} />
       </Modal>
     </Surface>
   );
@@ -161,7 +163,36 @@ function Onboarding() {
 }
 
 /** The runs list and task form: in the side panel, or in the dialog (with `onClose`). */
-function RunsPanel(props: { onClose?: () => void }) {
+function RunsPanel(props: { visible: boolean; onClose?: () => void }) {
+  type Move = NonNullable<ReturnType<typeof followUp>>;
+  const choice = signal<{ run: Run; decision: Move; opener?: ViewRef } | null>(null);
+  const moving = signal<Move | null>(null);
+  const cancelMove = () => { choice.set(null); moving.set(null); };
+  effect(() => { if (!props.visible) cancelMove(); });
+  cleanup(cancelMove);
+  const follow = (run: Run, opener?: ViewRef) => {
+    cancelMove();
+    dispatchOpen.set(true);
+    const decision = followUp(run);
+    if (decision) choice.set({ run, decision, opener });
+  };
+  const closeChoice = () => {
+    const opener = choice()?.opener;
+    choice.set(null);
+    if (opener) void opener.measure().then(layout => {
+      if (layout && props.visible && !choice()) opener.focus();
+    });
+  };
+  const move = async (decision: Move) => {
+    if (choice()?.decision !== decision || !decision.current()) return;
+    closeChoice();
+    moving.set(decision);
+    try {
+      await decision.move(() => moving() === decision && props.visible && dispatchOpen());
+    } finally {
+      if (moving() === decision) moving.set(null);
+    }
+  };
   return (
     <Column grow>
       <Column padX={4} padY={3} gap={1}>
@@ -182,7 +213,10 @@ function RunsPanel(props: { onClose?: () => void }) {
       </Column>
       <ScrollArea padX={4} padY={1} gap={2} testID="runs-list">
         <If when={dispatchOpen()}>
-          <Dispatch />
+          <Dispatch moving={!!moving()?.current()} onEdit={cancelMove} onClose={() => {
+            cancelMove();
+            dispatchOpen.set(false);
+          }} />
         </If>
         <If when={runsError()}>
           {(message) => (
@@ -192,12 +226,33 @@ function RunsPanel(props: { onClose?: () => void }) {
           )}
         </If>
         <Each of={runs()} key={(run) => run.id}>
-          {(run) => <RunCard run={run} onLeave={props.onClose} />}
+          {(run) => <RunCard run={run} onFollow={follow} onLeave={props.onClose} />}
         </Each>
         <If when={runsLoaded() && runs().length === 0 && !runsError()}>
           <RunsEmpty />
         </If>
       </ScrollArea>
+      <If when={props.visible && choice()?.decision.current() ? choice() : null}>
+        {item => (
+          <Modal open size="compact" title="Move task draft" testID="dispatch-move-confirm" onClose={closeChoice}>
+            <Column pad={4} gap={3}>
+              <Label heading variant="title">Move this draft?</Label>
+              <Label>{`Follow up in ${runDestination(item().run)} instead? Your draft text stays the same. Nothing is sent.`}</Label>
+              <Label variant="caption" color="muted">{dispatchRecipient()}</Label>
+              <ActionBar>
+                <Action label="Keep draft" testID="dispatch-keep-draft" onPress={closeChoice}
+                  viewRef={node => {
+                    const active = choice();
+                    void node.measure().then(layout => {
+                      if (layout && active && choice() === active && props.visible && active.decision.current()) node.focus();
+                    });
+                  }} />
+                <Action label="Move draft" testID="dispatch-move-draft" variant="primary" disabled={dispatching()} onPress={() => void move(item().decision)} />
+              </ActionBar>
+            </Column>
+          </Modal>
+        )}
+      </If>
     </Column>
   );
 }
@@ -220,7 +275,7 @@ function RunsEmpty() {
   const suggest = (text: string) => {
     if (noSpace()) return;
     dispatchOpen.set(true);
-    if (dispatchDraft().trim() === "") dispatchDraft.set(text);
+    if (dispatchDraft().trim() === "") setDispatchDraft(text);
   };
   return (
     <Column gap={2} padY={3} align="center" testID="runs-empty">
@@ -256,16 +311,22 @@ function RunsEmpty() {
   );
 }
 
-function RunCard(props: { run: () => Run; /** Opening the run leaves the Chat: close the dialog first. */ onLeave?: () => void }) {
+function runDestination(run: Run) {
+  const { space, room } = runScope(run);
+  return `${space} › #${room}`;
+}
+
+function RunCard(props: { run: () => Run; onFollow: (run: Run, opener?: ViewRef) => void; /** Opening the run leaves the Chat: close the dialog first. */ onLeave?: () => void }) {
   const run = () => props.run();
-  const scope = () => runScope(run());
+  const destination = () => runDestination(run());
+  let followButton: ViewRef | undefined;
   return (
     <Surface variant="card" pad={3} gap={2} testID={`run:${run().id}`}>
       <Row align="center" gap={2}>
         <Badge tone={runTone(run().status)} label={runStatusLabel(run().status)} />
         <Column grow>
           <Label variant="caption" color="muted" lines={1}>
-            {`${scope().space} › #${scope().room}`}
+            {destination()}
           </Label>
         </Column>
       </Row>
@@ -280,7 +341,7 @@ function RunCard(props: { run: () => Run; /** Opening the run leaves the Chat: c
           compact
           testID={`run-open:${run().id}`}
           label="Open"
-          accessibilityLabel={`Open #${scope().room}`}
+          accessibilityLabel={`Open ${destination()}`}
           onPress={() => {
             props.onLeave?.();
             void openRun(run());
@@ -290,11 +351,9 @@ function RunCard(props: { run: () => Run; /** Opening the run leaves the Chat: c
           compact
           testID={`run-follow:${run().id}`}
           label="Follow up"
-          accessibilityLabel={`Follow up in #${scope().room}`}
-          onPress={() => {
-            dispatchOpen.set(true);
-            void followUp(run());
-          }}
+          accessibilityLabel={`Follow up in ${destination()}`}
+          viewRef={node => { followButton = node; }}
+          onPress={() => props.onFollow(run(), followButton)}
         />
         <Spacer />
         <If when={isActiveRun(run())}>
@@ -314,11 +373,16 @@ function RunCard(props: { run: () => Run; /** Opening the run leaves the Chat: c
   );
 }
 
-function Dispatch() {
+const dispatchSpace = () => spaces().find(s => s.id === dispatchTarget()?.spaceId);
+const dispatchRoom = () => roomsOf(dispatchTarget()?.spaceId ?? "").find(r => r.id === dispatchTarget()?.roomId);
+function dispatchRecipient() {
+  const space = dispatchSpace(), room = dispatchRoom();
+  return space && room ? `To: agent in ${space.name} › #${room.name}` : "Choose a Space and a room.";
+}
+
+function Dispatch(props: { moving: boolean; onEdit: () => void; onClose: () => void }) {
   const target = () => dispatchTarget();
-  const targetSpace = () => spaces().find((s) => s.id === target()?.spaceId) ?? null;
-  const targetRoom = () => roomsOf(target()?.spaceId ?? "").find((r) => r.id === target()?.roomId) ?? null;
-  const ready = () => !!targetSpace() && !!targetRoom() && dispatchDraft().trim().length > 0 && !dispatching();
+  const ready = () => !!dispatchSpace() && !!dispatchRoom() && dispatchDraft().trim().length > 0 && !dispatching() && !props.moving;
   return (
     <Surface variant="card" pad={3} gap={2} testID="dispatch">
       <Row align="center" gap={2}>
@@ -326,7 +390,7 @@ function Dispatch() {
           <Label variant="strong">Send a task to a Space's agent</Label>
         </Column>
         {/* Folding the form keeps the draft and the chosen Space and room. */}
-        <Action compact testID="dispatch-close" label="Close" variant="ghost" accessibilityLabel="Close the task form (your draft is kept)" onPress={() => dispatchOpen.set(false)} />
+        <Action compact testID="dispatch-close" label="Close" variant="ghost" accessibilityLabel="Close the task form (your draft is kept)" onPress={props.onClose} />
       </Row>
       <If
         when={spaces().length > 0}
@@ -342,10 +406,13 @@ function Dispatch() {
           </Label>
           <Row gap={1} wrap>
             <Each of={spaces()} key={(s) => s.id}>
-              {(s) => <Chip testID={`dispatch-space:${s().id}`} label={s().name} selected={target()?.spaceId === s().id} onPress={() => void setDispatchSpace(s().id)} />}
+              {(s) => <Chip testID={`dispatch-space:${s().id}`} label={s().name} selected={target()?.spaceId === s().id} onPress={() => {
+                props.onEdit();
+                void setDispatchSpace(s().id);
+              }} />}
             </Each>
           </Row>
-          <If when={targetSpace()}>
+          <If when={dispatchSpace()}>
             <Label variant="caption" color="muted">
               Room or thread
             </Label>
@@ -356,7 +423,10 @@ function Dispatch() {
                     testID={`dispatch-room:${row().room.id}`}
                     label={`${row().depth > 1 ? "↳ " : "#"}${row().room.name}`}
                     selected={target()?.roomId === row().room.id}
-                    onPress={() => setDispatchRoom(row().room.id)}
+                    onPress={() => {
+                      props.onEdit();
+                      setDispatchRoom(row().room.id);
+                    }}
                   />
                 )}
               </Each>
@@ -366,14 +436,18 @@ function Dispatch() {
             testID="dispatch-text"
             accessibilityLabel="Task for the agent"
             value={dispatchDraft()}
-            onChange={dispatchDraft.set}
+            onChange={text => {
+              props.onEdit();
+              setDispatchDraft(text);
+            }}
             placeholder="Describe the task or follow-up"
             multiline
             keepFocusOnSubmit
           />
-          <Label variant="caption" color={targetRoom() ? "default" : "muted"} testID="dispatch-recipient">
-            {targetSpace() && targetRoom() ? `To: agent in ${targetSpace()!.name} › #${targetRoom()!.name}` : "Choose a Space and a room."}
+          <Label variant="caption" color={dispatchRoom() ? "default" : "muted"} testID="dispatch-recipient">
+            {dispatchRecipient()}
           </Label>
+          <If when={props.moving}><Label variant="caption" color="muted" testID="dispatch-verifying">Checking the new destination…</Label></If>
           <Row align="center" gap={2}>
             <Spacer />
             <Action
