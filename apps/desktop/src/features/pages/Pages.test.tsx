@@ -50,6 +50,17 @@ async function pickFilesTemplate(app: App) {
   await app.press("id:page-template:files");
 }
 
+test("Page sheet content and footer share the same responsive gutter", async () => {
+  const app = await open("./test/pageLayout.fixture.tsx", { width: 1280, height: 800, platform: "linux" });
+  await app.waitFor("text:Content width: 720");
+  await app.waitFor("text:Footer width: 720");
+  await app.waitFor("text:Section gap: 16");
+  await app.setViewport(720, 480);
+  await app.waitFor("text:Content width: 688");
+  await app.waitFor("text:Footer width: 688");
+  expect(app.shows("text:Section gap: 16")).toBe(true);
+});
+
 test("Pages navigation, scoped list, pins and Space template creation", async () => {
   const f = pagesFixture();
   const app = await start(f);

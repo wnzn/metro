@@ -23,7 +23,7 @@ export function PagesView() {
 }
 
 function Route(props: { route: PagesRoute; allowed: boolean }) {
-  if (!props.allowed) return <PageLayout gap={3}>
+  if (!props.allowed) return <PageLayout inset={6} gap={6}>
     <PageHeader title="Pages" />
     <Label>This Space is no longer available.</Label>
     <Action testID="page-back" label="All pages" onPress={() => goPages()} />

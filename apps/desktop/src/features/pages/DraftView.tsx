@@ -212,15 +212,17 @@ export function DraftView(props: { route: DraftRoute }) {
     return [`${c.added.length} added`, `${c.changed.length} changed`, `${c.removed.length} removed`,
       c.data.length ? `${c.data.length} data sources changed` : "", c.page ? "Page layout or settings changed" : ""].filter(Boolean).join(" · ");
   };
-  return <Column grow pad={4} gap={3} testID="page-draft-view">
-    <Row gap={2} wrap>
-      <Action compact testID="page-draft-back" label={route.returnRoom ? "‹ Back to room" : route.returnPage ? "‹ Back to page" : "‹ Back to pages"}
-        variant="ghost" disabled={busy()} onPress={back} />
-      <If when={route.returnRoom || route.returnPage}><Action compact variant="ghost" label="All pages" onPress={() => goPages()} /></If>
-    </Row>
-    <PageHeader title={title()} subtitle="Review the draft before it changes a page.">
-      <Badge label={scopeName(route.spaceId)} tone="system" />
-    </PageHeader>
+  return <Column grow pad={6} gap={6} testID="page-draft-view">
+    <Column gap={2}>
+      <Row gap={2} wrap>
+        <Action compact testID="page-draft-back" label={route.returnRoom ? "‹ Back to room" : route.returnPage ? "‹ Back to page" : "‹ Back to pages"}
+          variant="ghost" disabled={busy()} onPress={back} />
+        <If when={route.returnRoom || route.returnPage}><Action compact variant="ghost" label="All pages" onPress={() => goPages()} /></If>
+      </Row>
+      <PageHeader title={title()} subtitle="Review the draft before it changes a page.">
+        <Badge label={scopeName(route.spaceId)} tone="system" />
+      </PageHeader>
+    </Column>
     <PagesError message={error()} />
     <If when={loading()}><Label color="muted">Loading draft…</Label></If>
     <If when={applyAccess() === "checking"}>

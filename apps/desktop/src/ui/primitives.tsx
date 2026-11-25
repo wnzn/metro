@@ -1211,16 +1211,22 @@ export function ScrollArea(props: StackProps) {
  * A page that scrolls with a footer that doesn't: the footer (an ActionBar of
  * Save / Cancel) stays at the bottom of the page while the content scrolls
  * above it. Content and footer share the content width unless `wide`.
+ * `inset` adds an outer gutter around the content column, and gives the
+ * footer that same horizontal gutter. `pad` is inside the content column.
  * The scrolling region takes `testID`; the footer `${testID}:footer`.
  */
-export function PageLayout(props: StackProps & { footer?: JSX.Element; wide?: boolean }) {
+export function PageLayout(props: StackProps & { footer?: JSX.Element; wide?: boolean; inset?: Space }) {
+  const content = <View class={cx(stackClass(props, "col", false), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>;
   return (
     <View class="flex-1 min-h-0 flex-col">
       <Scroll class="flex-1 min-h-0" testID={props.testID}>
-        <View class={cx(stackClass(props, "col", false), !props.wide && "w-full max-w-(--content-width) self-center")}>{props.children}</View>
+        <If when={props.inset !== undefined} else={content}>
+          <View class={cx("flex-col", padClass[props.inset ?? 0])}>{content}</View>
+        </If>
       </Scroll>
       <If when={props.footer}>
-        <View class="border-t border-border bg-background px-(--space-8) max-md:px-(--space-4) py-(--space-3)" testID={props.testID ? `${props.testID}:footer` : undefined}>
+        <View class={cx("border-t border-border bg-background py-(--space-3)", props.inset === undefined
+          ? "px-(--space-8) max-md:px-(--space-4)" : padXClass[props.inset])} testID={props.testID ? `${props.testID}:footer` : undefined}>
           <View class={cx("w-full", !props.wide && "max-w-(--content-width) self-center")}>{props.footer}</View>
         </View>
       </If>

@@ -4,7 +4,7 @@ import { isPageStatus, pageFailure } from "../../api/pages";
 import { goPages, hasSpace, pageGuard, pagesProblem, refreshPages, sameSpaceGrants, scopeVisible, spaceGrants } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
 import { apiClient, me, openChat, openExactRoom, openPlace, sessionGuard } from "../../store";
-import { Action, ActionBar, ActionsMenu, Badge, Banner, Column, Label, Modal, modalOpen, PageHeader, PageLayout, Row } from "../../ui";
+import { Action, ActionBar, ActionsMenu, Badge, Banner, Column, compactWidth, Label, Modal, modalOpen, PageHeader, PageLayout, Row } from "../../ui";
 import { httpsLink } from "../../ui/pageBlocks";
 import { prefillPageTask } from "../discovery/scheduleState";
 import { openAsset } from "../library/libraryState";
@@ -256,34 +256,39 @@ export function PageView(props: { route: ViewRoute }) {
       finally { if (valid()) busy.set(false); }
     };
   }
-  return <PageLayout wide gap={3} testID="page-view">
-    <Row gap={2} wrap>
-      <Action compact label={unavailableSpace() ? "‹ All pages" : "‹ Pages"} testID="page-back" variant="ghost" onPress={() => {
-        const sid = verifiedSpace() ?? undefined;
-        goPages({ kind: "home", spaceId: !unavailableSpace() && hasSpace(sid) ? sid : undefined });
-      }} />
-    </Row>
-    <PagesError message={error()} onRetry={unavailableSpace() ? undefined : () => void refresh(true)} />
-    <If when={notice()}>{message => <Banner tone="success" variant="inline" message={message()} />}</If>
-    <If when={loading() && !page()}><Label color="muted">Loading page…</Label></If>
-    <If when={valid() ? page() : null}>{head => <>
-      <PageHeader title={[head().icon, head().title].filter(Boolean).join(" ")} subtitle={`Version ${head().head_version} · Edited by ${profileName(head().version.author_id) ?? head().version.author_id}`}>
-        <ActionsMenu testID="page-menu" label="Page options" disabled={busy()} items={[
-          { id: "page-pin", label: head().pinned ? "Unpin" : "Pin", onPress: () => {
-            const current = head();
-            if (!client || !live() || busy()) return;
-            busy.set(true);
-            void client.pinPage(current.id, !current.pinned).then(prefs => {
-              if (valid() && page() === current) page.set({ ...current, ...prefs });
-              if (valid()) void refreshPages();
-            }, e => { if (valid()) error.set(pagesProblem(e)); }).finally(() => { if (valid()) busy.set(false); });
-          } },
-          ...(head().can_edit ? [{ id: "page-source", label: "Edit source", onPress: () => sheet.set("source") }] : []),
-          { id: "page-history", label: "History", onPress: () => sheet.set("history") },
-          ...(head().can_edit || head().can_manage ? [{ id: "page-settings", label: "Page settings", onPress: () => sheet.set("settings") }] : []),
-          ...(head().can_delete ? [{ id: "page-delete", label: "Delete…", destructive: true, onPress: () => sheet.set("delete") }] : []),
-        ]} />
-      </PageHeader>
+  const shownPage = () => valid() ? page() : null;
+  return <PageLayout wide inset={6} gap={6} testID="page-view">
+    <Column gap={2}>
+      <Row gap={2} wrap>
+        <Action compact label={unavailableSpace() ? "‹ All pages" : "‹ Pages"} testID="page-back" variant="ghost" onPress={() => {
+          const sid = verifiedSpace() ?? undefined;
+          goPages({ kind: "home", spaceId: !unavailableSpace() && hasSpace(sid) ? sid : undefined });
+        }} />
+      </Row>
+      <PagesError message={error()} onRetry={unavailableSpace() ? undefined : () => void refresh(true)} />
+      <If when={notice()}>{message => <Banner tone="success" variant="inline" message={message()} />}</If>
+      <If when={loading() && !page()}><Label color="muted">Loading page…</Label></If>
+      <If when={shownPage()}>{head =>
+        <PageHeader title={[head().icon, head().title].filter(Boolean).join(" ")} subtitle={`Version ${head().head_version} · Edited by ${profileName(head().version.author_id) ?? head().version.author_id}`}>
+          <ActionsMenu testID="page-menu" label="Page options" disabled={busy()} items={[
+            { id: "page-pin", label: head().pinned ? "Unpin" : "Pin", onPress: () => {
+              const current = head();
+              if (!client || !live() || busy()) return;
+              busy.set(true);
+              void client.pinPage(current.id, !current.pinned).then(prefs => {
+                if (valid() && page() === current) page.set({ ...current, ...prefs });
+                if (valid()) void refreshPages();
+              }, e => { if (valid()) error.set(pagesProblem(e)); }).finally(() => { if (valid()) busy.set(false); });
+            } },
+            ...(head().can_edit ? [{ id: "page-source", label: "Edit source", onPress: () => sheet.set("source") }] : []),
+            { id: "page-history", label: "History", onPress: () => sheet.set("history") },
+            ...(head().can_edit || head().can_manage ? [{ id: "page-settings", label: "Page settings", onPress: () => sheet.set("settings") }] : []),
+            ...(head().can_delete ? [{ id: "page-delete", label: "Delete…", destructive: true, onPress: () => sheet.set("delete") }] : []),
+          ]} />
+        </PageHeader>
+      }</If>
+    </Column>
+    <If when={shownPage()}>{head => <>
       <Row gap={2} align="center" wrap>
         <Badge tone="system" label={scopeName(head().space_id)} />
         <Label variant="meta">{refreshing() ? "Refreshing…" : data() ? `Updated ${cell(data()?.resolved_at, "relative").label.toLowerCase()}` : "Data not loaded"}</Label>
@@ -324,15 +329,17 @@ export function PageView(props: { route: ViewRoute }) {
       </Modal></If>
     </>}</If>
     <If when={confirm()}>{choice => <Modal open title="Approve page version" testID="page-action-confirm" onClose={() => confirm.set(null)}>
-      <PageLayout gap={3} pad={4} testID="page-action-review" footer={
+      <PageLayout gap={4} inset={compactWidth() ? 4 : 6} testID="page-action-review" footer={
         <ActionBar><Action label="Cancel" testID="page-action-cancel" variant="ghost" onPress={() => confirm.set(null)} />
           <Action label="Approve version and run" testID="page-action-run" variant="primary" busy={busy()} onPress={() => void run(choice().block_key, choice().action.kind, choice())} /></ActionBar>
       }>
         <PageHeader title={`Approve version ${choice().version} and ${choice().action.kind === "runAgent" ? "run the agent?" : "run the scheduled task?"}`} />
-        <Label>Runs as you, with your model settings.</Label>
-        <Label variant="meta">Last edited by {profileName(choice().edited_by) ?? choice().edited_by} · {cell(choice().edited_at, "datetime").label}</Label>
-        <Label variant="strong">{destination(choice())}</Label>
-        <Column selectable><Label>{choice().action.prompt}</Label></Column>
+        <Column gap={2}>
+          <Label>Runs as you, with your model settings.</Label>
+          <Label variant="meta">Last edited by {profileName(choice().edited_by) ?? choice().edited_by} · {cell(choice().edited_at, "datetime").label}</Label>
+          <Label variant="strong">{destination(choice())}</Label>
+          <Column selectable><Label>{choice().action.prompt}</Label></Column>
+        </Column>
         <Label>This approval covers every agent and schedule button on this page version. Only this action runs now. The other buttons still need a click, but won’t ask for page approval again. Permission and schedule checks still apply.</Label>
         <If when={covered()?.labels.length ? covered() : undefined}>{buttons =>
           <Column gap={1} testID="page-action-covered">

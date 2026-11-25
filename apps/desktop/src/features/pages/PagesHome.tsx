@@ -4,7 +4,7 @@ import { isPageStatus, pageFailure } from "../../api/pages";
 import { goPages, hasSpace, pageGuard, pages, pagesError, pagesLoading, pagesProblem, recentPageDrafts, refreshPages, scopeVisible, spaceGrants, watchPageScope } from "../../pagesState";
 import type { PagesRoute } from "../../pagesState";
 import { apiClient, sessionGuard, spaces } from "../../store";
-import { Action, Badge, Column, Label, Modal, PageHeader, PageLayout, Picker, Row, SettingsGroup, Surface } from "../../ui";
+import { Action, ActionBar, Badge, Column, compactWidth, Label, Modal, PageHeader, PageLayout, Picker, Row, SettingsGroup, Surface } from "../../ui";
 import { profileName } from "../profile/profileState";
 import { Diagnostics, DraftPrompt, PagesError, scopeName, showDraft, showPage } from "./controls";
 import { cell } from "./renderPlan";
@@ -16,12 +16,14 @@ export function PagesHome(props: { route: Home }) {
   const scopeId = () => props.route.spaceId;
   const inSpace = () => !!scopeId();
   const drafts = () => recentPageDrafts().filter(d => !scopeId() || d.spaceId === scopeId());
-  return <PageLayout wide testID="pages-home" gap={4}>
-    <If when={inSpace()}><Row><Action compact variant="ghost" label="‹ All pages" onPress={() => goPages()} /></Row></If>
-    <PageHeader title={inSpace() ? `${scopeName(scopeId())} pages` : "Pages"}
-      subtitle="Build dashboards and small apps with Page TSX. Review generated changes before applying them.">
-      <Action testID="new-page" label="New page" variant="primary" onPress={() => creating.set(true)} />
-    </PageHeader>
+  return <PageLayout testID="pages-home" inset={6} gap={6}>
+    <Column gap={2}>
+      <If when={inSpace()}><Row><Action compact variant="ghost" label="‹ All pages" onPress={() => goPages()} /></Row></If>
+      <PageHeader title={inSpace() ? `${scopeName(scopeId())} pages` : "Pages"}
+        subtitle="Build dashboards and small apps with Page TSX. Review generated changes before applying them.">
+        <Action testID="new-page" label="New page" variant="primary" onPress={() => creating.set(true)} />
+      </PageHeader>
+    </Column>
     <Row gap={2} wrap>
       <Action compact testID="pages-reload" label="Refresh list" onPress={() => void refreshPages()} />
       <Action compact testID="pages-deleted" label="Recently deleted" variant="ghost" onPress={() => deleted.set(true)} />
@@ -35,7 +37,7 @@ export function PagesHome(props: { route: Home }) {
     </Each>
     <If when={drafts().length}>
       <SettingsGroup title="Continue reviewing" description="Drafts opened in this session. Only you can review or apply them.">
-        <Each of={drafts()} key={d => d.id}>{draft => <Row gap={2} pad={2} align="center" justify="between">
+        <Each of={drafts()} key={d => d.id}>{draft => <Row gap={2} padX={4} padY={3} align="center" justify="between" wrap>
           <Label>{pages().find(p => p.id === draft().returnPage)?.title ?? (draft().returnRoom ? "Draft from a room" : "Page draft")} · {scopeName(draft().spaceId)}</Label>
           <Action compact label="Review draft" testID={`continue-page-draft:${draft().id}`} onPress={() => goPages({ ...draft() })} />
         </Row>}</Each>
@@ -49,10 +51,10 @@ export function PagesHome(props: { route: Home }) {
 function PageGroup(props: { title: string; entries: PageMeta[] }) {
   return <SettingsGroup title={props.title}>
     <If when={!props.entries.length && !pagesLoading() && !pagesError()}>
-      <Column pad={3}><Label color="muted">No pages yet. Create one from a template or a prompt.</Label></Column>
+      <Column padX={4} padY={3}><Label color="muted">No pages yet. Create one from a template or a prompt.</Label></Column>
     </If>
     <Each of={props.entries} key={p => p.id}>{p =>
-      <Surface variant="card" pad={3} gap={1}>
+      <Surface variant="card" padX={4} padY={3}>
         <Row gap={2} align="center" justify="between" wrap>
           <Column gap={1} grow>
             <Label variant="strong">{[p().icon, p().title].filter(Boolean).join(" ")}</Label>
@@ -112,14 +114,14 @@ function NewPageSheet(props: { route: Home; close: () => void }) {
   const sameTarget = (dest: PageTarget, result: Pick<PageMeta, "scope" | "space_id">) =>
     scopeVisible(result) && result.scope === dest.scope && result.space_id === (dest.space_id ?? null);
   return <Modal open title="New page" testID="new-page-sheet" onClose={() => { if (!busy()) props.close(); }}>
-    <PageLayout wide gap={3}>
+    <PageLayout inset={compactWidth() ? 4 : 6} gap={4}>
       <PageHeader title="New page" subtitle="Choose who can see the page and how to start." />
       <Picker testID="new-page-scope" accessibilityLabel="Page scope" disabled={!!busy()}
         items={[{ value: "personal", label: "Personal", detail: "Only you can see this page." },
           ...spaces().map(s => ({ value: `space:${s.id}`, label: s.name, detail: "Members of this Space can see this page.", group: "Spaces" }))]}
         value={scope() ? `space:${scope()}` : "personal"} onChange={value => scope.set(value?.startsWith("space:") ? value.slice(6) : null)} />
       <If when={!hasSpace(scope()) && mode() === "template"}><Label color="warning">You no longer have access to this Space. Choose a different scope.</Label></If>
-      <Row gap={2}>
+      <Row gap={2} wrap>
         <Action label="Describe a page" testID="new-page-prompt" disabled={!!busy()} variant={mode() === "prompt" ? "primary" : "secondary"} onPress={() => mode.set("prompt")} />
         <Action label="Use a template" testID="new-page-templates" disabled={!!busy()} variant={mode() === "template" ? "primary" : "secondary"} onPress={() => {
           mode.set("template"); if (!templates().length) void templatesLoad();
@@ -194,21 +196,26 @@ function DeletedPages(props: { route: Home; close: () => void }) {
   }
   untracked(() => void load());
   return <Modal open title="Recently deleted" testID="pages-recently-deleted" onClose={props.close}>
-    <PageLayout gap={3}>
+    <PageLayout inset={compactWidth() ? 4 : 6} gap={4} footer={
+      <ActionBar>
+        <Action label="Refresh list" testID="deleted-pages-refresh" disabled={loading() || !!busy()} onPress={() => void load()} />
+        <Action label="Done" onPress={props.close} />
+      </ActionBar>
+    }>
       <PageHeader title="Recently deleted" subtitle="You can restore pages you manage for 30 days after deletion." />
       <PagesError message={error()} onRetry={() => void load()} />
       <If when={loading()}><Label color="muted">Loading deleted pages…</Label></If>
       <If when={!loading() && !rows().length && !error()}><Label color="muted">No recently deleted pages.</Label></If>
-      <Each of={rows()} key={entry => entry.page.id}>
-        {entry => <Row align="center" gap={2} justify="between">
-          <Label>{entry().page.title} · {scopeName(entry().page.space_id)}</Label>
-          <Action compact label="Undelete" testID={`undelete-page:${entry().page.id}`} disabled={!!busy()} busy={busy()?.pageId === entry().page.id} onPress={() => void restore(entry())} />
-        </Row>}
-      </Each>
-      <Row justify="end" gap={2}>
-        <Action label="Refresh list" testID="deleted-pages-refresh" disabled={loading() || !!busy()} onPress={() => void load()} />
-        <Action label="Done" onPress={props.close} />
-      </Row>
+      <If when={rows().length}>
+        <Column gap={2}>
+          <Each of={rows()} key={entry => entry.page.id}>
+            {entry => <Row align="center" gap={2} justify="between" wrap>
+              <Label>{entry().page.title} · {scopeName(entry().page.space_id)}</Label>
+              <Action compact label="Undelete" testID={`undelete-page:${entry().page.id}`} disabled={!!busy()} busy={busy()?.pageId === entry().page.id} onPress={() => void restore(entry())} />
+            </Row>}
+          </Each>
+        </Column>
+      </If>
     </PageLayout>
   </Modal>;
 }

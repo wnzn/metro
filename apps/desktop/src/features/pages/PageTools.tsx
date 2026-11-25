@@ -4,7 +4,7 @@ import type { Page, PageDiagnostic, VersionMeta, Definition } from "../../api/pa
 import { isPageStatus, pageFailure, targetOf } from "../../api/pages";
 import { pagesProblem } from "../../pagesState";
 import { apiClient } from "../../store";
-import { Action, ActionBar, Badge, Banner, Column, Field, Label, Modal, PageHeader, PageLayout, Row, ScrollArea, SegmentedControl, Surface, Toggle } from "../../ui";
+import { Action, ActionBar, Badge, Banner, Column, compactWidth, Field, Label, Modal, PageHeader, Row, ScrollArea, SegmentedControl, Surface, Toggle } from "../../ui";
 import { PageCode, PageDiff } from "../../ui/pageBlocks";
 import { profileName } from "../profile/profileState";
 import { Diagnostics, PagesError } from "./controls";
@@ -119,7 +119,7 @@ export function SourceEditor(props: PageToolProps) {
     return [{ range: { start, end: { ...start, column: start.column + 1 } }, message: d.message, severity: "error" }];
   });
   return <Modal open testID="page-source-sheet" title="Edit page source" onClose={() => { if (!busy()) props.close(); }}>
-    <Column grow pad={4} gap={2}>
+    <Column grow pad={compactWidth() ? 4 : 6} gap={4}>
       <PageHeader title="Edit page source" subtitle={`Page TSX · based on version ${target().head_version} · checked by Metro, never run as code.`} />
       <If when={conflict() !== null}>
         <Banner tone="warning" variant="inline" title="The published page changed"
@@ -208,7 +208,7 @@ export function PageHistory(props: PageToolProps) {
   }
   untracked(() => void load());
   return <Modal open title="Page history" testID="page-history-sheet" onClose={() => { if (!busy()) props.close(); }}>
-    <Column grow pad={4} gap={2}>
+    <Column grow pad={compactWidth() ? 4 : 6} gap={4}>
       <PageHeader title="Page history" subtitle="Restoring makes a new version instead of changing history." />
       <PagesError message={error()} />
       <If when={loading()}><Label color="muted">Loading history…</Label></If>
