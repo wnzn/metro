@@ -16,6 +16,7 @@ pub mod db;
 pub mod device_relay;
 mod directory;
 mod dms;
+mod forward;
 pub mod jobs;
 pub mod library;
 pub mod library_search;
@@ -256,6 +257,7 @@ pub fn router(state: AppState) -> Router {
         )
         .route("/v1/chat/events", get(api::chat_events))
         .route("/v1/chat/messages", post(api::chat_message))
+        .route("/v1/forward", post(forward::post))
         .route(
             "/v1/chat/events/{eid}/reactions",
             put(api::put_chat_reaction).delete(api::delete_chat_reaction),
