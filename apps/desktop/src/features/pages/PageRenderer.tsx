@@ -52,6 +52,20 @@ function Block(props: { node: PlanBlock; interactions: Interactions }) {
   </If>;
 }
 
+/** A List's children grouped by the item they were rendered for (`<list>#<index>/…`). */
+export function listItems(node: PlanBlock) {
+  const items: { id: string; blocks: PlanBlock[] }[] = [];
+  for (const child of node.children) {
+    const rest = child.instance.startsWith(`${node.instance}#`) ? child.instance.slice(node.instance.length + 1) : child.instance;
+    const slash = rest.indexOf("/");
+    const id = slash < 0 ? rest : rest.slice(0, slash);
+    const last = items[items.length - 1];
+    if (last?.id === id) last.blocks.push(child);
+    else items.push({ id, blocks: [child] });
+  }
+  return items;
+}
+
 function blockLabel(node: PlanBlock) {
   const type = node.type.replace(/([a-z])([A-Z])/g, "$1 $2").toLowerCase();
   const title = str(node.p.title) || str(node.p.label) || (node.type === "Heading" ? node.text : "");
@@ -103,7 +117,14 @@ function BlockBody(props: { node: PlanBlock; interactions: Interactions }) {
       <PageTable label={label()} headings={n().headings ?? []} rows={n().rows ?? []} numericColumns={n().numericColumns} />
     </If>;
     case "List": return <If when={n().children.length} else={<Label color="muted">{empty()}</Label>}>
-      <Column gap={1}>{children()}</Column>
+      <Column testID="page-list">
+        <Each of={listItems(n())} key={item => item.id}>{(item, index) => <Column gap={1}>
+          <If when={index() > 0}><Divider /></If>
+          <Column padY={2} gap={1} testID="page-list-item">
+            <Each of={item().blocks} key={b => b.instance}>{child => <Block node={child()} interactions={props.interactions} />}</Each>
+          </Column>
+        </Column>}</Each>
+      </Column>
     </If>;
     case "Each": case "Show": return <Column gap={2}>{children()}</Column>;
     case "AgentAnswer": {
