@@ -504,6 +504,11 @@ mod tests {
                 assert_eq!(agents[0].name, "Metro");
                 assert!(agents[0].is_default);
                 assert_eq!(agents[0].tools, crate::space_agents::default_tools());
+                assert!(
+                    crate::pages::agent_tools::NAMES
+                        .iter()
+                        .all(|tool| !agents[0].allows(tool))
+                );
             }
             let conn = db.lock();
             assert!(load_in(&conn, &a, "alice").unwrap().classify_unaddressed);

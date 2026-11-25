@@ -139,6 +139,7 @@ struct RunModel {
     model: DynModel<Completion>,
     max_tokens: Option<u64>,
     params: Option<serde_json::Value>,
+    effective_device: Option<crate::providers::EffectiveDevice>,
 }
 
 impl RunModel {
@@ -194,6 +195,7 @@ async fn route_model(
                         model: selected.model,
                         max_tokens: selected.max_tokens,
                         params: selection.and_then(|s| s.params(&selected.provider_id)),
+                        effective_device: selected.effective_device,
                     })
                 }
                 Err(e) => Err(route.unavailable(&e)),
@@ -208,6 +210,7 @@ async fn route_model(
                     model: selected.model,
                     max_tokens: selected.max_tokens,
                     params: None,
+                    effective_device: selected.effective_device,
                 })
             }
             Ok(None) => match &state.config.model {
@@ -221,6 +224,7 @@ async fn route_model(
                         model: model(config).into(),
                         max_tokens: None,
                         params: None,
+                        effective_device: None,
                     })
                 }
                 None => Err(NO_MODEL.to_owned()),
@@ -391,6 +395,7 @@ async fn drive(
     prompt: Message,
     history: Vec<Message>,
     cancel: Option<watch::Receiver<bool>>,
+    redact_diagnostics: bool,
 ) -> Outcome {
     let limits = &state.config.limits;
     let run = agent
@@ -407,6 +412,14 @@ async fn drive(
         result = tokio::time::timeout(limits.agent_timeout, run) => match result {
             Ok(Ok(response)) => Outcome::Completed(response.output()),
             Ok(Err(e)) => {
+                // A provider can echo request bodies, credentials or its
+                // own account diagnostics. Keep only the classified code
+                // for Pages turns; don't log or publish the raw error.
+                if redact_diagnostics {
+                    let code = failure_code(&e);
+                    tracing::warn!(?code, "Pages model turn failed");
+                    return Outcome::Failed("The agent could not complete the model turn.".to_owned(), code);
+                }
                 tracing::warn!(error = %e, "agent run failed");
                 Outcome::Failed(
                     truncate(&format!("The agent failed: {e}"), 2_000),
@@ -424,6 +437,36 @@ async fn drive(
 
 // ---- Page builder ----
 
+/// The room run's actual route, including its private resolved binding.
+/// Never use this binding for activity, draft provenance or diagnostics.
+#[derive(Clone)]
+pub(crate) struct RoomBuilderModel {
+    pub(crate) route: Route,
+    effective_device: Option<crate::providers::EffectiveDevice>,
+}
+
+impl RoomBuilderModel {
+    pub(crate) fn pinned(
+        route: &Route,
+        effective_device: Option<crate::providers::EffectiveDevice>,
+    ) -> Self {
+        let mut route = route.clone();
+        // A default route may not have named a connection before the room
+        // selected its model. Use the actual public choice, not a new default.
+        route.connection_id = route.note.connection_id.clone();
+        Self {
+            route,
+            effective_device,
+        }
+    }
+
+    fn matches(&self, route: &Route, model: &RunModel) -> bool {
+        self.route.note.connection_id == route.note.connection_id
+            && self.route.note.model_id == route.note.model_id
+            && self.effective_device == model.effective_device
+    }
+}
+
 /// One tool-less model turn for the page builder ([`crate::pages`]), as
 /// `user_id` on `route`: the same model choice and checks as their agent
 /// turns, and a failure (including a connection that can't be used) is
@@ -431,7 +474,7 @@ async fn drive(
 /// of the same generation, `(from_user, text)`. Returns the reply and the
 /// route note of the model that answered.
 #[allow(clippy::too_many_arguments)]
-pub async fn page_builder_turn<F, Fut>(
+pub(crate) async fn page_builder_turn<F, Fut>(
     state: &AppState,
     user_id: &str,
     space: Option<&str>,
@@ -439,6 +482,7 @@ pub async fn page_builder_turn<F, Fut>(
     preamble: &str,
     history: Vec<(bool, String)>,
     prompt: String,
+    pin: Option<&RoomBuilderModel>,
     recheck: F,
 ) -> Result<(String, crate::model_routing::RouteNote), PageTurnError>
 where
@@ -460,6 +504,14 @@ where
     if !recheck().await {
         return Err(PageTurnError::Revoked);
     }
+    // The model is bound to the resolved device id. For presets its
+    // transport also reauthorizes that same target at dispatch, so a
+    // later change cannot redirect the request to a replacement device.
+    if pin.is_some_and(|expected| !expected.matches(&route, &model)) {
+        return Err(PageTurnError::Failed(
+            "The model connection used by the room run changed; start a new run.".to_owned(),
+        ));
+    }
     let agent = model.builder().preamble(preamble).build();
     let history = history
         .into_iter()
@@ -471,7 +523,16 @@ where
             }
         })
         .collect();
-    match drive(state, agent, Message::user(prompt), history, None).await {
+    match drive(
+        state,
+        agent,
+        Message::user(prompt),
+        history,
+        None,
+        pin.is_some(),
+    )
+    .await
+    {
         Outcome::Completed(text) => Ok((text, route.note)),
         Outcome::Failed(text, _) => Err(PageTurnError::Failed(text)),
         Outcome::Cancelled => Err(PageTurnError::Failed(
@@ -788,9 +849,23 @@ async fn execute_room_run(
                 .copied()
                 .filter(|t| agent.allows(t.runner_name()))
                 .collect();
-            let mut builder = model
-                .builder()
-                .preamble(PREAMBLE)
+            let page_tools = crate::pages::agent_tools::tools(
+                state,
+                space_id,
+                room,
+                initiator,
+                turn,
+                &RoomBuilderModel::pinned(route, model.effective_device.clone()),
+                agent,
+            );
+            let offers_pages = !page_tools.is_empty();
+            let mut builder = model.builder().preamble(PREAMBLE);
+            if offers_pages {
+                builder = builder
+                    .append_preamble(crate::pages::agent_tools::PREAMBLE)
+                    .dynamic_tools(page_tools);
+            }
+            builder = builder
                 .append_preamble(&agent_preamble(agent))
                 .append_preamble(match (paired, allowed.is_empty()) {
                     (false, _) => NO_RUNNER_PREAMBLE,
@@ -866,9 +941,11 @@ async fn execute_room_run(
                 reacted = flag;
             }
             let key = TurnKey::new();
-            builder = builder
-                .append_preamble(&turn_preamble(crate::db::now_ms(), &key))
-                .add_hook(ReasoningSummaries {
+            builder = builder.append_preamble(&turn_preamble(crate::db::now_ms(), &key));
+            // Don't publish provider reasoning on shared Pages runs. It
+            // is not a room-projected value and can carry provider details.
+            if !offers_pages {
+                builder = builder.add_hook(ReasoningSummaries {
                     state: state.clone(),
                     scope: Scope::Room {
                         space_id: space_id.to_owned(),
@@ -876,6 +953,7 @@ async fn execute_room_run(
                     },
                     turn: turn.clone(),
                 });
+            }
             let prompt = user_turn(trigger, &key);
             drive(
                 state,
@@ -883,6 +961,7 @@ async fn execute_room_run(
                 prompt,
                 history(&earlier, &key),
                 Some(cancel),
+                offers_pages,
             )
             .await
         }
@@ -1515,7 +1594,7 @@ async fn execute_personal_run(
     };
     // Web tools only for a person who turned them on for their own Chat,
     // always on their own computer.
-    let web = {
+    let web = lane == PersonalLane::Chat && {
         let user = user_id.clone();
         state
             .db
@@ -1590,6 +1669,7 @@ async fn execute_personal_run(
         prompt,
         history(&earlier, &key),
         None,
+        false,
     )
     .await
     {

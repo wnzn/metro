@@ -7,7 +7,7 @@
 //! only store and read.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::access::{Rights, member_role, rights_in};
 use super::limits::PageLimits;
@@ -384,6 +384,17 @@ pub enum Need {
     Manage,
 }
 
+impl Need {
+    fn allowed(self, rights: &Rights) -> bool {
+        match self {
+            Self::View => true,
+            Self::Edit => rights.can_edit,
+            Self::Delete => rights.can_delete,
+            Self::Manage => rights.can_manage,
+        }
+    }
+}
+
 /// The live page `id` and `user`'s rights on it, read on `conn` (inside
 /// the caller's transaction), or why not.
 pub fn load_in(
@@ -398,16 +409,51 @@ pub fn load_in(
     let Some(rights) = rights_in(conn, &page, user)? else {
         return Ok(Err(Denied::Gone));
     };
-    let allowed = match need {
-        Need::View => true,
-        Need::Edit => rights.can_edit,
-        Need::Delete => rights.can_delete,
-        Need::Manage => rights.can_manage,
-    };
-    if !allowed {
+    if !need.allowed(&rights) {
         return Ok(Err(Denied::Forbidden));
     }
     Ok(Ok((page, rights)))
+}
+
+/// Live pages of this Space only (metadata, never versions). The caller
+/// holds the same lock as its agent grant check.
+pub(crate) fn list_space_in(
+    conn: &Connection,
+    space: &str,
+    after: &str,
+    limit: usize,
+) -> anyhow::Result<Vec<PageRow>> {
+    let mut stmt = conn.prepare_cached(&format!(
+        "SELECT {PAGE_COLUMNS} FROM pages
+         WHERE scope = 'space' AND space_id = ?1 AND deleted_at IS NULL AND id > ?2
+         ORDER BY id LIMIT ?3",
+    ))?;
+    let rows = stmt.query_map(params![space, after, limit as i64], row_page)?;
+    Ok(rows.collect::<Result<_, _>>()?)
+}
+
+/// Scope is checked before edit rights, so pages outside the Space are
+/// indistinguishable from unknown ids even when the caller can edit them.
+pub(crate) fn load_space_in(
+    conn: &Connection,
+    space: &str,
+    id: &str,
+    user: &str,
+    need: Need,
+) -> rusqlite::Result<Result<(PageRow, Rights), Denied>> {
+    let result = load_in(conn, id, user, Need::View)?;
+    Ok(match result {
+        Ok((page, rights))
+            if page.scope == Scope::Space && page.space_id.as_deref() == Some(space) =>
+        {
+            if !need.allowed(&rights) {
+                Err(Denied::Forbidden)
+            } else {
+                Ok((page, rights))
+            }
+        }
+        _ => Err(Denied::Gone),
+    })
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -779,7 +825,11 @@ pub fn versions_for(
     Ok(Ok(out))
 }
 
-fn version_in(conn: &Connection, page: &str, n: i64) -> rusqlite::Result<Option<VersionRow>> {
+pub(crate) fn version_in(
+    conn: &Connection,
+    page: &str,
+    n: i64,
+) -> rusqlite::Result<Option<VersionRow>> {
     conn.query_row(
         &format!("SELECT {VERSION_COLUMNS} FROM page_versions WHERE page_id = ?1 AND version = ?2"),
         params![page, n],
@@ -1724,6 +1774,26 @@ pub fn chat_events(
 
 // ---- Drafts ----
 
+/// A room event's public draft card. The draft endpoint still returns
+/// 404 to anyone but its author, even if they know the id from this card.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DraftCard {
+    pub draft_id: String,
+    pub title: String,
+    pub summary: String,
+    pub kind: DraftKind,
+    pub page_id: Option<String>,
+    pub author_id: String,
+    pub expires_at: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftKind {
+    New,
+    Edit,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DraftRow {
     pub id: String,
@@ -1787,6 +1857,8 @@ pub enum DraftError {
     Busy,
     /// `block_key` isn't a block of the page's head.
     NoBlock,
+    /// A model supplied a replacement for a specific version, now stale.
+    Stale,
 }
 
 /// Create a draft in `generating`, reserving one of its author's
@@ -1799,21 +1871,48 @@ pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Result<DraftRow
 
 /// [`create_draft`], also returning the base version (for an edit), read
 /// in the same transaction as the reservation.
-#[allow(clippy::type_complexity)]
+pub(crate) type Reservation = (DraftRow, Option<VersionRow>);
+
 pub fn create_draft_with_base(
     db: &Db,
     d: &NewDraft<'_>,
-) -> anyhow::Result<Result<(DraftRow, Option<VersionRow>), DraftError>> {
+) -> anyhow::Result<Result<Reservation, DraftError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let result = reserve_draft_in(&tx, d, None)?;
+    if result.is_ok() {
+        tx.commit()?;
+    }
+    Ok(result)
+}
+
+/// Shared reservation for both HTTP and agent drafts. The latter also
+/// check the agent grant and insert the room card in this transaction.
+pub(crate) fn reserve_draft_in(
+    tx: &rusqlite::Transaction<'_>,
+    d: &NewDraft<'_>,
+    expected_head: Option<i64>,
+) -> anyhow::Result<Result<Reservation, DraftError>> {
     let base = match d.page_id {
         Some(pid) => {
-            let (page, _) = match load_in(&tx, pid, d.author_id, Need::Edit)? {
+            let loaded = match d.space_id {
+                Some(space) => load_space_in(tx, space, pid, d.author_id, Need::Edit)?,
+                None => match load_in(tx, pid, d.author_id, Need::View)? {
+                    Ok((page, rights)) if page.scope == Scope::Personal && rights.can_edit => {
+                        Ok((page, rights))
+                    }
+                    _ => Err(Denied::Gone),
+                },
+            };
+            let (page, _) = match loaded {
                 Ok(v) => v,
                 Err(e) => return Ok(Err(DraftError::Denied(e))),
             };
+            if expected_head.is_some_and(|head| head != page.head_version) {
+                return Ok(Err(DraftError::Stale));
+            }
             if let Some(k) = d.block_key {
-                let head = version_in(&tx, pid, page.head_version)?
+                let head = version_in(tx, pid, page.head_version)?
                     .and_then(|v| serde_json::from_str::<PageSpec>(&v.spec).ok());
                 if head.is_none_or(|s| s.block(k).is_none()) {
                     return Ok(Err(DraftError::NoBlock));
@@ -1823,7 +1922,7 @@ pub fn create_draft_with_base(
         }
         None => {
             if let Some(sid) = d.space_id
-                && member_role(&tx, sid, d.author_id)?.is_none()
+                && member_role(tx, sid, d.author_id)?.is_none()
             {
                 return Ok(Err(DraftError::Denied(Denied::Gone)));
             }
@@ -1866,7 +1965,7 @@ pub fn create_draft_with_base(
     tx.execute(
         "DELETE FROM page_drafts WHERE author_id = ?1
              AND status NOT IN ('generating', 'discarded') AND id NOT IN
-             (SELECT id FROM page_drafts WHERE author_id = ?1 ORDER BY created_at DESC, id
+             (SELECT id FROM page_drafts WHERE author_id = ?1 ORDER BY created_at DESC, rowid DESC
               LIMIT ?2)",
         params![d.author_id, MAX_DRAFTS_PER_PERSON as i64],
     )?;
@@ -1876,10 +1975,9 @@ pub fn create_draft_with_base(
         row_draft,
     )?;
     let base_row = match base {
-        Some(n) => version_in(&tx, d.page_id.unwrap_or_default(), n)?,
+        Some(n) => version_in(tx, d.page_id.unwrap_or_default(), n)?,
         None => None,
     };
-    tx.commit()?;
     Ok(Ok((row, base_row)))
 }
 
@@ -1904,7 +2002,15 @@ pub fn draft(db: &Db, id: &str) -> anyhow::Result<Option<DraftRow>> {
 /// edit the page is live and they may still edit it, and they're still a
 /// member of every Space in `spaces` (those the request names).
 pub fn draft_live(db: &Db, id: &str, user: &str, spaces: &[String]) -> anyhow::Result<bool> {
-    let conn = db.lock();
+    draft_live_in(&db.lock(), id, user, spaces)
+}
+
+pub(crate) fn draft_live_in(
+    conn: &Connection,
+    id: &str,
+    user: &str,
+    spaces: &[String],
+) -> anyhow::Result<bool> {
     let row: Option<(Option<String>, Option<String>)> = conn
         .query_row(
             "SELECT page_id, space_id FROM page_drafts
@@ -1917,18 +2023,18 @@ pub fn draft_live(db: &Db, id: &str, user: &str, spaces: &[String]) -> anyhow::R
         return Ok(false);
     };
     if let Some(sid) = &space
-        && member_role(&conn, sid, user)?.is_none()
+        && member_role(conn, sid, user)?.is_none()
     {
         return Ok(false);
     }
     if let Some(pid) = &page
-        && load_in(&conn, pid, user, Need::Edit)?.is_err()
+        && load_in(conn, pid, user, Need::Edit)?.is_err()
     {
         return Ok(false);
     }
     // Every Space the request names, still theirs.
     for sid in spaces {
-        if member_role(&conn, sid, user)?.is_none() {
+        if member_role(conn, sid, user)?.is_none() {
             return Ok(false);
         }
     }
@@ -2010,7 +2116,31 @@ pub fn finish_draft(
     model_ref: Option<&str>,
     attempts: i64,
 ) -> anyhow::Result<()> {
-    let conn = db.lock();
+    finish_draft_in(
+        &db.lock(),
+        id,
+        status,
+        source,
+        spec,
+        diagnostics,
+        error,
+        model_ref,
+        attempts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_draft_in(
+    conn: &Connection,
+    id: &str,
+    status: &str,
+    source: Option<&str>,
+    spec: Option<&str>,
+    diagnostics: Option<&str>,
+    error: Option<&str>,
+    model_ref: Option<&str>,
+    attempts: i64,
+) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE page_drafts SET status = ?2, source = ?3, spec = ?4, diagnostics = ?5, error = ?6, \
          model_ref = ?7, attempts = ?8 WHERE id = ?1 AND status = 'generating'",

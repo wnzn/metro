@@ -769,14 +769,16 @@ async fn every_provider_exhausted_is_listed_and_bad_answers_fail_visibly() {
     assert_eq!(s.answer(&web, &wj, bad).await, StatusCode::NO_CONTENT);
     let job = s.model_job(&model).await;
     assert!(last_tool_message(&job).contains("sent an answer Metro can't use"));
-    // A device that refuses (web search turned off there) says so.
+    // A device refusal says so without publishing its private diagnostic.
     s.reply_tool(&model, &job, "web_search", json!({"query": "q3"}))
         .await;
     let wj = s.job(&web, &json!({})).await;
     let off = json!({"ok": false, "error": "web search is turned off on this computer"});
     assert_eq!(s.answer(&web, &wj, off).await, StatusCode::NO_CONTENT);
     let job = s.model_job(&model).await;
-    assert!(last_tool_message(&job).contains("web search is turned off on this computer"));
+    let told = last_tool_message(&job);
+    assert!(told.contains("computer refused the web request"));
+    assert!(!told.contains("web search is turned off on this computer"));
     // Envelope without attempts is refused at the relay.
     s.reply_tool(&model, &job, "web_search", json!({"query": "q4"}))
         .await;
@@ -791,6 +793,11 @@ async fn every_provider_exhausted_is_listed_and_bad_answers_fail_visibly() {
     let events = s
         .wait_for(ALICE, &format!("{room}/events"), "agent", "done")
         .await;
+    assert!(
+        !serde_json::to_string(&events)
+            .unwrap()
+            .contains("web search is turned off on this computer")
+    );
     let failures: Vec<&Value> = events
         .iter()
         .filter(|e| e["kind"] == "error")
