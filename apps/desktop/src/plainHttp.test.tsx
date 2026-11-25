@@ -28,12 +28,16 @@ function at(origin: string, server: F) {
   return network;
 }
 
-async function launch(storage: Record<string, string> = {}, env?: Record<string, string>): Promise<App> {
+async function launch(
+  storage: Record<string, string> = {},
+  env?: Record<string, string>,
+  viewport = { width: 1200, height: 820 },
+): Promise<App> {
   const s = world();
   const network = { ...(s.network as any), ...at(LAN, s), ...at(TAILNET_IP, s), ...at(MAGIC_DNS, s) };
   // Without `env`, as the launcher starts the app with no proxy configured.
   const modules = env ? { process: { "default.env": env } } as any : launched();
-  return open("../App.tsx", { network, platform: "linux", width: 1200, height: 820, storage, modules });
+  return open("../App.tsx", { network, platform: "linux", ...viewport, storage, modules });
 }
 
 async function fill(app: App, url: string, user = "alice") {
@@ -103,6 +107,42 @@ test("another plain-HTTP host asks first; Cancel sends nothing, Connect anyway s
   await again.waitFor("id:account-menu");
   expect(again.shows("id:plain-http-consent")).toBe(false);
 });
+
+for (const [width, height] of [[720, 480], [1280, 800]]) {
+  test(`startup HTTP consent is safe and keyboard reachable at ${width}×${height}`, async () => {
+    const app = await launch({}, undefined, { width, height });
+    await fill(app, LAN);
+    // Start from a field at minimum height and from the button at wide size.
+    if (width === 720) await app.submit("id:server-url");
+    else await app.press("id:connect");
+    await app.waitFor("id:plain-http-consent:cancel");
+    expect(app.shows("id:plain-http-consent:accept")).toBe(true);
+
+    // The first deliberate activation is Cancel, not Connect anyway.
+    await app.keyboard.press("enter");
+    await app.waitFor("id:plain-http-consent", { state: "gone" });
+    expect(sentTo(app, LAN)).toBe(0);
+    expect(saved(app)).toEqual([]);
+
+    await app.keyboard.press("enter"); // Back at the original submit control.
+    await app.waitFor("id:plain-http-consent:cancel");
+    await app.keyboard.press("tab"); // Cancel → Connect anyway.
+    await app.keyboard.press("escape"); // Escape on either action is a safe back.
+    await app.waitFor("id:plain-http-consent", { state: "gone" });
+    expect(sentTo(app, LAN)).toBe(0);
+    expect(saved(app)).toEqual([]);
+    noTokensStored(app);
+
+    await app.keyboard.press("enter");
+    await app.waitFor("id:plain-http-consent:cancel");
+    await app.keyboard.press("tab");
+    expect(sentTo(app, LAN)).toBe(0);
+    await app.keyboard.press("enter"); // Only explicit activation of Connect anyway sends a request.
+    await app.waitFor("id:account-menu");
+    expect(sentTo(app, LAN)).toBeGreaterThan(0);
+    noTokensStored(app);
+  });
+}
 
 test("a saved server without the confirmation asks before its token goes out, also from the account menu", async () => {
   const id = "srv-lan";

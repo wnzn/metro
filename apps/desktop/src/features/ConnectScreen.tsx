@@ -1,4 +1,5 @@
-import { signal } from "nsh";
+import { cleanup, effect, keymap, Scroll, signal, View } from "nsh";
+import type { JSX, ViewRef } from "nsh";
 import { localAvailability, localError, localOpening, openLocalWorkspace } from "../localWorkspace";
 import { pendingPlainHttp } from "../plainHttp";
 import { addressLabel, cancelSwitch, confirmPlainHttp, defaultName, hasToken, saveCurrentServer, savedError, savedServers, switchTo } from "../savedWorkspaces";
@@ -17,6 +18,8 @@ import { Action, Banner, Column, Divider, Field, FormRow, Label, MetroMark, Row,
  */
 let launchScreen = true;
 
+type SubmitControl = "button" | "url" | "token";
+
 export function ConnectScreen() {
   const quiet = launchScreen;
   launchScreen = false;
@@ -34,8 +37,23 @@ export function ConnectScreen() {
   const keep = signal(false);
   const connecting = () => status().phase === "connecting";
   /** A plain-HTTP address waiting for the person's one-time confirmation. */
-  const consent = signal<string | null>(null);
+  const consent = signal<{ url: string; opener: SubmitControl } | null>(null);
+  let content: ViewRef | undefined;
+  const controls: Partial<Record<SubmitControl, ViewRef>> = {};
+  let restoreConnect = false;
   let intent = 0;
+  cleanup(() => { ++intent; });
+  const revealAndFocus = (node: ViewRef, current: () => boolean, keepBottomPadding = false) => {
+    // Wait for the expanded form (or the returning control) to lay out.
+    void node.measure().then((layout) => {
+      if (!layout || !current()) return;
+      // The warning is at the end; reveal it with the card's bottom padding
+      // so the buttons and their focus rings aren't on the viewport edge.
+      if (keepBottomPadding) content?.reveal({ vertical: "end", animated: false });
+      else node.reveal({ vertical: "nearest", animated: false });
+      node.focus();
+    });
+  };
   const manual = () => {
     ++intent;
     cancelSwitch();
@@ -43,8 +61,23 @@ export function ConnectScreen() {
     savedError.set(null);
     consent.set(null);
   };
-  const submit = () => {
-    if (connecting()) return;
+  const cancelConsent = () => {
+    const pending = consent();
+    if (!pending) return;
+    const mine = ++intent;
+    if (pending.opener === "button") restoreConnect = true;
+    consent.set(null);
+    if (pending.opener !== "button") {
+      const opener = controls[pending.opener];
+      if (opener) revealAndFocus(opener, () => mine === intent);
+    }
+  };
+  effect(() => {
+    if (!consent()) return;
+    return keymap.bind("escape", cancelConsent, { when: "always" });
+  });
+  const submit = (opener: SubmitControl) => {
+    if (connecting() || consent()) return;
     selected.set(target());
     manual();
     const value = token();
@@ -53,7 +86,7 @@ export function ConnectScreen() {
     if (unconfirmed) {
       // Asked before the token goes anywhere; nothing is sent until confirmed.
       connectError.set(null);
-      consent.set(unconfirmed);
+      consent.set({ url: unconfirmed, opener });
       return;
     }
     const saving = !!target() || save();
@@ -92,7 +125,7 @@ export function ConnectScreen() {
 
   return (
     <Surface variant="panel" grow testID="connect-screen">
-      <Column grow align="center" justify="center" pad={6}>
+      <ConnectViewport contentRef={(node) => { content = node; }}>
         <If when={!startupOpening()} else={<Column gap={3} align="center">
           <MetroMark size="lg" />
           <Label variant="strong">Opening workspace…</Label>
@@ -179,7 +212,8 @@ export function ConnectScreen() {
                   disabled={!!target() || connecting()}
                   onChange={(next) => { if (target()) return; manual(); token.set(""); serverUrlInput.set(next); }}
                   placeholder="http://127.0.0.1:8787"
-                  onSubmit={submit}
+                  inputRef={(node) => { controls.url = node; }}
+                  onSubmit={() => submit("url")}
                 />
               </FormRow>
 
@@ -198,7 +232,8 @@ export function ConnectScreen() {
                   placeholder="Paste your bearer token"
                   masked
                   autoFocus={!offerLocal() || formOpen()}
-                  onSubmit={submit}
+                  inputRef={(node) => { controls.token = node; }}
+                  onSubmit={() => submit("token")}
                 />
               </FormRow>
 
@@ -218,19 +253,24 @@ export function ConnectScreen() {
               </If>
 
               <If when={consent()}>
-                {(url) => (
-                  <PlainHttpConsent
-                    testID="plain-http-consent"
-                    baseUrl={url()}
-                    onCancel={() => consent.set(null)}
-                    onAccept={() => {
-                      const confirmed = url();
-                      consent.set(null);
-                      void confirmPlainHttp(confirmed);
-                      submit();
-                    }}
-                  />
-                )}
+                {(pending) => {
+                  const shown = pending();
+                  const mine = intent;
+                  return (
+                    <PlainHttpConsent
+                      testID="plain-http-consent"
+                      baseUrl={shown.url}
+                      cancelRef={(node) => revealAndFocus(node, () => mine === intent && consent() === shown, true)}
+                      onCancel={cancelConsent}
+                      onAccept={() => {
+                        if (consent() !== shown) return;
+                        consent.set(null);
+                        void confirmPlainHttp(shown.url);
+                        submit(shown.opener);
+                      }}
+                    />
+                  );
+                }}
               </If>
 
               <If when={!consent()}>
@@ -242,7 +282,13 @@ export function ConnectScreen() {
                     busyLabel="Connecting…"
                     busy={connecting()}
                     variant={offerLocal() ? "secondary" : "primary"}
-                    onPress={submit}
+                    viewRef={(node) => {
+                      if (!restoreConnect) return;
+                      restoreConnect = false;
+                      const mine = intent;
+                      revealAndFocus(node, () => mine === intent);
+                    }}
+                    onPress={() => submit("button")}
                   />
                 </Row>
               </If>
@@ -250,7 +296,19 @@ export function ConnectScreen() {
           </If>
         </Surface>
         </If>
-      </Column>
+      </ConnectViewport>
     </Surface>
+  );
+}
+
+function ConnectViewport(props: { contentRef: (node: ViewRef) => void; children?: JSX.Element }) {
+  const height = signal(0);
+  return (
+    <Scroll class="flex-1 min-h-0" testID="connect-scroll" onLayout={({ bounds }) => height.set(bounds.size.height)}>
+      {/* Center the card when it fits; give overflow a real scroll range, not a negative top edge. */}
+      <View ref={props.contentRef} class="flex-col justify-center" style={{ minHeight: height() }}>
+        <Column align="center" pad={6}>{props.children}</Column>
+      </View>
+    </Scroll>
   );
 }
