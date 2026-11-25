@@ -98,9 +98,10 @@ fn space_of(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Option<S
     }
 }
 
-fn room_ok(db: &Db, space: &str, room: Option<&str>) -> Result<(), Fail> {
+fn room_ok(db: &Db, viewer: &str, space: &str, room: Option<&str>) -> Result<(), Fail> {
+    // Membership is in the same statement as the room.
     if let Some(r) = room
-        && db.get_room(space, r)?.is_none()
+        && store::room_for(db, viewer, space, r)?.is_none()
     {
         return Err(Fail::Gone("The room this reads no longer exists."));
     }
@@ -155,7 +156,7 @@ fn messages(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json, Fa
     let mut events = match space_of(db, ctx, t, viewer)? {
         Some(sid) => {
             let room = t.room_id.as_deref().ok_or(Fail::NoAccess)?;
-            room_ok(db, &sid, Some(room))?;
+            room_ok(db, viewer, &sid, Some(room))?;
             store::room_events(
                 db,
                 viewer,
@@ -199,7 +200,7 @@ fn answer_json(db: &Db, e: &Event, room: Option<&str>) -> Json {
 fn agent_answer(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json, Fail> {
     let space = space_of(db, ctx, t, viewer)?;
     if let Some(sid) = &space {
-        room_ok(db, sid, t.room_id.as_deref())?;
+        room_ok(db, viewer, sid, t.room_id.as_deref())?;
     }
     if let Some(block) = &t.block {
         let Some(page) = &ctx.page_id else {
@@ -462,11 +463,12 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
         None => db.list_spaces(viewer)?.into_iter().map(|s| s.id).collect(),
     };
     if let (Some(sid), Some(room)) = (allowed.first(), t.room_id.as_deref()) {
-        room_ok(db, sid, Some(room))?;
+        room_ok(db, viewer, sid, Some(room))?;
     }
-    // Filter in registry order, newest first; limit only afterwards.
+    // Filter in registry order (`RunRegistry::list` is newest first); limit
+    // only afterwards.
     let mut matching = Vec::new();
-    for r in all.iter().rev() {
+    for r in all.iter() {
         if !allowed.contains(&r.space_id) {
             continue;
         }
@@ -511,8 +513,7 @@ fn runs(db: &Db, ctx: &Context, t: &Target, viewer: &str, all: &[RunInfo]) -> Re
     for (r, agent, started) in matching.into_iter().take(limit_of(t)) {
         let key = (r.space_id.clone(), r.room_id.clone());
         if !rooms.contains_key(&key) {
-            let name = db
-                .get_room(&r.space_id, &r.room_id)?
+            let name = store::room_for(db, viewer, &r.space_id, &r.room_id)?
                 .map(|room| room.name)
                 .unwrap_or_default();
             rooms.insert(key.clone(), name);
@@ -578,8 +579,16 @@ fn capability(
     let result: Result<Json, Fail> = (|| match a.kind.as_str() {
         // The same destination policy the click claim applies.
         action::RUN_AGENT | action::RUN_SCHEDULE => {
+            // The viewer's grant and the destination under one lock.
             let dest = {
                 let conn = db.lock();
+                if let Some(page) = &ctx.page_id
+                    && store::load_in(&conn, page, viewer, store::Need::View)
+                        .map_err(anyhow::Error::from)?
+                        .is_err()
+                {
+                    return Err(Fail::NoAccess);
+                }
                 store::destination_in(&conn, ctx.space_id.as_deref(), a, viewer)
                     .map_err(anyhow::Error::from)?
             };
@@ -594,7 +603,7 @@ fn capability(
         action::OPEN_ROOM => match space_of(db, ctx, &a.target, viewer)? {
             Some(sid) => {
                 let room = a.target.room_id.clone().unwrap_or_default();
-                Ok(if db.get_room(&sid, &room)?.is_some() {
+                Ok(if store::room_for(db, viewer, &sid, &room)?.is_some() {
                     json!({"enabled": true, "space_id": sid, "room_id": room})
                 } else {
                     no("This room no longer exists.")

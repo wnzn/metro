@@ -1876,3 +1876,98 @@ async fn any_title_round_trips_through_a_rename() {
         assert_eq!(check["spec"]["title"], title);
     }
 }
+
+// ---- Round 4 ----
+
+#[tokio::test]
+async fn repair_diagnostics_never_carry_names_beyond_the_catalogue() {
+    let (arrived, release) = (
+        Arc::new(tokio::sync::Notify::new()),
+        Arc::new(tokio::sync::Notify::new()),
+    );
+    let sid_for_model = Arc::new(Mutex::new(String::new()));
+    let sid_seen = sid_for_model.clone();
+    let m = gated_model(arrived.clone(), release.clone(), move |_, n| {
+        if n == 0 {
+            let sid = sid_seen.lock().unwrap().clone();
+            format!(
+                "```tsx\nexport default <Page title=\"x\"><Data name=\"m\" source=\"messages\" space=\"{sid}\" room=\"nope\"/><MessageFeed key=\"f\" from={{m}}/></Page>\n```"
+            )
+        } else {
+            INVALID.to_owned()
+        }
+    })
+    .await;
+    let s = Server::start(Some(m.config.clone())).await;
+    let sid = s.space(BOB, "Bob's Space", &["alice"]).await;
+    *sid_for_model.lock().unwrap() = sid.clone();
+    let (_, d) = s
+        .post(
+            ALICE,
+            "/v1/pages/drafts",
+            json!({"scope": "personal", "prompt": "x"}),
+        )
+        .await;
+    arrived.notified().await;
+    // A room appears after the catalogue was taken.
+    let (st, _) = s
+        .post(
+            BOB,
+            &format!("/v1/spaces/{sid}/rooms"),
+            json!({"name": "zz-late-secret"}),
+        )
+        .await;
+    assert_eq!(st, StatusCode::CREATED);
+    release.notify_one();
+    s.draft_done(ALICE, d["id"].as_str().unwrap()).await;
+    let reqs = m.requests.lock().unwrap().clone();
+    assert!(reqs.len() >= 2);
+    let retry = last_user_text(&reqs[1]);
+    assert!(retry.contains("unknown room"), "{retry}");
+    for r in &reqs {
+        assert!(
+            !r.to_string().contains("zz-late-secret"),
+            "a name outside the catalogue was sent"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_runs_source_lists_the_newest_run_first() {
+    let m = model(|req, _| {
+        if is_builder(req) {
+            "no".to_owned()
+        } else {
+            HANG.to_owned()
+        }
+    })
+    .await;
+    let s = Server::start(Some(m.config.clone())).await;
+    let sid = s.space(ALICE, "Team", &[]).await;
+    let src = r#"export default <Page title="R"><Data name="runs" source="runs" limit={1}/><RunList key="l" from={runs}/></Page>"#;
+    let p = s.create_page(ALICE, space_scope(&sid), src).await;
+    let pid = p["id"].as_str().unwrap().to_owned();
+    for text in ["@agent first run", "@agent second run"] {
+        let (st, v) = s
+            .post(
+                ALICE,
+                &format!("/v1/spaces/{sid}/rooms/lobby/messages"),
+                json!({"text": text}),
+            )
+            .await;
+        assert_eq!(st, StatusCode::ACCEPTED, "{v}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let d = s
+        .data_until(ALICE, &pid, |d| d["data"]["runs"]["value"]["active"] == 2)
+        .await;
+    let items = d["data"]["runs"]["value"]["items"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(items.len(), 1, "{d}");
+    assert!(
+        items[0]["task"].as_str().unwrap().contains("second run"),
+        "{d}"
+    );
+}

@@ -1009,20 +1009,58 @@ async fn create_draft(
         body.reasoning_effort,
     )
     .await?;
-    // Reserve the generation slot, with the page, edit rights and
-    // membership checked in the same transaction. Any model-backed routing
-    // (use-case routing may ask System One) happens only after this, in the
-    // job, under the reservation.
+    // One independent task owns the reservation (with the base version read
+    // in the same transaction) and the start of the job; this handler only
+    // awaits it, so a client hanging up can't leave a reserved slot without
+    // its job.
+    let request = DraftRequest {
+        user: who.id.clone(),
+        page_id,
+        space,
+        block_key: body.block_key,
+        prompt,
+        chosen,
+    };
+    start_draft(&state, request).await
+}
+
+/// Reserve and start a draft in its own task and await its result: the
+/// caller going away can't separate the reservation from its job.
+pub(crate) async fn start_draft(state: &AppState, request: DraftRequest) -> ApiResult<Response> {
+    let st = state.clone();
+    match tokio::spawn(async move { reserve_and_start(&st, request).await }).await {
+        Ok(response) => response,
+        Err(e) => Err(ApiError::internal(anyhow::anyhow!(
+            "starting a page draft: {e}"
+        ))),
+    }
+}
+
+/// A checked request for a new draft.
+pub(crate) struct DraftRequest {
+    pub user: String,
+    pub page_id: Option<String>,
+    pub space: Option<String>,
+    pub block_key: Option<String>,
+    pub prompt: String,
+    pub chosen: Option<crate::model_routing::Route>,
+}
+
+/// Reserve the generation slot (page, edit rights, membership and the base
+/// version read in one transaction), then start the job. Any model-backed
+/// routing (use-case routing may ask System One) happens only after this,
+/// in the job, under the reservation.
+async fn reserve_and_start(state: &AppState, r: DraftRequest) -> ApiResult<Response> {
     let (uid, pid, sid, bk, pr) = (
-        who.id.clone(),
-        page_id.clone(),
-        space.clone(),
-        body.block_key.clone(),
-        prompt.clone(),
+        r.user.clone(),
+        r.page_id.clone(),
+        r.space.clone(),
+        r.block_key.clone(),
+        r.prompt.clone(),
     );
     let window = generate::busy_window_ms(&state.config.limits);
-    let draft = match db(&state, move |db| {
-        store::create_draft(
+    let (draft, base) = match db(state, move |db| {
+        store::create_draft_with_base(
             db,
             &store::NewDraft {
                 page_id: pid.as_deref(),
@@ -1055,15 +1093,20 @@ async fn create_draft(
             return Err(forbidden("you can't edit this page"));
         }
     };
-    let base = draft_base(&state, &draft).await?;
+    let base_spaces = base
+        .as_ref()
+        .and_then(|b| serde_json::from_str::<PageSpec>(&b.spec).ok())
+        .map(|spec| generate::spec_spaces(&spec))
+        .unwrap_or_default();
     let job = generate::Job {
         draft_id: draft.id.clone(),
-        user: who.id.clone(),
-        space,
-        prompt,
+        user: r.user,
+        space: r.space,
+        prompt: r.prompt,
         base_source: base.as_ref().map(|b| b.source.clone()),
-        block_key: body.block_key,
-        chosen,
+        block_key: r.block_key,
+        chosen: r.chosen,
+        base_spaces,
     };
     tokio::spawn(generate::run(state.clone(), job));
     Ok((

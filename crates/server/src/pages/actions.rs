@@ -46,7 +46,28 @@ pub struct Click {
 }
 
 /// Run the button `click.block_key` of page `page_id` for `who`.
+///
+/// One independent task owns the whole click: the claim, the dispatch and
+/// the recording of how it went. The caller only awaits its result, so a
+/// client that hangs up at any point (before the claim commits, or after
+/// the work was submitted) can't leave a claim without its dispatch or a
+/// run without its record.
 pub async fn run(
+    state: &AppState,
+    who: &Human,
+    page_id: &str,
+    click: Click,
+) -> ApiResult<Response> {
+    let (st, person, pid) = (state.clone(), who.clone(), page_id.to_owned());
+    match tokio::spawn(async move { claim_and_dispatch(&st, &person, &pid, click).await }).await {
+        Ok(response) => response,
+        Err(e) => Err(ApiError::internal(anyhow::anyhow!(
+            "running a page action: {e}"
+        ))),
+    }
+}
+
+async fn claim_and_dispatch(
     state: &AppState,
     who: &Human,
     page_id: &str,
@@ -79,16 +100,7 @@ pub async fn run(
         Ok(c) => c,
         Err(e) => return refused(e, max),
     };
-    // From here the work is accepted: it's owned by its own task, so a
-    // client that hangs up (and drops this handler) can't strand it, and
-    // every failure is recorded on the run's origin.
-    let (st, person, pid) = (state.clone(), who.clone(), page_id.to_owned());
-    match tokio::spawn(async move { dispatch(&st, &person, &pid, claimed, turn).await }).await {
-        Ok(response) => response,
-        Err(e) => Err(ApiError::internal(anyhow::anyhow!(
-            "dispatching a page action: {e}"
-        ))),
-    }
+    dispatch(state, who, page_id, claimed, turn).await
 }
 
 /// Record why a claimed run didn't start.

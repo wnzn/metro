@@ -133,6 +133,9 @@ pub fn init(conn: &Connection) -> anyhow::Result<()> {
     use anyhow::Context;
     conn.execute_batch(TABLES).context("creating page tables")?;
     upgrade(conn).context("upgrading page tables")?;
+    // A rebuilt table lost its indexes: create anything missing again.
+    conn.execute_batch(TABLES)
+        .context("recreating page indexes")?;
     recover_drafts(conn).context("recovering page drafts")?;
     recover_runs(conn).context("recovering page runs")?;
     Ok(())
@@ -1679,6 +1682,28 @@ pub fn room_events(
     Ok(rows.collect::<Result<_, _>>()?)
 }
 
+/// Room `room` of `space` if `viewer` is a member of the Space now: the
+/// membership check is in the same statement as the row.
+pub fn room_for(db: &Db, viewer: &str, space: &str, room: &str) -> anyhow::Result<Option<Room>> {
+    let conn = db.lock();
+    Ok(conn
+        .query_row(
+            "SELECT r.id, r.name, r.parent_room_id FROM space_rooms r
+             WHERE r.space_id = ?1 AND r.id = ?2
+               AND EXISTS (SELECT 1 FROM space_members m
+                           WHERE m.space_id = r.space_id AND m.user_id = ?3)",
+            params![space, room, viewer],
+            |r| {
+                Ok(Room {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    parent_room_id: r.get(2)?,
+                })
+            },
+        )
+        .optional()?)
+}
+
 /// Newest personal Chat events of `kinds`, newest first.
 pub fn chat_events(
     db: &Db,
@@ -1769,6 +1794,16 @@ pub enum DraftError {
 /// page and edit rights now (its base is the head now); a new Space page's
 /// draft needs membership now.
 pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Result<DraftRow, DraftError>> {
+    Ok(create_draft_with_base(db, d)?.map(|(row, _)| row))
+}
+
+/// [`create_draft`], also returning the base version (for an edit), read
+/// in the same transaction as the reservation.
+#[allow(clippy::type_complexity)]
+pub fn create_draft_with_base(
+    db: &Db,
+    d: &NewDraft<'_>,
+) -> anyhow::Result<Result<(DraftRow, Option<VersionRow>), DraftError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let base = match d.page_id {
@@ -1840,8 +1875,12 @@ pub fn create_draft(db: &Db, d: &NewDraft<'_>) -> anyhow::Result<Result<DraftRow
         [&id],
         row_draft,
     )?;
+    let base_row = match base {
+        Some(n) => version_in(&tx, d.page_id.unwrap_or_default(), n)?,
+        None => None,
+    };
     tx.commit()?;
-    Ok(Ok(row))
+    Ok(Ok((row, base_row)))
 }
 
 /// A draft, unless it was discarded or has expired.

@@ -2318,6 +2318,7 @@ mod store_tests {
                          source TEXT, spec TEXT, diagnostics TEXT, error TEXT, model_ref TEXT,
                          attempts INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL,
                          expires_at INTEGER NOT NULL);
+                     CREATE INDEX page_drafts_author ON page_drafts (author_id, created_at);
                      INSERT INTO page_drafts (id, scope, author_id, prompt, status, created_at, expires_at)
                          VALUES ('pgd_old', 'personal', 'alice', 'p', 'ready', 0, 9999999999999);
                      CREATE TABLE page_runs (
@@ -2332,9 +2333,21 @@ mod store_tests {
                 .unwrap();
             p.id
         };
-        // Opened by this build: upgraded in place, rows kept, twice over.
+        // Opened by this build: upgraded in place, rows kept, twice over;
+        // the rebuilt table's index is there right after the first open.
         for _ in 0..2 {
             let db = Db::open(&path).unwrap();
+            let indexed: bool = db
+                .lock()
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM sqlite_master
+                     WHERE type = 'index' AND name = 'page_drafts_author'
+                       AND tbl_name = 'page_drafts')",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(indexed, "page_drafts_author is missing after the upgrade");
             assert_eq!(
                 store::version_list_for(&db, &page_id, "alice")
                     .unwrap()
@@ -2458,5 +2471,221 @@ mod store_tests {
             1
         );
         assert!(store::get(&db, &p.id).unwrap().is_none());
+    }
+}
+
+/// A caller that goes away at any point never strands claimed work.
+mod cancellation {
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::super::limits::PageLimits;
+    use super::super::{actions, api, store};
+    use crate::auth::{AuthFailure, AuthFuture, Human, HumanAuth};
+    use crate::db::Db;
+    use crate::{AppState, Config, Limits};
+
+    struct NoAuth;
+
+    impl HumanAuth for NoAuth {
+        fn identity<'a>(&'a self, _bearer: &'a str) -> AuthFuture<'a> {
+            Box::pin(async { Err(AuthFailure::Rejected("tests".to_owned())) })
+        }
+        fn namespace(&self) -> &str {
+            "dev"
+        }
+    }
+
+    async fn state() -> AppState {
+        let config = Config {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            db_path: ":memory:".into(),
+            // No model at all: work that starts fails quickly and visibly.
+            model: None,
+            limits: Limits::default(),
+            org_admins: Vec::new(),
+        };
+        AppState::new(config, Db::open_in_memory().unwrap(), Arc::new(NoAuth))
+            .await
+            .unwrap()
+    }
+
+    fn hold_lock(db: &Db) -> std::sync::mpsc::Sender<()> {
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let (locked, is_locked) = std::sync::mpsc::channel::<()>();
+        let db = db.clone();
+        std::thread::spawn(move || {
+            let _guard = db.lock();
+            locked.send(()).unwrap();
+            let _ = wait.recv();
+        });
+        is_locked.recv().unwrap();
+        release
+    }
+
+    fn alice() -> Human {
+        Human {
+            id: "alice".into(),
+            name: "Alice".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_click_cancelled_while_its_claim_is_pending_still_runs_and_records() {
+        let st = state().await;
+        let space = st.db.create_space("alice", "Team", 10).unwrap();
+        let src = r#"export default <Page title="P"><Button key="ask" label="Ask" action="runAgent" agent="agent" room="lobby" prompt="Go"/></Page>"#;
+        let mut r = super::super::access::DbResolver {
+            db: &st.db,
+            user: "alice",
+            space: Some(space.id.clone()),
+        };
+        let c = super::super::compile::compile(src, &mut r);
+        let spec = c.spec.unwrap();
+        let v = store::NewVersion {
+            author_id: "alice".into(),
+            kind: "manual",
+            prompt: None,
+            model_ref: None,
+            restored_from: None,
+            source: c.source,
+            spec: serde_json::to_string(&spec).unwrap(),
+            title: spec.title,
+        };
+        let p = store::create(&st.db, Some(&space.id), &v, &PageLimits::default())
+            .unwrap()
+            .unwrap();
+        let release = hold_lock(&st.db);
+        let (s2, pid) = (st.clone(), p.id.clone());
+        let caller = tokio::spawn(async move {
+            let click = actions::Click {
+                version: 1,
+                block_key: "ask".into(),
+                confirm: false,
+                schedule_revision: None,
+            };
+            let _ = actions::run(&s2, &alice(), &pid, click).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        caller.abort();
+        let _ = caller.await;
+        drop(release);
+        for _ in 0..300 {
+            let row: Option<(String, Option<String>)> = {
+                let conn = st.db.lock();
+                rusqlite::OptionalExtension::optional(conn.query_row(
+                    "SELECT run_id, error FROM page_runs",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                ))
+                .unwrap()
+            };
+            if let Some((run_id, error)) = row
+                && (!run_id.is_empty() || error.is_some())
+            {
+                // No model: the run couldn't start, and that's recorded.
+                assert!(error.is_some(), "{run_id:?}");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the claimed click was never dispatched or recorded");
+    }
+
+    #[tokio::test]
+    async fn data_checks_the_viewers_grant_with_the_destination() {
+        let st = state().await;
+        let space = st.db.create_space("alice", "Team", 10).unwrap();
+        st.db.add_member(&space.id, "bob", 10).unwrap();
+        let src = r#"export default <Page title="P"><Button key="ask" label="Ask" action="runAgent" agent="agent" room="lobby" prompt="Go"/></Page>"#;
+        let mut r = super::super::access::DbResolver {
+            db: &st.db,
+            user: "alice",
+            space: Some(space.id.clone()),
+        };
+        let c = super::super::compile::compile(src, &mut r);
+        let spec = c.spec.unwrap();
+        let ctx = |pid: &str| super::super::data::Context {
+            page_id: Some(pid.to_owned()),
+            space_id: Some(space.id.clone()),
+            version: Some(1),
+            draft: false,
+        };
+        let v = store::NewVersion {
+            author_id: "alice".into(),
+            kind: "manual",
+            prompt: None,
+            model_ref: None,
+            restored_from: None,
+            source: c.source.clone(),
+            spec: serde_json::to_string(&spec).unwrap(),
+            title: spec.title.clone(),
+        };
+        let p = store::create(&st.db, Some(&space.id), &v, &PageLimits::default())
+            .unwrap()
+            .unwrap();
+        let out = super::super::data::resolve(&st, ctx(&p.id), spec.clone(), "bob".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(out["actions"]["ask"]["enabled"], true);
+        // Bob is removed between the page check and the data read.
+        st.db.remove_member(&space.id, "bob").unwrap();
+        let out = super::super::data::resolve(&st, ctx(&p.id), spec, "bob".into(), None)
+            .await
+            .unwrap();
+        assert_eq!(out["actions"]["ask"]["enabled"], false, "{out}");
+        // And no room metadata without membership.
+        assert!(
+            store::room_for(&st.db, "bob", &space.id, "lobby")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store::room_for(&st.db, "alice", &space.id, "lobby")
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_draft_cancelled_while_its_reservation_is_pending_still_starts() {
+        let st = state().await;
+        let release = hold_lock(&st.db);
+        let s2 = st.clone();
+        let caller = tokio::spawn(async move {
+            let request = api::DraftRequest {
+                user: "alice".into(),
+                page_id: None,
+                space: None,
+                block_key: None,
+                prompt: "x".into(),
+                chosen: None,
+            };
+            let _ = api::start_draft(&s2, request).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        caller.abort();
+        let _ = caller.await;
+        drop(release);
+        for _ in 0..300 {
+            let status: Option<String> = {
+                let conn = st.db.lock();
+                rusqlite::OptionalExtension::optional(conn.query_row(
+                    "SELECT status FROM page_drafts",
+                    [],
+                    |r| r.get(0),
+                ))
+                .unwrap()
+            };
+            if let Some(s) = status
+                && s != "generating"
+            {
+                // No model: the job ran and failed visibly, freeing the slot.
+                assert_eq!(s, "failed");
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("the reserved draft's job never ran");
     }
 }

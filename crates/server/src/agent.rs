@@ -424,7 +424,8 @@ async fn drive(
 /// returned, never answered by another model. `history` is earlier turns
 /// of the same generation, `(from_user, text)`. Returns the reply and the
 /// route note of the model that answered.
-pub async fn page_builder_turn(
+#[allow(clippy::too_many_arguments)]
+pub async fn page_builder_turn<F, Fut>(
     state: &AppState,
     user_id: &str,
     space: Option<&str>,
@@ -432,12 +433,27 @@ pub async fn page_builder_turn(
     preamble: &str,
     history: Vec<(bool, String)>,
     prompt: String,
-) -> Result<(String, crate::model_routing::RouteNote), String> {
-    let model = route_model(state, user_id, space, &mut route).await?;
+    recheck: F,
+) -> Result<(String, crate::model_routing::RouteNote), PageTurnError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let model = route_model(state, user_id, space, &mut route)
+        .await
+        .map_err(PageTurnError::Failed)?;
     // Its own small pool: page building never takes agent-run slots.
     let Ok(_permit) = state.page_builds.clone().try_acquire_owned() else {
-        return Err("Metro is building other pages right now; try again shortly.".to_owned());
+        return Err(PageTurnError::Failed(
+            "Metro is building other pages right now; try again shortly.".to_owned(),
+        ));
     };
+    // Resolving the model can take a while (a device, a connection check):
+    // access is checked again after it, immediately before the provider is
+    // called.
+    if !recheck().await {
+        return Err(PageTurnError::Revoked);
+    }
     let agent = model.builder().preamble(preamble).build();
     let history = history
         .into_iter()
@@ -451,9 +467,20 @@ pub async fn page_builder_turn(
         .collect();
     match drive(state, agent, Message::user(prompt), history, None).await {
         Outcome::Completed(text) => Ok((text, route.note)),
-        Outcome::Failed(text, _) => Err(text),
-        Outcome::Cancelled => Err("The page builder was stopped.".to_owned()),
+        Outcome::Failed(text, _) => Err(PageTurnError::Failed(text)),
+        Outcome::Cancelled => Err(PageTurnError::Failed(
+            "The page builder was stopped.".to_owned(),
+        )),
     }
+}
+
+/// Why a page builder turn produced no reply.
+#[derive(Debug)]
+pub enum PageTurnError {
+    /// The model couldn't be used or failed (the text says why).
+    Failed(String),
+    /// The recheck right before the provider call failed: nothing was sent.
+    Revoked,
 }
 
 // ---- Reasoning summaries ----

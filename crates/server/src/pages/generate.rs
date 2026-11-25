@@ -422,6 +422,8 @@ pub struct Job {
     pub block_key: Option<String>,
     /// The model the person chose for this request, already checked.
     pub chosen: Option<Route>,
+    /// Spaces the base page names (their names are in the request too).
+    pub base_spaces: Vec<String>,
 }
 
 fn model_ref(note: &crate::model_routing::RouteNote) -> Option<String> {
@@ -587,24 +589,103 @@ fn cap(s: &str, max: usize) -> String {
     s[..end].to_owned()
 }
 
+/// Resolves names in a page the model wrote, for diagnostics that go back
+/// to the model: only Spaces the request already names (`allowed`) resolve,
+/// and errors never list room or agent names, so a repair prompt carries
+/// nothing beyond the original catalogue and base page.
+struct ContextResolver<'a> {
+    inner: access::DbResolver<'a>,
+    allowed: &'a [String],
+}
+
+impl compile::Resolver for ContextResolver<'_> {
+    fn page_space(&self) -> Option<&str> {
+        self.inner.page_space()
+    }
+
+    fn space(&mut self, id: &str) -> Result<String, String> {
+        let unknown =
+            || format!("no Space \"{id}\" in the Metro context; use a Space listed there");
+        if !self.allowed.iter().any(|a| a == id) {
+            return Err(unknown());
+        }
+        self.inner.space(id).map_err(|_| unknown())
+    }
+
+    fn room(&mut self, space: &str, name: &str) -> Result<(String, String, bool), String> {
+        let unknown = || format!("unknown room \"{name}\"; use a room listed in the Metro context");
+        if !self.allowed.iter().any(|a| a == space) {
+            return Err(unknown());
+        }
+        self.inner.room(space, name).map_err(|_| unknown())
+    }
+
+    fn agent(&mut self, space: &str, handle: &str) -> Result<(String, String), String> {
+        let unknown =
+            || format!("unknown agent @{handle}; use an agent listed in the Metro context");
+        if !self.allowed.iter().any(|a| a == space) {
+            return Err(unknown());
+        }
+        self.inner.agent(space, handle).map_err(|_| unknown())
+    }
+}
+
+/// Compile the model's page as the author, resolving only within `allowed`.
+pub(crate) fn compile_for_model(
+    db: &crate::db::Db,
+    user: &str,
+    space: Option<&str>,
+    allowed: &[String],
+    source: &str,
+) -> Compiled {
+    let mut r = ContextResolver {
+        inner: access::DbResolver {
+            db,
+            user,
+            space: space.map(str::to_owned),
+        },
+        allowed,
+    };
+    compile::compile(source, &mut r)
+}
+
 async fn compile_as(
     state: &AppState,
     user: &str,
     space: Option<&str>,
+    allowed: &[String],
     source: String,
 ) -> anyhow::Result<Compiled> {
-    let (user, space) = (user.to_owned(), space.map(str::to_owned));
+    let (user, space, allowed) = (user.to_owned(), space.map(str::to_owned), allowed.to_vec());
     state
         .db
         .call(move |db| {
-            let mut r = access::DbResolver {
+            Ok(compile_for_model(
                 db,
-                user: &user,
-                space,
-            };
-            Ok(compile::compile(&source, &mut r))
+                &user,
+                space.as_deref(),
+                &allowed,
+                &source,
+            ))
         })
         .await
+}
+
+/// The Spaces a page spec names (its `<Data>` and buttons).
+pub fn spec_spaces(spec: &PageSpec) -> Vec<String> {
+    let mut out: Vec<String> = spec
+        .data
+        .iter()
+        .filter_map(|d| d.params.space_id.clone())
+        .chain(
+            spec.all_blocks()
+                .into_iter()
+                .filter_map(|b| b.action.as_ref().and_then(|a| a.target.space_id.clone())),
+        )
+        .collect();
+    out.sort();
+    out.dedup();
+    out
 }
 
 /// Whether the job may still call a model: the draft is still wanted
@@ -664,6 +745,14 @@ async fn generate(state: &AppState, job: &Job) -> Outcome {
     // The system message is always the same; everything that varies is in
     // the user turn.
     let preamble = REFERENCE;
+    // Every Space whose names the request or its history can carry: the
+    // catalogue, the base page and the page's own Space. Rechecked before
+    // every provider call; diagnostics resolve only within it.
+    let mut involved = catalogued.clone();
+    involved.extend(job.base_spaces.iter().cloned());
+    involved.extend(job.space.iter().cloned());
+    involved.sort();
+    involved.dedup();
     let mut request = catalogue_message(&context);
     if let Some(base) = &job.base_source {
         request.push_str("Current page source:\n```tsx\n");
@@ -695,7 +784,7 @@ async fn generate(state: &AppState, job: &Job) -> Outcome {
         // theirs, still a member, still an editor of the page.
         // The request (and its history) names these Spaces: stop rather
         // than send their names once the author has left one of them.
-        if !still_wanted(state, job, &catalogued).await {
+        if !still_wanted(state, job, &involved).await {
             return Outcome::Error {
                 error: REVOKED.to_owned(),
                 attempts: attempts - 1,
@@ -709,26 +798,42 @@ async fn generate(state: &AppState, job: &Job) -> Outcome {
             preamble,
             history.clone(),
             prompt.clone(),
+            || still_wanted(state, job, &involved),
         )
         .await;
         let (reply, note) = match reply {
             Ok(r) => r,
-            Err(error) => return Outcome::Error { error, attempts },
+            Err(crate::agent::PageTurnError::Failed(error)) => {
+                return Outcome::Error { error, attempts };
+            }
+            Err(crate::agent::PageTurnError::Revoked) => {
+                return Outcome::Error {
+                    error: REVOKED.to_owned(),
+                    attempts: attempts - 1,
+                };
+            }
         };
         model = model_ref(&note);
         let reply = cap(&reply, MAX_REPLY_BYTES);
         let source = cap(&extract_source(&reply), tsx::MAX_SOURCE_BYTES + 1);
-        let compiled =
-            match compile_as(state, &job.user, job.space.as_deref(), source.clone()).await {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::error!(error = %format!("{e:#}"), "compiling a generated page");
-                    return Outcome::Error {
-                        error: "The page couldn't be checked.".to_owned(),
-                        attempts,
-                    };
-                }
-            };
+        let compiled = match compile_as(
+            state,
+            &job.user,
+            job.space.as_deref(),
+            &involved,
+            source.clone(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::error!(error = %format!("{e:#}"), "compiling a generated page");
+                return Outcome::Error {
+                    error: "The page couldn't be checked.".to_owned(),
+                    attempts,
+                };
+            }
+        };
         if let Some(spec) = &compiled.spec {
             return Outcome::Ready {
                 source: compiled.source.clone(),
