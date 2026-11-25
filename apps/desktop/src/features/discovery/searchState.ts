@@ -133,7 +133,7 @@ export async function runSearch(): Promise<void> {
       return;
     }
     if (status === 409) {
-      searchError.set({ message: `Search needs an embedding model: ${detail ?? "choose one in Settings › Model providers"}.`, needsEmbeddings: true });
+      searchError.set({ message: `Search needs an embedding model. Choose one in Settings › Model choices.${detail ? ` ${detail}` : ""}`, needsEmbeddings: true });
       return;
     }
     if (status === 502) {

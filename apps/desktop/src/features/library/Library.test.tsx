@@ -56,6 +56,10 @@ async function poll(cond: () => boolean, ms = 20_000) {
 
 const text = (app: App) => app.texts().join(" | ");
 const enc = new TextEncoder();
+const LEGACY_SELECTION = "/v1/library/settings";
+const GUARDED_SELECTION = "/v1/library/settings/selection";
+const INDEX = "/v1/library/index/selection";
+const SEARCH = "/v1/library/search/selection";
 const lib = (w: W, path: string, method = "GET") => w.l.log.filter((r) => r.path === path && r.method === method);
 const contentReads = (w: W) => w.l.log.filter((r) => r.path.endsWith("/content"));
 
@@ -89,17 +93,18 @@ test("Library is its own page listing only what I can access; Search's file mode
   // No page intro, no media model form here; with no media model there's no Index line either.
   expect(app.shows("id:library-model-picker")).toBe(false);
   expect(app.shows("id:library-model-status")).toBe(false);
-  expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
+  expect(lib(w, INDEX, "POST").length).toBe(0);
 
-  // A first Index with no media model leads straight to the choice in Settings › Model providers: nothing is sent.
+  // A first Index with no media model leads straight to the choice in Settings › Model choices: nothing is sent.
   await app.press(`id:library-actions:${s.mine.id}`);
   await app.waitFor("text:Choose a media model to index");
   await app.press(`id:library-index:${s.mine.id}`);
+  await app.waitFor("id:routing-settings >> text:Model choices");
   await app.waitFor("id:library-model");
   await app.waitFor("id:library-model-asked");
-  expect(app.shows("id:library-model-picker")).toBe(true);
-  expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
-  expect(lib(w, "/v1/library/settings", "PUT").length).toBe(0);
+  await app.waitFor("id:library-model-picker");
+  expect(lib(w, INDEX, "POST").length).toBe(0);
+  expect(lib(w, GUARDED_SELECTION, "PUT").length).toBe(0);
   await app.back(); // Escape closes Settings, back on the Library
   await app.waitFor("id:library-view");
 
@@ -129,10 +134,314 @@ test("Library is its own page listing only what I can access; Search's file mode
   expect(app.shows("id:library-choose")).toBe(false);
   expect(app.shows(`id:library-file:${s.mine.id}`)).toBe(false);
   expect(lib(w, "/v1/library/assets").length).toBe(lists);
-  expect(lib(w, "/v1/library/search", "POST").length).toBe(0);
+  expect(lib(w, SEARCH, "POST").length).toBe(0);
   // From there, the Library is one press away.
   await app.press("id:search-open-library");
   await app.waitFor("id:library-view");
+});
+
+test("a revoked Documents & media model is shown as unavailable until explicitly cleared and saved", async () => {
+  const w = libraryWorld();
+  w.addMediaConnection("alice", "device-embeddinggemma-2", "Another media model");
+  const revoked = w.addMediaConnection("bob", "embeddinggemma-2", "Previously shared");
+  w.l.settings.set("alice", revoked);
+  const app = await signIn(w);
+  await app.press("id:nav-settings");
+  await app.press("id:nav-settings:routing");
+  await app.waitFor("id:library-model-missing");
+  expect(app.shows("text:The saved selection is unavailable in personal scope; no other model takes its place.")).toBe(true);
+  expect(lib(w, GUARDED_SELECTION, "PUT")).toHaveLength(0);
+  await app.press("id:library-model-clear");
+  expect(w.l.settings.get("alice")).toBe(revoked);
+  await app.press("id:library-model-save");
+  await app.waitFor("id:library-model-save:warning >> text:/removes your Documents & media index/");
+  await app.press("id:library-model-save:confirm");
+  await app.waitFor("id:library-model-notice");
+  const writes = lib(w, GUARDED_SELECTION, "PUT");
+  expect(writes).toHaveLength(1);
+  expect(writes[0]!.body).toBe(JSON.stringify({ embedding_id: null, expected_embedding_id: revoked, expected_selection_revision: "0" }));
+});
+
+test("cancelling a replacement or clear sends no PUT and preserves the person's index", async () => {
+  const w = libraryWorld();
+  const current = w.addMediaConnection("alice", "embeddinggemma-2", "Current model");
+  const replacement = w.addMediaConnection("alice", "device-embeddinggemma-2", "Replacement model");
+  const file = w.addAsset("alice", null, "saved.txt", "Already indexed.");
+  w.l.settings.set("alice", current);
+  w.l.index.set("alice", new Set([file.id]));
+  const app = await signIn(w);
+  await app.press("id:nav-settings");
+  await app.press("id:nav-settings:routing");
+  await app.waitFor("text:Saved: Current model.");
+  for (const choice of [replacement, "none"]) {
+    await app.press("id:library-model-picker");
+    await app.press(`id:library-model-picker:${choice}`);
+    await app.press("id:library-model-save");
+    await app.waitFor("id:library-model-save:warning >> text:/not your files or anyone else's index/");
+    expect(lib(w, GUARDED_SELECTION, "PUT")).toHaveLength(0);
+    await app.press("id:library-model-save:cancel");
+    await app.waitFor("id:library-model-save:panel", { state: "gone" });
+    expect(lib(w, GUARDED_SELECTION, "PUT")).toHaveLength(0);
+    expect(lib(w, LEGACY_SELECTION, "PUT")).toHaveLength(0);
+    expect(w.l.settings.get("alice")).toBe(current);
+    expect(w.l.index.get("alice")?.has(file.id)).toBe(true);
+  }
+  // Confirming a replacement explicitly clears the index, with no new work sent.
+  await app.press("id:library-model-picker");
+  await app.press(`id:library-model-picker:${replacement}`);
+  await app.press("id:library-model-save");
+  await app.press("id:library-model-save:confirm");
+  await app.waitFor("id:library-model-notice");
+  expect(w.l.settings.get("alice")).toBe(replacement);
+  expect(w.l.index.has("alice")).toBe(false);
+  expect(lib(w, GUARDED_SELECTION, "PUT").map((r) => JSON.parse(r.body!))).toEqual([
+    { embedding_id: replacement, expected_embedding_id: current, expected_selection_revision: "0" },
+  ]);
+  expect(lib(w, INDEX, "POST")).toHaveLength(0);
+  expect(lib(w, SEARCH, "POST")).toHaveLength(0);
+});
+
+test("a failed refresh never leaves a cached media model draft saveable", async () => {
+  const w = libraryWorld();
+  const own = w.addMediaConnection("alice", "embeddinggemma-2", "Use this model");
+  const app = await signIn(w);
+  await app.press("id:nav-settings");
+  await app.press("id:nav-settings:routing");
+  await app.waitFor("id:library-model-picker");
+  await app.press("id:library-model-picker");
+  await app.press(`id:library-model-picker:${own}`);
+  expect(app.enabled("id:library-model-save")).toBe(true);
+  w.l.settingsReadStatus = 503;
+  // Crossing the layout breakpoint remounts the editor and reloads its
+  // choices without leaving the page or discarding the unsaved draft.
+  await app.setViewport(760, 900);
+  await app.waitFor("id:library-model-error");
+  expect(app.shows("id:library-model-save")).toBe(true);
+  expect(app.enabled("id:library-model-save")).toBe(false);
+  expect(app.shows("id:library-model-picker")).toBe(false);
+  expect(lib(w, GUARDED_SELECTION, "PUT")).toHaveLength(0);
+  w.l.settingsReadStatus = 200;
+  await app.press("id:library-model-error >> label:Try again");
+  await app.waitUntil(() => app.enabled("id:library-model-save"));
+  await app.press("id:library-model-save");
+  await app.waitFor("id:library-model-notice");
+  expect(w.l.settings.get("alice")).toBe(own);
+});
+
+async function openModelChoices(app: App) {
+  await app.press("id:nav-settings");
+  await app.press("id:nav-settings:routing");
+  await app.waitFor("id:library-model");
+}
+
+async function chooseModel(app: App, id: string) {
+  await app.waitFor("id:library-model-picker");
+  await app.press("id:library-model-picker");
+  await app.press(`id:library-model-picker:${id}`);
+}
+
+test("two windows: a stale first save and a stale confirmed clear preserve the other window's model and index", async () => {
+  const w = libraryWorld();
+  const alpha = w.addMediaConnection("alice", "embeddinggemma-2", "Alpha model");
+  const beta = w.addMediaConnection("alice", "device-embeddinggemma-2", "Beta model");
+  const file = w.addAsset("alice", null, "index.txt", "Keep the current index.");
+  const a = await signIn(w);
+  await openModelChoices(a);
+  await chooseModel(a, alpha); // A observes no saved model; no purge confirmation yet.
+  const b = await signIn(w);
+  await openModelChoices(b);
+  await chooseModel(b, beta);
+  await b.press("id:library-model-save");
+  await b.waitFor("id:library-model-notice");
+  await b.press("id:settings-close");
+  await openLibrary(b);
+  const indexFromB = async () => {
+    await b.waitFor(`id:library-file:${file.id}`);
+    await b.press(`id:library-actions:${file.id}`);
+    await b.press(`id:library-index:${file.id}`);
+    await b.waitFor(`id:library-index-state:${file.id}`);
+    expect(w.l.index.get("alice")?.has(file.id)).toBe(true);
+  };
+  await indexFromB();
+
+  await a.press("id:library-model-save");
+  await a.waitFor("id:library-model-conflict >> text:/changed elsewhere/");
+  await a.waitFor("text:Saved: Beta model.");
+  expect(a.shows("id:library-model-save")).toBe(false); // draft was discarded, not retried
+  expect(w.l.selectionConflicts).toBe(1);
+  expect(w.l.settings.get("alice")).toBe(beta);
+  expect(w.l.index.get("alice")?.has(file.id)).toBe(true);
+  expect(lib(w, GUARDED_SELECTION, "PUT").map((r) => JSON.parse(r.body!))).toEqual([
+    { embedding_id: beta, expected_embedding_id: null, expected_selection_revision: "0" },
+    { embedding_id: alpha, expected_embedding_id: null, expected_selection_revision: "0" },
+  ]);
+
+  // A opens a clear confirmation for Beta, but B replaces the model and
+  // indexes before A confirms. That confirmation isn't consent for Alpha.
+  await chooseModel(a, "none");
+  await a.press("id:library-model-save");
+  await a.waitFor("id:library-model-save:confirm");
+  await openModelChoices(b);
+  await chooseModel(b, alpha);
+  await b.press("id:library-model-save");
+  await b.press("id:library-model-save:confirm");
+  await b.waitFor("id:library-model-notice");
+  await b.press("id:settings-close");
+  await indexFromB();
+  await a.press("id:library-model-save:confirm");
+  await a.waitFor("id:library-model-conflict >> text:/draft was discarded/");
+  await a.waitFor("text:Saved: Alpha model.");
+  expect(a.shows("id:library-model-save:panel")).toBe(false);
+  expect(a.shows("id:library-model-save")).toBe(false);
+  expect(w.l.selectionConflicts).toBe(2);
+  expect(w.l.settings.get("alice")).toBe(alpha);
+  expect(w.l.index.get("alice")?.has(file.id)).toBe(true);
+  expect(lib(w, GUARDED_SELECTION, "PUT").map((r) => JSON.parse(r.body!))).toEqual([
+    { embedding_id: beta, expected_embedding_id: null, expected_selection_revision: "0" },
+    { embedding_id: alpha, expected_embedding_id: null, expected_selection_revision: "0" },
+    { embedding_id: alpha, expected_embedding_id: beta, expected_selection_revision: "1" },
+    { embedding_id: null, expected_embedding_id: beta, expected_selection_revision: "1" },
+  ]);
+  expect(lib(w, LEGACY_SELECTION, "PUT")).toHaveLength(0);
+  expect(lib(w, INDEX, "POST")).toHaveLength(2);
+  expect(lib(w, SEARCH, "POST")).toHaveLength(0);
+});
+
+test("an older server or a missing guarded route never falls back to a legacy media-model write", async () => {
+  const w = libraryWorld();
+  const old = w.addMediaConnection("alice", "embeddinggemma-2", "Original model");
+  const next = w.addMediaConnection("alice", "embeddinggemma-2", "Another model");
+  const file = w.addAsset("alice", null, "old.txt", "Already indexed.");
+  w.l.settings.set("alice", old);
+  w.l.index.set("alice", new Set([file.id]));
+  w.l.advertisesSelectionPrecondition = false;
+  w.l.guardedSelectionRoute = false;
+  const app = await signIn(w);
+  await openModelChoices(app);
+  await app.waitFor("id:library-model-guard-unsupported");
+  expect(app.shows("text:Saved: Original model.")).toBe(true);
+  expect(app.shows("id:library-model-picker")).toBe(false);
+  expect(lib(w, GUARDED_SELECTION, "PUT")).toHaveLength(0);
+  expect(lib(w, LEGACY_SELECTION, "PUT")).toHaveLength(0);
+
+  w.l.advertisesSelectionPrecondition = true;
+  await app.press("id:settings-close");
+  await openModelChoices(app);
+  await chooseModel(app, next);
+  await app.press("id:library-model-save");
+  await app.press("id:library-model-save:confirm");
+  await app.waitFor("id:library-model-error >> text:/couldn't confirm/");
+  expect(w.l.settings.get("alice")).toBe(old);
+  expect(w.l.index.get("alice")?.has(file.id)).toBe(true);
+  expect(lib(w, GUARDED_SELECTION, "PUT")).toHaveLength(1);
+  expect(lib(w, LEGACY_SELECTION, "PUT")).toHaveLength(0);
+});
+
+for (const operation of ["index", "search"] as const) {
+  test(`stale ${operation} consent for Alpha sends no data to Beta`, async () => {
+    const w = libraryWorld();
+    const alpha = w.addMediaConnection("alice", "embeddinggemma-2", "Alpha");
+    const beta = w.addMediaConnection("alice", "device-embeddinggemma-2", "Beta");
+    const file = w.addAsset("alice", null, "private.txt", "private bytes");
+    w.setSelection("alice", alpha);
+    const app = await signIn(w);
+    if (operation === "index") {
+      await openLibrary(app);
+      await app.waitFor("text:/Index sends the whole file to Alpha/");
+    } else {
+      await openFileSearch(app);
+      await app.waitFor("text:/sends your query to Alpha/");
+    }
+    w.setSelection("alice", beta);
+    if (operation === "index") {
+      await app.press(`id:library-actions:${file.id}`);
+      await app.press(`id:library-index:${file.id}`);
+      await app.waitFor(`id:library-index-state:${file.id}`);
+      expect(text(app)).toContain("The saved media model changed.");
+    } else {
+      await app.type("id:top-search", "private query");
+      await app.submit("id:top-search");
+      await app.waitFor("id:library-search-error >> text:/saved media model changed/");
+    }
+    const sent = lib(w, operation === "index" ? INDEX : SEARCH, "POST");
+    expect(sent).toHaveLength(1);
+    expect(JSON.parse(sent[0]!.body!).selection_revision).toBe("1");
+    expect(w.l.modelCalls).toEqual([]);
+    expect(lib(w, `/v1/library/${operation}`, "POST")).toHaveLength(0);
+  });
+}
+
+test("file search from a displayed empty selection never sends a query to a newly selected model", async () => {
+  const w = libraryWorld();
+  const beta = w.addMediaConnection("alice", "device-embeddinggemma-2", "Beta");
+  const app = await signIn(w);
+  await openFileSearch(app);
+  await app.waitFor("id:library-search-no-model");
+  w.setSelection("alice", beta);
+  await app.type("id:top-search", "private query");
+  await app.submit("id:top-search");
+  await app.waitFor("id:library-search-error >> text:/saved media model changed/");
+  expect(lib(w, SEARCH, "POST").map((r) => JSON.parse(r.body!).selection_revision)).toEqual(["0"]);
+  expect(w.l.modelCalls).toEqual([]);
+});
+
+test("an unchanged reload after a lost save acknowledgement keeps Index and Search paused", async () => {
+  const w = libraryWorld();
+  const alpha = w.addMediaConnection("alice", "embeddinggemma-2", "Alpha");
+  const beta = w.addMediaConnection("alice", "device-embeddinggemma-2", "Beta");
+  const file = w.addAsset("alice", null, "private.txt", "private bytes");
+  w.setSelection("alice", alpha);
+  const app = await signIn(w);
+  await openModelChoices(app);
+  await chooseModel(app, beta);
+  w.l.loseSelectionAck = true;
+  await app.press("id:library-model-save");
+  await app.press("id:library-model-save:confirm");
+  await app.waitFor("id:library-model-error >> text:/couldn't confirm/");
+  expect(w.l.settings.get("alice")).toBe(alpha);
+  await app.press("id:settings-close");
+  await openLibrary(app);
+  await app.waitFor("id:library-media-paused");
+  await app.press(`id:library-actions:${file.id}`);
+  expect(app.enabled(`id:library-index:${file.id}`)).toBe(false);
+  await app.back();
+  await openFileSearch(app);
+  await app.type("id:top-search", "private query");
+  await app.submit("id:top-search");
+  await app.waitFor("id:library-search-error >> text:/paused/");
+  expect(lib(w, INDEX, "POST")).toHaveLength(0);
+  expect(lib(w, SEARCH, "POST")).toHaveLength(0);
+  expect(w.l.modelCalls).toEqual([]);
+
+  w.l.heldSelectionSave!();
+  await app.press("id:library-media-paused >> label:Reload media model");
+  await app.waitFor("text:/sends your query to Beta/");
+  expect(lib(w, SEARCH, "POST")).toHaveLength(0); // reload never replays consent
+  await searchFiles(app, "now search");
+  expect(w.l.modelCalls).toEqual([{ model: beta, operation: "search", data: "now search" }]);
+  expect(lib(w, GUARDED_SELECTION, "PUT")).toHaveLength(1);
+});
+
+test("missing guarded media routes never retry against a legacy operation", async () => {
+  const w = libraryWorld();
+  const file = w.addAsset("alice", null, "private.txt", "private bytes");
+  w.setSelection("alice", w.addMediaConnection("alice", "embeddinggemma-2", "Alpha"));
+  w.l.guardedOperations = false;
+  const app = await signIn(w);
+  await openLibrary(app);
+  await app.waitFor("id:library-model-status");
+  await app.press(`id:library-actions:${file.id}`);
+  await app.press(`id:library-index:${file.id}`);
+  await app.waitFor(`id:library-index-state:${file.id}`);
+  await openFileSearch(app);
+  await app.type("id:top-search", "private query");
+  await app.submit("id:top-search");
+  await app.waitFor("id:library-search-error");
+  expect(lib(w, INDEX, "POST")).toHaveLength(1);
+  expect(lib(w, SEARCH, "POST")).toHaveLength(1);
+  expect(lib(w, "/v1/library/index", "POST")).toHaveLength(0);
+  expect(lib(w, "/v1/library/search", "POST")).toHaveLength(0);
+  expect(w.l.modelCalls).toEqual([]);
 });
 
 test("uploads come from the system picker as raw bytes, to the chosen Space, within the server's limit; nothing goes to a model", async () => {
@@ -177,8 +486,8 @@ test("uploads come from the system picker as raw bytes, to the chosen Space, wit
   expect(w.l.log.some((r) => r.url.includes(TOKENS.alice!))).toBe(false);
   expect(w.l.assets[0]!.space_id).toBe("acme");
   await app.waitFor(`id:library-file:${w.l.assets[0]!.id}`);
-  expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
-  expect(lib(w, "/v1/library/search", "POST").length).toBe(0);
+  expect(lib(w, INDEX, "POST").length).toBe(0);
+  expect(lib(w, SEARCH, "POST").length).toBe(0);
 });
 
 test("the media model settings offer only media-capable connections and disclose the data flow; Index sends one file only on request", async () => {
@@ -186,7 +495,7 @@ test("the media model settings offer only media-capable connections and disclose
   const s = seed(w);
   w.f.addConnection("alice", "custom-embeddings", "Text embeddings", "nomic-embed");
   const own = w.addMediaConnection("alice", "device-embeddinggemma-2", "My EG2");
-  w.addMediaConnection("bob", "embeddinggemma-2", "Bob's EG2 server", { visibility: "spaces", space_ids: ["acme"] });
+  w.addMediaConnection("bob", "embeddinggemma-2", "Bob's EG2 server", { visibility: "organization", space_ids: [] });
   const app = await open("./test/ModelHarness.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1280, height: 900 });
   await connect(app, "alice");
   await app.waitFor("id:library-model");
@@ -198,7 +507,7 @@ test("the media model settings offer only media-capable connections and disclose
   expect(text(app)).toContain("Choose a media model to index");
   await app.press(`id:library-index:${s.mine.id}`);
   await app.waitFor("id:library-model-asked");
-  expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
+  expect(lib(w, INDEX, "POST").length).toBe(0);
   expect(text(app)).toContain("Nothing is chosen, so nothing can be indexed or searched.");
 
   await app.press("id:library-model-picker");
@@ -211,15 +520,15 @@ test("the media model settings offer only media-capable connections and disclose
   expect(text(app)).toContain("never whole files");
   expect(text(app)).toContain("Shared by bob: it runs on bob's endpoint, so whoever runs that endpoint can see the files and queries sent, and bob may pay for it.");
   // Picking isn't saving: nothing is used yet.
-  expect(lib(w, "/v1/library/settings", "PUT").length).toBe(0);
+  expect(lib(w, GUARDED_SELECTION, "PUT").length).toBe(0);
 
   await app.press("id:library-model-picker");
   await app.press("text:/My EG2/");
   await app.waitFor("text:/It runs in your own metro-connector on your device/");
   await app.press("id:library-model-save");
   await app.waitFor("text:Saved: My EG2.");
-  expect(lib(w, "/v1/library/settings", "PUT")[0]!.body).toBe(JSON.stringify({ embedding_id: own }));
-  expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
+  expect(lib(w, GUARDED_SELECTION, "PUT")[0]!.body).toBe(JSON.stringify({ embedding_id: own, expected_embedding_id: null, expected_selection_revision: "0" }));
+  expect(lib(w, INDEX, "POST").length).toBe(0);
   await app.waitFor("text:/Index sends the whole file to My EG2; whoever runs it can see it/");
   expect(app.shows("id:library-model-asked")).toBe(false);
 
@@ -227,9 +536,9 @@ test("the media model settings offer only media-capable connections and disclose
   await app.press(`id:library-index:${s.mine.id}`);
   await app.waitFor(`id:library-index-state:${s.mine.id}`);
   await app.waitFor("text:Indexed 3 parts in your own index.");
-  const index = lib(w, "/v1/library/index", "POST");
+  const index = lib(w, INDEX, "POST");
   expect(index.length).toBe(1);
-  expect(JSON.parse(index[0]!.body!)).toEqual({ asset_id: s.mine.id });
+  expect(JSON.parse(index[0]!.body!)).toEqual({ asset_id: s.mine.id, selection_revision: "1" });
 });
 
 test("Delete sits in each row's More menu, asks first, and is offered only to the uploader or the Space owner", async () => {
@@ -311,7 +620,7 @@ test("file search: chips filter, Return runs it, results carry no raw scores, on
   const w = libraryWorld();
   const s = seed(w);
   const { pdf, wav } = seedHits(w, s);
-  w.l.settings.set("alice", w.addMediaConnection("alice", "embeddinggemma-2", "EG2"));
+  w.setSelection("alice", w.addMediaConnection("alice", "embeddinggemma-2", "EG2"));
   const app = await signIn(w);
   await openFileSearch(app);
   await app.waitFor("id:library-search-disclosure");
@@ -319,10 +628,10 @@ test("file search: chips filter, Return runs it, results carry no raw scores, on
   // Filters change nothing until the search runs.
   await app.press("id:library-search-kind:document");
   await app.press("id:library-search-kind:any");
-  expect(lib(w, "/v1/library/search", "POST").length).toBe(0);
+  expect(lib(w, SEARCH, "POST").length).toBe(0);
 
   await searchFiles(app, "rollback plan");
-  expect(JSON.parse(lib(w, "/v1/library/search", "POST")[0]!.body!)).toEqual({ query: "rollback plan", scope: "all", limit: 10 });
+  expect(JSON.parse(lib(w, SEARCH, "POST")[0]!.body!)).toEqual({ query: "rollback plan", scope: "all", limit: 10, selection_revision: "1" });
   expect(text(app)).toContain("5 matches for “rollback plan” · Everything you can access");
   expect(text(app)).not.toContain("carol's secret");
   expect(text(app)).toContain("Documents reranked by System One");
@@ -386,7 +695,7 @@ test("file search: chips filter, Return runs it, results carry no raw scores, on
   expect(text(app)).toContain("then go to page 3");
   expect(lib(w, `/v1/library/assets/${pdf.id}/content`).length).toBe(1);
   // Opening never indexes or sends a file anywhere.
-  expect(lib(w, "/v1/library/index", "POST").length).toBe(0);
+  expect(lib(w, INDEX, "POST").length).toBe(0);
 });
 
 test("similarity-only answers say so; without a media model Search says what's missing before anything is sent", async () => {
@@ -403,7 +712,10 @@ test("similarity-only answers say so; without a media model Search says what's m
   await app.waitFor("id:library-search-error");
   expect(text(app)).toContain("File search needs a media model: choose a media embedding model in Settings to search your files.");
   expect(app.shows("id:library-search-open-providers")).toBe(true);
-  w.l.settings.set("alice", w.addMediaConnection("alice", "embeddinggemma-2", "EG2"));
+  w.setSelection("alice", w.addMediaConnection("alice", "embeddinggemma-2", "EG2"));
+  await app.press("id:library-search-open-providers");
+  await app.waitFor("text:Saved: EG2.");
+  await app.press("id:settings-close");
   await searchFiles(app, "rollback");
   expect(text(app)).toContain("Similarity order");
   expect(text(app)).toContain("System One didn't rerank these.");

@@ -19,7 +19,9 @@
 //   form that holds it clears it as soon as it is sent.
 
 import { batch, computed, effect, signal, untracked } from "nsh";
-import { ApiError } from "./api/client";
+import { ApiError, EndpointPatchError } from "./api/client";
+import { serverHost } from "./api/serverUrl";
+import type { PageScope } from "./ui";
 import type {
   Capability,
   CatalogProvider,
@@ -41,6 +43,7 @@ import {
   activeSpace,
   activeSpaceId,
   apiClient,
+  connectedTo,
   describe,
   disconnect,
   handleManageError,
@@ -59,6 +62,11 @@ import {
 import { forgetQuietly, localConnections, localStep, onLocalPairingChanged, packaged, refreshHelper } from "./device/state";
 
 export type { Capability, CatalogProvider, ConnectionModel, DeviceStatus, ModelThinking, NewConnectionModel, ProviderConnection, RegisteredRunner, RunnerVisibility, SpaceRunner };
+
+export function settingsAccountScope(): PageScope | undefined {
+  const server = connectedTo();
+  return server ? { kind: "account", host: serverHost(server) } : undefined;
+}
 
 // ------------------------------------------------------------------ the one-time reveal
 
@@ -489,21 +497,27 @@ async function loadCatalog(): Promise<void> {
 }
 
 export async function loadConnections(): Promise<void> {
+  await readConnections();
+}
+
+/** Returns only an authoritative list applied to this session, not a cached one. */
+async function readConnections(confirmEndpointOf?: string): Promise<ProviderConnection[] | null> {
   const c = apiClient();
-  if (!c) return;
+  if (!c) return null;
   const seq = ++connectionsSeq;
   const ok = sessionGuard();
   try {
-    const list = await c.listProviders();
-    if (!ok() || seq !== connectionsSeq) return;
+    const list = await c.listProviders(confirmEndpointOf);
+    if (!ok() || seq !== connectionsSeq) return null;
     batch(() => {
       connections.set(list);
       clearProviderError();
     });
     for (const x of list) if (isDeviceConnection(x)) void loadDeviceStatus(x.id);
+    return list;
   } catch (error) {
-    if (!ok() || seq !== connectionsSeq) return;
-    providerError(error, "Could not load your connections");
+    if (ok() && seq === connectionsSeq) providerError(error, "Could not load your connections");
+    return null;
   }
 }
 
@@ -575,9 +589,9 @@ export async function createConnection(body: NewProviderConnection, opts: { fetc
  * is dropped). For a device connection this is also its connection test: it
  * answers only while its metro-connector is online.
  */
-export async function fetchModels(id: string): Promise<void> {
+export async function fetchModels(id: string, afterEndpointChange = false): Promise<void> {
   const c = apiClient();
-  if (!c) return;
+  if (!c || endpointNeedsReload(id)) return;
   const seq = (modelsSeq.get(id) ?? 0) + 1;
   modelsSeq.set(id, seq);
   const ok = sessionGuard();
@@ -585,7 +599,7 @@ export async function fetchModels(id: string): Promise<void> {
   const known = connections()?.find((x) => x.id === id);
   if (known && isDeviceConnection(known)) void loadDeviceStatus(id);
   try {
-    const result = await c.refreshConnectionModels(id);
+    const result = await c.refreshConnectionModels(id, afterEndpointChange);
     if (!ok() || modelsSeq.get(id) !== seq) return;
     batch(() => {
       modelListings.set({ ...modelListings(), [id]: { state: "ok", models: result.models, added: result.added, unavailable: result.unavailable } });
@@ -740,6 +754,143 @@ export async function updateConnection(id: string, patch: ProviderPatch, done?: 
   }
 }
 
+type EndpointResult =
+  | { kind: "ignored" | "not-approved" | "unconfirmed" }
+  | { kind: "refused"; message: string; retry: boolean; detail?: string }
+  | { kind: "changed"; listing?: ModelListing };
+
+type EndpointCheck = {
+  from: string | null; to: string; detail?: string;
+  refusal?: "conflict" | "missing";
+  phase: "unknown" | "reload-failed" | "saved" | "not-settled" | "review";
+};
+/** A check survives editor closes/remounts. Only positive refusal evidence allows review instead of waiting for a possible commit. */
+export const endpointChecks = signal<Partial<Record<string, EndpointCheck>>>({});
+
+export function endpointNeedsReload(id: string): boolean {
+  const phase = endpointChecks()[id]?.phase;
+  return phase === "unknown" || phase === "reload-failed" || phase === "not-settled";
+}
+
+export function dismissEndpointCheck(id: string) {
+  if (!endpointChecks()[id] || endpointNeedsReload(id)) return;
+  const checks = { ...endpointChecks() };
+  delete checks[id];
+  endpointChecks.set(checks);
+}
+
+function invalidateEndpointListing(id: string) {
+  modelsSeq.set(id, (modelsSeq.get(id) ?? 0) + 1);
+  const listings = { ...modelListings() };
+  delete listings[id];
+  modelListings.set(listings);
+}
+
+export async function reloadEndpoint(id: string): Promise<void> {
+  const check = endpointChecks()[id];
+  if (!check || !endpointNeedsReload(id) || providerBusy() || !apiClient()) return;
+  const ok = sessionGuard();
+  providerBusy.set(`endpoint-reload:${id}`);
+  try {
+    const list = await readConnections(id);
+    if (!ok()) return;
+    if (!list) {
+      endpointChecks.set({ ...endpointChecks(), [id]: { ...check, phase: "reload-failed" } });
+      return;
+    }
+    const connection = list.find((x) => x.id === id) ?? null;
+    batch(() => {
+      if (connection?.baseUrl !== check.from) invalidateEndpointListing(id);
+      const checks = { ...endpointChecks() };
+      if (!connection) {
+        delete checks[id];
+        connectionsError.set("This connection is no longer available to edit.");
+      } else if (check.refusal) {
+        // A definite refusal never saved the draft, even if someone else
+        // has since chosen the same URL. Always ask for fresh review.
+        checks[id] = { ...check, phase: "review" };
+      } else {
+        // A GET is a snapshot, not proof an uncertain PATCH has stopped.
+        checks[id] = { ...check, phase: connection.baseUrl === check.to ? "saved" : "not-settled" };
+      }
+      endpointChecks.set(checks);
+    });
+  } finally {
+    if (ok()) providerBusy.set(null);
+  }
+}
+
+/** Keep the committed endpoint in state until the server confirms a successful test and save. */
+export async function updateEndpoint(id: string, url: string, revision: string): Promise<EndpointResult> {
+  const c = apiClient();
+  const current = connections()?.find((x) => x.id === id);
+  const provider = current && providerById(current.providerId);
+  if (!c || !current || !provider?.allowCustomUrl || isDeviceConnection(current) || providerBusy() || endpointNeedsReload(id) || url === current.baseUrl) {
+    return { kind: "ignored" };
+  }
+  if (catalogError() || !isAllowedBaseUrl(url)) return { kind: "not-approved" };
+  const ok = sessionGuard();
+  batch(() => {
+    dismissEndpointCheck(id);
+    providerBusy.set(`endpoint:${id}`);
+    clearProviderError();
+    providerNotice.set(null);
+  });
+  try {
+    const changed = await c.updateProviderEndpoint(id, url, revision);
+    if (!ok()) return { kind: "ignored" };
+    // Don't show a listing from the old endpoint, even if it finishes after the PATCH.
+    batch(() => {
+      invalidateEndpointListing(id);
+      replaceConnection(changed);
+      providerBusy.set(`endpoint-refresh:${id}`);
+    });
+    if (provider.listsModels) await fetchModels(id, true);
+    if (!ok()) return { kind: "ignored" };
+    return { kind: "changed", listing: modelListings()[id] };
+  } catch (error) {
+    if (!ok() || isAborted(error)) return { kind: "ignored" };
+    if (error instanceof ApiError && error.kind === "auth") {
+      disconnect(error.message);
+      return { kind: "ignored" };
+    }
+    const status = error instanceof ApiError ? error.status : null;
+    const detail = status ? `PATCH endpoint: HTTP ${status}` : undefined;
+    let refusal: EndpointCheck["refusal"];
+    if (error instanceof EndpointPatchError) {
+      switch (error.code) {
+        case "endpoint_not_approved":
+          void loadCatalog();
+          return { kind: "not-approved" };
+        case "endpoint_probe_busy":
+          return { kind: "refused", message: "The server has too many endpoint tests running. No change was saved. Try again shortly.", retry: true, detail };
+        case "endpoint_probe_failed": {
+          const reason = status === 504 ? "the test timed out" : "the connection test failed";
+          return { kind: "refused", message: `The new endpoint didn't answer (${reason}). The connection still uses the old one.`, retry: true, detail };
+        }
+        case "endpoint_rejected":
+          return { kind: "refused", message: `Metro didn't save the endpoint change: ${error.reason}`, retry: false, detail };
+        case "endpoint_conflict":
+          refusal = "conflict";
+          break;
+        case "endpoint_missing":
+          refusal = "missing";
+          break;
+      }
+    }
+    batch(() => {
+      // An old refresh's result can't later overwrite the reloaded endpoint.
+      invalidateEndpointListing(id);
+      endpointChecks.set({
+        ...endpointChecks(), [id]: { phase: "unknown", refusal, from: current.baseUrl, to: url, detail: detail ?? "Endpoint response was not confirmed" },
+      });
+    });
+    return { kind: "unconfirmed" };
+  } finally {
+    if (ok()) providerBusy.set(null);
+  }
+}
+
 export async function deleteConnection(id: string): Promise<void> {
   const c = apiClient();
   if (!c || providerBusy()) return;
@@ -882,12 +1033,12 @@ export async function rotateDeviceToken(id: string): Promise<void> {
   }
 }
 
-const onProvidersPage = () => place() === "settings" && settingsSection() === "providers";
+const onProvidersPage = () => place() === "settings" && settingsSection() === "connections";
 
 /** Whether `url` may be used as a custom base URL: exactly one of the server's allowed URLs. */
 export function isAllowedBaseUrl(url: string): boolean {
   const allowed = catalog()?.allowedBaseUrls ?? [];
-  return allowed.includes(url.trim());
+  return allowed.includes(url);
 }
 
 // ------------------------------------------------------------------ errors and lifecycle
@@ -960,7 +1111,7 @@ effect(() => {
   const here = place() === "settings" ? settingsSection() : null;
   untracked(() => {
     if (here === "runners") void loadRunners();
-    else if (here === "providers") {
+    else if (here === "connections") {
       void loadProviders();
       void refreshHelper();
     }
@@ -1003,6 +1154,7 @@ onSessionEnd(() => {
   catalog.set(null);
   catalogError.set(null);
   connections.set(null);
+  endpointChecks.set({});
   clearProviderError();
   providerBusy.set(null);
   providerNotice.set(null);

@@ -48,7 +48,7 @@ show the message as it is.
 ## `GET /v1/library/settings`
 
 ```json
-{ "embedding_id": null, "suggested_id": "pc_…" }
+{ "embedding_id": null, "suggested_id": "pc_…", "selection_precondition": true }
 ```
 
 - `embedding_id`: the media embedding connection the person chose, or
@@ -58,21 +58,29 @@ show the message as it is.
   the person's message-search embedding connection is confirmed
   media-capable (`media_inputs: true`). Show it as a suggestion. It is not
   used until it is saved with `PUT`.
-- Pick connections from `GET /v1/models/available` entries with
+- `selection_precondition: true`: guarded writes are supported. A client
+  requiring a guarded write must not save if this is absent.
+- Pick connections from personal `GET /v1/models/available` entries with
   `capability: "embeddings"` and `media_inputs: true`.
 
-## `PUT /v1/library/settings`
+## `PUT /v1/library/settings/selection`
 
-Request: `{ "embedding_id": "pc_…" | null }`. Response: the same shape as
-`GET` (without `suggested_id`).
+Request: `{ "embedding_id": "pc_…" | null, "expected_embedding_id": "pc_…" | null }`.
+Supply both fields, with an explicit `null` for none. `expected_embedding_id`
+is the selection the user saw. The response has the same shape as `GET`
+(without `suggested_id`). Do not fall back to the legacy route on failure.
 
 - `422`: the connection is not media-capable (a text-only embeddings
   connection never stands in for media).
-- `409`: the connection is unknown or can't be used by the caller (the
-  message is provider-safe).
+- `409`: the expected selection changed (no write or purge), or the
+  connection is unknown or can't be used in personal scope. Reload the saved
+  selection; do not automatically retry.
 - Choosing a **different** connection, or `null`, deletes the caller's whole
   library index. The UI should confirm first. Saving the same id again keeps
   the index.
+
+The legacy `PUT /v1/library/settings` still takes `{ "embedding_id": "pc_…" | null }`
+and writes unconditionally for older clients.
 
 ## `POST /v1/library/index`
 

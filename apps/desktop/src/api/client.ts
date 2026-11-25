@@ -167,6 +167,7 @@ export type ProviderConnection = {
   name: string;
   providerId: string;
   baseUrl: string | null;
+  endpointRevision?: string;
   model: string | null;
   isDefault: boolean;
   hasKey: boolean;
@@ -299,7 +300,7 @@ export type ModelRouting = {
 };
 
 /** The transport other API modules (src/api/discovery.ts) build on. */
-export type RequestFn = (method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown, signal?: AbortSignal) => Promise<unknown>;
+export type RequestFn = (method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", path: string, body?: unknown, signal?: AbortSignal, deadlineMs?: number) => Promise<unknown>;
 
 /** A device connection's metro-connector (GET /v1/providers/{id}/device-token). */
 export type DeviceStatus = { paired: boolean; online: boolean; lastSeenSecs: number | null };
@@ -346,6 +347,25 @@ export class ApiError extends Error {
   }
 }
 
+const ENDPOINT_REFUSAL_STATUSES = {
+  endpoint_not_approved: [400],
+  endpoint_probe_busy: [503],
+  endpoint_probe_failed: [502, 504],
+  endpoint_conflict: [409],
+  endpoint_missing: [404],
+  endpoint_rejected: [400, 403, 404, 409, 422, 500, 503],
+} as const;
+export const revisionToken = (value: unknown): string | null =>
+  typeof value === "string" && /^(0|[1-9][0-9]{0,18})$/.test(value) ? value : null;
+type EndpointRefusal = keyof typeof ENDPOINT_REFUSAL_STATUSES;
+
+/** A Metro endpoint PATCH response that expressly refuses the write. */
+export class EndpointPatchError extends ApiError {
+  constructor(status: number, readonly code: EndpointRefusal, readonly reason: string) {
+    super(status === 404 ? "not_found" : "http", `Endpoint change refused (HTTP ${status}): ${reason}`, status);
+  }
+}
+
 export type ClientOptions = {
   baseUrl: string;
   /** Read per request; the token itself lives only in memory. */
@@ -360,10 +380,10 @@ export type Client = ReturnType<typeof createClient>;
 export function createClient(options: ClientOptions) {
   const timeoutMs = options.timeoutMs ?? 10_000;
 
-  const request: RequestFn = async (method, path, body, signal) => {
+  const request: RequestFn = async (method, path, body, signal, deadlineMs = timeoutMs) => {
     const url = options.baseUrl + path;
     const timeout = new AbortController();
-    const timer = setTimeout(() => timeout.abort(), timeoutMs);
+    const timer = setTimeout(() => timeout.abort(), deadlineMs);
     const onOuterAbort = () => timeout.abort();
     options.signal?.addEventListener("abort", onOuterAbort);
     signal?.addEventListener("abort", onOuterAbort);
@@ -385,7 +405,10 @@ export function createClient(options: ClientOptions) {
         redirect: "error", // never forward the bearer token to another location
       });
       checkCancelled();
-      await checkStatus(response, method, path, path.startsWith("/v1/pages"));
+      const errorDetails = path.startsWith("/v1/pages") ? "pages"
+        : method === "PATCH" && /^\/v1\/providers\/[^/]+$/.test(path) && isObject(body) && "base_url" in body ? "endpoint"
+        : /^\/v1\/library\/(?:settings|index|search)\/selection$/.test(path) ? "library" : undefined;
+      await checkStatus(response, method, path, errorDetails);
       const text = await response.text();
       checkCancelled();
       if (!text.trim()) return null;
@@ -398,7 +421,7 @@ export function createClient(options: ClientOptions) {
       checkCancelled();
       if (error instanceof ApiError) throw error;
       if (timeout.signal.aborted) {
-        throw new ApiError("timeout", `${options.baseUrl} did not answer ${method} ${path} within ${Math.round(timeoutMs / 1000)}s.`);
+        throw new ApiError("timeout", `${options.baseUrl} did not answer ${method} ${path} within ${Math.round(deadlineMs / 1000)}s.`);
       }
       const detail = String((error as Error)?.message ?? error).replace(/^Network request failed:\s*/i, "");
       throw new ApiError("network", `Cannot reach ${options.baseUrl} (${detail}). Is the server running?`);
@@ -562,11 +585,19 @@ export function createClient(options: ClientOptions) {
       return { providers: providers.filter(isCatalogProvider).map(toCatalogProvider), allowedBaseUrls: allowed };
     },
 
-    async listProviders(): Promise<ProviderConnection[]> {
+    async listProviders(confirmEndpointOf?: string): Promise<ProviderConnection[]> {
       const data = await request("GET", "/v1/providers");
       const list = isObject(data) ? data.connections : undefined;
       if (!Array.isArray(list)) throw new ApiError("protocol", "GET /v1/providers did not return { connections: [...] }.");
-      return list.filter(isConnection).map(toConnection);
+      const connections = list.filter(isConnection);
+      if (confirmEndpointOf !== undefined) {
+        const matches = connections.filter((row) => String(row.id) === confirmEndpointOf);
+        const url = matches[0]?.base_url; // absent or null is valid for a provider's built-in URL
+        if (list.length !== connections.length || matches.length > 1 || (url != null && (typeof url !== "string" || !url))) {
+          throw new ApiError("protocol", "GET /v1/providers did not confirm the connection's endpoint.");
+        }
+      }
+      return connections.map(toConnection);
     },
 
     async createProvider(body: NewProviderConnection): Promise<ProviderConnection> {
@@ -597,8 +628,8 @@ export function createClient(options: ClientOptions) {
     },
 
     /** Lists the provider's models again and merges them into the connection's list. */
-    async refreshConnectionModels(id: string): Promise<ModelRefresh> {
-      const data = await request("POST", `/v1/providers/${encodeURIComponent(id)}/model-list/refresh`, {});
+    async refreshConnectionModels(id: string, afterEndpointChange = false): Promise<ModelRefresh> {
+      const data = await request("POST", `/v1/providers/${encodeURIComponent(id)}/model-list/refresh`, {}, undefined, afterEndpointChange ? 25_000 : undefined);
       const models = isObject(data) ? data.models : undefined;
       if (!isObject(data) || !Array.isArray(models)) throw new ApiError("protocol", "POST …/model-list/refresh did not return { models: [...] }.");
       return {
@@ -611,6 +642,17 @@ export function createClient(options: ClientOptions) {
 
     async updateProvider(id: string, patch: ProviderPatch): Promise<void> {
       await request("PATCH", `/v1/providers/${encodeURIComponent(id)}`, patch);
+    },
+
+    /** The server tests and commits in one operation (its endpoint probe can take up to 20s). */
+    async updateProviderEndpoint(id: string, baseUrl: string, revision: string): Promise<ProviderConnection> {
+      const path = `/v1/providers/${encodeURIComponent(id)}`;
+      const data = await request("PATCH", path, { base_url: baseUrl, expected_endpoint_revision: revision }, undefined, 25_000);
+      const savedRevision = isObject(data) ? revisionToken(data.endpoint_revision) : null;
+      if (!isConnection(data) || String(data.id) !== id || data.base_url !== baseUrl || !savedRevision || savedRevision === revision) {
+        throw new ApiError("protocol", "The server did not confirm the requested endpoint.");
+      }
+      return toConnection(data);
     },
 
     async deleteProvider(id: string): Promise<void> {
@@ -1066,6 +1108,7 @@ function toConnection(v: Record<string, unknown> & { id: string | number; name: 
     name: v.name,
     providerId: v.provider_id,
     baseUrl: typeof v.base_url === "string" && v.base_url ? v.base_url : null,
+    endpointRevision: revisionToken(v.endpoint_revision) ?? undefined,
     model: typeof v.model === "string" && v.model ? v.model : null,
     isDefault: v.is_default === true,
     hasKey: v.has_key === true,
@@ -1258,19 +1301,56 @@ function isEvent(v: unknown): v is RoomEvent {
   );
 }
 
-/** Maps a non-2xx response to its ApiError (the body read only for a short server message). */
-async function checkStatus(response: Response, method: string, path: string, pageDetails = false): Promise<void> {
+/** Only a recognised Metro JSON error, with its expected status, can settle a refused PATCH. */
+function endpointRefusal(data: unknown, status: number): EndpointPatchError | null {
+  if (!isObject(data) || typeof data.error !== "string" || !data.error.trim()) return null;
+  const reason = data.error.slice(0, 200);
+  if (Object.prototype.hasOwnProperty.call(data, "code")) {
+    if (typeof data.code !== "string" || !Object.prototype.hasOwnProperty.call(ENDPOINT_REFUSAL_STATUSES, data.code)) return null;
+    const code = data.code as EndpointRefusal;
+    const statuses: readonly number[] = ENDPOINT_REFUSAL_STATUSES[code];
+    return statuses.includes(status) ? new EndpointPatchError(status, code, reason) : null;
+  }
+  // Older Metro servers used these two specific reasons in the same JSON
+  // envelope. A generic gateway response or any plain text isn't evidence.
+  if (status === 400 && reason === "base_url must be exactly one of this server's allowed_base_urls") {
+    return new EndpointPatchError(status, "endpoint_not_approved", reason);
+  }
+  const legacyProbe = /^the new endpoint failed its (?:model listing test(?:: .+)?|(?:chat completion(?: \(response too large\))?|System One (?:Noul|request setup)|embeddings(?: request setup)?) test(?: \(timed out\))?)$/;
+  if ((status === 502 || status === 504) && legacyProbe.test(reason)) {
+    return new EndpointPatchError(status, "endpoint_probe_failed", reason);
+  }
+  return null;
+}
+
+/** Maps a non-2xx response to its ApiError. */
+async function checkStatus(response: Response, method: string, path: string, errorDetails?: "pages" | "endpoint" | "library"): Promise<void> {
   if (response.status === 401) {
     throw new ApiError("auth", "The server rejected the access token (HTTP 401). Check the token and connect again.", 401);
+  }
+  if (errorDetails === "endpoint" && !response.ok) {
+    const data: unknown = await response.json().catch(() => undefined);
+    throw endpointRefusal(data, response.status) ??
+      new ApiError("http", `${method} ${path} failed with HTTP ${response.status}`, response.status);
+  }
+  if (errorDetails === "library" && !response.ok) {
+    const data: unknown = await response.json().catch(() => undefined);
+    const reason = isObject(data) && typeof data.error === "string" ? data.error.trim().slice(0, 200) : "";
+    const status = response.status;
+    const code = reason && isObject(data) ? data.code : null;
+    const verified = (code === "library_selection_changed" && status === 409)
+      || (code === "library_selection_refused" && method === "PUT" && [400, 404, 409, 422].includes(status));
+    throw new ApiError(status === 404 ? "not_found" : "http",
+      `${method} ${path} failed with HTTP ${status}${reason ? `: ${reason}` : ""}`, status, verified ? { code } : undefined);
   }
   if (response.status === 403) {
     const detail = await safeSnippet(response);
     throw new ApiError("forbidden", `You don't have access to that (HTTP 403)${detail ? `: ${detail}` : ""}.`, 403);
   }
   if (!response.ok) {
-    // Only Pages needs structured error bodies (diagnostics, conflicts and
+    // Pages needs structured error bodies (diagnostics, conflicts and
     // action challenges). Do not turn any of those fields into error text.
-    if (pageDetails && [409, 422, 428].includes(response.status)) {
+    if (errorDetails === "pages" && [409, 422, 428].includes(response.status)) {
       const details: unknown = await response.json().catch(() => undefined);
       const error = isObject(details) && typeof details.error === "string" ? details.error.slice(0, 200) : "";
       throw new ApiError("http", error || `${method} ${path} failed with HTTP ${response.status}`, response.status, details);

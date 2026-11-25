@@ -66,6 +66,7 @@ test("choosing Light repaints every surface and is saved", async () => {
   await app.press("id:appearance:light");
   await expectScheme(app, light);
   expect(app.storage()[APPEARANCE_KEY]).toBe("light");
+  await app.waitFor("text:Appearance saved on this computer.");
   // Still the primary fill (and readable) with the pointer left on it.
   await app.hover("id:appearance:light");
   expect(bg(app, "id:appearance:light")).toBe(rgba(light.primary));
@@ -228,8 +229,14 @@ test("Showing now appears only while System is chosen", async () => {
   await app.waitFor("id:appearance-shown", { state: "gone" });
 });
 
-test("the preview shows every kind of element, including a sample message", async () => {
+test("the Appearance page shows its scope, without the development gallery", async () => {
   const app = await openFixture({ [APPEARANCE_KEY]: "dark" });
+  await app.waitFor("text:This computer only");
+  expect(app.shows("id:appearance-preview")).toBe(false);
+});
+
+test("the development gallery shows every kind of element, including a sample message", async () => {
+  const app = await open("./themeGallery.fixture.tsx", { platform: "linux", width: 1280, height: 1400, storage: { [APPEARANCE_KEY]: "dark" } });
   await app.waitFor("id:appearance-preview");
   for (const label of [
     "Preview of a primary button",

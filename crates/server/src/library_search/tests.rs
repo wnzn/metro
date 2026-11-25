@@ -638,6 +638,7 @@ impl MediaModels for Fixture {
         dest: Option<&'a str>,
         c: &'a str,
         input: Value,
+        _binding: Option<(i64, &'a str)>,
     ) -> ModelFuture<'a, Value> {
         let sent = match (input.get("query"), input.get("asset")) {
             (Some(q), None) => Sent {
@@ -697,6 +698,7 @@ impl MediaModels for Fixture {
         _c: &'a str,
         state: Value,
         questions: Value,
+        _selection: Option<(&'a str, i64)>,
     ) -> ModelFuture<'a, Value> {
         assert_eq!(questions[engine::RERANK_QUESTION]["type"], "noul");
         let obj = state.as_object().unwrap();
@@ -910,7 +912,7 @@ impl World {
     fn engine<'a>(&'a self, user: &'a str, classifier: bool) -> Engine<'a> {
         let mut c = self.db.lock();
         if store::embedding_id(&c, user).unwrap().is_none() {
-            store::set_embedding_id(&mut c, user, Some("media")).unwrap();
+            store::set_embedding_id(&mut c, user, Some("media"), None).unwrap();
         }
         drop(c);
         Engine::new(
@@ -1801,6 +1803,8 @@ async fn settings_never_switch_silently() {
         v,
         SettingsView {
             embedding_id: None,
+            selection_precondition: true,
+            selection_revision: "0".into(),
             suggested_id: None
         }
     );
@@ -1811,24 +1815,24 @@ async fn settings_never_switch_silently() {
         v,
         SettingsView {
             embedding_id: None,
+            selection_precondition: true,
+            selection_revision: "0".into(),
             suggested_id: Some("media".into())
         }
     );
     // Saving: text-only and unknown connections are refused.
-    let put = |id: Option<&str>| Settings {
-        embedding_id: id.map(str::to_owned),
-    };
+    let put = |id: Option<&str>| id.map(str::to_owned);
     assert_eq!(
-        engine::save_settings(&w.db, &w.fx, "alice", put(Some("text-only")))
+        engine::save_settings(&w.db, &w.fx, "alice", put(Some("text-only")), None)
             .await
             .unwrap_err(),
         LibrarySearchError::NotMediaCapable
     );
     assert!(matches!(
-        engine::save_settings(&w.db, &w.fx, "alice", put(Some("ghost"))).await,
+        engine::save_settings(&w.db, &w.fx, "alice", put(Some("ghost")), None).await,
         Err(LibrarySearchError::Unusable(_))
     ));
-    engine::save_settings(&w.db, &w.fx, "alice", put(Some("media")))
+    engine::save_settings(&w.db, &w.fx, "alice", put(Some("media")), None)
         .await
         .unwrap();
     let v = engine::settings_view(&w.db, &w.fx, "alice", Some("media".into()))
@@ -1838,6 +1842,8 @@ async fn settings_never_switch_silently() {
         v,
         SettingsView {
             embedding_id: Some("media".into()),
+            selection_precondition: true,
+            selection_revision: "1".into(),
             suggested_id: None
         }
     );
@@ -1852,11 +1858,11 @@ async fn settings_never_switch_silently() {
     );
     w.index("alice", "a").await.unwrap();
     assert_eq!(w.segments("alice"), 3);
-    engine::save_settings(&w.db, &w.fx, "alice", put(Some("media")))
+    engine::save_settings(&w.db, &w.fx, "alice", put(Some("media")), None)
         .await
         .unwrap();
     assert_eq!(w.segments("alice"), 3, "same connection keeps it");
-    engine::save_settings(&w.db, &w.fx, "alice", put(None))
+    engine::save_settings(&w.db, &w.fx, "alice", put(None), None)
         .await
         .unwrap();
     assert_eq!(w.segments("alice"), 0);
@@ -2387,6 +2393,95 @@ async fn unsuccessful_file_embed_rechecks_access_and_preserves_error_kinds() {
 }
 
 #[tokio::test]
+async fn selection_transaction_rechecks_personal_grant_before_purging() {
+    use crate::providers::{Capability, store as providers};
+    let w = World::new();
+    let space = w.space("bob", &["alice"]);
+    w.upload(
+        "a",
+        "alice",
+        None,
+        "a.txt",
+        "text/plain",
+        INVOICE_DOC.into(),
+    );
+    w.index("alice", "a").await.unwrap();
+    let segments = w.segments("alice");
+    assert!(segments > 0);
+    let grant = upstream::grant_check("alice".into());
+    let row = providers::Row {
+        id: "pc_0000000000000000000000000000000a".into(),
+        user_id: "bob".into(),
+        name: "Candidate".into(),
+        provider_id: "embeddinggemma-2".into(),
+        base_url: None,
+        model: "google/embeddinggemma-2".into(),
+        is_default: false,
+        sealed_key: None,
+        capability: Capability::Embeddings,
+        config_rev: 0,
+        edit_rev: 0,
+    };
+    let org = providers::Share {
+        visibility: providers::Visibility::Organization,
+        space_ids: vec![],
+    };
+    let spaces = providers::Share {
+        visibility: providers::Visibility::Spaces,
+        space_ids: vec![space.clone()],
+    };
+    {
+        let mut conn = w.db.lock();
+        providers::insert(&mut conn, &row, 10).unwrap();
+        providers::set_share(&mut conn, "bob", &row.id, &org).unwrap();
+        // A usable organization share at preflight can be reduced to a
+        // legitimate Space-only share before the save takes its write lock.
+        assert!(grant(&conn, None, &row.id).is_ok());
+        providers::set_share(&mut conn, "bob", &row.id, &spaces).unwrap();
+        assert!(grant(&conn, Some(&space), &row.id).is_ok());
+    }
+    let attempt = || {
+        store::save_selection(
+            &mut w.db.lock(),
+            "alice",
+            Some(&row.id),
+            Some(Some("media")),
+            Some(1),
+            &grant,
+        )
+        .unwrap()
+    };
+    assert!(matches!(attempt(), store::SelectionWrite::Unusable(_)));
+    assert_eq!(
+        store::selection(&w.db.lock(), "alice").unwrap(),
+        (Some("media".into()), 1)
+    );
+    assert_eq!(w.segments("alice"), segments);
+
+    {
+        let mut conn = w.db.lock();
+        providers::set_share(&mut conn, "bob", &row.id, &org).unwrap();
+        assert!(grant(&conn, None, &row.id).is_ok());
+        providers::delete(&conn, "bob", &row.id).unwrap();
+    }
+    assert!(matches!(attempt(), store::SelectionWrite::Unusable(_)));
+    assert_eq!(
+        store::selection(&w.db.lock(), "alice").unwrap(),
+        (Some("media".into()), 1)
+    );
+    assert_eq!(w.segments("alice"), segments);
+
+    {
+        let mut conn = w.db.lock();
+        providers::insert(&mut conn, &row, 10).unwrap();
+        providers::set_share(&mut conn, "bob", &row.id, &org).unwrap();
+    }
+    assert!(matches!(attempt(), store::SelectionWrite::Saved(2)));
+    assert_eq!(w.segments("alice"), 0);
+    assert!(upstream::grant_check("bob".into())(&w.db.lock(), None, &row.id).is_ok());
+}
+
+#[tokio::test]
 async fn settings_switched_while_the_old_model_runs_stores_nothing() {
     let w = World::new();
     w.upload(
@@ -2399,7 +2494,7 @@ async fn settings_switched_while_the_old_model_runs_stores_nothing() {
     );
     w.engine("alice", false); // the setting names `media`
     hold(&w, |db| {
-        store::set_embedding_id(&mut db.lock(), "alice", Some("media2")).unwrap();
+        store::set_embedding_id(&mut db.lock(), "alice", Some("media2"), None).unwrap();
     });
     match w.index("alice", "a").await {
         Err(LibrarySearchError::Unusable(m)) => assert!(m.contains("nothing was stored")),
@@ -2492,7 +2587,7 @@ fn the_store_transaction_revalidates_everything() {
     let sid = w.space("alice", &["bob"]);
     w.upload("s", "alice", Some(&sid), "s.txt", "text/plain", "x".into());
     let sha = hex(b"x");
-    store::set_embedding_id(&mut w.db.lock(), "bob", Some("media")).unwrap();
+    store::set_embedding_id(&mut w.db.lock(), "bob", Some("media"), None).unwrap();
     let seg = protocol::Segment {
         seq: 0,
         vector: vec![1.0],
@@ -2509,6 +2604,7 @@ fn the_store_transaction_revalidates_everything() {
     let segs = [seg];
     fn new<'a>(conn: &'a str, hash: &'a str) -> store::NewAsset<'a> {
         store::NewAsset {
+            selection_revision: None,
             asset_id: "s",
             source: "",
             space_id: None,
@@ -2594,19 +2690,35 @@ async fn an_old_request_cannot_purge_a_fresh_index() {
         &mut w.db.lock(),
         "alice",
         "personal",
-        "media",
+        ("media", Some(1)),
         &old_fp,
         None,
         old_snapshot,
     )
     .unwrap();
     assert_eq!((n, w.segments("alice")), (0, 3));
-    let n =
-        store::purge_source(&mut w.db.lock(), "alice", "personal", "media", old_snapshot).unwrap();
+    let n = store::purge_source(
+        &mut w.db.lock(),
+        "alice",
+        "personal",
+        ("media", Some(1)),
+        old_snapshot,
+    )
+    .unwrap();
     assert_eq!((n, w.segments("alice")), (0, 3));
     // A request on a connection that is no longer the setting purges nothing.
     let now = store::snapshot(&w.db.lock()).unwrap();
-    let n = store::purge_source(&mut w.db.lock(), "alice", "personal", "media2", now).unwrap();
+    let n =
+        store::purge_source(&mut w.db.lock(), "alice", "personal", ("media2", None), now).unwrap();
+    assert_eq!((n, w.segments("alice")), (0, 3));
+    let n = store::purge_source(
+        &mut w.db.lock(),
+        "alice",
+        "personal",
+        ("media", Some(0)),
+        now,
+    )
+    .unwrap();
     assert_eq!((n, w.segments("alice")), (0, 3));
     // A current request with the current fingerprint keeps them too.
     let fp = w.fx.fingerprints.lock().unwrap()["personal"].clone();
@@ -2614,7 +2726,7 @@ async fn an_old_request_cannot_purge_a_fresh_index() {
         &mut w.db.lock(),
         "alice",
         "personal",
-        "media",
+        ("media", Some(1)),
         &fp,
         None,
         now,

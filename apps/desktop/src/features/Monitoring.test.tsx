@@ -350,7 +350,7 @@ test("an older helper is unsupported; a refused bridge bearer is an error; a lat
   const calls = () => b.calls("/v1/monitoring/events", "GET").length;
   const before = calls();
   b.state.monitoringDelay = LATE_REPLY;
-  await app.press("id:monitoring-refresh");
+  await app.press("id:monitoring-retry");
   await app.waitUntil(() => calls() === before + 1, BEFORE_REPLY);
   await app.waitFor("id:monitoring-loading", BEFORE_REPLY);
   await pick(app, "space:acme");
