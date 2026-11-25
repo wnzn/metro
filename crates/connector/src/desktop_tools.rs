@@ -540,14 +540,14 @@ impl DesktopTools {
         Self::check_account(&api, h).await?;
         match api.role(&h.token, sid).await.map_err(from_call)? {
             None => return Err(ToolsError::new(404, "not_found", "no such Space")),
-            Some(r) if r != "owner" => {
+            Some(hosted::SpaceRole::Member) => {
                 return Err(ToolsError::new(
                     403,
                     "not_owner",
                     "Only the Space owner can turn on local tools.",
                 ));
             }
-            Some(_) => {}
+            Some(hosted::SpaceRole::Owner) => {}
         }
         let existing = {
             let _g = self.store_lock.lock();
@@ -661,9 +661,9 @@ impl DesktopTools {
                 Err(e @ CallError::NotFound(_)) => {
                     // A missing route on an older server is not loss of
                     // ownership. Keep the pairing and worker in that case.
-                    if api.role(&h.token, sid).await.map_err(from_call)?.as_deref() == Some("owner")
-                    {
-                        return Err(from_call(e));
+                    match api.role(&h.token, sid).await.map_err(from_call)? {
+                        Some(hosted::SpaceRole::Owner) => return Err(from_call(e)),
+                        Some(hosted::SpaceRole::Member) | None => {}
                     }
                     detail = Some(
                         "You no longer own this Space, so nothing was revoked on the server; \

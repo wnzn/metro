@@ -4,8 +4,10 @@
 //! No redirects, no proxy (loopback only), bounded bodies, and tokens only in
 //! the `Authorization` header, never in a URL or a log line.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::Secret;
@@ -58,6 +60,13 @@ pub enum SpaceRunner {
     None,
     Dedicated,
     Registered(String),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SpaceRole {
+    Owner,
+    Member,
 }
 
 #[derive(Debug)]
@@ -143,6 +152,25 @@ impl Hosted {
         body: Option<&Value>,
         cap: usize,
     ) -> Result<(u16, reqwest::header::HeaderMap, Value), CallError> {
+        let (status, headers, bytes) = self
+            .send_raw(method, path, bearer, headers, body, cap)
+            .await?;
+        Ok((
+            status,
+            headers,
+            serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+        ))
+    }
+
+    async fn send_raw(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        bearer: &Secret,
+        headers: &[(&str, &str)],
+        body: Option<&Value>,
+        cap: usize,
+    ) -> Result<(u16, reqwest::header::HeaderMap, Vec<u8>), CallError> {
         let mut req = self
             .http
             .request(method, format!("{}{}", self.base, path))
@@ -162,12 +190,7 @@ impl Hosted {
         let bytes = read_capped(resp, cap)
             .await
             .map_err(|_| CallError::Other("the local Metro server sent too much data".into()))?;
-        let v = if bytes.iter().all(u8::is_ascii_whitespace) {
-            Value::Null
-        } else {
-            serde_json::from_slice(&bytes).unwrap_or(Value::Null)
-        };
-        Ok((status, resp_headers, v))
+        Ok((status, resp_headers, bytes))
     }
 
     fn classify(status: u16, v: &Value) -> CallError {
@@ -198,11 +221,10 @@ impl Hosted {
             .ok_or_else(|| CallError::Other("the local Metro server sent no account id".into()))
     }
 
-    /// The caller's role in `sid` (`owner`/`member`), or `None` when the
-    /// Space isn't visible to them.
-    pub async fn role(&self, session: &Secret, sid: &str) -> Result<Option<String>, CallError> {
-        let (s, _, v) = self
-            .send(
+    /// `None` is proof of absence only in a fully valid roster.
+    pub async fn role(&self, session: &Secret, sid: &str) -> Result<Option<SpaceRole>, CallError> {
+        let (s, _, bytes) = self
+            .send_raw(
                 reqwest::Method::GET,
                 "/v1/spaces",
                 session,
@@ -212,18 +234,46 @@ impl Hosted {
             )
             .await?;
         if s != 200 {
-            return Err(Self::classify(s, &v));
+            return Err(Self::classify(
+                s,
+                &serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+            ));
         }
-        let spaces = v
+        // Decode raw JSON so duplicate required fields aren't silently
+        // collapsed by Value. Extra Space metadata is not used for access.
+        #[derive(Deserialize)]
+        struct Roster {
+            spaces: Vec<Entry>,
+        }
+        #[derive(Deserialize)]
+        struct Entry {
+            id: String,
+            role: SpaceRole,
+        }
+        let invalid =
+            || CallError::Other("the local Metro server sent an invalid Space roster".into());
+        // Serde structs also accept positional arrays. Only JSON objects
+        // count as roster entries, regardless of their positional values.
+        let shape: Value = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        if !shape
             .get("spaces")
             .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        Ok(spaces
-            .iter()
-            .find(|sp| sp.get("id").and_then(Value::as_str) == Some(sid))
-            .and_then(|sp| sp.get("role").and_then(Value::as_str))
-            .map(str::to_owned))
+            .is_some_and(|rows| rows.iter().all(Value::is_object))
+        {
+            return Err(invalid());
+        }
+        let roster: Roster = serde_json::from_slice(&bytes).map_err(|_| invalid())?;
+        let mut seen = HashSet::with_capacity(roster.spaces.len());
+        let mut role = None;
+        for sp in &roster.spaces {
+            if !super::store::valid_space_id(&sp.id) || !seen.insert(&sp.id) {
+                return Err(invalid());
+            }
+            if sp.id == sid {
+                role = Some(sp.role);
+            }
+        }
+        Ok(role)
     }
 
     pub async fn space_runner(

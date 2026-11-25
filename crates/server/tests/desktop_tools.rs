@@ -42,6 +42,10 @@ struct Server {
 
 impl Server {
     async fn start() -> Self {
+        Self::start_with(|app| app).await
+    }
+
+    async fn start_with(layer: impl FnOnce(axum::Router) -> axum::Router) -> Self {
         let user = |id: &str, actor: &str| UserIdentity {
             id: id.to_owned(),
             actor: actor.to_owned(),
@@ -67,7 +71,8 @@ impl Server {
             .unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base = format!("http://{}", listener.local_addr().unwrap());
-        tokio::spawn(async move { axum::serve(listener, router(state)).await.unwrap() });
+        let app = layer(router(state));
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         Server {
             base,
             http: reqwest::Client::new(),
@@ -479,6 +484,143 @@ async fn stale_local_confirmation_neither_stops_nor_revokes_the_new_pairing() {
     assert_eq!(st, 200);
     assert_eq!(v["state"], "off");
     assert_eq!(s.claim(&token).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn guarded_revoke_404_needs_a_conclusive_roster_before_local_cleanup() {
+    use axum::extract::Request;
+    use axum::middleware::{Next, from_fn};
+    use axum::response::IntoResponse;
+    use std::sync::Mutex;
+
+    let roster = Arc::new(Mutex::new(None::<(StatusCode, String)>));
+    let writes = Arc::new(Mutex::new(Vec::new()));
+    let fixture = (roster.clone(), writes.clone());
+    let s = Server::start_with(move |app| {
+        app.layer(from_fn(move |req: Request, next: Next| {
+            let (roster, writes) = fixture.clone();
+            async move {
+                let reply = roster.lock().unwrap().clone();
+                if let Some((status, body)) = reply {
+                    let path = req.uri().path();
+                    if req.method() == "GET" && path == "/v1/spaces" {
+                        return (status, body).into_response();
+                    }
+                    if path.starts_with("/v1/spaces/") && path.contains("/runner-token") {
+                        writes
+                            .lock()
+                            .unwrap()
+                            .push((req.method().clone(), path.to_owned()));
+                        return StatusCode::NOT_FOUND.into_response();
+                    }
+                }
+                next.run(req).await
+            }
+        }))
+    })
+    .await;
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("local-tools");
+    let tools = DesktopTools::new(root.clone());
+    let alice = s.hosted(ALICE, "alice");
+    let sid = s.space(ALICE, "legacy-roster").await;
+    assert_eq!(enable(&tools, &alice, &sid).await.0, 200);
+    let before = wait_worker(&tools, &alice, &sid, "online").await;
+    let token = token_of(&root, "alice", &sid);
+    let guarded_disable = |sid: &str, pairing: &Value| {
+        let path = format!("/v1/local-tools/spaces/{sid}/disable-if-current");
+        let body = serde_json::to_vec(
+            &json!({"account_id": "alice", "pairing_revision": pairing["pairing_revision"]}),
+        )
+        .unwrap();
+        let h = alice.clone();
+        let tools = &tools;
+        async move { tools.handle("POST", &path, &body, Some(h)).await }
+    };
+
+    let uncertain = [
+        (StatusCode::OK, "not JSON".to_string()),
+        (StatusCode::OK, "{}".into()),
+        (StatusCode::OK, r#"{"spaces":{}}"#.into()),
+        (
+            StatusCode::OK,
+            format!(r#"{{"spaces":[{{"id":"{sid}"}}]}}"#),
+        ),
+        (
+            StatusCode::OK,
+            format!(r#"{{"spaces":[{{"id":"{sid}","role":"admin"}}]}}"#),
+        ),
+        (
+            StatusCode::OK,
+            format!(r#"{{"spaces":[["{sid}","member"]]}}"#),
+        ),
+        (
+            StatusCode::OK,
+            format!(r#"{{"spaces":[{{"id":"{sid}","role":"owner","role":"member"}}]}}"#),
+        ),
+        (
+            StatusCode::OK,
+            format!(
+                r#"{{"spaces":[{{"id":"{sid}","role":"member"}},{{"id":"{sid}","role":"owner"}}]}}"#
+            ),
+        ),
+        (
+            StatusCode::OK,
+            r#"{"spaces":[{"id":"other","role":"member"},{"id":"other","role":"member"}]}"#.into(),
+        ),
+        (
+            StatusCode::OK,
+            r#"{"spaces":[{"id":"other","role":null}]}"#.into(),
+        ),
+        (StatusCode::SERVICE_UNAVAILABLE, r#"{"spaces":[]}"#.into()),
+        (
+            StatusCode::OK,
+            format!(r#"{{"spaces":[{{"id":"{sid}","role":"owner"}}]}}"#),
+        ),
+    ];
+    for (status, body) in uncertain {
+        *roster.lock().unwrap() = Some((status, body));
+        let (st, _) = guarded_disable(&sid, &before).await;
+        assert_ne!(st, 200);
+        let current = wait_worker(&tools, &alice, &sid, "online").await;
+        assert_eq!(current["pairing_revision"], before["pairing_revision"]);
+        assert_eq!(s.claim(&token).await, StatusCode::NO_CONTENT);
+    }
+    for member in [true, false] {
+        let (sid, active, token) = if member {
+            (sid.clone(), before.clone(), token.clone())
+        } else {
+            *roster.lock().unwrap() = None;
+            let other = s.space(ALICE, "legacy-absent").await;
+            assert_eq!(enable(&tools, &alice, &other).await.0, 200);
+            let active = wait_worker(&tools, &alice, &other, "online").await;
+            let token = token_of(&root, "alice", &other);
+            (other, active, token)
+        };
+        let spaces = if member {
+            json!([{"id": sid, "role": "member"}])
+        } else {
+            json!([{"id": "other", "role": "owner"}])
+        };
+        *roster.lock().unwrap() = Some((StatusCode::OK, json!({"spaces": spaces}).to_string()));
+        let (st, off) = guarded_disable(&sid, &active).await;
+        assert_eq!(st, 200);
+        assert_eq!(off["state"], "off");
+        assert!(
+            off["detail"]
+                .as_str()
+                .unwrap()
+                .contains("nothing was revoked")
+        );
+        assert_eq!(s.claim(&token).await, StatusCode::NO_CONTENT);
+    }
+    let writes = writes.lock().unwrap();
+    assert_eq!(writes.len(), 14);
+    assert!(
+        writes
+            .iter()
+            .all(|(method, path)| *method == "POST" && path.ends_with("/revoke-if-current"))
+    );
 }
 
 #[tokio::test]
