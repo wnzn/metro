@@ -228,10 +228,23 @@ function AttachRunner(props: { runner: RegisteredRunner }) {
 
 function DetachRunner(props: { runner: Extract<SpaceRunner, { kind: "registered" }> }) {
   return (
-    <ConfirmInline testID="space-runner-detach" triggerLabel="Detach…" confirmLabel="Detach runner"
-      message={`This Space stops sending jobs to ${props.runner.name}. Its other Spaces and files stay as they are.`}
-      scopeKey={`${spaceSettingsFor()}:${props.runner.id}`} disabled={busy()}
-      onConfirm={() => void changeRunner({ kind: "detach", id: props.runner.id })} />
+    <If when={props.runner.assignmentRevision} else={<GuardedRemovalUnavailable />}>
+      {(revision) => (
+        <ConfirmInline testID="space-runner-detach" triggerLabel="Detach…" confirmLabel="Detach runner"
+          message={`This Space stops sending jobs to ${props.runner.name}. Its other Spaces and files stay as they are.`}
+          scopeKey={`${spaceSettingsFor()}:${props.runner.id}:${revision()}`} disabled={busy()}
+          onConfirm={() => void changeRunner({ kind: "detach", id: props.runner.id, revision: revision() })} />
+      )}
+    </If>
+  );
+}
+
+function GuardedRemovalUnavailable() {
+  return (
+    <Column gap={1} testID="space-runner-removal-unavailable">
+      <Label variant="caption" color="muted">Safe removal is unavailable for this assignment.</Label>
+      <Action label="Refresh status" variant="ghost" disabled={busy()} onPress={() => void loadRunner()} />
+    </Column>
   );
 }
 
@@ -253,9 +266,13 @@ function DedicatedAndLocalTools() {
                 disabled={busy()} onPress={() => void changeRunner({ kind: "rotate" })} />
             </SettingRow>
             <SettingRow label="Revoke the token" stacked>
-              <ConfirmInline testID="revoke-runner-token" triggerLabel="Revoke…" confirmLabel="Revoke token"
-                message="The dedicated runner stops serving this Space." scopeKey={spaceSettingsFor() ?? undefined}
-                disabled={busy()} onConfirm={() => void changeRunner({ kind: "revoke" })} />
+              <If when={runner()?.assignmentRevision} else={<GuardedRemovalUnavailable />}>
+                {(revision) => (
+                  <ConfirmInline testID="revoke-runner-token" triggerLabel="Revoke…" confirmLabel="Revoke token"
+                    message="The dedicated runner stops serving this Space." scopeKey={`${spaceSettingsFor()}:dedicated:${revision()}`}
+                    disabled={busy()} onConfirm={() => void changeRunner({ kind: "revoke", revision: revision() })} />
+                )}
+              </If>
             </SettingRow>
           </Column>
         </If>

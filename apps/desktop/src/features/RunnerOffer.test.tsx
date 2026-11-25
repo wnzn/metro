@@ -293,7 +293,7 @@ test("a held successful attach reply cannot resurrect a runner after a newer Spa
   expect(creates(f)).toHaveLength(1);
   expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([
     ["POST", `/v1/spaces/${id}/runner/attach-if-empty`],
-    ["DELETE", `/v1/spaces/${id}/runner`],
+    ["POST", `/v1/spaces/${id}/runner/detach-if-current`],
   ]);
   await app.press("id:space-settings-close");
   await app.press("id:nav-settings");

@@ -302,12 +302,28 @@ test("a concurrent dedicated pairing is never replaced, and detach confirms the 
   await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:space-runner-detach");
   await app.press("id:space-runner-detach");
-  w.f.state.attached.set("empty", other.id);
+  // This lands inside the fixture handling the destructive request, after
+  // any reads the desktop could have made for its old confirmation.
+  w.f.state.beforeGuardedDetach = (sid) => { w.f.state.attached.set(sid, other.id); };
   await app.press("id:space-runner-detach:confirm");
   await app.waitFor("id:space-runner-status >> text:Attached · Different runner");
   expect(app.shows("id:manage-error")).toBe(true);
+  expect(app.texts().join(" ")).toContain("Nothing was removed. Review the current runner before confirming again.");
+  expect(app.shows("id:space-runner-detach:confirm")).toBe(false);
   expect(w.f.state.attached.get("empty")).toBe(other.id);
-  expect(w.f.posts().filter((p) => p.path.includes("/runner")).map((p) => p.method)).toEqual(["POST"]);
+  const attempts = () => w.f.posts().filter((p) => p.path.includes("/runner"));
+  expect(attempts().map((p) => [p.method, p.path])).toEqual([
+    ["POST", "/v1/spaces/empty/runner/attach-if-empty"],
+    ["POST", "/v1/spaces/empty/runner/detach-if-current"],
+  ]);
+  const oldRevision = attempts().at(-1)!.body.assignment_revision;
+  w.f.state.beforeGuardedDetach = null;
+  await app.press("id:space-runner-detach");
+  expect(app.texts().join(" ")).toContain("This Space stops sending jobs to Different runner.");
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitFor("id:space-runner-status >> text:No runner");
+  expect(attempts()).toHaveLength(3);
+  expect(attempts().at(-1)!.body.assignment_revision).not.toBe(oldRevision);
 });
 
 test("delayed attach and detach responses cannot overwrite newer actual assignments", async () => {
@@ -324,7 +340,7 @@ test("delayed attach and detach responses cannot overwrite newer actual assignme
     };
   };
   gate("POST", "/v1/spaces/empty/runner/attach-if-empty");
-  gate("DELETE", "/v1/spaces/empty/runner");
+  gate("POST", "/v1/spaces/empty/runner/detach-if-current");
   const app = await signIn(w, "alice", true);
   await openSettingsFor(app, "empty");
   await app.press("id:space-settings-tab:runner");
@@ -345,6 +361,60 @@ test("delayed attach and detach responses cannot overwrite newer actual assignme
   await app.waitFor("id:manage-error");
   expect(app.shows("id:manage-notice")).toBe(false);
   expect(app.shows("id:test-runner")).toBe(true);
+});
+
+test("revoke requires a fresh confirmation after a dedicated token rotates", async () => {
+  const w = spaceWorld();
+  const rotated = "fixture-rotated-dedicated";
+  const app = await signIn(w);
+  await openSettingsFor(app);
+  await app.press("id:space-settings-tab:runner");
+  await app.press("id:space-runner-advanced:toggle");
+  await app.press("id:revoke-runner-token");
+  w.f.state.beforeGuardedDetach = (sid) => { w.f.state.spaces.get(sid)!.runnerToken = rotated; };
+  await app.press("id:revoke-runner-token:confirm");
+  await app.waitFor("id:manage-error");
+  await app.waitFor("id:revoke-runner-token");
+  expect(app.shows("id:revoke-runner-token:confirm")).toBe(false);
+  expect(w.f.state.spaces.get("acme")!.runnerToken).toBe(rotated);
+  expect(app.texts().some((t) => t.includes(rotated))).toBe(false);
+  w.f.state.beforeGuardedDetach = null;
+  await app.press("id:revoke-runner-token");
+  await app.press("id:revoke-runner-token:confirm");
+  await app.waitFor("id:space-runner-status >> text:No runner");
+  const writes = w.f.posts().filter((p) => p.path.includes("/runner"));
+  expect(writes.map((p) => [p.method, p.path])).toEqual([
+    ["POST", "/v1/spaces/acme/runner/detach-if-current"],
+    ["POST", "/v1/spaces/acme/runner/detach-if-current"],
+  ]);
+  expect(writes[0]!.body.assignment_revision).not.toBe(writes[1]!.body.assignment_revision);
+});
+
+test("an old or inconsistent server never gets an unguarded detach", async () => {
+  for (const legacy of [true, false]) {
+    const w = spaceWorld();
+    w.f.addSpace("paired", "Paired", "alice");
+    const r = w.f.addRunner("Existing runner", "personal", "alice");
+    w.f.state.attached.set("paired", r.id);
+    w.f.state.guardedDetachSupported = !legacy;
+    w.f.state.missingGuardedDetachRoute = !legacy;
+    const app = await signIn(w);
+    await openSettingsFor(app, "paired");
+    await app.press("id:space-settings-tab:runner");
+    await app.waitFor("id:space-runner-status >> text:Attached · Existing runner");
+    if (legacy) {
+      await app.waitFor("id:space-runner-removal-unavailable");
+      expect(app.shows("id:space-runner-detach")).toBe(false);
+      expect(w.f.posts()).toEqual([]);
+    } else {
+      await app.press("id:space-runner-detach");
+      await app.press("id:space-runner-detach:confirm");
+      await app.waitFor("id:manage-error");
+      expect(app.texts().join(" ")).toContain("No unguarded removal was attempted.");
+      expect(w.f.posts().map((p) => [p.method, p.path])).toEqual([["POST", "/v1/spaces/paired/runner/detach-if-current"]]);
+    }
+    expect(w.f.state.attached.get("paired")).toBe(r.id);
+  }
 });
 
 test("a dedicated token starts masked and cannot be recovered by reopening Runner", async () => {

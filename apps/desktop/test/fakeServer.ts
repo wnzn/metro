@@ -71,6 +71,9 @@ export function fakeServer() {
     attachIfEmpty: true,
     missingEmptyAttachRoute: false,
     beforeEmptyAttach: null as ((sid: string) => void) | null,
+    guardedDetachSupported: true,
+    missingGuardedDetachRoute: false,
+    beforeGuardedDetach: null as ((sid: string) => void) | null,
     runnerRelease: new Map<string, { presence: Record<string, unknown>; update: Record<string, unknown> }>(),
     rejectRunnerUpdate: new Set<string>(),
     connections: new Map<string, Conn>(),
@@ -189,6 +192,19 @@ export function fakeServer() {
     if (s.runnerToken) return { id: null, name: "Dedicated Space runner", visibility: "dedicated", kind: "dedicated" };
     const r = state.runners.get(state.attached.get(s.id) ?? "");
     return r ? { id: r.id, name: r.name, visibility: r.visibility, kind: "registered" } : null;
+  };
+  // Notice direct fixture changes too; actual fake API mutations call this
+  // on every transition so detach/reattach of the same ID is still an ABA.
+  const assignments = new Map<string, { mark: string; revision: number }>();
+  const assignmentRevision = (s: Space) => {
+    const id = state.attached.get(s.id);
+    const mark = JSON.stringify([s.runnerToken, id, id && state.runners.get(id)?.token]);
+    let current = assignments.get(s.id);
+    if (current?.mark !== mark) {
+      current = { mark, revision: (current?.revision ?? 0) + 1 };
+      assignments.set(s.id, current);
+    }
+    return String(current.revision);
   };
   const addRunner = (name: string, visibility: "personal" | "organization", owner: string) => {
     const r: Runner = { id: `rn${nextId++}`, name, visibility, owner, token: `metro_rt_v2_secret${nextId++}` };
@@ -476,9 +492,11 @@ export function fakeServer() {
         if (req.method === "POST") {
           if (state.attached.has(space.id)) return err(409, "this Space has an attached runner; detach it first");
           space.runnerToken = `secret-runner-token-${nextId++}`;
+          assignmentRevision(space);
           return ok({ token: space.runnerToken });
         }
         space.runnerToken = null;
+        assignmentRevision(space);
         return ok({});
       }
       if (rest === "/runner/attach-if-empty" && req.method === "POST") {
@@ -489,21 +507,40 @@ export function fakeServer() {
         state.beforeEmptyAttach?.(space.id);
         if (space.runnerToken || state.attached.has(space.id)) return err(409, "this Space already has a runner");
         state.attached.set(space.id, runner!.id);
+        assignmentRevision(space);
         return ok({ runner: spaceRunnerJson(space) });
       }
+      if (rest === "/runner/detach-if-current" && req.method === "POST") {
+        if (!state.guardedDetachSupported || state.missingGuardedDetachRoute) return err(404, "unknown route");
+        state.beforeGuardedDetach?.(space.id);
+        if (!space.members.has(user)) return err(404, "no such Space");
+        if (space.owner !== user) return err(403, "only the owner manages the runner");
+        if (!body || typeof body.assignment_revision !== "string") return err(400, "invalid runner assignment revision");
+        const revision = assignmentRevision(space);
+        if (!spaceRunnerJson(space) || revision !== body.assignment_revision) return err(409, "the runner assignment changed");
+        state.attached.delete(space.id);
+        space.runnerToken = null;
+        assignmentRevision(space);
+        return ok(undefined, 204);
+      }
       if (rest === "/runner") {
-        if (req.method === "GET") return ok({ runner: spaceRunnerJson(space) });
+        if (req.method === "GET") {
+          const runner = spaceRunnerJson(space);
+          return ok({ runner, ...(owner && runner && state.guardedDetachSupported ? { assignment_revision: assignmentRevision(space) } : {}) });
+        }
         if (!owner) return err(403, "only the owner manages the runner");
         if (req.method === "PUT") {
           const runner = state.runners.get(body?.runner_id ?? "");
           if (!visibleRunner(runner, user)) return err(404, "no such runner");
           if (space.runnerToken) return err(409, "this Space has a dedicated runner token; revoke it first");
           state.attached.set(space.id, runner!.id);
+          assignmentRevision(space);
           return ok({ runner: spaceRunnerJson(space) });
         }
         if (req.method === "DELETE") {
           state.attached.delete(space.id);
           space.runnerToken = null;
+          assignmentRevision(space);
           return ok(undefined, 204);
         }
       }

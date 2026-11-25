@@ -430,8 +430,9 @@ export async function loadRunnerInventory(): Promise<void> {
 
 type RunnerAction =
   | { kind: "attach"; id: string; installed: boolean }
-  | { kind: "detach"; id: string }
-  | { kind: "issue" | "rotate" | "revoke" };
+  | { kind: "detach"; id: string; revision: string }
+  | { kind: "revoke"; revision: string }
+  | { kind: "issue" | "rotate" };
 
 export async function changeRunner(action: RunnerAction): Promise<void> {
   const api = apiClient();
@@ -445,10 +446,12 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
   const advanced = advancedGeneration;
   const stillConsented = () => live() && (!dedicatedAction || (runnerAdvanced() && advancedGeneration === advanced));
   if (!stillConsented()) return;
+  const guardedRemoval = action.kind === "detach" || action.kind === "revoke";
   const expected = (runner: SpaceRunner | null) =>
     action.kind === "attach" || action.kind === "issue" ? runner === null :
       action.kind === "detach" ? runner?.kind === "registered" && runner.id === action.id : runner?.kind === "dedicated";
   if (!expected(before.runner)) return;
+  if (guardedRemoval && before.runner?.assignmentRevision !== action.revision) return;
   if (action.kind === "attach" && (before.legacy || !runnerInventory()?.attachIfEmpty || !runnerInventory()?.runners.some((r) => r.id === action.id))) return;
   const installed = action.kind === "attach" && action.installed ? snapshotInstalledRunner(action.id) : null;
   if (action.kind === "attach" && action.installed && !installed) return;
@@ -474,18 +477,15 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       pendingWrite = beginSpaceRunnerWrite(sid);
       await api.attachRunnerIfEmpty(sid, action.id);
       if (installed?.isCurrent()) dismissRunnerOffer();
+    } else if (guardedRemoval) {
+      pendingWrite = beginSpaceRunnerWrite(sid);
+      await api.detachRunnerIfCurrent(sid, action.revision);
     } else {
       const current = await refreshAssignment(api, sid, stillConsented, live);
       if (!current || !stillConsented()) return;
       if (!expected(current.runner)) return reject("This Space's runner changed. Nothing was changed by this action.");
       pendingWrite = beginSpaceRunnerWrite(sid);
-      if (action.kind === "detach") {
-        await api.detachRunner(sid);
-      } else if (action.kind === "revoke") {
-        await api.revokeRunnerToken(sid);
-      } else {
-        token = await api.issueRunnerToken(sid);
-      }
+      token = await api.issueRunnerToken(sid);
     }
     if (!writeCurrent()) return;
     // A delayed write reply describes history, not the current assignment.
@@ -514,11 +514,20 @@ export async function changeRunner(action: RunnerAction): Promise<void> {
       return;
     }
     // Don't echo server bodies from runner mutations, including token endpoints.
-    reject(error instanceof ApiError && error.status === 409
-      ? "This Space already has a runner or its assignment changed. No replacement was made."
-      : error instanceof ApiError && error.kind === "forbidden"
-        ? "Only the owner can change this."
-        : "The server did not confirm the runner change. Check its status before trying again.");
+    if (guardedRemoval && error instanceof ApiError && error.status === 409) {
+      // Hide the old revision immediately; a new confirmation must show a
+      // fresh assignment, not the one the server already rejected.
+      runnerSource.set(null);
+      reject("The runner assignment changed. Nothing was removed. Review the current runner before confirming again.");
+    } else if (guardedRemoval && error instanceof ApiError && (error.status === 404 || error.status === 405)) {
+      reject("The guarded removal route is unavailable. No unguarded removal was attempted.");
+    } else {
+      reject(error instanceof ApiError && error.status === 409
+        ? "This Space already has a runner or its assignment changed. No replacement was made."
+        : error instanceof ApiError && error.kind === "forbidden"
+          ? "Only the owner can change this."
+          : "The server did not confirm the runner change. Check its status before trying again.");
+    }
     await loadRunner();
   } finally {
     if (page()) runnerBusy.set(null);

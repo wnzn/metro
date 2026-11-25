@@ -19,6 +19,104 @@ const BOB: &str = "bob-token";
 const CAROL: &str = "carol-token";
 const PROTOCOL: &str = "X-Metro-Runner-Protocol";
 
+#[tokio::test]
+async fn guarded_detach_rejects_replacement_aba_and_dedicated_rotation() {
+    let s = Server::start().await;
+    let a = s.space(ALICE, "Guarded").await;
+    let b = s.space(ALICE, "Unchanged sibling").await;
+    s.add(ALICE, &a, "bob").await;
+    let (first, _) = s.register(ALICE, "First", "personal").await;
+    let (second, _) = s.register(ALICE, "Second", "personal").await;
+    assert_eq!(s.attach_if_empty(ALICE, &a, &first).await.0, StatusCode::OK);
+    assert_eq!(
+        s.attach_if_empty(ALICE, &b, &second).await.0,
+        StatusCode::OK
+    );
+    let first_revision = s.runner_snapshot(ALICE, &a).await["assignment_revision"].clone();
+    assert!(first_revision.is_string());
+    assert!(
+        s.runner_snapshot(BOB, &a)
+            .await
+            .get("assignment_revision")
+            .is_none()
+    );
+    assert_eq!(
+        s.guarded_detach(BOB, &a, &first_revision).await,
+        StatusCode::FORBIDDEN
+    );
+    assert_eq!(
+        s.guarded_detach(CAROL, &a, &first_revision).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &json!(1)).await,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &json!("01")).await,
+        StatusCode::BAD_REQUEST
+    );
+
+    // Old clients may still replace a registered runner using PUT.
+    assert_eq!(s.attach(ALICE, &a, &second).await.0, StatusCode::OK);
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &first_revision).await,
+        StatusCode::CONFLICT
+    );
+    let replacement = s.runner_snapshot(ALICE, &a).await;
+    assert_eq!(replacement["runner"]["id"], second);
+    let second_revision = &replacement["assignment_revision"];
+    let legacy = format!("/v1/spaces/{a}/runner");
+
+    // Same runner id, different assignment (including detach by an old client).
+    assert_eq!(s.delete(ALICE, &legacy).await.0, StatusCode::NO_CONTENT);
+    assert_eq!(
+        s.attach_if_empty(ALICE, &a, &second).await.0,
+        StatusCode::OK
+    );
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, second_revision).await,
+        StatusCode::CONFLICT
+    );
+    let reattached = s.runner_snapshot(ALICE, &a).await;
+    assert_eq!(reattached["runner"]["id"], second);
+    assert_ne!(&reattached["assignment_revision"], second_revision);
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &reattached["assignment_revision"])
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(s.runner_snapshot(ALICE, &b).await["runner"]["id"], second);
+
+    // A registered confirmation cannot remove a later dedicated pairing,
+    // and a dedicated confirmation cannot revoke a rotated credential.
+    assert_eq!(s.dedicated_token(ALICE, &a).await.0, StatusCode::OK);
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &reattached["assignment_revision"])
+            .await,
+        StatusCode::CONFLICT
+    );
+    let dedicated = s.runner_snapshot(ALICE, &a).await;
+    assert_eq!(dedicated["runner"]["kind"], "dedicated");
+    assert_eq!(s.dedicated_token(ALICE, &a).await.0, StatusCode::OK);
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &dedicated["assignment_revision"])
+            .await,
+        StatusCode::CONFLICT
+    );
+    let rotated = s.runner_snapshot(ALICE, &a).await;
+    assert_eq!(rotated["runner"]["kind"], "dedicated");
+    assert!(rotated.get("token").is_none());
+    assert_eq!(
+        s.guarded_detach(ALICE, &a, &rotated["assignment_revision"])
+            .await,
+        StatusCode::NO_CONTENT
+    );
+    let empty = s.runner_snapshot(ALICE, &a).await;
+    assert!(empty["runner"].is_null());
+    assert!(empty.get("assignment_revision").is_none());
+}
+
 struct FakeAuth(HashMap<String, UserIdentity>);
 
 impl HumanAuth for FakeAuth {
@@ -179,6 +277,22 @@ impl Server {
             json!({"runner_id": runner}),
         )
         .await
+    }
+
+    async fn runner_snapshot(&self, user: &str, sid: &str) -> Value {
+        let (status, view) = self.get(user, &format!("/v1/spaces/{sid}/runner")).await;
+        assert_eq!(status, StatusCode::OK);
+        view
+    }
+
+    async fn guarded_detach(&self, user: &str, sid: &str, revision: &Value) -> StatusCode {
+        self.post(
+            user,
+            &format!("/v1/spaces/{sid}/runner/detach-if-current"),
+            json!({"assignment_revision": revision}),
+        )
+        .await
+        .0
     }
 
     async fn demo(&self, token: &str, space: &str) -> StatusCode {

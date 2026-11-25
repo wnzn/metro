@@ -127,9 +127,10 @@ export type RegisteredRunner = {
  * Space's own dedicated (legacy) token, or nobody. Attached says nothing
  * about the runner being online.
  */
-export type SpaceRunner =
+export type SpaceRunner = (
   | { kind: "registered"; id: string; name: string; visibility: RunnerVisibility }
-  | { kind: "dedicated"; name: string };
+  | { kind: "dedicated"; name: string }
+) & { assignmentRevision?: string };
 
 /** Where a provider's inference runs: in the user's own metro-connector, or from the server. */
 export type ProviderExecution = "device" | "server";
@@ -549,7 +550,10 @@ export function createClient(options: ClientOptions) {
     async getSpaceRunner(spaceId: string): Promise<SpaceRunner | null> {
       const data = await request("GET", `${sp(spaceId)}/runner`);
       if (!isObject(data) || !("runner" in data)) throw new ApiError("protocol", "GET …/runner did not return { runner }.");
-      return toSpaceRunner(data.runner);
+      const runner = toSpaceRunner(data.runner);
+      const revision = data.assignment_revision;
+      return runner && typeof revision === "string" && /^(0|[1-9][0-9]{0,18})$/.test(revision)
+        ? { ...runner, assignmentRevision: revision } : runner;
     },
 
     async attachRunner(spaceId: string, runnerId: string): Promise<SpaceRunner | null> {
@@ -574,9 +578,9 @@ export function createClient(options: ClientOptions) {
       return pending;
     },
 
-    /** Detaches the Space's registered runner (or revokes its dedicated token). */
-    async detachRunner(spaceId: string): Promise<void> {
-      await request("DELETE", `${sp(spaceId)}/runner`);
+    /** Removes only the assignment the owner confirmed. Never falls back to DELETE. */
+    async detachRunnerIfCurrent(spaceId: string, revision: string): Promise<void> {
+      await request("POST", `${sp(spaceId)}/runner/detach-if-current`, { assignment_revision: revision });
     },
 
     // ---- personal model connections
