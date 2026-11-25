@@ -282,6 +282,22 @@ async fn missing_binary_is_a_clear_error() {
     assert_eq!(host.state(), LocalState::Failed);
 }
 
+#[tokio::test]
+async fn exiting_child_is_detected_during_readiness_wait() {
+    let dir = scratch();
+    let bin = dir.path().join("metro-server");
+    std::fs::write(&bin, "#!/bin/sh\nexit 3\n").unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let root = dir.path().join("local");
+    let host = LocalServer::new(bin, root.clone());
+
+    let err = host.open().await.err().unwrap();
+    assert!(err.as_str().contains("stopped while starting"), "{err}");
+    assert_eq!(host.state(), LocalState::Failed);
+    assert!(host.current().is_none());
+    assert!(!root.join("run/dev-users.json").exists());
+}
+
 /// The launcher dying without `shutdown` (SIGKILL) leaves no server behind,
 /// and the developer's own METRO_* settings never reach the local server.
 #[tokio::test(flavor = "multi_thread")]
