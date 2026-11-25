@@ -376,7 +376,7 @@ async function refreshAssignment(
     const next = await readRunner(api, sid, !!options?.exact);
     if (!valid()) return undefined;
     batch(() => {
-      observation.publish(next.runner, options?.allowFolderAdd?.(next.runner) === true);
+      observation.publish(next.runner, options?.allowFolderAdd?.(next.runner) === true, !next.legacy);
       if (show()) {
         runnerSource.set({ sid, legacy: next.legacy, guardedTokenChanges: next.guardedTokenChanges });
         runnerError.set(null);

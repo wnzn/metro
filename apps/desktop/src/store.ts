@@ -39,7 +39,7 @@ import type { Client, Me, Member, Mention, Room, RoomEvent, Run, Space, TurnMode
 export { ApiError };
 import { DEFAULT_SERVER_URL, parseServerUrl, serverHost } from "./api/serverUrl";
 import { plainHttpAccepted } from "./plainHttp";
-import { acceptSpaceRunnerSummary, clearSpaceRunnerOrder, nextSpaceRunnerStamp } from "./spaceRunnerOrder";
+import { acceptSpaceRunnerSummary, clearSpaceRunnerOrder, hasNewerSpaceAccessProof, nextSpaceRunnerStamp, recordSpaceAccessProof } from "./spaceRunnerOrder";
 
 export type { Member, Mention, Room, RoomEvent, Run, Space };
 
@@ -585,6 +585,7 @@ export async function createSpace(nameInput: string, options?: CreateSpaceOption
     const fromOriginalForm = source === createSpaceContext && !!options?.formIsCurrent();
     const expectedContext = createSpaceContext + 1; // enterSpace clears transients once
     const spaceOK = guard(space.id);
+    recordSpaceAccessProof(space.id, nextSpaceRunnerStamp());
     spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
     await enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
     kick();
@@ -1438,14 +1439,17 @@ async function refreshLists(force = false) {
   if (!ok()) return;
   lastListsRefresh = Date.now();
   const known = new Set(list.map((s) => s.id));
-  const lost = spaces().filter((s) => !known.has(s.id));
+  const omitted = spaces().filter((s) => !known.has(s.id));
+  const retained = omitted.filter((s) => hasNewerSpaceAccessProof(s.id, runnerStamp));
+  for (const space of retained) known.add(space.id);
+  const lost = omitted.filter((s) => !known.has(s.id));
   for (const space of lost) purgeSpace(space.id, true);
   const previousSpaces = new Map(spaces().map((s) => [s.id, s]));
-  spaces.set(list.map((space) => {
+  spaces.set([...list.map((space) => {
     const previous = previousSpaces.get(space.id);
     const accepted = acceptSpaceRunnerSummary(space.id, runnerStamp);
     return previous && !accepted ? { ...space, runnerPaired: previous.runnerPaired } : space;
-  }));
+  }), ...retained]);
   const active = activeSpaceId();
   if (active && !known.has(active)) {
     const lostSpace = lost.find((s) => s.id === active);

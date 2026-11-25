@@ -1,7 +1,7 @@
 import { batch, signal } from "nsh";
 import type { SpaceRunner } from "./api/client";
 import { onSessionEnd, sessionGuard, setRunnerPaired } from "./store";
-import { clearSpaceRunnerOrder, isSpaceRunnerStampCurrent, nextSpaceRunnerStamp, recordSpaceRunnerStamp, spaceRunnerExactPending } from "./spaceRunnerOrder";
+import { clearSpaceRunnerOrder, isSpaceRunnerStampCurrent, nextSpaceRunnerStamp, recordSpaceAccessProof, recordSpaceRunnerStamp, spaceRunnerExactPending } from "./spaceRunnerOrder";
 
 /** Missing means not observed; null is an observed empty assignment. */
 export const spaceRunners = signal<Record<string, SpaceRunner | null>>({});
@@ -42,9 +42,10 @@ export function beginSpaceRunnerObservation(sid: string) {
   const isCurrent = () => inScope() && isSpaceRunnerStampCurrent(sid, stamp);
   return {
     isCurrent,
-    publish(runner: SpaceRunner | null, allowFolderAdd = true) {
+    publish(runner: SpaceRunner | null, allowFolderAdd = true, exact = true) {
       if (!isCurrent()) return false;
       recordSpaceRunnerStamp(sid, stamp);
+      if (exact) recordSpaceAccessProof(sid, stamp);
       batch(() => {
         spaceRunners.set({ ...spaceRunners(), [sid]: runner });
         setRunnerPaired(sid, runner !== null);

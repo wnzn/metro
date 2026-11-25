@@ -542,6 +542,30 @@ test("a held successful attach reply cannot resurrect a runner after a newer Spa
   expect(app.shows(`id:installed-runner-space:${id}`)).toBe(false);
 });
 
+test("a held pre-create Space list cannot purge the successfully attached new Space", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  const app = await launch(fixture(f, r.id), { manual: true });
+  await signIn(app);
+  const list = f.answerLate("/v1/spaces", TOKENS.alice!, 3000);
+  await app.clock!.runFor(11_000);
+  await app.waitUntil(() => list.arrived() === 1); // Snapshot predates the Space.
+  f.answerLate("/v1/spaces", TOKENS.alice!, 0); // The create preflight sees live membership.
+  await startSidebar(app, "Survives the old list");
+  await app.press("id:create-space");
+  await app.waitFor(success);
+  const id = space(f, "Survives the old list").id;
+  expect(f.state.attached.get(id)).toBe(r.id);
+  await app.clock!.runFor(3000);
+  await app.waitFor(`id:space:${id}`);
+  await app.waitFor("id:runner-state >> text:Runner attached");
+
+  // The protection is ordered, not a permanent pin on a created Space.
+  f.state.spaces.delete(id);
+  await app.clock!.runFor(11_000);
+  await app.waitFor(`id:space:${id}`, { state: "gone" });
+});
+
 test("the follow-up read also detects a newer assignment made outside this app", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");
