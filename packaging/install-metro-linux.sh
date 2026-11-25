@@ -219,14 +219,42 @@ run_privileged_install() { # $1 = package manager command (fixed list)
     $prefix $1 || die "the package manager failed; nothing was installed into $root"
 }
 
+# ---------------------------------------------------------------- in-app updates
+# The Metro app updates itself too: it journals each step in
+# $root/.update.json and holds $root/.lock with an owner file while it
+# stages. This script never interrupts a running in-app update.
+JOURNAL=.update.json
+
+journal_field() { # $1 = key: the app writes compact JSON ("key":"value")
+    sed -n "s/.*\"$1\":\"\([A-Za-z0-9._-]*\)\".*/\1/p" "$root/$JOURNAL" | head -n 1
+}
+
+refuse_during_in_app_update() {
+    [ -f "$root/$JOURNAL" ] || return 0
+    phase=$(journal_field phase)
+    case "$phase" in
+        staged|committed|failed) ;; # finished or only prepared: this install supersedes it
+        trial|committing)
+            die "Metro is in the middle of updating itself to $(journal_field to). Let it finish, or close Metro and start it once to complete or undo the update, then run this again" ;;
+        *) die "$root/$JOURNAL has an unknown in-app update state; start Metro once, then run this again" ;;
+    esac
+}
+
+lock_busy() { # why $root/.lock exists
+    if [ -f "$root/.lock/owner" ] && grep -q '"by":"metro-desktop"' "$root/.lock/owner" 2>/dev/null; then
+        die "Metro is preparing an in-app update right now (it holds $root/.lock). Wait for it to finish, then run this again"
+    fi
+    die "another install is running (or a previous one crashed: remove $root/.lock and retry)"
+}
+
 # ---------------------------------------------------------------- install
 lock() {
     mkdir -p -- "$root"
     if [ -e "$root/current" ] || [ -n "$(ls -A -- "$root" 2>/dev/null)" ]; then
         [ -f "$root/$MARK" ] || die "$root exists but was not created by this installer; refusing to change it"
     fi
-    mkdir -- "$root/.lock" 2>/dev/null ||
-        die "another install is running (or a previous one crashed: remove $root/.lock and retry)"
+    refuse_during_in_app_update
+    mkdir -- "$root/.lock" 2>/dev/null || lock_busy
     # On failure before anything was installed, leave no trace behind.
     trap 'rm -rf -- "$root/.lock" ${stage:+"$stage"}; [ -L "$root/current" ] || { rm -f -- "$root/$MARK"; rmdir -- "$root" 2>/dev/null; }' EXIT
     trap 'exit 130' INT TERM
@@ -298,6 +326,8 @@ install_app() {
         [ -e "$other" ] || continue
         [ "$other" = "$root/versions/$version" ] || rm -rf -- "$other"
     done
+    # A staged or finished in-app update is superseded (its files are gone).
+    rm -f -- "$root/$JOURNAL"
 
     if [ "$menu" = 1 ]; then
         if [ -x "$root/versions/$version/install-desktop" ]; then
@@ -324,7 +354,8 @@ uninstall_app() {
     [ -d "$root" ] || { say "Metro is not installed in $root."; return 0; }
     [ -f "$root/$MARK" ] || die "$root was not created by this installer; refusing to remove it"
     stage=
-    mkdir -- "$root/.lock" 2>/dev/null || die "an install is running (or crashed: remove $root/.lock)"
+    refuse_during_in_app_update
+    mkdir -- "$root/.lock" 2>/dev/null || lock_busy
     if [ -x "$root/current/install-desktop" ]; then
         "$root/current/install-desktop" --uninstall >/dev/null || say "warning: could not remove the applications-menu entry"
     fi

@@ -199,6 +199,41 @@ class DesktopInstallerTests(unittest.TestCase):
         self.assertEqual((self.data / "desktop.json").read_text(), "keep")
         self.assertEqual(self.box.calls(), [])  # no package manager, sudo or systemctl
 
+    def test_in_app_updates_are_never_clobbered(self):
+        self.box.run(DESKTOP, "install", "--archive", self.archive(), check=True)
+        journal = self.app_root / ".update.json"
+        b = self.archive("0.3.1")
+        for phase in ("trial", "committing"):
+            journal.write_text(json.dumps({"version": 1, "id": "ab12", "from": "0.3.0", "to": "0.3.2", "phase": phase},
+                                          separators=(",", ":")))
+            for args in (("update", "--archive", b), ("uninstall",)):
+                r = self.box.run(DESKTOP, *args)
+                self.assertNotEqual(r.returncode, 0, (phase, args))
+                self.assertIn("in the middle of updating itself to 0.3.2", r.stderr, (phase, args))
+            self.assertEqual(os.readlink(self.app_root / "current"), "versions/0.3.0")
+            self.assertTrue(journal.exists())
+        journal.write_text('{"phase":"exploded"}')
+        self.assertIn("unknown in-app update state", self.box.run(DESKTOP, "update", "--archive", b).stderr)
+        # The app holding the lock while it stages.
+        journal.unlink()
+        lock = self.app_root / ".lock"
+        lock.mkdir()
+        (lock / "owner").write_text('{"by":"metro-desktop","pid":1,"started_at":1}')
+        r = self.box.run(DESKTOP, "update", "--archive", b)
+        self.assertIn("preparing an in-app update right now", r.stderr)
+        self.assertTrue(lock.is_dir(), "the app's lock is left alone")
+        self.assertIn("preparing an in-app update right now", self.box.run(DESKTOP, "uninstall").stderr)
+        (lock / "owner").unlink()
+        self.assertIn("another install is running", self.box.run(DESKTOP, "update", "--archive", b).stderr)
+        shutil.rmtree(lock)
+        # A staged (not started) in-app update is superseded and its journal removed.
+        (self.app_root / "versions/0.3.2").mkdir()
+        journal.write_text('{"version":1,"id":"ab12","from":"0.3.0","to":"0.3.2","phase":"staged"}')
+        self.box.run(DESKTOP, "update", "--archive", b, check=True)
+        self.assertEqual(os.readlink(self.app_root / "current"), "versions/0.3.1")
+        self.assertFalse(journal.exists())
+        self.assertFalse((self.app_root / "versions/0.3.2").exists())
+
     def test_update_requires_install_and_old_archives_without_menu_script(self):
         # Like the early 0.2.0 candidates: no menu script, no local_runner capability.
         a = self.archive(files=desktop_files(with_menu=False), fields={})
@@ -690,6 +725,25 @@ class MacosInstallerTests(unittest.TestCase):
             r = box.run(MACOS, "install", "--archive", a)
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("for macOS", r.stderr)
+
+
+class WindowsInAppUpdateGuardTests(unittest.TestCase):
+    """Static checks (pwsh isn't needed): install and uninstall check the
+    journal and the app's lock owner before changing anything."""
+
+    def test_guard_runs_before_any_change(self):
+        text = WINDOWS.read_text()
+        install = text[text.index("function Install-Metro {"):text.index("function Uninstall-Metro {")]
+        uninstall = text[text.index("function Uninstall-Metro {"):]
+        self.assertLess(install.index("Assert-NoInAppUpdate"), install.index("New-Item -ItemType Directory -Path $lock"))
+        self.assertIn("Fail (Get-LockBusyMessage $lock)", install)
+        self.assertLess(uninstall.index("Assert-NoInAppUpdate"), uninstall.index("Remove-Item"))
+        self.assertIn("Get-LockBusyMessage $lock", uninstall)
+        guard = text[text.index("function Assert-NoInAppUpdate"):text.index("function Get-LockBusyMessage")]
+        self.assertIn("@('trial', 'committing')", guard)
+        self.assertIn('"by":"metro-desktop"', text)
+        self.assertLess(install.index("Remove-Item -LiteralPath (Join-Path $Root '.update.json')"),
+                        install.index("Keep a copy of this script"))
 
 
 @unittest.skipUnless(shutil.which("pwsh"), "PowerShell 7 (pwsh) is not installed")

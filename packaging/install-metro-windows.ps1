@@ -182,6 +182,30 @@ function Get-ShortcutTarget([string] $Path) {
     return (New-Object -ComObject WScript.Shell).CreateShortcut($Path).TargetPath
 }
 
+# The Metro app updates itself too: it journals each step in
+# $Root\.update.json and holds $Root\.lock with an owner file while it
+# stages. This script never interrupts a running in-app update.
+function Assert-NoInAppUpdate {
+    $journal = Join-Path $Root '.update.json'
+    if (-not (Test-Path -LiteralPath $journal -PathType Leaf)) { return }
+    $j = $null
+    try { $j = Get-Content -LiteralPath $journal -Raw | ConvertFrom-Json } catch { $j = $null }
+    if ($null -eq $j -or -not ($j.phase -in @('staged', 'trial', 'committing', 'committed', 'failed'))) {
+        Fail "$journal has an unknown in-app update state; start Metro once, then run this again"
+    }
+    if ($j.phase -in @('trial', 'committing')) {
+        Fail "Metro is in the middle of updating itself to $($j.to). Let it finish, or close Metro and start it once to complete or undo the update, then run this again"
+    }
+}
+
+function Get-LockBusyMessage([string] $Lock) {
+    $owner = Join-Path $Lock 'owner'
+    if ((Test-Path -LiteralPath $owner -PathType Leaf) -and ((Get-Content -LiteralPath $owner -Raw) -match '"by":"metro-desktop"')) {
+        return "Metro is preparing an in-app update right now (it holds $Lock). Wait for it to finish, then run this again"
+    }
+    return "another install is running (or a previous one crashed: remove $Lock and retry)"
+}
+
 function Install-Metro {
     if (-not $Archive) { Fail '-Archive is required' }
     if (-not (Test-Path -LiteralPath $Archive -PathType Leaf)) { Fail "archive not found: $Archive" }
@@ -213,9 +237,10 @@ function Install-Metro {
     if ((Get-ChildItem -LiteralPath $Root -Force | Measure-Object).Count -gt 0 -and -not (Test-Path -LiteralPath (Join-Path $Root $Mark))) {
         Fail "$Root exists but was not created by this installer; refusing to change it"
     }
+    Assert-NoInAppUpdate
     $lock = Join-Path $Root '.lock'
     try { New-Item -ItemType Directory -Path $lock -ErrorAction Stop | Out-Null }
-    catch { Fail "another install is running (or a previous one crashed: remove $lock and retry)" }
+    catch { Fail (Get-LockBusyMessage $lock) }
     $stage = Join-Path $Root ('.stage.' + [Guid]::NewGuid().ToString('N'))
     try {
         Set-Content -LiteralPath (Join-Path $Root $Mark) -Value "Metro desktop per-user install (managed by $Prog). Your data is in $UserData." -Encoding UTF8
@@ -254,6 +279,8 @@ function Install-Metro {
             if ($d.Name -ne $version) { Remove-Item -LiteralPath $d.FullName -Recurse -Force }
         }
         if ($old) { Remove-Item -LiteralPath $old -Recurse -Force }
+        # A staged or finished in-app update is superseded (its files are gone).
+        Remove-Item -LiteralPath (Join-Path $Root '.update.json') -Force -ErrorAction SilentlyContinue
 
         # Keep a copy of this script for the "Installed apps" uninstall entry.
         $self = Join-Path $Root 'install-metro-windows.ps1'
@@ -307,6 +334,9 @@ function Uninstall-Metro {
     if (Test-Path -LiteralPath $Root) {
         if (-not (Test-Path -LiteralPath (Join-Path $Root $Mark))) { Fail "$Root was not created by this installer; refusing to remove it" }
         if (Test-Running) { Fail 'Metro is running; close it first' }
+        Assert-NoInAppUpdate
+        $lock = Join-Path $Root '.lock'
+        if (Test-Path -LiteralPath $lock) { Fail (Get-LockBusyMessage $lock) }
     }
     $lnk = Get-ShortcutPath
     # Only this script's own shortcut; another installer's (such as the MSI's) stays.
