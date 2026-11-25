@@ -141,8 +141,8 @@ This was local source inspection, not a live provider or retention test.
   is remembered for that page version. Say explicitly that it also
   covers other buttons in the version.
 
-See the following entry for the later source cutoff and outstanding UX
-review items.
+The entries below distinguish the later UX integration from this
+historical review.
 
 ## Source only: interim gate and startup evidence
 
@@ -176,33 +176,50 @@ review items.
   Each room fixture logged one separate bridge status read. These
   are controlled fixture observations, not native launch or live
   network timings, and not measurements of `cf5fd97` or `2cb1beb`.
-- **Docs cutoff, `2cb1bebf55f06a168161404c1496fd9f20442a93`.**
-  The [source preview](next-source.md) was advanced after checking the
+- **Pre-UX docs cutoff, `2cb1bebf55f06a168161404c1496fd9f20442a93`.**
+  The source preview was advanced after checking the
   merged Space settings, guarded runner and token routes, mentions and
   Dispatch, sender notices, startup, and Space deletion code. The
   docs lane verified the local 0.4.0 tag and kept the published release
   record unchanged. It ran local Markdown/link and diff checks only.
 
-**Open after the full UX review of `2cb1beb`:** small-window startup
-HTTP consent, live bulk runner selection, the in-app Space deletion
-warning, retargeting a nonempty **Follow up** draft, reviewing other
-actions covered by Page consent, and web activity labels for keys and
-limits. The docs describe the behavior at this cutoff, not the fixes
-under way. The admin browser fixture did not yield a usable result in
-that UX review.
+The full UX review at `2cb1beb` identified the issues addressed by the
+later UX integration below. The admin browser fixture in that review did
+not yield a usable result; the backend gate's mocked Chromium result is
+a separate run.
 
 **Pre-UX desktop check at `2cb1beb`: 862/863 passed.** The offline full
 NSH run and an isolated rerun both failed the same stale selector in
 [`Activity.test.tsx`](../apps/desktop/src/features/activity/Activity.test.tsx):
 it expected the whole `@agent` question in one text node, but the
 renderer split the mention from the message text. This is not a
-passing desktop gate. Rerun the full suite after the UX fixes merge.
+passing desktop gate.
 
-**Final acceptance pending.** The backend receipt below is separate.
-Record the passing desktop gate, UX fixes and combined results
-against their exact commits after independent verification. Don't add
-interim totals to the final matrix, or change published instructions
-until publication is recorded.
+## Source only: reviewed UX integration at b444379
+
+The [source preview](next-source.md) now describes
+`b44437956e73f2eaa6e8a4d62102352139fa67d2`. This local integration
+includes the reviewed startup HTTP consent, runner selection and Space
+deletion warning, exact **Follow up** confirmation and verification,
+Page version approval, and Web Activity wording. It also updates the
+stale Activity selector for text split across mention spans.
+
+- **Scoped desktop evidence:** The startup fix author checked the
+  startup consent fixture offline in GTK/Xvfb at **720×480** and
+  **1280×800** on `4f37cdeb9845297c607ac149b4467a34913f8eb3`.
+  Scoped offline headless NSH checks and reviews covered the desktop
+  changes on their respective lanes. These are not a full desktop
+  run on `b444379`, a screen-reader check, or native Windows verification.
+- **Backend continuity:** The backend, workflows and backend test
+  files are unchanged from `2cb1beb`; `crates/` still has tree
+  `7242f3cb5a77486e51b43c3cad864499737572bb`. The bounded backend
+  result below remains attributed to `2cb1beb`; it was not rerun
+  for this docs update.
+
+**Final acceptance pending.** Record the full desktop rerun at its
+exact commit once its receipt is verified, then record the combined
+results and exceptions. This entry is not a passing desktop gate or
+release sign-off.
 
 ## Source only: bounded backend gate at 2cb1beb
 
@@ -249,7 +266,7 @@ gate at `141a89f`, a new desktop result, or release sign-off.
 images; native Windows or macOS installs and signing; hosted CI or an
 actual release run; live auth, providers, signing or updates; live
 hourly recurrence; the media-reference e2e; or the separate desktop,
-TUI and UI matrices. Desktop acceptance and UX fixes remain pending.
+TUI and UI matrices.
 
 ## Source only: updater lane and reviewed integration (2026-11-25, local)
 

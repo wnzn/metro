@@ -1,6 +1,6 @@
 # In the source, not released
 
-This guide describes the Metro source at `2cb1beb`. None of the changes
+This guide describes the Metro source at `b444379`. None of the changes
 below are in the published [Metro 0.4.0][release]. The screens and API
 changes are a preview, not instructions for 0.4.0; wait for release files
 that include them. For the current downloads, see [Install](install.md).
@@ -82,6 +82,12 @@ draft. Every member gets these pages:
 open Space room. People who can read that room can see it; it isn't
 private to the person who opened Settings.
 
+Under **General → Danger zone**, **Delete Space…** warns that deletion
+is permanent and includes Space Pages, their history and drafts. Only
+the owner can delete the Space, and they must type its exact name.
+Unlike [deleting an individual Page](pages.md#deleting-pages-and-spaces),
+there is no Trash recovery.
+
 ### Guarded runner changes
 
 On **Space settings → Runner**, assignment and online status are separate.
@@ -134,6 +140,10 @@ source changes do not alter the 0.4.0 [deployment instructions](deploy.md).
   also requires confirmation if the app cannot tell that the route is
   direct. The choice is for that exact server address and is remembered
   with a saved server; forgetting the server removes the choice.
+  On the startup connection screen, the form scrolls to reveal the
+  warning and both actions in short windows. Focus moves to **Cancel**.
+  **Cancel** or Escape returns focus to the field or button that opened
+  the warning. **Connect anyway** explicitly proceeds.
 - **Proxies:** The desktop keeps your proxy settings and only adds exact
   loopback entries to its exemptions. It does not silently add tailnet
   hosts or bypass your proxy for ordinary hosts. If your environment uses
@@ -175,8 +185,11 @@ along with the personal and organization runner lists.
   the sidebar can offer to attach it. **Choose Spaces…** opens
   **Settings → Runners → Spaces without a runner**; **Not now** dismisses
   the offer for this account and server without changing any Space.
-  The eligible list can change while open. Review the checked Spaces
-  just before pressing **Attach** to make the change.
+  The first verified list shown in a Runners visit starts checked.
+  Newly eligible Spaces appear unchecked. If a Space loses eligibility,
+  it loses its check and won't be checked automatically if it returns.
+  Changing the runner or session clears the selection. Review the
+  checked Spaces before pressing **Attach to N Spaces**.
   You can still use Settings later. A confirmed new-Space attachment
   also dismisses the sidebar offer.
 - This attach path only fills an empty assignment. The server rechecks
@@ -223,11 +236,31 @@ changes here are how it addresses a task and verifies its destination:
 - **New task** and **Follow up** ask the generic agent in the selected
   Space room or thread. Dispatch is not a mention composer: text such
   as `@name` doesn't add recipients.
-- **Follow up** checks the run's exact room or thread. If it can't
-  verify that destination, it doesn't silently substitute a different
-  one. Choose another yourself. The form keeps unsent text when the
-  destination changes, so check the **To:** line before pressing
-  **Send to agent**.
+- If **Follow up** would change the destination of a nonempty task
+  draft, **Keep draft** leaves it where it is. **Move draft** changes
+  the destination only after Metro verifies the new room or thread.
+  Neither choice sends anything or changes the draft text.
+- **Follow up** checks the run's exact room or thread even if it's
+  already selected or in the room list. A cached entry isn't enough
+  to enable **Send to agent** while the check is pending or after it
+  fails. Try **Follow up** again or choose another destination yourself;
+  Metro doesn't quietly substitute a different room. Check the **To:**
+  line before sending.
+
+## Page consent and Web Activity
+
+- **Approve version and run** grants approval for the whole Page
+  version but runs only the action you clicked. The prompt shows the
+  clicked action and lists up to four other available agent or schedule
+  button labels, with a count if more are available. The list is not
+  the scope of the approval. See [Page actions](pages.md#who-can-see-edit-and-run-things)
+  for the checks that still apply to each click.
+- Web Activity labels provider attempts **saved key** or **no key**;
+  a skipped provider may say it **requires an API key**. If all attempts
+  fail to produce usable output, Activity says **No provider returned a
+  usable result.** Look at the individual outcomes rather than treating
+  that summary as a rate-limit diagnosis. A key does not guarantee
+  better limits. See [Web search](web-search.md#what-metro-keeps-in-conversation-activity).
 
 ## Private sender notices
 
