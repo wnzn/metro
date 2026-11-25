@@ -1,6 +1,6 @@
 // The one place a just-issued token is shown: a focused panel that takes over
 // its page (Settings › Runners, Settings › Model providers, or a Space's
-// Manage view) until the user presses Done or leaves. The token starts
+// Runner settings) until the user presses Done or leaves. The token starts
 // masked; Copy works without showing it. The setup steps beside it are
 // non-secret text (src/features/setupTemplates.ts): they say where to paste
 // the token, never contain it.
@@ -191,7 +191,7 @@ function RunnerSteps(props: { name: string }) {
         <Step n={3} text="Start it. Its workspace holds a separate folder for each Space it serves (spaces/<space id>/):">
           <CopyBlock testID="setup-standalone-run" label="the command that starts the runner" text={standaloneRunCommand({ serverUrl: server(), runnerName: props.name, appVersion: APP_VERSION })} />
         </Step>
-        <Step n={4} text="Attach it to a Space you own: Space › Manage › Runner." />
+        <Step n={4} text="Attach it to a Space you own: Space settings › Runner." />
         <SettingRow label="What it can do" description={RUNNER_TOOLS_NOTE} />
       </SettingsGroup>
 

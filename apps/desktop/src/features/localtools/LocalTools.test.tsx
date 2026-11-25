@@ -1,4 +1,4 @@
-// Local workspace tools in Manage Space, against the fake server
+// Local workspace tools in Runner › Advanced, against the fake server
 // (test/fakeServer.ts) and the fake desktop bridge, extended with the
 // `/v1/local-tools…` routes the launcher forwards to desktop_tools. Fake
 // tokens only.
@@ -62,12 +62,13 @@ function bridgeWithTools(f: F, available = true, opts: { startingReads?: number 
     const inner = (b.network as any)[`${method} ${BRIDGE}/v1/*`];
     network[`${method} ${BRIDGE}/v1/*`] = (req: Req) => (new URL(req.url).pathname.startsWith("/v1/local-tools") ? handleTools(req) : inner(req));
   }
-  return { b, tools, log, network };
+  return { b, tools, log, network, finishStartingAfter: (reads: number) => { starting = reads; } };
 }
 
-async function openWith(f: F, t: ReturnType<typeof bridgeWithTools> | null) {
+async function openWith(f: F, t: ReturnType<typeof bridgeWithTools> | null, manual = false) {
   const network = { ...(f.network as any), ...(t ? t.network : {}) };
-  return open("../../../App.tsx", { network, platform: "linux", width: 1280, height: 900, modules: (t ? bridgeEnv() : launched()) as any });
+  return open("../../../App.tsx", { network, platform: "linux", width: 1280, height: 900, modules: (t ? bridgeEnv() : launched()) as any,
+    ...(manual ? { clock: {} } : {}) });
 }
 
 async function signIn(app: App, user: string) {
@@ -82,7 +83,10 @@ async function manage(app: App, sid: string) {
   await app.press(`id:space:${sid}`);
   await app.waitFor("id:manage-space");
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:runner-card");
+  expect(app.shows("id:local-tools-card")).toBe(false);
+  await app.press("id:space-runner-advanced:toggle");
 }
 
 const text = (app: App) => app.texts().join(" | ");
@@ -141,7 +145,7 @@ test("the bridge's refusal is shown as is, and nothing changes", async () => {
   const app = await openWith(f, t);
   await signIn(app, "alice");
   await manage(app, "solo");
-  await app.waitFor("id:local-tools-enable");
+  await app.waitUntil(() => app.enabled("id:local-tools-enable"));
   // Someone pairs a runner after the card loaded: the guarded request refuses.
   f.state.spaces.get("solo")!.runnerToken = "operator-token";
   await app.press("id:local-tools-enable");
@@ -180,24 +184,28 @@ test("members never see the switch", async () => {
 });
 
 const statusReads = (t: ReturnType<typeof bridgeWithTools>) => t.log.filter((l) => l.method === "GET" && l.path === "/v1/local-tools").length;
-const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 test("after turning on, the card follows a starting worker to On without reopening the page", async () => {
   const f = world();
   f.addSpace("solo", "Solo", "alice");
-  const t = bridgeWithTools(f, true, { startingReads: 2 });
-  const app = await openWith(f, t);
+  const t = bridgeWithTools(f, true, { startingReads: 1_000 });
+  const app = await openWith(f, t, true);
   await signIn(app, "alice");
   await manage(app, "solo");
   await app.press("id:local-tools-enable");
   await app.waitFor("text:Starting…");
   const before = statusReads(t);
+  t.finishStartingAfter(2);
+  for (let i = 0; i < 3; i++) {
+    await app.clock!.runFor(750);
+    await app.waitUntil(() => statusReads(t) >= before + i + 1);
+  }
   await app.waitFor("text:On", { timeout: 10_000 });
   expect(app.shows("text:Starting…")).toBe(false);
   // Exactly the reads needed, then it stops.
   const after = statusReads(t);
   expect(after - before).toBe(3);
-  await sleep(2000);
+  await app.clock!.runFor(2_000);
   expect(statusReads(t)).toBe(after);
   // Guard semantics unchanged: one guarded enable, nothing else posted.
   expect(t.log.filter((l) => l.method === "POST").map((l) => l.path)).toEqual(["/v1/local-tools/spaces/solo/enable"]);
@@ -207,26 +215,34 @@ test("a worker stuck at starting is followed only while the page is open, and ne
   const f = world();
   f.addSpace("solo", "Solo", "alice");
   const t = bridgeWithTools(f, true, { startingReads: 1_000 });
-  const app = await openWith(f, t);
+  const app = await openWith(f, t, true);
   await signIn(app, "alice");
   await manage(app, "solo");
+  await app.waitFor("id:local-tools-enable");
   const opened = statusReads(t);
   await app.press("id:local-tools-enable");
+  await app.waitFor("text:Starting…");
+  await app.clock!.runFor(1_500);
   await app.waitUntil(() => statusReads(t) >= opened + 2, { timeout: 10_000 });
   // Leaving the page ends it.
-  await app.press("id:close-manage");
+  await app.press("id:space-settings-close");
   const left = statusReads(t);
-  await sleep(2000);
+  await app.clock!.runFor(2_000);
   expect(statusReads(t)).toBe(left);
 
   // Back on the page it follows again (one poller), and signing out ends it.
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
+  await app.press("id:space-runner-advanced:toggle");
+  await app.waitFor("text:Starting…");
+  await app.clock!.runFor(1_500);
   await app.waitUntil(() => statusReads(t) >= left + 3, { timeout: 10_000 });
+  await app.press("id:space-settings-close");
   await app.press("id:account-menu"); // Sign out is in the account menu
   await app.press("id:disconnect");
-  await sleep(300);
+  await app.waitFor("id:connect-screen");
   const out = statusReads(t);
-  await sleep(2000);
+  await app.clock!.runFor(2_000);
   expect(statusReads(t)).toBe(out);
   // Never more than the open read plus the bounded follow-up, per visit.
   expect(out - left).toBeLessThanOrEqual(1 + 20 + 1);

@@ -18,6 +18,29 @@ import { apiClient, describe, disconnect, isAborted, onSessionEnd, sessionGuard 
 /** How long a loaded list is trusted before `ensureSpaceAgents` asks again. */
 export const AGENTS_RECHECK_MS = 60_000;
 
+export const TOOL_LABELS: Readonly<Record<string, { label: string; description: string; group: "workspace" | "web" | "pages" }>> = {
+  "workspace.list": { label: "List files", description: "List files in this Space's folder.", group: "workspace" },
+  "workspace.read": { label: "Read files", description: "Read files in this Space's folder.", group: "workspace" },
+  "workspace.check": { label: "Run checks", description: "Run checks defined by the runner operator.", group: "workspace" },
+  "workspace.mcp_list": { label: "List MCP tools", description: "See the operator's MCP tools.", group: "workspace" },
+  "workspace.mcp": { label: "Use MCP tools", description: "Call the operator's MCP tools.", group: "workspace" },
+  threads: { label: "Threads", description: "Start and reply in threads in this Space.", group: "workspace" },
+  web_search: { label: "Search the web", description: "Send search queries to the starter's web search providers. Off by default.", group: "web" },
+  web_fetch: { label: "Read web pages", description: "Send addresses shared by people or returned by a search in the same run to those providers. Off by default.", group: "web" },
+  pages_list: { label: "List Pages", description: "List Pages the starter can see in this Space. Off by default.", group: "pages" },
+  page_read: { label: "Read Page data", description: "Read room-safe data the starter can access. Off by default.", group: "pages" },
+  page_propose: { label: "Propose Page changes", description: "Draft a new Page or an edit; nothing changes until the starter applies it with edit rights. Off by default.", group: "pages" },
+};
+
+export function toolInfo(id: string) {
+  return Object.prototype.hasOwnProperty.call(TOOL_LABELS, id) ? TOOL_LABELS[id] : undefined;
+}
+
+export function isOptInTool(id: string) {
+  const group = toolInfo(id)?.group;
+  return group === "web" || group === "pages";
+}
+
 export type AgentList = {
   status: "loading" | "ready" | "hidden" | "error";
   agents: readonly SpaceAgent[];

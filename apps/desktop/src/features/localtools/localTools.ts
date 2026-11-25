@@ -14,7 +14,7 @@ import { signal } from "nsh";
 import { readBridgeEnv } from "../../device/env";
 import type { BridgeEndpoint } from "../../device/env";
 import { BridgeError, scrub } from "../../device/bridge";
-import { loadSpaceRunner } from "../../settings";
+import { onSessionEnd, sessionGuard } from "../../store";
 
 export type LocalToolsWorker = "starting" | "online" | "offline" | "revoked" | "stopped";
 
@@ -155,46 +155,55 @@ function merge(entry: LocalToolsSpace) {
 }
 
 /** Re-reads the bridge's local tools status. Never throws. */
-export async function loadLocalTools(): Promise<void> {
+export async function loadLocalTools(stillOpen: () => boolean): Promise<void> {
   if (!client) return;
+  const session = sessionGuard();
   try {
-    localTools.set(await client.status());
+    const next = await client.status();
+    if (session() && stillOpen()) localTools.set(next);
   } catch {
     // Unknown means hidden: the card never guesses.
-    localTools.set(null);
+    if (session() && stillOpen()) localTools.set(null);
   }
 }
 
-export async function enableLocalTools(spaceId: string): Promise<void> {
+export async function enableLocalTools(spaceId: string, stillOpen: () => boolean): Promise<void> {
   if (!client || localToolsBusy()) return;
+  const live = sessionGuard(spaceId);
+  const session = sessionGuard();
   localToolsBusy.set("enable");
   localToolsError.set(null);
   localToolsNotice.set(null);
   try {
-    merge(await client.enable(spaceId));
-    localToolsNotice.set("Local tools are on for this Space.");
+    const result = await client.enable(spaceId);
+    if (live()) {
+      merge(result);
+      if (stillOpen()) localToolsNotice.set("Local tools are on for this Space.");
+    }
   } catch (error) {
-    localToolsError.set(message(error, "Turning on local tools"));
+    if (live() && stillOpen()) localToolsError.set(message(error, "Turning on local tools"));
   } finally {
-    localToolsBusy.set(null);
-    void loadSpaceRunner(spaceId);
+    if (session()) localToolsBusy.set(null);
   }
 }
 
-export async function disableLocalTools(spaceId: string): Promise<void> {
+export async function disableLocalTools(spaceId: string, stillOpen: () => boolean): Promise<void> {
   if (!client || localToolsBusy()) return;
+  const live = sessionGuard(spaceId);
+  const session = sessionGuard();
   localToolsBusy.set("disable");
   localToolsError.set(null);
   localToolsNotice.set(null);
   try {
     const entry = await client.disable(spaceId);
-    merge(entry);
-    localToolsNotice.set(entry.detail ?? "Local tools are off. The files in the folder stay on this computer.");
+    if (live()) {
+      merge(entry);
+      if (stillOpen()) localToolsNotice.set(entry.detail ?? "Local tools are off. The files in the folder stay on this computer.");
+    }
   } catch (error) {
-    localToolsError.set(message(error, "Turning off local tools"));
+    if (live() && stillOpen()) localToolsError.set(message(error, "Turning off local tools"));
   } finally {
-    localToolsBusy.set(null);
-    void loadSpaceRunner(spaceId);
+    if (session()) localToolsBusy.set(null);
   }
 }
 
@@ -241,3 +250,9 @@ export function clearLocalToolsMessages() {
   localToolsError.set(null);
   localToolsNotice.set(null);
 }
+
+onSessionEnd(() => {
+  localTools.set(null);
+  localToolsBusy.set(null);
+  clearLocalToolsMessages();
+});

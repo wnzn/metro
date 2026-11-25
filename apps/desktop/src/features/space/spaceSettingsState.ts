@@ -2,9 +2,8 @@
 // deleting or leaving it, its agents, and the signed-in person's own
 // preferences there. The pages read these signals and call these functions.
 //
-// - The owner edits the Space and its agents; every member reads the agents
-//   and edits only their own preferences. The server is the judge: a 403 or
-//   404 closes the settings and reloads the Space list.
+// - The owner edits the Space, membership, runner and agents. Everyone can
+//   read them and edit their own preferences. The server is the judge.
 // - Deleting needs the Space's exact name typed; leaving is for members
 //   other than the owner. Both then forget the Space (store.spaceGone).
 // - An agent's picture comes only from the system's file picker, PNG or
@@ -12,9 +11,9 @@
 // - Preferences take effect when changed (no Save). Model choices are only
 //   the person's own usable chat connections, or ones shared with them here.
 
-import { batch, effect, Picker as SystemPicker, signal, untracked } from "nsh";
+import { batch, cleanup, computed, effect, Picker as SystemPicker, signal, untracked } from "nsh";
 import { ApiError } from "../../api/client";
-import type { AvailableCatalog } from "../../api/client";
+import type { AvailableCatalog, Client, Member, RegisteredRunner, SpaceRunner } from "../../api/client";
 import { AVATAR_EXTENSIONS, MAX_AVATAR_BYTES, sniffAvatar } from "../../api/profile";
 import type { AvatarMime } from "../../api/profile";
 import {
@@ -27,11 +26,15 @@ import {
   MAX_SPACE_DESCRIPTION,
 } from "../../api/spaces";
 import type { AgentPatch, ModelSelection, SpaceAgent, SpaceDetails, SpacePrefs, SpacePrefsView } from "../../api/spaces";
-import { apiClient, describe, disconnect, isAborted, onSessionEnd, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
+import { apiClient, closeSettings, describe, disconnect, isAborted, me, onManageOpen, onSessionEnd, onTransientClear, rememberMembers, sessionGuard, spaceGone, spaceRenamed, spaces } from "../../store";
+import { beginSpaceRunnerRead, beginSpaceRunnerWrite, dismissReveal, rememberSpaceRunner, revealDedicatedToken, revealed, spaceRunners } from "../../settings";
+import { dismissRunnerOffer, installedRunnerChoice, snapshotInstalledRunner } from "../../runnersState";
+import { recordAttachedFolder } from "../installedRunner/installedRunner";
+import { clearLocalToolsMessages, localToolsBusy } from "../localtools/localTools";
 import { noteClassifierPrefs } from "./askAgent";
-import { adoptAgent, agentList, dropAgent, ensureSpaceAgents, forgetSpaceAgents, invalidateSpaceAgents, showPicture, spaceAgents } from "./agents";
+import { adoptAgent, agentList, dropAgent, ensureSpaceAgents, forgetSpaceAgents, invalidateSpaceAgents, isOptInTool, showPicture, spaceAgents } from "./agents";
 
-export type SpaceSettingsSection = "general" | "members" | "agents" | "preferences";
+export type SpaceSettingsSection = "general" | "members" | "runner" | "agents" | "preferences";
 
 /** The Space whose settings are open, or null. */
 export const spaceSettingsFor = signal<string | null>(null);
@@ -42,7 +45,6 @@ export function settingsSpace() {
   const sid = spaceSettingsFor();
   return sid ? spaces().find((s) => s.id === sid) ?? null : null;
 }
-export const isSettingsOwner = () => settingsSpace()?.role === "owner";
 
 // ---------------------------------------------------------------- state
 
@@ -53,6 +55,27 @@ export const descriptionDraft = signal("");
 export const savingGeneral = signal(false);
 /** The last outcome of an action on these pages, said once. */
 export const spaceNotice = signal<{ ok: boolean; message: string } | null>(null);
+
+export const roster = signal<Member[] | null>(null);
+export const isSettingsOwner = computed(() => settingsSpace()?.role === "owner" && roster()?.find((m) => m.userId === me())?.role !== "member");
+export const rosterError = signal<string | null>(null);
+export const memberBusy = signal<string | null>(null);
+export const memberNotice = signal<{ ok: boolean; message: string } | null>(null);
+
+type RunnerSnapshot = { runner: SpaceRunner | null; legacy: boolean };
+const runnerSource = signal<{ sid: string; legacy: boolean } | null>(null);
+export const runnerSnapshot = computed<RunnerSnapshot | null>(() => {
+  const source = runnerSource();
+  if (!source) return null;
+  const runner = spaceRunners()[source.sid];
+  return runner === undefined ? null : { runner, legacy: source.legacy };
+});
+export const runnerError = signal<string | null>(null);
+export const runnerInventory = signal<{ attachIfEmpty: boolean; runners: RegisteredRunner[] } | null>(null);
+export const runnerInventoryError = signal<string | null>(null);
+export const runnerBusy = signal<string | null>(null);
+export const runnerNotice = signal<{ ok: boolean; message: string } | null>(null);
+export const runnerAdvanced = signal(false);
 
 export const dangerOpen = signal<null | "delete" | "leave">(null);
 export const deleteConfirmText = signal("");
@@ -90,6 +113,10 @@ export const catalog = signal<AvailableCatalog | null>(null);
 export const catalogError = signal<string | null>(null);
 
 let generation = 0;
+let pageGeneration = 0;
+let advancedGeneration = 0;
+let memberRead = 0;
+let inventoryRead = 0;
 
 // ---------------------------------------------------------------- open and close
 
@@ -97,35 +124,53 @@ let generation = 0;
 export function openSpaceSettings(spaceId: string, section: SpaceSettingsSection = "general") {
   const space = spaces().find((s) => s.id === spaceId);
   if (!space) return;
+  closeSettings();
   const changed = untracked(spaceSettingsFor) !== spaceId;
-  if (changed) resetPages();
   batch(() => {
+    if (changed) resetPages();
+    else if (untracked(spaceSettingsSection) !== section) resetSection();
     spaceSettingsFor.set(spaceId);
     spaceSettingsSection.set(section);
   });
-  if (changed) {
-    void loadDetails();
-    void ensureSpaceAgents(spaceId, true);
-  }
 }
 
 export function showSection(section: SpaceSettingsSection) {
-  spaceSettingsSection.set(section);
-  if (section === "preferences") void loadPreferences();
-  if (section === "agents") {
-    const sid = spaceSettingsFor();
-    if (sid) void ensureSpaceAgents(sid);
-  }
+  if (untracked(spaceSettingsSection) === section) return;
+  batch(() => {
+    resetSection();
+    spaceSettingsSection.set(section);
+  });
 }
 
 export function closeSpaceSettings() {
-  resetPages();
-  spaceSettingsFor.set(null);
+  if (!untracked(spaceSettingsFor)) return;
+  batch(() => {
+    spaceSettingsFor.set(null);
+    resetPages();
+  });
+}
+
+function resetSection() {
+  pageGeneration++;
+  memberBusy.set(null);
+  memberNotice.set(null);
+  runnerSource.set(null);
+  runnerError.set(null);
+  runnerInventory.set(null);
+  runnerInventoryError.set(null);
+  runnerBusy.set(null);
+  runnerNotice.set(null);
+  runnerAdvanced.set(false);
+  clearLocalToolsMessages();
+  if (untracked(revealed)?.kind === "dedicated") dismissReveal();
 }
 
 function resetPages() {
   generation++;
   batch(() => {
+    resetSection();
+    roster.set(null);
+    rosterError.set(null);
     details.set(null);
     detailsError.set(null);
     nameDraft.set("");
@@ -151,14 +196,52 @@ function resetPages() {
   });
 }
 
-// The Space went away (deleted elsewhere, access lost) or ownership changed: close, or hide owner pages.
+// Keep read-only pages visible to members; close them when the Space goes away.
 effect(() => {
   const sid = spaceSettingsFor();
   if (!sid) return;
   const space = spaces().find((s) => s.id === sid);
   untracked(() => {
     if (!space) closeSpaceSettings();
-    else if (space.role !== "owner" && spaceSettingsSection() === "members") spaceSettingsSection.set("general");
+  });
+});
+
+effect(() => {
+  const sid = spaceSettingsFor();
+  const section = spaceSettingsSection();
+  if (!sid) return;
+  untracked(() => {
+    if (section === "general") {
+      if (!details()) void loadDetails();
+    } else if (section === "members") {
+      let polling = false;
+      const tick = async () => {
+        if (polling || memberBusy()) return;
+        polling = true;
+        try { await loadMembers(); }
+        finally { polling = false; }
+      };
+      void tick();
+      const timer = setInterval(() => void tick(), 5_000);
+      cleanup(() => clearInterval(timer));
+    } else if (section === "runner") {
+      void loadRunner();
+    } else if (section === "agents") {
+      void ensureSpaceAgents(sid, true);
+    }
+  });
+});
+
+effect(() => {
+  const owner = isSettingsOwner();
+  const section = spaceSettingsSection();
+  untracked(() => {
+    if (owner && section === "runner") void loadRunnerInventory();
+    else if (!owner) {
+      setRunnerAdvanced(false);
+      runnerInventory.set(null);
+      if (editing()) cancelAgentEdit();
+    }
   });
 });
 
@@ -168,6 +251,15 @@ function guardFor(sid: string) {
   const ok = sessionGuard(sid);
   return () => ok() && gen === generation && spaceSettingsFor() === sid;
 }
+
+function guardPage(sid: string, section: SpaceSettingsSection) {
+  const live = guardFor(sid);
+  const page = pageGeneration;
+  return () => live() && page === pageGeneration && spaceSettingsSection() === section;
+}
+
+onManageOpen(openSpaceSettings);
+onTransientClear(closeSpaceSettings);
 
 /** Handles an error of a Space request; true when it was handled (closed, signed out). */
 function lost(error: unknown, sid: string): boolean {
@@ -194,6 +286,258 @@ function reason(error: unknown, what: string): string {
   }
   if (error instanceof ApiError && error.kind === "forbidden") return `${what}: only the Space's owner can change this.`;
   return describe(error, what);
+}
+
+// ---------------------------------------------------------------- members
+
+export async function loadMembers(): Promise<void> {
+  const api = apiClient();
+  const sid = spaceSettingsFor();
+  if (!api || !sid) return;
+  const page = guardPage(sid, "members");
+  const seq = ++memberRead;
+  const live = () => page() && seq === memberRead;
+  try {
+    const list = await api.listMembers(sid);
+    if (!live()) return;
+    batch(() => {
+      roster.set(list);
+      rosterError.set(null);
+      rememberMembers(sid, list);
+    });
+  } catch (error) {
+    if (!live() || lost(error, sid)) return;
+    rosterError.set(reason(error, "Couldn't load members"));
+  }
+}
+
+export async function changeMember(action: "add" | "remove", input: string): Promise<boolean> {
+  const api = apiClient();
+  const sid = spaceSettingsFor();
+  const uid = input.trim();
+  if (!api || !sid || !isSettingsOwner() || spaceSettingsSection() !== "members" || memberBusy() || uid === me()) return false;
+  if (!uid) {
+    memberNotice.set({ ok: false, message: "Enter a user ID. The person can copy it from their account menu." });
+    return false;
+  }
+  if (action === "remove" && !roster()?.some((m) => m.userId === uid && m.role === "member")) return false;
+  const live = guardPage(sid, "members");
+  memberRead++; // an older read must not overwrite the post-mutation roster
+  memberBusy.set(uid);
+  memberNotice.set(null);
+  try {
+    if (action === "add") await api.addMember(sid, uid);
+    else await api.removeMember(sid, uid);
+    if (!live()) return false;
+    memberNotice.set({ ok: true, message: action === "add" ? `Added ${uid}.` : `Removed ${uid}.` });
+    await loadMembers();
+    return live();
+  } catch (error) {
+    if (!live() || isAborted(error)) return false;
+    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else {
+      memberNotice.set({ ok: false, message: reason(error, `Couldn't ${action} ${uid}`) });
+      // A 404 could also mean a missing user, not lost access to the Space.
+      await loadMembers();
+    }
+    return false;
+  } finally {
+    if (live()) memberBusy.set(null);
+  }
+}
+
+// ---------------------------------------------------------------- runner
+
+const dedicatedRunner = { kind: "dedicated", name: "Dedicated Space runner" } as const;
+const canAttach = (r: RegisteredRunner) => r.visibility === "organization" || r.canManage;
+
+async function readRunner(api: Client, sid: string): Promise<RunnerSnapshot> {
+  try {
+    return { runner: await api.getSpaceRunner(sid), legacy: false };
+  } catch (error) {
+    if (!(error instanceof ApiError) || error.kind !== "not_found") throw error;
+    // Older servers lack GET …/runner. Prove access before showing any
+    // fallback from the Space record; a revoked membership also returns 404.
+    const space = (await api.listSpaces()).find((s) => s.id === sid);
+    if (!space) throw error;
+    return { runner: space.runnerPaired ? dedicatedRunner : null, legacy: true };
+  }
+}
+
+async function refreshAssignment(api: Client, sid: string, current: () => boolean, show: () => boolean) {
+  const latestRead = beginSpaceRunnerRead(sid);
+  const valid = () => latestRead() && current();
+  try {
+    const next = await readRunner(api, sid);
+    if (!valid()) return undefined;
+    batch(() => {
+      rememberSpaceRunner(sid, next.runner);
+      if (show()) {
+        runnerSource.set({ sid, legacy: next.legacy });
+        runnerError.set(null);
+      }
+    });
+    return next;
+  } catch (error) {
+    if (valid()) throw error;
+    return undefined;
+  }
+}
+
+export async function loadRunner(stillLatest: () => boolean = () => true): Promise<void> {
+  const api = apiClient();
+  const sid = spaceSettingsFor();
+  if (!api || !sid || spaceSettingsSection() !== "runner" || !stillLatest()) return;
+  const page = guardPage(sid, "runner");
+  const live = () => page() && stillLatest();
+  try {
+    const next = await refreshAssignment(api, sid, live, page);
+    if (!next && live() && !runnerSnapshot() && !runnerBusy() && !localToolsBusy()) {
+      // Another read or write superseded the initial check; ask again.
+      await refreshAssignment(api, sid, live, page);
+    }
+  } catch (error) {
+    if (!live() || lost(error, sid)) return;
+    runnerSource.set(null);
+    runnerError.set("Couldn't check which runner serves this Space.");
+  }
+}
+
+export async function loadRunnerInventory(): Promise<void> {
+  const api = apiClient();
+  const sid = spaceSettingsFor();
+  if (!api || !sid || !isSettingsOwner() || spaceSettingsSection() !== "runner") return;
+  const page = guardPage(sid, "runner");
+  const seq = ++inventoryRead;
+  const live = () => page() && isSettingsOwner() && seq === inventoryRead;
+  try {
+    const next = await api.listRunnerInventory();
+    if (!live()) return;
+    runnerInventory.set({ ...next, runners: next.runners.filter(canAttach) });
+    runnerInventoryError.set(null);
+  } catch (error) {
+    if (!live() || isAborted(error)) return;
+    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else if (error instanceof ApiError && error.kind === "not_found") {
+      runnerInventory.set({ attachIfEmpty: false, runners: [] });
+      runnerInventoryError.set(null);
+    } else {
+      runnerInventory.set(null);
+      runnerInventoryError.set("Couldn't load runners you can attach.");
+    }
+  }
+}
+
+type RunnerAction =
+  | { kind: "attach"; id: string; installed: boolean }
+  | { kind: "detach"; id: string }
+  | { kind: "issue" | "rotate" | "revoke" };
+
+export async function changeRunner(action: RunnerAction): Promise<void> {
+  const api = apiClient();
+  const sid = spaceSettingsFor();
+  const before = runnerSnapshot();
+  if (!api || !sid || !before || !isSettingsOwner() || runnerBusy() || localToolsBusy() || spaceSettingsSection() !== "runner") return;
+  const page = guardPage(sid, "runner");
+  const owns = () => spaces().some((s) => s.id === sid && s.role === "owner");
+  const live = () => page() && isSettingsOwner();
+  const dedicatedAction = action.kind === "issue" || action.kind === "rotate" || action.kind === "revoke";
+  const advanced = advancedGeneration;
+  const stillConsented = () => live() && (!dedicatedAction || (runnerAdvanced() && advancedGeneration === advanced));
+  if (!stillConsented()) return;
+  const expected = (runner: SpaceRunner | null) =>
+    action.kind === "attach" || action.kind === "issue" ? runner === null :
+      action.kind === "detach" ? runner?.kind === "registered" && runner.id === action.id : runner?.kind === "dedicated";
+  if (!expected(before.runner)) return;
+  if (action.kind === "attach" && (before.legacy || !runnerInventory()?.attachIfEmpty || !runnerInventory()?.runners.some((r) => r.id === action.id))) return;
+  const installed = action.kind === "attach" && action.installed ? snapshotInstalledRunner(action.id) : null;
+  if (action.kind === "attach" && action.installed && !installed) return;
+  const reject = (message: string) => { if (live()) runnerNotice.set({ ok: false, message }); };
+  runnerBusy.set(action.kind === "attach" ? `attach:${action.id}` : action.kind);
+  runnerNotice.set(null);
+  let pendingWrite: (() => boolean) | undefined;
+  const writeCurrent = () => !!pendingWrite?.() && owns();
+  try {
+    let token: string | null = null;
+    if (action.kind === "attach") {
+      const inventoryRequest = ++inventoryRead;
+      const inventory = await api.listRunnerInventory();
+      if (!live()) return;
+      if (inventoryRead === inventoryRequest) {
+        runnerInventory.set({ ...inventory, runners: inventory.runners.filter(canAttach) });
+        runnerInventoryError.set(null);
+      }
+      if (!inventory.attachIfEmpty) return reject("This server doesn't support attaching only to Spaces without a runner.");
+      if (!inventory.runners.some((r) => r.id === action.id && canAttach(r)) || (installed && !installed.isCurrent())) {
+        return reject("That runner is no longer available to attach.");
+      }
+      pendingWrite = beginSpaceRunnerWrite(sid);
+      await api.attachRunnerIfEmpty(sid, action.id);
+      if (installed?.isCurrent()) dismissRunnerOffer();
+    } else {
+      const current = await refreshAssignment(api, sid, stillConsented, live);
+      if (!current || !stillConsented()) return;
+      if (!expected(current.runner)) return reject("This Space's runner changed. Nothing was changed by this action.");
+      pendingWrite = beginSpaceRunnerWrite(sid);
+      if (action.kind === "detach") {
+        await api.detachRunner(sid);
+      } else if (action.kind === "revoke") {
+        await api.revokeRunnerToken(sid);
+      } else {
+        token = await api.issueRunnerToken(sid);
+      }
+    }
+    if (!writeCurrent()) return;
+    // A delayed write reply describes history, not the current assignment.
+    // Use the shared exact-Space guards even when the originating page closed.
+    const actual = await refreshAssignment(api, sid, writeCurrent, live);
+    if (!actual) return;
+    const r = actual.runner;
+    const confirmed = action.kind === "attach" ? r?.kind === "registered" && r.id === action.id :
+      action.kind === "detach" || action.kind === "revoke" ? r === null : r?.kind === "dedicated";
+    if (!confirmed) return reject("The runner assignment changed. Check the current runner above.");
+    if (action.kind === "attach" && installed?.isCurrent()) {
+      const space = spaces().find((s) => s.id === sid && s.role === "owner");
+      if (space) recordAttachedFolder(space);
+    }
+    if (!live() || !writeCurrent()) return;
+    const message = action.kind === "attach" ? `Attached “${r?.name}”. This Space now sends its runner jobs there.` :
+      action.kind === "detach" ? "Runner detached from this Space. Its other Spaces are unchanged." :
+        action.kind === "revoke" ? "Dedicated token revoked. The runner can no longer serve this Space." :
+          "Dedicated token issued. Rotate it if you need a new copy.";
+    runnerNotice.set({ ok: true, message });
+    if (token && stillConsented()) revealDedicatedToken(sid, settingsSpace()?.name ?? sid, token);
+  } catch (error) {
+    if (!live() || (pendingWrite && !pendingWrite()) || isAborted(error)) return;
+    if (error instanceof ApiError && error.kind === "auth") {
+      disconnect();
+      return;
+    }
+    // Don't echo server bodies from runner mutations, including token endpoints.
+    reject(error instanceof ApiError && error.status === 409
+      ? "This Space already has a runner or its assignment changed. No replacement was made."
+      : error instanceof ApiError && error.kind === "forbidden"
+        ? "Only the owner can change this."
+        : "The server did not confirm the runner change. Check its status before trying again.");
+    await loadRunner();
+  } finally {
+    if (page()) runnerBusy.set(null);
+  }
+}
+
+export function preferredSpaceRunner() {
+  const installed = installedRunnerChoice();
+  return installed && runnerInventory()?.runners.some((r) => r.id === installed.id) ? installed.id : null;
+}
+
+export function setRunnerAdvanced(open: boolean) {
+  if (runnerAdvanced() === open) return;
+  advancedGeneration++;
+  runnerAdvanced.set(open);
+  if (!open) {
+    clearLocalToolsMessages();
+    if (revealed()?.kind === "dedicated") dismissReveal();
+  }
 }
 
 // ---------------------------------------------------------------- general
@@ -233,7 +577,7 @@ export async function saveGeneral(): Promise<void> {
   const api = apiClient();
   const sid = spaceSettingsFor();
   const d = details();
-  if (!api || !sid || !d || savingGeneral() || generalProblem() || !generalDirty()) return;
+  if (!api || !sid || !d || !isSettingsOwner() || savingGeneral() || generalProblem() || !generalDirty()) return;
   const live = guardFor(sid);
   const patch: { name?: string; description?: string } = {};
   if (nameDraft().trim() !== d.name) patch.name = nameDraft().trim();
@@ -280,7 +624,7 @@ export async function deleteSpaceNow(): Promise<void> {
   const api = apiClient();
   const sid = spaceSettingsFor();
   const name = details()?.name ?? settingsSpace()?.name;
-  if (!api || !sid || !name || dangerBusy() || !deleteNameMatches()) return;
+  if (!api || !sid || !name || !isSettingsOwner() || dangerBusy() || !deleteNameMatches()) return;
   const live = guardFor(sid);
   batch(() => {
     dangerBusy.set(true);
@@ -306,7 +650,7 @@ export async function leaveSpaceNow(): Promise<void> {
   const api = apiClient();
   const sid = spaceSettingsFor();
   const name = settingsSpace()?.name ?? "the Space";
-  if (!api || !sid || dangerBusy()) return;
+  if (!api || !sid || isSettingsOwner() || dangerBusy()) return;
   const live = guardFor(sid);
   batch(() => {
     dangerBusy.set(true);
@@ -338,12 +682,12 @@ function draftOf(a: SpaceAgent): AgentDraft {
 /** Opens the editor for a new agent with server defaults and the next unused colour. */
 export function startNewAgent() {
   const sid = spaceSettingsFor();
-  if (!sid) return;
+  if (!sid || !isSettingsOwner()) return;
   const used = new Set(spaceAgents(sid).map((a) => a.color));
   const color = AGENT_COLORS.find((c) => !used.has(c)) ?? AGENT_COLORS[0];
   batch(() => {
     editing.set({ mode: "new" });
-    agentDraft.set({ name: "", handle: "", handleTouched: false, description: "", instructions: "", tools: [...(agentList(sid)?.defaultTools ?? [])], color });
+    agentDraft.set({ name: "", handle: "", handleTouched: false, description: "", instructions: "", tools: (agentList(sid)?.defaultTools ?? []).filter((tool) => !isOptInTool(tool)), color });
     pendingPicture.set(null);
     agentError.set(null);
     spaceNotice.set(null);
@@ -354,7 +698,7 @@ export function startNewAgent() {
 export function startEditAgent(agentId: string) {
   const sid = spaceSettingsFor();
   const a = spaceAgents(sid).find((x) => x.id === agentId);
-  if (!a) return;
+  if (!a || !isSettingsOwner()) return;
   batch(() => {
     editing.set({ mode: "edit", id: a.id });
     agentDraft.set(draftOf(a));
@@ -435,7 +779,7 @@ export async function saveAgent(): Promise<void> {
   const sid = spaceSettingsFor();
   const d = agentDraft();
   const e = editing();
-  if (!api || !sid || !d || !e || savingAgent() || draftProblem()) return;
+  if (!api || !sid || !d || !e || !isSettingsOwner() || savingAgent() || draftProblem()) return;
   const live = guardFor(sid);
   batch(() => {
     savingAgent.set(true);
@@ -503,7 +847,7 @@ function adoptAgentOrReload(a: SpaceAgent) {
 export async function makeDefaultAgent(agentId: string): Promise<void> {
   const api = apiClient();
   const sid = spaceSettingsFor();
-  if (!api || !sid || agentBusy()) return;
+  if (!api || !sid || !isSettingsOwner() || agentBusy()) return;
   const live = guardFor(sid);
   batch(() => {
     agentBusy.set(`default:${agentId}`);
@@ -514,7 +858,7 @@ export async function makeDefaultAgent(agentId: string): Promise<void> {
     if (!live()) return;
     adoptAgentOrReload(saved);
     invalidateSpaceAgents(sid);
-    spaceNotice.set({ ok: true, message: `${saved.name} is now the default: @agent and Ask agent start it.` });
+    spaceNotice.set({ ok: true, message: `${saved.name} is now the default when no other agent is picked.` });
   } catch (error) {
     if (!live() || lost(error, sid)) return;
     spaceNotice.set({ ok: false, message: reason(error, "Couldn't change the default agent") });
@@ -527,7 +871,7 @@ export async function deleteAgentNow(agentId: string): Promise<void> {
   const api = apiClient();
   const sid = spaceSettingsFor();
   const a = spaceAgents(sid).find((x) => x.id === agentId);
-  if (!api || !sid || !a || agentBusy()) return;
+  if (!api || !sid || !a || !isSettingsOwner() || agentBusy()) return;
   const live = guardFor(sid);
   batch(() => {
     agentBusy.set(`delete:${agentId}`);
@@ -590,7 +934,7 @@ export async function chooseAgentPicture(): Promise<void> {
   const api = apiClient();
   const sid = spaceSettingsFor();
   const e = editing();
-  if (!api || !sid || !e || agentBusy()) return;
+  if (!api || !sid || !e || !isSettingsOwner() || agentBusy()) return;
   const live = guardFor(sid);
   const busyKey = `picture:${e.mode === "edit" ? e.id : "new"}`;
   batch(() => {
@@ -599,7 +943,7 @@ export async function chooseAgentPicture(): Promise<void> {
   });
   try {
     const picture = await pickPicture(live);
-    if (!picture || !live()) return;
+    if (!picture || !live() || !isSettingsOwner()) return;
     if (e.mode === "new") {
       pendingPicture.set(picture);
       return;
@@ -626,7 +970,7 @@ export async function removeAgentPicture(): Promise<void> {
   const api = apiClient();
   const sid = spaceSettingsFor();
   const e = editing();
-  if (!api || !sid || !e || agentBusy()) return;
+  if (!api || !sid || !e || !isSettingsOwner() || agentBusy()) return;
   if (e.mode === "new") {
     pendingPicture.set(null);
     return;
@@ -694,7 +1038,7 @@ async function putPrefs(next: SpacePrefs, busy: string, what: string): Promise<b
   } catch (error) {
     if (!live() || lost(error, sid)) return false;
     if (busy === "classify" && error instanceof ApiError && error.status === 409) {
-      spaceNotice.set({ ok: false, message: "You don't have a System One connection you can use in this Space. Add one in Settings › Model providers first." });
+      spaceNotice.set({ ok: false, message: "You don't have a System One connection you can use in this Space. Add one in Settings › Model connections first." });
       const p = prefs();
       if (p) prefs.set({ ...p, classifierAvailable: false });
     } else {

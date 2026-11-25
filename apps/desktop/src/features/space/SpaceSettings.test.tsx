@@ -10,8 +10,8 @@ import { launched } from "../../../test/launched";
 
 type W = ReturnType<typeof spaceWorld>;
 
-async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice"): Promise<App> {
-  const app = await open("./test/Harness.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1280, height: 900 });
+async function signIn(w: W, user: "alice" | "bob" | "carol" = "alice", manual = false): Promise<App> {
+  const app = await open("./test/Harness.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1280, height: 900, ...(manual ? { clock: {} } : {}) });
   await app.clear("id:server-url");
   await app.type("id:server-url", BASE);
   await app.type("id:access-token", TOKENS[user]!);
@@ -53,6 +53,38 @@ for (const legacy of [false, true]) {
     );
   });
 }
+
+test("Tools uses server-supported groups and saves explicit Web and Pages permission changes only", async () => {
+  const w = spaceWorld();
+  w.s.toolCatalog = ["workspace.list", "threads", "web_fetch", "pages_list", "page_propose"];
+  const a = w.agent("acme", { name: "Reader", handle: "reader", tools: ["threads", "page_propose"] });
+  const app = await signIn(w);
+  await openSettingsFor(app);
+  await app.press("id:space-settings-tab:agents");
+  await app.waitFor(`id:agent:${a.id} >> text:Propose Page changes`);
+  await app.press(`id:edit-agent:${a.id}`);
+  await app.waitFor("id:agent-tool:web_fetch");
+  expect(app.shows("id:agent-tools:web >> text:Read web pages")).toBe(true);
+  expect(app.shows("id:agent-tools:workspace >> text:List files")).toBe(true);
+  expect(app.shows("id:agent-tool:web_search")).toBe(false);
+  expect(app.shows("id:agent-tool:page_read")).toBe(false);
+  expect(app.texts().join(" ")).toContain("Members can see exact queries in run activity");
+  expect(app.texts().join(" ")).toContain("nothing changes until the starter applies it with edit rights");
+  await app.press("id:agent-tool:web_fetch");
+  await app.press("id:agent-tool:page_propose");
+  await app.press("id:agent-tool:pages_list");
+  await app.press("id:agent-save");
+  await app.waitFor("id:agent-editor", { state: "gone" });
+  const route = `/v1/spaces/acme/agents/${a.id}`;
+  expect(calls(w, "PATCH", route).map((p) => p.body)).toEqual([{ tools: ["threads", "web_fetch", "pages_list"] }]);
+  await app.waitFor(`id:agent:${a.id} >> text:List Pages`);
+  await app.press(`id:edit-agent:${a.id}`);
+  await app.press("id:agent-tool:web_fetch");
+  await app.press("id:agent-tool:pages_list");
+  await app.press("id:agent-save");
+  await app.waitFor("id:agent-editor", { state: "gone" });
+  expect(calls(w, "PATCH", route).at(-1)?.body).toEqual({ tools: ["threads"] });
+});
 
 test("the owner edits the Space's name and description; the new name shows everywhere", async () => {
   const w = spaceWorld();
@@ -106,11 +138,16 @@ test("a member reads General and the agents, can't edit them, and can leave", as
   await app.waitFor("id:space-name-readonly");
   expect(app.shows("id:space-name")).toBe(false);
   expect(app.shows("id:delete-space")).toBe(false);
-  // Members and runner: the runner's status and Test runner, no management.
+  // Members can see the roster and test the runner, without management.
   await app.press("id:space-settings-tab:members");
   await app.waitFor("id:space-members");
-  expect(app.shows("id:open-manage")).toBe(false);
-  expect(app.shows("id:space-runner-status >> text:Runner attached")).toBe(true);
+  await app.waitFor("id:member:alice >> text:Owner");
+  await app.waitFor("id:member:bob >> text:Member");
+  expect(app.shows("id:add-member")).toBe(false);
+  expect(app.shows("id:remove-member:bob")).toBe(false);
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:space-runner-status >> text:Dedicated token");
+  expect(app.shows("id:space-runner-advanced:toggle")).toBe(false);
   await app.press("id:test-runner");
   await app.waitFor("text:/^Requested\\. The listing appears in # lobby/");
   expect(w.f.posts().at(-1)).toMatchObject({ path: "/v1/spaces/acme/rooms/lobby/demo" });
@@ -129,6 +166,207 @@ test("a member reads General and the agents, can't edit them, and can leave", as
   await app.waitUntil(() => !app.shows("id:space-settings"));
   expect(calls(w, "POST", "/v1/spaces/acme/leave").length).toBe(1);
   await app.waitUntil(() => !app.shows("id:space:acme"));
+});
+
+test("legacy room shortcut opens Members and preserves the room draft; owner adds and removes by ID", async () => {
+  const w = spaceWorld();
+  const app = await signIn(w);
+  await app.press("id:space:acme");
+  await app.waitFor("id:manage-space");
+  await app.type("id:composer", "Unsent room draft");
+  await app.press("id:manage-space");
+  await app.waitFor("id:space-members");
+  await app.waitFor("id:member:alice >> text:Owner");
+  expect(app.shows("id:remove-member:alice")).toBe(false);
+  await app.type("id:add-member-id", "carol");
+  await app.press("id:add-member");
+  await app.waitFor("id:member:carol");
+  expect(w.f.posts().filter((p) => p.path === "/v1/spaces/acme/members").map((p) => p.body)).toEqual([{ user_id: "carol" }]);
+  await app.press("id:remove-member:carol");
+  await app.press("id:remove-member:carol:cancel");
+  expect(w.f.state.spaces.get("acme")!.members.has("carol")).toBe(true);
+  await app.press("id:remove-member:carol");
+  await app.press("id:remove-member:carol:confirm");
+  await app.waitFor("id:member:carol", { state: "gone" });
+  expect(w.f.state.spaces.get("acme")!.members.has("carol")).toBe(false);
+  await app.press("id:space-settings-close");
+  await app.waitFor("id:space-settings-dialog", { state: "gone" });
+  expect(app.value("id:composer")).toBe("Unsent room draft");
+  expect(app.texts()).toContain("# lobby");
+});
+
+test("a Members page refreshes live and closes when the viewer loses access", async () => {
+  const w = spaceWorld();
+  const rosterPath = "/v1/spaces/acme/members";
+  const get = `GET ${BASE}/v1/*`;
+  const respond = w.network[get]!;
+  let slow = false;
+  w.network[get] = (req) => {
+    const reply = respond(req);
+    return slow && new URL(req.url).pathname === rosterPath ? { ...(reply as object), delay: 6_000 } : reply;
+  };
+  const rosterReads = () => w.f.state.log.filter((p) => p.method === "GET" && p.path === rosterPath).length;
+  const app = await signIn(w, "bob", true);
+  // Open Acme settings over the other Space, without changing rooms.
+  await app.press("id:space:side");
+  await app.waitFor("text:side lobby only");
+  await app.press("id:space-menu:acme");
+  await app.press("id:space-settings:acme");
+  await app.waitFor("id:space-name-readonly");
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:test-runner");
+  expect(app.enabled("id:test-runner")).toBe(false);
+  expect(app.texts().join(" ")).toContain("Open a room of this Space first");
+  await app.press("id:space-settings-tab:members");
+  await app.waitFor("id:member:alice");
+  const before = rosterReads();
+  w.f.state.spaces.get("acme")!.members.add("carol");
+  slow = true;
+  await app.clock!.runFor(10_000);
+  expect(rosterReads()).toBe(before + 1); // A slow read is not starved by the next tick.
+  await app.clock!.runFor(1_000);
+  await app.waitFor("id:member:carol");
+  slow = false;
+  w.f.state.spaces.get("acme")!.members.delete("bob");
+  await app.clock!.runFor(5_000);
+  await app.waitFor("id:space-settings-dialog", { state: "gone" });
+  await app.waitFor("id:space:acme", { state: "gone" });
+  expect(app.shows("text:side lobby only")).toBe(true);
+});
+
+test("attach and confirmed detach affect only the Space being configured", async () => {
+  const w = spaceWorld();
+  w.f.addSpace("empty", "Empty", "alice");
+  w.f.addSpace("other", "Other", "alice");
+  const r = w.f.addRunner("Shared", "organization", "bob");
+  const foreign = w.f.addRunner("Bob’s private runner", "personal", "bob");
+  w.f.state.attached.set("other", r.id);
+  const app = await signIn(w);
+  await openSettingsFor(app, "empty");
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor(`id:space-runner-attach:${r.id}`);
+  expect(app.shows(`id:space-runner-attach:${foreign.id}`)).toBe(false);
+  expect(w.f.posts()).toEqual([]);
+  await app.press(`id:space-runner-attach:${r.id}`);
+  await app.waitFor("id:space-runner-status >> text:Attached · Shared");
+  expect(w.f.posts().filter((p) => p.path.includes("/runner"))).toEqual([
+    { user: "alice", method: "POST", path: "/v1/spaces/empty/runner/attach-if-empty", body: { runner_id: r.id } },
+  ]);
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:cancel");
+  expect(w.f.state.attached.get("empty")).toBe(r.id);
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitFor("id:space-runner-status >> text:No runner");
+  expect(w.f.state.attached.has("empty")).toBe(false);
+  expect(w.f.state.attached.get("other")).toBe(r.id);
+});
+
+test("an old server cannot offer or fall back to a replacing attach", async () => {
+  const w = spaceWorld();
+  w.f.addSpace("empty", "Empty", "alice");
+  const r = w.f.addRunner("Runner", "personal", "alice");
+  w.f.state.attachIfEmpty = false;
+  const app = await signIn(w);
+  await openSettingsFor(app, "empty");
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:space-runner-attach-unsupported");
+  expect(app.shows(`id:space-runner-attach:${r.id}`)).toBe(false);
+  await app.press("id:space-runner-advanced:toggle");
+  expect(app.shows("id:issue-runner-token")).toBe(true);
+  expect(app.shows("id:local-tools-card")).toBe(false);
+  expect(w.f.posts()).toEqual([]);
+});
+
+test("a concurrent dedicated pairing is never replaced, and detach confirms the same runner", async () => {
+  const w = spaceWorld();
+  w.f.addSpace("empty", "Empty", "alice");
+  const r = w.f.addRunner("First runner", "personal", "alice");
+  const other = w.f.addRunner("Different runner", "organization", "alice");
+  const app = await signIn(w);
+  await openSettingsFor(app, "empty");
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor(`id:space-runner-attach:${r.id}`);
+  w.f.state.beforeEmptyAttach = (sid) => { w.f.state.spaces.get(sid)!.runnerToken = "fixture-dedicated"; };
+  await app.press(`id:space-runner-attach:${r.id}`);
+  await app.waitFor("id:space-runner-status >> text:Dedicated token");
+  expect(app.shows("id:manage-error")).toBe(true);
+  expect(w.f.state.attached.has("empty")).toBe(false);
+  expect(w.f.state.spaces.get("empty")!.runnerToken).toBe("fixture-dedicated");
+  expect(app.texts().join(" ")).not.toContain("fixture-dedicated");
+  expect(app.shows(`id:space-runner-attach:${r.id}`)).toBe(false);
+  w.f.state.beforeEmptyAttach = null;
+  w.f.state.spaces.get("empty")!.runnerToken = null;
+  w.f.state.attached.set("empty", r.id);
+  await app.press("id:space-settings-tab:members");
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:space-runner-detach");
+  await app.press("id:space-runner-detach");
+  w.f.state.attached.set("empty", other.id);
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitFor("id:space-runner-status >> text:Attached · Different runner");
+  expect(app.shows("id:manage-error")).toBe(true);
+  expect(w.f.state.attached.get("empty")).toBe(other.id);
+  expect(w.f.posts().filter((p) => p.path.includes("/runner")).map((p) => p.method)).toEqual(["POST"]);
+});
+
+test("delayed attach and detach responses cannot overwrite newer actual assignments", async () => {
+  const w = spaceWorld();
+  w.f.addSpace("empty", "Empty", "alice");
+  const first = w.f.addRunner("First runner", "personal", "alice");
+  const second = w.f.addRunner("Second runner", "personal", "alice");
+  const gate = (method: string, path: string) => {
+    const key = `${method} ${BASE}/v1/*`;
+    const respond = w.network[key]!;
+    w.network[key] = (req) => {
+      const reply = respond(req);
+      return new URL(req.url).pathname === path ? { ...(reply as object), delay: 800 } : reply;
+    };
+  };
+  gate("POST", "/v1/spaces/empty/runner/attach-if-empty");
+  gate("DELETE", "/v1/spaces/empty/runner");
+  const app = await signIn(w, "alice", true);
+  await openSettingsFor(app, "empty");
+  await app.press("id:space-settings-tab:runner");
+  await app.press(`id:space-runner-attach:${first.id}`);
+  await app.waitUntil(() => w.f.state.attached.get("empty") === first.id);
+  w.f.state.attached.set("empty", second.id);
+  await app.clock!.runFor(800);
+  await app.waitFor("id:space-runner-status >> text:Attached · Second runner");
+  await app.waitFor("id:manage-error");
+  expect(app.shows("id:manage-notice")).toBe(false);
+
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitUntil(() => !w.f.state.attached.has("empty"));
+  w.f.state.attached.set("empty", first.id);
+  await app.clock!.runFor(800);
+  await app.waitFor("id:space-runner-status >> text:Attached · First runner");
+  await app.waitFor("id:manage-error");
+  expect(app.shows("id:manage-notice")).toBe(false);
+  expect(app.shows("id:test-runner")).toBe(true);
+});
+
+test("a dedicated token starts masked and cannot be recovered by reopening Runner", async () => {
+  const w = spaceWorld();
+  w.f.addSpace("empty", "Empty", "alice");
+  const app = await signIn(w);
+  await openSettingsFor(app, "empty");
+  await app.press("id:space-settings-tab:runner");
+  expect(app.shows("id:issue-runner-token")).toBe(false);
+  await app.press("id:space-runner-advanced:toggle");
+  await app.press("id:issue-runner-token");
+  await app.waitFor("id:token-reveal");
+  const issued = w.f.state.spaces.get("empty")!.runnerToken!;
+  expect(!!issued).toBe(true);
+  expect(app.texts().some((t) => t.includes(issued))).toBe(false);
+  await app.press("id:space-settings-tab:members");
+  await app.press("id:space-settings-tab:runner");
+  await app.waitFor("id:space-runner-status >> text:Dedicated token");
+  expect(app.shows("id:token-reveal")).toBe(false);
+  await app.press("id:space-runner-advanced:toggle");
+  await app.waitFor("id:issue-runner-token");
+  expect(app.shows("id:copy-runner-token")).toBe(false);
 });
 
 test("the owner adds an agent with live handle checks, makes it the default and deletes the other", async () => {

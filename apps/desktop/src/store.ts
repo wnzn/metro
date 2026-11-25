@@ -58,7 +58,7 @@ export type Status =
   | { phase: "online" }
   | { phase: "retrying"; attempt: number; retryInMs: number; message: string };
 
-export type View = "room" | "manage";
+export type View = "room";
 /**
  * What the user is looking at: the personal Chat, the active Space, the
  * user's own Search, Library (Documents & media) and Scheduled tasks (all
@@ -157,13 +157,14 @@ const membersBySpace = signal<Record<string, Member[]>>({});
 export const members = computed(() => membersBySpace()[activeSpaceId() ?? ""] ?? null);
 export const membersError = signal<string | null>(null);
 
+/** Share a fresh membership read with the active room's existing cache. */
+export function rememberMembers(sid: string, list: Member[]) {
+  membersBySpace.set({ ...membersBySpace(), [sid]: list });
+}
+
 // Mentions picked in the room composer. Only for the active room; cleared when
 // the room or Space changes, and pruned when their text leaves the draft.
 export const mentions = signal<Mention[]>([]);
-
-// Space management (owners)
-export const manageError = signal<string | null>(null);
-export const memberBusy = signal<string | null>(null);
 
 // ------------------------------------------------------------------ session internals
 
@@ -187,7 +188,7 @@ const spaceEpoch = new Map<string, number>();
 // here instead of this module importing them.
 const transientClearers: (() => void)[] = [];
 const sessionEnders: (() => void)[] = [];
-const manageOpeners: ((spaceId: string) => void)[] = [];
+const manageOpeners: ((spaceId: string, section: "members" | "runner") => void)[] = [];
 /** Called whenever the place, Space, room or view changes: drop anything shown once. */
 export function onTransientClear(fn: () => void) {
   transientClearers.push(fn);
@@ -205,8 +206,8 @@ const sessionStarters: ((session: { baseUrl: string; token: string }) => void)[]
 export function onSessionStart(fn: (session: { baseUrl: string; token: string }) => void) {
   sessionStarters.push(fn);
 }
-/** Called after an owner opens a Space's management view. */
-export function onManageOpen(fn: (spaceId: string) => void) {
+/** Registers the Space settings destination for legacy management links. */
+export function onManageOpen(fn: (spaceId: string, section: "members" | "runner") => void) {
   manageOpeners.push(fn);
 }
 
@@ -1100,41 +1101,13 @@ export async function runDemo(): Promise<boolean> {
   }
 }
 
-// ------------------------------------------------------------------ management (owners)
+// ------------------------------------------------------------------ Space settings links
 
-export async function openManage(): Promise<void> {
-  const space = activeSpace();
-  if (!space || space.role !== "owner") return;
-  batch(() => {
-    clearTransient();
-    view.set("manage");
-    manageError.set(null);
-    notice.set(null);
-  });
-  for (const fn of manageOpeners) fn(space.id);
-  await reloadMembers();
-}
-
-export function closeManage() {
-  batch(() => {
-    clearTransient();
-    view.set("room");
-    manageError.set(null);
-    notice.set(null);
-  });
-}
-
-export async function reloadMembers(): Promise<void> {
+/** The old Manage link now opens Members without leaving the room or its draft. */
+export function openManage(section: "members" | "runner" = "members") {
   const sid = activeSpaceId();
-  const c = client;
-  if (!sid || !c) return;
-  const ok = guard(sid);
-  try {
-    const list = await c.listMembers(sid);
-    if (ok()) membersBySpace.set({ ...membersBySpace(), [sid]: list });
-  } catch (error) {
-    if (ok()) handleManageError(error, "Could not load members", sid);
-  }
+  if (!sid || !activeSpace()) return;
+  for (const fn of manageOpeners) fn(sid, section);
 }
 
 /** Loads the active Space's members for the mention picker (any member may). */
@@ -1216,53 +1189,6 @@ export function setDraft(text: string) {
     });
     if (kept.length !== mentions().length) mentions.set(kept);
   });
-}
-
-export async function addMember(userIdInput: string): Promise<boolean> {
-  const userId = userIdInput.trim();
-  const sid = activeSpaceId();
-  const c = client;
-  if (!sid || !c || memberBusy()) return false;
-  if (!userId) {
-    manageError.set("Enter the user ID of the person to add. They can copy it from their sidebar.");
-    return false;
-  }
-  const ok = guard(sid);
-  batch(() => {
-    memberBusy.set(userId);
-    manageError.set(null);
-  });
-  try {
-    await c.addMember(sid, userId);
-    if (!ok()) return false;
-    await reloadMembers();
-    return true;
-  } catch (error) {
-    if (ok()) handleManageError(error, `Could not add ${userId}`, sid);
-    return false;
-  } finally {
-    if (ok()) memberBusy.set(null);
-  }
-}
-
-export async function removeMember(userId: string): Promise<void> {
-  const sid = activeSpaceId();
-  const c = client;
-  if (!sid || !c || memberBusy()) return;
-  const ok = guard(sid);
-  batch(() => {
-    memberBusy.set(userId);
-    manageError.set(null);
-  });
-  try {
-    await c.removeMember(sid, userId);
-    if (!ok()) return;
-    await reloadMembers();
-  } catch (error) {
-    if (ok()) handleManageError(error, `Could not remove ${userId}`, sid);
-  } finally {
-    if (ok()) memberBusy.set(null);
-  }
 }
 
 /** Marks whether anyone serves a Space (a dedicated token or an attached runner). */
@@ -1359,8 +1285,6 @@ function endSession() {
     membersBySpace.set({});
     membersError.set(null);
     mentions.set([]);
-    manageError.set(null);
-    memberBusy.set(null);
     orgAdmin.set(false);
     settingsSection.set("runners");
     for (const fn of sessionEnders) fn();
@@ -1632,21 +1556,6 @@ function handleActionError(error: unknown, what: string, spaceId?: string) {
     void lostAccess(spaceId, activeSpaceId() === spaceId ? activeRoomId() : null);
   } else if (error instanceof ApiError && error.transient) {
     kick();
-  }
-}
-
-export function handleManageError(error: unknown, what: string, spaceId: string) {
-  if (isAborted(error)) return;
-  if (error instanceof ApiError && error.kind === "auth") {
-    disconnect(error.message);
-    return;
-  }
-  manageError.set(describe(error, what));
-  if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) {
-    void lostAccess(spaceId, null).then(() => {
-      // Ownership may have changed: leave the management view if no longer the owner.
-      if (activeSpace()?.role !== "owner" && view() === "manage") closeManage();
-    });
   }
 }
 

@@ -160,18 +160,21 @@ test("revoking a dedicated token asks first; Cancel changes nothing", async () =
   await app.press("id:space:acme");
   await app.waitFor("id:manage-space");
   await app.press("id:manage-space");
+  await app.waitFor("id:space-members");
+  await app.press("id:space-settings-tab:runner");
+  await app.press("id:space-runner-advanced:toggle");
   await app.waitFor("id:dedicated-runner");
   await app.press("id:revoke-runner-token");
-  await app.waitFor("id:confirm-revoke");
-  expect(app.shows("text:Revoke now: the runner stops serving this Space")).toBe(true);
-  await app.press("text:Cancel");
-  await app.waitFor("id:confirm-revoke", { state: "gone" });
+  await app.waitFor("id:revoke-runner-token:confirm");
+  expect(app.shows("text:The dedicated runner stops serving this Space.")).toBe(true);
+  await app.press("id:revoke-runner-token:cancel");
+  await app.waitFor("id:revoke-runner-token:confirm", { state: "gone" });
   expect(f.state.spaces.get("acme")!.runnerToken).toBe("runner-acme");
 
   await app.press("id:revoke-runner-token");
-  await app.press("id:confirm-revoke");
+  await app.press("id:revoke-runner-token:confirm");
   await app.waitFor("id:manage-notice");
-  expect(text(app)).toContain("Runner token revoked.");
+  expect(text(app)).toContain("Dedicated token revoked.");
   expect(f.state.spaces.get("acme")!.runnerToken).toBe(null);
 });
 

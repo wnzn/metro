@@ -1,14 +1,13 @@
 // Space settings: a modal over the app, opened per Space
-// (openSpaceSettings). Every member sees General (owners edit it), Agents
-// (owners edit them), Your preferences (their own) and Members and runner
-// (the runner's status and Test runner; owners also manage there).
+// (openSpaceSettings). Every member sees General, Members, Runner, Agents
+// and Your preferences; only the owner changes shared settings.
 // Closing returns to where the user was.
 //
 // Destructive steps follow the app's pattern: an outlined first press, then
 // a filled confirmation that says what happens (Delete also needs the
 // Space's exact name typed).
 
-import { closeManage, openManage, selectSpace, activeSpaceId, openSettings } from "../../store";
+import { openSettings } from "../../store";
 import {
   Action,
   ActionBar,
@@ -38,9 +37,9 @@ import {
 import type { IconName } from "../../ui";
 import { MAX_AGENT_DESCRIPTION, MAX_AGENT_HANDLE, MAX_AGENT_INSTRUCTIONS, MAX_AGENT_NAME, MAX_SPACE_DESCRIPTION, initialOf, suggestHandle } from "../../api/spaces";
 import type { SpaceAgent } from "../../api/spaces";
-import { agentList, spaceAgents } from "./agents";
+import { agentList, spaceAgents, toolInfo } from "./agents";
 import { SpaceAgentAvatar } from "./SpaceAgentAvatar";
-import { TEST_RUNNER_DESCRIPTION, TEST_RUNNER_LABEL, TestRunnerAction } from "./TestRunner";
+import { MembersPage, RunnerPage } from "./SpaceManagementPages";
 import { effortsOf, selectionOf, shownValue, spaceModelOptions, thinkingOptions, unlisted, withEffort } from "./modelOptions";
 import { ThinkingChoice } from "../../ui/composerModelTrigger";
 import {
@@ -102,14 +101,13 @@ import {
 } from "./spaceSettingsState";
 import type { SpaceSettingsSection } from "./spaceSettingsState";
 
-const PAGES: readonly { section: SpaceSettingsSection; label: string; icon: IconName; ownerOnly?: boolean }[] = [
+const PAGES: readonly { section: SpaceSettingsSection; label: string; icon: IconName }[] = [
   { section: "general", label: "General", icon: "settings" },
-  { section: "members", label: "Members and runner", icon: "person" },
+  { section: "members", label: "Members", icon: "person" },
+  { section: "runner", label: "Runner", icon: "server" },
   { section: "agents", label: "Agents", icon: "agent" },
   { section: "preferences", label: "Your preferences", icon: "routing" },
 ];
-
-const pages = () => PAGES.filter((p) => !p.ownerOnly || isSettingsOwner());
 
 /** The Space settings modal. Mount it once (the Shell); it shows while a Space's settings are open. */
 export function SpaceSettingsModal() {
@@ -167,7 +165,7 @@ function Compact() {
 
 function Tabs(props: { compact: boolean }) {
   return (
-    <Each of={pages()} key={(p) => p.section}>
+    <Each of={PAGES} key={(p) => p.section}>
       {(p) => (
         <ModalTab
           testID={`space-settings-tab:${p().section}`}
@@ -194,6 +192,9 @@ function Page() {
       </If>
       <If when={spaceSettingsSection() === "members"}>
         <MembersPage />
+      </If>
+      <If when={spaceSettingsSection() === "runner"}>
+        <RunnerPage />
       </If>
       <If when={spaceSettingsSection() === "agents"}>
         <AgentsPage />
@@ -261,7 +262,7 @@ function GeneralPage() {
         </Column>
       }
     >
-      <PageHeader title="General" subtitle={isSettingsOwner() ? "Every member of this Space sees its name and description." : "Only the Space's owner can change these."} />
+      <PageHeader title="General" scope={{ kind: "space" }} subtitle={isSettingsOwner() ? "Every member of this Space sees its name and description." : "Only the owner can change this."} />
       <If when={detailsError()}>
         {(m) => (
           <Banner variant="inline" tone="danger" testID="space-details-error" message={m()} action={<Action label="Try again" onPress={() => void loadDetails()} />} />
@@ -398,49 +399,6 @@ function DangerZone() {
   );
 }
 
-// ---------------------------------------------------------------- Members and runner
-
-/** The runner's status and Test runner for every member; owners also open Manage (members and the runner). */
-function MembersPage() {
-  const open = async () => {
-    const sid = spaceSettingsFor();
-    if (!sid) return;
-    closeSpaceSettings();
-    if (activeSpaceId() !== sid) await selectSpace(sid);
-    closeManage();
-    await openManage();
-  };
-  const paired = () => !!settingsSpace()?.runnerPaired;
-  return (
-    <PageLayout testID="space-members" pad={pad()} gap={6}>
-      <PageHeader
-        title="Members and runner"
-        subtitle={isSettingsOwner() ? "Who is in this Space, and which runner serves it." : "Which runner serves this Space. Only the owner manages members and the runner."}
-      />
-      <SettingsGroup>
-        {/* Management stays the owner's; every member sees the runner's status and can test it. */}
-        <If when={isSettingsOwner()}>
-          <SettingRow label="Manage members and the runner" description="Add or remove members by their user ID, attach or detach a runner, or pair a dedicated one. Only you, the owner, can do this.">
-            <Action testID="open-manage" label="Open" onPress={() => void open()} />
-          </SettingRow>
-        </If>
-        <SettingRow
-          label="Runner"
-          description={paired() ? "Attached: this Space's jobs go to it. That doesn't mean the runner is online." : "No runner is attached; agents still answer, without workspace tools."}
-          testID="runner-status-row"
-        >
-          <Badge testID="space-runner-status" tone={paired() ? "runner" : "neutral"} label={paired() ? "Runner attached" : "No runner"} />
-        </SettingRow>
-        <If when={paired()}>
-          <SettingRow label={TEST_RUNNER_LABEL} description={`${TEST_RUNNER_DESCRIPTION}. The listing is posted in the room you have open.`} testID="test-runner-row">
-            <TestRunnerAction spaceId={spaceSettingsFor()} />
-          </SettingRow>
-        </If>
-      </SettingsGroup>
-    </PageLayout>
-  );
-}
-
 // ---------------------------------------------------------------- Agents
 
 function AgentsPage() {
@@ -469,6 +427,7 @@ function AgentsPage() {
           <>
             <PageHeader
               title="Agents"
+              scope={{ kind: "space" }}
               subtitle={
                 isSettingsOwner()
                   ? "Members address an agent with its @handle. @agent and Ask agent start the default one, or the agent a member's own classifier picks when they turned it on."
@@ -522,9 +481,14 @@ function AgentCard(props: { agent: SpaceAgent }) {
           <Label variant="caption" color="muted" testID={`agent-description:${a().id}`}>
             {a().description}
           </Label>
-          <Label variant="caption" color="muted">
-            {a().tools.length ? `Tools: ${a().tools.join(", ")}` : "No workspace or thread tools"}
-          </Label>
+          <If when={a().tools.length} else={<Label variant="caption" color="muted">No optional tools</Label>}>
+            <Row align="center" gap={1} wrap>
+              <Label variant="caption" color="muted">Tools:</Label>
+              <Each of={a().tools} key={(t) => t}>
+                {(t, index) => <Label variant={toolInfo(t()) ? "caption" : "mono"} color="muted">{`${toolInfo(t())?.label ?? t()}${index() < a().tools.length - 1 ? "," : ""}`}</Label>}
+              </Each>
+            </Row>
+          </If>
         </Column>
       </Row>
       <If when={isSettingsOwner()}>
@@ -605,14 +569,13 @@ function AgentEditor() {
   const d = () => agentDraft()!;
   const sid = () => spaceSettingsFor() ?? "";
   const isNew = () => editing()?.mode === "new";
-  const tools = () => agentList(sid())?.tools ?? [];
   const current = () => editedAgent();
   const busyPicture = () => !!agentBusy()?.startsWith("picture:");
   const hasPicture = () => (isNew() ? !!pendingPicture() : !!current()?.avatarVersion);
   return (
     <If when={agentDraft()}>
       <Column gap={6} testID="agent-editor">
-        <PageHeader title={isNew() ? "New agent" : `Edit ${current()?.name ?? "agent"}`} subtitle="Members see everything on this page, including the instructions." />
+        <PageHeader title={isNew() ? "New agent" : `Edit ${current()?.name ?? "agent"}`} scope={{ kind: "space" }} subtitle="Members see everything on this page, including the instructions." />
 
         <SettingsGroup title="Picture" description="PNG or JPEG, up to 1 MB. Without one, the initial shows on the colour below.">
           <Row gap={4} align="center" padX={4} padY={4}>
@@ -702,22 +665,60 @@ function AgentEditor() {
           </SettingRow>
         </SettingsGroup>
 
-        <SettingsGroup title="Tools" description="What the agent may use in this Space's runner workspace and threads. With none, it can only answer.">
-          <Each of={[...tools()]} key={(t) => t}>
-            {(t) => (
-              <SettingRow label={t()}>
-                <Toggle
-                  testID={`agent-tool:${t()}`}
-                  label={`Allow ${t()}`}
-                  checked={d().tools.includes(t())}
-                  onChange={(on) => updateDraft({ tools: on ? [...d().tools.filter((x) => x !== t()), t()] : d().tools.filter((x) => x !== t()) })}
-                />
-              </SettingRow>
-            )}
-          </Each>
-        </SettingsGroup>
+        <AgentToolGroups />
       </Column>
     </If>
+  );
+}
+
+const TOOL_GROUPS = [
+  { key: "workspace", title: "Workspace and threads", description: "Workspace tools need a runner that offers them. Threads stay in this Space." },
+  { key: "web", title: "Web", description: "Uses only the computer, internet address and providers of the person who started the run. If that computer is offline, no web data is fetched." },
+  { key: "pages", title: "Pages", description: "Works only in this Space and with the starter's access. The room sees the draft card; only the starter can preview and apply it." },
+  { key: "other", title: "Other tools", description: "Additional tools reported by this server." },
+] as const;
+
+function AgentToolGroups() {
+  const tools = () => agentList(spaceSettingsFor())?.tools ?? [];
+  return (
+    <Column gap={3} testID="agent-tool-groups">
+      <Label variant="heading" heading>Tools</Label>
+      <Label variant="caption" color="muted">These permissions limit what the agent can use. They don’t add tools to a run.</Label>
+      <Each of={TOOL_GROUPS} key={(g) => g.key}>
+        {(group) => {
+          const ids = () => tools().filter((id) => (toolInfo(id)?.group ?? "other") === group().key);
+          return (
+            <If when={ids().length}>
+              <SettingsGroup title={group().title} description={group().description} testID={`agent-tools:${group().key}`}>
+                <If when={group().key === "web"}>
+                  <SettingRow label="Queries are visible to this Space" description="Members can see exact queries in run activity. Providers see queries or addresses; keys stay on the starter's computer." />
+                </If>
+                <Each of={ids()} key={(id) => id}>
+                  {(id) => {
+                    const tool = () => toolInfo(id());
+                    const label = () => tool()?.label ?? id();
+                    return (
+                      <SettingRow label={tool() ? label() : "Allow tool"} description={tool()?.description}>
+                        <If when={!tool()}><Label variant="mono">{id()}</Label></If>
+                        <Toggle testID={`agent-tool:${id()}`} label={`Allow ${label()}`}
+                          checked={!!agentDraft()?.tools.includes(id())} disabled={savingAgent()}
+                          onChange={(on) => {
+                            const draft = agentDraft();
+                            const toolId = id();
+                            if (!draft || !isSettingsOwner() || savingAgent() || !tools().includes(toolId)) return;
+                            const kept = draft.tools.filter((x) => x !== toolId);
+                            updateDraft({ tools: on ? [...kept, toolId] : kept });
+                          }} />
+                      </SettingRow>
+                    );
+                  }}
+                </Each>
+              </SettingsGroup>
+            </If>
+          );
+        }}
+      </Each>
+    </Column>
   );
 }
 
@@ -732,7 +733,7 @@ function PreferencesPage() {
   const agentOptions = () => spaceModelOptions(catalog(), "Your model for this Space, or the rule after it");
   return (
     <PageLayout testID="space-preferences" pad={pad()} gap={6} footer={spaceNotice() ? <Notice /> : undefined}>
-      <PageHeader title="Your preferences" subtitle="Only you see and change these. They apply to your own messages in this Space." />
+      <PageHeader title="Your preferences" scope={{ kind: "space", personal: true }} subtitle="These choices apply to your own messages in this Space." />
       <If when={prefsError()}>
         {(m) => <Banner variant="inline" tone="danger" testID="prefs-error" message={m()} action={<Action label="Try again" onPress={() => void loadPreferences()} />} />}
       </If>
@@ -748,19 +749,22 @@ function PreferencesPage() {
       >
         {(v) => (
           <Column gap={6}>
-            <SettingsGroup title="Messages without @agent">
+            <SettingsGroup title="Agent pickup">
               <SettingRow
                 testID="classify-row"
-                label="Let an agent pick up messages without @agent"
-                description="Your System One classifier reads your own messages here that mention no agent, decides whether one is for an agent and which, and that agent answers with your model. Never other people's messages. Off by default."
+                label="Classify my unaddressed messages"
+                description="System One can decide whether your unaddressed messages here are for an agent, and pick which one. Off by default." stacked
               >
                 <Toggle
                   testID="classify-unaddressed"
-                  label="Let an agent pick up messages without @agent"
+                  label="Classify my unaddressed messages"
                   checked={v().classifyUnaddressed}
                   disabled={prefsBusy() !== null || (!v().classifierAvailable && !v().classifyUnaddressed)}
                   onChange={setClassifyUnaddressed}
                 />
+                <Label variant="caption" color="muted">
+                  With this on, System One can also pick the agent for a generic @agent or Ask agent request. It never classifies messages to a person only or to a named agent. Never other people's messages. Personal Chat starts its agent directly, without classification.
+                </Label>
               </SettingRow>
               <If when={!v().classifierAvailable}>
                 <Row padX={4} padY={3} gap={3} align="center" testID="classifier-missing">
@@ -772,7 +776,7 @@ function PreferencesPage() {
                   <Action
                     compact
                     testID="open-model-providers"
-                    label="Model providers"
+                    label="Open Model connections"
                     onPress={() => {
                       closeSpaceSettings();
                       openSettings("providers");
@@ -829,7 +833,7 @@ function PreferencesPage() {
               </SettingRow>
               <SettingRow
                 label="Use model routing in this Space"
-                description="When you've turned on use-case routing (Settings › Model routing), let it pick your model here when you haven't chosen one above."
+                description="Let your use-case routing pick the answering model here when you haven't chosen one for the turn, agent or Space."
               >
                 <Toggle testID="space-routing" label="Use model routing in this Space" checked={v().routing} disabled={prefsBusy() !== null} onChange={setSpaceRouting} />
               </SettingRow>

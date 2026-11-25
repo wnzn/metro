@@ -1,10 +1,9 @@
 import { cleanup, effect, keymap, untracked } from "nsh";
-import { mainPlace, me, openSettings, spaces, view } from "../store";
+import { mainPlace, me, openSettings, spaces } from "../store";
 import { refreshPages } from "../pagesState";
 import { CenteredToolbar, Column, compactWidth, modalOpen, navigationPanel, PanelToggle, Surface } from "../ui";
 import { ChatView } from "./ChatView";
 import { LibraryHome } from "./library/LibraryView";
-import { ManageSpace } from "./ManageSpace";
 import { PagesView } from "./pages/PagesView";
 import { ScheduledTasksView } from "./ScheduledTasksView";
 import { SearchView } from "./SearchView";
@@ -19,7 +18,7 @@ import { TopSearch } from "./TopSearch";
  * on a narrow window), then the main panel: one header row (the sidebar's
  * toggle, a room's breadcrumb and actions, the search box, which mod+k
  * focuses), under it the Chat, Library, Search, Scheduled
- * tasks, or a Space's room or its management. Settings opens as a modal over
+ * tasks, or a Space's room. Settings opens as a modal over
  * all of it and leaves the main panel mounted, so closing it returns to the
  * same place, draft and scroll.
  */
@@ -40,7 +39,7 @@ export function Shell() {
     }
   });
   // A Space's room puts its breadcrumb and actions in the same header row.
-  const inRoom = () => mainPlace() === "space" && view() !== "manage";
+  const inRoom = () => mainPlace() === "space";
   // Construct one Pages route owner. The owner mounts just the active slot.
   const pagesPane = <PagesView />;
   return (
@@ -72,9 +71,7 @@ export function Shell() {
           <ScheduledTasksView />
         </If>
         <If when={mainPlace() === "space"}>
-          <If when={view() === "manage"} else={<SpaceView />}>
-            <ManageSpace />
-          </If>
+          <SpaceView />
         </If>
       </Column>
       <SettingsModal />

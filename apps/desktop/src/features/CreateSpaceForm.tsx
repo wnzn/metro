@@ -99,8 +99,7 @@ export function NewSpaceRunnerFeedback() {
           action={result().failed && activeSpace()?.role === "owner" ? (
             <Action compact testID="new-space-open-runner" label="Open Runner" variant="ghost" onPress={() => {
               if (activeSpace()?.id !== result().spaceId || activeSpace()?.role !== "owner") return;
-              // Until U9: this is the created Space's existing runner management.
-              void openManage();
+              openManage("runner");
             }} />
           ) : undefined} />
       )}

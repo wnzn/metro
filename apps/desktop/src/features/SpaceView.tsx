@@ -132,19 +132,19 @@ export function RoomHeaderTitle() {
   );
 }
 
-/** The room's actions at the end of the header row: whether a runner serves it, Manage (owners), Space settings. Test runner lives with the runner controls (Space settings › Members and runner, Manage). */
+/** Room actions: runner status, an owner's Members shortcut, and Space settings. */
 export function RoomHeaderActions() {
   const paired = () => !!activeSpace()?.runnerPaired;
   return (
     <>
       <Badge testID="runner-state" tone={paired() ? "runner" : "neutral"} label={paired() ? "Runner attached" : "No runner"} />
       <If when={activeSpace()?.role === "owner"}>
-        <Action testID="manage-space" label="Manage" onPress={() => void openManage()} />
+        <Action testID="manage-space" label="Members" onPress={() => openManage()} />
       </If>
       <ToolbarIconButton
         testID="space-settings-open"
         icon="settings"
-        accessibilityLabel={`Settings of ${activeSpace()?.name ?? "this Space"}: its agents and your preferences`}
+        accessibilityLabel={`Open settings for ${activeSpace()?.name ?? "this Space"}`}
         tooltip="Space settings"
         disabled={!activeSpace()}
         onPress={() => {

@@ -215,7 +215,31 @@ test("atomic conflicts and a missing empty-only route preserve the created Space
     expect(words(app)).toContain(kind === "missing route" ? "safe attachment route" : "already has a runner");
     expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
     await app.press("id:new-space-open-runner");
-    await app.waitFor("id:runner-card"); // existing management until U9 lands
+    await app.waitFor("id:space-runner");
+    expect(app.shows("id:space-members")).toBe(false);
+    const expected = kind === "registered" ? "Attached · Shared" : kind === "dedicated" ? "Dedicated token" : "No runner";
+    await app.waitFor(`id:space-runner-status >> text:${expected}`);
+    if (kind === "missing route") {
+      await app.waitFor(`id:space-runner-attach:${r.id}`);
+      expect(app.shows("text:Recommended")).toBe(true);
+    } else {
+      expect(app.shows(`id:space-runner-attach:${r.id}`)).toBe(false);
+    }
+    expect(runnerWrites(f)).toHaveLength(1);
+    if (kind === "missing route") {
+      f.state.missingEmptyAttachRoute = false;
+      await app.press(`id:space-runner-attach:${r.id}`);
+      await app.waitFor("id:space-runner-status >> text:Attached · This PC");
+      expect(f.state.attached.get(created.id)).toBe(r.id);
+      expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([
+        ["POST", `/v1/spaces/${created.id}/runner/attach-if-empty`],
+        ["POST", `/v1/spaces/${created.id}/runner/attach-if-empty`],
+      ]);
+      await app.waitUntil(() => app.storage()[runnerOfferStorageKey(BASE, "alice")] === "dismissed");
+    }
+    await app.press("id:space-settings-close");
+    await app.waitFor("id:space-settings-dialog", { state: "gone" });
+    expect(app.shows("id:space-view")).toBe(true);
   }
 });
 
@@ -240,7 +264,7 @@ test("an unconfirmed attach is not a refusal or a retry; Open Runner checks the 
   expect(runnerWrites(f)).toHaveLength(1);
 });
 
-test("a held successful attach reply cannot resurrect a runner after a newer Manage detach", async () => {
+test("a held successful attach reply cannot resurrect a runner after a newer Space settings detach", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");
   const t = fixture(f, r.id);
@@ -255,10 +279,11 @@ test("a held successful attach reply cannot resurrect a runner after a newer Man
   });
   const id = space(f, "Detach before receipt").id;
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
   await app.waitFor("id:attached-runner");
-  await app.press("id:detach-runner");
-  await app.press("id:confirm-detach");
-  await app.waitFor(`id:attach-runner:${r.id}`);
+  await app.press("id:space-runner-detach");
+  await app.press("id:space-runner-detach:confirm");
+  await app.waitFor(`id:space-runner-attach:${r.id}`);
   expect(f.state.attached.has(id)).toBe(false);
 
   await app.clock!.runFor(800);
@@ -270,6 +295,7 @@ test("a held successful attach reply cannot resurrect a runner after a newer Man
     ["POST", `/v1/spaces/${id}/runner/attach-if-empty`],
     ["DELETE", `/v1/spaces/${id}/runner`],
   ]);
+  await app.press("id:space-settings-close");
   await app.press("id:nav-settings");
   await app.waitFor(`id:runner-attach-pick:${id}`); // The paired flag is false.
   expect(app.shows(`id:installed-runner-space:${id}`)).toBe(false);
@@ -483,7 +509,7 @@ test("only a recently verified online status offers existing Spaces; becoming of
   expect(creates(f)).toEqual([]);
 });
 
-test("Settings reopen joins held Sidebar liveness and refreshes folders after manual attach and detach", async () => {
+test("Settings reopen joins held Sidebar liveness and refreshes folders after an assignment changes on another client", async () => {
   const f = world();
   const r = f.addRunner("This PC", "personal", "alice");
   f.addSpace("manual", "Manual", "alice");
@@ -496,11 +522,9 @@ test("Settings reopen joins held Sidebar liveness and refreshes folders after ma
   await app.waitFor("id:runner-attach-pick:manual");
   expect(app.shows("id:installed-runner-space:manual")).toBe(false);
   await app.press("id:settings-close");
-  await app.press("id:space:manual");
-  await app.press("id:manage-space");
-  await app.waitFor(`id:attach-runner:${r.id}`);
-  await app.press(`id:attach-runner:${r.id}`);
-  await app.waitFor("id:attached-runner");
+  // Another client attaches the runner. A successful local attach dismisses
+  // this launch's offer, which would stop the Sidebar liveness watch.
+  f.state.attached.set("manual", r.id);
   t.status.delay = 800;
   const reopenDuringLiveness = async () => {
     const before = t.status.reads;
@@ -514,9 +538,7 @@ test("Settings reopen joins held Sidebar liveness and refreshes folders after ma
   await reopenDuringLiveness();
   await app.waitFor("id:installed-runner-space:manual");
   await app.press("id:settings-close");
-  await app.press("id:detach-runner");
-  await app.press("id:confirm-detach");
-  await app.waitFor(`id:attach-runner:${r.id}`);
+  f.state.attached.delete("manual");
   const folderReads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/spaces/manual/runner").length;
   const before = folderReads();
   await reopenDuringLiveness();

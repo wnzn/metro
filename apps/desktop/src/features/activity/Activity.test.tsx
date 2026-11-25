@@ -178,11 +178,12 @@ test("failed, cancelled and interrupted turns say so while collapsed; errors sta
 test("Demo is Runner activity, not thinking, and never the person's name", async () => {
   const f = world();
   const app = await signedIntoAcme(f);
-  // Test runner, beside the runner's status on Manage.
+  // Test runner, beside the runner's status in Space settings.
   await app.press("id:manage-space");
+  await app.press("id:space-settings-tab:runner");
   await app.press("id:test-runner");
   await app.waitFor("text:/^Requested\\./");
-  await app.press("id:close-manage");
+  await app.press("id:space-settings-close");
   await app.waitFor("text:/^Runner (activity|is working…)$/");
   expect(shown(app, "text:/thinking/")).toBe(false);
   expect(shown(app, "text:Demo: workspace.list on the Space's runner")).toBe(true); // the request stays top-level
