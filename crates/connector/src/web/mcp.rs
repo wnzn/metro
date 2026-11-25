@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::{Value, json};
 
-use super::{Failure, MAX_VENDOR_BYTES, Outcome, retry_after, transport};
+use super::{Failure, GateStop, MAX_VENDOR_BYTES, Outcome, retry_after, transport};
 
 pub const PROTOCOL_VERSION: &str = "2025-11-25";
 const SESSION_TTL: Duration = Duration::from_secs(600);
@@ -71,14 +71,14 @@ pub enum McpError {
     Transport(Failure),
     /// An unreadable reply or a JSON-RPC error.
     Bad,
-    /// Consent was withdrawn: nothing more was sent.
-    Stopped,
+    /// The local gate refused to send the next message.
+    Stopped(GateStop),
 }
 
 /// One MCP request's context.
 pub struct Target<'a> {
     /// Re-read before every message sent (initialize, initialized, call).
-    pub gate: &'a (dyn Fn() -> bool + Sync),
+    pub gate: &'a (dyn Fn() -> Result<(), GateStop> + Sync),
     pub http: &'a reqwest::Client,
     pub url: &'a str,
     /// Credential headers (already marked sensitive); empty when keyless.
@@ -100,9 +100,7 @@ async fn post(
     body: &Value,
     want: Option<u64>,
 ) -> Result<Reply, McpError> {
-    if !(t.gate)() {
-        return Err(McpError::Stopped);
-    }
+    (t.gate)().map_err(McpError::Stopped)?;
     let mut rb = t
         .http
         .post(t.url)

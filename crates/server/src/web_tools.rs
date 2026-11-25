@@ -55,7 +55,7 @@ pub const PROVIDERS: [(&str, &str); 5] = [
 
 /// How a device reports one provider attempt. A fixed vocabulary, so no
 /// vendor text ever reaches Metro.
-pub const OUTCOMES: [&str; 11] = [
+pub const OUTCOMES: [&str; 12] = [
     "ok",
     "limited",
     "out_of_credits",
@@ -67,6 +67,7 @@ pub const OUTCOMES: [&str; 11] = [
     "skipped_cooldown",
     "skipped_no_key",
     "skipped_disabled",
+    "credential_changed",
 ];
 
 /// Why one URL of a fetch failed (a result, not a provider failure).
@@ -732,6 +733,7 @@ fn outcome_label(a: &Attempt) -> String {
         "skipped_cooldown" => "paused after an earlier limit",
         "skipped_no_key" => "needs a free key",
         "skipped_disabled" => "turned off",
+        "credential_changed" => "credential changed",
         _ => "failed",
     };
     match a.outcome.as_str() {

@@ -30,10 +30,7 @@ fn request(c: &Call<'_>, url: String, body: Value) -> reqwest::RequestBuilder {
 
 fn failure(c: &Call<'_>, status: u16, headers: &reqwest::header::HeaderMap) -> Failure {
     match status {
-        429 => Failure {
-            outcome: Outcome::Limited,
-            cooldown: retry_after(headers, c.now),
-        },
+        429 => Failure::with_cooldown(Outcome::Limited, retry_after(headers, c.now)),
         432 | 433 => Failure::for_secs(Outcome::OutOfCredits, 6 * 3600),
         401 | 403 if c.key.is_some() => Failure::of(Outcome::KeyRejected),
         _ => Failure::of(Outcome::Unavailable),

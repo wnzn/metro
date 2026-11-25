@@ -45,6 +45,7 @@ mod tests;
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, bail};
@@ -156,6 +157,8 @@ pub enum Outcome {
     /// Turned off (the master switch or this provider) while the job ran:
     /// no further request was made.
     SkippedDisabled,
+    /// The credential changed after a request, before the attempt finished.
+    CredentialChanged,
 }
 
 impl Outcome {
@@ -172,6 +175,7 @@ impl Outcome {
             Outcome::SkippedCooldown => "skipped_cooldown",
             Outcome::SkippedNoKey => "skipped_no_key",
             Outcome::SkippedDisabled => "skipped_disabled",
+            Outcome::CredentialChanged => "credential_changed",
         }
     }
 
@@ -188,6 +192,7 @@ impl Outcome {
             Outcome::SkippedCooldown,
             Outcome::SkippedNoKey,
             Outcome::SkippedDisabled,
+            Outcome::CredentialChanged,
         ]
         .into_iter()
         .find(|o| o.as_str() == s)
@@ -205,27 +210,37 @@ impl Outcome {
     }
 }
 
-/// How one provider call failed, with the provider's cooldown hint (seconds
-/// from now), if it gave one.
+/// Why the outbound gate refused to send a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Failure {
-    pub outcome: Outcome,
-    pub cooldown: Option<u64>,
+pub enum GateStop {
+    TurnedOff,
+    ProviderOff,
+    CredentialChanged,
+    KeysUnreadable,
+}
+
+/// A provider failure (with an optional cooldown hint in seconds), or a
+/// local interruption that says nothing about the provider's health.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Failure {
+    Provider {
+        outcome: Outcome,
+        cooldown: Option<u64>,
+    },
+    Stopped(GateStop),
 }
 
 impl Failure {
     pub fn of(outcome: Outcome) -> Self {
-        Self {
-            outcome,
-            cooldown: None,
-        }
+        Self::with_cooldown(outcome, None)
     }
 
     pub fn for_secs(outcome: Outcome, secs: u64) -> Self {
-        Self {
-            outcome,
-            cooldown: Some(secs),
-        }
+        Self::with_cooldown(outcome, Some(secs))
+    }
+
+    fn with_cooldown(outcome: Outcome, cooldown: Option<u64>) -> Self {
+        Self::Provider { outcome, cooldown }
     }
 }
 
@@ -722,9 +737,9 @@ pub fn system_clock() -> Clock {
 
 /// One provider call's context.
 pub(crate) struct Call<'a> {
-    /// Consent right now: re-read before every outbound request of this
-    /// attempt. `false` means stop without sending anything more.
-    pub gate: &'a (dyn Fn() -> bool + Sync),
+    /// Recheck consent and credentials before each request in a multi-request
+    /// adapter. An error stops the adapter without sending anything more.
+    pub gate: &'a (dyn Fn() -> Result<(), GateStop> + Sync),
     pub http: &'a reqwest::Client,
     pub key: Option<&'a Secret>,
     pub timeout: Duration,
@@ -832,15 +847,16 @@ impl Engine {
         }
     }
 
-    /// Try the person's providers in order until one answers. Always returns
-    /// Metro's answer object; `provider: null` when every one failed.
+    /// Convenience for tests inspecting the answer object rather than the
+    /// production job envelope from [`Self::handle`].
+    #[cfg(test)]
     pub async fn rotate(&self, job_id: &str, op: &Op, deadline: Instant) -> Value {
         self.rotate_inner(job_id, op, deadline)
             .await
             .unwrap_or_else(|_| json!({"v": 1, "provider": null, "attempts": []}))
     }
 
-    /// [`Self::rotate`], or the fixed reason no provider may be contacted.
+    /// Try the person's providers in order, or return a fixed local refusal.
     /// Consent is checked again before every attempt and every outbound
     /// request; any doubt (an unreadable file, the switch off) stops the job
     /// without contacting anyone further.
@@ -932,11 +948,11 @@ impl Engine {
                     // Before every further request of this attempt: still
                     // allowed, and still the same credential.
                     let used = key.as_ref().map(keys::fingerprint);
+                    let started = AtomicBool::new(false);
                     let gate = || {
-                        self.consent(Some(p)) == Consent::Yes
-                            && self
-                                .current_key(p)
-                                .is_ok_and(|k| k.as_ref().map(keys::fingerprint) == used)
+                        self.check_outbound(p, Some(p), used.as_deref())?;
+                        started.store(true, Ordering::Relaxed);
+                        Ok(())
                     };
                     let call = Call {
                         gate: &gate,
@@ -969,49 +985,48 @@ impl Engine {
                             answer = Some((p, mode, a));
                             break 'rotation Ok(());
                         }
-                        Err(f) if f.outcome == Outcome::SkippedDisabled => {
-                            // Stopped mid-attempt: nothing more was sent.
-                            match self.consent(Some(p)) {
-                                Consent::Off => {
-                                    log(job_id, op, Some(p), Some(mode), "stopped: turned off");
-                                    break 'rotation Err(TURNED_OFF);
-                                }
-                                Consent::ProviderOff => break,
-                                // The credential changed: start over once
-                                // with the current one.
-                                Consent::Yes if restarts == 0 => {
-                                    log(
-                                        job_id,
-                                        op,
-                                        Some(p),
-                                        Some(mode),
-                                        "credential changed; restarting",
-                                    );
-                                    restarts += 1;
-                                    continue;
-                                }
-                                Consent::Yes => break,
-                            }
+                        Err(Failure::Stopped(GateStop::TurnedOff)) => {
+                            log(job_id, op, Some(p), Some(mode), "stopped: turned off");
+                            break 'rotation Err(TURNED_OFF);
                         }
-                        Err(f) => {
-                            log(job_id, op, Some(p), Some(mode), f.outcome.as_str());
-                            updates.last.push((p, f.outcome, now));
-                            if f.outcome == Outcome::KeyRejected {
+                        Err(Failure::Stopped(GateStop::ProviderOff)) => break,
+                        Err(Failure::Stopped(GateStop::KeysUnreadable)) => {
+                            log(job_id, op, None, None, "saved keys unreadable; stopped");
+                            break 'rotation Err(KEYS_UNREADABLE);
+                        }
+                        Err(Failure::Stopped(GateStop::CredentialChanged)) => {
+                            // The mode belongs to the interrupted attempt, not
+                            // its replacement. If the gate blocked its first
+                            // request, no credential mode was used.
+                            if started.load(Ordering::Relaxed) {
+                                let outcome = Outcome::CredentialChanged;
+                                push(outcome, None);
+                                log(job_id, op, Some(p), Some(mode), outcome.as_str());
+                            }
+                            if restarts == 0 {
+                                restarts += 1;
+                                continue;
+                            }
+                            break;
+                        }
+                        Err(Failure::Provider { outcome, cooldown }) => {
+                            log(job_id, op, Some(p), Some(mode), outcome.as_str());
+                            updates.last.push((p, outcome, now));
+                            if outcome == Outcome::KeyRejected {
                                 if let Some(k) = &key {
                                     updates.rejected.push((p, keys::fingerprint(k)));
                                 }
                                 push(Outcome::KeyRejected, None);
                                 break;
                             }
-                            let secs = f
-                                .cooldown
-                                .or(f.outcome.default_cooldown())
+                            let secs = cooldown
+                                .or(outcome.default_cooldown())
                                 .map(|s| s.clamp(1, 24 * 3600));
                             let until = secs.map(|s| now + s);
                             if let Some(u) = until {
-                                updates.cooldowns.push((p, mode, u, f.outcome));
+                                updates.cooldowns.push((p, mode, u, outcome));
                             }
-                            push(f.outcome, until);
+                            push(outcome, until);
                             break;
                         }
                     }
@@ -1059,6 +1074,27 @@ impl Engine {
             .map_err(|_| KEYS_UNREADABLE)
     }
 
+    /// Keep the reason observed at the gate: re-reading after an adapter
+    /// stops could miss a transient refusal or mistake corruption for a key
+    /// change.
+    fn check_outbound(
+        &self,
+        p: ProviderId,
+        provider_consent: Option<ProviderId>,
+        used: Option<&str>,
+    ) -> Result<(), GateStop> {
+        match self.consent(provider_consent) {
+            Consent::Yes => {}
+            Consent::ProviderOff => return Err(GateStop::ProviderOff),
+            Consent::Off => return Err(GateStop::TurnedOff),
+        }
+        let key = self.current_key(p).map_err(|_| GateStop::KeysUnreadable)?;
+        if key.as_ref().map(keys::fingerprint).as_deref() != used {
+            return Err(GateStop::CredentialChanged);
+        }
+        Ok(())
+    }
+
     /// Consent now, from the files as they are (any process may have
     /// changed them): the master switch, and `p`'s own switch.
     fn consent(&self, p: Option<ProviderId>) -> Consent {
@@ -1083,10 +1119,8 @@ impl Engine {
             Ok(_) => return Err(TURNED_OFF),
             Err(_) => return Err(SETTINGS_UNREADABLE),
         }
-        let keys = keys::KeyStore::new(&self.dir)
-            .load()
-            .map_err(|_| KEYS_UNREADABLE)?;
-        let key = keys.get(p.as_str());
+        let key = self.current_key(p)?;
+        let key = key.as_ref();
         if key.is_none() && !p.keyless() {
             return Ok(Outcome::SkippedNoKey);
         }
@@ -1098,12 +1132,7 @@ impl Engine {
         // An explicit test of one provider: the master switch, and the same
         // credential as when the test began.
         let used = key.map(keys::fingerprint);
-        let gate = || {
-            self.consent(None) == Consent::Yes
-                && self
-                    .current_key(p)
-                    .is_ok_and(|k| k.as_ref().map(keys::fingerprint) == used)
-        };
+        let gate = || self.check_outbound(p, None, used.as_deref());
         let op = Op::Search(SearchReq {
             query: "Metro web search test".into(),
             keywords: Vec::new(),
@@ -1120,7 +1149,13 @@ impl Engine {
         };
         let outcome = match tokio::time::timeout(SEARCH_ATTEMPT, self.call(p, &op, &call)).await {
             Ok(Ok(_)) => Outcome::Ok,
-            Ok(Err(f)) => f.outcome,
+            Ok(Err(Failure::Provider { outcome, .. })) => outcome,
+            Ok(Err(Failure::Stopped(why))) => match why {
+                GateStop::TurnedOff => return Err(TURNED_OFF),
+                GateStop::KeysUnreadable => return Err(KEYS_UNREADABLE),
+                GateStop::CredentialChanged => Outcome::CredentialChanged,
+                GateStop::ProviderOff => Outcome::SkippedDisabled,
+            },
             Err(_) => Outcome::Timeout,
         };
         let mut updates = settings::Updates::default();

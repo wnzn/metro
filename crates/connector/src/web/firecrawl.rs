@@ -38,10 +38,10 @@ async fn failure(c: &Call<'_>, resp: reqwest::Response) -> Option<Failure> {
         429 => {
             let body = vendor_json(resp).await.unwrap_or(Value::Null);
             let daily = c.key.is_none() || body["code"] == "INDEX_DAILY_LIMIT";
-            Some(Failure {
-                outcome: Outcome::Limited,
-                cooldown: hint.or(daily.then(|| until_utc_midnight(c.now))),
-            })
+            Some(Failure::with_cooldown(
+                Outcome::Limited,
+                hint.or(daily.then(|| until_utc_midnight(c.now))),
+            ))
         }
         402 => Some(Failure::for_secs(
             Outcome::OutOfCredits,
@@ -93,10 +93,8 @@ pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<An
 pub(crate) async fn fetch(c: &Call<'_>, base: &str, r: &FetchReq) -> Result<Answer, Failure> {
     let mut out = Answer::default();
     for url in &r.urls {
-        // Each URL is its own request: consent is checked before each.
-        if !(c.gate)() {
-            return Err(Failure::of(Outcome::SkippedDisabled));
-        }
+        // Each URL is its own request; preserve why the gate stopped it.
+        (c.gate)().map_err(Failure::Stopped)?;
         let resp = request(
             c,
             format!("{base}/scrape"),

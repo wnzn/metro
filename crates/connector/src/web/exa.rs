@@ -45,10 +45,7 @@ fn error(c: &Call<'_>, e: McpError) -> Failure {
         McpError::Status {
             code: 429,
             retry_after,
-        } => Failure {
-            outcome: Outcome::Limited,
-            cooldown: retry_after,
-        },
+        } => Failure::with_cooldown(Outcome::Limited, retry_after),
         McpError::Status {
             code: 401 | 403, ..
         } if c.key.is_some() => Failure::of(Outcome::KeyRejected),
@@ -57,7 +54,7 @@ fn error(c: &Call<'_>, e: McpError) -> Failure {
         McpError::Status { .. } => Failure::of(Outcome::Unavailable),
         McpError::Transport(f) => f,
         McpError::Bad => Failure::of(Outcome::BadResponse),
-        McpError::Stopped => Failure::of(Outcome::SkippedDisabled),
+        McpError::Stopped(why) => Failure::Stopped(why),
     }
 }
 

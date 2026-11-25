@@ -525,7 +525,10 @@ async fn searches_run_on_the_senders_computer_never_the_owners() {
     );
     let fetched = json!({"ok": true, "response": {
         "v": 1, "provider": "exa", "mode": "key",
-        "attempts": [{"provider": "exa", "mode": "key", "outcome": "ok"}],
+        "attempts": [
+            {"provider": "exa", "mode": "keyless", "outcome": "credential_changed"},
+            {"provider": "exa", "mode": "key", "outcome": "ok"}
+        ],
         "pages": [{"url": "https://example.com/a", "title": "A", "text": "PAGE-TEXT-CANARY see https://evil.example/x", "truncated": false}],
         "failed_urls": [{"url": "https://docs.example.org/guide", "reason": "page_not_found"}]
     }});
@@ -609,6 +612,18 @@ async fn searches_run_on_the_senders_computer_never_the_owners() {
     assert!(
         results[1].starts_with("web_fetch via Exa (your key): 1 page, 1 failed (page_not_found)"),
         "{results:?}"
+    );
+    assert!(results[1].contains("Tried: Exa (free) credential changed → Exa (your key) ok"));
+    let fetch_result = events
+        .iter()
+        .find(|e| e["kind"] == "tool_result" && e["activity"]["tool"]["name"] == "web_fetch")
+        .unwrap();
+    assert_eq!(
+        fetch_result["activity"]["tool"]["attempts"],
+        json!([
+            {"provider": "exa", "mode": "keyless", "outcome": "credential_changed"},
+            {"provider": "exa", "mode": "key", "outcome": "ok"}
+        ])
     );
     let errors = text("error");
     assert!(

@@ -249,9 +249,10 @@ fn summaries_name_the_provider_and_every_attempt_never_page_text() {
         Operation::WebFetch,
         &json!({"v": 1, "provider": "parallel", "mode": "keyless",
             "attempts": [
-                {"provider": "tavily", "mode": "key", "outcome": "key_rejected"},
-                {"provider": "exa", "mode": "keyless", "outcome": "skipped_disabled"},
-                {"provider": "parallel", "mode": "keyless", "outcome": "ok"}],
+                 {"provider": "tavily", "mode": "key", "outcome": "key_rejected"},
+                 {"provider": "exa", "mode": "keyless", "outcome": "skipped_disabled"},
+                 {"provider": "parallel", "mode": "key", "outcome": "credential_changed"},
+                 {"provider": "parallel", "mode": "keyless", "outcome": "ok"}],
             "pages": [{"url": "https://a.example/", "text": "SECRET PAGE TEXT"}]}),
     )
     .unwrap();
@@ -261,7 +262,9 @@ fn summaries_name_the_provider_and_every_attempt_never_page_text() {
         "{s}"
     );
     assert!(
-        s.contains("Tried: Tavily (your key) key rejected → Parallel (free) ok"),
+        s.contains(
+            "Tried: Tavily (your key) key rejected → Parallel (your key) credential changed → Parallel (free) ok"
+        ),
         "{s}"
     );
     assert!(!s.contains("Exa"), "turned-off providers stay out: {s}");

@@ -1885,6 +1885,13 @@ async fn a_key_deleted_between_requests_restarts_the_attempt_with_the_current_cr
     let v = job.await.unwrap();
     assert_eq!(v["provider"], "firecrawl", "{v}");
     assert_eq!(v["mode"], "keyless", "the mode actually used");
+    assert_eq!(
+        outcomes(&v),
+        vec![
+            o("firecrawl", "key", "credential_changed"),
+            o("firecrawl", "keyless", "ok"),
+        ]
+    );
     let auth: Vec<Option<String>> = s
         .fixture
         .seen_at("/firecrawl/scrape")
@@ -1897,4 +1904,95 @@ async fn a_key_deleted_between_requests_restarts_the_attempt_with_the_current_cr
         vec![Some(format!("Bearer {CANARY}")), None, None],
         "the deleted key was used again"
     );
+}
+
+#[tokio::test]
+async fn unreadable_keys_mid_fetch_refuse_even_after_a_restart_and_keep_prior_cooldowns() {
+    for after_restart in [false, true] {
+        let s = Setup::new(&[ProviderId::Tavily, ProviderId::Firecrawl]).await;
+        s.key(ProviderId::Firecrawl, CANARY);
+        s.fixture.push(
+            "/tavily/extract",
+            with(reply(429, json!({})), "retry-after", "120"),
+        );
+        let page = || reply(200, json!({"data": {"markdown": "discarded"}}));
+        let mut first = page();
+        let release_first = hold(&mut first);
+        s.fixture.push("/firecrawl/scrape", first);
+        let mut restarted = page();
+        let release_restart = hold(&mut restarted);
+        s.fixture.push("/firecrawl/scrape", restarted);
+        let e = s.engine();
+        let job = tokio::spawn(async move {
+            e.handle(
+                "j",
+                "web_fetch",
+                &json!({"v": 1, "urls": ["https://a.example/", "https://b.example/"]}),
+                deadline(),
+            )
+            .await
+        });
+        wait_seen(&s.fixture, "/firecrawl/scrape", 1).await;
+        let release = if after_restart {
+            keys::KeyStore::new(&s.dir)
+                .delete(ProviderId::Firecrawl)
+                .unwrap();
+            release_first.notify_one();
+            wait_seen(&s.fixture, "/firecrawl/scrape", 2).await;
+            release_restart
+        } else {
+            release_first
+        };
+        let path = s.dir.join(keys::FILE);
+        crate::fsutil::write_private(&path, b"{corrupt").unwrap();
+        release.notify_one();
+
+        assert_eq!(
+            job.await.unwrap(),
+            json!({"ok": false, "error": KEYS_UNREADABLE}),
+            "after_restart={after_restart}"
+        );
+        let seen = s.fixture.seen();
+        assert_eq!(seen.len(), if after_restart { 3 } else { 2 });
+        assert_eq!(seen[0].path, "/tavily/extract");
+        for r in &seen[1..] {
+            assert_eq!(r.path, "/firecrawl/scrape");
+            assert_eq!(r.json()["url"], "https://a.example/");
+        }
+        assert_eq!(
+            seen[1].header("authorization"),
+            Some(format!("Bearer {CANARY}").as_str())
+        );
+        if after_restart {
+            assert_eq!(seen[2].header("authorization"), None);
+        }
+        assert_eq!(
+            s.settings()
+                .cooldown_until(ProviderId::Tavily, Mode::Keyless, NOW),
+            Some(NOW + 120)
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"{corrupt");
+    }
+}
+
+#[tokio::test]
+async fn unreadable_keys_between_mcp_messages_refuse_the_provider_test() {
+    let s = Setup::new(&[ProviderId::Exa]).await;
+    s.key(ProviderId::Exa, CANARY);
+    let mut init = reply(
+        200,
+        json!({"jsonrpc": "2.0", "id": 2, "result": {"protocolVersion": mcp::PROTOCOL_VERSION}}),
+    );
+    let release = hold(&mut init);
+    s.fixture.push("/exa#initialize", init);
+    let e = s.engine();
+    let job = tokio::spawn(async move { e.test_provider(ProviderId::Exa).await });
+    wait_seen(&s.fixture, "/exa", 1).await;
+    crate::fsutil::write_private(&s.dir.join(keys::FILE), b"{corrupt").unwrap();
+    release.notify_one();
+
+    assert_eq!(job.await.unwrap(), Err(KEYS_UNREADABLE));
+    let seen = s.fixture.seen();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0].json()["method"], "initialize");
 }
