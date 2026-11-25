@@ -10,14 +10,17 @@ whatever model `METRO_MODEL` names.
 
 | Role | Owner |
 | --- | --- |
-| Project manager and orchestrator: decides architecture, scope and trade-offs; assigns and directs subagents; accepts results only once they are verified | **Astra 6.2** |
-| Writing (README, AGENTS.md, docs/), frontend (`apps/desktop`), complex code | **Opus 5.5**, only through OpenChamber subagents; **Astra 6.2** may directly edit and test `apps/desktop` for UX Round 2 only. |
-| Mid-level code (assigned to either, at Astra's discretion) | **Sol 6.2** or **Sonnet 5.5**, both through OpenChamber subagents |
+| Orchestrator: decides scope, architecture and trade-offs; assigns and directs subagents; accepts results only once they're verified. Assigns the work in the other rows to subagents and doesn't do it itself | Any model; no specific model is required |
+| UI/UX decisions: what to build, and how it should look and behave | **Opus 5.5** |
+| UI/UX implementation (`apps/desktop`, including `theme/` and `src/ui/`) | By complexity: **Opus 5.5** for complex work, **Sonnet 5.5** for medium, **Sol 6.2** for the most routine tasks |
+| Complex code in any layer (for example security-sensitive or tricky Rust) | **Opus 5.5** |
+| General tasks (routine code, tests, fixtures, chores) | **Sol 6.2** |
+| Writing (README, AGENTS.md, docs/) | **Opus 5.5** |
+| Reviews | **Opus 5.5** first, then **Astra 6.2**. Work is accepted only after both reviews pass |
 
-Opus 5.5 never edits directly in the root session, and nobody calls the
-Claude CLI directly. Opus contributes only as an OpenChamber subagent. These
-are build assignments only. They don't affect which model Metro calls at
-runtime.
+Every role works through OpenChamber subagents running the named model.
+Nobody calls the Claude CLI directly. These are build assignments only. They
+don't affect which model Metro calls at runtime.
 
 ## Layout
 
