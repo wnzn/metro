@@ -69,7 +69,8 @@ fn parse_url(raw: &str, what: &str) -> Result<(Url, Host<String>)> {
     }
     let url = match Url::parse(raw) {
         Ok(u) => u,
-        Err(_) => bail!("{what}: {raw:?} is not a valid URL"),
+        // The input may contain credentials, including when parsing fails.
+        Err(e) => bail!("{what}: invalid URL ({e})"),
     };
     if !url.username().is_empty() || url.password().is_some() {
         bail!("{what}: the URL must not contain a user name or password");

@@ -14,7 +14,7 @@ use super::{Endpoints, Engine, ProviderId, keys, settings};
 use crate::desktop::metro_api::{ApiError, MetroApi};
 use crate::fsutil::read_secret_input;
 use crate::metro::MetroClient;
-use crate::netpolicy::validate_base_url;
+use crate::netpolicy::{server_plain_http_warning, validate_server_url};
 use crate::profile::{Profile, root_dir, validate_device_token, validate_profile_name};
 use crate::run::{RunOptions, Stop};
 
@@ -194,14 +194,20 @@ fn say(s: impl AsRef<str>) {
     eprintln!("{}", s.as_ref());
 }
 
+fn warn_plain_http(server: &str, credential: &str) {
+    if let Some(w) = server_plain_http_warning(server, credential) {
+        say(format!("metro-connector: warning: {w}"));
+    }
+}
+
 async fn setup(a: Args) -> Result<()> {
-    let p = profile(&a)?;
-    let server = validate_base_url(
+    let server = validate_server_url(
         a.server_url
             .as_deref()
             .context("--server-url is required")?,
-        "server_url",
+        "--server-url",
     )?;
+    let p = profile(&a)?;
     let _setup = setup_lock(&p).await?;
     let existing = binding::load(&p.dir)?;
     // `created`: a registration this setup made, removed again if the local
@@ -210,6 +216,7 @@ async fn setup(a: Args) -> Result<()> {
         (Some(f), None) => {
             let session = read_secret_input(f, "session token")?;
             let label = a.label.clone().unwrap_or_else(|| "metro-connector".into());
+            warn_plain_http(&server, "Metro session token");
             let api = MetroApi::new(&server, session)
                 .map_err(|e| anyhow::anyhow!("cannot reach Metro: {e:?}"))?;
             let account = api
@@ -256,6 +263,7 @@ async fn setup(a: Args) -> Result<()> {
             }
             let t = read_secret_input(f, "device token")?;
             validate_device_token(&t)?;
+            warn_plain_http(&server, "web device token");
             let fp = super::keys::fingerprint(&t);
             (t, None, format!("device:{fp}"), None, false)
         }
@@ -292,6 +300,7 @@ async fn run(a: Args) -> Result<i32> {
     let p = profile(&a)?;
     let d = device(&p)?;
     let engine = Engine::new(&data_dir(&p, &d)?, Endpoints::from_env()?)?;
+    warn_plain_http(&d.server_url, "web device token");
     let client = MetroClient::new(&d.server_url, d.token().clone(), Duration::from_secs(30))?;
     let poll = std::env::var(crate::cli::ENV_POLL_MS)
         .ok()
@@ -712,8 +721,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn re_pairing_for_another_account_never_reuses_the_previous_keys() {
+    async fn re_pairing_for_another_account_or_server_never_reuses_the_previous_keys() {
         let (base, seen, _) = fakes().await;
+        let (other_server, _, other_metro) = fakes().await;
         let t = tempfile::tempdir().unwrap();
         let root = t.path().join("home");
         let file = |name: &str, v: &str| {
@@ -722,13 +732,13 @@ mod tests {
             p.to_string_lossy().into_owned()
         };
         let (alice, bob, key) = (file("a", "tok-alice"), file("b", "tok-bob"), file("k", KEY));
-        let setup = |session: &str| {
+        let setup = |server: &str, session: &str| {
             args(
                 &root,
-                &["--server-url", &base, "--session-token-file", session],
+                &["--server-url", server, "--session-token-file", session],
             )
         };
-        assert_eq!(command("setup", setup(&alice)).await.unwrap(), 0);
+        assert_eq!(command("setup", setup(&base, &alice)).await.unwrap(), 0);
         assert_eq!(
             command("key", args(&root, &["set", "tavily", "--from-file", &key]))
                 .await
@@ -743,7 +753,7 @@ mod tests {
         );
 
         // Bob re-pairs the same profile: Alice's key is not his.
-        assert_eq!(command("setup", setup(&bob)).await.unwrap(), 0);
+        assert_eq!(command("setup", setup(&base, &bob)).await.unwrap(), 0);
         let v = search_once(&root, &base).await;
         assert_eq!(v["mode"], "keyless");
         assert_eq!(
@@ -753,7 +763,26 @@ mod tests {
         );
 
         // Alice again: her own key is back.
-        assert_eq!(command("setup", setup(&alice)).await.unwrap(), 0);
+        assert_eq!(command("setup", setup(&base, &alice)).await.unwrap(), 0);
+        assert_eq!(search_once(&root, &base).await["mode"], "key");
+
+        // The same account id on another server has a separate device and keys.
+        assert_eq!(
+            command("setup", setup(&other_server, &alice))
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(other_metro.lock().unwrap().created, 1);
+        assert_eq!(search_once(&root, &base).await["mode"], "keyless");
+
+        // The canonical URL (not the spelling used at setup) identifies the server.
+        assert_eq!(
+            command("setup", setup(&format!("{base}/"), &alice))
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(search_once(&root, &base).await["mode"], "key");
 
         // A device token alone can't take over a set-up profile...
