@@ -67,16 +67,27 @@ config_dir=$config_home/metro-runner
 config=$config_dir/runner.env
 unit_file=$config_home/systemd/user/$UNIT
 
+matches_locked_root() {
+    # Linux sh's -ef compares device/inode with the locked directory fd and fails if either path is missing.
+    # It follows symlinks; lock_install checks the root separately.
+    # shellcheck disable=SC3013
+    [ "$root" -ef /proc/self/fd/9 ]
+}
+
 # Same open-directory flock as metro-runner. Closing fd 9 releases only
 # this invocation's lock; there is no stale lock file to delete.
 lock_install() {
-    [ -d "$root" ] && [ ! -L "$root" ] || die "install directory is not a plain directory"
+    if [ ! -d "$root" ] || [ -L "$root" ]; then
+        die "install directory is not a plain directory"
+    fi
     [ "$(stat -c '%u' -- "$root")" = "$(id -u)" ] || die "install directory is not owned by you"
     mode=$(stat -c '%a' -- "$root")
     [ "$((0$mode & 022))" -eq 0 ] || die "install directory is writable by others"
     exec 9<"$root"
     flock -n -x 9 || die "another install is running"
-    [ ! -L "$root" ] && [ "$root" -ef /proc/self/fd/9 ] || die "the install directory changed"
+    if [ -L "$root" ] || ! matches_locked_root; then
+        die "the install directory changed"
+    fi
     compat_take
 }
 
@@ -113,7 +124,7 @@ compat_take() {
 }
 
 compat_release() {
-    if [ "$root" -ef /proc/self/fd/9 ] && [ ! -L "$root/.lock" ] &&
+    if matches_locked_root && [ ! -L "$root/.lock" ] &&
         [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
         [ "$(cat -- "$compat_owner")" = "$compat_token" ]; then
         compat_retire || :
@@ -571,7 +582,7 @@ install_runner() {
     stage=
     old=
     installed=0
-    trap 'if [ "$root" -ef /proc/self/fd/9 ]; then
+    trap 'if matches_locked_root; then
         if [ "$installed" = 0 ] && [ -n "$old" ] && [ ! -e "$root/versions/$version" ] && [ -e "$old/$version" ]; then
             mv -- "$old/$version" "$root/versions/$version"
         fi
@@ -714,7 +725,7 @@ uninstall_runner() {
         say "Settings kept in $config (use --purge-config to remove them)."
     fi
     if [ -n "$locked" ]; then
-        [ "$root" -ef /proc/self/fd/9 ] || die "the install directory changed"
+        matches_locked_root || die "the install directory changed"
         retired=$(mktemp -d -- "${root%/*}/.metro-uninstall.XXXXXX")
         mv -T -- "$root" "$retired/install"
         rm -rf -- "$retired"

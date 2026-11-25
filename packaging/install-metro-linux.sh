@@ -364,7 +364,9 @@ install_root_has_entries() { # optionally skip the lock we just took
 }
 
 lock_install_root() {
-    [ -d "$root" ] && [ ! -L "$root" ] || die "install directory is not a plain directory"
+    if [ ! -d "$root" ] || [ -L "$root" ]; then
+        die "install directory is not a plain directory"
+    fi
     if install_root_has_entries && { [ ! -f "$root/$MARK" ] || [ -L "$root/$MARK" ]; }; then
         die "$root was not created by this installer; refusing to change it"
     fi
@@ -377,7 +379,12 @@ lock_install_root() {
     compat_take
 }
 
-owns_install_root() { [ ! -L "$root" ] && [ "$root" -ef /proc/self/fd/9 ]; }
+owns_install_root() {
+    [ ! -L "$root" ] || return 1
+    # Linux sh's -ef compares device/inode with the locked directory fd and fails if either path is missing.
+    # shellcheck disable=SC3013
+    [ "$root" -ef /proc/self/fd/9 ]
+}
 
 compat_retire() {
     compat_tomb=$(mktemp -d -- "$root/.unlock.XXXXXX") || return 1
@@ -426,8 +433,9 @@ lock() {
     mkdir -p -m 700 -- "$root"
     lock_install_root
     if [ -e "$root/current" ] || install_root_has_entries "$root/.lock"; then
-        [ -f "$root/$MARK" ] && [ ! -L "$root/$MARK" ] ||
+        if [ ! -f "$root/$MARK" ] || [ -L "$root/$MARK" ]; then
             die "$root exists but was not created by this installer; refusing to change it"
+        fi
     fi
     refuse_during_in_app_update
     # On failure before anything was installed, leave no trace behind.
@@ -551,7 +559,9 @@ install_app() {
 uninstall_app() {
     [ -d "$root" ] || { say "Metro is not installed in $root."; return 0; }
     lock_install_root
-    [ -f "$root/$MARK" ] && [ ! -L "$root/$MARK" ] || die "$root was not created by this installer; refusing to remove it"
+    if [ ! -f "$root/$MARK" ] || [ -L "$root/$MARK" ]; then
+        die "$root was not created by this installer; refusing to remove it"
+    fi
     refuse_during_in_app_update
     if [ -x "$root/current/install-desktop" ]; then
         "$root/current/install-desktop" --uninstall >/dev/null || say "warning: could not remove the applications-menu entry"
