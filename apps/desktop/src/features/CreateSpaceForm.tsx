@@ -48,15 +48,23 @@ export function CreateSpaceForm(props: {
           (props.onboarding || mounted);
         const result = await attachCreatedSpaceRunner(space, choice, stillConsented);
         if (!stillInCreatedSpace()) return;
-        if ("reason" in result) {
+        if (result.kind !== "attached") {
+          const detail = result.kind === "not-attached"
+            ? `Metro didn't attach this computer's runner. ${result.reason}`
+            : result.kind === "unconfirmed"
+              ? "Metro couldn't confirm whether this computer's runner was attached. Open Runner to check this Space before retrying."
+              : "The runner assignment changed. Open Runner to check this Space's current runner.";
           feedback.set({
             spaceId: space.id, failed: true, tone: "warning",
-            message: `Created ${space.name}, but this computer's runner couldn't be attached: ${result.reason}.`,
+            message: `Created ${space.name}. ${detail}`,
           });
         } else {
-          const status = result.offline ? " It's offline now; jobs wait until it's back." : "";
+          const status = result.state === "online" ? ""
+            : result.state === "revoked"
+              ? " Its token is no longer accepted. Reconnect it in Settings › Runners. Jobs may time out until it reconnects."
+              : " It was offline when last checked; jobs may time out before it comes back.";
           feedback.set({
-            spaceId: space.id, failed: false, tone: result.offline ? "warning" : "success",
+            spaceId: space.id, failed: false, tone: result.state === "online" ? "success" : "warning",
             message: `Created ${space.name} with this computer's runner.${status}`,
           });
         }

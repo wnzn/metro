@@ -19,7 +19,7 @@ const space = (f: Server, name: string) => [...f.state.spaces.values()].find((s)
 const words = (app: App) => app.texts().join(" | ");
 
 function fixture(f: Server, runnerId: string | null, state = "online") {
-  const status = { runnerId, state, available: true, reads: 0 };
+  const status = { runnerId, state, available: true, reads: 0, failReads: 0 };
   const b = fakeBridge(f);
   const network = { ...f.network, ...b.network } as Record<string, (req: Request) => unknown>;
   const bridgeGet = network[`GET ${BRIDGE}/v1/*`]!;
@@ -27,26 +27,33 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
     if (new URL(req.url).pathname !== "/v1/local-tools/runner") return bridgeGet(req);
     if (header(req, "authorization") !== `Bearer ${BRIDGE_TOKEN}`) return { status: 401 };
     status.reads++;
+    if (status.reads <= status.failReads) return { status: 503, body: {} };
     return {
       status: 200,
       body: {
         requested: true, available: status.available, state: status.state,
         runner: status.runnerId && { id: status.runnerId, name: "This PC" },
-        tools: ["workspace.list", "workspace.read"], can_reconnect: false,
+        tools: ["workspace.list", "workspace.read"], can_reconnect: status.state === "revoked",
       },
     };
   };
-  // This gate delays only the create response, not startup's list or polling.
-  const gate = { create: 0 };
+  // The server applies the write before these gates hold or spoil the reply.
+  const gate = { create: 0, attach: 0, badConfirmation: false };
   const serverPost = network[`POST ${BASE}/v1/*`]!;
   network[`POST ${BASE}/v1/*`] = (req) => {
     const reply = serverPost(req);
-    return gate.create && new URL(req.url).pathname === "/v1/spaces" ? { ...(reply as object), delay: gate.create } : reply;
+    const path = new URL(req.url).pathname;
+    if (path === "/v1/spaces" && gate.create) return { ...(reply as object), delay: gate.create };
+    if (path.endsWith("/runner/attach-if-empty")) {
+      if (gate.badConfirmation) return { status: 200, body: {} };
+      if (gate.attach) return { ...(reply as object), delay: gate.attach };
+    }
+    return reply;
   };
   return { status, gate, network };
 }
 
-async function launch(t: ReturnType<typeof fixture>, opts: { storage?: Record<string, string>; manual?: boolean; second?: Server } = {}) {
+async function launch(t: ReturnType<typeof fixture>, opts: { storage?: Record<string, string>; manual?: boolean; second?: Server; width?: number } = {}) {
   const network = { ...t.network };
   if (opts.second) {
     for (const [rule, respond] of Object.entries(opts.second.network)) {
@@ -54,7 +61,7 @@ async function launch(t: ReturnType<typeof fixture>, opts: { storage?: Record<st
     }
   }
   return open("../../App.tsx", {
-    network: network as Network, modules: bridgeEnv() as any, platform: "linux", width: 1280, height: 900,
+    network: network as Network, modules: bridgeEnv() as any, platform: "linux", width: opts.width ?? 1280, height: 900,
     storage: opts.storage, ...(opts.manual ? { clock: {} } : {}),
   });
 }
@@ -130,7 +137,19 @@ test("first-Space onboarding attaches offline, does not show an offline offer, a
   expect(app.shows("id:space-view")).toBe(true);
   expect(app.shows("id:onboarding")).toBe(false);
   expect(app.shows(offer)).toBe(false);
-  expect(words(app)).toContain("It's offline now; jobs wait until it's back.");
+  expect(words(app)).toContain("It was offline when last checked; jobs may time out");
+});
+
+test("a revoked runner needs a reconnect, not just a wait for it to come back", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  const app = await launch(fixture(f, r.id, "revoked"));
+  await signIn(app);
+  await startSidebar(app, "Revoked warning");
+  await app.press("id:create-space");
+  await app.waitFor(success);
+  expect(f.state.attached.get(space(f, "Revoked warning").id)).toBe(r.id);
+  expect(words(app)).toContain("Its token is no longer accepted. Reconnect it in Settings › Runners. Jobs may time out");
 });
 
 test("unknown, foreign and legacy choices never render or send a runner attachment", async () => {
@@ -154,15 +173,17 @@ test("unknown, foreign and legacy choices never render or send a runner attachme
   }
 });
 
-test("onboarding creates normally with its displayed choice unchecked", async () => {
+test("on a narrow window, the onboarding checkbox and unchecked creation work by keyboard", async () => {
   const f = fakeServer();
   const r = f.addRunner("This PC", "personal", "carol");
-  const app = await launch(fixture(f, r.id));
+  const app = await launch(fixture(f, r.id), { width: 760 });
   await signIn(app, "carol");
   await app.waitFor("id:onboarding-space-use-runner");
-  await app.press("id:onboarding-space-use-runner");
   await app.type("id:onboarding-space-name", "No pairing");
-  await app.press("id:onboarding-create-space");
+  await app.keyboard.press("tab");
+  await app.keyboard.press("space");
+  await app.keyboard.press("tab");
+  await app.keyboard.press("enter");
   await app.waitFor("id:space-view");
   expect(creates(f)).toHaveLength(1);
   expect(runnerWrites(f)).toEqual([]);
@@ -189,12 +210,95 @@ test("atomic conflicts and a missing empty-only route preserve the created Space
     expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["POST", `/v1/spaces/${created.id}/runner/attach-if-empty`]]);
     expect(f.state.attached.get(created.id)).toBe(kind === "registered" ? other.id : undefined);
     expect(!!created.runnerToken).toBe(kind === "dedicated");
-    expect(words(app)).toContain(`Created ${kind}, but this computer's runner couldn't be attached:`);
+    expect(words(app)).toContain(`Created ${kind}. Metro didn't attach this computer's runner.`);
+    expect(words(app)).not.toContain("before retrying");
     expect(words(app)).toContain(kind === "missing route" ? "safe attachment route" : "already has a runner");
     expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
     await app.press("id:new-space-open-runner");
     await app.waitFor("id:runner-card"); // existing management until U9 lands
   }
+});
+
+test("an unconfirmed attach is not a refusal or a retry; Open Runner checks the created ID", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  const t = fixture(f, r.id);
+  t.gate.badConfirmation = true;
+  const app = await launch(t);
+  await signIn(app);
+  await startSidebar(app, "Keep on unknown");
+  await app.press("id:create-space");
+  await app.waitFor(failure);
+  const created = space(f, "Keep on unknown");
+  expect(words(app)).toContain("Metro couldn't confirm whether this computer's runner was attached. Open Runner to check this Space before retrying.");
+  expect(words(app)).not.toContain("Metro didn't attach");
+  expect(f.state.attached.get(created.id)).toBe(r.id);
+  await app.press("id:new-space-open-runner");
+  await app.waitFor("id:attached-runner");
+  expect(f.state.log.some((p) => p.method === "GET" && p.path === `/v1/spaces/${created.id}/runner`)).toBe(true);
+  expect(creates(f)).toHaveLength(1);
+  expect(runnerWrites(f)).toHaveLength(1);
+});
+
+test("a held successful attach reply cannot resurrect a runner after a newer Manage detach", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  const t = fixture(f, r.id);
+  t.gate.attach = 800;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await startSidebar(app, "Detach before receipt");
+  await app.press("id:create-space");
+  await app.waitUntil(() => {
+    const created = space(f, "Detach before receipt");
+    return !!created && f.state.attached.get(created.id) === r.id;
+  });
+  const id = space(f, "Detach before receipt").id;
+  await app.press("id:manage-space");
+  await app.waitFor("id:attached-runner");
+  await app.press("id:detach-runner");
+  await app.press("id:confirm-detach");
+  await app.waitFor(`id:attach-runner:${r.id}`);
+  expect(f.state.attached.has(id)).toBe(false);
+
+  await app.clock!.runFor(800);
+  await app.waitUntil(() => !app.shows("id:new-space-name"));
+  expect(app.shows("id:attached-runner")).toBe(false);
+  expect(app.shows("id:test-runner-row")).toBe(false);
+  expect(creates(f)).toHaveLength(1);
+  expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([
+    ["POST", `/v1/spaces/${id}/runner/attach-if-empty`],
+    ["DELETE", `/v1/spaces/${id}/runner`],
+  ]);
+  await app.press("id:nav-settings");
+  await app.waitFor(`id:runner-attach-pick:${id}`); // The paired flag is false.
+  expect(app.shows(`id:installed-runner-space:${id}`)).toBe(false);
+});
+
+test("the follow-up read also detects a newer assignment made outside this app", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  const other = f.addRunner("Other computer", "personal", "alice");
+  const t = fixture(f, r.id);
+  t.gate.attach = 800;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await startSidebar(app, "Another client");
+  await app.press("id:create-space");
+  await app.waitUntil(() => {
+    const created = space(f, "Another client");
+    return !!created && f.state.attached.get(created.id) === r.id;
+  });
+  const id = space(f, "Another client").id;
+  f.state.attached.set(id, other.id); // A later pairing by the same owner on another client.
+  await app.clock!.runFor(800);
+  await app.waitFor(failure);
+  expect(words(app)).toContain("The runner assignment changed");
+  expect(app.shows(success)).toBe(false);
+  expect(f.state.attached.get(id)).toBe(other.id);
+  await app.press("id:new-space-open-runner");
+  await app.waitFor("id:attached-runner");
+  expect(words(app)).toContain(other.name);
 });
 
 test("changing and restoring consent while the create response is held never posts an attach or duplicate create", async () => {
@@ -220,6 +324,7 @@ test("changing and restoring consent while the create response is held never pos
 
 test("a runner becoming eligible during creation was not part of the submitted choice", async () => {
   const f = world();
+  f.addSpace("eligible", "Eligible", "alice"); // Watches the offer while the worker starts.
   const r = f.addRunner("This PC", "personal", "alice");
   const t = fixture(f, null, "starting");
   t.gate.create = 5500;
@@ -371,9 +476,66 @@ test("only a recently verified online status offers existing Spaces; becoming of
   await app.clock!.runFor(5000);
   await app.waitFor(offer);
   t.status.state = "offline";
-  await app.clock!.runFor(30_000);
+  await app.clock!.runFor(5000);
   await app.waitUntil(() => !app.shows(offer));
   expect(app.shows(choice)).toBe(true);
   expect(runnerWrites(f)).toEqual([]);
   expect(creates(f)).toEqual([]);
+});
+
+test("Settings reopen refreshes the folder list after both a manual attach and detach", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("manual", "Manual", "alice");
+  const app = await launch(fixture(f, r.id), { manual: true });
+  await signIn(app);
+  await app.waitFor(offer);
+  await app.press("id:runner-offer-choose");
+  await app.waitFor("id:runner-attach-pick:manual");
+  expect(app.shows("id:installed-runner-space:manual")).toBe(false);
+  await app.press("id:settings-close");
+  await app.press("id:space:manual");
+  await app.press("id:manage-space");
+  await app.waitFor(`id:attach-runner:${r.id}`);
+  await app.press(`id:attach-runner:${r.id}`);
+  await app.waitFor("id:attached-runner");
+  await app.press("id:nav-settings");
+  await app.waitFor("id:installed-runner-space:manual");
+  await app.press("id:settings-close");
+  await app.press("id:detach-runner");
+  await app.press("id:confirm-detach");
+  await app.waitFor(`id:attach-runner:${r.id}`);
+  const folderReads = () => f.state.log.filter((p) => p.method === "GET" && p.path === "/v1/spaces/manual/runner").length;
+  const before = folderReads();
+  await app.press("id:nav-settings");
+  await app.waitUntil(() => folderReads() > before);
+  await app.waitUntil(() => !app.shows("id:installed-runner-space:manual"));
+  expect(app.shows("id:runner-attach-pick:manual")).toBe(true);
+});
+
+test("Sidebar recovers from its first failed status read and reopening Settings doesn't add a poller", async () => {
+  const f = world();
+  const r = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("eligible", "Eligible", "alice");
+  const t = fixture(f, r.id);
+  t.status.failReads = 1;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await app.waitUntil(() => t.status.reads > 0);
+  expect(t.status.reads).toBe(1);
+  expect(app.shows(offer)).toBe(false);
+  await app.clock!.runFor(5000);
+  await app.waitFor(offer);
+  expect(t.status.reads).toBe(2);
+  await app.press("id:runner-offer-choose");
+  await app.waitFor("id:runner-attach-pick:eligible");
+  const opened = t.status.reads;
+  await app.clock!.runFor(5000);
+  expect(t.status.reads).toBe(opened + 1);
+  await app.press("id:settings-close");
+  await app.clock!.runFor(5000);
+  expect(t.status.reads).toBe(opened + 2);
+  await signOut(app);
+  await app.clock!.runFor(15_000);
+  expect(t.status.reads).toBe(opened + 2);
 });

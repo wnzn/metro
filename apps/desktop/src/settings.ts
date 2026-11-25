@@ -247,7 +247,11 @@ export async function deleteRunner(runnerId: string): Promise<void> {
       const next: Record<string, SpaceRunner | null> = {};
       for (const [sid, r] of Object.entries(cached)) next[sid] = r?.kind === "registered" && r.id === runnerId ? null : r;
       spaceRunners.set(next);
-      for (const [sid, r] of Object.entries(cached)) if (r?.kind === "registered" && r.id === runnerId) setRunnerPaired(sid, false);
+      for (const [sid, r] of Object.entries(cached)) {
+        if (r?.kind !== "registered" || r.id !== runnerId) continue;
+        invalidateSpaceRunnerRequests(sid);
+        setRunnerPaired(sid, false);
+      }
     });
     void loadRunners();
   } catch (error) {
@@ -274,22 +278,56 @@ export const registeredRunnersSupported = signal(true);
 /** What is in flight in the Manage view: "attach:<id>", "detach", "issue", "revoke". */
 export const spaceRunnerBusy = signal<string | null>(null);
 export const spaceRunnerNotice = signal<string | null>(null);
-let spaceRunnerSeq = 0;
+const spaceRunnerReads = new Map<string, object>();
+const spaceRunnerWrites = new Map<string, object>();
+
+function runnerRequest(markers: Map<string, object>, sid: string) {
+  const mark = {};
+  markers.set(sid, mark);
+  const ok = sessionGuard(sid);
+  return () => ok() && markers.get(sid) === mark;
+}
+
+function invalidateSpaceRunnerRequests(sid: string) {
+  spaceRunnerReads.delete(sid);
+  spaceRunnerWrites.delete(sid);
+}
+
+/** Mark an exact-Space write. A newer Manage operation supersedes the pending reply. */
+export function beginSpaceRunnerWrite(sid: string) {
+  spaceRunnerReads.delete(sid);
+  return runnerRequest(spaceRunnerWrites, sid);
+}
+
+/** The POST's reply is historical by the time it arrives. Read the actual assignment. */
+export async function reconcileOwnedSpaceRunner(sid: string, stillLatest: () => boolean) {
+  const c = apiClient();
+  const owns = () => spaces().some((s) => s.id === sid && s.role === "owner");
+  if (!c || !stillLatest() || !owns()) return undefined;
+  const latestRead = runnerRequest(spaceRunnerReads, sid);
+  const current = await c.getSpaceRunner(sid);
+  if (!latestRead() || !stillLatest() || !owns()) return undefined;
+  batch(() => {
+    spaceRunners.set({ ...spaceRunners(), [sid]: current });
+    setRunnerPaired(sid, current !== null);
+  });
+  return current;
+}
 
 export async function loadSpaceRunner(spaceId: string): Promise<void> {
   const c = apiClient();
   if (!c) return;
-  const seq = ++spaceRunnerSeq;
-  const ok = sessionGuard(spaceId);
+  const ok = runnerRequest(spaceRunnerReads, spaceId);
   try {
     const runner = await c.getSpaceRunner(spaceId);
-    if (!ok() || seq !== spaceRunnerSeq) return;
+    if (!ok()) return;
     batch(() => {
       registeredRunnersSupported.set(true);
       spaceRunners.set({ ...spaceRunners(), [spaceId]: runner });
+      setRunnerPaired(spaceId, runner !== null);
     });
   } catch (error) {
-    if (!ok() || seq !== spaceRunnerSeq || isAborted(error)) return;
+    if (!ok() || isAborted(error)) return;
     // 404 for a Space we're still in: this server predates registered runners.
     if (error instanceof ApiError && error.kind === "not_found" && spaces().some((s) => s.id === spaceId)) {
       const legacy = spaces().find((s) => s.id === spaceId)?.runnerPaired;
@@ -299,7 +337,7 @@ export async function loadSpaceRunner(spaceId: string): Promise<void> {
       });
       return;
     }
-    handleManageError(error, "Could not load this Space's runner", spaceId);
+    if (activeSpaceId() === spaceId) handleManageError(error, "Could not load this Space's runner", spaceId);
   }
 }
 
@@ -309,6 +347,7 @@ export async function attachRunner(runnerId: string): Promise<void> {
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
   const ok = sessionGuard(sid);
+  invalidateSpaceRunnerRequests(sid);
   batch(() => {
     spaceRunnerBusy.set(`attach:${runnerId}`);
     spaceRunnerNotice.set(null);
@@ -317,7 +356,7 @@ export async function attachRunner(runnerId: string): Promise<void> {
   try {
     const attached = await c.attachRunner(sid, runnerId);
     if (!ok()) return;
-    spaceRunnerSeq++;
+    invalidateSpaceRunnerRequests(sid);
     const runner = runners()?.find((r) => r.id === runnerId);
     const value: SpaceRunner | null = attached ?? (runner ? { kind: "registered", id: runner.id, name: runner.name, visibility: runner.visibility } : null);
     batch(() => {
@@ -339,6 +378,7 @@ export async function detachRunner(): Promise<void> {
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
   const ok = sessionGuard(sid);
+  invalidateSpaceRunnerRequests(sid);
   batch(() => {
     spaceRunnerBusy.set("detach");
     spaceRunnerNotice.set(null);
@@ -346,7 +386,7 @@ export async function detachRunner(): Promise<void> {
   try {
     await c.detachRunner(sid);
     if (!ok()) return;
-    spaceRunnerSeq++;
+    invalidateSpaceRunnerRequests(sid);
     batch(() => {
       spaceRunners.set({ ...spaceRunners(), [sid]: null });
       setRunnerPaired(sid, false);
@@ -365,6 +405,7 @@ export async function issueDedicatedToken(): Promise<void> {
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
   const ok = sessionGuard(sid);
+  invalidateSpaceRunnerRequests(sid);
   batch(() => {
     spaceRunnerBusy.set("issue");
     spaceRunnerNotice.set(null);
@@ -373,7 +414,7 @@ export async function issueDedicatedToken(): Promise<void> {
   try {
     const token = await c.issueRunnerToken(sid);
     if (!ok()) return;
-    spaceRunnerSeq++;
+    invalidateSpaceRunnerRequests(sid);
     batch(() => {
       spaceRunners.set({ ...spaceRunners(), [sid]: { kind: "dedicated", name: "Dedicated Space runner" } });
       setRunnerPaired(sid, true);
@@ -394,6 +435,7 @@ export async function revokeDedicatedToken(): Promise<void> {
   const c = apiClient();
   if (!sid || !c || spaceRunnerBusy()) return;
   const ok = sessionGuard(sid);
+  invalidateSpaceRunnerRequests(sid);
   batch(() => {
     spaceRunnerBusy.set("revoke");
     spaceRunnerNotice.set(null);
@@ -402,7 +444,7 @@ export async function revokeDedicatedToken(): Promise<void> {
   try {
     await c.revokeRunnerToken(sid);
     if (!ok()) return;
-    spaceRunnerSeq++;
+    invalidateSpaceRunnerRequests(sid);
     batch(() => {
       spaceRunners.set({ ...spaceRunners(), [sid]: null });
       setRunnerPaired(sid, false);
@@ -984,7 +1026,8 @@ onManageOpen((spaceId) => {
 onSessionEnd(() => {
   runnersSeq++;
   impactSeq++;
-  spaceRunnerSeq++;
+  spaceRunnerReads.clear();
+  spaceRunnerWrites.clear();
   catalogSeq++;
   connectionsSeq++;
   modelsSeq.clear();

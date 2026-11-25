@@ -2,10 +2,11 @@
 import { cleanup, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError } from "./api/client";
 import type { RegisteredRunner, Space } from "./api/client";
-import { loadRunners, runnerBusy, runners, spaceRunners } from "./settings";
+import { beginSpaceRunnerWrite, loadRunners, reconcileOwnedSpaceRunner, runnerBusy, runners, spaceRunners } from "./settings";
 import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, setRunnerPaired, spaces } from "./store";
 import { helper } from "./device/state";
 import { installedBusy, installedRunner, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner, recordAttachedFolder } from "./features/installedRunner/installedRunner";
+import type { InstalledRunnerState } from "./features/installedRunner/installedRunner";
 
 export const runnerSessionKey = () => JSON.stringify([connectedTo(), me()]);
 export const runnerOfferStorageKey = (server: string, userId: string) =>
@@ -163,25 +164,35 @@ function actionError(error: unknown, fallback: string) {
   return fallback;
 }
 
+type CreatedSpaceAttachment =
+  | { kind: "attached"; state: InstalledRunnerState }
+  | { kind: "not-attached"; reason: string }
+  | { kind: "unconfirmed" }
+  | { kind: "superseded" };
+
+const notAttached = (reason: string): CreatedSpaceAttachment => ({ kind: "not-attached", reason });
+
 /** Called only after Create Space succeeds, with the id returned by that creation. */
 export async function attachCreatedSpaceRunner(
   space: Space,
   choice: NonNullable<ReturnType<typeof snapshotInstalledRunner>>,
   stillConsented: () => boolean,
-): Promise<{ offline: boolean } | { reason: string }> {
+): Promise<CreatedSpaceAttachment> {
   const c = apiClient();
   const sid = space.id;
   const sessionOK = sessionGuard();
   const spaceOK = sessionGuard(sid);
   const ownsSpace = () => spaces().some((s) => s.id === sid && s.role === "owner");
-  const consentChanged = { reason: "The Create Space choice changed" };
-  const runnerChanged = { reason: "This computer's runner is no longer available for this account" };
-  const notOwner = { reason: "You no longer own this Space" };
-  const alreadyPaired = { reason: "This Space already has a runner" };
-  const unsupported = { reason: "This server doesn't support safe attachment to empty Spaces" };
+  const consentChanged = notAttached("The Create Space choice changed.");
+  const runnerChanged = notAttached("This computer's runner is no longer available for this account.");
+  const notOwner = notAttached("You no longer own this Space.");
+  const alreadyPaired = notAttached("This Space already has a runner.");
+  const unsupported = notAttached("This server doesn't support safe attachment to empty Spaces.");
   if (!c || !stillConsented()) return consentChanged;
   if (!choice.isCurrent()) return runnerChanged;
   if (!spaceOK() || space.role !== "owner" || !ownsSpace()) return notOwner;
+  let pendingWrite: (() => boolean) | undefined;
+  let accepted = false;
   try {
     const [local, inventory, liveSpaces] = await Promise.all([readInstalledRunner(), c.listRunnerInventory(), c.listSpaces()]);
     if (!stillConsented()) return consentChanged;
@@ -191,31 +202,32 @@ export async function attachCreatedSpaceRunner(
         !inventory.runners.some((r) => r.id === choice.id && r.visibility === "personal" && r.canManage)) return runnerChanged;
     const live = liveSpaces.find((s) => s.id === sid);
     if (live?.role !== "owner") return notOwner;
-    if (live.runnerPaired !== false) {
-      setRunnerPaired(sid, true);
-      return alreadyPaired;
-    }
+    if (live.runnerPaired !== false) return alreadyPaired;
     // The server repeats ownership and emptiness checks atomically. No fallback
     // to the replacing route, including for servers missing this endpoint.
-    const result = await c.attachRunnerIfEmpty(sid, choice.id);
-    if (sessionOK()) {
-      dismissRunnerOffer();
-      if (spaceOK() && ownsSpace()) {
-        setRunnerPaired(sid, true);
-        spaceRunners.set({ ...spaceRunners(), [sid]: result });
-        if (choice.isCurrent()) recordAttachedFolder({ id: sid, name: space.name });
-      }
-    }
-    return { offline: local.state !== "online" };
+    pendingWrite = beginSpaceRunnerWrite(sid);
+    await c.attachRunnerIfEmpty(sid, choice.id);
+    accepted = true;
+    if (sessionOK()) dismissRunnerOffer();
+    if (!pendingWrite()) return { kind: "superseded" };
+    // Reconcile the actual assignment instead of replaying a delayed POST
+    // response. Folder membership is read authoritatively on Settings open.
+    const current = await reconcileOwnedSpaceRunner(sid, () => !!pendingWrite?.() && choice.isCurrent());
+    if (current === undefined) return { kind: "unconfirmed" };
+    if (current?.kind !== "registered" || current.id !== choice.id) return { kind: "superseded" };
+    return { kind: "attached", state: local.state };
   } catch (error) {
-    if (error instanceof ApiError && error.status === 409) {
-      if (spaceOK() && ownsSpace()) setRunnerPaired(sid, true);
-      return alreadyPaired;
+    if (!pendingWrite) return notAttached("Metro couldn't verify the runner and the new Space.");
+    if (!pendingWrite()) return { kind: "superseded" };
+    if (!accepted && error instanceof ApiError && error.kind !== "protocol") {
+      if (error.status === 409) return alreadyPaired;
+      if (error.status === 404 || error.status === 405) {
+        return notAttached("The safe attachment route or runner is no longer available on this server.");
+      }
+      if (error.status === 401 || error.status === 403) return notAttached("The server refused permission to attach the runner.");
+      if (error.status === 400 || error.status === 422) return notAttached("The server rejected the attachment request.");
     }
-    if (error instanceof ApiError && (error.status === 404 || error.status === 405)) {
-      return { reason: "The safe attachment route or runner is no longer available on this server" };
-    }
-    return { reason: actionError(error, "The server did not confirm the attachment").replace(/\.$/, "") };
+    return { kind: "unconfirmed" };
   }
 }
 
@@ -260,6 +272,7 @@ export async function attachMany(spaceIds: readonly string[]) {
         continue;
       }
       const spaceOK = sessionGuard(s.id);
+      let pendingWrite: (() => boolean) | undefined;
       try {
         const current = await c.getSpaceRunner(s.id);
         if (!valid()) return;
@@ -276,18 +289,19 @@ export async function attachMany(spaceIds: readonly string[]) {
           failures.push(`${s.name}: This computer's runner changed.`);
           continue;
         }
+        pendingWrite = beginSpaceRunnerWrite(s.id);
         const result = await c.attachRunnerIfEmpty(s.id, runner.id);
         if (!valid()) return;
         attached++;
         dismissRunnerOffer();
-        if (!spaceOK() || !spaces().some((space) => space.id === s.id && space.role === "owner")) continue;
+        if (!pendingWrite() || !spaceOK() || !spaces().some((space) => space.id === s.id && space.role === "owner")) continue;
         setRunnerPaired(s.id, true);
         spaceRunners.set({ ...spaceRunners(), [s.id]: result });
         if (matches()) recordAttachedFolder({ id: s.id, name: s.name });
       } catch (error) {
         if (!valid()) return;
         if (error instanceof ApiError && error.status === 409) {
-          if (spaceOK()) setRunnerPaired(s.id, true);
+          if (pendingWrite?.() && spaceOK()) setRunnerPaired(s.id, true);
           failures.push(`${s.name}: Already has a runner.`);
         } else {
           failures.push(`${s.name}: ${actionError(error, "The attach was not confirmed.")}`);
