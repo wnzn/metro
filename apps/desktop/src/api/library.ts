@@ -6,7 +6,7 @@
 // URL never carries a credential, and the server answers `no-store`.
 // No state, no timers, no UI.
 
-import { ApiError } from "./client";
+import { ApiError, revisionToken } from "./client";
 import type { RequestFn } from "./client";
 
 /** The formats the server accepts (validate.rs): declared type, extension and signature must agree. */
@@ -93,7 +93,7 @@ export type IndexItem = { assetId: string; status: "indexed" | "not_found" | "un
 export type IndexResult = { indexedSegments: number; partial: boolean; items: IndexItem[]; notice: string | null };
 
 /** The person's media embedding choice. `suggestedId`: their message-search connection, when the server confirmed it media-capable; never used until saved. */
-export type LibrarySettings = { embeddingId: string | null; suggestedId: string | null; selectionPrecondition: boolean };
+export type LibrarySettings = { embeddingId: string | null; suggestedId: string | null; selectionRevision: string | null };
 
 /** A file's bytes, read through an authenticated request. */
 export type AssetContent = { bytes: Uint8Array; contentType: string };
@@ -178,22 +178,23 @@ export function libraryApi(request: RequestFn, binary: BinaryFn) {
       return {
         embeddingId: optionalId(data.embedding_id),
         suggestedId: optionalId(data.suggested_id),
-        selectionPrecondition: data.selection_precondition === true,
+        selectionRevision: data.selection_precondition === true ? revisionToken(data.selection_revision) : null,
       };
     },
 
-    async putLibrarySettings(embeddingId: string | null, expected: string | null): Promise<LibrarySettings> {
+    async putLibrarySettings(embeddingId: string | null, expected: string | null, revision: string): Promise<LibrarySettings> {
       // The legacy route has no precondition. Never use it, even as a retry.
-      const data = await request("PUT", "/v1/library/settings/selection", { embedding_id: embeddingId, expected_embedding_id: expected });
-      if (!isObject(data) || data.selection_precondition !== true || data.embedding_id !== embeddingId) {
+      const data = await request("PUT", "/v1/library/settings/selection", { embedding_id: embeddingId, expected_embedding_id: expected, expected_selection_revision: revision });
+      const savedRevision = isObject(data) ? revisionToken(data.selection_revision) : null;
+      if (!isObject(data) || data.selection_precondition !== true || data.embedding_id !== embeddingId || !savedRevision || revision === savedRevision) {
         throw new ApiError("protocol", "The server did not confirm the media model selection.");
       }
-      return { embeddingId, suggestedId: optionalId(data.suggested_id), selectionPrecondition: true };
+      return { embeddingId, suggestedId: optionalId(data.suggested_id), selectionRevision: savedRevision };
     },
 
     /** Sends this one file to the chosen media model. */
-    async indexAsset(assetId: string): Promise<IndexResult> {
-      const data = await request("POST", "/v1/library/index", { asset_id: assetId });
+    async indexAsset(assetId: string, revision: string): Promise<IndexResult> {
+      const data = await request("POST", "/v1/library/index/selection", { asset_id: assetId, selection_revision: revision });
       if (!isObject(data) || typeof data.indexed_segments !== "number") throw new ApiError("protocol", "POST /v1/library/index did not return { indexed_segments, partial }.");
       const items: IndexItem[] = [];
       for (const it of Array.isArray(data.items) ? data.items : []) {
@@ -210,10 +211,10 @@ export function libraryApi(request: RequestFn, binary: BinaryFn) {
       return { indexedSegments: data.indexed_segments, partial: data.partial === true, items, notice: shortText(data.notice, 500) };
     },
 
-    async searchLibrary(query: string, scope: LibraryScope, limit: number, kind?: MediaKind | null): Promise<LibrarySearchResponse> {
-      const body: Record<string, unknown> = { query, ...scopeBody(scope), limit };
+    async searchLibrary(query: string, scope: LibraryScope, limit: number, revision: string, kind?: MediaKind | null): Promise<LibrarySearchResponse> {
+      const body: Record<string, unknown> = { query, ...scopeBody(scope), limit, selection_revision: revision };
       if (kind) body.kind = kind;
-      const data = await request("POST", "/v1/library/search", body);
+      const data = await request("POST", "/v1/library/search/selection", body);
       if (!isObject(data) || !Array.isArray(data.results)) throw new ApiError("protocol", "POST /v1/library/search did not return { results: [...] }.");
       const ranking: LibraryRanking = data.ranking === "classifier" || data.ranking === "mixed" ? data.ranking : "embeddings";
       return {

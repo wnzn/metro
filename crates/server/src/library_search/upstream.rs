@@ -38,22 +38,32 @@ use crate::auth::Human;
 /// The caller's media embedding connection and System One connection.
 /// The media connection is the library setting only, never the message
 /// search connection.
-pub async fn routing(state: &AppState, who: &Human) -> Result<Routing, LibrarySearchError> {
+pub async fn routing(
+    state: &AppState,
+    who: &Human,
+    expected: Option<i64>,
+) -> Result<(Routing, i64), LibrarySearchError> {
     let user = who.id.clone();
-    let embedding = state
+    let (embedding, revision) = state
         .db
-        .call(move |db| Ok(super::store::embedding_id(&db.lock(), &user)?))
+        .call(move |db| Ok(super::store::selection(&db.lock(), &user)?))
         .await?;
+    if expected.is_some_and(|expected| revision != expected) {
+        return Err(LibrarySearchError::SelectionChanged);
+    }
     let prefs = crate::model_routing::preferences(state, &who.id)
         .await
         .map_err(|e| LibrarySearchError::Internal(format!("reading model routing: {e:#}")))?;
     if embedding.is_none() {
         return Err(LibrarySearchError::NoMediaModel);
     }
-    Ok(Routing {
-        embedding,
-        classifier: prefs.classifier_id,
-    })
+    Ok((
+        Routing {
+            embedding,
+            classifier: prefs.classifier_id,
+        },
+        revision,
+    ))
 }
 
 pub fn seams<'a>(state: &'a AppState, who: &'a Human) -> (DbLibrary, ProviderModels<'a>) {
@@ -157,14 +167,19 @@ fn use_error(e: crate::providers::UseError) -> MediaError {
 /// `caller`, keyed by every fact a stored vector depends on (chosen and
 /// running connection, provider, capability, model, config revision,
 /// endpoint, and how the caller reaches it).
-fn grant_check(caller: String) -> GrantCheck {
+pub(super) fn grant_check(caller: String) -> GrantCheck {
     std::sync::Arc::new(move |conn, space, id| {
         let a =
             crate::providers::sharing::authorize(conn, &caller, space, id).map_err(use_error)?;
         let media = a.row.capability == crate::providers::Capability::Embeddings
-            && crate::providers::catalog::find(&a.row.provider_id).is_some_and(|e| e.media_inputs);
+            && crate::providers::catalog::find(&a.row.provider_id).is_some_and(|e| {
+                e.media_inputs && e.capability == crate::providers::Capability::Embeddings
+            });
         if !media {
             return Err(use_error(crate::providers::UseError::MediaUnsupported));
+        }
+        if a.row.model.is_empty() {
+            return Err(use_error(crate::providers::UseError::NoModel));
         }
         Ok(format!(
             "{:?}",
@@ -235,11 +250,19 @@ impl MediaModels for ProviderModels<'_> {
         dest: Option<&'a str>,
         connection: &'a str,
         input: Value,
+        binding: Option<(i64, &'a str)>,
     ) -> ModelFuture<'a, Value> {
         Box::pin(async move {
-            crate::providers::media_embed(self.state, self.caller, dest, connection, input)
-                .await
-                .map_err(provider_error)
+            crate::providers::media_embed_bound(
+                self.state,
+                self.caller,
+                dest,
+                connection,
+                input,
+                binding,
+            )
+            .await
+            .map_err(provider_error)
         })
     }
 
@@ -249,11 +272,19 @@ impl MediaModels for ProviderModels<'_> {
         connection: &'a str,
         state: Value,
         questions: Value,
+        selection: Option<(&'a str, i64)>,
     ) -> ModelFuture<'a, Value> {
         Box::pin(async move {
-            crate::providers::decide(self.state, self.caller, dest, connection, state, questions)
-                .await
-                .map_err(provider_error)
+            crate::providers::library_decide(
+                self.state,
+                self.caller,
+                dest,
+                connection,
+                (state, questions),
+                selection,
+            )
+            .await
+            .map_err(provider_error)
         })
     }
 
@@ -304,9 +335,13 @@ pub async fn put_selection(
             &models,
             &who.id,
             body.embedding_id,
-            Some(body.expected_embedding_id),
+            Some((
+                body.expected_embedding_id,
+                request_revision(body.expected_selection_revision.as_deref(), false)?,
+            )),
         )
-        .await?,
+        .await
+        .map_err(selection_save_error)?,
     ))
 }
 

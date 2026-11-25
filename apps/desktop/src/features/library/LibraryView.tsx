@@ -86,6 +86,9 @@ import {
   maxFileBytes,
   mediaModels,
   mediaSelectionPrecondition,
+  mediaSelectionRevision,
+  mediaActionsReady,
+  mediaSavePending,
   modelConflict,
   modelDraft,
   modelError,
@@ -258,7 +261,15 @@ function openMediaChoices() {
 function ModelStatus() {
   return (
     <>
-      <If when={modelError()}>
+      <If when={mediaSavePending() !== null || savingModel()}>
+        <MediaSaveStatus />
+      </If>
+      <If when={modelsLoaded() && !modelsLoading() && !mediaSelectionPrecondition() && mediaSavePending() === null}>
+        <Banner tone="warning" testID="library-selection-unavailable"
+          message={mediaSelectionRevision() === null ? "This server doesn't offer guarded indexing." : "The saved media model changed. Reload it before indexing again."}
+          action={<Action label="Review media model" onPress={openMediaChoices} />} />
+      </If>
+      <If when={mediaSavePending() === null && !savingModel() ? modelError() : null}>
         {(e) => (
           <Banner tone="warning" testID="library-model-status">
             <Label variant="caption" color="warning">
@@ -267,7 +278,7 @@ function ModelStatus() {
           </Banner>
         )}
       </If>
-      <If when={modelError() ? null : savedModel()}>
+      <If when={mediaActionsReady() ? savedModel() : null}>
         {(m) => (
           <Row align="center" gap={2} wrap testID="library-model-status">
             <Label variant="caption" color="muted">
@@ -351,13 +362,13 @@ function AssetRow(props: { asset: LibraryAsset }) {
             label="More"
             accessibilityLabel={`More actions for ${a().name}`}
             items={[
-              modelsLoaded() && !savedModelId()
+              mediaActionsReady() && !savedModelId()
                 ? // No media model yet: this leads straight to choosing one; nothing is sent.
                   { id: `library-index:${a().id}`, label: "Choose a media model to index", onPress: chooseMediaModel }
                 : {
                     id: `library-index:${a().id}`,
                     label: state()?.state === "indexing" ? "Indexing…" : state()?.state === "indexed" ? "Index again" : "Index",
-                    disabled: !savedModelId() || state()?.state === "indexing",
+                    disabled: !mediaActionsReady() || !savedModel() || state()?.state === "indexing",
                     onPress: () => void indexAsset(a()),
                   },
               ...(canDelete(a()) ? [{ id: `library-delete:${a().id}`, label: "Delete…", destructive: true, onPress: () => askDelete(a().id) }] : []),
@@ -426,7 +437,7 @@ export function MediaModelSettings(props: { separate?: boolean; canReveal?: bool
     ...mediaModels().map((m) => ({ value: m.connectionId, label: `${m.name}${m.model ? ` · ${m.model}` : ""}${m.owned ? "" : ` · shared by ${m.ownerId ?? "someone"}`}` })),
   ];
   const missing = () => modelsLoaded() && !modelsLoading() && modelDraft() !== null && !draftModel();
-  const editable = () => modelsLoaded() && !modelsLoading() && mediaSelectionPrecondition();
+  const editable = () => modelsLoaded() && !modelsLoading() && mediaSelectionPrecondition() && mediaSavePending() === null;
   const suggestion = () => {
     const id = suggestedModelId();
     return id && id !== savedModelId() ? mediaModels().find((m) => m.connectionId === id) ?? null : null;
@@ -522,9 +533,15 @@ export function MediaModelFeedback() {
   );
 }
 
+function MediaSaveStatus() {
+  return <Banner variant="inline" tone="warning" testID="library-media-paused"
+    message="The media model save is not confirmed. Indexing and file search are paused."
+    action={<Action label="Reload media model" disabled={savingModel() || modelsLoading()} onPress={() => void loadModels()} />} />;
+}
+
 export function MediaModelSaveBar(props: { separate?: boolean }) {
   const dirty = () => modelDraft() !== savedModelId();
-  const disabled = () => !dirty() || !mediaSelectionPrecondition() || !modelsLoaded() || modelsLoading() || (modelDraft() !== null && !draftModel());
+  const disabled = () => !dirty() || !mediaActionsReady() || (modelDraft() !== null && !draftModel());
   const save = (confirmed?: { previous: string; next: string | null }) => {
     void saveModel(confirmed).then((saved) => {
       if (saved && savedModelId()) mediaModelAsked.set(false);
@@ -549,7 +566,7 @@ export function MediaModelSaveBar(props: { separate?: boolean }) {
               triggerLabel={modelDraft() === null ? "Clear media model…" : "Change media model…"}
               confirmLabel={modelDraft() === null ? "Clear model and index" : "Change model and clear index"}
               message="This removes your Documents & media index, not your files or anyone else's index. Index your files again to search them with a new model."
-              scopeKey={JSON.stringify([previous(), modelDraft(), modelsLoaded(), modelsLoading(), mediaSelectionPrecondition()])}
+              scopeKey={JSON.stringify([previous(), modelDraft(), mediaSelectionRevision(), mediaActionsReady()])}
               busy={savingModel()} busyLabel="Saving…" disabled={disabled()}
               onConfirm={() => save({ previous: previous(), next: modelDraft() })} />
           )}
@@ -584,13 +601,14 @@ function LibrarySearchPage() {
 function LibraryFilters() {
   const scopes = () => [{ value: "all", label: "Everything" }, { value: "personal", label: "Personal" }, ...spaces().map((s) => ({ value: `space:${s.id}`, label: s.name }))];
   const disclosure = () => {
-    const m = savedModel();
+    const m = mediaActionsReady() ? savedModel() : null;
     if (!m) return null;
     const who = m.owned ? "" : m.execution === "device" ? `, which runs on ${m.ownerId ?? "its owner"}'s device` : `, shared by ${m.ownerId ?? "someone"}: whoever runs it sees the query`;
     return libSearching() ? "Searching…" : `Return in the search box at the top, or More results under it, sends your query to ${m.name}${who}. While you type, Metro only looks up literal matches itself, with no model; changing a filter sends nothing. ${RERANK_NOTE}`;
   };
   return (
     <Column gap={3} testID="library-search-form">
+      <If when={mediaSavePending() !== null || savingModel()}><MediaSaveStatus /></If>
       <Row align="center" gap={2} wrap testID="library-search-scope" accessibilityLabel="Search files in">
         <Label variant="caption" color="muted">
           In
@@ -625,7 +643,7 @@ function LibraryFilters() {
       <If
         when={disclosure()}
         else={
-          <If when={modelsLoaded()}>
+          <If when={mediaActionsReady() && !savedModelId()}>
             <Banner tone="warning" testID="library-search-no-model">
               <Column grow>
                 <Label variant="caption" color="warning">

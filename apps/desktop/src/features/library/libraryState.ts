@@ -76,8 +76,12 @@ export const modelError = signal<string | null>(null);
 export const modelConflict = signal<string | null>(null);
 export const modelNotice = signal<string | null>(null);
 export const mediaSelectionPrecondition = signal(false);
+export const mediaSelectionRevision = signal<string | null>(null);
+export const mediaSavePending = signal<string | null>(null);
 export const modelsUnsupported = signal(false);
 export const savingModel = signal(false);
+export const mediaActionsReady = computed(() => modelsLoaded() && !modelsLoading() && mediaSelectionPrecondition()
+  && mediaSelectionRevision() !== null && !savingModel() && mediaSavePending() === null);
 let mediaModelsSeq = 0;
 let mediaVisit = 0;
 let mediaIndexRevision = 0;
@@ -211,6 +215,9 @@ function serverDetail(error: unknown): string | null {
   return m ? m[1]! : null;
 }
 
+const selectionCode = (error: unknown) => error instanceof ApiError
+  ? (error.details as { code?: string } | undefined)?.code : undefined;
+
 const joinedIds = () => new Set(spaces().map((s) => s.id));
 export const spaceName = (spaceId: string) => spaces().find((s) => s.id === spaceId)?.name ?? "a Space";
 const isJoined = (spaceId: string | null) => spaceId === null || spaces().some((s) => s.id === spaceId);
@@ -337,13 +344,22 @@ export async function loadModels(): Promise<void> {
     if (!live()) return;
     const previous = savedModelId();
     const edited = modelDraft() !== previous;
+    const pending = mediaSavePending();
     batch(() => {
       // Only adapters that embed media themselves: a text-only embeddings connection never stands in.
       mediaModels.set(models.filter((m) => m.capability === "embeddings" && m.mediaInputs === true && !!m.model && m.ready !== false));
-      adoptMediaSelection(settings.embeddingId);
-      mediaSelectionPrecondition.set(settings.selectionPrecondition);
+      adoptMediaSelection(settings.embeddingId, settings.selectionRevision);
+      mediaSelectionPrecondition.set(settings.selectionRevision !== null);
       suggestedModelId.set(settings.suggestedId);
-      if (!edited || previous !== settings.embeddingId) modelDraft.set(settings.embeddingId);
+      if (!edited || previous !== settings.embeddingId || pending !== null) modelDraft.set(settings.embeddingId);
+      // An unchanged GET cannot disprove a late PUT. A different revision
+      // means the original compare can no longer succeed, including after ABA.
+      if (pending !== null && settings.selectionRevision !== null && settings.selectionRevision !== pending) {
+        mediaSavePending.set(null);
+        modelConflict.set("The saved media model was reloaded. Review the current selection.");
+      } else if (pending !== null) {
+        modelError.set("Metro couldn't confirm the media model save. Indexing and file search are paused until a reload shows the save can no longer change the selection.");
+      }
       modelsLoaded.set(true);
     });
   } catch (error) {
@@ -365,8 +381,8 @@ export async function loadModels(): Promise<void> {
   }
 }
 
-function adoptMediaSelection(id: string | null) {
-  if (savedModelId() !== null && id !== savedModelId()) {
+function adoptMediaSelection(id: string | null, revision: string | null) {
+  if (id !== savedModelId() || revision !== mediaSelectionRevision()) {
     mediaIndexRevision++;
     indexStates.set({});
     libAnswer.set(null);
@@ -375,13 +391,15 @@ function adoptMediaSelection(id: string | null) {
     lessRelevantOpen.set(false);
   }
   savedModelId.set(id);
+  mediaSelectionRevision.set(revision);
 }
 
 export async function saveModel(confirmed?: { previous: string; next: string | null }): Promise<boolean> {
   const api = library();
   const id = modelDraft();
   const previous = savedModelId();
-  if (!api || !mediaSelectionPrecondition() || !modelsLoaded() || modelsLoading() || savingModel() || id === previous || (id !== null && !draftModel())) return false;
+  const revision = mediaSelectionRevision();
+  if (!api || !revision || !mediaActionsReady() || id === previous || (id !== null && !draftModel())) return false;
   if (previous !== null && (confirmed?.previous !== previous || confirmed.next !== id)) return false;
   const ok = sessionGuard();
   const visit = mediaVisit;
@@ -393,10 +411,10 @@ export async function saveModel(confirmed?: { previous: string; next: string | n
     modelNotice.set(null);
   });
   try {
-    const saved = await api.putLibrarySettings(id, previous);
+    const saved = await api.putLibrarySettings(id, previous, revision);
     if (!ok()) return false;
     batch(() => {
-      adoptMediaSelection(saved.embeddingId);
+      adoptMediaSelection(saved.embeddingId, saved.selectionRevision);
       modelDraft.set(saved.embeddingId);
       if (saved.suggestedId) suggestedModelId.set(saved.suggestedId);
       if (visit === mediaVisit) modelNotice.set(saved.embeddingId ? "Media model saved." : "Media model cleared. Indexing and file search are off.");
@@ -405,8 +423,8 @@ export async function saveModel(confirmed?: { previous: string; next: string | n
   } catch (error) {
     if (!ok()) return false;
     const detail = serverDetail(error);
-    const status = statusOf(error);
-    if (status === 409) {
+    const code = selectionCode(error);
+    if (code === "library_selection_changed" || (code === "library_selection_refused" && statusOf(error) === 409)) {
       reload = true;
       batch(() => {
         modelsLoaded.set(false);
@@ -420,18 +438,16 @@ export async function saveModel(confirmed?: { previous: string; next: string | n
       });
       return false;
     }
-    if (status === 404 || status === 405) {
-      // A server downgrade or mixed deployment may lack the guarded route.
-      mediaSelectionPrecondition.set(false);
-      modelDraft.set(savedModelId());
-      return false;
-    }
-    if (status === 422 || status === 400) {
+    if (code === "library_selection_refused") {
       if (visit === mediaVisit) modelError.set(`That connection can't be used for Documents & media${detail ? `: ${detail}` : ""}.`);
       return false;
     }
-    const message = failure(error, "Couldn't save the media model");
-    if (message && visit === mediaVisit) modelError.set(message);
+    if (error instanceof ApiError && error.kind === "auth") {
+      disconnect(error.message);
+      return false;
+    }
+    mediaSavePending.set(revision);
+    reload = true;
     return false;
   } finally {
     if (ok()) {
@@ -537,8 +553,10 @@ export async function chooseAndUpload(): Promise<void> {
 // ------------------------------------------------------------------ index and delete
 
 export async function indexAsset(asset: LibraryAsset): Promise<void> {
+  const selection = mediaSelectionRevision();
+  if (!selection || !mediaActionsReady()) return;
   if (indexStates()[asset.id]?.state === "indexing") return;
-  if (!savedModelId()) {
+  if (!savedModel()) {
     indexStates.set({ ...indexStates(), [asset.id]: { state: "failed", message: "Choose and save a media model first." } });
     return;
   }
@@ -550,7 +568,7 @@ export async function indexAsset(asset: LibraryAsset): Promise<void> {
   try {
     const api = library();
     if (!api) return;
-    const result = await api.indexAsset(asset.id);
+    const result = await api.indexAsset(asset.id, selection);
     if (!ok() || !isJoined(asset.spaceId)) return;
     const item = result.items.find((i) => i.assetId === asset.id);
     if (item && item.status !== "indexed") {
@@ -567,7 +585,10 @@ export async function indexAsset(asset: LibraryAsset): Promise<void> {
     if (!ok()) return;
     const status = statusOf(error);
     const detail = serverDetail(error);
-    if (status === 404) set({ state: "failed", message: "That file is gone or no longer yours to see." });
+    if (selectionCode(error) === "library_selection_changed") {
+      mediaSelectionPrecondition.set(false);
+      set({ state: "failed", message: "The saved media model changed. Reload it and review the selection before indexing again." });
+    } else if (status === 404) set({ state: "failed", message: "That file or guarded indexing is unavailable on this server." });
     else if (status === 409) set({ state: "failed", message: `Not indexed: ${detail ?? "choose a media model you may use for this file"}.` });
     else if (status === 422) set({ state: "failed", message: "Not indexed: the saved connection can't embed documents, images, audio or video." });
     else if (status === 502) set({ state: "failed", message: `Not indexed: the media model failed${detail ? ` (${detail})` : ""}. Nothing was stored.` });
@@ -646,6 +667,11 @@ export async function runLibrarySearch(): Promise<void> {
     libSearchError.set({ message: `Searches are at most ${MAX_QUERY_CHARS} characters.`, needsModel: false });
     return;
   }
+  const selection = mediaSelectionRevision();
+  if (!selection || !mediaActionsReady() || (savedModelId() !== null && !savedModel())) {
+    libSearchError.set({ message: "File search is paused. Review the saved media model, then search again.", needsModel: true });
+    return;
+  }
   const scope = libScope();
   const kind = libKind();
   const sameSession = sessionGuard();
@@ -659,7 +685,7 @@ export async function runLibrarySearch(): Promise<void> {
   try {
     const api = library();
     if (!api) return;
-    const answer = await api.searchLibrary(query, scope, LIBRARY_SEARCH_LIMIT, kind);
+    const answer = await api.searchLibrary(query, scope, LIBRARY_SEARCH_LIMIT, selection, kind);
     if (!ok() || mine !== seq) return;
     batch(() => {
       lessRelevantOpen.set(false);
@@ -669,7 +695,12 @@ export async function runLibrarySearch(): Promise<void> {
     if (!ok() || mine !== seq) return;
     const status = statusOf(error);
     const detail = serverDetail(error);
-    if (status === 404 && scope.kind === "space") {
+    if (selectionCode(error) === "library_selection_changed") {
+      mediaSelectionPrecondition.set(false);
+      libSearchError.set({ message: "The saved media model changed. Reload it and review the selection before searching again.", needsModel: true });
+      return;
+    }
+    if (status === 404 && scope.kind === "space" && detail === "space not found") {
       batch(() => {
         libScope.set({ kind: "all" });
         libAnswer.set(null);
@@ -1144,6 +1175,8 @@ onSessionEnd(() => {
     modelsLoading.set(false);
     modelsUnsupported.set(false);
     mediaSelectionPrecondition.set(false);
+    mediaSelectionRevision.set(null);
+    mediaSavePending.set(null);
     modelError.set(null);
     modelConflict.set(null);
     modelNotice.set(null);

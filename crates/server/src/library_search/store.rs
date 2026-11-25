@@ -52,7 +52,8 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
         "CREATE TABLE IF NOT EXISTS library_search_settings (
              user_id      TEXT PRIMARY KEY NOT NULL,
              embedding_id TEXT,
-             updated_at   INTEGER NOT NULL
+             updated_at   INTEGER NOT NULL,
+             selection_rev INTEGER NOT NULL DEFAULT 0
          );
          CREATE TABLE IF NOT EXISTS library_search_clock (
              id    INTEGER PRIMARY KEY CHECK (id = 1),
@@ -102,7 +103,19 @@ pub fn init(conn: &Connection) -> rusqlite::Result<()> {
              ON library_search_segments (asset_id);
          CREATE INDEX IF NOT EXISTS library_search_segments_by_connection
              ON library_search_segments (connection_id);",
-    )
+    )?;
+    let has_revision: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('library_search_settings')
+                         WHERE name = 'selection_rev')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has_revision {
+        conn.execute_batch(
+            "ALTER TABLE library_search_settings ADD COLUMN selection_rev INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
 }
 
 /// The write clock now; see the module docs.
@@ -139,37 +152,54 @@ fn now_ms() -> i64 {
 
 // ---- Settings ----
 
-pub fn embedding_id(conn: &Connection, user: &str) -> rusqlite::Result<Option<String>> {
+pub fn selection(conn: &Connection, user: &str) -> rusqlite::Result<(Option<String>, i64)> {
     Ok(conn
         .query_row(
-            "SELECT embedding_id FROM library_search_settings WHERE user_id = ?1",
+            "SELECT embedding_id, selection_rev FROM library_search_settings WHERE user_id = ?1",
             [user],
-            |r| r.get::<_, Option<String>>(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .optional()?
-        .flatten())
+        .unwrap_or_default())
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[cfg(test)]
+pub fn embedding_id(conn: &Connection, user: &str) -> rusqlite::Result<Option<String>> {
+    Ok(selection(conn, user)?.0)
+}
+
+#[derive(Debug)]
 pub enum SelectionWrite {
-    Saved,
+    Saved(i64),
     Stale,
+    Unusable(super::MediaError),
 }
 
 /// Compare (if supplied), save and purge the old index in one write
 /// transaction. A stale write leaves both the selection and index intact.
-pub fn set_embedding_id(
+pub fn save_selection(
     conn: &mut Connection,
     user: &str,
     id: Option<&str>,
     expected: Option<Option<&str>>,
+    expected_revision: Option<i64>,
+    grant: &GrantCheck,
 ) -> rusqlite::Result<SelectionWrite> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let before = embedding_id(&tx, user)?;
-    if expected.is_some_and(|expected| expected != before.as_deref()) {
+    let (before, revision) = selection(&tx, user)?;
+    if expected.is_some_and(|expected| expected != before.as_deref())
+        || expected_revision.is_some_and(|expected| expected != revision)
+    {
         return Ok(SelectionWrite::Stale);
     }
-    if before.as_deref() != id {
+    // Same transaction and personal scope, before any purge or write.
+    if let Some(id) = id
+        && let Err(error) = grant(&tx, None, id)
+    {
+        return Ok(SelectionWrite::Unusable(error));
+    }
+    let changed = before.as_deref() != id;
+    if changed {
         tx.execute(
             "DELETE FROM library_search_segments WHERE user_id = ?1",
             [user],
@@ -179,15 +209,29 @@ pub fn set_embedding_id(
             [user],
         )?;
     }
-    tx.execute(
-        "INSERT INTO library_search_settings (user_id, embedding_id, updated_at)
-         VALUES (?1, ?2, ?3)
+    let revision = tx.query_row(
+        "INSERT INTO library_search_settings (user_id, embedding_id, updated_at, selection_rev)
+         VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT (user_id) DO UPDATE
-         SET embedding_id = excluded.embedding_id, updated_at = excluded.updated_at",
-        params![user, id, now_ms()],
+         SET embedding_id = excluded.embedding_id, updated_at = excluded.updated_at,
+             selection_rev = selection_rev + ?4
+         RETURNING selection_rev",
+        params![user, id, now_ms(), i64::from(changed)],
+        |r| r.get(0),
     )?;
     tx.commit()?;
-    Ok(SelectionWrite::Saved)
+    Ok(SelectionWrite::Saved(revision))
+}
+
+#[cfg(test)]
+pub fn set_embedding_id(
+    conn: &mut Connection,
+    user: &str,
+    id: Option<&str>,
+    expected: Option<Option<&str>>,
+) -> rusqlite::Result<SelectionWrite> {
+    let grant: GrantCheck = std::sync::Arc::new(|_, _, _| Ok(String::new()));
+    save_selection(conn, user, id, expected, None, &grant)
 }
 
 // ---- Access ----
@@ -295,6 +339,7 @@ pub fn forget_connection(
 // ---- Indexing ----
 
 pub struct NewAsset<'a> {
+    pub selection_revision: Option<i64>,
     pub asset_id: &'a str,
     pub source: &'a str,
     pub space_id: Option<&'a str>,
@@ -315,6 +360,8 @@ pub enum StoreOutcome {
     Revoked,
     /// The file's bytes or Space changed.
     Changed,
+    /// The request's selection revision no longer matches.
+    SelectionChanged,
     /// The setting now names another connection, or the connection's grant
     /// or configuration changed, or it may no longer be used.
     Switched,
@@ -337,7 +384,13 @@ pub fn store_asset(
     max_segments: usize,
 ) -> anyhow::Result<StoreOutcome> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if embedding_id(&tx, user)?.as_deref() != Some(a.connection_id) {
+    let (selected, revision) = selection(&tx, user)?;
+    if a.selection_revision
+        .is_some_and(|expected| expected != revision)
+    {
+        return Ok(StoreOutcome::SelectionChanged);
+    }
+    if selected.as_deref() != Some(a.connection_id) {
         return Ok(StoreOutcome::Switched);
     }
     let file: Option<(String, Option<String>, String)> = tx
@@ -468,13 +521,14 @@ pub fn purge_stale(
     conn: &mut Connection,
     user: &str,
     source: &str,
-    connection_id: &str,
+    (connection_id, expected_revision): (&str, Option<i64>),
     fingerprint: &str,
     dims: Option<usize>,
     snapshot: i64,
 ) -> rusqlite::Result<usize> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if embedding_id(&tx, user)?.as_deref() != Some(connection_id) {
+    let (id, revision) = selection(&tx, user)?;
+    if id.as_deref() != Some(connection_id) || expected_revision.is_some_and(|r| r != revision) {
         return Ok(0);
     }
     let dims = dims.map(|d| d as i64).unwrap_or(-1);
@@ -504,11 +558,12 @@ pub fn purge_source(
     conn: &mut Connection,
     user: &str,
     source: &str,
-    connection_id: &str,
+    (connection_id, expected_revision): (&str, Option<i64>),
     snapshot: i64,
 ) -> rusqlite::Result<usize> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    if embedding_id(&tx, user)?.as_deref() != Some(connection_id) {
+    let (id, revision) = selection(&tx, user)?;
+    if id.as_deref() != Some(connection_id) || expected_revision.is_some_and(|r| r != revision) {
         return Ok(0);
     }
     let n = delete_both(

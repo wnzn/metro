@@ -114,7 +114,9 @@ pub fn router() -> Router<AppState> {
             axum::routing::put(upstream::put_selection),
         )
         .route("/v1/library/index", post(index))
+        .route("/v1/library/index/selection", post(index_checked))
         .route("/v1/library/search", post(search))
+        .route("/v1/library/search/selection", post(search_checked))
 }
 
 /// Hooks for the library owner. Index rows reference `library_assets(id)`
@@ -164,6 +166,17 @@ pub mod hooks {
     ) -> rusqlite::Result<()> {
         super::store::forget_connection(conn, connection_id, Some(owner_id)).map(drop)
     }
+}
+
+/// Checked during dispatch (and queued device claim) using the caller's current selection.
+pub(crate) fn selection_is(
+    conn: &rusqlite::Connection,
+    user: &str,
+    id: &str,
+    revision: i64,
+) -> rusqlite::Result<bool> {
+    let (current, actual) = store::selection(conn, user)?;
+    Ok(actual == revision && current.as_deref() == Some(id))
 }
 
 // ---- Seams ----
@@ -275,20 +288,23 @@ pub trait MediaModels: Send + Sync {
         dest: Option<&'a str>,
         connection: &'a str,
     ) -> ModelFuture<'a, String>;
-    /// One media embedding request (see [`protocol`]); returns the answer.
+    /// One media embedding request (see [`protocol`]), pinned to the
+    /// supplied selection revision and connection fingerprint when bound.
     fn embed<'a>(
         &'a self,
         dest: Option<&'a str>,
         connection: &'a str,
         input: Value,
+        binding: Option<(i64, &'a str)>,
     ) -> ModelFuture<'a, Value>;
-    /// One System One request.
+    /// One System One request, using the same media selection as retrieval.
     fn decide<'a>(
         &'a self,
         dest: Option<&'a str>,
         connection: &'a str,
         state: Value,
         questions: Value,
+        selection: Option<(&'a str, i64)>,
     ) -> ModelFuture<'a, Value>;
     /// The caller's grant check (see [`GrantCheck`]).
     fn grant(&self) -> GrantCheck;
@@ -357,6 +373,8 @@ pub struct CheckedSettings {
     pub embedding_id: Option<String>,
     #[serde(deserialize_with = "required_nullable_id")]
     pub expected_embedding_id: Option<String>,
+    /// Older guarded clients supplied only the id.
+    pub expected_selection_revision: Option<String>,
 }
 
 fn required_nullable_id<'de, D>(d: D) -> Result<Option<String>, D::Error>
@@ -374,6 +392,8 @@ pub struct SettingsView {
     pub embedding_id: Option<String>,
     /// New clients require this before sending a guarded write.
     pub selection_precondition: bool,
+    /// Opaque on the wire. "0" represents the initial selection, including none.
+    pub selection_revision: String,
     /// The person's message-search embedding connection, offered only
     /// when it is confirmed media-capable. A suggestion to show; it is not
     /// used until saved with `PUT`.
@@ -388,6 +408,7 @@ pub struct IndexBody {
     pub asset_id: Option<String>,
     #[serde(default)]
     pub asset_ids: Option<Vec<String>>,
+    pub selection_revision: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -432,6 +453,24 @@ pub struct SearchBody {
     pub limit: Option<usize>,
     #[serde(default)]
     pub kind: Option<Kind>,
+    pub selection_revision: Option<String>,
+}
+
+fn parse_selection_revision(text: &str) -> Result<i64, LibrarySearchError> {
+    text.parse::<i64>()
+        .ok()
+        .filter(|n| *n >= 0 && n.to_string() == text)
+        .ok_or_else(|| LibrarySearchError::BadRequest("invalid selection_revision".into()))
+}
+
+fn request_revision(text: Option<&str>, required: bool) -> Result<Option<i64>, LibrarySearchError> {
+    match text {
+        Some(text) => parse_selection_revision(text).map(Some),
+        None if required => Err(LibrarySearchError::BadRequest(
+            "selection_revision is required".into(),
+        )),
+        None => Ok(None),
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -554,8 +593,23 @@ impl From<LibrarySearchError> for ApiError {
         match e {
             LibrarySearchError::Internal(m) => ApiError::internal(anyhow::anyhow!(m)),
             LibrarySearchError::Busy => ApiError::unavailable(e.message()),
+            LibrarySearchError::SelectionChanged => {
+                ApiError::new(e.status(), e.message()).with_code("library_selection_changed")
+            }
             e => ApiError::new(e.status(), e.message()),
         }
+    }
+}
+
+fn selection_save_error(e: LibrarySearchError) -> ApiError {
+    match e {
+        LibrarySearchError::BadRequest(_)
+        | LibrarySearchError::NotFound(_)
+        | LibrarySearchError::NotMediaCapable
+        | LibrarySearchError::Unusable(_) => {
+            ApiError::from(e).with_code("library_selection_refused")
+        }
+        e => e.into(),
     }
 }
 
@@ -676,13 +730,33 @@ async fn index(
     body: Result<Json<IndexBody>, JsonRejection>,
 ) -> Result<Json<IndexResponse>, ApiError> {
     let Json(body) = body?;
+    index_with(state, who, body, false).await
+}
+
+async fn index_checked(
+    State(state): State<AppState>,
+    who: Human,
+    body: Result<Json<IndexBody>, JsonRejection>,
+) -> Result<Json<IndexResponse>, ApiError> {
+    let Json(body) = body?;
+    index_with(state, who, body, true).await
+}
+
+async fn index_with(
+    state: AppState,
+    who: Human,
+    body: IndexBody,
+    checked: bool,
+) -> Result<Json<IndexResponse>, ApiError> {
+    let expected = request_revision(body.selection_revision.as_deref(), checked)?;
     let (ids, bulk) = check_index_body(body)?;
     let _permit = permits()
         .try_acquire_owned()
         .map_err(|_| LibrarySearchError::Busy)?;
-    let routing = upstream::routing(&state, &who).await?;
+    let (routing, revision) = upstream::routing(&state, &who, expected).await?;
     let (library, models) = upstream::seams(&state, &who);
-    let engine = Engine::new(&state.db, &who.id, &library, &models, routing);
+    let engine =
+        Engine::new(&state.db, &who.id, &library, &models, routing).bind_selection(revision);
     Ok(Json(engine.index(&ids, bulk).await?))
 }
 
@@ -692,6 +766,25 @@ async fn search(
     body: Result<Json<SearchBody>, JsonRejection>,
 ) -> Result<Json<SearchResponse>, ApiError> {
     let Json(body) = body?;
+    search_with(state, who, body, false).await
+}
+
+async fn search_checked(
+    State(state): State<AppState>,
+    who: Human,
+    body: Result<Json<SearchBody>, JsonRejection>,
+) -> Result<Json<SearchResponse>, ApiError> {
+    let Json(body) = body?;
+    search_with(state, who, body, true).await
+}
+
+async fn search_with(
+    state: AppState,
+    who: Human,
+    body: SearchBody,
+    checked: bool,
+) -> Result<Json<SearchResponse>, ApiError> {
+    let expected = request_revision(body.selection_revision.as_deref(), checked)?;
     let query = check_query(&body.query)?;
     let limit = check_limit(body.limit)?;
     let (sources, left_out) =
@@ -699,9 +792,10 @@ async fn search(
     let _permit = permits()
         .try_acquire_owned()
         .map_err(|_| LibrarySearchError::Busy)?;
-    let routing = upstream::routing(&state, &who).await?;
+    let (routing, revision) = upstream::routing(&state, &who, expected).await?;
     let (library, models) = upstream::seams(&state, &who);
-    let engine = Engine::new(&state.db, &who.id, &library, &models, routing);
+    let engine =
+        Engine::new(&state.db, &who.id, &library, &models, routing).bind_selection(revision);
     Ok(Json(
         engine
             .search(&query, &sources, left_out, limit, body.kind)

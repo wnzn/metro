@@ -401,7 +401,8 @@ export function createClient(options: ClientOptions) {
       });
       checkCancelled();
       const errorDetails = path.startsWith("/v1/pages") ? "pages"
-        : method === "PATCH" && /^\/v1\/providers\/[^/]+$/.test(path) && isObject(body) && "base_url" in body ? "endpoint" : undefined;
+        : method === "PATCH" && /^\/v1\/providers\/[^/]+$/.test(path) && isObject(body) && "base_url" in body ? "endpoint"
+        : /^\/v1\/library\/(?:settings|index|search)\/selection$/.test(path) ? "library" : undefined;
       await checkStatus(response, method, path, errorDetails);
       const text = await response.text();
       checkCancelled();
@@ -1314,7 +1315,7 @@ function endpointRefusal(data: unknown, status: number): EndpointPatchError | nu
 }
 
 /** Maps a non-2xx response to its ApiError. */
-async function checkStatus(response: Response, method: string, path: string, errorDetails?: "pages" | "endpoint"): Promise<void> {
+async function checkStatus(response: Response, method: string, path: string, errorDetails?: "pages" | "endpoint" | "library"): Promise<void> {
   if (response.status === 401) {
     throw new ApiError("auth", "The server rejected the access token (HTTP 401). Check the token and connect again.", 401);
   }
@@ -1322,6 +1323,16 @@ async function checkStatus(response: Response, method: string, path: string, err
     const data: unknown = await response.json().catch(() => undefined);
     throw endpointRefusal(data, response.status) ??
       new ApiError("http", `${method} ${path} failed with HTTP ${response.status}`, response.status);
+  }
+  if (errorDetails === "library" && !response.ok) {
+    const data: unknown = await response.json().catch(() => undefined);
+    const reason = isObject(data) && typeof data.error === "string" ? data.error.trim().slice(0, 200) : "";
+    const status = response.status;
+    const code = reason && isObject(data) ? data.code : null;
+    const verified = (code === "library_selection_changed" && status === 409)
+      || (code === "library_selection_refused" && method === "PUT" && [400, 404, 409, 422].includes(status));
+    throw new ApiError(status === 404 ? "not_found" : "http",
+      `${method} ${path} failed with HTTP ${status}${reason ? `: ${reason}` : ""}`, status, verified ? { code } : undefined);
   }
   if (response.status === 403) {
     const detail = await safeSnippet(response);
