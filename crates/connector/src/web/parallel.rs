@@ -46,7 +46,12 @@ fn error(c: &Call<'_>, e: McpError) -> Failure {
     }
 }
 
-async fn call(c: &Call<'_>, base: &str, tool: &str, args: Value) -> Result<String, Failure> {
+async fn call(
+    c: &Call<'_>,
+    base: &str,
+    tool: &str,
+    args: Value,
+) -> Result<(String, Value), Failure> {
     let url = format!("{}?tools=web_search,web_fetch", base.trim_end_matches('/'));
     let (auth, mode, fp) = match c.key {
         Some(k) => (
@@ -74,16 +79,29 @@ async fn call(c: &Call<'_>, base: &str, tool: &str, args: Value) -> Result<Strin
     if text.trim().is_empty() {
         return Err(Failure::of(Outcome::BadResponse));
     }
-    Ok(text)
+    Ok((text, result))
 }
 
-/// Results from a JSON tool output (`{results:[{url,title,excerpts|…}]}`),
-/// best effort; the text itself still goes to Metro.
-fn parse_results(text: &str) -> Vec<Hit> {
-    let Ok(v) = serde_json::from_str::<Value>(text) else {
-        return Vec::new();
+/// Results from structured data only: the tool result's
+/// `structuredContent`, or a text part that is one whole JSON document
+/// (`{results:[{url,title,excerpts|…}]}`). In both, a URL is its own JSON
+/// field, so excerpt text can't create a result. Free text is never parsed
+/// into results; it goes to Metro as untrusted text without fetch
+/// permission.
+pub(crate) fn structured_results(result: &Value, text: &str) -> Vec<Hit> {
+    let parsed;
+    let doc = if result["structuredContent"]["results"].is_array() {
+        &result["structuredContent"]
+    } else {
+        match serde_json::from_str::<Value>(text.trim()) {
+            Ok(v) if v.is_object() => {
+                parsed = v;
+                &parsed
+            }
+            _ => return Vec::new(),
+        }
     };
-    v["results"]
+    doc["results"]
         .as_array()
         .into_iter()
         .flatten()
@@ -108,8 +126,8 @@ fn parse_results(text: &str) -> Vec<Hit> {
 }
 
 pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<Answer, Failure> {
-    let text = call(c, base, "web_search", search_arguments(r)).await?;
-    let mut results = parse_results(&text);
+    let (text, result) = call(c, base, "web_search", search_arguments(r)).await?;
+    let mut results = structured_results(&result, &text);
     results.truncate(r.max_results as usize);
     Ok(Answer {
         results,
@@ -123,7 +141,7 @@ pub(crate) async fn fetch(c: &Call<'_>, base: &str, r: &FetchReq) -> Result<Answ
     if let Some(f) = &r.focus {
         args["objective"] = json!(f);
     }
-    let text = call(c, base, "web_fetch", args).await?;
+    let (text, _) = call(c, base, "web_fetch", args).await?;
     Ok(Answer {
         text: Some(text),
         ..Answer::default()

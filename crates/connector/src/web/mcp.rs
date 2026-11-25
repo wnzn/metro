@@ -139,58 +139,93 @@ async fn post(
     })
 }
 
+/// An incremental SSE splitter: bytes go in as they arrive, the `data` of
+/// each complete event comes out. Every byte is scanned for a delimiter once
+/// (a cursor remembers how far it got) and the consumed prefix is dropped
+/// once per pushed chunk, so fragmented input and many small events both
+/// cost linear work.
+#[derive(Default)]
+pub(crate) struct SseParser {
+    buf: Vec<u8>,
+    /// Start of the event not yet emitted.
+    consumed: usize,
+    /// Where the delimiter search resumes.
+    scanned: usize,
+    /// Bytes inspected, for tests.
+    pub(crate) work: usize,
+}
+
+impl SseParser {
+    /// Add `chunk`; returns the `data` of each event it completed.
+    pub(crate) fn push(&mut self, chunk: &[u8]) -> Vec<String> {
+        self.buf.extend_from_slice(chunk);
+        let mut out = Vec::new();
+        let mut i = self.scanned.max(self.consumed);
+        while i < self.buf.len() {
+            self.work += 1;
+            // An event ends at a blank line: "\n\n" or "\r\n\r\n" (or a
+            // mix); look back from each '\n'.
+            if self.buf[i] == b'\n' {
+                let before = &self.buf[self.consumed..i];
+                let blank = before.ends_with(b"\n") || before.ends_with(b"\n\r");
+                if blank {
+                    let event = &self.buf[self.consumed..i];
+                    if let Some(d) = event_data(event) {
+                        out.push(d);
+                    }
+                    self.consumed = i + 1;
+                }
+            }
+            i += 1;
+        }
+        self.scanned = i;
+        // Compact once per chunk.
+        if self.consumed > 0 {
+            self.buf.drain(..self.consumed);
+            self.scanned -= self.consumed;
+            self.consumed = 0;
+        }
+        out
+    }
+}
+
+/// The joined `data:` lines of one event, if any.
+fn event_data(event: &[u8]) -> Option<String> {
+    let text = String::from_utf8_lossy(event);
+    let data: Vec<&str> = text
+        .split('\n')
+        .map(|l| l.strip_suffix('\r').unwrap_or(l))
+        .filter_map(|l| l.strip_prefix("data:"))
+        .map(|d| d.strip_prefix(' ').unwrap_or(d))
+        .collect();
+    (!data.is_empty()).then(|| data.join("\n"))
+}
+
 /// Read an event stream until the JSON-RPC response with id `want`.
 async fn read_sse(resp: &mut reqwest::Response, want: u64) -> Result<Option<Value>, McpError> {
-    let mut buf: Vec<u8> = Vec::new();
+    let mut parser = SseParser::default();
     let mut read = 0usize;
     loop {
-        // Complete events in the buffer first.
-        while let Some(end) = event_end(&buf) {
-            let event: Vec<u8> = buf.drain(..end.1).collect();
-            let text = String::from_utf8_lossy(&event[..end.0]).replace("\r\n", "\n");
-            let data: Vec<&str> = text
-                .lines()
-                .filter_map(|l| l.strip_prefix("data:"))
-                .map(|d| d.strip_prefix(' ').unwrap_or(d))
-                .collect();
-            if data.is_empty() {
-                continue;
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(&data.join("\n"))
-                && v["id"] == json!(want)
-                && (v.get("result").is_some() || v.get("error").is_some())
-            {
-                return Ok(Some(v));
-            }
-        }
         match resp.chunk().await {
             Ok(Some(chunk)) => {
                 read += chunk.len();
                 if read > MAX_VENDOR_BYTES {
                     return Err(McpError::Bad);
                 }
-                buf.extend_from_slice(&chunk);
+                for data in parser.push(&chunk) {
+                    if let Ok(v) = serde_json::from_str::<Value>(&data)
+                        && v["id"] == json!(want)
+                        && (v.get("result").is_some() || v.get("error").is_some())
+                    {
+                        return Ok(Some(v));
+                    }
+                }
+                // Let other tasks run between chunks of a busy stream.
+                tokio::task::yield_now().await;
             }
             Ok(None) => return Ok(None),
             Err(e) => return Err(McpError::Transport(transport(&e))),
         }
-    }
-}
-
-/// `(event length, length including the blank line)` of the first complete
-/// event in `buf`.
-fn event_end(buf: &[u8]) -> Option<(usize, usize)> {
-    let lf = buf
-        .windows(2)
-        .position(|w| w == b"\n\n")
-        .map(|i| (i, i + 2));
-    let crlf = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .map(|i| (i, i + 4));
-    match (lf, crlf) {
-        (Some(a), Some(b)) => Some(if a.0 <= b.0 { a } else { b }),
-        (a, b) => a.or(b),
     }
 }
 
@@ -311,4 +346,44 @@ pub fn auth_header(name: &'static str, value: &str) -> Result<HeaderMap, Failure
     let mut h = HeaderMap::new();
     h.insert(HeaderName::from_static(name), v);
     Ok(h)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fragmented_events_parse_with_linear_work() {
+        let payload = "x".repeat(200_000);
+        let stream = format!("event: message\r\ndata: {payload}\r\n\r\ndata: tail\n\n");
+        let mut p = SseParser::default();
+        let mut got = Vec::new();
+        for b in stream.as_bytes().chunks(1) {
+            got.extend(p.push(b));
+        }
+        assert_eq!(got, vec![payload, "tail".to_owned()]);
+        assert!(
+            p.work <= stream.len(),
+            "work {} for {} bytes",
+            p.work,
+            stream.len()
+        );
+    }
+
+    #[test]
+    fn dense_small_events_parse_with_linear_work() {
+        let n = 20_000;
+        let stream: String = (0..n).map(|i| format!("data: {i}\n\n")).collect();
+        let mut p = SseParser::default();
+        let got = p.push(stream.as_bytes());
+        assert_eq!(got.len(), n);
+        assert_eq!(got[n - 1], (n - 1).to_string());
+        assert!(p.work <= stream.len());
+        // Split mid-delimiter and mid-line.
+        let mut p = SseParser::default();
+        let mut got = p.push(b"data: a\n");
+        got.extend(p.push(b"\ndata: b\r\n\r"));
+        got.extend(p.push(b"\n: comment\n\nevent: x\n\n"));
+        assert_eq!(got, vec!["a", "b"]);
+    }
 }

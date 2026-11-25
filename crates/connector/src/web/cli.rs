@@ -55,6 +55,8 @@ struct Args {
     label: Option<String>,
     once: bool,
     positional: Vec<String>,
+    /// The connector home (`root_dir()` when `None`); set by tests.
+    root: Option<std::path::PathBuf>,
 }
 
 fn parse(args: &[String]) -> Result<Args> {
@@ -101,14 +103,49 @@ struct Device {
     server_url: String,
     #[serde(default)]
     device_id: Option<String>,
+    /// Whose web search this is: `account:<stable id>` when Metro confirmed
+    /// the account at setup, else `device:<token fingerprint>`. Keys,
+    /// settings and cooldowns live under this owner only, so re-pairing a
+    /// profile for someone else never reuses the previous person's keys.
+    owner: String,
 }
 
 fn profile(a: &Args) -> Result<Profile> {
     let name = a.profile.clone().unwrap_or_else(|| DEFAULT_PROFILE.into());
     validate_profile_name(&name)?;
-    let p = Profile::open(&root_dir()?, &name)?;
+    let root = match &a.root {
+        Some(r) => r.clone(),
+        None => root_dir()?,
+    };
+    // Private before anything is written, custom roots included (on
+    // Windows: a protected DACL for this user and SYSTEM).
+    for dir in [root.clone(), root.join("profiles")] {
+        crate::desktop::store::prepare_private_dir(&dir)?;
+    }
+    let p = Profile::open(&root, &name)?;
+    crate::desktop::store::prepare_private_dir(&p.dir)?;
     p.ensure()?;
     Ok(p)
+}
+
+/// Where `d`'s keys, settings and cooldowns live: one private directory per
+/// (server, owner) inside the profile.
+fn data_dir(p: &Profile, d: &Device) -> Result<std::path::PathBuf> {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in [d.server_url.as_str(), d.owner.as_str()] {
+        h.update((part.len() as u64).to_be_bytes());
+        h.update(part.as_bytes());
+    }
+    let name: String = h.finalize()[..12]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let accounts = p.dir.join("accounts");
+    crate::desktop::store::prepare_private_dir(&accounts)?;
+    let dir = accounts.join(name);
+    crate::desktop::store::prepare_private_dir(&dir)?;
+    Ok(dir)
 }
 
 fn device(p: &Profile) -> Result<Device> {
@@ -138,22 +175,36 @@ async fn setup(a: Args) -> Result<()> {
             .context("--server-url is required")?,
         "server_url",
     )?;
-    let (token, id) = match (&a.session_token_file, &a.device_token_file) {
+    let (token, id, owner) = match (&a.session_token_file, &a.device_token_file) {
         (Some(f), None) => {
             let session = read_secret_input(f, "session token")?;
             let label = a.label.clone().unwrap_or_else(|| "metro-connector".into());
             let api = MetroApi::new(&server, session)
                 .map_err(|e| anyhow::anyhow!("cannot reach Metro: {e:?}"))?;
+            let account = api
+                .me()
+                .await
+                .map_err(|e| anyhow::anyhow!("Metro didn't confirm the account: {e:?}"))?;
             let (id, token) = api
                 .create_web_device(&label)
                 .await
                 .map_err(|e| anyhow::anyhow!("Metro refused to register this computer: {e:?}"))?;
-            (token, Some(id))
+            (token, Some(id), format!("account:{account}"))
         }
         (None, Some(f)) => {
+            // Nobody's account is confirmed: never take over a profile that
+            // is already set up (its keys may be someone else's).
+            if p.dir.join(DEVICE_FILE).exists() {
+                bail!(
+                    "profile {:?} is already set up for web search; use another --profile, or \
+                     --session-token-file so Metro confirms whose it is",
+                    p.name
+                );
+            }
             let t = read_secret_input(f, "device token")?;
             validate_device_token(&t)?;
-            (t, None)
+            let fp = super::keys::fingerprint(&t);
+            (t, None, format!("device:{fp}"))
         }
         _ => bail!("give exactly one of --session-token-file and --device-token-file"),
     };
@@ -162,10 +213,12 @@ async fn setup(a: Args) -> Result<()> {
         v: 1,
         server_url: server.clone(),
         device_id: id.clone(),
+        owner,
     };
     write_private(&p.dir.join(DEVICE_FILE), &serde_json::to_vec_pretty(&d)?)?;
-    let s = settings::load(&p.dir)?;
-    settings::save(&p.dir, &s)?;
+    let dir = data_dir(&p, &d)?;
+    let s = settings::load(&dir)?;
+    settings::save(&dir, &s)?;
     say(format!(
         "Web search is set up in profile {:?} for {server}{}. Run `metro-connector web run --profile {}`.",
         p.name,
@@ -179,7 +232,7 @@ async fn run(a: Args) -> Result<i32> {
     let p = profile(&a)?;
     let d = device(&p)?;
     let token = p.device_token_for(&d.server_url)?;
-    let engine = Engine::new(&p.dir, Endpoints::from_env()?)?;
+    let engine = Engine::new(&data_dir(&p, &d)?, Endpoints::from_env()?)?;
     let client = MetroClient::new(&d.server_url, token, Duration::from_secs(30))?;
     let poll = std::env::var(crate::cli::ENV_POLL_MS)
         .ok()
@@ -250,12 +303,11 @@ async fn futures_join<F: std::future::Future<Output = Stop>>(
 
 fn status(a: Args) -> Result<()> {
     let p = profile(&a)?;
-    let s = settings::load(&p.dir)?;
-    let k = keys::KeyStore::new(&p.dir).load();
-    match device(&p) {
-        Ok(d) => say(format!("server: {}", d.server_url)),
-        Err(_) => say("server: not set up"),
-    }
+    let d = device(&p)?;
+    let dir = data_dir(&p, &d)?;
+    let s = settings::load(&dir)?;
+    let k = keys::KeyStore::new(&dir).load();
+    say(format!("server: {}", d.server_url));
     say(format!(
         "web search: {}",
         if s.enabled { "on" } else { "off" }
@@ -301,9 +353,10 @@ fn status(a: Args) -> Result<()> {
 
 fn edit(a: &Args, f: impl FnOnce(&mut settings::Settings) -> Result<()>) -> Result<()> {
     let p = profile(a)?;
-    let mut s = settings::load(&p.dir)?;
+    let dir = data_dir(&p, &device(&p)?)?;
+    let mut s = settings::load(&dir)?;
     f(&mut s)?;
-    settings::save(&p.dir, &s)
+    settings::save(&dir, &s)
 }
 
 /// `metro-connector web …`.
@@ -323,13 +376,24 @@ pub async fn main(args: &[String]) -> i32 {
             return 2;
         }
     };
+    match command(&args[0], a).await {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("metro-connector: {}", crate::secret::log_text(&e, &[]));
+            1
+        }
+    }
+}
+
+/// One `web` command with parsed arguments.
+async fn command(cmd: &str, a: Args) -> Result<i32> {
     let pos = a.positional.clone();
-    let r: Result<i32> = match args[0].as_str() {
+    let r: Result<i32> = match cmd {
         "setup" => setup(a).await.map(|_| 0),
         "run" => run(a).await,
         "status" => status(a).map(|_| 0),
         "enable" | "disable" => {
-            let on = args[0] == "enable";
+            let on = cmd == "enable";
             edit(&a, |s| {
                 s.enabled = on;
                 Ok(())
@@ -365,7 +429,7 @@ pub async fn main(args: &[String]) -> i32 {
         .map(|_| 0),
         "key" => (|| {
             let p = profile(&a)?;
-            let store = keys::KeyStore::new(&p.dir);
+            let store = keys::KeyStore::new(&data_dir(&p, &device(&p)?)?);
             match pos.first().map(String::as_str) {
                 Some("set") => {
                     let pid = provider(pos.get(1))?;
@@ -396,16 +460,10 @@ pub async fn main(args: &[String]) -> i32 {
             eprintln!(
                 "metro-connector: unknown web command {other:?}; see `metro-connector web --help`"
             );
-            return 2;
+            return Ok(2);
         }
     };
-    match r {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("metro-connector: {}", crate::secret::log_text(&e, &[]));
-            1
-        }
-    }
+    r
 }
 
 #[cfg(test)]
@@ -431,5 +489,176 @@ mod tests {
         assert_eq!(a.positional, vec!["tavily"]);
         assert_eq!(a.from_file.as_deref(), Some("-"));
         assert_eq!(a.profile.as_deref(), Some("p"));
+    }
+
+    use std::sync::{Arc, Mutex};
+
+    use axum::Router;
+    use axum::http::HeaderMap;
+    use axum::routing::{get, post};
+    use serde_json::{Value, json};
+
+    const KEY: &str = "alice-tavily-key-123456";
+
+    async fn fakes() -> (String, Arc<Mutex<Vec<Option<String>>>>) {
+        let seen: Arc<Mutex<Vec<Option<String>>>> = Arc::default();
+        let who = |h: &HeaderMap| match h.get("authorization").and_then(|v| v.to_str().ok()) {
+            Some("Bearer tok-alice") => Some("alice"),
+            Some("Bearer tok-bob") => Some("bob"),
+            _ => None,
+        };
+        let n = Arc::new(Mutex::new(0u32));
+        let s2 = seen.clone();
+        let app = Router::new()
+            .route(
+                "/v1/me",
+                get(move |h: HeaderMap| async move {
+                    axum::Json(json!({"id": who(&h).unwrap_or("nobody")}))
+                }),
+            )
+            .route(
+                "/v1/web-devices",
+                post(move || {
+                    let n = n.clone();
+                    async move {
+                        let mut n = n.lock().unwrap();
+                        *n += 1;
+                        (
+                            axum::http::StatusCode::CREATED,
+                            axum::Json(json!({"id": format!("wd_{:032x}", *n), "token": format!("metro_pc_{:064x}", *n)})),
+                        )
+                    }
+                }),
+            )
+            .route(
+                "/tavily/search",
+                post(move |h: HeaderMap| {
+                    let s2 = s2.clone();
+                    async move {
+                        s2.lock().unwrap().push(
+                            h.get("authorization").and_then(|v| v.to_str().ok()).map(str::to_owned),
+                        );
+                        axum::Json(json!({"results": [{"title": "t", "url": "https://t.example/", "content": "c"}]}))
+                    }
+                }),
+            );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", l.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        (base, seen)
+    }
+
+    fn args(root: &std::path::Path, v: &[&str]) -> Args {
+        let mut a = parse(&s(v)).unwrap();
+        a.root = Some(root.to_path_buf());
+        a
+    }
+
+    async fn search_once(root: &std::path::Path, base: &str) -> Value {
+        let a = args(root, &[]);
+        let p = profile(&a).unwrap();
+        let d = device(&p).unwrap();
+        let mut e = super::super::Endpoints::vendor();
+        e.tavily = format!("{base}/tavily");
+        let engine = Engine::new(&data_dir(&p, &d).unwrap(), e).unwrap();
+        engine
+            .rotate(
+                "j",
+                &super::super::Op::Search(super::super::SearchReq {
+                    query: "q".into(),
+                    keywords: vec![],
+                    max_results: 1,
+                }),
+                std::time::Instant::now() + Duration::from_secs(10),
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn re_pairing_for_another_account_never_reuses_the_previous_keys() {
+        let (base, seen) = fakes().await;
+        let t = tempfile::tempdir().unwrap();
+        let root = t.path().join("home");
+        let file = |name: &str, v: &str| {
+            let p = t.path().join(name);
+            write_private(&p, format!("{v}\n").as_bytes()).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+        let (alice, bob, key) = (file("a", "tok-alice"), file("b", "tok-bob"), file("k", KEY));
+        let setup = |session: &str| {
+            args(
+                &root,
+                &["--server-url", &base, "--session-token-file", session],
+            )
+        };
+        assert_eq!(command("setup", setup(&alice)).await.unwrap(), 0);
+        assert_eq!(
+            command("key", args(&root, &["set", "tavily", "--from-file", &key]))
+                .await
+                .unwrap(),
+            0
+        );
+        let v = search_once(&root, &base).await;
+        assert_eq!(v["mode"], "key");
+        assert_eq!(
+            seen.lock().unwrap().pop().unwrap().as_deref(),
+            Some(format!("Bearer {KEY}").as_str())
+        );
+
+        // Bob re-pairs the same profile: Alice's key is not his.
+        assert_eq!(command("setup", setup(&bob)).await.unwrap(), 0);
+        let v = search_once(&root, &base).await;
+        assert_eq!(v["mode"], "keyless");
+        assert_eq!(
+            seen.lock().unwrap().pop().unwrap(),
+            None,
+            "no Authorization at all"
+        );
+
+        // Alice again: her own key is back.
+        assert_eq!(command("setup", setup(&alice)).await.unwrap(), 0);
+        assert_eq!(search_once(&root, &base).await["mode"], "key");
+
+        // A device token alone can't take over a set-up profile...
+        let token = file("t", &format!("metro_pc_{:064x}", 99));
+        let only = |profile: &str| {
+            args(
+                &root,
+                &[
+                    "--server-url",
+                    &base,
+                    "--device-token-file",
+                    &token,
+                    "--profile",
+                    profile,
+                ],
+            )
+        };
+        let mut a = only("web");
+        a.profile = None;
+        assert!(command("setup", a).await.is_err());
+        // ...but sets up a fresh one, with no keys.
+        assert_eq!(command("setup", only("fresh")).await.unwrap(), 0);
+        let p = profile(&args(&root, &["--profile", "fresh"])).unwrap();
+        let d = device(&p).unwrap();
+        assert!(d.owner.starts_with("device:"));
+        assert!(
+            !keys::KeyStore::new(&data_dir(&p, &d).unwrap())
+                .load()
+                .unwrap()
+                .has("tavily")
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            for dir in [root.clone(), root.join("profiles"), p.dir.clone()] {
+                assert_eq!(
+                    std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+                    0o700,
+                    "{dir:?}"
+                );
+            }
+        }
     }
 }

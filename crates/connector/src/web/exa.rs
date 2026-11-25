@@ -64,7 +64,7 @@ async fn call(
     base: &str,
     tool: &str,
     args: serde_json::Value,
-) -> Result<String, Failure> {
+) -> Result<(String, serde_json::Value), Failure> {
     let url = format!("{base}?tools=web_search_exa,web_fetch_exa");
     let t = target(c, base, &url)?;
     let result = mcp::call_tool(&t, c.sessions, tool, args)
@@ -80,81 +80,54 @@ async fn call(
     if text.trim().is_empty() {
         return Err(Failure::of(Outcome::BadResponse));
     }
-    Ok(text)
+    Ok((text, result))
 }
 
-/// Results parsed from Exa's `Title:` / `URL:` / `Published:` lines, best
-/// effort (the text itself still goes to Metro). Only the header of a hit
-/// sets its fields: the first `URL:` line counts, and once `Highlights:` or
-/// `Text:` starts the page excerpt, `URL:` and `Published:` lines there are
-/// page text, so a page can't choose the URL Metro records for its hit.
-pub(crate) fn parse_results(text: &str) -> Vec<Hit> {
-    struct Cur {
-        hit: Hit,
-        in_body: bool,
-    }
-    let mut out: Vec<Hit> = Vec::new();
-    let mut cur: Option<Cur> = None;
-    let flush = |cur: Option<Cur>, out: &mut Vec<Hit>| {
-        if let Some(c) = cur.filter(|c| !c.hit.url.is_empty()) {
-            out.push(c.hit);
-        }
-    };
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(t) = line.strip_prefix("Title:") {
-            flush(cur.take(), &mut out);
-            cur = Some(Cur {
-                hit: Hit {
-                    title: t.trim().to_owned(),
-                    ..Hit::default()
-                },
-                in_body: false,
-            });
-            continue;
-        }
-        let Some(c) = cur.as_mut() else {
-            continue;
-        };
-        if line.starts_with("Highlights:") || line.starts_with("Text:") {
-            c.in_body = true;
-            continue;
-        }
-        if !c.in_body {
-            if let Some(u) = line.strip_prefix("URL:") {
-                if c.hit.url.is_empty() {
-                    c.hit.url = u.trim().to_owned();
-                }
-                continue;
-            }
-            if let Some(p) = line.strip_prefix("Published:") {
-                let p = p.trim();
-                if c.hit.published.is_none() && !p.is_empty() && p != "N/A" {
-                    c.hit.published = Some(p.to_owned());
-                }
-                continue;
-            }
-        }
-        if !c.hit.url.is_empty() && c.hit.snippet.len() < 500 && !line.is_empty() {
-            if !c.hit.snippet.is_empty() {
-                c.hit.snippet.push(' ');
-            }
-            c.hit.snippet.push_str(line);
-        }
-    }
-    flush(cur, &mut out);
-    out
+/// Results from the tool result's `structuredContent` (MCP structured tool
+/// output), when Exa sends it. Only those become `results`, which Metro may
+/// later let the agent fetch. Exa's text output is never parsed into
+/// results: excerpt text can imitate a result boundary (`Title:`/`URL:`), so
+/// text-only answers go to Metro as untrusted text and grant no fetch
+/// permission.
+pub(crate) fn structured_results(result: &serde_json::Value) -> Vec<Hit> {
+    result["structuredContent"]["results"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| {
+            let url = x["url"].as_str()?;
+            let snippet = match &x["highlights"] {
+                serde_json::Value::Array(a) => a
+                    .iter()
+                    .filter_map(serde_json::Value::as_str)
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                _ => x["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .chars()
+                    .take(500)
+                    .collect(),
+            };
+            Some(Hit {
+                title: x["title"].as_str().unwrap_or_default().to_owned(),
+                url: url.to_owned(),
+                snippet,
+                published: x["publishedDate"].as_str().map(str::to_owned),
+            })
+        })
+        .collect()
 }
 
 pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<Answer, Failure> {
-    let text = call(
+    let (text, result) = call(
         c,
         base,
         "web_search_exa",
         json!({"query": r.query, "numResults": r.max_results}),
     )
     .await?;
-    let mut results = parse_results(&text);
+    let mut results = structured_results(&result);
     results.truncate(r.max_results as usize);
     Ok(Answer {
         results,
@@ -164,7 +137,7 @@ pub(crate) async fn search(c: &Call<'_>, base: &str, r: &SearchReq) -> Result<An
 }
 
 pub(crate) async fn fetch(c: &Call<'_>, base: &str, r: &FetchReq) -> Result<Answer, Failure> {
-    let text = call(
+    let (text, _) = call(
         c,
         base,
         "web_fetch_exa",

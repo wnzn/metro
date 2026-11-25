@@ -522,6 +522,93 @@ fn answer_json(op: &Op, answer: Answer) -> Value {
     Value::Object(out)
 }
 
+/// The forms a key could come back in: as is, percent-encoded (upper and
+/// lower hex, `+` or `%20` for spaces) and base64 (standard and URL-safe, at
+/// each of the three byte alignments a longer encoded value could put it in).
+pub(crate) fn key_forms(key: &str) -> Vec<String> {
+    use base64::Engine as _;
+    use base64::engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD};
+    let mut out = vec![key.to_owned()];
+    let pct = |upper: bool| -> String {
+        key.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {
+                    (b as char).to_string()
+                } else if upper {
+                    format!("%{b:02X}")
+                } else {
+                    format!("%{b:02x}")
+                }
+            })
+            .collect()
+    };
+    out.push(pct(true));
+    out.push(pct(false));
+    out.push(url::form_urlencoded::byte_serialize(key.as_bytes()).collect());
+    for engine in [&STANDARD_NO_PAD, &URL_SAFE_NO_PAD] {
+        for pad in 0..3usize {
+            let mut bytes = vec![0u8; pad];
+            bytes.extend_from_slice(key.as_bytes());
+            let enc = engine.encode(&bytes);
+            // Drop the characters that depend on the unknown bytes around
+            // the key (leading pad bytes, a partial last group).
+            let skip = (pad * 4).div_ceil(3);
+            let full = ((pad + key.len()) / 3) * 4;
+            if full > skip + 4 {
+                out.push(enc[skip..full].to_owned());
+            }
+        }
+    }
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// `s` with every `%XX` decoded (any characters, over-encoded or not).
+fn percent_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let (Some(h), Some(l)) = (
+                (b[i + 1] as char).to_digit(16),
+                (b[i + 2] as char).to_digit(16),
+            )
+        {
+            out.push((h * 16 + l) as u8);
+            i += 3;
+        } else {
+            out.push(b[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Whether any string in `v` carries `key` in one of [`key_forms`], as is
+/// or after percent-decoding.
+pub(crate) fn reflects(v: &Value, key: &Secret) -> bool {
+    let forms = key_forms(key.expose());
+    fn walk(v: &Value, forms: &[String]) -> bool {
+        match v {
+            Value::String(s) => {
+                let decoded = percent_decode(s);
+                forms
+                    .iter()
+                    .any(|f| s.contains(f.as_str()) || decoded.contains(f.as_str()))
+            }
+            Value::Array(a) => a.iter().any(|x| walk(x, forms)),
+            Value::Object(o) => o
+                .iter()
+                .any(|(k, x)| walk(&Value::String(k.clone()), forms) || walk(x, forms)),
+            _ => false,
+        }
+    }
+    walk(v, &forms)
+}
+
 // ---------------------------------------------------------------------------
 // Endpoints.
 
@@ -728,7 +815,7 @@ impl Engine {
         };
         let mut attempts: Vec<Value> = Vec::new();
         let mut updates = settings::Updates::default();
-        let mut answer: Option<(ProviderId, Mode, Answer)> = None;
+        let mut answer: Option<(ProviderId, Mode, Value)> = None;
         for ps in &snapshot.providers {
             if !ps.enabled {
                 continue;
@@ -777,6 +864,16 @@ impl Engine {
                 Ok(r) => r,
                 Err(_) => Err(Failure::of(Outcome::Timeout)),
             };
+            // What would leave this computer, checked for the key used on
+            // this request: a vendor that echoes it back fails the attempt,
+            // and nothing of that answer is delivered.
+            let result = result.and_then(|a| {
+                let body = answer_json(op, a);
+                match key {
+                    Some(k) if reflects(&body, k) => Err(Failure::of(Outcome::BadResponse)),
+                    _ => Ok(body),
+                }
+            });
             match result {
                 Ok(a) => {
                     push(Outcome::Ok, None);
@@ -821,8 +918,8 @@ impl Engine {
         }
         let mut out = json!({"v": 1, "attempts": attempts});
         match answer {
-            Some((p, mode, a)) => {
-                if let Value::Object(fields) = answer_json(op, a) {
+            Some((p, mode, body)) => {
+                if let Value::Object(fields) = body {
                     for (k, v) in fields {
                         out[k] = v;
                     }
