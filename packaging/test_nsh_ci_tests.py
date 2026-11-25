@@ -48,6 +48,11 @@ if mode == "missing":
 if mode == "malformed":
     output.write_text("<")
     sys.exit(0)
+if mode.startswith("empty"):
+    root = ET.Element("testsuites", name="nsh test", tests=str(int(mode == "empty-invalid")),
+                      failures="0", errors="0", skipped="0")
+    ET.ElementTree(root).write(output)
+    sys.exit(7 if mode == "empty-nonzero" else 0)
 attrs = {"tests": "4" if mode != "bad-count" else "3",
          "failures": str(int(mode == "failure")), "errors": str(int(mode == "error")), "skipped": "2"}
 root = ET.Element("testsuites", name="nsh test", **attrs)
@@ -150,16 +155,25 @@ class ShardTests(unittest.TestCase):
         self.assertTrue((self.audit / "dev_new.test.tsx").is_file())
 
     def test_failed_and_unverifiable_shards_never_fall_back(self):
-        for mode in ("missing", "malformed", "bad-count", "failure", "error", "nonzero", "wrong-suite"):
+        for mode in ("missing", "malformed", "bad-count", "failure", "error", "nonzero", "wrong-suite",
+                     "empty-invalid", "empty-nonzero"):
             with self.subTest(mode=mode):
                 self.write("a.test.ts", mode)
                 result = self.run_helper()
                 self.assertEqual(result.returncode, 1, result.stderr)
                 self.assertIn("2/2 files, 1 unsuccessful", result.stdout)
                 self.assertIn("'a.test.ts':", result.stderr)
-                self.assertIn("JUnit" if mode != "nonzero" else "NSH exited 7", result.stderr)
+                self.assertIn("NSH exited 7" if mode.endswith("nonzero") else "JUnit", result.stderr)
                 self.assertNotIn("must not leak", result.stdout + result.stderr)
                 self.assertFalse((self.audit / "unfiltered").exists())
+
+    def test_empty_but_successful_test_file_matches_plain_nsh(self):
+        self.write("a.test.ts", "empty")
+        result = self.run_helper()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("2/2 files, 0 unsuccessful", result.stdout)
+        self.assertIn("2 passed, 0 failed, 0 errors, 1 skipped, 1 todo", result.stdout)
+        self.assertFalse((self.audit / "unfiltered").exists())
 
     def test_unknown_cli_version_falls_back_and_preserves_plain_failure(self):
         result = self.run_helper(FAKE_VERSION="nsh 0.6.2", FAKE_PLAIN_STATUS="9")

@@ -138,12 +138,18 @@ def prepare(app, scratch, nsh, env):
 
 def report_counts(report, file):
     root = ET.parse(report).getroot()
-    if root.tag != "testsuites" or root.get("name") != "nsh test" or len(root) != 1:
-        raise ValueError("expected exactly one NSH JUnit suite")
+    counts = dict.fromkeys(RESULTS, 0)
+    if root.tag != "testsuites" or root.get("name") != "nsh test" or len(root) > 1:
+        raise ValueError("expected at most one NSH JUnit suite")
+    if not len(root):
+        # NSH runs files with no registered test cases, but omits their suite
+        # entirely. This is only success with all-zero counts and exit 0.
+        if any(root.get(key) != "0" for key in ("tests", "failures", "errors", "skipped")):
+            raise ValueError("inconsistent empty JUnit report")
+        return counts
     suite = root[0]
     if suite.tag != "testsuite" or suite.get("name") != file or not len(suite):
         raise ValueError("missing or wrong per-file JUnit suite")
-    counts = dict.fromkeys(RESULTS, 0)
     for case in suite:
         if case.tag != "testcase" or case.get("classname") != file or "name" not in case.attrib:
             raise ValueError("unexpected JUnit test case")
