@@ -159,6 +159,7 @@ const TEXT_PAIRS: [string, string][] = [
   // A Space's initials on each tile color.
   ...[1, 2, 3, 4, 5, 6].map((n): [string, string] => ["space-tile-foreground", `space-tile-${n}`]),
   ...["neutral", "agent", "runner", "system", "success", "warning", "danger"].map((t): [string, string] => [`tone-${t}-foreground`, `tone-${t}`]),
+  ...["self", "person", "agent"].map((t): [string, string] => [`mention-${t}-foreground`, `mention-${t}`]),
 ];
 
 // Edges and indicators the user must find: 3:1 against what is next to them (WCAG 1.4.11).
@@ -169,6 +170,7 @@ const EDGE_PAIRS: [string, string][] = [
   // The selected row's accent bar and icon, on its pill and beside it.
   ["sidebar-indicator", "sidebar-accent"],
   ["sidebar-indicator", "sidebar"],
+  ["sidebar-indicator", "sidebar-hover"], // update dot on a hovered tab or rail button
   ["sidebar-indicator", "sidebar-gradient-end"],
   ["primary", "muted"], // the chosen segment on its track
   ["primary", "background"],
@@ -333,4 +335,157 @@ test("a Space's tile color is fixed by its id and drawn from the six tile tones"
   const seen = new Set(Array.from({ length: 60 }, (_, i) => spaceTileFor(`s${i}`)));
   expect([...seen].every((c) => (spaceTileClass as readonly string[]).includes(c))).toBe(true);
   expect(seen.size).toBe(6);
+});
+
+const openSettingsFixture = (width = 1280, height = 1000) =>
+  open("./settings.fixture.tsx", { platform: "linux", width, height, reducedMotion: true });
+
+test("Settings primitives: grouped navigation keeps update indicators named and flattens compact tabs", async () => {
+  const app = await openSettingsFixture();
+  await app.waitFor("id:fx-section-you");
+  expect(app.shows("id:fx-section-metro")).toBe(true);
+  expect(app.shows("id:fx-tab-about:dot")).toBe(true);
+  expect(app.shows("label:About & updates, Update available")).toBe(true);
+  expect(app.shows("id:fx-rail-dot")).toBe(true);
+  expect(app.shows("label:Settings, Update available")).toBe(true);
+  await app.press("id:fx-tab-about");
+  expect(bg(app, "id:fx-tab-about")).toBe(rgba(dark["sidebar-accent"]));
+  await app.waitFor("id:fx-header >> text:About");
+
+  await app.setViewport(720, 900);
+  expect(app.shows("id:fx-section-you")).toBe(false);
+  expect(app.shows("id:fx-section-metro")).toBe(false);
+  expect(app.shows("id:fx-tab-about:dot")).toBe(true);
+  await app.press("id:fx-tab-profile");
+  await app.waitFor("id:fx-header >> text:Profile page");
+  await app.press("id:fx-update");
+  expect(app.shows("id:fx-tab-about:dot")).toBe(false);
+  expect(app.shows("label:About & updates")).toBe(true);
+});
+
+test("Settings primitives: the page header shows the fixed scope wording beside its usable action", async () => {
+  const app = await openSettingsFixture(720, 900);
+  for (const scope of [
+    "Your account on metro.example", "This computer only", "This Space · only the owner changes it",
+    "This Space · only you see these", "Organization · org admins manage it",
+  ]) {
+    await app.waitFor(`id:fx-header:scope >> text:${scope}`);
+    expect(fg(app, `text:${scope}`)).toBe(rgba(dark["muted-foreground"]));
+    await app.press("id:fx-next-scope");
+  }
+});
+
+test("Settings primitives: exact inline confirmation is scoped, cancellable and not triggered by Return in the field", async () => {
+  const app = await openSettingsFixture();
+  await app.type("id:fx-before-checkbox", "x");
+  await app.keyboard.press("tab");
+  await app.keyboard.press("tab");
+  await app.keyboard.press("enter");
+  expect(bg(app, "id:fx-confirm:warning")).toBe(rgba(dark["tone-warning"]));
+  expect(app.enabled("id:fx-confirm:confirm")).toBe(false);
+  await app.type("id:fx-confirm:input", "exact Name");
+  expect(app.enabled("id:fx-confirm:confirm")).toBe(false);
+  await app.clear("id:fx-confirm:input");
+  await app.type("id:fx-confirm:input", "Exact Name ");
+  expect(app.enabled("id:fx-confirm:confirm")).toBe(false);
+  await app.clear("id:fx-confirm:input");
+  await app.type("id:fx-confirm:input", "Exact Name");
+  expect(app.enabled("id:fx-confirm:confirm")).toBe(true);
+  expect(bg(app, "id:fx-confirm:confirm")).toBe(rgba(dark.destructive));
+  await app.keyboard.press("enter");
+  expect(app.shows("text:Confirmations: 0")).toBe(true);
+  await app.press("id:fx-retarget");
+  expect(app.shows("id:fx-confirm:panel")).toBe(false);
+  await app.press("id:fx-retarget");
+  expect(app.shows("id:fx-confirm:panel")).toBe(false);
+  await app.press("id:fx-confirm");
+  expect(app.value("id:fx-confirm:input")).toBe("");
+  await app.type("id:fx-confirm:input", "Exact Name");
+  await app.keyboard.press("escape");
+  expect(app.shows("id:fx-modal")).toBe(true);
+  expect(app.shows("id:fx-confirm:panel")).toBe(false);
+  await app.keyboard.press("enter"); // Escape restored focus to the trigger.
+  expect(app.value("id:fx-confirm:input")).toBe("");
+  await app.keyboard.press("tab"); // From the field to Cancel.
+  await app.keyboard.press("escape");
+  expect(app.shows("id:fx-modal")).toBe(true);
+  expect(app.shows("id:fx-confirm:panel")).toBe(false);
+  await app.press("id:fx-confirm");
+  await app.press("id:fx-confirm:cancel");
+  expect(app.shows("id:fx-confirm:panel")).toBe(false);
+  await app.press("id:fx-confirm");
+  await app.type("id:fx-confirm:input", "Exact Name");
+  await app.press("id:fx-confirm:confirm");
+  await app.waitFor("text:Confirmations: 1");
+  expect(app.shows("id:fx-confirm:panel")).toBe(false);
+});
+
+test("Settings primitives: controlled confirmation supports an external trigger and disables actions while busy", async () => {
+  const app = await openSettingsFixture();
+  expect(app.shows("id:fx-external:panel")).toBe(false);
+  await app.press("id:fx-external-open");
+  expect(app.shows("id:fx-external:warning")).toBe(true);
+  expect(app.shows("id:fx-external:input")).toBe(false);
+  await app.press("id:fx-external:cancel");
+  expect(app.shows("id:fx-external:panel")).toBe(false);
+  await app.press("id:fx-external-open");
+  expect(bg(app, "id:fx-external:confirm")).toBe(rgba(dark.primary));
+  await app.press("id:fx-external:confirm");
+  await app.waitFor("id:fx-external:confirm >> text:Downloading…");
+  expect(app.shows("label:Downloading…")).toBe(true);
+  expect(app.enabled("id:fx-external:confirm")).toBe(false);
+  expect(app.enabled("id:fx-external:cancel")).toBe(false);
+});
+
+test("Settings primitives: the whole checkbox toggles with keyboard or pointer, until disabled", async () => {
+  const app = await openSettingsFixture();
+  await app.waitFor("text:Runner selected: true");
+  expect(app.shows("label:Use the runner. Only uses this computer.")).toBe(true);
+  await app.press("id:fx-checkbox >> text:Only uses this computer.");
+  await app.waitFor("text:Runner selected: false");
+  await app.type("id:fx-before-checkbox", "x");
+  await app.keyboard.press("tab");
+  await app.keyboard.press("space");
+  await app.waitFor("text:Runner selected: true");
+  await app.press("id:fx-disabled");
+  expect(app.enabled("id:fx-checkbox")).toBe(false);
+  await expect(app.press("id:fx-checkbox")).rejects.toMatchObject({ code: "ERR_NSH_TEST_DISABLED" });
+  expect(app.shows("text:Runner selected: true")).toBe(true);
+});
+
+test("Settings primitives: tagged and passive list rows keep their trailing actions separate", async () => {
+  const app = await openSettingsFixture(720, 900);
+  await app.waitFor("label:Test provider, default, Update 0.5.0, Online");
+  expect(app.shows("id:fx-row:default")).toBe(true);
+  expect(bg(app, "id:fx-update-tag")).toBe(rgba(dark.accent));
+  expect(app.shows("id:fx-problem")).toBe(true);
+  expect(app.shows("id:fx-passive:open")).toBe(false);
+  await app.press("id:fx-row-action");
+  await app.waitFor("text:Last row action: trailing");
+  await app.press("id:fx-row:open");
+  await app.waitFor("text:Last row action: open");
+});
+
+test("Settings primitives: reorder buttons report one step and disable impossible moves", async () => {
+  const app = await openSettingsFixture();
+  expect(app.shows("label:Move Test provider up")).toBe(true);
+  expect(app.shows("label:Move Test provider down")).toBe(true);
+  expect(app.enabled("id:fx-reorder:up")).toBe(false);
+  await app.press("id:fx-reorder:down");
+  await app.waitFor("text:Provider position: 2");
+  expect(app.enabled("id:fx-reorder:down")).toBe(false);
+  await app.press("id:fx-reorder:up");
+  await app.waitFor("text:Provider position: 1");
+  await app.press("id:fx-disabled");
+  expect(app.enabled("id:fx-reorder:up")).toBe(false);
+  expect(app.enabled("id:fx-reorder:down")).toBe(false);
+});
+
+test("Settings primitives: progress shows bounded percentages and never guesses an unknown total", async () => {
+  const app = await openSettingsFixture();
+  await app.waitFor("label:Downloading 0.5.0…");
+  for (const [index, text] of ["Downloading 0.5.0… 42%", "Downloading 0.5.0… 100%", "Downloading 0.5.0…", "Downloading 0.5.0… 0%"].entries()) {
+    await app.waitFor(`id:fx-progress >> text:${text}`);
+    if (index < 3) await app.press("id:fx-advance");
+  }
 });

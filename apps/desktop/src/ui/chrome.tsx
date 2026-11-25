@@ -97,6 +97,7 @@ const ICONS = {
   chat: chatIcon,
   check: checkIcon,
   "chevron-down": chevronDownIcon,
+  "chevron-up": chevronDownIcon,
   "chevron-right": chevronRightIcon,
   clock: clockIcon,
   close: closeIcon,
@@ -144,7 +145,12 @@ export function Icon(props: { name: IconName; color?: IconColor; size?: 12 | 14 
     <Image
       src={ICONS[props.name]}
       fadeDuration={0}
-      style={{ width: size(), height: size(), tintColor: token(ICON_TOKEN[props.color ?? "muted"]) }}
+      style={{
+        width: size(),
+        height: size(),
+        tintColor: token(ICON_TOKEN[props.color ?? "muted"]),
+        transform: props.name === "chevron-up" ? [{ rotate: "180deg" }] : undefined,
+      }}
       accessibilityElementsHidden
     />
   );
@@ -219,9 +225,13 @@ export function RailButton(props: {
   /** Any small picture instead (an avatar). */
   content?: JSX.Element;
   testID?: string;
+  /** A quiet attention dot; give its meaning in words ("Update available"). */
+  dot?: string;
+  dotTestID?: string;
   /** Its own actions on a secondary click (a Space's settings); the tooltip says so. */
   menu?: readonly { id: string; label: string; onPress: () => void }[];
 }) {
+  const tooltip = () => [props.label, props.dot, props.menu?.length ? "right-click for more" : undefined].filter(Boolean).join(" · ");
   const button = (
     <Button
       class={cx(
@@ -233,8 +243,8 @@ export function RailButton(props: {
       selected={props.selected}
       onPress={props.onPress}
       testID={props.testID}
-      accessibilityLabel={props.label}
-      tooltip={<Text class={tooltipClass}>{props.menu?.length ? `${props.label} · right-click for more` : props.label}</Text>}
+      accessibilityLabel={props.dot ? `${props.label}, ${props.dot}` : props.label}
+      tooltip={<Text class={tooltipClass}>{tooltip()}</Text>}
     >
       {/* The selected place: an accent bar at the rail's edge, as in the open sidebar. */}
       <If when={props.selected}>
@@ -253,6 +263,10 @@ export function RailButton(props: {
       >
         {props.content}
       </If>
+      <If when={props.dot}>
+        <View class="absolute right-[5px] top-[5px] size-[7px] rounded-full bg-sidebar-indicator border border-sidebar" accessibilityElementsHidden
+          testID={props.dotTestID ?? (props.testID ? `${props.testID}:dot` : undefined)} />
+      </If>
     </Button>
   );
   return (
@@ -270,6 +284,11 @@ export function RailButton(props: {
       )}
     </If>
   );
+}
+
+/** Separates groups in a collapsed icon rail without adding a focus stop. */
+export function RailDivider() {
+  return <View class="w-[24px] h-px shrink-0 my-(--space-1) bg-sidebar-border" accessibilityElementsHidden />;
 }
 
 // ---------------------------------------------------------------- brand
@@ -561,9 +580,11 @@ export function Modal(props: Testable & { open: boolean; title: string; onClose:
 export function ModalNav(props: Testable & { children?: JSX.Element }) {
   return (
     <>
-      <View class="shrink-0 flex-col gap-(--space-1) bg-sidebar border-r border-sidebar-border px-(--space-2) py-(--space-3)" style={{ width: settingsPanel.width() }}
+      <View class="shrink-0 min-h-0 flex-col bg-sidebar border-r border-sidebar-border" style={{ width: settingsPanel.width() }}
         testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="tablist">
-        {props.children}
+        <Scroll class="flex-1 min-h-0">
+          <View class="flex-col gap-(--space-1) px-(--space-2) py-(--space-3)">{props.children}</View>
+        </Scroll>
       </View>
       {/* One width for every modal's sections (Settings, Space settings). */}
       <ResizeHandle panel={settingsPanel} edge="end" name="sections" testID={props.testID ? `${props.testID}-resize` : undefined} />
@@ -571,8 +592,23 @@ export function ModalNav(props: Testable & { children?: JSX.Element }) {
   );
 }
 
+/** Heading before a group of modal tabs. Compact tabs stay in one wrapping row without headings. */
+export function ModalNavSection(props: Testable & { label: string; compact?: boolean; divided?: boolean }) {
+  return (
+    <If when={!(props.compact ?? compactWidth())}>
+      <View class={cx("shrink-0 flex-col mx-(--space-1) px-(--space-2) pt-(--space-1)", props.divided && "border-t border-sidebar-border mt-(--space-1)")}>
+        <Text class={cx(textClass.xs, "font-semibold uppercase tracking-wider text-muted-foreground")} role="header"
+          testID={props.testID} accessibilityLabel={props.accessibilityLabel ?? props.label} style={{ numberOfLines: 1 }}>
+          {props.label}
+        </Text>
+      </View>
+    </If>
+  );
+}
+
 /** One section of a modal's navigation: a tab, side by side or (compact) in a row. */
-export function ModalTab(props: { label: string; icon: IconName; selected: boolean; onPress: () => void; testID?: string; compact?: boolean }) {
+export function ModalTab(props: Testable & { label: string; icon: IconName; selected: boolean; onPress: () => void; compact?: boolean; dot?: string }) {
+  const label = () => props.accessibilityLabel ?? props.label;
   return (
     <Button
       class={cx(
@@ -588,15 +624,18 @@ export function ModalTab(props: { label: string; icon: IconName; selected: boole
       selected={props.selected}
       onPress={props.onPress}
       testID={props.testID}
-      accessibilityLabel={props.label}
+      accessibilityLabel={props.dot ? `${label()}, ${props.dot}` : label()}
     >
       <If when={props.selected && !props.compact}>
         <View class="absolute left-0 top-[9px] bottom-[9px] w-[3px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
       </If>
       <Icon name={props.icon} color={props.selected ? "sidebar-indicator" : "sidebar"} />
-      <Text class={cx("text-(length:--text-sm)", props.selected ? "font-semibold text-sidebar-accent-foreground" : "text-sidebar-foreground")} style={{ numberOfLines: 1 }}>
+      <Text class={cx("text-(length:--text-sm)", props.dot && "shrink min-w-0", props.selected ? "font-semibold text-sidebar-accent-foreground" : "text-sidebar-foreground")} style={{ numberOfLines: 1 }}>
         {props.label}
       </Text>
+      <If when={props.dot}>
+        <View class="size-[7px] shrink-0 rounded-full bg-sidebar-indicator" accessibilityElementsHidden testID={props.testID ? `${props.testID}:dot` : undefined} />
+      </If>
     </Button>
   );
 }
@@ -604,7 +643,8 @@ export function ModalTab(props: { label: string; icon: IconName; selected: boole
 /** A modal's tabs in one wrapping row (compact windows). */
 export function ModalTabRow(props: Testable & { children?: JSX.Element }) {
   return (
-    <View class="flex-row flex-wrap gap-[2px] bg-sidebar border-b border-sidebar-border px-(--space-2) py-(--space-2)" testID={props.testID} role="tablist">
+    <View class="flex-row flex-wrap gap-[2px] bg-sidebar border-b border-sidebar-border px-(--space-2) py-(--space-2)"
+      testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="tablist">
       {props.children}
     </View>
   );

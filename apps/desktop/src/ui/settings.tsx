@@ -5,10 +5,10 @@
 
 import { signal, Text, View } from "nsh";
 import type { JSX } from "nsh";
-import { Input } from "nsh/base";
-import { compactWidth } from "./chrome";
+import { Input, Progress } from "nsh/base";
+import { compactWidth, IconButton } from "./chrome";
 import { Disclosure } from "./primitives";
-import { cx } from "./tokens";
+import { cx, textClass } from "./tokens";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
 
@@ -96,5 +96,48 @@ export function LearnMore(props: { testID: string; children?: JSX.Element }) {
     <Disclosure testID={props.testID} title="Learn more" open={open()} onToggle={open.set}>
       {props.children}
     </Disclosure>
+  );
+}
+
+/** Progress with a readable status line. Omit `value` when the total is unknown. */
+export function ProgressLine(props: Testable & { label: string; value?: number }) {
+  const value = () => props.value !== undefined && Number.isFinite(props.value) ? Math.min(100, Math.max(0, Math.round(props.value))) : undefined;
+  return (
+    <Progress
+      class="min-w-0 flex-col gap-(--space-1)"
+      trackClass="h-[6px] overflow-hidden rounded-full bg-muted"
+      indicatorClass={cx("h-full rounded-full bg-primary", value() === undefined && "w-0")}
+      value={value()}
+      indeterminate={value() === undefined}
+      accessibilityLabel={props.accessibilityLabel ?? props.label}
+      testID={props.testID}
+    >
+      <Text class={cx(textClass.xs, "tabular-nums text-muted-foreground")} accessibilityElementsHidden>
+        {value() === undefined ? props.label : `${props.label} ${value()}%`}
+      </Text>
+    </Progress>
+  );
+}
+
+/** Move an item one step at a time. The caller owns its order and list boundaries. */
+export function ReorderButtons(props: {
+  label: string;
+  onMove: (step: -1 | 1) => void;
+  canMoveUp: boolean;
+  canMoveDown: boolean;
+  disabled?: boolean;
+  testID?: string;
+  upTestID?: string;
+  downTestID?: string;
+}) {
+  return (
+    <View class="shrink-0 flex-row items-center gap-(--space-1)" testID={props.testID}>
+      <IconButton icon="chevron-up" accessibilityLabel={`Move ${props.label} up`} tooltip="Move up"
+        testID={props.upTestID ?? (props.testID ? `${props.testID}:up` : undefined)}
+        disabled={props.disabled || !props.canMoveUp} onPress={() => props.onMove(-1)} />
+      <IconButton icon="chevron-down" accessibilityLabel={`Move ${props.label} down`} tooltip="Move down"
+        testID={props.downTestID ?? (props.testID ? `${props.testID}:down` : undefined)}
+        disabled={props.disabled || !props.canMoveDown} onPress={() => props.onMove(1)} />
+    </View>
   );
 }

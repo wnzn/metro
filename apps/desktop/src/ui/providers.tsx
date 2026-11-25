@@ -105,45 +105,60 @@ export function DefaultsLine(props: { entries: readonly DefaultEntry[]; testID?:
 // ------------------------------------------------------------------ saved connections
 
 /**
- * One saved connection as a compact row: its provider's mark, its name with a
- * quiet "Default" tag, and one status line led by a coloured dot. Pressing
- * the row opens its details (`onPress`); `trailing` holds its ⋯ menu, outside
- * the pressable area. `children` go under the row (a problem and its fix).
+ * A compact list row: a provider mark (or custom `leading`), name with tags,
+ * and a status line. Supply `onPress` for a row that opens details; otherwise
+ * only the trailing controls are interactive. `children` go under the row.
  */
 export function ConnectionItem(props: {
-  mark: Mark;
+  mark?: Mark;
+  leading?: JSX.Element;
   name: string;
-  isDefault: boolean;
+  isDefault?: boolean;
+  /** Non-interactive badges beside the name. */
+  tags?: JSX.Element;
+  /** The badges' meaning when the identity area is a single accessible button. */
+  tagsLabel?: string;
   status: { tone: Tone; text: string };
-  onPress: () => void;
+  onPress?: () => void;
   trailing?: JSX.Element;
   children?: JSX.Element;
   testID?: string;
   accessibilityLabel?: string;
 }) {
+  const identityClass = "flex-1 min-w-0 flex-row items-center gap-(--space-3) px-(--space-2) py-(--space-2)";
+  const identity = (
+    <>
+      <If when={props.leading} else={<If when={props.mark}>{(mark) => <BrandMark mark={mark()} size="md" />}</If>}>
+        <View class="shrink-0" accessibilityElementsHidden>{props.leading}</View>
+      </If>
+      <View class="flex-1 min-w-0 flex-col gap-px">
+        <View class={cx("flex-row items-center gap-(--space-2)", !!props.tags && "flex-wrap gap-y-px")}>
+          <Text class={cx(textClass.sm, "font-medium text-foreground", !!props.tags && "shrink min-w-0")} style={{ numberOfLines: 1 }}>
+            {props.name}
+          </Text>
+          <If when={props.isDefault}>
+            <Badge tone="neutral" variant="outline" label="Default" testID={props.testID ? `${props.testID}:default` : undefined} />
+          </If>
+          {props.tags}
+        </View>
+        <StatusLine tone={props.status.tone} text={props.status.text} testID={props.testID ? `${props.testID}:status` : undefined} />
+      </View>
+    </>
+  );
   return (
     <View class="flex-col" testID={props.testID}>
       <View class="flex-row items-center gap-(--space-2) px-(--space-2) py-(--space-1)">
-        <Button
-          class={cx("flex-1 min-w-0 flex-row items-center gap-(--space-3) rounded-(--radius-sm) px-(--space-2) py-(--space-2) hover:bg-muted active:bg-muted", transitionClass, focusRingClass)}
-          onPress={props.onPress}
-          accessibilityLabel={props.accessibilityLabel ?? `${props.name}${props.isDefault ? ", default" : ""}, ${props.status.text}`}
-          testID={props.testID ? `${props.testID}:open` : undefined}
-        >
-          <BrandMark mark={props.mark} size="md" />
-          <View class="flex-1 min-w-0 flex-col gap-px">
-            <View class="flex-row items-center gap-(--space-2)">
-              <Text class={cx(textClass.sm, "font-medium text-foreground")} style={{ numberOfLines: 1 }}>
-                {props.name}
-              </Text>
-              <If when={props.isDefault}>
-                <Badge tone="neutral" variant="outline" label="Default" testID={props.testID ? `${props.testID}:default` : undefined} />
-              </If>
-            </View>
-            <StatusLine tone={props.status.tone} text={props.status.text} testID={props.testID ? `${props.testID}:status` : undefined} />
-          </View>
-          <Icon name="chevron-right" color="muted" size={14} />
-        </Button>
+        <If when={!!props.onPress} else={<View class={identityClass} accessibilityLabel={props.accessibilityLabel}>{identity}</View>}>
+          <Button
+            class={cx(identityClass, "rounded-(--radius-sm) hover:bg-muted active:bg-muted", transitionClass, focusRingClass)}
+            onPress={() => props.onPress?.()}
+            accessibilityLabel={props.accessibilityLabel ?? [props.name, props.isDefault ? "default" : undefined, props.tagsLabel, props.status.text].filter(Boolean).join(", ")}
+            testID={props.testID ? `${props.testID}:open` : undefined}
+          >
+            {identity}
+            <Icon name="chevron-right" color="muted" size={14} />
+          </Button>
+        </If>
         {props.trailing}
       </View>
       {props.children}
@@ -324,4 +339,3 @@ export function EditableName(props: { name: string; accessibilityLabel: string; 
     </Button>
   );
 }
-

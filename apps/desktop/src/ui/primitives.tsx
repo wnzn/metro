@@ -4,8 +4,8 @@
 // keeping its exports' props.
 
 import { effect, keymap, List, Scroll, signal, Text, View } from "nsh";
-import type { JSX, ListRef } from "nsh";
-import { Button, Collapsible, ContextMenu, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
+import type { JSX, ListRef, ViewRef } from "nsh";
+import { Button, Checkbox as BaseCheckbox, Collapsible, ContextMenu, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
 import { Icon, SpaceTile } from "./chrome";
 import type { IconColor, IconName } from "./chrome";
 import {
@@ -640,6 +640,8 @@ export function Field(
     multiline?: boolean;
     disabled?: boolean;
     autoFocus?: boolean;
+    /** Keep the text exactly as typed (names and confirmation phrases). */
+    verbatim?: boolean;
     grow?: boolean;
     /** Return submits (Shift+Return adds a line in multiline fields). */
     onSubmit?: () => void;
@@ -678,8 +680,8 @@ export function Field(
       disabled={props.disabled}
       autoFocus={props.autoFocus}
       maxLength={props.maxLength}
-      autoCapitalize={props.masked ? "none" : undefined}
-      autoCorrect={props.masked ? false : undefined}
+      autoCapitalize={props.masked || props.verbatim ? "none" : undefined}
+      autoCorrect={props.masked || props.verbatim ? false : undefined}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel ?? props.placeholder}
     />
@@ -707,17 +709,17 @@ export function FormRow(props: { label: string; hint?: string; children?: JSX.El
  * A quiet status pill. `soft` (the default) is tinted by its tone; `outline`
  * is quieter still, for metadata beside a name (a scope, a capability).
  */
-export function Badge(props: { tone: Tone; label: string; testID?: string; variant?: "soft" | "outline" }) {
+export function Badge(props: { tone: Tone | "info"; label: string; testID?: string; variant?: "soft" | "outline" }) {
   const outline = () => props.variant === "outline";
   return (
     <View
       class={cx(
         "flex-row items-center self-center rounded-full px-[8px] py-px",
-        outline() ? "border border-border" : toneSurfaceClass[props.tone],
+        outline() ? "border border-border" : props.tone === "info" ? "bg-accent" : toneSurfaceClass[props.tone],
       )}
       testID={props.testID}
     >
-      <Text class={cx(textClass.xs, "font-medium", outline() ? "text-muted-foreground" : toneTextClass[props.tone])} style={{ numberOfLines: 1 }}>
+      <Text class={cx(textClass.xs, "font-medium", outline() ? "text-muted-foreground" : props.tone === "info" ? "text-accent-foreground" : toneTextClass[props.tone])} style={{ numberOfLines: 1 }}>
         {props.label}
       </Text>
     </View>
@@ -778,6 +780,125 @@ export function Banner(
       </If>
       <If when={props.action}>
         <View class="shrink-0 flex-row items-center gap-(--space-2)">{props.action}</View>
+      </If>
+    </View>
+  );
+}
+
+/**
+ * A confirmation scoped to one row. `testID` names the trigger; the panel,
+ * warning, input, Cancel and final action use `:panel`, `:warning`, `:input`,
+ * `:cancel` and `:confirm`. For a menu trigger or a saving state, control
+ * `open` and `onOpenChange`; omit `triggerLabel` for an external trigger.
+ */
+export function ConfirmInline(props: Testable & {
+  triggerLabel?: string;
+  confirmLabel: string;
+  title?: string;
+  message: string;
+  /** The exact (case- and space-sensitive) text needed to enable the action. */
+  typeToConfirm?: string;
+  /** Identity of the target if the same row is reused for another one. */
+  scopeKey?: string;
+  open?: boolean;
+  onOpenChange?: (open: boolean) => void;
+  onConfirm: () => void;
+  /** Non-destructive actions (such as starting an update) use `primary`. */
+  variant?: "destructive" | "primary";
+  disabled?: boolean;
+  busy?: boolean;
+  busyLabel?: string;
+}) {
+  const localOpen = signal<{ key?: string } | null>(null);
+  const typed = signal("");
+  const open = () => props.open ?? (localOpen() !== null && localOpen()?.key === props.scopeKey);
+  const ready = () => !props.disabled && !props.busy && (props.typeToConfirm === undefined || typed() === props.typeToConfirm);
+  const id = (part: string) => props.testID ? `${props.testID}:${part}` : undefined;
+  let trigger: ViewRef | undefined;
+  // Reopening, retargeting, or changing what must be typed always starts fresh.
+  effect(() => {
+    open();
+    const key = props.scopeKey;
+    props.typeToConfirm;
+    const local = localOpen();
+    if (local && local.key !== key) localOpen.set(null);
+    typed.set("");
+  });
+  const changeOpen = (next: boolean) => {
+    if (props.open === undefined) localOpen.set(next ? { key: props.scopeKey } : null);
+    props.onOpenChange?.(next);
+  };
+  const cancel = () => {
+    if (!open() || props.busy) return;
+    typed.set("");
+    changeOpen(false);
+    if (!props.disabled) trigger?.focus();
+  };
+  const confirm = () => {
+    if (!open() || !ready()) return;
+    typed.set("");
+    if (props.open === undefined) {
+      changeOpen(false);
+      trigger?.focus();
+    }
+    props.onConfirm();
+  };
+  const variant = () => props.variant ?? "destructive";
+  const unavailable = () => !!(props.disabled || props.busy);
+  return (
+    <View
+      class="min-w-0 flex-col"
+      captureKeys={open() && !props.busy ? ["escape"] : undefined}
+      onKeyDown={(e) => {
+        if (e.key === "Escape" && e.defaultPrevented) cancel();
+      }}
+    >
+      <If when={props.triggerLabel}>
+        <View
+          ref={(node) => (trigger = node)}
+          class={cx("group self-start flex-row items-center justify-center rounded-(--radius-md) px-(--space-3)", controlHeightClass.default,
+            focusRing, transitionClass, actionClass[variant() === "destructive" ? "destructive" : "secondary"], actionDisabledClass)}
+          role="button"
+          focusable={!unavailable()}
+          disabled={unavailable()}
+          accessibilityState={{ expanded: open(), disabled: unavailable() }}
+          accessibilityLabel={props.accessibilityLabel ?? props.triggerLabel}
+          testID={props.testID}
+          onPress={() => {
+            if (unavailable()) return;
+            if (open()) cancel();
+            else changeOpen(true);
+          }}
+        >
+          <Text class={cx(textClass.sm, "font-medium", actionTextClass[variant() === "destructive" ? "destructive" : "secondary"], disabledTextClass)}>
+            {props.triggerLabel}
+          </Text>
+        </View>
+      </If>
+      <If when={open()}>
+        <View class={cx("min-w-0 flex-col gap-(--space-2)", props.triggerLabel && "mt-(--space-2)")} testID={id("panel")}>
+          <Banner tone="warning" variant="inline" title={props.title} message={props.message} testID={id("warning")} />
+          <If when={props.typeToConfirm !== undefined}>
+            <FormRow label={`Type “${props.typeToConfirm}” to confirm`}>
+              <Field
+                value={typed()}
+                onChange={typed.set}
+                accessibilityLabel={`Type “${props.typeToConfirm}” to confirm`}
+                testID={id("input")}
+                disabled={unavailable()}
+                autoFocus={!unavailable()}
+                onCancel={cancel}
+                verbatim
+              />
+            </FormRow>
+          </If>
+          <ActionBar>
+            <Action label="Cancel" variant="ghost" testID={id("cancel")} onPress={cancel} disabled={props.busy} />
+            <Action label={props.confirmLabel} variant={variant() === "destructive" ? "danger" : "primary"} testID={id("confirm")}
+              onPress={confirm} disabled={!ready()} busy={props.busy} busyLabel={props.busyLabel}
+              accessibilityLabel={props.busy ? props.busyLabel : undefined} />
+          </ActionBar>
+        </View>
       </If>
     </View>
   );
@@ -1080,6 +1201,36 @@ export function Toggle(
   );
 }
 
+/** A selectable option in a form, with one target for the box, label and optional hint. */
+export function Checkbox(props: Testable & {
+  label: string;
+  hint?: string;
+  checked: boolean;
+  disabled?: boolean;
+  onChange: (checked: boolean) => void;
+}) {
+  const label = () => props.accessibilityLabel ?? props.label;
+  return (
+    <BaseCheckbox
+      class={cx("self-start max-w-full flex-row items-start gap-(--space-2) rounded-(--radius-sm) py-(--space-1)", controlHeightClass.compact, focusRing, disabledClass)}
+      indicatorClass={cx("size-[18px] shrink-0 items-center justify-center rounded-[4px] border bg-background checked:bg-primary checked:border-primary", controlEdgeClass)}
+      indicator={<If when={props.checked}><Icon name="check" color="on-primary" size={14} /></If>}
+      checked={props.checked}
+      disabled={props.disabled}
+      onChange={({ checked }) => props.onChange(checked)}
+      testID={props.testID}
+      accessibilityLabel={props.hint ? `${label()}. ${props.hint}` : label()}
+    >
+      <View class="shrink min-w-0 flex-col" accessibilityElementsHidden>
+        <Text class={cx(textClass.sm, "font-medium text-foreground")}>{props.label}</Text>
+        <If when={props.hint}>
+          <Text class={cx(textClass.xs, "text-muted-foreground")}>{props.hint}</Text>
+        </If>
+      </View>
+    </BaseCheckbox>
+  );
+}
+
 export type PickerItem = {
   value: string;
   label: string;
@@ -1168,8 +1319,33 @@ export function Picker(
   );
 }
 
+export type PageScope =
+  | { kind: "account"; host: string }
+  | { kind: "computer" }
+  | { kind: "space"; personal?: boolean }
+  | { kind: "organization" };
+
+/** Whose settings these are, in fixed wording shared across pages. */
+export function ScopeLine(props: Testable & { scope: PageScope }) {
+  const text = () => {
+    switch (props.scope.kind) {
+      case "account": return `Your account on ${props.scope.host}`;
+      case "computer": return "This computer only";
+      case "space": return props.scope.personal ? "This Space · only you see these" : "This Space · only the owner changes it";
+      case "organization": return "Organization · org admins manage it";
+    }
+  };
+  const icons = { account: "person", computer: "device", space: "hash", organization: "server" } as const;
+  return (
+    <View class="min-w-0 flex-row items-start gap-(--space-1)" testID={props.testID}>
+      <View class="shrink-0 pt-[2px]"><Icon name={icons[props.scope.kind]} color="muted" size={12} /></View>
+      <Label variant="caption" color="muted" accessibilityLabel={props.accessibilityLabel}>{text()}</Label>
+    </View>
+  );
+}
+
 /** The title block at the top of a page (Settings, a Space's management). */
-export function PageHeader(props: Testable & { title: string; subtitle?: string; children?: JSX.Element }) {
+export function PageHeader(props: Testable & { title: string; subtitle?: string; scope?: PageScope; children?: JSX.Element }) {
   return (
     <View class="flex-row items-start gap-(--space-4) pb-(--space-2)" testID={props.testID}>
       <View class="flex-1 min-w-0 flex-col gap-(--space-1)">
@@ -1178,6 +1354,9 @@ export function PageHeader(props: Testable & { title: string; subtitle?: string;
         </Text>
         <If when={props.subtitle}>
           <Text class={cx(textClass.sm, "text-muted-foreground")}>{props.subtitle}</Text>
+        </If>
+        <If when={props.scope}>
+          {(scope) => <ScopeLine scope={scope()} testID={props.testID ? `${props.testID}:scope` : undefined} />}
         </If>
       </View>
       {props.children}
