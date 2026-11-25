@@ -1,7 +1,7 @@
 # Documents & media
 
 > **Status: verified locally with fixtures.** It's in the published
-> [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2) and
+> [Metro 0.3.2](https://github.com/wnzn/metro/releases/tag/v0.3.2),
 > [0.4.0](https://github.com/wnzn/metro/releases/tag/v0.4.0) and
 > [0.5.0](https://github.com/wnzn/metro/releases/tag/v0.5.0).
 > The checks below were local runs, not runs of the release files. It's part of the
