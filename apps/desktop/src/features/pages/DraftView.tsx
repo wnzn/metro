@@ -251,7 +251,7 @@ export function DraftView(props: { route: DraftRoute }) {
       <If when={applyAccess() === "denied"}>
         <Banner tone="warning" variant="inline" message="You can still review or discard this draft, but you no longer have permission to apply it." />
       </If>
-      <If when={review().status === "generating"}><Label testID="page-draft-generating">Building draft… You can leave and resume under Pages → Continue reviewing.</Label></If>
+      <If when={review().status === "generating"}><Label testID="page-draft-generating">Building draft… You can leave and resume under Pages → Drafts.</Label></If>
       <If when={review().status === "failed"}>
         <Banner tone="danger" variant="inline" message={review().error || "Couldn’t build this draft."}
           action={applyAccess() === "allowed" ? <Action compact testID="page-retry-failed" label={retry() ? "Close prompt" : "Edit prompt and retry"} disabled={busy()}

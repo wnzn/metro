@@ -45,6 +45,7 @@ pub struct Template {
     pub description: &'static str,
     /// `space`, `personal` or both.
     pub scopes: &'static [&'static str],
+    pub requires_space_destination: bool,
     source: &'static str,
 }
 
@@ -54,6 +55,7 @@ pub const TEMPLATES: &[Template] = &[
         title: "Space overview",
         description: "The Space's agents, active runs and latest answer.",
         scopes: &["space"],
+        requires_space_destination: true,
         source: include_str!("templates/space-overview.tsx"),
     },
     Template {
@@ -61,6 +63,7 @@ pub const TEMPLATES: &[Template] = &[
         title: "Release watch",
         description: "Runs in one room and an agent's status answer with a button to refresh it.",
         scopes: &["space"],
+        requires_space_destination: true,
         source: include_str!("templates/release-watch.tsx"),
     },
     Template {
@@ -68,6 +71,7 @@ pub const TEMPLATES: &[Template] = &[
         title: "Daily brief",
         description: "An agent's daily brief with a button to write a new one.",
         scopes: &["space", "personal"],
+        requires_space_destination: true,
         source: include_str!("templates/daily-brief.tsx"),
     },
     Template {
@@ -75,6 +79,7 @@ pub const TEMPLATES: &[Template] = &[
         title: "Runs",
         description: "Active and recent agent runs.",
         scopes: &["space", "personal"],
+        requires_space_destination: false,
         source: include_str!("templates/my-runs.tsx"),
     },
     Template {
@@ -82,6 +87,7 @@ pub const TEMPLATES: &[Template] = &[
         title: "Files",
         description: "Recent files in the library.",
         scopes: &["space", "personal"],
+        requires_space_destination: false,
         source: include_str!("templates/files.tsx"),
     },
 ];
@@ -90,9 +96,59 @@ pub fn template(id: &str) -> Option<&'static Template> {
     TEMPLATES.iter().find(|t| t.id == id)
 }
 
+pub struct TemplateDestination {
+    pub room: crate::db::Room,
+    pub agent_id: String,
+    pub handle: String,
+}
+
+impl TemplateDestination {
+    pub fn checked(self, resolver: access::DbResolver<'_>) -> impl compile::Resolver + '_ {
+        TemplateResolver {
+            resolver,
+            destination: self,
+        }
+    }
+}
+
+/// Don't bind a generated reference to a different room or agent if a
+/// reviewed name was changed or reused between selection and compilation.
+struct TemplateResolver<'a> {
+    resolver: access::DbResolver<'a>,
+    destination: TemplateDestination,
+}
+
+impl compile::Resolver for TemplateResolver<'_> {
+    fn page_space(&self) -> Option<&str> {
+        self.resolver.page_space()
+    }
+
+    fn space(&mut self, id: &str) -> Result<String, String> {
+        self.resolver.space(id)
+    }
+
+    fn room(&mut self, space: &str, name: &str) -> Result<(String, String, bool), String> {
+        let room = self.resolver.room(space, name)?;
+        if room.0 == self.destination.room.id && room.1 == self.destination.room.name && !room.2 {
+            Ok(room)
+        } else {
+            Err("the template's room changed; choose the destination again".into())
+        }
+    }
+
+    fn agent(&mut self, space: &str, handle: &str) -> Result<(String, String), String> {
+        let agent = self.resolver.agent(space, handle)?;
+        if agent.0 == self.destination.agent_id && agent.1 == self.destination.handle {
+            Ok(agent)
+        } else {
+            Err("the template's agent changed; choose the destination again".into())
+        }
+    }
+}
+
 /// `template`'s source for a page in `space` (with its `room` and `agent`
 /// handle), or for a personal page (personal Chat).
-pub fn instantiate(t: &Template, space: Option<(&str, &str, &str)>) -> String {
+pub fn instantiate(t: &Template, space: Option<(&str, &str)>) -> String {
     let body: String = t
         .source
         .lines()
@@ -100,7 +156,7 @@ pub fn instantiate(t: &Template, space: Option<(&str, &str, &str)>) -> String {
         .map(|l| format!("{l}\n"))
         .collect();
     let (target, room_only) = match space {
-        Some((_room_id, room_name, agent)) => {
+        Some((room_name, agent)) => {
             let room = tsx::jsx_attr_string(room_name);
             (
                 format!("room={room} agent=\"{agent}\""),

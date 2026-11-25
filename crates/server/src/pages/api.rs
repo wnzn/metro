@@ -33,7 +33,7 @@ pub fn router() -> Router<AppState> {
         .route("/v1/pages", get(list).post(create).layer(big()))
         .route("/v1/pages/templates", get(templates))
         .route("/v1/pages/validate", post(validate).layer(big()))
-        .route("/v1/pages/drafts", post(create_draft))
+        .route("/v1/pages/drafts", get(list_drafts).post(create_draft))
         .route("/v1/pages/drafts/{id}", get(get_draft).delete(delete_draft))
         .route("/v1/pages/drafts/{id}/apply", post(apply_draft))
         .route("/v1/pages/drafts/{id}/data", post(draft_data))
@@ -310,7 +310,8 @@ async fn templates(_who: Human) -> Json<Json_> {
     let list: Vec<Json_> = generate::TEMPLATES
         .iter()
         .map(|t| {
-            json!({"id": t.id, "title": t.title, "description": t.description, "scopes": t.scopes})
+            json!({"id": t.id, "title": t.title, "description": t.description, "scopes": t.scopes,
+                   "requires_space_destination": t.requires_space_destination})
         })
         .collect();
     Json(json!({"templates": list}))
@@ -329,6 +330,9 @@ struct CreateBody {
     /// Templates in a Space: the room and agent to use (names).
     #[serde(default)]
     room: Option<String>,
+    /// When supplied, `room` is the name reviewed for this exact room.
+    #[serde(default)]
+    room_id: Option<String>,
     #[serde(default)]
     agent: Option<String>,
 }
@@ -340,14 +344,14 @@ async fn create(
 ) -> ApiResult<Response> {
     let Json(body) = body?;
     let space = scope_space(&state, &who, body.scope, body.space_id).await?;
-    let (source, kind) = match (body.source, body.template) {
+    let (source, kind, destination) = match (body.source, body.template) {
         (Some(s), None) => {
-            if body.room.is_some() || body.agent.is_some() {
+            if body.room.is_some() || body.room_id.is_some() || body.agent.is_some() {
                 return Err(ApiError::bad_request(
                     "room and agent are only for templates",
                 ));
             }
-            (s, "create")
+            (s, "create", None)
         }
         (None, Some(t)) => {
             let Some(t) = generate::template(&t) else {
@@ -362,16 +366,27 @@ async fn create(
                 )));
             }
             let target = match &space {
-                Some(sid) => {
-                    let (sid, room, agent) = (sid.clone(), body.room.clone(), body.agent.clone());
+                Some(sid) if t.requires_space_destination => {
+                    if body.room_id.is_some() && body.room.is_none() {
+                        return Err(ApiError::bad_request(
+                            "room_id needs the reviewed room name",
+                        ));
+                    }
+                    let (sid, room, room_id, agent) =
+                        (sid.clone(), body.room, body.room_id, body.agent);
+                    let user = who.id.clone();
                     let picked = db(&state, move |db| {
-                        let rooms = db.list_rooms(&sid)?;
-                        let room = match room {
-                            Some(name) => rooms
-                                .into_iter()
-                                .find(|r| r.name.eq_ignore_ascii_case(&name)),
-                            None => rooms.into_iter().find(|r| r.parent_room_id.is_none()),
-                        };
+                        if db.membership(&sid, &user)?.is_none() {
+                            return Ok(None);
+                        }
+                        let room = db.list_rooms(&sid)?.into_iter().find(|r| {
+                            r.parent_room_id.is_none()
+                                && match (&room, &room_id) {
+                                    (Some(name), Some(id)) => r.id == *id && r.name == *name,
+                                    (Some(name), None) => r.name.eq_ignore_ascii_case(name),
+                                    _ => true,
+                                }
+                        });
                         let agents = db.space_agents(&sid)?;
                         let agent = match agent {
                             Some(h) => agents
@@ -385,17 +400,28 @@ async fn create(
                     let Some((room, agent)) = picked else {
                         return Err(ApiError::not_found("no such room or agent in this Space"));
                     };
-                    Some((room.id, room.name, agent.handle))
+                    Some(generate::TemplateDestination {
+                        room,
+                        agent_id: agent.id,
+                        handle: agent.handle,
+                    })
                 }
-                None => None,
+                _ => {
+                    if body.room_id.is_some() {
+                        return Err(ApiError::bad_request(
+                            "this template does not take a room destination",
+                        ));
+                    }
+                    None
+                }
             };
             let source = generate::instantiate(
                 t,
                 target
                     .as_ref()
-                    .map(|(i, n, a)| (i.as_str(), n.as_str(), a.as_str())),
+                    .map(|d| (d.room.name.as_str(), d.handle.as_str())),
             );
-            (source, "template")
+            (source, "template", target)
         }
         _ => {
             return Err(ApiError::bad_request(
@@ -403,7 +429,20 @@ async fn create(
             ));
         }
     };
-    let compiled = compile_as(&state, &who, space.clone(), source).await?;
+    let uid = who.id.clone();
+    let scope = space.clone();
+    let compiled = db(&state, move |db| {
+        let mut r = access::DbResolver {
+            db,
+            user: &uid,
+            space: scope,
+        };
+        Ok(match destination {
+            Some(d) => compile::compile(&source, &mut d.checked(r)),
+            None => compile::compile(&source, &mut r),
+        })
+    })
+    .await?;
     if compiled.spec.is_none() {
         return Ok(invalid(&compiled));
     }
@@ -1114,12 +1153,19 @@ async fn reserve_and_start(state: &AppState, r: DraftRequest) -> ApiResult<Respo
 
 /// `who`'s own draft `id`; 404 for anyone else's.
 async fn own_draft(state: &AppState, who: &Human, id: &str) -> ApiResult<store::DraftRow> {
-    let id = id.to_owned();
-    let d = db(state, move |db| store::draft(db, &id)).await?;
-    match d {
-        Some(d) if d.author_id == who.id => Ok(d),
-        _ => Err(ApiError::not_found(NO_DRAFT)),
-    }
+    let (id, uid) = (id.to_owned(), who.id.clone());
+    db(state, move |db| {
+        let conn = db.lock();
+        let Some(d) = store::draft_in(&conn, &id)?.filter(|d| d.author_id == uid) else {
+            return Ok(None);
+        };
+        Ok(
+            store::draft_context_in(&conn, &uid, d.space_id.as_deref(), d.page_id.as_deref())?
+                .map(|_| d),
+        )
+    })
+    .await?
+    .ok_or_else(|| ApiError::not_found(NO_DRAFT))
 }
 
 async fn draft_base(state: &AppState, d: &store::DraftRow) -> ApiResult<Option<VersionRow>> {
@@ -1129,26 +1175,9 @@ async fn draft_base(state: &AppState, d: &store::DraftRow) -> ApiResult<Option<V
     db(state, move |db| store::version(db, &pid, n)).await
 }
 
-/// A draft's page (if any) still visible to its author, and their access
-/// to the draft's Space now.
-async fn draft_access(
-    state: &AppState,
-    who: &Human,
-    d: &store::DraftRow,
-) -> ApiResult<Option<(PageRow, Rights)>> {
-    if let Some(sid) = &d.space_id {
-        member_of(state, sid, who)
-            .await
-            .map_err(|_| ApiError::not_found(NO_DRAFT))?;
-    }
-    match &d.page_id {
-        Some(pid) => Ok(Some(
-            load_live(state, who, pid)
-                .await
-                .map_err(|_| ApiError::not_found(NO_DRAFT))?,
-        )),
-        None => Ok(None),
-    }
+async fn list_drafts(State(state): State<AppState>, who: Human) -> ApiResult<Json<Json_>> {
+    let drafts = db(&state, move |db| store::list_drafts(db, &who.id)).await?;
+    Ok(Json(json!({"drafts": drafts})))
 }
 
 async fn get_draft(
@@ -1157,7 +1186,6 @@ async fn get_draft(
     Path(id): Path<String>,
 ) -> ApiResult<Json<Json_>> {
     let d = own_draft(&state, &who, &id).await?;
-    draft_access(&state, &who, &d).await?;
     let base = draft_base(&state, &d).await?;
     Ok(Json(generate::draft_view(&d, base.as_ref())))
 }
@@ -1196,7 +1224,6 @@ async fn apply_draft(
             .map_err(|e| ApiError::bad_request(format!("bad body: {e}")))?
     };
     let d = own_draft(&state, &who, &id).await?;
-    draft_access(&state, &who, &d).await?;
     if d.status != "ready" {
         return Err(ApiError::new(
             StatusCode::CONFLICT,
@@ -1279,7 +1306,6 @@ async fn draft_data(
 ) -> ApiResult<Json<Json_>> {
     let body = data_body(&body)?;
     let d = own_draft(&state, &who, &id).await?;
-    draft_access(&state, &who, &d).await?;
     let Some(spec) = d
         .spec
         .as_deref()

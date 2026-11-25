@@ -28,7 +28,7 @@ export type PageBlock = {
 };
 export type Definition = { source: string; spec: PageSpec };
 export type Page = PageMeta & Definition & { version: VersionMeta };
-export type Template = { id: string; title: string; description: string; scopes: PageMeta["scope"][] };
+export type Template = { id: string; title: string; description: string; scopes: PageMeta["scope"][]; requires_space_destination?: boolean };
 export type PageDiagnostic = { line: number; column: number; message: string; key?: string };
 export type Validation = { ok: boolean; source: string; spec: PageSpec | null; diagnostics: PageDiagnostic[] };
 export type Changes = { added: string[]; removed: string[]; changed: string[]; data: string[]; page: boolean };
@@ -37,6 +37,10 @@ export type Draft = Pick<PageMeta, "id" | "scope" | "space_id" | "created_at"> &
   status: "generating" | "ready" | "failed"; source: string | null; spec: PageSpec | null;
   diagnostics: PageDiagnostic[]; error: string | null; model: string | null; attempts: number;
   base_source: string | null; changes: Changes | null; outside_selection: string[];
+};
+export type DraftMeta = Pick<Draft, "id" | "status" | "scope" | "space_id" | "page_id"> & {
+  space_name: string | null; page_title: string | null;
+  created_at: string | null; updated_at: string | null; expires_at: string | null;
 };
 export type PageDraftEvent = {
   draft_id: string; title: string; summary: string; kind: "new" | "edit";
@@ -100,9 +104,10 @@ export function pagesApi(request: RequestFn) {
   };
   return {
     listPages: (deleted = false) => list<"pages", PageMeta>("pages", root + (deleted ? "?deleted=true" : "")),
+    listPageDrafts: () => list<"drafts", DraftMeta>("drafts", `${root}/drafts`),
     pageTemplates: () => list<"templates", Template>("templates", `${root}/templates`),
     getPage: (id: string, signal?: AbortSignal) => json<Page>("GET", page(id), undefined, signal),
-    createPage: (body: PageTarget & ({ template: string; room?: string; agent?: string } | { source: string })) =>
+    createPage: (body: PageTarget & ({ template: string; room?: string; room_id?: string; agent?: string } | { source: string })) =>
       json<Page>("POST", root, body),
     validatePage: (target: PageTarget, source: string, signal?: AbortSignal) => json<Validation>("POST", `${root}/validate`, { ...target, source }, signal),
     patchPage: (id: string, body: { title?: string; base_version?: number; icon?: string | null; members_edit?: boolean }) =>

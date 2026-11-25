@@ -76,6 +76,7 @@ const TABLES: &str = "CREATE TABLE IF NOT EXISTS pages (
              model_ref    TEXT,
              attempts     INTEGER NOT NULL DEFAULT 0,
              created_at   INTEGER NOT NULL,
+             updated_at   INTEGER,
              expires_at   INTEGER NOT NULL
          );
          CREATE INDEX IF NOT EXISTS page_drafts_author ON page_drafts (author_id, created_at);
@@ -192,6 +193,9 @@ fn upgrade(conn: &Connection) -> rusqlite::Result<()> {
              RELEASE upgrade_{table};"
         ))?;
     }
+    if !has_column("page_drafts", "updated_at")? {
+        conn.execute_batch("ALTER TABLE page_drafts ADD COLUMN updated_at INTEGER")?;
+    }
     Ok(())
 }
 
@@ -258,8 +262,9 @@ pub const INTERRUPTED: &str = "Interrupted by a server restart; try again.";
 /// their generation slots are free again.
 pub fn recover_drafts(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute(
-        "UPDATE page_drafts SET status = 'failed', error = ?1 WHERE status = 'generating'",
-        [INTERRUPTED],
+        "UPDATE page_drafts SET status = 'failed', error = ?1, updated_at = ?2
+         WHERE status = 'generating'",
+        params![INTERRUPTED, now_ms()],
     )?;
     conn.execute("DELETE FROM page_drafts WHERE status = 'discarded'", [])?;
     Ok(())
@@ -2000,18 +2005,107 @@ pub(crate) fn reserve_draft_in(
 }
 
 /// A draft, unless it was discarded or has expired.
+#[cfg(test)]
 pub fn draft(db: &Db, id: &str) -> anyhow::Result<Option<DraftRow>> {
-    let conn = db.lock();
-    Ok(conn
-        .query_row(
-            &format!(
-                "SELECT {DRAFT_COLUMNS} FROM page_drafts
+    Ok(draft_in(&db.lock(), id)?)
+}
+
+pub fn draft_in(conn: &Connection, id: &str) -> rusqlite::Result<Option<DraftRow>> {
+    conn.query_row(
+        &format!(
+            "SELECT {DRAFT_COLUMNS} FROM page_drafts
                  WHERE id = ?1 AND status <> 'discarded' AND expires_at > ?2"
-            ),
-            params![id, now_ms()],
-            row_draft,
-        )
-        .optional()?)
+        ),
+        params![id, now_ms()],
+        row_draft,
+    )
+    .optional()
+}
+
+pub struct DraftContext {
+    space_name: Option<String>,
+    page: Option<PageRow>,
+}
+
+/// Shared view-access check for opening and listing private drafts.
+/// This deliberately doesn't require edit rights on the target page.
+pub fn draft_context_in(
+    conn: &Connection,
+    user: &str,
+    space: Option<&str>,
+    page: Option<&str>,
+) -> rusqlite::Result<Option<DraftContext>> {
+    let space_name = if let Some(sid) = space {
+        let name = conn
+            .query_row(
+                "SELECT s.name FROM spaces s JOIN space_members m ON s.id = m.space_id
+                 WHERE s.id = ?1 AND m.user_id = ?2",
+                params![sid, user],
+                |r| r.get(0),
+            )
+            .optional()?;
+        let Some(name) = name else { return Ok(None) };
+        Some(name)
+    } else {
+        None
+    };
+    let page = if let Some(pid) = page {
+        match load_in(conn, pid, user, Need::View)? {
+            Ok((p, _)) if p.space_id.as_deref() == space => Some(p),
+            _ => return Ok(None),
+        }
+    } else {
+        None
+    };
+    Ok(Some(DraftContext { space_name, page }))
+}
+
+#[derive(Serialize)]
+pub struct DraftMeta {
+    id: String,
+    status: String,
+    scope: Scope,
+    space_id: Option<String>,
+    space_name: Option<String>,
+    page_id: Option<String>,
+    page_title: Option<String>,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    expires_at: Option<String>,
+}
+
+pub fn list_drafts(db: &Db, user: &str) -> anyhow::Result<Vec<DraftMeta>> {
+    let conn = db.lock();
+    let mut stmt = conn.prepare_cached(
+        "SELECT id, status, scope, space_id, page_id, created_at,
+                COALESCE(updated_at, created_at), expires_at
+         FROM page_drafts WHERE author_id = ?1 AND status <> 'discarded' AND expires_at > ?2
+         ORDER BY created_at DESC, rowid DESC",
+    )?;
+    let mut rows = stmt.query(params![user, now_ms()])?;
+    let mut drafts = Vec::new();
+    while let Some(row) = rows.next()? {
+        let space_id: Option<String> = row.get(3)?;
+        let page_id: Option<String> = row.get(4)?;
+        let Some(context) = draft_context_in(&conn, user, space_id.as_deref(), page_id.as_deref())?
+        else {
+            continue;
+        };
+        let timestamp = |i| row.get(i).map(crate::db::rfc3339_utc);
+        drafts.push(DraftMeta {
+            id: row.get(0)?,
+            status: row.get(1)?,
+            scope: Scope::parse(&row.get::<_, String>(2)?),
+            space_id,
+            space_name: context.space_name,
+            page_id,
+            page_title: context.page.map(|p| p.title),
+            created_at: timestamp(5)?,
+            updated_at: timestamp(6)?,
+            expires_at: timestamp(7)?,
+        });
+    }
+    Ok(drafts)
 }
 
 /// Whether draft `id`'s job may still call a model for `user`, decided in
@@ -2160,7 +2254,7 @@ pub(crate) fn finish_draft_in(
 ) -> anyhow::Result<()> {
     conn.execute(
         "UPDATE page_drafts SET status = ?2, source = ?3, spec = ?4, diagnostics = ?5, error = ?6, \
-         model_ref = ?7, attempts = ?8 WHERE id = ?1 AND status = 'generating'",
+         model_ref = ?7, attempts = ?8, updated_at = ?9 WHERE id = ?1 AND status = 'generating'",
         params![
             id,
             status,
@@ -2169,7 +2263,8 @@ pub(crate) fn finish_draft_in(
             diagnostics,
             error,
             model_ref,
-            attempts
+            attempts,
+            now_ms()
         ],
     )?;
     // A draft discarded while it was generating goes once its job is done;
