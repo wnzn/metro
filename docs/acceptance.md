@@ -216,10 +216,30 @@ stale Activity selector for text split across mention spans.
   result below remains attributed to `2cb1beb`; it was not rerun
   for this docs update.
 
-**Final acceptance pending.** Record the full desktop rerun at its
-exact commit once its receipt is verified, then record the combined
-results and exceptions. This entry is not a passing desktop gate or
-release sign-off.
+## Source only: final local acceptance at b444379
+
+- **Full desktop gate:** The immutable source archive of
+  `b44437956e73f2eaa6e8a4d62102352139fa67d2` passed **894/894 unique
+  tests across 67 files**, with no failures, errors, skips or duplicates.
+  The console log and JUnit receipt agree, including the Activity test
+  that was the sole failure at `2cb1beb`. From `apps/desktop`, the run
+  used `TZ=Asia/Manila nsh test . --junit ../../full.junit.xml` with
+  headless NSH 0.6.1 (`2f51d86`); JUnit recorded **685.440 s**. This
+  offline headless gate is separate from the scoped GTK/Xvfb startup
+  consent evidence above.
+- **Backend and supporting checks:** The [bounded backend gate](#source-only-bounded-backend-gate-at-2cb1beb)
+  remains attributed to `2cb1bebf55f06a168161404c1496fd9f20442a93`.
+  The backend, packaging, workflows and backend e2e sources are
+  unchanged at `b444379`; `crates/` still has tree
+  `7242f3cb5a77486e51b43c3cad864499737572bb`. Rust, loopback e2e and
+  isolated updater, packaging and signing fixtures, mocked Chromium,
+  and workflow tooling results were not rerun or reattributed.
+
+This closes local desktop acceptance alongside the bounded backend
+result, not release sign-off. Its exclusions still apply, including
+Docker, hosted CI, live services and distribution, native Windows
+and macOS, separate TUI and media-reference checks, and screen-reader
+verification. No push, deployment, or publication is implied.
 
 ## Source only: bounded backend gate at 2cb1beb
 

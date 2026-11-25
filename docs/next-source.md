@@ -188,8 +188,10 @@ along with the personal and organization runner lists.
   The first verified list shown in a Runners visit starts checked.
   Newly eligible Spaces appear unchecked. If a Space loses eligibility,
   it loses its check and won't be checked automatically if it returns.
-  Changing the runner or session clears the selection. Review the
-  checked Spaces before pressing **Attach to N Spaces**.
+  Changing the runner or session clears the selection. If this
+  computer's runner is newly registered while Runners settings are
+  already open, its Spaces also start unchecked. Review the checked
+  Spaces before pressing **Attach to N Spaces**.
   You can still use Settings later. A confirmed new-Space attachment
   also dismisses the sidebar offer.
 - This attach path only fills an empty assignment. The server rechecks
