@@ -112,6 +112,8 @@ fn event(kind: &str, actor_id: Option<&str>, text: &str) -> Event {
         activity: None,
         created_at: None,
         attachments: Vec::new(),
+        meta: Default::default(),
+        replies: None,
     }
 }
 

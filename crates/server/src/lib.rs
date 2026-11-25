@@ -20,6 +20,7 @@ pub mod jobs;
 pub mod library;
 pub mod library_search;
 pub mod mentions;
+pub mod messages;
 pub mod model_routing;
 pub mod monitoring;
 pub mod orchestration;
@@ -27,6 +28,7 @@ pub mod pages;
 pub mod profiles;
 pub mod providers;
 pub mod quick_search;
+pub mod replies;
 pub mod runner_pairing;
 pub mod runners;
 pub mod schedules;
@@ -244,6 +246,10 @@ pub fn router(state: AppState) -> Router {
             post(api::post_message),
         )
         .route("/v1/spaces/{sid}/rooms/{rid}/demo", post(api::demo))
+        .route(
+            "/v1/spaces/{sid}/rooms/{rid}/events/{eid}/thread",
+            post(api::reply_thread),
+        )
         .route(
             "/v1/spaces/{sid}/rooms/{rid}/events/{eid}/reactions",
             put(api::put_space_reaction).delete(api::delete_space_reaction),

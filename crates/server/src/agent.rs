@@ -2023,6 +2023,8 @@ mod tests {
             activity: None,
             created_at,
             attachments: Vec::new(),
+            meta: Default::default(),
+            replies: None,
         }
     }
 

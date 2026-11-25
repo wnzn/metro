@@ -594,7 +594,7 @@ test("switching to a thread during an upload never posts the old room's draft in
   expect(app.value("id:composer")).toBe("a separate thread draft");
 });
 
-test("a real-shaped message response displays current names, leaves deleted spans unavailable, and copies current text", async () => {
+test("a real-shaped Markdown message displays current names, leaves deleted spans unavailable, and copies Markdown", async () => {
   const w = spaceWorld();
   const coder = w.agent("acme", { handle: "coder", name: "Refactor Coach", description: "Reviews builds." });
   const base = w.network[get]!;
@@ -602,7 +602,7 @@ test("a real-shaped message response displays current names, leaves deleted span
     ? { status: 200, body: { id: "alice", display_name: "Alice Renamed", bio: "Rollout owner." } }
     : base(req);
   const callback = w.network[post]!;
-  const saved = '🤖 @alice, @coder, @old and @agent.';
+  const saved = "🤖 **@alice**, *@coder*, @old and @agent.";
   let stored: { id: number } | undefined;
   w.network[post] = req => {
     if (new URL(req.url).pathname !== lobby) return callback(req);
@@ -630,7 +630,12 @@ test("a real-shaped message response displays current names, leaves deleted span
   expect(app.shows("label:Refactor Coach, mentioned. Open card.")).toBe(true);
   expect(app.shows("label:@old, unavailable")).toBe(true);
   expect(app.shows(`id:mention-token:${id}:3`)).toBe(true);
-  await app.press(`id:mention-token:${id}:0`);
+  // The headless text engine positions inline attachments at one character's
+  // advance, regardless of their width. Exercise their keyboard path here.
+  await app.keyboard.press("shift+tab");
+  await app.keyboard.press("shift+tab");
+  await app.keyboard.press("shift+tab");
+  await app.keyboard.press("enter");
   await app.waitFor("id:identity-card-copy-id");
   expect(app.shows("id:identity-card >> text:Rollout owner.")).toBe(true);
   await app.keyboard.press("enter");
@@ -641,13 +646,14 @@ test("a real-shaped message response displays current names, leaves deleted span
   await app.waitFor("id:identity-card");
   await app.keyboard.press("escape");
   await app.waitFor("id:identity-card", { state: "gone" });
-  await app.press(`id:mention-token:${id}:1`);
+  await app.keyboard.press("tab");
+  await app.keyboard.press("enter");
   await app.waitFor("id:identity-card-agent-settings");
   expect(app.shows("id:identity-card >> text:Reviews builds.")).toBe(true);
   await app.keyboard.press("escape");
   await app.waitFor("id:identity-card", { state: "gone" });
   await app.press(`id:copy:${id}`);
-  expect(app.clipboard()).toBe("🤖 @Alice Renamed, @Refactor Coach, @old and @agent.");
+  expect(app.clipboard()).toBe("🤖 **@Alice Renamed**, *@Refactor Coach*, @old and @agent.");
 });
 
 test("authoritative empty and malformed span fields disable fallback and copy rewriting; only stored legacy spellings qualify", async () => {

@@ -14,6 +14,10 @@
 //!   (the probability that the message is for some agent at least the
 //!   sender's `min_directedness`) starts that agent; "No agent", an unsure,
 //!   malformed or failed answer starts nothing.
+//! - **Replies to an agent** (`reply_to` an agent's reply in a thread, see
+//!   [`crate::replies`]): that agent is an explicit recipient, with any of
+//!   the above, and nothing is classified. If it was deleted, it isn't
+//!   asked and the sender alone is told.
 //!
 //! Each run records how its agent was chosen on its `started` marker
 //! (`activity.pick`). A chat model's free text is never used as a System
@@ -72,7 +76,10 @@ fn classifies(prefs: &SpacePrefs, settings: &RoutingSettings) -> bool {
 }
 
 /// Decide what a message of `user` in `space` starts. `agents` are the
-/// Space's agents, the default first.
+/// Space's agents, the default first. `reply` is the agent whose reply the
+/// message answers in a thread ([`crate::replies::reply_agent`]): it is an
+/// explicit recipient, so `addressing` is then [`Addressing::Agent`] and
+/// the unaddressed classifier never runs.
 #[allow(clippy::too_many_arguments)]
 pub async fn plan(
     state: &AppState,
@@ -84,6 +91,7 @@ pub async fn plan(
     settings: &RoutingSettings,
     prefs: &SpacePrefs,
     agents: &[SpaceAgent],
+    reply: Option<&SpaceAgent>,
 ) -> Plan {
     let mut plan = Plan::default();
     let Some(default) = agents.iter().find(|a| a.is_default).or(agents.first()) else {
@@ -168,6 +176,17 @@ pub async fn plan(
             }
         }
     }
+    // After named agents, so naming the replied agent too starts one run.
+    if let Some(agent) = reply {
+        push(
+            &mut plan.targets,
+            Target {
+                pick: format!("Reply to @{}", agent.handle),
+                agent: agent.clone(),
+                addressed_by: AddressedBy::Explicit,
+            },
+        );
+    }
     plan
 }
 
@@ -216,6 +235,8 @@ pub struct Started {
     pub failures: Vec<String>,
     /// The first sender-only note, for their POST response only.
     pub note: Option<AddressingNote>,
+    /// The runs that started, in target order.
+    pub runs: Vec<crate::orchestration::RunInfo>,
 }
 
 /// Start one run per target answering `event` (already stored) in `room`.
@@ -252,7 +273,7 @@ pub async fn start_runs(
                 .await
             }
         };
-        if let Err(refusal) = crate::agent::start_room_run(
+        match crate::agent::start_room_run(
             state,
             space,
             room,
@@ -264,18 +285,21 @@ pub async fn start_runs(
         )
         .await
         {
-            state
-                .append(
-                    space,
-                    &room.id,
-                    kind::ERROR,
-                    &Author::server(actor::SYSTEM),
-                    &refusal.shown,
-                )
-                .await;
-            started.failures.push(refusal.private().to_owned());
-            if started.note.is_none() {
-                started.note = refusal.note;
+            Ok(run) => started.runs.push(run),
+            Err(refusal) => {
+                state
+                    .append(
+                        space,
+                        &room.id,
+                        kind::ERROR,
+                        &Author::server(actor::SYSTEM),
+                        &refusal.shown,
+                    )
+                    .await;
+                started.failures.push(refusal.private().to_owned());
+                if started.note.is_none() {
+                    started.note = refusal.note;
+                }
             }
         }
     }

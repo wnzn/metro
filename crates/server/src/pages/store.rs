@@ -1138,13 +1138,14 @@ pub fn destination_in(
     use super::spec::action as kinds;
     let room_in = |sid: &str, rid: &str| -> rusqlite::Result<Option<Room>> {
         conn.query_row(
-            "SELECT id, name, parent_room_id FROM space_rooms WHERE space_id = ?1 AND id = ?2",
+            "SELECT id, name, parent_room_id, anchor_event_id FROM space_rooms WHERE space_id = ?1 AND id = ?2",
             params![sid, rid],
             |r| {
                 Ok(Room {
                     id: r.get(0)?,
                     name: r.get(1)?,
                     parent_room_id: r.get(2)?,
+                    anchor_event_id: r.get(3)?,
                 })
             },
         )
@@ -1624,6 +1625,8 @@ fn row_page_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
             .and_then(|a| serde_json::from_str(&a).ok()),
         created_at: r.get::<_, Option<i64>>(6)?.and_then(event_time),
         attachments: Vec::new(),
+        meta: Default::default(),
+        replies: None,
     })
 }
 
@@ -1761,7 +1764,7 @@ pub fn room_for(db: &Db, viewer: &str, space: &str, room: &str) -> anyhow::Resul
     let conn = db.lock();
     Ok(conn
         .query_row(
-            "SELECT r.id, r.name, r.parent_room_id FROM space_rooms r
+            "SELECT r.id, r.name, r.parent_room_id, r.anchor_event_id FROM space_rooms r
              WHERE r.space_id = ?1 AND r.id = ?2
                AND EXISTS (SELECT 1 FROM space_members m
                            WHERE m.space_id = r.space_id AND m.user_id = ?3)",
@@ -1771,6 +1774,7 @@ pub fn room_for(db: &Db, viewer: &str, space: &str, room: &str) -> anyhow::Resul
                     id: r.get(0)?,
                     name: r.get(1)?,
                     parent_room_id: r.get(2)?,
+                    anchor_event_id: r.get(3)?,
                 })
             },
         )
