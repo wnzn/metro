@@ -1,7 +1,7 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BRIDGE, BRIDGE_TOKEN, bridgeEnv, fakeBridge } from "../device/test/fakeBridge";
-import { officialReleaseUrl } from "../updates";
+import { createOutcomeDismissal, officialReleaseUrl } from "../updates";
 import { BASE, header, TOKENS, world } from "../../test/fakeServer";
 import { launched } from "../../test/launched";
 
@@ -11,6 +11,7 @@ const NEXT = "0.5.1";
 const AFTER = "0.6.0";
 const RELEASE = `https://github.com/wnzn/metro/releases/tag/v${NEXT}`;
 const INERT = "[Steal](https://untrusted.invalid) <script>bad()</script> ![image](https://untrusted.invalid/image)";
+const OUTCOME_DISMISSAL_KEY = "metro.update.dismissedOutcome";
 const latest = (version = NEXT) => ({
   version, signed_at: 123, commit: "a".repeat(40), release_url: `https://github.com/wnzn/metro/releases/tag/v${version}`,
   notes: INERT, notes_truncated: true,
@@ -34,6 +35,7 @@ function scenario(overrides: Record<string, unknown> = {}) {
   const fixture = {
     f, calls, readDelay: 0, readError: null as null | { status: number; body: unknown },
     check: null as null | ((body: any) => unknown),
+    download: null as null | ((body: any) => unknown),
     apply: null as null | ((body: any) => unknown),
     update(patch: Record<string, unknown>) { view = { ...view, ...patch }; },
     steps: () => calls.filter(call => call.step !== "read").map(call => call.step),
@@ -51,7 +53,10 @@ function scenario(overrides: Record<string, unknown> = {}) {
       case "started": return ok({ trial: true });
       case "check": return fixture.check?.(body) ?? ok(view);
       case "settings": fixture.update({ auto_check: body.auto_check }); return ok(view);
-      case "download": fixture.update({ phase: "downloading", progress: { done: 0, total: 0 } }); return ok(view);
+      case "download":
+        if (fixture.download) return fixture.download(body);
+        fixture.update({ phase: "downloading", progress: { done: 0, total: 0 } });
+        return ok(view);
       case "cancel": return ok(view); // launcher acknowledges before cancellation settles
       case "apply":
         if (fixture.apply) return fixture.apply(body);
@@ -71,8 +76,8 @@ function scenario(overrides: Record<string, unknown> = {}) {
 
 type Fixture = ReturnType<typeof scenario>;
 const text = (app: App) => app.texts().join(" | ");
-async function harness(f: Fixture, showAbout = true, modules = bridgeEnv(), platform: "linux" | "windows" = "linux") {
-  const app = await open("../../test/AboutHarness.tsx", { modules, network: f.network as any, width: 1000, height: 840, platform });
+async function harness(f: Fixture, showAbout = true, modules = bridgeEnv(), platform: "linux" | "windows" = "linux", storage?: Record<string, string>) {
+  const app = await open("../../test/AboutHarness.tsx", { modules, network: f.network as any, width: 1000, height: 840, platform, storage });
   if (showAbout) await app.press("id:h-about");
   return app;
 }
@@ -296,12 +301,12 @@ test("verification and installer exclusion failures don't enable restart, and ch
 test("rollback and backup exclusion show safe facts and do not offer the old stage", async () => {
   for (const last_update of [
     { from: CURRENT, to: NEXT, at: lastAt, outcome: "rolled_back", detail: "private path" },
-    { from: CURRENT, to: NEXT, at: lastAt, outcome: "install_failed", detail: "The local workspace could not be backed up. The update was not started." },
+    { from: CURRENT, to: NEXT, at: lastAt, outcome: "install_failed", failure_code: "backup_failed" },
   ]) {
     const f = scenario({ ...available(), phase: "ready", last_update });
     const app = await harness(f);
     await app.waitFor("id:update-outcome");
-    expect(text(app)).toContain(last_update.outcome === "rolled_back" ? `Metro went back to ${CURRENT}` : last_update.detail);
+    expect(text(app)).toContain(last_update.outcome === "rolled_back" ? `Metro went back to ${CURRENT}` : "Metro couldn't back up the local workspace.");
     expect(text(app)).not.toContain("private path");
     expect(app.shows("id:update-restart")).toBe(false);
     expect(app.shows("id:update-start")).toBe(false);
@@ -309,6 +314,106 @@ test("rollback and backup exclusion show safe facts and do not offer the old sta
     await app.waitFor("id:update-outcome", { state: "gone" });
     expect(app.shows("id:update-restart")).toBe(false);
   }
+});
+
+test("a refused download does not hide an independent newer offer returned by the next GET", async () => {
+  const f = scenario(available());
+  f.download = () => {
+    f.update({ latest: latest(AFTER), last_checked_at: lastAt + 1 });
+    return err(409, "not_latest");
+  };
+  const app = await harness(f);
+  await app.press("id:h-render");
+  await app.waitFor("id:update-start");
+  await download(app);
+  await app.waitFor(`text:Update to ${AFTER}…`);
+  expect(app.shows("id:h-update-available")).toBe(true);
+  expect(app.shows("id:update-action-error")).toBe(false);
+  expect(f.calls.filter(c => c.step === "download").map(c => c.body)).toEqual([{ version: NEXT }]);
+  expect(f.count("check")).toBe(0);
+  expect(f.count("apply")).toBe(0);
+});
+
+test("a ready refusal blocks the same stage on refresh, not a distinct stage", async () => {
+  const f = scenario({ ...available(), phase: "ready", stage_revision: "1".repeat(64) });
+  f.apply = () => err(409, "not_ready");
+  const app = await harness(f);
+  await app.press("id:h-render");
+  await app.waitFor("id:update-restart");
+  const reads = f.count("read");
+  await app.press("id:update-restart");
+  await app.waitFor("id:update-action-error");
+  await app.waitUntil(() => f.count("read") > reads);
+  expect(app.shows("id:update-restart")).toBe(false);
+  expect(app.shows("id:h-update-available")).toBe(false);
+  f.update({ stage_revision: "2".repeat(64) });
+  await app.waitFor("id:update-restart");
+  expect(app.shows("id:h-update-available")).toBe(true);
+  expect(f.calls.filter(c => c.step === "apply").map(c => c.body)).toEqual([{ version: NEXT, confirm_interrupt: false }]);
+  expect(f.count("check")).toBe(0);
+});
+
+test("a verified check cannot re-offer a stage with a recorded verification failure", async () => {
+  const f = scenario({ ...available(), phase: "idle",
+    last_update: { from: CURRENT, to: NEXT, at: lastAt, outcome: "install_failed", failure_code: "stage_verification_failed",
+      detail: "Untrusted prose: this was actually safe." } });
+  const app = await harness(f);
+  await app.press("id:h-render");
+  await app.waitFor("id:update-recovery-release");
+  expect(app.shows("id:update-start")).toBe(false);
+  expect(text(app)).not.toContain("Untrusted prose");
+  f.check = () => {
+    f.update({ phase: "ready", last_checked_at: lastAt + 1, stage_revision: "1".repeat(64) });
+    return undefined;
+  };
+  await app.press("id:update-check");
+  await app.waitUntil(() => f.count("check") === 1);
+  await app.waitFor("text:Check again");
+  expect(app.shows("id:update-restart")).toBe(false);
+  expect(app.shows("id:h-update-available")).toBe(false);
+  await app.press("id:update-dismiss-outcome");
+  await app.waitFor("id:update-outcome", { state: "gone" });
+  expect(app.shows("id:update-recovery-release")).toBe(true);
+  f.update({ phase: "idle", latest: latest(AFTER), last_checked_at: lastAt + 2 });
+  await app.waitFor(`text:Update to ${AFTER}…`);
+  expect(app.shows("id:h-update-available")).toBe(true);
+  expect(f.count("apply")).toBe(0);
+  expect(f.count("download")).toBe(0);
+});
+
+test("a dismissed outcome stays dismissed on relaunch, but a new attempt with the same version and result appears", async () => {
+  const last = { from: CURRENT, to: NEXT, at: lastAt, outcome: "rolled_back", detail: "private path" };
+  const f = scenario({ ...available(), last_update: last });
+  const app = await harness(f);
+  await app.waitFor("id:update-outcome");
+  await app.press("id:update-dismiss-outcome");
+  const dismissed = `${CURRENT}/${NEXT}/${lastAt}/rolled_back`;
+  await app.waitUntil(() => app.storage()[OUTCOME_DISMISSAL_KEY] === dismissed);
+  expect(JSON.stringify(app.storage())).not.toContain("private path");
+
+  const next = await harness(f, true, bridgeEnv(), "linux", app.storage());
+  await next.waitFor("id:update-status");
+  expect(next.shows("id:update-outcome")).toBe(false);
+  await next.press("id:h-render");
+  f.update({ last_update: { ...last, at: lastAt + 1 } });
+  await next.waitFor("id:update-outcome");
+  expect(next.storage()[OUTCOME_DISMISSAL_KEY]).toBe(dismissed);
+});
+
+test("a slow initial dismissal read cannot undo a newer dismissal", async () => {
+  const saved = new Map<string, string>();
+  let complete!: (value: string) => void;
+  const outcomeStore = createOutcomeDismissal({
+    getItem: () => new Promise<string>(resolve => { complete = resolve; }),
+    setItem: async (key, value) => { saved.set(key, value); },
+  });
+  const restoring = outcomeStore.restore();
+  const dismissed = `${CURRENT}/${NEXT}/${lastAt}/rolled_back`;
+  await outcomeStore.dismiss(dismissed);
+  complete(`${CURRENT}/${NEXT}/${lastAt - 1}/rolled_back`);
+  await restoring;
+  expect(outcomeStore.current()).toBe(dismissed);
+  expect(saved.get(OUTCOME_DISMISSAL_KEY)).toBe(dismissed);
 });
 
 test("newer offer invalidates an already-open restart confirmation", async () => {

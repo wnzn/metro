@@ -2,8 +2,8 @@ import { appInfo, cleanup, Clipboard, effect, openUrl, platform, signal } from "
 import type { ViewRef } from "nsh";
 import type { ServerUpdate } from "../api/serverUpdate";
 import { apiClient, connectedTo, me, orgAdmin, sessionGuard, status } from "../store";
-import { desktopUpdates as updates, METRO_LICENSES, METRO_RELEASES, METRO_SOURCE, newerVersion, officialReleaseUrl, stableVersion } from "../updates";
-import type { UpdateState } from "../updates";
+import { desktopUpdates as updates, METRO_LICENSES, METRO_RELEASES, METRO_SOURCE, needsManualRecovery, newerVersion, officialReleaseUrl, outcomeKey, stableVersion } from "../updates";
+import type { UpdateOffer, UpdateState } from "../updates";
 import { Action, ActionBar, Badge, Banner, Column, compactWidth, ConfirmInline, Disclosure, Label, PageHeader,
   PageLayout, ProgressLine, SettingRow, SettingsGroup, Toggle } from "../ui";
 
@@ -44,6 +44,8 @@ function failureMessage(code: string | undefined) {
     case "manifest":
     case "not_offered": return "Metro couldn't confirm a complete, published release.";
     case "installer_busy": return "Another installation or update is using this Metro install. No update was installed. Try again when it finishes.";
+    case "stage_verification_failed": return "Metro couldn't verify the staged update. Use the official installer to update manually.";
+    case "backup_failed": return "Metro couldn't back up the local workspace. The update wasn't started.";
     case "missing_libraries": return "This version needs system libraries that aren't installed. Install the required GTK, WebKitGTK and GStreamer packages before trying again.";
     case "not_latest": return "That version is no longer the current verified offer. Check again.";
     case "not_ready": return "That update isn't ready to install. Check again.";
@@ -129,7 +131,7 @@ function Privacy() {
     <SettingRow label="Update checks"
       description="Metro contacts github.com and its release asset hosts (release-assets.githubusercontent.com or objects.githubusercontent.com). A newer release can also make a request to api.github.com for notes. If verification data is out of date, Metro can refresh it at tuf-repo-cdn.sigstore.dev. These requests don't send your account, device ID or usage data. If you're offline, the check can't confirm the latest release." />
     <SettingRow label="Web search"
-      description="Your queries and the pages agents read go to the web provider from this computer's address. Your web-search keys stay on this computer." />
+      description="Your queries and the pages agents read go to the web provider from this computer's address. Metro stores your web-search keys on this computer and sends a key only to its provider when needed." />
     <SettingRow label="Model connections"
       description="What you send goes to the connection that answers. A shared connection's owner can see those requests and may pay for them." />
     <SettingRow label="Your Metro server"
@@ -141,17 +143,18 @@ function Privacy() {
 }
 
 function UpdateOutcome() {
-  const copied = signal("");
-  return <If when={updates.outcome()}>{last => {
+  return <Each of={updates.outcome() ? [updates.outcome()!] : []} key={outcomeKey}>{last => {
+    const copied = signal("");
     const label = () => ({ updated: "Update installed", install_failed: "Update not installed",
       not_confirmed: "Update not confirmed", rolled_back: "Previous version restored" })[last().outcome];
     const detail = () => {
-      const { from, to, outcome, detail } = last();
+      const { from, to, outcome, failureCode } = last();
       switch (outcome) {
         case "updated": return `Metro updated from ${from} to ${to}.`;
         case "rolled_back": return `Metro ${to} didn't start successfully. Metro went back to ${from}.`;
         case "not_confirmed": return `Metro ${to} didn't finish starting. Metro kept ${from}.`;
-        case "install_failed": return `Metro didn't install ${to}. ${detail ?? "Check again before retrying."}`;
+        case "install_failed": return `Metro didn't install ${to}. ${failureCode ? failureMessage(failureCode)
+          : "Metro couldn't confirm the stage was safe to use. Use the official installer to update manually."}`;
       }
     };
     const copyDetails = async () => {
@@ -168,7 +171,7 @@ function UpdateOutcome() {
       </ActionBar>
       <If when={copied()}><Label variant="caption" color="muted">{copied()}</Label></If>
     </SettingRow>;
-  }}</If>;
+  }}</Each>;
 }
 
 function ReleaseNotes(props: { release: NonNullable<UpdateState["latest"]> }) {
@@ -185,7 +188,7 @@ function ReleaseNotes(props: { release: NonNullable<UpdateState["latest"]> }) {
   </Disclosure>;
 }
 
-function RestartUpdate(props: { version: string }) {
+function RestartUpdate(props: { target: UpdateOffer }) {
   const confirmation = signal<string | null>(null);
   const deferred = signal(false);
   let restartButton: ViewRef | undefined;
@@ -199,11 +202,11 @@ function RestartUpdate(props: { version: string }) {
     return jobs ? `Restarting now stops work in ${jobs}. Restart anyway?` : "Metro may have on-device work in progress. Restarting stops that work. Restart anyway?";
   };
   const restart = async (confirmed: boolean) => {
-    const version = props.version;
-    if (confirmed && confirmation() !== version) return;
-    const refused = await updates.restart(version, confirmed);
-    if (alive && updates.state()?.phase === "ready" && updates.offer()?.version === version) {
-      confirmation.set(refused === "would_interrupt" ? version : null);
+    const target = props.target;
+    if (confirmed && confirmation() !== target.identity) return;
+    const refused = await updates.restart(target, confirmed);
+    if (alive && updates.state()?.phase === "ready" && updates.offer()?.identity === target.identity) {
+      confirmation.set(refused === "would_interrupt" ? target.identity : null);
     }
   };
   return <Column gap={2}>
@@ -216,8 +219,8 @@ function RestartUpdate(props: { version: string }) {
     </ActionBar>}>
       <Action label="Show restart options" variant="ghost" testID="update-show-restart" onPress={() => deferred.set(false)} />
     </If>
-    <ConfirmInline open={confirmation() === props.version} onOpenChange={open => { if (!open) confirmation.set(null); }}
-      returnFocus={() => restartButton} scopeKey={props.version}
+    <ConfirmInline open={confirmation() === props.target.identity} onOpenChange={open => { if (!open) confirmation.set(null); }}
+      returnFocus={() => restartButton} scopeKey={props.target.identity}
       testID="update-interrupt" title="Work in progress" message={busyText()} confirmLabel="Restart anyway" variant="primary"
       busy={updates.pending() === "restart"} busyLabel="Restarting…" disabled={!!updates.pending()}
       onConfirm={() => void restart(true)} />
@@ -231,7 +234,11 @@ function PublishedUpdates() {
   const actionBusy = () => !!updates.pending();
   const checking = () => phase() === "checking" || updates.pending() === "check";
   const transfer = () => phase() === "downloading" || phase() === "verifying" || phase() === "staging";
-  const ready = () => s().canUpdateInApp && phase() === "ready" && offer() ? offer()!.version : undefined;
+  const ready = () => s().canUpdateInApp && phase() === "ready" ? offer() : undefined;
+  const blocked = () => {
+    const last = s().lastUpdate;
+    return s().canUpdateInApp && last?.from === s().current.version && needsManualRecovery(last) ? last.to : undefined;
+  };
   const error = () => {
     const v = s();
     if (v.anomaly === "older_release_served") return "GitHub returned an older release than Metro already verified. Metro won't use it. Check again later.";
@@ -240,6 +247,7 @@ function PublishedUpdates() {
     if (v.persistenceError === "settings_io") return "Metro can't read or save this computer's update settings.";
     if (v.phase === "failed") return failureMessage(v.failure);
     if (v.error || v.result === "error") return failureMessage(v.error);
+    if (blocked() && v.latest?.version === blocked()) return `Metro won't retry the staged update to ${blocked()} in the app.`;
     if (v.result === "available" && !offer() && !updates.problem()) return "Check again for a current verified offer.";
     return "";
   };
@@ -247,7 +255,7 @@ function PublishedUpdates() {
     if (phase() === "applying") return "Metro is restarting to finish the update…";
     if (transfer()) return "No update has been installed.";
     if (checking()) return "Checking for updates…";
-    if (ready()) return `Metro ${ready()} is verified and ready. Restart to finish the update.`;
+    if (ready()) return `Metro ${ready()!.version} is verified and ready. Restart to finish the update.`;
     if (error()) return error();
     if (offer()) return `Metro ${offer()!.version} is available. You have ${s().current.version}.`;
     if (s().result === "up_to_date") return `Metro ${s().current.version} is up to date.`;
@@ -273,9 +281,9 @@ function PublishedUpdates() {
             onPress={() => void updates.cancel()} />
         </If>
       </If>
-      <Each of={ready() ? [ready()!] : []} key={version => version}>{version => <Column gap={2} align="start">
+      <Each of={ready() ? [ready()!] : []} key={target => target.identity}>{target => <Column gap={2} align="start">
         <Badge tone="success" label="Ready" />
-        <RestartUpdate version={version()} />
+        <RestartUpdate target={target()} />
       </Column>}</Each>
       <If when={!checking() && phase() === "failed"}><Badge tone="danger" label="Failed" /></If>
       <If when={phase() === "idle" && !checking() && !error() && !ready()}>
@@ -288,6 +296,12 @@ function PublishedUpdates() {
       <SettingRow label="Manual updates" description={notInApp(s())} testID="update-manual" stacked>
         <OfficialLink label="Open Metro releases" url={offer()?.url ?? METRO_RELEASES} testID="update-download-page" />
       </SettingRow>
+    </If>
+    <If when={blocked()}>
+      {version => <SettingRow label="Manual recovery" testID="update-manual-recovery" stacked
+        description={`The staged update to ${version()} wasn't used. To update manually, get the Linux installer from Metro's official releases.`}>
+        <OfficialLink label="Open Metro releases" url={METRO_RELEASES} testID="update-recovery-release" />
+      </SettingRow>}
     </If>
     <If when={updates.problem()}>{problem => {
       const message = () => {
@@ -307,13 +321,13 @@ function PublishedUpdates() {
       <Action label={error() || updates.problem() ? "Check again" : "Check now"} busyLabel="Checking…" busy={checking()}
         disabled={actionBusy() || transfer() || phase() === "applying"} testID="update-check" onPress={() => void updates.check()} />
     </SettingRow>
-    <Each of={offer() ? [offer()!] : []} key={release => release.version}>{release => <SettingRow label={`Metro ${release().version}`} stacked>
+    <Each of={offer() ? [offer()!] : []} key={release => release.identity}>{release => <SettingRow label={`Metro ${release().version}`} stacked>
       <ReleaseNotes release={release()} />
       <If when={s().canUpdateInApp && phase() === "idle" && !checking()}>
         <ConfirmInline testID="update-start" triggerLabel={`Update to ${release().version}…`} confirmLabel="Download and verify"
           message={`Metro downloads ${release().version} from GitHub and verifies its signature and checksum. It won't install anything until you choose to restart.`}
-          scopeKey={release().version} variant="primary" disabled={actionBusy()}
-          onConfirm={() => void updates.download(release().version)} />
+          scopeKey={release().identity} variant="primary" disabled={actionBusy()}
+          onConfirm={() => void updates.download(release())} />
       </If>
     </SettingRow>}</Each>
   </>;

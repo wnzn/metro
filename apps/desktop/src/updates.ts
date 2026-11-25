@@ -1,6 +1,6 @@
 // Launcher-scoped, not account-scoped. The launcher schedules and verifies
 // checks. Polling here only reads the loopback state; it never checks GitHub.
-import { platform, signal } from "nsh";
+import { platform, signal, Storage } from "nsh";
 import { readBridgeEnv } from "./device/env";
 import type { BridgeEndpoint } from "./device/env";
 
@@ -34,9 +34,12 @@ const channels = ["release", "preview", "source"] as const;
 const installs = ["linux-installer", "windows-script", "windows-msi", "portable", "unsupported"] as const;
 const results = ["never", "up_to_date", "available", "error"] as const;
 const outcomes = ["updated", "rolled_back", "install_failed", "not_confirmed"] as const;
+const installFailures = ["installer_busy", "stage_verification_failed", "backup_failed"] as const;
+const DISMISSED_OUTCOME = "metro.update.dismissedOutcome";
 
-type Release = { version: string; url?: string; notes?: string; notesTruncated: boolean };
-type LastUpdate = { from: string; to: string; outcome: typeof outcomes[number]; at: number; detail?: string };
+type Release = { version: string; commit?: string; signedAt: number | null; url?: string; notes?: string; notesTruncated: boolean };
+export type UpdateOffer = Release & { identity: string };
+type LastUpdate = { from: string; to: string; outcome: typeof outcomes[number]; at: number; failureCode?: typeof installFailures[number] };
 export type UpdateState = {
   current: { version: string; channel: typeof channels[number]; install: typeof installs[number] };
   phase: typeof phases[number];
@@ -50,6 +53,7 @@ export type UpdateState = {
   anomaly?: string;
   persistenceError?: string;
   latest?: Release;
+  stageRevision?: string;
   progress?: number;
   failure?: string;
   busy: { servingConnections: number; localWorkspace: boolean };
@@ -63,13 +67,7 @@ const code = (v: unknown) => typeof v === "string" && /^[a-z_]{1,48}$/.test(v) ?
 const count = (v: unknown) => typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? v : 0;
 const timestamp = (v: unknown) => typeof v === "number" && count(v) && v <= 8.64e15 ? v : null;
 
-// These are the launcher's fixed, non-sensitive failure details. Never display
-// an arbitrary bridge error body, which can also come from an older launcher.
-const safeOutcomeDetails = [
-  "The installer is busy. Close the other installer and try again.",
-  "The staged update could not be verified. Check again before restarting.",
-  "The local workspace could not be backed up. The update was not started.",
-] as const;
+const hex = (v: unknown, length: number) => typeof v === "string" && v.length === length && /^[a-f0-9]+$/.test(v) ? v : undefined;
 
 class UpdateBridgeError extends Error {
   constructor(readonly code: string, readonly status = 0) { super(code); }
@@ -109,15 +107,18 @@ function parseState(value: unknown): UpdateState {
     persistenceError: code(v.persistence_error),
     latest: stableVersion(latest.version) ? {
       version: latest.version,
+      commit: hex(latest.commit, 40),
+      signedAt: timestamp(latest.signed_at),
       url: officialReleaseUrl(latest.version, latest.release_url),
       notes: typeof latest.notes === "string" ? latest.notes.slice(0, 32 * 1024) : undefined,
       notesTruncated: latest.notes_truncated === true || (typeof latest.notes === "string" && latest.notes.length > 32 * 1024),
     } : undefined,
+    stageRevision: hex(v.stage_revision, 64),
     progress: total ? Math.min(100, 100 * count(progress.done) / total) : undefined,
     failure: code(record(v.failure).code),
     busy: { servingConnections: count(busy.serving_connections), localWorkspace: busy.local_workspace === true },
     lastUpdate: outcome && at !== null && stableVersion(last.from) && stableVersion(last.to)
-      ? { from: last.from, to: last.to, outcome, at, detail: oneOf(last.detail, safeOutcomeDetails) } : undefined,
+      ? { from: last.from, to: last.to, outcome, at, failureCode: oneOf(last.failure_code, installFailures) } : undefined,
   };
 }
 
@@ -150,14 +151,54 @@ function updateBridge(endpoint: BridgeEndpoint) {
   };
 }
 
-export function verifiedOffer(s: UpdateState | null): Release | undefined {
+export function needsManualRecovery(last: LastUpdate | undefined) {
+  // Older launchers reported "install_failed" without a reason. Treat that
+  // as unclassified and fail closed instead of guessing from display text.
+  return last?.outcome === "install_failed" && (last.failureCode === undefined || last.failureCode === "stage_verification_failed");
+}
+
+export function verifiedOffer(s: UpdateState | null): UpdateOffer | undefined {
   if (!s?.canCheck || s.result !== "available" || s.error || s.anomaly || s.persistenceError
       || !s.latest || !newerVersion(s.latest.version, s.current.version)) return;
   // A failed restart should not immediately re-offer that same version on
   // the strength of the old check. Checking again never downloads anything.
   const last = s.lastUpdate;
+  if (needsManualRecovery(last) && last?.from === s.current.version && last.to === s.latest.version) return;
   if (last && last.outcome !== "updated" && last.to === s.latest.version && (s.lastCheckedAt ?? 0) <= last.at) return;
-  return s.latest;
+  const stage = s.phase === "ready" ? s.stageRevision ?? "legacy-ready" : null;
+  const identity = JSON.stringify([s.current.version, s.latest.version, s.latest.commit, s.latest.signedAt, s.lastCheckedAt, stage]);
+  return { ...s.latest, identity };
+}
+
+export const outcomeKey = (last: LastUpdate) => `${last.from}/${last.to}/${last.at}/${last.outcome}`;
+function validOutcomeKey(key: string) {
+  const [from, to, at, outcome, extra] = key.split("/");
+  return extra === undefined && stableVersion(from) && stableVersion(to) && /^[1-9]\d{0,15}$/.test(at)
+    && timestamp(Number(at)) !== null && oneOf(outcome, outcomes) !== undefined;
+}
+
+/** Device-local; the only persisted value is the outcome identity. An early
+ * dismissal wins over an outstanding read, and writes keep click order. */
+export function createOutcomeDismissal(storage: Pick<typeof Storage, "getItem" | "setItem">) {
+  const current = signal("");
+  let restored: Promise<void> | undefined;
+  let edited = false;
+  let writes = Promise.resolve();
+  return {
+    current,
+    restore() {
+      return restored ??= storage.getItem(DISMISSED_OUTCOME).then(key => {
+        if (!edited && key && validOutcomeKey(key)) current.set(key);
+      }).catch(() => {});
+    },
+    dismiss(key: string) {
+      if (!validOutcomeKey(key)) return Promise.resolve();
+      edited = true;
+      current.set(key);
+      writes = writes.then(() => storage.setItem(DISMISSED_OUTCOME, key)).catch(() => {});
+      return writes;
+    },
+  };
 }
 
 type Command = "check" | "settings" | "download" | "cancel" | "restart";
@@ -168,18 +209,26 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
   const bridge = endpoint && updateBridge(endpoint);
   const state = signal<UpdateState | null>(null);
   const readProblem = signal<string | null>(bridge ? null : "no_launcher");
-  const problem = signal<{ command: Command; code: string } | null>(null);
+  const problem = signal<{ command: Command; code: string; refusedIdentity?: string } | null>(null);
   const pending = signal<Command | null>(null);
   const cancelling = signal(false);
   const notice = signal<string | null>(null);
-  const needsCheck = signal(false);
-  const dismissedOutcome = signal("");
-  const offer = () => !needsCheck() && !readProblem() ? verifiedOffer(state()) : undefined;
+  const refusedOffers = signal<ReadonlySet<string>>(new Set());
+  const dismissal = createOutcomeDismissal(Storage);
+  const offer = () => {
+    const candidate = !readProblem() ? verifiedOffer(state()) : undefined;
+    return candidate && !refusedOffers().has(candidate.identity) ? candidate : undefined;
+  };
   const outcome = () => {
     const last = state()?.lastUpdate;
-    return last && outcomeKey(last) !== dismissedOutcome() ? last : undefined;
+    return last && outcomeKey(last) !== dismissal.current() ? last : undefined;
   };
-  const outcomeKey = (last: LastUpdate) => `${last.from}/${last.to}/${last.at}/${last.outcome}`;
+  function dismissOutcome(last: LastUpdate) {
+    const current = outcome();
+    const key = outcomeKey(last);
+    if (!current || outcomeKey(current) !== key) return;
+    void dismissal.dismiss(key);
+  }
   let started = false;
   let healthSent = false;
   let readInFlight: Promise<void> | undefined;
@@ -190,6 +239,8 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
   function publish(s: UpdateState) {
     state.set(s);
     readProblem.set(null);
+    const refusal = problem()?.refusedIdentity;
+    if (refusal && offer()) problem.set(null);
     if (cancelling() && !activeTransfer(s)) {
       cancelling.set(false);
       if (s.phase === "idle") notice.set("Download cancelled. No update was installed.");
@@ -228,7 +279,7 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
     return readInFlight;
   }
 
-  async function run(command: Command, act: () => Promise<UpdateState>): Promise<string | null> {
+  async function run(command: Command, act: () => Promise<UpdateState>, actedOn?: UpdateOffer): Promise<string | null> {
     ++revision;
     pending.set(command);
     problem.set(null);
@@ -239,14 +290,17 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
     try {
       const s = await act();
       ++revision; // No in-flight GET may overwrite a newer action response.
-      if (command === "check" && !s.error && !s.anomaly && s.result !== "error" && s.persistenceError !== "status_io") needsCheck.set(false);
       publish(s);
     } catch (e) {
       ++revision;
       refusal = e instanceof UpdateBridgeError ? e.code : "unavailable";
       if (command === "cancel") cancelling.set(false);
-      if (["not_latest", "not_ready", "not_verified", "not_in_app"].includes(refusal)) needsCheck.set(true);
-      if (refusal !== "would_interrupt") problem.set({ command, code: refusal });
+      // Capture the action's identity, not whichever offer a concurrent
+      // read happened to publish before the refusal arrived.
+      const refusedIdentity = ["not_latest", "not_ready", "not_verified", "not_in_app", "stage_verification_failed"].includes(refusal)
+        ? actedOn?.identity : undefined;
+      if (refusedIdentity) refusedOffers.set(new Set([...refusedOffers(), refusedIdentity]));
+      if (refusal !== "would_interrupt") problem.set({ command, code: refusal, refusedIdentity });
       // An apply can lose its reply during shutdown; never retry it for the
       // user. A refusal may also be racing with a newer release or busy work.
       await readInFlight;
@@ -261,7 +315,7 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
 
   return {
     state, readProblem, problem, pending, cancelling, notice, offer, outcome,
-    dismissOutcome: (last: LastUpdate) => dismissedOutcome.set(outcomeKey(last)),
+    dismissOutcome,
     refresh,
     /** Called by App only after the UI has a nonempty native layout. */
     start() {
@@ -273,6 +327,7 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
     /** Faster reads while the About page is open, without owning the lifecycle. */
     watch() {
       ++viewers;
+      void dismissal.restore();
       void refresh();
       return () => { --viewers; schedule(); };
     },
@@ -285,13 +340,13 @@ function createDesktopUpdates(endpoint: BridgeEndpoint | null) {
       if (!bridge || !state()?.canCheck || readProblem() || pending() || state()?.phase === "applying") return;
       return run("settings", () => bridge.settings(value));
     },
-    download(version: string) {
-      if (!bridge || !state()?.canUpdateInApp || state()?.phase !== "idle" || pending() || offer()?.version !== version) return;
-      return run("download", () => bridge.download(version));
+    download(target: UpdateOffer) {
+      if (!bridge || !state()?.canUpdateInApp || state()?.phase !== "idle" || pending() || offer()?.identity !== target.identity) return;
+      return run("download", () => bridge.download(target.version), target);
     },
-    restart(version: string, confirmInterrupt: boolean) {
-      if (!bridge || !state()?.canUpdateInApp || state()?.phase !== "ready" || pending() || offer()?.version !== version) return;
-      return run("restart", () => bridge.restart(version, confirmInterrupt));
+    restart(target: UpdateOffer, confirmInterrupt: boolean) {
+      if (!bridge || !state()?.canUpdateInApp || state()?.phase !== "ready" || pending() || offer()?.identity !== target.identity) return;
+      return run("restart", () => bridge.restart(target.version, confirmInterrupt), target);
     },
     cancel() {
       if (!bridge || !state()?.canUpdateInApp || !canCancel(state()) || readProblem() || pending() || cancelling()) return;
