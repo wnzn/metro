@@ -855,9 +855,9 @@ fn deep_and_long_expressions_are_refused_without_overflowing() {
         assert!(src.len() < super::tsx::MAX_SOURCE_BYTES);
         rejects(&space_page(&src), "at most 8 values");
     }
-    let eight = vec!["r.active"; 8].join(" ?? ");
+    let eight = ["r.active"; 8].join(" ?? ");
     ok(&space_page(&when(eight)));
-    let nine = vec!["r.active"; 9].join(" ?? ");
+    let nine = ["r.active"; 9].join(" ?? ");
     rejects(&space_page(&when(nine)), "at most 8 values");
     // Nesting, negation and long mixtures are bounded too.
     let parens = format!("{}r{}", "(".repeat(15_000), ")".repeat(15_000));
@@ -866,11 +866,11 @@ fn deep_and_long_expressions_are_refused_without_overflowing() {
         &space_page(&when(format!("{}r", "!".repeat(15_000)))),
         "nested too deeply",
     );
-    let wide = vec!["(!!!!!r.active)"; 8].join(" ?? ");
+    let wide = ["(!!!!!r.active)"; 8].join(" ?? ");
     rejects(&space_page(&when(wide)), "too long");
     let nested_chains = format!(
         "({0}) ?? ({0}) ?? ({0}) ?? ({0})",
-        vec!["(r.active ?? (r.items ?? (r.active ?? r.items)))"; 2].join(" ?? ")
+        ["(r.active ?? (r.items ?? (r.active ?? r.items)))"; 2].join(" ?? ")
     );
     let c = space_page(&when(nested_chains));
     if let Some(spec) = &c.spec {
@@ -912,11 +912,12 @@ fn control_and_direction_characters_are_refused_however_written() {
             let c = space_page(&page(&body));
             // Numeric entities for C0/C1 controls stay literal text (they
             // aren't decoded), which is harmless; everything else is refused.
-            if body.contains("&#x") && bad.is_control() {
-                if let Some(spec) = &c.spec {
-                    assert!(!serde_json::to_string(spec).unwrap().contains(bad));
-                    continue;
-                }
+            if body.contains("&#x")
+                && bad.is_control()
+                && let Some(spec) = &c.spec
+            {
+                assert!(!serde_json::to_string(spec).unwrap().contains(bad));
+                continue;
             }
             assert!(
                 c.spec.is_none(),
