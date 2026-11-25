@@ -533,7 +533,16 @@ export async function selectSpace(spaceId: string): Promise<void> {
   kick();
 }
 
-export async function createSpace(nameInput: string): Promise<boolean> {
+type CreateSpaceOptions = {
+  formIsCurrent: () => boolean;
+  attachRunner: (space: Space, fromOriginalForm: boolean, stillInCreatedSpace: () => boolean) => Promise<void>;
+};
+
+// Also catches a modal opened and closed while creating or checking the runner.
+let createSpaceContext = 0;
+onTransientClear(() => { createSpaceContext++; });
+
+export async function createSpace(nameInput: string, options?: CreateSpaceOptions): Promise<boolean> {
   const name = nameInput.trim();
   const c = client;
   if (!c || creatingSpace()) return false;
@@ -542,6 +551,8 @@ export async function createSpace(nameInput: string): Promise<boolean> {
     return false;
   }
   const ok = guard();
+  const source = createSpaceContext;
+  let created = false;
   batch(() => {
     creatingSpace.set(true);
     actionError.set(null);
@@ -549,11 +560,22 @@ export async function createSpace(nameInput: string): Promise<boolean> {
   try {
     const space = await c.createSpace(name);
     if (!ok()) return false;
+    created = true;
+    // Onboarding can unmount as soon as we publish the first Space. Check
+    // the submitting form before that expected transition.
+    const fromOriginalForm = source === createSpaceContext && !!options?.formIsCurrent();
+    const expectedContext = createSpaceContext + 1; // enterSpace clears transients once
+    const spaceOK = guard(space.id);
     spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
     await enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
     kick();
+    const stillInCreatedSpace = () => spaceOK() && createSpaceContext === expectedContext &&
+      basePlace() === "space" && activeSpaceId() === space.id;
+    if (options && stillInCreatedSpace()) await options.attachRunner(space, fromOriginalForm, stillInCreatedSpace);
     return true;
   } catch (error) {
+    // A follow-up failure must not turn a confirmed creation into a retry.
+    if (created) return ok();
     if (ok()) handleActionError(error, "Could not create the Space");
     return false;
   } finally {

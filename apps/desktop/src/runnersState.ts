@@ -22,11 +22,40 @@ const attachFeedback = signal<{ message: string; incomplete: boolean } | null>(n
 export const runnerAttachFeedback = () => attachFeedback();
 export const runnerAttachBusy = signal(false);
 
+const bridgeSessionMatches = computed(() => {
+  const h = helper();
+  return h.phase === "ready" && !!h.status.session && h.status.session.accountId === me() &&
+    h.status.session.serverUrl.replace(/\/+$/, "") === connectedTo();
+});
+
 export const installedRunnerChoice = computed(() => {
   const runner = installedRunner()?.runner;
   const owned = ownedInstalledRunner();
-  return runner && runner.id === owned?.id && owned.attachIfEmpty ? runner : null;
+  return bridgeSessionMatches() && runner && runner.id === owned?.id && owned.attachIfEmpty ? runner : null;
 });
+
+const installedChoiceId = computed(() => installedRunnerChoice()?.id ?? null);
+const reconnectingInstalled = computed(() => installedBusy() === "reconnect");
+let installedChoiceEpoch = 0;
+effect(() => {
+  installedChoiceId();
+  // Starting a reconnect can rebind even a runner with the same id.
+  reconnectingInstalled();
+  installedChoiceEpoch++;
+});
+
+/** Capture the exact choice at submission; a lost or different choice cannot regain consent. */
+export function snapshotInstalledRunner(displayedId: string) {
+  if (installedChoiceId() !== displayedId || reconnectingInstalled()) return null;
+  const epoch = installedChoiceEpoch;
+  const key = runnerSessionKey();
+  const sessionOK = sessionGuard();
+  return {
+    id: displayedId,
+    isCurrent: () => sessionOK() && runnerSessionKey() === key &&
+      installedChoiceEpoch === epoch && installedChoiceId() === displayedId && !reconnectingInstalled(),
+  };
+}
 
 const isEmptyOwned = (s: Space) => s.role === "owner" && s.runnerPaired === false;
 
@@ -66,7 +95,7 @@ export function watchInstalledRunner(refreshFoldersOnOpen = false) {
   watchers.set(untracked(watchers) + 1);
   cleanup(() => watchers.set(untracked(watchers) - 1));
   if (refreshFoldersOnOpen) effect(() => {
-    if (!offerKey() || helper().phase === "checking") return;
+    if (!offerKey() || !bridgeSessionMatches()) return;
     const valid = sessionGuard();
     let wanted = true;
     cleanup(() => { wanted = false; });
@@ -81,14 +110,14 @@ effect(() => {
 });
 
 effect(() => {
-  if (!watching() || !offerKey() || helper().phase === "checking") return;
+  if (!watching() || !offerKey() || !bridgeSessionMatches()) return;
   // Initial read is independent of the offer, so Create can still use the
   // verified runner after dismissal or when there are no existing Spaces.
   untracked(() => void loadInstalledRunner(false));
 });
 
 const shouldWatchOffer = computed(() => {
-  if (!watching() || helper().phase === "checking" || !installedRunnerStatusWatchable() ||
+  if (!watching() || !bridgeSessionMatches() || !installedRunnerStatusWatchable() ||
       runnerAttachBusy() || installedBusy() || ownedInstalledRunner()?.attachIfEmpty === false) return false;
   const key = offerKey();
   const state = offer();
@@ -132,6 +161,62 @@ function actionError(error: unknown, fallback: string) {
   if (error.status === 404 || error.status === 405) return "The requested action or item is no longer available on this server.";
   if (error.kind === "timeout" || error.kind === "network") return "The server did not confirm the action. Check again before retrying.";
   return fallback;
+}
+
+/** Called only after Create Space succeeds, with the id returned by that creation. */
+export async function attachCreatedSpaceRunner(
+  space: Space,
+  choice: NonNullable<ReturnType<typeof snapshotInstalledRunner>>,
+  stillConsented: () => boolean,
+): Promise<{ offline: boolean } | { reason: string }> {
+  const c = apiClient();
+  const sid = space.id;
+  const sessionOK = sessionGuard();
+  const spaceOK = sessionGuard(sid);
+  const ownsSpace = () => spaces().some((s) => s.id === sid && s.role === "owner");
+  const consentChanged = { reason: "The Create Space choice changed" };
+  const runnerChanged = { reason: "This computer's runner is no longer available for this account" };
+  const notOwner = { reason: "You no longer own this Space" };
+  const alreadyPaired = { reason: "This Space already has a runner" };
+  const unsupported = { reason: "This server doesn't support safe attachment to empty Spaces" };
+  if (!c || !stillConsented()) return consentChanged;
+  if (!choice.isCurrent()) return runnerChanged;
+  if (!spaceOK() || space.role !== "owner" || !ownsSpace()) return notOwner;
+  try {
+    const [local, inventory, liveSpaces] = await Promise.all([readInstalledRunner(), c.listRunnerInventory(), c.listSpaces()]);
+    if (!stillConsented()) return consentChanged;
+    if (!spaceOK() || !ownsSpace()) return notOwner;
+    if (!inventory.attachIfEmpty) return unsupported;
+    if (!choice.isCurrent() || local?.runner?.id !== choice.id ||
+        !inventory.runners.some((r) => r.id === choice.id && r.visibility === "personal" && r.canManage)) return runnerChanged;
+    const live = liveSpaces.find((s) => s.id === sid);
+    if (live?.role !== "owner") return notOwner;
+    if (live.runnerPaired !== false) {
+      setRunnerPaired(sid, true);
+      return alreadyPaired;
+    }
+    // The server repeats ownership and emptiness checks atomically. No fallback
+    // to the replacing route, including for servers missing this endpoint.
+    const result = await c.attachRunnerIfEmpty(sid, choice.id);
+    if (sessionOK()) {
+      dismissRunnerOffer();
+      if (spaceOK() && ownsSpace()) {
+        setRunnerPaired(sid, true);
+        spaceRunners.set({ ...spaceRunners(), [sid]: result });
+        if (choice.isCurrent()) recordAttachedFolder({ id: sid, name: space.name });
+      }
+    }
+    return { offline: local.state !== "online" };
+  } catch (error) {
+    if (error instanceof ApiError && error.status === 409) {
+      if (spaceOK() && ownsSpace()) setRunnerPaired(sid, true);
+      return alreadyPaired;
+    }
+    if (error instanceof ApiError && (error.status === 404 || error.status === 405)) {
+      return { reason: "The safe attachment route or runner is no longer available on this server" };
+    }
+    return { reason: actionError(error, "The server did not confirm the attachment").replace(/\.$/, "") };
+  }
 }
 
 /** Uses the same non-replacing route for every selected Space, one at a time. */

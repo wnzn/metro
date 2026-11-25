@@ -60,6 +60,7 @@ import type { AskAgentChoice } from "../ui";
 import type { SpaceAgent } from "../api/spaces";
 import { RESERVED_HANDLE } from "../api/spaces";
 import { Composer, ConnectionBanner, fillDraft, focusComposer, Transcript } from "./Conversation";
+import { NewSpaceRunnerFeedback } from "./CreateSpaceForm";
 import type { DraftIdea } from "./Conversation";
 import { mentionText } from "./eventKinds";
 import { PersonAvatar } from "./profile/PersonAvatar";
@@ -90,6 +91,7 @@ export function SpaceView() {
   return (
     <Surface variant="panel" grow testID="space-view">
       <ConnectionBanner />
+      <NewSpaceRunnerFeedback />
       <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
       <RoomComposer />
     </Surface>
