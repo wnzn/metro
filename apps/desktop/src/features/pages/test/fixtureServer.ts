@@ -39,6 +39,7 @@ export function pagesFixture() {
   let nextId = 1;
   const state = { revision: 3, delayPage: "", delay: 0, dataDelay: 0, draftDelay: 0, previewDelay: 0,
     actionDelay: 0, createDelay: 0, restoreDelay: 0, modelDelay: 0, answer: "", linkedPage: PERSONAL,
+    runStatus: "running", runReads: 0, answerStatus: "done", actionError: "", dataError: "", draftError: "", previewError: "", defaultAgent: true,
     denyDraftRead: false, liveRoom: "Renamed room", liveAgent: "renamed_agent", liveAgentName: "Renamed agent",
     stale: false, staleSource: false, outside: false, generating: 0, started: 0, applied: 0 };
   const visible = (p: PageMeta, user: string) => p.scope === "personal" ? p.creator_id === user : !!p.space_id && f.state.spaces.get(p.space_id)?.members.has(user);
@@ -72,7 +73,7 @@ export function pagesFixture() {
     const confirm = !confirmations.has(`${user}/${p.id}/${p.head_version}`);
     return { ...sampleData, version: p.head_version,
       data: state.answer || (p.id === PERSONAL && state.started) ? { ...sampleData.data, answer: { ok: true, value: {
-        text: state.answer || "Private page-only answer", status: "done",
+        text: state.answer || (state.answerStatus === "done" ? "Private page-only answer" : ""), status: state.answerStatus,
       } } } : sampleData.data,
       actions: { ...sampleData.actions, other: { enabled: true, page_id: state.linkedPage }, ask: { enabled: true, confirm }, run: p.scope === "personal" ? { enabled: false, reason: "Space only" } : { enabled: true, confirm, schedule_revision: state.revision } } };
   }
@@ -86,7 +87,11 @@ export function pagesFixture() {
       }
       if (pathname === "/v1/spaces/acme/agents" && req.method === "GET") {
         return ok({ agents: [{ id: "sa_fixture", space_id: "acme", handle: "agent", name: "Agent",
-          description: "Fixture", is_default: true, instructions: "", tools: [] }] });
+          description: "Fixture", is_default: state.defaultAgent, instructions: "", tools: [] }] });
+      }
+      if (pathname === "/v1/runs/run_page_fixture" && req.method === "GET") {
+        state.runReads++;
+        return ok({ id: "run_page_fixture", space_id: "acme", room_id: "lobby", status: state.runStatus, actor: "alice", task: "brief" });
       }
       if (pathname === "/v1/schedules" && req.method === "GET") return ok({ tasks: [] });
       return response;
@@ -123,6 +128,7 @@ export function pagesFixture() {
       if (method === "DELETE") { privateDrafts.delete(op!); return { status: 204 }; }
       if (detail !== "apply" && state.denyDraftRead) return { ...fail(404, "no such draft"), delay: state.draftDelay };
       if (detail === "data") {
+        if (state.previewError) return fail(503, state.previewError);
         const { version: _version, ...fixture } = sampleData;
         return { ...ok({ ...fixture, data: state.answer ? { ...fixture.data, answer: { ok: true, value: { text: state.answer, status: "done" } } } : fixture.data }),
           delay: state.previewDelay };
@@ -145,7 +151,7 @@ export function pagesFixture() {
         state.generating--;
         return { ...ok({ ...d, status: "generating", spec: null, source: null }), delay: state.draftDelay };
       }
-      return { ...ok(d), delay: state.draftDelay };
+      return { ...ok(state.draftError ? { ...d, status: "failed", error: state.draftError, spec: null, source: null } : d), delay: state.draftDelay };
     }
     const page = entries.get(id);
     if (!page || !visible(page, user) || (page.deleted_at && op !== "undelete")) return fail(404, "no such page");
@@ -154,14 +160,14 @@ export function pagesFixture() {
       if (body.base_version && body.base_version !== page.head_version) return fail(409, "head changed", { head_version: page.head_version });
       return ok(caps(save(id, { title: body.title ?? page.title, icon: body.icon ?? null, members_edit: body.members_edit ?? page.members_edit }, "rename", user), user));
     }
-    if (!op && method === "DELETE") { entries.set(id, { ...page, deleted_at: stamp }); return { status: 204 }; }
+    if (!op && method === "DELETE") { entries.set(id, { ...page, deleted_at: new Date().toISOString() }); return { status: 204 }; }
     if (!op) return { ...ok(view), delay: state.delayPage === id ? state.delay : 0 };
     if (op === "prefs") { prefs.set(`${user}/${id}`, body.pinned); return ok({ pinned: body.pinned, position: null }); }
     if (op === "undelete") {
       entries.set(id, { ...page, deleted_at: null });
       return { ...ok(caps(entries.get(id)!, user)), delay: state.restoreDelay };
     }
-    if (op === "data") return { ...ok(dataOf(page, user)), delay: state.dataDelay };
+    if (op === "data") return { ...(state.dataError ? fail(503, state.dataError) : ok(dataOf(page, user))), delay: state.dataDelay };
     if (op === "versions") {
       if (!detail && method === "POST") {
         if (state.staleSource) {
@@ -198,7 +204,8 @@ export function pagesFixture() {
       if (schedule && body.schedule_revision !== state.revision) return fail(409, "schedule changed", { schedule_revision: state.revision });
       confirmations.add(key);
       state.started++;
-      return { ...(schedule ? ok({ kind: "runSchedule", run: { status: "done", detail: null } }) : ok({ kind: "runAgent", started: true }, 202)),
+      return { ...(schedule ? ok({ kind: "runSchedule", run: { status: "done", detail: null } })
+        : ok({ kind: "runAgent", started: !state.actionError, error: state.actionError || undefined, run_id: "run_page_fixture", room_id: "lobby" }, 202)),
         delay: state.actionDelay };
     }
     return fail(404, "unknown Pages fixture request");

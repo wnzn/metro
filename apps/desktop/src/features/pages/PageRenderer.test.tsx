@@ -20,6 +20,23 @@ test("PageSpec fixture draws native blocks, tables, repeated conditions and deni
   expect(text()).toContain("Preview only");
 });
 
+test("A wide table owns its labelled horizontal scroll", async () => {
+  const app = await open("./test/pages.fixture.tsx", { width: 720, height: 480, platform: "linux" });
+  await app.press("id:fixture-wide-table");
+  await app.waitFor("label:Run details, scroll horizontally");
+  await app.scroll("id:page-table-scroll", 900);
+  await app.waitFor("text:Column 10");
+});
+
+test("Page Markdown uses underlined, high-contrast link ink", async () => {
+  const app = await open("./test/pages.fixture.tsx", { width: 1100, height: 850, platform: "linux" });
+  await app.setColorScheme("dark");
+  await app.waitFor("id:page-block:markdown");
+  const link = app.spanStyle("id:page-block:markdown >> text:release");
+  expect(link.color.toLowerCase()).toBe("#a6c8ffff");
+  expect(link.underline).toBe(true);
+});
+
 test("only own scalar data paths and supported blocks are interpreted", () => {
   let accessed = false;
   const hostile = Object.assign(Object.create({ hidden: "inherited" }), { ok: "visible" });
