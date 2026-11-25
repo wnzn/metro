@@ -1109,6 +1109,111 @@ async fn a_thread_may_fetch_what_a_person_wrote_in_the_parent_room_not_its_task_
 }
 
 #[tokio::test]
+async fn removed_initiator_cannot_claim_or_receive_queued_space_web_work() {
+    // One process-wide subscriber, so a concurrent test's first use of the
+    // enqueue callsite doesn't make the event invisible to this fixture.
+    #[derive(Clone, Default)]
+    struct QueueTrace {
+        bytes: Arc<std::sync::Mutex<Vec<u8>>>,
+        changed: Arc<tokio::sync::Notify>,
+    }
+    impl std::io::Write for QueueTrace {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.bytes.lock().unwrap().extend_from_slice(bytes);
+            self.changed.notify_waiters();
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let trace = QueueTrace::default();
+    let writer = trace.clone();
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_env_filter(tracing_subscriber::EnvFilter::new(
+                "metro_server::device_relay=debug",
+            ))
+            .with_writer(move || writer.clone())
+            .finish(),
+    )
+    .unwrap();
+
+    for remove_after_claim in [false, true] {
+        let s = Server::start().await;
+        let sid = s.space(BOB, &["alice"]).await;
+        s.agent_tools(BOB, &sid, json!(["web_search"])).await;
+        let (_, model) = s.chat_device(ALICE).await;
+        let (web_id, web) = s.web_device(ALICE, "laptop").await;
+        s.idle(&web).await;
+        let room = format!("/v1/spaces/{sid}/rooms/lobby");
+        let (status, _) = s
+            .post(
+                ALICE,
+                &format!("{room}/messages"),
+                json!({"text": "@agent search"}),
+            )
+            .await;
+        assert_eq!(status, StatusCode::ACCEPTED);
+        let job = s.model_job(&model).await;
+        assert!(tool_names(&job).iter().any(|name| name == "web_search"));
+        s.reply_tool(
+            &model,
+            &job,
+            "web_search",
+            json!({"query": "loopback fixture query"}),
+        )
+        .await;
+        let marker = format!("connection={web_id}");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let changed = trace.changed.notified();
+                let queued = String::from_utf8_lossy(&trace.bytes.lock().unwrap())
+                    .lines()
+                    .any(|line| line.contains("device job queued") && line.contains(&marker));
+                if queued {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("the web job reached the relay queue");
+        let claimed = if remove_after_claim {
+            Some(s.job(&web, &json!({})).await)
+        } else {
+            None
+        };
+        // Commit removal without stopping the run: exercise the claim and
+        // result checks even in the gap before an HTTP removal stops it.
+        s.state.db.remove_member(&sid, "alice").unwrap();
+        if let Some(job) = claimed {
+            assert_eq!(
+                s.answer(&web, &job, search_answer()).await,
+                StatusCode::NO_CONTENT
+            );
+        } else {
+            let (status, _) = s.post(&web, "/v1/device/claim", json!({})).await;
+            assert_eq!(
+                status,
+                StatusCode::NO_CONTENT,
+                "claim released a Space payload"
+            );
+        }
+        let events = s
+            .wait_for(
+                BOB,
+                &format!("{room}/events"),
+                "error",
+                "lost access to the Space",
+            )
+            .await;
+        assert!(!events.iter().any(|event| event["kind"] == "tool_result"));
+    }
+}
+
+#[tokio::test]
 async fn revoking_the_tool_mid_run_refuses_the_next_call_without_a_job() {
     let s = Server::start().await;
     let sid = s.space(BOB, &["alice"]).await;

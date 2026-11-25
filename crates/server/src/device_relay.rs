@@ -1320,12 +1320,13 @@ impl DeviceRelay {
         .await
     }
 
-    /// One web job (`web_search` / `web_fetch`) on `owner`'s own web device
-    /// `connection`, never borrowed, with its own `run_timeout`.
+    /// One web job on the initiator's own device, never borrowed, with the
+    /// operation's own timeout. A Space caller is checked at claim and
+    /// result delivery; a personal caller has no Space.
     pub async fn dispatch_web(
         &self,
         db: &Db,
-        owner: &str,
+        caller: &Caller,
         connection: &str,
         operation: Operation,
         request: Value,
@@ -1337,7 +1338,7 @@ impl DeviceRelay {
         let size = metro_model_protocol::json_len(&request);
         self.dispatch_sized(
             db,
-            &Caller::personal(owner),
+            caller,
             connection,
             operation,
             request,

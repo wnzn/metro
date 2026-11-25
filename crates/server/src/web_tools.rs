@@ -34,7 +34,7 @@ use metro_model_protocol::web_privacy;
 
 use crate::AppState;
 use crate::db::{Activity, Addressed, Author, Event, actor, kind};
-use crate::device_relay::{DeviceError, Operation};
+use crate::device_relay::{Caller, DeviceError, Operation};
 use crate::monitoring::Code;
 use crate::tools::truncate;
 use crate::web_devices::Unavailable;
@@ -971,7 +971,13 @@ fn device_error_text(tool: &str, whose: &str, e: &DeviceError) -> (String, &'sta
             format!("{what} couldn't run: {whose} computer didn't answer in time."),
             "timed_out",
         ),
-        DeviceError::CredentialChanged | DeviceError::AccessRevoked => (
+        DeviceError::AccessRevoked => (
+            format!(
+                "{what} couldn't run: the person who started the run lost access to the Space."
+            ),
+            "revoked",
+        ),
+        DeviceError::CredentialChanged => (
             format!(
                 "{what} couldn't run: web search on {whose} computer was removed or set up again \
                  while it ran."
@@ -1269,12 +1275,16 @@ impl WebContext {
         } else {
             SEARCH_RUN_TIMEOUT
         };
+        let caller = match &self.scope {
+            WebScope::Room { space_id, .. } => Caller::in_space(self.user(), space_id),
+            WebScope::Personal => Caller::personal(self.user()),
+        };
         let response = match self
             .state
             .device
             .dispatch_web(
                 &self.state.db,
-                self.user(),
+                &caller,
                 &device,
                 operation,
                 request,

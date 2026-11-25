@@ -421,7 +421,7 @@ mod tests {
                 relay
                     .dispatch_web(
                         &db,
-                        "alice",
+                        &crate::device_relay::Caller::personal("alice"),
                         &id,
                         Operation::WebSearch,
                         json!({"v": 1}),
@@ -500,7 +500,7 @@ mod tests {
                 relay
                     .dispatch_web(
                         &db,
-                        "alice",
+                        &crate::device_relay::Caller::personal("alice"),
                         &id,
                         Operation::WebSearch,
                         json!({"v": 1}),
@@ -588,7 +588,7 @@ mod tests {
         let err = relay
             .dispatch_web(
                 &db,
-                "bob",
+                &crate::device_relay::Caller::personal("bob"),
                 &id,
                 Operation::WebSearch,
                 json!({"v": 1}),
@@ -601,7 +601,7 @@ mod tests {
         let err = relay
             .dispatch_web(
                 &db,
-                "alice",
+                &crate::device_relay::Caller::personal("alice"),
                 &id,
                 Operation::WebSearch,
                 json!({"v": 1}),
