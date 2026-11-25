@@ -783,6 +783,14 @@ impl<'a> Engine<'a> {
             }
         }
         if served == 0 && !report.failed.is_empty() {
+            // An explicit Space search that lost access in flight is a
+            // missing Space, not an upstream outage. Recheck membership
+            // rather than inferring it from the model's error.
+            if let [Source::Space(sid)] = sources
+                && !self.member(sid).await?
+            {
+                return Err(LibrarySearchError::NotFound("space"));
+            }
             return Err(LibrarySearchError::Upstream(format!(
                 "file search is unavailable: {}",
                 report.failed[0]

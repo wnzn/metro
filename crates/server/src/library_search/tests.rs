@@ -533,6 +533,7 @@ struct Sent {
 }
 
 type Hook = Box<dyn Fn() + Send + Sync>;
+type QueryHook = Box<dyn Fn() -> Option<MediaError> + Send + Sync>;
 
 struct Fixture {
     sent: Mutex<Vec<Sent>>,
@@ -547,7 +548,7 @@ struct Fixture {
     /// Runs while an asset request is "in flight".
     on_embed: Mutex<Option<Hook>>,
     /// Runs while a query request is "in flight".
-    on_query: Mutex<Option<Hook>>,
+    on_query: Mutex<Option<QueryHook>>,
     /// Destinations whose connection is temporarily unavailable.
     outage: std::sync::Arc<Mutex<std::collections::HashSet<String>>>,
     /// Make the text model return words that aren't in the file.
@@ -661,13 +662,14 @@ impl MediaModels for Fixture {
         };
         let is_asset = sent.bytes_sha.is_some();
         self.sent.lock().unwrap().push(sent);
-        let hook = if is_asset {
-            &self.on_embed
-        } else {
-            &self.on_query
-        };
-        if let Some(hook) = hook.lock().unwrap().as_ref() {
-            hook();
+        if is_asset {
+            if let Some(hook) = self.on_embed.lock().unwrap().as_ref() {
+                hook();
+            }
+        } else if let Some(hook) = self.on_query.lock().unwrap().as_ref()
+            && let Some(error) = hook()
+        {
+            return Box::pin(async move { Err(error) });
         }
         let fabricate = *self.fabricate.lock().unwrap();
         let media = self.media.lock().unwrap().get(c).copied() == Some(true);
@@ -2740,6 +2742,7 @@ async fn removed_while_the_query_embeds_gets_nothing() {
     let (db, s2) = (w.db.clone(), sid.clone());
     *w.fx.on_query.lock().unwrap() = Some(Box::new(move || {
         db.remove_member(&s2, "bob").unwrap();
+        None
     }));
     w.fx.nouls
         .lock()
@@ -2751,6 +2754,42 @@ async fn removed_while_the_query_embeds_gets_nothing() {
         .unwrap();
     assert!(s.results.is_empty());
     assert!(w.fx.decided().is_empty(), "no excerpt left for System One");
+    assert_eq!(w.segments("bob"), 0);
+}
+
+#[tokio::test]
+async fn failed_query_after_membership_loss_reads_as_not_found() {
+    let w = World::new();
+    let sid = w.space("alice", &["bob"]);
+    w.upload(
+        "s",
+        "alice",
+        Some(&sid),
+        "s.txt",
+        "text/plain",
+        INVOICE_DOC.into(),
+    );
+    w.index("bob", "s").await.unwrap();
+    // A provider failure while access still holds stays an upstream error.
+    *w.fx.on_query.lock().unwrap() =
+        Some(Box::new(|| Some(MediaError::transient("endpoint offline"))));
+    assert!(matches!(
+        w.search("bob", false, Scope::Space, Some(&sid), "invoice", None)
+            .await,
+        Err(LibrarySearchError::Upstream(_))
+    ));
+    // The typed provider withholds this result after Bob is removed.
+    let (db, space) = (w.db.clone(), sid.clone());
+    *w.fx.on_query.lock().unwrap() = Some(Box::new(move || {
+        db.remove_member(&space, "bob").unwrap();
+        Some(MediaError::gone("access revoked"))
+    }));
+    assert!(matches!(
+        w.search("bob", false, Scope::Space, Some(&sid), "invoice", None)
+            .await,
+        Err(LibrarySearchError::NotFound("space"))
+    ));
+    assert!(w.fx.decided().is_empty());
     assert_eq!(w.segments("bob"), 0);
 }
 
