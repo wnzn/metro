@@ -44,6 +44,48 @@ pub enum Phase {
     Translation,
 }
 
+/// The class of a successful answer's `content-type`, never the raw header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MediaType {
+    /// `text/event-stream`.
+    EventStream,
+    /// `application/json`.
+    Json,
+    /// Any other media type.
+    Other,
+    /// No usable `content-type` header.
+    Missing,
+}
+
+impl MediaType {
+    /// Classifies a raw `content-type` header value. Only the class is kept.
+    pub(crate) fn classify(raw: Option<&str>) -> Self {
+        let Some(raw) = raw else {
+            return MediaType::Missing;
+        };
+        let essence = raw.split(';').next().unwrap_or("").trim();
+        if essence.is_empty() {
+            MediaType::Missing
+        } else if essence.eq_ignore_ascii_case("text/event-stream") {
+            MediaType::EventStream
+        } else if essence.eq_ignore_ascii_case("application/json") {
+            MediaType::Json
+        } else {
+            MediaType::Other
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            MediaType::EventStream => "event_stream",
+            MediaType::Json => "json",
+            MediaType::Other => "other",
+            MediaType::Missing => "missing",
+        }
+    }
+}
+
 /// The value used for a code or parameter outside the allowlists.
 pub const UNRECOGNIZED: &str = "unrecognized";
 
@@ -149,6 +191,7 @@ pub(crate) struct Detail {
     pub status: Option<u16>,
     pub code: Option<&'static str>,
     pub param: Option<&'static str>,
+    pub media: Option<MediaType>,
 }
 
 impl Detail {
@@ -158,6 +201,7 @@ impl Detail {
             status: None,
             code: None,
             param: None,
+            media: None,
         }
     }
 
@@ -167,7 +211,13 @@ impl Detail {
             status: status(raw_status),
             code: provider_code(code),
             param: param(param_),
+            media: None,
         }
+    }
+
+    pub fn with_media(mut self, media: MediaType) -> Self {
+        self.media = Some(media);
+        self
     }
 }
 
@@ -196,6 +246,10 @@ pub struct LocalFailure {
     provider_code: Option<&'static str>,
     provider_param: Option<&'static str>,
     code: &'static str,
+    /// Omitted when unknown, so records written before it existed stay
+    /// canonical.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_type: Option<MediaType>,
 }
 
 impl LocalFailure {
@@ -208,7 +262,14 @@ impl LocalFailure {
             provider_code: d.code,
             provider_param: d.param,
             code: category.code(),
+            media_type: d.media,
         }
+    }
+
+    /// The class of a successful answer's `content-type`, when the failure
+    /// was about the answer's shape.
+    pub fn media_type(&self) -> Option<MediaType> {
+        self.media_type
     }
 
     pub fn operation(&self) -> Operation {
@@ -258,12 +319,17 @@ impl LocalFailure {
             .http_status
             .map(|s| s.to_string())
             .unwrap_or_else(|| "none".into());
-        format!(
+        let mut s = format!(
             "{} operation={op} phase={phase} http_status={status} provider_code={} provider_param={}",
             self.code,
             self.provider_code.unwrap_or("none"),
             self.provider_param.unwrap_or("none"),
-        )
+        );
+        if let Some(m) = self.media_type {
+            s += " media_type=";
+            s += m.as_str();
+        }
+        s
     }
 }
 
@@ -280,6 +346,8 @@ impl<'de> Deserialize<'de> for LocalFailure {
             provider_code: Option<String>,
             provider_param: Option<String>,
             code: String,
+            #[serde(default)]
+            media_type: Option<MediaType>,
         }
         let r = Raw::deserialize(d)?;
         Ok(Self {
@@ -293,6 +361,7 @@ impl<'de> Deserialize<'de> for LocalFailure {
                 .map(|c| c.code())
                 .find(|c| *c == r.code)
                 .unwrap_or(UNRECOGNIZED),
+            media_type: r.media_type,
         })
     }
 }
@@ -360,6 +429,56 @@ mod tests {
                 "operation": "catalog", "phase": "http", "http_status": null,
                 "provider_code": null, "provider_param": null, "code": "chatgpt_rejected",
                 "message": "x"
+            }))
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn media_type_is_a_closed_class() {
+        assert_eq!(MediaType::classify(None), MediaType::Missing);
+        assert_eq!(MediaType::classify(Some("  ")), MediaType::Missing);
+        assert_eq!(
+            MediaType::classify(Some("Text/Event-Stream; charset=utf-8")),
+            MediaType::EventStream
+        );
+        assert_eq!(
+            MediaType::classify(Some("application/json")),
+            MediaType::Json
+        );
+        assert_eq!(
+            MediaType::classify(Some("text/html; SENSITIVE")),
+            MediaType::Other
+        );
+
+        let f = LocalFailure::new(
+            Operation::Inference,
+            Some(Detail::http(Phase::Http, 200, None, None).with_media(MediaType::Other)),
+            Category::UnusableResponse,
+        );
+        let v = serde_json::to_value(f).unwrap();
+        assert_eq!(v["media_type"], "other");
+        let back: LocalFailure = serde_json::from_value(v).unwrap();
+        assert_eq!(back, f);
+        assert_eq!(back.media_type(), Some(MediaType::Other));
+        assert!(f.summary().ends_with(" media_type=other"));
+
+        // Records written before the field existed stay canonical.
+        let old = LocalFailure::new(
+            Operation::Inference,
+            Some(Detail::http(Phase::Http, 503, None, None)),
+            Category::ServiceOrRouting,
+        );
+        let v = serde_json::to_value(old).unwrap();
+        assert!(v.get("media_type").is_none());
+        assert!(!old.summary().contains("media_type"));
+
+        // Only the closed vocabulary is accepted.
+        assert!(
+            serde_json::from_value::<LocalFailure>(serde_json::json!({
+                "operation": "inference", "phase": "http", "http_status": 200,
+                "provider_code": null, "provider_param": null,
+                "code": "chatgpt_unusable_response", "media_type": "text/html"
             }))
             .is_err()
         );

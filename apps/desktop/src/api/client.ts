@@ -6,18 +6,22 @@ import { discoveryApi } from "./discovery";
 import { libraryApi } from "./library";
 import { monitoringApi } from "./monitoring";
 import { profileApi } from "./profile";
+import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
 
 /** `parentRoomId`: set on a thread an agent delegated from that room. */
 export type Room = { id: string; name: string; parentRoomId?: string };
 /**
  * Who a message addresses: the Space's agent, or a member by their stable
- * user id. On received events only, an agent mention may say it wasn't typed:
+ * user id. An agent mention with `agentId` names one of the Space's agents
+ * (`@handle`); without it, it is the generic `@agent` (the Space's default
+ * agent, or the sender's classifier pick). `handle` is only the draft's text
+ * for it (`@coder`), never sent. On received events only, an agent mention may say it wasn't typed:
  * `classifier` (the sender's opt-in System One judgement started the agent
  * from an unaddressed message) or `schedule` (the creator's scheduled
  * prompt). The server sets it; the app never sends it.
  */
-export type Mention = { kind: "agent"; addressedBy?: "classifier" | "schedule" } | { kind: "user"; id: string };
+export type Mention = { kind: "agent"; agentId?: string; handle?: string; addressedBy?: "classifier" | "schedule" } | { kind: "user"; id: string };
 /** For messages: who it was addressed to ("room" = nobody in particular). */
 export type Audience = "room" | "agent" | "users" | "mixed";
 /** Where a turn's activity comes from: an agent run, or the deterministic Demo (no model). */
@@ -29,7 +33,19 @@ export type ActivityPhase = "started" | "completed" | "failed" | "cancelled" | "
  * event of the turn — its lifecycle (`kind: "activity"`), tool calls and
  * results — carries the same `id`, `name` and `source`.
  */
-export type EventActivity = { id: string; name: string; source: ActivitySource; phase?: ActivityPhase; route?: ActivityRoute };
+export type EventActivity = {
+  id: string;
+  name: string;
+  source: ActivitySource;
+  phase?: ActivityPhase;
+  route?: ActivityRoute;
+  /** The Space agent working this turn, on every event of it (absent in personal Chat, Demo and older history). */
+  agent?: EventAgent;
+  /** Only on a Space turn's `started` marker: how its agent was chosen ("Picked by classifier: Coder"). */
+  pick?: string;
+};
+/** A Space agent as a run's events show it: enough for its name and avatar. */
+export type EventAgent = { id: string; handle: string; name: string; avatar_version?: string; color: string };
 
 /** Where a turn's model came from (`activity.route` on its `started` marker). */
 export type RouteSource = "override" | "case" | "routing_default" | "default" | "environment" | "inherited";
@@ -149,7 +165,66 @@ export type ProviderConnection = {
   capability: Capability | null;
   /** null: the server didn't say (an older server shares nothing). */
   visibility: ShareVisibility | null;
+  /** The connection's own model list (owner only); empty on an older server. */
+  models: ConnectionModel[];
+  /** Its models take thinking options set by the owner (self-hosted OpenAI-compatible endpoints). */
+  customThinking: boolean;
+  /** Why the model list couldn't be fetched when it was created (`fetch_models`). */
+  modelsError?: string | null;
 };
+
+/** How a chosen thinking level is sent to a self-hosted model. */
+export type EffortWire = "none" | "reasoning_effort" | "reasoning";
+/** A self-hosted model's thinking options, set by the connection's owner. */
+export type ModelThinking = { efforts: string[]; wire: EffortWire };
+
+/** One model of a connection (GET /v1/providers/{id}/model-list). */
+export type ConnectionModel = {
+  modelId: string;
+  /** What pickers show: the owner's name, else the provider's, else the id. */
+  displayName: string;
+  customName: string | null;
+  listedName: string | null;
+  enabled: boolean;
+  /** false: the provider's last listing no longer had it. */
+  available: boolean;
+  source: "listed" | "manual";
+  position: number;
+  /** The connection's default model. */
+  isDefault: boolean;
+  thinking: ModelThinking | null;
+  reasoningEfforts: string[];
+};
+
+/** A connection's model list as the server answers a change to it. */
+export type ConnectionModelList = { connectionId: string; defaultModel: string | null; customThinking: boolean; models: ConnectionModel[] };
+
+/** What a refresh of a connection's model list did. */
+export type ModelRefresh = { models: string[]; added: number; unavailable: number; connection: ProviderConnection | null };
+
+export type NewConnectionModel = { model_id: string; display_name?: string; thinking?: ModelThinking };
+export type ConnectionModelPatch = { model_id: string; display_name?: string | null; enabled?: boolean; thinking?: ModelThinking | null; position?: number; default?: true };
+
+/** A chat model in the grouped picker (GET /v1/models/available `chat_providers`). */
+export type PickerModel = { id: string; displayName: string; reasoningEfforts: string[]; isDefault: boolean; available: boolean };
+/** One connection in the grouped picker; `connectionId` null is the operator's model (send no connection). */
+export type PickerConnection = {
+  connectionId: string | null;
+  name: string;
+  owned: boolean;
+  ownerId: string | null;
+  visibility: ShareVisibility | null;
+  runsOn: string;
+  billing: string;
+  ready: boolean | null;
+  isDefault: boolean;
+  defaultModel: string | null;
+  operator: boolean;
+  models: PickerModel[];
+};
+export type PickerProvider = { providerId: string; providerName: string; connections: PickerConnection[] };
+/** GET /v1/models/available in full. */
+export type AvailableCatalog = { models: AvailableModel[]; chatProviders: PickerProvider[] | null; operatorModel: { modelId: string; label: string } | null };
 
 /**
  * A model the signed-in user may pick (GET /v1/models/available): one of
@@ -182,7 +257,7 @@ export type AvailableModel = {
   /** An embeddings adapter that embeds documents, images, audio and video itself (never a text-only `/v1/embeddings`). */
   mediaInputs?: boolean;
   /** Absent on older servers (pinned model only); an empty list explicitly offers no chat model. */
-  chatModels?: { id: string; reasoningEfforts: string[] }[];
+  chatModels?: { id: string; reasoningEfforts: string[]; displayName?: string; isDefault?: boolean; available?: boolean }[];
 };
 
 /** Snapshot of the user's explicit choice for this agent turn; does not change the connection default. */
@@ -220,7 +295,17 @@ export type RequestFn = (method: "GET" | "POST" | "PUT" | "PATCH" | "DELETE", pa
 /** A device connection's metro-connector (GET /v1/providers/{id}/device-token). */
 export type DeviceStatus = { paired: boolean; online: boolean; lastSeenSecs: number | null };
 
-export type NewProviderConnection = { name: string; provider_id: string; base_url?: string; api_key?: string; model?: string };
+export type NewProviderConnection = {
+  name: string;
+  provider_id: string;
+  base_url?: string;
+  api_key?: string;
+  model?: string;
+  /** List the provider's models right after saving; every listed model starts enabled. */
+  fetch_models?: boolean;
+  /** Models added by hand (self-hosted endpoints, or any provider). */
+  models?: NewConnectionModel[];
+};
 export type ProviderPatch = { name?: string; model?: string; is_default?: boolean; api_key?: string };
 
 export type ApiErrorKind =
@@ -361,6 +446,29 @@ export function createClient(options: ClientOptions) {
   const sp = (spaceId: string) => `/v1/spaces/${encodeURIComponent(spaceId)}`;
   const room = (spaceId: string, roomId: string) => `${sp(spaceId)}/rooms/${encodeURIComponent(roomId)}`;
 
+  /** GET /v1/models/available in full: the flat list, the grouped chat picker and the operator's model, if it applies to me. */
+  async function availableCatalog(scope?: string | null): Promise<AvailableCatalog> {
+    const query = scope === null ? "" : scope === undefined ? "?scope=any" : `?space_id=${encodeURIComponent(scope)}`;
+    const data = await request("GET", `/v1/models/available${query}`);
+    const models = isObject(data) ? data.models : undefined;
+    if (!isObject(data) || !Array.isArray(models)) throw new ApiError("protocol", "GET /v1/models/available did not return { models: [...] }.");
+    const seen = new Set<string>();
+    const out: AvailableModel[] = [];
+    for (const m of models) {
+      const model = toAvailableModel(m);
+      if (model && !seen.has(model.connectionId)) {
+        seen.add(model.connectionId);
+        out.push(model);
+      }
+    }
+    const op = isObject(data.operator_model) && typeof data.operator_model.model_id === "string" && data.operator_model.model_id ? data.operator_model : null;
+    return {
+      models: out,
+      chatProviders: Array.isArray(data.chat_providers) ? data.chat_providers.flatMap(toPickerProvider) : null,
+      operatorModel: op ? { modelId: String(op.model_id), label: typeof op.label === "string" && op.label ? op.label : "Server model (operator)" } : null,
+    };
+  }
+
   return {
     baseUrl: options.baseUrl,
     // Search and scheduled prompts (src/api/discovery.ts), on the same transport.
@@ -369,6 +477,8 @@ export function createClient(options: ClientOptions) {
     ...libraryApi(request, binary),
     // Profiles (src/api/profile.ts): JSON on `request`, pictures on `binary`.
     ...profileApi(request, binary),
+    // A Space's settings, agents and the person's own preferences there (src/api/spaces.ts).
+    ...spacesApi(request, binary),
     // Monitoring events (src/api/monitoring.ts): one Space, My Chat or the instance; never an aggregate.
     ...monitoringApi(request),
 
@@ -450,6 +560,39 @@ export function createClient(options: ClientOptions) {
       return toConnection(connection);
     },
 
+    /** A connection's own model list (owner only). */
+    async connectionModels(id: string): Promise<ConnectionModelList> {
+      return toModelList(await request("GET", `/v1/providers/${encodeURIComponent(id)}/model-list`), id, "GET …/model-list");
+    },
+
+    /** Adds a model by hand, enabled. */
+    async addConnectionModel(id: string, model: NewConnectionModel): Promise<ConnectionModelList> {
+      return toModelList(await request("POST", `/v1/providers/${encodeURIComponent(id)}/model-list`, model), id, "POST …/model-list");
+    },
+
+    /** Renames, switches on or off, sets thinking options or makes a model the default. */
+    async patchConnectionModel(id: string, patch: ConnectionModelPatch): Promise<ConnectionModelList> {
+      return toModelList(await request("PATCH", `/v1/providers/${encodeURIComponent(id)}/model-list`, patch), id, "PATCH …/model-list");
+    },
+
+    async removeConnectionModel(id: string, modelId: string): Promise<ConnectionModelList> {
+      const data = await request("DELETE", `/v1/providers/${encodeURIComponent(id)}/model-list?model_id=${encodeURIComponent(modelId)}`);
+      return toModelList(data, id, "DELETE …/model-list");
+    },
+
+    /** Lists the provider's models again and merges them into the connection's list. */
+    async refreshConnectionModels(id: string): Promise<ModelRefresh> {
+      const data = await request("POST", `/v1/providers/${encodeURIComponent(id)}/model-list/refresh`, {});
+      const models = isObject(data) ? data.models : undefined;
+      if (!isObject(data) || !Array.isArray(models)) throw new ApiError("protocol", "POST …/model-list/refresh did not return { models: [...] }.");
+      return {
+        models: [...new Set(models.filter((m): m is string => typeof m === "string" && m.trim() !== "").map((m) => m.trim()))],
+        added: typeof data.added === "number" ? data.added : 0,
+        unavailable: typeof data.unavailable === "number" ? data.unavailable : 0,
+        connection: isConnection(data.connection) ? toConnection(data.connection) : null,
+      };
+    },
+
     async updateProvider(id: string, patch: ProviderPatch): Promise<void> {
       await request("PATCH", `/v1/providers/${encodeURIComponent(id)}`, patch);
     },
@@ -500,21 +643,11 @@ export function createClient(options: ClientOptions) {
 
     /** null = personal Chat, a string = exact Space, omitted = Settings across all usable scopes. */
     async availableModels(scope?: string | null): Promise<AvailableModel[]> {
-      const query = scope === null ? "" : scope === undefined ? "?scope=any" : `?space_id=${encodeURIComponent(scope)}`;
-      const data = await request("GET", `/v1/models/available${query}`);
-      const models = isObject(data) ? data.models : undefined;
-      if (!Array.isArray(models)) throw new ApiError("protocol", "GET /v1/models/available did not return { models: [...] }.");
-      const seen = new Set<string>();
-      const out: AvailableModel[] = [];
-      for (const m of models) {
-        const model = toAvailableModel(m);
-        if (model && !seen.has(model.connectionId)) {
-          seen.add(model.connectionId);
-          out.push(model);
-        }
-      }
-      return out;
+      return (await availableCatalog(scope)).models;
     },
+
+    /** The same answer in full: the flat list, the grouped chat picker and the operator's model, if it applies to me. */
+    availableCatalog,
 
     async getModelRouting(): Promise<ModelRouting> {
       return toModelRouting(await request("GET", "/v1/model-routing"), "GET /v1/model-routing");
@@ -600,10 +733,22 @@ export function createClient(options: ClientOptions) {
       return events.filter(isEvent).map(toEvent);
     },
 
-    async sendMessage(spaceId: string, roomId: string, text: string, invokeAgent: boolean, mentions?: Mention[], assetIds?: readonly string[], choice?: TurnModelChoice): Promise<void> {
+    /** `agentId` (with `invokeAgent`): Ask agent asks that agent of the Space instead of the default (or the classifier's pick). */
+    async sendMessage(
+      spaceId: string,
+      roomId: string,
+      text: string,
+      invokeAgent: boolean,
+      mentions?: Mention[],
+      assetIds?: readonly string[],
+      choice?: TurnModelChoice,
+      agentId?: string,
+    ): Promise<void> {
       const body: Record<string, unknown> = { text, invoke_agent: invokeAgent, ...turnModelBody(choice) };
+      if (invokeAgent && agentId) body.agent_id = agentId;
       // Only what a person can type: never `addressed_by`, which only the server sets.
-      if (mentions && mentions.length > 0) body.mentions = mentions.map((m) => (m.kind === "agent" ? { kind: "agent" } : { kind: "user", id: m.id }));
+      if (mentions && mentions.length > 0)
+        body.mentions = mentions.map((m) => (m.kind === "agent" ? (m.agentId ? { kind: "agent", agent_id: m.agentId } : { kind: "agent" }) : { kind: "user", id: m.id }));
       const ids = assetIdsBody(assetIds);
       if (ids) body.asset_ids = ids;
       await request("POST", `${room(spaceId, roomId)}/messages`, body);
@@ -757,10 +902,104 @@ function parseChatModels(value: unknown): NonNullable<AvailableModel["chatModels
   for (const row of value) {
     if (!isObject(row) || typeof row.id !== "string" || !row.id.trim() || seen.has(row.id)) continue;
     seen.add(row.id);
-    const levels = Array.isArray(row.reasoning_efforts) ? row.reasoning_efforts : [];
-    result.push({ id: row.id, reasoningEfforts: [...new Set(levels.filter((x): x is string => typeof x === "string" && /^(none|minimal|low|medium|high|xhigh|max)$/.test(x)))] });
+    result.push({
+      id: row.id,
+      reasoningEfforts: efforts(row.reasoning_efforts),
+      ...(typeof row.display_name === "string" && row.display_name.trim() ? { displayName: row.display_name.trim() } : {}),
+      ...(typeof row.is_default === "boolean" ? { isDefault: row.is_default } : {}),
+      ...(typeof row.available === "boolean" ? { available: row.available } : {}),
+    });
   }
   return result;
+}
+
+/**
+ * Thinking levels as the server advertises them: Metro's documented ones, or
+ * the values a self-hosted model's owner set (1–32 of a-z, 0-9, _ and -).
+ */
+function efforts(value: unknown): string[] {
+  const levels = Array.isArray(value) ? value : [];
+  return [...new Set(levels.filter((x): x is string => typeof x === "string" && /^[a-z0-9_-]{1,32}$/.test(x)))];
+}
+
+const EFFORT_WIRES: readonly EffortWire[] = ["none", "reasoning_effort", "reasoning"];
+
+function toThinking(v: unknown): ModelThinking | null {
+  if (!isObject(v)) return null;
+  const wire = EFFORT_WIRES.includes(v.wire as EffortWire) ? (v.wire as EffortWire) : "none";
+  return { efforts: efforts(v.efforts), wire };
+}
+
+function toConnectionModels(value: unknown): ConnectionModel[] {
+  if (!Array.isArray(value)) return [];
+  const out: ConnectionModel[] = [];
+  const seen = new Set<string>();
+  for (const m of value) {
+    if (!isObject(m) || typeof m.model_id !== "string" || !m.model_id || seen.has(m.model_id)) continue;
+    seen.add(m.model_id);
+    const custom = typeof m.custom_name === "string" && m.custom_name ? m.custom_name : null;
+    const listed = typeof m.listed_name === "string" && m.listed_name ? m.listed_name : null;
+    out.push({
+      modelId: m.model_id,
+      displayName: typeof m.display_name === "string" && m.display_name ? m.display_name : custom ?? listed ?? m.model_id,
+      customName: custom,
+      listedName: listed,
+      enabled: m.enabled !== false,
+      available: m.available !== false,
+      source: m.source === "listed" ? "listed" : "manual",
+      position: typeof m.position === "number" ? m.position : out.length,
+      isDefault: m.is_default === true,
+      thinking: toThinking(m.thinking),
+      reasoningEfforts: efforts(m.reasoning_efforts),
+    });
+  }
+  return out;
+}
+
+function toModelList(v: unknown, id: string, what: string): ConnectionModelList {
+  if (!isObject(v) || !Array.isArray(v.models)) throw new ApiError("protocol", `${what} did not return { models: [...] }.`);
+  return {
+    connectionId: isId(v.connection_id) ? String(v.connection_id) : id,
+    defaultModel: typeof v.default_model === "string" && v.default_model ? v.default_model : null,
+    customThinking: v.custom_thinking === true,
+    models: toConnectionModels(v.models),
+  };
+}
+
+function toPickerProvider(v: unknown): PickerProvider[] {
+  if (!isObject(v) || typeof v.provider_id !== "string" || !Array.isArray(v.connections)) return [];
+  const connections: PickerConnection[] = [];
+  for (const c of v.connections) {
+    if (!isObject(c)) continue;
+    const operator = c.operator === true;
+    if (!operator && !isId(c.connection_id)) continue;
+    const models: PickerModel[] = [];
+    for (const m of Array.isArray(c.models) ? c.models : []) {
+      if (!isObject(m) || typeof m.id !== "string" || !m.id.trim() || models.some((x) => x.id === m.id)) continue;
+      models.push({
+        id: m.id,
+        displayName: typeof m.display_name === "string" && m.display_name.trim() ? m.display_name.trim() : m.id,
+        reasoningEfforts: efforts(m.reasoning_efforts),
+        isDefault: m.is_default === true,
+        available: m.available !== false,
+      });
+    }
+    connections.push({
+      connectionId: operator ? null : String(c.connection_id),
+      name: typeof c.name === "string" ? c.name : "",
+      owned: c.owned === true,
+      ownerId: isId(c.owner_id) ? String(c.owner_id) : null,
+      visibility: isShareVisibility(c.visibility) ? c.visibility : null,
+      runsOn: typeof c.runs_on === "string" ? c.runs_on : c.owned === true ? "your_connection" : "owner_connection",
+      billing: typeof c.billing === "string" ? c.billing : c.owned === true ? "you" : "owner",
+      ready: typeof c.ready === "boolean" ? c.ready : null,
+      isDefault: c.is_default === true,
+      defaultModel: typeof c.default_model === "string" && c.default_model ? c.default_model : null,
+      operator,
+      models,
+    });
+  }
+  return connections.length ? [{ providerId: v.provider_id, providerName: typeof v.provider_name === "string" && v.provider_name ? v.provider_name : v.provider_id, connections }] : [];
 }
 
 const optionalId = (v: unknown): string | null => (isId(v) && String(v) !== "" ? String(v) : null);
@@ -801,6 +1040,9 @@ function toConnection(v: Record<string, unknown> & { id: string | number; name: 
     hasKey: v.has_key === true,
     capability: isCapability(v.capability) ? v.capability : null,
     visibility: isShareVisibility(v.visibility) ? v.visibility : null,
+    models: toConnectionModels(v.models),
+    customThinking: v.custom_thinking === true,
+    modelsError: typeof v.models_error === "string" && v.models_error ? v.models_error : null,
   };
 }
 
@@ -831,7 +1073,10 @@ function toEvent(v: RoomEvent): RoomEvent {
     const mentions: Mention[] = [];
     for (const m of raw.mentions) {
       if (isObject(m) && m.kind === "agent") {
-        mentions.push(m.addressed_by === "classifier" || m.addressed_by === "schedule" ? { kind: "agent", addressedBy: m.addressed_by } : { kind: "agent" });
+        const mention: Mention = { kind: "agent" };
+        if (typeof m.agent_id === "string" && m.agent_id.trim()) mention.agentId = m.agent_id.trim();
+        if (m.addressed_by === "classifier" || m.addressed_by === "schedule") mention.addressedBy = m.addressed_by;
+        mentions.push(mention);
       }
       else if (isObject(m) && m.kind === "user" && isId(m.id)) mentions.push({ kind: "user", id: String(m.id) });
     }
@@ -916,7 +1161,24 @@ export function toActivity(v: unknown): EventActivity | undefined {
   if (typeof v.phase === "string" && ACTIVITY_PHASES.includes(v.phase)) activity.phase = v.phase as ActivityPhase;
   const route = toRoute(v.route);
   if (route) activity.route = route;
+  const agent = toEventAgent(v.agent);
+  if (agent) activity.agent = agent;
+  const pick = shortText(v.pick, 200);
+  if (pick) activity.pick = pick;
   return activity;
+}
+
+/** A run's agent badge (`activity.agent`), or undefined when missing or malformed. */
+export function toEventAgent(v: unknown): EventAgent | undefined {
+  if (!isObject(v) || typeof v.id !== "string" || !v.id.trim() || typeof v.name !== "string" || !v.name.trim()) return undefined;
+  const agent: EventAgent = {
+    id: v.id.trim(),
+    handle: typeof v.handle === "string" ? v.handle.trim() : "",
+    name: v.name.trim().slice(0, 64),
+    color: typeof v.color === "string" && /^#[0-9a-f]{6}$/i.test(v.color) ? v.color : "#4f46e5",
+  };
+  if (typeof v.avatar_version === "string" && v.avatar_version.trim()) agent.avatar_version = v.avatar_version.trim();
+  return agent;
 }
 
 const ROUTE_SOURCES: readonly string[] = ["override", "case", "routing_default", "default", "environment", "inherited"];

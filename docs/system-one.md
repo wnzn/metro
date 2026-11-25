@@ -8,6 +8,10 @@
 > is a historical milestone.
 > The earlier [System One milestone gate](acceptance.md#historical-final-gate-for-the-system-one-milestone-2026-11-22-independent-reviewer-local),
 > with 403 Rust tests, is kept as a record.
+> The latest [staged gate on unreleased source](acceptance.md#staged-spaces-with-several-agents-per-connection-model-lists-and-the-desktop-redesign-at-4175475-2026-11-25-project-manager-local)
+> (686 Rust tests, eight e2e scripts including `intelligence.py`, desktop
+> `nsh test` 400/400) covers per-Space classification over a Space's agents.
+> It isn't a release, and the published 0.3.2 release doesn't contain it.
 >
 > - Every part is documented from its code.
 > - `tests/e2e/intelligence.py` passed against the primary workspace's
@@ -22,7 +26,7 @@
 | --- | --- | --- |
 | [Connection capabilities](settings.md#capabilities) (`chat`, `system_one`, `embeddings`) | yes | Component tests, and `tests/e2e/intelligence.py` |
 | [Sharing a connection](settings.md#sharing-a-connection) with Spaces or the organization | yes | Component tests, and `tests/e2e/intelligence.py` across users, on a local endpoint and on a device, including revocation |
-| [Opt-in classification](#opt-in-classification-of-unaddressed-messages) of unaddressed messages | yes | Component tests, and `tests/e2e/intelligence.py` |
+| [Opt-in classification](#opt-in-classification-of-unaddressed-messages) of unaddressed messages | yes | Component tests, and `tests/e2e/intelligence.py`, including the per-Space Choice over a Space's agents plus *No agent* |
 | [Use-case routing](#use-case-routing) to an answering model | yes | Component tests, and `tests/e2e/intelligence.py` |
 | [Semantic search](#semantic-search) with a System One rerank | yes | 14 unit + 4 HTTP tests, `tests/e2e/intelligence.py`, and the native desktop screen ([screenshot](screenshots/semantic-search.png)) |
 | [Scheduled prompts](schedules.md) | yes | 30 unit + 2 HTTP tests, `tests/e2e/schedules.py`, a live hourly cron run, and the native desktop screen ([screenshot](screenshots/scheduled-tasks.png)), all with scripted models |
@@ -31,11 +35,13 @@
 
 A server that never turns any of this on behaves as it does today:
 
-- A message to people only (`@bob`, with no `@agent` and not sent with Ask
-  agent) never starts the agent.
-- Only `@agent` or **Ask agent** starts agent work, including in a mixed
-  `@bob @agent` message. Text with no mention is ordinary conversation.
-- A run uses the default model connection of the person who started it, or
+- A message to people only (`@bob`, with no agent and not sent with Ask
+  agent) never starts an agent.
+- Only an agent's `@handle`, `@agent` or **Ask agent** starts agent work,
+  including in a mixed `@bob @agent` message. `@agent` and Ask agent without
+  a chosen agent start the Space's default agent. Text with no mention is
+  ordinary conversation.
+- A run uses the default chat connection of the person who started it, or
   `METRO_MODEL` if they have none. A connection that fails fails the run, with
   no fallback.
 - Connections are private to their owner until the owner shares one.
@@ -65,10 +71,10 @@ docs describe it no further than TypeSafe's own docs do:
   ([API reference](https://docs.typesafe.ai/api/system-one)).
 - Metro uses two question types
   ([primitives](https://docs.typesafe.ai/primitives)):
-  - `noul`, the probability of yes from 0 to 1, for addressing and the
-    search rerank;
+  - `noul`, the probability of yes from 0 to 1, for addressing in personal
+    Chat and the search rerank;
   - `choice`, one option with `confidence` and per-option `probabilities`,
-    for use-case routing.
+    for choosing a Space agent and for use-case routing.
 
   Every request Metro sends carries exactly one question, because some
   endpoints accept no more.
@@ -100,45 +106,70 @@ This is documented from the code in
 ## How a message reaches the agent
 
 Explicit recipients always decide who a message is addressed to. System One
-makes two separate decisions, each with its own opt-in:
+makes separate decisions, each behind the sender's own opt-in:
 
-- **Addressing:** whether an unaddressed message is asking the agent. This
-  is [classification](#opt-in-classification-of-unaddressed-messages).
-- **Answering model:** which chat connection answers a turn that has already
+- **Addressing:** whether an unaddressed message is asking an agent, and in
+  a Space which one; and which agent the generic `@agent` means. This is
+  [classification](#opt-in-classification-of-unaddressed-messages).
+- **Answering model:** which chat connection answers a run that has already
   started. This is [use-case routing](#use-case-routing).
 
-| Message | Starts the agent? | Addressing decision | Answering model |
+| Message | Starts an agent? | Agent decision | Answering model |
 | --- | --- | --- | --- |
-| People only: `@bob`, no `@agent`, not sent with Ask agent | Never | None. It's never sent to System One. | None. There's no turn. |
-| To the agent: `@agent` or Ask agent, including mixed `@bob @agent` | Yes | None. Explicit recipients already decide it. | The model the person chose for this turn, if any; otherwise routing, if on; otherwise their default chat connection |
-| Unaddressed, with the sender's classification **off** (the default) | No | None | None. There's no turn. |
-| Unaddressed, with the sender's classification **on** | Only if System One says it's asking the agent | System One, on the sender's `system_one` connection | Same order as the row above |
+| People only: `@bob`, no agent, not sent with Ask agent | Never | None. It's never sent to System One. | None. There's no run. |
+| An agent's `@handle`, or Ask agent with that agent chosen | Yes, that agent (one run per agent mentioned) | None | See [which model a run uses](settings.md#which-model-a-run-uses) |
+| `@agent`, or Ask agent without an agent, including mixed `@bob @agent` | Yes | The default agent; with the sender's classification on in that Space, a Choice among the agents (no "no agent" option). Unsure: the default agent. Failed: an error, and nothing runs. | Same |
+| Unaddressed, with the sender's classification **off** (the default) | No | None | None. There's no run. |
+| Unaddressed, with the sender's classification **on** | Only if System One clearly picks an agent | A Choice among the agents plus *No agent* (Spaces), or a `noul` (personal Chat) | Same |
 
 ## Opt-in classification of unaddressed messages
 
-A person can turn on classification for **their own** outgoing messages, in
-Space rooms or in their personal Chat. It decides only one thing: whether an
-**unaddressed** message (no mention, and not sent with Ask agent) is asking
-the agent.
+A person can turn on classification for **their own** outgoing messages. In
+Spaces it's a setting **per Space** (`classify_unaddressed` in
+[your preferences for that Space](spaces.md#your-preferences-in-a-space)).
+It can be turned on only while the person has a System One connection
+usable in that Space. Personal Chat keeps its own setting
+(`infer_addressing`, [below](#settings-get--put-v1model-routing)). Both are
+off by default.
 
-- Only that one new message, never the room's history, goes to the sender's
-  System One connection (`classifier_id`), as a single `noul`, cut to
-  4,000 characters.
-- Only an answer at or above `min_directedness` starts a run. The default is
-  0.85, and it can be set anywhere from 0.5 to 1. The run belongs to the
-  sender and uses the sender's connections.
-- No answer, an uncertain answer, a malformed answer or an error starts
-  nothing. The message stays ordinary conversation.
-- A message that started a run this way is stored with `addressed_by:
-  "classifier"`, which no client can send.
-- It never sees a people-only message, which never starts the agent.
-- It never sees a message to the agent. `@agent` and Ask agent, including a
-  mixed `@bob @agent`, skip only this decision. Use-case routing can still
-  pick their answering model.
+**In a Space room**, it decides two things for the sender's messages:
+
+- **Unaddressed** messages (no mention, and not sent with Ask agent): one
+  System One `choice` over the Space's agents plus *No agent*. Each option
+  shows the agent's name and description and is keyed internally
+  (`agent_1`, `agent_2`, …), so nothing the model returns is ever used as an
+  agent id. A pick starts that agent, as the sender, only if the probability
+  that the message is for some agent is at least `min_directedness`. *No
+  agent*, an unsure, malformed or failed answer, or an option that was never
+  offered starts nothing, and the message stays ordinary conversation.
+- **`@agent`, or Ask agent without an agent**, in a Space with more than
+  one agent: the same `choice`, without *No agent*. A pick at or above
+  `min_route_probability` runs that agent; a weaker one runs the default
+  agent. A failed decision posts an error in the room and runs nothing for
+  `@agent`.
+
+**In personal Chat**, it decides only whether an unaddressed message is
+asking the agent: a single `noul`, and only an answer at or above
+`min_directedness` starts a run.
+
+In both places:
+
+- Only that one new message, never the room's history, ids or the agents'
+  instructions, goes to the sender's System One connection (`classifier_id`),
+  cut to 4,000 characters.
+- The run belongs to the sender and uses the sender's connections.
+- An unaddressed message that started a run this way is stored with
+  `addressed_by: "classifier"`, which no client can send. The run's activity
+  shows how its agent was chosen, for example *Picked by classifier: Coder*.
+- It never sees a people-only message, which never starts an agent.
+- It never sees a message to a named agent (`@coder`, or Ask agent with an
+  agent chosen).
 - It never sees other members' messages because of someone else's opt-in.
 
-With classification off (`infer_addressing: false`), which is the default,
-unaddressed text stays ordinary conversation.
+When the per-Space setting was introduced, everyone who had
+`infer_addressing` on with a System One connection got
+`classify_unaddressed` on in each Space they were a member of then. That
+happened once; Spaces joined later start with it off.
 
 ## Use-case routing
 
@@ -147,10 +178,14 @@ question*, *writing*) to chat connections they can use. It's a separate
 opt-in from classification (`enabled`). It decides only which connection
 answers, never whether the agent is addressed.
 
-- It can run on any turn that has started for that person: from `@agent`,
-  from Ask agent (mixed messages included), or from a classified unaddressed
-  message.
-- **A model the person chooses explicitly for that turn overrides routing.**
+- It can run on any run that has started for that person: from an agent's
+  `@handle`, `@agent`, Ask agent (mixed messages included), or a classified
+  unaddressed message.
+- **A model the person chooses explicitly for that turn overrides routing**,
+  and so do their own per-agent and per-Space models in that Space. In a
+  Space, it applies only while their `routing` preference for that Space is
+  on (the default). See
+  [which model a run uses](settings.md#which-model-a-run-uses).
 - System One gets one `choice` over the person's case keys, plus a reserved
   `no_match` option.
   - A case is used only if it's chosen with probability at or above
@@ -169,9 +204,11 @@ answers, never whether the agent is addressed.
   marker: where the model came from, the case, the connection and model ids,
   and a short reason. No prompt or credential is recorded.
 
-A message costs at most two System One calls: the addressing `noul` (only
-for unaddressed messages from someone who opted in), then the routing
-`choice`, only after a clear yes or on an explicit agent turn.
+Every System One request carries one question. A run costs at most two
+calls: one agent decision (the Space `choice`, or the personal Chat `noul`,
+only for someone who opted in), then the routing `choice`, only when the run
+uses routing. A message that starts several agents makes one routing call
+per run.
 
 ### Settings: `GET` / `PUT /v1/model-routing`
 
@@ -180,8 +217,8 @@ Each person has their own settings, and both features are off by default.
 | Field | Meaning |
 | --- | --- |
 | `enabled` | Use-case routing on or off (default `false`) |
-| `infer_addressing` | Classification of your own unaddressed messages on or off (default `false`) |
-| `classifier_id` | Your System One connection. It's required when either feature is on, and it's also used for the search rerank. |
+| `infer_addressing` | Classification of your own unaddressed messages **in your personal Chat** on or off (default `false`). In Spaces, use each Space's `classify_unaddressed` ([preferences](spaces.md#your-preferences-in-a-space)). |
+| `classifier_id` | Your System One connection. It's required when either feature is on, and it's also used for per-Space classification and the search rerank. |
 | `embedding_id` | Your embeddings connection, used for [search](#semantic-search) |
 | `default_chat_id` | The chat connection to use on `no_match`. Leave it out to keep your default. |
 | `min_directedness` | 0.5 to 1, default 0.85 |
@@ -409,7 +446,8 @@ untested.
 These are now documented from the code in [schedules.md](schedules.md). That
 page covers the API, five-field cron in an IANA time zone, the limits, the
 statuses and `METRO_SCHEDULE_TICK_SECS`. A scheduled prompt counts as its
-creator explicitly asking the agent, so the classifier never sees it. It
+creator explicitly asking the agent (in a Space, its default agent), so the
+classifier never sees it. It
 has been demonstrated end to end against the real server binary with
 scripted models ([acceptance.md](acceptance.md#demonstrated-scheduled-prompts-end-to-end-2026-11-22-scheduler-lane-local)).
 

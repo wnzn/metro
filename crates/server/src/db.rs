@@ -58,6 +58,8 @@ impl Role {
 pub struct SpaceView {
     pub id: String,
     pub name: String,
+    /// The owner's short description; empty when none was set.
+    pub description: String,
     pub role: Role,
     pub runner_paired: bool,
 }
@@ -151,6 +153,28 @@ pub struct Activity {
     /// why ([`crate::model_routing`]). No prompts, no credentials.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub route: Option<crate::model_routing::RouteNote>,
+    /// The Space agent working this turn ([`crate::space_agents`]), on
+    /// every event of the turn. Absent in personal Chat, Demo and older
+    /// history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<AgentBadge>,
+    /// Only on a Space turn's `started` event: how its agent was chosen,
+    /// e.g. `Picked by classifier: Coder` or `Addressed: @coder`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pick: Option<String>,
+}
+
+/// A Space agent as shown on its events: enough to draw its name and
+/// avatar (`GET /v1/spaces/{sid}/agents/{id}/avatar` when
+/// `avatar_version` is set, else its initial on `color`).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentBadge {
+    pub id: String,
+    pub handle: String,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_version: Option<String>,
+    pub color: String,
 }
 
 impl Activity {
@@ -165,7 +189,15 @@ impl Activity {
             source: activity::AGENT.to_owned(),
             phase: None,
             route: None,
+            agent: None,
+            pick: None,
         }
+    }
+
+    /// This activity worked by the Space agent `agent`.
+    pub fn with_agent(mut self, agent: AgentBadge) -> Self {
+        self.agent = Some(agent);
+        self
     }
 
     /// A personal Chat turn: there is no registered run, so it gets its own id.
@@ -183,6 +215,8 @@ impl Activity {
             source: activity::DEMO.to_owned(),
             phase: None,
             route: None,
+            agent: None,
+            pick: None,
         }
     }
 
@@ -192,6 +226,7 @@ impl Activity {
         Self {
             phase: Some(phase.to_owned()),
             route: None,
+            pick: None,
             ..self.clone()
         }
     }
@@ -254,6 +289,10 @@ pub mod kind {
     /// An agent turn or Demo run started or ended; `activity.phase` says
     /// which, and the text is empty. Never a message, never model history.
     pub const ACTIVITY: &str = "activity";
+    /// The summary of the model's reasoning in one model turn of an agent
+    /// run, as the provider returned it (bounded). Tagged with the run's
+    /// activity; never a message, never model history, never indexed.
+    pub const REASONING_SUMMARY: &str = "reasoning_summary";
 }
 
 /// Actors the server writes for non-human events.
@@ -413,6 +452,7 @@ impl Db {
              CREATE INDEX IF NOT EXISTS personal_events_user ON personal_events (user_id, id);",
         )?;
         add_activity_columns(&conn)?;
+        add_space_description(&conn)?;
         reactions::init(&conn)?;
         crate::runners::init(&conn)?;
         crate::admin_users::init(&conn)?;
@@ -428,6 +468,9 @@ impl Db {
         // References library_assets, so it comes after it.
         crate::library_search::init(&conn)?;
         crate::monitoring::init(&conn)?;
+        // After spaces, members and model routing settings exist.
+        crate::space_agents::init(&conn)?;
+        crate::space_prefs::init(&conn)?;
         let version: Option<String> = conn
             .query_row(
                 "SELECT value FROM metro_meta WHERE key = 'schema_version'",
@@ -538,10 +581,12 @@ impl Db {
             params![id, owner_id, now],
         )?;
         insert_room(&tx, &id, LOBBY_ID, LOBBY_NAME)?;
+        crate::space_agents::seed_default(&tx, &id)?;
         tx.commit()?;
         Ok(SpaceView {
             id,
             name: name.to_owned(),
+            description: String::new(),
             role: Role::Owner,
             runner_paired: false,
         })
@@ -554,6 +599,7 @@ impl Db {
             "SELECT s.id, s.name, m.role,
                     (s.runner_token_hash IS NOT NULL
                      OR EXISTS (SELECT 1 FROM space_runners a WHERE a.space_id = s.id))
+             , s.description
              FROM space_members m JOIN spaces s ON s.id = m.space_id
              WHERE m.user_id = ?1 ORDER BY s.created_at, s.rowid",
         )?;
@@ -570,6 +616,7 @@ impl Db {
                 "SELECT s.id, s.name, m.role,
                     (s.runner_token_hash IS NOT NULL
                      OR EXISTS (SELECT 1 FROM space_runners a WHERE a.space_id = s.id))
+                 , s.description
                  FROM space_members m JOIN spaces s ON s.id = m.space_id
                  WHERE m.space_id = ?1 AND m.user_id = ?2",
                 params![space_id, user_id],
@@ -649,6 +696,8 @@ impl Db {
                 // same transaction; the Space's files and other members'
                 // index rows stay.
                 crate::library_search::hooks::member_removed(&tx, space_id, user_id)?;
+                // Their per-Space preferences go with their membership.
+                crate::space_prefs::member_removed(&tx, space_id, user_id)?;
                 RemoveMember::Removed
             }
         };
@@ -983,7 +1032,7 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM space_events
-             WHERE space_id = ?1 AND room_id = ?2 AND id < ?3 AND kind <> 'activity'
+             WHERE space_id = ?1 AND room_id = ?2 AND id < ?3 AND kind NOT IN ('activity', 'reasoning_summary')
              ORDER BY id DESC LIMIT ?4",
         )?;
         let rows = stmt.query_map(params![space_id, room_id, before, limit as i64], row_event)?;
@@ -1067,7 +1116,7 @@ impl Db {
         let conn = self.lock();
         let mut stmt = conn.prepare_cached(
             "SELECT id, kind, actor, actor_id, text, mentions, audience, activity, created_at FROM personal_events
-             WHERE user_id = ?1 AND id < ?2 AND kind <> 'activity'
+             WHERE user_id = ?1 AND id < ?2 AND kind NOT IN ('activity', 'reasoning_summary')
              ORDER BY id DESC LIMIT ?3",
         )?;
         let rows = stmt.query_map(params![user_id, before, limit as i64], row_event)?;
@@ -1125,6 +1174,7 @@ fn row_space(r: &rusqlite::Row<'_>) -> rusqlite::Result<SpaceView> {
     Ok(SpaceView {
         id: r.get(0)?,
         name: r.get(1)?,
+        description: r.get::<_, Option<String>>(4)?.unwrap_or_default(),
         role: Role::parse(&r.get::<_, String>(2)?)?,
         runner_paired: r.get(3)?,
     })
@@ -1152,6 +1202,20 @@ fn row_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
 
 fn activity_json(activity: Option<&Activity>) -> anyhow::Result<Option<String>> {
     Ok(activity.map(serde_json::to_string).transpose()?)
+}
+
+/// Additive: older databases gain a `description` column on `spaces`;
+/// existing Spaces get an empty description.
+fn add_space_description(conn: &Connection) -> rusqlite::Result<()> {
+    let has: bool = conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('spaces') WHERE name = 'description')",
+        [],
+        |r| r.get(0),
+    )?;
+    if !has {
+        conn.execute_batch("ALTER TABLE spaces ADD COLUMN description TEXT NOT NULL DEFAULT ''")?;
+    }
+    Ok(())
 }
 
 /// Additive: older databases gain a nullable `activity` column; their

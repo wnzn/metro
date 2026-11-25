@@ -5,10 +5,13 @@
 // preference) before the app's first frame: see ./appearance.
 export * from "./appearance";
 export * from "./panels";
+export * from "./resize";
 import "./fonts/InterVariable.ttf";
 export * from "./primitives";
 export * from "./chrome";
 export * from "./media";
 export * from "./chat";
+export * from "./agentAvatar";
 export type { Space, Tone } from "./tokens";
 export * from "./settings";
+export * from "./modelPicker";

@@ -149,6 +149,21 @@ class Vendor(ThreadingHTTPServer):
                 else:
                     raise RuntimeError("unrecognized Noul decision")
                 answers[name] = {"type": "noul", "noul": p}
+            elif kind == "choice" and name == "agent":
+                # The Space agent Choice: agents plus "No agent" for an
+                # unaddressed message of an opted-in sender.
+                criteria = question["criteria"]
+                require(isinstance(criteria, dict) and "agent_1" in criteria
+                        and criteria["agent_1"].get("description"),
+                        "the agent Choice did not present the Space's agents")
+                if "ROUTING_DOUBTFUL" in message:
+                    probabilities = {"agent_1": 0.5, "no_agent": 0.5}
+                else:
+                    probabilities = {"agent_1": 0.99, "no_agent": 0.01}
+                probabilities = {key: probabilities.get(key, 0.0) for key in criteria}
+                choice = max(probabilities, key=probabilities.get)
+                answers[name] = {"type": "choice", "choice": choice, "confidence": 1.0,
+                                 "probabilities": probabilities}
             elif kind == "choice":
                 criteria = question["criteria"]
                 require(isinstance(criteria, dict) and criteria, "Choice criteria were not a map")
@@ -501,7 +516,10 @@ def exercise_routing(run, space, classifier, default, routed):
              "description": "Answer a simple factual question.", "connection_id": default},
         ],
     )
-    directed = (("directed", "noul"),)
+    # In a Space, the opt-in is per Space and asks one Choice over its agents.
+    run.call("alice", "PUT", f"/v1/spaces/{space}/prefs",
+             body={"classify_unaddressed": True}, expect=(200,), read_json=True)
+    directed = (("agent", "choice"),)
     use_case = (("use_case", "choice"),)
     implicit = directed + use_case
 
@@ -560,7 +578,7 @@ def exercise_routing(run, space, classifier, default, routed):
     end = min(run.deadline, time.monotonic() + 0.45)
     while True:
         run.healthy()
-        require(all(body["state"]["message"] == FAILED and set(body["questions"]) == {"directed"}
+        require(all(body["state"]["message"] == FAILED and set(body["questions"]) == {"agent"}
                     for body in run.systemone.posts()[before[0]:]),
                 "directedness failure reached the use-case classifier")
         require(run.post_counts()[1:] == before[1:],

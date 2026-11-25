@@ -556,6 +556,7 @@ pub(crate) fn to_chat_completion(r: &Value) -> Result<Value> {
         .ok_or_else(|| anyhow!("completed response has no output"))?;
     let mut text = String::new();
     let mut refusal = String::new();
+    let mut summaries: Vec<&str> = Vec::new();
     let mut tool_calls = Vec::new();
     for item in output {
         match item.get("type").and_then(Value::as_str).unwrap_or("") {
@@ -573,8 +574,9 @@ pub(crate) fn to_chat_completion(r: &Value) -> Result<Value> {
                         Some("refusal") => {
                             refusal += c.get("refusal").and_then(Value::as_str).unwrap_or("")
                         }
-                        Some(other) => bail!("unsupported Responses message content `{other}`"),
-                        None => {}
+                        // Other parts (annotations-only, audio, future kinds)
+                        // carry nothing this chat.completion can hold.
+                        _ => {}
                     }
                 }
             }
@@ -602,12 +604,27 @@ pub(crate) fn to_chat_completion(r: &Value) -> Result<Value> {
                     },
                 }));
             }
-            // Reasoning is model-internal. Only public text output is
-            // surfaced, and encrypted or raw reasoning is never forwarded.
-            "reasoning" => {}
-            other => bail!(
-                "unsupported Responses output item `{other}`; this connector only requests text and function/custom tool calls"
-            ),
+            // Only the model's public reasoning *summary* is surfaced.
+            // Encrypted content and raw reasoning text are never forwarded.
+            "reasoning" => {
+                for s in item
+                    .get("summary")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    if s.get("type").and_then(Value::as_str) == Some("summary_text")
+                        && let Some(t) = s.get("text").and_then(Value::as_str)
+                        && !t.trim().is_empty()
+                    {
+                        summaries.push(t);
+                    }
+                }
+            }
+            // Items Metro didn't ask for and can't represent (for example
+            // hosted tool progress) are skipped; the turn fails below only if
+            // nothing usable is left.
+            _ => {}
         }
     }
     if text.is_empty() && refusal.is_empty() && tool_calls.is_empty() {
@@ -625,6 +642,13 @@ pub(crate) fn to_chat_completion(r: &Value) -> Result<Value> {
     );
     if !refusal.is_empty() {
         message.insert("refusal".into(), Value::String(refusal));
+    }
+    // Metro's relay forwards `reasoning_content` as the reasoning delta.
+    if !summaries.is_empty() {
+        message.insert(
+            "reasoning_content".into(),
+            Value::String(summaries.join("\n\n")),
+        );
     }
     let finish = if tool_calls.is_empty() {
         "stop"

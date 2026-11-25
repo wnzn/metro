@@ -20,6 +20,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
 use super::catalog::{self, Adapter, Capability, Entry, Execution};
+use super::models::{self, ModelView, Thinking};
 use super::secret::MAX_API_KEY_BYTES;
 use super::store::{self, Row};
 use super::{
@@ -62,6 +63,14 @@ pub struct ConnectionView {
     pub capability: Capability,
     /// Whether it embeds documents and media (EmbeddingGemma 2 adapters).
     pub media_inputs: bool,
+    /// Whether its models take per-model thinking options (self-hosted
+    /// OpenAI-compatible endpoints).
+    pub custom_thinking: bool,
+    /// Its models (`GET /v1/providers/{id}/model-list` has the same list).
+    pub models: Vec<ModelView>,
+    /// Why the model list could not be fetched on create (`fetch_models`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub models_error: Option<String>,
 }
 
 impl From<&Row> for ConnectionView {
@@ -77,8 +86,28 @@ impl From<&Row> for ConnectionView {
             execution: catalog::find(&row.provider_id).map_or(Execution::Server, |e| e.execution),
             capability: row.capability,
             media_inputs: catalog::find(&row.provider_id).is_some_and(|e| e.media_inputs),
+            custom_thinking: catalog::find(&row.provider_id).is_some_and(models::custom_thinking),
+            models: Vec::new(),
+            models_error: None,
         }
     }
+}
+
+impl ConnectionView {
+    /// The view of `row` with its models, read on `conn`.
+    pub fn read(conn: &rusqlite::Connection, row: &Row) -> rusqlite::Result<Self> {
+        let mut view = Self::from(row);
+        view.models = models::views(row, &models::list(conn, &row.id)?);
+        Ok(view)
+    }
+}
+
+async fn view_of(state: &AppState, row: Row) -> ApiResult<ConnectionView> {
+    state
+        .db
+        .call(move |db| Ok(ConnectionView::read(&db.lock(), &row)?))
+        .await
+        .map_err(ApiError::internal)
 }
 
 /// Connection ids are `pc_` and 32 lowercase hex digits.
@@ -180,12 +209,18 @@ pub async fn catalog(State(state): State<AppState>, _who: Human) -> Json<serde_j
 
 pub async fn list(State(state): State<AppState>, who: Human) -> ApiResult<Json<serde_json::Value>> {
     let user = who.id.clone();
-    let rows = state
+    let connections: Vec<ConnectionView> = state
         .db
-        .call(move |db| Ok(store::list(&db.lock(), &user)?))
+        .call(move |db| {
+            let conn = db.lock();
+            store::list(&conn, &user)?
+                .iter()
+                .map(|row| ConnectionView::read(&conn, row))
+                .collect::<rusqlite::Result<_>>()
+                .map_err(Into::into)
+        })
         .await
         .map_err(ApiError::internal)?;
-    let connections: Vec<ConnectionView> = rows.iter().map(ConnectionView::from).collect();
     Ok(Json(json!({ "connections": connections })))
 }
 
@@ -205,6 +240,25 @@ pub struct CreateBody {
     /// if the user has none of that capability yet.
     #[serde(default)]
     is_default: Option<bool>,
+    /// Fetch the provider's model list right after saving (server
+    /// connections whose provider lists models): every listed chat model is
+    /// added, enabled. A failed listing does not fail the create.
+    #[serde(default)]
+    fetch_models: bool,
+    /// Model ids to add by hand (self-hosted endpoints and any provider).
+    #[serde(default)]
+    models: Vec<ManualModel>,
+}
+
+/// A model added by hand on create.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ManualModel {
+    model_id: String,
+    #[serde(default)]
+    display_name: Option<String>,
+    #[serde(default)]
+    thinking: Option<Thinking>,
 }
 
 pub async fn create(
@@ -217,7 +271,35 @@ pub async fn create(
     let entry = entry_for(&state, body.provider_id.trim())?;
     // An adapter's suggested model only when none is given at all; an
     // explicit "" (choose later) or any other model is kept as written.
-    let model = check_model(body.model.as_deref().or(entry.default_model).unwrap_or(""))?;
+    let mut model = check_model(body.model.as_deref().or(entry.default_model).unwrap_or(""))?;
+    if body.models.len() > models::MAX_MODELS_PER_CONNECTION {
+        return Err(bad_request("too many models"));
+    }
+    let mut manual: Vec<(String, Option<String>, Option<Thinking>)> = Vec::new();
+    for m in body.models {
+        let id = check_model(&m.model_id)?;
+        if id.is_empty() {
+            return Err(bad_request("models[].model_id is required"));
+        }
+        if manual.iter().any(|(i, ..)| *i == id) {
+            return Err(bad_request("models has a duplicate model_id"));
+        }
+        let name = m
+            .display_name
+            .as_deref()
+            .map(models::check_display_name)
+            .transpose()?
+            .flatten();
+        let thinking = models::thinking_for(entry, m.thinking)?;
+        manual.push((id, name, thinking));
+    }
+    // A connection created with models but no `model` defaults to the first.
+    if body.model.is_none()
+        && entry.default_model.is_none()
+        && let Some((first, ..)) = manual.first()
+    {
+        model.clone_from(first);
+    }
     if body.is_default == Some(true) && model.is_empty() {
         return Err(conflict(
             "a default connection needs a model; choose one first",
@@ -292,8 +374,28 @@ pub async fn create(
                         && store::default_for(&conn, &row.user_id, row.capability)?.is_none()
                 }
             };
-            let inserted = store::insert(&mut conn, &row, MAX_CONNECTIONS_PER_USER)?;
-            Ok(inserted.then_some(row))
+            if !store::insert(&mut conn, &row, MAX_CONNECTIONS_PER_USER)? {
+                return Ok(None);
+            }
+            let tx = conn.transaction()?;
+            for (id, name, thinking) in &manual {
+                if id == &row.model {
+                    models::patch(
+                        &tx,
+                        &row.id,
+                        id,
+                        &models::Patch {
+                            display_name: Some(name.clone()),
+                            thinking: Some(thinking.clone()),
+                            ..models::Patch::default()
+                        },
+                    )?;
+                } else {
+                    models::add_manual(&tx, &row.id, id, name.as_deref(), true, thinking.as_ref())?;
+                }
+            }
+            tx.commit()?;
+            Ok(Some(row))
         })
         .await
         .map_err(ApiError::internal)?;
@@ -303,7 +405,59 @@ pub async fn create(
         )));
     };
     tracing::info!(connection = %row.id, provider = %row.provider_id, "model connection created");
-    Ok((StatusCode::CREATED, Json(ConnectionView::from(&row))).into_response())
+    let mut row = row;
+    let mut models_error = None;
+    if body.fetch_models && entry.lists_models && super::listed::server_chat(entry, &row) {
+        match list_server_models(&state, entry, &row).await {
+            Ok(listed) => {
+                match super::listed::merge_chat_listing(
+                    &state.db,
+                    row.clone(),
+                    clean_listed(listed),
+                )
+                .await
+                .map_err(ApiError::internal)?
+                {
+                    Some((settled, _)) => row = settled,
+                    None => {
+                        models_error = Some("the connection changed while fetching models".into())
+                    }
+                }
+                if explicit == Some(false) && row.is_default {
+                    row.is_default = false;
+                    let r = row.clone();
+                    if let Some(rev) = state
+                        .db
+                        .call(move |db| Ok(store::update(&mut db.lock(), &r)?))
+                        .await
+                        .map_err(ApiError::internal)?
+                    {
+                        row.config_rev = rev;
+                    }
+                }
+            }
+            Err(e) => models_error = Some(e.message().to_owned()),
+        }
+    }
+    let mut view = view_of(&state, row).await?;
+    view.models_error = models_error;
+    Ok((StatusCode::CREATED, Json(view)).into_response())
+}
+
+/// Clean a listing: valid unique ids in listed order, with usable names.
+fn clean_listed(listed: Vec<(String, Option<String>)>) -> Vec<(String, Option<String>)> {
+    let mut out: Vec<(String, Option<String>)> = Vec::new();
+    for (id, name) in listed {
+        let Ok(id) = check_model(&id) else { continue };
+        if id.is_empty() || out.iter().any(|(i, _)| *i == id) {
+            continue;
+        }
+        out.push((id, models::clean_listed_name(name.as_deref())));
+        if out.len() >= MAX_LISTED_MODELS {
+            break;
+        }
+    }
+    out
 }
 
 /// `Some(None)` for an explicit `null`, `None` when the field is absent.
@@ -386,7 +540,7 @@ pub async fn update(
         return Err(not_found());
     };
     row.config_rev = rev;
-    Ok(Json(ConnectionView::from(&row)))
+    Ok(Json(view_of(&state, row).await?))
 }
 
 pub async fn remove(
@@ -432,29 +586,39 @@ pub async fn models(
     crate::api::empty_object(&body)?;
     let entry = catalog::find(&row.provider_id)
         .ok_or_else(|| conflict("this connection's provider is no longer supported"))?;
-    let started_at = std::time::Instant::now();
-    let models = match entry.adapter {
+    let listed: Vec<(String, Option<String>)> = match entry.adapter {
         Adapter::Device => state
             .device
-            .models(&state.db, &who.id, &row.id)
+            .models_named(&state.db, &who.id, &row.id)
             .await
             .map_err(device_error)?,
-        Adapter::SystemOne | Adapter::Embeddings => list_typed_models(&state, entry, &row).await?,
+        Adapter::SystemOne | Adapter::Embeddings => list_typed_models(&state, entry, &row)
+            .await?
+            .into_iter()
+            .map(|id| (id, None))
+            .collect(),
         Adapter::Registered(_) | Adapter::Custom => list_server_models(&state, entry, &row).await?,
     };
-    let models = clean_model_ids(models);
-    if super::listed::server_chat(entry, &row)
-        && !state
-            .providers
-            .remember_chat_listing(&state.db, row, started_at, &models)
-            .await
-            .map_err(ApiError::internal)?
-    {
+    let listed = clean_listed(listed);
+    let models = clean_model_ids(listed.iter().map(|(id, _)| id.clone()));
+    if row.capability != Capability::Chat || entry.capability != Capability::Chat {
+        return Ok(Json(json!({ "models": models })));
+    }
+    let Some((row, synced)) = super::listed::merge_chat_listing(&state.db, row, listed)
+        .await
+        .map_err(ApiError::internal)?
+    else {
         return Err(conflict(
             "the connection changed while fetching models; fetch them again",
         ));
-    }
-    Ok(Json(json!({ "models": models })))
+    };
+    let view = view_of(&state, row).await?;
+    Ok(Json(json!({
+        "models": models,
+        "added": synced.added,
+        "unavailable": synced.unavailable,
+        "connection": view,
+    })))
 }
 
 /// Valid, unique model ids, sorted, at most [`MAX_LISTED_MODELS`].
@@ -502,7 +666,11 @@ fn device_error(e: DeviceError) -> ApiError {
     ApiError::new(status, e.to_string())
 }
 
-async fn list_server_models(state: &AppState, entry: &Entry, row: &Row) -> ApiResult<Vec<String>> {
+async fn list_server_models(
+    state: &AppState,
+    entry: &Entry,
+    row: &Row,
+) -> ApiResult<Vec<(String, Option<String>)>> {
     if !entry.lists_models {
         return Err(ApiError::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -519,7 +687,7 @@ async fn list_server_models(state: &AppState, entry: &Entry, row: &Row) -> ApiRe
         ));
     };
     match tokio::time::timeout(LIST_TIMEOUT, list_upstream(config, state.providers.http())).await {
-        Ok(Ok(list)) => Ok(list.data.into_iter().map(|m| m.id).collect()),
+        Ok(Ok(list)) => Ok(list.data.into_iter().map(|m| (m.id, m.name)).collect()),
         Ok(Err(e)) => {
             // Only the error's kind is logged: upstream text may echo input.
             tracing::warn!(

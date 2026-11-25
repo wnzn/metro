@@ -231,3 +231,44 @@ test("the keyboard alone searches, chooses a model and a thinking level", async 
   await app.keyboard.press("escape");
   await app.waitFor("label:Model: opus · Claude · Anthropic · Thinking: low");
 });
+
+test("rows show the model's display name with its id beneath, custom thinking levels included; Default names the operator's model when it runs", async () => {
+  const f = world();
+  const get = `GET ${BASE}/v1/*`;
+  const base = f.network[get]!;
+  let operator: { model_id: string; label: string } | null = null;
+  let rows: unknown[] = [{
+    connection_id: "own", name: "Home vLLM", provider_id: "custom", model: "qwen3-32b", capability: "chat",
+    execution: "server", visibility: "personal", owned: true, owner_id: "alice", runs_on: "your_connection", billing: "you",
+    chat_models: [{ id: "qwen3-32b", display_name: "Qwen 3 (home)", reasoning_efforts: ["think_low", "think_high"], is_default: true, available: true }],
+  }];
+  f.network[get] = req => {
+    const url = new URL(req.url);
+    if (url.pathname !== "/v1/models/available") return base(req);
+    return { status: 200, body: { models: rows, operator_model: operator } };
+  };
+  const app = await open("./test/Harness.tsx", { network: f.network as any });
+  await app.waitFor("id:composer-model");
+  await app.press("id:composer-model");
+  await app.press("id:composer-model-options");
+  const row = 'id:composer-model-options:["own","qwen3-32b"]';
+  await app.waitFor(row);
+  expect(app.shows(`${row} >> text:Qwen 3 (home)`)).toBe(true);
+  expect(app.shows(`${row} >> text:qwen3-32b`)).toBe(true); // the id, muted beneath
+  expect(app.shows("text:Thinking: think_low · think_high")).toBe(true); // an owner's own levels are kept
+  await app.press(row);
+  await app.press("id:composer-thinking-options:think_high");
+  await app.press("label:Done");
+  await app.waitFor("id:composer-model >> text:Qwen 3 (home)"); // the closed trigger says the name
+  await app.waitFor("text:· think_high");
+
+  // No chat model of my own, but the operator's: Default says so and stays selectable.
+  rows = [];
+  operator = { model_id: "operator-fixture", label: "Server model (operator)" };
+  await app.press("label:Personal");
+  await app.press("id:composer-model");
+  await app.waitFor("id:composer-operator-model");
+  expect(app.shows("text:Default runs server model (operator): operator-fixture. Add your own model in Model providers.")).toBe(true);
+  await app.press("id:composer-model-options");
+  await app.waitFor("text:Server model (operator): operator-fixture");
+});

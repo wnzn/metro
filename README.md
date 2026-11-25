@@ -29,17 +29,21 @@ own files.
 ## Features
 
 - **Personal Chat:** a private conversation with the agent, plus your agent runs across Spaces.
-- **Spaces:** private groups of rooms. Only members see them, and only the owner adds people.
+- **Spaces:** private groups of rooms. Only members see them, and only the owner adds people, renames or deletes the Space and manages its agents. Any member except the owner can leave.
+- **Several agents per Space:** up to 16, each with its own `@handle`, description, instructions and tools, and one default. Every member can read their settings ([details](docs/spaces.md#agents)).
 - **Child threads:** a room's agent can hand work to bounded threads that report back.
-- **Clear addressing:** `@bob` only notifies Bob. `@agent` or **Ask agent** starts the agent.
-- **Your own model:** a device connection keeps your vendor sign-in or key on your computer; a server-stored API profile keeps an encrypted key on the server.
+- **Clear addressing:** `@bob` only notifies Bob. An agent's `@handle` starts that agent; `@agent` or **Ask agent** starts the default agent, or the one your opt-in classifier picks.
+- **Your own model:** a device connection keeps your vendor sign-in or key on your computer; a server-stored API profile keeps an encrypted key on the server. Each connection has its own model list. A run uses the model picked for that turn, else yours for that agent or Space, else your routing or default chat connection, and never falls back silently ([details](docs/settings.md#which-model-a-run-uses)).
 - **Runners (optional):** give one Space's agent tools over that Space's own directory.
 - **Native desktop app** with reactions, profiles, and dark and light themes.
+
+Several agents per Space, `@handle` addressing, per-Space classification and
+per-connection model lists are in the source since 0.3.2, not released.
 
 Opt-in extras:
 
 - **Scheduled prompts:** the agent gets your prompt once or on a recurrence, in Chat or a room.
-- **Classification and use-case routing:** System One decides whether an unaddressed message is for the agent, and which of your models answers.
+- **Classification (per Space) and use-case routing:** System One decides which agent, if any, an unaddressed message is for, and which of your models answers.
 - **Semantic search:** embeddings over what you can already read, reranked by System One.
 - **Documents & media:** files you upload yourself, indexed on request and searchable by content.
 

@@ -18,7 +18,7 @@ use serde_json::{Value, json};
 
 use crate::metro::{Claim, ErrorKind, Job, MAX_RESPONSE_BYTES, MetroClient, MetroError};
 use crate::policy::{
-    Operation, approved_models, check_typed, operation_allowed, parse_operation,
+    Operation, approved_models_named, check_typed, operation_allowed, parse_operation,
     sanitize_complete_for_kind, sanitize_response,
 };
 use crate::profile::{MAX_REQUEST_TIMEOUT_SECS, SERVER_RUN_TIMEOUT_SECS};
@@ -161,8 +161,8 @@ pub async fn handle_job_observed(
     let work = async {
         match op {
             Operation::Models => {
-                let available = provider.available_models().await?;
-                Ok::<Value, anyhow::Error>(approved_models(allowed, Some(&available)))
+                let available = provider.available_models_named().await?;
+                Ok::<Value, anyhow::Error>(approved_models_named(allowed, &available))
             }
             Operation::Complete(req) => {
                 let clean = sanitize_complete_for_kind(&req, allowed, provider.config.kind)?;

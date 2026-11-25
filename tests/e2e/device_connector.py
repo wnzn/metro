@@ -16,7 +16,7 @@ import stat
 import subprocess
 import threading
 import time
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 import uuid
 
 from smoke import (
@@ -294,6 +294,11 @@ def exercise_rotation(call, port, deadline, alice, models, status, old, foreign,
                 return f"/v1/device/jobs/{quote(job['id'], safe='')}/result"
             time.sleep(min(0.05, remaining(deadline)))
 
+    connection_path = models.removesuffix("/models")
+    connection_id = unquote(connection_path.rsplit("/", 1)[1])
+    before = call(alice, "GET", f"{connection_path}/model-list", read_json=True)["models"]
+    known = {entry["model_id"] for entry in before}
+    require("duplicate" not in known, "unexpected model before the duplicate-result test")
     with ThreadPoolExecutor(max_workers=1) as executor:
         pending = executor.submit(call, alice, "POST", models, body={}, read_json=True)
         result_path = listing_claim(pending)
@@ -302,8 +307,20 @@ def exercise_rotation(call, port, deadline, alice, models, status, old, foreign,
              label="current device result is accepted")
         call(old, "POST", result_path, body={"ok": True, "response": {"models": ["duplicate"]}},
              expect=(204,), label="duplicate delivery is acknowledged without replacing the result")
-        require(pending.result(timeout=remaining(deadline)) == response,
+        listing = pending.result(timeout=remaining(deadline))
+        require(set(listing) == {"models", "added", "unavailable", "connection"}
+                and listing["models"] == response["models"],
                 "a duplicate device result replaced the original")
+        merged = {entry["model_id"]: entry for entry in listing["connection"]["models"]}
+        require(listing["added"] == len({vendor.model} - known) and listing["unavailable"] == 0
+                and listing["connection"]["id"] == connection_id
+                and set(merged) == known | {vendor.model} and "duplicate" not in merged
+                and merged[vendor.model]["enabled"] is True
+                and merged[vendor.model]["available"] is True,
+                "the device listing was not merged into the connection's model list")
+        after = call(alice, "GET", f"{connection_path}/model-list", read_json=True)["models"]
+        require({entry["model_id"] for entry in after} == set(merged),
+                "a duplicate device result reached the stored model list")
 
         pending = executor.submit(
             call, alice, "POST", models, body={}, expect=(502,), label="rotated in-flight listing",

@@ -521,7 +521,7 @@ async fn members_share_a_space_and_only_the_owner_manages_it() {
     let (_, spaces) = s.get(BOB, "/v1/spaces").await;
     assert_eq!(
         spaces["spaces"][0],
-        json!({"id": a, "name": "team", "role": "member", "runner_paired": false})
+        json!({"id": a, "name": "team", "description": "", "role": "member", "runner_paired": false})
     );
     // Members can read the roster (for @mention autocomplete) ...
     let (status, list) = s.get(BOB, &members).await;

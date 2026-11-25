@@ -27,14 +27,44 @@ const AGENT_HANDLE: &str = "agent";
 ///
 /// Wire format: `{"kind":"agent"}` or `{"kind":"user","id":"<member id>"}`.
 /// Unknown kinds and extra fields are rejected.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "lowercase", try_from = "WireMention")]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
+#[serde(try_from = "WireMention")]
 pub enum Mention {
-    /// The room's agent.
+    /// The Space's generic agent (`@agent`): its default agent, or the one
+    /// the sender's opt-in classifier picks.
     Agent,
+    /// One agent of the Space, by id (`{"kind":"agent","agent_id":"ag-…"}`),
+    /// or by its handle in text (`@coder`).
+    AgentId { agent_id: String },
     /// A human member, by stable identity id (`sub` or dev username), never
     /// by display name.
     User { id: String },
+}
+
+impl Serialize for Mention {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut m = s.serialize_map(None)?;
+        match self {
+            Mention::Agent => m.serialize_entry("kind", "agent")?,
+            Mention::AgentId { agent_id } => {
+                m.serialize_entry("kind", "agent")?;
+                m.serialize_entry("agent_id", agent_id)?;
+            }
+            Mention::User { id } => {
+                m.serialize_entry("kind", "user")?;
+                m.serialize_entry("id", id)?;
+            }
+        }
+        m.end()
+    }
+}
+
+impl Mention {
+    /// The generic agent or one named agent.
+    pub fn is_agent(&self) -> bool {
+        matches!(self, Mention::Agent | Mention::AgentId { .. })
+    }
 }
 
 /// Strict wire shape. serde's `deny_unknown_fields` does not reject extra
@@ -46,6 +76,8 @@ struct WireMention {
     kind: WireKind,
     #[serde(default)]
     id: Option<String>,
+    #[serde(default)]
+    agent_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -58,11 +90,13 @@ enum WireKind {
 impl TryFrom<WireMention> for Mention {
     type Error = &'static str;
     fn try_from(w: WireMention) -> Result<Self, Self::Error> {
-        match (w.kind, w.id) {
-            (WireKind::Agent, None) => Ok(Mention::Agent),
-            (WireKind::Agent, Some(_)) => Err("agent mention takes no id"),
-            (WireKind::User, Some(id)) => Ok(Mention::User { id }),
-            (WireKind::User, None) => Err("user mention requires id"),
+        match (w.kind, w.id, w.agent_id) {
+            (WireKind::Agent, None, None) => Ok(Mention::Agent),
+            (WireKind::Agent, None, Some(agent_id)) => Ok(Mention::AgentId { agent_id }),
+            (WireKind::Agent, Some(_), _) => Err("agent mention takes agent_id, not id"),
+            (WireKind::User, Some(id), None) => Ok(Mention::User { id }),
+            (WireKind::User, _, Some(_)) => Err("user mention takes no agent_id"),
+            (WireKind::User, None, None) => Err("user mention requires id"),
         }
     }
 }
@@ -99,6 +133,23 @@ pub fn resolve(
     invoke_agent: bool,
     member_ids: &[String],
 ) -> Result<Vec<Mention>, String> {
+    resolve_with_agents(text, explicit, invoke_agent, None, member_ids, &[])
+}
+
+/// [`resolve`] in a Space with agents: `agents` are `(id, handle)` of the
+/// Space's agents. An explicit [`Mention::AgentId`] must name one of them;
+/// `invoke_agent` with `invoke_agent_id` adds that agent instead of the
+/// generic one. In text, `@handle` of an agent (any ASCII case) wins over a
+/// member id of the same length; the handle `agent` always stays the
+/// generic `@agent`.
+pub fn resolve_with_agents(
+    text: &str,
+    explicit: &[Mention],
+    invoke_agent: bool,
+    invoke_agent_id: Option<&str>,
+    member_ids: &[String],
+    agents: &[(String, String)],
+) -> Result<Vec<Mention>, String> {
     if explicit.len() > MAX_RECIPIENTS {
         return Err(ERR_TOO_MANY.to_owned());
     }
@@ -119,10 +170,28 @@ pub fn resolve(
         {
             return Err(ERR_UNKNOWN.to_owned());
         }
+        if let Mention::AgentId { agent_id } = m
+            && !agents.iter().any(|(id, _)| id == agent_id)
+        {
+            return Err(ERR_UNKNOWN.to_owned());
+        }
         push(m.clone(), &mut out)?;
     }
-    if invoke_agent {
-        push(Mention::Agent, &mut out)?;
+    match (invoke_agent, invoke_agent_id) {
+        (true, None) => push(Mention::Agent, &mut out)?,
+        (true, Some(agent_id)) => {
+            if !agents.iter().any(|(id, _)| id == agent_id) {
+                return Err(ERR_UNKNOWN.to_owned());
+            }
+            push(
+                Mention::AgentId {
+                    agent_id: agent_id.to_owned(),
+                },
+                &mut out,
+            )?;
+        }
+        (false, Some(_)) => return Err("agent_id needs invoke_agent".to_owned()),
+        (false, None) => {}
     }
 
     let handles: Vec<&str> = member_ids
@@ -130,7 +199,12 @@ pub fn resolve(
         .map(String::as_str)
         .filter(|id| is_handle(id) && !id.eq_ignore_ascii_case(AGENT_HANDLE))
         .collect();
-    for m in scan_text(text, &handles) {
+    let agent_handles: Vec<(&str, &str)> = agents
+        .iter()
+        .filter(|(_, h)| is_handle(h) && !h.eq_ignore_ascii_case(AGENT_HANDLE))
+        .map(|(id, h)| (id.as_str(), h.as_str()))
+        .collect();
+    for m in scan_text(text, &handles, &agent_handles) {
         push(m, &mut out)?;
     }
     Ok(out)
@@ -138,7 +212,7 @@ pub fn resolve(
 
 /// `"room"` (no recipients), `"agent"`, `"users"` or `"mixed"`.
 pub fn audience(mentions: &[Mention]) -> &'static str {
-    let agent = mentions.iter().any(|m| matches!(m, Mention::Agent));
+    let agent = mentions.iter().any(Mention::is_agent);
     let users = mentions.iter().any(|m| matches!(m, Mention::User { .. }));
     match (agent, users) {
         (false, false) => "room",
@@ -150,7 +224,7 @@ pub fn audience(mentions: &[Mention]) -> &'static str {
 
 /// True when the agent is among the recipients.
 pub fn invokes_agent(mentions: &[Mention]) -> bool {
-    mentions.iter().any(|m| matches!(m, Mention::Agent))
+    mentions.iter().any(Mention::is_agent)
 }
 
 fn is_handle(id: &str) -> bool {
@@ -264,7 +338,7 @@ fn code_ranges(text: &str) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn scan_text(text: &str, handles: &[&str]) -> Vec<Mention> {
+fn scan_text(text: &str, handles: &[&str], agents: &[(&str, &str)]) -> Vec<Mention> {
     let code = code_ranges(text);
     let in_code = |i: usize| code.iter().any(|&(s, e)| i >= s && i < e);
     let mut found = Vec::new();
@@ -288,12 +362,26 @@ fn scan_text(text: &str, handles: &[&str]) -> Vec<Mention> {
             .filter(|h| rest.starts_with(**h) && closes_token(&rest[h.len()..]))
             .max_by_key(|h| h.len());
 
-        let m = match (user, agent_match) {
+        // Longest agent handle that matches (ASCII case-insensitively).
+        let named = agents
+            .iter()
+            .filter(|(_, h)| {
+                rest.len() >= h.len()
+                    && rest.as_bytes()[..h.len()].eq_ignore_ascii_case(h.as_bytes())
+                    && closes_token(&rest[h.len()..])
+            })
+            .max_by_key(|(_, h)| h.len());
+
+        let m = match (user, named, agent_match) {
+            // An agent handle at least as long as any member id wins.
+            (u, Some((id, h)), _) if u.is_none_or(|u| h.len() >= u.len()) => Mention::AgentId {
+                agent_id: (*id).to_owned(),
+            },
             // A longer member id (e.g. `agent.smith`) beats the bare handle.
-            (Some(h), _) if h.len() > AGENT_HANDLE.len() || !agent_match => Mention::User {
+            (Some(h), _, _) if h.len() > AGENT_HANDLE.len() || !agent_match => Mention::User {
                 id: (*h).to_owned(),
             },
-            (_, true) => Mention::Agent,
+            (_, _, true) => Mention::Agent,
             _ => continue,
         };
         if !found.contains(&m) {
@@ -339,6 +427,7 @@ mod tests {
             r#"{"kind":"user"}"#,
             r#"{"kind":"user","id":"bob","admin":true}"#,
             r#"{"kind":"agent","id":"bob"}"#,
+            r#"{"kind":"user","id":"bob","agent_id":"ag-1"}"#,
             r#"{"id":"bob"}"#,
             r#"{"kind":"user","id":5}"#,
             r#"{"kind":"user","id":null}"#,
@@ -539,6 +628,47 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn named_agents() {
+        let agents = vec![
+            ("ag-1".to_owned(), "coder".to_owned()),
+            ("ag-0".to_owned(), "agent".to_owned()),
+        ];
+        let members = ids(&["alice", "coder2"]);
+        let coder = Mention::AgentId {
+            agent_id: "ag-1".into(),
+        };
+        let r = resolve_with_agents(
+            "@Coder and @agent, @coder2",
+            &[],
+            false,
+            None,
+            &members,
+            &agents,
+        )
+        .unwrap();
+        assert_eq!(r, vec![coder.clone(), Mention::Agent, user("coder2")]);
+        assert_eq!(audience(&r), "mixed");
+        assert_eq!(
+            serde_json::to_string(&coder).unwrap(),
+            r#"{"kind":"agent","agent_id":"ag-1"}"#
+        );
+        let wire: Mention = serde_json::from_str(r#"{"kind":"agent","agent_id":"ag-1"}"#).unwrap();
+        assert_eq!(wire, coder);
+        // Unknown agent ids are refused generically.
+        let bad = Mention::AgentId {
+            agent_id: "ag-9".into(),
+        };
+        assert!(resolve_with_agents("hi", &[bad], false, None, &members, &agents).is_err());
+        assert!(resolve_with_agents("hi", &[], true, Some("ag-9"), &members, &agents).is_err());
+        assert!(resolve_with_agents("hi", &[], false, Some("ag-1"), &members, &agents).is_err());
+        let r = resolve_with_agents("hi", &[], true, Some("ag-1"), &members, &agents).unwrap();
+        assert_eq!(r, vec![coder]);
+        // A member whose id equals a handle loses the text handle.
+        let r = resolve_with_agents("@coder", &[], false, None, &ids(&["coder"]), &agents).unwrap();
+        assert!(matches!(r[0], Mention::AgentId { .. }));
     }
 
     #[test]

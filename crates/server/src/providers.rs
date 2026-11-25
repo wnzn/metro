@@ -43,6 +43,7 @@ pub mod api;
 pub mod catalog;
 pub mod guard;
 mod listed;
+pub mod models;
 pub mod secret;
 pub mod sharing;
 pub mod store;
@@ -116,7 +117,9 @@ pub fn init(conn: &rusqlite::Connection) -> anyhow::Result<()> {
 }
 
 /// `GET /v1/provider-catalog`, `GET|POST /v1/providers`,
-/// `PATCH|DELETE /v1/providers/{id}`, `POST /v1/providers/{id}/models`,
+/// `PATCH|DELETE /v1/providers/{id}`, `POST /v1/providers/{id}/models`
+/// (also `.../model-list/refresh`: list and merge into the connection's
+/// models), `GET|POST|PATCH|DELETE /v1/providers/{id}/model-list`,
 /// `GET|PUT /v1/providers/{id}/sharing` and `GET /v1/models/available`.
 pub fn router() -> Router<AppState> {
     Router::new()
@@ -127,6 +130,14 @@ pub fn router() -> Router<AppState> {
             axum::routing::patch(api::update).delete(api::remove),
         )
         .route("/v1/providers/{id}/models", post(api::models))
+        .route(
+            "/v1/providers/{id}/model-list",
+            get(models::get_list)
+                .post(models::add)
+                .patch(models::patch_one)
+                .delete(models::remove_one),
+        )
+        .route("/v1/providers/{id}/model-list/refresh", post(api::models))
         .route(
             "/v1/providers/{id}/sharing",
             get(sharing::get_sharing).put(sharing::put_sharing),
@@ -145,7 +156,6 @@ struct Inner {
     allowed: Vec<String>,
     http: DynHttpClient,
     listings: Semaphore,
-    listed_chat: Mutex<listed::Cache>,
     typed_calls: Arc<Semaphore>,
     media_calls: Arc<Semaphore>,
     /// Media calls in flight by caller and by connection.
@@ -187,7 +197,6 @@ impl ProviderService {
                 allowed,
                 http: no_redirect_client()?,
                 listings: Semaphore::new(MAX_LISTINGS),
-                listed_chat: Mutex::new(listed::Cache::default()),
                 typed_calls: Arc::new(Semaphore::new(MAX_TYPED_CALLS)),
                 media_calls: Arc::new(Semaphore::new(MAX_MEDIA_CALLS)),
                 media_in_flight: Arc::new(Mutex::new(MediaInFlight::default())),
@@ -643,7 +652,14 @@ pub(crate) async fn turn_model_for(
             return Err(UseError::NotFound);
         }
     }
-    selection.recheck(state, &authorized)?;
+    {
+        let (st, sel, a) = (state.clone(), selection.clone(), authorized.clone());
+        state
+            .db
+            .call(move |db| Ok(sel.recheck(&st, &db.lock(), &a)))
+            .await
+            .map_err(read_error)??;
+    }
     authorized.row.model.clone_from(&selection.model_id);
     build_model_for_turn(state, caller, space, authorized, Some(selection))
 }

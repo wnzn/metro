@@ -7,13 +7,16 @@ import { ManageSpace } from "./ManageSpace";
 import { ScheduledTasksView } from "./ScheduledTasksView";
 import { SearchView } from "./SearchView";
 import { SettingsModal } from "./SettingsView";
+import { SpaceSettingsModal } from "./space/SpaceSettings";
 import { Sidebar } from "./Sidebar";
-import { SpaceView } from "./SpaceView";
+import { RoomHeaderActions, RoomHeaderTitle, SpaceView } from "./SpaceView";
 import { TopSearch } from "./TopSearch";
 
 /**
- * The signed-in app: the sidebar, then the main panel: the search box on
- * top (mod+k focuses it), under it the Chat, Library, Search, Scheduled
+ * The signed-in app: the sidebar (or its icon rail while collapsed; nothing
+ * on a narrow window), then the main panel: one header row (the sidebar's
+ * toggle, a room's breadcrumb and actions, the search box, which mod+k
+ * focuses), under it the Chat, Library, Search, Scheduled
  * tasks, or a Space's room or its management. Settings opens as a modal over
  * all of it and leaves the main panel mounted, so closing it returns to the
  * same place, draft and scroll.
@@ -26,14 +29,21 @@ export function Shell() {
   } catch {
     /* a platform that keeps this keystroke: the sidebar's Settings still opens it */
   }
+  // A Space's room puts its breadcrumb and actions in the same header row.
+  const inRoom = () => mainPlace() === "space" && view() !== "manage";
   return (
     <Surface variant="app" testID="workspace">
-      <Sidebar hidden={!navigationPanel.open()} />
+      <Sidebar mode={navigationPanel.open() ? "full" : compactWidth() ? "hidden" : "rail"} />
       <Column grow testID="main-panel">
-        <CenteredToolbar testID="top-bar" leading={
-          <PanelToggle side="left" name="workspace navigation" caption={compactWidth() ? undefined : "Navigation"} expanded={navigationPanel.open()}
-            shortcut="B" testID="toggle-navigation" onPress={navigationPanel.toggle} />
-        }>
+        <CenteredToolbar
+          testID="top-bar"
+          leading={
+            <PanelToggle side="left" name="workspace navigation" expanded={navigationPanel.open()}
+              shortcut="B" testID="toggle-navigation" onPress={navigationPanel.toggle} />
+          }
+          title={inRoom() ? <RoomHeaderTitle /> : undefined}
+          trailing={inRoom() ? <RoomHeaderActions /> : undefined}
+        >
           <TopSearch />
         </CenteredToolbar>
         <If when={mainPlace() === "chat"}>
@@ -55,6 +65,7 @@ export function Shell() {
         </If>
       </Column>
       <SettingsModal />
+      <SpaceSettingsModal />
     </Surface>
   );
 }

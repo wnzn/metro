@@ -1,5 +1,5 @@
 // A turn says which model answered and why (its `started` marker's
-// `activity.route`), as a compact "Routed: … · N%" badge on the one collapsed
+// `activity.route`), as a compact "Routed: … · N%" part of the one collapsed
 // row and a complete sentence only in its opened details. The raw "(p 0.91)"
 // is never shown. A message System One judged to be for the agent is labelled
 // as detected, never shown as an "@agent" its sender typed.
@@ -73,7 +73,7 @@ test("a classifier-started, use-case-routed turn: detected label, one row with a
   expect(text(app)).not.toContain("System One matched");
   expect(text(app)).not.toContain("gpt-fixture-2");
   expect(text(app)).not.toContain("pc_0123456789abcdef");
-  expect(app.shows("text:2 steps")).toBe(true); // the route is not a step
+  expect(app.shows("id:activity-tools:agent:r1 >> text:1 tool")).toBe(true); // the route is not a tool
 
   await app.press("id:activity-toggle:agent:r1");
   await app.waitFor("id:activity-route:agent:r1");

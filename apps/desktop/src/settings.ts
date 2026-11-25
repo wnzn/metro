@@ -23,7 +23,12 @@ import { ApiError } from "./api/client";
 import type {
   Capability,
   CatalogProvider,
+  ConnectionModel,
+  ConnectionModelList,
+  ConnectionModelPatch,
   DeviceStatus,
+  ModelThinking,
+  NewConnectionModel,
   NewProviderConnection,
   ProviderCatalog,
   ProviderConnection,
@@ -51,9 +56,9 @@ import {
   spaces,
   view,
 } from "./store";
-import { forgetQuietly, localConnections, onLocalPairingChanged, packaged, refreshHelper } from "./device/state";
+import { forgetQuietly, localConnections, localStep, onLocalPairingChanged, packaged, refreshHelper } from "./device/state";
 
-export type { Capability, CatalogProvider, DeviceStatus, ProviderConnection, RegisteredRunner, RunnerVisibility, SpaceRunner };
+export type { Capability, CatalogProvider, ConnectionModel, DeviceStatus, ModelThinking, NewConnectionModel, ProviderConnection, RegisteredRunner, RunnerVisibility, SpaceRunner };
 
 // ------------------------------------------------------------------ the one-time reveal
 
@@ -419,16 +424,23 @@ export const catalog = signal<ProviderCatalog | null>(null);
 export const catalogError = signal<string | null>(null);
 export const connections = signal<ProviderConnection[] | null>(null);
 export const connectionsError = signal<string | null>(null);
-/** What is in flight: "create", "patch:<id>", "delete:<id>", "token:<id>". */
+/** The technical text behind `connectionsError` (HTTP status, server wording), shown only on request. */
+export const connectionsErrorDetail = signal<string | null>(null);
+/** What is in flight: "create", "patch:<id>", "delete:<id>", "token:<id>", "model:<id>". */
 export const providerBusy = signal<string | null>(null);
 export const providerNotice = signal<string | null>(null);
 export const providerConfirmDelete = signal<string | null>(null);
 
 export type ModelListing =
   | { state: "loading" }
-  | { state: "ok"; models: string[] }
-  /** `offline`: a device connection whose metro-connector didn't answer. */
-  | { state: "error"; message: string; offline: boolean };
+  /** `added` / `unavailable`: what the refresh changed in the connection's list. */
+  | { state: "ok"; models: string[]; added?: number; unavailable?: number }
+  /**
+   * `message` is one plain sentence; `detail` the technical text behind it
+   * (shown only under Technical details). `offline`: a device connection
+   * whose metro-connector didn't answer.
+   */
+  | { state: "error"; message: string; offline: boolean; detail?: string };
 /** The last model listing per connection id. */
 export const modelListings = signal<Record<string, ModelListing>>({});
 /** Paired / online per device connection, as last loaded; `error` when it couldn't be read. */
@@ -486,12 +498,12 @@ export async function loadConnections(): Promise<void> {
     if (!ok() || seq !== connectionsSeq) return;
     batch(() => {
       connections.set(list);
-      connectionsError.set(null);
+      clearProviderError();
     });
     for (const x of list) if (isDeviceConnection(x)) void loadDeviceStatus(x.id);
   } catch (error) {
     if (!ok() || seq !== connectionsSeq) return;
-    settingsError(error, connectionsError, "Could not load your connections");
+    providerError(error, "Could not load your connections");
   }
 }
 
@@ -506,13 +518,14 @@ export async function createConnection(body: NewProviderConnection, opts: { fetc
   const ok = sessionGuard();
   batch(() => {
     providerBusy.set("create");
-    connectionsError.set(null);
+    clearProviderError();
     providerNotice.set(null);
     providerConfirmDelete.set(null);
     dismissReveal();
   });
   try {
-    const created = await c.createProvider(body);
+    const listing = opts.fetchModels && providerById(body.provider_id)?.execution !== "device" && providerById(body.provider_id)?.listsModels !== false;
+    const created = await c.createProvider(listing ? { ...body, fetch_models: true } : body);
     if (!ok()) return null;
     connectionsSeq++;
     connections.set([...(connections() ?? []).filter((x) => x.id !== created.id), created]);
@@ -531,23 +544,37 @@ export async function createConnection(body: NewProviderConnection, opts: { fetc
           reveal({ kind: "device", reason: "created", connectionId: created.id, connectionName: created.name, providerId: created.providerId, token });
         } else providerNotice.set(`“${created.name}” was added. Open it and press New device token to set up metro-connector.`);
       } catch (error) {
-        if (ok()) settingsError(error, connectionsError, `“${created.name}” was saved, but its device token could not be issued; press New device token to try again`);
+        if (ok()) providerError(error, `“${created.name}” was saved, but its device token could not be issued; press New device token to try again`);
       }
     } else {
-      providerNotice.set(`Saved “${created.name}”.${created.hasKey ? " Its key is stored encrypted and is never shown again." : ""}`);
+      const n = created.models.filter((m) => m.enabled).length;
+      const models = n > 0 ? ` ${n} model${n === 1 ? "" : "s"} ready.` : "";
+      providerNotice.set(`Saved “${created.name}”.${models}${created.hasKey ? " Its key is stored encrypted and is never shown again." : ""}`);
+    }
+    if (created.modelsError) {
+      modelListings.set({
+        ...modelListings(),
+        [created.id]: { state: "error", offline: false, message: "Saved, but its models couldn't be listed. Check the key and endpoint, then press Refresh models, or add a model by hand.", detail: created.modelsError },
+      });
+    } else if (listing) {
+      modelListings.set({ ...modelListings(), [created.id]: { state: "ok", models: created.models.map((m) => m.modelId), added: created.models.length } });
     }
     void loadConnections();
-    if (opts.fetchModels && !device) void fetchModels(created.id);
     return created;
   } catch (error) {
-    if (ok()) settingsError(error, connectionsError, "Could not save the connection");
+    if (ok()) providerError(error, "Could not save the connection");
     return null;
   } finally {
     if (ok()) providerBusy.set(null);
   }
 }
 
-/** Lists a connection's models. A device connection answers only while its metro-connector is online. */
+/**
+ * Lists a connection's models again and merges them into its list (new ones
+ * enabled, ones no longer listed marked unavailable; nothing of the owner's
+ * is dropped). For a device connection this is also its connection test: it
+ * answers only while its metro-connector is online.
+ */
 export async function fetchModels(id: string): Promise<void> {
   const c = apiClient();
   if (!c) return;
@@ -558,9 +585,13 @@ export async function fetchModels(id: string): Promise<void> {
   const known = connections()?.find((x) => x.id === id);
   if (known && isDeviceConnection(known)) void loadDeviceStatus(id);
   try {
-    const models = await c.listProviderModels(id);
+    const result = await c.refreshConnectionModels(id);
     if (!ok() || modelsSeq.get(id) !== seq) return;
-    modelListings.set({ ...modelListings(), [id]: { state: "ok", models } });
+    batch(() => {
+      modelListings.set({ ...modelListings(), [id]: { state: "ok", models: result.models, added: result.added, unavailable: result.unavailable } });
+      if (result.connection) replaceConnection(result.connection);
+    });
+    if (!result.connection) void loadConnections();
     // A test that went through the device: this computer's state may have moved on too (status only).
     if (known && isDeviceConnection(known) && packaged()) void refreshHelper();
   } catch (error) {
@@ -578,14 +609,89 @@ export async function fetchModels(id: string): Promise<void> {
     }
     const detail = error instanceof ApiError ? error.message : describe(error, "error");
     const message = device && packaged()
-      ? `This connection's device didn't answer. ${localConnections()[id] ? "Finish its setup on this computer (Set up on this computer), or check that the computer serving it is online." : "It isn't set up on this computer: press Set up on this computer, or start it where it was paired."} (${detail})`
+      ? localConnections()[id]
+        ? "This device didn't answer. Check that the computer serving it is online, or finish its setup here."
+        : "This device isn't set up here yet."
       : device
-      ? `metro-connector for this connection didn't answer. Start it on the computer you set it up on (metro-connector run), finish signing in there, then test again. (${detail})`
+      ? "metro-connector for this connection didn't answer. Start it on the computer you set it up on (metro-connector run), then test again."
       : error instanceof ApiError && !error.transient
-        ? `This endpoint didn't list its models, so pick nothing from a list: enter the model ID by hand below. (${detail})`
-        : `Couldn't reach the endpoint to list models. Try again, or enter the model ID by hand. (${detail})`;
-    modelListings.set({ ...modelListings(), [id]: { state: "error", message, offline: device } });
+        ? "This endpoint didn't list its models. Add the model you want by hand."
+        : "Couldn't reach the endpoint to list its models. Try again, or add a model by hand.";
+    modelListings.set({ ...modelListings(), [id]: { state: "error", message, offline: device, detail } });
   }
+}
+
+/** Puts the server's latest view of one connection in the list (its models included). */
+function replaceConnection(next: ProviderConnection) {
+  connectionsSeq++;
+  const list = connections() ?? [];
+  connections.set(list.some((x) => x.id === next.id) ? list.map((x) => (x.id === next.id ? { ...next, visibility: next.visibility ?? x.visibility } : x)) : [...list, next]);
+}
+
+/** Applies a model-list answer to its connection: the models, and the default model they name. */
+function applyModelList(list: ConnectionModelList) {
+  connectionsSeq++;
+  connections.set(
+    (connections() ?? []).map((x) =>
+      x.id === list.connectionId ? { ...x, models: list.models, customThinking: list.customThinking, model: list.defaultModel ?? x.model } : x,
+    ),
+  );
+}
+
+/** A connection's models in the order the server keeps them. */
+export const connectionModels = (c: ProviderConnection): ConnectionModel[] => [...c.models].sort((a, b) => a.position - b.position);
+
+/** The connection's default model's name as pickers show it, else its id, else null. */
+export function defaultModelName(c: ProviderConnection): string | null {
+  const m = c.models.find((x) => x.isDefault) ?? c.models.find((x) => x.modelId === c.model);
+  return m?.displayName ?? c.model;
+}
+
+async function modelListChange(id: string, run: (c: NonNullable<ReturnType<typeof apiClient>>) => Promise<ConnectionModelList>, what: string, done?: string): Promise<boolean> {
+  const c = apiClient();
+  if (!c || providerBusy()) return false;
+  const ok = sessionGuard();
+  batch(() => {
+    providerBusy.set(`model:${id}`);
+    clearProviderError();
+    providerNotice.set(null);
+  });
+  try {
+    const list = await run(c);
+    if (!ok()) return false;
+    batch(() => {
+      applyModelList(list);
+      if (done) providerNotice.set(done);
+    });
+    return true;
+  } catch (error) {
+    if (ok()) providerError(error, what, () => void loadConnections());
+    return false;
+  } finally {
+    if (ok()) providerBusy.set(null);
+  }
+}
+
+/** Adds a model by hand (enabled). */
+export function addConnectionModel(id: string, model: NewConnectionModel): Promise<boolean> {
+  const body: NewConnectionModel = { model_id: model.model_id.trim() };
+  if (model.display_name?.trim()) body.display_name = model.display_name.trim();
+  if (model.thinking && model.thinking.efforts.length > 0 && model.thinking.wire !== "none") body.thinking = model.thinking;
+  if (!body.model_id) {
+    connectionsError.set("Enter the model ID your provider documents.");
+    return Promise.resolve(false);
+  }
+  return modelListChange(id, (c) => c.addConnectionModel(id, body), "Couldn't add the model", `Added ${body.display_name ?? body.model_id}.`);
+}
+
+/** Renames, switches on or off, changes thinking options, or makes a model the connection's default. */
+export function patchConnectionModel(id: string, patch: ConnectionModelPatch, done?: string): Promise<boolean> {
+  return modelListChange(id, (c) => c.patchConnectionModel(id, patch), "Couldn't save the model change", done);
+}
+
+/** Removes a model added by hand. */
+export function removeConnectionModel(id: string, modelId: string): Promise<boolean> {
+  return modelListChange(id, (c) => c.removeConnectionModel(id, modelId), "Couldn't remove the model");
 }
 
 /** Saves a change to a connection: its model, name, default or a replacement key. */
@@ -599,7 +705,7 @@ export async function updateConnection(id: string, patch: ProviderPatch, done?: 
   const ok = sessionGuard();
   batch(() => {
     providerBusy.set(`patch:${id}`);
-    connectionsError.set(null);
+    clearProviderError();
     providerNotice.set(null);
   });
   try {
@@ -627,7 +733,7 @@ export async function updateConnection(id: string, patch: ProviderPatch, done?: 
     void loadConnections();
     return true;
   } catch (error) {
-    if (ok()) settingsError(error, connectionsError, "Could not save the change", () => void loadConnections());
+    if (ok()) providerError(error, "Could not save the change", () => void loadConnections());
     return false;
   } finally {
     if (ok()) providerBusy.set(null);
@@ -642,7 +748,7 @@ export async function deleteConnection(id: string): Promise<void> {
   batch(() => {
     providerBusy.set(`delete:${id}`);
     providerConfirmDelete.set(null);
-    connectionsError.set(null);
+    clearProviderError();
     providerNotice.set(null);
   });
   try {
@@ -662,7 +768,7 @@ export async function deleteConnection(id: string): Promise<void> {
     void forgetQuietly(id);
     void loadConnections();
   } catch (error) {
-    if (ok()) settingsError(error, connectionsError, "Could not delete the connection", () => void loadConnections());
+    if (ok()) providerError(error, "Could not delete the connection", () => void loadConnections());
   } finally {
     if (ok()) providerBusy.set(null);
   }
@@ -677,7 +783,13 @@ export async function loadDeviceStatus(id: string): Promise<void> {
   try {
     const value = await c.deviceStatus(id);
     if (!ok() || statusSeq.get(id) !== seq) return;
+    const before = deviceStatuses()[id];
     deviceStatuses.set({ ...deviceStatuses(), [id]: value });
+    // A device that just came online with no models yet: list them once, so
+    // nobody has to press Refresh after pairing.
+    const wasOnline = !!before && !("error" in before) && before.online;
+    const connection = connections()?.find((x) => x.id === id);
+    if (value.online && !wasOnline && connection && connection.models.length === 0 && modelListings()[id]?.state !== "loading") void fetchModels(id);
   } catch (error) {
     if (!ok() || statusSeq.get(id) !== seq || isAborted(error)) return;
     if (error instanceof ApiError && error.kind === "auth") {
@@ -697,7 +809,7 @@ export async function unpairDevice(id: string): Promise<void> {
   batch(() => {
     providerBusy.set(`unpair:${id}`);
     deviceConfirmUnpair.set(null);
-    connectionsError.set(null);
+    clearProviderError();
     providerNotice.set(null);
   });
   try {
@@ -716,7 +828,7 @@ export async function unpairDevice(id: string): Promise<void> {
     void forgetQuietly(id);
     void loadDeviceStatus(id);
   } catch (error) {
-    if (ok()) settingsError(error, connectionsError, "Could not unpair the device", () => void loadConnections());
+    if (ok()) providerError(error, "Could not unpair the device", () => void loadConnections());
   } finally {
     if (ok()) providerBusy.set(null);
   }
@@ -730,7 +842,7 @@ export function openDeviceSetup(id: string) {
   const connection = connections()?.find((x) => x.id === id);
   if (!connection || !packaged()) return;
   batch(() => {
-    connectionsError.set(null);
+    clearProviderError();
     providerNotice.set(null);
     dismissReveal();
   });
@@ -752,7 +864,7 @@ export async function rotateDeviceToken(id: string): Promise<void> {
   const ok = sessionGuard();
   batch(() => {
     providerBusy.set(`token:${id}`);
-    connectionsError.set(null);
+    clearProviderError();
     providerNotice.set(null);
     dismissReveal();
   });
@@ -764,7 +876,7 @@ export async function rotateDeviceToken(id: string): Promise<void> {
       reveal({ kind: "device", reason: "rotated", connectionId: id, connectionName: connection.name, providerId: connection.providerId, token });
     }
   } catch (error) {
-    if (ok()) settingsError(error, connectionsError, "Could not issue a device token", () => void loadConnections());
+    if (ok()) providerError(error, "Could not issue a device token", () => void loadConnections());
   } finally {
     if (ok()) providerBusy.set(null);
   }
@@ -779,6 +891,48 @@ export function isAllowedBaseUrl(url: string): boolean {
 }
 
 // ------------------------------------------------------------------ errors and lifecycle
+
+function clearProviderError() {
+  connectionsError.set(null);
+  connectionsErrorDetail.set(null);
+}
+
+/** The server's own short reason in an HTTP error ("…failed with HTTP 409: <reason>"), else null. */
+export function serverReason(error: unknown): string | null {
+  if (!(error instanceof ApiError) || (error.kind !== "http" && error.kind !== "not_found" && error.kind !== "forbidden")) return null;
+  const m = /HTTP \d{3}\)?: (.+?)\.?$/.exec(error.message);
+  const reason = m?.[1]?.trim();
+  return reason ? reason.charAt(0).toUpperCase() + reason.slice(1) : null;
+}
+
+/**
+ * A provider change failed: one plain sentence in `connectionsError` (what
+ * failed, and the server's reason when it gave one), and the technical text
+ * (method, path, HTTP status) in `connectionsErrorDetail`, shown on request.
+ */
+function providerError(error: unknown, what: string, onGone?: () => void) {
+  if (isAborted(error)) return;
+  if (error instanceof ApiError && error.kind === "auth") {
+    disconnect(error.message);
+    return;
+  }
+  if (error instanceof ApiError && error.kind === "not_found" && onGone) onGone();
+  const detail = error instanceof ApiError ? error.message : describe(error, what);
+  const reason = serverReason(error);
+  const plain =
+    error instanceof ApiError && (error.kind === "network" || error.kind === "timeout")
+      ? `${what}: the server didn't answer. Try again.`
+      : reason
+        ? `${what}. ${reason}.`
+        : error instanceof ApiError
+          ? `${what}.`
+          : detail;
+  batch(() => {
+    connectionsError.set(plain);
+    connectionsErrorDetail.set(error instanceof ApiError ? detail : null);
+  });
+}
+
 
 function settingsError(error: unknown, target: { set(v: string | null): void }, what: string, onGone?: () => void) {
   if (isAborted(error)) return;
@@ -814,8 +968,11 @@ effect(() => {
 });
 
 // A pairing on this computer changed: the server's paired/online view follows.
+// Pairing just completed here: list the device's models at once (the user never presses Refresh).
 onLocalPairingChanged((id) => {
-  if (connections()?.some((x) => x.id === id)) void loadDeviceStatus(id);
+  if (!connections()?.some((x) => x.id === id)) return;
+  void loadDeviceStatus(id);
+  if (localStep(localConnections()[id]) === "ready" && modelListings()[id]?.state !== "loading") void fetchModels(id);
 });
 
 onManageOpen((spaceId) => {
@@ -846,7 +1003,7 @@ onSessionEnd(() => {
   catalog.set(null);
   catalogError.set(null);
   connections.set(null);
-  connectionsError.set(null);
+  clearProviderError();
   providerBusy.set(null);
   providerNotice.set(null);
   providerConfirmDelete.set(null);

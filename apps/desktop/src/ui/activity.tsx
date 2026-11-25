@@ -10,6 +10,7 @@
 import { Image, Text, View, cleanup, createMotion, reduceMotion, token, windowSize } from "nsh";
 import type { ImageAsset, JSX, Tokens } from "nsh";
 import { Button } from "nsh/base";
+import agentIcon from "./icons/agent.svg";
 import chatIcon from "./icons/chat.svg";
 import checkIcon from "./icons/check.svg";
 import chevronDownIcon from "./icons/chevron-down.svg";
@@ -113,18 +114,66 @@ export function StepIcon(props: { phase: StepPhase; testID?: string }) {
  * open) and the label. Space and Return press it. Say the state in
  * `accessibilityLabel` ("Show details: …" / "Hide details: …").
  */
-export function DisclosureToggle(props: { label: string; expanded: boolean; onPress: () => void; accessibilityLabel?: string; testID?: string; children?: JSX.Element }) {
+export function DisclosureToggle(props: { label: string; expanded: boolean; onPress: () => void; accessibilityLabel?: string; testID?: string; leading?: JSX.Element; children?: JSX.Element }) {
   return (
     <Button
-      class={cx("flex-row items-center gap-(--space-2) min-h-[28px] rounded-(--radius-sm) pl-(--space-1) pr-(--space-2) hover:bg-muted active:bg-muted", focusRing)}
+      class={cx("flex-row items-center gap-(--space-2) min-h-[28px] shrink min-w-0 rounded-(--radius-sm) pl-(--space-1) pr-(--space-2) hover:bg-muted active:bg-muted", focusRing)}
       onPress={props.onPress}
       accessibilityLabel={props.accessibilityLabel ?? props.label}
       testID={props.testID}
     >
       <Glyph src={props.expanded ? chevronDownIcon : chevronRightIcon} tint="muted-foreground" />
-      <Text class="text-(length:--text-sm) font-medium text-foreground">{props.label}</Text>
+      {props.leading}
+      <Text class="shrink min-w-0 text-(length:--text-sm) font-medium text-foreground" style={{ numberOfLines: 1 }}>{props.label}</Text>
       {props.children}
     </Button>
+  );
+}
+
+/**
+ * The parts of an activity's one-line summary after its name, quiet and
+ * separated by middle dots ("thought 12s · 2 tools · Routed: …"). Each part
+ * may carry its own testID.
+ */
+export function SummaryParts(props: { parts: readonly { text: string; testID?: string }[] }) {
+  return (
+    <Each of={[...props.parts]} key={(p) => p.text}>
+      {(p) => (
+        <View class="flex-row items-center gap-(--space-2) shrink min-w-0" testID={p().testID}>
+          <Text class="text-(length:--text-sm) text-muted-foreground" accessibilityElementsHidden>·</Text>
+          <Text class="shrink min-w-0 text-(length:--text-sm) text-muted-foreground" style={{ numberOfLines: 1 }}>
+            {p().text}
+          </Text>
+        </View>
+      )}
+    </Each>
+  );
+}
+
+/** A small picture before an agent's name in its summary line (its avatar), or the agent glyph. */
+export function AgentMark(props: { picture?: JSX.Element }) {
+  return (
+    <If when={props.picture} else={<View class="size-[20px] items-center justify-center rounded-full bg-tone-agent" accessibilityElementsHidden><Glyph src={agentIcon} tint="tone-agent-foreground" size={12} /></View>}>
+      <View class="size-[20px] items-center justify-center" accessibilityElementsHidden>{props.picture}</View>
+    </If>
+  );
+}
+
+/**
+ * One entry of a turn's timeline: its phase icon on a thin vertical line
+ * that joins it to the next entry (none after the last), the content beside.
+ */
+export function TimelineEntry(props: { phase: StepPhase; iconTestID?: string; last?: boolean; testID?: string; children?: JSX.Element }) {
+  return (
+    <View class="flex-row gap-(--space-3) min-w-0" testID={props.testID}>
+      <View class="w-[20px] shrink-0 flex-col items-center">
+        <StepIcon phase={props.phase} testID={props.iconTestID} />
+        <If when={!props.last}>
+          <View class="w-px flex-1 min-h-[8px] bg-border" accessibilityElementsHidden />
+        </If>
+      </View>
+      <View class={cx("flex-1 min-w-0 flex-col gap-(--space-1)", !props.last && "pb-(--space-3)")}>{props.children}</View>
+    </View>
   );
 }
 

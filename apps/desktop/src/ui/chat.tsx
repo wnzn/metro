@@ -100,7 +100,8 @@ export function MessageFrame(
       <If when={props.highlight}>
         <View class="absolute left-0 top-[3px] bottom-[3px] w-[3px] rounded-full bg-tone-warning-foreground" accessibilityElementsHidden />
       </If>
-      <View class="w-[52px] shrink-0 items-center">{props.gutter}</View>
+      {/* The picture's top on the author line's; the time of a follow-up on its first line. */}
+      <View class="w-[52px] shrink-0 self-start items-center">{props.gutter}</View>
       <View class="flex-1 min-w-0 flex-col gap-[2px]" selectable={props.selectable}>
         {props.children}
       </View>
@@ -113,9 +114,10 @@ export function MessageFrame(
 }
 
 /** The author line of a message: name, markers and time on one baseline. */
-export function MessageHeader(props: Testable & { children?: JSX.Element }) {
+export function MessageHeader(props: Testable & { children?: JSX.Element; slim?: boolean }) {
+  // `slim`: a follow-up's recipients alone, as high as the time in the gutter beside it.
   return (
-    <View class="flex-row flex-wrap items-center gap-x-(--space-2) gap-y-px" testID={props.testID}>
+    <View class={cx("flex-row flex-wrap items-center gap-x-(--space-2) gap-y-px min-w-0", props.slim && "min-h-[16px] pt-px")} testID={props.testID}>
       {props.children}
     </View>
   );
@@ -139,12 +141,12 @@ export function AuthorName(props: Testable & { name: string; agent?: boolean; de
   );
 }
 
-/** A quiet marker after an author's name ("you", "agent"). */
+/** A quiet marker after an author's name ("you"): plain muted words, never a pill. */
 export function AuthorTag(props: Testable & { label: string; tone?: Tone }) {
   return (
-    <View class={cx("rounded-full px-[6px] py-px", toneSurfaceClass[props.tone ?? "neutral"])} testID={props.testID}>
-      <Text class={cx("text-[11px] font-medium", toneTextClass[props.tone ?? "neutral"])}>{props.label}</Text>
-    </View>
+    <Text class="text-(length:--text-xs) text-muted-foreground" testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
+      {props.label}
+    </Text>
   );
 }
 

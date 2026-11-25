@@ -105,7 +105,9 @@ for (const width of [780, 860, 960]) {
     const f = world();
     f.state.runs.push({ id: "run1", space_id: "acme", room_id: "lobby", status: "running", actor: "alice", task: "Audit the build" });
     const app = await inChat(f, width);
-    await app.waitFor("id:runs-toggle >> text:Runs · 1 active");
+    await app.waitFor("label:Show agent runs, 1 active");
+    expect(app.shows("id:runs-toggle-attention")).toBe(true);
+    expect(app.shows("id:runs-toggle >> text:/Runs/")).toBe(false); // icon only
     expect(app.shows("id:runs-aside")).toBe(false); // never squeezed beside the Chat
     await app.type("id:composer", "my chat draft");
 

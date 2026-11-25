@@ -65,7 +65,7 @@ test("the media model is chosen in Settings › Model providers: its data flow i
   expect(lib(w, "/v1/library/settings", "PUT").length).toBe(0); // nothing saved until Save
 
   await app.press("id:library-model-picker");
-  await app.press("text:/My EG2/");
+  await app.press("text:My EG2 · google/embeddinggemma-2"); // the option, not the connection's row
   await app.press("id:library-model-save");
   await app.waitUntil(() => lib(w, "/v1/library/settings", "PUT").length === 1);
   expect(lib(w, "/v1/library/settings", "PUT")[0]!.body).toBe(JSON.stringify({ embedding_id: own }));

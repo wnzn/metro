@@ -10,8 +10,10 @@ export type Target = {
   key: string;
   /** "model · connection · provider": what search matches and screen readers say. */
   label: string;
-  /** The model as the row and the closed trigger show it. */
+  /** The model as the row and the closed trigger show it: its display name, else its id. */
   model: string;
+  /** The model's id, shown muted under its name. */
+  modelId?: string;
   /** The connection's own name (two connections of one provider stay apart). */
   connection: string;
   provider: TargetProvider;
@@ -45,13 +47,14 @@ function targets(rows: AvailableModel[], names: ReadonlyMap<string, string>): Ta
     const detail = m.runsOn === "owner_connection"
       ? `${m.ownerId ?? "The owner"} can see these requests and may pay for them.`
       : m.runsOn === "your_own_sign_in" ? "Shared preset · uses your own sign-in." : undefined;
-    return (m.chatModels ?? [{ id: undefined, reasoningEfforts: [] }]).map(model => {
+    const models: { id?: string; reasoningEfforts: string[]; displayName?: string }[] = m.chatModels ?? [{ id: undefined, reasoningEfforts: [] }];
+    return models.map(model => {
       const choice = model.id === undefined ? { connectionId: m.connectionId } : { connectionId: m.connectionId, modelId: model.id };
       return {
         key: keyFor(choice), choice, detail, levels: model.reasoningEfforts,
         fetchFrom: m.owned && m.execution === "server" && m.runsOn === "your_connection" ? m.name || m.providerId : undefined,
-        label: [model.id ?? m.model, m.name, provider.name].filter(Boolean).join(" · "),
-        model: model.id ?? m.model ?? m.name, connection: m.name, provider,
+        label: [model.displayName && model.displayName !== model.id ? model.displayName : null, model.id ?? m.model, m.name, provider.name].filter(Boolean).join(" · "),
+        model: model.displayName ?? model.id ?? m.model ?? m.name, modelId: model.id ?? m.model ?? undefined, connection: m.name, provider,
       };
     });
   });

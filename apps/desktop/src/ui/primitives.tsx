@@ -3,10 +3,10 @@
 // in theme/theme.json. To swap the design system, replace this module while
 // keeping its exports' props.
 
-import { List, Scroll, signal, Text, View } from "nsh";
+import { effect, keymap, List, Scroll, signal, Text, View } from "nsh";
 import type { JSX, ListRef } from "nsh";
-import { Button, Collapsible, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
-import { Icon } from "./chrome";
+import { Button, Collapsible, ContextMenu, Input, Menu, MenuItem, MenuSeparator, Radio, RadioGroup, Select, Switch } from "nsh/base";
+import { Icon, SpaceTile } from "./chrome";
 import type { IconColor, IconName } from "./chrome";
 import {
   actionDisabledClass,
@@ -28,6 +28,7 @@ import {
   toneSolidClass,
   toneSurfaceClass,
   toneTextClass,
+  tooltipClass,
   transitionClass,
 } from "./tokens";
 import type { Space, Tone } from "./tokens";
@@ -94,6 +95,7 @@ export function Spacer() {
 export type SurfaceVariant =
   | "app"
   | "sidebar"
+  | "rail"
   | "panel"
   | "card"
   | "dialog"
@@ -111,7 +113,10 @@ export type SurfaceVariant =
 
 const surfaceClass: Record<SurfaceVariant, string> = {
   app: "flex-1 flex-row bg-background",
-  sidebar: "w-(--sidebar-width) bg-sidebar border-r border-sidebar-border",
+  // Navy deepening toward a lighter tone, ended by a hairline rather than a hard border.
+  sidebar: "w-(--sidebar-width) bg-sidebar bg-linear-to-b from-sidebar to-sidebar-gradient-end border-r border-sidebar-border/70",
+  /** A collapsed sidebar: one column of icons, the account at the bottom. */
+  rail: "w-[56px] shrink-0 items-center bg-sidebar bg-linear-to-b from-sidebar to-sidebar-gradient-end border-r border-sidebar-border/70 py-(--space-3) gap-(--space-1)",
   panel: "flex-1 min-w-0 bg-background",
   // Cards are flat: a border, no shadow. Only popovers and dialogs float.
   card: "bg-card border border-border rounded-(--radius)",
@@ -122,14 +127,16 @@ const surfaceClass: Record<SurfaceVariant, string> = {
   section: "border-b border-border",
   scroll: "flex-1 min-h-0",
   content: "w-full max-w-(--content-width) self-center",
-  topbar: "flex-row items-center justify-center min-h-[52px] px-(--space-4) py-(--space-2) border-b border-border bg-background",
+  // One height with the sidebar's brand header and the rail's (--header-height), its divider inside it, so both dividers share one y.
+  topbar: "flex-row items-center justify-center shrink-0 h-(--header-height) px-(--space-4) border-b border-border bg-background",
   popover: "bg-popover border border-border rounded-(--radius-lg) shadow-lg",
 };
 
-export function Surface(props: StackProps & { variant: SurfaceVariant; hidden?: boolean }) {
+export function Surface(props: StackProps & { variant: SurfaceVariant; hidden?: boolean; /** A side panel's width the user chose (points), over the variant's own. */ width?: number }) {
   return (
     <View
-      class={cx(surfaceClass[props.variant], stackClass({ ...props, grow: false }, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col"), props.grow && "flex-1 min-h-0", props.hidden && "hidden")}
+      class={cx(surfaceClass[props.variant], stackClass({ ...props, grow: false }, props.variant === "toolbar" || props.variant === "topbar" || props.variant === "app" ? "row" : "col"), props.grow && "flex-1 min-h-0", props.hidden && "hidden", props.width !== undefined && "shrink-0")}
+      style={props.width !== undefined ? { width: props.width } : undefined}
       accessibilityElementsHidden={props.hidden}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
@@ -143,15 +150,29 @@ export function Divider() {
   return <View class="h-px bg-border" />;
 }
 
-/** Keep search on the main pane's centerline. Reserve the actual width of
- * the leading control on both sides, including when it becomes icon-only. */
-export function CenteredToolbar(props: Children & Testable & { leading: JSX.Element }) {
+/**
+ * The main pane's one header row, divided from the content under it by a
+ * line. Alone, `children` (the search box) fills the row and stays on the
+ * pane's centerline: the leading control's actual width is reserved on both
+ * sides. With a `title` (a room's breadcrumb) and `trailing` actions the row
+ * reads leading, title, search, actions, the search filling the middle.
+ */
+export function CenteredToolbar(props: Children & Testable & { leading: JSX.Element; title?: JSX.Element; trailing?: JSX.Element }) {
   const leadingWidth = signal(0);
+  const split = () => !!(props.title || props.trailing);
+  // One tree either way, so the search box keeps its focus as the place changes.
   return (
     <Surface variant="topbar" testID={props.testID} gap={2}>
       <View class="shrink-0" onLayout={e => leadingWidth.set(e.bounds.size.width)}>{props.leading}</View>
-      <Column grow align="center">{props.children}</Column>
-      <View class="shrink-0" style={{ width: leadingWidth() }} accessibilityElementsHidden />
+      <If when={split()}>
+        {/* The title takes what it needs; when the row is tight the search box gives way first (to 180), then the title (to 120). */}
+        <View class="shrink min-w-[120px] max-w-[40%] flex-row items-center overflow-hidden">{props.title}</View>
+      </If>
+      {/* The search box fills the space between the leading toggle (and a title) and the trailing actions, inset from both. */}
+      <View class={cx("flex-1 flex-col items-stretch px-(--space-2)", split() ? "min-w-[180px]" : "min-w-0")}>{props.children}</View>
+      <View class="shrink-0 flex-row items-center gap-(--space-2)" style={split() ? undefined : { width: leadingWidth() }} accessibilityElementsHidden={!split()}>
+        {props.trailing}
+      </View>
     </Surface>
   );
 }
@@ -201,6 +222,8 @@ export function Label(
     lines?: number;
     /** Screen readers treat it as a heading (page and section titles). */
     heading?: boolean;
+    /** More words on hover (a description that has no room on screen). */
+    tooltip?: string;
     children?: JSX.Element;
   },
 ) {
@@ -211,6 +234,7 @@ export function Label(
       role={props.heading ? "header" : undefined}
       testID={props.testID}
       accessibilityLabel={props.accessibilityLabel}
+      tooltip={props.tooltip ? <Text class={tooltipClass}>{props.tooltip}</Text> : undefined}
     >
       {props.children}
     </Text>
@@ -330,7 +354,10 @@ export function ActionBar(props: Testable & { children?: JSX.Element; justify?: 
   );
 }
 
-const indentClass = ["", "ml-(--space-4)", "ml-[32px]", "ml-[48px]", "ml-[64px]"];
+// Nesting is inner padding, never a margin: a nested row's selected pill
+// keeps the list's full width, and its glyph lines up under its parent's
+// name (the parent's 20-point leading slot plus the 8-point gap: 28 more).
+const indentClass = ["pl-(--space-3)", "pl-[40px]", "pl-[56px]", "pl-[72px]", "pl-[88px]"];
 
 /** A selectable row in a navigation list (Chat, Spaces, rooms, threads). */
 export function NavItem(
@@ -338,22 +365,37 @@ export function NavItem(
     label: string;
     selected: boolean;
     onPress: () => void;
-    /** A short glyph before the label ("#", "›"). Ignored when `icon` is set. */
+    /** A short glyph before the label ("#", "›"). Ignored when `icon` or `tile` is set. */
     prefix?: string;
     /** An icon of the app's family before the label, in place of `prefix`. */
     icon?: IconName;
+    /** A rounded letter tile before the label (a Space), its color fixed by `seed`. */
+    tile?: { initial: string; seed: string };
+    /** A chevron at the end: the row opens a group (a Space's rooms). */
+    expanded?: boolean;
     /** A quiet note after the label (a role, a count). */
     trailing?: string;
+    /** A small accent dot at the end (something is working there); its words for screen readers. */
+    dot?: string;
     /** Nesting level (threads under their parent room). */
     depth?: number;
     emphasis?: boolean;
+    /** A quiet extra shown on hover (a role), never in the row. */
+    tooltip?: string;
+    /**
+     * The row's own actions ("Space settings"): a ⋯ button at its end that
+     * shows on hover and keyboard focus (always on touch screens), and the
+     * same items on a secondary click of the row.
+     */
+    menu?: { items: readonly ActionsMenuItem[]; accessibilityLabel: string; testID?: string };
   },
 ) {
-  return (
+  const row = (
     <Button
       class={cx(
-        // 40 high: a comfortable list row; the selected one takes the accent tint.
-        "flex-row items-center gap-(--space-2) min-h-[40px] rounded-(--radius-sm) px-(--space-3) py-[8px]",
+        // 40 high: a comfortable list row; the selected one is a soft pill with an accent bar.
+        "relative flex-row items-center gap-(--space-2) min-h-[40px] rounded-(--radius-md) py-[8px]",
+        props.menu ? "pr-[40px]" : "pr-(--space-3)",
         focusRing,
         transitionClass,
         indentClass[Math.min(props.depth ?? 0, indentClass.length - 1)],
@@ -362,18 +404,31 @@ export function NavItem(
       selected={props.selected}
       onPress={props.onPress}
       testID={props.testID}
-      accessibilityLabel={props.accessibilityLabel ?? props.label}
+      accessibilityLabel={(props.accessibilityLabel ?? props.label) + (props.dot ? `, ${props.dot}` : "")}
+      tooltip={props.tooltip ? <Text class={tooltipClass}>{props.tooltip}</Text> : undefined}
     >
-      <If
-        when={props.icon}
-        else={
-          <If when={props.prefix !== ""}>
-            <Text class={cx("w-[12px]", textClass.sm, "text-muted-foreground")}>{props.prefix ?? "#"}</Text>
-          </If>
-        }
-      >
-        {(name) => <Icon name={name()} color={props.selected ? "sidebar-active" : "sidebar"} />}
+      <If when={props.selected}>
+        <View class="absolute left-0 top-[9px] bottom-[9px] w-[3px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
       </If>
+      <View class="w-[20px] shrink-0 items-center justify-center" accessibilityElementsHidden>
+        <If
+          when={props.tile}
+          else={
+            <If
+              when={props.icon}
+              else={
+                <If when={props.prefix !== ""}>
+                  <Text class={cx(textClass.sm, "text-muted-foreground")}>{props.prefix ?? "#"}</Text>
+                </If>
+              }
+            >
+              {(name) => <Icon name={name()} color={props.selected ? "sidebar-indicator" : "sidebar"} />}
+            </If>
+          }
+        >
+          {(t) => <SpaceTile initial={t().initial} seed={t().seed} />}
+        </If>
+      </View>
       <Text
         class={cx(
           "flex-1",
@@ -387,8 +442,128 @@ export function NavItem(
       <If when={props.trailing}>
         <Text class={cx(textClass.xs, "text-muted-foreground")}>{props.trailing}</Text>
       </If>
+      <If when={props.dot}>
+        <View class="size-[7px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
+      </If>
+      <If when={props.expanded !== undefined}>
+        <Icon name={props.expanded ? "chevron-down" : "chevron-right"} color="muted" size={12} />
+      </If>
     </Button>
   );
+  const items = (onSelect: (item: ActionsMenuItem) => void) => (
+    <Each of={[...(props.menu?.items ?? [])]} key={(item) => item.id}>
+      {(item) => (
+        <MenuItem class={popoverItemClass} disabled={item().disabled} onSelect={() => onSelect(item())} testID={item().id}>
+          <Text class={cx(textClass.sm, item().destructive ? "text-destructive" : "text-popover-foreground")}>{item().label}</Text>
+        </MenuItem>
+      )}
+    </Each>
+  );
+  return (
+    <If when={props.menu} else={row}>
+      {(menu) => (
+        <View class="group/nav relative">
+          <ContextMenu
+            popupClass={cx(popoverClass, "min-w-[180px]")}
+            popupStartingClass={popoverMotion.starting}
+            popupEndingClass={popoverMotion.ending}
+            trigger={row}
+          >
+            {items((item) => item.onPress())}
+          </ContextMenu>
+          <View class="absolute right-[6px] top-0 bottom-0 justify-center">
+            <Menu
+              placement="bottom"
+              align="end"
+              offset={4}
+              popupClass={cx(popoverClass, "min-w-[180px]")}
+              popupStartingClass={popoverMotion.starting}
+              popupEndingClass={popoverMotion.ending}
+              trigger={
+                <Button
+                  class={cx(
+                    "items-center justify-center size-[26px] rounded-(--radius-sm) hover:bg-sidebar-hover active:bg-sidebar-hover aria-expanded:bg-sidebar-hover aria-expanded:opacity-100",
+                    "opacity-0 group-hover/nav:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100",
+                    focusRing,
+                    transitionClass,
+                  )}
+                  testID={menu().testID}
+                  accessibilityLabel={menu().accessibilityLabel}
+                  tooltip={<Text class={tooltipClass}>More</Text>}
+                >
+                  <Icon name="more" color="sidebar" size={14} />
+                </Button>
+              }
+            >
+              {items((item) => item.onPress())}
+            </Menu>
+          </View>
+        </View>
+      )}
+    </If>
+  );
+}
+
+/**
+ * Rows nested under a NavItem (a Space's rooms), joined by a thin vertical
+ * guide under the parent's tile. The rows keep the list's full width; their
+ * own padding indents them.
+ */
+export function NavGroup(props: Testable & { children?: JSX.Element }) {
+  return (
+    <View class="relative flex-col gap-(--space-1)" testID={props.testID} accessibilityLabel={props.accessibilityLabel}>
+      <View class="absolute left-[21px] top-[4px] bottom-[4px] w-px bg-sidebar-guide" accessibilityElementsHidden />
+      {props.children}
+    </View>
+  );
+}
+
+/**
+ * A section's heading in a sidebar ("SPACES"): small, uppercase, wide
+ * tracking, muted, with an optional action that shows on hover and keyboard
+ * focus (always on touch screens, and while `actionShown`).
+ */
+export function SectionHeader(
+  props: Testable & {
+    label: string;
+    action?: { icon: IconName; label: string; tooltip?: string; onPress: () => void; testID?: string; shown?: boolean };
+  },
+) {
+  return (
+    <View class="group/section flex-row items-center min-h-[30px] pl-(--space-3) pr-[5px]" testID={props.testID}>
+      <Text class={cx("flex-1 uppercase tracking-wider font-semibold text-muted-foreground", textClass.xs)} role="header" style={{ numberOfLines: 1 }}>
+        {props.label}
+      </Text>
+      <If when={props.action}>
+        {(a) => (
+          <Button
+            class={cx(
+              "items-center justify-center size-[26px] rounded-(--radius-sm) hover:bg-sidebar-hover active:bg-sidebar-hover",
+              transitionClass,
+              focusRing,
+              a().shown ? "opacity-100" : "opacity-0 group-hover/section:opacity-100 focus-visible:opacity-100 pointer-coarse:opacity-100",
+            )}
+            onPress={a().onPress}
+            testID={a().testID}
+            accessibilityLabel={a().label}
+            tooltip={<Text class={tooltipClass}>{a().tooltip ?? a().label}</Text>}
+          >
+            <Icon name={a().icon} color="sidebar" size={14} />
+          </Button>
+        )}
+      </If>
+    </View>
+  );
+}
+
+/** The top of a sidebar: the logo, centred, in a band as tall as the main panel's header row, its divider on the same line. */
+/** The top of the icon rail: the compact mark in a band as tall as the main panel's header row, its divider on the same line. Pulled up over the rail's top padding. */
+export function RailBrand(props: { children?: JSX.Element }) {
+  return <View class="self-stretch shrink-0 items-center justify-center h-(--header-height) mt-[-12px] mb-(--space-2) border-b border-sidebar-border/70">{props.children}</View>;
+}
+
+export function SidebarBrand(props: { children?: JSX.Element }) {
+  return <View class="flex-row shrink-0 items-center justify-center h-(--header-height) px-(--space-4) border-b border-sidebar-border/70">{props.children}</View>;
 }
 
 /** A small selectable pill (targets, filters). */
@@ -470,10 +645,20 @@ export function Field(
     onSubmit?: () => void;
     keepFocusOnSubmit?: boolean;
     maxLength?: number;
+    /** Escape in the field (an inline edit's cancel). */
+    onCancel?: () => void;
   },
 ) {
+  // Escape cancels while the field has the focus: an app binding that wins over the field's own keys.
+  const focused = signal(false);
+  effect(() => {
+    if (!props.onCancel || !focused()) return;
+    return keymap.bind("escape", () => props.onCancel?.(), { when: "always" });
+  });
   return (
     <Input
+      onFocus={() => focused.set(true)}
+      onBlur={() => focused.set(false)}
       class={cx(
         "rounded-(--radius-md) border bg-background px-(--space-3) py-[7px] text-foreground placeholder:text-muted-foreground focus:border-ring focus:ring-1 focus:ring-ring",
         controlEdgeClass,

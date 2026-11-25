@@ -3,6 +3,56 @@
 What has been demonstrated, and how to reproduce it. Anything not listed here
 hasn't been demonstrated.
 
+## Staged: Spaces with several agents, per-connection model lists and the desktop redesign at 4175475 (2026-11-25, project manager, local)
+
+A **gate on unreleased source**, run on Linux and reported by the project
+manager. It isn't a release, and nothing was built for distribution or
+published. Its source came after the published
+[Metro 0.3.2](#published-metro-032-2026-11-24-github-release-v032) release
+(tag on `d943797`): it's in the source since 0.3.2, not released, and isn't in
+0.3.0, 0.3.1 or 0.3.2. Packaging tests weren't rerun.
+
+**Source.** Commits `4d72b28` through `4175475`:
+
+- **ChatGPT connector** (`4d72b28`, `80b82cf`): reads JSON and untyped `200`
+  answers, skips unknown items, reports an answer it can't use as
+  `chatgpt_unusable_response`, sends the `media_type`, passes reasoning
+  summaries through, sends the catalog's display names, and forwards custom
+  thinking for OpenAI-compatible endpoints.
+- **Per-connection model lists** (`85b579e`): listed models are opt-out,
+  manual models carry owner-set thinking options, the first connection of a
+  capability with a model becomes its default automatically, and the
+  operator's model is shown only as described in [settings.md](settings.md).
+- **Spaces** (`e0f9124`): edit, delete and leave; several agents per Space
+  with `@handle` mentions; the classifier picks an agent or none; per-Space
+  preferences; `reasoning_summary` events.
+- **Desktop** (`5abdb06` through `4175475`): Model providers by capability
+  with a details view and one grouped model picker, Space settings (General,
+  agents, your preferences), the Ask-agent chooser and each run's agent,
+  the activity block, the sidebar rail and resizable panels, one header
+  height, per-place drafts, and **Test runner** for every member in Space
+  settings › Members and runner.
+
+| Check | Result |
+| --- | --- |
+| `cargo build --workspace --locked`, then `cargo test --workspace --locked --no-fail-fast`, at `8dc3f16` (no Rust changes after it) | **686 passed, 0 failed**. The Docker sandbox suite isn't claimed: those tests ran or skipped as the environment allowed. |
+| e2e scripts at `8dc3f16` | 8/8 passed: smoke, threads, settings, device_connector, intelligence, attachments (`--timeout 60`), schedules (`--timeout 150`), library. `library_reference.py` wasn't run (it needs the media service's Python environment). |
+| Desktop at `4175475`, NSH 0.6.1: `nsh check` | Clean |
+| Desktop at `4175475`, NSH 0.6.1: `nsh test` | **400/400** |
+
+The desktop screenshots reviewed for this gate were rendered against the
+in-memory fake server. They're UI previews, not a run against a real
+server, and they aren't stored in the repository.
+
+**Not covered by this gate:**
+
+- The connector fix with a real ChatGPT or OpenAI account: it needs a
+  confirmation on the user's own device.
+- Native Windows and macOS.
+- Real agent picture images.
+- Resetting a panel's width with a double-click.
+- Packaging tests, release archives, and the Docker sandbox suite.
+
 ## Published: Metro 0.3.2 (2026-11-24, GitHub release v0.3.2)
 
 **What was published.** The GitHub release

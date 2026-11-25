@@ -592,7 +592,7 @@ async fn metro_sees_only_fixed_error_categories() {
         Option<&'static str>,
         &'static str,
     );
-    let cases: [Want; 16] = [
+    let cases: [Want; 19] = [
         (
             "limit",
             "usage limit reached",
@@ -721,21 +721,49 @@ async fn metro_sees_only_fixed_error_categories() {
         ),
         (
             "non_sse",
-            "unexpected response",
+            "couldn't read an answer",
             Http,
             Some(200),
             None,
             None,
-            "chatgpt_unexpected_response",
+            "chatgpt_unusable_response",
         ),
+        // Only a hosted-tool item: skipped, and nothing usable is left.
         (
             "hosted",
-            "unexpected response",
+            "couldn't read an answer",
             Translation,
             None,
             None,
             None,
-            "chatgpt_unexpected_response",
+            "chatgpt_unusable_response",
+        ),
+        (
+            "json_error",
+            "usage limit reached",
+            Http,
+            Some(200),
+            Some("subscription_sharing_usage_limit_exceeded"),
+            None,
+            "chatgpt_usage_limit",
+        ),
+        (
+            "json_incomplete",
+            "content filter",
+            Http,
+            Some(200),
+            None,
+            None,
+            "chatgpt_content_filter",
+        ),
+        (
+            "json_other",
+            "couldn't read an answer",
+            Http,
+            Some(200),
+            None,
+            None,
+            "chatgpt_unusable_response",
         ),
     ];
     for (mode, want, phase, status, code, param, outcome) in cases {
@@ -812,6 +840,88 @@ async fn metro_sees_only_fixed_error_categories() {
         // A profile refuses endpoints it didn't sign in with.
         (oa::Operation::Catalog, oa::Phase::Session, None)
     );
+}
+
+/// A 200 answer that isn't a typed event stream is still read when it is a
+/// usable Responses answer: a whole JSON object, or SSE/JSON without a
+/// `content-type`. Unknown items and parts are skipped, and only the
+/// reasoning *summary* passes through, as `reasoning_content`.
+#[tokio::test]
+async fn non_streamed_and_untyped_success_answers_are_read() {
+    let f = fixture(Browser::Approve {
+        sub: "user-1",
+        scope: PLAN_SCOPES,
+    })
+    .await;
+    oa::login_with(&f.profile, opts(&f)).await.unwrap();
+    let ask = || json!({"model": "gpt-6.2-sol", "messages": [{"role": "user", "content": "hi"}]});
+
+    for (mode, text, summary) in [
+        (
+            "json_ok",
+            "Hello from JSON.",
+            Some("Checked the listing first."),
+        ),
+        ("untyped_sse", "Untyped stream.", None),
+        ("untyped_json", "Untyped JSON.", None),
+        ("summary", "Done.", Some("Looked first.\n\nThen answered.")),
+    ] {
+        f.s.lock().unwrap().sse_mode = mode;
+        let out = oa::complete_with(&f.profile, &f.ep, ask())
+            .await
+            .unwrap_or_else(|e| panic!("{mode}: {e:#}"));
+        let msg = &out["choices"][0]["message"];
+        assert_eq!(msg["content"], text, "{mode}");
+        assert_eq!(out["choices"][0]["finish_reason"], "stop", "{mode}");
+        assert_eq!(
+            msg.get("reasoning_content").and_then(Value::as_str),
+            summary,
+            "{mode}"
+        );
+        let wire = out.to_string();
+        for leak in ["SECRET-REASONING", "SECRET-RAW", "SENSITIVE", "encrypted"] {
+            assert!(!wire.contains(leak), "{mode}: {leak} in {wire}");
+        }
+    }
+    // The request itself is unchanged: no reasoning summary is asked for.
+    assert!(
+        f.s.lock()
+            .unwrap()
+            .responses_bodies
+            .iter()
+            .all(|b| b.get("reasoning").is_none())
+    );
+
+    // Failures of a 200 answer record only the media-type class.
+    for (mode, media) in [
+        ("non_sse", oa::MediaType::Other),
+        ("json_other", oa::MediaType::Json),
+        ("json_error", oa::MediaType::Json),
+        ("hosted", oa::MediaType::EventStream),
+    ] {
+        f.s.lock().unwrap().sse_mode = mode;
+        let e = oa::complete_with(&f.profile, &f.ep, ask())
+            .await
+            .unwrap_err();
+        let d = oa::local_failure(&e).unwrap();
+        assert_eq!(d.media_type(), Some(media), "{mode}");
+        assert!(
+            d.summary()
+                .ends_with(&format!(" media_type={}", media.as_str())),
+            "{mode}: {}",
+            d.summary()
+        );
+        let stored = serde_json::to_value(d).unwrap();
+        assert_eq!(stored["media_type"], media.as_str(), "{mode}");
+        assert!(!stored.to_string().contains("SENSITIVE"), "{mode}");
+        assert!(!stored.to_string().contains("text/html"), "{mode}");
+    }
+    // Errors before any answer carry no media type.
+    f.s.lock().unwrap().sse_mode = "http400";
+    let e = oa::complete_with(&f.profile, &f.ep, ask())
+        .await
+        .unwrap_err();
+    assert_eq!(oa::local_failure(&e).unwrap().media_type(), None);
 }
 
 /// The relay body for each failure is exactly `{"ok":false,"error":<fixed

@@ -416,7 +416,7 @@ async fn connections_are_private_and_keys_are_write_only() {
     assert_eq!(status, StatusCode::OK);
     let (status, models) = s.post(ALICE, &format!("{path}/models"), json!({})).await;
     assert_eq!(status, StatusCode::OK, "{models}");
-    assert_eq!(models, json!({"models": ["fixture/alice"]}));
+    assert_eq!(models["models"], json!(["fixture/alice"]));
     let listing = fixture.seen();
     assert_eq!(listing.len(), 1);
     assert_eq!(
@@ -543,7 +543,7 @@ async fn keys_need_a_master_key_and_keyless_endpoints_send_no_auth() {
         .post(ALICE, &format!("/v1/providers/{id}/models"), json!({}))
         .await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(models, json!({"models": ["local-a", "local-b"]}));
+    assert_eq!(models["models"], json!(["local-a", "local-b"]));
     assert_eq!(
         fixture.seen()[0].authorization,
         None,
@@ -1035,13 +1035,20 @@ async fn anthropic_and_gemini_connections_use_their_native_wires() {
         .connect(BOB, json!({"name": "gemini", "provider_id": "gcp.gemini", "base_url": base, "api_key": "gm-bob-key"}))
         .await;
     let list = |c: &Value| format!("/v1/providers/{}/models", c["id"].as_str().unwrap());
+    let listed = s.post(ALICE, &list(&a), json!({})).await.1;
+    assert_eq!(listed["models"], json!(["claude-x"]));
+    // The first listed model of a model-less first connection becomes its
+    // model and the default, with the provider's catalog name.
+    assert_eq!(listed["connection"]["model"], "claude-x");
+    assert_eq!(listed["connection"]["is_default"], true);
     assert_eq!(
-        s.post(ALICE, &list(&a), json!({})).await.1,
-        json!({"models": ["claude-x"]})
+        listed["connection"]["models"][0]["display_name"],
+        "Claude X"
     );
+    assert_eq!(listed["connection"]["models"][0]["source"], "listed");
     assert_eq!(
-        s.post(BOB, &list(&g), json!({})).await.1,
-        json!({"models": ["gemini-x"]})
+        s.post(BOB, &list(&g), json!({})).await.1["models"],
+        json!(["gemini-x"])
     );
     for (token, c, model) in [(ALICE, &a, "claude-x"), (BOB, &g, "gemini-x")] {
         let (status, _) = s

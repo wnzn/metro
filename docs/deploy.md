@@ -430,7 +430,12 @@ in the same or a later pull request, because only a version bump releases.
   their stored API profile, or `METRO_MODEL_BASE_URL`. So a Space's
   transcript can reach any member's chosen provider. Messages between people still become history for
   later agent turns in the same room. Demo never calls a model, and nothing
-  reaches the model until someone addresses the agent.
+  reaches the model until someone addresses an agent. A Space agent's
+  owner-written instructions go with each of its runs, so they reach every
+  member's chosen provider too; every member can read them. A member who
+  turned on classification sends only their own new message (no history,
+  ids or instructions) to their System One connection, with the agents'
+  names and descriptions.
 - **Secrets on screen:** user tokens, runner tokens and model keys are bearer
   secrets. Follow [spaces.md](spaces.md#keeping-secrets-out-of-screenshots-and-logs)
   before you screen-share or take screenshots.

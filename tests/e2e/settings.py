@@ -232,9 +232,20 @@ def exercise_providers(call, alice, bob, keyed, manual, alternate, db_path, chil
     require(all(f.requests == 0 for f in fixtures),
              "saving settings or a foreign request contacted a model")
 
+    before = call(alice, "GET", f"{alice_route}/model-list", read_json=True)["models"]
     models = call(alice, "POST", f"{alice_route}/models", body={}, read_json=True)
-    require(models == {"models": [keyed.model]} and keyed.list_calls == 1,
+    require(set(models) == {"models", "added", "unavailable", "connection"}
+            and models["models"] == [keyed.model] and keyed.list_calls == 1,
             "authenticated listing did not return the fixture model ID")
+    check_redacted(models, private_values)
+    known = {entry["model_id"] for entry in before}
+    merged = {entry["model_id"]: entry for entry in models["connection"]["models"]}
+    require(models["added"] == len({keyed.model} - known) and models["unavailable"] == 0
+            and models["connection"]["id"] == alice_id
+            and known | {keyed.model} == set(merged)
+            and merged[keyed.model]["enabled"] is True
+            and merged[keyed.model]["available"] is True,
+            "the chat listing was not merged into the connection's model list")
     call(bob, "POST", f"{bob_route}/models", body={}, expect=(502,),
          label="upstream model listing unavailable")
     require(manual.list_calls == 1, "manual endpoint did not receive its keyless listing request")

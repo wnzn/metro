@@ -39,10 +39,11 @@ import {
   stopRun,
 } from "../store";
 import type { Run } from "../store";
-import { Action, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, PanelToggle, Row, runsPanel, ScrollArea, Spacer, Surface } from "../ui";
+import { Action, Badge, Banner, Chip, Column, Field, Icon, IconButton, Label, Modal, modalOpen, PanelToggle, ResizeHandle, Row, runsPanel, ScrollArea, Spacer, Surface } from "../ui";
 import { EmptyState, sidePanelFits, SuggestionChip } from "../ui/activity";
 import { runStatusLabel, runTitle, runTone } from "./activity/runs";
 import { Composer, ConnectionBanner, Transcript } from "./Conversation";
+import { ModelOnboarding, needsChatModel } from "./ModelOnboarding";
 import { roomTree } from "./Sidebar";
 
 /** The task form is open (folded behind "New task" otherwise). */
@@ -75,7 +76,8 @@ export function ChatView() {
             </Label>
           </Column>
           <PanelToggle side="right" name="agent runs" testID="runs-toggle"
-            caption={runs().some(isActiveRun) ? `Runs · ${runs().filter(isActiveRun).length} active` : "Runs"}
+            status={runs().some(isActiveRun) ? `${runs().filter(isActiveRun).length} active` : undefined}
+            attention={runs().some(isActiveRun)}
             expanded={sidePanelFits() ? runsPanel.open() : runsDialogOpen()} shortcut="Shift+B" onPress={showRuns} />
         </Surface>
         <ConnectionBanner />
@@ -101,7 +103,8 @@ export function ChatView() {
       {/* Wide windows keep the runs beside the Chat; narrower ones open them
           in a dialog, so the Chat (and its draft) keeps its full width. */}
       <If when={sidePanelFits() && runsPanel.open()}>
-        <Surface variant="aside" testID="runs-aside">
+        <ResizeHandle panel={runsPanel} edge="start" name="agent runs" testID="resize-runs" />
+        <Surface variant="aside" testID="runs-aside" width={runsPanel.width()}>
           <RunsPanel />
         </Surface>
       </If>
@@ -116,7 +119,12 @@ export function ChatView() {
 function ChatEmpty() {
   const typed = () => draft().trim().length > 0;
   return (
-    <EmptyState testID="chat-empty" title="Start a conversation" text="A suggestion only fills the message box.">
+    <Column grow>
+      {/* Shows only while nothing can answer yet (no model of mine, none shared, no operator model). */}
+      <Column padX={6} padY={needsChatModel() ? 4 : 0}>
+        <ModelOnboarding testID="chat-onboarding" />
+      </Column>
+      <EmptyState testID="chat-empty" title="Start a conversation" text="A suggestion only fills the message box.">
       <Row gap={2} wrap justify="center">
         <Each of={[...CHAT_SUGGESTIONS]} key={(s) => s.label}>
           {(s) => (
@@ -133,7 +141,8 @@ function ChatEmpty() {
           )}
         </Each>
       </Row>
-    </EmptyState>
+      </EmptyState>
+    </Column>
   );
 }
 

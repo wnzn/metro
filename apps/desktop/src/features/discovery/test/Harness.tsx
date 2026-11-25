@@ -4,7 +4,7 @@
 // `discoveryApi(request)`, it attaches the same wrappers to the session's
 // client over a test transport (fake tokens only, never a real one).
 
-import { effect, mount, untracked } from "nsh";
+import { effect, mount, untracked, View } from "nsh";
 import { ApiError } from "../../../api/client";
 import { discoveryApi } from "../../../api/discovery";
 import type { RequestFn } from "../../../api/client";
@@ -56,8 +56,11 @@ function Harness() {
           <Action testID="h-chat" label="Chat" onPress={openChat} />
         </Row>
         {/* The Shell has its own search box; these pages get the same one here. */}
+        {/* The search box fills its container (the Shell's header row); here it gets a slot of its own, as wide as it used to be. */}
         <If when={place() === "search" || place() === "schedules"}>
-          <TopSearch />
+          <View class="w-[560px] shrink-0">
+            <TopSearch />
+          </View>
         </If>
         <If when={place() === "search"}>
           <SearchView />

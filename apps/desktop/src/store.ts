@@ -598,6 +598,7 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     return next;
   };
   batch(() => {
+    stashedDrafts.set(strip(stashedDrafts()));
     const { [spaceId]: _gone, ...restRooms } = roomsBySpace();
     roomsBySpace.set(restRooms);
     eventsByScope.set(strip(eventsByScope()));
@@ -716,7 +717,7 @@ export const ASK_NEEDS_TEXT = "Type a question to ask the agent. Attached files 
  * first; if one fails nothing is posted and the draft and files stay. A
  * message may be files only, unless it asks the agent.
  */
-export async function send(invokeAgent: boolean, choice?: TurnModelChoice): Promise<void> {
+export async function send(invokeAgent: boolean, choice?: TurnModelChoice, agentId?: string): Promise<void> {
   const chat = basePlace() === "chat";
   const text = draft().trim();
   const sid = activeSpaceId();
@@ -763,7 +764,7 @@ export async function send(invokeAgent: boolean, choice?: TurnModelChoice): Prom
       keys = up.keys;
     }
     if (chat) await c.sendChatMessage(text, invokeAgent, ids, choice);
-    else await c.sendMessage(sid!, rid!, text, invokeAgent, sentMentions, ids, choice);
+    else await c.sendMessage(sid!, rid!, text, invokeAgent, sentMentions, ids, choice, invokeAgent ? agentId : undefined);
     if (!ok()) return;
     if (keys.length) attachments?.sent(scope, keys, to);
     if (activeScope() === scope && draft().trim() === text) {
@@ -772,6 +773,10 @@ export async function send(invokeAgent: boolean, choice?: TurnModelChoice): Prom
         draft.set("");
         if (!chat) mentions.set([]);
       });
+    } else if (stashedDrafts()[scope]?.text.trim() === text) {
+      // Sent from a place the user has since left: its stashed draft is gone too.
+      const { [scope]: _sent, ...rest } = stashedDrafts();
+      stashedDrafts.set(rest);
     }
     if (chat) {
       if (chatUnavailable()) chatUnavailable.set(null);
@@ -972,12 +977,16 @@ async function refreshRuns() {
   }
 }
 
-/** Asks the server to run the deterministic runner demo (workspace.list) with this Space's runner. */
-export async function runDemo(): Promise<void> {
+/**
+ * Test runner: asks the server to run the deterministic `workspace.list` on
+ * this Space's runner (POST …/demo; no model is used). Its listing is posted
+ * in the active room. True once the server took the request.
+ */
+export async function runDemo(): Promise<boolean> {
   const sid = activeSpaceId();
   const rid = activeRoomId();
   const c = client;
-  if (!sid || !rid || !c || demoPending()) return;
+  if (!sid || !rid || !c || demoPending()) return false;
   const ok = guard(sid);
   batch(() => {
     demoPending.set(true);
@@ -986,11 +995,12 @@ export async function runDemo(): Promise<void> {
   });
   try {
     await c.runDemo(sid, rid);
-    if (!ok()) return;
-    notice.set("Demo requested: this Space's runner will answer with workspace.list in this room.");
+    if (!ok()) return false;
     kick();
+    return true;
   } catch (error) {
-    if (ok()) handleActionError(error, "Could not start the demo", sid);
+    if (ok()) handleActionError(error, "Could not test the runner", sid);
+    return false;
   } finally {
     if (ok()) demoPending.set(false);
   }
@@ -1053,12 +1063,14 @@ export async function loadMembersForMentions(): Promise<void> {
 // ------------------------------------------------------------------ mentions
 
 export function mentionLiteral(m: Mention): string | null {
-  if (m.kind === "agent") return "@agent";
+  // A named agent by its @handle; the generic @agent (the default agent, or the classifier's pick) otherwise.
+  if (m.kind === "agent") return m.agentId ? (m.handle && /^[a-z0-9_-]+$/.test(m.handle) ? `@${m.handle}` : null) : "@agent";
   return /^\S+$/.test(m.id) ? `@${m.id}` : null; // ids with spaces go only in the explicit list
 }
 
 export function sameMention(a: Mention, b: Mention) {
-  return a.kind === b.kind && (a.kind === "agent" || (b.kind === "user" && a.id === b.id));
+  if (a.kind === "agent" && b.kind === "agent") return (a.agentId ?? null) === (b.agentId ?? null);
+  return a.kind === "user" && b.kind === "user" && a.id === b.id;
 }
 
 function escapeRegExp(text: string) {
@@ -1169,15 +1181,30 @@ function clearTransient() {
   for (const fn of transientClearers) fn();
 }
 
-// Mentions belong to one room: forget them whenever the room, Space or place changes.
+// Drafts are per place: each room or thread, and the personal Chat, keeps its
+// own text and mention chips. `draft` and `mentions` are the active place's;
+// switching stashes them under the place left and restores the new one's.
+const stashedDrafts = signal<Record<string, { text: string; mentions: Mention[] }>>({});
+/** Some place other than the active one has a draft not sent yet. */
+export const stashedDraftPending = computed(() => Object.values(stashedDrafts()).some((d) => d.text.trim().length > 0));
 let mentionScope = "";
 effect(() => {
   const scope = activeScope();
   untracked(() => {
     if (scope === mentionScope) return;
+    const left = mentionScope;
     mentionScope = scope;
-    if (mentions().length) mentions.set([]);
-    if (membersError()) membersError.set(null);
+    const stash = { ...stashedDrafts() };
+    if (left && (draft() || mentions().length)) stash[left] = { text: draft(), mentions: mentions() };
+    else delete stash[left];
+    const back = stash[scope];
+    delete stash[scope];
+    batch(() => {
+      stashedDrafts.set(stash);
+      draft.set(back?.text ?? "");
+      mentions.set(back?.mentions ?? []);
+      if (membersError()) membersError.set(null);
+    });
   });
 });
 
@@ -1228,6 +1255,7 @@ function endSession() {
     reactionPending.set(null);
     view.set("room");
     draft.set("");
+    stashedDrafts.set({});
     sending.set(null);
     demoPending.set(false);
     creatingRoom.set(false);
@@ -1339,6 +1367,20 @@ async function lostAccess(spaceId: string | null, roomId: string | null) {
   } else if (before) {
     notice.set(`You no longer have access to ${before.name}.`);
   }
+}
+
+/**
+ * The user just deleted or left a Space (src/features/space): reload the
+ * list, which forgets it and leaves it if it was open, then say what happened.
+ */
+export async function spaceGone(spaceId: string, message: string): Promise<void> {
+  await lostAccess(spaceId, null);
+  if (!spaces().some((s) => s.id === spaceId)) notice.set(message);
+}
+
+/** A Space's name changed (src/features/space): show it everywhere at once. */
+export function spaceRenamed(spaceId: string, name: string) {
+  spaces.set(spaces().map((s) => (s.id === spaceId ? { ...s, name } : s)));
 }
 
 /** Reloads the Space list and the active Space's rooms. */

@@ -284,7 +284,7 @@ async fn chat_uses_the_chosen_connection_or_the_default_never_another() {
         .unwrap();
     assert_eq!(
         offered["chat_models"],
-        json!([{"id": "m", "reasoning_efforts": []}])
+        json!([{"id": "m", "display_name": "m", "reasoning_efforts": [], "is_default": true, "available": true}])
     );
     let answer = s
         .ask(
@@ -380,7 +380,8 @@ async fn chat_uses_the_chosen_connection_or_the_default_never_another() {
     assert_eq!(
         offered["chat_models"],
         json!([
-            {"id":"m","reasoning_efforts":[]}, {"id":"m-other","reasoning_efforts":[]}
+            {"id":"m","display_name":"m","reasoning_efforts":[],"is_default":true,"available":true},
+            {"id":"m-other","display_name":"m-other","reasoning_efforts":[],"is_default":false,"available":true}
         ])
     );
     let answer = s

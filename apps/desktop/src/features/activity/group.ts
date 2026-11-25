@@ -11,8 +11,8 @@
 // not known, so each one stays its own collapsed group: nothing is guessed
 // across runs. Domain mapping only, no UI.
 
-import type { ActivityPhase, ActivityRoute, RoomEvent } from "../../api/client";
-import { activityOf } from "./classify";
+import type { ActivityPhase, ActivityRoute, EventAgent, RoomEvent } from "../../api/client";
+import { activityOf, toolName } from "./classify";
 import type { Activity } from "./classify";
 
 /** "live": started and not ended yet. "ended": no outcome was recorded (it is never shown as ongoing). */
@@ -35,6 +35,15 @@ export type ActivityGroup = {
   correlated: boolean;
   /** Which model answered and why, from the turn's `started` marker; null when the server sent none. */
   route: ActivityRoute | null;
+  /** The Space agent working the turn, when its events name one. */
+  agent: EventAgent | null;
+  /** How its agent was chosen ("Picked by classifier: Coder"), from the `started` marker. */
+  pick: string | null;
+  /** The server's id for the turn (a Space run's `run_…`); null for an uncorrelated event. */
+  activityId: string | null;
+  /** When its first and last events were recorded (ms), when the server dated them. */
+  firstMs: number | null;
+  lastMs: number | null;
 };
 
 export type TranscriptItem = { type: "event"; key: string; event: RoomEvent } | { type: "group"; key: string; group: ActivityGroup };
@@ -89,7 +98,7 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
         const { source, name } = legacySource(e.actor);
         const key = `event:${e.id}`;
         groups.set(key, {
-          key, source, name, correlated: false, failed: false, outcome: "ended", started: false, ended: true, terminal: null, route: null,
+          key, source, name, correlated: false, failed: false, outcome: "ended", started: false, ended: true, terminal: null, route: null, agent: null, pick: null, activityId: null, firstMs: null, lastMs: null,
           steps: [{ eventId: e.id, activity: { kind: "progress", summary: "Activity update", tone: "neutral", details: text, mono: false } }],
         });
         memberOf.set(e.id, key);
@@ -97,7 +106,7 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
         const { source, name } = legacySource(e.actor);
         const key = `event:${e.id}`;
         groups.set(key, {
-          key, source, name, correlated: false, failed: step.tone === "danger", outcome: "ended", started: false, ended: true, terminal: null, route: null,
+          key, source, name, correlated: false, failed: step.tone === "danger", outcome: "ended", started: false, ended: true, terminal: null, route: null, agent: null, pick: null, activityId: null, firstMs: null, lastMs: null,
           steps: [{ eventId: e.id, activity: step }],
         });
         memberOf.set(e.id, key);
@@ -120,17 +129,29 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
         ended: false,
         terminal: null,
         route: null,
+        agent: meta.agent ?? null,
+        pick: null,
+        activityId: meta.id,
+        firstMs: null,
+        lastMs: null,
       };
       groups.set(key, g);
     } else if (meta.source === "agent" && meta.name && g.name === DEFAULT_AGENT_NAME) {
       g.name = meta.name; // a later event named the agent
     }
+    if (!g.agent && meta.agent) g.agent = meta.agent;
 
+    const ms = e.createdAt ? Date.parse(e.createdAt) : NaN;
+    if (Number.isFinite(ms)) {
+      if (g.firstMs === null || ms < g.firstMs) g.firstMs = ms;
+      if (g.lastMs === null || ms > g.lastMs) g.lastMs = ms;
+    }
     if (isLifecycle(e)) {
       memberOf.set(e.id, key);
       if (meta.phase === "started") {
         g.started = true;
         if (meta.source === "agent" && meta.route) g.route = meta.route; // Demo never calls a model
+        if (meta.source === "agent" && meta.pick) g.pick = meta.pick;
       }
       else if (meta.phase) g.terminal = TERMINAL[meta.phase];
       if (meta.phase === "failed") g.failed = true;
@@ -170,7 +191,7 @@ export function groupTranscript(events: readonly RoomEvent[]): TranscriptItem[] 
     // A turn that ended with nothing to inspect leaves no empty shell, unless
     // its route is worth saying (a use case, a chosen model, a System One or
     // scheduled start): then it stays one row, with nothing else in it.
-    if (g.steps.length === 0 && !routeBadge(g.route) && (g.outcome === "completed" || g.outcome === "ended")) continue;
+    if (g.steps.length === 0 && !routeBadge(g.route) && !pickBadge(g.pick) && (g.outcome === "completed" || g.outcome === "ended")) continue;
     placed.add(key);
     const { started: _s, ended: _e, terminal: _t, ...group } = g;
     items.push({ type: "group", key: `group:${key}`, group });
@@ -260,9 +281,137 @@ export function routeText(r: ActivityRoute): string {
   return [`${where[r.source]}${model} answered${reason}.`, how].filter(Boolean).join(" ");
 }
 
-/** What a screen reader hears for the disclosure, e.g. "Metro’s activity, failed, 3 steps". */
-export function groupAccessibleLabel(g: ActivityGroup): string {
+/** How many tools the turn used: its calls, or its results where no call was recorded. */
+export function toolCount(g: ActivityGroup): number {
+  const calls = g.steps.filter((s) => s.activity.kind === "tool_call").length;
+  return calls || g.steps.filter((s) => s.activity.kind === "tool_result").length;
+}
+
+/** "thought 12s" for an agent turn that ended (runner work "took"); null while live or undated. */
+export function durationText(g: ActivityGroup): string | null {
+  if (g.outcome === "live" || g.firstMs === null || g.lastMs === null) return null;
+  const s = Math.round((g.lastMs - g.firstMs) / 1000);
+  const verb = g.source === "agent" ? "thought" : "took";
+  if (s < 1) return null;
+  return s < 90 ? `${verb} ${s}s` : `${verb} ${Math.round(s / 60)}m`;
+}
+
+/**
+ * The collapsed line's parts after the name: how long, how many tools, the
+ * route it took, and how it stopped when that wasn't a plain finish
+ * ("cancelled"). A failure is its own pill, not a part.
+ */
+export function summaryParts(g: ActivityGroup): { pick: string | null; duration: string | null; tools: string | null; route: string | null; stopped: string | null } {
+  const n = toolCount(g);
+  const outcome = groupOutcomeText(g);
+  return {
+    pick: pickBadge(g.pick),
+    duration: durationText(g),
+    tools: n === 0 ? null : n === 1 ? "1 tool" : `${n} tools`,
+    route: routeBadge(g.route),
+    stopped: outcome === "cancelled" || outcome === "interrupted" ? outcome : null,
+  };
+}
+
+/**
+ * How the turn's agent was chosen, when that is worth a word on the collapsed
+ * line: a classifier's pick or an unsure fallback. A plain default or an
+ * explicit @handle says nothing more than the agent's name already does.
+ */
+export function pickBadge(pick: string | null | undefined): string | null {
+  const p = pick?.trim();
+  if (!p || p === "Default agent" || /^(Addressed|Mentioned):/.test(p)) return null;
+  return p;
+}
+
+/** A tool call's arguments in a few words: a path, else the values, else the raw text; at most 60 characters. */
+export function shortArgs(raw: string): string {
+  const text = raw.trim();
+  if (!text) return "";
+  let out = text;
+  try {
+    const v = JSON.parse(text) as unknown;
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      const o = v as Record<string, unknown>;
+      const first = o.path ?? o.file ?? o.name ?? o.tool ?? o.query;
+      const values = Object.values(o).filter((x) => typeof x === "string" || typeof x === "number");
+      out = typeof first === "string" ? first : values.length ? values.join(" ") : Object.keys(o).length ? text : "";
+    }
+  } catch {
+    /* not JSON: shown as it came */
+  }
+  out = out.replace(/\s+/g, " ");
+  return out.length > 60 ? `${out.slice(0, 59)}…` : out;
+}
+
+/** A tool call's text ("workspace.read {…}") as its raw name and arguments. */
+export function splitCall(details: string): { tool: string; args: string } {
+  const m = /^(\S+)(?:\s+([\s\S]*))?$/.exec(details.trim());
+  return m ? { tool: m[1]!, args: m[2] ?? "" } : { tool: "", args: "" };
+}
+
+/** What a live turn is doing now, in a few words ("Reading README.md…"). */
+export function currentStep(g: ActivityGroup): string {
+  const last = g.steps[g.steps.length - 1]?.activity;
+  if (g.source !== "agent") return "Runner is working…";
+  if (last?.kind === "tool_call") {
+    const { tool, args } = splitCall(last.details);
+    const what = shortArgs(args);
+    switch (tool.replace(/^workspace_/, "workspace.")) {
+      case "workspace.read":
+        return what ? `Reading ${what}…` : "Reading a file…";
+      case "workspace.list":
+        return !what || what === "." ? "Listing the workspace…" : `Listing ${what}…`;
+      case "workspace.check":
+        return "Running a check…";
+      case "workspace.mcp_list":
+        return "Listing MCP tools…";
+      case "workspace.mcp":
+        return "Calling an MCP tool…";
+      default:
+        return `Using ${toolName(tool)}…`;
+    }
+  }
+  return `${g.name} is thinking…`;
+}
+
+/** A turn's steps as a timeline: each tool call with its result, thoughts and notes in order. */
+export type TimelineItem =
+  | { type: "tool"; key: string; call: Step | null; result: Step | null; name: string; args: string; failed: boolean }
+  | { type: "thought"; key: string; step: Step }
+  | { type: "note"; key: string; step: Step };
+
+export function timeline(g: ActivityGroup): TimelineItem[] {
+  const out: TimelineItem[] = [];
+  for (const step of g.steps) {
+    const a = step.activity;
+    if (a.kind === "tool_call") {
+      const { tool, args } = splitCall(a.details);
+      out.push({ type: "tool", key: `step:${step.eventId}`, call: step, result: null, name: tool ? toolName(tool) : "Tool", args: shortArgs(args), failed: false });
+    } else if (a.kind === "tool_result") {
+      const name = /^Tool · (.+) · (?:complete|failed)$/.exec(a.summary)?.[1] ?? "Tool";
+      const open = [...out].reverse().find((i): i is Extract<TimelineItem, { type: "tool" }> => i.type === "tool" && !i.result && i.name === name);
+      if (open) {
+        open.result = step;
+        open.failed = a.tone === "danger";
+      } else out.push({ type: "tool", key: `step:${step.eventId}`, call: null, result: step, name, args: "", failed: a.tone === "danger" });
+    } else if (a.kind === "thinking") out.push({ type: "thought", key: `step:${step.eventId}`, step });
+    else out.push({ type: "note", key: `step:${step.eventId}`, step });
+  }
+  return out;
+}
+
+/** A live turn's one line: "Scout is thinking…", "Metro · Reading README.md…", "Runner is working…". */
+export function liveTitle(g: ActivityGroup, name = g.name): string {
+  if (g.source !== "agent") return "Runner is working…";
+  const step = currentStep({ ...g, name });
+  return step === `${name} is thinking…` ? step : `${name} · ${step}`;
+}
+
+/** What a screen reader hears for the disclosure, e.g. "Metro, 2 tools, Routed: chosen model, completed". */
+export function groupAccessibleLabel(g: ActivityGroup, name = g.name): string {
+  const p = summaryParts(g);
   const outcome = groupOutcomeText(g) ?? (g.outcome === "completed" ? "completed" : g.outcome === "live" ? "in progress" : null);
-  const steps = g.steps.length === 1 ? "1 step" : `${g.steps.length} steps`;
-  return [groupTitle(g), outcome, g.steps.length ? steps : "no steps yet"].filter(Boolean).join(", ");
+  const head = g.outcome === "live" && !g.failed ? liveTitle(g, name) : g.source === "agent" ? name : "Runner activity";
+  return [head, p.duration, p.tools, p.route, outcome].filter(Boolean).join(", ");
 }

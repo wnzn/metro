@@ -85,6 +85,10 @@ const MAX_DECISIONS: usize = 8;
 
 const Q_DIRECTED: &str = "directed";
 const Q_USE_CASE: &str = "use_case";
+const Q_AGENT: &str = "agent";
+/// The agent Choice's reserved "nobody" option. Agent options are keyed
+/// `agent_1`, `agent_2`, ... so no agent can take it.
+pub const NO_AGENT_KEY: &str = "no_agent";
 
 // ---- Settings ----
 
@@ -380,6 +384,21 @@ pub trait RoutingBackend: Send + Sync + 'static {
         id: &'a str,
     ) -> BoxFuture<'a, anyhow::Result<Option<Capability>>>;
 
+    /// Whether `user` may use System One connection `id` in Space `space`
+    /// now. By default: visible somewhere with the System One capability.
+    fn system_one_usable<'a>(
+        &'a self,
+        state: &'a AppState,
+        user: &'a str,
+        space: &'a str,
+        id: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        let _ = space;
+        Box::pin(async move {
+            Ok(self.visible_capability(state, user, id).await? == Some(Capability::SystemOne))
+        })
+    }
+
     /// The chat model of `id` for a turn `user` starts in `space`
     /// (`None`: personal Chat), if they may use it there.
     fn chat_model<'a>(
@@ -441,6 +460,30 @@ impl RoutingBackend for ProviderBackend {
                     Ok(visible
                         .then(|| serde_json::from_value(json!(row.capability.as_str())).ok())
                         .flatten())
+                })
+                .await
+        })
+    }
+
+    fn system_one_usable<'a>(
+        &'a self,
+        state: &'a AppState,
+        user: &'a str,
+        space: &'a str,
+        id: &'a str,
+    ) -> BoxFuture<'a, anyhow::Result<bool>> {
+        let (user, space, id) = (user.to_owned(), space.to_owned(), id.to_owned());
+        Box::pin(async move {
+            state
+                .db
+                .call(move |db| {
+                    use crate::providers::{sharing, store};
+                    let conn = db.lock();
+                    let Some(row) = store::find(&conn, &id)? else {
+                        return Ok(false);
+                    };
+                    Ok(row.capability.as_str() == Capability::SystemOne.as_str()
+                        && sharing::visible(&conn, &user, Some(&space), &row)?.is_some())
                 })
                 .await
         })
@@ -536,6 +579,11 @@ pub enum RouteSource {
     Environment,
     /// The parent turn's model, for a thread.
     Inherited,
+    /// The person's default model for this agent in this Space
+    /// ([`crate::space_prefs`]).
+    AgentDefault,
+    /// The person's default model in this Space ([`crate::space_prefs`]).
+    SpaceDefault,
 }
 
 /// The route a turn actually took, as shown on its `started` marker.
@@ -647,6 +695,14 @@ impl Route {
             (RouteSource::RoutingDefault, e) => format!(
                 "Your routing default model connection can't be used here: {e}. No other model \
                  was used."
+            ),
+            (RouteSource::AgentDefault, e) => format!(
+                "Your default model for this agent in this Space can't be used here: {e}. No \
+                 other model was used."
+            ),
+            (RouteSource::SpaceDefault, e) => format!(
+                "Your default model for this Space can't be used here: {e}. No other model was \
+                 used."
             ),
             (RouteSource::Inherited, e) => format!(
                 "The model connection of the parent turn can't be used here: {e}. No other \
@@ -821,6 +877,108 @@ pub async fn use_case(
         },
         Decision::Failed(why) => Decision::Failed(why),
     }
+}
+
+/// The agent Choice's answer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgentAnswer {
+    /// The index of the chosen agent in the options, or `None` for
+    /// [`NO_AGENT_KEY`].
+    pub index: Option<usize>,
+    /// The chosen option's probability (0 when none was given).
+    pub probability: f64,
+    /// The probability that the message is for some agent: one minus the
+    /// probability of [`NO_AGENT_KEY`] when it was offered and answered,
+    /// otherwise the chosen agent's probability.
+    pub directed: f64,
+}
+
+fn agent_key(i: usize) -> String {
+    format!("agent_{}", i + 1)
+}
+
+fn agent_question(agents: &[(String, String)], with_none: bool) -> Question {
+    let mut criteria: BTreeMap<String, Value> = agents
+        .iter()
+        .enumerate()
+        .map(|(i, (name, description))| {
+            (
+                agent_key(i),
+                json!({"label": name, "description": description}),
+            )
+        })
+        .collect();
+    if with_none {
+        criteria.insert(
+            NO_AGENT_KEY.to_owned(),
+            json!({"label": "No agent", "description": "The message is conversation between \
+                   people, a status update or a remark, not a request to any of the agents"}),
+        );
+    }
+    Question::Choice {
+        instructions: json!(if with_none {
+            "Which agent, if any, is `message` asking to answer or do something?"
+        } else {
+            "`message` asks an agent to answer or do something. Which agent fits it best?"
+        }),
+        criteria,
+    }
+}
+
+/// One typed System One Choice over a Space's agents (`(name,
+/// description)`, in order), plus [`NO_AGENT_KEY`] when `with_none`. Only
+/// the one new message is sent; never history, ids or instructions.
+pub async fn pick_agent(
+    state: &AppState,
+    user: &str,
+    space: &str,
+    settings: &RoutingSettings,
+    text: &str,
+    agents: &[(String, String)],
+    with_none: bool,
+) -> Decision<AgentAnswer> {
+    let answer = ask_one(
+        state,
+        user,
+        Some(space),
+        settings,
+        text,
+        Q_AGENT,
+        agent_question(agents, with_none),
+    )
+    .await;
+    let answer = match answer {
+        Decision::Answered(a) => a,
+        Decision::Failed(why) => return Decision::Failed(why),
+    };
+    let protocol::Answer::Choice {
+        choice,
+        probabilities,
+        ..
+    } = &answer
+    else {
+        return Decision::Failed("System One's answer was malformed");
+    };
+    let probability = probabilities.get(choice).copied().unwrap_or(0.0);
+    let index = if with_none && choice == NO_AGENT_KEY {
+        None
+    } else {
+        match (0..agents.len()).find(|i| agent_key(*i) == *choice) {
+            Some(i) => Some(i),
+            // An option that was never offered.
+            None => return Decision::Failed("System One's answer was malformed"),
+        }
+    };
+    let directed = match (with_none, probabilities.get(NO_AGENT_KEY)) {
+        (true, Some(none)) => 1.0 - none,
+        _ if index.is_some() => probability,
+        _ => 0.0,
+    };
+    Decision::Answered(AgentAnswer {
+        index,
+        probability,
+        directed,
+    })
 }
 
 /// Whether an unaddressed message of `user` starts agent work: only when
@@ -1031,28 +1189,25 @@ pub async fn submit_scheduled(
                     "the creator is no longer a member of the Space, or the room no longer exists"
                 );
             };
-            let route = route_turn(
-                state,
-                owner_id,
-                Some(space_id),
-                &settings,
-                &text,
-                AddressedBy::Schedule,
-                None,
+            // A scheduled prompt asks the Space's default agent, on the
+            // creator's models for this Space; no System One addressing.
+            let (sid, uid) = (space_id.to_owned(), owner_id.to_owned());
+            let agent = state
+                .db
+                .call(move |db| db.default_space_agent(&sid))
+                .await?
+                .ok_or_else(|| anyhow::anyhow!("the Space has no agent"))?;
+            let prefs = crate::space_prefs::load(state, space_id, &uid).await?;
+            let targets = vec![crate::agent_dispatch::Target {
+                agent,
+                pick: "Scheduled prompt: default agent".to_owned(),
+                addressed_by: AddressedBy::Schedule,
+            }];
+            let failures = crate::agent_dispatch::start_runs(
+                state, space_id, &room, &author, &event, targets, None, &settings, &prefs,
             )
             .await;
-            if let Err(reason) =
-                crate::agent::start_room_run(state, space_id, &room, &author, &event, route).await
-            {
-                state
-                    .append(
-                        space_id,
-                        &room.id,
-                        kind::ERROR,
-                        &Author::server(crate::db::actor::SYSTEM),
-                        &reason,
-                    )
-                    .await;
+            if let Some(reason) = failures.into_iter().next() {
                 anyhow::bail!(reason);
             }
             Ok(())

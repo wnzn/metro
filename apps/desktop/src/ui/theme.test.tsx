@@ -6,6 +6,7 @@ import { expect, open, test } from "nsh/test";
 import type { App, ColorScheme } from "nsh/test";
 import theme from "../../theme/theme.json";
 import { APPEARANCE_KEY } from "./appearance";
+import { spaceTileClass, spaceTileFor } from "./tokens";
 
 type Palette = Record<string, string>;
 const light = theme.cssVars.light as Palette;
@@ -149,6 +150,13 @@ const TEXT_PAIRS: [string, string][] = [
   ["muted-foreground", "sidebar"],
   ["muted-foreground", "sidebar-hover"],
   ["muted-foreground", "sidebar-accent"], // NavItem trailing note when selected
+  // The sidebar's gradient ends lighter: its text stays readable at the bottom, and on the account card.
+  ["sidebar-foreground", "sidebar-gradient-end"],
+  ["muted-foreground", "sidebar-gradient-end"],
+  ["sidebar-foreground", "sidebar-card"],
+  ["muted-foreground", "sidebar-card"],
+  // A Space's initials on each tile color.
+  ...[1, 2, 3, 4, 5, 6].map((n): [string, string] => ["space-tile-foreground", `space-tile-${n}`]),
   ...["neutral", "agent", "runner", "system", "success", "warning", "danger"].map((t): [string, string] => [`tone-${t}-foreground`, `tone-${t}`]),
 ];
 
@@ -157,6 +165,10 @@ const EDGE_PAIRS: [string, string][] = [
   ...["background", "card", "popover", "sidebar"].map((s): [string, string] => ["ring", s]),
   ...["background", "card", "popover"].map((s): [string, string] => ["control-edge", s]), // fields, pickers, a switch's off track
   ...["background", "card", "popover"].map((s): [string, string] => ["destructive", s]), // destructive outline
+  // The selected row's accent bar and icon, on its pill and beside it.
+  ["sidebar-indicator", "sidebar-accent"],
+  ["sidebar-indicator", "sidebar"],
+  ["sidebar-indicator", "sidebar-gradient-end"],
   ["primary", "muted"], // the chosen segment on its track
   ["primary", "background"],
   ["primary", "card"],
@@ -313,4 +325,11 @@ test("menus open and close with and without reduced motion (fade + 0.98 scale, n
     await app.waitFor("id:fx-menu-rename", { state: "gone" });
     await app.waitFor("text:Last: rename");
   }
+});
+
+test("a Space's tile color is fixed by its id and drawn from the six tile tones", () => {
+  expect(spaceTileFor("acme")).toBe(spaceTileFor("acme"));
+  const seen = new Set(Array.from({ length: 60 }, (_, i) => spaceTileFor(`s${i}`)));
+  expect([...seen].every((c) => (spaceTileClass as readonly string[]).includes(c))).toBe(true);
+  expect(seen.size).toBe(6);
 });

@@ -3,13 +3,14 @@
 // Escape, the backdrop) returns there as it was: the place, Space, room,
 // draft and scroll are never touched, because the main panel stays mounted
 // underneath. Its sections are its own navigation, side by side on a wide
-// window and as a row of tabs on a narrow one; the app's sidebar only opens it.
+// window (an icon rail while collapsed) and as a row of tabs on a narrow
+// one, hidden there while collapsed; the app's sidebar only opens it.
 // Each page owns its scroll area and loads its data when opened
 // (src/settings.ts, src/routing.ts).
 
 import { closeSettings, openSettings, settingsOpen, settingsSection } from "../store";
 import type { SettingsSection } from "../store";
-import { Column, compactWidth, IconButton, Label, Modal, ModalNav, ModalTab, ModalTabRow, PanelToggle, Row, settingsPanel, Spacer, Surface } from "../ui";
+import { Column, compactWidth, IconButton, Label, Modal, ModalNav, ModalTab, ModalTabRow, PanelToggle, RailButton, Row, settingsPanel, Spacer, Surface } from "../ui";
 import type { IconName } from "../ui";
 import { AppearanceSettings } from "./AppearanceSettings";
 import { ConnectionBanner } from "./Conversation";
@@ -45,9 +46,27 @@ export function SettingsModal() {
 function WideSettings() {
   return (
     <Row grow testID="settings">
-      <If when={settingsPanel.open()}>
+      {/* Collapsed, the sections stay as a rail of their icons. */}
+      <If
+        when={settingsPanel.open()}
+        else={
+          <Surface variant="rail" testID="settings-rail" accessibilityLabel="Settings sections">
+            <Each of={SETTINGS_PAGES} key={(p) => p.section}>
+              {(p) => (
+                <RailButton
+                  testID={`rail-settings:${p().section}`}
+                  label={p().label}
+                  icon={p().icon}
+                  selected={settingsSection() === p().section}
+                  onPress={() => openSettings(p().section)}
+                />
+              )}
+            </Each>
+          </Surface>
+        }
+      >
         <ModalNav testID="settings-nav" accessibilityLabel="Settings sections">
-          <Row padX={2} padY={2}>
+          <Row padX={3} padY={2}>
             <Label variant="heading" heading>Settings</Label>
           </Row>
           <Tabs compact={false} />
@@ -87,7 +106,7 @@ function CompactSettings() {
 }
 
 function SectionsToggle() {
-  return <PanelToggle side="left" name="settings sections" caption="Sections" expanded={settingsPanel.open()}
+  return <PanelToggle side="left" name="settings sections" expanded={settingsPanel.open()}
     testID="toggle-settings-sections" onPress={settingsPanel.toggle} />;
 }
 

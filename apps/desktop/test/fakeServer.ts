@@ -20,7 +20,10 @@ type Run = { id: string; space_id: string; room_id: string; status: string; acto
 type Runner = { id: string; name: string; visibility: "personal" | "organization"; owner: string; token: string };
 type Capability = "chat" | "system_one" | "embeddings";
 type Share = { visibility: "personal" | "spaces" | "organization"; space_ids: string[] };
-type Conn = { id: string; owner: string; name: string; provider_id: string; base_url: string | null; model: string | null; is_default: boolean; key: string | null; deviceToken: string | null; capability: Capability; share: Share };
+type Thinking = { efforts: string[]; wire: "none" | "reasoning_effort" | "reasoning" };
+/** One model of a connection's own list (provider_connection_models). */
+type ConnModel = { model_id: string; display_name: string | null; listed_name: string | null; enabled: boolean; available: boolean; source: "listed" | "manual"; position: number; thinking: Thinking | null };
+type Conn = { id: string; owner: string; name: string; provider_id: string; base_url: string | null; model: string | null; is_default: boolean; key: string | null; deviceToken: string | null; capability: Capability; share: Share; models: ConnModel[] };
 type RoutingCase = { key: string; label: string; description: string; connection_id: string | null };
 type Routing = { enabled: boolean; infer_addressing: boolean; classifier_id: string | null; embedding_id: string | null; default_chat_id: string | null; min_directedness: number; min_route_probability: number; cases: RoutingCase[] };
 const DEFAULT_ROUTING: Routing = { enabled: false, infer_addressing: false, classifier_id: null, embedding_id: null, default_chat_id: null, min_directedness: 0.85, min_route_probability: 0.65, cases: [] };
@@ -72,6 +75,13 @@ export function fakeServer() {
     routing: new Map<string, Routing>(),
     /** The server has no model routing (an older version): 404. */
     noRouting: false,
+    /** The operator's METRO_MODEL (GET /v1/models/available `operator_model`, for users with no default chat connection). */
+    operatorModel: null as string | null,
+    /** What each provider lists (POST …/model-list/refresh, `fetch_models`); a device lists only while online. */
+    listings: new Map<string, { id: string; name?: string }[]>([
+      ["openai", [{ id: "gpt-fixture-1" }, { id: "gpt-fixture-2", name: "GPT Fixture 2" }]],
+      ["device", [{ id: "fixture-local-small" }, { id: "fixture-local-large" }]],
+    ]),
     /** Delays (ms) for GET paths (pathname, or pathname plus query), to test that late answers don't win. */
     delays: new Map<string, number>(),
     /**
@@ -112,7 +122,47 @@ export function fakeServer() {
   const admin = (user: string) => ORG_ADMINS.includes(user);
   const visibleRunner = (r: Runner | undefined, user: string) => !!r && (r.visibility === "organization" || r.owner === user);
   const runnerJson = (r: Runner, user: string) => ({ id: r.id, name: r.name, visibility: r.visibility, can_manage: r.visibility === "personal" ? r.owner === user : admin(user) });
-  const connJson = (c: Conn) => ({ id: c.id, name: c.name, provider_id: c.provider_id, base_url: c.base_url, model: c.model, is_default: c.is_default, has_key: !!c.key, capability: c.capability, visibility: c.share.visibility });
+  /** Self-hosted OpenAI-compatible connections take per-model thinking options. */
+  const customThinking = (c: Conn) => c.provider_id === "custom" || c.provider_id === "device-openai-compatible";
+  const modelViews = (c: Conn) =>
+    [...(c.models ?? [])].sort((a, b) => a.position - b.position).map((m) => ({
+      model_id: m.model_id, display_name: m.display_name ?? m.listed_name ?? m.model_id, custom_name: m.display_name, listed_name: m.listed_name,
+      enabled: m.enabled, available: m.available, source: m.source, position: m.position, is_default: m.model_id === c.model,
+      thinking: m.thinking, reasoning_efforts: m.thinking?.efforts ?? [],
+    }));
+  const connJson = (c: Conn) => ({ id: c.id, name: c.name, provider_id: c.provider_id, base_url: c.base_url, model: c.model, is_default: c.is_default, has_key: !!c.key, capability: c.capability, visibility: c.share.visibility, custom_thinking: customThinking(c), models: modelViews(c) });
+  const listView = (c: Conn) => ({ connection_id: c.id, default_model: c.model, custom_thinking: customThinking(c), models: modelViews(c) });
+  /** The connection's model is always an enabled entry of its list; with none, the first enabled one becomes it. */
+  const settle = (c: Conn) => {
+    c.models ??= [];
+    if (c.model && !c.models.some((m) => m.model_id === c.model)) c.models.push({ model_id: c.model, display_name: null, listed_name: null, enabled: true, available: true, source: "manual", position: c.models.length, thinking: null });
+    if (!c.model) c.model = c.models.find((m) => m.enabled)?.model_id ?? null;
+  };
+  /** What a provider lists now, or an error. */
+  const listingOf = (c: Conn): { ok: true; models: { id: string; name?: string }[] } | { ok: false; status: number; error: string } => {
+    if (c.provider_id.startsWith("device-")) return c.deviceToken && state.online.has(c.id) ? { ok: true, models: state.listings.get("device") ?? [] } : { ok: false, status: 503, error: "metro-connector is offline" };
+    const listed = state.listings.get(c.provider_id);
+    return listed ? { ok: true, models: listed } : { ok: false, status: 422, error: "this endpoint does not list models" };
+  };
+  /** Merges a listing: new ones enabled, gone ones unavailable; the owner's entries stay. */
+  const merge = (c: Conn, listed: { id: string; name?: string }[]) => {
+    settle(c);
+    let added = 0;
+    let unavailable = 0;
+    for (const l of listed) {
+      const m = c.models.find((x) => x.model_id === l.id);
+      if (m) {
+        m.available = true;
+        if (l.name) m.listed_name = l.name;
+      } else {
+        c.models.push({ model_id: l.id, display_name: null, listed_name: l.name ?? null, enabled: true, available: true, source: "listed", position: c.models.length, thinking: null });
+        added++;
+      }
+    }
+    for (const m of c.models) if (m.source === "listed" && m.available && !listed.some((l) => l.id === m.model_id)) (m.available = false), unavailable++;
+    settle(c);
+    return { added, unavailable };
+  };
   /** Whether `user` may use `c`: their own, or shared with the organization or a Space both are in now. */
   const usable = (c: Conn, user: string, scope?: string | null) =>
     c.owner === user ||
@@ -203,9 +253,20 @@ export function fakeServer() {
       if (body.base_url && !CATALOG.allowed_base_urls.includes(body.base_url)) return err(400, "base_url is not allowed");
       if (provider.requires_key && !body.api_key) return err(400, "api_key is required");
       const first = ![...state.connections.values()].some((x) => x.owner === user && x.capability === provider.capability);
-      const c: Conn = { id: `pc${nextId++}`, owner: user, name: body.name, provider_id: provider.id, base_url: body.base_url ?? provider.default_base_url ?? null, model: body.model ?? null, is_default: first, key: body.api_key ?? null, deviceToken: null, capability: provider.capability, share: { visibility: "personal", space_ids: [] } };
+      const c: Conn = { id: `pc${nextId++}`, owner: user, name: body.name, provider_id: provider.id, base_url: body.base_url ?? provider.default_base_url ?? null, model: body.model ?? null, is_default: first, key: body.api_key ?? null, deviceToken: null, capability: provider.capability, share: { visibility: "personal", space_ids: [] }, models: [] };
+      for (const m of (body.models ?? []) as { model_id: string; display_name?: string; thinking?: Thinking }[]) {
+        if (m.thinking && !customThinking(c)) return err(422, "thinking options can be set only on self-hosted OpenAI-compatible connections");
+        c.models.push({ model_id: m.model_id, display_name: m.display_name ?? null, listed_name: null, enabled: true, available: true, source: "manual", position: c.models.length, thinking: m.thinking ?? null });
+      }
+      settle(c);
+      let models_error: string | undefined;
+      if (body.fetch_models) {
+        const l = listingOf(c);
+        if (l.ok) merge(c, l.models);
+        else models_error = l.error;
+      }
       state.connections.set(c.id, c);
-      return ok({ connection: connJson(c) }, 201);
+      return ok({ ...connJson(c), ...(models_error ? { models_error } : {}) }, 201);
     }
     if (path === "/v1/models/available" && req.method === "GET") {
       const sid = url.searchParams.get("space_id");
@@ -226,7 +287,9 @@ export function fakeServer() {
             is_default: owned && c.is_default,
           };
         });
-      return ok({ models });
+      const hasDefault = [...state.connections.values()].some((c) => c.owner === user && c.capability === "chat" && c.is_default && !!c.model);
+      const operator = state.operatorModel && !hasDefault ? { model_id: state.operatorModel, label: "Server model (operator)" } : null;
+      return ok({ models, operator_model: operator });
     }
     if (path === "/v1/model-routing") {
       if (state.noRouting) return err(404, "not found");
@@ -246,7 +309,7 @@ export function fakeServer() {
         return ok(stored);
       }
     }
-    if ((r = m(/^\/v1\/providers\/([^/]+)(\/models|\/device-token|\/sharing)?$/))) {
+    if ((r = m(/^\/v1\/providers\/([^/]+)(\/models|\/device-token|\/sharing|\/model-list\/refresh|\/model-list)?$/))) {
       const c = state.connections.get(decodeURIComponent(r[1]));
       if (!c || c.owner !== user) return err(404, "no such connection"); // only the owner sees or changes a share
       if (r[2] === "/sharing") {
@@ -281,14 +344,55 @@ export function fakeServer() {
           return ok(undefined, 204);
         }
       }
-      if (r[2] === "/models" && req.method === "POST") {
-        if (device) return c.deviceToken && state.online.has(c.id) ? ok({ models: ["fixture-local-small", "fixture-local-large"] }) : err(503, "metro-connector is offline");
-        if (c.provider_id === "openai") return ok({ models: ["gpt-fixture-1", "gpt-fixture-2"] });
-        return err(422, "this endpoint does not list models");
+      if ((r[2] === "/models" || r[2] === "/model-list/refresh") && req.method === "POST") {
+        const l = listingOf(c);
+        if (!l.ok) return err(l.status, l.error);
+        const ids = l.models.map((x) => x.id);
+        if (c.capability !== "chat") return ok({ models: ids });
+        const synced = merge(c, l.models);
+        return ok({ models: ids, ...synced, connection: connJson(c) });
+      }
+      if (r[2] === "/model-list") {
+        settle(c);
+        if (req.method === "GET") return ok(listView(c));
+        const id = req.method === "DELETE" ? url.searchParams.get("model_id") : body?.model_id;
+        if (typeof id !== "string" || !id.trim()) return err(400, "model_id is required");
+        const entry = c.models.find((x) => x.model_id === id);
+        if (req.method === "POST") {
+          if (entry) return err(409, "that connection already has this model");
+          if (body.thinking && !customThinking(c)) return err(422, "thinking options can be set only on self-hosted OpenAI-compatible connections");
+          c.models.push({ model_id: id, display_name: body.display_name ?? null, listed_name: null, enabled: body.enabled ?? true, available: true, source: "manual", position: c.models.length, thinking: body.thinking ?? null });
+          if (body.default) c.model = id;
+          settle(c);
+          return ok(listView(c), 201);
+        }
+        if (!entry) return err(404, "that connection has no such model");
+        if (req.method === "PATCH") {
+          if (body.enabled === false && c.model === id) return err(409, "this is the connection's default model; choose another default model first");
+          if (body.display_name !== undefined) entry.display_name = body.display_name || null;
+          if (body.enabled !== undefined) entry.enabled = body.enabled;
+          if (body.thinking !== undefined) {
+            if (body.thinking && !customThinking(c)) return err(422, "thinking options can be set only on self-hosted OpenAI-compatible connections");
+            entry.thinking = body.thinking;
+          }
+          if (body.default === true) {
+            if (!entry.enabled) return err(409, "the default model must be enabled");
+            c.model = id;
+          }
+          return ok(listView(c));
+        }
+        if (req.method === "DELETE") {
+          if (c.model === id) return err(409, "this is the connection's default model; choose another default model first");
+          c.models = c.models.filter((x) => x.model_id !== id);
+          return ok(listView(c));
+        }
       }
       if (!r[2] && req.method === "PATCH") {
         if (body.name !== undefined) c.name = body.name;
-        if (body.model !== undefined) c.model = body.model;
+        if (body.model !== undefined) {
+          c.model = body.model;
+          settle(c);
+        }
         if (body.api_key !== undefined) c.key = body.api_key || null;
         if (body.is_default) for (const x of state.connections.values()) if (x.owner === user && x.capability === c.capability) x.is_default = x.id === c.id;
         return ok({ connection: connJson(c) });
@@ -448,7 +552,8 @@ export function fakeServer() {
   const addConnection = (owner: string, provider_id: string, name: string, model: string | null, share: Share = { visibility: "personal", space_ids: [] }) => {
     const provider = CATALOG.providers.find((p) => p.id === provider_id)!;
     const first = ![...state.connections.values()].some((x) => x.owner === owner && x.capability === provider.capability);
-    const c: Conn = { id: `pc${nextId++}`, owner, name, provider_id, base_url: provider.default_base_url ?? null, model, is_default: first, key: provider.requires_key ? "sk-fixture-not-real" : null, deviceToken: null, capability: provider.capability, share };
+    const c: Conn = { id: `pc${nextId++}`, owner, name, provider_id, base_url: provider.default_base_url ?? null, model, is_default: first, key: provider.requires_key ? "sk-fixture-not-real" : null, deviceToken: null, capability: provider.capability, share, models: [] };
+    settle(c);
     state.connections.set(c.id, c);
     return c;
   };

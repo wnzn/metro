@@ -187,3 +187,23 @@ export const popoverItemClass =
 /** A tooltip's bubble (also a popover step). */
 export const tooltipClass =
   "rounded-(--radius-sm) bg-popover border border-border px-(--space-2) py-[3px] text-(length:--text-xs) leading-(--leading-xs) text-popover-foreground shadow-md";
+
+/**
+ * A Space's tile colors: six brand-friendly tones (theme `space-tile-N`),
+ * each with white initials at 4.5:1 or better in both schemes.
+ */
+export const spaceTileClass = [
+  "bg-space-tile-1",
+  "bg-space-tile-2",
+  "bg-space-tile-3",
+  "bg-space-tile-4",
+  "bg-space-tile-5",
+  "bg-space-tile-6",
+] as const;
+
+/** The same tile color for the same seed (a Space's id), always. */
+export function spaceTileFor(seed: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < seed.length; i++) h = Math.imul(h ^ seed.charCodeAt(i), 16777619);
+  return spaceTileClass[(h >>> 0) % spaceTileClass.length]!;
+}

@@ -7,7 +7,7 @@
 import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
-import { headerAudience } from "./transcriptRows";
+import { headerAudience, textNamesRecipients } from "./transcriptRows";
 import theme from "../../theme/theme.json";
 import { APPEARANCE_KEY } from "../ui";
 
@@ -244,4 +244,54 @@ test("at 720 and 860 the composer's help stays reachable on Ask agent and the se
     expect(app.enabled("id:ask-agent")).toBe(true);
     expect(app.enabled("id:send")).toBe(true);
   }
+});
+
+test("a follow-up that starts by naming its recipients has no recipient line; one that doesn't has a slim one", () => {
+  const bob = { kind: "user" as const, id: "bob" };
+  const agent = { kind: "agent" as const };
+  expect(textNamesRecipients("@bob can you look", [bob])).toBe(true);
+  expect(textNamesRecipients("@Bob, @agent: ping", [bob, agent])).toBe(true);
+  expect(textNamesRecipients("can you look @bob", [bob])).toBe(false);
+  expect(textNamesRecipients("@bob look", [bob, agent])).toBe(false);
+  expect(textNamesRecipients("@agent hi", [{ kind: "agent", addressedBy: "classifier" }])).toBe(false); // never typed
+  expect(textNamesRecipients("hi", undefined)).toBe(false);
+});
+
+test("follow-ups: no lone recipient line when the text names them; 'you' is plain words; a technical error is one sentence with Details", async () => {
+  const f = world();
+  const at = (m: number) => `2026-11-22T01:0${m}:00.000Z`;
+  const say = (e: Record<string, unknown>) => f.post("acme/lobby", e as any);
+  say({ kind: "message", actor: "bob", actor_id: "bob", text: "first from bob", created_at: at(1) });
+  const named = say({ kind: "message", actor: "bob", actor_id: "bob", text: "@alice see this", mentions: [{ kind: "user", id: "alice" }], audience: "users", created_at: at(2) });
+  const unnamed = say({ kind: "message", actor: "bob", actor_id: "bob", text: "and this too", mentions: [{ kind: "user", id: "alice" }], audience: "users", created_at: at(3) });
+  const mine = say({ kind: "message", actor: "alice", actor_id: "alice", text: "mine", created_at: at(4) });
+  const raw = "The agent failed: CompletionError: ProviderError: HTTP 503 Service Unavailable";
+  const err = say({ kind: "error", actor: "system", text: raw, created_at: at(5) });
+  const app = await inAcme(f);
+  await app.waitFor("text:and this too");
+  expect(app.shows(`id:header:${named.id}`)).toBe(false); // the text already says @alice
+  expect(app.shows(`id:recipient:${unnamed.id}:alice`)).toBe(true); // a slim line, level with the time
+  expect(app.shows(`id:author:${unnamed.id}`)).toBe(false);
+  expect(app.shows(`id:failure:${err.id} >> text:The model provider had a problem answering.`)).toBe(true);
+  expect(app.shows("text:/ProviderError/")).toBe(false);
+  await app.press(`id:failure:${err.id}:details`);
+  await app.waitFor(`id:failure:${err.id}:text`);
+  expect(app.shows(`id:you:${mine.id} >> text:you`) || app.shows(`id:you:${mine.id}`)).toBe(true);
+  expect(app.viewStyle(`id:you:${mine.id}`)?.backgroundColor).toBeUndefined(); // muted words, no pill
+});
+
+test("@ suggestions: Tab inserts the highlighted one like Return; Return sends only once the list is closed", async () => {
+  const f = world();
+  const app = await inAcme(f);
+  await app.type("id:composer", "ping @");
+  await app.waitFor("id:pick:bob");
+  const before = messages(f).length;
+  await app.keyboard.press("down");
+  await app.keyboard.press("tab");
+  await app.waitFor("id:mention-chip:bob");
+  expect(app.shows("id:mention-picker")).toBe(false);
+  expect(app.value("id:composer")).toBe("ping @bob ");
+  expect(messages(f).length).toBe(before);
+  await app.keyboard.press("enter");
+  await app.waitUntil(() => messages(f).length === before + 1);
 });

@@ -12,7 +12,7 @@
 
 import { Image, Overlay, Scroll, Text, View, cleanup, effect, keymap, reduceMotion, signal, token, untracked, windowSize } from "nsh";
 import type { ImageAsset, InputRef, JSX, ViewRef } from "nsh";
-import { Button, Dialog, Input, Menu, MenuItem, MenuSeparator, Select } from "nsh/base";
+import { Button, ContextMenu, Dialog, Input, Menu, MenuItem, MenuSeparator, Select } from "nsh/base";
 import agentIcon from "./icons/agent.svg";
 import appearanceIcon from "./icons/appearance.svg";
 import chatIcon from "./icons/chat.svg";
@@ -30,6 +30,7 @@ import chevronRightIcon from "./icons/chevron-right.svg";
 import clockIcon from "./icons/clock.svg";
 import closeIcon from "./icons/close.svg";
 import copyIcon from "./icons/copy.svg";
+import pencilIcon from "./icons/pencil.svg";
 import deviceIcon from "./icons/device.svg";
 import hashIcon from "./icons/hash.svg";
 import logoutIcon from "./icons/logout.svg";
@@ -72,13 +73,17 @@ import {
   popoverClass,
   popoverItemClass,
   popoverMotion,
+  spaceTileFor,
   textClass,
+  toneSolidClass,
   toneSurfaceClass,
   toneTextClass,
   tooltipClass,
   transitionClass,
 } from "./tokens";
 import type { Tone } from "./tokens";
+import { settingsPanel } from "./panels";
+import { ResizeHandle } from "./resize";
 
 type Testable = { testID?: string; accessibilityLabel?: string };
 
@@ -96,6 +101,7 @@ const ICONS = {
   clock: clockIcon,
   close: closeIcon,
   copy: copyIcon,
+  pencil: pencilIcon,
   device: deviceIcon,
   file: fileIcon,
   hash: hashIcon,
@@ -118,13 +124,14 @@ const ICONS = {
 } as const;
 
 export type IconName = keyof typeof ICONS;
-export type IconColor = "default" | "muted" | "sidebar" | "sidebar-active" | "accent" | "danger" | "on-primary";
+export type IconColor = "default" | "muted" | "sidebar" | "sidebar-active" | "sidebar-indicator" | "accent" | "danger" | "on-primary";
 
 const ICON_TOKEN = {
   default: "foreground",
   muted: "muted-foreground",
   sidebar: "sidebar-foreground",
   "sidebar-active": "sidebar-accent-foreground",
+  "sidebar-indicator": "sidebar-indicator",
   accent: "accent-foreground",
   danger: "destructive",
   "on-primary": "primary-foreground",
@@ -162,20 +169,106 @@ export function IconButton(props: { icon: IconName; accessibilityLabel: string; 
 }
 
 /** Kept outside the panel it controls: one target to collapse and restore,
- * including when navigating with a keyboard or a screen reader. */
+ * including when navigating with a keyboard or a screen reader. Icon only:
+ * what it does (and `status`, such as "1 active") is its tooltip and
+ * accessible name; `attention` adds a small dot on the icon. */
 export function PanelToggle(props: {
-  side: "left" | "right"; expanded: boolean; name: string; caption?: string;
+  side: "left" | "right"; expanded: boolean; name: string; status?: string; attention?: boolean;
   shortcut?: "B" | "Shift+B"; testID: string; onPress: () => void;
 }) {
-  const label = () => `${props.expanded ? "Hide" : "Show"} ${props.name}`;
+  const label = () => `${props.expanded ? "Hide" : "Show"} ${props.name}${props.status ? `, ${props.status}` : ""}`;
   const shortcut = () => props.shortcut ? ` (${keymap.label("mod+" + props.shortcut.toLowerCase())})` : "";
   return (
-    <View role="button" focusable class={cx("flex-row shrink-0 min-w-[36px] min-h-[36px] items-center justify-center gap-(--space-1) px-(--space-2) rounded-(--radius-md) hover:bg-muted", transitionClass, focusRing)}
+    <View role="button" focusable class={cx("relative shrink-0 size-[36px] items-center justify-center rounded-(--radius-md) hover:bg-muted", transitionClass, focusRing)}
       testID={props.testID} accessibilityLabel={label()} accessibilityState={{ expanded: props.expanded }}
       tooltip={<Text class={tooltipClass}>{label() + shortcut()}</Text>} onPress={props.onPress}>
       <Icon name={props.side === "left" ? "panel-left" : "panel-right"} color={props.expanded ? "accent" : "muted"} size={20} />
-      <If when={props.caption}>{(caption) => <Text class={cx(textClass.sm, "font-medium text-foreground")}>{caption()}</Text>}</If>
+      <If when={props.attention}>
+        <View class="absolute right-[6px] top-[6px] size-[7px] rounded-full bg-primary border border-background" accessibilityElementsHidden testID={`${props.testID}-attention`} />
+      </If>
     </View>
+  );
+}
+
+// ---------------------------------------------------------------- rail
+
+/** A Space's rounded letter tile; its color comes from `seed` (the Space's id), the same every time. */
+export function SpaceTile(props: { initial: string; seed: string; size?: "sm" | "md" }) {
+  const md = () => props.size === "md";
+  return (
+    <View class={cx("items-center justify-center", md() ? "size-[28px] rounded-(--radius-md)" : "size-[20px] rounded-[5px]", spaceTileFor(props.seed))} accessibilityElementsHidden>
+      <Text class={cx("font-semibold text-space-tile-foreground", md() ? textClass.sm : "text-[11px]")}>{props.initial}</Text>
+    </View>
+  );
+}
+
+
+/**
+ * One place in a collapsed panel's icon rail: an icon, a letter tile (a
+ * Space's initial) or any small picture (`content`, an avatar). Its name is
+ * the tooltip and all a screen reader hears; `selected` takes the accent.
+ */
+export function RailButton(props: {
+  label: string;
+  selected?: boolean;
+  onPress: () => void;
+  icon?: IconName;
+  /** A letter tile instead of an icon (a Space), its color fixed by `seed`. */
+  initial?: string;
+  seed?: string;
+  /** Any small picture instead (an avatar). */
+  content?: JSX.Element;
+  testID?: string;
+  /** Its own actions on a secondary click (a Space's settings); the tooltip says so. */
+  menu?: readonly { id: string; label: string; onPress: () => void }[];
+}) {
+  const button = (
+    <Button
+      class={cx(
+        "relative items-center justify-center size-[40px] shrink-0 rounded-(--radius-md)",
+        transitionClass,
+        focusRing,
+        props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-hover active:bg-sidebar-hover",
+      )}
+      selected={props.selected}
+      onPress={props.onPress}
+      testID={props.testID}
+      accessibilityLabel={props.label}
+      tooltip={<Text class={tooltipClass}>{props.menu?.length ? `${props.label} · right-click for more` : props.label}</Text>}
+    >
+      {/* The selected place: an accent bar at the rail's edge, as in the open sidebar. */}
+      <If when={props.selected}>
+        <View class="absolute left-[-8px] top-[10px] bottom-[10px] w-[3px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
+      </If>
+      <If
+        when={props.content}
+        else={
+          <If
+            when={props.initial}
+            else={<Icon name={props.icon ?? "more"} color={props.selected ? "sidebar-indicator" : "sidebar"} size={20} />}
+          >
+            {(letter) => <SpaceTile initial={letter()} seed={props.seed ?? letter()} size="md" />}
+          </If>
+        }
+      >
+        {props.content}
+      </If>
+    </Button>
+  );
+  return (
+    <If when={props.menu?.length ? props.menu : null} else={button}>
+      {(items) => (
+        <ContextMenu popupClass={cx(popoverClass, "min-w-[180px]")} popupStartingClass={popoverMotion.starting} popupEndingClass={popoverMotion.ending} trigger={button}>
+          <Each of={[...items()]} key={(item) => item.id}>
+            {(item) => (
+              <MenuItem class={popoverItemClass} onSelect={() => item().onPress()} testID={item().id}>
+                <Text class={cx(textClass.sm, "text-popover-foreground")}>{item().label}</Text>
+              </MenuItem>
+            )}
+          </Each>
+        </ContextMenu>
+      )}
+    </If>
   );
 }
 
@@ -183,8 +276,11 @@ export function PanelToggle(props: {
 
 /** A single tinted silhouette and wordmark, with one accessible name. */
 export function MetroMark(props: { size?: "sm" | "lg"; symbolOnly?: boolean }) {
-  const width = () => props.symbolOnly ? 50 : props.size === "lg" ? 174 : 126;
-  const height = () => width() * 96 / (props.symbolOnly ? 200 : 498);
+  // Whole, even heights, as the header's 36-point controls have: centred in
+  // the same band they round to the same rows (no half-pixel drift). The
+  // symbol alone is 16 high in the 56-wide icon rail (size "sm"), else 24.
+  const height = () => props.symbolOnly ? (props.size === "sm" ? 16 : 24) : props.size === "lg" ? 34 : 24;
+  const width = () => height() * (props.symbolOnly ? 200 : 498) / 96;
   return (
     <Image
       src={props.symbolOnly ? metroIcon : metroHorizontal}
@@ -229,12 +325,23 @@ export function AccountMenu(props: {
   name: string;
   detail: string;
   detailIcon?: IconName;
+  /**
+   * The connection to the server, beside `detail`: a dot in `tone`, `text`
+   * after it only when there is something to say (Reconnecting), and the
+   * whole status (`label`) as its tooltip.
+   */
+  status?: { tone: Tone; label: string; text?: string; testID?: string };
+  /** Only the avatar, for an icon rail; the name and server are its tooltip. */
+  compact?: boolean;
   note?: string;
   items: readonly AccountMenuItem[];
 }) {
   const plain = () => props.items.filter((i) => !i.destructive);
   const ending = () => props.items.filter((i) => i.destructive);
   const still = () => reduceMotion();
+  const dot = (s: { tone: Tone; label: string; testID?: string }, extra?: string) => (
+    <View class={cx("size-2 shrink-0 rounded-full", toneSolidClass[s.tone], extra)} testID={s.testID} accessibilityLabel={s.label} />
+  );
   return (
     <Menu
       placement="top"
@@ -245,26 +352,58 @@ export function AccountMenu(props: {
       popupEndingClass={still() ? undefined : popoverMotion.ending}
       backdropClass="bg-black/40"
       trigger={
-        <View
-          class={cx("flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-(--space-2) hover:bg-sidebar-hover active:bg-sidebar-hover", transitionClass, focusRing)}
-          focusable
-          testID={props.testID}
-          accessibilityLabel={props.accessibilityLabel}
-        >
-          {props.avatar}
-          <View class="flex-1 min-w-0 flex-col">
-            <Text class={cx(textClass.sm, "font-semibold text-sidebar-foreground")} style={{ numberOfLines: 1 }}>
-              {props.name}
-            </Text>
-            <View class="flex-row items-center gap-[4px] min-w-0">
-              <If when={props.detailIcon}>{(name) => <Icon name={name()} color="muted" size={12} />}</If>
-              <Text class={cx("flex-1", textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
-                {props.detail}
-              </Text>
+        <If
+          when={props.compact}
+          else={
+            <View
+              class={cx(
+                // A raised compact card, set apart by space rather than a line.
+                "flex-row items-center gap-(--space-2) rounded-(--radius-lg) border border-sidebar-border/70 bg-sidebar-card px-(--space-3) py-[9px] shadow-sm hover:bg-sidebar-hover active:bg-sidebar-hover",
+                transitionClass,
+                focusRing,
+              )}
+              focusable
+              testID={props.testID}
+              accessibilityLabel={props.accessibilityLabel}
+            >
+              {props.avatar}
+              <View class="flex-1 min-w-0 flex-col">
+                <Text class={cx(textClass.sm, "font-semibold text-sidebar-foreground")} style={{ numberOfLines: 1 }}>
+                  {props.name}
+                </Text>
+                <View class="flex-row items-center gap-[4px] min-w-0">
+                  <If when={props.detailIcon}>{(name) => <Icon name={name()} color="muted" size={12} />}</If>
+                  <Text class={cx("shrink min-w-0", textClass.xs, "text-muted-foreground")} style={{ numberOfLines: 1 }}>
+                    {props.detail}
+                  </Text>
+                  <If when={props.status}>
+                    {(s) => (
+                      <View class="flex-row items-center gap-[4px] shrink-0" tooltip={<Text class={tooltipClass}>{s().label}</Text>}>
+                        {dot(s())}
+                        <If when={s().text}>
+                          {(t) => <Text class={cx(textClass.xs, toneTextClass[s().tone])} style={{ numberOfLines: 1 }}>{t()}</Text>}
+                        </If>
+                      </View>
+                    )}
+                  </If>
+                  <View class="flex-1" />
+                </View>
+              </View>
+              <Icon name="more" color="muted" />
             </View>
+          }
+        >
+          <View
+            class={cx("relative items-center justify-center size-[40px] rounded-(--radius-md) hover:bg-sidebar-hover active:bg-sidebar-hover", transitionClass, focusRing)}
+            focusable
+            testID={props.testID}
+            accessibilityLabel={props.accessibilityLabel}
+            tooltip={<Text class={tooltipClass}>{[props.name, props.detail, props.status?.label].filter(Boolean).join(" · ")}</Text>}
+          >
+            {props.avatar}
+            <If when={props.status}>{(s) => dot(s(), "absolute right-[5px] bottom-[5px] border border-sidebar")}</If>
           </View>
-          <Icon name="more" color="muted" />
-        </View>
+        </If>
       }
     >
       <If when={props.note}>
@@ -421,9 +560,14 @@ export function Modal(props: Testable & { open: boolean; title: string; onClose:
 /** The side navigation of a modal (Settings' sections). */
 export function ModalNav(props: Testable & { children?: JSX.Element }) {
   return (
-    <View class="w-[228px] flex-col gap-[2px] bg-sidebar border-r border-sidebar-border px-(--space-2) py-(--space-3)" testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="tablist">
-      {props.children}
-    </View>
+    <>
+      <View class="shrink-0 flex-col gap-(--space-1) bg-sidebar border-r border-sidebar-border px-(--space-2) py-(--space-3)" style={{ width: settingsPanel.width() }}
+        testID={props.testID} accessibilityLabel={props.accessibilityLabel} role="tablist">
+        {props.children}
+      </View>
+      {/* One width for every modal's sections (Settings, Space settings). */}
+      <ResizeHandle panel={settingsPanel} edge="end" name="sections" testID={props.testID ? `${props.testID}-resize` : undefined} />
+    </>
   );
 }
 
@@ -432,11 +576,12 @@ export function ModalTab(props: { label: string; icon: IconName; selected: boole
   return (
     <Button
       class={cx(
-        "flex-row items-center gap-(--space-2) rounded-(--radius-sm) px-(--space-2) py-[7px]",
+        // As the main sidebar's rows (NavItem): a soft pill with an accent bar at its start, the same insets.
+        "relative flex-row items-center gap-(--space-2) rounded-(--radius-md) px-(--space-3)",
         transitionClass,
         focusRing,
         // 40px rows in the side nav; the compact row of tabs keeps its own height.
-        props.compact ? "px-(--space-3)" : "min-h-[40px]",
+        props.compact ? "py-[7px]" : "min-h-[40px] py-[8px]",
         props.selected ? "bg-sidebar-accent" : "hover:bg-sidebar-hover active:bg-sidebar-hover",
       )}
       role="tab"
@@ -445,7 +590,10 @@ export function ModalTab(props: { label: string; icon: IconName; selected: boole
       testID={props.testID}
       accessibilityLabel={props.label}
     >
-      <Icon name={props.icon} color={props.selected ? "sidebar-active" : "sidebar"} />
+      <If when={props.selected && !props.compact}>
+        <View class="absolute left-0 top-[9px] bottom-[9px] w-[3px] rounded-full bg-sidebar-indicator" accessibilityElementsHidden />
+      </If>
+      <Icon name={props.icon} color={props.selected ? "sidebar-indicator" : "sidebar"} />
       <Text class={cx("text-(length:--text-sm)", props.selected ? "font-semibold text-sidebar-accent-foreground" : "text-sidebar-foreground")} style={{ numberOfLines: 1 }}>
         {props.label}
       </Text>
@@ -679,7 +827,7 @@ export function SearchBox(
       ref={(node) => box.set(node)}
       onLayout={(e) => width.set(e.bounds.size.width)}
       class={cx(
-        "flex-row items-center gap-(--space-2) w-full max-w-[560px] min-w-0 rounded-full border bg-popover pl-(--space-3) pr-[6px] focus-within:border-ring focus-within:bg-background",
+        "flex-row items-center gap-(--space-2) w-full min-w-0 rounded-(--radius-md) border bg-popover pl-(--space-3) pr-[6px] focus-within:border-ring focus-within:bg-background",
         controlEdgeClass,
         controlHeightClass.default,
         transitionClass,

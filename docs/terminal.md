@@ -91,9 +91,10 @@ example `Enter Ask agent · F2 Ask · F3 Save note`.
   rooms. Other Spaces never appear. Every request is checked by the server
   as usual.
 - **Addressing is the same as in the app.** In a room, type standalone
-  `@agent` or `@member-id`. A people-only message never starts the agent.
-  **F2** always asks the agent. An unaddressed **Send** follows your Metro
-  settings.
+  `@agent`, an agent's `@handle` or `@member-id` (the server resolves them).
+  A people-only message never starts an agent. **F2** always asks the
+  generic agent (the Space's default agent, or your classifier's pick). An
+  unaddressed **Send** follows your Metro settings for that Space.
 - **Personal Chat.** When a chat model is ready for you and you haven't set
   up System One, **Enter** on a typed question is **Ask agent**, and **F3**
   is **Save note**, which saves it without calling any model. Otherwise

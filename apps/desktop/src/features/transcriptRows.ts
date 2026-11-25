@@ -90,3 +90,16 @@ export function transcriptRows(items: readonly TranscriptItem[], events: readonl
   }
   return rows;
 }
+
+/**
+ * The message's text already starts by naming every explicit recipient
+ * ("@bob @agent can you…"), so a follow-up message needs no recipient line
+ * of its own. Only typed mentions count: an agent detected by System One or
+ * started by a schedule was never written in the text.
+ */
+export function textNamesRecipients(text: string, mentions: readonly MentionOf[] | undefined): boolean {
+  if (!mentions?.length) return false;
+  const lead = /^\s*((?:@[^\s@,:;]+[\s,:;]*)+)/.exec(text)?.[1] ?? "";
+  const named = new Set((lead.match(/@[^\s@,:;]+/g) ?? []).map((t) => t.slice(1).replace(/[.!?]+$/, "").toLowerCase()));
+  return mentions.every((m) => (m.kind === "agent" ? !m.addressedBy && named.has("agent") : named.has(m.id.toLowerCase())));
+}

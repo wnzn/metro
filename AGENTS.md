@@ -37,10 +37,29 @@ runtime.
   report what needs to change instead.
 - Never commit secrets. Generate tokens locally, and keep `.env` out of git.
 - Access is per **Space**. Only members see a Space or its rooms. Only the
-  owner manages members and the runner token. Outsiders and unknown ids get
-  404, non-owners get 403, and nobody can add themselves. Users are identified
-  by their stable identity-provider id (`sub`, or the dev username), never by
-  display name.
+  owner manages members and the runner token, renames and describes the
+  Space, and deletes it. Outsiders and unknown ids get 404, non-owners get
+  403, and nobody can add themselves. Users are identified by their stable
+  identity-provider id (`sub`, or the dev username), never by display name.
+- Deleting a Space is permanent, owner-only and needs the Space's exact name
+  typed as confirmation. It removes everything of the Space in one
+  transaction (see [docs/spaces.md](docs/spaces.md#spaces-and-members)),
+  revokes its dedicated token, detaches its runner and stops its runs. Any
+  member except the owner can leave. Leaving is the same as being removed,
+  including the purge of that person's index rows and preferences for the
+  Space. The owner can't leave.
+- A Space has one or more **agents** (at most 16), each with a name, a
+  unique `@handle`, a required one-line description, instructions, a
+  picture and a tool allowlist. Exactly one is the **default**. The handle
+  `agent` is reserved: only each Space's original agent may keep it, and
+  `@agent` always means the generic agent, that is, the default agent or
+  the classifier's pick. Instructions are appended after Metro's
+  built-in preamble and can never replace it. The allowlist is a subset of
+  the tools the run would get anyway; it never adds one. Only the owner
+  manages agents, and every member can read everything about them,
+  instructions included. Each run records its agent; threads keep the agent
+  of the run that created them; scheduled prompts in a Space use its
+  default agent.
 - A server has one organization. Org admins are the stable user ids in
   `METRO_ORG_ADMINS`, a JSON array. There's no other admin role.
 - There are two kinds of runner, and they never stand in for each other:
@@ -65,12 +84,18 @@ runtime.
   offers only list and read. Check and MCP need `METRO_SANDBOX=docker`, which
   mounts only the claiming Space's root. Dedicated runners keep their
   existing behaviour.
-- Model connections are personal by default. Unless something below says
-  otherwise, a run uses the default chat connection of the person who
-  started it, and so do the child threads that run starts. Nothing ever
-  falls back silently to another person's connection or to `METRO_MODEL`
-  after a connection fails. There are two kinds of connection, and docs must
-  keep them apart:
+- Model connections are personal by default. A run uses the sender's own
+  usable connections (or ones shared with them there), and so do the child
+  threads that run starts, in this order: the model explicitly chosen for
+  that turn, the sender's model for that agent in that Space, the sender's
+  default model in that Space, then the sender's use-case routing (below)
+  or default chat connection. Every step is checked when saved and again
+  when used; a choice that can't be used fails the run visibly. Nothing ever
+  falls back silently to the next step, to another person's connection or
+  to `METRO_MODEL` after a connection fails. `METRO_MODEL` is shown as
+  "Server model (operator)", and only to someone with no default chat
+  connection. There are two kinds of connection, and docs must keep them
+  apart:
   - **Device connections** (`device-*` providers) run in the user's own
     `metro-connector` on their machine, with their own vendor sign-in or
     key. The server stores only the connection id and a hash of its device
@@ -90,7 +115,17 @@ runtime.
 - Each connection serves one **capability**: `chat` (answers and tool turns),
   `system_one` (typed System One decisions) or `embeddings`. A connection is
   never used for a capability it wasn't set up for, and each capability has
-  its own default.
+  its own default. A person's first connection of a capability with a model
+  becomes that default automatically, and deleting the default promotes
+  their oldest remaining one.
+- Each chat connection has its own **model list**, managed only by its
+  owner. Models a provider lists are added enabled (opt-out); a refresh
+  adds new ones and marks vanished ones unavailable, never deleting entries
+  or the owner's names. Custom and self-hosted endpoints take manual models
+  with owner-set thinking options (effort values plus the wire: `none`,
+  `reasoning_effort` or `reasoning.effort`). A borrower of a shared
+  connection may pick any model its owner left enabled; the owner controls
+  that by disabling models.
 - **Sharing is explicit and grants use, never credentials.** Only a
   connection's owner can share it, either with Spaces they select or with
   the whole organization, and can revoke the share. A Space share works
@@ -106,30 +141,47 @@ runtime.
   switch quietly to the borrower's paid API profile. Accounts are never
   shared.
 - **Explicit recipients always decide who a message is addressed to.** A
-  message falls into exactly one of three cases:
-  - **People only** (`@bob`, with no `@agent` and not sent with Ask agent).
+  message falls into exactly one of these cases:
+  - **People only** (`@bob`, with no agent and not sent with Ask agent).
     It never starts agent work, and it's never sent to System One for an
     addressing or routing decision.
-  - **To the agent** (`@agent` or Ask agent, including mixed `@bob @agent`).
-    It starts agent work, with no "was this for the agent?" decision. The
-    same routing below still applies to choose the answering model.
+  - **To a named agent** (its `@handle`, or Ask agent with that agent
+    chosen). That agent runs, with no classification. Several agents
+    mentioned start one run each.
+  - **To the generic agent** (`@agent` or Ask agent without an agent,
+    including mixed `@bob @agent`). It starts agent work, with no "was this
+    for an agent?" decision. The default agent runs, unless the sender opted
+    in to classification in that Space; then one System One Choice among the
+    agents (with no "no agent" option) picks it. An unsure answer runs the
+    default agent. A failed decision shows a visible error, and no agent
+    runs for `@agent`.
   - **Unaddressed** (no mention, and not sent with Ask agent). By default it's
     ordinary conversation. Only the sender's opt-in classification (below)
-    can start the agent from it.
+    can start an agent from it.
 
-  The agent's history shows each message's author and recipients.
-- **Opt-in classification** decides only one thing: whether an unaddressed
-  outgoing message is asking the agent. A person can turn it on for their own
-  messages, in rooms or in their personal Chat. A message it starts runs as
-  that person. It's never used on people-only or to-the-agent messages, or on
-  other people's messages. With it off, which is the default, unaddressed
-  text is ordinary conversation.
+  The same routing below still applies to choose each run's answering
+  model. The agent's history shows each message's author and recipients.
+- **Opt-in classification** decides only which agent, if any, an outgoing
+  message is for. A person turns it on for their own messages **per
+  Space**, only while they have a System One connection usable in that
+  Space; personal Chat keeps its own per-person setting. In a Space it's one
+  typed System One Choice over the Space's agents plus "No agent" for an
+  unaddressed message (without "No agent" for the generic `@agent`). The
+  options are keyed internally, so model text never becomes an agent id.
+  For an unaddressed message, "No agent", low confidence or a failure
+  starts nothing (for `@agent`, see above). The run's
+  activity shows the decision ("Picked by classifier: X"). A message it
+  starts runs as that person. It's never used on people-only messages,
+  messages to a named agent or other people's messages. With it off, which
+  is the default, unaddressed text is ordinary conversation.
 - **Use-case routing** is a separate opt-in, and it decides only which of a
-  person's usable chat connections answers. It can run on any message that
-  starts agent work for that person: explicit `@agent`, Ask agent, or one
-  started by classification. An explicit model chosen for that turn
-  overrides it. With routing off, the person's default chat connection
-  answers. It follows the same consent, membership and sharing checks.
+  person's usable chat connections answers. It can run on any run that
+  starts for that person: a named agent, `@agent`, Ask agent, or one
+  started by classification. An explicit model chosen for that turn and
+  the person's per-agent and per-Space models override it, and each person
+  can turn it off per Space. With routing off, the person's default chat
+  connection answers. It follows the same consent, membership and sharing
+  checks.
 - **System One is the typed TypeSafe API** (`POST /v1/systemone`, models such
   as `jev-latest`, question types `noul`, `choice`, `score`). Spell it
   "System One" and "Noul". Never present a chat model's free-text guess as a
@@ -174,10 +226,16 @@ runtime.
   restarts too. On every trigger, the server re-checks the creator's
   membership and connection. If a check fails, that occurrence fails visibly
   and no fallback is used. A scheduled prompt counts as the creator
-  explicitly asking the agent.
+  explicitly asking the agent (in a Space, its default agent, never
+  classified).
 - Reactions never start agent work and never imply that work is complete.
-- Threads stay one level deep and bounded, and inherit their Space's members
-  and runner. The personal Chat agent's only tool is the scoped
+- A `reasoning_summary` event carries only the reasoning summary text a
+  provider returned (bounded), never encrypted, raw or redacted reasoning
+  and never text Metro made up. It's never a message, never model history
+  and never indexed.
+- Threads stay one level deep and bounded, inherit their Space's members
+  and runner, and keep the agent and connection of the run that created
+  them. The personal Chat agent's only tool is the scoped
   `react_to_message` acknowledgment. It has no runner, workspace or thread
   tools, and can't read Space transcripts. Cross-Space run controls are for
   the human, and they check membership.
@@ -205,6 +263,12 @@ runtime.
     `SHA256SUMS`, unsigned Windows files and GHCR images signed by the release workflow
     (`docs/acceptance.md`). Native Windows by a person, real vendor
     accounts and real sign-ins are still unverified.
+  - The latest gate on source since 0.3.2, not released (4175475, several
+    agents per Space, per-connection model lists, the desktop redesign) is
+    staged, not a release: 686 Rust tests, eight e2e scripts (not
+    `library_reference.py`) and desktop `nsh test` 400/400, with no
+    packaging tests, real vendor run or native Windows check. None of the
+    0.3.0, 0.3.1 or 0.3.2 releases contains that staged source.
   - Don't claim a real commercial provider, production auth, a release
     other than the recorded ones, pretrained `google/embeddinggemma-2` ranking quality, or
     native audio and video playback, seeking or the native file picker for

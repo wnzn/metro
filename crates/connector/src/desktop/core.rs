@@ -1402,7 +1402,8 @@ impl Desktop {
             profile: &b.profile,
             config: &b.config,
         };
-        let result = tokio::time::timeout(Duration::from_secs(60), p.available_models()).await;
+        let result =
+            tokio::time::timeout(Duration::from_secs(60), p.available_models_named()).await;
         match &result {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => match openai_oauth::local_failure(e) {
@@ -1412,7 +1413,12 @@ impl Desktop {
             Err(_) => self.events.record(EventKind::DeviceModelDiscoveryFailed),
         }
         match result {
-            Ok(Ok(models)) => Ok(json!({"models": models})),
+            Ok(Ok(catalog)) => {
+                // Every listed model (not filtered by approval), plus the
+                // catalog names the provider reports, when any.
+                let ids: Vec<String> = catalog.iter().map(|(id, _)| id.clone()).collect();
+                Ok(crate::policy::approved_models_named(&ids, &catalog))
+            }
             Ok(Err(e)) => Err(err(
                 502,
                 "provider_error",

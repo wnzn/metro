@@ -33,10 +33,17 @@ async function signOut(app: App) {
   await app.press("id:disconnect");
 }
 
-/** Picks `label` in the picker `id`. */
-async function pick(app: App, id: string, label: string) {
+/** Picks connection `value` in the model picker `id` (its rows are `id:<picker>:<connection id>`). */
+async function pick(app: App, id: string, value: string) {
   await app.press(`id:${id}`);
-  await app.press(`text:${label}`);
+  await app.press(`id:${id}:${value}`);
+}
+
+/** Opens a connection's ⋯ menu on Model providers and chooses `item` (e.g. `connection-sharing`). */
+async function menu(app: App, connectionId: string, item: string) {
+  await app.waitFor(`id:connection-menu:${connectionId}`);
+  await app.press(`id:connection-menu:${connectionId}`);
+  await app.press(`id:${item}:${connectionId}`);
 }
 
 /** Alice's own chat, System One and embeddings connections, Bob's chat connection shared with Acme, and one he keeps private. */
@@ -79,7 +86,7 @@ test("Model routing is off by default and says nothing is sent", async () => {
 });
 
 test("pickers offer only models of their capability that I can use, mine and shared ones; a use case routes to a shared model", async () => {
-  const { f, s1, emb, shared } = routingWorld();
+  const { f, chat, s1, emb, shared, hidden } = routingWorld();
   const app = await signIn(f, "alice");
   await settings(app, "routing");
   await app.waitFor("id:routing-classifier");
@@ -92,23 +99,28 @@ test("pickers offer only models of their capability that I can use, mine and sha
 
   // The classifier picker lists System One connections only.
   await app.press("id:routing-classifier");
-  expect(app.shows("text:/Alice System One · jev-latest/")).toBe(true);
-  expect(app.shows("text:/Alice OpenAI · gpt-fixture-2/")).toBe(false);
-  expect(app.shows("text:/Home embeddings/")).toBe(false);
-  await app.press("text:/Alice System One · jev-latest/");
+  await app.waitFor(`id:routing-classifier:${s1.id}`);
+  // Grouped by provider; the connection's name first, its model and whose it is beneath.
+  expect(app.shows(`id:routing-classifier:${s1.id} >> text:Alice System One`)).toBe(true);
+  expect(app.shows(`id:routing-classifier:${s1.id} >> text:jev-latest · Yours`)).toBe(true);
+  expect(app.shows("id:routing-classifier-group:System One")).toBe(true);
+  expect(app.shows(`id:routing-classifier:${chat.id}`)).toBe(false);
+  expect(app.shows(`id:routing-classifier:${emb.id}`)).toBe(false);
+  await app.press(`id:routing-classifier:${s1.id}`);
 
   // A use case answered by Bob's shared connection; his private one is never offered.
   await app.press("id:routing-add-case");
   await app.type("id:case-label:0", "Code review");
   await app.type("id:case-description:0", "Reviewing a diff or a pull request");
-  const classifierRows = app.count("text:/^Alice System One · /"); // the classifier's own trigger
   await app.press("id:case-model:0");
-  expect(app.shows("text:/Bob GPU · qwen-fixture/")).toBe(true);
-  expect(app.shows("text:/Bob private/")).toBe(false);
-  expect(app.count("text:/^Alice System One · /")).toBe(classifierRows); // not offered: not a chat model
-  await app.press("text:/Bob GPU · qwen-fixture/");
+  await app.waitFor(`id:case-model:0:${shared.id}`);
+  // A shared one says whose it is and that they see the requests.
+  expect(app.shows(`id:case-model:0:${shared.id} >> text:qwen-fixture · Shared by bob, who can see these requests`)).toBe(true);
+  expect(app.shows(`id:case-model:0:${hidden.id}`)).toBe(false);
+  expect(app.shows(`id:case-model:0:${s1.id}`)).toBe(false); // not offered: not a chat model
+  await app.press(`id:case-model:0:${shared.id}`);
 
-  await pick(app, "routing-embedding", "/Home embeddings · nomic-embed-text/");
+  await pick(app, "routing-embedding", emb.id);
   await app.clear("id:routing-min-route");
   await app.type("id:routing-min-route", "70");
 
@@ -149,7 +161,7 @@ test("classification of my unaddressed messages is a separate opt-in and names t
   const { f, s1 } = routingWorld();
   const app = await signIn(f, "alice");
   await settings(app, "routing");
-  await pick(app, "routing-classifier", "/Alice System One · jev-latest/");
+  await pick(app, "routing-classifier", s1.id);
   await app.press("id:routing-infer");
   expect(app.shows("id:dataflow-addressing-facts >> text:Each message you write that mentions nobody and isn't sent with Ask agent")).toBe(true);
   expect(app.shows("id:dataflow-addressing-facts >> text:“Alice System One” (TypeSafe System One)")).toBe(true);
@@ -221,28 +233,26 @@ test("a late routing answer never lands in the next user's session", async () =>
 // ------------------------------------------------------------------ capabilities and sharing
 
 test("each capability has its own default; a System One connection never becomes the chat default", async () => {
-  const { f, chat } = routingWorld();
+  const { f, chat, s1, emb } = routingWorld();
   const app = await signIn(f, "alice");
   await settings(app, "providers");
   await app.waitFor(`id:connection:${chat.id}`);
-  expect(app.shows(`id:connection-default:${chat.id} >> text:Default chat`)).toBe(true);
-  // Each capability's default, on one line at the top of the page.
-  expect(app.shows(`id:provider-defaults:chat >> text:${chat.name}`)).toBe(true);
-  expect(app.shows("id:provider-defaults:system_one >> text:Alice System One")).toBe(true);
-  expect(app.shows("id:provider-defaults:embeddings >> text:Home embeddings")).toBe(true);
+  // One group per capability, each with its own Default tag.
+  expect(app.shows(`id:connection-group:chat >> id:connection:${chat.id}:default`)).toBe(true);
+  expect(app.shows(`id:connection-group:system_one >> id:connection:${s1.id}:default`)).toBe(true);
+  expect(app.shows(`id:connection-group:embeddings >> id:connection:${emb.id}:default`)).toBe(true);
   const s1b = f.addConnection("alice", "device-systemone", "Laptop System One", "jev-latest");
   await app.press("id:settings-close");
   await settings(app, "providers");
-  await app.waitFor(`id:connection:${s1b.id}`);
-  expect(app.shows(`id:connection-capability:${s1b.id} >> text:System One`)).toBe(true);
-  expect(app.shows(`id:connection-make-default:${s1b.id}`)).toBe(false); // inside Manage
-  await app.press(`id:connection-manage:${s1b.id}`);
-  await app.press(`id:connection-make-default:${s1b.id}`);
+  await app.waitFor(`id:connection-group:system_one >> id:connection:${s1b.id}`);
+  expect(app.shows(`id:connection:${s1b.id}:default`)).toBe(false);
+  expect(app.shows(`id:connection-make-default:${s1b.id}`)).toBe(false); // inside the ⋯ menu
+  await menu(app, s1b.id, "connection-make-default");
   await app.waitUntil(() => f.state.connections.get(s1b.id)!.is_default);
-  await app.waitFor(`id:connection-default:${s1b.id}`);
-  expect(app.shows(`id:connection-default:${s1b.id} >> text:Default System One`)).toBe(true);
+  await app.waitFor(`id:connection:${s1b.id}:default`);
+  expect(app.shows(`id:connection:${s1.id}:default`)).toBe(false);
   expect(f.state.connections.get(chat.id)!.is_default).toBe(true);
-  expect(app.shows(`id:connection-default:${chat.id}`)).toBe(true);
+  expect(app.shows(`id:connection:${chat.id}:default`)).toBe(true);
 });
 
 test("the provider list filters by capability; an embeddings endpoint that can't list models needs a model ID", async () => {
@@ -265,13 +275,16 @@ test("the provider list filters by capability; an embeddings endpoint that can't
   expect(app.shows("id:provider:device-embeddings")).toBe(true);
   await app.press("id:provider:custom-embeddings");
   await app.waitFor("id:server-form");
-  expect(app.shows("id:provider-save-fetch")).toBe(false);
+  expect(app.shows("id:provider-save >> text:Save")).toBe(true); // nothing to list
+  expect(app.shows("id:provider-model-thinking:toggle")).toBe(false); // thinking options are for chat models
   await app.press("id:provider-url:http://127.0.0.1:11434/v1");
   const before = f.posts().length;
   await app.press("id:provider-save");
-  await app.waitFor("text:This provider can't list its models: enter the model ID it documents.");
+  await app.waitFor("text:This provider can't list its models: add the model ID it documents.");
   expect(f.posts().length).toBe(before);
-  await app.type("id:provider-model", "nomic-embed-text");
+  await app.type("id:provider-model-id", "nomic-embed-text");
+  await app.press("id:provider-model-save");
+  await app.waitFor("id:provider-model-draft:nomic-embed-text");
   await app.press("id:provider-save");
   await app.waitUntil(() => [...f.state.connections.values()].some((c) => c.name === "Self-hosted embeddings (OpenAI-compatible)" && c.capability === "embeddings"));
 });
@@ -280,9 +293,7 @@ test("the owner shares a connection with chosen Spaces, others can use it withou
   const { f, chat } = routingWorld();
   const app = await signIn(f, "alice");
   await settings(app, "providers");
-  await app.waitFor(`id:connection:${chat.id}`);
-  await app.press(`id:connection-manage:${chat.id}`);
-  await app.press(`id:connection-sharing:${chat.id}`);
+  await menu(app, chat.id, "connection-sharing");
   await app.waitFor(`id:sharing-visibility:${chat.id}`);
   expect(text(app)).toContain("Only you can use it. This is the default.");
   await app.press(`id:sharing-visibility:${chat.id}:spaces`);
@@ -297,7 +308,7 @@ test("the owner shares a connection with chosen Spaces, others can use it withou
   await app.waitFor(`id:sharing-notice:${chat.id}`);
   expect(puts(f, `/v1/providers/${chat.id}/sharing`).at(-1)?.body).toEqual({ visibility: "spaces", space_ids: ["acme"] });
   expect(text(app)).toContain("Members of Acme can now use “Alice OpenAI”.");
-  await app.waitFor(`id:connection-shared:${chat.id}`);
+  await app.waitFor(`id:connection-heading:${chat.id}:status >> text:/Shared with Spaces/`);
   expect(text(app)).not.toContain("sk-fixture-not-real");
 
   // Bob (in Acme) can pick it, never read it; Carol (in no Space with Alice) can't see it.
@@ -306,28 +317,29 @@ test("the owner shares a connection with chosen Spaces, others can use it withou
   await settings(app, "routing");
   await app.press("id:routing-add-case");
   await app.press("id:case-model:0");
-  expect(app.shows("text:/Alice OpenAI · gpt-fixture-2/")).toBe(true);
+  await app.waitFor(`id:case-model:0:${chat.id}`);
+  expect(app.shows(`id:case-model:0:${chat.id} >> text:gpt-fixture-2 · Shared by alice, who can see these requests`)).toBe(true);
   expect(text(app)).not.toContain("sk-fixture-not-real");
   await signOut(app);
   await signIn(f, "carol", app);
   await settings(app, "routing");
   await app.press("id:routing-add-case");
   await app.press("id:case-model:0");
-  expect(app.shows("text:/Alice OpenAI/")).toBe(false);
+  expect(app.shows(`id:case-model:0:${chat.id}`)).toBe(false);
 
   // Alice makes it private again.
   await signOut(app);
   await signIn(f, "alice", app);
   await settings(app, "providers");
-  if (!app.shows(`id:connection-sharing:${chat.id}`)) await app.press(`id:connection-manage:${chat.id}`);
-  await app.press(`id:connection-sharing:${chat.id}`);
+  await menu(app, chat.id, "connection-sharing");
   await app.waitFor(`id:sharing-visibility:${chat.id}`);
   await app.press(`id:sharing-visibility:${chat.id}:personal`);
   await app.press(`id:sharing-save:${chat.id}`);
   await app.waitFor(`id:sharing-notice:${chat.id}`);
   expect(text(app)).toContain("“Alice OpenAI” is private again. Nobody else can use it from now on.");
   expect(f.state.connections.get(chat.id)!.share.visibility).toBe("personal");
-  await app.waitFor(`id:connection-shared:${chat.id}`, { state: "gone" });
+  await app.press(`id:sharing-close:${chat.id}`);
+  await app.waitFor(`id:sharing-section:${chat.id} >> text:Only you can use it.`);
 });
 
 test("a ChatGPT sign-in is shared only as a bring-your-own preset; a device share says it runs on the owner's computer", async () => {
@@ -336,16 +348,15 @@ test("a ChatGPT sign-in is shared only as a bring-your-own preset; a device shar
   const gpu = f.addConnection("alice", "device-openai-compatible", "Desk GPU", "qwen-fixture");
   const app = await signIn(f, "alice");
   await settings(app, "providers");
-  await app.press(`id:connection-manage:${oauth.id}`);
-  await app.press(`id:connection-sharing:${oauth.id}`);
+  await menu(app, oauth.id, "connection-sharing");
   await app.waitFor(`id:sharing-preset:${oauth.id}`);
   expect(text(app)).toContain("Your ChatGPT sign-in and plan can't be shared or lent.");
   await app.press(`id:sharing-visibility:${oauth.id}:organization`);
   expect(app.shows(`id:sharing-save:${oauth.id} >> text:Share preset with the organization`)).toBe(true);
   expect(text(app)).toContain("Their requests go to their own sign-in, never through yours.");
 
-  await app.press(`id:connection-manage:${gpu.id}`);
-  await app.press(`id:connection-sharing:${gpu.id}`); // one panel at a time
+  await app.press("id:connection-back");
+  await menu(app, gpu.id, "connection-sharing"); // one panel at a time
   await app.waitFor(`id:sharing-visibility:${gpu.id}`);
   expect(app.shows(`id:sharing:${oauth.id}`)).toBe(false);
   await app.press(`id:sharing-visibility:${gpu.id}:organization`);

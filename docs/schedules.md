@@ -87,7 +87,10 @@ app labels the statuses in plain words: *Dispatched*, *Not dispatched* (for
 
 - **It counts as you explicitly asking the agent.** It goes through the same
   path as an `@agent` message from you: your model connection, and the
-  Space's runner when it's in a Space. It never goes to a classifier.
+  Space's runner when it's in a Space. In a Space it always asks the Space's
+  **default agent**, on your models for that agent and Space
+  ([order](settings.md#which-model-a-run-uses)). It never goes to a
+  classifier.
 - **It belongs to you.** Only you can see, edit, pause or delete your tasks.
   Another person's task, and one that doesn't exist, both get `404`. Tasks are
   tied to your stable user id. The server stores no user token.

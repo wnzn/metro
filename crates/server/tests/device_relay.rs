@@ -171,7 +171,7 @@ async fn composer_inventory_is_current_generation_owner_scoped_and_pinned_for_pr
     assert_eq!(s.claim(&device).await.0, StatusCode::NO_CONTENT);
     assert_eq!(
         available(ALICE, path).await.1["models"][0]["chat_models"],
-        json!([{"id":"gpt-5.5","reasoning_efforts":[]}])
+        json!([{"id": "gpt-5.5", "display_name": "gpt-5.5", "reasoning_efforts": [], "is_default": true, "available": true}])
     );
 
     let poll = json!({"approved_models": ["gpt-6.2-sol", "gpt-5.5", "gpt-4.1"]});
@@ -188,9 +188,9 @@ async fn composer_inventory_is_current_generation_owner_scoped_and_pinned_for_pr
     assert_eq!(
         models["models"][0]["chat_models"],
         json!([
-            {"id": "gpt-4.1", "reasoning_efforts": []},
-            {"id": "gpt-5.5", "reasoning_efforts": ["low", "medium", "high", "xhigh"]},
-            {"id": "gpt-6.2-sol", "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"]}
+            {"id": "gpt-4.1", "display_name": "gpt-4.1", "reasoning_efforts": [], "is_default": false, "available": true},
+            {"id": "gpt-5.5", "display_name": "gpt-5.5", "reasoning_efforts": ["low", "medium", "high", "xhigh"], "is_default": true, "available": true},
+            {"id": "gpt-6.2-sol", "display_name": "gpt-6.2-sol", "reasoning_efforts": ["low", "medium", "high", "xhigh", "max"], "is_default": false, "available": true}
         ])
     );
     assert!(!models.to_string().contains(&device));
@@ -248,7 +248,7 @@ async fn composer_inventory_is_current_generation_owner_scoped_and_pinned_for_pr
     assert_eq!(
         preset["chat_models"],
         json!([
-            {"id":"gpt-5.5","reasoning_efforts":["low","medium","high","xhigh"]}
+            {"id": "gpt-5.5", "display_name": "gpt-5.5", "reasoning_efforts": ["low","medium","high","xhigh"], "is_default": true, "available": true}
         ])
     );
     let forged = json!({
@@ -278,7 +278,7 @@ async fn composer_inventory_is_current_generation_owner_scoped_and_pinned_for_pr
     assert_eq!(s.claim(&rotated).await.0, StatusCode::NO_CONTENT);
     assert_eq!(
         available(ALICE, path).await.1["models"][0]["chat_models"],
-        json!([{"id":"gpt-5.5","reasoning_efforts":[]}])
+        json!([{"id": "gpt-5.5", "display_name": "gpt-5.5", "reasoning_efforts": [], "is_default": true, "available": true}])
     );
 }
 

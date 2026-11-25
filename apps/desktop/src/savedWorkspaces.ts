@@ -31,7 +31,7 @@ import { parseServerUrl } from "./api/serverUrl";
 import { hasPendingAttachments } from "./features/attachments/attachmentDraft";
 import { commitLocalWorkspace, onLocalWorkspace, prepareLocalWorkspace } from "./localWorkspace";
 import { clearForgottenDefault } from "./startupWorkspace";
-import { adoptConnection, connectedTo, describe, disconnect, dispatchDraft, dispatching, draft, onSessionEnd, onSessionStart, prepareConnection, sending, serverUrlInput, sessionGuard, status } from "./store";
+import { adoptConnection, connectedTo, describe, disconnect, dispatchDraft, dispatching, draft, onSessionEnd, stashedDraftPending, onSessionStart, prepareConnection, sending, serverUrlInput, sessionGuard, status } from "./store";
 
 export const SAVED_SERVERS_KEY = "metro.savedServers";
 /** Names are short labels; addresses are checked by parseServerUrl. */
@@ -245,9 +245,9 @@ export function registerUnsentCheck(fn: () => boolean): void {
   unsentChecks.push(fn);
 }
 
-/** Something would be lost by leaving: text not sent (a room or Chat message, a task), a send in flight, or another registered check. */
+/** Something would be lost by leaving: text not sent (a room or Chat message in any place, a task), a send in flight, or another registered check. */
 export const unsentDraft = computed(
-  () => draft().trim().length > 0 || dispatchDraft().trim().length > 0 || sending() !== null || dispatching() || hasPendingAttachments() || unsentChecks.some((fn) => fn()),
+  () => draft().trim().length > 0 || stashedDraftPending() || dispatchDraft().trim().length > 0 || sending() !== null || dispatching() || hasPendingAttachments() || unsentChecks.some((fn) => fn()),
 );
 
 let switchSeq = 0;
