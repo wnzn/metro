@@ -118,6 +118,8 @@ export const switchingSpace = signal(false);
 
 const roomsBySpace = signal<Record<string, readonly Room[]>>({});
 export const rooms = computed(() => roomsBySpace()[activeSpaceId() ?? ""] ?? EMPTY_ROOMS);
+/** The active Space returned a room list, possibly an empty one. */
+export const roomsLoaded = computed(() => roomsBySpace()[activeSpaceId() ?? ""] !== undefined);
 export const activeRoomId = signal<string | null>(null);
 export const activeRoom = computed(() => rooms().find((r) => r.id === activeRoomId()) ?? null);
 
@@ -181,6 +183,7 @@ let abort: AbortController | null = null;
 let session = 0;
 let navigationGeneration = 0;
 let roomEntryNavigation: number | undefined;
+const pendingRoomEntries = new Map<string, number>();
 let timer: number | undefined;
 let ticking = false;
 let tickAgain = false;
@@ -326,7 +329,7 @@ function publishSession(baseUrl: string, token: string, who: Me, list: Space[], 
           basePlace() === "space" && activeSpaceId() === initial.id && activeRoomId() !== null && view() === "room";
         // Don't wake a later navigation, even if it returned to this Space.
         // Still start the loop if none is scheduled (e.g. after falling back to Chat).
-        if (stillTarget || timer === undefined) kick();
+        if (stillTarget || (timer === undefined && !switchingSpace())) kick();
       });
     } else {
       kick();
@@ -537,23 +540,21 @@ export function closeSettings() {
 }
 
 export async function selectSpace(spaceId: string): Promise<void> {
-  if (switchingSpace()) return;
-  if (spaceId === activeSpaceId() && roomsBySpace()[spaceId]) {
-    if (basePlace() === "space" && !settingsOpen()) return;
-    navigationGeneration++;
-    batch(() => {
-      clearTransient();
-      view.set("room");
-      settingsOpen.set(false);
-      basePlace.set("space");
-      actionError.set(null);
-      notice.set(null);
-    });
-    kick();
-    return;
+  if (!client || !spaces().some(s => s.id === spaceId)) return;
+  if (spaceId === activeSpaceId() && basePlace() === "space") {
+    // Repeated clicks on the pending target aren't a new entry. Clicking any
+    // other Space is deliberate navigation, even during startup hydration.
+    if (roomEntryNavigation === navigationGeneration) {
+      if (settingsOpen()) closeSettings();
+      return;
+    }
+    if (roomsBySpace()[spaceId] && !settingsOpen()) return;
   }
-  await enterSpace(spaceId, { place: basePlace(), spaceId: activeSpaceId() });
-  kick();
+  const current = guard();
+  const entering = enterSpace(spaceId, { place: basePlace(), spaceId: activeSpaceId() });
+  const navigation = navigationGeneration;
+  await entering;
+  if (current() && navigation === navigationGeneration) kick();
 }
 
 export async function createSpace(nameInput: string): Promise<boolean> {
@@ -594,8 +595,11 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
   if (!c) return;
   const navigation = ++navigationGeneration;
   roomEntryNavigation = navigation;
+  pendingRoomEntries.set(spaceId, navigation);
   const currentSession = guard();
   const ok = guard(spaceId);
+  const listedSpace = () => spaces().find(s => s.id === spaceId);
+  const membership = listedSpace();
   batch(() => {
     clearTransient();
     view.set("room");
@@ -611,9 +615,11 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
     if (!roomsBySpace()[spaceId]) {
       const list = await c.listRooms(spaceId);
       if (!ok() || navigation !== navigationGeneration) return;
+      // A room list from another verified read may already have landed.
+      const fresh = roomsBySpace()[spaceId];
       batch(() => {
-        roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
-        if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, list));
+        if (!fresh) roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
+        if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, fresh ?? list));
       });
     }
     if (activeSpaceId() === spaceId) rememberSpace(spaceId);
@@ -623,11 +629,14 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
       disconnect(error.message);
       return;
     }
+    if (pendingRoomEntries.get(spaceId) !== navigation) return;
     const denied = error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found");
+    const verifiedRooms = roomsBySpace()[spaceId];
+    // Only this Space's evidence can supersede its refusal: a newer entry,
+    // a committed room read (including []), or a refreshed membership.
+    const sameEvidence = !verifiedRooms && membership !== undefined && listedSpace() === membership;
     if (navigation !== navigationGeneration) {
-      // A deliberate move to another pane wins, but the latest room entry
-      // still tells us whether the Space can remain in the sidebar.
-      if (denied && roomEntryNavigation === navigation) {
+      if (denied && sameEvidence) {
         batch(() => {
           purgeSpace(spaceId, true);
           if (activeSpaceId() === spaceId) {
@@ -638,9 +647,13 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
       }
       return;
     }
-    const name = spaces().find((s) => s.id === spaceId)?.name ?? spaceId;
-    if (denied) purgeSpace(spaceId, true);
-    else purgeSpace(spaceId, false); // keep it listed; just don't keep half-loaded state
+    if (verifiedRooms) {
+      activeRoomId.set(pickRoom(spaceId, verifiedRooms));
+      rememberSpace(spaceId);
+      return;
+    }
+    const name = listedSpace()?.name ?? spaceId;
+    if (sameEvidence) purgeSpace(spaceId, denied);
     const back = previous.spaceId && spaces().some((s) => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
     batch(() => {
       activeSpaceId.set(back);
@@ -649,9 +662,12 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
       actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
     });
   } finally {
-    if (currentSession() && roomEntryNavigation === navigation) {
-      roomEntryNavigation = undefined;
-      switchingSpace.set(false);
+    if (currentSession()) {
+      if (pendingRoomEntries.get(spaceId) === navigation) pendingRoomEntries.delete(spaceId);
+      if (roomEntryNavigation === navigation) {
+        roomEntryNavigation = undefined;
+        switchingSpace.set(false);
+      }
     }
   }
 }
@@ -1341,6 +1357,8 @@ function endSession() {
   pollAgain.clear();
   lastRoomBySpace.clear();
   spaceEpoch.clear();
+  roomEntryNavigation = undefined;
+  pendingRoomEntries.clear();
   batch(() => {
     status.set({ phase: "signedOut" });
     connectedTo.set(null);

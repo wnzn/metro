@@ -20,6 +20,7 @@ import { announce, computed, effect, keymap, signal, untracked } from "nsh";
 import type { JSX } from "nsh";
 import type { Bounds, ViewRef } from "nsh";
 import {
+  actionError,
   activeRoom,
   activeSpace,
   activeSpaceId,
@@ -34,6 +35,7 @@ import {
   openManage,
   removeMention,
   rooms,
+  roomsLoaded,
   selectRoom,
   setDraft,
   status,
@@ -86,21 +88,32 @@ const ROOM_IDEAS: DraftIdea[] = [
   { id: "mention", label: "Mention someone", apply: () => fillDraft("@") },
 ];
 
+const roomsPending = () => switchingSpace() && !roomsLoaded();
+
 export function SpaceView() {
   // Its header (breadcrumb, runner, Manage, Space settings) is the Shell's one
   // header row: RoomHeaderTitle and RoomHeaderActions below.
   return (
     <Surface variant="panel" grow testID="space-view">
       <ConnectionBanner />
-      <If when={switchingSpace() && !activeRoom()} else={
-        <>
-          <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
-          <RoomComposer />
-        </>
+      <If when={!!activeRoom()} else={
+        <If when={roomsPending()} else={
+          <Column grow align="center" justify="center" pad={6} gap={2}>
+            <If when={actionError()}>
+              {error => <Label color="danger" testID="rooms-error">{error()}</Label>}
+            </If>
+            <If when={roomsLoaded() && rooms().length === 0} else={<Label color="muted">Select a room in the sidebar.</Label>}>
+              <Label color="muted" testID="rooms-empty">No rooms in this Space yet.</Label>
+            </If>
+          </Column>
+        }>
+          <Column grow align="center" justify="center" pad={6} testID="rooms-loading">
+            <Label color="muted">Loading rooms…</Label>
+          </Column>
+        </If>
       }>
-        <Column grow align="center" justify="center" pad={6} testID="rooms-loading">
-          <Label color="muted">Loading rooms…</Label>
-        </Column>
+        <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
+        <RoomComposer />
       </If>
     </Surface>
   );
@@ -124,7 +137,7 @@ export function RoomHeaderTitle() {
         ›
       </Label>
       <Label variant="heading" lines={1} testID="room-title" heading tooltip={parent() ? undefined : ROOM_DESCRIPTION}>
-        {activeRoom() ? `# ${activeRoom()!.name}` : "No room selected"}
+        {activeRoom() ? `# ${activeRoom()!.name}` : roomsPending() ? "Rooms" : "No room selected"}
       </Label>
       <If when={parent()}>
         {(p) => (

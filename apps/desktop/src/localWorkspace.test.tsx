@@ -148,10 +148,17 @@ test("a remembered Space with no rooms makes no transcript request", async () =>
   local.state.rooms.set("solo", []);
   local.answerLate(localRooms, LOCAL_TOKEN, 80);
   const app = await launch(world(), local, fakeLauncher(), lastLocalSpace, true);
-  await app.waitFor("id:workspace");
+  await app.waitFor("id:rooms-loading", { timeout: 50 });
+  expect(app.shows("text:No room selected")).toBe(false);
+  expect(app.shows("id:rooms-empty")).toBe(false);
+  await app.waitFor("id:rooms-empty", { timeout: 150 });
   await app.clock!.runFor(1700);
   expect(app.shows("id:space:solo")).toBe(true);
   expect(app.shows("text:No room selected")).toBe(true);
+  expect(app.shows("text:No rooms in this Space yet.")).toBe(true);
+  expect(app.shows("id:rooms-loading")).toBe(false);
+  expect(app.shows("id:transcript")).toBe(false);
+  expect(app.shows("id:composer")).toBe(false);
   expect(roomEventPaths(local)).toEqual([]);
 });
 
@@ -168,6 +175,8 @@ test("membership refused by the rooms endpoint never starts that Space's transcr
   const app = await launch(world(), local, fakeLauncher(), lastLocalSpace, true);
   await app.waitUntil(() => text(app).includes("Couldn't open Solo"), { timeout: 200 });
   expect(app.shows("id:space:solo")).toBe(false);
+  expect(app.shows("id:rooms-empty")).toBe(false);
+  expect(app.shows("id:rooms-loading")).toBe(false);
   expect(roomEventPaths(local)).toEqual([]);
   await app.waitUntil(() => local.state.log.some((r) => r.path === "/v1/chat/events?after=0"), { timeout: 200 });
 });
@@ -217,8 +226,8 @@ for (const [nextSpace, action] of [
     const expected = [`/v1/spaces/${created.id}/rooms/lobby/events?after=0`];
 
     if (nextSpace) {
-      // Ordinary Space selection is blocked while a selection is pending.
-      // Creating a Space lets us move again before the original reply arrives.
+      // Exercise the Create path followed by another move, distinct from a
+      // direct sidebar click during hydration on saved remote startup.
       if (nextSpace === "solo") local.answerLate(localRooms, LOCAL_TOKEN, 10);
       await app.press(`id:space:${nextSpace}`);
       expected.push(`/v1/spaces/${nextSpace}/rooms/lobby/events?after=0`);

@@ -312,7 +312,13 @@ const rememberedRemote = {
 };
 const betaRooms = "/v1/spaces/beta/rooms";
 const betaEvents = `${betaRooms}/lobby/events`;
+const acmeRooms = "/v1/spaces/acme/rooms";
 const remotePaths = (s: ReturnType<typeof servers>) => s.b.state.log.map(r => r.path);
+const firstAcme = `${acmeRooms}/lobby/events?after=0`;
+const firstBeta = `${betaEvents}?after=0`;
+const firstRoomPages = (s: ReturnType<typeof servers>) => remotePaths(s).filter(p => p.includes("/rooms/") && p.endsWith("/events?after=0"));
+const chatStarted = (s: ReturnType<typeof servers>) => remotePaths(s)
+  .some(p => p.startsWith("/v1/chat/") || p === "/v1/runs" || p === "/v1/models/available" || p === "/v1/providers");
 
 async function submitSavedStartup(app: App) {
   await app.waitFor("text:Sign in to Team B");
@@ -339,6 +345,7 @@ test("saved remote verifies before showing the scoped Shell and room hydration n
   expect(app.shows("id:space:beta")).toBe(true);
   expect(app.shows("id:chat-view")).toBe(false);
   expect(app.shows("id:composer")).toBe(false);
+  expect(app.shows("text:No room selected")).toBe(false);
   expect(rooms.arrived()).toBe(1);
   expect(remotePaths(s).some(p => p.includes("/events") || p.startsWith("/v1/models/available"))).toBe(false);
   await app.waitFor("text:First remote room message", { timeout: 340 });
@@ -347,7 +354,7 @@ test("saved remote verifies before showing the scoped Shell and room hydration n
   for (const path of ["/v1/me", "/v1/spaces", betaRooms]) expect(paths.filter(p => p === path)).toHaveLength(1);
   expect(models.arrived()).toBe(1);
   expect(paths.filter(p => p.includes("/events?"))).toEqual([`${betaEvents}?after=0`, `${betaEvents}?after=${message.id}`]);
-  expect(paths.some(p => p.startsWith("/v1/chat/") || p === "/v1/runs" || p === "/v1/models/available" || p === "/v1/providers")).toBe(false);
+  expect(chatStarted(s)).toBe(false);
   expect(bridge.opens()).toBe(0);
 });
 
@@ -389,6 +396,128 @@ test("a delayed room refusal removes the Space without undoing deliberate naviga
   expect(app.shows("id:library-view")).toBe(true);
   expect(app.shows("id:chat-view")).toBe(false);
   expect(remotePaths(s).some(p => p.includes("/events"))).toBe(false);
+});
+
+test("clicking a different Space during startup wins before the remembered room replies", async () => {
+  const s = servers();
+  s.b.post("beta/lobby", { kind: "message", actor: "bob", text: "Old startup target" });
+  const old = s.b.answerLate(betaRooms, TOKENS.bob!, 700);
+  const acme = s.b.answerLate(acmeRooms, TOKENS.bob!, 80);
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:rooms-loading", { timeout: 100 });
+  expect(old.arrived()).toBe(1);
+  await app.press("id:space:beta"); // a repeat click on the pending Space isn't another read
+  await app.press("id:space:acme");
+  await app.waitFor("text:hello from bob in acme", { timeout: 200 });
+  await app.clock!.runFor(750);
+  expect(old.arrived()).toBe(1);
+  expect(acme.arrived()).toBe(1);
+  expect(firstRoomPages(s)).toEqual([firstAcme]);
+  expect(app.shows("text:hello from bob in acme")).toBe(true);
+  expect(app.shows("text:Old startup target")).toBe(false);
+  expect(app.shows("id:space:beta")).toBe(true);
+  expect(chatStarted(s)).toBe(false);
+  expect(remotePaths(s)).not.toContain("/v1/models/available?space_id=beta");
+});
+
+/** The first room request observes revoked access; later requests read current membership. */
+function holdBetaDenial(s: ReturnType<typeof servers>, status: 403 | 404) {
+  const get = s.b.network[`GET ${BASE}/v1/*`]!;
+  const members = s.b.state.spaces.get("beta")!.members;
+  let captured = false;
+  s.b.network[`GET ${BASE}/v1/*`] = req => {
+    if (!captured && new URL(req.url).pathname === betaRooms) {
+      captured = true;
+      members.delete("bob");
+      return { status, body: { error: "Space access denied" }, delay: 650 };
+    }
+    return get(req);
+  };
+  return { rejoin: () => members.add("bob") };
+}
+
+test("the latest delayed denial for A removes only A while B is still loading", async () => {
+  const s = servers();
+  holdBetaDenial(s, 404);
+  const acme = s.b.answerLate(acmeRooms, TOKENS.bob!, 850);
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:rooms-loading", { timeout: 100 });
+  await app.press("id:space:acme");
+  await app.waitUntil(() => acme.arrived() === 1, { timeout: 100 });
+  await app.waitFor("id:space:beta", { state: "gone", timeout: 700 });
+  expect(app.shows("id:rooms-loading")).toBe(true);
+  expect(app.shows("id:rooms-empty")).toBe(false);
+  expect(firstRoomPages(s)).toEqual([]);
+  await app.waitFor("text:hello from bob in acme", { timeout: 350 });
+  expect(firstRoomPages(s)).toEqual([firstAcme]);
+  expect(chatStarted(s)).toBe(false);
+});
+
+test("a held denial can't remove a rejoined Space while its newer room entry is pending", async () => {
+  const s = servers();
+  const beta = holdBetaDenial(s, 403);
+  s.b.post("beta/lobby", { kind: "message", actor: "bob", text: "Rejoined Beta" });
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:rooms-loading", { timeout: 100 });
+  await app.press("id:space:acme");
+  await app.waitFor("text:hello from bob in acme", { timeout: 180 });
+  expect(firstRoomPages(s)).toEqual([firstAcme]);
+  beta.rejoin();
+  const newRooms = s.b.answerLate(betaRooms, TOKENS.bob!, 900);
+  await app.press("id:space:beta");
+  await app.waitUntil(() => newRooms.arrived() === 1, { timeout: 100 });
+  await app.clock!.runFor(700);
+  expect(app.shows("id:rooms-loading")).toBe(true);
+  expect(firstRoomPages(s)).toEqual([firstAcme]);
+  expect(app.shows("id:space:beta")).toBe(true);
+  await app.waitFor("text:Rejoined Beta", { timeout: 350 });
+  expect(firstRoomPages(s)).toEqual([firstAcme, firstBeta]);
+  expect(chatStarted(s)).toBe(false);
+});
+
+test("a newer scoped dispatch room read supersedes a denied startup entry without opening its transcript", async () => {
+  const s = servers();
+  const beta = holdBetaDenial(s, 404);
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:rooms-loading", { timeout: 100 });
+  await app.press("id:nav-chat"); // deliberate Chat; the task form reads Beta's room list
+  await app.press("id:dispatch-new");
+  beta.rejoin();
+  await app.press("id:dispatch-space:beta");
+  await app.waitFor("id:dispatch-room:lobby", { timeout: 150 });
+  await app.press("id:space:acme");
+  await app.waitFor("text:hello from bob in acme", { timeout: 180 });
+  await app.clock!.runFor(700);
+  expect(app.shows("id:space:beta")).toBe(true);
+  expect(app.shows("text:hello from bob in acme")).toBe(true);
+  expect(firstRoomPages(s)).toEqual([firstAcme]);
+  expect(app.requests().filter(r => r.url === REMOTE + betaRooms)).toHaveLength(2);
+});
+
+test("a room-list failure stays visible when returning to a settled empty Space", async () => {
+  const s = servers();
+  s.b.state.rooms.set("beta", []);
+  const get = s.b.network[`GET ${BASE}/v1/*`]!;
+  s.b.network[`GET ${BASE}/v1/*`] = req => new URL(req.url).pathname === acmeRooms
+    ? { status: 503, body: { error: "Try again later" }, delay: 90 }
+    : get(req);
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:rooms-empty", { timeout: 100 });
+  await app.press("id:space:acme");
+  await app.waitFor("id:rooms-loading", { timeout: 50 });
+  expect(app.shows("text:No room selected")).toBe(false);
+  await app.waitFor("id:rooms-error", { timeout: 180 });
+  expect(app.texts().join(" ")).toContain("Couldn't open Acme");
+  expect(app.shows("id:rooms-empty")).toBe(true); // Beta, not the failed Acme read
+  expect(app.shows("id:rooms-loading")).toBe(false);
+  expect(app.shows("id:space:acme")).toBe(true);
+  expect(firstRoomPages(s)).toEqual([]);
+  expect(chatStarted(s)).toBe(false);
 });
 
 test("signing out during remote hydration aborts the old room and never saves its token", async () => {
