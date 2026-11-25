@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde_json::{Value, json};
 
 use crate::Secret;
-use crate::http::{client, read_capped};
+use crate::http::read_capped;
 use crate::profile::validate_models;
 
 /// Metro hands a device at most 4 MiB of request (`max_request_bytes`).
@@ -107,10 +107,10 @@ enum ClaimMode {
 }
 
 impl MetroClient {
-    /// `base` must already be validated (`netpolicy::validate_base_url`).
+    /// `base` must already be validated (`netpolicy::validate_server_url`).
     pub fn new(base: &str, token: Secret, timeout: Duration) -> anyhow::Result<Self> {
         Ok(MetroClient {
-            http: client(timeout)?,
+            http: crate::http::client_for_server(timeout, base)?,
             base: base.trim_end_matches('/').to_string(),
             token,
             claim_cap: MAX_CLAIM_BODY,

@@ -67,6 +67,23 @@ pub(crate) fn client_for_url(timeout: Duration, url: &url::Url) -> Result<reqwes
     Ok(builder.build()?)
 }
 
+/// Build a client for the Metro server at `base` (already validated by
+/// `netpolicy::validate_server_url`). Loopback and Tailscale hosts are
+/// reached directly, never through a proxy from `HTTP_PROXY` and friends:
+/// plain HTTP to a Tailscale host is only treated as encrypted while it
+/// travels over the tailnet itself (see `metro-url-policy`).
+pub fn client_for_server(timeout: Duration, base: &str) -> Result<reqwest::Client> {
+    let mut builder = client_builder(timeout);
+    if server_bypasses_proxy(base) {
+        builder = builder.no_proxy();
+    }
+    Ok(builder.build()?)
+}
+
+fn server_bypasses_proxy(base: &str) -> bool {
+    url::Url::parse(base).is_ok_and(|u| crate::netpolicy::url_host_class(&u).plain_http_ok())
+}
+
 fn client_builder(timeout: Duration) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
@@ -103,5 +120,31 @@ pub async fn read_json(resp: reqwest::Response, cap: usize) -> Result<Value> {
     match serde_json::from_slice(&bytes) {
         Ok(v) => Ok(v),
         Err(_) => bail!(SafeError::new("response is not valid JSON")),
+    }
+}
+
+#[cfg(test)]
+mod server_proxy_tests {
+    use super::server_bypasses_proxy;
+
+    #[test]
+    fn loopback_and_tailscale_servers_skip_proxies() {
+        for direct in [
+            "http://127.0.0.1:8787",
+            "http://localhost:8787",
+            "http://[::1]:8787",
+            "http://100.101.102.103:8787",
+            "https://metro.tail1234.ts.net",
+            "http://[fd7a:115c:a1e0::1]:8787",
+        ] {
+            assert!(server_bypasses_proxy(direct), "{direct}");
+        }
+        for proxied in [
+            "https://metro.example.com",
+            "http://192.168.1.5:8787",
+            "not a url",
+        ] {
+            assert!(!server_bypasses_proxy(proxied), "{proxied}");
+        }
     }
 }

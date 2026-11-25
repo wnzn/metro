@@ -889,13 +889,15 @@ async fn cli_refuses_secrets_on_argv_and_bad_profiles() {
     .await;
     assert_ne!(out.code, 0);
     assert!(!out.stderr.contains("sk-ant-not"), "{}", out.stderr);
-    // Plain http to a non-loopback Metro is refused.
+    // A Metro server URL with an unsupported scheme or credentials is
+    // refused. (Plain http to any host is allowed, with a warning for hosts
+    // that are neither loopback nor Tailscale: see netpolicy's unit tests.)
     let out = connector(
         &e.home,
         &[
             "setup",
             "--server-url",
-            "http://metro.example.com",
+            "ftp://metro.example.com",
             "--kind",
             "device-claude-code",
             "--device-token-file",
@@ -905,11 +907,36 @@ async fn cli_refuses_secrets_on_argv_and_bad_profiles() {
             "m",
             "--yes",
         ],
-        Some(&format!("{DEVICE_TOKEN}\n")),
+        None, // refused before the token is read
     )
     .await;
     assert_ne!(out.code, 0);
-    assert!(out.stderr.contains("plain http"), "{}", out.stderr);
+    assert!(out.stderr.contains("not supported"), "{}", out.stderr);
+    let out = connector(
+        &e.home,
+        &[
+            "setup",
+            "--server-url",
+            "http://user:pw@192.168.1.5:8787",
+            "--kind",
+            "device-claude-code",
+            "--device-token-file",
+            "-",
+            "--no-login",
+            "--model",
+            "m",
+            "--yes",
+        ],
+        None, // refused before the token is read
+    )
+    .await;
+    assert_ne!(out.code, 0);
+    assert!(
+        out.stderr.contains("user name or password"),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains(DEVICE_TOKEN), "{}", out.stderr);
     let help = connector(&e.home, &["--help"], None).await;
     assert_eq!(help.code, 0);
     assert!(help.stdout.contains("metro-connector setup"));

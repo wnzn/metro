@@ -8,7 +8,7 @@ use std::time::Duration;
 use serde_json::Value;
 
 use crate::Secret;
-use crate::http::{client, read_capped};
+use crate::http::read_capped;
 use crate::profile::validate_device_token;
 
 const MAX_BODY: usize = 1024 * 1024;
@@ -32,10 +32,11 @@ pub struct MetroApi {
 }
 
 impl MetroApi {
-    /// `base` must already be validated (`netpolicy::validate_base_url`).
+    /// `base` must already be validated (`netpolicy::validate_server_url`).
     pub fn new(base: &str, token: Secret) -> Result<Self, ApiError> {
         Ok(MetroApi {
-            http: client(TIMEOUT).map_err(|_| ApiError::Server("cannot start HTTP".into()))?,
+            http: crate::http::client_for_server(TIMEOUT, base)
+                .map_err(|_| ApiError::Server("cannot start HTTP".into()))?,
             base: base.trim_end_matches('/').to_string(),
             token,
         })
