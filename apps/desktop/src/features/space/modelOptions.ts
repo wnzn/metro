@@ -55,7 +55,7 @@ export function spaceModelOptions(c: AvailableCatalog | null, noChoiceDetail: st
             modelId: m.id,
             detail: off ? `${detail} · not available right now` : detail,
             title: [name, m.id, conn.name, p.providerName, ...(m.reasoningEfforts.length ? [`thinking ${m.reasoningEfforts.join(", ")}`] : [])].join(" — "),
-            provider: { name: v.name, mark: v.mark },
+            provider: v,
             thinking: m.reasoningEfforts.length ? `Thinking: ${m.reasoningEfforts.join(" · ")}` : undefined,
             disabled: off,
           });
@@ -76,7 +76,7 @@ export function spaceModelOptions(c: AvailableCatalog | null, noChoiceDetail: st
         model: x.id,
         detail,
         title: [x.id, m.name].join(" — "),
-        provider: { name: v.name, mark: v.mark },
+        provider: v,
         disabled: m.ready === false,
       });
     }

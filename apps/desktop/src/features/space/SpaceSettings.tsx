@@ -795,6 +795,8 @@ function PreferencesPage() {
               <SettingRow label="Default model in this Space" description="Used for every agent here unless you pick one for that agent below." stacked>
                 <ModelPicker
                   testID="space-default-model"
+                  rememberAs="space-prefs"
+                  context={sid()}
                   accessibilityLabel="Your default model in this Space"
                   options={spaceOptions()}
                   value={shownValue(spaceOptions(), v().defaultModel)}
@@ -842,6 +844,8 @@ function PreferencesPage() {
                       <Column grow>
                         <ModelPicker
                           testID={`agent-model:${a().id}`}
+                          rememberAs="space-prefs"
+                          context={sid()}
                           accessibilityLabel={`Your model for ${a().name}`}
                           options={agentOptions()}
                           value={shownValue(agentOptions(), v().agentModels[a().id])}

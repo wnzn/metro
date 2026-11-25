@@ -132,9 +132,11 @@ export function ComposerModelControls() {
                <Label variant="caption">No chat models are ready here. Connect a provider or check its approved models.</Label>
                <Action compact label="Model providers" testID="composer-open-providers" onPress={() => { close(); openSettings("providers"); }} />
              </If>
-             <If when={!!current()?.targets.length || !!current()?.pin || !!operatorModel()}><ModelOptionPicker testID="composer-model-options"
-              options={options()} value={selected()?.key ?? (current()?.pin ? null : "")}
-              onChange={k => pick(k || null)} /></If>
+             <If when={!!current()?.targets.length || !!current()?.pin || !!operatorModel()}>
+               <ModelOptionPicker testID="composer-model-options" rememberAs="composer" context={composerScope()}
+                 options={options()} value={selected()?.key ?? (current()?.pin ? null : "")}
+                 onChange={k => pick(k || null)} />
+             </If>
             <If when={selected()?.detail}>{d => <Label variant="caption">{d()}</Label>}</If>
             <If when={selected()?.fetchFrom}>{name =>
               <Action compact variant="ghost" testID="composer-fetch-models" label={`Fetch models from ${name()}`}

@@ -167,7 +167,7 @@ function optionsFor(capability: Capability, none?: string): ModelOption[] {
       model: m.name,
       detail: modelDetail(m),
       title: [m.name, defaultModelOf(m), m.model, v.name, m.owned ? "yours" : m.ownerId].filter(Boolean).join(" · "),
-      provider: { name: v.name, mark: v.mark },
+      provider: v,
       disabled: !m.model || m.ready === false,
     };
   });
@@ -198,6 +198,7 @@ function RoutingModelPicker(props: {
     <Column gap={1}>
       <ModelPicker
         testID={props.testID}
+        rememberAs="routing"
         accessibilityLabel={props.label}
         options={optionsFor(props.capability, props.none)}
         value={props.value && findAvailable(props.value) ? props.value : props.none ? NONE : null}
@@ -339,6 +340,7 @@ function CaseRow(props: { item: DraftCase; index: number }) {
           <Column grow>
             <ModelPicker
               testID={`case-model:${n()}`}
+              rememberAs="routing"
               accessibilityLabel={`Model that answers use case ${n() + 1}`}
               options={optionsFor("chat")}
               value={c().connectionId && findAvailable(c().connectionId) ? c().connectionId : null}
