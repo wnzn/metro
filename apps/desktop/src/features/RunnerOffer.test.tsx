@@ -299,6 +299,49 @@ test("Delete cannot submit while impact is held or failed and can retry with pro
   expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["DELETE", `/v1/runners/${r.id}`]]);
 });
 
+test("a held assignment write immediately disables Delete and exposes a fresh impact retry", async () => {
+  const f = world();
+  const installed = f.addRunner("This PC", "personal", "alice");
+  const other = f.addRunner("Remote runner", "personal", "alice");
+  f.addSpace("kept", "Kept folder", "alice");
+  f.state.attached.set("kept", installed.id);
+  f.addSpace("remote", "Remote Space", "alice");
+  f.state.attached.set("remote", other.id);
+  f.addSpace("solo", "Solo", "alice");
+  const t = fixture(f, installed.id);
+  t.gate.attach = 1000;
+  const app = await launch(t, { manual: true });
+  await signIn(app);
+  await openRunnerSettings(app);
+  await app.waitFor("id:installed-runner-space:kept");
+  const confirm = `id:delete-runner:${other.id}:confirm`;
+  const retry = `id:delete-runner:${other.id}:retry-impact`;
+  await app.press(`id:delete-runner:${other.id}`);
+  await app.waitUntil(() => app.enabled(confirm));
+  expect(app.shows(retry)).toBe(false);
+
+  await app.press("id:runner-attach-many");
+  await app.waitUntil(() => f.state.attached.get("solo") === installed.id);
+  // Do not release the write reply or refresh membership: dispatch alone
+  // must invalidate this panel's previous exact impact proof.
+  await app.waitFor(retry);
+  expect(app.enabled(confirm)).toBe(false);
+  await app.press(confirm).catch(() => {});
+  expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["POST", "/v1/spaces/solo/runner/attach-if-empty"]]);
+  expect(app.shows("id:installed-runner-space:kept")).toBe(true);
+
+  await app.clock!.runFor(1000);
+  await app.waitFor("id:installed-runner-space:solo");
+  expect(app.enabled(confirm)).toBe(false);
+  await app.press(retry);
+  await app.waitUntil(() => app.enabled(confirm));
+  await app.press(confirm);
+  await app.waitUntil(() => !f.state.runners.has(other.id));
+  expect(app.shows("id:installed-runner-space:kept")).toBe(true);
+  expect(f.state.attached.get("solo")).toBe(installed.id);
+  expect(f.state.attached.get("kept")).toBe(installed.id);
+});
+
 test("a held Delete impact cannot authorize a different registration or a reopened panel", async () => {
   const f = world();
   const a = f.addRunner("Runner A", "personal", "alice");
