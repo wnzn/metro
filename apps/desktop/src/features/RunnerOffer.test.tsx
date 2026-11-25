@@ -3,6 +3,7 @@ import type { App } from "nsh/test";
 import { BASE, fakeServer, header, TOKENS, world } from "../../test/fakeServer";
 import { BRIDGE, BRIDGE_TOKEN, bridgeEnv, fakeBridge } from "../device/test/fakeBridge";
 import { runnerOfferStorageKey } from "../runnersState";
+import { spaceWorld } from "./space/test/fixtures";
 
 type Server = ReturnType<typeof fakeServer>;
 type Request = Parameters<Server["network"][string]>[0];
@@ -631,6 +632,35 @@ test("a held pre-create Space list cannot purge the successfully attached new Sp
   f.state.spaces.delete(id);
   await app.clock!.runFor(11_000);
   await app.waitFor(`id:space:${id}`, { state: "gone" });
+});
+
+test("an older positive Space list cannot restore a forced removal, but a newer rejoin can", async () => {
+  const w = spaceWorld();
+  const f = w.f;
+  const t = fixture(f, null);
+  const app = await launch({ ...t, network: { ...t.network, ...w.network } }, { manual: true });
+  await signIn(app);
+  await app.press("id:space:side");
+  await app.waitFor("id:space-settings-open");
+  const oldList = f.answerLate("/v1/spaces", TOKENS.alice!, 4000);
+  await app.clock!.runFor(11_000);
+  await app.waitUntil(() => oldList.arrived() === 1);
+  f.answerLate("/v1/spaces", TOKENS.alice!, 0);
+
+  await app.press("id:space-settings-open");
+  await app.waitFor("id:leave-space");
+  await app.press("id:leave-space");
+  await app.press("id:leave-confirm");
+  await app.waitFor("id:space:side", { state: "gone" });
+  expect(f.state.spaces.get("side")!.members.has("alice")).toBe(false);
+  await app.clock!.runFor(4000);
+  expect(app.shows("id:space:side")).toBe(false);
+
+  f.state.spaces.get("side")!.members.add("alice");
+  await app.clock!.runFor(11_000);
+  await app.waitFor("id:space:side");
+  await app.press("id:space:side");
+  await app.waitFor("id:space-settings-open");
 });
 
 test("a newer exact assignment read protects an existing Space from an older omission", async () => {

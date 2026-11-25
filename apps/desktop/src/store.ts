@@ -187,6 +187,10 @@ let ticking = false;
 let tickAgain = false;
 let failures = 0;
 let lastListsRefresh = 0;
+// Lane-local membership fence. Reuse U12's accepted-list high-water and
+// Space denials when integrating; all of these must share one request order.
+let lastMembershipRequest = 0;
+const spaceDenials = new Map<string, number>();
 let lastRunsRefresh = 0;
 const cursors = new Map<string, number>();
 const inflight = new Map<string, Promise<void>>();
@@ -620,6 +624,7 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
   navigationGeneration++;
   const currentSession = guard();
   const ok = guard(spaceId);
+  const accessRequest = nextSpaceRunnerStamp();
   batch(() => {
     clearTransient();
     view.set("room");
@@ -648,7 +653,11 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
       return;
     }
     const name = spaces().find((s) => s.id === spaceId)?.name ?? spaceId;
-    if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) purgeSpace(spaceId, true);
+    if (error instanceof ApiError && (error.kind === "forbidden" || error.kind === "not_found")) {
+      if (accessRequest >= lastMembershipRequest && !hasNewerSpaceAccessProof(spaceId, accessRequest)) {
+        purgeSpace(spaceId, true, accessRequest);
+      }
+    }
     else purgeSpace(spaceId, false); // keep it listed; just don't keep half-loaded state
     const back = previous.spaceId && spaces().some((s) => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
     batch(() => {
@@ -687,7 +696,8 @@ function pickRoom(spaceId: string, list: readonly Room[]): string | null {
 }
 
 /** Forgets everything cached for a Space; `unlist` also removes it from the list. */
-function purgeSpace(spaceId: string, unlist: boolean) {
+function purgeSpace(spaceId: string, unlist: boolean, deniedAt = 0) {
+  if (unlist && deniedAt > (spaceDenials.get(spaceId) ?? 0)) spaceDenials.set(spaceId, deniedAt);
   clearSpaceRunnerOrder(spaceId);
   spaceEpoch.set(spaceId, epochOf(spaceId) + 1);
   const prefix = scopeKey(spaceId, "");
@@ -1267,6 +1277,8 @@ function endSession() {
   tickAgain = false;
   failures = 0;
   lastListsRefresh = 0;
+  lastMembershipRequest = 0;
+  spaceDenials.clear();
   lastRunsRefresh = 0;
   cursors.clear();
   inflight.clear();
@@ -1435,17 +1447,20 @@ async function refreshLists(force = false) {
   if (!force && Date.now() - lastListsRefresh < LISTS_REFRESH_MS) return;
   const ok = guard();
   const runnerStamp = nextSpaceRunnerStamp();
-  const list = await c.listSpaces();
-  if (!ok()) return;
+  const response = await c.listSpaces();
+  if (!ok() || runnerStamp <= lastMembershipRequest) return;
+  lastMembershipRequest = runnerStamp;
   lastListsRefresh = Date.now();
+  const list = response.filter((s) => (spaceDenials.get(s.id) ?? 0) < runnerStamp);
   const known = new Set(list.map((s) => s.id));
   const omitted = spaces().filter((s) => !known.has(s.id));
   const retained = omitted.filter((s) => hasNewerSpaceAccessProof(s.id, runnerStamp));
   for (const space of retained) known.add(space.id);
   const lost = omitted.filter((s) => !known.has(s.id));
-  for (const space of lost) purgeSpace(space.id, true);
+  for (const space of lost) purgeSpace(space.id, true, runnerStamp);
   const previousSpaces = new Map(spaces().map((s) => [s.id, s]));
   spaces.set([...list.map((space) => {
+    spaceDenials.delete(space.id); // An accepted newer positive is a rejoin.
     const previous = previousSpaces.get(space.id);
     const accepted = acceptSpaceRunnerSummary(space.id, runnerStamp);
     return previous && !accepted ? { ...space, runnerPaired: previous.runnerPaired } : space;
