@@ -588,8 +588,8 @@ fn capability(
             };
             Ok(match dest {
                 Err(e) => no(e.reason()),
-                Ok(store::Destination::Schedule(t)) => {
-                    json!({"enabled": true, "confirm": confirm(), "schedule_revision": t.revision})
+                Ok(store::Destination::Schedule { task, .. }) => {
+                    json!({"enabled": true, "confirm": confirm(), "schedule_revision": task.revision})
                 }
                 Ok(_) => json!({"enabled": true, "confirm": confirm()}),
             })

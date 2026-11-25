@@ -1108,7 +1108,10 @@ pub enum Destination {
     },
     /// The clicker's page-only conversation.
     Chat,
-    Schedule(Box<crate::schedules::Task>),
+    Schedule {
+        task: Box<crate::schedules::Task>,
+        room: Room,
+    },
 }
 
 impl ActionError {
@@ -1204,7 +1207,10 @@ pub fn destination_in(
         Some(r) if r.parent_room_id.is_some() => Ok(Err(ActionError::Forbidden(
             "this schedule runs in a thread; a page can only run schedules of top-level rooms",
         ))),
-        Some(_) => Ok(Ok(Destination::Schedule(Box::new(task)))),
+        Some(room) => Ok(Ok(Destination::Schedule {
+            task: Box::new(task),
+            room,
+        })),
     }
 }
 
@@ -1320,30 +1326,44 @@ pub fn claim_action(
             agent,
         }) => (Some((space_id, room, *agent)), None),
         Ok(Destination::Chat) => (None, None),
-        Ok(Destination::Schedule(t)) => (None, Some(*t)),
+        Ok(Destination::Schedule { task, room }) => (None, Some((*task, room))),
         Err(e) => return Ok(Err(e)),
     };
     // Consent.
     let vouched = vouched_in(&tx, &page.id, req.version, req.user)?;
     if vouched.needs_confirmation(&a) {
         if !req.confirm {
-            let what = match &task {
-                Some(t) => serde_json::json!({
+            let what = match (&task, &room_agent) {
+                (Some((t, room)), _) => serde_json::json!({
                     "kind": kinds::RUN_SCHEDULE,
                     "schedule_id": t.id,
                     "schedule": t.name,
                     "schedule_revision": t.revision,
                     "prompt": t.prompt,
+                    "space_id": page_space,
+                    "room_id": room.id,
+                    "room": room.name,
                 }),
-                None => serde_json::json!({
+                (None, Some((sid, room, agent))) => serde_json::json!({
                     "kind": kinds::RUN_AGENT,
                     "prompt": a.prompt,
-                    "agent": a.target.agent,
-                    "agent_id": a.target.agent_id,
-                    "room": a.target.room,
-                    "room_id": a.target.room_id,
-                    "space_id": page_space,
-                    "chat": a.target.chat,
+                    "agent": agent.handle,
+                    "agent_id": agent.id,
+                    "agent_name": agent.name,
+                    "room": room.name,
+                    "room_id": room.id,
+                    "space_id": sid,
+                    "chat": false,
+                }),
+                (None, None) => serde_json::json!({
+                    "kind": kinds::RUN_AGENT,
+                    "prompt": a.prompt,
+                    "agent": null,
+                    "agent_id": null,
+                    "room": null,
+                    "room_id": null,
+                    "space_id": null,
+                    "chat": true,
                 }),
             };
             return Ok(Err(ActionError::NeedsConfirmation(serde_json::json!({
@@ -1357,7 +1377,7 @@ pub fn claim_action(
             }))));
         }
         // A schedule confirmation is bound to the revision it showed.
-        if let Some(t) = &task
+        if let Some((t, _)) = &task
             && req.schedule_revision != Some(t.revision)
         {
             return Ok(Err(ActionError::ScheduleChanged {
@@ -1370,7 +1390,7 @@ pub fn claim_action(
             params![req.user, page.id, req.version, now_ms()],
         )?;
     }
-    if let (Some(t), Some(r)) = (&task, req.schedule_revision)
+    if let (Some((t, _)), Some(r)) = (&task, req.schedule_revision)
         && t.revision != r
     {
         return Ok(Err(ActionError::ScheduleChanged {
@@ -1378,7 +1398,7 @@ pub fn claim_action(
         }));
     }
     let now = now_ms();
-    let claimed = if let Some(t) = task {
+    let claimed = if let Some((t, _)) = task {
         match crate::schedules::claim_now_in(
             &tx,
             req.user,
