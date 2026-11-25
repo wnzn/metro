@@ -107,6 +107,10 @@ struct Entry {
     /// Why the run failed, in full, for its initiator only. Never in
     /// [`RunInfo`], so listing or serializing runs can't expose it.
     failure: Option<RunFailure>,
+    /// Whether the run's worker has recorded its end
+    /// ([`RunRegistry::finish_with`]). A stopped run stays in the history
+    /// until then, so its worker always learns that the stop won.
+    settled: bool,
 }
 
 /// The full reason a run failed, kept in memory with the run (never
@@ -141,20 +145,14 @@ impl Inner {
         self.entries.iter_mut().find(|e| e.info.id == id)
     }
 
-    /// Drop the oldest finished runs beyond `max_history`. Running entries
-    /// are never dropped.
+    /// Drop the oldest settled runs beyond `max_history`. Running entries,
+    /// and stopped ones whose worker hasn't recorded its end yet, are never
+    /// dropped.
     fn evict(&mut self, max_history: usize) {
-        let mut terminal = self
-            .entries
-            .iter()
-            .filter(|e| e.info.status.is_terminal())
-            .count();
+        let evictable = |e: &Entry| e.info.status.is_terminal() && e.settled;
+        let mut terminal = self.entries.iter().filter(|e| evictable(e)).count();
         while terminal > max_history {
-            match self
-                .entries
-                .iter()
-                .position(|e| e.info.status.is_terminal())
-            {
+            match self.entries.iter().position(|e| evictable(e)) {
                 Some(i) => {
                     self.entries.remove(i);
                     terminal -= 1;
@@ -261,6 +259,7 @@ impl RunRegistry {
             info: info.clone(),
             cancel: Some(tx),
             failure: None,
+            settled: false,
         });
         Ok((info, rx))
     }
@@ -275,28 +274,33 @@ impl RunRegistry {
     /// Record how a run ended and, for a failed run, why (for its
     /// initiator only), under one lock. A run that already ended (a stop
     /// won the race) keeps its status and gets no failure. Returns the
-    /// run's status afterwards: the caller reports that one. `None` for an
-    /// unknown id.
+    /// run's status afterwards: the caller reports that one. `None` when
+    /// the registry no longer knows the run: the caller then publishes
+    /// nothing, since whatever it would say may be stale.
     pub fn finish_with(
         &self,
         id: &str,
         status: RunStatus,
         failure: Option<RunFailure>,
-    ) -> RunStatus {
+    ) -> Option<RunStatus> {
+        if !status.is_terminal() {
+            return self.get(id).map(|r| r.status);
+        }
         let mut inner = self.lock();
-        let Some(entry) = inner.find(id) else {
-            return status;
+        let entry = inner.find(id)?;
+        entry.settled = true;
+        let after = if entry.info.status == RunStatus::Running {
+            entry.info.status = status;
+            entry.cancel = None;
+            if status == RunStatus::Failed {
+                entry.failure = failure;
+            }
+            status
+        } else {
+            entry.info.status
         };
-        if entry.info.status != RunStatus::Running || !status.is_terminal() {
-            return entry.info.status;
-        }
-        entry.info.status = status;
-        entry.cancel = None;
-        if status == RunStatus::Failed {
-            entry.failure = failure;
-        }
         inner.evict(self.max_history);
-        status
+        Some(after)
     }
 
     /// One run and its initiator-only failure, from one snapshot. The
@@ -822,6 +826,43 @@ mod tests {
     }
 
     #[test]
+    fn a_stopped_run_outlives_the_history_bound_until_its_worker_settles() {
+        // History of one finished run.
+        let reg = RunRegistry::with_limits(10, 1);
+        let (stopped, _rx) = start(&reg, "stopped");
+        assert!(reg.stop(&stopped.id));
+        // Other runs finish meanwhile, past the bound.
+        for task in ["a", "b", "c"] {
+            let (other, _r) = start(&reg, task);
+            assert_eq!(
+                reg.finish_with(&other.id, RunStatus::Completed, None),
+                Some(RunStatus::Completed)
+            );
+        }
+        // The stopped run is still there for its worker, which learns the
+        // stop won (rather than publishing its own result).
+        assert_eq!(reg.get(&stopped.id).unwrap().status, RunStatus::Cancelled);
+        let failure = RunFailure {
+            reason: "model_error".into(),
+            message: "The agent failed.".into(),
+        };
+        assert_eq!(
+            reg.finish_with(&stopped.id, RunStatus::Failed, Some(failure)),
+            Some(RunStatus::Cancelled)
+        );
+        // Settled, it is evicted like any other finished run.
+        let (last, _r) = start(&reg, "last");
+        reg.finish_with(&last.id, RunStatus::Completed, None);
+        assert!(reg.get(&stopped.id).is_none());
+        // A run the registry no longer knows: nothing to report.
+        assert_eq!(reg.finish_with(&stopped.id, RunStatus::Failed, None), None);
+        assert_eq!(
+            reg.finish_with("run_missing", RunStatus::Completed, None),
+            None
+        );
+    }
+
+    #[test]
     fn a_won_cancellation_keeps_the_run_cancelled_without_a_failure() {
         let reg = RunRegistry::new();
         let failure = || RunFailure {
@@ -832,7 +873,11 @@ mod tests {
         let (info, _rx) = start(&reg, "raced");
         assert!(reg.stop(&info.id));
         let status = reg.finish_with(&info.id, RunStatus::Failed, Some(failure()));
-        assert_eq!(status, RunStatus::Cancelled, "the caller reports the stop");
+        assert_eq!(
+            status,
+            Some(RunStatus::Cancelled),
+            "the caller reports the stop"
+        );
         let (run, kept) = reg.get_with_failure(&info.id).unwrap();
         assert_eq!(run.status, RunStatus::Cancelled);
         assert_eq!(kept, None, "a cancelled run carries no failure");
@@ -845,14 +890,14 @@ mod tests {
         // Without a stop, status and failure land together, once.
         let (info, _rx) = start(&reg, "failed");
         let status = reg.finish_with(&info.id, RunStatus::Failed, Some(failure()));
-        assert_eq!(status, RunStatus::Failed);
+        assert_eq!(status, Some(RunStatus::Failed));
         assert_eq!(
             reg.get_with_failure(&info.id).unwrap(),
             (reg.get(&info.id).unwrap(), Some(failure()))
         );
         assert!(!reg.stop(&info.id), "a finished run can't be stopped");
         let later = reg.finish_with(&info.id, RunStatus::Completed, None);
-        assert_eq!(later, RunStatus::Failed);
+        assert_eq!(later, Some(RunStatus::Failed));
         assert_eq!(reg.get_with_failure(&info.id).unwrap().1, Some(failure()));
 
         // A failure never sticks to a completed run.

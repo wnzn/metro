@@ -895,7 +895,10 @@ async fn execute_room_run(
     };
     // The status and its private failure are committed together; a stop
     // that won in the meantime keeps the run cancelled, with no failure.
-    let status = state.runs.finish_with(run_id, status, failure);
+    let Some(status) = state.runs.finish_with(run_id, status, failure) else {
+        tracing::warn!(run = %run_id, "the run is no longer registered; nothing published");
+        return;
+    };
     let posted = match status {
         RunStatus::Cancelled => Some((kind::STATUS, format!("Agent run {run_id} was cancelled."))),
         _ => posted,
