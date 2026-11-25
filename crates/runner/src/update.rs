@@ -795,14 +795,9 @@ impl SelfUpdate {
         if Version::parse(version).is_some_and(|v| Some(v) <= self.own) {
             return;
         }
-        if self
-            .report
-            .as_ref()
-            .is_some_and(|r| r.target.as_deref() == Some(version))
-        {
-            // Already failed for this version; wait for a new request.
-            return;
-        }
+        // The server settles a request when it sees our failure report, so a
+        // header after that is a new click by the runner's manager: retry.
+        self.report = None;
         eprintln!("metro-runner: update to {version} requested; verifying it");
         match updater.prepare(version) {
             Ok(switch) => {

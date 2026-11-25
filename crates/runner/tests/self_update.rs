@@ -419,9 +419,15 @@ fn only_an_enabled_managed_release_runner_acts_on_a_request() {
     assert_eq!(body["runner"]["update"]["target"], NEW);
     assert_eq!(body["runner"]["update"]["code"], "download_failed");
     assert_eq!(body["runner"]["install"], "managed");
-    // Asking again for the same failed version doesn't retry in a loop.
+    // A new click for the same version tries again (and reports again).
     let before = f.hits.load(Ordering::SeqCst);
     s.on_request(NEW);
+    assert!(f.hits.load(Ordering::SeqCst) > before);
+    let body: serde_json::Value = serde_json::from_str(&s.body()).unwrap();
+    assert_eq!(body["runner"]["update"]["code"], "download_failed");
+    // The same version as this runner's own is never attempted.
+    let before = f.hits.load(Ordering::SeqCst);
+    s.on_request(OLD);
     assert_eq!(f.hits.load(Ordering::SeqCst), before);
 }
 
