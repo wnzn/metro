@@ -724,6 +724,74 @@ test("persistent folder failures exhaust the mounted Settings budget without sto
   }
 });
 
+for (const afterBudget of [false, true]) {
+  test(`a folder denial settled ${afterBudget ? "after" : "before"} the budget withdraws the row while its sibling is held`, async () => {
+    const f = world();
+    const mine = f.addRunner("This PC", "personal", "alice");
+    f.addSpace("target", "Denied target", "alice");
+    f.addSpace("sibling", "Held sibling", "alice");
+    f.addSpace("empty", "Empty", "alice");
+    f.state.attached.set("target", mine.id);
+    f.state.attached.set("sibling", mine.id);
+    const original = f.network[`GET ${BASE}/v1/*`]!;
+    let phase = "initial";
+    let siblingHeld = 0;
+    f.network[`GET ${BASE}/v1/*`] = (req) => {
+      const path = new URL(req.url).pathname;
+      const reply = original(req);
+      if (phase === "transient" && path.endsWith("/runner")) return { status: 503, body: {} };
+      // Leave the held exact denial current; the membership poll is not
+      // part of this scan or its budget.
+      if (phase === "held" && path === "/v1/spaces") return { ...(reply as object), delay: 7000 };
+      if (phase === "held" && path === "/v1/spaces/target/runner") {
+        return { status: afterBudget ? 403 : 404, body: {}, delay: afterBudget ? 6500 : 300 };
+      }
+      if (phase === "held" && path === "/v1/spaces/sibling/runner") {
+        siblingHeld++;
+        return { ...(reply as object), delay: 9000 };
+      }
+      return reply;
+    };
+    const t = bridgeWithRunner(f, mine.id, mine.name);
+    const app = await open("./runnerWatch.fixture.tsx", {
+      network: { ...f.network, ...t.network } as any, modules: bridgeEnv() as any, platform: "linux", width: 1280, height: 900, clock: {},
+    });
+    await app.press("id:fixture-connect");
+    await app.waitFor("id:dismiss-fixture-offer");
+    await app.press("id:dismiss-fixture-offer");
+    await app.press("id:toggle-runner-settings");
+    await app.waitFor("id:installed-runner-folder:target");
+    await app.press("id:installed-runner-folder:target");
+    await app.waitFor("id:installed-runner-path:target");
+    await app.press("id:installed-runner-folder:sibling");
+    await app.waitFor("id:installed-runner-path:sibling");
+    await app.press("id:toggle-runner-settings");
+
+    phase = "transient";
+    await app.press("id:toggle-runner-settings");
+    await app.clock!.runFor(24_000);
+    expect(app.shows("id:installed-runner-path:target")).toBe(true);
+    phase = "held";
+    await app.clock!.runFor(2000);
+    await app.waitUntil(() => siblingHeld === 1);
+    expect(app.shows("id:installed-runner-folders-retry")).toBe(false);
+    if (!afterBudget) await app.waitFor("id:installed-runner-space:target", { state: "gone" });
+    else expect(app.shows("id:installed-runner-path:target")).toBe(true);
+    expect(app.shows("id:installed-runner-path:sibling")).toBe(true);
+
+    await app.clock!.runFor(5000);
+    await app.waitFor("id:installed-runner-folders-retry");
+    if (afterBudget) expect(app.shows("id:installed-runner-path:target")).toBe(true);
+    await app.clock!.runFor(1000);
+    await app.waitFor("id:installed-runner-space:target", { state: "gone" });
+    expect(app.shows("id:installed-runner-path:target")).toBe(false);
+    expect(app.shows("id:installed-runner-path:sibling")).toBe(true);
+    await app.clock!.runFor(2500);
+    expect(siblingHeld).toBe(1);
+    expect(app.shows("id:installed-runner-folders-retry")).toBe(true);
+  });
+}
+
 const fixtureRelease = (install: string, action: string, extra = {}) => ({
   presence: { version: "0.4.0", online: true, seen_at: Date.now(), install, self_update: install === "managed" },
   update: { latest: "0.5.0", available: true, action, pending: null, last_result: null, ...extra },

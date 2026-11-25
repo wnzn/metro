@@ -141,31 +141,34 @@ function message(error: unknown, what: string): string {
 }
 
 /** Which Spaces this user owns use this runner, by stable id (read-only GETs). */
-async function loadAttached(runnerId: string, valid: () => boolean): Promise<void> {
+async function loadAttached(runnerId: string, scanWanted: () => boolean): Promise<void> {
   const c = apiClient();
   const root = folderRoot;
-  const stillScoped = () => valid() && root === folderRoot &&
+  const sameSession = sessionGuard();
+  const sameRunner = () => sameSession() && root === folderRoot &&
     installedRunner()?.runner?.id === runnerId && ownedInstalledRunner()?.id === runnerId;
-  if (!c || !stillScoped()) return;
+  const stillScanning = () => sameRunner() && scanWanted();
+  if (!c || !stillScanning()) return;
   const owned = spaces().filter((s) => s.role === "owner" && SPACE_ID_RE.test(s.id));
   const checks = await Promise.all(owned.map(async ({ id }) => {
     const observation = beginSpaceRunnerObservation(id);
     try {
       return { id, observation, ok: true as const, runner: await c.getSpaceRunner(id) };
     } catch (error) {
-      return { id, observation, ok: false as const, denied: isSpaceRunnerAccessDenied(error) };
+      const denied = isSpaceRunnerAccessDenied(error);
+      // Withdraw this row as soon as its refusal settles. A sibling, page
+      // close, or the scan budget must not keep current denied evidence alive.
+      if (denied && sameRunner()) observation.denyAccess();
+      return { ok: false as const, denied };
     }
   }));
-  if (!stillScoped()) return;
+  if (!stillScanning()) return;
   const stillOwned = new Set(spaces().filter((s) => s.role === "owner").map((s) => s.id));
   batch(() => {
-    // Merge exact observations: an older answer for A doesn't discard
-    // fresh answers for B. Denial withdraws evidence, not the assignment;
-    // transient failures leave existing rows and paths alone.
+    // Merge successful exact observations independently. Individual
+    // denials already settled; transient failures leave existing rows alone.
     for (const check of checks) {
-      if (!stillOwned.has(check.id)) continue;
-      if (check.ok) check.observation.publish(check.runner);
-      else if (check.denied) check.observation.denyAccess();
+      if (check.ok && stillOwned.has(check.id)) check.observation.publish(check.runner);
     }
     for (const { id } of runnerSpaces()) if (!stillOwned.has(id)) removeFolder(id);
     // Keep U5's complete-snapshot signal for the bounded refresh demand;
