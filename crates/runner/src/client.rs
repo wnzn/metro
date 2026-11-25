@@ -8,6 +8,11 @@
 //!   (`metro_rt_v2_`) credential a claim must name a valid `space_id`;
 //!   otherwise the job is refused and reported as failed. Dedicated (legacy)
 //!   credentials ignore `space_id` and keep the old single-workspace meaning.
+//! - A proxy from `ALL_PROXY` / `HTTPS_PROXY` / `HTTP_PROXY` (ureq reads them,
+//!   with `NO_PROXY`) is never used for a loopback or Tailscale server: plain
+//!   HTTP to a Tailscale host counts as encrypted only while it travels over
+//!   the tailnet itself, and a proxy must not see a token meant for this
+//!   machine (see `metro-url-policy`).
 
 use std::time::Duration;
 
@@ -94,7 +99,24 @@ impl ServerClient {
     }
 
     pub fn with(base: &str, token: &str, timeout: Duration) -> Self {
+        Self::with_proxy(base, token, timeout, ureq::Proxy::try_from_env())
+    }
+
+    /// `env_proxy` is the proxy the environment asks for; it is dropped for
+    /// a loopback or Tailscale server.
+    fn with_proxy(
+        base: &str,
+        token: &str,
+        timeout: Duration,
+        env_proxy: Option<ureq::Proxy>,
+    ) -> Self {
+        let proxy = if bypasses_proxy(base) {
+            None
+        } else {
+            env_proxy
+        };
         let agent: ureq::Agent = ureq::Agent::config_builder()
+            .proxy(proxy)
             .timeout_global(Some(timeout))
             .max_redirects(0)
             .http_status_as_error(false)
@@ -168,6 +190,11 @@ impl ServerClient {
             Err(status_error("result", status, &mut resp))
         }
     }
+}
+
+/// Loopback and Tailscale servers are always reached directly.
+fn bypasses_proxy(base: &str) -> bool {
+    metro_url_policy::classify_host(crate::config::url_host(base)).plain_http_ok()
 }
 
 fn status_error(
@@ -285,6 +312,72 @@ pub fn parse_claim_for(body: &str, credential: Credential) -> Result<Claim, Clie
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fake_proxy(addr: &str) -> Option<ureq::Proxy> {
+        Some(ureq::Proxy::new(&format!("http://{addr}")).unwrap())
+    }
+
+    #[test]
+    fn loopback_and_tailscale_servers_never_use_a_proxy() {
+        let t = Duration::from_secs(5);
+        for direct in [
+            "http://127.0.0.1:8787",
+            "http://localhost:8787/",
+            "http://[::1]:8787",
+            "http://100.101.102.103:8787",
+            "http://[fd7a:115c:a1e0::1]:8787/base",
+            "http://metro.tail1234.ts.net",
+            "https://metro.tail1234.ts.net",
+        ] {
+            let c = ServerClient::with_proxy(direct, "tok", t, fake_proxy("proxy.invalid:3128"));
+            assert!(c.agent.config().proxy().is_none(), "{direct}");
+        }
+        for proxied in [
+            // Trailing dots go through the resolver: never treated as direct.
+            "http://100.64.0.1.:8787",
+            "http://127.0.0.1.:8787",
+            "http://localhost.:8787",
+            "https://metro.example.com",
+            "http://192.168.1.5:8787",
+            "http://100.128.0.1",
+        ] {
+            let c = ServerClient::with_proxy(proxied, "tok", t, fake_proxy("proxy.invalid:3128"));
+            assert!(c.agent.config().proxy().is_some(), "{proxied}");
+        }
+    }
+
+    #[test]
+    fn a_loopback_server_is_reached_directly_even_with_a_proxy_set() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // A "proxy" that only records whether anyone connected to it.
+        let proxy = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        proxy.set_nonblocking(true).unwrap();
+        // The Metro server: answers one claim with 204 (idle).
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", server.local_addr().unwrap());
+        let handle = std::thread::spawn(move || {
+            let (mut s, _) = server.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = s.read(&mut buf).unwrap();
+            s.write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                .unwrap();
+        });
+        let c = ServerClient::with_proxy(
+            &base,
+            "tok",
+            Duration::from_secs(5),
+            fake_proxy(&proxy_addr.to_string()),
+        );
+        assert!(matches!(c.claim().unwrap(), Claim::Idle));
+        handle.join().unwrap();
+        assert!(
+            proxy.accept().is_err(),
+            "the proxy was used for a loopback server"
+        );
+    }
 
     #[test]
     fn job_ids() {

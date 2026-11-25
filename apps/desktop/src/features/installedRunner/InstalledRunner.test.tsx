@@ -9,6 +9,7 @@ import { BASE, header, TOKENS, world } from "../../../test/fakeServer";
 import { BRIDGE, BRIDGE_TOKEN, bridgeEnv, fakeBridge } from "../../device/test/fakeBridge";
 import { installedRunnerBadge } from "./InstalledRunnerSection";
 import { parseInstalledRunner } from "./installedRunner";
+import { launched } from "../../../test/launched";
 
 type F = ReturnType<typeof world>;
 type Req = { method: string; url: string; headers: Record<string, string>; body?: string | null };
@@ -69,7 +70,7 @@ function bridgeWithRunner(f: F, runnerId: string | null, name: string, opts: Opt
 
 async function openWith(f: F, t: ReturnType<typeof bridgeWithRunner> | null) {
   const network = { ...(f.network as any), ...(t ? t.network : {}) };
-  return open("../../../App.tsx", { network, platform: "linux", width: 1280, height: 900, ...(t ? { modules: bridgeEnv() as any } : {}) });
+  return open("../../../App.tsx", { network, platform: "linux", width: 1280, height: 900, modules: (t ? bridgeEnv() : launched()) as any });
 }
 
 async function signInToRunners(app: App, user: string) {

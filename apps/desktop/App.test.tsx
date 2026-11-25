@@ -6,9 +6,10 @@ import type { App } from "nsh/test";
 import { BASE, fakeServer, header, TOKENS, world } from "./test/fakeServer";
 import { serverPlace } from "./src/features/Sidebar";
 import { spaceWorld } from "./src/features/space/test/fixtures";
+import { launched } from "./test/launched";
 
 async function openApp(f: ReturnType<typeof fakeServer>, storage: Record<string, string> = {}) {
-  return open("./App.tsx", { network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
+  return open("./App.tsx", { modules: launched(), network: f.network as any, platform: "linux", width: 1200, height: 800, storage });
 }
 
 async function signIn(app: App, user: string, url = BASE) {
@@ -37,12 +38,16 @@ async function askAgent(app: App) {
   await app.press("id:ask-agent");
 }
 
-test("refuses to send a token over plain HTTP to a remote host", async () => {
+test("asks before sending a token over plain HTTP to a remote host, and sends nothing until confirmed", async () => {
   const f = world();
   const app = await openApp(f);
   await signIn(app, "alice", "http://192.168.1.20:8787");
-  await app.waitFor("id:connect-error");
-  expect(text(app)).toContain("Refusing to send your access token over plain HTTP");
+  await app.waitFor("id:plain-http-consent");
+  expect(text(app)).toContain("This connection isn't encrypted.");
+  expect(app.shows("id:account-menu")).toBe(false);
+  expect(app.requests()).toHaveLength(0);
+  await app.press("id:plain-http-consent:cancel");
+  await app.waitFor("id:connect");
   expect(app.requests()).toHaveLength(0);
 });
 
@@ -254,7 +259,7 @@ test("reactions: add and remove mine, fold the agent's acknowledgement, no extra
 test("Test runner lives with the runner controls, needs this Space's runner and shows its tool output collapsed", async () => {
   const w = spaceWorld();
   const f = w.f;
-  const app = await open("./App.tsx", { network: w.network as any, platform: "linux", width: 1200, height: 800 });
+  const app = await open("./App.tsx", { modules: launched(), network: w.network as any, platform: "linux", width: 1200, height: 800 });
   await signIn(app, "alice");
   await openAcme(app);
   expect(app.shows("text:Runner attached")).toBe(true);

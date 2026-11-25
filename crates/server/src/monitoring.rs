@@ -189,6 +189,8 @@ codes! {
     RunnerNotClaimed => ("runner", "not_claimed", "No runner picked up a tool call in time."),
     RunnerTimedOut => ("runner", "timed_out", "The runner did not return a tool result in time."),
     RunnerChanged => ("runner", "changed", "A tool call was cancelled because the Space's runner changed."),
+    // Space or personal: web tools.
+    WebSearchUnavailable => ("web", "search_unavailable", "A web search or page fetch could not run on the computer of the person who asked."),
     // Instance.
     ServerStarted => ("server", "started", "The server started."),
     SchedulerTickFailed => ("scheduler", "tick_failed", "The scheduler could not check scheduled prompts."),

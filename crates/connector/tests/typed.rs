@@ -2,6 +2,9 @@
 //! kinds (`device-systemone`, `device-embeddings`) against a fake Metro and
 //! a fake System One / embeddings server on loopback. No real vendor.
 
+#[path = "common/cli_stdin.rs"]
+mod cli_stdin;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -177,13 +180,7 @@ async fn connector(home: &Path, args: &[&str], stdin: Option<&str>) -> (i32, Str
         .kill_on_drop(true)
         .spawn()
         .unwrap();
-    {
-        use tokio::io::AsyncWriteExt;
-        let mut si = child.stdin.take().unwrap();
-        if let Some(s) = stdin {
-            si.write_all(s.as_bytes()).await.unwrap();
-        }
-    }
+    cli_stdin::send_stdin(child.stdin.take().unwrap(), stdin).await;
     let out = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
         .await
         .expect("connector timed out")

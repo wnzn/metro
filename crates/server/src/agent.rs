@@ -112,6 +112,12 @@ const PERSONAL_PREAMBLE: &str = "You are the Metro agent in the user's private p
 sees this conversation. You have no tools and no access to the user's Spaces from here. Answer concisely in \
 plain text.";
 
+/// [`PERSONAL_PREAMBLE`] for a person who turned on web tools in their own
+/// Chat.
+const PERSONAL_WEB_PREAMBLE: &str = "You are the Metro agent in the user's private personal Chat. Only this \
+user sees this conversation. You have no access to the user's Spaces from here; the user turned on web search \
+for this Chat, so you may search the web and read web pages for them. Answer concisely in plain text.";
+
 /// The operator's model on `http`, which must follow no redirect: a
 /// redirect would resend the conversation to another URL.
 fn model(
@@ -550,13 +556,137 @@ async fn drive(
     }
 }
 
+// ---- Page builder ----
+
+/// One tool-less model turn for the page builder ([`crate::pages`]), as
+/// `user_id` on `route`: the same model choice and checks as their agent
+/// turns, and a failure (including a connection that can't be used) is
+/// returned, never answered by another model. `history` is earlier turns
+/// of the same generation, `(from_user, text)`. Returns the reply and the
+/// route note of the model that answered.
+#[allow(clippy::too_many_arguments)]
+pub async fn page_builder_turn<F, Fut>(
+    state: &AppState,
+    user_id: &str,
+    space: Option<&str>,
+    mut route: Route,
+    preamble: &str,
+    history: Vec<(bool, String)>,
+    prompt: String,
+    recheck: F,
+) -> Result<(String, crate::model_routing::RouteNote), PageTurnError>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let model = route_model(state, user_id, space, &mut route)
+        .await
+        .map_err(|refusal| PageTurnError::Failed(refusal.private().to_owned()))?;
+    // Its own small pool: page building never takes agent-run slots.
+    let Ok(_permit) = state.page_builds.clone().try_acquire_owned() else {
+        return Err(PageTurnError::Failed(
+            "Metro is building other pages right now; try again shortly.".to_owned(),
+        ));
+    };
+    // Resolving the model can take a while (a device, a connection check):
+    // access is checked again after it, immediately before the provider is
+    // called.
+    if !recheck().await {
+        return Err(PageTurnError::Revoked);
+    }
+    let agent = model.builder().preamble(preamble).build();
+    let history = history
+        .into_iter()
+        .map(|(user, text)| {
+            if user {
+                Message::user(text)
+            } else {
+                Message::assistant(text)
+            }
+        })
+        .collect();
+    match drive(
+        state,
+        agent,
+        Message::user(prompt),
+        history,
+        None,
+        route.note.connection_id.as_deref(),
+    )
+    .await
+    {
+        Outcome::Completed(text) => Ok((text, route.note)),
+        Outcome::Failed(text, _) => Err(PageTurnError::Failed(text)),
+        Outcome::ModelFailed(failure) => Err(PageTurnError::Failed(failure.text())),
+        Outcome::Cancelled => Err(PageTurnError::Failed(
+            "The page builder was stopped.".to_owned(),
+        )),
+    }
+}
+
+/// Why a page builder turn produced no reply.
+#[derive(Debug)]
+pub enum PageTurnError {
+    /// The model couldn't be used or failed (the text says why).
+    Failed(String),
+    /// The recheck right before the provider call failed: nothing was sent.
+    Revoked,
+}
+
 // ---- Reasoning summaries ----
 
 /// Where a turn's reasoning summaries go.
 #[derive(Clone)]
 enum Scope {
     Room { space_id: String, room_id: String },
-    Personal { user_id: String },
+    Personal { user_id: String, lane: PersonalLane },
+}
+
+/// Where a personal agent turn's events go: the person's Chat, or the
+/// page-only conversation of one of their personal pages (runs started
+/// from a personal page show only on that page: never in their Chat, its
+/// search or its history).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PersonalLane {
+    Chat,
+    Page { page_id: String },
+}
+
+impl PersonalLane {
+    /// Append an event of `user_id` to this lane.
+    fn append(
+        &self,
+        db: &crate::db::Db,
+        user_id: &str,
+        kind: &str,
+        author: &Author,
+        text: &str,
+        activity: Option<&Activity>,
+    ) -> anyhow::Result<Event> {
+        match self {
+            PersonalLane::Chat => {
+                db.append_personal_with(user_id, kind, author, text, &Addressed::room(), activity)
+            }
+            PersonalLane::Page { page_id } => crate::pages::store::append_page_event(
+                db, page_id, user_id, kind, author, text, activity,
+            ),
+        }
+    }
+
+    fn before(
+        &self,
+        db: &crate::db::Db,
+        user_id: &str,
+        before: i64,
+        n: usize,
+    ) -> anyhow::Result<Vec<Event>> {
+        match self {
+            PersonalLane::Chat => db.personal_before(user_id, before, n),
+            PersonalLane::Page { page_id } => {
+                crate::pages::store::page_events_before(db, page_id, user_id, before, n)
+            }
+        }
+    }
 }
 
 /// Posts one `reasoning_summary` event per model turn that returned
@@ -610,16 +740,16 @@ impl AgentHook for ReasoningSummaries {
                             )
                             .await;
                     }
-                    Scope::Personal { user_id } => {
+                    Scope::Personal { user_id, lane } => {
                         let r = state
                             .db
                             .call(move |db| {
-                                db.append_personal_with(
+                                lane.append(
+                                    db,
                                     &user_id,
                                     kind::REASONING_SUMMARY,
                                     &author,
                                     &text,
-                                    &Addressed::room(),
                                     Some(&turn),
                                 )
                             })
@@ -787,18 +917,34 @@ async fn execute_room_run(
     let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
     let loaded = {
-        let (space, room_id, before, n) = (
+        // A thread's task came from its parent room: URLs people wrote
+        // there before the thread was created may be fetched by the thread
+        // too. Read only when this run may fetch.
+        let parent = room
+            .parent_room_id
+            .clone()
+            .filter(|_| agent.allows(crate::web_tools::WEB_FETCH));
+        let (space, room_id, before, n, thread_id, thread_name) = (
             space_id.to_owned(),
             room.id.clone(),
             trigger.id,
             limits.agent_history,
+            room.id.clone(),
+            room.name.clone(),
         );
         state
             .db
             .call(move |db| {
+                let parent_events = match &parent {
+                    Some(parent) => {
+                        db.events_before_thread(&space, parent, &thread_id, &thread_name, n)?
+                    }
+                    None => Vec::new(),
+                };
                 Ok((
                     db.events_before(&space, &room_id, before, n)?,
                     db.runner_paired(&space)?,
+                    parent_events,
                 ))
             })
             .await
@@ -812,7 +958,7 @@ async fn execute_room_run(
                 Code::AgentHistoryUnavailable,
             )
         }
-        Ok((earlier, paired)) => {
+        Ok((earlier, paired, parent_events)) => {
             let is_thread = room.parent_room_id.is_some();
             // The agent's own tools only: its allowlist filters the run's.
             let allowed: Vec<RunnerTool> = RunnerTool::ALL
@@ -836,6 +982,39 @@ async fn execute_room_run(
                         .map(|t| runner_tool(state, space_id, &room.id, initiator, turn, *t))
                         .collect(),
                 );
+            }
+            // Web tools: only when the agent may use them, and only on the
+            // computer of the person who started the run.
+            let (search, fetch) = (
+                agent.allows(crate::web_tools::WEB_SEARCH),
+                agent.allows(crate::web_tools::WEB_FETCH),
+            );
+            if search || fetch {
+                let user = initiator.id.clone().unwrap_or_default();
+                if crate::web_devices::has_device(state, &user).await {
+                    let provenance = crate::web_tools::Provenance::from_messages(
+                        parent_events
+                            .iter()
+                            .chain(earlier.iter())
+                            .chain(std::iter::once(trigger)),
+                    );
+                    let ctx = crate::web_tools::WebContext {
+                        state: state.clone(),
+                        scope: crate::web_tools::WebScope::Room {
+                            space_id: space_id.to_owned(),
+                            room_id: room.id.clone(),
+                        },
+                        initiator: initiator.clone(),
+                        turn: turn.clone(),
+                        provenance: Arc::new(provenance),
+                        agent_id: Some(agent.id.clone()),
+                    };
+                    builder = builder
+                        .append_preamble(crate::web_tools::WEB_PREAMBLE)
+                        .dynamic_tools(crate::web_tools::tools(&ctx, search, fetch));
+                } else {
+                    builder = builder.append_preamble(crate::web_tools::NO_WEB_DEVICE_PREAMBLE);
+                }
             }
             if is_thread {
                 builder = builder.append_preamble(THREAD_CHILD_PREAMBLE);
@@ -1224,7 +1403,7 @@ impl Threads {
                         &self.parent_room_id,
                         kind::THREAD,
                         &Author::server(actor::AGENT),
-                        &format!("Started thread \"{}\" ({}).", child.name, child.id),
+                        &crate::db::thread_started_text(&child.name, &child.id),
                         Some(&self.turn),
                     )
                     .await;
@@ -1349,7 +1528,16 @@ pub async fn respond_personal_routed(
     route: Route,
 ) {
     // A failure to start is already posted in the Chat.
-    let _ = run_personal(state, user_id, trigger, route, false).await;
+    let _ = run_personal(
+        state,
+        user_id,
+        trigger,
+        route,
+        false,
+        PersonalLane::Chat,
+        Activity::chat(),
+    )
+    .await;
 }
 
 /// Start an agent turn in `user_id`'s personal Chat answering `trigger`
@@ -1368,6 +1556,34 @@ pub async fn start_personal_run(
         trigger.clone(),
         route,
         true,
+        PersonalLane::Chat,
+        Activity::chat(),
+    )
+    .await
+}
+
+/// Start the personal agent answering `trigger` (already stored in the
+/// page-only conversation of `page_id`) on `route`, as turn `turn`. Like
+/// personal Chat it has only the agent's own rules and no tools; unlike it,
+/// nothing is written to the person's Chat.
+pub async fn start_page_chat_run(
+    state: &AppState,
+    user_id: &str,
+    page_id: &str,
+    trigger: &Event,
+    route: Route,
+    turn: Activity,
+) -> Result<(), String> {
+    run_personal(
+        state.clone(),
+        user_id.to_owned(),
+        trigger.clone(),
+        route,
+        true,
+        PersonalLane::Page {
+            page_id: page_id.to_owned(),
+        },
+        turn,
     )
     .await
 }
@@ -1380,30 +1596,31 @@ async fn run_personal(
     trigger: Event,
     mut route: Route,
     detach: bool,
+    lane: PersonalLane,
+    turn: Activity,
 ) -> Result<(), String> {
     let agent_author = Author::server(actor::AGENT);
     let append_as = |kind: &'static str, text: String, activity: Option<Activity>| {
-        let (state, user_id, author) = (state.clone(), user_id.clone(), agent_author.clone());
+        let (state, user_id, author, lane) = (
+            state.clone(),
+            user_id.clone(),
+            agent_author.clone(),
+            lane.clone(),
+        );
         async move {
             let r = state
                 .db
-                .call(move |db| {
-                    db.append_personal_with(
-                        &user_id,
-                        kind,
-                        &author,
-                        &text,
-                        &Addressed::room(),
-                        activity.as_ref(),
-                    )
-                })
+                .call(move |db| lane.append(db, &user_id, kind, &author, &text, activity.as_ref()))
                 .await;
             if let Err(e) = r {
                 tracing::error!(error = %format!("{e:#}"), "appending personal event");
             }
         }
     };
-    let append = |kind: &'static str, text: String| append_as(kind, text, None);
+    // In Chat a refusal stands alone; on a page it carries the turn, so the
+    // page can show that this click failed.
+    let tag = (lane != PersonalLane::Chat).then(|| turn.clone());
+    let append = |kind: &'static str, text: String| append_as(kind, text, tag.clone());
     // Refusals are recorded only in this person's own scope, as a code.
     let model = match route_model(&state, &user_id, None, &mut route).await {
         Ok(model) => model,
@@ -1423,7 +1640,7 @@ async fn run_personal(
         append(kind::ERROR, message.clone()).await;
         return Err(message);
     };
-    let run = execute_personal_run(state, user_id, trigger, route, model, permit);
+    let run = execute_personal_run(state, user_id, trigger, route, model, permit, lane, turn);
     if detach {
         tokio::spawn(run);
     } else {
@@ -1432,6 +1649,7 @@ async fn run_personal(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_personal_run(
     state: AppState,
     user_id: String,
@@ -1439,26 +1657,23 @@ async fn execute_personal_run(
     route: Route,
     model: RunModel,
     _permit: tokio::sync::OwnedSemaphorePermit,
+    lane: PersonalLane,
+    turn: Activity,
 ) {
     let built_from = model.built_from.clone();
     let limits = state.config.limits.clone();
     let agent_author = Author::server(actor::AGENT);
-    let turn = Activity::chat();
     let append_as = |kind: &'static str, text: String, activity: Option<Activity>| {
-        let (state, user_id, author) = (state.clone(), user_id.clone(), agent_author.clone());
+        let (state, user_id, author, lane) = (
+            state.clone(),
+            user_id.clone(),
+            agent_author.clone(),
+            lane.clone(),
+        );
         async move {
             let r = state
                 .db
-                .call(move |db| {
-                    db.append_personal_with(
-                        &user_id,
-                        kind,
-                        &author,
-                        &text,
-                        &Addressed::room(),
-                        activity.as_ref(),
-                    )
-                })
+                .call(move |db| lane.append(db, &user_id, kind, &author, &text, activity.as_ref()))
                 .await;
             if let Err(e) = r {
                 tracing::error!(error = %format!("{e:#}"), "appending personal event");
@@ -1475,10 +1690,15 @@ async fn execute_personal_run(
     let end = |phase: &'static str| append_as(kind::ACTIVITY, String::new(), Some(turn.at(phase)));
     let tagged = |kind: &'static str, text: String| append_as(kind, text, Some(turn.clone()));
     let earlier = {
-        let (user, before, n) = (user_id.clone(), trigger.id, limits.agent_history);
+        let (user, before, n, lane) = (
+            user_id.clone(),
+            trigger.id,
+            limits.agent_history,
+            lane.clone(),
+        );
         state
             .db
-            .call(move |db| db.personal_before(&user, before, n))
+            .call(move |db| lane.before(db, &user, before, n))
             .await
     };
     let earlier = match earlier {
@@ -1497,18 +1717,62 @@ async fn execute_personal_run(
             return;
         }
     };
-    let mut builder = model
-        .builder()
-        .preamble(PREAMBLE)
-        .append_preamble(PERSONAL_PREAMBLE);
+    // Web tools only for a person who turned them on for their own Chat,
+    // always on their own computer.
+    let web = {
+        let user = user_id.clone();
+        state
+            .db
+            .call(move |db| {
+                Ok(crate::web_devices::personal_chat_enabled(
+                    &db.lock(),
+                    &user,
+                )?)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %format!("{e:#}"), "reading web search prefs");
+                false
+            })
+    };
+    let mut builder = model.builder().preamble(PREAMBLE).append_preamble(if web {
+        PERSONAL_WEB_PREAMBLE
+    } else {
+        PERSONAL_PREAMBLE
+    });
+    if web {
+        if crate::web_devices::has_device(&state, &user_id).await {
+            let ctx = crate::web_tools::WebContext {
+                state: state.clone(),
+                scope: crate::web_tools::WebScope::Personal,
+                initiator: Author {
+                    id: Some(user_id.clone()),
+                    name: String::new(),
+                },
+                turn: turn.clone(),
+                provenance: Arc::new(crate::web_tools::Provenance::from_messages(
+                    earlier.iter().chain(std::iter::once(&trigger)),
+                )),
+                agent_id: None,
+            };
+            builder = builder
+                .append_preamble(crate::web_tools::WEB_PREAMBLE)
+                .dynamic_tools(crate::web_tools::tools(&ctx, true, true));
+        } else {
+            builder = builder.append_preamble(crate::web_tools::NO_WEB_DEVICE_PREAMBLE);
+        }
+    }
     let mut reacted = Arc::new(AtomicBool::new(false));
-    if let Some((tool, flag)) = reaction_tool(
-        &state,
-        ReactionScope::Personal {
-            user_id: user_id.clone(),
-        },
-        &trigger,
-    ) {
+    // Reactions are for Chat messages; a page-only conversation has none.
+    if lane == PersonalLane::Chat
+        && let Some((tool, flag)) = reaction_tool(
+            &state,
+            ReactionScope::Personal {
+                user_id: user_id.clone(),
+            },
+            &trigger,
+        )
+    {
         builder = builder.append_preamble(REACTION_PREAMBLE).tool(tool);
         reacted = flag;
     }
@@ -1519,6 +1783,7 @@ async fn execute_personal_run(
             state: state.clone(),
             scope: Scope::Personal {
                 user_id: user_id.clone(),
+                lane: lane.clone(),
             },
             turn: turn.clone(),
         });
@@ -1565,6 +1830,31 @@ async fn execute_personal_run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn web_tool_events_never_become_model_history() {
+        let key = TurnKey::new();
+        let web = "<web-data id=\"abc\" source=\"exa\">page text</web-data id=\"abc\">";
+        let events = vec![
+            event(kind::MESSAGE, "search please", Some(1)),
+            event(kind::TOOL_CALL, "web_search \"q\"", Some(2)),
+            event(kind::TOOL_RESULT, web, Some(3)),
+            event(
+                kind::ERROR,
+                "web_fetch refused: a URL didn't come from a person",
+                Some(4),
+            ),
+            event(kind::REASONING_SUMMARY, web, Some(5)),
+            event(kind::AGENT, "my own summary", Some(6)),
+        ];
+        let h = history(&events, &key);
+        assert_eq!(h.len(), 2);
+        let all = format!("{h:?}");
+        assert!(
+            !all.contains("web-data") && !all.contains("page text") && !all.contains("refused")
+        );
+        assert!(all.contains("my own summary"));
+    }
 
     fn event(kind: &str, text: &str, created_at: Option<i64>) -> Event {
         Event {

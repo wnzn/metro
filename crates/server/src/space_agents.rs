@@ -59,12 +59,27 @@ pub const COLORS: [&str; 8] = [
 ];
 const NO_AGENT: &str = "no such agent";
 
-/// Every entry an agent's tool allowlist may hold.
+/// Every entry an agent's tool allowlist may hold. The web tools run on the
+/// computer of whoever asks (`crate::web_tools`).
 pub fn all_tools() -> Vec<String> {
     RunnerTool::ALL
         .iter()
         .map(|t| t.runner_name().to_owned())
         .chain([THREADS_TOOL.to_owned()])
+        .chain([
+            crate::web_tools::WEB_SEARCH.to_owned(),
+            crate::web_tools::WEB_FETCH.to_owned(),
+        ])
+        .collect()
+}
+
+/// What a new agent, or a new Space's default agent, may use unless its
+/// owner says otherwise: every tool except the web tools, which the owner
+/// turns on per agent.
+pub fn default_tools() -> Vec<String> {
+    all_tools()
+        .into_iter()
+        .filter(|t| t != crate::web_tools::WEB_SEARCH && t != crate::web_tools::WEB_FETCH)
         .collect()
 }
 
@@ -180,7 +195,7 @@ fn insert_default(conn: &Connection, space_id: &str) -> rusqlite::Result<()> {
             Activity::AGENT_NAME,
             DEFAULT_HANDLE,
             "The Space's built-in agent.",
-            serde_json::to_string(&all_tools()).unwrap_or_else(|_| "[]".to_owned()),
+            serde_json::to_string(&default_tools()).unwrap_or_else(|_| "[]".to_owned()),
             COLORS[0],
             now,
         ],
@@ -580,7 +595,7 @@ pub struct CreateBody {
     description: String,
     #[serde(default)]
     instructions: String,
-    /// Default: every tool.
+    /// Default: every tool except the web tools ([`default_tools`]).
     #[serde(default)]
     tools: Option<Vec<String>>,
     #[serde(default)]
@@ -611,7 +626,7 @@ async fn create_agent(
         instructions: Some(check_instructions(&body.instructions)?),
         tools: Some(match &body.tools {
             Some(tools) => check_tools(tools)?,
-            None => all_tools(),
+            None => default_tools(),
         }),
         color: body.color.as_deref().map(check_color).transpose()?,
         make_default: body.is_default,

@@ -154,7 +154,8 @@ class Smoke:
                     "-c", 'mkdir -p "/workspace/spaces/$1" && : > "/workspace/spaces/$1/$2"',
                     "sh", reg_marked, markers[reg_marked])
 
-        runner_env = ["-e", "METRO_SERVER_URL=http://server:8787", "-e", "METRO_ALLOW_INSECURE_HTTP=1",
+        # Plain HTTP needs no opt-in (METRO_ALLOW_INSECURE_HTTP is a no-op now).
+        runner_env = ["-e", "METRO_SERVER_URL=http://server:8787",
                       "-e", "METRO_WORKSPACE=/workspace", "--entrypoint", "sh"]
         runners = [
             self.start("runner-dedicated", a.runner_image,

@@ -2,6 +2,9 @@
 //! Metro server and a fake OpenAI-compatible model server, both on loopback.
 //! No external accounts, no vendor CLIs.
 
+#[path = "common/cli_stdin.rs"]
+mod cli_stdin;
+
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -226,13 +229,7 @@ async fn connector(home: &Path, args: &[&str], stdin: Option<&str>) -> Out {
         .stderr(std::process::Stdio::piped())
         .kill_on_drop(true);
     let mut child = cmd.spawn().unwrap();
-    {
-        use tokio::io::AsyncWriteExt;
-        let mut si = child.stdin.take().unwrap();
-        if let Some(s) = stdin {
-            si.write_all(s.as_bytes()).await.unwrap();
-        }
-    }
+    cli_stdin::send_stdin(child.stdin.take().unwrap(), stdin).await;
     let out = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
         .await
         .expect("connector timed out")
@@ -889,13 +886,15 @@ async fn cli_refuses_secrets_on_argv_and_bad_profiles() {
     .await;
     assert_ne!(out.code, 0);
     assert!(!out.stderr.contains("sk-ant-not"), "{}", out.stderr);
-    // Plain http to a non-loopback Metro is refused.
+    // A Metro server URL with an unsupported scheme or credentials is
+    // refused. (Plain http to any host is allowed, with a warning for hosts
+    // that are neither loopback nor Tailscale: see netpolicy's unit tests.)
     let out = connector(
         &e.home,
         &[
             "setup",
             "--server-url",
-            "http://metro.example.com",
+            "ftp://metro.example.com",
             "--kind",
             "device-claude-code",
             "--device-token-file",
@@ -905,14 +904,60 @@ async fn cli_refuses_secrets_on_argv_and_bad_profiles() {
             "m",
             "--yes",
         ],
-        Some(&format!("{DEVICE_TOKEN}\n")),
+        None, // refused before the token is read
     )
     .await;
     assert_ne!(out.code, 0);
-    assert!(out.stderr.contains("plain http"), "{}", out.stderr);
+    assert!(out.stderr.contains("not supported"), "{}", out.stderr);
+    let out = connector(
+        &e.home,
+        &[
+            "setup",
+            "--server-url",
+            "http://user:pw@192.168.1.5:8787",
+            "--kind",
+            "device-claude-code",
+            "--device-token-file",
+            "-",
+            "--no-login",
+            "--model",
+            "m",
+            "--yes",
+        ],
+        None, // refused before the token is read
+    )
+    .await;
+    assert_ne!(out.code, 0);
+    assert!(
+        out.stderr.contains("user name or password"),
+        "{}",
+        out.stderr
+    );
+    assert!(!out.stderr.contains(DEVICE_TOKEN), "{}", out.stderr);
     let help = connector(&e.home, &["--help"], None).await;
     assert_eq!(help.code, 0);
     assert!(help.stdout.contains("metro-connector setup"));
+}
+
+#[tokio::test]
+async fn cli_stdin_tolerates_a_child_that_has_already_exited() {
+    let mut child = tokio::process::Command::new(env!("CARGO_BIN_EXE_metro-connector"))
+        .arg("--help")
+        .env_clear()
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let stdin = child.stdin.take().unwrap();
+    let out = tokio::time::timeout(std::time::Duration::from_secs(60), child.wait_with_output())
+        .await
+        .expect("connector timed out")
+        .unwrap();
+    // Waiting first forces the broken pipe rather than racing the child.
+    cli_stdin::send_stdin(stdin, Some("unused input\n")).await;
+    assert!(out.status.success());
+    assert!(String::from_utf8_lossy(&out.stdout).contains("metro-connector setup"));
 }
 
 // ------------------------------------------------ re-setup and destinations

@@ -42,6 +42,7 @@ pub mod profile;
 pub mod provider;
 pub mod run;
 pub mod secret;
+pub mod web;
 
 // Vendor adapters. Owned by their own authors; this crate only registers them
 // and calls the shared interface (see `provider.rs`).

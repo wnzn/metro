@@ -5,6 +5,7 @@
 
 import { header, TOKENS } from "../../../test/fakeServer";
 import type { fakeServer } from "../../../test/fakeServer";
+import { LAUNCHED_ENV } from "../../../test/launched";
 
 export const BRIDGE = "http://127.0.0.1:47123";
 /** A fake per-launch bearer: 64 hex characters, as the launcher makes them. */
@@ -14,7 +15,7 @@ export const BRIDGE_DEVICE_SECRET = "metro_pc_bridge_secret";
 export const LOCAL_MODELS = ["local-small", "local-large"];
 
 /** What nsh/test's `open` gives the app as its launcher-set environment. */
-export const bridgeEnv = (url = BRIDGE, token = BRIDGE_TOKEN) => ({ process: { "default.env": { METRO_DESKTOP_BRIDGE_URL: url, METRO_DESKTOP_BRIDGE_TOKEN: token } } });
+export const bridgeEnv = (url = BRIDGE, token = BRIDGE_TOKEN) => ({ process: { "default.env": { ...LAUNCHED_ENV, METRO_DESKTOP_BRIDGE_URL: url, METRO_DESKTOP_BRIDGE_TOKEN: token } } });
 
 type F = ReturnType<typeof fakeServer>;
 type Req = { method: string; url: string; headers: Record<string, string>; body?: string | null };
@@ -52,7 +53,7 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
     served: new Set<string>(),
     /** This computer's monitoring events; null: an older helper without them (404). */
     monitoring: null as null | unknown[],
-    /** Delay (ms) before the monitoring answer. */
+    /** Delay on NSH's stub clock, without blocking other route handlers. */
     monitoringDelay: 0,
   };
 
@@ -92,8 +93,7 @@ export function fakeBridge(f: F, opts: { instance?: "primary" | "secondary"; kin
     if (path === "/v1/status" && req.method === "GET") return ok(status());
     if (path === "/v1/monitoring/events" && req.method === "GET") {
       if (!state.monitoring) return err(404, "not_found", "Unknown path.");
-      const answer = ok({ events: state.monitoring });
-      return state.monitoringDelay ? new Promise((resolve) => setTimeout(() => resolve(answer), state.monitoringDelay)) : answer;
+      return { ...ok({ events: state.monitoring }), delay: state.monitoringDelay };
     }
     if (path === "/v1/session") {
       if (req.method === "DELETE") {

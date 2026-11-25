@@ -6,9 +6,16 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, TOKENS, world } from "../../test/fakeServer";
 import { BRIDGE, BRIDGE_TOKEN, bridgeEnv, fakeBridge } from "../device/test/fakeBridge";
+import { launched } from "../../test/launched";
 
 type F = ReturnType<typeof world>;
 type B = ReturnType<typeof fakeBridge>;
+
+// The stub reply is held on app time, not wall time, and comes before the
+// transport's timeout. Take the intervening actions before advancing it.
+const LATE_REPLY = 5_000;
+const BEFORE_REPLY = { timeout: 500 };
+const ACME_EVENTS = "/v1/monitoring/events?space_id=acme";
 
 const at = (minute: number) => `2026-11-23T10:${String(minute).padStart(2, "0")}:00Z`;
 const event = (minute: number, component: string, code: string, summary: string) => ({ timestamp: at(minute), component, code, summary });
@@ -26,7 +33,7 @@ function monitoringWorld() {
 
 async function launch(f: F, b: B | null = null) {
   const network = { ...(f.network as any), ...(b ? (b.network as any) : {}) };
-  return open("../../App.tsx", { network, platform: "linux", width: 1200, height: 900, ...(b ? { modules: bridgeEnv() as any } : {}) });
+  return open("../../App.tsx", { network, platform: "linux", width: 1200, height: 900, clock: {}, modules: (b ? bridgeEnv() : launched()) as any });
 }
 
 async function signIn(app: App, user: string) {
@@ -63,6 +70,11 @@ const rows = (app: App) => {
   return n;
 };
 const monitoringCalls = (f: F, user?: string) => f.state.log.filter((l) => l.path.startsWith("/v1/monitoring/") && (!user || l.user === user)).map((l) => l.path);
+
+async function waitForHeldReply(app: App, reply: { arrived: () => number }) {
+  await app.waitUntil(() => reply.arrived() === 1, BEFORE_REPLY);
+  await app.waitFor("id:monitoring-loading", BEFORE_REPLY);
+}
 
 test("an owner sees one owned Space's events at a time, with the server named; an admin also gets the instance", async () => {
   const f = monitoringWorld();
@@ -180,18 +192,17 @@ test("an older server without My Chat (400 or 404) is unsupported and never fall
 
 test("a late My Chat answer of the previous account never shows for the next one", async () => {
   const f = monitoringWorld();
-  f.state.delays.set("/v1/monitoring/events?scope=me", 2500);
+  const reply = f.answerLate("/v1/monitoring/events?scope=me", TOKENS.alice!, LATE_REPLY);
   const app = await launch(f);
   await signIn(app, "alice");
   await openMonitoring(app);
-  await app.waitFor("id:monitoring-loading");
+  await waitForHeldReply(app, reply);
   await signOut(app);
-  f.state.delays.delete("/v1/monitoring/events?scope=me");
   await signIn(app, "bob");
   await openMonitoring(app);
-  await app.waitFor("text:Bob chat turn failed");
+  await app.waitFor("text:Bob chat turn failed", BEFORE_REPLY);
   expect(text(app)).not.toContain("Alice chat turn failed");
-  await app.wait(2800); // Alice's answer arrives now, during Bob's session
+  await app.clock!.runFor(LATE_REPLY); // now let Alice's reply come due in Bob's session
   expect(text(app)).not.toContain("Alice chat turn failed");
   expect(app.shows("id:monitoring-source-facts >> text:bob")).toBe(true);
   expect(rows(app)).toBe(1);
@@ -227,16 +238,16 @@ test("a rejected session (401) signs out instead of showing events", async () =>
 
 test("a late answer for the source left behind never shows under the new one", async () => {
   const f = monitoringWorld();
-  f.state.delays.set("/v1/monitoring/events?space_id=acme", 600);
+  const reply = f.answerLate(ACME_EVENTS, TOKENS.alice!, LATE_REPLY);
   const app = await launch(f);
   await signIn(app, "alice");
   await openMonitoring(app);
   await app.waitFor("text:Alice chat turn failed");
   await pick(app, "space:acme");
-  await app.waitFor("id:monitoring-loading");
+  await waitForHeldReply(app, reply);
   await pick(app, "instance");
-  await app.waitFor("text:Instance database slow");
-  await app.wait(900); // Acme's answer arrives now
+  await app.waitFor("text:Instance database slow", BEFORE_REPLY);
+  await app.clock!.runFor(LATE_REPLY); // now deliver Acme's answer
   expect(text(app)).not.toContain("Acme runner went offline");
   expect(text(app)).not.toContain("Acme run failed");
   expect(rows(app)).toBe(1);
@@ -244,20 +255,20 @@ test("a late answer for the source left behind never shows under the new one", a
 
 test("a late answer from the last session never shows after sign-out and another sign-in", async () => {
   const f = monitoringWorld();
-  f.state.delays.set("/v1/monitoring/events?space_id=acme", 600);
+  const reply = f.answerLate(ACME_EVENTS, TOKENS.alice!, LATE_REPLY);
   const app = await launch(f);
   await signIn(app, "alice");
   await openMonitoring(app);
   await app.waitFor("text:Alice chat turn failed");
   await pick(app, "space:acme");
-  await app.waitFor("id:monitoring-loading");
+  await waitForHeldReply(app, reply);
   await signOut(app);
   await signIn(app, "bob");
   await openMonitoring(app);
-  await app.waitFor("text:Bob chat turn failed");
+  await app.waitFor("text:Bob chat turn failed", BEFORE_REPLY);
   await pick(app, "space:side");
-  await app.waitFor("text:Side claim retried");
-  await app.wait(900);
+  await app.waitFor("text:Side claim retried", BEFORE_REPLY);
+  await app.clock!.runFor(LATE_REPLY);
   expect(text(app)).not.toContain("Acme runner went offline");
   expect(text(app)).not.toContain("Instance database slow");
   expect(app.shows("id:monitoring-source-facts >> text:Space “Side project”")).toBe(true);
@@ -272,8 +283,7 @@ test("losing ownership of a Space drops it as a source", async () => {
   await pick(app, "space:side");
   await app.waitFor("text:Side claim retried");
   f.state.spaces.get("side")!.owner = "alice"; // ownership moved on the server
-  await app.wait(11_000); // the Space list refreshes
-  await app.waitFor("text:Bob chat turn failed"); // back to the first source, My Chat
+  await app.waitFor("text:Bob chat turn failed", { timeout: 15_000 }); // Space list refreshes; back to My Chat
   expect(text(app)).not.toContain("Side claim retried");
   await app.press("id:monitoring-source");
   expect(app.shows("id:monitoring-source:space:side")).toBe(false);
@@ -337,10 +347,15 @@ test("an older helper is unsupported; a refused bridge bearer is an error; a lat
 
   b.state.failWith = null;
   b.state.monitoring = [event(8, "connector", "late", "Late local event")];
-  b.state.monitoringDelay = 600;
+  const calls = () => b.calls("/v1/monitoring/events", "GET").length;
+  const before = calls();
+  b.state.monitoringDelay = LATE_REPLY;
   await app.press("id:monitoring-refresh");
+  await app.waitUntil(() => calls() === before + 1, BEFORE_REPLY);
+  await app.waitFor("id:monitoring-loading", BEFORE_REPLY);
   await pick(app, "space:acme");
-  await app.waitFor("text:Acme runner went offline");
-  await app.wait(900);
+  await app.waitFor("text:Acme runner went offline", BEFORE_REPLY);
+  await app.clock!.runFor(LATE_REPLY);
   expect(text(app)).not.toContain("Late local event");
+  expect(text(app)).toContain("Acme runner went offline");
 });

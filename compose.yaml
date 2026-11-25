@@ -60,9 +60,9 @@ services:
       server:
         condition: service_healthy
     environment:
+      # This HTTP hop stays inside the Compose network. Plain HTTP needs no
+      # opt-in; the runner logs one warning because "server" isn't loopback.
       METRO_SERVER_URL: http://server:8787
-      # This HTTP hop stays inside the Compose network; remote runners use HTTPS.
-      METRO_ALLOW_INSECURE_HTTP: "1"
       # Obtain a Space-issued token before starting this optional service.
       METRO_RUNNER_TOKEN: "${METRO_RUNNER_TOKEN:-}"
       METRO_WORKSPACE: /workspace
@@ -99,9 +99,9 @@ services:
       server:
         condition: service_healthy
     environment:
+      # This HTTP hop stays inside the Compose network. Plain HTTP needs no
+      # opt-in; the runner logs one warning because "server" isn't loopback.
       METRO_SERVER_URL: http://server:8787
-      # This HTTP hop stays inside the Compose network; remote runners use HTTPS.
-      METRO_ALLOW_INSECURE_HTTP: "1"
       # Registered token from the settings page; supply it at start, don't commit it.
       METRO_RUNNER_TOKEN: "${METRO_REGISTERED_RUNNER_TOKEN:-}"
       METRO_WORKSPACE: /workspace

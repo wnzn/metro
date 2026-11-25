@@ -21,6 +21,7 @@ pub mod mentions;
 pub mod model_routing;
 pub mod monitoring;
 pub mod orchestration;
+pub mod pages;
 pub mod profiles;
 pub mod providers;
 pub mod quick_search;
@@ -32,6 +33,8 @@ pub mod space_agents;
 pub mod space_prefs;
 pub mod spaces;
 pub mod tools;
+pub mod web_devices;
+pub mod web_tools;
 
 use std::sync::Arc;
 
@@ -74,6 +77,8 @@ pub struct AppState {
     pub managed: crate::admin_users::Managed,
     /// Avatar re-encodes running at once (see [`crate::profiles`]).
     pub avatar_encodes: Arc<Semaphore>,
+    /// Page builder model turns at once, apart from agent runs.
+    pub page_builds: Arc<Semaphore>,
 }
 
 impl AppState {
@@ -104,6 +109,7 @@ impl AppState {
             .await?;
         let state = Self {
             avatar_encodes: Arc::new(Semaphore::new(crate::profiles::MAX_AVATAR_ENCODES)),
+            page_builds: Arc::new(Semaphore::new(crate::pages::generate::MAX_PAGE_BUILDS)),
             managed,
             library,
             providers,
@@ -251,6 +257,8 @@ pub fn router(state: AppState) -> Router {
         // Personal device connector routes (`/v1/device/*` and
         // `POST /v1/providers/{id}/device-token`), with full paths.
         .merge(crate::device_relay::router())
+        // A person's own web search computers and their personal Chat opt-in.
+        .merge(crate::web_devices::router())
         // `GET|PUT /v1/model-routing`, personal routing settings.
         .merge(crate::model_routing::router())
         // Personal semantic search and scheduled prompts, with full paths.
@@ -272,6 +280,8 @@ pub fn router(state: AppState) -> Router {
         .merge(crate::spaces::router())
         .merge(crate::space_agents::router())
         .merge(crate::space_prefs::router())
+        // Pages; routes that carry page source set their own limit.
+        .merge(crate::pages::router())
         .layer(DefaultBodyLimit::max(HUMAN_BODY_LIMIT));
     // Room for the largest result plus JSON escaping.
     let runner_limit = state.config.limits.max_result_bytes * 2 + 1024;

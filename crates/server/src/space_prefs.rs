@@ -508,7 +508,7 @@ mod tests {
                 assert_eq!(agents[0].handle, "agent");
                 assert_eq!(agents[0].name, "Metro");
                 assert!(agents[0].is_default);
-                assert_eq!(agents[0].tools, crate::space_agents::all_tools());
+                assert_eq!(agents[0].tools, crate::space_agents::default_tools());
             }
             let conn = db.lock();
             assert!(load_in(&conn, &a, "alice").unwrap().classify_unaddressed);
