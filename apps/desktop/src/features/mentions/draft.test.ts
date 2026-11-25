@@ -202,7 +202,7 @@ test("an ambiguous full name becomes a stable anchor when a suggestion is tapped
   expect(match.kind).toBe("ambiguous");
   const picked = pickMention(source, match, otherAlice, directory)!;
   expect(picked.text).toBe("🙂 @Alice Moreno, next");
-  expect(picked.anchors).toEqual([{ start: 3, end: 16, literal: "@Alice Moreno", mention: otherAlice }]);
+  expect(picked.anchors).toEqual([{ start: 3, end: 16, literal: "@Alice Moreno", mention: otherAlice, picked: true }]);
   expect(body(prepareMentionSend(picked, directory))).toEqual({
     text: picked.text, mentions: [otherAlice], spans: [{ start: 5, end: 18, index: 0 }],
   });
@@ -328,6 +328,74 @@ test("an ambiguous quote boundary requires a deliberate agent choice", () => {
   expect([insideMatch.kind, insideMatch.literal]).toEqual(["ambiguous", "@agent"]);
   const insideResult = prepareMentionSend(inside, roster);
   expect(insideResult.ok ? null : insideResult.reason).toBe("ambiguous");
+});
+
+test("a suffix edit can make an already captured agent uncertain without changing its identity", () => {
+  const before = 'Say "hello " then @agent ';
+  const after = `${before}please "@outside`;
+  const captured = captureTypedMentions(draft(before), roster);
+  expect(body(prepareMentionSend(captured, roster)).mentions).toEqual([generic]);
+
+  const edited = captureTypedMentions(updateMentionDraft(captured, after), roster);
+  const [match] = scanMentionDraft(edited, roster);
+  expect(match).toEqual({
+    kind: "ambiguous", start: before.indexOf("@agent"), end: before.indexOf("@agent") + 6,
+    literal: "@agent", choices: [generic],
+  });
+  const blocked = prepareMentionSend(edited, roster);
+  expect(blocked.ok ? null : blocked.reason).toBe("ambiguous");
+  const chosen = pickMention(edited, match, generic, roster)!;
+  expect(body(prepareMentionSend(chosen, roster)).mentions).toEqual([generic]);
+  expect(body(prepareMentionSend(updateMentionDraft(edited, before), roster)).mentions).toEqual([generic]);
+});
+
+test("an uncertain typed named-agent anchor offers its pinned ID, not a replacement handle owner", () => {
+  const before = 'Say "hello " then @coder ';
+  const captured = captureTypedMentions(draft(before), roster);
+  const edited = editMentionDraft(captured, { start: before.length, end: before.length, replacement: 'please "@outside' })!;
+  const agents = [
+    ...roster.agents.map(a => a.id === coder.agentId ? { ...a, handle: "renamed" } : a),
+    { id: "ag-replacement", name: "Replacement", handle: "coder" },
+  ];
+  const directory = { ...roster, agents };
+  const blocked = prepareMentionSend(edited, directory);
+  expect(!blocked.ok && blocked.reason === "ambiguous" ? blocked.match.choices : null).toEqual([coder]);
+  expect(prepareMentionSend(edited, { ...directory, agents: agents.filter(a => a.id !== coder.agentId) }))
+    .toEqual({ ok: false, reason: "stale-recipient" });
+});
+
+test("a deliberate agent pick survives an uncertain suffix but not a definite email or stale ID", () => {
+  const before = 'Say "hello " then @agent ';
+  const start = before.indexOf("@agent");
+  const picked = pick(draft(before), start, start + 6, generic);
+  const edited = updateMentionDraft(picked, `${before}please "@outside`);
+  expect(body(prepareMentionSend(edited, roster)).mentions).toEqual([generic]);
+
+  const domain = pick(draft("@a"), 0, 2, generic);
+  const email = editMentionDraft(domain, { start: 0, end: 0, replacement: `"local"` })!;
+  expect(prepareMentionSend(email, roster)).toEqual({ ok: true, body: { text: '"local"@agent ' } });
+  const named = pick(draft("@co"), 0, 3, coder);
+  expect(prepareMentionSend(named, { ...roster, agents: [] })).toEqual({ ok: false, reason: "stale-recipient" });
+});
+
+test("wrapped and emphasized quoted email never contributes an agent recipient or shifts a real mention", () => {
+  const directory = {
+    ...roster, agents: [...roster.agents, { id: "ag-underscore", handle: "agent_", name: "Underscore" }],
+  };
+  for (const [left, right] of [
+    ["", ""], ["(", ")"], ["[", "]"], ["{", "}"], ["<", ">"],
+    ["*", "*"], ["**", "**"], ["***", "***"], ["_", "_"], ["__", "__"], ["(*", "*)"],
+  ]) {
+    for (const separator of ["", ",", ";", ".", "!"]) {
+      const text = `🌿 Use ${left}"local"@agent${right}${separator} then "@Alice Moreno"`;
+      const out = body(send(text, directory));
+      expect(out.text).toBe(text);
+      expect(out.mentions).toEqual([alice]);
+      const bytes = new TextEncoder().encode(text);
+      expect(out.spans?.map(s => new TextDecoder().decode(bytes.slice(s.start, s.end))))
+        .toEqual(["@Alice Moreno"]);
+    }
+  }
 });
 
 test("an email-like invalid host stays in the chooser even after its agent changes handle", () => {

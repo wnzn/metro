@@ -1,7 +1,7 @@
 import {
   closesMention, isAgentHandle, isLegacyId, isMemberId, isRange, isTextBoundary, mentionSyntaxRanges,
   opensMention, overlapsRanges, quotedLocalStart,
-  saneExplicitLabel, saneTypedLabel, validMentionSpan,
+  saneExplicitLabel, saneTypedLabel, trimTrailingMentionPunctuation, validMentionSpan,
 } from "./syntax";
 import type { MentionRange } from "./syntax";
 
@@ -16,7 +16,9 @@ export type MentionDirectory = {
 };
 
 export type MentionSelection = MentionRange & { readonly literal: string };
-export type MentionAnchor = MentionSelection & { readonly mention: MentionRecipient };
+type BoundMention = MentionSelection & { readonly mention: MentionRecipient };
+/** Only deliberate picks set `picked`; absent (including older drafts) means automatic. */
+export type MentionAnchor = BoundMention & { readonly picked?: true };
 type MentionDecision =
   | (MentionSelection & { kind: "ambiguous"; choices: readonly MentionRecipient[] })
   | (MentionSelection & { kind: "unresolved" });
@@ -26,7 +28,7 @@ export type MentionDraft = {
   /** Completed unbound tokens stay plain or require a pick even after roster refresh. */
   readonly decisions?: readonly MentionDecision[];
 };
-export type MentionMatch = (MentionAnchor & { kind: "resolved" }) | MentionDecision;
+export type MentionMatch = (BoundMention & { kind: "resolved" }) | MentionDecision;
 
 type WireRecipient = { kind: "agent"; agent_id?: string } | { kind: "user"; id: string };
 export type WireMentionSpan = { start: number; end: number; index: number };
@@ -78,6 +80,12 @@ function aliases(directory: MentionDirectory): Alias[] {
   return out;
 }
 
+function draftSyntax(text: string, anchors: readonly MentionAnchor[]) {
+  // Automatically captured text still participates in quote detection for
+  // the whole draft. Only a deliberate pick makes the label opaque.
+  return mentionSyntaxRanges(text, anchors.filter(anchor => anchor.picked === true));
+}
+
 function anchorSyntax(draft: MentionDraft) {
   const { text } = draft;
   const valid = (s: MentionSelection) => validMentionSpan(text, s) && text.slice(s.start, s.end) === s.literal;
@@ -91,7 +99,7 @@ function anchorSyntax(draft: MentionDraft) {
   // edit wrapped some anchors in real code, drop them and unmask their text
   // before checking the remaining anchors.
   for (;;) {
-    const syntax = mentionSyntaxRanges(text, anchors);
+    const syntax = draftSyntax(text, anchors);
     const { ignored } = syntax;
     const outside = anchors.filter(a => !overlapsRanges(a, ignored));
     if (outside.length === anchors.length) {
@@ -128,7 +136,15 @@ function inspect(
   { finalize = false, caret = draft.text.length }: CaptureOptions = {},
 ): MentionMatch[] {
   const { text } = draft;
-  const saved = new Map<number, MentionMatch>(draft.anchors.map(a => [a.start, { ...a, kind: "resolved" }]));
+  const saved = new Map<number, MentionMatch>();
+  for (const { start, end, literal, mention, picked } of draft.anchors) {
+    const range = { start, end, literal };
+    // An edit elsewhere can make a previously captured agent questionable.
+    // Offer only its pinned ID, not aliases discovered in today's roster.
+    saved.set(start, picked !== true && mention.kind === "agent" && overlapsRanges(range, uncertain)
+      ? { kind: "ambiguous", ...range, choices: [mention] }
+      : { kind: "resolved", ...range, mention });
+  }
   for (const decision of draft.decisions ?? []) saved.set(decision.start, decision);
   const lookup = aliases(directory);
   const matches: MentionMatch[] = [];
@@ -174,7 +190,7 @@ function inspect(
       // A quoted token can be valid as either an address-like string or
       // an intentional agent mention. Keep the explicit picker available.
       const needsChoice = distinct.length !== 1
-        || (distinct[0].kind === "agent" && overlapsRanges({ start, end: start + 1 }, uncertain));
+        || (distinct[0].kind === "agent" && overlapsRanges({ start, end }, uncertain));
       matches.push(!needsChoice
         ? { kind: "resolved", start, end, literal, mention: distinct[0] }
         : { kind: "ambiguous", start, end, literal, choices: distinct });
@@ -182,7 +198,7 @@ function inspect(
     }
     // Unknown text is only a hint. Do not treat email-like tokens or code as
     // either a mention or a typo the user needs to fix.
-    const label = rest.match(/^[^\p{White_Space}]+/u)?.[0].replace(/[.,;:!?)\]}>"'*]+$/u, "") ?? "";
+    const label = trimTrailingMentionPunctuation(rest.match(/^[^\p{White_Space}]+/u)?.[0] ?? "");
     const end = start + 1 + label.length;
     if (saneTypedLabel(label) && (finalize || end < text.length)
       && !overlapsRanges({ start, end }, ignored)) {
@@ -211,6 +227,8 @@ export function scanMentionDraft(
  * open token too, then run preflight against the current directory.
  * Existing decisions, including ambiguity and plain text, are not revised
  * by roster data; edit the token or explicitly pick a current identity.
+ * Keep the returned anchors unchanged, including a deliberate pick's optional
+ * `picked` marker. A captured agent is rechecked for ambiguity after edits.
  */
 export function captureTypedMentions(
   draft: MentionDraft, directory: MentionDirectory, options?: CaptureOptions,
@@ -274,7 +292,7 @@ function retainUncertainDecisions(
   if (!uncertain.size) return after;
   const { text, anchors } = after;
   const decisions = [...(after.decisions ?? [])];
-  const { ignored } = mentionSyntaxRanges(text, anchors);
+  const { ignored } = draftSyntax(text, anchors);
   const changedEnd = lastEnd + text.length - before.text.length;
   // An identical spelling may have survived a broad snapshot diff or may
   // have been pasted anew. Never guess its identity from the new roster.
@@ -346,7 +364,7 @@ export function pickMention(
   const prefix = append && (!opensMention(draft.text, start) || wouldCloseQuote) ? " " : "";
   const suffix = end === draft.text.length || !closesMention(draft.text.slice(end)) ? " " : "";
   const labels = displayLabels(directory, mention);
-  if (!append && labels.length && overlapsRanges({ start, end: start + 1 }, syntax.uncertain)) {
+  if (!append && labels.length && overlapsRanges(selection, syntax.uncertain)) {
     // A new name or handle might make this look like a definite address.
     // If so, keep the spelling the user explicitly chose to bind by ID.
     labels.push(literal.slice(1));
@@ -355,7 +373,9 @@ export function pickMention(
     if (!saneExplicitLabel(label)) continue;
     const picked = `@${label}`;
     const text = draft.text.slice(0, start) + prefix + picked + suffix + draft.text.slice(end);
-    const anchor = { start: start + prefix.length, end: start + prefix.length + picked.length, literal: picked, mention };
+    const anchor: MentionAnchor = {
+      start: start + prefix.length, end: start + prefix.length + picked.length, literal: picked, mention, picked: true,
+    };
     const next = shiftAnchors(draft, text, start, end, anchor);
     if (next.anchors.includes(anchor)) return next;
   }

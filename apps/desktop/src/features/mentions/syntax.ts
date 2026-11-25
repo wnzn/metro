@@ -6,12 +6,13 @@ export const MAX_MENTION_LABEL = 64;
 // Match the server's token punctuation and Rust char::is_whitespace. In
 // particular, JS's \s omits U+0085 and includes U+FEFF.
 const space = /\p{White_Space}/u;
-const opens = /[\p{White_Space}([{<"',;:!?*]/u;
-const trailing = /^[.,;:!?)\]}>"'*]*/u;
+const sharedOpen = /[\p{White_Space}([{<,;:*]/u;
+const mentionOnlyOpen = /["'!?]/;
+const trailing = /[.,;:!?)\]}>"'*]/u;
 const badLabel = /[\p{Cc}\p{Cs}\u2028\u2029]/u;
 
 export function opensMention(text: string, start: number): boolean {
-  return start === 0 || opens.test(text[start - 1]);
+  return start === 0 || sharedOpen.test(text[start - 1]) || mentionOnlyOpen.test(text[start - 1]);
 }
 
 function escaped(text: string, i: number, opaque: readonly MentionRange[]): boolean {
@@ -33,10 +34,22 @@ function previousQuote(text: string, before: number, opaque: readonly MentionRan
   return null;
 }
 
+function openingUnderscores(text: string, quote: number): number {
+  // Underscore emphasis can wrap mail, but is not wire mention punctuation:
+  // underscores are legal in handles and the server treats them as part of one.
+  let start = quote;
+  while (start > 0 && text[start - 1] === "_") start--;
+  return (start === 0 || sharedOpen.test(text[start - 1])) ? quote - start : 0;
+}
+
 function startsQuotedToken(text: string, start: number): boolean {
   // Narrower than a mention boundary: the quote in `hello!"`, for example,
   // closes prose rather than starting a new local-part token.
-  return start === 0 || /[\p{White_Space}([{<,;:]/u.test(text[start - 1]);
+  return start === 0 || sharedOpen.test(text[start - 1]) || openingUnderscores(text, start) > 0;
+}
+
+function endsDelimitedToken(text: string, end: number): boolean {
+  return end === text.length || space.test(text[end]) || trailing.test(text[end]);
 }
 
 /** Find a complete local part ending at this quote, without pairing unrelated prose quotes. */
@@ -83,7 +96,10 @@ function quotedEmailSyntax(text: string, opaque: readonly MentionRange[]) {
     }
     const end = domain.lastIndex;
     const completeHost = host.startsWith("[") || host.replace(/\.$/, "").split(".").every(label => domainLabel.test(label));
-    const boundary = end === text.length || /[\p{White_Space},;:!?)\]}>"']/u.test(text[end]);
+    const underscores = text[end] === "_" ? openingUnderscores(text, start) : 0;
+    const closesEmphasis = underscores > 0 && text.startsWith("_".repeat(underscores), end)
+      && endsDelimitedToken(text, end + underscores);
+    const boundary = endsDelimitedToken(text, end) || closesEmphasis;
     if (!completeHost || !boundary || couldCloseProse(text, start, opaque)
       || (text[end] === text[close] && visibleQuote(text, end, opaque))) {
       uncertain.push(range);
@@ -95,15 +111,25 @@ function quotedEmailSyntax(text: string, opaque: readonly MentionRange[]) {
 }
 
 export function closesMention(rest: string): boolean {
-  const end = rest.match(trailing)![0].length;
+  let end = 0;
+  while (end < rest.length && trailing.test(rest[end])) end++;
   return end === rest.length || space.test(rest[end]);
 }
 
+export function trimTrailingMentionPunctuation(token: string): string {
+  let end = token.length;
+  while (end > 0 && trailing.test(token[end - 1])) end--;
+  return token.slice(0, end);
+}
+
 export function saneExplicitLabel(label: string): boolean {
-  return label.length > 0 && !space.test(label[0]) && !space.test(label[label.length - 1])
-    && !badLabel.test(label) && [...label].length <= MAX_MENTION_LABEL
-    // B-G allows only interior @ marks that cannot start a separate token.
-    && !label.startsWith("@") && !label.endsWith("@") && !/[\p{White_Space}([{<"',;:!?*]@/u.test(label);
+  if (!label.length || space.test(label[0]) || space.test(label[label.length - 1])
+    || badLabel.test(label) || [...label].length > MAX_MENTION_LABEL || label.endsWith("@")) return false;
+  // B-G allows only interior @ marks that cannot start a separate token.
+  for (let i = label.indexOf("@"); i !== -1; i = label.indexOf("@", i + 1)) {
+    if (opensMention(label, i)) return false;
+  }
+  return true;
 }
 
 export function saneTypedLabel(label: string): boolean {
