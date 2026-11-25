@@ -2,8 +2,8 @@
 import { cleanup, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError } from "./api/client";
 import type { RegisteredRunner, Space } from "./api/client";
-import { loadRunners, runnerBusy, runners, spaceRunners } from "./settings";
-import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, setRunnerPaired, spaces } from "./store";
+import { loadRunners, recordRunnerUpdateAccepted, runnerBusy, runners, spaceRunners } from "./settings";
+import { apiClient, connectedTo, me, onSessionEnd, place, sessionGuard, setRunnerPaired, settingsSection, spaces } from "./store";
 import { helper } from "./device/state";
 import { installedBusy, installedFolderSnapshot, installedRunner, installedRunnerSeen, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner, recordAttachedFolder } from "./features/installedRunner/installedRunner";
 
@@ -304,6 +304,19 @@ export function pinnedRunnerImage(r: RegisteredRunner): string | null {
 export const runnerUpdateBusy = signal<string | null>(null);
 export const runnerUpdateErrors = signal<Record<string, string>>({});
 
+// One read-only poll for the visible Runners page while an accepted update
+// is pending. A slow current read must not be invalidated by the next tick.
+effect(() => {
+  if (place() !== "settings" || settingsSection() !== "runners" || !runners()?.some((r) => r.update?.pending)) return;
+  let reading = false;
+  const timer = setInterval(async () => {
+    if (reading || runnerBusy() || runnerUpdateBusy()) return;
+    reading = true;
+    try { await loadRunners(); } finally { reading = false; }
+  }, RUNNER_REFRESH_MS);
+  cleanup(() => clearInterval(timer));
+});
+
 /** Only called from a scoped confirmation. Re-read before sending; never retarget. */
 export async function requestRunnerUpdate(id: string, target: string) {
   const c = apiClient();
@@ -324,8 +337,7 @@ export async function requestRunnerUpdate(id: string, target: string) {
       return;
     }
     const pending = await c.requestRunnerUpdate(id, target);
-    if (!valid()) return;
-    runners.set(runners()?.map((r) => r.id === id && r.update ? { ...r, update: { ...r.update, pending } } : r) ?? null);
+    recordRunnerUpdateAccepted(id, pending, valid);
   } catch (error) {
     if (!valid()) return;
     const message = actionError(error, error instanceof ApiError && error.status === 409

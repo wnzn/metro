@@ -668,6 +668,84 @@ test("managed runner updates require confirmation, report denial and accepted pr
   expect(posts()).toHaveLength(3);
 });
 
+test("a pre-acceptance roster reply cannot erase the accepted update or stop authoritative polling", async () => {
+  const f = world();
+  const mine = f.addRunner("Build box", "personal", "alice");
+  const other = f.addRunner("Already updating", "personal", "alice");
+  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update"));
+  f.state.runnerRelease.set(other.id, fixtureRelease("managed", "self_update", {
+    pending: { target: "0.5.0", requested_at: Date.now() },
+  }));
+  const app = await openWith(f, null, true);
+  await signInToRunners(app, "alice");
+  const id = `id:runner-update:${mine.id}`;
+  const pending = `id:runner-update-result:${mine.id} >> text:Update to 0.5.0 requested`;
+  await app.waitFor(`id:runner-update-result:${other.id} >> text:Update to 0.5.0 requested`);
+
+  // The existing pending row causes a production roster poll. Its old answer
+  // knows neither row as pending: the unrelated update has already finished.
+  f.state.runnerRelease.set(other.id, fixtureRelease("managed", "none", { available: false }));
+  const held = f.answerLate("/v1/runners", TOKENS.alice!, 3500);
+  await app.clock!.runFor(5100);
+  expect(held.arrived()).toBe(1);
+  f.answerLate("/v1/runners", TOKENS.alice!, 0);
+  // Don't mutate the release object captured by the held reply.
+  f.state.runnerRelease.set(mine.id, fixtureRelease("managed", "self_update"));
+  await app.press(id);
+  await app.press(`${id}:confirm`);
+  await app.waitFor(pending);
+
+  await app.clock!.runFor(3700); // Release the old answer before the next poll.
+  expect(app.shows(pending)).toBe(true);
+  expect(app.shows(id)).toBe(false);
+
+  const completed = fixtureRelease("managed", "none", { available: false });
+  completed.presence.version = "0.5.0";
+  f.state.runnerRelease.set(mine.id, completed);
+  const authoritative = f.answerLate("/v1/runners", TOKENS.alice!, 6300);
+  await app.clock!.runFor(6500); // A second tick must not oust a slow fresh read.
+  expect(authoritative.arrived()).toBe(1);
+  expect(app.shows(pending)).toBe(true);
+  await app.clock!.runFor(1600);
+  await app.waitFor("text:v0.5.0 · Online");
+  expect(app.shows(pending)).toBe(false);
+  expect(app.shows(id)).toBe(false);
+  await app.clock!.runFor(6000);
+  expect(authoritative.arrived()).toBe(1);
+  expect(f.posts().filter((p) => p.path.endsWith("/update"))).toEqual([
+    { user: "alice", method: "POST", path: `/v1/runners/${mine.id}/update`, body: { version: "0.5.0" } },
+  ]);
+});
+
+test("a delayed update acknowledgement cannot stamp the next account's runner roster", async () => {
+  const f = world();
+  const shared = f.addRunner("Shared build box", "organization", "alice");
+  const path = `/v1/runners/${shared.id}/update`;
+  f.state.runnerRelease.set(shared.id, fixtureRelease("managed", "self_update"));
+  const held = f.answerLate(path, TOKENS.alice!, 3000);
+  const app = await openWith(f, null, true);
+  await signInToRunners(app, "alice");
+  const id = `id:runner-update:${shared.id}`;
+  await app.press(id);
+  await app.press(`${id}:confirm`);
+  await app.waitFor(`${id}:busy`);
+  expect(held.arrived()).toBe(1);
+
+  await app.press("id:settings-close");
+  await app.press("id:account-menu");
+  await app.press("id:disconnect");
+  await app.waitFor("id:connect");
+  // Bob can still see the same registered ID but the server isn't reporting
+  // a pending update anymore.
+  f.state.runnerRelease.set(shared.id, fixtureRelease("managed", "self_update"));
+  await signInToRunners(app, "bob");
+  await app.waitFor("text:Shared build box");
+  await app.clock!.runFor(3100);
+  expect(app.shows("text:Update to 0.5.0 requested")).toBe(false);
+  expect(app.shows(id)).toBe(false);
+  expect(f.posts().filter((p) => p.path === path).map((p) => p.user)).toEqual(["alice"]);
+});
+
 test("an update offer changed while confirming never requests a different target", async () => {
   const f = world();
   const mine = f.addRunner("Build box", "personal", "alice");
