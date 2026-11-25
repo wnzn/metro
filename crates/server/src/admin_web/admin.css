@@ -237,7 +237,8 @@ code.block { display: block; margin: var(--space-2) 0; padding: var(--space-2) v
   background: transparent; color: var(--destructive-outline); border-color: var(--destructive-outline);
 }
 .btn-ghost-danger:hover:not(:disabled) { background: var(--destructive-outline-hover); }
-.btn:disabled, .btn:disabled:hover {
+.btn:disabled, .btn:disabled:hover,
+.btn[aria-disabled="true"], .btn[aria-disabled="true"]:hover {
   background: var(--muted); color: var(--muted-foreground); border-color: var(--border);
   cursor: not-allowed;
 }
@@ -256,6 +257,13 @@ code.block { display: block; margin: var(--space-2) 0; padding: var(--space-2) v
 
 .add-form { display: flex; gap: var(--space-3); align-items: flex-end; flex-wrap: wrap; }
 .add-form .field { flex: 1 1 260px; }
+
+/* ------------------------------------------------------------------ Page limits */
+
+.page-limits-fields { display: flex; gap: 0 var(--space-4); flex-wrap: wrap; }
+.page-limits-fields .field { flex: 1 1 260px; min-width: 0; }
+.page-limits-fields .input { max-width: 10rem; }
+#page-limits-status:empty { margin: 0; }
 
 /* ------------------------------------------------------------------ users */
 
@@ -342,6 +350,6 @@ dialog p { margin: 0; color: var(--muted-foreground); overflow-wrap: anywhere; }
   .badge, .alert, .notice, .secret, dialog, .users tr { border-color: CanvasText; }
   .badge { border: 1px solid CanvasText; }
   .btn, .input, .input[aria-invalid="true"] { border-color: ButtonText; }
-  .btn:disabled { color: GrayText; border-color: GrayText; }
+  .btn:disabled, .btn[aria-disabled="true"] { color: GrayText; border-color: GrayText; }
   :focus-visible { outline-color: Highlight; }
 }

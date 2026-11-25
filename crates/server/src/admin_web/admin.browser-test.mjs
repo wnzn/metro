@@ -47,6 +47,11 @@ const mock = {
   ],
   failUsers: false,
   slowUsers: 0,
+  settings: { pages_per_space: 50, versions_per_page: 200 },
+  failSettingsGet: 0,
+  failSettingsPatch: 0,
+  slowSettingsGet: 0,
+  settingsPatches: [],
   log: [],
 };
 const CSP = "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self'; base-uri 'none'; form-action 'self'";
@@ -81,6 +86,18 @@ const server = createServer(async (req, res) => {
   if (p === "/v1/server/update") return mock.serverUpdate ? send(res, 200, mock.serverUpdate) : send(res, 404, { error: "not found" });
   let body = "";
   for await (const c of req) body += c;
+  if (p === "/v1/admin/settings" && req.method === "GET") {
+    if (mock.slowSettingsGet) await delay(mock.slowSettingsGet);
+    if (mock.failSettingsGet) return send(res, mock.failSettingsGet, { error: "settings unavailable" });
+    return send(res, 200, mock.settings);
+  }
+  if (p === "/v1/admin/settings" && req.method === "PATCH") {
+    const patch = JSON.parse(body);
+    mock.settingsPatches.push(patch);
+    if (mock.failSettingsPatch) return send(res, mock.failSettingsPatch, { error: "could not persist settings" });
+    Object.assign(mock.settings, patch);
+    return send(res, 200, mock.settings);
+  }
   if (p === "/v1/admin/users" && req.method === "GET") {
     if (mock.slowUsers) await new Promise((r) => setTimeout(r, mock.slowUsers));
     if (mock.failUsers) return send(res, 500, { error: "database is locked" });
@@ -369,6 +386,67 @@ await test("every button has an accessible name; inputs have labels", async () =
   assert(unlabeled === 0, unlabeled + " unlabeled inputs");
 });
 
+const value = (id) => `document.getElementById(${JSON.stringify(id)}).value`;
+
+await test("Page limits load, validate with accessible errors, and save only changed settings", async () => {
+  await waitFor(vis("page-limits-form"));
+  assert(await evaluate(value("pages-per-space")) === "50", "wrong Page count");
+  assert(await evaluate(value("versions-per-page")) === "200", "wrong retention");
+  const before = mock.settingsPatches.length;
+  await submit("page-limits-form");
+  assert((await text("page-limits-status")).includes("No changes"), "no unchanged status");
+  for (const [input, bad, fix] of [
+    ["pages-per-space", "501", "50"],
+    ["versions-per-page", "2.5", "200"],
+    ["pages-per-space", "", "50"],
+    ["versions-per-page", "1", "200"],
+  ]) {
+    await type(input, bad);
+    await submit("page-limits-form");
+    assert(await evaluate(vis("page-limits-error")), "validation error missing");
+    assert(await evaluate("document.activeElement.id") === input, "invalid input not focused");
+    assert(await evaluate("document.activeElement.getAttribute('aria-invalid')") === "true", "field not marked invalid");
+    assert(await evaluate("document.activeElement.getAttribute('aria-errormessage')") === "page-limits-error", "error not associated");
+    await type(input, fix);
+  }
+  assert(mock.settingsPatches.length === before, "invalid or unchanged settings were sent");
+  // A different admin also changed retention since our GET. Do not overwrite
+  // that value, and show the authoritative result of this PATCH.
+  mock.settings.versions_per_page = 14;
+  await type("pages-per-space", "25");
+  await submit("page-limits-form");
+  await waitFor("document.getElementById('page-limits-status').textContent === 'Page limits saved.'");
+  assert(JSON.stringify(mock.settingsPatches.at(-1)) === JSON.stringify({ pages_per_space: 25 }), "sent more than the edited limit");
+  assert(await evaluate(value("versions-per-page")) === "14", "ignored the server's saved settings");
+  assert(!(await evaluate(vis("page-limits-error"))), "old error still visible");
+});
+
+await test("Page limits offer recovery from load and save errors without losing edits", async () => {
+  mock.failSettingsGet = 503;
+  await goto(base + "/admin");
+  await signIn(ADMIN);
+  await waitFor(vis("page-limits-retry"));
+  assert(!(await evaluate(vis("page-limits-form"))), "showed invented values on load failure");
+  assert((await text("page-limits-error")).includes("settings unavailable"), "load error missing");
+  mock.failSettingsGet = 0;
+  await evaluate("document.getElementById('page-limits-retry').focus()");
+  await click("#page-limits-retry");
+  await waitFor(vis("page-limits-form"));
+  assert(await evaluate("document.activeElement.id") === "pages-per-space", "focus lost on retry");
+  assert(await evaluate(value("pages-per-space")) === "25", "saved setting not shown on fresh sign-in");
+  mock.failSettingsPatch = 503;
+  await type("versions-per-page", "9");
+  await submit("page-limits-form");
+  await waitFor(vis("page-limits-error"));
+  assert((await text("page-limits-error")).includes("retry"), "save retry guidance missing");
+  assert(await evaluate(value("versions-per-page")) === "9", "unsaved edit lost");
+  assert(mock.settings.versions_per_page === 14, "fixture wrote a failed edit");
+  mock.failSettingsPatch = 0;
+  await submit("page-limits-form");
+  await waitFor("document.getElementById('page-limits-status').textContent === 'Page limits saved.'");
+  assert(mock.settings.versions_per_page === 9, "retry did not save");
+});
+
 await test("brand, text, control edges and focus meet contrast targets in light and dark", async () => {
   try {
     for (const scheme of ["light", "dark"]) {
@@ -598,6 +676,29 @@ await test("a 401 mid-session signs out with an explanation", async () => {
   server.on("request", origEmit);
 });
 
+await test("a forbidden Page limits request signs out; a late read cannot restore the form", async () => {
+  await goto(base + "/admin");
+  await signIn(ADMIN);
+  await waitFor(vis("page-limits-form"));
+  mock.failSettingsPatch = 403;
+  await type("pages-per-space", "30");
+  await submit("page-limits-form");
+  await waitFor(vis("signin") + " && " + vis("signin-error"));
+  assert((await text("signin-error")).includes("no longer an organization admin"), "no explanation");
+  assert(!(await evaluate(vis("page-limits-form"))), "form survived auth loss");
+  assert(await evaluate(value("pages-per-space")) === "", "settings left in DOM");
+  mock.failSettingsPatch = 0;
+
+  mock.slowSettingsGet = 400;
+  await signIn(ADMIN);
+  await waitFor("document.getElementById('page-limits-status').textContent === 'Loading Page limits…'");
+  await click("#sign-out");
+  await sleep(500);
+  mock.slowSettingsGet = 0;
+  assert(!(await evaluate(vis("page-limits-form"))), "late response repopulated the form");
+  assert(await evaluate(value("pages-per-space")) === "", "late response kept values");
+});
+
 await test("credentials in the URL are ignored and scrubbed", async () => {
   mock.log.length = 0;
   await goto(base + "/admin?token=" + tok());
@@ -695,14 +796,18 @@ await test("withdrawing the choice in another tab signs this one out; the stored
   await goto(lan + "/admin");
   await click("#plain-http-accept");
   await signIn(ADMIN);
-  await waitFor(vis("panel") + " && document.querySelectorAll('#users-body tr').length > 0");
+  await waitFor(vis("panel") + " && " + vis("page-limits-form") +
+    " && document.querySelectorAll('#users-body tr').length > 0");
 
   // Same tab: the choice disappears from storage (no event here); the next
   // send is refused before any request.
   mock.log.length = 0;
   await evaluate("localStorage.removeItem('metro.admin.plainHttpAccepted')");
   await click("#refresh");
-  await sleep(300);
+  await type("pages-per-space", "31");
+  await submit("page-limits-form");
+  await waitFor(vis("users-error") + " && " + vis("page-limits-error"));
+  assert((await text("page-limits-error")).includes("Confirm the unencrypted connection first"), "missing HTTP choice error");
   assert(apiCalls().length === 0, "a request went out without the stored choice");
   await evaluate("localStorage.setItem('metro.admin.plainHttpAccepted', '1')");
 
