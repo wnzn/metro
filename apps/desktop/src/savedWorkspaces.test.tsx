@@ -7,6 +7,8 @@ import { expect, open, test } from "nsh/test";
 import type { App } from "nsh/test";
 import { BASE, header, TOKENS, world } from "../test/fakeServer";
 import { LAUNCHED_ENV, launched } from "../test/launched";
+import { pagesFixture, TEAM } from "./features/pages/test/fixtureServer";
+import { sampleData } from "./features/pages/test/sample";
 
 type F = ReturnType<typeof world>;
 type Req = { method: string; url: string; headers: Record<string, string>; body?: string | null };
@@ -650,6 +652,24 @@ function holdCreateCommit(s: ReturnType<typeof servers>) {
   return { arrived: () => !!commit, release: () => commit!() };
 }
 
+function addPages(s: ReturnType<typeof servers>, roomLink = false) {
+  const pages = pagesFixture();
+  pages.state.linkedPage = TEAM;
+  if (roomLink) pages.entries.set(TEAM, { ...pages.entries.get(TEAM)!, pinned: true });
+  for (const method of ["GET", "POST"]) {
+    const key = `${method} ${BASE}/v1/*`;
+    const other = s.b.network[key]!;
+    s.b.network[key] = req => {
+      const path = new URL(req.url).pathname;
+      if (roomLink && method === "POST" && path === `/v1/pages/${TEAM}/data`) {
+        return { status: 200, body: { ...sampleData,
+          actions: { ...sampleData.actions, room: { enabled: true, space_id: "acme", room_id: "lobby" } } } };
+      }
+      return path === "/v1/pages" || path.startsWith("/v1/pages/") ? pages.network[key]!(req) : other(req);
+    };
+  }
+}
+
 test("successful Create outvotes a pre-create membership omission even if its first room read fails", async () => {
   const s = servers();
   const get = s.b.network[`GET ${BASE}/v1/*`]!;
@@ -814,6 +834,105 @@ test("a delayed Create from a signed-out account doesn't enter or publish in the
   expect(app.shows(`id:space:${space.id}`)).toBe(false);
   expect(remotePaths(s)).not.toContain(`/v1/spaces/${space.id}/rooms`);
   expect(firstRoomPages(s)).toEqual([]);
+});
+
+for (const source of ["POST", "revalidation"] as const) {
+  for (const switchAccount of [false, true]) {
+    test(`${source} Create 401 ${switchAccount ? "cannot sign out the next account" : "signs out the current account after a move to Library"}`, async () => {
+      const s = servers();
+      const staged = source === "revalidation" ? holdCreateCommit(s) : undefined;
+      const method = staged ? "GET" : "POST";
+      const key = `${method} ${BASE}/v1/*`;
+      const route = s.b.network[key]!;
+      let refuse = !staged, refusals = 0;
+      s.b.network[key] = req => {
+        if (refuse && new URL(req.url).pathname === "/v1/spaces" && header(req, "authorization") === `Bearer ${TOKENS.bob}`) {
+          refusals++;
+          return { status: 401, body: { error: "expired" }, delay: 450 };
+        }
+        return route(req);
+      };
+      const app = await launchInEmptyBeta(s);
+      await startCreate(app);
+      await app.waitUntil(staged?.arrived ?? (() => refusals === 1), { timeout: 120 });
+      await app.press("id:nav-library");
+      await app.waitFor("id:library-view", { timeout: 120 });
+      if (staged) {
+        await startMembershipProbe(s, app, 35);
+        await app.clock!.runFor(65);
+        refuse = true;
+        staged.release();
+        await app.waitUntil(() => refusals === 1, { timeout: 850 });
+        expect(app.shows(`id:space:${createdSpace(s)!.id}`)).toBe(false);
+      }
+
+      if (switchAccount) {
+        await menuSwitch(app, "disconnect");
+        await app.waitFor("id:saved-server:srv-b", { timeout: 120 });
+        await app.press("id:saved-server:srv-b");
+        await app.type("id:access-token", TOKENS.alice!);
+        await app.press("id:connect");
+        await app.waitFor("id:chat-view", { timeout: 150 });
+        await app.clock!.runFor(500);
+        expect(app.shows("id:chat-view")).toBe(true);
+        expect(app.shows("id:connect-error")).toBe(false);
+        const space = createdSpace(s);
+        if (space) expect(app.shows(`id:space:${space.id}`)).toBe(false);
+      } else {
+        expect(app.shows("id:library-view")).toBe(true);
+        await app.waitFor("id:connect-error", { timeout: 500 });
+        expect(app.texts().join(" ")).toContain("The server rejected the access token (HTTP 401).");
+        expect(app.shows("id:workspace")).toBe(false);
+      }
+      expect(refusals).toBe(1);
+      expect(app.requests().filter(r => r.method === "POST" && r.url === REMOTE + "/v1/spaces")).toHaveLength(1);
+      expect(firstRoomPages(s)).toEqual([]);
+    });
+  }
+}
+
+for (const returnToOriginal of [false, true]) {
+  test(`Create does not override a real same-place Page link${returnToOriginal ? " and return to the original Page" : ""}`, async () => {
+    const s = servers();
+    addPages(s);
+    holdCreateResponse(s);
+    const app = await launchInEmptyBeta(s);
+    await app.press("id:pinned-page:pg_bob");
+    await app.waitFor("text:Bob’s dashboard", { timeout: 130 });
+    await app.waitFor("id:page-action:other", { timeout: 150 });
+    const space = await submitCreate(s, app);
+    await app.press("id:page-action:other");
+    await app.waitFor("text:Team dashboard", { timeout: 130 });
+    if (returnToOriginal) {
+      await app.press("id:pinned-page:pg_bob");
+      await app.waitFor("text:Bob’s dashboard", { timeout: 130 });
+    }
+    await app.waitFor(`id:space:${space.id}`, { timeout: 850 });
+    expect(app.shows("id:page-view")).toBe(true);
+    expect(app.shows(returnToOriginal ? "text:Bob’s dashboard" : "text:Team dashboard")).toBe(true);
+    expect(remotePaths(s)).not.toContain(`/v1/spaces/${space.id}/rooms`);
+    expect(firstRoomPages(s)).toEqual([]);
+    expect(chatStarted(s)).toBe(false);
+  });
+}
+
+test("a verified Page room link can open before superseded startup hydration replies", async () => {
+  const s = servers();
+  addPages(s, true);
+  const old = s.b.answerLate(betaRooms, TOKENS.bob!, 900);
+  const app = await launch(s, { storage: rememberedRemote, manualClock: true });
+  await submitSavedStartup(app);
+  await app.waitFor("id:rooms-loading", { timeout: 120 });
+  expect(old.arrived()).toBe(1);
+  await app.press(`id:pinned-page:${TEAM}`);
+  await app.waitFor("id:page-action:room", { timeout: 160 });
+  await app.press("id:page-action:room");
+  await app.waitFor("text:hello from bob in acme", { timeout: 170 });
+  await app.clock!.runFor(950);
+  expect(app.shows("text:hello from bob in acme")).toBe(true);
+  expect(old.arrived()).toBe(1);
+  expect(firstRoomPages(s)).toEqual([firstAcme]);
+  expect(chatStarted(s)).toBe(false);
 });
 
 test("a newer complete list can omit a Space that an older list discovered midflight", async () => {

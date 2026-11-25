@@ -476,10 +476,17 @@ export function retryNow() {
 
 // ------------------------------------------------------------------ spaces
 
+function supersedeRoomEntry() {
+  // The read can still settle as access evidence, but no longer owns navigation.
+  roomEntryNavigation = undefined;
+  switchingSpace.set(false);
+}
+
 export function openChat() {
   if (basePlace() === "chat" && !settingsOpen()) return;
   navigationGeneration++;
   batch(() => {
+    supersedeRoomEntry();
     clearTransient();
     view.set("room");
     settingsOpen.set(false);
@@ -491,11 +498,15 @@ export function openChat() {
   kick();
 }
 
-/** Opens Search, Library or Scheduled tasks: the user's own pages, outside every Space. */
-export function openPlace(where: "search" | "library" | "pages" | "schedules") {
-  if (basePlace() === where && !settingsOpen()) return;
+/** Open a destination outside a Space. Explicit sub-route moves also supersede old navigation intents. */
+export function openPlace(where: "search" | "library" | "pages" | "schedules", { subrouteChanged = false } = {}) {
+  if (basePlace() === where && !settingsOpen()) {
+    if (subrouteChanged) navigationGeneration++;
+    return;
+  }
   navigationGeneration++;
   batch(() => {
+    supersedeRoomEntry();
     clearTransient();
     view.set("room");
     settingsOpen.set(false);
@@ -675,7 +686,10 @@ export async function createSpace(nameInput: string): Promise<boolean> {
       // The newer list may have been taken before the POST committed, or
       // after the Space disappeared. Only a fresh read can distinguish them.
       // A failed check doesn't undo the accepted POST or make it safe to retry.
-      const checked = await refreshMembership(c).catch(() => undefined);
+      const checked = await refreshMembership(c).catch(error => {
+        if (ok() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+        return undefined;
+      });
       if (!ok()) return false;
       const verified = verifiedAccess.get(scopeKey(space.id, "")) ?? 0;
       if (checked === undefined || verified < checked || newerSpaceDenial(space.id, verified) ||
@@ -688,7 +702,9 @@ export async function createSpace(nameInput: string): Promise<boolean> {
     if (ok() && navigation === navigationGeneration) kick();
     return true;
   } catch (error) {
-    if (ok() && stillHere()) handleActionError(error, "Could not create the Space");
+    if (!ok()) return false;
+    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else if (stillHere()) handleActionError(error, "Could not create the Space");
     return false;
   } finally {
     if (ok()) creatingSpace.set(false);
