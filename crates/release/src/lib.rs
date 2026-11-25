@@ -24,6 +24,7 @@ pub mod error;
 #[cfg(any(feature = "blocking", feature = "async"))]
 pub mod fetch;
 pub mod images;
+pub mod installer_lock;
 pub mod manifest;
 pub mod policy;
 pub mod release;

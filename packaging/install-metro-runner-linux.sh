@@ -43,6 +43,9 @@ when there was none).
 
 Uninstall keeps your configuration (unless --purge-config), the workspace and
 the token file.
+To migrate an existing installation for managed updates, stop the runner
+and use this installer with update --migrate-update-lock. Only use current
+installer copies afterward; old configure and uninstall did not lock.
 Environment: METRO_RUNNER_INSTALL_DIR overrides the install directory
 (default: ${XDG_DATA_HOME:-~/.local/share}/metro-runner).
 EOF
@@ -71,8 +74,44 @@ lock_install() {
     exec 9<"$root"
     flock -n -x 9 || die "another install is running"
     [ ! -L "$root" ] && [ "$root" -ef /proc/self/fd/9 ] || die "the install directory changed"
+    compat_take
+}
+
+compat_retire() {
+    compat_tomb=$(mktemp -d -- "$root/.unlock.XXXXXX") || return 1
+    rmdir -- "$compat_tomb" || return 1
+    mv -nT -- "$root/.lock" "$compat_tomb" || return 1
+    [ -f "$compat_tomb/owner.metro-lock-v2" ] || return 1
+    rm -- "$compat_tomb/owner.metro-lock-v2" && rmdir -- "$compat_tomb"
+}
+
+compat_take() {
+    compat_owner=$root/.lock/owner.metro-lock-v2
     if [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; then
+        [ ! -L "$root/.lock" ] && [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
+            [ "$(ls -A -- "$root/.lock")" = owner.metro-lock-v2 ] &&
+            [ "$(stat -c '%s' -- "$compat_owner")" -le 128 ] &&
+            [ "$(wc -l <"$compat_owner")" -eq 1 ] &&
+            grep -Eq '^metro-lock-v2:[A-Za-z0-9._-]+$' "$compat_owner" &&
+            compat_retire || die "another install holds the legacy lock at $root/.lock"
+    fi
+    compat_new=$(mktemp -d -- "$root/.lock-new.XXXXXX")
+    compat_token=metro-lock-v2:${compat_new##*/}
+    printf '%s\n' "$compat_token" >"$compat_new/owner.metro-lock-v2"
+    mv -nT -- "$compat_new" "$root/.lock"
+    if [ -d "$compat_new" ]; then
+        rm -- "$compat_new/owner.metro-lock-v2"
+        rmdir -- "$compat_new"
         die "another install holds the legacy lock at $root/.lock"
+    fi
+    trap 'compat_release' EXIT
+}
+
+compat_release() {
+    if [ "$root" -ef /proc/self/fd/9 ] && [ ! -L "$root/.lock" ] &&
+        [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
+        [ "$(cat -- "$compat_owner")" = "$compat_token" ]; then
+        compat_retire || :
     fi
 }
 
@@ -84,7 +123,7 @@ no_pending_update() {
 
 action=${1:-}
 [ $# -gt 0 ] && shift
-archive='' sha='' checksum_file='' server_url='' workspace='' token_file='' purge=0 self_update=
+archive='' sha='' checksum_file='' server_url='' workspace='' token_file='' purge=0 self_update= migrate=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --archive) [ $# -ge 2 ] || die "--archive needs a file"; archive=$2; shift 2 ;;
@@ -94,6 +133,7 @@ while [ $# -gt 0 ]; do
         --workspace) [ $# -ge 2 ] || die "--workspace needs a directory"; workspace=$2; shift 2 ;;
         --token-file) [ $# -ge 2 ] || die "--token-file needs a file"; token_file=$2; shift 2 ;;
         --purge-config) purge=1; shift ;;
+        --migrate-update-lock) migrate=1; shift ;;
         --self-update)
             [ $# -ge 2 ] || die "--self-update needs on or off"
             case "$2" in on|off) self_update=$2 ;; *) die "--self-update must be on or off" ;; esac
@@ -102,6 +142,7 @@ while [ $# -gt 0 ]; do
         *) usage >&2; die "unknown option: $1" ;;
     esac
 done
+[ "$migrate" = 0 ] || [ "$action" = update ] || die "--migrate-update-lock requires update"
 
 # ---------------------------------------------------------------- archive checks
 sha_of() { sha256sum -- "$1" | cut -d' ' -f1; }
@@ -299,7 +340,7 @@ configure() {
     mkdir -p -- "$config_dir"
     chmod 700 -- "$config_dir"
     tmp=$(mktemp -- "$config_dir/.runner.env.XXXXXX")
-    trap 'rm -f -- "$tmp"' EXIT
+    trap 'rm -f -- "$tmp"; if [ -n "${compat_token:-}" ]; then compat_release; fi' EXIT
     {
         echo "# Metro runner settings (written by $PROG). The token itself is not stored here."
         printf 'METRO_SERVER_URL="%s"\n' "$server_url"
@@ -309,7 +350,6 @@ configure() {
     } >"$tmp"
     chmod 600 -- "$tmp"
     mv -f -- "$tmp" "$config"
-    trap - EXIT
     # An installed copy of an older script would refuse the new setting on
     # its next `run`: replace it with this one (never a newer copy).
     if [ -L "$root/current" ] && { [ ! -f "$root/$PROG.sh" ] ||
@@ -358,7 +398,7 @@ install_runner() {
     lock_install
     no_pending_update
     [ "$action" != update ] || [ -L "$root/current" ] || die "the runner is not installed in $root; use install"
-    if [ -n "$(ls -A -- "$root")" ] && [ ! -f "$root/$MARK" ]; then
+    if [ -n "$(ls -A -- "$root" | grep -vxF .lock || :)" ] && [ ! -f "$root/$MARK" ]; then
         die "$root exists but was not created by this installer; refusing to change it"
     fi
     stage=
@@ -369,6 +409,7 @@ install_runner() {
             mv -- "$old/$version" "$root/versions/$version"
         fi
         [ -z "$stage" ] || rm -rf -- "$stage"
+        compat_release
     fi' EXIT
     trap 'exit 130' INT TERM
     stage=$(mktemp -d -- "$root/.stage.XXXXXX")
@@ -411,6 +452,11 @@ install_runner() {
     [ -z "$old" ] || rm -rf -- "$old"
     # Keep a copy of this script beside the install for `run` and the unit.
     keep_script_copy
+    if [ "$migrate" = 1 ]; then
+        migration=$(mktemp -- "$root/.migrate.XXXXXX")
+        printf '%s\n' metro-update-lock-v2 >"$migration"
+        mv -fT -- "$migration" "$root/$MARK"
+    fi
     say "Metro runner $version is installed in $root/versions/$version"
     if [ -f "$config" ]; then
         say "Existing settings kept: $config"
@@ -502,7 +548,9 @@ uninstall_runner() {
     fi
     if [ -n "$locked" ]; then
         [ "$root" -ef /proc/self/fd/9 ] || die "the install directory changed"
-        rm -rf -- "$root"
+        retired=$(mktemp -d -- "${root%/*}/.metro-uninstall.XXXXXX")
+        mv -T -- "$root" "$retired/install"
+        rm -rf -- "$retired"
         say "Removed $root"
     fi
     say "Your workspace and token file were not changed. Revoke the runner's token in Metro if you no longer use it."

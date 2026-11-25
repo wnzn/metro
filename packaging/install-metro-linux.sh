@@ -34,6 +34,8 @@ Options for install/update:
                         your package manager (with sudo) for a fixed package
                         list, then check again
   --no-menu             do not add Metro to the applications menu
+  --migrate-update-lock enable managed updates using the current installer
+                        with update; close Metro first and retire old copies
 
 Environment: METRO_INSTALL_DIR overrides the install directory
 (default: ${XDG_DATA_HOME:-~/.local/share}/metro-desktop-app).
@@ -57,11 +59,12 @@ user_data=$config_home/metro-desktop
 # ---------------------------------------------------------------- arguments
 action=${1:-}
 [ $# -gt 0 ] && shift
-archive='' sha='' checksum_file='' local_runner='' install_deps=0 menu=1
+archive='' sha='' checksum_file='' local_runner='' install_deps=0 menu=1 migrate=0
 while [ $# -gt 0 ]; do
     case "$1" in
         --archive) [ $# -ge 2 ] || die "--archive needs a file"; archive=$2; shift 2 ;;
         --sha256) [ $# -ge 2 ] || die "--sha256 needs a value"; sha=$2; shift 2 ;;
+        --migrate-update-lock) migrate=1; shift ;;
         --checksum-file) [ $# -ge 2 ] || die "--checksum-file needs a file"; checksum_file=$2; shift 2 ;;
         --no-local-runner) local_runner=no; shift ;;
         --local-runner) local_runner=yes; shift ;;
@@ -71,6 +74,7 @@ while [ $# -gt 0 ]; do
         *) usage >&2; die "unknown option: $1" ;;
     esac
 done
+[ "$migrate" = 0 ] || [ "$action" = update ] || die "--migrate-update-lock requires update"
 
 # ---------------------------------------------------------------- checksums
 sha_of() { sha256sum -- "$1" | cut -d' ' -f1; }
@@ -257,9 +261,9 @@ try:
     if len(raw) > 65536:
         raise ValueError()
     j = json.loads(raw, object_pairs_hook=fields)
-    if not isinstance(j, dict) or j.keys() - {'version', 'id', 'from', 'to', 'phase', 'outcome', 'detail', 'local_db_snapshot', 'watchdog_pid', 'reported', 'started_at'}:
+    if not isinstance(j, dict) or j.keys() - {'version', 'id', 'from', 'to', 'phase', 'outcome', 'detail', 'local_db_snapshot', 'backup_manifest', 'watchdog_pid', 'reported', 'started_at'}:
         raise ValueError()
-    if type(j['version']) is not int or j['version'] != 1 or not re.fullmatch('[0-9a-f]{16}', j['id']):
+    if type(j['version']) is not int or j['version'] not in (1, 2) or not re.fullmatch('[0-9a-f]{16}', j['id']):
         raise ValueError()
     if version(j['from']) >= version(j['to']) or type(j['started_at']) is not int:
         raise ValueError()
@@ -271,19 +275,29 @@ try:
     if pid is not None and (type(pid) is not int or not 0 < pid < 2**32):
         raise ValueError()
     phase = j['phase']
+    if phase == 'backing_up' and j['version'] != 2:
+        raise ValueError()
+    manifest = j.get('backup_manifest')
+    if j['version'] == 2 and phase not in ('staged', 'backing_up'):
+        if not re.fullmatch('[0-9a-f]{64}', manifest):
+            raise ValueError()
+    elif manifest is not None:
+        raise ValueError()
     outcome = j.get('outcome')
-    if phase == 'staged' and (j.get('local_db_snapshot') or pid is not None):
+    if phase in ('staged', 'backing_up') and (j.get('local_db_snapshot') or pid is not None):
         raise ValueError()
     if phase == 'committed' and outcome == 'updated':
         expected = {j['to']}
     elif phase == 'failed' and outcome in ('rolled_back', 'not_confirmed', 'install_failed'):
         expected = {j['from']}
-    elif phase in ('staged', 'trial', 'committing', 'rolling_back') and outcome is None:
+    elif phase in ('staged', 'backing_up', 'trial', 'committing', 'rolling_back') and outcome is None:
         expected = {j['from'], j['to']} if phase in ('committing', 'rolling_back') else {j['from']}
     else:
         raise ValueError()
     if sys.argv[2] not in {'versions/' + v for v in expected}:
         raise ValueError()
+    if j['version'] == 2 and phase in ('committed', 'failed'):
+        phase = 'cleanup'
     print(phase + ' ' + j['to'])
 except (ValueError, KeyError, TypeError, OSError, RecursionError):
     sys.exit(1)
@@ -294,7 +308,7 @@ PY
     case "$phase" in
         staged) staged_version=$target ;;
         committed|failed) ;;
-        trial|committing|rolling_back)
+        backing_up|trial|committing|rolling_back|cleanup)
             die "Metro is in the middle of updating itself to $target. Let it finish, or close Metro and start it once to complete or undo the update, then run this again" ;;
         *) die "$root/$JOURNAL has an unknown in-app update state; start Metro once, then run this again" ;;
     esac
@@ -318,16 +332,54 @@ lock_install_root() {
     exec 9<"$root"
     flock -n -x 9 || die "another install is running (Metro may be preparing an in-app update right now)"
     owns_install_root || die "the install directory changed"
-    if [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; then lock_busy; fi
+    compat_take
 }
 
 owns_install_root() { [ ! -L "$root" ] && [ "$root" -ef /proc/self/fd/9 ]; }
+
+compat_retire() {
+    compat_tomb=$(mktemp -d -- "$root/.unlock.XXXXXX") || return 1
+    rmdir -- "$compat_tomb" || return 1
+    mv -nT -- "$root/.lock" "$compat_tomb" || return 1
+    [ -f "$compat_tomb/owner.metro-lock-v2" ] || return 1
+    rm -- "$compat_tomb/owner.metro-lock-v2" && rmdir -- "$compat_tomb"
+}
+
+compat_take() {
+    compat_owner=$root/.lock/owner.metro-lock-v2
+    if [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; then
+        [ ! -L "$root/.lock" ] && [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
+            [ "$(ls -A -- "$root/.lock")" = owner.metro-lock-v2 ] &&
+            [ "$(stat -c '%s' -- "$compat_owner")" -le 128 ] &&
+            [ "$(wc -l <"$compat_owner")" -eq 1 ] &&
+            grep -Eq '^metro-lock-v2:[A-Za-z0-9._-]+$' "$compat_owner" &&
+            compat_retire || lock_busy
+    fi
+    compat_new=$(mktemp -d -- "$root/.lock-new.XXXXXX")
+    compat_token=metro-lock-v2:${compat_new##*/}
+    printf '%s\n' "$compat_token" >"$compat_new/owner.metro-lock-v2"
+    mv -nT -- "$compat_new" "$root/.lock"
+    if [ -d "$compat_new" ]; then
+        rm -- "$compat_new/owner.metro-lock-v2"
+        rmdir -- "$compat_new"
+        lock_busy
+    fi
+    trap 'compat_release' EXIT
+}
+
+compat_release() {
+    if owns_install_root && [ ! -L "$root/.lock" ] &&
+        [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
+        [ "$(cat -- "$compat_owner")" = "$compat_token" ]; then
+        compat_retire || :
+    fi
+}
 
 # ---------------------------------------------------------------- install
 lock() {
     mkdir -p -m 700 -- "$root"
     lock_install_root
-    if [ -e "$root/current" ] || [ -n "$(ls -A -- "$root" 2>/dev/null)" ]; then
+    if [ -e "$root/current" ] || [ -n "$(ls -A -- "$root" | grep -vxF .lock || :)" ]; then
         [ -f "$root/$MARK" ] && [ ! -L "$root/$MARK" ] ||
             die "$root exists but was not created by this installer; refusing to change it"
     fi
@@ -338,12 +390,15 @@ lock() {
             mv -- "$old/$version" "$root/versions/$version"
         fi
         [ -z "$stage" ] || rm -rf -- "$stage"
+        compat_release
         if [ ! -L "$root/current" ] && [ -z "$old" ]; then
             rm -f -- "$root/$MARK"; rmdir -- "$root" 2>/dev/null || :
         fi
     fi' EXIT
     trap 'exit 130' INT TERM
-    printf 'Metro desktop per-user install (managed by %s). Your data is in %s.\n' "$PROG" "$user_data" >"$root/$MARK"
+    if [ ! -f "$root/$MARK" ]; then
+        printf 'Metro desktop per-user install (managed by %s). Your data is in %s.\n' "$PROG" "$user_data" >"$root/$MARK"
+    fi
 }
 
 install_app() {
@@ -420,6 +475,11 @@ install_app() {
     fi
     # Supersede the validated stage without discarding the previous working install.
     rm -f -- "$root/$JOURNAL"
+    if [ "$migrate" = 1 ]; then
+        migration=$(mktemp -- "$root/.migrate.XXXXXX")
+        printf '%s\n' metro-update-lock-v2 >"$migration"
+        mv -fT -- "$migration" "$root/$MARK"
+    fi
 
     if [ "$menu" = 1 ]; then
         if [ -x "$root/versions/$version/install-desktop" ]; then
@@ -450,7 +510,9 @@ uninstall_app() {
     if [ -x "$root/current/install-desktop" ]; then
         "$root/current/install-desktop" --uninstall >/dev/null || say "warning: could not remove the applications-menu entry"
     fi
-    rm -rf -- "$root"
+    retired=$(mktemp -d -- "${root%/*}/.metro-uninstall.XXXXXX")
+    mv -T -- "$root" "$retired/install"
+    rm -rf -- "$retired"
     say "Metro was removed from $root."
     say "Your Metro data was kept in $user_data (delete that folder yourself to remove it)."
 }

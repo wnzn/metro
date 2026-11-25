@@ -249,13 +249,54 @@ function Get-InstallLockPath {
     return Join-Path (Split-Path -Parent $rootPath) ('.' + (Split-Path -Leaf $rootPath) + '.install.lock')
 }
 
+function Get-LegacyLockToken([string] $Path) {
+    $dir = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+    if (-not $dir -or -not $dir.PSIsContainer -or $dir.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { return }
+    $entries = @(Get-ChildItem -LiteralPath $Path -Force)
+    if ($entries.Count -ne 1 -or $entries[0].Name -cne 'owner.metro-lock-v2' -or
+        $entries[0].PSIsContainer -or $entries[0].Length -gt 128 -or
+        $entries[0].Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) { return }
+    $raw = [IO.File]::ReadAllText($entries[0].FullName)
+    if ($raw -cmatch '\Ametro-lock-v2:[A-Za-z0-9._-]+\n\z') { return $raw }
+}
+
+function Move-LegacyLockAside([string] $Path) {
+    $retired = Join-Path $Root ('.unlock.' + [Guid]::NewGuid().ToString('N'))
+    [IO.Directory]::Move($Path, $retired)
+    Remove-Item -LiteralPath (Join-Path $retired 'owner.metro-lock-v2') -Force
+    [IO.Directory]::Delete($retired)
+}
+
+function Enter-LegacyLock {
+    $legacy = Join-Path $Root '.lock'
+    if (Get-Item -LiteralPath $legacy -Force -ErrorAction SilentlyContinue) {
+        if (-not (Get-LegacyLockToken $legacy)) { Fail (Get-LockBusyMessage $legacy) }
+        Move-LegacyLockAside $legacy
+    }
+    $name = '.lock-new.' + [Guid]::NewGuid().ToString('N')
+    $tmp = Join-Path $Root $name
+    $token = "metro-lock-v2:$name`n"
+    New-Item -ItemType Directory -Path $tmp | Out-Null
+    try {
+        [IO.File]::WriteAllText((Join-Path $tmp 'owner.metro-lock-v2'), $token)
+        # Directory.Move does not replace even an empty legacy lock.
+        [IO.Directory]::Move($tmp, $legacy)
+        $script:LegacyLockToken = $token
+    } finally {
+        if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Recurse -Force }
+    }
+}
+
+function Exit-LegacyLock {
+    $legacy = Join-Path $Root '.lock'
+    if ((Get-LegacyLockToken $legacy) -ceq $script:LegacyLockToken) { Move-LegacyLockAside $legacy }
+}
+
 function Enter-InstallLock {
     $item = Get-Item -LiteralPath $Root -Force
     if (-not $item.PSIsContainer -or $item.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint)) {
         Fail 'the install directory is not a plain directory'
     }
-    $legacy = Join-Path $Root '.lock'
-    if (Test-Path -LiteralPath $legacy) { Fail (Get-LockBusyMessage $legacy) }
     $path = Get-InstallLockPath
     $entry = Get-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
     if ($entry -and ($entry.PSIsContainer -or $entry.Attributes.HasFlag([IO.FileAttributes]::ReparsePoint))) { Fail 'the install lock is not a plain file' }
@@ -265,6 +306,7 @@ function Enter-InstallLock {
         # keeps this kernel lock on the same file until the last holder exits.
         $handle = [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::ReadWrite)
         $handle.Lock(0, 1)
+        Enter-LegacyLock
         return $handle
     } catch {
         if ($handle) { $handle.Dispose() }
@@ -301,7 +343,7 @@ function Install-Metro {
     $target = $null
     $old = $null
     try {
-        if ((Get-ChildItem -LiteralPath $Root -Force | Measure-Object).Count -gt 0 -and -not (Test-Path -LiteralPath (Join-Path $Root $Mark))) {
+        if ((Get-ChildItem -LiteralPath $Root -Force | Where-Object Name -ne '.lock' | Measure-Object).Count -gt 0 -and -not (Test-Path -LiteralPath (Join-Path $Root $Mark))) {
             Fail "$Root exists but was not created by this installer; refusing to change it"
         }
         if ($Action -eq 'Update' -and -not (Get-Current)) { Fail "Metro is not installed in $Root; use -Action Install" }
@@ -408,7 +450,7 @@ function Install-Metro {
             Move-Item -LiteralPath $old -Destination $target -ErrorAction SilentlyContinue
         }
         if (Test-Path -LiteralPath $stage) { Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue }
-        $lock.Dispose()
+        try { Exit-LegacyLock } finally { $lock.Dispose() }
         if ($Action -eq 'Verify') {
             Remove-Item -LiteralPath $Root -Recurse -Force -ErrorAction SilentlyContinue
             Remove-Item -LiteralPath (Get-InstallLockPath) -Force -ErrorAction SilentlyContinue
@@ -427,9 +469,11 @@ function Uninstall-Metro {
         $lnk = Get-ShortcutPath
         # Only this script's own shortcut; another installer's (such as the MSI's) stays.
         if (Test-OwnShortcut (Get-ShortcutTarget $lnk) $Root) { Remove-Item -LiteralPath $lnk -Force }
-        Remove-Item -LiteralPath $Root -Recurse -Force
         if (Test-Path -LiteralPath $UninstallKey) { Remove-Item -LiteralPath $UninstallKey -Recurse -Force }
-    } finally { $lock.Dispose() }
+        $retired = Join-Path (Split-Path -Parent $Root) ('.metro-uninstall.' + [Guid]::NewGuid().ToString('N'))
+        [IO.Directory]::Move($Root, $retired)
+        Remove-Item -LiteralPath $retired -Recurse -Force
+    } finally { try { Exit-LegacyLock } finally { $lock.Dispose() } }
     Say "Metro was removed. Your Metro data was kept in $UserData (delete that folder yourself to remove it)."
 }
 

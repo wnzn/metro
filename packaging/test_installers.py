@@ -12,6 +12,7 @@ import io
 import json
 import os
 from pathlib import Path
+import shlex
 import shutil
 import stat
 import subprocess
@@ -147,6 +148,34 @@ esac
     def calls(self):
         return self.log.read_text().splitlines()
 
+    def reciprocal_published_lock(self, modern, archive, marker):
+        # The fixture is the actual published script, not a lock mock.
+        name = modern.name
+        published = HERE / "test-fixtures" / name.replace(".sh", "-0.4.0.sh")
+        sums = (HERE.parent / "crates/release/tests/fixtures/v0.4.0/SHA256SUMS").read_text()
+        assert f"{sha(published.read_bytes())}  {name}" in sums.splitlines()
+        self.run(published, "install", "--archive", archive, check=True)
+        assert marker.read_text() != "metro-update-lock-v2\n"
+        tar = shlex.quote(str(self.tools / "tar"))
+        probe = self.root / "lock-probe"
+        hook = self.bin / "tar"
+        for holder, contender in [(published, modern), (modern, published)]:
+            nested = shlex.join(["/bin/sh", str(contender), "update", "--archive", str(archive)])
+            write_exec(hook, f"""#!/bin/sh
+if [ -z "${{METRO_LOCK_PROBING:-}}" ]; then
+    METRO_LOCK_PROBING=1 {nested} >{shlex.quote(str(probe))} 2>&1
+fi
+exec {tar} "$@"
+""")
+            self.run(holder, "update", "--archive", archive, check=True)
+            assert "another install" in probe.read_text(), probe.read_text()
+            assert not (marker.parent / ".lock").exists()
+        hook.unlink()
+        self.run(modern, "update", "--archive", archive, "--migrate-update-lock", check=True)
+        assert marker.read_text() == "metro-update-lock-v2\n"
+        self.run(published, "update", "--archive", archive, check=True)
+        assert marker.read_text() != "metro-update-lock-v2\n"
+
 
 class DesktopInstallerTests(unittest.TestCase):
     def setUp(self):
@@ -243,6 +272,24 @@ class DesktopInstallerTests(unittest.TestCase):
         self.assertEqual(os.readlink(self.app_root / "current"), "versions/0.3.1")
         self.assertFalse(journal.exists())
         self.assertFalse((self.app_root / "versions/0.3.2").exists())
+
+    def test_manual_installer_leaves_backup_cleanup_to_the_journal_owner(self):
+        self.box.run(DESKTOP, "install", "--archive", self.archive(), check=True)
+        journal = self.app_root / ".update.json"
+        b = self.archive("0.3.1")
+        record = {"version": 2, "id": "ab12" * 4, "from": "0.3.0", "to": "0.3.2", "started_at": 0}
+        for extra in ({"phase": "backing_up"},
+                      {"phase": "failed", "backup_manifest": "a" * 64, "outcome": "rolled_back"}):
+            text = json.dumps(record | extra)
+            journal.write_text(text)
+            for args in (("update", "--archive", b), ("uninstall",)):
+                result = self.box.run(DESKTOP, *args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("start it once", result.stderr)
+            self.assertEqual(journal.read_text(), text)
+
+    def test_published_desktop_installer_and_the_current_installer_exclude_each_other(self):
+        self.box.reciprocal_published_lock(DESKTOP, self.archive(), self.app_root / ".metro-desktop-install")
 
     def test_update_requires_install_and_old_archives_without_menu_script(self):
         # Like the early 0.2.0 candidates: no menu script, no local_runner capability.
@@ -389,6 +436,9 @@ class RunnerInstallerTests(unittest.TestCase):
     def configure(self, url="https://metro.example", **kw):
         return self.box.run(RUNNER, "configure", "--server-url", url, "--workspace", kw.get("ws", self.ws),
                             "--token-file", kw.get("token", self.token))
+
+    def test_published_runner_installer_and_the_current_installer_exclude_each_other(self):
+        self.box.reciprocal_published_lock(RUNNER, self.archive, self.install_root / ".metro-runner-install")
 
     def test_full_lifecycle_never_exposes_the_token(self):
         self.box.run(RUNNER, "install", "--archive", self.archive, check=True)
@@ -811,6 +861,66 @@ class PowerShellTests(unittest.TestCase):
             r = self.pwsh("-Command", f"$e=$null; [System.Management.Automation.Language.Parser]::ParseFile("
                                       f"'{script}', [ref]$null, [ref]$e) | Out-Null; if ($e) {{ $e; exit 1 }}")
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_published_windows_installer_and_current_installer_exclude_each_other(self):
+        published = HERE / "test-fixtures/install-metro-windows-0.4.0.ps1"
+        sums = (HERE.parent / "crates/release/tests/fixtures/v0.4.0/SHA256SUMS").read_text()
+        self.assertIn(f"{sha(published.read_bytes())}  {WINDOWS.name}", sums.splitlines())
+        with tempfile.TemporaryDirectory() as d:
+            dest = Path(d) / "install"
+            dest.mkdir()
+            (dest / ".metro-desktop-install").write_text("managed\n")
+            archive = Path(d) / "Metro-0.4.0-windows-x64.zip"
+            archive.write_bytes(b"not extracted")
+            harness = Path(d) / "hold.ps1"
+            # Run the unmodified Install-Metro body and its lock functions
+            # from each script; intercept prerequisite probes and stop at
+            # extraction, before any Windows-only install operations.
+            harness.write_text(r"""
+param($Installer, $Root, $Archive, $Contender)
+$ErrorActionPreference = 'Stop'
+$Action = 'Install'
+$Mark = '.metro-desktop-install'
+$Sha256 = (Get-FileHash -LiteralPath $Archive -Algorithm SHA256).Hash
+$Quiet = $true
+$UserData = Join-Path $Root 'unused'
+$tokens = $null
+$errors = $null
+$ast = [System.Management.Automation.Language.Parser]::ParseFile($Installer, [ref]$tokens, [ref]$errors)
+if ($errors) { throw 'could not parse installer' }
+$excluded = 'Test-Prerequisites', 'Get-MsiManagedMetro', 'Expand-Verified'
+foreach ($def in $ast.EndBlock.Statements) {
+    if ($def -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $def.Name -notin $excluded) {
+        . ([scriptblock]::Create($def.Extent.Text))
+    }
+}
+function Test-Prerequisites {}
+function Get-MsiManagedMetro {}
+function Expand-Verified {
+    if (-not $Contender) { throw 'contender got past the lock' }
+    $child = Join-Path $PSHOME 'pwsh'
+    $probe = & $child -NoProfile -NonInteractive -File $PSCommandPath $Contender $Root $Archive
+    if ($LASTEXITCODE -ne 0 -or $probe -notmatch 'another install is running') { throw "lock not honored: $probe" }
+    throw 'fixture stopped after verifying exclusion'
+}
+try {
+    Install-Metro
+    throw 'unexpected install result'
+} catch {
+    $message = $_.Exception.Message
+    if ($message -match 'another install is running|fixture stopped after verifying exclusion') {
+        Write-Output $message
+        exit 0
+    }
+    throw
+}
+""")
+            for holder, contender in ((published, WINDOWS), (WINDOWS, published)):
+                with self.subTest(holder=holder.name):
+                    result = self.pwsh("-File", harness, holder, dest, archive, contender)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn("fixture stopped after verifying exclusion", result.stdout)
+                    self.assertFalse((dest / ".lock").exists())
 
     def test_container_url_validation(self):
         missing = "/nonexistent/metro-token"  # a valid URL gets as far as the token file
