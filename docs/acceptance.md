@@ -152,19 +152,15 @@ review items.
   the integration at that commit, not the later feature cut or a final
   combined release matrix.
 - **Startup fixtures, `cf5fd97ff2f0a1ebe2d7fe1d73d78ddcdecfd379`.**
-  The startup handoff measured **70 ms to the authenticated Shell and
-  360 ms to first room text** for the saved remote path. The local
-  fixture measured **150/450 ms** for those same milestones. These are
-  offline NSH fixtures with controlled responses, compared with a
-  fixture baseline, not native app-launch or live network timings.
-  At this startup snapshot with the other conversation lanes merged in,
-  each steady remembered-room fixture made **12 server requests**,
+  With the conversation lanes merged into this startup snapshot, each
+  steady remembered-room fixture made **12 server requests**,
   not the 10 observed on the standalone startup lane. The empty-Chat
-  fixtures made 9 without an operator model and 8 with one. The
-  independent startup review checked focused regressions and request
-  assertions; it did not rerun the aggregate timings. The startup cut
-  is an ancestor of the guide's current feature cut; these measurements
-  were not rerun at the newer cut in the docs lane.
+  fixtures made 9 without an operator model and 8 with one. Independent
+  review checked focused regressions and request assertions. The
+  handoff reported Shell and first-room-text milestones in isolated
+  offline NSH fixtures, not native or live timings. Aggregate timing
+  figures are omitted pending a traceable measurement receipt. This
+  startup evidence isn't a measurement of `2cb1beb`.
 - **Docs cutoff, `2cb1bebf55f06a168161404c1496fd9f20442a93`.**
   The [source preview](next-source.md) was advanced after checking the
   merged Space settings, guarded runner and token routes, mentions and
@@ -180,8 +176,15 @@ limits. The docs describe the behavior at this cutoff, not the fixes
 under way. The admin browser fixture did not yield a usable result in
 that UX review.
 
+**Pre-UX desktop check at `2cb1beb`: 862/863 passed.** The offline full
+NSH run and an isolated rerun both failed the same stale selector in
+[`Activity.test.tsx`](../apps/desktop/src/features/activity/Activity.test.tsx):
+it expected the whole `@agent` question in one text node, but the
+renderer split the mention from the message text. This is not a
+passing desktop gate. Rerun the full suite after the UX fixes merge.
+
 **Final acceptance pending.** The backend receipt below is separate.
-Record the completed desktop gate, UX fixes and combined results
+Record the passing desktop gate, UX fixes and combined results
 against their exact commits after independent verification. Don't add
 interim totals to the final matrix, or change published instructions
 until publication is recorded.

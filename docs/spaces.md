@@ -193,7 +193,8 @@ inserts, **Esc** closes the list.
 
 ## Messages and addressing
 
-In the source, not released: [desktop mentions and Dispatch](next-source.md#mentions-in-rooms-and-threads),
+In the source, not released: [desktop mentions](next-source.md#mentions-in-rooms-and-threads),
+[recipient-safe Dispatch and exact-destination Follow up](next-source.md#recipient-safe-dispatch-and-exact-destination-follow-up),
 [private sender notices](next-source.md#private-sender-notices), and the
 [Space send protocol](next-source.md#space-send-protocol-client-developers).
 The following describes 0.4.0.
@@ -346,8 +347,9 @@ are in the source, not released.
   tools, and it can't read Space transcripts. Chat never uses a runner, not
   even your personal registered one, and Chat messages are never forwarded
   into a Space.
-- The cross-Space controls in Chat are for you, not the agent: you can list,
-  open, follow up on and stop runs (see [Runs](#runs)). In the desktop app,
+- The cross-Space controls in Chat are for you, not the agent. **Agent runs**
+  lists only Space runs, including threads; you can open, follow up on or
+  stop runs where permitted (see [Runs](#runs)). In the 0.4.0 desktop app,
   **New task** beside Chat's agent runs sends a task right away to the agent
   of a Space and a room or thread you pick explicitly. It shows the
   recipient (*To: agent in Acme › #lobby*) before **Send to agent**, and

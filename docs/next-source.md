@@ -78,6 +78,10 @@ draft. Every member gets these pages:
 | **Agents** | See the Space's agents, instructions and tools. Only the owner can edit them or change the default. |
 | **Your preferences** | Choose your own model and routing preferences, or enable classification for this Space with a usable System One connection. |
 
+**Test runner** posts the file listing as **Runner activity** in the
+open Space room. People who can read that room can see it; it isn't
+private to the person who opened Settings.
+
 ### Guarded runner changes
 
 On **Space settings → Runner**, assignment and online status are separate.
@@ -201,29 +205,38 @@ an agent request to explicit mentions. The per-Space classification
 preference still applies to unaddressed text. **Send** never adds an
 explicit agent beyond the draft's verified mentions.
 
-Sent mentions with verified ranges display as chips with current
-names and a stronger highlight for mentions of you. Open a chip for
-the person or agent card. Metro uses stored recipient IDs, not the
-display name as identity. Older messages without mention ranges can
-still show their recorded recipients; unknown or unavailable mentions
-don't gain a clickable identity.
+Sent mentions with verified ranges display as chips, using current
+names for people and named agents and a stronger highlight for
+mentions of you. Open a chip that identifies a current person or named
+agent to see their card. Generic `@agent` is not a specific identity
+and doesn't open a card. Metro uses stored recipient IDs, not display
+names, as identity. Older messages without mention ranges can still
+show their recorded recipients; unavailable mentions aren't clickable.
 
-**New task** and **Follow up** from Personal Chat's agent runs use the
-Dispatch form, not the room mention composer. They ask the generic agent
-in the selected Space room or thread. Text such as `@name` in the form
-doesn't add recipients. **Follow up** verifies the run's exact
-destination; if it is no longer available, choose another yourself.
-The form keeps unsent text when the destination changes. Check the
-**To:** line before pressing **Send to agent**.
+## Recipient-safe Dispatch and exact-destination Follow up
+
+Personal Chat's **Agent runs** panel lists runs in Spaces you belong
+to, including threads, not runs in Personal Chat itself. The Dispatch
+form (**New task** and **Follow up**) already exists in 0.4.0. The
+changes here are how it addresses a task and verifies its destination:
+
+- **New task** and **Follow up** ask the generic agent in the selected
+  Space room or thread. Dispatch is not a mention composer: text such
+  as `@name` doesn't add recipients.
+- **Follow up** checks the run's exact room or thread. If it can't
+  verify that destination, it doesn't silently substitute a different
+  one. Choose another yourself. The form keeps unsent text when the
+  destination changes, so check the **To:** line before pressing
+  **Send to agent**.
 
 ## Private sender notices
 
 After a message appears, its sender may see **Only you see this** on
-that message. This can explain a failed addressing decision in a
-Space or a failed model choice or routing decision for a turn. For
-unaddressed Space text that the classifier couldn't process, no agent
-starts; **Ask agent** prepares a generic mention in an empty draft or
-focuses the existing draft. It doesn't resend anything. A failed generic
+that message. It can carry an addressing notice, a routing or model
+notice, or both on the same message. For unaddressed Space text that
+the classifier couldn't process, no agent starts. **Ask agent** prepares
+a generic mention in an empty draft or focuses the existing draft. It
+doesn't resend anything. A failed generic
 `@agent` choice still has a public room error and doesn't cancel
 separately named agents. A Space routing notice describes one refused
 turn; it doesn't mean every agent named in the message failed.
@@ -267,11 +280,11 @@ Legacy clients can omit both fields. Modern sends can return an empty
 `spans` array to distinguish “no verified ranges” from a legacy event
 with no `spans` field.
 
-Successful Space message POSTs can return sender-only `addressing_note`
-(`classification_failed` or `generic_agent_unavailable`) or
-`routing_note` (`routing_failed` or `model_unavailable`) alongside the
-posted event. Handle these as
-response metadata, not as fields of a polled event. If an older server
+Successful Space message POSTs can return either or both sender-only
+fields alongside the posted event: `addressing_note`
+(`classification_failed` or `generic_agent_unavailable`) and
+`routing_note` (`routing_failed` or `model_unavailable`). Handle these
+as response metadata, not as fields of a polled event. If an older server
 rejects safe addressing, use matching prebuilt client and server files
 when available. If a reply was lost, check the room before resending.
 

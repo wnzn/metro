@@ -104,7 +104,9 @@ The rules below describe the current source. For behaviour added after
   token from an unconfirmed or superseded assignment. Rotation
   invalidates claimed work under the old credential and can preserve
   waiting work for the same runner; removing or replacing an assignment
-  drops old work rather than transferring it.
+  drops old work rather than transferring it. **Test runner** posts its
+  listing as Runner activity in the open Space room, not privately in
+  Settings, and never calls a model.
 - A registered runner never runs check or MCP commands as unsandboxed host
   processes, because they could read sibling Spaces' roots. By default it
   offers only list and read. Check and MCP need `METRO_SANDBOX=docker`, which
@@ -195,8 +197,10 @@ The rules below describe the current source. For behaviour added after
   text ranges. Never silently retarget an ambiguous, changed or stale
   mention; keep the original draft when send is refused. Dispatch from
   Chat is an explicit generic request to the verified room or thread,
-  with no implicit recipients from its text. Don't fall back to legacy
-  text inference on a server refusal.
+  with no implicit recipients from its text. Follow up checks the exact
+  destination and doesn't silently change it. Generic `@agent` isn't an
+  identity card. Don't fall back to legacy text inference on a server
+  refusal.
 - **Opt-in classification** decides only which agent, if any, an outgoing
   message is for. A person turns it on for their own messages **per
   Space**, only while they have a System One connection usable in that
@@ -213,10 +217,11 @@ The rules below describe the current source. For behaviour added after
   messages to a named agent or other people's messages. With it off, which
   is the default, unaddressed text is ordinary conversation.
 - Sender-only notice details are POST metadata, never a polled event,
-  search result or model history. Bind them to the originating
-  authenticated sender, destination and matching transcript row. Don't
-  replay them after dismissal, session reset or access loss, or expose
-  private model details in a shared room. Direct Personal Chat failures
+  search result or model history. Either or both fields may be present.
+  Bind them to the originating authenticated sender, destination and
+  matching transcript row. Don't replay them after dismissal, session
+  reset or access loss, or expose private model details in a shared
+  room. Direct Personal Chat failures
   in this server appear in the private Chat, not as addressing notices.
 - **Personal Chat is direct.** Send starts the Chat agent, including for
   attachment-only messages. No addressing classifier or marker is needed.
