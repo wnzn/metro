@@ -130,8 +130,9 @@ fn windows_alias(part: &str) -> bool {
 /// Create the folders of `rel` under `dest` one by one, never following a
 /// link (refusing anything that isn't a plain folder we can see).
 #[cfg(not(unix))]
-fn make_parents(dest: &Path, rel: &str) -> Result<PathBuf, Error> {
+fn make_parents(dest: &Path, rel: &str) -> Result<(PathBuf, Vec<File>), Error> {
     let mut path = dest.to_path_buf();
+    let mut pinned = Vec::new();
     let parts: Vec<&str> = rel.split('/').collect();
     for part in &parts[..parts.len() - 1] {
         path.push(part);
@@ -143,9 +144,12 @@ fn make_parents(dest: &Path, rel: &str) -> Result<PathBuf, Error> {
             }
             Err(e) => return Err(io_error("creating a folder", e)),
         }
+        pinned.push(
+            open_plain_windows_dir(&path).map_err(|e| io_error("opening an entry's folder", e))?,
+        );
     }
     path.push(parts[parts.len() - 1]);
-    Ok(path)
+    Ok((path, pinned))
 }
 
 #[cfg(not(unix))]
@@ -158,6 +162,39 @@ fn plain_dir(m: &fs::Metadata) -> bool {
         }
     }
     m.is_dir() && !m.file_type().is_symlink()
+}
+
+#[cfg(windows)]
+fn open_plain_windows_dir(path: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    let dir = OpenOptions::new()
+        .read(true)
+        // Deny rename/delete, open the directory itself, not a junction.
+        .share_mode(3)
+        .custom_flags(0x0200_0000 | 0x0020_0000)
+        .open(path)?;
+    if !plain_dir(&dir.metadata()?) {
+        return Err(io::ErrorKind::InvalidData.into());
+    }
+    Ok(dir)
+}
+
+/// Pin each directory in a Windows path without following reparse points.
+/// Keep these handles alive while passing a name below the path to an API
+/// (such as CreateProcess or Windows Installer) that opens it itself.
+#[cfg(windows)]
+pub fn pin_windows_dirs(path: &Path) -> io::Result<Vec<File>> {
+    let mut prefix = PathBuf::new();
+    let mut pinned = Vec::new();
+    for part in path.components() {
+        prefix.push(part);
+        match part {
+            std::path::Component::Normal(_) => pinned.push(open_plain_windows_dir(&prefix)?),
+            std::path::Component::ParentDir => return Err(io::ErrorKind::InvalidInput.into()),
+            _ => {}
+        }
+    }
+    Ok(pinned)
 }
 
 /// A new, exclusively created archive entry. Flushing makes it durable.
@@ -176,6 +213,8 @@ struct StageDir {
     path: PathBuf,
     #[cfg(unix)]
     dir: File,
+    #[cfg(windows)]
+    _pinned: Vec<File>,
 }
 
 impl StageDir {
@@ -185,7 +224,9 @@ impl StageDir {
         let dir = crate::unix_fs::open_dir(path).map_err(io)?;
         #[cfg(unix)]
         let empty = crate::unix_fs::empty(&dir).map_err(io)?;
-        #[cfg(not(unix))]
+        #[cfg(windows)]
+        let pinned = pin_windows_dirs(path).map_err(io)?;
+        #[cfg(windows)]
         let empty = plain_dir(&fs::symlink_metadata(path).map_err(io)?)
             && fs::read_dir(path).map_err(io)?.next().is_none();
         require(
@@ -197,6 +238,8 @@ impl StageDir {
             path: path.to_path_buf(),
             #[cfg(unix)]
             dir,
+            #[cfg(windows)]
+            _pinned: pinned,
         })
     }
 
@@ -230,10 +273,8 @@ impl StageDir {
         #[cfg(not(unix))]
         let file = {
             let _ = executable;
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(make_parents(&self.path, rel)?)
+            let (path, _pinned) = make_parents(&self.path, rel)?;
+            OpenOptions::new().write(true).create_new(true).open(path)
         };
         file.map(NewFile).map_err(|e| {
             if e.kind() == io::ErrorKind::AlreadyExists {
@@ -838,6 +879,11 @@ impl<R: Read> HashingReader<R> {
 
     /// Read to the end (bounded) and return the digest of everything read.
     pub fn finish(mut self) -> Result<[u8; 32], Error> {
+        require(
+            self.total <= MAX_ARCHIVE,
+            ErrorCode::TooLarge,
+            "archive is too large",
+        )?;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             let n = self
@@ -944,8 +990,11 @@ pub fn verify_tree(
         let root = crate::unix_fs::open_dir(root).map_err(|_| changed_tree())?;
         walk_at(&root, "", &mut seen, &mut 0, &mut 0)?;
     }
-    #[cfg(not(unix))]
-    walk(root, root, &mut seen)?;
+    #[cfg(windows)]
+    {
+        let _pinned = pin_windows_dirs(root).map_err(|_| changed_tree())?;
+        walk(root, root, &mut seen)?;
+    }
     for (rel, (digest, len)) in &seen {
         if rel == RELEASE_JSON {
             require(
@@ -1048,7 +1097,7 @@ fn walk_at(
     Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, ([u8; 32], u64)>) -> Result<(), Error> {
     if !plain_dir(&fs::symlink_metadata(dir).map_err(|_| changed_tree())?) {
         return Err(changed_tree());
@@ -1076,6 +1125,7 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, ([u8; 32], u64)>) ->
                 "the staged tree contains a link",
             ));
         } else if meta.is_dir() {
+            let _dir = open_plain_windows_dir(&path).map_err(|_| changed_tree())?;
             walk(root, &path, out)?;
         } else if meta.is_file() {
             let rel = path
@@ -1085,7 +1135,18 @@ fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, ([u8; 32], u64)>) ->
                 .map(|c| c.as_os_str().to_string_lossy().into_owned())
                 .collect::<Vec<_>>()
                 .join("/");
-            out.insert(rel, (sha256_file(&path)?, meta.len()));
+            use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+            let file = OpenOptions::new()
+                .read(true)
+                .share_mode(1)
+                .custom_flags(0x0020_0000)
+                .open(&path)
+                .map_err(|_| changed_tree())?;
+            let m = file.metadata().map_err(|_| changed_tree())?;
+            if !m.is_file() || m.file_attributes() & 0x400 != 0 {
+                return Err(changed_tree());
+            }
+            out.insert(rel, (HashingReader::new(file).finish()?, m.len()));
         } else {
             return Err(Error::new(
                 ErrorCode::NotVerified,

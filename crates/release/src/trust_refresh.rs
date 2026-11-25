@@ -280,6 +280,8 @@ struct CacheDir {
     handle: File,
     #[cfg(not(unix))]
     path: PathBuf,
+    #[cfg(windows)]
+    _pinned: Vec<File>,
 }
 
 impl CacheDir {
@@ -294,25 +296,26 @@ impl CacheDir {
 
     #[cfg(not(unix))]
     fn root(path: &Path, create: bool) -> io::Result<Self> {
-        use std::path::Component;
-        let mut prefix = PathBuf::new();
-        for part in path.components() {
-            prefix.push(part);
-            if matches!(part, Component::Normal(_)) {
-                if prefix == path && create {
-                    match std::fs::create_dir(&prefix) {
-                        Ok(()) => {}
-                        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-                        Err(e) => return Err(e),
-                    }
-                }
-                validate(&std::fs::symlink_metadata(&prefix)?, true)?;
-            } else if matches!(part, Component::ParentDir) {
-                return Err(invalid("invalid trust cache path"));
+        let parent = path
+            .parent()
+            .ok_or_else(|| invalid("invalid trust cache path"))?;
+        let _parent = crate::archive::pin_windows_dirs(parent)?;
+        if create {
+            match std::fs::create_dir(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(e) => return Err(e),
             }
         }
+        let pinned = crate::archive::pin_windows_dirs(path)?;
+        win::check_private(
+            pinned
+                .last()
+                .ok_or_else(|| invalid("invalid trust cache path"))?,
+        )?;
         Ok(Self {
             path: path.to_path_buf(),
+            _pinned: pinned,
         })
     }
 
@@ -355,11 +358,15 @@ impl CacheDir {
             #[cfg(windows)]
             {
                 use std::os::windows::fs::OpenOptionsExt;
-                options.custom_flags(0x0020_0000); // FILE_FLAG_OPEN_REPARSE_POINT
+                options
+                    .custom_flags(0x0020_0000)
+                    .share_mode(if lock { 3 } else { 1 });
             }
             options.open(self.path.join(name))?
         };
         validate(&file.metadata()?, false)?;
+        #[cfg(windows)]
+        win::check_private(&file)?;
         Ok(file)
     }
 
@@ -413,6 +420,80 @@ fn validate(m: &Metadata, dir: bool) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(windows)]
+mod win {
+    use std::fs::File;
+    use std::io;
+    use std::os::windows::io::AsRawHandle;
+    use std::ptr::{addr_of, null_mut};
+
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, LocalFree};
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_FILE_OBJECT};
+    use windows_sys::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, DACL_SECURITY_INFORMATION, EqualSid, GetAce,
+        GetTokenInformation, IsWellKnownSid, OWNER_SECURITY_INFORMATION, TOKEN_QUERY, TOKEN_USER,
+        TokenUser, WinLocalSystemSid,
+    };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+    pub fn check_private(file: &File) -> io::Result<()> {
+        let unsafe_acl = || super::invalid("trust cache is not private to this Windows account");
+        // SAFETY: the access token and descriptor are system allocations
+        // with checked returns. Owner/ACL/ACE pointers live in the descriptor;
+        // the token-user SID lives in the aligned buffer.
+        unsafe {
+            let mut token: HANDLE = null_mut();
+            if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut len = 0;
+            GetTokenInformation(token, TokenUser, null_mut(), 0, &mut len);
+            let mut buf = vec![0u64; (len as usize).div_ceil(8).max(1)];
+            let ok = GetTokenInformation(token, TokenUser, buf.as_mut_ptr().cast(), len, &mut len);
+            CloseHandle(token);
+            if ok == 0 {
+                return Err(unsafe_acl());
+            }
+            let user = (*buf.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+            let (mut owner, mut dacl, mut descriptor) = (null_mut(), null_mut(), null_mut());
+            let rc = GetSecurityInfo(
+                file.as_raw_handle().cast(),
+                SE_FILE_OBJECT,
+                DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                null_mut(),
+                &mut dacl,
+                null_mut(),
+                &mut descriptor,
+            );
+            if rc != 0 {
+                return Err(io::Error::from_raw_os_error(rc as i32));
+            }
+            let accepted = !dacl.is_null()
+                && !owner.is_null()
+                && EqualSid(owner, user) != 0
+                && (0..u32::from((*dacl).AceCount)).all(|index| {
+                    let mut ace = null_mut();
+                    if GetAce(dacl, index, &mut ace) == 0 || ace.is_null() {
+                        return false;
+                    }
+                    let header = &*ace.cast::<ACE_HEADER>();
+                    match header.AceType {
+                        0 if usize::from(header.AceSize) >= size_of::<ACCESS_ALLOWED_ACE>() => {
+                            let allowed = ace.cast::<ACCESS_ALLOWED_ACE>();
+                            let sid = addr_of!((*allowed).SidStart).cast_mut().cast();
+                            EqualSid(sid, user) != 0 || IsWellKnownSid(sid, WinLocalSystemSid) != 0
+                        }
+                        1 => true, // deny-only ACE cannot widen access
+                        _ => false,
+                    }
+                });
+            LocalFree(descriptor);
+            if accepted { Ok(()) } else { Err(unsafe_acl()) }
+        }
+    }
 }
 
 struct CacheStore {

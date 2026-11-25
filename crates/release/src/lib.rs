@@ -125,8 +125,7 @@ pub fn write_atomic(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()>
         f.write_all(bytes)?;
         f.sync_all()?;
         drop(f);
-        std::fs::rename(&tmp, path)?;
-        sync_parent(path)
+        rename_durable(&tmp, path)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&tmp);
@@ -146,6 +145,48 @@ fn atomic_temp_name(name: &str) -> String {
 
 #[cfg(unix)]
 mod unix_fs;
+
+/// Same-filesystem rename, with metadata made durable before returning.
+pub fn rename_durable(from: &std::path::Path, to: &std::path::Path) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::io;
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW,
+        };
+        let wide = |path: &std::path::Path| -> io::Result<Vec<u16>> {
+            let mut encoded: Vec<u16> = path.as_os_str().encode_wide().collect();
+            if encoded.contains(&0) {
+                return Err(io::ErrorKind::InvalidInput.into());
+            }
+            encoded.push(0);
+            Ok(encoded)
+        };
+        let (from, to) = (wide(from)?, wide(to)?);
+        // SAFETY: both paths are NUL-terminated UTF-16; no cross-volume copy.
+        if unsafe {
+            MoveFileExW(
+                from.as_ptr(),
+                to.as_ptr(),
+                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::fs::rename(from, to)?;
+        sync_parent(to)?;
+        if from.parent() != to.parent() {
+            sync_parent(from)?;
+        }
+        Ok(())
+    }
+}
 
 /// fsync a path's parent folder (Unix; Windows has no folder handles to sync).
 pub fn sync_parent(path: &std::path::Path) -> std::io::Result<()> {

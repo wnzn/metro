@@ -48,6 +48,9 @@ reqwest = { version = "0.13", default-features = false, features = ["rustls"], o
 libc = "0.2.180"
 rustix = { version = "1.1.6", features = ["fs"] }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
 [dev-dependencies]
 metro-release = { path = ".", features = ["testing", "blocking", "async"] }
 tokio = { version = "1.53.1", features = ["rt", "macros", "time"] }

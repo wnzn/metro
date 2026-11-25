@@ -107,6 +107,7 @@ mod tests {
 
     fn release(v: &str) -> VerifiedRelease {
         VerifiedRelease {
+            evidence: Default::default(),
             version: Version::parse(v).unwrap(),
             commit: "a".repeat(40),
             signed_at: 0,

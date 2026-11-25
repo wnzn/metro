@@ -32,11 +32,27 @@ pub trait ReleaseVerifier: Send + Sync {
 /// A release whose `SHA256SUMS` verified.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VerifiedRelease {
+    /// The exact signed manifest and bundle that authenticated this release.
+    pub evidence: Evidence,
     pub version: Version,
     pub commit: String,
     pub signed_at: i64,
     pub files: BTreeMap<String, [u8; 32]>,
     pub msi: String,
+}
+
+/// Persisted evidence is untrusted until verified against a release verifier.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Evidence {
+    pub manifest: Vec<u8>,
+    pub bundle: Vec<u8>,
+}
+
+impl Evidence {
+    pub fn verify(&self, verifier: &dyn ReleaseVerifier) -> Result<VerifiedRelease, Error> {
+        verify_manifest(verifier, &self.manifest, &self.bundle)
+    }
 }
 
 impl VerifiedRelease {
@@ -101,6 +117,11 @@ pub fn verify_manifest(
         ErrorCode::TooLarge,
         "SHA256SUMS is too large",
     )?;
+    require(
+        bundle_json.len() <= crate::MAX_BUNDLE,
+        ErrorCode::TooLarge,
+        "release bundle is too large",
+    )?;
     let facts = verifier.verify(Signed::Bytes(manifest_bytes), bundle_json)?;
     let Manifest {
         version,
@@ -108,6 +129,10 @@ pub fn verify_manifest(
         msi,
     } = manifest::parse(manifest_bytes)?;
     Ok(VerifiedRelease {
+        evidence: Evidence {
+            manifest: manifest_bytes.to_vec(),
+            bundle: bundle_json.to_vec(),
+        },
         version,
         commit: facts.commit,
         signed_at: facts.signed_at,
