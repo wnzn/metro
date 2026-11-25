@@ -196,6 +196,7 @@ test("Schedule consent sends the exact displayed version and revision, never ret
   expect(text(app)).toContain("Acme › Renamed room");
   expect(app.shows("id:page-action-confirm >> text:/covers every agent and schedule button on this page version/")).toBe(true);
   expect(app.shows("id:page-action-confirm >> text:/Only this action runs now. The other buttons still need a click/")).toBe(true);
+  expect(app.shows("id:page-action-confirm >> text:/Permission and schedule checks still apply/")).toBe(true);
   expect(f.state.started).toBe(0);
   await app.press("id:page-action-confirm >> label:Cancel");
   await app.waitFor("id:page-action-confirm", { state: "gone" });

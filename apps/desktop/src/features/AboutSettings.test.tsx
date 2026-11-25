@@ -92,6 +92,7 @@ test("About Privacy distinguishes web device, provider, server activity, and mod
   for (const phrase of [
     "your most recently seen online web device on this server",
     "Each contacted provider sees the device's connecting IP address",
+    "your query or page URLs and options like search keywords or page focus",
     "never uploaded to the Metro server",
     "People who can read a Space room can see its activity",
     "for this run only",

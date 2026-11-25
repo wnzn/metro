@@ -431,8 +431,8 @@ test("in the narrowest window routing consent, Save and the runner controls stay
   expect(app.enabled("id:routing-save")).toBe(true);
   expect(app.shows("id:dataflow-addressing >> text:/This never applies to personal Chat/")).toBe(true);
   await app.press("id:routing-revert");
-  expect(app.shows("id:dataflow-websearch >> text:/your most recently seen online web device on this server, not the model's device/")).toBe(true);
-  expect(app.shows("id:dataflow-websearch >> text:/Contacted providers may receive queries or page URLs/")).toBe(true);
+  expect(app.shows("id:dataflow-websearch >> text:/your most recently seen online web device on this server, regardless of the model connection/")).toBe(true);
+  expect(app.shows("id:dataflow-websearch >> text:/Contacted providers may receive queries, page URLs and options like keywords or page focus/")).toBe(true);
   await app.press("id:dataflow-websearch >> label:Open Web search");
   await app.waitFor("id:websearch-settings");
   await settings(app, "runners");

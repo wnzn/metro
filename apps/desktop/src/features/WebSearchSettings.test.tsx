@@ -226,7 +226,7 @@ test("Web search describes device selection and privacy with no disclosure requi
   expect(text(app)).toContain("This switch and these provider settings apply only to this computer.");
   expect(text(app)).toContain("For runs you start, Metro selects your most recently seen online web device on this server for each permitted search or page read.");
   expect(text(app)).toContain("If none of your web devices is online");
-  expect(text(app)).toContain("After setup, it may receive your query or page URLs.");
+  expect(text(app)).toContain("After setup, it may receive your query or page URLs and options like search keywords or page focus.");
   expect(text(app)).toContain("Web keys are stored on the device and never uploaded to the Metro server.");
   expect(text(app)).toContain("The Metro server relays requests and limited results.");
   expect(text(app)).toContain("Activity records accepted queries, URLs and options, plus summaries and provider outcomes.");
