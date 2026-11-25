@@ -5,6 +5,7 @@
 import { discoveryApi } from "./discovery";
 import { libraryApi } from "./library";
 import { monitoringApi } from "./monitoring";
+import { pagesApi } from "./pages";
 import { profileApi } from "./profile";
 import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
@@ -321,7 +322,7 @@ export type ApiErrorKind =
 export class ApiError extends Error {
   readonly kind: ApiErrorKind;
   readonly status: number | null;
-  constructor(kind: ApiErrorKind, message: string, status: number | null = null) {
+  constructor(kind: ApiErrorKind, message: string, status: number | null = null, readonly details?: unknown) {
     super(message);
     this.name = "ApiError";
     this.kind = kind;
@@ -386,7 +387,7 @@ export function createClient(options: ClientOptions) {
       options.signal?.removeEventListener("abort", onOuterAbort);
     }
 
-    await checkStatus(response, method, path);
+    await checkStatus(response, method, path, path.startsWith("/v1/pages"));
     const text = await response.text();
     if (!text.trim()) return null;
     try {
@@ -475,6 +476,7 @@ export function createClient(options: ClientOptions) {
     ...discoveryApi(request),
     // Documents & media (src/api/library.ts): JSON on `request`, bytes on `binary`.
     ...libraryApi(request, binary),
+    ...pagesApi(request),
     // Profiles (src/api/profile.ts): JSON on `request`, pictures on `binary`.
     ...profileApi(request, binary),
     // A Space's settings, agents and the person's own preferences there (src/api/spaces.ts).
@@ -1210,7 +1212,7 @@ function isEvent(v: unknown): v is RoomEvent {
 }
 
 /** Maps a non-2xx response to its ApiError (the body read only for a short server message). */
-async function checkStatus(response: Response, method: string, path: string): Promise<void> {
+async function checkStatus(response: Response, method: string, path: string, pageDetails = false): Promise<void> {
   if (response.status === 401) {
     throw new ApiError("auth", "The server rejected the access token (HTTP 401). Check the token and connect again.", 401);
   }
@@ -1219,6 +1221,13 @@ async function checkStatus(response: Response, method: string, path: string): Pr
     throw new ApiError("forbidden", `You don't have access to that (HTTP 403)${detail ? `: ${detail}` : ""}.`, 403);
   }
   if (!response.ok) {
+    // Only Pages needs structured error bodies (diagnostics, conflicts and
+    // action challenges). Do not turn any of those fields into error text.
+    if (pageDetails && [409, 422, 428].includes(response.status)) {
+      const details: unknown = await response.json().catch(() => undefined);
+      const error = isObject(details) && typeof details.error === "string" ? details.error.slice(0, 200) : "";
+      throw new ApiError("http", error || `${method} ${path} failed with HTTP ${response.status}`, response.status, details);
+    }
     const detail = await safeSnippet(response);
     throw new ApiError(
       response.status === 404 ? "not_found" : "http",
