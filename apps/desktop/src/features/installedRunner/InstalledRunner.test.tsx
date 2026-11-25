@@ -237,6 +237,32 @@ test("shows the installer's runner, read-only tools and how to attach; opening o
   }
 });
 
+test("an accepted membership omission purges only the lost Space's cached folder", async () => {
+  const f = world();
+  const mine = f.addRunner("This PC", "personal", "alice");
+  f.addSpace("target", "Target", "alice");
+  f.addSpace("sibling", "Sibling", "alice");
+  f.state.attached.set("target", mine.id);
+  f.state.attached.set("sibling", mine.id);
+  const t = bridgeWithRunner(f, mine.id, "This PC");
+  const app = await openWith(f, t, true);
+  await signInToRunners(app, "alice");
+  for (const sid of ["target", "sibling"]) {
+    await app.waitFor(`id:installed-runner-folder:${sid}`);
+    await app.press(`id:installed-runner-folder:${sid}`);
+    await app.waitFor(`id:installed-runner-path:${sid}`);
+  }
+
+  // The folder scan already completed; there is no new runner read to
+  // clear this row. Its membership removal must purge the cached path.
+  f.state.spaces.get("target")!.members.delete("alice");
+  await app.clock!.runFor(12_000);
+  await app.waitFor("id:space:target", { state: "gone" });
+  expect(app.shows("id:installed-runner-space:target")).toBe(false);
+  expect(app.shows("id:installed-runner-path:target")).toBe(false);
+  expect(app.shows("id:installed-runner-path:sibling")).toBe(true);
+});
+
 test("reconnect is offered only when allowed, explains itself, and posts only after confirming", async () => {
   const f = world();
   const mine = f.addRunner("This PC", "personal", "alice");

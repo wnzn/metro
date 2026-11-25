@@ -1,7 +1,7 @@
 import { batch, signal } from "nsh";
 import { ApiError } from "./api/client";
 import type { SpaceRunner } from "./api/client";
-import { beginRunnerAccessRead, nextAccessRequest, onSessionEnd, setRunnerPaired } from "./store";
+import { beginRunnerAccessRead, nextAccessRequest, onSessionEnd, onSpacePurged, setRunnerPaired } from "./store";
 import { clearSpaceRunnerOrder, hasNewerSpaceRunnerStamp, isSpaceRunnerStampCurrent, recordSpaceRunnerStamp, spaceRunnerExactPending } from "./spaceRunnerOrder";
 
 /** Missing means not observed; null is an observed empty assignment. */
@@ -32,16 +32,24 @@ export function forgetDisprovedSpaceRunner(sid: string, previous: SpaceRunner | 
   hideSpaceRunner(sid, nextAccessRequest());
 }
 
-function hideSpaceRunner(sid: string, stamp: number) {
+function forgetSpaceRunner(sid: string) {
   const all = spaceRunners();
-  const next = { ...all };
-  delete next[sid];
+  if (Object.prototype.hasOwnProperty.call(all, sid)) {
+    const next = { ...all };
+    delete next[sid];
+    spaceRunners.set(next);
+  }
+  for (const listener of listeners) listener(sid, null, false);
+}
+
+onSpacePurged(forgetSpaceRunner);
+
+function hideSpaceRunner(sid: string, stamp: number) {
   batch(() => {
     recordSpaceRunnerStamp(sid, stamp, true);
-    spaceRunners.set(next);
     setRunnerPaired(sid, null);
     // Hide a stale folder, but don't claim the Space is now empty or attachable.
-    for (const listener of listeners) listener(sid, null, false);
+    forgetSpaceRunner(sid);
   });
 }
 

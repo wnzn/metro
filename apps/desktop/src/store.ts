@@ -401,6 +401,7 @@ function observeChatAvailability(request: number, problem: string | null) {
 // here instead of this module importing them.
 const transientClearers: (() => void)[] = [];
 const sessionEnders: (() => void)[] = [];
+const spacePurgers: ((spaceId: string) => void)[] = [];
 const manageOpeners: ((spaceId: string, section: "members" | "runner") => void)[] = [];
 /** Called whenever the place, Space, room or view changes: drop anything shown once. */
 export function onTransientClear(fn: () => void) {
@@ -409,6 +410,9 @@ export function onTransientClear(fn: () => void) {
 /** Called when the session ends (disconnect, 401): drop everything of the session. */
 export function onSessionEnd(fn: () => void) {
   sessionEnders.push(fn);
+}
+export function onSpacePurged(fn: (spaceId: string) => void) {
+  spacePurgers.push(fn);
 }
 const sessionStarters: ((session: { baseUrl: string; token: string }) => void)[] = [];
 /**
@@ -1012,6 +1016,7 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     return next;
   };
   batch(() => {
+    for (const purge of spacePurgers) purge(spaceId);
     stashedDrafts.set(strip(stashedDrafts()));
     const { [spaceId]: _gone, ...restRooms } = roomsBySpace();
     roomsBySpace.set(restRooms);
