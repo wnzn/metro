@@ -1113,7 +1113,7 @@ async fn reserve_and_start(state: &AppState, r: DraftRequest) -> ApiResult<Respo
         block_key: r.block_key,
         chosen: r.chosen,
         base_spaces,
-        agent_grant: None,
+        room_origin: None,
     };
     tokio::spawn(generate::run(state.clone(), job));
     Ok((

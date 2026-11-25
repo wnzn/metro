@@ -541,7 +541,15 @@ pub struct SelectedModel {
     /// An output cap the run must set: Anthropic's Messages API requires
     /// `max_tokens`, and Rig knows the limit only for catalogued models.
     pub max_tokens: Option<u64>,
+    /// Internal binding of a device model. Unlike `connection_id`, this
+    /// may be the caller's private connection behind a shared preset.
+    pub effective_device: Option<EffectiveDevice>,
 }
+
+/// Compare the resolved device connections without printing or serializing
+/// the private identity, or using it as a public route.
+#[derive(Clone, PartialEq, Eq)]
+pub struct EffectiveDevice(String);
 
 impl std::fmt::Debug for SelectedModel {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -823,6 +831,7 @@ fn build_model_for_turn(
         model_id: row.model,
         model,
         max_tokens,
+        effective_device: matches!(entry.adapter, Adapter::Device).then(|| EffectiveDevice(row.id)),
     })
 }
 

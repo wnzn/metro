@@ -139,6 +139,7 @@ struct RunModel {
     model: DynModel<Completion>,
     max_tokens: Option<u64>,
     params: Option<serde_json::Value>,
+    effective_device: Option<crate::providers::EffectiveDevice>,
 }
 
 impl RunModel {
@@ -194,6 +195,7 @@ async fn route_model(
                         model: selected.model,
                         max_tokens: selected.max_tokens,
                         params: selection.and_then(|s| s.params(&selected.provider_id)),
+                        effective_device: selected.effective_device,
                     })
                 }
                 Err(e) => Err(route.unavailable(&e)),
@@ -208,6 +210,7 @@ async fn route_model(
                     model: selected.model,
                     max_tokens: selected.max_tokens,
                     params: None,
+                    effective_device: selected.effective_device,
                 })
             }
             Ok(None) => match &state.config.model {
@@ -221,6 +224,7 @@ async fn route_model(
                         model: model(config).into(),
                         max_tokens: None,
                         params: None,
+                        effective_device: None,
                     })
                 }
                 None => Err(NO_MODEL.to_owned()),
@@ -433,6 +437,36 @@ async fn drive(
 
 // ---- Page builder ----
 
+/// The room run's actual route, including its private resolved binding.
+/// Never use this binding for activity, draft provenance or diagnostics.
+#[derive(Clone)]
+pub(crate) struct RoomBuilderModel {
+    pub(crate) route: Route,
+    effective_device: Option<crate::providers::EffectiveDevice>,
+}
+
+impl RoomBuilderModel {
+    pub(crate) fn pinned(
+        route: &Route,
+        effective_device: Option<crate::providers::EffectiveDevice>,
+    ) -> Self {
+        let mut route = route.clone();
+        // A default route may not have named a connection before the room
+        // selected its model. Use the actual public choice, not a new default.
+        route.connection_id = route.note.connection_id.clone();
+        Self {
+            route,
+            effective_device,
+        }
+    }
+
+    fn matches(&self, route: &Route, model: &RunModel) -> bool {
+        self.route.note.connection_id == route.note.connection_id
+            && self.route.note.model_id == route.note.model_id
+            && self.effective_device == model.effective_device
+    }
+}
+
 /// One tool-less model turn for the page builder ([`crate::pages`]), as
 /// `user_id` on `route`: the same model choice and checks as their agent
 /// turns, and a failure (including a connection that can't be used) is
@@ -440,7 +474,7 @@ async fn drive(
 /// of the same generation, `(from_user, text)`. Returns the reply and the
 /// route note of the model that answered.
 #[allow(clippy::too_many_arguments)]
-pub async fn page_builder_turn<F, Fut>(
+pub(crate) async fn page_builder_turn<F, Fut>(
     state: &AppState,
     user_id: &str,
     space: Option<&str>,
@@ -448,31 +482,16 @@ pub async fn page_builder_turn<F, Fut>(
     preamble: &str,
     history: Vec<(bool, String)>,
     prompt: String,
-    pin_to_run: bool,
+    pin: Option<&RoomBuilderModel>,
     recheck: F,
 ) -> Result<(String, crate::model_routing::RouteNote), PageTurnError>
 where
     F: FnOnce() -> Fut,
     Fut: std::future::Future<Output = bool>,
 {
-    let expected = (
-        route.note.connection_id.clone(),
-        route.note.model_id.clone(),
-    );
     let model = route_model(state, user_id, space, &mut route)
         .await
         .map_err(PageTurnError::Failed)?;
-    if pin_to_run
-        && expected
-            != (
-                route.note.connection_id.clone(),
-                route.note.model_id.clone(),
-            )
-    {
-        return Err(PageTurnError::Failed(
-            "The model connection used by the room run changed; start a new run.".to_owned(),
-        ));
-    }
     // Its own small pool: page building never takes agent-run slots.
     let Ok(_permit) = state.page_builds.clone().try_acquire_owned() else {
         return Err(PageTurnError::Failed(
@@ -484,6 +503,14 @@ where
     // called.
     if !recheck().await {
         return Err(PageTurnError::Revoked);
+    }
+    // The model is bound to the resolved device id. For presets its
+    // transport also reauthorizes that same target at dispatch, so a
+    // later change cannot redirect the request to a replacement device.
+    if pin.is_some_and(|expected| !expected.matches(&route, &model)) {
+        return Err(PageTurnError::Failed(
+            "The model connection used by the room run changed; start a new run.".to_owned(),
+        ));
     }
     let agent = model.builder().preamble(preamble).build();
     let history = history
@@ -502,7 +529,7 @@ where
         Message::user(prompt),
         history,
         None,
-        pin_to_run,
+        pin.is_some(),
     )
     .await
     {
@@ -823,7 +850,13 @@ async fn execute_room_run(
                 .filter(|t| agent.allows(t.runner_name()))
                 .collect();
             let page_tools = crate::pages::agent_tools::tools(
-                state, space_id, room, initiator, turn, route, agent,
+                state,
+                space_id,
+                room,
+                initiator,
+                turn,
+                &RoomBuilderModel::pinned(route, model.effective_device.clone()),
+                agent,
             );
             let offers_pages = !page_tools.is_empty();
             let mut builder = model.builder().preamble(PREAMBLE);

@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::auth::{AuthFailure, AuthFuture, HumanAuth};
-use crate::model_routing::AddressedBy;
+use crate::model_routing::{AddressedBy, Route};
 
 const SOURCE: &str = r#"export default <Page title="Draft"><Text>Body</Text></Page>;"#;
 
@@ -32,7 +32,7 @@ async fn context(limits: crate::Limits) -> Context {
     let ctx = Context {
         state: AppState::new(config, db, Arc::new(NoAuth)).await.unwrap(),
         turn: Activity::agent("run_fixture", "Metro"),
-        route: Route::default_for(AddressedBy::Explicit),
+        model: RoomBuilderModel::pinned(&Route::default_for(AddressedBy::Explicit), None),
         grant: Grant {
             space,
             room: "lobby".into(),

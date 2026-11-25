@@ -28,8 +28,10 @@ ASKER_SCHEDULE = "PRIVATE_INITIATOR_TASK_5294"
 ORIGIN_ERROR = "PRIVATE_PAGE_RUN_ERROR_7514"
 PROVIDER_ERROR = "PRIVATE_PROVIDER_ERROR_7191"
 PROVIDER_REASONING = "PRIVATE_PROVIDER_REASONING_6119"
+WEB_DEVICE_REFUSAL = "PRIVATE_WEB_DEVICE_DIAGNOSTIC_1467"
 CONTROL_REASONING = "public reasoning fixture"
-PRIVATE_MARKERS = (OWNER_SCHEDULE, ASKER_SCHEDULE, ORIGIN_ERROR, PROVIDER_ERROR, PROVIDER_REASONING)
+PRIVATE_MARKERS = (OWNER_SCHEDULE, ASKER_SCHEDULE, ORIGIN_ERROR, PROVIDER_ERROR, PROVIDER_REASONING,
+                   WEB_DEVICE_REFUSAL)
 NOT_SHARED = {"ok": False, "error": "not_shared", "message": "This source is not available to shared room agents."}
 ORIGINAL = """export default <Page title="Shared dashboard">
   <Data name="s" source="schedules" room="lobby" />
@@ -108,11 +110,13 @@ class Model(Stub):
             expected, steps = self.plans[label]
             require(offered & (TOOLS | WEB_TOOLS) == expected, f"{label}: unexpected exposed Pages/web tools")
             reply = None
+            last_tool_result = None
             for idx, (tool, args, check) in enumerate(steps):
                 call_id = f"call_{label}_{idx}"
                 results = [t for m in messages if m.get("tool_call_id") == call_id
                            for t in content_parts(m["content"])]
                 if results:
+                    last_tool_result = results[0]
                     if check is not None:
                         check(results[0])
                 else:
@@ -120,6 +124,11 @@ class Model(Stub):
                     if label == "revoked":
                         self.held.set()
                         require(self.release.wait(12), "model fixture was not released")
+                    if label == "web_refusal" and tool == "page_propose":
+                        # Deliberately echo the actual prior result into the
+                        # separate builder, not a preprogrammed safe summary.
+                        require(last_tool_result is not None, "missing web refusal result")
+                        args = {"instruction": f"Build a page about this result: {last_tool_result}"}
                     reply = tool_reply(call_id, {"name": tool, "arguments": json.dumps(args)})
                     break
             if reply is None:
@@ -251,11 +260,13 @@ def exercise(binary, timeout):
         def events(who=bob, room=lobby):
             return ok(who, "GET", f"{room}/events?limit=150")["events"]
 
-        def ask(label, expected, steps=(), who=bob, room=lobby):
+        def ask(label, expected, steps=(), who=bob, room=lobby, connection=None):
             stub.plans[label] = (expected, steps)
             body = {"text": f"fixture:{label}!", "invoke_agent": True}
             if room != "/v1/chat":
                 body["agent_id"] = second["id"]
+            if connection is not None:
+                body["provider_connection_id"] = connection
             ok(who, "POST", f"{room}/messages", body, 202)
 
         def done(label, who=bob, room=lobby):
@@ -395,6 +406,14 @@ def exercise(binary, timeout):
             doc = ok(bob, "GET", path)
             return doc if doc["status"] != "generating" else None
 
+        def claim(device, inventory=None):
+            status, job = api.raw(device, "POST", "/v1/device/claim", inventory or {})
+            require(status in (200, 204), f"device claim: unexpected HTTP {status}")
+            return job if status == 200 else None
+
+        def device_reply(device, job, payload):
+            ok(device, "POST", f"/v1/device/jobs/{job['id']}/result", payload, 204)
+
         ask("instruction", TOOLS, [("page_propose", {"instruction": "Build a page"},
             proposed("generating"))])
         generated_path = f"/v1/pages/drafts/{card('instruction')['draft_id']}"
@@ -441,9 +460,30 @@ def exercise(binary, timeout):
         reject(alice, "GET", child_draft, None, 404)
         ok(bob, "GET", child_draft)
 
-        # Register a device (no worker needed to advertise tools) and opt
-        # in for Chat. Page-only runs must not use this Chat setting.
-        ok(bob, "POST", "/v1/web-devices", {"label": "Fixture device"}, 201)
+        # Exercise the raw device failure path, with both tool families on.
+        web_device = ok(bob, "POST", "/v1/web-devices", {"label": "Fixture device"}, 201)["token"]
+        require(claim(web_device) is None, "web device unexpectedly had work")
+        ok(alice, "PATCH", agent, {"tools": sorted(TOOLS | WEB_TOOLS)})
+        ask("web_refusal", TOOLS | WEB_TOOLS, [
+            ("web_search", {"query": "Check this fixture"}, denied("computer refused the web request")),
+            ("page_propose", {}, proposed("generating")),
+        ])
+        job = poll(deadline, "web device search request", lambda: claim(web_device), [watch])
+        require(job["operation"] == "web_search", "expected a web search job")
+        device_reply(web_device, job, {"ok": False, "error": WEB_DEVICE_REFUSAL})
+        web_card = card("web_refusal")
+        web_draft = f"/v1/pages/drafts/{web_card['draft_id']}"
+        web_built = poll(deadline, "builder after web refusal", lambda: build_ready(web_draft), [watch])
+        require(web_built["status"] == "ready" and "computer refused the web request" in stub.builder_calls[-1],
+                "the builder did not get the echoed classified web refusal")
+        require(any((e.get("activity") or {}).get("tool", {}).get("failure") == "refused"
+                    and "computer refused the web request" in e["text"] for e in events()),
+                "shared web activity did not show a classified refusal")
+        require(not any(WEB_DEVICE_REFUSAL in json.dumps(doc)
+                        for doc in (events(alice), stub.builder_calls, web_built)),
+                "raw device refusal was published or kept in builder data")
+
+        # Opt in for Chat. Page-only runs must not use this Chat setting.
         ok(bob, "PUT", "/v1/web-search/prefs", {"personal_chat": True})
         ask("chat_web", WEB_TOOLS, room="/v1/chat")
         done("chat_web", room="/v1/chat")
@@ -460,6 +500,84 @@ def exercise(binary, timeout):
             == "finished:page_only") or None, [watch])
         require(events(bob, "/v1/chat") == chat_before, "page-only run wrote to personal Chat")
 
+        # A shared preset is public, but the sign-in it resolves to is not.
+        # Keep the preset and model unchanged while switching which of Bob's
+        # devices resolves. Change it in the reserve transaction, after the
+        # original room model has returned the tool call, before any builder
+        # can resolve. This removes timing races from the test.
+        ok(alice, "PATCH", agent, {"tools": sorted(TOOLS)})
+        preset_model, other_model = "gpt-5.5", "gpt-5.4"
+
+        def sign_in(who, label, model_id):
+            return ok(who, "POST", "/v1/providers", {"name": label,
+                "provider_id": "device-openai-oauth", "model": model_id}, 201)["id"]
+
+        preset = sign_in(alice, "Shared preset", preset_model)
+        ok(alice, "PUT", f"/v1/providers/{preset}/sharing", {"visibility": "spaces", "space_ids": [space]})
+        original = sign_in(bob, "Original device", preset_model)
+        replacement = sign_in(bob, "Replacement device", other_model)
+        original_token = ok(bob, "POST", f"/v1/providers/{original}/device-token", {}, 201)["token"]
+        replacement_token = ok(bob, "POST", f"/v1/providers/{replacement}/device-token", {}, 201)["token"]
+        inventory = {"approved_models": [preset_model, other_model]}
+        require(claim(original_token, inventory) is None and claim(replacement_token, inventory) is None,
+                "the preset devices weren't idle")
+        require(all(re.fullmatch(r"pc_[0-9a-f]{32}", i) for i in (preset, original, replacement)),
+                "invalid fixture connection id")
+        preset_prompt = "Build a page after switching the preset's effective device"
+        with sqlite3.connect(state / "agent-pages.sqlite") as db:
+            db.executescript(f"""CREATE TRIGGER switch_preset_device AFTER INSERT ON page_drafts
+                WHEN new.author_id = 'bob' AND new.prompt = '{preset_prompt.replace("'", "''")}'
+                BEGIN
+                  UPDATE provider_connections SET model = '{other_model}' WHERE id = '{original}';
+                  UPDATE provider_connections SET model = '{preset_model}' WHERE id = '{replacement}';
+                END;""")
+
+        def completion(message, finish):
+            return {"ok": True, "response": {"id": "preset-fixture", "object": "chat.completion",
+                "created": 0, "model": preset_model,
+                "choices": [{"index": 0, "message": message, "finish_reason": finish}]}}
+
+        before_builds = len(stub.builder_calls)
+        preset_after = max(e["id"] for e in events(alice))
+        ask("preset_original", TOOLS, connection=preset)
+        job = poll(deadline, "original effective device", lambda: claim(original_token, inventory), [watch])
+        require(job["operation"] == "complete" and job["request"]["model"] == preset_model
+                and "fixture:preset_original!" in json.dumps(job["request"]), "preset did not use the original device")
+        device_reply(original_token, job, completion(tool_reply("call_preset_page", {
+            "name": "page_propose", "arguments": json.dumps({"instruction": preset_prompt}),
+        }), "tool_calls"))
+        # The old run cannot finish on the replaced preset, so find the new
+        # card independently of its final answer.
+        preset_card = poll(deadline, "preset proposal card", lambda: next((e["activity"]["page_draft"]
+            for e in reversed(events(alice)) if e["kind"] == "page_draft"
+            and e["id"] > preset_after), None), [watch])
+        preset_draft = f"/v1/pages/drafts/{preset_card['draft_id']}"
+
+        def failed_preset():
+            require(claim(replacement_token, inventory) is None,
+                    "a builder payload reached the replacement device")
+            return build_ready(preset_draft)
+
+        refusal = poll(deadline, "builder refusal after changed effective device", failed_preset, [watch])
+        require(refusal["status"] == "failed" and "model connection used by the room run changed" in refusal["error"]
+                and len(stub.builder_calls) == before_builds, "builder did not fail without a fallback")
+        require(claim(original_token, inventory) is None, "a builder payload reached the old device")
+
+        # Positive control: a *new* run on the exact same preset now uses
+        # the replacement. It wasn't offline or unable to serve this model.
+        ask("preset_replacement", TOOLS, connection=preset)
+        job = poll(deadline, "replacement in a new room run", lambda: claim(replacement_token, inventory), [watch])
+        require(job["request"]["model"] == preset_model and "fixture:preset_replacement!" in json.dumps(job["request"]),
+                "new room run did not use the unchanged preset model")
+        device_reply(replacement_token, job, completion(text_reply("finished:preset_replacement"), "stop"))
+        done("preset_replacement")
+        shared_events = events(alice)
+        starts = [e for e in shared_events if (e.get("activity") or {}).get("route", {}).get("connection_id") == preset]
+        require(len(starts) == 2 and all(e["activity"]["route"]["model_id"] == preset_model for e in starts),
+                "the public preset route/model didn't stay the same")
+        require(all(i not in json.dumps((shared_events, refusal)) for i in (original, replacement)),
+                "the private effective device id reached the event or draft")
+
         require(not any(marker in json.dumps(events(alice)) for marker in PRIVATE_MARKERS),
                 "private data leaked through later draft cards, replies or activity")
         ok(alice, "DELETE", f"{route}/members", {"user_id": "bob"}, 200)
@@ -468,7 +586,8 @@ def exercise(binary, timeout):
         watch()
     print("PASS: opt-in Space-only tools, room-safe reads, redacted diagnostics and reasoning, "
           "draft cards, permissions, stale apply, action vouching, initiator connection, "
-          "live revocation, threads, and no web tools or Chat events from page-only runs.")
+          "live revocation, threads, Chat-only web tools, fixed web refusal through a draft, "
+          "and no builder payload on a replaced preset device.")
 
 
 if __name__ == "__main__":

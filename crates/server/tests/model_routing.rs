@@ -264,6 +264,7 @@ impl RoutingBackend for Backend {
                     api_key: String::new(),
                 }),
                 max_tokens: None,
+                effective_device: None,
             })
         })
     }

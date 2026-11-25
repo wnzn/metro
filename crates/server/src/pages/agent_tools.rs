@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use super::store::{self, DraftCard, DraftError, DraftKind, Need};
 use super::{access, compile, data, generate, tsx};
 use crate::AppState;
+use crate::agent::RoomBuilderModel;
 use crate::db::{Activity, Addressed, Author, Db, Room, actor, kind, rfc3339_utc};
-use crate::model_routing::Route;
 use crate::space_agents::{self, SpaceAgent};
 
 pub(crate) const PAGE_PROPOSE: &str = "page_propose";
@@ -57,7 +57,7 @@ struct Context {
     state: AppState,
     grant: Grant,
     turn: Activity,
-    route: Route,
+    model: RoomBuilderModel,
 }
 
 #[derive(Debug)]
@@ -398,7 +398,7 @@ impl Context {
         let grant = self.grant.clone();
         let turn = self.turn.clone();
         let window = generate::busy_window_ms(&self.state.config.limits);
-        let model_ref = generate::model_ref(&self.route.note);
+        let model_ref = generate::model_ref(&self.model.route.note);
         let max_output = self.state.config.limits.max_tool_output_to_model;
         let (draft, base, output) = self
             .state
@@ -540,10 +540,6 @@ impl Context {
                 .and_then(|b| serde_json::from_str(&b.spec).ok())
                 .map(|spec| generate::spec_spaces(&spec))
                 .unwrap_or_default();
-            // Pin the actual (possibly default) connection used by the
-            // room run. The builder reauthorizes it on each provider turn.
-            let mut route = self.route.clone();
-            route.connection_id = route.note.connection_id.clone();
             tokio::spawn(generate::run(
                 self.state.clone(),
                 generate::Job {
@@ -553,9 +549,12 @@ impl Context {
                     prompt: draft.prompt,
                     base_source: base.map(|b| b.source),
                     block_key: None,
-                    chosen: Some(route),
+                    chosen: None,
                     base_spaces,
-                    agent_grant: Some(self.grant.clone()),
+                    room_origin: Some(generate::RoomOrigin {
+                        grant: self.grant.clone(),
+                        model: self.model.clone(),
+                    }),
                 },
             ));
         }
@@ -602,7 +601,7 @@ pub(crate) fn tools(
     room: &Room,
     initiator: &Author,
     turn: &Activity,
-    route: &Route,
+    model: &RoomBuilderModel,
     agent: &SpaceAgent,
 ) -> Vec<DynamicTool> {
     let Some(user) = &initiator.id else {
@@ -611,7 +610,7 @@ pub(crate) fn tools(
     let ctx = Context {
         state: state.clone(),
         turn: turn.clone(),
-        route: route.clone(),
+        model: model.clone(),
         grant: Grant {
             space: space.to_owned(),
             room: room.id.clone(),
