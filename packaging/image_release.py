@@ -254,6 +254,10 @@ def build(args):
             "--label", f"org.opencontainers.image.version=v{args.version}",
             "--label", f"org.opencontainers.image.title={name}",
             *(["--label", f"dev.metro.source-ref={args.source_ref}"] if args.source_ref else []),
+            # `release` only for published images (release-images.yml, push);
+            # anything else is a source build that never checks for updates.
+            *(["--build-arg", f"METRO_RELEASE_CHANNEL={args.release_channel}"]
+              if args.release_channel and args.component != "media" else []),
             "--output", f"type=oci,dest={tar},compression=gzip,rewrite-timestamp=true"]
     if target:
         cmd += ["--target", target]
@@ -720,6 +724,8 @@ def main(argv=None):
     b.add_argument("--source-ref", help="git ref the build came from, recorded as dev.metro.source-ref")
     b.add_argument("--context", default=".")
     b.add_argument("--git-dir", help="repository for the commit time (default: --context)")
+    b.add_argument("--release-channel", choices=("release", ""), default="",
+                   help="'release' for published images only (empty: a source build)")
     b.add_argument("--builder")
     b.add_argument("--out", required=True)
 
