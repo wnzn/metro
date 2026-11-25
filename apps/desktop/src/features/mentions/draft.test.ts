@@ -308,6 +308,55 @@ test("an agent at an interrupted quote boundary requires an explicit choice", ()
   expect(!afterEdit.ok && afterEdit.reason === "ambiguous" ? afterEdit.match.choices : null).toEqual([generic]);
 });
 
+test("agents inside an interrupted quoted local part require an explicit choice", () => {
+  for (const [text, expected] of [
+    ['Use "local `note` @agent here"@example.org', [["ambiguous", "@agent"]]],
+    ['Use "local `note`:@agent here"@example.org', [["ambiguous", "@agent"]]],
+    ['Use "done,"local `note` @agent here"@example.org', [["ambiguous", "@agent"]]],
+    ['Use "local `note` @agent. Still local"@example.org', [["ambiguous", "@agent"]]],
+    ['Use "local `note` @agent here "@example.org', [["ambiguous", "@agent"]]],
+    ['Use "local `first` @coder `last` @agent here"@example.org', [["resolved", "@coder"], ["ambiguous", "@agent"]]],
+    ['Use "local `note` @agent " @bo', [["resolved", "@agent"], ["resolved", "@bo"]]],
+    ['Use `note`. @coder finished. Say "@Alice Moreno"', [["resolved", "@coder"], ["resolved", "@Alice Moreno"]]],
+    ['Use `note`. @coder finished. Say "@agent"', [["resolved", "@coder"], ["ambiguous", "@agent"]]],
+    ['Use "done," `note`. @coder finished. Say "@agent"', [["resolved", "@coder"], ["ambiguous", "@agent"]]],
+    ['Use `note`. @coder finished. Then "local"@agent and "@Alice Moreno"', [["resolved", "@coder"], ["resolved", "@Alice Moreno"]]],
+    ['Use "local `note`\n@coder. Say "@Alice Moreno"', [["resolved", "@coder"], ["resolved", "@Alice Moreno"]]],
+  ] as const) {
+    const matches = scanMentionDraft(draft(text), roster, { finalize: true }).filter(m => m.kind !== "unresolved");
+    expect(matches.map(m => [m.kind, m.literal])).toEqual(expected);
+    const result = prepareMentionSend(draft(text), roster);
+    expect(result.ok ? null : result.reason).toBe(expected.some(([kind]) => kind === "ambiguous") ? "ambiguous" : null);
+  }
+});
+
+test("an edit rechecks typed anchors but preserves a deliberate pick next to an interrupted local part", () => {
+  const before = 'Use "local `note` @agent ';
+  const after = `${before}here"@example.org`;
+  const captured = captureTypedMentions(draft(before), roster);
+  expect(body(prepareMentionSend(captured, roster)).mentions).toEqual([generic]);
+  const edited = captureTypedMentions(updateMentionDraft(captured, after), roster);
+  const blocked = prepareMentionSend(edited, roster);
+  expect(!blocked.ok && blocked.reason === "ambiguous" ? blocked.match.choices : null).toEqual([generic]);
+  const [match] = scanMentionDraft(edited, roster);
+  const confirmed = pickMention(edited, match, generic, roster)!;
+  expect(body(prepareMentionSend(confirmed, roster)).mentions).toEqual([generic]);
+
+  const start = before.indexOf("@agent");
+  const picked = pick(draft(before), start, start + 6, generic);
+  const withSuffix = updateMentionDraft(picked, after);
+  expect(withSuffix.anchors[0]?.picked).toBe(true);
+  const sent = body(prepareMentionSend(withSuffix, roster));
+  expect(sent).toEqual({ text: after, mentions: [generic], spans: [{ start, end: start + 6, index: 0 }] });
+
+  const person = pick(draft('Use "local @al and @agent '), 11, 14, alice);
+  const personAndAgent = captureTypedMentions(person, roster);
+  const afterPerson = updateMentionDraft(personAndAgent, `${personAndAgent.text}here"@example.org`);
+  const recipients = scanMentionDraft(afterPerson, roster).filter(m => m.kind !== "unresolved");
+  expect(recipients.map(m => [m.kind, m.literal])).toEqual([["resolved", "@Alice Moreno"], ["ambiguous", "@agent"]]);
+  expect(afterPerson.anchors[0]?.picked).toBe(true);
+});
+
 test("quoted addresses are recognized independently of unmatched prose quotes", () => {
   for (const text of [
     'Say "`quote`" then <"local"@agent>',

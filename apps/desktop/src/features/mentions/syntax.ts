@@ -25,22 +25,33 @@ function visibleQuote(text: string, i: number, opaque: readonly MentionRange[]):
   return !overlapsRanges({ start: i, end: i + 1 }, opaque) && !escaped(text, i, opaque);
 }
 
-type QuoteLookback = number | "opaque" | null;
+type QuoteLookback = number | MentionRange | null;
 const lineBreak = /[\r\n\u0085\u2028\u2029]/u;
 
+function visibleQuoteBefore(
+  text: string, before: number, floor: number, quote: string, opaque: readonly MentionRange[],
+): number | "line-break" | null {
+  for (let i = before - 1; i >= floor; i--) {
+    if (lineBreak.test(text[i])) return "line-break";
+    if (text[i] === quote && visibleQuote(text, i, opaque)) return i;
+  }
+  return null;
+}
+
 function previousQuote(text: string, before: number, opaque: readonly MentionRange[]): QuoteLookback {
-  const quote = text[before];
-  let floor = 0;
+  let boundary: MentionRange | null = null;
   for (const range of opaque) {
-    if (range.start < before) floor = Math.max(floor, Math.min(range.end, before));
+    if (range.start >= before) continue;
+    const end = Math.min(range.end, before);
+    if (!boundary || end > boundary.end || (end === boundary.end && range.start < boundary.start)) {
+      boundary = { start: range.start, end };
+    }
   }
   // Code and selected labels split the line into quote-pairing regions.
   // A hidden delimiter must not join visible quotes on opposite sides.
-  for (let i = before - 1; i >= floor; i--) {
-    if (lineBreak.test(text[i])) return null;
-    if (text[i] === quote && visibleQuote(text, i, opaque)) return i;
-  }
-  return floor > 0 && !lineBreak.test(text[floor - 1]) ? "opaque" : null;
+  const prior = visibleQuoteBefore(text, before, boundary?.end ?? 0, text[before], opaque);
+  if (prior !== null) return prior === "line-break" ? null : prior;
+  return boundary && !lineBreak.test(text[boundary.end - 1]) ? boundary : null;
 }
 
 function startsEmailToken(text: string, start: number, opaque: readonly MentionRange[]): boolean {
@@ -99,6 +110,16 @@ function couldCloseProse(text: string, start: number, opaque: readonly MentionRa
   return typeof earlier === "number" && startsQuotedToken(text, earlier, opaque) && text[earlier + 1] !== "@";
 }
 
+function interruptedLocalStart(text: string, close: number, boundary: MentionRange, opaque: readonly MentionRange[]): number {
+  // Look for evidence of a possible opener before the opaque region, but
+  // never pair across it or extend uncertainty into preceding regions.
+  // With no opener evidence, only the quote next to @ is uncertain; the
+  // code or label might just belong to a separate sentence on this line.
+  const earlier = visibleQuoteBefore(text, boundary.start, 0, text[close], opaque);
+  return typeof earlier === "number" && startsQuotedToken(text, earlier, opaque)
+    && (!couldCloseProse(text, earlier, opaque) || !startsQuotedToken(text, close, opaque)) ? boundary.end : close;
+}
+
 function quotedEmailSyntax(text: string, opaque: readonly MentionRange[]) {
   const quoted: MentionRange[] = [];
   const uncertain: MentionRange[] = [];
@@ -108,19 +129,17 @@ function quotedEmailSyntax(text: string, opaque: readonly MentionRange[]) {
   const domainLabel = /^[\p{L}\p{N}](?:[\p{L}\p{N}\p{M}-]*[\p{L}\p{N}\p{M}])?$/u;
   for (const match of text.matchAll(/["']@/gu)) {
     const close = match.index!;
-    const start = quotedLocalBoundary(text, close, opaque);
-    if (start === null) continue;
-    // Use the original @ even when it starts an anchor: an adjoining
-    // edit can turn a formerly standalone mention into an email domain.
-    const range = { start: start === "opaque" ? close : start, end: close + 2 };
+    const local = quotedLocalBoundary(text, close, opaque);
+    if (local === null) continue;
     domain.lastIndex = close + 2;
     const host = domain.exec(text)?.[0];
-    if (!host) {
-      // These can start a Metro agent handle but not a host name.
-      if (/[_-]/.test(text[close + 2])) uncertain.push(range);
-      continue;
-    }
-    if (start === "opaque") {
+    // A leading underscore or hyphen can start an agent handle, not a host.
+    if (!host && !/[_-]/.test(text[close + 2])) continue;
+    // Use the original @ even when it starts an anchor: an adjoining
+    // edit can turn a formerly standalone mention into an email domain.
+    const start = typeof local === "number" ? local : interruptedLocalStart(text, close, local, opaque);
+    const range = { start, end: close + 2 };
+    if (!host || typeof local !== "number") {
       // Do not suppress a person's quoted mention or auto-dispatch an
       // agent on the strength of an interrupted, unproven local part.
       uncertain.push(range);
