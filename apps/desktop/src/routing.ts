@@ -109,7 +109,7 @@ export const MAX_LABEL = 64;
 export const MAX_DESCRIPTION = 500;
 const MAX_KEY = 32;
 /** "Is this asking the agent?" must be at least this sure; lower would start the agent on chatter. */
-export const MIN_DIRECTEDNESS_FLOOR = 0.5;
+export const MIN_DIRECTEDNESS_FLOOR = 0.2;
 
 export function toDraft(r: ModelRouting): RoutingDraft {
   return {
@@ -166,7 +166,7 @@ export function finalize(d: RoutingDraft, usable: readonly AvailableModel[]): { 
   // Shown as percentages, as the page asks for them; the values stay 0 to 1.
   if (minRouteProbability === null) return { ok: false, error: "The routing confidence must be a whole number from 0 to 100%, such as 65%." };
   if (minDirectedness === null || minDirectedness < MIN_DIRECTEDNESS_FLOOR) {
-    return { ok: false, error: `Space classification confidence must be a whole number from ${Math.round(MIN_DIRECTEDNESS_FLOOR * 100)} to 100%, such as 85%.` };
+    return { ok: false, error: `Space classification confidence must be a whole number from ${Math.round(MIN_DIRECTEDNESS_FLOOR * 100)} to 100%, such as 35%.` };
   }
   if (d.enabled && !d.classifierId) {
     return { ok: false, error: "Choose a System One classifier to use model routing." };
