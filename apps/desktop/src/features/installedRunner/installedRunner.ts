@@ -148,6 +148,22 @@ export function recordAttachedFolder(space: { id: string; name: string }) {
   if (!runnerSpaces().some((s) => s.id === space.id)) runnerSpaces.set([...runnerSpaces(), space]);
 }
 
+/** Called under the exact-Space write guard after a fresh assignment read. */
+export function forgetAttachedFolder(runnerId: string, sid: string) {
+  if (installedRunner()?.runner?.id !== runnerId || ownedInstalledRunner()?.id !== runnerId ||
+      !spaces().some((s) => s.id === sid && s.role === "owner")) return;
+  // An older folder snapshot can still include this Space, even if it wasn't
+  // in the published list when the assignment changed.
+  attachedSeq++;
+  if (runnerSpaces().some((s) => s.id === sid)) runnerSpaces.set(runnerSpaces().filter((s) => s.id !== sid));
+  const all = folders();
+  if (Object.prototype.hasOwnProperty.call(all, sid)) {
+    const next = { ...all };
+    delete next[sid];
+    folders.set(next);
+  }
+}
+
 /** The owner deleted this registration. An older bridge read can't revive its controls. */
 export function refreshAfterInstalledRunnerDeletion(id: string) {
   if (ownedInstalledRunner()?.id !== id) return;
@@ -283,7 +299,7 @@ export async function showRunnerFolder(sid: string): Promise<void> {
       installedError.set("This Space no longer uses this computer's runner.");
       return;
     }
-    folders.set({ ...folders(), [sid]: f });
+    if (runnerSpaces().some((s) => s.id === sid)) folders.set({ ...folders(), [sid]: f });
   } catch (error) {
     if (valid()) installedError.set(message(error, "Opening the Space's folder"));
   } finally {

@@ -290,17 +290,29 @@ function runnerRequest(markers: Map<string, object>, sid: string) {
 
 function invalidateSpaceRunnerRequests(sid: string) {
   spaceRunnerReads.delete(sid);
-  spaceRunnerWrites.delete(sid);
+  // Keep a new marker even after the action settles: becoming empty again
+  // must not restore consent captured before the action.
+  spaceRunnerWrites.set(sid, {});
 }
 
-/** Mark an exact-Space write. A newer Manage operation supersedes the pending reply. */
-export function beginSpaceRunnerWrite(sid: string) {
+/** Capture consent to write to this Space as it was at submission. */
+export function snapshotSpaceRunnerWrite(sid: string) {
+  const mark = spaceRunnerWrites.get(sid);
+  const ok = sessionGuard(sid);
+  return () => ok() && spaceRunnerWrites.get(sid) === mark;
+}
+
+/** Compare and mark an exact-Space write before the caller dispatches it in the same turn. */
+export function beginSpaceRunnerWrite(sid: string, expected?: () => boolean) {
+  if (expected && !expected()) return null;
   spaceRunnerReads.delete(sid);
   return runnerRequest(spaceRunnerWrites, sid);
 }
 
 /** The POST's reply is historical by the time it arrives. Read the actual assignment. */
-export async function reconcileOwnedSpaceRunner(sid: string, stillLatest: () => boolean) {
+export async function reconcileOwnedSpaceRunner(
+  sid: string, stillLatest: () => boolean, onReconciled?: (current: SpaceRunner | null) => void,
+) {
   const c = apiClient();
   const owns = () => spaces().some((s) => s.id === sid && s.role === "owner");
   if (!c || !stillLatest() || !owns()) return undefined;
@@ -310,6 +322,7 @@ export async function reconcileOwnedSpaceRunner(sid: string, stillLatest: () => 
   batch(() => {
     spaceRunners.set({ ...spaceRunners(), [sid]: current });
     setRunnerPaired(sid, current !== null);
+    onReconciled?.(current);
   });
   return current;
 }

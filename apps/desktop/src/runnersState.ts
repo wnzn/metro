@@ -2,10 +2,10 @@
 import { cleanup, computed, effect, signal, Storage, untracked } from "nsh";
 import { ApiError } from "./api/client";
 import type { Client, RegisteredRunner, Space, SpaceRunner } from "./api/client";
-import { beginSpaceRunnerWrite, loadRunners, reconcileOwnedSpaceRunner, runnerBusy, runners, spaceRunners } from "./settings";
+import { beginSpaceRunnerWrite, loadRunners, reconcileOwnedSpaceRunner, runnerBusy, runners, snapshotSpaceRunnerWrite, spaceRunners } from "./settings";
 import { apiClient, connectedTo, me, onSessionEnd, sessionGuard, spaces } from "./store";
 import { helper } from "./device/state";
-import { installedBusy, installedRunner, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner, recordAttachedFolder } from "./features/installedRunner/installedRunner";
+import { forgetAttachedFolder, installedBusy, installedRunner, installedRunnerStatusWatchable, loadInstalledRunner, ownedInstalledRunner, readInstalledRunner, recordAttachedFolder } from "./features/installedRunner/installedRunner";
 import type { InstalledRunnerState } from "./features/installedRunner/installedRunner";
 
 export const runnerSessionKey = () => JSON.stringify([connectedTo(), me()]);
@@ -174,16 +174,18 @@ const notAttached = (reason: string) => ({ kind: "not-attached" as const, reason
 const newerRunnerAction = {
   kind: "superseded" as const, reason: "A newer runner action superseded this attachment check.",
 };
+const changedSinceSelection = notAttached("A newer runner action changed this Space after it was selected. Select it again to attach.");
 
 const ownsSpace = (sid: string) => spaces().some((s) => s.id === sid && s.role === "owner");
 
 /** Never publish from the write receipt alone: another action may have won since it was sent. */
 async function attachAndReconcile(
-  c: Client, sid: string, choice: InstalledChoice, conflict: string,
+  c: Client, sid: string, choice: InstalledChoice, conflict: string, expectedWrite?: () => boolean,
 ): Promise<AttachProblem | { kind: "attached"; stillVerified: () => boolean }> {
   // The server repeats ownership and emptiness checks atomically. Never fall
   // back to the replacing route, including if the server lacks this endpoint.
-  const latest = beginSpaceRunnerWrite(sid);
+  const latest = beginSpaceRunnerWrite(sid, expectedWrite);
+  if (!latest) return changedSinceSelection;
   const stillScoped = () => latest() && ownsSpace(sid) && choice.isCurrent();
   const matches = (r: SpaceRunner | null | undefined) =>
     r?.kind === "registered" && r.id === choice.id && r.visibility === "personal";
@@ -192,7 +194,9 @@ async function attachAndReconcile(
     await c.attachRunnerIfEmpty(sid, choice.id);
     accepted = true;
     if (!latest()) return newerRunnerAction;
-    const current = await reconcileOwnedSpaceRunner(sid, stillScoped);
+    const current = await reconcileOwnedSpaceRunner(sid, stillScoped, (assignment) => {
+      if (!matches(assignment)) forgetAttachedFolder(choice.id, sid);
+    });
     if (!latest()) return newerRunnerAction;
     if (current === undefined) return { kind: "unconfirmed" };
     if (!matches(current)) return { kind: "superseded", reason: "The runner assignment changed." };
@@ -254,7 +258,8 @@ export async function attachMany(spaceIds: readonly string[]) {
   const runner = installedRunnerChoice();
   const choice = runner && snapshotInstalledRunner(runner.id);
   const selected = new Set(spaceIds);
-  const picks = eligibleSpaces().filter((s) => selected.has(s.id));
+  const picks = eligibleSpaces().filter((s) => selected.has(s.id))
+    .map((s) => ({ id: s.id, name: s.name, expectedWrite: snapshotSpaceRunnerWrite(s.id) }));
   if (!c || !choice || !picks.length || runnerAttachBusy() || installedBusy()) return;
   const sessionOK = sessionGuard();
   const key = runnerSessionKey();
@@ -289,6 +294,10 @@ export async function attachMany(spaceIds: readonly string[]) {
         failures.push(`${pick.name}: You no longer own this Space.`);
         continue;
       }
+      if (!pick.expectedWrite()) {
+        failures.push(`${pick.name}: ${changedSinceSelection.reason}`);
+        continue;
+      }
       const spaceOK = sessionGuard(s.id);
       try {
         const current = await c.getSpaceRunner(s.id);
@@ -305,7 +314,7 @@ export async function attachMany(spaceIds: readonly string[]) {
           failures.push(`${s.name}: This computer's runner changed.`);
           continue;
         }
-        const result = await attachAndReconcile(c, s.id, choice, "Already has a runner.");
+        const result = await attachAndReconcile(c, s.id, choice, "Already has a runner.", pick.expectedWrite);
         if (!valid()) return;
         if (result.kind === "attached" && result.stillVerified()) {
           attached++;

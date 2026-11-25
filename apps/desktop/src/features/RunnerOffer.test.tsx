@@ -20,7 +20,10 @@ const words = (app: App) => app.texts().join(" | ");
 
 function fixture(f: Server, runnerId: string | null, state = "online") {
   const status = { runnerId, state, available: true, reads: 0, failReads: 0, delay: 0, reconnects: 0 };
-  const gate = { create: 0, attach: 0, badConfirmation: false, reconnect: 0 };
+  const gate = {
+    create: 0, attach: 0, badConfirmation: false, reconnect: 0,
+    runnerRead: null as { sid: string; delay: number; parked: boolean } | null,
+  };
   const runnerStatus = () => ({
     requested: true, available: status.available, state: status.state,
     runner: status.runnerId && { id: status.runnerId, name: "This PC" },
@@ -44,7 +47,17 @@ function fixture(f: Server, runnerId: string | null, state = "online") {
     status.state = "online";
     return { status: 200, delay: gate.reconnect, body: runnerStatus() };
   };
-  // The server applies the write before these gates hold or spoil the reply.
+  // The server handles the request before these gates hold or spoil its reply.
+  const serverGet = network[`GET ${BASE}/v1/*`]!;
+  network[`GET ${BASE}/v1/*`] = (req) => {
+    const reply = serverGet(req);
+    const read = gate.runnerRead;
+    if (read && !read.parked && new URL(req.url).pathname === `/v1/spaces/${read.sid}/runner`) {
+      read.parked = true;
+      return { ...(reply as object), delay: read.delay };
+    }
+    return reply;
+  };
   const serverPost = network[`POST ${BASE}/v1/*`]!;
   network[`POST ${BASE}/v1/*`] = (req) => {
     const reply = serverPost(req);
@@ -375,8 +388,10 @@ test("bulk attach doesn't count a held success after an external detach or reass
   for (const replaced of [false, true]) {
     const f = world();
     f.addSpace("solo", "Solo", "alice");
+    f.addSpace("keep", "Keep folder", "alice");
     const r = f.addRunner("This PC", "personal", "alice");
     const other = f.addRunner("Other computer", "personal", "alice");
+    f.state.attached.set("keep", r.id);
     const t = fixture(f, r.id);
     t.gate.attach = 800;
     const app = await launch(t, { manual: true });
@@ -385,6 +400,20 @@ test("bulk attach doesn't count a held success after an external detach or reass
     await app.waitFor("id:runner-attach-pick:solo");
     await app.press("id:runner-attach-many");
     await app.waitUntil(() => f.state.attached.get("solo") === r.id);
+
+    // Settings can see the assignment while the batch is still waiting for
+    // its POST reply. Park a second folder snapshot of that same assignment.
+    await app.press("id:settings-close");
+    await app.press("id:nav-settings");
+    await app.waitFor("id:installed-runner-space:solo");
+    expect(app.shows("id:installed-runner-space:keep")).toBe(true);
+    await app.press("id:settings-close");
+    const folderRead = { sid: "solo", delay: 1200, parked: false };
+    t.gate.runnerRead = folderRead;
+    await app.press("id:nav-settings");
+    await app.waitUntil(() => folderRead.parked);
+    expect(app.shows("id:installed-runner-space:solo")).toBe(true);
+
     if (replaced) f.state.attached.set("solo", other.id);
     else f.state.attached.delete("solo");
 
@@ -395,6 +424,9 @@ test("bulk attach doesn't count a held success after an external detach or reass
     expect(f.state.attached.get("solo")).toBe(replaced ? other.id : undefined);
     expect(app.shows("id:runner-attach-pick:solo")).toBe(!replaced); // Authoritative paired flag.
     expect(app.shows("id:installed-runner-space:solo")).toBe(false);
+    await app.clock!.runFor(400); // The older folder snapshot must not restore the row.
+    expect(app.shows("id:installed-runner-space:solo")).toBe(false);
+    expect(app.shows("id:installed-runner-space:keep")).toBe(true);
     expect(app.storage()[runnerOfferStorageKey(BASE, "alice")]).toBe(undefined);
     expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([["POST", "/v1/spaces/solo/runner/attach-if-empty"]]);
 
@@ -407,6 +439,53 @@ test("bulk attach doesn't count a held success after an external detach or reass
       await app.waitFor("id:attached-runner");
       expect(words(app)).toContain(other.name);
     }
+  }
+});
+
+test("batch consent doesn't survive a local attach and detach while the first item or second preflight is held", async () => {
+  for (const holdFirst of [true, false]) {
+    const f = world();
+    f.addSpace("first", "First", "alice");
+    f.addSpace("second", "Second", "alice");
+    const r = f.addRunner("This PC", "personal", "alice");
+    const other = f.addRunner("Other computer", "personal", "alice");
+    const t = fixture(f, r.id);
+    const app = await launch(t, { manual: true });
+    await signIn(app);
+    await app.press("id:nav-settings");
+    await app.waitFor("id:runner-attach-pick:second");
+    await app.waitUntil(() => f.state.log.some((p) => p.method === "GET" && p.path === "/v1/spaces/second/runner"));
+    const preflight = { sid: "second", delay: 800, parked: false };
+    if (holdFirst) t.gate.attach = 800;
+    else t.gate.runnerRead = preflight;
+    await app.press("id:runner-attach-many");
+    await app.waitUntil(() => f.state.attached.get("first") === r.id && (holdFirst || preflight.parked));
+    await app.press("id:settings-close");
+    await app.press("id:space:second");
+    await app.press("id:manage-space");
+    await app.waitFor(`id:attach-runner:${other.id}`);
+    await app.press(`id:attach-runner:${other.id}`);
+    await app.waitFor("id:attached-runner");
+    expect(f.state.attached.get("second")).toBe(other.id);
+    await app.press("id:detach-runner");
+    await app.press("id:confirm-detach");
+    await app.waitFor(`id:attach-runner:${other.id}`);
+    expect(f.state.attached.has("second")).toBe(false);
+
+    await app.clock!.runFor(800);
+    await app.press("id:nav-settings");
+    await app.waitFor("id:runner-attach-result");
+    expect(words(app)).toContain("Attached to 1 of 2 Spaces. Second: A newer runner action changed this Space");
+    expect(app.shows("id:installed-runner-space:first")).toBe(true);
+    expect(app.shows("id:installed-runner-space:second")).toBe(false);
+    expect(app.shows("id:runner-attach-pick:second")).toBe(true);
+    expect(f.state.attached.has("second")).toBe(false);
+    await app.waitUntil(() => app.storage()[runnerOfferStorageKey(BASE, "alice")] === "dismissed");
+    expect(runnerWrites(f).map((p) => [p.method, p.path])).toEqual([
+      ["POST", "/v1/spaces/first/runner/attach-if-empty"],
+      ["PUT", "/v1/spaces/second/runner"], // Only the explicit Manage action.
+      ["DELETE", "/v1/spaces/second/runner"],
+    ]);
   }
 });
 
