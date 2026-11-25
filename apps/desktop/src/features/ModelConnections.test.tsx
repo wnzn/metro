@@ -44,15 +44,20 @@ const patches = (f: F, id: string) => f.posts().filter((p) => p.method === "PATC
 test("an owner tests and saves an approved shared endpoint with one authenticated PATCH, then refreshes models", async () => {
   const { f, custom } = fixture();
   const app = await signIn(f, "alice", undefined, 760);
+  const disclosure = `id:endpoint-section:${custom.id} >> text:/API key, if configured, to the new URL before saving/`;
   await edit(app, custom.id);
   await app.waitFor(`id:endpoint-shared:${custom.id}`);
+  expect(app.shows(disclosure)).toBe(true);
+  expect(app.shows(`id:endpoint-section:${custom.id} >> text:/receive the key even if the save fails/`)).toBe(true);
+  expect(patches(f, custom.id)).toHaveLength(0);
   await app.press(`id:endpoint-section:${custom.id} >> label:${NEW}`);
   expect(app.value(`id:endpoint-input:${custom.id}`)).toBe(NEW);
   expect(custom.base_url).toBe(OLD);
-  await app.press(`id:endpoint-save:${custom.id}`);
+  await app.press(`id:endpoint-section:${custom.id} >> label:Test and save`);
   await app.waitFor(`id:endpoint-current:${custom.id} >> text:${NEW}`);
   await app.waitFor("text:Endpoint changed. Models listed again: +1 new, 1 no longer listed.");
   expect(app.shows(`id:endpoint-input:${custom.id}`)).toBe(false);
+  expect(app.shows(disclosure)).toBe(false);
   expect(patches(f, custom.id)).toEqual([{ method: "PATCH", path: `/v1/providers/${custom.id}`, body: { base_url: NEW, expected_endpoint_revision: "0" }, user: "alice" }]);
   expect(f.state.endpointProbes).toEqual([NEW]);
   expect(f.posts().filter((p) => p.path.endsWith("/model-list/refresh"))).toHaveLength(1);

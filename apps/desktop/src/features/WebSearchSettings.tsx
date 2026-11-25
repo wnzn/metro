@@ -11,6 +11,7 @@ import {
 } from "../ui";
 import { createWebSearchSettings, providerSettings } from "../webSearch";
 import type { WebSearchSettingsModel } from "../webSearch";
+import { webActivityDisclosure, webDeviceSelection, webModelDisclosure, webProviderDisclosure } from "./webSearchPrivacy";
 
 const TERMS: Record<WebProvider, string> = {
   exa: "https://exa.ai/terms", parallel: "https://parallel.ai/terms-of-service",
@@ -30,7 +31,7 @@ export function WebSearchSettings(props: Props) {
   return (
     <PageLayout testID="websearch-settings" pad={compactWidth() ? 4 : 6} gap={6}>
       <PageHeader title="Web search" scope={{ kind: "computer" }}
-        subtitle="When an agent you start searches or reads the web, it runs on your computer with these providers." />
+        subtitle="This switch and these provider settings apply only to this computer." />
       <If when={targets().length} else={<Unavailable text="Sign in to Metro to set up web search." />}>
         <Each of={targets()} key={(t) => JSON.stringify([t.server, t.account])}>
           {(t) => <WebSearchAccount server={t().server} account={t().account}
@@ -45,7 +46,7 @@ function WebSearchAccount(props: Props & { server: string; account: string }) {
   const model = createWebSearchSettings(props.server, props.account);
   const local = () => model.phase() === "ready" ? model.local() : null;
   const unavailable = () => ({
-    unavailable: "Web search runs in the Metro desktop app. Open Metro on this computer to use it.",
+    unavailable: "Open the Metro desktop app to manage web search on this computer.",
     secondary: "Another Metro window serves web search on this computer. Open Web search in that window.",
     unbound: "Metro's helper isn't serving this account on this server. Reopen Metro or sign out and sign in again to reconnect it.",
     offline: model.canRefresh() ? "Metro's helper on this computer isn't answering. Refresh or reopen the desktop app."
@@ -56,17 +57,19 @@ function WebSearchAccount(props: Props & { server: string; account: string }) {
   return (
     <>
       <SettingsGroup title="How it works">
-        <LearnMore testID="websearch-learn">
-          <Label variant="caption">Space agents can search or read the web only if their Space owner allowed it. Fetching is limited to pages a person linked or that a search in the same run returned.</Label>
-        </LearnMore>
-        <SettingRow label="Runs on" description="This computer">
+        <SettingRow label="This computer's status">
           <If when={local()} else={
             <Badge label={model.phase() === "loading" ? "Checking" : "Unavailable"} tone={model.phase() === "loading" ? "neutral" : "warning"} />
           }>
             {(state) => <WorkerBadge state={state()} />}
           </If>
         </SettingRow>
-        <Label variant="caption">If Metro is closed or offline, web search fails visibly. Scheduled prompts can still answer without web data. Metro never uses someone else's computer or keys.</Label>
+        <SettingRow label="Which device is used" description={webDeviceSelection} />
+        <SettingRow label="If none of your web devices is online"
+          description="The tool can't run. Open Metro with web search enabled on one of your devices. Scheduled prompts can still answer without web data if their model is available." />
+        <LearnMore testID="websearch-learn">
+          <Label variant="caption">Space owners allow search and page reads separately for each agent. Metro only fetches URLs from a person's message available to the run or from a search result in that run. It doesn't check where DNS or provider redirects lead.</Label>
+        </LearnMore>
       </SettingsGroup>
       <If when={model.phase() === "loading"}><Label testID="websearch-loading" variant="caption">Loading web search…</Label></If>
       <If when={unavailable()}>{(text) => <Unavailable text={text()} />}</If>
@@ -80,8 +83,10 @@ function WebSearchAccount(props: Props & { server: string; account: string }) {
       <If when={local()}>{(state) => <Computer model={model} state={state()} />}</If>
       <PersonalChat model={model} server={props.server} />
       <SettingsGroup title="Privacy">
-        <SettingRow label="What is sent" description="Search queries and page addresses are sent to the provider that serves them. Exact queries from Space runs are visible in activity to everyone in that Space." />
-        <SettingRow label="What providers see" description="Providers see this computer's IP address and, if you add a key, your provider account. A provider may charge that account." />
+        <SettingRow label="What providers see" description={webProviderDisclosure} />
+        <SettingRow label="What Metro relays and keeps" description={webActivityDisclosure} />
+        <SettingRow label="What the model sees" description={webModelDisclosure} />
+        <SettingRow label="Links" description="Don't give agents private links or URLs that contain credentials." />
         <If when={props.onOpenPrivacy}>
           <Row><Action variant="ghost" label="Open About & updates › Privacy" testID="websearch-privacy" onPress={() => props.onOpenPrivacy?.()} /></Row>
         </If>
@@ -122,7 +127,7 @@ function Computer(props: { model: WebSearchSettingsModel; state: LocalWebSearch 
     <>
       <SettingsGroup title="This computer">
         <SettingRow label="Enable web search on this computer"
-          description="Lets permitted agents use this computer. This does not turn on web search in personal Chat.">
+          description="Makes this computer available to your permitted agents. It doesn't turn on web search in personal Chat.">
           <Toggle testID="websearch-master" label="Enable web search on this computer"
             checked={s().enabled} disabled={m.busy() || !!s().settingsError ||
               (!s().enabled && (s().endpointsError || s().serverUnsupported))}
@@ -130,7 +135,7 @@ function Computer(props: { model: WebSearchSettingsModel; state: LocalWebSearch 
         </SettingRow>
         <If when={!s().noticeAcknowledged}>
           <ProblemNote tone="system" testID="websearch-notice"
-            text="Web search is on by default for permitted agents. Queries and page addresses go to third-party providers from this computer. Turn it off here at any time."
+            text="Web search is on by default on this computer. If Metro selects it, third-party providers it contacts may receive your queries or page URLs. Turn it off here at any time."
             action={<Action label="Got it" testID="websearch-ack" disabled={blocked()}
               onPress={() => void m.update({ notice_acknowledged: true }, "Notice acknowledged.")} />} />
         </If>
@@ -174,13 +179,13 @@ function Computer(props: { model: WebSearchSettingsModel; state: LocalWebSearch 
           )}
         </Each>
         <If when={!s().settingsError && s().providers.every((p) => !p.enabled)}>
-          <ProblemNote tone="warning" testID="websearch-all-off" text="All providers are off: web searches in runs you start will fail." />
+          <ProblemNote tone="warning" testID="websearch-all-off" text="All providers are off on this computer. Turn one on to let this computer serve searches." />
         </If>
         <If when={!s().settingsError && !s().keysError && s().providers.some((p) => p.enabled) && s().providers.every((p) => !p.enabled || (!p.keyless && !p.keySaved))}>
           <ProblemNote tone="warning" testID="websearch-no-eligible" text="No enabled provider can search without a key. Add a key or turn on a keyless provider." />
         </If>
         <If when={m.canTest()} else={<Label variant="caption">Update Metro to test providers.</Label>}>
-          <Label variant="caption">Testing sends the fixed query “Metro web search test” to the selected provider, using its current mode. It can use provider credits.</Label>
+          <Label variant="caption">If setup succeeds, testing sends “Metro web search test” to the selected provider in its current mode. This can use provider credits.</Label>
         </If>
       </SettingsGroup>
     </>
@@ -198,7 +203,7 @@ function ProviderRow(props: {
   let menu: ViewRef | undefined;
   const status = () => {
     const row = p();
-    const mode = props.state.keysError ? "Key status unavailable" : row.keySaved ? "Your key" : row.keyless ? "Free (no key)" : "Needs a free key";
+    const mode = props.state.keysError ? "Key status unavailable" : row.keySaved ? "Your key" : row.keyless ? "No key" : "Key required";
     const pause = row.cooldown;
     const reason = pause?.outcome === "limited" || pause?.outcome === "out_of_credits" ? "Limit reached" :
       pause ? WEB_OUTCOMES[pause.outcome] : null;
@@ -242,7 +247,7 @@ function ProviderRow(props: {
       </If>
       <ConfirmInline testID={`websearch-remove-confirm:${id}`} open={props.removing} onOpenChange={props.setRemoval}
         returnFocus={() => menu} confirmLabel="Remove key" disabled={props.blocked || props.state.keysError}
-        message={`Remove your ${name} key? ${p().keyless ? "Searches use its free mode again." : `${name} can't search without it.`}`}
+        message={`Remove your ${name} key? ${p().keyless ? "When used, this provider will run without a key." : `${name} can't search without it.`}`}
         onConfirm={() => { props.setRemoval(false); void m.removeKey(id); }} />
     </ConnectionItem>
   );
@@ -270,7 +275,7 @@ function KeyEditor(props: { id: WebProvider; busy: boolean; onSave: (key: string
           void node.measure().then((layout) => { if (alive && layout && !props.busy) node.focus(); });
         }}
         value={key()} onChange={key.set} onSubmit={save} disabled={props.busy} />
-      <Label variant="caption">Keys are saved only for this account on this computer and are never shown again. {props.id === "tinyfish" ? "TinyFish requires a key from a provider account." : "A key uses your provider account and may give you higher limits."}</Label>
+      <Label variant="caption">Keys are saved for this account on this computer. Metro never uploads them to its server or shows them again. A key goes only to its provider, which may charge your account.</Label>
       <Row gap={2} wrap>
         <Action variant="primary" label="Save key" testID={`websearch-save:${props.id}`} disabled={!key().trim() || props.busy} onPress={save} onEscape={cancel} />
         <Action variant="ghost" label="Cancel" testID={`websearch-cancel:${props.id}`} onPress={cancel} onEscape={cancel} />
@@ -287,7 +292,7 @@ function PersonalChat(props: { model: WebSearchSettingsModel; server: string }) 
     <SettingsGroup title="Personal Chat">
       <ScopeLine scope={{ kind: "account", host: host() }} />
       <SettingRow label="Allow web search in personal Chat"
-        description="Off by default. Turning this on lets your Chat agent send queries and page addresses to your providers. It doesn't change this computer's switch or Space permissions.">
+        description="Off by default. Lets your Chat agent search and read pages through your online web devices. It doesn't change the computer switch or Space permissions.">
         <If when={setting()} else={<Badge label={m.chat().phase === "loading" ? "Loading" : "Unavailable"} tone="neutral" />}>
           {(pref) => <Toggle label="Allow web search in personal Chat" testID="websearch-chat-opt-in"
             checked={pref().enabled} disabled={m.chatBusy()} onChange={(on) => void m.setChat(on)} />}
