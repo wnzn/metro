@@ -239,32 +239,156 @@ test("same-room Follow up keeps the draft but clears a room authoritatively miss
   expect(sentAnything(f)).toBe(false);
 });
 
-test("an older same-room denial still removes lost access without touching the newly verified destination", async () => {
-  const f = world();
-  lobbyRuns(f);
-  const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
-  let deny = false;
-  f.network[get] = req => deny && req.url.endsWith("/acme/rooms")
-    ? { status: 404, body: { error: "no such space" }, delay: 2_000 } : base(req);
-  const app = await inChat(f, 1200, "alice", true);
-  await app.waitFor("label:Open Side project › #lobby");
-  await app.press("id:run-follow:run-acme");
-  await app.waitFor("text:To: agent in Acme › #lobby");
-  await app.type("id:dispatch-text", "Keep the new destination");
-  deny = true;
-  f.state.spaces.get("acme")!.members.delete("alice");
-  await app.press("id:run-follow:run-acme");
-  await app.waitFor("text:Checking the selected destination…");
-  await app.press("id:run-follow:run-side");
-  await app.press("id:dispatch-move-draft");
-  await app.waitFor("text:To: agent in Side project › #lobby");
-  await app.clock!.runFor(2_100);
-  await app.waitFor("id:space:acme", { state: "gone" });
-  expect(app.shows("text:To: agent in Side project › #lobby")).toBe(true);
-  expect(app.shows("id:dispatch-error")).toBe(false);
-  expect(app.value("id:dispatch-text")).toBe("Keep the new destination");
-  expect(sentAnything(f)).toBe(false);
-});
+for (const order of ["move first", "purge first", "purge then explicit retarget", "purge then leave the view"] as const) {
+  test(`a confirmed Follow up and an older Space denial settle independently: ${order}`, async () => {
+    const f = world();
+    lobbyRuns(f);
+    f.addRoom("side", { id: "scratch", name: "Scratch" });
+    const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
+    let deny = false, confirming = false, moveRead = false;
+    f.network[get] = req => {
+      if (deny && req.url.endsWith("/acme/rooms")) {
+        return { status: 404, body: { error: "no such space" }, delay: 2_000 };
+      }
+      const result = base(req);
+      if (confirming && req.url.endsWith("/side/rooms")) {
+        moveRead = true;
+        return { ...(result as object), delay: order === "move first" ? 0 : 4_000 };
+      }
+      return result;
+    };
+    const app = await inChat(f, 1200, "alice", true);
+    await app.waitFor("label:Open Side project › #lobby");
+    await app.press("id:run-follow:run-acme");
+    await app.waitFor("text:To: agent in Acme › #lobby");
+    const draft = "\u2003  🌿 @bob, résumé\nKeep my exact task  \t";
+    await app.paste("id:dispatch-text", { text: draft });
+    deny = true;
+    f.state.spaces.get("acme")!.members.delete("alice");
+    await app.press("id:run-follow:run-acme");
+    await app.waitFor("text:Checking the selected destination…");
+    await app.press("id:run-follow:run-side");
+    await app.waitFor("id:dispatch-move-confirm");
+    confirming = true;
+    await app.press("id:dispatch-move-draft");
+    await app.waitUntil(() => moveRead);
+    if (order === "move first") await app.waitFor("text:To: agent in Side project › #lobby");
+
+    await app.clock!.runFor(2_100);
+    await app.waitFor("id:space:acme", { state: "gone" });
+    if (order !== "move first") {
+      expect(app.shows("text:Choose a Space and a room.")).toBe(true);
+      expect(app.shows("text:Checking the new destination…")).toBe(true);
+      expect(app.enabled("id:dispatch-send")).toBe(false);
+    }
+    const retarget = order === "purge then explicit retarget";
+    if (retarget) {
+      await app.press("id:dispatch-space:side");
+      await app.press("id:dispatch-room:scratch");
+      await app.waitFor("text:To: agent in Side project › #Scratch");
+    }
+    const left = order === "purge then leave the view";
+    if (left) {
+      await app.press("id:nav-settings");
+      await app.waitFor("id:settings-dialog");
+      await app.press("id:settings-close");
+      await app.waitFor("id:settings-dialog", { state: "gone" });
+    }
+    await app.clock!.runFor(2_100);
+    expect(app.value("id:dispatch-text")).toBe(draft);
+    expect(sentAnything(f)).toBe(false);
+    if (left) {
+      expect(app.shows("text:Choose a Space and a room.")).toBe(true);
+      expect(app.enabled("id:dispatch-send")).toBe(false);
+      return;
+    }
+    await app.waitFor(`text:To: agent in Side project › #${retarget ? "Scratch" : "lobby"}`);
+    expect(app.shows("id:dispatch-error")).toBe(false);
+    await app.press("id:dispatch-send");
+    await app.waitFor("id:dispatch-notice");
+    expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
+      { path: `/v1/spaces/side/rooms/${retarget ? "scratch" : "lobby"}/messages`,
+        body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+    ]);
+  });
+}
+
+for (const recovery of ["retry", "different Space"] as const) {
+  test(`an inconclusive same-room recheck keeps Send blocked until ${recovery}`, async () => {
+    const f = world();
+    lobbyRuns(f);
+    // Select a non-default original room: re-clicking its Space must not silently pick #lobby.
+    f.addRoom("acme", { id: "releases", name: "Releases" });
+    f.addRoom("side", { id: "releases", name: "Releases" });
+    f.state.runs.push({ id: "releases", space_id: "acme", room_id: "releases", status: "completed", actor: "alice", task: "Earlier release task" });
+    const get = `GET ${BASE}/v1/*`, base = f.network[get]!;
+    let reply: "503" | "fresh" | undefined;
+    f.network[get] = req => {
+      if (!req.url.endsWith("/acme/rooms")) return base(req);
+      if (reply === "503") return { status: 503, body: { error: "temporarily unavailable" }, delay: 500 };
+      const result = base(req);
+      return reply === "fresh" ? { ...(result as object), delay: 500 } : result;
+    };
+    const app = await inChat(f, 1200, "alice", true);
+    await app.waitFor("label:Open Side project › #lobby");
+    await app.press("id:run-follow:releases");
+    await app.waitFor("text:To: agent in Acme › #Releases");
+    const draft = "\u2003  🌿 @bob, résumé\nRetry without losing text  \t";
+    await app.paste("id:dispatch-text", { text: draft });
+
+    reply = "503";
+    await app.press("id:run-follow:releases");
+    await app.waitFor("text:Checking the selected destination…");
+    expect(app.enabled("id:dispatch-send")).toBe(false);
+    await app.clock!.runFor(600);
+    await app.waitFor("text:/Follow up again to retry, or choose another room/");
+    expect(app.shows("id:dispatch-verifying")).toBe(false);
+    expect(app.shows("text:To: agent in Acme › #Releases")).toBe(true);
+    await expect(app.press("id:dispatch-send")).rejects.toMatchObject({ code: "ERR_NSH_TEST_DISABLED" });
+
+    await app.press("id:dispatch-close");
+    await app.press("id:dispatch-new");
+    await app.press("id:dispatch-space:acme");
+    await app.press("id:dispatch-room:releases");
+    expect(app.shows("text:To: agent in Acme › #Releases")).toBe(true);
+    expect(app.shows("id:dispatch-retry-destination")).toBe(true);
+    expect(app.enabled("id:dispatch-send")).toBe(false);
+    expect(app.value("id:dispatch-text")).toBe(draft);
+    expect(sentAnything(f)).toBe(false);
+
+    if (recovery === "retry") {
+      reply = "fresh";
+      await app.press("id:run-follow:releases");
+      await app.waitFor("text:Checking the selected destination…");
+      expect(app.enabled("id:dispatch-send")).toBe(false);
+      await app.clock!.runFor(600);
+      await app.waitUntil(() => app.enabled("id:dispatch-send"));
+      expect(app.shows("text:To: agent in Acme › #Releases")).toBe(true);
+    } else {
+      await app.press("id:dispatch-space:side");
+      await app.press("id:dispatch-room:releases");
+      await app.waitFor("text:To: agent in Side project › #Releases");
+      expect(app.enabled("id:dispatch-send")).toBe(true);
+      // The other destination is usable; returning to the failed scope from
+      // the cache is not a successful exact verification there.
+      await app.press("id:dispatch-space:acme");
+      await app.press("id:dispatch-room:releases");
+      expect(app.enabled("id:dispatch-send")).toBe(false);
+      await app.press("id:dispatch-space:side");
+      await app.press("id:dispatch-room:releases");
+      await app.waitFor("text:To: agent in Side project › #Releases");
+    }
+    expect(app.shows("id:dispatch-retry-destination")).toBe(false);
+    expect(app.value("id:dispatch-text")).toBe(draft);
+    expect(sentAnything(f)).toBe(false);
+    await app.press("id:dispatch-send");
+    await app.waitFor("id:dispatch-notice");
+    expect(f.posts().filter(p => p.path.endsWith("/messages"))).toMatchObject([
+      { path: recovery === "retry" ? "/v1/spaces/acme/rooms/releases/messages" : "/v1/spaces/side/rooms/releases/messages",
+        body: { text: draft, invoke_agent: true, infer_text_mentions: false } },
+    ]);
+  });
+}
 
 test("Follow up resolves an uncached thread in a cached Space before asking and checks it again on consent", async () => {
   const f = world();

@@ -18,13 +18,14 @@ import {
   dispatchError,
   dispatching,
   dispatchNotice,
-  dispatchRevalidating,
+  dispatchRoomCheck,
   dispatchTarget,
   draft,
   followUp,
   isActiveRun,
   me,
   openRun,
+  place,
   roomsOf,
   runBusy,
   runs,
@@ -170,15 +171,15 @@ function RunsPanel(props: { visible: boolean; onClose?: () => void }) {
   const resolving = signal<Move | null>(null);
   const moving = signal<Move | null>(null);
   const cancelMove = () => { choice.set(null); resolving.set(null); moving.set(null); };
-  const visibleForm = () => props.visible && dispatchOpen();
+  const visibleForm = () => props.visible && place() === "chat" && dispatchOpen();
   const activeChoice = () => {
     const item = choice();
     return visibleForm() && item?.decision.current() && runDestination(item.run) ? item : null;
   };
-  const verification = () => moving()?.current() ? "Checking the new destination…"
+  const verification = () => moving()?.moveCurrent() ? "Checking the new destination…"
     : resolving()?.current() ? "Looking up the room or thread…"
-    : dispatchRevalidating() ? "Checking the selected destination…" : null;
-  effect(() => { if (!props.visible) cancelMove(); });
+    : dispatchRoomCheck() === "checking" ? "Checking the selected destination…" : null;
+  effect(() => { if (!props.visible || place() !== "chat") cancelMove(); });
   cleanup(cancelMove);
   const follow = async (run: Run, opener?: ViewRef) => {
     cancelMove();
@@ -404,7 +405,8 @@ function dispatchRecipient() {
 
 function Dispatch(props: { verification: string | null; onEdit: () => void; onClose: () => void }) {
   const target = () => dispatchTarget();
-  const ready = () => !!dispatchSpace() && !!dispatchRoom() && dispatchDraft().trim().length > 0 && !dispatching() && !props.verification;
+  const ready = () => !!dispatchSpace() && !!dispatchRoom() && dispatchDraft().trim().length > 0 &&
+    !dispatching() && !dispatchRoomCheck() && !props.verification;
   return (
     <Surface variant="card" pad={3} gap={2} testID="dispatch">
       <Row align="center" gap={2}>
@@ -471,6 +473,11 @@ function Dispatch(props: { verification: string | null; onEdit: () => void; onCl
           </Label>
           <If when={props.verification}>
             {message => <Label variant="caption" color="muted" testID="dispatch-verifying">{message()}</Label>}
+          </If>
+          <If when={!props.verification && dispatchRoomCheck() === "retry"}>
+            <Label variant="caption" color="danger" testID="dispatch-retry-destination">
+              Send is blocked for this room. Follow up again to retry, or choose another room.
+            </Label>
           </If>
           <Row align="center" gap={2}>
             <Spacer />

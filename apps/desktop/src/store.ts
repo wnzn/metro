@@ -1046,6 +1046,7 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     senderNotices.set(strip(senderNotices()));
     if (unlist) spaces.set(spaces().filter((s) => s.id !== spaceId));
     if (dispatchTarget()?.spaceId === spaceId) dispatchTarget.set(null);
+    clearDispatchRoomChecks(prefix);
     const { [spaceId]: _members, ...restMembers } = membersBySpace();
     membersBySpace.set(restMembers);
     const { [spaceId]: _error, ...restErrors } = memberFailures();
@@ -1509,10 +1510,32 @@ export async function openRun(run: Run): Promise<void> {
   else notice.set("That room or thread isn't visible to you (yet).");
 }
 
+// This epoch records user intent, not cache/permission cleanup of the selected target.
 let dispatchIntent = 0;
 let dispatchDraftRevision = 0;
-const sameRoomDispatchCheck = signal<(() => boolean) | null>(null);
-export const dispatchRevalidating = () => sameRoomDispatchCheck()?.() === true;
+type DispatchRoomCheck = { phase: "checking" | "retry" };
+// Leave failures on the exact room: selecting away and back is not a recheck.
+const dispatchRoomChecks = signal(new Map<string, DispatchRoomCheck>());
+
+export function dispatchRoomCheck() {
+  const target = dispatchTarget();
+  return target?.roomId ? dispatchRoomChecks().get(scopeKey(target.spaceId, target.roomId))?.phase : undefined;
+}
+
+function setDispatchRoomCheck(key: string, check?: DispatchRoomCheck) {
+  const checks = dispatchRoomChecks();
+  if (!check && !checks.has(key)) return;
+  const next = new Map(checks);
+  if (check) next.set(key, check);
+  else next.delete(key);
+  dispatchRoomChecks.set(next);
+}
+
+function clearDispatchRoomChecks(prefix: string) {
+  const checks = dispatchRoomChecks();
+  const next = new Map([...checks].filter(([key]) => !key.startsWith(prefix)));
+  if (next.size !== checks.size) dispatchRoomChecks.set(next);
+}
 
 export function setDispatchDraft(text: string) {
   if (text === dispatchDraft()) return;
@@ -1539,39 +1562,51 @@ export function followUp(run: Run) {
   const latest = () => sameVisit() && intent === dispatchIntent;
   if (original?.spaceId === spaceId && original.roomId === roomId) {
     // Keep the selected recipient visible but don't send while checking it.
-    // Success must not replace its identity or interrupt a newer choice.
-    const check = () => sameVisit() && dispatchTarget() === original;
-    sameRoomDispatchCheck.set(check);
-    void verifyDispatchRoom(c, spaceId, roomId, () => intent === dispatchIntent && check()).finally(() => {
-      if (sameRoomDispatchCheck() === check) sameRoomDispatchCheck.set(null);
+    // An inconclusive response can't make the cached room sendable again.
+    const key = scopeKey(spaceId, roomId);
+    const check: DispatchRoomCheck = { phase: "checking" };
+    const current = () => latest() && dispatchTarget() === original;
+    setDispatchRoomCheck(key, check);
+    void verifyDispatchRoom(c, spaceId, roomId, current).then(verified => {
+      if (dispatchRoomChecks().get(key) === check) setDispatchRoomCheck(key, verified && current() ? undefined : { phase: "retry" });
     });
     return;
   }
-  const selectExactRoom = () => dispatchTarget.set({ spaceId, roomId });
+  const selectExactRoom = () => {
+    setDispatchRoomCheck(scopeKey(spaceId, roomId));
+    dispatchTarget.set({ spaceId, roomId });
+  };
   if (!text) {
     const pending = { spaceId, roomId: null };
     dispatchTarget.set(pending);
     void verifyDispatchRoom(c, spaceId, roomId, () => latest() && dispatchTarget() === pending, selectExactRoom);
     return;
   }
-  const current = () => latest() && dispatchTarget() === original && dispatchDraft() === text &&
+  // Once confirmed, a revocation can clear the old recipient without changing
+  // the user's move. A subsequent explicit selection still advances the epoch.
+  const moveCurrent = () => latest() && dispatchDraft() === text &&
     dispatchDraftRevision === revision && spaces().some(s => s.id === spaceId);
+  const current = () => moveCurrent() && dispatchTarget() === original;
   let used = false;
   return {
     current,
+    moveCurrent,
     lookup(stillHere: () => boolean) {
       return current() && stillHere() && verifyDispatchRoom(c, spaceId, roomId, () => current() && stillHere());
     },
     async move(stillHere: () => boolean) {
       if (used || !current() || !stillHere() || dispatching()) return;
       used = true;
-      await verifyDispatchRoom(c, spaceId, roomId, () => current() && stillHere(), selectExactRoom);
+      await verifyDispatchRoom(c, spaceId, roomId, () => moveCurrent() && stillHere(), selectExactRoom);
     },
   };
 }
 
 export async function setDispatchSpace(spaceId: string): Promise<void> {
   if (!client || !spaces().some((s) => s.id === spaceId)) return;
+  // Re-clicking the selected Space is not permission to fall back from an
+  // unverified exact room to its lobby. The room choices are already visible.
+  if (dispatchTarget()?.spaceId === spaceId && dispatchRoomCheck()) return;
   const intent = ++dispatchIntent;
   const ok = guard(spaceId);
   const sameSession = guard();
@@ -1651,7 +1686,7 @@ export async function sendDispatch(): Promise<void> {
   const text = dispatchDraft();
   const target = dispatchTarget();
   const c = client;
-  if (!text.trim() || !target?.roomId || !c || dispatching() || dispatchRevalidating()) return;
+  if (!text.trim() || !target?.roomId || !c || dispatching() || dispatchRoomCheck()) return;
   const space = spaces().find((s) => s.id === target.spaceId);
   const room = roomsBySpace()[target.spaceId]?.find((r) => r.id === target.roomId);
   if (!space || !room) {
@@ -2231,6 +2266,7 @@ function endSession() {
     runsError.set(null);
     runBusy.set(null);
     dispatchTarget.set(null);
+    dispatchRoomChecks.set(new Map());
     dispatchDraft.set("");
     dispatching.set(false);
     dispatchError.set(null);
@@ -2404,6 +2440,7 @@ async function dropLostRoom(spaceId: string, roomId: string, request: number, sh
     if (target?.spaceId === spaceId && target.roomId === roomId) {
       dispatchTarget.set({ spaceId, roomId: null });
     }
+    setDispatchRoomCheck(key);
     const { [key]: _e, ...events } = eventsByScope();
     eventsByScope.set(events);
     if (activeSpaceId() === spaceId && activeRoomId() === roomId) {
