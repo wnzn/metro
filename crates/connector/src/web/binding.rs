@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
 
 use crate::fsutil::{read_private, remove_private, write_private};
+use crate::netpolicy::validate_canonical_server_url;
 use crate::openai_oauth::store::{seal, unseal};
 use crate::profile::validate_device_token;
 use crate::{SafeError, Secret};
@@ -53,6 +54,9 @@ impl Binding {
         device_id: Option<String>,
         token: Secret,
     ) -> Result<Self> {
+        // The URL is part of the identity. Don't silently change which
+        // server a stored credential and the per-owner data are bound to.
+        validate_canonical_server_url(server_url, "web binding server_url")?;
         validate_device_token(&token)?;
         if owner.is_empty() || owner.len() > 300 || owner.chars().any(char::is_control) {
             bail!("invalid owner");
@@ -123,4 +127,33 @@ pub fn save(dir: &Path, b: &Binding) -> Result<()> {
 
 pub fn remove(dir: &Path) -> Result<bool> {
     remove_private(&path(dir))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn saved_binding_requires_a_canonical_metro_server_url() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::fsutil::ensure_private_dir(dir.path()).unwrap();
+        for server_url in [
+            "http://metro.invalid/",
+            "http://metro.invalid/?query",
+            "http://metro.invalid/#fragment",
+            "http://user:password@metro.invalid",
+            "ftp://metro.invalid",
+        ] {
+            let wire = Wire {
+                v: 1,
+                server_url: server_url.into(),
+                owner: "account:alice".into(),
+                device_id: Some("wd_fixture".into()),
+                token: format!("metro_pc_{:064x}", 1),
+            };
+            let sealed = seal(serde_json::to_vec(&wire).unwrap()).unwrap();
+            write_private(&path(dir.path()), &sealed).unwrap();
+            assert!(load(dir.path()).is_err(), "accepted an invalid binding URL");
+        }
+    }
 }
