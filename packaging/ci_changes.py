@@ -6,6 +6,7 @@ github.event.before..github.sha). It prints one answer per segment, and
 "true" means run:
 
 - rust:       the `rust` job (Cargo build, clippy, tests, end-to-end scripts).
+- updates:    the isolated updater fixture build and test within `rust`.
 - desktop:    the `desktop` job (nsh check and nsh test in apps/desktop).
 - containers: the `containers` job (images, Compose files, media service).
 - packaging:  the `packaging` job (packaging, release and signing unit tests).
@@ -33,7 +34,7 @@ import subprocess
 import sys
 
 
-SEGMENTS = ("rust", "desktop", "containers", "packaging", "previews")
+SEGMENTS = ("rust", "updates", "desktop", "containers", "packaging", "previews")
 ALL = frozenset(SEGMENTS)
 NONE = frozenset()
 SHA = re.compile(r"[a-f0-9]{40}")
@@ -60,6 +61,11 @@ RULES = tuple((re.compile(pattern.encode()), frozenset(segments)) for pattern, s
     (r"\.cargo/.+", {"rust", "previews"}),
     (r"tests/e2e/.+", {"rust", "containers"}),  # containers runs library_reference.py
     (r"tests/.+|examples/.+", {"rust"}),
+    # The updater fixture builds server and runner with their local runtime
+    # dependencies, imports smoke.py and exercises the actual Linux installer.
+    (r"crates/(?:server|runner|release|auth|model-protocol|url-policy)/.+"
+     r"|Cargo\.lock|rust-toolchain(?:\.toml)?|\.cargo/.+"
+     r"|tests/e2e/(?:updates|smoke)\.py|packaging/install-metro-runner-linux\.sh", {"rust", "updates"}),
     # crates/desktop/build.rs embeds the icon; package.py and the signing tests read the assets.
     (r"apps/desktop/assets/.+", {"rust", "desktop", "packaging", "previews"}),
     # package.py and the packaging tests read the icon modules, icons and font.

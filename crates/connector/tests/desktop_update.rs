@@ -16,7 +16,7 @@ use metro_connector::desktop::bridge;
 use metro_connector::desktop::core::{Desktop, DesktopConfig};
 use metro_connector::desktop::update::apply::{self, TrialOutcome, TrialPaths};
 use metro_connector::desktop::update::install::{self, InstallKind, Journal, JournalPhase};
-use metro_connector::desktop::update::{Busy, Updater, UpdaterConfig};
+use metro_connector::desktop::update::{Busy, InstallFailure, Updater, UpdaterConfig};
 use metro_release::fetch::Source;
 use metro_release::testing::{FixtureRelease, TestVerifier, release_json, tar_gz};
 use metro_release::{Channel, Version};
@@ -994,10 +994,31 @@ fn backup_intent_recovers_on_both_sides_of_publication() {
         }
         drop(lock);
         let old = Version::parse(OLD).unwrap();
-        assert_eq!(
-            install::recover(&p.root, &p.desktop_root, &p.update_dir, &old),
-            install::Recovery::Nothing
-        );
+        let instance = metro_connector::desktop::store::try_lock_instance(&p.desktop_root)
+            .unwrap()
+            .unwrap();
+        let gate = p.desktop_root.join("desktop-update.json");
+        let gate_bytes = serde_json::to_vec(&json!({"root": p.root, "id": j.id})).unwrap();
+        fs::write(&gate, &gate_bytes).unwrap();
+        let journal = p.root.join(install::JOURNAL);
+        let mut replacement = j.clone();
+        replacement.id = "ffeeddccbbaa9988".into();
+        install::write_journal(&journal, &replacement).unwrap();
+        let recover = || {
+            install::recover_with_gate(&p.root, &p.desktop_root, &p.update_dir, &old, &j, &instance)
+        };
+        assert_eq!(recover(), install::Recovery::JournalUncertain);
+        assert_eq!(install::read_journal(&journal), Some(replacement));
+        assert_eq!(fs::read(&gate).unwrap(), gate_bytes);
+        assert!(if published {
+            backup.exists()
+        } else {
+            pending.exists()
+        });
+        install::write_journal(&journal, &j).unwrap(); // restore the fixture's valid record
+        assert_eq!(recover(), install::Recovery::Nothing);
+        assert!(!gate.exists());
+        drop(instance);
         assert_eq!(db(&i), before);
         assert!(!pending.exists() && !backup.exists());
         assert!(old_orphan.join("metro.sqlite3").is_file());
@@ -1198,16 +1219,36 @@ async fn resumed_apply_requires_signed_evidence_and_every_staged_file() {
     drop(u);
 
     let u = updater(&i, &f, Channel::Release);
+    let stage_revision = u.state(Busy::default())["stage_revision"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let rx = u.apply_requests();
     u.request_apply(NEW, true, Busy::default()).unwrap();
     let req = rx.borrow().clone().unwrap();
     let lock = install::Lock::take(&i.root).unwrap();
     u.verify_apply(&req, &lock).unwrap();
+    let journal_path = i.root.join(install::JOURNAL);
+    let original_journal = fs::read(&journal_path).unwrap();
+    fs::write(&journal_path, b"{").unwrap();
+    let ambiguous = u.verify_apply(&req, &lock).err().unwrap();
+    assert!(
+        ambiguous
+            .get_ref()
+            .is_some_and(|e| e.is::<install::JournalUncertain>())
+    );
+    assert_eq!(fs::read(&journal_path).unwrap(), b"{");
+    fs::write(&journal_path, original_journal).unwrap();
     let stage = i.root.join("versions").join(NEW);
     let app_file = stage.join("ui/Metro");
     let original = fs::read(&app_file).unwrap();
     fs::write(&app_file, b"changed after staging").unwrap();
-    assert!(u.verify_apply(&req, &lock).is_err());
+    let bad_stage = u.verify_apply(&req, &lock).err().unwrap();
+    assert!(
+        !bad_stage
+            .get_ref()
+            .is_some_and(|e| e.is::<install::JournalUncertain>())
+    );
     fs::write(&app_file, original).unwrap();
     let assets = i
         .desktop_root
@@ -1220,7 +1261,83 @@ async fn resumed_apply_requires_signed_evidence_and_every_staged_file() {
     fs::write(&package, archive).unwrap();
     fs::write(assets.join("SHA256SUMS.sigstore.json"), b"changed proof").unwrap();
     assert!(u.verify_apply(&req, &lock).is_err());
+    assert_ne!(stage_revision, req.journal_id);
+    let journal = fs::read(i.root.join(install::JOURNAL)).unwrap();
+    assert!(u.record_install_failure(req.version, InstallFailure::StageVerificationFailed));
+    drop(lock);
+    drop(u);
+
+    // Real release metadata still verifies, but it says nothing about the
+    // staged bytes. Neither relaunch nor a fresh check repairs that stage.
+    let u = updater(&i, &f, Channel::Release);
+    assert_eq!(u.state(Busy::default())["phase"], "idle");
+    u.check(true).await.unwrap();
+    let view = u.state(Busy::default());
+    assert_eq!(view["phase"], "idle");
+    assert_eq!(view["latest"]["version"], NEW);
+    assert_eq!(
+        view["last_update"]["failure_code"],
+        "stage_verification_failed"
+    );
+    assert!(view.get("stage_revision").is_none());
+    assert!(u.request_apply(NEW, true, Busy::default()).is_err());
+    assert_eq!(
+        u.start_download(NEW).unwrap_err().code,
+        "stage_verification_failed"
+    );
+    assert_eq!(fs::read(i.root.join(install::JOURNAL)).unwrap(), journal);
+    assert!(stage.is_dir() && package.is_file());
     assert_eq!(install::read_pointer(&i.root).as_deref(), Some(OLD));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn missing_stage_evidence_does_not_hide_an_ambiguous_installation() {
+    let i = install();
+    let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
+    let u = updater(&i, &f, Channel::Release);
+    u.check(true).await.unwrap();
+    u.start_download(NEW).unwrap();
+    assert_eq!(until_settled(&u).await["phase"], "ready");
+    u.request_apply(NEW, true, Busy::default()).unwrap();
+    let req = u.apply_requests().borrow().clone().unwrap();
+    let lock = install::Lock::take(&i.root).unwrap();
+    let (j, _) = u.verify_apply(&req, &lock).unwrap();
+    let journal = i.root.join(install::JOURNAL);
+    let raw = fs::read(&journal).unwrap();
+    let kind = InstallKind::LinuxInstaller {
+        root: i.root.clone(),
+    };
+    let update_dir = i.desktop_root.join("update");
+    let manifest = update_dir
+        .join(format!("stage-{}", req.journal_id))
+        .join("SHA256SUMS");
+    fs::remove_file(&manifest).unwrap();
+    let is_uncertain = |e: std::io::Error| {
+        e.get_ref()
+            .is_some_and(|e| e.is::<install::JournalUncertain>())
+    };
+    let assert_verification = |uncertain| {
+        let e = u.verify_apply(&req, &lock).err().unwrap();
+        assert_eq!(is_uncertain(e), uncertain, "apply verification diagnostic");
+        let e = install::verify_staged(&kind, &update_dir, &j, &TestVerifier, None, &lock)
+            .err()
+            .unwrap();
+        assert_eq!(is_uncertain(e), uncertain, "staged verification diagnostic");
+    };
+    install::set_pointer(&i.root, NEW).unwrap();
+    assert_verification(true);
+    assert_eq!(install::read_pointer(&i.root).as_deref(), Some(NEW));
+    assert_eq!(fs::read(&journal).unwrap(), raw);
+    fs::write(&journal, b"{").unwrap();
+    assert_verification(true);
+    assert_eq!(fs::read(&journal).unwrap(), b"{");
+    assert!(!manifest.exists());
+
+    // With the install record and pointer restored, the same loss is an
+    // ordinary payload failure; the published manual install path still applies.
+    fs::write(&journal, raw).unwrap();
+    install::set_pointer(&i.root, OLD).unwrap();
+    assert_verification(false);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1378,29 +1495,72 @@ fn failed_restore_keeps_the_snapshot_and_can_retry_under_the_same_watchdog() {
 
 #[test]
 fn unknown_or_foreign_journal_is_never_consumed() {
+    use std::os::unix::fs::MetadataExt;
+
     let i = install();
     let mut j = staged_journal(&i);
     let p = paths(&i);
     let path = p.root.join(install::JOURNAL);
     let old = Version::parse(OLD).unwrap();
+    let snap = p.update_dir.join(format!("db-snapshot-{}", j.id));
+    fs::create_dir_all(&snap).unwrap();
+    let backup = snap.join("metro.sqlite3");
+    fs::write(&backup, b"preserve old database").unwrap();
+    let compat = p.root.join(".lock");
+    let owner = compat.join("owner.metro-lock-v2");
+    let owner_bytes = b"metro-lock-v2:connector-fixture\n";
+    fs::create_dir(&compat).unwrap();
+    fs::write(&owner, owner_bytes).unwrap();
+    let compat_inode = fs::metadata(&compat).unwrap().ino();
     for raw in [
+        b"{".as_slice(),
         br#"{"version":99,"id":"01","phase":"trial"}"#.as_slice(),
         br#"{"version":1,"id":"../../outside","from":"0.9.0","to":"0.9.1","phase":"trial","started_at":0}"#,
         br#"{"version":1,"id":"0123456789abcdef","from":"0.9.1","to":"0.9.0","phase":"trial","started_at":0}"#,
     ] {
         fs::write(&path, raw).unwrap();
-        assert_eq!(install::recover(&p.root, &p.desktop_root, &p.update_dir, &old), install::Recovery::Blocked);
+        assert_eq!(
+            install::recover(&p.root, &p.desktop_root, &p.update_dir, &old),
+            install::Recovery::JournalUncertain
+        );
         assert_eq!(fs::read(&path).unwrap(), raw);
+        assert_eq!(install::read_pointer(&p.root).as_deref(), Some(OLD));
+        assert_eq!(fs::read(&backup).unwrap(), b"preserve old database");
+        assert_eq!(fs::read(&owner).unwrap(), owner_bytes);
+        assert_eq!(fs::metadata(&compat).unwrap().ino(), compat_inode);
     }
     j.phase = JournalPhase::Trial;
     install::write_journal(&path, &j).unwrap();
     install::set_pointer(&p.root, "0.9.2").unwrap();
     assert_eq!(
         install::recover(&p.root, &p.desktop_root, &p.update_dir, &old),
-        install::Recovery::Blocked
+        install::Recovery::JournalUncertain
     );
     assert_eq!(install::read_journal(&path), Some(j));
     assert_eq!(install::read_pointer(&p.root).as_deref(), Some("0.9.2"));
+    assert_eq!(fs::read(&owner).unwrap(), owner_bytes);
+    assert_eq!(fs::metadata(&compat).unwrap().ino(), compat_inode);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_journal_that_becomes_unreadable_during_use_blocks_future_staging() {
+    let i = install();
+    let f = serve(release(desktop_archive(NEW, "desktop")).files, vec![]);
+    let u = updater(&i, &f, Channel::Release);
+    u.check(true).await.unwrap();
+    let journal = i.root.join(install::JOURNAL);
+    fs::write(&journal, b"{").unwrap();
+    u.start_download(NEW).unwrap();
+    let state = until_settled(&u).await;
+    assert_eq!(state["phase"], "failed");
+    assert_eq!(state["failure"]["code"], install::JOURNAL_UNCERTAIN);
+    u.check(true).await.unwrap();
+    assert_eq!(
+        u.start_download(NEW).unwrap_err().code,
+        install::JOURNAL_UNCERTAIN
+    );
+    assert_eq!(fs::read(&journal).unwrap(), b"{");
+    assert_eq!(install::read_pointer(&i.root).as_deref(), Some(OLD));
 }
 
 #[test]

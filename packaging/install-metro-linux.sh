@@ -20,7 +20,7 @@ Usage:
   install-metro-linux.sh update    --archive FILE [options]
   install-metro-linux.sh uninstall
   install-metro-linux.sh check-deps [--install-deps]
-  install-metro-linux.sh status
+  install-metro-linux.sh status  (read-only, including update journal diagnosis)
 
 Options for install/update:
   --archive FILE        Metro-<version>-linux-x64.tar.gz (a local file)
@@ -55,6 +55,7 @@ data_home=$(xdg_dir "${XDG_DATA_HOME:-}" "$HOME/.local/share")
 config_home=$(xdg_dir "${XDG_CONFIG_HOME:-}" "$HOME/.config")
 root=$(xdg_dir "${METRO_INSTALL_DIR:-}" "$data_home/metro-desktop-app")
 user_data=$config_home/metro-desktop
+workspace_data=$(xdg_dir "${METRO_DESKTOP_HOME:-}" "$user_data")
 
 # ---------------------------------------------------------------- arguments
 action=${1:-}
@@ -228,16 +229,27 @@ run_privileged_install() { # $1 = package manager command (fixed list)
 # $root/.update.json and locks the installation directory while it mutates it.
 JOURNAL=.update.json
 
-refuse_during_in_app_update() {
-    staged_version=
-    [ -e "$root/$JOURNAL" ] || [ -L "$root/$JOURNAL" ] || return 0
-    [ -f "$root/$JOURNAL" ] && [ ! -L "$root/$JOURNAL" ] ||
-        die "$root/$JOURNAL has an unknown in-app update state"
-    command -v python3 >/dev/null 2>&1 ||
-        die "python3 is needed to read the update journal safely; start Metro to finish the update and retry"
+has_update_journal() {
+    [ -e "$root/$JOURNAL" ] || [ -L "$root/$JOURNAL" ]
+}
+
+has_workspace_update_gate() {
+    [ -e "$workspace_data/desktop-update.json" ] || [ -L "$workspace_data/desktop-update.json" ]
+}
+
+journal_unknown() {
+    reason=${1:-"$root/$JOURNAL has an unknown in-app update state."}
+    die "[update_journal_unknown] $reason
+Stop Metro, its bundled server and any installer. Keep the installation and workspace data, including the update records, live database and backup. Do not remove locks or records, change the current version pointer, or overwrite either database copy.
+Use the verified official installer with 'sh install-metro-linux.sh status' for read-only diagnosis, not install, update or uninstall. Contact https://github.com/wnzn/metro/issues with this diagnostic, not private databases or credentials."
+}
+
+read_update_journal() {
+    [ -f "$root/$JOURNAL" ] && [ ! -L "$root/$JOURNAL" ] &&
+        command -v python3 >/dev/null 2>&1 || return 1
     current=$(readlink -- "$root/current" || :)
-    fields=$(python3 - "$root/$JOURNAL" "$current" <<'PY'
-import json, re, sys
+    python3 - "$root/$JOURNAL" "$current" <<'PY'
+import json, os, re, stat, sys
 
 def fields(items):
     result = {}
@@ -256,7 +268,10 @@ def version(s):
     return values
 
 try:
-    with open(sys.argv[1], 'rb') as f:
+    fd = os.open(sys.argv[1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(fd, 'rb') as f:
+        if not stat.S_ISREG(os.fstat(f.fileno()).st_mode):
+            raise ValueError()
         raw = f.read(65537)
     if len(raw) > 65536:
         raise ValueError()
@@ -302,16 +317,33 @@ try:
 except (ValueError, KeyError, TypeError, OSError, RecursionError):
     sys.exit(1)
 PY
-    ) || die "$root/$JOURNAL has an unknown in-app update state; start Metro once, then run this again"
+}
+
+refuse_during_in_app_update() {
+    staged_version=
+    if ! has_update_journal; then
+        if has_workspace_update_gate; then
+            journal_unknown "A workspace update gate exists but this installation's update journal is missing."
+        fi
+        return 0
+    fi
+    fields=$(read_update_journal) || journal_unknown
     phase=${fields% *}
     target=${fields#* }
     case "$phase" in
         staged) staged_version=$target ;;
         committed|failed) ;;
-        backing_up|trial|committing|rolling_back|cleanup)
+        backing_up|cleanup)
             die "Metro is in the middle of updating itself to $target. Let it finish, or close Metro and start it once to complete or undo the update, then run this again" ;;
-        *) die "$root/$JOURNAL has an unknown in-app update state; start Metro once, then run this again" ;;
+        trial|committing|rolling_back)
+            die "[update_recovery_required] Metro is in the middle of updating itself to $target. Let the active Metro finish. If it stopped, keep the install, update records and both database copies unchanged. Run 'sh install-metro-linux.sh status' for read-only diagnosis and contact https://github.com/wnzn/metro/issues; do not run install, update or uninstall to recover." ;;
+        *) journal_unknown ;;
     esac
+    # A valid staged or terminal install journal is not proof that the
+    # workspace's durable gate has been retired by its verified owner.
+    if has_workspace_update_gate; then
+        die "[update_recovery_required] A workspace update gate is still present. Leave the records, current pointer and both database copies unchanged. Use 'sh install-metro-linux.sh status' for read-only diagnosis and contact https://github.com/wnzn/metro/issues if Metro cannot verify recovery."
+    fi
 }
 
 lock_busy() { # why $root/.lock exists
@@ -321,9 +353,19 @@ lock_busy() { # why $root/.lock exists
     die "another install is running (or a previous one crashed: remove $root/.lock and retry)"
 }
 
+install_root_has_entries() { # optionally skip the lock we just took
+    for root_entry in "$root"/* "$root"/.[!.]* "$root"/..?*; do
+        [ "$root_entry" != "${1:-}" ] || continue
+        if [ -e "$root_entry" ] || [ -L "$root_entry" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 lock_install_root() {
     [ -d "$root" ] && [ ! -L "$root" ] || die "install directory is not a plain directory"
-    if [ -n "$(ls -A -- "$root" 2>/dev/null)" ] && { [ ! -f "$root/$MARK" ] || [ -L "$root/$MARK" ]; }; then
+    if install_root_has_entries && { [ ! -f "$root/$MARK" ] || [ -L "$root/$MARK" ]; }; then
         die "$root was not created by this installer; refusing to change it"
     fi
     [ "$(stat -c '%u' -- "$root")" = "$(id -u)" ] || die "install directory is not owned by you"
@@ -347,14 +389,15 @@ compat_retire() {
 
 compat_take() {
     compat_owner=$root/.lock/owner.metro-lock-v2
-    if [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; then
-        [ ! -L "$root/.lock" ] && [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
+    if { [ -e "$root/.lock" ] || [ -L "$root/.lock" ]; } &&
+        ! { [ ! -L "$root/.lock" ] && [ ! -L "$compat_owner" ] && [ -f "$compat_owner" ] &&
             [ "$(ls -A -- "$root/.lock")" = owner.metro-lock-v2 ] &&
             [ "$(stat -c '%s' -- "$compat_owner")" -le 128 ] &&
             [ "$(wc -l <"$compat_owner")" -eq 1 ] &&
             [ "$(LC_ALL=C grep -ac '^' "$compat_owner")" -eq 1 ] &&
             LC_ALL=C grep -aExq 'metro-lock-v2:[A-Za-z0-9._-]+' "$compat_owner" &&
-            compat_retire || lock_busy
+            compat_retire; }; then
+        lock_busy
     fi
     compat_new=$(mktemp -d -- "$root/.lock-new.XXXXXX")
     compat_token=metro-lock-v2:${compat_new##*/}
@@ -378,9 +421,11 @@ compat_release() {
 
 # ---------------------------------------------------------------- install
 lock() {
+    # Only the new install root is private; parent directories use the umask.
+    # shellcheck disable=SC2174
     mkdir -p -m 700 -- "$root"
     lock_install_root
-    if [ -e "$root/current" ] || [ -n "$(ls -A -- "$root" | grep -vxF .lock || :)" ]; then
+    if [ -e "$root/current" ] || install_root_has_entries "$root/.lock"; then
         [ -f "$root/$MARK" ] && [ ! -L "$root/$MARK" ] ||
             die "$root exists but was not created by this installer; refusing to change it"
     fi
@@ -519,6 +564,18 @@ uninstall_app() {
 }
 
 status() {
+    say "Install directory: $root"
+    say "Workspace data: $workspace_data"
+    if has_workspace_update_gate; then
+        say "Workspace update gate present. Leave it and the workspace data intact."
+        if ! has_update_journal; then
+            journal_unknown "A workspace update gate exists but this installation's update journal is missing."
+        fi
+    fi
+    if has_update_journal; then
+        fields=$(read_update_journal) || journal_unknown
+        say "Update journal phase: ${fields% *} (read-only diagnosis; does not authorize recovery)"
+    fi
     if [ -L "$root/current" ]; then
         target=$(readlink -- "$root/current")
         say "Installed: Metro ${target#versions/} in $root/$target"

@@ -36,6 +36,9 @@
     usersCard: $("users-card"), usersUpdated: $("users-updated"), refresh: $("refresh"),
     usersError: $("users-error"), usersEmpty: $("users-empty"), usersLoading: $("users-loading"),
     usersTable: $("users-table"), usersBody: $("users-body"),
+    pageLimitsForm: $("page-limits-form"), pageLimitsSave: $("page-limits-save"),
+    pageLimitsRetry: $("page-limits-retry"), pageLimitsError: $("page-limits-error"),
+    pageLimitsStatus: $("page-limits-status"),
     updateNotice: $("update-notice"), updateCurrent: $("update-current"), updateLatest: $("update-latest"),
     updateImage: $("update-image"), updateLink: $("update-link"),
     announce: $("announce"),
@@ -228,7 +231,8 @@
   let state = freshState();
 
   function freshState() {
-    return { users: [], loadedAt: null, loading: false, busy: new Set() };
+    return { users: [], loadedAt: null, loading: false, busy: new Set(),
+      pageLimits: null, pageLimitsBusy: false };
   }
 
   async function api(method, path, body) {
@@ -343,6 +347,7 @@
       announce("Signed in. Loading managed users.");
       el.addName.focus();
       loadUpdateNotice(s);
+      loadPageLimits();
       await loadUsers();
     } catch (e) {
       if (e instanceof SessionGone) return;
@@ -356,7 +361,7 @@
   }
 
   // Forget everything tied to the session: token, in-flight requests,
-  // user list and any one-time secret.
+  // user list, Page limits and any one-time secret.
   function dropSession() {
     if (session) { session.abort.abort(); session.token = null; }
     session = null;
@@ -371,6 +376,7 @@
     hideAlert(el.usersError);
     hideAlert(el.addError);
     el.addName.value = "";
+    resetPageLimits();
     el.token.value = "";
     el.whoName.textContent = "";
     el.whoId.textContent = "";
@@ -413,6 +419,114 @@
       el.updateNotice.hidden = false;
     } catch (e) {
       // No notice; never end the session for this optional call.
+    }
+  }
+
+  // ---------------------------------------------------------------- Page limits
+
+  const PAGE_LIMITS = "/v1/admin/settings";
+  const limitFields = [
+    { key: "pages_per_space", input: $("pages-per-space") },
+    { key: "versions_per_page", input: $("versions-per-page") },
+  ];
+
+  function showPageLimits(data) {
+    if (!data || !limitFields.every(({ key }) => Number.isInteger(data[key]))) {
+      throw new ApiError(0, "The server didn't return both Page limits as whole numbers.");
+    }
+    state.pageLimits = data;
+    for (const { input, key } of limitFields) input.value = String(data[key]);
+    el.pageLimitsForm.hidden = false;
+  }
+
+  function resetPageLimits() {
+    el.pageLimitsForm.hidden = true;
+    el.pageLimitsRetry.hidden = true;
+    el.pageLimitsRetry.removeAttribute("aria-disabled");
+    el.pageLimitsSave.removeAttribute("aria-disabled");
+    el.pageLimitsStatus.textContent = "";
+    hideAlert(el.pageLimitsError);
+    for (const { input } of limitFields) {
+      input.value = "";
+      input.readOnly = false;
+      input.removeAttribute("aria-invalid");
+    }
+  }
+
+  async function loadPageLimits() {
+    if (!session?.me?.is_org_admin || state.pageLimitsBusy || state.pageLimits) return;
+    const s = session;
+    state.pageLimitsBusy = true;
+    el.pageLimitsRetry.setAttribute("aria-disabled", "true");
+    hideAlert(el.pageLimitsError);
+    el.pageLimitsStatus.textContent = "Loading Page limits…";
+    try {
+      const data = await api("GET", PAGE_LIMITS);
+      if (session !== s) return;
+      showPageLimits(data);
+      const moveFocus = document.activeElement === el.pageLimitsRetry;
+      el.pageLimitsRetry.hidden = true;
+      if (moveFocus) limitFields[0].input.focus();
+    } catch (e) {
+      if (e instanceof SessionGone || session !== s || handleForbidden(e)) return;
+      showAlert(el.pageLimitsError, "Couldn't load Page limits: " + errorText(e));
+      el.pageLimitsRetry.hidden = false;
+    } finally {
+      if (session === s) {
+        state.pageLimitsBusy = false;
+        el.pageLimitsRetry.removeAttribute("aria-disabled");
+        el.pageLimitsStatus.textContent = "";
+      }
+    }
+  }
+
+  async function savePageLimits(ev) {
+    ev.preventDefault();
+    if (!session?.me?.is_org_admin || !state.pageLimits || state.pageLimitsBusy) return;
+    const s = session;
+    hideAlert(el.pageLimitsError);
+    el.pageLimitsStatus.textContent = "";
+    const patch = {};
+    const invalid = [];
+    for (const { input, key } of limitFields) {
+      const value = input.valueAsNumber;
+      if (!input.validity.valid || !Number.isInteger(value)) {
+        input.setAttribute("aria-invalid", "true");
+        invalid.push(input);
+      } else if (value !== state.pageLimits[key]) {
+        patch[key] = value;
+      }
+    }
+    if (invalid.length) {
+      showAlert(el.pageLimitsError, invalid.map((input) =>
+        input.labels[0].textContent + ": enter a whole number from " + input.min + " to " + input.max + "."
+      ).join(" "));
+      invalid[0].focus();
+      return;
+    }
+    if (Object.keys(patch).length === 0) {
+      el.pageLimitsStatus.textContent = "No changes to save.";
+      return;
+    }
+    state.pageLimitsBusy = true;
+    el.pageLimitsSave.setAttribute("aria-disabled", "true");
+    el.pageLimitsStatus.textContent = "Saving Page limits…";
+    for (const { input } of limitFields) input.readOnly = true;
+    try {
+      const data = await api("PATCH", PAGE_LIMITS, patch);
+      if (session !== s) return;
+      showPageLimits(data);
+      el.pageLimitsStatus.textContent = "Page limits saved.";
+    } catch (e) {
+      if (e instanceof SessionGone || session !== s || handleForbidden(e)) return;
+      el.pageLimitsStatus.textContent = "";
+      showAlert(el.pageLimitsError, "Couldn't save Page limits: " + errorText(e) + " Select Save Page limits to retry.");
+    } finally {
+      if (session === s) {
+        state.pageLimitsBusy = false;
+        el.pageLimitsSave.removeAttribute("aria-disabled");
+        for (const { input } of limitFields) input.readOnly = false;
+      }
     }
   }
 
@@ -717,6 +831,14 @@
     const hadSecretInUrl = scrubUrl();
     el.signinForm.addEventListener("submit", signIn);
     el.addForm.addEventListener("submit", addUser);
+    el.pageLimitsForm.addEventListener("submit", savePageLimits);
+    el.pageLimitsRetry.addEventListener("click", loadPageLimits);
+    for (const { input } of limitFields) {
+      input.addEventListener("input", () => {
+        input.removeAttribute("aria-invalid");
+        el.pageLimitsStatus.textContent = "";
+      });
+    }
     el.signOut.addEventListener("click", () => { endSession(null); announce("Signed out."); });
     el.deniedBack.addEventListener("click", () => endSession(null));
     el.refresh.addEventListener("click", () => loadUsers());

@@ -6,12 +6,12 @@
 //! Access is decided by the caller ([`super::access`]); these functions
 //! only store and read.
 
-use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 
 use super::access::{Rights, member_role, rights_in};
-use super::limits::PageLimits;
 use super::spec::{Action, PageSpec};
+use crate::admin_settings;
 use crate::db::{Activity, Author, Db, Event, Room, event_time, now_ms};
 
 /// How long a soft-deleted page can be restored.
@@ -459,7 +459,7 @@ pub(crate) fn load_space_in(
 #[derive(Debug, PartialEq, Eq)]
 pub enum CreateError {
     /// The Space (or person) already has the most pages allowed.
-    TooMany(usize),
+    TooMany(u32),
     /// The author isn't a member of the Space (any more): 404.
     NotAllowed,
 }
@@ -483,23 +483,21 @@ fn live_count(conn: &Connection, space: Option<&str>, owner: &str) -> rusqlite::
     }
 }
 
-/// Create a page with version 1 on `conn` (inside the caller's
-/// transaction). `space` set: a Space page; otherwise a personal page of
-/// `version.author_id`.
+/// Create a page with version 1. `space` set: a Space page; otherwise a
+/// personal page of `version.author_id`.
 fn create_in(
-    conn: &Connection,
+    tx: &Transaction<'_>,
     space: Option<&str>,
     version: &NewVersion,
-    limits: &PageLimits,
 ) -> anyhow::Result<Result<PageRow, CreateError>> {
     if let Some(sid) = space
-        && member_role(conn, sid, &version.author_id)?.is_none()
+        && member_role(tx, sid, &version.author_id)?.is_none()
     {
         return Ok(Err(CreateError::NotAllowed));
     }
-    let count = live_count(conn, space, &version.author_id)?;
-    if usize::try_from(count).unwrap_or(usize::MAX) >= limits.pages_per_space {
-        return Ok(Err(CreateError::TooMany(limits.pages_per_space)));
+    let limit = admin_settings::page_limits(tx)?.pages_per_space;
+    if live_count(tx, space, &version.author_id)? >= i64::from(limit) {
+        return Ok(Err(CreateError::TooMany(limit)));
     }
     let id = new_page_id();
     let now = now_ms();
@@ -507,7 +505,7 @@ fn create_in(
         Some(_) => ("space", None),
         None => ("personal", Some(version.author_id.as_str())),
     };
-    conn.execute(
+    tx.execute(
         "INSERT INTO pages (id, scope, owner_id, space_id, creator_id, title, head_version, \
          created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?7)",
         params![
@@ -520,8 +518,8 @@ fn create_in(
             now
         ],
     )?;
-    insert_version(conn, &id, 1, version, now)?;
-    let page = get_in(conn, &id)?.ok_or_else(|| anyhow::anyhow!("reading the new page"))?;
+    insert_version(tx, &id, 1, version, now)?;
+    let page = get_in(tx, &id)?.ok_or_else(|| anyhow::anyhow!("reading the new page"))?;
     Ok(Ok(page))
 }
 
@@ -530,11 +528,10 @@ pub fn create(
     db: &Db,
     space: Option<&str>,
     version: &NewVersion,
-    limits: &PageLimits,
 ) -> anyhow::Result<Result<PageRow, CreateError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let out = create_in(&tx, space, version, limits)?;
+    let out = create_in(&tx, space, version)?;
     if out.is_ok() {
         tx.commit()?;
     }
@@ -638,17 +635,16 @@ pub enum SaveError {
     Denied(Denied),
 }
 
-/// Append version `base + 1` on `conn` if `version.author_id` may edit the
+/// Append version `base + 1` if `version.author_id` may edit the
 /// live page now and its head is still `base` (optimistic concurrency:
 /// never a silent overwrite), then prune old versions.
 fn add_version_in(
-    conn: &Connection,
+    tx: &Transaction<'_>,
     page: &str,
     base: i64,
     version: &NewVersion,
-    limits: &PageLimits,
 ) -> anyhow::Result<Result<i64, SaveError>> {
-    let row = match load_in(conn, page, &version.author_id, Need::Edit)? {
+    let row = match load_in(tx, page, &version.author_id, Need::Edit)? {
         Ok((row, _)) => row,
         Err(d) => return Ok(Err(SaveError::Denied(d))),
     };
@@ -656,14 +652,15 @@ fn add_version_in(
     if head != base {
         return Ok(Err(SaveError::Conflict { head }));
     }
+    let keep = admin_settings::page_limits(tx)?.versions_per_page;
     let n = head + 1;
     let now = now_ms();
-    insert_version(conn, page, n, version, now)?;
-    conn.execute(
+    insert_version(tx, page, n, version, now)?;
+    tx.execute(
         "UPDATE pages SET head_version = ?2, title = ?3, updated_at = ?4 WHERE id = ?1",
         params![page, n, version.title, now],
     )?;
-    prune_versions(conn, page, n, limits.versions_per_page)?;
+    prune_versions(tx, page, n, keep)?;
     Ok(Ok(n))
 }
 
@@ -673,11 +670,10 @@ pub fn add_version(
     page: &str,
     base: i64,
     version: &NewVersion,
-    limits: &PageLimits,
 ) -> anyhow::Result<Result<i64, SaveError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    let out = add_version_in(&tx, page, base, version, limits)?;
+    let out = add_version_in(&tx, page, base, version)?;
     if out.is_ok() {
         tx.commit()?;
     }
@@ -686,10 +682,10 @@ pub fn add_version(
 
 /// Keep version 1 and the newest `keep` versions (and their provenance
 /// and confirmations).
-fn prune_versions(conn: &Connection, page: &str, head: i64, keep: usize) -> rusqlite::Result<()> {
-    let oldest_kept = head - keep as i64 + 1;
+fn prune_versions(tx: &Transaction<'_>, page: &str, head: i64, keep: u32) -> rusqlite::Result<()> {
+    let oldest_kept = head - i64::from(keep) + 1;
     for table in ["page_versions", "page_confirmations", "page_action_authors"] {
-        conn.execute(
+        tx.execute(
             &format!("DELETE FROM {table} WHERE page_id = ?1 AND version <> 1 AND version < ?2"),
             params![page, oldest_kept],
         )?;
@@ -868,7 +864,6 @@ pub fn patch(
     page: &str,
     user: &str,
     ops: &PatchOps,
-    limits: &PageLimits,
 ) -> anyhow::Result<Result<(), PatchError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -888,7 +883,7 @@ pub fn patch(
         return Ok(Err(PatchError::Denied(Denied::Forbidden)));
     }
     if let Some((base, version)) = &ops.rename {
-        match add_version_in(&tx, page, *base, version, limits)? {
+        match add_version_in(&tx, page, *base, version)? {
             Ok(_) => {}
             Err(SaveError::Conflict { head }) => return Ok(Err(PatchError::Conflict { head })),
             Err(SaveError::Denied(d)) => return Ok(Err(PatchError::Denied(d))),
@@ -930,17 +925,12 @@ pub fn soft_delete(db: &Db, page: &str, user: &str) -> anyhow::Result<Result<(),
 pub enum UndeleteError {
     Denied(Denied),
     NotDeleted,
-    TooMany(usize),
+    TooMany(u32),
 }
 
 /// Undelete for `user`, if they may restore it now, it's within the restore
 /// window, and the Space (or person) still has room for it.
-pub fn undelete(
-    db: &Db,
-    page: &str,
-    user: &str,
-    limits: &PageLimits,
-) -> anyhow::Result<Result<(), UndeleteError>> {
+pub fn undelete(db: &Db, page: &str, user: &str) -> anyhow::Result<Result<(), UndeleteError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let Some(row) = get_in(&tx, page)? else {
@@ -953,10 +943,10 @@ pub fn undelete(
     if row.deleted_at.is_none() {
         return Ok(Err(UndeleteError::NotDeleted));
     }
-    let owner = row.owner_id.clone().unwrap_or_default();
-    let count = live_count(&tx, row.space_id.as_deref(), &owner)?;
-    if usize::try_from(count).unwrap_or(usize::MAX) >= limits.pages_per_space {
-        return Ok(Err(UndeleteError::TooMany(limits.pages_per_space)));
+    let owner = row.owner_id.as_deref().unwrap_or_default();
+    let limit = admin_settings::page_limits(&tx)?.pages_per_space;
+    if live_count(&tx, row.space_id.as_deref(), owner)? >= i64::from(limit) {
+        return Ok(Err(UndeleteError::TooMany(limit)));
     }
     tx.execute(
         "UPDATE pages SET deleted_at = NULL, deleted_by = NULL, updated_at = ?2 WHERE id = ?1",
@@ -1417,6 +1407,7 @@ pub fn claim_action(
                 let addressed = crate::db::Addressed {
                     mentions: serde_json::json!([{"kind": "agent", "agent_id": agent.id}]),
                     audience: "agent".to_owned(),
+                    spans: Vec::new(),
                 };
                 tx.execute(
                     "INSERT INTO space_events (space_id, room_id, kind, actor, actor_id, text, \
@@ -1621,6 +1612,7 @@ fn row_page_event(r: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         actor_id: r.get(3)?,
         text: r.get(4)?,
         mentions: serde_json::Value::Array(Vec::new()),
+        spans: Vec::new(),
         audience: "agent".to_owned(),
         activity: r
             .get::<_, Option<String>>(5)?
@@ -2076,7 +2068,7 @@ pub enum ApplyError {
     Conflict {
         head: i64,
     },
-    TooMany(usize),
+    TooMany(u32),
 }
 
 /// Apply draft `id` for its author `user` in one transaction: the draft is
@@ -2089,7 +2081,6 @@ pub fn apply_draft(
     id: &str,
     user: &str,
     version: &NewVersion,
-    limits: &PageLimits,
 ) -> anyhow::Result<Result<String, ApplyError>> {
     let mut conn = db.lock();
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -2112,13 +2103,13 @@ pub fn apply_draft(
     let page_id = match &d.page_id {
         Some(pid) => {
             let base = d.base_version.unwrap_or(-1);
-            match add_version_in(&tx, pid, base, version, limits)? {
+            match add_version_in(&tx, pid, base, version)? {
                 Ok(_) => pid.clone(),
                 Err(SaveError::Conflict { head }) => return Ok(Err(ApplyError::Conflict { head })),
                 Err(SaveError::Denied(e)) => return Ok(Err(ApplyError::Denied(e))),
             }
         }
-        None => match create_in(&tx, d.space_id.as_deref(), version, limits)? {
+        None => match create_in(&tx, d.space_id.as_deref(), version)? {
             Ok(page) => page.id,
             Err(CreateError::TooMany(n)) => return Ok(Err(ApplyError::TooMany(n))),
             Err(CreateError::NotAllowed) => return Ok(Err(ApplyError::Denied(Denied::Gone))),

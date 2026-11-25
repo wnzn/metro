@@ -25,6 +25,7 @@ concurrency:
 # segments (packaging/ci_changes.py), and each job below runs only when its
 # segment is not 'false'. An empty answer (classifier skipped, failed or not
 # reached) runs the job. A skipped job counts as passed for branch protection.
+# The `updates` segment gates only the separate fixture build in `rust`.
 # When release-policy decides to release, every gate the `release` job needs
 # runs whatever the classifier said, and `release` requires each to succeed.
 # If `workflows` fails, `rust`, `containers` and `packaging` still run
@@ -81,9 +82,26 @@ jobs:
         run: python3 tests/e2e/attachments.py --bin-dir target/debug --timeout 60
       - name: End-to-end web search on the asker's computer with loopback vendors
         run: python3 tests/e2e/web_search.py --bin-dir target/debug --timeout 90
+      - name: End-to-end Pages test with a local model double
+        run: python3 tests/e2e/pages.py --bin-dir target/debug --timeout 60
+      - name: End-to-end agent Page tools and drafts test
+        run: python3 tests/e2e/agent_pages.py --bin-dir target/debug --timeout 90
       - name: metro-tui in a real PTY against an isolated server and a scripted model
         timeout-minutes: 5
         run: timeout --kill-after=15s 240s python3 -B crates/tui/tests/pty_qa.py --bin-dir target/debug
+      # Only this step builds the fixture verifier. Keep its binaries outside
+      # the normal target/cache; updates.py sets the fixture env on its children.
+      # This throwaway build needs neither debug info nor incremental state.
+      - name: Build and run the isolated updater fixture
+        if: ${{ needs.workflows.outputs.updates != 'false' || needs.release-policy.outputs.release == 'true' }}
+        timeout-minutes: 15
+        run: |
+          set -eu
+          target="$RUNNER_TEMP/metro-update-e2e-target"
+          CARGO_PROFILE_DEV_DEBUG=0 CARGO_INCREMENTAL=0 \
+            cargo build --locked -p metro-server -p metro-runner --target-dir "$target" \
+              --features metro-server/e2e-test-release,metro-runner/e2e-test-release
+          python3 tests/e2e/updates.py --bin-dir "$target/debug" --timeout 120
 
   desktop:
     # Release runs stay on GitHub-hosted runners: the self-hosted queue is used
@@ -339,6 +357,7 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       rust: ${{ steps.changes.outputs.rust }}
+      updates: ${{ steps.changes.outputs.updates }}
       desktop: ${{ steps.changes.outputs.desktop }}
       containers: ${{ steps.changes.outputs.containers }}
       packaging: ${{ steps.changes.outputs.packaging }}
@@ -446,9 +465,9 @@ jobs:
           set -eu
           bad="$(grep -hE '^\s*(-\s+)?uses:' .github/workflows/*.yml | grep -vE 'uses:\s+\./' | grep -vE 'uses:[[:space:]]+[^@[:space:]]+@[0-9a-f]{40}([[:space:]]|$)' || true)"
           [ -z "$bad" ] || { printf 'unpinned actions:\n%s\n' "$bad" >&2; exit 1; }
-      # One diff, one answer per segment (rust, desktop, containers, packaging,
-      # previews). Pull requests into main and pushes to main are classified;
-      # anything else, and any doubt, answers 'true' everywhere.
+      # One diff, one answer per segment (rust, updates, desktop, containers,
+      # packaging, previews). Pull requests into main and pushes to main are
+      # classified; anything else, and any doubt, answers 'true' everywhere.
       - name: Classify the changes into CI segments
         id: changes
         env:

@@ -11,7 +11,7 @@ import ci_changes as policy
 from test_release_workflow import load, yaml
 
 
-SEGMENTS = ("rust", "desktop", "containers", "packaging", "previews")
+SEGMENTS = ("rust", "updates", "desktop", "containers", "packaging", "previews")
 EVERYTHING = dict.fromkeys(SEGMENTS, True)
 NOTHING = dict.fromkeys(SEGMENTS, False)
 
@@ -91,15 +91,15 @@ class SegmentTests(GitFixture):
 
     def test_each_location_runs_its_segments(self):
         cases = {
-            "crates/server/src/main.rs": only("rust", "containers", "previews"),
-            "crates/auth/README.md": only("rust", "containers", "previews"),
-            "crates/server/src/admin_web/admin.browser-test.mjs": only("rust", "containers", "previews"),
+            "crates/server/src/main.rs": only("rust", "updates", "containers", "previews"),
+            "crates/auth/README.md": only("rust", "updates", "containers", "previews"),
+            "crates/server/src/admin_web/admin.browser-test.mjs": only("rust", "updates", "containers", "previews"),
             "crates/tui/tests/pty_qa.py": only("rust", "containers", "previews"),
-            "Cargo.lock": only("rust", "containers", "previews"),
-            "rust-toolchain.toml": only("rust", "containers", "previews"),
-            "rust-toolchain": only("rust", "containers", "previews"),
-            ".cargo/config.toml": only("rust", "previews"),
-            "tests/e2e/smoke.py": only("rust", "containers"),
+            "Cargo.lock": only("rust", "updates", "containers", "previews"),
+            "rust-toolchain.toml": only("rust", "updates", "containers", "previews"),
+            "rust-toolchain": only("rust", "updates", "containers", "previews"),
+            ".cargo/config.toml": only("rust", "updates", "previews"),
+            "tests/e2e/smoke.py": only("rust", "updates", "containers"),
             "tests/e2e/library_reference.py": only("rust", "containers"),
             "tests/README.md": only("rust"),
             "examples/workspace/check.sh": only("rust"),
@@ -140,6 +140,25 @@ class SegmentTests(GitFixture):
                     # Documentation alongside never adds a segment.
                     self.assertEqual(self.classify(path, "README.md", "docs/x.md", push=push), expected)
 
+    def test_updater_inputs_enable_the_fixture_within_rust(self):
+        cases = {
+            "crates/server/src/updates.rs": only("rust", "updates", "containers", "previews"),
+            "crates/runner/src/config.rs": only("rust", "updates", "containers", "previews"),
+            "crates/release/trust/sigstore-trusted-root.json": only("rust", "updates", "containers", "previews"),
+            "crates/model-protocol/src/lib.rs": only("rust", "updates", "containers", "previews"),
+            "crates/url-policy/src/lib.rs": only("rust", "updates", "containers", "previews"),
+            "tests/e2e/updates.py": only("rust", "updates", "containers"),
+            "packaging/install-metro-runner-linux.sh": only("rust", "updates", "packaging", "previews"),
+            "crates/connector/src/lib.rs": only("rust", "containers", "previews"),
+            "tests/e2e/pages.py": only("rust", "containers"),
+            "tests/e2e/agent_pages.py": only("rust", "containers"),
+            "tests/e2e/web_search.py": only("rust", "containers"),
+        }
+        for path, expected in cases.items():
+            for push in (False, True):
+                with self.subTest(path=path, push=push):
+                    self.assertEqual(self.classify(path, push=push), expected)
+
     def test_ci_yml_gitattributes_and_version_files_run_everything(self):
         for path in (".github/workflows/ci.yml", ".gitattributes", "Cargo.toml", "apps/desktop/nsh.json"):
             for push in (False, True):
@@ -155,7 +174,7 @@ class SegmentTests(GitFixture):
 
     def test_segments_are_the_union_over_paths(self):
         self.assertEqual(self.classify("apps/desktop/App.tsx", "tests/e2e/smoke.py"),
-                         only("rust", "desktop", "containers", "previews"))
+                         only("rust", "updates", "desktop", "containers", "previews"))
         self.assertEqual(self.classify("packaging/package.py", "examples/workspace/check.sh"),
                          only("rust", "packaging", "previews"))
 
@@ -163,22 +182,22 @@ class SegmentTests(GitFixture):
         self.git("checkout", "-q", "--detach", self.base)
         (self.repo / "crates/server/src/main.rs").unlink()
         self.assertEqual(policy.classify(self.base, self.commit(), root=self.repo),
-                         only("rust", "containers", "previews"))
+                         only("rust", "updates", "containers", "previews"))
         self.git("checkout", "-q", "--detach", self.base)
         self.git("mv", "crates/server/src/main.rs", "docs/renamed.md")
         self.assertEqual(policy.classify(self.base, self.commit(), root=self.repo),
-                         only("rust", "containers", "previews"))
+                         only("rust", "updates", "containers", "previews"))
         self.git("checkout", "-q", "--detach", self.base)
         (self.repo / "tests/e2e/smoke.py").unlink()
         self.assertEqual(policy.classify(self.base, self.commit(), push=True, root=self.repo),
-                         only("rust", "containers"))
+                         only("rust", "updates", "containers"))
 
     def test_executable_files_count_like_plain_files(self):
         self.git("checkout", "-q", "--detach", self.base)
         (self.repo / "tests/e2e/smoke.py").chmod(0o755)
         self.write("tests/e2e/run.sh", "#!/bin/sh\n")
         (self.repo / "tests/e2e/run.sh").chmod(0o755)
-        self.assertEqual(policy.classify(self.base, self.commit(), root=self.repo), only("rust", "containers"))
+        self.assertEqual(policy.classify(self.base, self.commit(), root=self.repo), only("rust", "updates", "containers"))
 
     def test_symlinks_and_unreadable_diffs_run_everything(self):
         self.git("checkout", "-q", "--detach", self.base)
@@ -281,7 +300,7 @@ class EnvironmentTests(GitFixture):
         for paths, expected in ((["apps/desktop/dev/screenshots/capture.sh"], NOTHING),
                                 (["docs/acceptance.md", "packaging/README.md"], NOTHING),
                                 (["Cargo.toml", "packaging/README.md"], EVERYTHING),
-                                (["crates/server/src/main.rs"], only("rust", "containers", "previews")),
+                                (["crates/server/src/main.rs"], only("rust", "updates", "containers", "previews")),
                                 (["apps/desktop/src/features/Shell.tsx"], only("desktop", "previews")),
                                 (["packaging/package.py"], only("packaging", "previews")),
                                 ([".github/workflows/ci.yml"], EVERYTHING),
@@ -370,13 +389,13 @@ class WorkflowWiringTests(unittest.TestCase):
         self.assertIs(step, workflow_job["steps"][-1])
         self.assertEqual(sum("ci_changes" in str(s.get("run", "")) for s in workflow_job["steps"]), 1)
 
-    def test_workflows_always_runs_and_each_job_reads_only_its_segment(self):
+    def test_workflows_always_runs_and_only_the_intended_jobs_read_segments(self):
         self.assertNotIn("if", self.jobs["workflows"])
         self.assertNotIn("needs", self.jobs["workflows"])
         readers = {name: {output for output in SEGMENTS if f"needs.workflows.outputs.{output}" in yaml.safe_dump(job)}
                    for name, job in self.jobs.items()}
         self.assertEqual({name: found for name, found in readers.items() if found},
-                         {"rust": {"rust"}, "desktop": {"desktop"}, "containers": {"containers"},
+                         {"rust": {"rust", "updates"}, "desktop": {"desktop"}, "containers": {"containers"},
                           "packaging": {"packaging"}, "package-smoke": {"previews"}})
         for name in self.GATED:
             self.assertEqual(self.jobs[name]["needs"], ["workflows", "release-policy"], name)

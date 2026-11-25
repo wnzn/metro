@@ -9,12 +9,12 @@
 //! `METRO_ORG_ADMINS` (403 otherwise).
 //!
 //! - `pages_per_space`: 1–500 (default 50)
-//! - `versions_per_page`: 2–1000 (default 200; room for the first and latest)
+//! - `versions_per_page`: 2–1000 newest versions (default 200), plus version 1
 //!
 //! Updating a limit does not itself delete anything.
 
 use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::AppState;
@@ -59,6 +59,19 @@ pub fn read(conn: &Connection) -> rusqlite::Result<Settings> {
     )
 }
 
+/// Enforce only settings this build accepts. Never fall back to defaults on
+/// a bad read: doing so could admit extra pages or prune too much history.
+pub(crate) fn page_limits(tx: &Transaction<'_>) -> anyhow::Result<Settings> {
+    let settings = read(tx)?;
+    check(Some(settings.pages_per_space), "pages_per_space", PAGES)?;
+    check(
+        Some(settings.versions_per_page),
+        "versions_per_page",
+        VERSIONS,
+    )?;
+    Ok(settings)
+}
+
 // Omission leaves the field unchanged. An explicit null is not a number.
 fn integer<'de, D: Deserializer<'de>>(d: D) -> Result<Option<u32>, D::Error> {
     u32::deserialize(d).map(Some)
@@ -73,11 +86,9 @@ struct Patch {
     versions_per_page: Option<u32>,
 }
 
-fn check(value: Option<u32>, field: &str, (min, max, _): (u32, u32, u32)) -> ApiResult<()> {
+fn check(value: Option<u32>, field: &str, (min, max, _): (u32, u32, u32)) -> anyhow::Result<()> {
     if value.is_some_and(|n| !(min..=max).contains(&n)) {
-        return Err(ApiError::bad_request(format!(
-            "{field} must be {min}..={max}"
-        )));
+        anyhow::bail!("{field} must be {min}..={max}");
     }
     Ok(())
 }
@@ -104,18 +115,22 @@ async fn patch_settings(
 ) -> ApiResult<Json<Settings>> {
     require_admin(&state, &who)?;
     let Json(patch) = body?;
-    check(patch.pages_per_space, "pages_per_space", PAGES)?;
-    check(patch.versions_per_page, "versions_per_page", VERSIONS)?;
+    check(patch.pages_per_space, "pages_per_space", PAGES)
+        .and_then(|()| check(patch.versions_per_page, "versions_per_page", VERSIONS))
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
     db(&state, move |db| {
-        let conn = db.lock();
-        conn.execute(
+        let mut conn = db.lock();
+        let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        tx.execute(
             "UPDATE admin_settings
              SET pages_per_space = coalesce(?1, pages_per_space),
                  versions_per_page = coalesce(?2, versions_per_page)
              WHERE singleton = 1",
             params![patch.pages_per_space, patch.versions_per_page],
         )?;
-        Ok(read(&conn)?)
+        let settings = read(&tx)?;
+        tx.commit()?;
+        Ok(settings)
     })
     .await
     .map(Json)
@@ -157,4 +172,7 @@ fn storage_checks_types_and_leaves_product_bounds_to_the_api() {
             versions_per_page: future_versions
         }
     );
+    // A server that doesn't understand those bounds must not use them to
+    // make Page write and pruning decisions. The stored values stay intact.
+    assert!(page_limits(&conn.unchecked_transaction().unwrap()).is_err());
 }

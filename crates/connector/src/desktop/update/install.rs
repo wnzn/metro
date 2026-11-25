@@ -18,10 +18,30 @@ use metro_release::archive::{self, Expect, HashingReader};
 use metro_release::{Channel, ReleaseVerifier, VerifiedRelease, Version};
 use serde::{Deserialize, Serialize};
 
+use crate::desktop::store::InstanceLock;
+
 use super::{LastUpdate, now_ms};
 
 pub const MARKER: &str = ".metro-desktop-install";
 pub const JOURNAL: &str = ".update.json";
+pub const JOURNAL_UNCERTAIN: &str = "update_journal_unknown";
+
+/// The update record could not be matched to this install. Unlike a bad
+/// payload, it is not safe to recommend that the installer replace it.
+#[derive(Debug)]
+pub struct JournalUncertain;
+
+impl std::fmt::Display for JournalUncertain {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("update journal could not be verified against this installation")
+    }
+}
+
+impl std::error::Error for JournalUncertain {}
+
+pub(super) fn journal_uncertain() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, JournalUncertain)
+}
 pub const MSI_JOURNAL: &str = "journal.json";
 pub const LOCK: &str = ".lock";
 pub const LOCAL_RUNNER_MARKER: &str = "enable-local-runner";
@@ -372,6 +392,7 @@ pub fn take_finished(kind: &InstallKind, update_dir: &Path, own: &Version) -> Op
         }),
         at: now_ms(),
         detail: detail.or_else(|| j.detail.clone()),
+        failure_code: None,
     };
     // Legacy MSI records and their unowned backup are never consumed here.
     // A failed record from the old helper could mean its wait call failed,
@@ -549,9 +570,14 @@ pub fn verify_staged(
     };
     lock.check(lock_root(kind, update_dir))?;
     let path = journal_path(kind, update_dir).ok_or_else(no)?;
-    if load_journal(&path)?.as_ref() != Some(j) {
-        return Err(no());
+    if load_journal(&path)
+        .map_err(|_| journal_uncertain())?
+        .as_ref()
+        != Some(j)
+    {
+        return Err(journal_uncertain());
     }
+    check_staged_current(kind, j)?;
     let version = Version::parse(&j.to).ok_or_else(no)?;
     let assets = stage_assets(update_dir, &j.id);
     if !plain_dir(&assets) {
@@ -639,6 +665,15 @@ pub fn verify_staged(
     })
 }
 
+pub(super) fn check_staged_current(kind: &InstallKind, j: &Journal) -> io::Result<()> {
+    if let Some(root) = kind.root()
+        && (j.phase != "staged" || !script_state(root, &j.from))
+    {
+        return Err(journal_uncertain());
+    }
+    Ok(())
+}
+
 // ---- the installers' lock ----
 
 pub struct Lock {
@@ -664,6 +699,12 @@ impl Lock {
     /// The same kernel lock the manual installers use. Never remove another
     /// holder's lock, or use wall-clock age to guess that it is free.
     pub fn take(root: &Path) -> Result<Lock, StageError> {
+        let mut lock = Self::take_kernel(root)?;
+        lock.take_compat()?;
+        Ok(lock)
+    }
+
+    fn take_kernel(root: &Path) -> Result<Lock, StageError> {
         if !plain_dir(root) {
             return Err(stage_err("io"));
         }
@@ -706,14 +747,18 @@ impl Lock {
             Err(fs::TryLockError::WouldBlock) => return Err(stage_err("installer_busy")),
             Err(fs::TryLockError::Error(_)) => return Err(stage_err("io")),
         }
-        let mut lock = Self {
+        let lock = Self {
             root: root.to_path_buf(),
             handle,
             legacy: None,
         };
         lock.check(root).map_err(|_| stage_err("installer_busy"))?;
-        lock.legacy = Some(
-            metro_release::installer_lock::LegacyLock::take(root).map_err(|e| {
+        Ok(lock)
+    }
+
+    fn take_compat(&mut self) -> Result<(), StageError> {
+        self.legacy = Some(
+            metro_release::installer_lock::LegacyLock::take(&self.root).map_err(|e| {
                 stage_err(if e.kind() == io::ErrorKind::WouldBlock {
                     "installer_busy"
                 } else {
@@ -721,7 +766,7 @@ impl Lock {
                 })
             })?,
         );
-        Ok(lock)
+        Ok(())
     }
 
     pub fn check(&self, root: &Path) -> io::Result<()> {
@@ -846,12 +891,17 @@ pub fn stage(
         return Err(stage_err("not_in_app"));
     }
     let from = own.to_string();
+    let existing = load_journal(&path).map_err(|_| stage_err(JOURNAL_UNCERTAIN))?;
     if kind.root().is_some_and(|root| {
         !script_state(root, &from) || install_dir != root.join("versions").join(&from)
     }) {
-        return Err(stage_err("installer_busy"));
+        return Err(stage_err(if existing.is_some() {
+            JOURNAL_UNCERTAIN
+        } else {
+            "installer_busy"
+        }));
     }
-    if let Some(j) = load_journal(&path).map_err(|_| stage_err("installer_busy"))? {
+    if let Some(j) = existing {
         if !finished_for(&j, &from) {
             return Err(stage_err("installer_busy"));
         }
@@ -1352,23 +1402,99 @@ pub enum Recovery {
     Nothing,
     /// Cannot safely open the database or install until recovery succeeds.
     Blocked,
+    /// The journal is unreadable or disagrees with the current installation.
+    JournalUncertain,
 }
 
-pub fn recover(root: &Path, _desktop_root: &Path, update_dir: &Path, own: &Version) -> Recovery {
-    let path = root.join(JOURNAL);
-    if matches!(load_journal(&path), Ok(None)) {
-        return Recovery::Nothing;
+/// Inspect the journal and current pointer without taking any locks or
+/// writing on disk. A successful observation never authorizes recovery.
+pub fn inspect_recovery_journal(root: &Path) -> io::Result<Option<Journal>> {
+    let Some(j) = load_journal(&root.join(JOURNAL)).map_err(|_| journal_uncertain())? else {
+        return Ok(None);
+    };
+    let current_matches = match j.phase {
+        JournalPhase::Committed => script_state(root, &j.to),
+        JournalPhase::Committing | JournalPhase::RollingBack => {
+            script_state(root, &j.from) || script_state(root, &j.to)
+        }
+        _ => script_state(root, &j.from),
+    };
+    if !current_matches {
+        return Err(journal_uncertain());
     }
-    let Ok(lock) = Lock::take(root) else {
+    Ok(Some(j))
+}
+
+pub fn recover(root: &Path, desktop_root: &Path, update_dir: &Path, own: &Version) -> Recovery {
+    recover_inner(root, desktop_root, update_dir, own, None)
+}
+
+/// Recovery of a journal tied to a workspace gate. The expected journal
+/// must still match and the gate is retired under both installation locks.
+pub fn recover_with_gate(
+    root: &Path,
+    desktop_root: &Path,
+    update_dir: &Path,
+    own: &Version,
+    expected: &Journal,
+    instance: &InstanceLock,
+) -> Recovery {
+    recover_inner(
+        root,
+        desktop_root,
+        update_dir,
+        own,
+        Some((expected, instance)),
+    )
+}
+
+fn recover_inner(
+    root: &Path,
+    desktop_root: &Path,
+    update_dir: &Path,
+    own: &Version,
+    guarded: Option<(&Journal, &InstanceLock)>,
+) -> Recovery {
+    use super::apply::RootGate;
+
+    let observed = match inspect_recovery_journal(root) {
+        Ok(Some(j)) if guarded.is_none_or(|(expected, _)| *expected == j) => j,
+        Ok(None) if guarded.is_none() => return Recovery::Nothing,
+        _ => return Recovery::JournalUncertain,
+    };
+    let gate_matches = |j: &Journal| {
+        guarded.is_none_or(|(_, instance)| {
+            instance.check(desktop_root).is_ok()
+                && RootGate::read(desktop_root)
+                    .is_ok_and(|gate| gate.is_some_and(|gate| gate.matches(root, &j.id)))
+        })
+    };
+    if !gate_matches(&observed) {
+        return Recovery::JournalUncertain;
+    }
+    let Ok(mut lock) = Lock::take_kernel(root) else {
         return Recovery::Blocked;
     };
-    let mut j = match load_journal(&path) {
-        Ok(Some(j)) => j,
-        Ok(None) => return Recovery::Nothing,
-        Err(_) => return Recovery::Blocked,
+    // Don't retire an existing compatibility lock if the journal changed.
+    // Old installers only respect that lock, so inspect again after taking it.
+    if !inspect_recovery_journal(root).is_ok_and(|j| j.as_ref() == Some(&observed))
+        || !gate_matches(&observed)
+    {
+        return Recovery::JournalUncertain;
+    }
+    if lock.take_compat().is_err() {
+        return Recovery::Blocked;
+    }
+    let mut j = match inspect_recovery_journal(root) {
+        Ok(Some(j)) if j == observed => j,
+        _ => return Recovery::JournalUncertain,
     };
+    if !gate_matches(&j) {
+        return Recovery::JournalUncertain;
+    }
+    let path = root.join(JOURNAL);
     let own = own.to_string();
-    match j.phase.as_str() {
+    let result = match j.phase.as_str() {
         "backing_up" if own == j.from => {
             // No trial can be launched before Trial is published. A crash
             // on either side of snapshot publication leaves the live DB
@@ -1392,7 +1518,15 @@ pub fn recover(root: &Path, _desktop_root: &Path, update_dir: &Path, own: &Versi
         // its lease. Only the original watchdog can safely restore.
         "committing" | "trial" | "rolling_back" => Recovery::Blocked,
         _ => Recovery::Nothing,
+    };
+    if result == Recovery::Nothing
+        && let Some((_, instance)) = guarded
+        && (lock.check(root).is_err()
+            || RootGate::retire(desktop_root, root, &j.id, instance).is_err())
+    {
+        return Recovery::Blocked;
     }
+    result
 }
 
 /// Linux: rewrite the menu entry when it names the old version's launcher.

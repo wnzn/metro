@@ -8,6 +8,7 @@ import { monitoringApi } from "./monitoring";
 import { pagesApi } from "./pages";
 import type { PageDraftEvent } from "./pages";
 import { profileApi } from "./profile";
+import { serverUpdateApi } from "./serverUpdate";
 import { spacesApi } from "./spaces";
 import type { RawFn } from "./profile";
 import { parseWebTool, webSearchPrefsApi } from "./webSearch";
@@ -495,6 +496,7 @@ export function createClient(options: ClientOptions) {
     // Monitoring events (src/api/monitoring.ts): one Space, My Chat or the instance; never an aggregate.
     ...monitoringApi(request),
     ...webSearchPrefsApi(request),
+    ...serverUpdateApi(request),
 
     async me(): Promise<Me> {
       const data = await request("GET", "/v1/me");
