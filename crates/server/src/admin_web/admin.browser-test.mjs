@@ -623,6 +623,43 @@ await test("plain HTTP on another host warns first; the token goes out only afte
   await evaluate("localStorage.clear()");
 });
 
+await test("Forget this choice withdraws the plain-HTTP choice; sign-out alone keeps it", async () => {
+  mock.log.length = 0;
+  const lan = `http://metro.lan:${port}`;
+  await goto(lan + "/admin");
+  await evaluate("localStorage.clear()");
+  await goto(lan + "/admin");
+  await click("#plain-http-accept");
+  await signIn(ADMIN);
+  await waitFor(vis("panel"));
+  await click("#sign-out");
+  // Signing out keeps the choice.
+  assert(await evaluate(vis("signin")) && !(await evaluate(vis("plain-http"))), "sign-out dropped the choice");
+  assert(await evaluate(vis("plain-http-note")), "no note after sign-out");
+  assert((await text("plain-http-forget")) === "Forget this choice", "forget label");
+  await type("token", "typed-but-not-sent");
+  await click("#plain-http-forget");
+  assert(await evaluate("localStorage.getItem('metro.admin.plainHttpAccepted')") === null, "choice still stored");
+  assert(await evaluate(vis("plain-http")) && !(await evaluate(vis("signin"))), "warning not shown again");
+  assert(await evaluate("document.getElementById('token').value") === "", "token left in the field");
+  await goto(lan + "/admin");
+  assert(await evaluate(vis("plain-http")) && !(await evaluate(vis("signin"))), "warning not shown after reload");
+  assert(!(await evaluate(vis("plain-http-note"))), "note shown without a choice");
+  assert(apiCalls().filter((r) => r.url === "/v1/me").length === 1, "unexpected sign-in requests");
+  await evaluate("localStorage.clear()");
+});
+
+await test("hostClass matches the shared host vectors (crates/url-policy/testdata/host_vectors.json)", async () => {
+  const src = readFileSync(join(here, "admin.js"), "utf8");
+  const begin = src.indexOf("// host-class:begin"), end = src.indexOf("// host-class:end");
+  assert(begin > 0 && end > begin, "host-class markers missing");
+  const hostClass = new Function(src.slice(begin, end) + "\nreturn hostClass;")();
+  const { hosts } = JSON.parse(readFileSync(join(here, "../../../url-policy/testdata/host_vectors.json"), "utf8"));
+  assert(hosts.length > 40, "too few vectors");
+  const wrong = hosts.filter((v) => hostClass(v.host) !== v.class).map((v) => `${JSON.stringify(v.host)}: ${hostClass(v.host)}`);
+  assert(wrong.length === 0, "mismatches: " + wrong.join(", "));
+});
+
 await test("loopback pages never show the plain-HTTP warning", async () => {
   await goto(base + "/admin");
   assert(await evaluate(vis("signin")), "sign-in hidden");
@@ -631,14 +668,19 @@ await test("loopback pages never show the plain-HTTP warning", async () => {
 
 await test("a framed panel refuses sign-in", async () => {
   await page("Page.navigate", { url: base + "/frame.html" });
-  await sleep(600);
-  const { frameTree } = await page("Page.getFrameTree");
-  const child = frameTree.childFrames?.[0]?.frame;
-  assert(child, "no iframe");
-  const { executionContextId } = await page("Page.createIsolatedWorld", { frameId: child.id });
-  const r = await page("Runtime.evaluate", { contextId: executionContextId, returnByValue: true,
-    expression: "!document.getElementById('unsafe').hidden && document.getElementById('signin').hidden" });
-  assert(r.result.value === true, "framed page offers sign-in");
+  // Poll rather than sleep: under load the frame and its script take longer.
+  let refused = false;
+  for (const end = Date.now() + 5000; !refused && Date.now() < end; await sleep(100)) {
+    const { frameTree } = await page("Page.getFrameTree");
+    const child = frameTree.childFrames?.[0]?.frame;
+    if (!child) continue;
+    const { executionContextId } = await page("Page.createIsolatedWorld", { frameId: child.id });
+    const r = await page("Runtime.evaluate", { contextId: executionContextId, returnByValue: true,
+      expression: "document.readyState === 'complete' && !!document.getElementById('unsafe') && " +
+        "!document.getElementById('unsafe').hidden && document.getElementById('signin').hidden" });
+    refused = r.result.value === true;
+  }
+  assert(refused, "framed page offers sign-in");
 });
 
 await test("the page never logs to the console and has no CSP violations", async () => {

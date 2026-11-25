@@ -69,7 +69,8 @@
       <label for="token" class="label">Admin access token</label>
       <input id="token" class="input" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" required aria-describedby="token-hint">
       <p id="token-hint" class="hint">Sent only to this server, in an Authorization header.</p>
-      <p id="plain-http-note" class="hint" hidden>This connection isn't encrypted.</p>
+      <p id="plain-http-note" class="hint" hidden>This connection isn't encrypted.
+        <button type="button" id="plain-http-forget" class="btn-link">Forget this choice</button></p>
       <button type="submit" id="signin-submit" class="btn btn-primary">Sign in</button>
     </form>
   </section>

@@ -24,7 +24,7 @@
     unsafe: $("unsafe"), unsafeReason: $("unsafe-reason"), unsafeSsh: $("unsafe-ssh"),
     unsafeLocal: $("unsafe-local"), unsafeLoopback: $("unsafe-loopback"),
     plainHttp: $("plain-http"), plainHttpReason: $("plain-http-reason"), plainHttpAccept: $("plain-http-accept"),
-    plainHttpNote: $("plain-http-note"),
+    plainHttpNote: $("plain-http-note"), plainHttpForget: $("plain-http-forget"),
     signin: $("signin"), signinForm: $("signin-form"), signinError: $("signin-error"),
     token: $("token"), signinSubmit: $("signin-submit"),
     denied: $("denied"), deniedId: $("denied-id"), deniedBack: $("denied-back"),
@@ -43,34 +43,80 @@
 
   // ---------------------------------------------------------------- safety
 
-  // "loopback", "tailscale" or "other", for location.hostname (which the
-  // browser has already put in canonical form). Mirrors
-  // apps/desktop/src/api/serverUrl.ts and the metro-url-policy crate.
+  // host-class:begin (admin.browser-test.mjs runs this block against
+  // crates/url-policy/testdata/host_vectors.json)
+  // "loopback", "tailscale" or "other" for a host, taken exactly as given: a
+  // trailing dot makes it a name for the resolver ("other"); only a MagicDNS
+  // name may end in a dot. Same rules as apps/desktop/src/api/serverUrl.ts
+  // and the metro-url-policy crate. The page passes location.hostname, which
+  // the browser has already put in canonical form.
   function hostClass(hostname) {
-    const h = hostname.toLowerCase().replace(/^\[|\]$/g, "").replace(/\.$/, "");
-    if (h === "localhost" || h.endsWith(".localhost")) return "loopback";
-    if (/^[^.].*[^.]\.ts\.net$/.test(h) && !h.includes("..")) return "tailscale";
-    const v4 = (text) => {
+    let h = hostname.toLowerCase();
+    if (h.startsWith("[") && h.endsWith("]")) h = h.slice(1, -1);
+    if (!h) return "other";
+    if (h === "localhost") return "loopback";
+    const name = h.endsWith(".") ? h.slice(0, -1) : h;
+    if (name.endsWith(".ts.net")) {
+      const labels = name.slice(0, -".ts.net".length);
+      if (labels !== "" && labels.split(".").every((l) => /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(l))) return "tailscale";
+    }
+    const ipv4 = (text) => {
       const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(text);
       if (!m) return null;
       const o = m.slice(1).map(Number);
-      if (o.some((n) => n > 255)) return null;
+      return o.every((n) => n <= 255) ? o : null;
+    };
+    const classifyV4 = (o) => {
       if (o[0] === 127) return "loopback";
       if (o[0] === 100 && o[1] >= 64 && o[1] <= 127) return "tailscale";
       return "other";
     };
-    const ip4 = v4(h);
-    if (ip4) return ip4;
-    if (h === "::1") return "loopback";
-    // IPv4-mapped IPv6, as browsers write it: ::ffff:7f00:1
-    const mapped = /^::ffff:([0-9a-f]{1,4}):([0-9a-f]{1,4})$/.exec(h);
-    if (mapped) {
-      const a = parseInt(mapped[1], 16), b = parseInt(mapped[2], 16);
-      return v4([a >> 8, a & 255, b >> 8, b & 255].join(".")) || "other";
+    // The eight 16-bit groups of an IPv6 address (IPv4 tail allowed), or null.
+    const ipv6 = (host) => {
+      if (!host.includes(":") || !/^[0-9a-f:.]+$/.test(host)) return null;
+      let text = host;
+      const tail = [];
+      const cut = text.lastIndexOf(":");
+      const last = text.slice(cut + 1);
+      if (last.includes(".")) {
+        const v4 = ipv4(last);
+        if (!v4) return null;
+        tail.push((v4[0] << 8) | v4[1], (v4[2] << 8) | v4[3]);
+        text = text.slice(0, cut);
+        if (text.endsWith(":")) text += ":";
+      }
+      const halves = text.split("::");
+      if (halves.length > 2) return null;
+      const parse = (x) => (x === "" ? [] : x.split(":"));
+      const head = parse(halves[0]);
+      const rest = halves.length === 2 ? parse(halves[1]) : [];
+      if ([...head, ...rest].some((g) => !/^[0-9a-f]{1,4}$/.test(g))) return null;
+      const hex = (g) => parseInt(g, 16);
+      const width = 8 - tail.length;
+      let groups;
+      if (halves.length === 2) {
+        const fill = width - head.length - rest.length;
+        if (fill < 1) return null;
+        groups = [...head.map(hex), ...new Array(fill).fill(0), ...rest.map(hex)];
+      } else {
+        if (head.length !== width) return null;
+        groups = head.map(hex);
+      }
+      return [...groups, ...tail];
+    };
+    const v4 = ipv4(h);
+    if (v4) return classifyV4(v4);
+    const v6 = ipv6(h);
+    if (v6) {
+      if (v6.slice(0, 7).every((g) => g === 0) && v6[7] === 1) return "loopback";
+      if (v6.slice(0, 5).every((g) => g === 0) && v6[5] === 0xffff) {
+        return classifyV4([v6[6] >> 8, v6[6] & 0xff, v6[7] >> 8, v6[7] & 0xff]);
+      }
+      if (v6[0] === 0xfd7a && v6[1] === 0x115c && v6[2] === 0xa1e0) return "tailscale";
     }
-    if (/^fd7a:115c:a1e0:/.test(h)) return "tailscale";
     return "other";
   }
+  // host-class:end
 
   // Plain HTTP to a host that is neither loopback nor Tailscale: the token
   // would cross the network unencrypted, so the person is asked first.
@@ -87,6 +133,12 @@
   function acceptPlainHttp() {
     plainHttpAcceptedHere = true;
     try { localStorage.setItem(PLAIN_HTTP_KEY, "1"); } catch { /* kept for this page only */ }
+  }
+  // Withdraws the choice: the warning shows again before the next sign-in.
+  // Signing out keeps it; only this does.
+  function forgetPlainHttp() {
+    plainHttpAcceptedHere = false;
+    try { localStorage.removeItem(PLAIN_HTTP_KEY); } catch { /* nothing kept */ }
   }
 
   // Returns null when this page may take a credential, else the reason.
@@ -629,6 +681,13 @@
     el.plainHttpAccept.addEventListener("click", () => {
       acceptPlainHttp();
       if (showSignIn()) el.token.focus();
+    });
+    el.plainHttpForget.addEventListener("click", () => {
+      forgetPlainHttp();
+      el.token.value = "";
+      hideAlert(el.signinError);
+      showSignIn();
+      announce("Choice forgotten. The warning shows again before you sign in.");
     });
     el.token.addEventListener("input", () => el.token.removeAttribute("aria-invalid"));
     el.addName.addEventListener("input", () => el.addName.removeAttribute("aria-invalid"));
