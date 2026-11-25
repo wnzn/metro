@@ -12,6 +12,7 @@
 import { effect, signal, untracked } from "nsh";
 import { catalog, connections, loadProviders, providerById } from "../settings";
 import type { CatalogProvider } from "../settings";
+import { readStartupModels } from "../startupModelRequests";
 import { apiClient, me, onSessionEnd, openSettings, sessionGuard, settingsOpen } from "../store";
 import { Column, Label, SettingsGroup } from "../ui";
 import { MethodRow } from "../ui/providers";
@@ -28,18 +29,20 @@ onSessionEnd(() => {
 });
 
 /** Loads whether any chat model can answer me (mine, shared with me, or the operator's). */
-export async function loadChatReadiness(): Promise<void> {
+async function loadChatReadiness(fresh: boolean): Promise<boolean> {
   const c = apiClient();
-  if (!c) return;
+  if (!c) return false;
   const n = ++seq;
   const ok = sessionGuard();
   try {
-    const answer = await c.availableCatalog(null);
-    if (!ok() || n !== seq) return;
+    const answer = await readStartupModels(c, null, fresh);
+    if (!ok() || n !== seq) return false;
     const hasChat = answer.models.some((m) => m.capability === "chat" && (m.owned || m.ready !== false));
     readiness.set({ hasChat, operator: !!answer.operatorModel });
+    return true;
   } catch {
     // Unknown: show nothing rather than a wrong prompt.
+    return false;
   }
 }
 
@@ -81,11 +84,12 @@ function choices(providers: readonly CatalogProvider[]): Choice[] {
 export function ModelOnboarding(props: { testID?: string }) {
   effect(() => {
     me();
-    settingsOpen();
-    untracked(() => {
-      void loadChatReadiness();
-      if (!catalog()) void loadProviders();
-    });
+    const editing = settingsOpen();
+    let disposed = false;
+    untracked(() => void loadChatReadiness(editing).then(loaded => {
+      if (!disposed && loaded && needsChatModel() && !catalog()) void loadProviders();
+    }));
+    return () => { disposed = true; };
   });
   const list = () => choices(catalog()?.providers ?? []);
   const choose = (id: string) => {

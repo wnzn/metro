@@ -20,6 +20,7 @@ import { announce, cleanup, computed, effect, keymap, signal, untracked } from "
 import type { JSX } from "nsh";
 import type { Bounds, ViewRef } from "nsh";
 import {
+  actionError,
   activeRoom,
   activeSpace,
   activeSpaceId,
@@ -40,9 +41,11 @@ import {
   previewMentionDraft,
   previewMentionMatches,
   rooms,
+  roomsLoaded,
   selectRoom,
   setDraft,
   status,
+  switchingSpace,
   verifiedConfirmationDirectory,
 } from "../store";
 import {
@@ -51,6 +54,8 @@ import {
   AskAgentChooser,
   AuthorGlyph,
   Badge,
+  Banner,
+  Column,
   ComposerHint,
   InlineLink,
   Label,
@@ -95,15 +100,40 @@ const ROOM_IDEAS: DraftIdea[] = [
   { id: "mention", label: "Mention someone", apply: () => fillDraft("@") },
 ];
 
+const roomsPending = () => switchingSpace() && !roomsLoaded();
+
 export function SpaceView() {
   // Its header (breadcrumb, runner, Manage, Space settings) is the Shell's one
   // header row: RoomHeaderTitle and RoomHeaderActions below.
+  let announcedFor: string | null = null;
+  effect(() => {
+    const pending = roomsPending() ? activeSpace() : null;
+    if (pending && pending.id !== announcedFor) announce(`Loading rooms in ${pending.name}.`);
+    announcedFor = pending?.id ?? null;
+  });
   return (
     <Surface variant="panel" grow testID="space-view">
       <ConnectionBanner />
       <NewSpaceRunnerFeedback />
-      <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
-      <RoomComposer />
+      <If when={!!activeRoom()} else={
+        <If when={roomsPending()} else={
+          <Column grow align="center" justify="center" pad={6} gap={2}>
+            <If when={actionError()}>
+              {error => <Banner tone="danger" variant="inline" testID="rooms-error" message={error()} />}
+            </If>
+            <If when={roomsLoaded() && rooms().length === 0} else={<Label color="muted">Select a room in the sidebar.</Label>}>
+              <Label color="muted" testID="rooms-empty">No rooms in this Space yet.</Label>
+            </If>
+          </Column>
+        }>
+          <Column grow align="center" justify="center" pad={6} testID="rooms-loading">
+            <Label color="muted">Rooms will appear here when they’re ready.</Label>
+          </Column>
+        </If>
+      }>
+        <Transcript emptyTitle="Start the conversation" emptyText="Messages here are seen by this Space's members." ideas={ROOM_IDEAS} />
+        <RoomComposer />
+      </If>
     </Surface>
   );
 }
@@ -126,7 +156,7 @@ export function RoomHeaderTitle() {
         ›
       </Label>
       <Label variant="heading" lines={1} testID="room-title" heading tooltip={parent() ? undefined : ROOM_DESCRIPTION}>
-        {activeRoom() ? `# ${activeRoom()!.name}` : "No room selected"}
+        {activeRoom() ? `# ${activeRoom()!.name}` : roomsPending() ? "Loading rooms…" : "No room selected"}
       </Label>
       <If when={parent()}>
         {(p) => (

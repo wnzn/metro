@@ -125,6 +125,8 @@ export const switchingSpace = signal(false);
 
 const roomsBySpace = signal<Record<string, readonly Room[]>>({});
 export const rooms = computed(() => roomsBySpace()[activeSpaceId() ?? ""] ?? EMPTY_ROOMS);
+/** The active Space returned a room list, possibly an empty one. */
+export const roomsLoaded = computed(() => roomsBySpace()[activeSpaceId() ?? ""] !== undefined);
 export const activeRoomId = signal<string | null>(null);
 export const activeRoom = computed(() => rooms().find((r) => r.id === activeRoomId()) ?? null);
 
@@ -227,6 +229,7 @@ let noticeSenderId: string | null = null; // canonical raw /me id, not a legacy 
 let abort: AbortController | null = null;
 let session = 0;
 let navigationGeneration = 0;
+let roomEntryNavigation: number | undefined;
 let timer: number | undefined;
 let ticking = false;
 let tickAgain = false;
@@ -239,49 +242,122 @@ const pollAgain = new Set<string>();
 const lastRoomBySpace = new Map<string, string>();
 const spaceEpoch = new Map<string, number>();
 
-// Access evidence is ordered by request start, not response arrival. A room
-// success proves both the room and its Space; a sibling proves only the Space.
+// Order Space membership, room access and Chat availability by request start.
 let accessSequence = 0;
 const verifiedAccess = new Map<string, number>();
-// Keep Space denials past purgeSpace: an older positive list may still be
-// in flight. A newer authoritative list can grant access again.
-const deniedSpaceAccess = new Map<string, number>();
-// Room losses likewise outlive cache eviction and rejoin: even after a
-// fresh positive, a read started before the loss must not select that room.
+const nextAccessRequest = () => ++accessSequence;
+const newerAccess = (key: string, request: number) => (verifiedAccess.get(key) ?? 0) > request;
+function verifyAccess(key: string, request: number) {
+  if (!newerAccess(key, request)) verifiedAccess.set(key, request);
+}
+const pendingAccessReads = new Map<string, Map<number, Promise<void>>>();
+// A complete list observes every Space, including ids unknown at dispatch.
+const pendingMembershipReads = new Map<number, Promise<void>>();
+const spaceDenials = new Map<string, number>();
+// Keep tombstones after cache eviction and rejoin to fence older replies.
 const deniedRoomAccess = new Map<string, number>();
 const accessProbes = new Map<string, { request: number }>();
 let chatAvailabilityRequest = 0;
 let chatProbeAfter = 0;
-const nextAccessRequest = () => ++accessSequence;
-const newerAccess = (key: string, request: number) => (verifiedAccess.get(key) ?? 0) > request;
-const roomDeniedAtOrAfter = (key: string, request: number) => (deniedRoomAccess.get(key) ?? 0) >= request;
-function verifyAccess(key: string, request: number) {
-  if (!newerAccess(key, request)) verifiedAccess.set(key, request);
+const roomListRequests = new Map<string, number>();
+// A newer complete snapshot also supersedes older discoveries of unknown ids.
+let lastMembershipRequest = 0;
+
+function trackAccessRead(reads: Map<number, Promise<void>>, request: number) {
+  let resolve!: () => void;
+  reads.set(request, new Promise<void>(done => { resolve = done; }));
+  return () => {
+    reads.delete(request);
+    resolve();
+  };
 }
+
+function trackScopedAccessRead(key: string, request: number) {
+  const reads = pendingAccessReads.get(key) ?? new Map<number, Promise<void>>();
+  pendingAccessReads.set(key, reads);
+  const settle = trackAccessRead(reads, request);
+  return () => {
+    settle();
+    if (!reads.size && pendingAccessReads.get(key) === reads) pendingAccessReads.delete(key);
+  };
+}
+
+function newerPendingRead(key: string, request: number) {
+  for (const [id, done] of pendingAccessReads.get(key) ?? []) {
+    if (id > request) return done;
+  }
+}
+
+function newerSpaceDenial(sid: string, request: number) {
+  return (spaceDenials.get(sid) ?? 0) > request;
+}
+
+function currentSpaceEvidence(sid: string, request: number) {
+  return !newerAccess(scopeKey(sid, ""), request) && !newerSpaceDenial(sid, request);
+}
+
+const roomDeniedAtOrAfter = (key: string, request: number) => (deniedRoomAccess.get(key) ?? 0) >= request;
+
 function verifyRoomAccess(sid: string, rid: string, request: number) {
+  if (newerSpaceDenial(sid, request)) return;
   verifyAccess(scopeKey(sid, ""), request);
   const key = scopeKey(sid, rid);
   if (!roomDeniedAtOrAfter(key, request)) verifyAccess(key, request);
 }
-/** Positive rows usable by this request, not rows verified by another read. */
-function verifyRoomList(sid: string, list: readonly Room[], request: number): Room[] {
-  verifyAccess(scopeKey(sid, ""), request);
-  return list.filter(room => {
-    if (roomDeniedAtOrAfter(scopeKey(sid, room.id), request)) return false;
-    verifyRoomAccess(sid, room.id, request);
-    return true;
-  });
+
+function keepNewerRooms(sid: string, list: readonly Room[], request: number, keepActiveOtherThan?: string): Room[] {
+  const listed = new Set(list.map(r => r.id));
+  return [...list, ...roomsOf(sid).filter(r => {
+    const key = scopeKey(sid, r.id);
+    return !listed.has(r.id) && (newerAccess(key, request) || newerPendingRead(key, request) ||
+      (keepActiveOtherThan !== undefined && r.id !== keepActiveOtherThan &&
+        activeSpaceId() === sid && activeRoomId() === r.id));
+  })];
 }
 
-function keepNewerRooms(sid: string, list: readonly Room[], request: number): Room[] {
-  const listed = new Set(list.map(r => r.id));
-  return [...list, ...roomsOf(sid).filter(r => !listed.has(r.id) && newerAccess(scopeKey(sid, r.id), request))];
-}
-const deniedAtOrAfter = (sid: string, request: number) => (deniedSpaceAccess.get(sid) ?? 0) >= request;
-function recordSpaceDenial(sid: string, request: number) {
-  if (deniedAtOrAfter(sid, request) || newerAccess(scopeKey(sid, ""), request)) return false;
-  deniedSpaceAccess.set(sid, request);
-  return true;
+/** Room lists and transcripts are also evidence for their Space. */
+function beginSpaceRead(sid: string, request = nextAccessRequest()) {
+  const key = scopeKey(sid, "");
+  const valid = guard(sid);
+  const settle = trackScopedAccessRead(key, request);
+  function finish(verified = false) {
+    if (verified && valid() && !newerSpaceDenial(sid, request)) verifyAccess(key, request);
+    settle();
+  }
+  return {
+    valid,
+    request,
+    finish,
+    finishRooms(list: readonly Room[]) {
+      finish(true);
+      if (!valid() || newerSpaceDenial(sid, request) || (roomListRequests.get(sid) ?? 0) > request) return;
+      roomListRequests.set(sid, request);
+      return list.filter(room => {
+        if (roomDeniedAtOrAfter(scopeKey(sid, room.id), request)) return false;
+        verifyRoomAccess(sid, room.id, request);
+        return true;
+      });
+    },
+    publishRooms(list: readonly Room[], keepActiveOtherThan?: string) {
+      roomsBySpace.set({ ...roomsBySpace(), [sid]: keepNewerRooms(sid, list, request, keepActiveOtherThan) });
+    },
+    async deny(apply: () => void) {
+      finish();
+      if (!valid() || !currentSpaceEvidence(sid, request) || spaceDenials.get(sid) === request) return false;
+      spaceDenials.set(sid, request);
+      while (valid() && !newerAccess(key, request) && spaceDenials.get(sid) === request) {
+        const newer = newerPendingRead(key, request) ??
+          [...pendingMembershipReads].find(([id]) => id > request)?.[1];
+        if (!newer) {
+          apply(); // stamp/epoch and cache change together, without an intervening await
+          return true;
+        }
+        // A newer attempt isn't a grant. If inconclusive, this refusal still stands.
+        await newer;
+      }
+      return false;
+    },
+  };
 }
 
 // A successful but older POST may retire its draft, not undo a newer denial.
@@ -355,6 +431,13 @@ export async function restorePreferences(mayRestore: () => boolean = () => true)
 
 // ------------------------------------------------------------------ connect / disconnect
 
+/** A pending startup read is reusable only during the same verified navigation. */
+export function startupReadGuard(spaceId?: string) {
+  const valid = guard(spaceId);
+  const navigation = navigationGeneration;
+  return () => valid() && navigation === navigationGeneration;
+}
+
 export type PreparedConnection = Readonly<{ baseUrl: string }>;
 const candidates = new WeakMap<PreparedConnection, {
   token: string; who: Me; list: Space[]; remembered: string | null; signal: AbortSignal;
@@ -374,11 +457,15 @@ function credentials(urlInput: string, tokenInput: string) {
   return { baseUrl: parsed.baseUrl, token };
 }
 
+function verifyConnection(c: Client, baseUrl: string) {
+  return Promise.all([c.me(), c.listSpaces(), rememberedSpace(baseUrl)]);
+}
+
 /** Probe a candidate without touching the live session, including on failure. */
 export async function prepareConnection(baseUrl: string, token: string, signal: AbortSignal): Promise<PreparedConnection> {
   const target = credentials(baseUrl, token);
   const c = createClient({ baseUrl: target.baseUrl, token: () => target.token, signal });
-  const [who, list, remembered] = await Promise.all([c.me(), c.listSpaces(), rememberedSpace(target.baseUrl)]);
+  const [who, list, remembered] = await verifyConnection(c, target.baseUrl);
   if (signal.aborted) throw new ApiError("aborted", "Cancelled");
   const prepared = Object.freeze({ baseUrl: target.baseUrl });
   candidates.set(prepared, { token: target.token, who, list, remembered, signal });
@@ -393,22 +480,37 @@ function beginSession(baseUrl: string, token: string) {
   return { sess, c: client };
 }
 
-function publishIdentity(baseUrl: string, who: Me, list: Space[], remember?: boolean) {
+/** Publish the verified identity, membership and destination together. */
+function publishSession(baseUrl: string, token: string, who: Me, list: Space[], remembered: string | null, remember?: boolean) {
   noticeSenderId = who.canonicalId;
-  batch(() => {
+  return batch(() => {
     me.set(who.id);
     orgAdmin.set(who.isOrgAdmin);
     spaces.set(list);
     connectedTo.set(baseUrl);
-  });
-  if (remember !== false) Storage.setItem(SERVER_URL_KEY, baseUrl).catch(() => {});
-}
+    if (remember !== false) Storage.setItem(SERVER_URL_KEY, baseUrl).catch(() => {});
 
-function startOnline(baseUrl: string, token: string) {
-  lastListsRefresh = Date.now();
-  failures = 0;
-  status.set({ phase: "online" });
-  for (const fn of sessionStarters) fn({ baseUrl, token });
+    const initial = list.find((s) => s.id === remembered);
+    let hydration: Promise<void> | undefined;
+    if (initial) {
+      // Set the Space before exposing the Shell. Chat must not mount while
+      // we wait for the selected Space's rooms.
+      const current = guard();
+      const entering = enterSpace(initial.id, { place: "chat", spaceId: null });
+      const navigation = navigationGeneration; // enterSpace starts navigation before its first await
+      hydration = entering.then(() => {
+        // A running tick reads the active destination after any refreshLists await.
+        if (current() && !ticking && navigation === navigationGeneration) kick();
+      });
+    }
+    lastListsRefresh = Date.now();
+    failures = 0;
+    status.set({ phase: "online" });
+    // Membership sync belongs to the session, not to a room entry or transcript.
+    kick();
+    for (const fn of sessionStarters) fn({ baseUrl, token });
+    return hydration;
+  });
 }
 
 /** Consume a verified candidate synchronously. Subsequent requests have their own session lifetime. */
@@ -420,27 +522,7 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
   batch(() => {
     beginSession(prepared.baseUrl, candidate.token);
     connectError.set(null);
-    publishIdentity(prepared.baseUrl, candidate.who, candidate.list, opts.remember);
-    startOnline(prepared.baseUrl, candidate.token);
-    const initial = candidate.list.find((s) => s.id === candidate.remembered);
-    if (initial) {
-      // Show the shell now; kick the first tick after enterSpace settles,
-      // bounded by listRooms' client timeout.
-      const current = guard();
-      const entering = enterSpace(initial.id, { place: "chat", spaceId: null });
-      const navigation = navigationGeneration; // enterSpace starts navigation before its first await
-      void entering.then(() => {
-        // A running tick reads the active room after any refreshLists await.
-        if (!current() || ticking) return;
-        const stillTarget = navigation === navigationGeneration &&
-          basePlace() === "space" && activeSpaceId() === initial.id && activeRoomId() !== null && view() === "room";
-        // Don't wake a later navigation, even if it returned to this Space.
-        // Still start the loop if none is scheduled (e.g. after falling back to Chat).
-        if (stillTarget || timer === undefined) kick();
-      });
-    } else {
-      kick();
-    }
+    void publishSession(prepared.baseUrl, candidate.token, candidate.who, candidate.list, candidate.remembered, opts.remember);
   });
 }
 
@@ -448,13 +530,13 @@ export function adoptConnection(prepared: PreparedConnection, opts: { remember?:
  * `remember: false` (the desktop-hosted local workspace): don't save this URL
  * as the server to offer next time, so the remote choice stays as it was.
  */
-export async function connect(urlInput: string, tokenInput: string, opts: { remember?: boolean } = {}): Promise<void> {
+export async function connect(urlInput: string, tokenInput: string, opts: { remember?: boolean } = {}): Promise<boolean> {
   let target: ReturnType<typeof credentials>;
   try {
     target = credentials(urlInput, tokenInput);
   } catch (error) {
     connectError.set((error as Error).message);
-    return;
+    return false;
   }
   const { baseUrl, token } = target;
   const { sess, c } = beginSession(baseUrl, token);
@@ -464,21 +546,18 @@ export async function connect(urlInput: string, tokenInput: string, opts: { reme
   });
 
   try {
-    const [who, list] = await Promise.all([c.me(), c.listSpaces()]);
-    if (sess !== session) return;
-    publishIdentity(baseUrl, who, list, opts.remember);
-    const remembered = await rememberedSpace(baseUrl);
-    if (sess !== session) return;
-    // A returning user lands in their last Space; everyone else in their Chat.
-    const initial = list.find((s) => s.id === remembered) ?? null;
-    if (initial) await enterSpace(initial.id, { place: "chat", spaceId: null });
-    if (sess !== session) return;
-    startOnline(baseUrl, token);
-    kick();
+    const [who, list, remembered] = await verifyConnection(c, baseUrl);
+    if (sess !== session) return false;
+    // The Shell can mount immediately, but don't offer to keep the token if
+    // room hydration lost the session or the person switched in the meantime.
+    await publishSession(baseUrl, token, who, list, remembered, opts.remember);
+    return sess === session;
   } catch (error) {
-    if (sess !== session) return;
-    endSession();
-    connectError.set(describe(error, "Could not connect"));
+    if (sess === session) {
+      endSession();
+      connectError.set(describe(error, "Could not connect"));
+    }
+    return false;
   }
 }
 
@@ -494,10 +573,17 @@ export function retryNow() {
 
 // ------------------------------------------------------------------ spaces
 
+function supersedeRoomEntry() {
+  // The read can still settle as access evidence, but no longer owns navigation.
+  roomEntryNavigation = undefined;
+  switchingSpace.set(false);
+}
+
 export function openChat() {
   if (basePlace() === "chat" && !settingsOpen()) return;
   navigationGeneration++;
   batch(() => {
+    supersedeRoomEntry();
     clearTransient();
     view.set("room");
     settingsOpen.set(false);
@@ -509,11 +595,15 @@ export function openChat() {
   kick();
 }
 
-/** Opens Search, Library or Scheduled tasks: the user's own pages, outside every Space. */
-export function openPlace(where: "search" | "library" | "pages" | "schedules") {
-  if (basePlace() === where && !settingsOpen()) return;
+/** Open a destination outside a Space. Explicit sub-route moves also supersede old navigation intents. */
+export function openPlace(where: "search" | "library" | "pages" | "schedules", { subrouteChanged = false } = {}) {
+  if (basePlace() === where && !settingsOpen()) {
+    if (subrouteChanged) navigationGeneration++;
+    return;
+  }
   navigationGeneration++;
   batch(() => {
+    supersedeRoomEntry();
     clearTransient();
     view.set("room");
     settingsOpen.set(false);
@@ -528,18 +618,23 @@ export function openPlace(where: "search" | "library" | "pages" | "schedules") {
 export async function openExactRoom(spaceId: string, roomId: string, stillHere: () => boolean): Promise<boolean> {
   const c = client;
   if (!c || switchingSpace() || !roomId || !spaces().some(s => s.id === spaceId)) return false;
-  const valid = guard(spaceId);
   const generation = navigationGeneration;
-  const request = nextAccessRequest();
-  const result = await c.listRooms(spaceId);
-  if (!valid() || switchingSpace() || generation !== navigationGeneration || !stillHere()) return false;
-  const list = verifyRoomList(spaceId, result, request);
-  if (!list.some(r => r.id === roomId)) return false;
+  const read = beginSpaceRead(spaceId);
+  let result: Room[];
+  try {
+    result = await c.listRooms(spaceId);
+  } catch (error) {
+    if (isAccessDenial(error)) void read.deny(() => dropLostSpace(spaceId));
+    else read.finish();
+    throw error;
+  }
+  const list = read.finishRooms(result);
+  if (switchingSpace() || generation !== navigationGeneration || !stillHere() || !list?.some(r => r.id === roomId)) return false;
   navigationGeneration++;
   lastRoomBySpace.set(spaceId, roomId);
   batch(() => {
     clearTransient();
-    roomsBySpace.set({ ...roomsBySpace(), [spaceId]: keepNewerRooms(spaceId, list, request) });
+    read.publishRooms(list);
     activeSpaceId.set(spaceId);
     activeRoomId.set(roomId);
     view.set("room");
@@ -635,23 +730,33 @@ export function closeSettings() {
 }
 
 export async function selectSpace(spaceId: string): Promise<void> {
-  if (switchingSpace()) return;
-  if (spaceId === activeSpaceId() && roomsBySpace()[spaceId]) {
-    if (basePlace() === "space" && !settingsOpen()) return;
-    navigationGeneration++;
-    batch(() => {
-      clearTransient();
-      view.set("room");
-      settingsOpen.set(false);
-      basePlace.set("space");
-      actionError.set(null);
-      notice.set(null);
-    });
-    kick();
-    return;
+  if (!client || !spaces().some(s => s.id === spaceId)) return;
+  if (spaceId === activeSpaceId() && basePlace() === "space") {
+    // Repeated clicks on the pending target aren't a new entry. Clicking any
+    // other Space is deliberate navigation, even during startup hydration.
+    if (roomEntryNavigation === navigationGeneration) {
+      if (settingsOpen()) closeSettings();
+      return;
+    }
+    if (roomsBySpace()[spaceId] && !settingsOpen()) return;
   }
-  await enterSpace(spaceId, { place: basePlace(), spaceId: activeSpaceId() });
-  kick();
+  const current = guard();
+  const entering = enterSpace(spaceId, { place: basePlace(), spaceId: activeSpaceId() });
+  const navigation = navigationGeneration;
+  await entering;
+  if (current() && navigation === navigationGeneration) kick();
+}
+
+/** Publish an acknowledged Create without replacing newer access evidence. */
+function publishCreatedSpace(space: Space, request: number): boolean {
+  if (newerSpaceDenial(space.id, request)) return false;
+  const key = scopeKey(space.id, "");
+  const listed = spaces();
+  if (newerAccess(key, request)) return listed.some(s => s.id === space.id);
+  // The POST proves access even if the first room read is inconclusive.
+  verifyAccess(key, request);
+  spaces.set([...listed.filter(s => s.id !== space.id), space]);
+  return true;
 }
 
 type CreateSpaceOptions = {
@@ -675,8 +780,17 @@ export async function createSpace(nameInput: string, options?: CreateSpaceOption
     return false;
   }
   const ok = guard();
+  const origin = navigationGeneration;
+  const originPlace = place(), originView = view();
+  const stillHere = () => origin === navigationGeneration && originPlace === place() && originView === view();
   const source = createSpaceContext;
   let created = false;
+  let fromOriginalForm = false;
+  const captureForm = () => {
+    // Publishing the first Space can unmount onboarding. Check the actual
+    // submitting form before that expected transition, not after the read.
+    fromOriginalForm = stillHere() && source === createSpaceContext && !!options?.formIsCurrent();
+  };
   batch(() => {
     creatingSpace.set(true);
     actionError.set(null);
@@ -685,30 +799,50 @@ export async function createSpace(nameInput: string, options?: CreateSpaceOption
     const request = nextAccessRequest();
     const space = await c.createSpace(name);
     if (!ok()) return false;
-    verifyAccess(scopeKey(space.id, ""), request);
     created = true;
-    // Onboarding can unmount as soon as we publish the first Space. Check
-    // the submitting form before that expected transition.
-    const fromOriginalForm = source === createSpaceContext && !!options?.formIsCurrent();
+    if (newerSpaceDenial(space.id, request)) return true;
+    if (lastMembershipRequest > request && !spaces().some(s => s.id === space.id)) {
+      // The newer list may have been taken before the POST committed, or
+      // after the Space disappeared. Only a fresh read can distinguish them.
+      // A failed check doesn't undo the accepted POST or make it safe to retry.
+      const checked = await refreshMembership(c, { beforePublish: captureForm }).catch(error => {
+        if (ok() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+        return undefined;
+      });
+      if (!ok()) return false;
+      const verified = verifiedAccess.get(scopeKey(space.id, "")) ?? 0;
+      if (checked === undefined || verified < checked || newerSpaceDenial(space.id, verified) ||
+        !spaces().some(s => s.id === space.id)) return true;
+    } else {
+      captureForm();
+      if (!publishCreatedSpace(space, request)) return true;
+    }
+    if (!stillHere()) return true; // the sidebar may update, but don't override navigation
+    const confirmed = spaces().find(s => s.id === space.id);
+    if (!confirmed) return true;
     const expectedContext = createSpaceContext + 1; // enterSpace clears transients once
     const spaceOK = guard(space.id);
-    spaces.set([...spaces().filter((s) => s.id !== space.id), space]);
-    await enterSpace(space.id, { place: basePlace(), spaceId: activeSpaceId() });
-    kick();
+    const entering = enterSpace(confirmed.id, { place: basePlace(), spaceId: activeSpaceId() });
+    const navigation = navigationGeneration;
+    await entering;
+    if (!ok()) return false;
+    if (navigation === navigationGeneration) kick();
     // Returning to the same Space can show a missing attachment, but cannot
     // revive consent invalidated by a move or dialog.
     const mayShowOutcome = () => spaceOK() && basePlace() === "space" && view() === "room" && activeSpaceId() === space.id;
     if (options && mayShowOutcome()) {
-      await options.attachRunner(space, {
-        mayAttach: () => fromOriginalForm && createSpaceContext === expectedContext && mayShowOutcome(),
+      await options.attachRunner(confirmed, {
+        mayAttach: () => fromOriginalForm && navigation === navigationGeneration && createSpaceContext === expectedContext &&
+          mayShowOutcome() && !newerSpaceDenial(space.id, verifiedAccess.get(scopeKey(space.id, "")) ?? 0),
         mayShowOutcome,
       });
     }
-    return true;
+    return ok();
   } catch (error) {
-    // A follow-up failure must not turn a confirmed creation into a retry.
-    if (created) return ok();
-    if (ok()) handleActionError(error, "Could not create the Space");
+    if (!ok()) return false;
+    if (error instanceof ApiError && error.kind === "auth") disconnect(error.message);
+    else if (created) return true; // a follow-up failure doesn't undo the POST
+    else if (stillHere()) handleActionError(error, "Could not create the Space");
     return false;
   } finally {
     if (ok()) creatingSpace.set(false);
@@ -723,10 +857,11 @@ export async function createSpace(nameInput: string, options?: CreateSpaceOption
 async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId: string | null }): Promise<void> {
   const c = client;
   if (!c) return;
-  navigationGeneration++;
+  const navigation = ++navigationGeneration;
+  roomEntryNavigation = navigation;
   const currentSession = guard();
   const ok = guard(spaceId);
-  let request: number | undefined;
+  const read = !roomsBySpace()[spaceId] ? beginSpaceRead(spaceId) : undefined;
   batch(() => {
     clearTransient();
     view.set("room");
@@ -739,40 +874,56 @@ async function enterSpace(spaceId: string, previous: { place: MainPlace; spaceId
     switchingSpace.set(true);
   });
   try {
-    if (!roomsBySpace()[spaceId]) {
-      request = nextAccessRequest();
-      const result = await c.listRooms(spaceId);
-      if (!ok()) return;
-      const list = keepNewerRooms(spaceId, verifyRoomList(spaceId, result, request), request);
+    if (read) {
+      const list = read.finishRooms(await c.listRooms(spaceId));
+      if (!ok() || navigation !== navigationGeneration) return;
       batch(() => {
-        roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
-        if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, list));
+        if (list) read.publishRooms(list);
+        if (activeSpaceId() === spaceId) activeRoomId.set(pickRoom(spaceId, roomsBySpace()[spaceId] ?? EMPTY_ROOMS));
       });
     }
     if (activeSpaceId() === spaceId) rememberSpace(spaceId);
   } catch (error) {
-    if (!ok() || isAborted(error)) return;
+    if (!ok() || isAborted(error)) { read?.finish(); return; }
     if (error instanceof ApiError && error.kind === "auth") {
+      read?.finish();
       disconnect(error.message);
       return;
     }
-    const name = spaces().find((s) => s.id === spaceId)?.name ?? spaceId;
-    if (isAccessDenial(error)) {
-      if (request === undefined || !recordSpaceDenial(spaceId, request)) {
-        if (activeSpaceId() === spaceId && !activeRoomId()) activeRoomId.set(pickRoom(spaceId, roomsOf(spaceId)));
+    const failed = (unlist: boolean) => {
+      if (navigation !== navigationGeneration) {
+        if (unlist) dropLostSpace(spaceId);
         return;
       }
-      purgeSpace(spaceId, true);
-    } else purgeSpace(spaceId, false); // keep it listed; just don't keep half-loaded state
-    const back = previous.spaceId && spaces().some((s) => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
-    batch(() => {
-      activeSpaceId.set(back);
-      activeRoomId.set(back ? pickRoom(back, roomsBySpace()[back] ?? EMPTY_ROOMS) : null);
-      basePlace.set(back && previous.place === "space" ? "space" : "chat");
-      actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
-    });
+      const name = spaces().find(s => s.id === spaceId)?.name ?? spaceId;
+      const back = previous.spaceId && previous.spaceId !== spaceId &&
+        spaces().some(s => s.id === previous.spaceId) && roomsBySpace()[previous.spaceId] ? previous.spaceId : null;
+      batch(() => {
+        if (unlist) purgeSpace(spaceId, true);
+        activeSpaceId.set(back);
+        activeRoomId.set(back ? pickRoom(back, roomsBySpace()[back] ?? EMPTY_ROOMS) : null);
+        basePlace.set(back && previous.place === "space" ? "space" : "chat");
+        actionError.set(`Couldn't open ${name}: ${describe(error, "error")}`);
+      });
+    };
+    if (read && isAccessDenial(error)) {
+      if (await read.deny(() => failed(true))) return;
+    } else {
+      read?.finish();
+    }
+    if (!ok() || navigation !== navigationGeneration) return;
+    const verifiedRooms = roomsBySpace()[spaceId];
+    if (verifiedRooms) {
+      activeRoomId.set(pickRoom(spaceId, verifiedRooms));
+      rememberSpace(spaceId);
+      return;
+    }
+    failed(false);
   } finally {
-    if (currentSession()) switchingSpace.set(false);
+    if (currentSession() && roomEntryNavigation === navigation) {
+      roomEntryNavigation = undefined;
+      switchingSpace.set(false);
+    }
   }
 }
 
@@ -782,19 +933,20 @@ async function ensureRooms(spaceId: string): Promise<readonly Room[]> {
   if (cached) return cached;
   const c = client;
   if (!c) return EMPTY_ROOMS;
-  const ok = guard(spaceId);
-  const request = nextAccessRequest();
-  let list: Room[];
+  const read = beginSpaceRead(spaceId);
   try {
-    list = await c.listRooms(spaceId);
+    const list = read.finishRooms(await c.listRooms(spaceId));
+    if (list) read.publishRooms(list);
+    return read.valid() ? roomsBySpace()[spaceId] ?? EMPTY_ROOMS : EMPTY_ROOMS;
   } catch (error) {
-    if (ok() && isAccessDenial(error)) dropLostSpace(spaceId, request, true);
+    if (read.valid() && isAccessDenial(error)) {
+      const dropped = await read.deny(() => dropLostSpace(spaceId));
+      if (!dropped && read.valid() && roomsBySpace()[spaceId]) return roomsBySpace()[spaceId]!;
+    } else {
+      read.finish();
+    }
     throw error;
   }
-  if (!ok()) return EMPTY_ROOMS;
-  list = keepNewerRooms(spaceId, verifyRoomList(spaceId, list, request), request);
-  roomsBySpace.set({ ...roomsBySpace(), [spaceId]: list });
-  return list;
 }
 
 function pickRoom(spaceId: string, list: readonly Room[]): string | null {
@@ -811,7 +963,11 @@ function pickRoom(spaceId: string, list: readonly Room[]): string | null {
 /** Forgets everything cached for a Space; `unlist` also removes it from the list. */
 function purgeSpace(spaceId: string, unlist: boolean) {
   spaceEpoch.set(spaceId, epochOf(spaceId) + 1);
+  // Keep denial evidence for the session. A complete list may still be on
+  // the wire from before the denial, even if this id was unknown to it.
+  roomListRequests.delete(spaceId);
   const prefix = scopeKey(spaceId, "");
+  for (const key of pendingAccessReads.keys()) if (key.startsWith(prefix)) pendingAccessReads.delete(key);
   for (const key of [...cursors.keys()]) if (key.startsWith(prefix)) cursors.delete(key);
   for (const key of [...inflight.keys()]) if (key.startsWith(prefix)) inflight.delete(key);
   for (const key of [...pollAgain]) if (key.startsWith(prefix)) pollAgain.delete(key);
@@ -845,9 +1001,25 @@ function purgeSpace(spaceId: string, unlist: boolean) {
     memberEvidence.set(restEvidence);
     memberRequests.delete(spaceId);
     memberVersions.delete(spaceId);
-    if (activeSpaceId() === spaceId) {
-      if (activeScope().startsWith(prefix)) writeMentionDraft(EMPTY_MENTION_DRAFT, null);
-      clearTransient();
+    if (activeScope().startsWith(prefix)) writeMentionDraft(EMPTY_MENTION_DRAFT, null);
+    if (basePlace() === "space" && !settingsOpen() && activeSpaceId() === spaceId) clearTransient();
+  });
+}
+
+/** Remove only the scope of a verified refusal, not the user's newer destination. */
+function dropLostSpace(spaceId: string, show = true) {
+  const name = spaces().find(s => s.id === spaceId)?.name;
+  batch(() => {
+    purgeSpace(spaceId, true);
+    if (activeSpaceId() !== spaceId) return;
+    activeSpaceId.set(null);
+    activeRoomId.set(null);
+    if (basePlace() === "space") {
+      view.set("room");
+      actionError.set(null);
+      notice.set(show && name ? `You no longer have access to ${name}.` : null);
+      basePlace.set("chat");
+      if (!ticking) kick();
     }
   });
 }
@@ -1296,50 +1468,49 @@ export async function setDispatchSpace(spaceId: string, roomId?: string): Promis
   const navigation = navigationGeneration;
   const pending = { spaceId, roomId: null };
   const here = () => basePlace() === "chat" && navigation === navigationGeneration && dispatchTarget() === pending;
+  const sameSession = guard();
   dispatchError.set(null);
   dispatchNotice.set(null);
   dispatchTarget.set(pending);
-  const request = nextAccessRequest();
+  const read = roomId === undefined ? undefined : beginSpaceRead(spaceId);
+  const unverified = "Couldn't verify that destination. Follow up again or choose another room.";
   try {
-    // Follow up at the exact requested room or thread. A cached list can
-    // miss a new thread or still contain one that no longer exists.
-    const list = roomId === undefined ? await ensureRooms(spaceId) : await c.listRooms(spaceId);
-    if (!ok()) return;
-    if (roomId === undefined) {
-      if (dispatchTarget() === pending) dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
-    } else {
-      const verified = verifyRoomList(spaceId, list, request);
-      const listed = new Set(verified.map(r => r.id));
-      const found = listed.has(roomId);
-      const key = scopeKey(spaceId, roomId);
-      const stale = !found && (roomDeniedAtOrAfter(key, request) || newerAccess(key, request));
-      batch(() => {
-        if (!stale) {
-          // Keep newer verified rooms and leave other active room views
-          // alone; their own poll is responsible for confirming a loss.
-          const keep = roomsOf(spaceId).filter(r => !listed.has(r.id) &&
-            (newerAccess(scopeKey(spaceId, r.id), request) ||
-              (r.id !== roomId && activeSpaceId() === spaceId && activeRoomId() === r.id)));
-          roomsBySpace.set({ ...roomsBySpace(), [spaceId]: [...verified, ...keep] });
-          if (!found) dropLostRoom(spaceId, roomId, request, false);
-        }
-        if (found && dispatchTarget() === pending) dispatchTarget.set({ spaceId, roomId });
-        else if (!found && here()) dispatchError.set(stale
-          ? "Couldn't verify that destination. Follow up again or choose another room."
-          : "That room or thread is no longer available. Choose another destination.");
-      });
+    if (!read || roomId === undefined) {
+      const list = await ensureRooms(spaceId);
+      if (ok() && here()) dispatchTarget.set({ spaceId, roomId: pickRoom(spaceId, list) });
+      return;
     }
-  } catch (error) {
+    // Verify the exact destination from this read, never from a cached fallback.
+    const list = read.finishRooms(await c.listRooms(spaceId));
     if (!ok()) return;
-    const show = here();
-    const denied = roomId !== undefined && isAccessDenial(error);
-    const stale = denied && newerAccess(scopeKey(spaceId, ""), request);
+    const key = scopeKey(spaceId, roomId);
+    const found = list?.some(r => r.id === roomId);
+    const stale = !list || (!found && (roomDeniedAtOrAfter(key, read.request) || newerAccess(key, read.request)));
     batch(() => {
-      if (denied && !stale) dropLostSpace(spaceId, request, false);
-      if (show) dispatchError.set(stale
-        ? "Couldn't verify that destination. Follow up again or choose another room."
-        : describe(error, "Could not load that Space's rooms"));
+      if (list && !stale) {
+        // An unrelated active room is left for its own poll to confirm.
+        read.publishRooms(list, roomId);
+        if (!found) void dropLostRoom(spaceId, roomId, read.request, false);
+      }
+      if (found && here()) dispatchTarget.set({ spaceId, roomId });
+      else if (!found && here()) dispatchError.set(stale ? unverified
+        : "That room or thread is no longer available. Choose another destination.");
     });
+  } catch (error) {
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") {
+      read?.finish();
+      disconnect(error.message);
+    } else if (read && isAccessDenial(error)) {
+      const applied = await read.deny(() => batch(() => {
+        const show = here();
+        dropLostSpace(spaceId, false);
+        if (show) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+      }));
+      if (!applied && ok() && here()) dispatchError.set(unverified);
+    } else {
+      read?.finish();
+      if (ok() && here()) dispatchError.set(describe(error, "Could not load that Space's rooms"));
+    }
   }
 }
 
@@ -1976,10 +2147,15 @@ function endSession() {
   pollAgain.clear();
   lastRoomBySpace.clear();
   spaceEpoch.clear();
+  roomEntryNavigation = undefined;
+  pendingAccessReads.clear();
+  pendingMembershipReads.clear();
+  spaceDenials.clear();
+  roomListRequests.clear();
+  verifiedAccess.clear();
+  lastMembershipRequest = 0;
   noticeEpochs.clear();
   pendingSenderNotices.clear();
-  verifiedAccess.clear();
-  deniedSpaceAccess.clear();
   deniedRoomAccess.clear();
   accessProbes.clear();
   chatAvailabilityRequest = 0;
@@ -2100,23 +2276,6 @@ async function handleLoopError(error: unknown): Promise<number | null> {
   return retryInMs;
 }
 
-function dropLostSpace(spaceId: string, request: number, show: boolean) {
-  if (!recordSpaceDenial(spaceId, request)) return;
-  const name = spaces().find(s => s.id === spaceId)?.name;
-  batch(() => {
-    purgeSpace(spaceId, true);
-    if (activeSpaceId() !== spaceId) return;
-    activeSpaceId.set(null);
-    activeRoomId.set(null);
-    view.set("room");
-    if (basePlace() === "space") {
-      actionError.set(null);
-      notice.set(show && name ? `You no longer have access to ${name}.` : null);
-      basePlace.set("chat");
-    }
-  });
-}
-
 /** A POST or poll denial invalidates the originating room's notes now.
  * Only a scoped, still-current access check may drop its public state. */
 async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind: "room" }>, valid: () => boolean, show: boolean) {
@@ -2127,29 +2286,41 @@ async function recheckRoomAccess(c: Client, to: Extract<SendDestination, { kind:
   // A stream of denials must not keep replacing its own slow probe. A
   // denial after fresh positive evidence, however, needs a fresh check.
   if (inProgress && !newerAccess(scope, inProgress.request) && !newerAccess(spaceScope, inProgress.request)) return;
-  const spaceRequest = nextAccessRequest();
-  const probe = { request: spaceRequest };
+  const sameSession = guard();
+  const probe = { request: 0 };
   accessProbes.set(scope, probe);
   const current = () => valid() && accessProbes.get(scope) === probe;
   try {
-    const visible = await c.listSpaces().catch(() => null);
-    if (!current() || !visible) return;
-    if (visible.some(s => s.id === spaceId)) verifyAccess(spaceScope, spaceRequest);
-    else if (!newerAccess(spaceScope, spaceRequest)) {
-      dropLostSpace(spaceId, spaceRequest, show);
-      return;
-    }
+    const spaceRequest = await refreshMembership(c, {
+      started: request => { probe.request = request; },
+      showLoss: sid => sid !== spaceId || show,
+      keepPollCadence: true,
+    });
+    if (!current() || !spaces().some(s => s.id === spaceId) ||
+      (spaceDenials.get(spaceId) ?? 0) >= (verifiedAccess.get(spaceScope) ?? 0)) return;
+    // A newer membership snapshot can settle the Space leg, not the room leg.
+    // Only newer evidence for this exact room makes the latter redundant.
+    if (spaceRequest === undefined && (!newerAccess(spaceScope, probe.request) ||
+      newerAccess(scope, probe.request) || roomDeniedAtOrAfter(scope, probe.request))) return;
     // The room read is a new observation. Access verified while the Space
     // list was in flight does not outrank a denial on this later leg.
-    const roomRequest = probe.request = nextAccessRequest();
+    const read = beginSpaceRead(spaceId);
+    const roomRequest = probe.request = read.request;
     try {
       const list = await c.listRooms(spaceId);
-      if (!current()) return;
+      read.finish(current());
+      if (!current() || newerSpaceDenial(spaceId, roomRequest)) return;
       if (list.some(r => r.id === roomId)) verifyRoomAccess(spaceId, roomId, roomRequest);
-      else dropLostRoom(spaceId, roomId, roomRequest, show);
+      else void dropLostRoom(spaceId, roomId, roomRequest, show);
     } catch (error) {
-      if (current() && isAccessDenial(error)) dropLostSpace(spaceId, roomRequest, show);
+      if (current() && isAccessDenial(error)) await read.deny(() => dropLostSpace(spaceId, show));
+      else {
+        read.finish();
+        throw error;
+      }
     }
+  } catch (error) {
+    if (sameSession() && error instanceof ApiError && error.kind === "auth") disconnect(error.message);
   } finally {
     if (accessProbes.get(scope) === probe) accessProbes.delete(scope);
   }
@@ -2161,10 +2332,18 @@ function recordRoomDenial(key: string, request: number) {
   return true;
 }
 
-function dropLostRoom(spaceId: string, roomId: string, request: number, show: boolean) {
+async function dropLostRoom(spaceId: string, roomId: string, request: number, show: boolean) {
   const key = scopeKey(spaceId, roomId);
   if (!recordRoomDenial(key, request)) return;
+  const valid = guard(spaceId);
+  // Record the fence now, but don't evict a room with a newer transcript on
+  // the wire. An empty successful transcript proves access too.
+  for (let pending = newerPendingRead(key, request); pending; pending = newerPendingRead(key, request)) {
+    await pending;
+    if (!valid() || newerAccess(key, request) || deniedRoomAccess.get(key) !== request) return;
+  }
   cursors.delete(key);
+  if (lastRoomBySpace.get(spaceId) === roomId) lastRoomBySpace.delete(spaceId);
   batch(() => {
     forgetSenderNotices(key);
     roomsBySpace.set({ ...roomsBySpace(), [spaceId]: roomsOf(spaceId).filter(r => r.id !== roomId) });
@@ -2216,38 +2395,47 @@ export function spaceRenamed(spaceId: string, name: string) {
   spaces.set(spaces().map((s) => (s.id === spaceId ? { ...s, name } : s)));
 }
 
-/** Merge a same-session membership snapshot with newer scoped evidence.
- * Startup publishing a snapshot into an existing session must use the
- * same request order; only a genuinely new session starts with no evidence. */
-function applySpaceList(list: readonly Space[], request: number) {
-  const previous = new Map(spaces().map(s => [s.id, s]));
-  const listed = new Set(list.map(s => s.id));
-  const next: Space[] = [];
-  batch(() => {
-    for (const s of list) {
-      if (deniedAtOrAfter(s.id, request)) continue;
-      const current = previous.get(s.id);
-      const key = scopeKey(s.id, "");
-      // A snapshot older than newer verified access doesn't replace its
-      // current listing (including role), even when both include the Space.
-      if (current && newerAccess(key, request)) next.push(current);
-      else {
-        verifyAccess(key, request);
-        next.push(s);
+/** Apply just the ordered membership snapshot, with no room or event reads. */
+async function refreshMembership(c: Client, options?: {
+  beforePublish?: () => void;
+  started?: (request: number) => void;
+  showLoss?: (spaceId: string) => boolean;
+  keepPollCadence?: boolean;
+}): Promise<number | undefined> {
+  const ok = guard();
+  const request = nextAccessRequest();
+  const settle = trackAccessRead(pendingMembershipReads, request);
+  try {
+    options?.started?.(request);
+    const list = await c.listSpaces();
+    if (!ok() || request <= lastMembershipRequest) return;
+    options?.beforePublish?.();
+    lastMembershipRequest = request;
+    // A denial-triggered probe is ordered like every snapshot, but must not
+    // postpone the regular scan (including rediscovery after a rejoin).
+    if (!options?.keepPollCadence) lastListsRefresh = Date.now();
+    const listed = new Set(list.map(s => s.id));
+    batch(() => {
+      const accepted = list.filter(s => {
+        if (!currentSpaceEvidence(s.id, request)) return false;
+        verifyAccess(scopeKey(s.id, ""), request);
+        return true;
+      });
+      // Include ids published by an earlier list while this one was in
+      // flight. Scope evidence still outranks an older complete snapshot.
+      const known = new Set([...spaces().map(s => s.id), ...spaceDenials.keys()]);
+      for (const id of known) {
+        if (!listed.has(id)) void beginSpaceRead(id, request).deny(() => {
+          if (spaces().some(s => s.id === id)) dropLostSpace(id, options?.showLoss?.(id));
+        });
       }
-    }
-    for (const [sid, s] of previous) {
-      if (listed.has(sid)) continue;
-      if (newerAccess(scopeKey(sid, ""), request)) next.push(s);
-      else dropLostSpace(sid, request, true);
-    }
-    // Even after eviction, a newer omission is evidence the Space is
-    // still gone, not a chance for an intermediate positive reply to win.
-    for (const sid of deniedSpaceAccess.keys()) {
-      if (!listed.has(sid)) recordSpaceDenial(sid, request);
-    }
-    spaces.set(next);
-  });
+      const updated = new Set(accepted.map(s => s.id));
+      spaces.set([...accepted, ...spaces().filter(s => !updated.has(s.id))]);
+    });
+    return request;
+  } finally {
+    settle();
+  }
 }
 
 /** Reloads the Space list and the active Space's rooms. */
@@ -2256,38 +2444,35 @@ async function refreshLists(force = false) {
   if (!c) return;
   if (!force && Date.now() - lastListsRefresh < LISTS_REFRESH_MS) return;
   const ok = guard();
-  const request = nextAccessRequest();
-  const list = await c.listSpaces();
-  if (!ok()) return;
-  lastListsRefresh = Date.now();
-  applySpaceList(list, request);
-  const active = activeSpaceId();
+  const request = await refreshMembership(c);
+  if (!ok() || request !== lastMembershipRequest) return;
+  const active = basePlace() === "space" && !switchingSpace() ? activeSpaceId() : null;
   if (active) {
-    const okSpace = guard(active);
-    const roomRequest = nextAccessRequest();
+    const read = beginSpaceRead(active);
     let rooms: Room[];
     try {
       rooms = await c.listRooms(active);
     } catch (error) {
-      if (!okSpace()) return;
       if (isAccessDenial(error)) {
-        dropLostSpace(active, roomRequest, true);
+        void read.deny(() => dropLostSpace(active));
         return;
       }
+      read.finish();
+      if (!read.valid()) return;
       throw error;
     }
-    if (!okSpace()) return;
     const snapshotIds = new Set(rooms.map(r => r.id));
-    rooms = verifyRoomList(active, rooms, roomRequest);
+    const list = read.finishRooms(rooms);
+    if (!list) return;
+    const roomRequest = read.request;
     const previous = roomsBySpace()[active] ?? EMPTY_ROOMS;
     const current = activeRoomId();
-    const next = keepNewerRooms(active, rooms, roomRequest);
     batch(() => {
       // Newer room access, including a successful create, wins over an
       // older omission. An authoritative loss must also clear Dispatch.
-      roomsBySpace.set({ ...roomsBySpace(), [active]: next });
+      read.publishRooms(list);
       for (const r of previous) {
-        if (!snapshotIds.has(r.id)) dropLostRoom(active, r.id, roomRequest, true);
+        if (!snapshotIds.has(r.id)) void dropLostRoom(active, r.id, roomRequest, true);
       }
       // An absent room can have an intermediate positive read still in
       // flight. Advance existing tombstones even when no row is cached.
@@ -2310,10 +2495,19 @@ async function pollRoom(spaceId: string, roomId: string): Promise<void> {
   let request = 0;
   try {
     await poll(scope, ok, async (c, after) => {
-      request = nextAccessRequest();
-      const events = await c.listEvents(spaceId, roomId, after);
-      if (ok()) verifyRoomAccess(spaceId, roomId, request);
-      return events;
+      const read = beginSpaceRead(spaceId);
+      request = read.request;
+      const settleRoom = trackScopedAccessRead(scope, request);
+      try {
+        const events = await c.listEvents(spaceId, roomId, after);
+        if (!read.valid() || newerSpaceDenial(spaceId, request)) return null;
+        // A notice epoch change fences rendering, not the server's access evidence.
+        verifyRoomAccess(spaceId, roomId, request);
+        return ok() && !roomDeniedAtOrAfter(scope, request) ? events : null;
+      } finally {
+        settleRoom();
+        read.finish();
+      }
     });
   } catch (error) {
     if (!ok()) return;
@@ -2352,7 +2546,7 @@ async function pollChat(): Promise<void> {
 }
 
 /** Fetches events after the scope's cursor; one request per scope at a time. */
-function poll(key: string, ok: () => boolean, fetch: (c: Client, after: number) => Promise<RoomEvent[]>): Promise<void> {
+function poll(key: string, ok: () => boolean, fetch: (c: Client, after: number) => Promise<RoomEvent[] | null>): Promise<void> {
   const running = inflight.get(key);
   if (running) {
     pollAgain.add(key);
@@ -2366,7 +2560,7 @@ function poll(key: string, ok: () => boolean, fetch: (c: Client, after: number) 
       if (!c || !ok()) return;
       const firstLoad = !loadedScopes()[key];
       const events = await fetch(c, cursors.get(key) ?? 0);
-      if (!ok()) return;
+      if (!events || !ok()) return;
       const added = merge(key, events);
       pages++;
       // Catch up a long history in a few quick pages on first load; otherwise

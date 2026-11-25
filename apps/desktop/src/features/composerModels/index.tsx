@@ -1,5 +1,6 @@
 import { cleanup, effect, signal, untracked } from "nsh";
 import { activeSpaceId, apiClient, composerScope, mainPlace, me, onSessionEnd, openSettings, sessionGuard, settingsOpen } from "../../store";
+import { readStartupModels, readStartupProviderCatalog } from "../../startupModelRequests";
 import { Action, Column, Label, Modal } from "../../ui";
 import { ComposerModelTrigger, ModelOptionPicker, ThinkingChoice } from "../../ui/composerModelTrigger";
 import type { ModelOption } from "../../ui/composerModelTrigger";
@@ -9,6 +10,7 @@ import type { ProviderName, Target } from "./catalog";
 const catalog = createComposerCatalog();
 /** The operator's model, when Default runs it for me (no default chat connection of my own); per scope load. */
 const operatorModel = signal<{ modelId: string; label: string } | null>(null);
+let operatorGeneration = 0;
 const scope = () => mainPlace() === "chat" ? null : mainPlace() === "space" ? activeSpaceId() ?? undefined : undefined;
 let registered = false;
 export const knownNoSystemOne = () => catalog.knownNoSystemOne(scope());
@@ -20,21 +22,22 @@ const providerNames = new WeakMap<Client, Promise<readonly ProviderName[]>>();
 function namesFor(client: Client) {
   let p = providerNames.get(client);
   if (!p) {
-    p = client.providerCatalog().then(c => c.providers.map(({ id, name }) => ({ id, name })));
+    p = readStartupProviderCatalog(client).then(c => c.providers.map(({ id, name }) => ({ id, name })));
     p.catch(() => providerNames.delete(client));
     providerNames.set(client, p);
   }
   return p;
 }
 
-function refresh() {
+function refresh(fresh = false) {
   const id = scope(), client = apiClient();
   if (id === undefined || !client) { catalog.clear(); return; }
+  const generation = ++operatorGeneration;
   const guard = sessionGuard(id ?? undefined);
   const valid = () => guard() && scope() === id && apiClient() === client;
   void catalog.load(id, valid, async () => {
-    const answer = await client.availableCatalog(id);
-    if (valid()) operatorModel.set(answer.operatorModel);
+    const answer = await readStartupModels(client, id, fresh);
+    if (generation === operatorGeneration && valid()) operatorModel.set(answer.operatorModel);
     return answer.models;
   }, () => namesFor(client));
 }
@@ -72,7 +75,7 @@ export function ComposerModelControls() {
     try {
       await client.listProviderModels(t.choice.connectionId);
       // Only the server's subsequent scoped catalog authorizes choices.
-      if (valid()) refresh();
+      if (valid()) refresh(true);
     } catch {
       if (valid()) fetchError.set(`Could not fetch models from ${t.fetchFrom}. Check that this connection supports listing models and is reachable.`);
     } finally {
@@ -99,21 +102,22 @@ export function ComposerModelControls() {
       detail, thinking: `Thinking: ${PROVIDER_DEFAULT}` },
       ...(s?.targets ?? []).map(t => option(t, t.key === chosen, effort))];
   };
+  let wasInSettings = false;
   effect(() => {
     scope();
     composerScope();
     me();
     // Settings can pair a device, change its approved models, remove a share
     // or change the classifier while Chat is still mounted underneath it.
-    if (settingsOpen()) { untracked(close); return; }
-    untracked(() => { close(); refresh(); });
+    if (settingsOpen()) { wasInSettings = true; untracked(close); return; }
+    untracked(() => { close(); refresh(wasInSettings); wasInSettings = false; });
   });
   return (
     <Column>
       <ComposerModelTrigger model={selected()?.model ?? (current()?.pin ? "Check selection" : null)}
         thinking={current()?.pin?.reasoningEffort ?? PROVIDER_DEFAULT}
         mark={selected()?.provider.mark ?? null} accessibilityLabel={triggerLabel()}
-        onPress={() => { refresh(); open.set(true); }} />
+        onPress={() => { refresh(true); open.set(true); }} />
       <Modal size="compact" open={open()} title="Model for agent turns" onClose={close}>
         <Column pad={3} gap={2}>
           <Label variant="strong">Model for agent turns</Label>
@@ -121,7 +125,7 @@ export function ComposerModelControls() {
            <If when={current()?.phase !== "ready"}>
              <Label>{current()?.phase === "failed" ? "Could not load available models." : "Loading available models…"}</Label>
              <If when={current()?.phase === "failed"}>
-               <Action compact label="Try again" testID="composer-retry-catalog" onPress={refresh} />
+                <Action compact label="Try again" testID="composer-retry-catalog" onPress={() => refresh(true)} />
              </If>
            </If>
            <If when={current()?.phase === "ready"}>

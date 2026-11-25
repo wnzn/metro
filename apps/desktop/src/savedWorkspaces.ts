@@ -221,8 +221,9 @@ export function serverCandidate(urlInput: string, name: string): SavedServer | n
 export async function saveCurrentServer(name: string, opts: { keep?: boolean; keepName?: boolean } = {}): Promise<SavedServer | null> {
   const url = connectedTo();
   if (!url || onLocalWorkspace()) return null;
+  const sameSession = sessionGuard();
   const entry = await saveServer(url, name, { keepName: opts.keepName });
-  if (entry && opts.keep) keepCurrentSignedIn();
+  if (entry && opts.keep && sameSession()) keepCurrentSignedIn();
   return entry;
 }
 

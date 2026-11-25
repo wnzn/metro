@@ -123,6 +123,7 @@ test("a slow remembered room starts one initial transcript request before the no
   local.addSpace("solo", "Solo", "carol");
   const message = local.post("solo/lobby", { kind: "message", actor: "carol", text: "First local message" });
   const rooms = local.answerLate(localRooms, LOCAL_TOKEN, 80);
+  const models = local.answerLate("/v1/models/available?space_id=solo", LOCAL_TOKEN, 900);
   local.answerLate(lobbyEvents, LOCAL_TOKEN, 300);
   const app = await launch(world(), local, fakeLauncher(), lastLocalSpace, true);
   await app.waitFor("id:workspace", { timeout: 50 });
@@ -137,6 +138,8 @@ test("a slow remembered room starts one initial transcript request before the no
   await app.waitUntil(() => roomEventPaths(local).length >= 2, { timeout: 150 });
   // The intentional catch-up page advances the cursor, never re-fetching page one.
   expect(roomEventPaths(local)).toEqual([`${lobbyEvents}?after=0`, `${lobbyEvents}?after=${message.id}`]);
+  expect(models.arrived()).toBe(1);
+  expect(local.state.log.some(r => r.path.startsWith("/v1/chat/") || r.path === "/v1/models/available")).toBe(false);
 });
 
 test("a remembered Space with no rooms makes no transcript request", async () => {
@@ -145,10 +148,17 @@ test("a remembered Space with no rooms makes no transcript request", async () =>
   local.state.rooms.set("solo", []);
   local.answerLate(localRooms, LOCAL_TOKEN, 80);
   const app = await launch(world(), local, fakeLauncher(), lastLocalSpace, true);
-  await app.waitFor("id:workspace");
+  await app.waitFor("id:rooms-loading", { timeout: 50 });
+  expect(app.shows("text:No room selected")).toBe(false);
+  expect(app.shows("id:rooms-empty")).toBe(false);
+  await app.waitFor("id:rooms-empty", { timeout: 150 });
   await app.clock!.runFor(1700);
   expect(app.shows("id:space:solo")).toBe(true);
   expect(app.shows("text:No room selected")).toBe(true);
+  expect(app.shows("text:No rooms in this Space yet.")).toBe(true);
+  expect(app.shows("id:rooms-loading")).toBe(false);
+  expect(app.shows("id:transcript")).toBe(false);
+  expect(app.shows("id:composer")).toBe(false);
   expect(roomEventPaths(local)).toEqual([]);
 });
 
@@ -165,6 +175,8 @@ test("membership refused by the rooms endpoint never starts that Space's transcr
   const app = await launch(world(), local, fakeLauncher(), lastLocalSpace, true);
   await app.waitUntil(() => text(app).includes("Couldn't open Solo"), { timeout: 200 });
   expect(app.shows("id:space:solo")).toBe(false);
+  expect(app.shows("id:rooms-empty")).toBe(false);
+  expect(app.shows("id:rooms-loading")).toBe(false);
   expect(roomEventPaths(local)).toEqual([]);
   await app.waitUntil(() => local.state.log.some((r) => r.path === "/v1/chat/events?after=0"), { timeout: 200 });
 });
@@ -214,8 +226,8 @@ for (const [nextSpace, action] of [
     const expected = [`/v1/spaces/${created.id}/rooms/lobby/events?after=0`];
 
     if (nextSpace) {
-      // Ordinary Space selection is blocked while a selection is pending.
-      // Creating a Space lets us move again before the original reply arrives.
+      // Exercise the Create path followed by another move, distinct from a
+      // direct sidebar click during hydration on saved remote startup.
       if (nextSpace === "solo") local.answerLate(localRooms, LOCAL_TOKEN, 10);
       await app.press(`id:space:${nextSpace}`);
       expected.push(`/v1/spaces/${nextSpace}/rooms/lobby/events?after=0`);
