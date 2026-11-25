@@ -130,11 +130,11 @@ function message(error: unknown, what: string): string {
 /** Which Spaces this user owns use this runner, by stable id (read-only GETs). */
 async function loadAttached(runnerId: string, valid: () => boolean): Promise<void> {
   const c = apiClient();
-  if (!c) return;
+  if (!c || !valid() || installedRunner()?.runner?.id !== runnerId || ownedInstalledRunner()?.id !== runnerId) return;
   const seq = ++attachedSeq;
   const owned = spaces().filter((s) => s.role === "owner" && SPACE_ID_RE.test(s.id));
   const checks = await Promise.allSettled(owned.map(async (s) => ({ s, r: await c.getSpaceRunner(s.id) })));
-  if (!valid() || seq !== attachedSeq || installedRunner()?.runner?.id !== runnerId) return;
+  if (!valid() || seq !== attachedSeq || installedRunner()?.runner?.id !== runnerId || ownedInstalledRunner()?.id !== runnerId) return;
   const list: { id: string; name: string }[] = [];
   for (const res of checks) {
     if (res.status === "fulfilled" && res.value.r?.kind === "registered" && res.value.r.id === runnerId) list.push({ id: res.value.s.id, name: res.value.s.name });
@@ -159,30 +159,42 @@ export function refreshAfterInstalledRunnerDeletion(id: string) {
   void loadInstalledRunner();
 }
 
-// One read per session at a time: the page may mount more than once as it opens.
-let inflight: { key: string; done: Promise<void> } | null = null;
+type FolderRead = { runnerId: string | undefined; wanted: () => boolean };
+type InstalledRead = { key: string; valid: () => boolean; folders: FolderRead[]; done: Promise<void> };
+// One bridge read per session at a time. Folder demand can join a status-only read.
+let inflight: InstalledRead | null = null;
 
-/** Opening the page: read the status only. Never throws; unknown hides. */
-export function loadInstalledRunner(readFolders = true): Promise<void> {
+/** Read status and optionally folders. A caller can withdraw its folder demand before the fetch. */
+export function loadInstalledRunner(readFolders = true, wanted = () => true): Promise<void> {
   const key = sessionKey();
-  if (inflight && inflight.key === key) return inflight.done;
   if (installedBusy()) return Promise.resolve();
-  const done = readStatus(readFolders).finally(() => {
-    if (inflight?.done === done) inflight = null;
-  });
-  inflight = { key, done };
-  return done;
+  const demand = readFolders ? { runnerId: installedRunner()?.runner?.id, wanted } : null;
+  if (inflight?.key === key && inflight.valid()) {
+    if (demand) inflight.folders.push(demand);
+    return inflight.done;
+  }
+  const read: InstalledRead = { key, valid: stillValid(), folders: demand ? [demand] : [], done: Promise.resolve() };
+  inflight = read;
+  read.done = readStatus(read);
+  return read.done;
 }
 
-async function readStatus(readFolders: boolean): Promise<void> {
-  const valid = stillValid();
-  const { runner: next, watchable } = await readBridgeStatus();
-  if (!valid()) return;
-  installedRunnerStatusWatchable.set(watchable);
-  if (!next || next.runner?.id !== installedRunner()?.runner?.id) reset();
-  installedRunner.set(next);
-  if (next?.runner && (readFolders || ownedInstalledRunner()?.id !== next.runner.id)) {
-    await loadInstalledScope(next.runner.id, valid);
+async function readStatus(read: InstalledRead): Promise<void> {
+  const { valid } = read;
+  try {
+    const { runner: next, watchable } = await readBridgeStatus();
+    if (!valid()) return;
+    installedRunnerStatusWatchable.set(watchable);
+    if (!next || next.runner?.id !== installedRunner()?.runner?.id) reset();
+    installedRunner.set(next);
+    const id = next?.runner?.id;
+    if (!id) return;
+    const wantsFolders = () => valid() && read.folders.some((d) => (d.runnerId === undefined || d.runnerId === id) && d.wanted());
+    if (ownedInstalledRunner()?.id !== id || wantsFolders()) await loadInstalledScope(id, valid);
+    if (wantsFolders()) await loadAttached(id, wantsFolders);
+  } finally {
+    // Clear before resolving, so no caller can join after the last decision.
+    if (inflight === read) inflight = null;
   }
 }
 
@@ -213,7 +225,6 @@ async function loadInstalledScope(runnerId: string, valid: () => boolean) {
     if (!valid()) return;
     if (list.runners.some((r) => r.id === runnerId && r.visibility === "personal" && r.canManage)) {
       ownedInstalledRunner.set({ id: runnerId, attachIfEmpty: list.attachIfEmpty });
-      await loadAttached(runnerId, valid);
     } else {
       ownedInstalledRunner.set(null);
       runnerSpaces.set([]);
@@ -242,8 +253,10 @@ export async function reconnectInstalledRunner(): Promise<void> {
     installedRunner.set(next);
     folders.set({});
     installedNotice.set("Reconnected. Choose Spaces without a runner below to attach it.");
-    if (next?.runner) await loadInstalledScope(next.runner.id, valid);
-    else {
+    if (next?.runner) {
+      await loadInstalledScope(next.runner.id, valid);
+      await loadAttached(next.runner.id, valid);
+    } else {
       ownedInstalledRunner.set(null);
       runnerSpaces.set([]);
     }

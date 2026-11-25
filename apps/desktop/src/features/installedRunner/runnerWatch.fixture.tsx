@@ -3,14 +3,21 @@ import { BASE, TOKENS } from "../../../test/fakeServer";
 import { dismissRunnerOffer, installedRunnerChoice, runnerOfferCount, watchInstalledRunner } from "../../runnersState";
 import { connect, me } from "../../store";
 import { Action, Column, Label } from "../../ui";
+import { RunnersSettings } from "../RunnersSettings";
 
 function Consumer() {
   watchInstalledRunner();
   return null;
 }
 
+function FolderConsumer() {
+  watchInstalledRunner(true);
+  return null;
+}
+
 function WatchFixture() {
   const active = signal(true);
+  const settings = signal(false);
   const visibleCount = signal(0);
   let shown = false;
   effect(() => {
@@ -19,7 +26,7 @@ function WatchFixture() {
     shown = visible;
   });
   return (
-    <Column testID="watch-fixture">
+    <Column grow testID="watch-fixture">
       <If when={active()}>
         <Consumer />
         <Consumer />
@@ -30,6 +37,11 @@ function WatchFixture() {
         <Action testID="dismiss-fixture-offer" label="Not now" onPress={dismissRunnerOffer} />
       </If>
       <Action testID="toggle-watchers" label="Toggle watches" onPress={() => active.set(!active())} />
+      <Action testID="toggle-runner-settings" label="Toggle runner settings" onPress={() => settings.set(!settings())} />
+      <If when={settings()}>
+        <FolderConsumer />
+        <RunnersSettings />
+      </If>
     </Column>
   );
 }

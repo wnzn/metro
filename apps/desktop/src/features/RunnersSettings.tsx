@@ -251,9 +251,19 @@ function RunnerUpdateControls(props: { runner: RegisteredRunner; scope: string }
   const intent = signal<{ target: string; scope: string } | null>(null);
   const confirmOpen = signal(false);
   const submitting = signal(false);
+  const lostOffer = signal(false);
   const pending = () => u()?.pending;
   const pendingText = () => { const p = pending(); return p ? `Update to ${p.target} requested` : null; };
-  const resultText = () => pendingText() ?? error();
+  const unavailableText = () => {
+    if (eligible() || pending()) return null;
+    if (target() && r().canManage && u()?.action === "self_update" && !r().presence?.online) {
+      return "Bring this runner online to request an update.";
+    }
+    return lostOffer() ? "This runner is no longer eligible for that update." : null;
+  };
+  const resultText = () => pendingText() ?? (error() || unavailableText());
+  const resultFocusable = () => !eligible() && !submitting() && !!(pendingText() || error() || lostOffer());
+  const restoreToResult = () => resultFocusable() ? result : undefined;
   let result: ViewRef | undefined;
   let mounted = true;
   cleanup(() => { mounted = false; });
@@ -268,6 +278,7 @@ function RunnerUpdateControls(props: { runner: RegisteredRunner; scope: string }
     const target = eligible();
     if (!target || runnerUpdateBusy() || runnerBusy()) return;
     batch(() => {
+      lostOffer.set(false);
       intent.set({ target, scope: props.scope });
       confirmOpen.set(true);
     });
@@ -291,7 +302,12 @@ function RunnerUpdateControls(props: { runner: RegisteredRunner; scope: string }
   };
   effect(() => {
     const request = intent();
-    if (confirmOpen() && !submitting() && (request?.scope !== props.scope || request?.target !== eligible())) confirmOpen.set(false);
+    if (confirmOpen() && !submitting() && (request?.scope !== props.scope || request?.target !== eligible())) {
+      batch(() => {
+        lostOffer.set(!eligible());
+        confirmOpen.set(false);
+      });
+    }
   });
   effect(() => {
     props.scope;
@@ -334,13 +350,11 @@ function RunnerUpdateControls(props: { runner: RegisteredRunner; scope: string }
             }} />
         </Row>
       </If>
-      <If when={target() && r().canManage && u()?.action === "self_update" && !r().presence?.online && !u()?.pending}>
-        <Label variant="caption" color="muted">Bring this runner online to request an update.</Label>
-      </If>
-      <StatusSummary viewRef={(node) => { result = node; }} focusable={!eligible() && !!resultText() && !submitting()}
-        accessibilityLabel={!eligible() && resultText() ? `${r().name}: ${resultText()}` : undefined} testID={`runner-update-result:${r().id}`}>
+      <StatusSummary viewRef={(node) => { result = node; }} focusable={resultFocusable()}
+        accessibilityLabel={resultFocusable() ? `${r().name}: ${resultText()}` : undefined} testID={`runner-update-result:${r().id}`}>
         <If when={pendingText()}>{(text) => <Label variant="caption" color="muted">{text()}</Label>}</If>
         <If when={error()}>{(text) => <ProblemNote testID={`runner-update-error:${r().id}`} text={`${r().name}: ${text()}`} />}</If>
+        <If when={unavailableText()}>{(text) => <Label variant="caption" color="muted">{text()}</Label>}</If>
       </StatusSummary>
       <If when={failure()}>
         {(last) => <ProblemNote testID={`runner-update-failed:${r().id}`}
@@ -352,7 +366,7 @@ function RunnerUpdateControls(props: { runner: RegisteredRunner; scope: string }
         open={confirmOpen()} onOpenChange={changeConfirmation}
         disabled={!eligible() || !!runnerBusy() || !!runnerUpdateBusy()} busy={submitting()} busyLabel="Requesting…"
         message={`${r().name} downloads ${intent()?.target} from GitHub, verifies the signature itself and restarts. Jobs pause for a moment.`}
-        returnFocusAfterBusy={() => !eligible() && resultText() ? result : undefined}
+        returnFocusOnClose={restoreToResult} returnFocusAfterBusy={restoreToResult}
         onConfirm={() => void confirm()} />
     </Column>
   );

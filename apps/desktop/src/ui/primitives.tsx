@@ -868,6 +868,8 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
   disabled?: boolean;
   busy?: boolean;
   busyLabel?: string;
+  /** Idle close in the same scope: use this when the opener has become unavailable. */
+  returnFocusOnClose?: () => ViewRef | null | undefined;
   /** Controlled close after confirming: fall back to the opener if this returns no result control. */
   returnFocusAfterBusy?: () => ViewRef | null | undefined;
 }) {
@@ -894,13 +896,15 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
   };
   const restore = (active: NonNullable<ReturnType<typeof session>>) => {
     const opener = active.opener ?? trigger;
-    if (!props.returnFocusAfterBusy || submitted !== active) {
+    const afterSubmit = submitted === active;
+    const choose = afterSubmit ? props.returnFocusAfterBusy : props.returnFocusOnClose;
+    if (!choose) {
       opener?.focus();
       return;
     }
     // Don't pull focus back from a different control the person moved to.
     if (props.busy || (focusedWhileBusy === active && busyFocus !== active)) return;
-    const next = props.returnFocusAfterBusy() ?? opener;
+    const next = choose() ?? opener;
     if (!next) return;
     void next.measure().then((layout) => {
       if (layout && mounted && session() === null && props.scopeKey === active.key) next.focus();
@@ -922,7 +926,7 @@ export function ConfirmInline(props: Testable & ConfirmTrigger & {
       if (props.open === undefined) localOpen.set(false);
     } else if (active && !requested) {
       session.set(null);
-      restore(active);
+      untracked(() => restore(active));
     }
   });
   effect(() => {

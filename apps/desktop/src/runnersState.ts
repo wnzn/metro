@@ -63,16 +63,17 @@ export function dismissRunnerOffer() {
 
 /** One shared read-only watch, regardless of how many consumers are mounted. */
 export function watchInstalledRunner(refreshFoldersOnOpen = false) {
-  untracked(() => {
-    const count = watchers();
-    watchers.set(count + 1);
-    // Settings can open after Sidebar has been showing the same session for
-    // a while. It needs a fresh folder list, not another periodic watcher.
-    if (refreshFoldersOnOpen && count && offerKey() && helper().phase !== "checking" && !runnerAttachBusy()) {
-      void loadInstalledRunner();
-    }
-  });
+  watchers.set(untracked(watchers) + 1);
   cleanup(() => watchers.set(untracked(watchers) - 1));
+  if (refreshFoldersOnOpen) effect(() => {
+    if (!offerKey() || helper().phase === "checking") return;
+    const valid = sessionGuard();
+    let wanted = true;
+    cleanup(() => { wanted = false; });
+    // A mounted Settings page needs folders, even when joining a Sidebar
+    // status read. Closing the page withdraws just this folder demand.
+    untracked(() => void loadInstalledRunner(true, () => wanted && valid()));
+  });
 }
 
 effect(() => {
@@ -83,7 +84,7 @@ effect(() => {
   if (!watching() || !offerKey() || helper().phase === "checking") return;
   // Initial read is independent of the offer, so Create can still use the
   // verified runner after dismissal or when there are no existing Spaces.
-  untracked(() => void loadInstalledRunner());
+  untracked(() => void loadInstalledRunner(false));
 });
 
 const shouldWatchOffer = computed(() => {

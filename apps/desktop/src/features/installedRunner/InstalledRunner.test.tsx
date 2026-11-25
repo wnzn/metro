@@ -433,6 +433,47 @@ test("a stalled bridge expires the online offer; unmount stops reads and remount
   expect(app.shows("id:dismiss-fixture-offer")).toBe(false);
 });
 
+test("Settings upgrades a held Sidebar poll to one folder fetch for the still-mounted exact runner only", async () => {
+  for (const change of ["same runner", "unmounted", "different runner"]) {
+    const f = world();
+    f.addSpace("solo", "Solo", "alice");
+    f.addSpace("empty", "Empty", "alice");
+    const mine = f.addRunner("This PC", "personal", "alice");
+    const replacement = f.addRunner("Replacement", "personal", "alice");
+    const t = bridgeWithRunner(f, mine.id, mine.name);
+    const reads = () => t.log.filter((l) => l.method === "GET" && l.path === "/v1/local-tools/runner").length;
+    const folders = () => f.state.log.filter((l) => l.method === "GET" && l.path === "/v1/spaces/solo/runner").length;
+    const app = await open("./runnerWatch.fixture.tsx", {
+      network: { ...f.network, ...t.network } as any, modules: bridgeEnv() as any, platform: "linux", width: 1280, height: 900, clock: {},
+    });
+    await app.press("id:fixture-connect");
+    await app.waitFor("id:dismiss-fixture-offer");
+    expect(reads()).toBe(1);
+    expect(folders()).toBe(0); // Sidebar read verified ownership, not the folders.
+    const id = change === "different runner" ? replacement.id : mine.id;
+    f.state.attached.set("solo", id);
+    t.st.runnerId = id;
+    t.st.delay = 1800;
+    await app.clock!.runFor(5100);
+    expect(reads()).toBe(2);
+    await app.press("id:toggle-runner-settings");
+    await app.waitFor("id:runners-settings");
+    expect(app.shows("id:installed-runner-folder:solo")).toBe(false);
+    expect(reads()).toBe(2); // Two folder consumers joined the same held read.
+    if (change === "unmounted") await app.press("id:toggle-runner-settings");
+    await app.clock!.runFor(1800);
+    if (change === "same runner") {
+      await app.waitFor("id:installed-runner-folder:solo");
+      expect(folders()).toBe(1);
+    } else {
+      expect(app.shows("id:installed-runner-folder:solo")).toBe(false);
+      expect(folders()).toBe(0);
+    }
+    expect(reads()).toBe(2);
+    expect(posts(t)).toEqual([]);
+  }
+});
+
 const fixtureRelease = (install: string, action: string, extra = {}) => ({
   presence: { version: "0.4.0", online: true, seen_at: Date.now(), install, self_update: install === "managed" },
   update: { latest: "0.5.0", available: true, action, pending: null, last_result: null, ...extra },
@@ -554,6 +595,34 @@ test("a held keyboard update keeps its scoped busy panel and restores focus to r
   await app.keyboard.press("enter");
   await app.waitFor(`id:rotate-runner:${mine.id}:panel`);
   expect(updates()).toHaveLength(2);
+});
+
+test("an idle confirmation closes without a POST and hands keyboard focus to status when its runner goes offline", async () => {
+  const f = world();
+  const mine = f.addRunner("Build box", "personal", "alice");
+  const other = f.addRunner("Already updating", "personal", "alice");
+  const release = fixtureRelease("managed", "self_update");
+  f.state.runnerRelease.set(mine.id, release);
+  // An unrelated accepted update drives the page's read-only roster refresh.
+  f.state.runnerRelease.set(other.id, fixtureRelease("managed", "self_update", {
+    pending: { target: "0.5.0", requested_at: Date.now() },
+  }));
+  const app = await openWith(f, null, true);
+  await signInToRunners(app, "alice");
+  const id = `id:runner-update:${mine.id}`;
+  await app.press(id);
+  await app.waitFor(`${id}:panel`);
+  await app.keyboard.press("tab"); // Cancel → Confirm, but don't submit.
+  release.presence.online = false;
+  await app.clock!.runFor(5100);
+  await app.waitFor(`id:runner-update-result:${mine.id} >> text:Bring this runner online to request an update.`);
+  expect(app.shows(`${id}:panel`)).toBe(false);
+  expect(app.shows(id)).toBe(false);
+  await app.keyboard.press("enter"); // The focused status cannot submit.
+  await app.keyboard.press("tab"); // Status → this runner's Rotate token.
+  await app.keyboard.press("enter");
+  await app.waitFor(`id:rotate-runner:${mine.id}:panel`);
+  expect(f.posts().filter((p) => p.path.endsWith("/update"))).toEqual([]);
 });
 
 test("Docker guidance only exposes official version-matched pinned images; embedded, unsupported and non-admin rows can't update", async () => {
