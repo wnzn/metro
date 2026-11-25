@@ -249,3 +249,33 @@ async fn argument_limits_and_tool_result_budget_fail_closed() {
     }
     assert_eq!(count(&ctx.state.db, "SELECT count(*) FROM page_drafts"), 0);
 }
+
+#[tokio::test]
+async fn oversize_proposal_result_rolls_back_reservation_and_card_and_caps_diagnostics() {
+    let ctx = context(crate::Limits {
+        max_tool_output_to_model: 100,
+        ..Default::default()
+    })
+    .await;
+    for args in [json!({"source": SOURCE}), json!({"instruction": "Build"})] {
+        let error = ctx.run(PAGE_PROPOSE, args).await.unwrap_err();
+        assert_eq!(error.note, TOO_LARGE);
+    }
+    let invalid = ctx
+        .run(
+            PAGE_PROPOSE,
+            json!({"source": "export default <Page><script /></Page>"}),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(invalid.note, "the Page TSX didn't validate");
+    assert!(invalid.details.is_none());
+    assert_eq!(count(&ctx.state.db, "SELECT count(*) FROM page_drafts"), 0);
+    assert_eq!(
+        count(
+            &ctx.state.db,
+            "SELECT count(*) FROM space_events WHERE kind='page_draft'"
+        ),
+        0
+    );
+}

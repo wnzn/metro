@@ -15,7 +15,7 @@
 //! `{"ok": false, "error": "no_access"}` and a fixed message; other sources
 //! still resolve, and nothing about the hidden data leaks into the error.
 //! The HTTP endpoint doesn't send these values to a model or index them.
-//! Opted-in Space agents can use the same resolver as their run's initiator.
+//! Space agents resolve a room-safe subset as their run's initiator.
 
 use std::collections::HashMap;
 
@@ -154,6 +154,16 @@ fn messages(db: &Db, ctx: &Context, t: &Target, viewer: &str) -> Result<Json, Fa
         Some("answers") => &[kind::AGENT],
         _ => &[kind::MESSAGE, kind::AGENT],
     };
+    messages_of(db, ctx, t, viewer, kinds)
+}
+
+fn messages_of(
+    db: &Db,
+    ctx: &Context,
+    t: &Target,
+    viewer: &str,
+    kinds: &[&str],
+) -> Result<Json, Fail> {
     let mut events = match space_of(db, ctx, t, viewer)? {
         Some(sid) => {
             let room = t.room_id.as_deref().ok_or(Fail::NoAccess)?;
@@ -649,20 +659,109 @@ pub async fn resolve(
     viewer: String,
     only: Option<Vec<String>>,
 ) -> anyhow::Result<Json> {
-    resolve_with_actions(state, ctx, spec, viewer, only, true).await
+    resolve_with_actions(state, ctx, spec, viewer, only).await
 }
 
-/// The same `<Data>` values as `/data`, without action capabilities.
-/// Those are for a human deciding whether to click a button, and checking
-/// `openPage` could otherwise reveal access to a page outside this Space.
-pub(crate) async fn resolve_sources(
+/// Shared-room model data is a separate, positive allowlist. Never resolve
+/// a viewer-only source here, even to count or redact its rows. Rights to
+/// view something in the page UI aren't consent to share it with the room.
+pub(crate) async fn resolve_room_sources(
     state: &AppState,
     ctx: Context,
     spec: PageSpec,
     viewer: String,
     only: Option<Vec<String>>,
 ) -> anyhow::Result<Json> {
-    resolve_with_actions(state, ctx, spec, viewer, only, false).await
+    anyhow::ensure!(
+        ctx.space_id.is_some() && !ctx.draft,
+        "expected a live Space page"
+    );
+    state
+        .db
+        .call(move |db| {
+            let mut data = serde_json::Map::new();
+            for d in &spec.data {
+                if only.as_ref().is_some_and(|o| !o.contains(&d.name)) {
+                    continue;
+                }
+                data.insert(d.name.clone(), room_source(db, &ctx, d, &viewer));
+            }
+            Ok(json!({"data": data, "resolved_at": rfc3339_utc(crate::db::now_ms())}))
+        })
+        .await
+}
+
+/// Only transcript messages and shared Space inventory. The field lists
+/// protect the model boundary even if a human-facing resolver gains fields.
+fn room_source(db: &Db, ctx: &Context, d: &DataDecl, viewer: &str) -> Json {
+    let t = &d.params;
+    let (result, fields): (_, &[&str]) = match d.source.as_str() {
+        "messages" if matches!(t.kind.as_deref(), None | Some("all" | "messages")) => (
+            messages_of(db, ctx, t, viewer, &[kind::MESSAGE]),
+            &["id", "kind", "author", "author_id", "text", "at"],
+        ),
+        "library" => (
+            library_files(db, ctx, t, viewer),
+            &[
+                "id",
+                "name",
+                "kind",
+                "mime_type",
+                "size",
+                "uploaded",
+                "space_id",
+            ],
+        ),
+        "agents" => (
+            agents(db, ctx, t, viewer),
+            &[
+                "id",
+                "name",
+                "handle",
+                "description",
+                "is_default",
+                "color",
+                "initial",
+                "avatar_version",
+                "space_id",
+            ],
+        ),
+        // Schedules are per-viewer. Run registry tasks and page-run origins
+        // can include user/provider diagnostics and model/account metadata.
+        // Answers are intentionally withheld too, including block runs and
+        // failure text. Capabilities are never queried here.
+        _ => {
+            return json!({"ok": false, "error": "not_shared", "message": "This source is not available to shared room agents."});
+        }
+    };
+    match result {
+        Ok(value) => {
+            let items: Vec<Json> = value["items"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|row| row.as_object())
+                .map(|row| {
+                    Json::Object(
+                        fields
+                            .iter()
+                            .filter_map(|&k| {
+                                row.get(k)
+                                    .filter(|v| !v.is_array() && !v.is_object())
+                                    .map(|v| (k.to_owned(), v.clone()))
+                            })
+                            .collect(),
+                    )
+                })
+                .collect();
+            let mut value = json!({"items": items});
+            if d.source == "messages" {
+                value["room"] = json!(t.room);
+            }
+            json!({"ok": true, "value": value})
+        }
+        Err(f) => f.json(),
+    }
 }
 
 async fn resolve_with_actions(
@@ -671,7 +770,6 @@ async fn resolve_with_actions(
     spec: PageSpec,
     viewer: String,
     only: Option<Vec<String>>,
-    include_actions: bool,
 ) -> anyhow::Result<Json> {
     let all_runs = state.runs.list();
     state
@@ -683,12 +781,6 @@ async fn resolve_with_actions(
                     continue;
                 }
                 data.insert(d.name.clone(), source(db, &ctx, d, &viewer, &all_runs));
-            }
-            if !include_actions {
-                return Ok(json!({
-                    "data": data,
-                    "resolved_at": rfc3339_utc(crate::db::now_ms()),
-                }));
             }
             // What the viewer vouched for, once per request.
             let vouched = match (&ctx.page_id, ctx.version) {

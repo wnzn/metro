@@ -391,6 +391,7 @@ async fn drive(
     prompt: Message,
     history: Vec<Message>,
     cancel: Option<watch::Receiver<bool>>,
+    redact_diagnostics: bool,
 ) -> Outcome {
     let limits = &state.config.limits;
     let run = agent
@@ -407,6 +408,14 @@ async fn drive(
         result = tokio::time::timeout(limits.agent_timeout, run) => match result {
             Ok(Ok(response)) => Outcome::Completed(response.output()),
             Ok(Err(e)) => {
+                // A provider can echo request bodies, credentials or its
+                // own account diagnostics. Keep only the classified code
+                // for Pages turns; don't log or publish the raw error.
+                if redact_diagnostics {
+                    let code = failure_code(&e);
+                    tracing::warn!(?code, "Pages model turn failed");
+                    return Outcome::Failed("The agent could not complete the model turn.".to_owned(), code);
+                }
                 tracing::warn!(error = %e, "agent run failed");
                 Outcome::Failed(
                     truncate(&format!("The agent failed: {e}"), 2_000),
@@ -487,7 +496,16 @@ where
             }
         })
         .collect();
-    match drive(state, agent, Message::user(prompt), history, None).await {
+    match drive(
+        state,
+        agent,
+        Message::user(prompt),
+        history,
+        None,
+        pin_to_run,
+    )
+    .await
+    {
         Outcome::Completed(text) => Ok((text, route.note)),
         Outcome::Failed(text, _) => Err(PageTurnError::Failed(text)),
         Outcome::Cancelled => Err(PageTurnError::Failed(
@@ -807,8 +825,9 @@ async fn execute_room_run(
             let page_tools = crate::pages::agent_tools::tools(
                 state, space_id, room, initiator, turn, route, agent,
             );
+            let offers_pages = !page_tools.is_empty();
             let mut builder = model.builder().preamble(PREAMBLE);
-            if !page_tools.is_empty() {
+            if offers_pages {
                 builder = builder
                     .append_preamble(crate::pages::agent_tools::PREAMBLE)
                     .dynamic_tools(page_tools);
@@ -889,9 +908,11 @@ async fn execute_room_run(
                 reacted = flag;
             }
             let key = TurnKey::new();
-            builder = builder
-                .append_preamble(&turn_preamble(crate::db::now_ms(), &key))
-                .add_hook(ReasoningSummaries {
+            builder = builder.append_preamble(&turn_preamble(crate::db::now_ms(), &key));
+            // Don't publish provider reasoning on shared Pages runs. It
+            // is not a room-projected value and can carry provider details.
+            if !offers_pages {
+                builder = builder.add_hook(ReasoningSummaries {
                     state: state.clone(),
                     scope: Scope::Room {
                         space_id: space_id.to_owned(),
@@ -899,6 +920,7 @@ async fn execute_room_run(
                     },
                     turn: turn.clone(),
                 });
+            }
             let prompt = user_turn(trigger, &key);
             drive(
                 state,
@@ -906,6 +928,7 @@ async fn execute_room_run(
                 prompt,
                 history(&earlier, &key),
                 Some(cancel),
+                offers_pages,
             )
             .await
         }
@@ -1538,7 +1561,7 @@ async fn execute_personal_run(
     };
     // Web tools only for a person who turned them on for their own Chat,
     // always on their own computer.
-    let web = {
+    let web = lane == PersonalLane::Chat && {
         let user = user_id.clone();
         state
             .db
@@ -1613,6 +1636,7 @@ async fn execute_personal_run(
         prompt,
         history(&earlier, &key),
         None,
+        false,
     )
     .await
     {

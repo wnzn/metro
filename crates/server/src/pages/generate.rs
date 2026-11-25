@@ -151,6 +151,7 @@ fn catalogue(
     db: &crate::db::Db,
     user: &str,
     space: Option<&str>,
+    include_private_schedules: bool,
 ) -> anyhow::Result<(Json, Vec<String>)> {
     let conn = db.lock();
     let spaces: Vec<(String, String)> = {
@@ -184,7 +185,7 @@ fn catalogue(
         listed.push(json!({"id": sid, "name": name, "rooms": rooms, "agents": agents}));
     }
     // Personal pages can't run schedules: only a Space page lists them.
-    let tasks: Vec<Json> = match space {
+    let tasks: Vec<Json> = match space.filter(|_| include_private_schedules) {
         None => Vec::new(),
         Some(sid) => {
             let mut stmt = conn.prepare_cached(
@@ -764,9 +765,10 @@ async fn generate(state: &AppState, job: &Job) -> Outcome {
         }
     };
     let (db_user, db_space) = (job.user.clone(), job.space.clone());
+    let include_private_schedules = job.agent_grant.is_none();
     let (context, catalogued) = match state
         .db
-        .call(move |db| catalogue(db, &db_user, db_space.as_deref()))
+        .call(move |db| catalogue(db, &db_user, db_space.as_deref(), include_private_schedules))
         .await
     {
         Ok(c) => c,
